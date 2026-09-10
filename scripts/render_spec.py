@@ -4,7 +4,8 @@
 This deliberately small renderer handles the Markdown subset used by our spec:
 headings, paragraphs, lists, fenced code, two-column tables, and horizontal rules.
 PDFs use the standard built-in fonts; no TeX, browser, or font download is needed.
-The output is deterministic, including PDF metadata and compression.
+The output has deterministic metadata and uncompressed page streams, avoiding
+byte differences between system zlib implementations.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from pathlib import Path
 import re
 import sys
 import textwrap
-import zlib
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -318,9 +318,9 @@ class PdfDocument:
                 f"BT /F1 8 Tf 0.38 0.42 0.46 rg 1 0 0 1 {PAGE_WIDTH - MARGIN - 36} 31 Tm "
                 f"{encoded(f'{index + 1} / {len(self.pages)}')} Tj ET"
             )
-            stream = zlib.compress("\n".join(commands).encode("ascii"), level=9)
+            stream = "\n".join(commands).encode("ascii")
             content = objects.add(
-                f"<< /Length {len(stream)} /Filter /FlateDecode >>\nstream\n".encode("ascii")
+                f"<< /Length {len(stream)} >>\nstream\n".encode("ascii")
                 + stream + b"\nendstream"
             )
             resources = " ".join(f"/F{i + 1} {obj} 0 R" for i, obj in enumerate(fonts))
