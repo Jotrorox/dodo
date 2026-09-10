@@ -26,15 +26,24 @@ or a proof of memory safety.
 
 ## Build and install
 
-Prerequisites: Rust 1.95.0 (pinned in `rust-toolchain.toml`), LLVM 22 development
-files, and a C toolchain for linking hosted executables. Inkwell provides LLVM
-bindings; the language server uses `lsp-server`, `lsp-types`, `serde_json`, and
-`url`. `Cargo.lock` fixes the dependencies.
+**Users of a built `dodo` binary do not need to install LLVM.** LLVM is linked
+statically, including all code generation targets. Copy the binary onto your
+`PATH`; there is no LLVM installation or environment variable to configure.
+Checking code and emitting objects, assembly, LLVM IR, or bitcode require no
+external compiler tools. Building and running hosted executables still requires
+a C toolchain (`cc`, or a driver selected with `--linker` / `DODO_CC`).
+
+Building Dodo **from source** requires Rust 1.95.0 (pinned in
+`rust-toolchain.toml`), LLVM 22 development files and static archives, and a C
+toolchain. Inkwell provides LLVM bindings; the language server uses `lsp-server`,
+`lsp-types`, `serde_json`, and `url`. `Cargo.lock` fixes the dependencies. A missing
+LLVM static archive is a build error; the build never silently falls back to
+shared LLVM.
 
 On Fedora with LLVM 22 packages:
 
 ```sh
-sudo dnf install llvm-devel clang gcc
+sudo dnf install llvm-devel llvm-static clang gcc gcc-c++ zlib-ng-compat-devel libzstd-devel libxml2-devel libffi-devel
 export LLVM_SYS_221_PREFIX=/usr/lib64/llvm22
 cargo build --locked --release
 cargo install --locked --path .
@@ -45,7 +54,7 @@ On Ubuntu 24.04, install LLVM 22 from the
 
 ```sh
 # After configuring the signed LLVM 22 apt repository:
-sudo apt-get install llvm-22-dev clang-22 build-essential
+sudo apt-get install llvm-22-dev libpolly-22-dev build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev
 export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 cargo build --locked --release
 cargo install --locked --path .
@@ -54,7 +63,40 @@ cargo install --locked --path .
 The exact signed-repository setup used by CI is in
 [ci.yml](.github/workflows/ci.yml). If LLVM is installed elsewhere, set
 `LLVM_SYS_221_PREFIX` to its installation prefix containing `bin/llvm-config`.
-Dodo links dynamically to LLVM; keep the matching LLVM runtime installed.
+Ordinary Cargo builds can still link LLVM's smaller support libraries (such as
+zlib, zstd, and the C++ library) dynamically. Use the release recipe below to
+bundle those as well.
+
+### Self-contained Linux release
+
+On an x86-64 Ubuntu 24.04 build machine with the packages above, run:
+
+```sh
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
+bash scripts/build-release.sh
+install -Dm755 target/x86_64-unknown-linux-gnu/release/dodo "$HOME/.local/bin/dodo"
+```
+
+The resulting binary contains LLVM, the C++ standard library, zlib, zstd, and
+any needed libffi code. Its only permitted shared dependencies are the standard
+Linux C runtime (`libc.so.6`), math library (`libm.so.6`), unwind library
+(`libgcc_s.so.1`), and ELF loader. The tested runtime baseline is x86-64 Linux
+with glibc 2.39 or newer (Ubuntu 24.04). LLVM and its support packages are only
+needed on the build machine. Keeping every LLVM target increases the binary
+size compared with the old shared-LLVM build.
+
+The script requires Python 3 and `readelf` (binutils) for verification and honors
+`LLVM_SYS_221_PREFIX`, `CC`, and `CARGO_TARGET_DIR`. Other native x86-64 GNU/Linux
+build hosts need the same development libraries, including `libz.a`,
+`libzstd.a`, `libstdc++.a`, and `libffi.a`. Their runtime glibc requirement depends
+on the build host. Other platforms can use the ordinary Cargo build above;
+the reduced support-library dependency list is only enforced for this Linux
+release recipe.
+
+The release build checks its ELF dependencies and fails if an unexpected shared
+library remains. CI also copies it into a clean Ubuntu container, checks code
+and emits native and WebAssembly objects before installing any compiler tools,
+then builds and runs a program with only the C toolchain added.
 
 ## Use
 
@@ -165,6 +207,8 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked --release
 python3 scripts/render_spec.py --check
+python3 scripts/test_check_linkage.py
+bash scripts/build-release.sh # x86-64 GNU/Linux release dependency check
 ```
 
 CI runs these checks. Tests include rejected programs, specification examples,
