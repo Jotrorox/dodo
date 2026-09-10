@@ -27,8 +27,9 @@ or a proof of memory safety.
 ## Build and install
 
 Prerequisites: Rust 1.95.0 (pinned in `rust-toolchain.toml`), LLVM 22 development
-files, and a C toolchain for linking hosted executables. Inkwell is the only
-direct Cargo dependency; `Cargo.lock` fixes the transitive dependencies.
+files, and a C toolchain for linking hosted executables. Inkwell provides LLVM
+bindings; the language server uses `lsp-server`, `lsp-types`, `serde_json`, and
+`url`. `Cargo.lock` fixes the dependencies.
 
 On Fedora with LLVM 22 packages:
 
@@ -91,6 +92,32 @@ requires the platform's startup code, linker script, and appropriate linker.
 `run` executes only the host target. Linux x86-64 native execution and wasm32
 object generation are covered by tests; other LLVM targets are not validated.
 
+## Editor diagnostics (LSP)
+
+Configure your editor's LSP client to launch `dodo` with the argument `--lsp`
+(or use `dodo lsp`). No input path is required. The server uses standard
+[LSP](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/)
+messages over stdin/stdout; transport errors and logs go to stderr.
+
+The server checks unsaved text on open and edit, refreshes diagnostics on save,
+and releases buffers on close. Diagnostics include source ranges, severity, and
+compiler notes. Local imports use other open buffers when available, and edits
+recheck all open files so diagnostics in callers stay current. Source files and
+build artifacts are never written by the server.
+
+By default, each document is checked like `dodo check <file>`, including its
+imports. For projects that use directory packages, set your LSP client's
+`initializationOptions` to `{"checkMode": "package"}`. This checks each open
+document's parent directory like `dodo check <directory>`, including unsaved new
+`.dodo` siblings. All files in a directory package must declare the same package.
+
+This initial implementation supports local `file:` URIs, full document
+synchronization, UTF-16 positions, and host pointer width. Checks stop at the
+first compiler error per file/package. Error and warning severities are
+supported, but the compiler currently only produces errors; no new warning
+rules are introduced. Completion, navigation, incremental analysis, file
+watching, and diagnostics for unopened workspace roots are not implemented yet.
+
 ## Language support
 
 - Fixed-width and pointer-sized integers, floats, Booleans, byte/string literals,
@@ -147,7 +174,12 @@ exercise the actual compiler and generated binaries rather than matching LLVM
 text alone. On systems that save core dumps, `ulimit -c 0` before running the
 trap tests avoids creating crash artifacts.
 
+`cargo test --locked --test lsp` exercises the real compiler's LSP lifecycle,
+framing, buffer updates, imported diagnostics, directory packages, Unicode
+positions, and recovery from invalid notifications.
+
 The pipeline is organized into [`lexer`](src/lexer.rs),
 [`parser`](src/parser.rs), [`package`](src/package.rs),
 [`sema`](src/sema.rs), [`consteval`](src/consteval.rs), and
-[`codegen`](src/codegen.rs), with a reusable library and a small CLI driver.
+[`codegen`](src/codegen.rs), with a reusable library, an
+[`LSP server`](src/lsp.rs), and a small CLI driver.
