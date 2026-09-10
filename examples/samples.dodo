@@ -1,0 +1,40 @@
+package samples
+
+pub struct Samples {
+    [4]u16 values
+
+    pub fn offset(self: &mut Self, amount: u16) -> void {
+        for value in &mut self.values {
+            *value += amount
+        }
+    }
+
+    pub fn weighted_sum(self: &Self) -> u32 {
+        total := 0u32
+        for i, value in self.values {
+            weight := i as u32 + 1
+            total += weight * (*value as u32)
+        }
+        return total
+    }
+
+    pub fn view(self: &Self) -> &[u16] {
+        return &self.values
+    }
+}
+
+pub fn demo() -> u32 {
+    samples := Samples{
+        values: [4]u16{1, 2, 3, 4},
+    }
+
+    view := samples.view()
+    first := view[0]
+    samples.offset(10)
+    return samples.weighted_sum() + first as u32
+}
+
+// The process exit status records the specification's expected value, 131.
+fn main() -> i32 {
+    return demo() as i32
+}

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compiler:
+    name: Rust and LLVM 22 / Ubuntu 24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Install LLVM 22 from the official signed repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-signing-key.asc
+          gpg --show-keys --with-colons /tmp/llvm-signing-key.asc | awk -F: '$1 == "fpr" {print $10}' > /tmp/llvm-fingerprints
+          grep -Fx '6084F3CF814B57C1CF12EFD515CF4D18AF4F7421' /tmp/llvm-fingerprints
+          sudo install -m 644 /tmp/llvm-signing-key.asc /usr/share/keyrings/llvm.asc
+          echo 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' | sudo tee /etc/apt/sources.list.d/llvm22.list
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y llvm-22-dev libpolly-22-dev clang-22 build-essential
+          /usr/lib/llvm-22/bin/llvm-config --version
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check generated documents
+        run: python3 scripts/render_spec.py --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test parser, semantics, CLI, native output, and optimized traps
+        shell: bash
+        run: |
+          ulimit -c 0
+          cargo test --locked --all-targets
+      - name: Build release compiler
+        run: cargo build --locked --release

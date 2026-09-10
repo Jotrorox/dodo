@@ -1,0 +1,2121 @@
+//! Native code generation. Checked operations keep their checks at every optimization level.
+use crate::ast::*;
+use inkwell::attributes::{Attribute, AttributeLoc};
+use inkwell::basic_block::BasicBlock;
+use inkwell::builder::{Builder, BuilderError};
+use inkwell::context::Context;
+use inkwell::intrinsics::Intrinsic;
+use inkwell::module::{Linkage, Module};
+use inkwell::passes::PassBuilderOptions;
+use inkwell::targets::{
+    CodeModel, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
+};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+};
+use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
+use std::collections::HashMap;
+
+#[derive(Debug)]
+pub struct CodegenError(pub String);
+impl std::fmt::Display for CodegenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CodegenError {}
+impl From<BuilderError> for CodegenError {
+    fn from(e: BuilderError) -> Self {
+        Self(e.to_string())
+    }
+}
+impl From<inkwell::support::LLVMString> for CodegenError {
+    fn from(e: inkwell::support::LLVMString) -> Self {
+        Self(e.to_string())
+    }
+}
+type Result<T> = std::result::Result<T, CodegenError>;
+fn error(s: impl std::fmt::Display) -> CodegenError {
+    CodegenError(s.to_string())
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    pub target: Option<String>,
+    pub cpu: Option<String>,
+    pub features: String,
+    pub optimization: u8,
+    pub entry: bool,
+}
+pub struct Generated<'ctx> {
+    pub module: Module<'ctx>,
+    pub machine: TargetMachine,
+}
+pub fn target_machine(options: &Options) -> Result<TargetMachine> {
+    Target::initialize_all(&InitializationConfig::default());
+    let triple = options
+        .target
+        .as_ref()
+        .map_or_else(TargetMachine::get_default_triple, |s| {
+            TargetTriple::create(s)
+        });
+    let target = Target::from_triple(&triple)?;
+    let level = match options.optimization {
+        0 => OptimizationLevel::None,
+        1 => OptimizationLevel::Less,
+        2 => OptimizationLevel::Default,
+        _ => OptimizationLevel::Aggressive,
+    };
+    target
+        .create_target_machine(
+            &triple,
+            options.cpu.as_deref().unwrap_or("generic"),
+            &options.features,
+            level,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .ok_or_else(|| error("LLVM could not create the requested target machine"))
+}
+pub fn pointer_bits(options: &Options) -> Result<u32> {
+    Ok(target_machine(options)?
+        .get_target_data()
+        .get_pointer_byte_size(None)
+        * 8)
+}
+pub fn generate<'ctx>(
+    context: &'ctx Context,
+    program: &Program,
+    options: &Options,
+) -> Result<Generated<'ctx>> {
+    let machine = target_machine(options)?;
+    let module = context.create_module(&program.package);
+    module.set_triple(&machine.get_triple());
+    module.set_data_layout(&machine.get_target_data().get_data_layout());
+    let bits = machine.get_target_data().get_pointer_byte_size(None) * 8;
+    let mut cg = Codegen {
+        context,
+        module,
+        builder: context.create_builder(),
+        program,
+        structs: HashMap::new(),
+        functions: HashMap::new(),
+        globals: HashMap::new(),
+        scopes: vec![],
+        loops: vec![],
+        function: None,
+        return_type: Type::Void,
+        bits,
+    };
+    cg.declare_types()?;
+    cg.declare_functions()?;
+    cg.declare_constants()?;
+    for f in &program.functions {
+        if f.body.is_some() && f.generics.is_empty() {
+            cg.function(f)?;
+        }
+    }
+    if options.entry {
+        cg.entry()?;
+    }
+    cg.module
+        .verify()
+        .map_err(|e| error(format!("LLVM verification failed: {e}")))?;
+    let passes = format!("default<O{}>", options.optimization.min(3));
+    cg.module
+        .run_passes(&passes, &machine, PassBuilderOptions::create())?;
+    cg.module
+        .verify()
+        .map_err(|e| error(format!("optimized LLVM verification failed: {e}")))?;
+    Ok(Generated {
+        module: cg.module,
+        machine,
+    })
+}
+
+#[derive(Clone)]
+struct Binding<'ctx> {
+    name: String,
+    ty: Type,
+    ptr: PointerValue<'ctx>,
+    live: Option<PointerValue<'ctx>>,
+}
+#[derive(Clone, Copy)]
+struct Loop<'ctx> {
+    end: BasicBlock<'ctx>,
+    next: BasicBlock<'ctx>,
+    depth: usize,
+}
+struct Codegen<'a, 'ctx> {
+    context: &'ctx Context,
+    module: Module<'ctx>,
+    builder: Builder<'ctx>,
+    program: &'a Program,
+    structs: HashMap<String, StructType<'ctx>>,
+    functions: HashMap<String, FunctionValue<'ctx>>,
+    globals: HashMap<String, (PointerValue<'ctx>, Type)>,
+    scopes: Vec<Vec<Binding<'ctx>>>,
+    loops: Vec<Loop<'ctx>>,
+    function: Option<FunctionValue<'ctx>>,
+    return_type: Type,
+    bits: u32,
+}
+impl<'a, 'ctx> Codegen<'a, 'ctx> {
+    fn ty(&self, t: &Type) -> Result<BasicTypeEnum<'ctx>> {
+        Ok(match t {
+            Type::Bool => self.context.bool_type().into(),
+            Type::Int { bits, .. } => self
+                .context
+                .custom_width_int_type(
+                    std::num::NonZeroU32::new(if *bits == 0 { self.bits } else { *bits }).unwrap(),
+                )
+                .unwrap()
+                .into(),
+            Type::Float(32) => self.context.f32_type().into(),
+            Type::Float(64) => self.context.f64_type().into(),
+            Type::Ref(..) | Type::Raw(..) => self.context.ptr_type(AddressSpace::default()).into(),
+            Type::Slice(..) | Type::Str => self
+                .context
+                .struct_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.usize_type().into(),
+                    ],
+                    false,
+                )
+                .into(),
+            Type::Array(n, t) => self
+                .ty(t)?
+                .array_type(u32::try_from(*n).map_err(|_| error("array is too large for LLVM"))?)
+                .into(),
+            Type::Named(n) => self
+                .structs
+                .get(n)
+                .copied()
+                .ok_or_else(|| error(format!("unresolved type {n}")))?
+                .into(),
+            Type::Result(t, e) => self
+                .context
+                .struct_type(
+                    &[
+                        self.context.bool_type().into(),
+                        self.storage_ty(t)?,
+                        self.storage_ty(e)?,
+                    ],
+                    false,
+                )
+                .into(),
+            Type::Option(t) => self
+                .context
+                .struct_type(
+                    &[self.context.bool_type().into(), self.storage_ty(t)?],
+                    false,
+                )
+                .into(),
+            _ => return Err(error(format!("cannot lower type {t}"))),
+        })
+    }
+    fn storage_ty(&self, t: &Type) -> Result<BasicTypeEnum<'ctx>> {
+        if *t == Type::Void {
+            Ok(self.context.i8_type().into())
+        } else {
+            self.ty(t)
+        }
+    }
+    fn usize_type(&self) -> inkwell::types::IntType<'ctx> {
+        self.context
+            .custom_width_int_type(std::num::NonZeroU32::new(self.bits).unwrap())
+            .unwrap()
+    }
+    fn declare_types(&mut self) -> Result<()> {
+        for s in &self.program.structs {
+            if s.generics.is_empty() {
+                self.structs
+                    .insert(s.name.clone(), self.context.opaque_struct_type(&s.name));
+            }
+        }
+        for e in &self.program.enums {
+            if e.generics.is_empty() {
+                self.structs
+                    .insert(e.name.clone(), self.context.opaque_struct_type(&e.name));
+            }
+        }
+        for s in &self.program.structs {
+            if s.generics.is_empty() {
+                let ts = s
+                    .fields
+                    .iter()
+                    .map(|f| self.ty(&f.ty))
+                    .collect::<Result<Vec<_>>>()?;
+                self.structs[&s.name].set_body(&ts, false);
+            }
+        }
+        for e in &self.program.enums {
+            if e.generics.is_empty() {
+                let mut ts = vec![self.context.i32_type().into()];
+                for v in &e.variants {
+                    let fs = v
+                        .fields
+                        .iter()
+                        .map(|f| self.ty(&f.ty))
+                        .collect::<Result<Vec<_>>>()?;
+                    ts.push(self.context.struct_type(&fs, false).into());
+                }
+                self.structs[&e.name].set_body(&ts, false);
+            }
+        }
+        Ok(())
+    }
+    fn declare_functions(&mut self) -> Result<()> {
+        for f in &self.program.functions {
+            if !f.generics.is_empty() {
+                continue;
+            }
+            let params = f
+                .params
+                .iter()
+                .map(|p| self.ty(&p.ty).map(BasicMetadataTypeEnum::from))
+                .collect::<Result<Vec<_>>>()?;
+            let ty = if f.ret == Type::Void {
+                self.context.void_type().fn_type(&params, false)
+            } else {
+                self.ty(&f.ret)?.fn_type(&params, false)
+            };
+            let symbol = if f.extern_ {
+                f.name.rsplit('.').next().unwrap_or(&f.name).to_owned()
+            } else {
+                format!("dodo.{}.{}", self.program.package, f.name)
+            };
+            let linkage = if f.extern_ || f.public || f.name == "main" {
+                Linkage::External
+            } else {
+                Linkage::Internal
+            };
+            let function = if let Some(existing) = self.module.get_function(&symbol) {
+                if !f.extern_ || existing.get_type() != ty {
+                    return Err(error(format!(
+                        "incompatible declarations of external symbol `{symbol}`"
+                    )));
+                }
+                existing
+            } else {
+                self.module.add_function(&symbol, ty, Some(linkage))
+            };
+            if f.extern_ {
+                for (location, attribute) in self.c_abi_attributes(f) {
+                    function.add_attribute(location, attribute);
+                }
+            }
+            self.functions.insert(f.name.clone(), function);
+        }
+        Ok(())
+    }
+    fn c_abi_attributes(&self, function: &Function) -> Vec<(AttributeLoc, Attribute)> {
+        let triple = self.module.get_triple();
+        let triple = triple.as_str().to_string_lossy();
+        // SysV x86 C promotes narrow arguments/results in registers. LLVM needs
+        // this promise on both declarations and calls (LangRef parameter attrs).
+        let x86 = ["x86_64-", "i386-", "i486-", "i586-", "i686-"]
+            .iter()
+            .any(|arch| triple.starts_with(arch));
+        if !x86 || triple.contains("windows") {
+            return Vec::new();
+        }
+        std::iter::once((AttributeLoc::Return, &function.ret))
+            .chain(
+                function
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (AttributeLoc::Param(i as u32), &p.ty)),
+            )
+            .filter_map(|(location, ty)| {
+                let name = match ty {
+                    Type::Bool => "zeroext",
+                    Type::Int {
+                        signed,
+                        bits: 8 | 16,
+                    } => {
+                        if *signed {
+                            "signext"
+                        } else {
+                            "zeroext"
+                        }
+                    }
+                    _ => return None,
+                };
+                Some((
+                    location,
+                    self.context
+                        .create_enum_attribute(Attribute::get_named_enum_kind_id(name), 0),
+                ))
+            })
+            .collect()
+    }
+    fn declare_constants(&mut self) -> Result<()> {
+        for c in &self.program.constants {
+            let val = self.constant(&c.value)?;
+            let g = self.module.add_global(
+                self.ty(&c.ty)?,
+                None,
+                &format!("dodo.{}.{}", self.program.package, c.name),
+            );
+            g.set_initializer(&val);
+            g.set_constant(!c.mutable);
+            g.set_linkage(if c.public {
+                Linkage::External
+            } else {
+                Linkage::Internal
+            });
+            self.globals
+                .insert(c.name.clone(), (g.as_pointer_value(), c.ty.clone()));
+        }
+        Ok(())
+    }
+    fn string_literal(&self, bytes: &[u8]) -> BasicValueEnum<'ctx> {
+        let data = self.context.const_string(bytes, false);
+        let g = self.module.add_global(data.get_type(), None, "string");
+        g.set_initializer(&data);
+        g.set_constant(true);
+        g.set_linkage(Linkage::Private);
+        g.set_unnamed_addr(true);
+        self.context
+            .struct_type(
+                &[
+                    self.context.ptr_type(AddressSpace::default()).into(),
+                    self.usize_type().into(),
+                ],
+                false,
+            )
+            .const_named_struct(&[
+                g.as_pointer_value().into(),
+                self.usize_type()
+                    .const_int(bytes.len() as u64, false)
+                    .into(),
+            ])
+            .into()
+    }
+    fn constant(&self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
+        match &e.kind {
+            ExprKind::String(bytes, _) => Ok(self.string_literal(bytes)),
+            ExprKind::Name(n) => {
+                let c = self
+                    .program
+                    .constants
+                    .iter()
+                    .find(|c| c.name == *n)
+                    .ok_or_else(|| error("unknown constant"))?;
+                self.constant(&c.value)
+            }
+            ExprKind::Array(_, xs) => {
+                let Type::Array(_, t) = &e.ty else {
+                    return Err(error("invalid array constant"));
+                };
+                let vals = xs
+                    .iter()
+                    .map(|x| self.constant(x))
+                    .collect::<Result<Vec<_>>>()?;
+                self.const_array(t, &vals)
+            }
+            ExprKind::Struct(n, fields) => {
+                let decl = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|s| s.name == *n)
+                    .ok_or_else(|| error("unknown constant struct"))?;
+                let values = decl
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        let (_, e) = fields
+                            .iter()
+                            .find(|(n, _)| *n == f.name)
+                            .ok_or_else(|| error("missing constant field"))?;
+                        self.constant(e)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(self
+                    .ty(&e.ty)?
+                    .into_struct_type()
+                    .const_named_struct(&values)
+                    .into())
+            }
+            _ => {
+                use crate::consteval::Scalar;
+                Ok(match crate::consteval::eval(e, self.bits).map_err(error)? {
+                    Scalar::Int(v) => self
+                        .ty(&e.ty)?
+                        .into_int_type()
+                        .const_int(v as u64, false)
+                        .into(),
+                    Scalar::Float(v) => self.ty(&e.ty)?.into_float_type().const_float(v).into(),
+                    Scalar::Bool(v) => self.context.bool_type().const_int(v as u64, false).into(),
+                })
+            }
+        }
+    }
+    fn const_array(&self, t: &Type, vs: &[BasicValueEnum<'ctx>]) -> Result<BasicValueEnum<'ctx>> {
+        use inkwell::types::BasicTypeEnum::*;
+        Ok(match self.ty(t)? {
+            IntType(t) => t
+                .const_array(&vs.iter().map(|v| v.into_int_value()).collect::<Vec<_>>())
+                .into(),
+            FloatType(t) => t
+                .const_array(&vs.iter().map(|v| v.into_float_value()).collect::<Vec<_>>())
+                .into(),
+            StructType(t) => t
+                .const_array(&vs.iter().map(|v| v.into_struct_value()).collect::<Vec<_>>())
+                .into(),
+            ArrayType(t) => t
+                .const_array(&vs.iter().map(|v| v.into_array_value()).collect::<Vec<_>>())
+                .into(),
+            PointerType(t) => t
+                .const_array(
+                    &vs.iter()
+                        .map(|v| v.into_pointer_value())
+                        .collect::<Vec<_>>(),
+                )
+                .into(),
+            _ => return Err(error("unsupported constant array element")),
+        })
+    }
+    fn function(&mut self, f: &Function) -> Result<()> {
+        let function = self.functions[&f.name];
+        self.function = Some(function);
+        self.return_type = f.ret.clone();
+        self.scopes = vec![vec![]];
+        self.loops.clear();
+        self.builder
+            .position_at_end(self.context.append_basic_block(function, "entry"));
+        for (p, v) in f.params.iter().zip(function.get_param_iter()) {
+            self.bind(&p.name, &p.ty, Some(v))?;
+        }
+        self.block(f.body.as_ref().unwrap())?;
+        if !self.terminated() {
+            self.cleanup_to(0)?;
+            if f.ret == Type::Void {
+                self.builder.build_return(None)?;
+            } else {
+                self.builder.build_unreachable()?;
+            }
+        }
+        self.scopes.clear();
+        Ok(())
+    }
+    fn entry(&mut self) -> Result<()> {
+        let f = self
+            .program
+            .functions
+            .iter()
+            .find(|f| f.name == "main" && !f.extern_)
+            .ok_or_else(|| error("executable requires fn main() -> i32 or -> void"))?;
+        if !f.params.is_empty()
+            || !matches!(
+                f.ret,
+                Type::Void
+                    | Type::Int {
+                        signed: true,
+                        bits: 32
+                    }
+            )
+        {
+            return Err(error(
+                "main must have signature fn main() -> i32 or fn main() -> void",
+            ));
+        }
+        if self.module.get_function("main").is_some() {
+            return Err(error("extern main conflicts with the hosted entry point"));
+        }
+        let entry =
+            self.module
+                .add_function("main", self.context.i32_type().fn_type(&[], false), None);
+        self.builder
+            .position_at_end(self.context.append_basic_block(entry, "entry"));
+        let call = self
+            .builder
+            .build_call(self.functions["main"], &[], "dodo.main")?;
+        let value = call
+            .try_as_basic_value()
+            .basic()
+            .unwrap_or(self.context.i32_type().const_zero().into());
+        self.builder.build_return(Some(&value))?;
+        Ok(())
+    }
+    fn terminated(&self) -> bool {
+        self.builder
+            .get_insert_block()
+            .is_some_and(|b| b.get_terminator().is_some())
+    }
+    fn bb(&self, name: &str) -> BasicBlock<'ctx> {
+        self.context
+            .append_basic_block(self.function.unwrap(), name)
+    }
+    fn alloca(&self, t: BasicTypeEnum<'ctx>, name: &str) -> Result<PointerValue<'ctx>> {
+        let b = self.context.create_builder();
+        let entry = self.function.unwrap().get_first_basic_block().unwrap();
+        if let Some(i) = entry.get_first_instruction() {
+            b.position_before(&i)
+        } else {
+            b.position_at_end(entry)
+        };
+        Ok(b.build_alloca(t, name)?)
+    }
+    fn bind(
+        &mut self,
+        name: &str,
+        ty: &Type,
+        value: Option<BasicValueEnum<'ctx>>,
+    ) -> Result<Binding<'ctx>> {
+        let ptr = self.alloca(self.ty(ty)?, name)?;
+        if let Some(v) = value {
+            self.builder.build_store(ptr, v)?;
+        }
+        let live = if self.needs_drop(ty) {
+            let flag = self.alloca(self.context.bool_type().into(), "initialized")?;
+            // A temporary may be created only in a short-circuit branch. Its
+            // cleanup flag must still be defined along the skipped path.
+            let entry_builder = self.context.create_builder();
+            let allocation = flag.as_instruction_value().unwrap();
+            if let Some(next) = allocation.get_next_instruction() {
+                entry_builder.position_before(&next);
+            } else {
+                entry_builder
+                    .position_at_end(self.function.unwrap().get_first_basic_block().unwrap());
+            }
+            entry_builder.build_store(flag, self.context.bool_type().const_zero())?;
+            self.builder.build_store(
+                flag,
+                self.context
+                    .bool_type()
+                    .const_int(value.is_some() as u64, false),
+            )?;
+            Some(flag)
+        } else {
+            None
+        };
+        let binding = Binding {
+            name: name.into(),
+            ty: ty.clone(),
+            ptr,
+            live,
+        };
+        self.scopes.last_mut().unwrap().push(binding.clone());
+        Ok(binding)
+    }
+    fn binding(&self, name: &str) -> Option<Binding<'ctx>> {
+        self.scopes
+            .iter()
+            .rev()
+            .flat_map(|s| s.iter().rev())
+            .find(|b| b.name == name)
+            .cloned()
+    }
+    fn load(&self, ptr: PointerValue<'ctx>, t: &Type) -> Result<BasicValueEnum<'ctx>> {
+        Ok(self.builder.build_load(self.ty(t)?, ptr, "value")?)
+    }
+    fn consume(&self, e: &Expr) -> Result<()> {
+        if !e.ty.is_copy()
+            && let ExprKind::Name(n) = &e.kind
+            && let Some(b) = self.binding(n)
+            && let Some(p) = b.live
+        {
+            self.builder
+                .build_store(p, self.context.bool_type().const_zero())?;
+        }
+        Ok(())
+    }
+    fn cleanup_to(&mut self, depth: usize) -> Result<()> {
+        let bindings = self.scopes[depth..]
+            .iter()
+            .rev()
+            .flat_map(|s| s.iter().rev().cloned())
+            .collect::<Vec<_>>();
+        for b in bindings {
+            self.drop_binding(&b)?;
+        }
+        Ok(())
+    }
+    fn drop_binding(&mut self, b: &Binding<'ctx>) -> Result<()> {
+        if let Some(flag) = b.live {
+            let live = self
+                .builder
+                .build_load(self.context.bool_type(), flag, "live")?
+                .into_int_value();
+            let yes = self.bb("drop");
+            let done = self.bb("drop.done");
+            self.builder.build_conditional_branch(live, yes, done)?;
+            self.builder.position_at_end(yes);
+            self.drop_ptr(b.ptr, &b.ty)?;
+            self.builder
+                .build_store(flag, self.context.bool_type().const_zero())?;
+            self.builder.build_unconditional_branch(done)?;
+            self.builder.position_at_end(done);
+        }
+        Ok(())
+    }
+    fn needs_drop(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Named(n) => {
+                self.functions.contains_key(&format!("{n}.drop"))
+                    || self
+                        .program
+                        .structs
+                        .iter()
+                        .find(|s| s.name == *n)
+                        .is_some_and(|s| s.fields.iter().any(|f| self.needs_drop(&f.ty)))
+                    || self
+                        .program
+                        .enums
+                        .iter()
+                        .find(|e| e.name == *n)
+                        .is_some_and(|e| {
+                            e.variants
+                                .iter()
+                                .any(|v| v.fields.iter().any(|f| self.needs_drop(&f.ty)))
+                        })
+            }
+            Type::Array(_, t) | Type::Option(t) => self.needs_drop(t),
+            Type::Result(t, e) => self.needs_drop(t) || self.needs_drop(e),
+            _ => false,
+        }
+    }
+    fn drop_ptr(&mut self, ptr: PointerValue<'ctx>, ty: &Type) -> Result<()> {
+        if !self.needs_drop(ty) {
+            return Ok(());
+        }
+        match ty {
+            Type::Named(n) => {
+                if let Some(s) = self.program.structs.iter().find(|s| s.name == *n).cloned() {
+                    if let Some(f) = self.functions.get(&format!("{n}.drop")).copied() {
+                        self.builder.build_call(f, &[ptr.into()], "")?;
+                    }
+                    for (i, field) in s.fields.iter().enumerate().rev() {
+                        let p = self.builder.build_struct_gep(
+                            self.ty(ty)?.into_struct_type(),
+                            ptr,
+                            i as u32,
+                            "drop.field",
+                        )?;
+                        self.drop_ptr(p, &field.ty)?;
+                    }
+                } else if let Some(e) = self.program.enums.iter().find(|e| e.name == *n).cloned() {
+                    let st = self.ty(ty)?.into_struct_type();
+                    let tagptr = self.builder.build_struct_gep(st, ptr, 0, "tag")?;
+                    let tag = self
+                        .builder
+                        .build_load(self.context.i32_type(), tagptr, "tag")?
+                        .into_int_value();
+                    let end = self.bb("drop.enum.end");
+                    let cases = e
+                        .variants
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| {
+                            (
+                                self.context.i32_type().const_int(i as u64, false),
+                                self.bb("drop.variant"),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    self.builder.build_switch(tag, end, &cases)?;
+                    for ((_, block), (i, v)) in cases.iter().zip(e.variants.iter().enumerate()) {
+                        self.builder.position_at_end(*block);
+                        let p =
+                            self.builder
+                                .build_struct_gep(st, ptr, (i + 1) as u32, "payload")?;
+                        let pt = st
+                            .get_field_type_at_index((i + 1) as u32)
+                            .unwrap()
+                            .into_struct_type();
+                        for (j, f) in v.fields.iter().enumerate().rev() {
+                            let fp = self.builder.build_struct_gep(pt, p, j as u32, "field")?;
+                            self.drop_ptr(fp, &f.ty)?;
+                        }
+                        self.builder.build_unconditional_branch(end)?;
+                    }
+                    self.builder.position_at_end(end);
+                }
+            }
+            Type::Array(n, t) => {
+                for i in (0..*n).rev() {
+                    let p =
+                        self.array_gep(ptr, ty, self.usize_type().const_int(i as u64, false))?;
+                    self.drop_ptr(p, t)?;
+                }
+            }
+            Type::Result(t, e) => {
+                let st = self.ty(ty)?.into_struct_type();
+                let tagptr = self.builder.build_struct_gep(st, ptr, 0, "tag")?;
+                let tag = self
+                    .builder
+                    .build_load(self.context.bool_type(), tagptr, "tag")?
+                    .into_int_value();
+                let ok = self.bb("drop.ok");
+                let err = self.bb("drop.err");
+                let end = self.bb("drop.result.end");
+                self.builder.build_conditional_branch(tag, err, ok)?;
+                for (bb, idx, t) in [(ok, 1, t), (err, 2, e)] {
+                    self.builder.position_at_end(bb);
+                    if **t != Type::Void {
+                        let p = self.builder.build_struct_gep(st, ptr, idx, "payload")?;
+                        self.drop_ptr(p, t)?;
+                    }
+                    self.builder.build_unconditional_branch(end)?;
+                }
+                self.builder.position_at_end(end);
+            }
+            Type::Option(t) => {
+                let st = self.ty(ty)?.into_struct_type();
+                let tp = self.builder.build_struct_gep(st, ptr, 0, "tag")?;
+                let tag = self
+                    .builder
+                    .build_load(self.context.bool_type(), tp, "tag")?
+                    .into_int_value();
+                let some = self.bb("drop.some");
+                let end = self.bb("drop.option.end");
+                self.builder.build_conditional_branch(tag, some, end)?;
+                self.builder.position_at_end(some);
+                let p = self.builder.build_struct_gep(st, ptr, 1, "payload")?;
+                self.drop_ptr(p, t)?;
+                self.builder.build_unconditional_branch(end)?;
+                self.builder.position_at_end(end);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn block(&mut self, block: &Block) -> Result<()> {
+        self.scopes.push(vec![]);
+        for s in block {
+            if self.terminated() {
+                break;
+            }
+            self.stmt(s)?;
+        }
+        if !self.terminated() {
+            self.cleanup_to(self.scopes.len() - 1)?;
+        }
+        self.scopes.pop();
+        Ok(())
+    }
+    fn stmt(&mut self, s: &Stmt) -> Result<()> {
+        match &s.kind {
+            StmtKind::Let {
+                name, ty, value, ..
+            } => {
+                let v = value.as_ref().map(|v| self.expr(v)).transpose()?;
+                self.bind(name, ty, v)?;
+            }
+            StmtKind::Assign { target, op, value } => {
+                if matches!(&target.kind,ExprKind::Name(n) if n=="_") {
+                    let v = self.expr(value)?;
+                    if !value.ty.is_copy() {
+                        let p = self.alloca(self.ty(&value.ty)?, "discard")?;
+                        self.builder.build_store(p, v)?;
+                        self.drop_ptr(p, &value.ty)?;
+                    }
+                    return Ok(());
+                }
+                let ptr = self.place(target)?;
+                let old = if op.is_some() {
+                    Some(self.load(ptr, &target.ty)?)
+                } else {
+                    None
+                };
+                let rhs = self.expr(value)?;
+                let v = if let Some(op) = op {
+                    self.binary(*op, old.unwrap(), rhs, &target.ty)?
+                } else {
+                    rhs
+                };
+                if op.is_none() && !target.ty.is_copy() {
+                    if let ExprKind::Name(n) = &target.kind {
+                        if let Some(b) = self.binding(n) {
+                            self.drop_binding(&b)?;
+                        }
+                    } else {
+                        self.drop_ptr(ptr, &target.ty)?;
+                    }
+                }
+                self.builder.build_store(ptr, v)?;
+                if let ExprKind::Name(n) = &target.kind
+                    && let Some(b) = self.binding(n)
+                    && let Some(f) = b.live
+                {
+                    self.builder
+                        .build_store(f, self.context.bool_type().const_int(1, false))?;
+                }
+            }
+            StmtKind::Expr(e) => {
+                let v = self.expr(e)?;
+                if !e.ty.is_copy() {
+                    let p = self.alloca(self.ty(&e.ty)?, "temporary")?;
+                    self.builder.build_store(p, v)?;
+                    self.drop_ptr(p, &e.ty)?;
+                }
+            }
+            StmtKind::Return(e) => {
+                let v = e.as_ref().map(|v| self.expr(v)).transpose()?;
+                self.cleanup_to(0)?;
+                if self.return_type == Type::Void {
+                    self.builder.build_return(None)?;
+                } else if let Some(v) = v {
+                    self.builder.build_return(Some(&v))?;
+                } else {
+                    return Err(error("non-void return is missing its value"));
+                }
+            }
+            StmtKind::Block(b) | StmtKind::Unsafe(b) => self.block(b)?,
+            StmtKind::If {
+                condition,
+                then_block,
+                else_block,
+            } => {
+                let c = self.expr(condition)?.into_int_value();
+                let yes = self.bb("if.then");
+                let no = self.bb("if.else");
+                let end = self.bb("if.end");
+                self.builder.build_conditional_branch(c, yes, no)?;
+                self.builder.position_at_end(yes);
+                self.block(then_block)?;
+                let yes_ends = self.terminated();
+                if !yes_ends {
+                    self.builder.build_unconditional_branch(end)?;
+                }
+                self.builder.position_at_end(no);
+                self.block(else_block)?;
+                let no_ends = self.terminated();
+                if !no_ends {
+                    self.builder.build_unconditional_branch(end)?;
+                }
+                self.builder.position_at_end(end);
+                if yes_ends && no_ends {
+                    self.builder.build_unreachable()?;
+                }
+            }
+            StmtKind::For {
+                init,
+                condition,
+                step,
+                body,
+            } => {
+                self.scopes.push(vec![]);
+                if let Some(s) = init {
+                    self.stmt(s)?;
+                }
+                let head = self.bb("for.condition");
+                let body_bb = self.bb("for.body");
+                let step_bb = self.bb("for.step");
+                let end = self.bb("for.end");
+                self.builder.build_unconditional_branch(head)?;
+                self.builder.position_at_end(head);
+                if let Some(c) = condition {
+                    let v = self.expr(c)?.into_int_value();
+                    self.builder.build_conditional_branch(v, body_bb, end)?;
+                } else {
+                    self.builder.build_unconditional_branch(body_bb)?;
+                }
+                self.loops.push(Loop {
+                    end,
+                    next: step_bb,
+                    depth: self.scopes.len(),
+                });
+                self.builder.position_at_end(body_bb);
+                self.block(body)?;
+                if !self.terminated() {
+                    self.builder.build_unconditional_branch(step_bb)?;
+                }
+                self.builder.position_at_end(step_bb);
+                if let Some(s) = step {
+                    self.stmt(s)?;
+                }
+                if !self.terminated() {
+                    self.builder.build_unconditional_branch(head)?;
+                }
+                self.loops.pop();
+                self.builder.position_at_end(end);
+                self.cleanup_to(self.scopes.len() - 1)?;
+                self.scopes.pop();
+            }
+            StmtKind::ForEach {
+                index,
+                name,
+                iterable,
+                body,
+            } => self.foreach(index.as_deref(), name, iterable, body)?,
+            StmtKind::Break | StmtKind::Continue => {
+                let l = *self
+                    .loops
+                    .last()
+                    .ok_or_else(|| error("loop control outside loop"))?;
+                self.cleanup_to(l.depth)?;
+                self.builder
+                    .build_unconditional_branch(if matches!(s.kind, StmtKind::Break) {
+                        l.end
+                    } else {
+                        l.next
+                    })?;
+            }
+            StmtKind::Match { value, arms } => self.match_stmt(value, arms)?,
+        }
+        Ok(())
+    }
+    fn stage(
+        &mut self,
+        expression: &Expr,
+        pending: &mut Vec<PointerValue<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let value = self.expr(expression)?;
+        if self.needs_drop(&expression.ty) {
+            let binding = self.bind("$pending", &expression.ty, Some(value))?;
+            if let Some(flag) = binding.live {
+                pending.push(flag);
+            }
+        }
+        Ok(value)
+    }
+    fn transfer(&self, pending: &[PointerValue<'ctx>]) -> Result<()> {
+        for flag in pending {
+            self.builder
+                .build_store(*flag, self.context.bool_type().const_zero())?;
+        }
+        Ok(())
+    }
+    fn expr(&mut self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
+        let value = match &e.kind {
+            ExprKind::Int(v, _) => self.ty(&e.ty)?.into_int_type().const_int(*v, false).into(),
+            ExprKind::Float(v, _) => self.ty(&e.ty)?.into_float_type().const_float(*v).into(),
+            ExprKind::Bool(v) => self.context.bool_type().const_int(*v as u64, false).into(),
+            ExprKind::String(bytes, _) => self.string_literal(bytes),
+            ExprKind::Name(n) => {
+                if n == "none" {
+                    self.ty(&e.ty)?.const_zero()
+                } else if let Some(b) = self.binding(n) {
+                    self.load(b.ptr, &b.ty)?
+                } else if let Some((p, t)) = self.globals.get(n).cloned() {
+                    self.load(p, &t)?
+                } else {
+                    return Err(error(format!("unknown value {n}")));
+                }
+            }
+            ExprKind::Array(_, xs) => {
+                let mut array = self.ty(&e.ty)?.into_array_type().const_zero();
+                let mut pending = Vec::new();
+                for (i, x) in xs.iter().enumerate() {
+                    let v = self.stage(x, &mut pending)?;
+                    array = self
+                        .builder
+                        .build_insert_value(array, v, i as u32, "array")?
+                        .into_array_value();
+                }
+                self.transfer(&pending)?;
+                array.into()
+            }
+            ExprKind::Struct(n, fields) => {
+                let st = self
+                    .structs
+                    .get(n)
+                    .copied()
+                    .ok_or_else(|| error(format!("unknown struct {n}")))?;
+                let decl = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|s| s.name == *n)
+                    .unwrap()
+                    .clone();
+                let mut v = st.const_zero();
+                let mut pending = Vec::new();
+                for (name, e) in fields {
+                    let i = decl
+                        .fields
+                        .iter()
+                        .position(|f| f.name == *name)
+                        .ok_or_else(|| error("unknown field"))?;
+                    let x = self.stage(e, &mut pending)?;
+                    v = self
+                        .builder
+                        .build_insert_value(v, x, i as u32, "struct")?
+                        .into_struct_value();
+                }
+                self.transfer(&pending)?;
+                v.into()
+            }
+            ExprKind::Unary(op, x) => match op {
+                UnaryOp::Borrow | UnaryOp::BorrowMut => {
+                    let ptr = self.place(x)?;
+                    if let Type::Slice(_, _) = &e.ty {
+                        match &x.ty {
+                            Type::Array(n, _) => {
+                                let mut v = self.ty(&e.ty)?.into_struct_type().const_zero();
+                                v = self
+                                    .builder
+                                    .build_insert_value(v, ptr, 0, "slice.ptr")?
+                                    .into_struct_value();
+                                self.builder
+                                    .build_insert_value(
+                                        v,
+                                        self.usize_type().const_int(*n as u64, false),
+                                        1,
+                                        "slice.len",
+                                    )?
+                                    .into_struct_value()
+                                    .into()
+                            }
+                            _ => self.load(ptr, &e.ty)?,
+                        }
+                    } else {
+                        ptr.into()
+                    }
+                }
+                UnaryOp::Deref => {
+                    let p = self.expr(x)?.into_pointer_value();
+                    self.load(p, &e.ty)?
+                }
+                UnaryOp::Neg => {
+                    if let ExprKind::Int(v, _) = x.kind {
+                        self.ty(&e.ty)?
+                            .into_int_type()
+                            .const_int(v, false)
+                            .const_neg()
+                            .into()
+                    } else {
+                        let v = self.expr(x)?;
+                        if e.ty.is_integer() {
+                            self.binary(BinaryOp::Sub, self.ty(&e.ty)?.const_zero(), v, &e.ty)?
+                        } else {
+                            self.builder
+                                .build_float_neg(v.into_float_value(), "neg")?
+                                .into()
+                        }
+                    }
+                }
+                UnaryOp::Not | UnaryOp::BitNot => {
+                    let v = self.expr(x)?.into_int_value();
+                    self.builder.build_not(v, "not")?.into()
+                }
+            },
+            ExprKind::Binary(op, l, r) => {
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    self.short_circuit(*op, l, r)?
+                } else {
+                    let a = self.expr(l)?;
+                    let b = self.expr(r)?;
+                    self.binary(*op, a, b, &l.ty)?
+                }
+            }
+            ExprKind::Call {
+                name,
+                type_args,
+                args,
+            } => self.call(name, type_args, args, &e.ty)?,
+            ExprKind::MethodCall { .. } => {
+                return Err(error("unresolved method call reached code generation"));
+            }
+            ExprKind::Field(x, n) => {
+                if let ExprKind::Name(en) = &x.kind
+                    && let Some(decl) = self
+                        .program
+                        .enums
+                        .iter()
+                        .find(|en_decl| en_decl.name == *en)
+                {
+                    let idx = decl
+                        .variants
+                        .iter()
+                        .position(|v| v.name == *n)
+                        .ok_or_else(|| error("unknown enum variant"))?;
+                    let v = self.ty(&e.ty)?.into_struct_type().const_zero();
+                    return Ok(self
+                        .builder
+                        .build_insert_value(
+                            v,
+                            self.context.i32_type().const_int(idx as u64, false),
+                            0,
+                            "enum.tag",
+                        )?
+                        .into_struct_value()
+                        .into());
+                }
+                if n == "len" {
+                    self.collection(x)?.1.into()
+                } else {
+                    let p = self.place(e)?;
+                    self.load(p, &e.ty)?
+                }
+            }
+            ExprKind::Index(..) => {
+                let p = self.place(e)?;
+                self.load(p, &e.ty)?
+            }
+            ExprKind::Cast(x, t) => {
+                let v = self.expr(x)?;
+                self.cast(v, &x.ty, t)?
+            }
+            ExprKind::Try(x) => {
+                let v = self.expr(x)?.into_struct_value();
+                let tag = self
+                    .builder
+                    .build_extract_value(v, 0, "is.error")?
+                    .into_int_value();
+                let err = self.bb("propagate.error");
+                let ok = self.bb("propagate.ok");
+                self.builder.build_conditional_branch(tag, err, ok)?;
+                self.builder.position_at_end(err);
+                let mut ret = self.ty(&self.return_type)?.into_struct_type().const_zero();
+                ret = self
+                    .builder
+                    .build_insert_value(
+                        ret,
+                        self.context.bool_type().const_int(1, false),
+                        0,
+                        "result.tag",
+                    )?
+                    .into_struct_value();
+                let payload = self.builder.build_extract_value(v, 2, "error")?;
+                ret = self
+                    .builder
+                    .build_insert_value(ret, payload, 2, "result.error")?
+                    .into_struct_value();
+                self.cleanup_to(0)?;
+                self.builder.build_return(Some(&ret))?;
+                self.builder.position_at_end(ok);
+                self.builder.build_extract_value(v, 1, "success")?
+            }
+        };
+        self.consume(e)?;
+        Ok(value)
+    }
+    fn place(&mut self, e: &Expr) -> Result<PointerValue<'ctx>> {
+        match &e.kind {
+            ExprKind::Name(n) => self
+                .binding(n)
+                .map(|b| b.ptr)
+                .or_else(|| self.globals.get(n).map(|g| g.0))
+                .ok_or_else(|| error(format!("{n} has no address"))),
+            ExprKind::Unary(UnaryOp::Deref, x) => Ok(self.expr(x)?.into_pointer_value()),
+            ExprKind::Field(x, n) => {
+                let (p, t) = self.autoderef_place(x)?;
+                let Type::Named(name) = &t else {
+                    return Err(error("field access on non-struct"));
+                };
+                let decl = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|s| s.name == *name)
+                    .ok_or_else(|| error("unknown struct"))?;
+                let i = decl
+                    .fields
+                    .iter()
+                    .position(|f| f.name == *n)
+                    .ok_or_else(|| error(format!("unknown field {n}")))?;
+                Ok(self.builder.build_struct_gep(
+                    self.ty(&t)?.into_struct_type(),
+                    p,
+                    i as u32,
+                    "field.ptr",
+                )?)
+            }
+            ExprKind::Index(x, i) => {
+                let (ptr, len, t) = self.collection(x)?;
+                let idx = self.expr(i)?;
+                let wide = self.cast(idx, &i.ty, &Type::usize())?.into_int_value();
+                let in_bounds =
+                    self.builder
+                        .build_int_compare(IntPredicate::ULT, wide, len, "in.bounds")?;
+                self.guard(in_bounds)?;
+                // The bounds check dominates this GEP; no inbounds assumption is needed.
+                Ok(unsafe {
+                    self.builder
+                        .build_gep(self.ty(&t)?, ptr, &[wide], "element.ptr")?
+                })
+            }
+            _ => {
+                let v = self.expr(e)?;
+                Ok(self.bind("$temporary", &e.ty, Some(v))?.ptr)
+            }
+        }
+    }
+    fn autoderef_place(&mut self, e: &Expr) -> Result<(PointerValue<'ctx>, Type)> {
+        let mut ty = e.ty.clone();
+        let mut p = self.place(e)?;
+        while let Type::Ref(_, t) = ty {
+            p = self
+                .load(p, &Type::Ref(false, t.clone()))?
+                .into_pointer_value();
+            ty = *t;
+        }
+        Ok((p, ty))
+    }
+    fn collection(&mut self, e: &Expr) -> Result<(PointerValue<'ctx>, IntValue<'ctx>, Type)> {
+        match &e.ty {
+            Type::Array(n, t) => Ok((
+                self.place(e)?,
+                self.usize_type().const_int(*n as u64, false),
+                *t.clone(),
+            )),
+            Type::Ref(_, t) => {
+                let p = self.expr(e)?.into_pointer_value();
+                match &**t {
+                    Type::Array(n, t) => {
+                        Ok((p, self.usize_type().const_int(*n as u64, false), *t.clone()))
+                    }
+                    _ => Err(error("reference is not a collection")),
+                }
+            }
+            Type::Slice(_, t) => {
+                let v = self.expr(e)?.into_struct_value();
+                Ok((
+                    self.builder
+                        .build_extract_value(v, 0, "data")?
+                        .into_pointer_value(),
+                    self.builder
+                        .build_extract_value(v, 1, "len")?
+                        .into_int_value(),
+                    *t.clone(),
+                ))
+            }
+            Type::Str => {
+                let v = self.expr(e)?.into_struct_value();
+                Ok((
+                    self.builder
+                        .build_extract_value(v, 0, "data")?
+                        .into_pointer_value(),
+                    self.builder
+                        .build_extract_value(v, 1, "len")?
+                        .into_int_value(),
+                    Type::u8(),
+                ))
+            }
+            _ => Err(error(format!("{} is not an array or slice", e.ty))),
+        }
+    }
+    fn array_gep(
+        &self,
+        p: PointerValue<'ctx>,
+        t: &Type,
+        i: IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>> {
+        // Callers use a statically in-range index into an array of this exact type.
+        Ok(unsafe {
+            self.builder.build_gep(
+                self.ty(t)?,
+                p,
+                &[self.usize_type().const_zero(), i],
+                "array.element",
+            )?
+        })
+    }
+    fn guard(&mut self, valid: IntValue<'ctx>) -> Result<()> {
+        let ok = self.bb("checked");
+        let fail = self.bb("trap");
+        self.builder.build_conditional_branch(valid, ok, fail)?;
+        self.builder.position_at_end(fail);
+        let trap = Intrinsic::find("llvm.trap")
+            .and_then(|i| i.get_declaration(&self.module, &[]))
+            .ok_or_else(|| error("LLVM trap intrinsic is unavailable"))?;
+        self.builder.build_call(trap, &[], "")?;
+        self.builder.build_unreachable()?;
+        self.builder.position_at_end(ok);
+        Ok(())
+    }
+    fn short_circuit(&mut self, op: BinaryOp, l: &Expr, r: &Expr) -> Result<BasicValueEnum<'ctx>> {
+        let a = self.expr(l)?.into_int_value();
+        let left = self.builder.get_insert_block().unwrap();
+        let rhs = self.bb("logic.rhs");
+        let end = self.bb("logic.end");
+        if op == BinaryOp::And {
+            self.builder.build_conditional_branch(a, rhs, end)?;
+        } else {
+            self.builder.build_conditional_branch(a, end, rhs)?;
+        }
+        self.builder.position_at_end(rhs);
+        let b = self.expr(r)?.into_int_value();
+        let right = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(end)?;
+        self.builder.position_at_end(end);
+        let phi = self.builder.build_phi(self.context.bool_type(), "logic")?;
+        phi.add_incoming(&[(&a, left), (&b, right)]);
+        Ok(phi.as_basic_value())
+    }
+    fn binary(
+        &mut self,
+        op: BinaryOp,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+        t: &Type,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        use BinaryOp::*;
+        if matches!(t, Type::Float(_)) {
+            let a = a.into_float_value();
+            let b = b.into_float_value();
+            return Ok(match op {
+                Add => self.builder.build_float_add(a, b, "add")?.into(),
+                Sub => self.builder.build_float_sub(a, b, "sub")?.into(),
+                Mul => self.builder.build_float_mul(a, b, "mul")?.into(),
+                Div => self.builder.build_float_div(a, b, "div")?.into(),
+                Rem => self.builder.build_float_rem(a, b, "rem")?.into(),
+                Eq | Ne | Lt | Le | Gt | Ge => self
+                    .builder
+                    .build_float_compare(
+                        match op {
+                            Eq => FloatPredicate::OEQ,
+                            Ne => FloatPredicate::UNE,
+                            Lt => FloatPredicate::OLT,
+                            Le => FloatPredicate::OLE,
+                            Gt => FloatPredicate::OGT,
+                            _ => FloatPredicate::OGE,
+                        },
+                        a,
+                        b,
+                        "compare",
+                    )?
+                    .into(),
+                _ => return Err(error("invalid floating point operation")),
+            });
+        }
+        let (a, b) = if a.is_struct_value() {
+            (
+                self.builder
+                    .build_extract_value(a.into_struct_value(), 0, "tag")?
+                    .into_int_value(),
+                self.builder
+                    .build_extract_value(b.into_struct_value(), 0, "tag")?
+                    .into_int_value(),
+            )
+        } else if a.is_pointer_value() {
+            let ai = self.builder.build_ptr_to_int(
+                a.into_pointer_value(),
+                self.usize_type(),
+                "address",
+            )?;
+            let bi = self.builder.build_ptr_to_int(
+                b.into_pointer_value(),
+                self.usize_type(),
+                "address",
+            )?;
+            (ai, bi)
+        } else {
+            (a.into_int_value(), b.into_int_value())
+        };
+        let signed = matches!(t, Type::Int { signed: true, .. });
+        let ity = a.get_type();
+        Ok(match op {
+            Add | Sub | Mul => {
+                let name = format!(
+                    "llvm.{}{}.with.overflow",
+                    if signed { "s" } else { "u" },
+                    match op {
+                        Add => "add",
+                        Sub => "sub",
+                        _ => "mul",
+                    }
+                );
+                let intrinsic = Intrinsic::find(&name)
+                    .and_then(|i| i.get_declaration(&self.module, &[ity.into()]))
+                    .ok_or_else(|| error("overflow intrinsic unavailable"))?;
+                let out = self
+                    .builder
+                    .build_call(intrinsic, &[a.into(), b.into()], "checked.arithmetic")?
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap()
+                    .into_struct_value();
+                let overflow = self
+                    .builder
+                    .build_extract_value(out, 1, "overflow")?
+                    .into_int_value();
+                let valid = self.builder.build_not(overflow, "no.overflow")?;
+                self.guard(valid)?;
+                self.builder.build_extract_value(out, 0, "result")?
+            }
+            Div | Rem => {
+                let nz = self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    b,
+                    ity.const_zero(),
+                    "nonzero",
+                )?;
+                self.guard(nz)?;
+                if signed {
+                    let min = ity.const_int(1u64 << (ity.get_bit_width() - 1), false);
+                    let a_min =
+                        self.builder
+                            .build_int_compare(IntPredicate::EQ, a, min, "is.min")?;
+                    let b_neg = self.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        b,
+                        ity.const_all_ones(),
+                        "is.neg.one",
+                    )?;
+                    let bad = self.builder.build_and(a_min, b_neg, "division.overflow")?;
+                    let valid = self.builder.build_not(bad, "division.valid")?;
+                    self.guard(valid)?;
+                }
+                match (op, signed) {
+                    (Div, true) => self.builder.build_int_signed_div(a, b, "div")?.into(),
+                    (Div, false) => self.builder.build_int_unsigned_div(a, b, "div")?.into(),
+                    (_, true) => self.builder.build_int_signed_rem(a, b, "rem")?.into(),
+                    _ => self.builder.build_int_unsigned_rem(a, b, "rem")?.into(),
+                }
+            }
+            Eq | Ne | Lt | Le | Gt | Ge => self
+                .builder
+                .build_int_compare(
+                    match op {
+                        Eq => IntPredicate::EQ,
+                        Ne => IntPredicate::NE,
+                        Lt => {
+                            if signed {
+                                IntPredicate::SLT
+                            } else {
+                                IntPredicate::ULT
+                            }
+                        }
+                        Le => {
+                            if signed {
+                                IntPredicate::SLE
+                            } else {
+                                IntPredicate::ULE
+                            }
+                        }
+                        Gt => {
+                            if signed {
+                                IntPredicate::SGT
+                            } else {
+                                IntPredicate::UGT
+                            }
+                        }
+                        _ => {
+                            if signed {
+                                IntPredicate::SGE
+                            } else {
+                                IntPredicate::UGE
+                            }
+                        }
+                    },
+                    a,
+                    b,
+                    "compare",
+                )?
+                .into(),
+            BitAnd => self.builder.build_and(a, b, "and")?.into(),
+            BitOr => self.builder.build_or(a, b, "or")?.into(),
+            BitXor => self.builder.build_xor(a, b, "xor")?.into(),
+            Shl | Shr => {
+                let valid = self.builder.build_int_compare(
+                    IntPredicate::ULT,
+                    b,
+                    ity.const_int(ity.get_bit_width() as u64, false),
+                    "shift.valid",
+                )?;
+                self.guard(valid)?;
+                if op == Shl {
+                    let v = self.builder.build_left_shift(a, b, "shl")?;
+                    let back = self.builder.build_right_shift(v, b, signed, "shift.back")?;
+                    let fits =
+                        self.builder
+                            .build_int_compare(IntPredicate::EQ, back, a, "shift.fits")?;
+                    self.guard(fits)?;
+                    v.into()
+                } else {
+                    self.builder.build_right_shift(a, b, signed, "shr")?.into()
+                }
+            }
+            And | Or => return Err(error("logical operator must use short-circuit lowering")),
+        })
+    }
+    fn cast(
+        &mut self,
+        v: BasicValueEnum<'ctx>,
+        from: &Type,
+        to: &Type,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        match (from, to) {
+            (Type::Int { signed: fs, .. }, Type::Int { signed: ts, .. }) => {
+                let v = v.into_int_value();
+                let out = self.ty(to)?.into_int_type();
+                let source = v.get_type();
+                if *fs && !*ts {
+                    let nonnegative = self.builder.build_int_compare(
+                        IntPredicate::SGE,
+                        v,
+                        source.const_zero(),
+                        "cast.nonnegative",
+                    )?;
+                    self.guard(nonnegative)?;
+                }
+                let converted = self.builder.build_int_cast_sign_flag(v, out, *fs, "cast")?;
+                if out.get_bit_width() < source.get_bit_width() {
+                    let back = self.builder.build_int_cast_sign_flag(
+                        converted,
+                        source,
+                        *ts,
+                        "cast.back",
+                    )?;
+                    let fits =
+                        self.builder
+                            .build_int_compare(IntPredicate::EQ, back, v, "cast.fits")?;
+                    self.guard(fits)?;
+                }
+                if !*fs && *ts && out.get_bit_width() <= source.get_bit_width() {
+                    let max = (1u64 << (out.get_bit_width() - 1)) - 1;
+                    let fits = self.builder.build_int_compare(
+                        IntPredicate::ULE,
+                        v,
+                        source.const_int(max, false),
+                        "cast.fits",
+                    )?;
+                    self.guard(fits)?;
+                }
+                Ok(converted.into())
+            }
+            (Type::Int { signed, .. }, Type::Float(_)) => {
+                let t = self.ty(to)?.into_float_type();
+                Ok(if *signed {
+                    self.builder
+                        .build_signed_int_to_float(v.into_int_value(), t, "cast")?
+                        .into()
+                } else {
+                    self.builder
+                        .build_unsigned_int_to_float(v.into_int_value(), t, "cast")?
+                        .into()
+                })
+            }
+            (Type::Float(_), Type::Int { signed, .. }) => {
+                let v = v.into_float_value();
+                let t = self.ty(to)?.into_int_type();
+                let bits = t.get_bit_width();
+                let low = if *signed {
+                    -(2f64).powi(bits as i32 - 1)
+                } else {
+                    0.
+                };
+                let high = (2f64).powi(bits as i32 - if *signed { 1 } else { 0 });
+                let lo = self.builder.build_float_compare(
+                    FloatPredicate::OGE,
+                    v,
+                    v.get_type().const_float(low),
+                    "cast.lower",
+                )?;
+                let hi = self.builder.build_float_compare(
+                    FloatPredicate::OLT,
+                    v,
+                    v.get_type().const_float(high),
+                    "cast.upper",
+                )?;
+                let valid = self.builder.build_and(lo, hi, "cast.valid")?;
+                self.guard(valid)?;
+                Ok(if *signed {
+                    self.builder.build_float_to_signed_int(v, t, "cast")?.into()
+                } else {
+                    self.builder
+                        .build_float_to_unsigned_int(v, t, "cast")?
+                        .into()
+                })
+            }
+            (Type::Float(_), Type::Float(_)) => {
+                let source = v.into_float_value();
+                let target = self.ty(to)?.into_float_type();
+                let out = self.builder.build_float_cast(source, target, "cast")?;
+                if target.get_bit_width() < source.get_type().get_bit_width() {
+                    let max = source.get_type().const_float(f32::MAX as f64);
+                    let min = source.get_type().const_float(-(f32::MAX as f64));
+                    let hi = self.builder.build_float_compare(
+                        FloatPredicate::OLE,
+                        source,
+                        max,
+                        "cast.upper",
+                    )?;
+                    let lo = self.builder.build_float_compare(
+                        FloatPredicate::OGE,
+                        source,
+                        min,
+                        "cast.lower",
+                    )?;
+                    let valid = self.builder.build_and(hi, lo, "cast.fits")?;
+                    self.guard(valid)?;
+                }
+                Ok(out.into())
+            }
+            (Type::Raw(..) | Type::Ref(..), Type::Raw(..) | Type::Ref(..)) => Ok(v),
+            (Type::Int { .. }, Type::Raw(..)) => Ok(self
+                .builder
+                .build_int_to_ptr(
+                    v.into_int_value(),
+                    self.context.ptr_type(AddressSpace::default()),
+                    "pointer",
+                )?
+                .into()),
+            (Type::Raw(..), Type::Int { .. }) => Ok(self
+                .builder
+                .build_ptr_to_int(
+                    v.into_pointer_value(),
+                    self.ty(to)?.into_int_type(),
+                    "address",
+                )?
+                .into()),
+            _ if from == to => Ok(v),
+            _ => Err(error(format!(
+                "cannot lower conversion from {from} to {to}"
+            ))),
+        }
+    }
+    fn call(
+        &mut self,
+        name: &str,
+        type_args: &[Type],
+        args: &[Expr],
+        ret: &Type,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let unit = self.context.i8_type().const_zero().into();
+        if name == "ok" || name == "err" || name == "some" || name == "none" {
+            let mut v = self.ty(ret)?.into_struct_type().const_zero();
+            let tag = name == "err" || name == "some";
+            v = self
+                .builder
+                .build_insert_value(
+                    v,
+                    self.context.bool_type().const_int(tag as u64, false),
+                    0,
+                    "tag",
+                )?
+                .into_struct_value();
+            if let Some(e) = args.first() {
+                let x = self.expr(e)?;
+                v = self
+                    .builder
+                    .build_insert_value(v, x, if name == "err" { 2 } else { 1 }, "payload")?
+                    .into_struct_value();
+            }
+            return Ok(v.into());
+        }
+        if name == "core.drop" {
+            let e = &args[0];
+            let v = self.expr(e)?;
+            let ptr = self.alloca(self.ty(&e.ty)?, "drop.value")?;
+            self.builder.build_store(ptr, v)?;
+            self.drop_ptr(ptr, &e.ty)?;
+            return Ok(unit);
+        }
+        if matches!(
+            name,
+            "mem.size_of" | "core.mem.size_of" | "mem.align_of" | "core.mem.align_of"
+        ) {
+            let argument = type_args
+                .first()
+                .ok_or_else(|| error("memory query requires a type argument"))?;
+            if *argument == Type::Void {
+                return Ok(self
+                    .usize_type()
+                    .const_int(u64::from(name.ends_with("align_of")), false)
+                    .into());
+            }
+            let t = self.ty(argument)?;
+            let data = inkwell::targets::TargetData::create(
+                self.module
+                    .get_data_layout()
+                    .as_str()
+                    .to_str()
+                    .map_err(|_| error("invalid LLVM data layout"))?,
+            );
+            let value = if name.ends_with("size_of") {
+                data.get_abi_size(&t)
+            } else {
+                data.get_abi_alignment(&t) as u64
+            };
+            return Ok(self.usize_type().const_int(value, false).into());
+        }
+        let mmio = name
+            .strip_prefix("mmio.")
+            .or_else(|| name.strip_prefix("core.mmio."));
+        if let Some(op) = mmio {
+            let address = self.expr(&args[0])?.into_int_value();
+            let pointer = self.builder.build_int_to_ptr(
+                address,
+                self.context.ptr_type(AddressSpace::default()),
+                "mmio.address",
+            )?;
+            if op.starts_with("read") {
+                let value = self
+                    .builder
+                    .build_load(self.ty(ret)?, pointer, "mmio.read")?;
+                value
+                    .as_instruction_value()
+                    .unwrap()
+                    .set_volatile(true)
+                    .map_err(error)?;
+                return Ok(value);
+            }
+            if op.starts_with("write") {
+                let value = self.expr(&args[1])?;
+                self.builder
+                    .build_store(pointer, value)?
+                    .set_volatile(true)
+                    .map_err(error)?;
+                return Ok(unit);
+            }
+        }
+        if let Some(op) = name
+            .strip_prefix("ptr.")
+            .or_else(|| name.strip_prefix("core.ptr."))
+        {
+            let pointer = self.expr(&args[0])?.into_pointer_value();
+            match op {
+                "read" | "read_unaligned" | "read_volatile" => {
+                    let value = self
+                        .builder
+                        .build_load(self.ty(ret)?, pointer, "ptr.read")?;
+                    let i = value.as_instruction_value().unwrap();
+                    if op == "read_unaligned" {
+                        i.set_alignment(1).map_err(error)?;
+                    }
+                    if op == "read_volatile" {
+                        i.set_volatile(true).map_err(error)?;
+                    }
+                    return Ok(value);
+                }
+                "write" | "write_unaligned" | "write_volatile" => {
+                    let value = self.expr(&args[1])?;
+                    let i = self.builder.build_store(pointer, value)?;
+                    if op == "write_unaligned" {
+                        i.set_alignment(1).map_err(error)?;
+                    }
+                    if op == "write_volatile" {
+                        i.set_volatile(true).map_err(error)?;
+                    }
+                    return Ok(unit);
+                }
+                "offset" => {
+                    let offset = self.expr(&args[1])?.into_int_value();
+                    let Type::Raw(_, t) = ret else {
+                        return Err(error("pointer offset requires raw pointer"));
+                    };
+                    return Ok(unsafe {
+                        self.builder
+                            .build_gep(self.ty(t)?, pointer, &[offset], "ptr.offset")?
+                    }
+                    .into());
+                }
+                _ => {}
+            }
+        }
+        if let Some((en, variant)) = name.rsplit_once('.')
+            && let Some(decl) = self.program.enums.iter().find(|e| e.name == en)
+        {
+            let i = decl
+                .variants
+                .iter()
+                .position(|v| v.name == variant)
+                .ok_or_else(|| error("unknown variant"))?;
+            let st = self.ty(ret)?.into_struct_type();
+            let mut v = st.const_zero();
+            v = self
+                .builder
+                .build_insert_value(
+                    v,
+                    self.context.i32_type().const_int(i as u64, false),
+                    0,
+                    "enum.tag",
+                )?
+                .into_struct_value();
+            let mut payload = st
+                .get_field_type_at_index((i + 1) as u32)
+                .unwrap()
+                .into_struct_type()
+                .const_zero();
+            let mut pending = Vec::new();
+            for (j, arg) in args.iter().enumerate() {
+                let x = self.stage(arg, &mut pending)?;
+                payload = self
+                    .builder
+                    .build_insert_value(payload, x, j as u32, "payload")?
+                    .into_struct_value();
+            }
+            v = self
+                .builder
+                .build_insert_value(v, payload, (i + 1) as u32, "enum.payload")?
+                .into_struct_value();
+            self.transfer(&pending)?;
+            return Ok(v.into());
+        }
+        let f = self
+            .functions
+            .get(name)
+            .copied()
+            .ok_or_else(|| error(format!("unknown function {name}")))?;
+        let mut pending = Vec::new();
+        let vs = args
+            .iter()
+            .map(|e| {
+                self.stage(e, &mut pending)
+                    .map(BasicMetadataValueEnum::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.transfer(&pending)?;
+        let call = self
+            .builder
+            .build_call(f, &vs, if *ret == Type::Void { "" } else { "call" })?;
+        if let Some(function) = self
+            .program
+            .functions
+            .iter()
+            .find(|f| f.name == name && f.extern_)
+        {
+            for (location, attribute) in self.c_abi_attributes(function) {
+                call.add_attribute(location, attribute);
+            }
+        }
+        Ok(call.try_as_basic_value().basic().unwrap_or(unit))
+    }
+    fn foreach(
+        &mut self,
+        index: Option<&str>,
+        name: &str,
+        iterable: &Expr,
+        body: &Block,
+    ) -> Result<()> {
+        let (ptr, len, element) = self.collection(iterable)?;
+        let mutable = matches!(iterable.ty, Type::Slice(true, _) | Type::Ref(true, _))
+            || matches!(iterable.kind, ExprKind::Unary(UnaryOp::BorrowMut, _));
+        let counter = self.alloca(self.usize_type().into(), "foreach.index")?;
+        self.builder
+            .build_store(counter, self.usize_type().const_zero())?;
+        let head = self.bb("foreach.condition");
+        let bb = self.bb("foreach.body");
+        let step = self.bb("foreach.step");
+        let end = self.bb("foreach.end");
+        self.builder.build_unconditional_branch(head)?;
+        self.builder.position_at_end(head);
+        let i = self
+            .builder
+            .build_load(self.usize_type(), counter, "index")?
+            .into_int_value();
+        let test = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, i, len, "foreach.more")?;
+        self.builder.build_conditional_branch(test, bb, end)?;
+        self.builder.position_at_end(bb);
+        self.loops.push(Loop {
+            end,
+            next: step,
+            depth: self.scopes.len(),
+        });
+        self.scopes.push(vec![]);
+        if let Some(name) = index {
+            self.bind(name, &Type::usize(), Some(i.into()))?;
+        }
+        // The loop condition proves the element index is below the captured length.
+        let p = unsafe {
+            self.builder
+                .build_gep(self.ty(&element)?, ptr, &[i], "foreach.element")?
+        };
+        self.bind(name, &Type::Ref(mutable, Box::new(element)), Some(p.into()))?;
+        self.block(body)?;
+        if !self.terminated() {
+            self.cleanup_to(self.scopes.len() - 1)?;
+            self.builder.build_unconditional_branch(step)?;
+        }
+        self.scopes.pop();
+        self.loops.pop();
+        self.builder.position_at_end(step);
+        let next = self
+            .builder
+            .build_int_add(i, self.usize_type().const_int(1, false), "next")?;
+        self.builder.build_store(counter, next)?;
+        self.builder.build_unconditional_branch(head)?;
+        self.builder.position_at_end(end);
+        Ok(())
+    }
+    fn match_stmt(&mut self, value: &Expr, arms: &[MatchArm]) -> Result<()> {
+        self.scopes.push(vec![]);
+        let borrowed = if let Type::Ref(m, t) = &value.ty {
+            Some((*m, *t.clone()))
+        } else {
+            None
+        };
+        let actual = borrowed
+            .as_ref()
+            .map_or_else(|| value.ty.clone(), |(_, t)| t.clone());
+        let (ptr, owner) = if borrowed.is_some() {
+            (self.expr(value)?.into_pointer_value(), None)
+        } else {
+            let v = self.expr(value)?;
+            let b = self.bind("$match", &value.ty, Some(v))?;
+            (b.ptr, Some(b))
+        };
+        let aggregate = matches!(actual, Type::Named(_) | Type::Result(..) | Type::Option(_));
+        let tag = if aggregate {
+            let p = self.builder.build_struct_gep(
+                self.ty(&actual)?.into_struct_type(),
+                ptr,
+                0,
+                "match.tag",
+            )?;
+            let t = if matches!(actual, Type::Named(_)) {
+                self.context.i32_type()
+            } else {
+                self.context.bool_type()
+            };
+            self.builder.build_load(t, p, "tag")?.into_int_value()
+        } else {
+            self.load(ptr, &actual)?.into_int_value()
+        };
+        let end = self.bb("match.end");
+        let blocks = arms
+            .iter()
+            .map(|_| self.bb("match.arm"))
+            .collect::<Vec<_>>();
+        let fallback = arms
+            .iter()
+            .position(|a| matches!(a.pattern, Pattern::Wildcard))
+            .map(|i| blocks[i]);
+        let unreachable = self.bb("match.invalid");
+        let mut cases = vec![];
+        for (a, bb) in arms.iter().zip(&blocks) {
+            let n = match &a.pattern {
+                Pattern::Wildcard => continue,
+                Pattern::Int(n) => *n,
+                Pattern::Bool(b) => *b as u64,
+                Pattern::Variant(n, _) => self.variant_tag(&actual, n)?,
+            };
+            cases.push((tag.get_type().const_int(n, false), *bb));
+        }
+        self.builder
+            .build_switch(tag, fallback.unwrap_or(unreachable), &cases)?;
+        self.builder.position_at_end(unreachable);
+        self.builder.build_unreachable()?;
+        let mut reaches_end = false;
+        for (a, bb) in arms.iter().zip(blocks) {
+            self.builder.position_at_end(bb);
+            self.scopes.push(vec![]);
+            if let Some(owner) = &owner
+                && let Some(flag) = owner.live
+            {
+                self.builder
+                    .build_store(flag, self.context.bool_type().const_zero())?;
+            }
+            match &a.pattern {
+                Pattern::Variant(name, names) => {
+                    let payloads = self.pattern_payloads(ptr, &actual, name)?;
+                    for ((p, t), name) in payloads.into_iter().zip(names) {
+                        if name == "_" {
+                            if borrowed.is_none() {
+                                self.drop_ptr(p, &t)?;
+                            }
+                            continue;
+                        }
+                        if let Some((m, _)) = &borrowed {
+                            self.bind(name, &Type::Ref(*m, Box::new(t)), Some(p.into()))?;
+                        } else {
+                            let v = self.load(p, &t)?;
+                            self.bind(name, &t, Some(v))?;
+                        }
+                    }
+                }
+                Pattern::Wildcard if borrowed.is_none() => {
+                    self.drop_ptr(ptr, &actual)?;
+                }
+                _ => {}
+            }
+            self.block(&a.body)?;
+            if !self.terminated() {
+                self.cleanup_to(self.scopes.len() - 1)?;
+                self.builder.build_unconditional_branch(end)?;
+                reaches_end = true;
+            }
+            self.scopes.pop();
+        }
+        self.builder.position_at_end(end);
+        if !reaches_end {
+            self.builder.build_unreachable()?;
+        }
+        self.scopes.pop();
+        Ok(())
+    }
+    fn variant_tag(&self, t: &Type, name: &str) -> Result<u64> {
+        let short = name.rsplit('.').next().unwrap_or(name);
+        match t {
+            Type::Result(..) => match short {
+                "ok" => Ok(0),
+                "err" => Ok(1),
+                _ => Err(error("invalid Result pattern")),
+            },
+            Type::Option(_) => match short {
+                "none" => Ok(0),
+                "some" => Ok(1),
+                _ => Err(error("invalid Option pattern")),
+            },
+            Type::Named(n) => self
+                .program
+                .enums
+                .iter()
+                .find(|e| e.name == *n)
+                .and_then(|e| e.variants.iter().position(|v| v.name == short))
+                .map(|n| n as u64)
+                .ok_or_else(|| error("invalid enum pattern")),
+            _ => Err(error("variant pattern on non-enum value")),
+        }
+    }
+    fn pattern_payloads(
+        &self,
+        ptr: PointerValue<'ctx>,
+        t: &Type,
+        name: &str,
+    ) -> Result<Vec<(PointerValue<'ctx>, Type)>> {
+        let tag = self.variant_tag(t, name)?;
+        let st = self.ty(t)?.into_struct_type();
+        match t {
+            Type::Result(ok, err) => {
+                let t = if tag == 0 { ok } else { err };
+                if **t == Type::Void {
+                    return Ok(vec![]);
+                }
+                Ok(vec![(
+                    self.builder.build_struct_gep(
+                        st,
+                        ptr,
+                        if tag == 0 { 1 } else { 2 },
+                        "payload",
+                    )?,
+                    *t.clone(),
+                )])
+            }
+            Type::Option(t) => {
+                if tag == 0 {
+                    Ok(vec![])
+                } else {
+                    Ok(vec![(
+                        self.builder.build_struct_gep(st, ptr, 1, "payload")?,
+                        *t.clone(),
+                    )])
+                }
+            }
+            Type::Named(n) => {
+                let decl = self.program.enums.iter().find(|e| e.name == *n).unwrap();
+                let fields = &decl.variants[tag as usize].fields;
+                let pt = st
+                    .get_field_type_at_index(tag as u32 + 1)
+                    .unwrap()
+                    .into_struct_type();
+                let p = self
+                    .builder
+                    .build_struct_gep(st, ptr, tag as u32 + 1, "payload")?;
+                fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        Ok((
+                            self.builder.build_struct_gep(pt, p, i as u32, "binding")?,
+                            f.ty.clone(),
+                        ))
+                    })
+                    .collect()
+            }
+            _ => Err(error("invalid payload pattern")),
+        }
+    }
+}

@@ -1,0 +1,42 @@
+package hex
+
+pub enum ParseError { Length, Digit }
+
+fn nibble(ch: u8) -> u8!ParseError {
+    if ch >= b'0' && ch <= b'9' {
+        return ok(ch - b'0')
+    } else if ch >= b'a' && ch <= b'f' {
+        return ok(ch - b'a' + 10)
+    } else {
+        return err(ParseError.Digit)
+    }
+}
+
+pub fn parse_byte(text: &[u8]) -> u8!ParseError {
+    if text.len != 2 {
+        return err(ParseError.Length)
+    }
+    high := nibble(text[0])?
+    low := nibble(text[1])?
+    return ok((high << 4) | low)
+}
+
+pub fn parse_or(text: &[u8], fallback: u8) -> u8 {
+    match parse_byte(text) {
+        ok(value) => { return value }
+        err(_) => { return fallback }
+    }
+}
+
+fn main() -> i32 {
+    if parse_or(b"2a", 0) != 42 {
+        return 1
+    }
+    if parse_or(b"zz", 7) != 7 {
+        return 2
+    }
+    if parse_or(b"", 9) != 9 {
+        return 3
+    }
+    return 0
+}
