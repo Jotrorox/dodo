@@ -24,11 +24,14 @@ pub struct Loaded {
 }
 
 impl Loaded {
+    pub fn source(&self, span: Span) -> Option<&Source> {
+        self.sources.iter().find(|source| {
+            span.start >= source.start && span.start <= source.start + source.text.len()
+        })
+    }
+
     pub fn render(&self, diagnostic: &Diagnostic) -> String {
-        let source = self.sources.iter().find(|source| {
-            diagnostic.span.start >= source.start
-                && diagnostic.span.start <= source.start + source.text.len()
-        });
+        let source = self.source(diagnostic.span);
         if let Some(source) = source.or_else(|| self.sources.first()) {
             let mut local = diagnostic.clone();
             local.span.start = local.span.start.saturating_sub(source.start);
@@ -40,8 +43,52 @@ impl Loaded {
     }
 }
 
+/// A loading error retains the original diagnostic and source for editor clients.
+#[derive(Debug)]
+pub struct LoadError {
+    pub diagnostic: Diagnostic,
+    pub source: Option<Box<Source>>,
+}
+
+impl From<String> for LoadError {
+    fn from(message: String) -> Self {
+        Self {
+            diagnostic: Diagnostic::new(Span::default(), message),
+            source: None,
+        }
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(source) = &self.source {
+            f.write_str(
+                &self
+                    .diagnostic
+                    .render(&source.path.display().to_string(), &source.text),
+            )
+        } else {
+            self.diagnostic.fmt(f)
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
 pub fn load(path: &Path) -> Result<Loaded, String> {
-    let mut loader = Loader::default();
+    load_with_overlays(path, &BTreeMap::new()).map_err(|error| error.to_string())
+}
+
+/// Load a file or package, preferring unsaved text over files on disk.
+/// Overlay keys must be absolute paths normalized with `source_path`.
+pub fn load_with_overlays(
+    path: &Path,
+    overlays: &BTreeMap<PathBuf, String>,
+) -> Result<Loaded, LoadError> {
+    let mut loader = Loader {
+        overlays,
+        ..Loader::default()
+    };
     let root = loader.module(path, None)?;
     let mut program = Program::default();
     let known_packages = loader.aliases.keys().cloned().collect();
@@ -80,8 +127,8 @@ struct Module {
     alias: String,
 }
 
-#[derive(Default)]
-struct Loader {
+struct Loader<'a> {
+    overlays: &'a BTreeMap<PathBuf, String>,
     modules: BTreeMap<PathBuf, Module>,
     aliases: BTreeMap<String, PathBuf>,
     loading: Vec<PathBuf>,
@@ -89,22 +136,39 @@ struct Loader {
     offset: usize,
 }
 
-impl Loader {
+impl Default for Loader<'_> {
+    fn default() -> Self {
+        static EMPTY: BTreeMap<PathBuf, String> = BTreeMap::new();
+        Self {
+            overlays: &EMPTY,
+            modules: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            loading: vec![],
+            sources: vec![],
+            offset: 0,
+        }
+    }
+}
+
+impl Loader<'_> {
     fn module(
         &mut self,
         requested: &Path,
         expected_alias: Option<&str>,
-    ) -> Result<PathBuf, String> {
-        let path = requested
-            .canonicalize()
-            .map_err(|error| format!("cannot open {}: {error}", requested.display()))?;
+    ) -> Result<PathBuf, LoadError> {
+        let path = source_path(requested);
+        if !self.overlays.contains_key(&path) {
+            requested
+                .canonicalize()
+                .map_err(|error| format!("cannot open {}: {error}", requested.display()))?;
+        }
         if let Some(index) = self.loading.iter().position(|entry| entry == &path) {
             let mut cycle: Vec<String> = self.loading[index..]
                 .iter()
                 .map(|entry| entry.display().to_string())
                 .collect();
             cycle.push(path.display().to_string());
-            return Err(format!("cyclic package import: {}", cycle.join(" -> ")));
+            return Err(format!("cyclic package import: {}", cycle.join(" -> ")).into());
         }
         if let Some(module) = self.modules.get(&path) {
             if expected_alias.is_some_and(|alias| alias != module.alias) {
@@ -112,15 +176,18 @@ impl Loader {
                     "{} declares package `{}`, which differs from its import name",
                     path.display(),
                     module.alias
-                ));
+                )
+                .into());
             }
             return Ok(path);
         }
         if self.loading.len() >= 128 {
-            return Err("package import nesting exceeds the supported limit of 128".to_owned());
+            return Err("package import nesting exceeds the supported limit of 128"
+                .to_owned()
+                .into());
         }
         self.loading.push(path.clone());
-        let files = source_files(&path)?;
+        let files = source_files(&path, self.overlays)?;
         let directory = if path.is_dir() {
             path.as_path()
         } else {
@@ -128,10 +195,20 @@ impl Loader {
         };
         let mut program = Program::default();
         for file in files {
-            let text = std::fs::read_to_string(&file)
-                .map_err(|error| format!("cannot read UTF-8 source {}: {error}", file.display()))?;
-            let mut unit = parser::parse(&text)
-                .map_err(|diagnostic| diagnostic.render(&file.display().to_string(), &text))?;
+            let text = match self.overlays.get(&file) {
+                Some(text) => text.clone(),
+                None => std::fs::read_to_string(&file).map_err(|error| {
+                    format!("cannot read UTF-8 source {}: {error}", file.display())
+                })?,
+            };
+            let mut unit = parser::parse(&text).map_err(|diagnostic| LoadError {
+                diagnostic,
+                source: Some(Box::new(Source {
+                    path: file.clone(),
+                    text: text.clone(),
+                    start: 0,
+                })),
+            })?;
             if program.package.is_empty() {
                 program.package = unit.package.clone();
             }
@@ -141,15 +218,15 @@ impl Loader {
                     file.display(),
                     unit.package,
                     program.package
-                ));
+                )
+                .into());
             }
             let mut imports = BTreeSet::new();
             for import in &unit.imports {
                 if !imports.insert(import) {
-                    return Err(format!(
-                        "{} imports `{import}` more than once",
-                        file.display()
-                    ));
+                    return Err(
+                        format!("{} imports `{import}` more than once", file.display()).into(),
+                    );
                 }
             }
             shift_program(&mut unit, self.offset);
@@ -171,7 +248,7 @@ impl Loader {
                 "{} declares package `{alias}`; expected `{}` to match the import's final component",
                 path.display(),
                 expected_alias.unwrap_or_default()
-            ));
+            ).into());
         }
         if let Some(previous) = self.aliases.get(&alias) {
             if previous != &path {
@@ -179,7 +256,8 @@ impl Loader {
                     "conflicting package name `{alias}`: {} and {}",
                     previous.display(),
                     path.display()
-                ));
+                )
+                .into());
             }
         } else {
             self.aliases.insert(alias.clone(), path.clone());
@@ -200,13 +278,13 @@ impl Loader {
                 return Err(format!(
                     "invalid import `{import}` in {}: use a relative package path without `.` or `..`",
                     path.display()
-                ));
+                ).into());
             }
             let import_alias = import_path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("invalid import path `{import}`"))?;
-            let dependency = resolve_import(directory, import_path)?;
+            let dependency = resolve_import(directory, import_path, self.overlays)?;
             let dependency = self.module(&dependency, Some(import_alias))?;
             if let Some(previous) =
                 import_aliases.insert(import_alias.to_owned(), dependency.clone())
@@ -215,7 +293,8 @@ impl Loader {
                 return Err(format!(
                     "conflicting import alias `{import_alias}` in {}",
                     path.display()
-                ));
+                )
+                .into());
             }
         }
         self.loading.pop();
@@ -224,8 +303,21 @@ impl Loader {
     }
 }
 
-fn source_files(path: &Path) -> Result<Vec<PathBuf>, String> {
-    if path.is_file() {
+/// Canonicalize existing files, while allowing a new unsaved file in an existing directory.
+pub fn source_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        match (
+            path.parent().and_then(|parent| parent.canonicalize().ok()),
+            path.file_name(),
+        ) {
+            (Some(parent), Some(name)) => parent.join(name),
+            _ => path.to_path_buf(),
+        }
+    })
+}
+
+fn source_files(path: &Path, overlays: &BTreeMap<PathBuf, String>) -> Result<Vec<PathBuf>, String> {
+    if path.is_file() || overlays.contains_key(path) {
         return Ok(vec![path.to_path_buf()]);
     }
     if !path.is_dir() {
@@ -253,17 +345,34 @@ fn source_files(path: &Path) -> Result<Vec<PathBuf>, String> {
             files.push(entry.path());
         }
     }
+    files = files.into_iter().map(|file| source_path(&file)).collect();
+    files.extend(
+        overlays
+            .keys()
+            .filter(|file| {
+                file.parent() == Some(path) && file.extension().is_some_and(|ext| ext == "dodo")
+            })
+            .cloned(),
+    );
     files.sort();
+    files.dedup();
     if files.is_empty() {
         return Err(format!("{} contains no .dodo source files", path.display()));
     }
     Ok(files)
 }
 
-fn resolve_import(directory: &Path, import: &Path) -> Result<PathBuf, String> {
+fn resolve_import(
+    directory: &Path,
+    import: &Path,
+    overlays: &BTreeMap<PathBuf, String>,
+) -> Result<PathBuf, String> {
     let base = directory.join(import);
     let file = base.with_extension("dodo");
-    match (file.is_file(), base.is_dir()) {
+    match (
+        file.is_file() || overlays.contains_key(&source_path(&file)),
+        base.is_dir(),
+    ) {
         (true, false) => Ok(file),
         (false, true) => Ok(base),
         (true, true) => Err(format!(

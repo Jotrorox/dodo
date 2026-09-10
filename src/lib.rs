@@ -4,6 +4,7 @@ pub mod codegen;
 pub mod consteval;
 pub mod diagnostic;
 pub mod lexer;
+pub mod lsp;
 pub mod package;
 pub mod parser;
 pub mod sema;
