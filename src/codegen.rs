@@ -104,6 +104,7 @@ pub fn generate<'ctx>(
         globals: HashMap::new(),
         scopes: vec![],
         loops: vec![],
+        yields: vec![],
         function: None,
         return_type: Type::Void,
         bits,
@@ -147,6 +148,12 @@ struct Loop<'ctx> {
     next: BasicBlock<'ctx>,
     depth: usize,
 }
+struct YieldTarget<'ctx> {
+    ptr: PointerValue<'ctx>,
+    ty: Type,
+    end: BasicBlock<'ctx>,
+    depth: usize,
+}
 struct Codegen<'a, 'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
@@ -157,6 +164,7 @@ struct Codegen<'a, 'ctx> {
     globals: HashMap<String, (PointerValue<'ctx>, Type)>,
     scopes: Vec<Vec<Binding<'ctx>>>,
     loops: Vec<Loop<'ctx>>,
+    yields: Vec<YieldTarget<'ctx>>,
     function: Option<FunctionValue<'ctx>>,
     return_type: Type,
     bits: u32,
@@ -407,6 +415,27 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .find(|c| c.name == *n)
                     .ok_or_else(|| error("unknown constant"))?;
                 self.constant(&c.value)
+            }
+            ExprKind::Constant(value, _) => self.constant(value),
+            ExprKind::Repeat(value, _) => {
+                let Type::Array(n, t) = &e.ty else {
+                    return Err(error("invalid repeated array constant"));
+                };
+                let value = self.constant(value)?;
+                if match value {
+                    BasicValueEnum::IntValue(v) => v.is_null(),
+                    BasicValueEnum::FloatValue(v) => v.is_null(),
+                    BasicValueEnum::PointerValue(v) => v.is_null(),
+                    _ => false,
+                } {
+                    return Ok(self.ty(&e.ty)?.const_zero());
+                }
+                if *n > 1_000_000 {
+                    return Err(error(
+                        "nonzero repeated constant array exceeds the supported size of 1000000 elements",
+                    ));
+                }
+                self.const_array(t, &vec![value; *n])
             }
             ExprKind::Array(_, xs) => {
                 let Type::Array(_, t) = &e.ty else {
@@ -856,6 +885,19 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.drop_ptr(p, &e.ty)?;
                 }
             }
+            StmtKind::Yield(e) => {
+                let value = self.expr(e)?;
+                let target = self
+                    .yields
+                    .last()
+                    .ok_or_else(|| error("value exit outside a value block"))?;
+                let (ptr, end, depth) = (target.ptr, target.end, target.depth);
+                if target.ty != Type::Void {
+                    self.builder.build_store(ptr, value)?;
+                }
+                self.cleanup_to(depth)?;
+                self.builder.build_unconditional_branch(end)?;
+            }
             StmtKind::Return(e) => {
                 let v = e.as_ref().map(|v| self.expr(v)).transpose()?;
                 self.cleanup_to(0)?;
@@ -1000,6 +1042,115 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     return Err(error(format!("unknown value {n}")));
                 }
             }
+            ExprKind::Constant(value, _) => self.expr(value)?,
+            ExprKind::Repeat(value, _) => {
+                let Type::Array(n, element) = &e.ty else {
+                    return Err(error("invalid repeated array"));
+                };
+                let value = self.expr(value)?;
+                let storage = self.alloca(self.ty(&e.ty)?, "repeat.array")?;
+                let counter = self.alloca(self.usize_type().into(), "repeat.index")?;
+                self.builder
+                    .build_store(counter, self.usize_type().const_zero())?;
+                let head = self.bb("repeat.condition");
+                let body = self.bb("repeat.body");
+                let end = self.bb("repeat.end");
+                self.builder.build_unconditional_branch(head)?;
+                self.builder.position_at_end(head);
+                let index = self
+                    .builder
+                    .build_load(self.usize_type(), counter, "repeat.index")?
+                    .into_int_value();
+                let more = self.builder.build_int_compare(
+                    IntPredicate::ULT,
+                    index,
+                    self.usize_type().const_int(*n as u64, false),
+                    "repeat.more",
+                )?;
+                self.builder.build_conditional_branch(more, body, end)?;
+                self.builder.position_at_end(body);
+                let ptr = unsafe {
+                    self.builder.build_gep(
+                        self.ty(element)?,
+                        storage,
+                        &[index],
+                        "repeat.element",
+                    )?
+                };
+                self.builder.build_store(ptr, value)?;
+                let next = self.builder.build_int_add(
+                    index,
+                    self.usize_type().const_int(1, false),
+                    "repeat.next",
+                )?;
+                self.builder.build_store(counter, next)?;
+                self.builder.build_unconditional_branch(head)?;
+                self.builder.position_at_end(end);
+                self.load(storage, &e.ty)?
+            }
+            ExprKind::ValueBlock(body) => {
+                let ptr = self.alloca(self.storage_ty(&e.ty)?, "block.value")?;
+                let end = self.bb("block.end");
+                self.yields.push(YieldTarget {
+                    ptr,
+                    ty: e.ty.clone(),
+                    end,
+                    depth: self.scopes.len(),
+                });
+                self.block(body)?;
+                self.yields.pop();
+                self.builder.position_at_end(end);
+                if e.ty == Type::Void {
+                    self.context.i8_type().const_zero().into()
+                } else {
+                    self.load(ptr, &e.ty)?
+                }
+            }
+            ExprKind::Slice {
+                base, start, end, ..
+            } => {
+                let (ptr, length, element) = self.collection(base)?;
+                let start = if let Some(e) = start {
+                    let v = self.expr(e)?;
+                    self.cast(v, &e.ty, &Type::usize())?.into_int_value()
+                } else {
+                    self.usize_type().const_zero()
+                };
+                let end = if let Some(e) = end {
+                    let v = self.expr(e)?;
+                    self.cast(v, &e.ty, &Type::usize())?.into_int_value()
+                } else {
+                    length
+                };
+                let ordered = self.builder.build_int_compare(
+                    IntPredicate::ULE,
+                    start,
+                    end,
+                    "slice.ordered",
+                )?;
+                let inside = self.builder.build_int_compare(
+                    IntPredicate::ULE,
+                    end,
+                    length,
+                    "slice.inside",
+                )?;
+                self.guard(self.builder.build_and(ordered, inside, "slice.valid")?)?;
+                let data = unsafe {
+                    self.builder
+                        .build_gep(self.ty(&element)?, ptr, &[start], "slice.data")?
+                };
+                let length = self.builder.build_int_sub(end, start, "slice.length")?;
+                let slice = self.ty(&e.ty)?.into_struct_type().const_zero();
+                let slice = self
+                    .builder
+                    .build_insert_value(slice, data, 0, "slice.ptr")?
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(slice, length, 1, "slice.len")?
+                    .into_struct_value()
+                    .into()
+            }
+            ExprKind::Range(..) => return Err(error("unresolved range reached code generation")),
             ExprKind::Array(_, xs) => {
                 let mut array = self.ty(&e.ty)?.into_array_type().const_zero();
                 let mut pending = Vec::new();

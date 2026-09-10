@@ -5,6 +5,108 @@ pub struct Span {
     pub end: usize,
 }
 
+/// Integer constant syntax retained until package names and target width are known.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LengthExpr {
+    Int(u64, Option<Box<Type>>),
+    Name(String),
+    Unary(UnaryOp, Box<LengthExpr>),
+    Binary(BinaryOp, Box<LengthExpr>, Box<LengthExpr>),
+    Cast(Box<LengthExpr>, Box<Type>),
+}
+impl LengthExpr {
+    pub fn from_expr(e: Expr) -> Result<Self, crate::diagnostic::Diagnostic> {
+        let invalid = || {
+            crate::diagnostic::Diagnostic::new(
+                e.span,
+                "array length must be an integer constant expression",
+            )
+        };
+        Ok(match e.kind {
+            ExprKind::Int(n, t) => Self::Int(n, t.map(Box::new)),
+            ExprKind::Name(n) => Self::Name(n),
+            ExprKind::Field(base, field) => match Self::from_expr(*base)? {
+                Self::Name(base) => Self::Name(format!("{base}.{field}")),
+                _ => return Err(invalid()),
+            },
+            ExprKind::Unary(op, value) => Self::Unary(op, Box::new(Self::from_expr(*value)?)),
+            ExprKind::Binary(op, a, b) => Self::Binary(
+                op,
+                Box::new(Self::from_expr(*a)?),
+                Box::new(Self::from_expr(*b)?),
+            ),
+            ExprKind::Cast(value, ty) => {
+                Self::Cast(Box::new(Self::from_expr(*value)?), Box::new(ty))
+            }
+            _ => return Err(invalid()),
+        })
+    }
+    pub fn expression(&self, span: Span) -> Expr {
+        Expr::new(
+            match self {
+                Self::Int(n, t) => ExprKind::Int(*n, t.as_deref().cloned()),
+                Self::Name(n) => ExprKind::Name(n.clone()),
+                Self::Unary(op, value) => ExprKind::Unary(*op, Box::new(value.expression(span))),
+                Self::Binary(op, a, b) => ExprKind::Binary(
+                    *op,
+                    Box::new(a.expression(span)),
+                    Box::new(b.expression(span)),
+                ),
+                Self::Cast(value, ty) => {
+                    ExprKind::Cast(Box::new(value.expression(span)), *ty.clone())
+                }
+            },
+            span,
+        )
+    }
+    pub fn text(&self) -> String {
+        match self {
+            Self::Int(n, t) => {
+                format!("{n}{}", t.as_ref().map_or(String::new(), |t| t.to_string()))
+            }
+            Self::Name(n) => n.clone(),
+            Self::Unary(op, e) => format!(
+                "{}({})",
+                match op {
+                    UnaryOp::Neg => "-",
+                    UnaryOp::Not => "!",
+                    UnaryOp::BitNot => "~",
+                    UnaryOp::Borrow => "&",
+                    UnaryOp::BorrowMut => "&mut ",
+                    UnaryOp::Deref => "*",
+                },
+                e.text()
+            ),
+            Self::Binary(op, a, b) => format!(
+                "({} {} {})",
+                a.text(),
+                match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    BinaryOp::Div => "/",
+                    BinaryOp::Rem => "%",
+                    BinaryOp::Eq => "==",
+                    BinaryOp::Ne => "!=",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::Le => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::Ge => ">=",
+                    BinaryOp::And => "&&",
+                    BinaryOp::Or => "||",
+                    BinaryOp::BitAnd => "&",
+                    BinaryOp::BitOr => "|",
+                    BinaryOp::BitXor => "^",
+                    BinaryOp::Shl => "<<",
+                    BinaryOp::Shr => ">>",
+                },
+                b.text()
+            ),
+            Self::Cast(e, ty) => format!("({} as {ty})", e.text()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Unknown,
@@ -14,6 +116,7 @@ pub enum Type {
     Float(u32),
     Str,
     Array(usize, Box<Type>),
+    ArrayExpr(Box<LengthExpr>, Box<Type>),
     Slice(bool, Box<Type>),
     Ref(bool, Box<Type>),
     Raw(bool, Box<Type>),
@@ -88,6 +191,7 @@ impl std::fmt::Display for Type {
             Self::Float(n) => write!(f, "f{n}"),
             Self::Str => write!(f, "&str"),
             Self::Array(n, t) => write!(f, "[{n}]{t}"),
+            Self::ArrayExpr(n, t) => write!(f, "[{}]{t}", n.text()),
             Self::Slice(m, t) => write!(f, "&{}[{t}]", if *m { "mut " } else { "" }),
             Self::Ref(m, t) => write!(f, "&{}{t}", if *m { "mut " } else { "" }),
             Self::Raw(m, t) => write!(f, "*{} {t}", if *m { "mut" } else { "const" }),
@@ -195,6 +299,8 @@ pub enum StmtKind {
         value: Expr,
     },
     Expr(Expr),
+    // Internal exit from a value block, distinct from a function return.
+    Yield(Expr),
     Return(Option<Expr>),
     If {
         condition: Expr,
@@ -258,6 +364,16 @@ pub enum ExprKind {
     String(Vec<u8>, bool),
     Name(String),
     Array(Type, Vec<Expr>),
+    Repeat(Box<Expr>, Type),
+    Constant(Box<Expr>, Type),
+    ValueBlock(Block),
+    Range(Box<Expr>, Box<Expr>),
+    Slice {
+        base: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        mutable: bool,
+    },
     Struct(String, Vec<(String, Expr)>),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
@@ -276,7 +392,7 @@ pub enum ExprKind {
     Cast(Box<Expr>, Type),
     Try(Box<Expr>),
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     Neg,
     Not,
@@ -285,7 +401,7 @@ pub enum UnaryOp {
     BorrowMut,
     Deref,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Add,
     Sub,

@@ -14,6 +14,7 @@ pub fn check(program: &mut Program) -> Check<()> {
 }
 
 pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
+    crate::prepare::prepare(program, pointer_bits)?;
     instantiate(program)?;
     let mut context = Context::new(program, pointer_bits)?;
     for constant in &mut program.constants {
@@ -82,6 +83,30 @@ pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn array_length(expression: &mut Expr, bits: u32) -> Check<usize> {
+    let context = Context::new(&Program::default(), bits)?;
+    let mut checker = Checker::new(&context, Type::Void, vec![], HashMap::new());
+    let value = checker.expr(expression, None, false)?;
+    if !value.ty.is_integer() || !constant_expression(expression) {
+        return Err(Diagnostic::new(
+            expression.span,
+            "array length must be an integer constant expression",
+        ));
+    }
+    let crate::consteval::Scalar::Int(n) = crate::consteval::eval(expression, bits)
+        .map_err(|e| Diagnostic::new(expression.span, e))?
+    else {
+        unreachable!()
+    };
+    if n < 0 || n > u32::MAX as i128 || n >= (1i128 << bits) {
+        return Err(Diagnostic::new(
+            expression.span,
+            "array length must be nonnegative and fit the target and LLVM array limit",
+        ));
+    }
+    Ok(n as usize)
 }
 
 #[derive(Clone)]
@@ -498,6 +523,12 @@ enum Access {
     Borrow(bool),
     Move,
 }
+struct YieldContext {
+    expected: Option<Type>,
+    depth: usize,
+    values: Vec<Value>,
+    states: Vec<Vec<Vec<Variable>>>,
+}
 struct Checker<'a> {
     context: &'a Context,
     scopes: Vec<Vec<Variable>>,
@@ -509,6 +540,8 @@ struct Checker<'a> {
     unsafe_depth: usize,
     loop_depth: usize,
     temporary: Vec<Loan>,
+    protected: Vec<Loan>,
+    yields: Vec<YieldContext>,
     loop_uses: Vec<HashSet<String>>,
     namespace: String,
     expression_deps: HashMap<(usize, usize), Vec<Loan>>,
@@ -531,6 +564,8 @@ impl<'a> Checker<'a> {
             unsafe_depth: 0,
             loop_depth: 0,
             temporary: vec![],
+            protected: vec![],
+            yields: vec![],
             loop_uses: vec![],
             namespace: String::new(),
             expression_deps: HashMap::new(),
@@ -631,7 +666,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        for loan in &self.temporary {
+        for loan in self.temporary.iter().chain(&self.protected) {
             if overlaps(place, loan) && incompatible(access, loan.mutable) {
                 return Err(Diagnostic::new(
                     span,
@@ -706,6 +741,70 @@ impl<'a> Checker<'a> {
     }
     fn statement(&mut self, statement: &mut Stmt) -> Check<bool> {
         let span = statement.span;
+        if let StmtKind::ForEach {
+            index,
+            name,
+            iterable,
+            body,
+        } = &statement.kind
+            && let ExprKind::Range(start, end) = &iterable.kind
+        {
+            if index.is_some() {
+                return Err(Diagnostic::new(
+                    span,
+                    "range loops bind one integer; use `for i in start..end`",
+                ));
+            }
+            let ty = self
+                .peek_type(start)
+                .or_else(|| self.peek_type(end))
+                .or_else(|| self.literal_type(start))
+                .unwrap_or(Type::isize());
+            if !ty.is_integer() {
+                return Err(Diagnostic::new(
+                    span,
+                    "range bounds must be integers of the same type",
+                ));
+            }
+            let first = format!("$range.start.{}", span.start);
+            let last = format!("$range.end.{}", span.start);
+            let counter = format!("$range.index.{}", span.start);
+            let expr = |name: &String| Expr::new(ExprKind::Name(name.clone()), span);
+            let stmt = |kind| Stmt { kind, span };
+            let binding = |name: String, value: Expr| {
+                stmt(StmtKind::Let {
+                    name,
+                    ty: ty.clone(),
+                    value: Some(value),
+                    constant: false,
+                })
+            };
+            let mut inner = body.clone();
+            if name != "_" {
+                inner.insert(0, binding(name.clone(), expr(&counter)));
+            }
+            statement.kind = StmtKind::Block(vec![
+                binding(first.clone(), *start.clone()),
+                binding(last.clone(), *end.clone()),
+                stmt(StmtKind::For {
+                    init: Some(Box::new(binding(counter.clone(), expr(&first)))),
+                    condition: Some(Expr::new(
+                        ExprKind::Binary(
+                            BinaryOp::Lt,
+                            Box::new(expr(&counter)),
+                            Box::new(expr(&last)),
+                        ),
+                        span,
+                    )),
+                    step: Some(Box::new(stmt(StmtKind::Assign {
+                        target: expr(&counter),
+                        op: Some(BinaryOp::Add),
+                        value: Expr::new(ExprKind::Int(1, None), span),
+                    }))),
+                    body: inner,
+                }),
+            ]);
+        }
         match &mut statement.kind {
             StmtKind::Let {
                 name,
@@ -810,6 +909,52 @@ impl<'a> Checker<'a> {
                         "Result must be handled, propagated, or returned",
                     ));
                 }
+            }
+            StmtKind::Yield(expression) => {
+                let context = self
+                    .yields
+                    .last()
+                    .ok_or_else(|| Diagnostic::new(span, "value exit outside a value block"))?;
+                let expected = context.expected.clone();
+                let depth = context.depth;
+                let value = self.expr(expression, expected.as_ref(), true)?;
+                if let Some(expected) = &expected {
+                    self.expect(expected, &value.ty, span)?;
+                }
+                let departing: HashSet<_> = self
+                    .scopes
+                    .iter()
+                    .skip(depth)
+                    .flatten()
+                    .map(|v| v.id)
+                    .collect();
+                if value
+                    .deps
+                    .iter()
+                    .any(|loan| departing.contains(&loan.root) && loan.external.is_none())
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        "value block cannot yield a borrow of its local storage",
+                    ));
+                }
+                if self
+                    .scopes
+                    .iter()
+                    .skip(depth)
+                    .flatten()
+                    .any(|v| v.initialized && v.pending_result)
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        "a Result must be handled before leaving its value block",
+                    ));
+                }
+                let context = self.yields.last_mut().unwrap();
+                context.expected = Some(value.ty.clone());
+                context.values.push(value);
+                context.states.push(self.scopes[..depth].to_vec());
+                return Ok(true);
             }
             StmtKind::Return(expression) => {
                 let expected = self.return_ty.clone();
@@ -1152,6 +1297,12 @@ impl<'a> Checker<'a> {
         if let Some(name) = qualified_name(expression)
             && self.context.constants.contains_key(&name)
         {
+            if !self.context.constants[&name].public && type_namespace(&name) != self.namespace {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("constant `{name}` is private to its package"),
+                ));
+            }
             expression.kind = ExprKind::Name(name);
         }
         // Module-qualified and associated calls have no receiver argument.
@@ -1323,7 +1474,156 @@ impl<'a> Checker<'a> {
                 }
                 Value { ty: place.ty, deps }
             }
+            ExprKind::Constant(value, ty) => {
+                let value = self.expr(value, Some(ty), true)?;
+                self.expect(ty, &value.ty, span)?;
+                value
+            }
+            ExprKind::Repeat(value, ty) => {
+                let Type::Array(_, element) = ty else {
+                    return Err(Diagnostic::new(span, "unresolved repetition length"));
+                };
+                let hint = if **element != Type::Unknown {
+                    Some(*element.clone())
+                } else if let Some(Type::Array(_, t)) = expected {
+                    Some(*t.clone())
+                } else {
+                    None
+                };
+                let value = self.expr(value, hint.as_ref(), true)?;
+                if let Some(hint) = &hint {
+                    self.expect(hint, &value.ty, span)?;
+                }
+                if !value.ty.is_copy() || value.ty == Type::Void {
+                    return Err(Diagnostic::new(
+                        span,
+                        "array repetition requires a copyable element",
+                    ));
+                }
+                **element = value.ty;
+                Value {
+                    ty: ty.clone(),
+                    deps: value.deps,
+                }
+            }
+            ExprKind::ValueBlock(body) => {
+                let depth = self.scopes.len();
+                let protected_len = self.protected.len();
+                let temporaries = std::mem::take(&mut self.temporary);
+                self.protected.extend(temporaries.iter().cloned());
+                let expression_deps = std::mem::take(&mut self.expression_deps);
+                self.yields.push(YieldContext {
+                    expected: expected.cloned(),
+                    depth,
+                    values: vec![],
+                    states: vec![],
+                });
+                let terminates = self.block(body, true)?;
+                let context = self.yields.pop().unwrap();
+                self.protected.truncate(protected_len);
+                self.temporary = temporaries;
+                self.expression_deps = expression_deps;
+                if !terminates || context.values.is_empty() {
+                    return Err(Diagnostic::new(
+                        span,
+                        "every continuing path of a value block must end with a value",
+                    ));
+                }
+                self.scopes = context.states.into_iter().reduce(merge_states).unwrap();
+                let deps: Vec<_> = context.values.into_iter().flat_map(|v| v.deps).collect();
+                self.temporary.extend(deps.clone());
+                Value {
+                    ty: context.expected.unwrap(),
+                    deps,
+                }
+            }
+            ExprKind::Slice {
+                base,
+                start,
+                end,
+                mutable,
+            } => {
+                let inherited = self.temporary.len();
+                let mut place = self.place(base, true)?;
+                while let Type::Ref(m, inner) = place.ty.clone() {
+                    place.ty = *inner;
+                    place.mutable = m;
+                    place.loans = self.provenance(base);
+                }
+                let element = match &place.ty {
+                    Type::Array(_, t) => *t.clone(),
+                    Type::Slice(m, t) => {
+                        place.mutable = *m;
+                        place.loans = self.provenance(base);
+                        *t.clone()
+                    }
+                    _ => return Err(Diagnostic::new(span, "slicing requires an array or slice")),
+                };
+                if *mutable && !place.mutable {
+                    return Err(Diagnostic::new(
+                        span,
+                        "cannot mutably slice a shared reference or immutable binding",
+                    ));
+                }
+                if place.loans.is_empty() {
+                    return Err(Diagnostic::new(
+                        span,
+                        "slice requires checked source storage",
+                    ));
+                }
+                // Reserve the captured source while bounds run: reads such as
+                // data.len are allowed, but moving or mutating it is not.
+                self.temporary.truncate(inherited);
+                let mut deps = place.loans;
+                for loan in &mut deps {
+                    self.conflict(loan, Access::Borrow(false), span)?;
+                    loan.mutable = false;
+                    loan.origin = span;
+                }
+                self.temporary.extend(deps.clone());
+                let reserved = self.temporary.len();
+                for bound in start.iter_mut().chain(end) {
+                    let value = self.expr(bound, Some(&Type::usize()), false)?;
+                    if !value.ty.is_integer() {
+                        return Err(Diagnostic::new(bound.span, "slice bounds must be integers"));
+                    }
+                    self.temporary.truncate(reserved);
+                }
+                self.temporary.truncate(inherited);
+                for loan in &mut deps {
+                    self.conflict(loan, Access::Borrow(*mutable), span)?;
+                    loan.mutable = *mutable;
+                }
+                self.temporary.extend(deps.clone());
+                Value {
+                    ty: Type::Slice(*mutable, Box::new(element)),
+                    deps,
+                }
+            }
+            ExprKind::Range(..) => {
+                return Err(Diagnostic::new(
+                    span,
+                    "ranges are only supported in for loops",
+                ));
+            }
             ExprKind::Array(ty, items) => {
+                if let Type::Array(_, element) = ty
+                    && **element == Type::Unknown
+                {
+                    **element = match expected {
+                        Some(Type::Array(_, t)) => *t.clone(),
+                        _ => items
+                            .iter()
+                            .find_map(|e| self.peek_type(e))
+                            .or_else(|| items.first().and_then(|e| self.literal_type(e)))
+                            .ok_or_else(|| {
+                                Diagnostic::new(
+                                    span,
+                                    "empty array literal needs an element type from its context",
+                                )
+                            })?,
+                    };
+                }
                 self.context.validate_type(ty, span, false)?;
                 let (length, element) = match ty {
                     Type::Array(n, t) => (*n, t.as_ref().clone()),
@@ -1674,6 +1974,13 @@ impl<'a> Checker<'a> {
             )),
         }
     }
+    fn literal_type(&self, expression: &Expr) -> Option<Type> {
+        match &expression.kind {
+            ExprKind::Int(..) => Some(Type::isize()),
+            ExprKind::Float(..) => Some(Type::Float(64)),
+            _ => self.peek_type(expression),
+        }
+    }
     fn peek_type(&self, expression: &Expr) -> Option<Type> {
         if expression.ty != Type::Unknown {
             return Some(expression.ty.clone());
@@ -1690,7 +1997,18 @@ impl<'a> Checker<'a> {
                 .lookup(n)
                 .map(|v| v.ty.clone())
                 .or_else(|| self.context.constants.get(n).map(|c| c.ty.clone())),
-            ExprKind::Array(t, _) | ExprKind::Cast(_, t) => Some(t.clone()),
+            ExprKind::Array(t, _)
+            | ExprKind::Cast(_, t)
+            | ExprKind::Constant(_, t)
+            | ExprKind::Repeat(_, t) => Some(t.clone()),
+            ExprKind::ValueBlock(_) => None,
+            ExprKind::Range(a, b) => self.peek_type(a).or_else(|| self.peek_type(b)),
+            ExprKind::Slice { base, mutable, .. } => {
+                self.peek_type(base).and_then(|t| match dereferenced(&t) {
+                    Type::Array(_, t) | Type::Slice(_, t) => Some(Type::Slice(*mutable, t.clone())),
+                    _ => None,
+                })
+            }
             ExprKind::Struct(n, _) => Some(Type::Named(n.clone())),
             ExprKind::Unary(UnaryOp::Borrow, e) => {
                 self.peek_type(e).map(|t| Type::Ref(false, Box::new(t)))
@@ -1824,6 +2142,18 @@ impl<'a> Checker<'a> {
     }
     fn place(&mut self, expression: &mut Expr, initialized: bool) -> Check<Place> {
         let span = expression.span;
+        if let Some(name) = qualified_name(expression)
+            && let Some(constant) = self.context.constants.get(&name)
+        {
+            if !constant.public && type_namespace(&name) != self.namespace {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("constant `{name}` is private to its package"),
+                ));
+            }
+            expression.kind = ExprKind::Name(name);
+        }
+
         let place = match &mut expression.kind {
             ExprKind::Name(name) => {
                 if let Some(variable) = self.lookup(name).cloned() {
@@ -1988,7 +2318,11 @@ impl<'a> Checker<'a> {
                 place.direct = None;
                 place
             }
-            ExprKind::Call { .. } | ExprKind::String(..) | ExprKind::MethodCall { .. } => {
+            ExprKind::Call { .. }
+            | ExprKind::String(..)
+            | ExprKind::MethodCall { .. }
+            | ExprKind::Slice { .. }
+            | ExprKind::ValueBlock(..) => {
                 let value = self.expr(expression, None, false)?;
                 if !matches!(value.ty, Type::Ref(..) | Type::Slice(..) | Type::Str) {
                     return Err(Diagnostic::new(
@@ -2026,6 +2360,19 @@ impl<'a> Checker<'a> {
                 span,
                 "a custom drop method cannot be called directly; use `core.drop(value)`",
             ));
+        }
+        if name == "some" && expected.is_none() {
+            if args.len() != 1 {
+                return Err(Diagnostic::new(span, "`some` expects one argument"));
+            }
+            let value = self.expr(&mut args[0], None, true)?;
+            if value.ty == Type::Void {
+                return Err(Diagnostic::new(span, "Option requires a non-void payload"));
+            }
+            return Ok(Value {
+                ty: Type::Option(Box::new(value.ty)),
+                deps: value.deps,
+            });
         }
         if matches!(name.as_str(), "ok" | "err" | "some" | "none") {
             let ty = expected.cloned().ok_or_else(|| {
@@ -2538,10 +2885,13 @@ fn names_expr(expression: &Expr, names: &mut HashMap<String, usize>) {
                 .and_modify(|n| *n = (*n).max(expression.span.start))
                 .or_insert(expression.span.start);
         }
-        ExprKind::Unary(_, e) | ExprKind::Field(e, _) | ExprKind::Cast(e, _) | ExprKind::Try(e) => {
-            names_expr(e, names)
-        }
-        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
+        ExprKind::Unary(_, e)
+        | ExprKind::Field(e, _)
+        | ExprKind::Cast(e, _)
+        | ExprKind::Try(e)
+        | ExprKind::Constant(e, _)
+        | ExprKind::Repeat(e, _) => names_expr(e, names),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
             names_expr(a, names);
             names_expr(b, names);
         }
@@ -2561,14 +2911,24 @@ fn names_expr(expression: &Expr, names: &mut HashMap<String, usize>) {
                 names_expr(e, names);
             }
         }
+        ExprKind::ValueBlock(body) => names_block(body, names),
+        ExprKind::Slice {
+            base, start, end, ..
+        } => {
+            names_expr(base, names);
+            for e in start.iter().chain(end) {
+                names_expr(e, names);
+            }
+        }
         _ => (),
     }
 }
 fn names_stmt(statement: &Stmt, names: &mut HashMap<String, usize>) {
     match &statement.kind {
-        StmtKind::Let { value: Some(e), .. } | StmtKind::Expr(e) | StmtKind::Return(Some(e)) => {
-            names_expr(e, names)
-        }
+        StmtKind::Let { value: Some(e), .. }
+        | StmtKind::Expr(e)
+        | StmtKind::Yield(e)
+        | StmtKind::Return(Some(e)) => names_expr(e, names),
         StmtKind::Assign { target, value, .. } => {
             names_expr(target, names);
             names_expr(value, names);
@@ -2644,6 +3004,7 @@ fn validate_constant(expression: &Expr, bits: u32) -> Check<()> {
             }
         }
         ExprKind::String(..) => (),
+        ExprKind::Constant(e, _) | ExprKind::Repeat(e, _) => validate_constant(e, bits)?,
         _ => {
             crate::consteval::eval(expression, bits)
                 .map_err(|e| Diagnostic::new(expression.span, e))?;
@@ -2655,12 +3016,12 @@ fn constant_expression(expression: &Expr) -> bool {
     match &expression.kind {
         ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::String(..) => true,
         ExprKind::Unary(UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot, e)
-        | ExprKind::Cast(e, _) => constant_expression(e),
+        | ExprKind::Cast(e, _)
+        | ExprKind::Constant(e, _)
+        | ExprKind::Repeat(e, _) => constant_expression(e),
         ExprKind::Binary(_, a, b) => constant_expression(a) && constant_expression(b),
         ExprKind::Array(_, elements) => elements.iter().all(constant_expression),
         ExprKind::Struct(_, fields) => fields.iter().all(|(_, e)| constant_expression(e)),
-        // Name resolution and cycles in constant expressions are deliberately
-        // left out until the constant evaluator can validate them consistently.
         _ => false,
     }
 }
@@ -2719,6 +3080,30 @@ fn instantiate(program: &mut Program) -> Check<()> {
             .filter(|f| !f.generics.is_empty())
             .map(|f| (f.name.clone(), f.clone()))
             .collect(),
+        known_structs: program
+            .structs
+            .iter()
+            .map(|s| (s.name.clone(), s.clone()))
+            .collect(),
+        known_enums: program
+            .enums
+            .iter()
+            .map(|e| (e.name.clone(), e.clone()))
+            .collect(),
+        signatures: program
+            .functions
+            .iter()
+            .map(|f| (f.name.clone(), f.clone()))
+            .collect(),
+        constants: program
+            .constants
+            .iter()
+            .map(|c| (c.name.clone(), c.ty.clone()))
+            .collect(),
+        concrete_types: HashMap::new(),
+        locals: HashMap::new(),
+        return_type: Type::Void,
+        yield_type: None,
         generated_types: HashSet::new(),
         generated_functions: HashSet::new(),
         structs: vec![],
@@ -2734,6 +3119,9 @@ fn instantiate(program: &mut Program) -> Check<()> {
         for field in &mut structure.fields {
             expander.ty(&mut field.ty, &substitutions, field.span)?;
         }
+        expander
+            .known_structs
+            .insert(structure.name.clone(), structure.clone());
     }
     for enumeration in &mut program.enums {
         for variant in &mut enumeration.variants {
@@ -2755,6 +3143,14 @@ fn instantiate(program: &mut Program) -> Check<()> {
     Ok(())
 }
 struct Expander {
+    known_structs: HashMap<String, Struct>,
+    known_enums: HashMap<String, Enum>,
+    signatures: HashMap<String, Function>,
+    constants: HashMap<String, Type>,
+    concrete_types: HashMap<String, Type>,
+    locals: HashMap<String, Type>,
+    return_type: Type,
+    yield_type: Option<Type>,
     struct_templates: HashMap<String, Struct>,
     enum_templates: HashMap<String, Enum>,
     function_templates: HashMap<String, Function>,
@@ -2809,6 +3205,7 @@ impl Expander {
             Type::Named(name) => {
                 if let Some(replacement) = substitutions.get(name) {
                     *ty = replacement.clone();
+                    self.ty(ty, &HashMap::new(), span)?;
                 }
             }
             Type::Array(_, t)
@@ -2825,6 +3222,10 @@ impl Expander {
                     self.ty(argument, substitutions, span)?;
                 }
                 let concrete = specialized(name, arguments);
+                self.concrete_types.insert(
+                    concrete.clone(),
+                    Type::Generic(name.clone(), arguments.clone()),
+                );
                 if self.generated_types.insert(concrete.clone()) {
                     self.budget(span)?;
                     if let Some(mut structure) = self.struct_templates.get(name).cloned() {
@@ -2835,6 +3236,8 @@ impl Expander {
                         for field in &mut structure.fields {
                             self.ty(&mut field.ty, &mapping, field.span)?;
                         }
+                        self.known_structs
+                            .insert(concrete.clone(), structure.clone());
                         self.structs.push(structure);
                         let methods: Vec<_> = self
                             .function_templates
@@ -2865,6 +3268,8 @@ impl Expander {
                                 self.ty(&mut field.ty, &mapping, field.span)?;
                             }
                         }
+                        self.known_enums
+                            .insert(concrete.clone(), enumeration.clone());
                         self.enums.push(enumeration);
                     } else {
                         return Err(Diagnostic::new(
@@ -2888,15 +3293,32 @@ impl Expander {
             self.ty(&mut parameter.ty, substitutions, parameter.span)?;
         }
         self.ty(&mut function.ret, substitutions, function.span)?;
+        self.signatures
+            .insert(function.name.clone(), function.clone());
+        let previous = std::mem::replace(
+            &mut self.locals,
+            function
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.ty.clone()))
+                .collect(),
+        );
+        let ret = std::mem::replace(&mut self.return_type, function.ret.clone());
+        let yielding = self.yield_type.take();
         if let Some(body) = &mut function.body {
             self.block(body, substitutions)?;
         }
+        self.locals = previous;
+        self.return_type = ret;
+        self.yield_type = yielding;
         Ok(())
     }
-    fn block(&mut self, block: &mut Block, substitutions: &HashMap<String, Type>) -> Check<()> {
-        for statement in block {
+    fn block(&mut self, body: &mut Block, substitutions: &HashMap<String, Type>) -> Check<()> {
+        let locals = self.locals.clone();
+        for statement in body {
             self.statement(statement, substitutions)?;
         }
+        self.locals = locals;
         Ok(())
     }
     fn statement(
@@ -2904,24 +3326,48 @@ impl Expander {
         statement: &mut Stmt,
         substitutions: &HashMap<String, Type>,
     ) -> Check<()> {
+        let span = statement.span;
         match &mut statement.kind {
-            StmtKind::Let { ty, value, .. } => {
-                self.ty(ty, substitutions, statement.span)?;
-                if let Some(e) = value {
-                    self.expr(e, substitutions)?;
-                }
+            StmtKind::Let {
+                name, ty, value, ..
+            } => {
+                self.ty(ty, substitutions, span)?;
+                let actual = if let Some(e) = value {
+                    self.expression(e, substitutions, (*ty != Type::Unknown).then_some(&*ty))?
+                } else {
+                    ty.clone()
+                };
+                self.locals.insert(
+                    name.clone(),
+                    if *ty == Type::Unknown {
+                        actual
+                    } else {
+                        ty.clone()
+                    },
+                );
             }
             StmtKind::Assign { target, value, .. } => {
-                self.expr(target, substitutions)?;
-                self.expr(value, substitutions)?;
+                let ty = self.expression(target, substitutions, None)?;
+                self.expression(value, substitutions, Some(&ty))?;
             }
-            StmtKind::Expr(e) | StmtKind::Return(Some(e)) => self.expr(e, substitutions)?,
+            StmtKind::Return(Some(e)) => {
+                self.expression(e, substitutions, Some(&self.return_type.clone()))?;
+            }
+            StmtKind::Yield(e) => {
+                let ty = self.expression(e, substitutions, self.yield_type.clone().as_ref())?;
+                if ty != Type::Unknown {
+                    self.yield_type = Some(ty);
+                }
+            }
+            StmtKind::Expr(e) => {
+                self.expression(e, substitutions, None)?;
+            }
             StmtKind::If {
                 condition,
                 then_block,
                 else_block,
             } => {
-                self.expr(condition, substitutions)?;
+                self.expression(condition, substitutions, Some(&Type::Bool))?;
                 self.block(then_block, substitutions)?;
                 self.block(else_block, substitutions)?;
             }
@@ -2931,117 +3377,662 @@ impl Expander {
                 step,
                 body,
             } => {
+                let locals = self.locals.clone();
                 if let Some(s) = init {
                     self.statement(s, substitutions)?;
                 }
                 if let Some(e) = condition {
-                    self.expr(e, substitutions)?;
+                    self.expression(e, substitutions, Some(&Type::Bool))?;
                 }
                 if let Some(s) = step {
                     self.statement(s, substitutions)?;
                 }
                 self.block(body, substitutions)?;
+                self.locals = locals;
             }
-            StmtKind::ForEach { iterable, body, .. } => {
-                self.expr(iterable, substitutions)?;
+            StmtKind::ForEach {
+                index,
+                name,
+                iterable,
+                body,
+            } => {
+                let ty = self.expression(iterable, substitutions, None)?;
+                let locals = self.locals.clone();
+                if let Some(n) = index {
+                    self.locals.insert(n.clone(), Type::usize());
+                }
+                let element = if matches!(iterable.kind, ExprKind::Range(..)) {
+                    ty
+                } else {
+                    match dereferenced(&ty) {
+                        Type::Array(_, t) | Type::Slice(_, t) => Type::Ref(
+                            matches!(ty, Type::Ref(true, _) | Type::Slice(true, _)),
+                            t.clone(),
+                        ),
+                        _ => Type::Unknown,
+                    }
+                };
+                self.locals.insert(name.clone(), element);
                 self.block(body, substitutions)?;
+                self.locals = locals;
             }
             StmtKind::Match { value, arms } => {
-                self.expr(value, substitutions)?;
+                let ty = self.expression(value, substitutions, None)?;
                 for arm in arms {
+                    let locals = self.locals.clone();
+                    if let Pattern::Variant(n, names) = &arm.pattern {
+                        let fields = self.payloads(dereferenced(&ty), n);
+                        for (name, field) in names.iter().zip(fields) {
+                            let field = if let Type::Ref(m, _) = ty {
+                                Type::Ref(m, Box::new(field))
+                            } else {
+                                field
+                            };
+                            self.locals.insert(name.clone(), field);
+                        }
+                    }
                     self.block(&mut arm.body, substitutions)?;
+                    self.locals = locals;
                 }
             }
-            StmtKind::Block(b) | StmtKind::Unsafe(b) => self.block(b, substitutions)?,
+            StmtKind::Block(body) | StmtKind::Unsafe(body) => self.block(body, substitutions)?,
             _ => (),
         }
         Ok(())
     }
-    fn expr(&mut self, expression: &mut Expr, substitutions: &HashMap<String, Type>) -> Check<()> {
-        match &mut expression.kind {
-            ExprKind::Int(_, Some(t)) | ExprKind::Float(_, Some(t)) => {
-                self.ty(t, substitutions, expression.span)?
+    fn payloads(&self, ty: &Type, variant: &str) -> Vec<Type> {
+        let variant = variant.rsplit('.').next().unwrap_or(variant);
+        match (ty, variant) {
+            (Type::Option(t), "some") | (Type::Result(t, _), "ok") if **t != Type::Void => {
+                vec![*t.clone()]
             }
-            ExprKind::Unary(_, e) | ExprKind::Field(e, _) | ExprKind::Try(e) => {
-                self.expr(e, substitutions)?
+            (Type::Result(_, t), "err") => vec![*t.clone()],
+            (Type::Named(n), v) => self
+                .known_enums
+                .get(n)
+                .and_then(|e| e.variants.iter().find(|a| a.name == v))
+                .map_or(vec![], |v| v.fields.iter().map(|f| f.ty.clone()).collect()),
+            _ => vec![],
+        }
+    }
+    fn shape(&self, ty: &Type) -> Type {
+        if let Type::Named(n) = ty
+            && let Some(t) = self.concrete_types.get(n)
+        {
+            return t.clone();
+        }
+        ty.clone()
+    }
+    fn substitute(ty: &Type, mapping: &HashMap<String, Type>) -> Type {
+        match ty {
+            Type::Named(n) => mapping.get(n).cloned().unwrap_or_else(|| ty.clone()),
+            Type::Array(n, t) => Type::Array(*n, Box::new(Self::substitute(t, mapping))),
+            Type::Ref(m, t) => Type::Ref(*m, Box::new(Self::substitute(t, mapping))),
+            Type::Slice(m, t) => Type::Slice(*m, Box::new(Self::substitute(t, mapping))),
+            Type::Raw(m, t) => Type::Raw(*m, Box::new(Self::substitute(t, mapping))),
+            Type::Option(t) => Type::Option(Box::new(Self::substitute(t, mapping))),
+            Type::Result(t, e) => Type::Result(
+                Box::new(Self::substitute(t, mapping)),
+                Box::new(Self::substitute(e, mapping)),
+            ),
+            Type::Generic(n, args) => Type::Generic(
+                n.clone(),
+                args.iter().map(|t| Self::substitute(t, mapping)).collect(),
+            ),
+            _ => ty.clone(),
+        }
+    }
+    fn concrete(ty: &Type, parameters: &[String]) -> bool {
+        match ty {
+            Type::Unknown => false,
+            Type::Named(n) => !parameters.contains(n),
+            Type::Array(_, t)
+            | Type::Ref(_, t)
+            | Type::Slice(_, t)
+            | Type::Raw(_, t)
+            | Type::Option(t) => Self::concrete(t, parameters),
+            Type::Result(t, e) => Self::concrete(t, parameters) && Self::concrete(e, parameters),
+            Type::Generic(_, args) => args.iter().all(|t| Self::concrete(t, parameters)),
+            _ => true,
+        }
+    }
+    fn unify(
+        &self,
+        pattern: &Type,
+        actual: &Type,
+        parameters: &[String],
+        mapping: &mut HashMap<String, Type>,
+        span: Span,
+    ) -> Check<()> {
+        if *actual == Type::Unknown {
+            return Ok(());
+        }
+        if let Type::Named(n) = pattern
+            && parameters.contains(n)
+        {
+            if let Some(previous) = mapping.get(n) {
+                if previous != actual {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!(
+                            "conflicting types for generic parameter `{n}`: `{previous}` and `{actual}`"
+                        ),
+                    ));
+                }
+            } else {
+                mapping.insert(n.clone(), actual.clone());
             }
-            ExprKind::Cast(e, t) => {
-                self.expr(e, substitutions)?;
-                self.ty(t, substitutions, expression.span)?;
+            return Ok(());
+        }
+        let actual = self.shape(actual);
+        match (pattern, &actual) {
+            (Type::Array(_, p), Type::Array(_, a))
+            | (Type::Ref(_, p), Type::Ref(_, a))
+            | (Type::Slice(_, p), Type::Slice(_, a))
+            | (Type::Raw(_, p), Type::Raw(_, a))
+            | (Type::Option(p), Type::Option(a)) => self.unify(p, a, parameters, mapping, span)?,
+            (Type::Slice(_, p), Type::Ref(_, a)) => {
+                if let Type::Array(_, a) = a.as_ref() {
+                    self.unify(p, a, parameters, mapping, span)?;
+                }
             }
-            ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
-                self.expr(a, substitutions)?;
-                self.expr(b, substitutions)?;
+            (Type::Result(p, e), Type::Result(a, b)) => {
+                self.unify(p, a, parameters, mapping, span)?;
+                self.unify(e, b, parameters, mapping, span)?;
+            }
+            (Type::Generic(p, ps), Type::Generic(a, args)) if p == a => {
+                for (p, a) in ps.iter().zip(args) {
+                    self.unify(p, a, parameters, mapping, span)?;
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+    fn guess(&self, e: &Expr) -> Option<Type> {
+        match &e.kind {
+            ExprKind::Int(_, t) | ExprKind::Float(_, t) => t.clone(),
+            ExprKind::Bool(_) => Some(Type::Bool),
+            ExprKind::Name(n) => self
+                .locals
+                .get(n)
+                .or_else(|| self.constants.get(n))
+                .cloned(),
+            ExprKind::String(_, bytes) => Some(if *bytes {
+                Type::Slice(false, Box::new(Type::u8()))
+            } else {
+                Type::Str
+            }),
+            ExprKind::Cast(_, t) | ExprKind::Constant(_, t) => Some(t.clone()),
+            ExprKind::Unary(UnaryOp::Borrow, e) => {
+                self.guess(e).map(|t| Type::Ref(false, Box::new(t)))
+            }
+            ExprKind::Unary(UnaryOp::BorrowMut, e) => {
+                self.guess(e).map(|t| Type::Ref(true, Box::new(t)))
+            }
+            ExprKind::Unary(UnaryOp::Deref, e) => self.guess(e).and_then(|t| match t {
+                Type::Ref(_, t) | Type::Raw(_, t) => Some(*t),
+                _ => None,
+            }),
+            ExprKind::Unary(_, e) => self.guess(e),
+            ExprKind::Binary(
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or,
+                _,
+                _,
+            ) => Some(Type::Bool),
+            ExprKind::Binary(_, a, b) | ExprKind::Range(a, b) => {
+                self.guess(a).or_else(|| self.guess(b))
+            }
+            ExprKind::Array(t, _) | ExprKind::Repeat(_, t) if Self::concrete(t, &[]) => {
+                Some(t.clone())
+            }
+            ExprKind::Index(e, _) => self.guess(e).and_then(|t| match dereferenced(&t) {
+                Type::Array(_, t) | Type::Slice(_, t) => Some(*t.clone()),
+                _ => None,
+            }),
+            ExprKind::Field(base, n) => {
+                if let Some(owner) = qualified_name(base)
+                    && self.known_enums.get(&owner).is_some_and(|e| {
+                        e.variants
+                            .iter()
+                            .any(|v| v.name == *n && v.fields.is_empty())
+                    })
+                {
+                    return Some(Type::Named(owner));
+                }
+
+                if let Some(path) = qualified_name(e)
+                    && let Some(t) = self.constants.get(&path)
+                {
+                    return Some(t.clone());
+                }
+                let ty = self.guess(base)?;
+                match dereferenced(&ty) {
+                    Type::Array(..) | Type::Slice(..) | Type::Str if n == "len" => {
+                        Some(Type::usize())
+                    }
+                    Type::Named(owner) => self
+                        .known_structs
+                        .get(owner)?
+                        .fields
+                        .iter()
+                        .find(|f| f.name == *n)
+                        .map(|f| f.ty.clone()),
+                    _ => None,
+                }
+            }
+            ExprKind::Call { name, .. } => self
+                .signatures
+                .get(name)
+                .filter(|f| f.generics.is_empty())
+                .map(|f| f.ret.clone()),
+            ExprKind::Try(e) => self.guess(e).and_then(|t| {
+                if let Type::Result(t, _) = t {
+                    Some(*t)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        }
+    }
+    fn expr(&mut self, e: &mut Expr, substitutions: &HashMap<String, Type>) -> Check<()> {
+        self.expression(e, substitutions, None).map(|_| ())
+    }
+    fn expression(
+        &mut self,
+        e: &mut Expr,
+        substitutions: &HashMap<String, Type>,
+        expected: Option<&Type>,
+    ) -> Check<Type> {
+        let span = e.span;
+        if let ExprKind::MethodCall {
+            receiver,
+            name,
+            args,
+        } = &mut e.kind
+            && let Some(prefix) = qualified_name(receiver)
+            && !self.locals.contains_key(&prefix)
+            && self.signatures.contains_key(&format!("{prefix}.{name}"))
+        {
+            e.kind = ExprKind::Call {
+                name: format!("{prefix}.{name}"),
+                type_args: vec![],
+                args: std::mem::take(args),
+            };
+        }
+        Ok(match &mut e.kind {
+            ExprKind::Int(_, suffix) => {
+                if let Some(t) = suffix {
+                    self.ty(t, substitutions, span)?;
+                    t.clone()
+                } else {
+                    expected
+                        .filter(|t| t.is_integer())
+                        .cloned()
+                        .unwrap_or(Type::isize())
+                }
+            }
+            ExprKind::Float(_, suffix) => suffix
+                .clone()
+                .or_else(|| expected.filter(|t| matches!(t, Type::Float(_))).cloned())
+                .unwrap_or(Type::Float(64)),
+            ExprKind::Bool(_) => Type::Bool,
+            ExprKind::String(_, bytes) => {
+                if *bytes {
+                    Type::Slice(false, Box::new(Type::u8()))
+                } else {
+                    Type::Str
+                }
+            }
+            ExprKind::Name(n) => self
+                .locals
+                .get(n)
+                .or_else(|| self.constants.get(n))
+                .cloned()
+                .or_else(|| expected.cloned())
+                .unwrap_or(Type::Unknown),
+            ExprKind::Constant(v, t) => {
+                self.ty(t, substitutions, span)?;
+                self.expression(v, substitutions, Some(t))?;
+                t.clone()
+            }
+            ExprKind::Cast(v, t) => {
+                self.ty(t, substitutions, span)?;
+                self.expression(v, substitutions, None)?;
+                t.clone()
+            }
+            ExprKind::Unary(op, value) => {
+                let hint = match (*op, expected) {
+                    (UnaryOp::Borrow | UnaryOp::BorrowMut, Some(Type::Ref(_, t))) => {
+                        Some(t.as_ref())
+                    }
+                    _ => expected,
+                };
+                let actual = self.expression(value, substitutions, hint)?;
+                match op {
+                    UnaryOp::Borrow => Type::Ref(false, Box::new(actual)),
+                    UnaryOp::BorrowMut => Type::Ref(true, Box::new(actual)),
+                    UnaryOp::Deref => match actual {
+                        Type::Ref(_, t) | Type::Raw(_, t) => *t,
+                        _ => Type::Unknown,
+                    },
+                    _ => actual,
+                }
+            }
+            ExprKind::Binary(op, a, b) => {
+                let hint = expected
+                    .filter(|t| t.is_numeric())
+                    .cloned()
+                    .or_else(|| self.guess(a))
+                    .or_else(|| self.guess(b));
+                let actual = self.expression(a, substitutions, hint.as_ref())?;
+                self.expression(b, substitutions, Some(&actual))?;
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::And
+                        | BinaryOp::Or
+                ) {
+                    Type::Bool
+                } else {
+                    actual
+                }
+            }
+            ExprKind::Range(a, b) => {
+                let hint = self.guess(a).or_else(|| self.guess(b));
+                let actual = self.expression(a, substitutions, hint.as_ref())?;
+                self.expression(b, substitutions, Some(&actual))?;
+                actual
             }
             ExprKind::Array(t, items) => {
-                self.ty(t, substitutions, expression.span)?;
-                for item in items {
-                    self.expr(item, substitutions)?;
+                self.ty(t, substitutions, span)?;
+                let Type::Array(n, element) = t else {
+                    return Err(Diagnostic::new(span, "unresolved array type"));
+                };
+                let mut hint = if **element != Type::Unknown {
+                    Some(*element.clone())
+                } else if let Some(Type::Array(_, t)) = expected {
+                    Some(*t.clone())
+                } else {
+                    items.iter().find_map(|v| self.guess(v))
+                };
+                for v in items {
+                    let actual = self.expression(v, substitutions, hint.as_ref())?;
+                    if hint.is_none() && actual != Type::Unknown {
+                        hint = Some(actual);
+                    }
                 }
+                if let Some(t) = hint {
+                    **element = t;
+                }
+                Type::Array(*n, element.clone())
+            }
+            ExprKind::Repeat(value, t) => {
+                self.ty(t, substitutions, span)?;
+                let hint = if let Some(Type::Array(_, t)) = expected {
+                    Some(t.as_ref())
+                } else {
+                    None
+                };
+                let actual = self.expression(value, substitutions, hint)?;
+                let Type::Array(n, _) = t else {
+                    return Err(Diagnostic::new(span, "unresolved repeat type"));
+                };
+                Type::Array(*n, Box::new(actual))
             }
             ExprKind::Struct(name, fields) => {
-                if name.contains('<') {
-                    let source =
-                        format!("package generated\nfn instantiate(value: {name}) -> void {{}}\n");
-                    let parsed = crate::parser::parse(&source).map_err(|_| {
-                        Diagnostic::new(expression.span, "invalid generic struct literal type")
-                    })?;
-                    let mut ty = parsed.functions[0].params[0].ty.clone();
-                    self.ty(&mut ty, substitutions, expression.span)?;
-                    if let Type::Named(concrete) = ty {
-                        *name = concrete;
+                let mut ty = if name.contains('<') {
+                    crate::parser::parse(&format!(
+                        "package generated\nfn instantiate(value: {name}) {{}}"
+                    ))
+                    .map_err(|_| Diagnostic::new(span, "invalid generic struct literal type"))?
+                    .functions[0]
+                        .params[0]
+                        .ty
+                        .clone()
+                } else {
+                    substitutions
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| Type::Named(name.clone()))
+                };
+                if let Type::Named(owner) = &ty
+                    && let Some(template) = self.struct_templates.get(owner).cloned()
+                {
+                    let parameters = &template.generics;
+                    let mut mapping = HashMap::new();
+                    if let Some(expected) = expected {
+                        self.unify(
+                            &Type::Generic(
+                                owner.clone(),
+                                parameters.iter().cloned().map(Type::Named).collect(),
+                            ),
+                            expected,
+                            parameters,
+                            &mut mapping,
+                            span,
+                        )?;
                     }
-                } else if let Some(Type::Named(concrete)) = substitutions.get(name) {
+                    for (n, v) in fields.iter() {
+                        if let Some(field) = template.fields.iter().find(|f| f.name == *n)
+                            && let Some(actual) = self.guess(v)
+                        {
+                            self.unify(&field.ty, &actual, parameters, &mut mapping, span)?;
+                        }
+                    }
+                    for (n, v) in fields.iter_mut() {
+                        let field = template.fields.iter().find(|f| f.name == *n);
+                        let hint = field
+                            .map(|f| Self::substitute(&f.ty, &mapping))
+                            .filter(|t| Self::concrete(t, parameters));
+                        let actual = self.expression(v, substitutions, hint.as_ref())?;
+                        if let Some(field) = field {
+                            self.unify(&field.ty, &actual, parameters, &mut mapping, span)?;
+                        }
+                    }
+                    ty = Type::Generic(
+                        owner.clone(),
+                        self.inferred_arguments(parameters, &mapping, span)?,
+                    );
+                }
+                self.ty(&mut ty, substitutions, span)?;
+                if let Type::Named(concrete) = &ty {
                     *name = concrete.clone();
                 }
-                for (_, field) in fields {
-                    self.expr(field, substitutions)?;
+                let decl = self.known_structs.get(name).cloned();
+                for (n, v) in fields {
+                    let hint = decl
+                        .as_ref()
+                        .and_then(|s| s.fields.iter().find(|f| f.name == *n))
+                        .map(|f| &f.ty);
+                    self.expression(v, substitutions, hint)?;
                 }
+                ty
             }
             ExprKind::Call {
                 name,
                 type_args,
                 args,
             } => {
-                for argument in type_args.iter_mut() {
-                    self.ty(argument, substitutions, expression.span)?;
+                for t in type_args.iter_mut() {
+                    self.ty(t, substitutions, span)?;
                 }
-                for argument in args {
-                    self.expr(argument, substitutions)?;
-                }
-                if let Some(template) = self.function_templates.get(name).cloned() {
-                    if type_args.is_empty() {
-                        return Err(Diagnostic::new(
-                            expression.span,
-                            format!("generic function `{name}` requires explicit type arguments"),
-                        ));
+                if let Some(template) = self.signatures.get(name).cloned() {
+                    let parameters = &template.generics;
+                    let explicit = !type_args.is_empty();
+                    let mut mapping = if explicit {
+                        self.substitutions(parameters, type_args, span)?
+                    } else {
+                        HashMap::new()
+                    };
+                    if !explicit && !parameters.is_empty() {
+                        if let Some(expected) = expected {
+                            self.unify(&template.ret, expected, parameters, &mut mapping, span)?;
+                        }
+                        for (parameter, arg) in template.params.iter().zip(args.iter()) {
+                            if let Some(actual) = self.guess(arg) {
+                                self.unify(&parameter.ty, &actual, parameters, &mut mapping, span)?;
+                            }
+                        }
                     }
-                    let concrete = specialized(name, type_args);
-                    if self.generated_functions.insert(concrete.clone()) {
-                        self.budget(expression.span)?;
-                        let mapping =
-                            self.substitutions(&template.generics, type_args, expression.span)?;
-                        let mut function = template;
-                        function.name = concrete.clone();
-                        function.generics.clear();
-                        self.function(&mut function, &mapping)?;
-                        self.functions.push(function);
+                    for (i, arg) in args.iter_mut().enumerate() {
+                        let param = template.params.get(i);
+                        let hint = param
+                            .map(|p| Self::substitute(&p.ty, &mapping))
+                            .filter(|t| Self::concrete(t, parameters));
+                        let actual = self.expression(arg, substitutions, hint.as_ref())?;
+                        if !explicit && let Some(param) = param {
+                            self.unify(&param.ty, &actual, parameters, &mut mapping, span)?;
+                        }
                     }
-                    *name = concrete;
-                    type_args.clear();
+                    let mut ret = Self::substitute(&template.ret, &mapping);
+                    if !parameters.is_empty() {
+                        let arguments = self.inferred_arguments(parameters, &mapping, span)?;
+                        let concrete = specialized(name, &arguments);
+                        if self.generated_functions.insert(concrete.clone()) {
+                            self.budget(span)?;
+                            let mut function = template;
+                            function.name = concrete.clone();
+                            function.generics.clear();
+                            self.function(&mut function, &mapping)?;
+                            self.functions.push(function);
+                        }
+                        *name = concrete;
+                        type_args.clear();
+                    }
+                    self.ty(&mut ret, substitutions, span)?;
+                    ret
+                } else if matches!(name.as_str(), "some" | "ok" | "err" | "none") {
+                    let payload = match (name.as_str(), expected) {
+                        ("some", Some(Type::Option(t)))
+                        | ("ok", Some(Type::Result(t, _)))
+                        | ("err", Some(Type::Result(_, t))) => Some(t.as_ref()),
+                        _ => None,
+                    };
+                    let mut actual = Type::Void;
+                    for arg in args {
+                        actual = self.expression(arg, substitutions, payload)?;
+                    }
+                    expected.cloned().unwrap_or_else(|| {
+                        if name == "some" {
+                            Type::Option(Box::new(actual))
+                        } else {
+                            Type::Unknown
+                        }
+                    })
+                } else {
+                    let variant = name
+                        .rsplit_once('.')
+                        .map(|(owner, variant)| (Type::Named(owner.into()), variant.to_owned()));
+                    let fields = variant
+                        .as_ref()
+                        .map_or(vec![], |(t, v)| self.payloads(t, v));
+                    for (i, arg) in args.iter_mut().enumerate() {
+                        self.expression(arg, substitutions, fields.get(i))?;
+                    }
+                    variant.map_or(Type::Unknown, |(t, _)| t)
                 }
             }
-            ExprKind::MethodCall { receiver, args, .. } => {
-                self.expr(receiver, substitutions)?;
-                for arg in args {
-                    self.expr(arg, substitutions)?;
+            ExprKind::MethodCall {
+                receiver,
+                name,
+                args,
+            } => {
+                let actual = self.expression(receiver, substitutions, None)?;
+                let signature = if let Type::Named(owner) = dereferenced(&actual) {
+                    self.signatures.get(&format!("{owner}.{name}")).cloned()
+                } else {
+                    None
+                };
+                for (i, arg) in args.iter_mut().enumerate() {
+                    self.expression(
+                        arg,
+                        substitutions,
+                        signature
+                            .as_ref()
+                            .and_then(|f| f.params.get(i + 1))
+                            .map(|p| &p.ty),
+                    )?;
+                }
+                signature.map_or(Type::Unknown, |f| f.ret)
+            }
+            ExprKind::Field(base, field) => {
+                let actual = self.expression(base, substitutions, None)?;
+                match dereferenced(&actual) {
+                    Type::Array(..) | Type::Slice(..) | Type::Str if field == "len" => {
+                        Type::usize()
+                    }
+                    Type::Named(owner) => self
+                        .known_structs
+                        .get(owner)
+                        .and_then(|s| s.fields.iter().find(|f| f.name == *field))
+                        .map_or(Type::Unknown, |f| f.ty.clone()),
+                    _ => self.guess(e).unwrap_or(Type::Unknown),
                 }
             }
-            _ => (),
-        }
-        Ok(())
+            ExprKind::Index(base, index) => {
+                let actual = self.expression(base, substitutions, None)?;
+                self.expression(index, substitutions, Some(&Type::usize()))?;
+                match dereferenced(&actual) {
+                    Type::Array(_, t) | Type::Slice(_, t) => *t.clone(),
+                    _ => Type::Unknown,
+                }
+            }
+            ExprKind::Slice {
+                base,
+                start,
+                end,
+                mutable,
+            } => {
+                let actual = self.expression(base, substitutions, None)?;
+                for v in start.iter_mut().chain(end) {
+                    self.expression(v, substitutions, Some(&Type::usize()))?;
+                }
+                match dereferenced(&actual) {
+                    Type::Array(_, t) | Type::Slice(_, t) => Type::Slice(*mutable, t.clone()),
+                    _ => Type::Unknown,
+                }
+            }
+            ExprKind::Try(value) => {
+                let actual = self.expression(value, substitutions, None)?;
+                if let Type::Result(t, _) = actual {
+                    *t
+                } else {
+                    Type::Unknown
+                }
+            }
+            ExprKind::ValueBlock(body) => {
+                let previous = std::mem::replace(&mut self.yield_type, expected.cloned());
+                self.block(body, substitutions)?;
+                let result = self.yield_type.take().unwrap_or(Type::Unknown);
+                self.yield_type = previous;
+                result
+            }
+        })
+    }
+    fn inferred_arguments(
+        &self,
+        parameters: &[String],
+        mapping: &HashMap<String, Type>,
+        span: Span,
+    ) -> Check<Vec<Type>> {
+        parameters.iter().map(|n| mapping.get(n).cloned().filter(|t| Self::concrete(t, parameters)).ok_or_else(|| Diagnostic::new(span, format!("cannot infer generic parameter `{n}`; supply explicit type arguments")))).collect()
     }
 }
+
 fn specialized(name: &str, arguments: &[Type]) -> String {
     let mut result = format!("{name}$");
     for (index, ty) in arguments.iter().enumerate() {

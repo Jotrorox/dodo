@@ -2,7 +2,7 @@
 
 **Language specification 0.1**
 
-**Edition:** 9 September 2026
+**Edition:** 10 September 2026
 
 **Status:** Proposed language; normative design specification
 
@@ -15,10 +15,11 @@ requiring a garbage collector, heap, operating system, or scheduler.
 
 ## Status and interpretation
 
-This document is a cleaned edition of the supplied *Dodo Language Specification
-0.1*. It preserves the source document's stated requirements and its unresolved
-questions. The underlying design draft was labeled “Draft 0.2”; the language
-specification version is 0.1. Neither label implies a release chronology.
+This edition incorporates the September 2026 ergonomics revisions to the Dodo
+0.1 design: consistent name-first declarations, shorter signatures and literals,
+local type inference, composable constants, value-producing blocks, ranges, and
+subslices. Earlier type-first declarations and fully explicit forms remain
+accepted for compatibility. The ownership categories are unchanged.
 
 **Must**, **must not**, **shall**, and **shall not** express requirements.
 **May** expresses permission. **Should** expresses a recommendation.
@@ -32,8 +33,8 @@ Compiler implementation status belongs in separate project documentation.
 
 Version 0.1 does not completely define lexical rules, expression grammar, ABI,
 standard library, target object formats, or a formal memory-safety argument.
-Appendix C collects these open items. Where this edition clarifies presentation,
-it does not silently resolve them.
+The resolved ergonomics rules are specified below; Appendix C collects the
+remaining open design items.
 
 ## Contents
 
@@ -173,7 +174,8 @@ This list is a record of the supplied design, not a complete lexical grammar.
 - Byte literals include forms such as `b'a'`.
 - String literals, such as `"hi"`, refer to immutable program-lifetime storage.
 - Byte strings, such as `b"hi"`, also refer to immutable program-lifetime storage.
-- Array literals use forms such as `[3]u8{1, 2, 3}`.
+- Array literals use `[1, 2, 3]`, with the length inferred from the elements.
+- Repeated array literals use `[value; N]`, where N is an integer constant expression.
 
 Numeric bases, digit separators, floating-point literals, character and string
 escapes, raw strings, Boolean literal spelling, and source encoding are not
@@ -204,15 +206,35 @@ fully specified.
 
 ### 4.2. Arrays and slices
 
-An array `[N]T` owns exactly N elements. Arrays use Go-style composite literals:
+An array `[N]T` owns exactly N elements. N is a nonnegative integer constant
+expression, including references to named constants. Array literals infer their
+length and take their element type from context, typed elements, or the ordinary
+literal defaults:
 
 ```dodo
-values := [4]u16{1, 2, 3, 4}
+values: [4]u16 = [1, 2, 3, 4]
+bytes := [0u8; 256]
 ```
 
+`[value; N]` evaluates value exactly once, including when N is zero, and repeats
+it N times. The element must be copyable; repetition never clones owned values
+or duplicates mutable references. Empty lists need an element type from context.
+The explicit composite form `[4]u16{1, 2, 3, 4}` remains accepted.
+
 Arrays and slices expose `.len`. Borrowing an array may coerce to a slice without
-allocation. A slice is a borrowed view and participates in borrow checking. A
-mutable slice grants mutable access under the exclusive-access rules in section 8.
+allocation. `&values[start..end]` produces a shared subslice and
+`&mut values[start..end]` produces an exclusive mutable subslice. A bare
+`values[start..end]` also produces a shared subslice. Missing start and end bounds
+mean zero and the collection length respectively. The source, start, and end
+are evaluated once, in that order. Bounds must satisfy
+`0 <= start <= end <= length`; violations trap in every optimization profile.
+An empty slice at the end of a collection is valid. Bounds may read the captured
+source (for example, `data.len`) but must not move or mutate it; mutable access
+is established after the bounds have been evaluated.
+
+Subslices retain their source's checked lifetime. Mutable slicing requires
+exclusive access; ranges do not establish disjointness between simultaneous
+mutable slices. UTF-8 string slicing is not provided by this syntax.
 
 ### 4.3. Checked references
 
@@ -236,17 +258,20 @@ package-private unless individually marked `pub`.
 
 ```dodo
 pub struct Pin {
-    usize set_address
-    usize clear_address
-    u32 mask
+    set_address: usize
+    clear_address: usize
+    mask: u32
 }
 
 pin := Pin{
     set_address: set,
     clear_address: clear,
-    mask: mask,
+    mask,
 }
 ```
+
+A literal field written as `mask` is shorthand for `mask: mask`. It reads or
+moves the binding exactly as the explicit initializer does.
 
 ### 4.6. Enums
 
@@ -257,7 +282,7 @@ exposes its variants. Matching may destructure payloads.
 pub enum ParseError { Length, Digit }
 
 // Conceptual payload form from the design:
-// Invalid(u8 byte)
+// Invalid(byte: u8)
 ```
 
 The conceptual payload example does not establish a complete payload grammar.
@@ -268,19 +293,29 @@ Basic type-parameter generics use angle brackets, as in `Name<T>`. Every
 instantiation must satisfy ordinary type and ownership checks. There are no
 traits, specialization, user-defined implicit conversions, or metaprogramming.
 
-Generic parameter constraints, variance, inference, generation strategy, and
-cross-package instantiation rules are unspecified.
+Function calls and struct literals infer omitted type arguments from their
+arguments or fields and an expected result type. For example, `identity(42i32)`
+and `Box{value: 42i32}` infer i32. An expected type also constrains unsuffixed
+literals, as in `value: i32 = identity(42)`. Inference is local; it does not infer
+function signatures from bodies or solve types from later statements. Conflicting
+or unresolved type arguments require a diagnostic. Explicit arguments remain
+available, such as `identity<i32>(42)`.
+
+`some(value)` infers `Option<T>` from its payload when no expected type exists.
+`none`, `ok`, and `err` still need enough context to determine their full types.
+Generic constraints, variance, and separately compiled interfaces remain open.
 
 ## 5. Bindings and initialization
 
 ### 5.1. Local bindings
 
 `:=` declares a mutable local whose type follows from its initializer and
-surrounding constraints. Explicit declarations put the type first:
+surrounding constraints. Explicit declarations use `name: Type`, consistently
+with parameters, fields, and enum payloads:
 
 ```dodo
 name := value
-u32 count = 0
+count: u32 = 0
 ```
 
 ### 5.2. Constants
@@ -288,8 +323,14 @@ u32 count = 0
 `const` declares a compile-time constant:
 
 ```dodo
-const u32 LIMIT = 64
+const LIMIT: u32 = 64
 ```
+
+Constants may refer to other constants, including imported public constants and
+previously declared local constants. Package constants may refer forward; cycles
+are rejected. Arithmetic uses the declared types and selected target width.
+Runtime variables and mutable static storage cannot determine a constant or
+array length. Compile-time function calls are not part of this revision.
 
 ### 5.3. Definite initialization
 
@@ -302,8 +343,10 @@ every applicable control-flow path.
 
 ### 6.1. Functions
 
-Every function declares its return type. A function that returns no value uses
-`-> void`. Returns are explicit; a final expression is not an implicit return.
+An omitted return type means `void`; `fn reset() {}` and
+`fn reset() -> void {}` have the same signature. Functions returning a value
+must declare its type. Function returns remain explicit; a final expression in
+a function body is not an implicit return.
 
 ```dodo
 pub fn add(a: u32, b: u32) -> u32 {
@@ -329,9 +372,12 @@ Methods are declared inside their struct. Their first parameter is named `self`:
 
 | Receiver | Effect |
 | --- | --- |
-| `self: &Self` | Shared read access |
-| `self: &mut Self` | Exclusive mutable access |
-| `self: Self` | Consumes the value |
+| `&self` | Shared read access |
+| `&mut self` | Exclusive mutable access |
+| `self` | Consumes the value |
+
+The equivalent explicit forms `self: &Self`, `self: &mut Self`, and
+`self: Self` remain accepted. Shorthand is valid only for struct receivers.
 
 `item.update()` automatically borrows or reborrows the receiver as needed. A
 function inside a struct without a receiver is called as `Type.name(...)`.
@@ -439,7 +485,7 @@ replacing it.
 A struct may declare the reserved method:
 
 ```dodo
-fn drop(self: &mut Self) -> void {
+fn drop(&mut self) {
     // cleanup
 }
 ```
@@ -508,6 +554,21 @@ if condition {
 }
 ```
 
+`if`, `match`, `unsafe`, and plain blocks can also produce values in expression
+positions. The final expression in a value block supplies its value:
+
+```dodo
+limit := if fast { 100u32 } else { 10u32 }
+value := unsafe { ptr.read(pointer) }
+```
+
+Every continuing path must supply a value of the same type, and at least one
+value-producing path must exist. Other paths may return, propagate an error,
+break, or continue as permitted by their enclosing function and loops. Only the
+selected branches execute. A value is transferred out before the block's locals
+are destroyed in reverse order. Borrows of the block's local storage cannot
+escape. Newlines and semicolons remain statement separators inside value blocks.
+
 ### 11.2. Loops
 
 `for` is the only loop keyword. `break` and `continue` apply to the nearest
@@ -517,13 +578,24 @@ enclosing loop.
 for { ... }
 for condition { ... }
 for i := 0; i < n; i += 1 { ... }
+for i in 0..n { ... }
+for _ in 0..n { ... }
 for item in items { ... }
 for index, item in items { ... }
 for item in &mut items { ... }
 for index, item in &mut items { ... }
 ```
 
-Foreach initially supports arrays and slices. It evaluates its input once,
+A range loop `for i in start..end` visits integers from start up to, excluding,
+end. Its integer bounds have the same type, inferred from typed bounds or the
+ordinary integer default. Both bounds are evaluated once, left to right, before
+the loop. A reversed or empty range performs zero iterations. Each iteration
+gets a fresh binding; assigning to it does not alter the loop counter. `_`
+discards the iteration value. `break` and `continue` keep their ordinary cleanup
+semantics. Ranges are built-in loop syntax, without an iterator protocol or a
+first-class range type.
+
+Collection foreach supports arrays and slices. It evaluates its input once,
 borrows rather than consumes the collection, and creates fresh bindings on each
 iteration. Indexed forms bind a `usize` index. Shared iteration binds `&T`
 elements; mutable iteration binds `&mut T` elements.
@@ -534,7 +606,8 @@ escape its iteration in version 0.1. There is no iterator protocol and no
 
 ### 11.3. Matching
 
-`match` is an exhaustive statement with no fallthrough:
+`match` is exhaustive and has no fallthrough. In statement position its arms
+contain blocks:
 
 ```dodo
 match value {
@@ -543,7 +616,17 @@ match value {
 }
 ```
 
-Patterns include literals, enum variants, payload bindings, and `_`. Matching an
+In expression position arms may contain a single expression or a value block:
+
+```dodo
+return match parsed {
+    ok(value) => value,
+    err(_) => fallback,
+}
+```
+
+Patterns include literals, enum variants, payload bindings, and `_`. Variant
+names may omit the enum qualifier when matching a value of that enum type. Matching an
 owned non-copy value consumes it. Matching `&value` or `&mut value` borrows its
 payloads.
 
@@ -770,15 +853,15 @@ parameters.
 package samples
 
 pub struct Samples {
-    [4]u16 values
+    values: [4]u16
 
-    pub fn offset(self: &mut Self, amount: u16) -> void {
+    pub fn offset(&mut self, amount: u16) {
         for value in &mut self.values {
             *value += amount
         }
     }
 
-    pub fn weighted_sum(self: &Self) -> u32 {
+    pub fn weighted_sum(&self) -> u32 {
         total := 0u32
         for i, value in self.values {
             weight := i as u32 + 1
@@ -787,19 +870,19 @@ pub struct Samples {
         return total
     }
 
-    pub fn view(self: &Self) -> &[u16] {
+    pub fn view(&self) -> &[u16] {
         return &self.values
     }
 }
 
 pub fn demo() -> u32 {
     samples := Samples{
-        values: [4]u16{1, 2, 3, 4},
+        values: [1, 2, 3, 4],
     }
 
     view := samples.view()
-    first := view[0]       // Copies u16; last use of view.
-    samples.offset(10)     // The shared loan has ended.
+    first := view[0]
+    samples.offset(10)
     return samples.weighted_sum() + first as u32
 }
 ```
@@ -833,16 +916,15 @@ pub fn parse_byte(text: &[u8]) -> u8!ParseError {
     if text.len != 2 {
         return err(ParseError.Length)
     }
-
     high := nibble(text[0])?
     low := nibble(text[1])?
     return ok((high << 4) | low)
 }
 
 pub fn parse_or(text: &[u8], fallback: u8) -> u8 {
-    match parse_byte(text) {
-        ok(value) => { return value }
-        err(_) => { return fallback }
+    return match parse_byte(text) {
+        ok(value) => value,
+        err(_) => fallback,
     }
 }
 ```
@@ -859,36 +941,34 @@ package gpio
 import "core/mmio"
 
 pub struct Pin {
-    usize set_address
-    usize clear_address
-    u32 mask
+    set_address: usize
+    clear_address: usize
+    mask: u32
 
-    // SAFETY: Valid, aligned 32-bit SET/CLEAR registers;
-    // valid mask; exclusive access; peripheral stays
-    // powered and configured for this handle's lifetime.
+    // SAFETY: The caller supplies valid, aligned 32-bit SET/CLEAR registers,
+    // a valid mask, and exclusive peripheral access for the handle's lifetime.
+    // The peripheral must remain powered and configured while the handle exists.
     pub unsafe fn claim(set: usize, clear: usize, mask: u32) -> Pin {
-        return Pin{
-            set_address: set,
-            clear_address: clear,
-            mask: mask,
-        }
+        return Pin{set_address: set, clear_address: clear, mask}
     }
 
-    pub fn high(self: &mut Self) -> void {
+    pub fn high(&mut self) {
+        // SAFETY: claim's contract guarantees a valid exclusive SET register.
         unsafe {
             mmio.write32(self.set_address, self.mask)
         }
     }
 
-    pub fn low(self: &mut Self) -> void {
+    pub fn low(&mut self) {
+        // SAFETY: claim's contract guarantees a valid exclusive CLEAR register.
         unsafe {
             mmio.write32(self.clear_address, self.mask)
         }
     }
 }
 
-pub fn pulse(pin: &mut Pin, count: usize) -> void {
-    for i := 0; i < count; i += 1 {
+pub fn pulse(pin: &mut Pin, count: usize) {
+    for _ in 0..count {
         pin.high()
         pin.low()
     }
@@ -916,24 +996,24 @@ import-decl   = "import", string-literal, newline ;
 declaration   = [ "pub" ],
                 ( function-decl | struct-decl | enum-decl )
               | const-decl ;
-const-decl    = "const", type, identifier, "=", expression, newline ;
+const-decl    = "const", identifier, ":", type, "=", expression, newline ;
 
 function-decl = [ "unsafe" ], [ "extern", string-literal ],
-                "fn", identifier, "(", [ parameters ], ")",
-                "->", type, [ borrow-source ], block ;
+                "fn", identifier, [ type-params ], "(", [ parameters ], ")",
+                [ "->", type ], [ borrow-source ], block ;
 parameters    = parameter, { ",", parameter } ;
-parameter     = identifier, ":", type ;
+parameter     = identifier, ":", type | "self" | "&", [ "mut" ], "self" ;
 borrow-source = "from", "(", ( "static" | identifier-list ), ")" ;
 
 struct-decl   = "struct", identifier, [ type-params ], "{",
                 { field-decl | function-decl }, "}" ;
-field-decl    = [ "pub" ], type, identifier, newline ;
+field-decl    = [ "pub" ], identifier, ":", type, newline ;
 enum-decl     = "enum", identifier, [ type-params ], "{",
                 enum-variant, { ",", enum-variant }, "}" ;
 
 type          = primitive-type
               | identifier, [ type-args ]
-              | "[", integer-literal, "]", type
+              | "[", constant-expression, "]", type
               | "&", [ "mut" ], type
               | "&", [ "mut" ], "[", type, "]"
               | "*const", type | "*mut", type
@@ -944,7 +1024,7 @@ statement     = local-decl | expression-stmt | return-stmt
               | if-stmt | for-stmt | match-stmt
               | break-stmt | continue-stmt | unsafe-block ;
 local-decl    = identifier, ":=", expression, newline
-              | type, identifier, "=", expression, newline ;
+              | identifier, ":", type, [ "=", expression ], newline ;
 return-stmt   = "return", [ expression ], newline ;
 if-stmt       = "if", expression, block,
                 { "else", "if", expression, block },
@@ -953,12 +1033,19 @@ for-stmt      = "for", block
               | "for", expression, block
               | "for", for-init, ";", expression, ";",
                 expression, block
-              | "for", identifier, "in", expression, block
+              | "for", identifier, "in", expression, [ "..", expression ], block
               | "for", identifier, ",", identifier,
                 "in", expression, block ;
 match-stmt    = "match", expression, "{", { match-arm }, "}" ;
 match-arm     = pattern, "=>", block ;
 unsafe-block  = "unsafe", block ;
+array-literal = "[", [ expression, { ",", expression }, [ "," ] ], "]"
+              | "[", expression, ";", constant-expression, "]" ;
+struct-field  = identifier, [ ":", expression ] ;
+subslice      = expression, "[", [ expression ], "..", [ expression ], "]" ;
+match-expr    = "match", expression, "{", { value-arm }, "}" ;
+value-arm     = pattern, "=>", ( expression | value-block ), [ "," ] ;
+value-block   = "{", { statement }, expression, "}" ;
 ```
 
 ## Appendix B. Conformance checklist
@@ -966,7 +1053,10 @@ unsafe-block  = "unsafe", block ;
 A compiler claiming Dodo 0.1 conformance should, at minimum:
 
 - Accept the specified declarations, functions, methods, control flow, and types.
-- Require explicit return types and explicit returns.
+- Default omitted return types to void and require explicit function returns.
+- Infer local generic arguments and array elements where the context suffices.
+- Resolve constant dependencies and reject cycles and invalid array lengths.
+- Preserve evaluation order, ownership, and cleanup in value blocks and ranges.
 - Enforce definite initialization and invalidation after moves.
 - Enforce shared-versus-exclusive borrowing for overlapping memory.
 - Check borrowed-return contracts and reject references escaping destroyed locals.
@@ -994,9 +1084,9 @@ independent implementations are expected to agree on output or diagnostics.
 3. **Primitive representation:** Signed-integer representation, floating-point
    model, Boolean representation, pointer-sized widths per target, and endianness.
 4. **Enums and Option:** All payload forms, discriminants, layout, niche
-   optimizations, and concrete `some`/`none` construction syntax.
-5. **Generics:** Parameter grammar, constraints, inference, separate compilation,
-   instantiation, variance, and code sharing.
+   optimizations, and further optional-value operations.
+5. **Generics:** Constraints, inference beyond the local rules in section 4.7,
+   separate compilation, instantiation, variance, and code sharing.
 6. **Patterns:** Complete grammar, binding modes, and exhaustiveness algorithm.
 7. **Pointers:** Provenance, integer conversion, foreign-allocation identity, and
    the alias model governing unsafe raw access.

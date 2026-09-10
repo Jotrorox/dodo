@@ -13,6 +13,7 @@ pub fn parse(source: &str) -> ParseResult<Program> {
         self_type: None,
         angle_splits: Vec::new(),
         depth: 0,
+        slice_first: false,
     }
     .program()
 }
@@ -26,6 +27,7 @@ struct Parser {
     // without cloning the token stream for every expression statement.
     angle_splits: Vec<(usize, Token)>,
     depth: usize,
+    slice_first: bool,
 }
 
 #[derive(Default)]
@@ -38,8 +40,8 @@ struct Modifiers {
 
 impl Parser {
     fn nested<T>(&mut self, operation: impl FnOnce(&mut Self) -> ParseResult<T>) -> ParseResult<T> {
-        if self.depth >= 128 {
-            return Err(self.error("syntax nesting exceeds the supported limit of 128 levels"));
+        if self.depth >= 64 {
+            return Err(self.error("syntax nesting exceeds the supported limit of 64 levels"));
         }
         self.depth += 1;
         let result = operation(self);
@@ -336,13 +338,30 @@ impl Parser {
             if !mutable && self.eat("str") {
                 return Ok(Type::Str);
             }
-            if self.at("[")
-                && !matches!(
-                    self.tokens.get(self.cursor + 1).map(|t| &t.kind),
-                    Some(TokenKind::Int(..))
-                )
-            {
-                self.bump();
+            if self.at("[") {
+                let saved = self.cursor;
+                let angles = self.angle_splits.len();
+                if self.slice_first {
+                    let slice: ParseResult<Type> = (|| {
+                        self.expect("[")?;
+                        self.newlines();
+                        let inner = self.ty()?;
+                        self.newlines();
+                        self.expect("]")?;
+                        Ok(Type::Slice(mutable, Box::new(inner)))
+                    })();
+                    if let Ok(slice) = slice {
+                        return Ok(slice);
+                    }
+                    self.cursor = saved;
+                    self.restore_angles(angles);
+                }
+                if let Ok(array) = self.type_atom() {
+                    return Ok(Type::Ref(mutable, Box::new(array)));
+                }
+                self.cursor = saved;
+                self.restore_angles(angles);
+                self.expect("[")?;
                 self.newlines();
                 let inner = self.ty()?;
                 self.newlines();
@@ -362,24 +381,19 @@ impl Parser {
         }
         if self.eat("[") {
             self.newlines();
-            let Token {
-                kind: TokenKind::Int(size, None),
-                span,
-            } = self.bump()
-            else {
-                return Err(
-                    self.error("array lengths must be untyped nonnegative integer literals")
-                );
-            };
-            let size = usize::try_from(size).map_err(|_| {
-                Diagnostic::new(
-                    span,
-                    "array length exceeds the compiler host's address space",
-                )
-            })?;
+            let size = self.expression(false)?;
             self.newlines();
             self.expect("]")?;
-            return Ok(Type::Array(size, Box::new(self.type_atom()?)));
+            let element = Box::new(self.type_atom()?);
+            return Ok(match size.kind {
+                ExprKind::Int(n, None) => Type::Array(
+                    usize::try_from(n).map_err(|_| {
+                        self.error("array length exceeds the compiler host's address space")
+                    })?,
+                    element,
+                ),
+                _ => Type::ArrayExpr(Box::new(LengthExpr::from_expr(size)?), element),
+            });
         }
         if self.eat("void") {
             return Ok(Type::Void);
@@ -500,8 +514,7 @@ impl Parser {
                 if field_mods.unsafe_ || field_mods.extern_ || field_mods.repr_c {
                     return Err(self.error("struct fields only support the `pub` modifier"));
                 }
-                let ty = self.ty()?;
-                let field_name = self.identifier()?;
+                let (field_name, ty) = self.typed_name()?;
                 fields.push(Field {
                     name: field_name,
                     ty,
@@ -551,13 +564,15 @@ impl Parser {
                         self.expect(":")?;
                         (name, self.ty()?)
                     } else {
-                        let ty = self.ty()?;
-                        let name = if matches!(self.token().kind, TokenKind::Ident(_)) {
-                            self.identifier()?
+                        let saved = self.cursor;
+                        let angles = self.angle_splits.len();
+                        if let Ok(named) = self.typed_name() {
+                            named
                         } else {
-                            fields.len().to_string()
-                        };
-                        (name, ty)
+                            self.cursor = saved;
+                            self.restore_angles(angles);
+                            (fields.len().to_string(), self.ty()?)
+                        }
                     };
                     fields.push(Field {
                         name: field_name,
@@ -602,10 +617,27 @@ impl Parser {
         let mut params = Vec::new();
         while !self.eat(")") {
             let param_start = self.span().start;
-            let name = self.identifier()?;
-            self.expect(":")?;
-            self.newlines();
-            let ty = self.ty()?;
+            let (name, ty) = if self.at("&") || (self.at("self") && !self.look(1, ":")) {
+                let borrow = self.eat("&");
+                let mutable = borrow && self.eat("mut");
+                self.expect("self")?;
+                let owner = self.self_type.clone().ok_or_else(|| {
+                    self.error("receiver shorthand is only valid inside a struct")
+                })?;
+                (
+                    "self".into(),
+                    if borrow {
+                        Type::Ref(mutable, Box::new(owner))
+                    } else {
+                        owner
+                    },
+                )
+            } else {
+                let name = self.identifier()?;
+                self.expect(":")?;
+                self.newlines();
+                (name, self.ty()?)
+            };
             params.push(Param {
                 name,
                 ty,
@@ -619,11 +651,12 @@ impl Parser {
                 break;
             }
         }
-        self.expect("->").map_err(|d| {
-            d.note("every function needs an explicit return type; use `-> void` for no result")
-        })?;
-        self.newlines();
-        let ret = self.ty()?;
+        let ret = if self.eat("->") {
+            self.newlines();
+            self.ty()?
+        } else {
+            Type::Void
+        };
         let mut from = Vec::new();
         if self.eat("from") {
             self.expect("(")?;
@@ -675,8 +708,7 @@ impl Parser {
             self.expect("const")?;
             false
         };
-        let ty = self.ty()?;
-        let name = self.identifier()?;
+        let (name, ty) = self.typed_name()?;
         self.expect("=")?;
         self.newlines();
         let value = self.expression(true)?;
@@ -736,7 +768,7 @@ impl Parser {
             self.for_statement()?
         } else if self.eat("match") {
             compound = true;
-            self.match_statement()?
+            self.match_statement(false)?
         } else if self.eat("unsafe") {
             compound = true;
             self.newlines();
@@ -754,10 +786,37 @@ impl Parser {
         }
         Ok(Stmt { kind, span })
     }
+    fn typed_name(&mut self) -> ParseResult<(String, Type)> {
+        if self.look(1, ":") {
+            let name = self.identifier()?;
+            self.expect(":")?;
+            self.newlines();
+            Ok((name, self.ty()?))
+        } else {
+            let saved = self.cursor;
+            let angles = self.angle_splits.len();
+            let first = (|| {
+                let ty = self.ty()?;
+                Ok((self.identifier()?, ty))
+            })();
+            if first.is_ok() {
+                return first;
+            }
+            self.cursor = saved;
+            self.restore_angles(angles);
+            let previous = self.slice_first;
+            self.slice_first = true;
+            let alternate: ParseResult<(String, Type)> = (|| {
+                let ty = self.ty()?;
+                Ok((self.identifier()?, ty))
+            })();
+            self.slice_first = previous;
+            alternate.or(first)
+        }
+    }
     fn simple_statement(&mut self, allow_struct: bool) -> ParseResult<StmtKind> {
         if self.eat("const") {
-            let ty = self.ty()?;
-            let name = self.identifier()?;
+            let (name, ty) = self.typed_name()?;
             self.expect("=")?;
             self.newlines();
             return Ok(StmtKind::Let {
@@ -778,13 +837,25 @@ impl Parser {
                 constant: false,
             });
         }
+        if self.look(1, ":") {
+            let (name, ty) = self.typed_name()?;
+            let value = if self.eat("=") {
+                self.newlines();
+                Some(self.expression(allow_struct)?)
+            } else {
+                None
+            };
+            return Ok(StmtKind::Let {
+                name,
+                ty,
+                value,
+                constant: false,
+            });
+        }
         // A type-first declaration is unambiguous once followed by its binding name.
         let saved = self.cursor;
         let saved_angles = self.angle_splits.len();
-        if let Ok(ty) = self.ty()
-            && matches!(&self.token().kind, TokenKind::Ident(name) if !reserved(name) && name != "as")
-        {
-            let name = self.identifier()?;
+        if let Ok((name, ty)) = self.typed_name() {
             let value = if self.eat("=") {
                 self.newlines();
                 Some(self.expression(allow_struct)?)
@@ -866,6 +937,7 @@ impl Parser {
         })
     }
     fn for_statement(&mut self) -> ParseResult<StmtKind> {
+        let start = self.span().start;
         if self.at("{") {
             return Ok(StmtKind::For {
                 init: None,
@@ -882,7 +954,15 @@ impl Parser {
                 (None, first)
             };
             self.expect("in")?;
-            let iterable = self.expression(false)?;
+            let mut iterable = self.expression(false)?;
+            if self.eat("..") {
+                self.newlines();
+                let end = self.expression(false)?;
+                iterable = Expr::new(
+                    ExprKind::Range(Box::new(iterable), Box::new(end)),
+                    self.since(start),
+                );
+            }
             self.newlines();
             let body = self.block()?;
             return Ok(StmtKind::ForEach {
@@ -950,7 +1030,7 @@ impl Parser {
             })
         }
     }
-    fn match_statement(&mut self) -> ParseResult<StmtKind> {
+    fn match_statement(&mut self, value_mode: bool) -> ParseResult<StmtKind> {
         let value = self.expression(false)?;
         self.newlines();
         self.expect("{")?;
@@ -964,7 +1044,21 @@ impl Parser {
             let pattern = self.pattern()?;
             self.expect("=>")?;
             self.newlines();
-            let body = self.block()?;
+            let body = if self.at("{") {
+                let mut body = self.block()?;
+                if value_mode {
+                    Self::yield_tail(&mut body)?;
+                }
+                body
+            } else if value_mode {
+                let value = self.expression(true)?;
+                vec![Stmt {
+                    span: value.span,
+                    kind: StmtKind::Yield(value),
+                }]
+            } else {
+                return Err(self.error("statement match arms require a braced block"));
+            };
             arms.push(MatchArm {
                 pattern,
                 body,
@@ -1048,8 +1142,16 @@ impl Parser {
         };
         let mut lhs = if let Some(op) = unary {
             self.newlines();
-            let rhs = self.expr_bp(23, allow_struct)?;
-            Expr::new(ExprKind::Unary(op, Box::new(rhs)), self.since(start))
+            let mut rhs = self.expr_bp(23, allow_struct)?;
+            if matches!(op, UnaryOp::Borrow | UnaryOp::BorrowMut)
+                && let ExprKind::Slice { mutable, .. } = &mut rhs.kind
+            {
+                *mutable = op == UnaryOp::BorrowMut;
+                rhs.span = self.since(start);
+                rhs
+            } else {
+                Expr::new(ExprKind::Unary(op, Box::new(rhs)), self.since(start))
+            }
         } else {
             self.primary(allow_struct)?
         };
@@ -1064,14 +1166,35 @@ impl Parser {
                 }
                 if self.eat("[") {
                     self.soft_newlines += 1;
-                    let index = self.expression(true)?;
+                    self.newlines();
+                    let index = if self.at("..") {
+                        None
+                    } else {
+                        Some(Box::new(self.expression(true)?))
+                    };
+                    let kind = if self.eat("..") {
+                        self.newlines();
+                        let end = if self.at("]") {
+                            None
+                        } else {
+                            Some(Box::new(self.expression(true)?))
+                        };
+                        ExprKind::Slice {
+                            base: Box::new(lhs),
+                            start: index,
+                            end,
+                            mutable: false,
+                        }
+                    } else {
+                        ExprKind::Index(
+                            Box::new(lhs),
+                            index.ok_or_else(|| self.error("expected an index"))?,
+                        )
+                    };
                     self.newlines();
                     self.expect("]")?;
                     self.soft_newlines -= 1;
-                    lhs = Expr::new(
-                        ExprKind::Index(Box::new(lhs), Box::new(index)),
-                        self.since(start),
-                    );
+                    lhs = Expr::new(kind, self.since(start));
                     continue;
                 }
                 if self.eat(".") {
@@ -1205,6 +1328,30 @@ impl Parser {
         self.soft_newlines -= 1;
         Ok(args)
     }
+    fn yield_tail(block: &mut Block) -> ParseResult<()> {
+        let Some(last) = block.last_mut() else {
+            return Ok(());
+        };
+        match &mut last.kind {
+            StmtKind::Expr(e) => last.kind = StmtKind::Yield(e.clone()),
+            StmtKind::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                Self::yield_tail(then_block)?;
+                Self::yield_tail(else_block)?;
+            }
+            StmtKind::Match { arms, .. } => {
+                for arm in arms {
+                    Self::yield_tail(&mut arm.body)?;
+                }
+            }
+            StmtKind::Block(b) | StmtKind::Unsafe(b) => Self::yield_tail(b)?,
+            _ => (),
+        }
+        Ok(())
+    }
     fn primary(&mut self, allow_struct: bool) -> ParseResult<Expr> {
         let start = self.span().start;
         let token = self.bump();
@@ -1212,6 +1359,28 @@ impl Parser {
             TokenKind::Int(value, ty) => ExprKind::Int(value, ty),
             TokenKind::Float(value, ty) => ExprKind::Float(value, ty),
             TokenKind::String(value, byte) => ExprKind::String(value, byte),
+            TokenKind::Ident(name) if name == "if" || name == "match" || name == "unsafe" => {
+                let kind = match name.as_str() {
+                    "if" => self.if_statement()?,
+                    "match" => self.match_statement(true)?,
+                    _ => {
+                        self.newlines();
+                        StmtKind::Unsafe(self.block()?)
+                    }
+                };
+                let mut body = vec![Stmt {
+                    kind,
+                    span: self.since(start),
+                }];
+                Self::yield_tail(&mut body)?;
+                ExprKind::ValueBlock(body)
+            }
+            TokenKind::Symbol("{") => {
+                self.cursor -= 1;
+                let mut body = self.block()?;
+                Self::yield_tail(&mut body)?;
+                ExprKind::ValueBlock(body)
+            }
             TokenKind::Ident(name) if name == "true" || name == "false" => {
                 ExprKind::Bool(name == "true")
             }
@@ -1245,32 +1414,75 @@ impl Parser {
                 value.span = self.since(start);
                 return Ok(value);
             }
-            TokenKind::Symbol("[") => {
-                self.cursor -= 1;
-                let ty = self.ty()?;
-                if !matches!(ty, Type::Array(..)) {
-                    return Err(self.error("array literal requires a fixed array type"));
-                }
-                self.expect("{")?;
-                self.soft_newlines += 1;
-                self.newlines();
-                let mut values = Vec::new();
-                while !self.eat("}") {
-                    values.push(self.expression(true)?);
-                    self.newlines();
-                    if self.eat(",") {
-                        self.newlines();
-                    } else {
-                        self.expect("}")?;
-                        break;
-                    }
-                }
-                self.soft_newlines -= 1;
-                ExprKind::Array(ty, values)
-            }
+            TokenKind::Symbol("[") => return self.array_literal(start),
             _ => return Err(Diagnostic::new(token.span, "expected an expression")),
         };
         Ok(Expr::new(kind, self.since(start)))
+    }
+    fn array_literal(&mut self, start: usize) -> ParseResult<Expr> {
+        self.cursor -= 1;
+        let saved = self.cursor;
+        let angles = self.angle_splits.len();
+        let legacy = self
+            .ty()
+            .ok()
+            .filter(|t| matches!(t, Type::Array(..) | Type::ArrayExpr(..)) && self.at("{"));
+        if legacy.is_none() {
+            self.cursor = saved;
+            self.restore_angles(angles);
+            self.expect("[")?;
+            self.soft_newlines += 1;
+            self.newlines();
+            let mut values = Vec::new();
+            if !self.at("]") {
+                values.push(self.expression(true)?);
+                if self.eat(";") {
+                    self.newlines();
+                    let length = LengthExpr::from_expr(self.expression(false)?)?;
+                    self.newlines();
+                    self.expect("]")?;
+                    self.soft_newlines -= 1;
+                    return Ok(Expr::new(
+                        ExprKind::Repeat(
+                            Box::new(values.remove(0)),
+                            Type::ArrayExpr(Box::new(length), Box::new(Type::Unknown)),
+                        ),
+                        self.since(start),
+                    ));
+                }
+                while self.eat(",") {
+                    self.newlines();
+                    if self.at("]") {
+                        break;
+                    }
+                    values.push(self.expression(true)?);
+                }
+            }
+            self.newlines();
+            self.expect("]")?;
+            self.soft_newlines -= 1;
+            return Ok(Expr::new(
+                ExprKind::Array(Type::Array(values.len(), Box::new(Type::Unknown)), values),
+                self.since(start),
+            ));
+        }
+        let ty = legacy.unwrap();
+        self.expect("{")?;
+        self.soft_newlines += 1;
+        self.newlines();
+        let mut values = Vec::new();
+        while !self.eat("}") {
+            values.push(self.expression(true)?);
+            self.newlines();
+            if self.eat(",") {
+                self.newlines();
+            } else {
+                self.expect("}")?;
+                break;
+            }
+        }
+        self.soft_newlines -= 1;
+        Ok(Expr::new(ExprKind::Array(ty, values), self.since(start)))
     }
     fn struct_literal(&mut self, name: String, start: usize) -> ParseResult<Expr> {
         self.expect("{")?;
@@ -1278,10 +1490,14 @@ impl Parser {
         self.newlines();
         let mut fields = Vec::new();
         while !self.eat("}") {
+            let field_start = self.span().start;
             let field = self.identifier()?;
-            self.expect(":")?;
-            self.newlines();
-            let value = self.expression(true)?;
+            let value = if self.eat(":") {
+                self.newlines();
+                self.expression(true)?
+            } else {
+                Expr::new(ExprKind::Name(field.clone()), self.since(field_start))
+            };
             fields.push((field, value));
             self.newlines();
             if self.eat(",") {
@@ -1463,9 +1679,8 @@ mod tests {
         assert_eq!(statements.len(), 7);
     }
     #[test]
-    fn rejects_missing_terminators_and_implicit_return_signatures() {
+    fn rejects_missing_terminators_and_malformed_declarations() {
         for source in [
-            "package p\nfn f() {}",
             "fn f() -> void {}",
             "package p\nfn f() -> void { x := 1 y := 2 }",
             "package p\nfn f() -> void {",

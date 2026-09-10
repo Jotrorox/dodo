@@ -8,3 +8,5 @@ pub mod lsp;
 pub mod package;
 pub mod parser;
 pub mod sema;
+
+mod prepare;
