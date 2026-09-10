@@ -410,40 +410,70 @@ impl Names<'_> {
         }
         output
     }
+    fn length(
+        &self,
+        length: &mut LengthExpr,
+        locals: &BTreeSet<String>,
+        generics: &BTreeSet<String>,
+    ) {
+        match length {
+            LengthExpr::Name(name) => *name = self.name(name, locals),
+            LengthExpr::Unary(_, v) => self.length(v, locals, generics),
+            LengthExpr::Binary(_, a, b) => {
+                self.length(a, locals, generics);
+                self.length(b, locals, generics);
+            }
+            LengthExpr::Cast(v, t) => {
+                self.length(v, locals, generics);
+                self.ty(t, generics);
+            }
+            LengthExpr::Int(_, Some(t)) => self.ty(t, generics),
+            _ => (),
+        }
+    }
     fn ty(&self, ty: &mut Type, generics: &BTreeSet<String>) {
+        self.scoped_ty(ty, &BTreeSet::new(), generics);
+    }
+    fn scoped_ty(&self, ty: &mut Type, locals: &BTreeSet<String>, generics: &BTreeSet<String>) {
         match ty {
             Type::Named(name) => *name = self.name(name, generics),
             Type::Generic(name, arguments) => {
                 *name = self.name(name, generics);
                 for ty in arguments {
-                    self.ty(ty, generics);
+                    self.scoped_ty(ty, locals, generics);
                 }
+            }
+            Type::ArrayExpr(length, inner) => {
+                self.length(length, locals, generics);
+                self.scoped_ty(inner, locals, generics);
             }
             Type::Array(_, inner)
             | Type::Slice(_, inner)
             | Type::Ref(_, inner)
             | Type::Raw(_, inner)
-            | Type::Option(inner) => self.ty(inner, generics),
+            | Type::Option(inner) => self.scoped_ty(inner, locals, generics),
             Type::Result(ok, error) => {
-                self.ty(ok, generics);
-                self.ty(error, generics);
+                self.scoped_ty(ok, locals, generics);
+                self.scoped_ty(error, locals, generics);
             }
             _ => {}
         }
     }
     fn expr(&self, expression: &mut Expr, locals: &BTreeSet<String>, generics: &BTreeSet<String>) {
-        self.ty(&mut expression.ty, generics);
+        self.scoped_ty(&mut expression.ty, locals, generics);
         match &mut expression.kind {
             ExprKind::Name(name) => *name = self.name(name, locals),
-            ExprKind::Int(_, Some(ty)) | ExprKind::Float(_, Some(ty)) => self.ty(ty, generics),
+            ExprKind::Int(_, Some(ty)) | ExprKind::Float(_, Some(ty)) => {
+                self.scoped_ty(ty, locals, generics)
+            }
             ExprKind::Array(ty, values) => {
-                self.ty(ty, generics);
+                self.scoped_ty(ty, locals, generics);
                 for value in values {
                     self.expr(value, locals, generics);
                 }
             }
             ExprKind::Struct(name, fields) => {
-                *name = self.type_text(name, generics);
+                *name = self.type_text(name, &generics.union(locals).cloned().collect());
                 for (_, value) in fields {
                     self.expr(value, locals, generics);
                 }
@@ -451,13 +481,17 @@ impl Names<'_> {
             ExprKind::Unary(_, value) | ExprKind::Try(value) | ExprKind::Field(value, _) => {
                 self.expr(value, locals, generics)
             }
-            ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+            ExprKind::Binary(_, left, right)
+            | ExprKind::Index(left, right)
+            | ExprKind::Range(left, right) => {
                 self.expr(left, locals, generics);
                 self.expr(right, locals, generics);
             }
-            ExprKind::Cast(value, ty) => {
+            ExprKind::Cast(value, ty)
+            | ExprKind::Repeat(value, ty)
+            | ExprKind::Constant(value, ty) => {
                 self.expr(value, locals, generics);
-                self.ty(ty, generics);
+                self.scoped_ty(ty, locals, generics);
             }
             ExprKind::Call {
                 name,
@@ -466,7 +500,7 @@ impl Names<'_> {
             } => {
                 *name = self.name(name, locals);
                 for ty in type_args {
-                    self.ty(ty, generics);
+                    self.scoped_ty(ty, locals, generics);
                 }
                 for argument in args {
                     self.expr(argument, locals, generics);
@@ -476,6 +510,15 @@ impl Names<'_> {
                 self.expr(receiver, locals, generics);
                 for argument in args {
                     self.expr(argument, locals, generics);
+                }
+            }
+            ExprKind::ValueBlock(body) => self.block(body, &mut locals.clone(), generics),
+            ExprKind::Slice {
+                base, start, end, ..
+            } => {
+                self.expr(base, locals, generics);
+                for value in start.iter_mut().chain(end) {
+                    self.expr(value, locals, generics);
                 }
             }
             _ => {}
@@ -496,7 +539,7 @@ impl Names<'_> {
             StmtKind::Let {
                 name, ty, value, ..
             } => {
-                self.ty(ty, generics);
+                self.scoped_ty(ty, locals, generics);
                 if let Some(value) = value {
                     self.expr(value, locals, generics);
                 }
@@ -506,7 +549,7 @@ impl Names<'_> {
                 self.expr(target, locals, generics);
                 self.expr(value, locals, generics);
             }
-            StmtKind::Expr(value) | StmtKind::Return(Some(value)) => {
+            StmtKind::Expr(value) | StmtKind::Yield(value) | StmtKind::Return(Some(value)) => {
                 self.expr(value, locals, generics)
             }
             StmtKind::If {
@@ -619,8 +662,12 @@ fn shift_expr(expression: &mut Expr, offset: usize) {
         ExprKind::Unary(_, value)
         | ExprKind::Try(value)
         | ExprKind::Field(value, _)
-        | ExprKind::Cast(value, _) => shift_expr(value, offset),
-        ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+        | ExprKind::Cast(value, _)
+        | ExprKind::Constant(value, _)
+        | ExprKind::Repeat(value, _) => shift_expr(value, offset),
+        ExprKind::Binary(_, left, right)
+        | ExprKind::Index(left, right)
+        | ExprKind::Range(left, right) => {
             shift_expr(left, offset);
             shift_expr(right, offset);
         }
@@ -633,6 +680,15 @@ fn shift_expr(expression: &mut Expr, offset: usize) {
             shift_expr(receiver, offset);
             for argument in args {
                 shift_expr(argument, offset);
+            }
+        }
+        ExprKind::ValueBlock(body) => shift_block(body, offset),
+        ExprKind::Slice {
+            base, start, end, ..
+        } => {
+            shift_expr(base, offset);
+            for value in start.iter_mut().chain(end) {
+                shift_expr(value, offset);
             }
         }
         _ => {}
@@ -650,6 +706,7 @@ fn shift_stmt(statement: &mut Stmt, offset: usize) {
             value: Some(value), ..
         }
         | StmtKind::Expr(value)
+        | StmtKind::Yield(value)
         | StmtKind::Return(Some(value)) => shift_expr(value, offset),
         StmtKind::Assign { target, value, .. } => {
             shift_expr(target, offset);

@@ -9,7 +9,7 @@ code needs no garbage collector, heap allocator, scheduler, or Dodo runtime.
 package hello
 
 fn main() -> i32 {
-    values := [4]i32{1, 2, 3, 4}
+    values := [1i32, 2, 3, 4]
     total := 0i32
     for item in values {
         total += *item
@@ -111,8 +111,8 @@ dodo build examples/hello.dodo -O 2 -o build/hello
 entry point. `build` defaults to `build/<source-name>`; it writes the final output
 only after compilation and linking succeed. `run` uses a temporary executable,
 cleans it up, and returns the program's exit status. Arguments after `--` are
-passed to the executable. Hosted entry points are `fn main() -> void` or
-`fn main() -> i32`; there is no built-in argument-access library yet.
+passed to the executable. Hosted entry points are `fn main()` (optionally
+`-> void`) or `fn main() -> i32`; there is no built-in argument-access library yet.
 
 ```sh
 dodo build examples/gpio.dodo --emit llvm-ir -o build/gpio.ll
@@ -137,10 +137,12 @@ object generation are covered by tests; other LLVM targets are not validated.
 
 - Fixed-width and pointer-sized integers, floats, Booleans, byte/string literals,
   arrays, checked references, slices, and raw pointers.
-- Explicitly typed and inferred bindings, constant expressions, definite
-  initialization, moves, structs with methods, enums with payloads, `Option`,
+- Consistent name-first declarations, concise receivers and field literals,
+  inferred array literals, copy-only array repetition, named constant expressions,
+  definite initialization, moves, structs with methods, enums with payloads, `Option`,
   `Result`, `?`, and exhaustive `match`.
-- All specified `for` forms, `break`, `continue`, conditional blocks, explicit
+- All specified `for` forms plus integer ranges, checked subslices, `break`,
+  `continue`, value-producing conditionals/matches/blocks, explicit
   returns, short-circuit Boolean expressions, and checked numeric conversions.
 - Shared/exclusive borrow checking, separate struct-field loans, reborrowing,
   last-use loan expiry, borrowed-return `from(...)` contracts, and borrow
@@ -148,8 +150,9 @@ object generation are covered by tests; other LLVM targets are not validated.
 - Deterministic destruction in reverse declaration order, custom `drop`,
   destruction before overwrite, and cleanup on returns, propagation, and loop
   exits. Moved values are not destroyed twice.
-- Explicit type-argument generics through monomorphization, including generic
-  structs and their methods.
+- Generics through monomorphization, including structs and methods, with local
+  type-argument inference and explicit arguments available. Option constructors
+  infer their payload types.
 - Local packages, public/private declarations and fields, unsafe blocks and
   functions, primitive/raw-pointer C ABI calls, `@repr(C)` struct layout,
   volatile MMIO, and a small compiler-provided memory/pointer core.
@@ -160,14 +163,14 @@ include source filenames, line/column locations, and notes for borrow conflicts.
 
 ## Documentation
 
-The cleaned specification is maintained in three formats in `docs/`:
+The specification is maintained in three formats in `docs/`:
 
 - [Markdown](docs/language-spec-0.1.md)
 - [Plain text](docs/language-spec-0.1.txt)
 - [PDF](docs/language-spec-0.1.pdf)
 
-It preserves the supplied specification's requirements and unresolved items.
-[Requirements](docs/spec-requirements.md) organize the original obligations;
+It incorporates the ergonomics revision and records remaining open design items.
+[Requirements](docs/spec-requirements.md) organize the current design obligations;
 [implementation decisions](docs/implementation.md) distinguish compiler choices
 and current restrictions. Regenerate the text and PDF with
 `python3 scripts/render_spec.py`; no document dependencies are needed.
@@ -193,5 +196,6 @@ trap tests avoids creating crash artifacts.
 
 The pipeline is organized into [`lexer`](src/lexer.rs),
 [`parser`](src/parser.rs), [`package`](src/package.rs),
-[`sema`](src/sema.rs), [`consteval`](src/consteval.rs), and
-[`codegen`](src/codegen.rs), with a reusable library and a small CLI driver.
+[`prepare`](src/prepare.rs), [`sema`](src/sema.rs),
+[`consteval`](src/consteval.rs), and [`codegen`](src/codegen.rs), with a reusable
+library and a small CLI driver.

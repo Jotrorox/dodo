@@ -2,7 +2,8 @@
 
 This document describes the implemented compiler. It supplements the cleaned
 [0.1 language design](language-spec-0.1.md), whose open questions remain open.
-Implementation choices below are not silent changes to that design.
+The specification includes the implemented September 2026 ergonomics revision;
+implementation-specific limits remain documented here.
 
 ## Lexing and expressions
 
@@ -31,10 +32,43 @@ evaluates the destination address once, then its previous value, then the right
 operand. Numeric operands must have compatible types; there are no implicit
 mixed-width conversions between already typed values.
 
-Constant initializers support literal expressions, checked scalar operators and
-conversions, strings, arrays, and struct literals. References to other named
-constants inside a constant initializer and compile-time function calls are not
-implemented; constants may be used normally in runtime expressions.
+Bindings, fields, constants, and parameters use `name: Type`. The earlier
+type-first forms remain supported for locals, fields, constants, and enum
+payloads. An omitted function return type means `void`. Struct receivers accept
+`self`, `&self`, and `&mut self`; field literals accept same-name shorthand.
+Function returns remain explicit.
+
+Array lists infer their length and element type from context or their elements.
+Repeated arrays evaluate their initializer once, even for a zero length, and
+require a copyable element. Constant initializers support checked scalar
+operators/conversions, strings, arrays, repeated arrays, and struct literals.
+They may reference other constants. Package constants permit forward references;
+local constants follow lexical scope. Cycles and mutable-static dependencies are
+rejected. Array lengths accept integer constant expressions and use the selected
+target width. Compile-time function calls are not implemented.
+
+Syntax nesting is bounded to 64 parser levels. Constant dependency depth is
+bounded to 128; expansion work is bounded to 200,000 nodes. Array lengths must
+fit the target's usize and LLVM's 32-bit element-count limit. Nonzero repeated
+constant arrays are limited to 1,000,000 elements; zero initialization has a
+compact representation. These limits produce diagnostics.
+
+`if`, `match`, `unsafe`, and plain blocks produce values in expression positions.
+Every continuing path must yield the same type; at least one value-producing
+path is required. Results are transferred before local cleanup. Explicit returns,
+propagation, break, and continue retain their surrounding control-flow meaning.
+The checker rejects local-storage borrows escaping a value block and preserves
+loans from earlier arguments while checking nested blocks.
+
+`for i in start..end` captures both integer bounds once and excludes end. Empty
+and reversed ranges do not iterate. Loop bindings are fresh, and assigning them
+does not change the counter. Ranges have no general value or iterator protocol.
+Subslices use `&data[start..end]` or `&mut data[start..end]`; bare slicing produces
+a shared view. Omitted bounds default to zero and length. Source and bounds are
+evaluated once and checked in every optimization profile. The captured source
+is reserved while bounds run: they may read it, but cannot move or mutate it.
+Exclusive access is established after the bounds. Indexed loans remain
+conservative: separate ranges do not prove mutable slices disjoint.
 
 Signed integers use two's complement. `isize` and `usize` follow the selected
 target's pointer width. Integer arithmetic and left shifts trap if the result
@@ -88,9 +122,13 @@ A `Result` must be forwarded, propagated, or matched with explicit `ok` and `err
 arms. Binding it and leaving scope, overwriting it unhandled, assigning it to
 `_`, or passing it to `core.drop` is rejected.
 
-Generics are monomorphized. Use explicit type arguments, for example
-`identity<i32>(42)` and `Box<i32>{value: 42}`. Generic argument inference,
-constraints/traits, specialization, and separately compiled generic interfaces
+Generics are monomorphized. Function calls and struct literals infer omitted
+type arguments from arguments, fields, and expected result types. Examples are
+`identity(42i32)`, `value: i32 = identity(42)`, and `Box{value: 42i32}`. `some(value)`
+infers its Option payload. Ambiguous calls require explicit arguments, such as
+`make<i32>()`; explicit forms remain accepted. Inference follows local expression
+context, not later uses of a binding. Function signatures remain declared.
+Constraints/traits, specialization, and separately compiled generic interfaces
 are not implemented. Recursive expansion is bounded and diagnosed.
 
 Owned local values are destroyed in reverse declaration order on normal exits.

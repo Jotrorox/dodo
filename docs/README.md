@@ -6,8 +6,8 @@ The cleaned language specification is available in three formats:
 - [Plain text](language-spec-0.1.txt).
 - [PDF](language-spec-0.1.pdf), with searchable text and section bookmarks.
 
-The specification preserves the supplied design's stated rules and marks its
-unresolved questions. It describes the intended language, not a claim that every
+The specification includes the September 2026 ergonomics revision and marks
+remaining unresolved questions. It describes the intended language, not a claim that every
 feature is implemented. Consult the project README for compiler support.
 
 Regenerate the text and PDF from the repository root with Python 3.10 or newer:

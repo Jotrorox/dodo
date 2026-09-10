@@ -37,6 +37,7 @@ fn fit(value: Scalar, ty: &Type, bits: u32) -> Result<Scalar, String> {
 }
 pub fn eval(e: &Expr, bits: u32) -> Result<Scalar, String> {
     let value = match &e.kind {
+        E::Constant(value, _) => eval(value, bits)?,
         E::Int(v, _) => Scalar::Int(*v as i128),
         E::Float(v, _) => Scalar::Float(*v),
         E::Bool(v) => Scalar::Bool(*v),
