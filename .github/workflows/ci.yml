@@ -16,7 +16,7 @@ jobs:
   compiler:
     name: Rust and LLVM 22 / Ubuntu 24.04
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
       CARGO_TERM_COLOR: always
@@ -38,12 +38,14 @@ jobs:
           sudo install -m 644 /tmp/llvm-signing-key.asc /usr/share/keyrings/llvm.asc
           echo 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' | sudo tee /etc/apt/sources.list.d/llvm22.list
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y llvm-22-dev libpolly-22-dev clang-22 build-essential
+          sudo apt-get install --no-install-recommends -y llvm-22-dev libpolly-22-dev clang-22 build-essential zlib1g-dev libzstd-dev libffi-dev
           /usr/lib/llvm-22/bin/llvm-config --version
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Check generated documents
         run: python3 scripts/render_spec.py --check
+      - name: Test ELF dependency checks
+        run: python3 scripts/test_check_linkage.py
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test parser, semantics, CLI, native output, and optimized traps
@@ -51,5 +53,39 @@ jobs:
         run: |
           ulimit -c 0
           cargo test --locked --all-targets
-      - name: Build release compiler
-        run: cargo build --locked --release
+      - name: Verify default builds embed LLVM
+        run: python3 scripts/check-linkage.py target/debug/dodo
+      - name: Build self-contained release compiler
+        run: bash scripts/build-release.sh
+      - name: Verify release only needs standard Linux runtime libraries
+        run: python3 scripts/check-linkage.py target/x86_64-unknown-linux-gnu/release/dodo --release
+      - name: Compile and run without an LLVM installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --mount type=bind,source="$PWD/target/x86_64-unknown-linux-gnu/release/dodo",target=/usr/local/bin/dodo,readonly \
+            --mount type=bind,source="$PWD/examples",target=/examples,readonly \
+            ubuntu:24.04 bash -euo pipefail -c '
+              if command -v llvm-config || command -v cc; then
+                echo "The runtime smoke test requires a clean image without compiler tools." >&2
+                exit 1
+              fi
+              dodo --version
+              dodo check /examples/hello.dodo
+              dodo build /examples/hello.dodo --emit llvm-ir -O 2 -o /tmp/hello.ll
+              dodo build /examples/hello.dodo --emit obj -O 2 -o /tmp/hello.o
+              dodo build /examples/hello.dodo --emit obj --target wasm32-unknown-unknown -O 2 -o /tmp/hello.wasm
+              test -s /tmp/hello.ll
+              test -s /tmp/hello.o
+              test -s /tmp/hello.wasm
+              apt-get update
+              apt-get install --no-install-recommends -y build-essential
+              if command -v llvm-config; then
+                echo "The C toolchain unexpectedly installed LLVM." >&2
+                exit 1
+              fi
+              dodo build /examples/hello.dodo -O 2 -o /tmp/hello
+              test "$(/tmp/hello)" = "Dodo 0.1"
+              test "$(dodo run /examples/hello.dodo -O 2)" = "Dodo 0.1"
+            '
