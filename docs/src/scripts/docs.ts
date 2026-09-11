@@ -160,6 +160,7 @@ document.addEventListener('keydown', (event) => {
 document.querySelector('.theme-toggle')?.addEventListener('click', () => {
   const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = theme;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#1a1a1a' : '#f6f6f6');
   try { localStorage.setItem('dodo-theme', theme); } catch { /* Theme still works without storage. */ }
 });
 
