@@ -1,0 +1,240 @@
+package float_decimal
+
+// Decimal conversion kernel adapted from musl v1.2.5 src/stdio/vfprintf.c,
+// fmt_fp, Copyright (c) 2005-2020 Rich Felker, et al. MIT license: LICENSE.musl.
+// Upstream: https://git.musl-libc.org/cgit/musl/tree/src/stdio/vfprintf.c?h=v1.2.5
+// The base-1e9 expansion is exact; rounding below uses integer guard/sticky
+// digits and ties-to-even, independent of the floating-point rounding mode.
+// This helper rejects nonfinite and negative inputs; fmt handles their signs
+// and special spellings before calling it.
+
+pub enum DecimalError {
+    InvalidPrecision, InvalidValue, BufferFull
+}
+pub const MAX_PRECISION: usize = 324
+
+pub fn convert(output: &mut[u8], value: f64, precision: usize, scientific: bool) -> usize!DecimalError {
+    if precision > MAX_PRECISION {
+        return err(DecimalError.InvalidPrecision)
+    }
+    if!(value >= 0.0) || value > 1.7976931348623157e308 {
+        return err(DecimalError.InvalidValue)
+    }
+    // Normalize with powers of two (exact, including every subnormal).
+    y := value
+    e2 := 0i32
+    if y != 0.0 {
+        for y >= 2.0 {
+            y = y * 0.5
+            e2 = e2 + 1
+        }
+        for y < 1.0 {
+            y = y * 2.0
+            e2 = e2 - 1
+        }
+        y = y * 268435456.0
+        e2 = e2 - 28
+    }
+    // 128 base-1e9 slots cover the complete binary64 decimal expansion.
+    big := [0u32; 128]
+    anchor := 0i32
+    if e2 >= 0 {
+        anchor = 122
+    }
+    first := anchor
+    end := anchor
+    for {
+        whole := y as u32
+        big[end as usize] = whole
+        end = end + 1
+        y = 1000000000.0 * (y - whole as f64)
+        if y == 0.0 {
+            break
+        }
+    }
+    for e2 > 0 {
+        shift := e2
+        if shift > 29 {
+            shift = 29
+        }
+        carry := 0u64
+        index := end
+        for index > first {
+            index = index - 1
+            expanded := ((big[index as usize] as u64) << (shift as u64)) + carry
+            big[index as usize] = (expanded % 1000000000) as u32
+            carry = expanded / 1000000000
+        }
+        if carry != 0 {
+            first = first - 1
+            big[first as usize] = carry as u32
+        }
+        for end > first && big[(end - 1) as usize] == 0 {
+            end = end - 1
+        }
+        e2 = e2 - shift
+    }
+    for e2 < 0 {
+        shift := 0 - e2
+        if shift > 9 {
+            shift = 9
+        }
+        carry := 0u32
+        for index in first..end {
+            remainder := big[index as usize] & ((1u32 << (shift as u32)) - 1)
+            big[index as usize] = (big[index as usize] >> (shift as u32)) + carry
+            carry = (1000000000u32 >> (shift as u32)) * remainder
+        }
+        if big[first as usize] == 0 {
+            first = first + 1
+        }
+        if carry != 0 {
+            big[end as usize] = carry
+            end = end + 1
+        }
+        e2 = e2 + shift
+    }
+    // Expand the exact limbs to decimal digits. Leading zero limbs are absent.
+    digits := [0u8; 1100]
+    length := 0usize
+    exponent := 0i32
+    if first < end {
+        divisor := 1u32
+        for big[first as usize] / divisor >= 10 {
+            divisor = divisor * 10
+        }
+        exponent = 9 * (anchor - first)
+        place := divisor
+        for place >= 10 {
+            exponent = exponent + 1;
+            place = place / 10
+        }
+        for index in first..end {
+            if index != first {
+                divisor = 100000000
+            }
+            for divisor != 0 {
+                digits[length] = ((big[index as usize] / divisor) % 10) as u8
+                length = length + 1
+                divisor = divisor / 10
+            }
+        }
+    } else {
+        digits[0] = 0
+        length = 1
+    }
+    keep := exponent + 1 + precision as i32
+    if scientific {
+        keep = 1 + precision as i32
+    }
+    if keep < 0 {
+        digits[0] = 0
+        length = 1
+        exponent = 0
+    } else if (keep as usize) < length {
+        cut := keep as usize
+        sticky := false
+        for index in cut + 1..length {
+            if digits[index] != 0 {
+                sticky = true
+            }
+        }
+        odd := false
+        if cut > 0 {
+            odd = digits[cut - 1] % 2 != 0
+        }
+        round_up := digits[cut] > 5 || (digits[cut] == 5 && (sticky || odd))
+        length = cut
+        if round_up {
+            position := cut
+            for position > 0 && digits[position - 1] == 9 {
+                position = position - 1
+                digits[position] = 0
+            }
+            if position == 0 {
+                digits[0] = 1
+                length = 1
+                exponent = exponent + 1
+            } else {
+                digits[position - 1] = digits[position - 1] + 1
+            }
+        } else if cut == 0 {
+            digits[0] = 0
+            length = 1
+            exponent = 0
+        }
+    }
+    needed := 1 + precision
+    if precision != 0 {
+        needed = needed + 1
+    }
+    exponent_digits := 2usize
+    exponent_magnitude := exponent
+    if exponent_magnitude < 0 {
+        exponent_magnitude = 0 - exponent_magnitude
+    }
+    if exponent_magnitude >= 100 {
+        exponent_digits = 3
+    }
+    if scientific {
+        needed = needed + 2 + exponent_digits
+    } else if exponent > 0 {
+        needed = needed + exponent as usize
+    }
+    if needed > output.len {
+        return err(DecimalError.BufferFull)
+    }
+    offset := 0usize
+    if scientific {
+        output[offset] = 48 + digits[0]
+        offset = offset + 1
+        if precision != 0 {
+            output[offset] = 46;
+            offset = offset + 1
+        }
+        for index in 1usize..precision + 1 {
+            digit := 0u8
+            if index < length {
+                digit = digits[index]
+            }
+            output[offset] = 48 + digit
+            offset = offset + 1
+        }
+        output[offset] = 101
+        output[offset + 1] = 43
+        if exponent < 0 {
+            output[offset + 1] = 45
+        }
+        offset = offset + 2
+        divisor := 10i32
+        if exponent_digits == 3 {
+            divisor = 100
+        }
+        for divisor != 0 {
+            output[offset] = 48 + ((exponent_magnitude / divisor) % 10) as u8
+            offset = offset + 1
+            divisor = divisor / 10
+        }
+    } else {
+        power := exponent
+        if power < 0 {
+            power = 0
+        }
+        last := 0 - precision as i32
+        for power >= last {
+            if power == -1 {
+                output[offset] = 46;
+                offset = offset + 1
+            }
+            index := exponent - power
+            digit := 0u8
+            if index >= 0 && (index as usize) < length {
+                digit = digits[index as usize]
+            }
+            output[offset] = 48 + digit
+            offset = offset + 1
+            power = power - 1
+        }
+    }
+    return ok(offset)
+}

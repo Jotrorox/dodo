@@ -49,7 +49,7 @@ fn copied_compiler_loads_bundled_sources_from_an_unrelated_directory() {
     fs::copy(env!("CARGO_BIN_EXE_dodo"), &compiler).unwrap();
     let source = workspace.write(
         "project/main.dodo",
-        "package app\nimport \"core/ascii\"\nfn main() -> i32 {\n if ascii.is_digit(55) { return 0 }\n return 1\n}\n",
+        "package app\nimport \"std/bytes\"\nfn main() -> i32 {\n if bytes.equal(b\"x\", b\"x\") { return 0 }\n return 1\n}\n",
     );
     fs::create_dir(workspace.0.join("unrelated")).unwrap();
     let output = Command::new(&compiler)
@@ -144,7 +144,14 @@ fn unknown_and_malformed_stdlib_imports_are_rejected_without_local_fallback() {
     let workspace = Workspace::new();
     workspace.write("core/missing.dodo", "package missing\n");
     workspace.write("alloc/missing.dodo", "package missing\n");
-    for import in ["core", "alloc", "core/missing", "alloc/missing"] {
+    for import in [
+        "core",
+        "alloc",
+        "std",
+        "core/missing",
+        "alloc/missing",
+        "std/missing",
+    ] {
         let source = workspace.write("main.dodo", &format!("package app\nimport \"{import}\"\n"));
         let error = package::load(&source).unwrap_err();
         assert!(error.contains("unknown standard library import"), "{error}");
@@ -280,5 +287,62 @@ fn uninitialized_storage_preserves_imported_type_namespaces() {
     assert_eq!(
         slot.fields[0].ty,
         Type::MaybeUninit(Box::new(Type::Named("storage.Item".to_owned())))
+    );
+}
+
+#[test]
+fn aliases_distinguish_same_named_packages_and_transitive_dependencies() {
+    let workspace = Workspace::new();
+    let source = workspace.write("main.dodo", "package app\nimport \"std/bytes\"\nimport \"core/bytes\" as raw\nimport \"left\"\nimport \"right\"\nfn main() -> bool { return bytes.equal(b\"x\", b\"x\") && raw.equal(b\"y\", b\"y\") && left.answer() && right.answer() }\n");
+    workspace.write("left.dodo", "package left\nimport \"std/bytes\"\npub fn answer() -> bool { return bytes.equal(b\"a\", b\"a\") }\n");
+    workspace.write("right.dodo", "package right\nimport \"core/bytes\"\npub fn answer() -> bool { return bytes.equal(b\"a\", b\"a\") }\n");
+    let mut loaded = package::load(&source).unwrap();
+    dodoc::sema::check(&mut loaded.program)
+        .unwrap_or_else(|error| panic!("{}", loaded.render(&error)));
+    for path in ["core/bytes.dodo", "std/bytes.dodo"] {
+        assert_eq!(
+            loaded
+                .sources
+                .iter()
+                .filter(|source| source.path.ends_with(path))
+                .count(),
+            1
+        );
+    }
+    let source = workspace.write(
+        "main.dodo",
+        "package app\nimport \"std/bytes\"\nimport \"core/bytes\"\n",
+    );
+    assert!(package::load(&source).unwrap_err().contains("use `import"));
+}
+
+#[test]
+fn aliases_preserve_visibility_local_shadowing_intrinsics_and_formatting() {
+    let workspace = Workspace::new();
+    workspace.write("first/values.dodo", "package values\npub fn answer() -> i32 { return hidden() }\nfn hidden() -> i32 { return 1 }\n");
+    workspace.write(
+        "second/values.dodo",
+        "package values\npub fn answer() -> i32 { return 2 }\n",
+    );
+    let text = "package app\nimport \"first/values\" as one\nimport \"second/values\" as two\nimport \"core/mem\" as memory\nfn main() -> i32 { size := memory.size_of::<u8>()\nreturn one.answer() + two.answer() + size as i32 - 4\n}\n";
+    let source = workspace.write("main.dodo", text);
+    let formatted = dodoc::format::format_source(text).unwrap();
+    assert!(formatted.contains("as memory"));
+    let mut loaded = package::load(&source).unwrap();
+    dodoc::sema::check(&mut loaded.program)
+        .unwrap_or_else(|error| panic!("{}", loaded.render(&error)));
+    workspace.write("main.dodo", &text.replace("one.answer()", "one.hidden()"));
+    let mut loaded = package::load(&source).unwrap();
+    assert!(
+        dodoc::sema::check(&mut loaded.program)
+            .unwrap_err()
+            .message
+            .contains("private")
+    );
+    workspace.write("main.dodo", "package app\nimport \"core/mem\" as memory\nfn main() -> usize { return mem.size_of::<u8>() }\n");
+    assert!(
+        package::load(&source)
+            .unwrap_err()
+            .contains("without importing")
     );
 }

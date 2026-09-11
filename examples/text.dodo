@@ -1,0 +1,43 @@
+package text_example
+
+import "std/text"
+
+// A fixed UTF-8 builder and scalar iteration, with no allocator or OS calls.
+fn example() -> i32!text.Error {
+    storage := [0u8; 32]
+    builder := text.Builder.new(&mut storage)
+    greeting := text.Text.from_str("Hello, ")
+    builder.append(&greeting)?
+    builder.push(127757)?
+    view := builder.as_text()
+    scalars := view.scalars()
+    count := 0usize
+    for {
+        match scalars.next() {
+            some(scalar) => {
+                if!text.is_scalar(scalar.value) {
+                    return ok(1)
+                }
+                count += 1
+            },
+            none => {
+                break
+            },
+        }
+    }
+    number := text.parse_i64(b"-7f", 16)?
+    if count != 8 || number != -127 {
+        return ok(2)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match example() {
+        ok(code) => {
+            return code
+        },
+        err(_) => {
+            return 3
+        },
+    }
+}

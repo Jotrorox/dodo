@@ -1,0 +1,677 @@
+package text
+
+import "core/ascii"
+import "core/bytes"
+import "core/mem"
+
+// Unicode scalar values follow Unicode 16.0.0. This package needs no Unicode
+// property tables: trimming/case-independent digits use explicitly ASCII rules.
+pub const REPLACEMENT: u32 = 65533
+pub const MAX_FLOAT_DIGITS: usize = 768
+pub enum ErrorKind {
+    InvalidLead, InvalidContinuation, Truncated, InvalidScalar,
+    OutOfBounds, NotBoundary, BufferFull, EmptyDelimiter,
+    EmptyNumber, InvalidDigit, InvalidRadix, Overflow, InvalidNumber, TooManyDigits
+}
+pub struct Error {
+    pub kind: ErrorKind
+    pub position: usize
+}
+fn failure(kind: ErrorKind, position: usize) -> Error {
+    return Error { kind: kind, position: position }
+}
+pub struct Decoded {
+    pub scalar: u32
+    pub next: usize
+}
+pub fn is_scalar(value: u32) -> bool {
+    return value <= 1114111 && (value < 55296 || value > 57343)
+}
+fn continuation(value: u8) -> bool {
+    return value >= 128 && value < 192
+}
+// Positions are byte offsets. Truncation reports the missing byte at data.len;
+// malformed continuation reports the offending byte, including range violations.
+pub fn decode(data: &[u8], offset: usize) -> Decoded!Error {
+    if offset >= data.len {
+        return err(failure(ErrorKind.OutOfBounds, offset))
+    }
+    lead := data[offset]
+    if lead < 128 {
+        return ok(Decoded { scalar: lead as u32, next: offset + 1 })
+    }
+    width := 0usize
+    value := 0u32
+    if lead >= 194 && lead <= 223 {
+        width = 2
+        value = (lead & 31) as u32
+    } else if lead >= 224 && lead <= 239 {
+        width = 3
+        value = (lead & 15) as u32
+    } else if lead >= 240 && lead <= 244 {
+        width = 4
+        value = (lead & 7) as u32
+    } else {
+        return err(failure(ErrorKind.InvalidLead, offset))
+    }
+    for i in 1usize..width {
+        if i >= data.len - offset {
+            return err(failure(ErrorKind.Truncated, data.len))
+        }
+        byte := data[offset + i]
+        if!continuation(byte) {
+            return err(failure(ErrorKind.InvalidContinuation, offset + i))
+        }
+        if i == 1 {
+            if (lead == 224 && byte < 160) || (lead == 237 && byte >= 160) || (lead == 240 && byte < 144) || (lead == 244 && byte >= 144) {
+                return err(failure(ErrorKind.InvalidScalar, offset + i))
+            }
+        }
+        value = (value << 6) | ((byte & 63) as u32)
+    }
+    return ok(Decoded { scalar: value, next: offset + width })
+}
+pub fn validate(data: &[u8]) -> void!Error {
+    offset := 0usize
+    for offset < data.len {
+        value := decode(data, offset)?
+        offset = value.next
+    }
+    return ok()
+}
+// Explicit replacement policy: one U+FFFD per malformed byte, never skips a
+// later valid leading byte. At EOF returns none; no hidden lossy conversion.
+pub fn decode_replacement(data: &[u8], offset: usize) -> Option<Decoded> {
+    if offset >= data.len {
+        return none
+    }
+    match decode(data, offset) {
+        ok(value) => {
+            return some(value)
+        },
+        err(_) => {
+            return some(Decoded { scalar: REPLACEMENT, next: offset + 1 })
+        },
+    }
+}
+pub fn encoded_len(scalar: u32) -> usize!Error {
+    if!is_scalar(scalar) {
+        return err(failure(ErrorKind.InvalidScalar, 0))
+    }
+    if scalar < 128 {
+        return ok(1)
+    }
+    if scalar < 2048 {
+        return ok(2)
+    }
+    if scalar < 65536 {
+        return ok(3)
+    }
+    return ok(4)
+}
+// Validate scalar and capacity before modifying destination. No partial encoding.
+pub fn encode(scalar: u32, destination: &mut[u8]) -> usize!Error {
+    count := encoded_len(scalar)?
+    if destination.len < count {
+        return err(failure(ErrorKind.BufferFull, destination.len))
+    }
+    if count == 1 {
+        destination[0] = scalar as u8
+    } else {
+        prefix := 192u8
+        if count == 3 {
+            prefix = 224
+        }
+        if count == 4 {
+            prefix = 240
+        }
+        destination[0] = prefix | ((scalar >> ((count - 1) as u32 * 6)) as u8)
+        for i in 1usize..count {
+            destination[i] = 128 | (((scalar >> ((count - 1 - i) as u32 * 6)) & 63) as u8)
+        }
+    }
+    return ok(count)
+}
+
+// A validated, borrowed UTF-8 byte sequence; scalar count is not grapheme count.
+// No mutable bytes are exposed, preserving validity for every derived view.
+pub struct Text {
+    data: &[u8]
+
+    pub fn new(data: &[u8]) -> Text!Error from(data) {
+        validate(data)?
+        return ok(Text { data: data })
+    }
+    pub fn from_str(value: &str) -> Text from(value) {
+        return Text { data: mem.str_bytes(value) }
+    }
+    pub fn as_bytes(&self) -> &[u8]from(self) {
+        return self.data
+    }
+    pub fn as_str(&self) -> &str from(self) {
+        unsafe {
+            return mem.str_from_utf8(self.data)
+        }
+    }
+    pub fn len_bytes(&self) -> usize {
+        return self.data.len
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.data.len == 0
+    }
+    pub fn is_boundary(&self, offset: usize) -> bool {
+        return offset <= self.data.len && (offset == self.data.len || !continuation(self.data[offset]))
+    }
+    pub fn floor_boundary(&self, offset: usize) -> usize!Error {
+        if offset > self.data.len {
+            return err(failure(ErrorKind.OutOfBounds, offset))
+        }
+        for!self.is_boundary(offset) {
+            offset -= 1
+        }
+        return ok(offset)
+    }
+    pub fn ceil_boundary(&self, offset: usize) -> usize!Error {
+        if offset > self.data.len {
+            return err(failure(ErrorKind.OutOfBounds, offset))
+        }
+        for!self.is_boundary(offset) {
+            offset += 1
+        }
+        return ok(offset)
+    }
+    pub fn slice(&self, start: usize, end: usize) -> Text!Error from(self) {
+        if start > end || end > self.data.len {
+            return err(failure(ErrorKind.OutOfBounds, end))
+        }
+        if!self.is_boundary(start) {
+            return err(failure(ErrorKind.NotBoundary, start))
+        }
+        if!self.is_boundary(end) {
+            return err(failure(ErrorKind.NotBoundary, end))
+        }
+        return ok(Text { data: &self.data[start..end] })
+    }
+    pub fn scalars(&self) -> Scalars from(self) {
+        return Scalars { data: self.data, offset: 0 }
+    }
+    pub fn len_scalars(&self) -> usize {
+        count := 0usize
+        for i in 0usize..self.data.len {
+            if!continuation(self.data[i]) {
+                count += 1
+            }
+        }
+        return count
+    }
+    // Maps a scalar index to a byte boundary, including one-past-the-end.
+    pub fn byte_offset(&self, scalar_index: usize) -> usize!Error {
+        count := 0usize
+        for i in 0usize..self.data.len {
+            if!continuation(self.data[i]) {
+                if count == scalar_index {
+                    return ok(i)
+                }
+                count += 1
+            }
+        }
+        if count == scalar_index {
+            return ok(self.data.len)
+        }
+        return err(failure(ErrorKind.OutOfBounds, scalar_index))
+    }
+    pub fn slice_scalars(&self, start: usize, end: usize) -> Text!Error from(self) {
+        if start > end {
+            return err(failure(ErrorKind.OutOfBounds, end))
+        }
+        first := self.byte_offset(start)?
+        last := self.byte_offset(end)?
+        return self.slice(first, last)
+    }
+    pub fn equal(&self, other: &Text) -> bool {
+        return bytes.equal(self.data, other.data)
+    }
+    pub fn starts_with(&self, prefix: &Text) -> bool {
+        return bytes.starts_with(self.data, prefix.data)
+    }
+    pub fn ends_with(&self, suffix: &Text) -> bool {
+        return bytes.ends_with(self.data, suffix.data)
+    }
+    // Exact UTF-8 byte search returns a byte offset; no normalization or folding.
+    pub fn find(&self, needle: &Text) -> Option<usize> {
+        if needle.data.len > self.data.len {
+            return none
+        }
+        for i in 0usize..self.data.len - needle.data.len + 1 {
+            if bytes.equal(&self.data[i..i + needle.data.len], needle.data) {
+                return some(i)
+            }
+        }
+        return none
+    }
+    pub fn trim_ascii(&self) -> Text from(self) {
+        start := 0usize
+        end := self.data.len
+        for start < end && ascii.is_whitespace(self.data[start]) {
+            start += 1
+        }
+        for end > start && ascii.is_whitespace(self.data[end - 1]) {
+            end -= 1
+        }
+        return Text { data: &self.data[start..end] }
+    }
+    // Empty delimiter is rejected. Splitting preserves leading/trailing empty
+    // fields. A splitter retains both source and delimiter borrows.
+    pub fn split(&self, delimiter: &Text) -> Split!Error from(self, delimiter) {
+        if delimiter.data.len == 0 {
+            return err(failure(ErrorKind.EmptyDelimiter, 0))
+        }
+        return ok(Split { data: self.data, delimiter: delimiter.data, offset: 0, finished: false })
+    }
+}
+pub struct Scalar {
+    pub value: u32
+    pub start: usize
+    pub end: usize
+}
+pub struct Scalars {
+    data: &[u8]
+    offset: usize
+    pub fn next(&mut self) -> Option<Scalar> {
+        if self.offset == self.data.len {
+            return none
+        }
+        start := self.offset
+        // Construction only accepts validated Text, so this branch cannot fail.
+        match decode(self.data, start) {
+            ok(value) => {
+                self.offset = value.next
+                return some(Scalar { value: value.scalar, start: start, end: value.next })
+            },
+            err(_) => {
+                return none
+            },
+        }
+    }
+}
+pub struct Split {
+    data: &[u8]
+    delimiter: &[u8]
+    offset: usize
+    finished: bool
+    pub fn next(&mut self) -> Option<Text> from(self) {
+        if self.finished {
+            return none
+        }
+        start := self.offset
+        if self.delimiter.len <= self.data.len - start {
+            for i in start..self.data.len - self.delimiter.len + 1 {
+                if bytes.equal(&self.data[i..i + self.delimiter.len], self.delimiter) {
+                    self.offset = i + self.delimiter.len
+                    return some(Text { data: &self.data[start..i] })
+                }
+            }
+        }
+        self.finished = true
+        return some(Text { data: &self.data[start..] })
+    }
+}
+// Caller-backed builder. Appends are transactional; views borrow the builder
+// and prevent append/clear while live. Capacity is fixed for its entire lifetime.
+pub struct Builder {
+    storage: &mut[u8]
+    used: usize
+    pub fn new(storage: &mut[u8]) -> Builder from(storage) {
+        return Builder { storage: storage, used: 0 }
+    }
+    pub fn len_bytes(&self) -> usize {
+        return self.used
+    }
+    pub fn capacity(&self) -> usize {
+        return self.storage.len
+    }
+    pub fn clear(&mut self) {
+        self.used = 0
+    }
+    pub fn as_text(&self) -> Text from(self) {
+        return Text { data: &self.storage[..self.used] }
+    }
+    pub fn append(&mut self, value: &Text) -> void!Error {
+        if value.data.len > self.storage.len - self.used {
+            return err(failure(ErrorKind.BufferFull, self.used))
+        }
+        for i in 0usize..value.data.len {
+            self.storage[self.used + i] = value.data[i]
+        }
+        self.used += value.data.len
+        return ok()
+    }
+    pub fn push(&mut self, scalar: u32) -> void!Error {
+        count := encode(scalar, &mut self.storage[self.used..])?
+        self.used += count
+        return ok()
+    }
+}
+fn digit(byte: u8) -> u32 {
+    if ascii.is_digit(byte) {
+        return (byte - 48) as u32
+    }
+    lowered := ascii.to_lowercase(byte)
+    if lowered >= 97 && lowered <= 122 {
+        return (lowered - 87) as u32
+    }
+    return 36
+}
+fn magnitude(data: &[u8], start: usize, radix: u32, limit: u64) -> u64!Error {
+    if radix < 2 || radix > 36 {
+        return err(failure(ErrorKind.InvalidRadix, 0))
+    }
+    if start == data.len {
+        return err(failure(ErrorKind.EmptyNumber, start))
+    }
+    value := 0u64
+    for i in start..data.len {
+        next := digit(data[i])
+        if next >= radix {
+            return err(failure(ErrorKind.InvalidDigit, i))
+        }
+        if value > (limit - (next as u64)) / (radix as u64) {
+            return err(failure(ErrorKind.Overflow, i))
+        }
+        value = value * (radix as u64) + (next as u64)
+    }
+    return ok(value)
+}
+// Full consumption; no whitespace, separators or implicit radix prefixes.
+pub fn parse_u64(data: &[u8], radix: u32) -> u64!Error {
+    start := 0usize
+    if data.len > 0 && data[0] == 43 {
+        start = 1
+    }
+    return magnitude(data, start, radix, ~0u64)
+}
+pub fn parse_i64(data: &[u8], radix: u32) -> i64!Error {
+    start := 0usize
+    negative := false
+    if data.len > 0 && (data[0] == 43 || data[0] == 45) {
+        negative = data[0] == 45
+        start = 1
+    }
+    limit := 9223372036854775807u64
+    if negative {
+        limit += 1
+    }
+    value := magnitude(data, start, radix, limit)?
+    if negative {
+        if value == 9223372036854775808u64 {
+            return ok(-9223372036854775807i64 - 1)
+        }
+        return ok(-(value as i64))
+    }
+    return ok(value as i64)
+}
+
+// Exact decimal conversion uses fixed 4096-bit integer scratch, then rounds
+// the exact rational to IEEE binary64, ties-to-even. No floating intermediate
+// rounding affects the selected mantissa. Input mantissas are capped at 768
+// digits (leading/trailing zeros count); exponent text can have any length.
+struct Big {
+    words: [128]u32
+    fn zero() -> Big {
+        return Big { words: [0u32; 128] }
+    }
+    fn one() -> Big {
+        result := Big.zero()
+        result.words[0] = 1
+        return result
+    }
+    fn clone(&self) -> Big {
+        result := Big.zero()
+        for i in 0usize..128 {
+            result.words[i] = self.words[i]
+        }
+        return result
+    }
+    fn mul_add(&mut self, multiplier: u32, addend: u32) {
+        carry := addend as u64
+        for i in 0usize..128 {
+            value := (self.words[i] as u64) * (multiplier as u64) + carry
+            self.words[i] = (value & 4294967295) as u32
+            carry = value >> 32
+        }
+    }
+    fn bits(&self) -> i32 {
+        i := 128usize
+        for i > 0 {
+            i -= 1
+            value := self.words[i]
+            if value != 0 {
+                count := 0i32
+                for value != 0 {
+                    value = value >> 1
+                    count += 1
+                }
+                return (i as i32) * 32 + count
+            }
+        }
+        return 0
+    }
+    fn compare(&self, other: &Big) -> i32 {
+        i := 128usize
+        for i > 0 {
+            i -= 1
+            if self.words[i] < other.words[i] {
+                return -1
+            }
+            if self.words[i] > other.words[i] {
+                return 1
+            }
+        }
+        return 0
+    }
+    fn shift_left(&mut self, count: i32) {
+        whole := (count / 32) as usize
+        bits := (count % 32) as u32
+        i := 128usize
+        for i > 0 {
+            i -= 1
+            value := 0u32
+            if i >= whole {
+                value = (self.words[i - whole] & (4294967295u32 >> bits)) << bits
+                if bits != 0 && i > whole {
+                    value = value | (self.words[i - whole - 1] >> (32 - bits))
+                }
+            }
+            self.words[i] = value
+        }
+    }
+    fn shift_right_one(&mut self) {
+        for i in 0usize..128 {
+            value := self.words[i] >> 1
+            if i < 127 {
+                value = value | ((self.words[i + 1] & 1) << 31)
+            }
+            self.words[i] = value
+        }
+    }
+    fn subtract(&mut self, other: &Big) {
+        borrow := 0u64
+        for i in 0usize..128 {
+            left := self.words[i] as u64
+            right := (other.words[i] as u64) + borrow
+            if left >= right {
+                self.words[i] = (left - right) as u32
+                borrow = 0
+            } else {
+                self.words[i] = (4294967296u64 + left - right) as u32
+                borrow = 1
+            }
+        }
+    }
+}
+fn signed_float(value: f64, negative: bool) -> f64 {
+    if negative {
+        return -value
+    }
+    return value
+}
+// Finite decimal grammar: [+-]?(digits(.digits?)?|.digits)([eE][+-]?digits)?
+// Rejects whitespace, NaN, infinity, hexadecimal notation, and incomplete input.
+// Overflow is recoverable; underflow rounds to subnormal or signed zero.
+pub fn parse_f64(data: &[u8]) -> f64!Error {
+    if data.len == 0 {
+        return err(failure(ErrorKind.EmptyNumber, 0))
+    }
+    offset := 0usize
+    negative := false
+    if data[0] == 43 || data[0] == 45 {
+        negative = data[0] == 45
+        offset = 1
+    }
+    if offset == data.len {
+        return err(failure(ErrorKind.EmptyNumber, offset))
+    }
+    numerator := Big.zero()
+    digits := 0usize
+    significant := 0i32
+    fraction := 0i32
+    point := false
+    nonzero := false
+    for offset < data.len {
+        byte := data[offset]
+        if byte == 46 && !point {
+            point = true
+            offset += 1
+        } else if ascii.is_digit(byte) {
+            if digits == MAX_FLOAT_DIGITS {
+                return err(failure(ErrorKind.TooManyDigits, offset))
+            }
+            digits += 1
+            next := (byte - 48) as u32
+            if next != 0 {
+                nonzero = true
+            }
+            if nonzero {
+                significant += 1
+            }
+            numerator.mul_add(10, next)
+            if point {
+                fraction += 1
+            }
+            offset += 1
+        } else {
+            break
+        }
+    }
+    if digits == 0 {
+        return err(failure(ErrorKind.InvalidNumber, offset))
+    }
+    exponent := 0i32
+    if offset < data.len && (data[offset] == 101 || data[offset] == 69) {
+        offset += 1
+        exponent_negative := false
+        if offset < data.len && (data[offset] == 43 || data[offset] == 45) {
+            exponent_negative = data[offset] == 45
+            offset += 1
+        }
+        start := offset
+        for offset < data.len && ascii.is_digit(data[offset]) {
+            // Saturation is sufficient to classify overflow/underflow and
+            // avoids rejecting arbitrarily many leading exponent zeroes.
+            if exponent < 10000 {
+                exponent = exponent * 10 + ((data[offset] - 48) as i32)
+                if exponent > 10000 {
+                    exponent = 10000
+                }
+            }
+            offset += 1
+        }
+        if start == offset {
+            return err(failure(ErrorKind.InvalidNumber, offset))
+        }
+        if exponent_negative {
+            exponent = -exponent
+        }
+    }
+    if offset != data.len {
+        return err(failure(ErrorKind.InvalidNumber, offset))
+    }
+    if!nonzero {
+        return ok(signed_float(0.0, negative))
+    }
+    exponent -= fraction
+    order := significant + exponent
+    if order > 309 {
+        return err(failure(ErrorKind.Overflow, data.len))
+    }
+    if order < -325 {
+        return ok(signed_float(0.0, negative))
+    }
+    denominator := Big.one()
+    if exponent >= 0 {
+        for i in 0i32..exponent {
+            numerator.mul_add(10, 0)
+        }
+    } else {
+        for i in 0i32..-exponent {
+            denominator.mul_add(10, 0)
+        }
+    }
+    binary_exponent := numerator.bits() - denominator.bits()
+    if binary_exponent >= 0 {
+        shifted := denominator.clone()
+        shifted.shift_left(binary_exponent)
+        if numerator.compare(&shifted) < 0 {
+            binary_exponent -= 1
+        }
+    } else {
+        shifted := numerator.clone()
+        shifted.shift_left(-binary_exponent)
+        if shifted.compare(&denominator) < 0 {
+            binary_exponent -= 1
+        }
+    }
+    if binary_exponent > 1023 {
+        return err(failure(ErrorKind.Overflow, data.len))
+    }
+    scale := binary_exponent - 52
+    if scale < -1074 {
+        scale = -1074
+    }
+    if scale < 0 {
+        numerator.shift_left(-scale)
+    } else {
+        denominator.shift_left(scale)
+    }
+    shifted := denominator.clone()
+    shifted.shift_left(53)
+    mantissa := 0u64
+    bit := 54i32
+    for bit > 0 {
+        bit -= 1
+        if numerator.compare(&shifted) >= 0 {
+            numerator.subtract(&shifted)
+            mantissa = mantissa | (1u64 << (bit as u64))
+        }
+        shifted.shift_right_one()
+    }
+    numerator.shift_left(1)
+    comparison := numerator.compare(&denominator)
+    if comparison > 0 || (comparison == 0 && (mantissa & 1) != 0) {
+        mantissa += 1
+    }
+    if binary_exponent == 1023 && mantissa == 9007199254740992u64 {
+        return err(failure(ErrorKind.Overflow, data.len))
+    }
+    result := mantissa as f64
+    if scale > 0 {
+        for i in 0i32..scale {
+            result *= 2.0
+        }
+    } else {
+        for i in 0i32..-scale {
+            result *= 0.5
+        }
+    }
+    return ok(signed_float(result, negative))
+}

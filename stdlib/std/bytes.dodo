@@ -1,0 +1,355 @@
+package bytes
+
+import "core/bytes" as raw
+
+// Byte offsets/counts, never scalar or grapheme indices. No allocation.
+pub enum RangeError {
+    OutOfBounds
+}
+
+pub fn check_range(length: usize, offset: usize, count: usize) -> void!RangeError {
+    if offset > length || count > length - offset {
+        return err(RangeError.OutOfBounds)
+    }
+    return ok()
+}
+pub fn view(data: &[u8], offset: usize, count: usize) -> &[u8]!RangeError from(data) {
+    check_range(data.len, offset, count)?
+    return ok(&data[offset..offset + count])
+}
+pub fn view_mut(data: &mut[u8], offset: usize, count: usize) -> &mut[u8]!RangeError from(data) {
+    check_range(data.len, offset, count)?
+    return ok(&mut data[offset..offset + count])
+}
+pub fn find(data: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len > data.len {
+        return none
+    }
+    i := 0usize
+    for i <= data.len - needle.len {
+        if raw.equal(&data[i..i + needle.len], needle) {
+            return some(i)
+        }
+        i = i + 1
+    }
+    return none
+}
+pub fn rfind(data: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len > data.len {
+        return none
+    }
+    i := data.len - needle.len
+    for {
+        if raw.equal(&data[i..i + needle.len], needle) {
+            return some(i)
+        }
+        if i == 0 {
+            return none
+        }
+        i = i - 1
+    }
+}
+pub fn find_byte(data: &[u8], value: u8) -> Option<usize> {
+    return raw.find(data, value)
+}
+pub fn equal(left: &[u8], right: &[u8]) -> bool {
+    return raw.equal(left, right)
+}
+pub fn compare(left: &[u8], right: &[u8]) -> i32 {
+    return raw.compare(left, right)
+}
+pub fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
+    return raw.starts_with(data, prefix)
+}
+pub fn ends_with(data: &[u8], suffix: &[u8]) -> bool {
+    return raw.ends_with(data, suffix)
+}
+
+pub struct Reader {
+    data: &[u8]
+    position: usize
+    pub fn new(data: &[u8]) -> Reader from(data) {
+        return Reader { data: data, position: 0 }
+    }
+    pub fn position(&self) -> usize {
+        return self.position
+    }
+    pub fn remaining(&self) -> usize {
+        return self.data.len - self.position
+    }
+    pub fn rest(&self) -> &[u8]from(self) {
+        return &self.data[self.position..self.data.len]
+    }
+    pub fn seek(&mut self, position: usize) -> void!RangeError {
+        check_range(self.data.len, position, 0)?
+        self.position = position
+        return ok()
+    }
+    pub fn skip(&mut self, count: usize) -> void!RangeError {
+        check_range(self.data.len, self.position, count)?
+        self.position = self.position + count
+        return ok()
+    }
+    // A failed operation leaves position unchanged.
+    pub fn take(&mut self, count: usize) -> &[u8]!RangeError from(self) {
+        check_range(self.data.len, self.position, count)?
+        start := self.position
+        self.position = self.position + count
+        return ok(&self.data[start..self.position])
+    }
+    pub fn read_u8(&mut self) -> u8!RangeError {
+        check_range(self.data.len, self.position, 1)?
+        value := self.data[self.position]
+        self.position = self.position + 1
+        return ok(value)
+    }
+    pub fn read_u16_le(&mut self) -> u16!RangeError {
+        value := read_u16_le(self.data, self.position)?
+        self.position = self.position + 2
+        return ok(value)
+    }
+
+    pub fn read_u16_be(&mut self) -> u16!RangeError {
+        value := read_u16_be(self.data, self.position)?
+        self.position = self.position + 2
+        return ok(value)
+    }
+
+    pub fn read_u32_le(&mut self) -> u32!RangeError {
+        value := read_u32_le(self.data, self.position)?
+        self.position = self.position + 4
+        return ok(value)
+    }
+
+    pub fn read_u32_be(&mut self) -> u32!RangeError {
+        value := read_u32_be(self.data, self.position)?
+        self.position = self.position + 4
+        return ok(value)
+    }
+
+    pub fn read_u64_le(&mut self) -> u64!RangeError {
+        value := read_u64_le(self.data, self.position)?
+        self.position = self.position + 8
+        return ok(value)
+    }
+
+    pub fn read_u64_be(&mut self) -> u64!RangeError {
+        value := read_u64_be(self.data, self.position)?
+        self.position = self.position + 8
+        return ok(value)
+    }
+
+}
+
+pub struct Writer {
+    data: &mut[u8]
+    position: usize
+    pub fn new(data: &mut[u8]) -> Writer from(data) {
+        return Writer { data: data, position: 0 }
+    }
+    pub fn position(&self) -> usize {
+        return self.position
+    }
+    pub fn remaining(&self) -> usize {
+        return self.data.len - self.position
+    }
+    pub fn written(&self) -> &[u8]from(self) {
+        return &self.data[0..self.position]
+    }
+    pub fn seek(&mut self, position: usize) -> void!RangeError {
+        check_range(self.data.len, position, 0)?
+        self.position = position
+        return ok()
+    }
+    // Full range is validated before any byte changes.
+    pub fn put(&mut self, data: &[u8]) -> void!RangeError {
+        check_range(self.data.len, self.position, data.len)?
+        i := 0usize
+        for i < data.len {
+            self.data[self.position + i] = data[i]
+            i = i + 1
+        }
+        self.position = self.position + data.len
+        return ok()
+    }
+    pub fn write_u8(&mut self, value: u8) -> void!RangeError {
+        check_range(self.data.len, self.position, 1)?
+        self.data[self.position] = value
+        self.position = self.position + 1
+        return ok()
+    }
+    pub fn write_u16_le(&mut self, value: u16) -> void!RangeError {
+        position := self.position
+        write_u16_le(self.data, position, value)?
+        self.position = self.position + 2
+        return ok()
+    }
+
+    pub fn write_u16_be(&mut self, value: u16) -> void!RangeError {
+        position := self.position
+        write_u16_be(self.data, position, value)?
+        self.position = self.position + 2
+        return ok()
+    }
+
+    pub fn write_u32_le(&mut self, value: u32) -> void!RangeError {
+        position := self.position
+        write_u32_le(self.data, position, value)?
+        self.position = self.position + 4
+        return ok()
+    }
+
+    pub fn write_u32_be(&mut self, value: u32) -> void!RangeError {
+        position := self.position
+        write_u32_be(self.data, position, value)?
+        self.position = self.position + 4
+        return ok()
+    }
+
+    pub fn write_u64_le(&mut self, value: u64) -> void!RangeError {
+        position := self.position
+        write_u64_le(self.data, position, value)?
+        self.position = self.position + 8
+        return ok()
+    }
+
+    pub fn write_u64_be(&mut self, value: u64) -> void!RangeError {
+        position := self.position
+        write_u64_be(self.data, position, value)?
+        self.position = self.position + 8
+        return ok()
+    }
+
+}
+
+pub fn read_u16_le(data: &[u8], offset: usize) -> u16!RangeError {
+    check_range(data.len, offset, 2)?
+    match raw.read_u16_le(data, offset) {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn write_u16_le(data: &mut[u8], offset: usize, value: u16) -> void!RangeError {
+    check_range(data.len, offset, 2)?
+    match raw.write_u16_le(data, offset, value) {
+        ok() => {
+            return ok()
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn read_u16_be(data: &[u8], offset: usize) -> u16!RangeError {
+    check_range(data.len, offset, 2)?
+    match raw.read_u16_be(data, offset) {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn write_u16_be(data: &mut[u8], offset: usize, value: u16) -> void!RangeError {
+    check_range(data.len, offset, 2)?
+    match raw.write_u16_be(data, offset, value) {
+        ok() => {
+            return ok()
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn read_u32_le(data: &[u8], offset: usize) -> u32!RangeError {
+    check_range(data.len, offset, 4)?
+    match raw.read_u32_le(data, offset) {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn write_u32_le(data: &mut[u8], offset: usize, value: u32) -> void!RangeError {
+    check_range(data.len, offset, 4)?
+    match raw.write_u32_le(data, offset, value) {
+        ok() => {
+            return ok()
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn read_u32_be(data: &[u8], offset: usize) -> u32!RangeError {
+    check_range(data.len, offset, 4)?
+    match raw.read_u32_be(data, offset) {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn write_u32_be(data: &mut[u8], offset: usize, value: u32) -> void!RangeError {
+    check_range(data.len, offset, 4)?
+    match raw.write_u32_be(data, offset, value) {
+        ok() => {
+            return ok()
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn read_u64_le(data: &[u8], offset: usize) -> u64!RangeError {
+    check_range(data.len, offset, 8)?
+    match raw.read_u64_le(data, offset) {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn write_u64_le(data: &mut[u8], offset: usize, value: u64) -> void!RangeError {
+    check_range(data.len, offset, 8)?
+    match raw.write_u64_le(data, offset, value) {
+        ok() => {
+            return ok()
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn read_u64_be(data: &[u8], offset: usize) -> u64!RangeError {
+    check_range(data.len, offset, 8)?
+    match raw.read_u64_be(data, offset) {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}
+
+pub fn write_u64_be(data: &mut[u8], offset: usize, value: u64) -> void!RangeError {
+    check_range(data.len, offset, 8)?
+    match raw.write_u64_be(data, offset, value) {
+        ok() => {
+            return ok()
+        }, err(_) => {
+            return err(RangeError.OutOfBounds)
+        }
+    }
+}

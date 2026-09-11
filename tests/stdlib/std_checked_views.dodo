@@ -1,0 +1,90 @@
+package std_checked_views
+import "core/mem"
+import "core/ptr"
+import "core/bytes"
+import "alloc/arena"
+import "alloc/arena_box"
+import "alloc/pool"
+import "alloc/block"
+import "alloc/layout"
+import "alloc/error"
+import "std/bytes_alloc"
+
+pub struct Counting {
+    pool: &mut pool.Pool
+    allocations: usize
+    releases: usize
+    pub fn allocate(&mut self, requested: &layout.Layout) -> block.Block!error.AllocError {
+        value := self.pool.allocate(requested)?
+        self.allocations += 1
+        return ok(value)
+    }
+    pub unsafe fn deallocate(&mut self, value: block.Block) {
+        self.releases += 1
+        unsafe {
+            self.pool.deallocate(value)
+        }
+    }
+}
+fn checks() -> i32!error.AllocError {
+    original := "hello"
+    bytes_view := mem.str_bytes(original)
+    if!bytes.equal(bytes_view, b"hello") {
+        return ok(1)
+    }
+    restored := unsafe {
+        mem.str_from_utf8(bytes_view)
+    }
+    if restored.len != 5 {
+        return ok(2)
+    }
+    backing := [0u8; 64]
+    arena := arena.Arena.new(&mut backing)
+    value := arena_box.new(&mut arena, 42i32)?
+    view := value.as_ref()
+    if *view != 42 {
+        return ok(3)
+    }
+    core.drop(view)
+    writable := value.as_mut()
+    *writable = 43
+    core.drop(writable)
+    if value.into_inner() != 43 {
+        return ok(4)
+    }
+    pool_data := [0u8; 256]
+    allocator := pool.Pool.new(&mut pool_data, 64, 8)?
+    available := allocator.available()
+    counter := Counting { pool: &mut allocator, allocations: 0, releases: 0 }
+    buffer := unsafe {
+        bytes_alloc.new(&mut counter, 1, 64)?
+    }
+    buffer.extend(b"12")?
+    buffer.extend(b"345")?
+    match buffer.reserve(65) {
+        ok() => {
+            return ok(5)
+        }, err(_) => {}
+    }
+    if!bytes.equal(buffer.as_slice(), b"12345") {
+        return ok(6)
+    }
+    core.drop(buffer)
+    if counter.allocations != 3 || counter.releases != 3 {
+        return ok(7)
+    }
+    core.drop(counter)
+    if allocator.available() != available {
+        return ok(8)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match checks() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        }
+    }
+}

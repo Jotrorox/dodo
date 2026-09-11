@@ -1,0 +1,36 @@
+package io_example
+
+import "std/io"
+import "core/bytes"
+
+fn example() -> i32!io.Error {
+    input := [68u8, 111, 100, 111]
+    output := [0u8; 4]
+    source := io.MemoryReader.new(&input)
+    destination := io.MemoryWriter.new(&mut output)
+    scratch := [0u8; 2]
+    match io.copy(&mut source, &mut destination, &mut scratch, 4) {
+        ok(report) => {
+            if report.written != 4 || report.eof {
+                return ok(1)
+            }
+        }
+        err(_) => {
+            return ok(3)
+        }
+    }
+    if!bytes.equal(destination.written(), &input) {
+        return ok(2)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match example() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 3
+        }
+    }
+}

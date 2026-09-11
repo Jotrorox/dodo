@@ -1,0 +1,249 @@
+package fmt
+
+import "core/mem"
+import "core/ptr"
+import "core/num"
+import "core/ascii"
+import "std/io"
+import "std/float_decimal"
+import "std/text"
+
+pub enum Alignment {
+    Left, Right, Center
+}
+pub enum Sign {
+    NegativeOnly, Always, Space
+}
+pub enum FloatStyle {
+    Fixed, Scientific
+}
+
+// Width counts output bytes, not Unicode scalars, graphemes, or display columns.
+// Fill must be ASCII. Numeric zero padding follows the sign. Center places an
+// odd extra padding byte on the right. radix must be in 2..=36.
+pub struct Options {
+    pub width: usize
+    pub fill: u8
+    pub alignment: Alignment
+    pub sign: Sign
+    pub radix: u8
+    pub uppercase: bool
+    pub zero_pad: bool
+}
+pub fn defaults() -> Options {
+    return Options { width: 0, fill: 32, alignment: Alignment.Right,
+    sign: Sign.NegativeOnly, radix: 10, uppercase: false, zero_pad: false }
+}
+
+// Statically dispatched byte formatting. W implements the std/io writer
+// contract. No allocation, implicit flush, global locale, or format parser.
+// Each failure reports total bytes emitted by this Formatter, including the
+// failing write's partial progress. Prior bytes are never rolled back.
+pub struct Formatter<W> {
+    sink: &mut W
+    count: usize
+
+    pub fn new(sink: &mut W) -> Formatter<W> from(sink) {
+        return Formatter<W> { sink: sink, count: 0 }
+    }
+    pub fn written(&self) -> usize {
+        return self.count
+    }
+
+    pub fn bytes(&mut self, value: &[u8]) -> void!io.Error {
+        if value.len > num.MAX - self.count {
+            return err(io.failure(io.ErrorKind.InvalidInput, self.count))
+        }
+        match io.write_all(self.sink, value) {
+            ok(size) => {
+                self.count = self.count + size
+            },
+            err(reason) => {
+                reason.transferred = reason.transferred + self.count
+                self.count = reason.transferred
+                return err(reason)
+            }
+        }
+        return ok()
+    }
+    pub fn string(&mut self, value: &str) -> void!io.Error {
+        return self.bytes(mem.str_bytes(value))
+    }
+    fn padding(&mut self, fill: u8, count: usize) -> void!io.Error {
+        block := [0u8; 32]
+        for index in 0usize..32 {
+            block[index] = fill
+        }
+        remaining := count
+        for remaining != 0 {
+            size := num.min(remaining, 32)
+            self.bytes(&block[..size])?
+            remaining = remaining - size
+        }
+        return ok()
+    }
+    fn field(&mut self, value: &[u8], prefix: u8, options: &Options) -> void!io.Error {
+        if!ascii.is_ascii(options.fill) {
+            return err(io.failure(io.ErrorKind.InvalidInput, self.count))
+        }
+        length := value.len
+        if prefix != 0 {
+            if length == num.MAX {
+                return err(io.failure(io.ErrorKind.InvalidInput, self.count))
+            }
+            length = length + 1
+        }
+        padding := num.saturating_sub(options.width, length)
+        if num.max(length, options.width) > num.MAX - self.count {
+            return err(io.failure(io.ErrorKind.InvalidInput, self.count))
+        }
+        left := 0usize
+        if options.alignment == Alignment.Right {
+            left = padding
+        }
+        if options.alignment == Alignment.Center {
+            left = padding / 2
+        }
+        if options.zero_pad {
+            if prefix != 0 {
+                one := [prefix];
+                self.bytes(&one)?
+            }
+            self.padding(48, padding)?
+            self.bytes(value)?
+        } else {
+            self.padding(options.fill, left)?
+            if prefix != 0 {
+                one := [prefix];
+                self.bytes(&one)?
+            }
+            self.bytes(value)?
+            self.padding(options.fill, padding - left)?
+        }
+        return ok()
+    }
+    pub fn padded_string(&mut self, value: &str, options: &Options) -> void!io.Error {
+        return self.field(mem.str_bytes(value), 0, options)
+    }
+    pub fn boolean(&mut self, value: bool, options: &Options) -> void!io.Error {
+        if value {
+            return self.field(b"true", 0, options)
+        }
+        return self.field(b"false", 0, options)
+    }
+    pub fn codepoint(&mut self, value: u32, options: &Options) -> void!io.Error {
+        encoded := [0u8; 4]
+        length := 0usize
+        match text.encode(value, &mut encoded) {
+            ok(size) => {
+                length = size
+            },
+            err(_) => {
+                return err(io.failure(io.ErrorKind.InvalidInput, self.count))
+            }
+        }
+        return self.field(&encoded[..length], 0, options)
+    }
+    fn magnitude(&mut self, value: u64, negative: bool, options: &Options) -> void!io.Error {
+        if options.radix < 2 || options.radix > 36 {
+            return err(io.failure(io.ErrorKind.InvalidInput, self.count))
+        }
+        buffer := [0u8; 64]
+        position := 64usize
+        for {
+            digit := (value % options.radix as u64) as u8
+            character := digit + 48
+            if digit >= 10 {
+                character = digit + 87
+            }
+            if options.uppercase {
+                character = ascii.to_uppercase(character)
+            }
+            position = position - 1
+            buffer[position] = character
+            value = value / options.radix as u64
+            if value == 0 {
+                break
+            }
+        }
+        return self.field(&buffer[position..], sign_byte(negative, options), options)
+    }
+    pub fn unsigned(&mut self, value: u64, options: &Options) -> void!io.Error {
+        return self.magnitude(value, false, options)
+    }
+    pub fn signed(&mut self, value: i64, options: &Options) -> void!io.Error {
+        if value < 0 {
+            // Avoid negating i64::MIN and avoid unchecked signed-to-unsigned casts.
+            magnitude := ((0 - (value + 1)) as u64) + 1
+            return self.magnitude(magnitude, true, options)
+        }
+        return self.magnitude(value as u64, false, options)
+    }
+    // Precision is mandatory, 0..=324 decimal places. Scientific uses exactly
+    // precision digits after its radix point; the exponent has at least 2 digits.
+    // Round to nearest, ties to even. Preserve negative zero. Emit inf/nan (or
+    // uppercase forms); all NaNs are canonicalized to an unsigned nan spelling.
+    pub fn floating(&mut self, value: f64, precision: usize, style: FloatStyle, options: &Options) -> void!io.Error {
+        if precision > float_decimal.MAX_PRECISION {
+            return err(io.failure(io.ErrorKind.InvalidInput, self.count))
+        }
+        bits := unsafe {
+            ptr.read_unaligned(ptr.from_ref(&value) as *const u64)
+        }
+        negative := (bits >> 63) != 0
+        magnitude := value
+        if negative {
+            magnitude = 0.0 - value
+        }
+        prefix := sign_byte(negative, options)
+        if (bits & 0x7ff0000000000000u64) == 0x7ff0000000000000u64 {
+            if (bits & 0x000fffffffffffffu64) != 0 {
+                prefix = sign_byte(false, options)
+                if options.uppercase {
+                    return self.field(b"NAN", prefix, options)
+                }
+                return self.field(b"nan", prefix, options)
+            }
+            if options.uppercase {
+                return self.field(b"INF", prefix, options)
+            }
+            return self.field(b"inf", prefix, options)
+        }
+        buffer := [0u8; 640]
+        length := 0usize
+        match float_decimal.convert(&mut buffer, magnitude, precision, style == FloatStyle.Scientific) {
+            ok(size) => {
+                length = size
+            },
+            err(_) => {
+                return err(io.failure(io.ErrorKind.InvalidInput, self.count))
+            }
+        }
+        if options.uppercase {
+            for index in 0usize..length {
+                buffer[index] = ascii.to_uppercase(buffer[index])
+            }
+        }
+        return self.field(&buffer[..length], prefix, options)
+    }
+}
+fn sign_byte(negative: bool, options: &Options) -> u8 {
+    if negative {
+        return 45
+    }
+    if options.sign == Sign.Always {
+        return 43
+    }
+    if options.sign == Sign.Space {
+        return 32
+    }
+    return 0
+}
+
+// T implements pub fn format<W>(&self, output:&mut Formatter<W>)->void!io.Error.
+// The compiler specializes this ordinary generic method: no traits/reflection.
+pub fn value<W, T>(sink: &mut W, input: &T) -> usize!io.Error {
+    output := Formatter.new::<W>(sink)
+    input.format(&mut output)?
+    return ok(output.written())
+}

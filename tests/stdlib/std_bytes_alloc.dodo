@@ -1,0 +1,132 @@
+package std_bytes_alloc_checks
+
+import "alloc/arena"
+import "alloc/pool"
+import "alloc/error"
+import "std/arena_bytes"
+import "std/pool_bytes"
+import "core/bytes"
+import "core/num"
+import "alloc/layout"
+
+fn checks() -> i32!error.AllocError {
+    backing := [0u8; 256]
+    allocator := arena.Arena.new(&mut backing)
+    buffer := arena_bytes.new(&mut allocator, 0, 64)?
+    buffer.extend(b"abc")?
+    if buffer.len() != 3 || buffer.capacity() != 4 {
+        return ok(1)
+    }
+    buffer.extend(b"defgh")?
+    view := buffer.as_slice()
+    if!bytes.equal(view, b"abcdefgh") {
+        return ok(2)
+    }
+    core.drop(view)
+    mutable := buffer.as_mut_slice()
+    mutable[0] = 65
+    core.drop(mutable)
+    if!bytes.equal(buffer.as_slice(), b"Abcdefgh") {
+        return ok(3)
+    }
+    match buffer.reserve(65) {
+        ok() => {
+            return ok(4)
+        }, err(_) => {}
+    }
+    if buffer.len() != 8 || buffer.capacity() != 8 {
+        return ok(5)
+    }
+    buffer.truncate(3)
+    buffer.push(33)?
+    if!bytes.equal(buffer.as_slice(), b"Abc!") {
+        return ok(6)
+    }
+    moved := buffer
+    if moved.len() != 4 {
+        return ok(7)
+    }
+    moved.clear()
+    moved.reserve(60)?
+    if moved.len() != 0 || moved.capacity() != 64 {
+        return ok(8)
+    }
+    core.drop(moved)
+    core.drop(allocator)
+    pool_storage := [0u8; 128]
+    allocator2 := pool.Pool.new(&mut pool_storage, 32, 8)?
+    available := allocator2.available()
+    owned := pool_bytes.new(&mut allocator2, 4, 64)?
+    owned.extend(b"abcdefgh")?
+    owned.reserve(24)?
+    match owned.reserve(25) {
+        ok() => {
+            return ok(9)
+        }, err(_) => {}
+    }
+    if owned.len() != 8 || owned.capacity() != 32 {
+        return ok(10)
+    }
+    core.drop(owned)
+    if allocator2.available() != available {
+        return ok(11)
+    }
+    tiny := [0u8; 8]
+    small := arena.Arena.new(&mut tiny)
+    failed := arena_bytes.new(&mut small, 4, 32)?
+    failed.extend(b"abcd")?
+    match failed.push(1) {
+        ok() => {
+            return ok(12)
+        }, err(_) => {}
+    }
+    if!bytes.equal(failed.as_slice(), b"abcd") || failed.capacity() != 4 {
+        return ok(13)
+    }
+    core.drop(failed)
+    if small.used() != 4 {
+        return ok(14)
+    }
+    edge_storage := [0u8; 64]
+    edge := arena.Arena.new(&mut edge_storage)
+    empty := arena_bytes.new(&mut edge, 0, 0)?
+    empty.reserve(0)?
+    empty.extend(b"")?
+    match empty.push(1) {
+        ok() => {
+            return ok(15)
+        }, err(_) => {}
+    }
+    core.drop(empty)
+    odd := arena_bytes.new(&mut edge, 3, 5)?
+    odd.extend(b"12345")?
+    if odd.capacity() != 5 {
+        return ok(16)
+    }
+    match odd.reserve(num.MAX) {
+        ok() => {
+            return ok(17)
+        }, err(_) => {}
+    }
+    core.drop(odd)
+    match arena_bytes.new(&mut edge, 4, 3) {
+        ok(_) => {
+            return ok(18)
+        }, err(_) => {}
+    }
+    match arena_bytes.new(&mut edge, 0, layout.max_size() + 1) {
+        ok(_) => {
+            return ok(19)
+        }, err(_) => {}
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match checks() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        }
+    }
+}

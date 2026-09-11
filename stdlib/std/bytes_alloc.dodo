@@ -1,0 +1,117 @@
+package bytes_alloc
+
+import "core/ptr"
+import "core/mem"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/block"
+
+// Move-only growing byte storage. The allocator remains exclusively borrowed.
+// Every growth temporarily requires both old and new allocations to be live.
+pub struct Buffer<A> {
+    allocator: &mut A
+    allocation: block.Block
+    length: usize
+    maximum: usize
+
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+    pub fn capacity(&self) -> usize {
+        return self.allocation.size()
+    }
+    pub fn limit(&self) -> usize {
+        return self.maximum
+    }
+    pub fn as_slice(&self) -> &[u8]from(self) {
+        unsafe {
+            return ptr.borrow_slice(self.allocation.as_ptr() as *const u8, self.length, self)
+        }
+    }
+    pub fn as_mut_slice(&mut self) -> &mut[u8]from(self) {
+        unsafe {
+            pointer := self.allocation.as_ptr()
+            length := self.length
+            return ptr.borrow_slice_mut(pointer, length, self)
+        }
+    }
+    pub fn truncate(&mut self, length: usize) {
+        if length < self.length {
+            self.length = length
+        }
+    }
+    pub fn clear(&mut self) {
+        self.length = 0
+    }
+    // Reserve space for additional bytes beyond len. Errors preserve all data.
+    pub fn reserve(&mut self, additional: usize) -> void!error.AllocError {
+        if additional > self.maximum - self.length {
+            return err(error.AllocError.Exhausted)
+        }
+        required := self.length + additional
+        if required <= self.capacity() {
+            return ok()
+        }
+        capacity := self.capacity()
+        if capacity == 0 {
+            capacity = 1
+        }
+        for capacity < required {
+            if capacity > self.maximum - capacity {
+                capacity = self.maximum
+            } else {
+                capacity = capacity + capacity
+            }
+        }
+        requested := layout.Layout.new(capacity, 1)?
+        allocated := self.allocator.allocate(&requested)?
+        unsafe {
+            if self.length != 0 {
+                ptr.copy_nonoverlapping(self.allocation.as_ptr(), allocated.as_ptr(), self.length)
+            }
+            previous := mem.replace(&mut self.allocation, allocated)
+            self.allocator.deallocate(previous)
+        }
+        return ok()
+    }
+    pub fn extend(&mut self, bytes: &[u8]) -> void!error.AllocError {
+        self.reserve(bytes.len)?
+        unsafe {
+            if bytes.len != 0 {
+                ptr.copy_nonoverlapping(ptr.as_ptr(bytes), ptr.offset(self.allocation.as_ptr(), self.length as isize), bytes.len)
+            }
+        }
+        self.length = self.length + bytes.len
+        return ok()
+    }
+    pub fn push(&mut self, byte: u8) -> void!error.AllocError {
+        self.reserve(1)?
+        unsafe {
+            ptr.write(ptr.offset(self.allocation.as_ptr(), self.length as isize), byte)
+        }
+        self.length = self.length + 1
+        return ok()
+    }
+    fn drop(&mut self) {
+        unsafe {
+            allocation := block.Block.from_raw_parts(self.allocation.as_ptr(), self.allocation.layout().clone())
+            self.allocator.deallocate(allocation)
+        }
+    }
+}
+
+// SAFETY: A.allocate returns exclusive, writable, correctly aligned storage of
+// the requested layout, valid until A.deallocate. Deallocation accepts exactly
+// the originating live descriptor, cannot fail, and does not unwind. Zero-size
+// descriptors must also be supported. No global allocator or hidden fallback.
+pub unsafe fn new<A>(allocator: &mut A, capacity: usize, limit: usize) -> Buffer<A>!error.AllocError from(allocator) {
+    if capacity > limit {
+        return err(error.AllocError.Exhausted)
+    }
+    if limit > layout.max_size() {
+        return err(error.AllocError.SizeOverflow)
+    }
+    requested := layout.Layout.new(capacity, 1)?
+    allocated := allocator.allocate(&requested)?
+    return ok(Buffer<A> { allocator: allocator, allocation: allocated, length: 0, maximum: limit })
+}

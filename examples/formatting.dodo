@@ -1,0 +1,32 @@
+package formatting
+
+import "core/bytes"
+import "std/io"
+import "std/fmt"
+
+pub struct Reading {
+    value: f64
+    pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error {
+        options := fmt.defaults()
+        output.string("temperature: ")?
+        output.floating(self.value, 2, fmt.FloatStyle.Fixed, &options)?
+        output.string(" C")?
+        return ok()
+    }
+}
+fn main() -> i32 {
+    storage := [0u8; 64]
+    sink := io.MemoryWriter.new(&mut storage)
+    reading := Reading { value: 21.375 }
+    match fmt.value(&mut sink, &reading) {
+        ok(_) => {
+            if bytes.equal(sink.written(), b"temperature: 21.38 C") {
+                return 0
+            }
+            return 1
+        },
+        err(_) => {
+            return 2
+        }
+    }
+}

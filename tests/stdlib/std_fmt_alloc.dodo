@@ -1,0 +1,103 @@
+package std_fmt_alloc_checks
+
+import "alloc/pool"
+import "alloc/error"
+import "core/bytes" as core_bytes
+import "std/pool_bytes"
+import "std/fmt"
+import "std/fmt_alloc"
+import "std/io"
+
+pub struct Value {
+    pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error {
+        options := fmt.defaults()
+        output.string("x")?
+        output.unsigned(18446744073709551615u64, &options)?
+        return ok()
+    }
+}
+pub struct Malformed {
+    pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error {
+        return output.bytes(b"\xff")
+    }
+}
+fn verify() -> i32!error.AllocError {
+    storage := [0u8; 512]
+    allocator := pool.Pool.new(&mut storage, 64, 8)?
+    available := allocator.available()
+    value := Value {}
+    {
+        buffer := pool_bytes.new(&mut allocator, 0, 64)?
+        match fmt_alloc.string(buffer, &value) {
+            ok(result) => {
+                view := result.as_text()
+                if result.capacity() < 21 || !core_bytes.equal(view.as_bytes(), b"x18446744073709551615") {
+                    return ok(1)
+                }
+            },
+            err(_) => {
+                return ok(2)
+            }
+        }
+    }
+    if allocator.available() != available {
+        return ok(3)
+    }
+    {
+        buffer := pool_bytes.new(&mut allocator, 0, 3)?
+        match fmt_alloc.string(buffer, &value) {
+            ok(_) => {
+                return ok(4)
+            },
+            err(reason) => {
+                match reason {
+                    fmt_alloc.Error.Format(problem) => {
+                        if problem.transferred != 1 || problem.kind != io.ErrorKind.BufferFull {
+                            return ok(5)
+                        }
+                    },
+                    _ => {
+                        return ok(6)
+                    }
+                }
+            }
+        }
+    }
+    if allocator.available() != available {
+        return ok(7)
+    }
+    {
+        buffer := pool_bytes.new(&mut allocator, 0, 64)?
+        malformed := Malformed {}
+        match fmt_alloc.string(buffer, &malformed) {
+            ok(_) => {
+                return ok(8)
+            },
+            err(reason) => {
+                match reason {
+                    fmt_alloc.Error.Text(problem) => {
+                        if problem.position != 0 {
+                            return ok(9)
+                        }
+                    },
+                    _ => {
+                        return ok(10)
+                    }
+                }
+            }
+        }
+    }
+    if allocator.available() != available {
+        return ok(11)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        }
+    }
+}

@@ -1,0 +1,336 @@
+package std_text
+
+import "std/text"
+import "core/bytes"
+import "core/mem"
+import "core/ptr"
+
+fn checks() -> i32!text.Error {
+    input := [65u8, 194, 162, 226, 130, 172, 240, 159, 152, 128]
+    view := text.Text.new(&input)?
+    if view.len_bytes() != 10 || view.len_scalars() != 4 {
+        return ok(1)
+    }
+    if!view.is_boundary(0) || !view.is_boundary(10) || view.is_boundary(2) || view.is_boundary(11) {
+        return ok(2)
+    }
+    floor := view.floor_boundary(9)?
+    ceil := view.ceil_boundary(7)?
+    if floor != 6 || ceil != 10 {
+        return ok(3)
+    }
+    part := view.slice_scalars(1, 3)?
+    if!bytes.equal(part.as_bytes(), &input[1..6]) {
+        return ok(4)
+    }
+    match view.slice(2, 5) {
+        ok(_) => {
+            return ok(5)
+        },
+        err(problem) => {
+            if problem.kind != text.ErrorKind.NotBoundary || problem.position != 2 {
+                return ok(6)
+            }
+        },
+    }
+    expected := [65u32, 162, 8364, 128512]
+    iter := view.scalars()
+    for i in 0usize..4 {
+        match iter.next() {
+            some(item) => {
+                if item.value != expected[i] {
+                    return ok(7)
+                }
+                encoded := [0u8; 4]
+                width := text.encode(item.value, &mut encoded)?
+                if!bytes.equal(&encoded[..width], &input[item.start..item.end]) {
+                    return ok(8)
+                }
+            },
+            none => {
+                return ok(9)
+            },
+        }
+    }
+    match iter.next() {
+        some(_) => {
+            return ok(10)
+        }, none => {}
+    }
+    scalar_bounds := [0u32, 127, 128, 2047, 2048, 55295, 57344, 65535, 65536, 1114111]
+    for i in 0usize..scalar_bounds.len {
+        output := [0u8; 4]
+        count := text.encode(scalar_bounds[i], &mut output)?
+        decoded := text.decode(&output[..count], 0)?
+        if decoded.scalar != scalar_bounds[i] || decoded.next != count {
+            return ok(11)
+        }
+    }
+    storage := [55u8; 3]
+    match text.encode(128512, &mut storage) {
+        ok(_) => {
+            return ok(12)
+        }, err(_) => {}
+    }
+    if storage[0] != 55 || storage[2] != 55 {
+        return ok(13)
+    }
+    match text.encode(55296, &mut storage) {
+        ok(_) => {
+            return ok(14)
+        }, err(_) => {}
+    }
+    sample := text.Text.from_str("  a,,b,\n")
+    trimmed := sample.trim_ascii()
+    comma := text.Text.from_str(",")
+    empty := text.Text.from_str("")
+    match trimmed.split(&empty) {
+        ok(_) => {
+            return ok(18)
+        }, err(_) => {}
+    }
+    splitter := trimmed.split(&comma)?
+    expected_lengths := [1usize, 0, 1, 0]
+    for i in 0usize..4 {
+        match splitter.next() {
+            some(field) => {
+                if field.len_bytes() != expected_lengths[i] {
+                    return ok(15)
+                }
+            }, none => {
+                return ok(16)
+            }
+        }
+    }
+    match splitter.next() {
+        some(_) => {
+            return ok(17)
+        }, none => {}
+    }
+    match trimmed.find(&comma) {
+        some(index) => {
+            if index != 1 {
+                return ok(19)
+            }
+        }, none => {
+            return ok(20)
+        }
+    }
+    if!bytes.equal(mem.str_bytes(trimmed.as_str()), b"a,,b,") {
+        return ok(21)
+    }
+    backing := [0u8; 5]
+    builder := text.Builder.new(&mut backing)
+    builder.push(8364)?
+    suffix := text.Text.from_str("ab")
+    builder.append(&suffix)?
+    match builder.push(99) {
+        ok() => {
+            return ok(22)
+        }, err(_) => {}
+    }
+    built := builder.as_text()
+    if built.len_scalars() != 3 || built.len_bytes() != 5 {
+        return ok(23)
+    }
+    core.drop(built)
+    builder.clear()
+    if builder.len_bytes() != 0 || builder.capacity() != 5 {
+        return ok(24)
+    }
+    return ok(0)
+}
+fn malformed() -> i32 {
+    cases := [[192u8, 128, 0, 0], [237u8, 160, 128, 0], [244u8, 144, 128, 128], [226u8, 65, 128, 0], [240u8, 159, 0, 0], [128u8, 0, 0, 0]]
+    lengths := [2usize, 3, 4, 3, 2, 1]
+    positions := [0usize, 1, 1, 1, 2, 0]
+    for i in 0usize..cases.len {
+        match text.validate(&cases[i][..lengths[i]]) {
+            ok() => {
+                return 30
+            },
+            err(problem) => {
+                if problem.position != positions[i] {
+                    return 31
+                }
+            },
+        }
+    }
+    broken := [226u8, 65, 128]
+    expected := [65533u32, 65, 65533]
+    for i in 0usize..3 {
+        match text.decode_replacement(&broken, i) {
+            some(value) => {
+                if value.scalar != expected[i] || value.next != i + 1 {
+                    return 32
+                }
+            }, none => {
+                return 33
+            }
+        }
+    }
+    match text.decode_replacement(&broken, 3) {
+        some(_) => {
+            return 34
+        }, none => {}
+    }
+    return 0
+}
+fn integers() -> i32!text.Error {
+    a := text.parse_u64(b"18446744073709551615", 10)?
+    b := text.parse_i64(b"-9223372036854775808", 10)?
+    c := text.parse_i64(b"+7fffffffffffffff", 16)?
+    d := text.parse_u64(b"Zz", 36)?
+    if a != ~0u64 || b != -9223372036854775807i64 - 1 || c != 9223372036854775807i64 || d != 1295 {
+        return ok(40)
+    }
+    match text.parse_u64(b"18446744073709551616", 10) {
+        ok(_) => {
+            return ok(41)
+        }, err(problem) => {
+            if problem.kind != text.ErrorKind.Overflow || problem.position != 19 {
+                return ok(42)
+            }
+        }
+    }
+    match text.parse_i64(b"9223372036854775808", 10) {
+        ok(_) => {
+            return ok(43)
+        }, err(_) => {}
+    }
+    match text.parse_u64(b"-1", 10) {
+        ok(_) => {
+            return ok(44)
+        }, err(_) => {}
+    }
+    match text.parse_i64(b"+", 10) {
+        ok(_) => {
+            return ok(45)
+        }, err(_) => {}
+    }
+    match text.parse_i64(b" 1", 10) {
+        ok(_) => {
+            return ok(46)
+        }, err(_) => {}
+    }
+    match text.parse_i64(b"1", 1) {
+        ok(_) => {
+            return ok(47)
+        }, err(_) => {}
+    }
+    return ok(0)
+}
+fn bits(value: f64) -> u64 {
+    unsafe {
+        return ptr.read(ptr.from_ref(&value) as *const u64)
+    }
+}
+fn float_case(input: &[u8], expected: u64) -> bool {
+    match text.parse_f64(input) {
+        ok(value) => {
+            return bits(value) == expected
+        }, err(_) => {
+            return false
+        }
+    }
+}
+fn floats() -> i32 {
+    if!float_case(b"0", 0) || !float_case(b"-0e90000", 9223372036854775808u64) {
+        return 50
+    }
+    if!float_case(b"0.1", 4591870180066957722u64) {
+        return 51
+    }
+    if!float_case(b"1.7976931348623157e308", 9218868437227405311u64) {
+        return 52
+    }
+    if!float_case(b"4.9406564584124654e-324", 1u64) {
+        return 53
+    }
+    if!float_case(b"2.2250738585072014e-308", 4503599627370496u64) {
+        return 54
+    }
+    if!float_case(b"9007199254740993", 4845873199050653696u64) {
+        return 55
+    }
+    if!float_case(b"9007199254740995", 4845873199050653698u64) {
+        return 56
+    }
+    if!float_case(b"1.00000000000000011102230246251565404236316680908203125", 4607182418800017408u64) {
+        return 57
+    }
+    if!float_case(b"1.00000000000000011102230246251565404236316680908203126", 4607182418800017409u64) {
+        return 58
+    }
+    if!float_case(b"-1e-90000", 9223372036854775808u64) {
+        return 59
+    }
+    if!float_case(b".5", 4602678819172646912u64) || !float_case(b"1.", 4607182418800017408u64) {
+        return 60
+    }
+    match text.parse_f64(b"1.7976931348623159e308") {
+        ok(_) => {
+            return 61
+        }, err(_) => {}
+    }
+    match text.parse_f64(b"1e309") {
+        ok(_) => {
+            return 62
+        }, err(_) => {}
+    }
+    match text.parse_f64(b"1e+") {
+        ok(_) => {
+            return 63
+        }, err(problem) => {
+            if problem.position != 3 {
+                return 64
+            }
+        }
+    }
+    match text.parse_f64(b"1.2.3") {
+        ok(_) => {
+            return 65
+        }, err(_) => {}
+    }
+    match text.parse_f64(b"nan") {
+        ok(_) => {
+            return 66
+        }, err(_) => {}
+    }
+    too_long := [48u8; 769]
+    match text.parse_f64(&too_long) {
+        ok(_) => {
+            return 67
+        }, err(problem) => {
+            if problem.kind != text.ErrorKind.TooManyDigits || problem.position != 768 {
+                return 68
+            }
+        }
+    }
+    return 0
+}
+fn main() -> i32 {
+    match checks() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 90
+        }
+    }
+    result := malformed()
+    if result != 0 {
+        return result
+    }
+    match integers() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 91
+        }
+    }
+    return floats()
+}

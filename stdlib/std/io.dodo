@@ -1,0 +1,538 @@
+package io
+
+import "core/bytes"
+import "core/num"
+import "core/mem"
+
+// Structural, statically dispatched contracts (no traits or runtime vtable):
+// Reader: read(&mut self, &mut[u8]) -> usize!Error.
+// Writer: write(&mut self, &[u8]) -> usize!Error.
+// Counts, including Error.transferred, refer to this call's slice prefix.
+// A nonempty successful read of zero bytes means EOF. A successful write of
+// zero bytes is converted to WriteZero by completion helpers. An empty request
+// succeeds without touching a device. Interrupted errors may carry progress.
+// A provider must never report or access more bytes than the supplied slice.
+pub enum ErrorKind {
+    UnexpectedEof, WriteZero, Interrupted, BufferFull, OutOfBounds,
+    InvalidInput, InvalidProgress, Other
+}
+
+pub struct Error {
+    pub kind: ErrorKind
+    pub transferred: usize
+    // Opaque adapter-defined device/platform code, zero for portable errors.
+    pub code: i32
+}
+
+pub fn failure(kind: ErrorKind, transferred: usize) -> Error {
+    return Error { kind: kind, transferred: transferred, code: 0 }
+}
+
+fn transfer(destination: &mut[u8], source: &[u8]) {
+    // All callers calculate equal, checked slice lengths before copying.
+    match bytes.copy_from(destination, source) {
+        ok() => {}
+        err(_) => {}
+    }
+}
+
+pub struct MemoryReader {
+    data: &[u8]
+    offset: usize
+
+    pub fn new(data: &[u8]) -> MemoryReader from(data) {
+        return MemoryReader { data: data, offset: 0 }
+    }
+    pub fn position(&self) -> usize {
+        return self.offset
+    }
+    pub fn remaining(&self) -> &[u8] {
+        return &self.data[self.offset..]
+    }
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!Error {
+        count := num.min(destination.len, self.data.len - self.offset)
+        transfer(&mut destination[..count], &self.data[self.offset..self.offset + count])
+        self.offset += count
+        return ok(count)
+    }
+    // Seeking is an optional capability, independent of the reader contract.
+    // Absolute positions through the end are accepted; failure does not move.
+    pub fn seek(&mut self, position: usize) -> usize!Error {
+        if position > self.data.len {
+            return err(failure(ErrorKind.OutOfBounds, 0))
+        }
+        self.offset = position
+        return ok(position)
+    }
+    pub fn poll_read(&mut self, destination: &mut[u8]) -> Poll!Error {
+        count := self.read(destination)?
+        state := PollState.Ready
+        if count == 0 && destination.len != 0 {
+            state = PollState.Eof
+        }
+        return ok(Poll { transferred: count, state: state })
+    }
+}
+
+pub struct MemoryWriter {
+    data: &mut[u8]
+    offset: usize
+
+    pub fn new(data: &mut[u8]) -> MemoryWriter from(data) {
+        return MemoryWriter { data: data, offset: 0 }
+    }
+    pub fn position(&self) -> usize {
+        return self.offset
+    }
+    pub fn remaining(&self) -> usize {
+        return self.data.len - self.offset
+    }
+    pub fn written(&self) -> &[u8] {
+        return &self.data[..self.offset]
+    }
+    pub fn write(&mut self, source: &[u8]) -> usize!Error {
+        if source.len == 0 {
+            return ok(0)
+        }
+        count := num.min(source.len, self.data.len - self.offset)
+        if count == 0 {
+            return err(failure(ErrorKind.BufferFull, 0))
+        }
+        transfer(&mut self.data[self.offset..self.offset + count], &source[..count])
+        self.offset += count
+        return ok(count)
+    }
+    pub fn poll_write(&mut self, source: &[u8]) -> Poll!Error {
+        count := self.write(source)?
+        return ok(Poll { transferred: count, state: PollState.Ready })
+    }
+}
+
+// A cursor reads and overwrites an initialized, fixed-size caller buffer.
+// It never extends storage; seeking past its end fails without changing state.
+pub struct Cursor {
+    data: &mut[u8]
+    offset: usize
+
+    pub fn new(data: &mut[u8]) -> Cursor from(data) {
+        return Cursor { data: data, offset: 0 }
+    }
+    pub fn position(&self) -> usize {
+        return self.offset
+    }
+    pub fn bytes(&self) -> &[u8] {
+        return &self.data[..]
+    }
+    pub fn seek(&mut self, position: usize) -> usize!Error {
+        if position > self.data.len {
+            return err(failure(ErrorKind.OutOfBounds, 0))
+        }
+        self.offset = position
+        return ok(position)
+    }
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!Error {
+        count := num.min(destination.len, self.data.len - self.offset)
+        transfer(&mut destination[..count], &self.data[self.offset..self.offset + count])
+        self.offset += count
+        return ok(count)
+    }
+    pub fn write(&mut self, source: &[u8]) -> usize!Error {
+        if source.len == 0 {
+            return ok(0)
+        }
+        count := num.min(source.len, self.data.len - self.offset)
+        if count == 0 {
+            return err(failure(ErrorKind.BufferFull, 0))
+        }
+        transfer(&mut self.data[self.offset..self.offset + count], &source[..count])
+        self.offset += count
+        return ok(count)
+    }
+}
+
+// Validate an adapter's returned progress before using it as a slice offset.
+// Empty operations never invoke the adapter, even if it is currently failing.
+pub fn read_once<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
+    if destination.len == 0 {
+        return ok(0)
+    }
+    match reader.read(destination) {
+        ok(count) => {
+            if count > destination.len {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            return ok(count)
+        }
+        err(reason) => {
+            if reason.transferred > destination.len {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            return err(reason)
+        }
+    }
+}
+
+pub fn write_once<W>(writer: &mut W, source: &[u8]) -> usize!Error {
+    if source.len == 0 {
+        return ok(0)
+    }
+    match writer.write(source) {
+        ok(count) => {
+            if count > source.len {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            if count == 0 {
+                return err(failure(ErrorKind.WriteZero, 0))
+            }
+            return ok(count)
+        }
+        err(reason) => {
+            if reason.transferred > source.len {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            return err(reason)
+        }
+    }
+}
+
+// Fill until the slice is full or EOF is reached. EOF is successful here.
+// Failure reports the total initialized prefix, not merely the final call.
+pub fn read_up_to<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
+    total := 0usize
+    for total < destination.len {
+        match read_once(reader, &mut destination[total..]) {
+            ok(count) => {
+                total += count
+                if count == 0 {
+                    return ok(total)
+                }
+            }
+            err(reason) => {
+                total += reason.transferred
+                if reason.kind != ErrorKind.Interrupted {
+                    reason.transferred = total
+                    return err(reason)
+                }
+            }
+        }
+    }
+    return ok(total)
+}
+
+pub fn read_exact<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
+    count := read_up_to(reader, destination)?
+    if count != destination.len {
+        return err(failure(ErrorKind.UnexpectedEof, count))
+    }
+    return ok(count)
+}
+
+// Completion is blocking: Interrupted retries, including after partial progress.
+// A persistent interruption can therefore block indefinitely, like the device.
+pub fn write_all<W>(writer: &mut W, source: &[u8]) -> usize!Error {
+    total := 0usize
+    for total < source.len {
+        match write_once(writer, &source[total..]) {
+            ok(count) => {
+                total += count
+            }
+            err(reason) => {
+                total += reason.transferred
+                if reason.kind != ErrorKind.Interrupted {
+                    reason.transferred = total
+                    return err(reason)
+                }
+            }
+        }
+    }
+    return ok(total)
+}
+
+// A bounded reader consumes at most limit bytes, counting error progress too.
+// The limit is a synthetic EOF; its exhausted state never touches the reader.
+pub struct LimitReader<R> {
+    reader: &mut R
+    left: usize
+
+    pub fn new(reader: &mut R, limit: usize) -> LimitReader<R> from(reader) {
+        return LimitReader<R> { reader: reader, left: limit }
+    }
+    pub fn remaining(&self) -> usize {
+        return self.left
+    }
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!Error {
+        count := num.min(destination.len, self.left)
+        match read_once(self.reader, &mut destination[..count]) {
+            ok(actual) => {
+                self.left -= actual
+                return ok(actual)
+            }
+            err(reason) => {
+                self.left -= reason.transferred
+                return err(reason)
+            }
+        }
+    }
+}
+
+// Discard exactly count bytes using caller storage. EOF before count is an
+// error. The scratch buffer may be empty only when count is zero.
+pub fn skip<R>(reader: &mut R, count: usize, scratch: &mut[u8]) -> usize!Error {
+    if count != 0 && scratch.len == 0 {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    total := 0usize
+    for total < count {
+        request := num.min(scratch.len, count - total)
+        match read_exact(reader, &mut scratch[..request]) {
+            ok(actual) => {
+                total += actual
+            }
+            err(reason) => {
+                reason.transferred += total
+                return err(reason)
+            }
+        }
+    }
+    return ok(total)
+}
+
+pub struct CopyReport {
+    pub read: usize
+    pub written: usize
+    // False when the explicit limit was reached without probing for EOF.
+    pub eof: bool
+}
+pub struct CopyError {
+    pub read: usize
+    pub written: usize
+    pub cause: Error
+}
+
+// Copy at most limit bytes through scratch; counts never exceed limit. On
+// failure, read - written bytes were consumed but not delivered. A read error
+// with progress first attempts to deliver that prefix, then returns the error.
+// If that write also fails, its error takes precedence; both counts survive.
+pub fn copy<R, W>(reader: &mut R, writer: &mut W, scratch: &mut[u8], limit: usize) -> CopyReport!CopyError {
+    read := 0usize
+    written := 0usize
+    if limit != 0 && scratch.len == 0 {
+        return err(CopyError { read: 0, written: 0, cause: failure(ErrorKind.InvalidInput, 0) })
+    }
+    for read < limit {
+        request := num.min(scratch.len, limit - read)
+        count := 0usize
+        failed := false
+        reason := failure(ErrorKind.Other, 0)
+        match read_once(reader, &mut scratch[..request]) {
+            ok(actual) => {
+                count = actual
+            }
+            err(actual_error) => {
+                count = actual_error.transferred
+                reason = actual_error
+                failed = reason.kind != ErrorKind.Interrupted
+            }
+        }
+        read += count
+        match write_all(writer, &scratch[..count]) {
+            ok(actual) => {
+                written += actual
+            }
+            err(write_error) => {
+                written += write_error.transferred
+                return err(CopyError { read: read, written: written, cause: write_error })
+            }
+        }
+        if failed {
+            return err(CopyError { read: read, written: written, cause: reason })
+        }
+        // Interrupted with no progress is retried, not mistaken for EOF.
+        if count == 0 && reason.kind != ErrorKind.Interrupted {
+            return ok(CopyReport { read: read, written: written, eof: true })
+        }
+    }
+    return ok(CopyReport { read: read, written: written, eof: false })
+}
+
+// Caller-backed buffering. The reader owns no allocation and holds exclusive
+// borrows of both device and buffer. No read-ahead is discarded by read().
+pub struct BufferedReader<R> {
+    reader: &mut R
+    storage: &mut[u8]
+    start: usize
+    end: usize
+    failed: bool
+    reason: Error
+
+    pub fn new(reader: &mut R, storage: &mut[u8]) -> BufferedReader<R>!Error from(reader, storage) {
+        if storage.len == 0 {
+            return err(failure(ErrorKind.InvalidInput, 0))
+        }
+        return ok(BufferedReader<R> { reader: reader, storage: storage, start: 0, end: 0,
+        failed: false, reason: failure(ErrorKind.Other, 0) })
+    }
+    pub fn buffered(&self) -> &[u8] {
+        return &self.storage[self.start..self.end]
+    }
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!Error {
+        if destination.len == 0 {
+            return ok(0)
+        }
+        if self.start == self.end {
+            self.start = 0
+            self.end = 0
+            match read_once(self.reader, self.storage) {
+                ok(count) => {
+                    self.end = count
+                }
+                err(reason) => {
+                    self.end = reason.transferred
+                    self.reason = reason
+                    self.failed = true
+                }
+            }
+        }
+        count := num.min(destination.len, self.end - self.start)
+        transfer(&mut destination[..count], &self.storage[self.start..self.start + count])
+        self.start += count
+        if self.start == self.end && self.failed {
+            self.failed = false
+            reason := mem.replace(&mut self.reason, failure(ErrorKind.Other, 0))
+            reason.transferred = count
+            return err(reason)
+        }
+        return ok(count)
+    }
+}
+
+// Accepted bytes belong to this adapter until flush succeeds. Dropping it does
+// not perform I/O: pending bytes are discarded. Call flush and handle its Result
+// before releasing the device. Failed flush preserves the unwritten suffix.
+pub struct BufferedWriter<W> {
+    writer: &mut W
+    storage: &mut[u8]
+    used: usize
+
+    pub fn new(writer: &mut W, storage: &mut[u8]) -> BufferedWriter<W>!Error from(writer, storage) {
+        if storage.len == 0 {
+            return err(failure(ErrorKind.InvalidInput, 0))
+        }
+        return ok(BufferedWriter<W> { writer: writer, storage: storage, used: 0 })
+    }
+    pub fn pending(&self) -> &[u8] {
+        return &self.storage[..self.used]
+    }
+    pub fn capacity(&self) -> usize {
+        return self.storage.len
+    }
+    pub fn write(&mut self, source: &[u8]) -> usize!Error {
+        if source.len == 0 {
+            return ok(0)
+        }
+        if self.used == self.storage.len {
+            match self.flush() {
+                ok(_) => {}
+                err(reason) => {
+                    // This call has not accepted any of source yet.
+                    reason.transferred = 0
+                    return err(reason)
+                }
+            }
+        }
+        count := num.min(source.len, self.storage.len - self.used)
+        transfer(&mut self.storage[self.used..self.used + count], &source[..count])
+        self.used += count
+        return ok(count)
+    }
+    pub fn flush(&mut self) -> usize!Error {
+        total := 0usize
+        for self.used != 0 {
+            count := 0usize
+            failed := false
+            reason := failure(ErrorKind.Other, 0)
+            match write_once(self.writer, &self.storage[..self.used]) {
+                ok(actual) => {
+                    count = actual
+                }
+                err(actual_error) => {
+                    count = actual_error.transferred
+                    reason = actual_error
+                    failed = reason.kind != ErrorKind.Interrupted
+                }
+            }
+            total += count
+            for i in 0usize..self.used - count {
+                self.storage[i] = self.storage[i + count]
+            }
+            self.used -= count
+            if failed {
+                reason.transferred = total
+                return err(reason)
+            }
+        }
+        return ok(total)
+    }
+}
+
+// Polling contracts are separate: poll_read/poll_write return after one device
+// attempt. Pending may include prefix progress. It never means EOF or an error;
+// the caller decides when to retry, with no scheduler or implicit busy loop.
+pub enum PollState {
+    Ready, Pending, Eof
+}
+pub struct Poll {
+    pub transferred: usize
+    pub state: PollState
+}
+
+pub fn poll_read_once<R>(reader: &mut R, destination: &mut[u8]) -> Poll!Error {
+    if destination.len == 0 {
+        return ok(Poll { transferred: 0, state: PollState.Ready })
+    }
+    match reader.poll_read(destination) {
+        ok(progress) => {
+            if progress.transferred > destination.len {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            if progress.transferred == 0 && progress.state == PollState.Ready {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            return ok(progress)
+        }
+        err(reason) => {
+            if reason.transferred > destination.len {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            return err(reason)
+        }
+    }
+}
+
+pub fn poll_write_once<W>(writer: &mut W, source: &[u8]) -> Poll!Error {
+    if source.len == 0 {
+        return ok(Poll { transferred: 0, state: PollState.Ready })
+    }
+    match writer.poll_write(source) {
+        ok(progress) => {
+            if progress.transferred > source.len || progress.state == PollState.Eof {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            if progress.transferred == 0 && progress.state == PollState.Ready {
+                return err(failure(ErrorKind.WriteZero, 0))
+            }
+            return ok(progress)
+        }
+        err(reason) => {
+            if reason.transferred > source.len {
+                return err(failure(ErrorKind.InvalidProgress, 0))
+            }
+            return err(reason)
+        }
+    }
+}
+
+// Optional absolute seek capability; generic read/write helpers never require it.
+pub fn seek<S>(stream: &mut S, position: usize) -> usize!Error {
+    return stream.seek(position)
+}

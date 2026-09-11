@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-compile the portable core/alloc fixtures and execute real PE files in Wine.
+"""Cross-compile the portable core/alloc/std fixtures and execute real PE files in Wine.
 
 Requires a built host dodo, clang, lld-link, Wine, and a MinGW kernel32 import
 library. No Windows C runtime or allocator is linked. The tiny test startup
@@ -45,6 +45,8 @@ def run(arguments, *, env=None, timeout=120):
 
 RUNTIME = r'''
 typedef __SIZE_TYPE__ size_t;
+// LLVM uses the MSVC floating-point marker even with a freestanding entry.
+int _fltused = 0;
 __declspec(dllimport) void __stdcall ExitProcess(unsigned int code);
 extern int dodo_main(void) __asm__("dodo.PACKAGE.main");
 void *memcpy(void *destination, const void *source, size_t length) {
@@ -144,7 +146,7 @@ def main():
         finally:
             subprocess.run([wineserver, "-k"], env=env, capture_output=True, timeout=20)
             subprocess.run([wineserver, "-w"], env=env, capture_output=True, timeout=20)
-    print(f"Passed {executions} Windows executions across {len(fixtures)} core/alloc fixtures.")
+    print(f"Passed {executions} Windows executions across {len(fixtures)} core/alloc/std fixtures.")
 
 
 if __name__ == "__main__":

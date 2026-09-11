@@ -19,6 +19,21 @@ pub struct Box<T, A> {
     initialized: bool
     pointer: *mut T
 
+    // Checked views keep this box and its allocator alive. A mutable view
+    // excludes replace, into_inner, moving, and destruction until its last use.
+    pub fn as_ref(&self) -> &T from(self) {
+        unsafe {
+            return ptr.borrow(self.pointer as *const T, self)
+        }
+    }
+
+    pub fn as_mut(&mut self) -> &mut T from(self) {
+        pointer := self.pointer
+        unsafe {
+            return ptr.borrow_mut(pointer, self)
+        }
+    }
+
     pub fn as_ptr(&self) -> *const T {
         unsafe {
             return self.pointer as *const T

@@ -1,0 +1,55 @@
+package io_alloc
+
+import "std/io"
+import "std/bytes_alloc"
+import "alloc/error"
+
+// Allocation-dependent append writer. The buffer exclusively retains its
+// allocator and limit; this adapter exclusively borrows the buffer. No global
+// allocator or implicit ownership transfer is involved. Each write either
+// appends every source byte or leaves the buffer unchanged on failure.
+pub struct BufferWriter<A> {
+    buffer: &mut bytes_alloc.Buffer<A>
+
+    pub fn new(buffer: &mut bytes_alloc.Buffer<A>) -> BufferWriter<A> from(buffer) {
+        return BufferWriter<A> { buffer: buffer }
+    }
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        if source.len == 0 {
+            return ok(0)
+        }
+        match self.buffer.extend(source) {
+            ok() => {
+                return ok(source.len)
+            }
+            err(reason) => {
+                // Device codes 1..4 preserve the concrete AllocError category.
+                code := 0i32
+                match reason {
+                    error.AllocError.InvalidAlignment => {
+                        code = 1
+                    }
+                    error.AllocError.SizeOverflow => {
+                        code = 2
+                    }
+                    error.AllocError.Exhausted => {
+                        code = 3
+                    }
+                    error.AllocError.UnsupportedLayout => {
+                        code = 4
+                    }
+                }
+                return err(io.Error { kind: io.ErrorKind.BufferFull, transferred: 0, code: code })
+            }
+        }
+    }
+}
+
+// Append at most limit bytes, using caller scratch and the buffer's explicit
+// allocator/capacity policy. CopyError records consumed and appended counts;
+// on allocation failure previously appended bytes remain owned by the buffer.
+// Reaching limit succeeds without an extra read; report.eof then remains false.
+pub fn append_from<R, A>(reader: &mut R, buffer: &mut bytes_alloc.Buffer<A>, scratch: &mut[u8], limit: usize) -> io.CopyReport!io.CopyError {
+    writer := BufferWriter.new(buffer)
+    return io.copy(reader, &mut writer, scratch, limit)
+}

@@ -1,0 +1,80 @@
+package text_alloc
+
+import "std/text"
+import "std/bytes_alloc"
+import "alloc/error"
+import "core/mem"
+
+pub enum Error {
+    Text(text.Error), Allocation(error.AllocError)
+}
+// Explicitly owned, growing UTF-8. The Buffer owns an exclusive borrow of its
+// allocator; dropping String releases its buffer deterministically. Its private
+// buffer cannot be mutated except through operations preserving UTF-8 validity.
+pub struct String<A> {
+    buffer: bytes_alloc.Buffer<A>
+
+    // Takes ownership even on validation failure, releasing the supplied buffer.
+    pub fn new(buffer: bytes_alloc.Buffer<A>) -> String<A>!text.Error from(buffer) {
+        text.validate(buffer.as_slice())?
+        return ok(String<A> { buffer: buffer })
+    }
+    pub fn len_bytes(&self) -> usize {
+        return self.buffer.len()
+    }
+    pub fn capacity(&self) -> usize {
+        return self.buffer.capacity()
+    }
+    pub fn limit(&self) -> usize {
+        return self.buffer.limit()
+    }
+    pub fn as_text(&self) -> text.Text from(self) {
+        // Every mutation below preserves UTF-8, and Buffer keeps storage live.
+        unsafe {
+            return text.Text.from_str(mem.str_from_utf8(self.buffer.as_slice()))
+        }
+    }
+    pub fn reserve(&mut self, additional: usize) -> void!error.AllocError {
+        return self.buffer.reserve(additional)
+    }
+    pub fn append(&mut self, value: &text.Text) -> void!error.AllocError {
+        return self.buffer.extend(value.as_bytes())
+    }
+    pub fn append_str(&mut self, value: &str) -> void!error.AllocError {
+        return self.buffer.extend(mem.str_bytes(value))
+    }
+    pub fn truncate(&mut self, length: usize) -> void!text.Error {
+        if length > self.buffer.len() {
+            return err(text.Error { kind: text.ErrorKind.OutOfBounds, position: length })
+        }
+        view := self.as_text()
+        if!view.is_boundary(length) {
+            return err(text.Error { kind: text.ErrorKind.NotBoundary, position: length })
+        }
+        self.buffer.truncate(length)
+        return ok()
+    }
+    pub fn push(&mut self, scalar: u32) -> void!Error {
+        storage := [0u8; 4]
+        count := 0usize
+        match text.encode(scalar, &mut storage) {
+            ok(value) => {
+                count = value
+            },
+            err(problem) => {
+                return err(Error.Text(problem))
+            },
+        }
+        match self.buffer.extend(&storage[..count]) {
+            ok() => {
+                return ok()
+            },
+            err(problem) => {
+                return err(Error.Allocation(problem))
+            },
+        }
+    }
+    pub fn clear(&mut self) {
+        self.buffer.clear()
+    }
+}

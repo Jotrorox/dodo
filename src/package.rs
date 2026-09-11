@@ -1,7 +1,7 @@
 //! Package loading, namespace resolution, and source-aware diagnostics.
 //!
 //! A file compiles that file. A directory compiles its immediate `.dodo` files
-//! in lexical order. `core/*` and `alloc/*` resolve from bundled sources. Other
+//! in lexical order. `core/*`, `alloc/*`, and `std/*` resolve from bundled sources. Other
 //! imports resolve relative to the importing package, without network access or
 //! an implicit dependency cache.
 use crate::ast::*;
@@ -130,23 +130,49 @@ pub fn load_with_overlays(
     };
     let root = loader.module(ModuleId::Local(source_path(path)), None)?;
     let mut program = Program::default();
-    let known_packages = loader.aliases.keys().cloned().collect();
+    // Keep familiar names when unique, but package identity is its resolved path,
+    // never its final component. Every module resolves its own local aliases.
+    let mut counts = BTreeMap::<String, usize>::new();
+    for module in loader.modules.values() {
+        *counts.entry(module.alias.clone()).or_default() += 1;
+    }
+    let mut known_packages: BTreeSet<String> = counts.keys().cloned().collect();
+    known_packages.extend(["mem", "ptr", "mmio"].map(str::to_owned));
+    let mut prefixes = BTreeMap::new();
+    for (index, (id, module)) in loader.modules.iter().enumerate() {
+        let prefix = if id == &root {
+            String::new()
+        } else if counts[&module.alias] == 1 {
+            module.alias.clone()
+        } else {
+            let mut candidate = format!("__dodo_package_{index}");
+            while known_packages.contains(&candidate) {
+                candidate.push('_');
+            }
+            candidate
+        };
+        known_packages.insert(prefix.clone());
+        prefixes.insert(id.clone(), prefix);
+    }
+    for intrinsic in INTRINSIC_IMPORTS {
+        prefixes.insert(
+            ModuleId::Bundled((*intrinsic).to_owned()),
+            intrinsic.rsplit('/').next().unwrap().to_owned(),
+        );
+    }
     for (key, mut module) in loader.modules {
-        let root_module = key == root;
-        if root_module {
+        if key == root {
             program.package = module.program.package.clone();
         }
-        let visible_packages = module
-            .program
-            .imports
+        let mut visible_packages: BTreeMap<String, String> = module
+            .import_aliases
             .iter()
-            .filter_map(|import| import.rsplit('/').next())
-            .map(str::to_owned)
-            .chain(std::iter::once(module.alias.clone()))
+            .map(|(alias, id)| (alias.clone(), prefixes[id].clone()))
             .collect();
+        visible_packages.insert(module.alias.clone(), prefixes[&key].clone());
         namespace(
             &mut module.program,
-            if root_module { "" } else { &module.alias },
+            &prefixes[&key],
             &known_packages,
             &visible_packages,
         )
@@ -164,12 +190,12 @@ pub fn load_with_overlays(
 struct Module {
     program: Program,
     alias: String,
+    import_aliases: BTreeMap<String, ModuleId>,
 }
 
 struct Loader<'a> {
     overlays: &'a BTreeMap<PathBuf, String>,
     modules: BTreeMap<ModuleId, Module>,
-    aliases: BTreeMap<String, ModuleId>,
     loading: Vec<ModuleId>,
     sources: Vec<Source>,
     offset: usize,
@@ -181,15 +207,6 @@ impl Default for Loader<'_> {
         Self {
             overlays: &EMPTY,
             modules: BTreeMap::new(),
-            aliases: INTRINSIC_IMPORTS
-                .iter()
-                .map(|import| {
-                    (
-                        import.rsplit('/').next().unwrap().to_owned(),
-                        ModuleId::Bundled((*import).to_owned()),
-                    )
-                })
-                .collect(),
             loading: vec![],
             sources: vec![],
             offset: 0,
@@ -313,18 +330,34 @@ impl Loader<'_> {
                 expected_alias.unwrap_or_default()
             ).into());
         }
-        if let Some(previous) = self.aliases.get(&alias) {
-            if previous != &id {
+        if matches!(alias.as_str(), "mem" | "ptr" | "mmio") {
+            return Err(format!(
+                "conflicting package name `{alias}`: reserved for compiler intrinsics"
+            )
+            .into());
+        }
+        let mut import_aliases = BTreeMap::new();
+        import_aliases.insert(alias.clone(), id.clone());
+        let mut explicit_aliases = BTreeMap::new();
+        for (import, name) in &program.import_aliases {
+            if let Some(previous) = explicit_aliases.insert(import.clone(), name.clone())
+                && previous != *name
+            {
                 return Err(format!(
-                    "conflicting package name `{alias}`: {previous} and {}",
+                    "conflicting aliases for import `{import}` in {}",
                     path.display()
                 )
                 .into());
             }
-        } else {
-            self.aliases.insert(alias.clone(), id.clone());
+            if name == "core"
+                || matches!(name.as_str(), "mem" | "ptr" | "mmio")
+                    && import != &format!("core/{name}")
+            {
+                return Err(
+                    format!("import alias `{name}` is reserved for compiler intrinsics").into(),
+                );
+            }
         }
-        let mut import_aliases = BTreeMap::new();
         let mut imports = program.imports.clone();
         imports.sort();
         imports.dedup();
@@ -348,7 +381,10 @@ impl Loader<'_> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("invalid import path `{import}`"))?;
-            let standard = matches!(import.split('/').next(), Some("core" | "alloc"));
+            let local_alias = explicit_aliases
+                .get(&import)
+                .map_or(import_alias, String::as_str);
+            let standard = matches!(import.split('/').next(), Some("core" | "alloc" | "std"));
             let dependency = if INTRINSIC_IMPORTS.contains(&import.as_str()) {
                 ModuleId::Bundled(import.clone())
             } else if standard {
@@ -375,18 +411,25 @@ impl Loader<'_> {
                 )?
             };
             if let Some(previous) =
-                import_aliases.insert(import_alias.to_owned(), dependency.clone())
+                import_aliases.insert(local_alias.to_owned(), dependency.clone())
                 && previous != dependency
             {
                 return Err(format!(
-                    "conflicting import alias `{import_alias}` in {}",
+                    "conflicting package name `{local_alias}` (import alias) in {}; use `import \"path\" as name`",
                     path.display()
                 )
                 .into());
             }
         }
         self.loading.pop();
-        self.modules.insert(id.clone(), Module { program, alias });
+        self.modules.insert(
+            id.clone(),
+            Module {
+                program,
+                alias,
+                import_aliases,
+            },
+        );
         Ok(id)
     }
 }
@@ -480,6 +523,7 @@ fn resolve_import(
 
 fn append(target: &mut Program, mut source: Program) {
     target.imports.append(&mut source.imports);
+    target.import_aliases.append(&mut source.import_aliases);
     target.structs.append(&mut source.structs);
     target.enums.append(&mut source.enums);
     target.functions.append(&mut source.functions);
@@ -491,7 +535,7 @@ fn namespace(
     program: &mut Program,
     prefix: &str,
     known_packages: &BTreeSet<String>,
-    visible_packages: &BTreeSet<String>,
+    visible_packages: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let symbols: BTreeSet<String> = program
         .structs
@@ -562,7 +606,7 @@ struct Names<'a> {
     prefix: &'a str,
     symbols: &'a BTreeSet<String>,
     known_packages: &'a BTreeSet<String>,
-    visible_packages: &'a BTreeSet<String>,
+    visible_packages: &'a BTreeMap<String, String>,
     missing_imports: RefCell<BTreeSet<String>>,
 }
 impl Names<'_> {
@@ -574,7 +618,10 @@ impl Names<'_> {
             .strip_prefix("core.")
             .and_then(|suffix| suffix.split('.').next())
             .filter(|prefix| matches!(*prefix, "mem" | "ptr" | "mmio"))
-            && !self.visible_packages.contains(intrinsic)
+            && !self
+                .visible_packages
+                .values()
+                .any(|prefix| prefix == intrinsic)
         {
             self.missing_imports
                 .borrow_mut()
@@ -588,8 +635,18 @@ impl Names<'_> {
                 format!("{}.{name}", self.prefix)
             }
         } else {
+            if !excluded.contains(first)
+                && let Some(prefix) = self.visible_packages.get(first)
+            {
+                let suffix = name.strip_prefix(first).unwrap();
+                return if prefix.is_empty() {
+                    suffix.trim_start_matches('.').to_owned()
+                } else {
+                    format!("{prefix}{suffix}")
+                };
+            }
             if self.known_packages.contains(first)
-                && !self.visible_packages.contains(first)
+                && !self.visible_packages.contains_key(first)
                 && !excluded.contains(first)
             {
                 self.missing_imports.borrow_mut().insert(first.to_owned());

@@ -21,7 +21,7 @@ unit must declare the same package. Subdirectories are not implicitly included.
 are supported; the imported package declaration must match the final path
 component. An ambiguous file-and-directory match, cycle, duplicate import alias,
 or conflicting package mapping is diagnosed. Dependencies are local files;
-there is no registry, network resolver, alias syntax, or re-export mechanism.
+there is no registry, network resolver, or re-export mechanism.
 Only directly imported package names are available in a package.
 
 ## Visibility and methods
@@ -38,14 +38,20 @@ calls with compiler lowering, not user-definable macros. See [memory and foreign
 for the supported intrinsic signatures.
 
 The compiler also embeds the Dodo source packages listed in
-[core and allocation](standard-library.md). Imports beginning with `core/` or
-`alloc/` always resolve from this bundled library, independent of the current
+[standard library](standard-library.md). Imports beginning with `core/`,
+`alloc/`, or `std/` always resolve from this bundled library, independent of the current
 directory; local files cannot shadow them. Unknown standard imports are errors.
 Only the imported packages and their dependencies are loaded.
 
-Package names `core`, `mem`, `ptr`, and `mmio` are reserved. Other package names
-still use the final path component globally: two distinct imported packages
-named `layout`, for example, conflict. Each package must directly import the
+Package names `core`, `mem`, `ptr`, and `mmio` are reserved. Other package identities follow their resolved paths.
+Names default to the final path component; `import "core/bytes" as raw` assigns
+a package-local alias. This allows importing `std/bytes` and `core/bytes`
+together, and allows transitive dependencies to use their own aliases without
+conflicts. Importing two distinct paths under the same local name is an error;
+assign an explicit alias to disambiguate. An alias does not rename the imported
+package declaration and does not grant access to private declarations. Aliases
+are shared across files in one directory package; inconsistent aliases for the
+same path are rejected. Each package must directly import the
 intrinsics it uses; a dependency's import does not grant access to its callers.
 
 ## A two-file example

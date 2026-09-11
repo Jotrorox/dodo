@@ -63,11 +63,17 @@ still require explicit unsafe blocks for unchecked operations.
 
 ## Remaining design surface
 
-Bundled [core and allocation packages](standard-library.md) now provide opaque
+The bundled [standard library](standard-library.md) provides opaque
 `MaybeUninit` storage, memory exchange, byte/slice utilities, layouts, caller-backed
-arenas and pools, and owned boxes with explicit allocator lifetimes.
+arenas and pools, and owned boxes with explicit allocator lifetimes. Portable
+`std/io`, `std/fmt`, `std/bytes`, and `std/text` add byte I/O contracts, formatting,
+binary views, UTF-8, numeric parsing, and separately imported growing buffers
+and strings. `std/text_unicode` supplies optional Unicode 16 whitespace rules.
+Checked views into allocated storage retain their owner's borrow. Import aliases
+separate packages with the same final path component, and generic formatting
+methods are statically dispatched.
 
-The broad design's disjoint mutable slice splitting, checked allocator
+The broad design's disjoint mutable slice splitting, trait-based checked allocator
 interfaces, atomics, DMA/interrupt-safe abstractions, target barriers, inline
 assembly, section/alignment/export/interrupt attributes, and custom panic-handler
 integration are not implemented. Unsupported syntax and unknown intrinsics

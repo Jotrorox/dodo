@@ -1,0 +1,24 @@
+package binary_example
+import "std/bytes"
+
+fn record() -> i32!bytes.RangeError {
+    storage := [0u8; 6]
+    writer := bytes.Writer.new(&mut storage)
+    writer.write_u16_be(0x1234)?
+    writer.write_u32_le(42)?
+    core.drop(writer)
+    reader := bytes.Reader.new(&storage)
+    if reader.read_u16_be()? != 0x1234 {
+        return ok(1)
+    }
+    return ok(reader.read_u32_le()? as i32 - 42)
+}
+fn main() -> i32 {
+    match record() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 2
+        }
+    }
+}

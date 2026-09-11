@@ -1,0 +1,128 @@
+package std_text_alloc
+
+import "std/text"
+import "std/text_alloc"
+import "std/pool_bytes"
+import "std/arena_bytes"
+import "alloc/pool"
+import "alloc/arena"
+import "alloc/error"
+import "core/bytes"
+
+fn growing() -> i32!error.AllocError {
+    storage := [0u8; 256]
+    allocator := pool.Pool.new(&mut storage, 32, 8)?
+    available := allocator.available()
+    raw := pool_bytes.new(&mut allocator, 0, 32)?
+    match text_alloc.String.new(raw) {
+        ok(value) => {
+            value.append_str("ab")?
+            match value.push(8364) {
+                ok() => {}, err(_) => {
+                    return ok(1)
+                }
+            }
+            value.reserve(25)?
+            if value.len_bytes() != 5 || value.capacity() != 32 || value.limit() != 32 {
+                return ok(2)
+            }
+            view := value.as_text()
+            if view.len_scalars() != 3 || !bytes.equal(view.as_bytes(), b"ab\xe2\x82\xac") {
+                return ok(3)
+            }
+            core.drop(view)
+            match value.truncate(4) {
+                ok() => {
+                    return ok(4)
+                }, err(problem) => {
+                    if problem.kind != text.ErrorKind.NotBoundary {
+                        return ok(5)
+                    }
+                }
+            }
+            match value.push(55296) {
+                ok() => {
+                    return ok(6)
+                }, err(_) => {}
+            }
+            match value.reserve(28) {
+                ok() => {
+                    return ok(7)
+                }, err(_) => {}
+            }
+            if value.len_bytes() != 5 {
+                return ok(8)
+            }
+            match value.truncate(2) {
+                ok() => {}, err(_) => {
+                    return ok(9)
+                }
+            }
+            value.clear()
+            value.append_str("done")?
+        },
+        err(_) => {
+            return ok(10)
+        },
+    }
+    if allocator.available() != available {
+        return ok(11)
+    }
+    invalid := pool_bytes.new(&mut allocator, 8, 32)?
+    invalid.push(255)?
+    match text_alloc.String.new(invalid) {
+        ok(_) => {
+            return ok(12)
+        },
+        err(problem) => {
+            if problem.position != 0 {
+                return ok(13)
+            }
+        },
+    }
+    if allocator.available() != available {
+        return ok(14)
+    }
+    return ok(0)
+}
+fn allocation_failure() -> i32!error.AllocError {
+    storage := [0u8; 4]
+    allocator := arena.Arena.new(&mut storage)
+    raw := arena_bytes.new(&mut allocator, 2, 16)?
+    match text_alloc.String.new(raw) {
+        ok(value) => {
+            value.append_str("ab")?
+            match value.append_str("c") {
+                ok() => {
+                    return ok(20)
+                }, err(_) => {}
+            }
+            view := value.as_text()
+            if!bytes.equal(view.as_bytes(), b"ab") {
+                return ok(21)
+            }
+        },
+        err(_) => {
+            return ok(22)
+        },
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match growing() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 90
+        }
+    }
+    match allocation_failure() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 91
+        }
+    }
+}

@@ -1,0 +1,158 @@
+package std_io_alloc_checks
+
+import "std/io"
+import "std/io_alloc"
+import "std/arena_bytes"
+import "std/pool_bytes"
+import "core/bytes"
+import "alloc/arena"
+import "alloc/pool"
+import "alloc/error"
+
+fn verify() -> i32!error.AllocError {
+    source := [1u8, 2, 3, 4, 5, 6, 7]
+    backing := [0u8; 128]
+    allocator := arena.Arena.new(&mut backing)
+    buffer := arena_bytes.new(&mut allocator, 1, 16)?
+    writer := io_alloc.BufferWriter.new(&mut buffer)
+    match io.write_all(&mut writer, &source[..2]) {
+        ok(count) => {
+            if count != 2 {
+                return ok(1)
+            }
+        }
+        err(_) => {
+            return ok(2)
+        }
+    }
+    match io.write_all(&mut writer, &source[2..]) {
+        ok(count) => {
+            if count != 5 {
+                return ok(3)
+            }
+        }
+        err(_) => {
+            return ok(4)
+        }
+    }
+    core.drop(writer)
+    if!bytes.equal(buffer.as_slice(), &source) || buffer.capacity() < 7 {
+        return ok(5)
+    }
+    core.drop(buffer)
+
+    limited := arena_bytes.new(&mut allocator, 1, 5)?
+    reader := io.MemoryReader.new(&source)
+    scratch := [0u8; 2]
+    match io_alloc.append_from(&mut reader, &mut limited, &mut scratch, 7) {
+        ok(_) => {
+            return ok(6)
+        }
+        err(reason) => {
+            if reason.read != 6 || reason.written != 4 || reason.cause.transferred != 0 || reason.cause.code != 3 {
+                return ok(7)
+            }
+        }
+    }
+    if limited.len() != 4 || !bytes.equal(limited.as_slice(), &source[..4]) || reader.position() != 6 {
+        return ok(8)
+    }
+    core.drop(limited)
+
+    tiny_backing := [0u8; 3]
+    exhausted := arena.Arena.new(&mut tiny_backing)
+    tiny := arena_bytes.new(&mut exhausted, 1, 16)?
+    small_writer := io_alloc.BufferWriter.new(&mut tiny)
+    match small_writer.write(&source[..2]) {
+        ok(count) => {
+            if count != 2 {
+                return ok(9)
+            }
+        }
+        err(_) => {
+            return ok(10)
+        }
+    }
+    match small_writer.write(&source[2..]) {
+        ok(_) => {
+            return ok(11)
+        }
+        err(reason) => {
+            if reason.kind != io.ErrorKind.BufferFull || reason.code != 3 || reason.transferred != 0 {
+                return ok(12)
+            }
+        }
+    }
+    core.drop(small_writer)
+    if tiny.len() != 2 || !bytes.equal(tiny.as_slice(), &source[..2]) {
+        return ok(13)
+    }
+    core.drop(tiny)
+    if exhausted.used() != 3 {
+        return ok(14)
+    }
+
+    empty_backing: [0]u8 = []
+    empty_allocator := arena.Arena.new(&mut empty_backing)
+    empty := arena_bytes.new(&mut empty_allocator, 0, 0)?
+    empty_writer := io_alloc.BufferWriter.new(&mut empty)
+    match empty_writer.write(&source[..0]) {
+        ok(count) => {
+            if count != 0 {
+                return ok(15)
+            }
+        }
+        err(_) => {
+            return ok(16)
+        }
+    }
+    match empty_writer.write(&source) {
+        ok(_) => {
+            return ok(17)
+        }
+        err(reason) => {
+            if reason.code != 3 {
+                return ok(18)
+            }
+        }
+    }
+    core.drop(empty_writer)
+    core.drop(empty)
+
+    pool_backing := [0u8; 512]
+    recycled := pool.Pool.new(&mut pool_backing, 64, 16)?
+    available := recycled.available()
+    for i in 0usize..8 {
+        pooled := pool_bytes.new(&mut recycled, 1, 64)?
+        destination := io_alloc.BufferWriter.new(&mut pooled)
+        match io.write_all(&mut destination, &source) {
+            ok(count) => {
+                if count != 7 {
+                    return ok(19)
+                }
+            }
+            err(_) => {
+                return ok(20)
+            }
+        }
+        core.drop(destination)
+        if!bytes.equal(pooled.as_slice(), &source) {
+            return ok(21)
+        }
+        core.drop(pooled)
+        if recycled.available() != available {
+            return ok(22)
+        }
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

@@ -57,7 +57,7 @@ pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
                 vec![Loan {
                     root: usize::MAX / 2 + id,
                     fields: vec![],
-                    mutable: mutable_borrow(&parameter.ty),
+                    mutable: context.carries_mutable_borrow(&parameter.ty),
                     origin: parameter.span,
                     via: vec![],
                     external: Some(parameter.name.clone()),
@@ -415,7 +415,13 @@ impl Context {
     }
     fn function_namespace(&self, name: &str) -> String {
         if let Some((owner, _)) = name.rsplit_once('.') {
-            if self.structs.contains_key(owner) {
+            if self.structs.contains_key(owner)
+                || self.structs.keys().any(|concrete| {
+                    concrete
+                        .split_once('$')
+                        .is_some_and(|(template, _)| template == owner)
+                })
+            {
                 type_namespace(owner).into()
             } else {
                 owner.into()
@@ -426,6 +432,27 @@ impl Context {
     }
     fn carries_borrow(&self, ty: &Type) -> bool {
         self.borrow_inner(ty, &mut HashSet::new())
+    }
+    fn carries_mutable_borrow(&self, ty: &Type) -> bool {
+        // By-value aggregates can own exclusive references. Their initial
+        // external dependency must retain that exclusivity for reborrowing.
+        // Stop at checked references: &T cannot grant mutable access to T.
+        match ty {
+            Type::Ref(mutable, _) | Type::Slice(mutable, _) => *mutable,
+            Type::Array(_, t) | Type::Option(t) => self.carries_mutable_borrow(t),
+            Type::Result(t, e) => self.carries_mutable_borrow(t) || self.carries_mutable_borrow(e),
+            Type::Named(name) => {
+                self.structs
+                    .get(name)
+                    .is_some_and(|s| s.fields.iter().any(|f| self.carries_mutable_borrow(&f.ty)))
+                    || self.enums.get(name).is_some_and(|e| {
+                        e.variants
+                            .iter()
+                            .any(|v| v.fields.iter().any(|f| self.carries_mutable_borrow(&f.ty)))
+                    })
+            }
+            _ => false,
+        }
     }
     fn borrow_inner(&self, ty: &Type, seen: &mut HashSet<String>) -> bool {
         match ty {
@@ -1808,6 +1835,15 @@ impl<'a> Checker<'a> {
                     return Ok(result);
                 }
                 let place = self.place(expression, true)?;
+                if expected.is_some_and(mutable_borrow)
+                    && mutable_borrow(&place.ty)
+                    && self.through_shared_reference(expression)
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        "cannot reborrow mutable storage through a shared reference",
+                    ));
+                }
                 for loan in &place.loans {
                     self.conflict(
                         loan,
@@ -1925,6 +1961,12 @@ impl<'a> Checker<'a> {
                     return Err(Diagnostic::new(
                         span,
                         "cannot mutably slice a shared reference or immutable binding",
+                    ));
+                }
+                if *mutable && self.through_shared_reference(base) {
+                    return Err(Diagnostic::new(
+                        span,
+                        "cannot mutably slice storage through a shared reference",
                     ));
                 }
                 if place.loans.is_empty() {
@@ -2095,16 +2137,20 @@ impl<'a> Checker<'a> {
                 if place.loans.is_empty() {
                     return Err(Diagnostic::new(
                         span,
-                        "creating a checked borrow from a raw pointer requires a lifetime primitive, which 0.1 does not yet provide",
+                        "creating a checked borrow from a raw pointer requires an explicit lifetime primitive; use unsafe ptr.borrow or ptr.borrow_mut with a checked owner",
                     ));
                 }
                 let mut deps = place.loans;
+                let direct = deps.len();
                 if self.context.carries_borrow(&place.ty) {
                     deps.extend(self.provenance(operand));
                 }
-                for loan in &mut deps {
-                    self.conflict(loan, Access::Borrow(mutable), span)?;
-                    loan.mutable = mutable;
+                for (index, loan) in deps.iter_mut().enumerate() {
+                    // Mutating an aggregate does not grant mutable access to
+                    // the shared references it stores (e.g. iterator input).
+                    let exclusive = mutable && (index < direct || loan.mutable);
+                    self.conflict(loan, Access::Borrow(exclusive), span)?;
+                    loan.mutable = exclusive;
                     loan.origin = span;
                 }
                 self.temporary.extend(deps.clone());
@@ -2210,7 +2256,7 @@ impl<'a> Checker<'a> {
                     self.unsafe_required(span, "raw pointer to checked-reference conversion")?;
                     return Err(Diagnostic::new(
                         span,
-                        "raw-pointer-to-reference casts require an explicit lifetime primitive, which 0.1 does not yet provide",
+                        "raw-pointer-to-reference casts require an explicit lifetime primitive; use unsafe ptr.borrow or ptr.borrow_mut with a checked owner",
                     ));
                 } else {
                     return Err(Diagnostic::new(
@@ -2494,8 +2540,24 @@ impl<'a> Checker<'a> {
                         vec![]
                     }
                 }),
-            ExprKind::Field(base, _)
-            | ExprKind::Index(base, _)
+            ExprKind::Field(base, field) => {
+                let mut deps = self.provenance(base);
+                // Project fields of an externally borrowed struct. The caller
+                // still retains the complete dependency via from(parameter).
+                // Locally assembled aggregates retain their original sources.
+                if self
+                    .peek_type(base)
+                    .is_some_and(|ty| matches!(ty, Type::Ref(..)))
+                {
+                    for loan in &mut deps {
+                        if loan.external.is_some() && loan.root != 0 {
+                            loan.fields.push(field.clone());
+                        }
+                    }
+                }
+                deps
+            }
+            ExprKind::Index(base, _)
             | ExprKind::Unary(UnaryOp::Deref, base)
             | ExprKind::Cast(base, _) => self.provenance(base),
             ExprKind::String(..) => vec![static_loan(expression.span)],
@@ -2516,6 +2578,29 @@ impl<'a> Checker<'a> {
         }
         deps
     }
+    fn through_shared_reference(&self, expression: &Expr) -> bool {
+        match &expression.kind {
+            ExprKind::Field(base, _)
+            | ExprKind::Index(base, _)
+            | ExprKind::Unary(UnaryOp::Deref, base) => {
+                let mut ty = self.peek_type(base);
+                if matches!(ty, Some(Type::Slice(false, _))) {
+                    return true;
+                }
+                while let Some(Type::Ref(mutable, inner)) = ty {
+                    if !mutable {
+                        return true;
+                    }
+                    ty = Some(*inner);
+                    if matches!(ty, Some(Type::Slice(false, _))) {
+                        return true;
+                    }
+                }
+                self.through_shared_reference(base)
+            }
+            _ => false,
+        }
+    }
     fn place(&mut self, expression: &mut Expr, initialized: bool) -> Check<Place> {
         let span = expression.span;
         if let Some(name) = qualified_name(expression)
@@ -2530,7 +2615,7 @@ impl<'a> Checker<'a> {
             expression.kind = ExprKind::Name(name);
         }
 
-        let place = match &mut expression.kind {
+        let mut place = match &mut expression.kind {
             ExprKind::Name(name) => {
                 if let Some(variable) = self.lookup(name).cloned() {
                     if initialized && !variable.initialized {
@@ -2726,6 +2811,9 @@ impl<'a> Checker<'a> {
                 ));
             }
         };
+        if self.through_shared_reference(expression) {
+            place.mutable = false;
+        }
         expression.ty = place.ty.clone();
         Ok(place)
     }
@@ -2946,6 +3034,29 @@ impl<'a> Checker<'a> {
             });
         }
         if let Some(operation) = name.strip_prefix("core.mem.") {
+            if matches!(operation, "str_bytes" | "str_from_utf8") {
+                if !type_args.is_empty() || args.len() != 1 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "string conversion expects one argument and no type arguments",
+                    ));
+                }
+                let bytes = Type::Slice(false, Box::new(Type::u8()));
+                let (expected, ty) = if operation == "str_bytes" {
+                    (Type::Str, bytes)
+                } else {
+                    self.unsafe_required(span, "unchecked UTF-8 conversion")?;
+                    (bytes, Type::Str)
+                };
+                let start = self.temporary.len();
+                let value = self.expr(&mut args[0], Some(&expected), false)?;
+                self.expect(&expected, &value.ty, span)?;
+                self.reserve_argument_borrow(&value, false, start, args[0].span)?;
+                return Ok(Value {
+                    ty,
+                    deps: value.deps,
+                });
+            }
             if operation == "offset_of" {
                 if type_args.len() != 1 || args.len() != 1 {
                     return Err(Diagnostic::new(
@@ -3189,6 +3300,73 @@ impl<'a> Checker<'a> {
             });
         }
         if let Some(operation) = name.strip_prefix("core.ptr.") {
+            // Unsafe validity is the caller's responsibility, but the resulting
+            // checked view always retains an ordinary borrow of its owner.
+            if matches!(
+                operation,
+                "borrow" | "borrow_mut" | "borrow_slice" | "borrow_slice_mut"
+            ) {
+                self.unsafe_required(span, "constructing a checked view from a raw pointer")?;
+                let slice = operation.contains("slice");
+                let mutable = operation.ends_with("mut");
+                let arity = if slice { 3 } else { 2 };
+                if args.len() != arity || type_args.len() > 1 {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!(
+                            "ptr.{operation} expects {arity} arguments and at most one element type"
+                        ),
+                    ));
+                }
+                let pointer = self.expr(&mut args[0], None, false)?;
+                let Type::Raw(writable, element) = pointer.ty else {
+                    return Err(Diagnostic::new(span, "checked view requires a raw pointer"));
+                };
+                if mutable && !writable {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mutable checked view requires a mutable raw pointer",
+                    ));
+                }
+                if self.context.carries_borrow(&element) || self.context.contains_result(&element) {
+                    return Err(Diagnostic::new(
+                        span,
+                        "raw checked views cannot contain checked borrows or unhandled Results",
+                    ));
+                }
+                if let Some(expected) = type_args.first() {
+                    self.expect(expected, &element, span)?;
+                }
+                if slice {
+                    let count = self.expr(&mut args[1], Some(&Type::usize()), false)?;
+                    self.expect(&Type::usize(), &count.ty, args[1].span)?;
+                }
+                let owner = self.intrinsic_reference(&mut args[arity - 1])?;
+                let Type::Ref(exclusive, _) = owner.ty else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "checked view owner must be a checked reference",
+                    ));
+                };
+                if mutable && !exclusive {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mutable checked view requires an exclusive owner borrow",
+                    ));
+                }
+                let mut deps = owner.deps;
+                for loan in &mut deps {
+                    loan.mutable &= mutable;
+                }
+                return Ok(Value {
+                    ty: if slice {
+                        Type::Slice(mutable, element)
+                    } else {
+                        Type::Ref(mutable, element)
+                    },
+                    deps,
+                });
+            }
             let expected_arity = match operation {
                 "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr" | "is_null" | "read"
                 | "read_unaligned" | "read_volatile" | "drop_in_place" => 1,
@@ -3378,8 +3556,8 @@ impl<'a> Checker<'a> {
         let fresh = self.temporary.split_off(start);
         let mut reserved = vec![];
         for mut loan in value.deps.clone() {
-            loan.mutable = mutable;
-            self.conflict(&loan, Access::Borrow(mutable), span)?;
+            loan.mutable &= mutable;
+            self.conflict(&loan, Access::Borrow(loan.mutable), span)?;
             loan.origin = span;
             reserved.push(loan);
         }
@@ -5672,6 +5850,42 @@ impl Expander {
                 } else {
                     None
                 };
+                if let Some(signature) = &signature
+                    && !signature.generics.is_empty()
+                {
+                    let mut receiver = receiver.as_ref().clone();
+                    if let Some(Param {
+                        ty: Type::Ref(mutable, _),
+                        ..
+                    }) = signature.params.first()
+                    {
+                        if matches!(actual, Type::Ref(..)) {
+                            receiver = Expr::new(
+                                ExprKind::Unary(UnaryOp::Deref, Box::new(receiver)),
+                                span,
+                            );
+                        }
+                        receiver = Expr::new(
+                            ExprKind::Unary(
+                                if *mutable {
+                                    UnaryOp::BorrowMut
+                                } else {
+                                    UnaryOp::Borrow
+                                },
+                                Box::new(receiver),
+                            ),
+                            span,
+                        );
+                    }
+                    let mut arguments = vec![receiver];
+                    arguments.append(args);
+                    e.kind = ExprKind::Call {
+                        name: signature.name.clone(),
+                        type_args: vec![],
+                        args: arguments,
+                    };
+                    return self.expression(e, substitutions, expected);
+                }
                 for (i, arg) in args.iter_mut().enumerate() {
                     self.expression(
                         arg,
@@ -5769,6 +5983,19 @@ fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -> Option<Ty
     let first = args.first().cloned().unwrap_or(Type::Unknown);
     let explicit = types.first().cloned().unwrap_or(Type::Unknown);
     Some(match name {
+        "mem.str_bytes" => Type::Slice(false, Box::new(Type::u8())),
+        "mem.str_from_utf8" => Type::Str,
+        "ptr.borrow" | "ptr.borrow_mut" | "ptr.borrow_slice" | "ptr.borrow_slice_mut" => {
+            let element = match first {
+                Type::Raw(_, t) => t,
+                _ => Box::new(explicit),
+            };
+            if name.contains("slice") {
+                Type::Slice(name.ends_with("mut"), element)
+            } else {
+                Type::Ref(name.ends_with("mut"), element)
+            }
+        }
         "mem.size_of" | "mem.align_of" | "mem.offset_of" => Type::usize(),
         "mem.uninit" => Type::MaybeUninit(Box::new(explicit)),
         "mem.init" => Type::MaybeUninit(Box::new(if first == Type::Unknown {

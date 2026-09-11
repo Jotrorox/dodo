@@ -1,0 +1,235 @@
+package std_fmt_checks
+
+import "core/bytes" as core_bytes
+import "core/mem"
+import "core/ptr"
+import "std/io"
+import "std/fmt"
+
+pub struct Point {
+    x: i64
+    y: i64
+    pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error {
+        options := fmt.defaults()
+        output.string("(")?
+        output.signed(self.x, &options)?
+        output.string(", ")?
+        output.signed(self.y, &options)?
+        output.string(")")?
+        return ok()
+    }
+}
+pub struct Fails {
+    calls: usize
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        self.calls = self.calls + 1
+        if self.calls == 1 {
+            return ok(source.len)
+        }
+        if self.calls == 2 {
+            return ok(2)
+        }
+        return err(io.Error { kind: io.ErrorKind.Other, transferred: 1, code: 99 })
+    }
+}
+fn from_bits(bits: u64) -> f64 {
+    return unsafe {
+        ptr.read_unaligned(ptr.from_ref(&bits) as *const f64)
+    }
+}
+fn float_equal(value: f64, precision: usize, style: fmt.FloatStyle, expected: &[u8]) -> bool!io.Error {
+    backing := [0u8; 640]
+    sink := io.MemoryWriter.new(&mut backing)
+    {
+        output := fmt.Formatter.new::<io.MemoryWriter>(&mut sink)
+        options := fmt.defaults()
+        output.floating(value, precision, style, &options)?
+    }
+    return ok(core_bytes.equal(sink.written(), expected))
+}
+fn verify() -> i32!io.Error {
+    backing := [0u8; 256]
+    sink := io.MemoryWriter.new(&mut backing)
+    {
+        output := fmt.Formatter.new::<io.MemoryWriter>(&mut sink)
+        options := fmt.defaults()
+        output.string("values: ")?
+        output.boolean(true, &options)?
+        output.string(" ")?
+        output.codepoint(0x1f980, &options)?
+        output.string(" ")?
+        output.signed(-9223372036854775808i64, &options)?
+        output.string(" ")?
+        output.unsigned(18446744073709551615u64, &options)?
+        options.radix = 16
+        options.uppercase = true
+        options.width = 6
+        options.sign = fmt.Sign.Always
+        options.zero_pad = true
+        output.string(" ")?
+        output.unsigned(255, &options)?
+        options.radix = 36
+        options.width = 0
+        options.sign = fmt.Sign.NegativeOnly
+        options.zero_pad = false
+        output.string(" ")?
+        output.unsigned(35, &options)?
+        options.width = 6
+        options.fill = 46
+        options.alignment = fmt.Alignment.Center
+        output.padded_string("x", &options)?
+        options.width = 0
+        output.string(" ")?
+        output.floating(-0.0, 2, fmt.FloatStyle.Fixed, &options)?
+    }
+    if!core_bytes.equal(sink.written(), b"values: true \xf0\x9f\xa6\x80 -9223372036854775808 18446744073709551615 +000FF Z..x... -0.00") {
+        return ok(1)
+    }
+    {
+        custom_backing := [0u8; 32]
+        custom := io.MemoryWriter.new(&mut custom_backing)
+        point := Point { x: -7, y: 23 }
+        count := fmt.value(&mut custom, &point)?
+        if count != 8 || !core_bytes.equal(custom.written(), b"(-7, 23)") {
+            return ok(2)
+        }
+    }
+    {
+        tiny := [0u8; 3]
+        writer := io.MemoryWriter.new(&mut tiny)
+        output := fmt.Formatter.new::<io.MemoryWriter>(&mut writer)
+        match output.string("hello") {
+            ok() => {
+                return ok(3)
+            },
+            err(reason) => {
+                if reason.kind != io.ErrorKind.BufferFull || reason.transferred != 3 || output.written() != 3 {
+                    return ok(4)
+                }
+            }
+        }
+    }
+    {
+        writer := Fails { calls: 0 }
+        output := fmt.Formatter.new::<Fails>(&mut writer)
+        output.string("!")?
+        match output.string("hello") {
+            ok() => {
+                return ok(5)
+            },
+            err(reason) => {
+                if reason.kind != io.ErrorKind.Other || reason.code != 99 || reason.transferred != 4 || output.written() != 4 {
+                    return ok(6)
+                }
+            }
+        }
+    }
+    {
+        data := [0u8; 16]
+        writer := io.MemoryWriter.new(&mut data)
+        output := fmt.Formatter.new::<io.MemoryWriter>(&mut writer)
+        options := fmt.defaults()
+        options.radix = 1
+        match output.unsigned(1, &options) {
+            ok() => {
+                return ok(7)
+            }, err(reason) => {
+                if reason.transferred != 0 {
+                    return ok(8)
+                }
+            }
+        }
+        options.radix = 10
+        match output.codepoint(0xd800, &options) {
+            ok() => {
+                return ok(9)
+            }, err(_) => {}
+        }
+        match output.floating(1.0, 325, fmt.FloatStyle.Fixed, &options) {
+            ok() => {
+                return ok(10)
+            }, err(_) => {}
+        }
+        if output.written() != 0 {
+            return ok(11)
+        }
+    }
+    {
+        data := [0u8; 128]
+        writer := io.MemoryWriter.new(&mut data)
+        {
+            output := fmt.Formatter.new::<io.MemoryWriter>(&mut writer)
+            options := fmt.defaults()
+            options.radix = 2
+            output.unsigned(18446744073709551615u64, &options)?
+            output.string(" ")?
+            options.radix = 10
+            options.alignment = fmt.Alignment.Left
+            options.width = 6
+            options.fill = 95
+            output.boolean(false, &options)?
+            options.width = 0
+            options.sign = fmt.Sign.Space
+            output.signed(0, &options)?
+            options.uppercase = true
+            output.floating(1.5f32 as f64, 1, fmt.FloatStyle.Scientific, &options)?
+            options.fill = 255
+            match output.padded_string("bad", &options) {
+                ok() => {
+                    return ok(23)
+                },
+                err(reason) => {
+                    if reason.kind != io.ErrorKind.InvalidInput {
+                        return ok(24)
+                    }
+                }
+            }
+        }
+        if!core_bytes.equal(writer.written(), b"1111111111111111111111111111111111111111111111111111111111111111 false_ 0 1.5E+00") {
+            return ok(25)
+        }
+    }
+    if!float_equal(2.5, 0, fmt.FloatStyle.Fixed, b"2")? {
+        return ok(12)
+    }
+    if!float_equal(3.5, 0, fmt.FloatStyle.Fixed, b"4")? {
+        return ok(13)
+    }
+    if!float_equal(9.999, 2, fmt.FloatStyle.Fixed, b"10.00")? {
+        return ok(14)
+    }
+    if!float_equal(0.125, 2, fmt.FloatStyle.Fixed, b"0.12")? {
+        return ok(15)
+    }
+    if!float_equal(0.375, 2, fmt.FloatStyle.Fixed, b"0.38")? {
+        return ok(16)
+    }
+    if!float_equal(1.23456789, 6, fmt.FloatStyle.Scientific, b"1.234568e+00")? {
+        return ok(17)
+    }
+    if!float_equal(from_bits(1), 17, fmt.FloatStyle.Scientific, b"4.94065645841246544e-324")? {
+        return ok(18)
+    }
+    if!float_equal(from_bits(0x7fefffffffffffff), 17, fmt.FloatStyle.Scientific, b"1.79769313486231571e+308")? {
+        return ok(19)
+    }
+    if!float_equal(from_bits(0x7ff0000000000000), 3, fmt.FloatStyle.Fixed, b"inf")? {
+        return ok(20)
+    }
+    if!float_equal(from_bits(0xfff0000000000000), 3, fmt.FloatStyle.Fixed, b"-inf")? {
+        return ok(21)
+    }
+    if!float_equal(from_bits(0xfff8000000000000), 3, fmt.FloatStyle.Fixed, b"nan")? {
+        return ok(22)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        }
+    }
+}

@@ -179,6 +179,11 @@ impl Parser {
                         if path.is_empty() {
                             return Err(Diagnostic::new(span, "import path cannot be empty"));
                         }
+                        if self.eat("as") {
+                            program
+                                .import_aliases
+                                .push((path.clone(), self.identifier()?));
+                        }
                         program.imports.push(path);
                     }
                     token => {

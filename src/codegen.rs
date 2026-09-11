@@ -1949,7 +1949,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         "storage.assume_init",
                     )?);
                 }
-                "uninit_as_ptr" | "uninit_as_mut_ptr" => return self.expr(&args[0]),
+                "uninit_as_ptr" | "uninit_as_mut_ptr" | "str_bytes" | "str_from_utf8" => {
+                    return self.expr(&args[0]);
+                }
                 "replace" | "swap" => {
                     let pointer = self.expr(&args[0])?.into_pointer_value();
                     let Type::Ref(_, element) = &args[0].ty else {
@@ -2020,6 +2022,29 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             let pointer = input.into_pointer_value();
             match op {
+                "borrow" | "borrow_mut" | "borrow_slice" | "borrow_slice_mut" => {
+                    let slice = op.contains("slice");
+                    let count = if slice {
+                        Some(self.expr(&args[1])?)
+                    } else {
+                        None
+                    };
+                    // Evaluate the owner expression, including its side effects.
+                    self.expr(&args[if slice { 2 } else { 1 }])?;
+                    if let Some(count) = count {
+                        let view = self.ty(ret)?.into_struct_type().get_undef();
+                        let view = self
+                            .builder
+                            .build_insert_value(view, pointer, 0, "borrow.ptr")?
+                            .into_struct_value();
+                        return Ok(self
+                            .builder
+                            .build_insert_value(view, count, 1, "borrow.len")?
+                            .into_struct_value()
+                            .into());
+                    }
+                    return Ok(pointer.into());
+                }
                 "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr" => return Ok(pointer.into()),
                 "is_null" => return Ok(self.builder.build_is_null(pointer, "ptr.is_null")?.into()),
                 "copy" | "copy_nonoverlapping" | "write_bytes" => {

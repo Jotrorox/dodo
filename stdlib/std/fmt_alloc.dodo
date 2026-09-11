@@ -1,0 +1,54 @@
+package fmt_alloc
+
+import "std/fmt"
+import "std/io"
+import "std/io_alloc"
+import "std/bytes_alloc"
+import "std/text"
+import "std/text_alloc"
+import "alloc/error"
+
+pub enum Error {
+    Allocation(error.AllocError), Format(io.Error), Text(text.Error)
+}
+
+// Consume an explicitly allocated buffer, clear its previous bytes, and format
+// a value into a new validated UTF-8 string. Capacity may grow up to the buffer's
+// limit. Failure destroys the buffer, releases its allocation, and preserves
+// the error (including formatter progress). Custom formatters may emit arbitrary
+// bytes; malformed UTF-8 is rejected rather than entering String's invariant.
+pub fn string<A, T>(buffer: bytes_alloc.Buffer<A>, value: &T) -> text_alloc.String<A>!Error from(buffer) {
+    buffer.clear()
+    {
+        writer := io_alloc.BufferWriter.new(&mut buffer)
+        match fmt.value(&mut writer, value) {
+            ok(_) => {},
+            err(reason) => {
+                return err(Error.Format(reason))
+            }
+        }
+    }
+    match text_alloc.String.new(buffer) {
+        ok(result) => {
+            return ok(result)
+        },
+        err(reason) => {
+            return err(Error.Text(reason))
+        }
+    }
+}
+
+// SAFETY: A must honor std/bytes_alloc.new's allocation contract. Prefer the
+// safe std/arena_bytes or std/pool_bytes constructors followed by string above.
+pub unsafe fn allocate<A, T>(allocator: &mut A, capacity: usize, limit: usize, value: &T) -> text_alloc.String<A>!Error from(allocator) {
+    unsafe {
+        match bytes_alloc.new(allocator, capacity, limit) {
+            ok(buffer) => {
+                return string(buffer, value)
+            },
+            err(reason) => {
+                return err(Error.Allocation(reason))
+            }
+        }
+    }
+}

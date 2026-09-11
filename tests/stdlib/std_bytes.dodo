@@ -1,0 +1,122 @@
+package std_bytes_checks
+
+import "std/bytes"
+import "core/bytes" as raw
+import "core/num"
+
+fn checks() -> i32!bytes.RangeError {
+    storage := [0u8; 32]
+    writer := bytes.Writer.new(&mut storage)
+    writer.write_u8(9)?
+    writer.write_u16_le(0x1234)?
+    writer.write_u32_be(0x89abcdef)?
+    writer.write_u64_le(0xfedcba9876543210)?
+    if writer.position() != 15 {
+        return ok(1)
+    }
+    match writer.put(b"01234567890123456789") {
+        ok() => {
+            return ok(2)
+        }, err(_) => {}
+    }
+    if writer.position() != 15 {
+        return ok(3)
+    }
+    core.drop(writer)
+    reader := bytes.Reader.new(&storage)
+    if reader.read_u8()? != 9 {
+        return ok(4)
+    }
+    if reader.read_u16_le()? != 0x1234 {
+        return ok(5)
+    }
+    if reader.read_u32_be()? != 0x89abcdef {
+        return ok(6)
+    }
+    if reader.read_u64_le()? != 0xfedcba9876543210 {
+        return ok(7)
+    }
+    reader.seek(31)?
+    match reader.read_u16_be() {
+        ok(_) => {
+            return ok(8)
+        }, err(_) => {}
+    }
+    if reader.position() != 31 {
+        return ok(9)
+    }
+    empty := reader.take(0)?
+    if empty.len != 0 {
+        return ok(10)
+    }
+    core.drop(empty)
+    core.drop(reader)
+    match bytes.check_range(32, num.MAX, 2) {
+        ok() => {
+            return ok(11)
+        }, err(_) => {}
+    }
+    match bytes.view(&storage, 33, 0) {
+        ok(_) => {
+            return ok(12)
+        }, err(_) => {}
+    }
+    part := bytes.view(&storage, 1, 2)?
+    if!raw.equal(part, b"\x34\x12") {
+        return ok(13)
+    }
+    match bytes.find(b"abcabc", b"bc") {
+        some(index) => {
+            if index != 1 {
+                return ok(14)
+            }
+        }, none => {
+            return ok(15)
+        }
+    }
+    match bytes.rfind(b"abcabc", b"bc") {
+        some(index) => {
+            if index != 4 {
+                return ok(16)
+            }
+        }, none => {
+            return ok(17)
+        }
+    }
+    match bytes.find(b"", b"") {
+        some(index) => {
+            if index != 0 {
+                return ok(18)
+            }
+        }, none => {
+            return ok(19)
+        }
+    }
+    match bytes.rfind(b"ab", b"") {
+        some(index) => {
+            if index != 2 {
+                return ok(20)
+            }
+        }, none => {
+            return ok(21)
+        }
+    }
+    match bytes.find_byte(b"abc", 100) {
+        some(_) => {
+            return ok(22)
+        }, none => {}
+    }
+    if bytes.compare(b"a", b"b") != -1 || !bytes.starts_with(b"abc", b"a") || !bytes.ends_with(b"abc", b"bc") {
+        return ok(23)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match checks() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        }
+    }
+}

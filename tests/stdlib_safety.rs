@@ -139,3 +139,95 @@ fn raw_copy_requires_unsafe_and_a_writable_destination() {
         "expected `*mut u8`, found `*const u8`",
     );
 }
+
+#[test]
+fn raw_checked_views_require_unsafe_valid_owner_and_plain_payloads() {
+    rejects(
+        "package app\nimport \"core/ptr\"\nfn main() -> i32 { value := 1u8\npointer := ptr.from_ref(&value)\nview := ptr.borrow(pointer, &value)\nreturn *view as i32\n}",
+        "requires an explicit unsafe block",
+    );
+    rejects(
+        "package app\nimport \"core/ptr\"\nfn main() -> i32 { value := 1u8\npointer := ptr.from_mut(&mut value)\nview := unsafe { ptr.borrow_mut(pointer, &value) }\nreturn *view as i32\n}",
+        "exclusive owner borrow",
+    );
+    rejects(
+        "package app\nimport \"core/ptr\"\nfn escape() -> &[u8] from(static) { value := 1u8\npointer := ptr.from_ref(&value)\nunsafe { return ptr.borrow_slice(pointer, 1, &value) }\n}",
+        "borrow",
+    );
+    for ty in ["&u8", "Result<u8, u8>", "Option<u8!u8>"] {
+        rejects(
+            &format!(
+                "package app\nimport \"core/ptr\"\nfn main() -> i32 {{ owner := 1u8\nunsafe {{ pointer := 1usize as *const {ty}\nview := ptr.borrow(pointer, &owner)\n}}\nreturn 0\n}}"
+            ),
+            "cannot contain checked borrows or unhandled Results",
+        );
+    }
+    rejects(
+        "package app\nimport \"core/mem\"\nfn escape() -> &str from(static) { bytes := [65u8]\nunsafe { return mem.str_from_utf8(&bytes) }\n}",
+        "borrow",
+    );
+    rejects(
+        "package app\nimport \"core/mem\"\nfn main() -> i32 { text := mem.str_from_utf8(b\"hello\")\nreturn text.len as i32\n}",
+        "requires an explicit unsafe block",
+    );
+}
+
+#[test]
+fn allocated_views_prevent_growth_moving_destruction_and_aliasing() {
+    let prefix = "package app\nimport \"alloc/arena\"\nimport \"std/arena_bytes\"\nfn main() -> i32 { backing := [0u8; 64]\nallocator := arena.Arena.new(&mut backing)\nmatch arena_bytes.new(&mut allocator, 4, 32) { ok(buffer) => {\nmatch buffer.extend(b\"abc\") { ok() => {}, err(_) => { return 2 } }\n";
+    for invalid in [
+        "match buffer.extend(buffer.as_slice()) { ok() => {}, err(_) => {} }\nreturn 0",
+        "view := buffer.as_slice()\nmatch buffer.reserve(16) { ok() => {}, err(_) => {} }\nreturn view.len as i32",
+        "view := buffer.as_slice()\ncore.drop(buffer)\nreturn view.len as i32",
+        "view := buffer.as_slice()\nother := buffer\nreturn view.len as i32",
+        "view := buffer.as_mut_slice()\nother := buffer.as_slice()\nview[0] = other[0]\nreturn 0",
+        "view := buffer.as_slice()\nallocator := allocator\nreturn view.len as i32",
+    ] {
+        rejects(
+            &format!("{prefix}{invalid}\n}}, err(_) => {{ return 1 }} }}\n}}"),
+            "borrow",
+        );
+    }
+    rejects(
+        &format!("{prefix}buffer.reserve(16)\nreturn 0\n}}, err(_) => {{ return 1 }} }}\n}}"),
+        "Result",
+    );
+}
+
+#[test]
+fn disjoint_adapter_fields_still_reject_aliasing_at_the_call_boundary() {
+    rejects(
+        "package app\nstruct Pair { a: &mut u8\nb: &mut u8 }\nfn use_pair(pair: &mut Pair) { *pair.a = 1\n*pair.b = 2 }\nfn main() -> i32 { value := 0u8\npair := Pair { a: &mut value, b: &mut value }\nuse_pair(&mut pair)\nreturn value as i32\n}",
+        "borrow",
+    );
+    rejects(
+        "package app\nstruct ReadOnly { value: &u8 }\nfn mutate(view: &mut ReadOnly) { *view.value = 2 }",
+        "immutable",
+    );
+}
+
+#[test]
+fn borrowed_aggregate_arguments_retain_exclusive_reference_capabilities() {
+    let pair = "fn mutate(a: &mut[u8], b: &mut[u8]) { a[0] = 1\nb[0] = 2 }\n";
+    for body in [
+        "struct Holder { data: &mut[u8] }\nfn bad(holders: &[Holder]) { mutate(holders[0].data, holders[0].data) }",
+        "fn bad(holders: &[&mut[u8]]) { mutate(holders[0], holders[0]) }",
+        "struct Holder { data: &mut[u8] }\nfn bad(holder: Holder) { mutate(holder.data, holder.data) }",
+        "fn bad(holder: Option<&mut[u8]>) { match holder { some(data) => { mutate(data, data) }, none => {} } }",
+        "struct Holder { data: &mut[u8] }\nfn bad(holder: &Holder) { mutate(holder.data, holder.data) }",
+        "struct Holder { data: &mut[u8] }\nfn bad(holder: &Holder) { holder.data[0] = 1 }",
+        "struct Holder { data: &mut[u8] }\nfn bad(holder: &Holder) { data := &mut holder.data[..]\ndata[0] = 1 }",
+    ] {
+        let source = Source::new(&format!("package app\n{pair}{body}\n"));
+        let output = Command::new(env!("CARGO_BIN_EXE_dodo"))
+            .arg("check")
+            .arg(&source.0)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "invalid exclusive alias accepted: {body}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked at"));
+    }
+}

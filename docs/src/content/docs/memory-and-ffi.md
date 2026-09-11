@@ -59,6 +59,10 @@ Custom targets require caller-supplied startup and linker configuration.
 | `ptr.offset(pointer, offset)` | Same pointer type | Unsafe; `offset: isize`, in elements. |
 | `ptr.from_ref(&value)` / `ptr.from_mut(&mut value)` | `*const T` / `*mut T` | Safe pointer conversion; dereferencing remains unsafe. |
 | `ptr.as_ptr(slice)` / `ptr.as_mut_ptr(slice)` | `*const T` / `*mut T` | Borrowed array or slice; mutable form requires exclusive access. |
+| `ptr.borrow(pointer, &owner)` / `ptr.borrow_mut(pointer, &mut owner)` | `&T` / `&mut T` | Unsafe; checked reference retaining the owner borrow. |
+| `ptr.borrow_slice(pointer, count, &owner)` / `ptr.borrow_slice_mut(pointer, count, &mut owner)` | `&[T]` / `&mut[T]` | Unsafe; checked slice of initialized storage retaining the owner borrow. |
+| `mem.str_bytes(text)` | `&[u8]` | Safe; preserves the string's checked dependencies. |
+| `mem.str_from_utf8(bytes)` | `&str` | Unsafe; bytes must be valid UTF-8, dependencies preserved. |
 | `ptr.is_null(pointer)` | `bool` | Safe; does not access storage. |
 | `ptr.copy(source, destination, count)` | `void` | Unsafe; copies `count` T elements; overlapping ranges allowed. |
 | `ptr.copy_nonoverlapping(source, destination, count)` | `void` | Unsafe; copied ranges must not overlap. |
@@ -82,9 +86,25 @@ value must not result in two live owners being destroyed. `drop_in_place`
 requires a valid aligned pointer to an initialized value, and that value must
 not subsequently be dropped again without reinitialization.
 
-Pointer conversions do not extend storage lifetimes or create a checked borrow
-from a raw pointer. Raw access must respect all live checked borrows. Allocator
-and storage examples are in [core and allocation](standard-library.md).
+Raw-pointer conversions do not extend storage lifetimes. The explicit unsafe
+`ptr.borrow*` primitives retain a checked reference to an owner: their result
+cannot outlive that owner, and a mutable result requires an exclusive owner
+borrow and mutable pointer. The caller must establish that the owner keeps the
+complete storage alive, nonnull, correctly aligned, initialized and valid for
+the returned lifetime. The byte extent must fit `isize`, stay within one live
+allocation, and respect every existing alias. Empty slices still require a
+nonnull aligned pointer. The pointer need not point inside the owner itself,
+which permits an owning buffer or box to anchor a view into its allocation.
+Element types containing checked borrows or Results are rejected; these APIs
+cannot reconstruct hidden dependencies or discard error-handling obligations.
+Unsafe code must not invalidate the allocation while any checked view lives.
+
+`mem.str_from_utf8` requires the complete byte slice to be valid UTF-8. Prefer
+safe `text.Text.new(bytes)?.as_str()` after binding the text view. It creates no
+allocation and does not extend the source lifetime.
+
+Raw access must respect all live checked borrows. Allocator
+and storage examples are in [standard library](standard-library.md).
 
 ## MMIO and volatile access
 
