@@ -1,0 +1,297 @@
+package native_checks
+import "std/net"
+import "std/net/native"
+import "std/io"
+import "core/bytes"
+
+fn read_byte(connection: &mut native.TcpConnection, expected: u8) -> i32!net.Error {
+    buffer := [0u8; 1]
+    ready := connection.wait_ready(net.Interest.Read, 1000)?
+    if!ready {
+        return ok(30)
+    }
+    match connection.read(&mut buffer) {
+        ok(count) => {
+            if count != 1 || buffer[0] != expected {
+                return ok(31)
+            }
+        }
+        err(_) => {
+            return ok(32)
+        }
+    }
+    return ok(0)
+}
+fn tcp(ip: net.IpAddress) -> i32!net.Error {
+    bind := net.SocketAddress.new(ip, 0)
+    listener := native.TcpListener.bind(&bind, 8)?
+    address := listener.local_address()?
+    if address.port == 0 {
+        return ok(1)
+    }
+    match listener.accept()? {
+        some(_) => {
+            return ok(2)
+        }
+        none => {}
+    }
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    operation := net.Operation.until(clock.now_ms() + 2000)
+    client := native.connect_with(&address, &operation, &mut clock, &cancel)?
+    if!client.poll_connected()? {
+        return ok(3)
+    }
+    ready := listener.wait_ready(1000)?
+    if!ready {
+        return ok(4)
+    }
+    match listener.accept()? {
+        some(server) => {
+            buffer := [0u8; 1]
+            match server.poll_read(&mut buffer) {
+                ok(progress) => {
+                    if progress.state != io.PollState.Pending {
+                        return ok(5)
+                    }
+                }
+                err(_) => {
+                    return ok(6)
+                }
+            }
+            match client.write(b"abc") {
+                ok(count) => {
+                    if count != 3 {
+                        return ok(7)
+                    }
+                }
+                err(_) => {
+                    return ok(8)
+                }
+            }
+            for expected in b"abc" {
+                code := read_byte(&mut server, *expected)?
+                if code != 0 {
+                    return ok(code)
+                }
+            }
+            client.shutdown(net.Shutdown.Write)?
+            ready = server.wait_ready(net.Interest.Read, 1000)?
+            if!ready {
+                return ok(9)
+            }
+            match server.poll_read(&mut buffer) {
+                ok(progress) => {
+                    if progress.state != io.PollState.Eof {
+                        return ok(10)
+                    }
+                }
+                err(_) => {
+                    return ok(11)
+                }
+            }
+            // Receive remains available after a write-half-close.
+            match server.write(b"z") {
+                ok(count) => {
+                    if count != 1 {
+                        return ok(12)
+                    }
+                }
+                err(_) => {
+                    return ok(13)
+                }
+            }
+            code := read_byte(&mut client, 122)?
+            if code != 0 {
+                return ok(code)
+            }
+            server.close()?
+            server.close()?
+            match server.read(&mut buffer) {
+                ok(_) => {
+                    return ok(14)
+                }
+                err(reason) => {
+                    if reason.kind != io.ErrorKind.Closed {
+                        return ok(15)
+                    }
+                }
+            }
+        }
+        none => {
+            return ok(16)
+        }
+    }
+    client.close()?
+    listener.close()?
+    // The closed port deterministically refuses a new connection.
+    match native.connect_with(&address, &operation, &mut clock, &cancel) {
+        ok(_) => {
+            return ok(17)
+        }
+        err(reason) => {
+            if reason.kind != net.ErrorKind.ConnectionRefused {
+                return ok(18)
+            }
+        }
+    }
+    return ok(0)
+}
+fn udp(ip: net.IpAddress) -> i32!net.Error {
+    bind := net.SocketAddress.new(ip, 0)
+    sender := native.UdpSocket.bind(&bind)?
+    receiver := native.UdpSocket.bind(&bind)?
+    address := receiver.local_address()?
+    buffer := [0u8; 3]
+    match receiver.receive_from(&mut buffer) {
+        ok(_) => {
+            return ok(40)
+        }
+        err(reason) => {
+            if reason.kind != net.ErrorKind.WouldBlock {
+                return ok(41)
+            }
+        }
+    }
+    sent := sender.send_to(b"abcdef", &address)?
+    if sent != 6 {
+        return ok(42)
+    }
+    ready := receiver.wait_ready(net.Interest.Read, 1000)?
+    if!ready {
+        return ok(43)
+    }
+    received := receiver.receive_from(&mut buffer)?
+    if received.transferred != 3 || !received.truncated || !bytes.equal(&buffer, b"abc") {
+        return ok(44)
+    }
+    // Truncated suffix is discarded; a subsequent packet has its own boundary.
+    sent = sender.send_to(b"xy", &address)?
+    ready = receiver.wait_ready(net.Interest.Read, 1000)?
+    received2 := receiver.receive_from(&mut buffer)?
+    if received2.transferred != 2 || received2.truncated || !bytes.equal(&buffer[..2], b"xy") {
+        return ok(45)
+    }
+    sent = sender.send_to(b"", &address)?
+    ready = receiver.wait_ready(net.Interest.Read, 1000)?
+    empty := receiver.receive_from(&mut buffer)?
+    if empty.transferred != 0 || empty.truncated {
+        return ok(46)
+    }
+    sent = sender.send_to(b"x", &address)?
+    ready = receiver.wait_ready(net.Interest.Read, 1000)?
+    zero := receiver.receive_from(&mut buffer[..0])?
+    if zero.transferred != 0 || !zero.truncated {
+        return ok(47)
+    }
+    return ok(0)
+}
+fn policies() -> i32!net.Error {
+    address := net.parse_socket(b"127.0.0.1:1")?
+    cancel := net.Cancellation.new()
+    cancel.cancel()
+    clock := native.MonotonicClock {}
+    operation := net.Operation.unlimited()
+    match native.connect_with(&address, &operation, &mut clock, &cancel) {
+        ok(_) => {
+            return ok(50)
+        }
+        err(reason) => {
+            if reason.kind != net.ErrorKind.Cancelled {
+                return ok(51)
+            }
+        }
+    }
+    expired := net.Operation.until(clock.now_ms())
+    never := net.NeverCancel {}
+    match native.connect_with(&address, &expired, &mut clock, &never) {
+        ok(_) => {
+            return ok(52)
+        }
+        err(reason) => {
+            if reason.kind != net.ErrorKind.TimedOut {
+                return ok(53)
+            }
+        }
+    }
+    workspace := [0u8; 768]
+    resolved := native.resolve(b"localhost", 8080, &mut workspace)?
+    if resolved.len() == 0 || resolved.truncated {
+        return ok(54)
+    }
+    first := resolved.get(0)?
+    if first.port != 8080 {
+        return ok(55)
+    }
+    small := [0u8; 1]
+    match native.resolve(b"localhost", 0, &mut small) {
+        ok(_) => {
+            return ok(56)
+        }
+        err(reason) => {
+            if reason.kind != net.ErrorKind.BufferTooSmall {
+                return ok(57)
+            }
+        }
+    }
+    match native.resolve(b"bad\x00host", 0, &mut workspace) {
+        ok(_) => {
+            return ok(58)
+        }
+        err(reason) => {
+            if reason.kind != net.ErrorKind.InvalidInput {
+                return ok(59)
+            }
+        }
+    }
+    match native.resolve_numeric(b"256.256.256.256", 0, &mut workspace) {
+        ok(_) => {
+            return ok(60)
+        }
+        err(reason) => {
+            if reason.kind != net.ErrorKind.NameNotFound {
+                return ok(61)
+            }
+        }
+    }
+    // Resource cleanup and repeated close are exercised on every owned handle.
+    bind := net.parse_socket(b"127.0.0.1:0")?
+    for i in 0usize..256 {
+        socket := native.UdpSocket.bind(&bind)?
+        socket.close()?
+        socket.close()?
+    }
+    return ok(0)
+}
+fn run() -> i32!net.Error {
+    v4 := net.IpAddress.v4(127, 0, 0, 1)
+    code := tcp(v4)?
+    if code != 0 {
+        return ok(code)
+    }
+    v6 := net.parse_ip(b"::1")?
+    code = tcp(v6)?
+    if code != 0 {
+        return ok(code)
+    }
+    code = udp(net.IpAddress.v4(127, 0, 0, 1))?
+    if code != 0 {
+        return ok(code)
+    }
+    v6_udp := net.parse_ip(b"::1")?
+    code = udp(v6_udp)?
+    if code != 0 {
+        return ok(code)
+    }
+    return policies()
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

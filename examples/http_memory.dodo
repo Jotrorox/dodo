@@ -1,0 +1,39 @@
+package http_memory
+import "std/http"
+
+// A complete HTTP protocol engine with no sockets, clocks, TLS or scheduler.
+fn run() -> i32!http.Error {
+    workspace := [0u8; 1024]
+    parser := http.Parser.new(http.Role.Request, &mut workspace, http.Limits.defaults())
+    message := b"POST /echo HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+    position := 0usize
+    body_bytes := 0usize
+    for true {
+        end := position + 1
+        if end > message.len {
+            end = message.len
+        }
+        event := parser.feed(&message[position..end])?
+        position += event.consumed
+        if event.kind == http.EventKind.Body {
+            body_bytes += event.length
+        }
+        if event.kind == http.EventKind.Complete {
+            break
+        }
+    }
+    if body_bytes != 3 || !parser.reusable() {
+        return ok(1)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 2
+        }
+    }
+}

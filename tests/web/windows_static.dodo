@@ -1,0 +1,97 @@
+package windows_static
+import "std/web/static_files"
+import "std/fs"
+import "std/fs/types"
+import "std/platform/native"
+import "std/platform/error"
+import "std/io"
+
+fn mkdir(name: &str) -> void!error.Error {
+    bytes := [0u8; 256]
+    wide := [0u16; 256]
+    path := native.from_utf8(name, &mut bytes, &mut wide)?
+    return fs.create_directory(&path)
+}
+fn create(name: &str, content: &[u8]) -> void!error.Error {
+    bytes := [0u8; 256]
+    wide := [0u16; 256]
+    path := native.from_utf8(name, &mut bytes, &mut wide)?
+    options := fs.OpenOptions.create_new()
+    file := fs.File.open(&path, &options)?
+    match io.write_all(&mut file, content) {
+        ok(_) => {}
+        err(_) => {
+            return err(error.failure(error.Kind.Other))
+        }
+    }
+    return file.close()
+}
+fn link(target: &str, name: &str, directory: bool) -> void!error.Error {
+    bytes := [0u8; 256]
+    wide := [0u16; 256]
+    target_bytes := [0u8; 256]
+    target_wide := [0u16; 256]
+    path := native.from_utf8(name, &mut bytes, &mut wide)?
+    destination := native.from_utf8(target, &mut target_bytes, &mut target_wide)?
+    fs.symlink(&destination, &path, directory)?
+    metadata := fs.symlink_metadata(&path)?
+    if metadata.kind != types.FileKind.SymbolicLink {
+        return err(error.failure(error.Kind.Other))
+    }
+    return ok()
+}
+fn run() -> i32!error.Error {
+    mkdir("public")?
+    mkdir("public/sub")?
+    mkdir("outside")?
+    create("public/hello.txt", b"hello")?
+    create("public/sub/nested.txt", b"nested")?
+    create("outside/secret", b"secret")?
+    // Create actual Windows reparse points through the selected FS provider.
+    link("..\\outside\\secret", "public/link", false)?
+    link("..\\outside", "public/dirlink", true)?
+    link("public", "rootlink", true)?
+    match static_files.Root.open(b"rootlink", static_files.Symlinks.Reject) {
+        ok(_) => {
+            return ok(1)
+        }
+        err(_) => {}
+    }
+    root := static_files.Root.open(b"public", static_files.Symlinks.Reject)?
+    file := root.open_file(b"/sub/nested.txt")?
+    buffer := [0u8; 6]
+    match io.read_exact(&mut file, &mut buffer) {
+        ok(count) => {
+            if count != 6 || buffer[0] != 110 || buffer[5] != 100 {
+                return ok(2)
+            }
+        }
+        err(_) => {
+            return ok(3)
+        }
+    }
+    bad := [b"/../outside/secret", b"/%2e%2e/outside/secret", b"/link", b"/dirlink/secret", b"/hello.txt/", b"//hello.txt", b"/hello.txt:stream", b"/hello.txt.", b"/hello.txt ", b"/sub/../hello.txt"]
+    for path in bad {
+        match root.open_file(*path) {
+            ok(_) => {
+                return ok(4)
+            }
+            err(_) => {}
+        }
+    }
+    for i in 0usize..100 {
+        other := root.open_file(b"/hello.txt")?
+        other.close()?
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

@@ -1,0 +1,402 @@
+package net
+
+// Portable addresses and operation policy: no OS, allocator, clock or scheduler.
+pub enum Family {
+    V4, V6
+}
+pub enum ErrorKind {
+    InvalidAddress, BufferTooSmall, InvalidInput, WouldBlock, Interrupted,
+    TimedOut, Cancelled, Closed, ConnectionReset, ConnectionRefused,
+    AddressInUse, NetworkUnreachable, NameNotFound, Exhausted, Other
+}
+pub struct Error {
+    pub kind: ErrorKind, pub code: i32, pub transferred: usize
+}
+pub fn failure(kind: ErrorKind) -> Error {
+    return Error { kind: kind, code: 0, transferred: 0 }
+}
+pub enum Shutdown {
+    Read, Write, Both
+}
+pub enum Interest {
+    Read, Write
+}
+pub struct IpAddress {
+    pub family: Family
+    // IPv4 occupies the first four bytes; its remaining bytes are zero.
+    pub octets: [16]u8
+    pub fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddress {
+        bytes := [0u8; 16]
+        bytes[0] = a
+        bytes[1] = b
+        bytes[2] = c
+        bytes[3] = d
+        return IpAddress { family: Family.V4, octets: bytes }
+    }
+    pub fn v6(bytes: [16]u8) -> IpAddress {
+        return IpAddress { family: Family.V6, octets: bytes }
+    }
+    pub fn clone(&self) -> IpAddress {
+        bytes := [0u8; 16]
+        for i in 0usize..16 {
+            bytes[i] = self.octets[i]
+        }
+        family := Family.V4
+        if self.family == Family.V6 {
+            family = Family.V6
+        }
+        return IpAddress { family: family, octets: bytes }
+    }
+    pub fn equals(&self, other: &IpAddress) -> bool {
+        if self.family != other.family {
+            return false
+        }
+        for i in 0usize..16 {
+            if self.octets[i] != other.octets[i] {
+                return false
+            }
+        }
+        return true
+    }
+}
+pub struct SocketAddress {
+    pub ip: IpAddress
+    pub port: u16
+    // Numeric interface index; names require an optional platform extension.
+    pub scope_id: u32
+    pub fn new(ip: IpAddress, port: u16) -> SocketAddress {
+        return SocketAddress { ip: ip, port: port, scope_id: 0 }
+    }
+    pub fn clone(&self) -> SocketAddress {
+        return SocketAddress { ip: self.ip.clone(), port: self.port, scope_id: self.scope_id }
+    }
+}
+fn decimal(input: &[u8], maximum: u32) -> u32!Error {
+    if input.len == 0 {
+        return err(failure(ErrorKind.InvalidAddress))
+    }
+    value := 0u32
+    for i in 0usize..input.len {
+        ch := input[i]
+        if ch < 48 || ch > 57 {
+            return err(failure(ErrorKind.InvalidAddress))
+        }
+        digit := (ch - 48) as u32
+        if value > maximum / 10 || (value == maximum / 10 && digit > maximum % 10) {
+            return err(failure(ErrorKind.InvalidAddress))
+        }
+        value = value * 10 + digit
+    }
+    return ok(value)
+}
+pub fn parse_v4(input: &[u8]) -> IpAddress!Error {
+    result := IpAddress.v4(0, 0, 0, 0)
+    start := 0usize
+    component := 0usize
+    for i in 0usize..input.len + 1 {
+        if i == input.len || input[i] == 46 {
+            if component == 4 || i == start || (i - start > 1 && input[start] == 48) {
+                return err(failure(ErrorKind.InvalidAddress))
+            }
+            result.octets[component] = decimal(&input[start..i], 255)? as u8
+            component += 1
+            start = i + 1
+        }
+    }
+    if component != 4 {
+        return err(failure(ErrorKind.InvalidAddress))
+    }
+    return ok(result)
+}
+fn hexadecimal(ch: u8) -> u16!Error {
+    if ch >= 48 && ch <= 57 {
+        return ok((ch - 48) as u16)
+    }
+    if ch >= 65 && ch <= 70 {
+        return ok((ch - 55) as u16)
+    }
+    if ch >= 97 && ch <= 102 {
+        return ok((ch - 87) as u16)
+    }
+    return err(failure(ErrorKind.InvalidAddress))
+}
+pub fn parse_v6(input: &[u8]) -> IpAddress!Error {
+    if input.len < 2 {
+        return err(failure(ErrorKind.InvalidAddress))
+    }
+    words := [0u16; 8]
+    used := 0usize
+    compression := 9usize
+    position := 0usize
+    if input[0] == 58 {
+        if input[1] != 58 {
+            return err(failure(ErrorKind.InvalidAddress))
+        }
+        compression = 0
+        position = 2
+    }
+    for position < input.len {
+        if used == 8 {
+            return err(failure(ErrorKind.InvalidAddress))
+        }
+        start := position
+        dotted := false
+        for position < input.len && input[position] != 58 {
+            if input[position] == 46 {
+                dotted = true
+            }
+            position += 1
+        }
+        if dotted {
+            if used > 6 || position != input.len {
+                return err(failure(ErrorKind.InvalidAddress))
+            }
+            v4 := parse_v4(&input[start..position])?
+            words[used] = ((v4.octets[0] as u16) << 8) | (v4.octets[1] as u16)
+            words[used + 1] = ((v4.octets[2] as u16) << 8) | (v4.octets[3] as u16)
+            used += 2
+        } else {
+            if position == start || position - start > 4 {
+                return err(failure(ErrorKind.InvalidAddress))
+            }
+            word := 0u16
+            for i in start..position {
+                word = (word << 4) | hexadecimal(input[i])?
+            }
+            words[used] = word
+            used += 1
+        }
+        if position < input.len {
+            position += 1
+            if position == input.len {
+                return err(failure(ErrorKind.InvalidAddress))
+            }
+            if input[position] == 58 {
+                if compression != 9 {
+                    return err(failure(ErrorKind.InvalidAddress))
+                }
+                compression = used
+                position += 1
+            }
+        }
+    }
+    if compression == 9 {
+        if used != 8 {
+            return err(failure(ErrorKind.InvalidAddress))
+        }
+    } else {
+        if used >= 8 {
+            return err(failure(ErrorKind.InvalidAddress))
+        }
+        tail := used - compression
+        for i in 0usize..tail {
+            words[7 - i] = words[used - 1 - i]
+        }
+        for i in compression..8 - tail {
+            words[i] = 0
+        }
+    }
+    bytes := [0u8; 16]
+    for i in 0usize..8 {
+        bytes[2 * i] = (words[i] >> 8) as u8
+        bytes[2 * i + 1] = (words[i] & 255) as u8
+    }
+    return ok(IpAddress.v6(bytes))
+}
+pub fn parse_ip(input: &[u8]) -> IpAddress!Error {
+    for i in 0usize..input.len {
+        if input[i] == 58 {
+            return parse_v6(input)
+        }
+    }
+    return parse_v4(input)
+}
+pub fn parse_socket(input: &[u8]) -> SocketAddress!Error {
+    if input.len == 0 {
+        return err(failure(ErrorKind.InvalidAddress))
+    }
+    if input[0] == 91 {
+        end := 1usize
+        scope := 0usize
+        for end < input.len && input[end] != 93 {
+            if input[end] == 37 {
+                if scope != 0 {
+                    return err(failure(ErrorKind.InvalidAddress))
+                }
+                scope = end
+            }
+            end += 1
+        }
+        if end + 2 >= input.len || input[end + 1] != 58 {
+            return err(failure(ErrorKind.InvalidAddress))
+        }
+        ip_end := end
+        zone := 0u32
+        if scope != 0 {
+            ip_end = scope
+            zone = decimal(&input[scope + 1..end], 4294967295u32)?
+        }
+        ip := parse_v6(&input[1..ip_end])?
+        port := decimal(&input[end + 2..], 65535)? as u16
+        return ok(SocketAddress { ip: ip, port: port, scope_id: zone })
+    }
+    split := 0usize
+    for split < input.len && input[split] != 58 {
+        split += 1
+    }
+    if split == input.len {
+        return err(failure(ErrorKind.InvalidAddress))
+    }
+    ip := parse_v4(&input[..split])?
+    port := decimal(&input[split + 1..], 65535)? as u16
+    return ok(SocketAddress.new(ip, port))
+}
+fn put(output: &mut[u8], position: &mut usize, byte: u8) {
+    output[*position] = byte
+    *position += 1
+}
+fn number(output: &mut[u8], position: &mut usize, value: u32, base: u32) {
+    digits := b"0123456789abcdef"
+    scratch := [0u8; 10]
+    count := 0usize
+    remaining := value
+    for true {
+        scratch[count] = digits[(remaining % base) as usize]
+        count += 1
+        remaining /= base
+        if remaining == 0 {
+            break
+        }
+    }
+    for i in 0usize..count {
+        put(output, position, scratch[count - 1 - i])
+    }
+}
+fn format_inner(ip: &IpAddress, output: &mut[u8], position: &mut usize) {
+    if ip.family == Family.V4 {
+        for i in 0usize..4 {
+            if i != 0 {
+                put(output, position, 46)
+            }
+            number(output, position, ip.octets[i] as u32, 10)
+        }
+        return
+    }
+    words := [0u16; 8]
+    for i in 0usize..8 {
+        words[i] = ((ip.octets[i * 2] as u16) << 8) | (ip.octets[i * 2 + 1] as u16)
+    }
+    best := 8usize
+    length := 1usize
+    i := 0usize
+    for i < 8 {
+        start := i
+        for i < 8 && words[i] == 0 {
+            i += 1
+        }
+        if i - start > length {
+            best = start
+            length = i - start
+        }
+        if i == start {
+            i += 1
+        }
+    }
+    i = 0
+    for i < 8 {
+        if i == best {
+            put(output, position, 58)
+            put(output, position, 58)
+            i += length
+        } else {
+            if i != 0 && i != best + length {
+                put(output, position, 58)
+            }
+            number(output, position, words[i] as u32, 16)
+            i += 1
+        }
+    }
+}
+// Output is unchanged on BufferTooSmall. No trailing NUL is written.
+pub fn format_ip(ip: &IpAddress, output: &mut[u8]) -> usize!Error {
+    scratch := [0u8; 64]
+    count := 0usize
+    format_inner(ip, &mut scratch, &mut count)
+    if count > output.len {
+        return err(failure(ErrorKind.BufferTooSmall))
+    }
+    for i in 0usize..count {
+        output[i] = scratch[i]
+    }
+    return ok(count)
+}
+pub fn format_socket(address: &SocketAddress, output: &mut[u8]) -> usize!Error {
+    scratch := [0u8; 64]
+    count := 0usize
+    if address.ip.family == Family.V6 {
+        put(&mut scratch, &mut count, 91)
+    }
+    format_inner(&address.ip, &mut scratch, &mut count)
+    if address.ip.family == Family.V6 {
+        if address.scope_id != 0 {
+            put(&mut scratch, &mut count, 37)
+            number(&mut scratch, &mut count, address.scope_id, 10)
+        }
+        put(&mut scratch, &mut count, 93)
+    }
+    put(&mut scratch, &mut count, 58)
+    number(&mut scratch, &mut count, address.port as u32, 10)
+    if count > output.len {
+        return err(failure(ErrorKind.BufferTooSmall))
+    }
+    for i in 0usize..count {
+        output[i] = scratch[i]
+    }
+    return ok(count)
+}
+
+// Absolute milliseconds in an explicit provider's clock domain. None means no
+// deadline; clocks must be monotonic. Cancellation is checked before an attempt.
+pub struct Operation {
+    pub deadline: Option<u64>
+    pub fn unlimited() -> Operation {
+        return Operation { deadline: none }
+    }
+    pub fn until(milliseconds: u64) -> Operation {
+        return Operation { deadline: some(milliseconds) }
+    }
+    pub fn check<C, X>(&self, clock: &mut C, cancel: &X) -> void!Error {
+        if cancel.cancelled() {
+            return err(failure(ErrorKind.Cancelled))
+        }
+        match &self.deadline {
+            some(limit) => {
+                if clock.now_ms() >= *limit {
+                    return err(failure(ErrorKind.TimedOut))
+                }
+            }
+            none => {}
+        }
+        return ok()
+    }
+}
+pub struct NeverCancel {
+    pub fn cancelled(&self) -> bool {
+        return false
+    }
+}
+pub struct Cancellation {
+    value: bool
+    pub fn new() -> Cancellation {
+        return Cancellation { value: false }
+    }
+    pub fn cancel(&mut self) {
+        self.value = true
+    }
+    pub fn cancelled(&self) -> bool {
+        return self.value
+    }
+}
+// A socket read/write/poll returns after an OS attempt, retaining no caller
+// memory. Pending connect belongs to the connection until success/close/drop.
+// Concurrent cancellation providers can implement cancelled() with std/sync.

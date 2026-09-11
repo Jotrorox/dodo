@@ -1,0 +1,195 @@
+package openssl
+
+import "core/ptr"
+import "std/io"
+import "std/tls"
+import "std/tls/native"
+
+// All configuration bytes are copied/parsed during construction. PEM key bytes
+// remain the caller's secret and must be wiped by the caller when appropriate.
+pub struct Config {
+    pub hostname: &[u8]
+    pub trust_pem: &[u8]
+    pub certificate_pem: &[u8]
+    pub private_key_pem: &[u8]
+    // RFC 7301 wire format: one-byte length followed by protocol bytes.
+    pub alpn: &[u8]
+    pub system_roots: bool
+    pub require_client_certificate: bool
+    // -1 uses the backend's platform wall clock; >=0 is explicit Unix seconds.
+    pub verification_time: i64
+    pub fn client(hostname: &[u8]) -> Config from(hostname) {
+        return Config { hostname: hostname, trust_pem: b"", certificate_pem: b"",
+        private_key_pem: b"", alpn: b"", system_roots: true,
+        require_client_certificate: false, verification_time: -1 }
+    }
+    pub fn server(certificate: &[u8], key: &[u8]) -> Config from(certificate, key) {
+        return Config { hostname: b"", trust_pem: b"", certificate_pem: certificate,
+        private_key_pem: key, alpn: b"", system_roots: false,
+        require_client_certificate: false, verification_time: -1 }
+    }
+}
+fn error(status: i32, code: i32) -> tls.Error {
+    kind := tls.ErrorKind.Backend
+    if status == -1 {
+        kind = tls.ErrorKind.InvalidInput
+    }
+    if status == -2 {
+        kind = tls.ErrorKind.AllocationFailed
+    }
+    if status == -3 {
+        kind = tls.ErrorKind.VerificationFailed
+    }
+    if status == -4 {
+        kind = tls.ErrorKind.Protocol
+    }
+    if status == -5 {
+        kind = tls.ErrorKind.Truncated
+    }
+    if status == -6 {
+        kind = tls.ErrorKind.Closed
+    }
+    if status == -10 {
+        kind = tls.ErrorKind.LimitExceeded
+    }
+    return tls.failure(kind, code)
+}
+fn state(status: i32, code: i32) -> tls.State!tls.Error {
+    if status < 0 {
+        return err(error(status, code))
+    }
+    if status == 1 {
+        return ok(tls.State.NeedInput)
+    }
+    if status == 2 {
+        return ok(tls.State.NeedOutput)
+    }
+    if status == 3 {
+        return ok(tls.State.Closed)
+    }
+    return ok(tls.State.Ready)
+}
+// Owns context, certificate/key references, SSL session, two 32KiB ciphertext
+// rings and a 16KiB plaintext retry buffer. No borrowed configuration survives.
+// Deliberately not Send/Sync: serialize all calls on the owning execution lane.
+pub struct Engine {
+    handle: *mut u8
+    pub fn client(config: &Config) -> Engine!tls.Error {
+        return create(config, false)
+    }
+    pub fn server(config: &Config) -> Engine!tls.Error {
+        return create(config, true)
+    }
+    pub fn handshake(&mut self) -> tls.State!tls.Error {
+        code := 0i32
+        unsafe {
+            return state(native.dodo_tls_handshake(self.handle, ptr.from_mut(&mut code)), code)
+        }
+    }
+    pub fn feed(&mut self, source: &[u8]) -> usize!tls.Error {
+        count := 0usize
+        unsafe {
+            status := native.dodo_tls_feed(self.handle, ptr.as_ptr(source), source.len, ptr.from_mut(&mut count))
+            if status < 0 {
+                return err(error(status, 0))
+            }
+        }
+        return ok(count)
+    }
+    pub fn drain(&mut self, destination: &mut[u8]) -> usize!tls.Error {
+        count := 0usize
+        unsafe {
+            status := native.dodo_tls_drain(self.handle, ptr.as_mut_ptr(destination), destination.len, ptr.from_mut(&mut count))
+            if status < 0 {
+                return err(error(status, 0))
+            }
+        }
+        return ok(count)
+    }
+    pub fn read_plain(&mut self, destination: &mut[u8]) -> tls.Progress!tls.Error {
+        count := 0usize
+        code := 0i32
+        status := 0i32
+        unsafe {
+            status = native.dodo_tls_read(self.handle, ptr.as_mut_ptr(destination), destination.len, ptr.from_mut(&mut count), ptr.from_mut(&mut code))
+        }
+        progress := state(status, code)?
+        return ok(tls.Progress { state: progress, transferred: count })
+    }
+    pub fn write_plain(&mut self, source: &[u8]) -> tls.Progress!tls.Error {
+        count := 0usize
+        code := 0i32
+        status := 0i32
+        unsafe {
+            status = native.dodo_tls_write(self.handle, ptr.as_ptr(source), source.len, ptr.from_mut(&mut count), ptr.from_mut(&mut code))
+        }
+        progress := state(status, code)?
+        return ok(tls.Progress { state: progress, transferred: count })
+    }
+    pub fn flush(&mut self) -> tls.State!tls.Error {
+        code := 0i32
+        unsafe {
+            return state(native.dodo_tls_flush(self.handle, ptr.from_mut(&mut code)), code)
+        }
+    }
+    pub fn shutdown(&mut self) -> tls.State!tls.Error {
+        code := 0i32
+        unsafe {
+            return state(native.dodo_tls_shutdown(self.handle, ptr.from_mut(&mut code)), code)
+        }
+    }
+    pub fn eof(&mut self) {
+        unsafe {
+            native.dodo_tls_eof(self.handle)
+        }
+    }
+    pub fn selected_alpn(&self, destination: &mut[u8]) -> usize!tls.Error {
+        unsafe {
+            length := native.dodo_tls_alpn(self.handle, ptr.as_mut_ptr(destination), destination.len)
+            if length < 0 {
+                return err(error(length, 0))
+            }
+            return ok(length as usize)
+        }
+    }
+    // Immediate abort, no I/O. Idempotent; all later operations fail Closed.
+    pub fn abort(&mut self) {
+        unsafe {
+            native.dodo_tls_free(self.handle)
+        }
+        unsafe {
+            self.handle = 0usize as *mut u8
+        }
+    }
+    fn drop(&mut self) {
+        self.abort()
+    }
+}
+fn create(config: &Config, server: bool) -> Engine!tls.Error {
+    code := 0i32
+    server_flag := 0i32
+    roots_flag := 0i32
+    auth_flag := 0i32
+    if server {
+        server_flag = 1
+    }
+    if config.system_roots {
+        roots_flag = 1
+    }
+    if config.require_client_certificate {
+        auth_flag = 1
+    }
+    unsafe {
+        handle := native.dodo_tls_new(server_flag,
+        ptr.as_ptr(config.hostname), config.hostname.len,
+        ptr.as_ptr(config.trust_pem), config.trust_pem.len,
+        ptr.as_ptr(config.certificate_pem), config.certificate_pem.len,
+        ptr.as_ptr(config.private_key_pem), config.private_key_pem.len,
+        ptr.as_ptr(config.alpn), config.alpn.len, roots_flag, auth_flag,
+        config.verification_time, ptr.from_mut(&mut code))
+        if ptr.is_null(handle) {
+            return err(error(code, code))
+        }
+        return ok(Engine { handle: handle })
+    }
+}

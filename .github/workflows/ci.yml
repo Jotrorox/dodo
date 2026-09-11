@@ -40,6 +40,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y llvm-22-dev libpolly-22-dev clang-22 build-essential zlib1g-dev libzstd-dev libffi-dev libz3-dev cmake ninja-build
           /usr/lib/llvm-22/bin/llvm-config --version
+      - name: Build the maintained OpenSSL backend for TLS fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_tls_prefix="$RUNNER_TEMP/dodo-openssl"
+          test_tls_archive="$RUNNER_TEMP/openssl-3.5.8.tar.gz"
+          curl --fail --silent --show-error --location https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz -o "$test_tls_archive"
+          printf '%s  %s\n' a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2 "$test_tls_archive" | sha256sum --check
+          tar -xzf "$test_tls_archive" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/openssl-3.5.8"
+          ./Configure --prefix="$test_tls_prefix" --libdir=lib no-shared no-tests
+          make -j2
+          make install_sw
+          echo "CPATH=$test_tls_prefix/include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$test_tls_prefix/lib" >> "$GITHUB_ENV"
+          echo "$test_tls_prefix/bin" >> "$GITHUB_PATH"
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Test ELF dependency checks

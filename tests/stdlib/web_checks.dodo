@@ -1,0 +1,165 @@
+package web_checks
+import "core/bytes"
+import "std/web"
+import "std/web/stream"
+import "std/io"
+
+pub struct Slow {
+    used: usize
+    pending: bool
+    pub fn poll_write(&mut self, data: &[u8]) -> io.Poll!io.Error {
+        if self.pending {
+            self.pending = false
+            return ok(io.Poll { state: io.PollState.Pending, transferred: 0 })
+        }
+        self.pending = true
+        self.used += 1
+        return ok(io.Poll { state: io.PollState.Ready, transferred: 1 })
+    }
+}
+pub struct Layer {
+    digit: u64
+    pub fn before(&mut self, context: &mut web.Context) -> void!web.Error {
+        context.request_id = context.request_id * 10 + self.digit
+        return ok()
+    }
+    pub fn after(&mut self, context: &mut web.Context, status: u16) {
+        context.request_id = context.request_id * 10 + self.digit
+    }
+}
+pub struct Handler {
+    pub fn handle<B, W>(&mut self, context: &mut web.Context, body: &mut B, output: &mut W) -> u16!web.Error {
+        context.request_id = context.request_id * 10 + 3
+        return ok(200)
+    }
+}
+fn checks() -> i32!web.Error {
+    routes := [web.Route { method: b"GET", pattern: b"/users/:id", id: 1 },
+    web.Route { method: b"GET", pattern: b"/users/new", id: 2 },
+    web.Route { method: b"GET", pattern: b"/files/*rest", id: 3 },
+    web.Route { method: b"POST", pattern: b"/users/new", id: 4 }]
+    router := web.Router.new(&routes)?
+    get := router.find(b"GET", b"/users/new")?
+    if get.id != 2 {
+        return ok(1)
+    }
+    head := router.find(b"HEAD", b"/users/new")?
+    if head.id != 2 {
+        return ok(2)
+    }
+    post := router.find(b"POST", b"/users/new")?
+    if post.id != 4 {
+        return ok(3)
+    }
+    match router.find(b"PUT", b"/users/new") {
+        ok(_) => {
+            return ok(4)
+        }
+        err(reason) => {
+            if reason != web.Error.MethodNotAllowed {
+                return ok(5)
+            }
+        }
+    }
+    match router.find(b"GET", b"/users/") {
+        ok(_) => {
+            return ok(6)
+        }
+        err(_) => {}
+    }
+    files := router.find(b"GET", b"/files/")?
+    if files.id != 3 {
+        return ok(7)
+    }
+    match router.parameter(2, b"/files/a/b", b"rest") {
+        some(value) => {
+            if value.start != 7 || value.end != 10 {
+                return ok(8)
+            }
+        }
+        none => {
+            return ok(9)
+        }
+    }
+    duplicate := [web.Route { method: b"GET", pattern: b"/:a", id: 1 }, web.Route { method: b"GET", pattern: b"/:b", id: 2 }]
+    match web.Router.new(&duplicate) {
+        ok(_) => {
+            return ok(10)
+        }
+        err(reason) => {
+            if reason != web.Error.AmbiguousRoute {
+                return ok(11)
+            }
+        }
+    }
+    data := [0u8; 64]
+    count := web.decode_path(b"/users/%6Eew?q=x", &mut data)?
+    if!bytes.equal(&data[..count], b"/users/new") {
+        return ok(12)
+    }
+    bad := [b"/%2f", b"/%5c", b"/%00", b"/%ff", b"/%2e%2e/x", b"/%", b"/a#b"]
+    for i in 0usize..bad.len {
+        match web.decode_path(bad[i], &mut data) {
+            ok(_) => {
+                return ok(13)
+            }
+            err(_) => {}
+        }
+    }
+    match web.decode_path(b"/long", &mut data[..2]) {
+        ok(_) => {
+            return ok(14)
+        }
+        err(reason) => {
+            if reason != web.Error.BufferFull {
+                return ok(15)
+            }
+        }
+    }
+    context := web.Context { method: b"GET", path: b"/", route_id: 0, request_id: 0, cancelled: false }
+    middleware := web.Chain<Layer, Layer> { outer: Layer { digit: 1 }, inner: Layer { digit: 2 } }
+    handler := Handler {}
+    body := io.MemoryReader.new(b"abc")
+    output := io.MemoryWriter.new(&mut data)
+    if web.dispatch(&mut middleware, &mut handler, &mut context, &mut body, &mut output)? != 200 {
+        return ok(16)
+    }
+    if context.request_id != 12321 {
+        return ok(17)
+    }
+    context.cancelled = true
+    match web.dispatch(&mut middleware, &mut handler, &mut context, &mut body, &mut output) {
+        ok(_) => {
+            return ok(18)
+        }
+        err(reason) => {
+            if reason != web.Error.Cancelled {
+                return ok(19)
+            }
+        }
+    }
+    pending := stream.PendingBody.new(b"abc")
+    slow := Slow { used: 0, pending: true }
+    for i in 0usize..6 {
+        match pending.step(&mut slow) {
+            ok(_) => {}
+            err(_) => {
+                return ok(20)
+            }
+        }
+    }
+    if pending.remaining() != 0 || slow.used != 3 {
+        return ok(21)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match checks() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

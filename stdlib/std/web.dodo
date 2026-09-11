@@ -1,0 +1,387 @@
+package web
+
+import "core/bytes"
+import "std/text"
+
+// Portable routing: byte paths decoded exactly once into caller storage.
+// No allocation, I/O, clock, filesystem, TLS, or scheduler dependency.
+pub enum Error {
+    InvalidPath, InvalidPattern, InvalidMethod, AmbiguousRoute, BufferFull,
+    NotFound, MethodNotAllowed, Cancelled, Handler, InvalidProgress
+}
+
+fn hex(value: u8) -> u8!Error {
+    if value >= 48 && value <= 57 {
+        return ok(value - 48)
+    }
+    if value >= 65 && value <= 70 {
+        return ok(value - 55)
+    }
+    if value >= 97 && value <= 102 {
+        return ok(value - 87)
+    }
+    return err(Error.InvalidPath)
+}
+
+// Query remains separate. Encoded separators, controls, backslashes, fragments,
+// invalid UTF-8, and dot segments are rejected, never silently normalized.
+// Failure can modify a prefix; only the successful returned prefix is a path.
+pub fn decode_path(target: &[u8], output: &mut[u8]) -> usize!Error {
+    if target.len == 0 || target[0] != 47 {
+        return err(Error.InvalidPath)
+    }
+    at := 0usize
+    used := 0usize
+    for at < target.len && target[at] != 63 {
+        value := target[at]
+        at += 1
+        if value == 37 {
+            if target.len - at < 2 {
+                return err(Error.InvalidPath)
+            }
+            value = hex(target[at])? * 16 + hex(target[at + 1])?
+            at += 2
+            if value == 47 || value == 92 {
+                return err(Error.InvalidPath)
+            }
+        }
+        if value <= 31 || value == 127 || value == 92 || value == 35 {
+            return err(Error.InvalidPath)
+        }
+        if used == output.len {
+            return err(Error.BufferFull)
+        }
+        output[used] = value
+        used += 1
+    }
+    validate_path(&output[..used])?
+    return ok(used)
+}
+
+pub fn validate_path(path: &[u8]) -> void!Error {
+    if path.len == 0 || path[0] != 47 {
+        return err(Error.InvalidPath)
+    }
+    match text.validate(path) {
+        ok() => {}
+        err(_) => {
+            return err(Error.InvalidPath)
+        }
+    }
+    start := 1usize
+    for at in 1usize..path.len + 1 {
+        if at == path.len || path[at] == 47 {
+            part := &path[start..at]
+            if bytes.equal(part, b".") || bytes.equal(part, b"..") {
+                return err(Error.InvalidPath)
+            }
+            start = at + 1
+        } else if path[at] <= 31 || path[at] == 127 || path[at] == 92 || path[at] == 35 {
+            return err(Error.InvalidPath)
+        }
+    }
+    return ok()
+}
+
+pub fn valid_method(method: &[u8]) -> bool {
+    if method.len == 0 {
+        return false
+    }
+    for at in 0usize..method.len {
+        value := method[at]
+        if!((value >= 65 && value <= 90) || (value >= 97 && value <= 122) ||
+            (value >= 48 && value <= 57) || value == 33 || value == 35 ||
+            value == 36 || value == 37 || value == 38 || value == 39 ||
+            value == 42 || value == 43 || value == 45 || value == 46 ||
+            value == 94 || value == 95 || value == 96 || value == 124 || value == 126) {
+            return false
+        }
+    }
+    return true
+}
+
+pub struct Route {
+    pub method: &[u8]
+    pub pattern: &[u8]
+    pub id: usize
+}
+
+fn end_segment(path: &[u8], start: usize) -> usize {
+    end := start
+    for end < path.len && path[end] != 47 {
+        end += 1
+    }
+    return end
+}
+fn segment_kind(path: &[u8], start: usize, end: usize) -> u8 {
+    if start < end {
+        if path[start] == 42 {
+            return 1
+        }
+        if path[start] == 58 {
+            return 2
+        }
+    }
+    return 3
+}
+fn valid_name(name: &[u8]) -> bool {
+    if name.len == 0 {
+        return false
+    }
+    for at in 0usize..name.len {
+        value := name[at]
+        if!((value >= 65 && value <= 90) || (value >= 97 && value <= 122) ||
+            (value >= 48 && value <= 57) || value == 95) {
+            return false
+        }
+    }
+    return true
+}
+fn validate_pattern(path: &[u8]) -> void!Error {
+    validate_path(path)?
+    at := 1usize
+    for at <= path.len {
+        end := end_segment(path, at)
+        kind := segment_kind(path, at, end)
+        if kind != 3 {
+            if!valid_name(&path[at + 1..end]) || (kind == 1 && end != path.len) {
+                return err(Error.InvalidPattern)
+            }
+            previous := 1usize
+            for previous < at {
+                previous_end := end_segment(path, previous)
+                if segment_kind(path, previous, previous_end) != 3 &&
+                    bytes.equal(&path[previous + 1..previous_end], &path[at + 1..end]) {
+                    return err(Error.InvalidPattern)
+                }
+                previous = previous_end + 1
+            }
+        } else {
+            for i in at..end {
+                if path[i] == 37 || path[i] == 63 || path[i] == 58 || path[i] == 42 {
+                    return err(Error.InvalidPattern)
+                }
+            }
+        }
+        at = end + 1
+    }
+    return ok()
+}
+
+fn same_shape(a: &[u8], b: &[u8]) -> bool {
+    ai := 1usize
+    bi := 1usize
+    for ai <= a.len && bi <= b.len {
+        ae := end_segment(a, ai)
+        be := end_segment(b, bi)
+        ak := segment_kind(a, ai, ae)
+        bk := segment_kind(b, bi, be)
+        if ak != bk || (ak == 3 && !bytes.equal(&a[ai..ae], &b[bi..be])) {
+            return false
+        }
+        ai = ae + 1
+        bi = be + 1
+    }
+    return ai > a.len && bi > b.len
+}
+fn matches_path(pattern: &[u8], path: &[u8]) -> bool {
+    pi := 1usize
+    si := 1usize
+    for pi <= pattern.len && si <= path.len {
+        pe := end_segment(pattern, pi)
+        se := end_segment(path, si)
+        kind := segment_kind(pattern, pi, pe)
+        if kind == 1 {
+            return true
+        }
+        if kind == 2 && se == si {
+            return false
+        }
+        if kind == 3 && !bytes.equal(&pattern[pi..pe], &path[si..se]) {
+            return false
+        }
+        pi = pe + 1
+        si = se + 1
+    }
+    return pi > pattern.len && si > path.len
+}
+// Lexicographic specificity at the first different segment, independent of
+// registration order: literal > parameter > terminal wildcard.
+fn more_specific(a: &[u8], b: &[u8]) -> bool {
+    ai := 1usize
+    bi := 1usize
+    for ai <= a.len && bi <= b.len {
+        ae := end_segment(a, ai)
+        be := end_segment(b, bi)
+        ak := segment_kind(a, ai, ae)
+        bk := segment_kind(b, bi, be)
+        if ak != bk {
+            return ak > bk
+        }
+        ai = ae + 1
+        bi = be + 1
+    }
+    return false
+}
+
+pub struct Match {
+    pub index: usize
+    pub id: usize
+    pub head: bool
+}
+pub struct Parameter {
+    pub start: usize
+    pub end: usize
+}
+pub struct Router {
+    routes: &[Route]
+    pub fn new(routes: &[Route]) -> Router!Error from(routes) {
+        for i in 0usize..routes.len {
+            if!valid_method(routes[i].method) {
+                return err(Error.InvalidMethod)
+            }
+            validate_pattern(routes[i].pattern)?
+            for j in 0usize..i {
+                if bytes.equal(routes[i].method, routes[j].method) && same_shape(routes[i].pattern, routes[j].pattern) {
+                    return err(Error.AmbiguousRoute)
+                }
+            }
+        }
+        return ok(Router { routes: routes })
+    }
+    pub fn find(&self, method: &[u8], path: &[u8]) -> Match!Error {
+        if!valid_method(method) {
+            return err(Error.InvalidMethod)
+        }
+        validate_path(path)?
+        best := self.routes.len
+        for i in 0usize..self.routes.len {
+            if matches_path(self.routes[i].pattern, path) {
+                if best == self.routes.len || more_specific(self.routes[i].pattern, self.routes[best].pattern) {
+                    best = i
+                }
+            }
+        }
+        if best == self.routes.len {
+            return err(Error.NotFound)
+        }
+        head := bytes.equal(method, b"HEAD")
+        fallback := self.routes.len
+        for i in 0usize..self.routes.len {
+            if same_shape(self.routes[i].pattern, self.routes[best].pattern) {
+                if bytes.equal(method, self.routes[i].method) {
+                    return ok(Match { index: i, id: self.routes[i].id, head: head })
+                }
+                if head && bytes.equal(self.routes[i].method, b"GET") {
+                    fallback = i
+                }
+            }
+        }
+        if fallback != self.routes.len {
+            return ok(Match { index: fallback, id: self.routes[fallback].id, head: true })
+        }
+        return err(Error.MethodNotAllowed)
+    }
+    // Returns offsets in the supplied decoded path, never an unchecked pointer.
+    pub fn parameter(&self, route: usize, path: &[u8], name: &[u8]) -> Option<Parameter> {
+        if route >= self.routes.len {
+            return none
+        }
+        pattern := self.routes[route].pattern
+        if!matches_path(pattern, path) {
+            return none
+        }
+        pi := 1usize
+        si := 1usize
+        for pi <= pattern.len && si <= path.len {
+            pe := end_segment(pattern, pi)
+            se := end_segment(path, si)
+            kind := segment_kind(pattern, pi, pe)
+            if kind != 3 && bytes.equal(&pattern[pi + 1..pe], name) {
+                if kind == 1 {
+                    se = path.len
+                }
+                return some(Parameter { start: si, end: se })
+            }
+            pi = pe + 1
+            si = se + 1
+        }
+        return none
+    }
+}
+
+pub struct Context {
+    pub method: &[u8]
+    pub path: &[u8]
+    pub route_id: usize
+    pub request_id: u64
+    pub cancelled: bool
+}
+// Structural contracts are compiler checked at each specialization. A handler
+// owns its state; borrowed context/body/output cannot escape their checked call.
+// Handler.handle(context, request_body, response_output) -> u16!web.Error.
+pub fn handle<H, B, W>(handler: &mut H, context: &mut Context, body: &mut B, output: &mut W) -> u16!Error {
+    if context.cancelled {
+        return err(Error.Cancelled)
+    }
+    return handler.handle(context, body, output)
+}
+
+// Middleware nesting runs before outer-to-inner, after inner-to-outer.
+pub struct Chain<A, B> {
+    pub outer: A
+    pub inner: B
+    pub fn before(&mut self, context: &mut Context) -> void!Error {
+        self.outer.before(context)?
+        return self.inner.before(context)
+    }
+    pub fn after(&mut self, context: &mut Context, status: u16) {
+        self.inner.after(context, status)
+        self.outer.after(context, status)
+    }
+}
+pub struct NoMiddleware {
+    pub fn before(&mut self, context: &mut Context) -> void!Error {
+        return ok()
+    }
+    pub fn after(&mut self, context: &mut Context, status: u16) {}
+}
+pub fn dispatch<M, H, B, W>(middleware: &mut M, handler: &mut H, context: &mut Context, body: &mut B, output: &mut W) -> u16!Error {
+    if context.cancelled {
+        return err(Error.Cancelled)
+    }
+    middleware.before(context)?
+    match handle(handler, context, body, output) {
+        ok(status) => {
+            middleware.after(context, status)
+            return ok(status)
+        }
+        err(reason) => {
+            middleware.after(context, 500)
+            return err(reason)
+        }
+    }
+}
+
+// Explicit application policy, including which errors become public responses.
+pub struct ErrorResponses {
+    pub invalid: u16
+    pub missing: u16
+    pub method: u16
+    pub internal: u16
+    pub fn defaults() -> ErrorResponses {
+        return ErrorResponses { invalid: 400, missing: 404, method: 405, internal: 500 }
+    }
+    pub fn status(&self, reason: Error) -> u16 {
+        if reason == Error.NotFound {
+            return self.missing
+        }
+        if reason == Error.MethodNotAllowed {
+            return self.method
+        }
+        if reason == Error.InvalidPath || reason == Error.InvalidMethod {
+            return self.invalid
+        }
+        return self.internal
+    }
+}

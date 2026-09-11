@@ -1,0 +1,104 @@
+package server
+import "std/http"
+
+pub enum Error {
+    Capacity, ShuttingDown, InvalidState, Deadline
+}
+pub struct Limits {
+    pub protocol: http.Limits
+    pub connections: usize
+    pub requests_per_connection: usize
+    pub header_timeout_ms: u64
+    pub body_timeout_ms: u64
+    pub write_timeout_ms: u64
+    pub idle_timeout_ms: u64
+    pub shutdown_timeout_ms: u64
+    pub fn defaults() -> Limits {
+        return Limits { protocol: http.Limits.defaults(), connections: 128, requests_per_connection: 100,
+        header_timeout_ms: 10000, body_timeout_ms: 30000, write_timeout_ms: 30000,
+        idle_timeout_ms: 15000, shutdown_timeout_ms: 30000 }
+    }
+}
+// Execution is selected by the caller. An accepted connection consumes one
+// admission slot; the owner must release it exactly once on every exit path.
+pub struct Server {
+    active: usize
+    maximum: usize
+    stopping: bool
+    stop_at: u64
+    pub fn new(maximum: usize) -> Server {
+        return Server { active: 0, maximum: maximum, stopping: false, stop_at: 0 }
+    }
+    pub fn admit(&mut self) -> void!Error {
+        if self.stopping {
+            return err(Error.ShuttingDown)
+        }
+        if self.active == self.maximum {
+            return err(Error.Capacity)
+        }
+        self.active += 1
+        return ok()
+    }
+    pub fn release(&mut self) -> void!Error {
+        if self.active == 0 {
+            return err(Error.InvalidState)
+        }
+        self.active -= 1
+        return ok()
+    }
+    pub fn begin_shutdown(&mut self, deadline_ms: u64) {
+        self.stopping = true
+        self.stop_at = deadline_ms
+    }
+    pub fn accepting(&self) -> bool {
+        return!self.stopping && self.active < self.maximum
+    }
+    pub fn active(&self) -> usize {
+        return self.active
+    }
+    pub fn drained(&self) -> bool {
+        return self.stopping && self.active == 0
+    }
+    pub fn must_close(&self, now_ms: u64) -> bool {
+        return self.stopping && now_ms >= self.stop_at
+    }
+}
+
+pub enum Phase {
+    Headers, Body, Response, Idle, Closed
+}
+pub struct Budget {
+    pub phase: Phase
+    pub deadline_ms: u64
+    pub requests: usize
+    pub fn new() -> Budget {
+        return Budget { phase: Phase.Headers, deadline_ms: 0, requests: 0 }
+    }
+    pub fn enter(&mut self, phase: Phase, now_ms: u64, duration_ms: u64) {
+        self.phase = phase
+        if duration_ms > 18446744073709551615u64 - now_ms {
+            self.deadline_ms = 18446744073709551615u64
+        } else {
+            self.deadline_ms = now_ms + duration_ms
+        }
+    }
+    pub fn check(&mut self, now_ms: u64, cancelled: bool) -> void!Error {
+        if cancelled || self.phase == Phase.Closed || (self.deadline_ms != 0 && now_ms >= self.deadline_ms) {
+            self.phase = Phase.Closed
+            return err(Error.Deadline)
+        }
+        return ok()
+    }
+    pub fn completed(&mut self, maximum: usize) -> bool {
+        if self.requests >= maximum {
+            self.phase = Phase.Closed
+            return false
+        }
+        self.requests += 1
+        if self.requests >= maximum {
+            self.phase = Phase.Closed
+            return false
+        }
+        return true
+    }
+}

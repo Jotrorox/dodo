@@ -1,0 +1,36 @@
+package response
+import "std/http"
+
+// A response builder borrows header slots, never allocates. Fields borrow the
+// caller's strings until serialization; streaming bodies are framing metadata.
+pub struct Builder {
+    status: u16
+    headers: &mut[http.Header]
+    used: usize
+    pub fn new(status: u16, headers: &mut[http.Header]) -> Builder!http.Error from(headers) {
+        match http.Status.new(status) {
+            ok(_) => {}
+            err(reason) => {
+                return err(reason)
+            }
+        }
+        return ok(Builder { status: status, headers: headers, used: 0 })
+    }
+    // Header storage can be preinitialized with borrowed values. Selecting a
+    // count avoids pretending mutation can extend the storage borrow lifetime.
+    pub fn include(&mut self, count: usize) -> void!http.Error {
+        if count > self.headers.len {
+            return err(http.failure(http.ErrorKind.BufferFull, count))
+        }
+        for i in 0usize..count {
+            if!http.valid_token(self.headers[i].name) || !http.valid_value(self.headers[i].value) {
+                return err(http.failure(http.ErrorKind.InvalidHeader, i))
+            }
+        }
+        self.used = count
+        return ok()
+    }
+    pub fn build(&self, body: http.Body) -> http.Response from(self) {
+        return http.Response { status: self.status, reason: b"", headers: &self.headers[..self.used], body: body }
+    }
+}

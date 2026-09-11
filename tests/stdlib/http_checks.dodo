@@ -1,0 +1,516 @@
+package http_checks
+import "std/http"
+import "core/mem"
+import "core/bytes"
+
+// Every fragment size is exercised; events may consume zero bytes when a
+// complete head transitions into an informational/terminal event.
+fn parse(message: &str, expected_body: &str, response: bool, fragment: usize, head: bool, connect: bool) -> i32 {
+    storage: [4096]u8 = [0; 4096]
+    role := http.Role.Request
+    if response {
+        role = http.Role.Response
+    }
+    parser := http.Parser.new(role, &mut storage, http.Limits.defaults())
+    parser.expect_head(head)
+    parser.expect_connect(connect)
+    input := mem.str_bytes(message)
+    body := mem.str_bytes(expected_body)
+    offset := 0usize
+    received := 0usize
+    steps := 0usize
+    for steps < input.len * 4 + 20 {
+        steps += 1
+        end := offset + fragment
+        if end > input.len {
+            end = input.len
+        }
+        match parser.feed(&input[offset..end]) {
+            ok(progress) => {
+                if progress.consumed > end - offset {
+                    return 1
+                }
+                if progress.kind == http.EventKind.Body {
+                    if progress.length > body.len - received {
+                        return 2
+                    }
+                    if!bytes.equal(&input[offset + progress.offset..offset + progress.offset + progress.length], &body[received..received + progress.length]) {
+                        return 3
+                    }
+                    received += progress.length
+                }
+                offset += progress.consumed
+                if progress.kind == http.EventKind.Complete || progress.kind == http.EventKind.Upgrade {
+                    if received != body.len {
+                        return 4
+                    }
+                    return 0
+                }
+                if progress.kind == http.EventKind.NeedInput && offset == input.len {
+                    match parser.eof() {
+                        ok(_) => {
+                            if received != body.len {
+                                return 5
+                            };
+                            return 0
+                        }
+                        err(_) => {
+                            return 6
+                        }
+                    }
+                }
+            }
+            err(_) => {
+                return 7
+            }
+        }
+    }
+    return 8
+}
+fn fragmented(message: &str, body: &str, response: bool) -> i32 {
+    for fragment in 1usize..mem.str_bytes(message).len + 1 {
+        result := parse(message, body, response, fragment, false, false)
+        if result != 0 {
+            return result
+        }
+    }
+    return 0
+}
+fn rejects(message: &str, response: bool) -> bool {
+    for fragment in 1usize..mem.str_bytes(message).len + 1 {
+        storage: [4096]u8 = [0; 4096]
+        role := http.Role.Request
+        if response {
+            role = http.Role.Response
+        }
+        parser := http.Parser.new(role, &mut storage, http.Limits.defaults())
+        input := mem.str_bytes(message)
+        offset := 0usize
+        failed := false
+        for offset < input.len {
+            end := offset + fragment
+            if end > input.len {
+                end = input.len
+            }
+            match parser.feed(&input[offset..end]) {
+                ok(progress) => {
+                    offset += progress.consumed
+                    if progress.kind == http.EventKind.Complete || progress.kind == http.EventKind.Upgrade {
+                        break
+                    }
+                }
+                err(_) => {
+                    failed = true;
+                    break
+                }
+            }
+        }
+        if!failed {
+            match parser.eof() {
+                ok(_) => {}
+                err(_) => {
+                    failed = true
+                }
+            }
+        }
+        if!failed || !parser.poisoned() || parser.reusable() {
+            return false
+        }
+    }
+    return true
+}
+fn pipeline() -> i32 {
+    storage: [512]u8 = [0; 512]
+    parser := http.Parser.new(http.Role.Request, &mut storage, http.Limits.defaults())
+    message := mem.str_bytes("GET /one HTTP/1.1\r\nHost: a\r\n\r\nGET /two HTTP/1.1\r\nHost: a\r\n\r\n")
+    offset := 0usize
+    completed := 0usize
+    for completed < 2 {
+        match parser.feed(&message[offset..]) {
+            ok(progress) => {
+                offset += progress.consumed
+                if progress.kind == http.EventKind.Complete {
+                    if!parser.reusable() {
+                        return 1
+                    }
+                    if completed == 0 && !bytes.equal(parser.target(), mem.str_bytes("/one")) {
+                        return 2
+                    }
+                    if completed == 1 && !bytes.equal(parser.target(), mem.str_bytes("/two")) {
+                        return 3
+                    }
+                    completed += 1
+                    match parser.next_message() {
+                        ok() => {}
+                        err(_) => {
+                            return 4
+                        }
+                    }
+                }
+            }
+            err(_) => {
+                return 5
+            }
+        }
+    }
+    if offset != message.len {
+        return 6
+    }
+    return 0
+}
+fn limits() -> i32 {
+    storage: [128]u8 = [0; 128]
+    limit := http.Limits.defaults()
+    limit.header_bytes = 8
+    parser := http.Parser.new(http.Role.Request, &mut storage, limit)
+    match parser.feed(mem.str_bytes("GET / HTTP/1.1\r\n")) {
+        ok(_) => {
+            return 1
+        }
+        err(reason) => {
+            if reason.kind != http.ErrorKind.HeaderLimit || !parser.poisoned() {
+                return 2
+            }
+        }
+    }
+    return 0
+}
+fn serialization() -> i32 {
+    header := http.Header { name: mem.str_bytes("Host"), value: mem.str_bytes("example.test") }
+    headers := [header]
+    request := http.Request { method: mem.str_bytes("POST"), target: mem.str_bytes("/upload"), headers: &headers, body: http.Body.streaming() }
+    output: [512]u8 = [0; 512]
+    head_len := 0usize
+    match http.write_request(&request, &mut output) {
+        ok(count) => {
+            head_len = count
+        }
+        err(_) => {
+            return 1
+        }
+    }
+    sender := http.Sender.new(http.Body.streaming())
+    input := mem.str_bytes("hello world")
+    consumed := 0usize
+    used := head_len
+    for consumed < input.len {
+        match sender.frame(&input[consumed..], &mut output[used..used + 23]) {
+            ok(progress) => {
+                consumed += progress.consumed;
+                used += progress.written
+            }
+            err(_) => {
+                return 2
+            }
+        }
+    }
+    trailers := [http.Header { name: mem.str_bytes("X-Checksum"), value: mem.str_bytes("yes") }]
+    match sender.finish(&trailers, &mut output[used..]) {
+        ok(count) => {
+            used += count
+        }
+        err(_) => {
+            return 3
+        }
+    }
+    if!sender.complete() {
+        return 4
+    }
+    unsafe {
+        result := fragmented(mem.str_from_utf8(&output[..used]), "hello world", false)
+        if result != 0 {
+            return 5
+        }
+    }
+    incomplete := http.Sender.new(http.Body.sized(5))
+    empty: [0]http.Header = []
+    match incomplete.finish(&empty, &mut output) {
+        ok(_) => {
+            return 6
+        }
+        err(_) => {}
+    }
+    if!incomplete.poisoned() {
+        return 7
+    }
+    tiny: [1]u8 = [0]
+    resumable := http.Sender.new(http.Body.streaming())
+    match resumable.frame(input, &mut tiny) {
+        ok(_) => {
+            return 8
+        }
+        err(_) => {}
+    }
+    if resumable.poisoned() {
+        return 9
+    }
+    return 0
+}
+fn uri_policy() -> i32 {
+    match http.Uri.parse(mem.str_bytes("https://example.test:443/a%20b?q=1")) {
+        ok(uri) => {
+            if!uri.secure() || !bytes.equal(uri.authority(), mem.str_bytes("example.test:443")) || !bytes.equal(uri.path(), mem.str_bytes("/a%20b")) || !bytes.equal(uri.query(), mem.str_bytes("q=1")) {
+                return 1
+            }
+        }
+        err(_) => {
+            return 2
+        }
+    }
+    match http.Uri.parse(mem.str_bytes("/bad%2")) {
+        ok(_) => {
+            return 3
+        }
+        err(_) => {}
+    }
+    match http.Uri.parse(mem.str_bytes("https://user:pass@host/")) {
+        ok(_) => {
+            return 4
+        }
+        err(_) => {}
+    }
+    if http.forward_header(mem.str_bytes("Authorization"), false, false) || http.forward_header(mem.str_bytes("Proxy-Authorization"), true, false) {
+        return 5
+    }
+    return 0
+}
+fn exhausted(message: &[u8], limit: http.Limits, capacity: usize, expected: http.ErrorKind) -> bool {
+    storage := [0u8; 512]
+    parser := http.Parser.new(http.Role.Request, &mut storage[..capacity], limit)
+    offset := 0usize
+    for step in 0usize..message.len + 10 {
+        match parser.feed(&message[offset..]) {
+            ok(progress) => {
+                offset += progress.consumed
+                if progress.kind == http.EventKind.Complete {
+                    return false
+                }
+                if progress.kind == http.EventKind.NeedInput && offset == message.len {
+                    return false
+                }
+            }
+            err(reason) => {
+                return reason.kind == expected && parser.poisoned() && !parser.reusable()
+            }
+        }
+    }
+    return false
+}
+fn all_limits() -> i32 {
+    limit := http.Limits.defaults()
+    limit.header_fields = 0
+    if!exhausted(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", limit, 512, http.ErrorKind.HeaderLimit) {
+        return 1
+    }
+    limit = http.Limits.defaults()
+    limit.body_bytes = 2
+    if!exhausted(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc", limit, 512, http.ErrorKind.BodyLimit) {
+        return 2
+    }
+    limit = http.Limits.defaults()
+    limit.body_bytes = 2
+    if!exhausted(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", limit, 512, http.ErrorKind.BodyLimit) {
+        return 3
+    }
+    limit = http.Limits.defaults()
+    limit.chunk_line_bytes = 3
+    if!exhausted(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;x=yes\r\na\r\n0\r\n\r\n", limit, 512, http.ErrorKind.HeaderLimit) {
+        return 4
+    }
+    limit = http.Limits.defaults()
+    limit.trailer_bytes = 4
+    if!exhausted(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: yes\r\n\r\n", limit, 512, http.ErrorKind.HeaderLimit) {
+        return 5
+    }
+    limit = http.Limits.defaults()
+    limit.trailer_fields = 0
+    if!exhausted(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: yes\r\n\r\n", limit, 512, http.ErrorKind.HeaderLimit) {
+        return 6
+    }
+    limit = http.Limits.defaults()
+    if!exhausted(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", limit, 8, http.ErrorKind.BufferFull) {
+        return 7
+    }
+    return 0
+}
+fn authority() -> i32 {
+    if!http.valid_authority(b"[::1]:443", true) || !http.valid_authority(b"host:80", true) {
+        return 1
+    }
+    if http.valid_authority(b"[:::]:80", false) || http.valid_authority(b"host:65536", false) || http.valid_authority(b"host", true) {
+        return 2
+    }
+    match http.Uri.parse(b"HTTPS://[2001:db8::1]/x") {
+        ok(uri) => {
+            if!uri.secure() {
+                return 3
+            }
+        }
+        err(_) => {
+            return 4
+        }
+    }
+    match http.Uri.parse(b"/bad<path>") {
+        ok(_) => {
+            return 5
+        }
+        err(_) => {}
+    }
+    if!rejects("GET * HTTP/1.1\r\nHost: a\r\n\r\n", false) {
+        return 6
+    }
+    if fragmented("OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n", "", false) != 0 {
+        return 7
+    }
+    if!rejects("CONNECT [:::]:80 HTTP/1.1\r\nHost: a\r\n\r\n", false) {
+        return 8
+    }
+    return 0
+}
+fn mutations() -> i32 {
+    // Deterministic byte-mutation property: bounded progress; errors permanently
+    // poison reuse. This covers 57*256 malformed and valid near-neighbor inputs.
+    seed := mem.str_bytes("POST /fuzz HTTP/1.1\r\nHost: test\r\nContent-Length: 3\r\n\r\nabc")
+    message: [128]u8 = [0; 128]
+    for i in 0usize..seed.len {
+        message[i] = seed[i]
+    }
+    for position in 0usize..seed.len {
+        saved := message[position]
+        for byte in 0u16..256u16 {
+            message[position] = byte as u8
+            workspace: [256]u8 = [0; 256]
+            parser := http.Parser.new(http.Role.Request, &mut workspace, http.Limits.defaults())
+            offset := 0usize
+            steps := 0usize
+            for steps < 128 {
+                steps += 1
+                match parser.feed(&message[offset..seed.len]) {
+                    ok(progress) => {
+                        if progress.consumed > seed.len - offset {
+                            return 1
+                        }
+                        offset += progress.consumed
+                        if progress.kind == http.EventKind.Complete || progress.kind == http.EventKind.Upgrade {
+                            break
+                        }
+                        if progress.kind == http.EventKind.NeedInput && offset == seed.len {
+                            match parser.eof() {
+                                ok(_) => {}
+                                err(_) => {}
+                            }
+                            break
+                        }
+                    }
+                    err(_) => {
+                        if!parser.poisoned() || parser.reusable() {
+                            return 2
+                        };
+                        break
+                    }
+                }
+            }
+            if steps == 128 {
+                return 3
+            }
+        }
+        message[position] = saved
+    }
+    return 0
+}
+fn main() -> i32 {
+    if fragmented("GET /hello?q=1 HTTP/1.1\r\nHost: example.test\r\n\r\n", "", false) != 0 {
+        return 10
+    }
+    if fragmented("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello", "hello", false) != 0 {
+        return 11
+    }
+    if fragmented("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nh\r\n4;foo=bar;x=\"ok\\\"x\"\r\nello\r\n0\r\nX-Sum: yes\r\n\r\n", "hello", true) != 0 {
+        return 12
+    }
+    if fragmented("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", "ok", true) != 0 {
+        return 13
+    }
+    if fragmented("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello", "hello", true) != 0 {
+        return 14
+    }
+    if parse("HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n", "", true, 1, true, false) != 0 {
+        return 15
+    }
+    if parse("HTTP/1.1 200 Connected\r\n\r\nopaque", "", true, 1, false, true) != 0 {
+        return 16
+    }
+    if fragmented("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: other\r\n\r\nopaque", "", true) != 0 {
+        return 17
+    }
+    if!rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", false) {
+        return 20
+    }
+    if!rejects("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n", false) {
+        return 21
+    }
+    if!rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na", false) {
+        return 22
+    }
+    if!rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1, 2\r\n\r\na", false) {
+        return 23
+    }
+    if!rejects("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", false) {
+        return 24
+    }
+    if!rejects("GET / HTTP/1.1\r\nHost : a\r\n\r\n", false) {
+        return 25
+    }
+    if!rejects("GET / HTTP/1.1\nHost: a\n\n", false) {
+        return 26
+    }
+    if!rejects("GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n", false) {
+        return 27
+    }
+    if!rejects("GET / HTTP/1.1\r\n\r\n", false) {
+        return 28
+    }
+    if!rejects("GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", false) {
+        return 29
+    }
+    if!rejects("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 18446744073709551616\r\n\r\n", false) {
+        return 30
+    }
+    if!rejects("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", true) {
+        return 31
+    }
+    if!rejects("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naX\n0\r\n\r\n", true) {
+        return 32
+    }
+    if!rejects("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 0\r\n\r\n", true) {
+        return 33
+    }
+    if!rejects("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;x=\"unclosed\r\na\r\n0\r\n\r\n", true) {
+        return 34
+    }
+    if!rejects("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc", true) {
+        return 35
+    }
+    if pipeline() != 0 {
+        return 40
+    }
+    if limits() != 0 {
+        return 41
+    }
+    if serialization() != 0 {
+        return 42
+    }
+    if uri_policy() != 0 {
+        return 43
+    }
+    if all_limits() != 0 {
+        return 46
+    }
+    if authority() != 0 {
+        return 45
+    }
+    if mutations() != 0 {
+        return 44
+    }
+    return 0
+}

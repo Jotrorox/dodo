@@ -1145,10 +1145,13 @@ impl<'a> Checker<'a> {
                     // Field replacement may narrow an aggregate's lifetime, never erase
                     // its existing conservative dependency set.
                     for loan in &place.loans {
+                        // External parameter storage has no local Variable entry.
+                        // Checking only inside by_id_mut silently accepted storing
+                        // a callback argument's short borrow through &mut self.
+                        if !loan.via.is_empty() || loan.external.is_some() {
+                            return Err(Diagnostic::new(span, "replacing borrow-carrying fields through a reference is not supported in 0.1").note("replace the owned aggregate so its complete borrow dependencies can be checked"));
+                        }
                         if let Some(owner) = self.by_id_mut(loan.root) {
-                            if !loan.via.is_empty() {
-                                return Err(Diagnostic::new(span, "replacing borrow-carrying fields through a reference is not supported in 0.1").note("replace the owned aggregate so its complete borrow dependencies can be checked"));
-                            }
                             owner.deps.extend(val.deps.clone());
                         }
                     }
@@ -6832,6 +6835,27 @@ mod tests {
         rejects(
             "struct View { &u8 item }\nfn f() -> u8 {\n u8 x = 1\n v := View{item: &x}\n x = 2\n return *v.item\n}",
             "live shared borrow",
+        );
+    }
+    #[test]
+    fn callbacks_cannot_store_short_borrows_in_external_storage() {
+        for source in [
+            "struct View { data: &[u8] }\nfn retain(out: &mut View, input: &[u8]) { out.data = input }",
+            "fn retain(out: &mut &[u8], input: &[u8]) { *out = input }",
+            "fn retain(out: &mut[&[u8]], input: &[u8]) { out[0] = input }",
+            "struct View { data: &[u8] }\nstruct Context { path: &[u8] }\nfn callback(out: &mut View, context: &Context) { out.data = context.path }",
+            "struct View { data: &[u8] }\nfn retain(out: &mut View) { local := [1u8]\n out.data = &local }",
+        ] {
+            rejects(
+                source,
+                "replacing borrow-carrying fields through a reference",
+            );
+        }
+        accepts(
+            "struct View { data: &[u8] }\nfn f() -> u8 { local := [1u8]\n view := View { data: b\"a\" }\n view.data = &local\n return view.data[0] }",
+        );
+        accepts(
+            "struct Counter { count: usize }\nfn callback(out: &mut Counter, input: &[u8]) { out.count = input.len }",
         );
     }
     #[test]

@@ -1,0 +1,221 @@
+package dns
+
+// RFC 1035 message codec only. Resolver choice, transport, retry, transaction
+// identity entropy, caching, DNSSEC and trust belong to explicit providers.
+pub enum Error {
+    Truncated, InvalidLabel, InvalidPointer, NameTooLong, BufferTooSmall, InvalidMessage, SectionOrder
+}
+pub const TYPE_A: u16 = 1
+pub const TYPE_AAAA: u16 = 28
+pub const CLASS_IN: u16 = 1
+fn u16_at(packet: &[u8], offset: usize) -> u16 {
+    return ((packet[offset] as u16) << 8) | (packet[offset + 1] as u16)
+}
+fn u32_at(packet: &[u8], offset: usize) -> u32 {
+    return ((u16_at(packet, offset) as u32) << 16) | (u16_at(packet, offset + 2) as u32)
+}
+fn put16(packet: &mut[u8], offset: usize, value: u16) {
+    packet[offset] = (value >> 8) as u8
+    packet[offset + 1] = (value & 255) as u8
+}
+pub struct Header {
+    pub id: u16
+    pub flags: u16
+    pub questions: u16
+    pub answers: u16
+    pub authorities: u16
+    pub additional: u16
+    pub fn response(&self) -> bool {
+        return (self.flags & 32768) != 0
+    }
+    pub fn truncated(&self) -> bool {
+        return (self.flags & 512) != 0
+    }
+    pub fn response_code(&self) -> u8 {
+        return (self.flags & 15) as u8
+    }
+}
+pub fn header(packet: &[u8]) -> Header!Error {
+    if packet.len < 12 {
+        return err(Error.Truncated)
+    }
+    return ok(Header { id: u16_at(packet, 0), flags: u16_at(packet, 2), questions: u16_at(packet, 4), answers: u16_at(packet, 6), authorities: u16_at(packet, 8), additional: u16_at(packet, 10) })
+}
+pub struct NameProgress {
+    pub consumed: usize, pub written: usize
+}
+// Expand into DNS wire form (length octet, label bytes, ..., final zero).
+// Arbitrary label bytes remain unambiguous. Pointers must refer backwards and
+// expansion performs <=128 hops. The expanded wire name is <=255 bytes.
+// On failure output may contain an initialized prefix but no result is valid.
+pub fn expand_name(packet: &[u8], start: usize, output: &mut[u8]) -> NameProgress!Error {
+    position := start
+    written := 0usize
+    consumed := 0usize
+    jumped := false
+    hops := 0usize
+    for hops < 128 {
+        hops += 1
+        if position >= packet.len {
+            return err(Error.Truncated)
+        }
+        length := packet[position] as usize
+        if (length & 192) == 192 {
+            if packet.len - position < 2 {
+                return err(Error.Truncated)
+            }
+            destination := ((length & 63) << 8) | (packet[position + 1] as usize)
+            if destination >= position {
+                return err(Error.InvalidPointer)
+            }
+            if!jumped {
+                consumed += 2
+            }
+            jumped = true
+            position = destination
+        } else {
+            if length > 63 {
+                return err(Error.InvalidLabel)
+            }
+            if packet.len - position - 1 < length {
+                return err(Error.Truncated)
+            }
+            if written + length + 1 > 255 {
+                return err(Error.NameTooLong)
+            }
+            if output.len - written < length + 1 {
+                return err(Error.BufferTooSmall)
+            }
+            for i in 0usize..length + 1 {
+                output[written + i] = packet[position + i]
+            }
+            written += length + 1
+            if!jumped {
+                consumed += length + 1
+            }
+            position += length + 1
+            if length == 0 {
+                return ok(NameProgress { consumed: consumed, written: written })
+            }
+        }
+    }
+    return err(Error.InvalidPointer)
+}
+// A query accepts ASCII presentation labels without escape syntax; a final dot
+// is allowed. Zero-length interior labels and labels >63 octets are rejected.
+// ID and recursion desired are caller decisions; no ambient entropy or policy.
+pub fn query(name: &[u8], id: u16, qtype: u16, recursion: bool, output: &mut[u8]) -> usize!Error {
+    scratch := [0u8; 271]
+    count := 12usize
+    end := name.len
+    if end != 0 && name[end - 1] == 46 {
+        end -= 1
+    }
+    if end > 253 {
+        return err(Error.NameTooLong)
+    }
+    start := 0usize
+    if end != 0 {
+        for i in 0usize..end + 1 {
+            if i == end || name[i] == 46 {
+                length := i - start
+                if length == 0 || length > 63 {
+                    return err(Error.InvalidLabel)
+                }
+                scratch[count] = length as u8
+                count += 1
+                for j in start..i {
+                    if name[j] <= 32 || name[j] >= 127 || name[j] == 92 {
+                        return err(Error.InvalidLabel)
+                    }
+                    scratch[count] = name[j]
+                    count += 1
+                }
+                start = i + 1
+            }
+        }
+    }
+    scratch[count] = 0
+    count += 1
+    if count - 12 > 255 {
+        return err(Error.NameTooLong)
+    }
+    put16(&mut scratch, count, qtype)
+    put16(&mut scratch, count + 2, CLASS_IN)
+    count += 4
+    put16(&mut scratch, 0, id)
+    if recursion {
+        put16(&mut scratch, 2, 256)
+    }
+    put16(&mut scratch, 4, 1)
+    if output.len < count {
+        return err(Error.BufferTooSmall)
+    }
+    for i in 0usize..count {
+        output[i] = scratch[i]
+    }
+    return ok(count)
+}
+pub struct Question {
+    pub name: &[u8], pub qtype: u16, pub class: u16
+}
+pub struct Record {
+    pub name: &[u8], pub kind: u16, pub class: u16, pub ttl: u32, pub data: &[u8], pub data_offset: usize
+}
+pub struct Reader {
+    packet: &[u8]
+    position: usize
+    questions: u32
+    records: u32
+    pub fn new(packet: &[u8]) -> Reader!Error from(packet) {
+        value := header(packet)?
+        return ok(Reader { packet: packet, position: 12, questions: value.questions as u32, records: (value.answers as u32) + (value.authorities as u32) + (value.additional as u32) })
+    }
+    pub fn position(&self) -> usize {
+        return self.position
+    }
+    pub fn next_question(&mut self, name: &mut[u8]) -> Option<Question>!Error from(self, name) {
+        if self.questions == 0 {
+            return ok(none)
+        }
+        progress := expand_name(self.packet, self.position, name)?
+        position := self.position + progress.consumed
+        if self.packet.len - position < 4 {
+            return err(Error.Truncated)
+        }
+        kind := u16_at(self.packet, position)
+        class := u16_at(self.packet, position + 2)
+        self.position = position + 4
+        self.questions -= 1
+        return ok(some(Question { name: &name[..progress.written], qtype: kind, class: class }))
+    }
+    pub fn next_record(&mut self, name: &mut[u8]) -> Option<Record>!Error from(self, name) {
+        if self.questions != 0 {
+            return err(Error.SectionOrder)
+        }
+        if self.records == 0 {
+            return ok(none)
+        }
+        progress := expand_name(self.packet, self.position, name)?
+        position := self.position + progress.consumed
+        if self.packet.len - position < 10 {
+            return err(Error.Truncated)
+        }
+        kind := u16_at(self.packet, position)
+        class := u16_at(self.packet, position + 2)
+        ttl := u32_at(self.packet, position + 4)
+        length := u16_at(self.packet, position + 8) as usize
+        if self.packet.len - position - 10 < length {
+            return err(Error.Truncated)
+        }
+        self.position = position + 10 + length
+        self.records -= 1
+        return ok(some(Record { name: &name[..progress.written], kind: kind, class: class, ttl: ttl, data: &self.packet[position + 10..position + 10 + length], data_offset: position + 10 }))
+    }
+    pub fn finish(&self) -> void!Error {
+        if self.questions != 0 || self.records != 0 || self.position != self.packet.len {
+            return err(Error.InvalidMessage)
+        }
+        return ok()
+    }
+}

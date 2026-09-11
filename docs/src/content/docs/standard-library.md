@@ -721,6 +721,12 @@ arena/pool Box interfaces retain their exclusive borrowing behavior.
 
 ## Dependency boundaries
 
+Networking preserves three independent boundaries: portable addresses, DNS/HTTP
+protocol engines and routing; selected transport, TLS, time and execution
+providers; and clients/servers that compose them. See [networking](networking.md),
+[TLS](tls.md), [HTTP](http.md), and [web applications](web.md). Importing `std/http`
+or `std/web` requires no sockets, TLS, filesystem, allocator or scheduler.
+
 ```mermaid
 flowchart BT
   core[Core byte and pointer primitives]

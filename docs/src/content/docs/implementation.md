@@ -78,6 +78,11 @@ native threads with checked move tasks, explicit unsafe transfer/sharing
 contracts, integer atomics, and guarded synchronization. Native callbacks use
 statically checked function specialization; closures remain unavailable.
 
+[Networking](networking.md), [TLS](tls.md), [HTTP/1.1](http.md), and [web routing](web.md)
+compose existing generic methods and checked buffers. Borrow-carrying assignments
+through external mutable references are rejected as well as local reborrows;
+callbacks cannot retain request storage by assigning it into their receiver.
+
 The broad design's disjoint mutable slice splitting, trait-based checked allocator
 interfaces, DMA/interrupt-safe abstractions, general target barriers, inline
 assembly, section/alignment/export/interrupt attributes, and custom panic-handler

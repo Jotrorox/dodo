@@ -1,0 +1,310 @@
+package http_client_checks
+import "std/http"
+import "std/http/client"
+import "std/http/connection"
+import "std/io"
+import "core/bytes"
+
+pub struct Fake {
+    data: &[u8]
+    position: usize
+    sent: usize
+    pause: bool
+    pub fn poll_read(&mut self, output: &mut[u8]) -> io.Poll!io.Error {
+        if self.pause {
+            self.pause = false;
+            return ok(io.Poll { state: io.PollState.Pending, transferred: 0 })
+        }
+        self.pause = true
+        count := self.data.len - self.position
+        if count > output.len {
+            count = output.len
+        }
+        if count > 7 {
+            count = 7
+        }
+        if count == 0 {
+            return ok(io.Poll { state: io.PollState.Eof, transferred: 0 })
+        }
+        for i in 0usize..count {
+            output[i] = self.data[self.position + i]
+        }
+        self.position += count
+        return ok(io.Poll { state: io.PollState.Ready, transferred: count })
+    }
+    pub fn poll_write(&mut self, input: &[u8]) -> io.Poll!io.Error {
+        count := input.len
+        if count > 2 {
+            count = 2
+        }
+        self.sent += count
+        return ok(io.Poll { state: io.PollState.Pending, transferred: count })
+    }
+}
+fn exchange(origin: http.Uri) -> i32!connection.Error {
+    workspace := [0u8; 2048]
+    input := [0u8; 13]
+    output := [0u8; 256]
+    policy := client.Policy.defaults()
+    policy.retries.max_attempts = 2
+    session := client.Client.new(origin, &mut workspace, &mut input, &mut output, http.Limits.defaults(), policy)?
+    fake := Fake { data: b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n", position: 0, sent: 0, pause: false }
+    headers := [http.Header { name: b"Host", value: b"localhost" }]
+    request := http.Request { method: b"GET", target: b"/test", headers: &headers, body: http.Body.empty() }
+    trailers: [0]http.Header = []
+    session.begin(&request, 100, false)?
+    if session.request_deadline() != 30100 || session.connect_deadline(100) != 10100 {
+        return ok(1)
+    }
+    for session.pending_output() != 0 {
+        progress := session.poll_flush(&mut fake, 100, false)?
+    }
+    session.finish_body(&trailers, 100, false)?
+    received := 0usize
+    complete := false
+    informational := 0usize
+    for step in 0usize..500 {
+        progress := session.poll_event(&mut fake, 101, false)?
+        if progress.kind == http.EventKind.Informational {
+            informational += 1
+        }
+        if progress.kind == http.EventKind.Body {
+            count := session.body().len
+            if!bytes.equal(session.body(), &b"abc"[received..received + count]) {
+                return ok(2)
+            }
+            received += count
+            match session.poll_event(&mut fake, 101, false) {
+                ok(_) => {
+                    return ok(3)
+                }
+                err(reason) => {
+                    if reason.kind != connection.ErrorKind.Backpressure {
+                        return ok(4)
+                    }
+                }
+            }
+            session.consume_body(count, 101, false)?
+        }
+        if progress.kind == http.EventKind.Complete {
+            complete = true;
+            break
+        }
+    }
+    if!complete || informational != 1 || received != 3 || !session.reusable() {
+        return ok(5)
+    }
+    match http.Method.new(b"GET") {
+        ok(method) => {
+            if session.retry_allowed(&method, 1, true) {
+                return ok(6)
+            }
+        }
+        err(_) => {
+            return ok(7)
+        }
+    }
+    session.next(102, false)?
+    head := http.Request { method: b"HEAD", target: b"/head", headers: &headers, body: http.Body.empty() }
+    session.begin(&head, 102, false)?
+    for session.pending_output() != 0 {
+        progress := session.poll_flush(&mut fake, 102, false)?
+    }
+    session.finish_body(&trailers, 102, false)?
+    complete = false
+    for step in 0usize..200 {
+        progress := session.poll_event(&mut fake, 103, false)?
+        if progress.kind == http.EventKind.Body {
+            return ok(8)
+        }
+        if progress.kind == http.EventKind.Complete {
+            complete = true;
+            break
+        }
+    }
+    if!complete || !session.reusable() {
+        return ok(9)
+    }
+    return ok(0)
+}
+fn deadlines(origin: http.Uri, cancel: bool) -> i32!connection.Error {
+    workspace := [0u8; 256]
+    input := [0u8; 32]
+    output := [0u8; 256]
+    policy := client.Policy.defaults()
+    policy.request_timeout_ms = 5
+    session := client.Client.new(origin, &mut workspace, &mut input, &mut output, http.Limits.defaults(), policy)?
+    headers := [http.Header { name: b"Host", value: b"localhost" }]
+    request := http.Request { method: b"GET", target: b"/", headers: &headers, body: http.Body.empty() }
+    session.begin(&request, 100, false)?
+    now := 105u64
+    if cancel {
+        now = 101
+    }
+    fake := Fake { data: b"", position: 0, sent: 0, pause: false }
+    match session.poll_flush(&mut fake, now, cancel) {
+        ok(_) => {
+            return ok(1)
+        }
+        err(reason) => {
+            if cancel && reason.kind != connection.ErrorKind.Cancelled {
+                return ok(2)
+            }
+            if!cancel && reason.kind != connection.ErrorKind.TimedOut {
+                return ok(3)
+            }
+        }
+    }
+    if fake.sent != 0 || session.reusable() {
+        return ok(4)
+    }
+    return ok(0)
+}
+fn proxies(origin: http.Uri, mode: u8) -> i32!connection.Error {
+    workspace := [0u8; 256]
+    input := [0u8; 32]
+    output := [0u8; 256]
+    policy := client.Policy.defaults()
+    if mode == 0 || mode == 1 {
+        policy.proxy = client.Proxy.Forward
+    }
+    if mode == 2 || mode == 3 {
+        policy.proxy = client.Proxy.Tunnel
+    }
+    session := client.Client.new(origin, &mut workspace, &mut input, &mut output, http.Limits.defaults(), policy)?
+    if mode == 3 {
+        session.tunnel_established()?
+    }
+    target := b"/"
+    if mode == 0 {
+        target = b"http://localhost/"
+    }
+    headers := [http.Header { name: b"Host", value: b"localhost" }]
+    request := http.Request { method: b"GET", target: target, headers: &headers, body: http.Body.empty() }
+    match session.begin(&request, 1, false) {
+        ok() => {
+            if mode == 1 || mode == 2 {
+                return ok(1)
+            }
+        }
+        err(_) => {
+            if mode == 0 || mode == 3 {
+                return ok(2)
+            }
+        }
+    }
+    return ok(0)
+}
+fn policies() -> i32 {
+    fields := [http.Header { name: b"Host", value: b"one" }, http.Header { name: b"Authorization", value: b"secret" },
+    http.Header { name: b"Cookie", value: b"secret" }, http.Header { name: b"Proxy-Authorization", value: b"secret" },
+    http.Header { name: b"Content-Length", value: b"3" }, http.Header { name: b"Connection", value: b"X-Hop" },
+    http.Header { name: b"X-Hop", value: b"gone" }, http.Header { name: b"Accept", value: b"text/plain" }]
+    filtered := client.RedirectHeaders.new(&fields, false, false)
+    match filtered.next() {
+        some(field) => {
+            if!bytes.equal(field.name, b"Accept") {
+                return 1
+            }
+        };
+        none => {
+            return 2
+        }
+    }
+    match filtered.next() {
+        some(_) => {
+            return 3
+        };
+        none => {}
+    }
+    match http.Uri.parse(b"https://one/") {
+        ok(source) => {
+            match http.Uri.parse(b"https://two/") {
+                ok(destination) => {
+                    policy := client.Policy.defaults()
+                    if client.redirect(&policy, 303, &source, &destination, 0, false, b"POST") != client.RedirectAction.Reject {
+                        return 4
+                    }
+                    policy.redirects.max_hops = 2
+                    if client.redirect(&policy, 303, &source, &destination, 0, false, b"POST") != client.RedirectAction.Get {
+                        return 5
+                    }
+                    if client.redirect(&policy, 307, &source, &destination, 0, false, b"POST") != client.RedirectAction.Reject {
+                        return 6
+                    }
+                    if client.redirect(&policy, 307, &source, &destination, 0, true, b"POST") != client.RedirectAction.Preserve {
+                        return 7
+                    }
+                }
+                err(_) => {
+                    return 8
+                }
+            }
+        }
+        err(_) => {
+            return 9
+        }
+    }
+    return 0
+}
+fn main() -> i32 {
+    match http.Uri.parse(b"http://localhost/") {
+        ok(origin) => {
+            match exchange(origin) {
+                ok(code) => {
+                    if code != 0 {
+                        return 10 + code
+                    }
+                }
+                err(_) => {
+                    return 20
+                }
+            }
+        }
+        err(_) => {
+            return 21
+        }
+    }
+    for cancel in 0u8..2u8 {
+        match http.Uri.parse(b"http://localhost/") {
+            ok(origin) => {
+                match deadlines(origin, cancel == 1) {
+                    ok(code) => {
+                        if code != 0 {
+                            return 30 + code
+                        }
+                    }
+                    err(_) => {
+                        return 40
+                    }
+                }
+            }
+            err(_) => {
+                return 41
+            }
+        }
+    }
+    for mode in 0u8..4u8 {
+        match http.Uri.parse(b"http://localhost/") {
+            ok(origin) => {
+                match proxies(origin, mode) {
+                    ok(code) => {
+                        if code != 0 {
+                            return 50 + code
+                        }
+                    }
+                    err(_) => {
+                        return 60
+                    }
+                }
+            }
+            err(_) => {
+                return 61
+            }
+        }
+    }
+    if policies() != 0 {
+        return 70
+    }
+    return 0
+}

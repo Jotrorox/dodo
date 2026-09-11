@@ -1,0 +1,71 @@
+package backpressure
+import "std/net"
+import "std/net/native"
+import "std/net/operations"
+import "std/io"
+fn run() -> i32!net.Error {
+    bind := net.parse_socket(b"127.0.0.1:0")?
+    listener := native.TcpListener.bind(&bind, 1)?
+    address := listener.local_address()?
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    deadline := net.Operation.until(clock.now_ms() + 2000)
+    client := native.connect_with(&address, &deadline, &mut clock, &cancel)?
+    ready := listener.wait_ready(1000)?
+    match listener.accept()? {
+        some(server) => {
+            buffer := [23u8; 65536]
+            pending := false
+            partial := false
+            for i in 0usize..1024 {
+                match server.poll_write(&buffer) {
+                    ok(progress) => {
+                        if progress.transferred > 0 && progress.transferred < buffer.len {
+                            partial = true
+                        }
+                        if progress.state == io.PollState.Pending {
+                            pending = true
+                            break
+                        }
+                    }
+                    err(_) => {
+                        return ok(1)
+                    }
+                }
+            }
+            if!pending {
+                return ok(2)
+            }
+            // Slow peer and deadline stop explicit write completion.
+            timeout := net.Operation.until(clock.now_ms() + 20)
+            match operations.write_all(&mut server, &buffer, &timeout, &mut clock, &cancel) {
+                ok(_) => {
+                    return ok(3)
+                }
+                err(reason) => {
+                    if reason.kind != io.ErrorKind.TimedOut || reason.transferred > buffer.len {
+                        return ok(4)
+                    }
+                }
+            }
+            // Closing the peer releases buffers without pending OS ownership.
+            client.close()?
+            server.close()?
+            buffer[0] = 99
+        }
+        none => {
+            return ok(5)
+        }
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

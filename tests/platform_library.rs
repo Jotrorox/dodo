@@ -77,3 +77,40 @@ fn portable_atomic_contract_has_no_native_blocking_dependency() {
     }
     fs::remove_dir_all(scratch).unwrap();
 }
+
+#[test]
+fn protocol_imports_remain_portable_and_backends_link_independently() {
+    let scratch =
+        std::env::temp_dir().join(format!("dodo-protocol-imports-{}", std::process::id()));
+    fs::create_dir_all(&scratch).unwrap();
+    let source = scratch.join("portable.dodo");
+    fs::write(&source, "package portable\nimport \"std/net\"\nimport \"std/net/dns\"\nimport \"std/tls\"\nimport \"std/http\"\nimport \"std/web\"\nimport \"std/web/server\"\nimport \"std/web/response\"\nfn main() {}\n").unwrap();
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "thumbv6m-none-eabi",
+        "wasm32-unknown-unknown",
+    ] {
+        let loaded = package::load_for_target(&source, target).unwrap();
+        assert!(package::native_sources(&loaded).is_empty(), "{target}");
+    }
+    for area in ["net", "tls", "web"] {
+        fs::write(
+            &source,
+            format!("package backend\nimport \"std/{area}/native\"\nfn main() {{}}\n"),
+        )
+        .unwrap();
+        for target in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            let loaded = package::load_for_target(&source, target).unwrap();
+            let native = package::native_sources(&loaded);
+            assert_eq!(native.len(), 1, "{area} for {target}");
+            assert_eq!(native[0].0, format!("std/{area}/runtime.c"));
+        }
+        assert!(
+            package::load_for_target(&source, "thumbv6m-none-eabi")
+                .unwrap_err()
+                .contains("unsupported")
+        );
+    }
+    fs::remove_dir_all(scratch).unwrap();
+}

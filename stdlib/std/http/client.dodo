@@ -1,0 +1,425 @@
+package client
+import "std/http"
+import "std/http/connection"
+import "std/io"
+import "core/bytes"
+
+// Policies are values. No environment proxy discovery or global reuse pool.
+pub enum Proxy {
+    Direct, Forward, Tunnel
+}
+pub struct Policy {
+    pub redirects: http.RedirectPolicy
+    pub retries: http.RetryPolicy
+    pub proxy: Proxy
+    pub connect_timeout_ms: u64
+    pub request_timeout_ms: u64
+    pub idle_timeout_ms: u64
+    pub max_idle: usize
+    pub fn defaults() -> Policy {
+        return Policy { redirects: http.RedirectPolicy.defaults(), retries: http.RetryPolicy.defaults(),
+        proxy: Proxy.Direct, connect_timeout_ms: 10000, request_timeout_ms: 30000,
+        idle_timeout_ms: 30000, max_idle: 4 }
+    }
+}
+pub enum RedirectAction {
+    Reject, Preserve, Get
+}
+pub fn redirect(policy: &Policy, status: u16, source: &http.Uri, destination: &http.Uri,
+hops: usize, replayable: bool, method: &[u8]) -> RedirectAction {
+    if status != 301 && status != 302 && status != 303 && status != 307 && status != 308 {
+        return RedirectAction.Reject
+    }
+    discard_body := status == 303 && !bytes.equal(method, b"HEAD")
+    if!policy.redirects.permits(source, destination, hops, replayable || discard_body) {
+        return RedirectAction.Reject
+    }
+    if discard_body {
+        return RedirectAction.Get
+    }
+    return RedirectAction.Preserve
+}
+
+// Caller-backed pool metadata; transport owners stay in application slots.
+// A slot enters Idle only after both message bodies completed successfully.
+pub enum SlotState {
+    Vacant, Busy, Idle
+}
+pub struct Slot {
+    pub state: SlotState
+    pub origin: u64
+    pub trust: u64
+    pub proxy: u64
+    pub idle_since_ms: u64
+}
+pub struct Pool {
+    slots: &mut[Slot]
+    pub fn new(slots: &mut[Slot]) -> Pool from(slots) {
+        for i in 0usize..slots.len {
+            slots[i].state = SlotState.Vacant
+        }
+        return Pool { slots: slots }
+    }
+    // Origin/trust/proxy IDs must be collision-free application identities,
+    // never unverified hashes. The pool never crosses any of these boundaries.
+    pub fn take(&mut self, origin: u64, trust: u64, proxy: u64, now_ms: u64, idle_ms: u64) -> Option<usize> {
+        for i in 0usize..self.slots.len {
+            if self.slots[i].state == SlotState.Idle {
+                if now_ms < self.slots[i].idle_since_ms || now_ms - self.slots[i].idle_since_ms >= idle_ms {
+                    self.slots[i].state = SlotState.Vacant
+                } else if self.slots[i].origin == origin && self.slots[i].trust == trust && self.slots[i].proxy == proxy {
+                    self.slots[i].state = SlotState.Busy
+                    return some(i)
+                }
+            }
+        }
+        return none
+    }
+    pub fn from_policy(slots: &mut[Slot], policy: &Policy) -> Pool from(slots) {
+        count := slots.len
+        if count > policy.max_idle {
+            count = policy.max_idle
+        }
+        return Pool.new(&mut slots[..count])
+    }
+    pub fn reserve(&mut self, origin: u64, trust: u64, proxy: u64) -> Option<usize> {
+        for i in 0usize..self.slots.len {
+            if self.slots[i].state == SlotState.Vacant {
+                self.slots[i].state = SlotState.Busy
+                self.slots[i].origin = origin
+                self.slots[i].trust = trust
+                self.slots[i].proxy = proxy
+                return some(i)
+            }
+        }
+        return none
+    }
+    pub fn release<C>(&mut self, index: usize, connection: &C, now_ms: u64) -> bool {
+        if index >= self.slots.len || self.slots[index].state != SlotState.Busy {
+            return false
+        }
+        if!connection.reusable() {
+            self.slots[index].state = SlotState.Vacant
+            return false
+        }
+        self.slots[index].state = SlotState.Idle
+        self.slots[index].idle_since_ms = now_ms
+        return true
+    }
+    pub fn discard(&mut self, index: usize) {
+        if index < self.slots.len {
+            self.slots[index].state = SlotState.Vacant
+        }
+    }
+    pub fn state(&self, index: usize) -> SlotState {
+        if index >= self.slots.len {
+            return SlotState.Vacant
+        }
+        if self.slots[index].state == SlotState.Idle {
+            return SlotState.Idle
+        }
+        if self.slots[index].state == SlotState.Busy {
+            return SlotState.Busy
+        }
+        return SlotState.Vacant
+    }
+}
+
+// A filtered, borrowed view for constructing a redirected head. Framing and
+// hop-by-hop fields are regenerated for the new connection. Custom credential
+// field names require a caller allowlist before inserting them in a new head.
+fn redirect_header_allowed(headers: &[http.Header], index: usize, same_origin: bool, to_proxy: bool) -> bool {
+    name := headers[index].name
+    if http.equal_ascii(name, b"Content-Length") || http.equal_ascii(name, b"Transfer-Encoding") ||
+        http.equal_ascii(name, b"Connection") || http.equal_ascii(name, b"Keep-Alive") ||
+        http.equal_ascii(name, b"TE") || http.equal_ascii(name, b"Trailer") ||
+        http.equal_ascii(name, b"Upgrade") || http.equal_ascii(name, b"Proxy-Connection") {
+        return false
+    }
+    // Connection can nominate arbitrary hop-by-hop fields.
+    for i in 0usize..headers.len {
+        if http.equal_ascii(headers[i].name, b"Connection") {
+            value := headers[i].value
+            start := 0usize
+            for start < value.len {
+                for start < value.len && (value[start] == 32 || value[start] == 9 || value[start] == 44) {
+                    start += 1
+                }
+                end := start
+                for end < value.len && http.token_byte(value[end]) {
+                    end += 1
+                }
+                if http.equal_ascii(&value[start..end], name) {
+                    return false
+                }
+                if end == start {
+                    return false
+                }
+                start = end
+                for start < value.len && value[start] != 44 {
+                    start += 1
+                }
+            }
+        }
+    }
+    return http.forward_header(name, same_origin, to_proxy)
+}
+fn header_at(headers: &[http.Header], index: usize) -> http.Header from(headers) {
+    return http.Header { name: headers[index].name, value: headers[index].value }
+}
+pub struct RedirectHeaders {
+    headers: &[http.Header]
+    index: usize
+    same_origin: bool
+    to_proxy: bool
+    pub fn new(headers: &[http.Header], same_origin: bool, to_proxy: bool) -> RedirectHeaders from(headers) {
+        return RedirectHeaders { headers: headers, index: 0, same_origin: same_origin, to_proxy: to_proxy }
+    }
+    pub fn next(&mut self) -> Option<http.Header> from(self) {
+        for self.index < self.headers.len {
+            index := self.index
+            self.index += 1
+            if redirect_header_allowed(self.headers, index, self.same_origin, self.to_proxy) {
+                return some(header_at(self.headers, index))
+            }
+        }
+        return none
+    }
+}
+
+fn deadline(now_ms: u64, timeout_ms: u64) -> u64 {
+    if timeout_ms == 0 {
+        return 0
+    }
+    if now_ms > 18446744073709551615u64 - timeout_ms {
+        return 18446744073709551615u64
+    }
+    return now_ms + timeout_ms
+}
+fn invalid() -> connection.Error {
+    return connection.Error { kind: connection.ErrorKind.InvalidState,
+    protocol: http.failure(http.ErrorKind.InvalidState, 0), transport: io.failure(io.ErrorKind.InvalidInput, 0) }
+}
+// Attach an already-established transport by passing it explicitly to poll
+// calls. TLS verification and proxy CONNECT must finish before origin traffic.
+// The client owns no transport, thread, clock, allocator, or implicit retry.
+pub struct Client {
+    inner: connection.Connection
+    policy: Policy
+    origin: http.Uri
+    deadline_ms: u64
+    active: bool
+    response_started: bool
+    last_now_ms: u64
+    tunnel_ready: bool
+    pub fn new(origin: http.Uri, workspace: &mut[u8], input: &mut[u8], output: &mut[u8], limits: http.Limits, policy: Policy) -> Client!connection.Error from(origin, workspace, input, output) {
+        if origin.authority().len == 0 {
+            return err(invalid())
+        }
+        tunnel_ready := policy.proxy != Proxy.Tunnel
+        inner := connection.Connection.new(http.Role.Response, workspace, input, output, limits)?
+        return ok(Client { inner: inner, policy: policy, origin: origin, deadline_ms: 0,
+        active: false, response_started: false, last_now_ms: 0, tunnel_ready: tunnel_ready })
+    }
+    // This is an explicit caller assertion: the supplied stream is now the
+    // established tunnel (and verified TLS stream for a secure origin).
+    pub fn tunnel_established(&mut self) -> void!connection.Error {
+        if self.active || self.policy.proxy != Proxy.Tunnel {
+            self.inner.poison();
+            return err(invalid())
+        }
+        self.tunnel_ready = true
+        return ok()
+    }
+    pub fn origin(&self) -> &http.Uri {
+        return &self.origin
+    }
+    pub fn poison(&mut self) {
+        self.inner.poison()
+    }
+    // Connect timeout is exposed for the external connector/provider; its
+    // execution model owns cancellation and all OS operation lifetimes.
+    pub fn connect_deadline(&self, now_ms: u64) -> u64 {
+        return deadline(now_ms, self.policy.connect_timeout_ms)
+    }
+    pub fn request_deadline(&self) -> u64 {
+        return self.deadline_ms
+    }
+    pub fn check(&mut self, now_ms: u64, cancelled: bool) -> void!connection.Error {
+        if!self.active {
+            self.inner.poison();
+            return err(invalid())
+        }
+        if now_ms < self.last_now_ms {
+            self.inner.poison();
+            return err(invalid())
+        }
+        self.last_now_ms = now_ms
+        return self.inner.check(now_ms, self.deadline_ms, cancelled)
+    }
+    fn validate_request(&self, request: &http.Request) -> bool {
+        if!self.tunnel_ready || bytes.equal(request.method, b"CONNECT") {
+            return false
+        }
+        if self.policy.proxy == Proxy.Forward {
+            // HTTPS origins must use a verified tunnel; forwarding their
+            // plaintext absolute-form requests would bypass TLS verification.
+            if self.origin.secure() {
+                return false
+            }
+            match http.Uri.parse(request.target) {
+                ok(target) => {
+                    if!self.origin.same_origin(&target) {
+                        return false
+                    }
+                }
+                err(_) => {
+                    return false
+                }
+            }
+        } else {
+            if request.target.len == 0 || (request.target[0] != 47 && !(request.target.len == 1 && request.target[0] == 42)) {
+                return false
+            }
+        }
+        host := false
+        for i in 0usize..request.headers.len {
+            name := request.headers[i].name
+            if http.equal_ascii(name, b"Host") {
+                if host || !http.equal_ascii(request.headers[i].value, self.origin.authority()) {
+                    return false
+                }
+                host = true
+            }
+            if self.policy.proxy != Proxy.Forward && http.equal_ascii(name, b"Proxy-Authorization") {
+                return false
+            }
+        }
+        return host
+    }
+    pub fn begin(&mut self, request: &http.Request, now_ms: u64, cancelled: bool) -> void!connection.Error {
+        if self.active || !self.validate_request(request) {
+            self.inner.poison();
+            return err(invalid())
+        }
+        self.deadline_ms = deadline(now_ms, self.policy.request_timeout_ms)
+        self.active = true
+        self.response_started = false
+        self.last_now_ms = now_ms
+        self.inner.check(now_ms, self.deadline_ms, cancelled)?
+        match self.inner.request(request) {
+            ok() => {
+                return ok()
+            }
+            err(reason) => {
+                if reason.kind != connection.ErrorKind.Backpressure {
+                    self.inner.poison()
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn poll_flush<S>(&mut self, stream: &mut S, now_ms: u64, cancelled: bool) -> io.Poll!connection.Error {
+        self.check(now_ms, cancelled)?
+        match self.inner.poll_flush(stream) {
+            ok(value) => {
+                return ok(value)
+            }
+            err(reason) => {
+                if reason.kind != connection.ErrorKind.Backpressure {
+                    self.inner.poison()
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn send_body(&mut self, source: &[u8], now_ms: u64, cancelled: bool) -> usize!connection.Error {
+        self.check(now_ms, cancelled)?
+        match self.inner.send_body(source) {
+            ok(value) => {
+                return ok(value)
+            }
+            err(reason) => {
+                if reason.kind != connection.ErrorKind.Backpressure {
+                    self.inner.poison()
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn finish_body(&mut self, trailers: &[http.Header], now_ms: u64, cancelled: bool) -> void!connection.Error {
+        self.check(now_ms, cancelled)?
+        match self.inner.finish_body(trailers) {
+            ok() => {
+                return ok()
+            }
+            err(reason) => {
+                if reason.kind != connection.ErrorKind.Backpressure {
+                    self.inner.poison()
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn poll_event<S>(&mut self, stream: &mut S, now_ms: u64, cancelled: bool) -> http.Event!connection.Error {
+        self.check(now_ms, cancelled)?
+        if self.inner.unread().len != 0 {
+            self.response_started = true
+        }
+        progress := self.inner.poll_event(stream)?
+        if progress.kind == http.EventKind.StartLine || progress.consumed != 0 || self.inner.unread().len != 0 {
+            self.response_started = true
+        }
+        return ok(progress)
+    }
+    pub fn body(&self) -> &[u8] {
+        return self.inner.body()
+    }
+    pub fn consume_body(&mut self, count: usize, now_ms: u64, cancelled: bool) -> void!connection.Error {
+        self.check(now_ms, cancelled)?
+        match self.inner.consume_body(count) {
+            ok() => {
+                return ok()
+            }
+            err(reason) => {
+                if reason.kind != connection.ErrorKind.Backpressure {
+                    self.inner.poison()
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn status(&self) -> u16 {
+        return self.inner.status()
+    }
+    pub fn field(&self, offset: usize, length: usize) -> &[u8]!http.Error from(self) {
+        return self.inner.field(offset, length)
+    }
+    pub fn unread(&self) -> &[u8] {
+        return self.inner.unread()
+    }
+    pub fn pending_output(&self) -> usize {
+        return self.inner.pending_output()
+    }
+    pub fn reusable(&self) -> bool {
+        return self.inner.reusable()
+    }
+    pub fn retry_allowed(&self, method: &http.Method, attempts: usize, replayable: bool) -> bool {
+        return self.policy.retries.permits(method, attempts, replayable, self.response_started || self.inner.unread().len != 0)
+    }
+    // Drained exchanges alone can reset this attached connection. A retry of a
+    // failed exchange constructs a fresh client around a fresh provider stream.
+    pub fn next(&mut self, now_ms: u64, cancelled: bool) -> void!connection.Error {
+        self.check(now_ms, cancelled)?
+        match self.inner.next_message() {
+            ok() => {}
+            err(reason) => {
+                self.inner.poison();
+                return err(reason)
+            }
+        }
+        self.active = false
+        self.deadline_ms = 0
+        return ok()
+    }
+}

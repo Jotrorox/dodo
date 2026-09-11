@@ -1,0 +1,43 @@
+package interoperability
+import "std/http"
+import "core/mem"
+unsafe extern "C" fn putchar(value: i32) -> i32
+fn emit(data: &[u8]) {
+    for i in 0usize..data.len {
+        unsafe {
+            putchar(data[i] as i32)
+        }
+    }
+}
+fn main() -> i32 {
+    headers := [http.Header { name: mem.str_bytes("Content-Type"), value: mem.str_bytes("text/plain") }]
+    response := http.Response { status: 200, reason: mem.str_bytes("OK"), headers: &headers, body: http.Body.streaming() }
+    output: [256]u8 = [0; 256]
+    match http.write_response(&response, &mut output) {
+        ok(count) => {
+            emit(&output[..count])
+        }
+        err(_) => {
+            return 1
+        }
+    }
+    sender := http.Sender.new(http.Body.streaming())
+    match sender.frame(mem.str_bytes("hello from Dodo"), &mut output) {
+        ok(progress) => {
+            emit(&output[..progress.written])
+        }
+        err(_) => {
+            return 2
+        }
+    }
+    trailers := [http.Header { name: mem.str_bytes("X-Test"), value: mem.str_bytes("yes") }]
+    match sender.finish(&trailers, &mut output) {
+        ok(count) => {
+            emit(&output[..count])
+        }
+        err(_) => {
+            return 3
+        }
+    }
+    return 0
+}

@@ -1,0 +1,71 @@
+package net_operations
+import "std/net"
+import "std/net/operations"
+import "std/io"
+
+pub struct Clock {
+    pub ticks: u64
+    pub fn now_ms(&mut self) -> u64 {
+        value := self.ticks
+        self.ticks += 1
+        return value
+    }
+}
+pub struct FakeStream {
+    pub writes: usize, pub reads: usize, pub waits: usize
+    pub fn poll_write(&mut self, input: &[u8]) -> io.Poll!io.Error {
+        self.writes += 1
+        if self.writes == 1 {
+            return ok(io.Poll { transferred: 2, state: io.PollState.Pending })
+        }
+        return ok(io.Poll { transferred: 0, state: io.PollState.Pending })
+    }
+    pub fn poll_read(&mut self, output: &mut[u8]) -> io.Poll!io.Error {
+        self.reads += 1
+        return ok(io.Poll { transferred: 0, state: io.PollState.Pending })
+    }
+    pub fn wait_ready(&self, interest: net.Interest, milliseconds: u32) -> bool!net.Error {
+        return ok(false)
+    }
+}
+fn main() -> i32 {
+    stream := FakeStream { writes: 0, reads: 0, waits: 0 }
+    clock := Clock { ticks: 10 }
+    operation := net.Operation.until(12)
+    cancel := net.NeverCancel {}
+    match operations.write_all(&mut stream, b"hello", &operation, &mut clock, &cancel) {
+        ok(_) => {
+            return 1
+        }
+        err(reason) => {
+            if reason.kind != io.ErrorKind.TimedOut || reason.transferred != 2 || stream.writes != 2 {
+                return 2
+            }
+        }
+    }
+    cancelled := net.Cancellation.new()
+    cancelled.cancel()
+    output := [0u8; 1]
+    match operations.read(&mut stream, &mut output, &operation, &mut clock, &cancelled) {
+        ok(_) => {
+            return 3
+        }
+        err(reason) => {
+            if reason.kind != io.ErrorKind.Cancelled || reason.transferred != 0 || stream.reads != 0 {
+                return 4
+            }
+        }
+    }
+    // Empty operations succeed without clock, cancellation or transport access.
+    match operations.write_all(&mut stream, b"", &operation, &mut clock, &cancelled) {
+        ok(count) => {
+            if count != 0 {
+                return 5
+            }
+        }
+        err(_) => {
+            return 6
+        }
+    }
+    return 0
+}

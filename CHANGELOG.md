@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add portable network addresses/DNS, Linux/Windows TCP/UDP/resolver providers,
+  verified OpenSSL TLS, bounded incremental HTTP/1.1, streaming clients/server
+  composition, routing/middleware and optional rooted static files. Keep transport,
+  TLS, clocks, allocation and execution independently selected.
+- Reject external-reference assignments that could retain a callback's borrowed
+  request storage. Add deterministic parser mutation/fragmentation tests, independent
+  loopback interoperability, local TLS credentials, Wine peers and portable objects.
+
 - Add independently selected Linux/Windows filesystem, process, environment,
   native thread, and synchronization packages, with native strings, explicit
   allocation, owned resources, bounded output collection, and deterministic

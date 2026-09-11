@@ -1,0 +1,1163 @@
+package http
+
+import "core/ascii"
+import "core/bytes"
+import "core/mem"
+import "std/net"
+
+// Allocation-free HTTP/1.1, RFC 9110/9112. This module owns no device, clock,
+// scheduler, or cryptography. Every output view is tied to caller-owned bytes.
+pub enum ErrorKind {
+    InvalidUri, InvalidMethod, InvalidStatus, InvalidHeader, InvalidStartLine,
+    InvalidFraming, InvalidChunk, ForbiddenTrailer, HeaderLimit, BodyLimit,
+    BufferFull, UnexpectedEof, InvalidState, Poisoned, OutOfBounds
+}
+pub struct Error {
+    pub kind: ErrorKind;
+    pub position: usize
+}
+pub fn failure(kind: ErrorKind, position: usize) -> Error {
+    return Error { kind: kind, position: position }
+}
+pub fn equal_ascii(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if ascii.to_lowercase(a[i]) != ascii.to_lowercase(b[i]) {
+            return false
+        }
+    }
+    return true
+}
+fn eq(data: &[u8], literal: &str) -> bool {
+    return equal_ascii(data, mem.str_bytes(literal))
+}
+pub fn token_byte(c: u8) -> bool {
+    return ascii.is_alphanumeric(c) || c == 33 || c == 35 || c == 36 || c == 37 ||
+        c == 38 || c == 39 || c == 42 || c == 43 || c == 45 || c == 46 ||
+        c == 94 || c == 95 || c == 96 || c == 124 || c == 126
+}
+pub fn valid_token(data: &[u8]) -> bool {
+    if data.len == 0 {
+        return false
+    }
+    for i in 0usize..data.len {
+        if!token_byte(data[i]) {
+            return false
+        }
+    }
+    return true
+}
+pub fn valid_value(data: &[u8]) -> bool {
+    for i in 0usize..data.len {
+        if (data[i] < 32 && data[i] != 9) || data[i] == 127 {
+            return false
+        }
+    }
+    return true
+}
+pub struct Method {
+    value: &[u8]
+    pub fn new(value: &[u8]) -> Method!Error from(value) {
+        if!valid_token(value) {
+            return err(failure(ErrorKind.InvalidMethod, 0))
+        }
+        return ok(Method { value: value })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        return self.value
+    }
+    pub fn idempotent(&self) -> bool {
+        return bytes.equal(self.value, mem.str_bytes("GET")) || bytes.equal(self.value, mem.str_bytes("HEAD")) ||
+            bytes.equal(self.value, mem.str_bytes("PUT")) || bytes.equal(self.value, mem.str_bytes("DELETE")) ||
+            bytes.equal(self.value, mem.str_bytes("OPTIONS")) || bytes.equal(self.value, mem.str_bytes("TRACE"))
+    }
+}
+pub struct Status {
+    pub code: u16
+    pub fn new(code: u16) -> Status!Error {
+        if code < 100 || code > 599 {
+            return err(failure(ErrorKind.InvalidStatus, 0))
+        }
+        return ok(Status { code: code })
+    }
+    pub fn informational(&self) -> bool {
+        return self.code >= 100 && self.code < 200
+    }
+}
+// Validate an HTTP authority without name resolution. IPv6 brackets delimit
+// colons; reg-name bytes retain percent escapes. Scoped IP literals are not
+// supported in HTTP authorities.
+pub fn valid_authority(data: &[u8], require_port: bool) -> bool {
+    if data.len == 0 {
+        return false
+    }
+    end := 0usize
+    if data[0] == 91 {
+        end = 1
+        for end < data.len && data[end] != 93 {
+            end += 1
+        }
+        if end == data.len {
+            return false
+        }
+        match net.parse_v6(&data[1..end]) {
+            ok(_) => {}
+            err(_) => {
+                return false
+            }
+        }
+        end += 1
+    } else {
+        for end < data.len && data[end] != 58 {
+            c := data[end]
+            if!(ascii.is_alphanumeric(c) || c == 45 || c == 46 || c == 95 || c == 126 ||
+                c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 ||
+                c == 42 || c == 43 || c == 59 || c == 61 || c == 37) {
+                return false
+            }
+            if c == 37 {
+                if data.len - end < 3 || !ascii.is_hex_digit(data[end + 1]) || !ascii.is_hex_digit(data[end + 2]) {
+                    return false
+                }
+                end += 2
+            }
+            end += 1
+        }
+        if end == 0 {
+            return false
+        }
+    }
+    if end == data.len {
+        return!require_port
+    }
+    if data[end] != 58 || end + 1 == data.len {
+        return false
+    }
+    match decimal(&data[end + 1..]) {
+        ok(port) => {
+            return port <= 65535
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+fn uri_byte(c: u8) -> bool {
+    return ascii.is_alphanumeric(c) || c == 45 || c == 46 || c == 95 || c == 126 ||
+        c == 58 || c == 47 || c == 63 || c == 91 || c == 93 || c == 64 ||
+        c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 ||
+        c == 42 || c == 43 || c == 44 || c == 59 || c == 61 || c == 37
+}
+// URI syntax is ASCII; percent escapes are validated but never decoded here.
+// Userinfo and fragments are rejected for HTTP request-targets and origins.
+pub struct Uri {
+    data: &[u8]
+    scheme_end: usize
+    authority_start: usize
+    authority_end: usize
+    path_start: usize
+    query_start: usize
+    pub fn parse(data: &[u8]) -> Uri!Error from(data) {
+        if data.len == 0 {
+            return err(failure(ErrorKind.InvalidUri, 0))
+        }
+        i := 0usize
+        for i < data.len {
+            c := data[i]
+            if!uri_byte(c) {
+                return err(failure(ErrorKind.InvalidUri, i))
+            }
+            if c == 37 {
+                if data.len - i < 3 || !ascii.is_hex_digit(data[i + 1]) || !ascii.is_hex_digit(data[i + 2]) {
+                    return err(failure(ErrorKind.InvalidUri, i))
+                }
+                i += 2
+            }
+            i += 1
+        }
+        scheme := 0usize
+        authority := 0usize
+        end := 0usize
+        path := 0usize
+        if data.len >= 7 && eq(&data[..7], "http://") {
+            scheme = 4;
+            authority = 7
+        }
+        if data.len >= 8 && eq(&data[..8], "https://") {
+            scheme = 5;
+            authority = 8
+        }
+        if authority != 0 {
+            end = authority
+            for end < data.len && data[end] != 47 && data[end] != 63 {
+                if data[end] == 64 {
+                    return err(failure(ErrorKind.InvalidUri, end))
+                }
+                end += 1
+            }
+            if!valid_authority(&data[authority..end], false) {
+                return err(failure(ErrorKind.InvalidUri, end))
+            }
+            path = end
+        } else {
+            if data[0] != 47 && !(data.len == 1 && data[0] == 42) {
+                return err(failure(ErrorKind.InvalidUri, 0))
+            }
+        }
+        query := data.len
+        for j in path..data.len {
+            if data[j] == 63 {
+                query = j;
+                break
+            }
+        }
+        return ok(Uri { data: data, scheme_end: scheme, authority_start: authority,
+        authority_end: end, path_start: path, query_start: query })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        return self.data
+    }
+    pub fn scheme(&self) -> &[u8] {
+        return &self.data[..self.scheme_end]
+    }
+    pub fn authority(&self) -> &[u8] {
+        return &self.data[self.authority_start..self.authority_end]
+    }
+    pub fn path(&self) -> &[u8] {
+        return &self.data[self.path_start..self.query_start]
+    }
+    pub fn query(&self) -> &[u8] {
+        start := self.query_start
+        if start < self.data.len {
+            start += 1
+        }
+        return &self.data[start..]
+    }
+    pub fn secure(&self) -> bool {
+        return self.scheme_end == 5
+    }
+    pub fn same_origin(&self, other: &Uri) -> bool {
+        return equal_ascii(self.scheme(), other.scheme()) && equal_ascii(self.authority(), other.authority())
+    }
+}
+pub struct Header {
+    pub name: &[u8];
+    pub value: &[u8]
+}
+pub enum BodyKind {
+    None, Length, Chunked, Close
+}
+pub struct Body {
+    pub kind: BodyKind
+    pub length: u64
+    pub fn empty() -> Body {
+        return Body { kind: BodyKind.None, length: 0 }
+    }
+    pub fn sized(length: u64) -> Body {
+        return Body { kind: BodyKind.Length, length: length }
+    }
+    pub fn streaming() -> Body {
+        return Body { kind: BodyKind.Chunked, length: 0 }
+    }
+}
+pub struct Request {
+    pub method: &[u8];
+    pub target: &[u8];
+    pub headers: &[Header];
+    pub body: Body
+}
+pub struct Response {
+    pub status: u16;
+    pub reason: &[u8];
+    pub headers: &[Header];
+    pub body: Body
+}
+pub enum Role {
+    Request, Response
+}
+pub struct Limits {
+    pub header_bytes: usize
+    pub header_fields: usize
+    pub body_bytes: u64
+    pub chunk_line_bytes: usize
+    pub trailer_bytes: usize
+    pub trailer_fields: usize
+    pub fn defaults() -> Limits {
+        return Limits { header_bytes: 16384, header_fields: 100, body_bytes: 16777216,
+        chunk_line_bytes: 1024, trailer_bytes: 4096, trailer_fields: 32 }
+    }
+}
+pub enum EventKind {
+    NeedInput, StartLine, Header, HeadersComplete, Body, Trailer, Informational, Complete, Upgrade
+}
+pub struct Event {
+    pub kind: EventKind
+    // Always advance by consumed. Body's offset/length index this feed input;
+    // header name/value index Parser.field(). No event retains input pointers.
+    pub consumed: usize
+    pub offset: usize
+    pub length: usize
+    pub name_offset: usize
+    pub name_length: usize
+    pub value_offset: usize
+    pub value_length: usize
+}
+fn event(kind: EventKind, consumed: usize) -> Event {
+    return Event { kind: kind, consumed: consumed, offset: 0, length: 0,
+    name_offset: 0, name_length: 0, value_offset: 0, value_length: 0 }
+}
+fn decimal(data: &[u8]) -> u64!Error {
+    if data.len == 0 {
+        return err(failure(ErrorKind.InvalidFraming, 0))
+    }
+    value := 0u64
+    for i in 0usize..data.len {
+        if!ascii.is_digit(data[i]) {
+            return err(failure(ErrorKind.InvalidFraming, i))
+        }
+        digit := (data[i] - 48) as u64
+        if value > (18446744073709551615u64 - digit) / 10 {
+            return err(failure(ErrorKind.InvalidFraming, i))
+        }
+        value = value * 10 + digit
+    }
+    return ok(value)
+}
+fn list_contains(data: &[u8], wanted: &str) -> bool!Error {
+    start := 0usize
+    found := false
+    for start < data.len {
+        for start < data.len && (data[start] == 32 || data[start] == 9) {
+            start += 1
+        }
+        end := start
+        for end < data.len && token_byte(data[end]) {
+            end += 1
+        }
+        if end == start {
+            return err(failure(ErrorKind.InvalidHeader, start))
+        }
+        if eq(&data[start..end], wanted) {
+            found = true
+        }
+        for end < data.len && (data[end] == 32 || data[end] == 9) {
+            end += 1
+        }
+        if end == data.len {
+            return ok(found)
+        }
+        if data[end] != 44 || end + 1 == data.len {
+            return err(failure(ErrorKind.InvalidHeader, end))
+        }
+        start = end + 1
+    }
+    return err(failure(ErrorKind.InvalidHeader, 0))
+}
+pub fn forbidden_trailer(name: &[u8]) -> bool {
+    return eq(name, "content-length") || eq(name, "transfer-encoding") || eq(name, "host") ||
+        eq(name, "connection") || eq(name, "trailer") || eq(name, "upgrade") ||
+        eq(name, "authorization") || eq(name, "proxy-authorization") || eq(name, "content-encoding") ||
+        eq(name, "content-type") || eq(name, "content-range")
+}
+
+// States: 0 start, 1 headers, 2 length, 3 chunk-size, 4 chunk-data,
+// 5 chunk CR, 6 chunk LF, 7 trailers, 8 close-body, 9 complete-pending,
+// 10 complete, 11 upgrade, 12 informational-pending, 13 restart, 255 poisoned.
+pub struct Parser {
+    workspace: &mut[u8]
+    limits: Limits
+    role: Role
+    state: u8
+    used: usize
+    line_start: usize
+    head_end: usize
+    cr: bool
+    fields: usize
+    trailer_count: usize
+    trailer_used: usize
+    method_end: usize
+    target_start: usize
+    target_end: usize
+    status_code: u16
+    seen_host: bool
+    seen_length: bool
+    seen_encoding: bool
+    close: bool
+    connection_upgrade: bool
+    has_upgrade: bool
+    head_response: bool
+    connect_response: bool
+    remaining: u64
+    total: u64
+    body: BodyKind
+    pub fn new(role: Role, workspace: &mut[u8], limits: Limits) -> Parser from(workspace) {
+        return Parser { workspace: workspace, limits: limits, role: role, state: 0,
+        used: 0, line_start: 0, head_end: 0, cr: false, fields: 0, trailer_count: 0,
+        trailer_used: 0, method_end: 0, target_start: 0, target_end: 0, status_code: 0,
+        seen_host: false, seen_length: false, seen_encoding: false, close: false,
+        connection_upgrade: false, has_upgrade: false, head_response: false,
+        connect_response: false, remaining: 0, total: 0, body: BodyKind.None }
+    }
+    pub fn method(&self) -> &[u8] {
+        return &self.workspace[..self.method_end]
+    }
+    pub fn target(&self) -> &[u8] {
+        return &self.workspace[self.target_start..self.target_end]
+    }
+    pub fn status(&self) -> u16 {
+        return self.status_code
+    }
+    pub fn body_kind(&self) -> BodyKind {
+        if self.body == BodyKind.Length {
+            return BodyKind.Length
+        }
+        if self.body == BodyKind.Chunked {
+            return BodyKind.Chunked
+        }
+        if self.body == BodyKind.Close {
+            return BodyKind.Close
+        }
+        return BodyKind.None
+    }
+    pub fn body_remaining(&self) -> u64 {
+        return self.remaining
+    }
+    pub fn body_received(&self) -> u64 {
+        return self.total
+    }
+    pub fn field(&self, offset: usize, length: usize) -> &[u8]!Error from(self) {
+        if offset > self.used || length > self.used - offset {
+            return err(failure(ErrorKind.OutOfBounds, offset))
+        }
+        return ok(&self.workspace[offset..offset + length])
+    }
+    pub fn reusable(&self) -> bool {
+        return self.state == 10 && !self.close
+    }
+    pub fn poisoned(&self) -> bool {
+        return self.state == 255
+    }
+    pub fn expect_head(&mut self, value: bool) {
+        self.head_response = value
+    }
+    pub fn expect_connect(&mut self, value: bool) {
+        self.connect_response = value
+    }
+    pub fn poison(&mut self) {
+        self.state = 255
+    }
+    fn reset(&mut self) {
+        self.state = 0;
+        self.used = 0;
+        self.line_start = 0;
+        self.head_end = 0;
+        self.cr = false
+        self.fields = 0;
+        self.trailer_count = 0;
+        self.trailer_used = 0;
+        self.method_end = 0
+        self.target_start = 0;
+        self.target_end = 0;
+        self.status_code = 0;
+        self.seen_host = false
+        self.seen_length = false;
+        self.seen_encoding = false;
+        self.close = false
+        self.connection_upgrade = false;
+        self.has_upgrade = false;
+        self.remaining = 0
+        self.total = 0;
+        self.body = BodyKind.None
+    }
+    pub fn next_message(&mut self) -> void!Error {
+        if!self.reusable() {
+            return err(failure(ErrorKind.InvalidState, 0))
+        }
+        self.reset()
+        self.head_response = false;
+        self.connect_response = false
+        return ok()
+    }
+    pub fn eof(&mut self) -> Event!Error {
+        if self.state == 8 || self.state == 9 || self.state == 10 {
+            self.close = true;
+            self.state = 10
+            return ok(event(EventKind.Complete, 0))
+        }
+        self.state = 255
+        return err(failure(ErrorKind.UnexpectedEof, self.used))
+    }
+    pub fn feed(&mut self, input: &[u8]) -> Event!Error {
+        match self.advance(input) {
+            ok(progress) => {
+                return ok(progress)
+            }
+            err(reason) => {
+                self.state = 255;
+                return err(reason)
+            }
+        }
+    }
+    fn start_line(&mut self, end: usize) -> void!Error {
+        line := &self.workspace[..end]
+        if self.role == Role.Response {
+            if end < 13 || !bytes.starts_with(line, mem.str_bytes("HTTP/1.1 ")) || line[12] != 32 {
+                return err(failure(ErrorKind.InvalidStartLine, 0))
+            }
+            code := decimal(&line[9..12])?
+            if code < 100 || code > 599 || !valid_value(&line[13..]) {
+                return err(failure(ErrorKind.InvalidStatus, 9))
+            }
+            self.status_code = code as u16
+        } else {
+            first := 0usize
+            for first < end && line[first] != 32 {
+                first += 1
+            }
+            if!valid_token(&line[..first]) || first == end {
+                return err(failure(ErrorKind.InvalidMethod, 0))
+            }
+            second := first + 1
+            for second < end && line[second] != 32 {
+                second += 1
+            }
+            if second == first + 1 || second == end || !bytes.equal(&line[second + 1..], mem.str_bytes("HTTP/1.1")) {
+                return err(failure(ErrorKind.InvalidStartLine, second))
+            }
+            if bytes.equal(&line[..first], mem.str_bytes("CONNECT")) {
+                if!valid_authority(&line[first + 1..second], true) {
+                    return err(failure(ErrorKind.InvalidUri, first + 1))
+                }
+            } else {
+                parsed := Uri.parse(&line[first + 1..second])?
+                if second == first + 2 && line[first + 1] == 42 && !bytes.equal(&line[..first], mem.str_bytes("OPTIONS")) {
+                    return err(failure(ErrorKind.InvalidUri, first + 1))
+                }
+            }
+            self.method_end = first;
+            self.target_start = first + 1;
+            self.target_end = second
+        }
+        self.state = 1
+        return ok()
+    }
+    fn header(&mut self, start: usize, end: usize, trailer: bool) -> Event!Error {
+        colon := start
+        for colon < end && self.workspace[colon] != 58 {
+            colon += 1
+        }
+        if colon == end || !valid_token(&self.workspace[start..colon]) {
+            return err(failure(ErrorKind.InvalidHeader, start))
+        }
+        value_start := colon + 1
+        for value_start < end && (self.workspace[value_start] == 32 || self.workspace[value_start] == 9) {
+            value_start += 1
+        }
+        value_end := end
+        for value_end > value_start && (self.workspace[value_end - 1] == 32 || self.workspace[value_end - 1] == 9) {
+            value_end -= 1
+        }
+        name := &self.workspace[start..colon]
+        value := &self.workspace[value_start..value_end]
+        if!valid_value(value) {
+            return err(failure(ErrorKind.InvalidHeader, value_start))
+        }
+        kind := EventKind.Header
+        if trailer {
+            if forbidden_trailer(name) {
+                return err(failure(ErrorKind.ForbiddenTrailer, start))
+            }
+            self.trailer_count += 1
+            if self.trailer_count > self.limits.trailer_fields {
+                return err(failure(ErrorKind.HeaderLimit, start))
+            }
+            kind = EventKind.Trailer
+        } else {
+            self.fields += 1
+            if self.fields > self.limits.header_fields {
+                return err(failure(ErrorKind.HeaderLimit, start))
+            }
+            if eq(name, "content-length") {
+                if self.seen_length || self.seen_encoding {
+                    return err(failure(ErrorKind.InvalidFraming, start))
+                }
+                self.remaining = decimal(value)?;
+                self.seen_length = true
+            }
+            if eq(name, "transfer-encoding") {
+                if self.seen_encoding || self.seen_length || !eq(value, "chunked") {
+                    return err(failure(ErrorKind.InvalidFraming, start))
+                }
+                self.seen_encoding = true
+            }
+            if eq(name, "host") {
+                if self.seen_host || value.len == 0 {
+                    return err(failure(ErrorKind.InvalidHeader, start))
+                }
+                if!valid_authority(value, false) {
+                    return err(failure(ErrorKind.InvalidHeader, value_start))
+                }
+                self.seen_host = true
+            }
+            if eq(name, "connection") {
+                close := list_contains(value, "close")?
+                upgrade := list_contains(value, "upgrade")?
+                self.close = self.close || close;
+                self.connection_upgrade = self.connection_upgrade || upgrade
+            }
+            if eq(name, "upgrade") {
+                self.has_upgrade = value.len != 0
+            }
+        }
+        result := event(kind, 0)
+        result.name_offset = start;
+        result.name_length = colon - start
+        result.value_offset = value_start;
+        result.value_length = value_end - value_start
+        return ok(result)
+    }
+    fn headers_done(&mut self) -> void!Error {
+        self.head_end = self.used
+        if self.role == Role.Request && !self.seen_host {
+            return err(failure(ErrorKind.InvalidHeader, self.used))
+        }
+        if self.role == Role.Response {
+            code := self.status_code
+            if (code < 200 || code == 204) && (self.seen_length || self.seen_encoding) {
+                return err(failure(ErrorKind.InvalidFraming, self.used))
+            }
+            if code == 101 {
+                if!self.connection_upgrade || !self.has_upgrade {
+                    return err(failure(ErrorKind.InvalidFraming, self.used))
+                }
+                self.state = 11;
+                self.close = true;
+                return ok()
+            }
+            if self.connect_response && code >= 200 && code < 300 {
+                self.state = 11;
+                self.close = true;
+                return ok()
+            }
+            if code < 200 {
+                self.state = 12;
+                return ok()
+            }
+            if self.head_response || code == 204 || code == 304 {
+                self.state = 9;
+                return ok()
+            }
+        }
+        if self.seen_encoding {
+            self.body = BodyKind.Chunked;
+            self.state = 3;
+            return ok()
+        }
+        if self.seen_length {
+            if self.remaining > self.limits.body_bytes {
+                return err(failure(ErrorKind.BodyLimit, self.used))
+            }
+            self.body = BodyKind.Length;
+            self.state = 2
+            if self.remaining == 0 {
+                self.state = 9
+            }
+            return ok()
+        }
+        self.state = 9
+        if self.role == Role.Response {
+            self.state = 8;
+            self.body = BodyKind.Close;
+            self.close = true
+        }
+        return ok()
+    }
+    fn chunk_size(&mut self, start: usize, end: usize) -> void!Error {
+        i := start
+        size := 0u64
+        for i < end && ascii.is_hex_digit(self.workspace[i]) {
+            digit := 0u64
+            match ascii.hex_value(self.workspace[i]) {
+                some(value) => {
+                    digit = value as u64
+                };
+                none => {}
+            }
+            if size > (18446744073709551615u64 - digit) / 16 {
+                return err(failure(ErrorKind.InvalidChunk, i))
+            }
+            size = size * 16 + digit;
+            i += 1
+        }
+        if i == start {
+            return err(failure(ErrorKind.InvalidChunk, start))
+        }
+        // Strict chunk-ext grammar, including bounded token/quoted values.
+        for i < end {
+            for i < end && (self.workspace[i] == 32 || self.workspace[i] == 9) {
+                i += 1
+            }
+            if i == end || self.workspace[i] != 59 {
+                return err(failure(ErrorKind.InvalidChunk, i))
+            }
+            i += 1
+            for i < end && (self.workspace[i] == 32 || self.workspace[i] == 9) {
+                i += 1
+            }
+            begin := i
+            for i < end && token_byte(self.workspace[i]) {
+                i += 1
+            }
+            if begin == i {
+                return err(failure(ErrorKind.InvalidChunk, i))
+            }
+            for i < end && (self.workspace[i] == 32 || self.workspace[i] == 9) {
+                i += 1
+            }
+            if i < end && self.workspace[i] == 61 {
+                i += 1
+                for i < end && (self.workspace[i] == 32 || self.workspace[i] == 9) {
+                    i += 1
+                }
+                if i < end && self.workspace[i] == 34 {
+                    i += 1;
+                    closed := false
+                    for i < end {
+                        c := self.workspace[i];
+                        i += 1
+                        if c == 34 {
+                            closed = true;
+                            break
+                        }
+                        if c == 92 {
+                            if i == end {
+                                return err(failure(ErrorKind.InvalidChunk, i))
+                            }
+                            c = self.workspace[i];
+                            i += 1
+                        }
+                        if (c < 32 && c != 9) || c == 127 {
+                            return err(failure(ErrorKind.InvalidChunk, i))
+                        }
+                    }
+                    if!closed {
+                        return err(failure(ErrorKind.InvalidChunk, i))
+                    }
+                } else {
+                    begin = i
+                    for i < end && token_byte(self.workspace[i]) {
+                        i += 1
+                    }
+                    if i == begin {
+                        return err(failure(ErrorKind.InvalidChunk, i))
+                    }
+                }
+            }
+        }
+        if size > self.limits.body_bytes - self.total {
+            return err(failure(ErrorKind.BodyLimit, start))
+        }
+        self.remaining = size;
+        self.state = 4
+        if size == 0 {
+            self.state = 7
+        }
+        return ok()
+    }
+    fn advance(&mut self, input: &[u8]) -> Event!Error {
+        if self.state == 255 {
+            return err(failure(ErrorKind.Poisoned, 0))
+        }
+        if self.state == 10 {
+            return err(failure(ErrorKind.InvalidState, 0))
+        }
+        if self.state == 9 {
+            self.state = 10;
+            return ok(event(EventKind.Complete, 0))
+        }
+        if self.state == 11 {
+            return ok(event(EventKind.Upgrade, 0))
+        }
+        if self.state == 12 {
+            self.state = 13;
+            return ok(event(EventKind.Informational, 0))
+        }
+        if self.state == 13 {
+            self.reset()
+        }
+        consumed := 0usize
+        for consumed < input.len {
+            if self.state == 2 || self.state == 4 || self.state == 8 {
+                count := input.len - consumed
+                if self.state != 8 && (count as u64) > self.remaining {
+                    count = self.remaining as usize
+                }
+                if (count as u64) > self.limits.body_bytes - self.total {
+                    return err(failure(ErrorKind.BodyLimit, consumed))
+                }
+                result := event(EventKind.Body, consumed + count)
+                result.offset = consumed;
+                result.length = count
+                self.total += count as u64
+                if self.state != 8 {
+                    self.remaining -= count as u64
+                    if self.remaining == 0 {
+                        if self.state == 2 {
+                            self.state = 9
+                        } else {
+                            self.state = 5
+                        }
+                    }
+                }
+                return ok(result)
+            }
+            if self.state == 5 || self.state == 6 {
+                expected := 13u8
+                if self.state == 6 {
+                    expected = 10
+                }
+                if input[consumed] != expected {
+                    return err(failure(ErrorKind.InvalidChunk, consumed))
+                }
+                consumed += 1
+                if self.state == 5 {
+                    self.state = 6
+                } else {
+                    self.state = 3
+                }
+            } else {
+                if self.used == self.workspace.len {
+                    return err(failure(ErrorKind.BufferFull, consumed))
+                }
+                if self.state <= 1 && self.used >= self.limits.header_bytes {
+                    return err(failure(ErrorKind.HeaderLimit, consumed))
+                }
+                if self.state == 3 && self.used - self.line_start >= self.limits.chunk_line_bytes {
+                    return err(failure(ErrorKind.HeaderLimit, consumed))
+                }
+                if self.state == 7 {
+                    if self.trailer_used >= self.limits.trailer_bytes {
+                        return err(failure(ErrorKind.HeaderLimit, consumed))
+                    }
+                    self.trailer_used += 1
+                }
+                c := input[consumed]
+                if (self.cr && c != 10) || (!self.cr && c == 10) {
+                    return err(failure(ErrorKind.InvalidHeader, consumed))
+                }
+                self.workspace[self.used] = c;
+                self.used += 1;
+                consumed += 1
+                if c == 10 {
+                    self.cr = false;
+                    start := self.line_start;
+                    end := self.used - 2
+                    self.line_start = self.used
+                    if self.state == 0 {
+                        self.start_line(end)?;;
+                        return ok(event(EventKind.StartLine, consumed))
+                    }
+                    if self.state == 1 {
+                        if start == end {
+                            self.headers_done()?;;
+                            return ok(event(EventKind.HeadersComplete, consumed))
+                        }
+                        result := self.header(start, end, false)?;
+                        result.consumed = consumed;
+                        return ok(result)
+                    }
+                    if self.state == 3 {
+                        self.chunk_size(start, end)?;
+                        self.used = self.head_end;
+                        self.line_start = self.used
+                    } else {
+                        if start == end {
+                            self.state = 10;
+                            return ok(event(EventKind.Complete, consumed))
+                        }
+                        result := self.header(start, end, true)?;
+                        result.consumed = consumed;
+                        return ok(result)
+                    }
+                } else {
+                    self.cr = c == 13
+                }
+            }
+        }
+        return ok(event(EventKind.NeedInput, consumed))
+    }
+}
+
+struct Output {
+    data: &mut[u8]
+    used: usize
+    fn put(&mut self, value: &[u8]) -> void!Error {
+        if value.len > self.data.len - self.used {
+            return err(failure(ErrorKind.BufferFull, self.used))
+        }
+        for i in 0usize..value.len {
+            self.data[self.used + i] = value[i]
+        }
+        self.used += value.len;
+        return ok()
+    }
+    fn literal(&mut self, value: &str) -> void!Error {
+        return self.put(mem.str_bytes(value))
+    }
+    fn number(&mut self, value: u64, radix: u64) -> void!Error {
+        digits: [20]u8 = [0; 20]
+        used := 0usize
+        for {
+            digit := (value % radix) as u8
+            c := digit + 48
+            if digit > 9 {
+                c = digit + 87
+            }
+            digits[19 - used] = c;
+            used += 1;
+            value = value / radix
+            if value == 0 {
+                break
+            }
+        }
+        return self.put(&digits[20 - used..])
+    }
+    fn headers(&mut self, headers: &[Header], body: &Body, request: bool) -> void!Error {
+        host := false
+        close := false
+        for i in 0usize..headers.len {
+            name := headers[i].name;
+            value := headers[i].value
+            if!valid_token(name) || !valid_value(value) {
+                return err(failure(ErrorKind.InvalidHeader, i))
+            }
+            if eq(name, "content-length") || eq(name, "transfer-encoding") {
+                return err(failure(ErrorKind.InvalidFraming, i))
+            }
+            if eq(name, "host") {
+                if host || value.len == 0 {
+                    return err(failure(ErrorKind.InvalidHeader, i))
+                }
+                host = true
+                if!valid_authority(value, false) {
+                    return err(failure(ErrorKind.InvalidHeader, i))
+                }
+            }
+            if eq(name, "connection") {
+                current_close := list_contains(value, "close")?;
+                close = close || current_close
+            }
+            self.put(name)?;
+            self.literal(": ")?;
+            self.put(value)?;
+            self.literal("\r\n")?
+        }
+        if request && !host {
+            return err(failure(ErrorKind.InvalidHeader, 0))
+        }
+        if body.kind == BodyKind.Length {
+            self.literal("Content-Length: ")?;
+            self.number(body.length, 10)?;
+            self.literal("\r\n")?
+        }
+        if body.kind == BodyKind.Chunked {
+            self.literal("Transfer-Encoding: chunked\r\n")?
+        }
+        if body.kind == BodyKind.Close {
+            if request {
+                return err(failure(ErrorKind.InvalidFraming, 0))
+            }
+            if!close {
+                self.literal("Connection: close\r\n")?
+            }
+        }
+        self.literal("\r\n")?;;
+        return ok()
+    }
+}
+// Caller must not transmit a buffer when serialization fails. Input headers
+// cannot supply framing fields: Body is their sole authority.
+pub fn write_request(request: &Request, destination: &mut[u8]) -> usize!Error {
+    if!valid_token(request.method) {
+        return err(failure(ErrorKind.InvalidMethod, 0))
+    }
+    if bytes.equal(request.method, mem.str_bytes("CONNECT")) {
+        if!valid_authority(request.target, true) {
+            return err(failure(ErrorKind.InvalidUri, 0))
+        }
+    } else {
+        uri := Uri.parse(request.target)?
+        if request.target.len == 1 && request.target[0] == 42 && !bytes.equal(request.method, mem.str_bytes("OPTIONS")) {
+            return err(failure(ErrorKind.InvalidUri, 0))
+        }
+    }
+    output := Output { data: destination, used: 0 }
+    output.put(request.method)?;
+    output.literal(" ")?;
+    output.put(request.target)?;
+    output.literal(" HTTP/1.1\r\n")?
+    output.headers(request.headers, &request.body, true)?;;
+    return ok(output.used)
+}
+pub fn write_response(response: &Response, destination: &mut[u8]) -> usize!Error {
+    if response.status < 100 || response.status > 599 || !valid_value(response.reason) {
+        return err(failure(ErrorKind.InvalidStatus, 0))
+    }
+    if (response.status < 200 || response.status == 204) && response.body.kind != BodyKind.None {
+        return err(failure(ErrorKind.InvalidFraming, 0))
+    }
+    output := Output { data: destination, used: 0 }
+    output.literal("HTTP/1.1 ")?;
+    output.number(response.status as u64, 10)?;
+    output.literal(" ")?
+    output.put(response.reason)?;
+    output.literal("\r\n")?
+    if response.body.kind == BodyKind.None && response.status >= 200 && response.status != 204 && response.status != 304 {
+        output.literal("Content-Length: 0\r\n")?
+    }
+    output.headers(response.headers, &response.body, false)?;;
+    return ok(output.used)
+}
+pub struct Encoded {
+    pub consumed: usize;
+    pub written: usize
+}
+pub struct Sender {
+    kind: BodyKind
+    remaining: u64
+    done: bool
+    failed: bool
+    pub fn new(body: Body) -> Sender {
+        kind := BodyKind.None
+        if body.kind == BodyKind.Length {
+            kind = BodyKind.Length
+        }
+        if body.kind == BodyKind.Chunked {
+            kind = BodyKind.Chunked
+        }
+        if body.kind == BodyKind.Close {
+            kind = BodyKind.Close
+        }
+        return Sender { kind: kind, remaining: body.length, done: false, failed: false }
+    }
+    pub fn complete(&self) -> bool {
+        return self.done && !self.failed
+    }
+    pub fn poisoned(&self) -> bool {
+        return self.failed
+    }
+    pub fn poison(&mut self) {
+        self.failed = true
+    }
+    pub fn frame(&mut self, input: &[u8], destination: &mut[u8]) -> Encoded!Error {
+        if self.failed {
+            return err(failure(ErrorKind.Poisoned, 0))
+        }
+        if self.done || (self.kind == BodyKind.None && input.len != 0) ||
+            (self.kind == BodyKind.Length && (input.len as u64) > self.remaining) {
+            self.failed = true;
+            return err(failure(ErrorKind.InvalidState, 0))
+        }
+        if input.len == 0 {
+            return ok(Encoded { consumed: 0, written: 0 })
+        }
+        count := input.len
+        if self.kind == BodyKind.Chunked {
+            // Reserve 16 hexadecimal digits, CRLF, and final CRLF. At least
+            // 21 output bytes permit progress regardless of chunk length.
+            if destination.len <= 20 {
+                return err(failure(ErrorKind.BufferFull, 0))
+            }
+            if count > destination.len - 20 {
+                count = destination.len - 20
+            }
+            output := Output { data: destination, used: 0 }
+            output.number(count as u64, 16)?;
+            output.literal("\r\n")?
+            output.put(&input[..count])?;
+            output.literal("\r\n")?
+            return ok(Encoded { consumed: count, written: output.used })
+        }
+        if count > destination.len {
+            count = destination.len
+        }
+        if count == 0 {
+            return err(failure(ErrorKind.BufferFull, 0))
+        }
+        for i in 0usize..count {
+            destination[i] = input[i]
+        }
+        if self.kind == BodyKind.Length {
+            self.remaining -= count as u64
+        }
+        return ok(Encoded { consumed: count, written: count })
+    }
+    pub fn finish(&mut self, trailers: &[Header], destination: &mut[u8]) -> usize!Error {
+        if self.failed {
+            return err(failure(ErrorKind.Poisoned, 0))
+        }
+        if self.done || (self.kind == BodyKind.Length && self.remaining != 0) ||
+            (self.kind != BodyKind.Chunked && trailers.len != 0) {
+            self.failed = true;
+            return err(failure(ErrorKind.InvalidState, 0))
+        }
+        if self.kind != BodyKind.Chunked {
+            self.done = true;
+            return ok(0)
+        }
+        for i in 0usize..trailers.len {
+            if forbidden_trailer(trailers[i].name) || !valid_token(trailers[i].name) || !valid_value(trailers[i].value) {
+                self.failed = true;
+                return err(failure(ErrorKind.ForbiddenTrailer, i))
+            }
+        }
+        output := Output { data: destination, used: 0 }
+        output.literal("0\r\n")?
+        for i in 0usize..trailers.len {
+            output.put(trailers[i].name)?;
+            output.literal(": ")?;
+            output.put(trailers[i].value)?;
+            output.literal("\r\n")?
+        }
+        output.literal("\r\n")?;
+        self.done = true;
+        return ok(output.used)
+    }
+}
+// Policy decisions take explicit facts; no replay, redirect, time, or socket
+// side effects occur inside the portable package.
+pub struct RedirectPolicy {
+    pub max_hops: usize
+    pub allow_https_downgrade: bool
+    pub fn defaults() -> RedirectPolicy {
+        return RedirectPolicy { max_hops: 0, allow_https_downgrade: false }
+    }
+    pub fn permits(&self, source: &Uri, target: &Uri, hops: usize, replayable: bool) -> bool {
+        return hops < self.max_hops && replayable && (self.allow_https_downgrade || !source.secure() || target.secure())
+    }
+}
+pub struct RetryPolicy {
+    pub max_attempts: usize
+    pub fn defaults() -> RetryPolicy {
+        return RetryPolicy { max_attempts: 1 }
+    }
+    pub fn permits(&self, method: &Method, attempts: usize, replayable: bool, response_started: bool) -> bool {
+        return attempts < self.max_attempts && replayable && method.idempotent() && !response_started
+    }
+}
+pub fn sensitive_header(name: &[u8]) -> bool {
+    return eq(name, "authorization") || eq(name, "proxy-authorization") || eq(name, "cookie") || eq(name, "host")
+}
+// Recompute Host and strip credentials whenever the origin changes. Proxy
+// credentials are always proxy-scoped; never forward them to origin servers.
+pub fn forward_header(name: &[u8], same_origin: bool, to_proxy: bool) -> bool {
+    if eq(name, "host") {
+        return false
+    }
+    if eq(name, "proxy-authorization") {
+        return to_proxy && same_origin
+    }
+    return same_origin || !sensitive_header(name)
+}

@@ -1,0 +1,351 @@
+package connection
+import "std/http"
+import "std/io"
+import "core/bytes"
+
+pub enum ErrorKind {
+    Protocol, Transport, Backpressure, InvalidState, TimedOut, Cancelled
+}
+pub struct Error {
+    pub kind: ErrorKind
+    pub protocol: http.Error
+    pub transport: io.Error
+}
+fn failure(kind: ErrorKind) -> Error {
+    return Error { kind: kind, protocol: http.failure(http.ErrorKind.InvalidState, 0), transport: io.failure(io.ErrorKind.Other, 0) }
+}
+fn clone_body(body: &http.Body) -> http.Body {
+    kind := http.BodyKind.None
+    if body.kind == http.BodyKind.Length {
+        kind = http.BodyKind.Length
+    }
+    if body.kind == http.BodyKind.Chunked {
+        kind = http.BodyKind.Chunked
+    }
+    if body.kind == http.BodyKind.Close {
+        kind = http.BodyKind.Close
+    }
+    return http.Body { kind: kind, length: body.length }
+}
+fn closes(headers: &[http.Header]) -> bool {
+    for i in 0usize..headers.len {
+        if http.equal_ascii(headers[i].name, b"connection") {
+            value := headers[i].value
+            start := 0usize
+            for start < value.len {
+                end := start
+                for end < value.len && value[end] != 44 {
+                    end += 1
+                }
+                first := start
+                last := end
+                for first < last && (value[first] == 32 || value[first] == 9) {
+                    first += 1
+                }
+                for last > first && (value[last - 1] == 32 || value[last - 1] == 9) {
+                    last -= 1
+                }
+                if http.equal_ascii(&value[first..last], b"close") {
+                    return true
+                }
+                start = end + 1
+            }
+        }
+    }
+    return false
+}
+pub fn waiting() -> http.Event {
+    return http.Event { kind: http.EventKind.NeedInput, consumed: 0, offset: 0, length: 0,
+    name_offset: 0, name_length: 0, value_offset: 0, value_length: 0 }
+}
+
+// A connection driver owns only caller buffers and protocol state. Stream,
+// execution, clock, cancellation, TLS and pooling are independent capabilities.
+// Each poll performs at most one read/write OS/provider operation.
+pub struct Connection {
+    parser: http.Parser
+    input: &mut[u8]
+    output: &mut[u8]
+    start: usize
+    end: usize
+    pending_start: usize
+    pending_end: usize
+    body_start: usize
+    body_end: usize
+    eof: bool
+    failed: bool
+    received: bool
+    sending: bool
+    outbound_close: bool
+    server: bool
+    sender: http.Sender
+    pub fn new(role: http.Role, workspace: &mut[u8], input: &mut[u8], output: &mut[u8], limits: http.Limits) -> Connection!Error from(workspace, input, output) {
+        if input.len == 0 || output.len == 0 {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        server := role == http.Role.Request
+        return ok(Connection { parser: http.Parser.new(role, workspace, limits), input: input,
+        output: output, start: 0, end: 0, pending_start: 0, pending_end: 0,
+        body_start: 0, body_end: 0, eof: false, failed: false, received: false,
+        sending: false, outbound_close: false, server: server, sender: http.Sender.new(http.Body.empty()) })
+    }
+    pub fn poison(&mut self) {
+        self.failed = true
+        self.parser.poison()
+        self.sender.poison()
+    }
+    pub fn check(&mut self, now_ms: u64, deadline_ms: u64, cancelled: bool) -> void!Error {
+        if cancelled {
+            self.poison()
+            return err(failure(ErrorKind.Cancelled))
+        }
+        if deadline_ms != 0 && now_ms >= deadline_ms {
+            self.poison()
+            return err(failure(ErrorKind.TimedOut))
+        }
+        if self.failed {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        return ok()
+    }
+    fn protocol_error(&mut self, reason: http.Error) -> Error {
+        self.poison()
+        result := failure(ErrorKind.Protocol)
+        result.protocol = reason
+        return result
+    }
+    fn transport_error(&mut self, reason: io.Error) -> Error {
+        self.poison()
+        result := failure(ErrorKind.Transport)
+        result.transport = reason
+        return result
+    }
+    pub fn pending_output(&self) -> usize {
+        return self.pending_end - self.pending_start
+    }
+    pub fn disable_reuse(&mut self) {
+        self.outbound_close = true
+    }
+    pub fn output_complete(&self) -> bool {
+        return self.sending && self.sender.complete() && self.pending_start == self.pending_end && !self.failed
+    }
+    pub fn reusable(&self) -> bool {
+        return!self.failed && !self.outbound_close && !self.eof && self.received && self.parser.reusable() && self.output_complete() && self.body_start == self.body_end
+    }
+    pub fn request(&mut self, request: &http.Request) -> void!Error {
+        if self.server || self.failed || self.sending || self.pending_start != self.pending_end {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        match http.write_request(request, self.output) {
+            ok(count) => {
+                self.pending_start = 0
+                self.pending_end = count
+            }
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+        self.parser.expect_head(bytes.equal(request.method, b"HEAD"))
+        self.parser.expect_connect(bytes.equal(request.method, b"CONNECT"))
+        self.sender = http.Sender.new(clone_body(&request.body))
+        self.outbound_close = self.outbound_close || closes(request.headers)
+        self.sending = true
+        return ok()
+    }
+    pub fn response(&mut self, response: &http.Response) -> void!Error {
+        if!self.server || self.failed || self.sending || self.pending_start != self.pending_end {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        match http.write_response(response, self.output) {
+            ok(count) => {
+                self.pending_start = 0
+                self.pending_end = count
+            }
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+        self.sender = http.Sender.new(clone_body(&response.body))
+        self.outbound_close = self.outbound_close || closes(response.headers) || response.body.kind == http.BodyKind.Close || response.status == 101 ||
+            (bytes.equal(self.parser.method(), b"CONNECT") && response.status >= 200 && response.status < 300)
+        if bytes.equal(self.parser.method(), b"HEAD") || response.status == 304 {
+            self.sender = http.Sender.new(http.Body.empty())
+        }
+        self.sending = true
+        return ok()
+    }
+    // Informational heads do not finish or replace the final response sender.
+    // Flush each head before queuing another. 101 is an explicit upgrade.
+    pub fn informational(&mut self, response: &http.Response) -> void!Error {
+        if!self.server || self.failed || self.sending || self.pending_start != self.pending_end ||
+            response.status < 100 || response.status >= 200 || response.status == 101 {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        match http.write_response(response, self.output) {
+            ok(count) => {
+                self.pending_start = 0
+                self.pending_end = count
+                return ok()
+            }
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+    }
+    // Accepted body bytes have been copied to output and must not be replayed.
+    // Backpressure returns before touching source or sender state.
+    pub fn send_body(&mut self, source: &[u8]) -> usize!Error {
+        if self.failed || !self.sending {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        if self.pending_start != self.pending_end {
+            return err(failure(ErrorKind.Backpressure))
+        }
+        match self.sender.frame(source, self.output) {
+            ok(encoded) => {
+                self.pending_start = 0
+                self.pending_end = encoded.written
+                return ok(encoded.consumed)
+            }
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+    }
+    pub fn finish_body(&mut self, trailers: &[http.Header]) -> void!Error {
+        if self.failed || !self.sending {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        if self.pending_start != self.pending_end {
+            return err(failure(ErrorKind.Backpressure))
+        }
+        match self.sender.finish(trailers, self.output) {
+            ok(count) => {
+                self.pending_start = 0
+                self.pending_end = count
+                return ok()
+            }
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+    }
+    pub fn poll_flush<S>(&mut self, stream: &mut S) -> io.Poll!Error {
+        if self.failed {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        if self.pending_start == self.pending_end {
+            return ok(io.Poll { state: io.PollState.Ready, transferred: 0 })
+        }
+        match io.poll_write_once(stream, &self.output[self.pending_start..self.pending_end]) {
+            ok(progress) => {
+                self.pending_start += progress.transferred
+                return ok(progress)
+            }
+            err(reason) => {
+                self.pending_start += reason.transferred
+                return err(self.transport_error(reason))
+            }
+        }
+    }
+    // Body must be explicitly consumed before advancing. This also prevents
+    // pipeline read-ahead from overwriting data while a sink is backpressured.
+    pub fn poll_event<S>(&mut self, stream: &mut S) -> http.Event!Error {
+        if self.failed || self.received {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        if self.body_start != self.body_end {
+            return err(failure(ErrorKind.Backpressure))
+        }
+        // A zero-input feed produces completion/informational transition events.
+        match self.parser.feed(&self.input[self.start..self.end]) {
+            ok(event) => {
+                self.body_start = self.start + event.offset
+                self.body_end = self.body_start
+                if event.kind == http.EventKind.Body {
+                    self.body_end += event.length
+                }
+                self.start += event.consumed
+                if event.kind == http.EventKind.Complete {
+                    self.received = true
+                }
+                if event.kind == http.EventKind.Upgrade {
+                    self.failed = true
+                }
+                if event.kind != http.EventKind.NeedInput || self.start < self.end {
+                    return ok(event)
+                }
+            }
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+        if self.eof {
+            match self.parser.eof() {
+                ok(event) => {
+                    self.received = true
+                    return ok(event)
+                }
+                err(reason) => {
+                    return err(self.protocol_error(reason))
+                }
+            }
+        }
+        self.start = 0
+        self.end = 0
+        match io.poll_read_once(stream, self.input) {
+            ok(progress) => {
+                self.end = progress.transferred
+                if progress.state == io.PollState.Eof {
+                    self.eof = true
+                }
+            }
+            err(reason) => {
+                self.end = reason.transferred
+                return err(self.transport_error(reason))
+            }
+        }
+        // Defer parsing to the next bounded step, so every read is visible.
+        return ok(waiting())
+    }
+    pub fn body(&self) -> &[u8] {
+        return &self.input[self.body_start..self.body_end]
+    }
+    pub fn consume_body(&mut self, count: usize) -> void!Error {
+        if count > self.body_end - self.body_start {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        self.body_start += count
+        return ok()
+    }
+    pub fn method(&self) -> &[u8] {
+        return self.parser.method()
+    }
+    pub fn target(&self) -> &[u8] {
+        return self.parser.target()
+    }
+    pub fn status(&self) -> u16 {
+        return self.parser.status()
+    }
+    pub fn field(&self, offset: usize, length: usize) -> &[u8]!http.Error from(self) {
+        return self.parser.field(offset, length)
+    }
+    // Upgraded bytes already read from the stream belong to the new protocol.
+    pub fn unread(&self) -> &[u8] {
+        return &self.input[self.start..self.end]
+    }
+    pub fn next_message(&mut self) -> void!Error {
+        if!self.reusable() {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        match self.parser.next_message() {
+            ok() => {}
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+        self.received = false
+        self.sending = false
+        return ok()
+    }
+}

@@ -1,0 +1,42 @@
+package static_checks
+import "std/web/static_files"
+import "std/io"
+import "std/platform/error"
+fn checks() -> i32!error.Error {
+    root := static_files.Root.open(b"public", static_files.Symlinks.Reject)?
+    file := root.open_file(b"/hello.txt")?
+    buffer := [0u8; 16]
+    match io.read_exact(&mut file, &mut buffer[..5]) {
+        ok(_) => {}
+        err(_) => {
+            return ok(1)
+        }
+    }
+    if buffer[0] != 104 || buffer[4] != 111 {
+        return ok(2)
+    }
+    for i in 0usize..100 {
+        other := root.open_file(b"/hello.txt")?
+        core.drop(other)
+    }
+    bad := [b"/../outside", b"/%2e%2e/outside", b"/link", b"/dirlink/secret", b"/hello.txt/", b"//hello.txt", b"/hello.txt:stream"]
+    for i in 0usize..bad.len {
+        match root.open_file(bad[i]) {
+            ok(_) => {
+                return ok(3)
+            }
+            err(_) => {}
+        }
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match checks() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

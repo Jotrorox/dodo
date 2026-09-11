@@ -1,0 +1,172 @@
+---
+title: "TLS"
+description: "Verified TLS engines, bounded record staging, and explicit transport composition."
+section: "Using Dodo"
+order: 152
+---
+
+`std/tls` contains portable provider contracts and typed errors. Importing it
+loads no TLS implementation, network adapter, filesystem, clock, entropy source,
+or scheduler. `std/tls/openssl` selects the independently linked OpenSSL provider;
+`std/tls/stream` composes any compatible engine with an `std/io` polling transport.
+HTTP has no dependency on a particular TLS backend.
+
+## Backend and build
+
+The implemented Linux and Windows x64 provider requires **OpenSSL 3.5 or later**;
+the verification environment uses **3.5.8**. The maintained 3.5 LTS branch is
+[supported through April 2030](https://openssl-library.org/post/2025-02-20-openssl-3.5-lts/).
+OpenSSL 3.x uses the [Apache License 2.0](https://openssl-library.org/source/license/).
+Dodo neither vendors OpenSSL nor implements cryptographic primitives.
+
+Install target OpenSSL development headers, libssl, libcrypto, and a target C
+toolchain. Hosted executable linking automatically compiles the embedded C
+boundary and adds `-lssl -lcrypto`; normal toolchain dynamic linking applies.
+`--link-arg` can select library/include directories or explicit static linking.
+Static Windows linkage additionally needs OpenSSL's system dependencies, normally
+crypt32, ws2_32, advapi32, bcrypt, and the matching CRT. Object emission requires
+the caller to compile `stdlib/std/tls/runtime.c` and link these dependencies.
+OpenSSL shared libraries and provider modules must match the deployment ABI.
+
+CI builds the pinned OpenSSL 3.5.8 source archive with SHA-256 verification because
+the compiler test suite needs this maintained backend even on hosts whose default
+development package is older. OpenSSL is a dependency of TLS programs and fixtures,
+not of the Dodo compiler executable or portable HTTP/routing imports.
+
+Windows uses the same OpenSSL backend, not Schannel. System-root mode means
+**OpenSSL's configured default trust paths**, not automatic import of the Windows
+certificate store. Supply explicit PEM roots for reproducible cross-platform
+trust. A TLS import on an unsupported hosted target receives a compiler adapter
+diagnostic; portable `std/tls` and `std/tls/stream` can compile for freestanding
+targets when composed with compatible custom providers.
+
+## Verification and providers
+
+`openssl.Config.client(hostname)` enables certificate-chain verification and
+requires a nonempty hostname. DNS names use certificate hostname checks with
+partial-label wildcards disabled; IP literals use iPAddress SAN matching. DNS
+names also configure SNI. Verification failure permanently poisons the engine;
+there is no option that silently disables client peer verification. See the
+[OpenSSL hostname verification API](https://docs.openssl.org/3.5/man3/SSL_set1_host/).
+The caller supplies an ASCII DNS A-label or IP literal; Unicode/IDNA conversion
+belongs to an optional name-processing integration.
+
+`trust_pem` adds a caller-provided PEM certificate bundle; `system_roots` chooses
+whether to load platform OpenSSL defaults as well. Setting it false with an empty
+bundle produces an empty trust store, so peer verification fails. Set
+`certificate_pem` and `private_key_pem` to provide an optional client identity.
+A certificate PEM may contain leaf followed by intermediate certificates.
+Encrypted PEM keys are rejected without prompting or reading standard input.
+Credential providers can load/decrypt bytes outside this package and supply them
+at construction. The caller remains responsible for wiping its own key bytes.
+
+`Config.server(certificate, key)` requires an identity. Ordinary TLS servers do
+not request client identities. Set `require_client_certificate=true` and supply
+trust roots for mandatory verified mutual TLS. ALPN is an explicit RFC 7301
+length-prefixed byte list; server preference determines selection. If both sides
+offer lists without overlap, the handshake fails. If a peer omits ALPN, the
+negotiated protocol is empty, and the application decides whether to continue.
+
+`verification_time=-1` uses OpenSSL's platform wall clock. Nonnegative Unix
+seconds select an explicit certificate-verification time, allowing an external
+time provider or deterministic tests. Entropy comes from OpenSSL's maintained
+platform CSPRNG/provider configuration; failure aborts the operation. This backend
+does not expose a custom entropy callback or allow weak test randomness. A
+separate engine can implement the portable contract with different providers.
+
+TLS 1.2 and TLS 1.3 are enabled. Compression, renegotiation, session caches and
+server session tickets are disabled. Early data, resumption policy, DTLS, custom
+cipher configuration, OCSP fetching, and certificate revocation policy are not
+implemented by this API. Ordinary chain, validity, purpose and hostname checks
+remain mandatory for clients.
+
+## Incremental engine and ownership
+
+Create an `openssl.Engine` with `client(&config)` or `server(&config)`. Construction
+copies/parses configuration; no configuration borrow survives. The engine owns
+the context, SSL state, credentials, encrypted rings and plaintext retry storage.
+It is neither implicitly Send nor Sync: serialize operations on one execution
+lane. The backend never starts workers or accesses sockets.
+
+* `handshake()` returns `Ready`, `NeedInput`, or `NeedOutput`.
+* `feed(ciphertext)` accepts a prefix into the inbound ring; zero means the ring
+  is full. Drive the engine before feeding more.
+* `drain(destination)` removes an encrypted prefix; zero means no output is
+  presently queued, not transport EOF.
+* `read_plain(destination)` and `write_plain(source)` return state and exact
+  initialized/accepted prefix counts. Empty requests succeed without I/O.
+* `flush()` completes an accepted plaintext retry. Encrypted bytes still need
+  `drain` and transport delivery.
+* `shutdown()` incrementally exchanges close_notify. Keep draining until output
+  reaches the peer; `Closed` means both TLS notifications were exchanged locally.
+* `eof()` reports transport EOF after feeding all preceding ciphertext. Missing
+  close_notify fails with `Truncated`, never a successful plaintext EOF.
+* `abort()` destroys the engine immediately; it is idempotent. Destruction also
+  aborts and does not perform network I/O.
+
+Each call borrows its input/output only until return. The backend copies accepted
+writes into a private 16 KiB buffer and uses that exact address/data for any
+OpenSSL retry. This satisfies [OpenSSL's retry requirements](https://docs.openssl.org/3.5/man3/SSL_write/)
+without asking callers to keep a borrowed source alive across calls. Accepted
+bytes can still be lost if the connection subsequently fails or is aborted;
+acceptance is not acknowledgement by the peer. Errors expose numeric backend
+codes, never plaintext, keys, certificates, or secret diagnostic formatting.
+
+## Transport composition and limits
+
+`stream.Stream.new(engine, &mut transport, incoming, outgoing)` returns a Result,
+owns the engine, and exclusively borrows an `std/io` polling transport plus two
+caller-supplied nonempty byte slices. The checked borrows prevent transport and
+scratch reuse, movement or destruction while the wrapper lives. `pump()` performs at
+most one transport write and one read, retains partial ciphertext progress, and
+never busy-waits. Caller-selected scratch lengths bound staging without allocation; even one-byte
+buffers are supported. Empty scratch fails `InvalidInput` during construction.
+The engine uses two fixed 32 KiB BIO rings plus its 16 KiB plaintext retry buffer.
+
+`poll_read`/`poll_write` integrate with `std/io`; one-attempt `read`/`write` report
+`WouldBlock` when no progress is possible. `flush` reports `Ready` only after
+accepted plaintext and all staged encrypted output reach the transport. The
+caller chooses readiness polling, blocking threads, or another execution model.
+`handshake_until(now, deadline, cancelled)` takes an explicit clock observation
+and cancellation snapshot. Equality reaches the deadline. Timeout/cancellation
+permanently aborts the stream; the underlying transport must then be closed by
+its owner. The same caller-controlled policy should bound body I/O, flush and
+shutdown attempts. No background operation or OS buffer borrow survives a call.
+
+Maximum hostname length is 253 bytes; ALPN wire lists are at most 65,535 bytes
+with nonempty elements of at most 255 bytes. Each PEM input is capped at 1 MiB.
+The peer certificate-list limit is 64 KiB with verification depth 16. Invalid
+configuration fails before creating a live connection. Full rings/staging return
+partial progress or a pending state; they never grow. ALPN destination shortage
+returns `LimitExceeded` without copying a partial protocol identifier.
+
+OpenSSL allocates internal cryptographic and handshake state, so these caps do
+not constitute a hard upper bound on total backend heap use. Direct wrapper
+allocation failures report `AllocationFailed`; OpenSSL internal failures report
+`Backend` or `Protocol` with an opaque code and permanently invalidate an active
+session. Construction unwinds all partially acquired resources. There is no
+Dodo global allocator choice hidden inside portable protocol packages.
+
+## Verification
+
+`cargo test --test tls_library` generates a local CA and short-lived leaf/key,
+then compiles and runs Dodo fixtures at `-O0` and `-O3`. It checks one-byte
+handshake fragmentation, ALPN selection/mismatch, mutual authentication and
+missing-client-identity rejection, wrong-host/untrusted/expired
+rejection, bounded write exhaustion, caller-buffer mutation during pending
+writes, close_notify, truncation, cancellation, exact deadline boundaries,
+idempotent cleanup, transport/scratch-borrow escape and reuse rejection, and
+portable object output for
+WebAssembly and Cortex-M0. No private credential is checked into the repository.
+
+The Linux interoperability test composes `std/http/client.Client` over Dodo's
+TLS stream and TCP adapter against Python's independent `ssl` server on controlled
+IPv4 loopback. It checks ALPN and local trust, serialized requests, incremental
+response parsing with three-byte input scratch, one-byte body consumption,
+connection nonreuse, and bilateral close_notify at both optimization levels. Native allocation-failure injection checks constructor cleanup at both
+levels. `scripts/test_tls_windows.py` cross-links the credential/engine fixture and the
+HTTP/TLS/TCP loopback client with an explicitly supplied Windows OpenSSL build.
+It executes four real PE fixtures under Wine: both client/server engines and
+both HTTPS loopback optimization levels. Native Windows deployment still needs checks
+of installed OpenSSL trust paths, provider loading and operating-system entropy
+behavior; Wine cannot establish those native-environment properties.

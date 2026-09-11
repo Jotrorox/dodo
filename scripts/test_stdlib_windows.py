@@ -227,7 +227,9 @@ def main():
                     run([linker, "/nologo", "/nodefaultlib", "/entry:mainCRTStartup", "/subsystem:console", "/machine:x64",
                          "/stack:8388608", f"/out:{exe}", str(runtime_object), str(stack_probe), str(alias_object), str(obj), str(kernel32),
                          *[str(native_objects[path, optimization]) for path in native_sources(source)],
-                         *([str(kernel32.parent / "libmsvcrt.a")] if native_sources(source) else [])])
+                         *([str(kernel32.parent / "libmsvcrt.a")] if native_sources(source) else []),
+                         *([str(kernel32.parent / "libws2_32.a")]
+                           if any(path.parent.name == "net" for path in native_sources(source)) else [])])
                     if exe.read_bytes()[:2] != b"MZ":
                         raise RuntimeError(f"Linker did not produce a Windows executable: {exe}")
                     work = scratch / f"work-{source.stem}-{optimization}"

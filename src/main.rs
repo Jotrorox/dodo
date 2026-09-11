@@ -316,6 +316,12 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 }
                 if target.contains("-windows-") {
                     linker.args(["-lkernel32", "-lshell32"]);
+                    if native.iter().any(|(name, _)| name.starts_with("std/net/")) {
+                        linker.arg("-lws2_32");
+                    }
+                }
+                if native.iter().any(|(name, _)| name.starts_with("std/tls/")) {
+                    linker.args(["-lssl", "-lcrypto"]);
                 }
             }
             let output = linker.args(&args.link_args).arg("-o").arg(out).output().map_err(|e|format!("could not execute linker '{}': {e}; install a C toolchain or select --linker",args.linker.to_string_lossy()))?;

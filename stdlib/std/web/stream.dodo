@@ -1,0 +1,30 @@
+package stream
+import "std/io"
+
+// Backpressure owns a checked borrow of a body fragment until fully delivered.
+// One step makes at most one writer call; Pending never spins or reads ahead.
+pub struct PendingBody {
+    data: &[u8]
+    offset: usize
+    pub fn new(data: &[u8]) -> PendingBody from(data) {
+        return PendingBody { data: data, offset: 0 }
+    }
+    pub fn remaining(&self) -> usize {
+        return self.data.len - self.offset
+    }
+    pub fn step<W>(&mut self, output: &mut W) -> io.Poll!io.Error {
+        if self.offset == self.data.len {
+            return ok(io.Poll { state: io.PollState.Ready, transferred: 0 })
+        }
+        match io.poll_write_once(output, &self.data[self.offset..]) {
+            ok(progress) => {
+                self.offset += progress.transferred
+                return ok(progress)
+            }
+            err(reason) => {
+                self.offset += reason.transferred
+                return err(reason)
+            }
+        }
+    }
+}

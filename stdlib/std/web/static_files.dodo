@@ -1,0 +1,59 @@
+package static_files
+import "core/ptr"
+import "std/fs"
+import "std/platform/error"
+import "std/web/native"
+import "std/web"
+
+pub enum Symlinks {
+    Reject
+}
+// Root is an open directory capability. Every intermediate directory is held
+// open while resolving; links/reparse points are rejected at every component.
+pub struct Root {
+    handle: isize
+    pub fn open(path: &[u8], policy: Symlinks) -> Root!error.Error {
+        code := 0i32
+        handle := unsafe {
+            native.dodo_web_root(ptr.as_ptr(path), path.len, ptr.from_mut(&mut code))
+        }
+        if handle == -1 {
+            return err(error.Error { kind: error.Kind.Other, code: code })
+        }
+        return ok(Root { handle: handle })
+    }
+    // Path is already decoded by web.decode_path. Dot segments, empty internal
+    // segments, colon, trailing space/dot, and percent escapes are disallowed.
+    pub fn open_file(&self, path: &[u8]) -> fs.File!error.Error {
+        match web.validate_path(path) {
+            ok() => {}
+            err(_) => {
+                return err(error.failure(error.Kind.InvalidInput))
+            }
+        }
+        if path.len <= 1 || path[path.len - 1] == 47 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        for i in 1usize..path.len {
+            if path[i] == 37 || path[i] == 58 || (path[i] == 47 && path[i - 1] == 47) ||
+                ((path[i] == 46 || path[i] == 32) && (i + 1 == path.len || path[i + 1] == 47)) {
+                return err(error.failure(error.Kind.InvalidInput))
+            }
+        }
+        code := 0i32
+        raw := unsafe {
+            native.dodo_web_file(self.handle, ptr.as_ptr(&path[1..]), path.len - 1, ptr.from_mut(&mut code))
+        }
+        if raw == -1 {
+            return err(error.Error { kind: error.Kind.Other, code: code })
+        }
+        return ok(unsafe {
+            fs.File.from_raw(raw)
+        })
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_web_close_root(self.handle)
+        }
+    }
+}

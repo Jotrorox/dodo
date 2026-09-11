@@ -1,0 +1,131 @@
+package tls_loopback
+import "std/tls"
+import "std/tls/openssl"
+import "std/tls/stream"
+import "std/net"
+import "std/net/native"
+import "std/http"
+import "std/http/client"
+import "std/http/connection" as http_connection
+import "std/thread"
+const CA: &[u8] = b"@@CA@@"
+const PORT: u16 = 0
+fn http_exchange<S>(transport: &mut S, clock: &mut native.MonotonicClock) -> i32!http_connection.Error {
+    workspace := [0u8; 512]
+    input := [0u8; 3]
+    output := [0u8; 256]
+    policy := client.Policy.defaults()
+    policy.request_timeout_ms = 10000
+    origin := match http.Uri.parse(b"https://localhost:@@PORT@@/") {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return ok(20)
+        }
+    }
+    driver := client.Client.new(origin, &mut workspace[..], &mut input[..], &mut output[..], http.Limits.defaults(), policy)?
+    headers := [http.Header { name: b"Host", value: b"localhost:@@PORT@@" }, http.Header { name: b"Connection", value: b"close" }]
+    request := http.Request { method: b"GET", target: b"/", headers: &headers, body: http.Body.empty() }
+    driver.begin(&request, clock.now_ms(), false)?
+    for driver.pending_output() != 0 {
+        driver.poll_flush(transport, clock.now_ms(), false)?
+        thread.sleep_ms(1)
+    }
+    trailers: [0]http.Header = []
+    driver.finish_body(&trailers, clock.now_ms(), false)?
+    expected := b"hello"
+    received := 0usize
+    for true {
+        event := driver.poll_event(transport, clock.now_ms(), false)?
+        if event.kind == http.EventKind.Body {
+            // Consume one borrowed body byte per turn, preserving backpressure.
+            if received >= expected.len || driver.body().len == 0 || driver.body()[0] != expected[received] {
+                return ok(21)
+            }
+            received += 1
+            driver.consume_body(1, clock.now_ms(), false)?
+        }
+        if event.kind == http.EventKind.Complete {
+            if driver.status() != 200 || received != expected.len || driver.reusable() {
+                return ok(22)
+            }
+            return ok(0)
+        }
+        if event.kind == http.EventKind.NeedInput {
+            thread.sleep_ms(1)
+        }
+    }
+    return ok(23)
+}
+fn exchange(socket: &mut native.TcpConnection) -> void!tls.Error {
+    config := openssl.Config.client(b"localhost")
+    config.system_roots = false
+    config.trust_pem = CA
+    config.alpn = b"\x08http/1.1"
+    engine := openssl.Engine.client(&config)?
+    input := [0u8; 4096]
+    output := [0u8; 4096]
+    connection := stream.Stream.new(engine, socket, &mut input[..], &mut output[..])?
+    clock := native.MonotonicClock {}
+    deadline := clock.now_ms() + 15000
+    ready := false
+    for i in 0usize..15000 {
+        state := connection.handshake_until(clock.now_ms(), deadline, false)?
+        if state == tls.State.Ready {
+            ready = true;
+            break
+        }
+        thread.sleep_ms(1)
+    }
+    if!ready {
+        return err(tls.failure(tls.ErrorKind.TimedOut, 1))
+    }
+    match http_exchange(&mut connection, &mut clock) {
+        ok(code) => {
+            if code != 0 {
+                return err(tls.failure(tls.ErrorKind.Protocol, code))
+            }
+        }
+        err(_) => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 24))
+        }
+    }
+    for i in 0usize..15000 {
+        if clock.now_ms() >= deadline {
+            return err(tls.failure(tls.ErrorKind.TimedOut, 25))
+        }
+        state := connection.shutdown()?
+        if state == tls.State.Closed {
+            return ok()
+        }
+        thread.sleep_ms(1)
+    }
+    return err(tls.failure(tls.ErrorKind.TimedOut, 26))
+}
+fn run() -> void!net.Error {
+    address := net.SocketAddress.new(net.IpAddress.v4(127, 0, 0, 1), PORT)
+    operation := net.Operation.until(18446744073709551615u64)
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    socket := native.connect_with(&address, &operation, &mut clock, &cancel)?
+    match exchange(&mut socket) {
+        ok() => {}
+        err(reason) => {
+            return err(net.Error { kind: net.ErrorKind.Other, code: reason.code, transferred: 0 })
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }, err(reason) => {
+            if reason.code > 0 && reason.code < 100 {
+                return reason.code
+            };
+            return 99
+        }
+    }
+}

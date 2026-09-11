@@ -1,0 +1,269 @@
+package web_application_checks
+import "std/web"
+import "std/web/server"
+import "std/web/response"
+import "std/http"
+import "std/http/connection"
+import "std/io"
+import "core/bytes"
+
+pub struct Transport {
+    input: &[u8]
+    position: usize
+    reads: usize
+    written: usize
+    pub fn poll_read(&mut self, output: &mut[u8]) -> io.Poll!io.Error {
+        self.reads += 1
+        count := self.input.len - self.position
+        if count > output.len {
+            count = output.len
+        }
+        if count > 11 {
+            count = 11
+        }
+        if count == 0 {
+            return ok(io.Poll { state: io.PollState.Eof, transferred: 0 })
+        }
+        for i in 0usize..count {
+            output[i] = self.input[self.position + i]
+        }
+        self.position += count
+        return ok(io.Poll { state: io.PollState.Ready, transferred: count })
+    }
+    pub fn poll_write(&mut self, input: &[u8]) -> io.Poll!io.Error {
+        count := input.len
+        if count > 3 {
+            count = 3
+        }
+        self.written += count
+        return ok(io.Poll { state: io.PollState.Pending, transferred: count })
+    }
+}
+pub struct Handler {
+    expected_path: &[u8]
+    head_calls: usize
+    sink_calls: usize
+    complete_calls: usize
+    body_bytes: usize
+    pause: bool
+    pub fn head(&mut self, context: &mut web.Context) -> void!web.Error {
+        self.head_calls += 1
+        if!bytes.equal(context.path, self.expected_path) || context.route_id != 1 || context.request_id != 1 {
+            return err(web.Error.Handler)
+        }
+        return ok()
+    }
+    pub fn poll_write(&mut self, input: &[u8]) -> io.Poll!io.Error {
+        self.sink_calls += 1
+        if self.pause {
+            self.pause = false;
+            return ok(io.Poll { state: io.PollState.Pending, transferred: 0 })
+        }
+        self.pause = true
+        count := input.len
+        if count > 2 {
+            count = 2
+        }
+        for i in 0usize..count {
+            if input[i] != b"abcdef"[self.body_bytes + i] {
+                return err(io.failure(io.ErrorKind.Other, 0))
+            }
+        }
+        self.body_bytes += count
+        return ok(io.Poll { state: io.PollState.Pending, transferred: count })
+    }
+    pub fn complete(&mut self, driver: &mut connection.Connection) -> void!connection.Error {
+        self.complete_calls += 1
+        headers: [0]http.Header = []
+        reply := http.Response { status: 200, reason: b"OK", headers: &headers, body: http.Body.empty() }
+        return driver.response(&reply)
+    }
+}
+pub struct Observer {
+    heads: usize
+    completes: usize
+    failures: usize
+    body_bytes: usize
+    failure_status: u16
+    pub fn event(&mut self, event: &server.Event) {
+        if event.kind == server.EventKind.Head {
+            self.heads += 1
+        }
+        if event.kind == server.EventKind.Complete {
+            self.completes += 1
+        }
+        if event.kind == server.EventKind.Body {
+            self.body_bytes += event.bytes
+        }
+        if event.kind == server.EventKind.Failure {
+            self.failures += 1;
+            self.failure_status = event.status
+        }
+    }
+}
+fn finish(driver: &mut connection.Connection, stream: &mut Transport) -> bool {
+    for driver.pending_output() != 0 {
+        match driver.poll_flush(stream) {
+            ok(_) => {}
+            err(_) => {
+                return false
+            }
+        }
+    }
+    empty: [0]http.Header = []
+    match driver.finish_body(&empty) {
+        ok() => {}
+        err(_) => {
+            return false
+        }
+    }
+    return driver.output_complete()
+}
+fn pump(application: &mut server.Application, driver: &mut connection.Connection, stream: &mut Transport,
+handler: &mut Handler, observer: &mut Observer, expected_status: u16, expected_body: usize) -> i32 {
+    rejected := false
+    completed := false
+    for step in 0usize..500 {
+        reads := stream.reads
+        outstanding := driver.body().len
+        match application.step(driver, stream, handler, observer) {
+            ok(progress) => {
+                if progress == server.Step.RequestComplete {
+                    completed = true;
+                    break
+                }
+            }
+            err(_) => {
+                rejected = true;
+                break
+            }
+        }
+        if outstanding != 0 && stream.reads != reads {
+            return 1
+        }
+    }
+    if expected_status != 200 {
+        if!rejected || completed || handler.head_calls != 0 || handler.sink_calls != 0 || handler.complete_calls != 0 ||
+            observer.failures != 1 || observer.failure_status != expected_status {
+            return 2
+        }
+        reads := stream.reads
+        for attempt in 0usize..4 {
+            match application.step(driver, stream, handler, observer) {
+                ok(_) => {
+                    return 3
+                }
+                err(_) => {}
+            }
+        }
+        if stream.reads != reads || handler.head_calls != 0 || handler.sink_calls != 0 || handler.complete_calls != 0 || observer.failures != 1 {
+            return 4
+        }
+        // Routing rejection reserves the driver for an explicit error response,
+        // while the failed Application can never dispatch stale callbacks.
+        headers := [http.Header { name: b"Connection", value: b"close" }]
+        reply := http.Response { status: expected_status, reason: b"Rejected", headers: &headers, body: http.Body.empty() }
+        match driver.response(&reply) {
+            ok() => {}
+            err(_) => {
+                return 5
+            }
+        }
+        if!finish(driver, stream) || driver.reusable() || stream.written == 0 {
+            return 6
+        }
+        return 0
+    }
+    if rejected || !completed || handler.head_calls != 1 || handler.complete_calls != 1 ||
+        handler.body_bytes != expected_body || observer.body_bytes != expected_body || observer.heads != 1 ||
+        observer.completes != 1 || observer.failures != 0 {
+        return 7
+    }
+    if expected_body != 0 && handler.sink_calls < 3 {
+        return 8
+    }
+    if!finish(driver, stream) || !driver.reusable() {
+        return 9
+    }
+    return 0
+}
+fn run_case(wire: &[u8], expected_path: &[u8], expected_status: u16, expected_body: usize, path_capacity: usize) -> i32 {
+    routes := [web.Route { method: b"POST", pattern: b"/ok", id: 1 }, web.Route { method: b"GET", pattern: b"/", id: 1 }]
+    workspace := [0u8; 2048]
+    input := [0u8; 128]
+    output := [0u8; 256]
+    path := [0u8; 64]
+    stream := Transport { input: wire, position: 0, reads: 0, written: 0 }
+    handler := Handler { expected_path: expected_path, head_calls: 0, sink_calls: 0, complete_calls: 0, body_bytes: 0, pause: true }
+    observer := Observer { heads: 0, completes: 0, failures: 0, body_bytes: 0, failure_status: 0 }
+    match server.Application.new(&routes, &mut path[..path_capacity]) {
+        ok(application) => {
+            match connection.Connection.new(http.Role.Request, &mut workspace, &mut input, &mut output, http.Limits.defaults()) {
+                ok(driver) => {
+                    return pump(&mut application, &mut driver, &mut stream, &mut handler, &mut observer, expected_status, expected_body)
+                }
+                err(_) => {
+                    return 10
+                }
+            }
+        }
+        err(_) => {
+            return 11
+        }
+    }
+}
+fn borrowed_builder() -> i32 {
+    name := [88u8, 45, 84, 101, 115, 116]
+    value := [121u8, 101, 115]
+    fields := [http.Header { name: &name, value: &value }]
+    output := [0u8; 128]
+    match response.Builder.new(200, &mut fields) {
+        ok(builder) => {
+            match builder.include(1) {
+                ok() => {}
+                err(_) => {
+                    return 1
+                }
+            }
+            message := builder.build(http.Body.empty())
+            match http.write_response(&message, &mut output) {
+                ok(count) => {
+                    if!bytes.equal(&output[..count], b"HTTP/1.1 200 \r\nContent-Length: 0\r\nX-Test: yes\r\n\r\n") {
+                        return 2
+                    }
+                }
+                err(_) => {
+                    return 3
+                }
+            }
+        }
+        err(_) => {
+            return 4
+        }
+    }
+    return 0
+}
+fn main() -> i32 {
+    if run_case(b"POST /missing HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\n\r\nabcdefPOST /ok HTTP/1.1\r\nHost: localhost\r\n\r\n", b"/ok", 404, 0, 64) != 0 {
+        return 10
+    }
+    if run_case(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n", b"/ok", 405, 0, 64) != 0 {
+        return 11
+    }
+    if run_case(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\n\r\nabcdef", b"/ok", 400, 0, 2) != 0 {
+        return 12
+    }
+    if run_case(b"POST http://localhost/%6Fk?query=yes HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\n\r\nabcdef", b"/ok", 200, 6, 64) != 0 {
+        return 13
+    }
+    if run_case(b"GET http://localhost?query=yes HTTP/1.1\r\nHost: localhost\r\n\r\n", b"/", 200, 0, 64) != 0 {
+        return 14
+    }
+    if run_case(b"POST /ok HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n4\r\ncdef\r\n0\r\n\r\n", b"/ok", 200, 6, 64) != 0 {
+        return 15
+    }
+    if borrowed_builder() != 0 {
+        return 16
+    }
+    return 0
+}

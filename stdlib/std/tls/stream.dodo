@@ -1,0 +1,183 @@
+package stream
+
+import "std/io"
+import "std/tls"
+
+// Generic composition: E is a TLS engine, T is an io polling transport.
+// Caller-provided bounded staging; exclusive transport and buffer borrows retained
+// through destruction. Each pump makes at most one transport read and write.
+pub struct Stream<E, T> {
+    engine: E
+    transport: &mut T
+    incoming: &mut[u8]
+    outgoing: &mut[u8]
+    input_start: usize
+    input_end: usize
+    output_start: usize
+    output_end: usize
+    failed: bool
+    transport_eof: bool
+    pub fn new(engine: E, transport: &mut T, incoming: &mut[u8], outgoing: &mut[u8]) -> Stream<E, T>!tls.Error from(transport, incoming, outgoing) {
+        if incoming.len == 0 || outgoing.len == 0 {
+            return err(tls.failure(tls.ErrorKind.InvalidInput, 0))
+        }
+        return ok(Stream<E, T> { engine: engine, transport: transport,
+        incoming: incoming, outgoing: outgoing, input_start: 0,
+        input_end: 0, output_start: 0, output_end: 0, failed: false, transport_eof: false })
+    }
+    pub fn pump(&mut self) -> bool!tls.Error {
+        if self.failed {
+            return err(tls.failure(tls.ErrorKind.Closed, 0))
+        }
+        progressed := false
+        if self.output_start == self.output_end {
+            self.output_start = 0
+            self.output_end = self.engine.drain(&mut self.outgoing[..])?
+        }
+        if self.output_start != self.output_end {
+            match io.poll_write_once(self.transport, &self.outgoing[self.output_start..self.output_end]) {
+                ok(progress) => {
+                    self.output_start += progress.transferred
+                    progressed = progress.transferred != 0
+                }
+                err(reason) => {
+                    self.failed = true
+                    return err(tls.failure(tls.ErrorKind.Transport, reason.code))
+                }
+            }
+        }
+        if self.input_start == self.input_end && !self.transport_eof {
+            self.input_start = 0
+            self.input_end = 0
+            match io.poll_read_once(self.transport, &mut self.incoming[..]) {
+                ok(progress) => {
+                    self.input_end = progress.transferred
+                    if progress.state == io.PollState.Eof {
+                        self.transport_eof = true
+                    }
+                }
+                err(reason) => {
+                    self.failed = true
+                    return err(tls.failure(tls.ErrorKind.Transport, reason.code))
+                }
+            }
+        }
+        if self.input_start != self.input_end {
+            count := self.engine.feed(&self.incoming[self.input_start..self.input_end])?
+            self.input_start += count
+            if count != 0 {
+                progressed = true
+            }
+        }
+        if self.transport_eof && self.input_start == self.input_end {
+            self.engine.eof()
+        }
+        return ok(progressed)
+    }
+    pub fn handshake(&mut self) -> tls.State!tls.Error {
+        self.pump()?
+        return self.engine.handshake()
+    }
+    // Caller supplies monotonic time/deadline and cancellation observation.
+    // Deadline is inclusive. Failure permanently invalidates this stream.
+    pub fn handshake_until(&mut self, now: u64, deadline: u64, cancelled: bool) -> tls.State!tls.Error {
+        if cancelled {
+            self.failed = true
+            self.engine.abort()
+            return err(tls.failure(tls.ErrorKind.Cancelled, 0))
+        }
+        if now >= deadline {
+            self.failed = true
+            self.engine.abort()
+            return err(tls.failure(tls.ErrorKind.TimedOut, 0))
+        }
+        return self.handshake()
+    }
+    pub fn poll_read(&mut self, destination: &mut[u8]) -> io.Poll!io.Error {
+        if destination.len == 0 {
+            return ok(io.Poll { transferred: 0, state: io.PollState.Ready })
+        }
+        match self.pump() {
+            ok(_) => {}, err(reason) => {
+                return err(tls.io_error(reason))
+            }
+        }
+        match self.engine.read_plain(destination) {
+            ok(progress) => {
+                return ok(tls.poll(progress))
+            }
+            err(reason) => {
+                return err(tls.io_error(reason))
+            }
+        }
+    }
+    pub fn poll_write(&mut self, source: &[u8]) -> io.Poll!io.Error {
+        if source.len == 0 {
+            return ok(io.Poll { transferred: 0, state: io.PollState.Ready })
+        }
+        match self.pump() {
+            ok(_) => {}, err(reason) => {
+                return err(tls.io_error(reason))
+            }
+        }
+        match self.engine.write_plain(source) {
+            ok(progress) => {
+                return ok(tls.poll(progress))
+            }
+            err(reason) => {
+                return err(tls.io_error(reason))
+            }
+        }
+    }
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!io.Error {
+        progress := self.poll_read(destination)?
+        if progress.state == io.PollState.Pending && progress.transferred == 0 {
+            return err(io.failure(io.ErrorKind.WouldBlock, 0))
+        }
+        return ok(progress.transferred)
+    }
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        progress := self.poll_write(source)?
+        if progress.state == io.PollState.Pending && progress.transferred == 0 {
+            return err(io.failure(io.ErrorKind.WouldBlock, 0))
+        }
+        return ok(progress.transferred)
+    }
+    // Ready only once private plaintext and ciphertext staging have drained.
+    pub fn flush(&mut self) -> tls.State!tls.Error {
+        self.pump()?
+        progress := self.engine.flush()?
+        if progress != tls.State.Ready {
+            return ok(progress)
+        }
+        if self.output_start != self.output_end {
+            return ok(tls.State.NeedOutput)
+        }
+        self.output_start = 0
+        self.output_end = self.engine.drain(&mut self.outgoing[..])?
+        if self.output_end != 0 {
+            return ok(tls.State.NeedOutput)
+        }
+        return ok(tls.State.Ready)
+    }
+    pub fn shutdown(&mut self) -> tls.State!tls.Error {
+        self.pump()?
+        progress := self.engine.shutdown()?
+        // The peer close_notify can be read before ours reaches transport.
+        if progress == tls.State.Closed {
+            if self.output_start != self.output_end {
+                return ok(tls.State.NeedOutput)
+            }
+            self.output_start = 0
+            self.output_end = self.engine.drain(&mut self.outgoing[..])?
+            if self.output_end != 0 {
+                return ok(tls.State.NeedOutput)
+            }
+        }
+        return ok(progress)
+    }
+    pub fn abort(&mut self) {
+        self.failed = true
+        self.engine.abort()
+    }
+}

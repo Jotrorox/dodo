@@ -1,0 +1,94 @@
+package operations
+
+import "std/net"
+import "std/io"
+
+fn boundary<C, X>(operation: &net.Operation, clock: &mut C, cancel: &X, transferred: usize) -> void!io.Error {
+    match operation.check(clock, cancel) {
+        ok() => {
+            return ok()
+        }
+        err(reason) => {
+            kind := io.ErrorKind.TimedOut
+            if reason.kind == net.ErrorKind.Cancelled {
+                kind = io.ErrorKind.Cancelled
+            }
+            return err(io.Error { kind: kind, code: reason.code, transferred: transferred })
+        }
+    }
+}
+fn wait_error(reason: net.Error, transferred: usize) -> io.Error {
+    kind := io.ErrorKind.Other
+    if reason.kind == net.ErrorKind.Closed {
+        kind = io.ErrorKind.Closed
+    }
+    if reason.kind == net.ErrorKind.Interrupted {
+        kind = io.ErrorKind.Interrupted
+    }
+    return io.Error { kind: kind, code: reason.code, transferred: transferred }
+}
+// Explicit blocking compositions. The readiness provider is the stream's
+// wait_ready(Interest, milliseconds)->bool!net.Error capability; fake streams
+// can supply deterministic execution. Cancellation latency is <=10ms plus one
+// nonblocking attempt and user provider execution. Empty I/O touches no provider.
+pub fn read<S, C, X>(stream: &mut S, destination: &mut[u8], operation: &net.Operation, clock: &mut C, cancel: &X) -> usize!io.Error {
+    if destination.len == 0 {
+        return ok(0)
+    }
+    for true {
+        boundary(operation, clock, cancel, 0)?
+        match io.poll_read_once(stream, destination) {
+            ok(progress) => {
+                if progress.transferred != 0 || progress.state == io.PollState.Eof {
+                    return ok(progress.transferred)
+                }
+            }
+            err(reason) => {
+                if reason.transferred != 0 || reason.kind != io.ErrorKind.Interrupted {
+                    return err(reason)
+                }
+            }
+        }
+        match stream.wait_ready(net.Interest.Read, 10) {
+            ok(_) => {}
+            err(reason) => {
+                if reason.kind != net.ErrorKind.Interrupted {
+                    return err(wait_error(reason, 0))
+                }
+            }
+        }
+    }
+    return err(io.failure(io.ErrorKind.Other, 0))
+}
+pub fn write_all<S, C, X>(stream: &mut S, source: &[u8], operation: &net.Operation, clock: &mut C, cancel: &X) -> usize!io.Error {
+    total := 0usize
+    for total < source.len {
+        boundary(operation, clock, cancel, total)?
+        pending := false
+        match io.poll_write_once(stream, &source[total..]) {
+            ok(progress) => {
+                total += progress.transferred
+                pending = progress.state == io.PollState.Pending
+            }
+            err(reason) => {
+                total += reason.transferred
+                if reason.kind != io.ErrorKind.Interrupted {
+                    reason.transferred = total
+                    return err(reason)
+                }
+                pending = true
+            }
+        }
+        if total < source.len && pending {
+            match stream.wait_ready(net.Interest.Write, 10) {
+                ok(_) => {}
+                err(reason) => {
+                    if reason.kind != net.ErrorKind.Interrupted {
+                        return err(wait_error(reason, total))
+                    }
+                }
+            }
+        }
+    }
+    return ok(total)
+}

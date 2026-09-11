@@ -62,7 +62,7 @@ and conservative borrow checking are documented alongside the specification.
 - [Implementation decisions and limits](https://jotrorox.github.io/dodo/implementation/): supported behavior and remaining work.
 - [Language specification](https://jotrorox.github.io/dodo/language-spec-0.1/): the Dodo 0.1 design, also available as [plain text](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.txt) and [PDF](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.pdf).
 - [Examples](examples): programs covering borrowing, patterns, generics, and hardware access.
-- [Standard library](https://jotrorox.github.io/dodo/standard-library/): portable foundations, explicit allocation, I/O, text, collections, mathematics, hashing, time, and independently selected filesystem, process, environment, thread, and synchronization adapters.
+- [Standard library](https://jotrorox.github.io/dodo/standard-library/): portable foundations, explicit allocation, I/O, text, collections, mathematics, hashing, time, networking, TLS, HTTP/1.1 and web routing, with independently selected operating-system and execution providers.
 
 ## Build and contribute
 

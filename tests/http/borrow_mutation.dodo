@@ -1,0 +1,21 @@
+package borrow_mutation
+import "std/http"
+import "core/mem"
+fn main() -> i32 {
+    storage: [128]u8 = [0; 128]
+    parser := http.Parser.new(http.Role.Request, &mut storage, http.Limits.defaults())
+    match parser.feed(mem.str_bytes("GET / HTTP/1.1\r\n")) {
+        ok(_) => {}
+        err(_) => {
+            return 1
+        }
+    }
+    target := parser.target()
+    match parser.feed(mem.str_bytes("Host: a\r\n")) {
+        ok(_) => {}
+        err(_) => {
+            return 2
+        }
+    }
+    return target.len as i32
+}

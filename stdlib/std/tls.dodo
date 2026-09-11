@@ -1,0 +1,55 @@
+package tls
+
+import "std/io"
+
+// Portable TLS provider contracts. No cryptography, sockets, clock, entropy,
+// allocation or execution provider is imported here.
+pub enum ErrorKind {
+    InvalidInput, AllocationFailed, VerificationFailed, Protocol, Truncated,
+    Closed, Transport, Cancelled, TimedOut, Backend, LimitExceeded
+}
+pub struct Error {
+    pub kind: ErrorKind
+    // Numeric backend/verification code only; never credentials or plaintext.
+    pub code: i32
+    pub transferred: usize
+}
+pub fn failure(kind: ErrorKind, code: i32) -> Error {
+    return Error { kind: kind, code: code, transferred: 0 }
+}
+pub enum State {
+    Ready, NeedInput, NeedOutput, Closed
+}
+pub struct Progress {
+    pub state: State
+    pub transferred: usize
+}
+// Provider: handshake()->State!Error, feed(ciphertext)->usize!Error,
+// drain(ciphertext)->usize!Error, read_plain(destination)->Progress!Error,
+// write_plain(source)->Progress!Error, shutdown()->State!Error, eof().
+// Every input is borrowed only for a call. Progress counts accepted prefixes;
+// accepted writes belong to provider-owned staging until drained or aborted.
+// NeedInput/NeedOutput transfer no ownership of caller storage to the provider.
+pub fn handshake<P>(provider: &mut P) -> State!Error {
+    return provider.handshake()
+}
+pub fn io_error(reason: Error) -> io.Error {
+    kind := io.ErrorKind.Other
+    if reason.kind == ErrorKind.InvalidInput {
+        kind = io.ErrorKind.InvalidInput
+    }
+    if reason.kind == ErrorKind.Truncated {
+        kind = io.ErrorKind.UnexpectedEof
+    }
+    return io.Error { kind: kind, transferred: reason.transferred, code: reason.code }
+}
+pub fn poll(progress: Progress) -> io.Poll {
+    state := io.PollState.Ready
+    if progress.state == State.NeedInput || progress.state == State.NeedOutput {
+        state = io.PollState.Pending
+    }
+    if progress.state == State.Closed {
+        state = io.PollState.Eof
+    }
+    return io.Poll { transferred: progress.transferred, state: state }
+}

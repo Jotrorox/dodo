@@ -1,0 +1,164 @@
+package server
+import "std/web"
+import "std/http"
+import "std/http/connection"
+import "std/io"
+
+pub enum Step {
+    Pending, Progress, RequestComplete, Upgrade
+}
+pub enum EventKind {
+    Head, Body, Complete, Failure
+}
+pub struct Event {
+    pub kind: EventKind;
+    pub request_id: u64;
+    pub bytes: usize;
+    pub status: u16
+}
+pub struct NoObserver {
+    pub fn event(&mut self, event: &Event) {}
+}
+fn decode_target(target: &[u8], output: &mut[u8]) -> usize!web.Error {
+    match http.Uri.parse(target) {
+        ok(uri) => {
+            if uri.path().len == 0 {
+                return web.decode_path(b"/", output)
+            }
+            return web.decode_path(uri.path(), output)
+        }
+        err(_) => {
+            return err(web.Error.InvalidPath)
+        }
+    }
+}
+
+// Application callbacks are synchronous structural methods:
+// head(&mut self, &mut web.Context) -> void!web.Error
+// poll_write(&mut self, &[u8]) -> io.Poll!io.Error (streaming request body sink)
+// complete(&mut self, &mut connection.Connection) -> void!connection.Error
+// Complete may queue a streaming response; application drives poll_flush,
+// send_body, finish_body. Returning does not imply successful delivery.
+pub struct Application {
+    router: web.Router
+    path: &mut[u8]
+    request_id: u64
+    failed: bool
+    pub fn new(routes: &[web.Route], path: &mut[u8]) -> Application!web.Error from(routes, path) {
+        return ok(Application { router: web.Router.new(routes)?, path: path, request_id: 0, failed: false })
+    }
+    fn reject<O>(&mut self, driver: &mut connection.Connection, observer: &mut O, reason: web.Error) -> web.Error {
+        self.failed = true
+        driver.disable_reuse()
+        status := 400u16
+        if reason == web.Error.NotFound {
+            status = 404
+        }
+        if reason == web.Error.MethodNotAllowed {
+            status = 405
+        }
+        observed := Event { kind: EventKind.Failure, request_id: self.request_id, bytes: 0, status: status }
+        observer.event(&observed)
+        return reason
+    }
+    pub fn step<S, H, O>(&mut self, driver: &mut connection.Connection, stream: &mut S, handler: &mut H, observer: &mut O) -> Step!web.Error {
+        if self.failed {
+            return err(web.Error.Handler)
+        }
+        // Never request more input while a prior fragment is outstanding.
+        if driver.body().len != 0 {
+            progress: io.Poll
+            match io.poll_write_once(handler, driver.body()) {
+                ok(value) => {
+                    progress = value
+                }
+                err(reason) => {
+                    self.failed = true
+                    observed := Event { kind: EventKind.Failure, request_id: self.request_id, bytes: reason.transferred, status: 500 }
+                    observer.event(&observed)
+                    driver.poison()
+                    return err(web.Error.Handler)
+                }
+            }
+            match driver.consume_body(progress.transferred) {
+                ok() => {}
+                err(_) => {
+                    return err(web.Error.InvalidProgress)
+                }
+            }
+            event := Event { kind: EventKind.Body, request_id: self.request_id, bytes: progress.transferred, status: 0 }
+            observer.event(&event)
+            if progress.state == io.PollState.Pending {
+                return ok(Step.Pending)
+            }
+            return ok(Step.Progress)
+        }
+        event: http.Event
+        match driver.poll_event(stream) {
+            ok(value) => {
+                event = value
+            }
+            err(_) => {
+                self.failed = true
+                observed := Event { kind: EventKind.Failure, request_id: self.request_id, bytes: 0, status: 400 }
+                observer.event(&observed)
+                return err(web.Error.Handler)
+            }
+        }
+        if event.kind == http.EventKind.NeedInput {
+            return ok(Step.Pending)
+        }
+        if event.kind == http.EventKind.HeadersComplete {
+            used := 0usize
+            match decode_target(driver.target(), self.path) {
+                ok(count) => {
+                    used = count
+                }
+                err(reason) => {
+                    return err(self.reject(driver, observer, reason))
+                }
+            }
+            found: web.Match
+            match self.router.find(driver.method(), &self.path[..used]) {
+                ok(value) => {
+                    found = value
+                }
+                err(reason) => {
+                    return err(self.reject(driver, observer, reason))
+                }
+            }
+            if self.request_id == 18446744073709551615u64 {
+                self.request_id = 0
+            }
+            self.request_id += 1
+            context := web.Context { method: driver.method(), path: &self.path[..used],
+            route_id: found.id, request_id: self.request_id, cancelled: false }
+            match handler.head(&mut context) {
+                ok() => {}
+                err(reason) => {
+                    core.drop(context)
+                    return err(self.reject(driver, observer, reason))
+                }
+            }
+            core.drop(context)
+            observed := Event { kind: EventKind.Head, request_id: self.request_id, bytes: 0, status: 0 }
+            observer.event(&observed)
+        }
+        if event.kind == http.EventKind.Complete {
+            match handler.complete(driver) {
+                ok() => {}
+                err(_) => {
+                    driver.poison()
+                    return err(web.Error.Handler)
+                }
+            }
+            observed := Event { kind: EventKind.Complete, request_id: self.request_id, bytes: 0, status: 0 }
+            observer.event(&observed)
+            return ok(Step.RequestComplete)
+        }
+        if event.kind == http.EventKind.Upgrade {
+            return ok(Step.Upgrade)
+        }
+        return ok(Step.Progress)
+    }
+}

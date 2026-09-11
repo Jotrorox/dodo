@@ -256,7 +256,7 @@ impl Loader<'_> {
             || parts[0] != "std"
             || !matches!(
                 parts[1],
-                "platform" | "fs" | "process" | "env" | "thread" | "sync"
+                "platform" | "fs" | "process" | "env" | "thread" | "sync" | "net" | "tls" | "web"
             )
             || !matches!(parts[2], "native" | "linux" | "windows")
         {

@@ -1,0 +1,305 @@
+package tls_checks
+import "std/tls"
+import "std/tls/openssl"
+import "std/tls/stream"
+import "std/io"
+
+const CA: &[u8] = b"@@CA@@"
+const CERT: &[u8] = b"@@CERT@@"
+const KEY: &[u8] = b"@@KEY@@"
+const NOW: i64 = 0
+
+fn pump(source: &mut openssl.Engine, destination: &mut openssl.Engine, fragment: usize) -> void!tls.Error {
+    buffer := [0u8; 32768]
+    count := source.drain(&mut buffer[..fragment])?
+    used := 0usize
+    for used < count {
+        actual := destination.feed(&buffer[used..count])?
+        if actual == 0 {
+            return err(tls.failure(tls.ErrorKind.LimitExceeded, 101))
+        }
+        used += actual
+    }
+    return ok()
+}
+fn negotiate(client: &mut openssl.Engine, server: &mut openssl.Engine, fragment: usize) -> void!tls.Error {
+    client_ready := false
+    server_ready := false
+    for i in 0usize..20000 {
+        if!client_ready {
+            value := client.handshake()?
+            client_ready = value == tls.State.Ready
+        }
+        pump(client, server, fragment)?
+        if!server_ready {
+            value := server.handshake()?
+            server_ready = value == tls.State.Ready
+        }
+        pump(server, client, fragment)?
+        if client_ready && server_ready {
+            return ok()
+        }
+    }
+    return err(tls.failure(tls.ErrorKind.TimedOut, 102))
+}
+fn verified(fragment: usize, mutual: bool) -> void!tls.Error {
+    client_config := openssl.Config.client(b"localhost")
+    client_config.system_roots = false
+    client_config.trust_pem = CA
+    client_config.verification_time = NOW
+    client_config.alpn = b"\x08http/1.1"
+    if mutual {
+        client_config.certificate_pem = CERT
+        client_config.private_key_pem = KEY
+    }
+    server_config := openssl.Config.server(CERT, KEY)
+    server_config.alpn = b"\x08http/1.1"
+    server_config.require_client_certificate = mutual
+    server_config.trust_pem = CA
+    server_config.verification_time = NOW
+    client := openssl.Engine.client(&client_config)?
+    server := openssl.Engine.server(&server_config)?
+    negotiate(&mut client, &mut server, fragment)?
+    selected := [0u8; 8]
+    if client.selected_alpn(&mut selected[..])? != 8 || selected[0] != 104 {
+        return err(tls.failure(tls.ErrorKind.Protocol, 103))
+    }
+    // Force bounded record backpressure. The caller mutates source immediately
+    // after every accepted write; all retries must use private owned bytes.
+    outgoing := [65u8; 16384]
+    accepted := 0usize
+    exhausted := false
+    for i in 0usize..12 {
+        for j in 0usize..outgoing.len {
+            outgoing[j] = 65
+        }
+        progress := client.write_plain(&outgoing[..])?
+        accepted += progress.transferred
+        for j in 0usize..outgoing.len {
+            outgoing[j] = 90
+        }
+        if progress.transferred == 0 {
+            exhausted = true;
+            break
+        }
+    }
+    if!exhausted {
+        return err(tls.failure(tls.ErrorKind.Protocol, 104))
+    }
+    incoming := [0u8; 257]
+    received := 0usize
+    for i in 0usize..30000 {
+        pump(&mut client, &mut server, 113)?
+        client.flush()?
+        progress := server.read_plain(&mut incoming[..])?
+        for j in 0usize..progress.transferred {
+            if incoming[j] != 65 {
+                return err(tls.failure(tls.ErrorKind.Protocol, 105))
+            }
+        }
+        received += progress.transferred
+        if received == accepted {
+            break
+        }
+    }
+    if received != accepted {
+        return err(tls.failure(tls.ErrorKind.Protocol, 106))
+    }
+    closed := false
+    for i in 0usize..1000 {
+        client.shutdown()?
+        pump(&mut client, &mut server, 19)?
+        server.shutdown()?
+        pump(&mut server, &mut client, 19)?
+        value := client.shutdown()?
+        if value == tls.State.Closed {
+            closed = true;
+            break
+        }
+    }
+    if!closed {
+        return err(tls.failure(tls.ErrorKind.Protocol, 107))
+    }
+    progress := client.read_plain(&mut incoming[..])?
+    if progress.state != tls.State.Closed {
+        return err(tls.failure(tls.ErrorKind.Protocol, 108))
+    }
+    client.abort()
+    client.abort()
+    match client.handshake() {
+        ok(_) => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 109))
+        }
+        err(reason) => {
+            if reason.kind != tls.ErrorKind.Closed {
+                return err(reason)
+            }
+        }
+    }
+    return ok()
+}
+fn rejected(hostname: &[u8], trusted: bool, expired: bool) -> void!tls.Error {
+    config := openssl.Config.client(hostname)
+    config.system_roots = false
+    config.verification_time = NOW
+    if trusted {
+        config.trust_pem = CA
+    }
+    if expired {
+        config.verification_time = NOW + 259200
+    }
+    server_config := openssl.Config.server(CERT, KEY)
+    client := openssl.Engine.client(&config)?
+    server := openssl.Engine.server(&server_config)?
+    match negotiate(&mut client, &mut server, 67) {
+        ok() => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 110))
+        }
+        err(reason) => {
+            if reason.kind != tls.ErrorKind.VerificationFailed {
+                return err(reason)
+            }
+        }
+    }
+    // A failed verification permanently poisons this session.
+    match client.handshake() {
+        ok(_) => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 111))
+        }
+        err(reason) => {
+            if reason.kind != tls.ErrorKind.VerificationFailed {
+                return err(reason)
+            }
+        }
+    }
+    return ok()
+}
+fn rejected_policy(mutual: bool) -> void!tls.Error {
+    config := openssl.Config.client(b"localhost")
+    config.system_roots = false
+    config.trust_pem = CA
+    config.verification_time = NOW
+    config.alpn = b"\x08http/1.1"
+    server_config := openssl.Config.server(CERT, KEY)
+    server_config.trust_pem = CA
+    server_config.verification_time = NOW
+    server_config.require_client_certificate = mutual
+    if!mutual {
+        server_config.alpn = b"\x02h2"
+    }
+    client := openssl.Engine.client(&config)?
+    server := openssl.Engine.server(&server_config)?
+    match negotiate(&mut client, &mut server, 71) {
+        ok() => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 116))
+        }
+        err(reason) => {
+            if reason.kind != tls.ErrorKind.Protocol && reason.kind != tls.ErrorKind.VerificationFailed {
+                return err(reason)
+            }
+        }
+    }
+    return ok()
+}
+fn truncation() -> void!tls.Error {
+    config := openssl.Config.client(b"localhost")
+    config.system_roots = false
+    config.trust_pem = CA
+    config.verification_time = NOW
+    server_config := openssl.Config.server(CERT, KEY)
+    client := openssl.Engine.client(&config)?
+    server := openssl.Engine.server(&server_config)?
+    negotiate(&mut client, &mut server, 256)?
+    client.eof()
+    buffer := [0u8; 16]
+    match client.read_plain(&mut buffer[..]) {
+        ok(_) => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 112))
+        }
+        err(reason) => {
+            if reason.kind != tls.ErrorKind.Truncated {
+                return err(reason)
+            }
+        }
+    }
+    return ok()
+}
+pub struct Idle {
+    pub fn poll_read(&mut self, bytes: &mut[u8]) -> io.Poll!io.Error {
+        return ok(io.Poll { transferred: 0, state: io.PollState.Pending })
+    }
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        return ok(io.Poll { transferred: 0, state: io.PollState.Pending })
+    }
+}
+fn cancellation() -> void!tls.Error {
+    config := openssl.Config.client(b"localhost")
+    config.system_roots = false
+    engine := openssl.Engine.client(&config)?
+    idle := Idle {}
+    input := [0u8; 64]
+    output := [0u8; 64]
+    connection := stream.Stream.new(engine, &mut idle, &mut input[..], &mut output[..])?
+    match connection.handshake_until(1, 100, true) {
+        ok(_) => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 113))
+        }
+        err(reason) => {
+            if reason.kind != tls.ErrorKind.Cancelled {
+                return err(reason)
+            }
+        }
+    }
+    engine2 := openssl.Engine.client(&config)?
+    idle2 := Idle {}
+    input2 := [0u8; 64]
+    output2 := [0u8; 64]
+    deadline := stream.Stream.new(engine2, &mut idle2, &mut input2[..], &mut output2[..])?
+    match deadline.handshake_until(100, 100, false) {
+        ok(_) => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 114))
+        }
+        err(reason) => {
+            if reason.kind != tls.ErrorKind.TimedOut {
+                return err(reason)
+            }
+        }
+    }
+    return ok()
+}
+fn run() -> void!tls.Error {
+    verified(1, false)?
+    verified(73, true)?
+    rejected(b"wrong.example", true, false)?
+    rejected(b"localhost", false, false)?
+    rejected(b"localhost", true, true)?
+    rejected_policy(true)?
+    rejected_policy(false)?
+    truncation()?
+    cancellation()?
+    config := openssl.Config.client(b"")
+    match openssl.Engine.client(&config) {
+        ok(_) => {
+            return err(tls.failure(tls.ErrorKind.Protocol, 115))
+        }
+        err(reason) => {
+            if reason.kind != tls.ErrorKind.InvalidInput {
+                return err(reason)
+            }
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }
+        err(reason) => {
+            if reason.code >= 101 && reason.code <= 116 {
+                return reason.code
+            };
+            return 99
+        }
+    }
+}

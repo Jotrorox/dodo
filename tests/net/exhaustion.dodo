@@ -1,0 +1,39 @@
+package exhaustion
+import "std/net"
+import "std/net/native"
+fn recurse(address: &net.SocketAddress, depth: usize) -> usize!net.Error {
+    match native.UdpSocket.bind(address) {
+        ok(socket) => {
+            if depth == 200 {
+                return ok(0)
+            }
+            return recurse(address, depth + 1)
+        }
+        err(reason) => {
+            if reason.kind == net.ErrorKind.Exhausted {
+                return ok(depth)
+            }
+            return err(reason)
+        }
+    }
+}
+fn run() -> i32!net.Error {
+    address := net.parse_socket(b"127.0.0.1:0")?
+    count := recurse(&address, 0)?
+    if count == 0 {
+        return ok(1)
+    }
+    // Every previously allocated descriptor was released during unwinding.
+    socket := native.UdpSocket.bind(&address)?
+    return ok(0)
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}
