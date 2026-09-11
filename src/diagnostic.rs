@@ -1,6 +1,21 @@
 use crate::ast::Span;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+impl Severity {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LabelStyle {
     Primary,
     Secondary,
@@ -17,18 +32,27 @@ pub struct DiagnosticLabel {
 
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
+    pub severity: Severity,
     pub span: Span,
-    pub message: String,
+    // A boxed message keeps recursive parser results compact alongside metadata.
+    pub message: Box<str>,
     pub notes: Vec<String>,
     pub labels: Vec<DiagnosticLabel>,
 }
 impl Diagnostic {
     pub fn new(span: Span, message: impl Into<String>) -> Self {
         Self {
+            severity: Severity::Error,
             span,
-            message: message.into(),
+            message: message.into().into_boxed_str(),
             notes: vec![],
             labels: vec![],
+        }
+    }
+    pub fn warning(span: Span, message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::new(span, message)
         }
     }
     pub fn note(mut self, note: impl Into<String>) -> Self {
@@ -62,7 +86,7 @@ impl Diagnostic {
     /// Resolve every label independently so imported declarations keep their
     /// own paths and local line numbers. Sources are (path, text, byte offset).
     pub(crate) fn render_with_sources(&self, sources: &[(&str, &str, usize)]) -> String {
-        let mut result = format!("error: {}\n", self.message);
+        let mut result = format!("{}: {}\n", self.severity.label(), self.message);
         let mut labels: Vec<_> = self.labels.iter().collect();
         let primary = DiagnosticLabel {
             span: self.span,
@@ -309,5 +333,33 @@ mod tests {
             .primary_label("new");
         assert_eq!(diagnostic.labels.len(), 1);
         assert_eq!(diagnostic.labels[0].message, "new");
+    }
+
+    #[test]
+    fn warning_severity_is_preserved_with_source_labels() {
+        let source = "value\nborrow\n";
+        let diagnostic = Diagnostic::warning(span(source, "borrow"), "warning example")
+            .primary_label("primary warning location")
+            .label(span(source, "value"), "related location")
+            .note("warning explanation");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        let rendered = diagnostic.render("warning.dodo", source);
+        assert!(
+            rendered.starts_with("warning: warning example\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("----- related location"), "{rendered}");
+        assert!(
+            rendered.contains("^^^^^^ primary warning location"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.ends_with("  = note: warning explanation\n"),
+            "{rendered}"
+        );
+        assert_eq!(
+            Diagnostic::new(Span::default(), "error").severity,
+            Severity::Error
+        );
     }
 }

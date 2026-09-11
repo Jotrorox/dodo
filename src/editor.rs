@@ -5,10 +5,10 @@
 use crate::ast::*;
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Token, TokenKind};
-use crate::{package, parser, sema};
+use crate::{parser, sema};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -22,8 +22,7 @@ pub struct Document {
     text: String,
     start: usize,
     entries: Vec<HoverEntry>,
-    diagnostic: Option<Diagnostic>,
-    sources: Vec<package::Source>,
+    pub(crate) diagnostic: Option<Diagnostic>,
 }
 
 impl Document {
@@ -33,24 +32,25 @@ impl Document {
     }
 
     fn standalone(text: String) -> Self {
-        let (program, diagnostic) = match parser::parse(&text) {
+        let (mut program, diagnostic) = match parser::parse(&text) {
             Ok(program) => (program, None),
             Err(error) => (Program::default(), Some(error)),
         };
-        Self::analyze(text, 0, program, vec![], diagnostic)
+        let diagnostic =
+            diagnostic.or_else(|| sema::check_for_target(&mut program, usize::BITS).err());
+        Self::from_checked(text, 0, &program, diagnostic)
     }
 
-    fn analyze(
+    /// Build a hover index from the same checked AST used to publish diagnostics.
+    pub(crate) fn from_checked(
         text: String,
         start: usize,
-        mut program: Program,
-        sources: Vec<package::Source>,
+        program: &Program,
         diagnostic: Option<Diagnostic>,
     ) -> Self {
-        let diagnostic = diagnostic.or_else(|| sema::check(&mut program).err());
         let tokens = lexer::lex(&text).unwrap_or_default();
         let mut index = HoverIndex {
-            program: &program,
+            program,
             tokens: &tokens,
             start,
             entries: vec![],
@@ -61,38 +61,7 @@ impl Document {
             start,
             entries: index.entries,
             diagnostic,
-            sources,
         }
-    }
-
-    fn load(uri: &str, text: String, overrides: &BTreeMap<PathBuf, String>) -> Self {
-        if let Some(path) = file_path(uri).and_then(|p| p.canonicalize().ok()) {
-            match package::load_with_overrides(&path, overrides) {
-                Ok(loaded) => {
-                    if let Some(source) = loaded.sources.iter().find(|s| s.path == path) {
-                        return Self::analyze(
-                            text,
-                            source.start,
-                            loaded.program,
-                            loaded.sources,
-                            None,
-                        );
-                    }
-                }
-                Err(error) => {
-                    let mut document = Self::standalone(text);
-                    // A syntax error in this buffer has a better range than the loader's text.
-                    if parser::parse(&document.text).is_ok() {
-                        document.diagnostic = Some(
-                            Diagnostic::new(Span::default(), "could not load document package")
-                                .note(error),
-                        );
-                    }
-                    return document;
-                }
-            }
-        }
-        Self::standalone(text)
     }
 
     /// Return an LSP Markdown hover and range for a zero-based UTF-16 position.
@@ -107,46 +76,6 @@ impl Document {
             "contents": {"kind": "markdown", "value": entry.markdown},
             "range": range(&self.text, local_span(entry.span, self.start))
         }))
-    }
-
-    fn location(&self, span: Span, uri: &str) -> Value {
-        if let Some(source) = self.sources.iter().find(|source| {
-            source.start <= span.start && span.start <= source.start + source.text.len()
-        }) {
-            json!({"uri": file_uri(&source.path), "range": range(&source.text, local_span(span, source.start))})
-        } else {
-            json!({"uri": uri, "range": range(&self.text, local_span(span, self.start))})
-        }
-    }
-
-    fn diagnostics(&self, uri: &str) -> Vec<Value> {
-        let Some(diagnostic) = &self.diagnostic else {
-            return vec![];
-        };
-        let mut related: Vec<_> = diagnostic.labels.iter().map(|label| {
-            json!({"location": self.location(label.span, uri), "message": label.message})
-        }).collect();
-        let primary = self.location(diagnostic.span, uri);
-        let local = diagnostic.span.start >= self.start
-            && diagnostic.span.start <= self.start + self.text.len();
-        if !local {
-            related.insert(
-                0,
-                json!({"location": primary, "message": diagnostic.message}),
-            );
-        }
-        let mut message = diagnostic.message.clone();
-        for note in &diagnostic.notes {
-            message.push('\n');
-            message.push_str(note);
-        }
-        vec![json!({
-            "range": if local { primary["range"].clone() } else { range(&self.text, Span::default()) },
-            "severity": 1,
-            "source": "dodo",
-            "message": message,
-            "relatedInformation": related
-        })]
     }
 }
 
@@ -552,252 +481,29 @@ fn range(text: &str, span: Span) -> Value {
     json!({"start": position(text, span.start), "end": position(text, span.end.max(span.start))})
 }
 
+#[cfg(test)]
 fn file_path(uri: &str) -> Option<PathBuf> {
-    let raw = uri.strip_prefix("file://")?;
-    let raw = if raw.starts_with("localhost/") {
-        &raw["localhost".len()..]
-    } else {
-        raw
-    };
-    if !raw.starts_with('/') || raw.contains(['?', '#']) {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    let mut cursor = 0;
-    while cursor < raw.len() {
-        if raw.as_bytes()[cursor] == b'%' {
-            let hex = raw.get(cursor + 1..cursor + 3)?;
-            bytes.push(u8::from_str_radix(hex, 16).ok()?);
-            cursor += 3;
-        } else {
-            bytes.push(raw.as_bytes()[cursor]);
-            cursor += 1;
-        }
-    }
-    let decoded = String::from_utf8(bytes).ok()?;
-    #[cfg(windows)]
-    let decoded = decoded.strip_prefix('/').unwrap_or(&decoded).to_owned();
-    Some(PathBuf::from(decoded))
+    crate::lsp::uri_path(&uri.parse().ok()?).ok()
 }
 
+#[cfg(test)]
 fn file_uri(path: &Path) -> String {
-    let mut uri = String::from("file://");
-    #[cfg(windows)]
-    uri.push('/');
-    for byte in path.to_string_lossy().replace('\\', "/").bytes() {
-        if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
-            uri.push(byte as char);
-        } else {
-            use std::fmt::Write;
-            let _ = write!(uri, "%{byte:02X}");
-        }
-    }
-    uri
-}
-
-struct OpenDocument {
-    text: String,
-    version: i64,
-    analysis: Document,
-}
-
-fn publish(
-    writer: &mut impl Write,
-    uri: &str,
-    version: Option<i64>,
-    diagnostics: Vec<Value>,
-) -> io::Result<()> {
-    let mut params = json!({"uri": uri, "diagnostics": diagnostics});
-    if let Some(version) = version {
-        params["version"] = json!(version);
-    }
-    write_message(
-        writer,
-        &json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
-    )
-}
-
-fn refresh(
-    documents: &mut BTreeMap<String, OpenDocument>,
-    writer: &mut impl Write,
-) -> io::Result<()> {
-    let overrides = documents
-        .iter()
-        .filter_map(|(uri, doc)| Some((file_path(uri)?.canonicalize().ok()?, doc.text.clone())))
-        .collect();
-    for (uri, document) in documents {
-        document.analysis = Document::load(uri, document.text.clone(), &overrides);
-        publish(
-            writer,
-            uri,
-            Some(document.version),
-            document.analysis.diagnostics(uri),
-        )?;
-    }
-    Ok(())
+    url::Url::from_file_path(path).unwrap().into()
 }
 
 /// Serve LSP JSON-RPC over framed streams. Returns the process exit status.
-/// Only full-document changes are advertised and accepted.
+/// The shared server supports full-document synchronization and package checking.
 pub fn serve(mut reader: impl BufRead, mut writer: impl Write) -> io::Result<i32> {
-    let mut documents = BTreeMap::<String, OpenDocument>::new();
-    let mut initialized = false;
-    let mut shutdown = false;
-    while let Some(body) = read_message(&mut reader)? {
-        let message: Value = match serde_json::from_slice(&body) {
-            Ok(message) => message,
-            Err(_) => {
-                error(&mut writer, Value::Null, -32700, "Parse error")?;
-                continue;
-            }
-        };
-        if !message.is_object() || message["jsonrpc"] != "2.0" {
-            error(&mut writer, Value::Null, -32600, "Invalid Request")?;
-            continue;
-        }
-        let id = message.get("id").cloned();
-        let Some(method) = message.get("method").and_then(Value::as_str) else {
-            if message.get("result").is_none() && message.get("error").is_none() {
-                error(
-                    &mut writer,
-                    id.unwrap_or(Value::Null),
-                    -32600,
-                    "Invalid Request",
-                )?;
-            }
-            continue;
-        };
-        if method == "exit" {
-            return Ok(if shutdown { 0 } else { 1 });
-        }
-        if shutdown {
-            if let Some(id) = id {
-                error(&mut writer, id, -32600, "Server has shut down")?;
-            }
-            continue;
-        }
-        let params = &message["params"];
-        if method == "initialize" {
-            if let Some(id) = id {
-                if initialized {
-                    error(&mut writer, id, -32600, "Server is already initialized")?;
-                } else {
-                    initialized = true;
-                    reply(
-                        &mut writer,
-                        id,
-                        json!({"capabilities": {"positionEncoding": "utf-16", "textDocumentSync": {"openClose": true, "change": 1}, "hoverProvider": true}, "serverInfo": {"name": "dodo", "version": env!("CARGO_PKG_VERSION")}}),
-                    )?;
-                }
-            }
-            continue;
-        }
-        if !initialized {
-            if let Some(id) = id {
-                error(&mut writer, id, -32002, "Server not initialized")?;
-            }
-            continue;
-        }
-        match method {
-            "shutdown" => {
-                if let Some(id) = id {
-                    shutdown = true;
-                    reply(&mut writer, id, Value::Null)?;
-                }
-            }
-            "textDocument/didOpen" => {
-                let doc = &params["textDocument"];
-                if let (Some(uri), Some(text), Some(version)) = (
-                    doc["uri"].as_str(),
-                    doc["text"].as_str(),
-                    doc["version"].as_i64(),
-                ) {
-                    documents.insert(
-                        uri.into(),
-                        OpenDocument {
-                            text: text.into(),
-                            version,
-                            analysis: Document::new(String::new()),
-                        },
-                    );
-                    refresh(&mut documents, &mut writer)?;
-                }
-            }
-            "textDocument/didChange" => {
-                if let (Some(uri), Some(version), Some(changes)) = (
-                    params["textDocument"]["uri"].as_str(),
-                    params["textDocument"]["version"].as_i64(),
-                    params["contentChanges"].as_array(),
-                ) && let Some(document) = documents.get_mut(uri)
-                    && version > document.version
-                    && changes
-                        .iter()
-                        .all(|change| change.get("range").is_none() && change["text"].is_string())
-                    && let Some(text) = changes.last().and_then(|change| change["text"].as_str())
-                {
-                    document.text = text.into();
-                    document.version = version;
-                    refresh(&mut documents, &mut writer)?;
-                }
-            }
-            "textDocument/didClose" => {
-                if let Some(uri) = params["textDocument"]["uri"].as_str() {
-                    documents.remove(uri);
-                    publish(&mut writer, uri, None, vec![])?;
-                    refresh(&mut documents, &mut writer)?;
-                }
-            }
-            "textDocument/hover" => {
-                if let Some(id) = id {
-                    let request = params["textDocument"]["uri"]
-                        .as_str()
-                        .zip(params["position"]["line"].as_u64())
-                        .zip(params["position"]["character"].as_u64());
-                    if let Some(((uri, line), character)) =
-                        request.filter(|((_, line), character)| {
-                            *line <= u32::MAX as u64 && *character <= u32::MAX as u64
-                        })
-                    {
-                        let hover = documents
-                            .get(uri)
-                            .and_then(|doc| doc.analysis.hover(line as u32, character as u32))
-                            .unwrap_or(Value::Null);
-                        reply(&mut writer, id, hover)?;
-                    } else {
-                        error(&mut writer, id, -32602, "Invalid hover parameters")?;
-                    }
-                }
-            }
-            "initialized" | "$/cancelRequest" | "$/setTrace" => {}
-            _ => {
-                if let Some(id) = id {
-                    error(&mut writer, id, -32601, "Method not found")?;
-                }
-            }
-        }
-    }
-    Ok(if shutdown { 0 } else { 1 })
+    crate::lsp::run(&mut reader, &mut writer)
 }
 
-fn reply(writer: &mut impl Write, id: Value, result: Value) -> io::Result<()> {
-    write_message(
-        writer,
-        &json!({"jsonrpc": "2.0", "id": id, "result": result}),
-    )
-}
-fn error(writer: &mut impl Write, id: Value, code: i32, message: &str) -> io::Result<()> {
-    write_message(
-        writer,
-        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
-    )
-}
-fn write_message(writer: &mut impl Write, message: &Value) -> io::Result<()> {
+pub(crate) fn write_message(writer: &mut impl Write, message: &Value) -> io::Result<()> {
     let body = serde_json::to_vec(message)?;
     write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
     writer.write_all(&body)?;
     writer.flush()
 }
-fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut length = None;
     let mut headers = 0;
     loop {

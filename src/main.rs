@@ -1,5 +1,5 @@
 //! Command-line driver. Linking is an explicit process invocation, never a shell command.
-use dodoc::{codegen, package, sema};
+use dodoc::{codegen, lsp, package, sema};
 use inkwell::context::Context;
 use inkwell::targets::FileType;
 use std::ffi::OsString;
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const HELP: &str = "Dodo 0.1.0 — ahead-of-time systems language compiler\n\nUsage: dodo <COMMAND> <FILE|DIRECTORY> [OPTIONS]\n       dodo lsp\n\nCommands:\n  check    Parse and check types, ownership, and borrowing\n  build    Compile a native executable or compiler artifact\n  run      Compile and run a program; arguments follow --\n  lsp      Run the language server over standard input/output\n  fmt      Format and migrate syntax (default input: current directory)\n\nFormatting options:\n      --check            Report unformatted files without writing\n      --stdout           Print one formatted file without writing\n  Use - as the fmt input to read stdin and write stdout.\n\nCompiler options:\n  -o, --output PATH       Output path (default: build/<source name>)\n      --emit KIND         exe (default), obj, asm, llvm-ir, bitcode\n  -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)\n      --target TRIPLE     LLVM target triple (default: host)\n      --cpu NAME          Target CPU (default: generic)\n      --features LIST     LLVM target features, e.g. +sse4.2\n      --linker PATH       C linker driver (default: DODO_CC or cc)\n      --link-arg ARG      Pass an argument to the linker; repeatable\n  -h, --help             Print help\n  -V, --version          Print compiler version\n\nExamples:\n  dodo fmt examples\n  dodo fmt --check examples\n  dodo check examples/hello.dodo\n  dodo run examples/samples.dodo -O 2\n  dodo build examples/hello.dodo -o build/hello\n  dodo build examples/gpio.dodo --emit llvm-ir -o build/gpio.ll\n\nLLVM 22 is embedded; no LLVM installation is needed to use this compiler.\nLinking executables requires a C toolchain (cc, --linker, or DODO_CC).\n";
+const HELP: &str = "Dodo 0.1.0 — ahead-of-time systems language compiler\n\nUsage: dodo <COMMAND> <FILE|DIRECTORY> [OPTIONS]\n       dodo lsp\n\nCommands:\n  check    Parse and check types, ownership, and borrowing\n  build    Compile a native executable or compiler artifact\n  run      Compile and run a program; arguments follow --\n  lsp      Run the language server over standard input/output (alias: --lsp)\n  fmt      Format and migrate syntax (default input: current directory)\n\nFormatting options:\n      --check            Report unformatted files without writing\n      --stdout           Print one formatted file without writing\n  Use - as the fmt input to read stdin and write stdout.\n\nCompiler options:\n  -o, --output PATH       Output path (default: build/<source name>)\n      --emit KIND         exe (default), obj, asm, llvm-ir, bitcode\n  -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)\n      --target TRIPLE     LLVM target triple (default: host)\n      --cpu NAME          Target CPU (default: generic)\n      --features LIST     LLVM target features, e.g. +sse4.2\n      --linker PATH       C linker driver (default: DODO_CC or cc)\n      --link-arg ARG      Pass an argument to the linker; repeatable\n  -h, --help             Print help\n  -V, --version          Print compiler version\n\nExamples:\n  dodo fmt examples\n  dodo fmt --check examples\n  dodo check examples/hello.dodo\n  dodo run examples/samples.dodo -O 2\n  dodo build examples/hello.dodo -o build/hello\n  dodo build examples/gpio.dodo --emit llvm-ir -o build/gpio.ll\n\nLLVM 22 is embedded; no LLVM installation is needed to use this compiler.\nLinking executables requires a C toolchain (cc, --linker, or DODO_CC).\n";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     Check,
@@ -90,11 +90,11 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
     let action = match command.to_str() {
         Some("-h" | "--help" | "help") => return Ok(Parsed::Help),
         Some("-V" | "--version") => return Ok(Parsed::Version),
-        Some("lsp") => {
-            return match args.next() {
+        Some("--lsp" | "lsp") => {
+            return match args.next().as_deref() {
                 None => Ok(Parsed::Lsp),
                 Some(arg) if arg == "--help" || arg == "-h" => Ok(Parsed::Help),
-                Some(_) => Err("lsp uses standard input/output and accepts no arguments".into()),
+                Some(_) => Err("LSP mode takes no source path or compiler options".into()),
             };
         }
         Some("fmt") => return parse_format(args),
@@ -510,8 +510,8 @@ fn main() -> ExitCode {
             Ok(0)
         }
         Ok(Parsed::Args(args)) => execute(*args),
-        Ok(Parsed::Lsp) => dodoc::editor::serve(std::io::stdin().lock(), std::io::stdout().lock())
-            .map_err(|error| format!("language server: {error}")),
+        Ok(Parsed::Lsp) => lsp::run(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
+            .map_err(|error| format!("LSP transport failed: {error}")),
         Ok(Parsed::Format(args)) => execute_format(args),
         Err(e) => Err(e),
     };
@@ -565,5 +565,15 @@ mod tests {
     fn help_and_version() {
         assert!(matches!(args(&[]), Ok(Parsed::Help)));
         assert!(matches!(args(&["--version"]), Ok(Parsed::Version)));
+    }
+
+    #[test]
+    fn lsp_does_not_require_a_source_or_accept_build_options() {
+        for command in ["--lsp", "lsp"] {
+            assert!(matches!(args(&[command]), Ok(Parsed::Lsp)));
+            assert!(matches!(args(&[command, "--help"]), Ok(Parsed::Help)));
+            assert!(args(&[command, "input.dodo"]).is_err());
+            assert!(args(&[command, "-O2"]).is_err());
+        }
     }
 }

@@ -6,6 +6,7 @@ pub mod diagnostic;
 pub mod editor;
 pub mod format;
 pub mod lexer;
+pub mod lsp;
 pub mod package;
 pub mod parser;
 pub mod sema;

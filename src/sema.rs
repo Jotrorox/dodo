@@ -3201,7 +3201,14 @@ impl<'a> Checker<'a> {
         span: Span,
     ) -> Check<()> {
         let mut paths = HashMap::new();
-        if matches!(value.ty, Type::Ref(..)) {
+        // Borrow-carrying aggregates also track loans rooted in their stored
+        // references' sources. Those roots do not share the aggregate's field
+        // paths: projecting Outer.inner.n onto an Inner loan would incorrectly
+        // make a live borrow appear disjoint from Inner.n. Keep these complete
+        // dependencies until projections can distinguish each loan's source.
+        if matches!(value.ty, Type::Ref(..))
+            && !self.context.carries_borrow(dereferenced(&value.ty))
+        {
             pattern_binding_paths(pattern, &[], &mut paths);
         }
         for (name, ty) in bindings {
@@ -6206,6 +6213,41 @@ mod tests {
         rejects(
             "struct Pair { i32 left; i32 right }\nfn f() -> void { pair := Pair{left: 0, right: 0}; let Pair{left, right} = &mut pair; pair.left = 3; *left = 1; *right = 2 }",
             "borrow",
+        );
+    }
+    #[test]
+    fn borrowed_patterns_preserve_sources_of_stored_references() {
+        for reference in ["&", "&mut "] {
+            for (pattern, usage) in [
+                ("Outer{inner: Inner{left, ..}}", "*left"),
+                ("Outer{inner}", "inner.left"),
+            ] {
+                let subject = format!("{reference}outer");
+                let declarations = format!(
+                    "struct Inner {{ i32 left; i32 right }}\nstruct Outer {{ {reference}Inner inner }}\n"
+                );
+                let setup = format!(
+                    "value := Inner{{left: 1, right: 2}}; outer := Outer{{inner: {reference}value}};"
+                );
+                for statement in [
+                    format!("let {pattern} = {subject}; value.left = 3; {usage}"),
+                    format!(
+                        "if let {pattern} = {subject} {{ value.left = 3; {usage} }} else {{ 0 }}"
+                    ),
+                    format!("match {subject} {{ {pattern} => {{ value.left = 3; {usage} }} }}"),
+                ] {
+                    rejects(
+                        &format!("{declarations}fn f() -> i32 {{ {setup} {statement} }}"),
+                        "live",
+                    );
+                }
+                accepts(&format!(
+                    "{declarations}fn f() -> i32 {{ {setup} let {pattern} = {subject}; {usage} }}"
+                ));
+            }
+        }
+        accepts(
+            "struct Inner { i32 left; i32 right }\nstruct Outer { Inner inner }\nfn f() -> i32 { outer := Outer{inner: Inner{left: 1, right: 2}}; let Outer{inner: Inner{left, right}} = &mut outer; *left = 3; *right = 4; *left + *right }",
         );
     }
     #[test]

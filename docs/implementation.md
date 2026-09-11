@@ -161,6 +161,9 @@ destruction extend liveness conservatively, so some valid programs may be
 rejected. Borrowed returns are checked against inferred or explicit `from(...)`
 sources; contracts do not extend the lifetime of local storage. Self-referential
 owning values and independently varying borrowed-field lifetimes are unsupported.
+Destructuring a borrowed aggregate that contains references conservatively keeps
+all of its source dependencies; purely owned nested struct fields retain separate
+field loans.
 
 Ownership errors retain source spans for the conflicting access, the originating
 borrow, and the use keeping it live. Moves retain their transfer location, and
@@ -168,8 +171,15 @@ borrowed-return errors label the declared contract and the returned source.
 The renderer resolves each label to its own file and shows labeled snippets.
 `dodo lsp` exposes inferred types, receiver ownership, and inferred or explicit
 borrowed-return sources through hover, and publishes errors with related source
-locations. See [diagnostics and editors](diagnostics-and-editors.md) for examples
-and the supported editor protocol.
+locations. `dodo --lsp` is an equivalent entry point. The server uses full-document
+synchronization for local `file:` URIs, UTF-16 positions, and host pointer width;
+open buffers supply unsaved files and imports. Open/change/save notifications
+refresh diagnostics. The default file mode includes local imports; setting
+`initializationOptions` to `{"checkMode": "package"}` checks each document's parent
+directory, including new unsaved `.dodo` siblings. Error and warning severities
+are represented, but no warning rules are currently emitted. See
+[diagnostics and editors](diagnostics-and-editors.md) for examples and the
+supported editor protocol.
 
 A `Result` must be forwarded, propagated, or matched with explicit `ok` and `err`
 arms. Binding it and leaving scope, overwriting it unhandled, assigning it to

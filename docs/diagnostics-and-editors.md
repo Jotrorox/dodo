@@ -59,7 +59,8 @@ dodo run examples/borrowing.dodo
 Configure an editor's Language Server Protocol client to start `dodo lsp` for
 `.dodo` files. The process speaks LSP over standard input/output; it takes no
 source filename. Set the server executable to `dodo`, its argument list to
-`["lsp"]`, and the language/filetype to `dodo` in the client's configuration.
+`["lsp"]` (or `["--lsp"]`), and the language/filetype to `dodo` in the client's
+configuration.
 
 Hover information includes:
 
@@ -75,16 +76,27 @@ details. Ownership errors appear as editor diagnostics; their related locations
 point to the same source expressions as the command-line labels.
 
 The server supports initialization, shutdown, full-document open/change/close
-synchronization, hover, and published diagnostics. Positions use zero-based LSP
-line numbers and UTF-16 columns. Saved files resolve local imports, using open
-buffers for unsaved edits to those files. Each document is treated as a file
-input with its imports; sibling package files are not automatically combined.
-Documents without a file on disk are analyzed on their own. Changes refresh the
-open documents, and closing a buffer restores its imported contents from disk.
-The server does not provide completion, rename, formatting, or a background file
-watcher.
-Syntax errors can prevent hover analysis; a semantic error can leave later
-expressions without inferred types.
+synchronization, save notifications, hover, and published diagnostics. It accepts
+local `file:` URIs and uses zero-based LSP line numbers, UTF-16 columns, and the
+host's pointer width. Open buffers supply unsaved source, including new files;
+local imports use those buffers when available. Changes recheck open documents,
+saves refresh diagnostics, and closing a buffer restores its imported contents
+from disk.
+
+Untitled buffers receive standalone analysis, including diagnostics and hovers.
+
+By default each document is checked as a file with its imports, like
+`dodo check <file>`. To combine sibling files as a directory package, set the
+client's `initializationOptions` to `{"checkMode": "package"}`. This checks the
+document's parent directory, including new unsaved `.dodo` siblings. All files in
+that directory package must declare the same package.
+
+Checks stop at the first compiler error per file or package. Error and warning
+severities are supported, although the compiler currently only produces errors.
+The server does not provide completion, rename, formatting, incremental analysis,
+a background file watcher, or checks of unopened workspace roots. Syntax errors
+can prevent hover analysis; a semantic error can leave later expressions without
+inferred types.
 
 Library consumers can inspect `Diagnostic.labels` directly instead of parsing
 terminal output. Spans are byte offsets into the source passed to the parser;
