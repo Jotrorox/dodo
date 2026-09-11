@@ -1,4 +1,8 @@
-# Dodo compiler 0.1.0: decisions and limits
+---
+title: "Dodo compiler 0.1.0: decisions and limits"
+description: "What Dodo 0.1.0 implements, compiler decisions, and the limits of this first release."
+order: 20
+---
 
 This document describes the implemented compiler. It supplements the cleaned
 [0.1 language design](language-spec-0.1.md), whose open questions remain open.
@@ -213,8 +217,8 @@ ignored nested Results are rejected. Borrowed patterns preserve shared/mutable
 permissions recursively, including separate loans for disjoint struct fields;
 owned patterns cannot destructure structs with custom `drop`.
 
-See [patterns.dodo](../examples/patterns.dodo) for conditional bindings and
-[hex.dodo](../examples/hex.dodo) for range matching with Result propagation.
+See [patterns.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/patterns.dodo) for conditional bindings and
+[hex.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/hex.dodo) for range matching with Result propagation.
 
 Generics are monomorphized. Function calls and struct literals infer omitted
 type arguments from arguments, fields, and expected result types. Examples are

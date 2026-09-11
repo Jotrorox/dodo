@@ -2003,7 +2003,7 @@ mod tests {
     }
     #[test]
     fn complete_worked_examples_from_the_specification_parse() {
-        let spec = include_str!("../docs/language-spec-0.1.md");
+        let spec = include_str!("../docs/src/content/docs/language-spec-0.1.md");
         let mut examples = 0;
         for block in spec.split("```dodo\n").skip(1) {
             let source = block.split("```").next().unwrap();

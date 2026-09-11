@@ -1,4 +1,8 @@
-# Ownership diagnostics and editor hovers
+---
+title: "Ownership diagnostics and editor hovers"
+description: "Understand ownership errors and configure editor diagnostics and hovers with dodo lsp."
+order: 40
+---
 
 `dodo check` shows the code responsible for ownership errors. A primary label
 uses `^` for the rejected operation; related labels use `-` to explain where the
@@ -45,7 +49,7 @@ describe the function's intended inputs. `from(static)` cannot make a reference
 to local storage survive its destruction.
 
 These three files are rejection examples: each command should fail. The working
-[borrowing example](../examples/borrowing.dodo) demonstrates shared, mutable, and
+[borrowing example](https://github.com/Jotrorox/dodo/blob/main/examples/borrowing.dodo) demonstrates shared, mutable, and
 consuming receivers, inferred and explicit return sources, and ending a borrow
 before mutation:
 
@@ -70,7 +74,7 @@ Hover information includes:
 - Borrowed-return sources such as `from(self)` or `from(a, b)`, including whether
   the contract was inferred or explicitly written.
 
-Open [borrowing.dodo](../examples/borrowing.dodo) and hover `view`, the method
+Open [borrowing.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/borrowing.dodo) and hover `view`, the method
 names `view`, `replace`, and `finish`, and the `choose` call to inspect these
 details. Ownership errors appear as editor diagnostics; their related locations
 point to the same source expressions as the command-line labels.

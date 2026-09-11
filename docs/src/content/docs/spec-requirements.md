@@ -1,4 +1,8 @@
-# Requirements for implementing Dodo 0.1
+---
+title: "Requirements for implementing Dodo 0.1"
+description: "A review and test-planning checklist for the Dodo 0.1 language design."
+order: 30
+---
 
 This is a review and test-planning checklist derived from the
 [language specification](language-spec-0.1.md). It does not describe completed

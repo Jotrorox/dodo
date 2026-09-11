@@ -1,4 +1,8 @@
-# The Dodo Programming Language
+---
+title: "The Dodo Programming Language"
+description: "The normative Dodo 0.1 language design, worked examples, and open specification items."
+order: 10
+---
 
 **Language specification 0.1**
 

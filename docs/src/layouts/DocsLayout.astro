@@ -1,0 +1,138 @@
+---
+import type { MarkdownHeading } from 'astro';
+import type { CollectionEntry } from 'astro:content';
+import { getDocs, pageUrl } from '../lib/docs';
+import '../styles/global.css';
+
+interface Props {
+  entry: CollectionEntry<'docs'>;
+  headings: MarkdownHeading[];
+}
+
+const { entry, headings } = Astro.props;
+const pages = await getDocs();
+const current = pages.findIndex((page) => page.id === entry.id);
+const previous = pages[current - 1];
+const next = pages[current + 1];
+const toc = headings.filter(({ depth }) => depth === 2 || depth === 3);
+const base = import.meta.env.BASE_URL;
+const repository = 'https://github.com/jotrorox/dodo';
+const canonical = new URL(pageUrl(entry.id), Astro.site);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={entry.data.description} />
+    <meta name="theme-color" content="#196b50" />
+    <title>{entry.id === 'index' ? 'Dodo documentation' : `${entry.data.title} · Dodo`}</title>
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/svg+xml" href={`${base}favicon.svg`} />
+    <script is:inline>
+      try {
+        const saved = localStorage.getItem('dodo-theme');
+        document.documentElement.dataset.theme = saved === 'light' || saved === 'dark'
+          ? saved : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      } catch {
+        document.documentElement.dataset.theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href={base} aria-label="Dodo documentation home">
+        <span class="brand-mark" aria-hidden="true">d</span>
+        <span>Dodo <span class="brand-docs">/ docs</span></span>
+        <span class="version">0.1</span>
+      </a>
+      <div class="header-actions">
+        <button class="search-trigger" type="button" data-search-open aria-label="Search documentation" aria-haspopup="dialog" aria-controls="search-dialog">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>
+          <span>Search docs</span><kbd data-search-key>Ctrl K</kbd>
+        </button>
+        <a class="repository-link" href={repository}>GitHub <span aria-hidden="true">↗</span></a>
+        <button class="icon-button theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle color theme">
+          <svg class="theme-sun" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></svg>
+          <svg class="theme-moon" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M20.5 14A9 9 0 0 1 10 3.5 9 9 0 1 0 20.5 14Z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="docs-shell">
+      <aside class="sidebar">
+        <details class="navigation" open>
+          <summary>Documentation <span aria-hidden="true">⌄</span></summary>
+          <nav aria-label="Documentation">
+            <p class="nav-label">Documentation</p>
+            <ul>
+              {pages.map((page) => (
+                <li><a href={pageUrl(page.id)} aria-current={entry.id === page.id ? 'page' : undefined}>{page.data.title}</a></li>
+              ))}
+            </ul>
+          </nav>
+        </details>
+        <div class="sidebar-bottom">
+          <span class="sidebar-caption">A small language.<br />Native by design.</span>
+          <button type="button" class="shortcut-trigger" data-shortcuts-open aria-haspopup="dialog" aria-controls="shortcuts-dialog"><kbd>?</kbd> Keyboard shortcuts</button>
+        </div>
+      </aside>
+
+      <main id="main-content" tabindex="-1">
+        <div class="page-heading">
+          <p class="eyebrow">Dodo documentation <span aria-hidden="true">/</span> v0.1</p>
+          <h1>{entry.data.title}</h1>
+          <p class="page-description">{entry.data.description}</p>
+        </div>
+        {toc.length > 0 && (
+          <details class="mobile-toc">
+            <summary>On this page</summary>
+            <ul>{toc.filter(({ depth }) => depth === 2).map((heading) => <li><a href={`#${heading.slug}`}>{heading.text}</a></li>)}</ul>
+          </details>
+        )}
+        <article class="prose"><slot /></article>
+        <footer class="page-footer">
+          <a class="edit-link" href={`${repository}/edit/main/docs/src/content/docs/${entry.id}.md`}>Edit this page on GitHub <span aria-hidden="true">↗</span></a>
+          <nav class="page-navigation" aria-label="Previous and next pages">
+            {previous ? <a href={pageUrl(previous.id)} rel="prev"><span>← Previous</span><strong>{previous.data.title}</strong></a> : <span />}
+            {next ? <a href={pageUrl(next.id)} rel="next"><span>Next →</span><strong>{next.data.title}</strong></a> : <span />}
+          </nav>
+          <p class="footer-caption">Dodo 0.1 · Open source under BSD-2-Clause</p>
+        </footer>
+      </main>
+
+      <aside class="toc" aria-label="On this page">
+        {toc.length > 0 && <nav><p class="nav-label">On this page</p><ul>{toc.map((heading) => <li class:list={{ nested: heading.depth === 3 }}><a href={`#${heading.slug}`}>{heading.text}</a></li>)}</ul></nav>}
+        <a class="back-to-top" href="#main-content">Back to top ↑</a>
+      </aside>
+    </div>
+
+    <dialog id="search-dialog" class="search-dialog" aria-label="Search documentation" data-search-index={`${base}search.json`}>
+      <div class="search-box">
+        <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>
+        <label class="sr-only" for="search-input">Search documentation</label>
+        <input id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="search-results" aria-describedby="search-status" />
+        <button class="dialog-close" type="button" data-close-dialog aria-label="Close search"><kbd>Esc</kbd></button>
+      </div>
+      <p id="search-status" class="search-status" role="status" aria-live="polite">Type to search all documentation.</p>
+      <ul id="search-results" class="search-results" role="listbox" aria-label="Search results"></ul>
+      <div class="search-footer"><span><kbd>↑</kbd> <kbd>↓</kbd> navigate</span><span><kbd>Enter</kbd> open</span><span><kbd>Esc</kbd> close</span></div>
+    </dialog>
+
+    <dialog id="shortcuts-dialog" class="shortcuts-dialog" aria-labelledby="shortcuts-title">
+      <div class="dialog-heading"><h2 id="shortcuts-title">Keyboard shortcuts</h2><button class="dialog-close" type="button" data-close-dialog aria-label="Close keyboard shortcuts"><kbd>Esc</kbd></button></div>
+      <dl class="shortcut-list">
+        <div><dt>Search documentation</dt><dd><kbd data-search-key>Ctrl K</kbd> <span>or</span> <kbd>/</kbd></dd></div>
+        <div><dt>Move through results</dt><dd><kbd>↑</kbd> <kbd>↓</kbd></dd></div>
+        <div><dt>Open selected result</dt><dd><kbd>Enter</kbd></dd></div>
+        <div><dt>Close a dialog</dt><dd><kbd>Esc</kbd></dd></div>
+        <div><dt>Show these shortcuts</dt><dd><kbd>?</kbd></dd></div>
+      </dl>
+    </dialog>
+    <script>
+      import '../scripts/docs';
+    </script>
+  </body>
+</html>

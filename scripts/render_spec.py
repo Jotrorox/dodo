@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import re
 import sys
@@ -19,11 +20,35 @@ import textwrap
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "docs" / "language-spec-0.1.md"
+SOURCE = ROOT / "docs" / "src" / "content" / "docs" / "language-spec-0.1.md"
+DOWNLOADS = ROOT / "docs" / "public" / "downloads"
 PAGE_WIDTH, PAGE_HEIGHT = 595.28, 841.89  # A4, in PDF points
 MARGIN = 52.0
 CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2
 BOTTOM = 56.0
+
+
+def specification_source() -> str:
+    """Use the website's title as the document heading, without a YAML dependency.
+
+    The title must be a single-line plain, single-quoted, or JSON-quoted string.
+    Other frontmatter belongs to the website and is omitted from the exports.
+    """
+    source = SOURCE.read_text(encoding="utf-8")
+    metadata, separator, body = source.partition("\n---\n")
+    if not metadata.startswith("---\n") or not separator:
+        raise ValueError("Specification must start with YAML frontmatter")
+    match = re.search(r"^title:[ \t]*(.+)$", metadata, re.MULTILINE)
+    if match is None:
+        raise ValueError("Specification frontmatter needs a single-line title")
+    title = match.group(1).strip()
+    if title.startswith('"'):
+        title = json.loads(title)
+    elif title.startswith("'") and title.endswith("'"):
+        title = title[1:-1].replace("''", "'")
+    if not isinstance(title, str) or not title or title in ("|", ">") or "\n" in title:
+        raise ValueError("Specification title must be a nonempty single-line string")
+    return f"# {title}\n\n" + body.lstrip("\n")
 
 
 def plain(text: str) -> str:
@@ -355,9 +380,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="fail if generated documents differ")
     args = parser.parse_args()
-    parsed = blocks(SOURCE.read_text(encoding="utf-8"))
-    outputs = {SOURCE.with_suffix(".txt"): text_document(parsed),
-               SOURCE.with_suffix(".pdf"): PdfDocument().render(parsed)}
+    parsed = blocks(specification_source())
+    outputs = {DOWNLOADS / "language-spec-0.1.txt": text_document(parsed),
+               DOWNLOADS / "language-spec-0.1.pdf": PdfDocument().render(parsed)}
+    if not args.check:
+        DOWNLOADS.mkdir(parents=True, exist_ok=True)
     stale = False
     for path, content in outputs.items():
         if args.check:

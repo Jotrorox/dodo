@@ -19,7 +19,7 @@ fn main() -> i32 {
 ```
 
 This is the first compiler release, **0.1.0**, licensed under
-[BSD-2-Clause](LICENSE). The [language specification](docs/language-spec-0.1.md)
+[BSD-2-Clause](LICENSE). The [language specification](https://jotrorox.github.io/dodo-docs/language-spec-0.1/)
 is a broader design contract. The implemented features and remaining limits are
 explicit below; this release does not claim complete specification conformance
 or a proof of memory safety.
@@ -240,7 +240,7 @@ first compiler error per file/package. Error and warning severities are
 supported, but the compiler currently only produces errors; no new warning
 rules are introduced. Completion, navigation, incremental analysis, file
 watching, and diagnostics for unopened workspace roots are not implemented yet.
-See [diagnostics and editor setup](docs/diagnostics-and-editors.md) for labeled
+See [diagnostics and editor setup](https://jotrorox.github.io/dodo-docs/diagnostics-and-editors/) for labeled
 examples and hover details.
 
 ## Language support
@@ -272,27 +272,43 @@ examples and hover details.
   functions, primitive/raw-pointer C ABI calls, `@repr(C)` struct layout,
   volatile MMIO, and a small compiler-provided memory/pointer core.
 
-See [implementation decisions](docs/implementation.md) for exact lexical,
+See [implementation decisions](https://jotrorox.github.io/dodo-docs/implementation/) for exact lexical,
 operator, package, layout, intrinsic, and release-limit details. Compiler errors
 include labeled source snippets for borrow origins, conflicting accesses, live
 uses, moves, and borrowed-return contracts. Run `dodo lsp` from an editor's LSP
 client for inferred types, receiver ownership, and borrowed-return source hovers.
-See [diagnostics and editor setup](docs/diagnostics-and-editors.md) and the
+See [diagnostics and editor setup](https://jotrorox.github.io/dodo-docs/diagnostics-and-editors/) and the
 [borrowing example](examples/borrowing.dodo).
 
 ## Documentation
 
-The specification is maintained in three formats in `docs/`:
+Read the **[documentation website](https://jotrorox.github.io/dodo-docs/)** for the
+language specification, implementation limits, requirements, and editor setup.
+The specification includes the ergonomics revision and remaining open design
+items. It is also available as [plain text](https://jotrorox.github.io/dodo-docs/downloads/language-spec-0.1.txt)
+and [PDF](https://jotrorox.github.io/dodo-docs/downloads/language-spec-0.1.pdf).
 
-- [Markdown](docs/language-spec-0.1.md)
-- [Plain text](docs/language-spec-0.1.txt)
-- [PDF](docs/language-spec-0.1.pdf)
+The entire `docs/` directory is a small Astro website. Edit or add Markdown files
+in [docs/src/content/docs](docs/src/content/docs); frontmatter sets each page's
+`title`, `description`, and numeric `order`. Navigation and browser search update
+automatically. Use Node.js 24 and Python 3.10 or newer to preview and build:
 
-It incorporates the ergonomics revision and records remaining open design items.
-[Requirements](docs/spec-requirements.md) organize the current design obligations;
-[implementation decisions](docs/implementation.md) distinguish compiler choices
-and current restrictions. Regenerate the text and PDF with
-`python3 scripts/render_spec.py`; no document dependencies are needed.
+```sh
+cd docs
+npm ci
+npm run dev
+npm run build
+npm run preview
+```
+
+See [Edit these docs](https://jotrorox.github.io/dodo-docs/contributing/) for authoring
+and keyboard shortcut details. GitHub Actions validates pull requests and deploys
+the generated website from `main` to GitHub Pages through the public
+[dodo-docs repository](https://github.com/Jotrorox/dodo-docs). After editing the
+[specification source](docs/src/content/docs/language-spec-0.1.md), the next website
+build automatically regenerates its PDF and plain text downloads. Generated
+files are ignored by Git, so only the Markdown edit needs committing. The
+exporter uses Python's standard library and needs no third-party dependencies.
 
 ## Development
 
@@ -301,6 +317,7 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked --release
+python3 scripts/render_spec.py
 python3 scripts/render_spec.py --check
 python3 scripts/test_check_linkage.py
 bash scripts/build-release.sh # x86-64 GNU/Linux release dependency check

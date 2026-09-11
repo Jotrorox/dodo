@@ -1,0 +1,102 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'scripts/render_spec.py'
+      - 'scripts/check_docs.py'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'scripts/render_spec.py'
+      - 'scripts/check_docs.py'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and check documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - name: Install dependencies
+        working-directory: docs
+        run: npm ci
+      - name: Build website
+        working-directory: docs
+        run: npm run build
+      - name: Check generated documents
+        run: python3 scripts/render_spec.py --check
+      - name: Check links and search index
+        run: python3 scripts/check_docs.py
+      - name: Upload website artifact
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-site
+          path: docs/dist
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Deploy GitHub Pages
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: https://jotrorox.github.io/dodo-docs/
+    steps:
+      - name: Download website artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docs-site
+          path: site
+      # Only generated files are published to this public Pages repository.
+      # Its dedicated SSH deploy key cannot write to the private source repository.
+      - name: Publish to Jotrorox/dodo-docs
+        shell: bash
+        env:
+          DOCS_DEPLOY_KEY: ${{ secrets.DOCS_DEPLOY_KEY }}
+          DOCS_DEPLOY_KNOWN_HOSTS: ${{ secrets.DOCS_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          task_deploy_dir=$(mktemp -d "$RUNNER_TEMP/docs-deploy.XXXXXX")
+          trap 'rm -rf "$task_deploy_dir"' EXIT
+          printf '%s\n' "$DOCS_DEPLOY_KEY" > "$task_deploy_dir/key"
+          printf '%s\n' "$DOCS_DEPLOY_KNOWN_HOSTS" > "$task_deploy_dir/known_hosts"
+          chmod 600 "$task_deploy_dir/key" "$task_deploy_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i \"$task_deploy_dir/key\" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=\"$task_deploy_dir/known_hosts\" -o StrictHostKeyChecking=yes"
+          task_publish_dir="$task_deploy_dir/repository"
+          git clone --depth 1 --branch main git@github.com:Jotrorox/dodo-docs.git "$task_publish_dir"
+          rsync -a --delete --exclude=.git "$GITHUB_WORKSPACE/site/" "$task_publish_dir/"
+          touch "$task_publish_dir/.nojekyll"
+          git -C "$task_publish_dir" config user.name 'github-actions[bot]'
+          git -C "$task_publish_dir" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$task_publish_dir" add --all
+          if git -C "$task_publish_dir" diff --cached --quiet; then
+            echo 'Published website is already up to date.'
+          else
+            git -C "$task_publish_dir" commit -m "Publish documentation from $GITHUB_SHA"
+            git -C "$task_publish_dir" push origin HEAD:main
+          fi
