@@ -2,6 +2,7 @@
 use crate::ast::*;
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind, lex};
+use std::collections::HashSet;
 
 type ParseResult<T> = Result<T, Diagnostic>;
 
@@ -14,6 +15,7 @@ pub fn parse(source: &str) -> ParseResult<Program> {
         angle_splits: Vec::new(),
         depth: 0,
         slice_first: false,
+        discarded_tails: HashSet::new(),
     }
     .program()
 }
@@ -28,6 +30,9 @@ struct Parser {
     angle_splits: Vec<(usize, Token)>,
     depth: usize,
     slice_first: bool,
+    // Explicit semicolons suppress implicit block values without changing the
+    // statement AST used by semantic analysis and the backend.
+    discarded_tails: HashSet<usize>,
 }
 
 #[derive(Default)]
@@ -115,6 +120,12 @@ impl Parser {
         while self.newline() || self.at(";") {
             self.bump();
         }
+    }
+    fn following_semicolon(&self) -> bool {
+        self.tokens[self.cursor..]
+            .iter()
+            .take_while(|token| matches!(token.kind, TokenKind::Newline | TokenKind::Symbol(";")))
+            .any(|token| matches!(token.kind, TokenKind::Symbol(";")))
     }
     fn end_statement(&mut self) -> ParseResult<()> {
         if self.newline() || self.at(";") {
@@ -651,13 +662,24 @@ impl Parser {
                 break;
             }
         }
+        let ret_start = self.span().start;
         let ret = if self.eat("->") {
             self.newlines();
             self.ty()?
         } else {
             Type::Void
         };
+        let ret_span = if ret == Type::Void && self.span().start == ret_start {
+            Span {
+                start: ret_start,
+                end: ret_start,
+            }
+        } else {
+            self.since(ret_start)
+        };
         let mut from = Vec::new();
+        let from_start = self.span().start;
+        let mut from_span = None;
         if self.eat("from") {
             self.expect("(")?;
             self.newlines();
@@ -675,12 +697,17 @@ impl Parser {
                 }
             }
             self.expect(")")?;
+            from_span = Some(self.since(from_start));
         }
         // Foreign prototypes end at the line; an optional body may start on the next line.
         let saved = self.cursor;
         self.newlines();
         let body = if self.at("{") {
-            Some(self.block()?)
+            let mut body = self.block()?;
+            if ret != Type::Void {
+                self.lower_tail(&mut body, true);
+            }
+            Some(body)
         } else if mods.extern_ {
             self.cursor = saved;
             self.end_statement()?;
@@ -696,7 +723,9 @@ impl Parser {
             generics,
             params,
             ret,
+            ret_span,
             from,
+            from_span,
             body,
             span: self.since(start),
         })
@@ -781,6 +810,9 @@ impl Parser {
             self.simple_statement(true)?
         };
         let span = self.since(start);
+        if self.following_semicolon() {
+            self.discarded_tails.insert(start);
+        }
         if !compound {
             self.end_statement()?;
         }
@@ -815,6 +847,44 @@ impl Parser {
         }
     }
     fn simple_statement(&mut self, allow_struct: bool) -> ParseResult<StmtKind> {
+        if self.eat("let") {
+            let pattern = self.pattern()?;
+            let ty = if self.eat(":") {
+                self.newlines();
+                self.ty()?
+            } else {
+                Type::Unknown
+            };
+            self.expect("=")?;
+            self.newlines();
+            let value = self.expression(allow_struct)?;
+            let saved = self.cursor;
+            self.newlines();
+            let else_block = if self.eat("else") {
+                self.newlines();
+                Some(self.block()?)
+            } else {
+                self.cursor = saved;
+                None
+            };
+            if else_block.is_none()
+                && let Pattern::Binding(name) = &pattern
+            {
+                return Ok(StmtKind::Let {
+                    name: name.clone(),
+                    ty,
+                    value: Some(value),
+                    constant: false,
+                    mutable: false,
+                });
+            }
+            return Ok(StmtKind::LetPattern {
+                pattern,
+                ty,
+                value,
+                else_block,
+            });
+        }
         if self.eat("const") {
             let (name, ty) = self.typed_name()?;
             self.expect("=")?;
@@ -824,6 +894,7 @@ impl Parser {
                 ty,
                 value: Some(self.expression(allow_struct)?),
                 constant: true,
+                mutable: false,
             });
         }
         if self.look(1, ":=") {
@@ -835,6 +906,7 @@ impl Parser {
                 ty: Type::Unknown,
                 value: Some(self.expression(allow_struct)?),
                 constant: false,
+                mutable: true,
             });
         }
         if self.look(1, ":") {
@@ -850,6 +922,7 @@ impl Parser {
                 ty,
                 value,
                 constant: false,
+                mutable: true,
             });
         }
         // A type-first declaration is unambiguous once followed by its binding name.
@@ -867,6 +940,7 @@ impl Parser {
                 ty,
                 value,
                 constant: false,
+                mutable: true,
             });
         }
         self.cursor = saved;
@@ -909,6 +983,14 @@ impl Parser {
         self.nested(Self::if_statement_inner)
     }
     fn if_statement_inner(&mut self) -> ParseResult<StmtKind> {
+        let pattern = if self.eat("let") {
+            let pattern = self.pattern()?;
+            self.expect("=")?;
+            self.newlines();
+            Some(pattern)
+        } else {
+            None
+        };
         let condition = self.expression(false)?;
         self.newlines();
         let then_block = self.block()?;
@@ -930,10 +1012,19 @@ impl Parser {
             self.cursor = saved;
             Vec::new()
         };
-        Ok(StmtKind::If {
-            condition,
-            then_block,
-            else_block,
+        Ok(if let Some(pattern) = pattern {
+            StmtKind::IfLet {
+                pattern,
+                value: condition,
+                then_block,
+                else_block,
+            }
+        } else {
+            StmtKind::If {
+                condition,
+                then_block,
+                else_block,
+            }
         })
     }
     fn for_statement(&mut self) -> ParseResult<StmtKind> {
@@ -946,9 +1037,26 @@ impl Parser {
                 body: self.block()?,
             });
         }
-        if self.look(1, "in") || self.look(1, ",") {
+        if self.at("&") || self.look(1, "in") || self.look(1, ",") {
+            let mut copy = self.eat("&");
+            if copy && self.at("mut") {
+                return Err(self.error(
+                    "`&mut` loop patterns are unsupported; use `for value in &mut values`",
+                ));
+            }
             let first = self.identifier()?;
             let (index, name) = if self.eat(",") {
+                if copy {
+                    return Err(self.error(
+                        "loop indices are values; put `&` on the element: `for i, &value in values`",
+                    ));
+                }
+                copy = self.eat("&");
+                if copy && self.at("mut") {
+                    return Err(self.error(
+                        "`&mut` loop patterns are unsupported; use `for i, value in &mut values`",
+                    ));
+                }
                 (Some(first), self.identifier()?)
             } else {
                 (None, first)
@@ -968,6 +1076,7 @@ impl Parser {
             return Ok(StmtKind::ForEach {
                 index,
                 name,
+                copy,
                 iterable,
                 body,
             });
@@ -1042,25 +1151,45 @@ impl Parser {
             }
             let start = self.span().start;
             let pattern = self.pattern()?;
+            self.newlines();
+            let guard = if self.eat("if") {
+                self.newlines();
+                Some(self.expression(true)?)
+            } else {
+                None
+            };
+            self.newlines();
             self.expect("=>")?;
             self.newlines();
             let body = if self.at("{") {
                 let mut body = self.block()?;
                 if value_mode {
-                    Self::yield_tail(&mut body)?;
+                    self.lower_tail(&mut body, false);
                 }
                 body
-            } else if value_mode {
+            } else {
                 let value = self.expression(true)?;
+                let discarded = self.following_semicolon();
+                if discarded {
+                    self.discarded_tails.insert(value.span.start);
+                }
+                if !self.at(",") && !self.at("}") && !self.newline() && !self.at(";") {
+                    return Err(
+                        self.error("expected `,` or a newline after a match arm expression")
+                    );
+                }
                 vec![Stmt {
                     span: value.span,
-                    kind: StmtKind::Yield(value),
+                    kind: if value_mode && !discarded {
+                        StmtKind::Yield(value)
+                    } else {
+                        StmtKind::Expr(value)
+                    },
                 }]
-            } else {
-                return Err(self.error("statement match arms require a braced block"));
             };
             arms.push(MatchArm {
                 pattern,
+                guard,
                 body,
                 span: self.since(start),
             });
@@ -1070,6 +1199,76 @@ impl Parser {
         Ok(StmtKind::Match { value, arms })
     }
     fn pattern(&mut self) -> ParseResult<Pattern> {
+        self.nested(Self::pattern_inner)
+    }
+    fn pattern_inner(&mut self) -> ParseResult<Pattern> {
+        self.eat("|");
+        self.newlines();
+        let first = self.pattern_atom()?;
+        let mut alternatives = vec![first];
+        loop {
+            let saved = self.cursor;
+            self.newlines();
+            if !self.eat("|") {
+                self.cursor = saved;
+                break;
+            }
+            self.newlines();
+            alternatives.push(self.pattern_atom()?);
+        }
+        if alternatives.len() == 1 {
+            Ok(alternatives.remove(0))
+        } else {
+            Ok(Pattern::Or(alternatives))
+        }
+    }
+    fn pattern_integer(&mut self) -> ParseResult<u64> {
+        let negative = self.eat("-");
+        let token = self.bump();
+        if let TokenKind::Int(value, _) = token.kind
+            && (!negative || value <= (1u64 << 63))
+        {
+            Ok(if negative {
+                value.wrapping_neg()
+            } else {
+                value
+            })
+        } else {
+            Err(Diagnostic::new(
+                token.span,
+                "expected an integer or byte literal in a pattern",
+            ))
+        }
+    }
+    fn pattern_name(&mut self) -> ParseResult<String> {
+        let start = self.span();
+        let mut name = self.qualified_name()?;
+        if name == "Self" {
+            name = self
+                .self_type
+                .as_ref()
+                .ok_or_else(|| {
+                    Diagnostic::new(start, "`Self` is only valid inside a struct declaration")
+                })?
+                .to_string();
+        }
+        if self.eat("::") || self.at("<") {
+            name = Type::Generic(name, self.type_args()?).to_string();
+            while self.eat(".") {
+                name.push('.');
+                name.push_str(&self.identifier()?);
+            }
+        }
+        Ok(name)
+    }
+    fn pattern_atom(&mut self) -> ParseResult<Pattern> {
+        if self.eat("(") {
+            self.newlines();
+            let pattern = self.pattern()?;
+            self.newlines();
+            self.expect(")")?;
+            return Ok(pattern);
+        }
         if self.eat("_") {
             return Ok(Pattern::Wildcard);
         }
@@ -1079,28 +1278,22 @@ impl Parser {
         if self.eat("false") {
             return Ok(Pattern::Bool(false));
         }
-        if self.eat("-") {
-            let token = self.bump();
-            if let TokenKind::Int(value, _) = token.kind
-                && value <= (1u64 << 63)
-            {
-                return Ok(Pattern::Int(value.wrapping_neg()));
+        if self.at("-") || matches!(self.token().kind, TokenKind::Int(..)) {
+            let value = self.pattern_integer()?;
+            let inclusive = self.eat("..=");
+            if inclusive || self.eat("..") {
+                self.newlines();
+                let end = self.pattern_integer()?;
+                return Ok(Pattern::Range(value, end, inclusive));
             }
-            return Err(Diagnostic::new(
-                token.span,
-                "expected a signed integer literal after `-` in a pattern",
-            ));
-        }
-        if let TokenKind::Int(value, _) = self.token().kind {
-            self.bump();
             return Ok(Pattern::Int(value));
         }
-        let name = self.qualified_name()?;
-        let mut bindings = Vec::new();
+        let name = self.pattern_name()?;
         if self.eat("(") {
+            let mut fields = Vec::new();
             self.newlines();
             while !self.eat(")") {
-                bindings.push(self.identifier()?);
+                fields.push(self.pattern()?);
                 self.newlines();
                 if self.eat(",") {
                     self.newlines();
@@ -1109,11 +1302,60 @@ impl Parser {
                     break;
                 }
             }
+            return Ok(Pattern::Variant(name, fields));
         }
-        Ok(Pattern::Variant(name, bindings))
+        if self.eat("{") {
+            let mut fields = Vec::new();
+            let mut rest = false;
+            self.newlines();
+            while !self.eat("}") {
+                if self.eat("..") {
+                    rest = true;
+                    self.eat(",");
+                    self.newlines();
+                    self.expect("}")?;
+                    break;
+                }
+                let field = self.identifier()?;
+                let pattern = if self.eat(":") {
+                    self.newlines();
+                    self.pattern()?
+                } else {
+                    Pattern::Binding(field.clone())
+                };
+                fields.push((field, pattern));
+                self.newlines();
+                if self.eat(",") {
+                    self.newlines();
+                } else {
+                    self.expect("}")?;
+                    break;
+                }
+            }
+            return Ok(Pattern::Struct(name, fields, rest));
+        }
+        Ok(
+            if name == "none" || name.contains('.') || name.contains('<') {
+                Pattern::Variant(name, Vec::new())
+            } else {
+                Pattern::Binding(name)
+            },
+        )
     }
     fn expression(&mut self, allow_struct: bool) -> ParseResult<Expr> {
         self.expr_bp(0, allow_struct)
+    }
+    fn chain_newlines(&mut self) {
+        let mut next = self.cursor;
+        while matches!(self.tokens[next].kind, TokenKind::Newline) {
+            next += 1;
+        }
+        // A leading dot continues the preceding expression across blank and
+        // comment-only lines. Leave every other newline (and every semicolon)
+        // in place so ordinary statement boundaries keep their meaning.
+        if matches!(self.tokens[next].kind, TokenKind::Symbol(".")) {
+            self.cursor = next;
+        }
     }
     fn expr_bp(&mut self, minimum: u8, allow_struct: bool) -> ParseResult<Expr> {
         self.nested(|parser| parser.expr_bp_inner(minimum, allow_struct))
@@ -1158,6 +1400,8 @@ impl Parser {
         loop {
             if self.soft_newlines > 0 {
                 self.newlines();
+            } else if 25 >= minimum {
+                self.chain_newlines();
             }
             if 25 >= minimum {
                 if self.eat("?") {
@@ -1328,29 +1572,42 @@ impl Parser {
         self.soft_newlines -= 1;
         Ok(args)
     }
-    fn yield_tail(block: &mut Block) -> ParseResult<()> {
+    fn lower_tail(&self, block: &mut Block, function_return: bool) {
         let Some(last) = block.last_mut() else {
-            return Ok(());
+            return;
         };
+        if self.discarded_tails.contains(&last.span.start) {
+            return;
+        }
         match &mut last.kind {
-            StmtKind::Expr(e) => last.kind = StmtKind::Yield(e.clone()),
+            StmtKind::Expr(e) => {
+                last.kind = if function_return {
+                    StmtKind::Return(Some(e.clone()))
+                } else {
+                    StmtKind::Yield(e.clone())
+                }
+            }
             StmtKind::If {
                 then_block,
                 else_block,
                 ..
+            }
+            | StmtKind::IfLet {
+                then_block,
+                else_block,
+                ..
             } => {
-                Self::yield_tail(then_block)?;
-                Self::yield_tail(else_block)?;
+                self.lower_tail(then_block, function_return);
+                self.lower_tail(else_block, function_return);
             }
             StmtKind::Match { arms, .. } => {
                 for arm in arms {
-                    Self::yield_tail(&mut arm.body)?;
+                    self.lower_tail(&mut arm.body, function_return);
                 }
             }
-            StmtKind::Block(b) | StmtKind::Unsafe(b) => Self::yield_tail(b)?,
+            StmtKind::Block(b) | StmtKind::Unsafe(b) => self.lower_tail(b, function_return),
             _ => (),
         }
-        Ok(())
     }
     fn primary(&mut self, allow_struct: bool) -> ParseResult<Expr> {
         let start = self.span().start;
@@ -1372,13 +1629,13 @@ impl Parser {
                     kind,
                     span: self.since(start),
                 }];
-                Self::yield_tail(&mut body)?;
+                self.lower_tail(&mut body, false);
                 ExprKind::ValueBlock(body)
             }
             TokenKind::Symbol("{") => {
                 self.cursor -= 1;
                 let mut body = self.block()?;
-                Self::yield_tail(&mut body)?;
+                self.lower_tail(&mut body, false);
                 ExprKind::ValueBlock(body)
             }
             TokenKind::Ident(name) if name == "true" || name == "false" => {
@@ -1409,6 +1666,33 @@ impl Parser {
                 self.soft_newlines += 1;
                 let mut value = self.expression(true)?;
                 self.newlines();
+                if self.eat(":") {
+                    self.newlines();
+                    let annotation = self.ty()?;
+                    if !matches!(annotation, Type::Array(..) | Type::ArrayExpr(..)) {
+                        return Err(
+                            self.error("array literal annotation requires a fixed-size array type")
+                        );
+                    }
+                    match &mut value.kind {
+                        ExprKind::Array(ty, _) if matches!(&*ty, Type::Array(_, element) if **element == Type::Unknown) =>
+                        {
+                            *ty = annotation;
+                        }
+                        ExprKind::Array(..) => {
+                            return Err(self.error("array literal already has an explicit type"));
+                        }
+                        ExprKind::Repeat(..) => {
+                            return Err(self.error("array repetition annotations are not supported; annotate the binding instead"));
+                        }
+                        _ => {
+                            return Err(self.error(
+                                "expression type annotations require a bracket array literal",
+                            ));
+                        }
+                    }
+                    self.newlines();
+                }
                 self.expect(")")?;
                 self.soft_newlines -= 1;
                 value.span = self.since(start);
@@ -1530,6 +1814,7 @@ fn reserved(name: &str) -> bool {
             | "struct"
             | "enum"
             | "const"
+            | "let"
             | "return"
             | "if"
             | "else"
@@ -1744,5 +2029,405 @@ mod tests {
         assert!(
             matches!(&statements[1].kind, StmtKind::Match { arms, .. } if matches!(arms[0].pattern, Pattern::Int(u64::MAX)))
         );
+    }
+    #[test]
+    fn expression_arms_work_in_statement_and_value_matches() {
+        let statements = body(
+            "match result { ok(value) => consume(value), err(error) => report(error), }\n\
+             answer := match optional { some(value) => value, none => { log(); 0 } }",
+        );
+        let StmtKind::Match { arms, .. } = &statements[0].kind else {
+            panic!("expected statement match");
+        };
+        assert!(
+            arms.iter()
+                .all(|arm| matches!(arm.body[0].kind, StmtKind::Expr(_)))
+        );
+        let StmtKind::Let {
+            value:
+                Some(Expr {
+                    kind: ExprKind::ValueBlock(block),
+                    ..
+                }),
+            ..
+        } = &statements[1].kind
+        else {
+            panic!("expected value match");
+        };
+        let StmtKind::Match { arms, .. } = &block[0].kind else {
+            panic!("expected value match arms");
+        };
+        assert!(
+            arms.iter()
+                .all(|arm| matches!(arm.body.last().unwrap().kind, StmtKind::Yield(_)))
+        );
+    }
+    #[test]
+    fn function_tails_return_values_and_semicolons_discard_them() {
+        let program = parse(
+            "package p\n\
+             fn add(a: u32, b: u32) -> u32 { a + b }\n\
+             fn discard() -> u32 { 1; }\n\
+             fn choose(b: bool) -> u32 { if b { 1 } else { return 2 } }\n\
+             fn discard_match(b: bool) -> u32 { match b { true => 1, false => 2 }; }\n\
+             fn side_effect() { consume() }",
+        )
+        .unwrap();
+        assert!(matches!(
+            program.functions[0].body.as_ref().unwrap()[0].kind,
+            StmtKind::Return(Some(_))
+        ));
+        assert!(matches!(
+            program.functions[1].body.as_ref().unwrap()[0].kind,
+            StmtKind::Expr(_)
+        ));
+        let StmtKind::If {
+            then_block,
+            else_block,
+            ..
+        } = &program.functions[2].body.as_ref().unwrap()[0].kind
+        else {
+            panic!("expected conditional tail");
+        };
+        assert!(matches!(then_block[0].kind, StmtKind::Return(Some(_))));
+        assert!(matches!(else_block[0].kind, StmtKind::Return(Some(_))));
+        let StmtKind::Match { arms, .. } = &program.functions[3].body.as_ref().unwrap()[0].kind
+        else {
+            panic!("expected discarded match");
+        };
+        assert!(
+            arms.iter()
+                .all(|arm| matches!(arm.body[0].kind, StmtKind::Expr(_)))
+        );
+        assert!(matches!(
+            program.functions[4].body.as_ref().unwrap()[0].kind,
+            StmtKind::Expr(_)
+        ));
+
+        let statements =
+            body("x := { 1; }\ny := { 2 }\nz := match true { true => { 3; }, false => 4 }");
+        let StmtKind::Let {
+            value:
+                Some(Expr {
+                    kind: ExprKind::ValueBlock(block),
+                    ..
+                }),
+            ..
+        } = &statements[0].kind
+        else {
+            panic!("expected value block")
+        };
+        assert!(matches!(block[0].kind, StmtKind::Expr(_)));
+        let StmtKind::Let {
+            value:
+                Some(Expr {
+                    kind: ExprKind::ValueBlock(block),
+                    ..
+                }),
+            ..
+        } = &statements[1].kind
+        else {
+            panic!("expected value block")
+        };
+        assert!(matches!(block[0].kind, StmtKind::Yield(_)));
+        let StmtKind::Let {
+            value:
+                Some(Expr {
+                    kind: ExprKind::ValueBlock(block),
+                    ..
+                }),
+            ..
+        } = &statements[2].kind
+        else {
+            panic!("expected match")
+        };
+        let StmtKind::Match { arms, .. } = &block[0].kind else {
+            panic!("expected match")
+        };
+        assert!(matches!(arms[0].body[0].kind, StmtKind::Expr(_)));
+    }
+    #[test]
+    fn immutable_runtime_bindings_are_distinct_from_constants_and_mutable_locals() {
+        let statements = body(
+            "let limit = read_limit()\nlet size: u32 = read_limit()\ncount := 0u32\nconst CAPACITY: usize = 256",
+        );
+        assert!(matches!(
+            &statements[0].kind,
+            StmtKind::Let {
+                ty: Type::Unknown,
+                constant: false,
+                mutable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &statements[1].kind,
+            StmtKind::Let {
+                ty: Type::Int { bits: 32, .. },
+                constant: false,
+                mutable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &statements[2].kind,
+            StmtKind::Let {
+                constant: false,
+                mutable: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &statements[3].kind,
+            StmtKind::Let {
+                constant: true,
+                mutable: false,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn recursive_patterns_ranges_alternatives_and_guards_share_a_grammar() {
+        let statements = body(
+            "match optional {\n\
+             some(some(Point { x: 1..=9, y, .. })) | some(some(Point { x: 20..30, y, .. })) if y > 0 => consume(y),\n\
+             some(none) | none => {},\n\
+             _ => {},\n}\n\
+             match byte { b'0'..=b'9' => {}, -3..-1 => {}, _ => {} }",
+        );
+        let StmtKind::Match { arms, .. } = &statements[0].kind else {
+            panic!("expected match")
+        };
+        assert!(matches!(arms[0].pattern, Pattern::Or(_)));
+        assert_eq!(arms[0].pattern.bindings(), vec!["y"]);
+        assert!(arms[0].guard.is_some());
+        let Pattern::Or(alternatives) = &arms[0].pattern else {
+            panic!("expected alternatives")
+        };
+        let Pattern::Variant(_, outer) = &alternatives[0] else {
+            panic!("expected variant")
+        };
+        let Pattern::Variant(_, inner) = &outer[0] else {
+            panic!("expected nested variant")
+        };
+        let Pattern::Struct(_, fields, rest) = &inner[0] else {
+            panic!("expected nested struct")
+        };
+        assert!(*rest);
+        assert!(matches!(fields[0].1, Pattern::Range(1, 9, true)));
+        let StmtKind::Match { arms, .. } = &statements[1].kind else {
+            panic!("expected match")
+        };
+        assert!(matches!(arms[0].pattern, Pattern::Range(48, 57, true)));
+        assert!(
+            matches!(arms[1].pattern, Pattern::Range(start, end, false) if start == (-3i64 as u64) && end == u64::MAX)
+        );
+    }
+    #[test]
+    fn conditional_and_early_exit_destructuring_use_recursive_patterns() {
+        let statements = body(
+            "if let some(some(value)) = optional { consume(value) } else if let some(value) = other { consume(value) }\n\
+             let some(Point { x: value, .. }): Option<Point> = optional else { return }\n\
+             let Point { x, y } = point",
+        );
+        let StmtKind::IfLet {
+            pattern,
+            else_block,
+            ..
+        } = &statements[0].kind
+        else {
+            panic!("expected if let")
+        };
+        assert_eq!(pattern.bindings(), vec!["value"]);
+        assert!(matches!(else_block[0].kind, StmtKind::IfLet { .. }));
+        assert!(matches!(
+            &statements[1].kind,
+            StmtKind::LetPattern {
+                ty: Type::Option(_),
+                else_block: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &statements[2].kind,
+            StmtKind::LetPattern {
+                pattern: Pattern::Struct(_, _, false),
+                else_block: None,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn malformed_patterns_and_bindings_report_errors() {
+        for source in [
+            "let limit",
+            "let limit := 3",
+            "if let some(value) optional {}",
+            "match x { 1..= => {} }",
+            "match x { some(some(value) => {} }",
+            "match x { Point { .., x } => {} }",
+            "match x { true => f() false => g() }",
+            "let some(x) = optional else return",
+        ] {
+            assert!(
+                parse(&format!("package p\nfn f() {{ {source} }}")).is_err(),
+                "accepted {source:?}"
+            );
+        }
+        let source = format!(
+            "package p\nfn f() {{ match x {{ {}v{} => {{}} }} }}",
+            "some(".repeat(100),
+            ")".repeat(100)
+        );
+        assert!(parse(&source).unwrap_err().message.contains("nesting"));
+    }
+    #[test]
+    fn qualified_generic_pattern_names_preserve_nested_type_arguments() {
+        let statements = body(
+            "match value {\n\
+             lib.Choice<Option<u8>>.Value(lib.Box<Option<u8>> { value: some(inner) }) => consume(inner),\n\
+             lib.Choice.Value::<Option<u8>>(lib.Box::<Option<u8>> { value: none }) => {},\n\
+             _ => {},\n}",
+        );
+        let StmtKind::Match { arms, .. } = &statements[0].kind else {
+            panic!("expected match")
+        };
+        let Pattern::Variant(name, fields) = &arms[0].pattern else {
+            panic!("expected variant")
+        };
+        assert_eq!(name, "lib.Choice<Option<u8>>.Value");
+        assert!(matches!(&fields[0], Pattern::Struct(name, _, _) if name == "lib.Box<Option<u8>>"));
+        let Pattern::Variant(name, fields) = &arms[1].pattern else {
+            panic!("expected variant")
+        };
+        assert_eq!(name, "lib.Choice.Value<Option<u8>>");
+        assert!(matches!(&fields[0], Pattern::Struct(name, _, _) if name == "lib.Box<Option<u8>>"));
+    }
+    #[test]
+    fn semicolons_on_compound_tails_suppress_all_implicit_exits() {
+        for statement in [
+            "if true { 1 } else { 2 }",
+            "if let some(x) = optional { x } else { 2 }",
+            "match true { true => 1, false => 2 }",
+            "{ 1 }",
+            "unsafe { 1 }",
+        ] {
+            let source = format!("package p\nfn f() -> u32 {{ {statement}\n; }}");
+            let block = parse(&source).unwrap().functions.remove(0).body.unwrap();
+            let assert_discarded = |tail: &Stmt| match &tail.kind {
+                StmtKind::If {
+                    then_block,
+                    else_block,
+                    ..
+                }
+                | StmtKind::IfLet {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    assert!(matches!(then_block[0].kind, StmtKind::Expr(_)));
+                    assert!(matches!(else_block[0].kind, StmtKind::Expr(_)));
+                }
+                StmtKind::Match { arms, .. } => {
+                    assert!(
+                        arms.iter()
+                            .all(|arm| matches!(arm.body[0].kind, StmtKind::Expr(_)))
+                    );
+                }
+                StmtKind::Block(block) | StmtKind::Unsafe(block) => {
+                    assert!(matches!(block[0].kind, StmtKind::Expr(_)));
+                }
+                _ => panic!("expected compound tail"),
+            };
+            assert_discarded(&block[0]);
+            let statements = body(&format!("x := {{ {statement}; }}"));
+            let StmtKind::Let {
+                value:
+                    Some(Expr {
+                        kind: ExprKind::ValueBlock(block),
+                        ..
+                    }),
+                ..
+            } = &statements[0].kind
+            else {
+                panic!("expected value block")
+            };
+            assert_discarded(&block[0]);
+        }
+    }
+    #[test]
+    fn if_let_expression_tails_yield_and_function_tails_return() {
+        let statements = body(
+            "let x = if let some(x) = optional { x } else if let some(y) = other { y } else { 0 }",
+        );
+        let StmtKind::Let {
+            value:
+                Some(Expr {
+                    kind: ExprKind::ValueBlock(block),
+                    ..
+                }),
+            ..
+        } = &statements[0].kind
+        else {
+            panic!("expected if let value")
+        };
+        let StmtKind::IfLet {
+            then_block,
+            else_block,
+            ..
+        } = &block[0].kind
+        else {
+            panic!("expected if let")
+        };
+        assert!(matches!(then_block[0].kind, StmtKind::Yield(_)));
+        let StmtKind::IfLet {
+            then_block,
+            else_block,
+            ..
+        } = &else_block[0].kind
+        else {
+            panic!("expected else if let")
+        };
+        assert!(matches!(then_block[0].kind, StmtKind::Yield(_)));
+        assert!(matches!(else_block[0].kind, StmtKind::Yield(_)));
+        let block =
+            parse("package p\nfn f() -> u32 { if let some(x) = optional { x } else { 0 } }")
+                .unwrap()
+                .functions
+                .remove(0)
+                .body
+                .unwrap();
+        let StmtKind::IfLet {
+            then_block,
+            else_block,
+            ..
+        } = &block[0].kind
+        else {
+            panic!("expected if let")
+        };
+        assert!(matches!(then_block[0].kind, StmtKind::Return(Some(_))));
+        assert!(matches!(else_block[0].kind, StmtKind::Return(Some(_))));
+    }
+    #[test]
+    fn reserved_let_and_malformed_generic_patterns_report_errors() {
+        for source in [
+            "package p\nfn let() {}",
+            "package p\nstruct let {}",
+            "package p\nfn f(let: u8) {}",
+            "package p\nfn f() { match x { some(let) => {} } }",
+            "package p\nfn f() { let let = 1 }",
+            "package p\nfn f() { match x { Box<> { value } => {} } }",
+            "package p\nfn f() { match x { Box::<u8 { value } => {} } }",
+            "package p\nfn f() { match x { Choice<u8>. => {} } }",
+            "package p\nfn f() { match x { Self {} => {} } }",
+        ] {
+            assert!(parse(source).is_err(), "accepted {source:?}");
+        }
+        let source = format!(
+            "package p\nfn f() {{ match x {{ Box<{}u8{}> {{value}} => {{}} }} }}",
+            "Option<".repeat(100),
+            ">".repeat(100)
+        );
+        assert!(parse(&source).unwrap_err().message.contains("nesting"));
     }
 }

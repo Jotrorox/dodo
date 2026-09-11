@@ -1,0 +1,43 @@
+package borrowing
+
+struct Value {
+    number: i32
+
+    // Hover: shared receiver; the returned reference borrows from self.
+    fn view(&self) -> &i32 {
+        return &self.number
+    }
+
+    // Hover: mutable receiver; the call borrows the value exclusively.
+    fn replace(&mut self, number: i32) {
+        self.number = number
+    }
+
+    // Hover: consuming receiver; the call transfers ownership.
+    fn finish(self) -> i32 {
+        return self.number
+    }
+}
+
+fn consume(view: &i32) -> i32 {
+    return *view
+}
+
+// Hover: the explicit contract permits a borrowed return from either input.
+fn choose(a: &i32, b: &i32, first: bool) -> &i32 from(a, b) {
+    if first {
+        return a
+    }
+    return b
+}
+
+fn main() -> i32 {
+    value := Value { number: 10 }
+    view := value.view()
+    previous := consume(view)
+    // The last use above ends the shared borrow, so replacement is allowed.
+    value.replace(20)
+    selected := choose(&previous, &value.number, true)
+    result := *selected
+    return result + value.finish() - 30
+}

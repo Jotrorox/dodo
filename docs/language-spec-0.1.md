@@ -2,7 +2,7 @@
 
 **Language specification 0.1**
 
-**Edition:** 10 September 2026
+**Edition:** 11 September 2026
 
 **Status:** Proposed language; normative design specification
 
@@ -17,8 +17,10 @@ requiring a garbage collector, heap, operating system, or scheduler.
 
 This edition incorporates the September 2026 ergonomics revisions to the Dodo
 0.1 design: consistent name-first declarations, shorter signatures and literals,
-local type inference, composable constants, value-producing blocks, ranges, and
-subslices. Earlier type-first declarations and fully explicit forms remain
+local type inference, composable constants, value-producing blocks, ranges,
+immutable runtime bindings, implicit function returns, recursive patterns,
+conditional destructuring, subslices, explicit copying in collection loops, canonical formatting, and
+leading-dot continuation. Earlier type-first declarations and fully explicit forms remain
 accepted for compatibility. The ownership categories are unchanged.
 
 **Must**, **must not**, **shall**, and **shall not** express requirements.
@@ -137,7 +139,17 @@ initialization order are unspecified.
 
 Newlines normally terminate statements. Semicolons separate the clauses of a
 three-part `for` statement. Blocks require braces; conditions do not require
-parentheses.
+parentheses. Delimited expressions and expressions continued after an operator
+accept newlines. A newline before `.` continues the preceding expression with a
+field or method access. Indentation, blank lines, and line comments do not affect
+this rule; an explicit semicolon ends the expression. Other leading operators
+do not continue a statement outside delimited expressions.
+
+```dodo
+value := source
+    .decode()
+    .validate()
+```
 
 ```dodo
 for i := 0; i < n; i += 1 {
@@ -148,8 +160,8 @@ for i := 0; i < n; i += 1 {
 ### 3.2. Comments
 
 `//` begins a line comment that extends to the end of the line. Block comments,
-nested comments, documentation comments, and the exact effect of comments on
-lexical disambiguation are unspecified.
+nested comments, and documentation comments are unspecified. A line comment
+preserves its terminating newline for statement and continuation rules.
 
 ### 3.3. Identifiers and keywords
 
@@ -157,7 +169,7 @@ Examples use identifiers such as `parse_byte`, `Samples`, and `set_address`.
 The design uses these syntactic or contextual keywords:
 
 ```text
-package import pub fn struct enum const return if else for in
+package import pub fn struct enum const let return if else for in
 break continue match unsafe extern as from static Self self void
 ```
 
@@ -219,7 +231,13 @@ bytes := [0u8; 256]
 `[value; N]` evaluates value exactly once, including when N is zero, and repeats
 it N times. The element must be copyable; repetition never clones owned values
 or duplicates mutable references. Empty lists need an element type from context.
-The explicit composite form `[4]u16{1, 2, 3, 4}` remains accepted.
+Bracket lists and repetition are canonical. A list may also carry an explicit
+type annotation in expression position: `([1, 2, 3, 4]: [4]u16)` or
+`([]: [0]u8)`. This annotation checks the element type and exact length without
+converting or copying an existing aggregate. It applies only to an unannotated
+bracket list; annotate the binding when using repetition. The historical
+composite form `[4]u16{1, 2, 3, 4}` remains accepted and is automatically migrated
+to an annotated bracket list by `dodo fmt`.
 
 Arrays and slices expose `.len`. Borrowing an array may coerce to a slice without
 allocation. `&values[start..end]` produces a shared subslice and
@@ -299,7 +317,9 @@ and `Box{value: 42i32}` infer i32. An expected type also constrains unsuffixed
 literals, as in `value: i32 = identity(42)`. Inference is local; it does not infer
 function signatures from bodies or solve types from later statements. Conflicting
 or unresolved type arguments require a diagnostic. Explicit arguments remain
-available, such as `identity<i32>(42)`.
+available, canonically as `identity::<i32>(42)`. The historical call spelling
+`identity<i32>(42)` remains accepted and is migrated by `dodo fmt`. Generic type
+names and declarations continue to use `Name<T>`.
 
 `some(value)` infers `Option<T>` from its payload when no expected type exists.
 `none`, `ok`, and `err` still need enough context to determine their full types.
@@ -317,6 +337,29 @@ with parameters, fields, and enum payloads:
 name := value
 count: u32 = 0
 ```
+
+Name-first declarations are canonical, including fields, constants, statics,
+and named enum payloads. `dodo fmt` migrates earlier type-first declarations,
+array literals, and explicit generic calls, while preserving explicit type
+information. Historical forms remain accepted in 0.1; a future revision may
+announce their deprecation after the migration path is established.
+
+`let` declares an immutable runtime binding. Its initializer runs normally and
+may call functions; a type annotation is optional. Initialization is mandatory:
+
+```dodo
+let limit = read_limit()
+let typed_limit: u32 = read_limit()
+```
+
+An immutable binding cannot be reassigned, mutably borrowed, or used to mutate
+its owned fields or array elements. Immutability does not change the type or
+permissions of a reference it holds: `let r = &mut value` allows `*r = next`
+and writes to the referent's fields. An immutable binding holding a mutable
+slice likewise permits element writes. Replacing `r` itself is forbidden.
+Moving an owned value out of an immutable binding remains allowed under the
+ordinary move rules. Runtime `let` bindings cannot be used as compile-time
+constants, even when their initializers are literals.
 
 ### 5.2. Constants
 
@@ -345,12 +388,15 @@ every applicable control-flow path.
 
 An omitted return type means `void`; `fn reset() {}` and
 `fn reset() -> void {}` have the same signature. Functions returning a value
-must declare its type. Function returns remain explicit; a final expression in
-a function body is not an implicit return.
+must declare its type. A function returning a value returns its final expression
+when that expression has no trailing semicolon. This applies recursively to
+final conditionals, matches, and blocks; every continuing path must produce the
+declared return type. `return` remains available anywhere for early exits.
+Void functions retain statement semantics and reject discarded Results.
 
 ```dodo
 pub fn add(a: u32, b: u32) -> u32 {
-    return a + b
+    a + b
 }
 ```
 
@@ -523,7 +569,7 @@ operations must express wrapping or truncation.
 
 ```dodo
 weight := i as u32 + 1
-total += weight * (*value as u32)
+total += weight * (value as u32)
 ```
 
 ### 10.3. Operators
@@ -582,6 +628,8 @@ for i in 0..n { ... }
 for _ in 0..n { ... }
 for item in items { ... }
 for index, item in items { ... }
+for &item in items { ... }
+for index, &item in items { ... }
 for item in &mut items { ... }
 for index, item in &mut items { ... }
 ```
@@ -598,7 +646,18 @@ first-class range type.
 Collection foreach supports arrays and slices. It evaluates its input once,
 borrows rather than consumes the collection, and creates fresh bindings on each
 iteration. Indexed forms bind a `usize` index. Shared iteration binds `&T`
-elements; mutable iteration binds `&mut T` elements.
+elements; mutable iteration binds `&mut T` elements. These meanings never depend
+on the element type.
+
+A shared reference pattern opts into copying: `for &item in items` or
+`for index, &item in items` binds a fresh value of type T on each iteration.
+T must be copyable under section 7; owned aggregates and mutable references
+cannot be copied. Reassigning item only changes the local copy. Copying a shared
+reference preserves its dependency on the original storage. The collection is
+still evaluated once and borrowed for the loop. The pattern applies only to
+shared collection elements; reference patterns on range values, indices, or
+mutable iteration are rejected. Use a shared reborrow to copy from a mutable
+view. `&mut item` binding patterns are not supported.
 
 The collection stays borrowed for the iteration. A mutable element loan cannot
 escape its iteration in version 0.1. There is no iterator protocol and no
@@ -606,17 +665,18 @@ escape its iteration in version 0.1. There is no iterator protocol and no
 
 ### 11.3. Matching
 
-`match` is exhaustive and has no fallthrough. In statement position its arms
-contain blocks:
+`match` is exhaustive and has no fallthrough. Arms accept single expressions
+or braced blocks in both statement and expression positions:
 
 ```dodo
-match value {
-    pattern => { ... }
-    pattern => { ... }
+match result {
+    ok(value) => consume(value),
+    err(error) => report(error),
 }
 ```
 
-In expression position arms may contain a single expression or a value block:
+Blocks allow multiple statements. When the match produces a value, each
+continuing arm yields its final expression:
 
 ```dodo
 return match parsed {
@@ -625,13 +685,59 @@ return match parsed {
 }
 ```
 
-Patterns include literals, enum variants, payload bindings, and `_`. Variant
-names may omit the enum qualifier when matching a value of that enum type. Matching an
-owned non-copy value consumes it. Matching `&value` or `&mut value` borrows its
-payloads.
+The same recursive pattern grammar is used by `match`, `if let`, and `let`:
 
-Guards, nested structural patterns beyond enum payloads, or-patterns, ranges,
-integer-domain exhaustiveness, and further binding modes are unspecified.
+- `_` ignores a value; a binding name captures it.
+- Boolean and integer literals test equality. Integer and byte ranges use
+  `start..end` (exclusive) or `start..=end` (inclusive); bounds must be integer
+  literals representable in the matched type, with a nonempty ordered range.
+- Enum/Option/Result payloads contain patterns, such as `some(some(value))`.
+  Enum variant names may omit the qualifier when the matched type identifies it.
+- Struct patterns use `Name{field: pattern, shorthand, ..}`. Without `..`, every
+  field must be listed; shorthand binds the field's name.
+- Alternatives use `p | q` and must bind the same names with the same types and
+  borrow modes in every alternative. Alternatives may be nested in payloads.
+
+Arms are considered in source order. An optional `if condition` guard runs
+after a pattern matches, with its bindings in scope. A false guard tries the
+next alternative or arm. Guards must be Boolean and cannot move or mutate the
+matched bindings before the arm is selected. Guarded arms do not establish
+exhaustiveness. These alternative and guard rules follow the
+[Rust match reference](https://doc.rust-lang.org/reference/expressions/match-expr.html).
+
+Matching an owned non-copy value consumes it; matching `&value` or `&mut value`
+borrows its payloads recursively. Ignored owned fields are destroyed once.
+Destructuring cannot move fields out of a struct with custom `drop`.
+
+### 11.4. Conditional and early-exit bindings
+
+```dodo
+if let some(value) = optional {
+    consume(value)
+}
+
+let some(value) = optional else {
+    return
+}
+```
+
+`if let` evaluates its scrutinee once and makes immutable bindings available only
+in the success block; an optional `else` handles failure. `let` patterns introduce
+immutable bindings in the enclosing scope. A refutable `let` pattern requires
+an `else` block that exits the current path, for example with `return`, `break`,
+`continue`, or an infinite loop. An irrefutable pattern needs no `else`.
+The failure block cannot access the new bindings. Owned scrutinees are consumed
+on either path, with unused values destroyed; borrowed scrutinees remain borrowed.
+
+Conditional destructuring must cover every path that carries a `Result`.
+Success-only `ok(value)` patterns are rejected; use an exhaustive `match` with
+explicit `ok` and `err` handling, or propagate with `?` first. This restriction
+also applies to nested Results and borrowed Results. `some(result)` may match
+an `Option<Result<T, E>>` because the unmatched `none` path carries no Result,
+but the captured `result` must still be handled in the success block. Patterns
+cannot discard an unhandled Result in a wildcard, omitted field, or payload.
+A statement arm that produces a new Result must still forward, propagate, or
+handle it.
 
 ## 12. Results and error propagation
 
@@ -863,9 +969,9 @@ pub struct Samples {
 
     pub fn weighted_sum(&self) -> u32 {
         total := 0u32
-        for i, value in self.values {
+        for i, &value in self.values {
             weight := i as u32 + 1
-            total += weight * (*value as u32)
+            total += weight * (value as u32)
         }
         return total
     }
@@ -903,12 +1009,10 @@ package hex
 pub enum ParseError { Length, Digit }
 
 fn nibble(ch: u8) -> u8!ParseError {
-    if ch >= b'0' && ch <= b'9' {
-        return ok(ch - b'0')
-    } else if ch >= b'a' && ch <= b'f' {
-        return ok(ch - b'a' + 10)
-    } else {
-        return err(ParseError.Digit)
+    match ch {
+        b'0'..=b'9' => ok(ch - b'0'),
+        b'a'..=b'f' => ok(ch - b'a' + 10),
+        _ => err(ParseError.Digit),
     }
 }
 
@@ -916,13 +1020,13 @@ pub fn parse_byte(text: &[u8]) -> u8!ParseError {
     if text.len != 2 {
         return err(ParseError.Length)
     }
-    high := nibble(text[0])?
-    low := nibble(text[1])?
-    return ok((high << 4) | low)
+    let high = nibble(text[0])?
+    let low = nibble(text[1])?
+    ok((high << 4) | low)
 }
 
 pub fn parse_or(text: &[u8], fallback: u8) -> u8 {
-    return match parse_byte(text) {
+    match parse_byte(text) {
         ok(value) => value,
         err(_) => fallback,
     }
@@ -1023,10 +1127,12 @@ block         = "{", { statement }, "}" ;
 statement     = local-decl | expression-stmt | return-stmt
               | if-stmt | for-stmt | match-stmt
               | break-stmt | continue-stmt | unsafe-block ;
-local-decl    = identifier, ":=", expression, newline
+local-decl    = "let", pattern, [ ":", type ], "=", expression,
+                [ "else", block ], newline
+              | identifier, ":=", expression, newline
               | identifier, ":", type, [ "=", expression ], newline ;
 return-stmt   = "return", [ expression ], newline ;
-if-stmt       = "if", expression, block,
+if-stmt       = "if", ( expression | "let", pattern, "=", expression ), block,
                 { "else", "if", expression, block },
                 [ "else", block ] ;
 for-stmt      = "for", block
@@ -1034,17 +1140,28 @@ for-stmt      = "for", block
               | "for", for-init, ";", expression, ";",
                 expression, block
               | "for", identifier, "in", expression, [ "..", expression ], block
-              | "for", identifier, ",", identifier,
+              | "for", [ identifier, "," ], [ "&" ], identifier,
                 "in", expression, block ;
 match-stmt    = "match", expression, "{", { match-arm }, "}" ;
-match-arm     = pattern, "=>", block ;
+match-arm     = pattern, [ "if", expression ], "=>",
+                ( expression | block ), [ "," ] ;
+pattern       = pattern-atom, { "|", pattern-atom } ;
+pattern-atom  = "_" | identifier | boolean-literal | integer-literal
+              | integer-literal, ( ".." | "..=" ), integer-literal
+              | qualified-name, "(", [ pattern, { ",", pattern } ], ")"
+              | qualified-name, "{", [ pattern-field, { ",", pattern-field } ], "}"
+              | "(", pattern, ")" ;
+pattern-field = identifier, [ ":", pattern ] | ".." ;
 unsafe-block  = "unsafe", block ;
-array-literal = "[", [ expression, { ",", expression }, [ "," ] ], "]"
+array-list    = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
+array-literal = array-list
               | "[", expression, ";", constant-expression, "]" ;
+typed-array   = "(", array-list, ":", array-type, ")" ;
 struct-field  = identifier, [ ":", expression ] ;
 subslice      = expression, "[", [ expression ], "..", [ expression ], "]" ;
 match-expr    = "match", expression, "{", { value-arm }, "}" ;
-value-arm     = pattern, "=>", ( expression | value-block ), [ "," ] ;
+value-arm     = pattern, [ "if", expression ], "=>",
+                ( expression | value-block ), [ "," ] ;
 value-block   = "{", { statement }, expression, "}" ;
 ```
 
@@ -1053,8 +1170,13 @@ value-block   = "{", { statement }, expression, "}" ;
 A compiler claiming Dodo 0.1 conformance should, at minimum:
 
 - Accept the specified declarations, functions, methods, control flow, and types.
-- Default omitted return types to void and require explicit function returns.
+- Default omitted return types to void; accept final-expression and explicit returns.
+- Distinguish immutable runtime bindings, mutable locals, and compile-time constants.
+- Share recursive patterns across matching and conditional bindings without weakening Result handling.
 - Infer local generic arguments and array elements where the context suffices.
+- Support explicit copy patterns only for shared copyable collection elements.
+- Preserve explicit types when formatting historical syntax into canonical forms.
+- Support leading-dot continuation with semicolons as expression boundaries.
 - Resolve constant dependencies and reject cycles and invalid array lengths.
 - Preserve evaluation order, ownership, and cleanup in value blocks and ranges.
 - Enforce definite initialization and invalidation after moves.
@@ -1087,7 +1209,8 @@ independent implementations are expected to agree on output or diagnostics.
    optimizations, and further optional-value operations.
 5. **Generics:** Constraints, inference beyond the local rules in section 4.7,
    separate compilation, instantiation, variance, and code sharing.
-6. **Patterns:** Complete grammar, binding modes, and exhaustiveness algorithm.
+6. **Patterns:** Additional binding modes, constant range endpoints, and diagnostics
+   for redundant patterns; compiler complexity limits for exhaustiveness checking.
 7. **Pointers:** Provenance, integer conversion, foreign-allocation identity, and
    the alias model governing unsafe raw access.
 8. **ABI and layout:** Non-C structs, enums, calling conventions beyond declared

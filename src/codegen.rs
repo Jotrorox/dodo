@@ -937,6 +937,22 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.builder.build_unreachable()?;
                 }
             }
+            StmtKind::IfLet {
+                pattern,
+                value,
+                then_block,
+                else_block,
+            } => {
+                self.if_let_stmt(pattern, value, then_block, else_block)?;
+            }
+            StmtKind::LetPattern {
+                pattern,
+                value,
+                else_block,
+                ..
+            } => {
+                self.let_pattern_stmt(pattern, value, else_block.as_ref())?;
+            }
             StmtKind::For {
                 init,
                 condition,
@@ -984,9 +1000,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             StmtKind::ForEach {
                 index,
                 name,
+                copy,
                 iterable,
                 body,
-            } => self.foreach(index.as_deref(), name, iterable, body)?,
+            } => self.foreach(index.as_deref(), name, *copy, iterable, body)?,
             StmtKind::Break | StmtKind::Continue => {
                 let l = *self
                     .loops
@@ -2026,6 +2043,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         &mut self,
         index: Option<&str>,
         name: &str,
+        copy: bool,
         iterable: &Expr,
         body: &Block,
     ) -> Result<()> {
@@ -2064,7 +2082,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.builder
                 .build_gep(self.ty(&element)?, ptr, &[i], "foreach.element")?
         };
-        self.bind(name, &Type::Ref(mutable, Box::new(element)), Some(p.into()))?;
+        if copy {
+            if name != "_" {
+                let value = self.load(p, &element)?;
+                self.bind(name, &element, Some(value))?;
+            }
+        } else {
+            self.bind(name, &Type::Ref(mutable, Box::new(element)), Some(p.into()))?;
+        }
         self.block(body)?;
         if !self.terminated() {
             self.cleanup_to(self.scopes.len() - 1)?;
@@ -2081,110 +2106,567 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.builder.position_at_end(end);
         Ok(())
     }
-    fn match_stmt(&mut self, value: &Expr, arms: &[MatchArm]) -> Result<()> {
-        self.scopes.push(vec![]);
-        let borrowed = if let Type::Ref(m, t) = &value.ty {
-            Some((*m, *t.clone()))
-        } else {
-            None
-        };
-        let actual = borrowed
-            .as_ref()
-            .map_or_else(|| value.ty.clone(), |(_, t)| t.clone());
-        let (ptr, owner) = if borrowed.is_some() {
-            (self.expr(value)?.into_pointer_value(), None)
-        } else {
-            let v = self.expr(value)?;
-            let b = self.bind("$match", &value.ty, Some(v))?;
-            (b.ptr, Some(b))
-        };
-        let aggregate = matches!(actual, Type::Named(_) | Type::Result(..) | Type::Option(_));
-        let tag = if aggregate {
-            let p = self.builder.build_struct_gep(
-                self.ty(&actual)?.into_struct_type(),
-                ptr,
-                0,
-                "match.tag",
-            )?;
-            let t = if matches!(actual, Type::Named(_)) {
-                self.context.i32_type()
-            } else {
-                self.context.bool_type()
-            };
-            self.builder.build_load(t, p, "tag")?.into_int_value()
-        } else {
-            self.load(ptr, &actual)?.into_int_value()
-        };
-        let end = self.bb("match.end");
-        let blocks = arms
-            .iter()
-            .map(|_| self.bb("match.arm"))
-            .collect::<Vec<_>>();
-        let fallback = arms
-            .iter()
-            .position(|a| matches!(a.pattern, Pattern::Wildcard))
-            .map(|i| blocks[i]);
-        let unreachable = self.bb("match.invalid");
-        let mut cases = vec![];
-        for (a, bb) in arms.iter().zip(&blocks) {
-            let n = match &a.pattern {
-                Pattern::Wildcard => continue,
-                Pattern::Int(n) => *n,
-                Pattern::Bool(b) => *b as u64,
-                Pattern::Variant(n, _) => self.variant_tag(&actual, n)?,
-            };
-            cases.push((tag.get_type().const_int(n, false), *bb));
-        }
-        self.builder
-            .build_switch(tag, fallback.unwrap_or(unreachable), &cases)?;
-        self.builder.position_at_end(unreachable);
-        self.builder.build_unreachable()?;
-        let mut reaches_end = false;
-        for (a, bb) in arms.iter().zip(blocks) {
-            self.builder.position_at_end(bb);
-            self.scopes.push(vec![]);
-            if let Some(owner) = &owner
-                && let Some(flag) = owner.live
-            {
-                self.builder
-                    .build_store(flag, self.context.bool_type().const_zero())?;
+    /// Expand nested alternatives in source order. Each alternative gets its own
+    /// guard evaluation, including when several alternatives match the value.
+    fn pattern_alternatives(pattern: &Pattern) -> Vec<Pattern> {
+        match pattern {
+            Pattern::Or(patterns) => patterns
+                .iter()
+                .flat_map(Self::pattern_alternatives)
+                .collect(),
+            Pattern::Variant(name, fields) => {
+                let mut combinations = vec![vec![]];
+                for field in fields {
+                    let alternatives = Self::pattern_alternatives(field);
+                    combinations = combinations
+                        .into_iter()
+                        .flat_map(|prefix| {
+                            alternatives.iter().map(move |alternative| {
+                                let mut fields = prefix.clone();
+                                fields.push(alternative.clone());
+                                fields
+                            })
+                        })
+                        .collect();
+                }
+                combinations
+                    .into_iter()
+                    .map(|fields| Pattern::Variant(name.clone(), fields))
+                    .collect()
             }
-            match &a.pattern {
-                Pattern::Variant(name, names) => {
-                    let payloads = self.pattern_payloads(ptr, &actual, name)?;
-                    for ((p, t), name) in payloads.into_iter().zip(names) {
-                        if name == "_" {
-                            if borrowed.is_none() {
-                                self.drop_ptr(p, &t)?;
-                            }
-                            continue;
-                        }
-                        if let Some((m, _)) = &borrowed {
-                            self.bind(name, &Type::Ref(*m, Box::new(t)), Some(p.into()))?;
+            Pattern::Struct(name, fields, rest) => {
+                let mut combinations = vec![vec![]];
+                for (field, pattern) in fields {
+                    let alternatives = Self::pattern_alternatives(pattern);
+                    combinations = combinations
+                        .into_iter()
+                        .flat_map(|prefix| {
+                            alternatives.iter().map(move |alternative| {
+                                let mut fields = prefix.clone();
+                                fields.push((field.clone(), alternative.clone()));
+                                fields
+                            })
+                        })
+                        .collect();
+                }
+                combinations
+                    .into_iter()
+                    .map(|fields| Pattern::Struct(name.clone(), fields, *rest))
+                    .collect()
+            }
+            _ => vec![pattern.clone()],
+        }
+    }
+    fn pattern_value(
+        &mut self,
+        value: &Expr,
+    ) -> Result<(
+        PointerValue<'ctx>,
+        Type,
+        Option<bool>,
+        Option<Binding<'ctx>>,
+    )> {
+        if let Type::Ref(mutable, inner) = &value.ty {
+            Ok((
+                self.expr(value)?.into_pointer_value(),
+                *inner.clone(),
+                Some(*mutable),
+                None,
+            ))
+        } else {
+            let value_ir = self.expr(value)?;
+            let owner = self.bind("$pattern", &value.ty, Some(value_ir))?;
+            Ok((owner.ptr, value.ty.clone(), None, Some(owner)))
+        }
+    }
+    /// Reference fields are inspected through their pointees for a structural
+    /// pattern. A binding still binds the reference itself.
+    fn pattern_place(
+        &self,
+        pattern: &Pattern,
+        mut ptr: PointerValue<'ctx>,
+        ty: &Type,
+        mut borrowed: Option<bool>,
+    ) -> Result<(PointerValue<'ctx>, Type, Option<bool>)> {
+        let mut ty = ty.clone();
+        if !matches!(pattern, Pattern::Binding(_) | Pattern::Wildcard) {
+            while let Type::Ref(mutable, inner) = &ty {
+                ptr = self.load(ptr, &ty)?.into_pointer_value();
+                borrowed = Some(borrowed.is_none_or(|outer| outer) && *mutable);
+                ty = *inner.clone();
+            }
+        }
+        Ok((ptr, ty, borrowed))
+    }
+    fn struct_pattern_fields(
+        &self,
+        ptr: PointerValue<'ctx>,
+        ty: &Type,
+    ) -> Result<Vec<(String, PointerValue<'ctx>, Type)>> {
+        let Type::Named(name) = ty else {
+            return Err(error("struct pattern on non-struct value"));
+        };
+        let declaration = self
+            .program
+            .structs
+            .iter()
+            .find(|s| s.name == *name)
+            .ok_or_else(|| error("unknown struct pattern"))?;
+        let st = self.ty(ty)?.into_struct_type();
+        declaration
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                Ok((
+                    field.name.clone(),
+                    self.builder
+                        .build_struct_gep(st, ptr, i as u32, "pattern.field")?,
+                    field.ty.clone(),
+                ))
+            })
+            .collect()
+    }
+    /// Emit short-circuit tests so inactive enum payloads are never loaded.
+    fn pattern_test(
+        &mut self,
+        pattern: &Pattern,
+        ptr: PointerValue<'ctx>,
+        ty: &Type,
+        yes: BasicBlock<'ctx>,
+        no: BasicBlock<'ctx>,
+    ) -> Result<()> {
+        let (ptr, ty, _) = self.pattern_place(pattern, ptr, ty, None)?;
+        match pattern {
+            Pattern::Binding(_) | Pattern::Wildcard => {
+                self.builder.build_unconditional_branch(yes)?;
+            }
+            Pattern::Int(value) | Pattern::Range(value, _, _) => {
+                let value_ir = self.load(ptr, &ty)?.into_int_value();
+                let signed = matches!(ty, Type::Int { signed: true, .. });
+                let lower = value_ir.get_type().const_int(*value, false);
+                let test = if let Pattern::Range(_, upper, inclusive) = pattern {
+                    let lower_test = self.builder.build_int_compare(
+                        if signed {
+                            IntPredicate::SGE
                         } else {
-                            let v = self.load(p, &t)?;
-                            self.bind(name, &t, Some(v))?;
+                            IntPredicate::UGE
+                        },
+                        value_ir,
+                        lower,
+                        "pattern.lower",
+                    )?;
+                    let upper_test = self.builder.build_int_compare(
+                        match (signed, inclusive) {
+                            (true, true) => IntPredicate::SLE,
+                            (true, false) => IntPredicate::SLT,
+                            (false, true) => IntPredicate::ULE,
+                            (false, false) => IntPredicate::ULT,
+                        },
+                        value_ir,
+                        value_ir.get_type().const_int(*upper, false),
+                        "pattern.upper",
+                    )?;
+                    self.builder
+                        .build_and(lower_test, upper_test, "pattern.range")?
+                } else {
+                    self.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        value_ir,
+                        lower,
+                        "pattern.equal",
+                    )?
+                };
+                self.builder.build_conditional_branch(test, yes, no)?;
+            }
+            Pattern::Bool(value) => {
+                let value_ir = self.load(ptr, &ty)?.into_int_value();
+                let test = self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    value_ir,
+                    self.context.bool_type().const_int(*value as u64, false),
+                    "pattern.bool",
+                )?;
+                self.builder.build_conditional_branch(test, yes, no)?;
+            }
+            Pattern::Variant(name, fields) => {
+                let tagptr = self.builder.build_struct_gep(
+                    self.ty(&ty)?.into_struct_type(),
+                    ptr,
+                    0,
+                    "pattern.tag",
+                )?;
+                let tag_type = if matches!(ty, Type::Named(_)) {
+                    self.context.i32_type()
+                } else {
+                    self.context.bool_type()
+                };
+                let tag = self
+                    .builder
+                    .build_load(tag_type, tagptr, "tag")?
+                    .into_int_value();
+                let test = self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    tag,
+                    tag_type.const_int(self.variant_tag(&ty, name)?, false),
+                    "pattern.variant",
+                )?;
+                if fields.is_empty() {
+                    self.builder.build_conditional_branch(test, yes, no)?;
+                } else {
+                    let payload = self.bb("pattern.payload");
+                    self.builder.build_conditional_branch(test, payload, no)?;
+                    self.builder.position_at_end(payload);
+                    let payloads = self.pattern_payloads(ptr, &ty, name)?;
+                    for (i, (field, (ptr, ty))) in fields.iter().zip(payloads).enumerate() {
+                        let next = if i + 1 == fields.len() {
+                            yes
+                        } else {
+                            self.bb("pattern.next")
+                        };
+                        self.pattern_test(field, ptr, &ty, next, no)?;
+                        if i + 1 != fields.len() {
+                            self.builder.position_at_end(next);
                         }
                     }
                 }
-                Pattern::Wildcard if borrowed.is_none() => {
-                    self.drop_ptr(ptr, &actual)?;
-                }
-                _ => {}
             }
-            self.block(&a.body)?;
+            Pattern::Struct(_, fields, _) => {
+                let all_fields = self.struct_pattern_fields(ptr, &ty)?;
+                if fields.is_empty() {
+                    self.builder.build_unconditional_branch(yes)?;
+                }
+                for (i, (name, field)) in fields.iter().enumerate() {
+                    let (_, ptr, ty) = all_fields
+                        .iter()
+                        .find(|(n, _, _)| n == name)
+                        .ok_or_else(|| error("unknown pattern field"))?;
+                    let next = if i + 1 == fields.len() {
+                        yes
+                    } else {
+                        self.bb("pattern.next")
+                    };
+                    self.pattern_test(field, *ptr, ty, next, no)?;
+                    if i + 1 != fields.len() {
+                        self.builder.position_at_end(next);
+                    }
+                }
+            }
+            Pattern::Or(_) => return Err(error("unexpanded pattern alternative")),
+        }
+        Ok(())
+    }
+    /// Preview bindings only alias the scrutinee for guard evaluation. Commit
+    /// transfers ownership and drops the fields omitted by the chosen pattern.
+    fn pattern_bind(
+        &mut self,
+        pattern: &Pattern,
+        ptr: PointerValue<'ctx>,
+        ty: &Type,
+        borrowed: Option<bool>,
+        preview: bool,
+        destinations: Option<&HashMap<String, Binding<'ctx>>>,
+    ) -> Result<()> {
+        let (ptr, ty, borrowed) = self.pattern_place(pattern, ptr, ty, borrowed)?;
+        match pattern {
+            Pattern::Binding(name) => {
+                let (binding_ty, value) = if let Some(mutable) = borrowed {
+                    (Type::Ref(mutable, Box::new(ty)), ptr.into())
+                } else {
+                    let value = self.load(ptr, &ty)?;
+                    (ty, value)
+                };
+                if let Some(destinations) = destinations {
+                    let binding = &destinations[name];
+                    self.builder.build_store(binding.ptr, value)?;
+                    if let Some(flag) = binding.live {
+                        self.builder
+                            .build_store(flag, self.context.bool_type().const_int(1, false))?;
+                    }
+                } else {
+                    let binding = self.bind(name, &binding_ty, Some(value))?;
+                    if preview && let Some(flag) = binding.live {
+                        self.builder
+                            .build_store(flag, self.context.bool_type().const_zero())?;
+                    }
+                }
+            }
+            Pattern::Variant(name, fields) => {
+                for (field, (ptr, ty)) in fields.iter().zip(self.pattern_payloads(ptr, &ty, name)?)
+                {
+                    self.pattern_bind(field, ptr, &ty, borrowed, preview, destinations)?;
+                }
+            }
+            Pattern::Struct(_, fields, _) => {
+                let all_fields = self.struct_pattern_fields(ptr, &ty)?;
+                for (name, pattern) in fields {
+                    let (_, ptr, ty) = all_fields
+                        .iter()
+                        .find(|(n, _, _)| n == name)
+                        .ok_or_else(|| error("unknown pattern field"))?;
+                    self.pattern_bind(pattern, *ptr, ty, borrowed, preview, destinations)?;
+                }
+                for (name, ptr, ty) in all_fields.into_iter().rev() {
+                    if !fields.iter().any(|(n, _)| *n == name) {
+                        self.pattern_bind(
+                            &Pattern::Wildcard,
+                            ptr,
+                            &ty,
+                            borrowed,
+                            preview,
+                            destinations,
+                        )?;
+                    }
+                }
+            }
+            Pattern::Wildcard if !preview && borrowed.is_none() => self.drop_ptr(ptr, &ty)?,
+            Pattern::Or(_) => return Err(error("unexpanded pattern alternative")),
+            _ => {}
+        }
+        Ok(())
+    }
+    fn pattern_commit(&self, owner: &Option<Binding<'ctx>>) -> Result<()> {
+        if let Some(owner) = owner
+            && let Some(flag) = owner.live
+        {
+            self.builder
+                .build_store(flag, self.context.bool_type().const_zero())?;
+        }
+        Ok(())
+    }
+    fn order_pattern_bindings(&mut self, names: &[String]) {
+        // Alternatives introduce one lexical set of bindings, whose drop
+        // order is defined by the first alternative even when another wins.
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .sort_by_key(|binding| names.iter().position(|name| *name == binding.name));
+    }
+    fn match_stmt(&mut self, value: &Expr, arms: &[MatchArm]) -> Result<()> {
+        self.scopes.push(vec![]);
+        let (ptr, actual, borrowed, owner) = self.pattern_value(value)?;
+        let end = self.bb("match.end");
+        let mut reaches_end = false;
+        for arm in arms {
+            let binding_order = arm.pattern.bindings();
+            for pattern in Self::pattern_alternatives(&arm.pattern) {
+                let yes = self.bb("match.pattern");
+                let no = self.bb("match.next");
+                self.pattern_test(&pattern, ptr, &actual, yes, no)?;
+                self.builder.position_at_end(yes);
+                if let Some(guard) = &arm.guard {
+                    self.scopes.push(vec![]);
+                    self.pattern_bind(&pattern, ptr, &actual, borrowed, true, None)?;
+                    self.order_pattern_bindings(&binding_order);
+                    let condition = self.expr(guard)?.into_int_value();
+                    self.cleanup_to(self.scopes.len() - 1)?;
+                    self.scopes.pop();
+                    let accepted = self.bb("match.guarded");
+                    self.builder
+                        .build_conditional_branch(condition, accepted, no)?;
+                    self.builder.position_at_end(accepted);
+                }
+                self.scopes.push(vec![]);
+                self.pattern_commit(&owner)?;
+                self.pattern_bind(&pattern, ptr, &actual, borrowed, false, None)?;
+                self.order_pattern_bindings(&binding_order);
+                self.block(&arm.body)?;
+                if !self.terminated() {
+                    self.cleanup_to(self.scopes.len() - 1)?;
+                    self.builder.build_unconditional_branch(end)?;
+                    reaches_end = true;
+                }
+                self.scopes.pop();
+                self.builder.position_at_end(no);
+            }
+        }
+        self.builder.build_unreachable()?;
+        self.builder.position_at_end(end);
+        if !reaches_end {
+            self.builder.build_unreachable()?;
+        }
+        self.scopes.pop();
+        Ok(())
+    }
+    fn if_let_stmt(
+        &mut self,
+        pattern: &Pattern,
+        value: &Expr,
+        then_block: &Block,
+        else_block: &Block,
+    ) -> Result<()> {
+        self.scopes.push(vec![]);
+        let (ptr, actual, borrowed, owner) = self.pattern_value(value)?;
+        let end = self.bb("if.let.end");
+        let mut reaches_end = false;
+        let binding_order = pattern.bindings();
+        for pattern in Self::pattern_alternatives(pattern) {
+            let yes = self.bb("if.let.then");
+            let no = self.bb("if.let.next");
+            self.pattern_test(&pattern, ptr, &actual, yes, no)?;
+            self.builder.position_at_end(yes);
+            self.scopes.push(vec![]);
+            self.pattern_commit(&owner)?;
+            self.pattern_bind(&pattern, ptr, &actual, borrowed, false, None)?;
+            self.order_pattern_bindings(&binding_order);
+            self.block(then_block)?;
             if !self.terminated() {
                 self.cleanup_to(self.scopes.len() - 1)?;
                 self.builder.build_unconditional_branch(end)?;
                 reaches_end = true;
             }
             self.scopes.pop();
+            self.builder.position_at_end(no);
+        }
+        if let Some(owner) = &owner {
+            self.drop_binding(owner)?;
+        }
+        self.block(else_block)?;
+        if !self.terminated() {
+            self.builder.build_unconditional_branch(end)?;
+            reaches_end = true;
         }
         self.builder.position_at_end(end);
         if !reaches_end {
             self.builder.build_unreachable()?;
         }
         self.scopes.pop();
+        Ok(())
+    }
+    fn pattern_binding_types(
+        &self,
+        pattern: &Pattern,
+        ty: &Type,
+        mut borrowed: Option<bool>,
+        bindings: &mut Vec<(String, Type)>,
+    ) -> Result<()> {
+        let mut ty = ty;
+        if !matches!(pattern, Pattern::Binding(_) | Pattern::Wildcard) {
+            while let Type::Ref(mutable, inner) = ty {
+                borrowed = Some(borrowed.is_none_or(|outer| outer) && *mutable);
+                ty = inner;
+            }
+        }
+        match pattern {
+            Pattern::Binding(name) => {
+                bindings.push((
+                    name.clone(),
+                    borrowed.map_or_else(
+                        || ty.clone(),
+                        |mutable| Type::Ref(mutable, Box::new(ty.clone())),
+                    ),
+                ));
+            }
+            Pattern::Variant(name, fields) => {
+                let tag = self.variant_tag(ty, name)?;
+                let types = match ty {
+                    Type::Result(ok, err) => {
+                        let ty = if tag == 0 { ok } else { err };
+                        if **ty == Type::Void {
+                            vec![]
+                        } else {
+                            vec![ty.as_ref()]
+                        }
+                    }
+                    Type::Option(inner) => {
+                        if tag == 0 {
+                            vec![]
+                        } else {
+                            vec![inner.as_ref()]
+                        }
+                    }
+                    Type::Named(name) => self
+                        .program
+                        .enums
+                        .iter()
+                        .find(|e| e.name == *name)
+                        .ok_or_else(|| error("unknown enum pattern"))?
+                        .variants[tag as usize]
+                        .fields
+                        .iter()
+                        .map(|f| &f.ty)
+                        .collect(),
+                    _ => return Err(error("invalid payload pattern")),
+                };
+                for (pattern, ty) in fields.iter().zip(types) {
+                    self.pattern_binding_types(pattern, ty, borrowed, bindings)?;
+                }
+            }
+            Pattern::Struct(_, fields, _) => {
+                let Type::Named(name) = ty else {
+                    return Err(error("invalid struct pattern"));
+                };
+                let declaration = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|s| s.name == *name)
+                    .ok_or_else(|| error("unknown struct pattern"))?;
+                for (name, pattern) in fields {
+                    let field = declaration
+                        .fields
+                        .iter()
+                        .find(|f| f.name == *name)
+                        .ok_or_else(|| error("unknown pattern field"))?;
+                    self.pattern_binding_types(pattern, &field.ty, borrowed, bindings)?;
+                }
+            }
+            Pattern::Or(_) => return Err(error("unexpanded pattern alternative")),
+            _ => {}
+        }
+        Ok(())
+    }
+    fn let_pattern_stmt(
+        &mut self,
+        pattern: &Pattern,
+        value: &Expr,
+        else_block: Option<&Block>,
+    ) -> Result<()> {
+        let (ptr, actual, borrowed, owner) = self.pattern_value(value)?;
+        let alternatives = Self::pattern_alternatives(pattern);
+        // Allocate the names once so every successful alternative initializes
+        // the same bindings visible to the following statements.
+        let mut binding_types = vec![];
+        self.pattern_binding_types(&alternatives[0], &actual, borrowed, &mut binding_types)?;
+        self.scopes.push(vec![]);
+        for (name, ty) in binding_types {
+            self.bind(&name, &ty, None)?;
+        }
+        let destinations = self
+            .scopes
+            .pop()
+            .unwrap()
+            .into_iter()
+            .map(|binding| (binding.name.clone(), binding))
+            .collect::<HashMap<_, _>>();
+        let end = self.bb("let.pattern.end");
+        for pattern in alternatives {
+            let yes = self.bb("let.pattern.bound");
+            let no = self.bb("let.pattern.next");
+            self.pattern_test(&pattern, ptr, &actual, yes, no)?;
+            self.builder.position_at_end(yes);
+            self.pattern_commit(&owner)?;
+            self.pattern_bind(&pattern, ptr, &actual, borrowed, false, Some(&destinations))?;
+            self.builder.build_unconditional_branch(end)?;
+            self.builder.position_at_end(no);
+        }
+        if let Some(owner) = &owner {
+            self.drop_binding(owner)?;
+        }
+        if let Some(block) = else_block {
+            self.block(block)?;
+        }
+        if !self.terminated() {
+            self.builder.build_unreachable()?;
+        }
+        self.builder.position_at_end(end);
+        // Preserve source binding order for deterministic reverse-order drops.
+        for name in pattern.bindings() {
+            self.scopes
+                .last_mut()
+                .unwrap()
+                .push(destinations[&name].clone());
+        }
         Ok(())
     }
     fn variant_tag(&self, t: &Type, name: &str) -> Result<u64> {

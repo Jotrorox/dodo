@@ -433,6 +433,215 @@ fn main() -> i32 {
     );
 }
 
+#[test]
+fn immutable_runtime_bindings_preserve_mutable_references_and_function_tails() {
+    native_at_all_levels(
+        r#"package bindings
+struct Counter { value: i32 }
+fn read_limit() -> i32 { 20 }
+fn add(a: i32, b: i32) -> i32 { a + b }
+fn early(value: i32) -> i32 {
+    if value < 0 { return 0 }
+    { value + 1 }
+}
+fn main() -> i32 {
+    const CAPACITY: usize = 2
+    let limit: i32 = read_limit()
+    count := Counter{value: 0}
+    let reference = &mut count
+    reference.value = limit
+    let contents = &mut reference.value
+    *contents += 1
+    data := [0i32; CAPACITY]
+    let view = &mut data[..]
+    view[0] = early(0)
+    let second = &mut view[1]
+    *second = 20
+    add(count.value, data[0] + data[1])
+}
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn recursive_patterns_ranges_guards_and_conditional_bindings_execute() {
+    native_at_all_levels(
+        r#"package patterns
+struct Inner { value: Option<Option<i32>> }
+struct Outer { inner: Inner, unused: i32 }
+fn unpack(optional: Option<i32>) -> i32 {
+    let some(value) = optional else { return 0 }
+    value
+}
+fn classify(value: Option<Option<bool>>) -> i32 {
+    match value {
+        some(some(true)) => 1,
+        some(some(false)) => 2,
+        some(none) => 3,
+        none => 4,
+    }
+}
+fn digit(ch: u8) -> i32 {
+    match ch {
+        b'0'..=b'9' => 10,
+        b'a'..b'g' | b'A'..=b'F' => 20,
+        _ => 0,
+    }
+}
+fn main() -> i32 {
+    let outer = Outer{inner: Inner{value: some(some(7i32))}, unused: 99}
+    total := 0i32
+    if let Outer{inner: Inner{value: some(some(value))}, ..} = outer {
+        total += value
+    } else { return 1 }
+    let Inner{value: optional} = Inner{value: some(some(2i32))}
+    let some(some(value)) = optional else { return 2 }
+    total += value
+    match digit(b'a') {
+        value if value > 10 => { total += value }
+        _ => { return 3 }
+    }
+    total + unpack(some(3i32)) + unpack(none) + classify(some(some(true))) + classify(some(some(false))) + classify(some(none)) + classify(none)
+}
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn alternative_patterns_retry_guards_in_order() {
+    native_at_all_levels(
+        r#"package guards
+unsafe extern "C" fn putchar(value: i32) -> i32
+enum Pair { Values(i32, i32) }
+fn accept(value: i32) -> bool {
+    unsafe { putchar(64 + value) }
+    value == 1
+}
+fn main() -> i32 {
+    match Pair.Values(1, 2) {
+        Pair.Values(1, value) | Pair.Values(value, 2) if accept(value) => 42,
+        _ => 0,
+    }
+}
+"#,
+        42,
+        "BA",
+    );
+}
+
+#[test]
+fn statement_match_expression_arms_handle_results_and_function_tails_forward_them() {
+    native_at_all_levels(
+        r#"package results
+fn read(fail: bool) -> i32!i32 {
+    if fail { err(7) } else { ok(42) }
+}
+fn forward() -> i32!i32 { read(false) }
+fn consume(value: i32) {}
+fn main() -> i32 {
+    match read(true) {
+        ok(value) => consume(value),
+        err(error) => consume(error),
+    }
+    match forward() {
+        ok(value) => value,
+        err(_) => 0,
+    }
+}
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn recursive_borrowed_patterns_keep_mutable_payload_access() {
+    native_at_all_levels(
+        r#"package borrows
+struct Item { value: i32 }
+fn main() -> i32 {
+    item := some(some(Item{value: 40}))
+    if let some(some(Item{value})) = &mut item { *value += 1 }
+    let some(some(Item{value})) = &mut item else { return 0 }
+    *value += 1
+    *value
+}
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn new_binding_and_pattern_forms_reject_invalid_programs() {
+    for (body, message) in [
+        ("fn f() { let x = 1\nx = 2 }", "immutable"),
+        (
+            "struct S { x: i32 }\nfn f() { let s = S{x: 1}\ns.x = 2 }",
+            "immutable",
+        ),
+        ("fn f() { let a = [1i32]\na[0] = 2 }", "immutable"),
+        ("fn f() { let x = 1\nr := &mut x }", "immutable"),
+        ("fn f() { let x = 1\nconst N: isize = x }", "compile-time"),
+        ("fn f() -> i32 { 42; }", "returning"),
+        ("fn f() -> i32 { false }", "expected"),
+        (
+            "fn fallible() -> i32!i32 { ok(1) }\nfn f() { match true { true => fallible(), false => fallible() } }",
+            "Result",
+        ),
+        ("fn f(value: i32!i32) { if let ok(x) = value {} }", "Result"),
+        (
+            "fn f(value: i32!i32) { let ok(x) = value else { return } }",
+            "Result",
+        ),
+        (
+            "fn f(value: Option<i32!i32>) { if let some(ok(x)) = value {} }",
+            "Result",
+        ),
+        (
+            "fn f(value: Option<i32!i32>) { match value { some(_) => {}, none => {} } }",
+            "Result",
+        ),
+        (
+            "fn f(value: Option<i32>) { let some(x) = value else {} }",
+            "diverge",
+        ),
+        (
+            "fn f(value: Option<i32>) { let some(x) = value }",
+            "refutable",
+        ),
+        (
+            "fn f(value: Option<i32>) { match value { some(x) | none => {}, _ => {} } }",
+            "bind",
+        ),
+        (
+            "fn f(value: Option<Option<bool>>) { match value { some(some(true)) => {}, some(none) => {}, none => {} } }",
+            "exhaustive",
+        ),
+        (
+            "fn f(value: bool) { match value { true if false => {}, false => {} } }",
+            "exhaustive",
+        ),
+        (
+            "fn f(value: u8) { match value { 300..=400 => {}, _ => {} } }",
+            "range",
+        ),
+        (
+            "fn f(value: u8) { match value { 9..=1 => {}, _ => {} } }",
+            "range",
+        ),
+        (
+            "struct S { x: i32 }\nfn take(s: S) -> bool { true }\nfn f(value: Option<S>) { match value { some(s) if take(s) => {}, _ => {} } }",
+            "guard",
+        ),
+    ] {
+        rejects(&format!("package invalid\n{body}\n"), message);
+    }
+}
 const DROP_TYPE: &str = r#"
 unsafe extern "C" fn putchar(character: i32) -> i32
 struct Guard {
@@ -1321,5 +1530,318 @@ fn main() -> i32 {
     rejects(
         "package slice_loan\nfn main() { data := [1u8, 2]\nview := &data[{ data[0] = 9\n0 }..] }\n",
         "overlapping",
+    );
+}
+
+#[test]
+fn pattern_example_runs() {
+    native_at_all_levels(include_str!("../examples/patterns.dodo"), 0, "");
+}
+
+#[test]
+fn nested_patterns_drop_ignored_values_and_guard_failures_once() {
+    let source = format!(
+        "package cleanup\n{DROP_TYPE}\n{}",
+        r#"struct Pair { first: Guard, second: Guard }
+fn run(value: Option<Pair>) -> i32 {
+    match value {
+        some(Pair{first, ..}) if first.character == 0 => 1,
+        some(Pair{first, ..}) => first.character,
+        none => 0,
+    }
+}
+fn conditional(value: Option<Option<Guard>>) {
+    if let some(some(guard)) = value { core.drop(guard) }
+}
+fn main() -> i32 {
+    let code = run(some(Pair{first: Guard{character: 65}, second: Guard{character: 66}}))
+    conditional(some(some(Guard{character: 67})))
+    conditional(some(none))
+    let some(guard) = some(Guard{character: 68}) else { return 1 }
+    core.drop(guard)
+    code - 65
+}
+"#
+    );
+    native_at_all_levels(&source, 0, "BACD");
+}
+
+#[test]
+fn if_let_failure_drops_unmatched_owned_payload() {
+    let source = format!(
+        "package cleanup\n{DROP_TYPE}\n{}",
+        r#"struct Pair { first: Guard, second: Guard }
+fn main() -> i32 {
+    let pair = some(Pair{first: Guard{character: 65}, second: Guard{character: 66}})
+    if let none = pair { return 2 }
+    0
+}
+"#
+    );
+    native_at_all_levels(&source, 0, "BA");
+}
+
+#[test]
+fn imported_recursive_patterns_resolve_types_bindings_and_guard_constants() {
+    let workspace = Workspace::new();
+    workspace.file(
+        "items/lib.dodo",
+        r#"package items
+pub const MIN: i32 = 40
+pub struct Item { pub value: Option<i32> }
+pub enum Envelope { Value(Item), Empty }
+pub fn make() -> Envelope { Envelope.Value(Item{value: some(42i32)}) }
+"#,
+    );
+    let source = workspace.source(
+        r#"package app
+import "items"
+fn main() -> i32 {
+    let item = items.make()
+    match item {
+        items.Envelope.Value(items.Item{value: some(value)}) if value > items.MIN => value,
+        _ => 0,
+    }
+}
+"#,
+    );
+    for optimization in [0, 3] {
+        let executable = workspace.build(&source, optimization);
+        assert_eq!(workspace.execute(&executable).status.code(), Some(42));
+    }
+}
+
+#[test]
+fn pattern_codegen_guard_return_drops_scrutinee_once() {
+    let source = format!(
+        "package guard_return\n{DROP_TYPE}\n{}",
+        r#"fn inspect(stop: bool) -> i32 {
+    match some(Guard{character: 65}) {
+        some(value) if {
+            if stop { return 40 }
+            value.character == 65
+        } => 2,
+        some(_) => 0,
+        none => 0,
+    }
+}
+fn main() -> i32 { inspect(true) + inspect(false) }
+"#
+    );
+    native_at_all_levels(&source, 42, "AA");
+}
+
+#[test]
+fn pattern_codegen_guard_propagation_drops_scrutinee_once() {
+    let source = format!(
+        "package guard_propagation\n{DROP_TYPE}\n{}",
+        r#"fn condition(value: &Guard, fail: bool) -> bool!i32 {
+    if fail { err(40) } else { ok(value.character == 66) }
+}
+fn inspect(fail: bool) -> i32!i32 {
+    match some(Guard{character: 66}) {
+        some(value) if condition(&value, fail)? => ok(2),
+        some(_) => ok(0),
+        none => ok(0),
+    }
+}
+fn main() -> i32 {
+    let first = match inspect(true) { ok(value) => value, err(error) => error }
+    let second = match inspect(false) { ok(value) => value, err(error) => error }
+    first + second
+}
+"#
+    );
+    native_at_all_levels(&source, 42, "BB");
+}
+
+#[test]
+fn pattern_codegen_let_else_alternatives_share_binding_storage() {
+    let source = format!(
+        "package let_alternatives\n{DROP_TYPE}\n{}",
+        r#"struct Pair { left: Option<Guard>, right: Option<Guard> }
+fn inspect(right: bool) -> i32 {
+    pair := if right {
+        Pair{left: none, right: some(Guard{character: 66})}
+    } else {
+        Pair{left: some(Guard{character: 65}), right: none}
+    }
+    let Pair{left: some(value), right: none}
+        | Pair{left: none, right: some(value)} = pair else { return 0 }
+    value.character - 44
+}
+fn main() -> i32 { inspect(false) + inspect(true) - 1 }
+"#
+    );
+    native_at_all_levels(&source, 42, "AB");
+}
+
+#[test]
+fn generic_patterns_and_unqualified_variants_preserve_existing_syntax() {
+    native_at_all_levels(
+        r#"package generic_patterns
+struct Box<T> { value: T }
+enum State { Ready, Done }
+enum Message<T> { Value(T), Empty }
+fn unbox<T>(input: Box<T>) -> T {
+    let Box{value} = input
+    value
+}
+fn classify(state: State) -> i32 {
+    match state { Ready => 1, Done => 2 }
+}
+fn main() -> i32 {
+    let value = Box<Option<i32>>{value: some(40i32)}
+    let Box<Option<i32>>{value: some(number)} = value else { return 0 }
+    let message = Message.Value::<Box<i32>>(Box<i32>{value: number})
+    match message {
+        Message<Box<i32>>.Value(Box{value}) => {
+            let boxed = Box{value}
+            unbox(boxed) + classify(State.Done)
+        },
+        Message<Box<i32>>.Empty => 0,
+    }
+}
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn patterns_respect_constant_shadowing_and_conditional_binding_scopes() {
+    native_at_all_levels(
+        r#"package pattern_scopes
+const value: i32 = 40
+fn identity<T>(input: T) -> T { input }
+fn main() -> i32 {
+    const value: i32 = 20
+    result := 0i32
+    if let some(value) = some(2i32) { result = identity(value) }
+    result += value
+    {
+        let some(value) = some(20i32) else { return value }
+        result + identity(value)
+    }
+}
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn pattern_codegen_signed_ranges_cover_the_integer_domain() {
+    native_at_all_levels(
+        r#"package signed_patterns
+fn score(value: i8) -> i32 {
+    match value { -128..=-1 => 20, 0..=127 => 22 }
+}
+fn main() -> i32 { score(-128i8) + score(127i8) }
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn pattern_codegen_recursive_reference_fields_preserve_mutability() {
+    native_at_all_levels(
+        r#"package reference_fields
+struct Holder { item: &mut Option<i32> }
+fn main() -> i32 {
+    item := some(41i32)
+    let holder = Holder{item: &mut item}
+    if let Holder{item: some(value)} = holder { *value += 1 }
+    match item { some(value) => value, none => 0 }
+}
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn pattern_codegen_alternatives_preserve_lexical_binding_drop_order() {
+    let source = format!(
+        "package alternative_cleanup\n{DROP_TYPE}\n{}",
+        r#"enum Pair { Values(i32, Guard, Guard) }
+fn matched() -> i32 {
+    match Pair.Values(2, Guard{character: 65}, Guard{character: 66}) {
+        Pair.Values(1, first, second) | Pair.Values(2, second, first) => {
+            first.character + second.character - 110
+        },
+        _ => 0,
+    }
+}
+fn conditional() -> i32 {
+    if let Pair.Values(1, first, second) | Pair.Values(2, second, first) = Pair.Values(2, Guard{character: 67}, Guard{character: 68}) {
+        return first.character + second.character - 114
+    }
+    0
+}
+fn main() -> i32 { matched() + conditional() }
+"#
+    );
+    native_at_all_levels(&source, 42, "ABCD");
+}
+
+#[test]
+fn borrowed_patterns_preserve_disjoint_fields_and_explicit_result_handling() {
+    native_at_all_levels(
+        r#"package pattern_loans
+struct Pair { left: i32, right: i32 }
+fn borrowed_if() -> i32 {
+    result: i32!i32 = err(42)
+    total := 0i32
+    if let ok(value) | err(value) = &result { total = *value }
+    total
+}
+fn borrowed_let() -> i32 {
+    result: i32!i32 = err(42)
+    let ok(value) | err(value) = &result
+    *value
+}
+fn main() -> i32 {
+    pair := some(Pair{left: 0, right: 0})
+    if let some(Pair{left, right}) = &mut pair {
+        *left = 20
+        *right = 22
+    }
+    let some(Pair{left, right}) = &mut pair else { return 1 }
+    *left += 1
+    *right -= 1
+    if borrowed_if() != 42 || borrowed_let() != 42 { return 2 }
+    *left + *right
+}
+"#,
+        42,
+        "",
+    );
+}
+
+#[test]
+fn conditional_patterns_allow_result_free_failure_paths() {
+    native_at_all_levels(
+        r#"package conditional_results
+fn process(optional: Option<i32!i32>) -> i32 {
+    total := 0i32
+    if let some(result) = optional {
+        total = match result { ok(value) => value, err(error) => error }
+    }
+    total
+}
+fn require(optional: Option<i32!i32>) -> i32 {
+    let some(result) = optional else { return 0 }
+    match result { ok(value) => value, err(error) => error }
+}
+fn main() -> i32 {
+    if process(none) != 0 || require(none) != 0 { return 1 }
+    if process(some(err(42))) != 42 { return 2 }
+    require(some(ok(42)))
+}
+"#,
+        42,
+        "",
     );
 }

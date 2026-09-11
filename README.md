@@ -11,8 +11,8 @@ package hello
 fn main() -> i32 {
     values := [1i32, 2, 3, 4]
     total := 0i32
-    for item in values {
-        total += *item
+    for &item in values {
+        total += item
     }
     return total
 }
@@ -35,8 +35,8 @@ a C toolchain (`cc`, or a driver selected with `--linker` / `DODO_CC`).
 
 Building Dodo **from source** requires Rust 1.95.0 (pinned in
 `rust-toolchain.toml`), LLVM 22 development files and static archives, and a C
-toolchain. Inkwell is the only direct Cargo dependency; `Cargo.lock` fixes the
-transitive dependencies. A missing LLVM static archive is a build error; the
+toolchain. Inkwell embeds LLVM; serde_json handles editor protocol messages.
+`Cargo.lock` fixes the transitive dependencies. A missing LLVM static archive is a build error; the
 build never silently falls back to shared LLVM.
 
 On Fedora with LLVM 22 packages:
@@ -65,6 +65,28 @@ The exact signed-repository setup used by CI is in
 Ordinary Cargo builds can still link LLVM's smaller support libraries (such as
 zlib, zstd, and the C++ library) dynamically. Use the release recipe below to
 bundle those as well.
+
+### Size-focused compiler build
+
+Use the `release-small` profile to minimize the Dodo compiler executable with
+stable compiler options:
+
+```sh
+cargo build --locked --profile release-small --bin dodo
+# Binary: target/release-small/dodo
+cargo install --locked --path . --profile release-small
+```
+
+This profile uses size optimization (`opt-level = "z"`), full link-time
+optimization, one codegen unit, and symbol stripping. Compiler panics abort the
+process instead of unwinding. Builds may take longer and the compiler may run
+more slowly. All LLVM targets remain included; prebuilt LLVM archives limit how
+much Rust compiler options can reduce the final size. Actual size depends on the
+platform and toolchain.
+
+For the self-contained Linux recipe below, run
+`bash scripts/build-release.sh release-small`; its binary is written to
+`target/x86_64-unknown-linux-gnu/release-small/dodo`.
 
 ### Self-contained Linux release
 
@@ -97,15 +119,72 @@ library remains. CI also copies it into a clean Ubuntu container, checks code
 and emits native and WebAssembly objects before installing any compiler tools,
 then builds and runs a program with only the C toolchain added.
 
+### Fully static Linux compiler
+
+On a native x86-64 GNU/Linux build host, use:
+
+```sh
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 # Fedora: /usr/lib64/llvm22
+bash scripts/build-release.sh release-small-static
+# Binary: target/x86_64-unknown-linux-gnu/release-small-static/dodo
+```
+
+`release-small-static` inherits all `release-small` size settings. The script
+adds static C-runtime linking and static relocation, producing a non-PIE
+executable, and links LLVM's support libraries statically. It rejects a binary
+with any shared-library dependency or ELF interpreter. Use the script: selecting
+the Cargo profile alone does not supply the required Linux linker flags.
+
+Install static archives for the C and math runtimes, the C++ standard library,
+zlib, zstd, libffi, and any additional libraries listed by
+`llvm-config --link-static --system-libs`. Ubuntu 24.04's development packages
+listed above provide these archives; LLVM builds with libxml2 support also need
+`libxml2-dev`. On Fedora, additionally install `glibc-static`,
+`libstdc++-static`, `zlib-ng-compat-static`, `libzstd-static`, and
+`libxml2-static` if LLVM uses libxml2. If your distribution does not ship
+`libffi.a`, build a static libffi. Archives in custom locations can be made
+available through `LIBRARY_PATH`.
+
+All LLVM targets remain included. This profile minimizes size through compiler
+and linker options; the size still depends on the prebuilt LLVM archives and
+platform libraries. It includes glibc, so it can be larger than `release-small`
+despite having no shared-library dependencies. Checking code and emitting
+compiler artifacts need no external tools; linking and running Dodo programs
+still needs a C toolchain. Only native x86-64 GNU/Linux builds are supported by
+this recipe.
+
 ## Use
 
 ```sh
 dodo --help
+dodo fmt examples
+dodo fmt --check examples
 dodo check examples/samples.dodo
 dodo run examples/hello.dodo
 dodo build examples/hello.dodo -O 2 -o build/hello
 ./build/hello
 ```
+
+`fmt` formats Dodo files and automatically migrates legacy declarations, array
+literals, and explicit generic calls to their canonical spellings. Omit its path
+to format the current directory. Directory inputs recursively include `.dodo`
+files, skipping hidden directories, `target`, `build`, and symlinks. `--check`
+reports files needing formatting and exits with status 1 without writing;
+`--stdout` previews a single file, and `dodo fmt -` reads stdin and writes stdout.
+All inputs are parsed before any source file is replaced. Comments and literal
+spellings are preserved.
+
+Canonical syntax uses `name: Type`, bracket arrays, and `function::<Type>()` for
+explicit generic arguments; inference and explicit annotations remain available.
+A typed array can be written `values: [2]u16 = [1, 2]` or, in any expression,
+`([1, 2]: [2]u16)`. Legacy forms remain accepted in 0.1; formatting provides the
+migration path before a future deprecation.
+
+Use `for &value in values` (or `for index, &value in values`) to copy copyable
+shared elements. Ordinary iteration still binds references; mutable iteration
+still uses `for value in &mut values`. A newline before `.` continues a field or
+method chain, including across comments and blank lines; `;` ends the expression.
+See [ergonomics.dodo](examples/ergonomics.dodo) for a complete example.
 
 `check` parses and validates a file or package directory without requiring an
 entry point. `build` defaults to `build/<source-name>`; it writes the final output
@@ -141,9 +220,14 @@ object generation are covered by tests; other LLVM targets are not validated.
   inferred array literals, copy-only array repetition, named constant expressions,
   definite initialization, moves, structs with methods, enums with payloads, `Option`,
   `Result`, `?`, and exhaustive `match`.
+- Immutable runtime `let` bindings alongside mutable `:=` locals and `const`.
+  Recursive enum/struct patterns, ranges, alternatives, guards, `if let`, and
+  `let ... else` share ownership and mandatory Result checks.
+- Explicit copy patterns for shared collection iteration, leading-dot method
+  chains, and `dodo fmt` with automatic syntax migration.
 - All specified `for` forms plus integer ranges, checked subslices, `break`,
   `continue`, value-producing conditionals/matches/blocks, explicit
-  returns, short-circuit Boolean expressions, and checked numeric conversions.
+  and final-expression returns, short-circuit Boolean expressions, and checked numeric conversions.
 - Shared/exclusive borrow checking, separate struct-field loans, reborrowing,
   last-use loan expiry, borrowed-return `from(...)` contracts, and borrow
   dependencies carried through aggregates.
@@ -159,7 +243,11 @@ object generation are covered by tests; other LLVM targets are not validated.
 
 See [implementation decisions](docs/implementation.md) for exact lexical,
 operator, package, layout, intrinsic, and release-limit details. Compiler errors
-include source filenames, line/column locations, and notes for borrow conflicts.
+include labeled source snippets for borrow origins, conflicting accesses, live
+uses, moves, and borrowed-return contracts. Run `dodo lsp` from an editor's LSP
+client for inferred types, receiver ownership, and borrowed-return source hovers.
+See [diagnostics and editor setup](docs/diagnostics-and-editors.md) and the
+[borrowing example](examples/borrowing.dodo).
 
 ## Documentation
 

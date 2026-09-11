@@ -262,6 +262,7 @@ impl Resolver {
                 ty,
                 value,
                 constant,
+                ..
             } => {
                 self.ty(ty, locals, ns, s.span)?;
                 if let Some(v) = value {
@@ -279,6 +280,35 @@ impl Resolver {
             StmtKind::Assign { target, value, .. } => {
                 self.expr(target, locals, ns, false)?;
                 self.expr(value, locals, ns, false)?;
+            }
+            StmtKind::LetPattern {
+                pattern,
+                ty,
+                value,
+                else_block,
+            } => {
+                self.ty(ty, locals, ns, s.span)?;
+                self.expr(value, locals, ns, false)?;
+                if let Some(body) = else_block {
+                    self.block(body, &mut locals.clone(), ns)?;
+                }
+                for name in pattern.bindings() {
+                    locals.insert(name, None);
+                }
+            }
+            StmtKind::IfLet {
+                pattern,
+                value,
+                then_block,
+                else_block,
+            } => {
+                self.expr(value, locals, ns, false)?;
+                let mut inner = locals.clone();
+                for name in pattern.bindings() {
+                    inner.insert(name, None);
+                }
+                self.block(then_block, &mut inner, ns)?;
+                self.block(else_block, &mut locals.clone(), ns)?;
             }
             StmtKind::Expr(e) | StmtKind::Yield(e) | StmtKind::Return(Some(e)) => {
                 self.expr(e, locals, ns, false)?
@@ -315,6 +345,7 @@ impl Resolver {
                 name,
                 iterable,
                 body,
+                ..
             } => {
                 self.expr(iterable, locals, ns, false)?;
                 let mut inner = locals.clone();
@@ -328,10 +359,11 @@ impl Resolver {
                 self.expr(value, locals, ns, false)?;
                 for arm in arms {
                     let mut inner = locals.clone();
-                    if let Pattern::Variant(_, bindings) = &arm.pattern {
-                        for n in bindings {
-                            inner.insert(n.clone(), None);
-                        }
+                    for name in arm.pattern.bindings() {
+                        inner.insert(name, None);
+                    }
+                    if let Some(guard) = &mut arm.guard {
+                        self.expr(guard, &inner, ns, false)?;
                     }
                     self.block(&mut arm.body, &mut inner, ns)?;
                 }

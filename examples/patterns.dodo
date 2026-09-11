@@ -1,0 +1,42 @@
+package patterns
+
+struct Reading {
+    value: Option<Option<u32>>, valid: bool
+}
+
+fn add(a: u32, b: u32) -> u32 {
+    a + b
+}
+
+fn unpack(reading: Reading) -> u32 {
+    let Reading { value: some(some(value)), valid: true } = reading else {
+        return 0
+    }
+    value
+}
+
+fn category(value: u32) -> u32 {
+    match value {
+        0..=9 => 1,
+        10 | 20 => 2,
+        n if n < 100 => 3,
+        _ => 4,
+    }
+}
+
+fn main() -> i32 {
+    const CAPACITY: usize = 2
+    let limit: u32 = add(20, 20)
+    count := 0u32
+    if let some(value) = some(limit) {
+        count = value
+    }
+    data := [0u32; CAPACITY]
+    let writable = &mut data[..]
+    writable[0] = count
+    let value = unpack(Reading { value: some(some(data[0])), valid: true })
+    if add(value, category(20)) != 42 {
+        return 1
+    }
+    0
+}

@@ -1,0 +1,32 @@
+package ergonomics
+
+struct Source {
+    value: i32
+
+    fn decode(&self) -> Source {
+        return Source { value: self.value }
+    }
+
+    fn validate(self) -> i32 {
+        return self.value
+    }
+}
+
+fn identity<T>(value: T) -> T {
+    return value
+}
+
+fn main() -> i32 {
+    values := [10i32, 14, 18]
+    total := 0i32
+    // Copy each scalar explicitly; the array remains borrowed during the loop.
+    for &value in values {
+        total += value
+    }
+
+    source := Source { value: total }
+    value := source
+        .decode()
+        .validate()
+    return identity::<i32>(value)
+}

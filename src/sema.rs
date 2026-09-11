@@ -16,7 +16,12 @@ pub fn check(program: &mut Program) -> Check<()> {
 pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
     crate::prepare::prepare(program, pointer_bits)?;
     instantiate(program)?;
-    let mut context = Context::new(program, pointer_bits)?;
+    let context = Context::new(program, pointer_bits)?;
+    // Publish inferred contracts before checking bodies, so editor queries can
+    // inspect signatures even when a body has a diagnostic.
+    for function in &mut program.functions {
+        function.from = context.functions[&function.name].from.clone();
+    }
     for constant in &mut program.constants {
         let mut checker = Checker::new(&context, Type::Void, vec![], HashMap::new());
         let value = checker.expr(&mut constant.value, Some(&constant.ty), true)?;
@@ -42,6 +47,9 @@ pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
             uses,
         );
         checker.namespace = context.function_namespace(&function.name);
+        checker.binding_uses = binding_use_spans(function);
+        checker.return_contract = Some(function.from_span.unwrap_or(function.ret_span));
+        checker.inferred_contract = function.from_span.is_none();
         for parameter in &function.params {
             let id = checker.next_id;
             let deps = if context.carries_borrow(&parameter.ty) {
@@ -75,12 +83,6 @@ pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
             ));
         }
         checker.finish_scope(function.span)?;
-    }
-    // Keep inferred contracts available to the backend and library consumers.
-    for function in &mut program.functions {
-        if let Some(signature) = context.functions.remove(&function.name) {
-            function.from = signature.from;
-        }
     }
     Ok(())
 }
@@ -264,7 +266,18 @@ impl Context {
                             .filter(|p| context.carries_borrow(&p.ty))
                             .collect();
                         if sources.len() != 1 {
-                            return Err(Diagnostic::new(function.span, "borrowed return needs an explicit `from(...)` contract").note("name its borrowed input sources, or use `from(static)` for program-lifetime storage"));
+                            let mut diagnostic = Diagnostic::new(
+                                function.ret_span,
+                                "borrowed return needs an explicit `from(...)` contract",
+                            )
+                            .primary_label("specify the sources of this borrowed return");
+                            for source in sources {
+                                diagnostic = diagnostic.label(
+                                    source.span,
+                                    format!("possible borrowed source `{}`", source.name),
+                                );
+                            }
+                            return Err(diagnostic.note("name its borrowed input sources, or use `from(static)` for program-lifetime storage"));
                         }
                         from.push(sources[0].name.clone());
                     }
@@ -276,16 +289,36 @@ impl Context {
                             .iter()
                             .any(|p| p.name == *source && context.carries_borrow(&p.ty))
                     {
-                        return Err(Diagnostic::new(
-                            function.span,
+                        let mut diagnostic = Diagnostic::new(
+                            function.from_span.unwrap_or(function.ret_span),
                             format!("borrow source `{source}` is not a borrow-carrying parameter"),
-                        ));
+                        )
+                        .primary_label(format!(
+                            "`{source}` cannot be used as a borrowed-return source"
+                        ))
+                        .label(function.ret_span, "borrowed return type is declared here");
+                        if let Some(parameter) = function
+                            .params
+                            .iter()
+                            .find(|parameter| parameter.name == *source)
+                        {
+                            diagnostic = diagnostic.label(
+                                parameter.span,
+                                format!("`{source}` does not carry a borrow"),
+                            );
+                        }
+                        return Err(diagnostic);
                     }
                 }
             } else if !from.is_empty() {
                 return Err(Diagnostic::new(
-                    function.span,
+                    function.from_span.unwrap_or(function.ret_span),
                     "`from(...)` requires a borrow-carrying return type",
+                )
+                .primary_label("borrow sources do not apply to this return type")
+                .label(
+                    function.ret_span,
+                    "this return type does not carry a borrow",
                 ));
             }
             if function.name.ends_with(".drop") {
@@ -457,6 +490,24 @@ impl Context {
             _ => ty.carries_borrow(),
         }
     }
+    // References do not own their referent's handling obligation.
+    fn contains_result(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Result(..) => true,
+            Type::Array(_, t) | Type::Option(t) => self.contains_result(t),
+            Type::Named(name) => {
+                self.structs
+                    .get(name)
+                    .is_some_and(|s| s.fields.iter().any(|f| self.contains_result(&f.ty)))
+                    || self.enums.get(name).is_some_and(|e| {
+                        e.variants
+                            .iter()
+                            .any(|v| v.fields.iter().any(|f| self.contains_result(&f.ty)))
+                    })
+            }
+            _ => false,
+        }
+    }
     fn has_drop(&self, ty: &Type) -> bool {
         match ty {
             Type::Named(name) => {
@@ -503,10 +554,12 @@ struct Variable {
     name: String,
     ty: Type,
     initialized: bool,
+    moved_at: Option<Span>,
     immutable: bool,
     deps: Vec<Loan>,
     span: Span,
     last_use: usize,
+    last_use_span: Option<Span>,
     pending_result: bool,
 }
 #[derive(Clone)]
@@ -523,6 +576,10 @@ enum Access {
     Borrow(bool),
     Move,
 }
+struct LoopUse {
+    span: Span,
+    implicit: bool,
+}
 struct YieldContext {
     expected: Option<Type>,
     depth: usize,
@@ -535,15 +592,19 @@ struct Checker<'a> {
     next_id: usize,
     return_ty: Type,
     from: Vec<String>,
-    uses: HashMap<String, usize>,
+    return_contract: Option<Span>,
+    inferred_contract: bool,
+    uses: HashMap<String, Span>,
+    binding_uses: HashMap<(usize, String), Span>,
     position: usize,
     unsafe_depth: usize,
     loop_depth: usize,
     temporary: Vec<Loan>,
     protected: Vec<Loan>,
     yields: Vec<YieldContext>,
-    loop_uses: Vec<HashSet<String>>,
+    loop_uses: Vec<HashMap<String, LoopUse>>,
     namespace: String,
+    guard_depth: usize,
     expression_deps: HashMap<(usize, usize), Vec<Loan>>,
 }
 impl<'a> Checker<'a> {
@@ -551,7 +612,7 @@ impl<'a> Checker<'a> {
         context: &'a Context,
         return_ty: Type,
         from: Vec<String>,
-        uses: HashMap<String, usize>,
+        uses: HashMap<String, Span>,
     ) -> Self {
         Self {
             context,
@@ -559,7 +620,10 @@ impl<'a> Checker<'a> {
             next_id: 1,
             return_ty,
             from,
+            return_contract: None,
+            inferred_contract: false,
             uses,
+            binding_uses: HashMap::new(),
             position: 0,
             unsafe_depth: 0,
             loop_depth: 0,
@@ -568,6 +632,7 @@ impl<'a> Checker<'a> {
             yields: vec![],
             loop_uses: vec![],
             namespace: String::new(),
+            guard_depth: 0,
             expression_deps: HashMap::new(),
         }
     }
@@ -611,13 +676,15 @@ impl<'a> Checker<'a> {
             ));
         }
         let initialized = deps.is_some();
-        let pending_result = initialized && matches!(ty, Type::Result(..));
+        let pending_result = initialized && self.context.contains_result(&ty);
         let variable = Variable {
             id: self.next_id,
-            last_use: self.uses.get(&name).copied().unwrap_or(span.end),
+            last_use: self.uses.get(&name).map_or(span.end, |span| span.start),
+            last_use_span: self.binding_uses.get(&(span.start, name.clone())).copied(),
             name,
             ty,
             initialized,
+            moved_at: None,
             immutable,
             deps: deps.unwrap_or_default(),
             span,
@@ -631,7 +698,10 @@ impl<'a> Checker<'a> {
         v.initialized
             && (v.last_use >= self.position
                 || self.context.has_drop(&v.ty)
-                || self.loop_uses.iter().any(|names| names.contains(&v.name)))
+                || self
+                    .loop_uses
+                    .iter()
+                    .any(|names| names.contains_key(&v.name)))
     }
     fn expect(&self, expected: &Type, actual: &Type, span: Span) -> Check<()> {
         if expected != actual {
@@ -654,14 +724,31 @@ impl<'a> Checker<'a> {
         }
     }
     fn conflict(&self, place: &Loan, access: Access, span: Span) -> Check<()> {
+        if self.guard_depth > 0
+            && matches!(access, Access::Write | Access::Move | Access::Borrow(true))
+        {
+            return Err(Diagnostic::new(
+                span,
+                "match guards cannot move values, mutate storage, or borrow mutably",
+            ));
+        }
         for variable in self.scopes.iter().flatten().filter(|v| self.live(v)) {
             if place.via.contains(&variable.id) {
                 continue;
             }
             for loan in &variable.deps {
                 if overlaps(place, loan) && incompatible(access, loan.mutable) {
-                    return Err(Diagnostic::new(span, format!("access conflicts with a live {} borrow held by `{}`", if loan.mutable { "mutable" } else { "shared" }, variable.name))
-                        .note(format!("the loan begins at source byte {}; `{}` may use it through byte {}", loan.origin.start, variable.name, variable.last_use))
+                    let kind = if loan.mutable { "mutable" } else { "shared" };
+                    let diagnostic = Diagnostic::new(
+                        span,
+                        format!(
+                            "access conflicts with a live {kind} borrow held by `{}`",
+                            variable.name
+                        ),
+                    )
+                    .primary_label(self.access_label(place, access))
+                    .label(loan.origin, format!("{kind} borrow begins here"));
+                    return Err(self.label_live_borrow(diagnostic, variable, span)
                         .note("end the borrow's uses before this access, or borrow disjoint struct fields"));
                 }
             }
@@ -672,13 +759,101 @@ impl<'a> Checker<'a> {
                     span,
                     "overlapping borrows within the same expression",
                 )
-                .note(format!(
-                    "the earlier loan begins at source byte {}",
-                    loan.origin.start
-                )));
+                .primary_label(self.access_label(place, access))
+                .label(
+                    loan.origin,
+                    format!(
+                        "{} borrow begins here and remains live for this expression",
+                        if loan.mutable { "mutable" } else { "shared" }
+                    ),
+                ));
             }
         }
         Ok(())
+    }
+    fn access_label(&self, place: &Loan, access: Access) -> String {
+        let name = self.by_id(place.root).map_or_else(
+            || {
+                place
+                    .external
+                    .clone()
+                    .unwrap_or_else(|| "this value".into())
+            },
+            |variable| format!("`{}`", variable.name),
+        );
+        let operation = match access {
+            Access::Read => "read",
+            Access::Write => "modify",
+            Access::Move => "move",
+            Access::Borrow(false) => "borrow",
+            Access::Borrow(true) => "mutably borrow",
+        };
+        format!("cannot {operation} {name} while this borrow is live")
+    }
+    fn label_live_borrow(
+        &self,
+        diagnostic: Diagnostic,
+        variable: &Variable,
+        access: Span,
+    ) -> Diagnostic {
+        if let Some(span) = variable
+            .last_use_span
+            .filter(|span| span.start >= access.end)
+        {
+            diagnostic.label(span, "borrow is used here")
+        } else if let Some(usage) = self
+            .loop_uses
+            .iter()
+            .rev()
+            .find_map(|uses| uses.get(&variable.name))
+        {
+            if usage.implicit {
+                diagnostic.label(usage.span, "borrow remains live for this iteration")
+            } else if variable.last_use_span == Some(usage.span) {
+                diagnostic.label(usage.span, "borrow is used here on a later loop iteration")
+            } else {
+                diagnostic.label(
+                    variable.span,
+                    "borrow remains live under conservative loop checking",
+                )
+            }
+        } else if self.context.has_drop(&variable.ty) {
+            diagnostic.label(
+                variable.span,
+                format!(
+                    "borrow may be used when `{}` is destroyed at scope exit",
+                    variable.name
+                ),
+            )
+        } else if let Some(span) = variable
+            .last_use_span
+            .filter(|span| span.start >= self.position)
+        {
+            diagnostic.label(span, "borrow is used here in the same statement")
+        } else {
+            diagnostic.label(
+                variable.span,
+                format!("borrow is held by `{}`", variable.name),
+            )
+        }
+    }
+    fn label_return_contract(&self, diagnostic: Diagnostic) -> Diagnostic {
+        if let Some(span) = self.return_contract {
+            diagnostic.label(
+                span,
+                format!(
+                    "{}return contract allows borrows from({})",
+                    if self.inferred_contract {
+                        "inferred "
+                    } else {
+                        ""
+                    },
+                    self.from.join(", ")
+                ),
+            )
+        } else {
+            diagnostic
+        }
     }
     fn finish_scope(&mut self, span: Span) -> Check<()> {
         let departing: HashSet<_> = self.scopes.last().unwrap().iter().map(|v| v.id).collect();
@@ -699,18 +874,21 @@ impl<'a> Checker<'a> {
             .flatten()
             .filter(|v| self.live(v))
         {
-            if variable
+            if let Some(loan) = variable
                 .deps
                 .iter()
-                .any(|d| departing.contains(&d.root) && d.external.is_none())
+                .find(|d| departing.contains(&d.root) && d.external.is_none())
             {
-                return Err(Diagnostic::new(
+                let diagnostic = Diagnostic::new(
                     span,
                     format!(
                         "borrow in `{}` outlives its source in this scope",
                         variable.name
                     ),
-                ));
+                )
+                .primary_label("borrowed source cannot outlive this scope")
+                .label(loan.origin, "borrow begins here");
+                return Err(self.label_live_borrow(diagnostic, variable, span));
             }
         }
         Ok(())
@@ -744,11 +922,18 @@ impl<'a> Checker<'a> {
         if let StmtKind::ForEach {
             index,
             name,
+            copy,
             iterable,
             body,
         } = &statement.kind
             && let ExprKind::Range(start, end) = &iterable.kind
         {
+            if *copy {
+                return Err(Diagnostic::new(
+                    span,
+                    "range loops yield integer values, not references; use `for value in start..end`",
+                ));
+            }
             if index.is_some() {
                 return Err(Diagnostic::new(
                     span,
@@ -777,6 +962,7 @@ impl<'a> Checker<'a> {
                     ty: ty.clone(),
                     value: Some(value),
                     constant: false,
+                    mutable: true,
                 })
             };
             let mut inner = body.clone();
@@ -811,6 +997,7 @@ impl<'a> Checker<'a> {
                 ty,
                 value,
                 constant,
+                mutable,
             } => {
                 if *ty != Type::Unknown {
                     self.context.validate_type(ty, span, false)?;
@@ -851,13 +1038,16 @@ impl<'a> Checker<'a> {
                     }
                     None
                 };
-                self.bind(name.clone(), ty.clone(), deps, *constant, span)?;
+                self.bind(name.clone(), ty.clone(), deps, !*mutable, span)?;
             }
             StmtKind::Assign { target, op, value } => {
+                if self.guard_depth > 0 {
+                    return Err(Diagnostic::new(span, "match guards cannot mutate storage"));
+                }
                 if matches!(&target.kind, ExprKind::Name(name) if name == "_") {
                     let val = self.expr(value, None, true)?;
                     target.ty = val.ty.clone();
-                    if matches!(val.ty, Type::Result(..)) {
+                    if self.context.contains_result(&val.ty) {
                         return Err(Diagnostic::new(
                             span,
                             "a Result cannot be discarded through `_ =`",
@@ -880,14 +1070,16 @@ impl<'a> Checker<'a> {
                 if let Some(binary) = op {
                     self.binary_type(*binary, &place.ty, span)?;
                 }
+                let pending_result = self.context.contains_result(&place.ty);
                 if let Some(id) = place.direct {
                     let variable = self.by_id_mut(id).unwrap();
                     if variable.initialized && variable.pending_result {
                         return Err(Diagnostic::new(span, "overwriting an unhandled Result"));
                     }
                     variable.initialized = true;
+                    variable.moved_at = None;
                     variable.deps = val.deps;
-                    variable.pending_result = matches!(variable.ty, Type::Result(..));
+                    variable.pending_result = pending_result;
                 } else if self.context.carries_borrow(&place.ty) {
                     // Field replacement may narrow an aggregate's lifetime, never erase
                     // its existing conservative dependency set.
@@ -903,7 +1095,7 @@ impl<'a> Checker<'a> {
             }
             StmtKind::Expr(expression) => {
                 let value = self.expr(expression, None, true)?;
-                if matches!(value.ty, Type::Result(..)) {
+                if self.context.contains_result(&value.ty) {
                     return Err(Diagnostic::new(
                         span,
                         "Result must be handled, propagated, or returned",
@@ -928,15 +1120,24 @@ impl<'a> Checker<'a> {
                     .flatten()
                     .map(|v| v.id)
                     .collect();
-                if value
+                if let Some(loan) = value
                     .deps
                     .iter()
-                    .any(|loan| departing.contains(&loan.root) && loan.external.is_none())
+                    .find(|loan| departing.contains(&loan.root) && loan.external.is_none())
                 {
-                    return Err(Diagnostic::new(
-                        span,
+                    let mut diagnostic = Diagnostic::new(
+                        expression.span,
                         "value block cannot yield a borrow of its local storage",
-                    ));
+                    )
+                    .primary_label("local storage does not live beyond this value block")
+                    .label(loan.origin, "local borrow begins here");
+                    if let Some(source) = self.by_id(loan.root) {
+                        diagnostic = diagnostic.label(
+                            source.span,
+                            format!("local value `{}` is declared here", source.name),
+                        );
+                    }
+                    return Err(diagnostic);
                 }
                 if self
                     .scopes
@@ -958,6 +1159,9 @@ impl<'a> Checker<'a> {
             }
             StmtKind::Return(expression) => {
                 let expected = self.return_ty.clone();
+                let return_span = expression
+                    .as_ref()
+                    .map_or(span, |expression| expression.span);
                 let value = match expression {
                     Some(e) => self.expr(e, Some(&expected), true)?,
                     None => Value {
@@ -971,22 +1175,35 @@ impl<'a> Checker<'a> {
                         match &loan.external {
                             Some(source) if self.from.contains(source) || source == "static" => (),
                             Some(source) => {
-                                return Err(Diagnostic::new(
-                                    span,
+                                let source_span = self.scopes[0]
+                                    .iter()
+                                    .find(|variable| &variable.name == source)
+                                    .map_or(loan.origin, |variable| variable.span);
+                                return Err(self.label_return_contract(Diagnostic::new(
+                                    return_span,
                                     format!(
                                         "returned borrow depends on `{source}`, outside the return contract"
                                     ),
-                                ));
+                                )
+                                .primary_label(format!("returned borrow comes from `{source}`"))
+                                .label(source_span, format!("borrowed source `{source}` is declared here"))));
                             }
                             None => {
-                                return Err(Diagnostic::new(
-                                    span,
+                                let mut diagnostic = Diagnostic::new(
+                                    return_span,
                                     "cannot return a borrow of a local value",
                                 )
-                                .note(format!(
-                                    "the local borrow begins at source byte {}",
-                                    loan.origin.start
-                                )));
+                                .primary_label(
+                                    "local value does not live long enough to be returned",
+                                )
+                                .label(loan.origin, "local borrow begins here");
+                                if let Some(source) = self.by_id(loan.root) {
+                                    diagnostic = diagnostic.label(
+                                        source.span,
+                                        format!("local value `{}` is declared here", source.name),
+                                    );
+                                }
+                                return Err(self.label_return_contract(diagnostic));
                             }
                         }
                     }
@@ -1051,7 +1268,20 @@ impl<'a> Checker<'a> {
                 if let Some(s) = step.as_ref() {
                     names_stmt(s, &mut names);
                 }
-                self.loop_uses.push(names.keys().cloned().collect());
+                self.loop_uses.push(
+                    names
+                        .into_iter()
+                        .map(|(name, span)| {
+                            (
+                                name,
+                                LoopUse {
+                                    span,
+                                    implicit: false,
+                                },
+                            )
+                        })
+                        .collect(),
+                );
                 self.loop_depth += 1;
                 if let Some(e) = condition {
                     let val = self.expr(e, Some(&Type::Bool), false)?;
@@ -1075,6 +1305,7 @@ impl<'a> Checker<'a> {
             StmtKind::ForEach {
                 index,
                 name,
+                copy,
                 iterable,
                 body,
             } => {
@@ -1116,35 +1347,123 @@ impl<'a> Checker<'a> {
                     },
                     _ => return Err(Diagnostic::new(span, "foreach requires an array or slice")),
                 };
+                if *copy && (mutable || matches!(iterable.ty, Type::Ref(true, _))) {
+                    return Err(Diagnostic::new(
+                        span,
+                        "`&value` requires shared iteration; use a shared array borrow or slice",
+                    )
+                    .note("mutable iteration remains `for value in &mut values`"));
+                }
+                if *copy && !element.is_copy() {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("`&value` loop pattern requires a copyable element; `{element}` is not copyable"),
+                    )
+                    .note("use `for value in values` to borrow elements without copying"));
+                }
+                let copied_deps = if *copy && self.context.carries_borrow(&element) {
+                    // Reading an owned array's element copies the references stored
+                    // in it, without borrowing the array storage itself.
+                    let source = match &iterable.kind {
+                        ExprKind::Unary(UnaryOp::Borrow, source)
+                            if matches!(source.ty, Type::Array(..)) =>
+                        {
+                            source.as_ref()
+                        }
+                        _ => iterable,
+                    };
+                    let deps = if matches!(source.ty, Type::Array(..)) {
+                        self.provenance(source)
+                    } else {
+                        // References and slices carry the source collection's
+                        // provenance, rather than borrowing their local binding.
+                        self.provenance(iterable)
+                    };
+                    self.transitive_dependencies(deps)
+                } else {
+                    vec![]
+                };
                 self.temporary.clear();
                 let before = self.scopes.clone();
                 self.scopes.push(vec![]);
                 if let Some(index) = index {
                     self.bind(index.clone(), Type::usize(), Some(vec![]), false, span)?;
                 }
-                self.bind(
-                    name.clone(),
-                    Type::Ref(mutable, Box::new(element)),
-                    Some(value.deps),
-                    false,
-                    span,
-                )?;
-                let iteration_id = self.lookup(name).unwrap().id;
+                let collection = format!("$foreach.collection.{}", span.start);
+                if *copy {
+                    // The captured collection stays borrowed across every loop
+                    // back edge, independently of reassignment of the copy binding.
+                    let mut deps = value.deps;
+                    deps.extend(self.provenance(iterable));
+                    let mut deps = self.transitive_dependencies(deps);
+                    for loan in &mut deps {
+                        self.conflict(loan, Access::Borrow(false), iterable.span)?;
+                        loan.mutable = false;
+                    }
+                    self.bind(collection.clone(), value.ty, Some(deps), false, span)?;
+                    if name != "_" {
+                        self.bind(name.clone(), element, Some(copied_deps), false, span)?;
+                    }
+                } else {
+                    self.bind(
+                        name.clone(),
+                        Type::Ref(mutable, Box::new(element)),
+                        Some(value.deps),
+                        false,
+                        span,
+                    )?;
+                }
+                let iteration_id = self.lookup(name).map(|variable| variable.id);
                 let mut names = HashMap::new();
                 names_block(body, &mut names);
-                names.insert(name.clone(), span.end);
-                self.loop_uses.push(names.keys().cloned().collect());
+                let mut loop_uses: HashMap<_, _> = names
+                    .into_iter()
+                    .map(|(name, span)| {
+                        (
+                            name,
+                            LoopUse {
+                                span,
+                                implicit: false,
+                            },
+                        )
+                    })
+                    .collect();
+                loop_uses.entry(name.clone()).or_insert(LoopUse {
+                    span: iterable.span,
+                    implicit: true,
+                });
+                if *copy {
+                    loop_uses.insert(
+                        collection,
+                        LoopUse {
+                            span: iterable.span,
+                            implicit: true,
+                        },
+                    );
+                }
+                self.loop_uses.push(loop_uses);
                 self.loop_depth += 1;
                 self.block(body, false)?;
                 self.loop_depth -= 1;
                 self.loop_uses.pop();
                 if mutable {
                     for variable in self.scopes.iter().take(self.scopes.len() - 1).flatten() {
-                        if variable.deps.iter().any(|d| d.via.contains(&iteration_id)) {
-                            return Err(Diagnostic::new(
+                        if let Some(loan) = variable
+                            .deps
+                            .iter()
+                            .find(|d| iteration_id.is_some_and(|id| d.via.contains(&id)))
+                        {
+                            let diagnostic = Diagnostic::new(
                                 span,
                                 "mutable foreach element borrow cannot escape its iteration",
-                            ));
+                            )
+                            .primary_label("element borrow escapes this iteration")
+                            .label(loan.origin, "mutable element borrow begins here")
+                            .label(
+                                variable.span,
+                                format!("borrow is stored in outer binding `{}`", variable.name),
+                            );
+                            return Err(self.label_live_borrow(diagnostic, variable, span));
                         }
                     }
                 }
@@ -1153,57 +1472,118 @@ impl<'a> Checker<'a> {
                 self.check_loop_moves(&before, span)?;
                 self.scopes = merge_states(before, self.scopes.clone());
             }
+            StmtKind::IfLet {
+                pattern,
+                value,
+                then_block,
+                else_block,
+            } => {
+                let val = self.expr(value, None, true)?;
+                self.temporary.clear();
+                let (matched, borrowed) = match_subject(&val.ty);
+                let (checked, bindings) = self.check_pattern(pattern, matched, borrowed, span)?;
+                self.check_conditional_pattern(&checked, matched, span)?;
+                if self.context.contains_result(dereferenced(&val.ty)) {
+                    self.mark_matched_result(value);
+                }
+                let before = self.scopes.clone();
+                self.scopes.push(vec![]);
+                self.bind_pattern(pattern, bindings, &val, true, span)?;
+                let first = self.block(then_block, false)?;
+                self.finish_scope(span)?;
+                self.scopes.pop();
+                let then_state = self.scopes.clone();
+                self.scopes = before;
+                let second = self.block(else_block, true)?;
+                let else_state = self.scopes.clone();
+                self.scopes = if first && !second {
+                    else_state
+                } else if second && !first {
+                    then_state
+                } else {
+                    merge_states(then_state, else_state)
+                };
+                return Ok(first && second);
+            }
+            StmtKind::LetPattern {
+                pattern,
+                ty,
+                value,
+                else_block,
+            } => {
+                if *ty != Type::Unknown {
+                    self.context.validate_type(ty, span, false)?;
+                }
+                let val = self.expr(value, (*ty != Type::Unknown).then_some(&*ty), true)?;
+                if *ty == Type::Unknown {
+                    *ty = val.ty.clone();
+                } else {
+                    self.expect(ty, &val.ty, span)?;
+                }
+                self.temporary.clear();
+                let (matched, borrowed) = match_subject(&val.ty);
+                let (checked, bindings) = self.check_pattern(pattern, matched, borrowed, span)?;
+                self.check_conditional_pattern(&checked, matched, span)?;
+                if self.context.contains_result(dereferenced(&val.ty)) {
+                    self.mark_matched_result(value);
+                }
+                let irrefutable =
+                    self.patterns_exhaustive(&[vec![checked]], std::slice::from_ref(matched))?;
+                if let Some(block) = else_block {
+                    let before = self.scopes.clone();
+                    if !self.block(block, true)? {
+                        return Err(Diagnostic::new(
+                            span,
+                            "the `else` block of a let pattern must diverge (return, break, or continue)",
+                        ));
+                    }
+                    self.scopes = before;
+                } else if !irrefutable {
+                    return Err(Diagnostic::new(
+                        span,
+                        "refutable let pattern requires an `else` block",
+                    ));
+                }
+                self.bind_pattern(pattern, bindings, &val, true, span)?;
+            }
             StmtKind::Match { value, arms } => {
                 let val = self.expr(value, None, true)?;
-                if matches!(dereferenced(&val.ty), Type::Result(..))
-                    && let ExprKind::Unary(UnaryOp::Borrow | UnaryOp::BorrowMut, owner) =
-                        &value.kind
-                    && let ExprKind::Name(name) = &owner.kind
-                    && let Some(id) = self.lookup(name).map(|v| v.id)
-                {
-                    self.by_id_mut(id).unwrap().pending_result = false;
+                if self.context.contains_result(dereferenced(&val.ty)) {
+                    self.mark_matched_result(value);
                 }
                 self.temporary.clear();
                 let before = self.scopes.clone();
-                let borrowed = match &val.ty {
-                    Type::Ref(m, _) => Some(*m),
-                    _ => None,
-                };
-                let match_ty = dereferenced(&val.ty).clone();
-                let variants = self.pattern_variants(&match_ty, value.span)?;
-                let mut seen = HashSet::new();
-                let mut wildcard = false;
+                let (match_ty, borrowed) = match_subject(&val.ty);
+                let mut rows = vec![];
                 let mut surviving = vec![];
                 let mut all_terminate = true;
                 for arm in arms {
-                    if wildcard {
-                        return Err(Diagnostic::new(arm.span, "unreachable match arm after `_`"));
+                    if self.patterns_exhaustive(&rows, std::slice::from_ref(match_ty))? {
+                        return Err(Diagnostic::new(
+                            arm.span,
+                            "unreachable match arm after exhaustive patterns",
+                        ));
                     }
                     self.scopes = before.clone();
                     self.scopes.push(vec![]);
-                    let (key, bindings) =
-                        self.pattern(&arm.pattern, &match_ty, &variants, arm.span)?;
-                    if key == "_" {
-                        wildcard = true;
-                    } else if !seen.insert(key.clone()) {
-                        return Err(Diagnostic::new(
-                            arm.span,
-                            format!("duplicate match pattern `{key}`"),
-                        ));
-                    }
-                    for (name, ty) in bindings {
-                        if name == "_" {
-                            continue;
+                    let (checked, bindings) =
+                        self.check_pattern(&arm.pattern, match_ty, borrowed, arm.span)?;
+                    self.bind_pattern(&arm.pattern, bindings, &val, false, arm.span)?;
+                    if let Some(guard) = &mut arm.guard {
+                        self.guard_depth += 1;
+                        let result = self.expr(guard, Some(&Type::Bool), false);
+                        self.guard_depth -= 1;
+                        let guard_value = result?;
+                        self.expect(&Type::Bool, &guard_value.ty, guard.span)?;
+                        self.temporary.clear();
+                    } else {
+                        if rows
+                            .iter()
+                            .any(|r: &Vec<CheckedPattern>| r == &vec![checked.clone()])
+                        {
+                            return Err(Diagnostic::new(arm.span, "duplicate match pattern"));
                         }
-                        let ty = borrowed
-                            .map(|m| Type::Ref(m, Box::new(ty.clone())))
-                            .unwrap_or(ty);
-                        let deps = if self.context.carries_borrow(&ty) {
-                            val.deps.clone()
-                        } else {
-                            vec![]
-                        };
-                        self.bind(name, ty, Some(deps), false, arm.span)?;
+                        rows.push(vec![checked]);
                     }
                     let terminates = self.block(&mut arm.body, false)?;
                     self.finish_scope(arm.span)?;
@@ -1213,10 +1593,9 @@ impl<'a> Checker<'a> {
                         surviving.push(self.scopes.clone());
                     }
                 }
-                if !wildcard && (variants.is_empty() || variants.keys().any(|v| !seen.contains(v)))
-                {
+                if !self.patterns_exhaustive(&rows, std::slice::from_ref(match_ty))? {
                     return Err(Diagnostic::new(span, "non-exhaustive match")
-                        .note("handle every variant, or add a `_` arm for the remaining values"));
+                        .note("cover every possible payload; guarded arms do not establish exhaustiveness"));
                 }
                 self.scopes = surviving.into_iter().reduce(merge_states).unwrap_or(before);
                 return Ok(all_terminate);
@@ -1253,7 +1632,14 @@ impl<'a> Checker<'a> {
                             .iter()
                             .any(|source| source.id == loan.root && source.id > variable.id)
                     {
-                        return Err(Diagnostic::new(span, format!("destructor of `{}` would run after its borrowed source is destroyed", variable.name)).note("declare the borrowed source before the value whose destructor accesses it"));
+                        let mut diagnostic = Diagnostic::new(span, format!("destructor of `{}` would run after its borrowed source is destroyed", variable.name))
+                            .primary_label("borrowed source is destroyed before its borrower")
+                            .label(loan.origin, "borrow begins here")
+                            .label(variable.span, format!("`{}` is declared first and will be destroyed last", variable.name));
+                        if let Some(source) = self.by_id(loan.root) {
+                            diagnostic = diagnostic.label(source.span, format!("borrowed source `{}` is declared later and will be destroyed first", source.name));
+                        }
+                        return Err(diagnostic.note("declare the borrowed source before the value whose destructor accesses it"));
                     }
                 }
             }
@@ -1275,12 +1661,22 @@ impl<'a> Checker<'a> {
     fn check_loop_moves(&self, before: &[Vec<Variable>], span: Span) -> Check<()> {
         for old in before.iter().flatten() {
             if old.initialized && self.by_id(old.id).is_some_and(|v| !v.initialized) {
+                let moved_at = self
+                    .by_id(old.id)
+                    .and_then(|variable| variable.moved_at)
+                    .unwrap_or(span);
                 return Err(Diagnostic::new(
-                    span,
+                    moved_at,
                     format!(
                         "`{}` is moved in a loop and may be used again on the next iteration",
                         old.name
                     ),
+                )
+                .primary_label(format!("value `{}` is moved here", old.name))
+                .label(span, "this loop may repeat the move on a later iteration")
+                .label(
+                    old.span,
+                    format!("binding `{}` is declared outside the loop", old.name),
                 )
                 .note("reinitialize the binding before continuing the loop"));
             }
@@ -1467,6 +1863,7 @@ impl<'a> Checker<'a> {
                     if let Some(id) = place.direct {
                         let variable = self.by_id_mut(id).unwrap();
                         variable.initialized = false;
+                        variable.moved_at = Some(span);
                         variable.pending_result = false;
                     } else {
                         return Err(Diagnostic::new(span, "moving a non-copy field or indexed element is not supported").note("move the complete owned value, borrow the subobject, or call an explicit clone function"));
@@ -2140,6 +2537,20 @@ impl<'a> Checker<'a> {
             _ => vec![],
         }
     }
+    fn transitive_dependencies(&self, mut deps: Vec<Loan>) -> Vec<Loan> {
+        let mut visited = HashSet::new();
+        let mut cursor = 0;
+        while cursor < deps.len() {
+            let root = deps[cursor].root;
+            cursor += 1;
+            if visited.insert(root)
+                && let Some(variable) = self.by_id(root)
+            {
+                deps.extend(variable.deps.clone());
+            }
+        }
+        deps
+    }
     fn place(&mut self, expression: &mut Expr, initialized: bool) -> Check<Place> {
         let span = expression.span;
         if let Some(name) = qualified_name(expression)
@@ -2158,14 +2569,20 @@ impl<'a> Checker<'a> {
             ExprKind::Name(name) => {
                 if let Some(variable) = self.lookup(name).cloned() {
                     if initialized && !variable.initialized {
-                        return Err(Diagnostic::new(
+                        let mut diagnostic = Diagnostic::new(
                             span,
                             format!("`{name}` is uninitialized or has been moved"),
                         )
-                        .note(format!(
-                            "the binding was declared at source byte {}",
-                            variable.span.start
-                        )));
+                        .label(variable.span, format!("binding `{name}` is declared here"));
+                        diagnostic = if let Some(moved_at) = variable.moved_at {
+                            diagnostic
+                                .primary_label(format!("cannot use `{name}` after it was moved"))
+                                .label(moved_at, format!("value `{name}` is moved here"))
+                        } else {
+                            diagnostic
+                                .primary_label(format!("`{name}` is not initialized on every path"))
+                        };
+                        return Err(diagnostic);
                     }
                     Place {
                         ty: variable.ty,
@@ -2443,7 +2860,7 @@ impl<'a> Checker<'a> {
                 return Err(Diagnostic::new(span, "core.drop expects one argument"));
             }
             let value = self.expr(&mut args[0], None, true)?;
-            if matches!(value.ty, Type::Result(..)) {
+            if self.context.contains_result(&value.ty) {
                 return Err(Diagnostic::new(
                     span,
                     "a Result cannot be discarded with core.drop",
@@ -2519,6 +2936,9 @@ impl<'a> Checker<'a> {
                 for mut loan in value.deps.clone() {
                     loan.mutable = mutable_borrow(&parameter.ty);
                     self.conflict(&loan, Access::Borrow(loan.mutable), arg.span)?;
+                    // Passing a reference reserves a temporary reborrow here.
+                    // Returned dependencies retain the original source span.
+                    loan.origin = arg.span;
                     self.temporary.push(loan);
                 }
             }
@@ -2752,33 +3172,237 @@ impl<'a> Checker<'a> {
             }
         })
     }
-    fn pattern(
+    fn mark_matched_result(&mut self, expression: &Expr) {
+        match &expression.kind {
+            ExprKind::Unary(UnaryOp::Borrow | UnaryOp::BorrowMut, owner) => {
+                self.mark_matched_result(owner)
+            }
+            ExprKind::Name(name) => {
+                if let Some(variable) = self.lookup(name).cloned() {
+                    self.by_id_mut(variable.id).unwrap().pending_result = false;
+                    for loan in variable.deps {
+                        if loan.fields.is_empty()
+                            && let Some(owner) = self.by_id_mut(loan.root)
+                        {
+                            owner.pending_result = false;
+                        }
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    fn bind_pattern(
+        &mut self,
+        pattern: &Pattern,
+        bindings: Vec<(String, Type)>,
+        value: &Value,
+        immutable: bool,
+        span: Span,
+    ) -> Check<()> {
+        let mut paths = HashMap::new();
+        if matches!(value.ty, Type::Ref(..)) {
+            pattern_binding_paths(pattern, &[], &mut paths);
+        }
+        for (name, ty) in bindings {
+            let deps = if self.context.carries_borrow(&ty) {
+                if let Some(projections) = paths.get(&name) {
+                    projections
+                        .iter()
+                        .flat_map(|path| {
+                            value.deps.iter().map(move |loan| {
+                                let mut loan = loan.clone();
+                                loan.fields.extend(path.iter().cloned());
+                                loan
+                            })
+                        })
+                        .collect()
+                } else {
+                    value.deps.clone()
+                }
+            } else {
+                vec![]
+            };
+            let pending = self.context.contains_result(dereferenced(&ty));
+            self.bind(name, ty, Some(deps), immutable, span)?;
+            if pending {
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .last_mut()
+                    .unwrap()
+                    .pending_result = true;
+            }
+        }
+        Ok(())
+    }
+    fn check_conditional_pattern(
+        &self,
+        pattern: &CheckedPattern,
+        ty: &Type,
+        span: Span,
+    ) -> Check<()> {
+        if self.context.contains_result(dereferenced(ty))
+            && !self.patterns_exhaustive(
+                &[
+                    vec![pattern.clone()],
+                    vec![self.result_free_pattern(dereferenced(ty))],
+                ],
+                std::slice::from_ref(ty),
+            )?
+        {
+            return Err(Diagnostic::new(
+                span,
+                "conditional patterns cannot discard a Result on the unmatched path",
+            )
+            .note("use an exhaustive match that explicitly handles both `ok` and `err`"));
+        }
+        Ok(())
+    }
+    // An unmatched value may be discarded only when its active payload contains
+    // no Result. For example, `none` is harmless for Option<Result<T, E>>, while
+    // either Result constructor still imposes an explicit handling obligation.
+    fn result_free_pattern(&self, ty: &Type) -> CheckedPattern {
+        if !self.context.contains_result(ty) {
+            return CheckedPattern::Any;
+        }
+        match ty {
+            Type::Option(inner) => CheckedPattern::Or(vec![
+                CheckedPattern::Constructor("none".into(), vec![]),
+                CheckedPattern::Constructor("some".into(), vec![self.result_free_pattern(inner)]),
+            ]),
+            Type::Named(name) => {
+                if let Some(structure) = self.context.structs.get(name) {
+                    CheckedPattern::Constructor(
+                        "$struct".into(),
+                        structure
+                            .fields
+                            .iter()
+                            .map(|f| self.result_free_pattern(&f.ty))
+                            .collect(),
+                    )
+                } else if let Some(enumeration) = self.context.enums.get(name) {
+                    CheckedPattern::Or(
+                        enumeration
+                            .variants
+                            .iter()
+                            .map(|v| {
+                                CheckedPattern::Constructor(
+                                    v.name.clone(),
+                                    v.fields
+                                        .iter()
+                                        .map(|f| self.result_free_pattern(&f.ty))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    )
+                } else {
+                    CheckedPattern::Or(vec![])
+                }
+            }
+            // Result itself is never freely discardable. Array patterns do not
+            // inspect elements, so only an irrefutable binding can handle one.
+            _ => CheckedPattern::Or(vec![]),
+        }
+    }
+    fn check_pattern(
         &self,
         pattern: &Pattern,
         ty: &Type,
-        variants: &HashMap<String, Vec<Type>>,
+        borrowed: Option<bool>,
         span: Span,
-    ) -> Check<(String, Vec<(String, Type)>)> {
-        match pattern {
-            Pattern::Wildcard => {
-                if matches!(ty, Type::Result(..)) {
+    ) -> Check<(CheckedPattern, Vec<(String, Type)>)> {
+        let (checked, bindings) = self.pattern_inner(pattern, ty, borrowed, span)?;
+        if pattern_expansion_size(&checked) > 4096 {
+            return Err(Diagnostic::new(
+                span,
+                "pattern expands to more than 4096 alternatives; split it into smaller patterns",
+            ));
+        }
+        let mut names = HashSet::new();
+        for (name, _) in &bindings {
+            if !names.insert(name) {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("duplicate pattern binding `{name}`"),
+                ));
+            }
+        }
+        Ok((checked, bindings))
+    }
+    fn pattern_inner(
+        &self,
+        pattern: &Pattern,
+        ty: &Type,
+        borrowed: Option<bool>,
+        span: Span,
+    ) -> Check<(CheckedPattern, Vec<(String, Type)>)> {
+        if let Pattern::Or(alternatives) = pattern {
+            let mut checked = vec![];
+            let mut bindings = None;
+            let mut comparison = None;
+            for alternative in alternatives {
+                let (p, names) = self.check_pattern(alternative, ty, borrowed, span)?;
+                let mut sorted = names.clone();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                if comparison
+                    .as_ref()
+                    .is_some_and(|previous| previous != &sorted)
+                {
                     return Err(Diagnostic::new(
                         span,
-                        "a Result match must explicitly handle both `ok` and `err`",
+                        "alternative patterns must bind the same names with the same types and borrowing modes",
                     ));
                 }
-                Ok(("_".into(), vec![]))
-            }
-            Pattern::Bool(value) if *ty == Type::Bool => Ok((value.to_string(), vec![])),
-            Pattern::Int(value) if ty.is_integer() => {
-                if matches!(ty, Type::Int { signed: true, .. }) && *value > i64::MAX as u64 {
-                    self.integer_range(value.wrapping_neg(), ty, true, span)?;
-                } else {
-                    self.integer_range(*value, ty, false, span)?;
+                comparison = Some(sorted);
+                if bindings.is_none() {
+                    bindings = Some(names);
                 }
-                Ok((value.to_string(), vec![]))
+                checked.push(p);
             }
-            Pattern::Variant(name, bindings) => {
+            return Ok((CheckedPattern::Or(checked), bindings.unwrap_or_default()));
+        }
+        if let Pattern::Binding(name) = pattern {
+            let ty = borrowed.map_or_else(|| ty.clone(), |m| Type::Ref(m, Box::new(ty.clone())));
+            if ty == Type::Void {
+                return Err(Diagnostic::new(span, "cannot bind a void value"));
+            }
+            return Ok((CheckedPattern::Any, vec![(name.clone(), ty)]));
+        }
+        if matches!(pattern, Pattern::Wildcard) {
+            if self.context.contains_result(dereferenced(ty)) {
+                return Err(Diagnostic::new(
+                    span,
+                    "a Result pattern must explicitly handle both `ok` and `err`; a nested Result cannot be discarded",
+                ));
+            }
+            return Ok((CheckedPattern::Any, vec![]));
+        }
+        let mut ty = ty;
+        let mut borrowed = borrowed;
+        while let Type::Ref(mutable, inner) = ty {
+            borrowed = Some(borrowed.unwrap_or(true) && *mutable);
+            ty = inner;
+        }
+        match pattern {
+            Pattern::Bool(value) if *ty == Type::Bool => Ok((
+                CheckedPattern::Constructor(value.to_string(), vec![]),
+                vec![],
+            )),
+            Pattern::Int(value) if ty.is_integer() => {
+                let value = self.pattern_integer(*value, ty, span)?;
+                Ok((CheckedPattern::Range(value, value), vec![]))
+            }
+            Pattern::Range(start, end, inclusive) if ty.is_integer() => {
+                let start = self.pattern_integer(*start, ty, span)?;
+                let end = self.pattern_integer(*end, ty, span)? - i128::from(!*inclusive);
+                if start > end {
+                    return Err(Diagnostic::new(span, "range pattern is empty or reversed"));
+                }
+                Ok((CheckedPattern::Range(start, end), vec![]))
+            }
+            Pattern::Variant(name, payloads) => {
                 let short = if let Some((owner, name)) = name.rsplit_once('.') {
                     if *ty != Type::Named(owner.into()) {
                         return Err(Diagnostic::new(
@@ -2790,22 +3414,100 @@ impl<'a> Checker<'a> {
                 } else {
                     name
                 };
+                let variants = self.pattern_variants(ty, span)?;
                 let fields = variants.get(short).ok_or_else(|| {
                     Diagnostic::new(span, format!("unknown variant pattern `{name}` for `{ty}`"))
                 })?;
-                if bindings.len() != fields.len() {
+                if payloads.len() != fields.len() {
                     return Err(Diagnostic::new(
                         span,
-                        format!("pattern `{name}` expects {} payload bindings", fields.len()),
+                        format!("pattern `{name}` expects {} payload patterns", fields.len()),
                     ));
                 }
-                Ok((
-                    short.into(),
-                    bindings
+                let mut checked = vec![];
+                let mut bindings = vec![];
+                for (pattern, field) in payloads.iter().zip(fields) {
+                    let (p, names) = self.pattern_inner(pattern, field, borrowed, span)?;
+                    checked.push(p);
+                    bindings.extend(names);
+                }
+                Ok((CheckedPattern::Constructor(short.into(), checked), bindings))
+            }
+            Pattern::Struct(name, fields, rest) => {
+                if *ty != Type::Named(name.clone()) {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("struct pattern `{name}` does not match `{ty}`"),
+                    ));
+                }
+                let declaration = self.context.structs.get(name).ok_or_else(|| {
+                    Diagnostic::new(span, format!("unknown struct pattern `{name}`"))
+                })?;
+                if borrowed.is_none()
+                    && self.context.functions.contains_key(&format!("{name}.drop"))
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        "cannot destructure an owned struct with a custom drop method; borrow it instead",
+                    ));
+                }
+                let mut seen = HashSet::new();
+                for (field, _) in fields {
+                    if !seen.insert(field) {
+                        return Err(Diagnostic::new(
+                            span,
+                            format!("duplicate field `{field}` in pattern"),
+                        ));
+                    }
+                    let declared = declaration
+                        .fields
                         .iter()
-                        .cloned()
-                        .zip(fields.iter().cloned())
-                        .collect(),
+                        .find(|f| &f.name == field)
+                        .ok_or_else(|| {
+                            Diagnostic::new(
+                                span,
+                                format!("unknown field `{field}` in struct pattern"),
+                            )
+                        })?;
+                    if !declared.public && type_namespace(name) != self.namespace {
+                        return Err(Diagnostic::new(
+                            span,
+                            format!("field `{field}` is private to its package"),
+                        ));
+                    }
+                }
+                let mut checked = vec![];
+                let mut bindings = vec![];
+                for field in &declaration.fields {
+                    let pattern = fields
+                        .iter()
+                        .find(|(n, _)| n == &field.name)
+                        .map(|(_, p)| p);
+                    if pattern.is_none() && !*rest {
+                        return Err(Diagnostic::new(
+                            span,
+                            format!(
+                                "missing field `{}` in struct pattern; use `..` to omit fields",
+                                field.name
+                            ),
+                        ));
+                    }
+                    let (p, names) = self.pattern_inner(
+                        pattern.unwrap_or(&Pattern::Wildcard),
+                        &field.ty,
+                        borrowed,
+                        span,
+                    )?;
+                    checked.push(p);
+                    bindings.extend(names);
+                }
+                let order = pattern.bindings();
+                bindings.sort_by_key(|(name, _)| {
+                    order.iter().position(|n| n == name).unwrap_or(usize::MAX)
+                });
+                Ok((
+                    CheckedPattern::Constructor("$struct".into(), checked),
+                    bindings,
                 ))
             }
             _ => Err(Diagnostic::new(
@@ -2813,6 +3515,190 @@ impl<'a> Checker<'a> {
                 format!("pattern does not match `{ty}`"),
             )),
         }
+    }
+    fn pattern_integer(&self, value: u64, ty: &Type, span: Span) -> Check<i128> {
+        if matches!(ty, Type::Int { signed: true, .. }) && value > i64::MAX as u64 {
+            self.integer_range(value.wrapping_neg(), ty, true, span)?;
+            Ok(value as i64 as i128)
+        } else {
+            self.integer_range(value, ty, false, span)?;
+            Ok(i128::from(value))
+        }
+    }
+    // Specialize one column at a time. Integer interval boundaries partition a
+    // finite domain, avoiding enumeration of even 64-bit ranges. Constructor
+    // payload columns retain correlations between fields and nested patterns.
+    fn patterns_exhaustive(&self, rows: &[Vec<CheckedPattern>], types: &[Type]) -> Check<bool> {
+        self.coverage(rows, types, &mut 131_072).ok_or_else(|| Diagnostic::new(
+            Span { start: self.position, end: self.position },
+            "pattern exhaustiveness analysis is too complex; simplify the patterns or add a fallback arm",
+        ))
+    }
+    fn coverage(
+        &self,
+        rows: &[Vec<CheckedPattern>],
+        types: &[Type],
+        budget: &mut usize,
+    ) -> Option<bool> {
+        *budget = budget.checked_sub(rows.len() + types.len() + 1)?;
+        if types.is_empty() {
+            return Some(!rows.is_empty());
+        }
+        if rows.is_empty() {
+            return Some(false);
+        }
+        if rows
+            .iter()
+            .any(|r| r.iter().all(|p| matches!(p, CheckedPattern::Any)))
+        {
+            return Some(true);
+        }
+        if rows.iter().all(|r| matches!(r[0], CheckedPattern::Any)) {
+            let tails: Vec<_> = rows.iter().map(|r| r[1..].to_vec()).collect();
+            return self.coverage(&tails, &types[1..], budget);
+        }
+        let mut expanded = vec![];
+        for row in rows {
+            expand_pattern_row(row, &mut expanded);
+        }
+        *budget = budget.checked_sub(expanded.len())?;
+        let ty = dereferenced(&types[0]);
+        if let Type::Int { signed, bits } = ty {
+            let bits = if *bits == 0 {
+                self.context.pointer_bits
+            } else {
+                *bits
+            };
+            let (min, max) = if *signed {
+                (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+            } else {
+                (0, (1i128 << bits) - 1)
+            };
+            let mut boundaries = vec![min, max + 1];
+            for row in &expanded {
+                if let CheckedPattern::Range(a, b) = row[0] {
+                    boundaries.extend([a, b + 1]);
+                }
+            }
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            for interval in boundaries.windows(2) {
+                let point = interval[0];
+                let specialized: Vec<_> = expanded
+                    .iter()
+                    .filter(|row| match row[0] {
+                        CheckedPattern::Any => true,
+                        CheckedPattern::Range(a, b) => a <= point && point <= b,
+                        _ => false,
+                    })
+                    .map(|row| row[1..].to_vec())
+                    .collect();
+                if !self.coverage(&specialized, &types[1..], budget)? {
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+        let constructors: Vec<(String, Vec<Type>)> = if let Type::Named(name) = ty
+            && let Some(s) = self.context.structs.get(name)
+        {
+            vec![(
+                "$struct".into(),
+                s.fields.iter().map(|f| f.ty.clone()).collect(),
+            )]
+        } else if let Ok(variants) = self.pattern_variants(ty, Span::default()) {
+            variants.into_iter().collect()
+        } else {
+            let defaults: Vec<_> = expanded
+                .iter()
+                .filter(|r| matches!(r[0], CheckedPattern::Any))
+                .map(|r| r[1..].to_vec())
+                .collect();
+            return self.coverage(&defaults, &types[1..], budget);
+        };
+        for (name, fields) in constructors {
+            let specialized: Vec<_> = expanded
+                .iter()
+                .filter_map(|row| {
+                    let mut payload = match &row[0] {
+                        CheckedPattern::Any => vec![CheckedPattern::Any; fields.len()],
+                        CheckedPattern::Constructor(key, payload) if key == &name => {
+                            payload.clone()
+                        }
+                        _ => return None,
+                    };
+                    payload.extend_from_slice(&row[1..]);
+                    Some(payload)
+                })
+                .collect();
+            let mut specialized_types = fields;
+            specialized_types.extend_from_slice(&types[1..]);
+            if !self.coverage(&specialized, &specialized_types, budget)? {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CheckedPattern {
+    Any,
+    Constructor(String, Vec<CheckedPattern>),
+    Range(i128, i128),
+    Or(Vec<CheckedPattern>),
+}
+fn pattern_binding_paths(
+    pattern: &Pattern,
+    path: &[String],
+    paths: &mut HashMap<String, Vec<Vec<String>>>,
+) {
+    match pattern {
+        Pattern::Binding(name) => {
+            paths.entry(name.clone()).or_default().push(path.to_vec());
+        }
+        Pattern::Struct(_, fields, _) => {
+            for (field, pattern) in fields {
+                let mut projected = path.to_vec();
+                projected.push(field.clone());
+                pattern_binding_paths(pattern, &projected, paths);
+            }
+        }
+        Pattern::Variant(_, fields) | Pattern::Or(fields) => {
+            for pattern in fields {
+                pattern_binding_paths(pattern, path, paths);
+            }
+        }
+        _ => (),
+    }
+}
+fn pattern_expansion_size(pattern: &CheckedPattern) -> usize {
+    match pattern {
+        CheckedPattern::Or(patterns) => patterns
+            .iter()
+            .fold(0usize, |n, p| n.saturating_add(pattern_expansion_size(p))),
+        CheckedPattern::Constructor(_, fields) => fields
+            .iter()
+            .fold(1usize, |n, p| n.saturating_mul(pattern_expansion_size(p))),
+        _ => 1,
+    }
+}
+fn match_subject(ty: &Type) -> (&Type, Option<bool>) {
+    if let Type::Ref(m, inner) = ty {
+        (inner, Some(*m))
+    } else {
+        (ty, None)
+    }
+}
+fn expand_pattern_row(row: &[CheckedPattern], result: &mut Vec<Vec<CheckedPattern>>) {
+    if let Some(CheckedPattern::Or(alternatives)) = row.first() {
+        for alternative in alternatives {
+            let mut expanded = vec![alternative.clone()];
+            expanded.extend_from_slice(&row[1..]);
+            expand_pattern_row(&expanded, result);
+        }
+    } else {
+        result.push(row.to_vec());
     }
 }
 
@@ -2862,6 +3748,7 @@ fn merge_states(mut a: Vec<Vec<Variable>>, b: Vec<Vec<Variable>>) -> Vec<Vec<Var
     for variable in a.iter_mut().flatten() {
         if let Some(other) = b.iter().flatten().find(|v| v.id == variable.id) {
             variable.initialized &= other.initialized;
+            variable.moved_at = variable.moved_at.or(other.moved_at);
             variable.pending_result |= other.pending_result;
             variable.deps.extend(other.deps.clone());
             variable
@@ -2877,13 +3764,17 @@ fn merge_states(mut a: Vec<Vec<Variable>>, b: Vec<Vec<Variable>>) -> Vec<Vec<Var
     }
     a
 }
-fn names_expr(expression: &Expr, names: &mut HashMap<String, usize>) {
+fn names_expr(expression: &Expr, names: &mut HashMap<String, Span>) {
     match &expression.kind {
         ExprKind::Name(name) => {
             names
                 .entry(name.clone())
-                .and_modify(|n| *n = (*n).max(expression.span.start))
-                .or_insert(expression.span.start);
+                .and_modify(|span| {
+                    if expression.span.start > span.start {
+                        *span = expression.span;
+                    }
+                })
+                .or_insert(expression.span);
         }
         ExprKind::Unary(_, e)
         | ExprKind::Field(e, _)
@@ -2923,7 +3814,7 @@ fn names_expr(expression: &Expr, names: &mut HashMap<String, usize>) {
         _ => (),
     }
 }
-fn names_stmt(statement: &Stmt, names: &mut HashMap<String, usize>) {
+fn names_stmt(statement: &Stmt, names: &mut HashMap<String, Span>) {
     match &statement.kind {
         StmtKind::Let { value: Some(e), .. }
         | StmtKind::Expr(e)
@@ -2941,6 +3832,24 @@ fn names_stmt(statement: &Stmt, names: &mut HashMap<String, usize>) {
             names_expr(condition, names);
             names_block(then_block, names);
             names_block(else_block, names);
+        }
+        StmtKind::IfLet {
+            value,
+            then_block,
+            else_block,
+            ..
+        } => {
+            names_expr(value, names);
+            names_block(then_block, names);
+            names_block(else_block, names);
+        }
+        StmtKind::LetPattern {
+            value, else_block, ..
+        } => {
+            names_expr(value, names);
+            if let Some(block) = else_block {
+                names_block(block, names);
+            }
         }
         StmtKind::For {
             init,
@@ -2966,6 +3875,9 @@ fn names_stmt(statement: &Stmt, names: &mut HashMap<String, usize>) {
         StmtKind::Match { value, arms } => {
             names_expr(value, names);
             for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    names_expr(guard, names);
+                }
                 names_block(&arm.body, names);
             }
         }
@@ -2973,11 +3885,210 @@ fn names_stmt(statement: &Stmt, names: &mut HashMap<String, usize>) {
         _ => (),
     }
 }
-fn names_block(block: &Block, names: &mut HashMap<String, usize>) {
+fn names_block(block: &Block, names: &mut HashMap<String, Span>) {
     for s in block {
         names_stmt(s, names);
     }
 }
+
+/// Resolve diagnostic use sites lexically. The conservative name-based liveness
+/// calculation above remains unchanged; a shadowed name must not be presented
+/// as evidence that an earlier binding's borrow is used.
+fn binding_use_spans(function: &Function) -> HashMap<(usize, String), Span> {
+    #[derive(Default)]
+    struct Uses {
+        scopes: Vec<HashMap<String, usize>>,
+        spans: HashMap<(usize, String), Span>,
+    }
+    impl Uses {
+        fn bind(&mut self, name: &str, span: Span) {
+            self.scopes
+                .last_mut()
+                .unwrap()
+                .insert(name.into(), span.start);
+        }
+        fn pattern(&mut self, pattern: &Pattern, span: Span) {
+            for name in pattern.bindings() {
+                self.bind(&name, span);
+            }
+        }
+        fn expr(&mut self, expression: &Expr) {
+            match &expression.kind {
+                ExprKind::Name(name) => {
+                    if let Some(declaration) =
+                        self.scopes.iter().rev().find_map(|scope| scope.get(name))
+                    {
+                        self.spans
+                            .entry((*declaration, name.clone()))
+                            .and_modify(|span| {
+                                if expression.span.start > span.start {
+                                    *span = expression.span;
+                                }
+                            })
+                            .or_insert(expression.span);
+                    }
+                }
+                ExprKind::Unary(_, e)
+                | ExprKind::Field(e, _)
+                | ExprKind::Cast(e, _)
+                | ExprKind::Try(e)
+                | ExprKind::Constant(e, _)
+                | ExprKind::Repeat(e, _) => self.expr(e),
+                ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
+                    self.expr(a);
+                    self.expr(b);
+                }
+                ExprKind::Call { args, .. } | ExprKind::Array(_, args) => {
+                    for arg in args {
+                        self.expr(arg);
+                    }
+                }
+                ExprKind::MethodCall { receiver, args, .. } => {
+                    self.expr(receiver);
+                    for arg in args {
+                        self.expr(arg);
+                    }
+                }
+                ExprKind::Struct(_, fields) => {
+                    for (_, value) in fields {
+                        self.expr(value);
+                    }
+                }
+                ExprKind::ValueBlock(body) => self.block(body, true),
+                ExprKind::Slice {
+                    base, start, end, ..
+                } => {
+                    self.expr(base);
+                    for bound in start.iter().chain(end) {
+                        self.expr(bound);
+                    }
+                }
+                _ => (),
+            }
+        }
+        fn block(&mut self, block: &Block, scoped: bool) {
+            if scoped {
+                self.scopes.push(HashMap::new());
+            }
+            for statement in block {
+                self.stmt(statement);
+            }
+            if scoped {
+                self.scopes.pop();
+            }
+        }
+        fn stmt(&mut self, statement: &Stmt) {
+            match &statement.kind {
+                StmtKind::Let { name, value, .. } => {
+                    if let Some(value) = value {
+                        self.expr(value);
+                    }
+                    self.bind(name, statement.span);
+                }
+                StmtKind::LetPattern {
+                    pattern,
+                    value,
+                    else_block,
+                    ..
+                } => {
+                    self.expr(value);
+                    if let Some(block) = else_block {
+                        self.block(block, true);
+                    }
+                    self.pattern(pattern, statement.span);
+                }
+                StmtKind::Assign { target, value, .. } => {
+                    self.expr(target);
+                    self.expr(value);
+                }
+                StmtKind::Expr(e) | StmtKind::Yield(e) | StmtKind::Return(Some(e)) => self.expr(e),
+                StmtKind::If {
+                    condition,
+                    then_block,
+                    else_block,
+                } => {
+                    self.expr(condition);
+                    self.block(then_block, true);
+                    self.block(else_block, true);
+                }
+                StmtKind::IfLet {
+                    pattern,
+                    value,
+                    then_block,
+                    else_block,
+                } => {
+                    self.expr(value);
+                    self.scopes.push(HashMap::new());
+                    self.pattern(pattern, statement.span);
+                    self.block(then_block, false);
+                    self.scopes.pop();
+                    self.block(else_block, true);
+                }
+                StmtKind::For {
+                    init,
+                    condition,
+                    step,
+                    body,
+                } => {
+                    self.scopes.push(HashMap::new());
+                    if let Some(s) = init {
+                        self.stmt(s);
+                    }
+                    if let Some(e) = condition {
+                        self.expr(e);
+                    }
+                    if let Some(s) = step {
+                        self.stmt(s);
+                    }
+                    self.block(body, true);
+                    self.scopes.pop();
+                }
+                StmtKind::ForEach {
+                    index,
+                    name,
+                    iterable,
+                    body,
+                    ..
+                } => {
+                    self.expr(iterable);
+                    self.scopes.push(HashMap::new());
+                    if let Some(index) = index {
+                        self.bind(index, statement.span);
+                    }
+                    self.bind(name, statement.span);
+                    self.block(body, false);
+                    self.scopes.pop();
+                }
+                StmtKind::Match { value, arms } => {
+                    self.expr(value);
+                    for arm in arms {
+                        self.scopes.push(HashMap::new());
+                        self.pattern(&arm.pattern, arm.span);
+                        if let Some(guard) = &arm.guard {
+                            self.expr(guard);
+                        }
+                        self.block(&arm.body, false);
+                        self.scopes.pop();
+                    }
+                }
+                StmtKind::Block(block) | StmtKind::Unsafe(block) => self.block(block, true),
+                _ => (),
+            }
+        }
+    }
+    let mut uses = Uses {
+        scopes: vec![HashMap::new()],
+        ..Uses::default()
+    };
+    for parameter in &function.params {
+        uses.bind(&parameter.name, parameter.span);
+    }
+    if let Some(body) = &function.body {
+        uses.block(body, false);
+    }
+    uses.spans
+}
+
 fn contains_break(block: &Block) -> bool {
     block.iter().any(|s| match &s.kind {
         StmtKind::Break => true,
@@ -2985,7 +4096,16 @@ fn contains_break(block: &Block) -> bool {
             then_block,
             else_block,
             ..
+        }
+        | StmtKind::IfLet {
+            then_block,
+            else_block,
+            ..
         } => contains_break(then_block) || contains_break(else_block),
+        StmtKind::LetPattern {
+            else_block: Some(block),
+            ..
+        } => contains_break(block),
         StmtKind::Block(b) | StmtKind::Unsafe(b) => contains_break(b),
         StmtKind::Match { arms, .. } => arms.iter().any(|a| contains_break(&a.body)),
         _ => false,
@@ -3393,6 +4513,7 @@ impl Expander {
             StmtKind::ForEach {
                 index,
                 name,
+                copy,
                 iterable,
                 body,
             } => {
@@ -3405,6 +4526,7 @@ impl Expander {
                     ty
                 } else {
                     match dereferenced(&ty) {
+                        Type::Array(_, t) | Type::Slice(_, t) if *copy => *t.clone(),
                         Type::Array(_, t) | Type::Slice(_, t) => Type::Ref(
                             matches!(ty, Type::Ref(true, _) | Type::Slice(true, _)),
                             t.clone(),
@@ -3420,20 +4542,43 @@ impl Expander {
                 let ty = self.expression(value, substitutions, None)?;
                 for arm in arms {
                     let locals = self.locals.clone();
-                    if let Pattern::Variant(n, names) = &arm.pattern {
-                        let fields = self.payloads(dereferenced(&ty), n);
-                        for (name, field) in names.iter().zip(fields) {
-                            let field = if let Type::Ref(m, _) = ty {
-                                Type::Ref(m, Box::new(field))
-                            } else {
-                                field
-                            };
-                            self.locals.insert(name.clone(), field);
-                        }
+                    let (matched, borrowed) = match_subject(&ty);
+                    self.pattern_locals(&mut arm.pattern, matched, borrowed, substitutions, span)?;
+                    if let Some(guard) = &mut arm.guard {
+                        self.expression(guard, substitutions, Some(&Type::Bool))?;
                     }
                     self.block(&mut arm.body, substitutions)?;
                     self.locals = locals;
                 }
+            }
+            StmtKind::IfLet {
+                pattern,
+                value,
+                then_block,
+                else_block,
+            } => {
+                let ty = self.expression(value, substitutions, None)?;
+                let locals = self.locals.clone();
+                let (matched, borrowed) = match_subject(&ty);
+                self.pattern_locals(pattern, matched, borrowed, substitutions, span)?;
+                self.block(then_block, substitutions)?;
+                self.locals = locals;
+                self.block(else_block, substitutions)?;
+            }
+            StmtKind::LetPattern {
+                pattern,
+                ty,
+                value,
+                else_block,
+            } => {
+                self.ty(ty, substitutions, span)?;
+                let actual =
+                    self.expression(value, substitutions, (*ty != Type::Unknown).then_some(&*ty))?;
+                if let Some(block) = else_block {
+                    self.block(block, substitutions)?;
+                }
+                let (matched, borrowed) = match_subject(&actual);
+                self.pattern_locals(pattern, matched, borrowed, substitutions, span)?;
             }
             StmtKind::Block(body) | StmtKind::Unsafe(body) => self.block(body, substitutions)?,
             _ => (),
@@ -3454,6 +4599,117 @@ impl Expander {
                 .map_or(vec![], |v| v.fields.iter().map(|f| f.ty.clone()).collect()),
             _ => vec![],
         }
+    }
+    fn pattern_locals(
+        &mut self,
+        pattern: &mut Pattern,
+        ty: &Type,
+        borrowed: Option<bool>,
+        substitutions: &HashMap<String, Type>,
+        span: Span,
+    ) -> Check<()> {
+        if let Pattern::Binding(name) = pattern
+            && let Type::Named(owner) = dereferenced(ty)
+            && self.known_enums.get(owner).is_some_and(|e| {
+                e.variants
+                    .iter()
+                    .any(|v| v.name == *name && v.fields.is_empty())
+            })
+        {
+            *pattern = Pattern::Variant(name.clone(), vec![]);
+        }
+        match pattern {
+            Pattern::Binding(name) => {
+                self.locals.insert(
+                    name.clone(),
+                    borrowed.map_or_else(|| ty.clone(), |m| Type::Ref(m, Box::new(ty.clone()))),
+                );
+                return Ok(());
+            }
+            Pattern::Or(alternatives) => {
+                for alternative in alternatives {
+                    self.pattern_locals(alternative, ty, borrowed, substitutions, span)?;
+                }
+                return Ok(());
+            }
+            _ => (),
+        }
+        let mut ty = ty;
+        let mut borrowed = borrowed;
+        while let Type::Ref(m, inner) = ty {
+            borrowed = Some(borrowed.unwrap_or(true) && *m);
+            ty = inner;
+        }
+        match pattern {
+            Pattern::Variant(name, patterns) => {
+                let mut depth = 0usize;
+                let mut separator = None;
+                for (index, ch) in name.char_indices() {
+                    match ch {
+                        '<' => depth += 1,
+                        '>' => depth = depth.saturating_sub(1),
+                        '.' if depth == 0 => separator = Some(index),
+                        _ => (),
+                    }
+                }
+                if let Some(index) = separator {
+                    let mut owner = name[..index].to_string();
+                    let mut variant = name[index + 1..].to_string();
+                    if let Some(start) = variant.find('<') {
+                        owner.push_str(&variant[start..]);
+                        variant.truncate(start);
+                    }
+                    self.pattern_owner(&mut owner, ty, substitutions, span)?;
+                    *name = format!("{owner}.{variant}");
+                }
+                let fields = self.payloads(ty, name);
+                for (pattern, field) in patterns.iter_mut().zip(fields) {
+                    self.pattern_locals(pattern, &field, borrowed, substitutions, span)?;
+                }
+            }
+            Pattern::Struct(name, fields, _) => {
+                self.pattern_owner(name, ty, substitutions, span)?;
+                if let Some(declaration) = self.known_structs.get(name).cloned() {
+                    for (name, pattern) in fields {
+                        if let Some(field) = declaration.fields.iter().find(|f| &f.name == name) {
+                            self.pattern_locals(pattern, &field.ty, borrowed, substitutions, span)?;
+                        }
+                    }
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+    fn pattern_owner(
+        &mut self,
+        name: &mut String,
+        matched: &Type,
+        substitutions: &HashMap<String, Type>,
+        span: Span,
+    ) -> Check<()> {
+        if name.contains('<') {
+            let mut ty = crate::parser::parse(&format!(
+                "package generated\nfn instantiate(value: {name}) {{}}"
+            ))
+            .map_err(|_| Diagnostic::new(span, "invalid generic pattern type"))?
+            .functions[0]
+                .params[0]
+                .ty
+                .clone();
+            self.ty(&mut ty, substitutions, span)?;
+            if let Type::Named(concrete) = ty {
+                *name = concrete;
+            }
+        } else if let Type::Named(concrete) = matched
+            && let Type::Generic(template, _) = self.shape(matched)
+            && *name == template
+        {
+            *name = concrete.clone();
+        } else if let Some(Type::Named(concrete)) = substitutions.get(name) {
+            *name = concrete.clone();
+        }
+        Ok(())
     }
     fn shape(&self, ty: &Type) -> Type {
         if let Type::Named(n) = ty
@@ -3660,7 +4916,8 @@ impl Expander {
         } = &mut e.kind
             && let Some(prefix) = qualified_name(receiver)
             && !self.locals.contains_key(&prefix)
-            && self.signatures.contains_key(&format!("{prefix}.{name}"))
+            && (self.signatures.contains_key(&format!("{prefix}.{name}"))
+                || self.known_enums.contains_key(&prefix))
         {
             e.kind = ExprKind::Call {
                 name: format!("{prefix}.{name}"),
@@ -3934,6 +5191,60 @@ impl Expander {
                         }
                     })
                 } else {
+                    if let Some((owner, variant)) = name.rsplit_once('.')
+                        && let Some(template) = self.enum_templates.get(owner).cloned()
+                    {
+                        let owner = owner.to_owned();
+                        let variant = variant.to_owned();
+                        let mut mapping = if type_args.is_empty() {
+                            HashMap::new()
+                        } else {
+                            self.substitutions(&template.generics, type_args, span)?
+                        };
+                        if type_args.is_empty() {
+                            if let Some(expected) = expected {
+                                self.unify(
+                                    &Type::Generic(
+                                        owner.clone(),
+                                        template
+                                            .generics
+                                            .iter()
+                                            .cloned()
+                                            .map(Type::Named)
+                                            .collect(),
+                                    ),
+                                    expected,
+                                    &template.generics,
+                                    &mut mapping,
+                                    span,
+                                )?;
+                            }
+                            if let Some(payload) =
+                                template.variants.iter().find(|v| v.name == variant)
+                            {
+                                for (field, arg) in payload.fields.iter().zip(args.iter()) {
+                                    if let Some(actual) = self.guess(arg) {
+                                        self.unify(
+                                            &field.ty,
+                                            &actual,
+                                            &template.generics,
+                                            &mut mapping,
+                                            span,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                        let arguments =
+                            self.inferred_arguments(&template.generics, &mapping, span)?;
+                        let mut owner_type = Type::Generic(owner, arguments);
+                        self.ty(&mut owner_type, substitutions, span)?;
+                        let Type::Named(concrete) = owner_type else {
+                            unreachable!()
+                        };
+                        *name = format!("{concrete}.{variant}");
+                        type_args.clear();
+                    }
                     let variant = name
                         .rsplit_once('.')
                         .map(|(owner, variant)| (Type::Named(owner.into()), variant.to_owned()));
@@ -4119,6 +5430,273 @@ mod tests {
         );
         accepts(
             "struct S { u8 n }\nfn take(s: S) -> void {}\nfn f() -> u8 {\n s := S{n: 1}\n take(s)\n s = S{n: 2}\n return s.n\n}",
+        );
+    }
+    fn diagnostic_label_source<'a>(
+        body: &str,
+        diagnostic: &'a Diagnostic,
+        message: &str,
+    ) -> (String, &'a str) {
+        let source = format!("package test\n{body}\n");
+        let label = diagnostic
+            .labels
+            .iter()
+            .find(|label| label.message.contains(message))
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing label {message:?}: {}",
+                    diagnostic.render("test.dodo", &source)
+                )
+            });
+        (
+            source[label.span.start..label.span.end].to_owned(),
+            &label.message,
+        )
+    }
+    #[test]
+    fn borrow_diagnostic_labels_origin_conflict_and_actual_use() {
+        let body = "fn consume(view: &u8) -> void {}\nfn f() -> void {\n u8 value = 1\n view := &value\n value = 2\n consume(view)\n}";
+        let error = checked(body).unwrap_err();
+        assert_eq!(
+            diagnostic_label_source(body, &error, "shared borrow begins here").0,
+            "&value"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "cannot modify").0,
+            "value"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "borrow is used here").0,
+            "view"
+        );
+        assert!(
+            !error
+                .render("test.dodo", &format!("package test\n{body}\n"))
+                .contains("source byte")
+        );
+    }
+    #[test]
+    fn borrow_diagnostic_distinguishes_loop_back_edge_use() {
+        let body = "fn f() -> void {\n u8 x = 1\n r := &x\n for i := 0; i < 2; i += 1 {\n n := *r\n x = n\n }\n}";
+        let error = checked(body).unwrap_err();
+        assert_eq!(
+            diagnostic_label_source(body, &error, "later loop iteration").0,
+            "r"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "borrow begins here").0,
+            "&x"
+        );
+    }
+    #[test]
+    fn borrow_diagnostic_labels_competing_implicit_argument_reborrows() {
+        let body = "fn both(a: &mut u8, b: &mut u8) -> void {}\nfn f() -> void {\n u8 x = 1\n r := &mut x\n both(r, r)\n}";
+        let error = checked(body).unwrap_err();
+        let source = format!("package test\n{body}\n");
+        let origin = error
+            .labels
+            .iter()
+            .find(|label| label.message.contains("begins here"))
+            .unwrap();
+        assert_eq!(
+            origin.span.start,
+            source.find("both(r, r)").unwrap() + "both(".len()
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "cannot mutably borrow").0,
+            "r"
+        );
+    }
+    #[test]
+    fn borrow_diagnostic_labels_escape_from_mutable_foreach() {
+        let body = "fn f() -> void {\n values := [2]u8{1, 2}\n &mut u8 escaped\n for item in &mut values { escaped = item }\n *escaped = 3\n}";
+        let error = checked(body).unwrap_err();
+        assert!(error.message.contains("mutable foreach element borrow"));
+        assert_eq!(
+            diagnostic_label_source(body, &error, "mutable element borrow begins").0,
+            "&mut values"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "borrow is used here").0,
+            "escaped"
+        );
+    }
+    #[test]
+    fn borrow_diagnostic_labels_scope_and_value_block_escapes() {
+        let body = "fn f() -> u8 {\n &u8 view\n {\n u8 x = 1\n view = &x\n }\n return *view\n}";
+        let error = checked(body).unwrap_err();
+        assert_eq!(
+            diagnostic_label_source(body, &error, "borrow begins here").0,
+            "&x"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "borrow is used here").0,
+            "view"
+        );
+        assert!(
+            !error
+                .labels
+                .iter()
+                .any(|label| label.message.contains("leaves its scope here"))
+        );
+
+        let body = "fn f() -> u8 {\n view := {\n u8 x = 1\n &x\n }\n return *view\n}";
+        let error = checked(body).unwrap_err();
+        assert!(error.message.contains("value block cannot yield"));
+        assert_eq!(
+            diagnostic_label_source(body, &error, "local borrow begins here").0,
+            "&x"
+        );
+        assert!(
+            diagnostic_label_source(body, &error, "local value `x`")
+                .0
+                .starts_with("u8 x")
+        );
+    }
+    #[test]
+    fn borrow_diagnostic_explains_implicit_destruction_use() {
+        let body = "struct View {\n &u8 r\n fn drop(self: &mut Self) -> void { n := *self.r }\n}\nfn f() -> void {\n u8 x = 1\n v := View{r: &x}\n x = 2\n}";
+        let error = checked(body).unwrap_err();
+        assert!(
+            diagnostic_label_source(body, &error, "destroyed at scope exit")
+                .0
+                .starts_with("v := View")
+        );
+        assert!(
+            !error
+                .labels
+                .iter()
+                .any(|label| label.message == "borrow is used here")
+        );
+    }
+    #[test]
+    fn shadowed_binding_is_not_labeled_as_a_borrow_use() {
+        // Existing liveness is conservative across shadowing. Its explanation
+        // must not claim that the new scalar binding uses the outer borrow.
+        let body = "fn f() -> void {\n u8 x = 1\n r := &x\n x = 2\n {\n r := 3\n n := r\n }\n}";
+        let error = checked(body).unwrap_err();
+        assert!(error.message.contains("live shared borrow"));
+        assert!(
+            !error
+                .labels
+                .iter()
+                .any(|label| label.message == "borrow is used here")
+        );
+        assert!(
+            diagnostic_label_source(body, &error, "borrow is held")
+                .0
+                .starts_with("r := &x")
+        );
+    }
+    #[test]
+    fn move_diagnostic_keeps_branch_origin() {
+        for branch in ["if b { take(s) }", "if b {} else { take(s) }"] {
+            let body = format!(
+                "struct S {{ u8 n }}\nfn take(s: S) -> void {{}}\nfn f(b: bool) -> u8 {{\n s := S{{n: 1}}\n {branch}\n return s.n\n}}"
+            );
+            let error = checked(&body).unwrap_err();
+            let source = format!("package test\n{body}\n");
+            let moved = error
+                .labels
+                .iter()
+                .find(|label| label.message.contains("is moved here"))
+                .unwrap();
+            assert_eq!(
+                moved.span.start,
+                source.find("take(s)").unwrap() + "take(".len()
+            );
+            assert_eq!(diagnostic_label_source(&body, &error, "cannot use").0, "s");
+            assert!(
+                diagnostic_label_source(&body, &error, "binding `s` is declared")
+                    .0
+                    .starts_with("s := S")
+            );
+        }
+    }
+    #[test]
+    fn move_diagnostic_uses_latest_move_after_reinitialization() {
+        let body = "struct S { u8 n }\nfn take(s: S) -> void {}\nfn f() -> u8 {\n s := S{n: 1}\n take(s)\n s = S{n: 2}\n take(s)\n return s.n\n}";
+        let error = checked(body).unwrap_err();
+        let source = format!("package test\n{body}\n");
+        let moved = error
+            .labels
+            .iter()
+            .find(|label| label.message.contains("is moved here"))
+            .unwrap();
+        assert_eq!(
+            moved.span.start,
+            source.rfind("take(s)").unwrap() + "take(".len()
+        );
+    }
+    #[test]
+    fn uninitialized_binding_diagnostic_does_not_invent_a_move() {
+        let body = "fn f(b: bool) -> u8 {\n u8 x\n if b { x = 1 }\n return x\n}";
+        let error = checked(body).unwrap_err();
+        assert_eq!(
+            diagnostic_label_source(body, &error, "not initialized on every path").0,
+            "x"
+        );
+        assert!(
+            !error
+                .labels
+                .iter()
+                .any(|label| label.message.contains("moved here"))
+        );
+    }
+    #[test]
+    fn return_contract_diagnostic_labels_contract_parameter_and_return() {
+        let body = "fn choose(a: &u8, b: &u8) -> &u8 from(a) { return b }";
+        let error = checked(body).unwrap_err();
+        assert_eq!(
+            diagnostic_label_source(body, &error, "return contract allows").0,
+            "from(a)"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "borrowed source `b`").0,
+            "b: &u8"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "returned borrow comes").0,
+            "b"
+        );
+    }
+    #[test]
+    fn local_return_diagnostic_labels_static_contract_and_local_borrow() {
+        let body = "fn f() -> &u8 from(static) {\n u8 x = 1\n r := &x\n return r\n}";
+        let error = checked(body).unwrap_err();
+        assert_eq!(
+            diagnostic_label_source(body, &error, "return contract allows").0,
+            "from(static)"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "local borrow begins").0,
+            "&x"
+        );
+        assert_eq!(
+            diagnostic_label_source(body, &error, "does not live long enough").0,
+            "r"
+        );
+    }
+    #[test]
+    fn inferred_return_contract_is_labeled_and_available_on_error() {
+        let body =
+            "struct S {\n u8 n\n fn choose(self: &Self, other: &u8) -> &u8 { return other }\n}";
+        let source = format!("package test\n{body}\n");
+        let mut program = crate::parser::parse(&source).unwrap();
+        let error = check(&mut program).unwrap_err();
+        assert!(
+            diagnostic_label_source(body, &error, "inferred return contract")
+                .0
+                .contains("&u8")
+        );
+        assert_eq!(
+            program
+                .functions
+                .iter()
+                .find(|function| function.name == "S.choose")
+                .unwrap()
+                .from,
+            ["self"]
         );
     }
     #[test]
@@ -4432,5 +6010,264 @@ mod tests {
     #[test]
     fn empty_forever_loop_diverges() {
         accepts("fn f() -> u8 { for {} }");
+    }
+    #[test]
+    fn immutable_runtime_bindings_preserve_reference_permissions() {
+        accepts(
+            "fn value() -> u32 { 3 }\nfn f() -> u32 { let limit: u32 = value(); count := 0u32; count += limit; count }",
+        );
+        rejects("fn f() -> void { let n = 2u32; n = 3 }", "immutable");
+        rejects(
+            "struct S { u8 n }\nfn f() -> void { let s = S{n: 1}; s.n = 2 }",
+            "immutable",
+        );
+        rejects(
+            "fn f() -> void { let a = [2]u8{1, 2}; a[0] = 2 }",
+            "immutable",
+        );
+        accepts("struct S { u8 n }\nfn f() -> u8 { s := S{n: 1}; let r = &mut s; r.n = 2; r.n }");
+        accepts("fn f() -> u8 { a := [2]u8{1, 2}; let s = &mut a[..]; s[0] = 3; s[0] }");
+        accepts(
+            "fn set(r: &mut u8) -> void { *r = 3 }\nfn f() -> u8 { n := 1u8; let r = &mut n; set(r); *r }",
+        );
+        rejects(
+            "fn f() -> void { n := 1u8; m := 2u8; let r = &mut n; r = &mut m }",
+            "immutable",
+        );
+    }
+    #[test]
+    fn concise_match_arms_must_handle_their_own_results() {
+        accepts(
+            "enum E { Bad }\nfn make() -> u8!E { ok(1) }\nfn use(n: u8) -> void {}\nfn f() -> void { match make() { ok(n) => use(n), err(_) => use(0) } }",
+        );
+        rejects(
+            "enum E { Bad }\nfn make() -> u8!E { ok(1) }\nfn f() -> void { match true { true => make(), false => make() } }",
+            "Result must be handled",
+        );
+        rejects(
+            "enum E { Bad }\nfn make() -> u8!E { ok(1) }\nfn f() -> void { match true { true => { make() }, false => {} } }",
+            "Result must be handled",
+        );
+    }
+    #[test]
+    fn recursive_patterns_check_nested_coverage() {
+        accepts(
+            "fn f(n: Option<Option<u8>>) -> u8 { match n { some(some(v)) => v, some(none) | none => 0 } }",
+        );
+        rejects(
+            "fn f(n: Option<Option<u8>>) -> u8 { match n { some(some(v)) => v, none => 0 } }",
+            "non-exhaustive",
+        );
+        accepts(
+            "struct Pair { bool a; bool b }\nfn f(p: Pair) -> u8 { match p { Pair{a: true, b: _} => 1, Pair{a: false, b: true} => 2, Pair{a: false, b: false} => 3 } }",
+        );
+        rejects(
+            "struct Pair { bool a; bool b }\nfn f(p: Pair) -> u8 { match p { Pair{a: true, b: true} => 1, Pair{a: false, b: false} => 2 } }",
+            "non-exhaustive",
+        );
+    }
+    #[test]
+    fn pattern_ranges_and_alternatives_are_typed_and_exhaustive() {
+        accepts("fn f(n: u8) -> u8 { match n { 0..=127 => 1, 128..=255 => 2 } }");
+        accepts("fn f(n: i8) -> u8 { match n { -128..0 => 1, 0..=127 => 2 } }");
+        rejects(
+            "fn f(n: u8) -> u8 { match n { 0..255 => 1 } }",
+            "non-exhaustive",
+        );
+        rejects(
+            "fn f(n: u8) -> u8 { match n { 8..8 => 1, _ => 2 } }",
+            "empty or reversed",
+        );
+        rejects(
+            "fn f(n: u8) -> u8 { match n { 0..=256 => 1, _ => 2 } }",
+            "out of range",
+        );
+        rejects(
+            "enum E { A(u8 x), B(u32 y) }\nfn f(e: E) -> void { match e { E.A(x) | E.B(x) => {} } }",
+            "same names with the same types",
+        );
+        rejects(
+            "enum E { A(u8 x), B(u8 y) }\nfn f(e: E) -> void { match e { E.A(x) | E.B(y) => {} } }",
+            "same names with the same types",
+        );
+    }
+    #[test]
+    fn guards_are_boolean_and_do_not_contribute_coverage() {
+        accepts(
+            "fn f(n: Option<u8>) -> u8 { match n { some(v) if v > 3 => v, some(v) => v + 1, none => 0 } }",
+        );
+        rejects(
+            "fn f(n: Option<u8>) -> u8 { match n { some(v) if v > 3 => v, none => 0 } }",
+            "non-exhaustive",
+        );
+        rejects(
+            "fn f(n: u8) -> u8 { match n { v if v => 1, _ => 2 } }",
+            "expected `bool`",
+        );
+        rejects(
+            "struct S {}\nfn test(s: S) -> bool { true }\nfn f(s: Option<S>) -> void { match s { some(v) if test(v) => {}, _ => {} } }",
+            "match guards cannot move",
+        );
+        rejects(
+            "fn test(r: &mut u8) -> bool { *r = 2; true }\nfn f(n: &mut Option<u8>) -> void { match n { some(v) if test(v) => {}, _ => {} } }",
+            "match guards cannot move",
+        );
+    }
+    #[test]
+    fn conditional_bindings_share_recursive_patterns_and_scope() {
+        accepts("fn f(n: Option<Option<u8>>) -> u8 { if let some(some(v)) = n { v } else { 0 } }");
+        accepts("fn f(n: Option<Option<u8>>) -> u8 { let some(some(v)) = n else { return 0 }; v }");
+        accepts("struct S { u8 n }\nfn f(s: S) -> u8 { let S{n} = s; n }");
+        rejects(
+            "fn f(n: Option<u8>) -> void { let some(v) = n }",
+            "requires an `else`",
+        );
+        rejects(
+            "fn f(n: Option<u8>) -> void { let some(v) = n else {} }",
+            "must diverge",
+        );
+        rejects(
+            "fn f(n: Option<u8>) -> u8 { if let some(v) = n {}; v }",
+            "unknown binding `v`",
+        );
+        rejects(
+            "fn f(n: Option<u8>) -> void { if let some(v) = n { v = 1 } }",
+            "immutable",
+        );
+    }
+    #[test]
+    fn conditional_and_recursive_patterns_cannot_discard_results() {
+        rejects(
+            "enum E { Bad }\nfn f(n: u8!E) -> void { if let ok(v) = n {} }",
+            "conditional patterns cannot discard a Result",
+        );
+        rejects(
+            "enum E { Bad }\nfn f(n: u8!E) -> void { let ok(v) = n else { return } }",
+            "conditional patterns cannot discard a Result",
+        );
+        rejects(
+            "enum E { Bad }\nfn f(n: Option<u8!E>) -> void { if let some(ok(v)) = n {} }",
+            "conditional patterns cannot discard a Result",
+        );
+        rejects(
+            "enum E { Bad }\nfn f(n: Option<u8!E>) -> void { match n { some(_) => {}, none => {} } }",
+            "nested Result cannot be discarded",
+        );
+        rejects(
+            "enum E { Bad }\nfn f(n: Option<u8!E>) -> void { match n { some(r) => {}, none => {} } }",
+            "never handled",
+        );
+        accepts(
+            "enum E { Bad }\nfn f(n: Option<u8!E>) -> void { match n { some(ok(v)) => {}, some(err(e)) => {}, none => {} } }",
+        );
+        accepts(
+            "enum E { Bad }\nfn f(n: &Option<u8!E>) -> void { match n { some(r) => { match r { ok(v) => {}, err(e) => {} } }, none => {} } }",
+        );
+    }
+    #[test]
+    fn destructuring_preserves_borrows_moves_and_custom_drop() {
+        rejects(
+            "struct S { u8 n }\nfn f(s: S) -> u8 { let S{n} = s; s.n }",
+            "moved",
+        );
+        rejects(
+            "struct S { u8 n; fn drop(self: &mut Self) -> void {} }\nfn f(s: S) -> u8 { let S{n} = s; n }",
+            "custom drop",
+        );
+        accepts(
+            "struct S { u8 n; fn drop(self: &mut Self) -> void {} }\nfn f(s: S) -> u8 { let S{n} = &s; *n }",
+        );
+        accepts("struct S { u8 n }\nfn f(s: &mut S) -> u8 { let S{n} = s; *n = 4; *n }");
+        rejects(
+            "fn f() -> &u8 from(static) { n := some(2u8); let some(v) = &n else { for {} }; v }",
+            "cannot return a borrow",
+        );
+    }
+    #[test]
+    fn generic_patterns_supply_payload_types_to_instantiation() {
+        accepts(
+            "struct Box<T> { T value }\nfn identity<T>(value: T) -> T { value }\nfn read<T>(box: Box<T>) -> T { let Box{value} = box; identity(value) }\nfn f() -> u8 { read(Box<u8>{value: 3}) }",
+        );
+        accepts(
+            "enum Choice<T> { Value(T value), Empty }\nfn read<T>(choice: Choice<T>, default: T) -> T { match choice { Choice.Value(value) => value, Choice.Empty => default } }\nfn f(c: Choice<u8>) -> u8 { read(c, 0u8) }",
+        );
+    }
+    #[test]
+    fn borrowed_struct_patterns_preserve_disjoint_field_loans() {
+        accepts(
+            "struct Pair { i32 left; i32 right }\nfn f() -> i32 { pair := Pair{left: 0, right: 0}; if let Pair{left, right} = &mut pair { *left = 1; *right = 2 }; pair.left + pair.right }",
+        );
+        accepts(
+            "struct Pair { i32 left; i32 right }\nfn f() -> i32 { pair := Pair{left: 0, right: 0}; let Pair{left, right} = &mut pair; *left = 1; *right = 2; *left + *right }",
+        );
+        accepts(
+            "struct Pair { i32 left; i32 right }\nfn f() -> i32 { pair := Pair{left: 0, right: 0}; match &mut pair { Pair{left, right} => { *left = 1; *right = 2; *left + *right } } }",
+        );
+        rejects(
+            "struct Pair { i32 left; i32 right }\nfn f() -> void { pair := Pair{left: 0, right: 0}; let Pair{left, right} = &mut pair; pair.left = 3; *left = 1; *right = 2 }",
+            "borrow",
+        );
+    }
+    #[test]
+    fn irrefutable_borrowed_conditionals_handle_result_obligations() {
+        accepts(
+            "fn consume(n: i32) {}\nfn f(result: i32!i32) { if let ok(value) | err(value) = &result { consume(*value) } }",
+        );
+        accepts("fn f(result: i32!i32) -> i32 { let ok(value) | err(value) = &result; *value }");
+        accepts("enum E { A, B }\nfn f(e: E) -> u8 { match e { A => 1, B => 2 } }");
+        accepts(
+            "struct Box<T> { T value }\nfn f<T>(input: Box<T>) -> T { let Box<T>{value} = input; value }\nfn main() -> u8 { f(Box<u8>{value: 3}) }",
+        );
+        accepts(
+            "enum Choice<T> { Value(T value), Empty }\nfn f(c: Choice<u8>) -> u8 { match c { Choice.Value::<u8>(n) => n, Choice<u8>.Empty => 0 } }\nfn main() -> u8 { f(Choice.Value::<u8>(3)) }",
+        );
+    }
+    #[test]
+    fn excessive_pattern_expansion_reports_a_diagnostic() {
+        let fields = (0..13)
+            .map(|n| format!("bool f{n}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let patterns = (0..13)
+            .map(|n| format!("f{n}: true | false"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        rejects(
+            &format!(
+                "struct Many {{ {fields} }}\nfn f(value: Many) {{ match value {{ Many{{ {patterns} }} => {{}} }} }}"
+            ),
+            "more than 4096 alternatives",
+        );
+    }
+
+    #[test]
+    fn conditional_results_allow_only_result_free_unmatched_payloads() {
+        accepts(
+            "fn use(r: i32!i32) { match r { ok(_) => {}, err(_) => {} } }\nfn f(input: Option<i32!i32>) { if let some(r) = input { use(r) } }",
+        );
+        accepts(
+            "fn f(input: Option<i32!i32>) -> i32 { let some(r) = input else { return 0 }; match r { ok(v) | err(v) => v } }",
+        );
+        accepts(
+            "struct Box { Option<i32!i32> value }\nfn f(input: Box) -> i32 { if let Box{value: some(r)} = input { match r { ok(v) | err(v) => v } } else { 0 } }",
+        );
+        accepts(
+            "enum E { Item(i32!i32 value), Empty }\nfn f(input: E) -> i32 { let E.Item(r) = input else { return 0 }; match r { ok(v) | err(v) => v } }",
+        );
+        accepts(
+            "fn f(input: Option<i32!i32>) -> i32 { if let some(r) = &input { match r { ok(v) | err(v) => *v } } else { 0 } }",
+        );
+        rejects(
+            "fn f(input: Option<i32!i32>) { if let some(r) = input {} }",
+            "never handled",
+        );
+        rejects(
+            "enum E { Item(i32!i32 value), Empty }\nfn f(input: E) { if let E.Empty = input {} }",
+            "conditional patterns cannot discard a Result",
+        );
+        rejects(
+            "struct Box { Option<i32!i32> value }\nfn f(input: Box) { if let Box{value: some(ok(v))} = input {} }",
+            "conditional patterns cannot discard a Result",
+        );
     }
 }

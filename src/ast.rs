@@ -260,7 +260,9 @@ pub struct Function {
     pub generics: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Type,
+    pub ret_span: Span,
     pub from: Vec<String>,
+    pub from_span: Option<Span>,
     pub body: Option<Block>,
     pub span: Span,
 }
@@ -292,6 +294,7 @@ pub enum StmtKind {
         ty: Type,
         value: Option<Expr>,
         constant: bool,
+        mutable: bool,
     },
     Assign {
         target: Expr,
@@ -307,6 +310,18 @@ pub enum StmtKind {
         then_block: Block,
         else_block: Block,
     },
+    IfLet {
+        pattern: Pattern,
+        value: Expr,
+        then_block: Block,
+        else_block: Block,
+    },
+    LetPattern {
+        pattern: Pattern,
+        ty: Type,
+        value: Expr,
+        else_block: Option<Block>,
+    },
     For {
         init: Option<Box<Stmt>>,
         condition: Option<Expr>,
@@ -316,6 +331,8 @@ pub enum StmtKind {
     ForEach {
         index: Option<String>,
         name: String,
+        /// Destructure a shared element reference and copy its copyable value.
+        copy: bool,
         iterable: Expr,
         body: Block,
     },
@@ -331,15 +348,33 @@ pub enum StmtKind {
 #[derive(Clone, Debug)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    pub guard: Option<Expr>,
     pub body: Block,
     pub span: Span,
 }
 #[derive(Clone, Debug)]
 pub enum Pattern {
     Wildcard,
+    Binding(String),
     Bool(bool),
     Int(u64),
-    Variant(String, Vec<String>),
+    Variant(String, Vec<Pattern>),
+    Struct(String, Vec<(String, Pattern)>, bool),
+    Range(u64, u64, bool),
+    Or(Vec<Pattern>),
+}
+impl Pattern {
+    /// Binding names introduced by this pattern. Alternatives share one scope,
+    /// so semantic analysis checks that every alternative binds this same set.
+    pub fn bindings(&self) -> Vec<String> {
+        match self {
+            Self::Binding(name) => vec![name.clone()],
+            Self::Variant(_, fields) => fields.iter().flat_map(Self::bindings).collect(),
+            Self::Struct(_, fields, _) => fields.iter().flat_map(|(_, p)| p.bindings()).collect(),
+            Self::Or(alternatives) => alternatives.first().map_or_else(Vec::new, Self::bindings),
+            Self::Wildcard | Self::Bool(_) | Self::Int(_) | Self::Range(..) => Vec::new(),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Expr {

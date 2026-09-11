@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const HELP: &str = "Dodo 0.1.0 — ahead-of-time systems language compiler\n\nUsage: dodo <COMMAND> <FILE|DIRECTORY> [OPTIONS]\n\nCommands:\n  check    Parse and check types, ownership, and borrowing\n  build    Compile a native executable or compiler artifact\n  run      Compile and run a program; arguments follow --\n\nOptions:\n  -o, --output PATH       Output path (default: build/<source name>)\n      --emit KIND         exe (default), obj, asm, llvm-ir, bitcode\n  -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)\n      --target TRIPLE     LLVM target triple (default: host)\n      --cpu NAME          Target CPU (default: generic)\n      --features LIST     LLVM target features, e.g. +sse4.2\n      --linker PATH       C linker driver (default: DODO_CC or cc)\n      --link-arg ARG      Pass an argument to the linker; repeatable\n  -h, --help             Print help\n  -V, --version          Print compiler version\n\nExamples:\n  dodo check examples/hello.dodo\n  dodo run examples/samples.dodo -O 2\n  dodo build examples/hello.dodo -o build/hello\n  dodo build examples/gpio.dodo --emit llvm-ir -o build/gpio.ll\n\nLLVM 22 is embedded; no LLVM installation is needed to use this compiler.\nLinking executables requires a C toolchain (cc, --linker, or DODO_CC).\n";
+const HELP: &str = "Dodo 0.1.0 — ahead-of-time systems language compiler\n\nUsage: dodo <COMMAND> <FILE|DIRECTORY> [OPTIONS]\n       dodo lsp\n\nCommands:\n  check    Parse and check types, ownership, and borrowing\n  build    Compile a native executable or compiler artifact\n  run      Compile and run a program; arguments follow --\n  lsp      Run the language server over standard input/output\n  fmt      Format and migrate syntax (default input: current directory)\n\nFormatting options:\n      --check            Report unformatted files without writing\n      --stdout           Print one formatted file without writing\n  Use - as the fmt input to read stdin and write stdout.\n\nCompiler options:\n  -o, --output PATH       Output path (default: build/<source name>)\n      --emit KIND         exe (default), obj, asm, llvm-ir, bitcode\n  -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)\n      --target TRIPLE     LLVM target triple (default: host)\n      --cpu NAME          Target CPU (default: generic)\n      --features LIST     LLVM target features, e.g. +sse4.2\n      --linker PATH       C linker driver (default: DODO_CC or cc)\n      --link-arg ARG      Pass an argument to the linker; repeatable\n  -h, --help             Print help\n  -V, --version          Print compiler version\n\nExamples:\n  dodo fmt examples\n  dodo fmt --check examples\n  dodo check examples/hello.dodo\n  dodo run examples/samples.dodo -O 2\n  dodo build examples/hello.dodo -o build/hello\n  dodo build examples/gpio.dodo --emit llvm-ir -o build/gpio.ll\n\nLLVM 22 is embedded; no LLVM installation is needed to use this compiler.\nLinking executables requires a C toolchain (cc, --linker, or DODO_CC).\n";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     Check,
@@ -36,7 +36,46 @@ struct Args {
 enum Parsed {
     Help,
     Version,
+    Lsp,
     Args(Box<Args>),
+    Format(FormatArgs),
+}
+
+struct FormatArgs {
+    input: PathBuf,
+    check: bool,
+    stdout: bool,
+}
+
+fn parse_format(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
+    let mut input = None;
+    let mut check = false;
+    let mut stdout = false;
+    let mut positional = false;
+    for arg in args {
+        match arg.to_str() {
+            Some("--help" | "-h") if !positional => return Ok(Parsed::Help),
+            Some("--check") if !positional => check = true,
+            Some("--stdout") if !positional => stdout = true,
+            Some("--") if !positional => positional = true,
+            Some(s) if !positional && s.starts_with('-') && s != "-" => {
+                return Err(format!("unknown fmt option '{s}'; use dodo --help"));
+            }
+            _ => {
+                if input.replace(PathBuf::from(arg)).is_some() {
+                    return Err("fmt accepts one file or directory; omit the path to format the current directory".into());
+                }
+            }
+        }
+    }
+    if check && stdout {
+        return Err("fmt --check and --stdout cannot be combined".into());
+    }
+    Ok(Parsed::Format(FormatArgs {
+        input: input.unwrap_or_else(|| PathBuf::from(".")),
+        check,
+        stdout,
+    }))
 }
 fn string(value: OsString, name: &str) -> Result<String, String> {
     value
@@ -51,6 +90,14 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
     let action = match command.to_str() {
         Some("-h" | "--help" | "help") => return Ok(Parsed::Help),
         Some("-V" | "--version") => return Ok(Parsed::Version),
+        Some("lsp") => {
+            return match args.next() {
+                None => Ok(Parsed::Lsp),
+                Some(arg) if arg == "--help" || arg == "-h" => Ok(Parsed::Help),
+                Some(_) => Err("lsp uses standard input/output and accepts no arguments".into()),
+            };
+        }
+        Some("fmt") => return parse_format(args),
         Some("check") => Action::Check,
         Some("build") => Action::Build,
         Some("run") => Action::Run,
@@ -336,6 +383,122 @@ fn execute(mut args: Args) -> Result<i32, String> {
     println!("Built {}", output.display());
     Ok(0)
 }
+
+fn format_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|e| format!("cannot read directory {}: {e}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", directory.display()))?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if kind.is_dir() {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with('.') && name != "target" && name != "build" {
+                format_files(&path, files)?;
+            }
+        } else if kind.is_file() && path.extension().is_some_and(|e| e == "dodo") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn format_source(path: &Path, source: &str) -> Result<String, String> {
+    dodoc::format::format_source(source).map_err(|d| d.render(&path.to_string_lossy(), source))
+}
+
+fn execute_format(args: FormatArgs) -> Result<i32, String> {
+    if args.input == Path::new("-") {
+        use std::io::{Read, Write};
+        let mut source = String::new();
+        std::io::stdin()
+            .read_to_string(&mut source)
+            .map_err(|e| format!("cannot read stdin: {e}"))?;
+        let formatted = format_source(Path::new("<stdin>"), &source)?;
+        if args.check {
+            if source != formatted {
+                eprintln!("Would format <stdin>");
+                return Ok(1);
+            }
+        } else {
+            std::io::stdout()
+                .write_all(formatted.as_bytes())
+                .map_err(|e| format!("cannot write stdout: {e}"))?;
+        }
+        return Ok(0);
+    }
+    let input = fs::canonicalize(&args.input)
+        .map_err(|e| format!("cannot open {}: {e}", args.input.display()))?;
+    let mut paths = vec![];
+    if input.is_dir() {
+        if args.stdout {
+            return Err("fmt --stdout requires a single file or stdin (-)".into());
+        }
+        format_files(&input, &mut paths)?;
+        paths.sort();
+    } else {
+        paths.push(input);
+    }
+    // Validate every source before writing any file, including package directories.
+    let mut changes = vec![];
+    for path in paths {
+        let source = fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let formatted = format_source(&path, &source)?;
+        if args.stdout {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(formatted.as_bytes())
+                .map_err(|e| format!("cannot write stdout: {e}"))?;
+            return Ok(0);
+        }
+        if source != formatted {
+            changes.push((path, source, formatted));
+        }
+    }
+    if args.check {
+        for (path, _, _) in &changes {
+            eprintln!("Would format {}", path.display());
+        }
+        return Ok(i32::from(!changes.is_empty()));
+    }
+    // Stage replacements next to their targets for atomic per-file renames.
+    let mut staged = vec![];
+    for (path, original, formatted) in changes {
+        let temporary = TempDir::new(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        let replacement = temporary.0.join("formatted.dodo");
+        fs::write(&replacement, formatted)
+            .map_err(|e| format!("cannot stage {}: {e}", path.display()))?;
+        let permissions = fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        fs::set_permissions(&replacement, permissions).map_err(|e| e.to_string())?;
+        staged.push((path, original, replacement, temporary));
+    }
+    let mut formatted_paths = vec![];
+    for (path, original, replacement, _temporary) in staged {
+        let current = fs::read_to_string(&path)
+            .map_err(|e| format!("cannot re-read {}: {e}", path.display()))?;
+        if current != original {
+            return Err(format!(
+                "{} changed during formatting; leaving its new contents untouched",
+                path.display()
+            ));
+        }
+        fs::rename(replacement, &path)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        formatted_paths.push(path);
+    }
+    // A closed output pipe must not interrupt the source replacement loop.
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    for path in formatted_paths {
+        writeln!(stdout, "Formatted {}", path.display())
+            .map_err(|e| format!("cannot write stdout: {e}"))?;
+    }
+    Ok(0)
+}
+
 fn main() -> ExitCode {
     let result = match parse(std::env::args_os().skip(1)) {
         Ok(Parsed::Help) => {
@@ -347,6 +510,9 @@ fn main() -> ExitCode {
             Ok(0)
         }
         Ok(Parsed::Args(args)) => execute(*args),
+        Ok(Parsed::Lsp) => dodoc::editor::serve(std::io::stdin().lock(), std::io::stdout().lock())
+            .map_err(|error| format!("language server: {error}")),
+        Ok(Parsed::Format(args)) => execute_format(args),
         Err(e) => Err(e),
     };
     match result {

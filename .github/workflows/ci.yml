@@ -59,33 +59,37 @@ jobs:
         run: bash scripts/build-release.sh
       - name: Verify release only needs standard Linux runtime libraries
         run: python3 scripts/check-linkage.py target/x86_64-unknown-linux-gnu/release/dodo --release
+      - name: Build and verify fully static size-focused compiler
+        run: bash scripts/build-release.sh release-small-static
       - name: Compile and run without an LLVM installation
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm \
-            --mount type=bind,source="$PWD/target/x86_64-unknown-linux-gnu/release/dodo",target=/usr/local/bin/dodo,readonly \
-            --mount type=bind,source="$PWD/examples",target=/examples,readonly \
-            ubuntu:24.04 bash -euo pipefail -c '
-              if command -v llvm-config || command -v cc; then
-                echo "The runtime smoke test requires a clean image without compiler tools." >&2
-                exit 1
-              fi
-              dodo --version
-              dodo check /examples/hello.dodo
-              dodo build /examples/hello.dodo --emit llvm-ir -O 2 -o /tmp/hello.ll
-              dodo build /examples/hello.dodo --emit obj -O 2 -o /tmp/hello.o
-              dodo build /examples/hello.dodo --emit obj --target wasm32-unknown-unknown -O 2 -o /tmp/hello.wasm
-              test -s /tmp/hello.ll
-              test -s /tmp/hello.o
-              test -s /tmp/hello.wasm
-              apt-get update
-              apt-get install --no-install-recommends -y build-essential
-              if command -v llvm-config; then
-                echo "The C toolchain unexpectedly installed LLVM." >&2
-                exit 1
-              fi
-              dodo build /examples/hello.dodo -O 2 -o /tmp/hello
-              test "$(/tmp/hello)" = "Dodo 0.1"
-              test "$(dodo run /examples/hello.dodo -O 2)" = "Dodo 0.1"
-            '
+          for profile in release release-small-static; do
+            docker run --rm \
+              --mount type=bind,source="$PWD/target/x86_64-unknown-linux-gnu/$profile/dodo",target=/usr/local/bin/dodo,readonly \
+              --mount type=bind,source="$PWD/examples",target=/examples,readonly \
+              ubuntu:24.04 bash -euo pipefail -c '
+                if command -v llvm-config || command -v cc; then
+                  echo "The runtime smoke test requires a clean image without compiler tools." >&2
+                  exit 1
+                fi
+                dodo --version
+                dodo check /examples/hello.dodo
+                dodo build /examples/hello.dodo --emit llvm-ir -O 2 -o /tmp/hello.ll
+                dodo build /examples/hello.dodo --emit obj -O 2 -o /tmp/hello.o
+                dodo build /examples/hello.dodo --emit obj --target wasm32-unknown-unknown -O 2 -o /tmp/hello.wasm
+                test -s /tmp/hello.ll
+                test -s /tmp/hello.o
+                test -s /tmp/hello.wasm
+                apt-get update
+                apt-get install --no-install-recommends -y build-essential
+                if command -v llvm-config; then
+                  echo "The C toolchain unexpectedly installed LLVM." >&2
+                  exit 1
+                fi
+                dodo build /examples/hello.dodo -O 2 -o /tmp/hello
+                test "$(/tmp/hello)" = "Dodo 0.1"
+                test "$(dodo run /examples/hello.dodo -O 2)" = "Dodo 0.1"
+              '
+          done

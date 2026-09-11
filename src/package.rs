@@ -25,23 +25,35 @@ pub struct Loaded {
 
 impl Loaded {
     pub fn render(&self, diagnostic: &Diagnostic) -> String {
-        let source = self.sources.iter().find(|source| {
-            diagnostic.span.start >= source.start
-                && diagnostic.span.start <= source.start + source.text.len()
-        });
-        if let Some(source) = source.or_else(|| self.sources.first()) {
-            let mut local = diagnostic.clone();
-            local.span.start = local.span.start.saturating_sub(source.start);
-            local.span.end = local.span.end.saturating_sub(source.start);
-            local.render(&source.path.display().to_string(), &source.text)
-        } else {
-            format!("error: {diagnostic}\n")
-        }
+        let paths: Vec<_> = self
+            .sources
+            .iter()
+            .map(|source| source.path.display().to_string())
+            .collect();
+        let sources: Vec<_> = self
+            .sources
+            .iter()
+            .zip(&paths)
+            .map(|(source, path)| (path.as_str(), source.text.as_str(), source.start))
+            .collect();
+        diagnostic.render_with_sources(&sources)
     }
 }
 
 pub fn load(path: &Path) -> Result<Loaded, String> {
-    let mut loader = Loader::default();
+    load_with_overrides(path, &BTreeMap::new())
+}
+
+/// Load a package using open editor buffers in place of files on disk. Override
+/// keys are canonical paths; loading and resolving imports never writes them.
+pub fn load_with_overrides(
+    path: &Path,
+    overrides: &BTreeMap<PathBuf, String>,
+) -> Result<Loaded, String> {
+    let mut loader = Loader {
+        overrides: overrides.clone(),
+        ..Loader::default()
+    };
     let root = loader.module(path, None)?;
     let mut program = Program::default();
     let known_packages = loader.aliases.keys().cloned().collect();
@@ -87,6 +99,7 @@ struct Loader {
     loading: Vec<PathBuf>,
     sources: Vec<Source>,
     offset: usize,
+    overrides: BTreeMap<PathBuf, String>,
 }
 
 impl Loader {
@@ -128,8 +141,12 @@ impl Loader {
         };
         let mut program = Program::default();
         for file in files {
-            let text = std::fs::read_to_string(&file)
-                .map_err(|error| format!("cannot read UTF-8 source {}: {error}", file.display()))?;
+            let text = match self.overrides.get(&file) {
+                Some(text) => text.clone(),
+                None => std::fs::read_to_string(&file).map_err(|error| {
+                    format!("cannot read UTF-8 source {}: {error}", file.display())
+                })?,
+            };
             let mut unit = parser::parse(&text)
                 .map_err(|diagnostic| diagnostic.render(&file.display().to_string(), &text))?;
             if program.package.is_empty() {
@@ -524,6 +541,28 @@ impl Names<'_> {
             _ => {}
         }
     }
+    fn pattern(&self, pattern: &mut Pattern, generics: &BTreeSet<String>) {
+        match pattern {
+            Pattern::Variant(name, fields) => {
+                *name = self.type_text(name, generics);
+                for field in fields {
+                    self.pattern(field, generics);
+                }
+            }
+            Pattern::Struct(name, fields, _) => {
+                *name = self.type_text(name, generics);
+                for (_, field) in fields {
+                    self.pattern(field, generics);
+                }
+            }
+            Pattern::Or(patterns) => {
+                for pattern in patterns {
+                    self.pattern(pattern, generics);
+                }
+            }
+            _ => {}
+        }
+    }
     fn block(&self, block: &mut Block, locals: &mut BTreeSet<String>, generics: &BTreeSet<String>) {
         for statement in block {
             self.stmt(statement, locals, generics);
@@ -548,6 +587,33 @@ impl Names<'_> {
             StmtKind::Assign { target, value, .. } => {
                 self.expr(target, locals, generics);
                 self.expr(value, locals, generics);
+            }
+            StmtKind::LetPattern {
+                pattern,
+                ty,
+                value,
+                else_block,
+            } => {
+                self.scoped_ty(ty, locals, generics);
+                self.expr(value, locals, generics);
+                if let Some(body) = else_block {
+                    self.block(body, &mut locals.clone(), generics);
+                }
+                self.pattern(pattern, generics);
+                locals.extend(pattern.bindings());
+            }
+            StmtKind::IfLet {
+                pattern,
+                value,
+                then_block,
+                else_block,
+            } => {
+                self.expr(value, locals, generics);
+                self.pattern(pattern, generics);
+                let mut inner = locals.clone();
+                inner.extend(pattern.bindings());
+                self.block(then_block, &mut inner, generics);
+                self.block(else_block, &mut locals.clone(), generics);
             }
             StmtKind::Expr(value) | StmtKind::Yield(value) | StmtKind::Return(Some(value)) => {
                 self.expr(value, locals, generics)
@@ -584,6 +650,7 @@ impl Names<'_> {
                 name,
                 iterable,
                 body,
+                ..
             } => {
                 self.expr(iterable, locals, generics);
                 let mut loop_locals = locals.clone();
@@ -597,9 +664,10 @@ impl Names<'_> {
                 self.expr(value, locals, generics);
                 for arm in arms {
                     let mut arm_locals = locals.clone();
-                    if let Pattern::Variant(name, bindings) = &mut arm.pattern {
-                        *name = self.name(name, &BTreeSet::new());
-                        arm_locals.extend(bindings.iter().cloned());
+                    self.pattern(&mut arm.pattern, generics);
+                    arm_locals.extend(arm.pattern.bindings());
+                    if let Some(guard) = &mut arm.guard {
+                        self.expr(guard, &arm_locals, generics);
                     }
                     self.block(&mut arm.body, &mut arm_locals, generics);
                 }
@@ -638,6 +706,10 @@ fn shift_program(program: &mut Program, offset: usize) {
     }
     for function in &mut program.functions {
         shift(&mut function.span, offset);
+        shift(&mut function.ret_span, offset);
+        if let Some(span) = &mut function.from_span {
+            shift(span, offset);
+        }
         for parameter in &mut function.params {
             shift(&mut parameter.span, offset);
         }
@@ -712,6 +784,24 @@ fn shift_stmt(statement: &mut Stmt, offset: usize) {
             shift_expr(target, offset);
             shift_expr(value, offset);
         }
+        StmtKind::LetPattern {
+            value, else_block, ..
+        } => {
+            shift_expr(value, offset);
+            if let Some(body) = else_block {
+                shift_block(body, offset);
+            }
+        }
+        StmtKind::IfLet {
+            value,
+            then_block,
+            else_block,
+            ..
+        } => {
+            shift_expr(value, offset);
+            shift_block(then_block, offset);
+            shift_block(else_block, offset);
+        }
         StmtKind::If {
             condition,
             then_block,
@@ -746,6 +836,9 @@ fn shift_stmt(statement: &mut Stmt, offset: usize) {
             shift_expr(value, offset);
             for arm in arms {
                 shift(&mut arm.span, offset);
+                if let Some(guard) = &mut arm.guard {
+                    shift_expr(guard, offset);
+                }
                 shift_block(&mut arm.body, offset);
             }
         }
@@ -851,6 +944,109 @@ mod tests {
         let rendered = loaded.render(&Diagnostic::new(value.span, "unknown name"));
         assert!(rendered.contains("math.dodo:2:"), "{rendered}");
         assert!(rendered.contains("return missing"));
+    }
+    #[test]
+    fn diagnostic_labels_resolve_each_file_independently() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "main.dodo",
+            "package app\nimport \"views\"\nfn main() -> void {}\n",
+        );
+        fixture.write(
+            "views.dodo",
+            "package views\npub fn first(value: &i32) -> &i32 from(value) { return value }\n",
+        );
+        let loaded = load(&fixture.0.join("main.dodo")).unwrap();
+        let main = loaded
+            .program
+            .functions
+            .iter()
+            .find(|function| function.name == "main")
+            .unwrap();
+        let first = loaded
+            .program
+            .functions
+            .iter()
+            .find(|function| function.name == "views.first")
+            .unwrap();
+        let source = loaded
+            .sources
+            .iter()
+            .find(|source| source.path.ends_with("views.dodo"))
+            .unwrap();
+        let from_span = first.from_span.unwrap();
+        assert_eq!(
+            &source.text[from_span.start - source.start..from_span.end - source.start],
+            "from(value)"
+        );
+        assert_eq!(
+            &source.text[first.ret_span.start - source.start..first.ret_span.end - source.start],
+            "-> &i32"
+        );
+        let rendered = loaded.render(
+            &Diagnostic::new(main.span, "invalid borrow")
+                .primary_label("borrow escapes here")
+                .label(from_span, "borrowed return source declared here"),
+        );
+        assert!(rendered.contains("main.dodo:3:1"), "{rendered}");
+        assert!(rendered.contains("views.dodo:2:"), "{rendered}");
+        assert!(rendered.contains("^^^^^^^^"), "{rendered}");
+        assert!(
+            rendered.contains("----------- borrowed return source declared here"),
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("error:").count(), 1);
+    }
+    #[test]
+    fn editor_overrides_load_root_and_imports_without_changing_files() {
+        let fixture = Fixture::new();
+        let disk_root = "package app\nimport \"math\"\nfn main() -> void {}\n";
+        let disk_import = "package math\npub fn answer() -> i32 { return 1 }\n";
+        fixture.write("main.dodo", disk_root);
+        fixture.write("math.dodo", disk_import);
+        let root = fixture.0.join("main.dodo").canonicalize().unwrap();
+        let import = fixture.0.join("math.dodo").canonicalize().unwrap();
+        let root_buffer =
+            "package app\nimport \"math\"\nfn main() -> i32 { return math.answer() }\n";
+        let import_buffer = "package math\npub fn answer() -> i32 { return 42 }\n";
+        let overrides = BTreeMap::from([
+            (root.clone(), root_buffer.to_owned()),
+            (import.clone(), import_buffer.to_owned()),
+        ]);
+        let loaded = load_with_overrides(&root, &overrides).unwrap();
+        assert_eq!(
+            loaded
+                .sources
+                .iter()
+                .find(|source| source.path == root)
+                .unwrap()
+                .text,
+            root_buffer
+        );
+        assert_eq!(
+            loaded
+                .sources
+                .iter()
+                .find(|source| source.path == import)
+                .unwrap()
+                .text,
+            import_buffer
+        );
+        assert_eq!(std::fs::read_to_string(root).unwrap(), disk_root);
+        assert_eq!(std::fs::read_to_string(import).unwrap(), disk_import);
+        assert_eq!(
+            loaded
+                .program
+                .functions
+                .iter()
+                .find(|function| function.name == "main")
+                .unwrap()
+                .ret,
+            Type::Int {
+                signed: true,
+                bits: 32
+            }
+        );
     }
     #[test]
     fn rejects_cycles_ambiguous_imports_and_package_mismatches() {

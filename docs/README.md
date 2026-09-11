@@ -10,6 +10,9 @@ The specification includes the September 2026 ergonomics revision and marks
 remaining unresolved questions. It describes the intended language, not a claim that every
 feature is implemented. Consult the project README for compiler support.
 
+[Ownership diagnostics and editor hovers](diagnostics-and-editors.md) documents
+labeled errors, runnable and intentionally rejected examples, and `dodo lsp`.
+
 Regenerate the text and PDF from the repository root with Python 3.10 or newer:
 
 ```sh

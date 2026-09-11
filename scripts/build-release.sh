@@ -4,6 +4,12 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+profile=${1:-release}
+if [[ $# -gt 1 || ( "$profile" != release && "$profile" != release-small && "$profile" != release-small-static ) ]]; then
+    echo "Usage: $0 [release|release-small|release-small-static]" >&2
+    exit 1
+fi
+
 target=x86_64-unknown-linux-gnu
 host=$(rustc -vV | sed -n 's/^host: //p')
 if [[ "$host" != "$target" ]]; then
@@ -14,15 +20,53 @@ fi
 
 # An explicit target keeps these flags off host build scripts and proc macros.
 # LLVM itself is static through Cargo.toml; bundle its support libraries too.
-# Keep the platform C runtime dynamic so the binary uses the host's libc.
 flags=()
-for library in z zstd stdc++ ffi; do
+libraries=(z zstd stdc++ ffi)
+linkage_mode=--release
+if [[ "$profile" == release-small-static ]]; then
+    linkage_mode=--static
+    # Avoid PIE relocation overhead and include the platform C runtime.
+    flags+=(-C target-feature=+crt-static -C relocation-model=static
+            -C "linker=$PWD/scripts/link-static.sh")
+    libraries+=(c m)
+
+    # LLVM builds can have additional dependencies (for example libxml2).
+    # The static linker adapter also handles llvm-sys's dynamic declarations.
+    if [[ -n "${LLVM_SYS_221_PREFIX:-}" ]]; then
+        llvm_config="$LLVM_SYS_221_PREFIX/bin/llvm-config"
+    else
+        llvm_config=$(command -v llvm-config-22 || command -v llvm-config22 || command -v llvm-config || true)
+    fi
+    if [[ ! -x "$llvm_config" ]]; then
+        echo "Set LLVM_SYS_221_PREFIX to the LLVM 22 installation for the static build." >&2
+        exit 1
+    fi
+    system_libraries=$("$llvm_config" --link-static --system-libs)
+    read -r -a system_libraries <<< "$system_libraries"
+    for flag in "${system_libraries[@]}"; do
+        if [[ "$flag" == -l* && "$flag" != -l:* ]]; then
+            libraries+=("${flag#-l}")
+        else
+            echo "Unsupported LLVM system-library flag for static linking: $flag" >&2
+            exit 1
+        fi
+    done
+fi
+declare -A seen_libraries=()
+for library in "${libraries[@]}"; do
+    if [[ -v "seen_libraries[$library]" ]]; then
+        continue
+    fi
+    seen_libraries[$library]=1
     archive=$("${CC:-cc}" "-print-file-name=lib${library}.a")
     if [[ ! -f "$archive" ]]; then
         echo "Missing static archive lib${library}.a; install the build prerequisites in README.md." >&2
         exit 1
     fi
-    flags+=(-L "native=$(dirname "$archive")" -l "static=$library")
+    flags+=(-L "native=$(dirname "$archive")")
+    if [[ "$profile" != release-small-static ]]; then
+        flags+=(-l "static=$library")
+    fi
 done
 
 # Preserve caller flags, including paths with spaces in Cargo's encoded form.
@@ -34,9 +78,9 @@ for flag in "${flags[@]}"; do
 done
 export CARGO_ENCODED_RUSTFLAGS
 
-cargo build --locked --release --bin dodo --target "$target"
+cargo build --locked --profile "$profile" --bin dodo --target "$target"
 target_directory=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
-binary="$target_directory/$target/release/dodo"
-python3 scripts/check-linkage.py "$binary" --release
+binary="$target_directory/$target/$profile/dodo"
+python3 scripts/check-linkage.py "$binary" "$linkage_mode"
 "$binary" --version
 echo "Self-contained compiler: $binary"

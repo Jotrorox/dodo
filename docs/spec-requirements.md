@@ -8,9 +8,9 @@ features should receive clear diagnostics rather than silently altered semantics
 | Area | Required behavior and useful checks |
 | --- | --- |
 | Source and visibility | Require packages; support string imports and qualified names; make declarations and fields private by default; reject public APIs exposing private types; expose public enum variants. |
-| Syntax | Newline statement termination, braced blocks, void as the default return type, explicit function returns, name-first declarations, receiver and field shorthand, inferred mutable locals, constants, struct-local methods. |
+| Syntax | Newline statement termination with leading-dot continuation and explicit semicolon boundaries, canonical name-first declarations/bracket arrays/`f::<T>()` calls, automatic legacy migration with `dodo fmt`, braced blocks, void as the default return type, explicit and final-expression function returns, name-first declarations, receiver and field shorthand, immutable runtime let bindings, inferred mutable locals, constants, struct-local methods. |
 | Values | Primitive integers, pointer-sized integers, floats, bool, arrays, shared/mutable slices and references, raw pointers, UTF-8 string views, Result, Option, structs, enums, and basic generics. |
-| Literals | Contextual integer inference with isize default; typed integers; byte, string, byte-string, and array literals; immutable program-lifetime string storage; inferred array lists and copy-only repetition with one initializer evaluation. |
+| Literals | Contextual integer inference with isize default; typed integers; byte, string, byte-string, and array literals; immutable program-lifetime string storage; inferred and explicitly annotated bracket array lists and copy-only repetition with one initializer evaluation. |
 | Initialization | Reject reads before initialization and after a move, including branch-dependent paths and subobjects; allow reinitialization. |
 | Moves | Copy scalars/shared references/raw pointers; move structs/arrays/tagged values/mutable references; no implicit deep copy; consuming receivers transfer ownership. |
 | Methods | Infer receiver borrowing for shared/mutable methods; support consuming receivers and associated functions; require explicit new borrows in free calls. |
@@ -23,15 +23,15 @@ features should receive clear diagnostics rather than silently altered semantics
 | Constants and inference | Resolve named constant dependencies and array lengths; diagnose cycles, target-width overflow, and ambiguous local generic arguments; infer some(payload). |
 | Value blocks | Unify branch result types, evaluate selected branches only, transfer values before cleanup, retain outer-expression loans, and reject escaping local borrows. |
 | Ranges and slicing | Capture integer range bounds once, create fresh bindings, preserve loop cleanup, and bounds-check subslices with source lifetimes. |
-| Foreach | Evaluate the collection once; borrow arrays/slices without consuming; fresh bindings per iteration; usize indices; &T or &mut T elements; forbid mutable element loans escaping their iteration. |
-| Matching | Exhaustive statements and value expressions with no fallthrough; literals/variants/payload bindings/wildcard; consume an owned non-copy scrutinee and borrow payloads of reference scrutinees. |
+| Foreach | Evaluate the collection once; borrow arrays/slices without consuming; fresh bindings per iteration; usize indices; &T or &mut T elements; opt-in `&value` patterns copy shared copyable elements while preserving collection loans and reference dependencies; forbid mutable element loans escaping their iteration. |
+| Matching | Uniform expression/block arms; shared recursive enum/struct patterns, literals, ranges, alternatives, and guards; exhaustive unguarded coverage; conditional if-let and diverging let-else; preserve ownership, borrow permissions, and mandatory nested Result handling. |
 | Errors | T!E aliases Result<T,E>; ! binds outside borrow/slice syntax; ok/err and ok() for void; ? requires identical error types and ordinary cleanup; reject discarded or unhandled Results, including `_ =`. |
 | Unsafe boundary | Restrict pointer dereference/arithmetic/reference conversion, foreign calls, unchecked access, and assembly; require unsafe blocks even inside unsafe fn; keep ordinary type, borrow, and bounds checks active. |
 | Raw validity | Preserve requirements for bounds, alignment, initialization, valid values, aliasing, and originating object; unsafe syntax cannot validate an invalid checked reference. |
 | Memory and hardware | Provide specified core.ptr/core.mem facilities; allocation remains optional and recoverable failures use Result; MMIO accesses use supported widths without splitting and never fabricate ordinary mutable references. |
 | Volatile and concurrency | Preserve volatile accesses and mutual compiler ordering; do not imply atomicity or barriers; unsafe mutable-static access unless synchronized; atomics expose no ordinary mutable reference to concurrent storage. |
 | FFI and targets | Explicit C ABI and repr(C); target-specific attributes, assembly, barriers, entry/linker integration, and non-returning panic path; no mandatory heap, collector, OS, or scheduler. |
-| Diagnostics | Show conflicting access, loan origin, live use, and a safe repair direction; do not offer unsafe as the default borrow-conflict repair. |
+| Diagnostics | Label source snippets for conflicting access, loan origin, and live use; show move origins and borrowed-return contract/source violations; provide a safe repair direction without unsafe as the default. Editor hovers expose inferred types, receiver ownership, and borrowed-return sources. |
 
 The worked examples establish three useful execution checks: `samples.demo()`
 returns 131; `hex.parse_or(b"2a", 0)` returns 42; and

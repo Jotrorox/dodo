@@ -93,10 +93,10 @@ impl Lexer<'_> {
                 _ => {
                     let rest = &self.source[self.cursor..];
                     let symbol = [
-                        "<<=", ">>=", ":=", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "<<",
-                        ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::", "..", "{", "}",
-                        "(", ")", "[", "]", ",", ";", ":", ".", "+", "-", "*", "/", "%", "=", "<",
-                        ">", "!", "?", "&", "|", "^", "~", "@",
+                        "<<=", ">>=", "..=", ":=", "->", "=>", "==", "!=", "<=", ">=", "&&", "||",
+                        "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::", "..",
+                        "{", "}", "(", ")", "[", "]", ",", ";", ":", ".", "+", "-", "*", "/", "%",
+                        "=", "<", ">", "!", "?", "&", "|", "^", "~", "@",
                     ]
                     .into_iter()
                     .find(|s| rest.starts_with(s));
@@ -389,6 +389,14 @@ mod tests {
             TokenKind::String(vec![b'h', b'i', 255], true)
         );
         assert_eq!(tokens[2].kind, TokenKind::Int(10, Some(Type::u8())));
+    }
+    #[test]
+    fn inclusive_pattern_ranges_use_the_longest_operator() {
+        let tokens = lex("b'0'..=b'9' 1..10 | 20..=30").unwrap();
+        assert_eq!(tokens[1].kind, TokenKind::Symbol("..="));
+        assert_eq!(tokens[4].kind, TokenKind::Symbol(".."));
+        assert_eq!(tokens[6].kind, TokenKind::Symbol("|"));
+        assert_eq!(tokens[8].kind, TokenKind::Symbol("..="));
     }
     #[test]
     fn comments_preserve_newlines_and_byte_spans() {

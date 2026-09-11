@@ -10,10 +10,24 @@ repository = "https://github.com/Jotrorox/dodo"
 [dependencies]
 # Never fall back to a shared LLVM library: installed binaries must not need LLVM.
 inkwell = { version = "0.10", default-features = false, features = ["llvm22-1-force-static", "target-all"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
 strip = "debuginfo"
+
+# Minimize the compiler executable with stable compiler options.
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Linux static linking flags are supplied by scripts/build-release.sh.
+[profile.release-small-static]
+inherits = "release-small"
 
 [[bin]]
 name = "dodo"
