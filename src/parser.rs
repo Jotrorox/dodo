@@ -728,6 +728,7 @@ impl Parser {
             return Err(self.error("expected a function body enclosed in braces"));
         };
         Ok(Function {
+            generic_instance: false,
             name,
             public: mods.public,
             unsafe_: mods.unsafe_,

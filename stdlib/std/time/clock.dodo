@@ -1,0 +1,77 @@
+package clock
+
+import "std/time"
+
+// Statically dispatched capability: C.now(&self)->Instant!TimeError.
+// A provider must keep one identity for its clock domain and never decrease
+// ticks. Identity allocation, OS reads and suspend policy belong to adapters.
+pub fn now<C>(source: &C) -> time.Instant!time.TimeError {
+    return source.now()
+}
+// W.wall_now(&self)->Timestamp!TimeError may jump forward or backward.
+pub fn wall_now<W>(source: &W) -> time.Timestamp!time.TimeError {
+    return source.wall_now()
+}
+
+pub struct FakeClock {
+    identity: u64
+    ticks: time.Duration
+    pub fn new(clock_id: u64) -> FakeClock {
+        return FakeClock { identity: clock_id, ticks: time.Duration.zero() }
+    }
+    pub fn starting_at(clock_id: u64, ticks: time.Duration) -> FakeClock {
+        return FakeClock { identity: clock_id, ticks: ticks }
+    }
+    pub fn now(&self) -> time.Instant!time.TimeError {
+        return ok(time.Instant.new(self.identity, self.ticks.clone()))
+    }
+    // Failure is atomic. No sleeping or scheduler is started.
+    pub fn advance(&mut self, duration: &time.Duration) -> void!time.TimeError {
+        next := self.ticks.checked_add(duration)?
+        self.ticks = next
+        return ok()
+    }
+}
+pub struct FakeWallClock {
+    current: time.Timestamp
+    pub fn new(initial: time.Timestamp) -> FakeWallClock {
+        return FakeWallClock { current: initial }
+    }
+    pub fn wall_now(&self) -> time.Timestamp!time.TimeError {
+        return ok(self.current.clone())
+    }
+    pub fn set(&mut self, value: time.Timestamp) {
+        self.current = value
+    }
+    pub fn advance(&mut self, duration: &time.Duration) -> void!time.TimeError {
+        next := self.current.checked_add(duration)?
+        self.current = next
+        return ok()
+    }
+}
+
+pub struct Deadline {
+    target: time.Instant
+    pub fn at(target: time.Instant) -> Deadline {
+        return Deadline { target: target }
+    }
+    pub fn instant(&self) -> &time.Instant {
+        return &self.target
+    }
+    pub fn is_due(&self, current: &time.Instant) -> bool!time.TimeError {
+        order := current.compare(&self.target)?
+        return ok(order >= 0)
+    }
+
+}
+
+pub fn deadline_after<C>(source: &C, duration: &time.Duration) -> Deadline!time.TimeError {
+    current := source.now()?
+    target := current.checked_add(duration)?
+    return ok(Deadline.at(target))
+}
+
+pub fn deadline_poll<C>(deadline: &Deadline, source: &C) -> bool!time.TimeError {
+    current := source.now()?
+    return deadline.is_due(&current)
+}

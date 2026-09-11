@@ -1,0 +1,83 @@
+package collections_algorithms
+import "std/collections"
+pub struct Even {
+    pub fn test(&self, value: &i32) -> bool {
+        return *value % 2 == 0
+    }
+}
+fn main() -> i32 {
+    one := 1i32
+    three := 3i32
+    five := 5i32
+    even := Even {}
+    order := collections.I32 {}
+    data := [9i32, 3, 5, 1, 4, 2, 8, 7, 6, 0, 5, 5]
+    collections.sort(&mut data, &order)
+    if!collections.is_sorted(&data, &order) {
+        return 1
+    }
+    if collections.lower_bound(&data, &five, &order) != 5 {
+        return 2
+    }
+    if collections.upper_bound(&data, &five, &order) != 8 {
+        return 3
+    }
+    match collections.binary_search(&data, &five, &order) {
+        some(i) => {
+            if i != 5 {
+                return 4
+            }
+        }, none => {
+            return 5
+        },
+    }
+    empty: [0]i32 = []
+    collections.sort(&mut empty, &order)
+    if collections.lower_bound(&empty, &one, &order) != 0 {
+        return 6
+    }
+    match collections.find(&data, &three, &order) {
+        some(i) => {
+            if i != 3 {
+                return 7
+            }
+        }, none => {
+            return 8
+        },
+    }
+    if!collections.equal(&data, &data, &order) || collections.compare(&empty, &data, &order) != -1 {
+        return 9
+    }
+    boundary := collections.partition(&mut data, &even)
+    if boundary != 5 {
+        return 10
+    }
+    for i in 0usize..boundary {
+        if data[i] % 2 != 0 {
+            return 11
+        }
+    }
+    for i in boundary..data.len {
+        if data[i] % 2 == 0 {
+            return 12
+        }
+    }
+    collections.stable_sort(&mut data, &order)
+    if!collections.is_sorted(&data, &order) {
+        return 13
+    }
+    // Deterministic shuffled permutations, compare with their exact sorted model.
+    values := [0i32; 97]
+    for round in 0usize..40usize {
+        for i in 0usize..values.len {
+            values[i] = ((i * 37 + round * 13) % 97) as i32
+        }
+        collections.sort(&mut values, &order)
+        for i in 0usize..values.len {
+            if values[i] != i as i32 {
+                return 14
+            }
+        }
+    }
+    return 0
+}

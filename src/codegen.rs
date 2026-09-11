@@ -837,8 +837,23 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             StmtKind::Let {
                 name, ty, value, ..
             } => {
-                let v = value.as_ref().map(|v| self.expr(v)).transpose()?;
-                self.bind(name, ty, v)?;
+                if let Some(initializer) = value
+                    && let ExprKind::Repeat(element, _) = &initializer.kind
+                {
+                    // Evaluate before introducing the new name: a shadowing
+                    // initializer still refers to the previous binding. This
+                    // also preserves evaluation and propagation for length 0.
+                    let element = self.expr(element)?;
+                    let binding = self.bind(name, ty, None)?;
+                    self.initialize_repeat(binding.ptr, ty, element)?;
+                    if let Some(flag) = binding.live {
+                        self.builder
+                            .build_store(flag, self.context.bool_type().const_int(1, false))?;
+                    }
+                } else {
+                    let v = value.as_ref().map(|v| self.expr(v)).transpose()?;
+                    self.bind(name, ty, v)?;
+                }
             }
             StmtKind::Assign { target, op, value } => {
                 if matches!(&target.kind,ExprKind::Name(n) if n=="_") {
@@ -1045,6 +1060,54 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         Ok(())
     }
+    // Fill existing array storage without materializing the complete array as
+    // an SSA aggregate. In particular, large caller-owned byte buffers must not
+    // become hundreds of thousands of scalar loads/stores during lowering.
+    // The checked language requires a copyable element and evaluates it once.
+    fn initialize_repeat(
+        &mut self,
+        storage: PointerValue<'ctx>,
+        ty: &Type,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<()> {
+        let Type::Array(n, element) = ty else {
+            return Err(error("invalid repeated array"));
+        };
+        let counter = self.alloca(self.usize_type().into(), "repeat.index")?;
+        self.builder
+            .build_store(counter, self.usize_type().const_zero())?;
+        let head = self.bb("repeat.condition");
+        let body = self.bb("repeat.body");
+        let end = self.bb("repeat.end");
+        self.builder.build_unconditional_branch(head)?;
+        self.builder.position_at_end(head);
+        let index = self
+            .builder
+            .build_load(self.usize_type(), counter, "repeat.index")?
+            .into_int_value();
+        let more = self.builder.build_int_compare(
+            IntPredicate::ULT,
+            index,
+            self.usize_type().const_int(*n as u64, false),
+            "repeat.more",
+        )?;
+        self.builder.build_conditional_branch(more, body, end)?;
+        self.builder.position_at_end(body);
+        let ptr = unsafe {
+            self.builder
+                .build_gep(self.ty(element)?, storage, &[index], "repeat.element")?
+        };
+        self.builder.build_store(ptr, value)?;
+        let next = self.builder.build_int_add(
+            index,
+            self.usize_type().const_int(1, false),
+            "repeat.next",
+        )?;
+        self.builder.build_store(counter, next)?;
+        self.builder.build_unconditional_branch(head)?;
+        self.builder.position_at_end(end);
+        Ok(())
+    }
     fn expr(&mut self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
         let value = match &e.kind {
             ExprKind::Int(v, _) => self.ty(&e.ty)?.into_int_type().const_int(*v, false).into(),
@@ -1064,48 +1127,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             ExprKind::Constant(value, _) => self.expr(value)?,
             ExprKind::Repeat(value, _) => {
-                let Type::Array(n, element) = &e.ty else {
-                    return Err(error("invalid repeated array"));
-                };
                 let value = self.expr(value)?;
                 let storage = self.alloca(self.ty(&e.ty)?, "repeat.array")?;
-                let counter = self.alloca(self.usize_type().into(), "repeat.index")?;
-                self.builder
-                    .build_store(counter, self.usize_type().const_zero())?;
-                let head = self.bb("repeat.condition");
-                let body = self.bb("repeat.body");
-                let end = self.bb("repeat.end");
-                self.builder.build_unconditional_branch(head)?;
-                self.builder.position_at_end(head);
-                let index = self
-                    .builder
-                    .build_load(self.usize_type(), counter, "repeat.index")?
-                    .into_int_value();
-                let more = self.builder.build_int_compare(
-                    IntPredicate::ULT,
-                    index,
-                    self.usize_type().const_int(*n as u64, false),
-                    "repeat.more",
-                )?;
-                self.builder.build_conditional_branch(more, body, end)?;
-                self.builder.position_at_end(body);
-                let ptr = unsafe {
-                    self.builder.build_gep(
-                        self.ty(element)?,
-                        storage,
-                        &[index],
-                        "repeat.element",
-                    )?
-                };
-                self.builder.build_store(ptr, value)?;
-                let next = self.builder.build_int_add(
-                    index,
-                    self.usize_type().const_int(1, false),
-                    "repeat.next",
-                )?;
-                self.builder.build_store(counter, next)?;
-                self.builder.build_unconditional_branch(head)?;
-                self.builder.position_at_end(end);
+                self.initialize_repeat(storage, &e.ty, value)?;
                 self.load(storage, &e.ty)?
             }
             ExprKind::ValueBlock(body) => {
@@ -2022,28 +2046,27 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             let pointer = input.into_pointer_value();
             match op {
-                "borrow" | "borrow_mut" | "borrow_slice" | "borrow_slice_mut" => {
-                    let slice = op.contains("slice");
-                    let count = if slice {
-                        Some(self.expr(&args[1])?)
-                    } else {
-                        None
-                    };
-                    // Evaluate the owner expression, including its side effects.
-                    self.expr(&args[if slice { 2 } else { 1 }])?;
-                    if let Some(count) = count {
-                        let view = self.ty(ret)?.into_struct_type().get_undef();
-                        let view = self
-                            .builder
-                            .build_insert_value(view, pointer, 0, "borrow.ptr")?
-                            .into_struct_value();
-                        return Ok(self
-                            .builder
-                            .build_insert_value(view, count, 1, "borrow.len")?
-                            .into_struct_value()
-                            .into());
-                    }
+                "borrow" | "borrow_mut" => {
+                    self.expr(&args[1])?;
                     return Ok(pointer.into());
+                }
+                "borrow_slice" | "borrow_slice_mut" => {
+                    let length = self.expr(&args[1])?;
+                    self.expr(&args[2])?;
+                    let value = self
+                        .builder
+                        .build_insert_value(
+                            self.ty(ret)?.into_struct_type().const_zero(),
+                            pointer,
+                            0,
+                            "owned.slice.pointer",
+                        )?
+                        .into_struct_value();
+                    return Ok(self
+                        .builder
+                        .build_insert_value(value, length, 1, "owned.slice.length")?
+                        .into_struct_value()
+                        .into());
                 }
                 "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr" => return Ok(pointer.into()),
                 "is_null" => return Ok(self.builder.build_is_null(pointer, "ptr.is_null")?.into()),

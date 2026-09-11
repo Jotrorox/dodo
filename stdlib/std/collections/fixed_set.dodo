@@ -1,0 +1,51 @@
+package fixed_set
+
+import "std/collections"
+import "std/collections/fixed_map"
+
+pub struct Unit {}
+pub struct Set<T, E> {
+    map: fixed_map.Map<T, Unit, E>
+    pub fn new(slots: &mut[Option<fixed_map.Entry<T, Unit>>], equality: E) -> Set<T, E> from(slots, equality) {
+        return Set<T, E> { map: fixed_map.Map.new::<T, Unit, E>(slots, equality) }
+    }
+    pub fn len(&self) -> usize {
+        return self.map.len()
+    }
+    pub fn capacity(&self) -> usize {
+        return self.map.capacity()
+    }
+    pub fn contains(&self, value: &T) -> bool {
+        return self.map.contains(value)
+    }
+    pub fn get(&self, index: usize) -> Option<&T> {
+        match self.map.entry(index) {
+            some(entry) => {
+                return some(&entry.key)
+            }, none => {
+                return none
+            },
+        }
+    }
+    pub fn insert(&mut self, value: T) -> bool!collections.CapacityError {
+        match self.map.insert(value, Unit {})? {
+            some(_) => {
+                return ok(false)
+            }, none => {
+                return ok(true)
+            },
+        }
+    }
+    pub fn remove(&mut self, value: &T) -> bool {
+        match self.map.remove(value) {
+            some(_) => {
+                return true
+            }, none => {
+                return false
+            },
+        }
+    }
+    pub fn clear(&mut self) {
+        self.map.clear()
+    }
+}

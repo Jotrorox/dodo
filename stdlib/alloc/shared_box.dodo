@@ -1,0 +1,68 @@
+package shared_box
+
+import "core/mem"
+import "core/ptr"
+import "alloc/shared_arena"
+import "alloc/block"
+import "alloc/layout"
+import "alloc/error"
+
+// Multiple boxes/containers may each own a handle to one arena. Checked loans
+// retain the arena and backing memory. T cannot contain borrows or Results.
+pub struct Box<T> {
+    allocator: shared_arena.Handle
+    pointer: *mut T
+    initialized: bool
+
+    pub fn get(&self) -> &T {
+        unsafe {
+            return ptr.borrow(self.pointer, self)
+        }
+    }
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe {
+            return ptr.borrow_mut(self.pointer, self)
+        }
+    }
+    pub fn replace(&mut self, value: T) -> T {
+        unsafe {
+            previous := ptr.read(self.pointer)
+            ptr.write(self.pointer, value)
+            return previous
+        }
+    }
+    pub fn into_inner(self) -> T {
+        self.initialized = false
+        unsafe {
+            return ptr.read(self.pointer)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            if self.initialized {
+                ptr.drop_in_place(self.pointer)
+            }
+            // new validated this exact layout before initialization.
+            match layout.of::<T>() {
+                ok(requested) => {
+                    allocated := block.Block.from_raw_parts(self.pointer as *mut u8, requested)
+                    self.allocator.deallocate(allocated)
+                },
+                err(_) => {},
+            }
+        }
+    }
+}
+
+// Failure destroys the value once. Allocator metadata is never exposed through
+// any checked value reference and there is no callback inside allocate.
+pub fn new<T>(allocator: shared_arena.Handle, value: T) -> Box<T>!error.AllocError from(allocator) {
+    requested := layout.of::<T>()?
+    allocated := allocator.allocate(&requested)?
+    initialized := mem.init(value)
+    unsafe {
+        pointer := allocated.as_ptr() as *mut T
+        ptr.write(pointer, mem.assume_init(initialized))
+        return ok(Box<T> { allocator: allocator, pointer: pointer, initialized: true })
+    }
+}

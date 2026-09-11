@@ -1,0 +1,11 @@
+package shared_hash_set
+
+import "alloc/shared_arena"
+import "std/collections/hash_set"
+
+// Safe adapter for the checked single-threaded shared arena capability.
+pub fn new<T, H>(allocator: shared_arena.Handle, policy: H) -> hash_set.Set<T, H, shared_arena.Handle> from(allocator, policy) {
+    unsafe {
+        return hash_set.new::<T, H, shared_arena.Handle>(allocator, policy)
+    }
+}

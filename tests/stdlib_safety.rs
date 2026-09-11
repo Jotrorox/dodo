@@ -159,7 +159,7 @@ fn raw_checked_views_require_unsafe_valid_owner_and_plain_payloads() {
             &format!(
                 "package app\nimport \"core/ptr\"\nfn main() -> i32 {{ owner := 1u8\nunsafe {{ pointer := 1usize as *const {ty}\nview := ptr.borrow(pointer, &owner)\n}}\nreturn 0\n}}"
             ),
-            "cannot contain checked borrows or unhandled Results",
+            "cannot reconstruct checked-borrow elements or unhandled Results",
         );
     }
     rejects(

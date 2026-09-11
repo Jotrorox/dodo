@@ -1,0 +1,536 @@
+package time_checks
+import "std/time"
+import "std/time/clock"
+import "std/time/timer"
+import "std/time/iso8601"
+import "core/bytes"
+
+fn durations() -> i32!time.TimeError {
+    a := time.Duration.new(2, 1500000000)?
+    if a.seconds() != 3 || a.subsec_nanos() != 500000000 {
+        return ok(1)
+    }
+    b := time.Duration.new(1, 750000000)?
+    c := a.checked_add(&b)?
+    if c.seconds() != 5 || c.subsec_nanos() != 250000000 {
+        return ok(2)
+    }
+    difference := a.checked_sub(&b)?
+    if difference.seconds() != 1 || difference.subsec_nanos() != 750000000 {
+        return ok(3)
+    }
+    divided := a.checked_div(3)?
+    if divided.seconds() != 1 || divided.subsec_nanos() != 166666666 {
+        return ok(4)
+    }
+    multiplied := a.checked_mul(2)?
+    if multiplied.seconds() != 7 || multiplied.subsec_nanos() != 0 {
+        return ok(5)
+    }
+    max := time.Duration.new(~0u64, 999999999)?
+    zero := time.Duration.zero()
+    same := max.checked_add(&zero)?
+    if same.compare(&max) != 0 {
+        return ok(6)
+    }
+    nothing := max.checked_mul(0)?
+    if!nothing.is_zero() {
+        return ok(7)
+    }
+    one := time.Duration.from_nanos(1)
+    match max.checked_add(&one) {
+        ok(_) => {
+            return ok(8)
+        }, err(_) => {}
+    }
+    match time.Duration.new(~0u64, 1000000000) {
+        ok(_) => {
+            return ok(9)
+        }, err(_) => {}
+    }
+    match zero.checked_sub(&one) {
+        ok(_) => {
+            return ok(10)
+        }, err(_) => {}
+    }
+    match max.checked_mul(2) {
+        ok(_) => {
+            return ok(11)
+        }, err(_) => {}
+    }
+    match a.checked_div(0) {
+        ok(_) => {
+            return ok(12)
+        }, err(_) => {}
+    }
+    match max.to_nanos() {
+        ok(_) => {
+            return ok(13)
+        }, err(_) => {}
+    }
+    huge := time.Duration.from_nanos(~0u64)
+    large := huge.to_nanos()?
+    if large != ~0u64 {
+        return ok(14)
+    }
+    milli := time.Duration.from_millis(1234)
+    micro := time.Duration.from_micros(1234567)
+    if milli.to_millis()? != 1234 || micro.to_micros()? != 1234567 {
+        return ok(15)
+    }
+    seed := 12345u64
+    for i in 0..10000 {
+        seed = (seed * 1664525 + 1013904223) % 4294967296
+        lhs := seed
+        seed = (seed * 1664525 + 1013904223) % 4294967296
+        rhs := seed
+        left := time.Duration.from_nanos(lhs)
+        right := time.Duration.from_nanos(rhs)
+        sum := left.checked_add(&right)?
+        if sum.to_nanos()? != lhs + rhs {
+            return ok(16)
+        }
+        restored := sum.checked_sub(&right)?
+        if restored.compare(&left) != 0 {
+            return ok(17)
+        }
+        factor := (rhs % 100) as u32
+        product := left.checked_mul(factor)?
+        if product.to_nanos()? != lhs * (factor as u64) {
+            return ok(18)
+        }
+        quotient := left.checked_div(factor + 1)?
+        if quotient.to_nanos()? != lhs / ((factor + 1) as u64) {
+            return ok(19)
+        }
+    }
+    return ok(0)
+}
+fn timestamps() -> i32!time.TimeError {
+    negative := time.Timestamp.from_unix_nanos(-1)
+    if negative.seconds() != -1 || negative.subsec_nanos() != 999999999 {
+        return ok(20)
+    }
+    if negative.to_unix_nanos()? != -1 {
+        return ok(21)
+    }
+    one := time.Duration.from_nanos(1)
+    epoch := negative.checked_add(&one)?
+    if epoch.seconds() != 0 || epoch.subsec_nanos() != 0 {
+        return ok(22)
+    }
+    back := epoch.checked_sub(&one)?
+    if back.compare(&negative) != 0 {
+        return ok(23)
+    }
+    low := time.Timestamp.from_unix_seconds(-9223372036854775807 - 1)
+    high := time.Timestamp.new(9223372036854775807, 999999999)?
+    whole := high.duration_since(&low)?
+    if whole.seconds() != ~0u64 || whole.subsec_nanos() != 999999999 {
+        return ok(24)
+    }
+    restored := low.checked_add(&whole)?
+    if restored.compare(&high) != 0 {
+        return ok(25)
+    }
+    restored_low := high.checked_sub(&whole)?
+    if restored_low.compare(&low) != 0 {
+        return ok(26)
+    }
+    match high.checked_add(&one) {
+        ok(_) => {
+            return ok(27)
+        }, err(_) => {}
+    }
+    match low.checked_sub(&one) {
+        ok(_) => {
+            return ok(28)
+        }, err(_) => {}
+    }
+    match low.duration_since(&high) {
+        ok(_) => {
+            return ok(29)
+        }, err(_) => {}
+    }
+    match time.Timestamp.new(0, 1000000000) {
+        ok(_) => {
+            return ok(30)
+        }, err(_) => {}
+    }
+    for value in -10000i64..10000 {
+        nanos := value * 123456789
+        stamp := time.Timestamp.from_unix_nanos(nanos)
+        if stamp.to_unix_nanos()? != nanos {
+            return ok(31)
+        }
+    }
+    min := time.Timestamp.from_unix_nanos(-9223372036854775807 - 1)
+    max := time.Timestamp.from_unix_nanos(9223372036854775807)
+    if min.to_unix_nanos()? != -9223372036854775807 - 1 || max.to_unix_nanos()? != 9223372036854775807 {
+        return ok(32)
+    }
+    lower := min.checked_sub(&one)?
+    upper := max.checked_add(&one)?
+    match lower.to_unix_nanos() {
+        ok(_) => {
+            return ok(33)
+        }, err(_) => {}
+    }
+    match upper.to_unix_nanos() {
+        ok(_) => {
+            return ok(34)
+        }, err(_) => {}
+    }
+    return ok(0)
+}
+fn calendar() -> i32!time.TimeError {
+    if!time.is_leap_year(0) || !time.is_leap_year(2000) || time.is_leap_year(1900) || time.is_leap_year(2023) {
+        return ok(40)
+    }
+    first := time.Date.new(0, 1, 1)?
+    last := time.Date.new(9999, 12, 31)?
+    epoch := time.Date.new(1970, 1, 1)?
+    if first.days_since_epoch() != -719528 || last.days_since_epoch() != 2932896 || epoch.days_since_epoch() != 0 || epoch.weekday() != 4 {
+        return ok(41)
+    }
+    match first.checked_add_days(-1) {
+        ok(_) => {
+            return ok(42)
+        }, err(_) => {}
+    }
+    match last.checked_add_days(1) {
+        ok(_) => {
+            return ok(43)
+        }, err(_) => {}
+    }
+    match first.checked_add_days(-9223372036854775807 - 1) {
+        ok(_) => {
+            return ok(44)
+        }, err(_) => {}
+    }
+    match last.checked_add_days(9223372036854775807) {
+        ok(_) => {
+            return ok(45)
+        }, err(_) => {}
+    }
+    match time.Date.new(1900, 2, 29) {
+        ok(_) => {
+            return ok(46)
+        }, err(_) => {}
+    }
+    match time.Date.new(2000, 13, 1) {
+        ok(_) => {
+            return ok(47)
+        }, err(_) => {}
+    }
+    match time.Date.new(2000, 1, 0) {
+        ok(_) => {
+            return ok(48)
+        }, err(_) => {}
+    }
+    leap := time.Date.new(2000, 2, 29)?
+    march := leap.checked_add_days(1)?
+    if march.month() != 3 || march.day() != 1 {
+        return ok(49)
+    }
+    // Every day in a complete 400-year Gregorian leap cycle, including year 0.
+    for day in -719528i64..-573431 {
+        date := time.Date.from_days_since_epoch(day)?
+        if date.days_since_epoch() != day {
+            return ok(50)
+        }
+        if date.weekday() < 1 || date.weekday() > 7 {
+            return ok(51)
+        }
+        date2 := time.Date.new(date.year(), date.month(), date.day())?
+        if date.compare(&date2) != 0 {
+            return ok(52)
+        }
+    }
+    for second in 0u32..86400 {
+        clock := time.TimeOfDay.from_seconds_since_midnight(second, 999999999)?
+        if clock.seconds_since_midnight() != second {
+            return ok(53)
+        }
+    }
+    match time.TimeOfDay.new(23, 59, 60, 0) {
+        ok(_) => {
+            return ok(54)
+        }, err(_) => {}
+    }
+    match time.TimeOfDay.new(24, 0, 0, 0) {
+        ok(_) => {
+            return ok(55)
+        }, err(_) => {}
+    }
+    for seconds in -86401i64..86401 {
+        stamp := time.Timestamp.new(seconds, 123456789)?
+        value := time.DateTime.from_timestamp(&stamp)?
+        back := value.to_timestamp()
+        if stamp.compare(&back) != 0 {
+            return ok(56)
+        }
+    }
+    before := time.Timestamp.from_unix_nanos(-1)
+    calendar := time.DateTime.from_timestamp(&before)?
+    if calendar.date().year() != 1969 || calendar.date().month() != 12 || calendar.date().day() != 31 || calendar.time_of_day().hour() != 23 || calendar.time_of_day().minute() != 59 || calendar.time_of_day().second() != 59 {
+        return ok(57)
+    }
+    beyond := time.Timestamp.from_unix_seconds(9223372036854775807)
+    match time.DateTime.from_timestamp(&beyond) {
+        ok(_) => {
+            return ok(58)
+        }, err(_) => {}
+    }
+    midnight := time.TimeOfDay.midnight()
+    one := time.Duration.from_nanos(1)
+    previous := midnight.checked_sub(&one)?
+    if previous.day_offset() != -1 || previous.time_of_day().hour() != 23 || previous.time_of_day().subsec_nanos() != 999999999 {
+        return ok(92)
+    }
+    next := previous.time_of_day().checked_add(&one)?
+    if next.day_offset() != 1 || next.time_of_day().seconds_since_midnight() != 0 || next.time_of_day().subsec_nanos() != 0 {
+        return ok(93)
+    }
+    limit := time.Duration.new(~0u64, 999999999)?
+    distant := midnight.checked_add(&limit)?
+    if distant.day_offset() != ((~0u64) / 86400) as i64 {
+        return ok(94)
+    }
+    midnight_duration := midnight.since_midnight()
+    exact := time.TimeOfDay.from_duration(&midnight_duration)?
+    if exact.compare(&midnight) != 0 {
+        return ok(95)
+    }
+    full_day := time.Duration.from_seconds(86400)
+    match time.TimeOfDay.from_duration(&full_day) {
+        ok(_) => {
+            return ok(96)
+        }, err(_) => {}
+    }
+    old_date := time.Date.new(1999, 12, 31)?
+    old_clock := time.TimeOfDay.new(23, 59, 59, 999999999)?
+    old := time.DateTime.new(old_date, old_clock)
+    new_year := old.checked_add(&one)?
+    if new_year.date().year() != 2000 || new_year.time_of_day().seconds_since_midnight() != 0 {
+        return ok(97)
+    }
+    back := new_year.checked_sub(&one)?
+    interval := new_year.duration_since(&back)?
+    if interval.compare(&one) != 0 || new_year.date().days_since(back.date()) != 1 {
+        return ok(98)
+    }
+    return ok(0)
+}
+fn clocks() -> i32!time.TimeError {
+    source := clock.FakeClock.new(7)
+    other := clock.FakeClock.new(8)
+    first := clock.now(&source)?
+    independent := clock.now(&other)?
+    match first.compare(&independent) {
+        ok(_) => {
+            return ok(60)
+        }, err(reason) => {
+            if reason != time.TimeError.DifferentClock {
+                return ok(60)
+            }
+        }
+    }
+    match first.duration_since(&independent) {
+        ok(_) => {
+            return ok(61)
+        }, err(_) => {}
+    }
+    step := time.Duration.from_millis(10)
+    deadline := clock.deadline_after(&source, &step)?
+    if clock.deadline_poll(&deadline, &source)? {
+        return ok(62)
+    }
+    source.advance(&step)?
+    second := source.now()?
+    elapsed := second.duration_since(&first)?
+    if elapsed.compare(&step) != 0 || !clock.deadline_poll(&deadline, &source)? {
+        return ok(63)
+    }
+    fake := timer.FakeTimer.new(7)
+    timer.arm(&mut fake, second.clone())?
+    if!timer.poll(&mut fake, &second)? || timer.poll(&mut fake, &second)? {
+        return ok(64)
+    }
+    timer.arm(&mut fake, second.clone())?
+    if!timer.cancel(&mut fake) || timer.cancel(&mut fake) {
+        return ok(65)
+    }
+    timer.arm(&mut fake, second.clone())?
+    match timer.arm(&mut fake, independent.clone()) {
+        ok() => {
+            return ok(66)
+        }, err(_) => {}
+    }
+    if!fake.is_armed() {
+        return ok(67)
+    }
+    match timer.poll(&mut fake, &independent) {
+        ok(_) => {
+            return ok(68)
+        }, err(_) => {}
+    }
+    if!timer.poll(&mut fake, &second)? {
+        return ok(69)
+    }
+    full := time.Duration.new(~0u64, 999999999)?
+    overflowing := clock.FakeClock.starting_at(9, full)
+    match overflowing.advance(&step) {
+        ok() => {
+            return ok(70)
+        }, err(_) => {}
+    }
+    current := overflowing.now()?
+    if current.elapsed_ticks().seconds() != ~0u64 || current.elapsed_ticks().subsec_nanos() != 999999999 {
+        return ok(71)
+    }
+    wall := clock.FakeWallClock.new(time.Timestamp.epoch())
+    wall.set(time.Timestamp.from_unix_seconds(-100))
+    wall_value := clock.wall_now(&wall)?
+    unchanged := source.now()?
+    if wall_value.seconds() != -100 || unchanged.compare(&second)? != 0 {
+        return ok(72)
+    }
+    wall.advance(&step)?
+    return ok(0)
+}
+fn text_checks() -> i32!iso8601.TextError {
+    input := [49u8, 57, 54, 57, 45, 49, 50, 45, 51, 49, 84, 50, 51, 58, 53, 57, 58, 53, 57, 46, 57, 57, 57, 57, 57, 57, 57, 57, 57, 90]
+    stamp := iso8601.parse_timestamp(&input)?
+    if stamp.seconds() != -1 || stamp.subsec_nanos() != 999999999 {
+        return ok(80)
+    }
+    output := [77u8; 35]
+    if iso8601.format_timestamp(&mut output, &stamp)? != 30 || !bytes.equal(&output[..30], &input) || output[30] != 77 {
+        return ok(81)
+    }
+    for length in 0usize..30 {
+        output := [77u8; 30]
+        match iso8601.format_timestamp(&mut output[..length], &stamp) {
+            ok(_) => {
+                return ok(82)
+            }, err(_) => {}
+        }
+        for &byte in output {
+            if byte != 77 {
+                return ok(83)
+            }
+        }
+    }
+    compact := [49u8, 57, 55, 48, 45, 48, 49, 45, 48, 49, 84, 48, 48, 58, 48, 48, 58, 48, 48, 90]
+    zero := iso8601.parse_timestamp(&compact)?
+    if zero.seconds() != 0 || zero.subsec_nanos() != 0 {
+        return ok(84)
+    }
+    short_fraction := [48u8, 48, 58, 48, 48, 58, 48, 48, 46, 49]
+    parsed := iso8601.parse_time(&short_fraction)?
+    if parsed.subsec_nanos() != 100000000 {
+        return ok(85)
+    }
+    leap_second := [50u8, 51, 58, 53, 57, 58, 54, 48]
+    match iso8601.parse_time(&leap_second) {
+        ok(_) => {
+            return ok(86)
+        }, err(_) => {}
+    }
+    for length in 0usize..20 {
+        match iso8601.parse_timestamp(&compact[..length]) {
+            ok(_) => {
+                return ok(87)
+            }, err(_) => {}
+        }
+    }
+    // Invalid separators, letters, and fractional length fail deterministically.
+    for index in 0usize..compact.len {
+        broken := [49u8, 57, 55, 48, 45, 48, 49, 45, 48, 49, 84, 48, 48, 58, 48, 48, 58, 48, 48, 90]
+        broken[index] = 120
+        match iso8601.parse_timestamp(&broken) {
+            ok(_) => {
+                return ok(88)
+            }, err(_) => {}
+        }
+    }
+    return ok(0)
+}
+// Independent expected results generated with Python datetime, seed 0xD0D0.
+fn calendar_reference() -> i32!time.TimeError {
+    years := [1i32, 9999i32, 1582i32, 1900i32, 2000i32, 2038i32, 1792i32, 3977i32, 8268i32, 4907i32, 4233i32, 6326i32, 2665i32, 3397i32, 9973i32, 4416i32, 8150i32, 294i32, 9523i32, 5287i32, 5383i32, 2473i32, 4677i32, 9401i32, 5691i32, 3404i32, 121i32, 4224i32, 9863i32, 7235i32, 1902i32, 2448i32, 4349i32, 5004i32, 8654i32, 3581i32, 7970i32, 5227i32, 3641i32, 9463i32, 2138i32, 3445i32, 2523i32, 8900i32, 3894i32, 7991i32, 9764i32, 5403i32, 2964i32, 9059i32, 6952i32, 3905i32, 2905i32, 9841i32, 9952i32, 8902i32, 250i32, 1538i32, 8414i32, 1818i32, 1257i32, 8684i32, 25i32, 734i32, 1020i32, 8741i32, 2381i32, 392i32, 976i32, 4323i32, 7446i32, 2709i32, 6648i32, 4566i32, 8019i32, 502i32, 767i32, 2628i32, 795i32, 3726i32, 8857i32, 6031i32, 8538i32, 5525i32, 2170i32, 8787i32, 1257i32, 9535i32, 1808i32, 5049i32, 9284i32, 4053i32, 2883i32, 9134i32, 2597i32, 7411i32, 9130i32, 7099i32, 7184i32, 1413i32, 7496i32, 3631i32, 9294i32, 7142i32, 2564i32, 949i32, 5479i32, 5147i32, 985i32, 8085i32, 6804i32, 873i32, 55i32, 3823i32, 6349i32, 1395i32, 1639i32, 3946i32, 1807i32, 2391i32, 5011i32, 6229i32, 3830i32, 8533i32, 251i32, 8446i32, 2026i32, 6859i32, 5969i32, 2739i32, 7166i32, 6027i32, 9084i32, 4631i32]
+    months := [1u32, 12u32, 10u32, 3u32, 2u32, 1u32, 11u32, 9u32, 4u32, 9u32, 9u32, 10u32, 9u32, 9u32, 4u32, 2u32, 5u32, 10u32, 11u32, 4u32, 2u32, 3u32, 4u32, 4u32, 3u32, 12u32, 1u32, 5u32, 1u32, 11u32, 5u32, 12u32, 6u32, 9u32, 3u32, 2u32, 4u32, 4u32, 4u32, 1u32, 11u32, 11u32, 12u32, 10u32, 2u32, 8u32, 12u32, 6u32, 10u32, 10u32, 10u32, 2u32, 8u32, 3u32, 11u32, 7u32, 4u32, 1u32, 9u32, 9u32, 9u32, 8u32, 7u32, 9u32, 7u32, 4u32, 10u32, 11u32, 8u32, 9u32, 8u32, 3u32, 9u32, 2u32, 2u32, 12u32, 6u32, 3u32, 4u32, 12u32, 9u32, 4u32, 3u32, 12u32, 1u32, 9u32, 10u32, 11u32, 1u32, 10u32, 7u32, 1u32, 9u32, 3u32, 4u32, 5u32, 4u32, 11u32, 5u32, 8u32, 5u32, 5u32, 3u32, 1u32, 11u32, 7u32, 4u32, 4u32, 2u32, 11u32, 10u32, 6u32, 6u32, 4u32, 5u32, 7u32, 2u32, 1u32, 1u32, 5u32, 3u32, 9u32, 3u32, 6u32, 7u32, 6u32, 3u32, 5u32, 9u32, 2u32, 9u32, 5u32, 5u32, 2u32]
+    days := [1u32, 31u32, 15u32, 1u32, 29u32, 19u32, 6u32, 6u32, 7u32, 1u32, 22u32, 20u32, 13u32, 5u32, 6u32, 26u32, 4u32, 18u32, 23u32, 19u32, 25u32, 26u32, 14u32, 24u32, 6u32, 7u32, 14u32, 21u32, 19u32, 12u32, 8u32, 29u32, 6u32, 2u32, 10u32, 10u32, 16u32, 24u32, 22u32, 31u32, 6u32, 5u32, 29u32, 13u32, 12u32, 4u32, 15u32, 30u32, 1u32, 18u32, 11u32, 22u32, 18u32, 18u32, 17u32, 25u32, 24u32, 15u32, 7u32, 17u32, 21u32, 4u32, 22u32, 8u32, 26u32, 22u32, 23u32, 4u32, 24u32, 5u32, 8u32, 27u32, 19u32, 27u32, 21u32, 11u32, 30u32, 10u32, 2u32, 8u32, 10u32, 2u32, 26u32, 23u32, 4u32, 13u32, 28u32, 3u32, 12u32, 14u32, 11u32, 11u32, 3u32, 23u32, 12u32, 20u32, 26u32, 12u32, 3u32, 9u32, 4u32, 3u32, 11u32, 5u32, 11u32, 5u32, 14u32, 30u32, 15u32, 9u32, 11u32, 23u32, 17u32, 9u32, 31u32, 20u32, 24u32, 29u32, 9u32, 20u32, 30u32, 27u32, 4u32, 12u32, 12u32, 13u32, 7u32, 11u32, 9u32, 13u32, 20u32, 23u32, 20u32, 10u32]
+    serial := [-719162i64, 2932896i64, -141427i64, -25508i64, 11016i64, 24855i64, -64703i64, 733290i64, 2300394i64, 1072960i64, 826808i64, 1591288i64, 254099i64, 521449i64, 2923131i64, 893439i64, 2257322i64, -611856i64, 2759002i64, 1211618i64, 1246628i64, 183802i64, 988815i64, 2714230i64, 1359132i64, 524098i64, -675320i64, 823397i64, 2882877i64, 1923317i64, -24710i64, 174949i64, 869068i64, 1108390i64, 2441349i64, 588446i64, 2191560i64, 1189708i64, 610432i64, 2736792i64, 61670i64, 539041i64, 202341i64, 2531416i64, 702769i64, 2199340i64, 2847049i64, 1254057i64, 363325i64, 2589494i64, 1819922i64, 706796i64, 341731i64, 2874900i64, 2915686i64, 2532066i64, -628104i64, -157771i64, 2353872i64, -55258i64, -260154i64, 2452454i64, -710194i64, -451190i64, -346774i64, 2473168i64, 150410i64, -576045i64, -362815i64, 859662i64, 2000287i64, 269999i64, 1708866i64, 948227i64, 2209403i64, -535832i64, -439207i64, 240398i64, -429069i64, 641707i64, 2515678i64, 1483341i64, 2398997i64, 1298793i64, 73052i64, 2490113i64, -260117i64, 2763365i64, -59159i64, 1124868i64, 2671576i64, 760811i64, 333712i64, 2616678i64, 229109i64, 1987423i64, 2615251i64, 1873644i64, 1904497i64, -203220i64, 2018454i64, 606790i64, 2675106i64, 1889038i64, 217269i64, -372727i64, 1281739i64, 1160494i64, -359718i64, 2233771i64, 1765866i64, -400497i64, -699272i64, 676892i64, 1599547i64, -209814i64, -120841i64, 721747i64, -59527i64, 153906i64, 1110790i64, 1555837i64, 679413i64, 2397249i64, -627660i64, 2365474i64, 20519i64, 1785801i64, 1460856i64, 280914i64, 1898062i64, 1481931i64, 2598475i64, 971950i64]
+    weekdays := [1u32, 5u32, 5u32, 4u32, 2u32, 2u32, 2u32, 2u32, 2u32, 4u32, 7u32, 3u32, 3u32, 2u32, 5u32, 5u32, 1u32, 4u32, 5u32, 6u32, 2u32, 7u32, 6u32, 5u32, 2u32, 5u32, 2u32, 5u32, 1u32, 1u32, 4u32, 2u32, 1u32, 7u32, 5u32, 2u32, 4u32, 6u32, 1u32, 6u32, 4u32, 3u32, 3u32, 3u32, 1u32, 7u32, 6u32, 4u32, 1u32, 2u32, 3u32, 3u32, 2u32, 4u32, 1u32, 2u32, 3u32, 6u32, 7u32, 4u32, 5u32, 1u32, 2u32, 6u32, 3u32, 2u32, 5u32, 3u32, 6u32, 3u32, 6u32, 6u32, 2u32, 4u32, 4u32, 1u32, 5u32, 1u32, 7u32, 7u32, 1u32, 3u32, 3u32, 3u32, 4u32, 7u32, 7u32, 7u32, 2u32, 7u32, 2u32, 6u32, 5u32, 5u32, 3u32, 1u32, 6u32, 7u32, 4u32, 1u32, 1u32, 6u32, 4u32, 1u32, 7u32, 6u32, 1u32, 3u32, 2u32, 5u32, 1u32, 5u32, 4u32, 3u32, 2u32, 1u32, 4u32, 2u32, 5u32, 1u32, 6u32, 7u32, 4u32, 5u32, 6u32, 3u32, 6u32, 7u32, 2u32, 1u32, 2u32, 7u32, 2u32, 4u32]
+    for i in 0usize..years.len {
+        value := time.Date.new(years[i], months[i], days[i])?
+        if value.days_since_epoch() != serial[i] || value.weekday() != weekdays[i] {
+            return ok(90)
+        }
+        restored := time.Date.from_days_since_epoch(serial[i])?
+        if restored.year() != years[i] || restored.month() != months[i] || restored.day() != days[i] {
+            return ok(91)
+        }
+    }
+    return ok(0)
+}
+
+fn main() -> i32 {
+    match calendar_reference() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 106
+        }
+    }
+    match durations() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 101
+        }
+    }
+    match timestamps() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 102
+        }
+    }
+    match calendar() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 103
+        }
+    }
+    match clocks() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 104
+        }
+    }
+    match text_checks() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 105
+        }
+    }
+    return 0
+}

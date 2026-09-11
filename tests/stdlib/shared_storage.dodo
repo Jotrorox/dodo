@@ -1,0 +1,84 @@
+package shared_storage
+
+import "alloc/shared_arena"
+import "alloc/shared_box"
+import "alloc/error"
+import "alloc/layout"
+import "core/ptr"
+
+struct Token {
+    counter: *mut i32
+    value: i32
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.counter, ptr.read(self.counter) + self.value)
+        }
+    }
+}
+struct Empty {}
+
+fn checks() -> i32!error.AllocError {
+    memory := [0u8; 4096]
+    dropped := 0i32
+    owner := shared_arena.SharedArena.new(&mut memory[1..4096])?
+    first := shared_box.new(owner.handle(), Token { counter: ptr.from_mut(&mut dropped), value: 1 })?
+    second := shared_box.new(owner.handle(), Token { counter: ptr.from_mut(&mut dropped), value: 2 })?
+    if first.get().value != 1 || second.get().value != 2 {
+        return ok(1)
+    }
+    first_view := first.get_mut()
+    first_view.value = 4
+    old := second.replace(Token { counter: ptr.from_mut(&mut dropped), value: 8 })
+    core.drop(old)
+    if dropped != 2 {
+        return ok(2)
+    }
+    moved := first.into_inner()
+    if dropped != 2 {
+        return ok(3)
+    }
+    core.drop(moved)
+    core.drop(second)
+    if dropped != 14 {
+        return ok(4)
+    }
+    before := owner.used()
+    empty := shared_box.new(owner.handle(), Empty {})?
+    core.drop(empty)
+    if owner.used() != before {
+        return ok(5)
+    }
+    requested := layout.Layout.new(owner.remaining(), 1)?
+    handle := owner.handle()
+    raw := handle.allocate(&requested)?
+    match shared_box.new(owner.handle(), Token { counter: ptr.from_mut(&mut dropped), value: 16 }) {
+        ok(_) => {
+            return ok(6)
+        },
+        err(_) => {},
+    }
+    if dropped != 30 {
+        return ok(7)
+    }
+    unsafe {
+        handle.deallocate(raw)
+    }
+    core.drop(handle)
+    unsafe {
+        owner.reset()
+    }
+    if owner.used() != 0 {
+        return ok(8)
+    }
+    return ok(0)
+}
+
+fn main() -> i32 {
+    match checks() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        }
+    }
+}

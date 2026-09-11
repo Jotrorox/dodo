@@ -247,3 +247,37 @@ pub fn value<W, T>(sink: &mut W, input: &T) -> usize!io.Error {
     input.format(&mut output)?
     return ok(output.written())
 }
+
+// Transactional decimal formatting into caller storage. Width is a minimum;
+// values are never truncated. The full output is checked before the first write.
+pub enum FormatError {
+    BufferTooSmall
+}
+
+pub fn write_u32_padded(destination: &mut[u8], value: u32, width: usize) -> usize!FormatError {
+    digits := 1usize
+    remaining := value
+    for remaining >= 10 {
+        remaining = remaining / 10
+        digits += 1
+    }
+    count := num.max(digits, width)
+    if count > destination.len {
+        return err(FormatError.BufferTooSmall)
+    }
+    sink := io.MemoryWriter.new(destination)
+    output := Formatter.new::<io.MemoryWriter>(&mut sink)
+    options := defaults()
+    options.width = width
+    options.zero_pad = true
+    // MemoryWriter has enough space for the whole validated decimal field,
+    // so the ordinary formatter's partial-write errors cannot occur here.
+    match output.unsigned(value as u64, &options) {
+        ok() => {
+            return ok(output.written())
+        },
+        err(_) => {
+            return err(FormatError.BufferTooSmall)
+        },
+    }
+}

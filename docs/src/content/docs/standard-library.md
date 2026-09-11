@@ -1,6 +1,6 @@
 ---
 title: "Standard library"
-description: "Portable core, allocation, byte I/O, formatting, binary buffers, and UTF-8 text."
+description: "Portable core, allocation, I/O, text, collections, mathematics, hashing, and time."
 section: "Using Dodo"
 order: 140
 ---
@@ -11,8 +11,10 @@ is needed. Packages are loaded only when imported, including their explicit
 dependencies. These portable packages require no OS, libc, global allocator,
 scheduler, or garbage collector.
 
-HTTP, JSON/TOML, filesystem,
-threading, and peripheral drivers are not implemented yet.
+The library includes byte I/O, formatting, binary buffers, UTF-8 text,
+[collections](collections.md), [mathematics](math.md), [hashing and
+checksums](hash.md), and [time values and clock contracts](time.md).
+HTTP, JSON/TOML, filesystem, threading, and peripheral drivers are not implemented.
 
 ## Packages
 
@@ -33,6 +35,12 @@ threading, and peripheral drivers are not implemented yet.
 | `alloc/pool` | Fixed-block allocation and reuse from an exclusively borrowed byte slice. |
 | `alloc/boxed` | Deterministic ownership of one allocated value. |
 | `alloc/arena_box`, `alloc/pool_box` | Safe box constructors for each concrete allocator, imported independently. |
+| `alloc/shared_arena`, `alloc/shared_box` | Caller-backed shared allocation capabilities and checked owning boxes. |
+| `std/collections` | Slice algorithms and statically dispatched policies; child packages contain individual fixed and owned containers. |
+| `std/math`, `std/math/trig` | Checked integers and portable binary64 functions; trigonometry and its table are independently imported. |
+| `std/hash`, `std/checksum` | Incremental FNV-1a/SipHash, explicit key sources, CRC-32 and Adler-32. |
+| `std/time` | Checked duration, timestamp, Gregorian date and time-of-day values. |
+| `std/time/clock`, `std/time/timer`, `std/time/iso8601` | Clock/timer contracts, deterministic fakes, and UTC text conversion. |
 | `std/io` | Structural blocking/polling byte I/O, memory adapters, buffering, bounded transfer helpers. |
 | `std/fmt` | Byte-sink formatting, static customization, integer and exact-precision floating conversion. |
 | `std/bytes` | Checked byte views, bounded binary readers/writers, endian operations and searching. |
@@ -225,9 +233,11 @@ the allocation. `replace(value)` installs a new value and returns the old one
 without destroying it. Allocation failure destroys the supplied value exactly once.
 Arena space is only reclaimed on reset; pool blocks are immediately reusable.
 
-`as_ptr` and `as_mut_ptr` expose raw access. `as_ref` and `as_mut` expose checked
-`&T`/`&mut T` views tied to the box. A live view prevents replacing the value,
-consuming or moving the box, and releasing its allocation. `T` cannot contain checked borrows or
+`as_ptr` and `as_mut_ptr` expose raw access. `as_ref` / `as_mut` and
+`get` / `get_mut` are equivalent checked `&T` / `&mut T` accessors, retained
+for compatibility. A live view prevents conflicting access, replacement,
+extraction, moving or destroying the box, and releasing its allocation.
+`T` cannot contain checked borrows or
 Results, including through nested aggregates; a box cannot hide an error that
 the program must handle.
 The generic `boxed.new::<T, A>` entry point is unsafe: a custom allocator must
@@ -465,6 +475,15 @@ byte count. The method may compose all standard formatting operations and
 propagate failures with `?`. It requires no traits, closures, reflection,
 vtables, scheduler, or allocation. See `examples/formatting.dodo`.
 
+`write_u32_padded(destination, value, width)` is an allocation-free convenience
+for decimal output into a caller-owned byte slice, built on the same formatter
+and memory-writer contracts. It writes at least `width` digits, adding leading
+zeroes without truncating the value, and returns the written byte count. It
+leaves the complete destination unchanged if it returns
+`FormatError.BufferTooSmall`, and preserves all bytes beyond successful output.
+No NUL terminator is added. [Time formatting](time.md#parsing-and-formatting)
+uses this helper for fixed-width calendar fields.
+
 `std/fmt_alloc` is imported independently. `fmt_alloc.string(buffer, &value)`
 consumes a `std/bytes_alloc.Buffer`, clears its old contents, formats with the
 buffer's explicit allocator and growth limit, and returns a validated
@@ -594,6 +613,13 @@ are rejected. `InvalidRadix`, `EmptyNumber`, `InvalidDigit`, and `Overflow` are
 recoverable errors. Overflow identifies the first digit that cannot fit.
 Both signed boundaries, including -9223372036854775808, are handled exactly.
 
+`parse_u32_decimal(bytes)` is a strict decimal helper for fixed-width protocol
+and calendar fields. It consumes the entire input, accepts only ASCII `0`–`9`,
+and rejects signs, whitespace, and separators. Its `ParseError` distinguishes
+`Empty`, `InvalidDigit`, and `Overflow`; leading zeroes are permitted. It reuses
+the integer parser with the `u32` range limit. The [time parser](time.md#parsing-and-formatting)
+uses it after validating field positions and punctuation.
+
 `parse_f64(bytes)` accepts finite decimal syntax:
 `[+-]?(digits(.digits?)?|.digits)([eE][+-]?digits)?`.
 It rejects whitespace, hexadecimal notation, NaN, infinity, separators, and
@@ -650,7 +676,67 @@ scalars and combining marks. It executes at `-O0`/`-O3` and emits WebAssembly
 and Cortex-M0 objects. Additional rejection cases ensure trimmed views cannot
 escape source storage or survive invalidating mutation.
 
+## Sharing an explicit allocator
 
+`shared_arena.SharedArena.new(&mut bytes)` reserves an aligned `usize` cursor
+inside caller memory. Construction fails with `Exhausted` if that metadata does
+not fit. `capacity`, `used`, and `remaining` exclude this reserved prefix; used
+space includes allocation alignment padding. The arena never exposes the
+metadata as a checked reference. Its shared operations access it through private
+raw pointers, without casting any shared reference to an exclusive reference.
+There are no callbacks during allocation and no concurrent access guarantee.
+
+`handle()` produces an owned capability that retains a shared loan of the arena
+and all its backing dependencies. Different handles can supply allocations to
+unrelated containers or boxes concurrently in one thread. Mutating a container
+borrows its own storage exclusively and retains the allocator's shared dependency.
+It does not upgrade that dependency to an exclusive allocator loan.
+
+`Handle.allocate(&layout)` uses O(1) bump allocation; failure leaves its cursor
+unchanged. Zero-sized allocation consumes no additional space. Unsafe
+`Handle.deallocate(block)` consumes the unique descriptor without reclaiming
+space. Unsafe `SharedArena.reset(&mut self)` reclaims all allocations and requires
+that every initialized value be destroyed and every raw pointer invalidated.
+The exclusive receiver statically prevents reset while checked handles remain
+live. `Handle.clone` is a checked reborrow of that handle; obtaining separate
+handles directly from the arena avoids tying their lifetimes to each other.
+
+`shared_box.new(arena.handle(), value)` is a safe constructor with checked
+`get`, `get_mut`, moving `replace`/`into_inner`, and deterministic destruction.
+Each `std/collections/shared_*` adapter uses the same capability. The original
+arena/pool Box interfaces retain their exclusive borrowing behavior.
+
+## Dependency boundaries
+
+```mermaid
+flowchart BT
+  core[Core byte and pointer primitives]
+  values[Slice algorithms, math, hash, time values] --> core
+  text[Binary bytes and UTF-8 text] --> core
+  io[Byte I/O contracts and memory adapters] --> core
+  fmt[Formatting] --> io
+  fmt --> text
+  time_text[Time parsing and formatting] --> values
+  time_text --> text
+  time_text --> fmt
+  fixed[Caller-backed containers] --> core
+  alloc[Explicit allocation capabilities] --> core
+  owned[Owned containers and boxes] --> alloc
+  owned --> values
+  owned_text[Owned bytes, text, I/O and formatting] --> alloc
+  owned_text --> text
+  owned_text --> io
+  owned_text --> fmt
+  clocks[Clock and timer contracts and fakes] --> values
+  adapters[Application OS, entropy, timer and timezone adapters] --> clocks
+```
+
+No portable package requests entropy, obtains the current time, waits, starts a
+runtime, or installs a global allocator. Hashing never imports collections; time
+values never import clocks. Generic customization is monomorphized ordinary
+method dispatch. The sections above and the [collections](collections.md),
+[math](math.md), [hash](hash.md), and [time](time.md) pages specify storage,
+complexity, ordering, invalidation, and numerical contracts.
 
 ## Verification
 
@@ -666,6 +752,7 @@ and run them in Wine at both optimization levels:
 ```sh
 cargo build --locked --bin dodo
 python3 scripts/test_stdlib_windows.py
+python3 scripts/test_portable_stdlib.py
 ```
 
 The script requires Clang, `lld-link`, Wine, and a MinGW `libkernel32.a` import
@@ -676,3 +763,8 @@ fixture's exit status through a minimal Windows startup, and supplies compiler
 memory helpers and LLVM's stack probe without linking a Windows C runtime or
 allocator. The probe is exercised by the large-allocation failure fixture. This tests
 Dodo-generated Windows programs, not a Windows build of the Rust compiler.
+`--wine PATH --wineserver PATH` selects a matching local Wine installation,
+including an unpacked installation with its complete data directory; no system
+installation change is required. Both scripts accept `--fixture` for a focused
+run and `--report PATH` for machine-readable validation records. The portable
+object runner checks all fixtures at O0 and O3 for WebAssembly and Cortex-M0.

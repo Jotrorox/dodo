@@ -1,0 +1,104 @@
+package text_fmt_foundation
+
+import "std/text"
+import "std/fmt"
+
+fn main() -> i32 {
+    match text.parse_u32_decimal(b"4294967295") {
+        ok(value) => {
+            if value != 4294967295u32 {
+                return 1
+            }
+        },
+        err(_) => {
+            return 2
+        },
+    }
+    match text.parse_u32_decimal(b"4294967296") {
+        err(kind) => {
+            match kind {
+                text.ParseError.Overflow => {}, _ => {
+                    return 3
+                }
+            }
+        },
+        ok(_) => {
+            return 3
+        },
+    }
+    match text.parse_u32_decimal(b"") {
+        err(kind) => {
+            match kind {
+                text.ParseError.Empty => {}, _ => {
+                    return 4
+                }
+            }
+        },
+        ok(_) => {
+            return 4
+        },
+    }
+    match text.parse_u32_decimal(b" 1") {
+        err(kind) => {
+            match kind {
+                text.ParseError.InvalidDigit => {}, _ => {
+                    return 5
+                }
+            }
+        },
+        ok(_) => {
+            return 5
+        },
+    }
+    match text.parse_u32_decimal(b"+1") {
+        err(kind) => {
+            match kind {
+                text.ParseError.InvalidDigit => {}, _ => {
+                    return 6
+                }
+            }
+        },
+        ok(_) => {
+            return 6
+        },
+    }
+    output := [9u8; 12]
+    match fmt.write_u32_padded(&mut output, 4294967295u32, 12) {
+        ok(count) => {
+            if count != 12 {
+                return 7
+            }
+        },
+        err(_) => {
+            return 8
+        },
+    }
+    expected := b"004294967295"
+    for i in 0usize..12 {
+        if output[i] != expected[i] {
+            return 9
+        }
+    }
+    match fmt.write_u32_padded(&mut output[0..2], 100, 0) {
+        err(fmt.FormatError.BufferTooSmall) => {},
+        ok(_) => {
+            return 10
+        },
+    }
+    for i in 0usize..12 {
+        if output[i] != expected[i] {
+            return 11
+        }
+    }
+    match fmt.write_u32_padded(&mut output, 0, 0) {
+        ok(count) => {
+            if count != 1 || output[0] != 48 || output[1] != 48 {
+                return 12
+            }
+        },
+        err(_) => {
+            return 13
+        },
+    }
+    return 0
+}

@@ -1,0 +1,523 @@
+package math_checks
+import "std/math"
+import "std/math/trig"
+
+fn integer_checks() -> i32 {
+    if math.unsigned_abs(math.I64_MIN) != 0x8000000000000000u64 {
+        return 1
+    }
+    match math.checked_abs(math.I64_MIN) {
+        ok(_) => {
+            return 2
+        }, err(e) => {
+            if e != math.MathError.Overflow {
+                return 2
+            }
+        }
+    }
+    match math.checked_add(math.I64_MAX, 1) {
+        ok(_) => {
+            return 3
+        }, err(_) => {}
+    }
+    match math.checked_add(math.I64_MIN, -1) {
+        ok(_) => {
+            return 4
+        }, err(_) => {}
+    }
+    match math.checked_sub(math.I64_MIN, 1) {
+        ok(_) => {
+            return 5
+        }, err(_) => {}
+    }
+    match math.checked_sub(math.I64_MAX, -1) {
+        ok(_) => {
+            return 6
+        }, err(_) => {}
+    }
+    match math.checked_mul(math.I64_MIN, -1) {
+        ok(_) => {
+            return 7
+        }, err(_) => {}
+    }
+    match math.checked_mul(math.I64_MIN, 1) {
+        ok(v) => {
+            if v != math.I64_MIN {
+                return 8
+            }
+        }, err(_) => {
+            return 8
+        }
+    }
+    match math.checked_mul(math.I64_MIN, 0) {
+        ok(v) => {
+            if v != 0 {
+                return 9
+            }
+        }, err(_) => {
+            return 9
+        }
+    }
+    match math.checked_div(1, 0) {
+        ok(_) => {
+            return 10
+        }, err(e) => {
+            if e != math.MathError.DivisionByZero {
+                return 10
+            }
+        }
+    }
+    match math.checked_div(math.I64_MIN, -1) {
+        ok(_) => {
+            return 11
+        }, err(_) => {}
+    }
+    match math.checked_rem(math.I64_MIN, -1) {
+        ok(v) => {
+            if v != 0 {
+                return 12
+            }
+        }, err(_) => {
+            return 12
+        }
+    }
+    match math.checked_pow(-2, 63) {
+        ok(v) => {
+            if v != math.I64_MIN {
+                return 13
+            }
+        }, err(_) => {
+            return 13
+        }
+    }
+    match math.checked_pow(2, 63) {
+        ok(_) => {
+            return 14
+        }, err(_) => {}
+    }
+    match math.checked_pow(0, 0) {
+        ok(v) => {
+            if v != 1 {
+                return 15
+            }
+        }, err(_) => {
+            return 15
+        }
+    }
+    match math.checked_pow_u64(2, 63) {
+        ok(v) => {
+            if v != 0x8000000000000000u64 {
+                return 16
+            }
+        }, err(_) => {
+            return 16
+        }
+    }
+    match math.checked_pow_u64(2, 64) {
+        ok(_) => {
+            return 17
+        }, err(_) => {}
+    }
+    if math.gcd(0, 0) != 0 || math.gcd(18, 12) != 6 || math.gcd(0, 8) != 8 {
+        return 18
+    }
+    match math.checked_lcm(12, 18) {
+        ok(v) => {
+            if v != 36 {
+                return 19
+            }
+        }, err(_) => {
+            return 19
+        }
+    }
+    match math.checked_lcm(0, 0) {
+        ok(v) => {
+            if v != 0 {
+                return 20
+            }
+        }, err(_) => {
+            return 20
+        }
+    }
+    match math.checked_lcm(math.U64_MAX, 2) {
+        ok(_) => {
+            return 21
+        }, err(_) => {}
+    }
+    if math.isqrt(0) != 0 || math.isqrt(1) != 1 || math.isqrt(math.U64_MAX) != 4294967295u64 {
+        return 22
+    }
+    for value in 0u64..10000 {
+        root := math.isqrt(value)
+        if root * root > value || (root + 1) * (root + 1) <= value {
+            return 23
+        }
+    }
+    // Deterministic model checks exercise signed arithmetic without overflow.
+    for a in -50i64..51 {
+        for b in -50i64..51 {
+            match math.checked_add(a, b) {
+                ok(v) => {
+                    if v != a + b {
+                        return 24
+                    }
+                }, err(_) => {
+                    return 24
+                }
+            }
+            match math.checked_sub(a, b) {
+                ok(v) => {
+                    if v != a - b {
+                        return 25
+                    }
+                }, err(_) => {
+                    return 25
+                }
+            }
+            match math.checked_mul(a, b) {
+                ok(v) => {
+                    if v != a * b {
+                        return 26
+                    }
+                }, err(_) => {
+                    return 26
+                }
+            }
+        }
+    }
+    match math.checked_next_power_of_two(0) {
+        ok(v) => {
+            if v != 1 {
+                return 27
+            }
+        }, err(_) => {
+            return 27
+        }
+    }
+    match math.checked_next_power_of_two(0x8000000000000000u64) {
+        ok(v) => {
+            if v != 0x8000000000000000u64 {
+                return 28
+            }
+        }, err(_) => {
+            return 28
+        }
+    }
+    match math.checked_next_power_of_two(math.U64_MAX) {
+        ok(_) => {
+            return 29
+        }, err(_) => {}
+    }
+    return 0
+}
+fn value_checks() -> i32 {
+    negative_zero := math.from_bits(0x8000000000000000)
+    tiny := math.from_bits(1)
+    if math.to_bits(negative_zero) != 0x8000000000000000u64 || !math.sign_bit(negative_zero) {
+        return 30
+    }
+    if math.classify(negative_zero) != math.Classification.Zero {
+        return 31
+    }
+    if!math.is_subnormal(tiny) || math.is_normal(tiny) || !math.is_normal(math.MIN_NORMAL) {
+        return 32
+    }
+    if!math.is_infinite(math.infinity()) || math.is_finite(math.infinity()) {
+        return 33
+    }
+    if!math.is_nan(math.nan()) || math.is_finite(math.nan()) {
+        return 34
+    }
+    if math.sign_bit(math.abs(negative_zero)) || !math.sign_bit(math.copy_sign(1.0, negative_zero)) {
+        return 35
+    }
+    if math.floor(-0.5) != -1.0 || math.ceil(-0.5) != 0.0 || math.trunc(-1.9) != -1.0 {
+        return 36
+    }
+    if!math.sign_bit(math.ceil(-0.5)) || !math.sign_bit(math.trunc(-0.5)) {
+        return 37
+    }
+    if math.round(0.5) != 1.0 || math.round(-0.5) != -1.0 {
+        return 38
+    }
+    if math.round_even(0.5) != 0.0 || math.round_even(1.5) != 2.0 || math.round_even(2.5) != 2.0 {
+        return 39
+    }
+    if!math.sign_bit(math.round_even(-0.5)) || math.round_even(-1.5) != -2.0 {
+        return 40
+    }
+    if math.trunc(math.MAX_FINITE) != math.MAX_FINITE || !math.is_nan(math.floor(math.nan())) {
+        return 41
+    }
+    if math.scalbn(1.0, -1074) != tiny || math.scalbn(tiny, 1074) != 1.0 {
+        return 42
+    }
+    if math.scalbn(1.0, -2147483647 - 1) != 0.0 || !math.is_infinite(math.scalbn(1.0, 2147483647)) {
+        return 43
+    }
+    if!math.sign_bit(math.scalbn(negative_zero, 3)) {
+        return 44
+    }
+    match math.sqrt(-1.0) {
+        ok(_) => {
+            return 45
+        }, err(e) => {
+            if e != math.MathError.Domain {
+                return 45
+            }
+        }
+    }
+    match math.sqrt(negative_zero) {
+        ok(v) => {
+            if!math.sign_bit(v) {
+                return 46
+            }
+        }, err(_) => {
+            return 46
+        }
+    }
+    match math.sqrt(math.infinity()) {
+        ok(v) => {
+            if v != math.infinity() {
+                return 47
+            }
+        }, err(_) => {
+            return 47
+        }
+    }
+    match math.sqrt(math.nan()) {
+        ok(v) => {
+            if!math.is_nan(v) {
+                return 48
+            }
+        }, err(_) => {
+            return 48
+        }
+    }
+    if!math.sign_bit(math.cbrt(negative_zero)) || math.cbrt(-8.0) != -2.0 {
+        return 49
+    }
+    if math.hypot(3.0, 4.0) != 5.0 || !math.is_infinite(math.hypot(math.nan(), math.infinity())) {
+        return 50
+    }
+    match math.log(-1.0) {
+        ok(_) => {
+            return 51
+        }, err(_) => {}
+    }
+    match math.log(negative_zero) {
+        ok(v) => {
+            if v != -math.infinity() {
+                return 52
+            }
+        }, err(_) => {
+            return 52
+        }
+    }
+    match math.log1p(-1.0) {
+        ok(v) => {
+            if v != -math.infinity() {
+                return 53
+            }
+        }, err(_) => {
+            return 53
+        }
+    }
+    match math.log1p(-2.0) {
+        ok(_) => {
+            return 54
+        }, err(_) => {}
+    }
+    match math.exp(710.0) {
+        ok(_) => {
+            return 55
+        }, err(e) => {
+            if e != math.MathError.Overflow {
+                return 55
+            }
+        }
+    }
+    match math.exp(-math.infinity()) {
+        ok(v) => {
+            if v != 0.0 {
+                return 56
+            }
+        }, err(_) => {
+            return 56
+        }
+    }
+    match math.exp(math.infinity()) {
+        ok(v) => {
+            if v != math.infinity() {
+                return 57
+            }
+        }, err(_) => {
+            return 57
+        }
+    }
+    match math.exp2(-1074.0) {
+        ok(v) => {
+            if v != tiny {
+                return 58
+            }
+        }, err(_) => {
+            return 58
+        }
+    }
+    match math.exp2(1024.0) {
+        ok(_) => {
+            return 59
+        }, err(_) => {}
+    }
+    match math.powi(0.0, -1) {
+        ok(_) => {
+            return 60
+        }, err(e) => {
+            if e != math.MathError.DivisionByZero {
+                return 60
+            }
+        }
+    }
+    match math.powi(-2.0, -3) {
+        ok(v) => {
+            if v != -0.125 {
+                return 61
+            }
+        }, err(_) => {
+            return 61
+        }
+    }
+    match math.pow(4.0, 0.5) {
+        ok(v) => {
+            if math.abs(v - 2.0) > 1e-14 {
+                return 62
+            }
+        }, err(_) => {
+            return 62
+        }
+    }
+    match math.pow(-4.0, 0.5) {
+        ok(_) => {
+            return 63
+        }, err(_) => {}
+    }
+    match math.pow(math.nan(), 0.0) {
+        ok(v) => {
+            if v != 1.0 {
+                return 64
+            }
+        }, err(_) => {
+            return 64
+        }
+    }
+    match math.pow(1.0, math.nan()) {
+        ok(v) => {
+            if v != 1.0 {
+                return 65
+            }
+        }, err(_) => {
+            return 65
+        }
+    }
+    match math.pow(2.0, 1e300) {
+        ok(_) => {
+            return 66
+        }, err(_) => {}
+    }
+    match trig.sin(math.infinity()) {
+        ok(_) => {
+            return 67
+        }, err(_) => {}
+    }
+    match trig.sin(negative_zero) {
+        ok(v) => {
+            if!math.sign_bit(v) {
+                return 68
+            }
+        }, err(_) => {
+            return 68
+        }
+    }
+    match trig.tan(negative_zero) {
+        ok(v) => {
+            if!math.sign_bit(v) {
+                return 69
+            }
+        }, err(_) => {
+            return 69
+        }
+    }
+    match trig.cos(negative_zero) {
+        ok(v) => {
+            if v != 1.0 {
+                return 70
+            }
+        }, err(_) => {
+            return 70
+        }
+    }
+    match trig.asin(1.00001) {
+        ok(_) => {
+            return 71
+        }, err(_) => {}
+    }
+    match trig.acos(-1.00001) {
+        ok(_) => {
+            return 72
+        }, err(_) => {}
+    }
+    if trig.atan2(0.0, negative_zero) != math.PI || trig.atan2(negative_zero, negative_zero) != -math.PI {
+        return 73
+    }
+    if!math.sign_bit(trig.atan2(negative_zero, 0.0)) || trig.atan2(1.0, 0.0) != math.PI * 0.5 {
+        return 74
+    }
+    if trig.atan2(math.infinity(), -math.infinity()) != math.PI * 0.75 {
+        return 75
+    }
+    if!math.is_nan(trig.atan2(math.nan(), 0.0)) || trig.atan(math.infinity()) != math.PI * 0.5 {
+        return 76
+    }
+    return 0
+}
+fn large_zero_power() -> i32 {
+    match math.expm1(math.from_bits(0x8000000000000000)) {
+        ok(value) => {
+            if!math.sign_bit(value) {
+                return 78
+            }
+        }, err(_) => {
+            return 78
+        }
+    }
+    match math.log1p(math.from_bits(0x8000000000000000)) {
+        ok(value) => {
+            if!math.sign_bit(value) {
+                return 79
+            }
+        }, err(_) => {
+            return 79
+        }
+    }
+    match math.pow(math.from_bits(0x8000000000000000), 2147483649.0) {
+        ok(value) => {
+            if!math.sign_bit(value) {
+                return 77
+            }
+        }, err(_) => {
+            return 77
+        }
+    }
+    return 0
+}
+fn main() -> i32 {
+    result := integer_checks()
+    if result != 0 {
+        return result
+    }
+    result = value_checks()
+    if result != 0 {
+        return result
+    }
+    return large_zero_power()
+}

@@ -1,0 +1,162 @@
+package collections_destruction
+import "core/ptr"
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/collections"
+import "std/collections/fixed_vector"
+import "std/collections/fixed_deque"
+import "std/collections/fixed_map"
+import "std/collections/shared_hash_map"
+import "std/collections/shared_ordered_map"
+import "std/collections/shared_deque"
+import "std/collections/shared_heap"
+
+pub struct Item {
+    pub id: i32
+    pub counter: *mut usize
+    pub weight: usize
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.counter, ptr.read(self.counter) + self.weight)
+        }
+    }
+}
+pub struct Policy {
+    pub fn equal(&self, a: &Item, b: &Item) -> bool {
+        return a.id == b.id
+    }
+    pub fn compare(&self, a: &Item, b: &Item) -> i32 {
+        if a.id < b.id {
+            return -1
+        }
+        if a.id > b.id {
+            return 1
+        }
+        return 0
+    }
+    pub fn hash(&self, key: &Item) -> u64 {
+        return 7
+    }
+}
+fn fixed(counter: *mut usize) -> i32!collections.CapacityError {
+    slots: [2]Option<Item> = [none, none]
+    vector := fixed_vector.Vector.new(&mut slots)
+    vector.push(Item { id: 1, counter: counter, weight: 1 })?
+    vector.insert(0, Item { id: 2, counter: counter, weight: 10 })?
+    match vector.push(Item { id: 3, counter: counter, weight: 100 }) {
+        ok() => {
+            return ok(1)
+        }, err(_) => {},
+    }
+    unsafe {
+        if ptr.read(counter) != 100 {
+            return ok(2)
+        }
+    }
+    core.drop(vector.remove(1))
+    core.drop(vector)
+    unsafe {
+        if ptr.read(counter) != 111 {
+            return ok(3)
+        }
+    }
+    ring := fixed_deque.Deque.new(&mut slots)
+    ring.push_front(Item { id: 1, counter: counter, weight: 1 })?
+    ring.push_back(Item { id: 2, counter: counter, weight: 1 })?
+    core.drop(ring.pop_front())
+    ring.push_back(Item { id: 3, counter: counter, weight: 1 })?
+    core.drop(ring)
+    unsafe {
+        if ptr.read(counter) != 114 {
+            return ok(4)
+        }
+    }
+    map_slots: [2]Option<fixed_map.Entry<Item, Item>> = [none, none]
+    map := fixed_map.Map.new(&mut map_slots, Policy {})
+    core.drop(map.insert(Item { id: 1, counter: counter, weight: 1 }, Item { id: 10, counter: counter, weight: 100 })?)
+    core.drop(map.insert(Item { id: 1, counter: counter, weight: 2 }, Item { id: 20, counter: counter, weight: 200 })?)
+    unsafe {
+        if ptr.read(counter) != 216 {
+            return ok(5)
+        }
+    }
+    query := Item { id: 1, counter: counter, weight: 0 }
+    core.drop(map.remove(&query))
+    core.drop(map)
+    unsafe {
+        if ptr.read(counter) != 417 {
+            return ok(6)
+        }
+    }
+    // Stable sorting never drops or duplicates move-only elements.
+    data := [Item { id: 2, counter: counter, weight: 1 }, Item { id: 1, counter: counter, weight: 10 }, Item { id: 2, counter: counter, weight: 100 }]
+    policy := Policy {}
+    collections.stable_sort(&mut data, &policy)
+    if data[0].weight != 10 || data[1].weight != 1 || data[2].weight != 100 {
+        return ok(7)
+    }
+    core.drop(data)
+    unsafe {
+        if ptr.read(counter) != 528 {
+            return ok(8)
+        }
+    }
+    return ok(0)
+}
+fn allocated(counter: *mut usize) -> i32!error.AllocError {
+    bytes := [0u8; 16384]
+    allocator := shared_arena.SharedArena.new(&mut bytes)?
+    map := shared_hash_map.new::<Item, Item, Policy>(allocator.handle(), Policy {})
+    for i in 0i32..20i32 {
+        core.drop(map.insert(Item { id: i, counter: counter, weight: 1 }, Item { id: i, counter: counter, weight: 1 })?)
+    }
+    core.drop(map.insert(Item { id: 3, counter: counter, weight: 1 }, Item { id: 3, counter: counter, weight: 1 })?)
+    query := Item { id: 4, counter: counter, weight: 0 }
+    core.drop(map.remove(&query))
+    core.drop(map)
+    unsafe {
+        if ptr.read(counter) != 570 {
+            return ok(9)
+        }
+    }
+    ordered := shared_ordered_map.new::<Item, Item, Policy>(allocator.handle(), Policy {})
+    queue := shared_deque.new::<Item>(allocator.handle())
+    heap := shared_heap.new::<Item, Policy>(allocator.handle(), Policy {})
+    for i in 0i32..20i32 {
+        core.drop(ordered.insert(Item { id: 20 - i, counter: counter, weight: 1 }, Item { id: i, counter: counter, weight: 1 })?)
+        queue.push_front(Item { id: i, counter: counter, weight: 1 })?
+        heap.push(Item { id: i, counter: counter, weight: 1 })?
+    }
+    core.drop(ordered.remove(&query))
+    core.drop(ordered)
+    core.drop(queue.pop_back())
+    core.drop(queue)
+    core.drop(heap.pop())
+    core.drop(heap)
+    unsafe {
+        if ptr.read(counter) != 650 {
+            return ok(10)
+        }
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    counter := 0usize
+    pointer := ptr.from_mut(&mut counter)
+    match fixed(pointer) {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 98
+        },
+    }
+    match allocated(pointer) {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        },
+    }
+}

@@ -346,3 +346,64 @@ fn aliases_preserve_visibility_local_shadowing_intrinsics_and_formatting() {
             .contains("without importing")
     );
 }
+
+#[test]
+fn portable_package_dependencies_are_independent_and_reserved() {
+    let workspace = Workspace::new();
+    for (import, forbidden) in [
+        (
+            "std/collections",
+            vec!["alloc/", "std/hash", "std/math", "std/time"],
+        ),
+        ("std/collections/fixed_vector", vec!["alloc/", "std/hash"]),
+        ("std/hash", vec!["alloc/", "std/collections", "std/time"]),
+        (
+            "std/checksum",
+            vec!["alloc/", "std/hash", "std/collections"],
+        ),
+        ("std/math", vec!["alloc/", "std/math/trig", "std/time"]),
+        (
+            "std/time",
+            vec![
+                "alloc/",
+                "std/time/clock",
+                "std/time/timer",
+                "std/time/iso8601",
+            ],
+        ),
+        (
+            "std/time/iso8601",
+            vec!["alloc/", "std/time/clock", "std/time/timer"],
+        ),
+    ] {
+        let source = workspace.write(
+            "main.dodo",
+            &format!("package app\nimport \"{import}\"\nfn main(){{}}"),
+        );
+        // A malicious local source must not shadow a bundled std module.
+        workspace.write(&format!("{import}.dodo"), "invalid shadow");
+        let loaded = package::load(&source).unwrap();
+        for forbidden in forbidden {
+            assert!(
+                !loaded
+                    .program
+                    .imports
+                    .iter()
+                    .any(|name| name.starts_with(forbidden)),
+                "{import} unexpectedly depends on {forbidden}"
+            );
+        }
+        assert!(
+            loaded
+                .sources
+                .iter()
+                .any(|source| source.path.ends_with(format!("{import}.dodo")))
+        );
+        assert!(
+            loaded
+                .sources
+                .iter()
+                .all(|source| !source.text.contains("invalid shadow"))
+        );
+    }
+}

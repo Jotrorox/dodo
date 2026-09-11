@@ -1,0 +1,334 @@
+package collections_owned
+import "core/ptr"
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/collections"
+import "std/collections/shared_vector"
+import "std/collections/deque"
+import "std/collections/hash_map"
+import "std/collections/hash_set"
+import "std/collections/ordered_map"
+import "std/collections/ordered_set"
+import "std/collections/heap"
+import "std/hash"
+struct Empty {}
+struct Guard {
+    counter: *mut usize
+    weight: usize
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.counter, ptr.read(self.counter) + self.weight)
+        }
+    }
+}
+pub struct Collision {
+    pub fn hash(&self, key: &i32) -> u64 {
+        return 7
+    }
+    pub fn equal(&self, a: &i32, b: &i32) -> bool {
+        return *a == *b
+    }
+}
+fn verify() -> i32!error.AllocError {
+    bytes := [0u8; 16384]
+    allocator := shared_arena.SharedArena.new(&mut bytes)?
+    values := shared_vector.new::<i32>(allocator.handle())
+    other := shared_vector.new::<i32>(allocator.handle())
+    for i in 0i32..100i32 {
+        values.push(i)?
+    }
+    other.push(999)?
+    values.insert(1, -1)?
+    match values.remove(1) {
+        some(v) => {
+            if v != -1 {
+                return ok(1)
+            }
+        }, none => {
+            return ok(2)
+        },
+    }
+    for i in 0usize..values.len() {
+        if values.as_slice()[i] != i as i32 {
+            return ok(3)
+        }
+    }
+    match values.get_mut(1) {
+        some(v) => {
+            *v = 101
+        }, none => {
+            return ok(4)
+        },
+    }
+    match values.replace(1, 1) {
+        some(v) => {
+            if v != 101 {
+                return ok(5)
+            }
+        }, none => {
+            return ok(6)
+        },
+    }
+    match values.swap_remove(0) {
+        some(v) => {
+            if v != 0 {
+                return ok(7)
+            }
+        }, none => {
+            return ok(8)
+        },
+    }
+    if values.as_slice()[0] != 99 || values.len() != 99 || other.as_slice()[0] != 999 {
+        return ok(9)
+    }
+    independent_view := values.as_slice()
+    other.push(998)?
+    if independent_view[0] != 99 || other.len() != 2 {
+        return ok(40)
+    }
+    // A zero-size element still has independent move/length semantics.
+    before := allocator.used()
+    empty := shared_vector.new::<Empty>(allocator.handle())
+    for i in 0usize..100usize {
+        empty.push(Empty {})?
+    }
+    if empty.len() != 100 || allocator.used() != before {
+        return ok(10)
+    }
+    core.drop(empty)
+    drops := 0usize
+    pointer := ptr.from_mut(&mut drops)
+    guards := shared_vector.new::<Guard>(allocator.handle())
+    guards.push(Guard { counter: pointer, weight: 1 })?
+    guards.push(Guard { counter: pointer, weight: 10 })?
+    core.drop(guards.remove(0))
+    if drops != 1 {
+        return ok(11)
+    }
+    core.drop(guards.replace(0, Guard { counter: pointer, weight: 100 }))
+    if drops != 11 {
+        return ok(12)
+    }
+    core.drop(guards)
+    if drops != 111 {
+        return ok(13)
+    }
+    tiny_bytes := [0u8; 96]
+    tiny := shared_arena.SharedArena.new(&mut tiny_bytes)?
+    failed := shared_vector.new::<Guard>(tiny.handle())
+    failed.push(Guard { counter: pointer, weight: 1000 })?
+    failed.push(Guard { counter: pointer, weight: 1000 })?
+    failed.push(Guard { counter: pointer, weight: 1000 })?
+    failed.push(Guard { counter: pointer, weight: 1000 })?
+    capacity := failed.capacity()
+    match failed.push(Guard { counter: pointer, weight: 10000 }) {
+        ok() => {
+            return ok(14)
+        }, err(error.AllocError.Exhausted) => {}, err(_) => {
+            return ok(15)
+        },
+    }
+    if failed.len() != 4 || failed.capacity() != capacity || drops != 10111 {
+        return ok(16)
+    }
+    core.drop(failed)
+    if drops != 14111 {
+        return ok(17)
+    }
+    queue := unsafe {
+        deque.new::<i32, shared_arena.Handle>(allocator.handle())
+    }
+    // Model-based operations exercise wrapped growth and both ends.
+    model := [0i32; 512]
+    length := 0usize
+    state := 17usize
+    for step in 0usize..600usize {
+        state = (state * 109 + 89) % 1021
+        operation := state % 4
+        value := step as i32
+        if operation == 0 || length == 0 {
+            queue.push_back(value)?
+            model[length] = value
+            length = length + 1
+        } else if operation == 1 {
+            queue.push_front(value)?
+            i := length
+            for i > 0 {
+                model[i] = model[i - 1]
+                i = i - 1
+            }
+            model[0] = value
+            length = length + 1
+        } else if operation == 2 {
+            match queue.pop_front() {
+                some(v) => {
+                    if v != model[0] {
+                        return ok(18)
+                    }
+                }, none => {
+                    return ok(19)
+                },
+            }
+            length = length - 1
+            for i in 0usize..length {
+                model[i] = model[i + 1]
+            }
+        } else {
+            length = length - 1
+            match queue.pop_back() {
+                some(v) => {
+                    if v != model[length] {
+                        return ok(20)
+                    }
+                }, none => {
+                    return ok(21)
+                },
+            }
+        }
+        if queue.len() != length {
+            return ok(22)
+        }
+        for i in 0usize..length {
+            match queue.get(i) {
+                some(v) => {
+                    if *v != model[i] {
+                        return ok(23)
+                    }
+                }, none => {
+                    return ok(24)
+                },
+            }
+        }
+    }
+    // All keys collide; deletions must repair probe chains across bucket zero.
+    map := unsafe {
+        hash_map.new::<i32, i32, Collision, shared_arena.Handle>(allocator.handle(), Collision {})
+    }
+    expected := [-1i32; 37]
+    state = 31
+    for step in 0usize..800usize {
+        state = (state * 71 + 53) % 1021
+        key := (state % 37) as i32
+        index := key as usize
+        if state % 3 != 0 {
+            prior := expected[index]
+            match map.insert(key, step as i32)? {
+                some(v) => {
+                    if v != prior {
+                        return ok(25)
+                    }
+                },
+                none => {
+                    if prior != -1 {
+                        return ok(26)
+                    }
+                },
+            }
+            expected[index] = step as i32
+        } else {
+            match map.remove(&key) {
+                some(v) => {
+                    if v != expected[index] {
+                        return ok(27)
+                    }
+                },
+                none => {
+                    if expected[index] != -1 {
+                        return ok(28)
+                    }
+                },
+            }
+            expected[index] = -1
+        }
+        count := 0usize
+        for k in 0usize..37usize {
+            query := k as i32
+            match map.get(&query) {
+                some(v) => {
+                    if *v != expected[k] {
+                        return ok(29)
+                    }
+                    count = count + 1
+                },
+                none => {
+                    if expected[k] != -1 {
+                        return ok(30)
+                    }
+                },
+            }
+        }
+        if map.len() != count {
+            return ok(31)
+        }
+        iterated := 0usize
+        for i in 0usize..map.bucket_count() {
+            match map.entry(i) {
+                some(_) => {
+                    iterated = iterated + 1
+                }, none => {},
+            }
+        }
+        if iterated != count {
+            return ok(32)
+        }
+    }
+    keyed := unsafe {
+        hash_set.new::<i32, hash.SipI32, shared_arena.Handle>(allocator.handle(), hash.SipI32.new(123, 456))
+    }
+    one := 1i32
+    if!keyed.insert(1)? || keyed.insert(1)? || !keyed.contains(&one) || !keyed.remove(&one) {
+        return ok(33)
+    }
+    ordered := unsafe {
+        ordered_map.new::<i32, i32, collections.I32, shared_arena.Handle>(allocator.handle(), collections.I32 {})
+    }
+    set := unsafe {
+        ordered_set.new::<i32, collections.I32, shared_arena.Handle>(allocator.handle(), collections.I32 {})
+    }
+    maximum := unsafe {
+        heap.new::<i32, collections.I32, shared_arena.Handle>(allocator.handle(), collections.I32 {})
+    }
+    for i in 0i32..97i32 {
+        key := (i * 37) % 97
+        core.drop(ordered.insert(key, key * 10)?)
+        set.insert(key)?
+        maximum.push(key)?
+    }
+    for i in 0usize..97usize {
+        if ordered.entries()[i].key != i as i32 || ordered.entries()[i].value != i as i32 * 10 {
+            return ok(34)
+        }
+        match set.get(i) {
+            some(v) => {
+                if *v != i as i32 {
+                    return ok(35)
+                }
+            }, none => {
+                return ok(36)
+            },
+        }
+        match maximum.pop() {
+            some(v) => {
+                if v != (96 - i) as i32 {
+                    return ok(37)
+                }
+            }, none => {
+                return ok(38)
+            },
+        }
+    }
+    core.drop(ordered.remove(&one))
+    if ordered.contains(&one) || ordered.len() != 96 || !set.remove(&one) {
+        return ok(39)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        },
+    }
+}

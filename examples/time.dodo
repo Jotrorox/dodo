@@ -1,0 +1,51 @@
+package time_example
+import "std/time"
+import "std/time/clock"
+import "std/time/iso8601"
+
+fn run() -> i32!time.TimeError {
+    source := clock.FakeClock.new(1)
+    timeout := time.Duration.from_millis(250)
+    deadline := clock.deadline_after(&source, &timeout)?
+    if clock.deadline_poll(&deadline, &source)? {
+        return ok(1)
+    }
+    source.advance(&timeout)?
+    if!clock.deadline_poll(&deadline, &source)? {
+        return ok(2)
+    }
+    date := time.Date.new(2026, 9, 11)?
+    day := time.DateTime.new(date, time.TimeOfDay.midnight())
+    timestamp := day.to_timestamp()
+    output := [0u8; 30]
+    match iso8601.format_timestamp(&mut output, &timestamp) {
+        ok(length) => {
+            if length != 30 {
+                return ok(3)
+            }
+        },
+        err(_) => {
+            return ok(4)
+        }
+    }
+    match iso8601.parse_timestamp(&output) {
+        ok(parsed) => {
+            if parsed.compare(&timestamp) != 0 {
+                return ok(5)
+            }
+        },
+        err(_) => {
+            return ok(6)
+        }
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 7
+        }
+    }
+}

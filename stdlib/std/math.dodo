@@ -1,0 +1,624 @@
+package math
+
+import "core/ptr"
+
+// Portable binary64 values and arithmetic. Trigonometry and its reduction table
+// are independently imported from std/math/trig. No allocation or OS imports.
+pub const PI: f64 = 3.14159265358979323846264338327950288
+pub const TAU: f64 = 6.28318530717958647692528676655900576
+pub const E: f64 = 2.71828182845904523536028747135266250
+pub const LN_2: f64 = 0.693147180559945309417232121458176568
+pub const LN_10: f64 = 2.30258509299404568401799145468436421
+pub const EPSILON: f64 = 2.220446049250313080847263336181640625e-16
+pub const MIN_NORMAL: f64 = 2.2250738585072014e-308
+pub const MAX_FINITE: f64 = 1.7976931348623157e308
+pub const I64_MAX: i64 = 9223372036854775807
+pub const I64_MIN: i64 = -9223372036854775807 - 1
+pub const U64_MAX: u64 = 0xffffffffffffffff
+
+pub enum MathError {
+    Overflow, DivisionByZero, Domain
+}
+pub enum Classification {
+    Zero, Subnormal, Normal, Infinite, Nan
+}
+
+// The target binary64 representation is IEEE 754. Unaligned accesses avoid an
+// assumption that u64 and f64 have identical ABI alignment; byte order cancels.
+pub fn to_bits(value: f64) -> u64 {
+    unsafe {
+        return ptr.read_unaligned(ptr.from_ref(&value) as *const u64)
+    }
+}
+pub fn from_bits(value: u64) -> f64 {
+    unsafe {
+        return ptr.read_unaligned(ptr.from_ref(&value) as *const f64)
+    }
+}
+pub fn infinity() -> f64 {
+    return from_bits(0x7ff0000000000000)
+}
+pub fn nan() -> f64 {
+    return from_bits(0x7ff8000000000000)
+}
+pub fn sign_bit(value: f64) -> bool {
+    return (to_bits(value) >> 63) != 0
+}
+pub fn abs(value: f64) -> f64 {
+    return from_bits(to_bits(value) & 0x7fffffffffffffff)
+}
+pub fn copy_sign(value: f64, sign: f64) -> f64 {
+    return from_bits((to_bits(value) & 0x7fffffffffffffff) | (to_bits(sign) & 0x8000000000000000))
+}
+pub fn classify(value: f64) -> Classification {
+    bits := to_bits(value) & 0x7fffffffffffffff
+    if bits == 0 {
+        return Classification.Zero
+    }
+    if bits < 0x0010000000000000 {
+        return Classification.Subnormal
+    }
+    if bits < 0x7ff0000000000000 {
+        return Classification.Normal
+    }
+    if bits == 0x7ff0000000000000 {
+        return Classification.Infinite
+    }
+    return Classification.Nan
+}
+pub fn is_nan(value: f64) -> bool {
+    return (to_bits(value) & 0x7fffffffffffffff) > 0x7ff0000000000000
+}
+pub fn is_infinite(value: f64) -> bool {
+    return (to_bits(value) & 0x7fffffffffffffff) == 0x7ff0000000000000
+}
+pub fn is_finite(value: f64) -> bool {
+    return (to_bits(value) & 0x7fffffffffffffff) < 0x7ff0000000000000
+}
+pub fn is_normal(value: f64) -> bool {
+    return classify(value) == Classification.Normal
+}
+pub fn is_subnormal(value: f64) -> bool {
+    return classify(value) == Classification.Subnormal
+}
+
+pub fn checked_abs(value: i64) -> Result<i64, MathError> {
+    if value == I64_MIN {
+        return err(MathError.Overflow)
+    }
+    if value < 0 {
+        return ok(-value)
+    }
+    return ok(value)
+}
+// Unlike checked_abs, the magnitude of the signed minimum fits in u64.
+pub fn unsigned_abs(value: i64) -> u64 {
+    if value < 0 {
+        return (-(value + 1) as u64) + 1
+    }
+    return value as u64
+}
+pub fn checked_add(a: i64, b: i64) -> Result<i64, MathError> {
+    if b > 0 {
+        if a > I64_MAX - b {
+            return err(MathError.Overflow)
+        }
+    }
+    if b < 0 {
+        if a < I64_MIN - b {
+            return err(MathError.Overflow)
+        }
+    }
+    return ok(a + b)
+}
+pub fn checked_sub(a: i64, b: i64) -> Result<i64, MathError> {
+    if b > 0 {
+        if a < I64_MIN + b {
+            return err(MathError.Overflow)
+        }
+    }
+    if b < 0 {
+        if a > I64_MAX + b {
+            return err(MathError.Overflow)
+        }
+    }
+    return ok(a - b)
+}
+pub fn checked_mul(a: i64, b: i64) -> Result<i64, MathError> {
+    magnitude_a := unsigned_abs(a)
+    magnitude_b := unsigned_abs(b)
+    negative := (a < 0) != (b < 0)
+    limit := I64_MAX as u64
+    if negative {
+        limit = limit + 1
+    }
+    if magnitude_b != 0 && magnitude_a > limit / magnitude_b {
+        return err(MathError.Overflow)
+    }
+    product := magnitude_a * magnitude_b
+    if negative {
+        if product == 0x8000000000000000 {
+            return ok(I64_MIN)
+        }
+        return ok(-(product as i64))
+    }
+    return ok(product as i64)
+}
+pub fn checked_div(a: i64, b: i64) -> Result<i64, MathError> {
+    if b == 0 {
+        return err(MathError.DivisionByZero)
+    }
+    if a == I64_MIN && b == -1 {
+        return err(MathError.Overflow)
+    }
+    return ok(a / b)
+}
+pub fn checked_rem(a: i64, b: i64) -> Result<i64, MathError> {
+    if b == 0 {
+        return err(MathError.DivisionByZero)
+    }
+    // Avoid the language's signed-minimum remainder trap.
+    if b == -1 {
+        return ok(0)
+    }
+    return ok(a % b)
+}
+pub fn checked_pow(base: i64, exponent: u32) -> Result<i64, MathError> {
+    result := 1i64
+    for exponent != 0 {
+        if (exponent & 1) != 0 {
+            result = checked_mul(result, base)?
+        }
+        exponent = exponent >> 1
+        if exponent != 0 {
+            base = checked_mul(base, base)?
+        }
+    }
+    return ok(result)
+}
+pub fn checked_pow_u64(base: u64, exponent: u32) -> Result<u64, MathError> {
+    result := 1u64
+    for exponent != 0 {
+        if (exponent & 1) != 0 {
+            if base != 0 && result > U64_MAX / base {
+                return err(MathError.Overflow)
+            }
+            result = result * base
+        }
+        exponent = exponent >> 1
+        if exponent != 0 {
+            if base != 0 && base > U64_MAX / base {
+                return err(MathError.Overflow)
+            }
+            base = base * base
+        }
+    }
+    return ok(result)
+}
+// Euclid's algorithm; gcd(0,0)=0. lcm with a zero argument is zero.
+pub fn gcd(a: u64, b: u64) -> u64 {
+    for b != 0 {
+        remainder := a % b;
+        a = b;
+        b = remainder
+    }
+    return a
+}
+pub fn checked_lcm(a: u64, b: u64) -> Result<u64, MathError> {
+    if a == 0 || b == 0 {
+        return ok(0)
+    }
+    divided := a / gcd(a, b)
+    if divided > U64_MAX / b {
+        return err(MathError.Overflow)
+    }
+    return ok(divided * b)
+}
+// Restoring binary square root; exact floor(sqrt(n)), including U64_MAX.
+pub fn isqrt(value: u64) -> u64 {
+    bit := 1u64 << 62
+    result := 0u64
+    for bit > value {
+        bit = bit >> 2
+    }
+    for bit != 0 {
+        if value >= result + bit {
+            value = value - (result + bit)
+            result = (result >> 1) + bit
+        } else {
+            result = result >> 1
+        }
+        bit = bit >> 2
+    }
+    return result
+}
+pub fn checked_next_power_of_two(value: u64) -> Result<u64, MathError> {
+    if value <= 1 {
+        return ok(1)
+    }
+    if value > 0x8000000000000000 {
+        return err(MathError.Overflow)
+    }
+    value = value - 1
+    for shift in 0u64..6 {
+        value = value | (value >> (1u64 << shift))
+    }
+    return ok(value + 1)
+}
+
+// Exact integral rounding, independent of float-to-integer conversion ranges.
+pub fn trunc(value: f64) -> f64 {
+    bits := to_bits(value)
+    exponent := ((bits >> 52) & 0x7ff) as i32 - 1023
+    if exponent < 0 {
+        return copy_sign(0.0, value)
+    }
+    if exponent >= 52 {
+        return value
+    }
+    mask := (1u64 << ((52 - exponent) as u64)) - 1
+    return from_bits(bits & ~mask)
+}
+pub fn floor(value: f64) -> f64 {
+    integral := trunc(value)
+    if value < integral {
+        return integral - 1.0
+    }
+    return integral
+}
+pub fn ceil(value: f64) -> f64 {
+    integral := trunc(value)
+    if value > integral {
+        return integral + 1.0
+    }
+    return integral
+}
+// Nearest integer, ties away from zero. round_even uses ties to even.
+pub fn round(value: f64) -> f64 {
+    integral := trunc(value)
+    if abs(value - integral) >= 0.5 {
+        return integral + copy_sign(1.0, value)
+    }
+    return integral
+}
+pub fn round_even(value: f64) -> f64 {
+    integral := trunc(value)
+    fraction := abs(value - integral)
+    if fraction > 0.5 {
+        return integral + copy_sign(1.0, value)
+    }
+    if fraction == 0.5 {
+        if ((abs(integral) as u64) & 1) != 0 {
+            return integral + copy_sign(1.0, value)
+        }
+    }
+    return integral
+}
+// Power-of-two scaling keeps the final subnormal rounding in a single multiply.
+pub fn scalbn(value: f64, exponent: i32) -> f64 {
+    if value == 0.0 || !is_finite(value) {
+        return value
+    }
+    if exponent > 1023 {
+        value = value * from_bits(0x7fe0000000000000)
+        exponent = exponent - 1023
+        if exponent > 1023 {
+            value = value * from_bits(0x7fe0000000000000)
+            exponent = exponent - 1023
+            if exponent > 1023 {
+                exponent = 1023
+            }
+        }
+    }
+    if exponent < -1022 {
+        value = value * from_bits(0x0350000000000000)
+        exponent = exponent + 970
+        if exponent < -1022 {
+            value = value * from_bits(0x0350000000000000)
+            exponent = exponent + 970
+            if exponent < -1022 {
+                exponent = -1022
+            }
+        }
+    }
+    return value * from_bits(((exponent + 1023) as u64) << 52)
+}
+
+// Newton iteration after exact exponent normalization; no hardware sqrt needed.
+pub fn sqrt(value: f64) -> Result<f64, MathError> {
+    if is_nan(value) || value == 0.0 {
+        return ok(value)
+    }
+    if value < 0.0 {
+        return err(MathError.Domain)
+    }
+    if is_infinite(value) {
+        return ok(value)
+    }
+    correction := 0i32
+    if value < MIN_NORMAL {
+        value = value * 18014398509481984.0;
+        correction = -54
+    }
+    bits := to_bits(value)
+    exponent := ((bits >> 52) as i32) - 1023 + correction
+    normalized := from_bits((bits & 0x000fffffffffffff) | 0x3ff0000000000000)
+    if exponent % 2 != 0 {
+        normalized = normalized * 2.0;
+        exponent = exponent - 1
+    }
+    estimate := 0.5 * (normalized + 1.0)
+    for i in 0usize..7 {
+        estimate = 0.5 * (estimate + normalized / estimate)
+    }
+    return ok(scalbn(estimate, exponent / 2))
+}
+pub fn cbrt(value: f64) -> f64 {
+    if value == 0.0 || !is_finite(value) {
+        return value
+    }
+    magnitude := abs(value)
+    correction := 0i32
+    if magnitude < MIN_NORMAL {
+        magnitude = magnitude * 18014398509481984.0;
+        correction = -54
+    }
+    bits := to_bits(magnitude)
+    exponent := ((bits >> 52) as i32) - 1023 + correction
+    normalized := from_bits((bits & 0x000fffffffffffff) | 0x3ff0000000000000)
+    remainder := exponent % 3
+    if remainder < 0 {
+        remainder = remainder + 3
+    }
+    normalized = scalbn(normalized, remainder)
+    exponent = exponent - remainder
+    estimate := 2.0
+    for i in 0usize..9 {
+        estimate = (2.0 * estimate + normalized / (estimate * estimate)) / 3.0
+    }
+    return copy_sign(scalbn(estimate, exponent / 3), value)
+}
+pub fn hypot(a: f64, b: f64) -> f64 {
+    if is_infinite(a) || is_infinite(b) {
+        return infinity()
+    }
+    if is_nan(a) || is_nan(b) {
+        return nan()
+    }
+    a = abs(a);
+    b = abs(b)
+    if b > a {
+        saved := a;
+        a = b;
+        b = saved
+    }
+    if a == 0.0 {
+        return 0.0
+    }
+    ratio := b / a
+    match sqrt(1.0 + ratio * ratio) {
+        ok(root) => {
+            return a * root
+        }, err(_) => {
+            return nan()
+        }
+    }
+}
+
+// Log reduction to [sqrt(1/2),sqrt(2)]. The convergent atanh series uses 12
+// terms: its exact-arithmetic truncation error is below 2e-21 on that interval.
+// Split ln(2) follows fdlibm; see std/math/NOTICE and the math documentation.
+pub fn log(value: f64) -> Result<f64, MathError> {
+    if is_nan(value) {
+        return ok(value)
+    }
+    if value < 0.0 {
+        return err(MathError.Domain)
+    }
+    if value == 0.0 {
+        return ok(-infinity())
+    }
+    if is_infinite(value) {
+        return ok(value)
+    }
+    correction := 0i32
+    if value < MIN_NORMAL {
+        value = value * 18014398509481984.0;
+        correction = -54
+    }
+    bits := to_bits(value)
+    exponent := ((bits >> 52) as i32) - 1023 + correction
+    normalized := from_bits((bits & 0x000fffffffffffff) | 0x3ff0000000000000)
+    if normalized > 1.4142135623730951 {
+        normalized = normalized * 0.5;
+        exponent = exponent + 1
+    }
+    difference := normalized - 1.0
+    ratio := difference / (2.0 + difference)
+    square := ratio * ratio
+    term := ratio
+    sum := ratio
+    for i in 1usize..12 {
+        term = term * square;
+        sum = sum + term / ((2 * i + 1) as f64)
+    }
+    high := (exponent as f64) * 0.693147180369123816490
+    low := (exponent as f64) * 1.90821492927058770002e-10
+    return ok(high + (2.0 * sum + low))
+}
+pub fn log2(value: f64) -> Result<f64, MathError> {
+    result := log(value)?;
+    return ok(result / LN_2)
+}
+pub fn log10(value: f64) -> Result<f64, MathError> {
+    result := log(value)?;
+    return ok(result / LN_10)
+}
+pub fn log1p(value: f64) -> Result<f64, MathError> {
+    if value < -1.0 {
+        return err(MathError.Domain)
+    }
+    if abs(value) < 0.0001 {
+        // Stable alternating series for inputs for which 1+x loses digits.
+        term := value
+        sum := value
+        for i in 2usize..9 {
+            term = -term * value;
+            sum = sum + term / (i as f64)
+        }
+        return ok(sum)
+    }
+    if is_nan(value) || value == infinity() {
+        return ok(value)
+    }
+    if value == -1.0 {
+        return ok(-infinity())
+    }
+    rounded := 1.0 + value
+    result := log(rounded)?
+    // Correct the rounding error introduced by forming 1+x.
+    return ok(result + (value - (rounded - 1.0)) / rounded)
+}
+// Exp range reduction uses a split ln(2), then the Taylor polynomial on
+// [-ln(2)/2,ln(2)/2]. Finite overflow is an error; gradual underflow is allowed.
+pub fn exp(value: f64) -> Result<f64, MathError> {
+    if is_nan(value) {
+        return ok(value)
+    }
+    if value == infinity() {
+        return ok(value)
+    }
+    if value == -infinity() {
+        return ok(0.0)
+    }
+    if value > 709.782712893383973096 {
+        return err(MathError.Overflow)
+    }
+    if value < -745.133219101941108420 {
+        return ok(0.0)
+    }
+    exponent := round(value * 1.44269504088896340736) as i32
+    reduced := (value - (exponent as f64) * 0.693147180369123816490) - (exponent as f64) * 1.90821492927058770002e-10
+    term := 1.0
+    sum := 1.0
+    for i in 1usize..15 {
+        term = term * reduced / (i as f64);
+        sum = sum + term
+    }
+    result := scalbn(sum, exponent)
+    if is_infinite(result) {
+        return err(MathError.Overflow)
+    }
+    return ok(result)
+}
+pub fn exp2(value: f64) -> Result<f64, MathError> {
+    if is_nan(value) {
+        return ok(value)
+    }
+    if value == infinity() {
+        return ok(value)
+    }
+    if value >= 1024.0 {
+        return err(MathError.Overflow)
+    }
+    if value <= -1075.0 {
+        return ok(0.0)
+    }
+    integral := floor(value) as i32
+    fraction := value - (integral as f64)
+    fractional_exp := exp(fraction * LN_2)?
+    return ok(scalbn(fractional_exp, integral))
+}
+pub fn expm1(value: f64) -> Result<f64, MathError> {
+    if value == 0.0 {
+        return ok(value)
+    }
+    if abs(value) < 0.5 {
+        term := value
+        sum := value
+        for i in 2usize..17 {
+            term = term * value / (i as f64);
+            sum = sum + term
+        }
+        return ok(sum)
+    }
+    result := exp(value)?
+    return ok(result - 1.0)
+}
+// Integer exponentiation: negative exponents invert the base first. 0^0=1;
+// zero to a negative power is DivisionByZero; finite overflow is checked.
+pub fn powi(base: f64, exponent: i32) -> Result<f64, MathError> {
+    if exponent == 0 {
+        return ok(1.0)
+    }
+    finite := is_finite(base)
+    count := unsigned_abs(exponent as i64)
+    if exponent < 0 {
+        if base == 0.0 {
+            return err(MathError.DivisionByZero)
+        }
+        base = 1.0 / base
+    }
+    result := 1.0
+    for count != 0 {
+        if (count & 1) != 0 {
+            result = result * base
+        }
+        count = count >> 1
+        if count != 0 {
+            base = base * base
+        }
+    }
+    if finite && is_infinite(result) {
+        return err(MathError.Overflow)
+    }
+    return ok(result)
+}
+// General real power. Negative finite bases require an exactly integral power.
+pub fn pow(base: f64, exponent: f64) -> Result<f64, MathError> {
+    if exponent == 0.0 || base == 1.0 {
+        return ok(1.0)
+    }
+    if is_nan(base) || is_nan(exponent) {
+        return ok(nan())
+    }
+    if is_finite(exponent) && exponent >= -2147483648.0 && exponent <= 2147483647.0 && trunc(exponent) == exponent {
+        return powi(base, exponent as i32)
+    }
+    if base == 0.0 {
+        if exponent < 0.0 {
+            return err(MathError.DivisionByZero)
+        }
+        if sign_bit(base) && is_finite(exponent) && exponent < 9007199254740992.0 && trunc(exponent) == exponent {
+            if ((exponent as u64) & 1) != 0 {
+                return ok(base)
+            }
+        }
+        return ok(0.0)
+    }
+    negative := base < 0.0
+    if negative && trunc(exponent) != exponent {
+        return err(MathError.Domain)
+    }
+    magnitude := abs(base)
+    if is_infinite(exponent) {
+        if magnitude == 1.0 {
+            return ok(1.0)
+        }
+        if (magnitude > 1.0) == (exponent > 0.0) {
+            return ok(infinity())
+        }
+        return ok(0.0)
+    }
+    logarithm := log(magnitude)?
+    result := exp(exponent * logarithm)?
+    if is_finite(base) && is_finite(exponent) && is_infinite(result) {
+        return err(MathError.Overflow)
+    }
+    if negative && abs(exponent) < 9007199254740992.0 {
+        if ((abs(exponent) as u64) & 1) != 0 {
+            result = -result
+        }
+    }
+    return ok(result)
+}

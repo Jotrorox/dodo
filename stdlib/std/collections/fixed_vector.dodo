@@ -1,0 +1,121 @@
+package fixed_vector
+
+import "core/option"
+import "std/collections"
+
+// Caller owns the slot array; this container owns its initialized payloads.
+// Construction clears existing payloads. Unused slots always contain none.
+pub struct Vector<T> {
+    slots: &mut[Option<T>]
+    length: usize
+
+    pub fn new(slots: &mut[Option<T>]) -> Vector<T> from(slots) {
+        for i in 0usize..slots.len {
+            core.drop(option.take(&mut slots[i]))
+        }
+        return Vector<T> { slots: slots, length: 0 }
+    }
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+    pub fn capacity(&self) -> usize {
+        return self.slots.len
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.length == 0
+    }
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.length {
+            return none
+        }
+        match &self.slots[index] {
+            some(value) => {
+                return some(value)
+            },
+            none => {
+                return none
+            },
+        }
+    }
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.length {
+            return none
+        }
+        match &mut self.slots[index] {
+            some(value) => {
+                return some(value)
+            },
+            none => {
+                return none
+            },
+        }
+    }
+    // Failure destroys the supplied value and leaves the vector unchanged.
+    pub fn push(&mut self, value: T) -> void!collections.CapacityError {
+        if self.length == self.slots.len {
+            return err(collections.CapacityError.Full)
+        }
+        self.slots[self.length] = some(value)
+        self.length = self.length + 1
+        return ok()
+    }
+    pub fn pop(&mut self) -> Option<T> {
+        if self.length == 0 {
+            return none
+        }
+        self.length = self.length - 1
+        return option.take(&mut self.slots[self.length])
+    }
+    pub fn insert(&mut self, index: usize, value: T) -> void!collections.CapacityError {
+        if index > self.length {
+            return err(collections.CapacityError.OutOfBounds)
+        }
+        if self.length == self.slots.len {
+            return err(collections.CapacityError.Full)
+        }
+        i := self.length
+        for i > index {
+            self.slots[i] = option.take(&mut self.slots[i - 1])
+            i = i - 1
+        }
+        self.slots[index] = some(value)
+        self.length = self.length + 1
+        return ok()
+    }
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        if index >= self.length {
+            return none
+        }
+        removed := option.take(&mut self.slots[index])
+        for i in index..self.length - 1 {
+            self.slots[i] = option.take(&mut self.slots[i + 1])
+        }
+        self.length = self.length - 1
+        return removed
+    }
+    pub fn swap_remove(&mut self, index: usize) -> Option<T> {
+        if index >= self.length {
+            return none
+        }
+        removed := option.take(&mut self.slots[index])
+        self.length = self.length - 1
+        if index != self.length {
+            self.slots[index] = option.take(&mut self.slots[self.length])
+        }
+        return removed
+    }
+    pub fn replace(&mut self, index: usize, value: T) -> Option<T> {
+        if index >= self.length {
+            return none
+        }
+        return option.replace(&mut self.slots[index], value)
+    }
+    pub fn clear(&mut self) {
+        for self.length != 0 {
+            core.drop(self.pop())
+        }
+    }
+    fn drop(&mut self) {
+        self.clear()
+    }
+}

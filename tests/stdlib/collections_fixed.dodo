@@ -1,0 +1,209 @@
+package collections_fixed
+import "std/collections"
+import "std/collections/fixed_vector"
+import "std/collections/fixed_deque"
+import "std/collections/fixed_map"
+import "std/collections/fixed_set"
+fn verify() -> i32!collections.CapacityError {
+    one := 1i32
+    three := 3i32
+    slots: [4]Option<i32> = [none, none, none, none]
+    values := fixed_vector.Vector.new(&mut slots)
+    values.push(10)?
+    values.push(30)?
+    values.insert(1, 20)?
+    values.push(40)?
+    match values.push(50) {
+        ok() => {
+            return ok(1)
+        }, err(_) => {},
+    }
+    match values.remove(1) {
+        some(v) => {
+            if v != 20 {
+                return ok(2)
+            }
+        }, none => {
+            return ok(3)
+        },
+    }
+    match values.get(1) {
+        some(v) => {
+            if *v != 30 {
+                return ok(4)
+            }
+        }, none => {
+            return ok(5)
+        },
+    }
+    match values.swap_remove(0) {
+        some(v) => {
+            if v != 10 {
+                return ok(6)
+            }
+        }, none => {
+            return ok(7)
+        },
+    }
+    match values.pop() {
+        some(v) => {
+            if v != 30 {
+                return ok(8)
+            }
+        }, none => {
+            return ok(9)
+        },
+    }
+    values.clear()
+    if values.len() != 0 {
+        return ok(10)
+    }
+    // Deterministic bounded-vector model, including full and empty states.
+    model := [0i32; 4]
+    length := 0usize
+    state := 19usize
+    for step in 0usize..300usize {
+        state = (state * 71 + 53) % 1021
+        if state % 3 != 0 {
+            position := state % (length + 1)
+            match values.insert(position, step as i32) {
+                ok() => {
+                    if length == 4 {
+                        return ok(30)
+                    }
+                    i := length
+                    for i > position {
+                        model[i] = model[i - 1]
+                        i = i - 1
+                    }
+                    model[position] = step as i32
+                    length = length + 1
+                },
+                err(_) => {
+                    if length != 4 {
+                        return ok(31)
+                    }
+                },
+            }
+        } else if length != 0 {
+            position := state % length
+            match values.remove(position) {
+                some(value) => {
+                    if value != model[position] {
+                        return ok(32)
+                    }
+                },
+                none => {
+                    return ok(33)
+                },
+            }
+            length = length - 1
+            for i in position..length {
+                model[i] = model[i + 1]
+            }
+        } else {
+            match values.pop() {
+                some(_) => {
+                    return ok(34)
+                }, none => {},
+            }
+        }
+        if values.len() != length {
+            return ok(35)
+        }
+        for i in 0usize..length {
+            match values.get(i) {
+                some(value) => {
+                    if *value != model[i] {
+                        return ok(36)
+                    }
+                },
+                none => {
+                    return ok(37)
+                },
+            }
+        }
+    }
+    core.drop(values)
+    queue := fixed_deque.Deque.new(&mut slots)
+    queue.push_back(1)?
+    queue.push_back(2)?
+    queue.push_front(0)?
+    match queue.pop_front() {
+        some(v) => {
+            if v != 0 {
+                return ok(11)
+            }
+        }, none => {
+            return ok(12)
+        },
+    }
+    queue.push_back(3)?
+    queue.push_back(4)?
+    match queue.push_front(99) {
+        ok() => {
+            return ok(13)
+        }, err(_) => {},
+    }
+    for i in 1i32..5i32 {
+        match queue.pop_front() {
+            some(v) => {
+                if v != i {
+                    return ok(14)
+                }
+            }, none => {
+                return ok(15)
+            },
+        }
+    }
+    entries: [3]Option<fixed_map.Entry<i32, i32>> = [none, none, none]
+    map := fixed_map.Map.new(&mut entries, collections.I32 {})
+    core.drop(map.insert(3, 30)?)
+    core.drop(map.insert(1, 10)?)
+    match map.insert(3, 31)? {
+        some(v) => {
+            if v != 30 {
+                return ok(16)
+            }
+        }, none => {
+            return ok(17)
+        },
+    }
+    match map.get(&three) {
+        some(v) => {
+            if *v != 31 {
+                return ok(18)
+            }
+        }, none => {
+            return ok(19)
+        },
+    }
+    match map.entry(0) {
+        some(e) => {
+            if e.key != 3 {
+                return ok(20)
+            }
+        }, none => {
+            return ok(21)
+        },
+    }
+    core.drop(map.remove(&three))
+    if map.contains(&three) || map.len() != 1 {
+        return ok(22)
+    }
+    set_slots: [2]Option<fixed_map.Entry<i32, fixed_set.Unit>> = [none, none]
+    set := fixed_set.Set.new(&mut set_slots, collections.I32 {})
+    if!set.insert(1)? || set.insert(1)? || !set.remove(&one) {
+        return ok(23)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 99
+        },
+    }
+}

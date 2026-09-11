@@ -1,0 +1,31 @@
+package math_portable
+
+import "std/math"
+import "std/math/trig"
+
+// A sensor vector's length and angle need no allocator, clock, or libm.
+fn main() -> i32 {
+    length := math.hypot(3.0, 4.0)
+    angle := trig.atan2(4.0, 3.0)
+    match trig.cos(angle) {
+        ok(cosine) => {
+            if math.abs(length * cosine - 3.0) > 1e-12 {
+                return 1
+            }
+        }, err(_) => {
+            return 2
+        }
+    }
+    // Resource arithmetic remains fallible, including exponentiation.
+    match math.checked_pow(2, 12) {
+        ok(samples) => {
+            if samples != 4096 {
+                return 3
+            }
+        },
+        err(_) => {
+            return 4
+        }
+    }
+    return 0
+}

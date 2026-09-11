@@ -1,0 +1,70 @@
+package heap
+
+import "alloc/error"
+import "std/collections"
+import "std/collections/vector"
+
+// Max binary heap. Equal values have unspecified removal order.
+pub struct Heap<T, C, A> {
+    values: vector.Vector<T, A>
+    ordering: C
+
+    pub fn len(&self) -> usize {
+        return self.values.len()
+    }
+    pub fn capacity(&self) -> usize {
+        return self.values.capacity()
+    }
+    pub fn peek(&self) -> Option<&T> {
+        return self.values.get(0)
+    }
+    // Borrowed heap-order view, not sorted iteration.
+    pub fn as_slice(&self) -> &[T] {
+        return self.values.as_slice()
+    }
+    fn compare_indices(&self, a: usize, b: usize) -> i32 {
+        data := self.values.as_slice()
+        return self.ordering.compare(&data[a], &data[b])
+    }
+    pub fn push(&mut self, value: T) -> void!error.AllocError {
+        self.values.push(value)?
+        child := self.values.len() - 1
+        for child != 0 {
+            parent := (child - 1) / 2
+            ordered := self.compare_indices(parent, child) >= 0
+            if ordered {
+                return ok()
+            }
+            collections.swap(self.values.as_mut_slice(), parent, child)
+            child = parent
+        }
+        return ok()
+    }
+    pub fn pop(&mut self) -> Option<T> {
+        result := self.values.swap_remove(0)
+        end := self.values.len()
+        root := 0usize
+        for root < end / 2 {
+            child := root * 2 + 1
+            if child + 1 < end && self.compare_indices(child, child + 1) < 0 {
+                child = child + 1
+            }
+            ordered := self.compare_indices(root, child) >= 0
+            if ordered {
+                return result
+            }
+            collections.swap(self.values.as_mut_slice(), root, child)
+            root = child
+        }
+        return result
+    }
+    pub fn clear(&mut self) {
+        self.values.clear()
+    }
+}
+// SAFETY: allocator must satisfy vector.new's capability contract.
+pub unsafe fn new<T, C, A>(allocator: A, ordering: C) -> Heap<T, C, A> from(allocator, ordering) {
+    unsafe {
+        return Heap<T, C, A> { values: vector.new::<T, A>(allocator), ordering: ordering }
+    }
+}

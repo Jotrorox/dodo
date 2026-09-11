@@ -1,0 +1,57 @@
+package checksum
+
+// Checksums detect accidental corruption; neither authenticates data.
+pub struct Crc32 {
+    state: u32
+    pub fn new() -> Crc32 {
+        return Crc32 { state: 0xffffffffu32 }
+    }
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.state = self.state ^ (byte as u32)
+            for bit in 0..8 {
+                if (self.state & 1) == 1 {
+                    self.state = (self.state >> 1) ^ 0xedb88320u32
+                } else {
+                    self.state = self.state >> 1
+                }
+            }
+        }
+    }
+    pub fn finish(&self) -> u32 {
+        return self.state ^ 0xffffffffu32
+    }
+    pub fn reset(&mut self) {
+        self.state = 0xffffffffu32
+    }
+}
+pub struct Adler32 {
+    a: u32
+    b: u32
+    pub fn new() -> Adler32 {
+        return Adler32 { a: 1, b: 0 }
+    }
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.a = (self.a + (byte as u32)) % 65521
+            self.b = (self.b + self.a) % 65521
+        }
+    }
+    pub fn finish(&self) -> u32 {
+        return (self.b << 16) | self.a
+    }
+    pub fn reset(&mut self) {
+        self.a = 1;
+        self.b = 0
+    }
+}
+pub fn crc32(data: &[u8]) -> u32 {
+    state := Crc32.new()
+    state.update(data)
+    return state.finish()
+}
+pub fn adler32(data: &[u8]) -> u32 {
+    state := Adler32.new()
+    state.update(data)
+    return state.finish()
+}

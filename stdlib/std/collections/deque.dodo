@@ -1,0 +1,129 @@
+package deque
+
+import "core/option"
+import "alloc/error"
+import "std/collections/vector"
+
+// Allocation-dependent ring buffer. Growth linearizes a wrapped prefix by
+// moving it into the new half, preserving FIFO order and every payload.
+pub struct Deque<T, A> {
+    slots: vector.Vector<Option<T>, A>
+    head: usize
+    length: usize
+
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+    pub fn capacity(&self) -> usize {
+        return self.slots.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.length == 0
+    }
+    fn physical(&self, index: usize) -> usize {
+        remaining := self.slots.len() - self.head
+        if index >= remaining {
+            return index - remaining
+        }
+        return self.head + index
+    }
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.length {
+            return none
+        }
+        match self.slots.get(self.physical(index)) {
+            some(slot) => {
+                match slot {
+                    some(value) => {
+                        return some(value)
+                    }, none => {
+                        return none
+                    },
+                }
+            },
+            none => {
+                return none
+            },
+        }
+    }
+    fn take_slot(&mut self, index: usize) -> Option<T> {
+        match self.slots.replace(index, none) {
+            some(slot) => {
+                return slot
+            }, none => {
+                return none
+            },
+        }
+    }
+    fn grow(&mut self) -> void!error.AllocError {
+        previous := self.slots.len()
+        added := previous
+        if added == 0 {
+            added = 4
+        }
+        self.slots.reserve(added)?
+        for i in 0usize..added {
+            self.slots.push(none)?
+        }
+        for i in 0usize..self.head {
+            value := self.take_slot(i)
+            core.drop(self.slots.replace(previous + i, value))
+        }
+        return ok()
+    }
+    pub fn push_back(&mut self, value: T) -> void!error.AllocError {
+        if self.length == self.slots.len() {
+            self.grow()?
+        }
+        index := self.physical(self.length)
+        core.drop(self.slots.replace(index, some(value)))
+        self.length = self.length + 1
+        return ok()
+    }
+    pub fn push_front(&mut self, value: T) -> void!error.AllocError {
+        if self.length == self.slots.len() {
+            self.grow()?
+        }
+        if self.head == 0 {
+            self.head = self.slots.len()
+        }
+        self.head = self.head - 1
+        index := self.head
+        core.drop(self.slots.replace(index, some(value)))
+        self.length = self.length + 1
+        return ok()
+    }
+    pub fn pop_front(&mut self) -> Option<T> {
+        if self.length == 0 {
+            return none
+        }
+        index := self.head
+        value := self.take_slot(index)
+        self.head = self.head + 1
+        if self.head == self.slots.len() {
+            self.head = 0
+        }
+        self.length = self.length - 1
+        return value
+    }
+    pub fn pop_back(&mut self) -> Option<T> {
+        if self.length == 0 {
+            return none
+        }
+        self.length = self.length - 1
+        index := self.physical(self.length)
+        return self.take_slot(index)
+    }
+    pub fn clear(&mut self) {
+        for self.length != 0 {
+            core.drop(self.pop_back())
+        }
+        self.head = 0
+    }
+}
+// SAFETY: allocator must satisfy vector.new's capability contract.
+pub unsafe fn new<T, A>(allocator: A) -> Deque<T, A> from(allocator) {
+    unsafe {
+        return Deque<T, A> { slots: vector.new::<Option<T>, A>(allocator), head: 0, length: 0 }
+    }
+}

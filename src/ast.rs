@@ -266,6 +266,9 @@ pub struct Function {
     pub unsafe_: bool,
     pub extern_: bool,
     pub generics: Vec<String>,
+    /// Compiler-generated specialization: declared borrow sources may become
+    /// borrow-free after type substitution and then contribute no dependencies.
+    pub generic_instance: bool,
     pub params: Vec<Param>,
     pub ret: Type,
     pub ret_span: Span,

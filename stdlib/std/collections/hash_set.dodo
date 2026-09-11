@@ -1,0 +1,57 @@
+package hash_set
+
+import "alloc/error"
+import "std/collections/hash_map"
+
+pub struct Unit {}
+pub struct Set<T, H, A> {
+    map: hash_map.Map<T, Unit, H, A>
+    pub fn len(&self) -> usize {
+        return self.map.len()
+    }
+    pub fn capacity(&self) -> usize {
+        return self.map.capacity()
+    }
+    pub fn bucket_count(&self) -> usize {
+        return self.map.bucket_count()
+    }
+    pub fn contains(&self, value: &T) -> bool {
+        return self.map.contains(value)
+    }
+    pub fn entry(&self, index: usize) -> Option<&T> {
+        match self.map.entry(index) {
+            some(entry) => {
+                return some(&entry.key)
+            }, none => {
+                return none
+            },
+        }
+    }
+    pub fn insert(&mut self, value: T) -> bool!error.AllocError {
+        match self.map.insert(value, Unit {})? {
+            some(_) => {
+                return ok(false)
+            }, none => {
+                return ok(true)
+            },
+        }
+    }
+    pub fn remove(&mut self, value: &T) -> bool {
+        match self.map.remove(value) {
+            some(_) => {
+                return true
+            }, none => {
+                return false
+            },
+        }
+    }
+    pub fn clear(&mut self) {
+        self.map.clear()
+    }
+}
+// SAFETY: allocator must satisfy vector.new's capability contract.
+pub unsafe fn new<T, H, A>(allocator: A, policy: H) -> Set<T, H, A> from(allocator, policy) {
+    unsafe {
+        return Set<T, H, A> { map: hash_map.new::<T, Unit, H, A>(allocator, policy) }
+    }
+}

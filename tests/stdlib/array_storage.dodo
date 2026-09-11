@@ -1,0 +1,150 @@
+package array_storage
+import "core/ptr"
+
+enum Error {
+    Failed
+}
+struct Guard {
+    counter: *mut i32
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.counter, ptr.read(self.counter) + 1)
+        }
+    }
+}
+fn initialize(calls: &mut i32, fail: bool) -> u8!Error {
+    *calls = *calls + 1
+    if fail {
+        return err(Error.Failed)
+    }
+    return ok(173)
+}
+fn dynamic(calls: &mut i32, drops: *mut i32, fail: bool) -> i32!Error {
+    guard := Guard { counter: drops }
+    storage := [initialize(calls, fail)?; 262144]
+    if storage.len != 262144 {
+        return ok(1)
+    }
+    for &byte in storage {
+        if byte != 173 {
+            return ok(2)
+        }
+    }
+    storage[0] = 1
+    storage[131072] = 2
+    storage[262143] = 3
+    if storage[0] != 1 || storage[131072] != 2 || storage[262143] != 3 {
+        return ok(3)
+    }
+    return ok(0)
+}
+fn constant() -> i32 {
+    storage := [0u8; 262144]
+    for &byte in storage {
+        if byte != 0 {
+            return 4
+        }
+    }
+    storage[262143] = 255
+    if storage[0] != 0 || storage[262143] != 255 {
+        return 5
+    }
+    return 0
+}
+fn empty(calls: &mut i32, drops: *mut i32, fail: bool) -> i32!Error {
+    guard := Guard { counter: drops }
+    storage := [initialize(calls, fail)?; 0]
+    return ok(storage.len as i32)
+}
+fn shadow_and_reference() -> i32 {
+    value := 23u8
+    {
+        value := [value; 4]
+        if value[0] != 23 || value[3] != 23 {
+            return 6
+        }
+    }
+    references := [&value; 3]
+    for element in references {
+        if **element != 23 {
+            return 7
+        }
+    }
+    // The general expression path remains exercised for small returned arrays.
+    returned := small()
+    if returned[0] != 42 || returned[3] != 42 {
+        return 8
+    }
+    return 0
+}
+fn small() -> [4]u8 {
+    return [42u8; 4]
+}
+fn consume(guard: Guard) -> u8 {
+    return 9
+}
+fn moved_initializer(counter: *mut i32) -> i32 {
+    guard := Guard { counter: counter }
+    let values = [consume(guard); 4]
+    if values[0] != 9 || values[3] != 9 {
+        return 19
+    }
+    return 0
+}
+fn main() -> i32 {
+    calls := 0i32
+    drops := 0i32
+    counter := ptr.from_mut(&mut drops)
+    match dynamic(&mut calls, counter, false) {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 10
+        }
+    }
+    if calls != 1 || drops != 1 {
+        return 11
+    }
+    match dynamic(&mut calls, counter, true) {
+        ok(_) => {
+            return 12
+        }, err(_) => {}
+    }
+    if calls != 2 || drops != 2 {
+        return 13
+    }
+    match empty(&mut calls, counter, false) {
+        ok(code) => {
+            if code != 0 {
+                return 14
+            }
+        }, err(_) => {
+            return 15
+        }
+    }
+    if calls != 3 || drops != 3 {
+        return 16
+    }
+    match empty(&mut calls, counter, true) {
+        ok(_) => {
+            return 17
+        }, err(_) => {}
+    }
+    if calls != 4 || drops != 4 {
+        return 18
+    }
+    moved_status := moved_initializer(counter)
+    if moved_status != 0 {
+        return moved_status
+    }
+    if drops != 5 {
+        return 20
+    }
+    status := constant()
+    if status != 0 {
+        return status
+    }
+    return shadow_and_reference()
+}

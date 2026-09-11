@@ -1,0 +1,41 @@
+package collections_example
+
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/collections"
+import "std/collections/shared_vector"
+import "std/collections/shared_hash_map"
+import "std/hash"
+
+fn example() -> i32!error.AllocError {
+    memory := [0u8; 4096]
+    allocator := shared_arena.SharedArena.new(&mut memory)?
+    numbers := shared_vector.new::<i32>(allocator.handle())
+    counts := shared_hash_map.new::<i32, i32, hash.I32>(allocator.handle(), hash.I32 {})
+    numbers.push(30)?
+    numbers.push(10)?
+    numbers.push(20)?
+    ordering := collections.I32 {}
+    collections.sort(numbers.as_mut_slice(), &ordering)
+    for value in numbers.as_slice() {
+        core.drop(counts.insert(*value, *value / 10)?)
+    }
+    key := 20i32
+    match counts.get(&key) {
+        some(count) => {
+            return ok(*count - 2)
+        },
+        none => {
+            return ok(1)
+        },
+    }
+}
+fn main() -> i32 {
+    match example() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 2
+        },
+    }
+}

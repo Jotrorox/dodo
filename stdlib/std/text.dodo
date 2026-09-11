@@ -675,3 +675,26 @@ pub fn parse_f64(data: &[u8]) -> f64!Error {
     }
     return ok(signed_float(result, negative))
 }
+
+// Strict decimal parsing for bounded fields such as ISO 8601 components.
+// Unlike parse_u64, this accepts ASCII digits only: no sign or whitespace.
+pub enum ParseError {
+    Empty, InvalidDigit, Overflow
+}
+
+pub fn parse_u32_decimal(data: &[u8]) -> u32!ParseError {
+    match magnitude(data, 0, 10, 4294967295u64) {
+        ok(value) => {
+            return ok(value as u32)
+        },
+        err(reason) => {
+            if reason.kind == ErrorKind.EmptyNumber {
+                return err(ParseError.Empty)
+            }
+            if reason.kind == ErrorKind.Overflow {
+                return err(ParseError.Overflow)
+            }
+            return err(ParseError.InvalidDigit)
+        },
+    }
+}

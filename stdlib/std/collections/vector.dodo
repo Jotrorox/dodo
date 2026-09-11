@@ -1,0 +1,189 @@
+package vector
+
+import "core/mem"
+import "core/ptr"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/block"
+
+// A is an owned allocator capability: allocate(&self,&Layout)->Block!AllocError,
+// unsafe deallocate(&self,Block). It may retain checked backing dependencies.
+pub struct Vector<T, A> {
+    allocator: A
+    pointer: *mut T
+    length: usize
+    reserved: usize
+
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+    pub fn capacity(&self) -> usize {
+        return self.reserved
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.length == 0
+    }
+    pub fn as_slice(&self) -> &[T] {
+        unsafe {
+            return ptr.borrow_slice(self.pointer, self.length, self)
+        }
+    }
+    pub fn as_mut_slice(&mut self) -> &mut[T] {
+        unsafe {
+            return ptr.borrow_slice_mut(self.pointer, self.length, self)
+        }
+    }
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.length {
+            return none
+        }
+        unsafe {
+            return some(ptr.borrow(ptr.offset(self.pointer, index as isize), self))
+        }
+    }
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.length {
+            return none
+        }
+        unsafe {
+            return some(ptr.borrow_mut(ptr.offset(self.pointer, index as isize), self))
+        }
+    }
+    // Geometric growth; failure preserves all existing values and capacity.
+    pub fn reserve(&mut self, additional: usize) -> void!error.AllocError {
+        if additional > layout.max_size() - self.length {
+            return err(error.AllocError.SizeOverflow)
+        }
+        required := self.length + additional
+        if required <= self.reserved {
+            return ok()
+        }
+        capacity := self.reserved
+        if capacity < 4 {
+            capacity = 4
+        }
+        for capacity < required {
+            if capacity > layout.max_size() / 2 {
+                capacity = required
+            } else {
+                capacity = capacity * 2
+            }
+        }
+        requested := layout.array::<T>(capacity)?
+        previous_layout := layout.array::<T>(self.reserved)?
+        allocated := self.allocator.allocate(&requested)?
+        unsafe {
+            destination := allocated.as_ptr() as *mut T
+            ptr.copy_nonoverlapping(self.pointer, destination, self.length)
+            if self.reserved != 0 {
+                previous := block.Block.from_raw_parts(self.pointer as *mut u8, previous_layout)
+                self.allocator.deallocate(previous)
+            }
+            self.pointer = destination
+            self.reserved = capacity
+        }
+        return ok()
+    }
+    pub fn push(&mut self, value: T) -> void!error.AllocError {
+        self.reserve(1)?
+        initialized := mem.init(value)
+        unsafe {
+            ptr.write(ptr.offset(self.pointer, self.length as isize), mem.assume_init(initialized))
+        }
+        self.length = self.length + 1
+        return ok()
+    }
+    pub fn pop(&mut self) -> Option<T> {
+        if self.length == 0 {
+            return none
+        }
+        self.length = self.length - 1
+        unsafe {
+            return some(ptr.read(ptr.offset(self.pointer, self.length as isize)))
+        }
+    }
+    // Out-of-range is represented by UnsupportedLayout; no mutation on error.
+    pub fn insert(&mut self, index: usize, value: T) -> void!error.AllocError {
+        if index > self.length {
+            return err(error.AllocError.UnsupportedLayout)
+        }
+        self.reserve(1)?
+        initialized := mem.init(value)
+        unsafe {
+            destination := ptr.offset(self.pointer, index as isize)
+            ptr.copy(destination, ptr.offset(destination, 1), self.length - index)
+            ptr.write(destination, mem.assume_init(initialized))
+        }
+        self.length = self.length + 1
+        return ok()
+    }
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        if index >= self.length {
+            return none
+        }
+        unsafe {
+            source := ptr.offset(self.pointer, index as isize)
+            value := ptr.read(source)
+            ptr.copy(ptr.offset(source, 1), source, self.length - index - 1)
+            self.length = self.length - 1
+            return some(value)
+        }
+    }
+    pub fn swap_remove(&mut self, index: usize) -> Option<T> {
+        if index >= self.length {
+            return none
+        }
+        unsafe {
+            source := ptr.offset(self.pointer, index as isize)
+            value := ptr.read(source)
+            self.length = self.length - 1
+            if index != self.length {
+                ptr.write(source, ptr.read(ptr.offset(self.pointer, self.length as isize)))
+            }
+            return some(value)
+        }
+    }
+    // Invalid index destroys the replacement and returns none.
+    pub fn replace(&mut self, index: usize, value: T) -> Option<T> {
+        if index >= self.length {
+            return none
+        }
+        initialized := mem.init(value)
+        unsafe {
+            destination := ptr.offset(self.pointer, index as isize)
+            old := ptr.read(destination)
+            ptr.write(destination, mem.assume_init(initialized))
+            return some(old)
+        }
+    }
+    pub fn clear(&mut self) {
+        for self.length != 0 {
+            core.drop(self.pop())
+        }
+    }
+    fn drop(&mut self) {
+        self.clear()
+        if self.reserved != 0 {
+            // Every stored capacity was validated by reserve.
+            match layout.array::<T>(self.reserved) {
+                ok(requested) => {
+                    unsafe {
+                        allocation := block.Block.from_raw_parts(self.pointer as *mut u8, requested)
+                        self.allocator.deallocate(allocation)
+                    }
+                },
+                err(_) => {},
+            }
+        }
+    }
+}
+
+// SAFETY: A must keep all allocations unique, aligned, valid until deallocate,
+// and alive while the capability lives. No allocation occurs in new.
+pub unsafe fn new<T, A>(allocator: A) -> Vector<T, A> from(allocator) {
+    gate: Option<T> = none
+    core.drop(mem.init(gate))
+    unsafe {
+        return Vector<T, A> { allocator: allocator, pointer: mem.align_of::<T>() as *mut T, length: 0, reserved: 0 }
+    }
+}

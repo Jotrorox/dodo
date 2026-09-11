@@ -1,0 +1,41 @@
+package hash_example
+import "std/hash"
+import "std/checksum"
+
+// Replace this deterministic example source with an application entropy adapter.
+pub struct ExampleKeySource {
+    pub fn next_key(&mut self) -> hash.Key128!hash.KeyError {
+        return ok(hash.Key128.new(0x0123456789abcdefu64, 0xfedcba9876543210u64))
+    }
+}
+fn main() -> i32 {
+    first := [104u8, 101]
+    second := [108u8, 108, 111]
+    digest := hash.Fnv1a64.new()
+    digest.update(&first)
+    digest.update(&second)
+    if digest.finish() != 0xa430d84680aabd0bu64 {
+        return 1
+    }
+    // Production maps receive unpredictable keys from the caller's entropy
+    // adapter. These fixed words make this example deterministic only.
+    source := ExampleKeySource {}
+    map_key := match hash.obtain_key(&mut source) {
+        ok(key) => {
+            key
+        }, err(_) => {
+            return 4
+        }
+    }
+    policy := map_key.u64_policy()
+    key := 42u64
+    same := policy.hash(&key)
+    if same != policy.hash(&key) {
+        return 2
+    }
+    data := [49u8, 50, 51, 52, 53, 54, 55, 56, 57]
+    if checksum.crc32(&data) != 0xcbf43926u32 {
+        return 3
+    }
+    return 0
+}
