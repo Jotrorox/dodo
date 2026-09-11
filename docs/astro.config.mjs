@@ -4,11 +4,11 @@ import { markdownLinks } from './src/lib/markdown-links.mjs';
 
 export default defineConfig({
   site: 'https://jotrorox.github.io',
-  base: '/dodo-docs',
+  base: '/dodo',
   trailingSlash: 'always',
   output: 'static',
   markdown: {
-    processor: satteri({ mdastPlugins: [markdownLinks({ base: '/dodo-docs' })] }),
+    processor: satteri({ mdastPlugins: [markdownLinks({ base: '/dodo' })] }),
     shikiConfig: {
       themes: { light: 'github-light', dark: 'github-dark' },
       defaultColor: false,

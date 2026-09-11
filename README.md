@@ -19,7 +19,7 @@ fn main() -> i32 {
 ```
 
 This is the first compiler release, **0.1.0**, licensed under
-[BSD-2-Clause](LICENSE). The [language specification](https://jotrorox.github.io/dodo-docs/language-spec-0.1/)
+[BSD-2-Clause](LICENSE). The [language specification](https://jotrorox.github.io/dodo/language-spec-0.1/)
 is a broader design contract. The implemented features and remaining limits are
 explicit below; this release does not claim complete specification conformance
 or a proof of memory safety.
@@ -240,7 +240,7 @@ first compiler error per file/package. Error and warning severities are
 supported, but the compiler currently only produces errors; no new warning
 rules are introduced. Completion, navigation, incremental analysis, file
 watching, and diagnostics for unopened workspace roots are not implemented yet.
-See [diagnostics and editor setup](https://jotrorox.github.io/dodo-docs/diagnostics-and-editors/) for labeled
+See [diagnostics and editor setup](https://jotrorox.github.io/dodo/diagnostics-and-editors/) for labeled
 examples and hover details.
 
 ## Language support
@@ -272,21 +272,21 @@ examples and hover details.
   functions, primitive/raw-pointer C ABI calls, `@repr(C)` struct layout,
   volatile MMIO, and a small compiler-provided memory/pointer core.
 
-See [implementation decisions](https://jotrorox.github.io/dodo-docs/implementation/) for exact lexical,
+See [implementation decisions](https://jotrorox.github.io/dodo/implementation/) for exact lexical,
 operator, package, layout, intrinsic, and release-limit details. Compiler errors
 include labeled source snippets for borrow origins, conflicting accesses, live
 uses, moves, and borrowed-return contracts. Run `dodo lsp` from an editor's LSP
 client for inferred types, receiver ownership, and borrowed-return source hovers.
-See [diagnostics and editor setup](https://jotrorox.github.io/dodo-docs/diagnostics-and-editors/) and the
+See [diagnostics and editor setup](https://jotrorox.github.io/dodo/diagnostics-and-editors/) and the
 [borrowing example](examples/borrowing.dodo).
 
 ## Documentation
 
-Read the **[documentation website](https://jotrorox.github.io/dodo-docs/)** for the
+Read the **[documentation website](https://jotrorox.github.io/dodo/)** for the
 language specification, implementation limits, requirements, and editor setup.
 The specification includes the ergonomics revision and remaining open design
-items. It is also available as [plain text](https://jotrorox.github.io/dodo-docs/downloads/language-spec-0.1.txt)
-and [PDF](https://jotrorox.github.io/dodo-docs/downloads/language-spec-0.1.pdf).
+items. It is also available as [plain text](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.txt)
+and [PDF](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.pdf).
 
 The entire `docs/` directory is a small Astro website. Edit or add Markdown files
 in [docs/src/content/docs](docs/src/content/docs); frontmatter sets each page's
@@ -301,10 +301,10 @@ npm run build
 npm run preview
 ```
 
-See [Edit these docs](https://jotrorox.github.io/dodo-docs/contributing/) for authoring
+See [Edit these docs](https://jotrorox.github.io/dodo/contributing/) for authoring
 and keyboard shortcut details. GitHub Actions validates pull requests and deploys
-the generated website from `main` to GitHub Pages through the public
-[dodo-docs repository](https://github.com/Jotrorox/dodo-docs). After editing the
+the generated website from `main` directly to this repository's GitHub Pages.
+After editing the
 [specification source](docs/src/content/docs/language-spec-0.1.md), the next website
 build automatically regenerates its PDF and plain text downloads. Generated
 files are ignored by Git, so only the Markdown edit needs committing. The

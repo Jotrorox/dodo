@@ -12,7 +12,7 @@ import sys
 
 DIST = Path(__file__).resolve().parent.parent / "docs" / "dist"
 SITE = "https://jotrorox.github.io"
-BASE = "/dodo-docs/"
+BASE = "/dodo/"
 
 
 class Page(HTMLParser):

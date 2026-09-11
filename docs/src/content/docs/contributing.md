@@ -92,13 +92,11 @@ implemented compiler features.
 ## Publish
 
 Push changes to `main` to build and deploy the website with GitHub Actions.
-Pull requests build the site for validation. CI publishes only the generated
-website to the public [dodo-docs repository](https://github.com/Jotrorox/dodo-docs),
-which serves [GitHub Pages](https://jotrorox.github.io/dodo-docs/).
+Pull requests build the site for validation. CI publishes the generated website
+directly to this repository's [GitHub Pages](https://jotrorox.github.io/dodo/)
+using the built-in GitHub Actions deployment permissions.
 
-The source repository remains private. Its `DOCS_DEPLOY_KEY` Actions secret is a
-dedicated deploy key scoped to the public website repository. This publishing
-connection is already configured; routine documentation edits only need a
+Publishing is already configured; routine documentation edits only need a
 Markdown change and a push. The
 [documentation workflow](https://github.com/Jotrorox/dodo/blob/main/.github/workflows/docs.yml)
 defines the build and deployment steps.
