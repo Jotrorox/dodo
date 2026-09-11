@@ -1,0 +1,28 @@
+package text
+
+import "core/ascii"
+
+// Allocation-free decimal byte parsing, used by portable calendar conversion.
+// This deliberately small foundation accepts ASCII digits only, with no sign,
+// separators, whitespace, or implicit Unicode/localization transformations.
+pub enum ParseError {
+    Empty, InvalidDigit, Overflow
+}
+
+pub fn parse_u32_decimal(data: &[u8]) -> u32!ParseError {
+    if data.len == 0 {
+        return err(ParseError.Empty)
+    }
+    result := 0u32
+    for byte in data {
+        if!ascii.is_digit(*byte) {
+            return err(ParseError.InvalidDigit)
+        }
+        digit := (*byte - 48) as u32
+        if result > (4294967295u32 - digit) / 10 {
+            return err(ParseError.Overflow)
+        }
+        result = result * 10 + digit
+    }
+    return ok(result)
+}

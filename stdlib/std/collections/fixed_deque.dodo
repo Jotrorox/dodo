@@ -1,0 +1,96 @@
+package fixed_deque
+
+import "core/option"
+import "std/collections"
+
+// Ring buffer over caller-owned slots, FIFO iteration through get(0..len()).
+pub struct Deque<T> {
+    slots: &mut[Option<T>]
+    head: usize
+    length: usize
+
+    pub fn new(slots: &mut[Option<T>]) -> Deque<T> from(slots) {
+        for i in 0usize..slots.len {
+            core.drop(option.take(&mut slots[i]))
+        }
+        return Deque<T> { slots: slots, head: 0, length: 0 }
+    }
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+    pub fn capacity(&self) -> usize {
+        return self.slots.len
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.length == 0
+    }
+    fn physical(&self, index: usize) -> usize {
+        remaining := self.slots.len - self.head
+        if index >= remaining {
+            return index - remaining
+        }
+        return self.head + index
+    }
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.length {
+            return none
+        }
+        match &self.slots[self.physical(index)] {
+            some(value) => {
+                return some(value)
+            }, none => {
+                return none
+            },
+        }
+    }
+    pub fn push_back(&mut self, value: T) -> void!collections.CapacityError {
+        if self.length == self.slots.len {
+            return err(collections.CapacityError.Full)
+        }
+        index := self.physical(self.length)
+        self.slots[index] = some(value)
+        self.length = self.length + 1
+        return ok()
+    }
+    pub fn push_front(&mut self, value: T) -> void!collections.CapacityError {
+        if self.length == self.slots.len {
+            return err(collections.CapacityError.Full)
+        }
+        if self.head == 0 {
+            self.head = self.slots.len
+        }
+        self.head = self.head - 1
+        self.slots[self.head] = some(value)
+        self.length = self.length + 1
+        return ok()
+    }
+    pub fn pop_front(&mut self) -> Option<T> {
+        if self.length == 0 {
+            return none
+        }
+        value := option.take(&mut self.slots[self.head])
+        self.head = self.head + 1
+        if self.head == self.slots.len {
+            self.head = 0
+        }
+        self.length = self.length - 1
+        return value
+    }
+    pub fn pop_back(&mut self) -> Option<T> {
+        if self.length == 0 {
+            return none
+        }
+        self.length = self.length - 1
+        index := self.physical(self.length)
+        return option.take(&mut self.slots[index])
+    }
+    pub fn clear(&mut self) {
+        for self.length != 0 {
+            core.drop(self.pop_back())
+        }
+        self.head = 0
+    }
+    fn drop(&mut self) {
+        self.clear()
+    }
+}

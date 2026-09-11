@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-compile the portable core/alloc fixtures and execute real PE files in Wine.
+"""Cross-compile portable core/alloc/std fixtures and execute real PE files in Wine.
 
 Requires a built host dodo, clang, lld-link, Wine, and a MinGW kernel32 import
 library. No Windows C runtime or allocator is linked. The tiny test startup
@@ -7,6 +7,7 @@ supplies compiler-generated memory helpers and forwards the Dodo exit status;
 LLVM's stack probe handles large Windows stack frames.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -45,6 +46,9 @@ def run(arguments, *, env=None, timeout=120):
 
 RUNTIME = r'''
 typedef __SIZE_TYPE__ size_t;
+/* COFF floating-point marker. Arithmetic itself remains generated machine code;
+   this symbol introduces no C runtime, libm initialization, or dependency. */
+int _fltused = 0;
 __declspec(dllimport) void __stdcall ExitProcess(unsigned int code);
 extern int dodo_main(void) __asm__("dodo.PACKAGE.main");
 void *memcpy(void *destination, const void *source, size_t length) {
@@ -84,14 +88,17 @@ def main():
     parser.add_argument("--compiler", type=Path, default=ROOT / "target/debug/dodo")
     parser.add_argument("--kernel32", type=Path, help="Path to the MinGW libkernel32.a import library")
     parser.add_argument("--fixture", type=Path, action="append", help="Run only this fixture (repeatable)")
+    parser.add_argument("--wine", type=Path, help="Use a specific Wine binary, including a local unpacked installation")
+    parser.add_argument("--wineserver", type=Path, help="Matching Wine server for --wine")
+    parser.add_argument("--report", type=Path, help="Write a JSON record of successful fixture executions")
     args = parser.parse_args()
     compiler = args.compiler.resolve()
     if not compiler.is_file():
         raise SystemExit(f"Build the compiler first: {compiler}")
     clang = tool(["clang-22", "clang"])
     linker = tool(["lld-link-22", "lld-link"])
-    wine = tool(["wine64", "wine", "/usr/lib/wine/wine64"])
-    wineserver = tool(["wineserver", "/usr/lib/wine/wineserver64", "/usr/lib/wine/wineserver"])
+    wine = str(args.wine.absolute()) if args.wine else tool(["wine64", "wine", "/usr/lib/wine/wine64"])
+    wineserver = str(args.wineserver.absolute()) if args.wineserver else tool(["wineserver", "/usr/lib/wine/wineserver64", "/usr/lib/wine/wineserver"])
     wine_data = Path(wine).parent.parent / "share/wine"
     wine_inf = wine_data / "wine.inf"
     if wine_inf.is_file() and ".winmd" in wine_inf.read_text(errors="replace").lower() and not (wine_data / "winmd").is_dir():
@@ -108,6 +115,7 @@ def main():
     if not fixtures:
         raise SystemExit("No standard-library fixtures found")
     executions = 0
+    records = []
     with tempfile.TemporaryDirectory(prefix="dodo-windows-stdlib-") as directory:
         scratch = Path(directory)
         (scratch / "wine").mkdir()
@@ -140,11 +148,15 @@ def main():
                         raise RuntimeError(f"Linker did not produce a Windows executable: {exe}")
                     run([wine, str(exe)], env=env)
                     executions += 1
+                    records.append({"fixture": source.name, "optimization": optimization,
+                                    "target": "x86_64-pc-windows-msvc", "exit_code": 0})
                     print(f"PASS Windows x64 / Wine: {source.name} -O{optimization}", flush=True)
         finally:
             subprocess.run([wineserver, "-k"], env=env, capture_output=True, timeout=20)
             subprocess.run([wineserver, "-w"], env=env, capture_output=True, timeout=20)
-    print(f"Passed {executions} Windows executions across {len(fixtures)} core/alloc fixtures.")
+    if args.report:
+        args.report.write_text(json.dumps({"executions": executions, "fixtures": records}, indent=2) + "\n")
+    print(f"Passed {executions} Windows executions across {len(fixtures)} portable fixtures.")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,29 @@ Destructuring a borrowed aggregate that contains references conservatively keeps
 all of its source dependencies; purely owned nested struct fields retain separate
 field loans.
 
+The checker distinguishes the storage a view accesses from dependencies its
+owner keeps alive. Borrowing a container exclusively retains shared allocator or
+policy dependencies as shared; it never upgrades them into exclusive access.
+Source lifetimes remain checked, including through moves, control-flow joins,
+destruction, and borrowed returns. Shared access through an aggregate cannot
+extract a mutable reference or slice from one of its stored `&mut` fields:
+reading such a field creates a shared reborrow. A directly owned immutable
+binding that contains an exclusive reference can still write through that stored
+reference, as described in [syntax](implementation-syntax.md).
+
+For generic specializations, explicit `from(...)` parameters that become
+borrow-free contribute an empty dependency set. Parameters that contain borrows
+retain every actual source dependency. Unknown source names are errors; a
+contract never permits a borrow of a local value to escape.
+
+[Owner-bound raw-storage primitives](memory-and-ffi.md#unsafe-memory-access)
+allow library implementations to establish checked views of owned allocations.
+The pointer/owner correspondence is unsafe; later use follows ordinary checked
+borrowing. Opaque container elements containing references or Results remain
+explicitly unsupported. Bind a returned mutable view to a local before assigning
+through its fields; chained assignment through a call can be rejected by the
+conservative temporary-loan checker.
+
 ## Diagnosing ownership errors
 
 Compiler errors label the conflicting operation, the original borrow or move,

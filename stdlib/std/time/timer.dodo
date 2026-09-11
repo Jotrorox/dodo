@@ -1,0 +1,50 @@
+package timer
+
+import "std/time"
+
+// Monomorphized timer capability: arm(Instant)->void!TimeError,
+// cancel()->bool, poll(&Instant)->bool!TimeError. One-shot semantics.
+pub fn arm<T>(timer: &mut T, deadline: time.Instant) -> void!time.TimeError {
+    return timer.arm(deadline)
+}
+pub fn cancel<T>(timer: &mut T) -> bool {
+    return timer.cancel()
+}
+pub fn poll<T>(timer: &mut T, current: &time.Instant) -> bool!time.TimeError {
+    return timer.poll(current)
+}
+
+pub struct FakeTimer {
+    identity: u64
+    deadline: time.Instant
+    armed: bool
+    pub fn new(clock_id: u64) -> FakeTimer {
+        return FakeTimer { identity: clock_id, deadline: time.Instant.new(clock_id, time.Duration.zero()), armed: false }
+    }
+    // Re-arming replaces the previous deadline. Wrong identity changes nothing.
+    pub fn arm(&mut self, deadline: time.Instant) -> void!time.TimeError {
+        if deadline.clock_id() != self.identity {
+            return err(time.TimeError.DifferentClock)
+        }
+        self.deadline = deadline
+        self.armed = true
+        return ok()
+    }
+    pub fn cancel(&mut self) -> bool {
+        old := self.armed
+        self.armed = false
+        return old
+    }
+    pub fn is_armed(&self) -> bool {
+        return self.armed
+    }
+    // A true result consumes readiness exactly once; later polls return false.
+    pub fn poll(&mut self, current: &time.Instant) -> bool!time.TimeError {
+        order := current.compare(&self.deadline)?
+        if self.armed && order >= 0 {
+            self.armed = false;
+            return ok(true)
+        }
+        return ok(false)
+    }
+}

@@ -1,0 +1,112 @@
+package ordered_map
+
+import "core/mem"
+import "alloc/error"
+import "std/collections/vector"
+
+pub struct Entry<K, V> {
+    pub key: K, pub value: V
+}
+
+// Sorted contiguous map: O(log n) lookups, O(n) insertion/removal, compact
+// ordered iteration. C.compare(&K,&K)->i32 supplies a total ordering.
+pub struct Map<K, V, C, A> {
+    entries: vector.Vector<Entry<K, V>, A>
+    ordering: C
+
+    pub fn len(&self) -> usize {
+        return self.entries.len()
+    }
+    pub fn capacity(&self) -> usize {
+        return self.entries.capacity()
+    }
+    pub fn entries(&self) -> &[Entry<K, V>] {
+        return self.entries.as_slice()
+    }
+    fn lower(&self, key: &K) -> usize {
+        left := 0usize
+        right := self.entries.len()
+        for left < right {
+            middle := left + (right - left) / 2
+            match self.entries.get(middle) {
+                some(entry) => {
+                    if self.ordering.compare(&entry.key, key) < 0 {
+                        left = middle + 1
+                    } else {
+                        right = middle
+                    }
+                },
+                none => {
+                    return left
+                },
+            }
+        }
+        return left
+    }
+    pub fn get(&self, key: &K) -> Option<&V> {
+        match self.entries.get(self.lower(key)) {
+            some(entry) => {
+                if self.ordering.compare(&entry.key, key) == 0 {
+                    return some(&entry.value)
+                }
+            },
+            none => {},
+        }
+        return none
+    }
+    pub fn contains(&self, key: &K) -> bool {
+        match self.get(key) {
+            some(_) => {
+                return true
+            }, none => {
+                return false
+            },
+        }
+    }
+    pub fn insert(&mut self, key: K, value: V) -> Option<V>!error.AllocError {
+        index := self.lower(&key)
+        found := false
+        match self.entries.get(index) {
+            some(entry) => {
+                found = self.ordering.compare(&entry.key, &key) == 0
+            }, none => {},
+        }
+        if found {
+            match self.entries.get_mut(index) {
+                some(entry) => {
+                    return ok(some(mem.replace(&mut entry.value, value)))
+                }, none => {},
+            }
+        }
+        self.entries.insert(index, Entry<K, V> { key: key, value: value })?
+        return ok(none)
+    }
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        index := self.lower(key)
+        found := false
+        match self.entries.get(index) {
+            some(entry) => {
+                found = self.ordering.compare(&entry.key, key) == 0
+            }, none => {},
+        }
+        if found {
+            match self.entries.remove(index) {
+                some(entry) => {
+                    let Entry<K, V> { key, value } = entry
+                    core.drop(key)
+                    return some(value)
+                }, none => {},
+            }
+        }
+        return none
+    }
+    pub fn clear(&mut self) {
+        self.entries.clear()
+    }
+}
+// SAFETY: allocator must satisfy vector.new's capability contract.
+pub unsafe fn new<K, V, C, A>(allocator: A, ordering: C) -> Map<K, V, C, A> from(allocator, ordering) {
+    unsafe {
+        return Map<K, V, C, A> { entries: vector.new::<Entry<K, V>, A>(allocator), ordering: ordering }
+    }
+}

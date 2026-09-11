@@ -1,0 +1,98 @@
+package shared_arena
+
+import "core/mem"
+import "core/ptr"
+import "alloc/layout"
+import "alloc/block"
+import "alloc/error"
+
+// Single-threaded caller-backed allocator. The cursor lives in an aligned,
+// reserved part of backing memory, never in storage exposed by a checked view.
+// Shared handles keep the arena AND its complete backing dependency alive.
+// This is not a synchronization primitive; OS/thread adapters must not share it
+// concurrently. No callback occurs while allocator metadata is being changed.
+pub struct SharedArena {
+    backing: &mut[u8]
+    pointer: *mut u8
+    cursor: *mut usize
+    start: usize
+
+    pub fn new(backing: &mut[u8]) -> SharedArena!error.AllocError from(backing) {
+        if backing.len > layout.max_size() {
+            return err(error.AllocError.SizeOverflow)
+        }
+        pointer := ptr.as_mut_ptr(backing)
+        unsafe {
+            align := mem.align_of::<usize>()
+            padding := (align - ((pointer as usize) & (align - 1))) & (align - 1)
+            if padding > backing.len || mem.size_of::<usize>() > backing.len - padding {
+                return err(error.AllocError.Exhausted)
+            }
+            start := padding + mem.size_of::<usize>()
+            cursor := ptr.offset(pointer, padding as isize) as *mut usize
+            ptr.write(cursor, start)
+            return ok(SharedArena { backing: backing, pointer: pointer, cursor: cursor, start: start })
+        }
+    }
+
+    pub fn handle(&self) -> Handle from(self) {
+        return Handle { owner: self }
+    }
+
+    pub fn capacity(&self) -> usize {
+        return self.backing.len - self.start
+    }
+    pub fn used(&self) -> usize {
+        unsafe {
+            return ptr.read(self.cursor) - self.start
+        }
+    }
+    pub fn remaining(&self) -> usize {
+        return self.capacity() - self.used()
+    }
+
+    // Exclusive self prevents any live checked handle or container from using
+    // reset. Raw Blocks/pointers still require the ordinary unsafe obligation.
+    pub unsafe fn reset(&mut self) {
+        unsafe {
+            ptr.write(self.cursor, self.start)
+        }
+    }
+}
+
+pub struct Handle {
+    owner: &SharedArena
+
+    pub fn clone(&self) -> Handle from(self) {
+        return Handle { owner: self.owner }
+    }
+
+    pub fn allocate(&self, requested: &layout.Layout) -> block.Block!error.AllocError {
+        unsafe {
+            if requested.size() == 0 {
+                return ok(block.Block.from_raw_parts(requested.align() as *mut u8, requested.clone()))
+            }
+            used := ptr.read(self.owner.cursor)
+            remainder := (self.owner.pointer as usize + used) & (requested.align() - 1)
+            padding := 0usize
+            if remainder != 0 {
+                padding = requested.align() - remainder
+            }
+            available := self.owner.backing.len - used
+            if padding > available || requested.size() > available - padding {
+                return err(error.AllocError.Exhausted)
+            }
+            start := used + padding
+            pointer := ptr.offset(self.owner.pointer, start as isize)
+            ptr.write(self.owner.cursor, start + requested.size())
+            return ok(block.Block.from_raw_parts(pointer, requested.clone()))
+        }
+    }
+
+    // SAFETY: block is a currently live descriptor from this arena, released at
+    // most once; its initialized values have been destroyed and views ended.
+    // Individual frees do not reclaim bump storage. Reset reclaims all storage.
+    pub unsafe fn deallocate(&self, allocated: block.Block) {
+        core.drop(allocated)
+    }
+}

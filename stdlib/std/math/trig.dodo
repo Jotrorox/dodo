@@ -1,0 +1,233 @@
+package trig
+
+import "std/math"
+
+// This independently imported module contains the optional 2/pi reduction
+// table (1,584 significant bits, stored in 66 u64 limbs by this implementation).
+// Digits from Sun fdlibm e_rem_pio2.c, https://www.netlib.org/fdlibm/.
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+// Developed at SunSoft, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this software is freely
+// granted, provided that this notice is preserved.
+//
+// Full-range Payne-Hanek reduction: multiply the exact 53-bit significand by
+// floor((2/pi)*2^1584), then extract the quadrant and 128 fractional bits.
+// The largest finite binary64 exponent leaves over 550 guard bits in the
+// constant. No integer cast of a huge angle and no inaccurate x % (2*pi).
+struct Reduced {
+    angle: f64, quadrant: u64
+}
+fn bit_at(product: &[u64], bit: usize) -> u64 {
+    return (product[bit / 24] >> ((bit % 24) as u64)) & 1
+}
+fn reduce(value: f64) -> Reduced {
+    if math.abs(value) <= math.PI * 0.25 {
+        return Reduced { angle: value, quadrant: 0 }
+    }
+    digits := [0xA2F983u64, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62,
+    0x95993C, 0x439041, 0xFE5163, 0xABDEBB, 0xC561B7, 0x246E3A,
+    0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129,
+    0xA73EE8, 0x8235F5, 0x2EBB44, 0x84E99C, 0x7026B4, 0x5F7E41,
+    0x3991D6, 0x398353, 0x39F49C, 0x845F8B, 0xBDF928, 0x3B1FF8,
+    0x97FFDE, 0x05980F, 0xEF2F11, 0x8B5A0A, 0x6D1F6D, 0x367ECF,
+    0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5,
+    0xF17B3D, 0x0739F7, 0x8A5292, 0xEA6BFB, 0x5FB11F, 0x8D5D08,
+    0x560330, 0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3,
+    0x91615E, 0xE61B08, 0x659985, 0x5F14A0, 0x68408D, 0xFFD880,
+    0x4D7327, 0x310606, 0x1556CA, 0x73A8C9, 0x60E27B, 0xC08C6B]
+    raw := math.to_bits(math.abs(value))
+    exponent := ((raw >> 52) as i32) - 1023
+    significand := (raw & 0x000fffffffffffff) | 0x0010000000000000
+    multiplier := [significand & 0xffffff, (significand >> 24) & 0xffffff, significand >> 48]
+    product := [0u64; 69]
+    for i in 0usize..66 {
+        for j in 0usize..3 {
+            product[i + j] = product[i + j] + digits[65 - i] * multiplier[j]
+        }
+    }
+    carry := 0u64
+    for i in 0usize..69 {
+        sum := product[i] + carry
+        product[i] = sum & 0xffffff
+        carry = sum >> 24
+    }
+    binary_point := (1636 - exponent) as usize
+    quadrant := bit_at(&product, binary_point) + 2 * bit_at(&product, binary_point + 1)
+    upward := bit_at(&product, binary_point - 1) != 0
+    fraction := 0.0
+    weight := 0.5
+    for i in 0usize..128 {
+        digit := bit_at(&product, binary_point - 1 - i)
+        if upward {
+            digit = 1 - digit
+        }
+        if digit != 0 {
+            fraction = fraction + weight
+        }
+        weight = weight * 0.5
+    }
+    if upward {
+        fraction = -fraction
+        quadrant = (quadrant + 1) & 3
+    }
+    angle := fraction * (math.PI * 0.5)
+    if math.sign_bit(value) {
+        angle = -angle;
+        quadrant = (4 - quadrant) & 3
+    }
+    return Reduced { angle: angle, quadrant: quadrant }
+}
+fn sin_kernel(value: f64) -> f64 {
+    term := value
+    sum := value
+    square := -value * value
+    for i in 1usize..10 {
+        term = term * square / ((2 * i * (2 * i + 1)) as f64)
+        sum = sum + term
+    }
+    return sum
+}
+fn cos_kernel(value: f64) -> f64 {
+    term := 1.0
+    sum := 1.0
+    square := -value * value
+    for i in 1usize..10 {
+        term = term * square / ((2 * i * (2 * i - 1)) as f64)
+        sum = sum + term
+    }
+    return sum
+}
+pub fn sin(value: f64) -> Result<f64, math.MathError> {
+    if math.is_nan(value) || value == 0.0 {
+        return ok(value)
+    }
+    if math.is_infinite(value) {
+        return err(math.MathError.Domain)
+    }
+    reduced := reduce(value)
+    if reduced.quadrant == 0 {
+        return ok(sin_kernel(reduced.angle))
+    }
+    if reduced.quadrant == 1 {
+        return ok(cos_kernel(reduced.angle))
+    }
+    if reduced.quadrant == 2 {
+        return ok(-sin_kernel(reduced.angle))
+    }
+    return ok(-cos_kernel(reduced.angle))
+}
+pub fn cos(value: f64) -> Result<f64, math.MathError> {
+    if math.is_nan(value) {
+        return ok(value)
+    }
+    if math.is_infinite(value) {
+        return err(math.MathError.Domain)
+    }
+    reduced := reduce(value)
+    if reduced.quadrant == 0 {
+        return ok(cos_kernel(reduced.angle))
+    }
+    if reduced.quadrant == 1 {
+        return ok(-sin_kernel(reduced.angle))
+    }
+    if reduced.quadrant == 2 {
+        return ok(-cos_kernel(reduced.angle))
+    }
+    return ok(sin_kernel(reduced.angle))
+}
+pub fn tan(value: f64) -> Result<f64, math.MathError> {
+    if math.is_nan(value) || value == 0.0 {
+        return ok(value)
+    }
+    if math.is_infinite(value) {
+        return err(math.MathError.Domain)
+    }
+    reduced := reduce(value)
+    sine := sin_kernel(reduced.angle)
+    cosine := cos_kernel(reduced.angle)
+    result := sine / cosine
+    if (reduced.quadrant & 1) != 0 {
+        result = -cosine / sine
+    }
+    if math.is_infinite(result) {
+        return err(math.MathError.Overflow)
+    }
+    return ok(result)
+}
+// Atan reduction: reciprocal above 1; pi/4 transform above tan(pi/8).
+// The alternating series then has |argument| <= sqrt(2)-1.
+pub fn atan(value: f64) -> f64 {
+    if math.is_nan(value) || value == 0.0 {
+        return value
+    }
+    argument := math.abs(value)
+    reciprocal := argument > 1.0
+    if reciprocal {
+        argument = 1.0 / argument
+    }
+    offset := 0.0
+    if argument > 0.41421356237309504880 {
+        argument = (argument - 1.0) / (argument + 1.0)
+        offset = math.PI * 0.25
+    }
+    term := argument
+    sum := argument
+    square := -argument * argument
+    for i in 1usize..24 {
+        term = term * square;
+        sum = sum + term / ((2 * i + 1) as f64)
+    }
+    result := offset + sum
+    if reciprocal {
+        result = math.PI * 0.5 - result
+    }
+    return math.copy_sign(result, value)
+}
+pub fn atan2(y: f64, x: f64) -> f64 {
+    if math.is_nan(x) || math.is_nan(y) {
+        return math.nan()
+    }
+    if y == 0.0 {
+        if math.sign_bit(x) {
+            return math.copy_sign(math.PI, y)
+        }
+        return y
+    }
+    if x == 0.0 {
+        return math.copy_sign(math.PI * 0.5, y)
+    }
+    if math.is_infinite(y) {
+        if math.is_infinite(x) {
+            if math.sign_bit(x) {
+                return math.copy_sign(math.PI * 0.75, y)
+            }
+            return math.copy_sign(math.PI * 0.25, y)
+        }
+        return math.copy_sign(math.PI * 0.5, y)
+    }
+    angle := atan(math.abs(y) / math.abs(x))
+    if math.sign_bit(x) {
+        angle = math.PI - angle
+    }
+    return math.copy_sign(angle, y)
+}
+pub fn asin(value: f64) -> Result<f64, math.MathError> {
+    if math.is_nan(value) || value == 0.0 {
+        return ok(value)
+    }
+    if math.abs(value) > 1.0 {
+        return err(math.MathError.Domain)
+    }
+    root := math.sqrt((1.0 - math.abs(value)) * (1.0 + math.abs(value)))?
+    return ok(atan2(value, root))
+}
+pub fn acos(value: f64) -> Result<f64, math.MathError> {
+    if math.is_nan(value) {
+        return ok(value)
+    }
+    if math.abs(value) > 1.0 {
+        return err(math.MathError.Domain)
+    }
+    root := math.sqrt((1.0 - math.abs(value)) * (1.0 + math.abs(value)))?
+    return ok(atan2(root, value))
+}

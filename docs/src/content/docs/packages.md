@@ -38,8 +38,8 @@ calls with compiler lowering, not user-definable macros. See [memory and foreign
 for the supported intrinsic signatures.
 
 The compiler also embeds the Dodo source packages listed in
-[core and allocation](standard-library.md). Imports beginning with `core/` or
-`alloc/` always resolve from this bundled library, independent of the current
+[the portable standard library](standard-library.md). Imports beginning with
+`core/`, `alloc/`, or `std/` always resolve from this bundled library, independent of the current
 directory; local files cannot shadow them. Unknown standard imports are errors.
 Only the imported packages and their dependencies are loaded.
 

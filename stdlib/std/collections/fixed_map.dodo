@@ -1,0 +1,104 @@
+package fixed_map
+
+import "core/mem"
+import "std/collections"
+import "std/collections/fixed_vector"
+
+pub struct Entry<K, V> {
+    pub key: K
+    pub value: V
+}
+
+// Bounded insertion-ordered linear map. E.equal(&K,&K) supplies equality.
+pub struct Map<K, V, E> {
+    entries: fixed_vector.Vector<Entry<K, V>>
+    equality: E
+
+    pub fn new(slots: &mut[Option<Entry<K, V>>], equality: E) -> Map<K, V, E> from(slots, equality) {
+        return Map<K, V, E> { entries: fixed_vector.Vector.new::<Entry<K, V>>(slots), equality: equality }
+    }
+    pub fn len(&self) -> usize {
+        return self.entries.len()
+    }
+    pub fn capacity(&self) -> usize {
+        return self.entries.capacity()
+    }
+    pub fn entry(&self, index: usize) -> Option<&Entry<K, V>> {
+        return self.entries.get(index)
+    }
+    fn find(&self, key: &K) -> Option<usize> {
+        for i in 0usize..self.entries.len() {
+            match self.entries.get(i) {
+                some(entry) => {
+                    if self.equality.equal(&entry.key, key) {
+                        return some(i)
+                    }
+                },
+                none => {},
+            }
+        }
+        return none
+    }
+    pub fn contains(&self, key: &K) -> bool {
+        match self.find(key) {
+            some(_) => {
+                return true
+            }, none => {
+                return false
+            },
+        }
+    }
+    pub fn get(&self, key: &K) -> Option<&V> {
+        match self.find(key) {
+            some(i) => {
+                match self.entries.get(i) {
+                    some(entry) => {
+                        return some(&entry.value)
+                    }, none => {
+                        return none
+                    },
+                }
+            },
+            none => {
+                return none
+            },
+        }
+    }
+    // Equal keys replace only the value; retain original key and position.
+    pub fn insert(&mut self, key: K, value: V) -> Option<V>!collections.CapacityError {
+        match self.find(&key) {
+            some(i) => {
+                match self.entries.get_mut(i) {
+                    some(entry) => {
+                        return ok(some(mem.replace(&mut entry.value, value)))
+                    },
+                    none => {},
+                }
+            },
+            none => {},
+        }
+        self.entries.push(Entry<K, V> { key: key, value: value })?
+        return ok(none)
+    }
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        match self.find(key) {
+            some(i) => {
+                match self.entries.remove(i) {
+                    some(entry) => {
+                        let Entry<K, V> { key, value } = entry
+                        core.drop(key)
+                        return some(value)
+                    }, none => {
+                        return none
+                    },
+                }
+            },
+            none => {
+                return none
+            },
+        }
+    }
+    pub fn clear(&mut self) {
+        self.entries.clear()
+    }
+}

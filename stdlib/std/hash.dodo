@@ -1,0 +1,235 @@
+package hash
+
+// Stable byte-oriented FNV-1a-64 and SipHash-2-4. No native-layout hashing.
+const MAX: u64 = ~0u64
+fn add(a: u64, b: u64) -> u64 {
+    if b > MAX - a {
+        return b - (MAX - a) - 1
+    }
+    return a + b
+}
+fn shift(a: u64, n: u64) -> u64 {
+    return (a & (MAX >> n)) << n
+}
+fn rotate(a: u64, n: u64) -> u64 {
+    return shift(a, n) | (a >> (64 - n))
+}
+fn prime(a: u64) -> u64 {
+    return add(add(add(add(add(add(a, shift(a, 1)), shift(a, 4)), shift(a, 5)), shift(a, 7)), shift(a, 8)), shift(a, 40))
+}
+
+// Entropy acquisition belongs to the caller's source. No global or fallback key.
+pub enum KeyError {
+    Unavailable
+}
+pub struct Key128 {
+    k0: u64
+    k1: u64
+    pub fn new(k0: u64, k1: u64) -> Key128 {
+        return Key128 { k0: k0, k1: k1 }
+    }
+    pub fn word0(&self) -> u64 {
+        return self.k0
+    }
+    pub fn word1(&self) -> u64 {
+        return self.k1
+    }
+    pub fn hasher(&self) -> SipHash24 {
+        return SipHash24.new(self.k0, self.k1)
+    }
+    pub fn u64_policy(&self) -> SipU64 {
+        return SipU64.new(self.k0, self.k1)
+    }
+    pub fn i32_policy(&self) -> SipI32 {
+        return SipI32.new(self.k0, self.k1)
+    }
+}
+// Static capability S.next_key(&mut self)->Key128!KeyError. The source is
+// responsible for key quality. Errors propagate unchanged, without retry or
+// substituting a predictable key. Successful calls consume one source request.
+pub fn obtain_key<S>(source: &mut S) -> Key128!KeyError {
+    return source.next_key()
+}
+
+pub struct Fnv1a64 {
+    state: u64
+    initial: u64
+    pub fn new() -> Fnv1a64 {
+        return Fnv1a64.seeded(14695981039346656037u64)
+    }
+    // The seed replaces the offset basis; it is not an entropy/security key.
+    pub fn seeded(seed: u64) -> Fnv1a64 {
+        return Fnv1a64 { state: seed, initial: seed }
+    }
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.state = prime(self.state ^ (byte as u64))
+        }
+    }
+    pub fn finish(&self) -> u64 {
+        return self.state
+    }
+    pub fn reset(&mut self) {
+        self.state = self.initial
+    }
+}
+
+// Bernstein/Aumasson SipHash-2-4: 128-bit explicit key, 64-bit output.
+// Key words represent bytes 0..7 and 8..15 in little-endian order.
+pub struct SipHash24 {
+    key0: u64
+    key1: u64
+    v0: u64
+    v1: u64
+    v2: u64
+    v3: u64
+    tail: u64
+    count: u64
+    length: u64
+
+    pub fn new(k0: u64, k1: u64) -> SipHash24 {
+        return SipHash24 { key0: k0, key1: k1,
+        v0: k0 ^ 0x736f6d6570736575u64, v1: k1 ^ 0x646f72616e646f6du64,
+        v2: k0 ^ 0x6c7967656e657261u64, v3: k1 ^ 0x7465646279746573u64,
+        tail: 0, count: 0, length: 0 }
+    }
+    fn round(&mut self) {
+        self.v0 = add(self.v0, self.v1)
+        self.v1 = rotate(self.v1, 13) ^ self.v0
+        self.v0 = rotate(self.v0, 32)
+        self.v2 = add(self.v2, self.v3)
+        self.v3 = rotate(self.v3, 16) ^ self.v2
+        self.v0 = add(self.v0, self.v3)
+        self.v3 = rotate(self.v3, 21) ^ self.v0
+        self.v2 = add(self.v2, self.v1)
+        self.v1 = rotate(self.v1, 17) ^ self.v2
+        self.v2 = rotate(self.v2, 32)
+    }
+    fn block(&mut self, value: u64) {
+        self.v3 = self.v3 ^ value
+        self.round()
+        self.round()
+        self.v0 = self.v0 ^ value
+    }
+    pub fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.tail = self.tail | ((byte as u64) << (self.count * 8))
+            self.count = self.count + 1
+            self.length = (self.length + 1) & 255
+            if self.count == 8 {
+                word := self.tail
+                self.block(word)
+                self.tail = 0
+                self.count = 0
+            }
+        }
+    }
+    // Snapshot finalization: repeatable and does not consume/reset the stream.
+    pub fn finish(&self) -> u64 {
+        copy := SipHash24 { key0: self.key0, key1: self.key1,
+        v0: self.v0, v1: self.v1, v2: self.v2, v3: self.v3,
+        tail: self.tail, count: self.count, length: self.length }
+        copy.block(self.tail | (self.length << 56))
+        copy.v2 = copy.v2 ^ 255
+        for i in 0..4 {
+            copy.round()
+        }
+        return copy.v0 ^ copy.v1 ^ copy.v2 ^ copy.v3
+    }
+    pub fn reset(&mut self) {
+        self.v0 = self.key0 ^ 0x736f6d6570736575u64
+        self.v1 = self.key1 ^ 0x646f72616e646f6du64
+        self.v2 = self.key0 ^ 0x6c7967656e657261u64
+        self.v3 = self.key1 ^ 0x7465646279746573u64
+        self.tail = 0
+        self.count = 0
+        self.length = 0
+    }
+}
+
+pub fn fnv1a64(data: &[u8]) -> u64 {
+    state := Fnv1a64.new()
+    state.update(data)
+    return state.finish()
+}
+pub fn siphash24(data: &[u8], k0: u64, k1: u64) -> u64 {
+    state := SipHash24.new(k0, k1)
+    state.update(data)
+    return state.finish()
+}
+// Monomorphized contract: H.update(&mut self, &[u8]); H.finish(&self)->u64.
+// Prefix variable-size fields with lengths to distinguish composite encodings.
+pub fn write_u64<H>(state: &mut H, value: u64) {
+    bytes := [0u8; 8]
+    for i in 0usize..8 {
+        bytes[i] = ((value >> ((i as u64) * 8)) & 255) as u8
+    }
+    state.update(&bytes)
+}
+pub fn write_i32<H>(state: &mut H, value: i32) {
+    bits := 0u64
+    if value < 0 {
+        bits = 4294967295u64 - ((-(value + 1)) as u64)
+    } else {
+        bits = value as u64
+    }
+    bytes := [0u8; 4]
+    for i in 0usize..4 {
+        bytes[i] = ((bits >> ((i as u64) * 8)) & 255) as u8
+    }
+    state.update(&bytes)
+}
+pub fn write_bytes<H>(state: &mut H, data: &[u8]) {
+    write_u64(state, data.len as u64)
+    state.update(data)
+}
+pub struct U64 {
+    pub fn hash(&self, key: &u64) -> u64 {
+        state := Fnv1a64.new()
+        write_u64(&mut state, *key)
+        return state.finish()
+    }
+    pub fn equal(&self, a: &u64, b: &u64) -> bool {
+        return *a == *b
+    }
+}
+pub struct I32 {
+    pub fn hash(&self, key: &i32) -> u64 {
+        state := Fnv1a64.new()
+        write_i32(&mut state, *key)
+        return state.finish()
+    }
+    pub fn equal(&self, a: &i32, b: &i32) -> bool {
+        return *a == *b
+    }
+}
+pub struct SipU64 {
+    k0: u64
+    k1: u64
+    pub fn new(k0: u64, k1: u64) -> SipU64 {
+        return SipU64 { k0: k0, k1: k1 }
+    }
+    pub fn hash(&self, key: &u64) -> u64 {
+        state := SipHash24.new(self.k0, self.k1)
+        write_u64(&mut state, *key)
+        return state.finish()
+    }
+    pub fn equal(&self, a: &u64, b: &u64) -> bool {
+        return *a == *b
+    }
+}
+pub struct SipI32 {
+    k0: u64
+    k1: u64
+    pub fn new(k0: u64, k1: u64) -> SipI32 {
+        return SipI32 { k0: k0, k1: k1 }
+    }
+    pub fn hash(&self, key: &i32) -> u64 {
+        state := SipHash24.new(self.k0, self.k1)
+        write_i32(&mut state, *key)
+        return state.finish()
+    }
+    pub fn equal(&self, a: &i32, b: &i32) -> bool {
+        return *a == *b
+    }
+}

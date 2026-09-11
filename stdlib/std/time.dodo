@@ -1,0 +1,557 @@
+package time
+
+pub const NANOS_PER_SECOND: u64 = 1000000000
+const UMAX: u64 = ~0u64
+const IMAX: i64 = 9223372036854775807
+const IMIN: i64 = -9223372036854775807 - 1
+const SIGN: u64 = 9223372036854775808u64
+pub enum TimeError {
+    Overflow, InvalidComponent, Before, DifferentClock, ClockFailure
+}
+
+fn add_u(a: u64, b: u64) -> u64!TimeError {
+    if b > UMAX - a {
+        return err(TimeError.Overflow)
+    }
+    return ok(a + b)
+}
+fn add_positive(a: i64, b: u64) -> i64!TimeError {
+    if a >= 0 {
+        if b > (IMAX - a) as u64 {
+            return err(TimeError.Overflow)
+        }
+        return ok(a + (b as i64))
+    }
+    magnitude := ((-(a + 1)) as u64) + 1
+    if b >= magnitude {
+        positive := b - magnitude
+        if positive > IMAX as u64 {
+            return err(TimeError.Overflow)
+        }
+        return ok(positive as i64)
+    }
+    negative := magnitude - b
+    if negative == SIGN {
+        return ok(IMIN)
+    }
+    return ok(-(negative as i64))
+}
+fn sub_positive(a: i64, b: u64) -> i64!TimeError {
+    if a > 0 {
+        if b <= a as u64 {
+            return ok(a - (b as i64))
+        }
+        magnitude := b - (a as u64)
+        if magnitude > SIGN {
+            return err(TimeError.Overflow)
+        }
+        if magnitude == SIGN {
+            return ok(IMIN)
+        }
+        return ok(-(magnitude as i64))
+    }
+    magnitude := 0u64
+    if a < 0 {
+        magnitude = ((-(a + 1)) as u64) + 1
+    }
+    if b > SIGN - magnitude {
+        return err(TimeError.Overflow)
+    }
+    magnitude = magnitude + b
+    if magnitude == SIGN {
+        return ok(IMIN)
+    }
+    return ok(-(magnitude as i64))
+}
+fn signed_add(a: i64, b: i64) -> i64!TimeError {
+    if b >= 0 {
+        return add_positive(a, b as u64)
+    }
+    return sub_positive(a, ((-(b + 1)) as u64) + 1)
+}
+
+// Nonnegative, normalized, exact nanosecond duration; no implicit rounding.
+pub struct Duration {
+    secs: u64
+    nanos: u32
+    pub fn new(seconds: u64, nanoseconds: u64) -> Duration!TimeError {
+        normalized := add_u(seconds, nanoseconds / NANOS_PER_SECOND)?
+        return ok(Duration { secs: normalized, nanos: (nanoseconds % NANOS_PER_SECOND) as u32 })
+    }
+    pub fn zero() -> Duration {
+        return Duration { secs: 0, nanos: 0 }
+    }
+    pub fn from_seconds(value: u64) -> Duration {
+        return Duration { secs: value, nanos: 0 }
+    }
+    pub fn from_millis(value: u64) -> Duration {
+        return Duration { secs: value / 1000, nanos: ((value % 1000) * 1000000) as u32 }
+    }
+    pub fn from_micros(value: u64) -> Duration {
+        return Duration { secs: value / 1000000, nanos: ((value % 1000000) * 1000) as u32 }
+    }
+    pub fn from_nanos(value: u64) -> Duration {
+        return Duration { secs: value / NANOS_PER_SECOND, nanos: (value % NANOS_PER_SECOND) as u32 }
+    }
+    pub fn seconds(&self) -> u64 {
+        return self.secs
+    }
+    pub fn subsec_nanos(&self) -> u32 {
+        return self.nanos
+    }
+    pub fn clone(&self) -> Duration {
+        return Duration { secs: self.secs, nanos: self.nanos }
+    }
+    pub fn is_zero(&self) -> bool {
+        return self.secs == 0 && self.nanos == 0
+    }
+    pub fn compare(&self, other: &Duration) -> i32 {
+        if self.secs < other.secs || (self.secs == other.secs && self.nanos < other.nanos) {
+            return -1
+        }
+        if self.secs == other.secs && self.nanos == other.nanos {
+            return 0
+        }
+        return 1
+    }
+    pub fn checked_add(&self, other: &Duration) -> Duration!TimeError {
+        secs := add_u(self.secs, other.secs)?
+        return Duration.new(secs, (self.nanos as u64) + (other.nanos as u64))
+    }
+    pub fn checked_sub(&self, other: &Duration) -> Duration!TimeError {
+        if self.compare(other) < 0 {
+            return err(TimeError.Before)
+        }
+        secs := self.secs - other.secs
+        nanos := (self.nanos as u64) + NANOS_PER_SECOND - (other.nanos as u64)
+        if self.nanos < other.nanos {
+            secs = secs - 1
+        } else {
+            nanos = nanos - NANOS_PER_SECOND
+        }
+        return ok(Duration { secs: secs, nanos: nanos as u32 })
+    }
+    pub fn checked_mul(&self, factor: u32) -> Duration!TimeError {
+        if factor != 0 && self.secs > UMAX / (factor as u64) {
+            return err(TimeError.Overflow)
+        }
+        return Duration.new(self.secs * (factor as u64), (self.nanos as u64) * (factor as u64))
+    }
+    // Integer division discards fractional nanoseconds toward zero.
+    pub fn checked_div(&self, divisor: u32) -> Duration!TimeError {
+        if divisor == 0 {
+            return err(TimeError.InvalidComponent)
+        }
+        d := divisor as u64
+        fraction := ((self.secs % d) * NANOS_PER_SECOND + (self.nanos as u64)) / d
+        return Duration.new(self.secs / d, fraction)
+    }
+    fn units(&self, per_second: u64, divisor: u64) -> u64!TimeError {
+        if self.secs > UMAX / per_second {
+            return err(TimeError.Overflow)
+        }
+        return add_u(self.secs * per_second, (self.nanos as u64) / divisor)
+    }
+    pub fn to_nanos(&self) -> u64!TimeError {
+        return self.units(NANOS_PER_SECOND, 1)
+    }
+    pub fn to_micros(&self) -> u64!TimeError {
+        return self.units(1000000, 1000)
+    }
+    pub fn to_millis(&self) -> u64!TimeError {
+        return self.units(1000, 1000000)
+    }
+}
+
+// POSIX timestamp: seconds floor toward -infinity, fraction always nonnegative.
+pub struct Timestamp {
+    secs: i64
+    nanos: u32
+    pub fn new(seconds: i64, nanoseconds: u32) -> Timestamp!TimeError {
+        if nanoseconds >= 1000000000 {
+            return err(TimeError.InvalidComponent)
+        }
+        return ok(Timestamp { secs: seconds, nanos: nanoseconds })
+    }
+    pub fn epoch() -> Timestamp {
+        return Timestamp { secs: 0, nanos: 0 }
+    }
+    pub fn from_unix_seconds(value: i64) -> Timestamp {
+        return Timestamp { secs: value, nanos: 0 }
+    }
+    pub fn from_unix_nanos(value: i64) -> Timestamp {
+        secs := value / 1000000000
+        remainder := value % 1000000000
+        if remainder < 0 {
+            secs = secs - 1;
+            remainder = remainder + 1000000000
+        }
+        return Timestamp { secs: secs, nanos: remainder as u32 }
+    }
+    pub fn seconds(&self) -> i64 {
+        return self.secs
+    }
+    pub fn subsec_nanos(&self) -> u32 {
+        return self.nanos
+    }
+    pub fn clone(&self) -> Timestamp {
+        return Timestamp { secs: self.secs, nanos: self.nanos }
+    }
+    pub fn compare(&self, other: &Timestamp) -> i32 {
+        if self.secs < other.secs || (self.secs == other.secs && self.nanos < other.nanos) {
+            return -1
+        }
+        if self.secs == other.secs && self.nanos == other.nanos {
+            return 0
+        }
+        return 1
+    }
+    pub fn checked_add(&self, duration: &Duration) -> Timestamp!TimeError {
+        secs := add_positive(self.secs, duration.secs)?
+        nanos := (self.nanos as u64) + (duration.nanos as u64)
+        if nanos >= NANOS_PER_SECOND {
+            secs = add_positive(secs, 1)?;
+            nanos = nanos - NANOS_PER_SECOND
+        }
+        return ok(Timestamp { secs: secs, nanos: nanos as u32 })
+    }
+    pub fn checked_sub(&self, duration: &Duration) -> Timestamp!TimeError {
+        secs := sub_positive(self.secs, duration.secs)?
+        nanos := (self.nanos as u64) + NANOS_PER_SECOND - (duration.nanos as u64)
+        if self.nanos < duration.nanos {
+            secs = sub_positive(secs, 1)?
+        } else {
+            nanos = nanos - NANOS_PER_SECOND
+        }
+        return ok(Timestamp { secs: secs, nanos: nanos as u32 })
+    }
+    pub fn duration_since(&self, earlier: &Timestamp) -> Duration!TimeError {
+        if self.compare(earlier) < 0 {
+            return err(TimeError.Before)
+        }
+        secs := 0u64
+        if earlier.secs < 0 && self.secs >= 0 {
+            secs = (self.secs as u64) + ((-(earlier.secs + 1)) as u64) + 1
+        } else {
+            secs = (self.secs - earlier.secs) as u64
+        }
+        nanos := (self.nanos as u64) + NANOS_PER_SECOND - (earlier.nanos as u64)
+        if self.nanos < earlier.nanos {
+            secs = secs - 1
+        } else {
+            nanos = nanos - NANOS_PER_SECOND
+        }
+        return ok(Duration { secs: secs, nanos: nanos as u32 })
+    }
+    pub fn to_unix_nanos(&self) -> i64!TimeError {
+        // Avoid rejecting the lower endpoint merely because the floored second
+        // itself is below the nanosecond range.
+        if self.secs < -9223372037 || self.secs > 9223372036 {
+            return err(TimeError.Overflow)
+        }
+        if self.secs == -9223372037 {
+            if self.nanos < 145224192 {
+                return err(TimeError.Overflow)
+            }
+            return ok(IMIN + ((self.nanos - 145224192) as i64))
+        }
+        return add_positive(self.secs * 1000000000, self.nanos as u64)
+    }
+}
+
+pub fn is_leap_year(year: i32) -> bool {
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+pub fn days_in_month(year: i32, month: u32) -> u32!TimeError {
+    if year < 0 || year > 9999 || month < 1 || month > 12 {
+        return err(TimeError.InvalidComponent)
+    }
+    if month == 2 {
+        if is_leap_year(year) {
+            return ok(29)
+        }
+        return ok(28)
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        return ok(30)
+    }
+    return ok(31)
+}
+
+// Proleptic Gregorian calendar, astronomical years 0000..9999.
+// Era decomposition follows Howard Hinnant's civil date algorithms (see docs).
+pub struct Date {
+    y: i32
+    m: u32
+    d: u32
+    pub fn new(year: i32, month: u32, day: u32) -> Date!TimeError {
+        last := days_in_month(year, month)?
+        if day < 1 || day > last {
+            return err(TimeError.InvalidComponent)
+        }
+        return ok(Date { y: year, m: month, d: day })
+    }
+    pub fn year(&self) -> i32 {
+        return self.y
+    }
+    pub fn month(&self) -> u32 {
+        return self.m
+    }
+    pub fn day(&self) -> u32 {
+        return self.d
+    }
+    pub fn clone(&self) -> Date {
+        return Date { y: self.y, m: self.m, d: self.d }
+    }
+    pub fn days_since_epoch(&self) -> i64 {
+        y := self.y as i64
+        if self.m <= 2 {
+            y = y - 1
+        }
+        era := y / 400
+        if y < 0 {
+            era = (y - 399) / 400
+        }
+        yoe := y - era * 400
+        month := (self.m as i64) - 3
+        if self.m <= 2 {
+            month = (self.m as i64) + 9
+        }
+        doy := (153 * month + 2) / 5 + (self.d as i64) - 1
+        return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
+    }
+    pub fn from_days_since_epoch(days: i64) -> Date!TimeError {
+        if days < -719528 || days > 2932896 {
+            return err(TimeError.Overflow)
+        }
+        z := days + 719468
+        era := z / 146097
+        if z < 0 {
+            era = (z - 146096) / 146097
+        }
+        doe := z - era * 146097
+        yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+        y := yoe + era * 400
+        doy := doe - (365 * yoe + yoe / 4 - yoe / 100)
+        mp := (5 * doy + 2) / 153
+        d := doy - (153 * mp + 2) / 5 + 1
+        m := mp + 3
+        if mp >= 10 {
+            m = mp - 9
+        }
+        if m <= 2 {
+            y = y + 1
+        }
+        return ok(Date { y: y as i32, m: m as u32, d: d as u32 })
+    }
+    // ISO weekday numbering: Monday=1 through Sunday=7.
+    pub fn weekday(&self) -> u32 {
+        day := (self.days_since_epoch() + 3) % 7
+        if day < 0 {
+            day = day + 7
+        }
+        return (day + 1) as u32
+    }
+    pub fn checked_add_days(&self, days: i64) -> Date!TimeError {
+        target := signed_add(self.days_since_epoch(), days)?
+        return Date.from_days_since_epoch(target)
+    }
+    pub fn days_since(&self, earlier: &Date) -> i64 {
+        return self.days_since_epoch() - earlier.days_since_epoch()
+    }
+    pub fn compare(&self, other: &Date) -> i32 {
+        a := self.days_since_epoch()
+        b := other.days_since_epoch()
+        if a < b {
+            return -1
+        }
+        if a > b {
+            return 1
+        }
+        return 0
+    }
+}
+
+pub struct TimeOfDay {
+    h: u32
+    m: u32
+    s: u32
+    nanos: u32
+    pub fn new(hour: u32, minute: u32, second: u32, nanoseconds: u32) -> TimeOfDay!TimeError {
+        if hour >= 24 || minute >= 60 || second >= 60 || nanoseconds >= 1000000000 {
+            return err(TimeError.InvalidComponent)
+        }
+        return ok(TimeOfDay { h: hour, m: minute, s: second, nanos: nanoseconds })
+    }
+    pub fn midnight() -> TimeOfDay {
+        return TimeOfDay { h: 0, m: 0, s: 0, nanos: 0 }
+    }
+    pub fn hour(&self) -> u32 {
+        return self.h
+    }
+    pub fn minute(&self) -> u32 {
+        return self.m
+    }
+    pub fn second(&self) -> u32 {
+        return self.s
+    }
+    pub fn subsec_nanos(&self) -> u32 {
+        return self.nanos
+    }
+    pub fn seconds_since_midnight(&self) -> u32 {
+        return self.h * 3600 + self.m * 60 + self.s
+    }
+    pub fn clone(&self) -> TimeOfDay {
+        return TimeOfDay { h: self.h, m: self.m, s: self.s, nanos: self.nanos }
+    }
+    pub fn from_seconds_since_midnight(seconds: u32, nanoseconds: u32) -> TimeOfDay!TimeError {
+        if seconds >= 86400 {
+            return err(TimeError.InvalidComponent)
+        }
+        return TimeOfDay.new(seconds / 3600, (seconds % 3600) / 60, seconds % 60, nanoseconds)
+    }
+    pub fn since_midnight(&self) -> Duration {
+        return Duration { secs: self.seconds_since_midnight() as u64, nanos: self.nanos }
+    }
+    pub fn from_duration(value: &Duration) -> TimeOfDay!TimeError {
+        if value.secs >= 86400 {
+            return err(TimeError.InvalidComponent)
+        }
+        return TimeOfDay.from_seconds_since_midnight(value.secs as u32, value.nanos)
+    }
+    // Preserve crossed days explicitly rather than silently wrapping the time.
+    pub fn checked_add(&self, duration: &Duration) -> TimeShift!TimeError {
+        days := (duration.secs / 86400) as i64
+        seconds := (self.seconds_since_midnight() as u64) + duration.secs % 86400
+        nanos := (self.nanos as u64) + (duration.nanos as u64)
+        if nanos >= NANOS_PER_SECOND {
+            nanos = nanos - NANOS_PER_SECOND;
+            seconds = seconds + 1
+        }
+        if seconds >= 86400 {
+            days = days + 1;
+            seconds = seconds - 86400
+        }
+        value := TimeOfDay.from_seconds_since_midnight(seconds as u32, nanos as u32)?
+        return ok(TimeShift { days: days, clock: value })
+    }
+    pub fn checked_sub(&self, duration: &Duration) -> TimeShift!TimeError {
+        days := -((duration.secs / 86400) as i64)
+        seconds := (self.seconds_since_midnight() as i64) - ((duration.secs % 86400) as i64)
+        nanos := (self.nanos as i64) - (duration.nanos as i64)
+        if nanos < 0 {
+            nanos = nanos + 1000000000;
+            seconds = seconds - 1
+        }
+        if seconds < 0 {
+            days = days - 1;
+            seconds = seconds + 86400
+        }
+        value := TimeOfDay.from_seconds_since_midnight(seconds as u32, nanos as u32)?
+        return ok(TimeShift { days: days, clock: value })
+    }
+    pub fn compare(&self, other: &TimeOfDay) -> i32 {
+        a := self.seconds_since_midnight()
+        b := other.seconds_since_midnight()
+        if a < b || (a == b && self.nanos < other.nanos) {
+            return -1
+        }
+        if a == b && self.nanos == other.nanos {
+            return 0
+        }
+        return 1
+    }
+}
+
+pub struct TimeShift {
+    days: i64
+    clock: TimeOfDay
+    pub fn day_offset(&self) -> i64 {
+        return self.days
+    }
+    pub fn time_of_day(&self) -> &TimeOfDay {
+        return &self.clock
+    }
+}
+
+// A UTC calendar value. No implicit local offset or timezone lookup.
+pub struct DateTime {
+    date_value: Date
+    time_value: TimeOfDay
+    pub fn new(date: Date, clock: TimeOfDay) -> DateTime {
+        return DateTime { date_value: date, time_value: clock }
+    }
+    pub fn date(&self) -> &Date {
+        return &self.date_value
+    }
+    pub fn time_of_day(&self) -> &TimeOfDay {
+        return &self.time_value
+    }
+    pub fn to_timestamp(&self) -> Timestamp {
+        return Timestamp { secs: self.date_value.days_since_epoch() * 86400 + (self.time_value.seconds_since_midnight() as i64), nanos: self.time_value.nanos }
+    }
+    pub fn checked_add(&self, duration: &Duration) -> DateTime!TimeError {
+        current := self.to_timestamp()
+        next := current.checked_add(duration)?
+        return DateTime.from_timestamp(&next)
+    }
+    pub fn checked_sub(&self, duration: &Duration) -> DateTime!TimeError {
+        current := self.to_timestamp()
+        next := current.checked_sub(duration)?
+        return DateTime.from_timestamp(&next)
+    }
+    pub fn duration_since(&self, earlier: &DateTime) -> Duration!TimeError {
+        current := self.to_timestamp()
+        previous := earlier.to_timestamp()
+        return current.duration_since(&previous)
+    }
+    pub fn from_timestamp(value: &Timestamp) -> DateTime!TimeError {
+        days := value.secs / 86400
+        second := value.secs % 86400
+        if second < 0 {
+            days = days - 1;
+            second = second + 86400
+        }
+        date := Date.from_days_since_epoch(days)?
+        clock := TimeOfDay.from_seconds_since_midnight(second as u32, value.nanos)?
+        return ok(DateTime { date_value: date, time_value: clock })
+    }
+}
+
+// Clock-relative ticks. Distinct clock identities are never comparable.
+pub struct Instant {
+    identity: u64
+    ticks: Duration
+    pub fn new(clock_id: u64, ticks: Duration) -> Instant {
+        return Instant { identity: clock_id, ticks: ticks }
+    }
+    pub fn clock_id(&self) -> u64 {
+        return self.identity
+    }
+    pub fn elapsed_ticks(&self) -> &Duration {
+        return &self.ticks
+    }
+    pub fn clone(&self) -> Instant {
+        return Instant.new(self.identity, self.ticks.clone())
+    }
+    pub fn compare(&self, other: &Instant) -> i32!TimeError {
+        if self.identity != other.identity {
+            return err(TimeError.DifferentClock)
+        }
+        return ok(self.ticks.compare(&other.ticks))
+    }
+    pub fn duration_since(&self, earlier: &Instant) -> Duration!TimeError {
+        if self.identity != earlier.identity {
+            return err(TimeError.DifferentClock)
+        }
+        return self.ticks.checked_sub(&earlier.ticks)
+    }
+    pub fn checked_add(&self, duration: &Duration) -> Instant!TimeError {
+        ticks := self.ticks.checked_add(duration)?
+        return ok(Instant.new(self.identity, ticks))
+    }
+    pub fn checked_sub(&self, duration: &Duration) -> Instant!TimeError {
+        ticks := self.ticks.checked_sub(duration)?
+        return ok(Instant.new(self.identity, ticks))
+    }
+}

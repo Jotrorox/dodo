@@ -1,0 +1,173 @@
+package hash_checks
+import "std/hash"
+import "std/checksum"
+pub struct TestKeySource {
+    available: bool
+    requests: u32
+    pub fn next_key(&mut self) -> hash.Key128!hash.KeyError {
+        self.requests = self.requests + 1
+        if!self.available {
+            return err(hash.KeyError.Unavailable)
+        }
+        return ok(hash.Key128.new(0x0706050403020100u64, 0x0f0e0d0c0b0a0908u64))
+    }
+}
+fn key_source() -> i32 {
+    source := TestKeySource { available: true, requests: 0 }
+    match hash.obtain_key(&mut source) {
+        ok(key) => {
+            if key.word0() != 0x0706050403020100u64 || key.word1() != 0x0f0e0d0c0b0a0908u64 {
+                return 23
+            }
+            state := key.hasher()
+            if state.finish() != 0x726fdb47dd0e0e31u64 {
+                return 24
+            }
+            integer := 42u64
+            policy := key.u64_policy()
+            signed := 42i32
+            signed_policy := key.i32_policy()
+            expected := hash.SipU64.new(key.word0(), key.word1())
+            expected_signed := hash.SipI32.new(key.word0(), key.word1())
+            if policy.hash(&integer) != expected.hash(&integer) || signed_policy.hash(&signed) != expected_signed.hash(&signed) {
+                return 25
+            }
+        }, err(_) => {
+            return 26
+        }
+    }
+    source.available = false
+    match hash.obtain_key(&mut source) {
+        ok(_) => {
+            return 27
+        }, err(reason) => {
+            if reason != hash.KeyError.Unavailable {
+                return 28
+            }
+        }
+    }
+    if source.requests != 2 {
+        return 29
+    }
+    return 0
+}
+fn main() -> i32 {
+    key_status := key_source()
+    if key_status != 0 {
+        return key_status
+    }
+    empty: [0]u8 = []
+    hello := [104u8, 101, 108, 108, 111]
+    if hash.fnv1a64(&empty) != 0xcbf29ce484222325u64 {
+        return 1
+    }
+    if hash.fnv1a64(&hello) != 0xa430d84680aabd0bu64 {
+        return 2
+    }
+    input := [0u8; 513]
+    for i in 0usize..input.len {
+        input[i] = (i & 255) as u8
+    }
+    expected := [0x726fdb47dd0e0e31u64, 0x74f839c593dc67fdu64, 0x0d6c8009d9a94f5au64, 0x85676696d7fb7e2du64, 0xcf2794e0277187b7u64, 0x18765564cd99a68du64, 0xcbc9466e58fee3ceu64, 0xab0200f58b01d137u64, 0x93f5f5799a932462u64, 0x9e0082df0ba9e4b0u64, 0x7a5dbbc594ddb9f3u64, 0xf4b32f46226bada7u64, 0x751e8fbc860ee5fbu64, 0x14ea5627c0843d90u64, 0xf723ca908e7af2eeu64, 0xa129ca6149be45e5u64, 0x3f2acc7f57c29bdbu64, 0x699ae9f52cbe4794u64, 0x4bc1b3f0968dd39cu64, 0xbb6dc91da77961bdu64, 0xbed65cf21aa2ee98u64, 0xd0f2cbb02e3b67c7u64, 0x93536795e3a33e88u64, 0xa80c038ccd5ccec8u64, 0xb8ad50c6f649af94u64, 0xbce192de8a85b8eau64, 0x17d835b85bbb15f3u64, 0x2f2e6163076bcfadu64, 0xde4daaaca71dc9a5u64, 0xa6a2506687956571u64, 0xad87a3535c49ef28u64, 0x32d892fad841c342u64, 0x7127512f72f27cceu64, 0xa7f32346f95978e3u64, 0x12e0b01abb051238u64, 0x15e034d40fa197aeu64, 0x314dffbe0815a3b4u64, 0x027990f029623981u64, 0xcadcd4e59ef40c4du64, 0x9abfd8766a33735cu64, 0x0e3ea96b5304a7d0u64, 0xad0c42d6fc585992u64, 0x187306c89bc215a9u64, 0xd4a60abcf3792b95u64, 0xf935451de4f21df2u64, 0xa9538f0419755787u64, 0xdb9acddff56ca510u64, 0xd06c98cd5c0975ebu64, 0xe612a3cb9ecba951u64, 0xc766e62cfcadaf96u64, 0xee64435a9752fe72u64, 0xa192d576b245165au64, 0x0a8787bf8ecb74b2u64, 0x81b3e73d20b49b6fu64, 0x7fa8220ba3b2eceau64, 0x245731c13ca42499u64, 0xb78dbfaf3a8d83bdu64, 0xea1ad565322a1a0bu64, 0x60e61c23a3795013u64, 0x6606d7e446282b93u64, 0x6ca4ecb15c5f91e1u64, 0x9f626da15c9625f3u64, 0xe51b38608ef25f57u64, 0x958a324ceb064572u64]
+    state := hash.SipHash24.new(0x0706050403020100u64, 0x0f0e0d0c0b0a0908u64)
+    for i in 0usize..64 {
+        if state.finish() != expected[i] {
+            return 3
+        }
+        if state.finish() != hash.siphash24(&input[..i], 0x0706050403020100u64, 0x0f0e0d0c0b0a0908u64) {
+            return 4
+        }
+        state.update(&input[i..i + 1])
+    }
+    state.reset()
+    if state.finish() != expected[0] {
+        return 5
+    }
+    for split in 0usize..input.len + 1 {
+        sip := hash.SipHash24.new(123, 456)
+        sip.update(&input[..split])
+        sip.update(&empty)
+        snapshot := sip.finish()
+        if snapshot != sip.finish() {
+            return 6
+        }
+        sip.update(&input[split..])
+        if sip.finish() != hash.siphash24(&input, 123, 456) {
+            return 7
+        }
+        fnv := hash.Fnv1a64.new()
+        fnv.update(&input[..split])
+        fnv.update(&input[split..])
+        if fnv.finish() != hash.fnv1a64(&input) {
+            return 8
+        }
+        fnv.reset()
+        if fnv.finish() != hash.fnv1a64(&empty) {
+            return 9
+        }
+        crc := checksum.Crc32.new()
+        crc.update(&input[..split])
+        crc.update(&input[split..])
+        if crc.finish() != checksum.crc32(&input) {
+            return 10
+        }
+        crc.reset()
+        if crc.finish() != 0 {
+            return 11
+        }
+        adler := checksum.Adler32.new()
+        adler.update(&input[..split])
+        adler.update(&input[split..])
+        if adler.finish() != checksum.adler32(&input) {
+            return 12
+        }
+        adler.reset()
+        if adler.finish() != 1 {
+            return 13
+        }
+    }
+    digits := [49u8, 50, 51, 52, 53, 54, 55, 56, 57]
+    if checksum.crc32(&digits) != 0xcbf43926u32 {
+        return 14
+    }
+    if checksum.adler32(&digits) != 0x091e01deu32 {
+        return 15
+    }
+    if checksum.crc32(&input) != 1803049649u32 || checksum.adler32(&input) != 3799842561u32 {
+        return 16
+    }
+    seeded := hash.Fnv1a64.seeded(42)
+    seeded.update(&hello)
+    seeded.reset()
+    if seeded.finish() != 42 {
+        return 17
+    }
+    key := 0x0706050403020100u64
+    policy := hash.U64 {}
+    if policy.hash(&key) != hash.fnv1a64(&input[..8]) || !policy.equal(&key, &key) {
+        return 18
+    }
+    negative := -2147483647i32 - 1
+    encoded := [0u8, 0, 0, 128]
+    ints := hash.I32 {}
+    if ints.hash(&negative) != hash.fnv1a64(&encoded) {
+        return 19
+    }
+    keyed := hash.SipU64.new(123, 456)
+    if keyed.hash(&key) != hash.siphash24(&input[..8], 123, 456) {
+        return 20
+    }
+    signed := hash.SipI32.new(123, 456)
+    if signed.hash(&negative) != hash.siphash24(&encoded, 123, 456) {
+        return 21
+    }
+    framed := hash.Fnv1a64.new()
+    hash.write_bytes(&mut framed, &hello)
+    manual := hash.Fnv1a64.new()
+    hash.write_u64(&mut manual, 5)
+    manual.update(&hello)
+    if framed.finish() != manual.finish() {
+        return 22
+    }
+    return 0
+}

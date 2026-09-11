@@ -60,6 +60,10 @@ Custom targets require caller-supplied startup and linker configuration.
 | `ptr.from_ref(&value)` / `ptr.from_mut(&mut value)` | `*const T` / `*mut T` | Safe pointer conversion; dereferencing remains unsafe. |
 | `ptr.as_ptr(slice)` / `ptr.as_mut_ptr(slice)` | `*const T` / `*mut T` | Borrowed array or slice; mutable form requires exclusive access. |
 | `ptr.is_null(pointer)` | `bool` | Safe; does not access storage. |
+| `ptr.borrow(pointer, owner)` | `&T` | Unsafe; raw `*const T` or `*mut T`, checked owner reference or slice. |
+| `ptr.borrow_mut(pointer, owner)` | `&mut T` | Unsafe; mutable raw pointer and exclusive checked owner. |
+| `ptr.borrow_slice(pointer, count, owner)` | `&[T]` | Unsafe; initialized range, count in elements, checked owner. |
+| `ptr.borrow_slice_mut(pointer, count, owner)` | `&mut[T]` | Unsafe; uniquely accessible initialized range and exclusive owner. |
 | `ptr.copy(source, destination, count)` | `void` | Unsafe; copies `count` T elements; overlapping ranges allowed. |
 | `ptr.copy_nonoverlapping(source, destination, count)` | `void` | Unsafe; copied ranges must not overlap. |
 | `ptr.write_bytes(destination, byte, count)` | `void` | Unsafe; fills `count * size_of<T>()` bytes with a `u8` pattern. |
@@ -85,6 +89,24 @@ not subsequently be dropped again without reinitialization.
 Pointer conversions do not extend storage lifetimes or create a checked borrow
 from a raw pointer. Raw access must respect all live checked borrows. Allocator
 and storage examples are in [core and allocation](standard-library.md).
+
+The four owner-bound view operations are explicit lifetime primitives. The unsafe
+caller guarantees that the pointer's allocation is kept alive by the supplied
+owner, is nonnull and aligned (including empty/zero-sized views), is initialized
+for the complete range, and satisfies shared or exclusive access for the whole
+returned borrow. The count times the element size must fit in `isize` and the
+range must remain inside one allocation. A matching pointer and owner are an
+unsafe invariant; the compiler cannot establish their relationship from bytes.
+It does check that returned views retain the owner's complete dependencies and
+cannot outlive, move, destroy, or mutably alias their owner. Mutable views require
+an exclusive owner reference. Raw casts still cannot fabricate checked references.
+
+Elements containing checked references or Results are rejected, recursively:
+the owner loan cannot reconstruct hidden element provenance or Result handling
+obligations. The owner's own checked fields remain tracked. Owner expressions
+are evaluated after the pointer (and length for slices), even though their
+address is not used by the generated view. Safe container methods establish the
+unsafe invariant privately and return ordinary checked views.
 
 ## MMIO and volatile access
 

@@ -1,7 +1,7 @@
 //! Package loading, namespace resolution, and source-aware diagnostics.
 //!
 //! A file compiles that file. A directory compiles its immediate `.dodo` files
-//! in lexical order. `core/*` and `alloc/*` resolve from bundled sources. Other
+//! in lexical order. `core/*`, `alloc/*`, and `std/*` resolve from bundled sources. Other
 //! imports resolve relative to the importing package, without network access or
 //! an implicit dependency cache.
 use crate::ast::*;
@@ -348,7 +348,7 @@ impl Loader<'_> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("invalid import path `{import}`"))?;
-            let standard = matches!(import.split('/').next(), Some("core" | "alloc"));
+            let standard = matches!(import.split('/').next(), Some("core" | "alloc" | "std"));
             let dependency = if INTRINSIC_IMPORTS.contains(&import.as_str()) {
                 ModuleId::Bundled(import.clone())
             } else if standard {

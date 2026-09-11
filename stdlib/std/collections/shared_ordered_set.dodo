@@ -1,0 +1,11 @@
+package shared_ordered_set
+
+import "alloc/shared_arena"
+import "std/collections/ordered_set"
+
+// Safe adapter for the checked single-threaded shared arena capability.
+pub fn new<T, C>(allocator: shared_arena.Handle, policy: C) -> ordered_set.Set<T, C, shared_arena.Handle> from(allocator, policy) {
+    unsafe {
+        return ordered_set.new::<T, C, shared_arena.Handle>(allocator, policy)
+    }
+}

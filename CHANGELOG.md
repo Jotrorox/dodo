@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Add independently imported portable collections, binary64 mathematics,
+  hashing/checksums, and duration/calendar/clock-contract packages, with explicit
+  fallible allocation and no required OS, global allocator, or libm dependency.
+- Add checked owner-bound storage views and shared arena capabilities; preserve
+  source access modes through container borrowing and reject mutable reborrows
+  through shared aggregates. Borrow-free generic contract inputs contribute no
+  dependencies after specialization.
+- Validate native O0/O3 behavior, published hash vectors, MPFR references,
+  deterministic container/calendar models, Windows/Wine execution, and
+  WebAssembly/Cortex-M0 object generation.
+
 ## 0.1.1 — 2026-09-11
 
 Dodo 0.1.1 improves language ergonomics, editor support, compiler distribution,

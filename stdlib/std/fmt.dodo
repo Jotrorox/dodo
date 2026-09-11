@@ -1,0 +1,31 @@
+package fmt
+
+// Decimal formatting into caller storage. A failed request writes no bytes;
+// successful calls return the initialized prefix length. Width is a minimum,
+// values are never truncated. Padding uses ASCII zero and no locale.
+pub enum FormatError {
+    BufferTooSmall
+}
+
+pub fn write_u32_padded(destination: &mut[u8], value: u32, width: usize) -> usize!FormatError {
+    digits := 1usize
+    remaining := value
+    for remaining >= 10 {
+        remaining = remaining / 10;
+        digits += 1
+    }
+    count := digits
+    if width > count {
+        count = width
+    }
+    if count > destination.len {
+        return err(FormatError.BufferTooSmall)
+    }
+    i := count
+    for i != 0 {
+        i -= 1
+        destination[i] = 48u8 + (value % 10) as u8
+        value = value / 10
+    }
+    return ok(count)
+}

@@ -1,0 +1,140 @@
+package iso8601
+
+import "std/time"
+import "std/text"
+import "std/fmt"
+
+pub enum TextError {
+    InvalidSyntax, InvalidDateTime, BufferTooSmall
+}
+fn number(data: &[u8]) -> u32!TextError {
+    match text.parse_u32_decimal(data) {
+        ok(value) => {
+            return ok(value)
+        },
+        err(_) => {
+            return err(TextError.InvalidSyntax)
+        }
+    }
+}
+// Exactly YYYY-MM-DD, years 0000..9999.
+pub fn parse_date(data: &[u8]) -> time.Date!TextError {
+    if data.len != 10 {
+        return err(TextError.InvalidSyntax)
+    }
+    if data[4] != 45 || data[7] != 45 {
+        return err(TextError.InvalidSyntax)
+    }
+    year := number(&data[..4])?
+    month := number(&data[5..7])?
+    day := number(&data[8..10])?
+    match time.Date.new(year as i32, month, day) {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(TextError.InvalidDateTime)
+        }
+    }
+}
+// HH:MM:SS optionally followed by 1..9 fractional decimal digits.
+pub fn parse_time(data: &[u8]) -> time.TimeOfDay!TextError {
+    if data.len < 8 || data.len > 18 || data.len == 9 {
+        return err(TextError.InvalidSyntax)
+    }
+    if data[2] != 58 || data[5] != 58 {
+        return err(TextError.InvalidSyntax)
+    }
+    hour := number(&data[..2])?
+    minute := number(&data[3..5])?
+    second := number(&data[6..8])?
+    nanos := 0u32
+    if data.len > 8 {
+        if data[8] != 46 {
+            return err(TextError.InvalidSyntax)
+        }
+        nanos = number(&data[9..])?
+        for i in data.len..18 {
+            nanos = nanos * 10
+        }
+    }
+    match time.TimeOfDay.new(hour, minute, second, nanos) {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(TextError.InvalidDateTime)
+        }
+    }
+}
+// Explicit UTC suffix Z; numeric offsets and leap seconds are rejected.
+pub fn parse_timestamp(data: &[u8]) -> time.Timestamp!TextError {
+    if data.len < 20 || data.len > 30 {
+        return err(TextError.InvalidSyntax)
+    }
+    if data[10] != 84 || data[data.len - 1] != 90 {
+        return err(TextError.InvalidSyntax)
+    }
+    date := parse_date(&data[..10])?
+    clock := parse_time(&data[11..data.len - 1])?
+    value := time.DateTime.new(date, clock)
+    return ok(value.to_timestamp())
+}
+fn write_number(output: &mut[u8], value: u32, width: usize) -> void!TextError {
+    match fmt.write_u32_padded(output, value, width) {
+        ok(_) => {
+            return ok()
+        }, err(_) => {
+            return err(TextError.BufferTooSmall)
+        }
+    }
+}
+// Fixed field sizes; preflight ensures all errors leave the buffer unchanged.
+pub fn format_date(output: &mut[u8], value: &time.Date) -> usize!TextError {
+    if output.len < 10 {
+        return err(TextError.BufferTooSmall)
+    }
+    write_number(&mut output[..4], value.year() as u32, 4)?
+    output[4] = 45
+    write_number(&mut output[5..7], value.month(), 2)?
+    output[7] = 45
+    write_number(&mut output[8..10], value.day(), 2)?
+    return ok(10)
+}
+// Always nine fractional digits: HH:MM:SS.nnnnnnnnn (18 bytes).
+pub fn format_time(output: &mut[u8], value: &time.TimeOfDay) -> usize!TextError {
+    if output.len < 18 {
+        return err(TextError.BufferTooSmall)
+    }
+    write_number(&mut output[..2], value.hour(), 2)?
+    output[2] = 58
+    write_number(&mut output[3..5], value.minute(), 2)?
+    output[5] = 58
+    write_number(&mut output[6..8], value.second(), 2)?
+    output[8] = 46
+    write_number(&mut output[9..18], value.subsec_nanos(), 9)?
+    return ok(18)
+}
+pub fn format_timestamp(output: &mut[u8], value: &time.Timestamp) -> usize!TextError {
+    if output.len < 30 {
+        return err(TextError.BufferTooSmall)
+    }
+    calendar := match time.DateTime.from_timestamp(value) {
+        ok(value) => {
+            value
+        }, err(_) => {
+            return err(TextError.InvalidDateTime)
+        }
+    }
+    match format_date(&mut output[..10], calendar.date()) {
+        ok(_) => {}, err(reason) => {
+            return err(reason)
+        }
+    }
+    output[10] = 84
+    match format_time(&mut output[11..29], calendar.time_of_day()) {
+        ok(_) => {}, err(reason) => {
+            return err(reason)
+        }
+    }
+    output[29] = 90
+    return ok(30)
+}

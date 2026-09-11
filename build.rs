@@ -32,8 +32,8 @@ fn main() {
             .unwrap()
             .replace('\\', "/");
         assert!(
-            name.starts_with("core/") || name.starts_with("alloc/"),
-            "standard library module must be in core/ or alloc/: {name}"
+            name.starts_with("core/") || name.starts_with("alloc/") || name.starts_with("std/"),
+            "standard library module must be in core/, alloc/, or std/: {name}"
         );
         let source_path = format!("/stdlib/{}", relative.to_str().unwrap().replace('\\', "/"));
         inventory.push_str(&format!(

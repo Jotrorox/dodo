@@ -1,0 +1,194 @@
+package collections
+
+import "core/mem"
+import "core/ptr"
+
+// Policies use statically resolved methods, without traits or function objects.
+// compare(&T,&T) returns negative/zero/positive; equal(&T,&T) returns bool.
+pub struct I32 {
+    pub fn compare(&self, a: &i32, b: &i32) -> i32 {
+        if *a < *b {
+            return -1
+        }
+        if *a > *b {
+            return 1
+        }
+        return 0
+    }
+    pub fn equal(&self, a: &i32, b: &i32) -> bool {
+        return *a == *b
+    }
+}
+pub struct U64 {
+    pub fn compare(&self, a: &u64, b: &u64) -> i32 {
+        if *a < *b {
+            return -1
+        }
+        if *a > *b {
+            return 1
+        }
+        return 0
+    }
+    pub fn equal(&self, a: &u64, b: &u64) -> bool {
+        return *a == *b
+    }
+}
+pub enum CapacityError {
+    Full, OutOfBounds
+}
+
+// Checked indices, ownership-moving exchange, no destruction. O(1).
+// The mem.init gate explicitly rejects borrow/Result-bearing element types.
+pub fn swap<T>(data: &mut[T], a: usize, b: usize) -> bool {
+    if a >= data.len || b >= data.len {
+        return false
+    }
+    if a == b {
+        return true
+    }
+    unsafe {
+        base := ptr.as_mut_ptr(data)
+        first := ptr.offset(base, a as isize)
+        second := ptr.offset(base, b as isize)
+        temporary := mem.init(ptr.read(first))
+        ptr.write(first, ptr.read(second))
+        ptr.write(second, mem.assume_init(temporary))
+    }
+    return true
+}
+
+pub fn find<T, E>(data: &[T], needle: &T, equality: &E) -> Option<usize> {
+    for i in 0usize..data.len {
+        if equality.equal(&data[i], needle) {
+            return some(i)
+        }
+    }
+    return none
+}
+pub fn equal<T, E>(a: &[T], b: &[T], equality: &E) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if!equality.equal(&a[i], &b[i]) {
+            return false
+        }
+    }
+    return true
+}
+pub fn compare<T, C>(a: &[T], b: &[T], ordering: &C) -> i32 {
+    length := a.len
+    if b.len < length {
+        length = b.len
+    }
+    for i in 0usize..length {
+        c := ordering.compare(&a[i], &b[i])
+        if c < 0 {
+            return -1
+        }
+        if c > 0 {
+            return 1
+        }
+    }
+    if a.len < b.len {
+        return -1
+    }
+    if a.len > b.len {
+        return 1
+    }
+    return 0
+}
+
+// First element >= needle; insertion position on an empty slice is zero.
+pub fn lower_bound<T, C>(data: &[T], needle: &T, ordering: &C) -> usize {
+    left := 0usize
+    right := data.len
+    for left < right {
+        middle := left + (right - left) / 2
+        if ordering.compare(&data[middle], needle) < 0 {
+            left = middle + 1
+        } else {
+            right = middle
+        }
+    }
+    return left
+}
+pub fn upper_bound<T, C>(data: &[T], needle: &T, ordering: &C) -> usize {
+    left := 0usize
+    right := data.len
+    for left < right {
+        middle := left + (right - left) / 2
+        if ordering.compare(&data[middle], needle) <= 0 {
+            left = middle + 1
+        } else {
+            right = middle
+        }
+    }
+    return left
+}
+pub fn binary_search<T, C>(data: &[T], needle: &T, ordering: &C) -> Option<usize> {
+    index := lower_bound::<T, C>(data, needle, ordering)
+    if index < data.len && ordering.compare(&data[index], needle) == 0 {
+        return some(index)
+    }
+    return none
+}
+pub fn is_sorted<T, C>(data: &[T], ordering: &C) -> bool {
+    for i in 1usize..data.len {
+        if ordering.compare(&data[i - 1], &data[i]) > 0 {
+            return false
+        }
+    }
+    return true
+}
+
+fn sift<T, C>(data: &mut[T], start: usize, end: usize, ordering: &C) {
+    root := start
+    for root < end / 2 {
+        child := root * 2 + 1
+        if child + 1 < end && ordering.compare(&data[child], &data[child + 1]) < 0 {
+            child = child + 1
+        }
+        if ordering.compare(&data[root], &data[child]) >= 0 {
+            return
+        }
+        swap::<T>(data, root, child)
+        root = child
+    }
+}
+// In-place heapsort: O(n log n) worst case, O(1) storage, unstable.
+pub fn sort<T, C>(data: &mut[T], ordering: &C) {
+    start := data.len / 2
+    for start != 0 {
+        start = start - 1
+        sift::<T, C>(data, start, data.len, ordering)
+    }
+    end := data.len
+    for end > 1 {
+        end = end - 1
+        swap::<T>(data, 0, end)
+        sift::<T, C>(data, 0, end, ordering)
+    }
+}
+// Stable insertion sort: O(n²) worst case; O(n) for sorted input.
+pub fn stable_sort<T, C>(data: &mut[T], ordering: &C) {
+    for i in 1usize..data.len {
+        j := i
+        for j > 0 && ordering.compare(&data[j], &data[j - 1]) < 0 {
+            swap::<T>(data, j, j - 1)
+            j = j - 1
+        }
+    }
+}
+// Predicate provides test(&T)->bool. True values precede false values.
+// Returns the boundary, O(n) time/O(1) storage, unstable.
+pub fn partition<T, P>(data: &mut[T], predicate: &P) -> usize {
+    boundary := 0usize
+    for i in 0usize..data.len {
+        if predicate.test(&data[i]) {
+            swap::<T>(data, boundary, i)
+            boundary = boundary + 1
+        }
+    }
+    return boundary
+}

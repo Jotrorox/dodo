@@ -1,0 +1,11 @@
+package shared_hash_map
+
+import "alloc/shared_arena"
+import "std/collections/hash_map"
+
+// Safe adapter for the checked single-threaded shared arena capability.
+pub fn new<K, V, H>(allocator: shared_arena.Handle, policy: H) -> hash_map.Map<K, V, H, shared_arena.Handle> from(allocator, policy) {
+    unsafe {
+        return hash_map.new::<K, V, H, shared_arena.Handle>(allocator, policy)
+    }
+}

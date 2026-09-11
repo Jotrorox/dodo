@@ -1,0 +1,260 @@
+package hash_map
+
+import "core/mem"
+import "core/ptr"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/block"
+
+pub struct Entry<K, V> {
+    pub key: K, pub value: V
+}
+
+// Linear-probing map, power-of-two bucket count, maximum 75% load.
+// H supplies hash(&K)->u64 and equal(&K,&K)->bool. Equal keys MUST hash equally.
+pub struct Map<K, V, H, A> {
+    allocator: A
+    policy: H
+    pointer: *mut Option<Entry<K, V>>
+    length: usize
+    buckets: usize
+
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+    // Bucket count for physical-order entry(index) traversal.
+    pub fn bucket_count(&self) -> usize {
+        return self.buckets
+    }
+    pub fn capacity(&self) -> usize {
+        return self.buckets - self.buckets / 4
+    }
+    fn start(&self, key: &K) -> usize {
+        return (self.policy.hash(key) as usize) & (self.buckets - 1)
+    }
+    fn next(&self, index: usize) -> usize {
+        return (index + 1) & (self.buckets - 1)
+    }
+    pub fn entry(&self, index: usize) -> Option<&Entry<K, V>> {
+        if index >= self.buckets {
+            return none
+        }
+        unsafe {
+            match ptr.borrow(ptr.offset(self.pointer, index as isize), self) {
+                some(entry) => {
+                    return some(entry)
+                }, none => {
+                    return none
+                },
+            }
+        }
+    }
+    fn find(&self, key: &K) -> Option<usize> {
+        if self.buckets == 0 {
+            return none
+        }
+        index := self.start(key)
+        for {
+            match self.entry(index) {
+                some(entry) => {
+                    if self.policy.equal(&entry.key, key) {
+                        return some(index)
+                    }
+                },
+                none => {
+                    return none
+                },
+            }
+            index = self.next(index)
+        }
+    }
+    pub fn contains(&self, key: &K) -> bool {
+        match self.find(key) {
+            some(_) => {
+                return true
+            }, none => {
+                return false
+            },
+        }
+    }
+    pub fn get(&self, key: &K) -> Option<&V> {
+        match self.find(key) {
+            some(index) => {
+                match self.entry(index) {
+                    some(entry) => {
+                        return some(&entry.value)
+                    }, none => {},
+                }
+            },
+            none => {},
+        }
+        return none
+    }
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        match self.find(key) {
+            some(index) => {
+                unsafe {
+                    match ptr.borrow_mut(ptr.offset(self.pointer, index as isize), self) {
+                        some(entry) => {
+                            return some(&mut entry.value)
+                        }, none => {},
+                    }
+                }
+            },
+            none => {},
+        }
+        return none
+    }
+    // Requires free capacity; moves an entry into an empty bucket.
+    fn place(&mut self, entry: Entry<K, V>) {
+        index := self.start(&entry.key)
+        for {
+            occupied := false
+            match self.entry(index) {
+                some(_) => {
+                    occupied = true
+                }, none => {},
+            }
+            if!occupied {
+                unsafe {
+                    ptr.write(ptr.offset(self.pointer, index as isize), some(entry))
+                }
+                self.length = self.length + 1
+                return
+            }
+            index = self.next(index)
+        }
+    }
+    pub fn reserve(&mut self, additional: usize) -> void!error.AllocError {
+        if additional > layout.max_size() - self.length {
+            return err(error.AllocError.SizeOverflow)
+        }
+        required := self.length + additional
+        if required <= self.capacity() {
+            return ok()
+        }
+        buckets := self.buckets
+        if buckets == 0 {
+            buckets = 8
+        }
+        for required > buckets - buckets / 4 {
+            if buckets > layout.max_size() / 2 {
+                return err(error.AllocError.SizeOverflow)
+            }
+            buckets = buckets * 2
+        }
+        requested := layout.array::<Option<Entry<K, V>>>(buckets)?
+        previous_layout := layout.array::<Option<Entry<K, V>>>(self.buckets)?
+        allocation := self.allocator.allocate(&requested)?
+        unsafe {
+            destination := allocation.as_ptr() as *mut Option<Entry<K, V>>
+            for i in 0usize..buckets {
+                ptr.write(ptr.offset(destination, i as isize), none)
+            }
+            previous := self.pointer
+            previous_count := self.buckets
+            self.pointer = destination
+            self.buckets = buckets
+            self.length = 0
+            for i in 0usize..previous_count {
+                match ptr.read(ptr.offset(previous, i as isize)) {
+                    some(entry) => {
+                        self.place(entry)
+                    }, none => {},
+                }
+            }
+            if previous_count != 0 {
+                self.allocator.deallocate(block.Block.from_raw_parts(previous as *mut u8, previous_layout))
+            }
+        }
+        return ok()
+    }
+    pub fn insert(&mut self, key: K, value: V) -> Option<V>!error.AllocError {
+        match self.find(&key) {
+            some(index) => {
+                unsafe {
+                    match ptr.borrow_mut(ptr.offset(self.pointer, index as isize), self) {
+                        some(entry) => {
+                            return ok(some(mem.replace(&mut entry.value, value)))
+                        }, none => {},
+                    }
+                }
+            },
+            none => {},
+        }
+        self.reserve(1)?
+        self.place(Entry<K, V> { key: key, value: value })
+        return ok(none)
+    }
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        match self.find(key) {
+            some(index) => {
+                unsafe {
+                    removed := ptr.read(ptr.offset(self.pointer, index as isize))
+                    ptr.write(ptr.offset(self.pointer, index as isize), none)
+                    self.length = self.length - 1
+                    // Reinsert the following cluster so lookup never skips a hole.
+                    cursor := self.next(index)
+                    for {
+                        current := ptr.read(ptr.offset(self.pointer, cursor as isize))
+                        ptr.write(ptr.offset(self.pointer, cursor as isize), none)
+                        match current {
+                            some(entry) => {
+                                self.length = self.length - 1
+                                self.place(entry)
+                            },
+                            none => {
+                                break
+                            },
+                        }
+                        cursor = self.next(cursor)
+                    }
+                    match removed {
+                        some(entry) => {
+                            let Entry<K, V> { key, value } = entry
+                            core.drop(key)
+                            return some(value)
+                        }, none => {
+                            return none
+                        },
+                    }
+                }
+            },
+            none => {
+                return none
+            },
+        }
+    }
+    pub fn clear(&mut self) {
+        unsafe {
+            for i in 0usize..self.buckets {
+                source := ptr.offset(self.pointer, i as isize)
+                ptr.drop_in_place(source)
+                ptr.write(source, none)
+            }
+        }
+        self.length = 0
+    }
+    fn drop(&mut self) {
+        self.clear()
+        if self.buckets != 0 {
+            match layout.array::<Option<Entry<K, V>>>(self.buckets) {
+                ok(requested) => {
+                    unsafe {
+                        self.allocator.deallocate(block.Block.from_raw_parts(self.pointer as *mut u8, requested))
+                    }
+                },
+                err(_) => {},
+            }
+        }
+    }
+}
+// SAFETY: A obeys vector.new's allocation/lifetime contract. No allocation yet.
+pub unsafe fn new<K, V, H, A>(allocator: A, policy: H) -> Map<K, V, H, A> from(allocator, policy) {
+    gate: Option<Entry<K, V>> = none
+    core.drop(mem.init(gate))
+    unsafe {
+        return Map<K, V, H, A> { allocator: allocator, policy: policy,
+        pointer: mem.align_of::<Option<Entry<K, V>>>() as *mut Option<Entry<K, V>>, length: 0, buckets: 0 }
+    }
+}
