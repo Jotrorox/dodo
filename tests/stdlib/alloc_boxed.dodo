@@ -1,0 +1,152 @@
+package alloc_boxed_checks
+import "core/ptr"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/arena"
+import "alloc/pool"
+import "alloc/arena_box"
+import "alloc/pool_box"
+
+struct Empty {}
+struct Guard {
+    counter: *mut usize
+    weight: usize
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.counter, ptr.read(self.counter) + self.weight)
+        }
+    }
+}
+struct Outer {
+    guard: Guard, extra: Guard
+}
+struct Large {
+    guard: Guard, bytes: [512]u8
+}
+
+fn verify() -> i32!error.AllocError {
+    counter := 0usize
+    counter_pointer := ptr.from_mut(&mut counter)
+    bytes := [0u8; 1024]
+    allocator := arena.Arena.new(&mut bytes)
+    value := arena_box.new(&mut allocator, 42i32)?
+    unsafe {
+        if ptr.read(value.as_ptr()) != 42 {
+            return ok(1)
+        }
+    }
+    if value.into_inner() != 42 {
+        return ok(2)
+    }
+    // Ordinary destruction recursively drops the stored object exactly once.
+    owned := arena_box.new(&mut allocator, Outer {
+        guard: Guard { counter: counter_pointer, weight: 1 },
+        extra: Guard { counter: counter_pointer, weight: 10 },
+    })?
+    core.drop(owned)
+    if counter != 11 {
+        return ok(3)
+    }
+    moved := arena_box.new(&mut allocator, Guard { counter: counter_pointer, weight: 100 })?
+    returned := moved.into_inner()
+    if counter != 11 {
+        return ok(4)
+    }
+    core.drop(returned)
+    if counter != 111 {
+        return ok(5)
+    }
+    before := allocator.used()
+    empty := arena_box.new(&mut allocator, Empty {})?
+    core.drop(empty)
+    if allocator.used() != before {
+        return ok(6)
+    }
+
+    empty_backing: [0]u8 = []
+    exhausted := arena.Arena.new(&mut empty_backing)
+    match arena_box.new(&mut exhausted, Guard { counter: counter_pointer, weight: 1000 }) {
+        ok(_) => {
+            return ok(7)
+        }
+        err(error.AllocError.Exhausted) => {}
+        err(_) => {
+            return ok(8)
+        }
+    }
+    if counter != 1111 || exhausted.used() != 0 {
+        return ok(9)
+    }
+
+    pool_bytes := [0u8; 512]
+    recycled := pool.Pool.new(&mut pool_bytes, 64, 16)?
+    capacity := recycled.capacity()
+    for i in 0usize..20usize {
+        pooled := pool_box.new(&mut recycled, Guard { counter: counter_pointer, weight: 1 })?
+        core.drop(pooled)
+        if recycled.available() != capacity || counter != 1112 + i {
+            return ok(10)
+        }
+    }
+    match pool_box.new(&mut recycled, Large {
+        guard: Guard { counter: counter_pointer, weight: 10000 }, bytes: [0u8; 512],
+    }) {
+        ok(_) => {
+            return ok(11)
+        }
+        err(error.AllocError.UnsupportedLayout) => {}
+        err(_) => {
+            return ok(12)
+        }
+    }
+    if counter != 11131 || recycled.available() != capacity {
+        return ok(13)
+    }
+    // Owned values moved through Results are cleaned up on propagation exits.
+    match propagation(&mut recycled, counter_pointer) {
+        ok() => {
+            return ok(14)
+        }
+        err(error.AllocError.Exhausted) => {}
+        err(_) => {
+            return ok(15)
+        }
+    }
+    if counter != 11132 || recycled.available() != capacity {
+        return ok(16)
+    }
+    replaced := pool_box.new(&mut recycled, Guard { counter: counter_pointer, weight: 100 })?
+    previous := replaced.replace(Guard { counter: counter_pointer, weight: 1000 })
+    if counter != 11132 {
+        return ok(17)
+    }
+    core.drop(previous)
+    if counter != 11232 {
+        return ok(18)
+    }
+    core.drop(replaced)
+    if counter != 12232 || recycled.available() != capacity {
+        return ok(19)
+    }
+    return ok(0)
+}
+
+fn fail() -> void!error.AllocError {
+    return err(error.AllocError.Exhausted)
+}
+fn propagation(allocator: &mut pool.Pool, counter: *mut usize) -> void!error.AllocError {
+    value := pool_box.new(allocator, Guard { counter: counter, weight: 1 })?
+    fail()?
+    return ok()
+}
+
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

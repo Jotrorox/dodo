@@ -1,0 +1,35 @@
+package alloc_example
+
+import "alloc/error"
+import "alloc/arena"
+import "alloc/arena_box"
+
+struct Packet {
+    sequence: u32
+}
+
+fn demo() -> u32!error.AllocError {
+    // The application chooses the storage; neither the allocator nor Box
+    // depends on an operating system or a global heap.
+    storage := [0u8; 128]
+    memory := arena.Arena.new(&mut storage)
+    packet := arena_box.new(&mut memory, Packet { sequence: 20 })?
+
+    // The Box keeps memory exclusively borrowed while its value is live.
+    previous := packet.replace(Packet { sequence: 22 })
+    current := packet.into_inner()
+    // into_inner moves the value out and releases the Box's allocator borrow.
+    // Arena individual deallocation does not reclaim its bump storage.
+    return ok(previous.sequence + current.sequence)
+}
+
+fn main() -> i32 {
+    match demo() {
+        ok(answer) => {
+            return answer as i32 - 42
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

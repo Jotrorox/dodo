@@ -1,0 +1,116 @@
+package layout
+
+import "core/mem"
+import "alloc/error"
+
+// Keep object sizes within the signed pointer-offset range on every target.
+pub fn max_size() -> usize {
+    return (~0usize) >> 1
+}
+
+// A Layout has nonzero power-of-two alignment. Its size rounded up to that
+// alignment fits in isize. Fields are private to preserve those invariants.
+pub struct Layout {
+    bytes: usize
+    alignment: usize
+
+    pub fn new(size: usize, align: usize) -> Layout!error.AllocError {
+        if align == 0 || (align & (align - 1)) != 0 {
+            return err(error.AllocError.InvalidAlignment)
+        }
+        if size > max_size() - (align - 1) {
+            return err(error.AllocError.SizeOverflow)
+        }
+        return ok(Layout { bytes: size, alignment: align })
+    }
+
+    pub fn size(&self) -> usize {
+        return self.bytes
+    }
+    pub fn align(&self) -> usize {
+        return self.alignment
+    }
+
+    pub fn clone(&self) -> Layout {
+        return Layout { bytes: self.bytes, alignment: self.alignment }
+    }
+
+    pub fn padding(&self) -> usize {
+        remainder := self.bytes & (self.alignment - 1)
+        if remainder == 0 {
+            return 0
+        }
+        return self.alignment - remainder
+    }
+
+    pub fn pad_to_align(&self) -> Layout {
+        return Layout { bytes: self.bytes + self.padding(), alignment: self.alignment }
+    }
+
+    // Increase alignment without changing size; never reduce existing alignment.
+    pub fn align_to(&self, align: usize) -> Layout!error.AllocError {
+        if align == 0 || (align & (align - 1)) != 0 {
+            return err(error.AllocError.InvalidAlignment)
+        }
+        if align <= self.alignment {
+            return ok(self.clone())
+        }
+        return Layout.new(self.bytes, align)
+    }
+
+    // Lay out adjacent array elements with the padding each element requires.
+    pub fn repeat(&self, count: usize) -> Layout!error.AllocError {
+        stride := self.bytes + self.padding()
+        if stride != 0 && count > max_size() / stride {
+            return err(error.AllocError.SizeOverflow)
+        }
+        return Layout.new(stride * count, self.alignment)
+    }
+
+    // Append a field with its required alignment. The result is deliberately
+    // not padded at the end: use pad_to_align before making an array of it.
+    pub fn extend(&self, next: &Layout) -> ExtendedLayout!error.AllocError {
+        alignment := self.alignment
+        if next.alignment > alignment {
+            alignment = next.alignment
+        }
+        remainder := self.bytes & (next.alignment - 1)
+        padding := 0usize
+        if remainder != 0 {
+            padding = next.alignment - remainder
+        }
+        if self.bytes > max_size() - padding {
+            return err(error.AllocError.SizeOverflow)
+        }
+        offset := self.bytes + padding
+        if next.bytes > max_size() - offset {
+            return err(error.AllocError.SizeOverflow)
+        }
+        combined := Layout.new(offset + next.bytes, alignment)?
+        return ok(ExtendedLayout { combined: combined, field_offset: offset })
+    }
+}
+
+pub struct ExtendedLayout {
+    combined: Layout
+    field_offset: usize
+
+    pub fn offset(&self) -> usize {
+        return self.field_offset
+    }
+    pub fn layout(&self) -> &Layout {
+        return &self.combined
+    }
+    pub fn into_layout(self) -> Layout {
+        return self.combined.clone()
+    }
+}
+
+pub fn of<T>() -> Layout!error.AllocError {
+    return Layout.new(mem.size_of::<T>(), mem.align_of::<T>())
+}
+
+pub fn array<T>(count: usize) -> Layout!error.AllocError {
+    element := of::<T>()?
+    return element.repeat(count)
+}

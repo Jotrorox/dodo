@@ -1,0 +1,81 @@
+package arena
+
+import "core/ptr"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/block"
+
+// Caller-backed bump allocation, with no heap, OS calls, or hidden metadata.
+// The checked slice borrow prevents moving/dropping/reusing backing storage
+// while the Arena is live. Returned Blocks are raw: their access is unsafe.
+pub struct Arena {
+    backing: &mut[u8]
+    cursor: usize
+
+    pub fn new(backing: &mut[u8]) -> Arena from(backing) {
+        return Arena { backing: backing, cursor: 0 }
+    }
+
+    pub fn capacity(&self) -> usize {
+        return self.backing.len
+    }
+    pub fn used(&self) -> usize {
+        return self.cursor
+    }
+    pub fn remaining(&self) -> usize {
+        return self.backing.len - self.cursor
+    }
+
+    pub fn allocate(&mut self, requested: &layout.Layout) -> block.Block!error.AllocError {
+        // Zero-size requests consume no storage, even in an empty arena.
+        if requested.size() == 0 {
+            unsafe {
+                return ok(block.Block.from_raw_parts(requested.align() as *mut u8, requested.clone()))
+            }
+        }
+        unsafe {
+            base := ptr.as_mut_ptr(self.backing)
+            // A valid caller slice cannot wrap the address space.
+            address := base as usize + self.cursor
+            remainder := address & (requested.align() - 1)
+            padding := 0usize
+            if remainder != 0 {
+                padding = requested.align() - remainder
+            }
+            available := self.remaining()
+            if padding > available || requested.size() > available - padding {
+                return err(error.AllocError.Exhausted)
+            }
+            start := self.cursor + padding
+            if start > layout.max_size() {
+                return err(error.AllocError.SizeOverflow)
+            }
+            pointer := ptr.offset(base, start as isize)
+            self.cursor = start + requested.size()
+            return ok(block.Block.from_raw_parts(pointer, requested.clone()))
+        }
+    }
+
+    pub fn allocate_zeroed(&mut self, requested: &layout.Layout) -> block.Block!error.AllocError {
+        allocated := self.allocate(requested)?
+        if allocated.size() != 0 {
+            unsafe {
+                ptr.write_bytes(allocated.as_ptr(), 0u8, allocated.size())
+            }
+        }
+        return ok(allocated)
+    }
+
+    // SAFETY: allocated is a live allocation from this arena, not previously
+    // deallocated or invalidated by reset. Destroy stored values first and stop
+    // using every pointer into the block. Individual frees reclaim no space.
+    pub unsafe fn deallocate(&mut self, allocated: block.Block) {
+        core.drop(allocated)
+    }
+
+    // SAFETY: destroy all stored values first. Every outstanding allocation is
+    // invalidated; its pointers and descriptors must not be used again.
+    pub unsafe fn reset(&mut self) {
+        self.cursor = 0
+    }
+}

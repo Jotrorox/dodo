@@ -112,7 +112,10 @@ pub enum Type {
     Unknown,
     Void,
     Bool,
-    Int { signed: bool, bits: u32 }, // bits=0 means pointer-sized
+    Int {
+        signed: bool,
+        bits: u32,
+    }, // bits=0 means pointer-sized
     Float(u32),
     Str,
     Array(usize, Box<Type>),
@@ -124,6 +127,8 @@ pub enum Type {
     Generic(String, Vec<Type>),
     Result(Box<Type>, Box<Type>),
     Option(Box<Type>),
+    /// Opaque storage with the layout of T; never implicitly drops its contents.
+    MaybeUninit(Box<Type>),
 }
 impl Type {
     pub fn isize() -> Self {
@@ -208,6 +213,7 @@ impl std::fmt::Display for Type {
             }
             Self::Result(t, e) => write!(f, "Result<{t}, {e}>"),
             Self::Option(t) => write!(f, "Option<{t}>"),
+            Self::MaybeUninit(t) => write!(f, "MaybeUninit<{t}>"),
         }
     }
 }

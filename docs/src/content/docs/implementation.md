@@ -63,7 +63,11 @@ still require explicit unsafe blocks for unchecked operations.
 
 ## Remaining design surface
 
-The broad design's `MaybeUninit`, `offset_of`, checked slice splitting, allocator
+Bundled [core and allocation packages](standard-library.md) now provide opaque
+`MaybeUninit` storage, memory exchange, byte/slice utilities, layouts, caller-backed
+arenas and pools, and owned boxes with explicit allocator lifetimes.
+
+The broad design's disjoint mutable slice splitting, checked allocator
 interfaces, atomics, DMA/interrupt-safe abstractions, target barriers, inline
 assembly, section/alignment/export/interrupt attributes, and custom panic-handler
 integration are not implemented. Unsupported syntax and unknown intrinsics

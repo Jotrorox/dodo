@@ -1,0 +1,157 @@
+package bytes
+
+pub enum BufferError {
+    OutOfBounds, LengthMismatch
+}
+
+pub fn equal(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+// Lexicographic byte order, independent of target endianness.
+pub fn compare(a: &[u8], b: &[u8]) -> i32 {
+    count := a.len
+    if b.len < count {
+        count = b.len
+    }
+    for i in 0usize..count {
+        if a[i] < b[i] {
+            return -1
+        }
+        if a[i] > b[i] {
+            return 1
+        }
+    }
+    if a.len < b.len {
+        return -1
+    }
+    if a.len > b.len {
+        return 1
+    }
+    return 0
+}
+pub fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
+    if prefix.len > data.len {
+        return false
+    }
+    return equal(&data[..prefix.len], prefix)
+}
+pub fn ends_with(data: &[u8], suffix: &[u8]) -> bool {
+    if suffix.len > data.len {
+        return false
+    }
+    return equal(&data[data.len - suffix.len..], suffix)
+}
+pub fn find(data: &[u8], value: u8) -> Option<usize> {
+    for i in 0usize..data.len {
+        if data[i] == value {
+            return some(i)
+        }
+    }
+    return none
+}
+pub fn fill(data: &mut[u8], value: u8) {
+    for i in 0usize..data.len {
+        data[i] = value
+    }
+}
+pub fn reverse(data: &mut[u8]) {
+    for i in 0usize..data.len / 2 {
+        other := data.len - 1 - i
+        saved := data[i]
+        data[i] = data[other]
+        data[other] = saved
+    }
+}
+// Validate first: failure leaves the destination completely unchanged.
+pub fn copy_from(destination: &mut[u8], source: &[u8]) -> Result<void, BufferError> {
+    if destination.len != source.len {
+        return err(BufferError.LengthMismatch)
+    }
+    for i in 0usize..source.len {
+        destination[i] = source[i]
+    }
+    return ok()
+}
+fn read(data: &[u8], offset: usize, width: usize, little: bool) -> Result<u64, BufferError> {
+    if offset > data.len || width > data.len - offset {
+        return err(BufferError.OutOfBounds)
+    }
+    value := 0u64
+    for i in 0usize..width {
+        shift := i * 8
+        if!little {
+            shift = (width - 1 - i) * 8
+        }
+        value = value | ((data[offset + i] as u64) << (shift as u64))
+    }
+    return ok(value)
+}
+fn write(data: &mut[u8], offset: usize, width: usize, little: bool, value: u64) -> Result<void, BufferError> {
+    if offset > data.len || width > data.len - offset {
+        return err(BufferError.OutOfBounds)
+    }
+    for i in 0usize..width {
+        shift := i * 8
+        if!little {
+            shift = (width - 1 - i) * 8
+        }
+        data[offset + i] = ((value >> (shift as u64)) & 255) as u8
+    }
+    return ok()
+}
+
+pub fn read_u16_le(data: &[u8], offset: usize) -> Result<u16, BufferError> {
+    value := read(data, offset, 2, true)?
+    return ok(value as u16)
+}
+pub fn write_u16_le(data: &mut[u8], offset: usize, value: u16) -> Result<void, BufferError> {
+    return write(data, offset, 2, true, value as u64)
+}
+
+pub fn read_u16_be(data: &[u8], offset: usize) -> Result<u16, BufferError> {
+    value := read(data, offset, 2, false)?
+    return ok(value as u16)
+}
+pub fn write_u16_be(data: &mut[u8], offset: usize, value: u16) -> Result<void, BufferError> {
+    return write(data, offset, 2, false, value as u64)
+}
+
+pub fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, BufferError> {
+    value := read(data, offset, 4, true)?
+    return ok(value as u32)
+}
+pub fn write_u32_le(data: &mut[u8], offset: usize, value: u32) -> Result<void, BufferError> {
+    return write(data, offset, 4, true, value as u64)
+}
+
+pub fn read_u32_be(data: &[u8], offset: usize) -> Result<u32, BufferError> {
+    value := read(data, offset, 4, false)?
+    return ok(value as u32)
+}
+pub fn write_u32_be(data: &mut[u8], offset: usize, value: u32) -> Result<void, BufferError> {
+    return write(data, offset, 4, false, value as u64)
+}
+
+pub fn read_u64_le(data: &[u8], offset: usize) -> Result<u64, BufferError> {
+    value := read(data, offset, 8, true)?
+    return ok(value as u64)
+}
+pub fn write_u64_le(data: &mut[u8], offset: usize, value: u64) -> Result<void, BufferError> {
+    return write(data, offset, 8, true, value as u64)
+}
+
+pub fn read_u64_be(data: &[u8], offset: usize) -> Result<u64, BufferError> {
+    value := read(data, offset, 8, false)?
+    return ok(value as u64)
+}
+pub fn write_u64_be(data: &mut[u8], offset: usize, value: u64) -> Result<void, BufferError> {
+    return write(data, offset, 8, false, value as u64)
+}

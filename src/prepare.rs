@@ -133,9 +133,11 @@ impl Resolver {
                 }
                 self.ty(t, locals, ns, span)?;
             }
-            Type::Ref(_, t) | Type::Slice(_, t) | Type::Raw(_, t) | Type::Option(t) => {
-                self.ty(t, locals, ns, span)?
-            }
+            Type::Ref(_, t)
+            | Type::Slice(_, t)
+            | Type::Raw(_, t)
+            | Type::Option(t)
+            | Type::MaybeUninit(t) => self.ty(t, locals, ns, span)?,
             Type::Result(t, e) => {
                 self.ty(t, locals, ns, span)?;
                 self.ty(e, locals, ns, span)?;

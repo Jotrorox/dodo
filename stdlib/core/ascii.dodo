@@ -1,0 +1,63 @@
+package ascii
+
+// ASCII byte operations. Non-ASCII bytes are unchanged by case conversion.
+pub fn is_ascii(value: u8) -> bool {
+    return value < 128
+}
+pub fn is_digit(value: u8) -> bool {
+    return value >= 48 && value <= 57
+}
+pub fn is_lowercase(value: u8) -> bool {
+    return value >= 97 && value <= 122
+}
+pub fn is_uppercase(value: u8) -> bool {
+    return value >= 65 && value <= 90
+}
+pub fn is_alphabetic(value: u8) -> bool {
+    return is_lowercase(value) || is_uppercase(value)
+}
+pub fn is_alphanumeric(value: u8) -> bool {
+    return is_alphabetic(value) || is_digit(value)
+}
+pub fn is_hex_digit(value: u8) -> bool {
+    return is_digit(value) || (value >= 65 && value <= 70) || (value >= 97 && value <= 102)
+}
+pub fn is_whitespace(value: u8) -> bool {
+    return value == 32 || (value >= 9 && value <= 13)
+}
+pub fn is_control(value: u8) -> bool {
+    return value < 32 || value == 127
+}
+pub fn is_graphic(value: u8) -> bool {
+    return value >= 33 && value <= 126
+}
+pub fn to_lowercase(value: u8) -> u8 {
+    if is_uppercase(value) {
+        return value + 32
+    }
+    return value
+}
+pub fn to_uppercase(value: u8) -> u8 {
+    if is_lowercase(value) {
+        return value - 32
+    }
+    return value
+}
+pub fn digit_value(value: u8) -> Option<u8> {
+    if is_digit(value) {
+        return some(value - 48)
+    }
+    return none
+}
+pub fn hex_value(value: u8) -> Option<u8> {
+    if is_digit(value) {
+        return some(value - 48)
+    }
+    if value >= 65 && value <= 70 {
+        return some(value - 55)
+    }
+    if value >= 97 && value <= 102 {
+        return some(value - 87)
+    }
+    return none
+}

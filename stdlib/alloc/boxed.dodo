@@ -1,0 +1,80 @@
+package boxed
+
+import "core/ptr"
+import "core/mem"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/block"
+
+// Own one initialized T and an exclusive checked borrow of its allocator.
+// A provides allocate(&mut self, &Layout)->Block!AllocError and an unsafe
+// deallocate(&mut self, Block). Dispatch is static, with no vtable or heap.
+// T must not carry checked borrows or contain Results, including nested ones.
+// mem.init enforces this before ownership enters opaque allocation storage;
+// dropping the Box must never silently discard a Result handling obligation.
+// The allocator remains exclusively borrowed until Box is consumed/dropped.
+pub struct Box<T, A> {
+    allocator: &mut A
+    allocation: block.Block
+    initialized: bool
+    pointer: *mut T
+
+    pub fn as_ptr(&self) -> *const T {
+        unsafe {
+            return self.pointer as *const T
+        }
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        return self.pointer
+    }
+
+    // Replace the initialized value, returning ownership of the previous one.
+    pub fn replace(&mut self, value: T) -> T {
+        unsafe {
+            previous := ptr.read(self.pointer)
+            ptr.write(self.pointer, value)
+            return previous
+        }
+    }
+
+    // Moves the value out; the destructor still releases the allocation.
+    pub fn into_inner(self) -> T {
+        self.initialized = false
+        unsafe {
+            return ptr.read(self.pointer)
+        }
+    }
+
+    fn drop(&mut self) {
+        unsafe {
+            if self.initialized {
+                ptr.drop_in_place(self.pointer)
+                self.initialized = false
+            }
+            // Moving a field out of a borrowed owner is not permitted. Build
+            // its unique deallocation descriptor from the stored metadata.
+            allocation := block.Block.from_raw_parts(self.allocation.as_ptr(), self.allocation.layout().clone())
+            self.allocator.deallocate(allocation)
+        }
+    }
+}
+
+// On failure value is destroyed exactly once.
+// SAFETY: every successful A.allocate must return unique, writable storage of
+// the requested layout that remains valid until A.deallocate. Deallocation
+// must release only that block, and must not access T after it is destroyed.
+// An unconstrained generic allocator cannot express this contract statically.
+pub unsafe fn new<T, A>(allocator: &mut A, value: T) -> Box<T, A>!error.AllocError from(allocator) {
+    requested := layout.of::<T>()?
+    allocated := allocator.allocate(&requested)?
+    // Do this after fallible allocation so allocation failure still destroys
+    // value normally. The safe opaque-storage primitive validates T's bounds.
+    initialized := mem.init(value)
+    unsafe {
+        pointer := allocated.as_ptr() as *mut T
+        ptr.write(pointer, mem.assume_init(initialized))
+        return ok(Box<T, A> { allocator: allocator, allocation: allocated,
+        initialized: true, pointer: pointer })
+    }
+}

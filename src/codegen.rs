@@ -193,6 +193,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     false,
                 )
                 .into(),
+            // An opaque single-element array preserves T's ABI size/alignment without
+            // exposing an initialized T to the language or invoking its destructor.
+            Type::MaybeUninit(t) => self.ty(t)?.array_type(1).into(),
             Type::Array(n, t) => self
                 .ty(t)?
                 .array_type(u32::try_from(*n).map_err(|_| error("array is too large for LLVM"))?)
@@ -1871,7 +1874,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         if matches!(
             name,
-            "mem.size_of" | "core.mem.size_of" | "mem.align_of" | "core.mem.align_of"
+            "mem.size_of"
+                | "core.mem.size_of"
+                | "mem.align_of"
+                | "core.mem.align_of"
+                | "mem.offset_of"
+                | "core.mem.offset_of"
         ) {
             let argument = type_args
                 .first()
@@ -1892,10 +1900,81 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             );
             let value = if name.ends_with("size_of") {
                 data.get_abi_size(&t)
+            } else if name.ends_with("offset_of") {
+                let Type::Named(owner) = argument else {
+                    return Err(error("field offset requires a struct type"));
+                };
+                let ExprKind::String(bytes, false) = &args[0].kind else {
+                    return Err(error("field offset requires a literal field name"));
+                };
+                let index = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|s| s.name == *owner)
+                    .and_then(|s| s.fields.iter().position(|f| f.name.as_bytes() == bytes))
+                    .ok_or_else(|| error("unknown field in field offset query"))?;
+                data.offset_of_element(&t.into_struct_type(), index as u32)
+                    .ok_or_else(|| error("field offset is unavailable for this struct"))?
             } else {
                 data.get_abi_alignment(&t) as u64
             };
             return Ok(self.usize_type().const_int(value, false).into());
+        }
+        if let Some(op) = name.strip_prefix("core.mem.") {
+            match op {
+                "uninit" => {
+                    // The bytes are deliberately opaque. Zero initialization is an
+                    // implementation choice, never a claim that T is initialized.
+                    return Ok(self.ty(ret)?.const_zero());
+                }
+                "init" => {
+                    let value = self.expr(&args[0])?;
+                    return Ok(self
+                        .builder
+                        .build_insert_value(
+                            self.ty(ret)?.into_array_type().const_zero(),
+                            value,
+                            0,
+                            "storage.init",
+                        )?
+                        .into_array_value()
+                        .into());
+                }
+                "assume_init" => {
+                    let storage = self.expr(&args[0])?.into_array_value();
+                    return Ok(self.builder.build_extract_value(
+                        storage,
+                        0,
+                        "storage.assume_init",
+                    )?);
+                }
+                "uninit_as_ptr" | "uninit_as_mut_ptr" => return self.expr(&args[0]),
+                "replace" | "swap" => {
+                    let pointer = self.expr(&args[0])?.into_pointer_value();
+                    let Type::Ref(_, element) = &args[0].ty else {
+                        return Err(error("memory exchange requires a reference"));
+                    };
+                    // Evaluate both operands before changing storage: a propagated
+                    // failure in the replacement must leave the old value intact.
+                    let replacement = self.expr(&args[1])?;
+                    let old = self
+                        .builder
+                        .build_load(self.ty(element)?, pointer, "mem.old")?;
+                    if op == "replace" {
+                        self.builder.build_store(pointer, replacement)?;
+                        return Ok(old);
+                    }
+                    let other = replacement.into_pointer_value();
+                    let second = self
+                        .builder
+                        .build_load(self.ty(element)?, other, "mem.other")?;
+                    self.builder.build_store(pointer, second)?;
+                    self.builder.build_store(other, old)?;
+                    return Ok(unit);
+                }
+                _ => (),
+            }
         }
         let mmio = name
             .strip_prefix("mmio.")
@@ -1931,8 +2010,73 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .strip_prefix("ptr.")
             .or_else(|| name.strip_prefix("core.ptr."))
         {
-            let pointer = self.expr(&args[0])?.into_pointer_value();
+            let input = self.expr(&args[0])?;
+            if matches!(op, "as_ptr" | "as_mut_ptr") && matches!(args[0].ty, Type::Slice(..)) {
+                return Ok(self.builder.build_extract_value(
+                    input.into_struct_value(),
+                    0,
+                    "slice.pointer",
+                )?);
+            }
+            let pointer = input.into_pointer_value();
             match op {
+                "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr" => return Ok(pointer.into()),
+                "is_null" => return Ok(self.builder.build_is_null(pointer, "ptr.is_null")?.into()),
+                "copy" | "copy_nonoverlapping" | "write_bytes" => {
+                    let second = self.expr(&args[1])?;
+                    let count = self.expr(&args[2])?.into_int_value();
+                    let Type::Raw(_, element) = &args[0].ty else {
+                        return Err(error("memory operation requires a raw pointer"));
+                    };
+                    let data = inkwell::targets::TargetData::create(
+                        self.module
+                            .get_data_layout()
+                            .as_str()
+                            .to_str()
+                            .map_err(|_| error("invalid LLVM data layout"))?,
+                    );
+                    let size = self
+                        .usize_type()
+                        .const_int(data.get_abi_size(&self.ty(element)?), false);
+                    // The unsafe caller guarantees the complete byte extent fits.
+                    let bytes = self.builder.build_int_mul(count, size, "ptr.byte_count")?;
+                    match op {
+                        "copy" => {
+                            self.builder.build_memmove(
+                                second.into_pointer_value(),
+                                1,
+                                pointer,
+                                1,
+                                bytes,
+                            )?;
+                        }
+                        "copy_nonoverlapping" => {
+                            self.builder.build_memcpy(
+                                second.into_pointer_value(),
+                                1,
+                                pointer,
+                                1,
+                                bytes,
+                            )?;
+                        }
+                        _ => {
+                            self.builder.build_memset(
+                                pointer,
+                                1,
+                                second.into_int_value(),
+                                bytes,
+                            )?;
+                        }
+                    }
+                    return Ok(unit);
+                }
+                "drop_in_place" => {
+                    let Type::Raw(_, element) = &args[0].ty else {
+                        return Err(error("dropping in place requires a raw pointer"));
+                    };
+                    self.drop_ptr(pointer, element)?;
+                    return Ok(unit);
+                }
                 "read" | "read_unaligned" | "read_volatile" => {
                     let value = self
                         .builder

@@ -1,0 +1,130 @@
+package alloc_arena_checks
+import "core/ptr"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/arena"
+
+fn verify() -> i32!error.AllocError {
+    bytes := [0xAAu8; 512]
+    allocator := arena.Arena.new(&mut bytes[1..])
+    if allocator.capacity() != 511 || allocator.used() != 0 || allocator.remaining() != 511 {
+        return ok(1)
+    }
+    zero := layout.Layout.new(0, 128)?
+    zero_block := allocator.allocate(&zero)?
+    unsafe {
+        if zero_block.as_ptr() as usize == 0 || (zero_block.as_ptr() as usize) % 128 != 0 {
+            return ok(2)
+        }
+        allocator.deallocate(zero_block)
+    }
+    if allocator.used() != 0 {
+        return ok(3)
+    }
+    previous_end := 0usize
+    for power in 0usize..7usize {
+        alignment := 1usize << power
+        requested := layout.Layout.new(3, alignment)?
+        allocated := allocator.allocate(&requested)?
+        if allocated.size() != 3 || allocated.align() != alignment {
+            return ok(4)
+        }
+        unsafe {
+            address := allocated.as_ptr() as usize
+            if address % alignment != 0 || address < previous_end {
+                return ok(5)
+            }
+            ptr.write(allocated.as_ptr(), 11u8)
+            ptr.write(ptr.offset(allocated.as_ptr(), 2), 33u8)
+            if ptr.read(allocated.as_ptr()) != 11 || ptr.read(ptr.offset(allocated.as_ptr(), 2)) != 33 {
+                return ok(6)
+            }
+            previous_end = address + 3
+            allocator.deallocate(allocated)
+        }
+    }
+    before := allocator.used()
+    too_large := layout.Layout.new(512, 1)?
+    match allocator.allocate(&too_large) {
+        ok(_) => {
+            return ok(7)
+        }
+        err(error.AllocError.Exhausted) => {}
+        err(_) => {
+            return ok(8)
+        }
+    }
+    if allocator.used() != before || allocator.remaining() + before != 511 {
+        return ok(9)
+    }
+    unsafe {
+        allocator.reset()
+    }
+    if allocator.used() != 0 {
+        return ok(10)
+    }
+    full := layout.Layout.new(511, 1)?
+    allocated := allocator.allocate_zeroed(&full)?
+    for i in 0usize..511usize {
+        unsafe {
+            if ptr.read(ptr.offset(allocated.as_ptr(), i as isize)) != 0 {
+                return ok(11)
+            }
+        }
+    }
+    if allocator.remaining() != 0 || allocator.used() != 511 {
+        return ok(12)
+    }
+    empty_full := allocator.allocate(&zero)?
+    one := layout.Layout.new(1, 1)?
+    match allocator.allocate(&one) {
+        ok(_) => {
+            return ok(13)
+        }
+        err(error.AllocError.Exhausted) => {}
+        err(_) => {
+            return ok(14)
+        }
+    }
+    unsafe {
+        allocator.deallocate(empty_full)
+        allocator.deallocate(allocated)
+        allocator.reset()
+    }
+    reused := allocator.allocate(&full)?
+    unsafe {
+        allocator.deallocate(reused)
+    }
+    core.drop(allocator)
+    // The guard byte was excluded from the allocator's checked backing slice.
+    if bytes[0] != 0xAA {
+        return ok(15)
+    }
+    empty_backing: [0]u8 = []
+    empty_arena := arena.Arena.new(&mut empty_backing)
+    empty_block := empty_arena.allocate_zeroed(&zero)?
+    unsafe {
+        empty_arena.deallocate(empty_block)
+    }
+    match empty_arena.allocate(&one) {
+        ok(_) => {
+            return ok(16)
+        }
+        err(error.AllocError.Exhausted) => {}
+        err(_) => {
+            return ok(17)
+        }
+    }
+    return ok(0)
+}
+
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

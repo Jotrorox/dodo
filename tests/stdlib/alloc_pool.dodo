@@ -1,0 +1,173 @@
+package alloc_pool_checks
+import "core/mem"
+import "core/ptr"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/block"
+import "alloc/pool"
+
+fn verify() -> i32!error.AllocError {
+    bytes := [0xAAu8; 257]
+    allocator := pool.Pool.new(&mut bytes[1..], 16, 16)?
+    capacity := allocator.capacity()
+    if capacity < 15 || capacity > 16 || allocator.available() != capacity {
+        return ok(1)
+    }
+    if allocator.block_size() != 16 || allocator.block_align() != 16 {
+        return ok(2)
+    }
+    requested := layout.Layout.new(13, 8)?
+    addresses := [0usize; 16]
+    for i in 0usize..capacity {
+        allocated := allocator.allocate(&requested)?
+        unsafe {
+            addresses[i] = allocated.as_ptr() as usize
+            if addresses[i] % 16 != 0 {
+                return ok(3)
+            }
+            for j in 0usize..i {
+                if addresses[i] == addresses[j] {
+                    return ok(4)
+                }
+            }
+            ptr.write_bytes(allocated.as_ptr(), 0x55u8, allocated.size())
+        }
+        if allocator.available() != capacity - i - 1 {
+            return ok(5)
+        }
+        // Retain the raw allocation address. Recreate its unique descriptor
+        // below under the explicit Block.from_raw_parts unsafe contract.
+        core.drop(allocated)
+    }
+    match allocator.allocate(&requested) {
+        ok(_) => {
+            return ok(6)
+        }
+        err(error.AllocError.Exhausted) => {}
+        err(_) => {
+            return ok(7)
+        }
+    }
+    zero := layout.Layout.new(0, 1024)?
+    empty := allocator.allocate(&zero)?
+    unsafe {
+        if (empty.as_ptr() as usize) % 1024 != 0 {
+            return ok(8)
+        }
+        allocator.deallocate(empty)
+    }
+    if allocator.available() != 0 {
+        return ok(9)
+    }
+    for i in 0usize..capacity {
+        unsafe {
+            released := block.Block.from_raw_parts(addresses[i] as *mut u8, requested.clone())
+            allocator.deallocate(released)
+        }
+    }
+    if allocator.available() != capacity {
+        return ok(10)
+    }
+    // Free-list metadata and previous contents are cleared from the request.
+    reused := allocator.allocate_zeroed(&requested)?
+    unsafe {
+        if reused.as_ptr() as usize != addresses[capacity - 1] {
+            return ok(11)
+        }
+        for i in 0usize..13usize {
+            if ptr.read(ptr.offset(reused.as_ptr(), i as isize)) != 0 {
+                return ok(12)
+            }
+        }
+        allocator.deallocate(reused)
+    }
+    oversized := layout.Layout.new(17, 1)?
+    match allocator.allocate(&oversized) {
+        ok(_) => {
+            return ok(13)
+        }
+        err(error.AllocError.UnsupportedLayout) => {}
+        err(_) => {
+            return ok(14)
+        }
+    }
+    over_aligned := layout.Layout.new(1, 32)?
+    match allocator.allocate(&over_aligned) {
+        ok(_) => {
+            return ok(15)
+        }
+        err(error.AllocError.UnsupportedLayout) => {}
+        err(_) => {
+            return ok(16)
+        }
+    }
+    if allocator.available() != capacity {
+        return ok(17)
+    }
+    discarded := allocator.allocate(&requested)?
+    core.drop(discarded)
+    unsafe {
+        allocator.reset()
+    }
+    if allocator.available() != capacity {
+        return ok(18)
+    }
+    first := allocator.allocate(&requested)?
+    unsafe {
+        if first.as_ptr() as usize != addresses[0] {
+            return ok(19)
+        }
+        allocator.deallocate(first)
+    }
+    core.drop(allocator)
+    if bytes[0] != 0xAA {
+        return ok(20)
+    }
+
+    small_backing := [0u8; 64]
+    small := pool.Pool.new(&mut small_backing, 1, 1)?
+    if small.block_size() != mem.size_of::<usize>() || small.block_align() != mem.align_of::<usize>() {
+        return ok(21)
+    }
+    empty_backing: [0]u8 = []
+    empty_pool := pool.Pool.new(&mut empty_backing, 16, 16)?
+    if empty_pool.capacity() != 0 {
+        return ok(22)
+    }
+    match empty_pool.allocate(&requested) {
+        ok(_) => {
+            return ok(23)
+        }
+        err(error.AllocError.Exhausted) => {}
+        err(_) => {
+            return ok(24)
+        }
+    }
+    invalid_backing := [7u8; 32]
+    match pool.Pool.new(&mut invalid_backing, 16, 3) {
+        ok(_) => {
+            return ok(25)
+        }
+        err(error.AllocError.InvalidAlignment) => {}
+        err(_) => {
+            return ok(26)
+        }
+    }
+    for byte in invalid_backing {
+        if *byte != 7 {
+            return ok(27)
+        }
+    }
+    return ok(0)
+}
+
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

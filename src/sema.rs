@@ -15,6 +15,7 @@ pub fn check(program: &mut Program) -> Check<()> {
 
 pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
     crate::prepare::prepare(program, pointer_bits)?;
+    validate_public_interfaces(program)?;
     instantiate(program)?;
     let context = Context::new(program, pointer_bits)?;
     // Publish inferred contracts before checking bodies, so editor queries can
@@ -182,9 +183,6 @@ impl Context {
                     ));
                 }
                 context.validate_type(&field.ty, field.span, false)?;
-                if declaration.public && field.public {
-                    context.public_type(&field.ty, field.span)?;
-                }
             }
             context.no_value_cycle(
                 &Type::Named(declaration.name.clone()),
@@ -209,9 +207,6 @@ impl Context {
                 }
                 for field in &variant.fields {
                     context.validate_type(&field.ty, field.span, false)?;
-                    if declaration.public {
-                        context.public_type(&field.ty, field.span)?;
-                    }
                 }
             }
             context.no_value_cycle(
@@ -222,9 +217,6 @@ impl Context {
         }
         for constant in &program.constants {
             context.validate_type(&constant.ty, constant.span, false)?;
-            if constant.public {
-                context.public_type(&constant.ty, constant.span)?;
-            }
         }
         for function in &program.functions {
             if !names.insert(function.name.clone()) {
@@ -242,14 +234,8 @@ impl Context {
                     ));
                 }
                 context.validate_type(&param.ty, param.span, false)?;
-                if function.public {
-                    context.public_type(&param.ty, param.span)?;
-                }
             }
             context.validate_type(&function.ret, function.span, true)?;
-            if function.public {
-                context.public_type(&function.ret, function.span)?;
-            }
             let mut from = function.from.clone();
             if context.carries_borrow(&function.ret) {
                 if from.is_empty() {
@@ -373,37 +359,14 @@ impl Context {
             | Type::Slice(_, t)
             | Type::Ref(_, t)
             | Type::Raw(_, t)
-            | Type::Option(t) => self.validate_type(t, span, false),
+            | Type::Option(t)
+            | Type::MaybeUninit(t) => self.validate_type(t, span, false),
             Type::Result(t, e) => {
                 self.validate_type(t, span, true)?;
                 self.validate_type(e, span, false)
             }
             _ => Ok(()),
         }
-    }
-    fn public_type(&self, ty: &Type, span: Span) -> Check<()> {
-        match ty {
-            Type::Named(name)
-                if self.structs.get(name).is_some_and(|s| !s.public)
-                    || self.enums.get(name).is_some_and(|e| !e.public) =>
-            {
-                return Err(Diagnostic::new(
-                    span,
-                    format!("public API exposes private type `{name}`"),
-                ));
-            }
-            Type::Array(_, t)
-            | Type::Slice(_, t)
-            | Type::Ref(_, t)
-            | Type::Raw(_, t)
-            | Type::Option(t) => self.public_type(t, span)?,
-            Type::Result(t, e) => {
-                self.public_type(t, span)?;
-                self.public_type(e, span)?;
-            }
-            _ => (),
-        }
-        Ok(())
     }
     fn ffi_type(&self, ty: &Type, span: Span) -> Check<()> {
         match ty {
@@ -439,7 +402,9 @@ impl Context {
                 }
                 seen.remove(name);
             }
-            Type::Array(_, t) | Type::Option(t) => self.no_value_cycle(t, seen, span)?,
+            Type::Array(_, t) | Type::Option(t) | Type::MaybeUninit(t) => {
+                self.no_value_cycle(t, seen, span)?
+            }
             Type::Result(t, e) => {
                 self.no_value_cycle(t, seen, span)?;
                 self.no_value_cycle(e, seen, span)?;
@@ -2856,6 +2821,12 @@ impl<'a> Checker<'a> {
             });
         }
         if name == "core.drop" {
+            if !type_args.is_empty() {
+                return Err(Diagnostic::new(
+                    span,
+                    "core.drop does not accept type arguments",
+                ));
+            }
             if args.len() != 1 {
                 return Err(Diagnostic::new(span, "core.drop expects one argument"));
             }
@@ -2925,22 +2896,16 @@ impl<'a> Checker<'a> {
         let mut dependencies = vec![];
         for (arg, parameter) in args.iter_mut().zip(&signature.params) {
             let reference = matches!(parameter.ty, Type::Ref(..) | Type::Slice(..));
+            let argument_start = self.temporary.len();
             let value = self.expr(arg, Some(&parameter.ty), !reference)?;
             self.expect(&parameter.ty, &value.ty, arg.span)?;
-            if reference
-                && !matches!(
-                    arg.kind,
-                    ExprKind::Unary(UnaryOp::Borrow | UnaryOp::BorrowMut, _)
-                )
-            {
-                for mut loan in value.deps.clone() {
-                    loan.mutable = mutable_borrow(&parameter.ty);
-                    self.conflict(&loan, Access::Borrow(loan.mutable), arg.span)?;
-                    // Passing a reference reserves a temporary reborrow here.
-                    // Returned dependencies retain the original source span.
-                    loan.origin = arg.span;
-                    self.temporary.push(loan);
-                }
+            if reference {
+                self.reserve_argument_borrow(
+                    &value,
+                    mutable_borrow(&parameter.ty),
+                    argument_start,
+                    arg.span,
+                )?;
             }
             if signature.from.contains(&parameter.name) {
                 dependencies.extend(value.deps);
@@ -2980,7 +2945,212 @@ impl<'a> Checker<'a> {
                 deps: vec![],
             });
         }
+        if let Some(operation) = name.strip_prefix("core.mem.") {
+            if operation == "offset_of" {
+                if type_args.len() != 1 || args.len() != 1 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.offset_of expects one struct type argument and one literal field name",
+                    ));
+                }
+                self.context.validate_type(&type_args[0], span, false)?;
+                let Type::Named(owner) = &type_args[0] else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.offset_of requires a struct type",
+                    ));
+                };
+                let declaration =
+                    self.context.structs.get(owner).ok_or_else(|| {
+                        Diagnostic::new(span, "mem.offset_of requires a struct type")
+                    })?;
+                let ExprKind::String(bytes, false) = &args[0].kind else {
+                    return Err(Diagnostic::new(
+                        args[0].span,
+                        "mem.offset_of requires a string literal field name",
+                    ));
+                };
+                let field_name = std::str::from_utf8(bytes).map_err(|_| {
+                    Diagnostic::new(args[0].span, "mem.offset_of field name must be valid UTF-8")
+                })?;
+                let field = declaration
+                    .fields
+                    .iter()
+                    .find(|f| f.name == field_name)
+                    .ok_or_else(|| {
+                        Diagnostic::new(
+                            args[0].span,
+                            format!("unknown field `{field_name}` in `{owner}`"),
+                        )
+                    })?;
+                if !field.public && type_namespace(owner) != self.namespace {
+                    return Err(Diagnostic::new(
+                        args[0].span,
+                        format!("field `{field_name}` is private to its package"),
+                    ));
+                }
+                args[0].ty = Type::Str;
+                return Ok(Value {
+                    ty: Type::usize(),
+                    deps: vec![],
+                });
+            }
+            if operation == "uninit" {
+                if type_args.len() != 1 || !args.is_empty() {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.uninit expects one type argument and no value arguments",
+                    ));
+                }
+                self.context.validate_type(&type_args[0], span, false)?;
+                return Ok(Value {
+                    ty: Type::MaybeUninit(Box::new(type_args[0].clone())),
+                    deps: vec![],
+                });
+            }
+            if operation == "init" {
+                if args.len() != 1 || type_args.len() > 1 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.init expects one value and at most one type argument",
+                    ));
+                }
+                let value = self.expr(&mut args[0], type_args.first(), true)?;
+                if let Some(expected) = type_args.first() {
+                    self.expect(expected, &value.ty, span)?;
+                }
+                self.context.validate_type(&value.ty, span, false)?;
+                if self.context.carries_borrow(&value.ty) || self.context.contains_result(&value.ty)
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.init cannot hide checked borrows or unhandled Results in opaque storage",
+                    ));
+                }
+                return Ok(Value {
+                    ty: Type::MaybeUninit(Box::new(value.ty)),
+                    deps: vec![],
+                });
+            }
+            if operation == "assume_init" {
+                self.unsafe_required(span, "assuming uninitialized storage is initialized")?;
+                if args.len() != 1 || type_args.len() > 1 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.assume_init expects one value and at most one type argument",
+                    ));
+                }
+                let value = self.expr(&mut args[0], None, true)?;
+                let Type::MaybeUninit(element) = value.ty else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.assume_init requires MaybeUninit storage",
+                    ));
+                };
+                if let Some(expected) = type_args.first() {
+                    self.expect(expected, &element, span)?;
+                }
+                if self.context.carries_borrow(&element) {
+                    return Err(Diagnostic::new(
+                        span,
+                        "reading checked-borrow values from opaque storage is unsupported",
+                    ));
+                }
+                return Ok(Value {
+                    ty: *element,
+                    deps: vec![],
+                });
+            }
+            if matches!(operation, "uninit_as_ptr" | "uninit_as_mut_ptr") {
+                if args.len() != 1 || type_args.len() > 1 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "storage pointer conversion expects one reference and at most one type argument",
+                    ));
+                }
+                let value = self.expr(&mut args[0], None, false)?;
+                let mutable = operation == "uninit_as_mut_ptr";
+                let Type::Ref(actual_mutable, storage) = value.ty else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "storage pointer conversion requires a reference to MaybeUninit",
+                    ));
+                };
+                if mutable && !actual_mutable {
+                    return Err(Diagnostic::new(
+                        span,
+                        "a mutable storage pointer requires a mutable reference",
+                    ));
+                }
+                let Type::MaybeUninit(element) = *storage else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "storage pointer conversion requires MaybeUninit",
+                    ));
+                };
+                if let Some(expected) = type_args.first() {
+                    self.expect(expected, &element, span)?;
+                }
+                return Ok(Value {
+                    ty: Type::Raw(mutable, element),
+                    deps: vec![],
+                });
+            }
+            if matches!(operation, "replace" | "swap") {
+                if args.len() != 2 || type_args.len() > 1 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.replace/mem.swap expects two arguments and at most one type argument",
+                    ));
+                }
+                let temporary_start = self.temporary.len();
+                let first = self.intrinsic_reference(&mut args[0])?;
+                let Type::Ref(true, element) = first.ty else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.replace/mem.swap requires a mutable reference",
+                    ));
+                };
+                if let Some(expected) = type_args.first() {
+                    self.expect(expected, &element, span)?;
+                }
+                if self.context.carries_borrow(&element) {
+                    return Err(Diagnostic::new(
+                        span,
+                        "replacing or swapping checked-borrow values is unsupported",
+                    ));
+                }
+                if self.context.contains_result(&element) {
+                    return Err(Diagnostic::new(
+                        span,
+                        "replacing or swapping Result-containing values is unsupported because their handling obligations cannot be transferred through a reference",
+                    ));
+                }
+                if operation == "swap" {
+                    let value = self.intrinsic_reference(&mut args[1])?;
+                    self.expect(&Type::Ref(true, element.clone()), &value.ty, args[1].span)?;
+                } else {
+                    let value = self.expr(&mut args[1], Some(&element), true)?;
+                    self.expect(&element, &value.ty, args[1].span)?;
+                }
+                self.temporary.truncate(temporary_start);
+                return Ok(Value {
+                    ty: if operation == "replace" {
+                        *element
+                    } else {
+                        Type::Void
+                    },
+                    deps: vec![],
+                });
+            }
+        }
         if let Some(operation) = name.strip_prefix("core.mmio.") {
+            if !type_args.is_empty() {
+                return Err(Diagnostic::new(
+                    span,
+                    "MMIO operations do not accept type arguments",
+                ));
+            }
             self.unsafe_required(span, "volatile MMIO access")?;
             let (write, width) = if let Some(w) = operation.strip_prefix("read") {
                 (false, w)
@@ -3019,21 +3189,75 @@ impl<'a> Checker<'a> {
             });
         }
         if let Some(operation) = name.strip_prefix("core.ptr.") {
-            self.unsafe_required(span, "raw pointer operation")?;
-            if args.is_empty() {
-                return Err(Diagnostic::new(
-                    span,
-                    "pointer operation requires a pointer argument",
-                ));
-            }
-            let pointer = self.expr(&mut args[0], None, false)?;
-            let (mutable, element) = match pointer.ty.clone() {
-                Type::Raw(m, t) => (m, *t),
+            let expected_arity = match operation {
+                "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr" | "is_null" | "read"
+                | "read_unaligned" | "read_volatile" | "drop_in_place" => 1,
+                "write" | "write_unaligned" | "write_volatile" | "offset" => 2,
+                "copy" | "copy_nonoverlapping" | "write_bytes" => 3,
                 _ => {
                     return Err(Diagnostic::new(
-                        args[0].span,
-                        "pointer operation requires a raw pointer",
+                        span,
+                        format!("unsupported pointer intrinsic `{operation}`"),
                     ));
+                }
+            };
+            if args.len() != expected_arity {
+                return Err(Diagnostic::new(
+                    span,
+                    format!(
+                        "ptr.{operation} expects {expected_arity} arguments, found {}",
+                        args.len()
+                    ),
+                ));
+            }
+            let conversion = matches!(operation, "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr");
+            if !conversion && operation != "is_null" {
+                self.unsafe_required(span, "raw pointer operation")?;
+            }
+            let pointer = self.expr(&mut args[0], None, false)?;
+            let (mutable, element) = if conversion {
+                let mutable = matches!(operation, "from_mut" | "as_mut_ptr");
+                let (actual_mutable, element) = match &pointer.ty {
+                    Type::Ref(m, t) if matches!(operation, "from_ref" | "from_mut") => {
+                        (*m, *t.clone())
+                    }
+                    Type::Slice(m, t) if matches!(operation, "as_ptr" | "as_mut_ptr") => {
+                        (*m, *t.clone())
+                    }
+                    Type::Ref(m, t) if matches!(operation, "as_ptr" | "as_mut_ptr") => {
+                        match t.as_ref() {
+                            Type::Array(_, t) => (*m, *t.clone()),
+                            _ => {
+                                return Err(Diagnostic::new(
+                                    span,
+                                    "slice pointer conversion requires a slice or borrowed array",
+                                ));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(Diagnostic::new(
+                            span,
+                            "pointer conversion requires a reference or slice of the appropriate kind",
+                        ));
+                    }
+                };
+                if mutable && !actual_mutable {
+                    return Err(Diagnostic::new(
+                        span,
+                        "a mutable raw pointer requires a mutable reference or slice",
+                    ));
+                }
+                (mutable, element)
+            } else {
+                match pointer.ty.clone() {
+                    Type::Raw(m, t) => (m, *t),
+                    _ => {
+                        return Err(Diagnostic::new(
+                            args[0].span,
+                            "pointer operation requires a raw pointer",
+                        ));
+                    }
                 }
             };
             if type_args.len() > 1 || type_args.first().is_some_and(|t| t != &element) {
@@ -3042,7 +3266,14 @@ impl<'a> Checker<'a> {
                     "pointer type argument does not match the pointer element type",
                 ));
             }
-            match operation {
+            if conversion {
+                return Ok(Value {
+                    ty: Type::Raw(mutable, Box::new(element)),
+                    deps: vec![],
+                });
+            }
+            let ty = match operation {
+                "is_null" => Type::Bool,
                 "read" | "read_unaligned" | "read_volatile" => {
                     if self.context.carries_borrow(&element) {
                         return Err(Diagnostic::new(
@@ -3050,18 +3281,9 @@ impl<'a> Checker<'a> {
                             "reading checked-borrow values through raw pointers is unsupported",
                         ));
                     }
-                    if args.len() != 1 {
-                        return Err(Diagnostic::new(span, "pointer read expects one argument"));
-                    }
-                    Ok(Value {
-                        ty: element,
-                        deps: vec![],
-                    })
+                    element
                 }
                 "write" | "write_unaligned" | "write_volatile" => {
-                    if args.len() != 2 {
-                        return Err(Diagnostic::new(span, "pointer write expects two arguments"));
-                    }
                     if !mutable {
                         return Err(Diagnostic::new(
                             span,
@@ -3076,30 +3298,66 @@ impl<'a> Checker<'a> {
                     }
                     let value = self.expr(&mut args[1], Some(&element), true)?;
                     self.expect(&element, &value.ty, args[1].span)?;
-                    Ok(Value {
-                        ty: Type::Void,
-                        deps: vec![],
-                    })
+                    Type::Void
                 }
                 "offset" => {
-                    if args.len() != 2 {
-                        return Err(Diagnostic::new(
-                            span,
-                            "pointer offset expects two arguments",
-                        ));
-                    }
                     let value = self.expr(&mut args[1], Some(&Type::isize()), false)?;
                     self.expect(&Type::isize(), &value.ty, args[1].span)?;
-                    Ok(Value {
-                        ty: pointer.ty,
-                        deps: vec![],
-                    })
+                    pointer.ty
                 }
-                _ => Err(Diagnostic::new(
-                    span,
-                    format!("unsupported pointer intrinsic `{operation}`"),
-                )),
-            }
+                "copy" | "copy_nonoverlapping" => {
+                    if self.context.carries_borrow(&element) {
+                        return Err(Diagnostic::new(
+                            span,
+                            "copying checked-borrow values through raw pointers is unsupported",
+                        ));
+                    }
+                    let destination = self.expr(&mut args[1], None, false)?;
+                    self.expect(
+                        &Type::Raw(true, Box::new(element)),
+                        &destination.ty,
+                        args[1].span,
+                    )?;
+                    let count = self.expr(&mut args[2], Some(&Type::usize()), false)?;
+                    self.expect(&Type::usize(), &count.ty, args[2].span)?;
+                    Type::Void
+                }
+                "write_bytes" => {
+                    if !mutable {
+                        return Err(Diagnostic::new(
+                            span,
+                            "cannot write through a const raw pointer",
+                        ));
+                    }
+                    if self.context.carries_borrow(&element) {
+                        return Err(Diagnostic::new(
+                            span,
+                            "writing checked borrows through raw pointers is unsupported",
+                        ));
+                    }
+                    self.arguments(&mut args[1..], &[Type::u8(), Type::usize()], span)?;
+                    Type::Void
+                }
+                "drop_in_place" => {
+                    if !mutable {
+                        return Err(Diagnostic::new(
+                            span,
+                            "dropping in place requires a mutable raw pointer",
+                        ));
+                    }
+                    if self.context.carries_borrow(&element)
+                        || self.context.contains_result(&element)
+                    {
+                        return Err(Diagnostic::new(
+                            span,
+                            "dropping checked-borrow values or unhandled Results through raw pointers is unsupported",
+                        ));
+                    }
+                    Type::Void
+                }
+                _ => unreachable!(),
+            };
+            Ok(Value { ty, deps: vec![] })
         } else {
             Err(Diagnostic::new(
                 span,
@@ -3107,6 +3365,35 @@ impl<'a> Checker<'a> {
             ))
         }
     }
+    // An argument expression may itself create its returned loan (a slice,
+    // explicit borrow, or a call returning a borrow). Do not conflict that loan
+    // with itself, but retain reservations from every earlier argument.
+    fn reserve_argument_borrow(
+        &mut self,
+        value: &Value,
+        mutable: bool,
+        start: usize,
+        span: Span,
+    ) -> Check<()> {
+        let fresh = self.temporary.split_off(start);
+        let mut reserved = vec![];
+        for mut loan in value.deps.clone() {
+            loan.mutable = mutable;
+            self.conflict(&loan, Access::Borrow(mutable), span)?;
+            loan.origin = span;
+            reserved.push(loan);
+        }
+        self.temporary.extend(fresh);
+        self.temporary.extend(reserved);
+        Ok(())
+    }
+    fn intrinsic_reference(&mut self, arg: &mut Expr) -> Check<Value> {
+        let start = self.temporary.len();
+        let value = self.expr(arg, None, false)?;
+        self.reserve_argument_borrow(&value, mutable_borrow(&value.ty), start, arg.span)?;
+        Ok(value)
+    }
+
     fn arguments(&mut self, args: &mut [Expr], expected: &[Type], span: Span) -> Check<()> {
         if args.len() != expected.len() {
             return Err(Diagnostic::new(
@@ -4153,6 +4440,75 @@ fn constant_expression(expression: &Expr) -> bool {
     }
 }
 
+// Public interfaces belong to source declarations. A specialization of a public
+// generic for a caller-private type does not publish that private type. Check
+// declarations before replacing their type parameters with concrete arguments.
+fn validate_public_interfaces(program: &Program) -> Check<()> {
+    let private: HashSet<_> = program
+        .structs
+        .iter()
+        .filter(|s| !s.public)
+        .map(|s| s.name.as_str())
+        .chain(
+            program
+                .enums
+                .iter()
+                .filter(|e| !e.public)
+                .map(|e| e.name.as_str()),
+        )
+        .collect();
+    fn visit(ty: &Type, span: Span, generic: &[String], private: &HashSet<&str>) -> Check<()> {
+        match ty {
+            Type::Named(name) | Type::Generic(name, _) => {
+                if !generic.contains(name) && private.contains(name.as_str()) {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("public API exposes private type `{name}`"),
+                    ));
+                }
+                if let Type::Generic(_, args) = ty {
+                    for arg in args {
+                        visit(arg, span, generic, private)?;
+                    }
+                }
+            }
+            Type::Array(_, t)
+            | Type::ArrayExpr(_, t)
+            | Type::Slice(_, t)
+            | Type::Ref(_, t)
+            | Type::Raw(_, t)
+            | Type::Option(t)
+            | Type::MaybeUninit(t) => visit(t, span, generic, private)?,
+            Type::Result(t, e) => {
+                visit(t, span, generic, private)?;
+                visit(e, span, generic, private)?;
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+    for structure in program.structs.iter().filter(|s| s.public) {
+        for field in structure.fields.iter().filter(|f| f.public) {
+            visit(&field.ty, field.span, &structure.generics, &private)?;
+        }
+    }
+    for enumeration in program.enums.iter().filter(|e| e.public) {
+        for field in enumeration.variants.iter().flat_map(|v| &v.fields) {
+            visit(&field.ty, field.span, &enumeration.generics, &private)?;
+        }
+    }
+    for constant in program.constants.iter().filter(|c| c.public) {
+        visit(&constant.ty, constant.span, &[], &private)?;
+    }
+    for function in program.functions.iter().filter(|f| f.public) {
+        for parameter in &function.params {
+            visit(&parameter.ty, parameter.span, &function.generics, &private)?;
+        }
+        visit(&function.ret, function.span, &function.generics, &private)?;
+    }
+    Ok(())
+}
+
 /// Explicit type arguments specialize generic declarations before type checking.
 /// Every emitted specialization goes through the same ordinary checker.
 fn instantiate(program: &mut Program) -> Check<()> {
@@ -4339,7 +4695,8 @@ impl Expander {
             | Type::Slice(_, t)
             | Type::Ref(_, t)
             | Type::Raw(_, t)
-            | Type::Option(t) => self.ty(t, substitutions, span)?,
+            | Type::Option(t)
+            | Type::MaybeUninit(t) => self.ty(t, substitutions, span)?,
             Type::Result(t, e) => {
                 self.ty(t, substitutions, span)?;
                 self.ty(e, substitutions, span)?;
@@ -4734,6 +5091,7 @@ impl Expander {
             Type::Slice(m, t) => Type::Slice(*m, Box::new(Self::substitute(t, mapping))),
             Type::Raw(m, t) => Type::Raw(*m, Box::new(Self::substitute(t, mapping))),
             Type::Option(t) => Type::Option(Box::new(Self::substitute(t, mapping))),
+            Type::MaybeUninit(t) => Type::MaybeUninit(Box::new(Self::substitute(t, mapping))),
             Type::Result(t, e) => Type::Result(
                 Box::new(Self::substitute(t, mapping)),
                 Box::new(Self::substitute(e, mapping)),
@@ -4753,7 +5111,8 @@ impl Expander {
             | Type::Ref(_, t)
             | Type::Slice(_, t)
             | Type::Raw(_, t)
-            | Type::Option(t) => Self::concrete(t, parameters),
+            | Type::Option(t)
+            | Type::MaybeUninit(t) => Self::concrete(t, parameters),
             Type::Result(t, e) => Self::concrete(t, parameters) && Self::concrete(e, parameters),
             Type::Generic(_, args) => args.iter().all(|t| Self::concrete(t, parameters)),
             _ => true,
@@ -4793,7 +5152,10 @@ impl Expander {
             | (Type::Ref(_, p), Type::Ref(_, a))
             | (Type::Slice(_, p), Type::Slice(_, a))
             | (Type::Raw(_, p), Type::Raw(_, a))
-            | (Type::Option(p), Type::Option(a)) => self.unify(p, a, parameters, mapping, span)?,
+            | (Type::Option(p), Type::Option(a))
+            | (Type::MaybeUninit(p), Type::MaybeUninit(a)) => {
+                self.unify(p, a, parameters, mapping, span)?
+            }
             (Type::Slice(_, p), Type::Ref(_, a)) => {
                 if let Type::Array(_, a) = a.as_ref() {
                     self.unify(p, a, parameters, mapping, span)?;
@@ -4891,11 +5253,39 @@ impl Expander {
                     _ => None,
                 }
             }
-            ExprKind::Call { name, .. } => self
+            ExprKind::MethodCall {
+                receiver,
+                name,
+                args,
+            } => qualified_name(receiver).and_then(|prefix| {
+                intrinsic_result_type(
+                    &format!("{prefix}.{name}"),
+                    &[],
+                    &args
+                        .iter()
+                        .map(|a| self.guess(a).unwrap_or(Type::Unknown))
+                        .collect::<Vec<_>>(),
+                )
+            }),
+            ExprKind::Call {
+                name,
+                type_args,
+                args,
+            } => self
                 .signatures
                 .get(name)
                 .filter(|f| f.generics.is_empty())
-                .map(|f| f.ret.clone()),
+                .map(|f| f.ret.clone())
+                .or_else(|| {
+                    intrinsic_result_type(
+                        name,
+                        type_args,
+                        &args
+                            .iter()
+                            .map(|a| self.guess(a).unwrap_or(Type::Unknown))
+                            .collect::<Vec<_>>(),
+                    )
+                }),
             ExprKind::Try(e) => self.guess(e).and_then(|t| {
                 if let Type::Result(t, _) = t {
                     Some(*t)
@@ -4924,7 +5314,8 @@ impl Expander {
             && let Some(prefix) = qualified_name(receiver)
             && !self.locals.contains_key(&prefix)
             && (self.signatures.contains_key(&format!("{prefix}.{name}"))
-                || self.known_enums.contains_key(&prefix))
+                || self.known_enums.contains_key(&prefix)
+                || intrinsic_result_type(&format!("{prefix}.{name}"), &[], &[]).is_some())
         {
             e.kind = ExprKind::Call {
                 name: format!("{prefix}.{name}"),
@@ -5179,6 +5570,12 @@ impl Expander {
                     }
                     self.ty(&mut ret, substitutions, span)?;
                     ret
+                } else if intrinsic_result_type(name, type_args, &[]).is_some() {
+                    let mut actuals = Vec::new();
+                    for arg in args.iter_mut() {
+                        actuals.push(self.expression(arg, substitutions, None)?);
+                    }
+                    intrinsic_result_type(name, type_args, &actuals).unwrap_or(Type::Unknown)
                 } else if matches!(name.as_str(), "some" | "ok" | "err" | "none") {
                     let payload = match (name.as_str(), expected) {
                         ("some", Some(Type::Option(t)))
@@ -5363,6 +5760,65 @@ fn specialized(name: &str, arguments: &[Type]) -> String {
         }
     }
     result
+}
+
+// Intrinsic return shapes are needed before full checking so generic callers can
+// infer their parameters from a pointer or storage-producing expression.
+fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -> Option<Type> {
+    let name = name.strip_prefix("core.").unwrap_or(name);
+    let first = args.first().cloned().unwrap_or(Type::Unknown);
+    let explicit = types.first().cloned().unwrap_or(Type::Unknown);
+    Some(match name {
+        "mem.size_of" | "mem.align_of" | "mem.offset_of" => Type::usize(),
+        "mem.uninit" => Type::MaybeUninit(Box::new(explicit)),
+        "mem.init" => Type::MaybeUninit(Box::new(if first == Type::Unknown {
+            explicit
+        } else {
+            first
+        })),
+        "mem.assume_init" => match first {
+            Type::MaybeUninit(t) => *t,
+            _ => explicit,
+        },
+        "mem.uninit_as_ptr" | "mem.uninit_as_mut_ptr" => match first {
+            Type::Ref(_, t) => match *t {
+                Type::MaybeUninit(t) => Type::Raw(name.ends_with("mut_ptr"), t),
+                _ => Type::Unknown,
+            },
+            _ => Type::Unknown,
+        },
+        "mem.replace" => match first {
+            Type::Ref(_, t) => *t,
+            _ => explicit,
+        },
+        "mem.swap"
+        | "ptr.write"
+        | "ptr.write_unaligned"
+        | "ptr.write_volatile"
+        | "ptr.copy"
+        | "ptr.copy_nonoverlapping"
+        | "ptr.write_bytes"
+        | "ptr.drop_in_place" => Type::Void,
+        "ptr.from_ref" | "ptr.from_mut" => match first {
+            Type::Ref(_, t) => Type::Raw(name.ends_with("mut"), t),
+            _ => Type::Unknown,
+        },
+        "ptr.as_ptr" | "ptr.as_mut_ptr" => match first {
+            Type::Slice(_, t) => Type::Raw(name.ends_with("mut_ptr"), t),
+            Type::Ref(_, t) => match *t {
+                Type::Array(_, t) => Type::Raw(name.ends_with("mut_ptr"), t),
+                _ => Type::Unknown,
+            },
+            _ => Type::Unknown,
+        },
+        "ptr.is_null" => Type::Bool,
+        "ptr.offset" => first,
+        "ptr.read" | "ptr.read_unaligned" | "ptr.read_volatile" => match first {
+            Type::Raw(_, t) => *t,
+            _ => explicit,
+        },
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

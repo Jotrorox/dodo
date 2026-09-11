@@ -1,0 +1,134 @@
+package pool
+
+import "core/mem"
+import "core/ptr"
+import "alloc/error"
+import "alloc/layout"
+import "alloc/block"
+
+// A fixed-block allocator with an intrusive free list. Metadata occupies free
+// blocks only; allocating and freeing take constant time and never allocate.
+pub struct Pool {
+    backing: &mut[u8]
+    start: usize
+    stride: usize
+    alignment: usize
+    count: usize
+    free: usize
+    head: usize
+
+    // Blocks are padded to hold an aligned usize free-list entry. Capacity
+    // reflects this padding and any initial backing-address alignment loss.
+    pub fn new(backing: &mut[u8], block_size: usize, block_align: usize) -> Pool!error.AllocError from(backing) {
+        requested := layout.Layout.new(block_size, block_align)?
+        alignment := requested.align()
+        if alignment < mem.align_of::<usize>() {
+            alignment = mem.align_of::<usize>()
+        }
+        size := requested.size()
+        if size < mem.size_of::<usize>() {
+            size = mem.size_of::<usize>()
+        }
+        item := layout.Layout.new(size, alignment)?
+        padded := item.pad_to_align()
+        stride := padded.size()
+        start := 0usize
+        count := 0usize
+        unsafe {
+            pointer := ptr.as_mut_ptr(backing)
+            remainder := (pointer as usize) & (alignment - 1)
+            if remainder != 0 {
+                start = alignment - remainder
+            }
+            if start <= backing.len {
+                count = (backing.len - start) / stride
+            } else {
+                start = backing.len
+            }
+            // Only pointer offsets within the signed range are representable.
+            if backing.len > layout.max_size() {
+                return err(error.AllocError.SizeOverflow)
+            }
+            for i in 0..count {
+                entry := ptr.offset(pointer, (start + i * stride) as isize) as *mut usize
+                ptr.write(entry, i + 1)
+            }
+        }
+        return ok(Pool { backing: backing, start: start, stride: stride,
+        alignment: alignment, count: count, free: count, head: 0 })
+    }
+
+    pub fn capacity(&self) -> usize {
+        return self.count
+    }
+    pub fn available(&self) -> usize {
+        return self.free
+    }
+    pub fn block_size(&self) -> usize {
+        return self.stride
+    }
+    pub fn block_align(&self) -> usize {
+        return self.alignment
+    }
+
+    pub fn allocate(&mut self, requested: &layout.Layout) -> block.Block!error.AllocError {
+        if requested.size() == 0 {
+            unsafe {
+                return ok(block.Block.from_raw_parts(requested.align() as *mut u8, requested.clone()))
+            }
+        }
+        if requested.size() > self.stride || requested.align() > self.alignment {
+            return err(error.AllocError.UnsupportedLayout)
+        }
+        if self.free == 0 {
+            return err(error.AllocError.Exhausted)
+        }
+        unsafe {
+            pointer := ptr.offset(ptr.as_mut_ptr(self.backing), (self.start + self.head * self.stride) as isize)
+            self.head = ptr.read(pointer as *mut usize)
+            self.free -= 1
+            return ok(block.Block.from_raw_parts(pointer, requested.clone()))
+        }
+    }
+
+    pub fn allocate_zeroed(&mut self, requested: &layout.Layout) -> block.Block!error.AllocError {
+        allocated := self.allocate(requested)?
+        if allocated.size() != 0 {
+            unsafe {
+                ptr.write_bytes(allocated.as_ptr(), 0u8, allocated.size())
+            }
+        }
+        return ok(allocated)
+    }
+
+    // SAFETY: allocated is a currently live block from this exact pool, freed
+    // at most once. Destroy its values and stop using its pointers before this
+    // call. Blocks from another pool or a previous reset are invalid.
+    pub unsafe fn deallocate(&mut self, allocated: block.Block) {
+        if allocated.size() == 0 {
+            return
+        }
+        unsafe {
+            pointer := allocated.as_ptr()
+            base := ptr.as_mut_ptr(self.backing) as usize + self.start
+            index := (pointer as usize - base) / self.stride
+            ptr.write(pointer as *mut usize, self.head)
+            self.head = index
+            self.free += 1
+        }
+    }
+
+    // SAFETY: destroy all values first. All outstanding pointers and blocks
+    // become invalid, including descriptors that have not been deallocated.
+    pub unsafe fn reset(&mut self) {
+        unsafe {
+            pointer := ptr.as_mut_ptr(self.backing)
+            for i in 0..self.count {
+                entry := ptr.offset(pointer, (self.start + i * self.stride) as isize) as *mut usize
+                ptr.write(entry, i + 1)
+            }
+        }
+        self.free = self.count
+        self.head = 0
+    }
+}

@@ -1,0 +1,39 @@
+package slice
+
+// Optional checked access. Returned views retain the source borrow.
+pub fn is_empty<T>(data: &[T]) -> bool {
+    return data.len == 0
+}
+pub fn get<T>(data: &[T], index: usize) -> Option<&T> from(data) {
+    if index >= data.len {
+        return none
+    }
+    return some(&data[index])
+}
+pub fn get_mut<T>(data: &mut[T], index: usize) -> Option<&mut T> from(data) {
+    if index >= data.len {
+        return none
+    }
+    return some(&mut data[index])
+}
+pub fn first<T>(data: &[T]) -> Option<&T> from(data) {
+    return get::<T>(data, 0)
+}
+pub fn last<T>(data: &[T]) -> Option<&T> from(data) {
+    if data.len == 0 {
+        return none
+    }
+    return some(&data[data.len - 1])
+}
+pub fn subslice<T>(data: &[T], start: usize, end: usize) -> Option<&[T]> from(data) {
+    if start > end || end > data.len {
+        return none
+    }
+    return some(&data[start..end])
+}
+pub fn subslice_mut<T>(data: &mut[T], start: usize, end: usize) -> Option<&mut[T]> from(data) {
+    if start > end || end > data.len {
+        return none
+    }
+    return some(&mut data[start..end])
+}

@@ -464,8 +464,15 @@ impl Parser {
                     Box::new(args[1].clone()),
                 )),
                 "Option" if args.len() == 1 => Ok(Type::Option(Box::new(args[0].clone()))),
+                "MaybeUninit" if args.len() == 1 => {
+                    Ok(Type::MaybeUninit(Box::new(args[0].clone())))
+                }
                 "Result" => Err(Diagnostic::new(start, "Result requires two type arguments")),
                 "Option" => Err(Diagnostic::new(start, "Option requires one type argument")),
+                "MaybeUninit" => Err(Diagnostic::new(
+                    start,
+                    "MaybeUninit requires one type argument",
+                )),
                 _ => Ok(Type::Generic(name, args)),
             };
         }

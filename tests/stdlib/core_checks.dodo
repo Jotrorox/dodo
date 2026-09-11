@@ -1,0 +1,623 @@
+package core_checks
+
+import "core/ascii"
+import "core/num"
+import "core/bytes"
+import "core/slice"
+import "core/option"
+import "core/mem"
+import "core/ptr"
+
+struct Tracked {
+    count: *mut i32
+    weight: i32
+
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.count, ptr.read(self.count) + self.weight)
+        }
+    }
+}
+
+fn option_ownership() -> i32 {
+    drops := 0i32
+    counter := ptr.from_mut(&mut drops)
+    value: Option<Tracked> = some(Tracked { count: counter, weight: 1 })
+    old := option.replace(&mut value, Tracked { count: counter, weight: 2 })
+    core.drop(old)
+    taken := option.take(&mut value)
+    selected := option.unwrap_or(taken, Tracked { count: counter, weight: 4 })
+    if drops != 5 {
+        return 78
+    }
+    core.drop(selected)
+    if drops != 7 {
+        return 79
+    }
+    fallback := option.unwrap_or(value, Tracked { count: counter, weight: 8 })
+    core.drop(fallback)
+    if drops != 15 {
+        return 80
+    }
+    return 0
+}
+
+fn arithmetic() -> i32 {
+    match num.checked_add(0, 0) {
+        ok(value) => {
+            if value != 0 {
+                return 1
+            }
+        }, err(_) => {
+            return 1
+        }
+    }
+    match num.checked_add(num.MAX - 1, 1) {
+        ok(value) => {
+            if value != num.MAX {
+                return 2
+            }
+        }, err(_) => {
+            return 2
+        }
+    }
+    match num.checked_sub(num.MAX, num.MAX) {
+        ok(value) => {
+            if value != 0 {
+                return 3
+            }
+        }, err(_) => {
+            return 3
+        }
+    }
+    match num.checked_mul(0, num.MAX) {
+        ok(value) => {
+            if value != 0 {
+                return 4
+            }
+        }, err(_) => {
+            return 4
+        }
+    }
+    match num.checked_mul(num.MAX, 1) {
+        ok(value) => {
+            if value != num.MAX {
+                return 5
+            }
+        }, err(_) => {
+            return 5
+        }
+    }
+    match num.checked_div(num.MAX, num.MAX) {
+        ok(value) => {
+            if value != 1 {
+                return 6
+            }
+        }, err(_) => {
+            return 6
+        }
+    }
+    match num.checked_rem(num.MAX, num.MAX) {
+        ok(value) => {
+            if value != 0 {
+                return 7
+            }
+        }, err(_) => {
+            return 7
+        }
+    }
+    match num.checked_shl(1, mem.size_of::<usize>() * 8 - 1) {
+        ok(value) => {
+            if value != (num.MAX / 2) + 1 {
+                return 8
+            }
+        }, err(_) => {
+            return 8
+        }
+    }
+    match num.checked_shr(num.MAX, mem.size_of::<usize>() * 8 - 1) {
+        ok(value) => {
+            if value != 1 {
+                return 9
+            }
+        }, err(_) => {
+            return 9
+        }
+    }
+    match num.align_up(0, 8) {
+        ok(value) => {
+            if value != 0 {
+                return 10
+            }
+        }, err(_) => {
+            return 10
+        }
+    }
+    match num.align_up(17, 16) {
+        ok(value) => {
+            if value != 32 {
+                return 11
+            }
+        }, err(_) => {
+            return 11
+        }
+    }
+    match num.align_up(num.MAX, 1) {
+        ok(value) => {
+            if value != num.MAX {
+                return 12
+            }
+        }, err(_) => {
+            return 12
+        }
+    }
+    match num.checked_add(num.MAX, 1) {
+        ok(_) => {
+            return 13
+        }, err(reason) => {
+            if reason != num.ArithmeticError.Overflow {
+                return 13
+            }
+        }
+    }
+    match num.checked_sub(0, 1) {
+        ok(_) => {
+            return 14
+        }, err(reason) => {
+            if reason != num.ArithmeticError.Overflow {
+                return 14
+            }
+        }
+    }
+    match num.checked_mul(num.MAX, 2) {
+        ok(_) => {
+            return 15
+        }, err(reason) => {
+            if reason != num.ArithmeticError.Overflow {
+                return 15
+            }
+        }
+    }
+    match num.checked_div(1, 0) {
+        ok(_) => {
+            return 16
+        }, err(reason) => {
+            if reason != num.ArithmeticError.DivisionByZero {
+                return 16
+            }
+        }
+    }
+    match num.checked_rem(1, 0) {
+        ok(_) => {
+            return 17
+        }, err(reason) => {
+            if reason != num.ArithmeticError.DivisionByZero {
+                return 17
+            }
+        }
+    }
+    match num.checked_shl(num.MAX, 1) {
+        ok(_) => {
+            return 18
+        }, err(reason) => {
+            if reason != num.ArithmeticError.Overflow {
+                return 18
+            }
+        }
+    }
+    match num.checked_shl(0, mem.size_of::<usize>() * 8) {
+        ok(_) => {
+            return 19
+        }, err(reason) => {
+            if reason != num.ArithmeticError.InvalidShift {
+                return 19
+            }
+        }
+    }
+    match num.checked_shr(0, mem.size_of::<usize>() * 8) {
+        ok(_) => {
+            return 20
+        }, err(reason) => {
+            if reason != num.ArithmeticError.InvalidShift {
+                return 20
+            }
+        }
+    }
+    match num.align_up(1, 0) {
+        ok(_) => {
+            return 21
+        }, err(reason) => {
+            if reason != num.ArithmeticError.InvalidAlignment {
+                return 21
+            }
+        }
+    }
+    match num.align_up(1, 3) {
+        ok(_) => {
+            return 22
+        }, err(reason) => {
+            if reason != num.ArithmeticError.InvalidAlignment {
+                return 22
+            }
+        }
+    }
+    match num.align_up(num.MAX, 2) {
+        ok(_) => {
+            return 23
+        }, err(reason) => {
+            if reason != num.ArithmeticError.Overflow {
+                return 23
+            }
+        }
+    }
+    if num.wrapping_add(num.MAX, 1) != 0 || num.wrapping_sub(0, 1) != num.MAX {
+        return 24
+    }
+    if num.wrapping_mul(num.MAX, num.MAX) != 1 || num.wrapping_mul(num.MAX, 2) != num.MAX - 1 {
+        return 25
+    }
+    if num.saturating_add(num.MAX, 1) != num.MAX || num.saturating_sub(0, 1) != 0 {
+        return 26
+    }
+    if num.saturating_mul(num.MAX, 2) != num.MAX || num.saturating_mul(0, num.MAX) != 0 {
+        return 27
+    }
+    if num.is_power_of_two(0) || num.is_power_of_two(3) || !num.is_power_of_two(1) {
+        return 28
+    }
+    if num.min(3, 2) != 2 || num.max(3, 2) != 3 {
+        return 29
+    }
+    for a in 0usize..32 {
+        for b in 0usize..32 {
+            if num.wrapping_add(a, b) != a + b || num.wrapping_mul(a, b) != a * b {
+                return 30
+            }
+        }
+    }
+    return 0
+}
+
+fn byte_operations() -> i32 {
+    empty: [0]u8 = []
+    data := [0u8; 20]
+    if!bytes.equal(&empty, &empty) || bytes.compare(&empty, &data) != -1 {
+        return 31
+    }
+    if!bytes.starts_with(&data, &empty) || !bytes.ends_with(&data, &empty) {
+        return 32
+    }
+    match bytes.find(&empty, 0) {
+        some(_) => {
+            return 33
+        }, none => {}
+    }
+    match bytes.copy_from(&mut data, &empty) {
+        ok() => {
+            return 34
+        }, err(_) => {}
+    }
+    for &value in data {
+        if value != 0 {
+            return 35
+        }
+    }
+    match bytes.write_u16_le(&mut data, 1, 0xa1b2u16) {
+        ok() => {}, err(_) => {
+            return 36
+        }
+    }
+    match bytes.read_u16_le(&data, 1) {
+        ok(value) => {
+            if value != 0xa1b2u16 {
+                return 36
+            }
+        }, err(_) => {
+            return 36
+        }
+    }
+    match bytes.write_u16_be(&mut data, 1, 0xa1b2u16) {
+        ok() => {}, err(_) => {
+            return 37
+        }
+    }
+    match bytes.read_u16_be(&data, 1) {
+        ok(value) => {
+            if value != 0xa1b2u16 {
+                return 37
+            }
+        }, err(_) => {
+            return 37
+        }
+    }
+    match bytes.write_u32_le(&mut data, 1, 0x89abcdefu32) {
+        ok() => {}, err(_) => {
+            return 38
+        }
+    }
+    match bytes.read_u32_le(&data, 1) {
+        ok(value) => {
+            if value != 0x89abcdefu32 {
+                return 38
+            }
+        }, err(_) => {
+            return 38
+        }
+    }
+    match bytes.write_u32_be(&mut data, 1, 0x89abcdefu32) {
+        ok() => {}, err(_) => {
+            return 39
+        }
+    }
+    match bytes.read_u32_be(&data, 1) {
+        ok(value) => {
+            if value != 0x89abcdefu32 {
+                return 39
+            }
+        }, err(_) => {
+            return 39
+        }
+    }
+    match bytes.write_u64_le(&mut data, 1, 0x0123456789abcdefu64) {
+        ok() => {}, err(_) => {
+            return 40
+        }
+    }
+    match bytes.read_u64_le(&data, 1) {
+        ok(value) => {
+            if value != 0x0123456789abcdefu64 {
+                return 40
+            }
+        }, err(_) => {
+            return 40
+        }
+    }
+    match bytes.write_u64_be(&mut data, 1, 0x0123456789abcdefu64) {
+        ok() => {}, err(_) => {
+            return 41
+        }
+    }
+    match bytes.read_u64_be(&data, 1) {
+        ok(value) => {
+            if value != 0x0123456789abcdefu64 {
+                return 41
+            }
+        }, err(_) => {
+            return 41
+        }
+    }
+    match bytes.write_u32_be(&mut data, 1, 0x01020304) {
+        ok() => {}, err(_) => {
+            return 42
+        }
+    }
+    if data[1] != 1 || data[2] != 2 || data[3] != 3 || data[4] != 4 {
+        return 43
+    }
+    match bytes.write_u32_le(&mut data, 1, 0x01020304) {
+        ok() => {}, err(_) => {
+            return 44
+        }
+    }
+    if data[1] != 4 || data[2] != 3 || data[3] != 2 || data[4] != 1 {
+        return 45
+    }
+    bytes.fill(&mut data, 77)
+    match bytes.write_u64_be(&mut data, 15, 0) {
+        ok() => {
+            return 46
+        }, err(_) => {}
+    }
+    match bytes.write_u16_le(&mut data, num.MAX, 0) {
+        ok() => {
+            return 47
+        }, err(_) => {}
+    }
+    for &value in data {
+        if value != 77 {
+            return 48
+        }
+    }
+    match bytes.read_u64_le(&empty, 0) {
+        ok(_) => {
+            return 49
+        }, err(_) => {}
+    }
+    match bytes.read_u16_be(&data, num.MAX) {
+        ok(_) => {
+            return 50
+        }, err(_) => {}
+    }
+    odd := [1u8, 2, 3, 4, 5]
+    bytes.reverse(&mut odd)
+    if odd[0] != 5 || odd[4] != 1 || odd[2] != 3 {
+        return 51
+    }
+    bytes.reverse(&mut empty)
+    prefix := &mut data[..5]
+    match bytes.copy_from(prefix, &odd) {
+        ok() => {}, err(_) => {
+            return 52
+        }
+    }
+    if!bytes.equal(&data[..5], &odd) || bytes.compare(&data[..5], &odd) != 0 {
+        return 53
+    }
+    if!bytes.starts_with(&data, &odd) || !bytes.ends_with(&odd, &odd[3..]) {
+        return 54
+    }
+    match bytes.find(&odd, 3) {
+        some(index) => {
+            if index != 2 {
+                return 55
+            }
+        }, none => {
+            return 55
+        }
+    }
+    return 0
+}
+
+fn views() -> i32 {
+    data := [10i32, 20, 30]
+    match slice.get(&data, 1) {
+        some(value) => {
+            if *value != 20 {
+                return 56
+            }
+        }, none => {
+            return 56
+        }
+    }
+    match slice.get(&data, num.MAX) {
+        some(_) => {
+            return 57
+        }, none => {}
+    }
+    match slice.get_mut(&mut data, 1) {
+        some(value) => {
+            *value = 25
+        }, none => {
+            return 58
+        }
+    }
+    match slice.first(&data) {
+        some(value) => {
+            if *value != 10 {
+                return 59
+            }
+        }, none => {
+            return 59
+        }
+    }
+    match slice.last(&data) {
+        some(value) => {
+            if *value != 30 {
+                return 60
+            }
+        }, none => {
+            return 60
+        }
+    }
+    match slice.subslice(&data, 3, 3) {
+        some(value) => {
+            if!slice.is_empty(value) {
+                return 61
+            }
+        }, none => {
+            return 61
+        }
+    }
+    match slice.subslice(&data, 2, 1) {
+        some(_) => {
+            return 62
+        }, none => {}
+    }
+    match slice.subslice_mut(&mut data, 1, 3) {
+        some(value) => {
+            value[0] = 99
+        }, none => {
+            return 63
+        }
+    }
+    if data[1] != 99 {
+        return 64
+    }
+    value: Option<i32> = some(42)
+    old := option.take(&mut value)
+    if option.unwrap_or(old, 0) != 42 {
+        return 65
+    }
+    match value {
+        some(_) => {
+            return 66
+        }, none => {}
+    }
+    value = none
+    match option.replace(&mut value, 7) {
+        some(_) => {
+            return 67
+        }, none => {}
+    }
+    if option.unwrap_or(value, 0) != 7 {
+        return 68
+    }
+    return 0
+}
+
+fn ascii_operations() -> i32 {
+    for number in 0u16..256 {
+        value := number as u8
+        lower := ascii.to_lowercase(value)
+        upper := ascii.to_uppercase(value)
+        if ascii.to_lowercase(lower) != lower || ascii.to_uppercase(upper) != upper {
+            return 69
+        }
+        if number >= 128 && (lower != value || upper != value || ascii.is_ascii(value)) {
+            return 70
+        }
+        if ascii.is_digit(value) {
+            match ascii.digit_value(value) {
+                some(digit) => {
+                    if digit >= 10 {
+                        return 71
+                    }
+                }, none => {
+                    return 71
+                }
+            }
+        } else {
+            match ascii.digit_value(value) {
+                some(_) => {
+                    return 72
+                }, none => {}
+            }
+        }
+        if ascii.is_hex_digit(value) {
+            match ascii.hex_value(value) {
+                some(digit) => {
+                    if digit >= 16 {
+                        return 73
+                    }
+                }, none => {
+                    return 73
+                }
+            }
+        } else {
+            match ascii.hex_value(value) {
+                some(_) => {
+                    return 74
+                }, none => {}
+            }
+        }
+    }
+    if!ascii.is_digit(48) || !ascii.is_digit(57) || ascii.is_digit(47) || ascii.is_digit(58) {
+        return 75
+    }
+    if!ascii.is_whitespace(11) || ascii.is_whitespace(0) || !ascii.is_control(127) {
+        return 76
+    }
+    if!ascii.is_graphic(126) || ascii.is_graphic(127) || !ascii.is_alphanumeric(90) {
+        return 77
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    if option_ownership() != 0 {
+        return 81
+    }
+    code := arithmetic()
+    if code != 0 {
+        return code
+    }
+    code = byte_operations()
+    if code != 0 {
+        return code
+    }
+    code = views()
+    if code != 0 {
+        return code
+    }
+    return ascii_operations()
+}

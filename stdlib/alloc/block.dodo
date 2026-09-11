@@ -1,0 +1,32 @@
+package block
+
+import "alloc/layout"
+
+// A raw allocation descriptor. Moving it does not release storage or destroy
+// values. Its allocator and backing storage must outlive every pointer access.
+// There is deliberately no clone: deallocation consumes the descriptor once.
+pub struct Block {
+    pointer: *mut u8
+    allocation_layout: layout.Layout
+
+    // SAFETY: pointer is nonnull and aligned for allocation_layout. A nonzero
+    // allocation covers at least layout.size() writable, exclusively owned
+    // bytes. Zero-size pointers may dangle and must never be dereferenced.
+    // The caller establishes which allocator owns this allocation.
+    pub unsafe fn from_raw_parts(pointer: *mut u8, allocation_layout: layout.Layout) -> Block {
+        return Block { pointer: pointer, allocation_layout: allocation_layout }
+    }
+
+    pub fn as_ptr(&self) -> *mut u8 {
+        return self.pointer
+    }
+    pub fn size(&self) -> usize {
+        return self.allocation_layout.size()
+    }
+    pub fn align(&self) -> usize {
+        return self.allocation_layout.align()
+    }
+    pub fn layout(&self) -> &layout.Layout {
+        return &self.allocation_layout
+    }
+}

@@ -37,6 +37,17 @@ are statically dispatched; associated functions use `Type.name(...)`.
 calls with compiler lowering, not user-definable macros. See [memory and foreign calls](memory-and-ffi.md#implemented-core-calls)
 for the supported intrinsic signatures.
 
+The compiler also embeds the Dodo source packages listed in
+[core and allocation](standard-library.md). Imports beginning with `core/` or
+`alloc/` always resolve from this bundled library, independent of the current
+directory; local files cannot shadow them. Unknown standard imports are errors.
+Only the imported packages and their dependencies are loaded.
+
+Package names `core`, `mem`, `ptr`, and `mmio` are reserved. Other package names
+still use the final path component globally: two distinct imported packages
+named `layout`, for example, conflict. Each package must directly import the
+intrinsics it uses; a dependency's import does not grant access to its callers.
+
 ## A two-file example
 
 Create this directory layout:

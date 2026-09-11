@@ -1,14 +1,41 @@
-//! Local package loading, namespace resolution, and source-aware diagnostics.
+//! Package loading, namespace resolution, and source-aware diagnostics.
 //!
 //! A file compiles that file. A directory compiles its immediate `.dodo` files
-//! in lexical order. Imports resolve relative to the importing package, without
-//! network access or an implicit dependency cache.
+//! in lexical order. `core/*` and `alloc/*` resolve from bundled sources. Other
+//! imports resolve relative to the importing package, without network access or
+//! an implicit dependency cache.
 use crate::ast::*;
 use crate::diagnostic::Diagnostic;
 use crate::parser;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+
+include!(concat!(env!("OUT_DIR"), "/stdlib_sources.rs"));
+
+const INTRINSIC_IMPORTS: &[&str] = &["core/mem", "core/ptr", "core/mmio"];
+
+/// Distinct identities prevent a local path from impersonating a bundled source.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ModuleId {
+    Local(PathBuf),
+    Bundled(String),
+}
+
+impl ModuleId {
+    fn path(&self) -> PathBuf {
+        match self {
+            Self::Local(path) => path.clone(),
+            Self::Bundled(import) => PathBuf::from("<stdlib>").join(format!("{import}.dodo")),
+        }
+    }
+}
+
+impl std::fmt::Display for ModuleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.path().display().fmt(f)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Source {
@@ -101,7 +128,7 @@ pub fn load_with_overlays(
         overlays,
         ..Loader::default()
     };
-    let root = loader.module(path, None)?;
+    let root = loader.module(ModuleId::Local(source_path(path)), None)?;
     let mut program = Program::default();
     let known_packages = loader.aliases.keys().cloned().collect();
     for (key, mut module) in loader.modules {
@@ -123,7 +150,7 @@ pub fn load_with_overlays(
             &known_packages,
             &visible_packages,
         )
-        .map_err(|error| format!("{}: {error}", key.display()))?;
+        .map_err(|error| format!("{key}: {error}"))?;
         append(&mut program, module.program);
     }
     program.imports.sort();
@@ -141,9 +168,9 @@ struct Module {
 
 struct Loader<'a> {
     overlays: &'a BTreeMap<PathBuf, String>,
-    modules: BTreeMap<PathBuf, Module>,
-    aliases: BTreeMap<String, PathBuf>,
-    loading: Vec<PathBuf>,
+    modules: BTreeMap<ModuleId, Module>,
+    aliases: BTreeMap<String, ModuleId>,
+    loading: Vec<ModuleId>,
     sources: Vec<Source>,
     offset: usize,
 }
@@ -154,7 +181,15 @@ impl Default for Loader<'_> {
         Self {
             overlays: &EMPTY,
             modules: BTreeMap::new(),
-            aliases: BTreeMap::new(),
+            aliases: INTRINSIC_IMPORTS
+                .iter()
+                .map(|import| {
+                    (
+                        import.rsplit('/').next().unwrap().to_owned(),
+                        ModuleId::Bundled((*import).to_owned()),
+                    )
+                })
+                .collect(),
             loading: vec![],
             sources: vec![],
             offset: 0,
@@ -165,24 +200,23 @@ impl Default for Loader<'_> {
 impl Loader<'_> {
     fn module(
         &mut self,
-        requested: &Path,
+        id: ModuleId,
         expected_alias: Option<&str>,
-    ) -> Result<PathBuf, LoadError> {
-        let path = source_path(requested);
-        if !self.overlays.contains_key(&path) {
-            requested
-                .canonicalize()
-                .map_err(|error| format!("cannot open {}: {error}", requested.display()))?;
+    ) -> Result<ModuleId, LoadError> {
+        let path = id.path();
+        if matches!(id, ModuleId::Local(_)) && !self.overlays.contains_key(&path) {
+            path.canonicalize()
+                .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
         }
-        if let Some(index) = self.loading.iter().position(|entry| entry == &path) {
+        if let Some(index) = self.loading.iter().position(|entry| entry == &id) {
             let mut cycle: Vec<String> = self.loading[index..]
                 .iter()
-                .map(|entry| entry.display().to_string())
+                .map(ToString::to_string)
                 .collect();
             cycle.push(path.display().to_string());
             return Err(format!("cyclic package import: {}", cycle.join(" -> ")).into());
         }
-        if let Some(module) = self.modules.get(&path) {
+        if let Some(module) = self.modules.get(&id) {
             if expected_alias.is_some_and(|alias| alias != module.alias) {
                 return Err(format!(
                     "{} declares package `{}`, which differs from its import name",
@@ -191,15 +225,18 @@ impl Loader<'_> {
                 )
                 .into());
             }
-            return Ok(path);
+            return Ok(id);
         }
         if self.loading.len() >= 128 {
             return Err("package import nesting exceeds the supported limit of 128"
                 .to_owned()
                 .into());
         }
-        self.loading.push(path.clone());
-        let files = source_files(&path, self.overlays)?;
+        self.loading.push(id.clone());
+        let files = match &id {
+            ModuleId::Local(_) => source_files(&path, self.overlays)?,
+            ModuleId::Bundled(_) => vec![path.clone()],
+        };
         let directory = if path.is_dir() {
             path.as_path()
         } else {
@@ -207,11 +244,18 @@ impl Loader<'_> {
         };
         let mut program = Program::default();
         for file in files {
-            let text = match self.overlays.get(&file) {
-                Some(text) => text.clone(),
-                None => std::fs::read_to_string(&file).map_err(|error| {
-                    format!("cannot read UTF-8 source {}: {error}", file.display())
-                })?,
+            let text = match &id {
+                ModuleId::Bundled(import) => BUNDLED_SOURCES
+                    .iter()
+                    .find(|(name, _)| name == import)
+                    .map(|(_, text)| (*text).to_owned())
+                    .ok_or_else(|| format!("unknown standard library import `{import}`"))?,
+                ModuleId::Local(_) => match self.overlays.get(&file) {
+                    Some(text) => text.clone(),
+                    None => std::fs::read_to_string(&file).map_err(|error| {
+                        format!("cannot read UTF-8 source {}: {error}", file.display())
+                    })?,
+                },
             };
             let mut unit = parser::parse(&text).map_err(|diagnostic| LoadError {
                 diagnostic,
@@ -255,6 +299,13 @@ impl Loader<'_> {
             append(&mut program, unit);
         }
         let alias = program.package.clone();
+        if alias == "core" {
+            return Err(format!(
+                "{} declares package `core`, which is reserved for compiler intrinsics",
+                path.display()
+            )
+            .into());
+        }
         if expected_alias.is_some_and(|expected| expected != alias) {
             return Err(format!(
                 "{} declares package `{alias}`; expected `{}` to match the import's final component",
@@ -263,29 +314,30 @@ impl Loader<'_> {
             ).into());
         }
         if let Some(previous) = self.aliases.get(&alias) {
-            if previous != &path {
+            if previous != &id {
                 return Err(format!(
-                    "conflicting package name `{alias}`: {} and {}",
-                    previous.display(),
+                    "conflicting package name `{alias}`: {previous} and {}",
                     path.display()
                 )
                 .into());
             }
         } else {
-            self.aliases.insert(alias.clone(), path.clone());
+            self.aliases.insert(alias.clone(), id.clone());
         }
         let mut import_aliases = BTreeMap::new();
         let mut imports = program.imports.clone();
         imports.sort();
         imports.dedup();
         for import in imports {
-            if import == "core" || import.starts_with("core/") {
-                continue;
-            }
             let import_path = Path::new(&import);
-            if import_path
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
+            if import.is_empty()
+                || import.contains('\\')
+                || import
+                    .split('/')
+                    .any(|part| part.is_empty() || matches!(part, "." | ".."))
+                || import_path
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
             {
                 return Err(format!(
                     "invalid import `{import}` in {}: use a relative package path without `.` or `..`",
@@ -296,8 +348,32 @@ impl Loader<'_> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("invalid import path `{import}`"))?;
-            let dependency = resolve_import(directory, import_path, self.overlays)?;
-            let dependency = self.module(&dependency, Some(import_alias))?;
+            let standard = matches!(import.split('/').next(), Some("core" | "alloc"));
+            let dependency = if INTRINSIC_IMPORTS.contains(&import.as_str()) {
+                ModuleId::Bundled(import.clone())
+            } else if standard {
+                if !BUNDLED_SOURCES.iter().any(|(name, _)| *name == import) {
+                    return Err(format!(
+                        "unknown standard library import `{import}` in {}",
+                        path.display()
+                    )
+                    .into());
+                }
+                self.module(ModuleId::Bundled(import.clone()), Some(import_alias))?
+            } else {
+                if matches!(id, ModuleId::Bundled(_)) {
+                    return Err(format!(
+                        "bundled package {path} cannot import local package `{import}`",
+                        path = path.display()
+                    )
+                    .into());
+                }
+                let dependency = resolve_import(directory, import_path, self.overlays)?;
+                self.module(
+                    ModuleId::Local(source_path(&dependency)),
+                    Some(import_alias),
+                )?
+            };
             if let Some(previous) =
                 import_aliases.insert(import_alias.to_owned(), dependency.clone())
                 && previous != dependency
@@ -310,8 +386,8 @@ impl Loader<'_> {
             }
         }
         self.loading.pop();
-        self.modules.insert(path.clone(), Module { program, alias });
-        Ok(path)
+        self.modules.insert(id.clone(), Module { program, alias });
+        Ok(id)
     }
 }
 
@@ -491,6 +567,19 @@ struct Names<'a> {
 }
 impl Names<'_> {
     fn name(&self, name: &str, excluded: &BTreeSet<String>) -> String {
+        // Fully qualified intrinsic calls must obey the same per-package import
+        // rules as their shorter `mem`, `ptr`, and `mmio` spellings. `core.drop`
+        // remains available without any import.
+        if let Some(intrinsic) = name
+            .strip_prefix("core.")
+            .and_then(|suffix| suffix.split('.').next())
+            .filter(|prefix| matches!(*prefix, "mem" | "ptr" | "mmio"))
+            && !self.visible_packages.contains(intrinsic)
+        {
+            self.missing_imports
+                .borrow_mut()
+                .insert(intrinsic.to_owned());
+        }
         let first = name.split('.').next().unwrap_or(name);
         if self.symbols.contains(first) && !excluded.contains(first) {
             if self.prefix.is_empty() {
@@ -572,6 +661,7 @@ impl Names<'_> {
             | Type::Slice(_, inner)
             | Type::Ref(_, inner)
             | Type::Raw(_, inner)
+            | Type::MaybeUninit(inner)
             | Type::Option(inner) => self.scoped_ty(inner, locals, generics),
             Type::Result(ok, error) => {
                 self.scoped_ty(ok, locals, generics);

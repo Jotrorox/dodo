@@ -40,6 +40,14 @@ Custom targets require caller-supplied startup and linker configuration.
 | `core.drop(value)` | `void` | Consumes a value; cannot discard a Result. |
 | `mem.size_of::<T>()` | `usize` | Selected-target ABI size; `void` is zero. |
 | `mem.align_of::<T>()` | `usize` | Selected-target ABI alignment; `void` is one. |
+| `mem.offset_of::<T>("field")` | `usize` | Direct accessible field of a struct; selected-target ABI offset. |
+| `mem.replace(&mut value, replacement)` | Old value | Moves without dropping; disallows checked-borrow/Result-containing values. |
+| `mem.swap(&mut a, &mut b)` | `void` | Disjoint initialized values; same type restrictions as `replace`. |
+| `mem.uninit::<T>()` | `MaybeUninit<T>` | Opaque storage with T's size/alignment; never implicitly drops T. |
+| `mem.init(value)` | `MaybeUninit<T>` | Moves T into opaque storage; cannot hide checked borrows or Results. |
+| `mem.assume_init(storage)` | `T` | Unsafe; consumes fully initialized storage; checked-borrow T unsupported. |
+| `mem.uninit_as_ptr(&storage)` | `*const T` | Obtains a raw pointer without reading or initializing T. |
+| `mem.uninit_as_mut_ptr(&mut storage)` | `*mut T` | Requires an exclusive reference to the storage. |
 | `mmio.read8/16/32/64(address)` | Corresponding unsigned integer | Unsafe; `address: usize`. |
 | `mmio.write8/16/32/64(address, value)` | `void` | Unsafe; width-matched value. |
 | `ptr.read(pointer)` | Pointee value | Unsafe; raw pointer. |
@@ -49,6 +57,13 @@ Custom targets require caller-supplied startup and linker configuration.
 | `ptr.read_volatile(pointer)` | Pointee value | Unsafe; volatile load. |
 | `ptr.write_volatile(pointer, value)` | `void` | Unsafe; volatile store. |
 | `ptr.offset(pointer, offset)` | Same pointer type | Unsafe; `offset: isize`, in elements. |
+| `ptr.from_ref(&value)` / `ptr.from_mut(&mut value)` | `*const T` / `*mut T` | Safe pointer conversion; dereferencing remains unsafe. |
+| `ptr.as_ptr(slice)` / `ptr.as_mut_ptr(slice)` | `*const T` / `*mut T` | Borrowed array or slice; mutable form requires exclusive access. |
+| `ptr.is_null(pointer)` | `bool` | Safe; does not access storage. |
+| `ptr.copy(source, destination, count)` | `void` | Unsafe; copies `count` T elements; overlapping ranges allowed. |
+| `ptr.copy_nonoverlapping(source, destination, count)` | `void` | Unsafe; copied ranges must not overlap. |
+| `ptr.write_bytes(destination, byte, count)` | `void` | Unsafe; fills `count * size_of<T>()` bytes with a `u8` pattern. |
+| `ptr.drop_in_place(pointer)` | `void` | Unsafe; destroys one initialized T, including its fields; does not free storage. |
 
 ## Unsafe memory access
 
@@ -57,6 +72,19 @@ remain subject to the specification's validity and aliasing obligations.
 Reading/writing checked-borrow-carrying values through raw pointer intrinsics and
 raw-pointer-to-checked-reference casts are rejected in this release. Unsafe
 functions still need explicit unsafe blocks for unchecked operations.
+
+Raw copies and byte fills operate on byte ranges with alignment one and do not
+establish initialization or ownership by themselves. Their element count times
+element size must fit in `usize`, and nonempty source/destination ranges must be
+valid for the requested reads/writes. Zero-byte operations accept null pointers,
+including nonzero counts of zero-sized elements. A bitwise copy of an owning
+value must not result in two live owners being destroyed. `drop_in_place`
+requires a valid aligned pointer to an initialized value, and that value must
+not subsequently be dropped again without reinitialization.
+
+Pointer conversions do not extend storage lifetimes or create a checked borrow
+from a raw pointer. Raw access must respect all live checked borrows. Allocator
+and storage examples are in [core and allocation](standard-library.md).
 
 ## MMIO and volatile access
 

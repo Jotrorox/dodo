@@ -1,0 +1,169 @@
+package core_foundation
+import "core/mem"
+import "core/ptr"
+unsafe extern "C" fn putchar(value: i32) -> i32
+struct Token {
+    id: i32
+    fn drop(self: &mut Self) -> void {
+        unsafe {
+            putchar(self.id)
+        }
+    }
+}
+struct Empty {}
+@repr(C)
+struct Padded {
+    prefix: u8
+    word: u32
+    tail: u8
+    address: usize
+}
+struct GenericLayout<T> {
+    prefix: u8
+    value: T
+}
+fn value_offset<T>() -> usize {
+    return mem.offset_of::<GenericLayout<T>>("value")
+}
+fn identity<T>(value: T) -> T {
+    return value
+}
+fn slice_address(value: &[u32]) -> *const u32 {
+    return ptr.as_ptr(value)
+}
+fn slice_mut_address(value: &mut[u32]) -> *mut u32 {
+    return ptr.as_mut_ptr(value)
+}
+fn main() -> i32 {
+    if mem.offset_of::<Padded>("prefix") != 0usize {
+        return 16
+    }
+    if identity(mem.offset_of::<Padded>("word")) != 4usize {
+        return 17
+    }
+    if mem.offset_of::<Padded>("tail") != 8usize {
+        return 18
+    }
+    pointer_align := mem.align_of::<usize>()
+    expected_address := ((9usize + pointer_align - 1usize) / pointer_align) * pointer_align
+    if mem.offset_of::<Padded>("address") != expected_address {
+        return 19
+    }
+    if value_offset::<u64>() != mem.align_of::<u64>() {
+        return 20
+    }
+    if mem.size_of::<MaybeUninit<Token>>() != mem.size_of::<Token>() {
+        return 1
+    }
+    if mem.align_of::<MaybeUninit<Token>>() != mem.align_of::<Token>() {
+        return 2
+    }
+    if mem.size_of::<MaybeUninit<Empty>>() != 0usize {
+        return 3
+    }
+    if mem.align_of::<MaybeUninit<Empty>>() != mem.align_of::<Empty>() {
+        return 4
+    }
+    untouched := mem.uninit::<Token>()
+    core.drop(untouched)
+    leaked := mem.init(Token { id: 90 })
+    core.drop(leaked)
+    slot := mem.uninit::<Token>()
+    raw := mem.uninit_as_mut_ptr(&mut slot)
+    unsafe {
+        ptr.write(raw, Token { id: 65 })
+    }
+    value := unsafe {
+        mem.assume_init(slot)
+    }
+    old := mem.replace(&mut value, Token { id: 66 })
+    core.drop(old)
+    other := Token { id: 67 }
+    mem.swap(&mut value, &mut other)
+    core.drop(value)
+    core.drop(other)
+    storage := mem.init(Token { id: 68 })
+    unsafe {
+        ptr.drop_in_place(mem.uninit_as_mut_ptr(&mut storage))
+    }
+    core.drop(storage)
+    moved := mem.init(Token { id: 69 })
+    destination := mem.uninit::<Token>()
+    unsafe {
+        ptr.copy_nonoverlapping(mem.uninit_as_ptr(&moved), mem.uninit_as_mut_ptr(&mut destination), 1usize)
+    }
+    result := unsafe {
+        mem.assume_init(destination)
+    }
+    core.drop(result)
+    core.drop(moved)
+    values := ([1u32, 2u32, 3u32, 4u32, 5u32]: [5]u32)
+    pointer := identity(ptr.as_mut_ptr(&mut values))
+    unsafe {
+        ptr.copy(pointer, ptr.offset(pointer, 1isize), 4usize)
+    }
+    if values[0] != 1u32 || values[1] != 1u32 || values[2] != 2u32 || values[3] != 3u32 || values[4] != 4u32 {
+        return 5
+    }
+    unsafe {
+        ptr.copy(ptr.offset(pointer, 1isize), pointer, 4usize)
+    }
+    if values[0] != 1u32 || values[1] != 2u32 || values[2] != 3u32 || values[3] != 4u32 || values[4] != 4u32 {
+        return 6
+    }
+    unsafe {
+        ptr.write_bytes(pointer, 255u8, 2usize)
+    }
+    if values[0] != 4294967295u32 || values[1] != 4294967295u32 || values[2] != 3u32 {
+        return 7
+    }
+    separate := ([0u32, 0u32, 0u32, 0u32, 0u32]: [5]u32)
+    unsafe {
+        ptr.copy_nonoverlapping(ptr.as_ptr(&values), ptr.as_mut_ptr(&mut separate), 5usize)
+    }
+    if separate[3] != 4u32 {
+        return 8
+    }
+    scalar := 42u32
+    if ptr.is_null(ptr.from_ref(&scalar)) {
+        return 9
+    }
+    if ptr.is_null(ptr.from_mut(&mut scalar)) {
+        return 9
+    }
+    unsafe {
+        ptr.write(ptr.from_mut(&mut scalar), 24u32)
+    }
+    if scalar != 24u32 {
+        return 10
+    }
+    unsafe {
+        if ptr.read(slice_address(&values)) != values[0] {
+            return 11
+        }
+        ptr.write(slice_mut_address(&mut separate), 9u32)
+        if separate[0] != 9u32 {
+            return 12
+        }
+        null := 0usize as *mut u32
+        if!ptr.is_null(null) {
+            return 13
+        }
+        ptr.copy(null, null, 0usize)
+        ptr.copy_nonoverlapping(null, null, 0usize)
+        ptr.write_bytes(null, 255u8, 0usize)
+        empty := 0usize as *mut Empty
+        ptr.copy(empty, empty, 12usize)
+        ptr.copy_nonoverlapping(empty, empty, 12usize)
+        ptr.write_bytes(empty, 255u8, 12usize)
+    }
+    empty_array := ([]: [0]u8)
+    if empty_array.len != 0usize {
+        return 14
+    }
+    pointer_empty := ptr.as_ptr(&empty_array)
+    unsafe {
+        ptr.copy(pointer_empty, pointer_empty as *mut u8, 0usize)
+    }
+    return 0
+}

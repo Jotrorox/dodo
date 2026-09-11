@@ -1,0 +1,146 @@
+package alloc_layout_checks
+import "core/mem"
+import "alloc/error"
+import "alloc/layout"
+
+struct Empty {}
+struct Padded {
+    first: u8, second: u64
+}
+
+fn verify() -> i32!error.AllocError {
+    basic := layout.Layout.new(9, 8)?
+    if basic.size() != 9 || basic.align() != 8 || basic.padding() != 7 {
+        return ok(1)
+    }
+    padded := basic.pad_to_align()
+    if padded.size() != 16 || padded.align() != 8 || padded.padding() != 0 {
+        return ok(2)
+    }
+    repeated := basic.repeat(3)?
+    if repeated.size() != 48 || repeated.align() != 8 {
+        return ok(3)
+    }
+    aligned := basic.align_to(16)?
+    if aligned.size() != 9 || aligned.align() != 16 {
+        return ok(4)
+    }
+    unchanged := basic.align_to(1)?
+    if unchanged.align() != 8 {
+        return ok(5)
+    }
+    field := layout.Layout.new(4, 4)?
+    extended := basic.extend(&field)?
+    if extended.offset() != 12 || extended.layout().size() != 16 || extended.layout().align() != 8 {
+        return ok(6)
+    }
+    extracted := extended.into_layout()
+    if extracted.size() != 16 {
+        return ok(7)
+    }
+
+    typed := layout.of::<Padded>()?
+    if typed.size() != mem.size_of::<Padded>() || typed.align() != mem.align_of::<Padded>() {
+        return ok(8)
+    }
+    array := layout.array::<u64>(7)?
+    if array.size() != 56 || array.align() != mem.align_of::<u64>() {
+        return ok(9)
+    }
+    empty := layout.array::<Empty>(~0usize)?
+    if empty.size() != 0 {
+        return ok(10)
+    }
+    zero_repeat := basic.repeat(0)?
+    if zero_repeat.size() != 0 || zero_repeat.align() != 8 {
+        return ok(11)
+    }
+
+    invalid_alignments := [0usize, 3, 6, 7, 9]
+    for invalid in invalid_alignments {
+        match layout.Layout.new(0, *invalid) {
+            ok(_) => {
+                return ok(12)
+            }
+            err(error.AllocError.InvalidAlignment) => {}
+            err(_) => {
+                return ok(13)
+            }
+        }
+    }
+    match basic.align_to(3) {
+        ok(_) => {
+            return ok(14)
+        }
+        err(error.AllocError.InvalidAlignment) => {}
+        err(_) => {
+            return ok(15)
+        }
+    }
+    largest := layout.Layout.new(layout.max_size(), 1)?
+    if largest.size() != layout.max_size() {
+        return ok(16)
+    }
+    match layout.Layout.new(layout.max_size(), 2) {
+        ok(_) => {
+            return ok(17)
+        }
+        err(error.AllocError.SizeOverflow) => {}
+        err(_) => {
+            return ok(18)
+        }
+    }
+    match layout.array::<u64>(layout.max_size() / 8 + 1) {
+        ok(_) => {
+            return ok(19)
+        }
+        err(error.AllocError.SizeOverflow) => {}
+        err(_) => {
+            return ok(20)
+        }
+    }
+    match largest.extend(&field) {
+        ok(_) => {
+            return ok(21)
+        }
+        err(error.AllocError.SizeOverflow) => {}
+        err(_) => {
+            return ok(22)
+        }
+    }
+    match largest.repeat(2) {
+        ok(_) => {
+            return ok(23)
+        }
+        err(error.AllocError.SizeOverflow) => {}
+        err(_) => {
+            return ok(24)
+        }
+    }
+    // Highest power-of-two alignment is meaningful for a zero-size layout.
+    huge_zero := layout.Layout.new(0, layout.max_size() + 1)?
+    if huge_zero.padding() != 0 {
+        return ok(25)
+    }
+    match huge_zero.align_to(3) {
+        ok(_) => {
+            return ok(26)
+        }
+        err(error.AllocError.InvalidAlignment) => {}
+        err(_) => {
+            return ok(27)
+        }
+    }
+    return ok(0)
+}
+
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

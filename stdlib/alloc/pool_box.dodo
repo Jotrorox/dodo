@@ -1,0 +1,16 @@
+package pool_box
+
+import "alloc/error"
+import "alloc/pool"
+import "alloc/boxed"
+
+// Own a value in a caller-backed pool block. The returned Box exclusively
+// borrows its allocator until extraction or destruction. T cannot carry checked
+// borrows or contain Results. Allocation failure destroys value normally.
+pub fn new<T>(allocator: &mut pool.Pool, value: T) -> boxed.Box<T, pool.Pool>!error.AllocError from(allocator) {
+    // SAFETY: Pool guarantees unique, aligned live storage until deallocation;
+    // Box retains a checked borrow of the Pool, which retains its backing.
+    unsafe {
+        return boxed.new::<T, pool.Pool>(allocator, value)
+    }
+}
