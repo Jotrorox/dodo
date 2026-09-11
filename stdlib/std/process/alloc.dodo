@@ -1,0 +1,95 @@
+package alloc
+
+import "std/process"
+import "std/bytes_alloc"
+import "alloc/arena"
+import "alloc/error"
+
+pub enum Error {
+    Allocation(error.AllocError),
+    Collection(process.CollectError)
+}
+pub struct Output<A, B> {
+    stdout_buffer: bytes_alloc.Buffer<A>
+    stderr_buffer: bytes_alloc.Buffer<B>
+    exit_status: process.ExitStatus
+    pub fn stdout(&self) -> &[u8] {
+        return self.stdout_buffer.as_slice()
+    }
+    pub fn stderr(&self) -> &[u8] {
+        return self.stderr_buffer.as_slice()
+    }
+    pub fn status(&self) -> &process.ExitStatus {
+        return &self.exit_status
+    }
+}
+fn initialize<A>(buffer: &mut bytes_alloc.Buffer<A>, limit: usize) -> void!error.AllocError {
+    zeroes := [0u8; 256]
+    for buffer.len() < limit {
+        count := limit - buffer.len()
+        if count > 256 {
+            count = 256
+        }
+        buffer.extend(&zeroes[..count])?
+    }
+    return ok()
+}
+// SAFETY: Both allocators meet std/bytes_alloc.new's allocation/deallocation
+// contract. Each is exclusively borrowed by its output buffer. No global
+// allocator is consulted. Both bounds are allocated before touching the child.
+// Allocation failure leaves the child live; collection failure reaps it and
+// destroys both buffers (use caller-backed collect to retain failure prefixes).
+pub unsafe fn collect<A, B>(child: &mut process.Child, stdout_allocator: &mut A,
+stderr_allocator: &mut B, stdout_limit: usize, stderr_limit: usize,
+timeout_ms: u64) -> Output<A, B>!Error from(stdout_allocator, stderr_allocator) {
+    stdout := match unsafe {
+        bytes_alloc.new(stdout_allocator, stdout_limit, stdout_limit)
+    }
+    {
+        ok(value) => {
+            value
+        }, err(reason) => {
+            return err(Error.Allocation(reason))
+        }
+    }
+    stderr := match unsafe {
+        bytes_alloc.new(stderr_allocator, stderr_limit, stderr_limit)
+    }
+    {
+        ok(value) => {
+            value
+        }, err(reason) => {
+            return err(Error.Allocation(reason))
+        }
+    }
+    match initialize(&mut stdout, stdout_limit) {
+        ok() => {}, err(reason) => {
+            return err(Error.Allocation(reason))
+        }
+    }
+    match initialize(&mut stderr, stderr_limit) {
+        ok() => {}, err(reason) => {
+            return err(Error.Allocation(reason))
+        }
+    }
+    report := match child.collect(stdout.as_mut_slice(), stderr.as_mut_slice(), timeout_ms) {
+        ok(value) => {
+            value
+        }, err(reason) => {
+            return err(Error.Collection(reason))
+        }
+    }
+    stdout.truncate(report.stdout_len)
+    stderr.truncate(report.stderr_len)
+    // The complete report is consumed through an explicit status accessor in
+    // process to preserve move-only fields without exposing raw storage.
+    exit_status := process.into_status(report)
+    return ok(Output<A, B> { stdout_buffer: stdout, stderr_buffer: stderr, exit_status: exit_status })
+}
+pub fn collect_arena(child: &mut process.Child, stdout_allocator: &mut arena.Arena,
+stderr_allocator: &mut arena.Arena, stdout_limit: usize, stderr_limit: usize,
+timeout_ms: u64) -> Output<arena.Arena, arena.Arena>!Error from(stdout_allocator, stderr_allocator) {
+    return unsafe {
+        collect(child, stdout_allocator, stderr_allocator, stdout_limit, stderr_limit, timeout_ms)
+    }
+}

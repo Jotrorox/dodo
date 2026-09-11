@@ -1,0 +1,176 @@
+package fs_linux_checks
+
+import "std/fs"
+import "std/fs/unix"
+import "std/fs/types"
+import "std/platform/native"
+import "std/platform/error"
+import "std/io"
+import "core/bytes"
+import "core/ptr"
+
+unsafe extern "C" fn pipe(descriptors: *mut i32) -> i32
+
+fn count_descriptors() -> usize!error.Error {
+    source := native.NativeString.new(b"/proc/self/fd\x00")?
+    b := [0u8; 512]
+    w := [0u16; 1]
+    dir := fs.Directory.open(&source, &mut b, &mut w)?
+    count := 0usize
+    for true {
+        match dir.next(&mut b, &mut w)? {
+            some(_) => {
+                count += 1
+            }
+            none => {
+                return ok(count)
+            }
+        }
+    }
+    return ok(count)
+}
+fn early_failure(path: &native.NativeString) -> void!error.Error {
+    options := fs.OpenOptions.read_only()
+    file := fs.File.open(path, &options)?
+    return err(error.failure(error.Kind.Cancelled))
+}
+fn verify() -> i32!error.Error {
+    path := native.NativeString.new(b"nonutf-\xFF file\x00")?
+    target := native.NativeString.new(b"nonutf-\xFF file\x00")?
+    link := native.NativeString.new(b"symbolic link\x00")?
+    options := fs.OpenOptions.create_new()
+    writer := unix.open(&path, &options, 384)?
+    match io.write_all(&mut writer, b"native bytes") {
+        ok(_) => {}
+        err(_) => {
+            return ok(1)
+        }
+    }
+    writer.close()?
+    info := fs.metadata(&path)?
+    if!info.unix_metadata || (info.mode & 511) != 384 || info.inode == 0 || info.links != 1 {
+        return ok(2)
+    }
+    unix.set_mode(&path, 416)?
+    changed := fs.metadata(&path)?
+    if (changed.mode & 511) != 416 {
+        return ok(3)
+    }
+    fs.symlink(&target, &link, false)?
+    following := fs.metadata(&link)?
+    nonfollowing := fs.symlink_metadata(&link)?
+    if following.kind != types.FileKind.File || following.size != 12 || nonfollowing.kind != types.FileKind.SymbolicLink {
+        return ok(4)
+    }
+    b := [0u8; 4096]
+    w := [0u16; 1]
+    value := fs.read_link(&link, &mut b, &mut w)?
+    if!bytes.equal(value.units(), path.units()) {
+        return ok(5)
+    }
+    output := [0u8; 128]
+    match native.to_utf8(&value, &mut output, false) {
+        ok(_) => {
+            return ok(6)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.InvalidInput {
+                return ok(7)
+            }
+        }
+    }
+    n := native.to_utf8(&value, &mut output, true)?
+    if!bytes.equal(&output[..n], b"nonutf-\xEF\xBF\xBD file") {
+        return ok(8)
+    }
+    core.drop(value)
+    tiny := [0u8; 2]
+    match fs.read_link(&link, &mut tiny, &mut w) {
+        ok(_) => {
+            return ok(9)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.BufferTooSmall {
+                return ok(10)
+            }
+        }
+    }
+    nofollow := fs.OpenOptions.read_only()
+    nofollow.follow_symlinks = false
+    match fs.File.open(&link, &nofollow) {
+        ok(_) => {
+            return ok(11)
+        }
+        err(_) => {}
+    }
+    before := count_descriptors()?
+    for i in 0usize..256 {
+        match early_failure(&path) {
+            ok() => {
+                return ok(12)
+            }
+            err(_) => {}
+        }
+        match fs.File.open(&path, &options) {
+            ok(_) => {
+                return ok(13)
+            }
+            err(_) => {}
+        }
+    }
+    after := count_descriptors()?
+    if before != after {
+        return ok(14)
+    }
+    fs.remove_file(&link)?
+    existing := fs.metadata(&path)?
+    if existing.size != 12 {
+        return ok(15)
+    }
+    fs.remove_file(&path)?
+    match native.NativeString.new(b"interior\x00nul\x00") {
+        ok(_) => {
+            return ok(16)
+        }
+        err(_) => {}
+    }
+    match native.NativeString.new(b"missing terminator") {
+        ok(_) => {
+            return ok(17)
+        }
+        err(_) => {}
+    }
+    // File wrappers around a closed-reader native pipe must report EPIPE,
+    // preserving process-global signal disposition and ownership cleanup.
+    descriptors := [0i32; 2]
+    unsafe {
+        if pipe(ptr.as_mut_ptr(&mut descriptors)) != 0 {
+            return err(native.last_error())
+        }
+        reader := fs.File.from_raw(descriptors[0] as isize)
+        writer := fs.File.from_raw(descriptors[1] as isize)
+        reader.close()?
+        match writer.write(b"closed reader") {
+            ok(_) => {
+                return ok(18)
+            }
+            err(reason) => {
+                if reason.code != 32 {
+                    return ok(19)
+                }
+            }
+        }
+        writer.close()?
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(reason) => {
+            return 100 + reason.code % 100
+        }
+    }
+}

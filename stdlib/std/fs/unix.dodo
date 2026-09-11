@@ -1,0 +1,21 @@
+package unix
+
+import "std/fs"
+import "std/fs/linux"
+import "std/platform/native"
+import "std/platform/error"
+
+// Importing this extension on a non-Linux target is a build diagnostic.
+// Permission bits include setuid/setgid/sticky and are constrained to 07777.
+pub fn open(path: &native.NativeString, options: &fs.OpenOptions, mode: u32) -> fs.File!error.Error {
+    return fs.open_with_options(path, options, mode, 7)
+}
+pub fn set_mode(path: &native.NativeString, mode: u32) -> void!error.Error {
+    return linux.set_mode(path, mode)
+}
+pub fn create_directory(path: &native.NativeString, mode: u32) -> void!error.Error {
+    if mode > 4095 {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    return linux.create_directory(path, mode)
+}

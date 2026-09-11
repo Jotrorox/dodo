@@ -1,0 +1,55 @@
+package fs_path_checks
+import "std/fs/path"
+import "std/platform/error"
+import "core/bytes"
+fn verify() -> i32!error.Error {
+    output := [0u8; 64]
+    n := path.lexical_unix(b"//a/./b//../c/", &mut output)?
+    if!bytes.equal(&output[..n], b"//a/b/../c/") || output[n] != 0 {
+        return ok(1)
+    }
+    n = path.lexical_unix(b"././", &mut output)?
+    if!bytes.equal(&output[..n], b"./") {
+        return ok(2)
+    }
+    match path.lexical_unix(b"", &mut output) {
+        ok(_) => {
+            return ok(3)
+        }
+        err(_) => {}
+    }
+    source := [67u16, 58, 97, 47, 46, 47, 98, 92, 46, 46]
+    wide := [0u16; 64]
+    count := path.lexical_windows(&source, &mut wide)?
+    expected := [67u16, 58, 97, 92, 98, 92, 46, 46]
+    if count != expected.len || wide[count] != 0 {
+        return ok(4)
+    }
+    for i in 0usize..count {
+        if wide[i] != expected[i] {
+            return ok(5)
+        }
+    }
+    device := [92u16, 92, 63, 92, 67, 58, 92]
+    match path.lexical_windows(&device, &mut wide) {
+        ok(_) => {
+            return ok(6)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.Unsupported {
+                return ok(7)
+            }
+        }
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 99
+        }
+    }
+}

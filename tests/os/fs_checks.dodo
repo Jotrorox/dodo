@@ -1,0 +1,305 @@
+package fs_checks
+
+import "std/fs"
+import "std/fs/types"
+import "std/platform/native"
+import "std/platform/error"
+import "std/io"
+import "core/bytes"
+import "core/mem"
+
+fn verify() -> i32!error.Error {
+    dbytes := [0u8; 512]
+    dwide := [0u16; 512]
+    directory := native.from_utf8("fs space Ω", &mut dbytes, &mut dwide)?
+    fs.create_directory(&directory)?
+    match fs.create_directory(&directory) {
+        ok() => {
+            return ok(1)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.AlreadyExists {
+                return ok(2)
+            }
+        }
+    }
+    emptyb := [0u8; 128]
+    emptyw := [0u16; 128]
+    empty_directory := fs.Directory.open(&directory, &mut emptyb, &mut emptyw)?
+    match empty_directory.next(&mut emptyb, &mut emptyw)? {
+        some(_) => {
+            return ok(46)
+        }
+        none => {}
+    }
+    empty_directory.close()?
+    db := [0u8; 512]
+    dw := [0u16; 512]
+    path := native.from_utf8("fs space Ω/file Ω 😀.txt", &mut db, &mut dw)?
+    read := fs.OpenOptions.read_only()
+    match fs.File.open(&path, &read) {
+        ok(_) => {
+            return ok(3)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.NotFound {
+                return ok(4)
+            }
+        }
+    }
+    invalid := fs.OpenOptions.new()
+    match fs.File.open(&path, &invalid) {
+        ok(_) => {
+            return ok(5)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.InvalidInput {
+                return ok(6)
+            }
+        }
+    }
+    options := fs.OpenOptions.create_new()
+    options.read = true
+    file := fs.File.open(&path, &options)?
+    match io.write_all(&mut file, b"hello") {
+        ok(n) => {
+            if n != 5 {
+                return ok(7)
+            }
+        }
+        err(_) => {
+            return ok(8)
+        }
+    }
+    match file.seek(0) {
+        ok(_) => {}
+        err(_) => {
+            return ok(9)
+        }
+    }
+    data := [0u8; 8]
+    match io.read_up_to(&mut file, &mut data) {
+        ok(n) => {
+            if n != 5 {
+                return ok(10)
+            }
+        }
+        err(_) => {
+            return ok(11)
+        }
+    }
+    if!bytes.equal(&data[..5], b"hello") {
+        return ok(12)
+    }
+    info := file.metadata()?
+    if info.kind != types.FileKind.File || info.size != 5 {
+        return ok(13)
+    }
+    file.flush()?
+    file.sync()?
+    file.close()?
+    file.close()?
+    match file.read(&mut data) {
+        ok(_) => {
+            return ok(14)
+        }
+        err(_) => {}
+    }
+    match fs.File.open(&path, &options) {
+        ok(_) => {
+            return ok(15)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.AlreadyExists {
+                return ok(16)
+            }
+        }
+    }
+    append := fs.OpenOptions.new()
+    append.append = true
+    appender := fs.File.open(&path, &append)?
+    match appender.seek(0) {
+        ok(_) => {}
+        err(_) => {
+            return ok(17)
+        }
+    }
+    match io.write_all(&mut appender, b"!") {
+        ok(_) => {}
+        err(_) => {
+            return ok(18)
+        }
+    }
+    appender.close()?
+    reader := fs.File.open(&path, &read)?
+    match io.read_up_to(&mut reader, &mut data) {
+        ok(n) => {
+            if n != 6 {
+                return ok(19)
+            }
+        }
+        err(_) => {
+            return ok(20)
+        }
+    }
+    if!bytes.equal(&data[..6], b"hello!") {
+        return ok(21)
+    }
+    reader.close()?
+    dirinfo := fs.metadata(&directory)?
+    if dirinfo.kind != types.FileKind.Directory {
+        return ok(22)
+    }
+    scratchb := [0u8; 16384]
+    scratchw := [0u16; 4096]
+    listing := fs.Directory.open(&directory, &mut scratchb, &mut scratchw)?
+    tinyb := [0u8; 1]
+    tinyw := [0u16; 1]
+    match listing.next(&mut tinyb, &mut tinyw) {
+        ok(_) => {
+            return ok(23)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.BufferTooSmall {
+                return ok(24)
+            }
+        }
+    }
+    display := [0u8; 512]
+    match listing.next(&mut scratchb, &mut scratchw)? {
+        some(name) => {
+            count := native.to_utf8(&name, &mut display, false)?
+            if!bytes.equal(&display[..count], mem.str_bytes("file Ω 😀.txt")) {
+                return ok(25)
+            }
+        }
+        none => {
+            return ok(26)
+        }
+    }
+    match listing.next(&mut scratchb, &mut scratchw)? {
+        some(_) => {
+            return ok(27)
+        }
+        none => {}
+    }
+    listing.close()?
+    cb := [0u8; 512]
+    cw := [0u16; 512]
+    copied := native.from_utf8("fs space Ω/copied.txt", &mut cb, &mut cw)?
+    copy_buffer := [0u8; 2]
+    match fs.copy_new(&path, &copied, &mut copy_buffer, 100) {
+        ok(report) => {
+            if!report.eof || report.read != 6 || report.written != 6 {
+                return ok(28)
+            }
+        }
+        err(_) => {
+            return ok(29)
+        }
+    }
+    match fs.copy_new(&path, &copied, &mut copy_buffer, 100) {
+        ok(_) => {
+            return ok(30)
+        }
+        err(_) => {}
+    }
+    match fs.rename(&path, &copied, false) {
+        ok() => {
+            return ok(31)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.AlreadyExists {
+                return ok(32)
+            }
+        }
+    }
+    unchanged := fs.metadata(&path)?
+    if unchanged.size != 6 {
+        return ok(33)
+    }
+    fs.remove_file(&copied)?
+    match fs.copy_new(&path, &copied, &mut copy_buffer, 3) {
+        ok(report) => {
+            if report.eof || report.read != 3 || report.written != 3 {
+                return ok(40)
+            }
+        }
+        err(_) => {
+            return ok(41)
+        }
+    }
+    partial := fs.metadata(&copied)?
+    if partial.size != 3 {
+        return ok(42)
+    }
+    fs.remove_file(&copied)?
+    no_scratch: [0]u8 = []
+    match fs.copy_new(&path, &copied, &mut no_scratch, 1) {
+        ok(_) => {
+            return ok(43)
+        }
+        err(_) => {}
+    }
+    match fs.metadata(&copied) {
+        ok(_) => {
+            return ok(44)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.NotFound {
+                return ok(45)
+            }
+        }
+    }
+    fs.rename(&path, &copied, false)?
+    fs.rename(&copied, &path, true)?
+    fs.set_readonly(&path, true)?
+    permissions := fs.metadata(&path)?
+    if!permissions.readonly {
+        return ok(34)
+    }
+    fs.set_readonly(&path, false)?
+    truncate := fs.OpenOptions.new()
+    truncate.write = true
+    truncate.truncate = true
+    writer := fs.File.open(&path, &truncate)?
+    empty := writer.metadata()?
+    if empty.size != 0 {
+        return ok(35)
+    }
+    writer.set_len(9)?
+    grown := writer.metadata()?
+    if grown.size != 9 {
+        return ok(36)
+    }
+    writer.close()?
+    resolved := fs.canonicalize(&path, &mut scratchb, &mut scratchw)?
+    resolved_metadata := fs.metadata(&resolved)?
+    if resolved_metadata.size != 9 {
+        return ok(37)
+    }
+    core.drop(resolved)
+    match fs.remove_directory(&directory) {
+        ok() => {
+            return ok(38)
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.DirectoryNotEmpty {
+                return ok(39)
+            }
+        }
+    }
+    fs.remove_file(&path)?
+    fs.remove_directory(&directory)?
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(reason) => {
+            return 100 + reason.code % 100
+        }
+    }
+}

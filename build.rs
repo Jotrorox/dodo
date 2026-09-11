@@ -10,7 +10,12 @@ fn collect(directory: &Path, files: &mut Vec<PathBuf>) {
         let kind = entry.file_type().expect("inspect standard library entry");
         if kind.is_dir() {
             collect(&entry.path(), files);
-        } else if kind.is_file() && entry.path().extension().is_some_and(|ext| ext == "dodo") {
+        } else if kind.is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "dodo" || ext == "c" || ext == "h")
+        {
             files.push(entry.path());
         }
     }
@@ -24,6 +29,7 @@ fn main() {
     collect(&root, &mut files);
     files.sort();
     let mut inventory = String::from("const BUNDLED_SOURCES: &[(&str, &str)] = &[\n");
+    let mut native = String::from("const BUNDLED_NATIVE_SOURCES: &[(&str, &str)] = &[\n");
     for file in files {
         let relative = file.strip_prefix(&root).unwrap();
         let name = relative
@@ -36,11 +42,19 @@ fn main() {
             "standard library module must be in core/, alloc/, or std/: {name}"
         );
         let source_path = format!("/stdlib/{}", relative.to_str().unwrap().replace('\\', "/"));
-        inventory.push_str(&format!(
+        let entry = format!(
             "    ({name:?}, include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), {source_path:?}))),\n"
-        ));
+        );
+        if file.extension().is_some_and(|ext| ext == "dodo") {
+            inventory.push_str(&entry);
+        } else {
+            let name = relative.to_str().unwrap().replace('\\', "/");
+            native.push_str(&format!("    ({name:?}, include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), {source_path:?}))),\n"));
+        }
     }
     inventory.push_str("];\n");
+    native.push_str("];\n");
+    inventory.push_str(&native);
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("stdlib_sources.rs");
     fs::write(output, inventory).expect("write embedded standard library inventory");
 }

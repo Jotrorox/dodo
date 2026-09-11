@@ -41,6 +41,8 @@ struct Modifiers {
     unsafe_: bool,
     extern_: bool,
     repr_c: bool,
+    unsafe_send: bool,
+    unsafe_sync: bool,
 }
 
 impl Parser {
@@ -201,17 +203,27 @@ impl Parser {
                 }
                 self.struct_decl(&mut program, mods, start)?;
             } else if self.at("enum") {
-                if mods.unsafe_ || mods.extern_ || mods.repr_c {
+                if mods.unsafe_
+                    || mods.extern_
+                    || mods.repr_c
+                    || mods.unsafe_send
+                    || mods.unsafe_sync
+                {
                     return Err(self.error("enum declarations only support the `pub` modifier"));
                 }
                 program.enums.push(self.enum_decl(mods.public, start)?);
             } else if self.at("fn") {
-                if mods.repr_c {
-                    return Err(self.error("@repr(C) applies to structs"));
+                if mods.repr_c || mods.unsafe_send || mods.unsafe_sync {
+                    return Err(self.error("representation and thread contracts apply to structs"));
                 }
                 program.functions.push(self.function(mods, start)?);
             } else if self.at("const") || self.at("static") {
-                if mods.unsafe_ || mods.extern_ || mods.repr_c {
+                if mods.unsafe_
+                    || mods.extern_
+                    || mods.repr_c
+                    || mods.unsafe_send
+                    || mods.unsafe_sync
+                {
                     return Err(self.error("constant and static declarations only support `pub`"));
                 }
                 program.constants.push(self.constant(mods.public, start)?);
@@ -254,9 +266,22 @@ impl Parser {
                 }
             } else if self.eat("@") {
                 let name = self.identifier()?;
+                if matches!(name.as_str(), "unsafe_send" | "unsafe_sync") {
+                    let present = if name == "unsafe_send" {
+                        &mut mods.unsafe_send
+                    } else {
+                        &mut mods.unsafe_sync
+                    };
+                    if *present {
+                        return Err(self.error(format!("duplicate @{name} contract")));
+                    }
+                    *present = true;
+                    self.newlines();
+                    continue;
+                }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported attribute: @repr(C)"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync"
                     )));
                 }
                 if mods.repr_c {
@@ -517,8 +542,8 @@ impl Parser {
             let field_start = self.span().start;
             let field_mods = self.modifiers()?;
             if self.at("fn") {
-                if field_mods.repr_c {
-                    return Err(self.error("@repr(C) applies to structs"));
+                if field_mods.repr_c || field_mods.unsafe_send || field_mods.unsafe_sync {
+                    return Err(self.error("representation and thread contracts apply to structs"));
                 }
                 let mut function = self.function(field_mods, field_start)?;
                 function.name = format!("{name}.{}", function.name);
@@ -534,7 +559,12 @@ impl Parser {
                 function.generics = all_generics;
                 program.functions.push(function);
             } else {
-                if field_mods.unsafe_ || field_mods.extern_ || field_mods.repr_c {
+                if field_mods.unsafe_
+                    || field_mods.extern_
+                    || field_mods.repr_c
+                    || field_mods.unsafe_send
+                    || field_mods.unsafe_sync
+                {
                     return Err(self.error("struct fields only support the `pub` modifier"));
                 }
                 let (field_name, ty) = self.typed_name()?;
@@ -560,6 +590,8 @@ impl Parser {
             fields,
             span: self.since(start),
             repr_c: mods.repr_c,
+            unsafe_send: mods.unsafe_send,
+            unsafe_sync: mods.unsafe_sync,
         });
         Ok(())
     }

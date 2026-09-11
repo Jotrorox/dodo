@@ -535,6 +535,52 @@ impl Context {
             _ => false,
         }
     }
+
+    // Ownership transfer is deliberately stricter than borrow checking. Raw
+    // pointers, opaque storage, borrowed allocators and thread-affine drops
+    // require a library's explicit unsafe contract; a borrow cannot be made
+    // 'static merely by writing that contract on its surrounding struct.
+    fn thread_safe(&self, ty: &Type, sharing: bool, seen: &mut HashSet<String>) -> bool {
+        match ty {
+            Type::Void | Type::Bool | Type::Int { .. } | Type::Float(_) => true,
+            Type::Array(_, t) | Type::Option(t) => self.thread_safe(t, sharing, seen),
+            Type::Result(t, e) => {
+                self.thread_safe(t, sharing, seen) && self.thread_safe(e, sharing, seen)
+            }
+            Type::Named(name) => {
+                if !seen.insert(name.clone()) {
+                    return false;
+                }
+                let safe = if let Some(s) = self.structs.get(name) {
+                    if self.carries_borrow(ty) {
+                        false
+                    } else if if sharing {
+                        s.unsafe_sync
+                    } else {
+                        s.unsafe_send
+                    } {
+                        true
+                    } else {
+                        !self.functions.contains_key(&format!("{name}.drop"))
+                            && s.fields
+                                .iter()
+                                .all(|f| self.thread_safe(&f.ty, sharing, seen))
+                    }
+                } else if let Some(e) = self.enums.get(name) {
+                    e.variants.iter().all(|v| {
+                        v.fields
+                            .iter()
+                            .all(|f| self.thread_safe(&f.ty, sharing, seen))
+                    })
+                } else {
+                    false
+                };
+                seen.remove(name);
+                safe
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3071,6 +3117,187 @@ impl<'a> Checker<'a> {
             });
         }
         if let Some(operation) = name.strip_prefix("core.mem.") {
+            if matches!(operation, "assert_send" | "assert_sync") {
+                if type_args.len() != 1 || !args.is_empty() {
+                    return Err(Diagnostic::new(
+                        span,
+                        "thread capability assertion expects one type argument and no values",
+                    ));
+                }
+                self.context.validate_type(&type_args[0], span, true)?;
+                if !self.context.thread_safe(
+                    &type_args[0],
+                    operation == "assert_sync",
+                    &mut HashSet::new(),
+                ) {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!(
+                            "type `{}` is not checked for cross-thread {}: references, raw pointers, opaque storage, allocator borrows and thread-affine destructors require an appropriate ownership contract",
+                            type_args[0],
+                            if operation == "assert_sync" {
+                                "sharing"
+                            } else {
+                                "transfer"
+                            }
+                        ),
+                    ));
+                }
+                return Ok(Value {
+                    ty: Type::Void,
+                    deps: vec![],
+                });
+            }
+            if operation == "callback" {
+                self.unsafe_required(span, "native callback address conversion")?;
+                if !type_args.is_empty() || args.len() != 1 {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.callback expects a function name and its explicit generic arguments",
+                    ));
+                }
+                let ExprKind::Name(target) = &args[0].kind else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "mem.callback requires a statically named function",
+                    ));
+                };
+                let function = self
+                    .context
+                    .functions
+                    .get(target)
+                    .ok_or_else(|| Diagnostic::new(span, "unknown callback function"))?;
+                if !function.public && self.context.function_namespace(target) != self.namespace {
+                    return Err(Diagnostic::new(
+                        span,
+                        "native callback function is private to its package",
+                    ));
+                }
+                if !function.unsafe_
+                    || function.params.len() != 1
+                    || function.params[0].ty != Type::Raw(true, Box::new(Type::u8()))
+                    || function.ret != Type::Void
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        "native callback requires unsafe fn(*mut u8) -> void",
+                    ));
+                }
+                return Ok(Value {
+                    ty: Type::Raw(false, Box::new(Type::u8())),
+                    deps: vec![],
+                });
+            }
+            if let Some(operation) = operation.strip_prefix("atomic_") {
+                self.unsafe_required(span, "atomic raw storage access")?;
+                let arity = match operation {
+                    "load" => 2,
+                    "store" | "exchange" | "fetch_add" => 3,
+                    "compare_exchange" => 5,
+                    _ => return Err(Diagnostic::new(span, "unsupported atomic intrinsic")),
+                };
+                if type_args.len() > 1 || args.len() != arity {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!(
+                            "atomic {operation} expects {arity} arguments and at most one integer type argument"
+                        ),
+                    ));
+                }
+                let pointer = self.expr(&mut args[0], None, false)?;
+                let Type::Raw(mutable, element) = pointer.ty else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "atomic access requires an aligned raw integer pointer",
+                    ));
+                };
+                let Type::Int { bits, .. } = element.as_ref() else {
+                    return Err(Diagnostic::new(
+                        span,
+                        "atomics support integer storage only",
+                    ));
+                };
+                if !matches!(*bits, 0 | 8 | 16 | 32 | 64) || *bits > self.context.pointer_bits {
+                    return Err(Diagnostic::new(
+                        span,
+                        "atomic integer width exceeds the target's supported lock-free width",
+                    ));
+                }
+                if !mutable && operation != "load" {
+                    return Err(Diagnostic::new(
+                        span,
+                        "atomic modification requires a mutable raw pointer",
+                    ));
+                }
+                if let Some(explicit) = type_args.first() {
+                    self.expect(&element, explicit, span)?;
+                }
+                let first_order = if operation == "load" {
+                    1
+                } else if operation == "compare_exchange" {
+                    3
+                } else {
+                    2
+                };
+                for arg in &mut args[1..first_order] {
+                    let value = self.expr(arg, Some(&element), false)?;
+                    self.expect(&element, &value.ty, arg.span)?;
+                }
+                let mut orders = Vec::new();
+                for arg in &mut args[first_order..] {
+                    let value = self.expr(arg, Some(&Type::usize()), false)?;
+                    if !value.ty.is_integer() {
+                        return Err(Diagnostic::new(
+                            arg.span,
+                            "atomic ordering must be an integer constant",
+                        ));
+                    }
+                    let order = match crate::consteval::eval(arg, self.context.pointer_bits) {
+                        Ok(crate::consteval::Scalar::Int(n @ 0..=4)) => n as u64,
+                        _ => {
+                            return Err(Diagnostic::new(
+                                arg.span,
+                                "atomic ordering must be a compile-time integer from 0 through 4",
+                            ));
+                        }
+                    };
+                    arg.kind = ExprKind::Int(order, Some(Type::usize()));
+                    arg.ty = Type::usize();
+                    orders.push(order);
+                }
+                let order = orders[0];
+                if (operation == "load" && matches!(order, 2 | 3))
+                    || (operation == "store" && matches!(order, 1 | 3))
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        "invalid atomic load/store memory ordering",
+                    ));
+                }
+                if operation == "compare_exchange" {
+                    let failure = orders[1];
+                    let valid = match order {
+                        0 | 2 => failure == 0,
+                        1 | 3 => matches!(failure, 0 | 1),
+                        4 => matches!(failure, 0 | 1 | 4),
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(Diagnostic::new(
+                            span,
+                            "compare_exchange failure ordering must not release and must not be stronger than success ordering",
+                        ));
+                    }
+                }
+                return Ok(Value {
+                    ty: if operation == "store" {
+                        Type::Void
+                    } else {
+                        *element
+                    },
+                    deps: vec![],
+                });
+            }
             if matches!(operation, "str_bytes" | "str_from_utf8") {
                 if !type_args.is_empty() || args.len() != 1 {
                     return Err(Diagnostic::new(
@@ -5779,7 +6006,39 @@ impl Expander {
                 for t in type_args.iter_mut() {
                     self.ty(t, substitutions, span)?;
                 }
-                if let Some(template) = self.signatures.get(name).cloned() {
+                if matches!(name.as_str(), "mem.callback" | "core.mem.callback") {
+                    if args.len() != 1 {
+                        return Err(Diagnostic::new(
+                            span,
+                            "mem.callback expects one statically named function",
+                        ));
+                    }
+                    let target = qualified_name(&args[0]).ok_or_else(|| {
+                        Diagnostic::new(span, "mem.callback expects a function name")
+                    })?;
+                    let template = self.signatures.get(&target).cloned().ok_or_else(|| {
+                        Diagnostic::new(span, format!("unknown callback function `{target}`"))
+                    })?;
+                    let mapping = self.substitutions(&template.generics, type_args, span)?;
+                    let concrete = if template.generics.is_empty() {
+                        target
+                    } else {
+                        let concrete = specialized(&target, type_args);
+                        if self.generated_functions.insert(concrete.clone()) {
+                            self.budget(span)?;
+                            let mut function = template;
+                            function.name = concrete.clone();
+                            function.generics.clear();
+                            function.generic_instance = true;
+                            self.function(&mut function, &mapping)?;
+                            self.functions.push(function);
+                        }
+                        concrete
+                    };
+                    args[0].kind = ExprKind::Name(concrete);
+                    type_args.clear();
+                    Type::Raw(false, Box::new(Type::u8()))
+                } else if let Some(template) = self.signatures.get(name).cloned() {
                     let parameters = &template.generics;
                     let explicit = !type_args.is_empty();
                     let mut mapping = if explicit {
@@ -5923,7 +6182,19 @@ impl Expander {
             } => {
                 let actual = self.expression(receiver, substitutions, None)?;
                 let signature = if let Type::Named(owner) = dereferenced(&actual) {
-                    self.signatures.get(&format!("{owner}.{name}")).cloned()
+                    self.signatures
+                        .get(&format!("{owner}.{name}"))
+                        .cloned()
+                        .or_else(|| {
+                            // Methods with their own type parameters remain generic
+                            // after their containing struct has been specialized.
+                            // Infer both sets from the concrete receiver and other
+                            // arguments through the ordinary generic-call path.
+                            let Type::Generic(template, _) = self.concrete_types.get(owner)? else {
+                                return None;
+                            };
+                            self.signatures.get(&format!("{template}.{name}")).cloned()
+                        })
                 } else {
                     None
                 };
@@ -6060,6 +6331,15 @@ fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -> Option<Ty
     let first = args.first().cloned().unwrap_or(Type::Unknown);
     let explicit = types.first().cloned().unwrap_or(Type::Unknown);
     Some(match name {
+        "mem.assert_send" | "mem.assert_sync" | "mem.atomic_store" => Type::Void,
+        "mem.callback" => Type::Raw(false, Box::new(Type::u8())),
+        "mem.atomic_load"
+        | "mem.atomic_exchange"
+        | "mem.atomic_fetch_add"
+        | "mem.atomic_compare_exchange" => match first {
+            Type::Raw(_, t) => *t,
+            _ => explicit,
+        },
         "mem.str_bytes" => Type::Slice(false, Box::new(Type::u8())),
         "mem.str_from_utf8" => Type::Str,
         "ptr.borrow" | "ptr.borrow_mut" | "ptr.borrow_slice" | "ptr.borrow_slice_mut" => {
@@ -6128,6 +6408,12 @@ fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -> Option<Ty
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn method_type_parameters_infer_on_a_specialized_generic_owner() {
+        accepts(
+            "struct Cell<T> { value: T\nfn new(value: T) -> Cell<T> { return Cell<T> { value: value } }\nfn convert<U>(&self, other: U) -> U { return other } }\nfn main() { cell := Cell.new(1usize)\nvalue: u8 = cell.convert(7u8) }",
+        );
+    }
     fn checked(body: &str) -> Check<Program> {
         let mut program = crate::parser::parse(&format!("package test\n{body}\n"))?;
         check(&mut program)?;

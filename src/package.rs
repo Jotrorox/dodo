@@ -109,6 +109,29 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     load_with_overlays(path, &BTreeMap::new()).map_err(|error| error.to_string())
 }
 
+/// Select each hosted adapter independently using the compilation target.
+pub fn load_for_target(path: &Path, target: &str) -> Result<Loaded, String> {
+    load_with_overlays_for_target(path, &BTreeMap::new(), target).map_err(|error| error.to_string())
+}
+
+/// C boundaries are embedded alongside the Dodo sources for relocated compilers.
+pub fn native_sources(loaded: &Loaded) -> Vec<(&'static str, &'static str)> {
+    BUNDLED_NATIVE_SOURCES
+        .iter()
+        .copied()
+        .filter(|(name, _)| {
+            let directory = Path::new(name).parent().unwrap();
+            loaded.sources.iter().any(|source| {
+                source.path.parent() == Some(Path::new("<stdlib>").join(directory).as_path())
+                    && source
+                        .path
+                        .file_stem()
+                        .is_some_and(|stem| stem == "linux" || stem == "windows")
+            })
+        })
+        .collect()
+}
+
 /// Load editor buffers with string errors for callers of the original overlay API.
 /// Keys use the same normalized absolute paths as `load_with_overlays`.
 pub fn load_with_overrides(
@@ -124,8 +147,18 @@ pub fn load_with_overlays(
     path: &Path,
     overlays: &BTreeMap<PathBuf, String>,
 ) -> Result<Loaded, LoadError> {
+    let target = inkwell::targets::TargetMachine::get_default_triple();
+    load_with_overlays_for_target(path, overlays, &target.as_str().to_string_lossy())
+}
+
+pub fn load_with_overlays_for_target(
+    path: &Path,
+    overlays: &BTreeMap<PathBuf, String>,
+    target: &str,
+) -> Result<Loaded, LoadError> {
     let mut loader = Loader {
         overlays,
+        target: target.to_owned(),
         ..Loader::default()
     };
     let root = loader.module(ModuleId::Local(source_path(path)), None)?;
@@ -194,6 +227,7 @@ struct Module {
 }
 
 struct Loader<'a> {
+    target: String,
     overlays: &'a BTreeMap<PathBuf, String>,
     modules: BTreeMap<ModuleId, Module>,
     loading: Vec<ModuleId>,
@@ -205,6 +239,7 @@ impl Default for Loader<'_> {
     fn default() -> Self {
         static EMPTY: BTreeMap<PathBuf, String> = BTreeMap::new();
         Self {
+            target: String::new(),
             overlays: &EMPTY,
             modules: BTreeMap::new(),
             loading: vec![],
@@ -215,6 +250,37 @@ impl Default for Loader<'_> {
 }
 
 impl Loader<'_> {
+    fn native_import(&self, import: &str) -> Result<String, LoadError> {
+        let parts: Vec<_> = import.split('/').collect();
+        if parts.len() != 3
+            || parts[0] != "std"
+            || !matches!(
+                parts[1],
+                "platform" | "fs" | "process" | "env" | "thread" | "sync"
+            )
+            || !matches!(parts[2], "native" | "linux" | "windows")
+        {
+            return Ok(import.to_owned());
+        }
+        let adapter = if self.target.starts_with("x86_64-")
+            && self.target.contains("-linux-")
+            && self.target.ends_with("-gnu")
+        {
+            "linux"
+        } else if self.target.starts_with("x86_64-")
+            && self.target.contains("-windows-")
+            && (self.target.ends_with("-msvc") || self.target.ends_with("-gnu"))
+        {
+            "windows"
+        } else {
+            return Err(format!("`{import}` is unsupported for target `{}`; hosted adapters require x86_64 Linux GNU or Windows (MSVC/GNU)", self.target).into());
+        };
+        if parts[2] != "native" && parts[2] != adapter {
+            return Err(format!("`{import}` cannot be used for target `{}`; select `std/{}/native` or the `{adapter}` adapter", self.target, parts[1]).into());
+        }
+        Ok(format!("std/{}/{adapter}", parts[1]))
+    }
+
     fn module(
         &mut self,
         id: ModuleId,
@@ -388,14 +454,16 @@ impl Loader<'_> {
             let dependency = if INTRINSIC_IMPORTS.contains(&import.as_str()) {
                 ModuleId::Bundled(import.clone())
             } else if standard {
-                if !BUNDLED_SOURCES.iter().any(|(name, _)| *name == import) {
+                let selected = self.native_import(&import)?;
+                if !BUNDLED_SOURCES.iter().any(|(name, _)| *name == selected) {
                     return Err(format!(
                         "unknown standard library import `{import}` in {}",
                         path.display()
                     )
                     .into());
                 }
-                self.module(ModuleId::Bundled(import.clone()), Some(import_alias))?
+                let declared_alias = selected.rsplit('/').next().unwrap().to_owned();
+                self.module(ModuleId::Bundled(selected), Some(&declared_alias))?
             } else {
                 if matches!(id, ModuleId::Bundled(_)) {
                     return Err(format!(

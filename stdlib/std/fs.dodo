@@ -1,0 +1,211 @@
+package fs
+
+import "std/io"
+import "std/platform/native"
+import "std/platform/error"
+import "std/fs/types"
+import "std/fs/native" as adapter
+
+// All modes are explicit. write permits overwriting at the cursor; append
+// forces each write to the then-current end. append+truncate is invalid.
+// exclusive requires create and never opens an already-existing path.
+pub struct OpenOptions {
+    pub read: bool
+    pub write: bool
+    pub append: bool
+    pub truncate: bool
+    pub create: bool
+    pub exclusive: bool
+    pub follow_symlinks: bool
+    pub fn new() -> OpenOptions {
+        return OpenOptions { read: false, write: false, append: false,
+        truncate: false, create: false, exclusive: false, follow_symlinks: true }
+    }
+    pub fn read_only() -> OpenOptions {
+        value := OpenOptions.new()
+        value.read = true
+        return value
+    }
+    pub fn create_new() -> OpenOptions {
+        value := OpenOptions.new()
+        value.write = true
+        value.create = true
+        value.exclusive = true
+        return value
+    }
+    pub fn validate(&self) -> void!error.Error {
+        if (!self.read && !self.write && !self.append) || (self.truncate && !self.write) || (self.append && self.truncate) || (self.exclusive && !self.create) {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        return ok()
+    }
+}
+
+pub struct File {
+    handle: native.Handle
+    pub fn open(path: &native.NativeString, options: &OpenOptions) -> File!error.Error {
+        return open_with_options(path, options, 438, 7)
+    }
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!io.Error {
+        return self.handle.read(destination)
+    }
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        return self.handle.write(source)
+    }
+    pub fn seek(&mut self, position: usize) -> usize!io.Error {
+        return self.handle.seek(position)
+    }
+    // File has no userspace buffering. flush is a no-op; sync requests native
+    // persistence and does not promise persistence of the containing directory.
+    pub fn flush(&mut self) -> void!error.Error {
+        return ok()
+    }
+    pub fn sync(&mut self) -> void!error.Error {
+        return self.handle.sync()
+    }
+    pub fn set_len(&mut self, length: u64) -> void!error.Error {
+        return self.handle.truncate(length)
+    }
+    pub fn close(&mut self) -> void!error.Error {
+        return self.handle.close()
+    }
+    pub fn metadata(&self) -> types.Metadata!error.Error {
+        return adapter.handle_metadata(&self.handle)
+    }
+    // Access to raw numbers does not transfer ownership. Native calls and
+    // creating another owner remain unsafe; use after close is invalid.
+    pub fn raw_handle(&self) -> isize {
+        return self.handle.raw()
+    }
+    // SAFETY: unique owning synchronous descriptor/HANDLE of the selected OS,
+    // correctly opened for intended operations; no other owner may close it.
+    pub unsafe fn from_raw(raw: isize) -> File {
+        unsafe {
+            return File { handle: native.Handle.from_raw(raw) }
+        }
+    }
+}
+// Low-level customization used by the platform extension packages. Unix mode
+// is filtered through umask; Windows sharing bits are READ=1 WRITE=2 DELETE=4.
+pub fn open_with_options(path: &native.NativeString, options: &OpenOptions, unix_mode: u32, windows_sharing: u32) -> File!error.Error {
+    options.validate()?
+    if unix_mode > 4095 || windows_sharing > 7 {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    handle := adapter.open_file(path, options.read, options.write, options.append, options.truncate,
+    options.create, options.exclusive, options.follow_symlinks, unix_mode, windows_sharing)?
+    return ok(File { handle: handle })
+}
+pub fn capabilities() -> types.Capabilities {
+    return adapter.capabilities()
+}
+pub fn metadata(path: &native.NativeString) -> types.Metadata!error.Error {
+    return adapter.metadata(path, true)
+}
+pub fn symlink_metadata(path: &native.NativeString) -> types.Metadata!error.Error {
+    return adapter.metadata(path, false)
+}
+pub fn create_directory(path: &native.NativeString) -> void!error.Error {
+    return adapter.create_directory(path, 511)
+}
+pub fn remove_file(path: &native.NativeString) -> void!error.Error {
+    return adapter.remove_file(path)
+}
+pub fn remove_directory(path: &native.NativeString) -> void!error.Error {
+    return adapter.remove_directory(path)
+}
+// No copy/delete fallback. Cross-filesystem failure preserves the source.
+pub fn rename(old: &native.NativeString, new: &native.NativeString, replace: bool) -> void!error.Error {
+    return adapter.rename_path(old, new, replace)
+}
+pub fn set_readonly(path: &native.NativeString, readonly: bool) -> void!error.Error {
+    return adapter.set_readonly(path, readonly)
+}
+pub fn symlink(target: &native.NativeString, path: &native.NativeString, directory: bool) -> void!error.Error {
+    return adapter.create_symlink(target, path, directory)
+}
+pub fn read_link(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> native.NativeString!error.Error from(bytes, wide) {
+    return adapter.read_symlink(path, bytes, wide)
+}
+// Filesystem resolution follows links and requires existence. This is distinct
+// from lexical normalization, which has no OS effects and cannot resolve links.
+pub fn canonicalize(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> native.NativeString!error.Error from(bytes, wide) {
+    return adapter.canonicalize(path, bytes, wide)
+}
+pub struct Directory {
+    handle: adapter.Directory
+    pub fn open(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> Directory!error.Error {
+        handle := adapter.Directory.open(path, bytes, wide)?
+        return ok(Directory { handle: handle })
+    }
+    pub fn next(&mut self, bytes: &mut[u8], wide: &mut[u16]) -> Option<native.NativeString>!error.Error from(bytes, wide) {
+        return self.handle.next(bytes, wide)
+    }
+    pub fn close(&mut self) -> void!error.Error {
+        return self.handle.close()
+    }
+}
+
+fn copy_error(reason: error.Error) -> io.CopyError {
+    return io.CopyError { read: 0, written: 0, cause: io.Error { kind: io.ErrorKind.Other, transferred: 0, code: reason.code } }
+}
+// Creates a destination exclusively and copies through explicit caller storage.
+// Existing destinations are never truncated. A partial new file remains on
+// failure/limit for inspection; no racy implicit unlink or rename is attempted.
+// Permissions/times/links are not copied. limit is a hard transfer cap and
+// eof=false explicitly distinguishes a cap from a complete copy.
+pub fn copy_new(source: &native.NativeString, destination: &native.NativeString, scratch: &mut[u8], limit: usize) -> io.CopyReport!io.CopyError {
+    if scratch.len == 0 && limit != 0 {
+        return err(io.CopyError { read: 0, written: 0, cause: io.failure(io.ErrorKind.InvalidInput, 0) })
+    }
+    options := OpenOptions.read_only()
+    input: File
+    match File.open(source, &options) {
+        ok(file) => {
+            input = file
+        }
+        err(reason) => {
+            return err(copy_error(reason))
+        }
+    }
+    match input.metadata() {
+        ok(info) => {
+            if info.kind != types.FileKind.File {
+                return err(io.CopyError { read: 0, written: 0, cause: io.failure(io.ErrorKind.InvalidInput, 0) })
+            }
+        }
+        err(reason) => {
+            return err(copy_error(reason))
+        }
+    }
+    create := OpenOptions.create_new()
+    output: File
+    match File.open(destination, &create) {
+        ok(file) => {
+            output = file
+        }
+        err(reason) => {
+            return err(copy_error(reason))
+        }
+    }
+    report := io.copy(&mut input, &mut output, scratch, limit)?
+    match output.close() {
+        ok() => {}
+        err(reason) => {
+            failure := copy_error(reason)
+            failure.read = report.read
+            failure.written = report.written
+            return err(failure)
+        }
+    }
+    match input.close() {
+        ok() => {}
+        err(reason) => {
+            failure := copy_error(reason)
+            failure.read = report.read
+            failure.written = report.written
+            return err(failure)
+        }
+    }
+    return ok(report)
+}

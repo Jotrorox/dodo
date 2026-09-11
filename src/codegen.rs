@@ -14,7 +14,9 @@ use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
 };
-use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
+use inkwell::{
+    AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate, OptimizationLevel,
+};
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -560,11 +562,45 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if self.module.get_function("main").is_some() {
             return Err(error("extern main conflicts with the hosted entry point"));
         }
-        let entry =
-            self.module
-                .add_function("main", self.context.i32_type().fn_type(&[], false), None);
+        let uses_environment = self
+            .program
+            .imports
+            .iter()
+            .any(|path| path == "std/env" || path.starts_with("std/env/"));
+        let arguments_init = uses_environment
+            .then(|| {
+                self.program.functions.iter().find_map(|function| {
+                    (function.extern_
+                        && function.name.rsplit('.').next() == Some("dodo_env_init_args"))
+                    .then(|| self.functions[&function.name])
+                })
+            })
+            .flatten();
+        let entry_params = if arguments_init.is_some() {
+            vec![
+                self.context.i32_type().into(),
+                self.context.ptr_type(AddressSpace::default()).into(),
+            ]
+        } else {
+            vec![]
+        };
+        let entry = self.module.add_function(
+            "main",
+            self.context.i32_type().fn_type(&entry_params, false),
+            None,
+        );
         self.builder
             .position_at_end(self.context.append_basic_block(entry, "entry"));
+        if let Some(initialize) = arguments_init {
+            self.builder.build_call(
+                initialize,
+                &[
+                    entry.get_nth_param(0).unwrap().into(),
+                    entry.get_nth_param(1).unwrap().into(),
+                ],
+                "",
+            )?;
+        }
         let call = self
             .builder
             .build_call(self.functions["main"], &[], "dodo.main")?;
@@ -1946,7 +1982,105 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             return Ok(self.usize_type().const_int(value, false).into());
         }
         if let Some(op) = name.strip_prefix("core.mem.") {
+            if let Some(operation) = op.strip_prefix("atomic_") {
+                let triple = self
+                    .module
+                    .get_triple()
+                    .as_str()
+                    .to_string_lossy()
+                    .into_owned();
+                if !["x86_64-", "aarch64-"]
+                    .iter()
+                    .any(|arch| triple.starts_with(arch))
+                {
+                    return Err(error(format!(
+                        "atomic integer primitives are not supported for target `{triple}`; no OS or libatomic fallback is inserted"
+                    )));
+                }
+                let pointer = self.expr(&args[0])?.into_pointer_value();
+                let order = |index: usize| -> Result<AtomicOrdering> {
+                    let ExprKind::Int(value, _) = args[index].kind else {
+                        return Err(error("atomic ordering was not checked"));
+                    };
+                    Ok(match value {
+                        0 => AtomicOrdering::Monotonic,
+                        1 => AtomicOrdering::Acquire,
+                        2 => AtomicOrdering::Release,
+                        3 => AtomicOrdering::AcquireRelease,
+                        4 => AtomicOrdering::SequentiallyConsistent,
+                        _ => return Err(error("invalid atomic ordering")),
+                    })
+                };
+                match operation {
+                    "load" => {
+                        let value =
+                            self.builder
+                                .build_load(self.ty(ret)?, pointer, "atomic.load")?;
+                        let instruction = value.as_instruction_value().unwrap();
+                        instruction.set_atomic_ordering(order(1)?).map_err(error)?;
+                        instruction
+                            .set_alignment(self.ty(ret)?.into_int_type().get_bit_width() / 8)
+                            .map_err(error)?;
+                        return Ok(value);
+                    }
+                    "store" => {
+                        let value = self.expr(&args[1])?;
+                        let instruction = self.builder.build_store(pointer, value)?;
+                        instruction.set_atomic_ordering(order(2)?).map_err(error)?;
+                        instruction
+                            .set_alignment(value.into_int_value().get_type().get_bit_width() / 8)
+                            .map_err(error)?;
+                        return Ok(unit);
+                    }
+                    "exchange" | "fetch_add" => {
+                        let value = self.expr(&args[1])?.into_int_value();
+                        return Ok(self
+                            .builder
+                            .build_atomicrmw(
+                                if operation == "exchange" {
+                                    AtomicRMWBinOp::Xchg
+                                } else {
+                                    AtomicRMWBinOp::Add
+                                },
+                                pointer,
+                                value,
+                                order(2)?,
+                            )?
+                            .into());
+                    }
+                    "compare_exchange" => {
+                        let expected = self.expr(&args[1])?.into_int_value();
+                        let replacement = self.expr(&args[2])?.into_int_value();
+                        let result = self.builder.build_cmpxchg(
+                            pointer,
+                            expected,
+                            replacement,
+                            order(3)?,
+                            order(4)?,
+                        )?;
+                        return Ok(self.builder.build_extract_value(
+                            result,
+                            0,
+                            "atomic.observed",
+                        )?);
+                    }
+                    _ => return Err(error("unknown atomic intrinsic")),
+                }
+            }
             match op {
+                "assert_send" | "assert_sync" => return Ok(unit),
+                "callback" => {
+                    let ExprKind::Name(target) = &args[0].kind else {
+                        return Err(error("callback target was not checked"));
+                    };
+                    return Ok(self
+                        .functions
+                        .get(target)
+                        .ok_or_else(|| error("callback function is unavailable"))?
+                        .as_global_value()
+                        .as_pointer_value()
+                        .into());
+                }
                 "uninit" => {
                     // The bytes are deliberately opaque. Zero initialization is an
                     // implementation choice, never a claim that T is initialized.

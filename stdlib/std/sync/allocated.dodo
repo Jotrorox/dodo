@@ -1,0 +1,435 @@
+package allocated
+
+import "core/mem"
+import "core/ptr"
+import "std/sync/error"
+import "std/sync/native"
+import "std/sync/atomic"
+
+// Explicit allocation capability: each constructor maps private OS pages.
+// No process-global allocator, allocator borrow, or scheduler is introduced.
+pub struct PageAllocator {
+    pub fn new() -> PageAllocator {
+        return PageAllocator {}
+    }
+}
+
+unsafe fn allocate(allocator: PageAllocator, bytes: usize, alignment: usize) -> *mut u8!error.Error {
+    core.drop(allocator)
+    if alignment > 256 || bytes > 9223372036854775551usize {
+        return err(error.Error.InvalidInput)
+    }
+    unsafe {
+        address := native.dodo_sync_allocate(bytes, alignment)
+        if ptr.is_null(address) {
+            return err(error.Error.AllocationFailed)
+        }
+        return ok(address)
+    }
+}
+
+// SAFETY: only checked Send payloads enter private storage; shared access is
+// synchronized. References never escape their guards, and every clone retains
+// the stable mapping until the last owner and all its guards have ended.
+@unsafe_send
+@unsafe_sync
+pub struct Mutex<T> {
+    address: *mut u8
+    pointer: *mut T
+    pub fn new(allocator: PageAllocator, value: T) -> Mutex<T>!error.Error {
+        mem.assert_send::<T>()
+        unsafe {
+            address := allocate(allocator, mem.size_of::<T>(), mem.align_of::<T>())?
+            pointer := ptr.offset(address, 256) as *mut T
+            initialized := mem.init(value)
+            ptr.write(pointer, mem.assume_init(initialized))
+            return ok(Mutex<T> { address: address, pointer: pointer })
+        }
+    }
+    pub fn clone(&self) -> Mutex<T> {
+        unsafe {
+            native.dodo_sync_retain(self.address)
+        }
+        return Mutex<T> { address: self.address, pointer: self.pointer }
+    }
+    pub fn lock(&self, timeout: u64) -> Guard<T>!error.Error from(self) {
+        unsafe {
+            error.check(native.dodo_sync_lock(self.address, 0, timeout))?
+        }
+        return ok(Guard<T> { owner: self, pointer: self.pointer })
+    }
+    pub fn notify_one(&self) {
+        unsafe {
+            native.dodo_sync_notify(self.address, 0)
+        }
+    }
+    pub fn notify_all(&self) {
+        unsafe {
+            native.dodo_sync_notify(self.address, 1)
+        }
+    }
+    pub fn condition(&self) -> ConditionVariable<T> from(self) {
+        return ConditionVariable<T> { owner: self }
+    }
+    pub fn cancel(&self) {
+        unsafe {
+            native.dodo_sync_cancel(self.address)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            if native.dodo_sync_release(self.address) != 0 {
+                ptr.drop_in_place(self.pointer)
+                native.dodo_sync_free(self.address)
+            }
+        }
+    }
+}
+pub struct Guard<T> {
+    owner: &Mutex<T>
+    pointer: *mut T
+    pub fn get(&self) -> &T from(self) {
+        unsafe {
+            return ptr.borrow(self.pointer, self)
+        }
+    }
+    pub fn get_mut(&mut self) -> &mut T from(self) {
+        unsafe {
+            return ptr.borrow_mut(self.pointer, self)
+        }
+    }
+    pub fn wait(&mut self, timeout: u64) -> void!error.Error {
+        unsafe {
+            return error.check(native.dodo_sync_wait(self.owner.address, timeout))
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_unlock(self.owner.address, 0)
+        }
+    }
+}
+
+// SAFETY: only checked Send payloads enter private storage; shared access is
+// synchronized. References never escape their guards, and every clone retains
+// the stable mapping until the last owner and all its guards have ended.
+@unsafe_send
+@unsafe_sync
+pub struct RwLock<T> {
+    address: *mut u8
+    pointer: *mut T
+    pub fn new(allocator: PageAllocator, value: T) -> RwLock<T>!error.Error {
+        mem.assert_send::<T>()
+        mem.assert_sync::<T>()
+        unsafe {
+            address := allocate(allocator, mem.size_of::<T>(), mem.align_of::<T>())?
+            pointer := ptr.offset(address, 256) as *mut T
+            initialized := mem.init(value)
+            ptr.write(pointer, mem.assume_init(initialized))
+            return ok(RwLock<T> { address: address, pointer: pointer })
+        }
+    }
+    pub fn clone(&self) -> RwLock<T> {
+        unsafe {
+            native.dodo_sync_retain(self.address)
+        }
+        return RwLock<T> { address: self.address, pointer: self.pointer }
+    }
+    pub fn read(&self, timeout: u64) -> ReadGuard<T>!error.Error from(self) {
+        unsafe {
+            error.check(native.dodo_sync_lock(self.address, 1, timeout))?
+        }
+        return ok(ReadGuard<T> { owner: self, pointer: self.pointer })
+    }
+    pub fn write(&self, timeout: u64) -> WriteGuard<T>!error.Error from(self) {
+        unsafe {
+            error.check(native.dodo_sync_lock(self.address, 0, timeout))?
+        }
+        return ok(WriteGuard<T> { owner: self, pointer: self.pointer })
+    }
+    pub fn cancel(&self) {
+        unsafe {
+            native.dodo_sync_cancel(self.address)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            if native.dodo_sync_release(self.address) != 0 {
+                ptr.drop_in_place(self.pointer)
+                native.dodo_sync_free(self.address)
+            }
+        }
+    }
+}
+pub struct ReadGuard<T> {
+    owner: &RwLock<T>
+    pointer: *mut T
+    pub fn get(&self) -> &T from(self) {
+        unsafe {
+            return ptr.borrow(self.pointer, self)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_unlock(self.owner.address, 1)
+        }
+    }
+}
+
+pub struct WriteGuard<T> {
+    owner: &RwLock<T>
+    pointer: *mut T
+    pub fn get(&self) -> &T from(self) {
+        unsafe {
+            return ptr.borrow(self.pointer, self)
+        }
+    }
+    pub fn get_mut(&mut self) -> &mut T from(self) {
+        unsafe {
+            return ptr.borrow_mut(self.pointer, self)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_unlock(self.owner.address, 0)
+        }
+    }
+}
+
+pub struct ConditionVariable<T> {
+    owner: &Mutex<T>
+    pub fn wait(&self, guard: &mut Guard<T>, timeout: u64) -> void!error.Error {
+        if self.owner.address != guard.owner.address {
+            return err(error.Error.InvalidInput)
+        }
+        return guard.wait(timeout)
+    }
+    pub fn notify_one(&self) {
+        self.owner.notify_one()
+    }
+    pub fn notify_all(&self) {
+        self.owner.notify_all()
+    }
+}
+
+@unsafe_send
+@unsafe_sync
+pub struct Barrier {
+    address: *mut u8
+    pub fn new(allocator: PageAllocator, parties: usize) -> Barrier!error.Error {
+        if parties == 0 {
+            return err(error.Error.InvalidInput)
+        }
+        unsafe {
+            address := allocate(allocator, 0, 1)?
+            match error.check(native.dodo_sync_barrier_init(address, parties)) {
+                ok() => {}, err(reason) => {
+                    native.dodo_sync_free(address);
+                    return err(reason)
+                }
+            }
+            return ok(Barrier { address: address })
+        }
+    }
+    pub fn clone(&self) -> Barrier {
+        unsafe {
+            native.dodo_sync_retain(self.address)
+        };
+        return Barrier { address: self.address }
+    }
+    pub fn wait(&self, timeout: u64) -> void!error.Error {
+        unsafe {
+            return error.check(native.dodo_sync_barrier_wait(self.address, timeout))
+        }
+    }
+    pub fn cancel(&self) {
+        unsafe {
+            native.dodo_sync_cancel(self.address)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            if native.dodo_sync_release(self.address) != 0 {
+                native.dodo_sync_free(self.address)
+            }
+        }
+    }
+}
+
+@unsafe_send
+@unsafe_sync
+pub struct Channel<T> {
+    address: *mut u8
+    pointer: *mut T
+    pub fn new(allocator: PageAllocator, capacity: usize) -> Channel<T>!error.Error {
+        mem.assert_send::<T>()
+        stride := mem.size_of::<T>()
+        if capacity == 0 {
+            return err(error.Error.InvalidInput)
+        }
+        if stride != 0 && capacity > 9223372036854775551usize / stride {
+            return err(error.Error.InvalidInput)
+        }
+        unsafe {
+            address := allocate(allocator, capacity * stride, mem.align_of::<T>())?
+            pointer := ptr.offset(address, 256)
+            match error.check(native.dodo_sync_channel_init(address, pointer, capacity, stride)) {
+                ok() => {}, err(reason) => {
+                    native.dodo_sync_free(address);
+                    return err(reason)
+                }
+            }
+            return ok(Channel<T> { address: address, pointer: pointer as *mut T })
+        }
+    }
+    pub fn clone(&self) -> Channel<T> {
+        unsafe {
+            native.dodo_sync_retain(self.address)
+        }
+        return Channel<T> { address: self.address, pointer: self.pointer }
+    }
+    pub fn send(&self, value: T, timeout: u64) -> void!error.Error {
+        initialized := mem.init(value)
+        unsafe {
+            code := native.dodo_sync_send(self.address, mem.uninit_as_ptr(&initialized) as *const u8, timeout)
+            if code != 0 {
+                core.drop(mem.assume_init(initialized))
+            }
+            return error.check(code)
+        }
+    }
+    pub fn receive(&self, timeout: u64) -> Option<T>!error.Error {
+        initialized := mem.uninit::<T>()
+        unsafe {
+            code := native.dodo_sync_receive(self.address, mem.uninit_as_mut_ptr(&mut initialized) as *mut u8, timeout)
+            if code == 3 {
+                return ok(none)
+            }
+            error.check(code)?
+            return ok(some(mem.assume_init(initialized)))
+        }
+    }
+    pub fn close(&self) {
+        unsafe {
+            native.dodo_sync_close(self.address)
+        }
+    }
+    pub fn cancel(&self) {
+        unsafe {
+            native.dodo_sync_cancel(self.address)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            if native.dodo_sync_release(self.address) != 0 {
+                native.dodo_sync_close(self.address)
+                for {
+                    match self.receive(0) {
+                        ok(some(value)) => {
+                            core.drop(value)
+                        }, ok(none) => {
+                            break
+                        }, err(_) => {
+                            break
+                        }
+                    }
+                }
+                native.dodo_sync_free(self.address)
+            }
+        }
+    }
+}
+
+pub struct Once<T> {
+    inner: Mutex<Option<T>>
+    pub fn new(allocator: PageAllocator) -> Once<T>!error.Error {
+        return ok(Once<T> { inner: Mutex.new::<Option<T>>(allocator, none)? })
+    }
+    pub fn clone(&self) -> Once<T> {
+        return Once<T> { inner: self.inner.clone() }
+    }
+    pub fn get_or_init<I>(&self, initializer: &mut I, timeout: u64) -> OnceGuard<T>!error.Error from(self) {
+        guard := self.inner.lock(timeout)?
+        missing := false
+        match guard.get() {
+            some(_) => {}, none => {
+                missing = true
+            }
+        }
+        if missing {
+            value := initializer.initialize()?
+            slot := guard.get_mut()
+            *slot = some(value)
+        }
+        return ok(OnceGuard<T> { inner: guard })
+    }
+}
+pub struct OnceGuard<T> {
+    inner: Guard<Option<T>>
+    pub fn get(&self) -> &Option<T> from(self) {
+        return self.inner.get()
+    }
+}
+
+// A retained stable allocation for sharing actual lock-free atomic payload
+// operations. Retain/release use an OS lock and are not lock-free operations.
+@unsafe_send
+@unsafe_sync
+pub struct Atomic<T> {
+    address: *mut u8
+    pointer: *mut atomic.Atomic<T>
+    pub fn new(allocator: PageAllocator, value: T) -> Atomic<T>!error.Error {
+        mem.assert_send::<T>()
+        unsafe {
+            address := allocate(allocator, mem.size_of::<atomic.Atomic<T>>(), mem.align_of::<atomic.Atomic<T>>())?
+            pointer := ptr.offset(address, 256) as *mut atomic.Atomic<T>
+            initialized := mem.init(atomic.Atomic.new(value))
+            ptr.write(pointer, mem.assume_init(initialized))
+            return ok(Atomic<T> { address: address, pointer: pointer })
+        }
+    }
+    pub fn clone(&self) -> Atomic<T> {
+        unsafe {
+            native.dodo_sync_retain(self.address)
+        }
+        return Atomic<T> { address: self.address, pointer: self.pointer }
+    }
+    pub fn load(&self, order: atomic.Ordering) -> T!error.Error {
+        unsafe {
+            value := ptr.borrow(self.pointer, self);
+            return value.load(order)
+        }
+    }
+    pub fn store(&self, value: T, order: atomic.Ordering) -> void!error.Error {
+        unsafe {
+            cell := ptr.borrow(self.pointer, self);
+            return cell.store(value, order)
+        }
+    }
+    pub fn exchange(&self, value: T, order: atomic.Ordering) -> T!error.Error {
+        unsafe {
+            cell := ptr.borrow(self.pointer, self);
+            return cell.exchange(value, order)
+        }
+    }
+    pub fn fetch_add(&self, value: T, order: atomic.Ordering) -> T!error.Error {
+        unsafe {
+            cell := ptr.borrow(self.pointer, self);
+            return cell.fetch_add(value, order)
+        }
+    }
+    pub fn compare_exchange(&self, expected: T, replacement: T, success: atomic.Ordering, failure: atomic.Ordering) -> atomic.CompareExchange<T>!error.Error {
+        unsafe {
+            cell := ptr.borrow(self.pointer, self);
+            return cell.compare_exchange(expected, replacement, success, failure)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            if native.dodo_sync_release(self.address) != 0 {
+                ptr.drop_in_place(self.pointer)
+                native.dodo_sync_free(self.address)
+            }
+        }
+    }
+}

@@ -1,0 +1,97 @@
+package thread_failures
+import "std/thread"
+
+extern "C" fn dodo_thread_test_mode(mode: i32)
+extern "C" fn dodo_thread_test_drop()
+extern "C" fn dodo_thread_test_drops() -> i32
+extern "C" fn dodo_thread_test_maps() -> i32
+extern "C" fn dodo_thread_test_frees() -> i32
+
+// The destructor touches only a native test atomic. Moving this owner is safe.
+@unsafe_send
+pub struct Task {
+    pub fn run(self) -> usize {
+        return 42
+    }
+    fn drop(&mut self) {
+        unsafe {
+            dodo_thread_test_drop()
+        }
+    }
+}
+
+fn main() -> i32 {
+    storage := thread.Storage.new::<Task, usize>()
+    allocator := thread.NativeAllocator.new()
+    unsafe {
+        dodo_thread_test_mode(1)
+    }
+    match thread.spawn(&mut storage, Task {}) {
+        ok(_) => {
+            return 1
+        }, err(error) => {
+            if error.native_code == 0 {
+                return 2
+            }
+        }
+    }
+    unsafe {
+        if dodo_thread_test_drops() != 1 {
+            return 3
+        }
+    }
+    match thread.spawn_owned::<Task, usize>(&allocator, Task {}) {
+        ok(_) => {
+            return 4
+        }, err(error) => {
+            if error.native_code == 0 {
+                return 5
+            }
+        }
+    }
+    unsafe {
+        if dodo_thread_test_drops() != 2 || dodo_thread_test_maps() != 1 || dodo_thread_test_frees() != 1 {
+            return 6
+        }
+        dodo_thread_test_mode(2)
+    }
+    match thread.spawn_owned::<Task, usize>(&allocator, Task {}) {
+        ok(_) => {
+            return 7
+        }, err(error) => {
+            if error.native_code == 0 {
+                return 8
+            }
+        }
+    }
+    unsafe {
+        if dodo_thread_test_drops() != 3 || dodo_thread_test_maps() != 1 || dodo_thread_test_frees() != 1 {
+            return 9
+        }
+        dodo_thread_test_mode(0)
+    }
+    match thread.spawn_owned::<Task, usize>(&allocator, Task {}) {
+        ok(worker) => {
+            if worker.join() != 42 {
+                return 10
+            }
+        }, err(_) => {
+            return 11
+        }
+    }
+    match thread.spawn(&mut storage, Task {}) {
+        ok(worker) => {
+            if worker.join() != 42 {
+                return 12
+            }
+        }, err(_) => {
+            return 13
+        }
+    }
+    unsafe {
+        if dodo_thread_test_drops() != 5 || dodo_thread_test_maps() != 2 || dodo_thread_test_frees() != 2 {
+            return 14
+        }
+    }
+    return 0
+}

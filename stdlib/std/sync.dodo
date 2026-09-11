@@ -1,0 +1,358 @@
+package sync
+
+import "core/mem"
+import "core/ptr"
+import "std/time"
+import "std/sync/error"
+import "std/sync/native"
+
+// All waits take a relative monotonic millisecond budget. Zero is a try operation.
+// Saturation is explicit: forever() is the sole infinite sentinel.
+pub fn forever() -> u64 {
+    return 18446744073709551615u64
+}
+pub fn milliseconds(duration: &time.Duration) -> u64!error.Error {
+    if duration.seconds() > 18446744073709550u64 {
+        return err(error.Error.InvalidInput)
+    }
+    return ok(duration.seconds() * 1000 + (duration.subsec_nanos() as u64 + 999999) / 1000000)
+}
+
+// Storage is caller-owned and cannot move while an initialized owner exists.
+// The C boundary checks actual target size and alignment at initialization.
+pub struct Storage {
+    words: [32]u64
+    pub fn new() -> Storage {
+        return Storage { words: [0u64; 32] }
+    }
+}
+
+fn initialize(storage: &mut Storage) -> *mut u8!error.Error {
+    unsafe {
+        address := ptr.from_mut(storage) as *mut u8
+        error.check(native.dodo_sync_init(address, mem.size_of::<Storage>()))?
+        return ok(address)
+    }
+}
+
+pub struct Mutex<T> {
+    storage: &mut Storage
+    address: *mut u8
+    value: T
+    pub fn new(storage: &mut Storage, value: T) -> Mutex<T>!error.Error from(storage) {
+        mem.assert_send::<T>()
+        // Preserve Result handling: protected opaque/concurrent payloads cannot
+        // hide Results, even when the mutex is destroyed without being opened.
+        initialized := mem.init(value)
+        match initialize(storage) {
+            ok(address) => {
+                unsafe {
+                    return ok(Mutex<T> { storage: storage, address: address, value: mem.assume_init(initialized) })
+                }
+            }
+            err(reason) => {
+                unsafe {
+                    core.drop(mem.assume_init(initialized))
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn lock(&self, timeout: u64) -> Guard<T>!error.Error from(self) {
+        unsafe {
+            error.check(native.dodo_sync_lock(self.address, 0, timeout))?
+            return ok(Guard<T> { owner: self, pointer: ptr.from_ref(&self.value) as *mut T })
+        }
+    }
+    pub fn notify_one(&self) {
+        unsafe {
+            native.dodo_sync_notify(self.address, 0)
+        }
+    }
+    pub fn notify_all(&self) {
+        unsafe {
+            native.dodo_sync_notify(self.address, 1)
+        }
+    }
+    pub fn cancel(&self) {
+        unsafe {
+            native.dodo_sync_cancel(self.address)
+        }
+    }
+    pub fn condition(&self) -> ConditionVariable<T> from(self) {
+        return ConditionVariable<T> { owner: self }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_destroy(self.address)
+        }
+    }
+}
+
+// Guards are thread-affine and unlock deterministically on all normal exits.
+// Checked views borrow the guard itself, preventing unlock/wait while in use.
+pub struct Guard<T> {
+    owner: &Mutex<T>
+    pointer: *mut T
+    pub fn get(&self) -> &T from(self) {
+        unsafe {
+            return ptr.borrow(self.pointer, self)
+        }
+    }
+    pub fn get_mut(&mut self) -> &mut T from(self) {
+        unsafe {
+            return ptr.borrow_mut(self.pointer, self)
+        }
+    }
+    pub fn wait(&mut self, timeout: u64) -> void!error.Error {
+        unsafe {
+            return error.check(native.dodo_sync_wait(self.owner.address, timeout))
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_unlock(self.owner.address, 0)
+        }
+    }
+}
+
+// Permanently bound to a single mutex: using concurrent waits with a different
+// native mutex can never violate the OS condition-variable contract.
+pub struct ConditionVariable<T> {
+    owner: &Mutex<T>
+    pub fn wait(&self, guard: &mut Guard<T>, timeout: u64) -> void!error.Error {
+        if self.owner.address != guard.owner.address {
+            return err(error.Error.InvalidInput)
+        }
+        return guard.wait(timeout)
+    }
+    pub fn notify_one(&self) {
+        self.owner.notify_one()
+    }
+    pub fn notify_all(&self) {
+        self.owner.notify_all()
+    }
+}
+
+pub struct RwLock<T> {
+    storage: &mut Storage
+    address: *mut u8
+    value: T
+    pub fn new(storage: &mut Storage, value: T) -> RwLock<T>!error.Error from(storage) {
+        mem.assert_send::<T>()
+        mem.assert_sync::<T>()
+        initialized := mem.init(value)
+        match initialize(storage) {
+            ok(address) => {
+                unsafe {
+                    return ok(RwLock<T> { storage: storage, address: address, value: mem.assume_init(initialized) })
+                }
+            }
+            err(reason) => {
+                unsafe {
+                    core.drop(mem.assume_init(initialized))
+                };
+                return err(reason)
+            }
+        }
+    }
+    pub fn read(&self, timeout: u64) -> ReadGuard<T>!error.Error from(self) {
+        unsafe {
+            error.check(native.dodo_sync_lock(self.address, 1, timeout))?
+            return ok(ReadGuard<T> { owner: self, pointer: ptr.from_ref(&self.value) })
+        }
+    }
+    pub fn write(&self, timeout: u64) -> WriteGuard<T>!error.Error from(self) {
+        unsafe {
+            error.check(native.dodo_sync_lock(self.address, 0, timeout))?
+            return ok(WriteGuard<T> { owner: self, pointer: ptr.from_ref(&self.value) as *mut T })
+        }
+    }
+    pub fn cancel(&self) {
+        unsafe {
+            native.dodo_sync_cancel(self.address)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_destroy(self.address)
+        }
+    }
+}
+pub struct ReadGuard<T> {
+    owner: &RwLock<T>
+    pointer: *const T
+    pub fn get(&self) -> &T from(self) {
+        unsafe {
+            return ptr.borrow(self.pointer, self)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_unlock(self.owner.address, 1)
+        }
+    }
+}
+pub struct WriteGuard<T> {
+    owner: &RwLock<T>
+    pointer: *mut T
+    pub fn get(&self) -> &T from(self) {
+        unsafe {
+            return ptr.borrow(self.pointer, self)
+        }
+    }
+    pub fn get_mut(&mut self) -> &mut T from(self) {
+        unsafe {
+            return ptr.borrow_mut(self.pointer, self)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_unlock(self.owner.address, 0)
+        }
+    }
+}
+
+pub struct Barrier {
+    storage: &mut Storage
+    address: *mut u8
+    pub fn new(storage: &mut Storage, parties: usize) -> Barrier!error.Error from(storage) {
+        if parties == 0 {
+            return err(error.Error.InvalidInput)
+        }
+        address := initialize(storage)?
+        unsafe {
+            match error.check(native.dodo_sync_barrier_init(address, parties)) {
+                ok() => {}
+                err(reason) => {
+                    native.dodo_sync_destroy(address);
+                    return err(reason)
+                }
+            }
+        }
+        return ok(Barrier { storage: storage, address: address })
+    }
+    pub fn wait(&self, timeout: u64) -> void!error.Error {
+        unsafe {
+            return error.check(native.dodo_sync_barrier_wait(self.address, timeout))
+        }
+    }
+    pub fn cancel(&self) {
+        unsafe {
+            native.dodo_sync_cancel(self.address)
+        }
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_sync_destroy(self.address)
+        }
+    }
+}
+
+// A fixed ring owns initialized messages in caller-provided opaque slots.
+// Closing rejects senders, wakes waiters, and leaves buffered messages drainable.
+pub struct Channel<T> {
+    storage: &mut Storage
+    slots: &mut[MaybeUninit<T>]
+    address: *mut u8
+    pub fn new(storage: &mut Storage, slots: &mut[MaybeUninit<T>]) -> Channel<T>!error.Error from(storage, slots) {
+        mem.assert_send::<T>()
+        if slots.len == 0 {
+            return err(error.Error.InvalidInput)
+        }
+        address := initialize(storage)?
+        unsafe {
+            match error.check(native.dodo_sync_channel_init(address, ptr.as_mut_ptr(slots) as *mut u8, slots.len, mem.size_of::<T>())) {
+                ok() => {}
+                err(reason) => {
+                    native.dodo_sync_destroy(address);
+                    return err(reason)
+                }
+            }
+        }
+        return ok(Channel<T> { storage: storage, slots: slots, address: address })
+    }
+    pub fn send(&self, value: T, timeout: u64) -> void!error.Error {
+        initialized := mem.init(value)
+        unsafe {
+            code := native.dodo_sync_send(self.address, mem.uninit_as_ptr(&initialized) as *const u8, timeout)
+            if code != 0 {
+                core.drop(mem.assume_init(initialized))
+            }
+            return error.check(code)
+        }
+    }
+    pub fn receive(&self, timeout: u64) -> Option<T>!error.Error {
+        initialized := mem.uninit::<T>()
+        unsafe {
+            code := native.dodo_sync_receive(self.address, mem.uninit_as_mut_ptr(&mut initialized) as *mut u8, timeout)
+            if code == 3 {
+                return ok(none)
+            }
+            error.check(code)?
+            return ok(some(mem.assume_init(initialized)))
+        }
+    }
+    pub fn close(&self) {
+        unsafe {
+            native.dodo_sync_close(self.address)
+        }
+    }
+    pub fn cancel(&self) {
+        unsafe {
+            native.dodo_sync_cancel(self.address)
+        }
+    }
+    fn drop(&mut self) {
+        self.close()
+        for {
+            match self.receive(0) {
+                ok(some(value)) => {
+                    core.drop(value)
+                }
+                ok(none) => {
+                    break
+                }
+                err(_) => {
+                    break
+                }
+            }
+        }
+        unsafe {
+            native.dodo_sync_destroy(self.address)
+        }
+    }
+}
+
+// Initialization is serialized by the mutex. A fallible initializer leaves
+// None on failure and may be retried; aborting traps never unwind or poison.
+pub struct Once<T> {
+    inner: Mutex<Option<T>>
+    pub fn new(storage: &mut Storage) -> Once<T>!error.Error from(storage) {
+        inner := Mutex.new::<Option<T>>(storage, none)?
+        return ok(Once<T> { inner: inner })
+    }
+    pub fn get_or_init<I>(&self, initializer: &mut I, timeout: u64) -> OnceGuard<T>!error.Error from(self) {
+        guard := self.inner.lock(timeout)?
+        missing := false
+        match guard.get() {
+            some(_) => {}, none => {
+                missing = true
+            }
+        }
+        if missing {
+            value := initializer.initialize()?
+            slot := guard.get_mut()
+            *slot = some(value)
+        }
+        return ok(OnceGuard<T> { inner: guard })
+    }
+}
+pub struct OnceGuard<T> {
+    inner: Guard<Option<T>>
+    // Successful initialization always contains Some. Read-only access keeps
+    // callers from resetting the state and rerunning a completed initializer.
+    pub fn get(&self) -> &Option<T> from(self) {
+        return self.inner.get()
+    }
+}

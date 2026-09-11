@@ -1,0 +1,324 @@
+package linux
+
+import "core/ptr"
+import "core/mem"
+import "std/platform/native"
+import "std/platform/error"
+import "std/fs/types"
+
+// Verified x86_64 Linux GNU ABI; target selection rejects other ABIs.
+@repr(C)
+struct Stat {
+    device: u64
+    inode: u64
+    links: u64
+    mode: u32
+    uid: u32
+    gid: u32
+    padding: u32
+    rdevice: u64
+    size: i64
+    block_size: i64
+    blocks: i64
+    access_seconds: i64
+    access_nanos: i64
+    modified_seconds: i64
+    modified_nanos: i64
+    changed_seconds: i64
+    changed_nanos: i64
+    reserved: [3]i64
+}
+// The tiny C adapter supplies the correct variadic libc ABI.
+unsafe extern "C" fn dodo_fs_open(path: *const u8, flags: i32, mode: u32) -> i32
+unsafe extern "C" fn stat(path: *const u8, output: *mut Stat) -> i32
+unsafe extern "C" fn lstat(path: *const u8, output: *mut Stat) -> i32
+unsafe extern "C" fn fstat(fd: i32, output: *mut Stat) -> i32
+unsafe extern "C" fn mkdir(path: *const u8, mode: u32) -> i32
+unsafe extern "C" fn unlink(path: *const u8) -> i32
+unsafe extern "C" fn rmdir(path: *const u8) -> i32
+unsafe extern "C" fn rename(old: *const u8, new: *const u8) -> i32
+unsafe extern "C" fn chmod(path: *const u8, mode: u32) -> i32
+unsafe extern "C" fn symlink(target: *const u8, path: *const u8) -> i32
+unsafe extern "C" fn readlink(path: *const u8, output: *mut u8, capacity: usize) -> isize
+unsafe extern "C" fn realpath(path: *const u8, output: *mut u8) -> *mut u8
+unsafe extern "C" fn opendir(path: *const u8) -> *mut u8
+unsafe extern "C" fn readdir(directory: *mut u8) -> *mut u8
+unsafe extern "C" fn closedir(directory: *mut u8) -> i32
+unsafe extern "C" fn __errno_location() -> *mut i32
+
+pub fn capabilities() -> types.Capabilities {
+    return types.Capabilities { symbolic_links: true, unix_permissions: true, windows_sharing: false, directory_sync: true }
+}
+pub fn open_file(path: &native.NativeString, read: bool, write: bool, append: bool, truncate: bool, create: bool, exclusive: bool, follow: bool, mode: u32, sharing: u32) -> native.Handle!error.Error {
+    flags := 524288i32 // O_CLOEXEC: creation and inheritance restriction atomic.
+    if read && (write || append) {
+        flags |= 2
+    } else if write || append {
+        flags |= 1
+    }
+    if append {
+        flags |= 1024
+    }
+    if truncate {
+        flags |= 512
+    }
+    if create {
+        flags |= 64
+    }
+    if exclusive {
+        flags |= 128
+    }
+    if!follow {
+        flags |= 131072
+    }
+    unsafe {
+        fd := dodo_fs_open(path.as_ptr(), flags, mode)
+        if fd < 0 {
+            return err(native.last_error())
+        }
+        return ok(native.Handle.from_raw(fd as isize))
+    }
+}
+fn convert(value: &Stat) -> types.Metadata {
+    kind := types.FileKind.Other
+    tag := value.mode & 61440
+    if tag == 32768 {
+        kind = types.FileKind.File
+    }
+    if tag == 16384 {
+        kind = types.FileKind.Directory
+    }
+    if tag == 40960 {
+        kind = types.FileKind.SymbolicLink
+    }
+    return types.Metadata { kind: kind, size: value.size as u64,
+    modified_seconds: value.modified_seconds, modified_nanoseconds: value.modified_nanos as u32,
+    readonly: (value.mode & 146) == 0, unix_metadata: true,
+    mode: value.mode, uid: value.uid, gid: value.gid, device: value.device,
+    inode: value.inode, links: value.links }
+}
+pub fn metadata(path: &native.NativeString, follow: bool) -> types.Metadata!error.Error {
+    data := mem.uninit::<Stat>()
+    unsafe {
+        // Initialize reserved members before the OS fills its public fields.
+        ptr.write_bytes(mem.uninit_as_mut_ptr(&mut data), 0u8, 1)
+        code := 0i32
+        if follow {
+            code = stat(path.as_ptr(), mem.uninit_as_mut_ptr(&mut data))
+        } else {
+            code = lstat(path.as_ptr(), mem.uninit_as_mut_ptr(&mut data))
+        }
+        if code != 0 {
+            return err(native.last_error())
+        }
+        initialized := mem.assume_init(data)
+        return ok(convert(&initialized))
+    }
+}
+pub fn handle_metadata(handle: &native.Handle) -> types.Metadata!error.Error {
+    data := mem.uninit::<Stat>()
+    unsafe {
+        // Initialize reserved members before the OS fills its public fields.
+        ptr.write_bytes(mem.uninit_as_mut_ptr(&mut data), 0u8, 1)
+        if fstat(handle.raw() as i32, mem.uninit_as_mut_ptr(&mut data)) != 0 {
+            return err(native.last_error())
+        }
+        initialized := mem.assume_init(data)
+        return ok(convert(&initialized))
+    }
+}
+pub fn create_directory(path: &native.NativeString, mode: u32) -> void!error.Error {
+    unsafe {
+        if mkdir(path.as_ptr(), mode) != 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn remove_file(path: &native.NativeString) -> void!error.Error {
+    unsafe {
+        if unlink(path.as_ptr()) != 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn remove_directory(path: &native.NativeString) -> void!error.Error {
+    unsafe {
+        if rmdir(path.as_ptr()) != 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn rename_path(old: &native.NativeString, new: &native.NativeString, replace: bool) -> void!error.Error {
+    // renameat2's atomic NOREPLACE is intentionally a separate supported
+    // Linux syscall adapter; no check-then-rename race or copy/delete fallback.
+    if!replace {
+        return rename_exclusive(old, new)
+    }
+    unsafe {
+        if rename(old.as_ptr(), new.as_ptr()) != 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+unsafe extern "C" fn renameat2(old_directory: i32, old: *const u8, new_directory: i32, new: *const u8, flags: u32) -> i32
+fn rename_exclusive(old: &native.NativeString, new: &native.NativeString) -> void!error.Error {
+    unsafe {
+        if renameat2(-100, old.as_ptr(), -100, new.as_ptr(), 1) != 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn set_mode(path: &native.NativeString, mode: u32) -> void!error.Error {
+    if mode > 4095 {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    unsafe {
+        if chmod(path.as_ptr(), mode) != 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn set_readonly(path: &native.NativeString, readonly: bool) -> void!error.Error {
+    value := metadata(path, true)?
+    mode := value.mode & 4095
+    if readonly {
+        mode &= ~146u32
+    } else {
+        mode |= 128
+    }
+    return set_mode(path, mode)
+}
+pub fn create_symlink(target: &native.NativeString, path: &native.NativeString, directory: bool) -> void!error.Error {
+    unsafe {
+        if symlink(target.as_ptr(), path.as_ptr()) != 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn read_symlink(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> native.NativeString!error.Error from(bytes, wide) {
+    if bytes.len == 0 {
+        return err(error.failure(error.Kind.BufferTooSmall))
+    }
+    unsafe {
+        // Reserve final NUL, but request the full capacity so exact truncation
+        // is detectable even when the link changes concurrently.
+        count := readlink(path.as_ptr(), ptr.as_mut_ptr(bytes), bytes.len)
+        if count < 0 {
+            return err(native.last_error())
+        }
+        if count as usize >= bytes.len {
+            return err(error.failure(error.Kind.BufferTooSmall))
+        }
+        bytes[count as usize] = 0
+        return native.NativeString.new(&bytes[..(count as usize) + 1])
+    }
+}
+pub fn canonicalize(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> native.NativeString!error.Error from(bytes, wide) {
+    // Linux realpath's nonallocating API requires PATH_MAX writable bytes.
+    if bytes.len < 4096 {
+        return err(error.failure(error.Kind.BufferTooSmall))
+    }
+    unsafe {
+        if ptr.is_null(realpath(path.as_ptr(), ptr.as_mut_ptr(bytes))) {
+            return err(native.last_error())
+        }
+    }
+    length := 0usize
+    for length < 4096 && bytes[length] != 0 {
+        length += 1
+    }
+    if length == 4096 {
+        return err(error.failure(error.Kind.BufferTooSmall))
+    }
+    return native.NativeString.new(&bytes[..length + 1])
+}
+
+pub struct Directory {
+    handle: *mut u8
+    pending: *mut u8
+    ended: bool
+    pub fn open(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> Directory!error.Error {
+        unsafe {
+            handle := opendir(path.as_ptr())
+            if ptr.is_null(handle) {
+                return err(native.last_error())
+            }
+            return ok(Directory { handle: handle, pending: 0usize as *mut u8, ended: false })
+        }
+    }
+    pub fn close(&mut self) -> void!error.Error {
+        if ptr.is_null(self.handle) {
+            return ok()
+        }
+        handle := self.handle
+        unsafe {
+            self.handle = 0usize as *mut u8
+            self.pending = 0usize as *mut u8
+        }
+        self.ended = true
+        unsafe {
+            if closedir(handle) != 0 {
+                return err(native.last_error())
+            }
+        }
+        return ok()
+    }
+    fn drop(&mut self) {
+        match self.close() {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+    // Entries are copied to caller storage; BufferTooSmall preserves the entry
+    // for retry. Dot entries are skipped; concurrent changes/order unspecified.
+    pub fn next(&mut self, bytes: &mut[u8], wide: &mut[u16]) -> Option<native.NativeString>!error.Error from(bytes, wide) {
+        if self.ended {
+            return ok(none)
+        }
+        unsafe {
+            for true {
+                if ptr.is_null(self.pending) {
+                    ptr.write(__errno_location(), 0)
+                    self.pending = readdir(self.handle)
+                    if ptr.is_null(self.pending) {
+                        reason := native.last_error()
+                        if reason.code != 0 {
+                            return err(reason)
+                        }
+                        self.ended = true
+                        return ok(none)
+                    }
+                }
+                // struct dirent x86_64: ino64, off64, reclen16, type8, name[].
+                length := 0usize
+                for length < 256 && ptr.read(ptr.offset(self.pending, (19 + length) as isize)) != 0 {
+                    length += 1
+                }
+                if length == 256 {
+                    return err(error.failure(error.Kind.Other))
+                }
+                first := ptr.read(ptr.offset(self.pending, 19))
+                second := ptr.read(ptr.offset(self.pending, 20))
+                if (length == 1 && first == 46) || (length == 2 && first == 46 && second == 46) {
+                    self.pending = 0usize as *mut u8
+                } else {
+                    if bytes.len <= length {
+                        return err(error.failure(error.Kind.BufferTooSmall))
+                    }
+                    ptr.copy_nonoverlapping(ptr.offset(self.pending, 19), ptr.as_mut_ptr(bytes), length + 1)
+                    self.pending = 0usize as *mut u8
+                    name := native.NativeString.new(&bytes[..length + 1])?
+                    return ok(some(name))
+                }
+            }
+        }
+        return ok(none)
+    }
+}

@@ -1,0 +1,16 @@
+package error
+
+// The domain is the selected hosted adapter: errno on Linux, GetLastError on
+// Windows. Library-generated errors use code zero; native codes are retained.
+pub enum Kind {
+    InvalidInput, Unsupported, NotFound, AlreadyExists, PermissionDenied,
+    Interrupted, WouldBlock, TimedOut, Cancelled, BufferTooSmall, CrossDevice,
+    NotDirectory, IsDirectory, DirectoryNotEmpty, Closed, Other
+}
+pub struct Error {
+    pub kind: Kind
+    pub code: i32
+}
+pub fn failure(kind: Kind) -> Error {
+    return Error { kind: kind, code: 0 }
+}

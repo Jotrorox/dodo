@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Cross-compile portable core/alloc/std fixtures and execute real PE files in Wine.
+"""Cross-compile portable and hosted std fixtures and execute real PE files in Wine.
 
-Requires a built host dodo, clang, lld-link, Wine, and a MinGW kernel32 import
-library. No Windows C runtime or allocator is linked. The tiny test startup
-supplies compiler-generated memory helpers and forwards the Dodo exit status;
+Requires a built host dodo, clang, lld-link, Wine, and MinGW import libraries.
+Hosted fixtures also require MinGW headers. Portable fixtures retain their
+freestanding startup; hosted thread/child fixtures link the required C runtime.
 LLVM's stack probe handles large Windows stack frames.
 """
 import argparse
@@ -26,12 +26,12 @@ def tool(names):
     raise SystemExit(f"Required tool not found: {' or '.join(names)}")
 
 
-def run(arguments, *, env=None, timeout=120):
+def run(arguments, *, env=None, timeout=120, cwd=None):
     # Wine's background services can inherit stdout/stderr. A log file avoids
     # waiting for those services to close pipes after the tested process exits.
     with tempfile.TemporaryFile(mode="w+") as log:
         try:
-            result = subprocess.run(arguments, stdout=log, stderr=log, env=env, timeout=timeout)
+            result = subprocess.run(arguments, stdout=log, stderr=log, env=env, timeout=timeout, cwd=cwd)
         except subprocess.TimeoutExpired as error:
             log.seek(0)
             raise RuntimeError(f"Command timed out after {timeout}s: {' '.join(map(str, arguments))}\n"
@@ -82,11 +82,56 @@ int memcmp(const void *left, const void *right, size_t length) {
 void mainCRTStartup(void) { ExitProcess((unsigned int)dodo_main()); }
 '''
 
+CHILD_STARTUP = r'''
+#include <stdio.h>
+__declspec(dllimport) void __stdcall ExitProcess(unsigned int);
+__declspec(dllimport) int __getmainargs(int *, char ***, char ***, int, int *);
+__declspec(dllimport) FILE *__iob_func(void);
+/* MinGW's stdio declarations use the UCRT spelling. The controlled child uses
+   the matching legacy msvcrt FILE layout, selected by its target headers. */
+FILE *__cdecl child_iob(unsigned int index) {
+    return &__iob_func()[index];
+}
+FILE *(*__imp___acrt_iob_func)(unsigned int) = child_iob;
+void __main(void) {}
+extern int main(int, char **);
+void mainCRTStartup(void) {
+    int argc, startup = 0; char **argv, **environment;
+    if (__getmainargs(&argc, &argv, &environment, 0, &startup)) ExitProcess(100);
+    ExitProcess((unsigned int)main(argc, argv));
+}
+'''
+
+
+def native_sources(source):
+    """Follow bundled imports so independent packages link only their adapters."""
+    seen, runtime = set(), set()
+
+    def visit(path):
+        if path in seen:
+            return
+        seen.add(path)
+        for name in re.findall(r'^\s*import\s+"([^"]+)"', path.read_text(), re.MULTILINE):
+            if not name.startswith(("std/", "core/", "alloc/")):
+                continue
+            if name.endswith("/native"):
+                name = name[:-6] + "windows"
+            dependency = ROOT / "stdlib" / (name + ".dodo")
+            if dependency.is_file():
+                boundary = dependency.parent / "runtime.c"
+                if boundary.is_file() and dependency.stem in ("linux", "windows"):
+                    runtime.add(boundary)
+                visit(dependency)
+
+    visit(source)
+    return sorted(runtime)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, default=ROOT / "target/debug/dodo")
     parser.add_argument("--kernel32", type=Path, help="Path to the MinGW libkernel32.a import library")
+    parser.add_argument("--mingw-include", type=Path, help="Target MinGW headers (needed for hosted native boundaries)")
     parser.add_argument("--fixture", type=Path, action="append", help="Run only this fixture (repeatable)")
     parser.add_argument("--wine", type=Path, help="Use a specific Wine binary, including a local unpacked installation")
     parser.add_argument("--wineserver", type=Path, help="Matching Wine server for --wine")
@@ -111,7 +156,11 @@ def main():
     kernel32 = next((path.resolve() for path in candidates if path and path.is_file()), None)
     if kernel32 is None:
         raise SystemExit("MinGW libkernel32.a not found; provide --kernel32 or install the MinGW development files")
-    fixtures = [path.resolve() for path in args.fixture] if args.fixture else sorted((ROOT / "tests/stdlib").glob("*.dodo"))
+    fixtures = [path.resolve() for path in args.fixture] if args.fixture else (
+        sorted((ROOT / "tests/stdlib").glob("*.dodo")) +
+        sorted(path for path in (ROOT / "tests/os").glob("*.dodo")
+               if "_linux_" not in path.name and path.name not in (
+                   "process_checks.dodo", "env_native_checks.dodo", "thread_failures.dodo")))
     if not fixtures:
         raise SystemExit("No standard-library fixtures found")
     executions = 0
@@ -120,6 +169,7 @@ def main():
         scratch = Path(directory)
         (scratch / "wine").mkdir()
         env = dict(os.environ, WINEPREFIX=str(scratch / "wine"), WINEARCH="win64", WINEDEBUG="-all")
+        env.update(DODO_ENV_TEST="parent  é", DODO_PARENT_ONLY="must not leak")
         env.pop("DISPLAY", None)
         # Keep Wine services alive across fixtures; terminate only our own prefix.
         subprocess.run([wineserver, "-p"], env=env, stdout=subprocess.DEVNULL,
@@ -128,6 +178,38 @@ def main():
             stack_probe = scratch / "chkstk.obj"
             run([clang, "--target=x86_64-pc-windows-msvc", "-c", str(ROOT / "tests/support/windows_chkstk.S"),
                  "-o", str(stack_probe)])
+            native_objects = {}
+            hosted = any(native_sources(source) for source in fixtures)
+            includes = [args.mingw_include] if args.mingw_include else [
+                kernel32.parent.parent / "include",
+                Path("/usr/x86_64-w64-mingw32/include"),
+            ]
+            headers = next((path for path in includes if path and (path / "windows.h").is_file()), None)
+            if hosted and headers is None:
+                raise RuntimeError("Hosted Windows fixtures require MinGW target headers; provide --mingw-include")
+            cflags = [clang, "--target=x86_64-w64-windows-gnu", "-std=c11", "-O2", "-fno-stack-protector"]
+            if headers:
+                cflags += ["-isystem", str(headers)]
+            for boundary in sorted({path for source in fixtures for path in native_sources(source)}):
+                for optimization in (0, 3):
+                    obj = scratch / (boundary.parent.name + f"-native-O{optimization}.obj")
+                    run([*cflags, f"-O{optimization}", "-Wall", "-Wextra", "-Werror", "-c", str(boundary), "-o", str(obj)])
+                    native_objects[boundary, optimization] = obj
+            # GNU-targeted C probes use the same x64 convention under this name.
+            probe_alias = scratch / "probe-alias.S"
+            probe_alias.write_text(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n jmp __chkstk\n")
+            alias_object = scratch / "probe-alias.obj"
+            run([clang, "--target=x86_64-pc-windows-msvc", "-c", str(probe_alias), "-o", str(alias_object)])
+            child = ROOT / "tests/support/os_child.c"
+            if any("process" in source.stem for source in fixtures):
+                child_obj, child_start_obj = scratch / "child.obj", scratch / "child-start.obj"
+                child_start = scratch / "child-start.c"
+                child_start.write_text(CHILD_STARTUP)
+                run([*cflags, "-D__USE_MINGW_ANSI_STDIO=0", "-c", str(child), "-o", str(child_obj)])
+                run([*cflags, "-c", str(child_start), "-o", str(child_start_obj)])
+                run([linker, "/nologo", "/nodefaultlib", "/entry:mainCRTStartup", "/subsystem:console", "/machine:x64",
+                     f"/out:{scratch / 'os child.exe'}", str(child_obj), str(child_start_obj), str(stack_probe), str(alias_object),
+                     str(kernel32), str(kernel32.parent / "libmsvcrt.a")])
             for source in fixtures:
                 declaration = re.search(r"^package\s+([A-Za-z_][A-Za-z_0-9]*)\s*$", source.read_text(), re.MULTILINE)
                 if declaration is None:
@@ -143,10 +225,21 @@ def main():
                     run([str(compiler), "build", str(source), "--emit", "obj", "--target", "x86_64-pc-windows-msvc",
                          "-O", str(optimization), "-o", str(obj)])
                     run([linker, "/nologo", "/nodefaultlib", "/entry:mainCRTStartup", "/subsystem:console", "/machine:x64",
-                         f"/out:{exe}", str(runtime_object), str(stack_probe), str(obj), str(kernel32)])
+                         "/stack:8388608", f"/out:{exe}", str(runtime_object), str(stack_probe), str(alias_object), str(obj), str(kernel32),
+                         *[str(native_objects[path, optimization]) for path in native_sources(source)],
+                         *([str(kernel32.parent / "libmsvcrt.a")] if native_sources(source) else [])])
                     if exe.read_bytes()[:2] != b"MZ":
                         raise RuntimeError(f"Linker did not produce a Windows executable: {exe}")
-                    run([wine, str(exe)], env=env)
+                    work = scratch / f"work-{source.stem}-{optimization}"
+                    work.mkdir()
+                    if "process" in source.stem:
+                        shutil.copyfile(scratch / "os child.exe", work / "os child.exe")
+                        child_work = work / "child cwd é"
+                        child_work.mkdir()
+                        shutil.copyfile(scratch / "os child.exe", child_work / "os child.exe")
+                        (child_work / "cwd-marker").write_bytes(b"fixture")
+                    extra_args = ["space arg", "é", ""] if source.stem == "env_checks" else []
+                    run([wine, str(exe), *extra_args], env=env, cwd=work)
                     executions += 1
                     records.append({"fixture": source.name, "optimization": optimization,
                                     "target": "x86_64-pc-windows-msvc", "exit_code": 0})
@@ -156,7 +249,7 @@ def main():
             subprocess.run([wineserver, "-w"], env=env, capture_output=True, timeout=20)
     if args.report:
         args.report.write_text(json.dumps({"executions": executions, "fixtures": records}, indent=2) + "\n")
-    print(f"Passed {executions} Windows executions across {len(fixtures)} portable fixtures.")
+    print(f"Passed {executions} Windows executions across {len(fixtures)} fixtures.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,14 @@
+package windows_ext
+
+import "std/fs"
+import "std/fs/windows"
+import "std/platform/native"
+import "std/platform/error"
+
+pub const SHARE_READ: u32 = 1
+pub const SHARE_WRITE: u32 = 2
+pub const SHARE_DELETE: u32 = 4
+// Sharing governs other opens/removals, not this handle's access rights.
+pub fn open(path: &native.NativeString, options: &fs.OpenOptions, sharing: u32) -> fs.File!error.Error {
+    return fs.open_with_options(path, options, 438, sharing)
+}

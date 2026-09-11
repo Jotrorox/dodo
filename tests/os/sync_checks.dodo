@@ -1,0 +1,570 @@
+package sync_checks
+import "core/mem"
+import "std/sync"
+import "std/sync/error"
+import "std/sync/atomic"
+import "std/sync/allocated"
+import "std/thread"
+
+pub struct Initializer {
+    calls: usize
+    pub fn initialize(&mut self) -> usize!error.Error {
+        self.calls += 1;
+        return ok(42)
+    }
+}
+
+pub struct CounterTask {
+    counter: allocated.Mutex<usize>
+    atom: allocated.Atomic<usize>
+    start: allocated.Barrier
+    pub fn run(self) -> usize {
+        match self.start.wait(5000) {
+            ok() => {}, err(_) => {
+                return 1
+            }
+        }
+        for i in 0usize..5000 {
+            match self.counter.lock(5000) {
+                ok(guard) => {
+                    value := guard.get_mut();
+                    *value += 1
+                }
+                err(_) => {
+                    return 2
+                }
+            }
+            match self.atom.fetch_add(1, atomic.Ordering.Relaxed) {
+                ok(_) => {}, err(_) => {
+                    return 3
+                }
+            }
+        }
+        return 0
+    }
+}
+pub struct Producer {
+    queue: allocated.Channel<usize>
+    pub fn run(self) -> usize {
+        for i in 0usize..20000 {
+            match self.queue.send(i, 5000) {
+                ok() => {}, err(_) => {
+                    return 1
+                }
+            }
+        }
+        self.queue.close()
+        return 0
+    }
+}
+pub struct NotifyTask {
+    lock: allocated.Mutex<usize>
+    ready: allocated.Channel<usize>
+    pub fn run(self) -> usize {
+        match self.ready.receive(5000) {
+            ok(some(_)) => {}, ok(none) => {
+                return 1
+            }, err(_) => {
+                return 2
+            }
+        }
+        match self.lock.lock(5000) {
+            ok(guard) => {
+                value := guard.get_mut();
+                *value = 7
+            }
+            err(_) => {
+                return 3
+            }
+        }
+        self.lock.notify_one()
+        return 0
+    }
+}
+
+pub struct CancelWaiter {
+    lock: allocated.Mutex<usize>
+    pub fn run(self) -> usize {
+        // The parent owns the guard before spawn. Acquiring here proves its
+        // condition wait has atomically released ownership before cancellation.
+        match self.lock.lock(5000) {
+            ok(guard) => {
+                self.lock.cancel();
+                core.drop(guard)
+            }
+            err(_) => {
+                return 1
+            }
+        }
+        return 0
+    }
+}
+
+@unsafe_send
+pub struct DropValue {
+    counter: allocated.Atomic<usize>
+    fn drop(&mut self) {
+        match self.counter.fetch_add(1, atomic.Ordering.Relaxed) {
+            ok(_) => {}, err(_) => {}
+        }
+    }
+}
+pub struct SharedInitializer {
+    counter: allocated.Atomic<usize>
+    pub fn initialize(&mut self) -> usize!error.Error {
+        self.counter.fetch_add(1, atomic.Ordering.Relaxed)?
+        return ok(42)
+    }
+}
+pub struct OnceTask {
+    once: allocated.Once<usize>
+    counter: allocated.Atomic<usize>
+    start: allocated.Barrier
+    pub fn run(self) -> usize {
+        match self.start.wait(5000) {
+            ok() => {}, err(_) => {
+                return 1
+            }
+        }
+        initializer := SharedInitializer { counter: self.counter.clone() }
+        match self.once.get_or_init(&mut initializer, 5000) {
+            ok(guard) => {
+                match guard.get() {
+                    some(value) => {
+                        return *value
+                    }, none => {
+                        return 2
+                    }
+                }
+            }
+            err(_) => {
+                return 3
+            }
+        }
+    }
+}
+pub struct WriterTask {
+    lock: allocated.RwLock<usize>
+    ready: allocated.Channel<usize>
+    pub fn run(self) -> usize {
+        match self.ready.send(1, 5000) {
+            ok() => {}, err(_) => {
+                return 1
+            }
+        }
+        match self.lock.write(5000) {
+            ok(guard) => {
+                value := guard.get_mut();
+                *value = 9
+            }
+            err(_) => {
+                return 2
+            }
+        }
+        return 0
+    }
+}
+
+fn advanced_checks() -> i32!error.Error {
+    cancelled_lock := allocated.Mutex.new(allocated.PageAllocator.new(), 8usize)?
+    cancelled_guard := cancelled_lock.lock(5000)?
+    canceller_storage := thread.Storage.new::<CancelWaiter, usize>()
+    match thread.spawn(&mut canceller_storage, CancelWaiter { lock: cancelled_lock.clone() }) {
+        ok(worker) => {
+            for {
+                match cancelled_guard.wait(5000) {
+                    ok() => {}
+                    err(error.Error.Cancelled) => {
+                        break
+                    }
+                    err(_) => {
+                        core.drop(cancelled_guard)
+                        worker.join()
+                        return ok(65)
+                    }
+                }
+            }
+            if *cancelled_guard.get() != 8 {
+                return ok(66)
+            }
+            core.drop(cancelled_guard)
+            if worker.join() != 0 {
+                return ok(67)
+            }
+        }
+        err(_) => {
+            return ok(68)
+        }
+    }
+    drops := allocated.Atomic.new(allocated.PageAllocator.new(), 0usize)?
+    queue := allocated.Channel.new::<DropValue>(allocated.PageAllocator.new(), 1)?
+    queue.send(DropValue { counter: drops.clone() }, 0)?
+    match queue.send(DropValue { counter: drops.clone() }, 0) {
+        ok() => {
+            return ok(50)
+        }, err(error.Error.TimedOut) => {}, err(_) => {
+            return ok(51)
+        }
+    }
+    if drops.load(atomic.Ordering.Relaxed)? != 1 {
+        return ok(52)
+    }
+    core.drop(queue)
+    if drops.load(atomic.Ordering.Relaxed)? != 2 {
+        return ok(53)
+    }
+    lock := allocated.Mutex.new(allocated.PageAllocator.new(), DropValue { counter: drops.clone() })?
+    core.drop(lock)
+    if drops.load(atomic.Ordering.Relaxed)? != 3 {
+        return ok(54)
+    }
+
+    once := allocated.Once.new::<usize>(allocated.PageAllocator.new())?
+    calls := allocated.Atomic.new(allocated.PageAllocator.new(), 0usize)?
+    start := allocated.Barrier.new(allocated.PageAllocator.new(), 2)?
+    a := thread.Storage.new::<OnceTask, usize>()
+    b := thread.Storage.new::<OnceTask, usize>()
+    match thread.spawn(&mut a, OnceTask { once: once.clone(), counter: calls.clone(), start: start.clone() }) {
+        ok(first) => {
+            match thread.spawn(&mut b, OnceTask { once: once.clone(), counter: calls.clone(), start: start.clone() }) {
+                ok(second) => {
+                    if first.join() != 42 || second.join() != 42 {
+                        return ok(55)
+                    }
+                }
+                err(_) => {
+                    start.cancel();
+                    return ok(56)
+                }
+            }
+        }
+        err(_) => {
+            return ok(57)
+        }
+    }
+    if calls.load(atomic.Ordering.Relaxed)? != 1 {
+        return ok(58)
+    }
+
+    rw := allocated.RwLock.new(allocated.PageAllocator.new(), 4usize)?
+    ready := allocated.Channel.new::<usize>(allocated.PageAllocator.new(), 1)?
+    read_guard := rw.read(0)?
+    storage := thread.Storage.new::<WriterTask, usize>()
+    match thread.spawn(&mut storage, WriterTask { lock: rw.clone(), ready: ready.clone() }) {
+        ok(worker) => {
+            match ready.receive(5000)? {
+                some(_) => {}, none => {
+                    return ok(59)
+                }
+            }
+            if *read_guard.get() != 4 {
+                return ok(60)
+            }
+            core.drop(read_guard)
+            if worker.join() != 0 {
+                return ok(61)
+            }
+        }
+        err(_) => {
+            return ok(62)
+        }
+    }
+    final_guard := rw.read(5000)?
+    if *final_guard.get() != 9 {
+        return ok(63)
+    }
+    return ok(0)
+}
+
+fn local_checks() -> i32!error.Error {
+    storage := sync.Storage.new()
+    lock := sync.Mutex.new(&mut storage, 1usize)?
+    guard := lock.lock(0)?
+    {
+        value := guard.get_mut();
+        *value = 2
+    }
+    match lock.lock(0) {
+        ok(_) => {
+            return ok(1)
+        }, err(error.Error.TimedOut) => {}, err(_) => {
+            return ok(2)
+        }
+    }
+    match guard.wait(1) {
+        ok() => {}, err(error.Error.TimedOut) => {}, err(_) => {
+            return ok(3)
+        }
+    }
+    if *guard.get() != 2 {
+        return ok(4)
+    }
+    core.drop(guard)
+    other_storage := sync.Storage.new()
+    other := sync.Mutex.new(&mut other_storage, 1usize)?
+    other_guard := other.lock(0)?
+    cv := lock.condition()
+    match cv.wait(&mut other_guard, 0) {
+        ok() => {
+            return ok(5)
+        }, err(error.Error.InvalidInput) => {}, err(_) => {
+            return ok(6)
+        }
+    }
+    core.drop(other_guard)
+
+    rw_storage := sync.Storage.new()
+    rw := sync.RwLock.new(&mut rw_storage, 4usize)?
+    a := rw.read(0)?
+    b := rw.read(0)?
+    if *a.get() != 4 || *b.get() != 4 {
+        return ok(7)
+    }
+    match rw.write(0) {
+        ok(_) => {
+            return ok(8)
+        }, err(error.Error.TimedOut) => {}, err(_) => {
+            return ok(9)
+        }
+    }
+    core.drop(a)
+    core.drop(b)
+    writer := rw.write(0)?
+    {
+        destination := writer.get_mut();
+        *destination = 5
+    }
+    core.drop(writer)
+
+    channel_storage := sync.Storage.new()
+    slots := [mem.uninit::<usize>(), mem.uninit::<usize>()]
+    queue := sync.Channel.new::<usize>(&mut channel_storage, &mut slots)?
+    queue.send(10, 0)?
+    queue.send(20, 0)?
+    match queue.send(30, 0) {
+        ok() => {
+            return ok(10)
+        }, err(error.Error.TimedOut) => {}, err(_) => {
+            return ok(11)
+        }
+    }
+    queue.close()
+    match queue.receive(0)? {
+        some(value) => {
+            if value != 10 {
+                return ok(12)
+            }
+        }, none => {
+            return ok(13)
+        }
+    }
+    match queue.receive(0)? {
+        some(value) => {
+            if value != 20 {
+                return ok(14)
+            }
+        }, none => {
+            return ok(15)
+        }
+    }
+    match queue.receive(0)? {
+        some(_) => {
+            return ok(16)
+        }, none => {}
+    }
+    match queue.send(0, 0) {
+        ok() => {
+            return ok(17)
+        }, err(error.Error.Closed) => {}, err(_) => {
+            return ok(18)
+        }
+    }
+
+    once_storage := sync.Storage.new()
+    once := sync.Once.new::<usize>(&mut once_storage)?
+    initializer := Initializer { calls: 0 }
+    for i in 0usize..5 {
+        result := once.get_or_init(&mut initializer, 0)?
+        match result.get() {
+            some(value) => {
+                if *value != 42 {
+                    return ok(19)
+                }
+            }, none => {
+                return ok(20)
+            }
+        }
+    }
+    if initializer.calls != 1 {
+        return ok(21)
+    }
+    barrier_storage := sync.Storage.new()
+    barrier := sync.Barrier.new(&mut barrier_storage, 2)?
+    match barrier.wait(1) {
+        ok() => {
+            return ok(22)
+        }, err(error.Error.TimedOut) => {}, err(_) => {
+            return ok(23)
+        }
+    }
+    match barrier.wait(1) {
+        ok() => {
+            return ok(24)
+        }, err(error.Error.Cancelled) => {}, err(_) => {
+            return ok(25)
+        }
+    }
+    rw.cancel()
+    match rw.read(0) {
+        ok(_) => {
+            return ok(26)
+        }, err(error.Error.Cancelled) => {}, err(_) => {
+            return ok(27)
+        }
+    }
+    return ok(0)
+}
+
+fn concurrent_checks() -> i32!error.Error {
+    counter := allocated.Mutex.new(allocated.PageAllocator.new(), 0usize)?
+    atom := allocated.Atomic.new(allocated.PageAllocator.new(), 0usize)?
+    barrier := allocated.Barrier.new(allocated.PageAllocator.new(), 3)?
+    one := thread.Storage.new::<CounterTask, usize>()
+    two := thread.Storage.new::<CounterTask, usize>()
+    match thread.spawn(&mut one, CounterTask { counter: counter.clone(), atom: atom.clone(), start: barrier.clone() }) {
+        ok(first) => {
+            match thread.spawn(&mut two, CounterTask { counter: counter.clone(), atom: atom.clone(), start: barrier.clone() }) {
+                ok(second) => {
+                    barrier.wait(5000)?
+                    if first.join() != 0 || second.join() != 0 {
+                        return ok(30)
+                    }
+                }
+                err(_) => {
+                    barrier.cancel();
+                    return ok(31)
+                }
+            }
+        }
+        err(_) => {
+            return ok(32)
+        }
+    }
+    guard := counter.lock(5000)?
+    if *guard.get() != 10000 {
+        return ok(33)
+    }
+    core.drop(guard)
+    if atom.load(atomic.Ordering.Acquire)? != 10000 {
+        return ok(34)
+    }
+    cas := atom.compare_exchange(10000, 1, atomic.Ordering.AcqRel, atomic.Ordering.Acquire)?
+    if!cas.exchanged || cas.previous != 10000 {
+        return ok(35)
+    }
+    failed := atom.compare_exchange(10000, 2, atomic.Ordering.SeqCst, atomic.Ordering.SeqCst)?
+    if failed.exchanged || failed.previous != 1 {
+        return ok(36)
+    }
+    match atom.load(atomic.Ordering.Release) {
+        ok(_) => {
+            return ok(37)
+        }, err(error.Error.InvalidOrdering) => {}, err(_) => {
+            return ok(38)
+        }
+    }
+    match atom.compare_exchange(1, 2, atomic.Ordering.Release, atomic.Ordering.Acquire) {
+        ok(_) => {
+            return ok(39)
+        }, err(error.Error.InvalidOrdering) => {}, err(_) => {
+            return ok(40)
+        }
+    }
+
+    queue := allocated.Channel.new::<usize>(allocated.PageAllocator.new(), 4)?
+    producer_storage := thread.Storage.new::<Producer, usize>()
+    match thread.spawn(&mut producer_storage, Producer { queue: queue.clone() }) {
+        ok(producer) => {
+            for i in 0usize..20000 {
+                match queue.receive(5000)? {
+                    some(value) => {
+                        if value != i {
+                            return ok(41)
+                        }
+                    }, none => {
+                        return ok(42)
+                    }
+                }
+            }
+            if producer.join() != 0 {
+                return ok(43)
+            }
+        }
+        err(_) => {
+            return ok(44)
+        }
+    }
+    match queue.receive(0)? {
+        some(_) => {
+            return ok(45)
+        }, none => {}
+    }
+
+    lock := allocated.Mutex.new(allocated.PageAllocator.new(), 0usize)?
+    ready := allocated.Channel.new::<usize>(allocated.PageAllocator.new(), 1)?
+    notifier_storage := thread.Storage.new::<NotifyTask, usize>()
+    match thread.spawn(&mut notifier_storage, NotifyTask { lock: lock.clone(), ready: ready.clone() }) {
+        ok(worker) => {
+            guard := lock.lock(5000)?
+            ready.send(1, 5000)?
+            for *guard.get() != 7 {
+                guard.wait(5000)?
+            }
+            core.drop(guard)
+            if worker.join() != 0 {
+                return ok(46)
+            }
+        }
+        err(_) => {
+            return ok(47)
+        }
+    }
+    cancelled := allocated.Channel.new::<usize>(allocated.PageAllocator.new(), 1)?
+    cancelled.cancel()
+    match cancelled.receive(0) {
+        ok(_) => {
+            return ok(48)
+        }, err(error.Error.Cancelled) => {}, err(_) => {
+            return ok(49)
+        }
+    }
+    return ok(0)
+}
+
+fn main() -> i32 {
+    match local_checks() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 98
+        }
+    }
+    match concurrent_checks() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }, err(_) => {
+            return 99
+        }
+    }
+    match advanced_checks() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 97
+        }
+    }
+}

@@ -1,6 +1,6 @@
 ---
 title: "Standard library"
-description: "Portable core, allocation, I/O, text, collections, mathematics, hashing, and time."
+description: "Portable foundations and independent filesystem, process, environment, thread, and synchronization adapters."
 section: "Using Dodo"
 order: 140
 ---
@@ -8,13 +8,16 @@ order: 140
 Dodo embeds its standard-library sources in the compiler. Imports work from any
 directory and with a copied compiler binary; no registry or separate installation
 is needed. Packages are loaded only when imported, including their explicit
-dependencies. These portable packages require no OS, libc, global allocator,
-scheduler, or garbage collector.
+dependencies. Portable foundation packages require no OS, libc, global allocator,
+scheduler, or garbage collector. Hosted packages select explicit platform adapters.
 
 The library includes byte I/O, formatting, binary buffers, UTF-8 text,
 [collections](collections.md), [mathematics](math.md), [hashing and
 checksums](hash.md), and [time values and clock contracts](time.md).
-HTTP, JSON/TOML, filesystem, threading, and peripheral drivers are not implemented.
+Hosted [filesystem](filesystem.md), [process](processes.md),
+[environment](environment.md), [thread](threads.md), and
+[synchronization](synchronization.md) packages build on those foundations.
+HTTP, JSON/TOML, and peripheral drivers are not implemented.
 
 ## Packages
 
@@ -50,9 +53,19 @@ HTTP, JSON/TOML, filesystem, threading, and peripheral drivers are not implement
 | `std/arena_bytes`, `std/pool_bytes` | Independently imported safe buffer constructors. |
 | `std/io_alloc` | Allocated append writers and bounded read-to-buffer helpers. |
 | `std/text_alloc`, `std/fmt_alloc` | Allocated UTF-8 strings and formatting into a newly owned string. |
+| `std/fs`, `std/fs/types`, `std/fs/path` | Native files/directories, portable metadata contracts, and lexical paths. |
+| `std/process`, `std/process/alloc` | Direct child execution, streams, waiting, termination, and bounded output collection. |
+| `std/env` | Native arguments, environment snapshots, child-environment construction, and current-directory access. |
+| `std/thread` | Move tasks, joins, explicit allocated detach, and checked transfer contracts. |
+| `std/sync`, `std/sync/allocated` | Caller-backed and explicitly allocated locks, guards, conditions, Once, barriers, and channels. |
+| `std/sync/atomic` | Integer atomics with explicit ordering, independent of OS blocking facilities. |
 
-`mem`, `ptr`, and `mmio` are compiler intrinsics; the remaining modules are Dodo
-source libraries. Imports use their final path component by default. Explicit
+See [hosted platform adapters](platform.md) for target support, native errors,
+resource ownership, C toolchain requirements, and custom object linking.
+
+`mem`, `ptr`, and `mmio` are compiler intrinsics; library APIs use Dodo source,
+with small C boundaries for complex hosted interfaces.
+Imports use their final path component by default. Explicit
 aliases distinguish packages with the same name:
 
 ```dodo

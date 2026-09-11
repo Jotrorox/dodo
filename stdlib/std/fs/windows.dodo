@@ -1,0 +1,381 @@
+package windows
+
+import "core/ptr"
+import "core/mem"
+import "std/platform/native"
+import "std/platform/error"
+import "std/fs/types"
+
+// Win64 ABI: DWORD remains 32 bits; HANDLE is pointer-sized, FILETIME has two
+// DWORDs (alignment four), and LARGE_INTEGER has eight-byte alignment.
+@repr(C)
+struct FileTime {
+    low: u32, high: u32
+}
+@repr(C)
+struct Information {
+    attributes: u32
+    created: FileTime
+    accessed: FileTime
+    modified: FileTime
+    volume: u32
+    size_high: u32
+    size_low: u32
+    links: u32
+    index_high: u32
+    index_low: u32
+}
+@repr(C)
+struct FindData {
+    attributes: u32
+    created: FileTime
+    accessed: FileTime
+    modified: FileTime
+    size_high: u32
+    size_low: u32
+    reserved0: u32
+    reserved1: u32
+    name: [260]u16
+    alternate: [14]u16
+}
+unsafe extern "C" fn CreateFileW(path: *const u16, access: u32, sharing: u32, security: *mut u8, creation: u32, flags: u32, template: *mut u8) -> *mut u8
+unsafe extern "C" fn GetFileInformationByHandle(handle: *mut u8, output: *mut Information) -> i32
+unsafe extern "C" fn GetFileType(handle: *mut u8) -> u32
+unsafe extern "C" fn GetFileAttributesW(path: *const u16) -> u32
+unsafe extern "C" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32
+unsafe extern "C" fn CreateDirectoryW(path: *const u16, security: *mut u8) -> i32
+unsafe extern "C" fn RemoveDirectoryW(path: *const u16) -> i32
+unsafe extern "C" fn DeleteFileW(path: *const u16) -> i32
+unsafe extern "C" fn MoveFileExW(old: *const u16, new: *const u16, flags: u32) -> i32
+unsafe extern "C" fn CreateSymbolicLinkW(path: *const u16, target: *const u16, flags: u32) -> u8
+unsafe extern "C" fn DeviceIoControl(handle: *mut u8, code: u32, input: *mut u8, input_size: u32, output: *mut u8, output_size: u32, returned: *mut u32, overlapped: *mut u8) -> i32
+unsafe extern "C" fn GetFinalPathNameByHandleW(handle: *mut u8, output: *mut u16, size: u32, flags: u32) -> u32
+unsafe extern "C" fn FindFirstFileW(pattern: *const u16, output: *mut FindData) -> *mut u8
+unsafe extern "C" fn FindNextFileW(handle: *mut u8, output: *mut FindData) -> i32
+unsafe extern "C" fn FindClose(handle: *mut u8) -> i32
+
+pub fn capabilities() -> types.Capabilities {
+    return types.Capabilities { symbolic_links: true, unix_permissions: false, windows_sharing: true, directory_sync: false }
+}
+pub fn open_file(path: &native.NativeString, read: bool, write: bool, append: bool, truncate: bool, create: bool, exclusive: bool, follow: bool, mode: u32, sharing: u32) -> native.Handle!error.Error {
+    access := 0u32
+    if read {
+        access |= 2147483648u32
+    }
+    if append {
+        access |= 4
+    } else if write {
+        access |= 1073741824
+    }
+    creation := 3u32
+    if create {
+        creation = 4
+    }
+    if truncate {
+        creation = 5
+    }
+    if create && truncate {
+        creation = 2
+    }
+    if exclusive {
+        creation = 1
+    }
+    flags := 33554432u32 // FILE_FLAG_BACKUP_SEMANTICS permits directory handles.
+    if!follow {
+        flags |= 2097152
+    }
+    unsafe {
+        handle := CreateFileW(path.as_ptr(), access, sharing, 0usize as *mut u8, creation, flags, 0usize as *mut u8)
+        if handle as isize == -1 {
+            return err(native.last_error())
+        }
+        owned := native.Handle.from_raw(handle as isize)
+        if!follow {
+            value := handle_metadata(&owned)?
+            if value.kind == types.FileKind.SymbolicLink {
+                return err(error.failure(error.Kind.InvalidInput))
+            }
+        }
+        return ok(owned)
+    }
+}
+fn information(handle: &native.Handle) -> Information!error.Error {
+    output := mem.uninit::<Information>()
+    unsafe {
+        ptr.write_bytes(mem.uninit_as_mut_ptr(&mut output), 0u8, 1)
+        if GetFileInformationByHandle(handle.raw() as *mut u8, mem.uninit_as_mut_ptr(&mut output)) == 0 {
+            return err(native.last_error())
+        }
+        return ok(mem.assume_init(output))
+    }
+}
+fn convert(data: &Information) -> types.Metadata {
+    kind := types.FileKind.File
+    if (data.attributes & 16) != 0 {
+        kind = types.FileKind.Directory
+    }
+    if (data.attributes & 1024) != 0 {
+        kind = types.FileKind.SymbolicLink
+    }
+    ticks := ((data.modified.high as u64) << 32) | (data.modified.low as u64)
+    // Win32 epoch 1601-01-01, 100 ns ticks, translated without signed overflow.
+    seconds := (ticks / 10000000) as i64 - 11644473600i64
+    nanos := ((ticks % 10000000) * 100) as u32
+    return types.Metadata { kind: kind, size: ((data.size_high as u64) << 32) | (data.size_low as u64),
+    modified_seconds: seconds, modified_nanoseconds: nanos,
+    readonly: (data.attributes & 1) != 0, unix_metadata: false, mode: 0, uid: 0, gid: 0,
+    device: data.volume as u64, inode: ((data.index_high as u64) << 32) | (data.index_low as u64), links: data.links as u64 }
+}
+pub fn handle_metadata(handle: &native.Handle) -> types.Metadata!error.Error {
+    data := information(handle)?
+    return ok(convert(&data))
+}
+pub fn metadata(path: &native.NativeString, follow: bool) -> types.Metadata!error.Error {
+    flags := 33554432u32
+    if!follow {
+        flags |= 2097152
+    }
+    unsafe {
+        raw := CreateFileW(path.as_ptr(), 128, 7, 0usize as *mut u8, 3, flags, 0usize as *mut u8)
+        if raw as isize == -1 {
+            return err(native.last_error())
+        }
+        handle := native.Handle.from_raw(raw as isize)
+        return handle_metadata(&handle)
+    }
+}
+pub fn create_directory(path: &native.NativeString, mode: u32) -> void!error.Error {
+    unsafe {
+        if CreateDirectoryW(path.as_ptr(), 0usize as *mut u8) == 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn remove_file(path: &native.NativeString) -> void!error.Error {
+    unsafe {
+        if DeleteFileW(path.as_ptr()) == 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn remove_directory(path: &native.NativeString) -> void!error.Error {
+    unsafe {
+        if RemoveDirectoryW(path.as_ptr()) == 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn rename_path(old: &native.NativeString, new: &native.NativeString, replace: bool) -> void!error.Error {
+    flags := 0u32
+    if replace {
+        flags = 1
+    }
+    // MOVEFILE_COPY_ALLOWED is never set: cross-volume moves fail intact.
+    unsafe {
+        if MoveFileExW(old.as_ptr(), new.as_ptr(), flags) == 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn set_mode(path: &native.NativeString, mode: u32) -> void!error.Error {
+    return err(error.failure(error.Kind.Unsupported))
+}
+pub fn set_readonly(path: &native.NativeString, readonly: bool) -> void!error.Error {
+    unsafe {
+        attributes := GetFileAttributesW(path.as_ptr())
+        if attributes == 4294967295u32 {
+            return err(native.last_error())
+        }
+        if readonly {
+            attributes |= 1
+        } else {
+            attributes &= ~1u32
+        }
+        if attributes == 0 {
+            attributes = 128
+        }
+        if SetFileAttributesW(path.as_ptr(), attributes) == 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn create_symlink(target: &native.NativeString, path: &native.NativeString, directory: bool) -> void!error.Error {
+    flags := 2u32 // ALLOW_UNPRIVILEGED_CREATE, requires supported Windows mode.
+    if directory {
+        flags |= 1
+    }
+    unsafe {
+        if CreateSymbolicLinkW(path.as_ptr(), target.as_ptr(), flags) == 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
+}
+pub fn read_symlink(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> native.NativeString!error.Error from(bytes, wide) {
+    // Windows reparse data is byte-structured and may be unaligned. Caller
+    // supplies 16 KiB bytes for FSCTL_GET_REPARSE_POINT plus wide result space.
+    if bytes.len < 16384 {
+        return err(error.failure(error.Kind.BufferTooSmall))
+    }
+    unsafe {
+        raw := CreateFileW(path.as_ptr(), 0, 7, 0usize as *mut u8, 3, 35651584, 0usize as *mut u8)
+        if raw as isize == -1 {
+            return err(native.last_error())
+        }
+        handle := native.Handle.from_raw(raw as isize)
+        size := 0u32
+        if DeviceIoControl(raw, 589992, 0usize as *mut u8, 0, ptr.as_mut_ptr(bytes), 16384, ptr.from_mut(&mut size), 0usize as *mut u8) == 0 {
+            return err(native.last_error())
+        }
+        if size < 20 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        tag := ptr.read_unaligned(ptr.as_ptr(bytes) as *const u32)
+        if tag != 2684354572u32 {
+            return err(error.failure(error.Kind.Unsupported))
+        }
+        // Prefer the user-facing print name, falling back to substitute name.
+        offset := ptr.read_unaligned(ptr.offset(ptr.as_ptr(bytes), 12) as *const u16) as usize
+        length := ptr.read_unaligned(ptr.offset(ptr.as_ptr(bytes), 14) as *const u16) as usize
+        if length == 0 {
+            offset = ptr.read_unaligned(ptr.offset(ptr.as_ptr(bytes), 8) as *const u16) as usize
+            length = ptr.read_unaligned(ptr.offset(ptr.as_ptr(bytes), 10) as *const u16) as usize
+        }
+        if length % 2 != 0 || offset % 2 != 0 || offset + length > (size as usize) - 20 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        count := length / 2
+        if wide.len <= count {
+            return err(error.failure(error.Kind.BufferTooSmall))
+        }
+        for i in 0usize..count {
+            wide[i] = ptr.read_unaligned(ptr.offset(ptr.as_ptr(bytes), (20 + offset + 2 * i) as isize) as *const u16)
+        }
+        wide[count] = 0
+        return native.NativeString.new(&wide[..count + 1])
+    }
+}
+pub fn canonicalize(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> native.NativeString!error.Error from(bytes, wide) {
+    if wide.len == 0 || wide.len > 4294967295usize {
+        return err(error.failure(error.Kind.BufferTooSmall))
+    }
+    unsafe {
+        raw := CreateFileW(path.as_ptr(), 0, 7, 0usize as *mut u8, 3, 33554432, 0usize as *mut u8)
+        if raw as isize == -1 {
+            return err(native.last_error())
+        }
+        handle := native.Handle.from_raw(raw as isize)
+        length := GetFinalPathNameByHandleW(raw, ptr.as_mut_ptr(wide), wide.len as u32, 0)
+        if length == 0 {
+            return err(native.last_error())
+        }
+        if length as usize >= wide.len {
+            return err(error.failure(error.Kind.BufferTooSmall))
+        }
+        return native.NativeString.new(&wide[..(length as usize) + 1])
+    }
+}
+
+pub struct Directory {
+    handle: isize
+    data: FindData
+    pending: bool
+    ended: bool
+    pub fn open(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> Directory!error.Error {
+        source := path.units()
+        if source.len == 0 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        if wide.len < source.len + 3 {
+            return err(error.failure(error.Kind.BufferTooSmall))
+        }
+        for i in 0usize..source.len {
+            wide[i] = source[i]
+        }
+        length := source.len
+        if length != 0 && source[length - 1] != 92 && source[length - 1] != 47 {
+            wide[length] = 92
+            length += 1
+        }
+        wide[length] = 42
+        wide[length + 1] = 0
+        raw_data := mem.uninit::<FindData>()
+        unsafe {
+            // Win32 need not initialize unused filename array suffixes.
+            ptr.write_bytes(mem.uninit_as_mut_ptr(&mut raw_data), 0u8, 1)
+            raw := FindFirstFileW(ptr.as_ptr(wide), mem.uninit_as_mut_ptr(&mut raw_data))
+            if raw as isize == -1 {
+                return err(native.last_error())
+            }
+            data := mem.assume_init(raw_data)
+            return ok(Directory { handle: raw as isize, data: data, pending: true, ended: false })
+        }
+    }
+    pub fn close(&mut self) -> void!error.Error {
+        if self.handle == -1 {
+            return ok()
+        }
+        raw := self.handle
+        self.handle = -1
+        self.pending = false
+        self.ended = true
+        unsafe {
+            if FindClose(raw as *mut u8) == 0 {
+                return err(native.last_error())
+            }
+        }
+        return ok()
+    }
+    fn drop(&mut self) {
+        match self.close() {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+    pub fn next(&mut self, bytes: &mut[u8], wide: &mut[u16]) -> Option<native.NativeString>!error.Error from(bytes, wide) {
+        if self.ended {
+            return ok(none)
+        }
+        for true {
+            if!self.pending {
+                unsafe {
+                    if FindNextFileW(self.handle as *mut u8, ptr.from_mut(&mut self.data)) == 0 {
+                        reason := native.last_error()
+                        if reason.code != 18 {
+                            return err(reason)
+                        }
+                        self.ended = true
+                        return ok(none)
+                    }
+                }
+                self.pending = true
+            }
+            length := 0usize
+            for length < 260 && self.data.name[length] != 0 {
+                length += 1
+            }
+            if length == 260 {
+                return err(error.failure(error.Kind.Other))
+            }
+            if (length == 1 && self.data.name[0] == 46) || (length == 2 && self.data.name[0] == 46 && self.data.name[1] == 46) {
+                self.pending = false
+            } else {
+                if wide.len <= length {
+                    return err(error.failure(error.Kind.BufferTooSmall))
+                }
+                for i in 0usize..length + 1 {
+                    wide[i] = self.data.name[i]
+                }
+                self.pending = false
+                name := native.NativeString.new(&wide[..length + 1])?
+                return ok(some(name))
+            }
+        }
+        return ok(none)
+    }
+}

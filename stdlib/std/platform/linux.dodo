@@ -1,0 +1,263 @@
+package linux
+
+import "core/ptr"
+import "core/mem"
+import "std/text"
+import "std/io"
+import "std/platform/error"
+
+// Native code units including exactly one final NUL. Interior NUL is rejected.
+// Unix bytes are never implicitly decoded; Windows u16 may contain unpaired
+// surrogates. The borrow keeps caller-owned storage alive across foreign calls.
+pub struct NativeString {
+    data: &[u8]
+    pub fn new(units: &[u8]) -> NativeString!error.Error from(units) {
+        if units.len == 0 || units[units.len - 1] != 0 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        for i in 0usize..units.len - 1 {
+            if units[i] == 0 {
+                return err(error.failure(error.Kind.InvalidInput))
+            }
+        }
+        return ok(NativeString { data: units })
+    }
+    pub fn as_ptr(&self) -> *const u8 {
+        return ptr.as_ptr(self.data)
+    }
+    pub fn units(&self) -> &[u8] {
+        return &self.data[..self.data.len - 1]
+    }
+    pub fn terminated(&self) -> &[u8] {
+        return self.data
+    }
+}
+
+// Consecutive NUL-terminated native strings. Empty lists are valid. A final
+// empty element is represented by an additional NUL; no implicit sentinel.
+pub struct NativeList {
+    data: &[u8]
+    pub fn new(units: &[u8]) -> NativeList!error.Error from(units) {
+        if units.len != 0 && units[units.len - 1] != 0 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        return ok(NativeList { data: units })
+    }
+    pub fn as_ptr(&self) -> *const u8 {
+        return ptr.as_ptr(self.data)
+    }
+    pub fn units(&self) -> &[u8] {
+        return self.data
+    }
+}
+
+fn io_error(reason: error.Error) -> io.Error {
+    kind := io.ErrorKind.Other
+    if reason.kind == error.Kind.Interrupted {
+        kind = io.ErrorKind.Interrupted
+    }
+    if reason.kind == error.Kind.InvalidInput {
+        kind = io.ErrorKind.InvalidInput
+    }
+    return io.Error { kind: kind, transferred: 0, code: reason.code }
+}
+
+unsafe extern "C" fn __errno_location() -> *mut i32
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn read(fd: i32, data: *mut u8, count: usize) -> isize
+unsafe extern "C" fn dodo_platform_write(fd: i32, data: *const u8, count: usize) -> isize
+unsafe extern "C" fn lseek(fd: i32, offset: i64, origin: i32) -> i64
+unsafe extern "C" fn fsync(fd: i32) -> i32
+unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32
+
+pub fn from_code(code: i32) -> error.Error {
+    kind := error.Kind.Other
+    if code == 2 {
+        kind = error.Kind.NotFound
+    }
+    if code == 17 {
+        kind = error.Kind.AlreadyExists
+    }
+    if code == 1 || code == 13 {
+        kind = error.Kind.PermissionDenied
+    }
+    if code == 4 {
+        kind = error.Kind.Interrupted
+    }
+    if code == 11 {
+        kind = error.Kind.WouldBlock
+    }
+    if code == 18 {
+        kind = error.Kind.CrossDevice
+    }
+    if code == 20 {
+        kind = error.Kind.NotDirectory
+    }
+    if code == 21 {
+        kind = error.Kind.IsDirectory
+    }
+    if code == 22 {
+        kind = error.Kind.InvalidInput
+    }
+    if code == 38 || code == 95 {
+        kind = error.Kind.Unsupported
+    }
+    if code == 39 {
+        kind = error.Kind.DirectoryNotEmpty
+    }
+    if code == 110 {
+        kind = error.Kind.TimedOut
+    }
+    if code == 125 {
+        kind = error.Kind.Cancelled
+    }
+    if code == 34 || code == 36 {
+        kind = error.Kind.BufferTooSmall
+    }
+    if code == 9 {
+        kind = error.Kind.Closed
+    }
+    return error.Error { kind: kind, code: code }
+}
+pub fn last_error() -> error.Error {
+    unsafe {
+        return from_code(ptr.read(__errno_location()))
+    }
+}
+
+pub fn from_utf8(value: &str, bytes: &mut[u8], wide: &mut[u16]) -> NativeString!error.Error from(bytes, wide) {
+    source := mem.str_bytes(value)
+    if bytes.len <= source.len {
+        return err(error.failure(error.Kind.BufferTooSmall))
+    }
+    for i in 0usize..source.len {
+        bytes[i] = source[i]
+    }
+    bytes[source.len] = 0
+    return NativeString.new(&bytes[..source.len + 1])
+}
+
+// Explicit replacement: one U+FFFD for each malformed Unix byte. Native
+// conversions are otherwise strict, caller-backed, and never locale-dependent.
+pub fn to_utf8(value: &NativeString, output: &mut[u8], lossy: bool) -> usize!error.Error {
+    source := value.units()
+    offset := 0usize
+    used := 0usize
+    for offset < source.len {
+        scalar := 0u32
+        match text.decode(source, offset) {
+            ok(decoded) => {
+                scalar = decoded.scalar;
+                offset = decoded.next
+            }
+            err(_) => {
+                if!lossy {
+                    return err(error.failure(error.Kind.InvalidInput))
+                }
+                scalar = 65533
+                offset += 1
+            }
+        }
+        match text.encode(scalar, &mut output[used..]) {
+            ok(count) => {
+                used += count
+            }
+            err(_) => {
+                return err(error.failure(error.Kind.BufferTooSmall))
+            }
+        }
+    }
+    return ok(used)
+}
+
+// Unique owning descriptor. close invalidates first: Linux close(EINTR) must
+// never be retried, since the descriptor number may already have been reused.
+pub struct Handle {
+    value: isize
+    pub unsafe fn from_raw(raw: isize) -> Handle {
+        return Handle { value: raw }
+    }
+    pub fn raw(&self) -> isize {
+        return self.value
+    }
+    pub fn close(&mut self) -> void!error.Error {
+        if self.value == -1 {
+            return ok()
+        }
+        previous := self.value
+        self.value = -1
+        unsafe {
+            if close(previous as i32) != 0 {
+                return err(last_error())
+            }
+        }
+        return ok()
+    }
+    fn drop(&mut self) {
+        match self.close() {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+    pub fn read(&mut self, output: &mut[u8]) -> usize!io.Error {
+        if output.len == 0 {
+            return ok(0)
+        }
+        if output.len > 9223372036854775807usize {
+            return err(io.failure(io.ErrorKind.InvalidInput, 0))
+        }
+        unsafe {
+            count := read(self.value as i32, ptr.as_mut_ptr(output), output.len)
+            if count < 0 {
+                return err(io_error(last_error()))
+            }
+            return ok(count as usize)
+        }
+    }
+    pub fn write(&mut self, input: &[u8]) -> usize!io.Error {
+        if input.len == 0 {
+            return ok(0)
+        }
+        if input.len > 9223372036854775807usize {
+            return err(io.failure(io.ErrorKind.InvalidInput, 0))
+        }
+        unsafe {
+            count := dodo_platform_write(self.value as i32, ptr.as_ptr(input), input.len)
+            if count < 0 {
+                return err(io_error(last_error()))
+            }
+            return ok(count as usize)
+        }
+    }
+    pub fn seek(&mut self, position: usize) -> usize!io.Error {
+        if position > 9223372036854775807usize {
+            return err(io.failure(io.ErrorKind.OutOfBounds, 0))
+        }
+        unsafe {
+            offset := lseek(self.value as i32, position as i64, 0)
+            if offset < 0 {
+                return err(io_error(last_error()))
+            }
+            return ok(offset as usize)
+        }
+    }
+    pub fn sync(&mut self) -> void!error.Error {
+        unsafe {
+            if fsync(self.value as i32) != 0 {
+                return err(last_error())
+            }
+        }
+        return ok()
+    }
+    pub fn truncate(&mut self, length: u64) -> void!error.Error {
+        if length > 9223372036854775807u64 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        unsafe {
+            if ftruncate(self.value as i32, length as i64) != 0 {
+                return err(last_error())
+            }
+        }
+        return ok()
+    }
+}

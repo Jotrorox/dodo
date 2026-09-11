@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add independently selected Linux/Windows filesystem, process, environment,
+  native thread, and synchronization packages, with native strings, explicit
+  allocation, owned resources, bounded output collection, and deterministic
+  guard/thread destruction. Embed their native ABI boundaries in the compiler.
+- Add checked cross-thread transfer/sharing contracts, native callback
+  specialization, and integer atomics with validated memory orderings and target
+  capabilities. Extend Wine verification with real hosted and child programs.
 - Add independently imported portable collections, binary64 mathematics,
   hashing/checksums, and duration/calendar/clock-contract packages, with explicit
   fallible allocation and no required OS, global allocator, or libm dependency.

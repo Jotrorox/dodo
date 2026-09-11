@@ -290,7 +290,35 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 .machine
                 .write_to_file(&generated.module, FileType::Object, &object)
                 .map_err(|e| e.to_string())?;
-            let output=Command::new(&args.linker).arg(&object).args(&args.link_args).arg("-o").arg(out).output().map_err(|e|format!("could not execute linker '{}': {e}; install a C toolchain or select --linker",args.linker.to_string_lossy()))?;
+            let mut linker = Command::new(&args.linker);
+            linker.arg(&object);
+            let native = package::native_sources(loaded);
+            for (name, source) in &native {
+                let file = temporary.0.join(name);
+                fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+                fs::write(&file, source).map_err(|e| e.to_string())?;
+                if file.extension().is_some_and(|ext| ext == "c") {
+                    linker.arg(file);
+                }
+            }
+            if !native.is_empty() {
+                linker
+                    .arg("-std=c11")
+                    .arg(format!("-O{}", args.options.optimization));
+                let target = args.options.target.clone().unwrap_or_else(|| {
+                    inkwell::targets::TargetMachine::get_default_triple()
+                        .as_str()
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                if target.contains("-linux-") {
+                    linker.arg("-pthread");
+                }
+                if target.contains("-windows-") {
+                    linker.args(["-lkernel32", "-lshell32"]);
+                }
+            }
+            let output = linker.args(&args.link_args).arg("-o").arg(out).output().map_err(|e|format!("could not execute linker '{}': {e}; install a C toolchain or select --linker",args.linker.to_string_lossy()))?;
             if !output.status.success() {
                 return Err(format!(
                     "linker failed ({}):\n{}{}",
@@ -304,7 +332,13 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
     Ok(())
 }
 fn execute(mut args: Args) -> Result<i32, String> {
-    let mut loaded = package::load(&args.input)?;
+    let target = args.options.target.clone().unwrap_or_else(|| {
+        inkwell::targets::TargetMachine::get_default_triple()
+            .as_str()
+            .to_string_lossy()
+            .into_owned()
+    });
+    let mut loaded = package::load_for_target(&args.input, &target)?;
     let bits = codegen::pointer_bits(&args.options).map_err(|e| e.to_string())?;
     sema::check_for_target(&mut loaded.program, bits).map_err(|d| loaded.render(&d))?;
     if args.action == Action::Check {

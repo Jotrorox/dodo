@@ -1,0 +1,223 @@
+package thread
+
+import "core/mem"
+import "core/ptr"
+import "std/thread/native"
+
+pub struct Unit {}
+
+pub enum ErrorKind {
+    StartFailed
+    AllocationFailed
+    InvalidLayout
+}
+pub struct ThreadError {
+    pub kind: ErrorKind
+    pub native_code: i32
+}
+
+// Stable caller-owned storage. A Join exclusively borrows the complete storage
+// until the worker has stopped; moving, destroying or reusing it is rejected.
+// T is a move task with a statically dispatched run(self)->R method.
+pub struct Storage<T, R> {
+    native_state: [16]usize
+    task: MaybeUninit<T>
+    result: MaybeUninit<R>
+    complete: usize
+
+    pub fn new() -> Storage<T, R> {
+        mem.assert_send::<T>()
+        mem.assert_send::<R>()
+        return Storage<T, R> {
+            native_state: [0usize; 16], task: mem.uninit::<T>(), result: mem.uninit::<R>(), complete: 0
+        }
+    }
+}
+
+pub struct Join<T, R> {
+    owner: &mut Storage<T, R>
+    active: bool
+
+    pub fn is_finished(&self) -> bool {
+        unsafe {
+            return mem.atomic_load(ptr.from_ref(&self.owner.complete), 1) != 0
+        }
+    }
+
+    // Joining synchronizes all worker writes before transferring the result.
+    // Native failure indicates an unsafe contract violation and aborts; it
+    // cannot release caller storage while a worker might still access it.
+    pub fn join(self) -> R {
+        unsafe {
+            native.dodo_thread_join(ptr.as_mut_ptr(&mut self.owner.native_state) as *mut u8)
+            self.active = false
+            return ptr.read(mem.uninit_as_mut_ptr(&mut self.owner.result))
+        }
+    }
+
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                native.dodo_thread_join(ptr.as_mut_ptr(&mut self.owner.native_state) as *mut u8)
+                self.active = false
+                ptr.drop_in_place(mem.uninit_as_mut_ptr(&mut self.owner.result))
+            }
+        }
+    }
+}
+
+// Every supported normal exit joins, including return, ?, break, continue,
+// and explicit drop. Dodo traps abort the process and do not unwind.
+// Scoped borrowing inside tasks is intentionally unavailable: checking a
+// caller storage borrow alone does not make captured references thread-safe.
+pub fn spawn<T, R>(storage: &mut Storage<T, R>, task: T) -> Join<T, R>!ThreadError from(storage) {
+    mem.assert_send::<T>()
+    mem.assert_send::<R>()
+    storage.task = mem.init(task)
+    storage.complete = 0
+    unsafe {
+        code := native.dodo_thread_start(
+            ptr.as_mut_ptr(&mut storage.native_state) as *mut u8,
+            mem.callback::<T, R>(execute),
+            ptr.from_mut(storage) as *mut u8)
+        if code != 0 {
+            core.drop(ptr.read(mem.uninit_as_mut_ptr(&mut storage.task)))
+            return err(ThreadError { kind: ErrorKind.StartFailed, native_code: code })
+        }
+    }
+    return ok(Join<T, R> { owner: storage, active: true })
+}
+
+unsafe fn execute<T, R>(argument: *mut u8) {
+    unsafe {
+        task_pointer := ptr.offset(argument, mem.offset_of::<Storage<T, R>>("task") as isize) as *mut T
+        result_pointer := ptr.offset(argument, mem.offset_of::<Storage<T, R>>("result") as isize) as *mut R
+        task := ptr.read(task_pointer)
+        result: R = task.run()
+        // Enforce the same checked-borrow and Result obligations on returned
+        // storage. Result-containing outputs must be handled by the task.
+        initialized := mem.init(result)
+        ptr.write(result_pointer, mem.assume_init(initialized))
+        mem.atomic_store(ptr.offset(argument, mem.offset_of::<Storage<T, R>>("complete") as isize) as *mut usize, 1usize, 2)
+    }
+}
+
+pub fn yield_now() {
+    unsafe {
+        native.dodo_thread_yield()
+    }
+}
+pub fn sleep_ms(milliseconds: u32) {
+    unsafe {
+        native.dodo_thread_sleep(milliseconds)
+    }
+}
+
+// Explicit permission to allocate an independently owned native mapping.
+// It neither installs nor consults a global Dodo allocator.
+pub struct NativeAllocator {
+    pub fn new() -> NativeAllocator {
+        return NativeAllocator {}
+    }
+}
+
+struct OwnedState<T, R> {
+    native_state: [16]usize
+    task: MaybeUninit<T>
+    result: MaybeUninit<R>
+    // 0 = running/joinable; 1 = finished; 2 = running/detached.
+    disposition: usize
+}
+
+// SAFETY: this unique owner may move between threads. Its constructors check
+// both payloads, and the worker/owner disposition handshake releases mapping
+// and result exactly once. No checked reference escapes its raw storage.
+@unsafe_send
+pub struct OwnedJoin<T, R> {
+    state: *mut u8
+    active: bool
+
+    pub fn is_finished(&self) -> bool {
+        unsafe {
+            return mem.atomic_load(ptr.offset(self.state, mem.offset_of::<OwnedState<T, R>>("disposition") as isize) as *const usize, 1) == 1
+        }
+    }
+
+    pub fn join(self) -> R {
+        unsafe {
+            native.dodo_thread_join(self.state)
+            result := ptr.read(ptr.offset(self.state, mem.offset_of::<OwnedState<T, R>>("result") as isize) as *mut R)
+            native.dodo_thread_free(self.state, mem.size_of::<OwnedState<T, R>>())
+            self.active = false
+            return result
+        }
+    }
+
+    // Detach explicitly gives up result access. The task continues, destroys
+    // its result when complete and releases its own mapping. Process exit
+    // does not wait for detached workers. There is no forcible cancellation.
+    pub fn detach(self) {
+        unsafe {
+            native.dodo_thread_detach(self.state)
+            disposition := ptr.offset(self.state, mem.offset_of::<OwnedState<T, R>>("disposition") as isize) as *mut usize
+            previous := mem.atomic_exchange(disposition, 2usize, 3)
+            self.active = false
+            if previous == 1 {
+                release_owned::<T, R>(self.state)
+            }
+        }
+    }
+
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                native.dodo_thread_join(self.state)
+                release_owned::<T, R>(self.state)
+                self.active = false
+            }
+        }
+    }
+}
+
+pub fn spawn_owned<T, R>(allocator: &NativeAllocator, task: T) -> OwnedJoin<T, R>!ThreadError {
+    mem.assert_send::<T>()
+    mem.assert_send::<R>()
+    code := 0i32
+    unsafe {
+        state := native.dodo_thread_allocate(mem.size_of::<OwnedState<T, R>>(), mem.align_of::<OwnedState<T, R>>(), ptr.from_mut(&mut code))
+        if ptr.is_null(state) {
+            return err(ThreadError { kind: ErrorKind.AllocationFailed, native_code: code })
+        }
+        initialized := mem.init(task)
+        ptr.write(ptr.offset(state, mem.offset_of::<OwnedState<T, R>>("task") as isize) as *mut T, mem.assume_init(initialized))
+        ptr.write(ptr.offset(state, mem.offset_of::<OwnedState<T, R>>("disposition") as isize) as *mut usize, 0usize)
+        code = native.dodo_thread_start(state, mem.callback::<T, R>(execute_owned), state)
+        if code != 0 {
+            ptr.drop_in_place(ptr.offset(state, mem.offset_of::<OwnedState<T, R>>("task") as isize) as *mut T)
+            native.dodo_thread_free(state, mem.size_of::<OwnedState<T, R>>())
+            return err(ThreadError { kind: ErrorKind.StartFailed, native_code: code })
+        }
+        return ok(OwnedJoin<T, R> { state: state, active: true })
+    }
+}
+
+unsafe fn execute_owned<T, R>(state: *mut u8) {
+    unsafe {
+        task := ptr.read(ptr.offset(state, mem.offset_of::<OwnedState<T, R>>("task") as isize) as *mut T)
+        result: R = task.run()
+        initialized := mem.init(result)
+        ptr.write(ptr.offset(state, mem.offset_of::<OwnedState<T, R>>("result") as isize) as *mut R, mem.assume_init(initialized))
+        disposition := ptr.offset(state, mem.offset_of::<OwnedState<T, R>>("disposition") as isize) as *mut usize
+        previous := mem.atomic_exchange(disposition, 1usize, 3)
+        if previous == 2 {
+            release_owned::<T, R>(state)
+        }
+    }
+}
+
+unsafe fn release_owned<T, R>(state: *mut u8) {
+    unsafe {
+        ptr.drop_in_place(ptr.offset(state, mem.offset_of::<OwnedState<T, R>>("result") as isize) as *mut R)
+        native.dodo_thread_free(state, mem.size_of::<OwnedState<T, R>>())
+    }
+}

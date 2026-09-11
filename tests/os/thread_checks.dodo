@@ -1,0 +1,277 @@
+package thread_checks
+import "std/thread"
+import "core/mem"
+import "core/ptr"
+
+static mut START: usize = 0
+static mut READY: usize = 0
+static mut COUNT: usize = 0
+static mut TASK_DROPS: usize = 0
+static mut RESULT_DROPS: usize = 0
+
+fn load(value: *const usize) -> usize {
+    unsafe {
+        return mem.atomic_load(value, 1)
+    }
+}
+fn wait_for(value: *const usize, expected: usize) -> bool {
+    for i in 0usize..5000 {
+        if load(value) >= expected {
+            return true
+        }
+        thread.sleep_ms(1)
+    }
+    return false
+}
+
+pub struct CounterTask {
+    pub fn run(self) -> usize {
+        unsafe {
+            mem.atomic_fetch_add(ptr.from_ref(&READY) as *mut usize, 1usize, 2)
+            if!wait_for(ptr.from_ref(&START), 1) {
+                return 1
+            }
+            for i in 0usize..10000 {
+                mem.atomic_fetch_add(ptr.from_ref(&COUNT) as *mut usize, 1usize, 0)
+            }
+        }
+        return 0
+    }
+}
+
+// These explicit unsafe contracts are justified by global atomics exclusively
+// accessed atomically and by owned scalar payloads. No raw pointer is sent.
+@unsafe_send
+pub struct DropResult {
+    fn drop(&mut self) {
+        unsafe {
+            mem.atomic_fetch_add(ptr.from_ref(&RESULT_DROPS) as *mut usize, 1usize, 2)
+        }
+    }
+}
+@unsafe_send
+pub struct DropTask {
+    wait: bool
+    pub fn run(self) -> DropResult {
+        thread.sleep_ms(1)
+        if self.wait {
+            unsafe {
+                wait_for(ptr.from_ref(&START), 2)
+            }
+        }
+        return DropResult {}
+    }
+    fn drop(&mut self) {
+        unsafe {
+            mem.atomic_fetch_add(ptr.from_ref(&TASK_DROPS) as *mut usize, 1usize, 2)
+        }
+    }
+}
+
+fn exit_return() -> void!thread.ThreadError {
+    storage := thread.Storage.new::<DropTask, DropResult>()
+    worker := thread.spawn(&mut storage, DropTask { wait: false })?
+    return ok()
+}
+fn fail_now() -> void!thread.ThreadError {
+    return err(thread.ThreadError { kind: thread.ErrorKind.StartFailed, native_code: -999 })
+}
+fn exit_try() -> void!thread.ThreadError {
+    storage := thread.Storage.new::<DropTask, DropResult>()
+    worker := thread.spawn(&mut storage, DropTask { wait: false })?
+    fail_now()?
+    return ok()
+}
+fn exit_loops() -> void!thread.ThreadError {
+    storage := thread.Storage.new::<DropTask, DropResult>()
+    for i in 0usize..3 {
+        worker := thread.spawn(&mut storage, DropTask { wait: false })?
+        if i == 0 {
+            continue
+        }
+        break
+    }
+    return ok()
+}
+
+fn contention() -> usize!thread.ThreadError {
+    a := thread.Storage.new::<CounterTask, usize>()
+    b := thread.Storage.new::<CounterTask, usize>()
+    c := thread.Storage.new::<CounterTask, usize>()
+    d := thread.Storage.new::<CounterTask, usize>()
+    one := thread.spawn(&mut a, CounterTask {})?
+    two := thread.spawn(&mut b, CounterTask {})?
+    three := thread.spawn(&mut c, CounterTask {})?
+    four := thread.spawn(&mut d, CounterTask {})?
+    unsafe {
+        ready := wait_for(ptr.from_ref(&READY), 4)
+        mem.atomic_store(ptr.from_ref(&START) as *mut usize, 1usize, 2)
+        if!ready {
+            return ok(20)
+        }
+    }
+    if one.join() != 0 || two.join() != 0 || three.join() != 0 || four.join() != 0 {
+        return ok(21)
+    }
+    unsafe {
+        if load(ptr.from_ref(&COUNT)) != 40000 {
+            return ok(22)
+        }
+    }
+    return ok(0)
+}
+
+fn destruction() -> usize!thread.ThreadError {
+    allocator := thread.NativeAllocator.new()
+    // Detach before completing: the worker wins the release handshake.
+    before := thread.spawn_owned::<DropTask, DropResult>(&allocator, DropTask { wait: true })?
+    before.detach()
+    unsafe {
+        mem.atomic_store(ptr.from_ref(&START) as *mut usize, 2usize, 2)
+        if!wait_for(ptr.from_ref(&RESULT_DROPS), 1) {
+            return ok(30)
+        }
+    }
+    // Detach after completion: the caller wins the release handshake.
+    after := thread.spawn_owned::<DropTask, DropResult>(&allocator, DropTask { wait: false })?
+    for i in 0usize..5000 {
+        if after.is_finished() {
+            break
+        }
+        thread.sleep_ms(1)
+    }
+    if!after.is_finished() {
+        return ok(31)
+    }
+    after.detach()
+    // Joining transfers ownership without prematurely destroying the result.
+    joined := thread.spawn_owned::<DropTask, DropResult>(&allocator, DropTask { wait: false })?
+    result := joined.join()
+    unsafe {
+        if load(ptr.from_ref(&RESULT_DROPS)) != 2 {
+            return ok(32)
+        }
+    }
+    core.drop(result)
+    // An unjoined handle joins and destroys its result automatically.
+    dropped := thread.spawn_owned::<DropTask, DropResult>(&allocator, DropTask { wait: false })?
+    core.drop(dropped)
+    storage := thread.Storage.new::<DropTask, DropResult>()
+    scoped := thread.spawn(&mut storage, DropTask { wait: false })?
+    core.drop(scoped)
+    unsafe {
+        if load(ptr.from_ref(&TASK_DROPS)) != 5 || load(ptr.from_ref(&RESULT_DROPS)) != 5 {
+            return ok(33)
+        }
+    }
+    exit_return()?
+    match exit_try() {
+        ok() => {
+            return ok(35)
+        },
+        err(error) => {
+            if error.native_code != -999 {
+                return err(error)
+            }
+        }
+    }
+    exit_loops()?
+    unsafe {
+        if load(ptr.from_ref(&TASK_DROPS)) != 9 || load(ptr.from_ref(&RESULT_DROPS)) != 9 {
+            return ok(36)
+        }
+    }
+    return ok(0)
+}
+
+pub struct Task {
+    value: usize
+    pub fn run(self) -> usize {
+        return self.value * 2
+    }
+}
+
+fn main() -> i32 {
+    match contention() {
+        ok(code) => {
+            if code != 0 {
+                return code as i32
+            }
+        }, err(_) => {
+            return 23
+        }
+    }
+    match destruction() {
+        ok(code) => {
+            if code != 0 {
+                return code as i32
+            }
+        }, err(_) => {
+            return 34
+        }
+    }
+    storage := thread.Storage.new::<Task, usize>()
+    match thread.spawn(&mut storage, Task { value: 21 }) {
+        ok(worker) => {
+            if worker.join() != 42 {
+                return 1
+            }
+        },
+        err(_) => {
+            return 2
+        }
+    }
+    // Reuse is permitted after join, and implicit drop joins every worker.
+    for i in 0usize..100 {
+        match thread.spawn(&mut storage, Task { value: i }) {
+            ok(worker) => {
+                core.drop(worker)
+            },
+            err(_) => {
+                return 3
+            }
+        }
+    }
+    allocator := thread.NativeAllocator.new()
+    for i in 0usize..100 {
+        match thread.spawn_owned::<Task, usize>(&allocator, Task { value: i }) {
+            ok(worker) => {
+                if worker.join() != i * 2 {
+                    return 9
+                }
+            },
+            err(_) => {
+                return 10
+            }
+        }
+    }
+    match thread.spawn_owned::<Task, usize>(&allocator, Task { value: 1 }) {
+        ok(worker) => {
+            core.drop(worker)
+        },
+        err(_) => {
+            return 11
+        }
+    }
+    number := 0usize
+    unsafe {
+        pointer := ptr.from_mut(&mut number)
+        mem.atomic_store(pointer, 10usize, 2)
+        if mem.atomic_load(pointer, 1) != 10 {
+            return 4
+        }
+        if mem.atomic_fetch_add(pointer, 2usize, 0) != 10 {
+            return 5
+        }
+        if mem.atomic_exchange(pointer, 7usize, 3) != 12 {
+            return 6
+        }
+        if mem.atomic_compare_exchange(pointer, 7usize, 8usize, 4, 1) != 7 {
+            return 7
+        }
+        if mem.atomic_compare_exchange(pointer, 7usize, 9usize, 4, 4) != 8 {
+            return 8
+        }
+    }
+    return 0
+}

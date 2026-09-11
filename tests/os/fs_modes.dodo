@@ -1,0 +1,94 @@
+package fs_modes
+import "std/fs"
+import "std/platform/native"
+import "std/platform/error"
+import "std/io"
+
+fn exercise(path: &native.NativeString, mask: u32, existing: bool) -> i32!error.Error {
+    if existing {
+        create := fs.OpenOptions.create_new()
+        original := fs.File.open(path, &create)?
+        match io.write_all(&mut original, b"keep") {
+            ok(_) => {}
+            err(_) => {
+                return ok(1)
+            }
+        }
+        original.close()?
+    }
+    options := fs.OpenOptions.new()
+    options.read = (mask & 1) != 0
+    options.write = (mask & 2) != 0
+    options.append = (mask & 4) != 0
+    options.truncate = (mask & 8) != 0
+    options.create = (mask & 16) != 0
+    options.exclusive = (mask & 32) != 0
+    valid := (options.read || options.write || options.append) && (!options.truncate || options.write) && !(options.append && options.truncate) && (!options.exclusive || options.create)
+    should_open := valid && ((existing && !options.exclusive) || (!existing && options.create))
+    match fs.File.open(path, &options) {
+        ok(file) => {
+            if!should_open {
+                return ok(2)
+            }
+            info := file.metadata()?
+            expected := 0u64
+            if existing && !options.truncate {
+                expected = 4
+            }
+            if info.size != expected {
+                return ok(3)
+            }
+            file.close()?
+        }
+        err(reason) => {
+            if should_open {
+                return ok(4)
+            }
+            if!valid && reason.kind != error.Kind.InvalidInput {
+                return ok(5)
+            }
+            if valid && existing && reason.kind != error.Kind.AlreadyExists {
+                return ok(6)
+            }
+            if valid && !existing && reason.kind != error.Kind.NotFound {
+                return ok(7)
+            }
+            if existing {
+                unchanged := fs.metadata(path)?
+                if unchanged.size != 4 {
+                    return ok(8)
+                }
+            }
+        }
+    }
+    if existing || should_open {
+        fs.remove_file(path)?
+    }
+    return ok(0)
+}
+fn verify() -> i32!error.Error {
+    b := [0u8; 128]
+    w := [0u16; 128]
+    path := native.from_utf8("open mode combinations.txt", &mut b, &mut w)?
+    for mask in 0u32..64u32 {
+        missing := exercise(&path, mask, false)?
+        if missing != 0 {
+            return ok(mask as i32 + 1)
+        }
+        existing := exercise(&path, mask, true)?
+        if existing != 0 {
+            return ok(mask as i32 + 65)
+        }
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match verify() {
+        ok(code) => {
+            return code
+        }
+        err(reason) => {
+            return 150 + reason.code % 100
+        }
+    }
+}

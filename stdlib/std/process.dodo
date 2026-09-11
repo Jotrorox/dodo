@@ -1,0 +1,183 @@
+package process
+
+import "core/mem"
+import "std/io"
+import "std/platform/native"
+import "std/platform/error"
+import "std/process/native" as backend
+
+pub const FOREVER: u64 = 18446744073709551615
+pub enum Stdio {
+    Inherit, Piped, Null
+}
+pub enum ExitKind {
+    Exited, Signalled, Cancelled
+}
+pub struct ExitStatus {
+    pub kind: ExitKind
+    // Exit code on ordinary exit, native signal on Unix signal termination.
+    pub code: i32
+    pub fn success(&self) -> bool {
+        return self.kind == ExitKind.Exited && self.code == 0
+    }
+}
+pub struct Output {
+    pub status: ExitStatus
+    pub stdout_len: usize
+    pub stderr_len: usize
+}
+pub struct CollectError {
+    pub cause: error.Error
+    pub stdout_len: usize
+    pub stderr_len: usize
+}
+pub struct Options {
+    pub stdin: Stdio
+    pub stdout: Stdio
+    pub stderr: Stdio
+    pub inherit_environment: bool
+    // Linux only. Direct executable selection is the default. PATH lookup
+    // explicitly observes the parent's PATH; no shell interpretation occurs.
+    pub search_path: bool
+    pub fn new() -> Options {
+        return Options { stdin: Stdio.Inherit, stdout: Stdio.Inherit,
+        stderr: Stdio.Inherit, inherit_environment: true, search_path: false }
+    }
+    pub fn capture() -> Options {
+        return Options { stdin: Stdio.Null, stdout: Stdio.Piped,
+        stderr: Stdio.Piped, inherit_environment: true, search_path: false }
+    }
+}
+fn stream_mode(value: &Stdio) -> i32 {
+    if *value == Stdio.Piped {
+        return 1
+    }
+    if *value == Stdio.Null {
+        return 2
+    }
+    return 0
+}
+fn status(value: backend.Status) -> ExitStatus {
+    kind := ExitKind.Exited
+    if value.kind == 1 {
+        kind = ExitKind.Signalled
+    }
+    if value.kind == 2 {
+        kind = ExitKind.Cancelled
+    }
+    return ExitStatus { kind: kind, code: value.code }
+}
+
+// A Child uniquely owns the process and untaken pipes. Dropping an unfinished
+// Child closes pipes, forcibly terminates, and reaps it. wait never drains pipes;
+// use collect for captured output. A taken pipe has independent ownership.
+pub struct Child {
+    state: backend.State
+    pub fn wait(&mut self) -> ExitStatus!error.Error {
+        self.state.wait(FOREVER)?
+        return ok(status(self.state.status()))
+    }
+    // Timeout preserves a live child. Cancellation is explicit and recorded.
+    pub fn wait_timeout(&mut self, timeout_ms: u64) -> ExitStatus!error.Error {
+        self.state.wait(timeout_ms)?
+        return ok(status(self.state.status()))
+    }
+    pub fn try_wait(&mut self) -> Option<ExitStatus>!error.Error {
+        match self.state.wait(0) {
+            ok() => {
+                return ok(some(status(self.state.status())))
+            }
+            err(reason) => {
+                if reason.kind == error.Kind.TimedOut {
+                    return ok(none)
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn terminate(&mut self) -> void!error.Error {
+        return self.state.terminate()
+    }
+    pub fn cancel(&mut self) -> void!error.Error {
+        return self.state.cancel()
+    }
+    pub fn take_stdin(&mut self) -> Option<Pipe> {
+        match self.state.take_stdin() {
+            some(handle) => {
+                return some(Pipe { handle: handle })
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    pub fn take_stdout(&mut self) -> Option<Pipe> {
+        match self.state.take_stdout() {
+            some(handle) => {
+                return some(Pipe { handle: handle })
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    pub fn take_stderr(&mut self) -> Option<Pipe> {
+        match self.state.take_stderr() {
+            some(handle) => {
+                return some(Pipe { handle: handle })
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    // Both streams are drained fairly, including outputs larger than pipe
+    // capacity. Buffers are explicit per-stream limits. Failure preserves each
+    // initialized prefix, closes pipes, kills and reaps the child. Stdin closes
+    // before collection, so interactive input must be written/taken beforehand.
+    pub fn collect(&mut self, stdout: &mut[u8], stderr: &mut[u8], timeout_ms: u64) -> Output!CollectError {
+        match self.state.collect(stdout, stderr, timeout_ms) {
+            ok(value) => {
+                return ok(Output { status: status(self.state.status()), stdout_len: value.output_len,
+                stderr_len: value.error_len })
+            }
+            err(reason) => {
+                return err(CollectError { cause: mem.replace(&mut reason.cause, error.failure(error.Kind.Other)), stdout_len: reason.output_len,
+                stderr_len: reason.error_len })
+            }
+        }
+    }
+}
+
+// Executable and all list entries use native code units. Arguments exclude
+// argv[0], which is the executable. Spawn copies/consumes OS arguments before
+// returning, so the child retains no caller borrows. Directory is optional.
+pub fn spawn(executable: &native.NativeString, arguments: &native.NativeList,
+environment: &native.NativeList, directory: Option<&native.NativeString>, options: &Options) -> Child!error.Error {
+    state := backend.spawn(executable, arguments, environment, options.inherit_environment,
+    directory, stream_mode(&options.stdin), stream_mode(&options.stdout),
+    stream_mode(&options.stderr), options.search_path)?
+    return ok(Child { state: state })
+}
+
+// Taken child pipes implement std/io; writes suppress only the writing
+// thread's generated SIGPIPE so a closed reader becomes a recoverable error.
+pub struct Pipe {
+    handle: native.Handle
+    pub fn read(&mut self, output: &mut[u8]) -> usize!io.Error {
+        return self.handle.read(output)
+    }
+    pub fn write(&mut self, input: &[u8]) -> usize!io.Error {
+        return unsafe {
+            backend.pipe_write(self.handle.raw(), input)
+        }
+    }
+    pub fn close(&mut self) -> void!error.Error {
+        return self.handle.close()
+    }
+}
+
+// Consume a collection report while transferring its non-Copy exit status.
+pub fn into_status(output: Output) -> ExitStatus {
+    return mem.replace(&mut output.status, ExitStatus { kind: ExitKind.Exited, code: 0 })
+}

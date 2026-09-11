@@ -1,0 +1,142 @@
+package path
+
+import "std/platform/error"
+
+// Conservative lexical normalization only: collapse separators and `.` while
+// preserving every `..` component. No filesystem/environment access and no
+// symlink resolution. Output is NUL-terminated; the result excludes that NUL.
+// Caller supplies input.len + 1 units. Invalid input/capacity leaves output
+// untouched. Unix's exactly-two-leading-slash prefix is retained. Windows
+// drive-relative and UNC roots are retained; verbatim/device paths are rejected
+// because their dot/separator rules differ. This package is freestanding.
+
+pub fn lexical_unix(input: &[u8], output: &mut[u8]) -> usize!error.Error {
+    if input.len == 0 {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    if output.len <= input.len {
+        return err(error.failure(error.Kind.BufferTooSmall))
+    }
+    for i in 0usize..input.len {
+        if input[i] == 0 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+    }
+
+    offset := 0usize
+    used := 0usize
+    if input[0] == 47 {
+        for offset < input.len && input[offset] == 47 {
+            offset += 1
+        }
+        used = 1
+        if offset == 2 {
+            used = 2
+        }
+        for i in 0usize..used {
+            output[i] = 47
+        }
+    }
+    for offset < input.len {
+        for offset < input.len && input[offset] == 47 {
+            offset += 1
+        }
+        start := offset
+        for offset < input.len && !(input[offset] == 47) {
+            offset += 1
+        }
+        length := offset - start
+        if length != 0 && !(length == 1 && input[start] == 46) {
+            if used != 0 && output[used - 1] != 47 {
+                output[used] = 47
+                used += 1
+            }
+            for i in 0usize..length {
+                output[used + i] = input[start + i]
+            }
+            used += length
+        }
+    }
+    if used == 0 {
+        output[0] = 46;
+        used = 1
+    }
+    if (input[input.len - 1] == 47) && output[used - 1] != 47 {
+        output[used] = 47
+        used += 1
+    }
+    output[used] = 0
+    return ok(used)
+}
+
+pub fn lexical_windows(input: &[u16], output: &mut[u16]) -> usize!error.Error {
+    if input.len == 0 {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    if output.len <= input.len {
+        return err(error.failure(error.Kind.BufferTooSmall))
+    }
+    for i in 0usize..input.len {
+        if input[i] == 0 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+    }
+    if input.len >= 4 && (input[0] == 47 || input[0] == 92) && (input[1] == 47 || input[1] == 92) && (input[2] == 63 || input[2] == 46) && (input[3] == 47 || input[3] == 92) {
+        return err(error.failure(error.Kind.Unsupported))
+    }
+    offset := 0usize
+    used := 0usize
+    drive_relative := false
+    if input.len >= 2 && input[1] == 58 {
+        output[0] = input[0]
+        output[1] = 58
+        used = 2
+        offset = 2
+        drive_relative = true
+    }
+    if offset < input.len && (input[offset] == 47 || input[offset] == 92) {
+        start := offset
+        for offset < input.len && (input[offset] == 47 || input[offset] == 92) {
+            offset += 1
+        }
+        separators := 1usize
+        if start == 0 && offset >= 2 {
+            separators = 2
+        }
+        for i in 0usize..separators {
+            output[used + i] = 92
+        }
+        used += separators
+        drive_relative = false
+    }
+    for offset < input.len {
+        for offset < input.len && (input[offset] == 47 || input[offset] == 92) {
+            offset += 1
+        }
+        start := offset
+        for offset < input.len && !((input[offset] == 47 || input[offset] == 92)) {
+            offset += 1
+        }
+        length := offset - start
+        if length != 0 && !(length == 1 && input[start] == 46) {
+            if used != 0 && output[used - 1] != 92 && !(drive_relative && used == 2) {
+                output[used] = 92
+                used += 1
+            }
+            for i in 0usize..length {
+                output[used + i] = input[start + i]
+            }
+            used += length
+        }
+    }
+    if used == 0 {
+        output[0] = 46;
+        used = 1
+    }
+    if ((input[input.len - 1] == 47 || input[input.len - 1] == 92)) && output[used - 1] != 92 {
+        output[used] = 92
+        used += 1
+    }
+    output[used] = 0
+    return ok(used)
+}

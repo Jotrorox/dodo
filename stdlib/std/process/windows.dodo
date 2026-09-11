@@ -1,0 +1,216 @@
+package windows
+
+import "core/ptr"
+import "std/io"
+import "std/platform/native"
+import "std/platform/error"
+
+// Exact pointer-sized C boundary layout. Ownership stays in State.
+@repr(C)
+struct RawChild {
+    process: usize
+    input: isize
+    output: isize
+    error_output: isize
+    done: i32
+    kind: i32
+    code: i32
+}
+unsafe extern "C" fn dodo_process_spawn(executable: *const u8, arguments: *const u8, argument_units: usize, environment: *const u8, environment_units: usize, inherit_environment: i32, directory: *const u8, input: i32, output: i32, error_output: i32, search_path: i32, child: *mut RawChild) -> i32
+unsafe extern "C" fn dodo_process_wait(child: *mut RawChild, timeout_ms: u64) -> i32
+unsafe extern "C" fn dodo_process_terminate(child: *mut RawChild) -> i32
+unsafe extern "C" fn dodo_process_cancel(child: *mut RawChild) -> i32
+unsafe extern "C" fn dodo_process_drop(child: *mut RawChild)
+unsafe extern "C" fn dodo_process_collect(child: *mut RawChild, output: *mut u8, output_capacity: usize, error_output: *mut u8, error_capacity: usize, timeout_ms: u64, output_len: *mut usize, error_len: *mut usize) -> i32
+
+pub fn from_code(code: i32) -> error.Error {
+    if code == -1 {
+        return error.failure(error.Kind.InvalidInput)
+    }
+    if code == -2 {
+        return error.failure(error.Kind.TimedOut)
+    }
+    if code == -3 {
+        return error.failure(error.Kind.BufferTooSmall)
+    }
+    if code == -4 {
+        return error.failure(error.Kind.Cancelled)
+    }
+    return native.from_code(code)
+}
+pub struct Status {
+    pub kind: i32
+    pub code: i32
+}
+pub struct Collected {
+    pub output_len: usize
+    pub error_len: usize
+}
+pub struct CollectFailure {
+    pub cause: error.Error
+    pub output_len: usize
+    pub error_len: usize
+}
+pub struct State {
+    raw: RawChild
+    pub fn status(&self) -> Status {
+        return Status { kind: self.raw.kind, code: self.raw.code }
+    }
+    pub fn is_done(&self) -> bool {
+        return self.raw.done != 0
+    }
+    pub fn wait(&mut self, timeout_ms: u64) -> void!error.Error {
+        code := unsafe {
+            dodo_process_wait(ptr.from_mut(&mut self.raw), timeout_ms)
+        }
+        if code != 0 {
+            return err(from_code(code))
+        }
+        return ok()
+    }
+    pub fn terminate(&mut self) -> void!error.Error {
+        code := unsafe {
+            dodo_process_terminate(ptr.from_mut(&mut self.raw))
+        }
+        if code != 0 {
+            return err(from_code(code))
+        }
+        return ok()
+    }
+    pub fn cancel(&mut self) -> void!error.Error {
+        code := unsafe {
+            dodo_process_cancel(ptr.from_mut(&mut self.raw))
+        }
+        if code != 0 {
+            return err(from_code(code))
+        }
+        return ok()
+    }
+    pub fn take_stdin(&mut self) -> Option<native.Handle> {
+        raw := self.raw.input
+        if raw == -1 {
+            return none
+        }
+        self.raw.input = -1
+        return some(unsafe {
+            native.Handle.from_raw(raw)
+        })
+    }
+    pub fn take_stdout(&mut self) -> Option<native.Handle> {
+        raw := self.raw.output
+        if raw == -1 {
+            return none
+        }
+        self.raw.output = -1
+        return some(unsafe {
+            native.Handle.from_raw(raw)
+        })
+    }
+    pub fn take_stderr(&mut self) -> Option<native.Handle> {
+        raw := self.raw.error_output
+        if raw == -1 {
+            return none
+        }
+        self.raw.error_output = -1
+        return some(unsafe {
+            native.Handle.from_raw(raw)
+        })
+    }
+    pub fn collect(&mut self, output: &mut[u8], error_output: &mut[u8], timeout_ms: u64) -> Collected!CollectFailure {
+        output_len := 0usize
+        error_len := 0usize
+        code := unsafe {
+            dodo_process_collect(ptr.from_mut(&mut self.raw), ptr.as_mut_ptr(output), output.len,
+            ptr.as_mut_ptr(error_output), error_output.len, timeout_ms,
+            ptr.from_mut(&mut output_len), ptr.from_mut(&mut error_len))
+        }
+        if code != 0 {
+            return err(CollectFailure { cause: from_code(code), output_len: output_len, error_len: error_len })
+        }
+        return ok(Collected { output_len: output_len, error_len: error_len })
+    }
+    fn drop(&mut self) {
+        unsafe {
+            dodo_process_drop(ptr.from_mut(&mut self.raw))
+        }
+    }
+}
+
+pub fn spawn(executable: &native.NativeString, arguments: &native.NativeList,
+environment: &native.NativeList, inherit_environment: bool,
+directory: Option<&native.NativeString>, input: i32, output: i32, error_output: i32,
+search_path: bool) -> State!error.Error {
+    if search_path {
+        return err(error.failure(error.Kind.Unsupported))
+    }
+    if executable.units().len == 0 || input < 0 || input > 2 || output < 0 || output > 2 || error_output < 0 || error_output > 2 {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    // Environment entries require a nonempty name and '='. Windows permits
+    // drive-current-directory entries such as '=C:=C:\directory'.
+    units := environment.units()
+    start := 0usize
+    for start < units.len {
+        end := start
+        equal := false
+        for units[end] != 0 {
+            if units[end] == 61 && end > start {
+                equal = true
+            }
+            end += 1
+        }
+        if!equal {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        start = end + 1
+    }
+    cwd := unsafe {
+        0usize as *const u8
+    }
+    match directory {
+        some(value) => {
+            cwd = unsafe {
+                value.as_ptr() as *const u8
+            }
+        }
+        none => {}
+    }
+    inherit_mode := 0i32
+    if inherit_environment {
+        inherit_mode = 1
+    }
+    search_mode := 0i32
+    if search_path {
+        search_mode = 1
+    }
+    raw := RawChild { process: 0, input: -1, output: -1, error_output: -1, done: 0, kind: 0, code: 0 }
+    code := unsafe {
+        dodo_process_spawn(executable.as_ptr() as *const u8, arguments.as_ptr() as *const u8, arguments.units().len,
+        environment.as_ptr() as *const u8, environment.units().len, inherit_mode,
+        cwd, input, output, error_output, search_mode, ptr.from_mut(&mut raw))
+    }
+    if code != 0 {
+        return err(from_code(code))
+    }
+    return ok(State { raw: raw })
+}
+
+unsafe extern "C" fn dodo_process_pipe_write(handle: isize, data: *const u8, count: usize, written: *mut usize) -> i32
+pub unsafe fn pipe_write(handle: isize, data: &[u8]) -> usize!io.Error {
+    if data.len == 0 {
+        return ok(0)
+    }
+    written := 0usize
+    code := unsafe {
+        dodo_process_pipe_write(handle, ptr.as_ptr(data), data.len, ptr.from_mut(&mut written))
+    }
+    if code != 0 {
+        kind := io.ErrorKind.Other
+        reason := from_code(code)
+        if reason.kind == error.Kind.Interrupted {
+            kind = io.ErrorKind.Interrupted
+        }
+        return err(io.Error { kind: kind, transferred: written, code: code })
+    }
+    return ok(written)
+}

@@ -1,0 +1,77 @@
+package env_native_checks
+import "std/env"
+import "std/platform/native"
+import "std/platform/error"
+
+fn run() -> i32 {
+    bytes := [0u8; 65536]
+    wide := [0u16; 0]
+    snapshot := match env.snapshot(&mut bytes, &mut wide) {
+        ok(value) => {
+            value
+        }, err(_) => {
+            return 1
+        }
+    }
+    key := match native.NativeString.new(b"DODO_NATIVE\0") {
+        ok(value) => {
+            value
+        }, err(_) => {
+            return 2
+        }
+    }
+    match snapshot.get(&key) {
+        some(value) => {
+            if value.units().len != 1 || value.units()[0] != 255 {
+                return 3
+            }
+            output := [0u8; 8]
+            match native.to_utf8(&value, &mut output, false) {
+                ok(_) => {
+                    return 4
+                }
+                err(reason) => {
+                    if reason.kind != error.Kind.InvalidInput {
+                        return 5
+                    }
+                }
+            }
+            match native.to_utf8(&value, &mut output, true) {
+                ok(count) => {
+                    if count != 3 || output[0] != 239 || output[1] != 191 || output[2] != 189 {
+                        return 6
+                    }
+                }
+                err(_) => {
+                    return 7
+                }
+            }
+        }
+        none => {
+            return 8
+        }
+    }
+    args_bytes := [0u8; 4096]
+    args_wide := [0u16; 0]
+    arguments := match env.arguments(&mut args_bytes, &mut args_wide) {
+        ok(value) => {
+            value
+        }, err(_) => {
+            return 9
+        }
+    }
+    match arguments.at(1) {
+        some(value) => {
+            if value.units().len != 1 || value.units()[0] != 255 {
+                return 10
+            }
+        }
+        none => {
+            return 11
+        }
+    }
+    return 0
+}
+fn main() -> i32 {
+    return run()
+}

@@ -237,6 +237,10 @@ pub struct Struct {
     pub fields: Vec<Field>,
     pub span: Span,
     pub repr_c: bool,
+    /// Explicit unsafe contracts for moving ownership / sharing access across
+    /// native threads. Checked borrows are never erased by these contracts.
+    pub unsafe_send: bool,
+    pub unsafe_sync: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Field {

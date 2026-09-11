@@ -73,8 +73,13 @@ Checked views into allocated storage retain their owner's borrow. Import aliases
 separate packages with the same final path component, and generic formatting
 methods are statically dispatched.
 
+Hosted [platform packages](platform.md) add filesystem/process/environment APIs,
+native threads with checked move tasks, explicit unsafe transfer/sharing
+contracts, integer atomics, and guarded synchronization. Native callbacks use
+statically checked function specialization; closures remain unavailable.
+
 The broad design's disjoint mutable slice splitting, trait-based checked allocator
-interfaces, atomics, DMA/interrupt-safe abstractions, target barriers, inline
+interfaces, DMA/interrupt-safe abstractions, general target barriers, inline
 assembly, section/alignment/export/interrupt attributes, and custom panic-handler
 integration are not implemented. Unsupported syntax and unknown intrinsics
 produce diagnostics. The trap implementation is `llvm.trap`; it is not a

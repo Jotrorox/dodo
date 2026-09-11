@@ -1,0 +1,137 @@
+package atomic
+
+import "core/mem"
+import "core/ptr"
+import "std/sync/error"
+
+// Independent of every OS blocking adapter. The compiler emits LLVM atomics
+// and rejects widths/targets without the documented native primitive support.
+pub enum Ordering {
+    Relaxed, Acquire, Release, AcqRel, SeqCst
+}
+pub struct CompareExchange<T> {
+    pub previous: T, pub exchanged: bool
+}
+pub struct Atomic<T> {
+    value: T
+    pub fn new(value: T) -> Atomic<T> {
+        return Atomic<T> { value: value }
+    }
+    pub fn load(&self, order: Ordering) -> T!error.Error {
+        unsafe {
+            address := ptr.from_ref(&self.value)
+            if order == Ordering.Relaxed {
+                return ok(mem.atomic_load(address, 0))
+            }
+            if order == Ordering.Acquire {
+                return ok(mem.atomic_load(address, 1))
+            }
+            if order == Ordering.SeqCst {
+                return ok(mem.atomic_load(address, 4))
+            }
+        }
+        return err(error.Error.InvalidOrdering)
+    }
+    pub fn store(&self, value: T, order: Ordering) -> void!error.Error {
+        unsafe {
+            address := ptr.from_ref(&self.value) as *mut T
+            if order == Ordering.Relaxed {
+                mem.atomic_store(address, value, 0);
+                return ok()
+            }
+            if order == Ordering.Release {
+                mem.atomic_store(address, value, 2);
+                return ok()
+            }
+            if order == Ordering.SeqCst {
+                mem.atomic_store(address, value, 4);
+                return ok()
+            }
+        }
+        return err(error.Error.InvalidOrdering)
+    }
+    pub fn exchange(&self, value: T, order: Ordering) -> T!error.Error {
+        unsafe {
+            address := ptr.from_ref(&self.value) as *mut T
+            if order == Ordering.Relaxed {
+                return ok(mem.atomic_exchange(address, value, 0))
+            }
+            if order == Ordering.Acquire {
+                return ok(mem.atomic_exchange(address, value, 1))
+            }
+            if order == Ordering.Release {
+                return ok(mem.atomic_exchange(address, value, 2))
+            }
+            if order == Ordering.AcqRel {
+                return ok(mem.atomic_exchange(address, value, 3))
+            }
+            if order == Ordering.SeqCst {
+                return ok(mem.atomic_exchange(address, value, 4))
+            }
+        }
+        return err(error.Error.InvalidOrdering)
+    }
+    pub fn fetch_add(&self, value: T, order: Ordering) -> T!error.Error {
+        unsafe {
+            address := ptr.from_ref(&self.value) as *mut T
+            if order == Ordering.Relaxed {
+                return ok(mem.atomic_fetch_add(address, value, 0))
+            }
+            if order == Ordering.Acquire {
+                return ok(mem.atomic_fetch_add(address, value, 1))
+            }
+            if order == Ordering.Release {
+                return ok(mem.atomic_fetch_add(address, value, 2))
+            }
+            if order == Ordering.AcqRel {
+                return ok(mem.atomic_fetch_add(address, value, 3))
+            }
+            if order == Ordering.SeqCst {
+                return ok(mem.atomic_fetch_add(address, value, 4))
+            }
+        }
+        return err(error.Error.InvalidOrdering)
+    }
+    pub fn compare_exchange(&self, expected: T, replacement: T, success: Ordering, failure: Ordering) -> CompareExchange<T>!error.Error {
+        unsafe {
+            address := ptr.from_ref(&self.value) as *mut T
+            if success == Ordering.Relaxed && failure == Ordering.Relaxed {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 0, 0)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+            if success == Ordering.Acquire && failure == Ordering.Relaxed {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 1, 0)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+            if success == Ordering.Acquire && failure == Ordering.Acquire {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 1, 1)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+            if success == Ordering.Release && failure == Ordering.Relaxed {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 2, 0)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+            if success == Ordering.AcqRel && failure == Ordering.Relaxed {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 3, 0)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+            if success == Ordering.AcqRel && failure == Ordering.Acquire {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 3, 1)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+            if success == Ordering.SeqCst && failure == Ordering.Relaxed {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 4, 0)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+            if success == Ordering.SeqCst && failure == Ordering.Acquire {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 4, 1)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+            if success == Ordering.SeqCst && failure == Ordering.SeqCst {
+                previous := mem.atomic_compare_exchange(address, expected, replacement, 4, 4)
+                return ok(CompareExchange<T> { previous: previous, exchanged: previous == expected })
+            }
+        }
+        return err(error.Error.InvalidOrdering)
+    }
+}
