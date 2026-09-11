@@ -1,7 +1,8 @@
 ---
 title: "Edit these docs"
 description: "Write documentation in Markdown, preview the Astro site locally, and publish through GitHub Pages."
-order: 50
+section: "Project"
+order: 300
 ---
 
 The entire `docs/` directory is an Astro website. Documentation lives in
@@ -18,20 +19,45 @@ this frontmatter:
 ---
 title: "Your page title"
 description: "A short description of what readers will learn."
-order: 60
+section: "Using Dodo"
+order: 140
 ---
 ```
 
-Write the page content below the frontmatter. The layout supplies the page title,
-so start body sections with `##`. Use ordinary Markdown paragraphs, lists,
-tables, links, and fenced code blocks. Label Dodo code fences with `dodo`.
+Give each page one purpose: a task readers can complete or a topic they can look
+up. Split longer guides into separate pages when readers can use those pages
+independently. Choose a short, descriptive filename such as `compiler-options.md`.
 
-Pages appear automatically in navigation, ordered by their numeric `order`.
-`index.md` is the homepage; other filenames become page URLs. Links between
-pages can use their Markdown filenames, such as `[Language spec](language-spec-0.1.md)`.
-Section links also work: append `#appendix-c-open-specification-items` to that
-filename to link to the open questions. Use full GitHub URLs for compiler source
-and examples outside the website.
+The layout supplies the page title, so start body sections with `##` and use
+`###` for subsections. Use ordinary Markdown paragraphs, lists, tables, links,
+and fenced code blocks. Label Dodo code fences with `dodo`. Keep introductory
+examples short and include the command to run them and the expected result.
+
+## Place a page in navigation
+
+The sidebar groups pages by their `section` field in this fixed order:
+
+| Section | Purpose | Suggested `order` values |
+| --- | --- | --- |
+| `Start here` | Overview, installation, and a first program. | 0–99 |
+| `Using Dodo` | Practical guides for everyday compiler use. | 100–199 |
+| `Language reference` | Language topics and the full specification. | 200–299 |
+| `Project` | Implementation, requirements, and contributing. | 300 and above |
+
+Within a section, the numeric `order` controls the page position. Leave gaps
+between values so a new page can fit between existing ones. Pages with the same
+order sort by title. Previous and next links follow the same sequence.
+
+Use one of the section names exactly as written above. Pages without a `section`
+fall back to `Project` for compatibility; set it explicitly on new pages.
+
+## Link pages and downloads
+
+`index.md` is the homepage; other filenames become page URLs. Use Markdown
+filenames for links between pages, such as
+`[Language specification](language-spec-0.1.md)`. To link to a heading, append its
+anchor: `language-spec-0.1.md#appendix-c-open-specification-items`.
+Use full GitHub URLs for compiler source and examples outside the website.
 
 Put downloadable files in `docs/public/downloads/` and link to them as
 `/downloads/filename.ext`. The site handles the GitHub Pages path prefix.
@@ -46,17 +72,29 @@ npm ci
 npm run dev
 ```
 
-Open the local URL printed by Astro. Markdown edits update the preview. To
-check the production website:
+Open the local URL printed by Astro. Markdown edits update the preview.
+
+## Check the production website
+
+From `docs/`, build the site and check its generated links:
 
 ```sh
 npm run build
+python3 ../scripts/check_docs.py
 npm run preview
 ```
 
 The build generates static pages, specification downloads, and a search index
-in `docs/dist/`. Search updates automatically when content changes; it runs in
-the browser without an external service.
+in `docs/dist/`. The link checker validates internal pages, heading anchors,
+assets, and search targets using the production `/dodo/` path prefix. Run it
+after a fresh build so it checks your latest changes. It also checks that each
+page has one main heading and appears in search; it does not check external
+websites.
+
+Open the preview URL to check the page layout, grouped navigation, search, and
+light and dark themes. Check the mobile menu at a narrow window width when
+changing the layout. Search updates automatically when content changes and runs
+in the browser without an external service.
 
 ## Keyboard shortcuts
 

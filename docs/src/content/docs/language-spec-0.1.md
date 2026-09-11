@@ -1,7 +1,8 @@
 ---
-title: "The Dodo Programming Language"
-description: "The normative Dodo 0.1 language design, worked examples, and open specification items."
-order: 10
+title: "Dodo language specification 0.1"
+description: "The complete Dodo 0.1 design: language rules, worked examples, and open specification items."
+section: "Language reference"
+order: 240
 ---
 
 **Language specification 0.1**

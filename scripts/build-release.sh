@@ -22,6 +22,7 @@ fi
 # LLVM itself is static through Cargo.toml; bundle its support libraries too.
 flags=()
 libraries=(z zstd stdc++ ffi)
+declare -A library_archives=()
 linkage_mode=--release
 if [[ "$profile" == release-small-static ]]; then
     linkage_mode=--static
@@ -46,6 +47,15 @@ if [[ "$profile" == release-small-static ]]; then
     for flag in "${system_libraries[@]}"; do
         if [[ "$flag" == -l* && "$flag" != -l:* ]]; then
             libraries+=("${flag#-l}")
+        elif [[ "$flag" == /* && "${flag##*/}" =~ ^lib(.+)\.(a|so(\.[0-9.]+)?)$ ]]; then
+            # Distribution LLVM packages can report absolute shared-library
+            # paths even with --link-static. Resolve their static counterpart.
+            library=${BASH_REMATCH[1]}
+            libraries+=("$library")
+            sibling="$(dirname "$flag")/lib${library}.a"
+            if [[ -f "$sibling" ]]; then
+                library_archives[$library]=$sibling
+            fi
         else
             echo "Unsupported LLVM system-library flag for static linking: $flag" >&2
             exit 1
@@ -58,9 +68,12 @@ for library in "${libraries[@]}"; do
         continue
     fi
     seen_libraries[$library]=1
-    archive=$("${CC:-cc}" "-print-file-name=lib${library}.a")
+    archive=${library_archives[$library]:-}
+    if [[ -z "$archive" ]]; then
+        archive=$("${CC:-cc}" "-print-file-name=lib${library}.a")
+    fi
     if [[ ! -f "$archive" ]]; then
-        echo "Missing static archive lib${library}.a; install the build prerequisites in README.md." >&2
+        echo "Missing static archive lib${library}.a; install the build prerequisites in docs/src/content/docs/building-from-source.md." >&2
         exit 1
     fi
     flags+=(-L "native=$(dirname "$archive")")

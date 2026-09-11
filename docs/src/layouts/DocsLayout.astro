@@ -1,7 +1,7 @@
 ---
 import type { MarkdownHeading } from 'astro';
 import type { CollectionEntry } from 'astro:content';
-import { getDocs, pageUrl } from '../lib/docs';
+import { docSections, getDocs, pageUrl } from '../lib/docs';
 import '../styles/global.css';
 
 interface Props {
@@ -11,6 +11,10 @@ interface Props {
 
 const { entry, headings } = Astro.props;
 const pages = await getDocs();
+const sections = docSections.map((title) => ({
+  title,
+  pages: pages.filter((page) => page.data.section === title),
+})).filter((section) => section.pages.length > 0);
 const current = pages.findIndex((page) => page.id === entry.id);
 const previous = pages[current - 1];
 const next = pages[current + 1];
@@ -48,7 +52,7 @@ const canonical = new URL(pageUrl(entry.id), Astro.site);
       <a class="brand" href={base} aria-label="Dodo documentation home">
         <span class="brand-mark" aria-hidden="true">d</span>
         <span>Dodo <span class="brand-docs">/ docs</span></span>
-        <span class="version">0.1</span>
+        <span class="version">0.1.1</span>
       </a>
       <div class="header-actions">
         <button class="search-trigger" type="button" data-search-open aria-label="Search documentation" aria-haspopup="dialog" aria-controls="search-dialog">
@@ -68,12 +72,16 @@ const canonical = new URL(pageUrl(entry.id), Astro.site);
         <details class="navigation" open>
           <summary>Documentation <span aria-hidden="true">⌄</span></summary>
           <nav aria-label="Documentation">
-            <p class="nav-label">Documentation</p>
-            <ul>
-              {pages.map((page) => (
-                <li><a href={pageUrl(page.id)} aria-current={entry.id === page.id ? 'page' : undefined}>{page.data.title}</a></li>
-              ))}
-            </ul>
+            {sections.map((section, index) => (
+              <section class="nav-section" aria-labelledby={`nav-section-${index}`}>
+                <h2 class="nav-label" id={`nav-section-${index}`}>{section.title}</h2>
+                <ul>
+                  {section.pages.map((page) => (
+                    <li><a href={pageUrl(page.id)} aria-current={entry.id === page.id ? 'page' : undefined}>{page.data.title}</a></li>
+                  ))}
+                </ul>
+              </section>
+            ))}
           </nav>
         </details>
         <div class="sidebar-bottom">
@@ -84,7 +92,7 @@ const canonical = new URL(pageUrl(entry.id), Astro.site);
 
       <main id="main-content" tabindex="-1">
         <div class="page-heading">
-          <p class="eyebrow">Dodo documentation <span aria-hidden="true">/</span> v0.1</p>
+          <p class="eyebrow">{entry.data.section} <span aria-hidden="true">/</span> Dodo 0.1.1</p>
           <h1>{entry.data.title}</h1>
           <p class="page-description">{entry.data.description}</p>
         </div>
@@ -101,7 +109,7 @@ const canonical = new URL(pageUrl(entry.id), Astro.site);
             {previous ? <a href={pageUrl(previous.id)} rel="prev"><span>← Previous</span><strong>{previous.data.title}</strong></a> : <span />}
             {next ? <a href={pageUrl(next.id)} rel="next"><span>Next →</span><strong>{next.data.title}</strong></a> : <span />}
           </nav>
-          <p class="footer-caption">Dodo 0.1 · Open source under BSD-2-Clause</p>
+          <p class="footer-caption">© 2026 Johannes Müller and Dodo contributors.<br />Dodo 0.1.1 · <a href={`${repository}/blob/main/LICENSE`}>BSD-2-Clause license</a></p>
         </footer>
       </main>
 

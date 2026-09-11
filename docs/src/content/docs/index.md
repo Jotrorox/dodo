@@ -1,67 +1,48 @@
 ---
 title: "Dodo documentation"
-description: "An introduction to Dodo, a small systems language with explicit control and checked borrowing."
+description: "Install Dodo, write your first program, and find guides to the language and compiler."
+section: "Start here"
 order: 0
 ---
 
 Dodo is a small, ahead-of-time compiled systems language with checked borrowing
-and explicit hardware access. Its Rust and LLVM compiler produces native
-executables, object files, assembly, LLVM IR, and bitcode. Ordinary generated
-code needs no garbage collector, heap allocator, scheduler, or Dodo runtime.
+and explicit hardware access. Its compiler produces native executables, object
+files, assembly, LLVM IR, and bitcode. Ordinary generated code needs no garbage
+collector, heap allocator, scheduler, or Dodo runtime.
 
-The current compiler release is **0.1.0**. The language specification describes a
-broader design; this first release does not claim complete specification
-conformance or a proof of memory safety. Read the
-[implementation decisions and limits](implementation.md) for current support.
+The current compiler release is **0.1.1**, implementing part of the **Dodo 0.1**
+language design. See [implementation decisions and limits](implementation.md)
+for supported features and remaining work.
 
-## Start with a small program
+## Start here
 
-Install a built `dodo` binary on your `PATH`, or follow the
-[source build instructions](https://github.com/Jotrorox/dodo#build-and-install).
-Using a built compiler does not require an LLVM installation. Building and
-running a hosted executable requires a C toolchain such as `cc`.
+1. [Install Dodo](installation.md): get the compiler and check your setup.
+2. [Write your first program](first-program.md): create a small file and run it.
+3. [Use the command line](command-line.md): format, check, build, and choose output formats.
 
-Save this as `hello.dodo`:
+## Use Dodo in a project
 
-```dodo
-package hello
+Set up [editor diagnostics and hovers](editors.md), then explore
+the [example programs](https://github.com/Jotrorox/dodo/tree/main/examples).
+The command-line guide also covers [package directories](command-line.md#files-and-packages)
+and [target selection](command-line.md#targets-and-linking).
 
-unsafe extern "C" fn putchar(character: i32) -> i32
+## Look up language behavior
 
-fn main() {
-    for &character in b"Dodo 0.1\n" {
-        // SAFETY: putchar accepts each promoted unsigned byte.
-        unsafe {
-            putchar(character as i32)
-        }
-    }
-}
-```
-
-Then format, check, and run it:
-
-```sh
-dodo fmt hello.dodo
-dodo check hello.dodo
-dodo run hello.dodo
-```
-
-The program prints `Dodo 0.1`. Explore more
-[examples in the repository](https://github.com/Jotrorox/dodo/tree/main/examples),
-or use `dodo --help` to see compiler commands and output formats.
-
-## Find your way around
-
-- [Language specification](language-spec-0.1.md): syntax, types, ownership,
-  hardware boundaries, worked examples, and open design questions.
-- [Implementation decisions and limits](implementation.md): what the compiler
-  supports today and where the design remains unimplemented.
+- [Language specification](language-spec-0.1.md): the full design, syntax, types,
+  ownership rules, worked examples, and open design questions.
+- [Implementation decisions and limits](implementation.md): the behavior of the
+  current compiler, including differences from the broader design.
+- [Syntax and expressions](implementation-syntax.md), [ownership and borrowing](ownership.md),
+  and [patterns and Results](patterns-and-results.md): focused language references.
 - [Implementation requirements](spec-requirements.md): a checklist for reviewing
-  language behavior and planning conformance tests.
-- [Diagnostics and editors](diagnostics-and-editors.md): ownership error examples
-  and setup for diagnostics and hovers with `dodo lsp`.
-- [Edit these docs](contributing.md): write Markdown, preview locally, and publish
-  through GitHub Pages.
+  behavior and planning conformance tests.
+
+## Work on Dodo
+
+Follow [Build Dodo from source](building-from-source.md) for compiler prerequisites,
+build profiles, and development checks. Follow [Edit these docs](contributing.md)
+to add or improve a documentation page and preview the website locally.
 
 ## Read offline
 

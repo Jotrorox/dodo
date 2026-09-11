@@ -131,9 +131,7 @@ fn cli_help_version_and_bad_arguments() {
         let output = workspace.compiler().arg(flag).output().unwrap();
         assert_success(&output, flag);
         assert!(String::from_utf8_lossy(&output.stdout).contains("dodo"));
-        if flag == "--version" {
-            assert!(String::from_utf8_lossy(&output.stdout).contains("0.1.0"));
-        }
+        assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
     }
     for arguments in [vec!["unknown-command"], vec!["build"], vec!["--unknown"]] {
         let output = workspace.compiler().args(arguments).output().unwrap();
