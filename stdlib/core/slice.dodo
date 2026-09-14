@@ -1,5 +1,25 @@
 package slice
 
+import "core/mem"
+
+// Compiler-recognized pair: only split_at_mut constructs it, and individual
+// slice descriptors cannot be replaced. Consume it with
+// `let slice.SplitMut{left, right} = parts` for independent exclusive views.
+// The fields do not own T.
+pub struct SplitMut<T> {
+    pub &mut[T] left
+    pub &mut[T] right
+}
+
+// Checked like subslice_mut: both boundary splits succeed; an invalid
+// midpoint returns none. The source stays borrowed until both views expire.
+pub fn split_at_mut<T>(data: &mut[T], mid: usize) -> Option<SplitMut<T>> from(data) {
+    if mid > data.len {
+        return none
+    }
+    return some(mem.split_at_mut::<SplitMut<T>>(data, mid))
+}
+
 // Optional checked access. Returned views retain the source borrow.
 pub fn is_empty<T>(data: &[T]) -> bool {
     return data.len == 0

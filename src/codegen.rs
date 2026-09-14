@@ -2455,6 +2455,54 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.builder.position_at_end(ok);
             return Ok(unit);
         }
+        if matches!(name, "mem.split_at_mut" | "core.mem.split_at_mut") {
+            let input = self.expr(&args[0])?.into_struct_value();
+            let mid = self.expr(&args[1])?.into_int_value();
+            let pointer = self
+                .builder
+                .build_extract_value(input, 0, "split.ptr")?
+                .into_pointer_value();
+            let length = self
+                .builder
+                .build_extract_value(input, 1, "split.len")?
+                .into_int_value();
+            let inside =
+                self.builder
+                    .build_int_compare(IntPredicate::ULE, mid, length, "split.inside")?;
+            self.guard(inside, "slice bounds", "slice bounds out of range")?;
+            let Type::Slice(true, element) = &args[0].ty else {
+                return Err(error("split requires a mutable slice"));
+            };
+            // Non-inbounds GEP, just as for ordinary slicing: empty and ZST
+            // slices need no dereference and may have equal data addresses.
+            let right_pointer = unsafe {
+                self.builder
+                    .build_gep(self.ty(element)?, pointer, &[mid], "split.right.ptr")?
+            };
+            let right_length = self.builder.build_int_sub(length, mid, "split.right.len")?;
+            let left = self
+                .builder
+                .build_insert_value(input, mid, 1, "split.left")?
+                .into_struct_value();
+            let right = self
+                .builder
+                .build_insert_value(input, right_pointer, 0, "split.right")?
+                .into_struct_value();
+            let right = self
+                .builder
+                .build_insert_value(right, right_length, 1, "split.right")?
+                .into_struct_value();
+            let pair = self.ty(ret)?.into_struct_type().const_zero();
+            let pair = self
+                .builder
+                .build_insert_value(pair, left, 0, "split.pair")?
+                .into_struct_value();
+            return Ok(self
+                .builder
+                .build_insert_value(pair, right, 1, "split.pair")?
+                .into_struct_value()
+                .into());
+        }
         if name == "ok" || name == "err" || name == "some" || name == "none" {
             if matches!(ret, Type::Result(..)) {
                 let payload = args.first().map(|e| self.expr(e)).transpose()?;

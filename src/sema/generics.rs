@@ -1376,6 +1376,7 @@ pub(super) fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -
     let first = args.first().cloned().unwrap_or(Type::Unknown);
     let explicit = types.first().cloned().unwrap_or(Type::Unknown);
     Some(match name {
+        "mem.split_at_mut" => explicit,
         "assert" | "assert_eq" | "assert_ne" => Type::Void,
         "mem.assert_send" | "mem.assert_sync" | "mem.atomic_store" => Type::Void,
         "mem.callback" => Type::Raw(false, Box::new(Type::u8())),

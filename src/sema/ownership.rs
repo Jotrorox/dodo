@@ -10,6 +10,9 @@ pub(super) struct Loan {
     pub(super) dependency: bool,
     pub(super) root: usize,
     pub(super) fields: Vec<String>,
+    // Only consuming a SplitMut creates these witnesses. Different sides of
+    // the same split are disjoint; an ancestor without that witness overlaps.
+    pub(super) partitions: Vec<(usize, bool)>,
     pub(super) mutable: bool,
     pub(super) origin: Span,
     pub(super) via: Vec<usize>,
@@ -53,6 +56,7 @@ pub(super) fn static_loan(span: Span) -> Loan {
         dependency: false,
         root: 0,
         fields: vec![],
+        partitions: vec![],
         mutable: false,
         origin: span,
         via: vec![],
@@ -65,6 +69,11 @@ pub(super) fn overlaps(a: &Loan, b: &Loan) -> bool {
             .iter()
             .zip(&b.fields)
             .all(|(a, b)| a == b || a == "[]" || b == "[]")
+        && !a.partitions.iter().any(|(id, side)| {
+            b.partitions
+                .iter()
+                .any(|(other, opposite)| id == other && side != opposite)
+        })
 }
 pub(super) fn incompatible(access: Access, mutable: bool) -> bool {
     match access {
@@ -79,12 +88,19 @@ pub(super) fn merge_states(mut a: Vec<Vec<Variable>>, b: Vec<Vec<Variable>>) -> 
             variable.moved_at = variable.moved_at.or(other.moved_at);
             variable.pending_result |= other.pending_result;
             variable.deps.extend(other.deps.clone());
-            variable
-                .deps
-                .sort_by_key(|d| (d.root, d.fields.clone(), d.mutable, d.dependency));
+            variable.deps.sort_by_key(|d| {
+                (
+                    d.root,
+                    d.fields.clone(),
+                    d.partitions.clone(),
+                    d.mutable,
+                    d.dependency,
+                )
+            });
             variable.deps.dedup_by(|a, b| {
                 a.root == b.root
                     && a.fields == b.fields
+                    && a.partitions == b.partitions
                     && a.mutable == b.mutable
                     && a.dependency == b.dependency
                     && a.external == b.external

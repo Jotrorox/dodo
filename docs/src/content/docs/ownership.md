@@ -29,6 +29,11 @@ Destructuring a borrowed aggregate that contains references conservatively keeps
 all of its source dependencies; purely owned nested struct fields retain separate
 field loans.
 
+[`slice.split_at_mut`](slice-splitting.md) is the narrow exception for collections:
+consuming its `SplitMut` result gives two disjoint mutable slices while retaining
+the original storage's lifetime and dependencies. Ordinary indexing and slicing
+remain conservative; other aggregates do not gain independent field lifetimes.
+
 The checker distinguishes the storage a view accesses from dependencies its
 owner keeps alive. Borrowing a container exclusively retains shared allocator or
 policy dependencies as shared; it never upgrades them into exclusive access.
