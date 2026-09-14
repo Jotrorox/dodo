@@ -7,20 +7,45 @@ use std::collections::HashSet;
 type ParseResult<T> = Result<T, Diagnostic>;
 
 pub fn parse(source: &str) -> ParseResult<Program> {
-    Parser {
-        tokens: lex(source)?,
-        cursor: 0,
-        soft_newlines: 0,
-        self_type: None,
-        angle_splits: Vec::new(),
-        depth: 0,
-        slice_first: false,
-        discarded_tails: HashSet::new(),
+    Parser::new(lex(source)?, false).program()
+}
+
+/// Editor parser: retain sound declarations and statements after syntax errors.
+/// Compilation and formatting continue to use the strict `parse` entry point.
+pub fn parse_recovering(source: &str) -> (Program, Vec<Diagnostic>) {
+    let (tokens, errors) = crate::lexer::lex_recovering(source);
+    let mut parser = Parser::new(tokens, true);
+    parser.diagnostics = errors;
+    let program = match parser.program() {
+        Ok(program) => program,
+        Err(error) => {
+            parser.diagnostics.push(error);
+            Program::default()
+        }
+    };
+    (program, parser.diagnostics)
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>, recover: bool) -> Self {
+        Self {
+            tokens,
+            recover,
+            diagnostics: vec![],
+            cursor: 0,
+            soft_newlines: 0,
+            self_type: None,
+            angle_splits: Vec::new(),
+            depth: 0,
+            slice_first: false,
+            discarded_tails: HashSet::new(),
+        }
     }
-    .program()
 }
 
 struct Parser {
+    recover: bool,
+    diagnostics: Vec<Diagnostic>,
     tokens: Vec<Token>,
     cursor: usize,
     soft_newlines: usize,
@@ -159,7 +184,7 @@ impl Parser {
         }
         Ok(name)
     }
-    fn program(mut self) -> ParseResult<Program> {
+    fn program(&mut self) -> ParseResult<Program> {
         self.separators();
         self.expect("package")?;
         let mut program = Program {
@@ -172,73 +197,127 @@ impl Parser {
             if self.eof() {
                 break;
             }
-            if self.eat("import") {
-                match self.bump() {
-                    Token {
-                        kind: TokenKind::String(bytes, false),
-                        span,
-                    } => {
-                        let path = String::from_utf8(bytes)
-                            .map_err(|_| Diagnostic::new(span, "import path must be UTF-8"))?;
-                        if path.is_empty() {
-                            return Err(Diagnostic::new(span, "import path cannot be empty"));
-                        }
-                        if self.eat("as") {
-                            program
-                                .import_aliases
-                                .push((path.clone(), self.identifier()?));
-                        }
-                        program.imports.push(path);
-                    }
-                    token => {
-                        return Err(Diagnostic::new(token.span, "expected a string import path"));
-                    }
+            let cursor = self.cursor;
+            let soft = self.soft_newlines;
+            let self_type = self.self_type.clone();
+            let lengths = (
+                program.functions.len(),
+                program.structs.len(),
+                program.enums.len(),
+                program.constants.len(),
+                program.imports.len(),
+                program.import_aliases.len(),
+            );
+            if let Err(error) = self.declaration(&mut program) {
+                if !self.recover {
+                    return Err(error);
                 }
-                self.end_statement()?;
-                continue;
-            }
-            let start = self.span().start;
-            let mods = self.modifiers()?;
-            if (mods.test || mods.ignore.is_some()) && !self.at("fn") {
-                return Err(self.error("@test and @ignore apply only to functions"));
-            }
-            if self.at("struct") {
-                if mods.unsafe_ || mods.extern_ {
-                    return Err(self.error("structs cannot be unsafe or extern"));
-                }
-                self.struct_decl(&mut program, mods, start)?;
-            } else if self.at("enum") {
-                if mods.unsafe_
-                    || mods.extern_
-                    || mods.repr_c
-                    || mods.unsafe_send
-                    || mods.unsafe_sync
-                {
-                    return Err(self.error("enum declarations only support the `pub` modifier"));
-                }
-                program.enums.push(self.enum_decl(mods.public, start)?);
-            } else if self.at("fn") {
-                if mods.repr_c || mods.unsafe_send || mods.unsafe_sync {
-                    return Err(self.error("representation and thread contracts apply to structs"));
-                }
-                program.functions.push(self.function(mods, start)?);
-            } else if self.at("const") || self.at("static") {
-                if mods.unsafe_
-                    || mods.extern_
-                    || mods.repr_c
-                    || mods.unsafe_send
-                    || mods.unsafe_sync
-                {
-                    return Err(self.error("constant and static declarations only support `pub`"));
-                }
-                program.constants.push(self.constant(mods.public, start)?);
-            } else {
-                return Err(
-                    self.error("expected `fn`, `struct`, `enum`, `const`, or `static` declaration")
-                );
+                self.diagnostics.push(error);
+                // Struct parsing can append methods before reaching a bad field.
+                // Discard that incomplete declaration as one recovery unit.
+                program.functions.truncate(lengths.0);
+                program.structs.truncate(lengths.1);
+                program.enums.truncate(lengths.2);
+                program.constants.truncate(lengths.3);
+                program.imports.truncate(lengths.4);
+                program.import_aliases.truncate(lengths.5);
+                self.soft_newlines = soft;
+                self.self_type = self_type;
+                self.synchronize(cursor, true);
             }
         }
         Ok(program)
+    }
+    fn declaration(&mut self, program: &mut Program) -> ParseResult<()> {
+        if self.eat("import") {
+            match self.bump() {
+                Token {
+                    kind: TokenKind::String(bytes, false),
+                    span,
+                } => {
+                    let path = String::from_utf8(bytes)
+                        .map_err(|_| Diagnostic::new(span, "import path must be UTF-8"))?;
+                    if path.is_empty() {
+                        return Err(Diagnostic::new(span, "import path cannot be empty"));
+                    }
+                    if self.eat("as") {
+                        program
+                            .import_aliases
+                            .push((path.clone(), self.identifier()?));
+                    }
+                    program.imports.push(path);
+                }
+                token => {
+                    return Err(Diagnostic::new(token.span, "expected a string import path"));
+                }
+            }
+            self.end_statement()?;
+            return Ok(());
+        }
+        let start = self.span().start;
+        let mods = self.modifiers()?;
+        if (mods.test || mods.ignore.is_some()) && !self.at("fn") {
+            return Err(self.error("@test and @ignore apply only to functions"));
+        }
+        if self.at("struct") {
+            if mods.unsafe_ || mods.extern_ {
+                return Err(self.error("structs cannot be unsafe or extern"));
+            }
+            self.struct_decl(program, mods, start)?;
+        } else if self.at("enum") {
+            if mods.unsafe_ || mods.extern_ || mods.repr_c || mods.unsafe_send || mods.unsafe_sync {
+                return Err(self.error("enum declarations only support the `pub` modifier"));
+            }
+            program.enums.push(self.enum_decl(mods.public, start)?);
+        } else if self.at("fn") {
+            if mods.repr_c || mods.unsafe_send || mods.unsafe_sync {
+                return Err(self.error("representation and thread contracts apply to structs"));
+            }
+            program.functions.push(self.function(mods, start)?);
+        } else if self.at("const") || self.at("static") {
+            if mods.unsafe_ || mods.extern_ || mods.repr_c || mods.unsafe_send || mods.unsafe_sync {
+                return Err(self.error("constant and static declarations only support `pub`"));
+            }
+            program.constants.push(self.constant(mods.public, start)?);
+        } else {
+            return Err(
+                self.error("expected `fn`, `struct`, `enum`, `const`, or `static` declaration")
+            );
+        }
+        Ok(())
+    }
+
+    // Resume at a statement separator or the next declaration. Always advance
+    // after an error, while retaining a closing brace for the enclosing block.
+    fn synchronize(&mut self, cursor: usize, declaration: bool) {
+        if self.cursor == cursor && !self.eof() && (declaration || !self.at("}")) {
+            self.bump();
+        }
+        let mut braces = 0usize;
+        while !self.eof() {
+            if declaration
+                && (self.at("fn")
+                    || self.at("@")
+                    || self.at("pub")
+                    || self.at("struct")
+                    || self.at("enum")
+                    || self.at("const")
+                    || self.at("static")
+                    || self.at("import"))
+            {
+                break;
+            }
+            if !declaration && braces == 0 && (self.newline() || self.at(";") || self.at("}")) {
+                break;
+            }
+            if self.at("{") {
+                braces += 1;
+            }
+            if self.at("}") {
+                braces = braces.saturating_sub(1);
+            }
+            self.bump();
+        }
     }
     fn modifiers(&mut self) -> ParseResult<Modifiers> {
         let mut mods = Modifiers::default();
@@ -861,9 +940,24 @@ impl Parser {
         self.separators();
         while !self.eat("}") {
             if self.eof() {
-                return Err(self.error("unclosed block; expected `}`"));
+                let error = self.error("unclosed block; expected `}`");
+                if !self.recover {
+                    return Err(error);
+                }
+                self.diagnostics.push(error);
+                break;
             }
-            statements.push(self.statement()?);
+            let cursor = self.cursor;
+            let soft = self.soft_newlines;
+            match self.statement() {
+                Ok(statement) => statements.push(statement),
+                Err(error) if self.recover => {
+                    self.diagnostics.push(error);
+                    self.soft_newlines = soft;
+                    self.synchronize(cursor, false);
+                }
+                Err(error) => return Err(error),
+            }
             self.separators();
         }
         self.soft_newlines = previous_soft;
@@ -1902,7 +1996,7 @@ fn expression_path(expression: &Expr) -> Option<String> {
     }
 }
 
-fn reserved(name: &str) -> bool {
+pub(crate) fn reserved(name: &str) -> bool {
     matches!(
         name,
         "package"
@@ -2090,6 +2184,77 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn editor_recovery_advances_and_preserves_later_declarations() {
+        let source =
+            "package app\nfn broken() {\na := ;\nb := ;\n}\nfn good() -> i32 { return 3 }\n";
+        let (program, errors) = parse_recovering(source);
+        assert_eq!(errors.len(), 2);
+        assert_eq!(program.functions.len(), 2);
+        assert!(parse(source).is_err());
+        let (program, errors) = parse_recovering(
+            "package app\nstruct Bad {\nfn partial() {}\nfield: }\nfn good() {}\n",
+        );
+        assert!(!errors.is_empty());
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].name, "good");
+        let pieces = [
+            "fn", "{", "}", "(", ")", "<", ">>", "let", ":=", ";", "😀", "\"", "a", "\n",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let source = format!("package app\nfn main() {{ {a} {b} {c} }}\n");
+                    assert!(
+                        std::panic::catch_unwind(|| parse_recovering(&source)).is_ok(),
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn editor_recovery_preserves_test_attributes_after_bad_declarations() {
+        let source = "package app\nbroken declaration\n@test\n@ignore(\"needs hardware\")\nfn hardware() {}\n";
+        let (program, errors) = parse_recovering(source);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(program.functions.len(), 1);
+        let function = &program.functions[0];
+        assert_eq!(function.name, "hardware");
+        assert!(function.test);
+        assert_eq!(function.ignore.as_deref(), Some("needs hardware"));
+        assert!(parse(source).is_err());
+    }
+
+    #[test]
+    fn strict_and_recovering_parsers_reject_test_attributes_on_non_functions() {
+        for attribute in ["@test", "@ignore(\"later\")"] {
+            for declaration in [
+                "struct Invalid {}",
+                "enum Invalid { Value }",
+                "const invalid: i32 = 1",
+                "static invalid: i32 = 1",
+            ] {
+                let source = format!(
+                    "package app\n{attribute} {declaration}\n@test fn good() {{ assert(true) }}\n"
+                );
+                let expected = "@test and @ignore apply only to functions";
+                assert_eq!(
+                    parse(&source).unwrap_err().message.as_ref(),
+                    expected,
+                    "{source}"
+                );
+                let (program, errors) = parse_recovering(&source);
+                assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                assert_eq!(errors[0].message.as_ref(), expected);
+                assert_eq!(program.functions.len(), 1);
+                assert_eq!(program.functions[0].name, "good");
+                assert!(program.functions[0].test);
+            }
+        }
+    }
+
     #[test]
     fn excessive_nesting_has_a_diagnostic() {
         let source = format!(

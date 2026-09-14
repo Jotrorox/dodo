@@ -10,7 +10,9 @@
   through native discovery, with separate core/math/time checks and executable
   introductory, collection, hashing, allocation, math, clock, and thread docs.
   Run the native suite at both `-O0` and `-O3` in CI.
-
+- Add LSP completion, definition, references, rename, signature help, and canonical
+  document formatting. Recover multiple editor diagnostics, honor the configured
+  compilation target, and add a reproducible stdio responsiveness benchmark.
 - Use `main.dodo` in the current folder for `dodo run`, `dodo check`, and
   `dodo compile`; keep `build` as an alias for `compile`. Explicit project
   folders also select `main.dodo`; default build outputs use the project folder

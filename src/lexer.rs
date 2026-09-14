@@ -20,7 +20,16 @@ pub struct Token {
 }
 
 pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
-    Lexer { source, cursor: 0 }.lex()
+    Lexer { source, cursor: 0 }
+        .lex(false)
+        .map(|(tokens, _)| tokens)
+}
+
+/// Recover at the next token after a lexical error, preserving byte offsets.
+pub fn lex_recovering(source: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+    Lexer { source, cursor: 0 }
+        .lex(true)
+        .expect("recovering lexer cannot fail")
 }
 
 struct Lexer<'a> {
@@ -44,8 +53,9 @@ impl Lexer<'_> {
             message,
         )
     }
-    fn lex(mut self) -> Result<Vec<Token>, Diagnostic> {
+    fn lex(mut self, recover: bool) -> Result<(Vec<Token>, Vec<Diagnostic>), Diagnostic> {
         let mut tokens = Vec::new();
+        let mut diagnostics = Vec::new();
         while let Some(ch) = self.current() {
             let start = self.cursor;
             let kind = match ch {
@@ -63,50 +73,70 @@ impl Lexer<'_> {
                     }
                     continue;
                 }
-                b'"' => TokenKind::String(self.string(false, b'"')?, false),
-                b'b' if matches!(self.bytes().get(self.cursor + 1), Some(b'"' | b'\'')) => {
-                    self.cursor += 1;
-                    let quote = self.current().unwrap_or(b'"');
-                    let value = self.string(true, quote)?;
-                    if quote == b'\'' {
-                        if value.len() != 1 {
-                            return Err(
-                                self.error(start, "a byte literal must contain exactly one byte")
-                            );
-                        }
-                        TokenKind::Int(u64::from(value[0]), Some(Type::u8()))
-                    } else {
-                        TokenKind::String(value, true)
-                    }
-                }
-                b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
-                    self.cursor += 1;
-                    while self
-                        .current()
-                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
-                    {
-                        self.cursor += 1;
-                    }
-                    TokenKind::Ident(self.source[start..self.cursor].to_owned())
-                }
-                b'0'..=b'9' => self.number()?,
                 _ => {
-                    let rest = &self.source[self.cursor..];
-                    let symbol = [
-                        "<<=", ">>=", "..=", ":=", "->", "=>", "==", "!=", "<=", ">=", "&&", "||",
-                        "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::", "..",
-                        "{", "}", "(", ")", "[", "]", ",", ";", ":", ".", "+", "-", "*", "/", "%",
-                        "=", "<", ">", "!", "?", "&", "|", "^", "~", "@",
-                    ]
-                    .into_iter()
-                    .find(|s| rest.starts_with(s));
-                    if let Some(symbol) = symbol {
-                        self.cursor += symbol.len();
-                        TokenKind::Symbol(symbol)
-                    } else {
-                        let invalid = rest.chars().next().unwrap_or('\0');
-                        self.cursor += invalid.len_utf8();
-                        return Err(self.error(start, format!("unexpected character {invalid:?}; identifiers use ASCII letters, digits, and underscores")));
+                    let result = (|| {
+                        Ok(match ch {
+                            b'"' => TokenKind::String(self.string(false, b'"')?, false),
+                            b'b' if matches!(
+                                self.bytes().get(self.cursor + 1),
+                                Some(b'"' | b'\'')
+                            ) =>
+                            {
+                                self.cursor += 1;
+                                let quote = self.current().unwrap_or(b'"');
+                                let value = self.string(true, quote)?;
+                                if quote == b'\'' {
+                                    if value.len() != 1 {
+                                        return Err(self.error(
+                                            start,
+                                            "a byte literal must contain exactly one byte",
+                                        ));
+                                    }
+                                    TokenKind::Int(u64::from(value[0]), Some(Type::u8()))
+                                } else {
+                                    TokenKind::String(value, true)
+                                }
+                            }
+                            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                                self.cursor += 1;
+                                while self
+                                    .current()
+                                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+                                {
+                                    self.cursor += 1;
+                                }
+                                TokenKind::Ident(self.source[start..self.cursor].to_owned())
+                            }
+                            b'0'..=b'9' => self.number()?,
+                            _ => {
+                                let rest = &self.source[self.cursor..];
+                                let symbol = [
+                                    "<<=", ">>=", "..=", ":=", "->", "=>", "==", "!=", "<=", ">=",
+                                    "&&", "||", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=",
+                                    "|=", "^=", "::", "..", "{", "}", "(", ")", "[", "]", ",", ";",
+                                    ":", ".", "+", "-", "*", "/", "%", "=", "<", ">", "!", "?",
+                                    "&", "|", "^", "~", "@",
+                                ]
+                                .into_iter()
+                                .find(|s| rest.starts_with(s));
+                                if let Some(symbol) = symbol {
+                                    self.cursor += symbol.len();
+                                    TokenKind::Symbol(symbol)
+                                } else {
+                                    let invalid = rest.chars().next().unwrap_or('\0');
+                                    self.cursor += invalid.len_utf8();
+                                    return Err(self.error(start, format!("unexpected character {invalid:?}; identifiers use ASCII letters, digits, and underscores")));
+                                }
+                            }
+                        })
+                    })();
+                    match result {
+                        Ok(kind) => kind,
+                        Err(error) if recover => {
+                            diagnostics.push(error);
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
             };
@@ -125,7 +155,7 @@ impl Lexer<'_> {
                 end: self.cursor,
             },
         });
-        Ok(tokens)
+        Ok((tokens, diagnostics))
     }
     fn string(&mut self, byte: bool, quote: u8) -> Result<Vec<u8>, Diagnostic> {
         let start = self.cursor;

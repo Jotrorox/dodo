@@ -729,3 +729,810 @@ fn lsp_borrow_labels_in_imports_use_their_own_uris_and_ranges() {
     );
     assert!(client.shutdown().is_empty());
 }
+
+fn at(text: &str, needle: &str) -> Value {
+    let byte = text
+        .find(needle)
+        .unwrap_or_else(|| panic!("missing {needle:?}"));
+    let prefix = &text[..byte];
+    json!({"line":prefix.bytes().filter(|b| *b == b'\n').count(),
+        "character":prefix.rsplit('\n').next().unwrap().encode_utf16().count()})
+}
+
+fn query(
+    client: &mut Client,
+    method: &str,
+    uri: &str,
+    text: &str,
+    needle: &str,
+    extra: Value,
+) -> Value {
+    let mut params = json!({"textDocument":{"uri":uri},"position":at(text, needle)});
+    if let Some(extra) = extra.as_object() {
+        params.as_object_mut().unwrap().extend(extra.clone());
+    }
+    client.request(json!(42), &format!("textDocument/{method}"), params)
+}
+
+#[test]
+fn lsp_symbols_respect_shadowing_and_utf16_and_do_not_edit_comments() {
+    let source = "package app\r\nfn main() -> i32 {\r\nvalue := 1i32\r\n{\r\nvalue := value + 1\r\n_ = value\r\n}\r\n_ = \"😀 value\"; return value // value\r\n}\r\n";
+    let workspace = Workspace::new();
+    let uri = workspace.uri("main.dodo");
+    let mut client = Client::start("lsp");
+    let capabilities = client.initialize("file")["result"]["capabilities"].clone();
+    for provider in [
+        "definitionProvider",
+        "referencesProvider",
+        "documentFormattingProvider",
+    ] {
+        assert_eq!(capabilities[provider], true);
+    }
+    assert_eq!(capabilities["renameProvider"]["prepareProvider"], true);
+    client.open(&uri, source, 1);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    let definition = query(
+        &mut client,
+        "definition",
+        &uri,
+        source,
+        "value //",
+        json!({}),
+    );
+    assert_eq!(definition["result"]["uri"], uri);
+    assert_eq!(
+        definition["result"]["range"]["start"],
+        at(source, "value := 1")
+    );
+    let inner = query(
+        &mut client,
+        "definition",
+        &uri,
+        source,
+        "value\r\n}",
+        json!({}),
+    );
+    assert_eq!(
+        inner["result"]["range"]["start"],
+        at(source, "value := value")
+    );
+    let refs = query(
+        &mut client,
+        "references",
+        &uri,
+        source,
+        "value //",
+        json!({"context":{"includeDeclaration":false}}),
+    );
+    assert_eq!(refs["result"].as_array().unwrap().len(), 2, "{refs}");
+    let rename = query(
+        &mut client,
+        "rename",
+        &uri,
+        source,
+        "value //",
+        json!({"newName":"number"}),
+    );
+    let edits = rename["result"]["changes"][&uri].as_array().unwrap();
+    assert_eq!(edits.len(), 3, "{rename}");
+    assert!(edits.iter().all(|e| e["newText"] == "number"));
+    assert_eq!(edits[2]["range"]["start"], at(source, "value //"));
+    for bad in ["fn", "bad-name", "é", "", "_"] {
+        assert_eq!(
+            query(
+                &mut client,
+                "rename",
+                &uri,
+                source,
+                "value //",
+                json!({"newName":bad})
+            )["error"]["code"],
+            -32602
+        );
+    }
+    assert!(!workspace.0.join("main.dodo").exists());
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_cross_file_alias_navigation_references_rename_and_completion() {
+    let workspace = Workspace::new();
+    let source =
+        "package app\nimport \"lib\" as util\nfn main() -> i32 { return util.sum(1, 2) }\n";
+    let library =
+        "package lib\npub fn sum(a: i32, b: i32) -> i32 { return a + b }\nfn hidden() {}\n";
+    let root = workspace.uri("main.dodo");
+    let dependency = workspace.file("lib.dodo", library);
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 1);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    let definition = query(&mut client, "definition", &root, source, "sum(1", json!({}));
+    assert_eq!(definition["result"]["uri"], dependency, "{definition}");
+    assert_eq!(definition["result"]["range"]["start"], at(library, "sum("));
+    // A second analysis of the same dependency must not duplicate its declaration.
+    client.open(&dependency, library, 7);
+    client.diagnostics();
+    let rename = query(
+        &mut client,
+        "rename",
+        &dependency,
+        library,
+        "sum(",
+        json!({"newName":"add"}),
+    );
+    assert_eq!(
+        rename["result"]["changes"][&dependency]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{rename}"
+    );
+    assert_eq!(
+        rename["result"]["changes"][&root].as_array().unwrap().len(),
+        1,
+        "{rename}"
+    );
+    let completion = query(&mut client, "completion", &root, source, "sum(1", json!({}));
+    let items = completion["result"]["items"].as_array().unwrap();
+    assert!(items.iter().any(|i| i["label"] == "sum"), "{completion}");
+    assert!(
+        !items.iter().any(|i| i["label"] == "hidden"),
+        "{completion}"
+    );
+    let signature = query(&mut client, "signatureHelp", &root, source, "2)", json!({}));
+    assert_eq!(signature["result"]["activeParameter"], 1, "{signature}");
+    assert_eq!(
+        signature["result"]["signatures"][0]["parameters"][1]["label"],
+        "b: i32"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("lib.dodo")).unwrap(),
+        library
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_completion_and_signatures_work_during_incomplete_calls() {
+    let source = "package app\nfn sum(a: i32, b: i32) -> i32 { return a + b }\nfn main() -> i32 {\nnumber := 1i32\nreturn sum(number, \n}\n";
+    let uri = "untitled:editing";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(uri, source, 1);
+    client.diagnostics();
+    let response = query(
+        &mut client,
+        "signatureHelp",
+        uri,
+        source,
+        "\n}\n",
+        json!({}),
+    );
+    assert_eq!(response["result"]["activeParameter"], 1, "{response}");
+    let response = query(&mut client, "completion", uri, source, "\n}\n", json!({}));
+    assert!(
+        response["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["label"] == "number"),
+        "{response}"
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_recovers_multiple_syntax_and_semantic_errors_and_clears_them() {
+    let source = "package app\nfn syntax() {\na := ;\nb := ;\n}\nfn first() -> i32 { return missing }\nfn second() -> i32 { return absent }\nfn good() -> i32 { return 42 }\n";
+    let uri = "untitled:errors";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(uri, source, 1);
+    let diagnostics = client.diagnostics();
+    let errors = diagnostics[uri]["diagnostics"].as_array().unwrap();
+    assert!(errors.len() >= 4, "{diagnostics:?}");
+    let hover = query(&mut client, "hover", uri, source, "42", json!({}));
+    assert_eq!(hover["result"]["contents"]["value"], "```dodo\ni32\n```");
+    let two = "package app\nfn main() {\n_ = missing\n_ = absent\n}\n";
+    client.change(uri, two, 2);
+    let diagnostics = client.diagnostics();
+    assert_eq!(
+        diagnostics[uri]["diagnostics"].as_array().unwrap().len(),
+        2,
+        "{diagnostics:?}"
+    );
+    client.change(uri, VALID, 3);
+    assert_eq!(client.diagnostics()[uri]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_recovers_test_attribute_and_assertion_errors_and_preserves_navigation() {
+    let source = "package app\n@test struct Invalid {}\nfn sum(a: i32, b: i32) -> i32 { a + b }\n@test fn checks() {\nassert(1)\nassert_eq(1, true)\n}\n@test @ignore(\"later\") fn valid() { assert_eq(sum(1, 2), 3) }\n";
+    let workspace = Workspace::new();
+    let uri = workspace.uri("checks.dodo");
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&uri, source, 1);
+    let diagnostics = client.diagnostics();
+    let errors = diagnostics[&uri]["diagnostics"].as_array().unwrap();
+    assert_eq!(errors.len(), 3, "{diagnostics:?}");
+    assert!(
+        errors.iter().any(|error| error["message"]
+            .as_str()
+            .unwrap()
+            .contains("@test and @ignore apply only to functions")),
+        "{diagnostics:?}"
+    );
+    let definition = query(
+        &mut client,
+        "definition",
+        &uri,
+        source,
+        "sum(1, 2)",
+        json!({}),
+    );
+    assert_eq!(definition["result"]["uri"], uri, "{definition}");
+    assert_eq!(definition["result"]["range"]["start"], at(source, "sum(a:"));
+    let fixed = source
+        .replace("@test struct Invalid {}\n", "")
+        .replace("assert(1)", "assert(true)")
+        .replace("assert_eq(1, true)", "assert_eq(1, 1)");
+    client.change(&uri, &fixed, 2);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_formatting_uses_the_canonical_formatter_and_unsaved_text() {
+    let workspace = Workspace::new();
+    let uri = workspace.file("main.dodo", VALID);
+    let text = "package app\n// 😀 kept\nfn main()->i32{return 1}\n";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&uri, text, 1);
+    client.diagnostics();
+    let params = json!({"textDocument":{"uri":uri},"options":{"tabSize":4,"insertSpaces":true}});
+    let response = client.request(json!(10), "textDocument/formatting", params.clone());
+    let expected = dodoc::format::format_source(text).unwrap();
+    assert_eq!(response["result"][0]["newText"], expected);
+    assert_eq!(
+        response["result"][0]["range"]["end"],
+        json!({"line":3,"character":0})
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("main.dodo")).unwrap(),
+        VALID
+    );
+    client.change(&uri, &expected, 2);
+    client.diagnostics();
+    assert_eq!(
+        client.request(json!(11), "textDocument/formatting", params.clone())["result"],
+        json!([])
+    );
+    client.change(&uri, "package app\nfn main( {", 3);
+    client.diagnostics();
+    assert_eq!(
+        client.request(json!(12), "textDocument/formatting", params)["error"]["code"],
+        -32803
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_target_controls_pointer_width_and_hosted_imports() {
+    let workspace = Workspace::new();
+    let uri = workspace.uri("main.dodo");
+    let mut client = Client::start("lsp");
+    let invalid = client.request(
+        json!(0),
+        "initialize",
+        json!({"capabilities":{},"initializationOptions":{"target":"wasm32-unknown-unknown\0"}}),
+    );
+    assert_eq!(invalid["error"]["code"], -32602);
+    let invalid = client.request(
+        json!(1),
+        "initialize",
+        json!({"capabilities":{},"initializationOptions":{"target":"invalid-dodo-target"}}),
+    );
+    assert_eq!(invalid["error"]["code"], -32602);
+    let response = client.request(
+        json!(2),
+        "initialize",
+        json!({"capabilities":{},"initializationOptions":{"target":"wasm32-unknown-unknown"}}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let text = "package app\nfn big() -> usize { return 4294967296usize }\n";
+    client.open(&uri, text, 1);
+    assert!(
+        !client.diagnostics()[&uri]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    client.open("untitled:target", text, 1);
+    assert!(
+        !client.diagnostics()["untitled:target"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    client.change(&uri, "package app\nimport \"std/fs/native\"\n", 2);
+    let diagnostics = client.diagnostics();
+    assert!(
+        diagnostics[&uri]["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("wasm32-unknown-unknown"),
+        "{diagnostics:?}"
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_members_and_field_labels_have_distinct_symbol_identities() {
+    let source = "package app\nstruct Point {\n x: i32\n fn plus(self: &Self, amount: i32) -> i32 { return self.x + amount }\n}\nfn main() -> i32 {\nx := 1i32\np := Point { x: x }\nreturn p.plus(2) + p.x\n}\n";
+    let workspace = Workspace::new();
+    let uri = workspace.uri("main.dodo");
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&uri, source, 1);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    let response = query(
+        &mut client,
+        "definition",
+        &uri,
+        source,
+        "plus(2)",
+        json!({}),
+    );
+    assert_eq!(
+        response["result"]["range"]["start"],
+        at(source, "plus(self"),
+        "{response}"
+    );
+    let response = query(
+        &mut client,
+        "completion",
+        &uri,
+        source,
+        "plus(2)",
+        json!({}),
+    );
+    let items = response["result"]["items"].as_array().unwrap();
+    assert!(items.iter().any(|i| i["label"] == "x"));
+    assert!(items.iter().any(|i| i["label"] == "plus"));
+    let response = query(
+        &mut client,
+        "signatureHelp",
+        &uri,
+        source,
+        "2) +",
+        json!({}),
+    );
+    let parameters = response["result"]["signatures"][0]["parameters"]
+        .as_array()
+        .unwrap();
+    assert_eq!(parameters, &vec![json!({"label":"amount: i32"})]);
+    let response = query(
+        &mut client,
+        "rename",
+        &uri,
+        source,
+        "x :=",
+        json!({"newName":"value"}),
+    );
+    let edits = response["result"]["changes"][&uri].as_array().unwrap();
+    assert_eq!(edits.len(), 2, "{response}");
+    assert_eq!(edits[1]["range"]["start"], at(source, "x }"));
+    let response = query(
+        &mut client,
+        "rename",
+        &uri,
+        source,
+        "x: i32",
+        json!({"newName":"coordinate"}),
+    );
+    assert_eq!(
+        response["result"]["changes"][&uri]
+            .as_array()
+            .unwrap()
+            .len(),
+        4,
+        "{response}"
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_versioned_rename_and_collision_rejection() {
+    let source = "package app\nfn add(a: i32, b: i32) -> i32 { return a + b }\nfn main() -> i32 { return add(1, 2) }\n";
+    let workspace = Workspace::new();
+    let uri = workspace.uri("main.dodo");
+    let mut client = Client::start("lsp");
+    client.request(
+        json!(1),
+        "initialize",
+        json!({"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true}}}}),
+    );
+    client.open(&uri, source, 9);
+    client.diagnostics();
+    let response = query(
+        &mut client,
+        "prepareRename",
+        &uri,
+        source,
+        "a + b",
+        json!({}),
+    );
+    assert_eq!(response["result"]["placeholder"], "a");
+    let response = query(
+        &mut client,
+        "rename",
+        &uri,
+        source,
+        "a + b",
+        json!({"newName":"b"}),
+    );
+    assert_eq!(response["error"]["code"], -32803, "{response}");
+    let response = query(
+        &mut client,
+        "rename",
+        &uri,
+        source,
+        "a + b",
+        json!({"newName":"left"}),
+    );
+    assert_eq!(
+        response["result"]["documentChanges"][0]["textDocument"],
+        json!({"uri":uri,"version":9})
+    );
+    assert_eq!(
+        response["result"]["documentChanges"][0]["edits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_recovery_preserves_import_locations_and_does_not_weaken_cli_checks() {
+    let workspace = Workspace::new();
+    let source = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.good() }\n";
+    let library =
+        "package lib\npub fn bad() {\na := ;\nb := ;\n}\npub fn good() -> i32 { return 7 }\n";
+    let root = workspace.uri("main.dodo");
+    let dependency = workspace.file("lib.dodo", library);
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 1);
+    let diagnostics = client.diagnostics();
+    assert_eq!(
+        diagnostics[&dependency]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{diagnostics:?}"
+    );
+    let response = query(
+        &mut client,
+        "definition",
+        &root,
+        source,
+        "good()",
+        json!({}),
+    );
+    assert_eq!(response["result"]["uri"], dependency);
+    assert_eq!(response["result"]["range"]["start"], at(library, "good()"));
+    assert!(dodoc::parser::parse(library).is_err());
+    assert!(dodoc::package::load(&workspace.0.join("lib.dodo")).is_err());
+    assert!(dodoc::format::format_source(library).is_err());
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_completion_replaces_whole_identifier_and_excludes_closed_loop_scopes() {
+    let source = "package app\nfn main() -> i32 {\nnumber := 42i32\nfor index := 0; index < 2; index += 1 {}\nreturn number\n}\n";
+    let uri = "untitled:completion";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(uri, source, 1);
+    assert_eq!(client.diagnostics()[uri]["diagnostics"], json!([]));
+    let response = query(&mut client, "completion", uri, source, "mber\n", json!({}));
+    let item = response["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["label"] == "number")
+        .unwrap();
+    assert_eq!(item["textEdit"]["range"]["start"], at(source, "number\n"));
+    assert_eq!(
+        item["textEdit"]["range"]["end"],
+        json!({"line":4,"character":13})
+    );
+    let response = query(
+        &mut client,
+        "completion",
+        uri,
+        source,
+        "number\n",
+        json!({}),
+    );
+    assert!(
+        !response["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["label"] == "index"),
+        "{response}"
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_nested_generic_signature_help_and_malformed_requests() {
+    let source = "package app\nfn id<A, B>(value: A, ignored: B) -> A { return value }\nfn sum(a: i32, b: i32) -> i32 { return a + b }\nfn main() -> i32 { return sum(id::<i32, u8>(1, 2), 3) }\n";
+    let uri = "untitled:signatures";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(uri, source, 1);
+    assert_eq!(client.diagnostics()[uri]["diagnostics"], json!([]));
+    for needle in ["2),", "3) }"] {
+        let response = query(&mut client, "signatureHelp", uri, source, needle, json!({}));
+        assert_eq!(response["result"]["activeParameter"], 1, "{response}");
+    }
+    for method in [
+        "completion",
+        "definition",
+        "references",
+        "prepareRename",
+        "rename",
+        "signatureHelp",
+        "formatting",
+    ] {
+        let response = client.request(json!(80), &format!("textDocument/{method}"), json!({}));
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    assert!(client.shutdown().is_empty());
+}
+
+// Apply edits as an editor would, independently converting UTF-16 positions.
+fn apply_text_edits(source: &str, edits: &Value) -> String {
+    let byte = |position: &Value| {
+        let line = position["line"].as_u64().unwrap() as usize;
+        let column = position["character"].as_u64().unwrap() as usize;
+        let start: usize = source.split_inclusive('\n').take(line).map(str::len).sum();
+        let mut units = 0;
+        for (offset, ch) in source[start..].char_indices() {
+            if units == column {
+                return start + offset;
+            }
+            assert_ne!(ch, '\n', "edit column exceeds line length");
+            units += ch.len_utf16();
+            assert!(units <= column, "edit splits a UTF-16 surrogate pair");
+        }
+        assert_eq!(units, column);
+        source.len()
+    };
+    let mut edits: Vec<_> = edits
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edit| {
+            let range = &edit["range"];
+            (
+                byte(&range["start"]),
+                byte(&range["end"]),
+                edit["newText"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    edits.sort_by_key(|(start, end, _)| (*start, *end));
+    assert!(
+        edits.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+        "overlapping edits"
+    );
+    let mut result = source.to_owned();
+    for (start, end, text) in edits.into_iter().rev() {
+        result.replace_range(start..end, text);
+    }
+    result
+}
+
+#[test]
+fn lsp_rename_edits_round_trip_through_package_checking_and_navigation() {
+    let workspace = Workspace::new();
+    let source = "package app\nimport \"lib\" as util\nfn main() -> i32 {\n_ = \"😀 sum\"; return util.sum(1, 2) // sum stays in this comment\n}\n";
+    let library = "package lib\npub fn sum(a: i32, b: i32) -> i32 { return a + b }\n";
+    let root = workspace.uri("main.dodo");
+    let dependency = workspace.file("lib.dodo", library);
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 1);
+    client.open(&dependency, library, 1);
+    client.diagnostics();
+    let response = query(
+        &mut client,
+        "rename",
+        &root,
+        source,
+        "sum(1",
+        json!({"newName":"add"}),
+    );
+    let changes = &response["result"]["changes"];
+    assert_eq!(changes.as_object().unwrap().len(), 2, "{response}");
+    let renamed_source = apply_text_edits(source, &changes[&root]);
+    let renamed_library = apply_text_edits(library, &changes[&dependency]);
+    assert_eq!(renamed_source, source.replace("util.sum(", "util.add("));
+    assert_eq!(renamed_library, library.replace("fn sum(", "fn add("));
+
+    let overlays = BTreeMap::from([
+        (workspace.0.join("main.dodo"), renamed_source.clone()),
+        (workspace.0.join("lib.dodo"), renamed_library.clone()),
+    ]);
+    let mut loaded =
+        dodoc::package::load_with_overlays(&workspace.0.join("main.dodo"), &overlays).unwrap();
+    dodoc::sema::check_for_target(&mut loaded.program, usize::BITS).unwrap();
+    client.change(&root, &renamed_source, 2);
+    client.change(&dependency, &renamed_library, 2);
+    let diagnostics = client.diagnostics();
+    assert!(
+        diagnostics.values().all(|p| p["diagnostics"] == json!([])),
+        "{diagnostics:?}"
+    );
+    let definition = query(
+        &mut client,
+        "definition",
+        &root,
+        &renamed_source,
+        "add(1",
+        json!({}),
+    );
+    assert_eq!(definition["result"]["uri"], dependency);
+    assert_eq!(
+        definition["result"]["range"]["start"],
+        at(&renamed_library, "add(")
+    );
+    let references = query(
+        &mut client,
+        "references",
+        &dependency,
+        &renamed_library,
+        "add(",
+        json!({"context":{"includeDeclaration":true}}),
+    );
+    assert_eq!(
+        references["result"].as_array().unwrap().len(),
+        2,
+        "{references}"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("lib.dodo")).unwrap(),
+        library
+    );
+    assert!(!workspace.0.join("main.dodo").exists());
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_shorthand_rename_restrictions_follow_symbols_across_analysis_roots() {
+    let workspace = Workspace::new();
+    let source = "package app\nimport \"shapes\"\nfn main() -> i32 {\nx := 1i32\np := shapes.Point { x }\nreturn p.x\n}\n";
+    let library = "package shapes\npub struct Point { pub x: i32 }\n";
+    let root = workspace.uri("main.dodo");
+    let dependency = workspace.file("shapes.dodo", library);
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 1);
+    client.open(&dependency, library, 1);
+    let diagnostics = client.diagnostics();
+    assert!(
+        diagnostics.values().all(|p| p["diagnostics"] == json!([])),
+        "{diagnostics:?}"
+    );
+    // Query the dependency's own index: the restricting shorthand lives only
+    // in the caller's analysis, so checking the current index alone is unsafe.
+    let response = query(
+        &mut client,
+        "rename",
+        &dependency,
+        library,
+        "x: i32",
+        json!({"newName":"coordinate"}),
+    );
+    assert_eq!(response["error"]["code"], -32803, "{response}");
+    assert!(response.get("result").is_none());
+    let response = query(
+        &mut client,
+        "prepareRename",
+        &root,
+        source,
+        "x :=",
+        json!({}),
+    );
+    assert_eq!(response.get("result"), Some(&Value::Null));
+    let response = query(
+        &mut client,
+        "rename",
+        &root,
+        source,
+        "x :=",
+        json!({"newName":"value"}),
+    );
+    assert_eq!(response["error"]["code"], -32803, "{response}");
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_queries_ignore_strings_comments_and_invalid_utf16_positions() {
+    let source = "package app\nfn echo(text: &str, count: i32) -> i32 { return count }\nfn main() -> i32 { return echo(\"😀 marker\", 1) } // trailing comment\n";
+    let uri = "untitled:positions";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(uri, source, 1);
+    assert_eq!(client.diagnostics()[uri]["diagnostics"], json!([]));
+    for method in ["completion", "signatureHelp", "definition", "prepareRename"] {
+        for needle in ["marker", "trailing comment"] {
+            let response = query(&mut client, method, uri, source, needle, json!({}));
+            assert_eq!(response.get("result"), Some(&Value::Null), "{response}");
+        }
+        let mut surrogate = at(source, "😀");
+        surrogate["character"] = json!(surrogate["character"].as_u64().unwrap() + 1);
+        for position in [
+            surrogate,
+            json!({"line":999,"character":0}),
+            json!({"line":0,"character":999}),
+        ] {
+            let response = client.request(
+                json!(50),
+                &format!("textDocument/{method}"),
+                json!({"textDocument":{"uri":uri},"position":position}),
+            );
+            assert_eq!(response.get("result"), Some(&Value::Null), "{response}");
+        }
+    }
+    let response = query(&mut client, "signatureHelp", uri, source, "1) }", json!({}));
+    assert_eq!(response["result"]["activeParameter"], 1, "{response}");
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_package_recovery_combines_lexical_and_target_errors_in_unsaved_siblings() {
+    let workspace = Workspace::new();
+    let root = workspace.uri("main.dodo");
+    let sibling = workspace.uri("extra.dodo");
+    let broken = "package app\nfn bad() {\n😀\n§\n}\nfn big() -> usize { return 4294967296usize }\nfn good() -> i32 { return 7 }\n";
+    let fixed = "package app\nfn good() -> i32 { return 7 }\n";
+    let mut client = Client::start("lsp");
+    let response = client.request(json!(1), "initialize", json!({"capabilities":{},"initializationOptions":{"checkMode":"package","target":"wasm32-unknown-unknown"}}));
+    assert!(response.get("error").is_none(), "{response}");
+    client.open(&root, VALID, 1);
+    client.open(&sibling, broken, 4);
+    let diagnostics = client.diagnostics();
+    assert_eq!(diagnostics[&root]["diagnostics"], json!([]));
+    let errors = diagnostics[&sibling]["diagnostics"].as_array().unwrap();
+    assert_eq!(errors.len(), 3, "{diagnostics:?}");
+    assert_eq!(diagnostics[&sibling]["version"], 4);
+    for line in [2, 3, 5] {
+        assert!(
+            errors.iter().any(|e| e["range"]["start"]["line"] == line),
+            "{errors:?}"
+        );
+    }
+    let response = query(&mut client, "hover", &sibling, broken, "7 }", json!({}));
+    assert_eq!(response["result"]["contents"]["value"], "```dodo\ni32\n```");
+    client.change(&sibling, fixed, 5);
+    let diagnostics = client.diagnostics();
+    assert!(
+        diagnostics.values().all(|p| p["diagnostics"] == json!([])),
+        "{diagnostics:?}"
+    );
+    assert_eq!(diagnostics[&sibling]["version"], 5);
+    assert!(!workspace.0.join("extra.dodo").exists());
+    assert!(client.shutdown().is_empty());
+}

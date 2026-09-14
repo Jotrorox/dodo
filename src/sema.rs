@@ -14,6 +14,25 @@ pub fn check(program: &mut Program) -> Check<()> {
 }
 
 pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
+    check_program(program, pointer_bits, false, &mut Vec::new())
+}
+
+/// Check independent bodies after an error without reusing failed borrow state.
+/// Errors in shared declarations/preparation still stop checking that program.
+pub fn check_recovering(program: &mut Program, pointer_bits: u32) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    if let Err(error) = check_program(program, pointer_bits, true, &mut diagnostics) {
+        diagnostics.push(error);
+    }
+    diagnostics
+}
+
+fn check_program(
+    program: &mut Program,
+    pointer_bits: u32,
+    recover: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Check<()> {
     crate::prepare::prepare(program, pointer_bits)?;
     validate_public_interfaces(program)?;
     instantiate(program)?;
@@ -24,67 +43,89 @@ pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
         function.from = context.functions[&function.name].from.clone();
     }
     for constant in &mut program.constants {
-        let mut checker = Checker::new(&context, Type::Void, vec![], HashMap::new());
-        let value = checker.expr(&mut constant.value, Some(&constant.ty), true)?;
-        checker.expect(&constant.ty, &value.ty, constant.span)?;
-        if !constant_expression(&constant.value) {
-            return Err(Diagnostic::new(
-                constant.span,
-                "global initializers must be compile-time constants",
-            ));
+        let result = (|| {
+            let mut checker = Checker::new(&context, Type::Void, vec![], HashMap::new());
+            let value = checker.expr(&mut constant.value, Some(&constant.ty), true)?;
+            checker.expect(&constant.ty, &value.ty, constant.span)?;
+            if !constant_expression(&constant.value) {
+                return Err(Diagnostic::new(
+                    constant.span,
+                    "global initializers must be compile-time constants",
+                ));
+            }
+            validate_constant(&constant.value, pointer_bits)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if !recover {
+                return Err(error);
+            }
+            diagnostics.push(error);
         }
-        validate_constant(&constant.value, pointer_bits)?;
     }
     for function in &mut program.functions {
         if function.body.is_none() {
             continue;
         }
-        let mut uses = HashMap::new();
-        names_block(function.body.as_ref().unwrap(), &mut uses);
-        let mut checker = Checker::new(
-            &context,
-            function.ret.clone(),
-            context.functions[&function.name].from.clone(),
-            uses,
-        );
-        checker.namespace = context.function_namespace(&function.name);
-        checker.binding_uses = binding_use_spans(function);
-        checker.return_contract = Some(function.from_span.unwrap_or(function.ret_span));
-        checker.inferred_contract = function.from_span.is_none();
-        for parameter in &function.params {
-            let id = checker.next_id;
-            let deps = if context.carries_borrow(&parameter.ty) {
-                vec![Loan {
-                    dependency: false,
-                    root: usize::MAX / 2 + id,
-                    fields: vec![],
-                    mutable: context.carries_mutable_borrow(&parameter.ty),
-                    origin: parameter.span,
-                    via: vec![],
-                    external: Some(parameter.name.clone()),
-                }]
-            } else {
-                vec![]
-            };
-            checker.bind(
-                parameter.name.clone(),
-                parameter.ty.clone(),
-                Some(deps),
-                false,
-                parameter.span,
-            )?;
+        let result = (|| {
+            let mut uses = HashMap::new();
+            names_block(function.body.as_ref().unwrap(), &mut uses);
+            let mut checker = Checker::new(
+                &context,
+                function.ret.clone(),
+                context.functions[&function.name].from.clone(),
+                uses,
+            );
+            checker.recover = recover;
+            checker.namespace = context.function_namespace(&function.name);
+            checker.binding_uses = binding_use_spans(function);
+            checker.return_contract = Some(function.from_span.unwrap_or(function.ret_span));
+            checker.inferred_contract = function.from_span.is_none();
+            for parameter in &function.params {
+                let id = checker.next_id;
+                let deps = if context.carries_borrow(&parameter.ty) {
+                    vec![Loan {
+                        dependency: false,
+                        root: usize::MAX / 2 + id,
+                        fields: vec![],
+                        mutable: context.carries_mutable_borrow(&parameter.ty),
+                        origin: parameter.span,
+                        via: vec![],
+                        external: Some(parameter.name.clone()),
+                    }]
+                } else {
+                    vec![]
+                };
+                checker.bind(
+                    parameter.name.clone(),
+                    parameter.ty.clone(),
+                    Some(deps),
+                    false,
+                    parameter.span,
+                )?;
+            }
+            let result = checker.block(function.body.as_mut().unwrap(), false);
+            let had_errors = !checker.diagnostics.is_empty();
+            diagnostics.append(&mut checker.diagnostics);
+            let terminates = result?;
+            if function.ret != Type::Void && !terminates && !had_errors {
+                return Err(Diagnostic::new(
+                    function.span,
+                    format!(
+                        "function `{}` can reach its end without returning {}",
+                        function.name, function.ret
+                    ),
+                ));
+            }
+            checker.finish_scope(function.span)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if !recover {
+                return Err(error);
+            }
+            diagnostics.push(error);
         }
-        let terminates = checker.block(function.body.as_mut().unwrap(), false)?;
-        if function.ret != Type::Void && !terminates {
-            return Err(Diagnostic::new(
-                function.span,
-                format!(
-                    "function `{}` can reach its end without returning {}",
-                    function.name, function.ret
-                ),
-            ));
-        }
-        checker.finish_scope(function.span)?;
     }
     Ok(())
 }
@@ -629,17 +670,22 @@ enum Access {
     Borrow(bool),
     Move,
 }
+#[derive(Clone)]
 struct LoopUse {
     span: Span,
     implicit: bool,
 }
+#[derive(Clone)]
 struct YieldContext {
     expected: Option<Type>,
     depth: usize,
     values: Vec<Value>,
     states: Vec<Vec<Vec<Variable>>>,
 }
+#[derive(Clone)]
 struct Checker<'a> {
+    recover: bool,
+    diagnostics: Vec<Diagnostic>,
     context: &'a Context,
     scopes: Vec<Vec<Variable>>,
     next_id: usize,
@@ -668,6 +714,8 @@ impl<'a> Checker<'a> {
         uses: HashMap<String, Span>,
     ) -> Self {
         Self {
+            recover: false,
+            diagnostics: vec![],
             context,
             scopes: vec![vec![]],
             next_id: 1,
@@ -966,7 +1014,20 @@ impl<'a> Checker<'a> {
             self.position = statement.span.start;
             self.expression_deps.clear();
             self.temporary.clear();
-            terminated = self.statement(statement)?;
+            // Editor-only transaction: a failed statement may have moved values,
+            // created loans, or pushed scopes. Restore all checker state before
+            // considering the next independent statement. Strict builds never clone.
+            let checkpoint = self.recover.then(|| self.clone());
+            match self.statement(statement) {
+                Ok(ends) => terminated = ends,
+                Err(error) => {
+                    let Some(checkpoint) = checkpoint else {
+                        return Err(error);
+                    };
+                    *self = checkpoint;
+                    self.diagnostics.push(error);
+                }
+            }
             self.temporary.clear();
         }
         if scoped {
@@ -6450,6 +6511,17 @@ fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -> Option<Ty
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn editor_recovery_rolls_back_moves_from_failed_statements() {
+        let source = "package app\nstruct Box { value: i32 }\nfn consume(box: Box, count: i32) {}\nfn main() {\nbox := Box { value: 1 }\nconsume(box, true)\n_ = box.value\n_ = missing\n}\n";
+        let original = crate::parser::parse(source).unwrap();
+        let mut recovered = original.clone();
+        let diagnostics = check_recovering(&mut recovered, 64);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics[1].message.contains("missing"));
+        assert!(check_for_target(&mut original.clone(), 64).is_err());
+    }
+
     #[test]
     fn method_type_parameters_infer_on_a_specialized_generic_owner() {
         accepts(
