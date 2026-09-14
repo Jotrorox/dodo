@@ -33,6 +33,12 @@ The layout supplies the page title, so start body sections with `##` and use
 and fenced code blocks. Label Dodo code fences with `dodo`. Keep introductory
 examples short and include the command to run them and the expected result.
 
+Mark complete runnable examples with `dodo test` on the opening code fence.
+Include a package declaration and a `main` or test function. Run
+`dodo test docs --doc` from the repository root to verify them; compiler CI runs
+the same command. Leave illustrative or incomplete snippets marked `dodo`.
+See [executable documentation](testing.md#execute-documentation-examples).
+
 ## Place a page in navigation
 
 The sidebar groups pages by their `section` field in this fixed order:

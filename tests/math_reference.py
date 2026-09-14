@@ -150,6 +150,8 @@ lines.append("fn main() -> i32 {")
 for index, (name, *_rest) in enumerate(cases):
     lines.append(f"    if !check_{name}() {{ return {index + 1} }}")
 lines += ["    return 0", "}", ""]
+for name, *_rest in cases:
+    lines += ["@test", f"fn test_{name}_reference() {{", f"    assert(check_{name}(), \"{name} differs from the MPFR reference\")", "}", ""]
 path = Path(__file__).resolve().parent / "stdlib" / "math_reference.dodo"
 path.write_text("\n".join(lines))
 library.mpfr_clear(ctypes.byref(operand))

@@ -12,15 +12,19 @@ libc, libm, or runtime startup. No hardware backend is required or currently
 provided. Cortex-M0 builds use the target's ordinary compiler support routines
 for soft floating-point arithmetic; firmware supplies those when linking.
 
-```dodo
+```dodo test
+package vector_example
 import "std/math"
 import "std/math/trig"
 
-length := math.hypot(3.0, 4.0)
-angle := trig.atan2(4.0, 3.0)
-match trig.cos(angle) {
-    ok(value) => { /* length * value approximates 3 */ },
-    err(reason) => { /* explicitly handle the mathematical error */ }
+@test
+fn reconstructs_the_horizontal_component() {
+    length := math.hypot(3.0, 4.0)
+    angle := trig.atan2(4.0, 3.0)
+    match trig.cos(angle) {
+        ok(value) => { assert(math.abs(length * value - 3.0) < 1e-12) },
+        err(_) => { assert(false, "a finite vector should have a valid angle") },
+    }
 }
 ```
 

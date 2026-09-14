@@ -161,7 +161,7 @@ container destruction, even when an operation happens not to relocate storage.
 Unrelated containers sharing the allocator can still mutate independently.
 Keys are never exposed mutably by map/set APIs.
 
-```dodo
+```dodo test
 package example
 import "std/collections"
 import "std/collections/fixed_vector"

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add `dodo test` with recursive discovery, `@test` and `test_` functions,
+  companion test files, assertions, filtering, ignored tests, captured output,
+  timeouts, and isolated native execution. Report assertion values and source
+  locations for checked traps. Execute Markdown fences marked `dodo test` in CI.
+- Make self-contained standard-library fixtures and portable examples runnable
+  through native discovery, with separate core/math/time checks and executable
+  introductory, collection, hashing, allocation, math, clock, and thread docs.
+  Run the native suite at both `-O0` and `-O3` in CI.
+
 - Use `main.dodo` in the current folder for `dodo run`, `dodo check`, and
   `dodo compile`; keep `build` as an alias for `compile`. Explicit project
   folders also select `main.dodo`; default build outputs use the project folder

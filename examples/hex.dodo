@@ -40,3 +40,40 @@ fn main() -> i32 {
     }
     return 0
 }
+
+@test
+fn hex_accepts_full_byte_range() {
+    assert_eq(parse_or(b"00", 1), 0)
+    assert_eq(parse_or(b"09", 0), 9)
+    assert_eq(parse_or(b"af", 0), 175)
+    assert_eq(parse_or(b"ff", 0), 255)
+}
+
+@test
+fn hex_reports_length_and_digit_errors() {
+    match parse_byte(b"f") {
+        err(reason) => {
+            assert_eq(reason, ParseError.Length)
+        },
+        ok(_) => {
+            assert(false, "a byte requires exactly two digits")
+        },
+    }
+    match parse_byte(b"000") {
+        err(reason) => {
+            assert_eq(reason, ParseError.Length)
+        },
+        ok(_) => {
+            assert(false, "extra digits must be rejected")
+        },
+    }
+    match parse_byte(b"2z") {
+        err(reason) => {
+            assert_eq(reason, ParseError.Digit)
+        },
+        ok(_) => {
+            assert(false, "non-hexadecimal digits must be rejected")
+        },
+    }
+    assert_eq(parse_or(b"zz", 7), 7)
+}
