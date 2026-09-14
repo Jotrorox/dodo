@@ -160,7 +160,13 @@ cannot be represented. Both division and remainder trap for a signed minimum
 value and divisor `-1`, as well as for zero divisors. Shift counts must be
 nonnegative and smaller than the value's bit width. Integer conversions check
 range; they do not truncate or wrap. Float-to-integer conversion truncates toward
-zero after checking the source lies within the target range and is finite.
+zero after checking the finite source against the destination's half-open range
+before truncation (`-0.5 as u8` traps; `255.75 as u8` is 255).
 Integer-to-float conversion rounds to the target floating representation.
-Narrowing floats checks finite range. Floating arithmetic follows LLVM's IEEE
-operations without fast-math flags. There are no named wrapping operations yet.
+Narrowing floats checks finite range, rejecting NaN and infinity. Floating
+arithmetic follows LLVM's IEEE operations without fast-math flags. Constant
+floating evaluation uses binary64 intermediates, including integer-to-f32
+conversion, and can round differently from runtime conversion; the precise
+implementation-defined choice is recorded as ID-FLOAT in
+[specification Appendix C](language-spec-0.1.md#c1-required-implementation-profile).
+There are no named wrapping operations yet.

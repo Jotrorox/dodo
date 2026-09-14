@@ -1,15 +1,15 @@
 ---
 title: "Dodo language specification 0.1"
-description: "The complete Dodo 0.1 design: language rules, worked examples, and open specification items."
+description: "Normative Dodo 0.1 rules, implementation-defined target choices, and executable conformance requirements."
 section: "Language reference"
 order: 240
 ---
 
 **Language specification 0.1**
 
-**Edition:** 11 September 2026
+**Edition:** 14 September 2026
 
-**Status:** Proposed language; normative design specification
+**Status:** Normative specification of the implemented 0.1 language
 
 A small language. Explicit control. Checked borrowing.
 
@@ -30,18 +30,33 @@ accepted for compatibility. The ownership categories are unchanged.
 
 **Must**, **must not**, **shall**, and **shall not** express requirements.
 **May** expresses permission. **Should** expresses a recommendation.
-**Unspecified** means version 0.1 does not settle a behavior or syntax rule;
-portable programs must not depend on one implementation's choice.
+**Implementation-defined** means an implementation must document its choice for
+each supported target; a program may depend on that documented choice, but may
+then require changes on another implementation or target. Appendix C records
+these choices for compiler 0.1.1. **Unspecified** means a choice need not be
+documented and may vary between evaluations. **Undefined behavior** means a
+program has violated a runtime validity requirement and this specification
+imposes no requirements on that execution. An unsafe precondition violation is
+not a required diagnostic or trap. A required rejection is a compile-time error;
+a required trap is a non-returning runtime failure (section 17).
 
-The specification defines an intended source-language model. It does not assert
+This edition selects the implemented rules to retain as language requirements,
+including sequencing, representation, raw-memory contracts, C interfaces, and
+local package resolution. Sections carrying rule IDs are connected to acceptance,
+rejection, execution, or target-emission tests in Appendix B. Tests witness
+specific consequences of the rules; the prose defines the contract.
+
+The specification does not assert
 that an implementation is complete, sound, memory-safe, mature, or secure.
 Examples explain the design; they are not evidence of compiler conformance.
 Compiler implementation status belongs in separate project documentation.
 
-Version 0.1 does not completely define lexical rules, expression grammar, ABI,
-standard library, target object formats, or a formal memory-safety argument.
-The resolved ergonomics rules are specified below; Appendix C collects the
-remaining open design items.
+The core language rules below are normative. Library design guidance for DMA
+and interrupts does not imply compiler support for those facilities. Unsupported
+features are identified in Appendix C; they are not alternative meanings of
+accepted programs. The partial grammar is a reading aid, subordinate to the
+rules in the main text. Library APIs outside the core memory surface are
+versioned separately in the standard-library reference.
 
 ## Contents
 
@@ -66,7 +81,7 @@ remaining open design items.
 19. Worked examples
 A. Partial grammar
 B. Conformance checklist
-C. Open specification items
+C. Implementation-defined behavior and excluded features
 D. Informative references
 
 ## 1. Language overview
@@ -117,8 +132,13 @@ A source unit declares its package:
 package samples
 ```
 
-The relationship between source files and package compilation units is
-unspecified in version 0.1.
+**PKG-UNIT.** Every source file must start with a package declaration, apart from
+whitespace, comments, and empty semicolon statements. A file input includes exactly that file and its imports.
+A directory input includes its immediate regular files with extension `.dodo`,
+sorted by canonical path; it must contain at least one such file. Subdirectories
+and symlink entries are not scanned as source files. All included files must
+declare the same package. Their declarations and import aliases share one package
+scope, independent of declaration order. Duplicate declarations are errors.
 
 ### 2.2. Imports
 
@@ -129,14 +149,50 @@ such as `mmio.write32`:
 import "core/mmio"
 ```
 
+**PKG-RESOLVE.** An import must be a nonempty relative path of nonempty `/`-separated
+components, with no `.` or `..` component or backslash. For a local import `p`,
+resolution from the importing unit's directory considers the file obtained by
+replacing p's extension with `.dodo`, and the directory p. Exactly one must exist;
+both, neither, an empty directory package, or an import cycle is an error. Thus
+ordinary extensionless imports use `p.dodo` or `p/`. The imported declaration must
+match p's final component. Package identity is its canonical resolved path, not
+its declared name; repeated dependencies on the same unit are loaded once.
+Filesystem case handling and canonicalization are implementation-defined (ID-FS).
+
+**PKG-NAMES.** The final component is the default local name. `import "p" as name`
+selects an alias for the importing package, without renaming the dependency or
+changing its visibility. Distinct dependencies must not share a local name or
+conflict with the importing package's name. Repeated identical imports are
+permitted. A path must not have conflicting explicit aliases across files;
+an explicit alias also applies to unaliased repetitions of that path in the
+same unit. Only direct imports are in scope; imports are not re-exports.
+
+**PKG-CORE.** Imports starting with `core/`, `alloc/`, or `std/` must resolve from
+the compiler's bundled library, never local files. Unknown bundled imports are
+errors. `core/mem`, `core/ptr`, and `core/mmio` are compiler intrinsics and must
+be directly imported to use their calls. `core.drop` is available without an
+import. Package names `core`, `mem`, `ptr`, and `mmio` are reserved. These aliases
+are also reserved except for a matching `core/mem`, `core/ptr`, or `core/mmio`
+import. A bundled package cannot depend on a local package. Target selection
+for bundled platform adapters is implementation-defined (ID-LIB).
+
 ### 2.3. Visibility
 
-Declarations and fields are package-private unless marked `pub`. Letter case
+**PKG-VIS.** Declarations and fields are package-private unless marked `pub`. Letter case
 has no visibility meaning. A public API must not expose a private type. A public
 enum exposes its variants.
 
-Re-exports, import aliases, wildcard imports, cyclic packages, and package
-initialization order are unspecified.
+Wildcard imports and re-export declarations are not supported.
+
+**PKG-INIT.** There is no implicit package initialization hook or import-time execution.
+Package `const` and `static` initializers must be constant expressions; ordinary
+function calls in them are rejected. Constant dependencies may refer forward
+across the loaded package graph; cycles and dependencies on mutable statics are
+errors. Static storage is initialized before entry to the program. This imposes
+no runtime order among imports, because their initialization has no side effects.
+A function named `init` is an ordinary function and is never called implicitly.
+Static storage lasts for the program; its contents are not automatically
+destroyed at program exit.
 
 ## 3. Lexical structure
 
@@ -164,24 +220,28 @@ for i := 0; i < n; i += 1 {
 
 ### 3.2. Comments
 
-`//` begins a line comment that extends to the end of the line. Block comments,
-nested comments, and documentation comments are unspecified. A line comment
-preserves its terminating newline for statement and continuation rules.
+**LEX-TEXT.** Source must be valid UTF-8. Space, tab, and carriage return are
+whitespace; line feed is the newline token, so CRLF has the same statement effect
+as LF. `//` begins a comment through the next LF or end of file. Its terminating
+newline is preserved. `///` is an ordinary line comment. Block/nested comments,
+raw identifiers, raw strings, character literals without `b`, and a source BOM
+are not supported and must be rejected where used as syntax.
 
 ### 3.3. Identifiers and keywords
 
-Examples use identifiers such as `parse_byte`, `Samples`, and `set_address`.
-The design uses these syntactic or contextual keywords:
+Identifiers match `[A-Za-z_][A-Za-z0-9_]*` and are case-sensitive. No Unicode
+normalization is performed on strings or comments. The following words are
+reserved and must not be used as identifiers:
 
 ```text
 package import pub fn struct enum const let return if else for in
-break continue match unsafe extern as from static Self self void
+break continue match unsafe extern as from static void mut true false
 ```
 
-The exact identifier character set, Unicode normalization, case sensitivity,
-reserved-word policy, and raw-identifier syntax are unspecified. Implementations
-should reject source whose meaning depends on an undocumented lexical rule.
-This list is a record of the supplied design, not a complete lexical grammar.
+`Self`, `self`, primitive type names, and constructor names such as `some` have
+contextual meanings; they are not in the reserved-word set. Symbol tokens use
+the longest recognized spelling, including `..=` before `..`, and `>>=` before
+`>>`. There is no preprocessor.
 
 ### 3.4. Literals
 
@@ -194,9 +254,28 @@ This list is a record of the supplied design, not a complete lexical grammar.
 - Array literals use `[1, 2, 3]`, with the length inferred from the elements.
 - Repeated array literals use `[value; N]`, where N is an integer constant expression.
 
-Numeric bases, digit separators, floating-point literals, character and string
-escapes, raw strings, Boolean literal spelling, and source encoding are not
-fully specified.
+**LEX-LITERAL.** Integers use decimal or lowercase `0x`, `0o`, `0b` prefixes for
+bases 16, 8, 2. Hexadecimal digits may have either case. Underscores are ignored
+within digit runs (including after a base prefix and at the end); at least one
+digit is required. The magnitude must fit `u64` before contextual checking.
+An immediately following integer type name is a suffix. `-` is a separate unary
+operator; the magnitude of a signed minimum literal is allowed under negation.
+
+Floating literals are decimal digit runs with a fractional part, an `e`/`E`
+exponent with optional sign, or an `f32`/`f64` suffix. A fractional point must be
+followed by a digit; exponents require a digit. Digit separators are ignored.
+Floating syntax cannot take an integer suffix. The default type is `f64`; the
+text is converted to finite binary64 and then to the contextual/suffixed float
+type; a literal that becomes infinite in that type must be rejected. Source spellings for infinity and NaN are not supplied. `true` and `false`
+are Boolean literals; integers do not implicitly convert to `bool`.
+
+String and byte literals accept `\n`, `\r`, `\t`, `\0`, `\\`, `\"`, `\'`, and
+`\xHH` (exactly two hexadecimal digits). Only strings additionally accept
+`\u{H...}` with one to six digits denoting a Unicode scalar value. A string's
+decoded bytes must be valid UTF-8. Byte literals/strings require ASCII source
+characters; `\xHH` can supply any byte. A `b'...'` literal must decode to exactly
+one byte. Literal text must not contain a physical CR or LF. Other escapes and
+unterminated literals are errors.
 
 ## 4. Types and values
 
@@ -304,11 +383,18 @@ exposes its variants. Matching may destructure payloads.
 ```dodo
 pub enum ParseError { Length, Digit }
 
-// Conceptual payload form from the design:
-// Invalid(byte: u8)
+enum Token { End, Byte(value: u8), Pair(u8, u8) }
 ```
 
-The conceptual payload example does not establish a complete payload grammar.
+**REP-TAG.** Variants may have no payload or a parenthesized ordered list of
+payload fields. Fields may be bare types, `name: Type`, or the historical
+`Type name`. Explicit discriminant expressions are rejected. Variants have
+zero-based consecutive `u32` tags in declaration order. `Option<T>` uses
+`none`/`none()` (tag false) and `some(value)` (tag true); `Result<T,E>` uses
+`ok(value)` (tag false) and `err(error)` (tag true). `ok()` constructs `void`
+success. Only the active variant's payload is a live value and participates in
+ownership and destruction. Invalid tags and invalid active payloads violate
+runtime validity. Section 16.2 fixes their storage structure.
 
 ### 4.7. Generics
 
@@ -328,7 +414,35 @@ names and declarations continue to use `Name<T>`.
 
 `some(value)` infers `Option<T>` from its payload when no expected type exists.
 `none`, `ok`, and `err` still need enough context to determine their full types.
-Generic constraints, variance, and separately compiled interfaces remain open.
+**GEN-INSTANCE.** Generic calls and types are instantiated with concrete types
+in the loaded program; each used instantiation must pass ordinary semantic
+checks. There are no generic constraints, variance annotations, subtyping between
+different instantiations, or separately compiled generic interfaces. Implementations
+may share generated code only when observable behavior is preserved. Expansion
+limits must be diagnosed and documented (ID-LIMIT).
+
+### 4.8. Scalar and view representations
+
+**REP-SCALAR.** Integers have exactly their named bit widths; signed integers
+use two's complement and unsigned integers use binary representation with no
+invalid bit patterns. `isize` and `usize` have the selected target's default
+data-pointer width, not the compiler host's width. A byte is eight bits.
+`bool` has values false and true, stored as one byte, respectively 0 and 1;
+other byte representations do not establish a valid Boolean value.
+`f32` and `f64` use IEEE 754 binary32 and binary64 encodings, including signed
+zero, infinities, and NaNs. Integer/float alignment and byte order are target
+properties (ID-TARGET).
+
+**REP-VIEW.** A checked reference or raw pointer occupies one default data-pointer
+slot. A slice or `&str` occupies an ordered pair `(data pointer, usize length)`
+with target struct padding/alignment. Slice length counts elements; string length
+counts UTF-8 bytes. `&str` indexing is rejected. Literal strings and byte strings
+have immutable storage lasting for the program. Their length excludes any bytes
+outside the literal, and no trailing NUL is guaranteed. Literal pooling and literal
+addresses, padding bytes, inactive payload bytes, and NaN payload/sign selection are
+unspecified; programs must not use them as value identity or serialization.
+Only the explicitly initialized bytes of a value may be read as initialized
+bytes. Copying an object does not guarantee preservation of padding.
 
 ## 5. Bindings and initialization
 
@@ -476,8 +590,11 @@ Separate struct fields may be borrowed independently. Potentially overlapping
 indexed accesses are rejected unless a checked operation, such as slice
 splitting, establishes disjointness.
 
-Partial moves are otherwise unspecified, except that moving fields out of a
-value with a custom `drop` method is forbidden.
+**OWN-SUBOBJECT.** Moving a non-copy field or indexed element as a standalone
+expression is rejected. Move the whole owner or use the destructuring patterns
+in section 11.3, which consume the owner and destroy uncaptured values. Those
+patterns must not move fields out of a value with a custom `drop` method.
+There is no general partially moved aggregate state in 0.1.
 
 ## 8. Borrowing and reference validity
 
@@ -541,7 +658,9 @@ fn drop(&mut self) {
 }
 ```
 
-The method runs before the fields are destroyed. It cannot return an error or be
+The method runs before the fields are destroyed. Struct fields and enum payload
+fields are destroyed in reverse declaration order; array elements are destroyed
+in decreasing index order. Only active tagged payloads are destroyed. It cannot return an error or be
 called directly. `core.drop(value)` consumes and destroys a value early. Moving
 fields out of a value with a custom `drop` method is forbidden.
 
@@ -569,8 +688,20 @@ raw pointers. An explicit dereference obtains a scalar value where needed.
 
 ### 10.2. Numeric conversion
 
-`as` performs an explicit numeric conversion, checked where needed. Named
-operations must express wrapping or truncation.
+**NUM-CAST.** `as` between integers must trap if the source value is outside the
+destination's range. It does not truncate bits, wrap, or saturate. Integer-to-float
+conversion rounds to the destination representation. Widening `f32` to `f64`
+preserves its numerical value. Narrowing `f64` to `f32` requires a finite source
+in `[-f32::MAX, f32::MAX]` (where MAX denotes the largest finite binary32 value),
+then rounds; NaN and infinity must trap on this narrowing conversion.
+
+Float-to-integer conversion first requires a finite source x in
+`[-2^(N-1), 2^(N-1))` for signed N-bit integers or `[0, 2^N)` for unsigned
+integers, and then truncates toward zero. The test is on x before truncation:
+`-0.5 as u8` traps, `255.75 as u8` is 255. Conversion failure in an evaluated
+constant expression is a compile-time error. Floating constant precision is
+implementation-defined (ID-FLOAT). Raw-pointer casts have the separate rules
+in section 14.2; Boolean and enum numeric casts are not supported.
 
 ```dodo
 weight := i as u32 + 1
@@ -579,21 +710,90 @@ total += weight * (value as u32)
 
 ### 10.3. Operators
 
-Examples establish arithmetic, comparison, Boolean conjunction, shifts, bitwise
-OR, assignment, and compound assignment. Operators are compiler-defined for
-primitive types and supported simple enums; user code cannot overload them.
+**EXPR-PREC.** Operators are compiler-defined and cannot be overloaded. This table
+lists precedence from weakest to strongest. Binary operators and repeated casts
+associate left; prefix operators nest right; postfix operations chain left.
 
-The complete operator set, precedence, associativity, evaluation order,
-short-circuit details, and mixed-width arithmetic rules are unspecified. Portable
-code must not rely on an unstated ordering rule.
+| Level | Operators |
+| --- | --- |
+| 1 | `\|\|` |
+| 2 | `&&` |
+| 3 | `\|` |
+| 4 | `^` |
+| 5 | `&` |
+| 6 | `==`, `!=` |
+| 7 | `<`, `<=`, `>`, `>=` |
+| 8 | `<<`, `>>` |
+| 9 | `+`, `-` |
+| 10 | `*`, `/`, `%` |
+| 11 | `as Type` |
+| 12 | Prefix `-`, `!`, `~`, `*`, `&`, `&mut` |
+| 13 | Calls, `.field`, `[index]`, subslices, postfix `?` |
+
+Parentheses override precedence. `=` and the compound assignments `+=`, `-=`,
+`*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=` are statements, not expressions.
+Ranges are restricted to loop, slice, and pattern syntax; they are not binary
+operators on general values. Comparison chains do not have special semantics:
+`a < b < c` means `(a < b) < c` and must type-check that way.
+
+Operands must have the same type after contextual literal inference. Already
+typed operands never undergo implicit width or signedness conversion. Arithmetic
+supports integers and floats; bitwise operators and shifts require integers.
+Boolean `&&`, `||`, and `!` require bool; equality supports bool, numeric values,
+raw pointers, and payload-free enums. Ordered comparisons support numbers only.
+No aggregate equality is implied.
+
+**EXPR-ORDER.** Evaluation is sequenced left to right: complete each operand's
+effects before starting the next. Calls evaluate the receiver (if any), then
+arguments in source order, then enter the callee. Array elements, enum payload
+arguments, and struct field initializers evaluate in their written order; struct
+declaration order does not reorder initializer effects. An index evaluates its
+collection before its index. A slice evaluates its collection, start, then end;
+a range evaluates start then end. Each is evaluated once. Repetition evaluates
+its initializer exactly once even for length zero (section 4.2).
+
+`a && b` evaluates b only when a is true; `a || b` evaluates b only when a is
+false. `if` evaluates only the selected branch. Match selection follows section
+11.3. `?`, return, break, continue, or a trap stops evaluation of later operands
+on that path. Temporaries already owning values must receive normal cleanup on
+non-trapping exits, in reverse creation order. Moving into a completed call or
+aggregate transfers that cleanup obligation. A returned/yielded value transfers
+before scope cleanup, including a void call's effects.
+
+**EXPR-ASSIGN.** `place = rhs` evaluates the destination address once (including
+its base and indices), then rhs, then destroys any initialized old owned value,
+then stores the replacement. If rhs exits early, the old value remains owned
+and receives ordinary exit cleanup. `place op= rhs` evaluates that address once,
+loads the old value, evaluates rhs, applies the checked operator to the captured
+old value and rhs, then stores. It does not re-evaluate the place or reload its
+old value after rhs. All steps remain subject to borrow checking.
+
+**NUM-ARITH.** Integer `+`, `-`, `*`, unary negation, and left shift must trap if
+the mathematical result is unrepresentable. Integer division truncates toward
+zero; remainder has the dividend's sign or is zero. Division and remainder both
+trap for a zero divisor and for signed minimum divided by -1. Shift counts must
+be nonnegative and less than the left operand's width. Right shift sign-extends
+signed values and zero-extends unsigned values. Bitwise operations act on the
+fixed-width representation. Evaluated constant failures must be diagnosed.
+There are no implicit wrapping operations or built-in named wrapping intrinsics
+in this edition; libraries may implement explicit wrapping functions.
+
+**NUM-FLOAT.** Floating arithmetic uses IEEE operations without reassociation or
+fast-math assumptions. Division by zero and overflow may produce infinities or
+NaNs; they do not invoke the integer traps. `%` is remainder using a quotient
+truncated toward zero. Equality considers the two signed zeros equal. With a NaN
+operand, `!=` is true and all other comparisons are false. Runtime operations
+and integer conversions assume the target's default floating environment;
+rounding, subnormal support, and constant evaluation are documented under
+ID-FLOAT. Foreign code must restore that environment before executing Dodo code.
 
 ## 11. Statements and control flow
 
 ### 11.1. Blocks and conditions
 
 A block is a brace-delimited sequence of statements. Control-flow constructs
-that take blocks require braces. Conditions have type `bool`; numeric truthiness
-is not specified. Parentheses are optional around conditions.
+that take blocks require braces. Conditions must have type `bool`; numeric
+truthiness is rejected. Parentheses are optional around conditions.
 
 ```dodo
 if condition {
@@ -795,10 +995,10 @@ unsafe {
 The following operations require unsafe context:
 
 - Raw-pointer dereference and arithmetic.
-- Raw-pointer conversion to a checked reference.
+- Construction of a checked reference using an owner-bound raw-pointer primitive.
 - Foreign function calls.
 - Unchecked memory access.
-- Inline assembly.
+- Target-specific unchecked operations where provided by an implementation.
 
 An unsafe block does not disable type checking, ordinary borrowing rules, or
 safe indexing checks.
@@ -822,25 +1022,135 @@ caller allowed by its public API, not merely one expected caller.
 
 ## 14. Raw-memory validity
 
-Raw-pointer operations must respect the pointer's originating allocation or
-object, including bounds, alignment, initialization, valid representations, and
-aliasing requirements. Converting a raw pointer to a checked reference also
-asserts validity for the borrow's checked lifetime and compatibility with every
-other access.
+### 14.1. Allocation identity and permitted access
 
-A cast or unsafe block does not make an invalid checked reference valid.
+**PTR-VALID.** An allocation is one contiguous storage region with an extent,
+alignment, and lifetime. A local object's storage, a static object, and a region
+returned by a foreign allocator each have an allocation identity. Fields and
+elements are subobjects of their enclosing allocation. Moving a value transfers
+ownership, not an assurance that its address stays fixed. Ending a local storage
+lifetime or freeing/reallocating foreign storage invalidates pointers into that
+storage; reuse of its numerical address does not revive its identity.
 
-The formal provenance model, allocation identity, integer-to-pointer semantics,
-exposed-address model, and foreign-allocation lifetime model remain unspecified.
+A usable raw pointer consists conceptually of an address and authority to access
+an originating allocation. The implementation need not store that authority in
+pointer bits or track it dynamically. Every nonempty access must stay within one
+live allocation, with permission to read or write all accessed bytes. Typed
+loads/stores require the type's alignment, except explicit unaligned operations.
+Reads require initialized, valid values (including tags and active payloads).
+Writes must establish a valid value before a later typed read. Creating checked
+references to uninitialized T is invalid; `MaybeUninit<T>` supplies separate
+storage without asserting T's initialization.
+
+Raw access may reinterpret initialized bytes as another type if extent,
+alignment, value validity, and ownership requirements all hold; there is no
+additional effective-type rule based on the original declaration's type.
+Bitwise copying an owning value must not create two owners that will both be
+used or destroyed. `ptr.read` does not tell the checker that the source was
+moved; `ptr.write` overwrites without destroying the previous value. Accounting
+for ownership and eventual destruction is the unsafe caller's obligation.
+
+**PTR-ALIAS.** Raw-pointer copying alone does not create an exclusive loan.
+However, every raw access must respect live checked loans: shared-borrowed
+storage must not be mutated or invalidated except through the specified atomic
+storage primitives of section 15.4, and exclusively borrowed storage
+must not be accessed through an independent route while that loan is live.
+Access through a pointer derived from the active exclusive reference is allowed
+with its permissions and reborrow restrictions. Raw pointer casts cannot upgrade
+read-only storage or a shared loan to writable storage. Concurrent conflicting
+non-atomic accesses are invalid; volatile is not a synchronization exception.
+These are runtime obligations even where the compiler accepts the unsafe code.
+
+### 14.2. Casts, addresses, and offsets
+
+**PTR-CAST.** A checked `&T` can safely convert to `*const T`, and `&mut T` to
+`*mut T` or `*const T`, with the same pointee type. `ptr.from_ref`, `ptr.from_mut`,
+`ptr.as_ptr`, and `ptr.as_mut_ptr` provide the corresponding reference/collection
+conversions. Obtaining a raw pointer neither extends storage lifetime nor keeps
+a checked loan alive by itself. A shared reference must not convert to `*mut T`.
+
+Raw-pointer-to-raw-pointer casts, integer-to-raw-pointer casts, and
+raw-pointer-to-integer casts require `unsafe`. They do not access memory or check
+the resulting address. On the integral-address profile in ID-PTR, integer/pointer
+casts preserve low bits, discard excess high bits, and zero-extend when widening,
+regardless of integer signedness. They are distinct from checked numeric casts.
+Zero converts to null; `ptr.is_null` tests null without accessing storage. Raw
+pointer equality compares addresses; it does not establish allocation identity.
+
+Converting an allocation-derived pointer to an integer exposes that allocation's
+address. Converting the unchanged `usize` address back while the allocation is
+live must recover a usable pointer with the original access permissions.
+Address arithmetic may recover another address in that same exposed allocation,
+provided it does not overflow and the entire accessed range remains valid.
+An arbitrary number alone grants no allocation or access permission. A foreign
+API may supply a live allocation and its address; its allocation/free contract
+determines the lifetime. Access to fixed hardware addresses has the separate
+target contract in section 15.2. Non-integral pointer targets must document an
+alternative address interface or reject these operations (ID-PTR).
+
+**PTR-OFFSET.** `ptr.offset(p, n)` takes `n: isize`, in units of the pointee's
+size, and preserves p's allocation and permissions. For allocation-derived p,
+both positions must lie in that allocation or one past its end; the signed byte
+displacement must fit `isize` and address calculation must not wrap. One-past
+pointers may be brought back inside but must not be used for a nonempty access.
+No dynamic bounds or overflow checks are required by this unsafe operation.
+
+### 14.3. Constructing checked views
+
+**PTR-VIEW.** Raw-pointer-to-checked-reference casts and `&*raw_pointer` must be
+rejected, including inside unsafe. The explicit unsafe operations
+`ptr.borrow(p, owner)`, `ptr.borrow_mut(p, owner)`,
+`ptr.borrow_slice(p, count, owner)`, and `ptr.borrow_slice_mut(p, count, owner)`
+are the supported bridge. The owner must be a checked reference or slice;
+mutable views require a mutable pointer and exclusive owner. The result retains
+the owner's complete checked dependencies, including inherited shared dependencies.
+It must not outlive or conflict with the owner. Pointer, count (if present),
+and owner evaluate in that order, including the owner's effects even though
+its address need not appear in the returned view.
+
+The unsafe caller must ensure that the owner keeps the complete referent alive
+and valid for the returned loan. The pointer need not be inside the owner's own
+representation: a box may anchor its separately allocated contents. Nonempty
+views must cover initialized elements in one live allocation; their byte extent
+must fit `isize`. Empty and zero-sized views still require a nonnull aligned
+pointer, even though no bytes need to be accessed. Element types recursively
+containing checked references or Results must be rejected, since this operation
+cannot reconstruct their hidden lifetime or handling obligations.
+
+The compiler enforces the owner loan and type restrictions, not the pointer/owner
+correspondence. A cast or unsafe block cannot make an invalid view valid.
+
+### 14.4. Byte transfers and destruction
+
+**PTR-BYTES.** `ptr.copy(src, dst, count)` copies count elements' bytes with
+overlap permitted, as if through temporary bytes. `ptr.copy_nonoverlapping`
+requires disjoint ranges. `ptr.write_bytes(dst, byte, count)` fills
+`count * size_of<T>()` bytes. That product must fit `usize`; nonempty ranges
+require appropriate read/write permission. These operations require only byte
+alignment. Zero-byte operations permit null pointers, including nonzero counts
+of zero-sized elements. They do not by themselves prove initialization or create
+independent ownership. Typed raw access/copies/fills of checked-borrow-carrying
+elements must be rejected. `ptr.drop_in_place` requires one live, aligned,
+initialized T, destroys it and its fields, and does not free its storage. It must
+reject checked-borrow-carrying or Result-containing T. The caller must prevent
+subsequent use or another destruction until reinitialization.
 
 ## 15. Core memory and hardware primitives
 
 ### 15.1. Pointers and memory
 
-`core.ptr` provides raw reads and writes, offsets, unaligned access, and
-explicitly unchecked operations. `core.mem` supplies at least `size_of`,
-`align_of`, `offset_of`, and `MaybeUninit<T>`. Exposing uninitialized storage as
-`T` is unsafe.
+**CORE-MEM.** `core.ptr` provides the operations specified in section 14, including
+ordinary, unaligned, and volatile read/write forms. `core.mem` provides layout
+queries, opaque storage, exchange, and UTF-8 views. The
+[implemented core call table](memory-and-ffi.md#implemented-core-calls) gives
+their normative signatures and type restrictions for this edition. Unknown
+intrinsic names must be rejected. `mem.uninit::<T>()` creates opaque
+`MaybeUninit<T>` storage; `mem.assume_init` is unsafe and consumes storage that
+the caller has fully initialized. `MaybeUninit<T>` must never implicitly destroy
+a T. `mem.replace` returns the old value without dropping it; `mem.swap` exchanges
+two disjoint initialized values. Both reject checked-borrow- or Result-containing
+types. `mem.str_bytes` preserves a string's borrow; unsafe `mem.str_from_utf8`
+requires valid UTF-8 and preserves the input slice's dependencies.
 
 Allocation is optional and explicit. Recoverable allocation failure returns
 `Result`.
@@ -855,9 +1165,11 @@ unsafe fn read32(address: usize) -> u32
 unsafe fn write32(address: usize, value: u32) -> void
 ```
 
-These operations address device memory directly without fabricating an ordinary
+**CORE-MMIO.** These operations address device memory directly without fabricating an ordinary
 mutable reference. Only access widths supported by the target are accepted.
-Unsupported widths must not silently become multiple narrower accesses.
+Unsupported widths must not silently become multiple narrower accesses. The
+0.1.1 profile accepts 8, 16, 32, and 64 bits up to the target pointer width;
+actual device legality is a platform precondition (ID-HW).
 
 Valid addresses, permissions, device side effects, and configuration are unsafe
 obligations of the caller.
@@ -895,45 +1207,111 @@ establish that property.
 
 ### 16.1. C ABI
 
-A C-ABI declaration uses syntax such as:
+**ABI-C.** A C-ABI declaration uses syntax such as:
 
 ```dodo
 unsafe extern "C" fn send(data: *const u8, length: usize) -> i32
 ```
 
-Correct C types and declarations for the target remain the binding author's
-responsibility.
+Only `extern "C"` is supported. A declaration may be a prototype without a body
+or a definition with a Dodo body. A call to either requires an explicit unsafe
+block, even without an `unsafe` declaration modifier. Parameters/results must
+be primitive integers, floats, bool, or raw pointers; `void` is permitted only as
+the result. Checked references, slices, arrays, structs (including `@repr(C)`),
+enums, Option, and Result by value are rejected. Variadic declarations are
+rejected. Use a raw pointer to pass compatible aggregate storage.
+
+The selected target's C calling convention determines parameter passing and
+returning. Fixed-width integers correspond to C integers of the same width and
+signedness, `bool` to C `_Bool`, `f32`/`f64` to target binary32/binary64 C floating
+types, and raw pointers to C data pointers. `usize`/`isize` use the pointer-width
+integer ABI, not necessarily C `unsigned long`/`long`. Bindings must supply exact
+target C declarations and satisfy the foreign function's validity requirements.
+Narrow argument/result extension must match the target ABI (ID-C).
+
+An external symbol is the final declared function name, independent of package
+aliases. Compatible repeated declarations refer to one symbol. Declarations with
+different lowered parameter/result types must fail before native linking;
+the binding author must also ensure consistent signedness and extension contracts
+where those types have the same storage width (ID-C). C entry points must not unwind
+through Dodo frames; Dodo has no exception unwinding contract.
 
 ### 16.2. Layout and attributes
 
-`@repr(C)` requests C-compatible struct layout. A closed compiler-defined set
-of attributes handles alignment, sections, exported symbols, and target
-interrupt entry points. Attributes are not programmable macros.
+**REP-LAYOUT.** Struct fields retain declaration order, with no field reordering
+or packing. The first field starts at offset zero; each subsequent field starts
+at the first offset after its predecessor satisfying its target ABI alignment.
+The struct's size is rounded up to its target aggregate alignment, which must
+accommodate all fields. Arrays store elements contiguously with stride
+`size_of<T>()`; `[0]T` has size zero and T's alignment. Empty structs have size
+zero; distinct zero-sized objects need not have distinct addresses.
 
-### 16.3. Assembly and barriers
+`@repr(C)` uses this same field-order algorithm with the target's C-compatible
+alignment and padding. It does not make a Dodo-only field type a C type or
+authorize aggregate-by-value C calls. `mem.size_of::<T>()`,
+`mem.align_of::<T>()`, and `mem.offset_of::<T>("field")` must report the selected
+target's ABI size, alignment, and direct accessible struct-field offset.
+Private-field access through `offset_of` is rejected. The special queries for
+`void` are size zero and alignment one. `MaybeUninit<T>` has T's size/alignment.
 
-Inline assembly and target memory barriers are target intrinsics. Unaligned
-data requires explicit unaligned operations; ordinary references with invalid
-alignment must not be created.
+Enum storage is the ordered aggregate `(u32 tag, payload_0, ..., payload_n)`;
+each payload slot is an ordered struct of that variant's fields, including an
+empty struct for a payload-free variant. Slots do not overlap. Result storage
+is `(bool is_error, T success, E error)`, using a one-byte placeholder for void
+success. Option storage is `(bool is_some, T payload)`. Each uses the struct
+alignment/padding algorithm. There are no niche optimizations in 0.1: for
+example, an Option of a reference includes an explicit presence tag. Inactive
+slots do not require valid values or own resources. These storage rules do not
+constitute a C enum or C union ABI. Target scalar and aggregate alignment remain
+implementation-defined (ID-TARGET).
 
-The complete attribute set and grammar, object-file symbol model, C type
-mapping, enum layout, padding, non-C field reordering, and interrupt ABI syntax
-are unspecified.
+The only accepted struct attributes are `@repr(C)`, `@unsafe_send`, and
+`@unsafe_sync`; thread contracts are described in the
+[thread reference](threads.md). Enum declarations support only `pub`. Unknown,
+duplicate, or misplaced attributes/modifiers must be rejected. Attributes are
+not programmable macros.
+
+### 16.3. Native ABI and runtime entry
+
+**ABI-NATIVE.** Dodo-to-Dodo calling convention, linkage, and mangling are
+implementation-defined (ID-NATIVE). They must preserve the source types,
+evaluation, ownership, and return-source contracts. No cross-version or
+independent-compilation native ABI compatibility is promised. Stable foreign
+boundaries must use ABI-C with compatible storage.
+
+**ABI-ENTRY.** Hosted executable emission requires a root, non-extern
+`fn main() -> i32` or `fn main() -> void` (including omitted void return type).
+It supplies a C `main` wrapper that calls that function exactly once; a void
+result becomes zero, an i32 result becomes the C exit result. An external symbol
+named `main` conflicts with the wrapper and must be rejected. A library may omit
+main; `check`, object, assembly, bitcode, and IR emission must not demand a hosted
+entry signature or insert this wrapper. Platform startup, process exit-status
+encoding, and environment initialization are implementation-defined (ID-RUNTIME).
+
+### 16.4. Assembly and barriers
+
+Inline assembly, user alignment/section/export attributes, custom interrupt ABI,
+general target barriers, and custom panic-handler syntax are outside 0.1 and
+must not be silently accepted as those features. Unaligned data requires explicit
+unaligned operations; ordinary references with invalid alignment must not be
+created. Device/interrupt/DMA libraries must supply appropriate platform contracts.
 
 ## 17. Traps and arithmetic failure
 
-Safe integer overflow, division by zero, invalid shifts, and out-of-bounds
+**TRAP.** Safe integer overflow, division by zero, invalid shifts, and out-of-bounds
 indexing trap in every build profile. Numeric `as` conversions are explicit
 and checked where needed. Wrapping and truncation require named operations.
 Bounds checks may be removed only when proven unnecessary.
 
-A freestanding target supplies entry and linker configuration and a
-non-returning panic handler. Abort does not unwind. The language guarantees
+A freestanding target supplies entry and linker configuration. A required trap
+must not return to the failing operation or continue execution as if it succeeded.
+Abort does not unwind. The language guarantees
 neither real-time deadlines nor hardware correctness.
 
-The concrete trap mechanism, panic-handler signature, diagnostic payload, and
-platform action, such as process termination or target reset, are target-specific
-and not fully specified.
+The trap instruction, diagnostic payload, and platform action are
+implementation-defined (ID-TRAP). The current implementation uses `llvm.trap`
+and supplies no custom panic-handler hook or reset driver. Compile-time constant
+failures receive diagnostics rather than an emitted runtime trap.
 
 ## 18. Diagnostics and implementation obligations
 
@@ -1091,16 +1469,16 @@ arbitrary read-modify-write operations or guarantee pulse timing.
 
 ## Appendix A. Partial grammar
 
-This EBNF-style summary normalizes syntax established by the design. It is
-intentionally partial: expressions, lexical productions, precedence, and some
-declaration modifiers remain incomplete. The summary is not a complete parser
-specification. In particular, the C-ABI prototype example in section 16 has no
-body, while the draft's general function production below ends in a block.
+This EBNF-style summary is a reading aid for the normative rules above, not a
+complete parser specification. Lexing is defined in section 3 and expression
+precedence and sequencing in section 10. Historical accepted forms are described
+in their corresponding sections. A function without `extern "C"` requires a body;
+an extern function may have a body or end as a prototype.
 
 ```text
 program       = package-decl, { import-decl | declaration } ;
 package-decl  = "package", identifier, newline ;
-import-decl   = "import", string-literal, newline ;
+import-decl   = "import", string-literal, [ "as", identifier ], newline ;
 
 declaration   = [ "pub" ],
                 ( function-decl | struct-decl | enum-decl )
@@ -1109,7 +1487,7 @@ const-decl    = "const", identifier, ":", type, "=", expression, newline ;
 
 function-decl = [ "unsafe" ], [ "extern", string-literal ],
                 "fn", identifier, [ type-params ], "(", [ parameters ], ")",
-                [ "->", type ], [ borrow-source ], block ;
+                [ "->", type ], [ borrow-source ], ( block | newline ) ;
 parameters    = parameter, { ",", parameter } ;
 parameter     = identifier, ":", type | "self" | "&", [ "mut" ], "self" ;
 borrow-source = "from", "(", ( "static" | identifier-list ), ")" ;
@@ -1172,7 +1550,7 @@ value-block   = "{", { statement }, expression, "}" ;
 
 ## Appendix B. Conformance checklist
 
-A compiler claiming Dodo 0.1 conformance should, at minimum:
+A compiler claiming Dodo 0.1 conformance must, at minimum:
 
 - Accept the specified declarations, functions, methods, control flow, and types.
 - Default omitted return types to void; accept final-expression and explicit returns.
@@ -1199,40 +1577,99 @@ A compiler claiming Dodo 0.1 conformance should, at minimum:
 
 These requirements alone do not constitute a proof of soundness.
 
-## Appendix C. Open specification items
+### B.1. Rule-to-test index
 
-These items remain open in 0.1. A future revision should settle them before
-independent implementations are expected to agree on output or diagnostics.
+`A` means acceptance, `R` required rejection, `E` execution at both `-O0` and
+`-O3`, and `T` acceptance plus inspection of emitted target IR. `T` establishes
+lowering properties, not execution on that target. Paths below are relative to
+the repository; names after `::` are Rust test functions, usable as Cargo test
+filters. Suite abbreviations refer to these files:
 
-1. **Lexing:** Source encoding, identifier classes, Unicode normalization,
-   whitespace, block comments, escapes, and complete literal grammars.
-2. **Expressions:** Complete operators, precedence, associativity, evaluation
-   order, short-circuit semantics, and compound-assignment desugaring.
-3. **Primitive representation:** Signed-integer representation, floating-point
-   model, Boolean representation, pointer-sized widths per target, and endianness.
-4. **Enums and Option:** All payload forms, discriminants, layout, niche
-   optimizations, and further optional-value operations.
-5. **Generics:** Constraints, inference beyond the local rules in section 4.7,
-   separate compilation, instantiation, variance, and code sharing.
-6. **Patterns:** Additional binding modes, constant range endpoints, and diagnostics
-   for redundant patterns; compiler complexity limits for exhaustiveness checking.
-7. **Pointers:** Provenance, integer conversion, foreign-allocation identity, and
-   the alias model governing unsafe raw access.
-8. **ABI and layout:** Non-C structs, enums, calling conventions beyond declared
-   C ABI, symbol naming, target attributes, and interrupt ABI.
-9. **Runtime integration:** Entry convention, panic handler, trap encoding,
-   startup, linker inputs, and hosted runtime interface.
-10. **Core library:** Exact signatures and semantics of pointers, memory,
-    atomics, allocation, slice splitting, barriers, and named primitives.
-11. **Packages:** File mapping, dependencies, aliases, cycles, initialization,
-    naming, and visibility across compilation units.
-12. **Diagnostics:** Required categories and machine-readable stability beyond
-    the borrow-diagnostic recommendations.
+- `spec`: [tests/specification.rs](https://github.com/Jotrorox/dodo/blob/main/tests/specification.rs)
+- `compiler`: [tests/compiler.rs](https://github.com/Jotrorox/dodo/blob/main/tests/compiler.rs)
+- `regressions`: [tests/regressions.rs](https://github.com/Jotrorox/dodo/blob/main/tests/regressions.rs)
+- `storage`: [tests/owned_storage.rs](https://github.com/Jotrorox/dodo/blob/main/tests/owned_storage.rs)
+- `core`: [tests/core_intrinsics.rs](https://github.com/Jotrorox/dodo/blob/main/tests/core_intrinsics.rs)
+- `packages`: [tests/stdlib_packages.rs](https://github.com/Jotrorox/dodo/blob/main/tests/stdlib_packages.rs)
+- `lexer`, `parser`, `sema`, `package`: the `tests` modules in `src/lexer.rs`,
+  `src/parser.rs`, `src/sema.rs`, and `src/package.rs` respectively.
 
-Other points explicitly left open in their relevant sections include partial
-moves, comment disambiguation, raw identifiers, and detailed declaration
-modifiers. An implementation may document choices for these gaps; such choices
-must be distinguished from requirements of this source specification.
+Each row is a conformance obligation, not merely a record of what happens to
+compile. Undefined executions (dangling access, invalid tags, mismatched foreign
+allocators, data races, or invalid pointer/owner correspondence) are deliberately
+not executed as tests expecting rejection or a trap. Their adjacent valid
+execution cases and enforced static boundaries are identified separately.
+
+| Rule or section | Acceptance, rejection, or execution evidence |
+| --- | --- |
+| PKG-UNIT | E `spec::directory_package_scope_aliases_and_constant_initialization`, `canonical_package_identity_and_symlink_enumeration` (Unix); R `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected`; A `package::root_directory_collects_only_immediate_dodo_files`. |
+| PKG-RESOLVE | R `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected`; A `packages::local_packages_can_import_stdlib_and_stdlib_dependencies_are_deduplicated`. |
+| PKG-NAMES | E/R `spec::directory_package_scope_aliases_and_constant_initialization`; A/R `packages::aliases_distinguish_same_named_packages_and_transitive_dependencies`; R/A `package::transitive_packages_require_a_direct_import`. |
+| PKG-CORE | A/R `packages::bundled_imports_cannot_be_shadowed_by_local_files_or_editor_overlays`, `unknown_and_malformed_stdlib_imports_are_rejected_without_local_fallback`, `local_packages_cannot_conflict_with_bundled_or_intrinsic_aliases`, `transitive_imports_do_not_grant_source_or_intrinsic_package_visibility`. |
+| PKG-VIS | E `compiler::directory_packages_import_public_types_fields_and_methods`; R `compiler::imports_reject_private_functions_fields_and_field_construction`; R `sema::public_api_cannot_expose_private_type`. |
+| PKG-INIT | E `spec::static_storage_has_no_implicit_initialization_or_destruction_hooks`; E/R `spec::directory_package_scope_aliases_and_constant_initialization`; E `compiler::constants_compose_and_define_array_types`; R `compiler::constant_cycles_width_and_expansion_limits_are_diagnosed`. |
+| LEX-TEXT, LEX-LITERAL, section 3.1 | E/R `spec::lexical_boundaries_and_literal_encodings`; A `lexer::numeric_literals_and_longest_operators`, `utf8_and_byte_escapes`, `comments_preserve_newlines_and_byte_spans`; R `lexer::malformed_source_returns_diagnostics`; A/R/E `tests/newline_continuation.rs`. |
+| EXPR-PREC | E `spec::evaluation_order_and_precedence`; A `parser::precedence_casts_and_postfix`; R `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors`. |
+| EXPR-ORDER | E `spec::evaluation_order_and_precedence`, `compiler::floats_casts_and_short_circuit_preserve_side_effects`, `inferred_arrays_and_repetition_evaluate_once_even_when_empty`, `range_bounds_are_captured_once_and_iteration_bindings_are_fresh`, `slice_source_and_bounds_evaluate_once_in_order`. |
+| EXPR-ORDER cleanup | E `regressions::propagation_drops_previously_evaluated_call_arguments`, `propagation_drops_moved_call_arguments_exactly_once`, `propagation_drops_initialized_struct_fields`, `propagation_drops_initialized_array_elements`, `propagation_drops_initialized_enum_payloads`, `returning_a_void_call_preserves_effects_and_cleanup`; E `compiler::value_expression_exits_cleanup_on_return_break_and_continue`. |
+| EXPR-ASSIGN | E `spec::assignment_captures_destination_and_old_value_before_rhs`; E `core::replacement_failure_preserves_original_and_drops_it_once`. |
+| REP-SCALAR, NUM-FLOAT | E `spec::scalar_representations_and_float_comparisons`; T `spec::target_profiles_publish_width_endianness_and_native_symbols`. |
+| REP-TAG, REP-VIEW, REP-LAYOUT | E `spec::aggregate_layout_tags_and_string_byte_lengths`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`; R `core::field_offsets_enforce_literal_direct_fields_and_package_privacy`. |
+| NUM-CAST, NUM-ARITH, TRAP | E `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`; E `compiler::arithmetic_and_index_traps_survive_optimization`, `invalid_subslice_bounds_trap_at_all_optimization_levels`; R `sema::constant_arithmetic_checked_before_codegen`. |
+| GEN-INSTANCE, section 4.7 | E `compiler::generic_arguments_infer_from_values_parameters_and_return_context`, `generic_struct_methods_keep_borrowed_returns`; R `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors`. |
+| OWN-SUBOBJECT, sections 7–9 | R `sema::destructuring_preserves_borrows_moves_and_custom_drop`; E `compiler::cleanup_reverses_order_and_does_not_double_drop_moves`, `cleanup_runs_on_overwrite_explicit_drop_break_and_continue`, `custom_destructor_runs_before_nested_fields`, `nested_patterns_drop_ignored_values_and_guard_failures_once`. |
+| PTR-VALID, PTR-OFFSET | E valid ranges/reinterpretation `spec::pointer_integer_round_trip_offsets_and_byte_access`, `scalar_representations_and_float_comparisons`; E foreign allocated storage `storage::simultaneous_boxes_destruction_failure_alignment_and_zst`. Invalid runtime provenance is an unsafe precondition violation, not a required rejection. |
+| PTR-CAST | E `spec::pointer_integer_round_trip_offsets_and_byte_access`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`, `sema::raw_pointer_borrow_cannot_invent_a_checked_lifetime`. |
+| PTR-ALIAS, PTR-VIEW | E `spec::pointer_integer_round_trip_offsets_and_byte_access`, `owner_view_arguments_keep_their_effects_and_order`; R `storage::owned_views_are_unsafe_to_construct_and_require_matching_access`, `views_cannot_escape_owner_or_erase_underlying_dependencies`, `live_views_prevent_replacement_removal_and_destruction`, `opaque_views_reject_nested_reference_and_result_payloads`; E/R `storage::shared_dependencies_do_not_become_exclusive_when_mutating_owned_fields`. These reject checked conflicts; they do not dynamically validate raw accesses. |
+| PTR-BYTES, CORE-MEM | E `spec::pointer_integer_round_trip_offsets_and_byte_access`, `core::core_storage_pointers_and_owned_exchange`, `opaque_storage_moves_without_dropping_contents`; R `core::pointer_and_storage_errors_are_diagnostics`. |
+| CORE-MMIO, sections 15.2–15.3 | T `compiler::gpio_emits_volatile_accesses_without_host_execution`; R `sema::mmio_checked`; board address/width legality remains an unsafe precondition. |
+| ABI-C | E `spec::c_scalar_results_and_struct_pointer_layout_interoperate`; R `spec::incompatible_lowered_foreign_declarations_fail_before_linking`; E `regressions::foreign_narrow_integer_arguments_follow_the_c_abi`, `compiler::hello_uses_native_c_abi`, `imported_foreign_declarations_keep_their_c_symbol_name`, `repeated_foreign_declarations_across_packages_share_a_c_symbol`; E/R `spec::hosted_entry_signatures_and_c_definitions`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`. |
+| ABI-NATIVE, ABI-ENTRY | T `spec::target_profiles_publish_width_endianness_and_native_symbols`; A/R/E `spec::hosted_entry_signatures_and_c_definitions`; E `compiler::cli_run_preserves_program_exit_status`; T `compiler::emits_llvm_ir_bitcode_assembly_and_object_files`. |
+| Bindings, returns, patterns, sections 5–6 and 11–12 | E `compiler::immutable_runtime_bindings_preserve_mutable_references_and_function_tails`, `recursive_patterns_ranges_guards_and_conditional_bindings_execute`, `alternative_patterns_retry_guards_in_order`; R `compiler::new_binding_and_pattern_forms_reject_invalid_programs`, `rejects_unhandled_results_and_incompatible_propagation`; A/R/E `tests/reference_iteration.rs`. |
+| Borrow contracts and unsafe boundary, sections 8, 13 | E `compiler::borrowed_return_contracts_and_static_storage`, `references_reborrow_and_disjoint_fields`; R `compiler::rejects_conflicting_borrows_and_moves`, `rejects_escaping_or_ambiguous_borrows`, `unsafe_function_body_still_needs_an_explicit_block`. |
+| Diagnostics, section 18 | A/R `tests/diagnostics.rs`, `tests/lsp.rs`; R `package::diagnostic_labels_resolve_each_file_independently`. |
+
+Run the complete repository evidence with `cargo test --locked --all-targets`.
+The focused new contracts run with `cargo test --locked --test specification`.
+Native execution evidence is for the host tested; target emission alone does
+not establish another target's ABI or hardware behavior.
+
+## Appendix C. Implementation-defined behavior and excluded features
+
+### C.1. Required implementation profile
+
+An implementation must publish choices for the IDs below, including the compiler
+version and target. Changing an implementation-defined choice must not silently
+change the source-level rules above. The following is the compiler 0.1.1 profile;
+tests constrain the documented choice, not every possible conforming choice.
+
+| Choice | Compiler 0.1.1 definition and evidence |
+| --- | --- |
+| ID-TARGET: widths, endianness, alignment, object format | Uses the selected LLVM 22 target triple and its data layout. Default is the compiler host triple. `x86_64-unknown-linux-gnu` has 64-bit pointers and little-endian storage; `i686-unknown-linux-gnu` has 32-bit pointers and little-endian storage; `powerpc64-unknown-linux-gnu` has 64-bit pointers and big-endian storage. Scalar/aggregate alignment is the target data layout's ABI alignment, observable with core layout queries; emitted IR must include the triple/data layout. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `aggregate_layout_tags_and_string_byte_lengths` (E). |
+| ID-FLOAT: floating environment and constant precision | Runtime uses LLVM non-fast floating operations with default round-to-nearest, ties-to-even. Native tests assume gradual underflow and masked floating exceptions; no source facility changes rounding/exception modes. Constant scalar evaluation computes floating operations in host binary64 and rounds to the expression's type at each node; integer-to-f32 constants pass through binary64. This can introduce an extra rounding compared with runtime conversion. Decimal literal conversion also passes through binary64. An explicit constant floating cast to f32 must be finite and in range even if its operand is already f32. NaN payload/sign is unspecified. Evidence: `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap` (E); `spec::constant_float_precision_is_documented_separately_from_runtime` (E/R). |
+| ID-PTR: address representation | The integral default-address-space profile uses LLVM data pointers and integer casts, with zero as null; pointer offsets use element-scaled address computation. No hidden runtime provenance table is maintained. Non-default address spaces and capability/non-integral pointer interfaces are outside this profile; LLVM emission alone does not establish their conformance. Evidence: `spec::pointer_integer_round_trip_offsets_and_byte_access` (E), `unsafe_pointer_conversions_and_unsupported_abi_are_rejected` (R). |
+| ID-C: target C argument/result passing | Uses LLVM C calling convention. On x86 SysV, i8/i16 use sign extension and u8/u16/bool use zero extension on declarations and calls; Windows uses its target convention without those SysV attributes. Other scalar and pointer passing follows the selected target. Duplicate extern declarations are compared by lowered LLVM function type, which does not distinguish signed/unsigned integers of the same width; the author must keep those contracts consistent. Evidence: `spec::c_scalar_results_and_struct_pointer_layout_interoperate` (E), `incompatible_lowered_foreign_declarations_fail_before_linking` (R), `regressions::foreign_narrow_integer_arguments_follow_the_c_abi` (E), `compiler::repeated_foreign_declarations_across_packages_share_a_c_symbol` (E). |
+| ID-NATIVE: Dodo ABI and symbols | Parameters/results lower directly to the scalar/aggregate LLVM types in sections 4.8 and 16.2, using LLVM's default calling convention without C aggregate classification. Symbols are `dodo.<root-package>.<qualified-name>`. Root declarations have no package prefix in qualified-name; imported packages use their name when unique and generated `__dodo_package_...` prefixes when necessary. Public functions and root main have external linkage; other Dodo functions have internal linkage. Mangling of generic instances and collision prefixes is compiler-internal and may depend on the loaded graph. Link native objects only with a matching compiler/target configuration. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `compiler::generic_struct_methods_keep_borrowed_returns` (E). |
+| ID-FS: filesystem identity | Uses the host filesystem's path canonicalization and case sensitivity; directory entries are sorted using canonical host paths. Symlink entries are excluded from directory source enumeration, but an explicit input/import path may resolve through a symlink. No registry, network resolver, or lockfile participates. Evidence: `spec::canonical_package_identity_and_symlink_enumeration` (E, Unix), `package::root_directory_collects_only_immediate_dodo_files` (A), `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected` (R). |
+| ID-LIB: bundled platform selection | Imports are embedded in the compiler. `std/{platform,fs,process,env,thread,sync,net,tls,web}/native` selects `linux` for x86_64 Linux GNU and `windows` for x86_64 Windows GNU/MSVC. An explicit mismatching adapter or unsupported target is rejected. Portable packages need no hosted adapter. Evidence: `tests/platform_library.rs` and `packages::portable_package_dependencies_are_independent_and_reserved` (A/R). |
+| ID-RUNTIME: startup and linking | Hosted builds use a native C linker driver. Importing std/env initializes its argument runtime from the C main arguments before source main; other library facilities initialize through explicit calls. Raw object/IR emission supplies no startup. Freestanding startup, linker scripts, system libraries, and OS exit-status encoding are supplied by the target/toolchain. Evidence: `spec::hosted_entry_signatures_and_c_definitions` (A/R/E), `tests/env_library.rs` (E), `compiler::emits_llvm_ir_bitcode_assembly_and_object_files` (T). |
+| ID-TRAP: failure mechanism | Emits `llvm.trap` followed by unreachable control flow. Instruction, signal/exception, and exit encoding are target-specific; no diagnostic payload, cleanup, reset, or custom panic hook is guaranteed. Evidence: `compiler::arithmetic_and_index_traps_survive_optimization`, `spec::checked_float_cast_boundaries_trap` (E). |
+| ID-HW: device access and atomics | MMIO widths are restricted as in CORE-MMIO and use volatile loads/stores; board address legality is an unsafe precondition. Native integer atomic capabilities/orderings are target-restricted; unsupported operations are diagnosed, with no implicit libatomic fallback. Evidence: `compiler::gpio_emits_volatile_accesses_without_host_execution` (T), `tests/thread_library.rs::atomic_ordering_and_target_capabilities_are_checked` (R/T). |
+| ID-LIMIT: resource limits | Parser nesting: 64 levels. Constant dependency depth: 128; expansion work: 200,000 nodes. Array count must fit target usize and u32; nonzero repeated constants are limited to 1,000,000 elements. Generic instantiation: 256 specializations. Pattern expansion: 4096 alternatives; exhaustiveness work has a 131,072-unit budget (charged for matrix rows and type columns); exhaustion must diagnose, not assume coverage. Evidence: `compiler::constant_cycles_width_and_expansion_limits_are_diagnosed` (R), `sema::excessive_pattern_expansion_reports_a_diagnostic` (R), `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors` (R). |
+| ID-DIAG: diagnostic presentation | Errors identify a source location where available. Text wording, ordering, number of follow-on errors, and CLI/LSP presentation are not a stable machine-readable language ABI. Editor transport is separately documented. Evidence: `tests/diagnostics.rs`, `tests/lsp.rs`, `package::diagnostic_labels_resolve_each_file_independently` (A/R). |
+
+### C.2. Features excluded from this edition
+
+Trait constraints, specialization, user lifetime/variance syntax, standalone
+partial field moves, a package registry, package initializers, re-exports,
+variadic/C aggregate-by-value calls, inline assembly, user section/alignment/export
+attributes, interrupt ABI declarations, and panic-handler registration are not
+part of 0.1. The compiler must reject syntax presented as these features rather
+than assign it an undocumented meaning. General checked mutable slice splitting,
+DMA abstractions, and interrupt-safe allocators require future library/compiler
+work. The named rules above replace the former open questions about fundamental
+execution, representation, provenance, ABI, and packages; they do not assert a
+formal proof of memory safety or complete platform support.
 
 ## Appendix D. Informative references
 

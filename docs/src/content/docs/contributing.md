@@ -123,9 +123,10 @@ python3 scripts/render_spec.py --check
 
 The renderer uses only Python's standard library and produces deterministic files
 in `docs/public/downloads/`. It supports the Markdown forms used by the
-specification; keep the frontmatter title on one line. The specification describes
-the intended language, so retain its open design items and distinguish them from
-implemented compiler features.
+specification; keep the frontmatter title on one line. When changing a language
+rule, update its acceptance, rejection, or execution evidence in Appendix B.
+Keep the implementation-defined choices and excluded features in Appendix C
+distinct from the normative source-language requirements.
 
 ## Publish
 

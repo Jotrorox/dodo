@@ -7,8 +7,9 @@ order: 200
 
 Dodo 0.1.1 implements a hosted compiler, local packages, checked borrowing,
 and target object emission. This guide describes compiler behavior. The
-[0.1 language specification](language-spec-0.1.md) describes the wider design;
-its open questions remain open.
+[0.1 language specification](language-spec-0.1.md) defines the retained language
+rules and connects them to conformance tests. Its Appendix C records the
+implementation-defined choices for this compiler and the excluded features.
 
 Compiler releases and language versions are separate: this compiler is 0.1.1,
 and the language specification remains 0.1. The implemented September 2026
@@ -51,7 +52,8 @@ covers monomorphization and omitted type arguments.
 ## Layout, entry points, and foreign calls
 
 [Memory and foreign calls](memory-and-ffi.md) describes layout and entry points.
-The native function ABI and enum layout are unstable. The supported C ABI accepts
+The native function ABI is implementation-defined. Enum storage uses the explicit
+tag and separate payload slots specified for 0.1, with target ABI padding. The supported C ABI accepts
 primitive and raw-pointer arguments and results; aggregate-by-value calls and
 variadics are not supported.
 

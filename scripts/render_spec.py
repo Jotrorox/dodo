@@ -145,7 +145,10 @@ def text_document(parsed: list[Block]) -> bytes:
 
 def table_rows(lines: list[str]) -> list[list[str]]:
     return [
-        [plain(cell.strip()) for cell in line.strip("|").split("|")]
+        [
+            plain(cell.strip()).replace(r"\|", "|")
+            for cell in re.split(r"(?<!\\)\|", line.strip("|"))
+        ]
         for line in lines
         if not re.fullmatch(r"[|\s:-]+", line)
     ]
@@ -174,6 +177,17 @@ def wrap(text: str, available: float, size: float, font: str = "F1") -> list[str
     result: list[str] = []
     current = ""
     for word in text.split():
+        # Conformance test names and source links must fit inside table columns.
+        if width(word, size, font) > available:
+            if current:
+                result.append(current)
+            current = ""
+            for character in word:
+                if current and width(current + character, size, font) > available:
+                    result.append(current)
+                    current = ""
+                current += character
+            continue
         candidate = f"{current} {word}" if current else word
         if current and width(candidate, size, font) > available:
             result.append(current)

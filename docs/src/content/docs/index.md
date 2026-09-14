@@ -29,8 +29,8 @@ and [target selection](command-line.md#targets-and-linking).
 
 ## Look up language behavior
 
-- [Language specification](language-spec-0.1.md): the full design, syntax, types,
-  ownership rules, worked examples, and open design questions.
+- [Language specification](language-spec-0.1.md): normative syntax, types,
+  ownership rules, worked examples, conformance tests, and implementation-defined choices.
 - [Implementation decisions and limits](implementation.md): the behavior of the
   current compiler, including differences from the broader design.
 - [Syntax and expressions](implementation-syntax.md), [ownership and borrowing](ownership.md),

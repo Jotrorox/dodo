@@ -6,9 +6,11 @@ order: 250
 ---
 
 This review and test-planning checklist comes from the
-[language specification](language-spec-0.1.md). It describes design requirements,
-including features that have not been implemented. For supported behavior in
-compiler 0.1.1, start with [compiler support and limits](implementation.md).
+[language specification](language-spec-0.1.md). The specification's Appendix B
+maps the retained rules to acceptance, rejection, and execution tests; Appendix C
+records implementation-defined choices and excluded features. This checklist also
+contains future library/platform goals; those do not expand the specified 0.1
+compiler surface. For compiler 0.1.1, start with [compiler support and limits](implementation.md).
 
 ## How to use this checklist
 
@@ -79,10 +81,12 @@ reborrows, aggregate fields, calls, and destructors. Passing examples and LLVM
 verification alone do not establish borrow-checker soundness. DMA and interrupt
 contracts also require a sound platform/core-library design.
 
-## Open design decisions
+## Implementation-defined choices and future work
 
-The [open specification items](language-spec-0.1.md#appendix-c-open-specification-items)
-must remain visible. Implementations need documented choices for lexing,
-operator precedence/evaluation, further generic inference, patterns, entry conventions,
-package resolution, layout, and exact core APIs. An implementation choice does
-not retroactively become a rule of the supplied design.
+The [implementation profile](language-spec-0.1.md#appendix-c-implementation-defined-behavior-and-excluded-features)
+must remain explicit. Evaluation order, representation structure, pointer
+contracts, package resolution, and the supported C interface are normative rules.
+Target alignments, native ABI details, floating constant precision, and runtime
+integration have documented implementation-defined choices. Future work includes
+interrupt/DMA facilities and the excluded syntax listed in Appendix C; successful
+target emission alone does not establish platform conformance.

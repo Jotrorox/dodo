@@ -6,7 +6,10 @@ order: 230
 ---
 
 This page covers the implemented memory layout and low-level interfaces in
-Dodo 0.1.1. See the [compiler overview](implementation.md#remaining-design-surface)
+Dodo 0.1.1. The normative allocation, cast, and aliasing contracts are in
+[specification section 14](language-spec-0.1.md#14-raw-memory-validity); layout and
+ABI rules are in [section 16](language-spec-0.1.md#16-foreign-interfaces-layout-and-target-attributes).
+See the [compiler overview](implementation.md#remaining-design-surface)
 for planned facilities that are not yet available.
 
 ## Struct layout and the C ABI
@@ -21,10 +24,13 @@ the external symbol; Dodo functions use `dodo.<root-package>.<qualified-name>`.
 
 ## Enum, Result, and Option layout
 
-Enum storage is an explicit tag plus storage for each variant's payload. Result
-storage is an error tag plus success/error slots; Option storage is a presence
-tag plus a payload slot. There are no niche optimizations or stable enum ABI.
-`void` Result success uses an internal placeholder slot.
+Enum storage is a zero-based u32 tag plus separate storage for every variant's
+payload, in declaration order. Result storage is a bool error tag (false for ok,
+true for err) plus success/error slots; Option storage is a bool presence tag
+plus a payload slot. These are the 0.1 storage rules, with target ABI padding
+and no niche optimizations; they do not define a C enum ABI. `void` Result
+success uses a one-byte placeholder slot. Inactive payloads and padding are not
+guaranteed to contain initialized bytes.
 
 ## Entry points and linking
 
@@ -34,6 +40,11 @@ driver links executables; the driver is executed directly with argument vectors.
 Custom targets require caller-supplied startup and linker configuration.
 
 ## Implemented core calls
+
+This table supplies the normative core call signatures and restrictions referenced
+by the 14 September edition of the 0.1 specification. Calls with an owner argument
+also obey its checked dependency rules. Other library calls are versioned in their
+respective references.
 
 | Call | Return | Requirements |
 | --- | --- | --- |
