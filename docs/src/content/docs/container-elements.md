@@ -25,7 +25,7 @@ The starting points are [collections](collections.md),
 | Implementation | Relevant behavior |
 | --- | --- |
 | `src/sema.rs`: `Context::carries_borrow`, `contains_result` | Recursively inspect owned arrays, Options, structs and enum alternatives. References keep sources alive but do not own their referent's Result obligation. Raw pointers and `MaybeUninit` do not expose their payload's facts. |
-| Ownership state used by `src/sema.rs`: `Variable`, `Value`, `Place`, `merge_states` | Variables have dependency loans and one `pending_result` bit. Values carry loans, not per-element handling state. A place has `direct: Option<usize>` for a whole local binding. Joins union loans and OR pending bits. |
+| `Variable`, `Value`, `Place` and `merge_states` in `src/sema/ownership.rs` | Variables have dependency loans and one `pending_result` bit. Values carry loans, not per-element handling state. A place has `direct: Option<usize>` for a whole local binding. Joins union loans and OR pending bits. |
 | `Checker::call` in `src/sema.rs` | `from(...)` contributes argument dependencies to a borrowed return. It does not describe changes to an argument's stored dependencies or obligations. |
 | Assignment checking in `src/sema.rs` | Whole bindings replace their dependency set and reset their pending bit. Borrow-containing writes through references are rejected. Direct owned field updates conservatively retain old reference dependencies. This milestone rejects non-whole-binding Result writes as well. |
 | `mark_matched_result`, `bind_pattern` | Matching can discharge a named aggregate's pending bit; nested Result pattern bindings acquire obligations. This is not an indexed storage ledger or an interprocedural handling effect. |
