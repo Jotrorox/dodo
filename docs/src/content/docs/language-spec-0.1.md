@@ -1272,16 +1272,26 @@ target's ABI size, alignment, and direct accessible struct-field offset.
 Private-field access through `offset_of` is rejected. The special queries for
 `void` are size zero and alignment one. `MaybeUninit<T>` has T's size/alignment.
 
-Enum storage is the ordered aggregate `(u32 tag, payload_0, ..., payload_n)`;
-each payload slot is an ordered struct of that variant's fields, including an
-empty struct for a payload-free variant. Slots do not overlap. Result storage
-is `(bool is_error, T success, E error)`, using a one-byte placeholder for void
-success. Option storage is `(bool is_some, T payload)`. Each uses the struct
-alignment/padding algorithm. There are no niche optimizations in 0.1: for
-example, an Option of a reference includes an explicit presence tag. Inactive
-slots do not require valid values or own resources. These storage rules do not
-constitute a C enum or C union ABI. Target scalar and aggregate alignment remain
-implementation-defined (ID-TARGET).
+Enum storage is the ordered aggregate `(u32 tag, shared_payload)`. Each variant's
+payload is an ordered struct of its fields, including an empty struct for a
+payload-free variant. All alternatives start at the same offset within
+`shared_payload`. Its alignment is the maximum alternative alignment (at least
+one), and its size is the maximum alternative size rounded up to that alignment.
+Result storage is `(bool is_error, shared_payload)`, with overlapping alternatives
+T and E under the same rules; a `void` alternative has size zero and alignment
+one. The enclosing tag/payload aggregate uses the struct alignment/padding
+algorithm, so padding may precede the payload and follow the aggregate. Option
+storage remains `(bool is_some, T payload)` under that algorithm.
+
+For example, on Cortex-M0, an enum with two `[256]u8` alternatives has size 260
+and alignment 4, and `Result<[256]u8, [256]u8>` has size 257 and alignment 1.
+This shared representation replaces the earlier separate variant slots and void
+placeholder; objects compiled with the earlier layout must be rebuilt together.
+The existing tag values are unchanged (REP-TAG). There are no niche optimizations
+in 0.1: an Option of a reference includes an explicit presence tag. Only the active
+alternative requires a valid value or owns resources; padding and inactive bytes
+are unspecified. These storage rules do not constitute a C enum or C union ABI.
+Target scalar and aggregate alignment remain implementation-defined (ID-TARGET).
 
 The only accepted struct attributes are `@repr(C)`, `@unsafe_send`, and
 `@unsafe_sync`; thread contracts are described in the
@@ -1640,7 +1650,7 @@ execution cases and enforced static boundaries are identified separately.
 | EXPR-ORDER cleanup | E `regressions::propagation_drops_previously_evaluated_call_arguments`, `propagation_drops_moved_call_arguments_exactly_once`, `propagation_drops_initialized_struct_fields`, `propagation_drops_initialized_array_elements`, `propagation_drops_initialized_enum_payloads`, `returning_a_void_call_preserves_effects_and_cleanup`; E `compiler::value_expression_exits_cleanup_on_return_break_and_continue`. |
 | EXPR-ASSIGN | E `spec::assignment_captures_destination_and_old_value_before_rhs`; E `core::replacement_failure_preserves_original_and_drops_it_once`. |
 | REP-SCALAR, NUM-FLOAT | E `spec::scalar_representations_and_float_comparisons`; T `spec::target_profiles_publish_width_endianness_and_native_symbols`. |
-| REP-TAG, REP-VIEW, REP-LAYOUT | E `spec::aggregate_layout_tags_and_string_byte_lengths`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`; R `core::field_offsets_enforce_literal_direct_fields_and_package_privacy`. |
+| REP-TAG, REP-VIEW, REP-LAYOUT | E `spec::aggregate_layout_tags_and_string_byte_lengths`, `shared_payload_values_survive_moves_borrows_and_propagation`, `shared_payload_cleanup_drops_only_the_active_alternative`; T `spec::shared_payload_layout_on_native_and_embedded_targets`; E `debugging::gdb_reads_shared_enum_and_result_payloads`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`; R `core::field_offsets_enforce_literal_direct_fields_and_package_privacy`. |
 | NUM-CAST, NUM-ARITH, TRAP | E `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`; E `compiler::arithmetic_and_index_traps_survive_optimization`, `invalid_subslice_bounds_trap_at_all_optimization_levels`; R `sema::constant_arithmetic_checked_before_codegen`; E/R/T `core::wrapping_arithmetic_boundaries_inference_and_evaluation_order`, `wrapping_arithmetic_rejects_invalid_arguments`, `wrapping_arithmetic_emits_plain_operations_at_each_target_width`. |
 | GEN-INSTANCE, section 4.7 | E `compiler::generic_arguments_infer_from_values_parameters_and_return_context`, `generic_struct_methods_keep_borrowed_returns`; R `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors`. |
 | OWN-SUBOBJECT, sections 7–9 | R `sema::destructuring_preserves_borrows_moves_and_custom_drop`; E `compiler::cleanup_reverses_order_and_does_not_double_drop_moves`, `cleanup_runs_on_overwrite_explicit_drop_break_and_continue`, `custom_destructor_runs_before_nested_fields`, `nested_patterns_drop_ignored_values_and_guard_failures_once`. |

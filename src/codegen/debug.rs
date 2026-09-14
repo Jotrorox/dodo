@@ -352,6 +352,39 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .create_typedef(array, &name, file, 0, file.as_debug_info_scope(), align)
                     .as_type())
             }
+            Type::Result(ok, err) => {
+                let span = Span::default();
+                let llvm = llvm.into_struct_type();
+                let storage = llvm.get_field_type_at_index(1).unwrap().into_struct_type();
+                let mut alternatives = vec![];
+                for (field, ty) in [("value", ok), ("error", err)] {
+                    if **ty != Type::Void {
+                        alternatives.push((field.into(), self.ty(ty)?, self.debug_type(ty)?, span));
+                    }
+                }
+                let payload = self.debug_aggregate(
+                    &format!("{name}.payload"),
+                    span,
+                    storage,
+                    alternatives,
+                    true,
+                );
+                let tag = self.debug_type(&Type::Bool)?;
+                Ok(self.debug_struct(
+                    &name,
+                    span,
+                    llvm,
+                    vec![
+                        (
+                            "is_error".into(),
+                            self.context.bool_type().into(),
+                            tag,
+                            span,
+                        ),
+                        ("payload".into(), storage.into(), payload, span),
+                    ],
+                ))
+            }
             _ => {
                 let (span, fields): (Span, Vec<(String, Type, Span)>) = match ty {
                     Type::Str => (
@@ -377,14 +410,6 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         vec![
                             ("is_some".into(), Type::Bool, Span::default()),
                             ("value".into(), *inner.clone(), Span::default()),
-                        ],
-                    ),
-                    Type::Result(ok, err) => (
-                        Span::default(),
-                        vec![
-                            ("is_error".into(), Type::Bool, Span::default()),
-                            ("value".into(), *ok.clone(), Span::default()),
-                            ("error".into(), *err.clone(), Span::default()),
                         ],
                     ),
                     Type::Named(name) => {
@@ -417,6 +442,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         llvm: StructType<'ctx>,
         fields: Vec<(String, BasicTypeEnum<'ctx>, DIType<'ctx>, Span)>,
     ) -> DIType<'ctx> {
+        self.debug_aggregate(name, span, llvm, fields, false)
+    }
+    fn debug_aggregate(
+        &self,
+        name: &str,
+        span: Span,
+        llvm: StructType<'ctx>,
+        fields: Vec<(String, BasicTypeEnum<'ctx>, DIType<'ctx>, Span)>,
+        union: bool,
+    ) -> DIType<'ctx> {
         let debug = self.debug.as_ref().unwrap();
         let (file, line, _) = self.debug_file(span);
         let scope = file.as_debug_info_scope();
@@ -434,13 +469,34 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         line,
                         self.data.get_abi_size(&ty) * 8,
                         self.data.get_abi_alignment(&ty) * 8,
-                        self.data.offset_of_element(&llvm, i as u32).unwrap() * 8,
+                        if union {
+                            0
+                        } else {
+                            self.data.offset_of_element(&llvm, i as u32).unwrap() * 8
+                        },
                         DIFlags::PUBLIC,
                         dtype,
                     )
                     .as_type()
             })
             .collect();
+        if union {
+            return debug
+                .builder
+                .create_union_type(
+                    scope,
+                    name,
+                    file,
+                    line,
+                    self.data.get_abi_size(&llvm) * 8,
+                    self.data.get_abi_alignment(&llvm) * 8,
+                    DIFlags::ZERO,
+                    &members,
+                    0,
+                    "",
+                )
+                .as_type();
+        }
         debug
             .builder
             .create_struct_type(
@@ -493,11 +549,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             )
             .as_type();
         let mut fields = vec![("tag".into(), self.context.i32_type().into(), tag, decl.span)];
-        for (i, variant) in decl.variants.iter().enumerate() {
-            let layout = llvm
-                .get_field_type_at_index(i as u32 + 1)
-                .unwrap()
-                .into_struct_type();
+        let mut alternatives = vec![];
+        for variant in &decl.variants {
+            let layout = self.variant_ty(&variant.fields)?;
             let mut members = vec![];
             for f in &variant.fields {
                 members.push((
@@ -513,8 +567,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 layout,
                 members,
             );
-            fields.push((variant.name.clone(), layout.into(), dtype, variant.span));
+            alternatives.push((variant.name.clone(), layout.into(), dtype, variant.span));
         }
+        let storage = llvm.get_field_type_at_index(1).unwrap().into_struct_type();
+        let payload = self.debug_aggregate(
+            &format!("{name}.payload"),
+            decl.span,
+            storage,
+            alternatives,
+            true,
+        );
+        fields.push(("payload".into(), storage.into(), payload, decl.span));
         Ok(self.debug_struct(name, decl.span, llvm, fields))
     }
 }

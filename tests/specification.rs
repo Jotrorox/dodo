@@ -261,11 +261,11 @@ fn main() -> i32 {
     if mem.size_of::<&[u8]>() != mem.size_of::<&str>() { return 9 }
     if mem.size_of::<&i32>() != mem.size_of::<*mut i32>() { return 10 }
     if mem.size_of::<Option<u32>>() != 8 || mem.size_of::<u16!u32>() != 8 { return 11 }
-    if mem.size_of::<void!u8>() != 3 || mem.size_of::<State>() != 12 { return 12 }
+    if mem.size_of::<void!u8>() != 2 || mem.size_of::<State>() != 8 { return 12 }
     state := State.Word(42u32)
     present := some(9u32)
     absent: Option<u32> = none
-    // Read only active tags, never padding or inactive payload slots.
+    // Read only active tags, never padding or inactive payload bytes.
     unsafe {
         if ptr.read(ptr.from_ref(&state) as *const u32) != 2u32 { return 13 }
         if ptr.read(ptr.from_ref(&present) as *const u8) != 1u8 { return 14 }
@@ -283,6 +283,177 @@ fn main() -> i32 {
 }
 "#,
         b"",
+    );
+}
+
+#[test]
+fn shared_payload_layout_on_native_and_embedded_targets() {
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "layout.dodo",
+        r#"package shared_layout
+import "core/mem"
+struct Container { result: Later!Empty, nested: Option<Choice<Later>> }
+enum Choice<T> { First(T), Second(T) }
+enum Large { First([256]u8), Second([256]u8) }
+enum Mixed { Bytes([17]u8), Aligned(u64), Empty }
+enum Zero { Empty, Aligned([0]u64) }
+enum Plain { First, Second }
+enum Later { Value(u32), Empty }
+struct Empty {}
+struct Node { next: *const Node, value: Container }
+pub fn layout() -> u32 {
+    if mem.size_of::<Large>() != 260 || mem.align_of::<Large>() != 4 { return 1 }
+    if mem.size_of::<[256]u8![256]u8>() != 257 { return 2 }
+    if mem.align_of::<[256]u8![256]u8>() != 1 { return 3 }
+    alignment := mem.align_of::<u64>()
+    payload_size := (17usize + alignment - 1) / alignment * alignment
+    if mem.size_of::<Mixed>() != alignment + payload_size { return 4 }
+    if mem.align_of::<Mixed>() != alignment { return 5 }
+    if mem.size_of::<[17]u8!u64>() != alignment + payload_size { return 6 }
+    if mem.size_of::<u64![17]u8>() != alignment + payload_size { return 7 }
+    if mem.align_of::<[17]u8!u64>() != alignment { return 8 }
+    if mem.size_of::<Plain>() != 4 || mem.size_of::<Zero>() != alignment { return 9 }
+    if mem.align_of::<Zero>() != alignment { return 10 }
+    if mem.size_of::<void!Empty>() != 1 || mem.size_of::<Empty!Empty>() != 1 { return 11 }
+    if mem.size_of::<void!u8>() != 2 || mem.size_of::<void!u64>() != 8 + alignment { return 12 }
+    if mem.size_of::<Choice<[256]u8>>() != 260 { return 13 }
+    if mem.size_of::<Container>() != 28 || mem.align_of::<Node>() < 4 { return 14 }
+    0
+}
+"#,
+    );
+    for target in [
+        "thumbv6m-none-eabi",
+        "x86_64-unknown-linux-gnu",
+        "i686-unknown-linux-gnu",
+        "powerpc64-unknown-linux-gnu",
+    ] {
+        let path = workspace.0.join("layout.ll");
+        let mut command =
+            workspace.compiler(&["build", "-O3", "--emit", "llvm-ir", "--target", target]);
+        if target == "thumbv6m-none-eabi" {
+            command.args(["--cpu", "cortex-m0"]);
+        }
+        success(command.arg(&source).arg("-o").arg(&path).output().unwrap());
+        let ir = fs::read_to_string(path).unwrap();
+        assert!(
+            ir.contains("ret i32 0"),
+            "layout mismatch on {target}: {ir}"
+        );
+    }
+}
+
+#[test]
+fn shared_payload_values_survive_moves_borrows_and_propagation() {
+    native(
+        r#"package shared_values
+import "core/mem"
+import "core/ptr"
+enum Value { Padded(u8, u64), Bytes([17]u8), Pointer(*const u64), Flag(bool), Empty }
+fn identity<T>(value: T) -> T { value }
+fn attempt(fail: bool) -> u8![17]u8 {
+    if fail { return err([0xabu8; 17]) }
+    ok(42u8)
+}
+fn propagate(fail: bool) -> u64![17]u8 { ok(attempt(fail)? as u64) }
+fn unit(fail: bool) -> void!u8 {
+    if fail { return err(7u8) }
+    ok()
+}
+fn propagate_unit(fail: bool) -> u64!u8 { unit(fail)?; ok(42u64) }
+fn shrink(fail: bool) -> void!u8 { propagate_unit(fail)?; ok() }
+fn main() -> i32 {
+    bytes := identity(Value.Bytes([0xabu8; 17]))
+    match &mut bytes {
+        Value.Bytes(data) => { data[16] = 0xcdu8 },
+        _ => { return 1 },
+    }
+    match identity(bytes) {
+        Value.Bytes(data) => {
+            for i in 0usize..16usize { if data[i] != 0xabu8 { return 2 } }
+            if data[16] != 0xcdu8 { return 3 }
+        },
+        _ => { return 4 },
+    }
+    padded := identity(Value.Padded(0xefu8, 0x123456789abcdef0u64))
+    match &padded {
+        Value.Padded(first, second) => {
+            if *first != 0xefu8 || *second != 0x123456789abcdef0u64 { return 5 }
+            base := unsafe { ptr.from_ref(&padded) as usize }
+            start := unsafe { ptr.from_ref(first) as usize }
+            if start - base != mem.align_of::<u64>() { return 6 }
+        },
+        _ => { return 7 },
+    }
+    number := 42u64
+    pointer := unsafe { ptr.from_ref(&number) }
+    match identity(Value.Pointer(pointer)) {
+        Value.Pointer(p) => { if unsafe { ptr.read(p) } != 42u64 { return 8 } },
+        _ => { return 9 },
+    }
+    match identity(Value.Flag(true)) { Value.Flag(true) => {}, _ => { return 10 } }
+    match identity(Value.Empty) { Value.Empty => {}, _ => { return 11 } }
+    cases := [false, true]
+    for item in cases {
+        fail := *item
+        match identity(propagate(fail)) {
+            ok(value) => { if fail || value != 42u64 { return 12 } },
+            err(data) => {
+                if !fail { return 13 }
+                for byte in data { if *byte != 0xabu8 { return 14 } }
+            },
+        }
+        match propagate_unit(fail) {
+            ok(value) => { if fail || value != 42u64 { return 15 } },
+            err(value) => { if !fail || value != 7u8 { return 16 } },
+        }
+        match shrink(fail) {
+            ok() => { if fail { return 20 } },
+            err(value) => { if !fail || value != 7u8 { return 21 } },
+        }
+    }
+    result: u64!u8 = err(9u8)
+    match &mut result { ok(_) => { return 17 }, err(value) => { *value = 11u8 } }
+    match identity(result) { ok(_) => { return 18 }, err(value) => { if value != 11u8 { return 19 } } }
+    0
+}
+"#,
+        b"",
+    );
+}
+
+#[test]
+fn shared_payload_cleanup_drops_only_the_active_alternative() {
+    native(
+        r#"package shared_cleanup
+unsafe extern "C" fn putchar(ch: i32) -> i32
+struct Owned { ch: i32
+    fn drop(&mut self) { unsafe { putchar(self.ch) } }
+}
+enum Value { One(Owned), Two(Owned, Owned), Empty }
+fn failure() -> u8!Owned { err(Owned{ch: 70}) }
+fn propagate() -> u64!Owned {
+    value := Value.Two(Owned{ch: 68}, Owned{ch: 69})
+    ok(failure()? as u64)
+}
+fn main() {
+    value := Value.One(Owned{ch: 65})
+    value = Value.Two(Owned{ch: 66}, Owned{ch: 67})
+    core.drop(value)
+    match propagate() { ok(_) => {}, err(error) => { core.drop(error) } }
+    {
+        success: Owned!Owned = ok(Owned{ch: 71})
+        match &success { ok(_) => {}, err(_) => {} }
+    }
+    {
+        error: Owned!Owned = err(Owned{ch: 72})
+        match &error { ok(_) => {}, err(_) => {} }
+    }
+    core.drop(Value.Empty)
+}
+"#,
+        b"ACBEDFGH",
     );
 }
 

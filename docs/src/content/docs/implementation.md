@@ -56,7 +56,8 @@ covers monomorphization and omitted type arguments.
 
 [Memory and foreign calls](memory-and-ffi.md) describes layout and entry points.
 The native function ABI is implementation-defined. Enum storage uses the explicit
-tag and separate payload slots specified for 0.1, with target ABI padding. The supported C ABI accepts
+tag and shared payload storage specified for 0.1, with target ABI padding. Result
+success and error alternatives also share storage. The supported C ABI accepts
 primitive and raw-pointer arguments and results; aggregate-by-value calls and
 variadics are not supported.
 
