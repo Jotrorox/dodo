@@ -31,7 +31,7 @@ class ReleasePrerequisiteTests(unittest.TestCase):
             input="void dodo_archive_fixture(void) {}", text=True, check=True,
             capture_output=True,
         )
-        for library in ["z", "zstd", "stdc++", "ffi", "c", "m", "z3"]:
+        for library in ["z", "zstd", "stdc++", "ffi", "c", "m", "extra"]:
             self.archive(self.libraries / f"lib{library}.a")
         self.executable("rustc", "#!/bin/sh\necho 'host: x86_64-unknown-linux-gnu'\n")
         self.executable(
@@ -81,10 +81,10 @@ class ReleasePrerequisiteTests(unittest.TestCase):
         self.assertIn(f"native={archive_directory}", json.loads(self.flags_file.read_text()))
 
     def test_named_library_resolves_from_library_path(self):
-        self.assert_cargo_reached(self.run_preflight("-lz3"), self.libraries)
+        self.assert_cargo_reached(self.run_preflight("-lextra"), self.libraries)
 
     def test_absolute_shared_library_uses_static_search_path(self):
-        for filename in ["libz3.so", "libz3.so.4.8"]:
+        for filename in ["libextra.so", "libextra.so.1.2"]:
             with self.subTest(filename=filename):
                 result = self.run_preflight(str(self.directory / "shared" / filename))
                 self.assert_cargo_reached(result, self.libraries)

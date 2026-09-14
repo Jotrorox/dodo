@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use the official LLVM 22.1.8 Linux archive for release builds, removing the
+  static Z3 source build and cache. Verify the toolchain has no Z3 dependency.
 - Add `dodo test` with recursive discovery, `@test` and `test_` functions,
   companion test files, assertions, filtering, ignored tests, captured output,
   timeouts, and isolated native execution. Report assertion values and source

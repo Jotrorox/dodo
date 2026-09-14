@@ -25,12 +25,12 @@ def main() -> None:
     parser.add_argument("--target", choices=("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"),
                         default="x86_64-unknown-linux-gnu")
     parser.add_argument("--llvm-prefix", type=Path, default=os.environ.get("LLVM_SYS_221_PREFIX"),
-                        help="Windows LLVM installation, including its license notices")
+                        help="LLVM installation, including its license notices")
     parser.add_argument("--runner", help="Run the Windows compiler with Wine when packaging on Linux")
     args = parser.parse_args()
     windows = args.target == "x86_64-pc-windows-msvc"
-    if windows and not args.llvm_prefix:
-        parser.error("Windows packaging requires --llvm-prefix or LLVM_SYS_221_PREFIX")
+    if not args.llvm_prefix:
+        parser.error("packaging requires --llvm-prefix or LLVM_SYS_221_PREFIX")
     if args.runner and not windows:
         parser.error("--runner is only supported for Windows packaging")
 
@@ -84,13 +84,12 @@ def main() -> None:
         shutil.copytree(rust_docs / "licenses", notices / "rust/licenses")
         shutil.copy2(rust_docs / "COPYRIGHT-library.html", notices / "rust/COPYRIGHT-library.html")
 
+        shutil.copy2(args.llvm_prefix / "LICENSE.txt", notices / "LLVM-LICENSE.txt")
         if windows:
-            llvm_notices = args.llvm_prefix / "LICENSE.txt"
-            shutil.copy2(llvm_notices, notices / "LLVM-LICENSE.txt")
             shutil.copy2(args.llvm_prefix / "libxml2-Copyright", notices / "libxml2-Copyright")
         else:
             # These files describe the native libraries installed by the Ubuntu CI job.
-            system_packages = ("llvm-22-dev", "zlib1g-dev", "libzstd-dev", "libffi-dev", "libz3-dev")
+            system_packages = ("zlib1g-dev", "libzstd-dev", "libxml2-dev", "libffi-dev")
             for dependency in system_packages:
                 copyright_file = Path("/usr/share/doc") / dependency / "copyright"
                 shutil.copy2(copyright_file, notices / f"{dependency}-copyright")

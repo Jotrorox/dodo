@@ -49,8 +49,9 @@ cargo build --locked --release
 cargo install --locked --path .
 ```
 
-The exact signed-repository setup used by CI is in
-[CI workflow](https://github.com/Jotrorox/dodo/blob/main/.github/workflows/ci.yml). If LLVM is installed elsewhere, set
+The Ubuntu packages are suitable for ordinary Cargo builds. CI uses the
+[official prebuilt LLVM archive](#fully-static-linux-compiler) for releases,
+so the compiler does not depend on Z3. If LLVM is installed elsewhere, set
 `LLVM_SYS_221_PREFIX` to its installation prefix containing `bin/llvm-config`.
 Ordinary Cargo builds can still link LLVM's smaller support libraries (such as
 zlib, zstd, and the C++ library) dynamically. Use the [self-contained Linux recipe](#self-contained-linux-release) to
@@ -80,10 +81,11 @@ For the self-contained Linux recipe below, run
 
 ## Self-contained Linux release
 
-On an x86-64 Ubuntu 24.04 build machine with the packages above, run:
+On an x86-64 Ubuntu 24.04 build machine, install the
+[release toolchain below](#fully-static-linux-compiler), then run:
 
 ```sh
-export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
+export LLVM_SYS_221_PREFIX="$PWD/target/llvm-linux"
 bash scripts/build-release.sh
 install -Dm755 target/x86_64-unknown-linux-gnu/release/dodo "$HOME/.local/bin/dodo"
 ```
@@ -159,22 +161,28 @@ Install static archives for the C and math runtimes, the C++ standard library,
 zlib, zstd, libffi, and any additional libraries listed by
 `llvm-config --link-static --system-libs`.
 
-Ubuntu 24.04's development packages above provide most of these archives.
-LLVM packages with Z3 support also need a static Z3 library, which Ubuntu's
-`libz3-dev` package does not include. Build the pinned Z3 version with the
-repository helper, then add its archive directory to the library search path:
+CI uses the official LLVM 22.1.8 Linux x86-64 archive, which has Z3 disabled.
+On Ubuntu 24.04, install its prerequisites and the same toolchain:
 
 ```sh
-sudo apt-get install cmake ninja-build curl
-bash scripts/build-static-z3.sh
-export LIBRARY_PATH="$PWD/target/static-deps/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+sudo apt-get install build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev python3 curl xz-utils
+export LLVM_SYS_221_PREFIX="$PWD/target/llvm-linux"
+python3 scripts/install-linux-llvm.py
+export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH"
 ```
 
-The helper downloads Z3 4.8.12 from a fixed upstream commit, checks its SHA-256
-checksum, and installs the static library, headers, and license under
-`target/static-deps/`. It builds with two parallel jobs by default; set
-`CMAKE_BUILD_PARALLEL_LEVEL` to change this. CI uses the same helper.
-LLVM builds with libxml2 support also need `libxml2-dev`.
+The installer verifies pinned SHA-256 checksums and extracts LLVM's static
+libraries, headers, required tools, and license. The download is about 1.9 GB;
+CI caches the extracted installation. To reuse a downloaded archive, pass
+`--archive /path/to/LLVM-22.1.8-Linux-X64.tar.xz`. No LLVM or Z3 source build is
+needed.
+
+Ubuntu's `llvm-22-dev` package enables Z3 and cannot use this fully static recipe
+without an additional static Z3 library. Use the official archive above or an
+LLVM build configured with
+[`-DLLVM_ENABLE_Z3_SOLVER=OFF`](https://llvm.org/docs/CMake.html#llvm-enable-z3-solver).
+This is an LLVM build option, not a Cargo setting. The release script checks all
+libraries reported by `llvm-config`; it does not ignore missing dependencies.
 
 On Fedora, additionally install `glibc-static`, `libstdc++-static`,
 `zlib-ng-compat-static`, `libzstd-static`, and `libxml2-static` if LLVM uses
@@ -184,7 +192,7 @@ Archives in custom locations can be made available through `LIBRARY_PATH`.
 On a native x86-64 GNU/Linux build host, use:
 
 ```sh
-export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22 # Fedora: /usr/lib64/llvm22
+# Keep LLVM_SYS_221_PREFIX set to the selected LLVM installation.
 bash scripts/build-release.sh release-small-static
 # Binary: target/x86_64-unknown-linux-gnu/release-small-static/dodo
 ```
