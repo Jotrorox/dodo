@@ -508,7 +508,7 @@ fn range(text: &str, span: Span) -> Value {
 
 #[cfg(all(test, unix))]
 fn file_path(uri: &str) -> Option<PathBuf> {
-    crate::lsp::uri_path(&uri.parse().ok()?).ok()
+    crate::lsp::uri_path(uri).ok()
 }
 
 #[cfg(test)]
@@ -536,7 +536,10 @@ pub(crate) fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Vec<u
     let mut headers = 0;
     loop {
         let mut header = String::new();
-        if reader.read_line(&mut header)? == 0 {
+        // Bound the read itself, including a peer that never sends a newline.
+        if std::io::Read::take(&mut *reader, (8192 - headers + 1) as u64).read_line(&mut header)?
+            == 0
+        {
             return if headers == 0 {
                 Ok(None)
             } else {
@@ -556,16 +559,24 @@ pub(crate) fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Vec<u
         if header == "\r\n" || header == "\n" {
             break;
         }
-        if let Some((name, value)) = header.split_once(':')
-            && name.eq_ignore_ascii_case("Content-Length")
-        {
+        let (name, value) = header
+            .split_once(':')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid LSP header"))?;
+        if name.eq_ignore_ascii_case("Content-Length") {
             if length.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "duplicate Content-Length",
                 ));
             }
-            length = Some(value.trim().parse::<usize>().map_err(|_| {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Content-Length",
+                ));
+            }
+            length = Some(value.parse::<usize>().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")
             })?);
         }
@@ -822,6 +833,90 @@ mod tests {
         );
         assert!(read_message(&mut &b"Content-Length: 4\r\n\r\n{}"[..]).is_err());
         assert!(read_message(&mut &b"Content-Length: 0\r\nContent-Length: 0\r\n\r\n"[..]).is_err());
+    }
+
+    #[test]
+    fn framing_handles_fragmented_and_concatenated_messages_and_extension_headers() {
+        use std::io::BufReader;
+        // Independently encoded fixtures: body length is bytes, not characters.
+        let frames = concat!(
+            "content-length: 6\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\nX-Editor: test\r\n\r\n\"😀\"",
+            "Content-Length: 2\n\n{}",
+            "Content-Length: 0\r\n\r\n",
+        );
+        let mut reader = BufReader::with_capacity(1, frames.as_bytes());
+        assert_eq!(
+            read_message(&mut reader).unwrap().unwrap(),
+            "\"😀\"".as_bytes()
+        );
+        assert_eq!(read_message(&mut reader).unwrap().unwrap(), b"{}");
+        assert_eq!(read_message(&mut reader).unwrap().unwrap(), b"");
+        assert!(read_message(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn framing_rejects_bad_lengths_and_bounds_header_reads_before_allocating() {
+        for frame in [
+            "\r\n",
+            "Content-Type: application/json\r\n\r\n",
+            "not a header\r\n\r\n",
+            "Content-Length: \r\n\r\n",
+            "Content-Length: -1\r\n\r\n",
+            "Content-Length: +2\r\n\r\n{}",
+            "Content-Length: 1.5\r\n\r\n",
+            "Content-Length: 18446744073709551616\r\n\r\n",
+            "Content-Length: 16777217\r\n\r\n",
+            "Content-Length: 2\r\ncontent-length: 2\r\n\r\n{}",
+        ] {
+            assert_eq!(
+                read_message(&mut frame.as_bytes()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{frame:?}"
+            );
+        }
+        for frame in [
+            "Content-Length: 2",
+            "Content-Length: 2\r\n",
+            "Content-Length: 2\r\n\r\n{",
+        ] {
+            assert_eq!(
+                read_message(&mut frame.as_bytes()).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof,
+                "{frame:?}"
+            );
+        }
+        let mut reader = io::Cursor::new(vec![b'a'; 32 * 1024]);
+        assert_eq!(
+            read_message(&mut reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(reader.position(), 8193);
+    }
+
+    #[test]
+    fn framing_propagates_write_and_flush_failures() {
+        struct FailingWriter {
+            fail_write: bool,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.fail_write {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for fail_write in [true, false] {
+            let mut writer = FailingWriter { fail_write };
+            assert_eq!(
+                write_message(&mut writer, &json!({})).unwrap_err().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
     }
 
     #[test]

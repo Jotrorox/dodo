@@ -4,13 +4,10 @@
 //! by another document. Editor recovery retains independent valid syntax/bodies.
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::{codegen, editor, file_uri, format, package, sema};
-use lsp_server::{ErrorCode, Message, Notification, Request, Response};
-use lsp_types::{
-    CompletionParams, DiagnosticRelatedInformation, DiagnosticSeverity,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFormattingParams, InitializeParams, Location, Position,
-    PublishDiagnosticsParams, Range, ReferenceParams, RenameParams, SignatureHelpParams,
-    TextDocumentPositionParams, Uri,
+mod protocol;
+use protocol::{
+    DocumentChange, ErrorCode, InitializeParams, Location, Message, Notification, OpenDocument,
+    Position, PublishDiagnosticsParams, QueryParams, Range, Request, Response,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,7 +24,7 @@ enum State {
 }
 
 struct Document {
-    uri: Uri,
+    uri: String,
     path: Option<PathBuf>,
     text: String,
     version: i32,
@@ -38,7 +35,7 @@ struct Document {
 struct Server {
     state: State,
     documents: BTreeMap<String, Document>,
-    published: BTreeMap<String, Uri>,
+    published: BTreeMap<String, String>,
     check_packages: bool,
     target: String,
     pointer_bits: u32,
@@ -57,21 +54,16 @@ pub fn run(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<i32>
                 continue;
             }
         };
-        if !value.is_object() || value["jsonrpc"] != "2.0" {
-            write_error(output, Value::Null, -32600, "Invalid Request")?;
-            continue;
-        }
-        let id = value.get("id").cloned().unwrap_or(Value::Null);
-        let message = match serde_json::from_value::<Message>(value) {
+        let message = match Message::parse(value) {
             Ok(message) => message,
-            Err(_) => {
+            Err(id) => {
                 write_error(output, id, -32600, "Invalid Request")?;
                 continue;
             }
         };
         match message {
             Message::Request(request) => {
-                Message::Response(server.request(request)).write(output)?;
+                server.request(request).write(output)?;
             }
             Message::Notification(notification) if notification.method == "exit" => break,
             Message::Notification(notification) if server.state == State::Running => {
@@ -108,20 +100,12 @@ impl Server {
             if self.state != State::Uninitialized {
                 return error(ErrorCode::InvalidRequest, "server is already initialized");
             }
-            let mut raw_params = request.params.clone();
-            if let Some(params) = raw_params.as_object_mut() {
-                params.entry("capabilities").or_insert_with(|| json!({}));
-            }
-            let params = match serde_json::from_value::<InitializeParams>(raw_params) {
+            let params = match InitializeParams::parse(&request.params) {
                 Ok(params) => params,
                 Err(_) => return error(ErrorCode::InvalidParams, "invalid initialize parameters"),
             };
             let mut check_packages = false;
-            match params
-                .initialization_options
-                .as_ref()
-                .and_then(|options| options.get("checkMode"))
-            {
+            match params.initialization_options.get("checkMode") {
                 None | Some(Value::Null) => (),
                 Some(Value::String(mode)) if mode == "file" => (),
                 Some(Value::String(mode)) if mode == "package" => check_packages = true,
@@ -132,11 +116,7 @@ impl Server {
                     );
                 }
             }
-            let target = match params
-                .initialization_options
-                .as_ref()
-                .and_then(|o| o.get("target"))
-            {
+            let target = match params.initialization_options.get("target") {
                 None | Some(Value::Null) => inkwell::targets::TargetMachine::get_default_triple()
                     .as_str()
                     .to_string_lossy()
@@ -166,13 +146,7 @@ impl Server {
             self.check_packages = check_packages;
             self.target = target;
             self.pointer_bits = bits;
-            self.document_changes = params
-                .capabilities
-                .workspace
-                .as_ref()
-                .and_then(|w| w.workspace_edit.as_ref())
-                .and_then(|e| e.document_changes)
-                .unwrap_or(false);
+            self.document_changes = params.document_changes;
             self.state = State::Running;
             return Response::new_ok(
                 request.id,
@@ -207,12 +181,10 @@ impl Server {
             return Response::new_ok(request.id, Value::Null);
         }
         if request.method == "textDocument/formatting" {
-            let Ok(params) =
-                serde_json::from_value::<DocumentFormattingParams>(request.params.clone())
-            else {
+            let Ok(uri) = protocol::formatting_uri(&request.params) else {
                 return error(ErrorCode::InvalidParams, "invalid formatting parameters");
             };
-            let Some(document) = self.documents.get(params.text_document.uri.as_str()) else {
+            let Some(document) = self.documents.get(uri.as_str()) else {
                 return Response::new_ok(request.id, Value::Null);
             };
             return match format::format_source(&document.text) {
@@ -221,45 +193,31 @@ impl Server {
                     if formatted == document.text {
                         json!([])
                     } else {
-                        json!([{"range": Range::new(Position::new(0, 0), position(&document.text, document.text.len())), "newText": formatted}])
+                        json!([{"range": Range::new(Position::new(0, 0), position(&document.text, document.text.len())).to_json(), "newText": formatted}])
                     },
                 ),
                 Err(diagnostic) => error(ErrorCode::RequestFailed, &diagnostic.message),
             };
         }
-        let mut include_declaration = false;
-        let mut new_name = None;
-        let params = match request.method.as_str() {
-            "textDocument/hover" | "textDocument/definition" | "textDocument/prepareRename" => {
-                serde_json::from_value::<TextDocumentPositionParams>(request.params.clone())
-            }
-            "textDocument/completion" => {
-                serde_json::from_value::<CompletionParams>(request.params.clone())
-                    .map(|p| p.text_document_position)
-            }
-            "textDocument/signatureHelp" => {
-                serde_json::from_value::<SignatureHelpParams>(request.params.clone())
-                    .map(|p| p.text_document_position_params)
-            }
-            "textDocument/references" => {
-                serde_json::from_value::<ReferenceParams>(request.params.clone()).map(|p| {
-                    include_declaration = p.context.include_declaration;
-                    p.text_document_position
-                })
-            }
-            "textDocument/rename" => serde_json::from_value::<RenameParams>(request.params.clone())
-                .map(|p| {
-                    new_name = Some(p.new_name);
-                    p.text_document_position
-                }),
-            _ => return error(ErrorCode::MethodNotFound, "method is not supported"),
-        };
-        let Ok(params) = params else {
+        if !matches!(
+            request.method.as_str(),
+            "textDocument/hover"
+                | "textDocument/definition"
+                | "textDocument/prepareRename"
+                | "textDocument/completion"
+                | "textDocument/signatureHelp"
+                | "textDocument/references"
+                | "textDocument/rename"
+        ) {
+            return error(ErrorCode::MethodNotFound, "method is not supported");
+        }
+        let Ok(params) = QueryParams::parse(&request.params, &request.method) else {
             return error(
                 ErrorCode::InvalidParams,
                 "invalid document position parameters",
             );
         };
+        let new_name = params.new_name;
         if let Some(name) = &new_name
             && !valid_name(name)
         {
@@ -268,7 +226,7 @@ impl Server {
                 "newName must be a non-reserved Dodo identifier",
             );
         }
-        let Some(document) = self.documents.get(params.text_document.uri.as_str()) else {
+        let Some(document) = self.documents.get(params.uri.as_str()) else {
             return Response::new_ok(request.id, Value::Null);
         };
         let Some(analysis) = &document.analysis else {
@@ -297,11 +255,14 @@ impl Server {
                 match request.method.as_str() {
                     "textDocument/definition" => self
                         .location(&analysis.index, symbol.span)
-                        .map(|location| json!(location)),
+                        .map(|location| location.to_json()),
                     "textDocument/prepareRename" => analysis.index.prepare_rename(symbol, span),
-                    "textDocument/references" => {
-                        Some(json!(self.references(&symbol.key, include_declaration)))
-                    }
+                    "textDocument/references" => Some(json!(
+                        self.references(&symbol.key, params.include_declaration)
+                            .iter()
+                            .map(Location::to_json)
+                            .collect::<Vec<_>>()
+                    )),
                     "textDocument/rename" => {
                         let name = new_name.as_ref().unwrap();
                         if !self
@@ -321,7 +282,7 @@ impl Server {
                             changes
                                 .entry(location.uri.as_str().into())
                                 .or_default()
-                                .push(json!({"range":location.range,"newText":name}));
+                                .push(json!({"range":location.range.to_json(),"newText":name}));
                         }
                         if self.document_changes {
                             Some(
@@ -377,10 +338,7 @@ impl Server {
     fn notification(&mut self, notification: Notification) -> Result<bool, String> {
         match notification.method.as_str() {
             "textDocument/didOpen" => {
-                let params = notification
-                    .extract::<DidOpenTextDocumentParams>("textDocument/didOpen")
-                    .map_err(|error| error.to_string())?;
-                let document = params.text_document;
+                let document = OpenDocument::parse(&notification.params)?;
                 let path = if document.uri.as_str().starts_with("untitled:") {
                     None
                 } else {
@@ -398,54 +356,29 @@ impl Server {
                 );
             }
             "textDocument/didChange" => {
-                let params = notification
-                    .extract::<DidChangeTextDocumentParams>("textDocument/didChange")
-                    .map_err(|error| error.to_string())?;
-                let Some(document) = self.documents.get_mut(params.text_document.uri.as_str())
-                else {
+                let params = DocumentChange::parse(&notification.params)?;
+                let Some(document) = self.documents.get_mut(params.uri.as_str()) else {
                     return Ok(false);
                 };
-                if params.text_document.version <= document.version
-                    || params.content_changes.is_empty()
-                {
+                if params.version <= document.version || params.text.is_none() {
                     return Ok(false);
                 }
-                // Full synchronization is advertised. Reject the whole malformed
-                // update, so a ranged edit cannot silently replace the buffer.
-                if params
-                    .content_changes
-                    .iter()
-                    .any(|change| change.range.is_some())
-                {
-                    return Err("expected a full document change".into());
-                }
-                if let Some(change) = params.content_changes.into_iter().last() {
-                    document.text = change.text;
-                    document.version = params.text_document.version;
+                if let Some(text) = params.text {
+                    document.text = text;
+                    document.version = params.version;
                 }
             }
             "textDocument/didSave" => {
-                let params = notification
-                    .extract::<DidSaveTextDocumentParams>("textDocument/didSave")
-                    .map_err(|error| error.to_string())?;
-                if !self
-                    .documents
-                    .contains_key(params.text_document.uri.as_str())
-                {
+                let uri = protocol::saved_uri(&notification.params)?;
+                if !self.documents.contains_key(&uri) {
                     return Ok(false);
                 }
                 // A save refreshes on-disk dependencies. Open buffers remain
                 // authoritative until didChange/didClose, per LSP synchronization.
             }
             "textDocument/didClose" => {
-                let params = notification
-                    .extract::<DidCloseTextDocumentParams>("textDocument/didClose")
-                    .map_err(|error| error.to_string())?;
-                if self
-                    .documents
-                    .remove(params.text_document.uri.as_str())
-                    .is_none()
-                {
+                let uri = protocol::document_uri(&notification.params)?;
+                if self.documents.remove(&uri).is_none() {
                     return Ok(false);
                 }
             }
@@ -597,11 +530,11 @@ impl Server {
             }
         }
         for params in diagnostics.into_values() {
-            Message::Notification(Notification::new(
-                "textDocument/publishDiagnostics".into(),
-                params,
-            ))
-            .write(output)?;
+            protocol::write_notification(
+                output,
+                "textDocument/publishDiagnostics",
+                params.to_json(),
+            )?;
         }
         self.published = current;
         Ok(())
@@ -610,20 +543,20 @@ impl Server {
     fn add_diagnostic(
         &self,
         diagnostics: &mut BTreeMap<String, PublishDiagnosticsParams>,
-        fallback: &Uri,
+        fallback: &str,
         source: Option<&package::Source>,
         sources: &[package::Source],
         diagnostic: &Diagnostic,
     ) {
         let uri = source
             .and_then(|source| self.source_uri(&source.path))
-            .unwrap_or_else(|| fallback.clone());
+            .unwrap_or_else(|| fallback.to_owned());
         let (text, offset) = source
             .map(|source| (source.text.as_str(), source.start))
-            .unwrap_or_else(|| (self.documents[fallback.as_str()].text.as_str(), 0));
+            .unwrap_or_else(|| (self.documents[fallback].text.as_str(), 0));
         let mut converted = to_diagnostic(diagnostic, text, offset);
         if !diagnostic.labels.is_empty() {
-            converted.related_information = Some(
+            converted["relatedInformation"] = json!(
                 diagnostic
                     .labels
                     .iter()
@@ -637,22 +570,22 @@ impl Server {
                             .or(source);
                         let label_uri = source
                             .and_then(|source| self.source_uri(&source.path))
-                            .unwrap_or_else(|| fallback.clone());
+                            .unwrap_or_else(|| fallback.to_owned());
                         let (text, offset) = source
                             .map(|source| (source.text.as_str(), source.start))
                             .unwrap_or((text, offset));
-                        DiagnosticRelatedInformation {
-                            location: Location {
+                        json!({
+                            "location": Location {
                                 uri: label_uri,
                                 range: Range::new(
                                     position(text, label.span.start.saturating_sub(offset)),
                                     position(text, label.span.end.saturating_sub(offset)),
                                 ),
-                            },
-                            message: label.message.clone(),
-                        }
+                            }.to_json(),
+                            "message": label.message,
+                        })
                     })
-                    .collect(),
+                    .collect::<Vec<_>>()
             );
         }
         let diagnostic = converted;
@@ -673,7 +606,7 @@ impl Server {
         }
     }
 
-    fn source_uri(&self, path: &Path) -> Option<Uri> {
+    fn source_uri(&self, path: &Path) -> Option<String> {
         self.documents
             .values()
             .find(|document| {
@@ -696,12 +629,12 @@ fn valid_name(name: &str) -> bool {
         && !crate::parser::reserved(name)
 }
 
-pub(crate) fn uri_path(uri: &Uri) -> Result<PathBuf, String> {
+pub(crate) fn uri_path(uri: &str) -> Result<PathBuf, String> {
     let path = file_uri::to_path(uri)?;
     Ok(package::source_path(&path))
 }
 
-fn to_diagnostic(diagnostic: &Diagnostic, text: &str, offset: usize) -> lsp_types::Diagnostic {
+fn to_diagnostic(diagnostic: &Diagnostic, text: &str, offset: usize) -> Value {
     let start = diagnostic.span.start.saturating_sub(offset);
     let end = diagnostic.span.end.saturating_sub(offset).max(start);
     let mut message = diagnostic.message.to_string();
@@ -709,16 +642,15 @@ fn to_diagnostic(diagnostic: &Diagnostic, text: &str, offset: usize) -> lsp_type
         message.push_str("\nnote: ");
         message.push_str(note);
     }
-    lsp_types::Diagnostic {
-        range: Range::new(position(text, start), position(text, end)),
-        severity: Some(match diagnostic.severity {
-            Severity::Error => DiagnosticSeverity::ERROR,
-            Severity::Warning => DiagnosticSeverity::WARNING,
-        }),
-        source: Some("dodo".into()),
-        message,
-        ..Default::default()
-    }
+    json!({
+        "range": Range::new(position(text, start), position(text, end)).to_json(),
+        "severity": match diagnostic.severity {
+            Severity::Error => 1,
+            Severity::Warning => 2,
+        },
+        "source": "dodo",
+        "message": message,
+    })
 }
 
 /// Compiler spans are UTF-8 byte offsets; LSP columns default to UTF-16 units.
@@ -766,13 +698,13 @@ mod tests {
         )
         .note("use this information");
         let result = to_diagnostic(&warning, "😀é", 100);
-        assert_eq!(result.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(result["severity"], 2);
         assert_eq!(
-            result.range,
-            Range::new(Position::new(0, 2), Position::new(0, 3))
+            result["range"],
+            json!({"start":{"line":0,"character":2},"end":{"line":0,"character":3}})
         );
         assert_eq!(
-            result.message,
+            result["message"],
             "example warning\nnote: use this information"
         );
         assert!(warning.render("test.dodo", "😀é").starts_with("warning: "));

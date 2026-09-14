@@ -119,9 +119,13 @@ impl Client {
 
     fn send(&mut self, message: Value) {
         let body = serde_json::to_vec(&message).unwrap();
+        self.send_body(&body);
+    }
+
+    fn send_body(&mut self, body: &[u8]) {
         let input = self.input.as_mut().unwrap();
         write!(input, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
-        input.write_all(&body).unwrap();
+        input.write_all(body).unwrap();
         input.flush().unwrap();
     }
 
@@ -1646,4 +1650,329 @@ fn lsp_package_recovery_combines_lexical_and_target_errors_in_unsaved_siblings()
     assert_eq!(diagnostics[&sibling]["version"], 5);
     assert!(!workspace.0.join("extra.dodo").exists());
     assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_internal_json_rpc_validates_envelopes_and_preserves_request_ids() {
+    let mut client = Client::start("lsp");
+    for id in [
+        Value::Null,
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(1.5),
+        json!(1.0),
+        json!(2147483648_i64),
+        json!(-2147483649_i64),
+        json!(u64::MAX),
+    ] {
+        client.send(json!({"jsonrpc":"2.0", "id":id, "method":"initialize", "params":{}}));
+        assert_eq!(
+            client.receive(),
+            json!({
+                "jsonrpc":"2.0", "id":null, "error":{"code":-32600,"message":"Invalid Request"}
+            }),
+            "invalid ID {id}"
+        );
+    }
+    for (message, expected_id) in [
+        (json!(null), Value::Null),
+        (json!([]), Value::Null),
+        (
+            json!([{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]),
+            Value::Null,
+        ),
+        (
+            json!({"id":1,"method":"initialize","params":{}}),
+            Value::Null,
+        ),
+        (
+            json!({"jsonrpc":"1.0","id":1,"method":"initialize","params":{}}),
+            Value::Null,
+        ),
+        (
+            json!({"jsonrpc":"2.0","id":"bad","method":false}),
+            json!("bad"),
+        ),
+        (
+            json!({"jsonrpc":"2.0","id":"bad","method":"initialize","params":{},"result":null}),
+            json!("bad"),
+        ),
+        (
+            json!({"jsonrpc":"2.0","id":"bad","method":"initialize","params":{},"error":{}}),
+            json!("bad"),
+        ),
+        (json!({"jsonrpc":"2.0","id":"bad"}), json!("bad")),
+        (
+            json!({"jsonrpc":"2.0","id":"bad","result":null,"error":{"code":1,"message":"bad"}}),
+            json!("bad"),
+        ),
+        (
+            json!({"jsonrpc":"2.0","id":"bad","error":{"code":"1","message":"bad"}}),
+            json!("bad"),
+        ),
+    ] {
+        client.send(message.clone());
+        let response = client.receive();
+        assert_eq!(response["id"], expected_id, "{message}");
+        assert_eq!(response["error"]["code"], -32600, "{message}");
+        assert!(response.get("result").is_none(), "{response}");
+    }
+    // None of the invalid initialize envelopes may initialize the server.
+    client.initialize("file");
+    for id in [
+        json!(i32::MIN),
+        json!(-1),
+        json!(0),
+        json!(i32::MAX),
+        json!(""),
+        json!("1"),
+        json!("😀\"\\\n"),
+    ] {
+        let response = client.request(id, "unknown/method", Value::Null);
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(response.get("result").is_none());
+    }
+    for response in [
+        json!({"jsonrpc":"2.0","id":1,"result":null}),
+        json!({"jsonrpc":"2.0","id":"peer","result":{"extension":true}}),
+        json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"peer parse error"}}),
+        json!({"jsonrpc":"2.0","id":"peer","error":{"code":-32603,"message":"peer failure","data":[]}}),
+    ] {
+        client.send(response);
+    }
+    client.notify("unknown/extension", json!({"extension":true}));
+    assert!(client.diagnostics().is_empty()); // Responses never elicit responses.
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_internal_json_parser_recovers_on_the_next_frame() {
+    let mut client = Client::start("--lsp");
+    for body in [
+        &b"{"[..],
+        b"",
+        b"\xff",
+        b"{}{}",
+        b"[1,",
+        b"{\"x\":\"\xff\"}",
+    ] {
+        client.send_body(body);
+        assert_eq!(
+            client.receive(),
+            json!({
+                "jsonrpc":"2.0", "id":null, "error":{"code":-32700,"message":"Parse error"}
+            })
+        );
+    }
+    client.initialize("file");
+    client.open(
+        "untitled:unicode",
+        "package app\nfn main() { _ = \"😀é\" }\n",
+        1,
+    );
+    assert_eq!(
+        client.diagnostics()["untitled:unicode"]["diagnostics"],
+        json!([])
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_internal_parameter_validation_rejects_invalid_queries() {
+    let uri = "untitled:validation";
+    let mut client = Client::start("lsp");
+    for capabilities in [
+        Value::Null,
+        json!([]),
+        json!(false),
+        json!({"workspace":false}),
+        json!({"workspace":{"workspaceEdit":[]}}),
+        json!({"workspace":{"workspaceEdit":{"documentChanges":"true"}}}),
+    ] {
+        let response = client.request(json!(1), "initialize", json!({"capabilities":capabilities}));
+        assert_eq!(response["error"]["code"], -32602, "{capabilities}");
+    }
+    let response = client.request(json!(1), "initialize", json!({
+        "capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true,"futureOption":42}},"experimental":{"anything":[]}},
+        "futureParameter":true
+    }));
+    assert!(response.get("error").is_none(), "{response}");
+    client.open(uri, VALID, 1);
+    client.diagnostics();
+    let base = json!({"textDocument":{"uri":uri},"position":{"line":0,"character":0}});
+    for method in [
+        "hover",
+        "completion",
+        "definition",
+        "references",
+        "prepareRename",
+        "rename",
+        "signatureHelp",
+    ] {
+        for position in [
+            Value::Null,
+            json!([]),
+            json!(0),
+            json!({}),
+            json!({"line":0}),
+            json!({"character":0}),
+            json!({"line":-1,"character":0}),
+            json!({"line":0,"character":1.5}),
+            json!({"line":0,"character":"0"}),
+            json!({"line":2147483648_i64,"character":0}),
+            json!({"line":0,"character":u64::MAX}),
+        ] {
+            let mut params = base.clone();
+            params["position"] = position;
+            params["context"] = json!({"includeDeclaration":true});
+            params["newName"] = json!("renamed");
+            let response =
+                client.request(json!(2), &format!("textDocument/{method}"), params.clone());
+            assert_eq!(
+                response["error"]["code"], -32602,
+                "{method}: {params}: {response}"
+            );
+        }
+    }
+    for (method, field, value) in [
+        ("hover", "textDocument", json!("document")),
+        ("hover", "textDocument", json!({"uri":1})),
+        ("hover", "textDocument", json!({"uri":"untitled:bad%xy"})),
+        ("references", "context", Value::Null),
+        ("references", "context", json!({"includeDeclaration":1})),
+        ("rename", "newName", Value::Null),
+        ("rename", "newName", json!(true)),
+        ("completion", "context", json!({})),
+        ("completion", "context", json!({"triggerKind":"1"})),
+        (
+            "completion",
+            "context",
+            json!({"triggerKind":2,"triggerCharacter":42}),
+        ),
+        ("signatureHelp", "context", json!({"triggerKind":1})),
+        (
+            "signatureHelp",
+            "context",
+            json!({"triggerKind":1,"isRetrigger":"false"}),
+        ),
+        ("formatting", "options", Value::Null),
+        ("formatting", "options", json!({"tabSize":4})),
+        (
+            "formatting",
+            "options",
+            json!({"tabSize":-1,"insertSpaces":true}),
+        ),
+        (
+            "formatting",
+            "options",
+            json!({"tabSize":4,"insertSpaces":"true"}),
+        ),
+        (
+            "formatting",
+            "options",
+            json!({"tabSize":4,"insertSpaces":true,"insertFinalNewline":1}),
+        ),
+    ] {
+        let mut params = base.clone();
+        params[field] = value;
+        let response = client.request(json!(3), &format!("textDocument/{method}"), params.clone());
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "{method}: {params}: {response}"
+        );
+    }
+    // Unknown fields and optional nulls do not break supported requests.
+    let response = client.request(json!(4), "textDocument/completion", json!({
+        "textDocument":{"uri":uri,"future":[]}, "position":{"line":1,"character":3,"future":true},
+        "context":null, "workDoneToken":"progress", "future":{}
+    }));
+    assert!(response.get("result").is_some(), "{response}");
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_internal_notification_validation_is_atomic_and_response_free() {
+    let uri = "untitled:atomic";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(uri, INVALID, -2);
+    let original = client.diagnostics()[uri].clone();
+    let open = json!({"textDocument":{"uri":uri,"languageId":"dodo","version":1,"text":VALID}});
+    for (field, value) in [
+        ("uri", json!(1)),
+        ("languageId", Value::Null),
+        ("text", Value::Null),
+        ("text", json!(42)),
+        ("version", Value::Null),
+        ("version", json!(1.5)),
+        ("version", json!(2147483648_i64)),
+        ("version", json!(-2147483649_i64)),
+    ] {
+        let mut params = open.clone();
+        params["textDocument"][field] = value;
+        client.notify("textDocument/didOpen", params);
+    }
+    for changes in [
+        Value::Null,
+        json!({"text":VALID}),
+        json!([null]),
+        json!([{}]),
+        json!([{"text":true}]),
+        json!([{"text":VALID},{}]),
+        json!([{}, {"text":VALID}]),
+        json!([{"text":VALID,"rangeLength":"1"}]),
+        json!([{"text":VALID,"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]),
+        json!([{"text":VALID,"range":false}]),
+    ] {
+        client.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument":{"uri":uri,"version":1}, "contentChanges":changes
+            }),
+        );
+    }
+    for version in [Value::Null, json!(false), json!(1.0), json!(2147483648_i64)] {
+        client.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument":{"uri":uri,"version":version}, "contentChanges":[{"text":VALID}]
+            }),
+        );
+    }
+    client.notify(
+        "textDocument/didSave",
+        json!({"textDocument":{"uri":uri},"text":false}),
+    );
+    client.notify(
+        "textDocument/didClose",
+        json!({"textDocument":{"uri":null}}),
+    );
+    assert!(client.diagnostics().is_empty());
+    client.save(uri);
+    assert_eq!(client.diagnostics()[uri], original);
+    // Invalid updates must not consume the version or apply any partial text.
+    client.notify("textDocument/didChange", json!({
+        "textDocument":{"uri":uri,"version":1},
+        "contentChanges":[{"text":INVALID},{"text":VALID,"range":null,"rangeLength":null,"future":true}]
+    }));
+    let updated = client.diagnostics();
+    assert_eq!(updated[uri]["version"], 1);
+    assert_eq!(updated[uri]["diagnostics"], json!([]));
+    client.notify(
+        "textDocument/didChange",
+        json!({"textDocument":{"uri":uri,"version":2},"contentChanges":[]}),
+    );
+    client.change(uri, INVALID, 0);
+    assert!(client.diagnostics().is_empty());
+    client.change(uri, INVALID, 2);
+    assert_eq!(client.diagnostics()[uri]["version"], 2);
+    client.close(uri);
+    assert_eq!(
+        client.diagnostics()[uri],
+        json!({"uri":uri,"diagnostics":[]})
+    );
+    let stderr = client.shutdown();
+    assert!(stderr.contains("LSP:"));
+    assert!(!stderr.contains("panicked"), "{stderr}");
 }

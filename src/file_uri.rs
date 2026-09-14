@@ -1,33 +1,70 @@
 //! File URI conversion for LSP source documents, without a general URL library.
 //!
-//! `lsp_types::Uri` validates URI syntax. We handle the file scheme, native paths,
-//! and percent encoding here. Empty authorities and `localhost` refer to local
+//! URI syntax, the file scheme, native paths, and percent encoding are handled
+//! here. Empty authorities and `localhost` refer to local
 //! paths; Windows additionally supports ASCII UNC authorities. Paths need not
 //! exist, and conversion never performs hostname lookup or IDNA mapping.
 //! See https://www.rfc-editor.org/rfc/rfc8089.html for file URI conventions.
-use lsp_types::Uri;
 use std::path::{Path, PathBuf};
 
-pub(crate) fn to_path(uri: &Uri) -> Result<PathBuf, &'static str> {
-    if !uri
-        .scheme()
-        .is_some_and(|s| s.as_str().eq_ignore_ascii_case("file"))
-    {
+/// Validate source identifiers while preserving their spelling as editor keys.
+/// Dodo supports file documents and opaque `untitled:` editor buffers only.
+pub(crate) fn validate(uri: &str) -> Result<(), &'static str> {
+    if let Some(tail) = uri.strip_prefix("untitled:") {
+        let (rest, fragment) = tail.split_once('#').unwrap_or((tail, ""));
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        validate_component(path, b"/")?;
+        validate_component(query, b"/?")?;
+        validate_component(fragment, b"/?")
+    } else {
+        to_path(uri).map(|_| ())
+    }
+}
+
+// RFC 3986 pchar plus the delimiters allowed in the given component. URI text
+// is ASCII; Unicode and native filename bytes must be percent encoded.
+fn validate_component(text: &str, delimiters: &[u8]) -> Result<(), &'static str> {
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            for _ in 0..2 {
+                if !bytes.next().is_some_and(|b| b.is_ascii_hexdigit()) {
+                    return Err("invalid percent escape in source URI");
+                }
+            }
+        } else if !(byte.is_ascii_alphanumeric()
+            || b"-._~!$&'()*+,;=:@".contains(&byte)
+            || delimiters.contains(&byte))
+        {
+            return Err("invalid character in source URI");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn to_path(uri: &str) -> Result<PathBuf, &'static str> {
+    let (scheme, tail) = uri.split_once(':').ok_or("source URI must have a scheme")?;
+    if !scheme.eq_ignore_ascii_case("file") {
         return Err("only file URIs are supported");
     }
-    if uri.query().is_some() || uri.fragment().is_some() {
+    if tail.contains(['?', '#']) {
         return Err("source URI must not have a query or fragment");
     }
-    let authority = uri.authority().map_or("", |a| a.as_str());
+    let (authority, raw) = if let Some(tail) = tail.strip_prefix("//") {
+        let end = tail.find('/').unwrap_or(tail.len());
+        (&tail[..end], &tail[end..])
+    } else {
+        ("", tail)
+    };
     let host = if authority.eq_ignore_ascii_case("localhost") {
         ""
     } else {
         authority
     };
-    let raw = uri.path().as_str();
     if !raw.starts_with('/') {
         return Err("source URI must have an absolute path");
     }
+    validate_component(raw, b"/")?;
     // Resolve URI dot segments before converting to a native path, including
     // escaped dots. Never decode twice: `%2520` names a literal `%20`.
     let path = decode_path(raw, cfg!(windows))?;
@@ -55,7 +92,7 @@ pub(crate) fn to_path(uri: &Uri) -> Result<PathBuf, &'static str> {
     }
 }
 
-pub(crate) fn from_path(path: &Path) -> Result<Uri, &'static str> {
+pub(crate) fn from_path(path: &Path) -> Result<String, &'static str> {
     if !path.is_absolute() {
         return Err("source path must be absolute");
     }
@@ -104,8 +141,7 @@ pub(crate) fn from_path(path: &Path) -> Result<Uri, &'static str> {
         "file://{}",
         encode_path(path.to_str().ok_or("source path is not UTF-8")?.as_bytes())?
     );
-    text.parse()
-        .map_err(|_| "source path cannot be represented as a file URI")
+    Ok(text)
 }
 
 fn encode_path(bytes: &[u8]) -> Result<String, &'static str> {
@@ -221,8 +257,7 @@ mod tests {
     use super::*;
 
     fn parse(text: &str) -> Result<PathBuf, String> {
-        let uri = text.parse::<Uri>().map_err(|error| error.to_string())?;
-        to_path(&uri).map_err(str::to_owned)
+        to_path(text).map_err(str::to_owned)
     }
 
     #[test]
@@ -259,6 +294,38 @@ mod tests {
     fn rejects_relative_paths() {
         for path in ["", "a.dodo", "./a.dodo", "../a.dodo"] {
             assert!(from_path(Path::new(path)).is_err(), "accepted {path:?}");
+        }
+    }
+
+    #[test]
+    fn untitled_identifiers_validate_uri_syntax_without_normalizing_spelling() {
+        for uri in [
+            "untitled:",
+            "untitled:Untitled-1",
+            "untitled:/folder/%C3%A9%20%F0%9F%98%80.dodo",
+            "untitled:a%2fb?query=/a?b#fragment?x/y",
+            "untitled:!$&'()*+,;=:@-._~",
+        ] {
+            assert!(validate(uri).is_ok(), "rejected {uri}");
+        }
+        for tail in [
+            "a b", "é", "😀", "a\n", "a\r", "a\t", "a\0", "%", "%0", "%g0", "%0g", "a\\b", "[a]",
+            "a|b", "<a>", "a^b", "a`b", "{a}", "a\u{7f}", "a#b#c", "a?%xy", "a#%xy",
+        ] {
+            assert!(
+                validate(&format!("untitled:{tail}")).is_err(),
+                "accepted {tail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_paths_reject_raw_characters_previously_validated_by_the_uri_library() {
+        // Run on every platform: each URI includes a drive for Windows.
+        for byte in 0..=255_u8 {
+            let valid = byte.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:@".contains(&byte);
+            let uri = format!("file:///C:/a{}z", char::from(byte));
+            assert_eq!(to_path(&uri).is_ok(), valid, "byte {byte}");
         }
     }
 

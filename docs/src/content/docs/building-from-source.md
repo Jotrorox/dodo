@@ -23,8 +23,9 @@ instead. Run the commands on this page from the repository root.
 
 Building Dodo **from source** requires Rust 1.95.0 (pinned in
 `rust-toolchain.toml`), LLVM 22 development files and static archives, and a C
-toolchain. Inkwell provides LLVM bindings; the language server uses `lsp-server`,
-`lsp-types`, and `serde_json`, with internal file URI conversion. `Cargo.lock`
+toolchain. Inkwell provides LLVM bindings; the language server implements its
+JSON-RPC messages, LSP parameter validation, and file URI conversion internally,
+using only `serde_json` for JSON encoding and decoding. `Cargo.lock`
 fixes the dependencies. A missing LLVM static archive is a build error; the build
 never silently falls back to shared LLVM.
 
@@ -185,7 +186,9 @@ trap tests avoids creating crash artifacts.
 `cargo test --locked --test lsp` exercises the real compiler's LSP lifecycle,
 framing, buffer updates, imported diagnostics, directory packages, Unicode
 positions, completion, navigation, rename, signatures, formatting, target selection,
-and recovery from invalid source and notifications. Use the
+and recovery from invalid source and notifications. Independent JSON-RPC fixtures
+also check request IDs, malformed envelopes, parameter types, and atomic buffer
+updates; unit tests cover bounded framing and file/untitled URI validation. Use the
 [LSP benchmark](lsp-performance.md) to measure responsiveness separately from
 correctness tests.
 
