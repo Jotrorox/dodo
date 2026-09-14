@@ -419,8 +419,8 @@ fn cli_preserves_sources_and_existing_outputs_when_builds_fail() {
 }
 
 #[test]
-fn hello_uses_native_c_abi() {
-    native_at_all_levels(include_str!("../examples/hello.dodo"), 0, "Dodo 0.1\n");
+fn hello_uses_safe_hosted_console() {
+    native_at_all_levels(include_str!("../examples/hello.dodo"), 0, "Hello, world!\n");
 }
 
 #[test]

@@ -1,0 +1,128 @@
+package std_line_io_checks
+import "std/io"
+import "core/bytes"
+
+pub struct Probe {
+    calls: usize
+    mode: usize
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!io.Error {
+        self.calls += 1
+        if self.mode == 0 {
+            return ok(2)
+        }
+        if self.mode == 1 {
+            return err(io.Error { kind: io.ErrorKind.Other, transferred: 2, code: 91 })
+        }
+        if self.mode == 2 && self.calls == 1 {
+            return err(io.Error { kind: io.ErrorKind.Interrupted, transferred: 0, code: 4 })
+        }
+        if self.mode == 5 && self.calls == 1 {
+            destination[0] = 97
+            return ok(1)
+        }
+        destination[0] = 10
+        if self.mode == 3 {
+            destination[0] = 120
+        }
+        if self.mode == 2 {
+            return err(io.Error { kind: io.ErrorKind.Interrupted, transferred: 1, code: 4 })
+        }
+        return err(io.Error { kind: io.ErrorKind.WouldBlock, transferred: 1, code: 11 })
+    }
+}
+fn verify() -> void!io.Error {
+    storage := [165u8; 8]
+    reader := io.MemoryReader.new(b"\nnext\r\nlast")
+    first := io.read_line(&mut reader, &mut storage)?
+    assert(first.count == 1 && first.end == io.LineEnd.Newline)
+    assert(storage[0] == 10 && storage[1] == 165)
+    second := io.read_line(&mut reader, &mut storage[..6])?
+    assert(second.count == 6 && second.end == io.LineEnd.Newline)
+    assert(bytes.equal(&storage[..6], b"next\r\n"))
+    third := io.read_line(&mut reader, &mut storage)?
+    assert(third.count == 4 && third.end == io.LineEnd.Eof)
+    assert(bytes.equal(&storage[..4], b"last"))
+    fourth := io.read_line(&mut reader, &mut storage)?
+    assert(fourth.count == 0 && fourth.end == io.LineEnd.Eof)
+    reader2 := io.MemoryReader.new(b"abcd\n")
+    full := io.read_line(&mut reader2, &mut storage[..4])?
+    assert(full.count == 4 && full.end == io.LineEnd.Full && reader2.position() == 4)
+    tail := io.read_line(&mut reader2, &mut storage[..1])?
+    assert(tail.count == 1 && tail.end == io.LineEnd.Newline)
+    reader3 := io.MemoryReader.new(b"abcd")
+    exact := io.read_line(&mut reader3, &mut storage[..4])?
+    assert(exact.end == io.LineEnd.Full)
+    eof := io.read_line(&mut reader3, &mut storage)?
+    assert(eof.count == 0 && eof.end == io.LineEnd.Eof)
+    raw := [255u8, 0, 13, 10, 120]
+    reader4 := io.MemoryReader.new(&raw)
+    binary := io.read_line(&mut reader4, &mut storage)?
+    assert(binary.end == io.LineEnd.Newline && binary.count == 4)
+    assert(bytes.equal(&storage[..4], &raw[..4]))
+    probe := Probe { calls: 0, mode: 0 }
+    empty := io.read_line(&mut probe, &mut storage[..0])?
+    assert(empty.count == 0 && empty.end == io.LineEnd.Full && probe.calls == 0)
+    for mode in 0usize..2 {
+        probe.mode = mode
+        match io.read_line(&mut probe, &mut storage) {
+            ok(_) => {
+                return err(io.failure(io.ErrorKind.Other, 0))
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.InvalidProgress && reason.transferred == 0)
+            }
+        }
+    }
+    interrupted := Probe { calls: 0, mode: 2 }
+    resumed := io.read_line(&mut interrupted, &mut storage)?
+    assert(resumed.count == 1 && resumed.end == io.LineEnd.Newline && interrupted.calls == 2)
+    for mode in 3usize..5 {
+        failing := Probe { calls: 0, mode: mode }
+        match io.read_line(&mut failing, &mut storage) {
+            ok(_) => {
+                return err(io.failure(io.ErrorKind.Other, 0))
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.WouldBlock && reason.code == 11 && reason.transferred == 1)
+                assert(failing.calls == 1)
+            }
+        }
+    }
+    prefix := Probe { calls: 0, mode: 5 }
+    match io.read_line(&mut prefix, &mut storage) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason.transferred == 2 && reason.kind == io.ErrorKind.WouldBlock && reason.code == 11)
+            assert(storage[0] == 97 && storage[1] == 10)
+        }
+    }
+    // BufferedReader holds read-ahead and its error until the final byte.
+    source := Probe { calls: 0, mode: 3 }
+    ahead := [0u8; 2]
+    buffered := io.BufferedReader.new(&mut source, &mut ahead)?
+    match io.read_line(&mut buffered, &mut storage) {
+        ok(_) => {
+            return err(io.failure(io.ErrorKind.Other, 0))
+        }
+        err(reason) => {
+            assert(reason.transferred == 1 && storage[0] == 120)
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match verify() {
+        ok() => {
+            return 0
+        }, err(_) => {
+            return 250
+        }
+    }
+}
+
+@test
+fn line_reading_contracts() {
+    assert_eq(main(), 0)
+}

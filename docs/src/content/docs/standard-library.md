@@ -14,7 +14,7 @@ scheduler, or garbage collector. Hosted packages select explicit platform adapte
 The library includes byte I/O, formatting, binary buffers, UTF-8 text,
 [collections](collections.md), [mathematics](math.md), [hashing and
 checksums](hash.md), and [time values and clock contracts](time.md).
-Hosted [filesystem](filesystem.md), [process](processes.md),
+Hosted [console I/O and printing](console.md), [filesystem](filesystem.md), [process](processes.md),
 [environment](environment.md), [thread](threads.md), and
 [synchronization](synchronization.md) packages build on those foundations.
 HTTP, JSON/TOML, and peripheral drivers are not implemented.
@@ -44,6 +44,8 @@ HTTP, JSON/TOML, and peripheral drivers are not implemented.
 | `std/hash`, `std/checksum` | Incremental FNV-1a/SipHash, explicit key sources, CRC-32 and Adler-32. |
 | `std/time` | Checked duration, timestamp, Gregorian date and time-of-day values. |
 | `std/time/clock`, `std/time/timer`, `std/time/iso8601` | Clock/timer contracts, deterministic fakes, and UTC text conversion. |
+| `std/console` | Safe borrowed stdin, stdout, and stderr, text/value printing, and bounded line input on hosted targets. |
+| `std/fmt/errors` | Independently imported format adapters for common enum errors. |
 | `std/io` | Structural blocking/polling byte I/O, memory adapters, buffering, bounded transfer helpers. |
 | `std/fmt` | Byte-sink formatting, static customization, integer and exact-precision floating conversion. |
 | `std/bytes` | Checked byte views, bounded binary readers/writers, endian operations and searching. |
@@ -355,7 +357,9 @@ An `io.Error` contains `kind`, `transferred`, and an adapter-defined `code: i32`
 `transferred` records prefix progress even when the same operation fails. The
 portable `io.failure(kind, transferred)` constructor sets `code` to zero. Error
 kinds are `UnexpectedEof`, `WriteZero`, `Interrupted`, `BufferFull`, `OutOfBounds`,
-`InvalidInput`, `InvalidProgress`, and `Other`. A provider is responsible for
+`InvalidInput`, `InvalidProgress`, `WouldBlock`, `TimedOut`, `Cancelled`,
+`Closed`, `ConnectionReset`, `ConnectionRefused`, `BrokenPipe`,
+`PermissionDenied`, and `Other`. A provider is responsible for
 classifying recoverable device errors and preserving useful platform codes.
 Helpers validate returned counts before forming their next checked subslice;
 `InvalidProgress` means the provider violated its contract. This validation does
@@ -369,6 +373,13 @@ accounting for any prefix already processed; a persistent interruption can block
 indefinitely. They return total progress for the entire helper invocation,
 preserving a terminal device error and code even if its prefix finished the
 requested byte count. None rolls back bytes already read or written.
+
+`read_line(&mut reader, &mut storage)` returns `io.Line { count, end }`.
+`LineEnd.Newline` includes LF and any preceding CR, `Eof` reports observed EOF
+with an optional final unterminated prefix, and `Full` means storage filled
+without LF. It never reads beyond LF or probes beyond capacity. Empty storage
+returns `Full` without reading. Failures retain prefix progress in
+`Error.transferred`. See [bounded console input](console.md#read-a-bounded-line).
 
 `MemoryReader.new(&bytes)` retains a shared borrow and exposes `position`,
 `remaining`, `read`, `poll_read`, and absolute `seek`. `MemoryWriter.new(&mut
@@ -458,6 +469,21 @@ partial progress in `Error.transferred`; bytes already written remain visible.
 An empty string succeeds without calling the sink. Formatting never flushes.
 A `MemoryWriter` supplies caller-provided fixed storage; it reports `BufferFull`
 with the accepted prefix when exhausted.
+
+`fmt.print(&mut writer, text)` and `fmt.println(&mut writer, text)` print text
+and an optional LF. `fmt.value_line(&mut writer, &value)` adds LF to value
+formatting. All return the completed byte count, finish short writes, retry
+interruptions, and preserve partial progress on error. Primitive wrappers
+`fmt.signed`, `unsigned`, `boolean`, `floating`, and `codepoint` implement the
+value-formatting contract with decimal integers and scientific floats with six
+fraction digits. [Console printing](console.md) exposes the same operations
+on borrowed process stdout and stderr.
+
+I/O, platform, text, network, TLS, and HTTP errors implement the value-formatting
+contract directly. The optional `std/fmt/errors` package provides wrappers for
+allocation, range, parse, format, synchronization, web, math, and time enum
+errors. These displays contain fixed kind names, numeric codes, progress, and
+positions; they do not capture sensitive input or native message strings.
 
 `fmt.defaults()` creates options with decimal radix, no minimum width, ASCII
 space fill, right alignment, minus signs only, lowercase digits, and no zero

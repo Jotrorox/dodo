@@ -37,7 +37,7 @@ fn success(output: Output, context: &str) {
 fn portable_io_executes_at_both_optimization_levels_and_cross_compiles() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Workspace::new();
-    for fixture in ["std_io", "std_io_alloc"] {
+    for fixture in ["std_io", "std_io_alloc", "std_line_io"] {
         let source = root.join(format!("tests/stdlib/{fixture}.dodo"));
         for optimization in ["0", "3"] {
             let executable = scratch.0.join(format!(

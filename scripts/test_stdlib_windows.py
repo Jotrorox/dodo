@@ -45,6 +45,23 @@ def run(arguments, *, env=None, timeout=120, cwd=None):
     return result
 
 
+def run_console(arguments, *, env, cwd):
+    # Use files, not captured pipes: Wine services can inherit process handles.
+    with tempfile.TemporaryFile() as input_file, tempfile.TemporaryFile() as output_file, tempfile.TemporaryFile() as error_file:
+        input_file.write(b"abc\r\ntail")
+        input_file.seek(0)
+        result = subprocess.run(arguments, stdin=input_file, stdout=output_file,
+                                stderr=error_file, env=env, cwd=cwd, timeout=120)
+        output_file.seek(0)
+        error_file.seek(0)
+        stdout, stderr = output_file.read(), error_file.read()
+        expected_stdout = b"Hello, world!\n42\ntext line\n42\n"
+        expected_stderr = b"io: Closed code=9 transferred=0\n"
+        if result.returncode or stdout != expected_stdout or stderr != expected_stderr:
+            raise RuntimeError(f"Console fixture failed ({result.returncode}): {arguments}\n"
+                               f"stdout={stdout!r}\nstderr={stderr!r}")
+
+
 RUNTIME = r'''
 typedef __SIZE_TYPE__ size_t;
 /* COFF floating-point marker. Arithmetic itself remains generated machine code;
@@ -246,7 +263,10 @@ def main():
                         shutil.copyfile(scratch / "os child.exe", child_work / "os child.exe")
                         (child_work / "cwd-marker").write_bytes(b"fixture")
                     extra_args = ["space arg", "é", ""] if source.stem == "env_checks" else []
-                    run([wine, str(exe), *extra_args], env=env, cwd=work)
+                    if source.stem == "console_checks":
+                        run_console([wine, str(exe)], env=env, cwd=work)
+                    else:
+                        run([wine, str(exe), *extra_args], env=env, cwd=work)
                     executions += 1
                     records.append({"fixture": source.name, "optimization": optimization,
                                     "target": "x86_64-pc-windows-msvc", "exit_code": 0})

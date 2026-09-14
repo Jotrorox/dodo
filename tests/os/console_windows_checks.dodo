@@ -1,0 +1,87 @@
+package console_windows_checks
+import "std/console"
+import "std/platform/windows"
+import "std/platform/error"
+import "std/io"
+
+unsafe extern "C" fn GetStdHandle(kind: u32) -> isize
+unsafe extern "C" fn SetStdHandle(kind: u32, handle: isize) -> i32
+unsafe extern "C" fn SetLastError(code: u32)
+
+fn main() -> i32 {
+    blocked := windows.from_code(232)
+    assert(blocked.kind == error.Kind.WouldBlock && blocked.code == 232)
+    broken := windows.from_code(109)
+    assert(broken.kind == error.Kind.BrokenPipe && broken.code == 109)
+    unsafe {
+        SetLastError(2147483649)
+    }
+    high := windows.last_error()
+    assert(high.code == -2147483647)
+    // Temporarily remove the process stream entries, retaining their handles.
+    // No handle is closed, including by any console wrapper's destruction.
+    saved_in := unsafe {
+        GetStdHandle(4294967286)
+    }
+    saved_out := unsafe {
+        GetStdHandle(4294967285)
+    }
+    saved_err := unsafe {
+        GetStdHandle(4294967284)
+    }
+    unsafe {
+        assert(SetStdHandle(4294967286, 0) != 0)
+        assert(SetStdHandle(4294967285, 0) != 0)
+        assert(SetStdHandle(4294967284, 0) != 0)
+    }
+    {
+        input := console.stdin()
+        output := console.stdout()
+        errors := console.stderr()
+        storage := [0u8; 1]
+        match input.read(&mut storage[..0]) {
+            ok(count) => {
+                assert(count == 0)
+            }, err(_) => {
+                return 1
+            }
+        }
+        match output.print("") {
+            ok(count) => {
+                assert(count == 0)
+            }, err(_) => {
+                return 2
+            }
+        }
+        match input.read(&mut storage) {
+            ok(_) => {
+                return 3
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.Closed && reason.code == 6 && reason.transferred == 0)
+            }
+        }
+        match output.println("x") {
+            ok(_) => {
+                return 4
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.Closed && reason.code == 6 && reason.transferred == 0)
+            }
+        }
+        match errors.println("x") {
+            ok(_) => {
+                return 5
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.Closed && reason.code == 6 && reason.transferred == 0)
+            }
+        }
+    }
+    unsafe {
+        assert(SetStdHandle(4294967286, saved_in) != 0)
+        assert(SetStdHandle(4294967285, saved_out) != 0)
+        assert(SetStdHandle(4294967284, saved_err) != 0)
+    }
+    return 0
+}

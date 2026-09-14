@@ -1,0 +1,197 @@
+package std_printing_checks
+import "std/io"
+import "std/fmt"
+import "std/fmt/errors"
+import "std/text"
+import "std/net"
+import "std/tls"
+import "std/http"
+import "std/platform/error" as platform_error
+import "alloc/error" as allocation
+import "std/web"
+import "std/bytes"
+import "std/math"
+import "std/time"
+import "std/sync/error" as sync_error
+import "core/ptr"
+import "core/bytes" as raw
+
+pub struct Partial {
+    storage: &mut[u8]
+    used: usize
+    calls: usize
+    stop: usize
+    zero: bool
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        self.calls += 1
+        if self.used == self.stop {
+            if self.zero {
+                return ok(0)
+            }
+            return err(io.Error { kind: io.ErrorKind.WouldBlock, transferred: 0, code: 11 })
+        }
+        self.storage[self.used] = source[0]
+        self.used += 1
+        if self.calls % 2 == 0 {
+            return err(io.Error { kind: io.ErrorKind.Interrupted, transferred: 1, code: 4 })
+        }
+        return ok(1)
+    }
+}
+fn equal<T>(value: &T, expected: &[u8]) -> void!io.Error {
+    storage := [0u8; 512]
+    sink := io.MemoryWriter.new(&mut storage)
+    count := fmt.value(&mut sink, value)?
+    assert(count == expected.len && raw.equal(sink.written(), expected))
+    return ok()
+}
+fn from_bits(bits: u64) -> f64 {
+    return unsafe {
+        ptr.read_unaligned(ptr.from_ref(&bits) as *const f64)
+    }
+}
+fn verify() -> void!io.Error {
+    a := fmt.signed(-9223372036854775807 - 1)
+    equal(&a, b"-9223372036854775808")?
+    b := fmt.unsigned(18446744073709551615)
+    equal(&b, b"18446744073709551615")?
+    c := fmt.boolean(true)
+    equal(&c, b"true")?
+    d := fmt.boolean(false)
+    equal(&d, b"false")?
+    e := fmt.floating(1.25)
+    equal(&e, b"1.250000e+00")?
+    f := fmt.floating(-0.0)
+    equal(&f, b"-0.000000e+00")?
+    g := fmt.floating(from_bits(0x7ff0000000000000))
+    equal(&g, b"inf")?
+    h := fmt.floating(from_bits(0xfff8000000000001))
+    equal(&h, b"nan")?
+    i := fmt.codepoint(233)
+    equal(&i, b"\xc3\xa9")?
+    j := fmt.signed(0)
+    equal(&j, b"0")?
+    k := fmt.floating(from_bits(1))
+    equal(&k, b"4.940656e-324")?
+    small: i8 = -7
+    wide := fmt.signed(small as i64)
+    equal(&wide, b"-7")?
+    issue := io.Error { kind: io.ErrorKind.BrokenPipe, transferred: 3, code: 32 }
+    equal(&issue, b"io: BrokenPipe code=32 transferred=3")?
+    native := platform_error.Error { kind: platform_error.Kind.PermissionDenied, code: 13 }
+    equal(&native, b"platform/error: PermissionDenied code=13")?
+    network := net.Error { kind: net.ErrorKind.ConnectionRefused, code: 111, transferred: 0 }
+    equal(&network, b"net: ConnectionRefused code=111 transferred=0")?
+    secure := tls.Error { kind: tls.ErrorKind.VerificationFailed, code: -42, transferred: 7 }
+    equal(&secure, b"tls: VerificationFailed code=-42 transferred=7")?
+    protocol := http.Error { kind: http.ErrorKind.InvalidHeader, position: 8 }
+    equal(&protocol, b"http: InvalidHeader position=8")?
+    // Deliberately secret input must never appear in the printable parse error.
+    match text.parse_i64(b"password=secret&body=private", 10) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            equal(&reason, b"text: InvalidDigit position=0")?
+        }
+    }
+    alloc := errors.allocation(allocation.AllocError.Exhausted)
+    equal(&alloc, b"allocation: Exhausted")?
+    route := errors.web(web.Error.InvalidPath)
+    equal(&route, b"web: InvalidPath")?
+    range := errors.range(bytes.RangeError.OutOfBounds)
+    equal(&range, b"range: OutOfBounds")?
+    parse := errors.parse(text.ParseError.InvalidDigit)
+    equal(&parse, b"parse: InvalidDigit")?
+    format := errors.format(fmt.FormatError.BufferTooSmall)
+    equal(&format, b"format: BufferTooSmall")?
+    sync := errors.synchronization(sync_error.Error.Closed)
+    equal(&sync, b"synchronization: Closed")?
+    math_error := errors.math(math.MathError.DivisionByZero)
+    equal(&math_error, b"math: DivisionByZero")?
+    time_error := errors.time(time.TimeError.ClockFailure)
+    equal(&time_error, b"time: ClockFailure")?
+    storage := [0u8; 64]
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        count := fmt.println(&mut sink, "")?
+        assert(count == 1 && raw.equal(sink.written(), b"\n"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        count := fmt.print(&mut sink, "a\x00b")?
+        assert(count == 3 && raw.equal(sink.written(), b"a\x00b"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        invalid := fmt.codepoint(0xd800)
+        match fmt.value_line(&mut sink, &invalid) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.InvalidInput && reason.transferred == 0 && sink.position() == 0)
+            }
+        }
+    }
+    {
+        sink := Partial { storage: &mut storage, used: 0, calls: 0, stop: 64, zero: false }
+        count := fmt.println(&mut sink, "héllo")?
+        assert(count == 7 && sink.used == 7)
+    }
+    assert(raw.equal(&storage[..7], b"h\xc3\xa9llo\n"))
+    for stop in 0usize..4 {
+        sink := Partial { storage: &mut storage, used: 0, calls: 0, stop: stop, zero: false }
+        match fmt.println(&mut sink, "abc") {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.WouldBlock && reason.code == 11 && reason.transferred == stop)
+            }
+        }
+    }
+    {
+        sink := Partial { storage: &mut storage, used: 0, calls: 0, stop: 2, zero: true }
+        number := fmt.signed(123)
+        match fmt.value_line(&mut sink, &number) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.WriteZero && reason.transferred == 2)
+            }
+        }
+    }
+    {
+        sink := Partial { storage: &mut storage, used: 0, calls: 0, stop: 0, zero: false }
+        count := fmt.print(&mut sink, "")?
+        assert(count == 0 && sink.calls == 0)
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage[..2])
+        match fmt.value(&mut sink, &issue) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.BufferFull && reason.transferred == 2)
+            }
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match verify() {
+        ok() => {
+            return 0
+        }, err(_) => {
+            return 250
+        }
+    }
+}
+
+@test
+fn printing_contracts() {
+    assert_eq(main(), 0)
+}

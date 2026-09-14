@@ -23,15 +23,24 @@ manager is needed:
 ```dodo test
 package main
 
+import "std/console"
+
 fn main() -> i32 {
-    return 0
+    match console.println("Hello, world!") {
+        ok(_) => { return 0 }
+        err(_) => { return 1 }
+    }
 }
 ```
 
 - `package main` names the package that contains this file.
+- `import "std/console"` loads safe hosted console I/O from the bundled library.
 - `fn main()` defines the function that runs when the program starts.
 - `-> i32` says that `main` returns a 32-bit integer.
-- `return 0` ends the program with a success exit status.
+- `console.println("Hello, world!")` writes the greeting followed by a newline.
+- `match` handles the Result: `ok(_)` means all bytes were written; `err(_)` means
+  an I/O operation failed. `_` explicitly discards the count or error details.
+- `return 0` sets a success exit status; `return 1` reports failure.
 
 Braces surround the function body. Each statement can end at a newline, so this
 program needs no semicolons.
@@ -45,9 +54,15 @@ dodo run
 ```
 
 `dodo run` looks for `main.dodo` in the current folder.
-The program prints nothing. Your terminal returns to its prompt when the
-program finishes successfully. Returning `0` sets the exit status; it does not
-print the number.
+The program prints:
+
+```text
+Hello, world!
+```
+
+Your terminal returns to its prompt when the program finishes. Returning `0`
+sets the exit status; it does not print the number. Console access supports
+Linux GNU x86-64 and Windows x64 and needs no unsafe code in your program.
 
 On a Linux shell, you can see that status by running this immediately afterward:
 
@@ -77,9 +92,12 @@ dodo compile
 
 The output takes its name from the project folder, `hello`.
 The build prints `Built build/hello`. Running `./build/hello` then runs the same
-program, with the same empty output and success status.
+program, with the same greeting and success status.
 
 ## Next steps
+
+Continue with [console I/O](console.md) to print values, report errors to stderr,
+and read a line into caller-owned storage.
 
 Learn [everyday compiler commands](command-line.md), including `dodo fmt` for
 formatting your code, organize shared code in

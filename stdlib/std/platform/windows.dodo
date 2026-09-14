@@ -59,9 +59,28 @@ fn io_error(reason: error.Error) -> io.Error {
     if reason.kind == error.Kind.InvalidInput {
         kind = io.ErrorKind.InvalidInput
     }
+    if reason.kind == error.Kind.WouldBlock {
+        kind = io.ErrorKind.WouldBlock
+    }
+    if reason.kind == error.Kind.TimedOut {
+        kind = io.ErrorKind.TimedOut
+    }
+    if reason.kind == error.Kind.Cancelled {
+        kind = io.ErrorKind.Cancelled
+    }
+    if reason.kind == error.Kind.Closed {
+        kind = io.ErrorKind.Closed
+    }
+    if reason.kind == error.Kind.PermissionDenied {
+        kind = io.ErrorKind.PermissionDenied
+    }
+    if reason.kind == error.Kind.BrokenPipe {
+        kind = io.ErrorKind.BrokenPipe
+    }
     return io.Error { kind: kind, transferred: 0, code: reason.code }
 }
 
+unsafe extern "C" fn GetStdHandle(kind: u32) -> isize
 unsafe extern "C" fn GetLastError() -> u32
 unsafe extern "C" fn CloseHandle(handle: *mut u8) -> i32
 unsafe extern "C" fn ReadFile(handle: *mut u8, data: *mut u8, size: u32, count: *mut u32, overlapped: *mut u8) -> i32
@@ -99,6 +118,9 @@ pub fn from_code(code: i32) -> error.Error {
     if code == 122 || code == 206 {
         kind = error.Kind.BufferTooSmall
     }
+    if code == 109 {
+        kind = error.Kind.BrokenPipe
+    }
     if code == 6 {
         kind = error.Kind.Closed
     }
@@ -108,6 +130,7 @@ pub fn from_code(code: i32) -> error.Error {
     if code == 1460 || code == 258 {
         kind = error.Kind.TimedOut
     }
+    // ERROR_NO_DATA is also used by a nonblocking pipe read with no data.
     if code == 997 || code == 232 {
         kind = error.Kind.WouldBlock
     }
@@ -115,7 +138,9 @@ pub fn from_code(code: i32) -> error.Error {
 }
 pub fn last_error() -> error.Error {
     unsafe {
-        return from_code(GetLastError() as i32)
+        // Preserve every native code bit, including codes with the high bit set.
+        code := GetLastError()
+        return from_code(ptr.read_unaligned(ptr.from_ref(&code) as *const i32))
     }
 }
 
@@ -215,40 +240,10 @@ pub struct Handle {
         }
     }
     pub fn read(&mut self, output: &mut[u8]) -> usize!io.Error {
-        if output.len == 0 {
-            return ok(0)
-        }
-        request := output.len
-        if request > 4294967295usize {
-            request = 4294967295usize
-        }
-        count := 0u32
-        unsafe {
-            if ReadFile(self.value as *mut u8, ptr.as_mut_ptr(output), request as u32, ptr.from_mut(&mut count), 0usize as *mut u8) == 0 {
-                reason := last_error()
-                if reason.code == 109 || reason.code == 38 {
-                    return ok(0)
-                }
-                return err(io_error(reason))
-            }
-        }
-        return ok(count as usize)
+        return read_handle(self.value, output)
     }
     pub fn write(&mut self, input: &[u8]) -> usize!io.Error {
-        if input.len == 0 {
-            return ok(0)
-        }
-        request := input.len
-        if request > 4294967295usize {
-            request = 4294967295usize
-        }
-        count := 0u32
-        unsafe {
-            if WriteFile(self.value as *mut u8, ptr.as_ptr(input), request as u32, ptr.from_mut(&mut count), 0usize as *mut u8) == 0 {
-                return err(io_error(last_error()))
-            }
-        }
-        return ok(count as usize)
+        return write_handle(self.value, input)
     }
     pub fn seek(&mut self, position: usize) -> usize!io.Error {
         if position > 9223372036854775807usize {
@@ -283,4 +278,78 @@ pub struct Handle {
         }
         return ok()
     }
+}
+
+fn read_handle(handle: isize, output: &mut[u8]) -> usize!io.Error {
+    if output.len == 0 {
+        return ok(0)
+    }
+    request := output.len
+    if request > 4294967295usize {
+        request = 4294967295usize
+    }
+    count := 0u32
+    unsafe {
+        if ReadFile(handle as *mut u8, ptr.as_mut_ptr(output), request as u32, ptr.from_mut(&mut count), 0usize as *mut u8) == 0 {
+            reason := last_error()
+            if reason.code == 109 || reason.code == 38 {
+                return ok(count as usize)
+            }
+            reason_io := io_error(reason)
+            reason_io.transferred = count as usize
+            return err(reason_io)
+        }
+    }
+    return ok(count as usize)
+}
+
+fn write_handle(handle: isize, input: &[u8]) -> usize!io.Error {
+    if input.len == 0 {
+        return ok(0)
+    }
+    request := input.len
+    if request > 4294967295usize {
+        request = 4294967295usize
+    }
+    count := 0u32
+    unsafe {
+        if WriteFile(handle as *mut u8, ptr.as_ptr(input), request as u32, ptr.from_mut(&mut count), 0usize as *mut u8) == 0 {
+            reason := io_error(last_error())
+            reason.transferred = count as usize
+            return err(reason)
+        }
+    }
+    return ok(count as usize)
+}
+
+// Borrowed process standard stream: deliberately has no close or destructor.
+// Native replacement/closure by foreign code is observed as ordinary I/O.
+pub struct BorrowedHandle {
+    value: isize
+    pub fn read(&mut self, output: &mut[u8]) -> usize!io.Error {
+        return read_handle(self.value, output)
+    }
+    pub fn write(&mut self, input: &[u8]) -> usize!io.Error {
+        return write_handle(self.value, input)
+    }
+}
+// DWORD spellings of STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+// (-10, -11, -12); signed-to-unsigned numeric casts would be checked.
+pub fn stdin() -> BorrowedHandle {
+    value := unsafe {
+        GetStdHandle(4294967286)
+    }
+    return BorrowedHandle { value: value }
+}
+pub fn stdout() -> BorrowedHandle {
+    value := unsafe {
+        GetStdHandle(4294967285)
+    }
+    return BorrowedHandle { value: value }
+}
+pub fn stderr() -> BorrowedHandle {
+    value := unsafe {
+        GetStdHandle(4294967284)
+    }
+    return BorrowedHandle { value: value }
 }
