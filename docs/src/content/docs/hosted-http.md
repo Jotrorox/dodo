@@ -95,7 +95,8 @@ A completed non-200 response exits 2. The server reports individual failed
 connections in its `Report`, independently of startup errors.
 
 For the shortest bounded-body and one-request examples, see [HTTP](http.md)
-and [web serving](web.md). `Config.max_connections` sets a finite number of
+and [web serving](web.md); those guides also cover the underlying protocol APIs.
+`Config.max_connections` sets a finite number of
 accepted connections (including rejected requests). Repository versions are
 [http_client.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/http_client.dodo)
 and [web_server.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/web_server.dodo).

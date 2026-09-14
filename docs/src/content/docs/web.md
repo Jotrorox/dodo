@@ -263,4 +263,8 @@ integrations are separate extension work. HTTPS uses an independently supplied
 
 ## Hosted convenience layer
 
-Use `std/web/hosted` for a bounded serial listener with ordinary structural handlers. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit storage bounds, resolver/deadline scope, cancellation, and a generated local HTTPS setup.
+Use `std/web/hosted` for a bounded serial listener with ordinary structural
+handlers and library-owned connection, readiness, deadline, and body-transfer
+loops. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs,
+explicit storage bounds, resolver/deadline scope, cancellation, and a generated
+local HTTPS setup. Protocol and routing APIs remain usable independently.

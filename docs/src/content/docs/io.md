@@ -189,9 +189,11 @@ probe after filling the destination: an exact fit has `eof=true`; overflow has
 `eof=false` and discards that probe byte. Use it for a whole bounded input, not
 for resumable chunk streaming. Errors retain `output[..transferred]`.
 
-`io.read_line(reader, output)` retains LF and any preceding CR. Its `LineEnd`
-is `Newline`, `Eof`, or `Full`. `Eof` with zero length is end-of-input; with
+`io.read_line(&mut reader, &mut output)` returns `io.Line { count, end }`,
+retaining LF and any preceding CR in `count`. Its `LineEnd` is `Newline`, `Eof`,
+or `Full`. `Eof` with zero length is end-of-input; with
 positive length it is a final unterminated line. `Full` consumes no lookahead:
 process that fragment and call again to resume. Empty storage returns `Full`
 without reading. Errors preserve the initialized prefix, even if it ends in LF.
 Only `Interrupted` is retried. Neither helper decodes UTF-8 or allocates.
+See [bounded console input](console.md#read-a-bounded-line) for standard streams.

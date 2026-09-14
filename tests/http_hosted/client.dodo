@@ -1,0 +1,138 @@
+package hosted_client_checks
+import "core/bytes"
+import "std/console"
+import "std/http"
+import "std/http/hosted"
+import "std/http/hosting"
+import "std/io"
+import "std/net"
+import "std/net/native"
+import "std/thread"
+
+pub struct SlowWriter {
+    pub data: [64]u8
+    pub used: usize
+    pending: bool
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        if self.pending { self.pending = false; return err(io.failure(io.ErrorKind.WouldBlock, 0)) }
+        self.pending = true
+        if self.used == self.data.len { return err(io.failure(io.ErrorKind.BufferFull, 0)) }
+        self.data[self.used] = source[0]
+        self.used += 1
+        return err(io.failure(io.ErrorKind.Interrupted, 1))
+    }
+}
+fn rejected(url: &[u8], kind: hosting.ErrorKind, cap: usize) -> void!hosting.Error {
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    config := hosted.Config.defaults()
+    config.body_bytes = 8
+    config.header_bytes = 512
+    config.max_redirects = 2
+    config.request_timeout_ms = 150
+    client := hosted.Client.new(&mut workspace, config)?
+    body := [0u8; 32]
+    match client.get(url, &mut body[..cap]) {
+        ok(_) => { assert(false, "expected request failure") }
+        err(reason) => {
+            assert(reason.kind == kind, "wrong hosted error")
+            match client.header(b"X-Test", 0) { some(_) => { assert(false, "stale header") } none => {} }
+        }
+    }
+    return ok()
+}
+pub struct DelayedResolver {
+    pub fn resolve<C, X>(&mut self, host: &[u8], port: u16, workspace: &mut[u8], operation: &net.Operation, clock: &mut C, cancel: &X) -> native.Addresses!net.Error from(workspace) {
+        // Deliberately simulates an uncancellable resolver, including ignoring
+        // its operation. The client must check the resolution budget on return.
+        thread.sleep_ms(250)
+        return native.resolve_numeric(b"127.0.0.1", port, workspace)
+    }
+}
+fn resolution_scope(budget: u64, expires: bool) -> void!hosting.Error {
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    config := hosted.Config.defaults()
+    config.resolution_timeout_ms = budget
+    config.request_timeout_ms = 150
+    client := hosted.Client.new(&mut workspace, config)?
+    storage := [0u8; 32]
+    sink := io.MemoryWriter.new(&mut storage)
+    headers: [0]http.Header = []
+    request := hosted.Request { url: b"http://localhost:@@HTTP@@/fast", method: b"GET", headers: &headers, body: b"" }
+    resolver := DelayedResolver {}
+    connector := hosted.PlainConnector {}
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    started := clock.now_ms()
+    match client.request_with(&request, &mut sink, &mut resolver, &mut connector, &mut clock, &cancel) {
+        ok(response) => { assert(!expires && response.status == 200) }
+        err(reason) => { assert(expires && reason.kind == hosting.ErrorKind.TimedOut) }
+    }
+    assert(clock.now_ms() - started >= 250, "synchronous resolver was not preempted")
+    return ok()
+}
+fn run() -> void!hosting.Error {
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    config := hosted.Config.defaults()
+    config.max_redirects = 2
+    client := hosted.Client.new(&mut workspace, config)?
+    body := [0u8; 64]
+    empty_path := client.get(b"http://localhost:@@HTTP@@?query", &mut body)?
+    assert(empty_path.status == 200 && empty_path.body_bytes == 5)
+    close_body := client.get(b"http://localhost:@@HTTP@@/close", &mut body)?
+    assert(close_body.status == 200 && close_body.body_bytes == 5)
+    response := client.get(b"http://localhost:@@HTTP@@/fragmented?yes", &mut body)?
+    assert(response.status == 200 && response.body_bytes == 13)
+    assert(bytes.equal(&body[..13], b"Hello, Dodo!\n"))
+    match client.header(b"X-Test", 1) {
+        some(field) => { assert(bytes.equal(field.value, b"second")) }
+        none => { assert(false, "missing duplicate header") }
+    }
+    slow := SlowWriter { data: [0u8; 64], used: 0, pending: true }
+    streamed := client.get_to(b"http://localhost:@@HTTP@@/fragmented", &mut slow)?
+    assert(streamed.body_bytes == 13 && slow.used == 13)
+    headers := [http.Header { name: b"X-Custom", value: b"kept" }, http.Header { name: b"Content-Type", value: b"text/plain" }]
+    request := hosted.Request { url: b"http://localhost:@@HTTP@@/redirect307", method: b"POST", headers: &headers, body: b"repeat me" }
+    writer := io.MemoryWriter.new(&mut body)
+    redirected := client.request(&request, &mut writer)?
+    assert(redirected.status == 200 && redirected.redirects == 1)
+    assert(bytes.equal(writer.written(), b"repeat me"))
+    core.drop(writer)
+    request303 := hosted.Request { url: b"http://localhost:@@HTTP@@/redirect303", method: b"POST", headers: &headers, body: b"discard me" }
+    writer303 := io.MemoryWriter.new(&mut body)
+    changed := client.request(&request303, &mut writer303)?
+    assert(changed.status == 200 && changed.redirects == 1)
+    core.drop(writer303)
+    head_request := hosted.Request { url: b"http://localhost:@@HTTP@@/head", method: b"HEAD", headers: &headers, body: b"" }
+    head_writer := io.MemoryWriter.new(&mut body)
+    head := client.request(&head_request, &mut head_writer)?
+    assert(head.status == 200 && head.body_bytes == 0)
+    core.drop(head_writer)
+    for i in 0usize..50 {
+        result := client.get(b"http://localhost:@@HTTP@@/fast", &mut body)?
+        assert(result.status == 200)
+    }
+    rejected(b"http://localhost:@@HTTP@@/large", hosting.ErrorKind.BodyLimit, 32)?
+    rejected(b"http://localhost:@@HTTP@@/fast", hosting.ErrorKind.BodyLimit, 2)?
+    rejected(b"http://localhost:@@HTTP@@/chunklimit", hosting.ErrorKind.BodyLimit, 32)?
+    rejected(b"http://localhost:@@HTTP@@/badchunk", hosting.ErrorKind.Protocol, 32)?
+    rejected(b"http://localhost:@@HTTP@@/badtrailer", hosting.ErrorKind.Protocol, 32)?
+    rejected(b"http://localhost:@@HTTP@@/malformed", hosting.ErrorKind.Protocol, 32)?
+    rejected(b"http://localhost:@@HTTP@@/eof", hosting.ErrorKind.Protocol, 32)?
+    rejected(b"http://localhost:@@HTTP@@/headers", hosting.ErrorKind.HeaderLimit, 32)?
+    rejected(b"http://localhost:@@HTTP@@/timeout", hosting.ErrorKind.TimedOut, 32)?
+    rejected(b"http://localhost:@@HTTP@@/cross", hosting.ErrorKind.Redirect, 32)?
+    rejected(b"http://localhost:@@HTTP@@/loop", hosting.ErrorKind.Redirect, 32)?
+    resolution_scope(1000, false)?
+    resolution_scope(10, true)?
+    return ok()
+}
+fn main() -> i32 {
+    match run() {
+        ok() => { return 0 }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println_value(&reason) { ok(_) => {} err(_) => {} }
+            return 1
+        }
+    }
+}

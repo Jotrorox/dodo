@@ -376,4 +376,8 @@ allocation, or implicit transport destructor in this metadata layer.
 
 ## Hosted convenience layer
 
-Use `std/http/hosted` for a reusable URL client and `std/http/https` for verified HTTPS. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit storage bounds, resolver/deadline scope, cancellation, and a generated local HTTPS setup.
+Use `std/http/hosted` for a reusable URL client and `std/http/https` for verified
+HTTPS. They drive connection, readiness, deadline, and body-transfer loops.
+See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit
+storage bounds, resolver/deadline scope, cancellation, and a generated local
+HTTPS setup. The protocol APIs on this page remain usable independently.

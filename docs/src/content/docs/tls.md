@@ -312,4 +312,8 @@ behavior; Wine cannot establish those native-environment properties.
 
 ## Hosted convenience layer
 
-Use `std/http/https` for verified URL requests and a hosted HTTPS listener. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit storage bounds, resolver/deadline scope, cancellation, and a generated local HTTPS setup.
+Use `std/http/https` for verified URL requests and a hosted HTTPS listener with
+library-owned connection, readiness, deadline, and body-transfer loops.
+See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit
+storage bounds, resolver/deadline scope, cancellation, and a generated local
+HTTPS setup. The TLS engine and transport APIs remain usable independently.

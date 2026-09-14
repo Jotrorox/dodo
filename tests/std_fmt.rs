@@ -44,12 +44,17 @@ fn formatting_executes_and_cross_compiles() {
     let source = root.join("tests/stdlib/std_fmt.dodo");
     execute(&source, &scratch, "formatting");
     execute(
+        &root.join("tests/stdlib/std_printing.dodo"),
+        &scratch,
+        "printing",
+    );
+    execute(
         &root.join("tests/stdlib/std_fmt_alloc.dodo"),
         &scratch,
         "allocated-formatting",
     );
     execute(&root.join("examples/formatting.dodo"), &scratch, "example");
-    for fixture in ["std_fmt", "std_fmt_alloc"] {
+    for fixture in ["std_fmt", "std_fmt_alloc", "std_printing"] {
         let source = root.join(format!("tests/stdlib/{fixture}.dodo"));
         for target in ["wasm32-unknown-unknown", "thumbv6m-none-eabi"] {
             for optimization in ["0", "3"] {

@@ -1,0 +1,88 @@
+package http_client
+import "std/net"
+import "std/net/native"
+import "std/http"
+import "std/http/connection"
+import "std/http/client"
+
+// Start examples/web_server.dodo first. This client consumes a streaming body
+// using fixed buffers and a five-second absolute deadline, then exits.
+fn exchange(stream: &mut native.TcpConnection, clock: &mut native.MonotonicClock, origin: http.Uri) -> i32!connection.Error {
+    workspace := [0u8; 8192]
+    input := [0u8; 1024]
+    output := [0u8; 1024]
+    policy := client.Policy.defaults()
+    policy.request_timeout_ms = 5000
+    driver := client.Client.new(origin, &mut workspace, &mut input, &mut output, http.Limits.defaults(), policy)?
+    headers := [http.Header { name: b"Host", value: b"localhost:8080" }]
+    request := http.Request { method: b"GET", target: b"/", headers: &headers, body: http.Body.empty() }
+    driver.begin(&request, clock.now_ms(), false)?
+    for driver.pending_output() != 0 {
+        progress := driver.poll_flush(stream, clock.now_ms(), false)?
+        match stream.wait_ready(net.Interest.Write, 10) {
+            ok(_) => {}
+            err(_) => {
+                return ok(2)
+            }
+        }
+    }
+    trailers: [0]http.Header = []
+    driver.finish_body(&trailers, clock.now_ms(), false)?
+    received := 0usize
+    for true {
+        event := driver.poll_event(stream, clock.now_ms(), false)?
+        if event.kind == http.EventKind.Body {
+            count := driver.body().len
+            received += count
+            driver.consume_body(count, clock.now_ms(), false)?
+        }
+        if event.kind == http.EventKind.Complete {
+            if driver.status() != 200 || received != 13 {
+                return ok(3)
+            }
+            return ok(0)
+        }
+        if event.kind == http.EventKind.NeedInput {
+            match stream.wait_ready(net.Interest.Read, 10) {
+                ok(_) => {}
+                err(_) => {
+                    return ok(4)
+                }
+            }
+        }
+    }
+    return ok(5)
+}
+fn run() -> i32!net.Error {
+    address := net.parse_socket(b"127.0.0.1:8080")?
+    clock := native.MonotonicClock {}
+    deadline := clock.now_ms() + 5000
+    operation := net.Operation.until(deadline)
+    cancel := net.NeverCancel {}
+    stream := native.connect_with(&address, &operation, &mut clock, &cancel)?
+    match http.Uri.parse(b"http://localhost:8080/") {
+        ok(origin) => {
+            match exchange(&mut stream, &mut clock, origin) {
+                ok(code) => {
+                    return ok(code)
+                }
+                err(_) => {
+                    return ok(6)
+                }
+            }
+        }
+        err(_) => {
+            return ok(7)
+        }
+    }
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

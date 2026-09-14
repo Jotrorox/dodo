@@ -149,7 +149,8 @@ See [console I/O](console.md) for the complete hosted API, formatting defaults,
 line-reading results, and stream ownership. `fmt.print` and `fmt.println` take
 any structural writer and a string; `fmt.value_line` adds LF to `fmt.value`.
 Each helper reports cumulative progress for its whole call, including a failing
-newline write. `Formatter.decimal(i64)` and `natural(u64)` use default decimal
+newline write, completes short writes, and retries interruptions.
+`Formatter.decimal(i64)` and `natural(u64)` use default decimal
 formatting and support structural library error formatters without an import cycle.
 
 I/O, native platform, text, network, TLS, and HTTP errors implement `format`
@@ -157,3 +158,4 @@ directly. Optional `std/fmt/errors` supplies displays for enum errors with
 `allocation`, `range`, `parse`, `format`, `synchronization`, `web`, `math`, and
 `time`. Every display works with `fmt.value`, `fmt.value_line`, and console value
 printing. Built-in error output includes fixed kinds and numeric metadata only.
+It does not capture sensitive input or native error-message strings.

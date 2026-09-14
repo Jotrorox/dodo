@@ -1,0 +1,316 @@
+package hosting
+
+import "core/mem"
+import "std/http"
+import "std/http/connection"
+import "std/io"
+import "std/net"
+import "std/net/native"
+import "std/tls"
+import "std/thread"
+
+// Shared hosted driving primitives. Portable HTTP never imports this module.
+pub enum ErrorKind {
+    InvalidInput, Workspace, Resolve, Connect, Transport, Protocol, Tls,
+    BodyLimit, HeaderLimit, TimedOut, Cancelled, Redirect, Handler
+}
+pub struct Error {
+    pub kind: ErrorKind
+    pub network: net.Error
+    pub protocol: http.Error
+    pub transport: io.Error
+    pub security: tls.Error
+    // Response bytes accepted by the client sink before success/failure.
+    pub delivered: u64
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("http hosted: ")?
+        match &self.kind {
+            ErrorKind.InvalidInput => {
+                output.string("InvalidInput")?
+            }
+            ErrorKind.Workspace => {
+                output.string("Workspace")?
+            }
+            ErrorKind.Resolve => {
+                output.string("Resolve")?
+            }
+            ErrorKind.Connect => {
+                output.string("Connect")?
+            }
+            ErrorKind.Transport => {
+                output.string("Transport")?
+            }
+            ErrorKind.Protocol => {
+                output.string("Protocol")?
+            }
+            ErrorKind.Tls => {
+                output.string("Tls")?
+            }
+            ErrorKind.BodyLimit => {
+                output.string("BodyLimit")?
+            }
+            ErrorKind.HeaderLimit => {
+                output.string("HeaderLimit")?
+            }
+            ErrorKind.TimedOut => {
+                output.string("TimedOut")?
+            }
+            ErrorKind.Cancelled => {
+                output.string("Cancelled")?
+            }
+            ErrorKind.Redirect => {
+                output.string("Redirect")?
+            }
+            ErrorKind.Handler => {
+                output.string("Handler")?
+            }
+        }
+        if self.kind == ErrorKind.Protocol || self.kind == ErrorKind.HeaderLimit {
+            output.string("; ")?;
+            self.protocol.format(output)?
+        }
+        if self.kind == ErrorKind.Tls {
+            output.string("; ")?;
+            self.security.format(output)?
+        }
+        if self.kind == ErrorKind.Resolve || self.kind == ErrorKind.Connect {
+            output.string("; ")?;
+            self.network.format(output)?
+        }
+        if self.kind == ErrorKind.Transport {
+            output.string("; ")?;
+            self.transport.format(output)?
+        }
+        return ok()
+    }
+
+}
+pub fn failure(kind: ErrorKind) -> Error {
+    return Error { kind: kind, network: net.failure(net.ErrorKind.Other),
+    protocol: http.failure(http.ErrorKind.InvalidState, 0),
+    transport: io.failure(io.ErrorKind.Other, 0), security: tls.failure(tls.ErrorKind.Backend, 0), delivered: 0 }
+}
+pub fn network_error(reason: net.Error, kind: ErrorKind) -> Error {
+    result := failure(kind)
+    if reason.kind == net.ErrorKind.TimedOut {
+        result.kind = ErrorKind.TimedOut
+    }
+    if reason.kind == net.ErrorKind.Cancelled {
+        result.kind = ErrorKind.Cancelled
+    }
+    result.network = reason
+    return result
+}
+pub fn protocol_error(reason: http.Error) -> Error {
+    result := failure(ErrorKind.Protocol)
+    if reason.kind == http.ErrorKind.BodyLimit {
+        result.kind = ErrorKind.BodyLimit
+    }
+    if reason.kind == http.ErrorKind.HeaderLimit || reason.kind == http.ErrorKind.BufferFull {
+        result.kind = ErrorKind.HeaderLimit
+    }
+    result.protocol = reason
+    return result
+}
+pub fn io_error(reason: io.Error) -> Error {
+    result := failure(ErrorKind.Transport)
+    if reason.kind == io.ErrorKind.BufferFull {
+        result.kind = ErrorKind.BodyLimit
+    }
+    result.transport = reason
+    return result
+}
+pub fn connection_error(reason: connection.Error) -> Error {
+    if reason.kind == connection.ErrorKind.Protocol {
+        return protocol_error(mem.replace(&mut reason.protocol, http.failure(http.ErrorKind.InvalidState, 0)))
+    }
+    if reason.kind == connection.ErrorKind.Transport {
+        return io_error(mem.replace(&mut reason.transport, io.failure(io.ErrorKind.Other, 0)))
+    }
+    if reason.kind == connection.ErrorKind.TimedOut {
+        return failure(ErrorKind.TimedOut)
+    }
+    if reason.kind == connection.ErrorKind.Cancelled {
+        return failure(ErrorKind.Cancelled)
+    }
+    return failure(ErrorKind.InvalidInput)
+}
+pub fn tls_error(reason: tls.Error) -> Error {
+    result := failure(ErrorKind.Tls)
+    if reason.kind == tls.ErrorKind.TimedOut {
+        result.kind = ErrorKind.TimedOut
+    }
+    if reason.kind == tls.ErrorKind.Cancelled {
+        result.kind = ErrorKind.Cancelled
+    }
+    result.security = reason
+    return result
+}
+// Zero is never an implicit infinite timeout in the hosted layer.
+pub fn deadline(now: u64, milliseconds: u64) -> u64 {
+    if now > 18446744073709551615u64 - milliseconds {
+        return 18446744073709551615u64
+    }
+    return now + milliseconds
+}
+pub fn earlier(a: u64, b: u64) -> u64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+pub fn check<C, X>(clock: &mut C, cancel: &X, until: u64) -> void!Error {
+    if cancel.cancelled() {
+        return err(failure(ErrorKind.Cancelled))
+    }
+    if clock.now_ms() >= until {
+        return err(failure(ErrorKind.TimedOut))
+    }
+    return ok()
+}
+pub fn pause<C, X>(clock: &mut C, cancel: &X, until: u64) -> void!Error {
+    check(clock, cancel, until)?
+    thread.sleep_ms(1)
+    return check(clock, cancel, until)
+}
+pub fn wait<S, C, X>(stream: &mut S, writing: bool, clock: &mut C, cancel: &X, until: u64) -> void!Error {
+    check(clock, cancel, until)?
+    now := clock.now_ms()
+    if now >= until {
+        return err(failure(ErrorKind.TimedOut))
+    }
+    remaining := until - now
+    milliseconds := 10u32
+    if remaining < 10 {
+        milliseconds = remaining as u32
+    }
+    stream.wait(writing, milliseconds)?
+    return check(clock, cancel, until)
+}
+pub fn flush<S, C, X>(driver: &mut connection.Connection, stream: &mut S, clock: &mut C, cancel: &X, until: u64) -> void!Error {
+    for driver.pending_output() != 0 {
+        check(clock, cancel, until)?
+        match driver.poll_flush(stream) {
+            ok(progress) => {
+                if progress.state == io.PollState.Pending {
+                    wait(stream, true, clock, cancel, until)?
+                }
+            }
+            err(reason) => {
+                return err(connection_error(reason))
+            }
+        }
+    }
+    for true {
+        check(clock, cancel, until)?
+        if stream.flush()? {
+            return ok()
+        }
+        wait(stream, true, clock, cancel, until)?
+    }
+    return err(failure(ErrorKind.Transport))
+}
+pub fn send<S, C, X>(driver: &mut connection.Connection, stream: &mut S, body: &[u8], clock: &mut C, cancel: &X, until: u64) -> void!Error {
+    offset := 0usize
+    flush(driver, stream, clock, cancel, until)?
+    for offset < body.len {
+        check(clock, cancel, until)?
+        match driver.send_body(&body[offset..]) {
+            ok(count) => {
+                if count == 0 {
+                    return err(failure(ErrorKind.InvalidInput))
+                }
+                offset += count
+            }
+            err(reason) => {
+                return err(connection_error(reason))
+            }
+        }
+        flush(driver, stream, clock, cancel, until)?
+    }
+    trailers: [0]http.Header = []
+    match driver.finish_body(&trailers) {
+        ok() => {}
+        err(reason) => {
+            return err(connection_error(reason))
+        }
+    }
+    return flush(driver, stream, clock, cancel, until)
+}
+pub fn write<S, C, X>(stream: &mut S, data: &[u8], clock: &mut C, cancel: &X, until: u64) -> void!Error {
+    offset := 0usize
+    for offset < data.len {
+        check(clock, cancel, until)?
+        match io.poll_write_once(stream, &data[offset..]) {
+            ok(progress) => {
+                offset += progress.transferred
+                if progress.state == io.PollState.Pending {
+                    wait(stream, true, clock, cancel, until)?
+                }
+            }
+            err(reason) => {
+                return err(io_error(reason))
+            }
+        }
+    }
+    for true {
+        check(clock, cancel, until)?
+        if stream.flush()? {
+            return ok()
+        }
+        wait(stream, true, clock, cancel, until)?
+    }
+    return err(failure(ErrorKind.Transport))
+}
+pub struct Plain {
+    socket: &mut native.TcpConnection
+    pub fn new(socket: &mut native.TcpConnection) -> Plain from(socket) {
+        return Plain { socket: socket }
+    }
+    pub fn poll_read(&mut self, data: &mut[u8]) -> io.Poll!io.Error {
+        match self.socket.poll_read(data) {
+            ok(value) => {
+                return ok(value)
+            }
+            err(reason) => {
+                if reason.kind == io.ErrorKind.Interrupted {
+                    return ok(io.Poll { state: io.PollState.Pending, transferred: reason.transferred })
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn poll_write(&mut self, data: &[u8]) -> io.Poll!io.Error {
+        match self.socket.poll_write(data) {
+            ok(value) => {
+                return ok(value)
+            }
+            err(reason) => {
+                if reason.kind == io.ErrorKind.Interrupted {
+                    return ok(io.Poll { state: io.PollState.Pending, transferred: reason.transferred })
+                }
+                return err(reason)
+            }
+        }
+    }
+    pub fn flush(&mut self) -> bool!Error {
+        return ok(true)
+    }
+    pub fn wait(&mut self, writing: bool, milliseconds: u32) -> void!Error {
+        interest := net.Interest.Read
+        if writing {
+            interest = net.Interest.Write
+        }
+        match self.socket.wait_ready(interest, milliseconds) {
+            ok(_) => {
+                return ok()
+            }
+            err(reason) => {
+                if reason.kind == net.ErrorKind.Interrupted {
+                    return ok()
+                }
+                return err(network_error(reason, ErrorKind.Transport))
+            }
+        }
+    }
+}

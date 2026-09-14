@@ -1,0 +1,54 @@
+package console_read_line
+
+import "std/console"
+import "std/io"
+import "std/text"
+
+fn run() -> void!io.Error {
+    console.print("Your name: ")?
+    input := console.stdin()
+    storage := [0u8; 128]
+    line := input.read_line(&mut storage)?
+    if line.end == io.LineEnd.Full {
+        errors := console.stderr()
+        errors.println("The line did not fit in 128 bytes.")?
+        return ok()
+    }
+    if line.end == io.LineEnd.Eof && line.count == 0 {
+        return ok()
+    }
+    // Remove LF and an optional preceding CR before validating the text.
+    length := line.count
+    if line.end == io.LineEnd.Newline {
+        length -= 1
+        if length != 0 && storage[length - 1] == 13 {
+            length -= 1
+        }
+    }
+    match text.Text.new(&storage[..length]) {
+        ok(name) => {
+            console.print("Hello, ")?
+            console.print(name.as_str())?
+            console.println("!")?
+        }
+        err(reason) => {
+            errors := console.stderr()
+            errors.println_value(&reason)?
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println_value(&reason) {
+                ok(_) => {}, err(_) => {}
+            }
+            return 1
+        }
+    }
+}

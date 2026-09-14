@@ -69,6 +69,15 @@ pub struct Formatter<W> {
     pub fn string(&mut self, value: &str) -> void!io.Error {
         return self.bytes(mem.str_bytes(value))
     }
+    // Default decimal helpers also form the structural error-formatting contract.
+    pub fn decimal(&mut self, value: i64) -> void!io.Error {
+        options := defaults()
+        return self.signed(value, &options)
+    }
+    pub fn natural(&mut self, value: u64) -> void!io.Error {
+        options := defaults()
+        return self.unsigned(value, &options)
+    }
     fn padding(&mut self, fill: u8, count: usize) -> void!io.Error {
         block := [0u8; 32]
         for index in 0usize..32 {
@@ -280,4 +289,77 @@ pub fn write_u32_padded(destination: &mut[u8], value: u32, width: usize) -> usiz
             return err(FormatError.BufferTooSmall)
         },
     }
+}
+
+// Convenience operations keep one Formatter for the entire call, so a newline
+// failure includes the preceding text/value in Error.transferred.
+pub fn print<W>(sink: &mut W, text: &str) -> usize!io.Error {
+    output := Formatter.new::<W>(sink)
+    output.string(text)?
+    return ok(output.written())
+}
+pub fn println<W>(sink: &mut W, text: &str) -> usize!io.Error {
+    output := Formatter.new::<W>(sink)
+    output.string(text)?
+    output.string("\n")?
+    return ok(output.written())
+}
+pub fn value_line<W, T>(sink: &mut W, input: &T) -> usize!io.Error {
+    output := Formatter.new::<W>(sink)
+    input.format(&mut output)?
+    output.string("\n")?
+    return ok(output.written())
+}
+
+// Explicit wrappers use ordinary generics, without primitive methods or a
+// format-string parser. Smaller primitive values can be widened with `as`.
+pub struct Signed {
+    value: i64
+    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
+        return output.decimal(self.value)
+    }
+}
+pub fn signed(value: i64) -> Signed {
+    return Signed { value: value }
+}
+pub struct Unsigned {
+    value: u64
+    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
+        return output.natural(self.value)
+    }
+}
+pub fn unsigned(value: u64) -> Unsigned {
+    return Unsigned { value: value }
+}
+pub struct Boolean {
+    value: bool
+    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
+        options := defaults()
+        return output.boolean(self.value, &options)
+    }
+}
+pub fn boolean(value: bool) -> Boolean {
+    return Boolean { value: value }
+}
+pub struct Floating {
+    value: f64
+    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
+        options := defaults()
+        return output.floating(self.value, 6, FloatStyle.Scientific, &options)
+    }
+}
+// Six fraction digits in scientific notation keep both large and tiny values
+// visible. Explicit Formatter.floating controls precision and style.
+pub fn floating(value: f64) -> Floating {
+    return Floating { value: value }
+}
+pub struct Codepoint {
+    value: u32
+    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
+        options := defaults()
+        return output.codepoint(self.value, &options)
+    }
+}
+pub fn codepoint(value: u32) -> Codepoint {
+    return Codepoint { value: value }
 }

@@ -15,7 +15,7 @@ import "core/mem"
 pub enum ErrorKind {
     UnexpectedEof, WriteZero, Interrupted, BufferFull, OutOfBounds,
     InvalidInput, InvalidProgress, Other, WouldBlock, TimedOut, Cancelled,
-    Closed, ConnectionReset, ConnectionRefused
+    Closed, ConnectionReset, ConnectionRefused, BrokenPipe, PermissionDenied
 }
 
 pub struct Error {
@@ -23,6 +23,65 @@ pub struct Error {
     pub transferred: usize
     // Opaque adapter-defined device/platform code, zero for portable errors.
     pub code: i32
+    // Only fixed kind names and numeric metadata; never input or native messages.
+    pub fn format<F>(&self, output: &mut F) -> void!Error {
+        output.string("io: ")?
+        match &self.kind {
+            ErrorKind.UnexpectedEof => {
+                output.string("UnexpectedEof")?
+            }
+            ErrorKind.WriteZero => {
+                output.string("WriteZero")?
+            }
+            ErrorKind.Interrupted => {
+                output.string("Interrupted")?
+            }
+            ErrorKind.BufferFull => {
+                output.string("BufferFull")?
+            }
+            ErrorKind.OutOfBounds => {
+                output.string("OutOfBounds")?
+            }
+            ErrorKind.InvalidInput => {
+                output.string("InvalidInput")?
+            }
+            ErrorKind.InvalidProgress => {
+                output.string("InvalidProgress")?
+            }
+            ErrorKind.Other => {
+                output.string("Other")?
+            }
+            ErrorKind.WouldBlock => {
+                output.string("WouldBlock")?
+            }
+            ErrorKind.TimedOut => {
+                output.string("TimedOut")?
+            }
+            ErrorKind.Cancelled => {
+                output.string("Cancelled")?
+            }
+            ErrorKind.Closed => {
+                output.string("Closed")?
+            }
+            ErrorKind.ConnectionReset => {
+                output.string("ConnectionReset")?
+            }
+            ErrorKind.ConnectionRefused => {
+                output.string("ConnectionRefused")?
+            }
+            ErrorKind.BrokenPipe => {
+                output.string("BrokenPipe")?
+            }
+            ErrorKind.PermissionDenied => {
+                output.string("PermissionDenied")?
+            }
+        }
+        output.string(" code=")?
+        output.decimal(self.code as i64)?
+        output.string(" transferred=")?
+        output.natural(self.transferred as u64)?
+        return ok()
+    }
 }
 
 pub fn failure(kind: ErrorKind, transferred: usize) -> Error {
@@ -536,4 +595,95 @@ pub fn poll_write_once<W>(writer: &mut W, source: &[u8]) -> Poll!Error {
 // Optional absolute seek capability; generic read/write helpers never require it.
 pub fn seek<S>(stream: &mut S, position: usize) -> usize!Error {
     return stream.seek(position)
+}
+
+// Read a bounded whole stream. A one-byte probe distinguishes exact capacity
+// from exhaustion (including zero-capacity empty streams). The probe byte is
+// consumed and discarded. Errors retain destination[..transferred]; bytes
+// beyond that prefix have no output contract. Interrupted progress is retained.
+pub struct ReadReport {
+    pub read: usize
+    pub eof: bool
+}
+pub fn read_bounded<R>(reader: &mut R, destination: &mut[u8]) -> ReadReport!Error {
+    used := 0usize
+    for used < destination.len {
+        match read_once(reader, &mut destination[used..]) {
+            ok(count) => {
+                if count == 0 {
+                    return ok(ReadReport { read: used, eof: true })
+                }
+                used += count
+            }
+            err(reason) => {
+                used += reason.transferred
+                if reason.kind != ErrorKind.Interrupted {
+                    reason.transferred = used
+                    return err(reason)
+                }
+            }
+        }
+    }
+    probe := [0u8; 1]
+    for true {
+        match read_once(reader, &mut probe) {
+            ok(count) => {
+                return ok(ReadReport { read: used, eof: count == 0 })
+            }
+            err(reason) => {
+                if reason.kind == ErrorKind.Interrupted {
+                    if reason.transferred != 0 {
+                        return ok(ReadReport { read: used, eof: false })
+                    }
+                } else {
+                    reason.transferred = used
+                    return err(reason)
+                }
+            }
+        }
+    }
+    return err(failure(ErrorKind.Other, used))
+}
+
+// Line bytes include the terminating LF (and any preceding CR). No decoding,
+// allocation, read-ahead, or discarded bytes. Full means the buffer filled
+// without LF; EOF has not been probed. Continue with another buffer to resume.
+pub enum LineEnd {
+    Newline, Eof, Full
+}
+pub struct Line {
+    pub count: usize
+    pub end: LineEnd
+}
+
+// Empty storage returns Full without reading. Eof with count=0 is end of input;
+// Eof with count>0 is a final unterminated line. Errors retain the initialized
+// prefix in transferred, even if its last byte is LF. Only Interrupted retries.
+pub fn read_line<R>(reader: &mut R, destination: &mut[u8]) -> Line!Error {
+    used := 0usize
+    for used < destination.len {
+        count := 0usize
+        interrupted := false
+        match read_once(reader, &mut destination[used..used + 1]) {
+            ok(actual) => {
+                count = actual
+            }
+            err(reason) => {
+                if reason.kind != ErrorKind.Interrupted {
+                    reason.transferred += used
+                    return err(reason)
+                }
+                interrupted = true
+                count = reason.transferred
+            }
+        }
+        used += count
+        if count != 0 && destination[used - 1] == 10 {
+            return ok(Line { count: used, end: LineEnd.Newline })
+        }
+        if count == 0 && !interrupted {
+            return ok(Line { count: used, end: LineEnd.Eof })
+        }
+    }
+    return ok(Line { count: used, end: LineEnd.Full })
 }

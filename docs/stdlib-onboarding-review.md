@@ -7,11 +7,12 @@ points are distinguished from implementation helpers. The work uses the current
 checkout's console, native workspace, file, environment, command, shared-text,
 clock, hosted HTTP/HTTPS, and web convenience APIs.
 
-This documentation snapshot depends on the concurrent console, hosted API,
-hosted HTTP/HTTPS, and reference-container implementation tasks. The documentation
-PR remains a draft until those APIs and their example/setup files land. The
-executable validation below used the combined working checkout; it does not
-claim that these examples compile against the PR's current `main` base alone.
+The original snapshot depended on concurrent console, hosted API, hosted
+HTTP/HTTPS, and reference-container implementation tasks. Console and hosted
+HTTP/HTTPS have since landed in `main`; hosted environment/process/clock APIs
+and reference-container support remain dependencies. The original executable
+validation below used the combined working checkout. The main-integration
+results distinguish that validation from what passes on this branch alone.
 
 ## Pages and tooling changed
 
@@ -90,7 +91,7 @@ retained as signposts. Each quickstart explains imports and storage on first use
 provides the run command, and states its stdout or what a silent exit 0 proves.
 Local fixtures and peers require no public Internet service.
 
-## Validation
+## Original combined-checkout validation
 
 Validation ran on x86-64 Linux GNU with the compiler built from the changing
 checkout. OpenSSL-backed checks used matching OpenSSL 3.5.8 headers/libraries.
@@ -129,6 +130,36 @@ fresh dependency install, production website build, specification-download check
 and documentation checker (43 pages and 3,601 links/assets/search targets).
 Its Markdown examples passed again at O0 and O3 using the combined checkout's
 compiler: 28 passed and one intentional ignored example at each level.
+
+## Main-integration validation
+
+Merged `origin/main` at `dcf96c8` using the repository's merge-commit convention.
+Seven documentation conflicts were resolved while retaining the task overview,
+complete inventory, quickstarts, separate standard-library navigation, and
+relocated contracts. Upstream standard-stream ownership, recoverable errors,
+line-reader results, printing progress, and hosted driving guidance were
+preserved in their corresponding guides. The compiler and library changes from
+`main` were accepted unchanged.
+
+Validation used a fresh compiler built from this branch, with no pending source
+changes copied from other implementation worktrees:
+
+| Check | Result |
+| --- | --- |
+| `cargo build --locked --bin dodo` | Passed. Local linker search paths supplied the installed LLVM support libraries. |
+| `npm ci --prefix docs` and `npm run build --prefix docs` | Production site built successfully. |
+| `python3 scripts/render_spec.py --check` | Passed. |
+| `python3 scripts/check_docs.py` | 43 pages and 3,603 links/assets/search targets; navigation and inventory cover all 109 source modules currently on this branch. |
+| `dodo test examples`, O0 and O3 | 22 passed and one intentional ignored example at each level. |
+| `python3 scripts/test_hosted_http.py` | All 16 local HTTP/HTTPS integration groups passed across O0/O3 with the documented OpenSSL setup. |
+| `dodo test docs --doc`, O0 and O3 | 25 passed, two build failures, one intentional ignored example, and one discovery error at each level; see dependencies below. |
+
+The environment and current-clock examples require the hosted API work in
+[PR #23](https://github.com/Jotrorox/dodo/pull/23). The container-element example
+requires the `stores` syntax from `t3code/support-reference-collections`, which
+the current parser does not yet recognize. Those three pages were unchanged by
+this merge. Their examples remain executable Markdown rather than being hidden
+from checks. Rerun the complete suite after the remaining implementations land.
 
 ## Remaining implementation work
 
