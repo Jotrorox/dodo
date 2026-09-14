@@ -17,14 +17,14 @@ for supported features and remaining work.
 ## Start here
 
 1. [Install Dodo](installation.md): get the compiler and check your setup.
-2. [Write your first program](first-program.md): create a small file and run it.
+2. [Write your first program](first-program.md): create a folder with `main.dodo` and run it.
 3. [Use the command line](command-line.md): format, check, build, and choose output formats.
 
 ## Use Dodo in a project
 
 Set up [editor diagnostics and hovers](editors.md), then explore
 the [example programs](https://github.com/Jotrorox/dodo/tree/main/examples).
-The command-line guide also covers [package directories](command-line.md#files-and-packages)
+The command-line guide also covers [project folders](command-line.md#project-folders-and-source-files)
 and [target selection](command-line.md#targets-and-linking).
 
 ## Look up language behavior

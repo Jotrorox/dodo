@@ -1,7 +1,9 @@
 //! Package loading, namespace resolution, and source-aware diagnostics.
 //!
-//! A file compiles that file. A directory compiles its immediate `.dodo` files
-//! in lexical order. `core/*`, `alloc/*`, and `std/*` resolve from bundled sources. Other
+//! A file loads that file. An imported directory loads its immediate `.dodo`
+//! files in lexical order, as does an explicit directory load from an editor.
+//! The CLI selects `main.dodo` before calling the loader for a project folder.
+//! `core/*`, `alloc/*`, and `std/*` resolve from bundled sources. Other
 //! imports resolve relative to the importing package, without network access or
 //! an implicit dependency cache.
 use crate::ast::*;

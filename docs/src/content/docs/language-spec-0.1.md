@@ -133,12 +133,22 @@ package samples
 ```
 
 **PKG-UNIT.** Every source file must start with a package declaration, apart from
-whitespace, comments, and empty semicolon statements. A file input includes exactly that file and its imports.
-A directory input includes its immediate regular files with extension `.dodo`,
+whitespace, comments, and empty semicolon statements. A project is a folder with
+a `main.dodo` entry file. With no input, `dodo run`, `dodo check`, and
+`dodo compile` select `main.dodo` in the current folder; `build` is an alias for
+`compile`. An explicit CLI directory input selects that directory's `main.dodo`.
+A missing entry is an error, without searching parents or alternative filenames.
+A file input includes exactly that file and its imports; other root files are
+not implicitly included. No manifest, package manager, lockfile, or separate
+library project type participates in project selection.
+
+An imported directory includes its immediate regular files with extension `.dodo`,
 sorted by canonical path; it must contain at least one such file. Subdirectories
 and symlink entries are not scanned as source files. All included files must
 declare the same package. Their declarations and import aliases share one package
 scope, independent of declaration order. Duplicate declarations are errors.
+Imported folders need no entry filename or special library layout. The editor
+may also load a directory package directly without selecting `main.dodo`.
 
 ### 2.2. Imports
 
@@ -1602,7 +1612,7 @@ execution cases and enforced static boundaries are identified separately.
 
 | Rule or section | Acceptance, rejection, or execution evidence |
 | --- | --- |
-| PKG-UNIT | E `spec::directory_package_scope_aliases_and_constant_initialization`, `canonical_package_identity_and_symlink_enumeration` (Unix); R `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected`; A `package::root_directory_collects_only_immediate_dodo_files`. |
+| PKG-UNIT | E/R `compiler::cli_projects_default_to_main_and_compile_keeps_an_executable`, `cli_project_folders_and_libraries_are_ordinary_local_imports`, `cli_missing_project_entry_does_not_search_parents_or_other_files`; E `spec::directory_package_scope_aliases_and_constant_initialization`, `canonical_package_identity_and_symlink_enumeration` (Unix); R `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected`; A `package::root_directory_collects_only_immediate_dodo_files`. |
 | PKG-RESOLVE | R `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected`; A `packages::local_packages_can_import_stdlib_and_stdlib_dependencies_are_deduplicated`. |
 | PKG-NAMES | E/R `spec::directory_package_scope_aliases_and_constant_initialization`; A/R `packages::aliases_distinguish_same_named_packages_and_transitive_dependencies`; R/A `package::transitive_packages_require_a_direct_import`. |
 | PKG-CORE | A/R `packages::bundled_imports_cannot_be_shadowed_by_local_files_or_editor_overlays`, `unknown_and_malformed_stdlib_imports_are_rejected_without_local_fallback`, `local_packages_cannot_conflict_with_bundled_or_intrinsic_aliases`, `transitive_imports_do_not_grant_source_or_intrinsic_package_visibility`. |

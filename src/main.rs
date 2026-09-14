@@ -11,7 +11,54 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const HELP: &str = concat!(
     "Dodo ",
     env!("CARGO_PKG_VERSION"),
-    " — ahead-of-time systems language compiler\n\nUsage: dodo <COMMAND> <FILE|DIRECTORY> [OPTIONS]\n       dodo lsp\n\nCommands:\n  check    Parse and check types, ownership, and borrowing\n  build    Compile a native executable or compiler artifact\n  run      Compile and run a program; arguments follow --\n  lsp      Run the language server over standard input/output (alias: --lsp)\n  fmt      Format and migrate syntax (default input: current directory)\n\nFormatting options:\n      --check            Report unformatted files without writing\n      --stdout           Print one formatted file without writing\n  Use - as the fmt input to read stdin and write stdout.\n\nCompiler options:\n  -o, --output PATH       Output path (default: build/<source name>)\n      --emit KIND         exe (default), obj, asm, llvm-ir, bitcode\n  -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)\n      --target TRIPLE     LLVM target triple (default: host)\n      --cpu NAME          Target CPU (default: generic)\n      --features LIST     LLVM target features, e.g. +sse4.2\n      --linker PATH       C linker driver (default: DODO_CC or cc)\n      --link-arg ARG      Pass an argument to the linker; repeatable\n  -h, --help             Print help\n  -V, --version          Print compiler version\n\nExamples:\n  dodo fmt examples\n  dodo fmt --check examples\n  dodo check examples/hello.dodo\n  dodo run examples/samples.dodo -O 2\n  dodo build examples/hello.dodo -o build/hello\n  dodo build examples/gpio.dodo --emit llvm-ir -o build/gpio.ll\n\nLLVM 22 is embedded; no LLVM installation is needed to use this compiler.\nLinking executables requires a C toolchain (cc, --linker, or DODO_CC).\n"
+    r#" — ahead-of-time systems language compiler
+
+Usage: dodo <COMMAND> [FILE|DIRECTORY] [OPTIONS]
+       dodo lsp
+
+Commands:
+  check    Parse and check types, ownership, and borrowing
+  compile  Compile a native executable or compiler artifact (alias: build)
+  run      Compile and run a program; arguments follow --
+  lsp      Run the language server over standard input/output (alias: --lsp)
+  fmt      Format and migrate syntax (default input: current directory)
+
+Projects:
+  check, compile, build, and run default to main.dodo in the current folder.
+  A directory input selects its main.dodo. Explicit source files are supported.
+  Import local subfolders to share code. No manifest or package manager is needed.
+
+Formatting options:
+      --check            Report unformatted files without writing
+      --stdout           Print one formatted file without writing
+  Use - as the fmt input to read stdin and write stdout.
+
+Compiler options:
+  -o, --output PATH       Output path (default: build/<project folder name>)
+      --emit KIND         exe (default), obj, asm, llvm-ir, bitcode
+  -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)
+      --target TRIPLE     LLVM target triple (default: host)
+      --cpu NAME          Target CPU (default: generic)
+      --features LIST     LLVM target features, e.g. +sse4.2
+      --linker PATH       C linker driver (default: DODO_CC or cc)
+      --link-arg ARG      Pass an argument to the linker; repeatable
+  -h, --help             Print help
+  -V, --version          Print compiler version
+
+Examples:
+  dodo run
+  dodo check
+  dodo compile -O 2
+  dodo run -- example-argument
+  dodo fmt
+  dodo fmt --check
+  dodo run examples/samples.dodo -O 2
+  dodo compile examples/hello.dodo -o build/hello
+  dodo compile examples/gpio.dodo --emit llvm-ir -o build/gpio.ll
+
+LLVM 22 is embedded; no LLVM installation is needed to use this compiler.
+Linking executables requires a C toolchain (cc, --linker, or DODO_CC).
+"#
 );
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -103,7 +150,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
         }
         Some("fmt") => return parse_format(args),
         Some("check") => Action::Check,
-        Some("build") => Action::Build,
+        Some("compile" | "build") => Action::Build,
         Some("run") => Action::Run,
         _ => {
             return Err(format!(
@@ -138,7 +185,10 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
                 }
                 for path in args {
                     if !result.input.as_os_str().is_empty() {
-                        return Err("only one input path is accepted; pass a package directory for multiple files".into());
+                        return Err(
+                            "only one input path is accepted; pass a source file or project folder"
+                                .into(),
+                        );
                     }
                     result.input = path.into();
                 }
@@ -190,14 +240,17 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
             }
             _ => {
                 if !result.input.as_os_str().is_empty() {
-                    return Err("only one input path is accepted; pass a package directory for multiple files".into());
+                    return Err(
+                        "only one input path is accepted; pass a source file or project folder"
+                            .into(),
+                    );
                 }
                 result.input = arg.into();
             }
         }
     }
     if result.input.as_os_str().is_empty() {
-        return Err("missing source file or package directory".into());
+        result.input = PathBuf::from(".");
     }
     if action == Action::Check
         && (result.output.is_some() || emit_given || !result.link_args.is_empty())
@@ -206,7 +259,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
     }
     if action == Action::Run && (result.output.is_some() || emit_given) {
         return Err(
-            "run builds a temporary executable; use build to select an output artifact".into(),
+            "run builds a temporary executable; use compile to select an output artifact".into(),
         );
     }
     if result.emit != Emit::Exe && !result.link_args.is_empty() {
@@ -338,6 +391,24 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
     Ok(())
 }
 fn execute(mut args: Args) -> Result<i32, String> {
+    // A project folder selects its entry file. Directory imports are still
+    // loaded as ordinary packages by the source loader.
+    if args.input == Path::new(".") {
+        args.input = PathBuf::from("main.dodo");
+    } else if args.input.is_dir() {
+        args.input = args.input.join("main.dodo");
+    }
+    if args
+        .input
+        .file_name()
+        .is_some_and(|name| name == "main.dodo")
+        && !args.input.is_file()
+    {
+        return Err(format!(
+            "expected project entry file {}; create main.dodo in this folder or pass an explicit source file",
+            args.input.display()
+        ));
+    }
     let target = args.options.target.clone().unwrap_or_else(|| {
         inkwell::targets::TargetMachine::get_default_triple()
             .as_str()
@@ -358,7 +429,7 @@ fn execute(mut args: Args) -> Result<i32, String> {
                     .as_str()
                     .to_string_lossy()
         {
-            return Err("run requires the host target; use build for cross compilation".into());
+            return Err("run requires the host target; use compile for cross compilation".into());
         }
         let temp = TempDir::new(&std::env::temp_dir())?;
         let exe = temp.0.join("program");
@@ -384,27 +455,30 @@ fn execute(mut args: Args) -> Result<i32, String> {
         }
     }
     let output = args.output.clone().unwrap_or_else(|| {
-        let name = args
+        let mut name = if args
             .input
-            .file_stem()
-            .unwrap_or_else(|| std::ffi::OsStr::new("program"));
-        let mut p = PathBuf::from("build").join(name);
-        match args.emit {
-            Emit::Exe => {}
-            Emit::Obj => {
-                p.set_extension("o");
-            }
-            Emit::Asm => {
-                p.set_extension("s");
-            }
-            Emit::Ir => {
-                p.set_extension("ll");
-            }
-            Emit::Bitcode => {
-                p.set_extension("bc");
-            }
+            .file_name()
+            .is_some_and(|name| name == "main.dodo")
+        {
+            args.input
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .canonicalize()
+                .ok()
+                .and_then(|directory| directory.file_name().map(|name| name.to_os_string()))
+        } else {
+            args.input.file_stem().map(|name| name.to_os_string())
         }
-        p
+        .unwrap_or_else(|| OsString::from("program"));
+        name.push(match args.emit {
+            Emit::Exe => "",
+            Emit::Obj => ".o",
+            Emit::Asm => ".s",
+            Emit::Ir => ".ll",
+            Emit::Bitcode => ".bc",
+        });
+        PathBuf::from("build").join(name)
     });
     let parent = output
         .parent()

@@ -1,62 +1,82 @@
 ---
 title: "Use the command line"
-description: "Format, check, run, and build Dodo programs; select output formats and target platforms."
+description: "Format, check, run, and compile Dodo projects; select output formats and target platforms."
 section: "Using Dodo"
 order: 100
 ---
 
-The examples using `hello.dodo` build on [your first program](first-program.md).
-Run commands from the directory containing that file. Use `dodo --help` for the
+These examples build on [your first program](first-program.md). Run commands
+from the `hello` project folder containing `main.dodo`. Use `dodo --help` for the
 complete option list and `dodo --version` for the compiler version.
 
 ## Everyday commands
 
 | Command | What it does |
 | --- | --- |
-| `dodo fmt hello.dodo` | Format the source file. |
-| `dodo check hello.dodo` | Check syntax, types, ownership, and borrowing. |
-| `dodo run hello.dodo` | Build a temporary executable and run it. |
-| `dodo build hello.dodo` | Keep an executable at `build/hello`. |
+| `dodo fmt` | Format the project folder recursively. |
+| `dodo check` | Check syntax, types, ownership, and borrowing. |
+| `dodo run` | Build a temporary executable and run it. |
+| `dodo compile` | Keep an executable at `build/hello`. |
+| `dodo build` | Alias for `dodo compile`. |
 | `dodo lsp` | Start the language server for an editor. |
 
 `check` does not need a `main` function or a C toolchain. Building and running an
 executable require a C toolchain and a hosted entry point: `fn main()`,
 `fn main() -> void`, or `fn main() -> i32`.
 
-`build` writes its final output only after compilation and linking succeed.
+`compile` writes its final output only after compilation and linking succeed.
 Choose a different location with `-o` or `--output`:
 
 ```sh
-dodo build hello.dodo -o build/my-program
+dodo compile -o build/my-program
 ./build/my-program
 ```
 
 `run` cleans up its temporary executable and returns the program's exit status.
-Arguments after `--` are passed to the executable, although Dodo does not yet
-provide a built-in library for reading them:
+Arguments after `--` are passed to the executable;
+[`std/env`](environment.md) provides access to them:
 
 ```sh
-dodo run hello.dodo -- example-argument
+dodo run -- example-argument
 ```
 
 For editor configuration and protocol support, see [editor setup](editors.md).
 See [compiler diagnostics](diagnostics-and-editors.md) for error examples.
 
-## Files and packages
+## Project folders and source files
 
-Pass one source file or one package directory to `check`, `build`, or `run`.
-A file input includes that file and its imports. A directory input combines the
-immediate `.dodo` files in that directory; they must declare the same package.
-Subdirectories are not automatically included.
+With no input path, `check`, `compile`, `build`, and `run` select `main.dodo`
+in the current folder. Compiler options can follow the command directly.
+An explicit directory also selects its `main.dodo`. A project requires no
+manifest, lockfile, package manager, or special library folder.
 
 ```sh
-dodo check .
-dodo build . -o build/my-program
+dodo check
+dodo run -O 2
+dodo compile --emit llvm-ir
+dodo run .
+dodo compile path/to/project -o build/my-program
+dodo run examples/hello.dodo
 ```
 
-Dependencies resolve through local imports. See
-[packages and imports](packages.md) for import
-resolution and package restrictions.
+The entry file and its imports are loaded. Other files beside `main.dodo` and
+unimported subfolders are not automatically included. If `main.dodo` is missing,
+the command reports an error; it does not search parent folders, `src/`, or
+alternate entry names. Pass an explicit source file to use another filename.
+
+Shared code lives in ordinary imported subfolders. An imported folder combines
+its immediate `.dodo` files into one package; those files must declare the same
+package, and need no `main.dodo` or `lib.dodo`. See
+[projects and imports](packages.md) for a complete example and import rules.
+
+The default output uses the folder containing `main.dodo`: a project named
+`hello` produces `build/hello`. This applies whether you omit the input, pass a
+project folder, or pass its `main.dodo` explicitly. Other explicit source files
+use `build/<source name>`. Artifact extensions are appended to the full name,
+such as `build/hello.ll` for LLVM IR.
+
+Output paths are relative to the shell's current folder, even when compiling
+another project folder. Use `-o` to choose a different path.
 
 ## Format source
 
@@ -65,10 +85,10 @@ Directory inputs recursively include `.dodo` files, skipping hidden directories,
 `target`, `build`, and symlinks.
 
 ```sh
-dodo fmt hello.dodo
+dodo fmt main.dodo
 dodo fmt .
 dodo fmt --check .
-dodo fmt --stdout hello.dodo
+dodo fmt --stdout main.dodo
 ```
 
 `--check` reports files needing formatting and exits with status 1 without
@@ -85,7 +105,7 @@ details and the migration policy.
 
 ## Choose a compiler output
 
-`build` produces an executable by default. Other output formats do not require
+`compile` produces an executable by default. Other output formats do not require
 an entry point or an external linker:
 
 | `--emit` value | Output |
@@ -97,10 +117,10 @@ an entry point or an external linker:
 | `bitcode` | LLVM bitcode. |
 
 ```sh
-dodo build hello.dodo --emit llvm-ir -o build/hello.ll
-dodo build hello.dodo --emit obj -o build/hello.o
-dodo build hello.dodo --emit asm -o build/hello.s
-dodo build hello.dodo --emit bitcode -o build/hello.bc
+dodo compile --emit llvm-ir -o build/hello.ll
+dodo compile --emit obj -o build/hello.o
+dodo compile --emit asm -o build/hello.s
+dodo compile --emit bitcode -o build/hello.bc
 ```
 
 These compiler artifacts contain no startup code. Use executable output when
@@ -111,7 +131,7 @@ you want to run a hosted program directly.
 Choose `-O 0`, `1`, `2`, or `3`. The default is `0`:
 
 ```sh
-dodo build hello.dodo -O 2 -o build/hello
+dodo compile -O 2 -o build/hello
 ```
 
 Overflow, division, shift, conversion, and bounds checks remain active at every
@@ -124,7 +144,7 @@ runtime check traps using `llvm.trap`; it does not unwind or run destructors.
 targets are included in the compiler. For example, emit a WebAssembly object:
 
 ```sh
-dodo build hello.dodo --emit obj --target wasm32-unknown-unknown -o build/hello.wasm
+dodo compile --emit obj --target wasm32-unknown-unknown -o build/hello.wasm
 ```
 
 Cross-target object generation needs no host entry point or C runtime. Linking
@@ -137,7 +157,7 @@ For executables, `--linker` selects the C linker driver, overriding `DODO_CC` an
 the default `cc`. Use repeatable `--link-arg` options to pass arguments to it:
 
 ```sh
-dodo build hello.dodo --linker cc --link-arg -s -o build/hello
+dodo compile --linker cc --link-arg -s -o build/hello
 ```
 
 The argument `-s` in this Linux example asks the linker to strip symbols. Linker

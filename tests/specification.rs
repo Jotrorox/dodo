@@ -467,19 +467,26 @@ fn incompatible_lowered_foreign_declarations_fail_before_linking() {
 #[test]
 fn directory_package_scope_aliases_and_constant_initialization() {
     let workspace = Workspace::new();
-    workspace.file("app/a.dodo", "package app\nimport \"dep\" as helper\nconst ANSWER:i32 = LATER + helper.VALUE\nfn main()->i32 { answer() - 42 }\n");
+    workspace.file(
+        "main.dodo",
+        "package main\nimport \"app\"\nfn main()->i32 { app.answer() - 42 }\n",
+    );
+    workspace.file(
+        "app/a.dodo",
+        "package app\nimport \"dep\" as helper\nconst ANSWER:i32 = LATER + helper.VALUE\n",
+    );
     workspace.file(
         "app/z.dodo",
-        "package app\nconst LATER:i32 = 2\nfn answer()->i32 { ANSWER }\n",
+        "package app\nconst LATER:i32 = 2\npub fn answer()->i32 { ANSWER }\n",
     );
     workspace.file(
         "app/dep/main.dodo",
         "package dep\npub const VALUE:i32 = 40\n",
     );
     workspace.file("app/ignored.txt", "invalid");
-    workspace.run(&workspace.0.join("app"), b"");
+    workspace.run(&workspace.0.join("main.dodo"), b"");
     workspace.file("app/z.dodo", "package app\nimport \"dep\" as different\n");
-    let output = workspace.compiler(&["check", "app"]).output().unwrap();
+    let output = workspace.compiler(&["check"]).output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("conflicting aliases"));
     workspace.reject(
@@ -534,7 +541,8 @@ fn package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected `b`"));
     workspace.file("unit/a.dodo", "package first\n");
     workspace.file("unit/b.dodo", "package second\n");
-    let output = workspace.compiler(&["check", "unit"]).output().unwrap();
+    workspace.file("main.dodo", "package main\nimport \"unit\"\n");
+    let output = workspace.compiler(&["check"]).output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("package"));
 }
@@ -659,9 +667,13 @@ fn canonical_package_identity_and_symlink_enumeration() {
     let input = workspace.file("main.dodo", "package app\nimport \"dep\" as first\nimport \"other/dep\" as second\nfn main()->i32 { first.next() + second.next() - 3 }\n");
     workspace.run(&input, b"");
     let wrong = workspace.file("wrong.dodo", "package wrong\n");
-    workspace.file("unit/a.dodo", "package unit\nfn main() {}\n");
+    workspace.file("unit/a.dodo", "package unit\npub fn run() {}\n");
     symlink(&wrong, workspace.0.join("unit/z.dodo")).unwrap();
-    workspace.run(&workspace.0.join("unit"), b"");
+    let input = workspace.file(
+        "main.dodo",
+        "package main\nimport \"unit\"\nfn main() { unit.run() }\n",
+    );
+    workspace.run(&input, b"");
     // Explicit file input follows the link, although enumeration excluded it.
     success(
         workspace

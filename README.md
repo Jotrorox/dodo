@@ -14,10 +14,10 @@ and follow the [installation guide](https://jotrorox.github.io/dodo/installation
 Prebuilt compilers include LLVM; running Dodo programs also requires a C
 toolchain such as `cc`.
 
-Save this as `hello.dodo`:
+Create a project folder named `hello` and save this as `main.dodo` inside it:
 
 ```dodo
-package hello
+package main
 
 fn main() -> i32 {
     return 0
@@ -27,25 +27,32 @@ fn main() -> i32 {
 Run it from the same directory:
 
 ```sh
-dodo run hello.dodo
+dodo run
 ```
 
 The program prints nothing and exits successfully. `return 0` supplies its
-success exit status. The [first program guide](https://jotrorox.github.io/dodo/first-program/)
+success exit status. A project needs only `main.dodo`: no manifest, lockfile, or
+package manager. Put shared code in ordinary subfolders and import it by path.
+The [first program guide](https://jotrorox.github.io/dodo/first-program/)
 explains each line and shows how to check the program and keep an executable.
 
 ## Everyday commands
 
 ```sh
-dodo fmt hello.dodo
-dodo check hello.dodo
-dodo build hello.dodo -O 2 -o build/hello
+dodo fmt
+dodo check
+dodo compile -O 2
 ./build/hello
 dodo --help
 ```
 
+`run`, `check`, and `compile` default to `main.dodo` in the current folder.
+`build` remains an alias for `compile`. An explicit folder selects its
+`main.dodo`; you can also pass another source file directly. The default output
+uses the project folder name: `hello/main.dodo` compiles to `build/hello`.
+
 Use [the command-line guide](https://jotrorox.github.io/dodo/command-line/) for
-formatting options, package directories, compiler outputs, optimization, and
+formatting options, project folders, compiler outputs, optimization, and
 cross-target builds. For diagnostics and type hovers in an editor, configure its
 LSP client to run `dodo lsp` and follow the
 [editor setup guide](https://jotrorox.github.io/dodo/editors/).

@@ -21,7 +21,7 @@ final-expression returns, inference, patterns, and canonical formatting.
 | Topic | Read next |
 | --- | --- |
 | Declarations, literals, operators, inference, and control flow | [Syntax and expressions](implementation-syntax.md) |
-| Files, imports, and public declarations | [Packages and imports](packages.md) |
+| Files, imports, and public declarations | [Projects and imports](packages.md) |
 | Copying, moving, borrows, and destruction | [Ownership and borrowing](ownership.md) |
 | Matching, guards, destructuring, and error handling | [Patterns and Results](patterns-and-results.md) |
 | Layout, C calls, raw pointers, and MMIO | [Memory and foreign calls](memory-and-ffi.md) |
@@ -37,9 +37,11 @@ remain accepted; `dodo fmt` migrates them to the canonical syntax.
 
 ## Packages and visibility
 
-[Packages and imports](packages.md) explains file and directory inputs, local
-import resolution, and visibility. Dependencies are local files; this release
-has no package registry or network resolver.
+[Projects and imports](packages.md) explains the `main.dodo` project entry,
+ordinary imported subfolders, local import resolution, and visibility.
+`dodo run`, `dodo check`, and `dodo compile` default to `main.dodo` in the current
+folder; `build` is an alias for `compile`. There is no manifest, package manager,
+registry, network resolver, or separate library project type.
 
 ## Ownership and generics
 

@@ -54,10 +54,13 @@ Untitled buffers receive standalone analysis, including diagnostics and hovers.
 ## File and package checking
 
 By default each document is checked as a file with its imports, like
-`dodo check <file>`. To combine sibling files as a directory package, set the
+`dodo check <file>`. This matches the project entry behavior when editing
+`main.dodo`. To work on multiple files within an imported subfolder, set the
 client's `initializationOptions` to `{"checkMode": "package"}`. This checks the
 document's parent directory, including new unsaved `.dodo` siblings. All files in
-that directory package must declare the same package.
+that directory package must declare the same package. Package checking combines
+all immediate `.dodo` files, like a directory import; it does not select a
+`main.dodo` entry as the CLI does for an explicit project folder.
 
 ## Current limits
 

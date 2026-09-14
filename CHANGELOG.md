@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Use `main.dodo` in the current folder for `dodo run`, `dodo check`, and
+  `dodo compile`; keep `build` as an alias for `compile`. Explicit project
+  folders also select `main.dodo`; default build outputs use the project folder
+  name. Shared code lives in ordinary imported
+  subfolders, with no manifest, package manager, or special library layout.
 - Add portable network addresses/DNS, Linux/Windows TCP/UDP/resolver providers,
   verified OpenSSL TLS, bounded incremental HTTP/1.1, streaming clients/server
   composition, routing/middleware and optional rooted static files. Keep transport,

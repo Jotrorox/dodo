@@ -133,11 +133,197 @@ fn cli_help_version_and_bad_arguments() {
         assert!(String::from_utf8_lossy(&output.stdout).contains("dodo"));
         assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
     }
-    for arguments in [vec!["unknown-command"], vec!["build"], vec!["--unknown"]] {
+    for arguments in [
+        vec!["unknown-command"],
+        vec!["--unknown"],
+        vec!["compile", "--emit"],
+        vec!["check", "--output", "out"],
+        vec!["run", "--emit", "obj"],
+        vec!["compile", "one.dodo", "two.dodo"],
+    ] {
         let output = workspace.compiler().args(arguments).output().unwrap();
         assert!(!output.status.success());
         assert!(!output.stderr.is_empty());
     }
+}
+
+#[test]
+fn cli_projects_default_to_main_and_compile_keeps_an_executable() {
+    let workspace = Workspace::new();
+    workspace.file("main.dodo", "package app\nfn main() -> i32 { 23 }\n");
+    // Unimported siblings and folders are not part of the entry file.
+    workspace.file("other.dodo", "invalid source");
+    workspace.file("unused/broken.dodo", "invalid source");
+    let output = workspace.compiler().arg("check").output().unwrap();
+    assert_success(&output, "check the default entry");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Checked main.dodo"));
+    let output = workspace.compiler().arg("run").output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{output:?}");
+    assert!(!workspace.0.join("build").exists());
+    let executable = workspace
+        .0
+        .join("build")
+        .join(workspace.0.file_name().unwrap());
+    for command in ["compile", "build"] {
+        for input in [None, Some("."), Some("main.dodo")] {
+            let output = workspace
+                .compiler()
+                .arg(command)
+                .args(input)
+                .output()
+                .unwrap();
+            assert_success(&output, "compile the default entry");
+            assert_eq!(workspace.execute(&executable).status.code(), Some(23));
+        }
+    }
+    let output = workspace
+        .compiler()
+        .args([
+            "compile",
+            "-O2",
+            "--emit",
+            "llvm-ir",
+            "-o",
+            "custom/main.ll",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output, "compile the default entry with options");
+    assert!(
+        fs::read_to_string(workspace.0.join("custom/main.ll"))
+            .unwrap()
+            .contains("dodo.app.main")
+    );
+}
+
+#[test]
+fn cli_project_folders_and_libraries_are_ordinary_local_imports() {
+    let workspace = Workspace::new();
+    let project = workspace.0.join("my project.v1");
+    workspace.file("main.dodo", "invalid source in caller directory");
+    workspace.file("my project.v1/main.dodo", "package app\nimport \"lib\"\nimport \"features/count\"\nfn main() -> i32 { lib.answer() + count.extra() }\n");
+    workspace.file(
+        "my project.v1/lib/main.dodo",
+        "package lib\npub fn answer() -> i32 { base() + 1 }\n",
+    );
+    workspace.file(
+        "my project.v1/lib/helpers.dodo",
+        "package lib\nfn base() -> i32 { 40 }\n",
+    );
+    workspace.file("my project.v1/lib/unused/broken.dodo", "invalid source");
+    workspace.file(
+        "my project.v1/features/count/value.dodo",
+        "package count\npub fn extra() -> i32 { 1 }\n",
+    );
+    workspace.file("my project.v1/other.dodo", "invalid source");
+    for input in [&project, &project.join("main.dodo")] {
+        let output = workspace
+            .compiler()
+            .arg("check")
+            .arg(input)
+            .output()
+            .unwrap();
+        assert_success(&output, "check a project by folder or entry file");
+        let output = workspace.compiler().arg("run").arg(input).output().unwrap();
+        assert_eq!(output.status.code(), Some(42), "{output:?}");
+    }
+    for command in ["compile", "build"] {
+        for input in [&project, &project.join("main.dodo")] {
+            let output = workspace
+                .compiler()
+                .arg(command)
+                .arg(input)
+                .output()
+                .unwrap();
+            assert_success(&output, "compile an explicit project folder or entry file");
+            assert_eq!(
+                workspace
+                    .execute(&workspace.0.join("build/my project.v1"))
+                    .status
+                    .code(),
+                Some(42)
+            );
+        }
+    }
+    let output = workspace
+        .compiler()
+        .args(["compile", "--emit", "llvm-ir"])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert_success(
+        &output,
+        "emit an artifact using the full project folder name",
+    );
+    assert!(
+        fs::read_to_string(workspace.0.join("build/my project.v1.ll"))
+            .unwrap()
+            .contains("dodo.app.main")
+    );
+    let output = workspace
+        .compiler()
+        .current_dir(&project)
+        .args(["run", "."])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(42), "{output:?}");
+}
+
+#[test]
+fn cli_missing_project_entry_does_not_search_parents_or_other_files() {
+    let workspace = Workspace::new();
+    workspace.file("main.dodo", "package parent\nfn main() {}\n");
+    let project = workspace.0.join("child");
+    workspace.file("child/lib.dodo", "package lib\nfn main() {}\n");
+    workspace.file("child/src/main.dodo", "package nested\nfn main() {}\n");
+    for entry_is_directory in [false, true] {
+        if entry_is_directory {
+            workspace.file(
+                "child/main.dodo/main.dodo",
+                "package nested\nfn main() {}\n",
+            );
+        }
+        for command in ["check", "run", "compile", "build"] {
+            for input in [None, Some(".")] {
+                let output = workspace
+                    .compiler()
+                    .current_dir(&project)
+                    .arg(command)
+                    .args(input)
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success(), "{output:?}");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("expected project entry file"), "{stderr}");
+                assert!(stderr.contains("main.dodo"), "{stderr}");
+            }
+        }
+    }
+    assert!(!project.join("build").exists());
+    let output = workspace
+        .compiler()
+        .current_dir(&project)
+        .args(["run", "lib.dodo"])
+        .output()
+        .unwrap();
+    assert_success(&output, "an explicit file can have any name");
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[test]
+fn cli_default_run_passes_program_arguments_after_options() {
+    let workspace = Workspace::new();
+    workspace.file("main.dodo", include_str!("os/env_checks.dodo"));
+    let output = workspace
+        .compiler()
+        .args(["run", "-O2", "--", "space arg", "é", ""])
+        .env("DODO_ENV_TEST", "parent  é")
+        .output()
+        .unwrap();
+    assert_success(
+        &output,
+        "run default entry with options and program arguments",
+    );
 }
 
 #[test]
@@ -977,8 +1163,8 @@ fn directory_packages_import_public_types_fields_and_methods() {
     let workspace = Workspace::new();
     workspace.file("app/counter/counter.dodo", COUNTER_PACKAGE);
     workspace.file(
-        "app/helpers.dodo",
-        "package app\nfn extra() -> i32 { return 1 }\n",
+        "app/counter/helpers.dodo",
+        "package counter\npub fn extra() -> i32 { return 1 }\n",
     );
     workspace.file(
         "app/main.dodo",
@@ -987,7 +1173,7 @@ import "counter"
 fn main() -> i32 {
     value := counter.make(40)
     value.increment()
-    return value.value + extra()
+    return value.value + counter.extra()
 }
 "#,
     );

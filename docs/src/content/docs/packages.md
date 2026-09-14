@@ -1,18 +1,31 @@
 ---
-title: "Packages and imports"
-description: "Organize Dodo source files, resolve local imports, and control public declarations."
+title: "Projects and imports"
+description: "Start with main.dodo, organize shared code in subfolders, and import local packages."
 section: "Using Dodo"
 order: 130
 ---
 
-Each source file declares a package. You can compile a single file with its
-imports or combine sibling files into one directory package.
+A Dodo project is an ordinary folder with a `main.dodo` entry file. There is no
+manifest, lockfile, package manager, dependency cache, or separate library
+project type. Every source file still starts with a `package` declaration.
 
-## Files and directory packages
+## Project entry and subfolders
 
-A file input compiles that file and its imports. A directory input combines its
-immediate `.dodo` files, in sorted order, into one package. All files in that
-unit must declare the same package. Subdirectories are not implicitly included.
+Run `dodo run`, `dodo check`, or `dodo compile` from the project folder to use
+`main.dodo`. `dodo build` is an alias for `dodo compile`. Passing a project
+folder explicitly selects the same entry: `dodo run app` uses `app/main.dodo`.
+Passing a file, such as `dodo run app/main.dodo`, uses that file directly.
+
+Only the entry file and its imports are loaded. Other files beside `main.dodo`
+and unimported subfolders are not included automatically. Missing `main.dodo`
+is an error; the compiler does not search parent folders or infer another entry.
+
+Put shared code in subfolders and import their paths. An imported folder's
+immediate `.dodo` files form one package, in sorted order. They must all declare
+the same package and share declarations and import aliases. Nested folders are
+included only through imports. No filename is special inside an imported
+folder: it needs neither `main.dodo` nor `lib.dodo`, and a folder named `lib`
+behaves like any other local folder.
 
 ## Local imports
 
@@ -54,20 +67,22 @@ are shared across files in one directory package; inconsistent aliases for the
 same path are rejected. Each package must directly import the
 intrinsics it uses; a dependency's import does not grant access to its callers.
 
-## A two-file example
+## A project with shared code
 
 Create this directory layout:
 
 ```text
 app/
   main.dodo
-  math.dodo
+  math/
+    answer.dodo
+    base.dodo
 ```
 
 Put the entry point in `app/main.dodo`:
 
 ```dodo
-package app
+package main
 
 import "math"
 
@@ -76,27 +91,42 @@ fn main() -> i32 {
 }
 ```
 
-Put the imported package in `app/math.dodo`:
+Put the public function in `app/math/answer.dodo`:
 
 ```dodo
 package math
 
 pub fn answer() -> i32 {
-    42
+    base() + 2
 }
 ```
 
-Check and run the entry file:
+Put its private helper in `app/math/base.dodo`:
 
-```sh
-dodo check app/main.dodo
-dodo run app/main.dodo
+```dodo
+package math
+
+fn base() -> i32 {
+    40
+}
 ```
 
-The program exits successfully with no output. Use the file path here:
-`dodo check app` would combine both files into one package and reject their
-different package declarations. To compile `app` as a directory, place the
-`math` package in `app/math/` instead.
+Both files in `math/` are loaded by `import "math"`. The entry file can call
+`math.answer()` because it is public. The helper is available within `math/`.
+
+Check, run, and compile from the project folder:
+
+```sh
+cd app
+dodo check
+dodo run
+dodo compile
+./build/app
+```
+
+The executable is named after the project folder: `build/app`.
+The program exits successfully with no output. You can add more ordinary
+subfolders in the same way; there is no library registration step.
 
 The [editor setup guide](editors.md#file-and-package-checking) explains how to
-select the same file or directory behavior for editor checks.
+check the entry file and combine files while editing an imported folder.
