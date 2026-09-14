@@ -42,7 +42,7 @@ def main() -> None:
         bundle = scratch / args.archive.stem
         compiler = bundle / "dodo.exe"
         for name in ("dodo.exe", "INSTALL.txt", "LICENSE", "licenses/LLVM-LICENSE.txt", "licenses/libxml2-Copyright",
-                     "licenses/rust/COPYRIGHT-library.html", "examples/hello.dodo"):
+                     "licenses/Unicode-LICENSE.txt", "licenses/rust/COPYRIGHT-library.html", "examples/hello.dodo"):
             if not (bundle / name).is_file():
                 raise RuntimeError(f"Release is missing {name}")
 

@@ -54,8 +54,9 @@ specification remains version 0.1.
 - Replace external JSON, LSP protocol, and file-URI dependencies with internal
   implementations. Rename the Cargo package to `dodo`; the library remains `dodoc`.
 - Publish x86-64 Linux and Windows compiler archives with embedded LLVM,
-  examples, documentation, and dependency notices. The Windows build uses
-  static runtimes. Remove the separate checksum manifest.
+  examples, documentation, and dependency notices, including the embedded
+  standard library's Unicode notice. The Windows build uses static runtimes.
+  Remove the separate checksum manifest.
 - Use the official LLVM 22.1.8 Linux archive without a Z3 dependency. Cache
   native build dependencies, retry downloads, and improve Windows extraction
   and release smoke tests.

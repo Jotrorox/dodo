@@ -60,6 +60,7 @@ def main() -> None:
         shutil.copytree(ROOT / "docs/src/content/docs", bundle / "docs/src/content/docs")
         notices = bundle / "licenses"
         notices.mkdir()
+        shutil.copy2(ROOT / "stdlib/std/LICENSE.unicode", notices / "Unicode-LICENSE.txt")
 
         # Include build dependencies too, so the bundle records the locked toolchain.
         for dependency in metadata["packages"]:
