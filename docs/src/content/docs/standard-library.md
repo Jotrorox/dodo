@@ -471,15 +471,16 @@ exactly widened to binary64; formatting then rounds that exact value. There is
 no shortest-roundtrip, `%g`, hexadecimal-float, locale, or dynamic format-string
 API in this release.
 
-Floating conversion adapts the exact base-1e9 expansion from musl 1.2.5's
-[`fmt_fp`](https://git.musl-libc.org/cgit/musl/tree/src/stdio/vfprintf.c?h=v1.2.5),
-with integer guard/sticky rounding. Its MIT copyright and permission notice is
-preserved in `stdlib/std/LICENSE.musl`. No C code or libc is linked. The helper
-uses 128 `u32` limbs, 1100 decimal scratch bytes, and a 640-byte output buffer,
-plus ordinary scalar locals and call frames; integer and string formatting do
-not use this floating scratch. The algorithm favors correctness and bounded
-storage over shortest-output speed. All target memory and soft-float helper
-requirements are those of the normal compiler backend.
+Floating conversion decodes the binary64 significand and exponent and constructs
+an exact decimal integer using powers of two or the identity
+`m / 2^k = (m * 5^k) / 10^k`. This independent implementation uses integer
+arithmetic to round the coefficient once, with ties to even, regardless of the
+floating-point rounding mode. No C code or libc is linked. The helper uses a
+768-byte decimal digit array and a 640-byte output buffer, plus ordinary scalar
+locals and call frames; integer and string formatting do not use this floating
+scratch. The algorithm favors correctness and bounded storage over
+shortest-output speed. All target memory and soft-float helper requirements are
+those of the normal compiler backend.
 
 Customization is static and explicit. A public value type defines
 `pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error`;
