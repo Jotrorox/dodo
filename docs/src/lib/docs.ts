@@ -1,6 +1,6 @@
 import { getCollection } from 'astro:content';
 
-export const docSections = ['Start here', 'Using Dodo', 'Language reference', 'Project'] as const;
+export const docSections = ['Start here', 'Using Dodo', 'Standard library', 'Language reference', 'Project'] as const;
 
 export const pageUrl = (id: string) => `${import.meta.env.BASE_URL}${id === 'index' ? '' : `${id}/`}`;
 

@@ -39,6 +39,28 @@ Include a package declaration and a `main` or test function. Run
 the same command. Leave illustrative or incomplete snippets marked `dodo`.
 See [executable documentation](testing.md#execute-documentation-examples).
 
+For standard-library guides, start with the module's purpose, one recommended
+API, a complete copyable program, its run command, and expected stdout or exit
+status. Explain imports and storage beside first use. Handle likely failures
+and tell readers how to recover. Put ownership, invalidation, numerical,
+platform and protocol contracts after the quickstart; preserve them when
+reorganizing a page. Use the current source APIs, including convenience methods.
+
+Mark file/peer/credential-dependent examples `dodo` and include their complete
+local setup and cleanup. Use loopback peers instead of public services. Validate
+these separately at O0 and O3; do not mark an example executable merely to make
+discovery count it. A silent successful example should assert its result and
+explain what exit 0 proves. Use a fresh loopback port for each automated peer, as
+`scripts/test_http_web.py` does; a recently closed fixed port may still be
+reserved by the OS. Do not use `@test`-only code with a `dodo run` command.
+The test runner checks exit status and assertions, not prose about stdout; compare
+observable output separately when changing a quickstart.
+
+Keep the [package inventory](standard-library.md#packages) in sync with `stdlib/`
+and compiler intrinsic/virtual packages. Link every public family and identify
+helper packages. Explicitly distinguish portable imports from hosted adapters
+and accepted compilation targets from targets tested by execution.
+
 ## Place a page in navigation
 
 The sidebar groups pages by their `section` field in this fixed order:
@@ -47,6 +69,7 @@ The sidebar groups pages by their `section` field in this fixed order:
 | --- | --- | --- |
 | `Start here` | Overview, installation, and a first program. | 0–99 |
 | `Using Dodo` | Practical guides for everyday compiler use. | 100–199 |
+| `Standard library` | Task-first module guides and package inventory. | 140–199 |
 | `Language reference` | Language topics and the full specification. | 200–299 |
 | `Project` | Implementation, requirements, and contributing. | 300 and above |
 
@@ -94,7 +117,9 @@ The build generates static pages, specification downloads, and a search index
 in `docs/dist/`. The link checker validates internal pages, heading anchors,
 assets, and search targets using the production `/dodo/` path prefix. Run it
 after a fresh build so it checks your latest changes. It also checks that each
-page has one main heading and appears in search; it does not check external
+page has one main heading, appears in search and navigation, and has exactly one
+current-page link. It also checks that every source package in `stdlib/` is
+named in the overview inventory. It checks consistent sidebar ordering and duplicates; it does not check external
 websites.
 
 Open the preview URL to check the page layout, grouped navigation, search, and

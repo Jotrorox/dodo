@@ -1,9 +1,104 @@
 ---
 title: "HTTP"
 description: "Portable, bounded HTTP/1.1 framing and explicit transport composition."
-section: "Using Dodo"
-order: 153
+section: "Standard library"
+order: 159
 ---
+
+Use `std/http/hosted.Client.new` and `get` to fetch a URL on Linux GNU x86-64
+or Windows x64. The hosted wrapper handles resolution, connection and polling;
+start with its fixed workspace and a bounded body buffer. Portable `std/http`
+and `std/http/client` remain available for custom transports and executors.
+
+## Quickstart
+
+Create a fresh directory for a Python 3.11+ local HTTP peer in terminal 1:
+
+```sh
+python3 -c "from pathlib import Path; Path('local-http').mkdir(exist_ok=True); Path('local-http/index.html').write_bytes(b'Hello, Dodo!\n')"
+python3 -m http.server 8080 --bind 127.0.0.1 --directory local-http --protocol HTTP/1.1
+```
+
+Wait for the serving message, then use terminal 2. If port 8080 is occupied,
+stop your previous example or change the port in both places. No Internet,
+proxy configuration or credentials are involved. `--protocol HTTP/1.1` is
+required because Dodo rejects HTTP/1.0 responses.
+
+Save this as `fetch_url.dodo`:
+
+```dodo
+package fetch_url
+import "std/http/hosted"
+import "std/http/hosting"
+import "std/console"
+import "std/io"
+
+fn fetch() -> i32!hosting.Error {
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    client := hosted.Client.new(&mut workspace, hosted.Config.defaults())?
+    body := [0u8; 1024]
+    response := client.get(b"http://127.0.0.1:8080/", &mut body)?
+    if response.status != 200 { return ok(2) }
+    output := console.stdout()
+    match io.write_all(&mut output, &body[..response.body_bytes as usize]) {
+        ok(_) => { return ok(0) }, err(_) => { return ok(3) },
+    }
+}
+fn main() -> i32 {
+    match fetch() {
+        ok(code) => { return code },
+        err(reason) => {
+            if reason.kind == hosting.ErrorKind.BodyLimit { return 4 }
+            errors := console.stderr()
+            match errors.println_value(&reason) {
+                ok(_) => {}, err(_) => {},
+            }
+            return 1
+        },
+    }
+}
+```
+
+```sh
+dodo run fetch_url.dodo
+```
+
+Expected stdout is `Hello, Dodo!` followed by a newline; exit 0 means a complete
+HTTP 200 response was received. This also works against the [web quickstart](web.md).
+Stop the Python server with Ctrl+C when finished.
+
+`hosted.WORKSPACE_BYTES` supplies fixed parser/header/I/O storage; the 1024-byte
+array independently bounds the response body. `std/http/hosting` names shared
+hosted errors; its driving helpers are implementation plumbing, not the
+recommended application entry point. `console` selects stdout and `io.write_all`
+handles partial writes.
+
+Exit 1 means the request failed: start the local server for a connect error,
+check the URL for resolution errors, and inspect the nested network, transport
+or protocol cause. Exit 4 means the body exceeded your bound; increase it within
+a chosen limit or use `get_to` with a streaming sink. Error `delivered` counts
+body bytes already accepted by the sink. Exit 2 is an HTTP status other than 200,
+which is a completed response, not a transport failure. Exit 3 means stdout failed.
+
+## Hosted client choices
+
+`Config.defaults()` disables redirects and sets explicit positive resolution,
+connection and request budgets. Configure `max_redirects` only when following
+locations is intended. System resolution cannot interrupt `getaddrinfo`; its
+budget is checked before and after that call. Deadlines bound cooperative I/O,
+not arbitrary native blocking or application work.
+
+`get_to(url, sink)` streams to an `std/io` writer; `request` accepts explicit
+method, headers and borrowed body bytes. `header(name, occurrence)` exposes the
+final response's copied headers until the next request, and errors clear them.
+`request_with` selects resolver, connector, clock and cancellation providers.
+The default connector is plaintext HTTP. For HTTPS, start with
+`std/http/https.Client` and explicit `https.Trust`, as shown in the
+[TLS quickstart](tls.md). Never disable peer verification to make a
+request succeed. `std/http/connection` and the polling `std/http/client` are the
+advanced portable path described below.
+
+## API and contracts
 
 `std/http` contains HTTP types and an incremental HTTP/1.1 engine. Importing it
 requires only portable `core/ascii`, `core/bytes`, `core/mem`, and `std/net`
@@ -204,7 +299,7 @@ reads. The same portable fixture emits objects for `wasm32-unknown-unknown` and
 
 `std/http/client.Client` wraps the bounded connection driver around an explicit
 origin and caller-owned parser/input/output buffers. The runnable
-[`examples/http_client.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/http_client.dodo)
+[`examples/http_client_polling.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/http_client_polling.dodo)
 connects to the bundled web-server example with `std/net/native`, passes its
 nonblocking stream to Client methods, and streams the response without allocating
 or buffering the complete body.
@@ -278,3 +373,7 @@ reusable completed connection. Check the current client deadline/cancellation
 before pool admission. Transport owners remain in the application's corresponding
 slots and must be closed when metadata becomes vacant. There is no global pool,
 allocation, or implicit transport destructor in this metadata layer.
+
+## Hosted convenience layer
+
+Use `std/http/hosted` for a reusable URL client and `std/http/https` for verified HTTPS. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit storage bounds, resolver/deadline scope, cancellation, and a generated local HTTPS setup.

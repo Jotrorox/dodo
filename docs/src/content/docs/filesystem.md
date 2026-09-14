@@ -1,9 +1,86 @@
 ---
 title: "Filesystem and native platform values"
 description: "Native paths, files, directories, explicit storage, ownership, and Linux/Windows filesystem guarantees."
-section: "Using Dodo"
-order: 145
+section: "Standard library"
+order: 152
 ---
+
+Use `std/fs.read_file` to read a small file into a fixed byte array. Import
+`std/platform` for reusable path-conversion storage and `std/console` to display
+the returned bytes. These are hosted APIs for Linux GNU x86-64 and Windows x64.
+
+## Quickstart
+
+In a fresh example directory, create the fixture with Python 3:
+
+```sh
+python3 -c "from pathlib import Path; Path('message.txt').write_bytes(b'Hello, file!\n')"
+```
+
+Save this as `read_file.dodo`:
+
+```dodo
+package read_file
+import "std/fs"
+import "std/platform"
+import "std/platform/error"
+import "std/console"
+import "std/io"
+
+fn main() -> i32 {
+    workspace := platform.workspace()
+    contents := [0u8; 64]
+    match fs.read_file("message.txt", &mut contents, &mut workspace) {
+        ok(report) => {
+            if !report.eof { return 2 }
+            output := console.stdout()
+            match io.write_all(&mut output, &contents[..report.read]) {
+                ok(_) => { return 0 },
+                err(_) => { return 3 },
+            }
+        },
+        err(reason) => {
+            if reason.cause.kind == error.Kind.NotFound { return 4 }
+            errors := console.stderr()
+            match errors.println_value(&reason.cause) {
+                ok(_) => {}, err(_) => {},
+            }
+            return 1
+        },
+    }
+}
+```
+
+```sh
+dodo run read_file.dodo
+```
+
+Expected stdout is `Hello, file!` followed by a newline; success exits 0.
+The 64-byte array bounds file contents; `platform.workspace()` supplies a
+4096-unit native path buffer. No allocator is required.
+
+Exit 4 means the file is missing: run the setup in the same working directory.
+Exit 2 means the file exceeds the destination: enlarge it or stream with
+`File.open_utf8` and `io.copy`. Exit 3 means stdout failed. Other file errors
+exit 1; inspect `reason.cause.kind` and native `code` (permissions, for example).
+`reason.transferred` tells how much of the output array is valid after failure.
+Do not treat a partial read as the whole file.
+
+## Whole-file convenience operations
+
+`read_file(path, output, workspace)` opens a fresh cursor and closes it before
+returning. `ReadReport.read` is the retained prefix and `eof` distinguishes a
+complete file from capacity exhaustion. An exact fit uses a discarded one-byte
+EOF probe. This is not a snapshot against concurrent writers.
+`File.open_utf8(path, options, workspace)` gives explicit streaming ownership.
+
+`write_file(path, bytes, workspace)` creates or **truncates** the destination,
+follows symlinks, and leaves partial/truncated data on failure. It does not sync
+or atomically replace. For exclusive creation use `OpenOptions.create_new()`
+with `File.open_utf8` and `io.write_all`; for durability handle `File.sync`.
+`FileError` preserves native causes and transferred-byte counts.
+
+## API and contracts
 
 `std/fs` provides synchronous, recoverable filesystem operations. It imports
 `std/io` and independently selects `std/fs/linux` or `std/fs/windows` through
@@ -229,3 +306,33 @@ The Windows harness links and executes real PE fixtures under Wine, including
 sharing denial and strict/lossy unpaired-surrogate conversion. Rejection tests
 cover escaping native paths, mutable aliases, iterator name lifetimes, ignored
 Results, and private resource construction.
+
+## Whole-file boundaries and errors
+
+`read_file` reports `io.ReadReport { read, eof }`. The returned byte count always
+fits the destination. `eof=false` means more data was observed: do not treat the
+retained prefix as a whole file. A one-byte probe distinguishes an exact fit
+from exhaustion, including a zero-byte buffer and empty file. The probe byte is
+discarded; no unbounded allocation or metadata-size guess is used. Reads retry
+interruptions and may block, including on special files and during the probe.
+There is no file-operation timeout. `io.read_bounded` exposes this same portable
+algorithm for structural readers without importing any hosted module.
+
+On errors, only `output[..reason.transferred]` is retained output. Open/path
+conversion failures transfer zero bytes and leave output unchanged. Close errors
+preserve the full read count. The first operation error wins over cleanup errors;
+owners still attempt deterministic cleanup. File mutation during the read is
+observable; completion means observed EOF, not a consistent filesystem snapshot.
+
+`write_file` returns only after writing every input byte and successfully closing.
+It creates a missing file and truncates an existing one before writing, even for
+empty input. Unix creation mode is 0666 filtered by umask; Windows sharing allows
+read/write/delete. It follows symlinks. It does not create parent directories,
+replace atomically, or request durable storage. On failure, a created/truncated
+file and its written prefix remain; `transferred` counts accepted bytes, including
+all bytes if only close failed. Use `File.open_utf8` with explicit options for
+exclusive creation, append, or an explicit `sync` request.
+
+The complete [file example](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_files.dodo)
+creates/truncates `hosted-example.txt`, reads it through a 64-byte buffer, and
+prints it. Run it in a disposable directory to keep its output isolated.

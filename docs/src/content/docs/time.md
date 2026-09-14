@@ -1,9 +1,71 @@
 ---
-title: "Portable time values"
+title: "Time and clocks"
 description: "Exact durations, UTC calendars, explicit clock identity, and deterministic timers."
-section: "Using Dodo"
-order: 145
+section: "Standard library"
+order: 150
 ---
+
+Use `std/time/hosted.WallClock.new().wall_now()` to read the current UTC timestamp
+on Linux GNU x86-64 or Windows x64. Import `std/console` and `std/fmt` to print
+Unix seconds. For elapsed time and deadlines use `hosted.MonotonicClock` instead:
+a wall clock can jump when the system time changes.
+
+## Quickstart
+
+Save this as `time_start.dodo`:
+
+```dodo test
+package time_start
+import "std/time/hosted"
+import "std/console"
+import "std/fmt"
+
+fn main() -> i32 {
+    clock := hosted.WallClock.new()
+    match clock.wall_now() {
+        ok(timestamp) => {
+            value := fmt.signed(timestamp.seconds())
+            match console.println_value(&value) {
+                ok(_) => { return 0 }, err(_) => { return 2 },
+            }
+        },
+        err(_) => { return 1 },
+    }
+}
+```
+
+```sh
+dodo run time_start.dodo
+```
+
+Expected stdout: an integer such as `1789344000` followed by a newline.
+It is seconds since 1970-01-01 00:00:00 UTC, so it changes with the system clock.
+Success exits 0. Exit 1 means the clock could not be read; propagate the failure
+instead of substituting a believable timestamp. `wall_now_native` preserves the
+native error code when diagnostics are needed. Exit 2 means printing failed.
+The clock and timestamp are fixed-size values; no buffer or allocator is needed.
+
+`std/time` itself contains portable values, and `std/time/clock` supplies clock
+contracts and deterministic fakes. Importing either does not read the OS clock.
+Use `clock.FakeClock` / `FakeWallClock` in repeatable tests; choose
+`std/time/iso8601` to parse or format UTC text, and `std/time/timer` for the
+portable timer contract. Those imports are independent of the hosted provider.
+
+## Hosted clock behavior
+
+`hosted.MonotonicClock.new().now()` returns an `Instant` with the reserved native
+clock identity `hosted.MONOTONIC_ID`. All native instances share an origin;
+custom and fake clocks must use other IDs. Do not persist or serialize monotonic
+observations as portable deadlines. `now_native` retains platform errors;
+`now` maps them to `TimeError.ClockFailure`. `now_ms` supports network clock
+contracts and returns the maximum u64 on failure, causing deadline checks to
+fail closed. `WallClock` returns UTC timestamps, with no local-time conversion.
+
+`Duration.to_millis()` truncates fractional milliseconds. `to_millis_ceil()`
+rounds up; `timeout_millis()` additionally rejects the all-ones infinite-wait
+sentinel. All overflowing conversions fail. These helpers do not sleep.
+
+## API and contracts
 
 `std/time` contains allocation-free values and arithmetic. Importing it does
 not read a clock, sleep, schedule work, start a runtime, or consult a timezone.
@@ -16,7 +78,7 @@ Optional packages add capabilities and text conversion independently:
 | `std/time/timer` | Static one-shot timer contract and FakeTimer |
 | `std/time/iso8601` | Parsing and formatting over borrowed byte slices, using `std/text` and `std/fmt` |
 
-There is no OS clock, blocking wait, scheduler, timezone database, locale,
+These portable packages have no OS clock, blocking wait, scheduler, timezone database, locale,
 implicit local timezone, or daylight-saving conversion in these packages.
 Application adapters can provide clock/timer methods without changing the
 portable values. All storage is fixed-size; numeric operations and calendar
@@ -197,3 +259,31 @@ buffer failure. Compiler rejection tests preserve private invariants, mandatory
 Result handling, and distinct monotonic/wall-time types. Portable object checks
 do not execute an OS clock or board startup. See `examples/time.dodo` for a
 complete executable example.
+
+## Native providers and elapsed measurements
+
+Import `std/time/hosted` explicitly for OS observations. Its `MonotonicClock.now`
+and `WallClock.wall_now` implement the `std/time/clock` structural contracts;
+`now_native` and `wall_now_native` preserve `std/platform/error.Error` with the
+native error code (with kind `Other`). The portable contracts map failures to `TimeError.ClockFailure`.
+There is no allocation, sleeping, scheduler, or timezone lookup.
+
+Linux reads `CLOCK_MONOTONIC` (which excludes suspended time) and `CLOCK_REALTIME`.
+Windows uses `QueryPerformanceCounter`/`QueryPerformanceFrequency` for monotonic
+time and `GetSystemTimePreciseAsFileTime` for wall time (Windows 8 or later).
+Windows performance-counter elapsed time includes sleep/hibernation. Wall times
+use the Unix epoch; Windows 100 ns ticks are converted to normalized seconds and
+nanoseconds. Precision of the value type does not imply equal clock resolution.
+Both monotonic clocks can return equal consecutive values; wall clocks can jump.
+
+`hosted.MonotonicClock.now_ms` and legacy `std/net/native.MonotonicClock.now_ms`
+use the same provider and truncation, so their millisecond domains agree. Both
+return the maximum timestamp on failure for existing network deadline contracts.
+Synchronization's `milliseconds` uses `Duration.timeout_millis` and maps conversion
+failures to its `InvalidInput`. Portable clocks/durations do not import these
+hosted integrations. Native monotonic IDs are reserved for this adapter;
+application clocks must choose a different identity.
+
+[hosted_elapsed.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_elapsed.dodo)
+is a complete elapsed-time example: it prints nanoseconds between two observations.
+Place work between those observations to measure it; zero is a valid result.

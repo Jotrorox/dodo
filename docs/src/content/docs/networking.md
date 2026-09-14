@@ -1,12 +1,81 @@
 ---
 title: "Networking"
 description: "Portable IP and DNS codecs, owned nonblocking sockets, explicit execution and resolver providers."
-section: "Using Dodo"
-order: 150
+section: "Standard library"
+order: 157
 ---
 
+Use `std/net.parse_socket` for a literal address and `std/net/native.connect_with`
+for a TCP connection with an explicit deadline. Start with a literal loopback
+address so DNS and external services are unnecessary. `net` values are portable;
+`native` sockets and the monotonic clock require a supported hosted target.
+
+## Quickstart
+
+Start this Python 3 peer in terminal 1; it accepts exactly one local connection:
+
+```sh
+python3 -u -c "import socket; s = socket.socket(); s.bind(('127.0.0.1', 8081)); s.listen(1); print('ready', flush=True); c, _ = s.accept(); c.close(); s.close(); print('accepted')"
+```
+
+Wait for `ready`, then use terminal 2 in your example directory.
+If bind reports an occupied port, stop your previous example or change 8081 in
+both programs. The listener is bound only to loopback.
+
+Save this as `network_start.dodo`:
+
+```dodo
+package network_start
+import "std/net"
+import "std/net/native"
+
+fn connect() -> void!net.Error {
+    address := net.parse_socket(b"127.0.0.1:8081")?
+    clock := native.MonotonicClock {}
+    operation := net.Operation.until(clock.now_ms() + 5000)
+    cancel := net.NeverCancel {}
+    stream := native.connect_with(&address, &operation, &mut clock, &cancel)?
+    peer := stream.peer_address()?
+    assert_eq(peer.port, 8081u16)
+    stream.close()?
+    return ok()
+}
+fn main() -> i32 {
+    match connect() {
+        ok() => { return 0 },
+        err(reason) => {
+            if reason.kind == net.ErrorKind.ConnectionRefused { return 2 }
+            return 1
+        },
+    }
+}
+```
+
+```sh
+dodo run network_start.dodo
+```
+
+Expected output: none from Dodo; exit 0 means TCP connected to port 8081 and
+closed cleanly. The peer prints `accepted` and exits. Restart it for another run.
+The address and operation policy use fixed-size values; no caller byte workspace
+or allocator is needed for this connection.
+
+Exit 2 means connection refused: start the peer and check the port. Other
+failures exit 1: inspect `kind` and native `code`; check an invalid address,
+firewall or deadline before retrying. Never spin on `WouldBlock`; wait for the
+appropriate readiness event under a deadline. The client uses the convenient
+bounded connector; individual nonblocking steps remain available below.
+For a complete request/response task, continue to [HTTP](http.md).
+
+`std/net/dns` supplies portable DNS packets and resolver policies; use
+`native.resolve_numeric` for numeric hosts without invoking system DNS.
+`native.resolve` explicitly uses the hosted resolver and caller workspace;
+it can block independently of a connection deadline.
+
+## API and contracts
+
 `std/net` contains address values, parsers, formatting, errors and operation
-policy. It has no imports and works on freestanding targets. `std/net/dns`
+policy. It imports portable byte-I/O error support and works on freestanding targets. `std/net/dns`
 contains DNS message handling. `std/net/operations` composes structural stream,
 clock, cancellation and readiness capabilities without selecting a platform.
 Importing any of these packages does not open a socket or require an allocator,
@@ -223,7 +292,7 @@ resolver.
 The native boundary is bundled C11 source compiled against actual system socket
 headers, avoiding hand-declared platform structure layouts. Linux uses libc
 sockets, `poll`, `getaddrinfo` and `CLOCK_MONOTONIC`. Windows uses Winsock 2.2,
-`WSAPoll`, `getaddrinfo` and `GetTickCount64`, linking `ws2_32` plus the existing
+`WSAPoll`, `getaddrinfo` and the shared `std/time/hosted` performance counter, linking `ws2_32` plus the existing
 Windows runtime libraries. Winsock initialization happens once per process under
 `InitOnceExecuteOnce`; the process-wide startup reference remains until process
 exit. Socket options and local-domain sockets have no portable API in this

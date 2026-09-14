@@ -1,9 +1,52 @@
 ---
 title: Native threads and checked transfer
 description: Native tasks, joining, explicit detachment, and compiler transfer contracts.
-section: "Using Dodo"
-order: 148
+section: "Standard library"
+order: 155
 ---
+
+Use `std/thread.Storage.new` and `thread.spawn` to run one native task and
+`join` to retrieve its result. Start with caller-backed storage and join before
+returning; detached, explicitly allocated ownership is an advanced choice.
+This is hosted functionality on Linux GNU x86-64 and Windows x64.
+
+## Quickstart
+
+Save this as `thread_start.dodo`:
+
+```dodo test
+package thread_start
+import "std/thread"
+
+pub struct Double {
+    value: usize
+    pub fn run(self) -> usize { return self.value * 2 }
+}
+fn calculate() -> usize!thread.ThreadError {
+    storage := thread.Storage.new::<Double, usize>()
+    worker := thread.spawn(&mut storage, Double { value: 21 })?
+    return ok(worker.join())
+}
+fn main() -> i32 {
+    match calculate() {
+        ok(value) => { assert_eq(value, 42usize); return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+```sh
+dodo run thread_start.dodo
+```
+
+Expected output: none; exit 0 confirms the worker returned 42. Exit 1 means
+thread creation failed: reduce concurrent work or report the resource failure.
+The task and `run` method are public for static dispatch from the library.
+Storage holds the task, result and handle; the OS still provides a native stack.
+Pass owned scalar data as above. Captured checked references and unhandled
+Results cannot be hidden in tasks; the full transfer restrictions follow.
+
+## API and contracts
 
 `std/thread` starts native Linux pthreads or Windows CRT threads. Each adapter
 is selected from the compilation target independently of filesystem, process,
