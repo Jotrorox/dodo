@@ -1,5 +1,9 @@
 package hash
 
+import "core/mem"
+import "core/bytes"
+import "std/text"
+
 // Stable byte-oriented FNV-1a-64 and SipHash-2-4. No native-layout hashing.
 const MAX: u64 = ~0u64
 fn add(a: u64, b: u64) -> u64 {
@@ -231,5 +235,41 @@ pub struct SipI32 {
     }
     pub fn equal(&self, a: &i32, b: &i32) -> bool {
         return *a == *b
+    }
+}
+
+// Text keys compare/hash UTF-8 contents, never pointer addresses.
+pub struct Str {
+    pub fn compare(&self, a: & &str, b: & &str) -> i32 {
+        return bytes.compare(mem.str_bytes(*a), mem.str_bytes(*b))
+    }
+    pub fn equal(&self, a: & &str, b: & &str) -> bool {
+        return self.compare(a, b) == 0
+    }
+    pub fn hash(&self, key: & &str) -> u64 {
+        return fnv1a64(mem.str_bytes(*key))
+    }
+}
+pub struct Text {
+    pub fn compare(&self, a: &text.Text, b: &text.Text) -> i32 {
+        return bytes.compare(a.as_bytes(), b.as_bytes())
+    }
+    pub fn equal(&self, a: &text.Text, b: &text.Text) -> bool {
+        return self.compare(a, b) == 0
+    }
+    pub fn hash(&self, key: &text.Text) -> u64 {
+        return fnv1a64(key.as_bytes())
+    }
+}
+pub struct SipStr {
+    k0: u64, k1: u64
+    pub fn new(k0: u64, k1: u64) -> SipStr {
+        return SipStr { k0: k0, k1: k1 }
+    }
+    pub fn equal(&self, a: & &str, b: & &str) -> bool {
+        return bytes.equal(mem.str_bytes(*a), mem.str_bytes(*b))
+    }
+    pub fn hash(&self, key: & &str) -> u64 {
+        return siphash24(mem.str_bytes(*key), self.k0, self.k1)
     }
 }

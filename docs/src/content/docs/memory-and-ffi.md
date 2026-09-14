@@ -119,7 +119,8 @@ allocator dependencies as shared. Raw casts still cannot fabricate checked
 references, and unsafe code must not invalidate an allocation while a checked
 view remains live.
 
-Element types containing checked references or Results are rejected recursively:
+For `ptr.borrow*`, element types containing checked references or Results are
+rejected recursively:
 the owner loan cannot reconstruct hidden element provenance or Result handling
 obligations. The owner's own checked fields remain tracked. Owner expressions
 are evaluated after the pointer (and count for slices), even though their
@@ -133,8 +134,9 @@ transferred as well, including on failed insertion and destruction. Matching a
 value before replacing it does not handle the replacement. Ordinary assignment
 of Result-containing values through fields, indices, or references is rejected
 for the same missing handling-state transfer. See the
-[container element design and blocker tests](container-elements.md) for the
-proposed invariants; no raw-storage restriction is relaxed.
+[container element guide](container-elements.md) for the implemented typed-storage
+primitives and their checked mutation/return contracts. Existing raw pointer and
+opaque storage primitives retain their restrictions.
 
 `mem.str_from_utf8` requires the complete byte slice to be valid UTF-8. Prefer
 safe `text.Text.new(bytes)?.as_str()` after binding the text view. It creates no
@@ -153,3 +155,14 @@ are not atomics or CPU barriers.
 LLVM lowering follows the [LLVM Language Reference](https://llvm.org/docs/LangRef.html),
 including explicit overflow intrinsics, volatile instructions, and x86 SysV
 C-ABI integer extension attributes on declarations and call sites.
+
+
+## Typed allocated storage
+
+`mem.storage_type::<T>()` checks the supported element category. The unsafe
+`ptr.store`, `ptr.take`, `ptr.relocate`, `ptr.view`, and `ptr.view_slice` primitives
+require a matching zero-length typed witness in their checked owner. They track
+element dependencies separately from storage borrows; they cannot store owned
+Results or exclusive-reference elements. Pointer validity, initialized extents,
+and exactly-once ownership transfer remain unsafe obligations. See the complete
+[contracts and restrictions](container-elements.md#checked-region-invariant).

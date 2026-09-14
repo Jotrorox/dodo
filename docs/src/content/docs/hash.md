@@ -107,6 +107,14 @@ ordinary integer equality. `SipI32.new(k0, k1)` and
 `SipU64.new(k0, k1)` provide the same encodings with SipHash. Colliding unequal
 keys are allowed and handled by collections.
 
+For UTF-8 keys, `hash.Str {}` handles `&str` and `hash.Text {}` handles
+`text.Text`; both compare bytes lexicographically and hash contents with FNV.
+`hash.SipStr.new(k0, k1)` supplies caller-keyed hashing for `&str` keys.
+`text_shared.Key {}` provides comparison, equality, and FNV hashing for owned
+`text_shared.String` keys. See the
+[string-keyed map example](https://github.com/Jotrorox/dodo/blob/main/examples/string_map.dodo)
+and [collection lifetime restrictions](container-elements.md).
+
 ## Attribution and validation
 
 FNV follows Fowler/Noll/Vo's algorithm and the

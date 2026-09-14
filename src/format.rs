@@ -652,6 +652,10 @@ fn needs_space(
             "=" | ":=" | ":" | "," | ";" | "return" | "in" | "->"
         );
     }
+    // Two nested shared reference tokens must not become logical `&&`.
+    if previous == "&" && text == "&" {
+        return true;
+    }
     if matches!(previous, "&" | "*" | "!" | "~") {
         return false;
     }
@@ -659,7 +663,7 @@ fn needs_space(
         return false;
     }
     if previous == "]" && matches!(current.kind, TokenKind::Ident(_)) {
-        return matches!(text, "as" | "in");
+        return matches!(text, "as" | "in" | "from" | "stores" | "requires_plain");
     }
     if text == "!" {
         return false;
@@ -781,6 +785,16 @@ mod tests {
         assert!(output.contains("for i, &value in values"));
         assert!(output.contains("for &_ in values"));
         assert!(output.contains("result := source\n        .decode()\n        .validate()"));
+    }
+    #[test]
+    fn preserves_nested_references_and_storage_contracts() {
+        let output = formatted(
+            "package p\nfn compare(a:& &str,b:& &str)->i32{return 0}\nfn take<T>(owner:&mut Region<T>)->T from(owner.stored){return owner.pop()}\nfn put<T>(owner:&mut Region<T>,value:T) stores(owner,value){}\nfn view<T>(owner:&mut Region<T>)->&mut[T] requires_plain(T){return owner.view()}\n",
+        );
+        assert!(output.contains("a: & &str"));
+        assert!(output.contains("from(owner.stored)"));
+        assert!(output.contains("stores(owner, value)"));
+        assert!(output.contains("] requires_plain(T)"));
     }
     #[test]
     fn rejects_invalid_input() {

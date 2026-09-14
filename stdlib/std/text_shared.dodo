@@ -1,0 +1,126 @@
+package text_shared
+
+import "alloc/shared_arena"
+import "alloc/error"
+import "alloc/layout"
+import "std/collections/shared_vector"
+import "std/collections/vector"
+import "std/text"
+import "std/hash"
+import "core/bytes"
+import "core/mem"
+
+// Owned UTF-8 with a shared allocator capability and an explicit byte limit.
+// The private vector can only be mutated through UTF-8-preserving operations.
+pub enum Error {
+    Text(text.Error), Allocation(error.AllocError)
+}
+
+pub struct String {
+    buffer: vector.Vector<u8, shared_arena.Handle>
+    maximum: usize
+
+    pub fn len_bytes(&self) -> usize {
+        return self.buffer.len()
+    }
+    pub fn capacity(&self) -> usize {
+        return self.buffer.capacity()
+    }
+    pub fn limit(&self) -> usize {
+        return self.maximum
+    }
+    pub fn as_str(&self) -> &str {
+        unsafe {
+            return mem.str_from_utf8(self.buffer.as_slice())
+        }
+    }
+    pub fn as_text(&self) -> text.Text {
+        return text.Text.from_str(self.as_str())
+    }
+    pub fn reserve(&mut self, additional: usize) -> void!error.AllocError {
+        if additional > self.maximum - self.buffer.len() {
+            return err(error.AllocError.Exhausted)
+        }
+        return self.buffer.reserve(additional)
+    }
+    pub fn append_str(&mut self, value: &str) -> void!error.AllocError {
+        data := mem.str_bytes(value)
+        self.reserve(data.len)?
+        for &byte in data {
+            self.buffer.push(byte)?
+        }
+        return ok()
+    }
+    pub fn append(&mut self, value: &text.Text) -> void!error.AllocError {
+        return self.append_str(value.as_str())
+    }
+    pub fn truncate(&mut self, length: usize) -> void!text.Error {
+        if length > self.buffer.len() {
+            return err(text.Error { kind: text.ErrorKind.OutOfBounds, position: length })
+        }
+        view := self.as_text()
+        if!view.is_boundary(length) {
+            return err(text.Error { kind: text.ErrorKind.NotBoundary, position: length })
+        }
+        for self.buffer.len() > length {
+            core.drop(self.buffer.pop())
+        }
+        return ok()
+    }
+    pub fn push(&mut self, scalar: u32) -> void!Error {
+        storage := [0u8; 4]
+        count := match text.encode(scalar, &mut storage) {
+            ok(n) => {
+                n
+            }, err(problem) => {
+                return err(Error.Text(problem))
+            },
+        }
+        match self.reserve(count) {
+            ok() => {}, err(problem) => {
+                return err(Error.Allocation(problem))
+            },
+        }
+        for i in 0usize..count {
+            match self.buffer.push(storage[i]) {
+                ok() => {}, err(problem) => {
+                    return err(Error.Allocation(problem))
+                },
+            }
+        }
+        return ok()
+    }
+    pub fn clear(&mut self) {
+        self.buffer.clear()
+    }
+}
+
+// Empty construction allocates no bytes. The limit bounds logical UTF-8 bytes;
+// vector growth may reserve extra capacity. No implicit process heap is used.
+pub fn new(allocator: shared_arena.Handle, limit: usize) -> String!error.AllocError from(allocator) {
+    if limit > layout.max_size() {
+        return err(error.AllocError.SizeOverflow)
+    }
+    return ok(String { buffer: shared_vector.new::<u8>(allocator), maximum: limit })
+}
+pub fn from_str(allocator: shared_arena.Handle, value: &str, limit: usize) -> String!error.AllocError from(allocator) {
+    result := new(allocator, limit)?
+    result.append_str(value)?
+    return ok(result)
+}
+pub fn from_text(allocator: shared_arena.Handle, value: &text.Text, limit: usize) -> String!error.AllocError from(allocator) {
+    return from_str(allocator, value.as_str(), limit)
+}
+
+// Lexicographic UTF-8 byte ordering and deterministic FNV-1a hashing.
+pub struct Key {
+    pub fn compare(&self, a: &String, b: &String) -> i32 {
+        return bytes.compare(mem.str_bytes(a.as_str()), mem.str_bytes(b.as_str()))
+    }
+    pub fn equal(&self, a: &String, b: &String) -> bool {
+        return self.compare(a, b) == 0
+    }
+    pub fn hash(&self, value: &String) -> u64 {
+        return hash.fnv1a64(mem.str_bytes(value.as_str()))
+    }
+}

@@ -7,7 +7,7 @@
 (type_parameters (identifier) @type)
 
 (keyword) @keyword
-["package" "import" "fn" "struct" "enum" "from" "as" "mut" "const"] @keyword
+["package" "import" "fn" "struct" "enum" "from" "stores" "requires_plain" "as" "mut" "const"] @keyword
 (operator) @operator
 ["->" "&" "*" "!"] @operator
 ["." "," ":" ";" "::"] @punctuation.delimiter

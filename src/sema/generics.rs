@@ -270,6 +270,9 @@ impl Expander {
         function: &mut Function,
         substitutions: &HashMap<String, Type>,
     ) -> Check<()> {
+        for required in &mut function.requires_plain {
+            self.ty(required, substitutions, function.span)?;
+        }
         for parameter in &mut function.params {
             self.ty(&mut parameter.ty, substitutions, parameter.span)?;
         }
@@ -1389,7 +1392,12 @@ pub(super) fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -
         },
         "mem.str_bytes" => Type::Slice(false, Box::new(Type::u8())),
         "mem.str_from_utf8" => Type::Str,
-        "ptr.borrow" | "ptr.borrow_mut" | "ptr.borrow_slice" | "ptr.borrow_slice_mut" => {
+        "ptr.view"
+        | "ptr.view_slice"
+        | "ptr.borrow"
+        | "ptr.borrow_mut"
+        | "ptr.borrow_slice"
+        | "ptr.borrow_slice_mut" => {
             let element = match first {
                 Type::Raw(_, t) => t,
                 _ => Box::new(explicit),
@@ -1422,7 +1430,10 @@ pub(super) fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -
             Type::Ref(_, t) => *t,
             _ => explicit,
         },
-        "mem.swap"
+        "mem.storage_type"
+        | "ptr.store"
+        | "ptr.relocate"
+        | "mem.swap"
         | "ptr.write"
         | "ptr.write_unaligned"
         | "ptr.write_volatile"
@@ -1444,7 +1455,7 @@ pub(super) fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -
         },
         "ptr.is_null" => Type::Bool,
         "ptr.offset" => first,
-        "ptr.read" | "ptr.read_unaligned" | "ptr.read_volatile" => match first {
+        "ptr.take" | "ptr.read" | "ptr.read_unaligned" | "ptr.read_volatile" => match first {
             Type::Raw(_, t) => *t,
             _ => explicit,
         },

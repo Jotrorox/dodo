@@ -6,6 +6,15 @@ import "std/collections/hash_map"
 pub struct Unit {}
 pub struct Set<T, H, A> {
     map: hash_map.Map<T, Unit, H, A>
+    pub fn next(&self, cursor: &mut usize) -> Option<&T> from(self) {
+        match self.map.next(cursor) {
+            some(entry) => {
+                return some(&entry.key)
+            }, none => {
+                return none
+            },
+        }
+    }
     pub fn len(&self) -> usize {
         return self.map.len()
     }
@@ -27,7 +36,7 @@ pub struct Set<T, H, A> {
             },
         }
     }
-    pub fn insert(&mut self, value: T) -> bool!error.AllocError {
+    pub fn insert(&mut self, value: T) -> bool!error.AllocError stores(self, value) {
         match self.map.insert(value, Unit {})? {
             some(_) => {
                 return ok(false)

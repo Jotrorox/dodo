@@ -11,6 +11,15 @@ pub struct Deque<T, A> {
     head: usize
     length: usize
 
+    // Cursor starts at zero. Each call yields one logical element.
+    pub fn next(&self, cursor: &mut usize) -> Option<&T> from(self) {
+        if *cursor >= self.length {
+            return none
+        }
+        index := *cursor
+        *cursor = index + 1
+        return self.get(index)
+    }
     pub fn len(&self) -> usize {
         return self.length
     }
@@ -46,7 +55,7 @@ pub struct Deque<T, A> {
             },
         }
     }
-    fn take_slot(&mut self, index: usize) -> Option<T> {
+    fn take_slot(&mut self, index: usize) -> Option<T> from(self.stored) {
         match self.slots.replace(index, none) {
             some(slot) => {
                 return slot
@@ -71,7 +80,7 @@ pub struct Deque<T, A> {
         }
         return ok()
     }
-    pub fn push_back(&mut self, value: T) -> void!error.AllocError {
+    pub fn push_back(&mut self, value: T) -> void!error.AllocError stores(self, value) {
         if self.length == self.slots.len() {
             self.grow()?
         }
@@ -80,7 +89,7 @@ pub struct Deque<T, A> {
         self.length = self.length + 1
         return ok()
     }
-    pub fn push_front(&mut self, value: T) -> void!error.AllocError {
+    pub fn push_front(&mut self, value: T) -> void!error.AllocError stores(self, value) {
         if self.length == self.slots.len() {
             self.grow()?
         }
@@ -93,7 +102,7 @@ pub struct Deque<T, A> {
         self.length = self.length + 1
         return ok()
     }
-    pub fn pop_front(&mut self) -> Option<T> {
+    pub fn pop_front(&mut self) -> Option<T> from(self.stored) {
         if self.length == 0 {
             return none
         }
@@ -106,7 +115,7 @@ pub struct Deque<T, A> {
         self.length = self.length - 1
         return value
     }
-    pub fn pop_back(&mut self) -> Option<T> {
+    pub fn pop_back(&mut self) -> Option<T> from(self.stored) {
         if self.length == 0 {
             return none
         }

@@ -53,6 +53,7 @@ HTTP, JSON/TOML, and peripheral drivers are not implemented.
 | `std/arena_bytes`, `std/pool_bytes` | Independently imported safe buffer constructors. |
 | `std/io_alloc` | Allocated append writers and bounded read-to-buffer helpers. |
 | `std/text_alloc`, `std/fmt_alloc` | Allocated UTF-8 strings and formatting into a newly owned string. |
+| `std/text_shared` | Direct safe owned UTF-8 construction with a shared arena handle. |
 | `std/fs`, `std/fs/types`, `std/fs/path` | Native files/directories, portable metadata contracts, and lexical paths. |
 | `std/process`, `std/process/alloc` | Direct child execution, streams, waiting, termination, and bounded output collection. |
 | `std/env` | Native arguments, environment snapshots, child-environment construction, and current-directory access. |
@@ -172,8 +173,10 @@ nested paths and runtime reflection are not supported.
 Exchange currently rejects types containing checked borrows or Results because
 their source dependencies and handling obligations cannot yet be transferred
 through this interface. `mem.init` likewise cannot hide either in opaque
-storage. Reading a checked-borrow-bearing `T` back from raw or opaque storage
-is unsupported. These restrictions also apply transitively through aggregates.
+storage. These restrictions also apply transitively through aggregates. The
+separate [typed collection storage](container-elements.md) primitives support
+shared-reference elements with checked mutation and removal contracts; they
+retain the restrictions on Results and exclusive-reference elements.
 
 See [memory and foreign calls](memory-and-ffi.md) for pointer signatures and
 unsafe contracts. The compiler may lower memory operations to target toolchain
@@ -622,14 +625,28 @@ errors preserve existing contents. `push` returns `text_alloc.Error`, which
 separates scalar errors from allocator errors; allocation-only methods return
 `alloc/error.AllocError` directly.
 
-Construct a buffer with the independently imported `std/arena_bytes` or
-`std/pool_bytes` adapters, supplying initial capacity and a maximum. The string
-owns the buffer and keeps its allocator exclusively borrowed. Growth can move
+For routine construction with an exclusive arena, use
+`text_alloc.empty(&mut arena, limit)?`, `text_alloc.from_str(&mut arena, utf8,
+limit)?`, or `text_alloc.from_text(&mut arena, &text, limit)?` directly. The
+buffer-taking constructor also accepts buffers from `std/arena_bytes` and
+`std/pool_bytes`. The string owns its buffer and keeps its allocator exclusively
+borrowed. Growth can move
 storage and temporarily needs both allocations alive; arena deallocation does
 not reclaim individual old blocks. Shared text views prevent growth at compile
 time until their last use. Raw pointers become invalid when storage moves.
 Dropping the string releases its allocation exactly once; there is no hidden
 global allocator fallback.
+
+When several strings and containers share an allocator, prefer
+`alloc/shared_arena.SharedArena` with a fresh `arena.handle()` for each owner.
+`text_shared.new(handle, byte_limit)?` constructs allocation-free empty text;
+`text_shared.from_str(handle, utf8, byte_limit)?` and
+`text_shared.from_text(handle, &text, byte_limit)?` copy text without requiring an
+intermediate byte buffer. Its `String` provides the operations above plus
+`as_str()`. The byte limit bounds logical length; geometric capacity may be
+larger. Shared views prevent conflicting mutation, and each string retains its
+allocator dependency. Allocated collections support these owned strings and
+borrowed text under the [documented element rules](container-elements.md).
 
 ### Explicit numeric parsing
 

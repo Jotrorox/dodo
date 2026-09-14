@@ -842,7 +842,12 @@ impl Parser {
                 from.push(if self.eat("static") {
                     "static".to_owned()
                 } else {
-                    self.identifier()?
+                    let mut source = self.identifier()?;
+                    if self.eat(".") {
+                        self.expect("stored")?;
+                        source.push_str(".stored");
+                    }
+                    source
                 });
                 self.newlines();
                 if self.eat(",") {
@@ -853,6 +858,30 @@ impl Parser {
             }
             self.expect(")")?;
             from_span = Some(self.since(from_start));
+        }
+        let mut stores = Vec::new();
+        if self.eat("stores") {
+            self.expect("(")?;
+            loop {
+                self.newlines();
+                stores.push(self.identifier()?);
+                self.newlines();
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(")")?;
+        }
+        let mut requires_plain = Vec::new();
+        if self.eat("requires_plain") {
+            self.expect("(")?;
+            loop {
+                requires_plain.push(self.ty()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(")")?;
         }
         // Foreign prototypes end at the line; an optional body may start on the next line.
         let saved = self.cursor;
@@ -904,6 +933,8 @@ impl Parser {
             ret_span,
             from,
             from_span,
+            stores,
+            requires_plain,
             body,
             span: self.since(start),
         })
@@ -2020,6 +2051,8 @@ pub(crate) fn reserved(name: &str) -> bool {
             | "extern"
             | "as"
             | "from"
+            | "stores"
+            | "requires_plain"
             | "static"
             | "void"
             | "mut"

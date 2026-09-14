@@ -29,6 +29,15 @@ handles from the same arena simultaneously; the checked ownership model keeps
 the allocator and its backing storage alive without exclusively lending the
 entire allocator to one container.
 
+Use this shared arena path when constructing several strings and containers.
+Create one `shared_arena.SharedArena` over caller-owned bytes, then pass a fresh
+`arena.handle()` to each owner. `std/text_shared.new(handle, byte_limit)?`
+constructs empty owned text; `from_str(handle, utf8, byte_limit)?` and
+`from_text(handle, &text, byte_limit)?` copy UTF-8 directly. Each owner retains
+its allocator dependency, and allocation failures remain explicit. See the
+[complete string-keyed map example](https://github.com/Jotrorox/dodo/blob/main/examples/string_map.dodo)
+and [supported element combinations](container-elements.md).
+
 ## Algorithms and customization
 
 `find`, `equal`, and lexicographic `compare` take a policy value by checked shared
@@ -97,25 +106,36 @@ the capability lives. Shared arena adapters establish that contract in safe
 code. Allocator operations are single-threaded; concurrency requires a separate
 allocator adapter with its own synchronization contract.
 
-Zero-sized elements have ordinary independent lengths, moves, and destructor
+Zero-sized elements have ordinary independent lengths, moves and destructor
 calls while requiring zero allocation bytes. No default construction or cloning
-of elements is required. Move-only structs and recursively owned fields are
-supported. Current opaque-storage ownership explicitly rejects element types
-containing checked references or Results, including nested aggregates, at
-construction. The compiler cannot yet transfer their provenance or mandatory
-Result obligations into raw storage. The restriction also applies to fixed
-containers' moving `Option` operations and mutating slice algorithms. Read-only
-slice algorithms retain ordinary borrowing rules and can use reference-bearing
-elements. Allocator and policy values themselves retain their checked source
-dependencies.
+of elements is required. Owned vector/deque/map/set/heap storage supports shared
+references (`&i32`, `&str`, shared slices), aggregates containing shared
+references, and owned shared-arena strings. This uses explicit stored-dependency
+tracking; it does not relax ordinary raw-pointer or `MaybeUninit` restrictions.
 
-The [container element safety design](container-elements.md) separates storing
-reference dependencies from storing mandatory Result obligations. It records
-why even `fixed_vector.Vector<&i32>` needs checker mutation effects, and gives
-accepted programs and executable blockers. No additional element combinations
-are enabled by that design. In particular, handling an insertion's capacity or
-allocation Result would not handle a Result stored as its element; existing
-failure, clear, and drop paths destroy payloads and cannot discard pending errors.
+Result-containing elements (including references to Result-bearing sources) and
+exclusive-reference elements remain rejected recursively.
+Handling an insertion's allocation Result does not handle a Result stored as its
+element. Fixed containers' moving `Option` operations and mutating slice
+algorithms retain their more restrictive element rules; do not assume
+`fixed_vector.Vector<&i32>` is accepted because an owned vector supports it.
+Read-only slice algorithms follow ordinary borrowing rules.
+
+Insertion and replacement retain source dependencies conservatively, including
+failure paths. Moves, removal and `clear` do not erase the container's accumulated
+source dependencies; whole-owner destruction/replacement releases them. A
+removed reference still keeps its original source alive, even after the
+container is destroyed. Views into container storage additionally borrow that
+container and cannot survive mutation, growth or destruction. Mutable element
+views require plain payloads without checked borrows; storing a shared reference
+does not grant mutable access to its referent.
+
+Helpers forwarding insertion must declare the stored-dependency effect, such as
+`stores(out, value)`. A helper returning a removed reference uses
+`from(out.stored)`. The [container element guide](container-elements.md) records
+the implementation scope and remaining restrictions. Shared allocator and policy
+values retain their checked dependencies; these owners are not automatically
+thread-transferable.
 
 ## Maps, sets, and heaps
 
@@ -145,8 +165,10 @@ Hashing is independent of collections. `std/hash.I32` and `U64` use specified
 field-wise encodings. For untrusted keys, supply caller-keyed `SipI32` or
 `SipU64`; the caller must obtain unpredictable keys from a separate entropy
 source. Fixed seeds in examples and tests are deterministic examples, not an
-entropy source. Custom key hashing must encode fields explicitly; padding and
-native struct layout are never hash inputs.
+entropy source. `hash.Str`, `hash.Text`, and `text_shared.Key` compare/hash UTF-8
+contents; `hash.SipStr` supplies caller-keyed borrowed text hashing. Custom key
+hashing must encode fields explicitly; padding and native struct layout are
+never hash inputs.
 
 Binary heaps return the greatest element under their comparison policy.
 Push/pop take O(log n) excluding allocation growth; peek is O(1). Equal elements
@@ -154,9 +176,13 @@ have unspecified removal order. The borrowed view exposes heap order.
 
 ## Views and iteration
 
-Iteration is explicit indexing, avoiding a hidden allocation or invalidation
-counter. Vectors expose `as_slice()` / `as_mut_slice()` and optional
-`get()` / `get_mut()`. Fixed vectors and both rings use logical `get(index)`;
+Start iteration with `cursor := 0usize`, then call `container.next(&mut cursor)`
+until it returns `none`. It returns checked views and skips empty hash buckets
+and internal empty slots. Traversal uses sequence, sorted-key, heap, or hash
+order as appropriate. The cursor allocates nothing; reset it to zero after
+mutation or for a fresh traversal. Explicit indexing is also available: vectors
+expose `as_slice()` and optional `get()`, with `as_mut_slice()` and `get_mut()`
+available for plain elements. Fixed vectors and both rings use logical `get(index)`;
 rings index from the front. Bounded maps use `entry(0..len())`. Ordered maps
 expose `entries()` and ordered sets `get(0..len())`. Hash maps and sets use
 `entry(0..bucket_count())`, skipping `none` buckets.

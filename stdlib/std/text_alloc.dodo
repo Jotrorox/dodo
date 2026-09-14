@@ -1,6 +1,7 @@
 package text_alloc
 
 import "std/text"
+import "alloc/arena"
 import "std/bytes_alloc"
 import "alloc/error"
 import "core/mem"
@@ -77,4 +78,20 @@ pub struct String<A> {
     pub fn clear(&mut self) {
         self.buffer.clear()
     }
+}
+
+// Direct safe constructors for the concrete exclusive arena adapter. Prefer
+// text_shared when several independently mutable owners share an allocator.
+pub fn empty(allocator: &mut arena.Arena, limit: usize) -> String<arena.Arena>!error.AllocError from(allocator) {
+    unsafe {
+        return ok(String<arena.Arena> { buffer: bytes_alloc.new(allocator, 0, limit)? })
+    }
+}
+pub fn from_str(allocator: &mut arena.Arena, value: &str, limit: usize) -> String<arena.Arena>!error.AllocError from(allocator) {
+    result := empty(allocator, limit)?
+    result.append_str(value)?
+    return ok(result)
+}
+pub fn from_text(allocator: &mut arena.Arena, value: &text.Text, limit: usize) -> String<arena.Arena>!error.AllocError from(allocator) {
+    return from_str(allocator, value.as_str(), limit)
 }

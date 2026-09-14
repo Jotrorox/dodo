@@ -2678,7 +2678,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
             }
             match op {
-                "assert_send" | "assert_sync" => return Ok(unit),
+                "storage_type" | "assert_send" | "assert_sync" => return Ok(unit),
                 "callback" => {
                     let ExprKind::Name(target) = &args[0].kind else {
                         return Err(error("callback target was not checked"));
@@ -2790,11 +2790,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             let pointer = input.into_pointer_value();
             match op {
-                "borrow" | "borrow_mut" => {
+                "view" | "borrow" | "borrow_mut" => {
                     self.expr(&args[1])?;
                     return Ok(pointer.into());
                 }
-                "borrow_slice" | "borrow_slice_mut" => {
+                "view_slice" | "borrow_slice" | "borrow_slice_mut" => {
                     let length = self.expr(&args[1])?;
                     self.expr(&args[2])?;
                     let value = self
@@ -2814,9 +2814,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
                 "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr" => return Ok(pointer.into()),
                 "is_null" => return Ok(self.builder.build_is_null(pointer, "ptr.is_null")?.into()),
-                "copy" | "copy_nonoverlapping" | "write_bytes" => {
+                "relocate" | "copy" | "copy_nonoverlapping" | "write_bytes" => {
                     let second = self.expr(&args[1])?;
                     let count = self.expr(&args[2])?.into_int_value();
+                    if op == "relocate" {
+                        self.expr(&args[3])?;
+                    }
                     let Type::Raw(_, element) = &args[0].ty else {
                         return Err(error("memory operation requires a raw pointer"));
                     };
@@ -2833,7 +2836,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     // The unsafe caller guarantees the complete byte extent fits.
                     let bytes = self.builder.build_int_mul(count, size, "ptr.byte_count")?;
                     match op {
-                        "copy" => {
+                        "copy" | "relocate" => {
                             self.builder.build_memmove(
                                 second.into_pointer_value(),
                                 1,
@@ -2869,7 +2872,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.drop_ptr(pointer, element)?;
                     return Ok(unit);
                 }
-                "read" | "read_unaligned" | "read_volatile" => {
+                "take" | "read" | "read_unaligned" | "read_volatile" => {
+                    if op == "take" {
+                        self.expr(&args[1])?;
+                    }
                     let value = self
                         .builder
                         .build_load(self.ty(ret)?, pointer, "ptr.read")?;
@@ -2882,8 +2888,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     }
                     return Ok(value);
                 }
-                "write" | "write_unaligned" | "write_volatile" => {
+                "store" | "write" | "write_unaligned" | "write_volatile" => {
                     let value = self.expr(&args[1])?;
+                    if op == "store" {
+                        self.expr(&args[2])?;
+                    }
                     let i = self.builder.build_store(pointer, value)?;
                     if op == "write_unaligned" {
                         i.set_alignment(1).map_err(error)?;

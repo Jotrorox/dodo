@@ -281,6 +281,10 @@ pub struct Function {
     pub ret: Type,
     pub ret_span: Span,
     pub from: Vec<String>,
+    /// Checked dependency deposition: target followed by source parameters.
+    pub stores: Vec<String>,
+    /// A specialized method is callable only for borrow/Result-free types.
+    pub requires_plain: Vec<Type>,
     pub from_span: Option<Span>,
     pub body: Option<Block>,
     pub span: Span,

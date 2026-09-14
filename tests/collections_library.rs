@@ -27,6 +27,7 @@ const FIXTURES: &[&str] = &[
     "collections_fixed",
     "collections_owned",
     "collections_destruction",
+    "collections_iteration",
 ];
 fn native(fixture: &str) {
     let workspace = Workspace::new();
@@ -71,6 +72,10 @@ fn owned_containers_collisions_growth_destruction_and_models() {
 #[test]
 fn move_only_elements_drop_exactly_once_across_container_operations() {
     native(FIXTURES[3]);
+}
+#[test]
+fn logical_iteration_skips_empty_fixed_slots() {
+    native(FIXTURES[4]);
 }
 #[test]
 fn portable_collections_emit_wasm_and_cortex_m0_objects() {
@@ -150,7 +155,7 @@ fn owned_views_prevent_mutation_and_owner_destruction() {
 #[test]
 fn owned_elements_cannot_hide_borrows_or_result_obligations() {
     rejects(
-        "values := shared_vector.new::<&i32>(allocator.handle())",
+        "values := shared_vector.new::<&mut i32>(allocator.handle())",
         "borrow",
     );
     rejects(

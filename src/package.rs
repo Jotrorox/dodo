@@ -707,6 +707,9 @@ fn namespace(
             names.ty(&mut parameter.ty, &generics);
         }
         names.ty(&mut function.ret, &generics);
+        for required in &mut function.requires_plain {
+            names.ty(required, &generics);
+        }
         if let Some(body) = &mut function.body {
             names.block(body, &mut locals, &generics);
         }

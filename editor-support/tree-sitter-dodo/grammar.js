@@ -44,6 +44,8 @@ module.exports = grammar({
       field('parameters', $.parenthesized_group),
       optional(seq('->', field('return_type', $._type))),
       optional($.borrow_clause),
+      optional($.stores_clause),
+      optional($.plain_clause),
       optional(field('body', $.block)),
     )),
     struct_declaration: $ => seq(
@@ -56,6 +58,8 @@ module.exports = grammar({
     ),
     type_parameters: $ => seq('<', commaSep1($.identifier), optional(','), '>'),
     borrow_clause: $ => seq('from', $.parenthesized_group),
+    stores_clause: $ => seq('stores', $.parenthesized_group),
+    plain_clause: $ => seq('requires_plain', $.parenthesized_group),
     attribute: $ => prec.right(seq('@', field('name', $.identifier), optional($.parenthesized_group))),
     generic_call: $ => prec.dynamic(1, seq(
       field('function', $.identifier), optional('::'), $.type_arguments,

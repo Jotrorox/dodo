@@ -4,6 +4,8 @@ use crate::ast::{Span, Type};
 
 #[derive(Clone, Debug)]
 pub(super) struct Loan {
+    // Element-region provenance is distinct from ordinary owner dependencies.
+    pub(super) stored: bool,
     // A dependency keeps a referenced source live without treating the source
     // as the storage of its owning aggregate. Mutating a container does not
     // turn a shared allocator dependency into an exclusive allocator loan.
@@ -53,6 +55,7 @@ pub(super) enum Access {
 }
 pub(super) fn static_loan(span: Span) -> Loan {
     Loan {
+        stored: false,
         dependency: false,
         root: 0,
         fields: vec![],
@@ -95,6 +98,7 @@ pub(super) fn merge_states(mut a: Vec<Vec<Variable>>, b: Vec<Vec<Variable>>) -> 
                     d.partitions.clone(),
                     d.mutable,
                     d.dependency,
+                    d.stored,
                 )
             });
             variable.deps.dedup_by(|a, b| {
@@ -103,6 +107,7 @@ pub(super) fn merge_states(mut a: Vec<Vec<Variable>>, b: Vec<Vec<Variable>>) -> 
                     && a.partitions == b.partitions
                     && a.mutable == b.mutable
                     && a.dependency == b.dependency
+                    && a.stored == b.stored
                     && a.external == b.external
             });
         }

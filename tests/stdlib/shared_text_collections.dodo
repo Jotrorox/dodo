@@ -1,0 +1,145 @@
+package shared_text_collections
+import "alloc/error"
+import "alloc/shared_arena"
+import "alloc/arena"
+import "std/text_shared"
+import "std/text_alloc"
+import "std/text"
+import "core/bytes"
+import "core/mem"
+import "std/collections/shared_vector"
+import "std/collections/shared_hash_map"
+
+fn verify() -> void!error.AllocError {
+    backing := [0u8; 65536]
+    arena := shared_arena.SharedArena.new(&mut backing)?
+    empty := text_shared.new(arena.handle(), 64)?
+    core.assert(empty.len_bytes() == 0)
+    core.assert(empty.capacity() == 0)
+    match empty.push(0x1f426u32) {
+        ok() => {}, err(_) => {
+            core.assert(false)
+        }
+    }
+    core.assert(empty.len_bytes() == 4)
+    match empty.push(0xd800u32) {
+        ok() => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    core.assert(empty.len_bytes() == 4)
+    empty.clear()
+    first := text_shared.from_str(arena.handle(), "héllo", 64)?
+    first.append_str("!")?
+    other := text.Text.from_str("world")
+    second := text_shared.from_text(arena.handle(), &other, 64)?
+    empty.append(&other)?
+    core.assert(bytes.equal(mem.str_bytes(empty.as_str()), mem.str_bytes("world")))
+    match first.truncate(2) {
+        ok() => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    core.assert(bytes.equal(mem.str_bytes(first.as_str()), mem.str_bytes("héllo!")))
+    match first.truncate(3) {
+        ok() => {}, err(_) => {
+            core.assert(false)
+        }
+    }
+    core.assert(bytes.equal(mem.str_bytes(first.as_str()), mem.str_bytes("hé")))
+    values := shared_vector.new::<text_shared.String>(arena.handle())
+    values.push(first)?
+    values.push(second)?
+    values.push(empty)?
+    values.reserve(30)?
+    cursor := 0usize
+    length := 0usize
+    for {
+        match values.next(&mut cursor) {
+            some(value) => {
+                length = length + value.len_bytes()
+            }, none => {
+                break
+            }
+        }
+    }
+    core.assert(length == 13)
+    removed := values.remove(1)
+    core.drop(values)
+    match removed {
+        some(value) => {
+            core.assert(bytes.equal(mem.str_bytes(value.as_str()), mem.str_bytes("world")))
+        }, none => {
+            core.assert(false)
+        }
+    }
+
+    map := shared_hash_map.new::<text_shared.String, text_shared.String, text_shared.Key>(arena.handle(), text_shared.Key {})
+    core.drop(map.insert(text_shared.from_str(arena.handle(), "name", 64)?, text_shared.from_str(arena.handle(), "Dodo", 64)?)?)
+    core.drop(map.insert(text_shared.from_str(arena.handle(), "name", 64)?, text_shared.from_str(arena.handle(), "bird", 64)?)?)
+    query := text_shared.from_str(arena.handle(), "name", 64)?
+    match map.get(&query) {
+        some(value) => {
+            core.assert(bytes.equal(mem.str_bytes(value.as_str()), mem.str_bytes("bird")))
+        }, none => {
+            core.assert(false)
+        }
+    }
+    old := map.remove(&query)
+    core.drop(map)
+    match old {
+        some(value) => {
+            core.assert(bytes.equal(mem.str_bytes(value.as_str()), mem.str_bytes("bird")))
+        }, none => {
+            core.assert(false)
+        }
+    }
+    original := text_shared.from_str(arena.handle(), "copy", 64)?
+    independent := text_shared.from_str(arena.handle(), original.as_str(), 64)?
+    original.clear()
+    core.assert(bytes.equal(mem.str_bytes(independent.as_str()), mem.str_bytes("copy")))
+    limited := text_shared.from_str(arena.handle(), "abc", 3)?
+    match limited.append_str("d") {
+        ok() => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    core.assert(bytes.equal(mem.str_bytes(limited.as_str()), mem.str_bytes("abc")))
+    match text_shared.from_str(arena.handle(), "too long", 2) {
+        ok(_) => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    small_bytes := [0u8; 32]
+    small := shared_arena.SharedArena.new(&mut small_bytes)?
+    match text_shared.from_str(small.handle(), "this text is too long for the arena storage", 100) {
+        ok(_) => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    return ok()
+}
+fn exclusive() -> void!error.AllocError {
+    backing := [0u8; 1024]
+    allocator := arena.Arena.new(&mut backing)
+    empty := text_alloc.empty(&mut allocator, 64)?
+    core.assert(empty.len_bytes() == 0)
+    core.drop(empty)
+    copied := text_alloc.from_str(&mut allocator, "hello", 64)?
+    view := copied.as_text()
+    core.assert(bytes.equal(mem.str_bytes(view.as_str()), mem.str_bytes("hello")))
+    return ok()
+}
+fn main() -> i32 {
+    match verify() {
+        ok() => {}, err(_) => {
+            return 1
+        }
+    }
+    match exclusive() {
+        ok() => {}, err(_) => {
+            return 2
+        }
+    }
+    return 0
+}
