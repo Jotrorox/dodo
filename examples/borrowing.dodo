@@ -41,3 +41,19 @@ fn main() -> i32 {
     result := *selected
     return result + value.finish() - 30
 }
+
+@test
+fn choosing_either_borrow_preserves_the_source_value() {
+    left := 10i32
+    right := 20i32
+    assert_eq(*choose(&left, &right, true), 10)
+    assert_eq(*choose(&left, &right, false), 20)
+}
+
+@test
+fn receiver_borrows_end_before_replacement_and_consumption() {
+    value := Value { number: 10 }
+    assert_eq(*value.view(), 10)
+    value.replace(42)
+    assert_eq(value.finish(), 42)
+}

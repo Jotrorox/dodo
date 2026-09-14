@@ -124,7 +124,7 @@ of `T`. It never automatically destroys a `T`, including when it is a struct
 field or array element. Its bytes do not constitute a valid initialized value
 until the unsafe caller establishes that invariant.
 
-```dodo
+```dodo test
 package storage
 
 import "core/mem"
@@ -223,7 +223,7 @@ The resulting `Box<T, A>` holds an exclusive checked borrow of its allocator,
 keeping the allocator and its backing storage live until the box is destroyed
 or consumed. This initial API permits one live box per borrowed allocator.
 
-```dodo
+```dodo test
 package ownership
 
 import "alloc/arena"

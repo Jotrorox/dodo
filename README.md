@@ -41,6 +41,7 @@ explains each line and shows how to check the program and keep an executable.
 ```sh
 dodo fmt
 dodo check
+dodo test
 dodo compile -O 2
 ./build/hello
 dodo --help
@@ -50,6 +51,24 @@ dodo --help
 `build` remains an alias for `compile`. An explicit folder selects its
 `main.dodo`; you can also pass another source file directly. The default output
 uses the project folder name: `hello/main.dodo` compiles to `build/hello`.
+
+`dodo test` scans the current folder recursively for `@test` functions,
+`test_` functions, and Markdown examples marked `dodo test`. Add a test beside
+your code and run it without a manifest or a test dependency:
+
+```dodo test
+package example
+
+@test
+fn adds_numbers() {
+    assert_eq(20 + 22, 42)
+}
+```
+
+Each test runs in its own process, so a trap fails only that test. Use
+`dodo test --list`, `--filter TEXT`, and `--show-output` to inspect the suite.
+The [testing guide](https://jotrorox.github.io/dodo/testing/) covers companion
+test files, assertions, failure locations, timeouts, and executable docs.
 
 Use [the command-line guide](https://jotrorox.github.io/dodo/command-line/) for
 formatting options, project folders, compiler outputs, optimization, and

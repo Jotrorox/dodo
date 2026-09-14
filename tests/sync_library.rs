@@ -94,7 +94,9 @@ fn guards_payloads_and_result_obligations_are_checked() {
         (
             "result_payload",
             "fn main() { match allocated.Mutex.new::<usize!u8>(allocated.PageAllocator.new(), ok(1)) { ok(_) => {}, err(_) => {} } }",
-            "Results",
+            // Generic checking can reject either the opaque storage operation
+            // or the allocation-failure exit that would discard the Result.
+            "unhandled Results|Result `value` is left unhandled",
         ),
         (
             "escaping_guard",

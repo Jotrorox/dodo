@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add `dodo test` with recursive discovery, `@test` and `test_` functions,
+  companion test files, assertions, filtering, ignored tests, captured output,
+  timeouts, and isolated native execution. Report assertion values and source
+  locations for checked traps. Execute Markdown fences marked `dodo test` in CI.
+- Make self-contained standard-library fixtures and portable examples runnable
+  through native discovery, with separate core/math/time checks and executable
+  introductory, collection, hashing, allocation, math, clock, and thread docs.
+  Run the native suite at both `-O0` and `-O3` in CI.
 - Add LSP completion, definition, references, rename, signature help, and canonical
   document formatting. Recover multiple editor diagnostics, honor the configured
   compilation target, and add a reproducible stdio responsiveness benchmark.

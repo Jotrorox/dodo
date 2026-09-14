@@ -62,6 +62,8 @@ struct Parser {
 
 #[derive(Default)]
 struct Modifiers {
+    test: bool,
+    ignore: Option<String>,
     public: bool,
     unsafe_: bool,
     extern_: bool,
@@ -254,6 +256,9 @@ impl Parser {
         }
         let start = self.span().start;
         let mods = self.modifiers()?;
+        if (mods.test || mods.ignore.is_some()) && !self.at("fn") {
+            return Err(self.error("@test and @ignore apply only to functions"));
+        }
         if self.at("struct") {
             if mods.unsafe_ || mods.extern_ {
                 return Err(self.error("structs cannot be unsafe or extern"));
@@ -292,6 +297,7 @@ impl Parser {
         while !self.eof() {
             if declaration
                 && (self.at("fn")
+                    || self.at("@")
                     || self.at("pub")
                     || self.at("struct")
                     || self.at("enum")
@@ -344,6 +350,30 @@ impl Parser {
                 }
             } else if self.eat("@") {
                 let name = self.identifier()?;
+                if name == "test" {
+                    if mods.test {
+                        return Err(self.error("duplicate @test attribute"));
+                    }
+                    mods.test = true;
+                    self.newlines();
+                    continue;
+                }
+                if name == "ignore" {
+                    if mods.ignore.is_some() {
+                        return Err(self.error("duplicate @ignore attribute"));
+                    }
+                    self.expect("(")?;
+                    let TokenKind::String(reason, false) = self.bump().kind else {
+                        return Err(self.error("@ignore expects a string reason"));
+                    };
+                    mods.ignore = Some(
+                        String::from_utf8(reason)
+                            .map_err(|_| self.error("ignore reason must be UTF-8"))?,
+                    );
+                    self.expect(")")?;
+                    self.newlines();
+                    continue;
+                }
                 if matches!(name.as_str(), "unsafe_send" | "unsafe_sync") {
                     let present = if name == "unsafe_send" {
                         &mut mods.unsafe_send
@@ -359,7 +389,7 @@ impl Parser {
                 }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\")"
                     )));
                 }
                 if mods.repr_c {
@@ -619,6 +649,9 @@ impl Parser {
             }
             let field_start = self.span().start;
             let field_mods = self.modifiers()?;
+            if field_mods.test || field_mods.ignore.is_some() {
+                return Err(self.error("@test and @ignore apply only to top-level functions"));
+            }
             if self.at("fn") {
                 if field_mods.repr_c || field_mods.unsafe_send || field_mods.unsafe_sync {
                     return Err(self.error("representation and thread contracts apply to structs"));
@@ -837,8 +870,29 @@ impl Parser {
         } else {
             return Err(self.error("expected a function body enclosed in braces"));
         };
+        if mods.ignore.is_some() && !mods.test && !name.starts_with("test_") {
+            return Err(Diagnostic::new(
+                self.since(start),
+                "@ignore requires @test or a test_ function",
+            ));
+        }
+        if mods.test
+            && (mods.unsafe_
+                || mods.extern_
+                || !generics.is_empty()
+                || !params.is_empty()
+                || ret != Type::Void
+                || self.self_type.is_some())
+        {
+            return Err(Diagnostic::new(
+                self.since(start),
+                "@test requires a safe, non-generic, top-level fn name() -> void",
+            ));
+        }
         Ok(Function {
             generic_instance: false,
+            test: mods.test,
+            ignore: mods.ignore,
             name,
             public: mods.public,
             unsafe_: mods.unsafe_,
@@ -2156,6 +2210,47 @@ mod tests {
                         "{source}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn editor_recovery_preserves_test_attributes_after_bad_declarations() {
+        let source = "package app\nbroken declaration\n@test\n@ignore(\"needs hardware\")\nfn hardware() {}\n";
+        let (program, errors) = parse_recovering(source);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(program.functions.len(), 1);
+        let function = &program.functions[0];
+        assert_eq!(function.name, "hardware");
+        assert!(function.test);
+        assert_eq!(function.ignore.as_deref(), Some("needs hardware"));
+        assert!(parse(source).is_err());
+    }
+
+    #[test]
+    fn strict_and_recovering_parsers_reject_test_attributes_on_non_functions() {
+        for attribute in ["@test", "@ignore(\"later\")"] {
+            for declaration in [
+                "struct Invalid {}",
+                "enum Invalid { Value }",
+                "const invalid: i32 = 1",
+                "static invalid: i32 = 1",
+            ] {
+                let source = format!(
+                    "package app\n{attribute} {declaration}\n@test fn good() {{ assert(true) }}\n"
+                );
+                let expected = "@test and @ignore apply only to functions";
+                assert_eq!(
+                    parse(&source).unwrap_err().message.as_ref(),
+                    expected,
+                    "{source}"
+                );
+                let (program, errors) = parse_recovering(&source);
+                assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                assert_eq!(errors[0].message.as_ref(), expected);
+                assert_eq!(program.functions.len(), 1);
+                assert_eq!(program.functions[0].name, "good");
+                assert!(program.functions[0].test);
             }
         }
     }

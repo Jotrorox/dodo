@@ -49,6 +49,10 @@ pub struct Options {
     pub features: String,
     pub optimization: u8,
     pub entry: bool,
+    /// A hosted test executable dispatches one function per process invocation.
+    pub test_functions: Vec<String>,
+    /// Source maps are used only by the test failure reporter.
+    pub test_sources: Vec<crate::package::Source>,
 }
 pub struct Generated<'ctx> {
     pub module: Module<'ctx>,
@@ -110,6 +114,9 @@ pub fn generate<'ctx>(
         function: None,
         return_type: Type::Void,
         bits,
+        span: Span::default(),
+        test_sources: &options.test_sources,
+        testing: !options.test_functions.is_empty(),
     };
     cg.declare_types()?;
     cg.declare_functions()?;
@@ -120,7 +127,7 @@ pub fn generate<'ctx>(
         }
     }
     if options.entry {
-        cg.entry()?;
+        cg.entry(&options.test_functions)?;
     }
     cg.module
         .verify()
@@ -170,6 +177,9 @@ struct Codegen<'a, 'ctx> {
     function: Option<FunctionValue<'ctx>>,
     return_type: Type,
     bits: u32,
+    span: Span,
+    test_sources: &'a [crate::package::Source],
+    testing: bool,
 }
 impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn ty(&self, t: &Type) -> Result<BasicTypeEnum<'ctx>> {
@@ -538,26 +548,28 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.scopes.clear();
         Ok(())
     }
-    fn entry(&mut self) -> Result<()> {
-        let f = self
-            .program
-            .functions
-            .iter()
-            .find(|f| f.name == "main" && !f.extern_)
-            .ok_or_else(|| error("executable requires fn main() -> i32 or -> void"))?;
-        if !f.params.is_empty()
-            || !matches!(
-                f.ret,
-                Type::Void
-                    | Type::Int {
-                        signed: true,
-                        bits: 32
-                    }
-            )
-        {
-            return Err(error(
-                "main must have signature fn main() -> i32 or fn main() -> void",
-            ));
+    fn entry(&mut self, tests: &[String]) -> Result<()> {
+        if tests.is_empty() {
+            let f = self
+                .program
+                .functions
+                .iter()
+                .find(|f| f.name == "main" && !f.extern_)
+                .ok_or_else(|| error("executable requires fn main() -> i32 or -> void"))?;
+            if !f.params.is_empty()
+                || !matches!(
+                    f.ret,
+                    Type::Void
+                        | Type::Int {
+                            signed: true,
+                            bits: 32
+                        }
+                )
+            {
+                return Err(error(
+                    "main must have signature fn main() -> i32 or fn main() -> void",
+                ));
+            }
         }
         if self.module.get_function("main").is_some() {
             return Err(error("extern main conflicts with the hosted entry point"));
@@ -576,7 +588,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 })
             })
             .flatten();
-        let entry_params = if arguments_init.is_some() {
+        let entry_params = if arguments_init.is_some() || !tests.is_empty() {
             vec![
                 self.context.i32_type().into(),
                 self.context.ptr_type(AddressSpace::default()).into(),
@@ -600,6 +612,54 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 ],
                 "",
             )?;
+        }
+        if !tests.is_empty() {
+            let select = self.module.add_function(
+                "dodo_test_select",
+                self.context.i32_type().fn_type(&entry_params, false),
+                None,
+            );
+            let index = self
+                .builder
+                .build_call(
+                    select,
+                    &[
+                        entry.get_nth_param(0).unwrap().into(),
+                        entry.get_nth_param(1).unwrap().into(),
+                    ],
+                    "test.index",
+                )?
+                .try_as_basic_value()
+                .basic()
+                .unwrap()
+                .into_int_value();
+            let invalid = self.context.append_basic_block(entry, "invalid.test");
+            let cases: Vec<_> = tests
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    (
+                        self.context.i32_type().const_int(i as u64, false),
+                        self.context.append_basic_block(entry, "test"),
+                    )
+                })
+                .collect();
+            self.builder.build_switch(index, invalid, &cases)?;
+            self.builder.position_at_end(invalid);
+            self.builder
+                .build_return(Some(&self.context.i32_type().const_int(2, false)))?;
+            for (name, (_, block)) in tests.iter().zip(cases) {
+                self.builder.position_at_end(block);
+                let call = self
+                    .builder
+                    .build_call(self.functions[name], &[], "test.result")?;
+                let value = call
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap_or(self.context.i32_type().const_zero().into());
+                self.builder.build_return(Some(&value))?;
+            }
+            return Ok(());
         }
         let call = self
             .builder
@@ -869,6 +929,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(())
     }
     fn stmt(&mut self, s: &Stmt) -> Result<()> {
+        let previous = std::mem::replace(&mut self.span, s.span);
+        let result = self.stmt_inner(s);
+        self.span = previous;
+        result
+    }
+    fn stmt_inner(&mut self, s: &Stmt) -> Result<()> {
         match &s.kind {
             StmtKind::Let {
                 name, ty, value, ..
@@ -1145,6 +1211,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(())
     }
     fn expr(&mut self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
+        let previous = std::mem::replace(&mut self.span, e.span);
+        let result = self.expr_inner(e);
+        self.span = previous;
+        result
+    }
+    fn expr_inner(&mut self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
         let value = match &e.kind {
             ExprKind::Int(v, _) => self.ty(&e.ty)?.into_int_type().const_int(*v, false).into(),
             ExprKind::Float(v, _) => self.ty(&e.ty)?.into_float_type().const_float(*v).into(),
@@ -1214,7 +1286,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     length,
                     "slice.inside",
                 )?;
-                self.guard(self.builder.build_and(ordered, inside, "slice.valid")?)?;
+                self.guard(
+                    self.builder.build_and(ordered, inside, "slice.valid")?,
+                    "slice bounds out of range",
+                )?;
                 let data = unsafe {
                     self.builder
                         .build_gep(self.ty(&element)?, ptr, &[start], "slice.data")?
@@ -1420,6 +1495,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(value)
     }
     fn place(&mut self, e: &Expr) -> Result<PointerValue<'ctx>> {
+        let previous = std::mem::replace(&mut self.span, e.span);
+        let result = self.place_inner(e);
+        self.span = previous;
+        result
+    }
+    fn place_inner(&mut self, e: &Expr) -> Result<PointerValue<'ctx>> {
         match &e.kind {
             ExprKind::Name(n) => self
                 .binding(n)
@@ -1457,7 +1538,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let in_bounds =
                     self.builder
                         .build_int_compare(IntPredicate::ULT, wide, len, "in.bounds")?;
-                self.guard(in_bounds)?;
+                self.guard(in_bounds, "index out of bounds")?;
                 // The bounds check dominates this GEP; no inbounds assumption is needed.
                 Ok(unsafe {
                     self.builder
@@ -1540,18 +1621,214 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             )?
         })
     }
-    fn guard(&mut self, valid: IntValue<'ctx>) -> Result<()> {
+    fn guard(&mut self, valid: IntValue<'ctx>, reason: &str) -> Result<()> {
         let ok = self.bb("checked");
         let fail = self.bb("trap");
         self.builder.build_conditional_branch(valid, ok, fail)?;
         self.builder.position_at_end(fail);
+        self.report_failure(&format!("runtime check failed: {reason}"))?;
+        self.trap()?;
+        self.builder.position_at_end(ok);
+        Ok(())
+    }
+    fn trap(&mut self) -> Result<()> {
         let trap = Intrinsic::find("llvm.trap")
             .and_then(|i| i.get_declaration(&self.module, &[]))
             .ok_or_else(|| error("LLVM trap intrinsic is unavailable"))?;
         self.builder.build_call(trap, &[], "")?;
         self.builder.build_unreachable()?;
-        self.builder.position_at_end(ok);
         Ok(())
+    }
+    fn test_runtime_call(&self, name: &str, args: &[BasicValueEnum<'ctx>]) -> Result<()> {
+        let types: Vec<_> = args.iter().map(|v| v.get_type().into()).collect();
+        let ty = self.context.void_type().fn_type(&types, false);
+        let function = self
+            .module
+            .get_function(name)
+            .unwrap_or_else(|| self.module.add_function(name, ty, None));
+        if function.get_type() != ty {
+            return Err(error(format!("{name} is reserved for the test runtime")));
+        }
+        let args: Vec<_> = args.iter().copied().map(Into::into).collect();
+        self.builder.build_call(function, &args, "")?;
+        Ok(())
+    }
+    fn report_failure(&self, message: &str) -> Result<()> {
+        if !self.testing {
+            return Ok(());
+        }
+        let paths: Vec<_> = self
+            .test_sources
+            .iter()
+            .map(|s| s.path.display().to_string())
+            .collect();
+        let sources: Vec<_> = self
+            .test_sources
+            .iter()
+            .zip(&paths)
+            .map(|(s, p)| (p.as_str(), s.text.as_str(), s.start))
+            .collect();
+        let report =
+            crate::diagnostic::Diagnostic::new(self.span, message).render_with_sources(&sources);
+        let text = self
+            .builder
+            .build_global_string_ptr(&report, "test.diagnostic")?;
+        self.test_runtime_call(
+            "dodo_test_failure",
+            &[
+                text.as_pointer_value().into(),
+                self.usize_type()
+                    .const_int(report.len() as u64, false)
+                    .into(),
+            ],
+        )
+    }
+    fn report_value(&self, label: u64, value: BasicValueEnum<'ctx>, ty: &Type) -> Result<()> {
+        if !self.testing {
+            return Ok(());
+        }
+        let label = self.context.i32_type().const_int(label, false).into();
+        match ty {
+            Type::Bool => {
+                let value = self.builder.build_int_z_extend(
+                    value.into_int_value(),
+                    self.context.i32_type(),
+                    "test.bool",
+                )?;
+                self.test_runtime_call("dodo_test_bool", &[label, value.into()])
+            }
+            Type::Str => {
+                let value = value.into_struct_value();
+                let ptr = self.builder.build_extract_value(value, 0, "text.ptr")?;
+                let len = self.builder.build_extract_value(value, 1, "text.len")?;
+                self.test_runtime_call("dodo_test_text", &[label, ptr, len])
+            }
+            Type::Float(_) => {
+                let value = self.builder.build_float_cast(
+                    value.into_float_value(),
+                    self.context.f64_type(),
+                    "test.float",
+                )?;
+                self.test_runtime_call("dodo_test_float", &[label, value.into()])
+            }
+            _ => {
+                let signed = matches!(ty, Type::Int { signed: true, .. });
+                let value = if value.is_pointer_value() {
+                    self.builder.build_ptr_to_int(
+                        value.into_pointer_value(),
+                        self.context.i64_type(),
+                        "test.address",
+                    )?
+                } else if value.is_struct_value() {
+                    self.builder
+                        .build_extract_value(value.into_struct_value(), 0, "test.tag")?
+                        .into_int_value()
+                } else {
+                    value.into_int_value()
+                };
+                let value = self.builder.build_int_cast_sign_flag(
+                    value,
+                    self.context.i64_type(),
+                    signed,
+                    "test.integer",
+                )?;
+                self.test_runtime_call(
+                    if signed {
+                        "dodo_test_signed"
+                    } else {
+                        "dodo_test_unsigned"
+                    },
+                    &[label, value.into()],
+                )
+            }
+        }
+    }
+    /// String assertions compare bytes, including embedded NULs, without adding
+    /// a libc dependency to ordinary freestanding assertion users.
+    fn strings_equal(
+        &self,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+    ) -> Result<IntValue<'ctx>> {
+        let a = a.into_struct_value();
+        let b = b.into_struct_value();
+        let ap = self
+            .builder
+            .build_extract_value(a, 0, "left.ptr")?
+            .into_pointer_value();
+        let bp = self
+            .builder
+            .build_extract_value(b, 0, "right.ptr")?
+            .into_pointer_value();
+        let al = self
+            .builder
+            .build_extract_value(a, 1, "left.len")?
+            .into_int_value();
+        let bl = self
+            .builder
+            .build_extract_value(b, 1, "right.len")?
+            .into_int_value();
+        let result = self.alloca(self.context.bool_type().into(), "strings.equal")?;
+        let index = self.alloca(self.usize_type().into(), "strings.index")?;
+        self.builder
+            .build_store(result, self.context.bool_type().const_zero())?;
+        self.builder
+            .build_store(index, self.usize_type().const_zero())?;
+        let head = self.bb("strings.loop");
+        let body = self.bb("strings.byte");
+        let next = self.bb("strings.next");
+        let equal = self.bb("strings.match");
+        let end = self.bb("strings.end");
+        let same_length =
+            self.builder
+                .build_int_compare(IntPredicate::EQ, al, bl, "same.length")?;
+        self.builder
+            .build_conditional_branch(same_length, head, end)?;
+        self.builder.position_at_end(head);
+        let i = self
+            .builder
+            .build_load(self.usize_type(), index, "index")?
+            .into_int_value();
+        let done = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, i, al, "done")?;
+        self.builder.build_conditional_branch(done, equal, body)?;
+        self.builder.position_at_end(body);
+        let (ap, bp) = unsafe {
+            (
+                self.builder
+                    .build_gep(self.context.i8_type(), ap, &[i], "left.byte")?,
+                self.builder
+                    .build_gep(self.context.i8_type(), bp, &[i], "right.byte")?,
+            )
+        };
+        let av = self
+            .builder
+            .build_load(self.context.i8_type(), ap, "left")?
+            .into_int_value();
+        let bv = self
+            .builder
+            .build_load(self.context.i8_type(), bp, "right")?
+            .into_int_value();
+        let same = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, av, bv, "same.byte")?;
+        self.builder.build_conditional_branch(same, next, end)?;
+        self.builder.position_at_end(next);
+        let increment =
+            self.builder
+                .build_int_add(i, self.usize_type().const_int(1, false), "next")?;
+        self.builder.build_store(index, increment)?;
+        self.builder.build_unconditional_branch(head)?;
+        self.builder.position_at_end(equal);
+        self.builder
+            .build_store(result, self.context.bool_type().const_int(1, false))?;
+        self.builder.build_unconditional_branch(end)?;
+        self.builder.position_at_end(end);
+        Ok(self
+            .builder
+            .build_load(self.context.bool_type(), result, "equal")?
+            .into_int_value())
     }
     fn short_circuit(&mut self, op: BinaryOp, l: &Expr, r: &Expr) -> Result<BasicValueEnum<'ctx>> {
         let a = self.expr(l)?.into_int_value();
@@ -1660,7 +1937,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .build_extract_value(out, 1, "overflow")?
                     .into_int_value();
                 let valid = self.builder.build_not(overflow, "no.overflow")?;
-                self.guard(valid)?;
+                self.guard(valid, "integer overflow")?;
                 self.builder.build_extract_value(out, 0, "result")?
             }
             Div | Rem => {
@@ -1670,7 +1947,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     ity.const_zero(),
                     "nonzero",
                 )?;
-                self.guard(nz)?;
+                self.guard(nz, "division or remainder by zero")?;
                 if signed {
                     let min = ity.const_int(1u64 << (ity.get_bit_width() - 1), false);
                     let a_min =
@@ -1684,7 +1961,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     )?;
                     let bad = self.builder.build_and(a_min, b_neg, "division.overflow")?;
                     let valid = self.builder.build_not(bad, "division.valid")?;
-                    self.guard(valid)?;
+                    self.guard(valid, "signed division overflow")?;
                 }
                 match (op, signed) {
                     (Div, true) => self.builder.build_int_signed_div(a, b, "div")?.into(),
@@ -1743,14 +2020,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     ity.const_int(ity.get_bit_width() as u64, false),
                     "shift.valid",
                 )?;
-                self.guard(valid)?;
+                self.guard(valid, "shift count out of range")?;
                 if op == Shl {
                     let v = self.builder.build_left_shift(a, b, "shl")?;
                     let back = self.builder.build_right_shift(v, b, signed, "shift.back")?;
                     let fits =
                         self.builder
                             .build_int_compare(IntPredicate::EQ, back, a, "shift.fits")?;
-                    self.guard(fits)?;
+                    self.guard(fits, "left shift overflow")?;
                     v.into()
                 } else {
                     self.builder.build_right_shift(a, b, signed, "shr")?.into()
@@ -1777,7 +2054,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         source.const_zero(),
                         "cast.nonnegative",
                     )?;
-                    self.guard(nonnegative)?;
+                    self.guard(
+                        nonnegative,
+                        "negative value converted to an unsigned integer",
+                    )?;
                 }
                 let converted = self.builder.build_int_cast_sign_flag(v, out, *fs, "cast")?;
                 if out.get_bit_width() < source.get_bit_width() {
@@ -1790,7 +2070,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     let fits =
                         self.builder
                             .build_int_compare(IntPredicate::EQ, back, v, "cast.fits")?;
-                    self.guard(fits)?;
+                    self.guard(fits, "integer conversion out of range")?;
                 }
                 if !*fs && *ts && out.get_bit_width() <= source.get_bit_width() {
                     let max = (1u64 << (out.get_bit_width() - 1)) - 1;
@@ -1800,7 +2080,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         source.const_int(max, false),
                         "cast.fits",
                     )?;
-                    self.guard(fits)?;
+                    self.guard(fits, "integer conversion out of range")?;
                 }
                 Ok(converted.into())
             }
@@ -1839,7 +2119,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     "cast.upper",
                 )?;
                 let valid = self.builder.build_and(lo, hi, "cast.valid")?;
-                self.guard(valid)?;
+                self.guard(valid, "float-to-integer conversion out of range")?;
                 Ok(if *signed {
                     self.builder.build_float_to_signed_int(v, t, "cast")?.into()
                 } else {
@@ -1868,7 +2148,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         "cast.lower",
                     )?;
                     let valid = self.builder.build_and(hi, lo, "cast.fits")?;
-                    self.guard(valid)?;
+                    self.guard(valid, "floating-point conversion out of range")?;
                 }
                 Ok(out.into())
             }
@@ -1903,6 +2183,43 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         ret: &Type,
     ) -> Result<BasicValueEnum<'ctx>> {
         let unit = self.context.i8_type().const_zero().into();
+        if matches!(name, "core.assert" | "core.assert_eq" | "core.assert_ne") {
+            let count = if name == "core.assert" { 1 } else { 2 };
+            let values = args
+                .iter()
+                .map(|e| self.expr(e))
+                .collect::<Result<Vec<_>>>()?;
+            let valid = if count == 1 {
+                values[0].into_int_value()
+            } else {
+                let equal = if args[0].ty == Type::Str {
+                    self.strings_equal(values[0], values[1])?
+                } else {
+                    self.binary(BinaryOp::Eq, values[0], values[1], &args[0].ty)?
+                        .into_int_value()
+                };
+                if name == "core.assert_ne" {
+                    self.builder.build_not(equal, "not.equal")?
+                } else {
+                    equal
+                }
+            };
+            let ok = self.bb("assert.passed");
+            let fail = self.bb("assert.failed");
+            self.builder.build_conditional_branch(valid, ok, fail)?;
+            self.builder.position_at_end(fail);
+            self.report_failure(&format!("{} failed", name.trim_start_matches("core.")))?;
+            if count == 2 {
+                self.report_value(0, values[0], &args[0].ty)?;
+                self.report_value(1, values[1], &args[1].ty)?;
+            }
+            if let Some(message) = values.get(count) {
+                self.report_value(2, *message, &Type::Str)?;
+            }
+            self.trap()?;
+            self.builder.position_at_end(ok);
+            return Ok(unit);
+        }
         if name == "ok" || name == "err" || name == "some" || name == "none" {
             let mut v = self.ty(ret)?.into_struct_type().const_zero();
             let tag = name == "err" || name == "some";
