@@ -8,7 +8,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import tarfile
-import urllib.request
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,8 +16,12 @@ ROOT = Path(__file__).resolve().parent.parent
 def download(url: str, destination: Path, checksum: str) -> None:
     if not destination.is_file():
         print(f"Downloading {url}", flush=True)
-        with urllib.request.urlopen(url, timeout=60) as source, destination.open("wb") as target:
-            shutil.copyfileobj(source, target)
+        subprocess.run([
+            "curl.exe" if os.name == "nt" else "curl",
+            "--fail", "--location", "--retry", "5", "--retry-all-errors",
+            "--connect-timeout", "30", "--max-time", "300", "--retry-max-time", "600",
+            "--remove-on-error", "--output", str(destination), url,
+        ], check=True)
     with destination.open("rb") as source:
         actual = hashlib.file_digest(source, "sha256").hexdigest()
     if actual != checksum:

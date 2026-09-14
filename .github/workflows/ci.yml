@@ -54,7 +54,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --location https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-signing-key.asc
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 --retry-max-time 600 https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-signing-key.asc
           gpg --show-keys --with-colons /tmp/llvm-signing-key.asc | awk -F: '$1 == "fpr" {print $10}' > /tmp/llvm-fingerprints
           grep -Fx '6084F3CF814B57C1CF12EFD515CF4D18AF4F7421' /tmp/llvm-fingerprints
           sudo install -m 644 /tmp/llvm-signing-key.asc /usr/share/keyrings/llvm.asc
@@ -83,7 +83,7 @@ jobs:
           set -euo pipefail
           test_tls_prefix="$RUNNER_TEMP/dodo-openssl"
           test_tls_archive="$RUNNER_TEMP/openssl-3.5.8.tar.gz"
-          curl --fail --silent --show-error --location https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz -o "$test_tls_archive"
+          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 --retry-max-time 600 https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz -o "$test_tls_archive"
           printf '%s  %s\n' a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2 "$test_tls_archive" | sha256sum --check
           tar -xzf "$test_tls_archive" -C "$RUNNER_TEMP"
           cd "$RUNNER_TEMP/openssl-3.5.8"
@@ -257,12 +257,16 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $archive = "$env:RUNNER_TEMP/llvm-windows.tar.xz"
-          Invoke-WebRequest 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz' -OutFile $archive
+          Write-Host 'Downloading the Windows LLVM development archive'
+          curl.exe --fail --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 --retry-max-time 600 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz' --output $archive
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM archive download failed after retries' }
+          Write-Host 'Verifying the Windows LLVM archive checksum'
           if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'D96C2CC1736F4EB7FA43CB9BBDF56D93551A9AE0A9AADB9C99C3C3B2B712A234') {
             throw 'LLVM archive checksum mismatch'
           }
           $prefix = "$env:RUNNER_TEMP/llvm-windows"
           New-Item -ItemType Directory -Path $prefix | Out-Null
+          Write-Host 'Extracting the Windows LLVM development archive'
           tar -xJf $archive -C $prefix --strip-components=1
           if ($LASTEXITCODE -ne 0) { throw 'LLVM archive extraction failed' }
       - name: Build LLVM's missing static XML library and collect notices

@@ -19,6 +19,7 @@ trap 'rm -rf "$work"' EXIT
 revision=3a402ca2c14c3891d24658318406f80ce59b719f
 checksum=247ce6c545e9e09890b3de0aa075e567999eb897e7122a4dc4d94e708b8fba1a
 curl --fail --silent --show-error --location \
+    --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 --retry-max-time 600 \
     "https://codeload.github.com/Z3Prover/z3/tar.gz/$revision" -o "$work/z3.tar.gz"
 echo "$checksum  $work/z3.tar.gz" | sha256sum --check --status
 tar -xzf "$work/z3.tar.gz" -C "$work"
