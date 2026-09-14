@@ -251,8 +251,9 @@ jobs:
         with:
           path: ${{ runner.temp }}/llvm-windows
           key: llvm-windows-2022-${{ runner.arch }}-${{ steps.windows-toolchain.outputs.image }}-${{ hashFiles('.github/workflows/ci.yml', 'scripts/build-windows-llvm-support.py') }}
-      - name: Install the official LLVM 22 Windows development archive
+      - name: Download and verify the official LLVM 22 Windows archive
         if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 15
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -264,11 +265,29 @@ jobs:
           if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'D96C2CC1736F4EB7FA43CB9BBDF56D93551A9AE0A9AADB9C99C3C3B2B712A234') {
             throw 'LLVM archive checksum mismatch'
           }
+      - name: Extract the required Windows LLVM tools and libraries
+        if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "$env:RUNNER_TEMP/llvm-windows.tar.xz"
+          $tarArchive = "$env:RUNNER_TEMP/llvm-windows.tar"
           $prefix = "$env:RUNNER_TEMP/llvm-windows"
           New-Item -ItemType Directory -Path $prefix | Out-Null
-          Write-Host 'Extracting the Windows LLVM development archive'
-          tar -xJf $archive -C $prefix --strip-components=1
+          # Windows tar stalls on this XZ archive; decompress it with 7-Zip first.
+          7z x $archive "-o$env:RUNNER_TEMP" -y -bsp0
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM archive decompression failed' }
+          # Avoid extracting and caching over 3 GB of unused LLVM executables.
+          $root = 'clang+llvm-22.1.8-x86_64-pc-windows-msvc'
+          $members = @(
+            "$root/include", "$root/lib",
+            "$root/bin/clang.exe", "$root/bin/lld-link.exe",
+            "$root/bin/llvm-config.exe", "$root/bin/llvm-readobj.exe"
+          )
+          tar -xf $tarArchive -C $prefix --strip-components=1 @members
           if ($LASTEXITCODE -ne 0) { throw 'LLVM archive extraction failed' }
+          Remove-Item $archive, $tarArchive
       - name: Build LLVM's missing static XML library and collect notices
         if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
         run: python scripts/build-windows-llvm-support.py
