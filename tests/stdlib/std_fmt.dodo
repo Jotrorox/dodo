@@ -5,6 +5,7 @@ import "core/mem"
 import "core/ptr"
 import "std/io"
 import "std/fmt"
+import "std/float_decimal"
 
 pub struct Point {
     x: i64
@@ -47,7 +48,109 @@ fn float_equal(value: f64, precision: usize, style: fmt.FloatStyle, expected: &[
     }
     return ok(core_bytes.equal(sink.written(), expected))
 }
+fn decimal_rejects(value: f64, precision: usize, expected: float_decimal.DecimalError) -> bool {
+    storage := [165u8; 640]
+    styles := [false, true]
+    for scientific in styles {
+        match float_decimal.convert(&mut storage, value, precision, *scientific) {
+            ok(_) => {
+                return false
+            },
+            err(reason) => {
+                if reason != expected {
+                    return false
+                }
+            }
+        }
+        for byte in storage {
+            if *byte != 165 {
+                return false
+            }
+        }
+    }
+    return true
+}
+fn decimal_case(value: f64, precision: usize, scientific: bool, expected: &[u8]) -> bool {
+    // Empty, one byte short, exact, and oversized destinations. Failed writes
+    // must leave the whole buffer intact; successful writes preserve its tail.
+    capacities := [0usize, expected.len - 1, expected.len, expected.len + 1]
+    for entry in capacities {
+        capacity := *entry
+        storage := [165u8; 640]
+        written := 0usize
+        match float_decimal.convert(&mut storage[..capacity], value, precision, scientific) {
+            ok(size) => {
+                if capacity < expected.len || size != expected.len {
+                    return false
+                }
+                if!core_bytes.equal(&storage[..size], expected) {
+                    return false
+                }
+                written = size
+            },
+            err(reason) => {
+                if capacity >= expected.len || reason != float_decimal.DecimalError.BufferFull {
+                    return false
+                }
+            }
+        }
+        for index in written..storage.len {
+            if storage[index] != 165 {
+                return false
+            }
+        }
+    }
+    return true
+}
+fn decimal_contract() -> bool {
+    invalid := [0xbff0000000000000u64, 0x8000000000000001u64,
+    0x7ff0000000000000u64, 0xfff0000000000000u64,
+    0x7ff8000000000000u64, 0xfff8000000000000u64,
+    0x7ff0000000000001u64, 0xfff0000000000001u64]
+    for bits in invalid {
+        if!decimal_rejects(from_bits(*bits), 2, float_decimal.DecimalError.InvalidValue) {
+            return false
+        }
+    }
+    if!decimal_rejects(1.0, 325, float_decimal.DecimalError.InvalidPrecision) {
+        return false
+    }
+    if!decimal_rejects(from_bits(0x7ff8000000000000), 325, float_decimal.DecimalError.InvalidPrecision) {
+        return false
+    }
+    if!decimal_case(0.0, 0, false, b"0") {
+        return false
+    }
+    if!decimal_case(-0.0, 2, true, b"0.00e+00") {
+        return false
+    }
+    if!decimal_case(0.5, 0, false, b"0") {
+        return false
+    }
+    if!decimal_case(from_bits(0x3fe0000000000001), 0, false, b"1") {
+        return false
+    }
+    if!decimal_case(9.999, 2, false, b"10.00") {
+        return false
+    }
+    if!decimal_case(9.999, 2, true, b"1.00e+01") {
+        return false
+    }
+    if!decimal_case(from_bits(1), 0, true, b"5e-324") {
+        return false
+    }
+    if!decimal_case(from_bits(0x7fefffffffffffff), 0, true, b"2e+308") {
+        return false
+    }
+    subnormal := [48u8; 326]
+    subnormal[1] = 46
+    subnormal[325] = 53
+    return decimal_case(from_bits(1), 324, false, &subnormal)
+}
 fn verify() -> i32!io.Error {
+    if!decimal_contract() {
+        return ok(26)
+    }
     backing := [0u8; 256]
     sink := io.MemoryWriter.new(&mut backing)
     {

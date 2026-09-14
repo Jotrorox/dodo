@@ -94,6 +94,13 @@ import "core/ptr"
 import "core/bytes" as core_bytes
 import "std/io"
 import "std/fmt"
+struct Case {
+    bits: u64
+    precision: usize
+    scientific: bool
+    start: usize
+    end: usize
+}
 fn check(bits:u64, precision:usize, scientific:bool, expected:&[u8])->bool!io.Error {
     value := unsafe { ptr.read_unaligned(ptr.from_ref(&bits) as *const f64) }
     storage := [0u8;640]
@@ -109,7 +116,15 @@ fn check(bits:u64, precision:usize, scientific:bool, expected:&[u8])->bool!io.Er
     }
     return ok(core_bytes.equal(sink.written(),expected))
 }
-fn verify()->i32!io.Error {
+fn check_cases(cases:&[Case], expected:&[u8])->usize!io.Error {
+    for index in 0usize..cases.len {
+        item := &cases[index]
+        if!check(item.bits, item.precision, item.scientific, &expected[item.start..item.end])? {
+            return ok(index)
+        }
+    }
+    return ok(cases.len)
+}
 "#,
     );
     let boundaries: [f64; 20] = [
@@ -142,6 +157,35 @@ fn verify()->i32!io.Error {
             }
         }
     }
+    // Exercise every supported precision on zero, a repeating decimal, and
+    // both extremes of binary64, in each style and with each sign.
+    for value in [0.0, 1.0 / 3.0, f64::from_bits(1), f64::MAX] {
+        for precision in 0..=324 {
+            for is_scientific in [false, true] {
+                cases.push((value, precision, is_scientific));
+                cases.push((-value, precision, is_scientific));
+            }
+        }
+    }
+    // Every normal exponent and its predecessor cover binade transitions,
+    // including the subnormal/normal boundary and significand carry chains.
+    for exponent in 1u64..0x7ff {
+        for bits in [(exponent << 52) - 1, exponent << 52] {
+            for is_scientific in [false, true] {
+                cases.push((f64::from_bits(bits), 17, is_scientific));
+            }
+        }
+    }
+    // Exactly representable ties, their neighbors, and decimal exponent carries.
+    for value in [0.5f64, 2.5, 3.5, 9.5, 99.5, 0.125, 0.375, 9.999, 99.999] {
+        for bits in [value.to_bits() - 1, value.to_bits(), value.to_bits() + 1] {
+            for precision in [0, 1, 2] {
+                for is_scientific in [false, true] {
+                    cases.push((f64::from_bits(bits), precision, is_scientific));
+                }
+            }
+        }
+    }
     let mut bits = 0x6a09_e667_f3bc_c909u64;
     for index in 0..192 {
         bits ^= bits << 13;
@@ -149,25 +193,42 @@ fn verify()->i32!io.Error {
         bits ^= bits << 17;
         let value = f64::from_bits(bits);
         if value.is_finite() {
-            cases.push((
-                value,
-                [0, 1, 2, 6, 17, 30, 100, 324][index % 8],
-                index % 2 == 0,
-            ));
+            for is_scientific in [false, true] {
+                cases.push((
+                    value,
+                    [0, 1, 2, 6, 17, 30, 100, 324][index % 8],
+                    is_scientific,
+                ));
+            }
         }
     }
-    for (index, &(value, precision, is_scientific)) in cases.iter().enumerate() {
-        let expected = if is_scientific {
-            scientific(value, precision)
-        } else {
-            format!("{value:.precision$}")
-        };
+    // Small tables bound the size of each generated function and its stack use.
+    let mut invocations = String::from("fn verify()->i32!io.Error {\n");
+    for (batch, cases) in cases.chunks(128).enumerate() {
+        let mut expected_bytes = String::new();
         source.push_str(&format!(
-            "if!check({}u64, {precision}, {is_scientific}, b\"{expected}\")? {{ return ok({}) }}\n",
-            value.to_bits(),
-            index % 240 + 1
+            "fn batch_{batch}()->void!io.Error {{\ncases := [\n"
         ));
+        for &(value, precision, is_scientific) in cases {
+            let expected = if is_scientific {
+                scientific(value, precision)
+            } else {
+                format!("{value:.precision$}")
+            };
+            let start = expected_bytes.len();
+            expected_bytes.push_str(&expected);
+            source.push_str(&format!(
+                "Case {{ bits: {}u64, precision: {precision}, scientific: {is_scientific}, start: {start}, end: {} }},\n",
+                value.to_bits(), expected_bytes.len()
+            ));
+        }
+        source.push_str(&format!("]\nexpected := b\"{expected_bytes}\"\n"));
+        source.push_str(&format!(
+            "assert_eq(check_cases(&cases, expected)?, cases.len, \"Rust oracle batch {batch}: left is failing case index\")\nreturn ok()\n}}\n"
+        ));
+        invocations.push_str(&format!("batch_{batch}()?\n"));
     }
+    source.push_str(&invocations);
     source.push_str("return ok(0)\n}\nfn main()->i32 { match verify() { ok(code)=>{return code}, err(_)=>{return 250} } }\n");
     let input = scratch.join("float_oracle.dodo");
     fs::write(&input, source).unwrap();
