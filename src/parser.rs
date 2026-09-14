@@ -890,6 +890,7 @@ impl Parser {
             ));
         }
         Ok(Function {
+            imported: false,
             generic_instance: false,
             test: mods.test,
             ignore: mods.ignore,

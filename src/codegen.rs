@@ -3,6 +3,7 @@ use crate::ast::*;
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::{Builder, BuilderError};
+use inkwell::comdat::ComdatSelectionKind;
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::{Linkage, Module};
@@ -173,9 +174,16 @@ pub fn generate<'ctx>(
     cg.module
         .verify()
         .map_err(|e| error(format!("LLVM verification failed: {e}")))?;
-    let passes = format!("default<O{}>", options.optimization.min(3));
+    // Work from lowered references, including implicit drops, callback addresses,
+    // and the hosted/test entry point. Run at O0 too, and again after optimizations
+    // that can remove the last reference to an internal function.
+    let passes = format!(
+        "globaldce,default<O{}>,globaldce",
+        options.optimization.min(3)
+    );
     cg.module
         .run_passes(&passes, &machine, PassBuilderOptions::create())?;
+    cg.function_sections();
     cg.module
         .verify()
         .map_err(|e| error(format!("optimized LLVM verification failed: {e}")))?;
@@ -356,7 +364,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             } else {
                 format!("dodo.{}.{}", self.program.package, f.name)
             };
-            let linkage = if f.extern_ || f.public || f.name == "main" {
+            // `pub` grants source visibility to importers; only the root package
+            // exports a Dodo API from this compilation unit. Keep C definitions
+            // externally visible even when they originate in an imported package.
+            let linkage = if f.extern_
+                || f.name == "main"
+                || (!f.imported && f.public && !f.generic_instance)
+            {
                 Linkage::External
             } else {
                 Linkage::Internal
@@ -379,6 +393,40 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.functions.insert(f.name.clone(), function);
         }
         Ok(())
+    }
+    fn function_sections(&self) {
+        let triple = TargetMachine::normalize_triple(&self.module.get_triple());
+        let triple = triple.as_str().to_string_lossy();
+        // Mach-O and Wasm already allow dead stripping individual functions.
+        // Their section naming rules (and XCOFF's csects) differ from ELF/COFF.
+        if triple.starts_with("wasm")
+            || triple.split('-').any(|part| {
+                ["darwin", "macos", "ios", "tvos", "watchos", "xros", "aix"]
+                    .iter()
+                    .any(|os| part.starts_with(os))
+                    || part == "macho"
+            })
+        {
+            return;
+        }
+        let coff =
+            triple.contains("windows") || triple.contains("uefi") || triple.ends_with("-coff");
+        let prefix = if coff { ".text$" } else { ".text." };
+        // Assign after optimization so generated helpers get their own sections
+        // as well, and an unused exported API can be discarded by the linker.
+        for function in self.module.get_functions() {
+            if function.count_basic_blocks() != 0 {
+                let name = function.get_name().to_string_lossy();
+                function.set_section(Some(&format!("{prefix}{name}")));
+                if coff {
+                    // COFF dead stripping requires COMDAT sections. NoDuplicates
+                    // preserves the duplicate-definition error for strong exports.
+                    let comdat = self.module.get_or_insert_comdat(&name);
+                    comdat.set_selection_kind(ComdatSelectionKind::NoDuplicates);
+                    function.as_global_value().set_comdat(comdat);
+                }
+            }
+        }
     }
     fn c_abi_attributes(&self, function: &Function) -> Vec<(AttributeLoc, Attribute)> {
         let triple = self.module.get_triple();
