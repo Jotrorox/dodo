@@ -1,5 +1,7 @@
 package text
 
+import "std/io"
+
 import "core/ascii"
 import "core/bytes"
 import "core/mem"
@@ -16,6 +18,57 @@ pub enum ErrorKind {
 pub struct Error {
     pub kind: ErrorKind
     pub position: usize
+    // Only fixed kind names and numeric metadata; never input or native messages.
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("text: ")?
+        match &self.kind {
+            ErrorKind.InvalidLead => {
+                output.string("InvalidLead")?
+            }
+            ErrorKind.InvalidContinuation => {
+                output.string("InvalidContinuation")?
+            }
+            ErrorKind.Truncated => {
+                output.string("Truncated")?
+            }
+            ErrorKind.InvalidScalar => {
+                output.string("InvalidScalar")?
+            }
+            ErrorKind.OutOfBounds => {
+                output.string("OutOfBounds")?
+            }
+            ErrorKind.NotBoundary => {
+                output.string("NotBoundary")?
+            }
+            ErrorKind.BufferFull => {
+                output.string("BufferFull")?
+            }
+            ErrorKind.EmptyDelimiter => {
+                output.string("EmptyDelimiter")?
+            }
+            ErrorKind.EmptyNumber => {
+                output.string("EmptyNumber")?
+            }
+            ErrorKind.InvalidDigit => {
+                output.string("InvalidDigit")?
+            }
+            ErrorKind.InvalidRadix => {
+                output.string("InvalidRadix")?
+            }
+            ErrorKind.Overflow => {
+                output.string("Overflow")?
+            }
+            ErrorKind.InvalidNumber => {
+                output.string("InvalidNumber")?
+            }
+            ErrorKind.TooManyDigits => {
+                output.string("TooManyDigits")?
+            }
+        }
+        output.string(" position=")?
+        output.natural(self.position as u64)?
+        return ok()
+    }
 }
 fn failure(kind: ErrorKind, position: usize) -> Error {
     return Error { kind: kind, position: position }

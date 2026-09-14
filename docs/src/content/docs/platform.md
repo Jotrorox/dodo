@@ -5,7 +5,7 @@ section: "Using Dodo"
 order: 144
 ---
 
-[Filesystem](filesystem.md), [processes](processes.md),
+[Console I/O](console.md), [filesystem](filesystem.md), [processes](processes.md),
 [environment](environment.md), [threads](threads.md), and
 [synchronization](synchronization.md) select their adapters independently.
 `std/AREA/native` resolves to `std/AREA/linux` or `std/AREA/windows` using the
@@ -31,6 +31,13 @@ explicitly chooses strict or lossy behavior and uses caller storage. Native
 handles close once through deterministic destruction; explicit fallible close
 allows error handling. Unsafe raw construction must establish unique ownership
 and the correct native resource kind.
+
+Borrowed process standard streams are the exception to owning-handle cleanup:
+`native.stdin()`, `stdout()`, and `stderr()` return `BorrowedHandle`, which has
+no close operation or destructor. Prefer [std/console](console.md) for safe text
+printing and line input. Native-to-I/O conversion retains recoverable kinds,
+including `WouldBlock`, `Closed`, `PermissionDenied`, and `BrokenPipe`, as well
+as the native code.
 
 ## Linking and dependencies
 

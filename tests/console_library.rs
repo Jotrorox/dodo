@@ -72,11 +72,48 @@ fn console_examples_and_borrowed_stream_ownership() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let work = Workspace::new();
     for optimization in ["0", "3"] {
-        let source = root.join("tests/os/console_checks.dodo");
-        let exe = work.build(&source, optimization);
-        let output = run(&exe, b"abc\r\ntail");
-        assert_eq!(output.stdout, b"Hello, world!\n42\ntext line\n42\n");
-        assert_eq!(output.stderr, b"io: Closed code=9 transferred=0\n");
+        for (source, input, stdout, stderr) in [
+            (
+                "tests/os/console_checks.dodo",
+                "abc\r\ntail",
+                "Hello, world!\n42\ntext line\n42\n",
+                "io: Closed code=9 transferred=0\n",
+            ),
+            ("examples/hello.dodo", "", "Hello, world!\n", ""),
+            (
+                "examples/console_formatting.dodo",
+                "",
+                "The answer is 42\ntrue\n1.250000e+00\n",
+                "",
+            ),
+            (
+                "examples/console_error.dodo",
+                "",
+                "",
+                "Could not read the number: text: InvalidDigit position=0\n",
+            ),
+        ] {
+            let exe = work.build(&root.join(source), optimization);
+            let output = run(&exe, input.as_bytes());
+            assert_eq!(output.stdout, stdout.as_bytes(), "{source}");
+            assert_eq!(output.stderr, stderr.as_bytes(), "{source}");
+        }
+        let exe = work.build(&root.join("examples/console_read_line.dodo"), optimization);
+        for input in ["Ada\n", "Ada\r\n", "Ada", "Zoë\n"] {
+            let output = run(&exe, input.as_bytes());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("Your name: Hello, {}!\n", input.trim_end())
+            );
+            assert!(output.stderr.is_empty());
+        }
+        let output = run(&exe, b"");
+        assert_eq!(output.stdout, b"Your name: ");
+        assert!(output.stderr.is_empty());
+        let output = run(&exe, &[b'x'; 128]);
+        assert_eq!(output.stderr, b"The line did not fit in 128 bytes.\n");
+        let output = run(&exe, b"\xff\n");
+        assert_eq!(output.stderr, b"text: InvalidLead position=0\n");
     }
 }
 
@@ -139,10 +176,7 @@ fn console_is_embedded_and_only_selects_the_platform_boundary() {
                 .contains("unsupported for target")
         );
     }
-    let portable = work.source(
-        "portable",
-        "package app\nimport \"std/io\"\nimport \"std/fmt\"\nfn main() {}\n",
-    );
+    let portable = work.source("portable", "package app\nimport \"std/io\"\nimport \"std/fmt\"\nimport \"std/fmt/errors\"\nfn main() {}\n");
     for target in ["wasm32-unknown-unknown", "thumbv6m-none-eabi"] {
         assert!(
             package::native_sources(&package::load_for_target(&portable, target).unwrap())

@@ -1,0 +1,154 @@
+package errors
+
+import "std/fmt"
+import "std/io"
+import "alloc/error" as allocation_errors
+import "std/bytes" as bytes_errors
+import "std/text" as text_errors
+import "std/sync/error" as sync_error_errors
+import "std/web" as web_errors
+import "std/math" as math_errors
+import "std/time" as time_errors
+
+// An enum error's display contains only a static domain and kind name. These
+// adapters are optional; importing fmt never imports their source packages.
+pub struct Message {
+    text: &str
+    pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error {
+        return output.string(self.text)
+    }
+}
+pub fn allocation(reason: allocation_errors.AllocError) -> Message from(static) {
+    match reason {
+        allocation_errors.AllocError.InvalidAlignment => {
+            return Message { text: "allocation: InvalidAlignment" }
+        }
+        allocation_errors.AllocError.SizeOverflow => {
+            return Message { text: "allocation: SizeOverflow" }
+        }
+        allocation_errors.AllocError.Exhausted => {
+            return Message { text: "allocation: Exhausted" }
+        }
+        allocation_errors.AllocError.UnsupportedLayout => {
+            return Message { text: "allocation: UnsupportedLayout" }
+        }
+    }
+}
+pub fn range(reason: bytes_errors.RangeError) -> Message from(static) {
+    match reason {
+        bytes_errors.RangeError.OutOfBounds => {
+            return Message { text: "range: OutOfBounds" }
+        }
+    }
+}
+pub fn parse(reason: text_errors.ParseError) -> Message from(static) {
+    match reason {
+        text_errors.ParseError.Empty => {
+            return Message { text: "parse: Empty" }
+        }
+        text_errors.ParseError.InvalidDigit => {
+            return Message { text: "parse: InvalidDigit" }
+        }
+        text_errors.ParseError.Overflow => {
+            return Message { text: "parse: Overflow" }
+        }
+    }
+}
+pub fn format(reason: fmt.FormatError) -> Message from(static) {
+    match reason {
+        fmt.FormatError.BufferTooSmall => {
+            return Message { text: "format: BufferTooSmall" }
+        }
+    }
+}
+pub fn synchronization(reason: sync_error_errors.Error) -> Message from(static) {
+    match reason {
+        sync_error_errors.Error.TimedOut => {
+            return Message { text: "synchronization: TimedOut" }
+        }
+        sync_error_errors.Error.Cancelled => {
+            return Message { text: "synchronization: Cancelled" }
+        }
+        sync_error_errors.Error.Closed => {
+            return Message { text: "synchronization: Closed" }
+        }
+        sync_error_errors.Error.InvalidInput => {
+            return Message { text: "synchronization: InvalidInput" }
+        }
+        sync_error_errors.Error.NativeFailure => {
+            return Message { text: "synchronization: NativeFailure" }
+        }
+        sync_error_errors.Error.AllocationFailed => {
+            return Message { text: "synchronization: AllocationFailed" }
+        }
+        sync_error_errors.Error.InvalidOrdering => {
+            return Message { text: "synchronization: InvalidOrdering" }
+        }
+    }
+}
+pub fn web(reason: web_errors.Error) -> Message from(static) {
+    match reason {
+        web_errors.Error.InvalidPath => {
+            return Message { text: "web: InvalidPath" }
+        }
+        web_errors.Error.InvalidPattern => {
+            return Message { text: "web: InvalidPattern" }
+        }
+        web_errors.Error.InvalidMethod => {
+            return Message { text: "web: InvalidMethod" }
+        }
+        web_errors.Error.AmbiguousRoute => {
+            return Message { text: "web: AmbiguousRoute" }
+        }
+        web_errors.Error.BufferFull => {
+            return Message { text: "web: BufferFull" }
+        }
+        web_errors.Error.NotFound => {
+            return Message { text: "web: NotFound" }
+        }
+        web_errors.Error.MethodNotAllowed => {
+            return Message { text: "web: MethodNotAllowed" }
+        }
+        web_errors.Error.Cancelled => {
+            return Message { text: "web: Cancelled" }
+        }
+        web_errors.Error.Handler => {
+            return Message { text: "web: Handler" }
+        }
+        web_errors.Error.InvalidProgress => {
+            return Message { text: "web: InvalidProgress" }
+        }
+    }
+}
+pub fn math(reason: math_errors.MathError) -> Message from(static) {
+    match reason {
+        math_errors.MathError.Overflow => {
+            return Message { text: "math: Overflow" }
+        }
+        math_errors.MathError.DivisionByZero => {
+            return Message { text: "math: DivisionByZero" }
+        }
+        math_errors.MathError.Domain => {
+            return Message { text: "math: Domain" }
+        }
+    }
+}
+pub fn time(reason: time_errors.TimeError) -> Message from(static) {
+    match reason {
+        time_errors.TimeError.Overflow => {
+            return Message { text: "time: Overflow" }
+        }
+        time_errors.TimeError.InvalidComponent => {
+            return Message { text: "time: InvalidComponent" }
+        }
+        time_errors.TimeError.Before => {
+            return Message { text: "time: Before" }
+        }
+        time_errors.TimeError.DifferentClock => {
+            return Message { text: "time: DifferentClock" }
+        }
+        time_errors.TimeError.ClockFailure => {
+            return Message { text: "time: ClockFailure" }
+        }
+    }
+}
