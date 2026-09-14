@@ -1,19 +1,22 @@
 //! Synchronous stdio LSP server using the compiler's parser and semantic checker.
 //!
 //! Open documents are authoritative in-memory overlays, including when imported
-//! by another document. Each check stops at the compiler's first error.
+//! by another document. Editor recovery retains independent valid syntax/bodies.
 use crate::diagnostic::{Diagnostic, Severity};
-use crate::{editor, package, sema};
+use crate::{codegen, editor, format, package, sema};
 use lsp_server::{ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
-    DiagnosticRelatedInformation, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    InitializeParams, Location, Position, PublishDiagnosticsParams, Range, Uri,
+    CompletionParams, DiagnosticRelatedInformation, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentFormattingParams, InitializeParams, Location, Position,
+    PublishDiagnosticsParams, Range, ReferenceParams, RenameParams, SignatureHelpParams,
+    TextDocumentPositionParams, Uri,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use url::Url;
 
 #[derive(Default, PartialEq, Eq)]
@@ -38,6 +41,9 @@ struct Server {
     documents: BTreeMap<String, Document>,
     published: BTreeMap<String, Uri>,
     check_packages: bool,
+    target: String,
+    pointer_bits: u32,
+    document_changes: bool,
 }
 
 /// Serve LSP messages until `exit` or EOF. Stdout contains only framed JSON-RPC.
@@ -111,6 +117,7 @@ impl Server {
                 Ok(params) => params,
                 Err(_) => return error(ErrorCode::InvalidParams, "invalid initialize parameters"),
             };
+            let mut check_packages = false;
             match params
                 .initialization_options
                 .as_ref()
@@ -118,7 +125,7 @@ impl Server {
             {
                 None | Some(Value::Null) => (),
                 Some(Value::String(mode)) if mode == "file" => (),
-                Some(Value::String(mode)) if mode == "package" => self.check_packages = true,
+                Some(Value::String(mode)) if mode == "package" => check_packages = true,
                 Some(_) => {
                     return error(
                         ErrorCode::InvalidParams,
@@ -126,6 +133,47 @@ impl Server {
                     );
                 }
             }
+            let target = match params
+                .initialization_options
+                .as_ref()
+                .and_then(|o| o.get("target"))
+            {
+                None | Some(Value::Null) => inkwell::targets::TargetMachine::get_default_triple()
+                    .as_str()
+                    .to_string_lossy()
+                    .into_owned(),
+                Some(Value::String(target))
+                    if !target.is_empty()
+                        && target.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
+                        }) =>
+                {
+                    target.clone()
+                }
+                Some(_) => {
+                    return error(
+                        ErrorCode::InvalidParams,
+                        "target must be an LLVM target triple",
+                    );
+                }
+            };
+            let bits = match codegen::pointer_bits(&codegen::Options {
+                target: Some(target.clone()),
+                ..Default::default()
+            }) {
+                Ok(bits) => bits,
+                Err(e) => return error(ErrorCode::InvalidParams, &format!("invalid target: {e}")),
+            };
+            self.check_packages = check_packages;
+            self.target = target;
+            self.pointer_bits = bits;
+            self.document_changes = params
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|w| w.workspace_edit.as_ref())
+                .and_then(|e| e.document_changes)
+                .unwrap_or(false);
             self.state = State::Running;
             return Response::new_ok(
                 request.id,
@@ -133,6 +181,12 @@ impl Server {
                     "capabilities": {
                         "positionEncoding": "utf-16",
                         "hoverProvider": true,
+                        "completionProvider": {"triggerCharacters": ["."]},
+                        "definitionProvider": true,
+                        "referencesProvider": true,
+                        "renameProvider": {"prepareProvider": true},
+                        "signatureHelpProvider": {"triggerCharacters": ["(", ","], "retriggerCharacters": [","]},
+                        "documentFormattingProvider": true,
                         "textDocumentSync": {
                             "openClose": true,
                             "change": 1,
@@ -153,25 +207,172 @@ impl Server {
             self.state = State::Shutdown;
             return Response::new_ok(request.id, Value::Null);
         }
-        if request.method == "textDocument/hover" {
-            let params = &request.params;
-            let position = params["textDocument"]["uri"]
-                .as_str()
-                .zip(params["position"]["line"].as_u64())
-                .zip(params["position"]["character"].as_u64());
-            let Some(((uri, line), character)) = position.filter(|((_, line), character)| {
-                *line <= u32::MAX as u64 && *character <= u32::MAX as u64
-            }) else {
-                return error(ErrorCode::InvalidParams, "invalid hover parameters");
+        if request.method == "textDocument/formatting" {
+            let Ok(params) =
+                serde_json::from_value::<DocumentFormattingParams>(request.params.clone())
+            else {
+                return error(ErrorCode::InvalidParams, "invalid formatting parameters");
             };
-            let hover = self
-                .documents
-                .get(uri)
-                .and_then(|document| document.analysis.as_ref())
-                .and_then(|analysis| analysis.hover(line as u32, character as u32));
-            return Response::new_ok(request.id, hover.unwrap_or(Value::Null));
+            let Some(document) = self.documents.get(params.text_document.uri.as_str()) else {
+                return Response::new_ok(request.id, Value::Null);
+            };
+            return match format::format_source(&document.text) {
+                Ok(formatted) => Response::new_ok(
+                    request.id,
+                    if formatted == document.text {
+                        json!([])
+                    } else {
+                        json!([{"range": Range::new(Position::new(0, 0), position(&document.text, document.text.len())), "newText": formatted}])
+                    },
+                ),
+                Err(diagnostic) => error(ErrorCode::RequestFailed, &diagnostic.message),
+            };
         }
-        error(ErrorCode::MethodNotFound, "method is not supported")
+        let mut include_declaration = false;
+        let mut new_name = None;
+        let params = match request.method.as_str() {
+            "textDocument/hover" | "textDocument/definition" | "textDocument/prepareRename" => {
+                serde_json::from_value::<TextDocumentPositionParams>(request.params.clone())
+            }
+            "textDocument/completion" => {
+                serde_json::from_value::<CompletionParams>(request.params.clone())
+                    .map(|p| p.text_document_position)
+            }
+            "textDocument/signatureHelp" => {
+                serde_json::from_value::<SignatureHelpParams>(request.params.clone())
+                    .map(|p| p.text_document_position_params)
+            }
+            "textDocument/references" => {
+                serde_json::from_value::<ReferenceParams>(request.params.clone()).map(|p| {
+                    include_declaration = p.context.include_declaration;
+                    p.text_document_position
+                })
+            }
+            "textDocument/rename" => serde_json::from_value::<RenameParams>(request.params.clone())
+                .map(|p| {
+                    new_name = Some(p.new_name);
+                    p.text_document_position
+                }),
+            _ => return error(ErrorCode::MethodNotFound, "method is not supported"),
+        };
+        let Ok(params) = params else {
+            return error(
+                ErrorCode::InvalidParams,
+                "invalid document position parameters",
+            );
+        };
+        if let Some(name) = &new_name
+            && !valid_name(name)
+        {
+            return error(
+                ErrorCode::InvalidParams,
+                "newName must be a non-reserved Dodo identifier",
+            );
+        }
+        let Some(document) = self.documents.get(params.text_document.uri.as_str()) else {
+            return Response::new_ok(request.id, Value::Null);
+        };
+        let Some(analysis) = &document.analysis else {
+            return Response::new_ok(request.id, Value::Null);
+        };
+        let path = document
+            .path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(document.uri.as_str()));
+        let (line, character) = (params.position.line, params.position.character);
+        let result = match request.method.as_str() {
+            "textDocument/hover" => analysis.hover(line, character),
+            "textDocument/completion" => analysis.index.completion(&path, line, character),
+            "textDocument/signatureHelp" => analysis.index.signature_help(&path, line, character),
+            _ => {
+                let Some((symbol, span)) = analysis.index.symbol_at(&path, line, character) else {
+                    return Response::new_ok(
+                        request.id,
+                        if request.method == "textDocument/references" {
+                            json!([])
+                        } else {
+                            Value::Null
+                        },
+                    );
+                };
+                match request.method.as_str() {
+                    "textDocument/definition" => self
+                        .location(&analysis.index, symbol.span)
+                        .map(|location| json!(location)),
+                    "textDocument/prepareRename" => analysis.index.prepare_rename(symbol, span),
+                    "textDocument/references" => {
+                        Some(json!(self.references(&symbol.key, include_declaration)))
+                    }
+                    "textDocument/rename" => {
+                        let name = new_name.as_ref().unwrap();
+                        if !self
+                            .documents
+                            .values()
+                            .filter_map(|d| d.analysis.as_ref())
+                            .all(|a| a.index.can_rename(symbol, name))
+                        {
+                            return error(
+                                ErrorCode::RequestFailed,
+                                "rename is unavailable or could capture another binding",
+                            );
+                        }
+                        let locations = self.references(&symbol.key, true);
+                        let mut changes: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+                        for location in locations {
+                            changes
+                                .entry(location.uri.as_str().into())
+                                .or_default()
+                                .push(json!({"range":location.range,"newText":name}));
+                        }
+                        if self.document_changes {
+                            Some(
+                                json!({"documentChanges": changes.into_iter().map(|(uri, edits)| {
+                                let version = self.documents.get(&uri).map(|d| d.version);
+                                json!({"textDocument":{"uri":uri,"version":version},"edits":edits})
+                            }).collect::<Vec<_>>()}),
+                            )
+                        } else {
+                            Some(json!({"changes":changes}))
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        };
+        Response::new_ok(request.id, result.unwrap_or(Value::Null))
+    }
+
+    fn location(&self, index: &editor::symbols::Index, span: crate::ast::Span) -> Option<Location> {
+        let source = index.source(span)?;
+        let uri = self.source_uri(&source.path)?;
+        Some(Location {
+            uri,
+            range: Range::new(
+                position(&source.text, span.start.saturating_sub(source.start)),
+                position(&source.text, span.end.saturating_sub(source.start)),
+            ),
+        })
+    }
+
+    fn references(&self, key: &editor::symbols::Key, include_declaration: bool) -> Vec<Location> {
+        let mut locations = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        for analysis in self.documents.values().filter_map(|d| d.analysis.as_ref()) {
+            if !visited.insert(Arc::as_ptr(&analysis.index)) {
+                continue;
+            }
+            for span in analysis.index.occurrences(key, include_declaration) {
+                if let Some(location) = self.location(&analysis.index, span) {
+                    let key = (
+                        location.uri.as_str().to_owned(),
+                        location.range.start.line,
+                        location.range.start.character,
+                    );
+                    locations.insert(key, location);
+                }
+            }
+        }
+        locations.into_values().collect()
     }
 
     fn notification(&mut self, notification: Notification) -> Result<bool, String> {
@@ -278,8 +479,12 @@ impl Server {
         let mut analyses = BTreeMap::new();
         for (key, document) in &self.documents {
             let Some(path) = &document.path else {
-                let analysis = editor::Document::new(document.text.clone());
-                if let Some(diagnostic) = &analysis.diagnostic {
+                let analysis = editor::Document::standalone(
+                    document.text.clone(),
+                    self.pointer_bits,
+                    PathBuf::from(document.uri.as_str()),
+                );
+                for diagnostic in &analysis.diagnostics {
                     self.add_diagnostic(&mut diagnostics, &document.uri, None, &[], diagnostic);
                 }
                 analyses.insert(key.clone(), analysis);
@@ -293,10 +498,13 @@ impl Server {
             if !checked.insert(root) {
                 continue;
             }
-            match package::load_with_overlays(root, &overlays) {
+            match package::load_for_editor(root, &overlays, &self.target) {
                 Ok(mut loaded) => {
-                    let diagnostic = sema::check_for_target(&mut loaded.program, usize::BITS).err();
-                    if let Some(diagnostic) = &diagnostic {
+                    let original = loaded.program.clone();
+                    let semantic = sema::check_recovering(&mut loaded.program, self.pointer_bits);
+                    loaded.diagnostics.extend(semantic);
+                    let index = Arc::new(editor::symbols::Index::new(&loaded, &original));
+                    for diagnostic in &loaded.diagnostics {
                         self.add_diagnostic(
                             &mut diagnostics,
                             &document.uri,
@@ -328,7 +536,8 @@ impl Server {
                                     target.text.clone(),
                                     source.start,
                                     &loaded.program,
-                                    diagnostic.clone(),
+                                    loaded.diagnostics.clone(),
+                                    Arc::clone(&index),
                                 ),
                             );
                         }
@@ -354,8 +563,14 @@ impl Server {
                             target_path
                         };
                         if target_root == root {
-                            analyses
-                                .insert(key.clone(), editor::Document::new(target.text.clone()));
+                            analyses.insert(
+                                key.clone(),
+                                editor::Document::standalone(
+                                    target.text.clone(),
+                                    self.pointer_bits,
+                                    target_path.clone(),
+                                ),
+                            );
                         }
                     }
                 }
@@ -462,10 +677,24 @@ impl Server {
     fn source_uri(&self, path: &Path) -> Option<Uri> {
         self.documents
             .values()
-            .find(|document| document.path.as_deref() == Some(path))
+            .find(|document| {
+                document.path.as_deref() == Some(path)
+                    || (document.path.is_none() && Path::new(document.uri.as_str()) == path)
+            })
             .map(|document| document.uri.clone())
             .or_else(|| Url::from_file_path(path).ok()?.as_str().parse().ok())
     }
+}
+
+fn valid_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && name != "_"
+        && name != "self"
+        && !crate::parser::reserved(name)
 }
 
 pub(crate) fn uri_path(uri: &Uri) -> Result<PathBuf, String> {
