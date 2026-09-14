@@ -40,3 +40,22 @@ fn main() -> i32 {
     }
     0
 }
+
+@test
+fn categories_cover_ranges_alternatives_and_guards() {
+    assert_eq(category(0), 1)
+    assert_eq(category(9), 1)
+    assert_eq(category(10), 2)
+    assert_eq(category(20), 2)
+    assert_eq(category(11), 3)
+    assert_eq(category(99), 3)
+    assert_eq(category(100), 4)
+}
+
+@test
+fn nested_patterns_handle_missing_or_invalid_readings() {
+    assert_eq(unpack(Reading { value: some(some(42)), valid: true }), 42)
+    assert_eq(unpack(Reading { value: none, valid: true }), 0)
+    assert_eq(unpack(Reading { value: some(none), valid: true }), 0)
+    assert_eq(unpack(Reading { value: some(some(42)), valid: false }), 0)
+}

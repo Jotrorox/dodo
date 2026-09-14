@@ -16,7 +16,8 @@ be public so the standard package can call them. Ownership moves into the
 worker, and the return value moves back through `join`. For a task without data
 to return, use `thread.Unit` instead of `void`.
 
-```dodo
+```dodo test
+package thread_example
 import "std/thread"
 
 pub struct Double {
@@ -28,6 +29,14 @@ fn example() -> usize!thread.ThreadError {
     storage := thread.Storage.new::<Double, usize>()
     worker := thread.spawn(&mut storage, Double { value: 21 })?
     return ok(worker.join())
+}
+
+@test
+fn joined_worker_returns_its_result() {
+    match example() {
+        ok(value) => { assert_eq(value, 42) },
+        err(_) => { assert(false, "the example worker must start and join") },
+    }
 }
 ```
 

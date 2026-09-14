@@ -20,7 +20,7 @@ cd hello
 Save this code as `main.dodo` in that folder. No manifest, lockfile, or package
 manager is needed:
 
-```dodo
+```dodo test
 package main
 
 fn main() -> i32 {

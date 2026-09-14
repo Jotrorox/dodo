@@ -136,7 +136,7 @@ unchanged. A due poll returns true once and disarms. Cancellation returns
 whether a timer was previously armed. Polling with the wrong identity always
 fails, including when disarmed. There is no hidden blocking wait.
 
-```dodo
+```dodo test
 package deadline_example
 import "std/time"
 import "std/time/clock"
@@ -147,6 +147,14 @@ fn run() -> bool!time.TimeError {
     deadline := clock.deadline_after(&source, &interval)?
     source.advance(&interval)?
     return clock.deadline_poll(&deadline, &source)
+}
+
+@test
+fn deadline_expires_after_the_interval() {
+    match run() {
+        ok(expired) => { assert(expired) },
+        err(_) => { assert(false, "advancing the fake clock must succeed") },
+    }
 }
 ```
 

@@ -26,6 +26,7 @@ final-expression returns, inference, patterns, and canonical formatting.
 | Matching, guards, destructuring, and error handling | [Patterns and Results](patterns-and-results.md) |
 | Layout, C calls, raw pointers, and MMIO | [Memory and foreign calls](memory-and-ffi.md) |
 | Commands, formatting, targets, and output formats | [Command-line guide](command-line.md) |
+| Native tests, assertions, and executable documentation | [Testing guide](testing.md) |
 | Design requirements and unfinished specification work | [Implementation checklist](spec-requirements.md) |
 
 ## Lexing and expressions

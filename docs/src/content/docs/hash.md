@@ -37,7 +37,7 @@ The one-shot helpers produce the same result as `new`, `update`, `finish`.
 SipHash accepts any stream length and encodes the length modulo 256 in its
 final block as specified by the algorithm.
 
-```dodo
+```dodo test
 package example
 import "std/hash"
 

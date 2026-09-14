@@ -949,6 +949,43 @@ fn lsp_recovers_multiple_syntax_and_semantic_errors_and_clears_them() {
 }
 
 #[test]
+fn lsp_recovers_test_attribute_and_assertion_errors_and_preserves_navigation() {
+    let source = "package app\n@test struct Invalid {}\nfn sum(a: i32, b: i32) -> i32 { a + b }\n@test fn checks() {\nassert(1)\nassert_eq(1, true)\n}\n@test @ignore(\"later\") fn valid() { assert_eq(sum(1, 2), 3) }\n";
+    let workspace = Workspace::new();
+    let uri = workspace.uri("checks.dodo");
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&uri, source, 1);
+    let diagnostics = client.diagnostics();
+    let errors = diagnostics[&uri]["diagnostics"].as_array().unwrap();
+    assert_eq!(errors.len(), 3, "{diagnostics:?}");
+    assert!(
+        errors.iter().any(|error| error["message"]
+            .as_str()
+            .unwrap()
+            .contains("@test and @ignore apply only to functions")),
+        "{diagnostics:?}"
+    );
+    let definition = query(
+        &mut client,
+        "definition",
+        &uri,
+        source,
+        "sum(1, 2)",
+        json!({}),
+    );
+    assert_eq!(definition["result"]["uri"], uri, "{definition}");
+    assert_eq!(definition["result"]["range"]["start"], at(source, "sum(a:"));
+    let fixed = source
+        .replace("@test struct Invalid {}\n", "")
+        .replace("assert(1)", "assert(true)")
+        .replace("assert_eq(1, true)", "assert_eq(1, 1)");
+    client.change(&uri, &fixed, 2);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
 fn lsp_formatting_uses_the_canonical_formatter_and_unsaved_text() {
     let workspace = Workspace::new();
     let uri = workspace.file("main.dodo", VALID);

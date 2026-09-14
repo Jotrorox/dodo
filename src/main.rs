@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod test_runner;
+
 const HELP: &str = concat!(
     "Dodo ",
     env!("CARGO_PKG_VERSION"),
@@ -20,6 +22,7 @@ Commands:
   check    Parse and check types, ownership, and borrowing
   compile  Compile a native executable or compiler artifact (alias: build)
   run      Compile and run a program; arguments follow --
+  test     Discover and run tests recursively (default: current directory)
   lsp      Run the language server over standard input/output (alias: --lsp)
   fmt      Format and migrate syntax (default input: current directory)
 
@@ -55,6 +58,9 @@ Examples:
   dodo run -- example-argument
   dodo fmt
   dodo fmt --check
+  dodo test
+  dodo test --filter addition
+  dodo test --help
   dodo run examples/samples.dodo -O 2
   dodo compile examples/hello.dodo -o build/hello
   dodo compile examples/gpio.dodo --emit llvm-ir -o build/gpio.ll
@@ -93,6 +99,8 @@ enum Parsed {
     Lsp,
     Args(Box<Args>),
     Format(FormatArgs),
+    Test(Box<test_runner::TestArgs>),
+    TestHelp,
 }
 
 struct FormatArgs {
@@ -152,6 +160,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
             };
         }
         Some("fmt") => return parse_format(args),
+        Some("test") => return test_runner::parse(args),
         Some("check") => Action::Check,
         Some("compile" | "build") => Action::Build,
         Some("run") => Action::Run,
@@ -375,6 +384,11 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
             linker.arg(&object);
             if options.debug {
                 linker.arg("-g");
+            }
+            if !args.options.test_functions.is_empty() {
+                let runtime = temporary.0.join("test_runtime.c");
+                fs::write(&runtime, include_str!("test_runtime.c")).map_err(|e| e.to_string())?;
+                linker.arg(runtime).arg("-std=c11");
             }
             let native = package::native_sources(loaded);
             for (name, source) in &native {
@@ -662,6 +676,11 @@ fn main() -> ExitCode {
         Ok(Parsed::Lsp) => lsp::run(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
             .map_err(|error| format!("LSP transport failed: {error}")),
         Ok(Parsed::Format(args)) => execute_format(args),
+        Ok(Parsed::Test(args)) => test_runner::execute(*args),
+        Ok(Parsed::TestHelp) => {
+            print!("{}", test_runner::HELP);
+            Ok(0)
+        }
         Err(e) => Err(e),
     };
     match result {

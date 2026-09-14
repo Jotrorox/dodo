@@ -266,6 +266,8 @@ pub struct Variant {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
+    pub test: bool,
+    pub ignore: Option<String>,
     pub public: bool,
     pub unsafe_: bool,
     pub extern_: bool,

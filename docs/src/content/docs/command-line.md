@@ -16,6 +16,7 @@ complete option list and `dodo --version` for the compiler version.
 | `dodo fmt` | Format the project folder recursively. |
 | `dodo check` | Check syntax, types, ownership, and borrowing. |
 | `dodo run` | Build a temporary executable and run it. |
+| `dodo test` | Discover and run tests recursively, in isolated processes. |
 | `dodo compile` | Keep an executable at `build/hello`. |
 | `dodo build` | Alias for `dodo compile`. |
 | `dodo lsp` | Start the language server for an editor. |
@@ -42,6 +43,12 @@ dodo run -- example-argument
 
 For editor configuration and protocol support, see [editor setup](editors.md).
 See [compiler diagnostics](diagnostics-and-editors.md) for error examples.
+
+`dodo test` scans the current directory for test functions and explicitly
+executable documentation examples. Use `dodo test --list` to inspect discovery,
+`--filter TEXT` to select tests, and `dodo test --help` for its options. See
+[Test your code](testing.md) for assertions, companion test files, and failure
+reports. Testing does not require `main.dodo`.
 
 ## Project folders and source files
 

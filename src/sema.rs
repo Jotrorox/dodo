@@ -2972,6 +2972,11 @@ impl<'a> Checker<'a> {
         expected: Option<&Type>,
         span: Span,
     ) -> Check<Value> {
+        if matches!(name.as_str(), "assert" | "assert_eq" | "assert_ne")
+            && !self.context.functions.contains_key(name)
+        {
+            *name = format!("core.{name}");
+        }
         if name.ends_with(".drop") && name != "core.drop" {
             return Err(Diagnostic::new(
                 span,
@@ -3167,6 +3172,39 @@ impl<'a> Checker<'a> {
         args: &mut [Expr],
         span: Span,
     ) -> Check<Value> {
+        if matches!(name, "core.assert" | "core.assert_eq" | "core.assert_ne") {
+            let count = if name == "core.assert" { 1 } else { 2 };
+            if !type_args.is_empty() || !(count..=count + 1).contains(&args.len()) {
+                return Err(Diagnostic::new(
+                    span,
+                    format!(
+                        "{name} expects {count} arguments and an optional string message; no type arguments"
+                    ),
+                ));
+            }
+            if count == 1 {
+                let value = self.expr(&mut args[0], Some(&Type::Bool), false)?;
+                self.expect(&Type::Bool, &value.ty, args[0].span)?;
+            } else {
+                let inferred = self
+                    .peek_type(&args[0])
+                    .or_else(|| self.peek_type(&args[1]));
+                let lhs = self.expr(&mut args[0], inferred.as_ref(), false)?;
+                let rhs = self.expr(&mut args[1], Some(&lhs.ty), false)?;
+                self.expect(&lhs.ty, &rhs.ty, args[1].span)?;
+                if lhs.ty != Type::Str {
+                    self.binary_type(BinaryOp::Eq, &lhs.ty, span)?;
+                }
+            }
+            if let Some(message) = args.get_mut(count) {
+                let value = self.expr(message, Some(&Type::Str), false)?;
+                self.expect(&Type::Str, &value.ty, message.span)?;
+            }
+            return Ok(Value {
+                ty: Type::Void,
+                deps: vec![],
+            });
+        }
         if matches!(name, "core.mem.size_of" | "core.mem.align_of") {
             if type_args.len() != 1 || !args.is_empty() {
                 return Err(Diagnostic::new(
@@ -6395,6 +6433,7 @@ fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -> Option<Ty
     let first = args.first().cloned().unwrap_or(Type::Unknown);
     let explicit = types.first().cloned().unwrap_or(Type::Unknown);
     Some(match name {
+        "assert" | "assert_eq" | "assert_ne" => Type::Void,
         "mem.assert_send" | "mem.assert_sync" | "mem.atomic_store" => Type::Void,
         "mem.callback" => Type::Raw(false, Box::new(Type::u8())),
         "mem.atomic_load"

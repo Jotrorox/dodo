@@ -164,6 +164,8 @@ this recipe.
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+cargo run --locked -- test
+cargo run --locked -- test -O 3
 cargo build --locked --release
 python3 scripts/render_spec.py
 python3 scripts/render_spec.py --check
@@ -172,7 +174,8 @@ python3 scripts/test_build_release.py
 bash scripts/build-release.sh # x86-64 GNU/Linux release dependency check
 ```
 
-CI runs these checks. Tests include rejected programs, specification examples,
+CI runs these checks, including native Dodo tests and executable documentation.
+Tests include rejected programs, specification examples,
 native execution at `-O0` and `-O3`, destructor ordering, error propagation,
 cross-target object emission, local imports, and expected runtime traps. They
 exercise the actual compiler and generated binaries rather than matching LLVM
