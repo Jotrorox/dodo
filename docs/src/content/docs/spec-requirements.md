@@ -10,7 +10,7 @@ This review and test-planning checklist comes from the
 maps the retained rules to acceptance, rejection, and execution tests; Appendix C
 records implementation-defined choices and excluded features. This checklist also
 contains future library/platform goals; those do not expand the specified 0.1
-compiler surface. For compiler 0.1.1, start with [compiler support and limits](implementation.md).
+compiler surface. For compiler 0.1.2, start with [compiler support and limits](implementation.md).
 
 ## How to use this checklist
 

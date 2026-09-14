@@ -1,50 +1,72 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 — 2026-09-14
 
-- Use the official LLVM 22.1.8 Linux archive for release builds, removing the
-  static Z3 source build and cache. Verify the toolchain has no Z3 dependency.
+Dodo 0.1.2 adds a portable and hosted standard library, native testing, source
+debugging, richer editor support, and Windows compiler downloads. The language
+specification remains version 0.1.
+
+- Add portable core and explicit allocation packages: uninitialized storage,
+  memory and slice utilities, caller-backed arenas and pools, and owned boxes.
+- Add byte I/O, formatting, binary views, UTF-8 text, numeric parsing, and
+  separately selected growing buffers and strings. Keep allocation explicit.
+- Add portable collections, binary64 mathematics, hashing/checksums, and
+  duration/calendar/clock contracts without requiring an OS, global allocator,
+  or libm. Generate mathematical constants independently and use integer-based
+  floating-point formatting.
+- Add independently selected Linux/Windows filesystem, process, environment,
+  native thread, and synchronization packages, with owned resources, bounded
+  output collection, and deterministic guard/thread destruction.
+- Add checked cross-thread transfer/sharing contracts, native callback
+  specialization, and integer atomics with validated memory orderings and
+  target capabilities.
+- Add portable network addresses and DNS, Linux/Windows TCP/UDP/resolver
+  providers, verified OpenSSL TLS, bounded incremental HTTP/1.1, streaming
+  clients and servers, routing/middleware, and optional rooted static files.
+  Transport, TLS, clocks, allocation, and execution remain independently selected.
+- Add checked owner-bound storage views and shared arena capabilities. Preserve
+  access modes through container borrowing, reject mutable reborrows through
+  shared aggregates, and prevent callbacks from retaining borrowed request
+  storage through external-reference assignments.
 - Add `dodo test` with recursive discovery, `@test` and `test_` functions,
   companion test files, assertions, filtering, ignored tests, captured output,
   timeouts, and isolated native execution. Report assertion values and source
-  locations for checked traps. Execute Markdown fences marked `dodo test` in CI.
-- Make self-contained standard-library fixtures and portable examples runnable
-  through native discovery, with separate core/math/time checks and executable
-  introductory, collection, hashing, allocation, math, clock, and thread docs.
-  Run the native suite at both `-O0` and `-O3` in CI.
-- Add LSP completion, definition, references, rename, signature help, and canonical
-  document formatting. Recover multiple editor diagnostics, honor the configured
-  compilation target, and add a reproducible stdio responsiveness benchmark.
+  locations, and execute Markdown fences marked `dodo test`.
+- Add source debugging with `-g`, source breakpoints, and local variables.
+  Report hosted runtime failures with their check and source location, and
+  support non-returning board failure handlers through `--panic-hook`.
+- Add LSP completion, definition, references, rename, signature help, canonical
+  document formatting, multiple diagnostics, configured compilation targets,
+  and a reproducible stdio responsiveness benchmark.
+- Publish the Dodo VS Code extension with syntax highlighting, snippets, LSP
+  integration, configuration, and restart/output commands as an installable VSIX.
 - Use `main.dodo` in the current folder for `dodo run`, `dodo check`, and
   `dodo compile`; keep `build` as an alias for `compile`. Explicit project
-  folders also select `main.dodo`; default build outputs use the project folder
-  name. Shared code lives in ordinary imported
-  subfolders, with no manifest, package manager, or special library layout.
-- Add portable network addresses/DNS, Linux/Windows TCP/UDP/resolver providers,
-  verified OpenSSL TLS, bounded incremental HTTP/1.1, streaming clients/server
-  composition, routing/middleware and optional rooted static files. Keep transport,
-  TLS, clocks, allocation and execution independently selected.
-- Reject external-reference assignments that could retain a callback's borrowed
-  request storage. Add deterministic parser mutation/fragmentation tests, independent
-  loopback interoperability, local TLS credentials, Wine peers and portable objects.
+  folders select `main.dodo`; default outputs use the project folder name.
+  Shared code uses ordinary imported subfolders, without a manifest or package
+  manager. Update existing scripts that relied on checking an entire directory
+  as one CLI package.
+- Share payload storage across enum and `Result` alternatives and initialize
+  only the active payload. Compile explicit wrapping arithmetic directly,
+  remove unreachable functions, and emit separate function/data sections.
+- Specify implemented language contracts and implementation-defined choices,
+  with expanded conformance tests and updated reference documentation.
+- Replace external JSON, LSP protocol, and file-URI dependencies with internal
+  implementations. Rename the Cargo package to `dodo`; the library remains `dodoc`.
+- Publish x86-64 Linux and Windows compiler archives with embedded LLVM,
+  examples, documentation, and dependency notices. The Windows build uses
+  static runtimes. Remove the separate checksum manifest.
+- Use the official LLVM 22.1.8 Linux archive without a Z3 dependency. Cache
+  native build dependencies, retry downloads, and improve Windows extraction
+  and release smoke tests.
+- Expand verification with native tests and executable documentation at `-O0`
+  and `-O3`, debugger and VS Code sessions, Windows/Wine programs, published hash
+  vectors, MPFR references, deterministic models, parser mutation/fragmentation,
+  independent network/TLS peers, and WebAssembly/Cortex-M0 object generation.
 
-- Add independently selected Linux/Windows filesystem, process, environment,
-  native thread, and synchronization packages, with native strings, explicit
-  allocation, owned resources, bounded output collection, and deterministic
-  guard/thread destruction. Embed their native ABI boundaries in the compiler.
-- Add checked cross-thread transfer/sharing contracts, native callback
-  specialization, and integer atomics with validated memory orderings and target
-  capabilities. Extend Wine verification with real hosted and child programs.
-- Add independently imported portable collections, binary64 mathematics,
-  hashing/checksums, and duration/calendar/clock-contract packages, with explicit
-  fallible allocation and no required OS, global allocator, or libm dependency.
-- Add checked owner-bound storage views and shared arena capabilities; preserve
-  source access modes through container borrowing and reject mutable reborrows
-  through shared aggregates. Borrow-free generic contract inputs contribute no
-  dependencies after specialization.
-- Validate native O0/O3 behavior, published hash vectors, MPFR references,
-  deterministic container/calendar models, Windows/Wine execution, and
-  WebAssembly/Cortex-M0 object generation.
+The compiler still implements a subset of the language design. See the
+[implementation status and limits](https://jotrorox.github.io/dodo/implementation/)
+for supported behavior and remaining work.
 
 ## 0.1.1 — 2026-09-11
 

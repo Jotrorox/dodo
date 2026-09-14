@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 — 2026-09-14
+
+- Publish the VSIX alongside the Dodo 0.1.2 compiler in GitHub Releases.
+- Align the extension version and installation instructions with the compiler release.
+
 ## 0.1.0
 
 - Connect to `dodo lsp` for diagnostics, completion, hover, definition, references,

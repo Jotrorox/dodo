@@ -5,7 +5,7 @@ hardware access. Its Rust and LLVM 22 compiler produces native executables,
 object files, assembly, LLVM IR, and bitcode. Ordinary generated code needs no
 garbage collector, heap allocator, scheduler, or Dodo runtime.
 
-**Compiler release: 0.1.1 · Language version: 0.1 · [BSD-2-Clause](LICENSE)**
+**Compiler release: 0.1.2 · Language version: 0.1 · [BSD-2-Clause](LICENSE)**
 
 ## Get started
 

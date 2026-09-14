@@ -14,18 +14,25 @@ client to get diagnostics, ownership information, and editing tools for `.dodo` 
 The [Dodo VS Code extension](https://github.com/Jotrorox/dodo/tree/main/editor-support/dodo-vscode)
 connects to `dodo lsp` automatically and adds syntax highlighting, bracket and
 comment support, and snippets for programs, functions, types, loops, matches,
-and tests. It requires VS Code 1.91 or newer and an installed Dodo compiler.
+and tests. It requires VS Code 1.91 or newer and Dodo 0.1.2 or newer.
 
-Build and install it from a checkout with Node.js 22 or newer:
+Download `dodo-vscode-0.1.2.vsix` from
+[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.2), then install it:
+
+```sh
+code --install-extension dodo-vscode-0.1.2.vsix
+```
+
+To build the extension from a checkout with Node.js 22 or newer:
 
 ```sh
 cd editor-support/dodo-vscode
 npm ci
 npm run package
-code --install-extension dodo-vscode-0.1.0.vsix
+code --install-extension dodo-vscode-0.1.2.vsix
 ```
 
-Alternatively, select the generated VSIX with **Extensions: Install from VSIX...**.
+Alternatively, select the VSIX with **Extensions: Install from VSIX...**.
 Open a `.dodo` file to activate the extension. It runs `dodo` from the extension
 host's PATH; set `dodo.server.path` to an executable path if needed. A source
 build can use `${workspaceFolder}/target/debug/dodo` (with `.exe` on Windows).

@@ -22,7 +22,7 @@ export PATH="$HOME/.local/bin:$PATH"
 dodo --version
 ```
 
-For this release, the output should begin with `dodo 0.1.1`. The `export` command
+For this release, the output should begin with `dodo 0.1.2`. The `export` command
 updates the current terminal; if your shell does not already include
 `~/.local/bin` on `PATH`, add that line to your shell's startup configuration as
 well.

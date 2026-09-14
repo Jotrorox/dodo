@@ -13,10 +13,10 @@ a downloaded compiler, follow [installation](installation.md) instead.
 ```sh
 git clone https://github.com/Jotrorox/dodo.git
 cd dodo
-git checkout v0.1.1
+git checkout v0.1.2
 ```
 
-The tag selects compiler release 0.1.1. For compiler development, use `main`
+The tag selects compiler release 0.1.2. For compiler development, use `main`
 instead. Run the commands on this page from the repository root.
 
 ## Install build prerequisites
@@ -132,7 +132,7 @@ rustup component add rust-docs
 python scripts/build-windows-llvm-support.py
 cargo build --locked --release --bin dodo --target x86_64-pc-windows-msvc
 python scripts/package-release.py --target x86_64-pc-windows-msvc
-python scripts/test_windows_release.py build/release-assets/dodo-0.1.1-x86_64-pc-windows-msvc.zip --linker clang
+python scripts/test_windows_release.py build/release-assets/dodo-0.1.2-x86_64-pc-windows-msvc.zip --linker clang
 ```
 
 The support script requires CMake and Visual Studio 2022. It builds the static

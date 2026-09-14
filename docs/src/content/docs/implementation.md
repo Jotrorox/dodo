@@ -1,17 +1,17 @@
 ---
 title: "Compiler support and limits"
-description: "What Dodo 0.1.1 implements, where to find reference details, and which design features remain open."
+description: "What Dodo 0.1.2 implements, where to find reference details, and which design features remain open."
 section: "Language reference"
 order: 200
 ---
 
-Dodo 0.1.1 implements a hosted compiler, local packages, checked borrowing,
+Dodo 0.1.2 implements a hosted compiler, local packages, checked borrowing,
 and target object emission. This guide describes compiler behavior. The
 [0.1 language specification](language-spec-0.1.md) defines the retained language
 rules and connects them to conformance tests. Its Appendix C records the
 implementation-defined choices for this compiler and the excluded features.
 
-Compiler releases and language versions are separate: this compiler is 0.1.1,
+Compiler releases and language versions are separate: this compiler is 0.1.2,
 and the language specification remains 0.1. The implemented September 2026
 ergonomics revision includes name-first declarations, immutable `let` bindings,
 final-expression returns, inference, patterns, and canonical formatting.

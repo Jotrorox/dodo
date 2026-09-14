@@ -10,11 +10,24 @@ built-in `dodo lsp` language server.
 - Comment toggling, bracket pairing, indentation, folding, and snippets.
 - Unsaved file and untitled buffer support, with compiler target and package-checking settings.
 
-## Install from source
+## Install
 
-Install [Dodo](https://jotrorox.github.io/dodo/installation/) 0.1.1 or newer and
+Install [Dodo](https://jotrorox.github.io/dodo/installation/) 0.1.2 or newer and
 ensure `dodo --version` works. The extension uses an existing compiler; the VSIX
 does not contain the compiler or LLVM.
+
+Download `dodo-vscode-0.1.2.vsix` from
+[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.2), then run:
+
+```sh
+code --install-extension dodo-vscode-0.1.2.vsix
+```
+
+You can also use **Extensions: Install from VSIX...** in VS Code and select the
+downloaded file. Open a `.dodo` file to activate the extension. VS Code 1.91 or
+newer is required.
+
+### Build from source
 
 With Node.js 22 or newer, run these commands from this repository's root:
 
@@ -22,12 +35,12 @@ With Node.js 22 or newer, run these commands from this repository's root:
 cd editor-support/dodo-vscode
 npm ci
 npm run package
-code --install-extension dodo-vscode-0.1.0.vsix
+code --install-extension dodo-vscode-0.1.2.vsix
 ```
 
-You can also use **Extensions: Install from VSIX...** in VS Code and select the
-generated file. Open a `.dodo` file to activate the extension. VS Code 1.91 or
-newer is required. Building the VSIX does not require Rust or LLVM.
+Building the VSIX does not require Rust or LLVM.
+
+### Configure the compiler
 
 If Dodo is not on the extension host's PATH, set **Dodo: Server Path** to the
 compiler executable. Paths with spaces work without shell quoting:
