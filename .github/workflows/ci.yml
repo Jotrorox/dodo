@@ -50,6 +50,7 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
       - name: Install LLVM 22 from the official signed repository
+        id: llvm
         shell: bash
         run: |
           set -euo pipefail
@@ -61,7 +62,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y llvm-22-dev libpolly-22-dev clang-22 build-essential zlib1g-dev libzstd-dev libffi-dev libz3-dev cmake ninja-build gdb xvfb
           /usr/lib/llvm-22/bin/llvm-config --version
+          # Rebuild native caches when the installed compiler or libraries change.
+          fingerprint=$({
+            cc --version
+            c++ --version
+            dpkg-query -W llvm-22-dev libpolly-22-dev clang-22 gcc g++ libc6-dev zlib1g-dev libzstd-dev libffi-dev libz3-dev cmake ninja-build
+          } | sha256sum | cut -d ' ' -f 1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+      - name: Restore OpenSSL for TLS fixtures
+        id: openssl-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/dodo-openssl
+          # The workflow contains the source checksum and Configure options.
+          key: openssl-ubuntu-24.04-${{ runner.arch }}-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Build the maintained OpenSSL backend for TLS fixtures
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -75,9 +91,30 @@ jobs:
           make -j2
           # install_sw omits openssl.cnf, which TLS credential generation needs.
           make install_sw install_ssldirs
+      - name: Configure OpenSSL for TLS fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_tls_prefix="$RUNNER_TEMP/dodo-openssl"
+          test -s "$test_tls_prefix/ssl/openssl.cnf"
+          "$test_tls_prefix/bin/openssl" version
           echo "CPATH=$test_tls_prefix/include" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$test_tls_prefix/lib" >> "$GITHUB_ENV"
           echo "$test_tls_prefix/bin" >> "$GITHUB_PATH"
+      # Save native dependencies before later tests can fail or cancel the job.
+      - name: Save OpenSSL for TLS fixtures
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/dodo-openssl
+          key: ${{ steps.openssl-cache.outputs.cache-primary-key }}
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ubuntu-24.04-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/ci.yml', 'scripts/build-release.sh', 'scripts/link-static.sh', 'scripts/build-static-z3.sh') }}
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS CPATH LIBRARY_PATH
+          cache-bin: false
+          cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Test ELF dependency checks
@@ -117,13 +154,28 @@ jobs:
         run: bash scripts/build-release.sh
       - name: Verify release only needs standard Linux runtime libraries
         run: python3 scripts/check-linkage.py target/x86_64-unknown-linux-gnu/release/dodo --release
-      - name: Build and verify fully static size-focused compiler
-        shell: bash
+      - name: Restore static Z3
+        id: z3-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/static-deps
+          key: z3-ubuntu-24.04-${{ runner.arch }}-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('scripts/build-static-z3.sh', '.github/workflows/ci.yml') }}
+      - name: Build static Z3
+        if: steps.z3-cache.outputs.cache-hit != 'true'
         env:
           CMAKE_BUILD_PARALLEL_LEVEL: 4
+        run: bash scripts/build-static-z3.sh
+      - name: Save static Z3
+        if: steps.z3-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/static-deps
+          key: ${{ steps.z3-cache.outputs.cache-primary-key }}
+      - name: Build and verify fully static size-focused compiler
+        shell: bash
         run: |
           set -euo pipefail
-          bash scripts/build-static-z3.sh
+          test -s target/static-deps/lib/libz3.a
           export LIBRARY_PATH="$PWD/target/static-deps/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
           bash scripts/build-release.sh release-small-static
       - name: Compile and run without an LLVM installation
@@ -185,7 +237,22 @@ jobs:
           toolchain: 1.95.0
           components: rust-docs
           targets: x86_64-pc-windows-msvc
+      - name: Configure Windows LLVM
+        id: windows-toolchain
+        shell: pwsh
+        run: |
+          $prefix = "$env:RUNNER_TEMP/llvm-windows"
+          "LLVM_SYS_221_PREFIX=$prefix" >> $env:GITHUB_ENV
+          "$prefix/bin" >> $env:GITHUB_PATH
+          "image=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+      - name: Restore Windows LLVM and static XML support
+        id: windows-llvm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/llvm-windows
+          key: llvm-windows-2022-${{ runner.arch }}-${{ steps.windows-toolchain.outputs.image }}-${{ hashFiles('.github/workflows/ci.yml', 'scripts/build-windows-llvm-support.py') }}
       - name: Install the official LLVM 22 Windows development archive
+        if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -198,10 +265,22 @@ jobs:
           New-Item -ItemType Directory -Path $prefix | Out-Null
           tar -xJf $archive -C $prefix --strip-components=1
           if ($LASTEXITCODE -ne 0) { throw 'LLVM archive extraction failed' }
-          "LLVM_SYS_221_PREFIX=$prefix" >> $env:GITHUB_ENV
-          "$prefix/bin" >> $env:GITHUB_PATH
       - name: Build LLVM's missing static XML library and collect notices
+        if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
         run: python scripts/build-windows-llvm-support.py
+      - name: Save Windows LLVM and static XML support
+        if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/llvm-windows
+          key: ${{ steps.windows-llvm-cache.outputs.cache-primary-key }}
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ steps.windows-llvm-cache.outputs.cache-primary-key }}
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS
+          cache-bin: false
+          cache-on-failure: true
       - name: Build the Windows compiler with static runtimes
         run: cargo build --locked --release --bin dodo --target x86_64-pc-windows-msvc
       - name: Package the Windows release

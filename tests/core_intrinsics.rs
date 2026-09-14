@@ -132,6 +132,10 @@ fn wrapping_arithmetic_emits_plain_operations_at_each_target_width() {
                 "pub fn {operation}_{ty}(a: {ty}, b: {ty}) -> {ty} {{ return core.wrapping_{operation}(a, b) }}\n"
             ));
         }
+        // Keep the imported helper reachable so its lowering is exercised too.
+        source.push_str(&format!(
+            "pub fn num_{operation}(a: usize, b: usize) -> usize {{ return num.wrapping_{operation}(a, b) }}\n"
+        ));
     }
     let input = workspace.source(&source);
     for (target, pointer_width) in [
@@ -167,7 +171,14 @@ fn wrapping_arithmetic_emits_plain_operations_at_each_target_width() {
                         (format!("{operation}_{ty}"), width)
                     })
                     .collect::<Vec<_>>();
-                functions.push((format!("num.wrapping_{operation}"), pointer_width));
+                // At O0 the helper owns the operation; at O3 it is inlined into
+                // the exported wrapper and its internal definition is removed.
+                let num_function = if level == "0" {
+                    format!("num.wrapping_{operation}")
+                } else {
+                    format!("num_{operation}")
+                };
+                functions.push((num_function, pointer_width));
                 for (name, width) in functions {
                     let definition = ir
                         .split("\ndefine ")
