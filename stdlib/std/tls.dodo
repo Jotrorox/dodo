@@ -13,6 +13,50 @@ pub struct Error {
     // Numeric backend/verification code only; never credentials or plaintext.
     pub code: i32
     pub transferred: usize
+    // Only fixed kind names and numeric metadata; never input or native messages.
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("tls: ")?
+        match &self.kind {
+            ErrorKind.InvalidInput => {
+                output.string("InvalidInput")?
+            }
+            ErrorKind.AllocationFailed => {
+                output.string("AllocationFailed")?
+            }
+            ErrorKind.VerificationFailed => {
+                output.string("VerificationFailed")?
+            }
+            ErrorKind.Protocol => {
+                output.string("Protocol")?
+            }
+            ErrorKind.Truncated => {
+                output.string("Truncated")?
+            }
+            ErrorKind.Closed => {
+                output.string("Closed")?
+            }
+            ErrorKind.Transport => {
+                output.string("Transport")?
+            }
+            ErrorKind.Cancelled => {
+                output.string("Cancelled")?
+            }
+            ErrorKind.TimedOut => {
+                output.string("TimedOut")?
+            }
+            ErrorKind.Backend => {
+                output.string("Backend")?
+            }
+            ErrorKind.LimitExceeded => {
+                output.string("LimitExceeded")?
+            }
+        }
+        output.string(" code=")?
+        output.decimal(self.code as i64)?
+        output.string(" transferred=")?
+        output.natural(self.transferred as u64)?
+        return ok()
+    }
 }
 pub fn failure(kind: ErrorKind, code: i32) -> Error {
     return Error { kind: kind, code: code, transferred: 0 }

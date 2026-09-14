@@ -1,5 +1,7 @@
 package net
 
+import "std/io"
+
 // Portable addresses and operation policy: no OS, allocator, clock or scheduler.
 pub enum Family {
     V4, V6
@@ -11,6 +13,62 @@ pub enum ErrorKind {
 }
 pub struct Error {
     pub kind: ErrorKind, pub code: i32, pub transferred: usize
+    // Only fixed kind names and numeric metadata; never input or native messages.
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("net: ")?
+        match &self.kind {
+            ErrorKind.InvalidAddress => {
+                output.string("InvalidAddress")?
+            }
+            ErrorKind.BufferTooSmall => {
+                output.string("BufferTooSmall")?
+            }
+            ErrorKind.InvalidInput => {
+                output.string("InvalidInput")?
+            }
+            ErrorKind.WouldBlock => {
+                output.string("WouldBlock")?
+            }
+            ErrorKind.Interrupted => {
+                output.string("Interrupted")?
+            }
+            ErrorKind.TimedOut => {
+                output.string("TimedOut")?
+            }
+            ErrorKind.Cancelled => {
+                output.string("Cancelled")?
+            }
+            ErrorKind.Closed => {
+                output.string("Closed")?
+            }
+            ErrorKind.ConnectionReset => {
+                output.string("ConnectionReset")?
+            }
+            ErrorKind.ConnectionRefused => {
+                output.string("ConnectionRefused")?
+            }
+            ErrorKind.AddressInUse => {
+                output.string("AddressInUse")?
+            }
+            ErrorKind.NetworkUnreachable => {
+                output.string("NetworkUnreachable")?
+            }
+            ErrorKind.NameNotFound => {
+                output.string("NameNotFound")?
+            }
+            ErrorKind.Exhausted => {
+                output.string("Exhausted")?
+            }
+            ErrorKind.Other => {
+                output.string("Other")?
+            }
+        }
+        output.string(" code=")?
+        output.decimal(self.code as i64)?
+        output.string(" transferred=")?
+        output.natural(self.transferred as u64)?
+        return ok()
+    }
 }
 pub fn failure(kind: ErrorKind) -> Error {
     return Error { kind: kind, code: 0, transferred: 0 }

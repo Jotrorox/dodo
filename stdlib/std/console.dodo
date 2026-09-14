@@ -1,0 +1,62 @@
+package console
+
+import "std/platform/native"
+import "std/io"
+import "std/fmt"
+
+// Unbuffered borrowed process streams. No allocation, implicit flush, ownership
+// transfer, or close-on-drop. Calls may block; separate wrappers may interleave.
+// Bytes are passed through unchanged, including LF on both hosted targets.
+pub struct Input {
+    handle: native.BorrowedHandle
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!io.Error {
+        return self.handle.read(destination)
+    }
+    pub fn read_line(&mut self, destination: &mut[u8]) -> io.Line!io.Error {
+        return io.read_line(self, destination)
+    }
+}
+pub struct Output {
+    handle: native.BorrowedHandle
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        return self.handle.write(source)
+    }
+    pub fn print(&mut self, text: &str) -> usize!io.Error {
+        return fmt.print(self, text)
+    }
+    pub fn println(&mut self, text: &str) -> usize!io.Error {
+        return fmt.println(self, text)
+    }
+    pub fn print_value<T>(&mut self, value: &T) -> usize!io.Error {
+        return fmt.value(self, value)
+    }
+    pub fn println_value<T>(&mut self, value: &T) -> usize!io.Error {
+        return fmt.value_line(self, value)
+    }
+}
+pub fn stdin() -> Input {
+    return Input { handle: native.stdin() }
+}
+pub fn stdout() -> Output {
+    return Output { handle: native.stdout() }
+}
+pub fn stderr() -> Output {
+    return Output { handle: native.stderr() }
+}
+
+pub fn print(text: &str) -> usize!io.Error {
+    output := stdout()
+    return output.print(text)
+}
+pub fn println(text: &str) -> usize!io.Error {
+    output := stdout()
+    return output.println(text)
+}
+pub fn print_value<T>(value: &T) -> usize!io.Error {
+    output := stdout()
+    return output.print_value(value)
+}
+pub fn println_value<T>(value: &T) -> usize!io.Error {
+    output := stdout()
+    return output.println_value(value)
+}

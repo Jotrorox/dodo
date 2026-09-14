@@ -1,0 +1,26 @@
+package platform
+
+import "core/mem"
+import "std/platform/native"
+import "std/platform/error"
+
+pub enum TextPolicy {
+    Strict, Replace
+}
+// 4096 native units, including NUL: bytes on Linux, UTF-16 units on Windows.
+pub fn workspace() -> native.Workspace {
+    return native.Workspace.new()
+}
+// 32768 native units, one NUL per element. No hidden growth or allocation.
+pub fn list_workspace() -> native.ListWorkspace {
+    return native.ListWorkspace.new()
+}
+// Strict rejects malformed native text; Replace emits U+FFFD per malformed
+// byte (Linux) or unpaired surrogate (Windows). Output excludes NUL. On error
+// output may contain a converted prefix, but no valid string is returned.
+pub fn decode(value: &native.NativeString, output: &mut[u8], policy: &TextPolicy) -> &str!error.Error from(output) {
+    used := native.to_utf8(value, output, *policy == TextPolicy.Replace)?
+    return ok(unsafe {
+        mem.str_from_utf8(&output[..used])
+    })
+}

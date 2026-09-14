@@ -52,7 +52,7 @@ def main():
             programs = {}
             for example in ("http_client", "web_server", "http_memory"):
                 source = scratch / f"{example}.dodo"
-                source.write_text((ROOT / f"examples/{example}.dodo").read_text().replace(":8080", f":{number}"))
+                source.write_text((ROOT / f"examples/{example}.dodo").read_text().replace(":8080", f":{number}").replace("config.max_connections = 0", "config.max_connections = 1"))
                 executable = scratch / f"{example}-{optimization}"
                 run([compiler, "build", str(source), "-O", str(optimization), "-o", str(executable)])
                 programs[example] = executable
@@ -62,7 +62,7 @@ def main():
                 if case != "dodo_client":
                     number = port()
                     source = scratch / "web_server.dodo"
-                    source.write_text((ROOT / "examples/web_server.dodo").read_text().replace(":8080", f":{number}"))
+                    source.write_text((ROOT / "examples/web_server.dodo").read_text().replace(":8080", f":{number}").replace("config.max_connections = 0", "config.max_connections = 1"))
                     run([compiler, "build", str(source), "-O", str(optimization), "-o", str(programs["web_server"])])
                 process = subprocess.Popen([str(programs["web_server"])], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
@@ -95,13 +95,17 @@ def main():
                                 assert response.status == 200 and response.read() == b"Hello, Dodo!\n"
                             elif case == "malformed":
                                 stream.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nxx")
-                                assert stream.recv(1024) == b""
+                                response = http.client.HTTPResponse(stream)
+                                response.begin()
+                                assert response.status == 400 and response.read() == b""
                             else:
                                 stream.sendall(b"GET / HTTP/1.1\r\nHost:")
                                 stream.shutdown(socket.SHUT_WR)
-                                assert stream.recv(1024) == b""
+                                response = http.client.HTTPResponse(stream)
+                                response.begin()
+                                assert response.status == 400 and response.read() == b""
                     stdout, stderr = process.communicate(timeout=10)
-                    expected = 8 if case in ("malformed", "disconnect") else 0
+                    expected = 0
                     if process.returncode != expected:
                         raise RuntimeError(f"{case} server: {process.returncode}, expected {expected}: {stdout!r} {stderr!r}")
                 finally:

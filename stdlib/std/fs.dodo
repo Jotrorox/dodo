@@ -46,6 +46,12 @@ pub struct File {
     pub fn open(path: &native.NativeString, options: &OpenOptions) -> File!error.Error {
         return open_with_options(path, options, 438, 7)
     }
+    // UTF-8 path, no retained workspace borrow after opening.
+    pub fn open_utf8(path: &str, options: &OpenOptions, workspace: &mut native.Workspace) -> File!error.Error {
+        workspace.set(path)?
+        name := workspace.get()?
+        return File.open(&name, options)
+    }
     pub fn read(&mut self, destination: &mut[u8]) -> usize!io.Error {
         return self.handle.read(destination)
     }
@@ -208,4 +214,88 @@ pub fn copy_new(source: &native.NativeString, destination: &native.NativeString,
         }
     }
     return ok(report)
+}
+
+// Progress always counts bytes retained in caller storage or accepted by the
+// file. Native errors retain their domain/code, including open and close errors.
+pub struct FileError {
+    pub cause: error.Error
+    pub transferred: usize
+}
+fn transfer_error(reason: io.Error) -> FileError {
+    cause := error.failure(error.Kind.Other)
+    if reason.code != 0 {
+        cause = native.from_code(reason.code)
+    } else {
+        if reason.kind == io.ErrorKind.InvalidInput {
+            cause.kind = error.Kind.InvalidInput
+        }
+        if reason.kind == io.ErrorKind.Interrupted {
+            cause.kind = error.Kind.Interrupted
+        }
+        if reason.kind == io.ErrorKind.WouldBlock {
+            cause.kind = error.Kind.WouldBlock
+        }
+        if reason.kind == io.ErrorKind.Closed {
+            cause.kind = error.Kind.Closed
+        }
+    }
+    return FileError { cause: cause, transferred: reason.transferred }
+}
+// Reads from a fresh cursor. eof=false means capacity exhaustion, not success
+// reading the whole file. Exact capacity uses a discarded one-byte EOF probe.
+// Errors retain output[..transferred]; opening failure leaves output untouched.
+// Concurrent writers can change the contents: this is not an atomic snapshot.
+pub fn read_file(path: &str, output: &mut[u8], workspace: &mut native.Workspace) -> io.ReadReport!FileError {
+    options := OpenOptions.read_only()
+    file := match File.open_utf8(path, &options, workspace) {
+        ok(value) => {
+            value
+        },
+        err(reason) => {
+            return err(FileError { cause: reason, transferred: 0 })
+        }
+    }
+    report := match io.read_bounded(&mut file, output) {
+        ok(value) => {
+            value
+        }, err(reason) => {
+            return err(transfer_error(reason))
+        }
+    }
+    match file.close() {
+        ok() => {}, err(reason) => {
+            return err(FileError { cause: reason, transferred: report.read })
+        }
+    }
+    return ok(report)
+}
+// Creates a missing file; truncates an existing file to zero before writing.
+// Follows symlinks, uses Unix 0666 filtered by umask / Windows sharing 7.
+// Empty input still creates/truncates. No atomic replacement or sync is implied.
+// On failure a partial/truncated file remains. Use OpenOptions.create_new()
+// with File.open_utf8 and io.write_all for exclusive creation instead.
+pub fn write_file(path: &str, input: &[u8], workspace: &mut native.Workspace) -> void!FileError {
+    options := OpenOptions.new()
+    options.write = true
+    options.create = true
+    options.truncate = true
+    file := match File.open_utf8(path, &options, workspace) {
+        ok(value) => {
+            value
+        }, err(reason) => {
+            return err(FileError { cause: reason, transferred: 0 })
+        }
+    }
+    match io.write_all(&mut file, input) {
+        ok(_) => {}, err(reason) => {
+            return err(transfer_error(reason))
+        }
+    }
+    match file.close() {
+        ok() => {}, err(reason) => {
+            return err(FileError { cause: reason, transferred: input.len })
+        }
+    }
+    return ok()
 }

@@ -73,7 +73,7 @@ def main():
 
             def build(name, optimization, port):
                 source = scratch / f"{name}-{optimization}.dodo"
-                source.write_text((ROOT / "examples" / f"{name}.dodo").read_text().replace("8080", str(port)))
+                source.write_text((ROOT / "examples" / f"{name}.dodo").read_text().replace("8080", str(port)).replace("config.max_connections = 0", "config.max_connections = 1"))
                 package = re.search(r"^package\s+(\w+)", source.read_text()).group(1)
                 startup = scratch / f"startup-{name}.c"
                 startup.write_text(RUNTIME.replace("PACKAGE", package))
