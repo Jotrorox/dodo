@@ -63,6 +63,55 @@ channel's log level to **Trace** with **Developer: Set Log Level** for protocol
 logs; `dodo.trace.server` selects message or verbose detail. Highlighting and snippets work without the
 compiler; the language server runs only in trusted workspaces.
 
+## Zed
+
+The [Dodo Zed extension](https://github.com/Jotrorox/dodo/tree/main/editor-support/dodo-zed)
+connects to `dodo lsp` and adds Tree-sitter syntax highlighting, bracket pairing,
+comment toggling, indentation, function/type outlines, and Vim text objects.
+It requires Zed 0.205 or newer and Dodo 0.1.2 or newer for LSP features.
+
+The extension currently installs from a source checkout. With Rust, Python 3.11
+or newer, and Git installed, run from the repository root:
+
+```sh
+python3 editor-support/dodo-zed/prepare-dev.py
+```
+
+Run **zed: install dev extension** in Zed's command palette and select the
+generated `build/dodo-zed` directory. Zed builds the extension and its local grammar
+snapshot; it downloads the WebAssembly toolchain as needed. Keep both
+`build/dodo-zed` and `build/tree-sitter-dodo` available while using the extension.
+Then open a `.dodo` file. Highlighting works without the compiler installed.
+
+The server uses `dodo` on the worktree's PATH. To use another executable or set
+the checking mode and compilation target, add to Zed's settings:
+
+```json
+{
+  "lsp": {
+    "dodo": {
+      "binary": { "path": "/absolute/path/to/dodo" },
+      "initialization_options": {
+        "checkMode": "package",
+        "target": "wasm32-unknown-unknown"
+      }
+    }
+  },
+  "languages": {
+    "Dodo": {
+      "formatter": "language_server",
+      "format_on_save": "on"
+    }
+  }
+}
+```
+
+Omit these options to use file checking and the host compilation target. The
+extension supplies the `lsp` argument automatically. Use **editor: restart
+language server** after rebuilding Dodo or changing initialization options, and
+**zed: open log** to inspect startup errors. See the extension's README for
+development and test commands.
+
 ## Start the language server
 
 Configure your editor's LSP client with these settings:

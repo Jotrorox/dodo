@@ -13,6 +13,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  zed:
+    name: Zed extension and Tree-sitter grammar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: editor-support/tree-sitter-dodo/package-lock.json
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+          targets: wasm32-wasip2
+      - name: Test grammar, highlights, and Zed queries
+        working-directory: editor-support/tree-sitter-dodo
+        run: |
+          npm ci
+          npm test
+          git diff --exit-code -- src
+      - name: Check and build the extension
+        working-directory: editor-support/dodo-zed
+        run: |
+          cargo fmt -- --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo build --locked --release --target wasm32-wasip2
+          python3 -m unittest discover -p 'test_*.py'
+          python3 prepare-dev.py
+
   vscode:
     name: VS Code extension
     runs-on: ubuntu-24.04

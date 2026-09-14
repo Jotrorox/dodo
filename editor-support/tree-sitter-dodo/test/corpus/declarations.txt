@@ -1,0 +1,223 @@
+==================
+Declarations, generics, methods, and borrowed results
+==================
+package sample
+import "core/bytes" as bytes
+@repr(C)
+pub struct Box<T> {
+    value: T
+    fn view(&self) -> &T from(self) { return &self.value }
+}
+enum State { Ready, Failed(code: i32) }
+extern fn read() -> &mut [u8]!error.Error
+fn nested() -> Option<Result<i32, error.Error>> { return none }
+fn array() -> [4]u8 { return [0u8; 4] }
+
+---
+
+(source_file
+  (package_clause
+    (identifier))
+  (import_clause
+    (string_literal)
+    (identifier))
+  (attribute
+    (identifier)
+    (parenthesized_group
+      (identifier)))
+  (keyword)
+  (struct_declaration
+    (identifier)
+    (type_parameters
+      (identifier))
+    (block
+      (identifier)
+      (identifier)
+      (function_declaration
+        (identifier)
+        (parenthesized_group
+          (operator)
+          (identifier))
+        (reference_type
+          (named_type
+            (identifier)))
+        (borrow_clause
+          (parenthesized_group
+            (identifier)))
+        (block
+          (keyword)
+          (operator)
+          (identifier)
+          (identifier)))))
+  (enum_declaration
+    (identifier)
+    (block
+      (identifier)
+      (identifier)
+      (parenthesized_group
+        (identifier)
+        (primitive_type))))
+  (keyword)
+  (function_declaration
+    (identifier)
+    (parenthesized_group)
+    (result_type
+      (reference_type
+        (slice_type
+          (named_type
+            (primitive_type))))
+      (named_type
+        (identifier)
+        (identifier))))
+  (function_declaration
+    (identifier)
+    (parenthesized_group)
+    (named_type
+      (identifier)
+      (type_arguments
+        (named_type
+          (identifier)
+          (type_arguments
+            (named_type
+              (primitive_type))
+            (named_type
+              (identifier)
+              (identifier))))))
+    (block
+      (keyword)
+      (none)))
+  (function_declaration
+    (identifier)
+    (parenthesized_group)
+    (array_type
+      (bracketed_group
+        (integer_literal))
+      (named_type
+        (primitive_type)))
+    (block
+      (keyword)
+      (bracketed_group
+        (integer_literal)
+        (integer_literal)))))
+
+==================
+Comments, strings, and every numeric literal form
+==================
+// fn fake() { this is not code }
+"hello\n\u{1f426}" b"//path/../file" b'\x41' "" b"" b' '
+0 1_000usize 0xffu8 0o755u32 0b1010i64 1.5 2e-3f32 3f64
+
+---
+
+(source_file
+  (comment)
+  (string_literal
+    (escape_sequence)
+    (escape_sequence))
+  (byte_string_literal)
+  (byte_literal
+    (escape_sequence))
+  (string_literal)
+  (byte_string_literal)
+  (byte_literal)
+  (integer_literal)
+  (integer_literal)
+  (integer_literal)
+  (integer_literal)
+  (integer_literal)
+  (float_literal)
+  (float_literal)
+  (float_literal))
+
+==================
+Balanced groups, pattern matching, and newline continuations
+==================
+fn main() {
+    values := [1, 2, 3]
+    let value = match some(values[0]) {
+        some(n) if n > 0 => n,
+        none | some(_) => { 0 },
+    }
+    for i, &n in values {
+        assert_eq(identity::<i32>(n), values[i])
+    }
+    let first = Buffer { value }.view()
+        .map(
+            value +
+            1,
+        )?
+}
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parenthesized_group)
+    (block
+      (identifier)
+      (operator)
+      (bracketed_group
+        (integer_literal)
+        (integer_literal)
+        (integer_literal))
+      (keyword)
+      (identifier)
+      (operator)
+      (keyword)
+      (identifier)
+      (parenthesized_group
+        (identifier)
+        (bracketed_group
+          (integer_literal)))
+      (block
+        (identifier)
+        (parenthesized_group
+          (identifier))
+        (keyword)
+        (identifier)
+        (operator)
+        (integer_literal)
+        (operator)
+        (identifier)
+        (none)
+        (operator)
+        (identifier)
+        (parenthesized_group
+          (identifier))
+        (operator)
+        (block
+          (integer_literal)))
+      (keyword)
+      (identifier)
+      (operator)
+      (identifier)
+      (keyword)
+      (identifier)
+      (block
+        (identifier)
+        (parenthesized_group
+          (generic_call
+            (identifier)
+            (type_arguments
+              (named_type
+                (primitive_type)))
+            (parenthesized_group
+              (identifier)))
+          (identifier)
+          (bracketed_group
+            (identifier))))
+      (keyword)
+      (identifier)
+      (operator)
+      (identifier)
+      (block
+        (identifier))
+      (identifier)
+      (parenthesized_group)
+      (identifier)
+      (parenthesized_group
+        (identifier)
+        (operator)
+        (integer_literal))
+      (operator))))

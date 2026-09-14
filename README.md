@@ -77,8 +77,9 @@ breakpoints and local variables. Hosted runtime checks report their kind and
 location; embedded builds can select a non-returning C ABI board handler with
 `--panic-hook` for fault reporting, halt, or reset behavior. For
 diagnostics, completion, navigation, rename, signature help, and formatting,
-install the [Dodo VS Code extension](editor-support/dodo-vscode), which also adds
-syntax highlighting and snippets, or configure your editor's LSP client to run
+install the [Dodo VS Code extension](editor-support/dodo-vscode) or
+[Dodo Zed extension](editor-support/dodo-zed), which also add syntax highlighting,
+or configure your editor's LSP client to run
 `dodo lsp` and follow the
 [editor setup guide](https://jotrorox.github.io/dodo/editors/).
 
