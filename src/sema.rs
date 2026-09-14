@@ -2606,11 +2606,26 @@ impl<'a> Checker<'a> {
                     _ => None,
                 }
             }
-            ExprKind::Call { name, .. } => self
+            ExprKind::Call {
+                name,
+                type_args,
+                args,
+            } => self
                 .context
                 .functions
                 .get(name)
                 .map(|f| f.ret.clone())
+                .or_else(|| {
+                    intrinsic_result_type(
+                        name,
+                        type_args,
+                        &args
+                            .iter()
+                            .map(|arg| self.peek_type(arg).unwrap_or(Type::Unknown))
+                            .collect::<Vec<_>>(),
+                    )
+                    .filter(|ty| *ty != Type::Unknown)
+                })
                 .or_else(|| {
                     name.rsplit_once('.')
                         .filter(|(n, _)| self.context.enums.contains_key(*n))
@@ -3099,7 +3114,7 @@ impl<'a> Checker<'a> {
         };
         if normalized.starts_with("core.") {
             *name = normalized;
-            return self.intrinsic(name, type_args, args, span);
+            return self.intrinsic(name, type_args, args, expected, span);
         }
         let signature = self
             .context
@@ -3170,8 +3185,50 @@ impl<'a> Checker<'a> {
         name: &str,
         type_args: &[Type],
         args: &mut [Expr],
+        expected: Option<&Type>,
         span: Span,
     ) -> Check<Value> {
+        if matches!(
+            name,
+            "core.wrapping_add" | "core.wrapping_sub" | "core.wrapping_mul"
+        ) {
+            if type_args.len() > 1 || args.len() != 2 {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("{name} expects two arguments and at most one type argument"),
+                ));
+            }
+            let inferred = type_args
+                .first()
+                .cloned()
+                .or_else(|| expected.filter(|t| t.is_integer()).cloned())
+                .or_else(|| self.peek_type(&args[0]))
+                .or_else(|| self.peek_type(&args[1]));
+            if let Some(ty) = &inferred
+                && !ty.is_integer()
+            {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("{name} requires an integer type, found `{ty}`"),
+                ));
+            }
+            let lhs = self.expr(&mut args[0], inferred.as_ref(), false)?;
+            if !lhs.ty.is_integer() {
+                return Err(Diagnostic::new(
+                    args[0].span,
+                    format!("{name} requires an integer type, found `{}`", lhs.ty),
+                ));
+            }
+            if let Some(ty) = inferred {
+                self.expect(&ty, &lhs.ty, args[0].span)?;
+            }
+            let rhs = self.expr(&mut args[1], Some(&lhs.ty), false)?;
+            self.expect(&lhs.ty, &rhs.ty, args[1].span)?;
+            return Ok(Value {
+                ty: lhs.ty,
+                deps: vec![],
+            });
+        }
         if matches!(name, "core.assert" | "core.assert_eq" | "core.assert_ne") {
             let count = if name == "core.assert" { 1 } else { 2 };
             if !type_args.is_empty() || !(count..=count + 1).contains(&args.len()) {
@@ -6186,6 +6243,23 @@ impl Expander {
                     }
                     self.ty(&mut ret, substitutions, span)?;
                     ret
+                } else if matches!(
+                    name.as_str(),
+                    "core.wrapping_add" | "core.wrapping_sub" | "core.wrapping_mul"
+                ) {
+                    let mut inferred = type_args
+                        .first()
+                        .cloned()
+                        .or_else(|| expected.filter(|t| t.is_integer()).cloned())
+                        .or_else(|| {
+                            args.iter()
+                                .find_map(|arg| self.guess(arg).filter(|ty| *ty != Type::Unknown))
+                        });
+                    for arg in args.iter_mut() {
+                        let actual = self.expression(arg, substitutions, inferred.as_ref())?;
+                        inferred.get_or_insert(actual);
+                    }
+                    inferred.unwrap_or(Type::Unknown)
                 } else if intrinsic_result_type(name, type_args, &[]).is_some() {
                     let mut actuals = Vec::new();
                     for arg in args.iter_mut() {
@@ -6427,8 +6501,20 @@ fn specialized(name: &str, arguments: &[Type]) -> String {
 }
 
 // Intrinsic return shapes are needed before full checking so generic callers can
-// infer their parameters from a pointer or storage-producing expression.
+// infer their parameters from an intrinsic expression.
 fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -> Option<Type> {
+    if matches!(
+        name,
+        "core.wrapping_add" | "core.wrapping_sub" | "core.wrapping_mul"
+    ) {
+        return Some(
+            types
+                .first()
+                .or_else(|| args.iter().find(|t| **t != Type::Unknown))
+                .cloned()
+                .unwrap_or(Type::Unknown),
+        );
+    }
     let name = name.strip_prefix("core.").unwrap_or(name);
     let first = args.first().cloned().unwrap_or(Type::Unknown);
     let explicit = types.first().cloned().unwrap_or(Type::Unknown);

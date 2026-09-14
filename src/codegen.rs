@@ -2262,6 +2262,22 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         ret: &Type,
     ) -> Result<BasicValueEnum<'ctx>> {
         let unit = self.context.i8_type().const_zero().into();
+        if matches!(
+            name,
+            "core.wrapping_add" | "core.wrapping_sub" | "core.wrapping_mul"
+        ) {
+            let a = self.expr(&args[0])?.into_int_value();
+            let b = self.expr(&args[1])?.into_int_value();
+            // Plain LLVM integer operations wrap modulo 2^N. Do not attach
+            // no-wrap flags or route these through checked arithmetic.
+            return Ok(match name {
+                "core.wrapping_add" => self.builder.build_int_add(a, b, "wrapping.add")?,
+                "core.wrapping_sub" => self.builder.build_int_sub(a, b, "wrapping.sub")?,
+                "core.wrapping_mul" => self.builder.build_int_mul(a, b, "wrapping.mul")?,
+                _ => unreachable!(),
+            }
+            .into());
+        }
         if matches!(name, "core.assert" | "core.assert_eq" | "core.assert_ne") {
             let count = if name == "core.assert" { 1 } else { 2 };
             let values = args

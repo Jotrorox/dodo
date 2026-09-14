@@ -50,6 +50,10 @@ are statically dispatched; associated functions use `Type.name(...)`.
 calls with compiler lowering, not user-definable macros. See [memory and foreign calls](memory-and-ffi.md#implemented-core-calls)
 for the supported intrinsic signatures.
 
+`core.wrapping_add`, `core.wrapping_sub`, and `core.wrapping_mul` provide
+[explicit wrapping integer arithmetic](standard-library.md#portable-core-utilities)
+without an import.
+
 The compiler also embeds the Dodo source packages listed in
 [the standard library](standard-library.md). Imports beginning with `core/`,
 `alloc/`, or `std/` always resolve from this bundled library, independent of the current

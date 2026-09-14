@@ -88,6 +88,15 @@ wrapping variants are provided for addition, subtraction, and multiplication.
 `min`, `max`, `is_power_of_two`, and `align_up` complete the resource-arithmetic
 helpers. This module currently covers `usize`, not every numeric type.
 
+The wrapping helpers use compiler primitives that lower directly to integer
+addition, subtraction, and multiplication without overflow checks or loops.
+`core.wrapping_add(a, b)`, `core.wrapping_sub(a, b)`, and
+`core.wrapping_mul(a, b)` are also available without an import for any integer
+type. Both operands and the result have the same type; an optional explicit
+type argument, such as `core.wrapping_mul::<u32>(a, b)`, selects that type.
+Results wrap modulo 2 to the power of the type's width, including for signed
+integers. Ordinary arithmetic operators continue to check overflow.
+
 `bytes` operates on borrowed byte slices. `equal`, `compare`, `starts_with`,
 `ends_with`, and `find` do not allocate. `compare` returns -1, 0, or 1 in
 lexicographic order. `fill` and `reverse` mutate a slice in place. `copy_from`

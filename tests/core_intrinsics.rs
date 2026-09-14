@@ -79,6 +79,132 @@ fn core_storage_pointers_and_owned_exchange() {
     Workspace::new().run(include_str!("fixtures/core_foundation.dodo"), b"ACBDE");
 }
 #[test]
+fn wrapping_arithmetic_boundaries_inference_and_evaluation_order() {
+    Workspace::new().run(include_str!("fixtures/wrapping_arithmetic.dodo"), b"");
+}
+#[test]
+fn wrapping_arithmetic_rejects_invalid_arguments() {
+    for operation in ["add", "sub", "mul"] {
+        for (call, diagnostic) in [
+            ("()", "expects two arguments"),
+            ("(1u8)", "expects two arguments"),
+            ("(1u8, 2u8, 3u8)", "expects two arguments"),
+            ("::<u8, u16>(1, 2)", "at most one type argument"),
+            ("(true, false)", "requires an integer type"),
+            ("(1.0, 2.0)", "requires an integer type"),
+            ("(\"a\", \"b\")", "requires an integer type"),
+            ("(&1u8, &2u8)", "requires an integer type"),
+            (
+                "(ptr.from_ref(&1u8), ptr.from_ref(&2u8))",
+                "requires an integer type",
+            ),
+            ("::<f32>(1, 2)", "requires an integer type"),
+            ("(1u8, 2u16)", "expected `u8`"),
+            ("(1u8, 2i8)", "expected `u8`"),
+            ("::<u16>(1u8, 2u8)", "expected `u16`"),
+            ("::<u8>(256, 0)", "out of range"),
+        ] {
+            rejects(
+                &format!("fn f() {{ core.wrapping_{operation}{call} }}"),
+                diagnostic,
+            );
+        }
+    }
+    rejects(
+        "struct S {} fn f() { core.wrapping_add(S{}, S{}) }",
+        "requires an integer type",
+    );
+    rejects(
+        "const VALUE: u8 = core.wrapping_add(255u8, 1u8)",
+        "global initializers must be compile-time constants",
+    );
+}
+#[test]
+fn wrapping_arithmetic_emits_plain_operations_at_each_target_width() {
+    let workspace = Workspace::new();
+    let mut source = String::from("package wrapping\nimport \"core/num\"\n");
+    let types = [
+        "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "usize", "isize",
+    ];
+    for operation in ["add", "sub", "mul"] {
+        for ty in types {
+            source.push_str(&format!(
+                "pub fn {operation}_{ty}(a: {ty}, b: {ty}) -> {ty} {{ return core.wrapping_{operation}(a, b) }}\n"
+            ));
+        }
+    }
+    let input = workspace.source(&source);
+    for (target, pointer_width) in [
+        ("x86_64-unknown-linux-gnu", 64),
+        ("wasm32-unknown-unknown", 32),
+        ("thumbv6m-none-eabi", 32),
+        ("msp430-none-elf", 16),
+    ] {
+        for level in ["0", "3"] {
+            let output = workspace.0.join("wrapping.ll");
+            let result = Command::new(env!("CARGO_BIN_EXE_dodo"))
+                .arg("build")
+                .arg(&input)
+                .args(["--emit", "llvm-ir", "--target", target, "-O", level, "-o"])
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{target} O{level}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let ir = fs::read_to_string(output).unwrap();
+            for operation in ["add", "sub", "mul"] {
+                let mut functions = types
+                    .iter()
+                    .map(|ty| {
+                        let width = if ty.ends_with("size") {
+                            pointer_width
+                        } else {
+                            ty[1..].parse().unwrap()
+                        };
+                        (format!("{operation}_{ty}"), width)
+                    })
+                    .collect::<Vec<_>>();
+                functions.push((format!("num.wrapping_{operation}"), pointer_width));
+                for (name, width) in functions {
+                    let definition = ir
+                        .split("\ndefine ")
+                        .find(|definition| {
+                            definition
+                                .lines()
+                                .next()
+                                .unwrap()
+                                .contains(&format!("@dodo.wrapping.{name}("))
+                        })
+                        .unwrap_or_else(|| panic!("missing {name} for {target} O{level}"));
+                    let body = definition
+                        .split_once('{')
+                        .unwrap()
+                        .1
+                        .split_once('}')
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        body.matches(&format!(" = {operation} i{width} ")).count(),
+                        1,
+                        "{target} O{level} {name}: {body}"
+                    );
+                    for unwanted in [
+                        " nsw ", " nuw ", " call ", " br ", " switch ", " icmp ", " phi ",
+                    ] {
+                        assert!(
+                            !body.contains(unwanted),
+                            "{target} O{level} {name} contains {unwanted}: {body}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+#[test]
 fn opaque_storage_moves_without_dropping_contents() {
     Workspace::new().run(
         r#"package storage

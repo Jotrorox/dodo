@@ -180,8 +180,9 @@ same unit. Only direct imports are in scope; imports are not re-exports.
 **PKG-CORE.** Imports starting with `core/`, `alloc/`, or `std/` must resolve from
 the compiler's bundled library, never local files. Unknown bundled imports are
 errors. `core/mem`, `core/ptr`, and `core/mmio` are compiler intrinsics and must
-be directly imported to use their calls. `core.drop` is available without an
-import. Package names `core`, `mem`, `ptr`, and `mmio` are reserved. These aliases
+be directly imported to use their calls. `core.drop`, `core.wrapping_add`,
+`core.wrapping_sub`, and `core.wrapping_mul` are available without an import.
+Package names `core`, `mem`, `ptr`, and `mmio` are reserved. These aliases
 are also reserved except for a matching `core/mem`, `core/ptr`, or `core/mmio`
 import. A bundled package cannot depend on a local package. Target selection
 for bundled platform adapters is implementation-defined (ID-LIB).
@@ -785,8 +786,15 @@ trap for a zero divisor and for signed minimum divided by -1. Shift counts must
 be nonnegative and less than the left operand's width. Right shift sign-extends
 signed values and zero-extends unsigned values. Bitwise operations act on the
 fixed-width representation. Evaluated constant failures must be diagnosed.
-There are no implicit wrapping operations or built-in named wrapping intrinsics
-in this edition; libraries may implement explicit wrapping functions.
+`core.wrapping_add(a, b)`, `core.wrapping_sub(a, b)`, and
+`core.wrapping_mul(a, b)` explicitly wrap modulo 2^N, where N is the operand
+type's width on the selected target. Both operands and the result must have
+the same integer type. These safe calls accept two value arguments and an
+optional explicit integer type argument; otherwise the type is inferred from
+the expected result or operands, defaulting to `isize` for unsuffixed literals.
+Signed results interpret the low N bits as two's complement. The wrapping
+operation never traps for overflow; its argument expressions retain their
+usual checked behavior. These calls are not constant expressions.
 
 **NUM-FLOAT.** Floating arithmetic uses IEEE operations without reassociation or
 fast-math assumptions. Division by zero and overflow may produce infinities or
@@ -1633,7 +1641,7 @@ execution cases and enforced static boundaries are identified separately.
 | EXPR-ASSIGN | E `spec::assignment_captures_destination_and_old_value_before_rhs`; E `core::replacement_failure_preserves_original_and_drops_it_once`. |
 | REP-SCALAR, NUM-FLOAT | E `spec::scalar_representations_and_float_comparisons`; T `spec::target_profiles_publish_width_endianness_and_native_symbols`. |
 | REP-TAG, REP-VIEW, REP-LAYOUT | E `spec::aggregate_layout_tags_and_string_byte_lengths`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`; R `core::field_offsets_enforce_literal_direct_fields_and_package_privacy`. |
-| NUM-CAST, NUM-ARITH, TRAP | E `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`; E `compiler::arithmetic_and_index_traps_survive_optimization`, `invalid_subslice_bounds_trap_at_all_optimization_levels`; R `sema::constant_arithmetic_checked_before_codegen`. |
+| NUM-CAST, NUM-ARITH, TRAP | E `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`; E `compiler::arithmetic_and_index_traps_survive_optimization`, `invalid_subslice_bounds_trap_at_all_optimization_levels`; R `sema::constant_arithmetic_checked_before_codegen`; E/R/T `core::wrapping_arithmetic_boundaries_inference_and_evaluation_order`, `wrapping_arithmetic_rejects_invalid_arguments`, `wrapping_arithmetic_emits_plain_operations_at_each_target_width`. |
 | GEN-INSTANCE, section 4.7 | E `compiler::generic_arguments_infer_from_values_parameters_and_return_context`, `generic_struct_methods_keep_borrowed_returns`; R `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors`. |
 | OWN-SUBOBJECT, sections 7–9 | R `sema::destructuring_preserves_borrows_moves_and_custom_drop`; E `compiler::cleanup_reverses_order_and_does_not_double_drop_moves`, `cleanup_runs_on_overwrite_explicit_drop_break_and_continue`, `custom_destructor_runs_before_nested_fields`, `nested_patterns_drop_ignored_values_and_guard_failures_once`. |
 | PTR-VALID, PTR-OFFSET | E valid ranges/reinterpretation `spec::pointer_integer_round_trip_offsets_and_byte_access`, `scalar_representations_and_float_comparisons`; E foreign allocated storage `storage::simultaneous_boxes_destruction_failure_alignment_and_zst`. Invalid runtime provenance is an unsafe precondition violation, not a required rejection. |

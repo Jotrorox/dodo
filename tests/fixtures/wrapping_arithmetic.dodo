@@ -1,0 +1,134 @@
+package wrapping_arithmetic
+import "core/num" as resource
+
+fn identity<T>(value: T) -> T {
+    return value
+}
+fn product<T>(a: T, b: T) -> T {
+    return core.wrapping_mul::<T>(a, b)
+}
+fn unsigned_boundaries<T>(max: T) -> bool {
+    return core.wrapping_add(max, 1) == 0 &&
+        core.wrapping_sub(0, max) == 1 &&
+        core.wrapping_sub::<T>(0, 1) == max &&
+        product(max, max) == 1 &&
+        product(max, 2) == max - 1 &&
+        product(max, 0) == 0 &&
+        product(max, 1) == max
+}
+fn signed_boundaries<T>(min: T, max: T) -> bool {
+    return core.wrapping_add(max, 1) == min &&
+        core.wrapping_add(min, -1) == max &&
+        core.wrapping_sub(min, 1) == max &&
+        core.wrapping_sub(max, -1) == min &&
+        product(min, -1) == min &&
+        product(min, 2) == 0 &&
+        product(max, max) == 1 &&
+        product(min, 0) == 0 &&
+        product(min, 1) == min
+}
+fn as_signed(value: u32) -> i8 {
+    if value < 128u32 {
+        return value as i8
+    }
+    return (value as i32 - 256i32) as i8
+}
+fn next(value: &mut u8) -> u8 {
+    *value += 1
+    return *value
+}
+fn main() -> i32 {
+    if!unsigned_boundaries(~0u8) {
+        return 1
+    }
+    if!unsigned_boundaries(~0u16) {
+        return 2
+    }
+    if!unsigned_boundaries(~0u32) {
+        return 3
+    }
+    if!unsigned_boundaries(~0u64) {
+        return 4
+    }
+    if!unsigned_boundaries(~0usize) {
+        return 5
+    }
+    if!signed_boundaries(-128i8, 127i8) {
+        return 6
+    }
+    if!signed_boundaries(-32768i16, 32767i16) {
+        return 7
+    }
+    if!signed_boundaries(-2147483648i32, 2147483647i32) {
+        return 8
+    }
+    if!signed_boundaries(-9223372036854775808i64, 9223372036854775807i64) {
+        return 9
+    }
+    signed_max := (resource.MAX >> 1) as isize
+    if!signed_boundaries(-signed_max - 1, signed_max) {
+        return 10
+    }
+    if resource.wrapping_add(resource.MAX, 1) != 0 {
+        return 11
+    }
+    if resource.wrapping_sub(0, 1) != resource.MAX {
+        return 12
+    }
+    if resource.wrapping_mul(resource.MAX, resource.MAX) != 1 {
+        return 13
+    }
+
+    // Inference through generic callers, either operand, and result context.
+    a: u8 = identity(core.wrapping_add(255, 1u8))
+    b := identity(core.wrapping_sub::<u8>(0, 1))
+    c: u8 = core.wrapping_mul(128, 2)
+    d: u8 = identity(core.wrapping_add(255, 1))
+    e := identity(core.wrapping_add(255u8, 1))
+    f := core.wrapping_add(1, 2)
+    g := identity(core.wrapping_mul(identity(128u8), identity(2u8)))
+    h := identity(core.wrapping_add(core.wrapping_sub(0, 255u8), 255u8))
+    if g != 0u8 || h != 0u8 {
+        return 23
+    }
+    if a != 0u8 || b != 255u8 || c != 0u8 || d != 0u8 || e != 0u8 || f != 3isize {
+        return 14
+    }
+
+    // Operand effects occur exactly once, from left to right.
+    counter := 0u8
+    if core.wrapping_sub(next(&mut counter), next(&mut counter)) != 255u8 {
+        return 15
+    }
+    if counter != 2u8 {
+        return 16
+    }
+
+    // Compare all 8-bit operand pairs against wider, checked arithmetic.
+    for x := 0u32; x < 256u32; x += 1 {
+        for y := 0u32; y < 256u32; y += 1 {
+            sum := (x + y) % 256u32
+            difference := (x + 256u32 - y) % 256u32
+            multiplied := (x * y) % 256u32
+            if core.wrapping_add(x as u8, y as u8) != sum as u8 {
+                return 17
+            }
+            if core.wrapping_sub(x as u8, y as u8) != difference as u8 {
+                return 18
+            }
+            if core.wrapping_mul(x as u8, y as u8) != multiplied as u8 {
+                return 19
+            }
+            if core.wrapping_add(as_signed(x), as_signed(y)) != as_signed(sum) {
+                return 20
+            }
+            if core.wrapping_sub(as_signed(x), as_signed(y)) != as_signed(difference) {
+                return 21
+            }
+            if core.wrapping_mul(as_signed(x), as_signed(y)) != as_signed(multiplied) {
+                return 22
+            }
+        }
+    }
+    return 0
+}
