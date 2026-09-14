@@ -269,8 +269,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 .struct_type(
                     &[
                         self.context.bool_type().into(),
-                        self.storage_ty(t)?,
-                        self.storage_ty(e)?,
+                        self.union_storage(&[self.payload_ty(t)?, self.payload_ty(e)?])?
+                            .into(),
                     ],
                     false,
                 )
@@ -292,6 +292,45 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.ty(t)
         }
     }
+    fn payload_ty(&self, t: &Type) -> Result<BasicTypeEnum<'ctx>> {
+        if *t == Type::Void {
+            Ok(self.context.struct_type(&[], false).into())
+        } else {
+            self.ty(t)
+        }
+    }
+    fn variant_ty(&self, fields: &[Field]) -> Result<StructType<'ctx>> {
+        let fields = fields
+            .iter()
+            .map(|f| self.ty(&f.ty))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self.context.struct_type(&fields, false))
+    }
+    /// LLVM has no union type. A zero-length array supplies the strictest
+    /// alignment, while bytes preserve every alternative's representation when
+    /// the enclosing aggregate is copied or passed by value. Using a real
+    /// alternative as storage would lose bytes in its padding or narrow fields.
+    fn union_storage(&self, alternatives: &[BasicTypeEnum<'ctx>]) -> Result<StructType<'ctx>> {
+        let mut aligner: BasicTypeEnum<'ctx> = self.context.i8_type().into();
+        let mut size = 0;
+        for ty in alternatives {
+            if !ty.is_sized() {
+                return Err(error("cannot lay out an unsized payload"));
+            }
+            size = size.max(self.data.get_abi_size(ty));
+            if self.data.get_abi_alignment(ty) > self.data.get_abi_alignment(&aligner) {
+                aligner = *ty;
+            }
+        }
+        let alignment = u64::from(self.data.get_abi_alignment(&aligner));
+        let size = size.div_ceil(alignment) * alignment;
+        let bytes = self.context.i8_type().array_type(
+            u32::try_from(size).map_err(|_| error("payload storage is too large for LLVM"))?,
+        );
+        Ok(self
+            .context
+            .struct_type(&[aligner.array_type(0).into(), bytes.into()], false))
+    }
     fn usize_type(&self) -> inkwell::types::IntType<'ctx> {
         self.context
             .custom_width_int_type(std::num::NonZeroU32::new(self.bits).unwrap())
@@ -310,31 +349,79 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .insert(e.name.clone(), self.context.opaque_struct_type(&e.name));
             }
         }
-        for s in &self.program.structs {
-            if s.generics.is_empty() {
-                let ts = s
-                    .fields
+        for name in self
+            .program
+            .structs
+            .iter()
+            .filter(|s| s.generics.is_empty())
+            .map(|s| &s.name)
+            .chain(
+                self.program
+                    .enums
                     .iter()
-                    .map(|f| self.ty(&f.ty))
-                    .collect::<Result<Vec<_>>>()?;
-                self.structs[&s.name].set_body(&ts, false);
-            }
-        }
-        for e in &self.program.enums {
-            if e.generics.is_empty() {
-                let mut ts = vec![self.context.i32_type().into()];
-                for v in &e.variants {
-                    let fs = v
-                        .fields
-                        .iter()
-                        .map(|f| self.ty(&f.ty))
-                        .collect::<Result<Vec<_>>>()?;
-                    ts.push(self.context.struct_type(&fs, false).into());
-                }
-                self.structs[&e.name].set_body(&ts, false);
-            }
+                    .filter(|e| e.generics.is_empty())
+                    .map(|e| &e.name),
+            )
+        {
+            self.define_layout(&Type::Named(name.clone()))?;
         }
         Ok(())
+    }
+    /// Resolve by-value dependencies before querying payload size/alignment.
+    /// The checker rejects by-value cycles; pointer/reference cycles need no layout.
+    fn define_layout(&self, ty: &Type) -> Result<()> {
+        match ty {
+            Type::Named(name) if self.structs[name].is_opaque() => {
+                let fields = if let Some(s) = self.program.structs.iter().find(|s| s.name == *name)
+                {
+                    for f in &s.fields {
+                        self.define_layout(&f.ty)?;
+                    }
+                    s.fields
+                        .iter()
+                        .map(|f| self.ty(&f.ty))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    let e = self.program.enums.iter().find(|e| e.name == *name).unwrap();
+                    let mut alternatives = Vec::new();
+                    for v in &e.variants {
+                        for f in &v.fields {
+                            self.define_layout(&f.ty)?;
+                        }
+                        alternatives.push(self.variant_ty(&v.fields)?.into());
+                    }
+                    vec![
+                        self.context.i32_type().into(),
+                        self.union_storage(&alternatives)?.into(),
+                    ]
+                };
+                self.structs[name].set_body(&fields, false);
+            }
+            Type::Array(_, t) | Type::MaybeUninit(t) | Type::Option(t) => self.define_layout(t)?,
+            Type::Result(t, e) => {
+                self.define_layout(t)?;
+                self.define_layout(e)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn tagged_value(
+        &self,
+        ty: StructType<'ctx>,
+        tag: IntValue<'ctx>,
+        payload: Option<BasicValueEnum<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>> {
+        let value = self
+            .builder
+            .build_insert_value(ty.const_zero(), tag, 0, "tag")?;
+        let ptr = self.alloca(ty.into(), "tagged.value")?;
+        self.builder.build_store(ptr, value.into_struct_value())?;
+        if let Some(payload) = payload {
+            let p = self.builder.build_struct_gep(ty, ptr, 1, "payload")?;
+            self.builder.build_store(p, payload)?;
+        }
+        Ok(self.builder.build_load(ty, ptr, "tagged")?)
     }
     fn declare_functions(&mut self) -> Result<()> {
         for f in &self.program.functions {
@@ -902,15 +989,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         })
                         .collect::<Vec<_>>();
                     self.builder.build_switch(tag, end, &cases)?;
-                    for ((_, block), (i, v)) in cases.iter().zip(e.variants.iter().enumerate()) {
+                    for ((_, block), v) in cases.iter().zip(&e.variants) {
                         self.builder.position_at_end(*block);
-                        let p =
-                            self.builder
-                                .build_struct_gep(st, ptr, (i + 1) as u32, "payload")?;
-                        let pt = st
-                            .get_field_type_at_index((i + 1) as u32)
-                            .unwrap()
-                            .into_struct_type();
+                        let p = self.builder.build_struct_gep(st, ptr, 1, "payload")?;
+                        let pt = self.variant_ty(&v.fields)?;
                         for (j, f) in v.fields.iter().enumerate().rev() {
                             let fp = self.builder.build_struct_gep(pt, p, j as u32, "field")?;
                             self.drop_ptr(fp, &f.ty)?;
@@ -938,10 +1020,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let err = self.bb("drop.err");
                 let end = self.bb("drop.result.end");
                 self.builder.build_conditional_branch(tag, err, ok)?;
-                for (bb, idx, t) in [(ok, 1, t), (err, 2, e)] {
+                for (bb, t) in [(ok, t), (err, e)] {
                     self.builder.position_at_end(bb);
                     if **t != Type::Void {
-                        let p = self.builder.build_struct_gep(st, ptr, idx, "payload")?;
+                        let p = self.builder.build_struct_gep(st, ptr, 1, "payload")?;
                         self.drop_ptr(p, t)?;
                     }
                     self.builder.build_unconditional_branch(end)?;
@@ -1519,6 +1601,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             ExprKind::Try(x) => {
                 let v = self.expr(x)?.into_struct_value();
+                let Type::Result(success, failure) = &x.ty else {
+                    return Err(error("propagation requires a Result"));
+                };
+                let st = v.get_type();
+                let ptr = self.alloca(st.into(), "propagate.value")?;
+                self.builder.build_store(ptr, v)?;
+                let p = self.builder.build_struct_gep(st, ptr, 1, "payload")?;
                 let tag = self
                     .builder
                     .build_extract_value(v, 0, "is.error")?
@@ -1527,25 +1616,24 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let ok = self.bb("propagate.ok");
                 self.builder.build_conditional_branch(tag, err, ok)?;
                 self.builder.position_at_end(err);
-                let mut ret = self.ty(&self.return_type)?.into_struct_type().const_zero();
-                ret = self
-                    .builder
-                    .build_insert_value(
-                        ret,
-                        self.context.bool_type().const_int(1, false),
-                        0,
-                        "result.tag",
-                    )?
-                    .into_struct_value();
-                let payload = self.builder.build_extract_value(v, 2, "error")?;
-                ret = self
-                    .builder
-                    .build_insert_value(ret, payload, 2, "result.error")?
-                    .into_struct_value();
+                let payload = if **failure == Type::Void {
+                    None
+                } else {
+                    Some(self.load(p, failure)?)
+                };
+                let ret = self.tagged_value(
+                    self.ty(&self.return_type)?.into_struct_type(),
+                    self.context.bool_type().const_int(1, false),
+                    payload,
+                )?;
                 self.cleanup_to(0)?;
                 self.builder.build_return(Some(&ret))?;
                 self.builder.position_at_end(ok);
-                self.builder.build_extract_value(v, 1, "success")?
+                if **success == Type::Void {
+                    self.context.i8_type().const_zero().into()
+                } else {
+                    self.load(p, success)?
+                }
             }
         };
         self.consume(e)?;
@@ -2304,6 +2392,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             return Ok(unit);
         }
         if name == "ok" || name == "err" || name == "some" || name == "none" {
+            if matches!(ret, Type::Result(..)) {
+                let payload = args.first().map(|e| self.expr(e)).transpose()?;
+                return self.tagged_value(
+                    self.ty(ret)?.into_struct_type(),
+                    self.context
+                        .bool_type()
+                        .const_int((name == "err") as u64, false),
+                    payload,
+                );
+            }
             let mut v = self.ty(ret)?.into_struct_type().const_zero();
             let tag = name == "err" || name == "some";
             v = self
@@ -2319,7 +2417,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let x = self.expr(e)?;
                 v = self
                     .builder
-                    .build_insert_value(v, x, if name == "err" { 2 } else { 1 }, "payload")?
+                    .build_insert_value(v, x, 1, "payload")?
                     .into_struct_value();
             }
             return Ok(v.into());
@@ -2706,21 +2804,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 .position(|v| v.name == variant)
                 .ok_or_else(|| error("unknown variant"))?;
             let st = self.ty(ret)?.into_struct_type();
-            let mut v = st.const_zero();
-            v = self
-                .builder
-                .build_insert_value(
-                    v,
-                    self.context.i32_type().const_int(i as u64, false),
-                    0,
-                    "enum.tag",
-                )?
-                .into_struct_value();
-            let mut payload = st
-                .get_field_type_at_index((i + 1) as u32)
-                .unwrap()
-                .into_struct_type()
-                .const_zero();
+            let mut payload = self.variant_ty(&decl.variants[i].fields)?.const_zero();
             let mut pending = Vec::new();
             for (j, arg) in args.iter().enumerate() {
                 let x = self.stage(arg, &mut pending)?;
@@ -2729,12 +2813,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .build_insert_value(payload, x, j as u32, "payload")?
                     .into_struct_value();
             }
-            v = self
-                .builder
-                .build_insert_value(v, payload, (i + 1) as u32, "enum.payload")?
-                .into_struct_value();
+            let v = self.tagged_value(
+                st,
+                self.context.i32_type().const_int(i as u64, false),
+                Some(payload.into()),
+            )?;
             self.transfer(&pending)?;
-            return Ok(v.into());
+            return Ok(v);
         }
         let f = self
             .functions
@@ -3434,12 +3519,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     return Ok(vec![]);
                 }
                 Ok(vec![(
-                    self.builder.build_struct_gep(
-                        st,
-                        ptr,
-                        if tag == 0 { 1 } else { 2 },
-                        "payload",
-                    )?,
+                    self.builder.build_struct_gep(st, ptr, 1, "payload")?,
                     *t.clone(),
                 )])
             }
@@ -3456,13 +3536,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             Type::Named(n) => {
                 let decl = self.program.enums.iter().find(|e| e.name == *n).unwrap();
                 let fields = &decl.variants[tag as usize].fields;
-                let pt = st
-                    .get_field_type_at_index(tag as u32 + 1)
-                    .unwrap()
-                    .into_struct_type();
-                let p = self
-                    .builder
-                    .build_struct_gep(st, ptr, tag as u32 + 1, "payload")?;
+                let pt = self.variant_ty(fields)?;
+                let p = self.builder.build_struct_gep(st, ptr, 1, "payload")?;
                 fields
                     .iter()
                     .enumerate()
