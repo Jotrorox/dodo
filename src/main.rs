@@ -41,7 +41,7 @@ Compiler options:
       --emit KIND         exe (default), obj, asm, llvm-ir, bitcode
   -g, --debug             Emit source locations, variables, and types
       --panic MODE       Runtime failure: auto (default), hosted, trap
-      --panic-hook NAME  Call a C ABI panic hook, then trap if it returns
+      --panic-hook NAME  Call a non-returning C ABI board failure handler
   -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)
       --target TRIPLE     LLVM target triple (default: host)
       --cpu NAME          Target CPU (default: generic)

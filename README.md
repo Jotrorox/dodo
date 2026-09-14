@@ -74,7 +74,8 @@ Use [the command-line guide](https://jotrorox.github.io/dodo/command-line/) for
 formatting options, project folders, compiler outputs, optimization, and
 cross-target builds. Add `-g -O 0` to debug generated programs with source
 breakpoints and local variables. Hosted runtime checks report their kind and
-location; embedded builds can select a C ABI hook with `--panic-hook`. For
+location; embedded builds can select a non-returning C ABI board handler with
+`--panic-hook` for fault reporting, halt, or reset behavior. For
 diagnostics, completion, navigation, rename, signature help, and formatting,
 install the [Dodo VS Code extension](editor-support/dodo-vscode), which also adds
 syntax highlighting and snippets, or configure your editor's LSP client to run

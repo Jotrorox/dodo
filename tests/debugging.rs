@@ -209,35 +209,45 @@ fn failures_name_checks_and_exact_locations_with_and_without_debug() {
 }
 
 #[test]
-fn panic_hooks_receive_source_details_and_cannot_resume_after_failure() {
+fn nonreturning_panic_hooks_receive_checks_and_assertion_locations() {
     let w = Workspace::new();
-    let source = w.file(
-        "hook.dodo",
-        "package hook\nfn main() -> i32 {\n    return 12 / 0\n}\n",
+    let c = w.file(
+        "hook.c",
+        "#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n_Noreturn void board_panic(const char *check, const char *file, uint32_t line, uint32_t column) { fprintf(stderr, \"HOOK %s %s:%u:%u\\n\", check, file, line, column); _Exit(73); }\n",
     );
-    for returns in [false, true] {
-        let c = w.file("hook.c", &format!("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\nvoid board_panic(const char *check, const char *file, uint32_t line, uint32_t column) {{ fprintf(stderr, \"HOOK %s %s:%u:%u\\n\", check, file, line, column); {} }}\n", if returns { "" } else { "_Exit(73);" }));
+    for (statement, check, column) in [
+        ("_ = 12 / 0", "division by zero", 9),
+        ("_ = 255u8 + 1u8", "arithmetic overflow", 9),
+        ("_ = 256u32 as u8", "numeric conversion", 9),
+        ("_ = values[index]", "index bounds", 9),
+        ("_ = values[0usize..index + 1usize]", "slice bounds", 9),
+        ("assert(false)", "assert", 5),
+        ("assert_eq(1, 2, \"numbers differ\")", "assert_eq", 5),
+        ("assert_ne(\"same\", \"same\")", "assert_ne", 5),
+    ] {
+        let source = w.file("hook.dodo", &format!("package hook\nfn main() -> i32 {{\n    values := [1i32, 2]\n    index := 2usize\n    {statement}\n    return 0\n}}\n"));
         for level in ["0", "3"] {
-            let program = w.0.join("hook");
-            w.build(
-                &source,
-                &program,
-                &[
-                    "-g",
+            for debug in [false, true] {
+                let program = w.0.join("hook");
+                let mut args = vec![
                     "-O",
                     level,
                     "--panic-hook",
                     "board_panic",
                     "--link-arg",
                     c.to_str().unwrap(),
-                ],
-            );
-            let output = Command::new(&program).output().unwrap();
-            assert_eq!(output.status.code(), if returns { None } else { Some(73) });
-            assert_eq!(
-                String::from_utf8_lossy(&output.stderr),
-                format!("HOOK division by zero {}:3:12\n", source.display())
-            );
+                ];
+                if debug {
+                    args.push("-g");
+                }
+                w.build(&source, &program, &args);
+                let output = Command::new(&program).output().unwrap();
+                assert_eq!(output.status.code(), Some(73), "{statement}, -O{level}");
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stderr),
+                    format!("HOOK {check} {}:5:{column}\n", source.display())
+                );
+            }
         }
     }
 }
@@ -247,29 +257,83 @@ fn freestanding_checks_need_only_the_selected_hook() {
     let w = Workspace::new();
     let source = w.file(
         "board.dodo",
-        "package board\npub fn add(a:u32,b:u32)->u32 { return a+b }\n",
+        "package board\npub fn add(a:u32,b:u32)->u32 { return a+b }\npub fn verify(a:u32,b:u32) { assert(a > 0)\nassert_eq(a, b)\nassert_ne(a, 0) }\n",
     );
-    for mode in ["auto", "trap", "hook"] {
-        let ir = w.0.join(format!("{mode}.ll"));
-        let mut args = vec!["-g", "--emit", "llvm-ir", "--target", "thumbv7em-none-eabi"];
-        args.extend(if mode == "hook" {
-            ["--panic-hook", "board_panic"]
-        } else {
-            ["--panic", mode]
-        });
-        w.build(&source, &ir, &args);
-        let ir = fs::read_to_string(ir).unwrap();
-        assert!(ir.contains("llvm.trap"));
-        assert!(!ir.contains("@write") && !ir.contains("@abort") && !ir.contains("@_write"));
-        assert_eq!(ir.contains("call void @board_panic"), mode == "hook");
-        if mode == "hook" {
-            assert!(ir.contains("i32 2, i32 39"), "{ir}");
+    for target in ["thumbv7em-none-eabi", "wasm32-unknown-unknown"] {
+        for level in ["0", "3"] {
+            for mode in ["auto", "trap", "hook"] {
+                let ir = w.0.join(format!("{mode}.ll"));
+                let mut args = vec!["-g", "-O", level, "--emit", "llvm-ir", "--target", target];
+                args.extend(if mode == "hook" {
+                    ["--panic-hook", "board_panic"]
+                } else {
+                    ["--panic", mode]
+                });
+                w.build(&source, &ir, &args);
+                let ir = fs::read_to_string(ir).unwrap();
+                assert_eq!(ir.contains("llvm.trap"), mode != "hook", "{ir}");
+                assert!(
+                    !ir.contains("@write") && !ir.contains("@abort") && !ir.contains("@_write")
+                );
+                assert!(!ir.contains("@dodo_test_"));
+                assert_eq!(ir.contains("call void @board_panic"), mode == "hook");
+                if mode == "hook" {
+                    assert!(ir.contains("i32 2, i32 39"), "{ir}");
+                    let declaration = ir
+                        .lines()
+                        .find(|line| line.starts_with("declare void @board_panic("))
+                        .unwrap();
+                    let attributes = declaration.split_once(" #").unwrap().1;
+                    let attributes = ir
+                        .lines()
+                        .find(|line| line.starts_with(&format!("attributes #{attributes} =")))
+                        .unwrap();
+                    assert!(attributes.contains("noreturn"), "{ir}");
+                    let lines: Vec<_> = ir.lines().collect();
+                    for pair in lines
+                        .windows(2)
+                        .filter(|pair| pair[0].contains("call void @board_panic"))
+                    {
+                        assert_eq!(pair[1].trim().split(',').next(), Some("unreachable"));
+                    }
+                }
+            }
         }
     }
-    // Explicit trap mode also makes hosted-target objects usable without libc.
+    // Explicit trap mode omits hosted reporting, even on a hosted target triple.
     let ir = w.0.join("host-trap.ll");
     w.build(&source, &ir, &["--emit", "llvm-ir", "--panic", "trap"]);
     assert!(!fs::read_to_string(ir).unwrap().contains("@write"));
+}
+
+#[test]
+fn board_hooks_avoid_abort_on_targets_without_a_trap_instruction() {
+    let w = Workspace::new();
+    let source = w.file(
+        "board.dodo",
+        "package board\npub fn add(a:u16,b:u16)->u16 { assert(a > 0)\nreturn a+b }\n",
+    );
+    for level in ["0", "3"] {
+        for mode in ["auto", "trap", "hook"] {
+            let assembly = w.0.join(format!("{mode}.s"));
+            let mut args = vec!["--emit", "asm", "--target", "msp430-none-elf", "-O", level];
+            args.extend(if mode == "hook" {
+                ["--panic-hook", "board_panic"]
+            } else {
+                ["--panic", mode]
+            });
+            w.build(&source, &assembly, &args);
+            let assembly = fs::read_to_string(assembly).unwrap();
+            // Inspect machine lowering: IR alone cannot reveal llvm.trap's
+            // implicit abort dependency on this target.
+            assert_eq!(assembly.contains("#abort"), mode != "hook", "{assembly}");
+            assert_eq!(
+                assembly.contains("#board_panic"),
+                mode == "hook",
+                "{assembly}"
+            );
+        }
+    }
 }
 
 #[test]

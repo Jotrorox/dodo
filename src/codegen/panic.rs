@@ -101,6 +101,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         .void_type()
                         .fn_type(&[ptr.into(), ptr.into(), i32.into(), i32.into()], false),
                 )?;
+                hook.add_attribute(
+                    AttributeLoc::Function,
+                    self.context
+                        .create_enum_attribute(Attribute::get_named_enum_kind_id("noreturn"), 0),
+                );
                 let message = self.builder.build_global_string_ptr(check, "panic.check")?;
                 let file = self.builder.build_global_string_ptr(&file, "panic.file")?;
                 self.builder.build_call(
@@ -113,16 +118,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     ],
                     "",
                 )?;
+                // Board code owns termination. A trap fallback can lower to abort
+                // on some targets and would impose an unwanted runtime dependency.
+                self.builder.build_unreachable()?;
+                return Ok(());
             }
             PanicStrategy::Trap => {}
             PanicStrategy::Auto => unreachable!(),
         }
-        // Also terminate if a user hook (or an interposed abort) returns.
-        let trap = Intrinsic::find("llvm.trap")
-            .and_then(|i| i.get_declaration(&self.module, &[]))
-            .ok_or_else(|| error("LLVM trap intrinsic is unavailable"))?;
-        self.builder.build_call(trap, &[], "")?;
-        self.builder.build_unreachable()?;
-        Ok(())
+        // Also terminate if an interposed hosted abort returns.
+        self.trap()
     }
 }
