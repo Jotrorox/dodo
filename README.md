@@ -53,7 +53,10 @@ uses the project folder name: `hello/main.dodo` compiles to `build/hello`.
 
 Use [the command-line guide](https://jotrorox.github.io/dodo/command-line/) for
 formatting options, project folders, compiler outputs, optimization, and
-cross-target builds. For diagnostics and type hovers in an editor, configure its
+cross-target builds. Add `-g -O 0` to debug generated programs with source
+breakpoints and local variables. Hosted runtime checks report their kind and
+location; embedded builds can select a C ABI hook with `--panic-hook`. For
+diagnostics and type hovers in an editor, configure its
 LSP client to run `dodo lsp` and follow the
 [editor setup guide](https://jotrorox.github.io/dodo/editors/).
 

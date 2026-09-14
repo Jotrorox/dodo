@@ -136,7 +136,76 @@ dodo compile -O 2 -o build/hello
 
 Overflow, division, shift, conversion, and bounds checks remain active at every
 level. LLVM may remove a check only when it proves the check redundant. A failed
-runtime check traps using `llvm.trap`; it does not unwind or run destructors.
+runtime check reports its kind and source location on hosted targets, then aborts.
+It does not unwind or run destructors. This reporting also works without `-g`.
+
+## Debug generated programs
+
+Add `-g` (or `--debug`) to emit DWARF source locations, function signatures,
+parameters, local variables, lexical scopes, and type layouts:
+
+```sh
+dodo compile hello.dodo -g -O 0 -o build/hello
+gdb build/hello
+# In GDB:
+# break hello.dodo:4
+# run
+# next
+# info locals
+# backtrace
+```
+
+`-g` works with every output format and does not change the selected optimization
+level. Use `-O 0` for predictable stepping and variable inspection. At higher
+levels, LLVM can inline functions and optimize variables away. Arrays, slices,
+strings, pointers, structs, enums, `Option`, `Result`, and `MaybeUninit` describe
+their actual target layout. Enum payload fields show physical storage; inspect
+the tag before reading a payload. Compiler temporaries are hidden.
+
+Source paths and line numbers follow imports and generic specializations back to
+their definitions. Keep source files available at their recorded paths, or use
+your debugger's source-path substitution. Bundled library files are named
+`<stdlib>/...`; map `<stdlib>` to this compiler version's `stdlib` directory to
+step through them. The compiler emits DWARF 4, with the C expression evaluator
+for debugger expressions; it does not emit Windows PDB files. GDB sessions on
+Linux and DWARF validation for Linux, Windows GNU, ARM, and WebAssembly objects
+are covered by smoke tests. On Darwin, keep object output and use the platform
+linker and `dsymutil` to produce a debug bundle before deleting the object.
+
+## Configure runtime failures
+
+The default `--panic auto` reports a message such as
+`dodo: index bounds check failed at /path/main.dodo:8:12` to standard error and
+calls C `abort` on Linux, Windows, Darwin, BSD, Solaris, and illumos targets.
+It uses `write` (`_write` on Windows) and requires the target C runtime when
+linking. Other targets, including bare-metal ARM and `wasm32-unknown-unknown`,
+default to `llvm.trap` without any C runtime dependency.
+
+Use `--panic hosted` to select reporting explicitly or `--panic trap` for a
+freestanding object even when using a hosted target triple. Embedded applications
+can supply a panic hook instead:
+
+```sh
+dodo compile firmware.dodo -g --emit obj --target thumbv7em-none-eabi \
+  --panic-hook board_panic -o build/firmware.o
+```
+
+Provide this C ABI symbol when linking the object with your board support code:
+
+```c
+#include <stdint.h>
+
+void board_panic(const char *check, const char *file,
+                 uint32_t line, uint32_t column);
+```
+
+`check` names the failed check, and `file` is its source path. Both are immutable,
+NUL-terminated UTF-8 strings with static lifetime. Line and column are one-based;
+columns count Unicode characters. The hook may log, stop in a debugger, halt,
+or reset the device. If it returns, the compiler executes `llvm.trap`; execution
+never resumes after a failed check. Hook mode introduces no hosted reporting
+dependencies. No mode unwinds or runs destructors. The last `--panic` or
+`--panic-hook` option selects the strategy.
 
 ## Targets and linking
 

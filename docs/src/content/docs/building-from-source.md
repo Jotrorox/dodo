@@ -190,3 +190,14 @@ The pipeline is organized into [`lexer`](https://github.com/Jotrorox/dodo/blob/m
 library, an [`LSP server`](https://github.com/Jotrorox/dodo/blob/main/src/lsp.rs), and a small CLI driver.
 
 For documentation changes and website checks, see [Edit these docs](contributing.md).
+
+Debugger smoke tests in `tests/debugging.rs` run batch GDB sessions and validate
+DWARF with `llvm-dwarfdump-22`. Install both tools and run:
+
+```sh
+DODO_REQUIRE_DEBUGGER_TESTS=1 cargo test --locked --test debugging
+```
+
+CI requires these tools. Local runs skip the relevant smoke tests if a tool is
+missing, unless `DODO_REQUIRE_DEBUGGER_TESTS` is set. Runtime-reporting and panic
+hook tests always run.
