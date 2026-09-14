@@ -1,9 +1,143 @@
 ---
 title: "TLS"
 description: "Verified TLS engines, bounded record staging, and explicit transport composition."
-section: "Using Dodo"
-order: 152
+section: "Standard library"
+order: 158
 ---
+
+For an HTTPS request, start with `std/http/https.Client.new` and explicit trust.
+It composes the hosted HTTP client with verified OpenSSL TLS. This example uses
+only a local Python peer and a certificate generated in your example directory.
+For non-HTTP TLS, the starting engine is `openssl.Engine.client` with
+`Config.client(hostname)`; the stream and engine contracts follow the quickstart.
+
+## Quickstart
+
+This hosted example requires Linux GNU x86-64 or Windows x64, Python 3 with
+`ssl`, and **OpenSSL 3.5+ headers, libssl and libcrypto** for the target C toolchain.
+On Fedora install `openssl-devel`; elsewhere use matching development packages
+or the pinned source-build procedure in the
+[compiler workflow](https://github.com/Jotrorox/dodo/blob/main/.github/workflows/ci.yml).
+A runtime-only `openssl` command is not enough to compile a TLS program.
+`dodo run` adds the TLS libraries automatically; custom installations may need
+`--link-arg -I/path/to/include --link-arg -L/path/to/lib` and a runtime library path.
+
+In a fresh disposable example directory, generate a two-day local certificate
+and key. No credentials or public service are needed:
+
+```sh
+openssl version
+openssl req -x509 -newkey rsa:2048 -noenc -keyout key.pem -out cert.pem -days 2 -subj /CN=localhost -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+
+Save this complete peer as `tls_peer.py`:
+
+```python
+import http.server
+import ssl
+
+class Hello(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        body = b"Hello, TLS!\n"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain("cert.pem", "key.pem")
+context.set_alpn_protocols(["http/1.1"])
+server = http.server.HTTPServer(("127.0.0.1", 8443), Hello)
+server.socket = context.wrap_socket(server.socket, server_side=True)
+print("ready on 127.0.0.1:8443", flush=True)
+try:
+    server.serve_forever()
+finally:
+    server.server_close()
+```
+
+In terminal 1 run `python3 tls_peer.py`. Wait for `ready`; if the port is occupied,
+stop your previous peer or change 8443 in both programs. Use terminal 2 for Dodo.
+
+Save this as `tls_start.dodo`:
+
+```dodo
+package tls_start
+import "std/fs"
+import "std/platform"
+import "std/http/hosted"
+import "std/http/https"
+import "std/http/hosting"
+import "std/console"
+import "std/io"
+
+fn fetch(roots: &[u8]) -> i32!hosting.Error {
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    trust := https.Trust.pem_roots(roots)
+    client := https.Client.new(&mut workspace, hosted.Config.defaults(), trust)?
+    body := [0u8; 1024]
+    response := client.get(b"https://127.0.0.1:8443/", &mut body)?
+    if response.status != 200 { return ok(2) }
+    output := console.stdout()
+    match io.write_all(&mut output, &body[..response.body_bytes as usize]) {
+        ok(_) => { return ok(0) }, err(_) => { return ok(3) },
+    }
+}
+fn main() -> i32 {
+    path := platform.workspace()
+    pem := [0u8; 4096]
+    match fs.read_file("cert.pem", &mut pem, &mut path) {
+        ok(report) => {
+            if !report.eof { return 4 }
+            match fetch(&pem[..report.read]) {
+                ok(code) => { return code },
+                err(reason) => {
+                    errors := console.stderr()
+                    match errors.println_value(&reason) {
+                        ok(_) => {}, err(_) => {},
+                    }
+                    return 1
+                },
+            }
+        },
+        err(_) => { return 4 },
+    }
+}
+```
+
+```sh
+dodo run tls_start.dodo
+```
+
+Expected stdout is `Hello, TLS!` followed by a newline; exit 0 means the local
+server certificate was trusted, its IP identity verified, and the full HTTP 200
+body received. Stop the peer with Ctrl+C. Delete this disposable example
+directory, including `key.pem`, when finished; never use this test key in a service.
+
+`fs` loads only the trust certificate, and `platform` supplies its path workspace.
+The PEM array stays alive while `Trust` and the client borrow it. HTTP workspace
+and response-body capacity are explicit; TLS staging is bounded separately, but
+OpenSSL also allocates internal state. `https` selects that external backend;
+plain `std/http/hosted` never selects TLS automatically.
+
+Exit 4 means the certificate file is missing, unreadable, or exceeds 4096 bytes:
+rerun setup or increase the explicit bound. Exit 1 means connection, protocol,
+or TLS failure: inspect the hosted error's `kind` and nested `security` cause.
+For verification failures, check the trust file, hostname/IP SAN, certificate
+validity and OS wall clock; regenerate expired local credentials. Do not disable
+verification. Exit 2 is a non-200 HTTP response; exit 3 means output failed.
+
+`https.Trust.system()` uses OpenSSL's configured trust paths, not the Windows
+certificate store. Prefer explicit `pem_roots` for reproducible applications.
+`https.serve` and `https.Acceptor` add TLS to the [hosted web server](web.md)
+with `openssl.Config.server(certificate, key)`; both identity arrays must remain
+alive. Custom providers can use `tls/stream.Stream` without importing OpenSSL.
+
+## API and contracts
 
 `std/tls` contains portable provider contracts and typed errors. Importing it
 loads no TLS implementation, network adapter, filesystem, clock, entropy source,
@@ -123,6 +257,11 @@ never busy-waits. Caller-selected scratch lengths bound staging without allocati
 buffers are supported. Empty scratch fails `InvalidInput` during construction.
 The engine uses two fixed 32 KiB BIO rings plus its 16 KiB plaintext retry buffer.
 
+`transport()` provides checked shared access to the underlying transport for
+provider-specific readiness queries; end that view before mutating the stream.
+`output_pending()` reports staged ciphertext. These observations add no readiness
+method requirement to the portable polling transport contract.
+
 `poll_read`/`poll_write` integrate with `std/io`; one-attempt `read`/`write` report
 `WouldBlock` when no progress is possible. `flush` reports `Ready` only after
 accepted plaintext and all staged encrypted output reach the transport. The
@@ -173,8 +312,8 @@ behavior; Wine cannot establish those native-environment properties.
 
 ## Hosted convenience layer
 
-For short applications with library-owned connection, readiness, deadline, and
-body-transfer loops, see [Hosted HTTP and HTTPS](hosted-http.md). It includes
-bounded HTTP and verified HTTPS clients, a serial web server, and complete
-local examples. The protocol and routing APIs on this page remain usable
-independently.
+Use `std/http/https` for verified URL requests and a hosted HTTPS listener with
+library-owned connection, readiness, deadline, and body-transfer loops.
+See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit
+storage bounds, resolver/deadline scope, cancellation, and a generated local
+HTTPS setup. The TLS engine and transport APIs remain usable independently.

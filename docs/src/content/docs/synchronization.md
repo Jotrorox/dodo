@@ -1,9 +1,62 @@
 ---
 title: "Synchronization"
 description: "Native atomics, guarded locks, condition waits, one-time initialization, barriers, and channels."
-section: "Using Dodo"
-order: 149
+section: "Standard library"
+order: 156
 ---
+
+Use `std/sync.Storage.new` and `sync.Mutex.new` to protect a value in caller
+storage on supported hosted targets. `std/sync/error` names lock failures.
+Start here for local ownership; use `std/sync/allocated` when independent
+owners must move into [native tasks](threads.md).
+
+## Quickstart
+
+Save this as `sync_start.dodo`:
+
+```dodo test
+package sync_start
+import "std/sync"
+import "std/sync/error"
+
+fn increment() -> void!error.Error {
+    storage := sync.Storage.new()
+    counter := sync.Mutex.new(&mut storage, 41usize)?
+    guard := counter.lock(1000)?
+    {
+        value := guard.get_mut()
+        *value += 1
+    }
+    assert_eq(*guard.get(), 42usize)
+    // guard unlocks before counter and its storage are destroyed.
+    return ok()
+}
+fn main() -> i32 {
+    match increment() {
+        ok() => { return 0 },
+        err(reason) => {
+            if reason == error.Error.TimedOut { return 2 }
+            return 1
+        },
+    }
+}
+```
+
+```sh
+dodo run sync_start.dodo
+```
+
+Expected output: none; exit 0 confirms the guarded value became 42. Exit 2
+means the lock budget expired: skip the work or retry under an overall deadline.
+Exit 1 means initialization or another lock operation failed. Propagate that
+failure and release owners; do not access the payload without a guard.
+The storage is fixed and caller-owned; no Dodo allocator is selected.
+
+`std/sync/atomic` is a separate integer-atomic family: start with
+`atomic.Atomic.new(0usize)` and `Ordering.SeqCst` unless you have a proven weaker
+ordering protocol. Its actual target restrictions are in [Atomics](#atomics).
+
+## API and contracts
 
 `std/sync` provides caller-backed synchronization. `std/sync/allocated` provides
 retained owners that explicitly allocate OS pages and can move between native

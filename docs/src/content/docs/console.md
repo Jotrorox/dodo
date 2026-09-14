@@ -1,7 +1,7 @@
 ---
 title: "Console I/O and printing"
 description: "Print text and values, report errors, and read bounded lines using safe hosted standard streams."
-section: "Using Dodo"
+section: "Standard library"
 order: 143.5
 ---
 
@@ -84,7 +84,7 @@ Widen smaller integers or `f32` with `as`. Integer formatting supports the full
 64-bit ranges. Floats round to nearest, ties to even; negative zero retains its
 sign, infinities print `inf`/`-inf`, and NaNs print `nan` without payloads.
 Use `fmt.Formatter` for width, radix, alignment, float style, and precision;
-see the [formatting reference](standard-library.md#byte-formatting). Custom values implement
+see the [formatting reference](formatting.md). Custom values implement
 `pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error`.
 
 Run `dodo run examples/console_formatting.dodo` from the source checkout to see

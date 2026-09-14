@@ -52,16 +52,19 @@ contract never permits a borrow of a local value to escape.
 [Owner-bound raw-storage primitives](memory-and-ffi.md#unsafe-memory-access)
 allow library implementations to establish checked views of owned allocations.
 The pointer/owner correspondence is unsafe; later use follows ordinary checked
-borrowing. Opaque container elements containing references or Results remain
-explicitly unsupported. Bind a returned mutable view to a local before assigning
+borrowing. Allocated typed storage supports shared-reference elements through checked
+mutation and removal contracts; owned Results and exclusive-reference elements
+remain unsupported. See [container elements](container-elements.md). Bind a returned mutable view to a local before assigning
 through its fields; chained assignment through a call can be rejected by the
 conservative temporary-loan checker.
 
 Storing a checked reference through a field, index, or dereference of borrowed
 storage remains rejected: `from(...)` describes returned dependencies, not
 updates to the caller's stored dependencies. Direct owned aggregate replacement
-is supported. The [container element design](container-elements.md) describes
-the separate mutation effects needed for insertion and ownership-returning removal.
+is supported. Allocated collection APIs use verified `stores(target, source...)` effects
+and `from(owner.stored)` ownership-return contracts, described in
+[container elements](container-elements.md). These effects retain a conservative
+source union until whole-owner destruction or replacement, including after clear.
 
 Result handling state belongs to whole owned bindings. Assignments of
 Result-containing values through fields, indices, or references are rejected,
