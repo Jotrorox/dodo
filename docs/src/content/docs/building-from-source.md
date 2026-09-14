@@ -24,9 +24,9 @@ instead. Run the commands on this page from the repository root.
 Building Dodo **from source** requires Rust 1.95.0 (pinned in
 `rust-toolchain.toml`), LLVM 22 development files and static archives, and a C
 toolchain. Inkwell provides LLVM bindings; the language server uses `lsp-server`,
-`lsp-types`, `serde_json`, and `url`. `Cargo.lock` fixes the dependencies. A missing
-LLVM static archive is a build error; the build never silently falls back to
-shared LLVM.
+`lsp-types`, and `serde_json`, with internal file URI conversion. `Cargo.lock`
+fixes the dependencies. A missing LLVM static archive is a build error; the build
+never silently falls back to shared LLVM.
 
 On Fedora with LLVM 22 packages:
 

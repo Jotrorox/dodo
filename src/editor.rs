@@ -506,14 +506,17 @@ fn range(text: &str, span: Span) -> Value {
     json!({"start": position(text, span.start), "end": position(text, span.end.max(span.start))})
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn file_path(uri: &str) -> Option<PathBuf> {
     crate::lsp::uri_path(&uri.parse().ok()?).ok()
 }
 
 #[cfg(test)]
 fn file_uri(path: &Path) -> String {
-    url::Url::from_file_path(path).unwrap().into()
+    crate::file_uri::from_path(path)
+        .unwrap()
+        .as_str()
+        .to_owned()
 }
 
 /// Serve LSP JSON-RPC over framed streams. Returns the process exit status.
@@ -731,6 +734,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn local_uris_round_trip_escaped_characters() {
         let path = PathBuf::from("/tmp/dodo é #?.dodo");
         let uri = file_uri(&path);

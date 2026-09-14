@@ -3,7 +3,7 @@
 //! Open documents are authoritative in-memory overlays, including when imported
 //! by another document. Editor recovery retains independent valid syntax/bodies.
 use crate::diagnostic::{Diagnostic, Severity};
-use crate::{codegen, editor, format, package, sema};
+use crate::{codegen, editor, file_uri, format, package, sema};
 use lsp_server::{ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
     CompletionParams, DiagnosticRelatedInformation, DiagnosticSeverity,
@@ -17,7 +17,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use url::Url;
 
 #[derive(Default, PartialEq, Eq)]
 enum State {
@@ -682,7 +681,7 @@ impl Server {
                     || (document.path.is_none() && Path::new(document.uri.as_str()) == path)
             })
             .map(|document| document.uri.clone())
-            .or_else(|| Url::from_file_path(path).ok()?.as_str().parse().ok())
+            .or_else(|| file_uri::from_path(path).ok())
     }
 }
 
@@ -698,26 +697,7 @@ fn valid_name(name: &str) -> bool {
 }
 
 pub(crate) fn uri_path(uri: &Uri) -> Result<PathBuf, String> {
-    let url = Url::parse(uri.as_str()).map_err(|error| error.to_string())?;
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("source URI must not have a query or fragment".into());
-    }
-    let raw = url.path().as_bytes();
-    for (index, byte) in raw.iter().enumerate() {
-        if *byte == b'%'
-            && (raw
-                .get(index + 1)
-                .is_none_or(|byte| !byte.is_ascii_hexdigit())
-                || raw
-                    .get(index + 2)
-                    .is_none_or(|byte| !byte.is_ascii_hexdigit()))
-        {
-            return Err("invalid percent escape in source URI".into());
-        }
-    }
-    let path = url
-        .to_file_path()
-        .map_err(|()| "only local file URIs are supported")?;
+    let path = file_uri::to_path(uri)?;
     Ok(package::source_path(&path))
 }
 

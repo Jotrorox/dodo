@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
-use url::Url;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const VALID: &str = "package app\nfn main() -> i32 { return 0 }\n";
@@ -21,7 +20,7 @@ impl Workspace {
     fn new() -> Self {
         loop {
             let path = std::env::temp_dir().join(format!(
-                "dodo-lsp-{}-{} space # é 😀",
+                "dodo-lsp-{}-{} space # %20 + é 😀",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -34,7 +33,25 @@ impl Workspace {
     }
 
     fn uri(&self, name: &str) -> String {
-        Url::from_file_path(self.0.join(name)).unwrap().into()
+        // Encode fixtures independently of the server's conversion, so URI
+        // assertions also catch bugs in URIs generated for imported sources.
+        let path = self.0.join(name);
+        #[cfg(not(windows))]
+        let bytes = path.as_os_str().as_encoded_bytes();
+        #[cfg(windows)]
+        let path = path.to_str().unwrap().replace('\\', "/");
+        #[cfg(windows)]
+        let bytes = path.as_bytes();
+        let mut uri = String::from(if cfg!(windows) { "file:///" } else { "file://" });
+        for &byte in bytes {
+            if byte.is_ascii_alphanumeric() || b"/-._~:+".contains(&byte) {
+                uri.push(char::from(byte));
+            } else {
+                use std::fmt::Write;
+                write!(uri, "%{byte:02X}").unwrap();
+            }
+        }
+        uri
     }
 
     fn file(&self, name: &str, text: &str) -> String {
@@ -637,6 +654,100 @@ fn lsp_missing_imports_and_malformed_notifications_do_not_stop_the_server() {
         "{stderr}"
     );
     assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn lsp_rejects_invalid_file_uris_and_recovers() {
+    let workspace = Workspace::new();
+    let uri = workspace.uri("main.dodo");
+    let mut client = Client::start("--lsp");
+    client.initialize("file");
+    for invalid in [
+        format!("{uri}?query"),
+        format!("{uri}#"),
+        format!("{uri}%00"),
+        uri.replacen("file:", "https:", 1),
+        uri.replacen("file:///", "file://user@localhost/", 1),
+        uri.replacen("file:///", "file://localhost:80/", 1),
+        "file:relative.dodo".into(),
+        "file:///tmp/%".into(),
+        "file:///tmp/%0g".into(),
+    ] {
+        client.open(&invalid, VALID, 1);
+        assert!(client.diagnostics().is_empty(), "accepted {invalid}");
+    }
+    client.open(&uri, INVALID, 1);
+    assert_eq!(
+        client.diagnostics()[&uri]["diagnostics"][0]["message"],
+        "unknown binding `missing`"
+    );
+    client.change(&uri, VALID, 2);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    assert!(!client.shutdown().contains("panicked"));
+}
+
+#[test]
+#[cfg(unix)]
+fn lsp_reports_imports_in_non_utf8_directories() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let parent = Workspace::new();
+    let workspace = Workspace(parent.0.join(OsString::from_vec(b"non-utf8-\xff".to_vec())));
+    let text = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n";
+    let root = workspace.file("main.dodo", text);
+    let dependency = workspace.file(
+        "lib.dodo",
+        "package lib\npub fn value() -> i32 { return missing }\n",
+    );
+    assert!(dependency.contains("non-utf8-%FF"));
+    let mut client = Client::start("--lsp");
+    client.initialize("file");
+    client.open(&root, text, 1);
+    let diagnostics = client.diagnostics();
+    assert_eq!(diagnostics[&root]["diagnostics"], json!([]));
+    assert_eq!(
+        diagnostics[&dependency]["diagnostics"][0]["message"],
+        "unknown binding `missing`"
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_preserves_client_uri_spelling_for_open_imports() {
+    let workspace = Workspace::new();
+    let text = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n";
+    let root = workspace.file("main.dodo", text);
+    let dependency = workspace.file(
+        "lib.dodo",
+        "package lib\npub fn value() -> i32 { return 0 }\n",
+    );
+    let alias = dependency
+        .replacen("file:///", "FILE://LOCALHOST/", 1)
+        .replace("%C3%A9", "%c3%a9");
+    let mut client = Client::start("--lsp");
+    client.initialize("file");
+    client.open(
+        &alias,
+        "package lib\npub fn value() -> i32 { return missing }\n",
+        1,
+    );
+    client.diagnostics();
+    client.open(&root, text, 1);
+    let diagnostics = client.diagnostics();
+    assert_eq!(
+        diagnostics[&alias]["diagnostics"][0]["message"],
+        "unknown binding `missing`"
+    );
+    assert!(!diagnostics.contains_key(&dependency));
+    client.change(
+        &alias,
+        "package lib\npub fn value() -> i32 { return 7 }\n",
+        2,
+    );
+    let diagnostics = client.diagnostics();
+    assert_eq!(diagnostics[&alias]["diagnostics"], json!([]));
+    assert_eq!(diagnostics[&root]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
 }
 
 #[test]

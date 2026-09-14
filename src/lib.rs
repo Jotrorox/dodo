@@ -11,4 +11,5 @@ pub mod package;
 pub mod parser;
 pub mod sema;
 
+mod file_uri;
 mod prepare;
