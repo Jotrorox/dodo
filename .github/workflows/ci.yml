@@ -52,7 +52,8 @@ jobs:
           cd "$RUNNER_TEMP/openssl-3.5.8"
           ./Configure --prefix="$test_tls_prefix" --libdir=lib no-shared no-tests
           make -j2
-          make install_sw
+          # install_sw omits openssl.cnf, which TLS credential generation needs.
+          make install_sw install_ssldirs
           echo "CPATH=$test_tls_prefix/include" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$test_tls_prefix/lib" >> "$GITHUB_ENV"
           echo "$test_tls_prefix/bin" >> "$GITHUB_PATH"

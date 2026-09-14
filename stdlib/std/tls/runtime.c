@@ -272,7 +272,7 @@ int dodo_tls_shutdown(void *state, int *error) {
 }
 void dodo_tls_eof(void *state) {
     dodo_tls *s = state;
-    if (s && !s->eof) { s->eof = 1; BIO_shutdown_wr(s->wire); }
+    if (s && !s->eof) { s->eof = 1; (void)BIO_shutdown_wr(s->wire); }
 }
 int dodo_tls_alpn(void *state, unsigned char *bytes, size_t capacity) {
     dodo_tls *s = state;
