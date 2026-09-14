@@ -345,6 +345,168 @@ pub fn layout() -> u32 {
 }
 
 #[test]
+fn small_shared_payload_constructors_do_not_clear_inactive_bytes() {
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "constructors.dodo",
+        r#"package constructors
+pub enum Value { Empty, Small(u8), Large([256]u8) }
+pub fn small(value: u8) -> Value { Value.Small(value) }
+pub fn store_small(output: &mut Value, value: u8) { *output = Value.Small(value) }
+pub fn empty() -> Value { Value.Empty }
+pub fn small_ok(value: u8) -> u8![256]u8 { ok(value) }
+pub fn small_err(value: u8) -> [256]u8!u8 { err(value) }
+pub fn unit_ok() -> void![256]u8 { ok() }
+"#,
+    );
+    // Check real Cortex-M0 instructions: undef bytes in IR alone do not prove
+    // the backend avoided materializing the unused part of an aggregate return.
+    let path = workspace.0.join("constructors.s");
+    success(
+        workspace
+            .compiler(&[
+                "build",
+                "-O3",
+                "--emit",
+                "asm",
+                "--target",
+                "thumbv6m-none-eabi",
+                "--cpu",
+                "cortex-m0",
+            ])
+            .arg(source)
+            .arg("-o")
+            .arg(&path)
+            .output()
+            .unwrap(),
+    );
+    let assembly = fs::read_to_string(path).unwrap();
+    for (name, stores) in [
+        ("small", 2),
+        ("store_small", 2),
+        ("empty", 1),
+        ("small_ok", 2),
+        ("small_err", 2),
+        ("unit_ok", 1),
+    ] {
+        let body = assembly
+            .split_once(&format!("dodo.constructors.{name}:\n"))
+            .unwrap()
+            .1
+            .split_once(".Lfunc_end")
+            .unwrap()
+            .0;
+        let instructions: Vec<_> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('.'))
+            .collect();
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|line| line.starts_with("str"))
+                .count(),
+            stores,
+            "{name}: {body}"
+        );
+        assert!(
+            instructions.len() <= 4,
+            "unexpected constructor work in {name}: {body}"
+        );
+    }
+}
+
+#[test]
+fn partially_initialized_payloads_survive_separately_compiled_aggregate_copies() {
+    let workspace = Workspace::new();
+    let declarations = r#"package copies
+import "core/ptr"
+enum Value { Empty, Small(u8), Bytes([256]u8), Padded(u8, u64), Flag(bool), Pointer(*const u64) }
+struct Wrapped { value: Value, marker: u64 }
+"#;
+    // The relay cannot see which alternative is active. Its aggregate load/store
+    // must preserve all active bytes, including padding in other alternatives.
+    let relay = workspace.file(
+        "relay.dodo",
+        &format!(
+            r#"{declarations}
+extern "C" fn relay(input: *const Wrapped, output: *mut Wrapped) {{
+    unsafe {{ ptr.write(output, ptr.read(input)) }}
+}}
+"#
+        ),
+    );
+    let source = workspace.file(
+        "main.dodo",
+        &format!(
+            r#"{declarations}
+unsafe extern "C" fn relay(input: *const Wrapped, output: *mut Wrapped)
+fn identity<T>(value: T) -> T {{ value }}
+fn main() -> i32 {{
+    number := 0x123456789abcdef0u64
+    for i in 0..6 {{
+        value := match i {{
+            0 => Value.Small(0xabu8),
+            1 => Value.Bytes([0xcdu8; 256]),
+            2 => Value.Padded(0xefu8, number),
+            3 => Value.Flag(true),
+            4 => Value.Pointer(ptr.from_ref(&number)),
+            _ => Value.Empty,
+        }}
+        input := Wrapped{{value: value, marker: number}}
+        output := Wrapped{{value: Value.Empty, marker: 0u64}}
+        unsafe {{ relay(ptr.from_ref(&input), ptr.from_mut(&mut output)) }}
+        copied := identity(output)
+        if copied.marker != number {{ return 1 }}
+        match &copied.value {{
+            Value.Small(byte) => {{ if i != 0 || *byte != 0xabu8 {{ return 2 }} }},
+            Value.Bytes(bytes) => {{
+                if i != 1 {{ return 3 }}
+                for byte in bytes {{ if *byte != 0xcdu8 {{ return 4 }} }}
+            }},
+            Value.Padded(byte, word) => {{
+                if i != 2 || *byte != 0xefu8 || *word != number {{ return 5 }}
+            }},
+            Value.Flag(flag) => {{ if i != 3 || !*flag {{ return 6 }} }},
+            Value.Pointer(pointer) => {{
+                if i != 4 || unsafe {{ ptr.read(*pointer) }} != number {{ return 7 }}
+            }},
+            Value.Empty => {{ if i != 5 {{ return 8 }} }},
+        }}
+    }}
+    0
+}}
+"#
+        ),
+    );
+    for level in ["0", "3"] {
+        let object = workspace.0.join("relay.o");
+        success(
+            workspace
+                .compiler(&["build", "--emit", "obj", "-O", level])
+                .arg(&relay)
+                .arg("-o")
+                .arg(&object)
+                .output()
+                .unwrap(),
+        );
+        let binary = workspace.0.join("copies");
+        success(
+            workspace
+                .compiler(&["build", "-O", level])
+                .arg(&source)
+                .arg("--link-arg")
+                .arg(&object)
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .unwrap(),
+        );
+        success(Command::new(binary).output().unwrap());
+    }
+}
+
+#[test]
 fn shared_payload_values_survive_moves_borrows_and_propagation() {
     native(
         r#"package shared_values

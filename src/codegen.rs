@@ -420,15 +420,21 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         tag: IntValue<'ctx>,
         payload: Option<BasicValueEnum<'ctx>>,
     ) -> Result<BasicValueEnum<'ctx>> {
+        // Only the tag and active payload are initialized. Inactive bytes are
+        // unspecified, so clearing the whole union would add unnecessary stores.
+        // Use undef, not poison: aggregate copies may combine inactive bytes with
+        // active ones. Keep union_storage's byte representation to preserve every
+        // initialized byte, including those in another alternative's padding.
         let value = self
             .builder
-            .build_insert_value(ty.const_zero(), tag, 0, "tag")?;
+            .build_insert_value(ty.get_undef(), tag, 0, "tag")?;
+        let Some(payload) = payload else {
+            return Ok(value.into_struct_value().into());
+        };
         let ptr = self.alloca(ty.into(), "tagged.value")?;
         self.builder.build_store(ptr, value.into_struct_value())?;
-        if let Some(payload) = payload {
-            let p = self.builder.build_struct_gep(ty, ptr, 1, "payload")?;
-            self.builder.build_store(p, payload)?;
-        }
+        let p = self.builder.build_struct_gep(ty, ptr, 1, "payload")?;
+        self.builder.build_store(p, payload)?;
         Ok(self.builder.build_load(ty, ptr, "tagged")?)
     }
     fn declare_functions(&mut self) -> Result<()> {
@@ -1620,17 +1626,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         .iter()
                         .position(|v| v.name == *n)
                         .ok_or_else(|| error("unknown enum variant"))?;
-                    let v = self.ty(&e.ty)?.into_struct_type().const_zero();
-                    return Ok(self
-                        .builder
-                        .build_insert_value(
-                            v,
-                            self.context.i32_type().const_int(idx as u64, false),
-                            0,
-                            "enum.tag",
-                        )?
-                        .into_struct_value()
-                        .into());
+                    return self.tagged_value(
+                        self.ty(&e.ty)?.into_struct_type(),
+                        self.context.i32_type().const_int(idx as u64, false),
+                        None,
+                    );
                 }
                 if n == "len" {
                     self.collection(x)?.1.into()
