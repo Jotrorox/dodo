@@ -53,8 +53,8 @@ uses the project folder name: `hello/main.dodo` compiles to `build/hello`.
 
 Use [the command-line guide](https://jotrorox.github.io/dodo/command-line/) for
 formatting options, project folders, compiler outputs, optimization, and
-cross-target builds. For diagnostics and type hovers in an editor, configure its
-LSP client to run `dodo lsp` and follow the
+cross-target builds. For diagnostics, completion, navigation, rename, signature
+help, and formatting, configure your editor's LSP client to run `dodo lsp` and follow the
 [editor setup guide](https://jotrorox.github.io/dodo/editors/).
 
 ## Language and reference

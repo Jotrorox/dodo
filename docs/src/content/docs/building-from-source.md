@@ -181,7 +181,10 @@ trap tests avoids creating crash artifacts.
 
 `cargo test --locked --test lsp` exercises the real compiler's LSP lifecycle,
 framing, buffer updates, imported diagnostics, directory packages, Unicode
-positions, and recovery from invalid notifications.
+positions, completion, navigation, rename, signatures, formatting, target selection,
+and recovery from invalid source and notifications. Use the
+[LSP benchmark](lsp-performance.md) to measure responsiveness separately from
+correctness tests.
 
 The pipeline is organized into [`lexer`](https://github.com/Jotrorox/dodo/blob/main/src/lexer.rs),
 [`parser`](https://github.com/Jotrorox/dodo/blob/main/src/parser.rs), [`package`](https://github.com/Jotrorox/dodo/blob/main/src/package.rs),

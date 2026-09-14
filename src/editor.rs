@@ -1,11 +1,15 @@
-//! Source hovers and a small, full-document-sync Language Server Protocol server.
+//! Full-document editor analysis and shared UTF-16 protocol helpers.
 //!
 //! Positions use UTF-16 code units, as required by the default LSP encoding.
 //! Checking uses in-memory document overlays; editor changes never write files.
 use crate::ast::*;
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, Token, TokenKind};
-use crate::{parser, sema};
+use crate::{package, parser, sema};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+#[path = "editor_symbols.rs"]
+pub(crate) mod symbols;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 #[cfg(test)]
@@ -22,33 +26,53 @@ pub struct Document {
     text: String,
     start: usize,
     entries: Vec<HoverEntry>,
-    pub(crate) diagnostic: Option<Diagnostic>,
+    pub(crate) diagnostics: Vec<Diagnostic>,
+    pub(crate) index: Arc<symbols::Index>,
 }
 
 impl Document {
     /// Analyze a standalone document. The language server additionally resolves imports.
     pub fn new(text: String) -> Self {
-        Self::standalone(text)
+        Self::standalone(text, usize::BITS, std::path::PathBuf::from("untitled:"))
     }
 
-    fn standalone(text: String) -> Self {
-        let (mut program, diagnostic) = match parser::parse(&text) {
-            Ok(program) => (program, None),
-            Err(error) => (Program::default(), Some(error)),
+    pub(crate) fn standalone(text: String, bits: u32, path: std::path::PathBuf) -> Self {
+        let (mut program, mut diagnostics) = parser::parse_recovering(&text);
+        let original = program.clone();
+        diagnostics.extend(sema::check_recovering(&mut program, bits));
+        let mut aliases: BTreeMap<_, _> = program
+            .imports
+            .iter()
+            .map(|import| {
+                let name = import.rsplit('/').next().unwrap().to_owned();
+                (name.clone(), name)
+            })
+            .collect();
+        aliases.insert(String::new(), String::new());
+        aliases.insert(program.package.clone(), String::new());
+        let loaded = package::Loaded {
+            program,
+            diagnostics,
+            sources: vec![package::Source {
+                path: path.clone(),
+                text: text.clone(),
+                start: 0,
+            }],
+            namespaces: BTreeMap::from([(path, aliases)]),
         };
-        let diagnostic =
-            diagnostic.or_else(|| sema::check_for_target(&mut program, usize::BITS).err());
-        Self::from_checked(text, 0, &program, diagnostic)
+        let index = Arc::new(symbols::Index::new(&loaded, &original));
+        Self::from_checked(text, 0, &loaded.program, loaded.diagnostics, index)
     }
 
-    /// Build a hover index from the same checked AST used to publish diagnostics.
+    /// Build indices from the same checked AST used to publish diagnostics.
     pub(crate) fn from_checked(
         text: String,
         start: usize,
         program: &Program,
-        diagnostic: Option<Diagnostic>,
+        diagnostics: Vec<Diagnostic>,
+        symbols: Arc<symbols::Index>,
     ) -> Self {
-        let tokens = lexer::lex(&text).unwrap_or_default();
+        let (tokens, _) = lexer::lex_recovering(&text);
         let mut index = HoverIndex {
             program,
             tokens: &tokens,
@@ -60,7 +84,8 @@ impl Document {
             text,
             start,
             entries: index.entries,
-            diagnostic,
+            diagnostics,
+            index: symbols,
         }
     }
 
@@ -575,7 +600,11 @@ mod tests {
         let document = Document::new(
             "package test\nfn main() -> i32 {\nnumber := 42i32\nreturn number + 1\n}\n".into(),
         );
-        assert!(document.diagnostic.is_none(), "{:?}", document.diagnostic);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
         assert!(
             hover_at(&document, "number :=")["contents"]["value"]
                 .as_str()
@@ -599,7 +628,11 @@ mod tests {
     #[test]
     fn signatures_describe_receiver_and_return_contracts() {
         let document = Document::new(include_str!("../examples/borrowing.dodo").into());
-        assert!(document.diagnostic.is_none(), "{:?}", document.diagnostic);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
         for (needle, expected) in [
             ("view()", "shared borrow"),
             ("replace(20)", "mutable borrow"),
@@ -632,7 +665,7 @@ mod tests {
     #[test]
     fn invalid_document_retains_checked_bindings_and_contracts() {
         let document = Document::new("package test\nfn borrow(input: &i32) -> &i32 {\nreturn input\n}\nfn main() {\nnumber := 4i32\nbad := missing\n}\n".into());
-        assert!(document.diagnostic.is_some());
+        assert!(!document.diagnostics.is_empty());
         assert!(
             hover_at(&document, "number :=")["contents"]["value"]
                 .as_str()
@@ -651,7 +684,11 @@ mod tests {
     #[test]
     fn method_name_hover_does_not_replace_receiver_type() {
         let document = Document::new("package test\nstruct Value {\nnumber: i32\nfn view(&self) -> &i32 { return &self.number }\n}\nfn main() {\nview := Value{number: 1}\nresult := view.view()\n}\n".into());
-        assert!(document.diagnostic.is_none(), "{:?}", document.diagnostic);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
         let receiver = hover_at(&document, "view.view()");
         assert!(
             receiver["contents"]["value"]
@@ -869,7 +906,11 @@ mod tests {
     #[test]
     fn inferred_generic_call_hover_uses_readable_specialized_types() {
         let document = Document::new("package test\nfn identity<T>(value: T) -> T { return value }\nfn main() { result := identity(1i32) }\n".into());
-        assert!(document.diagnostic.is_none(), "{:?}", document.diagnostic);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
         assert!(
             hover_at(&document, "result :=")["contents"]["value"]
                 .as_str()

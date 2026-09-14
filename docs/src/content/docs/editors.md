@@ -1,13 +1,13 @@
 ---
 title: "Editor setup"
-description: "Configure dodo lsp for diagnostics, type hovers, and file or package checking."
+description: "Configure dodo lsp for completion, navigation, rename, signatures, formatting, and target-aware diagnostics."
 section: "Using Dodo"
 order: 120
 ---
 
 Dodo includes a Language Server Protocol (LSP) server. After
 [installing the compiler](installation.md), connect it to your editor's LSP
-client to get diagnostics and ownership information for `.dodo` files.
+client to get diagnostics, ownership information, and editing tools for `.dodo` files.
 
 ## Start the language server
 
@@ -42,14 +42,55 @@ point to the same source expressions as the command-line labels.
 ## Documents and synchronization
 
 The server supports initialization, shutdown, full-document open/change/close
-synchronization, save notifications, hover, and published diagnostics. It accepts
-local `file:` URIs and uses zero-based LSP line numbers, UTF-16 columns, and the
-host's pointer width. Open buffers supply unsaved source, including new files;
+synchronization, save notifications, hover, completion, definition, references,
+prepare-rename/rename, signature help, document formatting, and published diagnostics.
+It accepts local `file:` URIs and uses zero-based LSP line numbers and UTF-16 columns.
+Open buffers supply unsaved source, including new files;
 local imports use those buffers when available. Changes recheck open documents,
 saves refresh diagnostics, and closing a buffer restores its imported contents
 from disk.
 
-Untitled buffers receive standalone analysis, including diagnostics and hovers.
+Untitled buffers receive standalone analysis and editing tools.
+
+## Completion, navigation, and refactoring
+
+- Completion suggests visible declarations, local bindings, keywords, and types.
+  Typing `.` requests members of an imported package or a typed receiver. Imported
+  private declarations are excluded. Suggestions use the current unsaved buffer.
+- Go-to-definition and references use source locations across the loaded package
+  and imports. Local bindings retain their identity through nested shadowing.
+  References honor the client's option to include the declaration.
+- Rename returns a workspace edit for the identified declaration and its indexed
+  uses. It excludes comments and strings, rejects invalid names and possible name
+  capture, and includes open-buffer versions when the client supports versioned
+  document changes. The editor applies the edits; the server never writes files.
+- Signature help triggers on `(` and `,`, selects the active argument, and omits
+  the implicit receiver parameter for instance methods. It also works while a
+  call's argument list is incomplete.
+
+## Formatting
+
+Use your editor's document-format command or format-on-save setting. The server
+uses the same comment-preserving canonical formatter as `dodo fmt`, including its
+syntax migration and indentation rules. Client indentation preferences do not
+override the canonical style. It returns one whole-document edit, or no edits if
+the buffer is already formatted. Invalid syntax produces a request error and
+leaves the buffer untouched.
+
+## Compilation target
+
+Set `initializationOptions.target` to the same LLVM triple used by your project's
+`dodo check --target` or `dodo compile --target` command. For example:
+
+```json
+{"checkMode": "package", "target": "wasm32-unknown-unknown"}
+```
+
+The target controls both pointer-width checking (`usize`, `isize`, array bounds)
+and selection of hosted imports such as `std/fs/native`. It applies to file,
+package, dependency, fallback, and untitled analysis. Invalid triples are rejected
+during initialization. The default is LLVM's host target. Restart the server after
+changing the initialization options; there is no project manifest to infer them from.
 
 ## File and package checking
 
@@ -64,12 +105,25 @@ all immediate `.dodo` files, like a directory import; it does not select a
 
 ## Current limits
 
-Checks stop at the first compiler error per file or package. Error and warning
-severities are supported, although the compiler currently only produces errors.
-The server does not provide completion, rename, formatting, incremental analysis,
-a background file watcher, or checks of unopened workspace roots. Syntax errors
-can prevent hover analysis; a semantic error can leave later expressions without
-inferred types.
+Editor parsing recovers at statement and declaration boundaries. Semantic checking
+restores checker state after failed statements and continues with independent
+statements and functions, producing multiple diagnostics. Shared declaration,
+import-resolution, and preparation errors can still stop a package check; recovery
+can leave some expressions without inferred types or produce follow-on errors.
+Compilation and formatting retain strict error handling.
+
+Navigation and rename cover open documents and the packages/imports they load;
+there is no scan of unopened workspace roots or reverse dependencies. Bundled
+standard-library declarations contribute completion and signatures, but currently
+have no editor-readable source URI for navigation or edits. Rename conservatively
+refuses possible collisions, generic parameters, destructuring bindings, and fields
+or bindings requiring shorthand/pattern expansion. These restrictions avoid edits
+that could change a different binding or leave a partial rename.
+
+Checks remain synchronous and rebuild full-document analysis. There is no
+incremental analysis or background file watcher. Save a document to refresh its
+on-disk dependencies. See the [responsiveness measurements](lsp-performance.md)
+and benchmark commands before changing the analysis model.
 
 See [ownership diagnostics](diagnostics-and-editors.md) for annotated examples
 of the errors shown in the editor.

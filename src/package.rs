@@ -50,6 +50,10 @@ pub struct Source {
 pub struct Loaded {
     pub program: Program,
     pub sources: Vec<Source>,
+    /// Editor syntax diagnostics; strict loading leaves this empty.
+    pub diagnostics: Vec<Diagnostic>,
+    /// Per-source package prefix (empty key) and visible import aliases.
+    pub(crate) namespaces: BTreeMap<PathBuf, BTreeMap<String, String>>,
 }
 
 impl Loaded {
@@ -158,8 +162,27 @@ pub fn load_with_overlays_for_target(
     overlays: &BTreeMap<PathBuf, String>,
     target: &str,
 ) -> Result<Loaded, LoadError> {
+    load_internal(path, overlays, target, false)
+}
+
+/// Recover syntax in editor buffers and dependencies without weakening builds.
+pub fn load_for_editor(
+    path: &Path,
+    overlays: &BTreeMap<PathBuf, String>,
+    target: &str,
+) -> Result<Loaded, LoadError> {
+    load_internal(path, overlays, target, true)
+}
+
+fn load_internal(
+    path: &Path,
+    overlays: &BTreeMap<PathBuf, String>,
+    target: &str,
+    recover: bool,
+) -> Result<Loaded, LoadError> {
     let mut loader = Loader {
         overlays,
+        recover,
         target: target.to_owned(),
         ..Loader::default()
     };
@@ -195,6 +218,7 @@ pub fn load_with_overlays_for_target(
             intrinsic.rsplit('/').next().unwrap().to_owned(),
         );
     }
+    let mut namespaces = BTreeMap::new();
     for (key, mut module) in loader.modules {
         if key == root {
             program.package = module.program.package.clone();
@@ -212,6 +236,10 @@ pub fn load_with_overlays_for_target(
             &visible_packages,
         )
         .map_err(|error| format!("{key}: {error}"))?;
+        visible_packages.insert(String::new(), prefixes[&key].clone());
+        for path in module.sources {
+            namespaces.insert(path, visible_packages.clone());
+        }
         append(&mut program, module.program);
     }
     program.imports.sort();
@@ -219,16 +247,21 @@ pub fn load_with_overlays_for_target(
     Ok(Loaded {
         program,
         sources: loader.sources,
+        diagnostics: loader.diagnostics,
+        namespaces,
     })
 }
 
 struct Module {
+    sources: Vec<PathBuf>,
     program: Program,
     alias: String,
     import_aliases: BTreeMap<String, ModuleId>,
 }
 
 struct Loader<'a> {
+    recover: bool,
+    diagnostics: Vec<Diagnostic>,
     target: String,
     overlays: &'a BTreeMap<PathBuf, String>,
     modules: BTreeMap<ModuleId, Module>,
@@ -241,6 +274,8 @@ impl Default for Loader<'_> {
     fn default() -> Self {
         static EMPTY: BTreeMap<PathBuf, String> = BTreeMap::new();
         Self {
+            recover: false,
+            diagnostics: vec![],
             target: String::new(),
             overlays: &EMPTY,
             modules: BTreeMap::new(),
@@ -328,6 +363,7 @@ impl Loader<'_> {
             path.parent().unwrap_or(Path::new("."))
         };
         let mut program = Program::default();
+        let source_paths = files.clone();
         for file in files {
             let text = match &id {
                 ModuleId::Bundled(import) => BUNDLED_SOURCES
@@ -342,14 +378,26 @@ impl Loader<'_> {
                     })?,
                 },
             };
-            let mut unit = parser::parse(&text).map_err(|diagnostic| LoadError {
-                diagnostic,
-                source: Some(Box::new(Source {
-                    path: file.clone(),
-                    text: text.clone(),
-                    start: 0,
-                })),
-            })?;
+            let mut unit = if self.recover {
+                let (unit, diagnostics) = parser::parse_recovering(&text);
+                for mut diagnostic in diagnostics {
+                    shift(&mut diagnostic.span, self.offset);
+                    for label in &mut diagnostic.labels {
+                        shift(&mut label.span, self.offset);
+                    }
+                    self.diagnostics.push(diagnostic);
+                }
+                unit
+            } else {
+                parser::parse(&text).map_err(|diagnostic| LoadError {
+                    diagnostic,
+                    source: Some(Box::new(Source {
+                        path: file.clone(),
+                        text: text.clone(),
+                        start: 0,
+                    })),
+                })?
+            };
             if program.package.is_empty() {
                 program.package = unit.package.clone();
             }
@@ -495,6 +543,7 @@ impl Loader<'_> {
         self.modules.insert(
             id.clone(),
             Module {
+                sources: source_paths,
                 program,
                 alias,
                 import_aliases,
