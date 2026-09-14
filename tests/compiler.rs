@@ -1011,6 +1011,14 @@ fn arithmetic_and_index_traps_survive_optimization() {
             "u8 value = 200\nvalue *= 2\nreturn value as i32",
         ),
         (
+            "overflow in wrapping argument",
+            "value := 255u8\nreturn core.wrapping_mul(value + 1u8, 0u8) as i32",
+        ),
+        (
+            "overflow after wrapping result",
+            "value := core.wrapping_sub(0u8, 1u8)\nreturn (value + 1u8) as i32",
+        ),
+        (
             "division by zero",
             "i32 value = 12\ni32 zero = 0\nreturn value / zero",
         ),
