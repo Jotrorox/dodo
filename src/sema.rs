@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 mod generics;
 mod ownership;
+mod slices;
 mod uses;
 
 use generics::{instantiate, intrinsic_result_type};
@@ -98,6 +99,7 @@ fn check_program(
                         dependency: false,
                         root: usize::MAX / 2 + id,
                         fields: vec![],
+                        partitions: vec![],
                         mutable: context.carries_mutable_borrow(&parameter.ty),
                         origin: parameter.span,
                         via: vec![],
@@ -653,6 +655,7 @@ struct Checker<'a> {
     context: &'a Context,
     scopes: Vec<Vec<Variable>>,
     next_id: usize,
+    next_partition: usize,
     return_ty: Type,
     from: Vec<String>,
     return_contract: Option<Span>,
@@ -683,6 +686,7 @@ impl<'a> Checker<'a> {
             context,
             scopes: vec![vec![]],
             next_id: 1,
+            next_partition: 1,
             return_ty,
             from,
             return_contract: None,
@@ -1151,6 +1155,7 @@ impl<'a> Checker<'a> {
                 for loan in &place.loans {
                     self.conflict(loan, Access::Write, target.span)?;
                 }
+                self.check_split_field_assignment(target)?;
                 let val = self.expr(value, Some(&place.ty), true)?;
                 self.expect(&place.ty, &val.ty, value.span)?;
                 if let Some(binary) = op {
@@ -1383,6 +1388,8 @@ impl<'a> Checker<'a> {
                         .collect(),
                 );
                 self.loop_depth += 1;
+                let first_partition = self.next_partition;
+                let split_depth = self.scopes.len();
                 if let Some(e) = condition {
                     let val = self.expr(e, Some(&Type::Bool), false)?;
                     self.expect(&Type::Bool, &val.ty, e.span)?;
@@ -1394,6 +1401,7 @@ impl<'a> Checker<'a> {
                     self.temporary.clear();
                 }
                 self.loop_depth -= 1;
+                self.check_split_loop_escape(first_partition, split_depth, span)?;
                 self.loop_uses.pop();
                 self.check_loop_moves(&before, span)?;
                 self.scopes = merge_states(before, self.scopes.clone());
@@ -1543,8 +1551,10 @@ impl<'a> Checker<'a> {
                 }
                 self.loop_uses.push(loop_uses);
                 self.loop_depth += 1;
+                let first_partition = self.next_partition;
                 self.block(body, false)?;
                 self.loop_depth -= 1;
+                self.check_split_loop_escape(first_partition, self.scopes.len() - 1, span)?;
                 self.loop_uses.pop();
                 if mutable {
                     for variable in self.scopes.iter().take(self.scopes.len() - 1).flatten() {
@@ -2168,6 +2178,16 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Struct(name, fields) => {
+                if self
+                    .context
+                    .split_mut_element(&Type::Named(name.clone()))
+                    .is_some()
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        "SplitMut must be constructed by slice.split_at_mut",
+                    ));
+                }
                 let declaration = self
                     .context
                     .structs
@@ -2763,6 +2783,7 @@ impl<'a> Checker<'a> {
                             dependency: false,
                             root: variable.id,
                             fields: vec![],
+                            partitions: vec![],
                             mutable: !variable.immutable,
                             origin: span,
                             via: vec![],
@@ -3163,6 +3184,9 @@ impl<'a> Checker<'a> {
         expected: Option<&Type>,
         span: Span,
     ) -> Check<Value> {
+        if name == "core.mem.split_at_mut" {
+            return self.split_at_mut(type_args, args, span);
+        }
         if matches!(
             name,
             "core.wrapping_add" | "core.wrapping_sub" | "core.wrapping_mul"
@@ -4073,6 +4097,9 @@ impl<'a> Checker<'a> {
         immutable: bool,
         span: Span,
     ) -> Check<()> {
+        if self.bind_split_pattern(pattern, &bindings, value, immutable, span)? {
+            return Ok(());
+        }
         let mut paths = HashMap::new();
         // Borrow-carrying aggregates also track loans rooted in their stored
         // references' sources. Those roots do not share the aggregate's field

@@ -1,0 +1,62 @@
+package slice_split
+import "core/slice"
+import "core/mem"
+
+fn both(left: &mut[i32], right: &mut[i32]) {
+    left[0] += 10
+    right[0] += 20
+}
+fn forward<T>(data: &mut[T], mid: usize) -> Option<slice.SplitMut<T>> from(data) {
+    return slice.split_at_mut(data, mid)
+}
+fn identity<T>(value: T) -> T from(value) { return value }
+fn first_half(data: &mut[i32]) -> &mut[i32] from(data) {
+    let some(slice.SplitMut{left, right: _}) = slice.split_at_mut(data, 1) else { for { assert(false) } }
+    return left
+}
+fn main() {
+    a := [1i32, 2i32, 3i32, 4i32]
+    parts := forward(&mut a, 2)
+    moved := identity(parts)
+    let some(pair) = moved else { for { assert(false) } }
+    let slice.SplitMut{left, right} = pair
+    both(left, right)
+    x := &mut left[1]
+    y := &mut right[1]
+    *x += 30
+    *y += 40
+    assert_eq(*x + *y, 76i32)
+    let some(slice.SplitMut{left: inner, right: tail}) = slice.split_at_mut(left, 1) else { for { assert(false) } }
+    both(inner, tail)
+    right[0] += 100
+    assert_eq(inner[0], 21i32)
+    assert_eq(tail[0], 52i32)
+    assert_eq(right[0], 123i32)
+    // Last uses of nested views recover the parent slice, then the owner.
+    left[0] += 1
+    assert_eq(left[0], 22i32)
+    a[0] += 1
+    assert_eq(a[0], 23i32)
+    first := first_half(&mut a)
+    first[0] = 7
+    assert_eq(a[0], 7i32)
+    for mid in 0usize..5usize {
+        let some(slice.SplitMut{left: l, right: r}) = slice.split_at_mut(&mut a, mid) else { for { assert(false) } }
+        assert_eq(l.len, mid)
+        assert_eq(r.len, 4usize - mid)
+        for item in l { *item += 1 }
+        for item in r { *item += 1 }
+    }
+    assert_eq(a[0], 12i32)
+    let none = slice.split_at_mut(&mut a, 5) else { for { assert(false) } }
+    let none = slice.split_at_mut(&mut a, core.wrapping_sub(0usize, 1usize)) else { for { assert(false) } }
+    a[0] = 8
+    empty := [0]i32{}
+    let some(slice.SplitMut{left: e1, right: e2}) = slice.split_at_mut(&mut empty, 0) else { for { assert(false) } }
+    assert_eq(e1.len + e2.len, 0usize)
+}
+
+@test
+fn split_at_mut_suite() {
+    main()
+}

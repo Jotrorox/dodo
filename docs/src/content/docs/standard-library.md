@@ -28,7 +28,7 @@ HTTP, JSON/TOML, and peripheral drivers are not implemented.
 | `core/mmio` | Width-specific volatile device access. |
 | `core/num` | Checked, saturating, and wrapping `usize` arithmetic; alignment calculations. |
 | `core/bytes` | Byte comparisons, searching, copying, filling, reversing, endian reads/writes. |
-| `core/slice` | Optional checked element and subslice access, preserving source borrows. |
+| `core/slice` | Optional checked element/subslice access and disjoint mutable splitting, preserving source borrows. |
 | `core/ascii` | ASCII classification, case conversion, decimal and hexadecimal digit values. |
 | `core/option` | Moving `take`, `replace`, and `unwrap_or` helpers. |
 | `alloc/error` | Shared `AllocError` values. |
@@ -113,6 +113,11 @@ range before changing any byte. They work independently of CPU endianness.
 index. Empty valid ranges succeed, reversed/out-of-bounds ranges return `none`.
 Returned borrows cannot outlive or conflict with their source. `is_empty` works
 with any element type.
+
+`slice.split_at_mut(data, mid)` returns `Option<slice.SplitMut<T>>`. Consume
+the pair with a struct pattern to obtain simultaneously usable, disjoint mutable
+halves. See [mutable slice splitting](slice-splitting.md) for bounds, reborrowing,
+source dependencies, and the pair's construction and mutation restrictions.
 
 `ascii` classifies bytes with `is_ascii`, `is_digit`, `is_hex_digit`,
 `is_lowercase`, `is_uppercase`, `is_alphabetic`, `is_alphanumeric`,
