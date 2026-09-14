@@ -1,0 +1,186 @@
+package container_element_baseline
+
+import "core/ptr"
+import "std/collections"
+
+// Raw counters instrument destruction only. Element references and Result
+// transfers below use checked, visible storage throughout.
+struct Token {
+    counter: *mut i32
+    weight: i32
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.counter, ptr.read(self.counter) + self.weight)
+        }
+    }
+}
+struct Observed {
+    value: &i32
+    counter: *mut i32
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.counter, ptr.read(self.counter) + *self.value)
+        }
+    }
+}
+struct Nested {
+    value: Option<Observed>
+}
+enum Envelope {
+    Value(Nested), Empty
+}
+pub struct RefPolicy {
+    pub fn equal<T>(&self, a: &T, b: &T) -> bool {
+        return **a == **b
+    }
+}
+
+fn references(counter: *mut i32) -> i32 {
+    first := 1i32
+    second := 2i32
+    data := [&first, &second]
+    policy := RefPolicy {}
+    needle := &second
+    match collections.find(&data, &needle, &policy) {
+        some(index) => {
+            if index != 1 {
+                return 1
+            }
+        },
+        none => {
+            return 2
+        },
+    }
+    // Whole-value replacement records the new source, and destroys the old
+    // active payload. A subsequent move transfers the destructor dependency.
+    value := Envelope.Value(Nested { value: some(Observed { value: &first, counter: counter }) })
+    value = Envelope.Value(Nested { value: some(Observed { value: &second, counter: counter }) })
+    unsafe {
+        if ptr.read(counter) != 1 {
+            return 3
+        }
+    }
+    moved := value
+    core.drop(moved)
+    unsafe {
+        if ptr.read(counter) != 3 {
+            return 4
+        }
+    }
+    {
+        implicit := Observed { value: &second, counter: counter }
+    }
+    unsafe {
+        if ptr.read(counter) != 5 {
+            return 5
+        }
+    }
+    return 0
+}
+
+fn consume(value: Option<Result<Token, Token>>) {
+    match value {
+        some(result) => {
+            match result {
+                ok(_) => {}, err(_) => {}
+            }
+        },
+        none => {},
+    }
+}
+fn fail(counter: *mut i32) -> Token!Token {
+    return err(Token { counter: counter, weight: 1000 })
+}
+fn propagate(counter: *mut i32) -> Token!Token {
+    cleanup := Token { counter: counter, weight: 100 }
+    value := fail(counter)?
+    return ok(value)
+}
+fn results(counter: *mut i32) -> i32 {
+    value: Option<Result<Token, Token>> = some(ok(Token { counter: counter, weight: 1 }))
+    match &value {
+        some(result) => {
+            match result {
+                ok(_) => {}, err(_) => {}
+            }
+        },
+        none => {},
+    }
+    // Matching by reference handles but does not destroy the payload.
+    unsafe {
+        if ptr.read(counter) != 0 {
+            return 6
+        }
+    }
+    value = some(err(Token { counter: counter, weight: 10 }))
+    after_replacement := unsafe {
+        ptr.read(counter)
+    }
+    consume(value)
+    if after_replacement != 1 {
+        return 7
+    }
+    unsafe {
+        if ptr.read(counter) != 11 {
+            return 8
+        }
+    }
+    consume(some(propagate(counter)))
+    unsafe {
+        if ptr.read(counter) != 1111 {
+            return 9
+        }
+    }
+    {
+        implicit: Token!Token = err(Token { counter: counter, weight: 10000 })
+        match &implicit {
+            ok(_) => {}, err(_) => {}
+        }
+    }
+    unsafe {
+        if ptr.read(counter) != 11111 {
+            return 10
+        }
+    }
+    // Shared/mutable observation is still allowed; replacing plain success
+    // payloads does not publish a new Result discriminant or obligation.
+    number: i32!u8 = ok(1)
+    match &mut number {
+        ok(n) => {
+            *n = 2
+        }, err(_) => {}
+    }
+    number = err(3)
+    alias := &number
+    match alias {
+        ok(_) => {
+            return 11
+        }, err(e) => {
+            if *e != 3 {
+                return 12
+            }
+        }
+    }
+    return 0
+}
+fn main() -> i32 {
+    reference_drops := 0i32
+    result_drops := 0i32
+    code := references(ptr.from_mut(&mut reference_drops))
+    if code != 0 {
+        return code
+    }
+    code = results(ptr.from_mut(&mut result_drops))
+    if code != 0 {
+        return code
+    }
+    if reference_drops != 5 || result_drops != 11111 {
+        return 13
+    }
+    return 0
+}
+
+@test
+fn container_element_baseline_suite() {
+    assert_eq(main(), 0, "visible element ownership baseline failed")
+}

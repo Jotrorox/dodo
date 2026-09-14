@@ -129,6 +129,63 @@ fn memory_exchanges_cannot_discard_new_result_obligations() {
 }
 
 #[test]
+fn indirect_assignments_cannot_erase_or_publish_result_obligations() {
+    // Matching the old binding cleared its sole pending_result bit; indirect
+    // stores did not set it again or check an old nested pending obligation.
+    for body in [
+        "r: i32!u8 = ok(1)\nmatch &r { ok(_) => {}, err(_) => {} }\nalias := &mut r\n*alias = err(2)",
+        "r := Outcome { result: ok(1) }\nmatch &r { Outcome { result: ok(_) } => {}, Outcome { result: err(_) } => {} }\nr.result = err(2)",
+        // Overwriting a still-pending nested value is also forbidden.
+        "r := Outcome { result: err(1) }\nr.result = ok(2)\nmatch r { Outcome { result: ok(_) } => {}, Outcome { result: err(_) } => {} }",
+        "r: [1]Result<i32, u8> = [err(1)]\nr[0] = ok(2)",
+        "r: Option<i32!u8> = none\nmatch &r { some(value) => { match value { ok(_) => {}, err(_) => {} } }, none => {} }\nalias := &mut r\n*alias = some(err(2))",
+    ] {
+        rejects(
+            &format!("package app\nstruct Outcome {{ result: i32!u8 }}\nfn main() {{\n{body}\n}}"),
+            "assigning Result-containing values through a field, index, or reference is unsupported",
+        );
+    }
+    for body in [
+        "fn store(out: &mut Result<i32, u8>) { *out = err(2) }",
+        "fn store(out: &mut[Result<i32, u8>]) { out[0] = err(2) }",
+        "fn store(out: &mut Option<Result<i32, u8>>) { *out = none }",
+        "fn store(out: &mut Outcome) { out.result = err(2) }",
+        "fn store(out: &mut[Outcome]) { out[0] = Outcome { result: err(2) } }",
+        "fn store(out: &mut[Envelope]) { out[0] = Envelope.Error(err(2)) }",
+        "fn store(out: &mut [1]Result<i32, u8>) { *out = [err(2)] }",
+        "fn store(out: &mut Result<i32, u8>, value: Result<i32, u8>) { *out = value }",
+        // A callee handling the old referent cannot publish a fresh obligation.
+        "fn store(out: &mut Result<i32, u8>) { match &*out { ok(_) => {}, err(_) => {} }\n*out = err(2) }",
+    ] {
+        rejects(
+            &format!(
+                "package app\nstruct Outcome {{ result: i32!u8 }}\nenum Envelope {{ Error(i32!u8), Empty }}\n{body}\n"
+            ),
+            "assigning Result-containing values through a field, index, or reference is unsupported",
+        );
+    }
+}
+
+#[test]
+fn whole_binding_replacement_keeps_new_results_pending_on_every_exit() {
+    for tail in [
+        "r = err(2)",
+        "r = err(2)\nr = ok(3)",
+        "if flag { r = err(2) }",
+        "for flag { r = err(2)\nbreak }",
+        "r = err(2)\ncore.drop(r)",
+        "r = err(2)\n_ = r",
+    ] {
+        rejects(
+            &format!(
+                "package app\nfn test(flag: bool) {{ r: i32!u8 = ok(1)\nmatch &r {{ ok(_) => {{}}, err(_) => {{}} }}\n{tail}\n}}"
+            ),
+            "Result",
+        );
+    }
+}
+
+#[test]
 fn raw_copy_requires_unsafe_and_a_writable_destination() {
     rejects(
         "package app\nimport \"core/ptr\"\nfn main() -> i32 { source := 1u8\ndestination := 0u8\nptr.copy(ptr.from_ref(&source), ptr.from_mut(&mut destination), 1usize)\nreturn 0\n}\n",

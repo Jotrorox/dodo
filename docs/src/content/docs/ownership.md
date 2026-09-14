@@ -52,6 +52,19 @@ explicitly unsupported. Bind a returned mutable view to a local before assigning
 through its fields; chained assignment through a call can be rejected by the
 conservative temporary-loan checker.
 
+Storing a checked reference through a field, index, or dereference of borrowed
+storage remains rejected: `from(...)` describes returned dependencies, not
+updates to the caller's stored dependencies. Direct owned aggregate replacement
+is supported. The [container element design](container-elements.md) describes
+the separate mutation effects needed for insertion and ownership-returning removal.
+
+Result handling state belongs to whole owned bindings. Assignments of
+Result-containing values through fields, indices, or references are rejected,
+including nested aggregates and local aliases. Handle the old value and replace
+the whole owned binding instead; the replacement has a new handling obligation.
+Assigning plain payload data through a matched mutable Result borrow is still
+allowed. These restrictions do not add support for Result container elements.
+
 ## Diagnosing ownership errors
 
 Compiler errors label the conflicting operation, the original borrow or move,

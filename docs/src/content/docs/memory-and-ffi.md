@@ -126,6 +126,16 @@ are evaluated after the pointer (and count for slices), even though their
 address is not used by the generated view. Safe container methods establish the
 unsafe invariant privately and return ordinary checked views.
 
+These are two independent restrictions. A stored reference needs its referent
+dependencies transferred on insertion and removal; an owner loan alone only
+protects storage. A stored Result needs its pending handling obligation
+transferred as well, including on failed insertion and destruction. Matching a
+value before replacing it does not handle the replacement. Ordinary assignment
+of Result-containing values through fields, indices, or references is rejected
+for the same missing handling-state transfer. See the
+[container element design and blocker tests](container-elements.md) for the
+proposed invariants; no raw-storage restriction is relaxed.
+
 `mem.str_from_utf8` requires the complete byte slice to be valid UTF-8. Prefer
 safe `text.Text.new(bytes)?.as_str()` after binding the text view. It creates no
 allocation and does not extend the source lifetime.

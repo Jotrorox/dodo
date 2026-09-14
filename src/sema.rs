@@ -1202,6 +1202,17 @@ impl<'a> Checker<'a> {
                     variable.moved_at = None;
                     variable.deps = val.deps;
                     variable.pending_result = pending_result;
+                } else if pending_result {
+                    // Handling state belongs to a whole local Variable. A field,
+                    // index, or dereference has no independent obligation state;
+                    // external storage may not have a local owner at all. Neither
+                    // overwriting its old Result nor publishing a new one can be
+                    // checked here, even if the caller previously matched it.
+                    return Err(Diagnostic::new(
+                        span,
+                        "assigning Result-containing values through a field, index, or reference is unsupported",
+                    )
+                    .note("handle the old Result and replace the whole owned binding so the new handling obligation can be tracked"));
                 } else if self.context.carries_borrow(&place.ty) {
                     // Field replacement may narrow an aggregate's lifetime, never erase
                     // its existing conservative dependency set.
