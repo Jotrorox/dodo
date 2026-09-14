@@ -5,6 +5,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -42,7 +43,7 @@ def main() -> None:
         bundle = scratch / args.archive.stem
         compiler = bundle / "dodo.exe"
         for name in ("dodo.exe", "INSTALL.txt", "LICENSE", "licenses/LLVM-LICENSE.txt", "licenses/libxml2-Copyright",
-                     "licenses/Unicode-LICENSE.txt", "licenses/rust/COPYRIGHT-library.html", "examples/hello.dodo"):
+                     "licenses/Unicode-LICENSE.txt", "licenses/rust/COPYRIGHT-library.html"):
             if not (bundle / name).is_file():
                 raise RuntimeError(f"Release is missing {name}")
 
@@ -71,10 +72,14 @@ def main() -> None:
             return result.stdout.strip()
 
         assert run(compiler, "--version") == f"dodo {version} (LLVM 22, BSD-2-Clause)"
-        hello = str(Path(bundle.name) / "examples/hello.dodo")
-        portable = str(Path(bundle.name) / "examples/io.dodo")
+        # Test sources come from the checkout and stay outside the extracted bundle.
+        examples = Path(__file__).resolve().parent.parent / "examples"
+        for name in ("hello.dodo", "io.dodo", "bytes.dodo"):
+            shutil.copy2(examples / name, scratch / name)
+        hello = "hello.dodo"
+        portable = "io.dodo"
         run(compiler, "check", hello)
-        run(compiler, "check", str(Path(bundle.name) / "examples/bytes.dodo"))
+        run(compiler, "check", "bytes.dodo")
         print("PASS extracted compiler: version, source checks, embedded standard library", flush=True)
 
         link = ["--linker", args.linker]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package a Linux or Windows compiler, examples, and dependency notices."""
+"""Package a Linux or Windows compiler, installation instructions, and license notices."""
 
 from pathlib import Path
 import argparse
@@ -54,10 +54,7 @@ def main() -> None:
         bundle = Path(temporary) / name
         bundle.mkdir()
         shutil.copy2(binary, bundle / executable)
-        for filename in ("LICENSE", "README.md", "CHANGELOG.md"):
-            shutil.copy2(ROOT / filename, bundle / filename)
-        shutil.copytree(ROOT / "examples", bundle / "examples")
-        shutil.copytree(ROOT / "docs/src/content/docs", bundle / "docs/src/content/docs")
+        shutil.copy2(ROOT / "LICENSE", bundle / "LICENSE")
         notices = bundle / "licenses"
         notices.mkdir()
         shutil.copy2(ROOT / "stdlib/std/LICENSE.unicode", notices / "Unicode-LICENSE.txt")
