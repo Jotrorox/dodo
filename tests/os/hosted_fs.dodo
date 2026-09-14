@@ -1,0 +1,86 @@
+package hosted_fs
+import "std/fs"
+import "std/io"
+import "std/platform"
+import "std/platform/error"
+import "core/bytes"
+import "core/mem"
+
+fn run() -> void!fs.FileError {
+    workspace := platform.workspace()
+    output := [88u8; 8]
+    match fs.read_file("missing Ω.txt", &mut output, &mut workspace) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason.cause.kind == error.Kind.NotFound && reason.cause.code != 0)
+            assert(reason.transferred == 0 && output[0] == 88)
+        }
+    }
+    fs.write_file("data Ω 😀.txt", b"12345678", &mut workspace)?
+    exact := fs.read_file("data Ω 😀.txt", &mut output, &mut workspace)?
+    assert(exact.eof && exact.read == 8 && bytes.equal(&output, b"12345678"))
+    small := fs.read_file("data Ω 😀.txt", &mut output[..7], &mut workspace)?
+    assert(!small.eof && small.read == 7)
+    zero := fs.read_file("data Ω 😀.txt", &mut output[..0], &mut workspace)?
+    assert(!zero.eof && zero.read == 0)
+    fs.write_file("data Ω 😀.txt", b"hi", &mut workspace)?
+    short := fs.read_file("data Ω 😀.txt", &mut output, &mut workspace)?
+    assert(short.eof && short.read == 2 && bytes.equal(&output[..2], b"hi"))
+    fs.write_file("data Ω 😀.txt", b"", &mut workspace)?
+    empty := fs.read_file("data Ω 😀.txt", &mut output[..0], &mut workspace)?
+    assert(empty.eof && empty.read == 0)
+    match fs.write_file("bad\x00name", b"lost", &mut workspace) {
+        ok() => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.cause.kind == error.Kind.InvalidInput && reason.transferred == 0)
+        }
+    }
+    options := fs.OpenOptions.create_new()
+    match fs.File.open_utf8("data Ω 😀.txt", &options, &mut workspace) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.AlreadyExists && reason.code != 0)
+        }
+    }
+    read := fs.OpenOptions.read_only()
+    match fs.File.open_utf8("data Ω 😀.txt", &read, &mut workspace) {
+        ok(file) => {
+            match file.close() {
+                ok() => {}, err(_) => {
+                    assert(false)
+                }
+            }
+        }
+        err(_) => {
+            assert(false)
+        }
+    }
+    // Repeated open failures/successes exercise all early cleanup paths.
+    for i in 0..80 {
+        report := fs.read_file("data Ω 😀.txt", &mut output, &mut workspace)?
+        assert(report.eof)
+    }
+    long := [97u8; 4096]
+    value := unsafe {
+        mem.str_from_utf8(&long)
+    }
+    match fs.read_file(value, &mut output, &mut workspace) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.cause.kind == error.Kind.BufferTooSmall && reason.transferred == 0)
+        }
+    }
+    return ok()
+}
+fn main() {
+    match run() {
+        ok() => {}, err(_) => {
+            assert(false, "hosted file operation failed")
+        }
+    }
+}

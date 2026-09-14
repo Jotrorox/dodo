@@ -1,0 +1,60 @@
+package console_checks
+import "std/console"
+import "std/fmt"
+import "std/io"
+import "core/bytes"
+
+fn verify() -> void!io.Error {
+    // Every wrapper can be destroyed before later use of the same stream.
+    {
+        input := console.stdin();
+        core.drop(input)
+    }
+    {
+        output := console.stdout();
+        core.drop(output)
+    }
+    {
+        errors := console.stderr();
+        core.drop(errors)
+    }
+    console.println("Hello, world!")?
+    number := fmt.signed(42)
+    console.println_value(&number)?
+    output := console.stdout()
+    output.print("text")?
+    output.println(" line")?
+    output.print_value(&number)?
+    output.println("")?
+    errors := console.stderr()
+    reason := io.Error { kind: io.ErrorKind.Closed, transferred: 0, code: 9 }
+    errors.println_value(&reason)?
+    storage := [0u8; 16]
+    {
+        input := console.stdin()
+        empty := input.read_line(&mut storage[..0])?
+        assert(empty.count == 0 && empty.end == io.LineEnd.Full)
+        line := input.read_line(&mut storage[..3])?
+        assert(line.count == 3 && line.end == io.LineEnd.Full)
+        assert(bytes.equal(&storage[..3], b"abc"))
+    }
+    input := console.stdin()
+    line := input.read_line(&mut storage)?
+    assert(line.count == 2 && line.end == io.LineEnd.Newline)
+    assert(bytes.equal(&storage[..2], b"\r\n"))
+    last := input.read_line(&mut storage)?
+    assert(last.count == 4 && last.end == io.LineEnd.Eof)
+    assert(bytes.equal(&storage[..4], b"tail"))
+    end := input.read_line(&mut storage)?
+    assert(end.count == 0 && end.end == io.LineEnd.Eof)
+    return ok()
+}
+fn main() -> i32 {
+    match verify() {
+        ok() => {
+            return 0
+        }, err(_) => {
+            return 250
+        }
+    }
+}

@@ -72,6 +72,7 @@ def main() -> None:
 
         assert run(compiler, "--version") == f"dodo {version} (LLVM 22, BSD-2-Clause)"
         hello = str(Path(bundle.name) / "examples/hello.dodo")
+        portable = str(Path(bundle.name) / "examples/io.dodo")
         run(compiler, "check", hello)
         run(compiler, "check", str(Path(bundle.name) / "examples/bytes.dodo"))
         print("PASS extracted compiler: version, source checks, embedded standard library", flush=True)
@@ -85,12 +86,12 @@ def main() -> None:
                 run(compiler, "build", hello, "--emit", emit, "-O", optimization, "-o", filename)
                 assert (scratch / filename).stat().st_size > 0, filename
             assert (scratch / "hello.obj").read_bytes().startswith(b"\x64\x86"), "expected x64 COFF"
-            run(compiler, "build", hello, "--emit", "obj", "--target", "wasm32-unknown-unknown",
+            run(compiler, "build", portable, "--emit", "obj", "--target", "wasm32-unknown-unknown",
                 "-O", optimization, "-o", "hello.wasm")
             assert (scratch / "hello.wasm").read_bytes().startswith(b"\x00asm")
             run(compiler, "build", hello, "-O", optimization, "-o", "hello.exe", *link, tools=True)
-            assert run(scratch / "hello.exe") == "Dodo 0.1"
-            assert run(compiler, "run", hello, "-O", optimization, *link, tools=True) == "Dodo 0.1"
+            assert run(scratch / "hello.exe") == "Hello, world!"
+            assert run(compiler, "run", hello, "-O", optimization, *link, tools=True) == "Hello, world!"
             print(f"PASS -O{optimization}: IR, bitcode, assembly, COFF, WebAssembly, build and run", flush=True)
 
     print(f"Verified Windows release: {args.archive}")

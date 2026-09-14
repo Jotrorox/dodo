@@ -1,5 +1,7 @@
 package http
 
+import "std/io"
+
 import "core/ascii"
 import "core/bytes"
 import "core/mem"
@@ -15,6 +17,60 @@ pub enum ErrorKind {
 pub struct Error {
     pub kind: ErrorKind;
     pub position: usize
+    // Only fixed kind names and numeric metadata; never input or native messages.
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("http: ")?
+        match &self.kind {
+            ErrorKind.InvalidUri => {
+                output.string("InvalidUri")?
+            }
+            ErrorKind.InvalidMethod => {
+                output.string("InvalidMethod")?
+            }
+            ErrorKind.InvalidStatus => {
+                output.string("InvalidStatus")?
+            }
+            ErrorKind.InvalidHeader => {
+                output.string("InvalidHeader")?
+            }
+            ErrorKind.InvalidStartLine => {
+                output.string("InvalidStartLine")?
+            }
+            ErrorKind.InvalidFraming => {
+                output.string("InvalidFraming")?
+            }
+            ErrorKind.InvalidChunk => {
+                output.string("InvalidChunk")?
+            }
+            ErrorKind.ForbiddenTrailer => {
+                output.string("ForbiddenTrailer")?
+            }
+            ErrorKind.HeaderLimit => {
+                output.string("HeaderLimit")?
+            }
+            ErrorKind.BodyLimit => {
+                output.string("BodyLimit")?
+            }
+            ErrorKind.BufferFull => {
+                output.string("BufferFull")?
+            }
+            ErrorKind.UnexpectedEof => {
+                output.string("UnexpectedEof")?
+            }
+            ErrorKind.InvalidState => {
+                output.string("InvalidState")?
+            }
+            ErrorKind.Poisoned => {
+                output.string("Poisoned")?
+            }
+            ErrorKind.OutOfBounds => {
+                output.string("OutOfBounds")?
+            }
+        }
+        output.string(" position=")?
+        output.natural(self.position as u64)?
+        return ok()
+    }
 }
 pub fn failure(kind: ErrorKind, position: usize) -> Error {
     return Error { kind: kind, position: position }

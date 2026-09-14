@@ -11,6 +11,30 @@
 #endif
 int main(int argc, char **argv) {
     if (argc < 2) return 90;
+    if (!strcmp(argv[1], "arguments")) {
+        for (int i = 2; i < argc; ++i) {
+            size_t count = strlen(argv[i]) + 1;
+            if (fwrite(argv[i], 1, count, stdout) != count) return 101;
+        }
+        fputs("done", stderr); return 0;
+    }
+    if (!strcmp(argv[1], "cleanup")) {
+        FILE *marker = fopen("child-pid", "wb");
+        if (!marker) return 102;
+#ifdef _WIN32
+        fprintf(marker, "%lu", (unsigned long)GetCurrentProcessId());
+#else
+        fprintf(marker, "%lu", (unsigned long)getpid());
+#endif
+        if (fclose(marker)) return 103;
+        fputs("ready", stdout); fflush(stdout);
+#ifdef _WIN32
+        Sleep(10000);
+#else
+        struct timespec delay = {10, 0}; nanosleep(&delay, NULL);
+#endif
+        return 0;
+    }
     if (!strcmp(argv[1], "flood")) {
         char data[4096]; memset(data, 'o', sizeof(data));
         char error[4096]; memset(error, 'e', sizeof(error));

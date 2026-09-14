@@ -1,0 +1,84 @@
+package hosted_text
+import "std/platform"
+import "std/platform/native"
+import "std/platform/error"
+import "core/mem"
+import "core/bytes"
+fn run() -> void!error.Error {
+    workspace := platform.workspace()
+    strict := platform.TextPolicy.Strict
+    workspace.set("Ω 😀")?
+    output := [0u8; 7]
+    {
+        value := workspace.get()?
+        {
+            rendered := platform.decode(&value, &mut output, &strict)?
+            assert(bytes.equal(mem.str_bytes(rendered), b"\xce\xa9 \xf0\x9f\x98\x80"))
+        }
+        match platform.decode(&value, &mut output[..6], &strict) {
+            ok(_) => {
+                assert(false)
+            }, err(reason) => {
+                assert(reason.kind == error.Kind.BufferTooSmall)
+            }
+        }
+    }
+    match workspace.set("bad\x00text") {
+        ok() => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    {
+        value := workspace.get()?
+        rendered := platform.decode(&value, &mut output, &strict)?
+        assert(mem.str_bytes(rendered).len == 7)
+    }
+    exact := [97u8; 4095]
+    text := unsafe {
+        mem.str_from_utf8(&exact)
+    }
+    workspace.set(text)?
+    bigger := [98u8; 4096]
+    long := unsafe {
+        mem.str_from_utf8(&bigger)
+    }
+    match workspace.set(long) {
+        ok() => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.BufferTooSmall)
+        }
+    }
+    {
+        value := workspace.get()?;
+        assert(value.units().len == 4095 && value.units()[0] == 97)
+    }
+    list := platform.list_workspace()
+    list.push(text)?
+    for i in 4096usize..32768 {
+        list.push("")?
+    }
+    assert(list.len_units() == 32768)
+    match list.push("") {
+        ok() => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.BufferTooSmall)
+        }
+    }
+    assert(list.len_units() == 32768)
+    list.clear()
+    list.push("")?
+    list.push("a")?
+    assert(list.len_units() == 3)
+    return ok()
+}
+fn main() {
+    match run() {
+        ok() => {}, err(_) => {
+            assert(false, "workspace conversion failed")
+        }
+    }
+}

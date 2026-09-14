@@ -6,7 +6,7 @@ order: 150
 ---
 
 `std/net` contains address values, parsers, formatting, errors and operation
-policy. It has no imports and works on freestanding targets. `std/net/dns`
+policy. It imports portable byte-I/O error support and works on freestanding targets. `std/net/dns`
 contains DNS message handling. `std/net/operations` composes structural stream,
 clock, cancellation and readiness capabilities without selecting a platform.
 Importing any of these packages does not open a socket or require an allocator,
@@ -223,7 +223,7 @@ resolver.
 The native boundary is bundled C11 source compiled against actual system socket
 headers, avoiding hand-declared platform structure layouts. Linux uses libc
 sockets, `poll`, `getaddrinfo` and `CLOCK_MONOTONIC`. Windows uses Winsock 2.2,
-`WSAPoll`, `getaddrinfo` and `GetTickCount64`, linking `ws2_32` plus the existing
+`WSAPoll`, `getaddrinfo` and the shared `std/time/hosted` performance counter, linking `ws2_32` plus the existing
 Windows runtime libraries. Winsock initialization happens once per process under
 `InitOnceExecuteOnce`; the process-wide startup reference remains until process
 exit. Socket options and local-domain sockets have no portable API in this

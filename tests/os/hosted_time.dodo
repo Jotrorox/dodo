@@ -1,0 +1,72 @@
+package hosted_time
+import "std/time"
+import "std/time/clock"
+import "std/time/hosted"
+import "std/net/native" as network
+import "std/sync"
+fn run() -> void!time.TimeError {
+    source := hosted.MonotonicClock.new()
+    other := hosted.MonotonicClock.new()
+    start := clock.now(&source)?
+    for i in 0..100 {
+        current := clock.now(&other)?
+        assert(current.compare(&start)? >= 0)
+        elapsed := current.duration_since(&start)?
+        assert(elapsed.seconds() < 60)
+    }
+    zero := time.Duration.zero()
+    target := clock.deadline_after(&source, &zero)?
+    assert(clock.deadline_poll(&target, &source)?)
+    wall := hosted.WallClock.new()
+    timestamp := clock.wall_now(&wall)?
+    assert(timestamp.seconds() > 1577836800 && timestamp.subsec_nanos() < 1000000000)
+    netclock := network.MonotonicClock {}
+    a := source.now_ms()
+    b := netclock.now_ms()
+    c := source.now_ms()
+    assert(a <= b && b <= c && c - a < 10000)
+    tiny := time.Duration.from_nanos(1)
+    assert(tiny.to_millis()? == 0 && tiny.to_millis_ceil()? == 1 && tiny.timeout_millis()? == 1)
+    match sync.milliseconds(&tiny) {
+        ok(n) => {
+            assert(n == 1)
+        }, err(_) => {
+            assert(false)
+        }
+    }
+    maximum := time.Duration.from_millis(18446744073709551615u64)
+    match maximum.timeout_millis() {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason == time.TimeError.Overflow)
+        }
+    }
+    finite := time.Duration.from_millis(18446744073709551614u64)
+    assert(finite.timeout_millis()? == 18446744073709551614u64)
+    huge := time.Duration.from_seconds(18446744073709551615u64)
+    match huge.to_millis_ceil() {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason == time.TimeError.Overflow)
+        }
+    }
+    fake := clock.FakeClock.new(1)
+    simulated := fake.now()?
+    match start.compare(&simulated) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason == time.TimeError.DifferentClock)
+        }
+    }
+    return ok()
+}
+fn main() {
+    match run() {
+        ok() => {}, err(_) => {
+            assert(false, "hosted clock operation failed")
+        }
+    }
+}

@@ -1,0 +1,91 @@
+package hosted
+
+import "core/ptr"
+import "std/time"
+import "std/time/native" as backend
+import "std/platform/error"
+
+// Reserved native monotonic domain. All instances on this OS share an origin.
+// Custom/FakeClock providers must use another ID. Timestamps are process-local
+// observations, never persistent identifiers or portable serialized deadlines.
+pub const MONOTONIC_ID: u64 = 18446744073709551614
+pub struct MonotonicClock {
+    pub fn new() -> MonotonicClock {
+        return MonotonicClock {}
+    }
+    // Clock-provider failures retain their native code with kind Other.
+    // The contract-facing methods below map them to ClockFailure.
+    pub fn now_native(&self) -> time.Instant!error.Error {
+        seconds := 0u64
+        nanos := 0u32
+        code := unsafe {
+            backend.dodo_time_monotonic(ptr.from_mut(&mut seconds), ptr.from_mut(&mut nanos))
+        }
+        if code != 0 {
+            return err(error.Error { kind: error.Kind.Other, code: code })
+        }
+        ticks := match time.Duration.new(seconds, nanos as u64) {
+            ok(value) => {
+                value
+            }, err(_) => {
+                return err(error.failure(error.Kind.Other))
+            }
+        }
+        return ok(time.Instant.new(MONOTONIC_ID, ticks))
+    }
+    pub fn now(&self) -> time.Instant!time.TimeError {
+        match self.now_native() {
+            ok(value) => {
+                return ok(value)
+            }, err(_) => {
+                return err(time.TimeError.ClockFailure)
+            }
+        }
+    }
+    // Structural std/net clock compatibility. Failure returns the maximum
+    // timestamp, preserving network deadline checks' fail-closed convention.
+    pub fn now_ms(&mut self) -> u64 {
+        match self.now() {
+            ok(value) => {
+                match value.elapsed_ticks().to_millis() {
+                    ok(ticks) => {
+                        return ticks
+                    }, err(_) => {}
+                }
+            }
+            err(_) => {}
+        }
+        return 18446744073709551615u64
+    }
+}
+pub struct WallClock {
+    pub fn new() -> WallClock {
+        return WallClock {}
+    }
+    pub fn wall_now_native(&self) -> time.Timestamp!error.Error {
+        seconds := 0i64
+        nanos := 0u32
+        code := unsafe {
+            backend.dodo_time_wall(ptr.from_mut(&mut seconds), ptr.from_mut(&mut nanos))
+        }
+        if code != 0 {
+            return err(error.Error { kind: error.Kind.Other, code: code })
+        }
+        match time.Timestamp.new(seconds, nanos) {
+            ok(value) => {
+                return ok(value)
+            }, err(_) => {
+                return err(error.failure(error.Kind.Other))
+            }
+        }
+    }
+    pub fn wall_now(&self) -> time.Timestamp!time.TimeError {
+        match self.wall_now_native() {
+            ok(value) => {
+                return ok(value)
+            }, err(_) => {
+                return err(time.TimeError.ClockFailure)
+            }
+        }
+    }
+}

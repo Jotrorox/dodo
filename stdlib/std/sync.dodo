@@ -12,10 +12,13 @@ pub fn forever() -> u64 {
     return 18446744073709551615u64
 }
 pub fn milliseconds(duration: &time.Duration) -> u64!error.Error {
-    if duration.seconds() > 18446744073709550u64 {
-        return err(error.Error.InvalidInput)
+    match duration.timeout_millis() {
+        ok(value) => {
+            return ok(value)
+        }, err(_) => {
+            return err(error.Error.InvalidInput)
+        }
     }
-    return ok(duration.seconds() * 1000 + (duration.subsec_nanos() as u64 + 999999) / 1000000)
 }
 
 // Storage is caller-owned and cannot move while an initialized owner exists.

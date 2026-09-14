@@ -6,11 +6,12 @@ use std::fs;
 fn adapters_are_selected_independently_and_reject_wrong_targets() {
     let scratch = std::env::temp_dir().join(format!("dodo-platform-{}", std::process::id()));
     fs::create_dir_all(&scratch).unwrap();
-    for area in ["fs", "process", "env", "thread", "sync"] {
+    for area in ["fs", "process", "env", "thread", "sync", "time"] {
         let source = scratch.join(format!("{area}.dodo"));
+        let import = if area == "time" { "time/hosted" } else { area };
         fs::write(
             &source,
-            format!("package fixture\nimport \"std/{area}\"\nfn main() {{}}\n"),
+            format!("package fixture\nimport \"std/{import}\"\nfn main() {{}}\n"),
         )
         .unwrap();
         for (target, adapter) in [
@@ -103,8 +104,15 @@ fn protocol_imports_remain_portable_and_backends_link_independently() {
         for target in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
             let loaded = package::load_for_target(&source, target).unwrap();
             let native = package::native_sources(&loaded);
-            assert_eq!(native.len(), 1, "{area} for {target}");
-            assert_eq!(native[0].0, format!("std/{area}/runtime.c"));
+            let names: Vec<_> = native.iter().map(|(name, _)| *name).collect();
+            let expected = if area == "net" {
+                vec!["std/net/runtime.c", "std/time/runtime.c"]
+            } else if area == "tls" {
+                vec!["std/tls/runtime.c"]
+            } else {
+                vec!["std/web/runtime.c"]
+            };
+            assert_eq!(names, expected, "{area} for {target}");
         }
         assert!(
             package::load_for_target(&source, "thumbv6m-none-eabi")
