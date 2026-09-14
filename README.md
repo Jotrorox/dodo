@@ -23,8 +23,13 @@ Create a project folder named `hello` and save this as `main.dodo` inside it:
 ```dodo
 package main
 
+import "std/console"
+
 fn main() -> i32 {
-    return 0
+    match console.println("Hello, world!") {
+        ok(_) => { return 0 }
+        err(_) => { return 1 }
+    }
 }
 ```
 
@@ -34,11 +39,16 @@ Run it from the same directory:
 dodo run
 ```
 
-The program prints nothing and exits successfully. `return 0` supplies its
-success exit status. A project needs only `main.dodo`: no manifest, lockfile, or
-package manager. Put shared code in ordinary subfolders and import it by path.
+The program prints `Hello, world!` and exits successfully. `console.println`
+returns a Result: `ok` reports the written byte count, and `err` reports an I/O
+failure. The example returns exit status 1 if printing fails. A project needs
+only `main.dodo`: no manifest, lockfile, or package manager. Put shared code in
+ordinary subfolders and import it by path.
 The [first program guide](https://jotrorox.github.io/dodo/first-program/)
 explains each line and shows how to check the program and keep an executable.
+Use the [console guide](docs/src/content/docs/console.md) to print primitive values,
+report errors to stderr, and read a line into a fixed buffer. Hosted console
+access supports Linux GNU x86-64 and Windows x64.
 
 ## Everyday commands
 

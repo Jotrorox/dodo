@@ -1,8 +1,8 @@
 ---
 title: "Hosted platform adapters"
 description: "Independent target selection, native errors and strings, and explicit native boundaries."
-section: "Using Dodo"
-order: 144
+section: "Standard library"
+order: 151
 ---
 
 Use `std/platform.workspace()` when a hosted operation needs reusable native
@@ -89,6 +89,13 @@ handles close once through deterministic destruction; explicit fallible close
 allows error handling. Unsafe raw construction must establish unique ownership
 and the correct native resource kind.
 
+Borrowed process standard streams are the exception to owning-handle cleanup:
+`native.stdin()`, `stdout()`, and `stderr()` return `BorrowedHandle`, which has
+no close operation or destructor. Prefer [std/console](console.md) for safe text
+printing and line input. Native-to-I/O conversion retains recoverable kinds,
+including `WouldBlock`, `Closed`, `PermissionDenied`, and `BrokenPipe`, as well
+as the native code.
+
 ## Linking and dependencies
 
 The compiler embeds both Dodo sources and the small C boundaries required by
@@ -118,13 +125,6 @@ No package installs a global allocator, scheduler, environment cache, or hidden
 startup worker. OS/C-library calls may allocate internally; Dodo-managed dynamic
 payloads require explicit allocation APIs. Foundation packages have no mandatory
 OS dependency.
-
-Borrowed process standard streams are the exception to owning-handle cleanup:
-`native.stdin()`, `stdout()`, and `stderr()` return `BorrowedHandle`, which has
-no close operation or destructor. Prefer [std/console](console.md) for safe text
-printing and line input. Native-to-I/O conversion retains recoverable kinds,
-including `WouldBlock`, `Closed`, `PermissionDenied`, and `BrokenPipe`, as well
-as the native code.
 
 ## Complete hosted examples and storage
 

@@ -1,8 +1,8 @@
 ---
 title: "Filesystem and native platform values"
 description: "Native paths, files, directories, explicit storage, ownership, and Linux/Windows filesystem guarantees."
-section: "Using Dodo"
-order: 145
+section: "Standard library"
+order: 152
 ---
 
 Use `std/fs.read_file` to read a small file into a fixed byte array. Import

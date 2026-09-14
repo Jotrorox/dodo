@@ -1,8 +1,8 @@
 ---
 title: "Time and clocks"
 description: "Exact durations, UTC calendars, explicit clock identity, and deterministic timers."
-section: "Using Dodo"
-order: 145
+section: "Standard library"
+order: 150
 ---
 
 Use `std/time/hosted.WallClock.new().wall_now()` to read the current UTC timestamp

@@ -1,0 +1,579 @@
+package hosted
+
+import "core/bytes"
+import "core/slice"
+import "std/http"
+import "std/http/client" as policy
+import "std/http/connection"
+import "std/http/hosting"
+import "std/io"
+import "std/net"
+import "std/net/native"
+
+// 16KiB parser, 4KiB receive, 16KiB transmit, 16KiB retained final headers.
+pub const WORKSPACE_BYTES: usize = 53248
+pub struct Config {
+    pub header_bytes: usize
+    pub header_fields: usize
+    pub body_bytes: u64
+    pub request_body_bytes: usize
+    pub resolution_timeout_ms: u64
+    pub connect_timeout_ms: u64
+    pub request_timeout_ms: u64
+    pub max_redirects: usize
+    pub fn defaults() -> Config {
+        return Config { header_bytes: 16384, header_fields: 100, body_bytes: 16777216,
+        request_body_bytes: 16777216, resolution_timeout_ms: 10000,
+        connect_timeout_ms: 10000, request_timeout_ms: 30000, max_redirects: 0 }
+    }
+    pub fn limits(&self) -> http.Limits {
+        limits := http.Limits.defaults()
+        limits.header_bytes = self.header_bytes
+        limits.header_fields = self.header_fields
+        limits.body_bytes = self.body_bytes
+        return limits
+    }
+}
+pub struct Request {
+    pub url: &[u8]
+    pub method: &[u8]
+    pub headers: &[http.Header]
+    // Borrowed bytes are intrinsically replayable. No implicit reader rewind.
+    pub body: &[u8]
+}
+pub struct Response {
+    pub status: u16
+    pub body_bytes: u64
+    pub redirects: usize
+}
+// Header bytes are copied; no parser/input borrow escapes an exchange.
+pub struct Head {
+    data: &mut[u8]
+    used: usize
+    pub fn new(data: &mut[u8]) -> Head from(data) {
+        return Head { data: data, used: 0 }
+    }
+    pub fn clear(&mut self) {
+        self.used = 0
+    }
+    pub fn insert(&mut self, name: &[u8], value: &[u8]) -> void!hosting.Error {
+        if name.len > self.data.len - self.used || value.len + 2 > self.data.len - self.used - name.len {
+            return err(hosting.failure(hosting.ErrorKind.HeaderLimit))
+        }
+        for i in 0usize..name.len {
+            self.data[self.used + i] = name[i]
+        }
+        self.used += name.len
+        self.data[self.used] = 0
+        self.used += 1
+        for i in 0usize..value.len {
+            self.data[self.used + i] = value[i]
+        }
+        self.used += value.len
+        self.data[self.used] = 0
+        self.used += 1
+        return ok()
+    }
+    pub fn len(&self) -> usize {
+        return self.used
+    }
+}
+// Zero-delimited names/values are safe because HTTP fields reject NUL.
+pub fn header_at(data: &[u8], wanted: &[u8], occurrence: usize) -> Option<http.Header> from(data) {
+    offset := 0usize
+    found := 0usize
+    for offset < data.len {
+        end := offset
+        for end < data.len && data[end] != 0 {
+            end += 1
+        }
+        start := end + 1
+        last := start
+        for last < data.len && data[last] != 0 {
+            last += 1
+        }
+        if start > data.len || last == data.len {
+            return none
+        }
+        if http.equal_ascii(&data[offset..end], wanted) {
+            if found == occurrence {
+                return some(http.Header { name: &data[offset..end], value: &data[start..last] })
+            }
+            found += 1
+        }
+        offset = last + 1
+    }
+    return none
+}
+
+// Structural resolver: resolve(host, port, workspace, operation, clock, cancel)
+// returns a Result whose value provides len() and get(index)->SocketAddress!net.Error.
+// Must retain no operation after return. SystemResolver cannot interrupt getaddrinfo.
+pub struct SystemResolver {
+    pub fn resolve<C, X>(&mut self, host: &[u8], port: u16, workspace: &mut[u8], operation: &net.Operation, clock: &mut C, cancel: &X) -> native.Addresses!net.Error from(workspace) {
+        operation.check(clock, cancel)?
+        addresses := native.resolve(host, port, workspace)?
+        operation.check(clock, cancel)?
+        return ok(addresses)
+    }
+}
+pub struct Authority {
+    pub host: &[u8]
+    pub port: u16
+}
+pub fn authority(uri: &http.Uri) -> Authority!hosting.Error from(uri) {
+    data := uri.authority()
+    if data.len == 0 {
+        return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+    }
+    start := 0usize
+    end := 0usize
+    port_start := data.len
+    if data[0] == 91 {
+        start = 1
+        end = 1
+        for end < data.len && data[end] != 93 {
+            end += 1
+        }
+        if end + 1 < data.len {
+            port_start = end + 2
+        }
+    } else {
+        for end < data.len && data[end] != 58 {
+            end += 1
+        }
+        if end < data.len {
+            port_start = end + 1
+        }
+    }
+    if end - start == 0 || end - start > 253 {
+        return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+    }
+    // Require DNS A-labels/IP literals, not URI percent-encoded reg-names.
+    for i in start..end {
+        if data[i] == 37 {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+    }
+    port := 80u16
+    if uri.secure() {
+        port = 443
+    }
+    if port_start < data.len {
+        port = 0
+        for i in port_start..data.len {
+            port = port * 10 + (data[i] - 48) as u16
+        }
+    }
+    if port == 0 {
+        return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+    }
+    return ok(Authority { host: &data[start..end], port: port })
+}
+fn copy(source: &[u8], destination: &mut[u8]) -> usize!hosting.Error {
+    if source.len > destination.len {
+        return err(hosting.failure(hosting.ErrorKind.HeaderLimit))
+    }
+    for i in 0usize..source.len {
+        destination[i] = source[i]
+    }
+    return ok(source.len)
+}
+fn empty_header() -> http.Header from(static) {
+    return http.Header { name: b"", value: b"" }
+}
+fn redirect_status(status: u16) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+}
+// Used by plain and TLS connectors. S provides polling I/O, flush()->bool!Error,
+// wait(writing, milliseconds)->void!Error. One attempt, no automatic retry.
+pub fn exchange<S, W, C, X>(stream: &mut S, request: &http.Request, body: &[u8], workspace: &mut[u8], config: &Config,
+head: &mut Head, sink: &mut W, clock: &mut C, cancel: &X, until: u64, delivered: &mut u64) -> Response!hosting.Error {
+    let some(slice.SplitMut { left: parser, right: rest }) = slice.split_at_mut(workspace, 16384) else {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    let some(slice.SplitMut { left: input, right: output }) = slice.split_at_mut(rest, 4096) else {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    driver: connection.Connection
+    match connection.Connection.new(http.Role.Response, parser, input, output, config.limits()) {
+        ok(value) => {
+            driver = value
+        }
+        err(reason) => {
+            return err(hosting.connection_error(reason))
+        }
+    }
+    match driver.request(request) {
+        ok() => {}
+        err(reason) => {
+            return err(hosting.connection_error(reason))
+        }
+    }
+    hosting.send(&mut driver, stream, body, clock, cancel, until)?
+    head.clear()
+    informational := 0usize
+    discard := false
+    for true {
+        hosting.check(clock, cancel, until)?
+        event: http.Event
+        match driver.poll_event(stream) {
+            ok(value) => {
+                event = value
+            }
+            err(reason) => {
+                return err(hosting.connection_error(reason))
+            }
+        }
+        if event.kind == http.EventKind.StartLine {
+            head.clear()
+        }
+        if event.kind == http.EventKind.Informational {
+            informational += 1
+            if informational > 16 {
+                return err(hosting.failure(hosting.ErrorKind.HeaderLimit))
+            }
+        }
+        if event.kind == http.EventKind.Header {
+            name: &[u8]
+            value: &[u8]
+            match driver.field(event.name_offset, event.name_length) {
+                ok(data) => {
+                    name = data
+                }
+                err(reason) => {
+                    return err(hosting.protocol_error(reason))
+                }
+            }
+            match driver.field(event.value_offset, event.value_length) {
+                ok(data) => {
+                    value = data
+                }
+                err(reason) => {
+                    return err(hosting.protocol_error(reason))
+                }
+            }
+            head.insert(name, value)?
+        }
+        if event.kind == http.EventKind.HeadersComplete {
+            discard = config.max_redirects != 0 && redirect_status(driver.status())
+            // The connection is closed by its owner; a redirect need not drain an untrusted body.
+            if discard {
+                return ok(Response { status: driver.status(), body_bytes: 0, redirects: 0 })
+            }
+        }
+        if event.kind == http.EventKind.Body {
+            for driver.body().len != 0 {
+                hosting.check(clock, cancel, until)?
+                progress: io.Poll
+                match io.write_once(sink, driver.body()) {
+                    ok(value) => {
+                        progress = io.Poll { state: io.PollState.Ready, transferred: value }
+                    }
+                    err(reason) => {
+                        if reason.kind != io.ErrorKind.Interrupted && reason.kind != io.ErrorKind.WouldBlock {
+                            *delivered += reason.transferred as u64
+                            return err(hosting.io_error(reason))
+                        }
+                        progress = io.Poll { state: io.PollState.Pending, transferred: reason.transferred }
+                    }
+                }
+                *delivered += progress.transferred as u64
+                match driver.consume_body(progress.transferred) {
+                    ok() => {}
+                    err(reason) => {
+                        return err(hosting.connection_error(reason))
+                    }
+                }
+                if progress.state == io.PollState.Pending {
+                    hosting.pause(clock, cancel, until)?
+                }
+            }
+        }
+        if event.kind == http.EventKind.Complete {
+            return ok(Response { status: driver.status(), body_bytes: *delivered, redirects: 0 })
+        }
+        if event.kind == http.EventKind.Upgrade {
+            return err(hosting.failure(hosting.ErrorKind.Protocol))
+        }
+        if event.kind == http.EventKind.NeedInput && driver.unread().len == 0 {
+            hosting.wait(stream, false, clock, cancel, until)?
+        }
+    }
+    return err(hosting.failure(hosting.ErrorKind.Protocol))
+}
+pub struct PlainConnector {
+    pub fn exchange<W, C, X>(&mut self, socket: &mut native.TcpConnection, host: &[u8], secure: bool,
+    request: &http.Request, body: &[u8], workspace: &mut[u8], config: &Config, head: &mut Head,
+    sink: &mut W, clock: &mut C, cancel: &X, until: u64, delivered: &mut u64) -> Response!hosting.Error {
+        if secure {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+        stream := hosting.Plain.new(socket)
+        return exchange(&mut stream, request, body, workspace, config, head, sink, clock, cancel, until, delivered)
+    }
+}
+pub struct Client {
+    workspace: &mut[u8]
+    headers: &mut[u8]
+    config: Config
+    header_used: usize
+    pub fn new(workspace: &mut[u8], config: Config) -> Client!hosting.Error from(workspace) {
+        if workspace.len < WORKSPACE_BYTES {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        if config.header_bytes == 0 || config.header_bytes > 16384 || config.header_fields == 0 || config.header_fields > 100 ||
+            config.resolution_timeout_ms == 0 || config.connect_timeout_ms == 0 || config.request_timeout_ms == 0 || config.max_redirects > 16 {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+        let some(slice.SplitMut { left: driver, right: headers }) = slice.split_at_mut(workspace, 36864) else {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        return ok(Client { workspace: driver, headers: &mut headers[..16384], config: config, header_used: 0 })
+    }
+    // Final headers, including duplicates by occurrence, live until the next call.
+    // Clear on error, so a failed request cannot expose stale headers.
+    pub fn header(&self, name: &[u8], occurrence: usize) -> Option<http.Header> from(self) {
+        return header_at(&self.headers[..self.header_used], name, occurrence)
+    }
+    pub fn get(&mut self, url: &[u8], storage: &mut[u8]) -> Response!hosting.Error {
+        sink := io.MemoryWriter.new(storage)
+        return self.get_to(url, &mut sink)
+    }
+    pub fn get_to<W>(&mut self, url: &[u8], sink: &mut W) -> Response!hosting.Error {
+        headers: [0]http.Header = []
+        request := Request { url: url, method: b"GET", headers: &headers, body: b"" }
+        return self.request(&request, sink)
+    }
+    pub fn request<W>(&mut self, request: &Request, sink: &mut W) -> Response!hosting.Error {
+        resolver := SystemResolver {}
+        connector := PlainConnector {}
+        clock := native.MonotonicClock {}
+        cancel := net.NeverCancel {}
+        return self.request_with(request, sink, &mut resolver, &mut connector, &mut clock, &cancel)
+    }
+    pub fn request_with<W, R, P, C, X>(&mut self, request: &Request, sink: &mut W, resolver: &mut R,
+    connector: &mut P, clock: &mut C, cancel: &X) -> Response!hosting.Error {
+        self.header_used = 0
+        delivered := 0u64
+        match self.run(request, sink, resolver, connector, clock, cancel, &mut delivered) {
+            ok(value) => {
+                return ok(value)
+            }
+            err(reason) => {
+                self.header_used = 0;
+                reason.delivered = delivered;
+                return err(reason)
+            }
+        }
+    }
+    fn run<W, R, P, C, X>(&mut self, original: &Request, sink: &mut W, resolver: &mut R,
+    connector: &mut P, clock: &mut C, cancel: &X, delivered: &mut u64) -> Response!hosting.Error {
+        if original.body.len > self.config.request_body_bytes {
+            return err(hosting.failure(hosting.ErrorKind.BodyLimit))
+        }
+        if original.headers.len > 14 || !http.valid_token(original.method) || bytes.equal(original.method, b"CONNECT") {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+        if original.headers.len + 2 > self.config.header_fields {
+            return err(hosting.failure(hosting.ErrorKind.HeaderLimit))
+        }
+        for i in 0usize..original.headers.len {
+            name := original.headers[i].name
+            if!http.valid_token(name) || !http.valid_value(original.headers[i].value) ||
+                http.equal_ascii(name, b"Host") || http.equal_ascii(name, b"Content-Length") || http.equal_ascii(name, b"Transfer-Encoding") ||
+                http.equal_ascii(name, b"Connection") || http.equal_ascii(name, b"Expect") || http.equal_ascii(name, b"Upgrade") ||
+                http.equal_ascii(name, b"Trailer") || http.equal_ascii(name, b"TE") || http.equal_ascii(name, b"Proxy-Authorization") {
+                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            }
+        }
+        url := [0u8; 4096]
+        next_url := [0u8; 4096]
+        used := copy(original.url, &mut url)?
+        hops := 0usize
+        use_get := false
+        for true {
+            next_used := 0usize
+            response := self.hop(&url[..used], original, sink, resolver, connector, clock, cancel, delivered,
+            &mut next_url, &mut next_used, &mut use_get, hops)?
+            if next_used == 0 {
+                return ok(response)
+            }
+            used = next_used
+            for i in 0usize..used {
+                url[i] = next_url[i]
+            }
+            hops += 1
+        }
+        return err(hosting.failure(hosting.ErrorKind.Redirect))
+    }
+    fn hop<W, R, P, C, X>(&mut self, url: &[u8], original: &Request, sink: &mut W, resolver: &mut R,
+    connector: &mut P, clock: &mut C, cancel: &X, delivered: &mut u64,
+    next_url: &mut[u8], redirect_length: &mut usize, use_get: &mut bool, hops: usize) -> Response!hosting.Error {
+        uri: http.Uri
+        match http.Uri.parse(url) {
+            ok(value) => {
+                uri = value
+            }
+            err(reason) => {
+                return err(hosting.protocol_error(reason))
+            }
+        }
+        origin := authority(&uri)?
+        target := [0u8; 4096]
+        target_used := 0usize
+        path := uri.path()
+        if path.len == 0 {
+            target[0] = 47;
+            target_used = 1
+        } else {
+            target_used = copy(path, &mut target)?
+        }
+        // Keep a bare query marker too.
+        tail := uri.bytes().len - uri.scheme().len - 3 - uri.authority().len
+        if tail > path.len {
+            target[target_used] = 63
+            target_used += 1
+            target_used += copy(uri.query(), &mut target[target_used..])?
+        }
+        headers := [empty_header(), empty_header(), empty_header(), empty_header(),
+        empty_header(), empty_header(), empty_header(), empty_header(),
+        empty_header(), empty_header(), empty_header(), empty_header(),
+        empty_header(), empty_header(), empty_header(), empty_header()]
+        header_count := 0usize
+        for i in 0usize..original.headers.len {
+            name := original.headers[i].name
+            if!*use_get || !(http.equal_ascii(name, b"Content-Type") || http.equal_ascii(name, b"Content-Encoding") ||
+                http.equal_ascii(name, b"Content-Language") || http.equal_ascii(name, b"Content-Location")) {
+                headers[header_count] = http.Header { name: name, value: original.headers[i].value }
+                header_count += 1
+            }
+        }
+        headers[header_count] = http.Header { name: b"Host", value: uri.authority() }
+        headers[header_count + 1] = http.Header { name: b"Connection", value: b"close" }
+        method := original.method
+        body := original.body
+        if *use_get {
+            method = b"GET";
+            body = b""
+        }
+        request := http.Request { method: method, target: &target[..target_used],
+        headers: &headers[..header_count + 2], body: http.Body.sized(body.len as u64) }
+        // Validate/size outgoing headers before resolution or connection.
+        match http.write_request(&request, &mut self.workspace[20480..20480 + self.config.header_bytes]) {
+            ok(_) => {}
+            err(reason) => {
+                return err(hosting.protocol_error(reason))
+            }
+        }
+        resolution := net.Operation.until(hosting.deadline(clock.now_ms(), self.config.resolution_timeout_ms))
+        address_bytes := [0u8; 384]
+        match resolution.check(clock, cancel) {
+            ok() => {}
+            err(reason) => {
+                return err(hosting.network_error(reason, hosting.ErrorKind.Resolve))
+            }
+        }
+        addresses := resolver.resolve(origin.host, origin.port, &mut address_bytes, &resolution, clock, cancel)
+        match addresses {
+            err(reason) => {
+                match resolution.check(clock, cancel) {
+                    ok() => {}
+                    err(expired) => {
+                        return err(hosting.network_error(expired, hosting.ErrorKind.Resolve))
+                    }
+                }
+                return err(hosting.network_error(reason, hosting.ErrorKind.Resolve))
+            }
+            ok(resolved) => {
+                match resolution.check(clock, cancel) {
+                    ok() => {}
+                    err(reason) => {
+                        return err(hosting.network_error(reason, hosting.ErrorKind.Resolve))
+                    }
+                }
+                if resolved.len() > 16 {
+                    return err(hosting.failure(hosting.ErrorKind.Resolve))
+                }
+                // The network budget starts AFTER resolution, afresh for each hop.
+                until := hosting.deadline(clock.now_ms(), self.config.request_timeout_ms)
+                connect_until := hosting.earlier(until, hosting.deadline(clock.now_ms(), self.config.connect_timeout_ms))
+                operation := net.Operation.until(connect_until)
+                last := net.failure(net.ErrorKind.NameNotFound)
+                for i in 0usize..resolved.len() {
+                    address: net.SocketAddress
+                    match resolved.get(i) {
+                        ok(value) => {
+                            address = value
+                        }
+                        err(reason) => {
+                            return err(hosting.network_error(reason, hosting.ErrorKind.Resolve))
+                        }
+                    }
+                    match native.connect_with(&address, &operation, clock, cancel) {
+                        err(reason) => {
+                            last = reason
+                        }
+                        ok(socket) => {
+                            head := Head.new(self.headers)
+                            result := connector.exchange(&mut socket, origin.host, uri.secure(), &request, body,
+                            &mut self.workspace[..36864], &self.config, &mut head, sink, clock, cancel, until, delivered)
+                            self.header_used = head.len()
+                            core.drop(head)
+                            match result {
+                                err(reason) => {
+                                    return err(reason)
+                                }
+                                ok(response) => {
+                                    response.redirects = hops
+                                    if self.config.max_redirects == 0 || !redirect_status(response.status) {
+                                        return ok(response)
+                                    }
+                                    location: &[u8]
+                                    match self.header(b"Location", 0) {
+                                        some(field) => {
+                                            location = field.value
+                                        }
+                                        none => {
+                                            return err(hosting.failure(hosting.ErrorKind.Redirect))
+                                        }
+                                    }
+                                    next_used := 0usize
+                                    if location.len != 0 && location[0] == 47 && !(location.len > 1 && location[1] == 47) {
+                                        next_used = copy(uri.scheme(), next_url)?
+                                        next_used += copy(b"://", &mut next_url[next_used..])?
+                                        next_used += copy(uri.authority(), &mut next_url[next_used..])?
+                                        next_used += copy(location, &mut next_url[next_used..])?
+                                    } else {
+                                        next_used = copy(location, next_url)?
+                                    }
+                                    destination: http.Uri
+                                    match http.Uri.parse(&next_url[..next_used]) {
+                                        ok(value) => {
+                                            destination = value
+                                        }
+                                        err(_) => {
+                                            return err(hosting.failure(hosting.ErrorKind.Redirect))
+                                        }
+                                    }
+                                    redirect_policy := policy.Policy.defaults()
+                                    redirect_policy.redirects.max_hops = self.config.max_redirects
+                                    action := policy.redirect(&redirect_policy, response.status, &uri, &destination, hops, true, method)
+                                    if!uri.same_origin(&destination) || action == policy.RedirectAction.Reject {
+                                        return err(hosting.failure(hosting.ErrorKind.Redirect))
+                                    }
+                                    if action == policy.RedirectAction.Get {
+                                        *use_get = true
+                                    }
+                                    *redirect_length = next_used
+                                    return ok(response)
+                                }
+                            }
+                        }
+                    }
+                }
+                return err(hosting.network_error(last, hosting.ErrorKind.Connect))
+            }
+        }
+    }
+}

@@ -1,8 +1,8 @@
 ---
 title: "Environment"
 description: "Native argument access, immutable environment snapshots, current directories and explicit child environments."
-section: "Using Dodo"
-order: 146
+section: "Standard library"
+order: 153
 ---
 
 Use `std/env.get` to read one environment variable as UTF-8. `env.Workspace`

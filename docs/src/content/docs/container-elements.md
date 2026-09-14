@@ -1,323 +1,206 @@
 ---
-title: "Container element safety design"
-description: "Separate reference dependencies from Result obligations, with a bounded checker milestone and executable blockers."
+title: "Container element safety"
+description: "Checked storage provenance, mutation effects, supported shared elements, and mandatory Result restrictions."
 section: "Project"
 order: 310
 ---
 
-Status: design and conservative checker hardening. This change enables **no new
-container element types**. The first candidate, `fixed_vector.Vector<&i32>`, is
-blocked on mutation effects in the ownership checker. Result elements need an
-additional, independent obligation model. Proposed rules below are not language
-features or new syntax.
+Allocated vectors, deques, hash maps/sets, ordered maps/sets, and heaps support
+shared-reference elements and owned strings with shared allocator dependencies.
+The acceptance scope below was established before implementation. Caller-backed
+moving containers retain their previous restrictions. Result elements remain
+unsupported; a capacity/allocation Result is always mandatory to handle.
 
-The delivered milestone rejects assignment of Result-containing values through
-fields, indices, and references. Previously these writes could discard an old
-pending Result or publish a new one without recording its handling obligation.
-Whole owned bindings retain their existing assignment and handling rules.
+## Supported combinations
 
-## Existing rules and implementation evidence
+| Element category | Allocated collections, including `shared_*` | Caller-backed `fixed_*` |
+| --- | --- | --- |
+| Plain scalars, raw pointers, move-only owned aggregates, zero-sized values | Supported | Supported |
+| `&i32`, `&str`, shared slices | Supported | Rejected |
+| Structs, enums, Options and arrays containing shared references | Supported recursively | Rejected |
+| `text_shared.String`, including nested owned aggregates | Supported; retains its allocator | Rejected |
+| Exclusive references/slices, or aggregates owning them | Rejected recursively | Rejected |
+| `Result`, including nested Results, Result-bearing references and already matched Results | Rejected recursively | Rejected |
 
-The starting points are [collections](collections.md),
-[ownership](ownership.md), [memory and FFI](memory-and-ffi.md), and
-[Result handling](patterns-and-results.md). In the source tree:
+Both keys and values follow these rules. References to Result-bearing sources also remain rejected in typed storage:
+matching one element cannot discharge obligations for its conservative source
+union. Ordinary checked Result borrowing outside these collections is unchanged. Read-only slice algorithms retain ordinary borrowing rules.
+Mutating slice algorithms and unrestricted mutable element views require plain,
+borrow-free, Result-free payloads. `get_mut` and `as_mut_slice` therefore remain
+available for plain allocated elements, but cannot expose stored references.
+Heap swaps and ordered-map replacement use ownership movement internally.
+To edit an owned String element, remove it, edit the owned value, and reinsert it;
+mutable String element views are not supported in this scope.
 
-| Implementation | Relevant behavior |
+## Allocation and text
+
+Use one `alloc/shared_arena.SharedArena` over caller-owned bytes, and pass a fresh
+`arena.handle()` to each `shared_*` container and `std/text_shared` constructor.
+Declare sources before containers that retain them. Empty text construction is
+`text_shared.new(handle, byte_limit)?`; copying valid UTF-8 is
+`text_shared.from_str(handle, value, byte_limit)?` or `from_text(handle, &text,
+byte_limit)?`. No intermediate byte buffer is needed. Each String owns its
+buffer and shared handle. The byte limit bounds logical length; geometric
+capacity can be larger. Allocation failure remains explicit.
+
+The existing exclusive arena path has direct safe `text_alloc.empty`,
+`text_alloc.from_str`, and `text_alloc.from_text` constructors. It exclusively
+borrows its arena and is useful for one owner at a time. Its String is not a
+supported reference-bearing element because it retains an exclusive dependency.
+The buffer-taking `text_alloc.String.new` remains available for UTF-8 validation.
+
+## Checked region invariant
+
+Three facts stay separate: the storage loan protecting a container, ordinary
+allocator/policy dependencies, and the union of sources retained by its stored
+elements. `Loan.stored` in `src/sema/ownership.rs` marks the third category;
+`dependency` alone cannot distinguish it from an ordinary reborrow. The checker
+uses symbolic `owner` and `owner.stored` sources when checking borrowed parameters.
+
+Allocated storage has a private `[0]T` witness field. It carries T's type facts
+without owning an active element or creating a runtime lifetime token. The
+witness alone grants no raw-storage access. Constructors call
+`mem.storage_type::<T>()`, which recursively rejects Results (including Result-bearing referents) and exclusive
+reference elements. Stored dependency summaries never discharge source Result obligations.
+Existing `mem.init`, raw pointer access, memory exchange,
+and `ptr.borrow*` restrictions remain in force.
+
+Library implementations use new **unsafe** owner-bound primitives:
+
+| Primitive | Checked behavior |
 | --- | --- |
-| `src/sema.rs`: `Context::carries_borrow`, `contains_result` | Recursively inspect owned arrays, Options, structs and enum alternatives. References keep sources alive but do not own their referent's Result obligation. Raw pointers and `MaybeUninit` do not expose their payload's facts. |
-| `Variable`, `Value`, `Place` and `merge_states` in `src/sema/ownership.rs` | Variables have dependency loans and one `pending_result` bit. Values carry loans, not per-element handling state. A place has `direct: Option<usize>` for a whole local binding. Joins union loans and OR pending bits. |
-| `Checker::call` in `src/sema.rs` | `from(...)` contributes argument dependencies to a borrowed return. It does not describe changes to an argument's stored dependencies or obligations. |
-| Assignment checking in `src/sema.rs` | Whole bindings replace their dependency set and reset their pending bit. Borrow-containing writes through references are rejected. Direct owned field updates conservatively retain old reference dependencies. This milestone rejects non-whole-binding Result writes as well. |
-| `mark_matched_result`, `bind_pattern` | Matching can discharge a named aggregate's pending bit; nested Result pattern bindings acquire obligations. This is not an indexed storage ledger or an interprocedural handling effect. |
-| `core/option` and `mem.replace` / `mem.swap` | `take` and `replace` lower to memory exchange. Exchange rejects both categories recursively. Returning an old reference value alone would not account for the newly stored reference. |
-| `fixed_vector`, `fixed_deque` | Borrow `&mut[Option<T>]`; construction clears preexisting slots; insertion assigns through the borrowed slots; removal exchanges an Option; clear/drop destroy the occupied payloads. |
-| `fixed_map`, `fixed_set` | Wrap the fixed vector. Duplicate keys, removal, replacement, and destruction add payload destruction paths. |
-| `vector`, `shared_vector` | Store an allocator capability plus raw pointer, length and capacity. Construction uses `mem.init(Option<T>)` as a recursive restriction. Insertion uses `mem.init` and raw writes; removal reads raw storage; growth copies ownership to a new allocation. |
-| Allocated deque, ordered maps/sets and heap; hash maps/sets | Build on vector storage or raw bucket storage. Shifting, ring relocation, cluster reinsertion, and heap swaps all transfer ownership. Hash map construction also checks a nested entry type. |
+| `ptr.store(pointer, value, &mut owner)` | Requires a matching typed witness; consumes the value and deposits all its dependencies into the owner. |
+| `ptr.take(pointer, &mut owner)` | Transfers ownership and returns the complete stored-source union without a borrow of the vacated storage. |
+| `ptr.relocate(source, destination, count, &mut owner)` | Preserves the region union while moving potentially overlapping storage. |
+| `ptr.view(pointer, &owner)`, `ptr.view_slice(pointer, count, &owner)` | Returns a checked shared view retaining both storage and source dependencies. No mutable counterpart exists for reference elements. |
 
-`ptr.borrow*` retains the owner's complete dependencies but cannot invent the
-dependencies of an element stored behind its raw pointer. Both element
-categories remain rejected there. Adding a phantom type parameter or changing
-`from(self)` does not establish missing facts. Unsafe casts are not a solution.
+The unsafe caller must prove pointer/owner correspondence, alignment, initialized
+extents, destination validity, and exactly-once ownership transfer. Relocation
+moves within one owner's allocations; old moved bytes cannot be used or destroyed
+again. `take` leaves uninitialized storage; `store` requires an uninitialized or
+otherwise already disposed destination. A zero-length witness is not evidence
+that arbitrary raw bytes contain live references. The safe library maintains
+occupancy and allocation invariants around these operations.
 
-Fixed-container rejection can first appear as an ambiguous borrowed return in
-`option.replace`, an unsupported memory exchange, or an unhandled insertion
-argument on a failure path. It is a generic specialization failure, not a
-dedicated fixed-vector constructor diagnostic. The lower-level tests isolate
-each underlying blocker instead of depending on which specialization fails first.
+## Mutation and return contracts
 
-## Reference dependencies: proposed invariant
+`stores(target, source...)` declares a conservative dependency deposition into
+an exclusive reference to a typed storage owner. There is one target per
+function. Every external source deposited by its body, including forwarded
+calls, must be listed. Local sources cannot escape through this effect. Sources
+already in `target.stored`, and static sources, need no new input effect.
+Borrow-free generic arguments contribute no dependencies.
 
-Keep three facts distinct: the storage loan protecting a container and its
-slots, the allocator/policy dependencies that keep that storage usable, and the
-referent dependencies carried by stored elements. Moving an element must move
-its referent dependencies without manufacturing a fresh exclusive capability.
-A checked view needs both the container storage loan and those dependencies;
-a value removed by ownership needs its referent dependencies, independently of
-the container storage it has left.
+The call checker updates the actual owner and existing aliases, including field
+owners and reborrows. Updating only an `&mut self` temporary would lose facts.
+The body checker also records deposits into external parameter storage: a helper
+cannot omit its effect or return a newly inserted source under an old-source-only
+contract. Effects apply conservatively on failure as well as success.
 
-For the first candidate use a conservative union of referent dependencies for
-the complete backing slot region, rather than facts for individual indices.
-Every insertion adds its sources to this union. Moving the vector or a nested
-aggregate retains that union. Branches and loops union possible sources.
-Removal/replacement can return the complete union, which may retain unrelated
-sources longer than necessary. Internal shifting never changes it.
+`from(owner.stored)` returns only retained element dependencies. The checker
+verifies this contract against the body. Returning `get`/`as_slice` under it is
+rejected because those views also depend on `owner` storage. A helper that inserts
+an input and returns it must name that input in its return contract as well.
+Ordinary `from(owner)` continues to retain the complete owner borrow.
 
-Do not subtract dependencies merely because `length` became zero: the current
-checker does not prove slot occupancy or runtime index equality. The initial
-candidate keeps the union until the backing storage capability ends or the
-whole backing binding is safely reinitialized. Existing caller-backed storage
-may retain conservative dependencies even after the vector is destroyed.
-Ending the vector's storage borrow and releasing all element source loans are
-different operations.
+`requires_plain(T, ...)` limits a specialization to borrow-free, Result-free
+types. Unavailable bodies are not emitted, and calls produce a diagnostic.
+This keeps mutable access methods usable for plain elements without making an
+unchecked accessor for reference-bearing elements. Destructors cannot carry
+this constraint.
 
-This needs a checked write effect across calls. Conceptually `push(self, value)`
-deposits `deps(value)` into the slot-region owner on success. A conservative
-first implementation may also retain them on failure. The function checker
-must verify that effect, and the caller must apply it to the actual place,
-including wrapper methods, forwarded parameters, and reborrows. The new sources
-must outlive the region's retained uses, including destruction. An ordinary
-return-source contract cannot express this side effect.
-
-For external parameter storage, there may be no local owner variable to update.
-The checker must either verify and export a mutation summary or reject the
-write. Updating only locally known roots is unsound. Updating only the temporary
-`&mut self` binding also loses the facts when that temporary ends.
-
-| Operation | Proposed reference behavior |
+| Operation | Conservative source behavior |
 | --- | --- |
-| Construction | Retain the backing storage loan and its existing dependencies; clearing old payloads must respect their destructors. An empty slot array does not confer a lifetime for future inputs. |
-| Insertion | Add incoming referent dependencies to the backing-region summary; check their lifetime at the caller. Reject insertion from storage that will expire too soon. Failed insertion may conservatively retain the input loan. |
-| Removal / pop | Transfer the element and a conservative referent summary to the result. Do not return a borrow of the vacated slot. Removing `&mut T` eventually requires exclusive capability transfer, not copying the union. |
-| Replacement | Return the old element's referent summary and deposit the replacement's. Replacing in place must not erase sources still used by other slots or prior returned elements. |
-| Shifting / swapping / reallocation | Preserve exactly one owner of each element and the same dependency summary. Moving bytes changes element addresses, not the lifetime of referenced objects. No live view may survive the operation. |
-| Clear / drop | Destroy occupied elements exactly once while their sources remain live. Conservatively retain the region summary; do not infer that a source is dead from an unchecked length update. |
-| Nested aggregates | Traverse structs, Options, arrays, enums and both Result alternatives; aggregates with both categories must satisfy both systems. Initially reject nested categories outside the exact candidate specialization. |
-| Allocator lifetime | Retain allocator and backing bytes independently of element sources. Shared allocator dependencies remain shared when the vector is mutably borrowed. Allocator reset/destruction is forbidden while any container or view depends on it. |
+| Insert, duplicate-key replacement, invalid-index replacement, failed allocation | Union incoming dependencies into the complete owner. Existing destruction/failure behavior remains exactly once. |
+| Shared access or `next(&mut cursor)` | Keep the storage borrow and complete dependencies. Mutation, relocation, clear and destruction are forbidden while the view is live. |
+| Pop/remove/replace returning ownership | Return the previous stored union; the removed value can outlive the container but cannot outlive its sources. |
+| Move or aggregate movement | Transfer dependencies with ownership. |
+| Shift, ring growth, heap swaps, hash cluster reinsertion | Preserve dependencies and exactly one owner of each payload. |
+| Clear | Destroy active payloads; retain capacity and the conservative source union. |
+| Whole-owner replacement/destruction | Release its retained union after destruction; separately removed values still retain theirs. |
+| Branches and loops | Union possible sources, including break/continue effects. Mutations conflicting across loop back edges are rejected. |
 
-External mutation includes `get_mut`, mutable slice views, taking `&mut` of a
-slot, and a user helper accepting `&mut Container`. A writable element view could
-install a short-lived reference without calling `push`. Such stores need the
-same checked effect on the original owner. In the first candidate, explicitly
-reject `get_mut` for reference-bearing elements. Internal authorized slot
-operations need checked effects, not a public unrestricted `&mut &i32` escape.
-Mutating plain referent data is a different permission from replacing the stored
-reference itself.
+No per-index release is inferred from lengths, occupancy, successful removal,
+or clear. Sources can be retained longer than necessary, including after failed
+insertion. For loops, the checker conservatively rejects a source mutation that
+could conflict with any retained deposit across an iteration, even if a runtime
+condition would prevent another iteration. Caller-backed regions do not gain
+these effects. Direct reference-bearing writes through borrowed fields/indices
+and memory exchange remain restricted.
 
-## Reference examples and the smallest candidate
+## Positive acceptance example
 
-Accepted today: visible owned aggregates transfer dependencies without hidden
-storage. This example also shows the by-value API shape already supported by
-the checker; it is not a replacement container API.
+This program forwards a checked insertion effect and uses a removed reference
+after destroying the vector:
 
 ```dodo test
 package example
-struct Holder { value: Option<&i32> }
-fn identity(value: Holder) -> Holder from(value) { return value }
-fn main() -> i32 {
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/collections/vector"
+import "std/collections/shared_vector"
+fn put(out: &mut vector.Vector<&i32, shared_arena.Handle>, value: &i32) -> void!error.AllocError stores(out, value) {
+    return out.push(value)
+}
+fn run() -> i32!error.AllocError {
+    bytes := [0u8; 4096]
+    arena := shared_arena.SharedArena.new(&mut bytes)?
     source := 42i32
-    holder := identity(Holder { value: some(&source) })
-    let Holder { value } = holder
-    match value {
-        some(value) => { return *value - 42 },
-        none => { return 1 },
+    values := shared_vector.new::<&i32>(arena.handle())
+    put(&mut values, &source)?
+    removed := values.pop()
+    core.drop(values)
+    match removed {
+        some(value) => { return ok(*value - 42) },
+        none => { return ok(1) },
     }
 }
-```
-
-Rejected today, including when the caller happens to provide a long-lived
-source; this is the minimal insertion blocker:
-
-```dodo
-fn put(slots: &mut[Option<&i32>], value: &i32) {
-    slots[0] = some(value)
-}
-```
-
-Even `*slot = none` through `&mut Option<&i32>` and
-`option.take(slot)` are rejected. Removing the memory-exchange guard would
-still leave insertion, effects through wrappers, and independent removal
-provenance unimplemented. An explicit `from(slot, value)` only addresses the
-return value; it does not make `put` safe.
-
-Proposed first candidate: only `fixed_vector.Vector<&i32>`, using shared scalar
-references and a conservative backing-region union. Construction, push/insert,
-pop/remove/swap_remove, replace, shared get, clear and drop must all respect
-that invariant; mutable element views stay rejected. No allocated vector,
-mutable reference elements, arbitrary reference-bearing structs, or Result
-elements would be enabled by this candidate. A static string exception is also
-out of scope: `&str` does not mean its value is necessarily static.
-
-Under that proposal, the following would be accepted once the checked effects
-exist. It is **rejected by the current compiler**:
-
-```dodo
-source := 42i32
-slots: [1]Option<&i32> = [none]
-values := fixed_vector.Vector.new(&mut slots)
-match values.push(&source) { ok() => {}, err(_) => {} }
-removed := values.pop()
-core.drop(values)
-match removed { some(value) => { observed := *value }, none => {} }
-```
-
-The same sequence with insertion inside `{ short := 42; ...push(&short)... }`
-and use of the vector or removed value outside that block must be rejected.
-So must `source = 0` while either stored or removed references remain live.
-Inserting a reference to another element of the same vector must fail because
-it conflicts with the required exclusive storage loan. A failed push does not
-justify releasing sources if the initial summary cannot distinguish outcomes.
-
-Decision: this candidate is **blocked**, not partially enabled. Needed checker
-work is verified argument mutation effects, caller-root writeback through
-external references, and separation of removed referent dependencies from a
-container storage loan. None is supplied by removing a type restriction.
-
-## Result obligations: a separate proposed invariant
-
-A Result's pending handling obligation is not a reference dependency and is
-not its destructor. Both `ok` and `err` require explicit handling. Moving a
-pending Result transfers responsibility; destroying its payload does not handle
-it. Matching an old value cannot pre-handle a replacement with identical type.
-
-A future container must associate obligations with the owned active payloads,
-including Results nested in fields or variants. A conceptual obligation ledger
-assigns new obligations to new Results, moves them with values, and discharges
-them only through checked matching/propagation/forwarding. This is a semantic
-model, not a proposed heap allocation or runtime flag for every element.
-
-For dynamically indexed storage, a conservative summary may say “some element
-may still be pending.” Reading or matching one element must never clear that
-summary for all elements. A draining proof or verified handling effect covering
-every active element is required to clear it. Branch joins preserve every
-possible obligation; a loop body handling one pop does not by itself prove the
-container is drained on all exits. Breaks, early returns and failure paths count.
-
-| Operation | Proposed Result behavior |
-| --- | --- |
-| Construction over caller slots | Existing destructive clearing cannot accept arbitrary pending payloads. Require checked empty slots or transfer every preexisting obligation back to the caller. |
-| Successful insertion | Move the input obligation into the logical storage owner. The Result reporting insertion success is separate from the stored element's obligation. |
-| Failed insertion | Existing methods destroy the incoming value: incompatible with pending Result elements. A future API must return the input, for example in `PushFailure<T> { reason, value }`, with recursive mandatory handling. Handling just the capacity/allocator error is insufficient. |
-| Removal / pop | Move the removed element's obligations to the returned `Option<T>`. Ignoring it, using `_`, or `core.drop` must fail when it contains Results. Returning `none` carries no active payload but may remain conservatively obligation-bearing until matched. |
-| Replacement | Transfer the old value's obligations to the return value and the new value's into storage. Invalid indices must return the incoming Result rather than destroy it. A plain assignment requires the old value already handled. |
-| Internal moves / growth | Transfer obligations with ownership; neither copying bytes nor deallocating the old block handles any Result. Allocation failure preserves existing obligations and returns the incoming one. |
-| Clear / implicit drop | Reject while anything may be pending. Clear cannot silently “handle” each element with an internal wildcard. A future explicit drain/handler API must have a verified complete handling effect, including early exits. |
-| Nested aggregates / containers | Transfer every active nested obligation. Handling an outer insertion Result or one outer `Option` does not discharge pending inner Results. Maps must also account for destroyed duplicate keys and stored keys removed without returning them. |
-| External mutation | Writing through a view must check the old obligation and register the new one with the original owner. Even replacing `Option<Result<...>>` with `none` may erase a pending error. |
-
-The current `contains_result` deliberately stops at references: borrowing a
-Result is not transferring ownership of it. Changing that traversal would charge
-every allocator/policy/view reference with its referent's obligations and still
-would not provide slot identities or mutation effects. Similarly, the current
-`pending_result` bit is insufficient for partially handled, dynamically sized
-collections. Merely adding a bit to the vector would let a match of one element
-hide errors in the rest.
-
-An already matched Result keeps its Result type. There is no `Handled<T>` type
-or persistent proof that can be put into opaque storage. `core.drop` and memory
-exchange retain their existing type-based prohibitions, even after a borrowed
-match. Such proof transport would be another language design, not this milestone.
-
-## Result examples and delivered milestone
-
-Accepted today, including native destruction of the old active payload when
-the whole binding is assigned again:
-
-```dodo test
-package example
 fn main() -> i32 {
-    value: i32!u8 = ok(1)
-    match &value { ok(_) => {}, err(_) => {} }
-    value = err(2)
-    match value {
-        ok(_) => { return 1 },
-        err(code) => { return code as i32 - 2 },
-    }
+    match run() { ok(code) => { return code }, err(_) => { return 2 } }
 }
 ```
 
-Omitting the second match is rejected. This applies to whole owned aggregates
-containing Results as well. Matching by reference leaves payload destruction
-for replacement or normal cleanup; it does not move the payload.
+See `examples/string_map.dodo` for complete text construction, string-key map
+insertion, replacement, lookup, iteration and removal with one allocator.
+`hash.Str`, `hash.Text` and `text_shared.Key` compare UTF-8 bytes and hash
+contents. `hash.SipStr` accepts explicit caller-provided keys for keyed hashing.
 
-Previously accepted incorrectly; now rejected at the assignment:
+## Negative acceptance and Results
+
+The following operations remain errors in the example above:
 
 ```dodo
-fn store(out: &mut Result<i32, u8>) { *out = err(2) }
-fn main() {
-    value: i32!u8 = ok(1)
-    match &value { ok(_) => {}, err(_) => {} }
-    store(&mut value)
-} // The new error used to disappear without being matched.
+values.push(&source)?
+source = 0                 // Stored dependency is still live.
+{ short := 1i32
+  values.push(&short)? }   // Source cannot escape this scope.
+view := values.as_slice()
+values.clear()
+core.drop(view)            // A live view forbids the preceding clear.
+values.push(&source)       // The insertion Result must be handled.
 ```
 
-The same gap existed for `alias := &mut value; *alias = err(2)`,
-`holder.result = err(2)`, and indexed writes. In `StmtKind::Assign`, only
-`place.direct` updated the pending bit. A referenced parameter owns no Result
-bit, and a nested field had no independent bit to update. Later cleanup checked
-the unchanged, already-cleared owner bit. Overwriting an unhandled nested Result
-could likewise evade the whole-binding overwrite check.
+Every Result alternative requires handling. Moving a Result is not handling it,
+and destroying its payload does not discharge its obligation. The current
+failure, duplicate-key, replacement, clear and drop APIs can destroy incoming
+or stored payloads, so they cannot accept owned Results. The existing whole-binding
+pending bit is not an indexed obligation ledger. No Result storage, drain proof,
+or handled-Result wrapper is introduced. Result-containing assignments through
+fields, indices and references remain rejected; whole-binding replacement still
+requires handling the previous value and creates a fresh obligation.
 
-The delivered guard rejects any assignment whose target type recursively
-contains a Result and whose place is not a whole owned binding. It applies to
-local fields/indices, local aliases, and external references, including replacing
-an entire referenced aggregate. It also conservatively rejects cases where
-subsequent code would handle the new Result. The diagnostic explains that whole
-owned replacement is the available route. Assigning a plain success payload
-through a matched `&mut Result` remains allowed; it creates no new Result.
+`tests/container_elements.rs` contains positive O0/O3 execution and negative
+programs for source mutation/destruction, lifetime escape, omitted/misdeclared
+effects, aliases, moves, stale views, loop exits and discarded Results.
+`reference_collections.dodo` covers reference aggregates, rings, maps/sets,
+heaps, relocation and destructor counters. `shared_text_collections.dodo` covers
+safe constructors, shared allocator strings, limits, UTF-8 boundaries, allocation
+failure and owned string maps. Existing collection fixtures continue to test
+move-only values, zero-sized destruction, collisions and allocation failures.
 
-This is one bounded safety milestone, with no code-generation changes, container
-API changes, unchecked representation casts, or relaxation of existing guards.
-It closes the reproduced assignment gap; it is not a claim that all future
-obligation effects or all raw-memory safety concerns are solved.
-
-## Executable acceptance and blocker tests
-
-Run from the repository root:
+Run the focused checks with:
 
 ```sh
-cargo test --locked --test stdlib_safety --test container_elements --test collections_library --test owned_storage
+cargo test --locked --lib --test container_elements --test collections_library --test owned_storage --test stdlib_safety --test std_text --test hash_library
 target/debug/dodo test docs --doc
 ```
-
-`tests/stdlib_safety.rs` covers opaque storage and exchange restrictions plus
-the new field/index/alias/external Result assignment rejection. Whole-binding
-reassignment tests preserve pending obligations across branches, loops, drop,
-discard and overwriting. `tests/container_elements.rs` isolates rejected
-reference insertion/extraction helpers, recursively rejected fixed/allocated
-vector specializations, escaped sources, source mutation after moves, custom
-destructor liveness, and exclusive reference aliasing. It also tests views
-against insertion, removal, replacement, growth, clear/drop, allocator reset,
-allocator destruction and backing-storage mutation.
-
-`tests/stdlib/container_element_baseline.dodo` runs at `-O0` and `-O3`. Accepted
-visible aggregates exercise checked references, read-only collection search,
-nested enum/struct/Option moves, whole binding replacement, success/error payload
-destruction, borrowed matching, and cleanup on propagation and scope exit.
-Weighted counters verify exactly one destruction of each active payload.
-The counters use raw pointers solely for instrumentation; stored reference and
-Result values use checked storage throughout.
-
-Existing collection native fixtures at both optimization levels exercise the
-supported element category: fixed capacity failure, allocated growth/failure,
-replacement, removal, shifting, clear/drop, move-only values and zero-sized
-destruction. These provide the storage-behavior baseline; they do **not** claim
-that reference or Result container programs now compile. Rejected programs are
-checked only, never executed after a lifetime or handling error.
-
-## What remains unsupported
-
-- All fixed and allocated moving containers with reference-bearing or
-  Result-containing elements, recursively, including maps' keys and values.
-- The proposed fixed vector of shared `&i32` elements, until verified mutation
-  effects and ownership-return dependencies exist.
-- Mutable reference elements, mutable reference-bearing views, arbitrary nested
-  reference aggregates, and precise release of sources after individual removals.
-- Result storage/drain/replace/clear/drop effects, failure APIs returning pending
-  inputs, partial handling of dynamic collections, and transported handled proofs.
-- Reference-bearing or Result-containing memory exchange, opaque initialization,
-  and owner-bound raw checked views. Existing unsafe raw-memory contracts remain
-  in force; this design grants no new raw-storage permission.
-- Assigning a Result-containing field, index, or referent, even when a programmer
-  can demonstrate that a particular update would be safe. Use a whole owned
-  binding and explicit handling while the checker lacks these effects.

@@ -1,8 +1,8 @@
 ---
 title: "Processes"
 description: "Direct native process execution, owned child handles, explicit environments and bounded output collection."
-section: "Using Dodo"
-order: 147
+section: "Standard library"
+order: 154
 ---
 
 Use `std/process.Command.new` and `Command.output` to run a program and collect

@@ -1,0 +1,107 @@
+package hosted_driving_checks
+import "core/bytes"
+import "std/console"
+import "std/http"
+import "std/http/hosted"
+import "std/http/hosting"
+import "std/io"
+import "std/net"
+import "std/web"
+import "std/web/hosted" as server
+
+pub struct Clock {
+    ticks: u64
+    pub fn now_ms(&mut self) -> u64 { self.ticks += 1; return self.ticks }
+}
+pub struct Peer {
+    response: &[u8]
+    offset: usize
+    wire: [1024]u8
+    used: usize
+    block: bool
+    stall: bool
+    pub fn poll_read(&mut self, output: &mut[u8]) -> io.Poll!io.Error {
+        if self.offset == self.response.len { return ok(io.Poll { state: io.PollState.Eof, transferred: 0 }) }
+        output[0] = self.response[self.offset]
+        self.offset += 1
+        return ok(io.Poll { state: io.PollState.Ready, transferred: 1 })
+    }
+    pub fn poll_write(&mut self, source: &[u8]) -> io.Poll!io.Error {
+        if self.stall { return ok(io.Poll { state: io.PollState.Pending, transferred: 0 }) }
+        self.block = !self.block
+        if self.block { return ok(io.Poll { state: io.PollState.Pending, transferred: 0 }) }
+        count := source.len
+        if count > 2 { count = 2 }
+        for i in 0usize..count { self.wire[self.used + i] = source[i] }
+        self.used += count
+        return ok(io.Poll { state: io.PollState.Pending, transferred: count })
+    }
+    pub fn flush(&mut self) -> bool!hosting.Error { return ok(true) }
+    pub fn wait(&mut self, writing: bool, milliseconds: u32) -> void!hosting.Error { return ok() }
+}
+fn run() -> void!hosting.Error {
+    peer := Peer { response: b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", offset: 0,
+        wire: [0u8; 1024], used: 0, block: false, stall: false }
+    workspace := [0u8; 36864]
+    fields := [0u8; 512]
+    head := hosted.Head.new(&mut fields)
+    config := hosted.Config.defaults()
+    headers := [http.Header { name: b"Host", value: b"example.test:80" }, http.Header { name: b"Connection", value: b"close" }]
+    request := http.Request { method: b"POST", target: b"/", headers: &headers, body: http.Body.sized(6) }
+    body := [0u8; 3]
+    sink := io.MemoryWriter.new(&mut body)
+    clock := Clock { ticks: 0 }
+    cancel := net.NeverCancel {}
+    delivered := 0u64
+    response := hosted.exchange(&mut peer, &request, b"abcdef", &mut workspace, &config, &mut head, &mut sink,
+        &mut clock, &cancel, 10000, &mut delivered)?
+    assert(response.body_bytes == 3 && bytes.equal(sink.written(), b"abc"))
+    assert(bytes.equal(&peer.wire[..peer.used], b"POST / HTTP/1.1\r\nHost: example.test:80\r\nConnection: close\r\nContent-Length: 6\r\n\r\nabcdef"))
+    blocked := Peer { response: b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", offset: 0,
+        wire: [0u8; 1024], used: 0, block: false, stall: true }
+    server_workspace := [0u8; server.WORKSPACE_BYTES]
+    request_body := [0u8; 32]
+    response_body := [0u8; 32]
+    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
+    router: web.Router
+    match web.Router.new(&routes) {
+        ok(value) => { router = value }
+        err(_) => { return err(hosting.failure(hosting.ErrorKind.InvalidInput)) }
+    }
+    handler := server.Text.new(b"body")
+    settings := server.Config.defaults()
+    settings.write_timeout_ms = 10
+    match server.serve_connection(&mut blocked, &router, &mut handler, &mut server_workspace,
+        &mut request_body, &mut response_body, &settings, 1, &mut clock, &cancel) {
+        ok(_) => { assert(false, "stalled server writer succeeded") }
+        err(reason) => { assert(reason.kind == hosting.ErrorKind.TimedOut) }
+    }
+    assert(blocked.used == 0, "stalled transport wrote bytes")
+    match server.serve_connection(&mut blocked, &router, &mut handler, &mut server_workspace[..0],
+        &mut request_body, &mut response_body, &settings, 1, &mut clock, &cancel) {
+        ok(_) => { assert(false, "short server workspace accepted") }
+        err(reason) => { assert(reason.kind == hosting.ErrorKind.Workspace) }
+    }
+    cancelled := net.Cancellation.new()
+    cancelled.cancel()
+    match hosting.check(&mut clock, &cancelled, 0) {
+        ok() => { assert(false) }
+        err(reason) => { assert(reason.kind == hosting.ErrorKind.Cancelled) }
+    }
+    clock.ticks = 9
+    match hosting.check(&mut clock, &cancel, 10) {
+        ok() => { assert(false) }
+        err(reason) => { assert(reason.kind == hosting.ErrorKind.TimedOut) }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match run() {
+        ok() => { return 0 }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println_value(&reason) { ok(_) => {} err(_) => {} }
+            return 1
+        }
+    }
+}
