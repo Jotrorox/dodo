@@ -235,8 +235,10 @@ Storage bounds are 4096 native units each for executable and directory (includin
 NUL), plus 32768 units for all arguments (one NUL per argument). Storage occupies
 40984 bytes on Linux and 81944 on Windows, including counters and alignment;
 there is no hidden allocator or growth. The OS imposes additional limits:
-Linux bounds arguments/environment using its exec limits; Windows bounds the
-quoted command line to 32768 UTF-16 units including NUL. Quotes/backslashes can
+Linux also limits explicit arguments to 4095 (plus the executable at argv[0])
+and custom environment entries to 4096 in the native backend; exceeding either
+returns `BufferTooSmall` at spawn. OS exec limits apply as well. Windows bounds
+the quoted command line to 32768 UTF-16 units including NUL. Quotes/backslashes can
 expand the Windows command line, so a successful `arg` can still lead to a
 `BufferTooSmall` spawn failure. The Windows round-trip guarantee applies to CRT
 argument parsing; programs with custom command-line parsers can differ.
