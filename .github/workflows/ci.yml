@@ -168,3 +168,55 @@ jobs:
           path: build/release-assets/
           if-no-files-found: error
           retention-days: 7
+
+  windows-compiler:
+    name: Windows x86-64 release / LLVM 22
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.95.0
+          components: rust-docs
+          targets: x86_64-pc-windows-msvc
+      - name: Install the official LLVM 22 Windows development archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "$env:RUNNER_TEMP/llvm-windows.tar.xz"
+          Invoke-WebRequest 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'D96C2CC1736F4EB7FA43CB9BBDF56D93551A9AE0A9AADB9C99C3C3B2B712A234') {
+            throw 'LLVM archive checksum mismatch'
+          }
+          $prefix = "$env:RUNNER_TEMP/llvm-windows"
+          New-Item -ItemType Directory -Path $prefix | Out-Null
+          tar -xJf $archive -C $prefix --strip-components=1
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM archive extraction failed' }
+          "LLVM_SYS_221_PREFIX=$prefix" >> $env:GITHUB_ENV
+          "$prefix/bin" >> $env:GITHUB_PATH
+      - name: Build LLVM's missing static XML library and collect notices
+        run: python scripts/build-windows-llvm-support.py
+      - name: Build the Windows compiler with static runtimes
+        run: cargo build --locked --release --bin dodo --target x86_64-pc-windows-msvc
+      - name: Package the Windows release
+        run: python scripts/package-release.py --target x86_64-pc-windows-msvc
+      - name: Test the extracted Windows release
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem build/release-assets/dodo-*-x86_64-pc-windows-msvc.zip
+          python scripts/test_windows_release.py $archive.FullName --linker "$env:LLVM_SYS_221_PREFIX/bin/clang.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release smoke test failed' }
+      - name: Upload the verified Windows compiler
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-x86_64-compiler
+          path: build/release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 7

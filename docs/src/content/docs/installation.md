@@ -27,6 +27,11 @@ updates the current terminal; if your shell does not already include
 `~/.local/bin` on `PATH`, add that line to your shell's startup configuration as
 well.
 
+On x86-64 Windows, download the `x86_64-pc-windows-msvc.zip` archive and extract
+it. Add the folder containing `dodo.exe` to your user `PATH`, then open a new
+terminal and run `dodo --version`. You can also run `.\dodo.exe --version`
+directly from the extracted folder in PowerShell.
+
 If no prebuilt compiler matches your system, use the
 [source build guide](building-from-source.md).
 
@@ -56,6 +61,11 @@ cc --version
 
 You can select another C linker driver with `--linker` or `DODO_CC`; see
 [targets and linking](command-line.md#targets-and-linking).
+
+On Windows, install Clang and the Visual Studio C++ Build Tools with a Windows
+SDK. Select the Clang driver in PowerShell with `$env:DODO_CC = "clang"`, or
+pass `--linker clang` when building or running a program. Checking source and
+emitting objects from the Windows archive work without these tools installed.
 
 ## Next step
 
