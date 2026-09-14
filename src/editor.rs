@@ -430,8 +430,26 @@ fn signature(function: &Function) -> String {
     } else {
         format!(" from({})", function.from.join(", "))
     };
+    let stores = if function.stores.is_empty() {
+        String::new()
+    } else {
+        format!(" stores({})", function.stores.join(", "))
+    };
+    let requires = if function.requires_plain.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " requires_plain({})",
+            function
+                .requires_plain
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let mut markdown = code(&format!(
-        "{}fn {}({params}) -> {}{from}",
+        "{}fn {}({params}) -> {}{from}{stores}{requires}",
         if function.unsafe_ { "unsafe " } else { "" },
         function.name,
         function.ret

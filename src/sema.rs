@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 mod generics;
 mod ownership;
 mod slices;
+mod storage;
 mod uses;
 
 use generics::{instantiate, intrinsic_result_type};
@@ -75,7 +76,7 @@ fn check_program(
         }
     }
     for function in &mut program.functions {
-        if function.body.is_none() {
+        if function.body.is_none() || context.functions[&function.name].unavailable {
             continue;
         }
         let result = (|| {
@@ -87,6 +88,7 @@ fn check_program(
                 context.functions[&function.name].from.clone(),
                 uses,
             );
+            checker.stores = function.stores.clone();
             checker.recover = recover;
             checker.namespace = context.function_namespace(&function.name);
             checker.binding_uses = binding_use_spans(function);
@@ -94,8 +96,11 @@ fn check_program(
             checker.inferred_contract = function.from_span.is_none();
             for parameter in &function.params {
                 let id = checker.next_id;
-                let deps = if context.carries_borrow(&parameter.ty) {
+                let stored = context.contains_storage_witness(&parameter.ty);
+                let borrowed = matches!(parameter.ty, Type::Ref(..) | Type::Slice(..));
+                let mut deps = if context.carries_borrow(&parameter.ty) {
                     vec![Loan {
+                        stored: stored && !borrowed,
                         dependency: false,
                         root: usize::MAX / 2 + id,
                         fields: vec![],
@@ -108,6 +113,22 @@ fn check_program(
                 } else {
                     vec![]
                 };
+                if let Type::Ref(_, inner) | Type::Slice(_, inner) = &parameter.ty
+                    && stored
+                    && context.carries_borrow(inner)
+                {
+                    deps.push(Loan {
+                        stored: true,
+                        dependency: true,
+                        root: usize::MAX / 4 + id,
+                        fields: vec![],
+                        partitions: vec![],
+                        mutable: context.carries_mutable_borrow(inner),
+                        origin: parameter.span,
+                        via: vec![],
+                        external: Some(format!("{}.stored", parameter.name)),
+                    });
+                }
                 checker.bind(
                     parameter.name.clone(),
                     parameter.ty.clone(),
@@ -139,6 +160,9 @@ fn check_program(
             diagnostics.push(error);
         }
     }
+    program
+        .functions
+        .retain(|f| !context.functions[&f.name].unavailable);
     Ok(())
 }
 
@@ -171,6 +195,8 @@ struct Signature {
     params: Vec<Param>,
     ret: Type,
     from: Vec<String>,
+    stores: Vec<String>,
+    unavailable: bool,
     unsafe_: bool,
     extern_: bool,
     public: bool,
@@ -290,7 +316,21 @@ impl Context {
                 context.validate_type(&param.ty, param.span, false)?;
             }
             context.validate_type(&function.ret, function.span, true)?;
+            for required in &function.requires_plain {
+                context.validate_type(required, function.span, false)?;
+            }
+            if function.name.ends_with(".drop") && !function.requires_plain.is_empty() {
+                return Err(Diagnostic::new(
+                    function.span,
+                    "destructors cannot have requires_plain constraints",
+                ));
+            }
             let mut from = function.from.clone();
+            for source in &from {
+                if let Some(owner) = source.strip_suffix(".stored") {
+                    context.validate_stored_source(function, owner)?;
+                }
+            }
             if context.carries_borrow(&function.ret) {
                 if from.is_empty() {
                     if let Some(receiver) = function
@@ -323,9 +363,10 @@ impl Context {
                     }
                 }
                 for source in &from {
+                    let parameter_source = source.strip_suffix(".stored").unwrap_or(source);
                     if source != "static"
                         && !function.params.iter().any(|p| {
-                            p.name == *source
+                            p.name == parameter_source
                                 && (context.carries_borrow(&p.ty) || function.generic_instance)
                         })
                     {
@@ -352,7 +393,12 @@ impl Context {
                 }
             } else if !from.is_empty() && function.generic_instance {
                 for source in &from {
-                    if source != "static" && !function.params.iter().any(|p| p.name == *source) {
+                    if source != "static"
+                        && !function
+                            .params
+                            .iter()
+                            .any(|p| p.name == source.strip_suffix(".stored").unwrap_or(source))
+                    {
                         return Err(Diagnostic::new(
                             function.from_span.unwrap_or(function.ret_span),
                             format!("borrow source `{source}` is not a parameter"),
@@ -371,6 +417,7 @@ impl Context {
                     "this return type does not carry a borrow",
                 ));
             }
+            context.validate_stores(function)?;
             if function.name.ends_with(".drop") {
                 let owner = function.name.trim_end_matches(".drop");
                 if function.params.len() != 1
@@ -398,6 +445,11 @@ impl Context {
                     params: function.params.clone(),
                     ret: function.ret.clone(),
                     from,
+                    stores: function.stores.clone(),
+                    unavailable: function
+                        .requires_plain
+                        .iter()
+                        .any(|t| context.carries_borrow(t) || context.contains_result(t)),
                     unsafe_: function.unsafe_,
                     extern_: function.extern_,
                     public: function.public,
@@ -658,6 +710,7 @@ struct Checker<'a> {
     next_partition: usize,
     return_ty: Type,
     from: Vec<String>,
+    stores: Vec<String>,
     return_contract: Option<Span>,
     inferred_contract: bool,
     uses: HashMap<String, Span>,
@@ -665,6 +718,7 @@ struct Checker<'a> {
     position: usize,
     unsafe_depth: usize,
     loop_depth: usize,
+    storage_loops: std::cell::RefCell<Vec<storage::StorageLoop>>,
     temporary: Vec<Loan>,
     protected: Vec<Loan>,
     yields: Vec<YieldContext>,
@@ -689,6 +743,7 @@ impl<'a> Checker<'a> {
             next_partition: 1,
             return_ty,
             from,
+            stores: vec![],
             return_contract: None,
             inferred_contract: false,
             uses,
@@ -696,6 +751,7 @@ impl<'a> Checker<'a> {
             position: 0,
             unsafe_depth: 0,
             loop_depth: 0,
+            storage_loops: std::cell::RefCell::new(vec![]),
             temporary: vec![],
             protected: vec![],
             yields: vec![],
@@ -809,6 +865,13 @@ impl<'a> Checker<'a> {
         } else {
             access
         };
+        if !place.dependency
+            && matches!(access, Access::Write | Access::Move | Access::Borrow(true))
+        {
+            for state in self.storage_loops.borrow_mut().iter_mut() {
+                state.accesses.push((place.clone(), span));
+            }
+        }
         for variable in self.scopes.iter().flatten().filter(|v| self.live(v)) {
             if place.via.contains(&variable.id) {
                 continue;
@@ -1278,7 +1341,12 @@ impl<'a> Checker<'a> {
                 if self.context.carries_borrow(&value.ty) {
                     for loan in &value.deps {
                         match &loan.external {
-                            Some(source) if self.from.contains(source) || source == "static" => (),
+                            Some(source)
+                                if self.from.contains(source)
+                                    || source == "static"
+                                    || source
+                                        .strip_suffix(".stored")
+                                        .is_some_and(|s| self.from.iter().any(|f| f == s)) => {}
                             Some(source) => {
                                 let source_span = self.scopes[0]
                                     .iter()
@@ -1387,6 +1455,7 @@ impl<'a> Checker<'a> {
                         })
                         .collect(),
                 );
+                self.begin_storage_loop();
                 self.loop_depth += 1;
                 let first_partition = self.next_partition;
                 let split_depth = self.scopes.len();
@@ -1400,6 +1469,7 @@ impl<'a> Checker<'a> {
                     self.statement(step)?;
                     self.temporary.clear();
                 }
+                self.end_storage_loop(span)?;
                 self.loop_depth -= 1;
                 self.check_split_loop_escape(first_partition, split_depth, span)?;
                 self.loop_uses.pop();
@@ -1550,9 +1620,11 @@ impl<'a> Checker<'a> {
                     );
                 }
                 self.loop_uses.push(loop_uses);
+                self.begin_storage_loop();
                 self.loop_depth += 1;
                 let first_partition = self.next_partition;
                 self.block(body, false)?;
+                self.end_storage_loop(span)?;
                 self.loop_depth -= 1;
                 self.check_split_loop_escape(first_partition, self.scopes.len() - 1, span)?;
                 self.loop_uses.pop();
@@ -2780,6 +2852,7 @@ impl<'a> Checker<'a> {
                     Place {
                         ty: variable.ty,
                         loans: vec![Loan {
+                            stored: false,
                             dependency: false,
                             root: variable.id,
                             fields: vec![],
@@ -3118,6 +3191,12 @@ impl<'a> Checker<'a> {
             .get(name)
             .cloned()
             .ok_or_else(|| Diagnostic::new(span, format!("unknown function `{name}`")))?;
+        if signature.unavailable {
+            return Err(Diagnostic::new(
+                span,
+                "this operation requires plain elements: mutable element views cannot expose checked borrows or Result obligations",
+            ));
+        }
         if !signature.public && self.context.function_namespace(name) != self.namespace {
             return Err(Diagnostic::new(
                 span,
@@ -3145,6 +3224,7 @@ impl<'a> Checker<'a> {
         }
         let temporary_start = self.temporary.len();
         let mut dependencies = vec![];
+        let mut argument_values = vec![];
         for (arg, parameter) in args.iter_mut().zip(&signature.params) {
             let reference = matches!(parameter.ty, Type::Ref(..) | Type::Slice(..));
             let argument_start = self.temporary.len();
@@ -3159,8 +3239,32 @@ impl<'a> Checker<'a> {
                 )?;
             }
             if signature.from.contains(&parameter.name) {
-                dependencies.extend(value.deps);
+                dependencies.extend(value.deps.clone());
             }
+            if signature
+                .from
+                .contains(&format!("{}.stored", parameter.name))
+            {
+                dependencies.extend(value.deps.iter().filter(|d| d.stored).cloned());
+            }
+            argument_values.push(value);
+        }
+        if let Some(target) = signature.stores.first() {
+            let target_index = signature
+                .params
+                .iter()
+                .position(|p| &p.name == target)
+                .unwrap();
+            let mut incoming = vec![];
+            for source in &signature.stores[1..] {
+                let index = signature
+                    .params
+                    .iter()
+                    .position(|p| &p.name == source)
+                    .unwrap();
+                incoming.extend(argument_values[index].deps.clone());
+            }
+            self.deposit(&argument_values[target_index], &incoming, span)?;
         }
         if signature.from.iter().any(|n| n == "static") {
             dependencies.push(static_loan(span));
@@ -3184,6 +3288,29 @@ impl<'a> Checker<'a> {
         expected: Option<&Type>,
         span: Span,
     ) -> Check<Value> {
+        if name == "core.mem.storage_type" {
+            if type_args.len() != 1 || !args.is_empty() {
+                return Err(Diagnostic::new(
+                    span,
+                    "mem.storage_type expects one element type and no arguments",
+                ));
+            }
+            self.context.check_storage_element(&type_args[0], span)?;
+            return Ok(Value {
+                ty: Type::Void,
+                deps: vec![],
+            });
+        }
+        if matches!(
+            name,
+            "core.ptr.store"
+                | "core.ptr.take"
+                | "core.ptr.relocate"
+                | "core.ptr.view"
+                | "core.ptr.view_slice"
+        ) {
+            return self.storage_intrinsic(name, type_args, args, span);
+        }
         if name == "core.mem.split_at_mut" {
             return self.split_at_mut(type_args, args, span);
         }
@@ -4078,7 +4205,8 @@ impl<'a> Checker<'a> {
                 if let Some(variable) = self.lookup(name).cloned() {
                     self.by_id_mut(variable.id).unwrap().pending_result = false;
                     for loan in variable.deps {
-                        if loan.fields.is_empty()
+                        if !loan.stored
+                            && loan.fields.is_empty()
                             && let Some(owner) = self.by_id_mut(loan.root)
                         {
                             owner.pending_result = false;

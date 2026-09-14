@@ -17,8 +17,16 @@ fn example() -> i32!error.AllocError {
     numbers.push(20)?
     ordering := collections.I32 {}
     collections.sort(numbers.as_mut_slice(), &ordering)
-    for value in numbers.as_slice() {
-        core.drop(counts.insert(*value, *value / 10)?)
+    cursor := 0usize
+    for {
+        match numbers.next(&mut cursor) {
+            some(value) => {
+                core.drop(counts.insert(*value, *value / 10)?)
+            },
+            none => {
+                break
+            },
+        }
     }
     key := 20i32
     match counts.get(&key) {

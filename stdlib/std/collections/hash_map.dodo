@@ -13,12 +13,26 @@ pub struct Entry<K, V> {
 // Linear-probing map, power-of-two bucket count, maximum 75% load.
 // H supplies hash(&K)->u64 and equal(&K,&K)->bool. Equal keys MUST hash equally.
 pub struct Map<K, V, H, A> {
+    elements: [0]Option<Entry<K, V>>
     allocator: A
     policy: H
     pointer: *mut Option<Entry<K, V>>
     length: usize
     buckets: usize
 
+    // The cursor is opaque traversal state; callers never inspect buckets.
+    pub fn next(&self, cursor: &mut usize) -> Option<&Entry<K, V>> from(self) {
+        for *cursor < self.buckets {
+            index := *cursor
+            *cursor = index + 1
+            match self.entry(index) {
+                some(entry) => {
+                    return some(entry)
+                }, none => {},
+            }
+        }
+        return none
+    }
     pub fn len(&self) -> usize {
         return self.length
     }
@@ -32,7 +46,7 @@ pub struct Map<K, V, H, A> {
     fn start(&self, key: &K) -> usize {
         return (self.policy.hash(key) as usize) & (self.buckets - 1)
     }
-    fn next(&self, index: usize) -> usize {
+    fn next_bucket(&self, index: usize) -> usize {
         return (index + 1) & (self.buckets - 1)
     }
     pub fn entry(&self, index: usize) -> Option<&Entry<K, V>> {
@@ -40,7 +54,7 @@ pub struct Map<K, V, H, A> {
             return none
         }
         unsafe {
-            match ptr.borrow(ptr.offset(self.pointer, index as isize), self) {
+            match ptr.view(ptr.offset(self.pointer, index as isize), self) {
                 some(entry) => {
                     return some(entry)
                 }, none => {
@@ -65,7 +79,7 @@ pub struct Map<K, V, H, A> {
                     return none
                 },
             }
-            index = self.next(index)
+            index = self.next_bucket(index)
         }
     }
     pub fn contains(&self, key: &K) -> bool {
@@ -90,7 +104,7 @@ pub struct Map<K, V, H, A> {
         }
         return none
     }
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> requires_plain(K, V) {
         match self.find(key) {
             some(index) => {
                 unsafe {
@@ -106,7 +120,7 @@ pub struct Map<K, V, H, A> {
         return none
     }
     // Requires free capacity; moves an entry into an empty bucket.
-    fn place(&mut self, entry: Entry<K, V>) {
+    fn place(&mut self, entry: Entry<K, V>) stores(self, entry) {
         index := self.start(&entry.key)
         for {
             occupied := false
@@ -117,12 +131,12 @@ pub struct Map<K, V, H, A> {
             }
             if!occupied {
                 unsafe {
-                    ptr.write(ptr.offset(self.pointer, index as isize), some(entry))
+                    ptr.store(ptr.offset(self.pointer, index as isize), some(entry), self)
                 }
                 self.length = self.length + 1
                 return
             }
-            index = self.next(index)
+            index = self.next_bucket(index)
         }
     }
     pub fn reserve(&mut self, additional: usize) -> void!error.AllocError {
@@ -149,7 +163,7 @@ pub struct Map<K, V, H, A> {
         unsafe {
             destination := allocation.as_ptr() as *mut Option<Entry<K, V>>
             for i in 0usize..buckets {
-                ptr.write(ptr.offset(destination, i as isize), none)
+                ptr.store(ptr.offset(destination, i as isize), none, self)
             }
             previous := self.pointer
             previous_count := self.buckets
@@ -157,7 +171,7 @@ pub struct Map<K, V, H, A> {
             self.buckets = buckets
             self.length = 0
             for i in 0usize..previous_count {
-                match ptr.read(ptr.offset(previous, i as isize)) {
+                match ptr.take(ptr.offset(previous, i as isize), self) {
                     some(entry) => {
                         self.place(entry)
                     }, none => {},
@@ -169,13 +183,16 @@ pub struct Map<K, V, H, A> {
         }
         return ok()
     }
-    pub fn insert(&mut self, key: K, value: V) -> Option<V>!error.AllocError {
+    pub fn insert(&mut self, key: K, value: V) -> Option<V>!error.AllocError from(self.stored) stores(self, key, value) {
         match self.find(&key) {
             some(index) => {
                 unsafe {
-                    match ptr.borrow_mut(ptr.offset(self.pointer, index as isize), self) {
+                    destination := ptr.offset(self.pointer, index as isize)
+                    match ptr.take(destination, self) {
                         some(entry) => {
-                            return ok(some(mem.replace(&mut entry.value, value)))
+                            let Entry<K, V> { key: original, value: previous } = entry
+                            ptr.store(destination, some(Entry<K, V> { key: original, value: value }), self)
+                            return ok(some(previous))
                         }, none => {},
                     }
                 }
@@ -186,18 +203,18 @@ pub struct Map<K, V, H, A> {
         self.place(Entry<K, V> { key: key, value: value })
         return ok(none)
     }
-    pub fn remove(&mut self, key: &K) -> Option<V> {
+    pub fn remove(&mut self, key: &K) -> Option<V> from(self.stored) {
         match self.find(key) {
             some(index) => {
                 unsafe {
-                    removed := ptr.read(ptr.offset(self.pointer, index as isize))
-                    ptr.write(ptr.offset(self.pointer, index as isize), none)
+                    removed := ptr.take(ptr.offset(self.pointer, index as isize), self)
+                    ptr.store(ptr.offset(self.pointer, index as isize), none, self)
                     self.length = self.length - 1
                     // Reinsert the following cluster so lookup never skips a hole.
-                    cursor := self.next(index)
+                    cursor := self.next_bucket(index)
                     for {
-                        current := ptr.read(ptr.offset(self.pointer, cursor as isize))
-                        ptr.write(ptr.offset(self.pointer, cursor as isize), none)
+                        current := ptr.take(ptr.offset(self.pointer, cursor as isize), self)
+                        ptr.store(ptr.offset(self.pointer, cursor as isize), none, self)
                         match current {
                             some(entry) => {
                                 self.length = self.length - 1
@@ -207,7 +224,7 @@ pub struct Map<K, V, H, A> {
                                 break
                             },
                         }
-                        cursor = self.next(cursor)
+                        cursor = self.next_bucket(cursor)
                     }
                     match removed {
                         some(entry) => {
@@ -229,8 +246,8 @@ pub struct Map<K, V, H, A> {
         unsafe {
             for i in 0usize..self.buckets {
                 source := ptr.offset(self.pointer, i as isize)
-                ptr.drop_in_place(source)
-                ptr.write(source, none)
+                core.drop(ptr.take(source, self))
+                ptr.store(source, none, self)
             }
         }
         self.length = 0
@@ -251,10 +268,9 @@ pub struct Map<K, V, H, A> {
 }
 // SAFETY: A obeys vector.new's allocation/lifetime contract. No allocation yet.
 pub unsafe fn new<K, V, H, A>(allocator: A, policy: H) -> Map<K, V, H, A> from(allocator, policy) {
-    gate: Option<Entry<K, V>> = none
-    core.drop(mem.init(gate))
+    mem.storage_type::<Option<Entry<K, V>>>()
     unsafe {
-        return Map<K, V, H, A> { allocator: allocator, policy: policy,
+        return Map<K, V, H, A> { elements: [], allocator: allocator, policy: policy,
         pointer: mem.align_of::<Option<Entry<K, V>>>() as *mut Option<Entry<K, V>>, length: 0, buckets: 0 }
     }
 }

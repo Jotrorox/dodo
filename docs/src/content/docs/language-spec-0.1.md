@@ -1119,7 +1119,13 @@ No dynamic bounds or overflow checks are required by this unsafe operation.
 rejected, including inside unsafe. The explicit unsafe operations
 `ptr.borrow(p, owner)`, `ptr.borrow_mut(p, owner)`,
 `ptr.borrow_slice(p, count, owner)`, and `ptr.borrow_slice_mut(p, count, owner)`
-are the supported bridge. The owner must be a checked reference or slice;
+are the bridge for plain opaque elements. The separately checked typed-storage
+operations `ptr.store`, `ptr.take`, `ptr.relocate`, `ptr.view`, and
+`ptr.view_slice`, with `stores(...)`, `from(owner.stored)` and
+`requires_plain(...)` contracts, are specified in the
+[container element guide](container-elements.md). They require a matching typed
+owner witness and reject Result-bearing and exclusive-reference elements.
+For `ptr.borrow*`, the owner must be a checked reference or slice;
 mutable views require a mutable pointer and exclusive owner. The result retains
 the owner's complete checked dependencies, including inherited shared dependencies.
 It must not outlive or conflict with the owner. Pointer, count (if present),

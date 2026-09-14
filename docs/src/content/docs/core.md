@@ -153,8 +153,10 @@ nested paths and runtime reflection are not supported.
 Exchange currently rejects types containing checked borrows or Results because
 their source dependencies and handling obligations cannot yet be transferred
 through this interface. `mem.init` likewise cannot hide either in opaque
-storage. Reading a checked-borrow-bearing `T` back from raw or opaque storage
-is unsupported. These restrictions also apply transitively through aggregates.
+storage. These restrictions also apply transitively through aggregates. The
+separate [typed collection storage](container-elements.md) primitives support
+shared-reference elements with checked mutation and removal contracts; they
+retain the restrictions on Results and exclusive-reference elements.
 
 See [memory and foreign calls](memory-and-ffi.md) for pointer signatures and
 unsafe contracts. The compiler may lower memory operations to target toolchain

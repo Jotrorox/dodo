@@ -1,0 +1,76 @@
+package string_map
+
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/text_shared"
+import "std/hash"
+import "std/collections/shared_hash_map"
+import "std/collections/shared_vector"
+
+fn example() -> i32!error.AllocError {
+    memory := [0u8; 8192]
+    allocator := shared_arena.SharedArena.new(&mut memory)?
+    // These owned strings and both containers share one safe allocator.
+    first := text_shared.from_str(allocator.handle(), "apple", 64)?
+    second := text_shared.from_str(allocator.handle(), "pear", 64)?
+    counts := shared_hash_map.new::<&str, i32, hash.Str>(allocator.handle(), hash.Str {})
+    lengths := shared_vector.new::<usize>(allocator.handle())
+    core.drop(counts.insert(first.as_str(), 2)?)
+    core.drop(counts.insert(second.as_str(), 1)?)
+    // Equal UTF-8 contents replace the value and return its previous owner.
+    match counts.insert("apple", 3)? {
+        some(previous) => {
+            assert_eq(previous, 2)
+        },
+        none => {
+            return ok(1)
+        },
+    }
+    query := "apple"
+    match counts.get(&query) {
+        some(count) => {
+            assert_eq(*count, 3)
+        }, none => {
+            return ok(2)
+        },
+    }
+    cursor := 0usize
+    total := 0i32
+    for {
+        match counts.next(&mut cursor) {
+            some(entry) => {
+                total = total + entry.value
+                lengths.push(entry.key.len)?
+            },
+            none => {
+                break
+            },
+        }
+    }
+    assert_eq(lengths.len(), 2usize)
+    assert_eq(total, 4)
+    match counts.remove(&query) {
+        some(previous) => {
+            assert_eq(previous, 3)
+        }, none => {
+            return ok(3)
+        },
+    }
+    core.drop(counts)
+    // The map's retained text dependencies have ended.
+    first.append_str(" pie")?
+    return ok(0)
+}
+fn main() -> i32 {
+    match example() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 4
+        }
+    }
+}
+@test
+fn string_map_succeeds() {
+    assert_eq(main(), 0)
+}

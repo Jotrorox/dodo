@@ -1,0 +1,314 @@
+package reference_collections
+import "alloc/error"
+import "alloc/shared_arena"
+import "core/ptr"
+import "std/hash"
+import "std/text"
+import "std/collections/vector"
+import "std/collections/shared_vector"
+import "std/collections/shared_deque"
+import "std/collections/shared_hash_map"
+import "std/collections/shared_hash_set"
+import "std/collections/shared_ordered_map"
+import "std/collections/shared_ordered_set"
+import "std/collections/shared_heap"
+
+enum Item {
+    Reference(Option<&i32>), Empty
+}
+
+struct Observed {
+    source: &i32
+    count: *mut i32
+    fn drop(&mut self) {
+        unsafe {
+            *self.count = *self.count + *self.source
+        }
+    }
+}
+pub struct RefOrder {
+    pub fn compare(&self, a: & &i32, b: & &i32) -> i32 {
+        if **a < **b {
+            return -1
+        }
+        if **a > **b {
+            return 1
+        }
+        return 0
+    }
+}
+fn forward(out: &mut vector.Vector<&i32, shared_arena.Handle>, value: &i32) -> void!error.AllocError stores(out, value) {
+    alias := out
+    return alias.push(value)
+}
+fn transfer(out: &mut vector.Vector<&i32, shared_arena.Handle>) -> Option<&i32> from(out.stored) {
+    return out.pop()
+}
+fn consume(values: vector.Vector<&i32, shared_arena.Handle>) -> Option<&i32> from(values) {
+    return values.pop()
+}
+enum OwnedValues {
+    Values(vector.Vector<&i32, shared_arena.Handle>), Empty
+}
+fn consume_wrapped(owner: OwnedValues) -> Option<&i32> from(owner) {
+    match owner {
+        OwnedValues.Values(values) => {
+            return consume(values)
+        }, OwnedValues.Empty => {
+            return none
+        }
+    }
+}
+fn references() -> void!error.AllocError {
+    bytes := [0u8; 65536]
+    arena := shared_arena.SharedArena.new(&mut bytes)?
+    a := 3i32
+    b := 7i32
+    values := shared_vector.new::<&i32>(arena.handle())
+    alias := &mut values
+    forward(alias, &a)?
+    alias.push(&b)?
+    core.assert(values.len() == 2)
+    values.insert(1, &a)?
+    values.swap(0, 2)
+    match values.replace(0, &a) {
+        some(v) => {
+            core.assert(*v == 7)
+        }, none => {
+            core.assert(false)
+        }
+    }
+    core.drop(values.remove(1))
+    core.drop(values.swap_remove(0))
+    removed := transfer(&mut values)
+    core.drop(values)
+    match removed {
+        some(v) => {
+            core.assert(*v == 3)
+        }, none => {
+            core.assert(false)
+        }
+    }
+
+    consumed := shared_vector.new::<&i32>(arena.handle())
+    consumed.push(&b)?
+    match consume_wrapped(OwnedValues.Values(consumed)) {
+        some(value) => {
+            core.assert(*value == 7)
+        }, none => {
+            core.assert(false)
+        }
+    }
+
+    ring := shared_deque.new::<&i32>(arena.handle())
+    for i in 0..10 {
+        ring.push_back(&a)?
+    }
+    for i in 0..7 {
+        core.drop(ring.pop_front())
+    }
+    for i in 0..30 {
+        ring.push_front(&b)?
+    }
+    cursor := 0usize
+    total := 0i32
+    for {
+        match ring.next(&mut cursor) {
+            some(v) => {
+                total = total + **v
+            }, none => {
+                break
+            }
+        }
+    }
+    core.assert(total == 219)
+    ring.clear()
+    heap := shared_heap.new::<&i32, RefOrder>(arena.handle(), RefOrder {})
+    heap.push(&a)?
+    heap.push(&b)?
+    heap.push(&a)?
+    match heap.pop() {
+        some(v) => {
+            core.assert(*v == 7)
+        }, none => {
+            core.assert(false)
+        }
+    }
+    heap.clear()
+
+    nested := shared_vector.new::<Item>(arena.handle())
+    nested.push(Item.Reference(some(&a)))?
+    match nested.pop() {
+        some(item) => {
+            match item {
+                Item.Reference(p) => {
+                    match p {
+                        some(v) => {
+                            core.assert(*v == 3)
+                        }, none => {
+                            core.assert(false)
+                        }
+                    }
+                }, Item.Empty => {
+                    core.assert(false)
+                }
+            }
+        },
+        none => {
+            core.assert(false)
+        },
+    }
+    array_refs := shared_vector.new::<[1] &i32>(arena.handle())
+    array_refs.push([&b])?
+    core.drop(array_refs.pop())
+    slice_source := [1i32, 2i32]
+    slices := shared_vector.new::<&[i32]>(arena.handle())
+    slices.push(&slice_source)?
+    core.drop(slices.pop())
+    count := 0i32
+    observed := shared_vector.new::<Observed>(arena.handle())
+    observed.push(Observed { source: &a, count: ptr.from_mut(&mut count) })?
+    observed.push(Observed { source: &b, count: ptr.from_mut(&mut count) })?
+    core.drop(observed.replace(0, Observed { source: &b, count: ptr.from_mut(&mut count) }))
+    observed.reserve(30)?
+    observed.clear()
+    core.assert(count == 17)
+    core.drop(observed)
+    core.assert(count == 17)
+    tiny_bytes := [0u8; 16]
+    tiny := shared_arena.SharedArena.new(&mut tiny_bytes)?
+    failed := shared_vector.new::<Observed>(tiny.handle())
+    match failed.push(Observed { source: &a, count: ptr.from_mut(&mut count) }) {
+        ok() => {
+            core.assert(false)
+        }, err(_) => {},
+    }
+    core.assert(count == 20)
+    core.drop(failed)
+    core.assert(count == 20)
+    return ok()
+}
+fn maps() -> void!error.AllocError {
+    bytes := [0u8; 65536]
+    arena := shared_arena.SharedArena.new(&mut bytes)?
+    source := [b'a', b'b', b'c']
+    key := text.Text.new(&source)
+    validated := match key {
+        ok(v) => {
+            v
+        }, err(_) => {
+            return ok()
+        }
+    }
+    borrowed := validated.as_str()
+    // A direct checked UTF-8 view is kept alive independently of map storage.
+    alpha := "alpha"
+    beta := "beta"
+    gamma := "gamma"
+    updated := "updated"
+    abc := "abc"
+    policy := hash.Str {}
+    text_key := text.Text.from_str("alpha")
+    keys := ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota"]
+    text_map := shared_hash_map.new::<text.Text, i32, hash.Text>(arena.handle(), hash.Text {})
+    core.drop(text_map.insert(text.Text.from_str("text"), 1)?)
+    text_query := text.Text.from_str("text")
+    core.assert(text_map.contains(&text_query))
+    sip := hash.SipStr.new(1, 2)
+    same := "alpha"
+    core.assert(sip.equal(&alpha, &same))
+    core.assert(sip.hash(&alpha) == sip.hash(&same))
+    map := shared_hash_map.new::<&str, &str, hash.Str>(arena.handle(), hash.Str {})
+    ordered := shared_ordered_map.new::<&str, i32, hash.Str>(arena.handle(), hash.Str {})
+    set := shared_hash_set.new::<&str, hash.Str>(arena.handle(), hash.Str {})
+    sorted := shared_ordered_set.new::<&str, hash.Str>(arena.handle(), hash.Str {})
+    for &key in &keys {
+        core.drop(map.insert(key, borrowed)?)
+        core.drop(ordered.insert(key, 1)?)
+        core.assert(set.insert(key)?)
+        core.assert(sorted.insert(key)?)
+    }
+    core.drop(map.insert(text_key.as_str(), "updated")?)
+    match map.get(&alpha) {
+        some(value) => {
+            core.assert(policy.equal(value, &updated))
+        }, none => {
+            core.assert(false)
+        }
+    }
+    core.drop(ordered.insert("alpha", 2)?)
+    core.drop(map.remove(&beta))
+    core.assert(set.remove(&beta))
+    cursor := 0usize
+    count := 0usize
+    for {
+        match map.next(&mut cursor) {
+            some(entry) => {
+                core.assert(!policy.equal(&entry.key, &beta))
+                count = count + 1
+            }, none => {
+                break
+            }
+        }
+    }
+    core.assert(count == 8)
+    cursor = 0
+    count = 0
+    for {
+        match set.next(&mut cursor) {
+            some(_) => {
+                count = count + 1
+            }, none => {
+                break
+            }
+        }
+    }
+    core.assert(count == 8)
+    cursor = 0
+    count = 0
+    for {
+        match ordered.next(&mut cursor) {
+            some(_) => {
+                count = count + 1
+            }, none => {
+                break
+            }
+        }
+    }
+    core.assert(count == 9)
+    cursor = 0
+    count = 0
+    for {
+        match sorted.next(&mut cursor) {
+            some(_) => {
+                count = count + 1
+            }, none => {
+                break
+            }
+        }
+    }
+    core.assert(count == 9)
+    old := map.remove(&gamma)
+    core.drop(map)
+    match old {
+        some(value) => {
+            core.assert(policy.equal(&value, &abc))
+        }, none => {
+            core.assert(false)
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match references() {
+        ok() => {}, err(_) => {
+            return 1
+        }
+    }
+    match maps() {
+        ok() => {}, err(_) => {
+            return 2
+        }
+    }
+    return 0
+}

@@ -14,6 +14,15 @@ pub struct Map<K, V, C, A> {
     entries: vector.Vector<Entry<K, V>, A>
     ordering: C
 
+    // Cursor starts at zero. Each call yields one logical element.
+    pub fn next(&self, cursor: &mut usize) -> Option<&Entry<K, V>> from(self) {
+        if *cursor >= self.len() {
+            return none
+        }
+        index := *cursor
+        *cursor = index + 1
+        return self.entries.get(index)
+    }
     pub fn len(&self) -> usize {
         return self.entries.len()
     }
@@ -63,7 +72,7 @@ pub struct Map<K, V, C, A> {
             },
         }
     }
-    pub fn insert(&mut self, key: K, value: V) -> Option<V>!error.AllocError {
+    pub fn insert(&mut self, key: K, value: V) -> Option<V>!error.AllocError from(self.stored) stores(self, key, value) {
         index := self.lower(&key)
         found := false
         match self.entries.get(index) {
@@ -72,16 +81,19 @@ pub struct Map<K, V, C, A> {
             }, none => {},
         }
         if found {
-            match self.entries.get_mut(index) {
+            match self.entries.remove(index) {
                 some(entry) => {
-                    return ok(some(mem.replace(&mut entry.value, value)))
+                    let Entry<K, V> { key: original, value: previous } = entry
+                    // Removal leaves enough capacity; reinsertion cannot allocate.
+                    self.entries.insert(index, Entry<K, V> { key: original, value: value })?
+                    return ok(some(previous))
                 }, none => {},
             }
         }
         self.entries.insert(index, Entry<K, V> { key: key, value: value })?
         return ok(none)
     }
-    pub fn remove(&mut self, key: &K) -> Option<V> {
+    pub fn remove(&mut self, key: &K) -> Option<V> from(self.stored) {
         index := self.lower(key)
         found := false
         match self.entries.get(index) {

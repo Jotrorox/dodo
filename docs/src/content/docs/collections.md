@@ -76,6 +76,15 @@ handles from the same arena simultaneously; the checked ownership model keeps
 the allocator and its backing storage alive without exclusively lending the
 entire allocator to one container.
 
+Use this shared arena path when constructing several strings and containers.
+Create one `shared_arena.SharedArena` over caller-owned bytes, then pass a fresh
+`arena.handle()` to each owner. `std/text_shared.new(handle, byte_limit)?`
+constructs empty owned text; `from_str(handle, utf8, byte_limit)?` and
+`from_text(handle, &text, byte_limit)?` copy UTF-8 directly. Each owner retains
+its allocator dependency, and allocation failures remain explicit. See the
+[complete string-keyed map example](https://github.com/Jotrorox/dodo/blob/main/examples/string_map.dodo)
+and [supported element combinations](container-elements.md).
+
 ## Algorithms and customization
 
 `find`, `equal`, and lexicographic `compare` take a policy value by checked shared
@@ -204,8 +213,9 @@ field-wise encodings. For untrusted keys, supply caller-keyed `SipI32` or
 `SipU64`; the caller must obtain unpredictable keys from a separate entropy
 source. Fixed seeds in examples and tests are deterministic examples, not an
 entropy source. `hash.Str`, `hash.Text`, and `text_shared.Key` compare/hash UTF-8
-contents; `hash.SipStr` supplies caller-keyed borrowed text hashing. Custom key hashing must encode fields explicitly; padding and
-native struct layout are never hash inputs.
+contents; `hash.SipStr` supplies caller-keyed borrowed text hashing. Custom key
+hashing must encode fields explicitly; padding and native struct layout are
+never hash inputs.
 
 Binary heaps return the greatest element under their comparison policy.
 Push/pop take O(log n) excluding allocation growth; peek is O(1). Equal elements
@@ -216,10 +226,10 @@ have unspecified removal order. The borrowed view exposes heap order.
 Start iteration with `cursor := 0usize`, then call `container.next(&mut cursor)`
 until it returns `none`. It returns checked views and skips empty hash buckets
 and internal empty slots. Traversal uses sequence, sorted-key, heap, or hash
-order as appropriate. Reset the cursor after mutation.
-The cursor allocates nothing; reset it to zero for a fresh traversal. Explicit
-indexing is also available: vectors with plain elements expose `as_slice()` / `as_mut_slice()` and optional
-`get()` / `get_mut()`. Fixed vectors and both rings use logical `get(index)`;
+order as appropriate. The cursor allocates nothing; reset it to zero after
+mutation or for a fresh traversal. Explicit indexing is also available: vectors
+expose `as_slice()` and optional `get()`, with `as_mut_slice()` and `get_mut()`
+available for plain elements. Fixed vectors and both rings use logical `get(index)`;
 rings index from the front. Bounded maps use `entry(0..len())`. Ordered maps
 expose `entries()` and ordered sets `get(0..len())`. Hash maps and sets use
 `entry(0..bucket_count())`, skipping `none` buckets.

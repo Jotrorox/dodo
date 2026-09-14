@@ -149,9 +149,12 @@ errors preserve existing contents. `push` returns `text_alloc.Error`, which
 separates scalar errors from allocator errors; allocation-only methods return
 `alloc/error.AllocError` directly.
 
-Construct a buffer with the independently imported `std/arena_bytes` or
-`std/pool_bytes` adapters, supplying initial capacity and a maximum. The string
-owns the buffer and keeps its allocator exclusively borrowed. Growth can move
+For routine construction with an exclusive arena, use
+`text_alloc.empty(&mut arena, limit)?`, `text_alloc.from_str(&mut arena, utf8,
+limit)?`, or `text_alloc.from_text(&mut arena, &text, limit)?` directly. The
+buffer-taking constructor also accepts buffers from `std/arena_bytes` and
+`std/pool_bytes`. The string owns its buffer and keeps its allocator exclusively
+borrowed. Growth can move
 storage and temporarily needs both allocations alive; arena deallocation does
 not reclaim individual old blocks. Shared text views prevent growth at compile
 time until their last use. Raw pointers become invalid when storage moves.

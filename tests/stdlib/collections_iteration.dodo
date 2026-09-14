@@ -1,0 +1,87 @@
+package collections_iteration
+import "std/collections"
+import "std/collections/fixed_vector"
+import "std/collections/fixed_deque"
+import "std/collections/fixed_map"
+import "std/collections/fixed_set"
+
+fn verify() -> void!collections.CapacityError {
+    slots: [3]Option<i32> = [none, none, none]
+    values := fixed_vector.Vector.new(&mut slots)
+    values.push(2)?
+    values.push(4)?
+    cursor := 0usize
+    total := 0i32
+    for {
+        match values.next(&mut cursor) {
+            some(v) => {
+                total = total + *v
+            }, none => {
+                break
+            }
+        }
+    }
+    core.assert(total == 6)
+    core.assert(cursor == 2)
+    ring_slots: [3]Option<i32> = [none, none, none]
+    ring := fixed_deque.Deque.new(&mut ring_slots)
+    ring.push_back(10)?
+    ring.push_back(20)?
+    core.drop(ring.pop_front())
+    ring.push_back(30)?
+    ring.push_back(40)?
+    cursor = 0
+    total = 0
+    for {
+        match ring.next(&mut cursor) {
+            some(v) => {
+                total = total + *v
+            }, none => {
+                break
+            }
+        }
+    }
+    core.assert(total == 90)
+    map_slots: [2]Option<fixed_map.Entry<i32, i32>> = [none, none]
+    map := fixed_map.Map.new(&mut map_slots, collections.I32 {})
+    core.drop(map.insert(1, 7)?)
+    cursor = 0
+    match map.next(&mut cursor) {
+        some(entry) => {
+            core.assert(entry.value == 7)
+        }, none => {
+            core.assert(false)
+        }
+    }
+    match map.next(&mut cursor) {
+        some(_) => {
+            core.assert(false)
+        }, none => {}
+    }
+    set_slots: [2]Option<fixed_map.Entry<i32, fixed_set.Unit>> = [none, none]
+    set := fixed_set.Set.new(&mut set_slots, collections.I32 {})
+    core.drop(set.insert(9)?)
+    cursor = 0
+    match set.next(&mut cursor) {
+        some(v) => {
+            core.assert(*v == 9)
+        }, none => {
+            core.assert(false)
+        }
+    }
+    match set.next(&mut cursor) {
+        some(_) => {
+            core.assert(false)
+        }, none => {}
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match verify() {
+        ok() => {
+            return 0
+        }, err(_) => {
+            return 1
+        }
+    }
+}

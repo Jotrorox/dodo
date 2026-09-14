@@ -63,6 +63,9 @@ pub fn prepare(program: &mut Program, bits: u32) -> Check<()> {
             locals.insert(parameter.name.clone(), None);
         }
         resolver.ty(&mut function.ret, &locals, ns, function.span)?;
+        for required in &mut function.requires_plain {
+            resolver.ty(required, &locals, ns, function.span)?;
+        }
         if let Some(body) = &mut function.body {
             resolver.block(body, &mut locals, ns)?;
         }
