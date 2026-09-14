@@ -9,6 +9,53 @@ Dodo includes a Language Server Protocol (LSP) server. After
 [installing the compiler](installation.md), connect it to your editor's LSP
 client to get diagnostics, ownership information, and editing tools for `.dodo` files.
 
+## Visual Studio Code
+
+The [Dodo VS Code extension](https://github.com/Jotrorox/dodo/tree/main/editor-support/dodo-vscode)
+connects to `dodo lsp` automatically and adds syntax highlighting, bracket and
+comment support, and snippets for programs, functions, types, loops, matches,
+and tests. It requires VS Code 1.91 or newer and an installed Dodo compiler.
+
+Build and install it from a checkout with Node.js 22 or newer:
+
+```sh
+cd editor-support/dodo-vscode
+npm ci
+npm run package
+code --install-extension dodo-vscode-0.1.0.vsix
+```
+
+Alternatively, select the generated VSIX with **Extensions: Install from VSIX...**.
+Open a `.dodo` file to activate the extension. It runs `dodo` from the extension
+host's PATH; set `dodo.server.path` to an executable path if needed. A source
+build can use `${workspaceFolder}/target/debug/dodo` (with `.exe` on Windows).
+Relative executable paths resolve against the first workspace folder.
+
+Set these options in VS Code's settings as needed:
+
+```json
+{
+  "dodo.server.path": "dodo",
+  "dodo.checkMode": "file",
+  "dodo.target": "",
+  "[dodo]": {
+    "editor.defaultFormatter": "Jotrorox.dodo-vscode",
+    "editor.formatOnSave": true
+  }
+}
+```
+
+The checking mode and target correspond to the initialization options described
+below. Changes restart the server automatically. Settings apply to the whole
+window, including multi-root workspaces. In SSH, WSL, and dev containers, Dodo
+must be installed on the remote extension host.
+
+Use **Dodo: Restart Language Server** after rebuilding the compiler and
+**Dodo: Show Language Server Output** to inspect startup errors. Set that output
+channel's log level to **Trace** with **Developer: Set Log Level** for protocol
+logs; `dodo.trace.server` selects message or verbose detail. Highlighting and snippets work without the
+compiler; the language server runs only in trusted workspaces.
+
 ## Start the language server
 
 Configure your editor's LSP client with these settings:
