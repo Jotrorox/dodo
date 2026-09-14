@@ -90,10 +90,12 @@ callbacks cannot retain request storage by assigning it into their receiver.
 
 The broad design's disjoint mutable slice splitting, trait-based checked allocator
 interfaces, DMA/interrupt-safe abstractions, general target barriers, inline
-assembly, section/alignment/export/interrupt attributes, and custom panic-handler
-integration are not implemented. Unsupported syntax and unknown intrinsics
-produce diagnostics. The trap implementation is `llvm.trap`; it is not a
-platform reset driver.
+assembly, and section/alignment/export/interrupt attributes are not implemented.
+Unsupported syntax and unknown intrinsics produce diagnostics. Hosted runtime
+failures report their check and source location before aborting. Freestanding
+builds default to `llvm.trap` and can select a C ABI hook with `--panic-hook`;
+board code supplies any reset action. `-g` emits source and variable/type debug
+information. See [debugging and failure configuration](command-line.md).
 
 This compiler provides a usable hosted core and target object emission. It is an
 initial implementation, with a conservative borrow checker and explicit platform

@@ -20,6 +20,7 @@ jobs:
     env:
       LLVM_SYS_221_PREFIX: /usr/lib/llvm-22
       CARGO_TERM_COLOR: always
+      DODO_REQUIRE_DEBUGGER_TESTS: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -38,7 +39,7 @@ jobs:
           sudo install -m 644 /tmp/llvm-signing-key.asc /usr/share/keyrings/llvm.asc
           echo 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' | sudo tee /etc/apt/sources.list.d/llvm22.list
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y llvm-22-dev libpolly-22-dev clang-22 build-essential zlib1g-dev libzstd-dev libffi-dev libz3-dev cmake ninja-build
+          sudo apt-get install --no-install-recommends -y llvm-22-dev libpolly-22-dev clang-22 build-essential zlib1g-dev libzstd-dev libffi-dev libz3-dev cmake ninja-build gdb
           /usr/lib/llvm-22/bin/llvm-config --version
       - name: Build the maintained OpenSSL backend for TLS fixtures
         shell: bash
@@ -65,7 +66,7 @@ jobs:
         run: python3 scripts/test_build_release.py
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Test parser, semantics, CLI, native output, and optimized traps
+      - name: Test compiler, native output, runtime checks, and debugger sessions
         shell: bash
         run: |
           ulimit -c 0

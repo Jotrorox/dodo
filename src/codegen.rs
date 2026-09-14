@@ -19,6 +19,21 @@ use inkwell::{
 };
 use std::collections::HashMap;
 
+mod debug;
+mod panic;
+use debug::{DebugInfo, SourceMap};
+
+#[derive(Clone, Debug, Default)]
+pub enum PanicStrategy {
+    /// Report to stderr on hosted targets; trap on freestanding targets.
+    #[default]
+    Auto,
+    Hosted,
+    Trap,
+    /// C ABI: void hook(const char *check, const char *file, uint32_t line, uint32_t column).
+    Hook(String),
+}
+
 #[derive(Debug)]
 pub struct CodegenError(pub String);
 impl std::fmt::Display for CodegenError {
@@ -49,6 +64,12 @@ pub struct Options {
     pub features: String,
     pub optimization: u8,
     pub entry: bool,
+    /// Emit DWARF independently of the optimization level.
+    pub debug: bool,
+    /// Original files and package offsets, required for debug information and
+    /// used for runtime failure locations even when debug information is off.
+    pub sources: Vec<crate::package::Source>,
+    pub panic: PanicStrategy,
     /// A hosted test executable dispatches one function per process invocation.
     pub test_functions: Vec<String>,
     /// Source maps are used only by the test failure reporter.
@@ -97,9 +118,18 @@ pub fn generate<'ctx>(
 ) -> Result<Generated<'ctx>> {
     let machine = target_machine(options)?;
     let module = context.create_module(&program.package);
+    if let Some(source) = options.sources.first() {
+        module.set_source_file_name(&source.path.to_string_lossy());
+    }
     module.set_triple(&machine.get_triple());
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     let bits = machine.get_target_data().get_pointer_byte_size(None) * 8;
+    let sources = SourceMap::new(&options.sources);
+    let debug = if options.debug {
+        Some(DebugInfo::new(context, &module, options, &sources)?)
+    } else {
+        None
+    };
     let mut cg = Codegen {
         context,
         module,
@@ -114,7 +144,12 @@ pub fn generate<'ctx>(
         function: None,
         return_type: Type::Void,
         bits,
+        sources,
+        debug,
         span: Span::default(),
+        parameter: 0,
+        data: machine.get_target_data(),
+        panic: options.panic.clone(),
         test_sources: &options.test_sources,
         testing: !options.test_functions.is_empty(),
     };
@@ -128,6 +163,9 @@ pub fn generate<'ctx>(
     }
     if options.entry {
         cg.entry(&options.test_functions)?;
+    }
+    if let Some(debug) = &cg.debug {
+        debug.builder.finalize();
     }
     cg.module
         .verify()
@@ -177,7 +215,12 @@ struct Codegen<'a, 'ctx> {
     function: Option<FunctionValue<'ctx>>,
     return_type: Type,
     bits: u32,
+    sources: SourceMap<'a>,
+    debug: Option<DebugInfo<'ctx>>,
     span: Span,
+    parameter: u32,
+    data: inkwell::targets::TargetData,
+    panic: PanicStrategy,
     test_sources: &'a [crate::package::Source],
     testing: bool,
 }
@@ -531,11 +574,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.return_type = f.ret.clone();
         self.scopes = vec![vec![]];
         self.loops.clear();
+        self.debug_function(f, function)?;
+        self.location(f.span);
         self.builder
             .position_at_end(self.context.append_basic_block(function, "entry"));
-        for (p, v) in f.params.iter().zip(function.get_param_iter()) {
+        for (index, (p, v)) in f.params.iter().zip(function.get_param_iter()).enumerate() {
+            self.parameter = index as u32 + 1;
+            self.location(p.span);
             self.bind(&p.name, &p.ty, Some(v))?;
         }
+        self.parameter = 0;
+        self.location(f.span);
         self.block(f.body.as_ref().unwrap())?;
         if !self.terminated() {
             self.cleanup_to(0)?;
@@ -549,6 +598,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(())
     }
     fn entry(&mut self, tests: &[String]) -> Result<()> {
+        self.builder.unset_current_debug_location();
         if tests.is_empty() {
             let f = self
                 .program
@@ -730,6 +780,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             live,
         };
         self.scopes.last_mut().unwrap().push(binding.clone());
+        self.debug_variable(name, ty, ptr)?;
         Ok(binding)
     }
     fn binding(&self, name: &str) -> Option<Binding<'ctx>> {
@@ -915,7 +966,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(())
     }
     fn block(&mut self, block: &Block) -> Result<()> {
-        self.scopes.push(vec![]);
+        self.push_scope();
         for s in block {
             if self.terminated() {
                 break;
@@ -925,13 +976,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if !self.terminated() {
             self.cleanup_to(self.scopes.len() - 1)?;
         }
-        self.scopes.pop();
+        self.pop_scope();
         Ok(())
     }
     fn stmt(&mut self, s: &Stmt) -> Result<()> {
-        let previous = std::mem::replace(&mut self.span, s.span);
+        let previous = self.span;
+        self.location(s.span);
         let result = self.stmt_inner(s);
-        self.span = previous;
+        self.location(previous);
         result
     }
     fn stmt_inner(&mut self, s: &Stmt) -> Result<()> {
@@ -1079,7 +1131,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 step,
                 body,
             } => {
-                self.scopes.push(vec![]);
+                self.push_scope();
                 if let Some(s) = init {
                     self.stmt(s)?;
                 }
@@ -1115,7 +1167,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.loops.pop();
                 self.builder.position_at_end(end);
                 self.cleanup_to(self.scopes.len() - 1)?;
-                self.scopes.pop();
+                self.pop_scope();
             }
             StmtKind::ForEach {
                 index,
@@ -1211,9 +1263,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(())
     }
     fn expr(&mut self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
-        let previous = std::mem::replace(&mut self.span, e.span);
+        let previous = self.span;
+        self.location(e.span);
         let result = self.expr_inner(e);
-        self.span = previous;
+        self.location(previous);
         result
     }
     fn expr_inner(&mut self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
@@ -1288,6 +1341,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 )?;
                 self.guard(
                     self.builder.build_and(ordered, inside, "slice.valid")?,
+                    "slice bounds",
                     "slice bounds out of range",
                 )?;
                 let data = unsafe {
@@ -1495,9 +1549,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(value)
     }
     fn place(&mut self, e: &Expr) -> Result<PointerValue<'ctx>> {
-        let previous = std::mem::replace(&mut self.span, e.span);
+        let previous = self.span;
+        self.location(e.span);
         let result = self.place_inner(e);
-        self.span = previous;
+        self.location(previous);
         result
     }
     fn place_inner(&mut self, e: &Expr) -> Result<PointerValue<'ctx>> {
@@ -1538,7 +1593,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let in_bounds =
                     self.builder
                         .build_int_compare(IntPredicate::ULT, wide, len, "in.bounds")?;
-                self.guard(in_bounds, "index out of bounds")?;
+                self.guard(in_bounds, "index bounds", "index out of bounds")?;
                 // The bounds check dominates this GEP; no inbounds assumption is needed.
                 Ok(unsafe {
                     self.builder
@@ -1621,13 +1676,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             )?
         })
     }
-    fn guard(&mut self, valid: IntValue<'ctx>, reason: &str) -> Result<()> {
+    fn guard(&mut self, valid: IntValue<'ctx>, check: &str, reason: &str) -> Result<()> {
         let ok = self.bb("checked");
         let fail = self.bb("trap");
         self.builder.build_conditional_branch(valid, ok, fail)?;
         self.builder.position_at_end(fail);
-        self.report_failure(&format!("runtime check failed: {reason}"))?;
-        self.trap()?;
+        if self.testing {
+            self.report_failure(&format!("runtime check failed: {reason}"))?;
+            self.trap()?;
+        } else {
+            self.panic(check)?;
+        }
         self.builder.position_at_end(ok);
         Ok(())
     }
@@ -1937,7 +1996,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .build_extract_value(out, 1, "overflow")?
                     .into_int_value();
                 let valid = self.builder.build_not(overflow, "no.overflow")?;
-                self.guard(valid, "integer overflow")?;
+                self.guard(valid, "arithmetic overflow", "integer overflow")?;
                 self.builder.build_extract_value(out, 0, "result")?
             }
             Div | Rem => {
@@ -1947,7 +2006,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     ity.const_zero(),
                     "nonzero",
                 )?;
-                self.guard(nz, "division or remainder by zero")?;
+                self.guard(nz, "division by zero", "division or remainder by zero")?;
                 if signed {
                     let min = ity.const_int(1u64 << (ity.get_bit_width() - 1), false);
                     let a_min =
@@ -1961,7 +2020,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     )?;
                     let bad = self.builder.build_and(a_min, b_neg, "division.overflow")?;
                     let valid = self.builder.build_not(bad, "division.valid")?;
-                    self.guard(valid, "signed division overflow")?;
+                    self.guard(valid, "division overflow", "signed division overflow")?;
                 }
                 match (op, signed) {
                     (Div, true) => self.builder.build_int_signed_div(a, b, "div")?.into(),
@@ -2020,14 +2079,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     ity.const_int(ity.get_bit_width() as u64, false),
                     "shift.valid",
                 )?;
-                self.guard(valid, "shift count out of range")?;
+                self.guard(valid, "shift amount", "shift count out of range")?;
                 if op == Shl {
                     let v = self.builder.build_left_shift(a, b, "shl")?;
                     let back = self.builder.build_right_shift(v, b, signed, "shift.back")?;
                     let fits =
                         self.builder
                             .build_int_compare(IntPredicate::EQ, back, a, "shift.fits")?;
-                    self.guard(fits, "left shift overflow")?;
+                    self.guard(fits, "shift overflow", "left shift overflow")?;
                     v.into()
                 } else {
                     self.builder.build_right_shift(a, b, signed, "shr")?.into()
@@ -2056,6 +2115,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     )?;
                     self.guard(
                         nonnegative,
+                        "numeric conversion",
                         "negative value converted to an unsigned integer",
                     )?;
                 }
@@ -2070,7 +2130,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     let fits =
                         self.builder
                             .build_int_compare(IntPredicate::EQ, back, v, "cast.fits")?;
-                    self.guard(fits, "integer conversion out of range")?;
+                    self.guard(
+                        fits,
+                        "numeric conversion",
+                        "integer conversion out of range",
+                    )?;
                 }
                 if !*fs && *ts && out.get_bit_width() <= source.get_bit_width() {
                     let max = (1u64 << (out.get_bit_width() - 1)) - 1;
@@ -2080,7 +2144,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         source.const_int(max, false),
                         "cast.fits",
                     )?;
-                    self.guard(fits, "integer conversion out of range")?;
+                    self.guard(
+                        fits,
+                        "numeric conversion",
+                        "integer conversion out of range",
+                    )?;
                 }
                 Ok(converted.into())
             }
@@ -2119,7 +2187,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     "cast.upper",
                 )?;
                 let valid = self.builder.build_and(lo, hi, "cast.valid")?;
-                self.guard(valid, "float-to-integer conversion out of range")?;
+                self.guard(
+                    valid,
+                    "numeric conversion",
+                    "float-to-integer conversion out of range",
+                )?;
                 Ok(if *signed {
                     self.builder.build_float_to_signed_int(v, t, "cast")?.into()
                 } else {
@@ -2148,7 +2220,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         "cast.lower",
                     )?;
                     let valid = self.builder.build_and(hi, lo, "cast.fits")?;
-                    self.guard(valid, "floating-point conversion out of range")?;
+                    self.guard(
+                        valid,
+                        "numeric conversion",
+                        "floating-point conversion out of range",
+                    )?;
                 }
                 Ok(out.into())
             }
@@ -2716,7 +2792,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             next: step,
             depth: self.scopes.len(),
         });
-        self.scopes.push(vec![]);
+        self.push_scope();
         if let Some(name) = index {
             self.bind(name, &Type::usize(), Some(i.into()))?;
         }
@@ -2738,7 +2814,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.cleanup_to(self.scopes.len() - 1)?;
             self.builder.build_unconditional_branch(step)?;
         }
-        self.scopes.pop();
+        self.pop_scope();
         self.loops.pop();
         self.builder.position_at_end(step);
         let next = self
@@ -3086,7 +3162,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .sort_by_key(|binding| names.iter().position(|name| *name == binding.name));
     }
     fn match_stmt(&mut self, value: &Expr, arms: &[MatchArm]) -> Result<()> {
-        self.scopes.push(vec![]);
+        self.push_scope();
         let (ptr, actual, borrowed, owner) = self.pattern_value(value)?;
         let end = self.bb("match.end");
         let mut reaches_end = false;
@@ -3098,18 +3174,18 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.pattern_test(&pattern, ptr, &actual, yes, no)?;
                 self.builder.position_at_end(yes);
                 if let Some(guard) = &arm.guard {
-                    self.scopes.push(vec![]);
+                    self.push_scope();
                     self.pattern_bind(&pattern, ptr, &actual, borrowed, true, None)?;
                     self.order_pattern_bindings(&binding_order);
                     let condition = self.expr(guard)?.into_int_value();
                     self.cleanup_to(self.scopes.len() - 1)?;
-                    self.scopes.pop();
+                    self.pop_scope();
                     let accepted = self.bb("match.guarded");
                     self.builder
                         .build_conditional_branch(condition, accepted, no)?;
                     self.builder.position_at_end(accepted);
                 }
-                self.scopes.push(vec![]);
+                self.push_scope();
                 self.pattern_commit(&owner)?;
                 self.pattern_bind(&pattern, ptr, &actual, borrowed, false, None)?;
                 self.order_pattern_bindings(&binding_order);
@@ -3119,7 +3195,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.builder.build_unconditional_branch(end)?;
                     reaches_end = true;
                 }
-                self.scopes.pop();
+                self.pop_scope();
                 self.builder.position_at_end(no);
             }
         }
@@ -3128,7 +3204,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if !reaches_end {
             self.builder.build_unreachable()?;
         }
-        self.scopes.pop();
+        self.pop_scope();
         Ok(())
     }
     fn if_let_stmt(
@@ -3138,7 +3214,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         then_block: &Block,
         else_block: &Block,
     ) -> Result<()> {
-        self.scopes.push(vec![]);
+        self.push_scope();
         let (ptr, actual, borrowed, owner) = self.pattern_value(value)?;
         let end = self.bb("if.let.end");
         let mut reaches_end = false;
@@ -3148,7 +3224,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             let no = self.bb("if.let.next");
             self.pattern_test(&pattern, ptr, &actual, yes, no)?;
             self.builder.position_at_end(yes);
-            self.scopes.push(vec![]);
+            self.push_scope();
             self.pattern_commit(&owner)?;
             self.pattern_bind(&pattern, ptr, &actual, borrowed, false, None)?;
             self.order_pattern_bindings(&binding_order);
@@ -3158,7 +3234,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.build_unconditional_branch(end)?;
                 reaches_end = true;
             }
-            self.scopes.pop();
+            self.pop_scope();
             self.builder.position_at_end(no);
         }
         if let Some(owner) = &owner {
@@ -3173,7 +3249,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if !reaches_end {
             self.builder.build_unreachable()?;
         }
-        self.scopes.pop();
+        self.pop_scope();
         Ok(())
     }
     fn pattern_binding_types(

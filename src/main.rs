@@ -39,6 +39,9 @@ Formatting options:
 Compiler options:
   -o, --output PATH       Output path (default: build/<project folder name>)
       --emit KIND         exe (default), obj, asm, llvm-ir, bitcode
+  -g, --debug             Emit source locations, variables, and types
+      --panic MODE       Runtime failure: auto (default), hosted, trap
+      --panic-hook NAME  Call a C ABI panic hook, then trap if it returns
   -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)
       --target TRIPLE     LLVM target triple (default: host)
       --cpu NAME          Target CPU (default: generic)
@@ -224,6 +227,30 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
                     }
                 };
             }
+            Some("-g" | "--debug") => result.options.debug = true,
+            Some("--panic") => {
+                result.options.panic = match string(value("--panic")?, "panic mode")?.as_str() {
+                    "auto" => codegen::PanicStrategy::Auto,
+                    "hosted" => codegen::PanicStrategy::Hosted,
+                    "trap" => codegen::PanicStrategy::Trap,
+                    mode => {
+                        return Err(format!(
+                            "invalid panic mode '{mode}'; expected auto, hosted, or trap"
+                        ));
+                    }
+                };
+            }
+            Some("--panic-hook") => {
+                let name = string(value("--panic-hook")?, "panic hook")?;
+                if name.is_empty()
+                    || !name.bytes().enumerate().all(|(i, b)| {
+                        b == b'_' || b.is_ascii_alphabetic() || (i != 0 && b.is_ascii_digit())
+                    })
+                {
+                    return Err("panic hook must be a C symbol name".into());
+                }
+                result.options.panic = codegen::PanicStrategy::Hook(name);
+            }
             Some("-O" | "--opt-level") => {
                 result.options.optimization =
                     optimization(&string(value("--opt-level")?, "optimization level")?)?;
@@ -321,6 +348,7 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
     let context = Context::create();
     let mut options = args.options.clone();
     options.entry = args.emit == Emit::Exe;
+    options.sources = loaded.sources.clone();
     let generated = codegen::generate(&context, &loaded.program, &options)
         .map_err(|e| format!("code generation failed: {e}"))?;
     match args.emit {
@@ -354,6 +382,9 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 .map_err(|e| e.to_string())?;
             let mut linker = Command::new(&args.linker);
             linker.arg(&object);
+            if options.debug {
+                linker.arg("-g");
+            }
             if !args.options.test_functions.is_empty() {
                 let runtime = temporary.0.join("test_runtime.c");
                 fs::write(&runtime, include_str!("test_runtime.c")).map_err(|e| e.to_string())?;

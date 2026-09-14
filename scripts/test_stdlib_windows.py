@@ -3,7 +3,8 @@
 
 Requires a built host dodo, clang, lld-link, Wine, and MinGW import libraries.
 Hosted fixtures also require MinGW headers. Portable fixtures retain their
-freestanding startup; hosted thread/child fixtures link the required C runtime.
+freestanding startup and trap on failed runtime checks; hosted thread/child
+fixtures link the required C runtime.
 LLVM's stack probe handles large Windows stack frames.
 """
 import argparse
@@ -211,6 +212,10 @@ def main():
                      f"/out:{scratch / 'os child.exe'}", str(child_obj), str(child_start_obj), str(stack_probe), str(alias_object),
                      str(kernel32), str(kernel32.parent / "libmsvcrt.a")])
             for source in fixtures:
+                boundaries = native_sources(source)
+                # Portable fixtures link without a CRT, even with a Windows
+                # target triple whose automatic panic strategy uses the CRT.
+                panic = "auto" if boundaries else "trap"
                 declaration = re.search(r"^package\s+([A-Za-z_][A-Za-z_0-9]*)\s*$", source.read_text(), re.MULTILINE)
                 if declaration is None:
                     raise RuntimeError(f"Missing package declaration: {source}")
@@ -223,13 +228,13 @@ def main():
                     obj = scratch / f"{source.stem}-O{optimization}.obj"
                     exe = obj.with_suffix(".exe")
                     run([str(compiler), "build", str(source), "--emit", "obj", "--target", "x86_64-pc-windows-msvc",
-                         "-O", str(optimization), "-o", str(obj)])
+                         "--panic", panic, "-O", str(optimization), "-o", str(obj)])
                     run([linker, "/nologo", "/nodefaultlib", "/entry:mainCRTStartup", "/subsystem:console", "/machine:x64",
                          "/stack:8388608", f"/out:{exe}", str(runtime_object), str(stack_probe), str(alias_object), str(obj), str(kernel32),
-                         *[str(native_objects[path, optimization]) for path in native_sources(source)],
-                         *([str(kernel32.parent / "libmsvcrt.a")] if native_sources(source) else []),
+                         *[str(native_objects[path, optimization]) for path in boundaries],
+                         *([str(kernel32.parent / "libmsvcrt.a")] if boundaries else []),
                          *([str(kernel32.parent / "libws2_32.a")]
-                           if any(path.parent.name == "net" for path in native_sources(source)) else [])])
+                           if any(path.parent.name == "net" for path in boundaries) else [])])
                     if exe.read_bytes()[:2] != b"MZ":
                         raise RuntimeError(f"Linker did not produce a Windows executable: {exe}")
                     work = scratch / f"work-{source.stem}-{optimization}"
