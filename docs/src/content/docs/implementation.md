@@ -93,8 +93,11 @@ interfaces, DMA/interrupt-safe abstractions, general target barriers, inline
 assembly, and section/alignment/export/interrupt attributes are not implemented.
 Unsupported syntax and unknown intrinsics produce diagnostics. Hosted runtime
 failures report their check and source location before aborting. Freestanding
-builds default to `llvm.trap` and can select a C ABI hook with `--panic-hook`;
-board code supplies any reset action. `-g` emits source and variable/type debug
+builds default to the target-dependent `llvm.trap`, which may lower to C `abort`.
+`--panic-hook` selects a non-returning C ABI board handler for checked operations
+and ordinary assertions, with no fallback trap or hosted reporting dependency.
+Board code supplies fault reporting, halt, or reset behavior; returning from the
+handler is undefined behavior. `-g` emits source and variable/type debug
 information. See [debugging and failure configuration](command-line.md).
 
 This compiler provides a usable hosted core and target object emission. It is an

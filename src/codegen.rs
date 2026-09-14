@@ -29,8 +29,11 @@ pub enum PanicStrategy {
     #[default]
     Auto,
     Hosted,
+    /// Target-dependent LLVM trap; may lower to a C abort call.
     Trap,
-    /// C ABI: void hook(const char *check, const char *file, uint32_t line, uint32_t column).
+    /// Non-returning C ABI:
+    /// _Noreturn void hook(const char *check, const char *file, uint32_t line, uint32_t column).
+    /// The hook owns termination; returning is undefined behavior.
     Hook(String),
 }
 
@@ -2292,7 +2295,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             if let Some(message) = values.get(count) {
                 self.report_value(2, *message, &Type::Str)?;
             }
-            self.trap()?;
+            if self.testing {
+                self.trap()?;
+            } else {
+                self.panic(name.trim_start_matches("core."))?;
+            }
             self.builder.position_at_end(ok);
             return Ok(unit);
         }

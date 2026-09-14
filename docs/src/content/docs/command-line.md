@@ -186,11 +186,14 @@ The default `--panic auto` reports a message such as
 calls C `abort` on Linux, Windows, Darwin, BSD, Solaris, and illumos targets.
 It uses `write` (`_write` on Windows) and requires the target C runtime when
 linking. Other targets, including bare-metal ARM and `wasm32-unknown-unknown`,
-default to `llvm.trap` without any C runtime dependency.
+default to `llvm.trap`. Its lowering is target-dependent: LLVM may emit a trap
+instruction or a call to C `abort` on targets without one. Trap mode therefore
+does not guarantee independence from a C runtime. See the
+[LLVM trap documentation](https://llvm.org/docs/LangRef.html#llvm-trap-intrinsic).
 
-Use `--panic hosted` to select reporting explicitly or `--panic trap` for a
-freestanding object even when using a hosted target triple. Embedded applications
-can supply a panic hook instead:
+Use `--panic hosted` to select reporting explicitly or `--panic trap` to select
+the target's LLVM trap behavior, including on a hosted target triple. Embedded
+applications can select an optional, non-returning board failure handler:
 
 ```sh
 dodo compile firmware.dodo -g --emit obj --target thumbv7em-none-eabi \
@@ -202,17 +205,23 @@ Provide this C ABI symbol when linking the object with your board support code:
 ```c
 #include <stdint.h>
 
-void board_panic(const char *check, const char *file,
-                 uint32_t line, uint32_t column);
+_Noreturn void board_panic(const char *check, const char *file,
+                          uint32_t line, uint32_t column);
 ```
 
 `check` names the failed check, and `file` is its source path. Both are immutable,
 NUL-terminated UTF-8 strings with static lifetime. Line and column are one-based;
-columns count Unicode characters. The hook may log, stop in a debugger, halt,
-or reset the device. If it returns, the compiler executes `llvm.trap`; execution
-never resumes after a failed check. Hook mode introduces no hosted reporting
-dependencies. No mode unwinds or runs destructors. The last `--panic` or
-`--panic-hook` option selects the strategy.
+columns count Unicode characters. The handler owns termination: it may report
+the fault, halt, or reset the device, and must never return or unwind into Dodo.
+The compiler marks the handler `noreturn` and ends its call with LLVM
+`unreachable`, without emitting a fallback trap or hosted reporting calls.
+Returning from the handler violates this contract and is undefined behavior.
+Any runtime dependencies of the handler itself are the board's responsibility.
+
+The selected policy applies to checked operations and ordinary `assert`,
+`assert_eq`, and `assert_ne` failures. The hosted `dodo test` runner retains its
+own failure reporting and trap behavior. No mode unwinds or runs destructors.
+The last `--panic` or `--panic-hook` option selects the strategy.
 
 ## Targets and linking
 

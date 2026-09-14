@@ -91,8 +91,9 @@ fn test_values() {
 }
 ```
 
-These assertions also work in ordinary programs, where failure traps without
-adding a hosted test runtime. Checks remain enabled at every optimization
+These assertions also work in ordinary programs, where failure follows the
+[selected runtime failure policy](command-line.md#configure-runtime-failures)
+without adding a hosted test runtime. Checks remain enabled at every optimization
 level. Use `core.assert`, `core.assert_eq`, or `core.assert_ne` when a local
 function has the same name. Test functions remain ordinary type-checked Dodo
 functions during `check` and `compile`; attributes do not hide invalid code.
