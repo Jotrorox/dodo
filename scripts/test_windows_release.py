@@ -62,7 +62,8 @@ def main() -> None:
             env = dict(os.environ)
             env.pop("LLVM_SYS_221_PREFIX", None)
             if os.name == "nt" and not tools:
-                env["PATH"] = str(Path(env["SystemRoot"]) / "System32")
+                # Windows os.environ keys are uppercase after copying to a dict.
+                env["PATH"] = str(Path(env["SYSTEMROOT"]) / "System32")
             result = subprocess.run([*runner, *map(str, command)], cwd=scratch, env=env,
                                     capture_output=True, text=True, timeout=120)
             if result.returncode:
