@@ -103,6 +103,11 @@ rejected because those views also depend on `owner` storage. A helper that inser
 an input and returns it must name that input in its return contract as well.
 Ordinary `from(owner)` continues to retain the complete owner borrow.
 
+Functions taking a collection by value retain its stored sources under the
+ordinary `from(value)` contract. This also applies when the collection is
+projected from an aggregate or a checked slice parameter. Moving a collection
+into a helper cannot erase the dependencies of an element removed there.
+
 `requires_plain(T, ...)` limits a specialization to borrow-free, Result-free
 types. Unavailable bodies are not emitted, and calls produce a diagnostic.
 This keeps mutable access methods usable for plain elements without making an

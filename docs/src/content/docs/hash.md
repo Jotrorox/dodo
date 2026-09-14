@@ -1,9 +1,42 @@
 ---
 title: "Hashing and checksums"
 description: "Portable incremental hashing, keyed map policies, and independent checksums."
-section: "Using Dodo"
-order: 144
+section: "Standard library"
+order: 149
 ---
+
+Use `std/hash.fnv1a64` for a stable fingerprint of trusted bytes and
+`std/checksum.crc32` for accidental-corruption checks. These separate portable
+imports use only fixed-size state and do not request an allocator or entropy.
+
+## Quickstart
+
+Save this as `hash_start.dodo`:
+
+```dodo test
+package hash_start
+import "std/hash"
+import "std/checksum"
+
+fn main() -> i32 {
+    assert_eq(hash.fnv1a64(b"hello"), 0xa430d84680aabd0bu64)
+    assert_eq(checksum.crc32(b"123456789"), 0xcbf43926u32)
+    return 0
+}
+```
+
+```sh
+dodo run hash_start.dodo
+```
+
+Expected output: none; exit 0 confirms both known results. These one-shot
+functions cannot fail. A checksum mismatch in an application means you should
+reject or reacquire the damaged data. Neither checksum nor FNV authenticates it.
+For hash tables accepting untrusted keys, use SipHash with an unpredictable
+caller-supplied key; if key acquisition fails, stop that operation. The library
+has no general OS entropy adapter and a fixed example seed is not a substitute.
+
+## API and contracts
 
 `std/hash` provides allocation-free byte hashing and statically dispatched map
 policies. `std/checksum` is an independent import for accidental-corruption

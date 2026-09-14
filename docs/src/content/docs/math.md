@@ -1,9 +1,43 @@
 ---
 title: Portable mathematics
-section: "Using Dodo"
-order: 142
+section: "Standard library"
+order: 148
 description: "Checked integers and portable binary64 elementary functions, accuracy, special values, and reference tests."
 ---
+
+Use `std/math.checked_add` for recoverable signed arithmetic and `math.hypot`
+for a vector length. Import `std/math/trig` separately when you need angles.
+These portable modules need no allocator or native libm.
+
+## Quickstart
+
+Save this as `math_start.dodo`:
+
+```dodo test
+package math_start
+import "std/math"
+
+fn main() -> i32 {
+    match math.checked_add(20, 22) {
+        ok(value) => { assert_eq(value, 42i64) },
+        err(_) => { return 1 },
+    }
+    assert(math.abs(math.hypot(3.0, 4.0) - 5.0) < 1e-12)
+    return 0
+}
+```
+
+```sh
+dodo run math_start.dodo
+```
+
+Expected output: none; exit 0 confirms the integer sum is 42 and the vector
+length is approximately 5. Exit 1 means arithmetic overflowed: validate or
+reduce the input, or report the error. Domain errors from checked elementary
+functions should likewise be handled, not unwrapped. Floating comparisons need
+a task-appropriate tolerance; detailed numerical bounds follow below.
+
+## API and contracts
 
 `std/math` supplies allocation-free integer algorithms, checked signed arithmetic,
 and binary64 (`f64`) mathematics. `std/math/trig` separately supplies trigonometry

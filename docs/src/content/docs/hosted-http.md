@@ -1,8 +1,8 @@
 ---
 title: "Hosted HTTP and HTTPS"
 description: "Small bounded clients and serial web servers with library-owned I/O loops."
-section: "Using Dodo"
-order: 154
+section: "Standard library"
+order: 159.5
 ---
 
 Use `std/http/hosted` for a hosted HTTP client, `std/http/https` for verified
@@ -94,7 +94,9 @@ error on stderr; check the cause and delivered-prefix count before retrying.
 A completed non-200 response exits 2. The server reports individual failed
 connections in its `Report`, independently of startup errors.
 
-For the underlying protocol APIs, see [HTTP](http.md) and [web serving](web.md). `Config.max_connections` sets a finite number of
+For the shortest bounded-body and one-request examples, see [HTTP](http.md)
+and [web serving](web.md); those guides also cover the underlying protocol APIs.
+`Config.max_connections` sets a finite number of
 accepted connections (including rejected requests). Repository versions are
 [http_client.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/http_client.dodo)
 and [web_server.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/web_server.dodo).

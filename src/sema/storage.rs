@@ -27,6 +27,35 @@ impl Context {
     pub(super) fn has_storage(&self, ty: &Type) -> bool {
         !self.storage_elements(ty).is_empty()
     }
+    // Parameter dependencies summarize the entire argument, including owners
+    // behind aggregate fields and checked references. Their stored sources
+    // must survive ownership moves and projections before an eventual take.
+    pub(super) fn contains_storage_witness(&self, ty: &Type) -> bool {
+        fn contains(context: &Context, ty: &Type, seen: &mut HashSet<String>) -> bool {
+            match ty {
+                Type::Array(0, _) => true,
+                Type::Ref(_, t) | Type::Slice(_, t) | Type::Array(_, t) | Type::Option(t) => {
+                    contains(context, t, seen)
+                }
+                Type::Result(ok, err) => {
+                    contains(context, ok, seen) || contains(context, err, seen)
+                }
+                Type::Named(name) if seen.insert(name.clone()) => {
+                    context
+                        .structs
+                        .get(name)
+                        .is_some_and(|s| s.fields.iter().any(|f| contains(context, &f.ty, seen)))
+                        || context.enums.get(name).is_some_and(|e| {
+                            e.variants
+                                .iter()
+                                .any(|v| v.fields.iter().any(|f| contains(context, &f.ty, seen)))
+                        })
+                }
+                _ => false,
+            }
+        }
+        contains(self, ty, &mut HashSet::new())
+    }
     // Matching through a conservative region union cannot identify which
     // source Result was observed. Keep Result-bearing referents out of scope,
     // independently of contains_result (which tracks *owned* obligations).

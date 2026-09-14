@@ -27,6 +27,12 @@ the [example programs](https://github.com/Jotrorox/dodo/tree/main/examples).
 The command-line guide also covers [project folders](command-line.md#project-folders-and-source-files)
 and [target selection](command-line.md#targets-and-linking).
 
+Find a task in the [standard-library guide](standard-library.md):
+[print a value](formatting.md), [read a file](filesystem.md),
+[get an environment variable](environment.md), [run a command](processes.md),
+[build a string](text.md), [store values](collections.md),
+[read time](time.md), [fetch a URL](http.md), or [serve a route](web.md).
+
 ## Look up language behavior
 
 - [Language specification](language-spec-0.1.md): normative syntax, types,

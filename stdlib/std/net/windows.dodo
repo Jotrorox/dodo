@@ -1,6 +1,7 @@
 package windows
 
 import "core/ptr"
+import "std/time/hosted"
 import "std/io"
 import "std/net"
 
@@ -17,7 +18,6 @@ unsafe extern "C" fn dodo_net_shutdown(handle: isize, direction: u32) -> i32
 unsafe extern "C" fn dodo_net_sendto(handle: isize, data: *const u8, size: usize, address: *const u8, error: *mut i32) -> isize
 unsafe extern "C" fn dodo_net_recvfrom(handle: isize, data: *mut u8, size: usize, address: *mut u8, truncated: *mut u32, original: *mut usize, error: *mut i32) -> isize
 unsafe extern "C" fn dodo_net_resolve(host: *const u8, port: u16, output: *mut u8, capacity: usize, numeric_only: u32, error: *mut i32) -> isize
-unsafe extern "C" fn dodo_net_now_ms() -> u64
 
 pub fn from_code(code: i32) -> net.Error {
     kind := net.ErrorKind.Other
@@ -482,9 +482,8 @@ fn resolve_impl(host: &[u8], port: u16, workspace: &mut[u8], numeric_only: u32) 
 }
 pub struct MonotonicClock {
     pub fn now_ms(&mut self) -> u64 {
-        unsafe {
-            return dodo_net_now_ms()
-        }
+        clock := hosted.MonotonicClock.new()
+        return clock.now_ms()
     }
 }
 // Blocking composition is explicit and bounded to at most 10ms per readiness

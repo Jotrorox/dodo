@@ -1,0 +1,36 @@
+package hosted_environment
+import "std/env"
+import "std/platform"
+import "std/console"
+
+fn main() -> i32 {
+    workspace := env.Workspace.new()
+    output := [0u8; 256]
+    match env.get("DODO_GREETING", &mut output, &mut workspace, platform.TextPolicy.Strict) {
+        ok(found) => {
+            match found {
+                some(value) => {
+                    match console.println(value) {
+                        ok(_) => {
+                            return 0
+                        }, err(_) => {
+                            return 2
+                        }
+                    }
+                }
+                none => {
+                    match console.println("DODO_GREETING is absent") {
+                        ok(_) => {
+                            return 0
+                        }, err(_) => {
+                            return 2
+                        }
+                    }
+                }
+            }
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

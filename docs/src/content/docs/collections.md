@@ -1,9 +1,56 @@
 ---
 title: "Collections"
 description: "Borrowed algorithms, caller-backed containers, and explicit fallible ownership."
-section: "Using Dodo"
-order: 141
+section: "Standard library"
+order: 147
 ---
+
+Use `std/collections/fixed_vector.Vector.new` to store a small bounded list.
+Its `Option<T>` slots are caller-owned storage; this portable path needs no
+allocator. Import the container directly; the parent `std/collections` package
+contains slice algorithms, not all child constructors.
+
+## Quickstart
+
+Save this as `collection_start.dodo`:
+
+```dodo test
+package collection_start
+import "std/collections/fixed_vector"
+
+fn main() -> i32 {
+    slots: [3]Option<i32> = [none, none, none]
+    values := fixed_vector.Vector.new(&mut slots)
+    match values.push(42) {
+        ok() => {},
+        err(_) => { return 1 },
+    }
+    match values.pop() {
+        some(value) => { assert_eq(value, 42) },
+        none => { return 2 },
+    }
+    return 0
+}
+```
+
+```sh
+dodo run collection_start.dodo
+```
+
+Expected output: none; exit 0 confirms the stored value was 42. Exit 1 means
+the fixed vector is full: remove an item, increase slot capacity, or report that
+the input exceeds your limit. Exit 2 means there was no item to pop.
+
+For growth, the recommended next step is `alloc/shared_arena` plus
+`std/collections/shared_vector.new::<T>(arena.handle())`; it permits several
+owners in the same arena. Use `text_shared.new(arena.handle(), limit)?` or
+`text_shared.from_str(arena.handle(), utf8, limit)?` for owned strings alongside
+them; no intermediate byte buffer is required. See the [string-map example](https://github.com/Jotrorox/dodo/blob/main/examples/string_map.dodo). The generic owned-container constructors are unsafe
+custom-allocator building blocks. Start with scalar or owned element values:
+[current container restrictions](container-elements.md) still reject certain
+reference-bearing and Result-bearing elements, even through nested aggregates.
+
+## API and contracts
 
 `std/collections` supplies algorithms over checked borrowed slices. Its child
 packages provide independently imported containers. Nothing starts a runtime,

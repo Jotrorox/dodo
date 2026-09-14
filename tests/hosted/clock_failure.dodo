@@ -1,0 +1,36 @@
+package clock_failure
+import "std/time"
+import "std/time/hosted"
+fn main() {
+    clock := hosted.MonotonicClock.new()
+    match clock.now_native() {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.code == 5)
+        }
+    }
+    match clock.now() {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason == time.TimeError.ClockFailure)
+        }
+    }
+    assert(clock.now_ms() == 18446744073709551615u64)
+    wall := hosted.WallClock.new()
+    match wall.wall_now_native() {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.code == 5)
+        }
+    }
+    match wall.wall_now() {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason == time.TimeError.ClockFailure)
+        }
+    }
+}

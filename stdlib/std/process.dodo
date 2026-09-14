@@ -181,3 +181,78 @@ pub struct Pipe {
 pub fn into_status(output: Output) -> ExitStatus {
     return mem.replace(&mut output.status, ExitStatus { kind: ExitKind.Exited, code: 0 })
 }
+
+// Owns bounded native copies of the executable, directory and individual args.
+// Defaults: inherited environment/streams/current directory, direct executable
+// selection, no shell. args exclude argv[0]. Set options for spawn customization.
+pub struct CommandStorage {
+    executable: native.Workspace
+    directory: native.Workspace
+    arguments: native.ListWorkspace
+    pub fn new() -> CommandStorage {
+        return CommandStorage { executable: native.Workspace.new(), directory: native.Workspace.new(), arguments: native.ListWorkspace.new() }
+    }
+}
+pub struct Command {
+    storage: &mut CommandStorage
+    has_directory: bool
+    pub options: Options
+    pub fn new(executable: &str, storage: &mut CommandStorage) -> Command!error.Error from(storage) {
+        if mem.str_bytes(executable).len == 0 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        storage.executable.set(executable)?
+        storage.arguments.clear()
+        return ok(Command { storage: storage, has_directory: false, options: Options.new() })
+    }
+    pub fn arg(&mut self, value: &str) -> void!error.Error {
+        return self.storage.arguments.push(value)
+    }
+    pub fn clear_args(&mut self) {
+        self.storage.arguments.clear()
+    }
+    pub fn current_dir(&mut self, path: &str) -> void!error.Error {
+        if mem.str_bytes(path).len == 0 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        self.storage.directory.set(path)?
+        self.has_directory = true
+        return ok()
+    }
+    fn start(&self, options: &Options, environment: &native.NativeList) -> Child!error.Error {
+        executable := self.storage.executable.get()?
+        arguments := self.storage.arguments.get()?
+        directory := self.storage.directory.get()?
+        if self.has_directory {
+            return spawn(&executable, &arguments, environment, some(&directory), options)
+        }
+        return spawn(&executable, &arguments, environment, none, options)
+    }
+    // Optional full-native child environment; selected by inherit_environment=false.
+    pub fn spawn_with_environment(&self, environment: &native.NativeList) -> Child!error.Error {
+        return self.start(&self.options, environment)
+    }
+    pub fn spawn(&self) -> Child!error.Error {
+        environment := self.storage.arguments.empty()
+        return self.start(&self.options, &environment)
+    }
+    // Overrides streams with null stdin and piped stdout/stderr. Other options
+    // are retained; inherit_environment=false selects an empty environment.
+    // Timeout starts at collection, AFTER synchronous spawn, and covers draining
+    // both pipes and waiting for this child. Failure retains prefixes and kills/
+    // reaps the child. Cleanup time can exceed the budget; descendants are not killed.
+    pub fn output(&self, stdout: &mut[u8], stderr: &mut[u8], timeout_ms: u64) -> Output!CollectError {
+        options := Options.capture()
+        options.inherit_environment = self.options.inherit_environment
+        options.search_path = self.options.search_path
+        environment := self.storage.arguments.empty()
+        child := match self.start(&options, &environment) {
+            ok(value) => {
+                value
+            }, err(reason) => {
+                return err(CollectError { cause: reason, stdout_len: 0, stderr_len: 0 })
+            }
+        }
+        return child.collect(stdout, stderr, timeout_ms)
+    }
+}

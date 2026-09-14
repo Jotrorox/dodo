@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdlib.h>
 #include <limits.h>
 #define DODO_INVALID (-1)
 #define DODO_LIMIT (-3)
@@ -15,6 +16,20 @@ void dodo_env_init_args(int32_t argc, char **argv) { dodo_argc = argc; dodo_argv
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+int32_t dodo_env_lookup(const void *name, void *storage, size_t capacity, size_t *used, int32_t *found) {
+    *used = 0; *found = 0;
+    if (capacity > UINT32_MAX) return DODO_INVALID;
+    SetLastError(ERROR_SUCCESS);
+    DWORD count = GetEnvironmentVariableW(name, storage, (DWORD)capacity);
+    if (!count) {
+        DWORD code = GetLastError();
+        if (code == ERROR_ENVVAR_NOT_FOUND) return 0;
+        if (code != ERROR_SUCCESS) return (int32_t)code;
+        if (!capacity) return DODO_LIMIT;
+        ((wchar_t *)storage)[0] = 0;
+    } else if (count >= capacity) return DODO_LIMIT;
+    *used = (size_t)count + 1; *found = 1; return 0;
+}
 int32_t dodo_env_capture(void *storage, size_t capacity, size_t *used) {
     wchar_t *source = GetEnvironmentStringsW();
     if (!source) return (int32_t)GetLastError();
@@ -78,6 +93,16 @@ int32_t dodo_env_name_equal(const void *left, size_t left_len, const void *right
 #include <errno.h>
 #include <unistd.h>
 extern char **environ;
+int32_t dodo_env_lookup(const void *name, void *storage, size_t capacity, size_t *used, int32_t *found) {
+    *used = 0; *found = 0;
+    const char *value = getenv(name);
+    if (!value) return 0;
+    size_t count = strlen(value) + 1;
+    if (count > capacity) return DODO_LIMIT;
+    memcpy(storage, value, count);
+    *used = count; *found = 1; return 0;
+}
+
 int32_t dodo_env_capture(void *storage, size_t capacity, size_t *used) {
     size_t count = 0;
     for (char **entry = environ; *entry; ++entry) {

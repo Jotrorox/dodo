@@ -1,0 +1,41 @@
+package hosted_command
+import "std/process"
+import "std/console"
+import "std/io"
+
+// First compile examples/hosted_child.dodo -o child.exe (also on Linux).
+fn main() -> i32 {
+    storage := process.CommandStorage.new()
+    command := match process.Command.new("./child.exe", &mut storage) {
+        ok(value) => {
+            value
+        }, err(_) => {
+            return 1
+        }
+    }
+    match command.arg("one argument with spaces") {
+        ok() => {}, err(_) => {
+            return 1
+        }
+    }
+    stdout := [0u8; 128]
+    stderr := [0u8; 128]
+    match command.output(&mut stdout, &mut stderr, 5000) {
+        ok(report) => {
+            if!report.status.success() {
+                return 3
+            }
+            output := console.stdout()
+            match io.write_all(&mut output, &stdout[..report.stdout_len]) {
+                ok(_) => {
+                    return 0
+                }, err(_) => {
+                    return 4
+                }
+            }
+        }
+        err(_) => {
+            return 2
+        }
+    }
+}

@@ -96,9 +96,11 @@ fn check_program(
             checker.inferred_contract = function.from_span.is_none();
             for parameter in &function.params {
                 let id = checker.next_id;
+                let stored = context.contains_storage_witness(&parameter.ty);
+                let borrowed = matches!(parameter.ty, Type::Ref(..) | Type::Slice(..));
                 let mut deps = if context.carries_borrow(&parameter.ty) {
                     vec![Loan {
-                        stored: false,
+                        stored: stored && !borrowed,
                         dependency: false,
                         root: usize::MAX / 2 + id,
                         fields: vec![],
@@ -111,8 +113,8 @@ fn check_program(
                 } else {
                     vec![]
                 };
-                if let Type::Ref(_, inner) = &parameter.ty
-                    && context.has_storage(inner)
+                if let Type::Ref(_, inner) | Type::Slice(_, inner) = &parameter.ty
+                    && stored
                     && context.carries_borrow(inner)
                 {
                     deps.push(Loan {

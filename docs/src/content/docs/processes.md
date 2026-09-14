@@ -1,9 +1,86 @@
 ---
 title: "Processes"
 description: "Direct native process execution, owned child handles, explicit environments and bounded output collection."
-section: "Using Dodo"
-order: 147
+section: "Standard library"
+order: 154
 ---
+
+Use `std/process.Command.new` and `Command.output` to run a program and collect
+bounded output. `Command.arg` adds one argument without shell quoting. This
+hosted API supports Linux GNU x86-64 and Windows x64; it does not interpret shell
+operators or search PATH unless explicitly configured.
+
+## Quickstart
+
+In a fresh example directory, save this companion program as `child.dodo`:
+
+```dodo test
+package child
+import "std/console"
+fn main() -> i32 {
+    match console.println("Hello, command!") {
+        ok(_) => { return 0 }, err(_) => { return 1 },
+    }
+}
+```
+
+Compile it first (the `.exe` suffix also works on Linux):
+
+```sh
+dodo compile child.dodo -o child.exe
+```
+
+Save this as `command_start.dodo`:
+
+```dodo
+package command_start
+import "std/process"
+import "std/console"
+import "std/io"
+
+fn main() -> i32 {
+    storage := process.CommandStorage.new()
+    command := match process.Command.new("./child.exe", &mut storage) {
+        ok(value) => { value }, err(_) => { return 1 },
+    }
+    stdout := [0u8; 128]
+    stderr := [0u8; 128]
+    match command.output(&mut stdout, &mut stderr, 5000) {
+        ok(report) => {
+            if !report.status.success() { return 3 }
+            output := console.stdout()
+            match io.write_all(&mut output, &stdout[..report.stdout_len]) {
+                ok(_) => { return 0 }, err(_) => { return 4 },
+            }
+        },
+        err(_) => { return 2 },
+    }
+}
+```
+
+```sh
+dodo run command_start.dodo
+```
+
+Expected stdout is `Hello, command!` followed by a newline; success exits 0.
+Both output arrays are caller-owned; `CommandStorage.new()` supplies fixed native
+workspaces for the executable, directory and arguments. `Command` borrows that
+storage until it is destroyed. No global allocator or shell is used.
+
+Exit 1 means an invalid/oversized executable name. Exit 2 means spawn, capture
+or wait failed: verify `child.exe` exists and is executable, inspect
+`CollectError.cause` and its stdout/stderr prefix counts, and increase the
+buffers or deadline only when appropriate. Exit 3 means the child ran but
+reported failure; inspect its exit status and stderr. Exit 4 means printing failed.
+
+`output` drains both pipes and waits, preventing the common deadlock from
+waiting before draining captured output. Its timeout starts **after synchronous
+spawn**, and cleanup can exceed the budget. Failure kills/reaps this child;
+descendants are not killed. `Command.spawn` provides explicit child ownership
+when you need interactive streams or a custom environment. `std/process/alloc`
+is the advanced bounded allocated-output alternative.
+
+## API and contracts
 
 `std/process` provides direct executable execution on x86-64 Linux/glibc and
 Windows x64. Its selected `std/process/native` adapter uses an explicit C ABI
@@ -142,3 +219,54 @@ bytes, environment inheritance and replacement, explicit working directories,
 stdin ownership and EOF, exit/signal/cancellation/timeout distinctions, missing
 executables, and destructor cleanup. The Windows harness compiles and executes
 real Windows parents and child programs under Wine using the same contracts.
+
+## UTF-8 command builder
+
+Create `CommandStorage.new()` once, then `Command.new(executable, &mut storage)`.
+The command exclusively borrows storage. Each `arg(text)` appends one copied
+argument; it does not retain the input string. Empty arguments, whitespace,
+quotes, and trailing backslashes are preserved. `clear_args()` resets the list.
+`current_dir(text)` selects the child directory. Invalid NUL/empty executable or
+directory names, and capacity failures, preserve the previous configuration.
+A failed `arg` leaves all prior arguments intact. Drop the command to reuse its
+storage with a different executable.
+
+Storage bounds are 4096 native units each for executable and directory (including
+NUL), plus 32768 units for all arguments (one NUL per argument). Storage occupies
+40984 bytes on Linux and 81944 on Windows, including counters and alignment;
+there is no hidden allocator or growth. The OS imposes additional limits:
+Linux also limits explicit arguments to 4095 (plus the executable at argv[0])
+and custom environment entries to 4096 in the native backend; exceeding either
+returns `BufferTooSmall` at spawn. OS exec limits apply as well. Windows bounds
+the quoted command line to 32768 UTF-16 units including NUL. Quotes/backslashes can
+expand the Windows command line, so a successful `arg` can still lead to a
+`BufferTooSmall` spawn failure. The Windows round-trip guarantee applies to CRT
+argument parsing; programs with custom command-line parsers can differ.
+
+`command.options` starts with inherited environment and standard streams,
+inherited working directory, and `search_path=false`. `spawn()` uses these
+options; with `inherit_environment=false` it supplies an empty environment.
+`spawn_with_environment(native_list)` uses an explicit native environment when
+inheritance is disabled, compatible with `env.child_environment`.
+`output(stdout, stderr, timeout_ms)` overrides streams with null stdin and piped
+stdout/stderr while retaining the other options. Use `spawn_with_environment` with capture options, followed by `Child.collect`,
+when you need an explicit child environment and capture together.
+
+Each output slice is an independent byte limit. Success reports actual lengths,
+EOF on both pipes, and an exit status; nonzero child exit is successful collection.
+Exact-capacity streams succeed, including empty streams with zero capacity.
+Excess output returns `BufferTooSmall`; errors retain exactly the prefixes named
+by `CollectError.stdout_len` and `stderr_len`. Startup errors report zero lengths
+and leave output untouched. Output bytes are never implicitly decoded.
+
+The relative millisecond timeout covers pipe draining and this child's exit,
+starting **after** synchronous spawn. `process.FOREVER` disables it; zero permits
+one immediate attempt. `Duration.timeout_millis()` rounds fractional milliseconds
+up and rejects overflow/the infinite sentinel. Spawn, process termination/reaping,
+OS scheduling, and descendants are outside the time guarantee. Collection errors
+close owned pipes, terminate and reap this child. Descendants are not terminated;
+a descendant holding a pipe open can cause timeout even after the child exits.
+`Child.wait_timeout` instead leaves a live child for explicit retry/cancellation.
+
+Complete runnable sources are [hosted_command.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_command.dodo)
+and [hosted_child.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_child.dodo).

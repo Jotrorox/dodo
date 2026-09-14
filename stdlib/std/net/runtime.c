@@ -253,12 +253,3 @@ intptr_t dodo_net_resolve(const uint8_t *hostname, uint16_t port, uint8_t *outpu
     }
     freeaddrinfo(result); return (intptr_t)count;
 }
-uint64_t dodo_net_now_ms(void) {
-#ifdef _WIN32
-    return (uint64_t)GetTickCount64();
-#else
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return UINT64_MAX;
-    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
-#endif
-}

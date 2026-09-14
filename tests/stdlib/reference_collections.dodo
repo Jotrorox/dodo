@@ -44,6 +44,21 @@ fn forward(out: &mut vector.Vector<&i32, shared_arena.Handle>, value: &i32) -> v
 fn transfer(out: &mut vector.Vector<&i32, shared_arena.Handle>) -> Option<&i32> from(out.stored) {
     return out.pop()
 }
+fn consume(values: vector.Vector<&i32, shared_arena.Handle>) -> Option<&i32> from(values) {
+    return values.pop()
+}
+enum OwnedValues {
+    Values(vector.Vector<&i32, shared_arena.Handle>), Empty
+}
+fn consume_wrapped(owner: OwnedValues) -> Option<&i32> from(owner) {
+    match owner {
+        OwnedValues.Values(values) => {
+            return consume(values)
+        }, OwnedValues.Empty => {
+            return none
+        }
+    }
+}
 fn references() -> void!error.AllocError {
     bytes := [0u8; 65536]
     arena := shared_arena.SharedArena.new(&mut bytes)?
@@ -70,6 +85,16 @@ fn references() -> void!error.AllocError {
     match removed {
         some(v) => {
             core.assert(*v == 3)
+        }, none => {
+            core.assert(false)
+        }
+    }
+
+    consumed := shared_vector.new::<&i32>(arena.handle())
+    consumed.push(&b)?
+    match consume_wrapped(OwnedValues.Values(consumed)) {
+        some(value) => {
+            core.assert(*value == 7)
         }, none => {
             core.assert(false)
         }

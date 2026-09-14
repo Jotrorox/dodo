@@ -1,9 +1,102 @@
 ---
 title: "Web applications"
 description: "Portable routing, checked streaming handlers, optional rooted files, and explicit server execution."
-section: "Using Dodo"
-order: 154
+section: "Standard library"
+order: 160
 ---
+
+Use `std/web/hosted.serve` with `hosted.Text.new` to serve one text route on
+Linux GNU x86-64 or Windows x64. Start with this serial, bounded server and
+caller-owned buffers. `std/web` supplies the portable route table; importing it
+alone does not create sockets or start a server.
+
+## Quickstart
+
+Save this as `serve_route.dodo`:
+
+```dodo
+package serve_route
+import "std/web"
+import "std/web/hosted"
+import "std/console"
+
+fn main() -> i32 {
+    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
+    handler := hosted.Text.new(b"Hello, Dodo!\n")
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    request_body := [0u8; 1024]
+    response_body := [0u8; 1024]
+    config := hosted.Config.defaults()
+    config.max_connections = 1
+    match hosted.serve(b"127.0.0.1:8080", &routes, &mut handler, &mut workspace,
+        &mut request_body, &mut response_body, config) {
+        ok(report) => {
+            if report.failed != 0 { return 2 }
+            if report.completed != 1 { return 3 }
+            return 0
+        },
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println_value(&reason) {
+                ok(_) => {}, err(_) => {},
+            }
+            return 1
+        },
+    }
+}
+```
+
+```sh
+dodo run serve_route.dodo
+```
+
+The server waits silently for one connection. In terminal 2, request the route
+with Python 3 (or run the [Dodo HTTP quickstart](http.md)):
+
+```sh
+python3 -c "import http.client; c = http.client.HTTPConnection('127.0.0.1', 8080, timeout=5); c.request('GET', '/'); r = c.getresponse(); print(r.status); print(r.read().decode(), end=''); c.close()"
+```
+
+Expected client stdout:
+
+```text
+200
+Hello, Dodo!
+```
+
+The server then exits 0. Restart it for another request. Stop an idle server
+with Ctrl+C; `max_connections = 1` counts accepted connections, not an idle
+acceptance timeout. Start the server before the client; if the client races
+compilation and reports connection refused, retry once the server is running.
+
+The workspace covers HTTP framing and paths. Separate 1024-byte arrays bound
+request and response bodies; `Text` borrows the literal. No allocator, thread
+pool, external files or credentials are required.
+
+Exit 1 means startup failed: inspect the hosted error, check the address and
+whether a previous server owns port 8080. The adapter does not set socket
+address-reuse options; the OS can retain a recently closed port temporarily.
+Wait for it to become reusable or change 8080 in both server and client.
+`console` is imported only to report startup errors on stderr. Exit 2 means an accepted connection
+failed; check protocol/body limits or deadlines. Exit 3 means the request was
+rejected instead of completed. Try `/missing` after restarting: the client gets
+404 and this example exits 3. A successful `serve` Result still requires checking
+its report; individual connection failures are counted there.
+
+## Hosted server choices
+
+`Config` supplies header/body/request/write budgets and buffer limits. The
+starter handles one request per connection, serially, and buffers the body
+before invoking the handler. `hosted.text(output, bytes)` builds a text response
+from a custom public handler with the structural `handle` method.
+`serve_with` lets an application select acceptor, clock and cancellation.
+Cancellation is cooperative; a handler that never returns cannot be preempted.
+For streaming bodies, middleware, or custom execution use `std/web/server`,
+`std/web/stream`, `std/web/response` and `std/http/connection` below.
+`std/web/static_files` is an optional filesystem entry point with its own
+rooted-path restrictions.
+
+## API and contracts
 
 `std/web` provides routing, request context, structural handlers, middleware and
 error-response policy. It imports no sockets, TLS, files, scheduler or clock.
@@ -121,12 +214,12 @@ must select explicit synchronization. It is not an implicit worker pool.
 The [web server example](https://github.com/Jotrorox/dodo/blob/main/examples/web_server_polling.dodo)
 demonstrates bounded serial execution: one connection, fixed buffers, a 30 s
 absolute deadline, routing/error responses, streaming, TCP half-close and cleanup.
-The [client](https://github.com/Jotrorox/dodo/blob/main/examples/http_client.dodo)
+The [client](https://github.com/Jotrorox/dodo/blob/main/examples/http_client_polling.dodo)
 consumes its response with a five-second deadline. Run these in two terminals:
 
 ```sh
 dodo run examples/web_server_polling.dodo
-dodo run examples/http_client.dodo
+dodo run examples/http_client_polling.dodo
 ```
 
 The server exits after one request; restart it for another. An ordinary HTTP client
@@ -170,8 +263,8 @@ integrations are separate extension work. HTTPS uses an independently supplied
 
 ## Hosted convenience layer
 
-For short applications with library-owned connection, readiness, deadline, and
-body-transfer loops, see [Hosted HTTP and HTTPS](hosted-http.md). It includes
-bounded HTTP and verified HTTPS clients, a serial web server, and complete
-local examples. The protocol and routing APIs on this page remain usable
-independently.
+Use `std/web/hosted` for a bounded serial listener with ordinary structural
+handlers and library-owned connection, readiness, deadline, and body-transfer
+loops. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs,
+explicit storage bounds, resolver/deadline scope, cancellation, and a generated
+local HTTPS setup. Protocol and routing APIs remain usable independently.

@@ -1,0 +1,160 @@
+package hosted_process
+import "std/process"
+import "std/platform"
+import "std/platform/error"
+import "std/fs"
+import "std/time"
+import "core/mem"
+import "core/bytes"
+fn run() -> void!error.Error {
+    storage := process.CommandStorage.new()
+    command := process.Command.new("./os child.exe", &mut storage)?
+    assert(command.options.inherit_environment && command.options.stdin == process.Stdio.Inherit && command.options.stdout == process.Stdio.Inherit && command.options.stderr == process.Stdio.Inherit && !command.options.search_path)
+    command.arg("arguments")?
+    command.arg("space arg")?
+    command.arg("quote\"arg")?
+    command.arg("tail\\")?
+    command.arg("")?
+    command.arg("two tail\\\\")?
+    command.arg(" \t ")?
+    command.arg("slash\\\"quote")?
+    command.arg("\"")?
+    command.arg("\\")?
+    command.arg("\\\\\"")?
+    command.arg("plain")?
+    match command.arg("bad\x00arg") {
+        ok() => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    oversized := [97u8; 32768]
+    too_long := unsafe {
+        mem.str_from_utf8(&oversized)
+    }
+    match command.arg(too_long) {
+        ok() => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.BufferTooSmall)
+        }
+    }
+    output := [0u8; 262144]
+    errors := [0u8; 262144]
+    expected := b"space arg\x00quote\"arg\x00tail\\\x00\x00two tail\\\\\x00 \t \x00slash\\\"quote\x00\"\x00\\\x00\\\\\"\x00plain\x00"
+    match command.output(&mut output[..expected.len], &mut errors[..4], 5000) {
+        ok(report) => {
+            assert(report.status.success() && report.stdout_len == expected.len && report.stderr_len == 4)
+            assert(bytes.equal(&output[..report.stdout_len], expected) && bytes.equal(&errors[..4], b"done"))
+        }
+        err(_) => {
+            assert(false, "argument preservation")
+        }
+    }
+    command.clear_args()
+    command.arg("inherit")?
+    match command.output(&mut output[..0], &mut errors[..0], 5000) {
+        ok(report) => {
+            assert(report.status.success() && report.stdout_len == 0 && report.stderr_len == 0)
+        }
+        err(_) => {
+            assert(false)
+        }
+    }
+    command.clear_args()
+    command.arg("flood")?
+    match command.output(&mut output, &mut errors, 5000) {
+        ok(report) => {
+            assert(report.status.code == 7 && report.stdout_len == output.len && report.stderr_len == errors.len)
+        }
+        err(_) => {
+            assert(false, "exact output limits")
+        }
+    }
+    for i in 0..8 {
+        match command.output(&mut output[..8], &mut errors[..8], 5000) {
+            ok(_) => {
+                assert(false)
+            }, err(reason) => {
+                assert(reason.cause.kind == error.Kind.BufferTooSmall)
+                assert(reason.stdout_len == 8 && output[0] == 111 && reason.stderr_len <= 8)
+            }
+        }
+    }
+    match command.output(&mut output, &mut errors[..0], 5000) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.cause.kind == error.Kind.BufferTooSmall && reason.stderr_len == 0)
+        }
+    }
+    command.clear_args()
+    command.arg("cleanup")?
+    duration := time.Duration.from_millis(1000)
+    budget := match duration.timeout_millis() {
+        ok(n) => {
+            n
+        }, err(_) => {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+    }
+    match command.output(&mut output, &mut errors, budget) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.cause.kind == error.Kind.TimedOut && reason.stdout_len == 5)
+            assert(bytes.equal(&output[..5], b"ready"))
+        }
+    }
+    command.clear_args()
+    command.arg("sleep")?
+    child := command.spawn()?
+    match child.wait_timeout(0) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.TimedOut)
+        }
+    }
+    child.cancel()?
+    status := child.wait()?
+    assert(status.kind == process.ExitKind.Cancelled)
+    match child.try_wait()? {
+        some(_) => {}, none => {
+            assert(false)
+        }
+    }
+    // A failed spawn retains no output and its native error is preserved.
+    missing_storage := process.CommandStorage.new()
+    missing := process.Command.new("./missing child.exe", &mut missing_storage)?
+    match missing.output(&mut output, &mut errors, 1000) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.cause.kind == error.Kind.NotFound && reason.cause.code != 0 && reason.stdout_len == 0 && reason.stderr_len == 0)
+        }
+    }
+    // Directory failures are atomic, and configured directories reach spawn.
+    command.current_dir("child cwd é")?
+    match command.current_dir("bad\x00directory") {
+        ok() => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    command.clear_args()
+    command.arg("inherit")?
+    child2 := command.spawn()?
+    status2 := child2.wait()?
+    assert(status2.success())
+    return ok()
+}
+fn main() {
+    match run() {
+        ok() => {}, err(_) => {
+            assert(false, "hosted command operation failed")
+        }
+    }
+}

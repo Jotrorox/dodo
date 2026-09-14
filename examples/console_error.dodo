@@ -1,0 +1,28 @@
+package console_error
+
+import "std/console"
+import "std/io"
+import "std/text"
+
+fn run() -> void!io.Error {
+    // Parsing errors retain a kind and position, never the input itself.
+    match text.parse_i64(b"not a number", 10) {
+        ok(_) => {}
+        err(reason) => {
+            errors := console.stderr()
+            errors.print("Could not read the number: ")?
+            errors.println_value(&reason)?
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

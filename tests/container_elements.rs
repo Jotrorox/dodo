@@ -378,3 +378,49 @@ match &second {ok(_) => {}, err(_) => {}} } }
         w.rejects(&format!("package app\nimport \"alloc/shared_arena\"\nimport \"std/collections/shared_vector\"\nstruct Wrapped {{ result: i32!u8 }}\nstruct Borrowed {{ inner: &Wrapped }}\nfn check(a: shared_arena.Handle) {{ v := shared_vector.new::<{element}>(a) }}"), "Result");
     }
 }
+
+#[test]
+fn parameter_moves_and_projections_cannot_erase_stored_sources() {
+    let w = Workspace::new();
+    let vector = "vector.Vector<&i32, shared_arena.Handle>";
+    let declarations = format!(
+        "struct OwnedWrapper {{ values: {vector} }}\nstruct Indirect {{ values: &mut {vector} }}\nenum Wrapped {{ Values({vector}), Empty }}"
+    );
+    for (parameter, body) in [
+        (format!("values: {vector}"), "return values.pop()"),
+        ("owner: OwnedWrapper".into(), "return owner.values.pop()"),
+        ("owner: Indirect".into(), "return owner.values.pop()"),
+        (format!("values: [1]{vector}"), "return values[0].pop()"),
+        (format!("values: &mut[{vector}]"), "return values[0].pop()"),
+        (
+            format!("values: Option<{vector}>"),
+            "match values { some(value) => { return value.pop() }, none => { return none } }",
+        ),
+        (
+            format!("values: Result<{vector}, u8>"),
+            "match values { ok(value) => { return value.pop() }, err(_) => { return none } }",
+        ),
+        (
+            "owner: Wrapped".into(),
+            "match owner { Wrapped.Values(value) => { return value.pop() }, Wrapped.Empty => { return none } }",
+        ),
+        (
+            "owner: &mut Wrapped".into(),
+            "match owner { Wrapped.Values(value) => { return value.pop() }, Wrapped.Empty => { return none } }",
+        ),
+    ] {
+        w.rejects(
+            &allocated_program("", &format!("{declarations}\nfn erase({parameter}) -> Option<&i32> from(static) {{ {body} }}")),
+            "return contract",
+        );
+    }
+    w.rejects(&allocated_program("", "fn erase(values: vector.Vector<text_shared.String, shared_arena.Handle>) -> Option<text_shared.String> from(static) { return values.pop() }"), "return contract");
+    w.rejects(&allocated_program("", "fn stale(values: vector.Vector<&i32, shared_arena.Handle>) -> &[&i32] from(values) { return values.as_slice() }"), "borrow");
+    w.rejects(
+        &allocated_program(
+            "values.push(&source)?\nremoved := consume(values)\nsource = 0\ncore.drop(removed)",
+            "fn consume(values: vector.Vector<&i32, shared_arena.Handle>) -> Option<&i32> from(values) { return values.pop() }",
+        ),
+        "borrow",
+    );
+}
