@@ -280,6 +280,137 @@ pub struct Handle {
     }
 }
 
+// Bounded inline native text storage. Units include the terminating NUL.
+// Only the selected platform representation is stored; no allocation occurs.
+pub const TEXT_CAPACITY: usize = 4096
+pub const LIST_CAPACITY: usize = 32768
+fn utf8_units(value: &str) -> usize!error.Error {
+    source := mem.str_bytes(value)
+    count := 1usize
+    offset := 0usize
+    for offset < source.len {
+        decoded := match text.decode(source, offset) {
+            ok(value) => {
+                value
+            }, err(_) => {
+                return err(error.failure(error.Kind.InvalidInput))
+            }
+        }
+        if decoded.scalar == 0 {
+            return err(error.failure(error.Kind.InvalidInput))
+        }
+        count += 1
+        if decoded.scalar > 65535 {
+            count += 1
+        }
+        offset = decoded.next
+    }
+    return ok(count)
+}
+pub struct Workspace {
+    data: [1024]u64
+    used: usize
+    pub fn new() -> Workspace {
+        return Workspace { data: [0u64; 1024], used: 1 }
+    }
+    // Failure preserves the previous string. All capacity checks precede writes.
+    pub fn set(&mut self, value: &str) -> void!error.Error {
+        required := utf8_units(value)?
+        if required > TEXT_CAPACITY {
+            return err(error.failure(error.Kind.BufferTooSmall))
+        }
+        unused := [0u8; 0]
+        {
+            encoded := from_utf8(value, &mut unused, self.buffer())?
+        }
+        self.used = required
+        return ok()
+    }
+    pub fn get(&self) -> NativeString!error.Error {
+        return NativeString.new(&self.units()[..self.used])
+    }
+    // Native observations use separate caller-owned storage. commit validates
+    // the returned length and terminator before publishing a view.
+    pub fn buffer(&mut self) -> &mut[u16] {
+        unsafe {
+            address := ptr.from_mut(&mut self.data) as *mut u16
+            capacity := self.data.len * 8 / mem.size_of::<u16>()
+            return ptr.borrow_slice_mut(address, capacity, self)
+        }
+    }
+    fn units(&self) -> &[u16] {
+        unsafe {
+            return ptr.borrow_slice(ptr.from_ref(&self.data) as *const u16, self.data.len * 8 / mem.size_of::<u16>(), self)
+        }
+    }
+    pub fn commit(&mut self, used: usize) -> void!error.Error {
+        if used > TEXT_CAPACITY {
+            return err(error.failure(error.Kind.BufferTooSmall))
+        }
+        {
+            value := NativeString.new(&self.units()[..used])?
+        }
+        self.used = used
+        return ok()
+    }
+}
+pub struct ListWorkspace {
+    data: [8192]u64
+    used: usize
+    pub fn new() -> ListWorkspace {
+        return ListWorkspace { data: [0u64; 8192], used: 0 }
+    }
+    pub fn empty(&self) -> NativeList {
+        return NativeList { data: &self.units()[..0] }
+    }
+    pub fn len_units(&self) -> usize {
+        return self.used
+    }
+    pub fn clear(&mut self) {
+        self.used = 0
+    }
+    // Each call appends exactly one argument, including an empty argument.
+    // Failed append preserves all previous arguments and the logical length.
+    pub fn push(&mut self, value: &str) -> void!error.Error {
+        required := utf8_units(value)?
+        if required > LIST_CAPACITY - self.used {
+            return err(error.failure(error.Kind.BufferTooSmall))
+        }
+        offset := self.used
+        unused := [0u8; 0]
+        {
+            encoded := from_utf8(value, &mut unused, &mut self.buffer()[offset..])?
+        }
+        self.used += required
+        return ok()
+    }
+    pub fn get(&self) -> NativeList!error.Error {
+        return NativeList.new(&self.units()[..self.used])
+    }
+    pub fn buffer(&mut self) -> &mut[u16] {
+        unsafe {
+            address := ptr.from_mut(&mut self.data) as *mut u16
+            capacity := self.data.len * 8 / mem.size_of::<u16>()
+            return ptr.borrow_slice_mut(address, capacity, self)
+        }
+    }
+    fn units(&self) -> &[u16] {
+        unsafe {
+            return ptr.borrow_slice(ptr.from_ref(&self.data) as *const u16, self.data.len * 8 / mem.size_of::<u16>(), self)
+        }
+    }
+    pub fn commit(&mut self, used: usize) -> void!error.Error {
+        if used > LIST_CAPACITY {
+            return err(error.failure(error.Kind.BufferTooSmall))
+        }
+        {
+            value := NativeList.new(&self.units()[..used])?
+        }
+        self.used = used
+        return ok()
+    }
+}
+
 fn read_handle(handle: isize, output: &mut[u8]) -> usize!io.Error {
     if output.len == 0 {
         return ok(0)

@@ -597,6 +597,54 @@ pub fn seek<S>(stream: &mut S, position: usize) -> usize!Error {
     return stream.seek(position)
 }
 
+// Read a bounded whole stream. A one-byte probe distinguishes exact capacity
+// from exhaustion (including zero-capacity empty streams). The probe byte is
+// consumed and discarded. Errors retain destination[..transferred]; bytes
+// beyond that prefix have no output contract. Interrupted progress is retained.
+pub struct ReadReport {
+    pub read: usize
+    pub eof: bool
+}
+pub fn read_bounded<R>(reader: &mut R, destination: &mut[u8]) -> ReadReport!Error {
+    used := 0usize
+    for used < destination.len {
+        match read_once(reader, &mut destination[used..]) {
+            ok(count) => {
+                if count == 0 {
+                    return ok(ReadReport { read: used, eof: true })
+                }
+                used += count
+            }
+            err(reason) => {
+                used += reason.transferred
+                if reason.kind != ErrorKind.Interrupted {
+                    reason.transferred = used
+                    return err(reason)
+                }
+            }
+        }
+    }
+    probe := [0u8; 1]
+    for true {
+        match read_once(reader, &mut probe) {
+            ok(count) => {
+                return ok(ReadReport { read: used, eof: count == 0 })
+            }
+            err(reason) => {
+                if reason.kind == ErrorKind.Interrupted {
+                    if reason.transferred != 0 {
+                        return ok(ReadReport { read: used, eof: false })
+                    }
+                } else {
+                    reason.transferred = used
+                    return err(reason)
+                }
+            }
+        }
+    }
+    return err(failure(ErrorKind.Other, used))
+}
+
 // Line bytes include the terminating LF (and any preceding CR). No decoding,
 // allocation, read-ahead, or discarded bytes. Full means the buffer filled
 // without LF; EOF has not been probed. Continue with another buffer to resume.

@@ -118,14 +118,14 @@ transports when `must_close(now)` becomes true. `drained()` confirms all admissi
 were released. The gate requires exclusive mutable access; concurrent execution
 must select explicit synchronization. It is not an implicit worker pool.
 
-The [web server example](https://github.com/Jotrorox/dodo/blob/main/examples/web_server.dodo)
+The [web server example](https://github.com/Jotrorox/dodo/blob/main/examples/web_server_polling.dodo)
 demonstrates bounded serial execution: one connection, fixed buffers, a 30 s
 absolute deadline, routing/error responses, streaming, TCP half-close and cleanup.
 The [client](https://github.com/Jotrorox/dodo/blob/main/examples/http_client.dodo)
 consumes its response with a five-second deadline. Run these in two terminals:
 
 ```sh
-dodo run examples/web_server.dodo
+dodo run examples/web_server_polling.dodo
 dodo run examples/http_client.dodo
 ```
 
@@ -167,3 +167,11 @@ Native Windows filesystem/sharing behavior still merits verification.
 HTTP/2, HTTP/3/QUIC, WebSockets, cookies, multipart, compression and serialization
 integrations are separate extension work. HTTPS uses an independently supplied
 [TLS transport](tls.md); HTTP types and routing never select it implicitly.
+
+## Hosted convenience layer
+
+For short applications with library-owned connection, readiness, deadline, and
+body-transfer loops, see [Hosted HTTP and HTTPS](hosted-http.md). It includes
+bounded HTTP and verified HTTPS clients, a serial web server, and complete
+local examples. The protocol and routing APIs on this page remain usable
+independently.

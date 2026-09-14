@@ -1,0 +1,153 @@
+package web_server
+import "core/bytes"
+import "std/net"
+import "std/net/native"
+import "std/http"
+import "std/http/connection"
+import "std/http/server" as limits
+import "std/web"
+import "std/web/server"
+import "std/io"
+
+// One connection, one request, fixed memory, then graceful close. Run this and
+// http_client.dodo in separate terminals, or request http://127.0.0.1:8080/.
+pub struct Hello {
+    head_only: bool
+    pub fn head(&mut self, context: &mut web.Context) -> void!web.Error {
+        self.head_only = bytes.equal(context.method, b"HEAD")
+        return ok()
+    }
+    pub fn poll_write(&mut self, body: &[u8]) -> io.Poll!io.Error {
+        return ok(io.Poll { state: io.PollState.Ready, transferred: body.len })
+    }
+    pub fn complete(&mut self, driver: &mut connection.Connection) -> void!connection.Error {
+        headers := [http.Header { name: b"Content-Type", value: b"text/plain; charset=utf-8" },
+        http.Header { name: b"Connection", value: b"close" }]
+        response := http.Response { status: 200, reason: b"OK", headers: &headers, body: http.Body.sized(13) }
+        return driver.response(&response)
+    }
+}
+fn serve(stream: &mut native.TcpConnection, clock: &mut native.MonotonicClock, deadline: u64) -> i32!connection.Error {
+    workspace := [0u8; 8192]
+    input := [0u8; 1024]
+    output := [0u8; 1024]
+    path := [0u8; 2048]
+    driver := connection.Connection.new(http.Role.Request, &mut workspace, &mut input, &mut output, http.Limits.defaults())?
+    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
+    application: server.Application
+    match server.Application.new(&routes, &mut path) {
+        ok(value) => {
+            application = value
+        }
+        err(_) => {
+            return ok(2)
+        }
+    }
+    handler := Hello { head_only: false }
+    observer := server.NoObserver {}
+    for true {
+        driver.check(clock.now_ms(), deadline, false)?
+        match application.step(&mut driver, stream, &mut handler, &mut observer) {
+            ok(step) => {
+                if step == server.Step.RequestComplete {
+                    break
+                }
+                if step == server.Step.Pending {
+                    match stream.wait_ready(net.Interest.Read, 10) {
+                        ok(_) => {}
+                        err(_) => {
+                            return ok(3)
+                        }
+                    }
+                }
+            }
+            err(reason) => {
+                policy := web.ErrorResponses.defaults()
+                headers: [0]http.Header = []
+                response := http.Response { status: policy.status(reason), reason: b"", headers: &headers, body: http.Body.empty() }
+                driver.response(&response)?
+                handler.head_only = true
+                break
+            }
+        }
+    }
+    for driver.pending_output() != 0 {
+        driver.check(clock.now_ms(), deadline, false)?
+        progress := driver.poll_flush(stream)?
+        match stream.wait_ready(net.Interest.Write, 10) {
+            ok(_) => {}
+            err(_) => {
+                return ok(4)
+            }
+        }
+    }
+    if!handler.head_only {
+        count := driver.send_body(b"Hello, Dodo!\n")?
+        if count != 13 {
+            return ok(5)
+        }
+        for driver.pending_output() != 0 {
+            driver.check(clock.now_ms(), deadline, false)?
+            progress := driver.poll_flush(stream)?
+            match stream.wait_ready(net.Interest.Write, 10) {
+                ok(_) => {}
+                err(_) => {
+                    return ok(6)
+                }
+            }
+        }
+    }
+    trailers: [0]http.Header = []
+    driver.finish_body(&trailers)?
+    return ok(0)
+}
+fn run() -> i32!net.Error {
+    address := net.parse_socket(b"127.0.0.1:8080")?
+    listener := native.TcpListener.bind(&address, 8)?
+    clock := native.MonotonicClock {}
+    deadline := clock.now_ms() + 30000
+    gate := limits.Server.new(1)
+    for clock.now_ms() < deadline {
+        match listener.accept()? {
+            some(stream) => {
+                match gate.admit() {
+                    ok() => {}
+                    err(_) => {
+                        return ok(7)
+                    }
+                }
+                gate.begin_shutdown(deadline)
+                result := 8i32
+                match serve(&mut stream, &mut clock, deadline) {
+                    ok(code) => {
+                        result = code
+                    }
+                    err(_) => {}
+                }
+                stream.shutdown(net.Shutdown.Write)?
+                stream.close()?
+                match gate.release() {
+                    ok() => {}
+                    err(_) => {
+                        return ok(9)
+                    }
+                }
+                return ok(result)
+            }
+            none => {
+                ready := listener.wait_ready(10)?
+            }
+        }
+    }
+    return ok(10)
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

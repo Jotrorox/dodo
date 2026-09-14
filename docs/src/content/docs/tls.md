@@ -170,3 +170,11 @@ It executes four real PE fixtures under Wine: both client/server engines and
 both HTTPS loopback optimization levels. Native Windows deployment still needs checks
 of installed OpenSSL trust paths, provider loading and operating-system entropy
 behavior; Wine cannot establish those native-environment properties.
+
+## Hosted convenience layer
+
+For short applications with library-owned connection, readiness, deadline, and
+body-transfer loops, see [Hosted HTTP and HTTPS](hosted-http.md). It includes
+bounded HTTP and verified HTTPS clients, a serial web server, and complete
+local examples. The protocol and routing APIs on this page remain usable
+independently.

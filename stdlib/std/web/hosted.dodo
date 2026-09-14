@@ -1,0 +1,445 @@
+package hosted
+
+import "core/bytes"
+import "core/slice"
+import "std/http"
+import "std/http/connection"
+import "std/http/hosting"
+import "std/io"
+import "std/net"
+import "std/net/native"
+import "std/web"
+
+// Parser/input/output/path plus caller-sized request and response storage.
+pub const WORKSPACE_BYTES: usize = 38912
+pub struct Config {
+    pub backlog: u32
+    pub header_bytes: usize
+    pub header_fields: usize
+    pub body_bytes: usize
+    pub response_bytes: usize
+    pub header_timeout_ms: u64
+    pub body_timeout_ms: u64
+    pub request_timeout_ms: u64
+    pub write_timeout_ms: u64
+    // Zero means serve until cancelled. One request per accepted connection.
+    pub max_connections: usize
+    pub fn defaults() -> Config {
+        return Config { backlog: 16, header_bytes: 16384, header_fields: 100,
+        body_bytes: 65536, response_bytes: 65536, header_timeout_ms: 10000,
+        body_timeout_ms: 30000, request_timeout_ms: 30000, write_timeout_ms: 30000, max_connections: 0 }
+    }
+    pub fn limits(&self, capacity: usize) -> http.Limits {
+        limits := http.Limits.defaults()
+        limits.header_bytes = self.header_bytes
+        limits.header_fields = self.header_fields
+        limits.body_bytes = self.body_bytes as u64
+        if capacity < self.body_bytes {
+            limits.body_bytes = capacity as u64
+        }
+        return limits
+    }
+}
+pub struct Report {
+    pub accepted: usize
+    pub completed: usize
+    pub rejected: usize
+    pub failed: usize
+    pub cancelled: bool
+}
+// Convenience for the ordinary structural handler's output writer.
+pub fn text<W>(output: &mut W, body: &[u8]) -> u16!web.Error {
+    match io.write_all(output, body) {
+        ok(_) => {
+            return ok(200)
+        }
+        err(_) => {
+            return err(web.Error.BufferFull)
+        }
+    }
+}
+pub struct Text {
+    body: &[u8]
+    pub fn new(body: &[u8]) -> Text from(body) {
+        return Text { body: body }
+    }
+    pub fn handle<B, W>(&mut self, context: &mut web.Context, body: &mut B, output: &mut W) -> u16!web.Error {
+        return text(output, self.body)
+    }
+}
+fn status(reason: &hosting.Error) -> u16 {
+    if reason.kind == hosting.ErrorKind.BodyLimit {
+        return 413
+    }
+    if reason.kind == hosting.ErrorKind.HeaderLimit {
+        return 431
+    }
+    if reason.kind == hosting.ErrorKind.TimedOut {
+        return 408
+    }
+    if reason.kind == hosting.ErrorKind.Handler {
+        return 500
+    }
+    return 400
+}
+// Fresh serialization is intentional: parser errors permanently poison the
+// connection driver. No output from a failed serializer is ever transmitted.
+pub fn error_response<S, C, X>(stream: &mut S, code: u16, output: &mut[u8], clock: &mut C, cancel: &X, until: u64) -> void!hosting.Error {
+    headers := [http.Header { name: b"Connection", value: b"close" }]
+    response := http.Response { status: code, reason: b"", headers: &headers, body: http.Body.empty() }
+    count := 0usize
+    match http.write_response(&response, output) {
+        ok(value) => {
+            count = value
+        }
+        err(reason) => {
+            return err(hosting.protocol_error(reason))
+        }
+    }
+    return hosting.write(stream, &output[..count], clock, cancel, until)
+}
+fn routed_status(reason: web.Error) -> u16 {
+    if reason == web.Error.NotFound {
+        return 404
+    }
+    if reason == web.Error.MethodNotAllowed {
+        return 405
+    }
+    if reason == web.Error.InvalidPath || reason == web.Error.InvalidMethod {
+        return 400
+    }
+    return 500
+}
+fn decode_target(target: &[u8], output: &mut[u8]) -> usize!hosting.Error {
+    uri: http.Uri
+    match http.Uri.parse(target) {
+        ok(value) => {
+            uri = value
+        }
+        err(reason) => {
+            return err(hosting.protocol_error(reason))
+        }
+    }
+    path := uri.path()
+    if path.len == 0 {
+        path = b"/"
+    }
+    match web.decode_path(path, output) {
+        ok(count) => {
+            return ok(count)
+        }
+        err(_) => {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+    }
+}
+// A request is buffered before dispatch. No unchecked callback borrow survives.
+// Handler.handle(&mut Context, &mut MemoryReader, &mut MemoryWriter)->u16!web.Error.
+// Callback execution itself is cooperative: checks occur before and after it.
+fn respond<S, H, C, X>(stream: &mut S, router: &web.Router, handler: &mut H, workspace: &mut[u8],
+request_body: &mut[u8], response_body: &mut[u8], config: &Config, request_id: u64,
+clock: &mut C, cancel: &X, response_started: &mut bool) -> bool!hosting.Error {
+    started := clock.now_ms()
+    request_until := hosting.deadline(started, config.request_timeout_ms)
+    phase_until := hosting.earlier(request_until, hosting.deadline(started, config.header_timeout_ms))
+    let some(slice.SplitMut { left: parser, right: rest }) = slice.split_at_mut(workspace, 16384) else {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    let some(slice.SplitMut { left: input_buffer, right: rest_output }) = slice.split_at_mut(rest, 4096) else {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    let some(slice.SplitMut { left: transmit, right: path_buffer }) = slice.split_at_mut(rest_output, 16384) else {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    driver: connection.Connection
+    match connection.Connection.new(http.Role.Request, parser, input_buffer, transmit, config.limits(request_body.len)) {
+        ok(value) => {
+            driver = value
+        }
+        err(reason) => {
+            return err(hosting.connection_error(reason))
+        }
+    }
+    body_used := 0usize
+    path_used := 0usize
+    route_id := 0usize
+    head := false
+    expect_continue := false
+    for true {
+        hosting.check(clock, cancel, phase_until)?
+        event: http.Event
+        match driver.poll_event(stream) {
+            ok(value) => {
+                event = value
+            }
+            err(reason) => {
+                return err(hosting.connection_error(reason))
+            }
+        }
+        if event.kind == http.EventKind.Header {
+            name: &[u8]
+            value: &[u8]
+            match driver.field(event.name_offset, event.name_length) {
+                ok(data) => {
+                    name = data
+                }
+                err(reason) => {
+                    return err(hosting.protocol_error(reason))
+                }
+            }
+            match driver.field(event.value_offset, event.value_length) {
+                ok(data) => {
+                    value = data
+                }
+                err(reason) => {
+                    return err(hosting.protocol_error(reason))
+                }
+            }
+            if http.equal_ascii(name, b"Expect") {
+                if!http.equal_ascii(value, b"100-continue") {
+                    return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+                }
+                expect_continue = true
+            }
+        }
+        if event.kind == http.EventKind.HeadersComplete {
+            phase_until = hosting.earlier(request_until, hosting.deadline(clock.now_ms(), config.body_timeout_ms))
+            path_used = decode_target(driver.target(), &mut path_buffer[..2048])?
+            match router.find(driver.method(), &path_buffer[..path_used]) {
+                ok(found) => {
+                    route_id = found.id;
+                    head = found.head
+                }
+                err(reason) => {
+                    code := routed_status(reason)
+                    core.drop(driver)
+                    *response_started = true
+                    write_until := hosting.earlier(request_until, hosting.deadline(clock.now_ms(), config.write_timeout_ms))
+                    error_response(stream, code, transmit, clock, cancel, write_until)?
+                    return ok(false)
+                }
+            }
+            if expect_continue {
+                headers: [0]http.Header = []
+                interim := http.Response { status: 100, reason: b"Continue", headers: &headers, body: http.Body.empty() }
+                match driver.informational(&interim) {
+                    ok() => {}
+                    err(reason) => {
+                        return err(hosting.connection_error(reason))
+                    }
+                }
+                hosting.flush(&mut driver, stream, clock, cancel, phase_until)?
+            }
+        }
+        if event.kind == http.EventKind.Body {
+            count := driver.body().len
+            if count > request_body.len - body_used {
+                return err(hosting.failure(hosting.ErrorKind.BodyLimit))
+            }
+            match bytes.copy_from(&mut request_body[body_used..body_used + count], driver.body()) {
+                ok() => {}
+                err(_) => {
+                    return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+                }
+            }
+            body_used += count
+            match driver.consume_body(count) {
+                ok() => {}
+                err(reason) => {
+                    return err(hosting.connection_error(reason))
+                }
+            }
+        }
+        if event.kind == http.EventKind.Upgrade {
+            return err(hosting.failure(hosting.ErrorKind.Protocol))
+        }
+        if event.kind == http.EventKind.Complete {
+            break
+        }
+        if event.kind == http.EventKind.NeedInput && driver.unread().len == 0 {
+            hosting.wait(stream, false, clock, cancel, phase_until)?
+        }
+    }
+    hosting.check(clock, cancel, request_until)?
+    input := io.MemoryReader.new(&request_body[..body_used])
+    capacity := response_body.len
+    if capacity > config.response_bytes {
+        capacity = config.response_bytes
+    }
+    output := io.MemoryWriter.new(&mut response_body[..capacity])
+    context := web.Context { method: driver.method(), path: &path_buffer[..path_used],
+    route_id: route_id, request_id: request_id, cancelled: false }
+    code := 500u16
+    match web.handle(handler, &mut context, &mut input, &mut output) {
+        ok(value) => {
+            code = value
+        }
+        err(reason) => {
+            core.drop(context)
+            core.drop(driver)
+            *response_started = true
+            write_until := hosting.earlier(request_until, hosting.deadline(clock.now_ms(), config.write_timeout_ms))
+            error_response(stream, routed_status(reason), transmit, clock, cancel, write_until)?
+            return ok(false)
+        }
+    }
+    core.drop(context)
+    hosting.check(clock, cancel, request_until)?
+    if code < 200 || code > 599 {
+        return err(hosting.failure(hosting.ErrorKind.Handler))
+    }
+    headers := [http.Header { name: b"Content-Type", value: b"text/plain; charset=utf-8" },
+    http.Header { name: b"Connection", value: b"close" }]
+    framing := http.Body.sized(output.position() as u64)
+    if code == 204 {
+        framing = http.Body.empty()
+    }
+    response := http.Response { status: code, reason: b"", headers: &headers, body: framing }
+    match driver.response(&response) {
+        ok() => {}
+        err(reason) => {
+            return err(hosting.connection_error(reason))
+        }
+    }
+    until := hosting.earlier(request_until, hosting.deadline(clock.now_ms(), config.write_timeout_ms))
+    *response_started = true
+    if head || code == 204 || code == 304 {
+        hosting.send(&mut driver, stream, b"", clock, cancel, until)?
+    } else {
+        hosting.send(&mut driver, stream, output.written(), clock, cancel, until)?
+    }
+    return ok(true)
+}
+// An error response gets its own bounded write interval, even if request input
+// timed out. Cancellation skips that write and closes immediately.
+pub fn serve_connection<S, H, C, X>(stream: &mut S, router: &web.Router, handler: &mut H, workspace: &mut[u8],
+request_body: &mut[u8], response_body: &mut[u8], config: &Config, request_id: u64,
+clock: &mut C, cancel: &X) -> bool!hosting.Error {
+    if workspace.len < WORKSPACE_BYTES {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    response_started := false
+    match respond(stream, router, handler, workspace, request_body, response_body, config, request_id, clock, cancel, &mut response_started) {
+        ok(value) => {
+            return ok(value)
+        }
+        err(reason) => {
+            if!response_started && reason.kind != hosting.ErrorKind.Cancelled && reason.kind != hosting.ErrorKind.Transport {
+                until := hosting.deadline(clock.now_ms(), config.write_timeout_ms)
+                match error_response(stream, status(&reason), &mut workspace[20480..36864], clock, cancel, until) {
+                    ok() => {
+                        return ok(false)
+                    }
+                    err(_) => {}
+                }
+            }
+            return err(reason)
+        }
+    }
+}
+pub struct PlainAcceptor {
+    pub fn serve<H, C, X>(&mut self, socket: &mut native.TcpConnection, router: &web.Router, handler: &mut H,
+    workspace: &mut[u8], request_body: &mut[u8], response_body: &mut[u8], config: &Config,
+    request_id: u64, clock: &mut C, cancel: &X) -> bool!hosting.Error {
+        stream := hosting.Plain.new(socket)
+        return serve_connection(&mut stream, router, handler, workspace, request_body, response_body, config, request_id, clock, cancel)
+    }
+}
+pub fn serve<H>(address: &[u8], routes: &[web.Route], handler: &mut H, workspace: &mut[u8], request_body: &mut[u8],
+response_body: &mut[u8], config: Config) -> Report!hosting.Error {
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    acceptor := PlainAcceptor {}
+    return serve_with(address, routes, handler, workspace, request_body, response_body, config, &mut acceptor, &mut clock, &cancel)
+}
+// Bounded serial execution: one socket, one request, no task/thread/pool per peer.
+// Cooperative cancellation ends acceptance and aborts the current connection.
+// No callback or socket ownership survives this function, including error exits.
+pub fn serve_with<H, P, C, X>(address: &[u8], routes: &[web.Route], handler: &mut H, workspace: &mut[u8],
+request_body: &mut[u8], response_body: &mut[u8], config: Config, acceptor: &mut P,
+clock: &mut C, cancel: &X) -> Report!hosting.Error {
+    if workspace.len < WORKSPACE_BYTES {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    if config.header_bytes == 0 || config.header_bytes > 16384 || config.header_fields == 0 || config.header_fields > 100 ||
+        config.backlog == 0 || config.header_timeout_ms == 0 || config.body_timeout_ms == 0 ||
+        config.request_timeout_ms == 0 || config.write_timeout_ms == 0 {
+        return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+    }
+    router: web.Router
+    match web.Router.new(routes) {
+        ok(value) => {
+            router = value
+        }
+        err(_) => {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+    }
+    local: net.SocketAddress
+    match net.parse_socket(address) {
+        ok(value) => {
+            local = value
+        }
+        err(reason) => {
+            return err(hosting.network_error(reason, hosting.ErrorKind.InvalidInput))
+        }
+    }
+    listener: native.TcpListener
+    match native.TcpListener.bind(&local, config.backlog) {
+        ok(value) => {
+            listener = value
+        }
+        err(reason) => {
+            return err(hosting.network_error(reason, hosting.ErrorKind.Connect))
+        }
+    }
+    report := Report { accepted: 0, completed: 0, rejected: 0, failed: 0, cancelled: false }
+    for config.max_connections == 0 || report.accepted < config.max_connections {
+        if cancel.cancelled() {
+            report.cancelled = true;
+            return ok(report)
+        }
+        match listener.accept() {
+            err(reason) => {
+                if reason.kind != net.ErrorKind.Interrupted {
+                    return err(hosting.network_error(reason, hosting.ErrorKind.Transport))
+                }
+            }
+            ok(pending) => {
+                match pending {
+                    none => {
+                        match listener.wait_ready(10) {
+                            ok(_) => {}
+                            err(reason) => {
+                                if reason.kind != net.ErrorKind.Interrupted {
+                                    return err(hosting.network_error(reason, hosting.ErrorKind.Transport))
+                                }
+                            }
+                        }
+                    }
+                    some(socket) => {
+                        report.accepted += 1
+                        match acceptor.serve(&mut socket, &router, handler, workspace, request_body, response_body,
+                        &config, report.accepted as u64, clock, cancel) {
+                            ok(completed) => {
+                                if completed {
+                                    report.completed += 1
+                                } else {
+                                    report.rejected += 1
+                                }
+                            }
+                            err(reason) => {
+                                if reason.kind == hosting.ErrorKind.Cancelled {
+                                    report.cancelled = true;
+                                    return ok(report)
+                                }
+                                report.failed += 1
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return ok(report)
+}

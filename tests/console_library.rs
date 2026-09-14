@@ -188,11 +188,15 @@ fn console_is_embedded_and_only_selects_the_platform_boundary() {
         .0
         .join(format!("installed-dodo{}", std::env::consts::EXE_SUFFIX));
     fs::copy(env!("CARGO_BIN_EXE_dodo"), &compiler).unwrap();
+    let relocated = work.source(
+        "relocated",
+        "package relocated\nimport \"std/console\"\nfn main() -> i32 { match console.println(\"Hello, world!\") { ok(_) => { return 0 } err(_) => { return 1 } } }\n",
+    );
     let output = success(
         Command::new(&compiler)
             .current_dir(&work.0)
             .arg("run")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/hello.dodo"))
+            .arg(&relocated)
             .output()
             .unwrap(),
     );

@@ -1,0 +1,65 @@
+package hosted_server_checks
+import "std/console"
+import "std/http/hosting"
+import "std/io"
+import "std/net/native"
+import "std/web"
+import "std/web/hosted"
+
+// Harness substitutes values; the source remains valid for ordinary check/fmt.
+const TEST_COUNT: usize = 0
+const TEST_STOP: u64 = 30000
+
+pub struct Handler {
+    pub fn handle<B, W>(&mut self, context: &mut web.Context, body: &mut B, output: &mut W) -> u16!web.Error {
+        if context.route_id == 2 { return err(web.Error.Handler) }
+        if context.route_id == 1 {
+            storage := [0u8; 32]
+            count := 0usize
+            match io.read_up_to(body, &mut storage) {
+                ok(value) => { count = value }
+                err(_) => { return err(web.Error.Handler) }
+            }
+            return hosted.text(output, &storage[..count])
+        }
+        return hosted.text(output, b"Hello, Dodo!\n")
+    }
+}
+pub struct Stop {
+    until: u64
+    pub fn cancelled(&self) -> bool {
+        clock := native.MonotonicClock {}
+        return clock.now_ms() >= self.until
+    }
+}
+fn main() -> i32 {
+    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 },
+        web.Route { method: b"POST", pattern: b"/echo", id: 1 },
+        web.Route { method: b"GET", pattern: b"/fail", id: 2 }]
+    handler := Handler {}
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    request := [0u8; 32]
+    response := [0u8; 32]
+    config := hosted.Config.defaults()
+    config.max_connections = TEST_COUNT
+    config.header_bytes = 512
+    config.header_timeout_ms = 200
+    config.body_timeout_ms = 200
+    config.write_timeout_ms = 200
+    clock := native.MonotonicClock {}
+    stop := Stop { until: clock.now_ms() + TEST_STOP }
+    acceptor := hosted.PlainAcceptor {}
+    match hosted.serve_with(b"127.0.0.1:@@PORT@@", &routes, &mut handler, &mut workspace, &mut request, &mut response,
+        config, &mut acceptor, &mut clock, &stop) {
+        ok(report) => {
+            assert(report.accepted == TEST_COUNT || report.cancelled)
+            assert(report.failed == 0)
+            return 0
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println_value(&reason) { ok(_) => {} err(_) => {} }
+            return 1
+        }
+    }
+}

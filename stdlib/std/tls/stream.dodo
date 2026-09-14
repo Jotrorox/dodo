@@ -1,5 +1,6 @@
 package stream
 
+import "core/option"
 import "std/io"
 import "std/tls"
 
@@ -16,6 +17,7 @@ pub struct Stream<E, T> {
     output_start: usize
     output_end: usize
     failed: bool
+    last_error: Option<tls.Error>
     transport_eof: bool
     pub fn new(engine: E, transport: &mut T, incoming: &mut[u8], outgoing: &mut[u8]) -> Stream<E, T>!tls.Error from(transport, incoming, outgoing) {
         if incoming.len == 0 || outgoing.len == 0 {
@@ -23,7 +25,7 @@ pub struct Stream<E, T> {
         }
         return ok(Stream<E, T> { engine: engine, transport: transport,
         incoming: incoming, outgoing: outgoing, input_start: 0,
-        input_end: 0, output_start: 0, output_end: 0, failed: false, transport_eof: false })
+        input_end: 0, output_start: 0, output_end: 0, failed: false, last_error: none, transport_eof: false })
     }
     pub fn pump(&mut self) -> bool!tls.Error {
         if self.failed {
@@ -41,8 +43,13 @@ pub struct Stream<E, T> {
                     progressed = progress.transferred != 0
                 }
                 err(reason) => {
-                    self.failed = true
-                    return err(tls.failure(tls.ErrorKind.Transport, reason.code))
+                    if reason.kind == io.ErrorKind.Interrupted {
+                        self.output_start += reason.transferred
+                        progressed = reason.transferred != 0
+                    } else {
+                        self.failed = true
+                        return err(tls.failure(tls.ErrorKind.Transport, reason.code))
+                    }
                 }
             }
         }
@@ -57,8 +64,12 @@ pub struct Stream<E, T> {
                     }
                 }
                 err(reason) => {
-                    self.failed = true
-                    return err(tls.failure(tls.ErrorKind.Transport, reason.code))
+                    if reason.kind == io.ErrorKind.Interrupted {
+                        self.input_end = reason.transferred
+                    } else {
+                        self.failed = true
+                        return err(tls.failure(tls.ErrorKind.Transport, reason.code))
+                    }
                 }
             }
         }
@@ -93,13 +104,23 @@ pub struct Stream<E, T> {
         }
         return self.handshake()
     }
+    // Preserve the typed TLS cause when adapting to the std/io contract.
+    pub fn take_error(&mut self) -> Option<tls.Error> { return option.take(&mut self.last_error) }
+    fn io_failure(&mut self, reason: tls.Error) -> io.Error {
+        kind := io.ErrorKind.Other
+        if reason.kind == tls.ErrorKind.InvalidInput { kind = io.ErrorKind.InvalidInput }
+        if reason.kind == tls.ErrorKind.Truncated { kind = io.ErrorKind.UnexpectedEof }
+        mapped := io.Error { kind: kind, code: reason.code, transferred: reason.transferred }
+        self.last_error = some(reason)
+        return mapped
+    }
     pub fn poll_read(&mut self, destination: &mut[u8]) -> io.Poll!io.Error {
         if destination.len == 0 {
             return ok(io.Poll { transferred: 0, state: io.PollState.Ready })
         }
         match self.pump() {
             ok(_) => {}, err(reason) => {
-                return err(tls.io_error(reason))
+                return err(self.io_failure(reason))
             }
         }
         match self.engine.read_plain(destination) {
@@ -107,7 +128,7 @@ pub struct Stream<E, T> {
                 return ok(tls.poll(progress))
             }
             err(reason) => {
-                return err(tls.io_error(reason))
+                return err(self.io_failure(reason))
             }
         }
     }
@@ -117,7 +138,7 @@ pub struct Stream<E, T> {
         }
         match self.pump() {
             ok(_) => {}, err(reason) => {
-                return err(tls.io_error(reason))
+                return err(self.io_failure(reason))
             }
         }
         match self.engine.write_plain(source) {
@@ -125,7 +146,7 @@ pub struct Stream<E, T> {
                 return ok(tls.poll(progress))
             }
             err(reason) => {
-                return err(tls.io_error(reason))
+                return err(self.io_failure(reason))
             }
         }
     }
@@ -176,6 +197,10 @@ pub struct Stream<E, T> {
         }
         return ok(progress)
     }
+    // Checked read-only transport access enables hosted readiness without
+    // extending the portable polling transport contract.
+    pub fn transport(&self) -> &T from(self) { return self.transport }
+    pub fn output_pending(&self) -> bool { return self.output_start != self.output_end }
     pub fn abort(&mut self) {
         self.failed = true
         self.engine.abort()

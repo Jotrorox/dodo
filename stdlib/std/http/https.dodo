@@ -1,0 +1,256 @@
+package https
+
+import "std/http"
+import "std/http/hosted"
+import "std/http/hosting"
+import "std/io"
+import "std/net"
+import "std/net/native"
+import "std/tls"
+import "std/tls/openssl"
+import "std/tls/stream"
+import "std/web"
+import "std/web/hosted" as server
+
+// Import selects OpenSSL >=3.5, including its internal heap allocations.
+// Caller staging is bounded. Trust uses OpenSSL paths, not the Windows store.
+pub struct Trust {
+    pub pem: &[u8]
+    pub system_roots: bool
+    pub fn system() -> Trust from(static) {
+        return Trust { pem: b"", system_roots: true }
+    }
+    pub fn pem_roots(pem: &[u8]) -> Trust from(pem) {
+        return Trust { pem: pem, system_roots: false }
+    }
+}
+pub struct Transport {
+    inner: stream.Stream<openssl.Engine, native.TcpConnection>
+    pub fn new(engine: openssl.Engine, socket: &mut native.TcpConnection, incoming: &mut[u8], outgoing: &mut[u8]) -> Transport!hosting.Error from(socket, incoming, outgoing) {
+        match stream.Stream.new(engine, socket, incoming, outgoing) {
+            ok(value) => {
+                return ok(Transport { inner: value })
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+    }
+    pub fn handshake<C, X>(&mut self, clock: &mut C, cancel: &X, until: u64) -> void!hosting.Error {
+        for true {
+            hosting.check(clock, cancel, until)?
+            match self.inner.handshake() {
+                ok(state) => {
+                    if state == tls.State.Ready {
+                        return ok()
+                    }
+                    if state == tls.State.Closed {
+                        return err(hosting.failure(hosting.ErrorKind.Tls))
+                    }
+                }
+                err(reason) => {
+                    return err(hosting.tls_error(reason))
+                }
+            }
+            hosting.wait(self, false, clock, cancel, until)?
+        }
+        return err(hosting.failure(hosting.ErrorKind.Tls))
+    }
+    pub fn poll_read(&mut self, data: &mut[u8]) -> io.Poll!io.Error {
+        return self.inner.poll_read(data)
+    }
+    pub fn poll_write(&mut self, data: &[u8]) -> io.Poll!io.Error {
+        return self.inner.poll_write(data)
+    }
+    pub fn flush(&mut self) -> bool!hosting.Error {
+        match self.inner.flush() {
+            ok(state) => {
+                return ok(state == tls.State.Ready)
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+    }
+    pub fn wait(&mut self, writing: bool, milliseconds: u32) -> void!hosting.Error {
+        match self.inner.pump() {
+            ok(progressed) => {
+                if progressed {
+                    return ok()
+                }
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+        interest := net.Interest.Read
+        if self.inner.output_pending() {
+            interest = net.Interest.Write
+        }
+        match self.inner.transport().wait_ready(interest, milliseconds) {
+            ok(_) => {
+                return ok()
+            }
+            err(reason) => {
+                if reason.kind == net.ErrorKind.Interrupted {
+                    return ok()
+                }
+                return err(hosting.network_error(reason, hosting.ErrorKind.Transport))
+            }
+        }
+    }
+    // Deliver our close_notify, without waiting for the peer's reply. Errors
+    // still abort on drop; HTTP framing determines successful body completion.
+    pub fn finish<C, X>(&mut self, clock: &mut C, cancel: &X, until: u64) -> void!hosting.Error {
+        hosting.check(clock, cancel, until)?
+        match self.inner.shutdown() {
+            ok(_) => {}
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+        for true {
+            hosting.check(clock, cancel, until)?
+            if self.flush()? {
+                return ok()
+            }
+            hosting.wait(self, true, clock, cancel, until)?
+        }
+        return err(hosting.failure(hosting.ErrorKind.Tls))
+    }
+}
+// Public connector for Client.request_with; it also accepts plain HTTP URLs.
+pub struct Connector {
+    trust: Trust
+    pub fn new(trust: Trust) -> Connector from(trust) {
+        return Connector { trust: trust }
+    }
+    pub fn exchange<W, C, X>(&mut self, socket: &mut native.TcpConnection, host: &[u8], secure: bool,
+    request: &http.Request, body: &[u8], workspace: &mut[u8], config: &hosted.Config, head: &mut hosted.Head,
+    sink: &mut W, clock: &mut C, cancel: &X, until: u64, delivered: &mut u64) -> hosted.Response!hosting.Error {
+        if!secure {
+            plain := hosted.PlainConnector {}
+            return plain.exchange(socket, host, false, request, body, workspace, config, head, sink, clock, cancel, until, delivered)
+        }
+        settings := openssl.Config.client(host)
+        settings.system_roots = self.trust.system_roots
+        settings.trust_pem = self.trust.pem
+        settings.alpn = b"\x08http/1.1"
+        engine: openssl.Engine
+        match openssl.Engine.client(&settings) {
+            ok(value) => {
+                engine = value
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+        incoming := [0u8; 4096]
+        outgoing := [0u8; 4096]
+        transport := Transport.new(engine, socket, &mut incoming, &mut outgoing)?
+        transport.handshake(clock, cancel, until)?
+        match hosted.exchange(&mut transport, request, body, workspace, config, head, sink, clock, cancel, until, delivered) {
+            ok(response) => {
+                transport.finish(clock, cancel, until)?
+                return ok(response)
+            }
+            err(reason) => {
+                match transport.inner.take_error() {
+                    some(cause) => {
+                        return err(hosting.tls_error(cause))
+                    }
+                    none => {
+                        return err(reason)
+                    }
+                }
+            }
+        }
+    }
+}
+pub struct Client {
+    inner: hosted.Client
+    connector: Connector
+    pub fn new(workspace: &mut[u8], config: hosted.Config, trust: Trust) -> Client!hosting.Error from(workspace, trust) {
+        return ok(Client { inner: hosted.Client.new(workspace, config)?, connector: Connector.new(trust) })
+    }
+    pub fn header(&self, name: &[u8], occurrence: usize) -> Option<http.Header> from(self) {
+        return self.inner.header(name, occurrence)
+    }
+    pub fn get(&mut self, url: &[u8], storage: &mut[u8]) -> hosted.Response!hosting.Error {
+        sink := io.MemoryWriter.new(storage)
+        return self.get_to(url, &mut sink)
+    }
+    pub fn get_to<W>(&mut self, url: &[u8], sink: &mut W) -> hosted.Response!hosting.Error {
+        headers: [0]http.Header = []
+        request := hosted.Request { url: url, method: b"GET", headers: &headers, body: b"" }
+        return self.request(&request, sink)
+    }
+    pub fn request<W>(&mut self, request: &hosted.Request, sink: &mut W) -> hosted.Response!hosting.Error {
+        resolver := hosted.SystemResolver {}
+        clock := native.MonotonicClock {}
+        cancel := net.NeverCancel {}
+        return self.request_with(request, sink, &mut resolver, &mut clock, &cancel)
+    }
+    pub fn request_with<W, R, C, X>(&mut self, request: &hosted.Request, sink: &mut W,
+    resolver: &mut R, clock: &mut C, cancel: &X) -> hosted.Response!hosting.Error {
+        return self.inner.request_with(request, sink, resolver, &mut self.connector, clock, cancel)
+    }
+}
+pub struct Acceptor {
+    config: openssl.Config
+    pub fn new(config: openssl.Config) -> Acceptor from(config) {
+        config.alpn = b"\x08http/1.1"
+        return Acceptor { config: config }
+    }
+    pub fn serve<H, C, X>(&mut self, socket: &mut native.TcpConnection, router: &web.Router, handler: &mut H,
+    workspace: &mut[u8], request_body: &mut[u8], response_body: &mut[u8], config: &server.Config,
+    request_id: u64, clock: &mut C, cancel: &X) -> bool!hosting.Error {
+        until := hosting.deadline(clock.now_ms(), config.header_timeout_ms)
+        engine: openssl.Engine
+        match openssl.Engine.server(&self.config) {
+            ok(value) => {
+                engine = value
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+        incoming := [0u8; 4096]
+        outgoing := [0u8; 4096]
+        transport := Transport.new(engine, socket, &mut incoming, &mut outgoing)?
+        transport.handshake(clock, cancel, until)?
+        response := false
+        match server.serve_connection(&mut transport, router, handler, workspace, request_body, response_body, config, request_id, clock, cancel) {
+            ok(value) => {
+                response = value
+            }
+            err(reason) => {
+                match transport.inner.take_error() {
+                    some(cause) => {
+                        return err(hosting.tls_error(cause))
+                    }
+                    none => {
+                        return err(reason)
+                    }
+                }
+            }
+        }
+        close_until := hosting.deadline(clock.now_ms(), config.write_timeout_ms)
+        transport.finish(clock, cancel, close_until)?
+        return ok(response)
+    }
+}
+pub fn serve<H>(address: &[u8], routes: &[web.Route], handler: &mut H, workspace: &mut[u8], request_body: &mut[u8],
+response_body: &mut[u8], config: server.Config, identity: openssl.Config) -> server.Report!hosting.Error {
+    // Fail invalid credentials before binding, instead of silently rejecting every peer.
+    match openssl.Engine.server(&identity) {
+        ok(_) => {}
+        err(reason) => {
+            return err(hosting.tls_error(reason))
+        }
+    }
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    acceptor := Acceptor.new(identity)
+    return server.serve_with(address, routes, handler, workspace, request_body, response_body, config, &mut acceptor, &mut clock, &cancel)
+}

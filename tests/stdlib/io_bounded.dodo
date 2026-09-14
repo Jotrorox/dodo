@@ -1,0 +1,73 @@
+package io_bounded
+import "std/io"
+import "core/bytes"
+
+pub struct FailingReader {
+    step: usize
+    pub fn read(&mut self, output: &mut[u8]) -> usize!io.Error {
+        assert(output.len != 0)
+        self.step += 1
+        output[0] = (96 + self.step) as u8
+        if self.step == 1 {
+            return err(io.failure(io.ErrorKind.Interrupted, 1))
+        }
+        if self.step == 2 {
+            return ok(1)
+        }
+        return err(io.Error { kind: io.ErrorKind.Other, transferred: 1, code: 77 })
+    }
+}
+pub struct InterruptedProbe {
+    step: usize
+    pub fn read(&mut self, output: &mut[u8]) -> usize!io.Error {
+        self.step += 1
+        if self.step == 1 {
+            return err(io.failure(io.ErrorKind.Interrupted, 0))
+        }
+        output[0] = 1
+        return err(io.failure(io.ErrorKind.Interrupted, 1))
+    }
+}
+fn run() -> void!io.Error {
+    output := [0u8; 4]
+    exact := io.MemoryReader.new(b"ab")
+    report := io.read_bounded(&mut exact, &mut output[..2])?
+    assert(report.eof && report.read == 2)
+    assert(bytes.equal(&output[..2], b"ab"))
+    short := io.MemoryReader.new(b"abc")
+    truncated := io.read_bounded(&mut short, &mut output[..2])?
+    assert(!truncated.eof && truncated.read == 2 && short.position() == 3)
+    empty := io.MemoryReader.new(b"")
+    zero := io.read_bounded(&mut empty, &mut output[..0])?
+    assert(zero.eof && zero.read == 0)
+    for capacity in 2usize..5 {
+        failing := FailingReader { step: 0 }
+        match io.read_bounded(&mut failing, &mut output[..capacity]) {
+            ok(_) => {
+                assert(false)
+            }, err(reason) => {
+                retained := 3usize
+                if capacity == 2 {
+                    retained = 2
+                }
+                assert(reason.transferred == retained && reason.code == 77)
+                assert(bytes.equal(&output[..2], b"ab"))
+            }
+        }
+    }
+    probe := InterruptedProbe { step: 0 }
+    interrupted := io.read_bounded(&mut probe, &mut output[..0])?
+    assert(!interrupted.eof && interrupted.read == 0 && probe.step == 2)
+    return ok()
+}
+fn main() {
+    match run() {
+        ok() => {}, err(_) => {
+            assert(false)
+        }
+    }
+}
+@test
+fn bounded_read_contracts() {
+    main()
+}
