@@ -1,0 +1,48 @@
+package https_client
+import "std/console"
+import "std/fs"
+import "std/platform"
+import "std/http/hosted"
+import "std/http/hosting"
+import "std/http/https"
+
+// Run scripts/local_https.py first, then launch from its generated directory.
+fn run() -> i32!hosting.Error {
+    paths := platform.workspace()
+    roots := [0u8; 8192]
+    count := 0usize
+    match fs.read_file("ca.pem", &mut roots, &mut paths) {
+        ok(report) => {
+            if!report.eof {
+                return err(hosting.failure(hosting.ErrorKind.Workspace))
+            }
+            count = report.read
+        }
+        err(_) => {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+    }
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    client := https.Client.new(&mut workspace, hosted.Config.defaults(), https.Trust.pem_roots(&roots[..count]))?
+    output := console.stdout()
+    response := client.get_to(b"https://localhost:8443/", &mut output)?
+    if response.status != 200 {
+        return ok(2)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println_value(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            return 1
+        }
+    }
+}

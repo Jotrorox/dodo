@@ -1,0 +1,62 @@
+package hosted_tls_checks
+import "core/bytes"
+import "std/console"
+import "std/http/hosted"
+import "std/http/hosting"
+import "std/http/https"
+import "std/tls"
+
+fn rejected(url: &[u8], roots: &[u8]) -> void!hosting.Error {
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    client := https.Client.new(&mut workspace, hosted.Config.defaults(), https.Trust.pem_roots(roots))?
+    data := [0u8; 32]
+    match client.get(url, &mut data) {
+        ok(_) => { assert(false, "unverified peer accepted") }
+        err(reason) => {
+            assert(reason.kind == hosting.ErrorKind.Tls)
+            assert(reason.security.kind == tls.ErrorKind.VerificationFailed)
+        }
+    }
+    return ok()
+}
+fn timeout(roots: &[u8]) -> void!hosting.Error {
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    config := hosted.Config.defaults()
+    config.request_timeout_ms = 150
+    client := https.Client.new(&mut workspace, config, https.Trust.pem_roots(roots))?
+    data := [0u8; 32]
+    match client.get(b"https://localhost:@@TLS@@/timeout", &mut data) {
+        ok(_) => { assert(false, "stalled TLS response succeeded") }
+        err(reason) => { assert(reason.kind == hosting.ErrorKind.TimedOut) }
+    }
+    return ok()
+}
+fn run() -> void!hosting.Error {
+    roots := b"@@CA@@"
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    client := https.Client.new(&mut workspace, hosted.Config.defaults(), https.Trust.pem_roots(roots))?
+    data := [0u8; 32]
+    for i in 0usize..12 {
+        response := client.get(b"https://localhost:@@TLS@@/fragmented", &mut data)?
+        assert(response.status == 200 && response.body_bytes == 13)
+        assert(bytes.equal(&data[..13], b"Hello, Dodo!\n"))
+    }
+    match client.get(b"https://localhost:@@TLS@@/truncated", &mut data) {
+        ok(_) => { assert(false, "unclean TLS EOF accepted") }
+        err(reason) => { assert(reason.kind == hosting.ErrorKind.Tls && reason.security.kind == tls.ErrorKind.Truncated) }
+    }
+    timeout(roots)?
+    rejected(b"https://127.0.0.1:@@TLS@@/fast", roots)?
+    rejected(b"https://localhost:@@TLS@@/fast", b"")?
+    return ok()
+}
+fn main() -> i32 {
+    match run() {
+        ok() => { return 0 }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println_value(&reason) { ok(_) => {} err(_) => {} }
+            return 1
+        }
+    }
+}

@@ -204,7 +204,7 @@ reads. The same portable fixture emits objects for `wasm32-unknown-unknown` and
 
 `std/http/client.Client` wraps the bounded connection driver around an explicit
 origin and caller-owned parser/input/output buffers. The runnable
-[`examples/http_client.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/http_client.dodo)
+[`examples/http_client_polling.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/http_client_polling.dodo)
 connects to the bundled web-server example with `std/net/native`, passes its
 nonblocking stream to Client methods, and streams the response without allocating
 or buffering the complete body.
@@ -278,3 +278,11 @@ reusable completed connection. Check the current client deadline/cancellation
 before pool admission. Transport owners remain in the application's corresponding
 slots and must be closed when metadata becomes vacant. There is no global pool,
 allocation, or implicit transport destructor in this metadata layer.
+
+## Hosted convenience layer
+
+For short applications with library-owned connection, readiness, deadline, and
+body-transfer loops, see [Hosted HTTP and HTTPS](hosted-http.md). It includes
+bounded HTTP and verified HTTPS clients, a serial web server, and complete
+local examples. The protocol and routing APIs on this page remain usable
+independently.
