@@ -158,6 +158,22 @@ pub struct Duration {
     pub fn to_micros(&self) -> u64!TimeError {
         return self.units(1000000, 1000)
     }
+    // Rounded upward for wait budgets; unlike to_millis, never shortens a wait.
+    pub fn to_millis_ceil(&self) -> u64!TimeError {
+        whole := self.to_millis()?
+        if self.nanos % 1000000 != 0 {
+            return add_u(whole, 1)
+        }
+        return ok(whole)
+    }
+    // UINT64_MAX is reserved by hosted waits as the infinite sentinel.
+    pub fn timeout_millis(&self) -> u64!TimeError {
+        value := self.to_millis_ceil()?
+        if value == UMAX {
+            return err(TimeError.Overflow)
+        }
+        return ok(value)
+    }
     pub fn to_millis(&self) -> u64!TimeError {
         return self.units(1000, 1000000)
     }

@@ -1,0 +1,34 @@
+package hosted_files
+import "std/fs"
+import "std/platform"
+import "std/console"
+import "std/io"
+
+// Creates or truncates hosted-example.txt in the current directory.
+fn main() -> i32 {
+    workspace := platform.workspace()
+    match fs.write_file("hosted-example.txt", b"Hello, file!\n", &mut workspace) {
+        ok() => {}, err(_) => {
+            return 1
+        }
+    }
+    contents := [0u8; 64]
+    match fs.read_file("hosted-example.txt", &mut contents, &mut workspace) {
+        ok(report) => {
+            if!report.eof {
+                return 2
+            }
+            output := console.stdout()
+            match io.write_all(&mut output, &contents[..report.read]) {
+                ok(_) => {
+                    return 0
+                }, err(_) => {
+                    return 3
+                }
+            }
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

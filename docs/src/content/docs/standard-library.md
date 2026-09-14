@@ -274,3 +274,17 @@ including an unpacked installation with its complete data directory; no system
 installation change is required. Both scripts accept `--fixture` for a focused
 run and `--report PATH` for machine-readable validation records. The portable
 object runner checks all fixtures at O0 and O3 for WebAssembly and Cortex-M0.
+
+## Hosted conveniences
+
+Hosted applications can use UTF-8 strings and bounded reusable workspace owners:
+
+- [Filesystem](filesystem.md): `File.open_utf8`, `read_file`, and `write_file`.
+- [Environment and arguments](environment.md): `env.get` and `Arguments.capture`.
+- [Processes](processes.md): `CommandStorage`, `Command.arg`, and bounded `Command.output`.
+- [Native clocks](time.md#native-providers-and-elapsed-measurements): hosted monotonic and wall clocks.
+- [Console](console.md): borrowed standard streams, printing, and bounded line input.
+
+[Platform storage and complete examples](platform.md#complete-hosted-examples-and-storage)
+document capacities, retained output, defaults, timeout scope, and target differences.
+Portable packages remain usable independently; native byte and UTF-16 APIs remain available.

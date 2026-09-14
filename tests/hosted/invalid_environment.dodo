@@ -1,0 +1,50 @@
+package invalid_environment
+import "std/env"
+import "std/platform"
+import "std/platform/error"
+import "core/bytes"
+import "core/mem"
+fn run() -> void!error.Error {
+    workspace := env.Workspace.new()
+    output := [0u8; 3]
+    match env.get("DODO_NATIVE", &mut output, &mut workspace, platform.TextPolicy.Strict) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    match env.get("DODO_NATIVE", &mut output, &mut workspace, platform.TextPolicy.Replace)? {
+        none => {
+            assert(false)
+        }, some(value) => {
+            assert(bytes.equal(mem.str_bytes(value), b"\xef\xbf\xbd"))
+        }
+    }
+    strict_storage := platform.list_workspace()
+    strict := env.Arguments.capture(&mut strict_storage, platform.TextPolicy.Strict)?
+    match strict.get(1, &mut output) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    replacement_storage := platform.list_workspace()
+    replacement := env.Arguments.capture(&mut replacement_storage, platform.TextPolicy.Replace)?
+    match replacement.get(1, &mut output)? {
+        none => {
+            assert(false)
+        }, some(value) => {
+            assert(bytes.equal(mem.str_bytes(value), b"\xef\xbf\xbd"))
+        }
+    }
+    return ok()
+}
+fn main() {
+    match run() {
+        ok() => {}, err(_) => {
+            assert(false)
+        }
+    }
+}

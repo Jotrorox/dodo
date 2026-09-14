@@ -126,13 +126,6 @@ startup worker. OS/C-library calls may allocate internally; Dodo-managed dynamic
 payloads require explicit allocation APIs. Foundation packages have no mandatory
 OS dependency.
 
-Borrowed process standard streams are the exception to owning-handle cleanup:
-`native.stdin()`, `stdout()`, and `stderr()` return `BorrowedHandle`, which has
-no close operation or destructor. Prefer [std/console](console.md) for safe text
-printing and line input. Native-to-I/O conversion retains recoverable kinds,
-including `WouldBlock`, `Closed`, `PermissionDenied`, and `BrokenPipe`, as well
-as the native code.
-
 ## Complete hosted examples and storage
 
 The examples use safe public constructors and explicit caller storage. Compile

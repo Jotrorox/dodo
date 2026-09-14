@@ -100,6 +100,21 @@ int memcmp(const void *left, const void *right, size_t length) {
 void mainCRTStartup(void) { ExitProcess((unsigned int)dodo_main()); }
 '''
 
+
+def runtime_source(source):
+    """Match the fixture's Dodo entry ABI; void has no exit-code register."""
+    package = re.search(r"^package\s+([A-Za-z_][A-Za-z_0-9]*)\s*$", source, re.MULTILINE)
+    entry = re.search(r"^(?:pub\s+)?fn\s+main\s*\(\s*\)\s*(?:->\s*(i32|void)\s*)?\{",
+                      source, re.MULTILINE)
+    if package is None or entry is None:
+        raise RuntimeError("Windows fixture needs a package and main() returning void or i32")
+    runtime = RUNTIME.replace("PACKAGE", package.group(1))
+    if entry.group(1) != "i32":
+        runtime = runtime.replace("extern int dodo_main(void)", "extern void dodo_main(void)")
+        runtime = runtime.replace("ExitProcess((unsigned int)dodo_main());", "dodo_main(); ExitProcess(0);")
+    return runtime
+
+
 CHILD_STARTUP = r'''
 #include <stdio.h>
 __declspec(dllimport) void __stdcall ExitProcess(unsigned int);
@@ -187,7 +202,9 @@ def main():
         scratch = Path(directory)
         (scratch / "wine").mkdir()
         env = dict(os.environ, WINEPREFIX=str(scratch / "wine"), WINEARCH="win64", WINEDEBUG="-all")
-        env.update(DODO_ENV_TEST="parent  é", DODO_PARENT_ONLY="must not leak")
+        env.update(DODO_ENV_TEST="parent  é", DODO_PARENT_ONLY="must not leak",
+                   DODO_HOSTED_EMPTY="", DODO_HOSTED_VALUE="hé!!")
+        env.pop("DODO_HOSTED_ABSENT", None)
         env.pop("DISPLAY", None)
         # Keep Wine services alive across fixtures; terminate only our own prefix.
         subprocess.run([wineserver, "-p"], env=env, stdout=subprocess.DEVNULL,
@@ -233,11 +250,8 @@ def main():
                 # Portable fixtures link without a CRT, even with a Windows
                 # target triple whose automatic panic strategy uses the CRT.
                 panic = "auto" if boundaries else "trap"
-                declaration = re.search(r"^package\s+([A-Za-z_][A-Za-z_0-9]*)\s*$", source.read_text(), re.MULTILINE)
-                if declaration is None:
-                    raise RuntimeError(f"Missing package declaration: {source}")
                 startup = scratch / "startup.c"
-                startup.write_text(RUNTIME.replace("PACKAGE", declaration.group(1)))
+                startup.write_text(runtime_source(source.read_text()))
                 runtime_object = scratch / "startup.obj"
                 run([clang, "--target=x86_64-pc-windows-msvc", "-ffreestanding", "-fno-builtin", "-fno-stack-protector",
                      "-O2", "-c", str(startup), "-o", str(runtime_object)])
@@ -262,7 +276,7 @@ def main():
                         child_work.mkdir()
                         shutil.copyfile(scratch / "os child.exe", child_work / "os child.exe")
                         (child_work / "cwd-marker").write_bytes(b"fixture")
-                    extra_args = ["space arg", "é", ""] if source.stem == "env_checks" else []
+                    extra_args = ["space arg", "é", ""] if source.stem in ("env_checks", "hosted_env") else []
                     if source.stem == "console_checks":
                         run_console([wine, str(exe)], env=env, cwd=work)
                     else:

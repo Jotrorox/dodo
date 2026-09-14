@@ -1,0 +1,32 @@
+package hosted_elapsed
+import "std/time"
+import "std/time/clock"
+import "std/time/hosted"
+import "std/console"
+import "std/fmt"
+
+fn measure() -> u64!time.TimeError {
+    source := hosted.MonotonicClock.new()
+    start := clock.now(&source)?
+    // Put the operation being measured here.
+    finish := clock.now(&source)?
+    elapsed := finish.duration_since(&start)?
+    return elapsed.to_nanos()
+}
+fn main() -> i32 {
+    match measure() {
+        ok(nanoseconds) => {
+            value := fmt.unsigned(nanoseconds)
+            match console.println_value(&value) {
+                ok(_) => {
+                    return 0
+                }, err(_) => {
+                    return 2
+                }
+            }
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

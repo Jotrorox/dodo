@@ -1,0 +1,115 @@
+package hosted_env
+import "std/env"
+import "std/platform"
+import "std/platform/error"
+import "core/mem"
+import "core/bytes"
+fn run() -> void!error.Error {
+    workspace := env.Workspace.new()
+    output := [0u8; 32]
+    match env.get("DODO_HOSTED_ABSENT", &mut output, &mut workspace, platform.TextPolicy.Strict)? {
+        none => {}, some(_) => {
+            assert(false)
+        }
+    }
+    match env.get("DODO_HOSTED_EMPTY", &mut output[..0], &mut workspace, platform.TextPolicy.Strict)? {
+        none => {
+            assert(false)
+        }, some(value) => {
+            assert(mem.str_bytes(value).len == 0)
+        }
+    }
+    match env.get("DODO_HOSTED_VALUE", &mut output[..5], &mut workspace, platform.TextPolicy.Strict)? {
+        none => {
+            assert(false)
+        }, some(value) => {
+            assert(bytes.equal(mem.str_bytes(value), b"h\xc3\xa9!!"))
+        }
+    }
+    match env.get("DODO_HOSTED_VALUE", &mut output[..4], &mut workspace, platform.TextPolicy.Strict) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.BufferTooSmall)
+        }
+    }
+    match env.get("bad=name", &mut output, &mut workspace, platform.TextPolicy.Strict) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    match env.get("", &mut output, &mut workspace, platform.TextPolicy.Strict) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    match env.get("bad\x00name", &mut output, &mut workspace, platform.TextPolicy.Strict) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    argument_storage := platform.list_workspace()
+    arguments := env.Arguments.capture(&mut argument_storage, platform.TextPolicy.Strict)?
+    assert(arguments.len() == 4)
+    match arguments.get(1, &mut output)? {
+        some(value) => {
+            assert(bytes.equal(mem.str_bytes(value), b"space arg"))
+        }, none => {
+            assert(false)
+        }
+    }
+    match arguments.get(2, &mut output[..2])? {
+        some(value) => {
+            assert(bytes.equal(mem.str_bytes(value), b"\xc3\xa9"))
+        }, none => {
+            assert(false)
+        }
+    }
+    match arguments.get(3, &mut output[..0])? {
+        some(value) => {
+            assert(mem.str_bytes(value).len == 0)
+        }, none => {
+            assert(false)
+        }
+    }
+    match arguments.get(4, &mut output)? {
+        some(_) => {
+            assert(false)
+        }, none => {}
+    }
+    match arguments.next(&mut output[..0]) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.BufferTooSmall)
+        }
+    }
+    // Failed next does not advance argv[0]; retry using enough conversion space.
+    large := [0u8; 4096]
+    match arguments.next(&mut large)? {
+        some(_) => {}, none => {
+            assert(false)
+        }
+    }
+    match arguments.next(&mut output)? {
+        some(value) => {
+            assert(bytes.equal(mem.str_bytes(value), b"space arg"))
+        }, none => {
+            assert(false)
+        }
+    }
+    return ok()
+}
+fn main() {
+    match run() {
+        ok() => {}, err(_) => {
+            assert(false, "hosted environment operation failed")
+        }
+    }
+}

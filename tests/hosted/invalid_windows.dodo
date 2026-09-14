@@ -1,0 +1,37 @@
+package invalid_text
+import "std/platform"
+import "std/platform/native"
+import "std/platform/error"
+import "core/bytes"
+import "core/mem"
+fn run() -> void!error.Error {
+    units := [55296u16, 0u16]
+    value := native.NativeString.new(&units)?
+    strict := platform.TextPolicy.Strict
+    replace := platform.TextPolicy.Replace
+    output := [0u8; 3]
+    match platform.decode(&value, &mut output, &strict) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.InvalidInput)
+        }
+    }
+    rendered := platform.decode(&value, &mut output, &replace)?
+    assert(bytes.equal(mem.str_bytes(rendered), b"\xef\xbf\xbd"))
+    match platform.decode(&value, &mut output[..2], &replace) {
+        ok(_) => {
+            assert(false)
+        }, err(reason) => {
+            assert(reason.kind == error.Kind.BufferTooSmall)
+        }
+    }
+    return ok()
+}
+fn main() {
+    match run() {
+        ok() => {}, err(_) => {
+            assert(false)
+        }
+    }
+}

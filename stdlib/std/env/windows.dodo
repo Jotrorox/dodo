@@ -232,3 +232,35 @@ pub struct Builder {
         return ok(Snapshot { values: values })
     }
 }
+
+unsafe extern "C" fn dodo_env_lookup(name: *const u8, storage: *mut u8, capacity: usize, used: *mut usize, found: *mut i32) -> i32
+pub fn lookup(name: &native.NativeString, storage: &mut native.Workspace) -> bool!error.Error {
+    used := 0usize
+    found := 0i32
+    code := unsafe {
+        dodo_env_lookup(name.as_ptr() as *const u8, ptr.as_mut_ptr(storage.buffer()) as *mut u8,
+        native.TEXT_CAPACITY, ptr.from_mut(&mut used), ptr.from_mut(&mut found))
+    }
+    if code != 0 {
+        return err(from_code(code))
+    }
+    if found == 0 {
+        return ok(false)
+    }
+    storage.commit(used)?
+    return ok(true)
+}
+pub fn arguments_into(storage: &mut native.ListWorkspace) -> void!error.Error {
+    used := 0usize
+    storage.clear()
+    code := unsafe {
+        dodo_env_arguments(ptr.as_mut_ptr(storage.buffer()) as *mut u8, native.LIST_CAPACITY, ptr.from_mut(&mut used))
+    }
+    if code != 0 {
+        return err(from_code(code))
+    }
+    return storage.commit(used)
+}
+pub fn view(values: native.NativeList) -> Snapshot {
+    return Snapshot { values: values }
+}

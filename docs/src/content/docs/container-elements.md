@@ -131,9 +131,11 @@ and memory exchange remain restricted.
 ## Positive acceptance example
 
 This program forwards a checked insertion effect and uses a removed reference
-after destroying the vector:
+after destroying the vector. It requires the pending compiler support in
+[PR #24](https://github.com/Jotrorox/dodo/pull/24); until that lands, it is an
+illustration of the proposed syntax rather than an executable doctest.
 
-```dodo test
+```dodo
 package example
 import "alloc/error"
 import "alloc/shared_arena"
