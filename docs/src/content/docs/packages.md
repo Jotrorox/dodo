@@ -43,6 +43,14 @@ Declarations and fields are private unless `pub`; public functions cannot expose
 private types. Public enum variants are available with the enum. Struct methods
 are statically dispatched; associated functions use `Type.name(...)`.
 
+An import makes public declarations available to the source checker; it does
+not export every imported function from the compiled object. The compiler keeps
+root-package public functions and methods, root `main`, and all `extern "C"`
+definitions as exports. Other functions, including generic specializations, are
+removed when unreachable, at every optimization level. Reachability includes
+implicit destructors and callback addresses. ELF and COFF output place functions
+in separate code sections so a linker can discard unused exported code as well.
+
 ## Compiler-provided packages
 
 `core/mmio`, `core/ptr`, and `core/mem` are compiler-provided imports.

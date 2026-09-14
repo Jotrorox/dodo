@@ -698,6 +698,7 @@ fn namespace(
         names.expr(&mut item.value, &BTreeSet::new(), &BTreeSet::new());
     }
     for function in &mut program.functions {
+        function.imported = !prefix.is_empty();
         function.name = names.name(&function.name, &BTreeSet::new());
         let generics = function.generics.iter().cloned().collect();
         let mut locals = BTreeSet::new();

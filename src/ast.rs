@@ -266,6 +266,8 @@ pub struct Variant {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
+    /// Defined in a dependency of this compilation unit; set by package loading.
+    pub imported: bool,
     pub test: bool,
     pub ignore: Option<String>,
     pub public: bool,
