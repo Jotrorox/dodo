@@ -1,0 +1,114 @@
+{
+  "name": "dodo-vscode",
+  "displayName": "Dodo",
+  "description": "Dodo language support: highlighting, snippets, diagnostics, completion, navigation, rename, and formatting.",
+  "version": "0.1.0",
+  "publisher": "Jotrorox",
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jotrorox/dodo.git",
+    "directory": "editor-support/dodo-vscode"
+  },
+  "homepage": "https://jotrorox.github.io/dodo/editors/",
+  "bugs": { "url": "https://github.com/Jotrorox/dodo/issues" },
+  "engines": { "vscode": "^1.91.0", "node": ">=22" },
+  "categories": ["Programming Languages", "Snippets", "Formatters"],
+  "keywords": ["dodo", "lsp"],
+  "extensionKind": ["workspace"],
+  "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Syntax highlighting and snippets are available. The Dodo language server runs only in trusted workspaces.",
+      "restrictedConfigurations": ["dodo.server.path"]
+    },
+    "virtualWorkspaces": {
+      "supported": "limited",
+      "description": "Syntax highlighting and snippets are available. The language server requires local files or untitled documents."
+    }
+  },
+  "contributes": {
+    "languages": [{
+      "id": "dodo",
+      "aliases": ["Dodo", "dodo"],
+      "extensions": [".dodo"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "dodo",
+      "scopeName": "source.dodo",
+      "path": "./syntaxes/dodo.tmLanguage.json"
+    }],
+    "snippets": [{ "language": "dodo", "path": "./snippets/dodo.json" }],
+    "commands": [
+      { "command": "dodo.restartServer", "title": "Restart Language Server", "category": "Dodo" },
+      { "command": "dodo.showOutput", "title": "Show Language Server Output", "category": "Dodo" }
+    ],
+    "configuration": {
+      "title": "Dodo",
+      "properties": {
+        "dodo.server.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Enable the Dodo language server. Highlighting and snippets are always available."
+        },
+        "dodo.server.path": {
+          "type": "string",
+          "default": "dodo",
+          "minLength": 1,
+          "scope": "window",
+          "markdownDescription": "Dodo executable name on PATH or a path to the compiler. Relative paths and `${workspaceFolder}` resolve against the first workspace folder. The extension supplies the `lsp` argument; do not include arguments or shell quotes."
+        },
+        "dodo.checkMode": {
+          "type": "string",
+          "enum": ["file", "package"],
+          "default": "file",
+          "scope": "window",
+          "enumDescriptions": [
+            "Check each open file and its imports.",
+            "Check each open file's parent directory as a package, including unsaved siblings."
+          ],
+          "description": "Diagnostic checking mode. Changing this setting restarts the server."
+        },
+        "dodo.target": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "LLVM target triple for diagnostics and platform imports (for example wasm32-unknown-unknown). Empty uses the host target. Changing this setting restarts the server."
+        },
+        "dodo.trace.server": {
+          "type": "string",
+          "enum": ["messages", "verbose"],
+          "default": "messages",
+          "scope": "window",
+          "description": "LSP trace detail. To enable tracing, set the Dodo Language Server output channel's log level to Trace using Developer: Set Log Level."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[dodo]": { "editor.insertSpaces": true, "editor.tabSize": 4 }
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "compile": "npm run check && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "vscode:prepublish": "npm run compile",
+    "test": "npm run compile && node --test test/grammar.test.cjs",
+    "test:integration": "npm run compile && node test/run-integration.cjs",
+    "package": "vsce package --no-dependencies"
+  },
+  "dependencies": { "vscode-languageclient": "^10.1.1" },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.91.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.2.0"
+  }
+}

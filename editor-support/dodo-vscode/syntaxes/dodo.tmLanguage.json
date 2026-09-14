@@ -1,0 +1,146 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Dodo",
+  "scopeName": "source.dodo",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#attributes" },
+    { "include": "#declarations" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#constants" },
+    { "include": "#numbers" },
+    { "include": "#functions" },
+    { "include": "#operators" },
+    { "name": "variable.other.dodo", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.double-slash.dodo",
+      "begin": "//",
+      "beginCaptures": { "0": { "name": "punctuation.definition.comment.dodo" } },
+      "end": "$"
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.byte.dodo",
+          "begin": "\\bb\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.dodo" } },
+          "end": "\"|$",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.dodo" } },
+          "patterns": [{ "include": "#byte-escapes" }]
+        },
+        {
+          "name": "string.quoted.single.byte.dodo",
+          "begin": "\\bb'",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.dodo" } },
+          "end": "'|$",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.dodo" } },
+          "patterns": [{ "include": "#byte-escapes" }]
+        },
+        {
+          "name": "string.quoted.double.dodo",
+          "begin": "\"",
+          "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.dodo" } },
+          "end": "\"|$",
+          "endCaptures": { "0": { "name": "punctuation.definition.string.end.dodo" } },
+          "patterns": [
+            { "name": "constant.character.escape.dodo", "match": "\\\\u\\{[0-9a-fA-F]{1,6}\\}" },
+            { "include": "#byte-escapes" }
+          ]
+        }
+      ]
+    },
+    "byte-escapes": {
+      "patterns": [
+        { "name": "constant.character.escape.dodo", "match": "\\\\(?:[nrt0\\\\\"']|x[0-9a-fA-F]{2})" },
+        { "name": "invalid.illegal.escape.dodo", "match": "\\\\." }
+      ]
+    },
+    "attributes": {
+      "match": "(@)([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.definition.annotation.dodo" },
+        "2": { "name": "storage.type.annotation.dodo" }
+      }
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.dodo" },
+            "2": { "name": "entity.name.function.dodo" }
+          }
+        },
+        {
+          "match": "\\b(struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.dodo" },
+            "2": { "name": "entity.name.type.dodo" }
+          }
+        },
+        {
+          "match": "\\b(package)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.package.dodo" },
+            "2": { "name": "entity.name.namespace.dodo" }
+          }
+        },
+        {
+          "match": "\\b(const)\\s+([A-Za-z_][A-Za-z0-9_]*)(?=\\s*[:=])",
+          "captures": {
+            "1": { "name": "storage.modifier.dodo" },
+            "2": { "name": "variable.other.constant.dodo" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.dodo", "match": "\\b(?:return|if|else|for|in|break|continue|match)\\b" },
+        { "name": "storage.modifier.dodo", "match": "\\b(?:pub|unsafe|extern|mut|const|static)\\b" },
+        { "name": "storage.type.dodo", "match": "\\b(?:fn|struct|enum|let)\\b" },
+        { "name": "keyword.other.dodo", "match": "\\b(?:package|import|from)\\b" },
+        { "name": "keyword.operator.cast.dodo", "match": "\\bas\\b" }
+      ]
+    },
+    "types": {
+      "patterns": [
+        { "name": "support.type.primitive.dodo", "match": "\\b(?:bool|void|str|[iu](?:8|16|32|64|size)|f(?:32|64))\\b" },
+        { "name": "support.type.dodo", "match": "\\b(?:Self|Option|Result)\\b" },
+        { "name": "entity.name.type.dodo", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        { "name": "constant.language.boolean.dodo", "match": "\\b(?:true|false)\\b" },
+        { "name": "constant.language.dodo", "match": "\\bnone\\b" },
+        { "name": "variable.language.dodo", "match": "\\bself\\b" }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.float.dodo", "match": "\\b[0-9][0-9_]*(?:(?:\\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?|[eE][+-]?[0-9_]+)(?:f(?:32|64))?|f(?:32|64))\\b" },
+        { "name": "constant.numeric.integer.dodo", "match": "\\b(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:[iu](?:8|16|32|64|size))?\\b" }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        { "name": "support.function.builtin.dodo", "match": "\\b(?:some|ok|err|assert|assert_eq|assert_ne)\\b" },
+        { "name": "entity.name.function.dodo", "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*(?:\\(|::\\s*<|<[^<>\\n]*>\\s*\\())" }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.dodo", "match": "<<=|>>=|\\.\\.=|:=|->|=>|==|!=|<=|>=|&&|\\|\\||<<|>>|[+*/%&|^=-]=|\\.\\.|[+*/%=<>!?&|^~-]" },
+        { "name": "punctuation.separator.dodo", "match": "::|[.,;:]" },
+        { "name": "punctuation.section.braces.dodo", "match": "[{}]" },
+        { "name": "punctuation.section.brackets.dodo", "match": "[\\[\\]]" },
+        { "name": "punctuation.section.parens.dodo", "match": "[()]" }
+      ]
+    }
+  }
+}

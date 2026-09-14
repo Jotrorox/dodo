@@ -76,7 +76,9 @@ cross-target builds. Add `-g -O 0` to debug generated programs with source
 breakpoints and local variables. Hosted runtime checks report their kind and
 location; embedded builds can select a C ABI hook with `--panic-hook`. For
 diagnostics, completion, navigation, rename, signature help, and formatting,
-configure your editor's LSP client to run `dodo lsp` and follow the
+install the [Dodo VS Code extension](editor-support/dodo-vscode), which also adds
+syntax highlighting and snippets, or configure your editor's LSP client to run
+`dodo lsp` and follow the
 [editor setup guide](https://jotrorox.github.io/dodo/editors/).
 
 ## Language and reference
