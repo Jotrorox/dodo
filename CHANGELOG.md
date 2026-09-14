@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add LSP completion, definition, references, rename, signature help, and canonical
+  document formatting. Recover multiple editor diagnostics, honor the configured
+  compilation target, and add a reproducible stdio responsiveness benchmark.
 - Use `main.dodo` in the current folder for `dodo run`, `dodo check`, and
   `dodo compile`; keep `build` as an alias for `compile`. Explicit project
   folders also select `main.dodo`; default build outputs use the project folder
