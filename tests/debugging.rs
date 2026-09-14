@@ -157,6 +157,7 @@ fn recursive_and_aggregate_debug_types_use_the_target_layout() {
                 "DW_TAG_array_type",
                 "Choice",
                 "DW_TAG_enumeration_type",
+                "DW_TAG_union_type",
                 "is_some",
                 "is_error",
                 "MaybeUninit<i64>",
@@ -167,6 +168,66 @@ fn recursive_and_aggregate_debug_types_use_the_target_layout() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn gdb_reads_shared_enum_and_result_payloads() {
+    if !tool("gdb") {
+        return;
+    }
+    let w = Workspace::new();
+    let source = w.file(
+        "shared.dodo",
+        r#"package shared
+enum Choice { Small(value: u8), Large(value: u64) }
+fn main() -> i32 {
+    small := Choice.Small(42u8)
+    large := Choice.Large(123456u64)
+    success: u8!u64 = ok(7u8)
+    failure: u8!u64 = err(654321u64)
+    marker := 0i32
+    match success { ok(_) => {}, err(_) => {} }
+    match failure { ok(_) => {}, err(_) => {} }
+    core.drop(small)
+    core.drop(large)
+    marker
+}
+"#,
+    );
+    let program = w.0.join("shared");
+    w.build(&source, &program, &["-g", "-O0"]);
+    let mut command = Command::new("gdb");
+    command.args(["--batch", "-nx", "-q"]).arg(&program);
+    for action in [
+        "set debuginfod enabled off",
+        "break shared.dodo:8",
+        "run",
+        "print (unsigned int) small.payload.Small.value",
+        "print large.payload.Large.value",
+        "print (unsigned int) success.payload.value",
+        "print failure.payload.error",
+        "print sizeof(small)",
+        "print sizeof(failure)",
+        "print (char *)&small.payload.Small - (char *)&small",
+        "print (char *)&large.payload.Large - (char *)&large",
+    ] {
+        command.args(["-ex", action]);
+    }
+    let output = command.output().unwrap();
+    success(&output);
+    let log = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "$1 = 42",
+        "$2 = 123456",
+        "$3 = 7",
+        "$4 = 654321",
+        "$5 = 16",
+        "$6 = 16",
+        "$7 = 8",
+        "$8 = 8",
+    ] {
+        assert!(log.contains(expected), "missing {expected}: {log}");
     }
 }
 

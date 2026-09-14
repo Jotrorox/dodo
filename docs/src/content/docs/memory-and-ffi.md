@@ -24,13 +24,15 @@ the external symbol; Dodo functions use `dodo.<root-package>.<qualified-name>`.
 
 ## Enum, Result, and Option layout
 
-Enum storage is a zero-based u32 tag plus separate storage for every variant's
-payload, in declaration order. Result storage is a bool error tag (false for ok,
-true for err) plus success/error slots; Option storage is a bool presence tag
-plus a payload slot. These are the 0.1 storage rules, with target ABI padding
-and no niche optimizations; they do not define a C enum ABI. `void` Result
-success uses a one-byte placeholder slot. Inactive payloads and padding are not
-guaranteed to contain initialized bytes.
+Enum storage is a zero-based u32 tag plus one shared payload area. Each variant's
+fields retain declaration order, and the area accommodates the largest payload
+and strictest alignment. Result storage is a bool error tag (false for ok, true
+for err) plus shared storage for success or error; a `void` alternative needs no
+payload bytes. Option storage is a bool presence tag plus a payload slot. These
+rules include target ABI padding and no niche optimizations; they do not define
+a C enum or union ABI. Only the active alternative owns resources. Inactive
+bytes and padding are not guaranteed to be initialized. Rebuild native objects
+together when migrating from the earlier separate payload slots.
 
 ## Entry points and linking
 
