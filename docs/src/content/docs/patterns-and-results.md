@@ -15,6 +15,14 @@ A `Result` must be forwarded, propagated, or matched with explicit `ok` and `err
 arms. Binding it and leaving scope, overwriting it unhandled, assigning it to
 `_`, or passing it to `core.drop` is rejected.
 
+After matching by reference, replacing the whole owned binding creates a fresh
+handling obligation. Assignments of Result-containing values through a field,
+index, or reference are unsupported, including writes through local aliases:
+the checker cannot transfer their handling state to the storage owner. Matching
+plain payloads through `&mut` still permits mutation of non-Result data. The
+[container element design](container-elements.md) explains why storing and
+destroying pending Results needs additional checker support.
+
 ## Match patterns and guards
 
 Patterns compose recursively across enum payloads and structs. They include

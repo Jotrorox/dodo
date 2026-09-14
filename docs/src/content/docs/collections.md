@@ -109,6 +109,14 @@ slice algorithms retain ordinary borrowing rules and can use reference-bearing
 elements. Allocator and policy values themselves retain their checked source
 dependencies.
 
+The [container element safety design](container-elements.md) separates storing
+reference dependencies from storing mandatory Result obligations. It records
+why even `fixed_vector.Vector<&i32>` needs checker mutation effects, and gives
+accepted programs and executable blockers. No additional element combinations
+are enabled by that design. In particular, handling an insertion's capacity or
+allocation Result would not handle a Result stored as its element; existing
+failure, clear, and drop paths destroy payloads and cannot discard pending errors.
+
 ## Maps, sets, and heaps
 
 Map insertion preserves the first equal key object and replaces its value,
