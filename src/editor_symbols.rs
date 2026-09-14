@@ -2,9 +2,9 @@
 //! rebuilt with each full check and shared by documents in the checked package.
 use super::{byte_offset, local_span, range, short_name, source_names};
 use crate::ast::*;
+use crate::json::{Value, json};
 use crate::lexer::{self, Token, TokenKind};
 use crate::package::{Loaded, Source};
-use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 

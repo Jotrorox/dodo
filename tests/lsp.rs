@@ -1,5 +1,5 @@
 //! Exercise the real compiler process with independently framed JSON-RPC.
-use serde_json::{Value, json};
+use dodoc::json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -103,7 +103,7 @@ impl Client {
                 assert_eq!(header, "\r\n");
                 let mut body = vec![0; length];
                 output.read_exact(&mut body).unwrap();
-                let message: Value = serde_json::from_slice(&body).unwrap();
+                let message: Value = dodoc::json::from_slice(&body).unwrap();
                 assert_eq!(message["jsonrpc"], "2.0");
                 if sender.send(message).is_err() {
                     break;
@@ -118,7 +118,7 @@ impl Client {
     }
 
     fn send(&mut self, message: Value) {
-        let body = serde_json::to_vec(&message).unwrap();
+        let body = dodoc::json::to_vec(&message);
         self.send_body(&body);
     }
 

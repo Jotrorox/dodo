@@ -130,7 +130,7 @@ fn borrow_labels_retain_exact_expression_ranges() {
     );
 }
 
-fn lsp(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+fn lsp(messages: &[dodoc::json::Value]) -> Vec<dodoc::json::Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dodo"))
         .arg("lsp")
         .stdin(Stdio::piped())
@@ -140,7 +140,7 @@ fn lsp(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     for message in messages {
-        let body = serde_json::to_vec(message).unwrap();
+        let body = dodoc::json::to_vec(message);
         write!(input, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
         input.write_all(&body).unwrap();
     }
@@ -167,7 +167,7 @@ fn lsp(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
             })
             .unwrap();
         bytes = &bytes[header_end + 4..];
-        replies.push(serde_json::from_slice(&bytes[..length]).unwrap());
+        replies.push(dodoc::json::from_slice(&bytes[..length]).unwrap());
         bytes = &bytes[length..];
     }
     replies
@@ -175,7 +175,7 @@ fn lsp(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
 
 #[test]
 fn editor_stdio_reports_inferred_types_and_clears_changed_diagnostics() {
-    use serde_json::json;
+    use dodoc::json::json;
     let source =
         "package hover\nfn main() {\nvalue := 1i32\nview := &value\nvalue = 2\ncopy := *view\n}\n";
     let fixed = source.replace("value = 2\ncopy := *view", "copy := *view\nvalue = 2");
@@ -223,7 +223,7 @@ fn editor_stdio_reports_inferred_types_and_clears_changed_diagnostics() {
 
 #[test]
 fn editor_stdio_exposes_receiver_ownership_and_borrowed_return_sources() {
-    use serde_json::json;
+    use dodoc::json::json;
     let source = include_str!("../examples/borrowing.dodo");
     let uri = "untitled:borrowing.dodo";
     let mut messages = vec![

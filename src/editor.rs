@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 #[path = "editor_symbols.rs"]
 pub(crate) mod symbols;
-use serde_json::{Value, json};
+use crate::json::{Value, json};
 use std::io::{self, BufRead, Write};
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -526,7 +526,7 @@ pub fn serve(mut reader: impl BufRead, mut writer: impl Write) -> io::Result<i32
 }
 
 pub(crate) fn write_message(writer: &mut impl Write, message: &Value) -> io::Result<()> {
-    let body = serde_json::to_vec(message)?;
+    let body = crate::json::to_vec(message);
     write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
     writer.write_all(&body)?;
     writer.flush()
@@ -769,7 +769,7 @@ mod tests {
         let mut reader = output.as_slice();
         let mut messages = vec![];
         while let Some(body) = read_message(&mut reader).unwrap() {
-            messages.push(serde_json::from_slice(&body).unwrap());
+            messages.push(crate::json::from_slice(&body).unwrap());
         }
         (status, messages)
     }
@@ -827,7 +827,7 @@ mod tests {
         let message = json!({"text": "😀"});
         write_message(&mut bytes, &message).unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&read_message(&mut bytes.as_slice()).unwrap().unwrap())
+            crate::json::from_slice(&read_message(&mut bytes.as_slice()).unwrap().unwrap())
                 .unwrap(),
             message
         );

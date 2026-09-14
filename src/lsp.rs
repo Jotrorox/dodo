@@ -5,11 +5,11 @@
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::{codegen, editor, file_uri, format, package, sema};
 mod protocol;
+use crate::json::{Value, json};
 use protocol::{
     DocumentChange, ErrorCode, InitializeParams, Location, Message, Notification, OpenDocument,
     Position, PublishDiagnosticsParams, QueryParams, Range, Request, Response,
 };
-use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ struct Server {
 pub fn run(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<i32> {
     let mut server = Server::default();
     while let Some(body) = editor::read_message(input)? {
-        let value: Value = match serde_json::from_slice(&body) {
+        let value: Value = match crate::json::from_slice(&body) {
             Ok(value) => value,
             Err(_) => {
                 write_error(output, Value::Null, -32700, "Parse error")?;

@@ -5,6 +5,7 @@ pub mod consteval;
 pub mod diagnostic;
 pub mod editor;
 pub mod format;
+pub mod json;
 pub mod lexer;
 pub mod lsp;
 pub mod package;

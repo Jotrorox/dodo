@@ -4,8 +4,8 @@
 //! optional fields we consume are validated before any server state changes.
 //! No external protocol definitions or serialization derives are needed.
 //! Wire formats: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/
+use crate::json::{Value, json};
 use crate::{editor, file_uri};
-use serde_json::{Value, json};
 use std::io::{self, Write};
 
 type Result<T> = std::result::Result<T, &'static str>;
