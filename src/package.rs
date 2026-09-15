@@ -153,7 +153,7 @@ pub fn load_with_overlays(
     path: &Path,
     overlays: &BTreeMap<PathBuf, String>,
 ) -> Result<Loaded, LoadError> {
-    let target = inkwell::targets::TargetMachine::get_default_triple();
+    let target = crate::codegen::TargetMachine::get_default_triple();
     load_with_overlays_for_target(path, overlays, &target.as_str().to_string_lossy())
 }
 

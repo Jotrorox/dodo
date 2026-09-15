@@ -40,13 +40,15 @@ class ReleasePrerequisiteTests(unittest.TestCase):
         )
         self.executable(
             "cargo",
-            "#!/usr/bin/env python3\nimport json, os\n"
+            "#!/usr/bin/env python3\nimport json, os, sys\n"
             "from pathlib import Path\n"
             "Path(os.environ['DODO_TEST_FLAGS']).write_text(\n"
             "    json.dumps(os.environ['CARGO_ENCODED_RUSTFLAGS'].split('\\x1f')))\n"
+            "Path(os.environ['DODO_TEST_ARGS']).write_text(json.dumps(sys.argv[1:]))\n"
             "raise SystemExit(41)\n",
         )
         self.flags_file = self.directory / "flags.json"
+        self.args_file = self.directory / "args.json"
         self.environment = {
             **os.environ,
             "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
@@ -54,6 +56,7 @@ class ReleasePrerequisiteTests(unittest.TestCase):
             "LIBRARY_PATH": str(self.libraries),
             "LLVM_SYS_221_PREFIX": str(self.directory),
             "DODO_TEST_FLAGS": str(self.flags_file),
+            "DODO_TEST_ARGS": str(self.args_file),
         }
         self.environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
         self.environment.pop("RUSTFLAGS", None)
@@ -79,6 +82,8 @@ class ReleasePrerequisiteTests(unittest.TestCase):
     def assert_cargo_reached(self, result, archive_directory):
         self.assertEqual(result.returncode, 41, result.stderr)
         self.assertIn(f"native={archive_directory}", json.loads(self.flags_file.read_text()))
+        args = json.loads(self.args_file.read_text())
+        self.assertEqual(args[args.index("--features") + 1], "llvm-sys/force-static")
 
     def test_named_library_resolves_from_library_path(self):
         self.assert_cargo_reached(self.run_preflight("-lextra"), self.libraries)

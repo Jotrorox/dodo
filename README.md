@@ -115,9 +115,9 @@ and conservative borrow checking are documented alongside the specification.
 
 ## Build and contribute
 
-Source builds require Rust 1.95.0, LLVM 22 development files and static archives,
-and a C toolchain. After installing the prerequisites and setting
-`LLVM_SYS_221_PREFIX` for your LLVM installation:
+Source builds require Rust 1.95.0, LLVM 22 development files, and a C toolchain.
+Cargo prefers static LLVM and allows a shared-library fallback. After installing
+the prerequisites and setting `LLVM_SYS_221_PREFIX` for your LLVM installation:
 
 ```sh
 git clone https://github.com/Jotrorox/dodo.git

@@ -1,8 +1,8 @@
 //! Dead imports must not introduce code or linker dependencies, even at O0.
+use dodoc::codegen::Context;
+use dodoc::codegen::FileType;
 use dodoc::{codegen, package, sema};
-use inkwell::context::Context;
-use inkwell::module::Linkage;
-use inkwell::targets::FileType;
+use llvm_sys::LLVMLinkage;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -34,7 +34,7 @@ impl Workspace {
         options: &codegen::Options,
     ) -> codegen::Generated<'ctx> {
         let target = options.target.clone().unwrap_or_else(|| {
-            inkwell::targets::TargetMachine::get_default_triple()
+            codegen::TargetMachine::get_default_triple()
                 .as_str()
                 .to_string_lossy()
                 .into_owned()
@@ -88,20 +88,15 @@ fn unused_num_import_emits_only_the_probe_without_helper_dependencies() {
                     .machine
                     .write_to_memory_buffer(&generated.module, FileType::Object)
                     .unwrap();
-                let binary = object.create_binary_file(None).unwrap();
-                let mut sections = binary.get_sections().unwrap();
                 let mut helpers = BTreeSet::new();
-                while let Some(section) = sections.next_section() {
-                    let mut relocations = section.get_relocations();
-                    while let Some(relocation) = relocations.next_relocation() {
-                        let symbol = relocation.get_symbol();
-                        let name = symbol.get_name().unwrap().to_string_lossy();
+                for section in object.sections().unwrap() {
+                    for name in section.relocation_symbols {
                         if name.starts_with("__") {
                             assert!(
                                 !["mul", "div", "mod"].iter().any(|op| name.contains(op)),
                                 "unexpected arithmetic dependency: {name}"
                             );
-                            helpers.insert(name.into_owned());
+                            helpers.insert(name);
                         }
                     }
                 }
@@ -170,7 +165,11 @@ extern "C" fn root_export() -> i32 { dependency.answer() }
         ] {
             let function = generated.module.get_function(name).unwrap();
             assert_ne!(function.count_basic_blocks(), 0, "missing body: {name}");
-            assert_eq!(function.get_linkage(), Linkage::External, "{name}");
+            assert_eq!(
+                function.get_linkage(),
+                LLVMLinkage::LLVMExternalLinkage,
+                "{name}"
+            );
         }
         let ir = generated.module.print_to_string().to_string();
         for dead in ["unused", "cycle_a", "cycle_b", "identity$", "missing"] {
@@ -180,7 +179,7 @@ extern "C" fn root_export() -> i32 { dependency.answer() }
             for name in ["dodo.api.dependency.answer", "dodo.api.dependency.helper"] {
                 assert_eq!(
                     generated.module.get_function(name).unwrap().get_linkage(),
-                    Linkage::Internal
+                    LLVMLinkage::LLVMInternalLinkage
                 );
             }
         }
@@ -275,14 +274,13 @@ fn emitted_functions_have_separate_sections_on_elf_and_coff() {
             if target.contains("apple") || target.starts_with("wasm") {
                 continue;
             }
-            let binary = object.create_binary_file(None).unwrap();
-            let mut sections = binary.get_sections().unwrap();
-            let mut names = Vec::new();
-            while let Some(section) = sections.next_section() {
-                if section.get_size() > 0 {
-                    names.push(section.get_name().unwrap().to_string_lossy().into_owned());
-                }
-            }
+            let names: Vec<_> = object
+                .sections()
+                .unwrap()
+                .into_iter()
+                .filter(|section| section.size > 0)
+                .map(|section| section.name)
+                .collect();
             let prefix = if target.contains("windows") {
                 ".text$"
             } else {

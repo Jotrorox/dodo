@@ -1,10 +1,9 @@
 //! Failure paths stay available without debug metadata or a bundled runtime.
 use super::*;
-use inkwell::types::FunctionType;
 
 impl<'a, 'ctx> Codegen<'a, 'ctx> {
-    fn runtime_function(&self, name: &str, ty: FunctionType<'ctx>) -> Result<FunctionValue<'ctx>> {
-        if let Some(function) = self.module.get_function(name) {
+    fn runtime_function(&self, name: &str, ty: LlvmType<'ctx>) -> Result<Value<'ctx>> {
+        if let Some(function) = self.module.lookup_function(name) {
             if function.get_type() != ty {
                 return Err(error(format!(
                     "runtime symbol `{name}` has an incompatible declaration"
@@ -60,7 +59,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 )
             })
             .unwrap_or_else(|| ("<unknown>".into(), 0, 0));
-        let ptr = self.context.ptr_type(AddressSpace::default());
+        let ptr = self.context.ptr_type(0);
         let i32 = self.context.i32_type();
         match strategy {
             PanicStrategy::Hosted => {
@@ -72,14 +71,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let count = if windows { i32 } else { self.usize_type() };
                 let write = self.runtime_function(
                     if windows { "_write" } else { "write" },
-                    count.fn_type(&[i32.into(), ptr.into(), count.into()], false),
+                    count.fn_type(&[i32, ptr, count], false),
                 )?;
                 self.builder.build_call(
                     write,
                     &[
-                        i32.const_int(2, false).into(),
-                        text.as_pointer_value().into(),
-                        count.const_int(message.len() as u64, false).into(),
+                        i32.const_int(2, false),
+                        text,
+                        count.const_int(message.len() as u64, false),
                     ],
                     "",
                 )?;
@@ -99,7 +98,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     &name,
                     self.context
                         .void_type()
-                        .fn_type(&[ptr.into(), ptr.into(), i32.into(), i32.into()], false),
+                        .fn_type(&[ptr, ptr, i32, i32], false),
                 )?;
                 hook.add_attribute(
                     AttributeLoc::Function,
@@ -111,10 +110,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.build_call(
                     hook,
                     &[
-                        message.as_pointer_value().into(),
-                        file.as_pointer_value().into(),
-                        i32.const_int(line as u64, false).into(),
-                        i32.const_int(column as u64, false).into(),
+                        message,
+                        file,
+                        i32.const_int(line as u64, false),
+                        i32.const_int(column as u64, false),
                     ],
                     "",
                 )?;

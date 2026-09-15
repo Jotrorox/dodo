@@ -1,12 +1,8 @@
 //! LLVM debug metadata and the source map shared with runtime diagnostics.
+use super::llvm::{DebugBuilder, Metadata};
 use super::*;
 use crate::package::Source;
-use inkwell::debug_info::{
-    AsDIScope, DIFile, DIFlags, DIFlagsConstants, DIScope, DIType, DWARFEmissionKind,
-    DWARFSourceLanguage, DebugInfoBuilder,
-};
-use inkwell::module::FlagBehavior;
-use inkwell::values::AsValueRef;
+use llvm_sys::debuginfo::{LLVMDIFlagPrototyped, LLVMDIFlagPublic, LLVMDIFlagZero};
 
 pub(super) struct SourceMap<'a> {
     pub sources: &'a [Source],
@@ -47,15 +43,15 @@ impl<'a> SourceMap<'a> {
 }
 
 pub(super) struct DebugInfo<'ctx> {
-    pub builder: DebugInfoBuilder<'ctx>,
-    files: Vec<DIFile<'ctx>>,
-    scopes: Vec<DIScope<'ctx>>,
-    types: HashMap<Type, DIType<'ctx>>,
+    pub builder: DebugBuilder<'ctx>,
+    files: Vec<Metadata<'ctx>>,
+    scopes: Vec<Metadata<'ctx>>,
+    types: HashMap<Type, Metadata<'ctx>>,
     optimized: bool,
 }
 impl<'ctx> DebugInfo<'ctx> {
     pub fn new(
-        context: &'ctx Context,
+        _context: &'ctx Context,
         module: &Module<'ctx>,
         options: &Options,
         sources: &SourceMap<'_>,
@@ -67,40 +63,15 @@ impl<'ctx> DebugInfo<'ctx> {
         let directory = source.path.parent().unwrap_or(std::path::Path::new("."));
         // Dodo has no DWARF language code yet. C gives debuggers a familiar
         // expression evaluator for our scalars and explicitly described layouts.
-        let (builder, _) = module.create_debug_info_builder(
-            true,
-            DWARFSourceLanguage::C,
+        let builder = DebugBuilder::new(
+            module,
             &source
                 .path
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy(),
             &directory.to_string_lossy(),
-            concat!("dodo ", env!("CARGO_PKG_VERSION")),
             options.optimization != 0,
-            "",
-            0,
-            "",
-            DWARFEmissionKind::Full,
-            0,
-            false,
-            false,
-            "",
-            "",
-        );
-        module.add_basic_value_flag(
-            "Debug Info Version",
-            FlagBehavior::Warning,
-            context
-                .i32_type()
-                .const_int(inkwell::debug_info::debug_metadata_version() as u64, false),
-        );
-        // DWARF 4 works with GDB, LLDB and embedded debuggers, including COFF
-        // objects linked by GNU-compatible Windows drivers.
-        module.add_basic_value_flag(
-            "Dwarf Version",
-            FlagBehavior::Warning,
-            context.i32_type().const_int(4, false),
         );
         let files = sources
             .sources
@@ -126,7 +97,7 @@ impl<'ctx> DebugInfo<'ctx> {
 }
 
 impl<'a, 'ctx> Codegen<'a, 'ctx> {
-    fn debug_file(&self, span: Span) -> (DIFile<'ctx>, u32, u32) {
+    fn debug_file(&self, span: Span) -> (Metadata<'ctx>, u32, u32) {
         let (index, line, column) = self.sources.location(span).unwrap_or((0, 0, 0));
         (self.debug.as_ref().unwrap().files[index], line, column)
     }
@@ -157,7 +128,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 line,
                 column,
             );
-            debug.scopes.push(scope.as_debug_info_scope());
+            debug.scopes.push(scope);
             self.location(self.span);
         }
     }
@@ -168,11 +139,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         self.location(self.span);
     }
-    pub(super) fn debug_function(
-        &mut self,
-        f: &Function,
-        function: FunctionValue<'ctx>,
-    ) -> Result<()> {
+    pub(super) fn debug_function(&mut self, f: &Function, function: Value<'ctx>) -> Result<()> {
         if self.debug.is_none() {
             return Ok(());
         }
@@ -190,34 +157,29 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let debug = self.debug.as_mut().unwrap();
         let signature = debug
             .builder
-            .create_subroutine_type(file, ret, &params, DIFlags::ZERO);
+            .create_subroutine_type(file, ret, &params, LLVMDIFlagZero);
         let subprogram = debug.builder.create_function(
-            file.as_debug_info_scope(),
+            file,
             &f.name,
             Some(&function.get_name().to_string_lossy()),
             file,
             line,
             signature,
-            function.get_linkage() == Linkage::Internal,
+            function.get_linkage() == LLVMInternalLinkage,
             true,
             line,
-            DIFlags::PROTOTYPED,
+            LLVMDIFlagPrototyped,
             debug.optimized,
         );
         function.set_subprogram(subprogram);
-        debug.scopes = vec![subprogram.as_debug_info_scope()];
+        debug.scopes = vec![subprogram];
         function.add_attribute(
             AttributeLoc::Function,
             self.context.create_string_attribute("frame-pointer", "all"),
         );
         Ok(())
     }
-    pub(super) fn debug_variable(
-        &mut self,
-        name: &str,
-        ty: &Type,
-        ptr: PointerValue<'ctx>,
-    ) -> Result<()> {
+    pub(super) fn debug_variable(&mut self, name: &str, ty: &Type, ptr: Value<'ctx>) -> Result<()> {
         if self.debug.is_none() || name.starts_with('$') || name == "_" {
             return Ok(());
         }
@@ -234,7 +196,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 line,
                 column,
             );
-            *debug.scopes.last_mut().unwrap() = scope.as_debug_info_scope();
+            *debug.scopes.last_mut().unwrap() = scope;
         }
         let scope = *debug.scopes.last().unwrap();
         let var = if self.parameter != 0 {
@@ -246,7 +208,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 line,
                 dtype,
                 true,
-                DIFlags::ZERO,
+                LLVMDIFlagZero,
             )
         } else {
             debug.builder.create_auto_variable(
@@ -256,57 +218,42 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 line,
                 dtype,
                 true,
-                DIFlags::ZERO,
+                LLVMDIFlagZero,
                 align,
             )
         };
         let location = debug
             .builder
             .create_debug_location(self.context, line, column, scope, None);
-        // Inkwell 0.10 casts this LLVM 22 DbgRecord to InstructionValue, which
-        // fails its instruction assertion. Use the record API directly.
-        unsafe {
-            inkwell::llvm_sys::debuginfo::LLVMDIBuilderInsertDeclareRecordAtEnd(
-                debug.builder.as_mut_ptr(),
-                ptr.as_value_ref(),
-                var.as_mut_ptr(),
-                debug.builder.create_expression(vec![]).as_mut_ptr(),
-                location.as_mut_ptr(),
-                self.builder.get_insert_block().unwrap().as_mut_ptr(),
-            );
-        }
+        debug
+            .builder
+            .insert_declare(ptr, var, location, self.builder.get_insert_block().unwrap());
         self.location(self.span);
         Ok(())
     }
-    fn debug_type(&mut self, ty: &Type) -> Result<DIType<'ctx>> {
+    fn debug_type(&mut self, ty: &Type) -> Result<Metadata<'ctx>> {
         if let Some(dtype) = self.debug.as_ref().unwrap().types.get(ty) {
             return Ok(*dtype);
         }
         // Temporaries break cycles such as Node -> *Node. Replace every use
         // before finalization and remove the dangling handle from our cache.
-        let placeholder = unsafe {
-            self.debug
-                .as_ref()
-                .unwrap()
-                .builder
-                .create_placeholder_derived_type(self.context)
-        };
+        let placeholder = self
+            .debug
+            .as_ref()
+            .unwrap()
+            .builder
+            .placeholder(self.context);
         self.debug
             .as_mut()
             .unwrap()
             .types
-            .insert(ty.clone(), placeholder.as_type());
+            .insert(ty.clone(), placeholder.metadata());
         let dtype = self.debug_type_inner(ty)?;
-        unsafe {
-            inkwell::llvm_sys::debuginfo::LLVMMetadataReplaceAllUsesWith(
-                placeholder.as_mut_ptr(),
-                dtype.as_mut_ptr(),
-            );
-        }
+        placeholder.replace_with(dtype);
         self.debug.as_mut().unwrap().types.insert(ty.clone(), dtype);
         Ok(dtype)
     }
-    fn debug_type_inner(&mut self, ty: &Type) -> Result<DIType<'ctx>> {
+    fn debug_type_inner(&mut self, ty: &Type) -> Result<Metadata<'ctx>> {
         let llvm = self.storage_ty(ty)?;
         let size = self.data.get_abi_size(&llvm) * 8;
         let align = self.data.get_abi_alignment(&llvm) * 8;
@@ -324,9 +271,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .as_ref()
                     .unwrap()
                     .builder
-                    .create_basic_type(&name, size, encoding, DIFlags::ZERO)
-                    .map_err(error)?
-                    .as_type())
+                    .create_basic_type(&name, size, encoding, LLVMDIFlagZero)
+                    .map_err(error)?)
             }
             Type::Ref(_, inner) | Type::Raw(_, inner) => {
                 let inner = self.debug_type(inner)?;
@@ -335,27 +281,26 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .as_ref()
                     .unwrap()
                     .builder
-                    .create_pointer_type(&name, inner, size, align, AddressSpace::default())
-                    .as_type())
+                    .create_pointer_type(&name, inner, size, align, 0))
             }
             Type::Array(_, inner) | Type::MaybeUninit(inner) => {
                 let n = if let Type::Array(n, _) = ty { *n } else { 1 };
                 let inner = self.debug_type(inner)?;
                 let debug = self.debug.as_ref().unwrap();
-                let array = debug
-                    .builder
-                    .create_array_type(inner, size, align, std::slice::from_ref(&(0..n as i64)))
-                    .as_type();
+                let array = debug.builder.create_array_type(
+                    inner,
+                    size,
+                    align,
+                    std::slice::from_ref(&(0..n as i64)),
+                );
                 let file = debug.files[0];
                 Ok(debug
                     .builder
-                    .create_typedef(array, &name, file, 0, file.as_debug_info_scope(), align)
-                    .as_type())
+                    .create_typedef(array, &name, file, 0, file, align))
             }
             Type::Result(ok, err) => {
                 let span = Span::default();
-                let llvm = llvm.into_struct_type();
-                let storage = llvm.get_field_type_at_index(1).unwrap().into_struct_type();
+                let storage = llvm.get_field_type_at_index(1).unwrap();
                 let mut alternatives = vec![];
                 for (field, ty) in [("value", ok), ("error", err)] {
                     if **ty != Type::Void {
@@ -375,13 +320,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     span,
                     llvm,
                     vec![
-                        (
-                            "is_error".into(),
-                            self.context.bool_type().into(),
-                            tag,
-                            span,
-                        ),
-                        ("payload".into(), storage.into(), payload, span),
+                        ("is_error".into(), self.context.bool_type(), tag, span),
+                        ("payload".into(), storage, payload, span),
                     ],
                 ))
             }
@@ -422,7 +362,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                                     .collect(),
                             )
                         } else {
-                            return self.debug_enum(name, llvm.into_struct_type());
+                            return self.debug_enum(name, llvm);
                         }
                     }
                     _ => return Err(error(format!("cannot describe debug type {ty}"))),
@@ -431,7 +371,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 for (field, ty, span) in fields {
                     members.push((field, self.storage_ty(&ty)?, self.debug_type(&ty)?, span));
                 }
-                Ok(self.debug_struct(&name, span, llvm.into_struct_type(), members))
+                Ok(self.debug_struct(&name, span, llvm, members))
             }
         }
     }
@@ -439,83 +379,74 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         &self,
         name: &str,
         span: Span,
-        llvm: StructType<'ctx>,
-        fields: Vec<(String, BasicTypeEnum<'ctx>, DIType<'ctx>, Span)>,
-    ) -> DIType<'ctx> {
+        llvm: LlvmType<'ctx>,
+        fields: Vec<(String, LlvmType<'ctx>, Metadata<'ctx>, Span)>,
+    ) -> Metadata<'ctx> {
         self.debug_aggregate(name, span, llvm, fields, false)
     }
     fn debug_aggregate(
         &self,
         name: &str,
         span: Span,
-        llvm: StructType<'ctx>,
-        fields: Vec<(String, BasicTypeEnum<'ctx>, DIType<'ctx>, Span)>,
+        llvm: LlvmType<'ctx>,
+        fields: Vec<(String, LlvmType<'ctx>, Metadata<'ctx>, Span)>,
         union: bool,
-    ) -> DIType<'ctx> {
+    ) -> Metadata<'ctx> {
         let debug = self.debug.as_ref().unwrap();
         let (file, line, _) = self.debug_file(span);
-        let scope = file.as_debug_info_scope();
+        let scope = file;
         let members: Vec<_> = fields
             .into_iter()
             .enumerate()
             .map(|(i, (name, ty, dtype, span))| {
                 let (file, line, _) = self.debug_file(span);
-                debug
-                    .builder
-                    .create_member_type(
-                        scope,
-                        &name,
-                        file,
-                        line,
-                        self.data.get_abi_size(&ty) * 8,
-                        self.data.get_abi_alignment(&ty) * 8,
-                        if union {
-                            0
-                        } else {
-                            self.data.offset_of_element(&llvm, i as u32).unwrap() * 8
-                        },
-                        DIFlags::PUBLIC,
-                        dtype,
-                    )
-                    .as_type()
+                debug.builder.create_member_type(
+                    scope,
+                    &name,
+                    file,
+                    line,
+                    self.data.get_abi_size(&ty) * 8,
+                    self.data.get_abi_alignment(&ty) * 8,
+                    if union {
+                        0
+                    } else {
+                        self.data.offset_of_element(&llvm, i as u32).unwrap() * 8
+                    },
+                    LLVMDIFlagPublic,
+                    dtype,
+                )
             })
             .collect();
         if union {
-            return debug
-                .builder
-                .create_union_type(
-                    scope,
-                    name,
-                    file,
-                    line,
-                    self.data.get_abi_size(&llvm) * 8,
-                    self.data.get_abi_alignment(&llvm) * 8,
-                    DIFlags::ZERO,
-                    &members,
-                    0,
-                    "",
-                )
-                .as_type();
-        }
-        debug
-            .builder
-            .create_struct_type(
+            return debug.builder.create_union_type(
                 scope,
                 name,
                 file,
                 line,
                 self.data.get_abi_size(&llvm) * 8,
                 self.data.get_abi_alignment(&llvm) * 8,
-                DIFlags::ZERO,
-                None,
+                LLVMDIFlagZero,
                 &members,
                 0,
-                None,
                 "",
-            )
-            .as_type()
+            );
+        }
+        debug.builder.create_struct_type(
+            scope,
+            name,
+            file,
+            line,
+            self.data.get_abi_size(&llvm) * 8,
+            self.data.get_abi_alignment(&llvm) * 8,
+            LLVMDIFlagZero,
+            None,
+            &members,
+            0,
+            None,
+            "",
+        )
     }
-    fn debug_enum(&mut self, name: &str, llvm: StructType<'ctx>) -> Result<DIType<'ctx>> {
+    fn debug_enum(&mut self, name: &str, llvm: LlvmType<'ctx>) -> Result<Metadata<'ctx>> {
         let decl = self
             .program
             .enums
@@ -535,20 +466,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .enumerate()
             .map(|(i, v)| debug.builder.create_enumerator(&v.name, i as i64, true))
             .collect();
-        let tag = debug
-            .builder
-            .create_enumeration_type(
-                file.as_debug_info_scope(),
-                &format!("{name}.tag"),
-                file,
-                line,
-                32,
-                32,
-                &variants,
-                tag_type,
-            )
-            .as_type();
-        let mut fields = vec![("tag".into(), self.context.i32_type().into(), tag, decl.span)];
+        let tag = debug.builder.create_enumeration_type(
+            file,
+            &format!("{name}.tag"),
+            file,
+            line,
+            32,
+            32,
+            &variants,
+            tag_type,
+        );
+        let mut fields = vec![("tag".into(), self.context.i32_type(), tag, decl.span)];
         let mut alternatives = vec![];
         for variant in &decl.variants {
             let layout = self.variant_ty(&variant.fields)?;
@@ -567,9 +495,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 layout,
                 members,
             );
-            alternatives.push((variant.name.clone(), layout.into(), dtype, variant.span));
+            alternatives.push((variant.name.clone(), layout, dtype, variant.span));
         }
-        let storage = llvm.get_field_type_at_index(1).unwrap().into_struct_type();
+        let storage = llvm.get_field_type_at_index(1).unwrap();
         let payload = self.debug_aggregate(
             &format!("{name}.payload"),
             decl.span,
@@ -577,7 +505,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             alternatives,
             true,
         );
-        fields.push(("payload".into(), storage.into(), payload, decl.span));
+        fields.push(("payload".into(), storage, payload, decl.span));
         Ok(self.debug_struct(name, decl.span, llvm, fields))
     }
 }

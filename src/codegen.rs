@@ -1,26 +1,16 @@
 //! Native code generation. Checked operations keep their checks at every optimization level.
 use crate::ast::*;
-use inkwell::attributes::{Attribute, AttributeLoc};
-use inkwell::basic_block::BasicBlock;
-use inkwell::builder::{Builder, BuilderError};
-use inkwell::comdat::ComdatSelectionKind;
-use inkwell::context::Context;
-use inkwell::intrinsics::Intrinsic;
-use inkwell::module::{Linkage, Module};
-use inkwell::passes::PassBuilderOptions;
-use inkwell::targets::{
-    CodeModel, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
-};
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
-use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
-};
-use inkwell::{
-    AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate, OptimizationLevel,
+use llvm::{Attribute, AttributeLoc, BasicBlock, Builder, LlvmType, Module, TargetData, Value};
+pub use llvm::{Context, FileType, TargetMachine};
+use llvm_sys::LLVMLinkage::{LLVMExternalLinkage, LLVMInternalLinkage, LLVMPrivateLinkage};
+use llvm_sys::{
+    LLVMAtomicOrdering as AtomicOrdering, LLVMAtomicRMWBinOp as AtomicRMWBinOp,
+    LLVMIntPredicate as IntPredicate, LLVMRealPredicate as FloatPredicate,
 };
 use std::collections::HashMap;
 
 mod debug;
+mod llvm;
 mod panic;
 use debug::{DebugInfo, SourceMap};
 
@@ -46,16 +36,6 @@ impl std::fmt::Display for CodegenError {
     }
 }
 impl std::error::Error for CodegenError {}
-impl From<BuilderError> for CodegenError {
-    fn from(e: BuilderError) -> Self {
-        Self(e.to_string())
-    }
-}
-impl From<inkwell::support::LLVMString> for CodegenError {
-    fn from(e: inkwell::support::LLVMString) -> Self {
-        Self(e.to_string())
-    }
-}
 type Result<T> = std::result::Result<T, CodegenError>;
 fn error(s: impl std::fmt::Display) -> CodegenError {
     CodegenError(s.to_string())
@@ -84,35 +64,13 @@ pub struct Generated<'ctx> {
     pub machine: TargetMachine,
 }
 pub fn target_machine(options: &Options) -> Result<TargetMachine> {
-    Target::initialize_all(&InitializationConfig::default());
-    let triple = options
-        .target
-        .as_ref()
-        .map_or_else(TargetMachine::get_default_triple, |s| {
-            TargetTriple::create(s)
-        });
-    let target = Target::from_triple(&triple)?;
-    let level = match options.optimization {
-        0 => OptimizationLevel::None,
-        1 => OptimizationLevel::Less,
-        2 => OptimizationLevel::Default,
-        _ => OptimizationLevel::Aggressive,
-    };
-    target
-        .create_target_machine(
-            &triple,
-            options.cpu.as_deref().unwrap_or("generic"),
-            &options.features,
-            level,
-            RelocMode::PIC,
-            CodeModel::Default,
-        )
-        .ok_or_else(|| error("LLVM could not create the requested target machine"))
+    TargetMachine::create(options)
 }
+
 pub fn pointer_bits(options: &Options) -> Result<u32> {
     Ok(target_machine(options)?
         .get_target_data()
-        .get_pointer_byte_size(None)
+        .get_pointer_byte_size()
         * 8)
 }
 pub fn generate<'ctx>(
@@ -127,7 +85,7 @@ pub fn generate<'ctx>(
     }
     module.set_triple(&machine.get_triple());
     module.set_data_layout(&machine.get_target_data().get_data_layout());
-    let bits = machine.get_target_data().get_pointer_byte_size(None) * 8;
+    let bits = machine.get_target_data().get_pointer_byte_size() * 8;
     let sources = SourceMap::new(&options.sources);
     let debug = if options.debug {
         Some(DebugInfo::new(context, &module, options, &sources)?)
@@ -181,8 +139,7 @@ pub fn generate<'ctx>(
         "globaldce,default<O{}>,globaldce",
         options.optimization.min(3)
     );
-    cg.module
-        .run_passes(&passes, &machine, PassBuilderOptions::create())?;
+    cg.module.run_passes(&passes, &machine)?;
     cg.function_sections();
     cg.module
         .verify()
@@ -197,8 +154,8 @@ pub fn generate<'ctx>(
 struct Binding<'ctx> {
     name: String,
     ty: Type,
-    ptr: PointerValue<'ctx>,
-    live: Option<PointerValue<'ctx>>,
+    ptr: Value<'ctx>,
+    live: Option<Value<'ctx>>,
 }
 #[derive(Clone, Copy)]
 struct Loop<'ctx> {
@@ -207,107 +164,90 @@ struct Loop<'ctx> {
     depth: usize,
 }
 struct YieldTarget<'ctx> {
-    ptr: PointerValue<'ctx>,
+    ptr: Value<'ctx>,
     ty: Type,
     end: BasicBlock<'ctx>,
     depth: usize,
 }
 struct Codegen<'a, 'ctx> {
     context: &'ctx Context,
-    module: Module<'ctx>,
+    // Drop debug metadata and builders before their owning module on errors.
+    debug: Option<DebugInfo<'ctx>>,
     builder: Builder<'ctx>,
+    module: Module<'ctx>,
     program: &'a Program,
-    structs: HashMap<String, StructType<'ctx>>,
-    functions: HashMap<String, FunctionValue<'ctx>>,
-    globals: HashMap<String, (PointerValue<'ctx>, Type)>,
+    structs: HashMap<String, LlvmType<'ctx>>,
+    functions: HashMap<String, Value<'ctx>>,
+    globals: HashMap<String, (Value<'ctx>, Type)>,
     scopes: Vec<Vec<Binding<'ctx>>>,
     loops: Vec<Loop<'ctx>>,
     yields: Vec<YieldTarget<'ctx>>,
-    function: Option<FunctionValue<'ctx>>,
+    function: Option<Value<'ctx>>,
     return_type: Type,
     bits: u32,
     sources: SourceMap<'a>,
-    debug: Option<DebugInfo<'ctx>>,
     span: Span,
     parameter: u32,
-    data: inkwell::targets::TargetData,
+    data: TargetData,
     panic: PanicStrategy,
     test_sources: &'a [crate::package::Source],
     testing: bool,
 }
 impl<'a, 'ctx> Codegen<'a, 'ctx> {
-    fn ty(&self, t: &Type) -> Result<BasicTypeEnum<'ctx>> {
+    fn ty(&self, t: &Type) -> Result<LlvmType<'ctx>> {
         Ok(match t {
-            Type::Bool => self.context.bool_type().into(),
+            Type::Bool => self.context.bool_type(),
             Type::Int { bits, .. } => self
                 .context
                 .custom_width_int_type(
                     std::num::NonZeroU32::new(if *bits == 0 { self.bits } else { *bits }).unwrap(),
                 )
-                .unwrap()
-                .into(),
-            Type::Float(32) => self.context.f32_type().into(),
-            Type::Float(64) => self.context.f64_type().into(),
-            Type::Ref(..) | Type::Raw(..) => self.context.ptr_type(AddressSpace::default()).into(),
+                .unwrap(),
+            Type::Float(32) => self.context.f32_type(),
+            Type::Float(64) => self.context.f64_type(),
+            Type::Ref(..) | Type::Raw(..) => self.context.ptr_type(0),
             Type::Slice(..) | Type::Str => self
                 .context
-                .struct_type(
-                    &[
-                        self.context.ptr_type(AddressSpace::default()).into(),
-                        self.usize_type().into(),
-                    ],
-                    false,
-                )
-                .into(),
+                .struct_type(&[self.context.ptr_type(0), self.usize_type()], false),
             // An opaque single-element array preserves T's ABI size/alignment without
             // exposing an initialized T to the language or invoking its destructor.
-            Type::MaybeUninit(t) => self.ty(t)?.array_type(1).into(),
+            Type::MaybeUninit(t) => self.ty(t)?.array_type(1),
             Type::Array(n, t) => self
                 .ty(t)?
-                .array_type(u32::try_from(*n).map_err(|_| error("array is too large for LLVM"))?)
-                .into(),
+                .array_type(u32::try_from(*n).map_err(|_| error("array is too large for LLVM"))?),
             Type::Named(n) => self
                 .structs
                 .get(n)
                 .copied()
-                .ok_or_else(|| error(format!("unresolved type {n}")))?
-                .into(),
-            Type::Result(t, e) => self
-                .context
-                .struct_type(
-                    &[
-                        self.context.bool_type().into(),
-                        self.union_storage(&[self.payload_ty(t)?, self.payload_ty(e)?])?
-                            .into(),
-                    ],
-                    false,
-                )
-                .into(),
+                .ok_or_else(|| error(format!("unresolved type {n}")))?,
+            Type::Result(t, e) => self.context.struct_type(
+                &[
+                    self.context.bool_type(),
+                    self.union_storage(&[self.payload_ty(t)?, self.payload_ty(e)?])?,
+                ],
+                false,
+            ),
             Type::Option(t) => self
                 .context
-                .struct_type(
-                    &[self.context.bool_type().into(), self.storage_ty(t)?],
-                    false,
-                )
-                .into(),
+                .struct_type(&[self.context.bool_type(), self.storage_ty(t)?], false),
             _ => return Err(error(format!("cannot lower type {t}"))),
         })
     }
-    fn storage_ty(&self, t: &Type) -> Result<BasicTypeEnum<'ctx>> {
+    fn storage_ty(&self, t: &Type) -> Result<LlvmType<'ctx>> {
         if *t == Type::Void {
-            Ok(self.context.i8_type().into())
+            Ok(self.context.i8_type())
         } else {
             self.ty(t)
         }
     }
-    fn payload_ty(&self, t: &Type) -> Result<BasicTypeEnum<'ctx>> {
+    fn payload_ty(&self, t: &Type) -> Result<LlvmType<'ctx>> {
         if *t == Type::Void {
-            Ok(self.context.struct_type(&[], false).into())
+            Ok(self.context.struct_type(&[], false))
         } else {
             self.ty(t)
         }
     }
-    fn variant_ty(&self, fields: &[Field]) -> Result<StructType<'ctx>> {
+    fn variant_ty(&self, fields: &[Field]) -> Result<LlvmType<'ctx>> {
         let fields = fields
             .iter()
             .map(|f| self.ty(&f.ty))
@@ -318,8 +258,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     /// alignment, while bytes preserve every alternative's representation when
     /// the enclosing aggregate is copied or passed by value. Using a real
     /// alternative as storage would lose bytes in its padding or narrow fields.
-    fn union_storage(&self, alternatives: &[BasicTypeEnum<'ctx>]) -> Result<StructType<'ctx>> {
-        let mut aligner: BasicTypeEnum<'ctx> = self.context.i8_type().into();
+    fn union_storage(&self, alternatives: &[LlvmType<'ctx>]) -> Result<LlvmType<'ctx>> {
+        let mut aligner: LlvmType<'ctx> = self.context.i8_type();
         let mut size = 0;
         for ty in alternatives {
             if !ty.is_sized() {
@@ -337,9 +277,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         );
         Ok(self
             .context
-            .struct_type(&[aligner.array_type(0).into(), bytes.into()], false))
+            .struct_type(&[aligner.array_type(0), bytes], false))
     }
-    fn usize_type(&self) -> inkwell::types::IntType<'ctx> {
+    fn usize_type(&self) -> LlvmType<'ctx> {
         self.context
             .custom_width_int_type(std::num::NonZeroU32::new(self.bits).unwrap())
             .unwrap()
@@ -396,12 +336,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         for f in &v.fields {
                             self.define_layout(&f.ty)?;
                         }
-                        alternatives.push(self.variant_ty(&v.fields)?.into());
+                        alternatives.push(self.variant_ty(&v.fields)?);
                     }
-                    vec![
-                        self.context.i32_type().into(),
-                        self.union_storage(&alternatives)?.into(),
-                    ]
+                    vec![self.context.i32_type(), self.union_storage(&alternatives)?]
                 };
                 self.structs[name].set_body(&fields, false);
             }
@@ -416,10 +353,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     }
     fn tagged_value(
         &self,
-        ty: StructType<'ctx>,
-        tag: IntValue<'ctx>,
-        payload: Option<BasicValueEnum<'ctx>>,
-    ) -> Result<BasicValueEnum<'ctx>> {
+        ty: LlvmType<'ctx>,
+        tag: Value<'ctx>,
+        payload: Option<Value<'ctx>>,
+    ) -> Result<Value<'ctx>> {
         // Only the tag and active payload are initialized. Inactive bytes are
         // unspecified, so clearing the whole union would add unnecessary stores.
         // Use undef, not poison: aggregate copies may combine inactive bytes with
@@ -429,13 +366,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .builder
             .build_insert_value(ty.get_undef(), tag, 0, "tag")?;
         let Some(payload) = payload else {
-            return Ok(value.into_struct_value().into());
+            return Ok(value);
         };
-        let ptr = self.alloca(ty.into(), "tagged.value")?;
-        self.builder.build_store(ptr, value.into_struct_value())?;
+        let ptr = self.alloca(ty, "tagged.value")?;
+        self.builder.build_store(ptr, value)?;
         let p = self.builder.build_struct_gep(ty, ptr, 1, "payload")?;
         self.builder.build_store(p, payload)?;
-        Ok(self.builder.build_load(ty, ptr, "tagged")?)
+        self.builder.build_load(ty, ptr, "tagged")
     }
     fn declare_functions(&mut self) -> Result<()> {
         for f in &self.program.functions {
@@ -445,7 +382,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             let params = f
                 .params
                 .iter()
-                .map(|p| self.ty(&p.ty).map(BasicMetadataTypeEnum::from))
+                .map(|p| self.ty(&p.ty))
                 .collect::<Result<Vec<_>>>()?;
             let ty = if f.ret == Type::Void {
                 self.context.void_type().fn_type(&params, false)
@@ -464,11 +401,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 || f.name == "main"
                 || (!f.imported && f.public && !f.generic_instance)
             {
-                Linkage::External
+                LLVMExternalLinkage
             } else {
-                Linkage::Internal
+                LLVMInternalLinkage
             };
-            let function = if let Some(existing) = self.module.get_function(&symbol) {
+            let function = if let Some(existing) = self.module.lookup_function(&symbol) {
                 if !f.extern_ || existing.get_type() != ty {
                     return Err(error(format!(
                         "incompatible declarations of external symbol `{symbol}`"
@@ -507,21 +444,19 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let prefix = if coff { ".text$" } else { ".text." };
         // Assign after optimization so generated helpers get their own sections
         // as well, and an unused exported API can be discarded by the linker.
-        for function in self.module.get_functions() {
+        for function in self.module.functions() {
             if function.count_basic_blocks() != 0 {
                 let name = function.get_name().to_string_lossy();
                 function.set_section(Some(&format!("{prefix}{name}")));
                 if coff {
                     // COFF dead stripping requires COMDAT sections. NoDuplicates
                     // preserves the duplicate-definition error for strong exports.
-                    let comdat = self.module.get_or_insert_comdat(&name);
-                    comdat.set_selection_kind(ComdatSelectionKind::NoDuplicates);
-                    function.as_global_value().set_comdat(comdat);
+                    self.module.set_noduplicate_comdat(function, &name);
                 }
             }
         }
     }
-    fn c_abi_attributes(&self, function: &Function) -> Vec<(AttributeLoc, Attribute)> {
+    fn c_abi_attributes(&self, function: &Function) -> Vec<(AttributeLoc, Attribute<'ctx>)> {
         let triple = self.module.get_triple();
         let triple = triple.as_str().to_string_lossy();
         // SysV x86 C promotes narrow arguments/results in registers. LLVM needs
@@ -574,39 +509,26 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             g.set_initializer(&val);
             g.set_constant(!c.mutable);
             g.set_linkage(if c.public {
-                Linkage::External
+                LLVMExternalLinkage
             } else {
-                Linkage::Internal
+                LLVMInternalLinkage
             });
-            self.globals
-                .insert(c.name.clone(), (g.as_pointer_value(), c.ty.clone()));
+            self.globals.insert(c.name.clone(), (g, c.ty.clone()));
         }
         Ok(())
     }
-    fn string_literal(&self, bytes: &[u8]) -> BasicValueEnum<'ctx> {
+    fn string_literal(&self, bytes: &[u8]) -> Value<'ctx> {
         let data = self.context.const_string(bytes, false);
         let g = self.module.add_global(data.get_type(), None, "string");
         g.set_initializer(&data);
         g.set_constant(true);
-        g.set_linkage(Linkage::Private);
+        g.set_linkage(LLVMPrivateLinkage);
         g.set_unnamed_addr(true);
         self.context
-            .struct_type(
-                &[
-                    self.context.ptr_type(AddressSpace::default()).into(),
-                    self.usize_type().into(),
-                ],
-                false,
-            )
-            .const_named_struct(&[
-                g.as_pointer_value().into(),
-                self.usize_type()
-                    .const_int(bytes.len() as u64, false)
-                    .into(),
-            ])
-            .into()
+            .struct_type(&[self.context.ptr_type(0), self.usize_type()], false)
+            .const_named_struct(&[g, self.usize_type().const_int(bytes.len() as u64, false)])
     }
-    fn constant(&self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
+    fn constant(&self, e: &Expr) -> Result<Value<'ctx>> {
         match &e.kind {
             ExprKind::String(bytes, _) => Ok(self.string_literal(bytes)),
             ExprKind::Name(n) => {
@@ -624,12 +546,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     return Err(error("invalid repeated array constant"));
                 };
                 let value = self.constant(value)?;
-                if match value {
-                    BasicValueEnum::IntValue(v) => v.is_null(),
-                    BasicValueEnum::FloatValue(v) => v.is_null(),
-                    BasicValueEnum::PointerValue(v) => v.is_null(),
-                    _ => false,
-                } {
+                if value.is_null() {
                     return Ok(self.ty(&e.ty)?.const_zero());
                 }
                 if *n > 1_000_000 {
@@ -667,51 +584,22 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         self.constant(e)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Ok(self
-                    .ty(&e.ty)?
-                    .into_struct_type()
-                    .const_named_struct(&values)
-                    .into())
+                Ok(self.ty(&e.ty)?.const_named_struct(&values))
             }
             _ => {
                 use crate::consteval::Scalar;
                 Ok(match crate::consteval::eval(e, self.bits).map_err(error)? {
-                    Scalar::Int(v) => self
-                        .ty(&e.ty)?
-                        .into_int_type()
-                        .const_int(v as u64, false)
-                        .into(),
-                    Scalar::Float(v) => self.ty(&e.ty)?.into_float_type().const_float(v).into(),
-                    Scalar::Bool(v) => self.context.bool_type().const_int(v as u64, false).into(),
+                    Scalar::Int(v) => self.ty(&e.ty)?.const_int(v as u64, false),
+                    Scalar::Float(v) => self.ty(&e.ty)?.const_float(v),
+                    Scalar::Bool(v) => self.context.bool_type().const_int(v as u64, false),
                 })
             }
         }
     }
-    fn const_array(&self, t: &Type, vs: &[BasicValueEnum<'ctx>]) -> Result<BasicValueEnum<'ctx>> {
-        use inkwell::types::BasicTypeEnum::*;
-        Ok(match self.ty(t)? {
-            IntType(t) => t
-                .const_array(&vs.iter().map(|v| v.into_int_value()).collect::<Vec<_>>())
-                .into(),
-            FloatType(t) => t
-                .const_array(&vs.iter().map(|v| v.into_float_value()).collect::<Vec<_>>())
-                .into(),
-            StructType(t) => t
-                .const_array(&vs.iter().map(|v| v.into_struct_value()).collect::<Vec<_>>())
-                .into(),
-            ArrayType(t) => t
-                .const_array(&vs.iter().map(|v| v.into_array_value()).collect::<Vec<_>>())
-                .into(),
-            PointerType(t) => t
-                .const_array(
-                    &vs.iter()
-                        .map(|v| v.into_pointer_value())
-                        .collect::<Vec<_>>(),
-                )
-                .into(),
-            _ => return Err(error("unsupported constant array element")),
-        })
+    fn const_array(&self, t: &Type, vs: &[Value<'ctx>]) -> Result<Value<'ctx>> {
+        Ok(self.ty(t)?.const_array(vs))
     }
+
     fn function(&mut self, f: &Function) -> Result<()> {
         let function = self.functions[&f.name];
         self.function = Some(function);
@@ -765,7 +653,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 ));
             }
         }
-        if self.module.get_function("main").is_some() {
+        if self.module.lookup_function("main").is_some() {
             return Err(error("extern main conflicts with the hosted entry point"));
         }
         let uses_environment = self
@@ -783,10 +671,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             })
             .flatten();
         let entry_params = if arguments_init.is_some() || !tests.is_empty() {
-            vec![
-                self.context.i32_type().into(),
-                self.context.ptr_type(AddressSpace::default()).into(),
-            ]
+            vec![self.context.i32_type(), self.context.ptr_type(0)]
         } else {
             vec![]
         };
@@ -801,8 +686,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.builder.build_call(
                 initialize,
                 &[
-                    entry.get_nth_param(0).unwrap().into(),
-                    entry.get_nth_param(1).unwrap().into(),
+                    entry.get_nth_param(0).unwrap(),
+                    entry.get_nth_param(1).unwrap(),
                 ],
                 "",
             )?;
@@ -818,15 +703,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 .build_call(
                     select,
                     &[
-                        entry.get_nth_param(0).unwrap().into(),
-                        entry.get_nth_param(1).unwrap().into(),
+                        entry.get_nth_param(0).unwrap(),
+                        entry.get_nth_param(1).unwrap(),
                     ],
                     "test.index",
                 )?
-                .try_as_basic_value()
                 .basic()
-                .unwrap()
-                .into_int_value();
+                .unwrap();
             let invalid = self.context.append_basic_block(entry, "invalid.test");
             let cases: Vec<_> = tests
                 .iter()
@@ -847,10 +730,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let call = self
                     .builder
                     .build_call(self.functions[name], &[], "test.result")?;
-                let value = call
-                    .try_as_basic_value()
-                    .basic()
-                    .unwrap_or(self.context.i32_type().const_zero().into());
+                let value = call.basic().unwrap_or(self.context.i32_type().const_zero());
                 self.builder.build_return(Some(&value))?;
             }
             return Ok(());
@@ -858,10 +738,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let call = self
             .builder
             .build_call(self.functions["main"], &[], "dodo.main")?;
-        let value = call
-            .try_as_basic_value()
-            .basic()
-            .unwrap_or(self.context.i32_type().const_zero().into());
+        let value = call.basic().unwrap_or(self.context.i32_type().const_zero());
         self.builder.build_return(Some(&value))?;
         Ok(())
     }
@@ -874,7 +751,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.context
             .append_basic_block(self.function.unwrap(), name)
     }
-    fn alloca(&self, t: BasicTypeEnum<'ctx>, name: &str) -> Result<PointerValue<'ctx>> {
+    fn alloca(&self, t: LlvmType<'ctx>, name: &str) -> Result<Value<'ctx>> {
         let b = self.context.create_builder();
         let entry = self.function.unwrap().get_first_basic_block().unwrap();
         if let Some(i) = entry.get_first_instruction() {
@@ -882,20 +759,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         } else {
             b.position_at_end(entry)
         };
-        Ok(b.build_alloca(t, name)?)
+        b.build_alloca(t, name)
     }
-    fn bind(
-        &mut self,
-        name: &str,
-        ty: &Type,
-        value: Option<BasicValueEnum<'ctx>>,
-    ) -> Result<Binding<'ctx>> {
+    fn bind(&mut self, name: &str, ty: &Type, value: Option<Value<'ctx>>) -> Result<Binding<'ctx>> {
         let ptr = self.alloca(self.ty(ty)?, name)?;
         if let Some(v) = value {
             self.builder.build_store(ptr, v)?;
         }
         let live = if self.needs_drop(ty) {
-            let flag = self.alloca(self.context.bool_type().into(), "initialized")?;
+            let flag = self.alloca(self.context.bool_type(), "initialized")?;
             // A temporary may be created only in a short-circuit branch. Its
             // cleanup flag must still be defined along the skipped path.
             let entry_builder = self.context.create_builder();
@@ -935,8 +807,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .find(|b| b.name == name)
             .cloned()
     }
-    fn load(&self, ptr: PointerValue<'ctx>, t: &Type) -> Result<BasicValueEnum<'ctx>> {
-        Ok(self.builder.build_load(self.ty(t)?, ptr, "value")?)
+    fn load(&self, ptr: Value<'ctx>, t: &Type) -> Result<Value<'ctx>> {
+        self.builder.build_load(self.ty(t)?, ptr, "value")
     }
     fn consume(&self, e: &Expr) -> Result<()> {
         if !e.ty.is_copy()
@@ -964,8 +836,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if let Some(flag) = b.live {
             let live = self
                 .builder
-                .build_load(self.context.bool_type(), flag, "live")?
-                .into_int_value();
+                .build_load(self.context.bool_type(), flag, "live")?;
             let yes = self.bb("drop");
             let done = self.bb("drop.done");
             self.builder.build_conditional_branch(live, yes, done)?;
@@ -1004,7 +875,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             _ => false,
         }
     }
-    fn drop_ptr(&mut self, ptr: PointerValue<'ctx>, ty: &Type) -> Result<()> {
+    fn drop_ptr(&mut self, ptr: Value<'ctx>, ty: &Type) -> Result<()> {
         if !self.needs_drop(ty) {
             return Ok(());
         }
@@ -1012,11 +883,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             Type::Named(n) => {
                 if let Some(s) = self.program.structs.iter().find(|s| s.name == *n).cloned() {
                     if let Some(f) = self.functions.get(&format!("{n}.drop")).copied() {
-                        self.builder.build_call(f, &[ptr.into()], "")?;
+                        self.builder.build_call(f, &[ptr], "")?;
                     }
                     for (i, field) in s.fields.iter().enumerate().rev() {
                         let p = self.builder.build_struct_gep(
-                            self.ty(ty)?.into_struct_type(),
+                            self.ty(ty)?,
                             ptr,
                             i as u32,
                             "drop.field",
@@ -1024,12 +895,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         self.drop_ptr(p, &field.ty)?;
                     }
                 } else if let Some(e) = self.program.enums.iter().find(|e| e.name == *n).cloned() {
-                    let st = self.ty(ty)?.into_struct_type();
+                    let st = self.ty(ty)?;
                     let tagptr = self.builder.build_struct_gep(st, ptr, 0, "tag")?;
                     let tag = self
                         .builder
-                        .build_load(self.context.i32_type(), tagptr, "tag")?
-                        .into_int_value();
+                        .build_load(self.context.i32_type(), tagptr, "tag")?;
                     let end = self.bb("drop.enum.end");
                     let cases = e
                         .variants
@@ -1064,12 +934,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
             }
             Type::Result(t, e) => {
-                let st = self.ty(ty)?.into_struct_type();
+                let st = self.ty(ty)?;
                 let tagptr = self.builder.build_struct_gep(st, ptr, 0, "tag")?;
                 let tag = self
                     .builder
-                    .build_load(self.context.bool_type(), tagptr, "tag")?
-                    .into_int_value();
+                    .build_load(self.context.bool_type(), tagptr, "tag")?;
                 let ok = self.bb("drop.ok");
                 let err = self.bb("drop.err");
                 let end = self.bb("drop.result.end");
@@ -1085,12 +954,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.position_at_end(end);
             }
             Type::Option(t) => {
-                let st = self.ty(ty)?.into_struct_type();
+                let st = self.ty(ty)?;
                 let tp = self.builder.build_struct_gep(st, ptr, 0, "tag")?;
                 let tag = self
                     .builder
-                    .build_load(self.context.bool_type(), tp, "tag")?
-                    .into_int_value();
+                    .build_load(self.context.bool_type(), tp, "tag")?;
                 let some = self.bb("drop.some");
                 let end = self.bb("drop.option.end");
                 self.builder.build_conditional_branch(tag, some, end)?;
@@ -1226,7 +1094,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 then_block,
                 else_block,
             } => {
-                let c = self.expr(condition)?.into_int_value();
+                let c = self.expr(condition)?;
                 let yes = self.bb("if.then");
                 let no = self.bb("if.else");
                 let end = self.bb("if.end");
@@ -1281,7 +1149,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.build_unconditional_branch(head)?;
                 self.builder.position_at_end(head);
                 if let Some(c) = condition {
-                    let v = self.expr(c)?.into_int_value();
+                    let v = self.expr(c)?;
                     self.builder.build_conditional_branch(v, body_bb, end)?;
                 } else {
                     self.builder.build_unconditional_branch(body_bb)?;
@@ -1332,11 +1200,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         Ok(())
     }
-    fn stage(
-        &mut self,
-        expression: &Expr,
-        pending: &mut Vec<PointerValue<'ctx>>,
-    ) -> Result<BasicValueEnum<'ctx>> {
+    fn stage(&mut self, expression: &Expr, pending: &mut Vec<Value<'ctx>>) -> Result<Value<'ctx>> {
         let value = self.expr(expression)?;
         if self.needs_drop(&expression.ty) {
             let binding = self.bind("$pending", &expression.ty, Some(value))?;
@@ -1346,7 +1210,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
         Ok(value)
     }
-    fn transfer(&self, pending: &[PointerValue<'ctx>]) -> Result<()> {
+    fn transfer(&self, pending: &[Value<'ctx>]) -> Result<()> {
         for flag in pending {
             self.builder
                 .build_store(*flag, self.context.bool_type().const_zero())?;
@@ -1359,14 +1223,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     // The checked language requires a copyable element and evaluates it once.
     fn initialize_repeat(
         &mut self,
-        storage: PointerValue<'ctx>,
+        storage: Value<'ctx>,
         ty: &Type,
-        value: BasicValueEnum<'ctx>,
+        value: Value<'ctx>,
     ) -> Result<()> {
         let Type::Array(n, element) = ty else {
             return Err(error("invalid repeated array"));
         };
-        let counter = self.alloca(self.usize_type().into(), "repeat.index")?;
+        let counter = self.alloca(self.usize_type(), "repeat.index")?;
         self.builder
             .build_store(counter, self.usize_type().const_zero())?;
         let head = self.bb("repeat.condition");
@@ -1376,10 +1240,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.builder.position_at_end(head);
         let index = self
             .builder
-            .build_load(self.usize_type(), counter, "repeat.index")?
-            .into_int_value();
+            .build_load(self.usize_type(), counter, "repeat.index")?;
         let more = self.builder.build_int_compare(
-            IntPredicate::ULT,
+            IntPredicate::LLVMIntULT,
             index,
             self.usize_type().const_int(*n as u64, false),
             "repeat.more",
@@ -1401,18 +1264,18 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.builder.position_at_end(end);
         Ok(())
     }
-    fn expr(&mut self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
+    fn expr(&mut self, e: &Expr) -> Result<Value<'ctx>> {
         let previous = self.span;
         self.location(e.span);
         let result = self.expr_inner(e);
         self.location(previous);
         result
     }
-    fn expr_inner(&mut self, e: &Expr) -> Result<BasicValueEnum<'ctx>> {
+    fn expr_inner(&mut self, e: &Expr) -> Result<Value<'ctx>> {
         let value = match &e.kind {
-            ExprKind::Int(v, _) => self.ty(&e.ty)?.into_int_type().const_int(*v, false).into(),
-            ExprKind::Float(v, _) => self.ty(&e.ty)?.into_float_type().const_float(*v).into(),
-            ExprKind::Bool(v) => self.context.bool_type().const_int(*v as u64, false).into(),
+            ExprKind::Int(v, _) => self.ty(&e.ty)?.const_int(*v, false),
+            ExprKind::Float(v, _) => self.ty(&e.ty)?.const_float(*v),
+            ExprKind::Bool(v) => self.context.bool_type().const_int(*v as u64, false),
             ExprKind::String(bytes, _) => self.string_literal(bytes),
             ExprKind::Name(n) => {
                 if n == "none" {
@@ -1445,7 +1308,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.yields.pop();
                 self.builder.position_at_end(end);
                 if e.ty == Type::Void {
-                    self.context.i8_type().const_zero().into()
+                    self.context.i8_type().const_zero()
                 } else {
                     self.load(ptr, &e.ty)?
                 }
@@ -1456,24 +1319,24 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let (ptr, length, element) = self.collection(base)?;
                 let start = if let Some(e) = start {
                     let v = self.expr(e)?;
-                    self.cast(v, &e.ty, &Type::usize())?.into_int_value()
+                    self.cast(v, &e.ty, &Type::usize())?
                 } else {
                     self.usize_type().const_zero()
                 };
                 let end = if let Some(e) = end {
                     let v = self.expr(e)?;
-                    self.cast(v, &e.ty, &Type::usize())?.into_int_value()
+                    self.cast(v, &e.ty, &Type::usize())?
                 } else {
                     length
                 };
                 let ordered = self.builder.build_int_compare(
-                    IntPredicate::ULE,
+                    IntPredicate::LLVMIntULE,
                     start,
                     end,
                     "slice.ordered",
                 )?;
                 let inside = self.builder.build_int_compare(
-                    IntPredicate::ULE,
+                    IntPredicate::LLVMIntULE,
                     end,
                     length,
                     "slice.inside",
@@ -1488,29 +1351,25 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         .build_gep(self.ty(&element)?, ptr, &[start], "slice.data")?
                 };
                 let length = self.builder.build_int_sub(end, start, "slice.length")?;
-                let slice = self.ty(&e.ty)?.into_struct_type().const_zero();
+                let slice = self.ty(&e.ty)?.const_zero();
                 let slice = self
                     .builder
-                    .build_insert_value(slice, data, 0, "slice.ptr")?
-                    .into_struct_value();
+                    .build_insert_value(slice, data, 0, "slice.ptr")?;
                 self.builder
                     .build_insert_value(slice, length, 1, "slice.len")?
-                    .into_struct_value()
-                    .into()
             }
             ExprKind::Range(..) => return Err(error("unresolved range reached code generation")),
             ExprKind::Array(_, xs) => {
-                let mut array = self.ty(&e.ty)?.into_array_type().const_zero();
+                let mut array = self.ty(&e.ty)?.const_zero();
                 let mut pending = Vec::new();
                 for (i, x) in xs.iter().enumerate() {
                     let v = self.stage(x, &mut pending)?;
                     array = self
                         .builder
-                        .build_insert_value(array, v, i as u32, "array")?
-                        .into_array_value();
+                        .build_insert_value(array, v, i as u32, "array")?;
                 }
                 self.transfer(&pending)?;
-                array.into()
+                array
             }
             ExprKind::Struct(n, fields) => {
                 let st = self
@@ -1534,13 +1393,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         .position(|f| f.name == *name)
                         .ok_or_else(|| error("unknown field"))?;
                     let x = self.stage(e, &mut pending)?;
-                    v = self
-                        .builder
-                        .build_insert_value(v, x, i as u32, "struct")?
-                        .into_struct_value();
+                    v = self.builder.build_insert_value(v, x, i as u32, "struct")?;
                 }
                 self.transfer(&pending)?;
-                v.into()
+                v
             }
             ExprKind::Unary(op, x) => match op {
                 UnaryOp::Borrow | UnaryOp::BorrowMut => {
@@ -1548,52 +1404,40 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     if let Type::Slice(_, _) = &e.ty {
                         match &x.ty {
                             Type::Array(n, _) => {
-                                let mut v = self.ty(&e.ty)?.into_struct_type().const_zero();
-                                v = self
-                                    .builder
-                                    .build_insert_value(v, ptr, 0, "slice.ptr")?
-                                    .into_struct_value();
-                                self.builder
-                                    .build_insert_value(
-                                        v,
-                                        self.usize_type().const_int(*n as u64, false),
-                                        1,
-                                        "slice.len",
-                                    )?
-                                    .into_struct_value()
-                                    .into()
+                                let mut v = self.ty(&e.ty)?.const_zero();
+                                v = self.builder.build_insert_value(v, ptr, 0, "slice.ptr")?;
+                                self.builder.build_insert_value(
+                                    v,
+                                    self.usize_type().const_int(*n as u64, false),
+                                    1,
+                                    "slice.len",
+                                )?
                             }
                             _ => self.load(ptr, &e.ty)?,
                         }
                     } else {
-                        ptr.into()
+                        ptr
                     }
                 }
                 UnaryOp::Deref => {
-                    let p = self.expr(x)?.into_pointer_value();
+                    let p = self.expr(x)?;
                     self.load(p, &e.ty)?
                 }
                 UnaryOp::Neg => {
                     if let ExprKind::Int(v, _) = x.kind {
-                        self.ty(&e.ty)?
-                            .into_int_type()
-                            .const_int(v, false)
-                            .const_neg()
-                            .into()
+                        self.ty(&e.ty)?.const_int(v, false).const_neg()
                     } else {
                         let v = self.expr(x)?;
                         if e.ty.is_integer() {
                             self.binary(BinaryOp::Sub, self.ty(&e.ty)?.const_zero(), v, &e.ty)?
                         } else {
-                            self.builder
-                                .build_float_neg(v.into_float_value(), "neg")?
-                                .into()
+                            self.builder.build_float_neg(v, "neg")?
                         }
                     }
                 }
                 UnaryOp::Not | UnaryOp::BitNot => {
-                    let v = self.expr(x)?.into_int_value();
-                    self.builder.build_not(v, "not")?.into()
+                    let v = self.expr(x)?;
+                    self.builder.build_not(v, "not")?
                 }
             },
             ExprKind::Binary(op, l, r) => {
@@ -1627,13 +1471,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         .position(|v| v.name == *n)
                         .ok_or_else(|| error("unknown enum variant"))?;
                     return self.tagged_value(
-                        self.ty(&e.ty)?.into_struct_type(),
+                        self.ty(&e.ty)?,
                         self.context.i32_type().const_int(idx as u64, false),
                         None,
                     );
                 }
                 if n == "len" {
-                    self.collection(x)?.1.into()
+                    self.collection(x)?.1
                 } else {
                     let p = self.place(e)?;
                     self.load(p, &e.ty)?
@@ -1648,18 +1492,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.cast(v, &x.ty, t)?
             }
             ExprKind::Try(x) => {
-                let v = self.expr(x)?.into_struct_value();
+                let v = self.expr(x)?;
                 let Type::Result(success, failure) = &x.ty else {
                     return Err(error("propagation requires a Result"));
                 };
                 let st = v.get_type();
-                let ptr = self.alloca(st.into(), "propagate.value")?;
+                let ptr = self.alloca(st, "propagate.value")?;
                 self.builder.build_store(ptr, v)?;
                 let p = self.builder.build_struct_gep(st, ptr, 1, "payload")?;
-                let tag = self
-                    .builder
-                    .build_extract_value(v, 0, "is.error")?
-                    .into_int_value();
+                let tag = self.builder.build_extract_value(v, 0, "is.error")?;
                 let err = self.bb("propagate.error");
                 let ok = self.bb("propagate.ok");
                 self.builder.build_conditional_branch(tag, err, ok)?;
@@ -1670,7 +1511,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     Some(self.load(p, failure)?)
                 };
                 let ret = self.tagged_value(
-                    self.ty(&self.return_type)?.into_struct_type(),
+                    self.ty(&self.return_type)?,
                     self.context.bool_type().const_int(1, false),
                     payload,
                 )?;
@@ -1678,7 +1519,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.build_return(Some(&ret))?;
                 self.builder.position_at_end(ok);
                 if **success == Type::Void {
-                    self.context.i8_type().const_zero().into()
+                    self.context.i8_type().const_zero()
                 } else {
                     self.load(p, success)?
                 }
@@ -1687,21 +1528,21 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.consume(e)?;
         Ok(value)
     }
-    fn place(&mut self, e: &Expr) -> Result<PointerValue<'ctx>> {
+    fn place(&mut self, e: &Expr) -> Result<Value<'ctx>> {
         let previous = self.span;
         self.location(e.span);
         let result = self.place_inner(e);
         self.location(previous);
         result
     }
-    fn place_inner(&mut self, e: &Expr) -> Result<PointerValue<'ctx>> {
+    fn place_inner(&mut self, e: &Expr) -> Result<Value<'ctx>> {
         match &e.kind {
             ExprKind::Name(n) => self
                 .binding(n)
                 .map(|b| b.ptr)
                 .or_else(|| self.globals.get(n).map(|g| g.0))
                 .ok_or_else(|| error(format!("{n} has no address"))),
-            ExprKind::Unary(UnaryOp::Deref, x) => Ok(self.expr(x)?.into_pointer_value()),
+            ExprKind::Unary(UnaryOp::Deref, x) => Ok(self.expr(x)?),
             ExprKind::Field(x, n) => {
                 let (p, t) = self.autoderef_place(x)?;
                 let Type::Named(name) = &t else {
@@ -1718,20 +1559,20 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .iter()
                     .position(|f| f.name == *n)
                     .ok_or_else(|| error(format!("unknown field {n}")))?;
-                Ok(self.builder.build_struct_gep(
-                    self.ty(&t)?.into_struct_type(),
-                    p,
-                    i as u32,
-                    "field.ptr",
-                )?)
+                Ok(self
+                    .builder
+                    .build_struct_gep(self.ty(&t)?, p, i as u32, "field.ptr")?)
             }
             ExprKind::Index(x, i) => {
                 let (ptr, len, t) = self.collection(x)?;
                 let idx = self.expr(i)?;
-                let wide = self.cast(idx, &i.ty, &Type::usize())?.into_int_value();
-                let in_bounds =
-                    self.builder
-                        .build_int_compare(IntPredicate::ULT, wide, len, "in.bounds")?;
+                let wide = self.cast(idx, &i.ty, &Type::usize())?;
+                let in_bounds = self.builder.build_int_compare(
+                    IntPredicate::LLVMIntULT,
+                    wide,
+                    len,
+                    "in.bounds",
+                )?;
                 self.guard(in_bounds, "index bounds", "index out of bounds")?;
                 // The bounds check dominates this GEP; no inbounds assumption is needed.
                 Ok(unsafe {
@@ -1745,18 +1586,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
         }
     }
-    fn autoderef_place(&mut self, e: &Expr) -> Result<(PointerValue<'ctx>, Type)> {
+    fn autoderef_place(&mut self, e: &Expr) -> Result<(Value<'ctx>, Type)> {
         let mut ty = e.ty.clone();
         let mut p = self.place(e)?;
         while let Type::Ref(_, t) = ty {
-            p = self
-                .load(p, &Type::Ref(false, t.clone()))?
-                .into_pointer_value();
+            p = self.load(p, &Type::Ref(false, t.clone()))?;
             ty = *t;
         }
         Ok((p, ty))
     }
-    fn collection(&mut self, e: &Expr) -> Result<(PointerValue<'ctx>, IntValue<'ctx>, Type)> {
+    fn collection(&mut self, e: &Expr) -> Result<(Value<'ctx>, Value<'ctx>, Type)> {
         match &e.ty {
             Type::Array(n, t) => Ok((
                 self.place(e)?,
@@ -1764,7 +1603,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 *t.clone(),
             )),
             Type::Ref(_, t) => {
-                let p = self.expr(e)?.into_pointer_value();
+                let p = self.expr(e)?;
                 match &**t {
                     Type::Array(n, t) => {
                         Ok((p, self.usize_type().const_int(*n as u64, false), *t.clone()))
@@ -1773,38 +1612,25 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
             }
             Type::Slice(_, t) => {
-                let v = self.expr(e)?.into_struct_value();
+                let v = self.expr(e)?;
                 Ok((
-                    self.builder
-                        .build_extract_value(v, 0, "data")?
-                        .into_pointer_value(),
-                    self.builder
-                        .build_extract_value(v, 1, "len")?
-                        .into_int_value(),
+                    self.builder.build_extract_value(v, 0, "data")?,
+                    self.builder.build_extract_value(v, 1, "len")?,
                     *t.clone(),
                 ))
             }
             Type::Str => {
-                let v = self.expr(e)?.into_struct_value();
+                let v = self.expr(e)?;
                 Ok((
-                    self.builder
-                        .build_extract_value(v, 0, "data")?
-                        .into_pointer_value(),
-                    self.builder
-                        .build_extract_value(v, 1, "len")?
-                        .into_int_value(),
+                    self.builder.build_extract_value(v, 0, "data")?,
+                    self.builder.build_extract_value(v, 1, "len")?,
                     Type::u8(),
                 ))
             }
             _ => Err(error(format!("{} is not an array or slice", e.ty))),
         }
     }
-    fn array_gep(
-        &self,
-        p: PointerValue<'ctx>,
-        t: &Type,
-        i: IntValue<'ctx>,
-    ) -> Result<PointerValue<'ctx>> {
+    fn array_gep(&self, p: Value<'ctx>, t: &Type, i: Value<'ctx>) -> Result<Value<'ctx>> {
         // Callers use a statically in-range index into an array of this exact type.
         Ok(unsafe {
             self.builder.build_gep(
@@ -1815,7 +1641,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             )?
         })
     }
-    fn guard(&mut self, valid: IntValue<'ctx>, check: &str, reason: &str) -> Result<()> {
+    fn guard(&mut self, valid: Value<'ctx>, check: &str, reason: &str) -> Result<()> {
         let ok = self.bb("checked");
         let fail = self.bb("trap");
         self.builder.build_conditional_branch(valid, ok, fail)?;
@@ -1830,24 +1656,25 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(())
     }
     fn trap(&mut self) -> Result<()> {
-        let trap = Intrinsic::find("llvm.trap")
-            .and_then(|i| i.get_declaration(&self.module, &[]))
+        let trap = self
+            .module
+            .intrinsic("llvm.trap", &[])
             .ok_or_else(|| error("LLVM trap intrinsic is unavailable"))?;
         self.builder.build_call(trap, &[], "")?;
         self.builder.build_unreachable()?;
         Ok(())
     }
-    fn test_runtime_call(&self, name: &str, args: &[BasicValueEnum<'ctx>]) -> Result<()> {
-        let types: Vec<_> = args.iter().map(|v| v.get_type().into()).collect();
+    fn test_runtime_call(&self, name: &str, args: &[Value<'ctx>]) -> Result<()> {
+        let types: Vec<_> = args.iter().map(|v| v.get_type()).collect();
         let ty = self.context.void_type().fn_type(&types, false);
         let function = self
             .module
-            .get_function(name)
+            .lookup_function(name)
             .unwrap_or_else(|| self.module.add_function(name, ty, None));
         if function.get_type() != ty {
             return Err(error(format!("{name} is reserved for the test runtime")));
         }
-        let args: Vec<_> = args.iter().copied().map(Into::into).collect();
+        let args: Vec<_> = args.to_vec();
         self.builder.build_call(function, &args, "")?;
         Ok(())
     }
@@ -1874,55 +1701,43 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.test_runtime_call(
             "dodo_test_failure",
             &[
-                text.as_pointer_value().into(),
-                self.usize_type()
-                    .const_int(report.len() as u64, false)
-                    .into(),
+                text,
+                self.usize_type().const_int(report.len() as u64, false),
             ],
         )
     }
-    fn report_value(&self, label: u64, value: BasicValueEnum<'ctx>, ty: &Type) -> Result<()> {
+    fn report_value(&self, label: u64, value: Value<'ctx>, ty: &Type) -> Result<()> {
         if !self.testing {
             return Ok(());
         }
-        let label = self.context.i32_type().const_int(label, false).into();
+        let label = self.context.i32_type().const_int(label, false);
         match ty {
             Type::Bool => {
-                let value = self.builder.build_int_z_extend(
-                    value.into_int_value(),
-                    self.context.i32_type(),
-                    "test.bool",
-                )?;
-                self.test_runtime_call("dodo_test_bool", &[label, value.into()])
+                let value =
+                    self.builder
+                        .build_int_z_extend(value, self.context.i32_type(), "test.bool")?;
+                self.test_runtime_call("dodo_test_bool", &[label, value])
             }
             Type::Str => {
-                let value = value.into_struct_value();
                 let ptr = self.builder.build_extract_value(value, 0, "text.ptr")?;
                 let len = self.builder.build_extract_value(value, 1, "text.len")?;
                 self.test_runtime_call("dodo_test_text", &[label, ptr, len])
             }
             Type::Float(_) => {
-                let value = self.builder.build_float_cast(
-                    value.into_float_value(),
-                    self.context.f64_type(),
-                    "test.float",
-                )?;
-                self.test_runtime_call("dodo_test_float", &[label, value.into()])
+                let value =
+                    self.builder
+                        .build_float_cast(value, self.context.f64_type(), "test.float")?;
+                self.test_runtime_call("dodo_test_float", &[label, value])
             }
             _ => {
                 let signed = matches!(ty, Type::Int { signed: true, .. });
                 let value = if value.is_pointer_value() {
-                    self.builder.build_ptr_to_int(
-                        value.into_pointer_value(),
-                        self.context.i64_type(),
-                        "test.address",
-                    )?
-                } else if value.is_struct_value() {
                     self.builder
-                        .build_extract_value(value.into_struct_value(), 0, "test.tag")?
-                        .into_int_value()
+                        .build_ptr_to_int(value, self.context.i64_type(), "test.address")?
+                } else if value.is_struct_value() {
+                    self.builder.build_extract_value(value, 0, "test.tag")?
                 } else {
-                    value.into_int_value()
+                    value
                 };
                 let value = self.builder.build_int_cast_sign_flag(
                     value,
@@ -1936,38 +1751,20 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     } else {
                         "dodo_test_unsigned"
                     },
-                    &[label, value.into()],
+                    &[label, value],
                 )
             }
         }
     }
     /// String assertions compare bytes, including embedded NULs, without adding
     /// a libc dependency to ordinary freestanding assertion users.
-    fn strings_equal(
-        &self,
-        a: BasicValueEnum<'ctx>,
-        b: BasicValueEnum<'ctx>,
-    ) -> Result<IntValue<'ctx>> {
-        let a = a.into_struct_value();
-        let b = b.into_struct_value();
-        let ap = self
-            .builder
-            .build_extract_value(a, 0, "left.ptr")?
-            .into_pointer_value();
-        let bp = self
-            .builder
-            .build_extract_value(b, 0, "right.ptr")?
-            .into_pointer_value();
-        let al = self
-            .builder
-            .build_extract_value(a, 1, "left.len")?
-            .into_int_value();
-        let bl = self
-            .builder
-            .build_extract_value(b, 1, "right.len")?
-            .into_int_value();
-        let result = self.alloca(self.context.bool_type().into(), "strings.equal")?;
-        let index = self.alloca(self.usize_type().into(), "strings.index")?;
+    fn strings_equal(&self, a: Value<'ctx>, b: Value<'ctx>) -> Result<Value<'ctx>> {
+        let ap = self.builder.build_extract_value(a, 0, "left.ptr")?;
+        let bp = self.builder.build_extract_value(b, 0, "right.ptr")?;
+        let al = self.builder.build_extract_value(a, 1, "left.len")?;
+        let bl = self.builder.build_extract_value(b, 1, "right.len")?;
+        let result = self.alloca(self.context.bool_type(), "strings.equal")?;
+        let index = self.alloca(self.usize_type(), "strings.index")?;
         self.builder
             .build_store(result, self.context.bool_type().const_zero())?;
         self.builder
@@ -1979,17 +1776,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let end = self.bb("strings.end");
         let same_length =
             self.builder
-                .build_int_compare(IntPredicate::EQ, al, bl, "same.length")?;
+                .build_int_compare(IntPredicate::LLVMIntEQ, al, bl, "same.length")?;
         self.builder
             .build_conditional_branch(same_length, head, end)?;
         self.builder.position_at_end(head);
-        let i = self
-            .builder
-            .build_load(self.usize_type(), index, "index")?
-            .into_int_value();
+        let i = self.builder.build_load(self.usize_type(), index, "index")?;
         let done = self
             .builder
-            .build_int_compare(IntPredicate::EQ, i, al, "done")?;
+            .build_int_compare(IntPredicate::LLVMIntEQ, i, al, "done")?;
         self.builder.build_conditional_branch(done, equal, body)?;
         self.builder.position_at_end(body);
         let (ap, bp) = unsafe {
@@ -2002,15 +1796,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         };
         let av = self
             .builder
-            .build_load(self.context.i8_type(), ap, "left")?
-            .into_int_value();
+            .build_load(self.context.i8_type(), ap, "left")?;
         let bv = self
             .builder
-            .build_load(self.context.i8_type(), bp, "right")?
-            .into_int_value();
+            .build_load(self.context.i8_type(), bp, "right")?;
         let same = self
             .builder
-            .build_int_compare(IntPredicate::EQ, av, bv, "same.byte")?;
+            .build_int_compare(IntPredicate::LLVMIntEQ, av, bv, "same.byte")?;
         self.builder.build_conditional_branch(same, next, end)?;
         self.builder.position_at_end(next);
         let increment =
@@ -2023,13 +1815,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .build_store(result, self.context.bool_type().const_int(1, false))?;
         self.builder.build_unconditional_branch(end)?;
         self.builder.position_at_end(end);
-        Ok(self
-            .builder
-            .build_load(self.context.bool_type(), result, "equal")?
-            .into_int_value())
+        self.builder
+            .build_load(self.context.bool_type(), result, "equal")
     }
-    fn short_circuit(&mut self, op: BinaryOp, l: &Expr, r: &Expr) -> Result<BasicValueEnum<'ctx>> {
-        let a = self.expr(l)?.into_int_value();
+    fn short_circuit(&mut self, op: BinaryOp, l: &Expr, r: &Expr) -> Result<Value<'ctx>> {
+        let a = self.expr(l)?;
         let left = self.builder.get_insert_block().unwrap();
         let rhs = self.bb("logic.rhs");
         let end = self.bb("logic.end");
@@ -2039,73 +1829,60 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.builder.build_conditional_branch(a, end, rhs)?;
         }
         self.builder.position_at_end(rhs);
-        let b = self.expr(r)?.into_int_value();
+        let b = self.expr(r)?;
         let right = self.builder.get_insert_block().unwrap();
         self.builder.build_unconditional_branch(end)?;
         self.builder.position_at_end(end);
         let phi = self.builder.build_phi(self.context.bool_type(), "logic")?;
         phi.add_incoming(&[(&a, left), (&b, right)]);
-        Ok(phi.as_basic_value())
+        Ok(phi)
     }
     fn binary(
         &mut self,
         op: BinaryOp,
-        a: BasicValueEnum<'ctx>,
-        b: BasicValueEnum<'ctx>,
+        a: Value<'ctx>,
+        b: Value<'ctx>,
         t: &Type,
-    ) -> Result<BasicValueEnum<'ctx>> {
+    ) -> Result<Value<'ctx>> {
         use BinaryOp::*;
         if matches!(t, Type::Float(_)) {
-            let a = a.into_float_value();
-            let b = b.into_float_value();
             return Ok(match op {
-                Add => self.builder.build_float_add(a, b, "add")?.into(),
-                Sub => self.builder.build_float_sub(a, b, "sub")?.into(),
-                Mul => self.builder.build_float_mul(a, b, "mul")?.into(),
-                Div => self.builder.build_float_div(a, b, "div")?.into(),
-                Rem => self.builder.build_float_rem(a, b, "rem")?.into(),
-                Eq | Ne | Lt | Le | Gt | Ge => self
-                    .builder
-                    .build_float_compare(
-                        match op {
-                            Eq => FloatPredicate::OEQ,
-                            Ne => FloatPredicate::UNE,
-                            Lt => FloatPredicate::OLT,
-                            Le => FloatPredicate::OLE,
-                            Gt => FloatPredicate::OGT,
-                            _ => FloatPredicate::OGE,
-                        },
-                        a,
-                        b,
-                        "compare",
-                    )?
-                    .into(),
+                Add => self.builder.build_float_add(a, b, "add")?,
+                Sub => self.builder.build_float_sub(a, b, "sub")?,
+                Mul => self.builder.build_float_mul(a, b, "mul")?,
+                Div => self.builder.build_float_div(a, b, "div")?,
+                Rem => self.builder.build_float_rem(a, b, "rem")?,
+                Eq | Ne | Lt | Le | Gt | Ge => self.builder.build_float_compare(
+                    match op {
+                        Eq => FloatPredicate::LLVMRealOEQ,
+                        Ne => FloatPredicate::LLVMRealUNE,
+                        Lt => FloatPredicate::LLVMRealOLT,
+                        Le => FloatPredicate::LLVMRealOLE,
+                        Gt => FloatPredicate::LLVMRealOGT,
+                        _ => FloatPredicate::LLVMRealOGE,
+                    },
+                    a,
+                    b,
+                    "compare",
+                )?,
                 _ => return Err(error("invalid floating point operation")),
             });
         }
         let (a, b) = if a.is_struct_value() {
             (
-                self.builder
-                    .build_extract_value(a.into_struct_value(), 0, "tag")?
-                    .into_int_value(),
-                self.builder
-                    .build_extract_value(b.into_struct_value(), 0, "tag")?
-                    .into_int_value(),
+                self.builder.build_extract_value(a, 0, "tag")?,
+                self.builder.build_extract_value(b, 0, "tag")?,
             )
         } else if a.is_pointer_value() {
-            let ai = self.builder.build_ptr_to_int(
-                a.into_pointer_value(),
-                self.usize_type(),
-                "address",
-            )?;
-            let bi = self.builder.build_ptr_to_int(
-                b.into_pointer_value(),
-                self.usize_type(),
-                "address",
-            )?;
+            let ai = self
+                .builder
+                .build_ptr_to_int(a, self.usize_type(), "address")?;
+            let bi = self
+                .builder
+                .build_ptr_to_int(b, self.usize_type(), "address")?;
             (ai, bi)
         } else {
-            (a.into_int_value(), b.into_int_value())
+            (a, b)
         };
         let signed = matches!(t, Type::Int { signed: true, .. });
         let ity = a.get_type();
@@ -2120,27 +1897,23 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         _ => "mul",
                     }
                 );
-                let intrinsic = Intrinsic::find(&name)
-                    .and_then(|i| i.get_declaration(&self.module, &[ity.into()]))
+                let intrinsic = self
+                    .module
+                    .intrinsic(&name, &[ity])
                     .ok_or_else(|| error("overflow intrinsic unavailable"))?;
                 let out = self
                     .builder
-                    .build_call(intrinsic, &[a.into(), b.into()], "checked.arithmetic")?
-                    .try_as_basic_value()
+                    .build_call(intrinsic, &[a, b], "checked.arithmetic")?
                     .basic()
-                    .unwrap()
-                    .into_struct_value();
-                let overflow = self
-                    .builder
-                    .build_extract_value(out, 1, "overflow")?
-                    .into_int_value();
+                    .unwrap();
+                let overflow = self.builder.build_extract_value(out, 1, "overflow")?;
                 let valid = self.builder.build_not(overflow, "no.overflow")?;
                 self.guard(valid, "arithmetic overflow", "integer overflow")?;
                 self.builder.build_extract_value(out, 0, "result")?
             }
             Div | Rem => {
                 let nz = self.builder.build_int_compare(
-                    IntPredicate::NE,
+                    IntPredicate::LLVMIntNE,
                     b,
                     ity.const_zero(),
                     "nonzero",
@@ -2148,11 +1921,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.guard(nz, "division by zero", "division or remainder by zero")?;
                 if signed {
                     let min = ity.const_int(1u64 << (ity.get_bit_width() - 1), false);
-                    let a_min =
-                        self.builder
-                            .build_int_compare(IntPredicate::EQ, a, min, "is.min")?;
+                    let a_min = self.builder.build_int_compare(
+                        IntPredicate::LLVMIntEQ,
+                        a,
+                        min,
+                        "is.min",
+                    )?;
                     let b_neg = self.builder.build_int_compare(
-                        IntPredicate::EQ,
+                        IntPredicate::LLVMIntEQ,
                         b,
                         ity.const_all_ones(),
                         "is.neg.one",
@@ -2162,58 +1938,55 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.guard(valid, "division overflow", "signed division overflow")?;
                 }
                 match (op, signed) {
-                    (Div, true) => self.builder.build_int_signed_div(a, b, "div")?.into(),
-                    (Div, false) => self.builder.build_int_unsigned_div(a, b, "div")?.into(),
-                    (_, true) => self.builder.build_int_signed_rem(a, b, "rem")?.into(),
-                    _ => self.builder.build_int_unsigned_rem(a, b, "rem")?.into(),
+                    (Div, true) => self.builder.build_int_signed_div(a, b, "div")?,
+                    (Div, false) => self.builder.build_int_unsigned_div(a, b, "div")?,
+                    (_, true) => self.builder.build_int_signed_rem(a, b, "rem")?,
+                    _ => self.builder.build_int_unsigned_rem(a, b, "rem")?,
                 }
             }
-            Eq | Ne | Lt | Le | Gt | Ge => self
-                .builder
-                .build_int_compare(
-                    match op {
-                        Eq => IntPredicate::EQ,
-                        Ne => IntPredicate::NE,
-                        Lt => {
-                            if signed {
-                                IntPredicate::SLT
-                            } else {
-                                IntPredicate::ULT
-                            }
+            Eq | Ne | Lt | Le | Gt | Ge => self.builder.build_int_compare(
+                match op {
+                    Eq => IntPredicate::LLVMIntEQ,
+                    Ne => IntPredicate::LLVMIntNE,
+                    Lt => {
+                        if signed {
+                            IntPredicate::LLVMIntSLT
+                        } else {
+                            IntPredicate::LLVMIntULT
                         }
-                        Le => {
-                            if signed {
-                                IntPredicate::SLE
-                            } else {
-                                IntPredicate::ULE
-                            }
+                    }
+                    Le => {
+                        if signed {
+                            IntPredicate::LLVMIntSLE
+                        } else {
+                            IntPredicate::LLVMIntULE
                         }
-                        Gt => {
-                            if signed {
-                                IntPredicate::SGT
-                            } else {
-                                IntPredicate::UGT
-                            }
+                    }
+                    Gt => {
+                        if signed {
+                            IntPredicate::LLVMIntSGT
+                        } else {
+                            IntPredicate::LLVMIntUGT
                         }
-                        _ => {
-                            if signed {
-                                IntPredicate::SGE
-                            } else {
-                                IntPredicate::UGE
-                            }
+                    }
+                    _ => {
+                        if signed {
+                            IntPredicate::LLVMIntSGE
+                        } else {
+                            IntPredicate::LLVMIntUGE
                         }
-                    },
-                    a,
-                    b,
-                    "compare",
-                )?
-                .into(),
-            BitAnd => self.builder.build_and(a, b, "and")?.into(),
-            BitOr => self.builder.build_or(a, b, "or")?.into(),
-            BitXor => self.builder.build_xor(a, b, "xor")?.into(),
+                    }
+                },
+                a,
+                b,
+                "compare",
+            )?,
+            BitAnd => self.builder.build_and(a, b, "and")?,
+            BitOr => self.builder.build_or(a, b, "or")?,
+            BitXor => self.builder.build_xor(a, b, "xor")?,
             Shl | Shr => {
                 let valid = self.builder.build_int_compare(
-                    IntPredicate::ULT,
+                    IntPredicate::LLVMIntULT,
                     b,
                     ity.const_int(ity.get_bit_width() as u64, false),
                     "shift.valid",
@@ -2222,32 +1995,29 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 if op == Shl {
                     let v = self.builder.build_left_shift(a, b, "shl")?;
                     let back = self.builder.build_right_shift(v, b, signed, "shift.back")?;
-                    let fits =
-                        self.builder
-                            .build_int_compare(IntPredicate::EQ, back, a, "shift.fits")?;
+                    let fits = self.builder.build_int_compare(
+                        IntPredicate::LLVMIntEQ,
+                        back,
+                        a,
+                        "shift.fits",
+                    )?;
                     self.guard(fits, "shift overflow", "left shift overflow")?;
-                    v.into()
+                    v
                 } else {
-                    self.builder.build_right_shift(a, b, signed, "shr")?.into()
+                    self.builder.build_right_shift(a, b, signed, "shr")?
                 }
             }
             And | Or => return Err(error("logical operator must use short-circuit lowering")),
         })
     }
-    fn cast(
-        &mut self,
-        v: BasicValueEnum<'ctx>,
-        from: &Type,
-        to: &Type,
-    ) -> Result<BasicValueEnum<'ctx>> {
+    fn cast(&mut self, v: Value<'ctx>, from: &Type, to: &Type) -> Result<Value<'ctx>> {
         match (from, to) {
             (Type::Int { signed: fs, .. }, Type::Int { signed: ts, .. }) => {
-                let v = v.into_int_value();
-                let out = self.ty(to)?.into_int_type();
+                let out = self.ty(to)?;
                 let source = v.get_type();
                 if *fs && !*ts {
                     let nonnegative = self.builder.build_int_compare(
-                        IntPredicate::SGE,
+                        IntPredicate::LLVMIntSGE,
                         v,
                         source.const_zero(),
                         "cast.nonnegative",
@@ -2266,9 +2036,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         *ts,
                         "cast.back",
                     )?;
-                    let fits =
-                        self.builder
-                            .build_int_compare(IntPredicate::EQ, back, v, "cast.fits")?;
+                    let fits = self.builder.build_int_compare(
+                        IntPredicate::LLVMIntEQ,
+                        back,
+                        v,
+                        "cast.fits",
+                    )?;
                     self.guard(
                         fits,
                         "numeric conversion",
@@ -2278,7 +2051,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 if !*fs && *ts && out.get_bit_width() <= source.get_bit_width() {
                     let max = (1u64 << (out.get_bit_width() - 1)) - 1;
                     let fits = self.builder.build_int_compare(
-                        IntPredicate::ULE,
+                        IntPredicate::LLVMIntULE,
                         v,
                         source.const_int(max, false),
                         "cast.fits",
@@ -2289,23 +2062,18 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         "integer conversion out of range",
                     )?;
                 }
-                Ok(converted.into())
+                Ok(converted)
             }
             (Type::Int { signed, .. }, Type::Float(_)) => {
-                let t = self.ty(to)?.into_float_type();
+                let t = self.ty(to)?;
                 Ok(if *signed {
-                    self.builder
-                        .build_signed_int_to_float(v.into_int_value(), t, "cast")?
-                        .into()
+                    self.builder.build_signed_int_to_float(v, t, "cast")?
                 } else {
-                    self.builder
-                        .build_unsigned_int_to_float(v.into_int_value(), t, "cast")?
-                        .into()
+                    self.builder.build_unsigned_int_to_float(v, t, "cast")?
                 })
             }
             (Type::Float(_), Type::Int { signed, .. }) => {
-                let v = v.into_float_value();
-                let t = self.ty(to)?.into_int_type();
+                let t = self.ty(to)?;
                 let bits = t.get_bit_width();
                 let low = if *signed {
                     -(2f64).powi(bits as i32 - 1)
@@ -2314,13 +2082,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 };
                 let high = (2f64).powi(bits as i32 - if *signed { 1 } else { 0 });
                 let lo = self.builder.build_float_compare(
-                    FloatPredicate::OGE,
+                    FloatPredicate::LLVMRealOGE,
                     v,
                     v.get_type().const_float(low),
                     "cast.lower",
                 )?;
                 let hi = self.builder.build_float_compare(
-                    FloatPredicate::OLT,
+                    FloatPredicate::LLVMRealOLT,
                     v,
                     v.get_type().const_float(high),
                     "cast.upper",
@@ -2332,28 +2100,26 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     "float-to-integer conversion out of range",
                 )?;
                 Ok(if *signed {
-                    self.builder.build_float_to_signed_int(v, t, "cast")?.into()
+                    self.builder.build_float_to_signed_int(v, t, "cast")?
                 } else {
-                    self.builder
-                        .build_float_to_unsigned_int(v, t, "cast")?
-                        .into()
+                    self.builder.build_float_to_unsigned_int(v, t, "cast")?
                 })
             }
             (Type::Float(_), Type::Float(_)) => {
-                let source = v.into_float_value();
-                let target = self.ty(to)?.into_float_type();
+                let source = v;
+                let target = self.ty(to)?;
                 let out = self.builder.build_float_cast(source, target, "cast")?;
                 if target.get_bit_width() < source.get_type().get_bit_width() {
                     let max = source.get_type().const_float(f32::MAX as f64);
                     let min = source.get_type().const_float(-(f32::MAX as f64));
                     let hi = self.builder.build_float_compare(
-                        FloatPredicate::OLE,
+                        FloatPredicate::LLVMRealOLE,
                         source,
                         max,
                         "cast.upper",
                     )?;
                     let lo = self.builder.build_float_compare(
-                        FloatPredicate::OGE,
+                        FloatPredicate::LLVMRealOGE,
                         source,
                         min,
                         "cast.lower",
@@ -2365,25 +2131,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         "floating-point conversion out of range",
                     )?;
                 }
-                Ok(out.into())
+                Ok(out)
             }
             (Type::Raw(..) | Type::Ref(..), Type::Raw(..) | Type::Ref(..)) => Ok(v),
-            (Type::Int { .. }, Type::Raw(..)) => Ok(self
-                .builder
-                .build_int_to_ptr(
-                    v.into_int_value(),
-                    self.context.ptr_type(AddressSpace::default()),
-                    "pointer",
-                )?
-                .into()),
-            (Type::Raw(..), Type::Int { .. }) => Ok(self
-                .builder
-                .build_ptr_to_int(
-                    v.into_pointer_value(),
-                    self.ty(to)?.into_int_type(),
-                    "address",
-                )?
-                .into()),
+            (Type::Int { .. }, Type::Raw(..)) => {
+                Ok(self
+                    .builder
+                    .build_int_to_ptr(v, self.context.ptr_type(0), "pointer")?)
+            }
+            (Type::Raw(..), Type::Int { .. }) => {
+                Ok(self.builder.build_ptr_to_int(v, self.ty(to)?, "address")?)
+            }
             _ if from == to => Ok(v),
             _ => Err(error(format!(
                 "cannot lower conversion from {from} to {to}"
@@ -2396,14 +2154,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         type_args: &[Type],
         args: &[Expr],
         ret: &Type,
-    ) -> Result<BasicValueEnum<'ctx>> {
-        let unit = self.context.i8_type().const_zero().into();
+    ) -> Result<Value<'ctx>> {
+        let unit = self.context.i8_type().const_zero();
         if matches!(
             name,
             "core.wrapping_add" | "core.wrapping_sub" | "core.wrapping_mul"
         ) {
-            let a = self.expr(&args[0])?.into_int_value();
-            let b = self.expr(&args[1])?.into_int_value();
+            let a = self.expr(&args[0])?;
+            let b = self.expr(&args[1])?;
             // Plain LLVM integer operations wrap modulo 2^N. Do not attach
             // no-wrap flags or route these through checked arithmetic.
             return Ok(match name {
@@ -2411,8 +2169,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 "core.wrapping_sub" => self.builder.build_int_sub(a, b, "wrapping.sub")?,
                 "core.wrapping_mul" => self.builder.build_int_mul(a, b, "wrapping.mul")?,
                 _ => unreachable!(),
-            }
-            .into());
+            });
         }
         if matches!(name, "core.assert" | "core.assert_eq" | "core.assert_ne") {
             let count = if name == "core.assert" { 1 } else { 2 };
@@ -2421,13 +2178,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 .map(|e| self.expr(e))
                 .collect::<Result<Vec<_>>>()?;
             let valid = if count == 1 {
-                values[0].into_int_value()
+                values[0]
             } else {
                 let equal = if args[0].ty == Type::Str {
                     self.strings_equal(values[0], values[1])?
                 } else {
                     self.binary(BinaryOp::Eq, values[0], values[1], &args[0].ty)?
-                        .into_int_value()
                 };
                 if name == "core.assert_ne" {
                     self.builder.build_not(equal, "not.equal")?
@@ -2456,19 +2212,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             return Ok(unit);
         }
         if matches!(name, "mem.split_at_mut" | "core.mem.split_at_mut") {
-            let input = self.expr(&args[0])?.into_struct_value();
-            let mid = self.expr(&args[1])?.into_int_value();
-            let pointer = self
-                .builder
-                .build_extract_value(input, 0, "split.ptr")?
-                .into_pointer_value();
-            let length = self
-                .builder
-                .build_extract_value(input, 1, "split.len")?
-                .into_int_value();
-            let inside =
-                self.builder
-                    .build_int_compare(IntPredicate::ULE, mid, length, "split.inside")?;
+            let input = self.expr(&args[0])?;
+            let mid = self.expr(&args[1])?;
+            let pointer = self.builder.build_extract_value(input, 0, "split.ptr")?;
+            let length = self.builder.build_extract_value(input, 1, "split.len")?;
+            let inside = self.builder.build_int_compare(
+                IntPredicate::LLVMIntULE,
+                mid,
+                length,
+                "split.inside",
+            )?;
             self.guard(inside, "slice bounds", "slice bounds out of range")?;
             let Type::Slice(true, element) = &args[0].ty else {
                 return Err(error("split requires a mutable slice"));
@@ -2482,57 +2235,45 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             let right_length = self.builder.build_int_sub(length, mid, "split.right.len")?;
             let left = self
                 .builder
-                .build_insert_value(input, mid, 1, "split.left")?
-                .into_struct_value();
+                .build_insert_value(input, mid, 1, "split.left")?;
             let right = self
                 .builder
-                .build_insert_value(input, right_pointer, 0, "split.right")?
-                .into_struct_value();
+                .build_insert_value(input, right_pointer, 0, "split.right")?;
             let right = self
                 .builder
-                .build_insert_value(right, right_length, 1, "split.right")?
-                .into_struct_value();
-            let pair = self.ty(ret)?.into_struct_type().const_zero();
+                .build_insert_value(right, right_length, 1, "split.right")?;
+            let pair = self.ty(ret)?.const_zero();
             let pair = self
                 .builder
-                .build_insert_value(pair, left, 0, "split.pair")?
-                .into_struct_value();
-            return Ok(self
+                .build_insert_value(pair, left, 0, "split.pair")?;
+            return self
                 .builder
-                .build_insert_value(pair, right, 1, "split.pair")?
-                .into_struct_value()
-                .into());
+                .build_insert_value(pair, right, 1, "split.pair");
         }
         if name == "ok" || name == "err" || name == "some" || name == "none" {
             if matches!(ret, Type::Result(..)) {
                 let payload = args.first().map(|e| self.expr(e)).transpose()?;
                 return self.tagged_value(
-                    self.ty(ret)?.into_struct_type(),
+                    self.ty(ret)?,
                     self.context
                         .bool_type()
                         .const_int((name == "err") as u64, false),
                     payload,
                 );
             }
-            let mut v = self.ty(ret)?.into_struct_type().const_zero();
+            let mut v = self.ty(ret)?.const_zero();
             let tag = name == "err" || name == "some";
-            v = self
-                .builder
-                .build_insert_value(
-                    v,
-                    self.context.bool_type().const_int(tag as u64, false),
-                    0,
-                    "tag",
-                )?
-                .into_struct_value();
+            v = self.builder.build_insert_value(
+                v,
+                self.context.bool_type().const_int(tag as u64, false),
+                0,
+                "tag",
+            )?;
             if let Some(e) = args.first() {
                 let x = self.expr(e)?;
-                v = self
-                    .builder
-                    .build_insert_value(v, x, 1, "payload")?
-                    .into_struct_value();
+                v = self.builder.build_insert_value(v, x, 1, "payload")?;
             }
-            return Ok(v.into());
+            return Ok(v);
         }
         if name == "core.drop" {
             let e = &args[0];
@@ -2557,11 +2298,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             if *argument == Type::Void {
                 return Ok(self
                     .usize_type()
-                    .const_int(u64::from(name.ends_with("align_of")), false)
-                    .into());
+                    .const_int(u64::from(name.ends_with("align_of")), false));
             }
             let t = self.ty(argument)?;
-            let data = inkwell::targets::TargetData::create(
+            let data = TargetData::create(
                 self.module
                     .get_data_layout()
                     .as_str()
@@ -2584,12 +2324,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .find(|s| s.name == *owner)
                     .and_then(|s| s.fields.iter().position(|f| f.name.as_bytes() == bytes))
                     .ok_or_else(|| error("unknown field in field offset query"))?;
-                data.offset_of_element(&t.into_struct_type(), index as u32)
+                data.offset_of_element(&t, index as u32)
                     .ok_or_else(|| error("field offset is unavailable for this struct"))?
             } else {
                 data.get_abi_alignment(&t) as u64
             };
-            return Ok(self.usize_type().const_int(value, false).into());
+            return Ok(self.usize_type().const_int(value, false));
         }
         if let Some(op) = name.strip_prefix("core.mem.") {
             if let Some(operation) = op.strip_prefix("atomic_") {
@@ -2607,17 +2347,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         "atomic integer primitives are not supported for target `{triple}`; no OS or libatomic fallback is inserted"
                     )));
                 }
-                let pointer = self.expr(&args[0])?.into_pointer_value();
+                let pointer = self.expr(&args[0])?;
                 let order = |index: usize| -> Result<AtomicOrdering> {
                     let ExprKind::Int(value, _) = args[index].kind else {
                         return Err(error("atomic ordering was not checked"));
                     };
                     Ok(match value {
-                        0 => AtomicOrdering::Monotonic,
-                        1 => AtomicOrdering::Acquire,
-                        2 => AtomicOrdering::Release,
-                        3 => AtomicOrdering::AcquireRelease,
-                        4 => AtomicOrdering::SequentiallyConsistent,
+                        0 => AtomicOrdering::LLVMAtomicOrderingMonotonic,
+                        1 => AtomicOrdering::LLVMAtomicOrderingAcquire,
+                        2 => AtomicOrdering::LLVMAtomicOrderingRelease,
+                        3 => AtomicOrdering::LLVMAtomicOrderingAcquireRelease,
+                        4 => AtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
                         _ => return Err(error("invalid atomic ordering")),
                     })
                 };
@@ -2629,7 +2369,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         let instruction = value.as_instruction_value().unwrap();
                         instruction.set_atomic_ordering(order(1)?).map_err(error)?;
                         instruction
-                            .set_alignment(self.ty(ret)?.into_int_type().get_bit_width() / 8)
+                            .set_alignment(self.ty(ret)?.get_bit_width() / 8)
                             .map_err(error)?;
                         return Ok(value);
                     }
@@ -2638,29 +2378,26 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         let instruction = self.builder.build_store(pointer, value)?;
                         instruction.set_atomic_ordering(order(2)?).map_err(error)?;
                         instruction
-                            .set_alignment(value.into_int_value().get_type().get_bit_width() / 8)
+                            .set_alignment(value.get_type().get_bit_width() / 8)
                             .map_err(error)?;
                         return Ok(unit);
                     }
                     "exchange" | "fetch_add" => {
-                        let value = self.expr(&args[1])?.into_int_value();
-                        return Ok(self
-                            .builder
-                            .build_atomicrmw(
-                                if operation == "exchange" {
-                                    AtomicRMWBinOp::Xchg
-                                } else {
-                                    AtomicRMWBinOp::Add
-                                },
-                                pointer,
-                                value,
-                                order(2)?,
-                            )?
-                            .into());
+                        let value = self.expr(&args[1])?;
+                        return self.builder.build_atomicrmw(
+                            if operation == "exchange" {
+                                AtomicRMWBinOp::LLVMAtomicRMWBinOpXchg
+                            } else {
+                                AtomicRMWBinOp::LLVMAtomicRMWBinOpAdd
+                            },
+                            pointer,
+                            value,
+                            order(2)?,
+                        );
                     }
                     "compare_exchange" => {
-                        let expected = self.expr(&args[1])?.into_int_value();
-                        let replacement = self.expr(&args[2])?.into_int_value();
+                        let expected = self.expr(&args[1])?;
+                        let replacement = self.expr(&args[2])?;
                         let result = self.builder.build_cmpxchg(
                             pointer,
                             expected,
@@ -2668,11 +2405,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                             order(3)?,
                             order(4)?,
                         )?;
-                        return Ok(self.builder.build_extract_value(
-                            result,
-                            0,
-                            "atomic.observed",
-                        )?);
+                        return self
+                            .builder
+                            .build_extract_value(result, 0, "atomic.observed");
                     }
                     _ => return Err(error("unknown atomic intrinsic")),
                 }
@@ -2683,13 +2418,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     let ExprKind::Name(target) = &args[0].kind else {
                         return Err(error("callback target was not checked"));
                     };
-                    return Ok(self
+                    return self
                         .functions
                         .get(target)
-                        .ok_or_else(|| error("callback function is unavailable"))?
-                        .as_global_value()
-                        .as_pointer_value()
-                        .into());
+                        .copied()
+                        .ok_or_else(|| error("callback function is unavailable"));
                 }
                 "uninit" => {
                     // The bytes are deliberately opaque. Zero initialization is an
@@ -2698,30 +2431,24 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
                 "init" => {
                     let value = self.expr(&args[0])?;
-                    return Ok(self
-                        .builder
-                        .build_insert_value(
-                            self.ty(ret)?.into_array_type().const_zero(),
-                            value,
-                            0,
-                            "storage.init",
-                        )?
-                        .into_array_value()
-                        .into());
+                    return self.builder.build_insert_value(
+                        self.ty(ret)?.const_zero(),
+                        value,
+                        0,
+                        "storage.init",
+                    );
                 }
                 "assume_init" => {
-                    let storage = self.expr(&args[0])?.into_array_value();
-                    return Ok(self.builder.build_extract_value(
-                        storage,
-                        0,
-                        "storage.assume_init",
-                    )?);
+                    let storage = self.expr(&args[0])?;
+                    return self
+                        .builder
+                        .build_extract_value(storage, 0, "storage.assume_init");
                 }
                 "uninit_as_ptr" | "uninit_as_mut_ptr" | "str_bytes" | "str_from_utf8" => {
                     return self.expr(&args[0]);
                 }
                 "replace" | "swap" => {
-                    let pointer = self.expr(&args[0])?.into_pointer_value();
+                    let pointer = self.expr(&args[0])?;
                     let Type::Ref(_, element) = &args[0].ty else {
                         return Err(error("memory exchange requires a reference"));
                     };
@@ -2735,7 +2462,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         self.builder.build_store(pointer, replacement)?;
                         return Ok(old);
                     }
-                    let other = replacement.into_pointer_value();
+                    let other = replacement;
                     let second = self
                         .builder
                         .build_load(self.ty(element)?, other, "mem.other")?;
@@ -2750,12 +2477,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .strip_prefix("mmio.")
             .or_else(|| name.strip_prefix("core.mmio."));
         if let Some(op) = mmio {
-            let address = self.expr(&args[0])?.into_int_value();
-            let pointer = self.builder.build_int_to_ptr(
-                address,
-                self.context.ptr_type(AddressSpace::default()),
-                "mmio.address",
-            )?;
+            let address = self.expr(&args[0])?;
+            let pointer =
+                self.builder
+                    .build_int_to_ptr(address, self.context.ptr_type(0), "mmio.address")?;
             if op.starts_with("read") {
                 let value = self
                     .builder
@@ -2782,48 +2507,39 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         {
             let input = self.expr(&args[0])?;
             if matches!(op, "as_ptr" | "as_mut_ptr") && matches!(args[0].ty, Type::Slice(..)) {
-                return Ok(self.builder.build_extract_value(
-                    input.into_struct_value(),
-                    0,
-                    "slice.pointer",
-                )?);
+                return self.builder.build_extract_value(input, 0, "slice.pointer");
             }
-            let pointer = input.into_pointer_value();
+            let pointer = input;
             match op {
                 "view" | "borrow" | "borrow_mut" => {
                     self.expr(&args[1])?;
-                    return Ok(pointer.into());
+                    return Ok(pointer);
                 }
                 "view_slice" | "borrow_slice" | "borrow_slice_mut" => {
                     let length = self.expr(&args[1])?;
                     self.expr(&args[2])?;
-                    let value = self
+                    let value = self.builder.build_insert_value(
+                        self.ty(ret)?.const_zero(),
+                        pointer,
+                        0,
+                        "owned.slice.pointer",
+                    )?;
+                    return self
                         .builder
-                        .build_insert_value(
-                            self.ty(ret)?.into_struct_type().const_zero(),
-                            pointer,
-                            0,
-                            "owned.slice.pointer",
-                        )?
-                        .into_struct_value();
-                    return Ok(self
-                        .builder
-                        .build_insert_value(value, length, 1, "owned.slice.length")?
-                        .into_struct_value()
-                        .into());
+                        .build_insert_value(value, length, 1, "owned.slice.length");
                 }
-                "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr" => return Ok(pointer.into()),
-                "is_null" => return Ok(self.builder.build_is_null(pointer, "ptr.is_null")?.into()),
+                "from_ref" | "from_mut" | "as_ptr" | "as_mut_ptr" => return Ok(pointer),
+                "is_null" => return self.builder.build_is_null(pointer, "ptr.is_null"),
                 "relocate" | "copy" | "copy_nonoverlapping" | "write_bytes" => {
                     let second = self.expr(&args[1])?;
-                    let count = self.expr(&args[2])?.into_int_value();
+                    let count = self.expr(&args[2])?;
                     if op == "relocate" {
                         self.expr(&args[3])?;
                     }
                     let Type::Raw(_, element) = &args[0].ty else {
                         return Err(error("memory operation requires a raw pointer"));
                     };
-                    let data = inkwell::targets::TargetData::create(
+                    let data = TargetData::create(
                         self.module
                             .get_data_layout()
                             .as_str()
@@ -2837,30 +2553,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     let bytes = self.builder.build_int_mul(count, size, "ptr.byte_count")?;
                     match op {
                         "copy" | "relocate" => {
-                            self.builder.build_memmove(
-                                second.into_pointer_value(),
-                                1,
-                                pointer,
-                                1,
-                                bytes,
-                            )?;
+                            self.builder.build_memmove(second, 1, pointer, 1, bytes)?;
                         }
                         "copy_nonoverlapping" => {
-                            self.builder.build_memcpy(
-                                second.into_pointer_value(),
-                                1,
-                                pointer,
-                                1,
-                                bytes,
-                            )?;
+                            self.builder.build_memcpy(second, 1, pointer, 1, bytes)?;
                         }
                         _ => {
-                            self.builder.build_memset(
-                                pointer,
-                                1,
-                                second.into_int_value(),
-                                bytes,
-                            )?;
+                            self.builder.build_memset(pointer, 1, second, bytes)?;
                         }
                     }
                     return Ok(unit);
@@ -2903,15 +2602,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     return Ok(unit);
                 }
                 "offset" => {
-                    let offset = self.expr(&args[1])?.into_int_value();
+                    let offset = self.expr(&args[1])?;
                     let Type::Raw(_, t) = ret else {
                         return Err(error("pointer offset requires raw pointer"));
                     };
                     return Ok(unsafe {
                         self.builder
                             .build_gep(self.ty(t)?, pointer, &[offset], "ptr.offset")?
-                    }
-                    .into());
+                    });
                 }
                 _ => {}
             }
@@ -2924,20 +2622,19 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 .iter()
                 .position(|v| v.name == variant)
                 .ok_or_else(|| error("unknown variant"))?;
-            let st = self.ty(ret)?.into_struct_type();
+            let st = self.ty(ret)?;
             let mut payload = self.variant_ty(&decl.variants[i].fields)?.const_zero();
             let mut pending = Vec::new();
             for (j, arg) in args.iter().enumerate() {
                 let x = self.stage(arg, &mut pending)?;
                 payload = self
                     .builder
-                    .build_insert_value(payload, x, j as u32, "payload")?
-                    .into_struct_value();
+                    .build_insert_value(payload, x, j as u32, "payload")?;
             }
             let v = self.tagged_value(
                 st,
                 self.context.i32_type().const_int(i as u64, false),
-                Some(payload.into()),
+                Some(payload),
             )?;
             self.transfer(&pending)?;
             return Ok(v);
@@ -2950,10 +2647,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let mut pending = Vec::new();
         let vs = args
             .iter()
-            .map(|e| {
-                self.stage(e, &mut pending)
-                    .map(BasicMetadataValueEnum::from)
-            })
+            .map(|e| self.stage(e, &mut pending))
             .collect::<Result<Vec<_>>>()?;
         self.transfer(&pending)?;
         let call = self
@@ -2969,7 +2663,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 call.add_attribute(location, attribute);
             }
         }
-        Ok(call.try_as_basic_value().basic().unwrap_or(unit))
+        Ok(call.basic().unwrap_or(unit))
     }
     fn foreach(
         &mut self,
@@ -2982,7 +2676,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let (ptr, len, element) = self.collection(iterable)?;
         let mutable = matches!(iterable.ty, Type::Slice(true, _) | Type::Ref(true, _))
             || matches!(iterable.kind, ExprKind::Unary(UnaryOp::BorrowMut, _));
-        let counter = self.alloca(self.usize_type().into(), "foreach.index")?;
+        let counter = self.alloca(self.usize_type(), "foreach.index")?;
         self.builder
             .build_store(counter, self.usize_type().const_zero())?;
         let head = self.bb("foreach.condition");
@@ -2993,11 +2687,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.builder.position_at_end(head);
         let i = self
             .builder
-            .build_load(self.usize_type(), counter, "index")?
-            .into_int_value();
-        let test = self
-            .builder
-            .build_int_compare(IntPredicate::ULT, i, len, "foreach.more")?;
+            .build_load(self.usize_type(), counter, "index")?;
+        let test =
+            self.builder
+                .build_int_compare(IntPredicate::LLVMIntULT, i, len, "foreach.more")?;
         self.builder.build_conditional_branch(test, bb, end)?;
         self.builder.position_at_end(bb);
         self.loops.push(Loop {
@@ -3007,7 +2700,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         });
         self.push_scope();
         if let Some(name) = index {
-            self.bind(name, &Type::usize(), Some(i.into()))?;
+            self.bind(name, &Type::usize(), Some(i))?;
         }
         // The loop condition proves the element index is below the captured length.
         let p = unsafe {
@@ -3020,7 +2713,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.bind(name, &element, Some(value))?;
             }
         } else {
-            self.bind(name, &Type::Ref(mutable, Box::new(element)), Some(p.into()))?;
+            self.bind(name, &Type::Ref(mutable, Box::new(element)), Some(p))?;
         }
         self.block(body)?;
         if !self.terminated() {
@@ -3092,19 +2785,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn pattern_value(
         &mut self,
         value: &Expr,
-    ) -> Result<(
-        PointerValue<'ctx>,
-        Type,
-        Option<bool>,
-        Option<Binding<'ctx>>,
-    )> {
+    ) -> Result<(Value<'ctx>, Type, Option<bool>, Option<Binding<'ctx>>)> {
         if let Type::Ref(mutable, inner) = &value.ty {
-            Ok((
-                self.expr(value)?.into_pointer_value(),
-                *inner.clone(),
-                Some(*mutable),
-                None,
-            ))
+            Ok((self.expr(value)?, *inner.clone(), Some(*mutable), None))
         } else {
             let value_ir = self.expr(value)?;
             let owner = self.bind("$pattern", &value.ty, Some(value_ir))?;
@@ -3116,14 +2799,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn pattern_place(
         &self,
         pattern: &Pattern,
-        mut ptr: PointerValue<'ctx>,
+        mut ptr: Value<'ctx>,
         ty: &Type,
         mut borrowed: Option<bool>,
-    ) -> Result<(PointerValue<'ctx>, Type, Option<bool>)> {
+    ) -> Result<(Value<'ctx>, Type, Option<bool>)> {
         let mut ty = ty.clone();
         if !matches!(pattern, Pattern::Binding(_) | Pattern::Wildcard) {
             while let Type::Ref(mutable, inner) = &ty {
-                ptr = self.load(ptr, &ty)?.into_pointer_value();
+                ptr = self.load(ptr, &ty)?;
                 borrowed = Some(borrowed.is_none_or(|outer| outer) && *mutable);
                 ty = *inner.clone();
             }
@@ -3132,9 +2815,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     }
     fn struct_pattern_fields(
         &self,
-        ptr: PointerValue<'ctx>,
+        ptr: Value<'ctx>,
         ty: &Type,
-    ) -> Result<Vec<(String, PointerValue<'ctx>, Type)>> {
+    ) -> Result<Vec<(String, Value<'ctx>, Type)>> {
         let Type::Named(name) = ty else {
             return Err(error("struct pattern on non-struct value"));
         };
@@ -3144,7 +2827,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .iter()
             .find(|s| s.name == *name)
             .ok_or_else(|| error("unknown struct pattern"))?;
-        let st = self.ty(ty)?.into_struct_type();
+        let st = self.ty(ty)?;
         declaration
             .fields
             .iter()
@@ -3163,7 +2846,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn pattern_test(
         &mut self,
         pattern: &Pattern,
-        ptr: PointerValue<'ctx>,
+        ptr: Value<'ctx>,
         ty: &Type,
         yes: BasicBlock<'ctx>,
         no: BasicBlock<'ctx>,
@@ -3174,15 +2857,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.build_unconditional_branch(yes)?;
             }
             Pattern::Int(value) | Pattern::Range(value, _, _) => {
-                let value_ir = self.load(ptr, &ty)?.into_int_value();
+                let value_ir = self.load(ptr, &ty)?;
                 let signed = matches!(ty, Type::Int { signed: true, .. });
                 let lower = value_ir.get_type().const_int(*value, false);
                 let test = if let Pattern::Range(_, upper, inclusive) = pattern {
                     let lower_test = self.builder.build_int_compare(
                         if signed {
-                            IntPredicate::SGE
+                            IntPredicate::LLVMIntSGE
                         } else {
-                            IntPredicate::UGE
+                            IntPredicate::LLVMIntUGE
                         },
                         value_ir,
                         lower,
@@ -3190,10 +2873,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     )?;
                     let upper_test = self.builder.build_int_compare(
                         match (signed, inclusive) {
-                            (true, true) => IntPredicate::SLE,
-                            (true, false) => IntPredicate::SLT,
-                            (false, true) => IntPredicate::ULE,
-                            (false, false) => IntPredicate::ULT,
+                            (true, true) => IntPredicate::LLVMIntSLE,
+                            (true, false) => IntPredicate::LLVMIntSLT,
+                            (false, true) => IntPredicate::LLVMIntULE,
+                            (false, false) => IntPredicate::LLVMIntULT,
                         },
                         value_ir,
                         value_ir.get_type().const_int(*upper, false),
@@ -3203,7 +2886,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         .build_and(lower_test, upper_test, "pattern.range")?
                 } else {
                     self.builder.build_int_compare(
-                        IntPredicate::EQ,
+                        IntPredicate::LLVMIntEQ,
                         value_ir,
                         lower,
                         "pattern.equal",
@@ -3212,9 +2895,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.build_conditional_branch(test, yes, no)?;
             }
             Pattern::Bool(value) => {
-                let value_ir = self.load(ptr, &ty)?.into_int_value();
+                let value_ir = self.load(ptr, &ty)?;
                 let test = self.builder.build_int_compare(
-                    IntPredicate::EQ,
+                    IntPredicate::LLVMIntEQ,
                     value_ir,
                     self.context.bool_type().const_int(*value as u64, false),
                     "pattern.bool",
@@ -3222,23 +2905,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.build_conditional_branch(test, yes, no)?;
             }
             Pattern::Variant(name, fields) => {
-                let tagptr = self.builder.build_struct_gep(
-                    self.ty(&ty)?.into_struct_type(),
-                    ptr,
-                    0,
-                    "pattern.tag",
-                )?;
+                let tagptr = self
+                    .builder
+                    .build_struct_gep(self.ty(&ty)?, ptr, 0, "pattern.tag")?;
                 let tag_type = if matches!(ty, Type::Named(_)) {
                     self.context.i32_type()
                 } else {
                     self.context.bool_type()
                 };
-                let tag = self
-                    .builder
-                    .build_load(tag_type, tagptr, "tag")?
-                    .into_int_value();
+                let tag = self.builder.build_load(tag_type, tagptr, "tag")?;
                 let test = self.builder.build_int_compare(
-                    IntPredicate::EQ,
+                    IntPredicate::LLVMIntEQ,
                     tag,
                     tag_type.const_int(self.variant_tag(&ty, name)?, false),
                     "pattern.variant",
@@ -3293,7 +2970,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn pattern_bind(
         &mut self,
         pattern: &Pattern,
-        ptr: PointerValue<'ctx>,
+        ptr: Value<'ctx>,
         ty: &Type,
         borrowed: Option<bool>,
         preview: bool,
@@ -3303,7 +2980,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         match pattern {
             Pattern::Binding(name) => {
                 let (binding_ty, value) = if let Some(mutable) = borrowed {
-                    (Type::Ref(mutable, Box::new(ty)), ptr.into())
+                    (Type::Ref(mutable, Box::new(ty)), ptr)
                 } else {
                     let value = self.load(ptr, &ty)?;
                     (ty, value)
@@ -3390,7 +3067,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.push_scope();
                     self.pattern_bind(&pattern, ptr, &actual, borrowed, true, None)?;
                     self.order_pattern_bindings(&binding_order);
-                    let condition = self.expr(guard)?.into_int_value();
+                    let condition = self.expr(guard)?;
                     self.cleanup_to(self.scopes.len() - 1)?;
                     self.pop_scope();
                     let accepted = self.bb("match.guarded");
@@ -3627,12 +3304,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     }
     fn pattern_payloads(
         &self,
-        ptr: PointerValue<'ctx>,
+        ptr: Value<'ctx>,
         t: &Type,
         name: &str,
-    ) -> Result<Vec<(PointerValue<'ctx>, Type)>> {
+    ) -> Result<Vec<(Value<'ctx>, Type)>> {
         let tag = self.variant_tag(t, name)?;
-        let st = self.ty(t)?.into_struct_type();
+        let st = self.ty(t)?;
         match t {
             Type::Result(ok, err) => {
                 let t = if tag == 0 { ok } else { err };

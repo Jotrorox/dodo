@@ -22,12 +22,14 @@ instead. Run the commands on this page from the repository root.
 ## Install build prerequisites
 
 Building Dodo **from source** requires Rust 1.95.0 (pinned in
-`rust-toolchain.toml`), LLVM 22 development files and static archives, and a C
-toolchain. Inkwell provides LLVM bindings; the language server implements its
-JSON encoding and decoding, JSON-RPC messages, LSP parameter validation, and file
+`rust-toolchain.toml`), LLVM 22 development files and a C toolchain.
+[`llvm-sys`](https://docs.rs/crate/llvm-sys/latest) provides the LLVM C API
+bindings; the language server implements its JSON encoding and decoding,
+JSON-RPC messages, LSP parameter validation, and file
 URI conversion internally using Rust's standard library. `Cargo.lock`
-fixes the dependencies. A missing LLVM static archive is a build error; the build
-never silently falls back to shared LLVM.
+fixes the dependencies. Ordinary Cargo builds prefer static LLVM and fall back
+to a shared LLVM library if static linking is unavailable. A compiler linked to
+shared LLVM needs that library installed at runtime.
 
 On Fedora with LLVM 22 packages:
 
@@ -53,7 +55,17 @@ The Ubuntu packages are suitable for ordinary Cargo builds. CI uses the
 [official prebuilt LLVM archive](#fully-static-linux-compiler) for releases,
 so the compiler does not depend on Z3. If LLVM is installed elsewhere, set
 `LLVM_SYS_221_PREFIX` to its installation prefix containing `bin/llvm-config`.
-Ordinary Cargo builds can still link LLVM's smaller support libraries (such as
+To prefer shared LLVM explicitly, use:
+
+```sh
+cargo build --locked --release --features llvm-sys/prefer-dynamic
+```
+
+Use `--features llvm-sys/force-static` to require static LLVM. The release
+packaging recipes select this feature explicitly. These linking features are
+mutually exclusive; select only one per build.
+
+Ordinary Cargo builds can also link LLVM's smaller support libraries (such as
 zlib, zstd, and the C++ library) dynamically. Use the [self-contained Linux recipe](#self-contained-linux-release) to
 bundle those as well.
 
@@ -130,7 +142,7 @@ $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-sta
 rustup target add x86_64-pc-windows-msvc
 rustup component add rust-docs
 python scripts/build-windows-llvm-support.py
-cargo build --locked --release --bin dodo --target x86_64-pc-windows-msvc
+cargo build --locked --features llvm-sys/force-static --release --bin dodo --target x86_64-pc-windows-msvc
 python scripts/package-release.py --target x86_64-pc-windows-msvc
 python scripts/test_windows_release.py build/release-assets/dodo-0.1.2-x86_64-pc-windows-msvc.zip --linker clang
 ```

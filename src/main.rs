@@ -1,7 +1,7 @@
 //! Command-line driver. Linking is an explicit process invocation, never a shell command.
+use dodoc::codegen::Context;
+use dodoc::codegen::FileType;
 use dodoc::{codegen, lsp, package, sema};
-use inkwell::context::Context;
-use inkwell::targets::FileType;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -404,7 +404,7 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                     .arg("-std=c11")
                     .arg(format!("-O{}", args.options.optimization));
                 let target = args.options.target.clone().unwrap_or_else(|| {
-                    inkwell::targets::TargetMachine::get_default_triple()
+                    codegen::TargetMachine::get_default_triple()
                         .as_str()
                         .to_string_lossy()
                         .into_owned()
@@ -455,7 +455,7 @@ fn execute(mut args: Args) -> Result<i32, String> {
         ));
     }
     let target = args.options.target.clone().unwrap_or_else(|| {
-        inkwell::targets::TargetMachine::get_default_triple()
+        codegen::TargetMachine::get_default_triple()
             .as_str()
             .to_string_lossy()
             .into_owned()
@@ -470,7 +470,7 @@ fn execute(mut args: Args) -> Result<i32, String> {
     if args.action == Action::Run {
         if let Some(target) = &args.options.target
             && *target
-                != inkwell::targets::TargetMachine::get_default_triple()
+                != codegen::TargetMachine::get_default_triple()
                     .as_str()
                     .to_string_lossy()
         {

@@ -11,15 +11,12 @@ repository = "https://github.com/Jotrorox/dodo"
 name = "dodoc"
 
 [dependencies]
-# Never fall back to a shared LLVM library: installed binaries must not need LLVM.
-inkwell = { version = "0.10", default-features = false, features = ["llvm22-1-force-static", "target-all"] }
+# llvm-sys defaults to preferring static LLVM, with a shared-library fallback.
+# Release packaging explicitly enables llvm-sys/force-static.
+llvm-sys = "221.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-# The official Windows LLVM build does not use libffi.
-inkwell = { version = "0.10", default-features = false, features = ["no-libffi-linking"] }
 
 [profile.release]
 lto = "thin"

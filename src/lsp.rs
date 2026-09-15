@@ -117,7 +117,7 @@ impl Server {
                 }
             }
             let target = match params.initialization_options.get("target") {
-                None | Some(Value::Null) => inkwell::targets::TargetMachine::get_default_triple()
+                None | Some(Value::Null) => codegen::TargetMachine::get_default_triple()
                     .as_str()
                     .to_string_lossy()
                     .into_owned(),

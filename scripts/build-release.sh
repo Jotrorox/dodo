@@ -14,12 +14,12 @@ target=x86_64-unknown-linux-gnu
 host=$(rustc -vV | sed -n 's/^host: //p')
 if [[ "$host" != "$target" ]]; then
     echo "The self-contained release build currently supports native $target hosts." >&2
-    echo "Use cargo build --locked --release for other hosts (LLVM is still static)." >&2
+    echo "Use cargo build --locked --release for other hosts." >&2
     exit 1
 fi
 
 # An explicit target keeps these flags off host build scripts and proc macros.
-# LLVM itself is static through Cargo.toml; bundle its support libraries too.
+# Explicitly request static LLVM below; bundle its support libraries too.
 flags=()
 libraries=(z zstd stdc++ ffi)
 declare -A library_archives=()
@@ -91,7 +91,7 @@ for flag in "${flags[@]}"; do
 done
 export CARGO_ENCODED_RUSTFLAGS
 
-cargo build --locked --profile "$profile" --bin dodo --target "$target"
+cargo build --locked --features llvm-sys/force-static --profile "$profile" --bin dodo --target "$target"
 target_directory=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
 binary="$target_directory/$target/$profile/dodo"
 python3 scripts/check-linkage.py "$binary" "$linkage_mode"
