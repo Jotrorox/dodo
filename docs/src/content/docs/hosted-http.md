@@ -326,6 +326,7 @@ import "std/web/https"
 fn main() -> i32 {
     return app.new()
         .get(b"/", web.text(b"Hello, Dodo!\n"))
+        .concurrent()
         .run_with(b"127.0.0.1:8443", https.files("cert.pem", "key.pem"))
 }
 ```
@@ -334,8 +335,9 @@ fn main() -> i32 {
 file), validates the identity before binding, and supplies default HTTP buffers.
 It reports file paths and underlying errors on startup failure. Routes,
 middleware, limits, and timeouts are configured on the ordinary app builder.
-The HTTPS transport is serial; requesting concurrent execution fails at startup.
-See [HTTPS web applications](web.md#https) for custom storage and cancellation.
+Add `.concurrent()` to enable concurrent TLS handshakes, HTTP/1.1 keep-alive, and
+pipelining. See [HTTPS web applications](web.md#https) for custom storage,
+deadlines, and cancellation.
 
 The HTTPS import selects the existing OpenSSL backend and requires **OpenSSL
 3.5+ development headers and libraries**, plus a target C toolchain. Hosted

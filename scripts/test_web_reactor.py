@@ -56,11 +56,11 @@ def running(binary):
         process.communicate(timeout=5)
 
 
-def checks(number, process):
+def checks(number, process, connector=connect):
     completed = []
 
     def exchange(data, method="GET"):
-        with connect(number, process) as sock:
+        with connector(number, process) as sock:
             sock.sendall(data)
             result = response(sock, method)
             assert sock.recv(1) == b""
@@ -77,7 +77,7 @@ def checks(number, process):
         assert (status, actual) == (expected, body)
         completed.append(f"{method} {path}")
 
-    with connect(number, process) as sock:
+    with connector(number, process) as sock:
         for i in range(3):
             sock.sendall(request(close=False))
             status, headers, body = response(sock)
@@ -86,7 +86,7 @@ def checks(number, process):
         assert sock.recv(1) == b""
     completed.append("keep-alive request limit")
 
-    with connect(number, process) as sock:
+    with connector(number, process) as sock:
         sock.sendall(request(path="/large", close=False))
         status, headers, body = response(sock)
         assert (status, body) == (200, b"x" * 65536)
@@ -97,7 +97,7 @@ def checks(number, process):
     completed.append("direct large response followed by another request")
 
     # Collect the complete pipeline before splitting frames, preserving read-ahead.
-    with connect(number, process) as sock:
+    with connector(number, process) as sock:
         sock.sendall(request(close=False) + request("HEAD", close=False) + request(close=False))
         wire = bytearray()
         while part := sock.recv(4096):
@@ -109,7 +109,7 @@ def checks(number, process):
         assert b"Connection: close\r\n" in parts[-1]
     completed.append("pipelining and HEAD framing")
 
-    with connect(number, process) as sock:
+    with connector(number, process) as sock:
         bad = request("POST", "/echo", b"Content-Length: 1\r\nContent-Length: 2\r\n", b"xx")
         sock.sendall(request(close=False) + bad)
         wire = bytearray()
@@ -119,14 +119,14 @@ def checks(number, process):
         assert len(parts) == 2 and parts[0].startswith(b"200 ") and parts[1].startswith(b"400 ")
     completed.append("malformed pipelined successor gets one final error")
 
-    with connect(number, process) as sock:
+    with connector(number, process) as sock:
         sock.sendall(request(close=False))
         assert response(sock)[2] == HELLO
         assert sock.recv(1) == b""  # bounded idle expiration
     completed.append("idle expiration")
 
     for phase in ("headers", "body"):
-        with connect(number, process) as slow:
+        with connector(number, process) as slow:
             prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-Slow: "
             suffix = b"done\r\n\r\n"
             if phase == "body":
@@ -143,7 +143,7 @@ def checks(number, process):
         completed.append(f"independent progress during partial {phase}")
 
     for phase in ("headers", "body"):
-        with connect(number, process) as sock:
+        with connector(number, process) as sock:
             prefix = b"GET / HTTP/1.1\r\nHost: "
             if phase == "body":
                 prefix = request("POST", "/echo", b"Content-Length: 4\r\n", b"a")
@@ -159,7 +159,7 @@ def checks(number, process):
     assert exchange(chunked)[2] == b"abcde"
     completed.append("chunked request and trailers")
 
-    with connect(number, process) as sock:
+    with connector(number, process) as sock:
         sock.sendall(request("POST", "/echo", b"Content-Length: 4\r\nExpect: 100-continue\r\n"))
         interim = bytearray()
         while not interim.endswith(b"\r\n\r\n"):
@@ -170,7 +170,7 @@ def checks(number, process):
         assert sock.recv(1) == b""
     completed.append("100 Continue")
 
-    with connect(number, process) as sock:
+    with connector(number, process) as sock:
         sock.sendall(request("POST", "/echo", b"Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n"))
         interim = bytearray()
         while not interim.endswith(b"\r\n\r\n"):
@@ -187,7 +187,7 @@ def checks(number, process):
         (request("POST", "/echo", b"Content-Length: 1\r\nContent-Length: 2\r\n", b"xx"), 400),
         (request("POST", "/echo", b"Transfer-Encoding: chunked\r\n", b"z\r\n"), 400),
     ]:
-        with connect(number, process) as sock:
+        with connector(number, process) as sock:
             sock.sendall(data)
             assert response(sock)[0] == expected
             # Closing a rejected request can reset unread client input.

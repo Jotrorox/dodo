@@ -262,6 +262,14 @@ provider-specific readiness queries; end that view before mutating the stream.
 `output_pending()` reports staged ciphertext. These observations add no readiness
 method requirement to the portable polling transport contract.
 
+`Stream.suspend()` moves the engine and progress offsets into an opaque
+`stream.State<E>`, releasing socket and buffer borrows. Resume it with
+`Stream.resume(state, &mut transport, incoming, outgoing)` and the same
+ciphertext buffer contents; pending ciphertext and partial records survive
+between turns. Resumption checks that saved offsets fit the supplied buffers.
+This lets bounded reactors keep TLS state without holding buffer borrows
+between polling turns.
+
 `poll_read`/`poll_write` integrate with `std/io`; one-attempt `read`/`write` report
 `WouldBlock` when no progress is possible. `flush` reports `Ready` only after
 accepted plaintext and all staged encrypted output reach the transport. The

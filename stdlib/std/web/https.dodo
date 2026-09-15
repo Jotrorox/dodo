@@ -2,6 +2,11 @@ package https
 
 import "std/web/app"
 import "std/web/hosted"
+import "std/web/reactor"
+import "std/tls"
+import "std/tls/stream"
+import "core/mem"
+import "core/slice"
 import "std/http/https" as transport
 import "std/http/hosting"
 import "std/tls/openssl"
@@ -14,9 +19,11 @@ import "std/net/native"
 // Explicit OpenSSL selection. Files are read once per serving call into fixed
 // storage and remain alive until all accepted TLS connections have closed.
 pub const PEM_BYTES: usize = 8192
+pub const STAGING_BYTES: usize = 8192
+pub const WORKSPACE_BYTES: usize = reactor.WORKSPACE_BYTES + STAGING_BYTES
 
 pub enum ErrorKind {
-    File, CredentialLimit, Serving, UnsupportedExecution
+    File, CredentialLimit, Serving
 }
 pub struct Error {
     pub kind: ErrorKind
@@ -36,9 +43,6 @@ pub struct Error {
             }
             ErrorKind.Serving => {
                 output.string("serving failed")?
-            }
-            ErrorKind.UnsupportedExecution => {
-                output.string("concurrent HTTPS is not supported; use serial execution")?
             }
         }
         match &self.file {
@@ -84,6 +88,9 @@ pub struct Files {
         return self.serve_until(server, address, &cancel)
     }
     pub fn serve_until<H, X>(&self, server: app.Server<H>, address: &[u8], cancel: &X) -> hosted.Report!Error from(self) {
+        if server.config.execution == app.Execution.Concurrent {
+            return self.concurrent_defaults(server, address, cancel)
+        }
         workspace := [0u8; app.WORKSPACE_BYTES]
         request := [0u8; app.BODY_BYTES]
         response := [0u8; app.BODY_BYTES]
@@ -91,11 +98,17 @@ pub struct Files {
         clock := native.MonotonicClock {}
         return self.serve_with(server, address, &mut storage, &mut clock, cancel)
     }
+    fn concurrent_defaults<H, X>(&self, server: app.Server<H>, address: &[u8], cancel: &X) -> hosted.Report!Error from(self) {
+        slots := reactor.slots()
+        workspace := [0u8; WORKSPACE_BYTES *app.DEFAULT_CONNECTIONS]
+        request := [0u8; app.BODY_BYTES *app.DEFAULT_CONNECTIONS]
+        response := [0u8; app.BODY_BYTES *app.DEFAULT_CONNECTIONS]
+        storage := app.Storage.concurrent(&mut workspace, &mut request, &mut response, &mut slots)
+        clock := native.MonotonicClock {}
+        return self.serve_with(server, address, &mut storage, &mut clock, cancel)
+    }
     pub fn serve_with<H, C, X>(&self, server: app.Server<H>, address: &[u8], storage: &mut app.Storage,
     clock: &mut C, cancel: &X) -> hosted.Report!Error from(self) {
-        if server.config.execution != app.Execution.Serial {
-            return err(Error { kind: ErrorKind.UnsupportedExecution, path: "", file: none, serving: none })
-        }
         certificate := [0u8; PEM_BYTES]
         key := [0u8; PEM_BYTES]
         certificate_bytes := load(self.certificate, &mut certificate)?
@@ -106,6 +119,17 @@ pub struct Files {
             ok(_) => {}
             err(reason) => {
                 return err(serving_error(hosting.tls_error(reason)))
+            }
+        }
+        if server.config.execution == app.Execution.Concurrent {
+            provider := Provider.new(identity)
+            match server.serve_concurrent_with(address, storage, &mut provider, clock, cancel) {
+                ok(report) => {
+                    return ok(report)
+                }
+                err(reason) => {
+                    return err(serving_error(reason))
+                }
             }
         }
         acceptor := transport.Acceptor.new(identity)
@@ -121,4 +145,156 @@ pub struct Files {
 }
 pub fn files(certificate: &str, key: &str) -> Files from(certificate, key) {
     return Files { certificate: certificate, key: key }
+}
+
+// TLS engines own their backend allocations. Only movable bookkeeping is
+// retained here; each slot's ciphertext lives in caller-provided workspace.
+pub struct SessionState {
+    tls: stream.State<openssl.Engine>
+    finishing: bool
+}
+pub struct Provider {
+    identity: openssl.Config
+    // Fixed bookkeeping for the reactor's 1..255 slots; engines are lazy.
+    states: [256]Option<SessionState>
+    pub fn new(identity: openssl.Config) -> Provider from(identity) {
+        identity.alpn = b"\x08http/1.1"
+        return Provider { identity: identity, states: [
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none,
+            none, none, none, none, none, none, none, none, none, none, none, none, none, none, none, none
+        ] }
+    }
+    pub fn handshake_required(&self) -> bool {
+        return true
+    }
+    pub fn staging_bytes(&self) -> usize {
+        return STAGING_BYTES
+    }
+    pub fn open(&mut self, index: usize, socket: &mut native.TcpConnection, staging: &mut[u8]) -> Session!hosting.Error from(socket, staging) {
+        let some(slice.SplitMut { left: incoming, right: outgoing }) = slice.split_at_mut(staging, 4096) else {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        state: SessionState
+        match mem.replace(&mut self.states[index], none) {
+            some(value) => {
+                state = value
+            }
+            none => {
+                match openssl.Engine.server(&self.identity) {
+                    ok(engine) => {
+                        state = SessionState { tls: stream.State.new(engine), finishing: false }
+                    }
+                    err(reason) => {
+                        return err(hosting.tls_error(reason))
+                    }
+                }
+            }
+        }
+        let SessionState { tls: saved, finishing: finishing } = state
+        match stream.Stream.resume(saved, socket, incoming, outgoing) {
+            ok(inner) => {
+                return ok(Session { inner: inner, finishing: finishing })
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+    }
+    pub fn save(&mut self, index: usize, state: SessionState) {
+        self.states[index] = some(state)
+    }
+    pub fn close(&mut self, index: usize) {
+        self.states[index] = none
+    }
+}
+pub struct Session {
+    inner: stream.Stream<openssl.Engine, native.TcpConnection>
+    finishing: bool
+    pub fn poll_read(&mut self, data: &mut[u8]) -> io.Poll!io.Error {
+        return self.inner.poll_read(data)
+    }
+    pub fn poll_write(&mut self, data: &[u8]) -> io.Poll!io.Error {
+        return self.inner.poll_write(data)
+    }
+    pub fn handshake(&mut self) -> bool!hosting.Error {
+        match self.inner.handshake() {
+            ok(state) => {
+                if state == tls.State.Closed {
+                    return err(hosting.failure(hosting.ErrorKind.Tls))
+                }
+                return ok(state == tls.State.Ready)
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+    }
+    pub fn flush(&mut self) -> bool!hosting.Error {
+        match self.inner.flush() {
+            ok(state) => {
+                return ok(state == tls.State.Ready)
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+    }
+    pub fn finish(&mut self) -> bool!hosting.Error {
+        if!self.finishing {
+            if!self.flush()? {
+                return ok(false)
+            }
+            match self.inner.shutdown() {
+                ok(_) => {
+                    self.finishing = true
+                }
+                err(reason) => {
+                    return err(hosting.tls_error(reason))
+                }
+            }
+        }
+        // Deliver close_notify without waiting for the peer's reply.
+        return self.flush()
+    }
+    pub fn prepare(&mut self) -> bool!hosting.Error {
+        match self.inner.pump() {
+            ok(progressed) => {
+                return ok(progressed)
+            }
+            err(reason) => {
+                return err(hosting.tls_error(reason))
+            }
+        }
+    }
+    pub fn writing(&self, http_writing: bool) -> bool {
+        return self.inner.output_pending()
+    }
+    pub fn take_error(&mut self) -> Option<hosting.Error> {
+        match self.inner.take_error() {
+            some(reason) => {
+                return some(hosting.tls_error(reason))
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    pub fn suspend(self) -> SessionState {
+        let Session { inner: inner, finishing: finishing } = self
+        return SessionState { tls: inner.suspend(), finishing: finishing }
+    }
 }

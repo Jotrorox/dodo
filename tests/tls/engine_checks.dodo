@@ -267,6 +267,34 @@ fn cancellation() -> void!tls.Error {
     }
     return ok()
 }
+fn suspension() -> void!tls.Error {
+    config := openssl.Config.client(b"localhost")
+    config.system_roots = false
+    engine := openssl.Engine.client(&config)?
+    idle := Idle {}
+    input := [0u8; 64]
+    output := [0u8; 64]
+    connection := stream.Stream.new(engine, &mut idle, &mut input, &mut output)?
+    connection.handshake()?
+    connection.pump()?
+    assert(connection.output_pending())
+    saved := connection.suspend()
+    // Suspension releases the transport borrow while retaining pending bytes.
+    idle = Idle {}
+    resumed := stream.Stream.resume(saved, &mut idle, &mut input, &mut output)?
+    assert(resumed.output_pending())
+    assert(!resumed.pump()?)
+    smaller := resumed.suspend()
+    match stream.Stream.resume(smaller, &mut idle, &mut input, &mut output[..1]) {
+        ok(_) => {
+            assert(false, "resumed ciphertext offsets exceed the buffer")
+        }
+        err(reason) => {
+            assert(reason.kind == tls.ErrorKind.InvalidInput)
+        }
+    }
+    return ok()
+}
 fn run() -> void!tls.Error {
     verified(1, false)?
     verified(73, true)?
@@ -277,6 +305,7 @@ fn run() -> void!tls.Error {
     rejected_policy(false)?
     truncation()?
     cancellation()?
+    suspension()?
     config := openssl.Config.client(b"")
     match openssl.Engine.client(&config) {
         ok(_) => {

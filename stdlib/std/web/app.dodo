@@ -136,7 +136,7 @@ pub struct Server<H> {
         cancel := net.NeverCancel {}
         return self.serve_with(address, storage, &mut clock, &cancel)
     }
-    // Explicit serial transport hook, also used by std/web/https. Never
+    // Explicit serial transport hook. Never
     // silently downgrade a requested concurrent server to serial execution.
     pub fn serve_serial_with<A, C, X>(self, address: &[u8], storage: &mut Storage,
     acceptor: &mut A, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
@@ -148,6 +148,26 @@ pub struct Server<H> {
         handler := owned_handler
         return hosted.serve_with(address, table.routes(), &mut handler,
         storage.workspace, storage.request, storage.response, config.serial(), acceptor, clock, cancel)
+    }
+    // Concurrent transport hook; providers declare their extra staging bytes
+    // per slot. Storage remains caller-owned and reusable after return.
+    pub fn serve_concurrent_with<P, C, X>(self, address: &[u8], storage: &mut Storage,
+    provider: &mut P, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
+        let Server { application: application, config: config } = self
+        if config.execution != Execution.Concurrent {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+        let application.Application { table: table, handler: owned_handler } = application
+        handler := owned_handler
+        match &mut storage.slots {
+            some(active) => {
+                return reactor.serve_using(address, table.routes(), &mut handler,
+                *active, storage.workspace, storage.request, storage.response, config.concurrent(), provider, clock, cancel)
+            }
+            none => {
+                return err(hosting.failure(hosting.ErrorKind.Workspace))
+            }
+        }
     }
     pub fn serve_with<C, X>(self, address: &[u8], storage: &mut Storage, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
         let Server { application: application, config: config } = self
