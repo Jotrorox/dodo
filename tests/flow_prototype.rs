@@ -81,13 +81,12 @@ fn moves_reinitialization_and_branch_exits_agree() {
 }
 
 #[test]
-fn conditional_continue_exposes_a_production_move_check_gap() {
-    // Production treats the terminating then-arm like a return and discards its
-    // moved state. Here it reaches the loop header instead. With b=true, the
-    // second iteration consumes the already moved s.
+fn conditional_continue_preserves_moves_on_the_back_edge() {
+    // The terminating then-arm reaches the loop header. With b=true, the
+    // second iteration would consume the already moved s.
     compare(
         "struct S { u8 n }\nfn take(s: S) {}\nfn f(s: S, b: bool) { for b { if b { take(s)\ncontinue } } }",
-        None,
+        Some("moved in a loop"),
         &["s"],
     );
 }
@@ -98,7 +97,7 @@ fn conditional_break_preserves_moves_on_the_loop_exit() {
     // observe the moved state on the break edge, not the state before the loop.
     compare(
         "struct S { u8 n }\nfn take(s: S) {}\nfn f(s: S, b: bool) { for { if b { take(s)\nbreak } }\ntake(s) }",
-        None,
+        Some("moved"),
         &["s"],
     );
 }
@@ -141,7 +140,7 @@ fn moves_on_exiting_loop_paths_do_not_reach_a_back_edge() {
             &format!(
                 "struct S {{ u8 n }}\nfn take(s: S) {{}}\nfn f(s: S) {{ for {{ take(s)\n{exit} }} }}"
             ),
-            Some("moved in a loop"),
+            None,
             &[],
         );
     }
