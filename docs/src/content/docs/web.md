@@ -265,13 +265,67 @@ Request and response buffers are divided equally among slots; trailing remainder
 are unused. A concurrent server given serial storage returns a workspace error.
 The slot count, rather than `max_connections`, bounds simultaneous connections.
 
+## HTTPS
+
+Use the same fluent routes and handlers with an explicit TLS transport:
+
+```dodo
+package https_server
+import "std/web"
+import "std/web/app"
+import "std/web/https"
+
+fn main() -> i32 {
+    return app.new()
+        .get(b"/", web.text(b"Hello, Dodo!\n"))
+        .run_with(b"127.0.0.1:8443", https.files("cert.pem", "key.pem"))
+}
+```
+
+`https.files` reads the certificate chain and private key from PEM files once
+at startup, with an 8,192-byte limit for each file. Relative paths use the
+process's working directory. Missing and oversized files report their path;
+invalid PEM or a mismatched key fails before binding. Route registration is
+checked first. `run_with` prints failures and uses the same exit codes as `run`:
+0 on success, 1 for startup failure, and 2 for failed connections.
+
+The HTTPS adapter uses `app.Config` limits and timeouts, bounded default buffers,
+middleware, and the same request/response helpers. It serves serially, with one
+request per connection. Combining it with `.concurrent()` produces an explicit
+startup error. Importing `std/web/https` selects OpenSSL 3.5+; ordinary
+`std/web/app` programs retain their existing dependencies.
+
+For typed errors and cooperative cancellation, build the app and call the
+transport directly:
+
+```dodo
+server := app.new().get(b"/", web.text(b"hello")).build()!
+identity := https.files("cert.pem", "key.pem")
+report := identity.serve_until(server, b"127.0.0.1:8443", &cancel)!
+```
+
+Here `cancel` supplies `cancelled(&self) -> bool`, as in the configuration
+example above. `identity.serve(server, address)` uses default cancellation;
+`identity.serve_with(server, address, &mut storage, &mut clock, &cancel)` accepts
+the same `app.Storage` used for custom HTTP buffers. These calls consume the
+server and return `hosted.Report!https.Error`. Errors retain the file cause or
+underlying `hosting.Error`; a file error borrows its path from `identity`.
+For larger credential buffers or explicit OpenSSL settings, use
+`std/http/https` and its existing acceptor API.
+
+See [complete local HTTPS setup](hosted-http.md#complete-local-https-setup) for
+generating test credentials and running a verified client.
+
 ## Hosted server choices
 
 The server object uses the existing serial `std/web/hosted` and concurrent
 `std/web/reactor` runners. Those lower-level functions remain available for
-custom dispatchers and transport adapters. HTTPS continues to use the explicit
-TLS acceptor. Streaming bodies, upgrades, and caller-driven execution use
-`std/web/server`, `std/web/stream`, `std/web/response`, and
+custom dispatchers and transport adapters. `Builder.run_with(address, transport)`
+accepts a transport with `serve(server, address) -> hosted.Report!E`, where `E`
+is printable. `Server.serve_serial_with` exposes the serial acceptor hook with
+custom storage, clock, and cancellation. HTTPS uses the explicit TLS acceptor
+through the convenience adapter above. Streaming bodies, upgrades, and
+caller-driven execution use `std/web/server`, `std/web/stream`, `std/web/response`, and
 `std/http/connection`; none acquire a hosted dependency. Rooted static files
 remain an optional `std/web/static_files` import.
 

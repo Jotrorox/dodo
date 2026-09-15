@@ -684,6 +684,33 @@ fn main() -> i32 {
 }
 
 #[test]
+fn generic_specialization_breadth_and_depth_have_separate_limits() {
+    let mut source = String::from("package wide\nfn accept<T>() {}\nfn main() {\n");
+    for count in 0..300 {
+        source.push_str(&format!("accept::<[{count}]u8>()\n"));
+    }
+    source.push_str("}\n");
+    native_at_all_levels(&source, 0, "");
+
+    let mut excessive = String::from("package wide\nfn accept<T>() {}\nfn main() {\n");
+    for count in 0..4097 {
+        excessive.push_str(&format!("accept::<[{count}]u8>()\n"));
+    }
+    excessive.push_str("}\n");
+    rejects(
+        &excessive,
+        "generic instantiation limit exceeded (4096 specializations)",
+    );
+    for source in [
+        "package recursive\nfn grow<T>() { grow::<Option<T>>() }\nfn main() { grow::<u8>() }",
+        "package recursive\nstruct Grow<T> { next: Option<Grow<Option<T>>> }\nfn use(value: &Grow<u8>) {}",
+        "package recursive\nimport \"core/mem\"\nfn grow<T>() { unsafe { _ = mem.callback::<Option<T>>(grow) } }\nfn main() { grow::<u8>() }",
+    ] {
+        rejects(source, "generic instantiation depth exceeded");
+    }
+}
+
+#[test]
 fn generic_struct_methods_keep_borrowed_returns() {
     native_at_all_levels(
         r#"package generic

@@ -136,6 +136,19 @@ pub struct Server<H> {
         cancel := net.NeverCancel {}
         return self.serve_with(address, storage, &mut clock, &cancel)
     }
+    // Explicit serial transport hook, also used by std/web/https. Never
+    // silently downgrade a requested concurrent server to serial execution.
+    pub fn serve_serial_with<A, C, X>(self, address: &[u8], storage: &mut Storage,
+    acceptor: &mut A, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
+        let Server { application: application, config: config } = self
+        if config.execution != Execution.Serial {
+            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        }
+        let application.Application { table: table, handler: owned_handler } = application
+        handler := owned_handler
+        return hosted.serve_with(address, table.routes(), &mut handler,
+        storage.workspace, storage.request, storage.response, config.serial(), acceptor, clock, cancel)
+    }
     pub fn serve_with<C, X>(self, address: &[u8], storage: &mut Storage, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
         let Server { application: application, config: config } = self
         let application.Application { table: table, handler: owned_handler } = application
@@ -224,22 +237,14 @@ pub struct Builder<H, M> {
     }
     // Main-function convenience: printable startup failures and an exit code.
     pub fn run(self, address: &[u8]) -> i32 {
-        match self.serve(address) {
-            ok(report) => {
-                if report.failed != 0 {
-                    match &report.last_error {
-                        some(reason) => {
-                            errors := console.stderr()
-                            match errors.println(reason) {
-                                ok(_) => {}
-                                err(_) => {}
-                            }
-                        }
-                        none => {}
-                    }
-                    return 2
-                }
-                return 0
+        return exit_code(self.serve(address))
+    }
+    // Transport supplies serve(server, address) -> hosted.Report!E, where E
+    // is printable. Plain apps do not import or link a TLS backend.
+    pub fn run_with<T>(self, address: &[u8], transport: T) -> i32 {
+        match self.build() {
+            ok(server) => {
+                return exit_code(transport.serve(server, address))
             }
             err(reason) => {
                 errors := console.stderr()
@@ -275,4 +280,34 @@ pub struct Builder<H, M> {
 }
 pub fn new() -> Builder<application.Empty, web.NoMiddleware> from(static) {
     return Builder { routes: application.builder(), config: Config.defaults() }
+}
+
+// Shared main-function reporting for built-in and explicitly chosen transports.
+fn exit_code<E>(result: hosted.Report!E) -> i32 {
+    match result {
+        ok(report) => {
+            if report.failed != 0 {
+                match &report.last_error {
+                    some(reason) => {
+                        errors := console.stderr()
+                        match errors.println(reason) {
+                            ok(_) => {}
+                            err(_) => {}
+                        }
+                    }
+                    none => {}
+                }
+                return 2
+            }
+            return 0
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            return 1
+        }
+    }
 }

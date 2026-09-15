@@ -344,7 +344,7 @@ def main():
                 server_checks(executable, port, context)
                 records.append({'case': 'HTTPS hosted server / independent verified Python client', 'optimization': level})
                 port = available_port()
-                server_source = (ROOT / 'examples/https_server.dodo').read_text().replace(':8443', f':{port}').replace('config.max_connections = 0', 'config.max_connections = 1')
+                server_source = (ROOT / 'examples/https_server.dodo').read_text().replace(':8443', f':{port}').replace('.run_with(', '.max_connections(1).run_with(')
                 client_source = (ROOT / 'examples/https_client.dodo').read_text().replace(':8443', f':{port}')
                 server_exe = build('https_example_server', level, text=server_source)
                 client_exe = build('https_example_client', level, text=client_source)

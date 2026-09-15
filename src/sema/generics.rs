@@ -8,6 +8,12 @@ use std::collections::{HashMap, HashSet};
 #[path = "printing.rs"]
 mod printing;
 
+// Composed standard-library apps need many independent specializations. Bound
+// total work separately from recursive expansion so that raising the breadth
+// limit does not allow runaway generic recursion to exhaust the compiler stack.
+const MAX_SPECIALIZATIONS: usize = 4096;
+const MAX_SPECIALIZATION_DEPTH: usize = 64;
+
 /// Explicit type arguments specialize generic declarations before type checking.
 /// Every emitted specialization goes through the same ordinary checker.
 pub(super) fn instantiate(program: &mut Program) -> Check<()> {
@@ -100,6 +106,7 @@ pub(super) fn instantiate(program: &mut Program) -> Check<()> {
         enums: vec![],
         functions: vec![],
         count: 0,
+        depth: 0,
         printing_count: 0,
     };
     program.structs.retain(|s| s.generics.is_empty());
@@ -153,19 +160,30 @@ struct Expander {
     enums: Vec<Enum>,
     functions: Vec<Function>,
     count: usize,
+    depth: usize,
     printing_count: usize,
 }
 impl Expander {
-    fn budget(&mut self, span: Span) -> Check<()> {
+    fn begin_specialization(&mut self, span: Span) -> Check<()> {
         self.count += 1;
-        if self.count > 256 {
-            Err(Diagnostic::new(
+        if self.count > MAX_SPECIALIZATIONS {
+            return Err(Diagnostic::new(
                 span,
-                "generic instantiation limit exceeded (256 specializations)",
-            ))
-        } else {
-            Ok(())
+                format!(
+                    "generic instantiation limit exceeded ({MAX_SPECIALIZATIONS} specializations)"
+                ),
+            ));
         }
+        if self.depth == MAX_SPECIALIZATION_DEPTH {
+            return Err(Diagnostic::new(
+                span,
+                format!(
+                    "generic instantiation depth exceeded ({MAX_SPECIALIZATION_DEPTH} nested specializations)"
+                ),
+            ));
+        }
+        self.depth += 1;
+        Ok(())
     }
     fn substitutions(
         &self,
@@ -222,7 +240,7 @@ impl Expander {
                     Type::Generic(name.clone(), arguments.clone()),
                 );
                 if self.generated_types.insert(concrete.clone()) {
-                    self.budget(span)?;
+                    self.begin_specialization(span)?;
                     if let Some(mut structure) = self.struct_templates.get(name).cloned() {
                         let mapping = self.substitutions(&structure.generics, arguments, span)?;
                         let original_generics = structure.generics.clone();
@@ -251,8 +269,10 @@ impl Expander {
                             let mut mapping = mapping.clone();
                             mapping.insert(name.clone(), Type::Named(concrete.clone()));
                             if self.generated_functions.insert(method.name.clone()) {
+                                self.begin_specialization(method.span)?;
                                 self.function(&mut method, &mapping)?;
                                 self.functions.push(method);
+                                self.depth -= 1;
                             }
                         }
                     } else if let Some(mut enumeration) = self.enum_templates.get(name).cloned() {
@@ -273,6 +293,7 @@ impl Expander {
                             format!("unknown generic type `{name}`"),
                         ));
                     }
+                    self.depth -= 1;
                 }
                 *ty = Type::Named(concrete);
             }
@@ -1065,13 +1086,14 @@ impl Expander {
                     } else {
                         let concrete = specialized(&target, type_args);
                         if self.generated_functions.insert(concrete.clone()) {
-                            self.budget(span)?;
+                            self.begin_specialization(span)?;
                             let mut function = template;
                             function.name = concrete.clone();
                             function.generics.clear();
                             function.generic_instance = true;
                             self.function(&mut function, &mapping)?;
                             self.functions.push(function);
+                            self.depth -= 1;
                         }
                         concrete
                     };
@@ -1121,13 +1143,14 @@ impl Expander {
                         let arguments = self.inferred_arguments(parameters, &mapping, span)?;
                         let concrete = specialized(name, &arguments);
                         if self.generated_functions.insert(concrete.clone()) {
-                            self.budget(span)?;
+                            self.begin_specialization(span)?;
                             let mut function = template;
                             function.name = concrete.clone();
                             function.generics.clear();
                             function.generic_instance = true;
                             self.function(&mut function, &mapping)?;
                             self.functions.push(function);
+                            self.depth -= 1;
                         }
                         *name = concrete;
                         type_args.clear();
