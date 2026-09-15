@@ -256,9 +256,9 @@ impl Index {
             return;
         };
         let parameters = function.map(|f| {
-            f.params
+            super::display_parameters(f)
                 .iter()
-                .map(|p| source_names(&format!("{}: {}", p.name, p.ty)))
+                .map(|p| source_names(p))
                 .collect::<Vec<_>>()
         });
         let detail = if let Some(parameters) = &parameters {

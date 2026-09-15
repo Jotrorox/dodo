@@ -1,6 +1,5 @@
 package console_checks
 import "std/console"
-import "std/fmt"
 import "std/io"
 import "core/bytes"
 
@@ -19,16 +18,14 @@ fn verify() -> void!io.Error {
         core.drop(errors)
     }
     console.println("Hello, world!")?
-    number := fmt.signed(42)
-    console.println_value(&number)?
+    number := 42
+    console.println(&number)?
     output := console.stdout()
     output.print("text")?
     output.println(" line")?
-    output.print_value(&number)?
-    output.println("")?
-    errors := console.stderr()
+    output.printf("{}\n", number)?
     reason := io.Error { kind: io.ErrorKind.Closed, transferred: 0, code: 9 }
-    errors.println_value(&reason)?
+    console.stderr().printf("{}\n", reason)?
     storage := [0u8; 16]
     {
         input := console.stdin()

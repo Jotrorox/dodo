@@ -18,14 +18,12 @@ Save this as `time_start.dodo`:
 package time_start
 import "std/time/hosted"
 import "std/console"
-import "std/fmt"
 
 fn main() -> i32 {
     clock := hosted.WallClock.new()
     match clock.wall_now() {
         ok(timestamp) => {
-            value := fmt.signed(timestamp.seconds())
-            match console.println_value(&value) {
+            match console.println(timestamp.seconds()) {
                 ok(_) => { return 0 }, err(_) => { return 2 },
             }
         },

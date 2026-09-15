@@ -5,9 +5,20 @@ use crate::ast::*;
 use crate::diagnostic::Diagnostic;
 use std::collections::{HashMap, HashSet};
 
+#[path = "printing.rs"]
+mod printing;
+
 /// Explicit type arguments specialize generic declarations before type checking.
 /// Every emitted specialization goes through the same ordinary checker.
 pub(super) fn instantiate(program: &mut Program) -> Check<()> {
+    for function in &program.functions {
+        if function.printing.is_some() && !function.imported {
+            return Err(Diagnostic::new(
+                function.span,
+                "@compiler printing declarations are reserved for the bundled standard library",
+            ));
+        }
+    }
     let mut declarations = HashSet::new();
     for (name, parameters, span) in program
         .structs
@@ -89,10 +100,13 @@ pub(super) fn instantiate(program: &mut Program) -> Check<()> {
         enums: vec![],
         functions: vec![],
         count: 0,
+        printing_count: 0,
     };
     program.structs.retain(|s| s.generics.is_empty());
     program.enums.retain(|e| e.generics.is_empty());
-    program.functions.retain(|f| f.generics.is_empty());
+    program
+        .functions
+        .retain(|f| f.generics.is_empty() && (f.printing.is_none() || f.generic_instance));
     let substitutions = HashMap::new();
     for structure in &mut program.structs {
         for field in &mut structure.fields {
@@ -139,6 +153,7 @@ struct Expander {
     enums: Vec<Enum>,
     functions: Vec<Function>,
     count: usize,
+    printing_count: usize,
 }
 impl Expander {
     fn budget(&mut self, span: Span) -> Check<()> {
@@ -1038,6 +1053,12 @@ impl Expander {
                     let template = self.signatures.get(&target).cloned().ok_or_else(|| {
                         Diagnostic::new(span, format!("unknown callback function `{target}`"))
                     })?;
+                    if template.printing.is_some() {
+                        return Err(Diagnostic::new(
+                            span,
+                            "printing entry points cannot be used as callbacks; wrap a concrete call in an ordinary function",
+                        ));
+                    }
                     let mapping = self.substitutions(&template.generics, type_args, span)?;
                     let concrete = if template.generics.is_empty() {
                         target
@@ -1058,6 +1079,16 @@ impl Expander {
                     type_args.clear();
                     Type::Raw(false, Box::new(Type::u8()))
                 } else if let Some(template) = self.signatures.get(name).cloned() {
+                    if template.printing.is_some() && !template.generic_instance {
+                        return self.printing_call(
+                            name,
+                            type_args,
+                            args,
+                            &template,
+                            substitutions,
+                            span,
+                        );
+                    }
                     let parameters = &template.generics;
                     let explicit = !type_args.is_empty();
                     let mut mapping = if explicit {
@@ -1234,6 +1265,43 @@ impl Expander {
                 } else {
                     None
                 };
+                if let Some(signature) = &signature
+                    && signature.printing.is_some()
+                    && !signature.generic_instance
+                {
+                    let mut receiver = receiver.as_ref().clone();
+                    // Existing places are exclusively reborrowed; a temporary
+                    // stream wrapper is owned by the generated helper.
+                    if printing::is_place(&receiver) {
+                        if matches!(actual, Type::Ref(..)) {
+                            receiver = Expr::new(
+                                ExprKind::Unary(UnaryOp::Deref, Box::new(receiver)),
+                                span,
+                            );
+                        }
+                        receiver = Expr::new(
+                            ExprKind::Unary(UnaryOp::BorrowMut, Box::new(receiver)),
+                            span,
+                        );
+                    }
+                    let mut arguments = vec![receiver];
+                    arguments.append(args);
+                    let mut target = signature.name.clone();
+                    let ret = self.printing_call(
+                        &mut target,
+                        &[],
+                        &mut arguments,
+                        signature,
+                        substitutions,
+                        span,
+                    )?;
+                    e.kind = ExprKind::Call {
+                        name: target,
+                        type_args: vec![],
+                        args: arguments,
+                    };
+                    return Ok(ret);
+                }
                 if let Some(signature) = &signature
                     && !signature.generics.is_empty()
                 {

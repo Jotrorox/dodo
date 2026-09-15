@@ -249,14 +249,6 @@ fn sign_byte(negative: bool, options: &Options) -> u8 {
     return 0
 }
 
-// T implements pub fn format<W>(&self, output:&mut Formatter<W>)->void!io.Error.
-// The compiler specializes this ordinary generic method: no traits/reflection.
-pub fn value<W, T>(sink: &mut W, input: &T) -> usize!io.Error {
-    output := Formatter.new::<W>(sink)
-    input.format(&mut output)?
-    return ok(output.written())
-}
-
 // Transactional decimal formatting into caller storage. Width is a minimum;
 // values are never truncated. The full output is checked before the first write.
 pub enum FormatError {
@@ -291,68 +283,20 @@ pub fn write_u32_padded(destination: &mut[u8], value: u32, width: usize) -> usiz
     }
 }
 
-// Convenience operations keep one Formatter for the entire call, so a newline
-// failure includes the preceding text/value in Error.transferred.
-pub fn print<W>(sink: &mut W, text: &str) -> usize!io.Error {
-    output := Formatter.new::<W>(sink)
-    output.string(text)?
-    return ok(output.written())
-}
-pub fn println<W>(sink: &mut W, text: &str) -> usize!io.Error {
-    output := Formatter.new::<W>(sink)
-    output.string(text)?
-    output.string("\n")?
-    return ok(output.written())
-}
-pub fn value_line<W, T>(sink: &mut W, input: &T) -> usize!io.Error {
-    output := Formatter.new::<W>(sink)
-    input.format(&mut output)?
-    output.string("\n")?
-    return ok(output.written())
-}
+// These reserved declarations lower to fixed, statically typed functions before
+// normal checking. All output uses one Formatter and preserves io.Error counts.
+// print/println automatically format primitives and borrow custom value places.
+@compiler(print)
+pub fn print<W, T>(sink: &mut W, value: T) -> usize!io.Error
+@compiler(println)
+pub fn println<W, T>(sink: &mut W, value: T) -> usize!io.Error
+// printf requires a literal format followed by heterogeneous arguments.
+// {} is automatic; {{ and }} escape braces. Options after ':' are
+// [[fill]align][sign][0][width][.precision][type]; see the formatting reference.
+@compiler(printf)
+pub fn printf<W>(sink: &mut W, format: &str) -> usize!io.Error
 
-// Explicit wrappers use ordinary generics, without primitive methods or a
-// format-string parser. Smaller primitive values can be widened with `as`.
-pub struct Signed {
-    value: i64
-    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
-        return output.decimal(self.value)
-    }
-}
-pub fn signed(value: i64) -> Signed {
-    return Signed { value: value }
-}
-pub struct Unsigned {
-    value: u64
-    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
-        return output.natural(self.value)
-    }
-}
-pub fn unsigned(value: u64) -> Unsigned {
-    return Unsigned { value: value }
-}
-pub struct Boolean {
-    value: bool
-    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
-        options := defaults()
-        return output.boolean(self.value, &options)
-    }
-}
-pub fn boolean(value: bool) -> Boolean {
-    return Boolean { value: value }
-}
-pub struct Floating {
-    value: f64
-    pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {
-        options := defaults()
-        return output.floating(self.value, 6, FloatStyle.Scientific, &options)
-    }
-}
-// Six fraction digits in scientific notation keep both large and tiny values
-// visible. Explicit Formatter.floating controls precision and style.
-pub fn floating(value: f64) -> Floating {
-    return Floating { value: value }
-}
+// A codepoint wrapper selects UTF-8 scalar rendering instead of integer output.
 pub struct Codepoint {
     value: u32
     pub fn format<W>(&self, output: &mut Formatter<W>) -> void!io.Error {

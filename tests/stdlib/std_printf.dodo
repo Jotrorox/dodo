@@ -1,0 +1,238 @@
+package printf_checks
+import "std/fmt"
+import "std/io"
+import "core/bytes"
+
+static mut evaluated: isize = 0
+static mut formatted: isize = 0
+static mut dropped: isize = 0
+fn next() -> isize {
+    unsafe {
+        evaluated += 1
+        return evaluated
+    }
+}
+pub struct Value<T> {
+    pub value: T
+    pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error {
+        unsafe {
+            formatted += 1
+            // Both scalar arguments must evaluate before even the first field.
+            assert(evaluated == 2)
+        }
+        return output.string("value")
+    }
+    fn drop(&mut self) {
+        unsafe {
+            dropped += 1
+        }
+    }
+}
+pub struct GenericError<E> {
+    pub error: E
+    pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!E {
+        return output.string("generic")
+    }
+}
+pub struct Failing {
+    storage: &mut[u8]
+    used: usize
+    stop: usize
+    zero: bool
+    calls: usize
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        self.calls += 1
+        if self.used == self.stop {
+            if self.zero {
+                return ok(0)
+            }
+            return err(io.Error { kind: io.ErrorKind.WouldBlock, code: 11, transferred: 0 })
+        }
+        self.storage[self.used] = source[0]
+        self.used += 1
+        // An interruption with progress must be counted once and retried.
+        return err(io.Error { kind: io.ErrorKind.Interrupted, code: 4, transferred: 1 })
+    }
+}
+fn generic<W, T>(sink: &mut W, value: &T) -> usize!io.Error {
+    return fmt.printf(sink, "[{}]", value)
+}
+fn no_value() -> isize!io.Error {
+    return err(io.failure(io.ErrorKind.InvalidInput, 0))
+}
+fn evaluation_failure(sink: &mut io.MemoryWriter) -> usize!io.Error {
+    return fmt.printf(sink, "never {} {}", Value { value: 42 }, no_value()?)
+}
+fn verify() -> void!io.Error {
+    storage := [0u8; 512]
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        count := fmt.printf(&mut sink, "Answer: {}, enabled: {}\n", 42, true)?
+        assert(count == 26 && bytes.equal(sink.written(), b"Answer: 42, enabled: true\n"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        count := fmt.printf(&mut sink, "{{{}}}\x00 {{}} hé", 7)?
+        assert(count == 11 && bytes.equal(sink.written(), b"{7}\x00 {} h\xc3\xa9"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        fmt.printf(&mut sink, "{:08x}|{:+06d}|{:b}|{:o}|{:X}|{:d}", 42u8, -7i8, 5u16, 63u32, 255u64, -8i16)?
+        assert(bytes.equal(sink.written(), b"0000002a|-00007|101|77|FF|-8"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        fmt.printf(&mut sink, "{:*^7s}|{:<6}|{:>6}|{:c}", "é", true, false, 65u32)?
+        assert(bytes.equal(sink.written(), b"**\xc3\xa9***|true  | false|A"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        fmt.printf(&mut sink, "{:+.2f}|{:.0}|{:.2E}|{}|{}", 1.25f32, 2.5, 12.5, -0.0, 1.25f32)?
+        assert(bytes.equal(sink.written(), b"+1.25|2|1.25E+01|-0.000000e+00|1.250000e+00"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        small := -7i8
+        fmt.printf(&mut sink, "{}|{}|{}|{}|{}", &small, -9223372036854775807i64 - 1, 18446744073709551615u64, 8usize, -9isize)?
+        assert(bytes.equal(sink.written(), b"-7|-9223372036854775808|18446744073709551615|8|-9"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        fmt.print(&mut sink, "{{literal}}")?
+        fmt.println(&mut sink, 42)?
+        fmt.print(&mut sink, false)?
+        fmt.printf(&mut sink, "")?
+        assert(bytes.equal(sink.written(), b"{{literal}}42\nfalse"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        unsafe {
+            evaluated = 0;
+            formatted = 0;
+            dropped = 0
+        }
+        value := Value { value: 42 }
+        count := fmt.printf(&mut sink, "{}:{}:{}", value, next(), next())?
+        assert(count == 9 && value.value == 42)
+        fmt.println(&mut sink, &value)?
+        generic(&mut sink, &value)?
+        fmt.print(&mut sink, Value { value: true })?
+        unsafe {
+            assert(evaluated == 2 && formatted == 4 && dropped == 1)
+        }
+        assert(bytes.equal(sink.written(), b"value:1:2value\n[value]value"))
+    }
+    unsafe {
+        assert(dropped == 2)
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        value := GenericError { error: io.failure(io.ErrorKind.InvalidInput, 0) }
+        fmt.printf(&mut sink, "{}", value)?
+        assert(bytes.equal(sink.written(), b"generic"))
+    }
+    // Check every failure boundary: literal, number, boolean, and final LF.
+    for stop in 0usize..10 {
+        sink := Failing { storage: &mut storage, used: 0, stop: stop, zero: false, calls: 0 }
+        match fmt.printf(&mut sink, "ab{}{}!\n", 42, true) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.WouldBlock && reason.code == 11 && reason.transferred == stop)
+            }
+        }
+        assert(sink.used == stop)
+    }
+    assert(bytes.equal(&storage[..9], b"ab42true!"))
+    {
+        sink := Failing { storage: &mut storage, used: 0, stop: 3, zero: true, calls: 0 }
+        match fmt.printf(&mut sink, "a{:05}", 42) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.WriteZero && reason.transferred == 3)
+            }
+        }
+    }
+    {
+        sink := Failing { storage: &mut storage, used: 0, stop: 0, zero: false, calls: 0 }
+        unsafe {
+            evaluated = 0;
+            formatted = 0;
+            dropped = 0
+        }
+        match fmt.printf(&mut sink, "prefix {} {} {}", next(), next(), Value { value: 7 }) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.transferred == 0)
+            }
+        }
+        unsafe {
+            assert(evaluated == 2 && formatted == 0 && dropped == 1)
+        }
+        assert(fmt.printf(&mut sink, "")? == 0 && sink.calls == 1)
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage[..3])
+        unsafe {
+            evaluated = 2
+        }
+        match fmt.printf(&mut sink, "a{}", Value { value: 7 }) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.BufferFull && reason.transferred == 3)
+            }
+        }
+        assert(bytes.equal(sink.written(), b"ava"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        match fmt.printf(&mut sink, "ab{:c}", 0xd800u32) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.kind == io.ErrorKind.InvalidInput && reason.transferred == 2)
+            }
+        }
+        assert(bytes.equal(sink.written(), b"ab"))
+    }
+    {
+        sink := io.MemoryWriter.new(&mut storage)
+        unsafe {
+            dropped = 0;
+            formatted = 0
+        }
+        match evaluation_failure(&mut sink) {
+            ok(_) => {
+                assert(false)
+            }
+            err(reason) => {
+                assert(reason.transferred == 0 && sink.position() == 0)
+                unsafe {
+                    assert(dropped == 1 && formatted == 0)
+                }
+            }
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match verify() {
+        ok() => {
+            return 0
+        }, err(_) => {
+            return 1
+        }
+    }
+}
+@test
+fn printf_contracts() {
+    assert_eq(main(), 0)
+}

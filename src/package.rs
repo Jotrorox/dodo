@@ -220,6 +220,17 @@ fn load_internal(
     }
     let mut namespaces = BTreeMap::new();
     for (key, mut module) in loader.modules {
+        for function in &module.program.functions {
+            if function.printing.is_some()
+                && !matches!(&key, ModuleId::Bundled(path) if path == "std/fmt" || path == "std/console")
+            {
+                return Err(
+                    "@compiler printing declarations are reserved for std/fmt and std/console"
+                        .to_owned()
+                        .into(),
+                );
+            }
+        }
         if key == root {
             program.package = module.program.package.clone();
         }

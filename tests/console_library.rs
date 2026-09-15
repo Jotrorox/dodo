@@ -83,7 +83,7 @@ fn console_examples_and_borrowed_stream_ownership() {
             (
                 "examples/console_formatting.dodo",
                 "",
-                "The answer is 42\ntrue\n1.250000e+00\n",
+                "Answer: 42, enabled: true\n1.250000e+00\n",
                 "",
             ),
             (
@@ -310,6 +310,20 @@ fn linux_closed_nonblocking_and_broken_streams_are_recoverable() {
         for (name, operation, kind, code, progress) in [
             ("closed", "console.println(\"x\")", "Closed", 9, 0),
             ("broken", "console.println(\"x\")", "BrokenPipe", 32, 0),
+            (
+                "closed_printf",
+                "console.printf(\"{}\", 42)",
+                "Closed",
+                9,
+                0,
+            ),
+            (
+                "broken_printf",
+                "console.stdout().printf(\"{}\", true)",
+                "BrokenPipe",
+                32,
+                0,
+            ),
             ("blocked", "input.read(&mut bytes)", "WouldBlock", 11, 0),
             (
                 "partial",
@@ -337,7 +351,7 @@ fn main() -> i32 {{
 "#));
             let exe = work.build(&source, optimization);
             let (read, write) = pipe();
-            let mut read = if name == "broken" {
+            let mut read = if name.starts_with("broken") {
                 drop(read);
                 None
             } else {
@@ -351,7 +365,7 @@ fn main() -> i32 {{
             if name == "partial" {
                 assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, 4096) }, 4096);
             }
-            let closed = name == "closed";
+            let closed = name.starts_with("closed");
             let destination = if name == "blocked" { 0 } else { 1 };
             let mut command = Command::new(exe);
             unsafe {
@@ -391,5 +405,35 @@ fn windows_absent_standard_streams_and_native_codes() {
                 .output()
                 .unwrap(),
         );
+    }
+}
+
+#[test]
+fn printf_evaluates_temporary_stream_and_arguments_once_in_order() {
+    let work = Workspace::new();
+    let source = work.source(
+        "evaluation",
+        r#"package evaluation
+import "std/console"
+static mut printing_evaluations: isize = 0
+fn next() -> isize {
+    unsafe { printing_evaluations += 1; return printing_evaluations }
+}
+fn stream() -> console.Output {
+    assert(next() == 1)
+    return console.stdout()
+}
+fn main() {
+    stream().printf("{} {}\n", next(), next())!
+    unsafe { assert(printing_evaluations == 3) }
+    console.stderr().println(false)!
+    console.stdout().print(42)!
+}
+"#,
+    );
+    for optimization in ["0", "3"] {
+        let output = run(&work.build(&source, optimization), b"");
+        assert_eq!(output.stdout, b"2 3\n42");
+        assert_eq!(output.stderr, b"false\n");
     }
 }

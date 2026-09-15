@@ -169,3 +169,9 @@ when the compiler's syntax changes.
 ## License
 
 [BSD-2-Clause](LICENSE), like Dodo.
+
+Printing completions include `print`, `println`, and `printf`. Signature help for
+`printf` shows its literal format and heterogeneous `args...` tail; diagnostics
+check placeholders and argument types. The `printf` snippet inserts a checked
+console call. Braces inside format strings remain string contents during
+highlighting and document formatting.

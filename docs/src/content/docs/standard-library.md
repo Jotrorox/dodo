@@ -17,7 +17,7 @@ compiler binary: if an older binary reports an unknown package or method,
 
 | Task | Recommended starting API | Guide |
 | --- | --- | --- |
-| Print a value | `console.println_value` and `fmt.signed` | [Formatting and console output](formatting.md) |
+| Print a value | `console.println` and `console.printf` | [Formatting and console output](formatting.md) |
 | Read a file | `fs.read_file` with `platform.workspace()` | [Filesystem](filesystem.md) |
 | Get an environment variable | `env.get` with `env.Workspace.new()` | [Environment](environment.md) |
 | Run a command | `process.Command.new` and `output` | [Processes](processes.md) |
@@ -48,7 +48,7 @@ never silently selects an allocator on exhaustion.
 Results must be handled. Examples use `match` at `main` and propagate with `?`
 inside helpers. A nonzero exit status denotes failure; the text beside each
 example explains the codes. For user-facing diagnostics use
-`console.stderr().println_value` with a formatted error; `std/fmt/errors` supplies
+`console.stderr().println` with a formatted error; `std/fmt/errors` supplies
 optional adapters for enum errors. Check I/O prefix counts before retrying.
 [Patterns and Results](patterns-and-results.md) explains the syntax.
 
