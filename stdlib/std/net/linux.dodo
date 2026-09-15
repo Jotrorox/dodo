@@ -11,6 +11,7 @@ unsafe extern "C" fn dodo_net_close(handle: isize) -> i32
 unsafe extern "C" fn dodo_net_accept(handle: isize, error: *mut i32) -> isize
 unsafe extern "C" fn dodo_net_address(handle: isize, address: *mut u8, peer: u32) -> i32
 unsafe extern "C" fn dodo_net_wait(handle: isize, writing: u32, milliseconds: u32, error: *mut i32) -> i32
+unsafe extern "C" fn dodo_net_wait_many(handles: *const isize, interests: *const u32, ready: *mut u32, count: usize, milliseconds: u32, error: *mut i32) -> i32
 unsafe extern "C" fn dodo_net_connected(handle: isize, error: *mut i32) -> i32
 unsafe extern "C" fn dodo_net_read(handle: isize, data: *mut u8, size: usize, error: *mut i32) -> isize
 unsafe extern "C" fn dodo_net_write(handle: isize, data: *const u8, size: usize, error: *mut i32) -> isize
@@ -177,10 +178,64 @@ fn wait(handle: isize, interest: &net.Interest, milliseconds: u32) -> bool!net.E
     }
 }
 
+// A bounded readiness set; no socket ownership or pointer survives wait().
+pub const POLL_CAPACITY: usize = 256
+pub struct PollSet {
+    handles: [256]isize
+    interests: [256]u32
+    events: [256]u32
+    count: usize
+    pub fn new() -> PollSet {
+        return PollSet { handles: [-1isize; 256], interests: [0u32; 256], events: [0u32; 256], count: 0 }
+    }
+    pub fn clear(&mut self) {
+        self.count = 0
+    }
+    fn add(&mut self, handle: isize, interest: net.Interest) -> usize!net.Error {
+        if handle == -1 {
+            return err(net.failure(net.ErrorKind.Closed))
+        }
+        if self.count == POLL_CAPACITY {
+            return err(net.failure(net.ErrorKind.Exhausted))
+        }
+        index := self.count
+        self.handles[index] = handle
+        self.interests[index] = 0
+        if interest == net.Interest.Write {
+            self.interests[index] = 1
+        }
+        self.events[index] = 0
+        self.count += 1
+        return ok(index)
+    }
+    pub fn ready(&self, index: usize) -> bool {
+        return index < self.count && self.events[index] != 0
+    }
+    pub fn wait(&mut self, milliseconds: u32) -> usize!net.Error {
+        if self.count == 0 {
+            return ok(0)
+        }
+        code := 0i32
+        result := unsafe {
+            dodo_net_wait_many(ptr.as_ptr(&self.handles), ptr.as_ptr(&self.interests),
+            ptr.as_mut_ptr(&mut self.events), self.count, milliseconds, ptr.from_mut(&mut code))
+        }
+        if result < 0 {
+            return err(from_code(code))
+        }
+        return ok(result as usize)
+    }
+}
 pub struct TcpConnection {
     handle: isize
     connecting: bool
     failed: bool
+    pub fn closed() -> TcpConnection {
+        return TcpConnection { handle: -1, connecting: false, failed: false }
+    }
+    pub fn register(&self, set: &mut PollSet, interest: net.Interest) -> usize!net.Error {
+        return set.add(self.handle, interest)
+    }
     pub fn connect(address: &net.SocketAddress) -> TcpConnection!net.Error {
         handle := open(address, 0, 0)?
         return ok(TcpConnection { handle: handle, connecting: true, failed: false })
@@ -325,6 +380,9 @@ pub struct TcpListener {
         }
         handle := open(address, 1, backlog)?
         return ok(TcpListener { handle: handle })
+    }
+    pub fn register(&self, set: &mut PollSet) -> usize!net.Error {
+        return set.add(self.handle, net.Interest.Read)
     }
     pub fn local_address(&self) -> net.SocketAddress!net.Error {
         return address(self.handle, 0)

@@ -2,6 +2,7 @@ package connection
 import "std/http"
 import "std/io"
 import "core/bytes"
+import "core/mem"
 
 pub enum ErrorKind {
     Protocol, Transport, Backpressure, InvalidState, TimedOut, Cancelled
@@ -62,6 +63,30 @@ pub fn waiting() -> http.Event {
 // A connection driver owns only caller buffers and protocol state. Stream,
 // execution, clock, cancellation, TLS and pooling are independent capabilities.
 // Each poll performs at most one read/write OS/provider operation.
+// Movable connection state for bounded executors. Buffer bytes remain owned by
+// the caller and must accompany this state when it is resumed.
+pub struct State {
+    parser: http.ParserState
+    start: usize
+    end: usize
+    pending_start: usize
+    pending_end: usize
+    body_start: usize
+    body_end: usize
+    eof: bool
+    failed: bool
+    received: bool
+    sending: bool
+    outbound_close: bool
+    server: bool
+    sender: http.Sender
+    pub fn new(role: http.Role, limits: http.Limits) -> State {
+        server := role == http.Role.Request
+        return State { parser: http.ParserState.new(role, limits), start: 0, end: 0, pending_start: 0, pending_end: 0,
+        body_start: 0, body_end: 0, eof: false, failed: false, received: false,
+        sending: false, outbound_close: false, server: server, sender: http.Sender.new(http.Body.empty()) }
+    }
+}
 pub struct Connection {
     parser: http.Parser
     input: &mut[u8]
@@ -88,6 +113,58 @@ pub struct Connection {
         output: output, start: 0, end: 0, pending_start: 0, pending_end: 0,
         body_start: 0, body_end: 0, eof: false, failed: false, received: false,
         sending: false, outbound_close: false, server: server, sender: http.Sender.new(http.Body.empty()) })
+    }
+    pub fn resume(state: State, workspace: &mut[u8], input: &mut[u8], output: &mut[u8]) -> Connection!Error from(workspace, input, output) {
+        if input.len == 0 || output.len == 0 || state.end > input.len || state.pending_end > output.len {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        parser: http.Parser
+        match http.Parser.resume(workspace, mem.replace(&mut state.parser, http.ParserState.new(http.Role.Request, http.Limits.defaults()))) {
+            ok(value) => {
+                parser = value
+            }
+            err(reason) => {
+                result := failure(ErrorKind.Protocol)
+                result.protocol = reason
+                return err(result)
+            }
+        }
+        return ok(Connection { parser: parser, input: input, output: output,
+        start: state.start,
+        end: state.end,
+        pending_start: state.pending_start,
+        pending_end: state.pending_end,
+        body_start: state.body_start,
+        body_end: state.body_end,
+        eof: state.eof,
+        failed: state.failed,
+        received: state.received,
+        sending: state.sending,
+        outbound_close: state.outbound_close,
+        server: state.server,
+        sender: mem.replace(&mut state.sender, http.Sender.new(http.Body.empty())) })
+    }
+    pub fn suspend(self) -> State {
+        return State { parser: self.parser.take_state(),
+        start: self.start,
+        end: self.end,
+        pending_start: self.pending_start,
+        pending_end: self.pending_end,
+        body_start: self.body_start,
+        body_end: self.body_end,
+        eof: self.eof,
+        failed: self.failed,
+        received: self.received,
+        sending: self.sending,
+        outbound_close: self.outbound_close,
+        server: self.server,
+        sender: mem.replace(&mut self.sender, http.Sender.new(http.Body.empty())) }
+    }
+    pub fn input_ended(&self) -> bool {
+        return self.eof
+    }
+    pub fn incoming_reusable(&self) -> bool {
+        return self.received && !self.failed && !self.eof && self.parser.reusable() && self.body_start == self.body_end
     }
     pub fn poison(&mut self) {
         self.failed = true
@@ -212,6 +289,26 @@ pub struct Connection {
             }
         }
     }
+    // Coalesce a body fragment with an entirely unsent head/body. The ordinary
+    // send_body contract still requires an empty output queue. Leave room for
+    // chunk framing before mutating sender state; callers can flush and retry.
+    pub fn append_body(&mut self, source: &[u8]) -> usize!Error {
+        if self.failed || !self.sending {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        if self.pending_start != 0 || self.output.len - self.pending_end <= 20 {
+            return err(failure(ErrorKind.Backpressure))
+        }
+        match self.sender.frame(source, &mut self.output[self.pending_end..]) {
+            ok(encoded) => {
+                self.pending_end += encoded.written
+                return ok(encoded.consumed)
+            }
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+    }
     pub fn finish_body(&mut self, trailers: &[http.Header]) -> void!Error {
         if self.failed || !self.sending {
             return err(failure(ErrorKind.InvalidState))
@@ -227,6 +324,41 @@ pub struct Connection {
             }
             err(reason) => {
                 return err(self.protocol_error(reason))
+            }
+        }
+    }
+    // One write, no retained source borrow and no staging copy. Chunked framing
+    // returns Backpressure so callers can fall back to send_body/poll_flush.
+    pub fn poll_body<S>(&mut self, stream: &mut S, source: &[u8]) -> io.Poll!Error {
+        if self.failed || !self.sending {
+            return err(failure(ErrorKind.InvalidState))
+        }
+        if self.pending_start != self.pending_end {
+            return err(failure(ErrorKind.Backpressure))
+        }
+        match self.sender.direct(source.len) {
+            ok(supported) => {
+                if!supported {
+                    return err(failure(ErrorKind.Backpressure))
+                }
+            }
+            err(reason) => {
+                return err(self.protocol_error(reason))
+            }
+        }
+        match io.poll_write_once(stream, source) {
+            ok(progress) => {
+                match self.sender.advance_direct(progress.transferred) {
+                    ok() => {
+                        return ok(progress)
+                    }
+                    err(reason) => {
+                        return err(self.protocol_error(reason))
+                    }
+                }
+            }
+            err(reason) => {
+                return err(self.transport_error(reason))
             }
         }
     }

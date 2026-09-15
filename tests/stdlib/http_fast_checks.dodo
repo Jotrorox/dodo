@@ -1,0 +1,280 @@
+package http_fast_checks
+import "core/bytes"
+import "std/http"
+import "std/http/connection"
+import "std/io"
+import "std/web"
+
+pub struct Peer {
+    input: &[u8]
+    read: bool
+    wire: [512]u8
+    used: usize
+    pub fn poll_read(&mut self, output: &mut[u8]) -> io.Poll!io.Error {
+        if self.read {
+            return ok(io.Poll { state: io.PollState.Eof, transferred: 0 })
+        }
+        for i in 0usize..self.input.len {
+            output[i] = self.input[i]
+        }
+        self.read = true
+        return ok(io.Poll { state: io.PollState.Ready, transferred: self.input.len })
+    }
+    pub fn poll_write(&mut self, input: &[u8]) -> io.Poll!io.Error {
+        count := input.len
+        if count > 2 {
+            count = 2
+        }
+        for i in 0usize..count {
+            self.wire[self.used + i] = input[i]
+        }
+        self.used += count
+        return ok(io.Poll { state: io.PollState.Pending, transferred: count })
+    }
+}
+fn transport() -> void!connection.Error {
+    workspace := [0u8; 512]
+    input := [0u8; 256]
+    output := [0u8; 128]
+    state := connection.State.new(http.Role.Request, http.Limits.defaults())
+    peer := Peer { input: b"POST / HTTP/1.1\r\nHost: local\r\nContent-Length: 4\r\n\r\nABCDGET / HTTP/1.1\r\nHost: local\r\n\r\n",
+    read: false, wire: [0u8; 512], used: 0 }
+    received := 0usize
+    complete := false
+    // Suspend at every event, including a partially consumed body fragment.
+    for i in 0usize..100 {
+        driver := connection.Connection.resume(state, &mut workspace, &mut input, &mut output)?
+        if driver.body().len != 0 {
+            driver.consume_body(1)?;
+            received += 1
+        } else {
+            event := driver.poll_event(&mut peer)?
+            if event.kind == http.EventKind.Complete {
+                complete = true
+            }
+        }
+        state = driver.suspend()
+        if complete {
+            break
+        }
+    }
+    assert(complete && received == 4)
+    driver := connection.Connection.resume(state, &mut workspace, &mut input, &mut output)?
+    headers: [0]http.Header = []
+    response := http.Response { status: 200, reason: b"OK", headers: &headers, body: http.Body.sized(6) }
+    driver.response(&response)?
+    count := driver.append_body(b"ab")?
+    assert(count == 2)
+    match driver.poll_body(&mut peer, b"cdef") {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason.kind == connection.ErrorKind.Backpressure)
+        }
+    }
+    progress := driver.poll_flush(&mut peer)?
+    assert(progress.transferred == 2)
+    match driver.append_body(b"cd") {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason.kind == connection.ErrorKind.Backpressure)
+        }
+    }
+    state = driver.suspend()
+    drained := false
+    for i in 0usize..100 {
+        current := connection.Connection.resume(state, &mut workspace, &mut input, &mut output)?
+        if current.pending_output() != 0 {
+            progress := current.poll_flush(&mut peer)?
+        }
+        drained = current.pending_output() == 0
+        state = current.suspend()
+        if drained {
+            break
+        }
+    }
+    assert(drained)
+    offset := 0usize
+    for offset < 4 {
+        current := connection.Connection.resume(state, &mut workspace, &mut input, &mut output)?
+        progress := current.poll_body(&mut peer, &b"cdef"[offset..])?
+        offset += progress.transferred
+        state = current.suspend()
+    }
+    current := connection.Connection.resume(state, &mut workspace, &mut input, &mut output)?
+    current.finish_body(&headers)?
+    assert(current.reusable())
+    assert(bytes.equal(&peer.wire[..peer.used], b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabcdef"))
+    current.next_message()?
+    state = current.suspend()
+    complete = false
+    for i in 0usize..100 {
+        next := connection.Connection.resume(state, &mut workspace, &mut input, &mut output)?
+        event := next.poll_event(&mut peer)?
+        if event.kind == http.EventKind.Complete {
+            complete = true;
+            assert(bytes.equal(next.method(), b"GET"))
+        }
+        state = next.suspend()
+        if complete {
+            break
+        }
+    }
+    assert(complete)
+    // Retained unread/output offsets cannot be resumed into short buffers.
+    match connection.Connection.resume(state, &mut workspace, &mut input[..1], &mut output) {
+        ok(_) => {
+            assert(false)
+        }
+        err(_) => {}
+    }
+    return ok()
+}
+fn routing() -> void!web.Error {
+    routes := [web.Route { method: b"GET", pattern: b"/:name", id: 1 },
+    web.Route { method: b"POST", pattern: b"/a", id: 2 },
+    web.Route { method: b"GET", pattern: b"/i", id: 3 },
+    web.Route { method: b"HEAD", pattern: b"/i", id: 4 },
+    web.Route { method: b"GET", pattern: b"/files/*path", id: 5 },
+    web.Route { method: b"GET", pattern: b"/files/:name", id: 6 }]
+    index := [0usize; 12]
+    indexed := web.Router.indexed(&routes, &mut index)?
+    plain := web.Router.new(&routes)?
+    methods := [b"GET", b"POST", b"HEAD", b"PUT"]
+    paths := [b"/a", b"/i", b"/new", b"/files/a", b"/files/a/b", b"/files/", b"/missing/path"]
+    for m in 0usize..methods.len {
+        for p in 0usize..paths.len {
+            match plain.find(methods[m], paths[p]) {
+                ok(expected) => {
+                    actual := indexed.find(methods[m], paths[p])?
+                    assert(actual.id == expected.id && actual.head == expected.head)
+                }
+                err(expected) => {
+                    match indexed.find(methods[m], paths[p]) {
+                        ok(_) => {
+                            assert(false)
+                        }
+                        err(actual) => {
+                            assert(actual == expected)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found_head := indexed.find(b"HEAD", b"/i")!
+    assert(found_head.id == 4)
+    found_file := indexed.find(b"GET", b"/files/a")!
+    assert(found_file.id == 6)
+    match indexed.find(b"GET", b"/a") {
+        ok(_) => {
+            assert(false, "less specific method incorrectly won")
+        }
+        err(reason) => {
+            assert(reason == web.Error.MethodNotAllowed)
+        }
+    }
+    duplicate_literal := [web.Route { method: b"GET", pattern: b"/x", id: 1 },
+    web.Route { method: b"GET", pattern: b"/x", id: 2 }]
+    duplicate_dynamic := [web.Route { method: b"GET", pattern: b"/:a", id: 1 },
+    web.Route { method: b"GET", pattern: b"/:b", id: 2 }]
+    duplicates := [0usize; 4]
+    match web.Router.indexed(&duplicate_literal, &mut duplicates) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == web.Error.AmbiguousRoute)
+        }
+    }
+    match web.Router.indexed(&duplicate_dynamic, &mut duplicates) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == web.Error.AmbiguousRoute)
+        }
+    }
+    small := [0usize; 2]
+    match web.Router.indexed(&routes, &mut small) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason == web.Error.BufferFull)
+        }
+    }
+    return ok()
+}
+fn header_spans() {
+    message := [0u8; 128]
+    prefix := b"GET / HTTP/1.1\r\nHost: local\r\nX-Test: "
+    for i in 0usize..prefix.len {
+        message[i] = prefix[i]
+    }
+    ending := prefix.len + 24
+    message[ending] = 13;
+    message[ending + 1] = 10;
+    message[ending + 2] = 13;
+    message[ending + 3] = 10
+    fragments := [1usize, 7usize, 8usize, 9usize, 64usize]
+    for offset in 0usize..16 {
+        for i in prefix.len..ending {
+            message[i] = 120
+        }
+        for value in 0u16..256 {
+            message[prefix.len + offset] = value as u8
+            valid := value == 9 || (value >= 32 && value != 127)
+            for f in 0usize..fragments.len {
+                workspace := [0u8; 128]
+                parser := http.Parser.new(http.Role.Request, &mut workspace, http.Limits.defaults())
+                position := 0usize
+                complete := false
+                rejected := false
+                for step in 0usize..200 {
+                    end := position + fragments[f]
+                    if end > ending + 4 {
+                        end = ending + 4
+                    }
+                    match parser.feed(&message[position..end]) {
+                        ok(event) => {
+                            position += event.consumed
+                            if event.kind == http.EventKind.Complete {
+                                complete = true;
+                                break
+                            }
+                        }
+                        err(_) => {
+                            rejected = true;
+                            break
+                        }
+                    }
+                }
+                assert(complete == valid && rejected != valid)
+            }
+        }
+    }
+}
+fn main() -> i32 {
+    sender := http.Sender.new(http.Body.sized(1))
+    match sender.direct(2) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            assert(reason.kind == http.ErrorKind.InvalidState)
+        }
+    }
+    assert(sender.poisoned())
+    header_spans()
+    transport()!
+    routing()!
+    return 0
+}
+@test
+fn state_transfer_direct_writes_and_indexed_routes() {
+    assert_eq(main(), 0)
+}

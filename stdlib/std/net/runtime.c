@@ -40,11 +40,6 @@ typedef socklen_t dodo_socklen;
 static int initialize(void) { return 0; }
 static int last_error(void) { return errno; }
 static int socket_close(dodo_socket s) { return close(s); }
-static int set_nonblocking(dodo_socket s) {
-    int flags = fcntl(s, F_GETFL, 0);
-    if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
-    return fcntl(s, F_SETFD, FD_CLOEXEC);
-}
 #endif
 /* Stable category tags independent of errno/WSA numeric values. */
 uint32_t dodo_net_error_kind(int32_t error) {
@@ -116,8 +111,8 @@ intptr_t dodo_net_open(const uint8_t *wire, uint32_t mode, uint32_t backlog, int
     dodo_socket socket_value = socket(address.ss_family, (mode == 2 ? SOCK_DGRAM : SOCK_STREAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 #endif
     if ((intptr_t)socket_value == -1) { *error = last_error(); return -1; }
-    if (set_nonblocking(socket_value) != 0) goto failed;
 #ifdef _WIN32
+    if (set_nonblocking(socket_value) != 0) goto failed;
     if (!SetHandleInformation((HANDLE)socket_value, HANDLE_FLAG_INHERIT, 0)) {
         *error = (int)GetLastError(); socket_close(socket_value); return -1;
     }
@@ -148,8 +143,8 @@ intptr_t dodo_net_accept(intptr_t raw, int32_t *error) {
 #endif
     *error = 0;
     if ((intptr_t)accepted == -1) { *error = last_error(); return -1; }
-    if (set_nonblocking(accepted) != 0) { *error = last_error(); socket_close(accepted); return -1; }
 #ifdef _WIN32
+    if (set_nonblocking(accepted) != 0) { *error = last_error(); socket_close(accepted); return -1; }
     if (!SetHandleInformation((HANDLE)accepted, HANDLE_FLAG_INHERIT, 0)) {
         *error = (int)GetLastError(); socket_close(accepted); return -1;
     }
@@ -174,6 +169,38 @@ int32_t dodo_net_wait(intptr_t raw, uint32_t writing, uint32_t milliseconds, int
 #endif
     if (result < 0) { *error = last_error(); return -1; }
     return result ? 1 : 0;
+}
+/* One syscall for all active sockets. The Dodo owner bounds and retains all
+ * arrays only for this synchronous call; readiness never transfers ownership. */
+int32_t dodo_net_wait_many(const intptr_t *handles, const uint32_t *interests,
+                          uint32_t *ready, size_t count, uint32_t milliseconds,
+                          int32_t *error) {
+    *error = 0;
+    if (count > 256) { *error = -1000003; return -1; }
+#ifdef _WIN32
+    WSAPOLLFD items[256];
+#else
+    struct pollfd items[256];
+#endif
+    for (size_t i = 0; i < count; ++i) {
+        ready[i] = 0;
+        items[i].fd = (dodo_socket)handles[i];
+#ifdef _WIN32
+        items[i].events = interests[i] ? POLLWRNORM : POLLRDNORM;
+#else
+        items[i].events = interests[i] ? POLLOUT : POLLIN;
+#endif
+        items[i].revents = 0;
+    }
+    int timeout = milliseconds > INT_MAX ? INT_MAX : (int)milliseconds;
+#ifdef _WIN32
+    int result = WSAPoll(items, (ULONG)count, timeout);
+#else
+    int result = poll(items, count, timeout);
+#endif
+    if (result < 0) { *error = last_error(); return -1; }
+    for (size_t i = 0; i < count; ++i) ready[i] = items[i].revents != 0;
+    return result;
 }
 int32_t dodo_net_connected(intptr_t raw, int32_t *error) {
     int ready = dodo_net_wait(raw, 1, 0, error); if (ready <= 0) return ready;

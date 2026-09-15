@@ -233,52 +233,187 @@ pub struct Parameter {
     pub start: usize
     pub end: usize
 }
+const EMPTY_INDEX: [0]usize = []
+fn literal_pattern(pattern: &[u8]) -> bool {
+    for i in 0usize..pattern.len {
+        if pattern[i] == 58 || pattern[i] == 42 {
+            return false
+        }
+    }
+    return true
+}
+// Bounded integer arithmetic also works on 32-bit freestanding targets.
+fn path_hash(path: &[u8]) -> usize {
+    hash := 5381usize
+    for i in 0usize..path.len {
+        hash = ((hash & 67108863usize) * 33usize) ^ (path[i] as usize)
+    }
+    return hash
+}
 pub struct Router {
     routes: &[Route]
+    index: &[usize]
+    literal_sorted: bool
+    dynamic: bool
     pub fn new(routes: &[Route]) -> Router!Error from(routes) {
+        sorted := true
+        dynamic := false
         for i in 0usize..routes.len {
             if!valid_method(routes[i].method) {
                 return err(Error.InvalidMethod)
             }
             validate_pattern(routes[i].pattern)?
-            for j in 0usize..i {
+            if!literal_pattern(routes[i].pattern) {
+                dynamic = true;
+                sorted = false
+            }
+            if i != 0 && bytes.compare(routes[i - 1].pattern, routes[i].pattern) > 0 {
+                sorted = false
+            }
+        }
+        for i in 0usize..routes.len {
+            j := i
+            for j != 0 {
+                j -= 1
+                if sorted && !bytes.equal(routes[i].pattern, routes[j].pattern) {
+                    break
+                }
                 if bytes.equal(routes[i].method, routes[j].method) && same_shape(routes[i].pattern, routes[j].pattern) {
                     return err(Error.AmbiguousRoute)
                 }
             }
         }
-        return ok(Router { routes: routes })
+        return ok(Router { routes: routes, index: &EMPTY_INDEX, literal_sorted: sorted, dynamic: dynamic })
     }
+    // Optional caller-owned hash table. Literal matches are independent of
+    // registration order; parameters/wildcards retain the specificity scan.
+    // No allocation, route-count ceiling, or probabilistic match is involved.
+    pub fn indexed(routes: &[Route], storage: &mut[usize]) -> Router!Error from(routes, storage) {
+        if routes.len > storage.len / 2 {
+            return err(Error.BufferFull)
+        }
+        dynamic := false
+        for i in 0usize..routes.len {
+            if!valid_method(routes[i].method) {
+                return err(Error.InvalidMethod)
+            }
+            validate_pattern(routes[i].pattern)?
+        }
+        for i in 0usize..storage.len {
+            storage[i] = 0
+        }
+        for i in 0usize..routes.len {
+            if literal_pattern(routes[i].pattern) {
+                at := path_hash(routes[i].pattern) % storage.len
+                for storage[at] != 0 {
+                    previous := storage[at] - 1
+                    if bytes.equal(routes[i].pattern, routes[previous].pattern) && bytes.equal(routes[i].method, routes[previous].method) {
+                        return err(Error.AmbiguousRoute)
+                    }
+                    at = (at + 1) % storage.len
+                }
+                storage[at] = i + 1
+            } else {
+                dynamic = true
+                for j in 0usize..i {
+                    if bytes.equal(routes[i].method, routes[j].method) && same_shape(routes[i].pattern, routes[j].pattern) {
+                        return err(Error.AmbiguousRoute)
+                    }
+                }
+            }
+        }
+        return ok(Router { routes: routes, index: storage, literal_sorted: false, dynamic: dynamic })
+    }
+
     pub fn find(&self, method: &[u8], path: &[u8]) -> Match!Error {
         if!valid_method(method) {
             return err(Error.InvalidMethod)
         }
         validate_path(path)?
+        head := bytes.equal(method, b"HEAD")
+        fallback := self.routes.len
+        if self.index.len != 0 {
+            at := path_hash(path) % self.index.len
+            matched := false
+            for self.index[at] != 0 {
+                i := self.index[at] - 1
+                if bytes.equal(self.routes[i].pattern, path) {
+                    matched = true
+                    if bytes.equal(method, self.routes[i].method) {
+                        return ok(Match { index: i, id: self.routes[i].id, head: head })
+                    }
+                    if head && bytes.equal(self.routes[i].method, b"GET") {
+                        fallback = i
+                    }
+                }
+                at = (at + 1) % self.index.len
+            }
+            if fallback != self.routes.len {
+                return ok(Match { index: fallback, id: self.routes[fallback].id, head: true })
+            }
+            if matched {
+                return err(Error.MethodNotAllowed)
+            }
+            if!self.dynamic {
+                return err(Error.NotFound)
+            }
+        } else if self.literal_sorted {
+            lower := 0usize
+            upper := self.routes.len
+            for lower < upper {
+                middle := lower + (upper - lower) / 2
+                if bytes.compare(self.routes[middle].pattern, path) < 0 {
+                    lower = middle + 1
+                } else {
+                    upper = middle
+                }
+            }
+            matched := false
+            for lower < self.routes.len && bytes.equal(self.routes[lower].pattern, path) {
+                matched = true
+                if bytes.equal(method, self.routes[lower].method) {
+                    return ok(Match { index: lower, id: self.routes[lower].id, head: head })
+                }
+                if head && bytes.equal(self.routes[lower].method, b"GET") {
+                    fallback = lower
+                }
+                lower += 1
+            }
+            if fallback != self.routes.len {
+                return ok(Match { index: fallback, id: self.routes[fallback].id, head: true })
+            }
+            if matched {
+                return err(Error.MethodNotAllowed)
+            }
+            return err(Error.NotFound)
+        }
         best := self.routes.len
+        selected := self.routes.len
         for i in 0usize..self.routes.len {
             if matches_path(self.routes[i].pattern, path) {
                 if best == self.routes.len || more_specific(self.routes[i].pattern, self.routes[best].pattern) {
                     best = i
+                    selected = self.routes.len
+                    fallback = self.routes.len
+                } else if!same_shape(self.routes[i].pattern, self.routes[best].pattern) {
+                    continue
                 }
-            }
-        }
-        if best == self.routes.len {
-            return err(Error.NotFound)
-        }
-        head := bytes.equal(method, b"HEAD")
-        fallback := self.routes.len
-        for i in 0usize..self.routes.len {
-            if same_shape(self.routes[i].pattern, self.routes[best].pattern) {
                 if bytes.equal(method, self.routes[i].method) {
-                    return ok(Match { index: i, id: self.routes[i].id, head: head })
+                    selected = i
                 }
                 if head && bytes.equal(self.routes[i].method, b"GET") {
                     fallback = i
                 }
             }
         }
+        if selected != self.routes.len {
+            return ok(Match { index: selected, id: self.routes[selected].id, head: head })
+        }
         if fallback != self.routes.len {
             return ok(Match { index: fallback, id: self.routes[fallback].id, head: true })
+        }
+        if best == self.routes.len {
+            return err(Error.NotFound)
         }
         return err(Error.MethodNotAllowed)
     }

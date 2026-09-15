@@ -237,7 +237,7 @@ response_body, config)` parses a numeric bind address, validates the router,
 binds one listener, and accepts repeated connections. It handles one request
 per connection and sends `Connection: close`. There is no per-peer thread,
 queue allocation, keep-alive pipeline, or unbounded task creation. The OS listen
-backlog defaults to 16. A slow client occupies the single execution lane until
+backlog defaults to 256. A slow client occupies the single execution lane until
 its limit, deadline, or cancellation fires.
 
 The server uses the existing ordinary structural interface:
@@ -254,11 +254,14 @@ handler returns the status. `hosted.text(output, bytes)` writes text and returns
 handlers using `web.handle` work directly. Response Content-Type is currently
 `text/plain; charset=utf-8`. Applications needing arbitrary response headers,
 streaming request callbacks (`head`/`poll_write`/`complete`), streaming response
-production, middleware-controlled I/O, upgrades, or concurrency should keep
+production, middleware-controlled I/O, or upgrades should keep
 using the independently available portable application/connection drivers.
+For concurrent socket progress and HTTP/1.1 connection reuse with the same
+buffered handler interface, use [`std/web/reactor`](../web/#concurrent-http11-server).
 
 The fixed server workspace is 38,912 bytes (16 KiB parser, 4 KiB input, 16 KiB
-output, 2 KiB decoded path). Body arrays are separate and explicit. Request and
+output, 2 KiB decoded path). A bounded route index also uses stack storage.
+Body arrays are separate and explicit. Request and
 response capacities are the smaller of the supplied arrays and the configured
 `body_bytes` / `response_bytes`, each defaulting to 65,536. Headers default to
 16,384 bytes and 100 fields. Overlarge requests get 413, oversized heads 431,

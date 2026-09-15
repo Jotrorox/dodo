@@ -212,9 +212,36 @@ pub fn flush<S, C, X>(driver: &mut connection.Connection, stream: &mut S, clock:
 }
 pub fn send<S, C, X>(driver: &mut connection.Connection, stream: &mut S, body: &[u8], clock: &mut C, cancel: &X, until: u64) -> void!Error {
     offset := 0usize
+    if body.len != 0 {
+        check(clock, cancel, until)?
+        match driver.append_body(body) {
+            ok(count) => {
+                offset = count
+            }
+            err(reason) => {
+                if reason.kind != connection.ErrorKind.Backpressure {
+                    return err(connection_error(reason))
+                }
+            }
+        }
+    }
     flush(driver, stream, clock, cancel, until)?
     for offset < body.len {
         check(clock, cancel, until)?
+        match driver.poll_body(stream, &body[offset..]) {
+            ok(progress) => {
+                offset += progress.transferred
+                if progress.state == io.PollState.Pending {
+                    wait(stream, true, clock, cancel, until)?
+                }
+                continue
+            }
+            err(reason) => {
+                if reason.kind != connection.ErrorKind.Backpressure {
+                    return err(connection_error(reason))
+                }
+            }
+        }
         match driver.send_body(&body[offset..]) {
             ok(count) => {
                 if count == 0 {

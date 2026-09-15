@@ -36,6 +36,7 @@ fn routing_middleware_and_backpressure_execute_and_remain_portable() {
     for fixture in [
         "web_checks",
         "http_connection_checks",
+        "http_fast_checks",
         "web_application_checks",
     ] {
         let source =
@@ -81,6 +82,10 @@ fn router_context_and_pending_body_borrows_cannot_escape() {
         (
             "router",
             "fn escape() -> web.Router!web.Error from(static) { routes := [web.Route { method: b\"GET\", pattern: b\"/\", id: 1 }]\n return web.Router.new(&routes) }",
+        ),
+        (
+            "router-index",
+            "fn bad() { routes := [web.Route { method: b\"GET\", pattern: b\"/\", id: 1 }]\n index := [0usize; 2]\n router := web.Router.indexed(&routes, &mut index)!\n index[0] = 99\n found := router.find(b\"GET\", b\"/\")! }",
         ),
         (
             "pending",
@@ -159,4 +164,43 @@ fn runnable_examples_interoperate_with_independent_http_peer() {
             .output()
             .unwrap(),
     );
+}
+
+#[test]
+fn concurrent_server_keeps_peers_independent_and_bounds_reuse() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    success(
+        Command::new("python3")
+            .arg(root.join("scripts/test_web_reactor.py"))
+            .arg("--compiler")
+            .arg(env!("CARGO_BIN_EXE_dodo"))
+            .output()
+            .unwrap(),
+    );
+}
+
+#[test]
+fn concurrent_server_cross_compiles_for_windows() {
+    let scratch = Workspace::new();
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/web_server_concurrent.dodo");
+    for optimization in ["0", "3"] {
+        success(
+            Command::new(env!("CARGO_BIN_EXE_dodo"))
+                .arg("compile")
+                .arg(&source)
+                .args([
+                    "-O",
+                    optimization,
+                    "--target",
+                    "x86_64-pc-windows-msvc",
+                    "--emit",
+                    "obj",
+                    "-o",
+                ])
+                .arg(scratch.0.join(format!("reactor-{optimization}.o")))
+                .output()
+                .unwrap(),
+        );
+    }
 }

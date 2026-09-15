@@ -150,6 +150,17 @@ platform signed integer range; the OS may further constrain it. `accept()` retur
 `none` when no connection is available, `some(TcpConnection)` on success or an
 error. There is no hidden worker thread. Accepted sockets are nonblocking.
 
+`PollSet.new()` batches readiness checks for up to `POLL_CAPACITY` (256) sockets
+using one native poll call. Register a listener with `listener.register(&mut set)`
+or a connection with `connection.register(&mut set, interest)`; each returns an
+index for `set.ready(index)`. `set.wait(timeout_ms)` updates readiness and returns
+the number of ready registrations; an empty set returns zero immediately.
+Readiness includes hangup/error notifications: the next socket operation reports
+the result. `set.clear()` removes registrations for the next batch. Registrations
+borrow native handle values without transferring ownership; keep every registered
+owner open until the wait finishes. `TcpConnection.closed()` supplies an empty,
+safe-to-drop owner for caller-owned connection slots.
+
 Every socket owns exactly one native descriptor/handle, moves as an aggregate,
 and releases it on `close()` or `drop`. `close()` is idempotent. A close error
 still invalidates the owner, and Linux interrupted close is never retried against

@@ -91,10 +91,88 @@ before invoking the handler. `hosted.text(output, bytes)` builds a text response
 from a custom public handler with the structural `handle` method.
 `serve_with` lets an application select acceptor, clock and cancellation.
 Cancellation is cooperative; a handler that never returns cannot be preempted.
+For concurrent plain HTTP and keep-alive, use `std/web/reactor` below with the
+same handler interface. The default listen backlog for both hosted servers is 256.
 For streaming bodies, middleware, or custom execution use `std/web/server`,
 `std/web/stream`, `std/web/response` and `std/http/connection` below.
 `std/web/static_files` is an optional filesystem entry point with its own
 rooted-path restrictions.
+
+## Concurrent HTTP/1.1 server
+
+`std/web/reactor` lets other connections advance while a socket waits for input
+or output. It uses one thread, bounded caller-owned storage, and native readiness
+polling. It supports HTTP keep-alive and ordered pipelined requests without an
+allocator, external framework, or task runtime.
+
+The complete example is
+[`examples/web_server_concurrent.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/web_server_concurrent.dodo):
+
+```sh
+dodo compile examples/web_server_concurrent.dodo -O 3 -o build/web-server
+./build/web-server
+```
+
+The essential setup is:
+
+```dodo
+package concurrent_web
+import "std/web"
+import "std/web/hosted"
+import "std/web/reactor"
+
+fn main() -> i32 {
+    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
+    handler := hosted.Text.new(b"Hello, Dodo!\n")
+    slots := reactor.slots()
+    workspace := [0u8; reactor.WORKSPACE_BYTES * 8]
+    request := [0u8; 4096 * 8]
+    response := [0u8; 4096 * 8]
+    config := reactor.Config.defaults()
+    match reactor.serve(b"127.0.0.1:8080", &routes, &mut handler, &mut slots,
+        &mut workspace, &mut request, &mut response, config) {
+        ok(report) => { if report.failed != 0 { return 2 }; return 0 }
+        err(_) => { return 1 }
+    }
+}
+```
+
+`slots()` constructs eight `Slot.new()` values. The slot count bounds active
+connections; applications may supply another array or owned collection with
+1–255 slots. Allocate `WORKSPACE_BYTES * slots.len` workspace bytes. Request and
+response arrays are divided equally between slots, with any trailing remainder
+unused. The example supplies 4 KiB per request and response, totaling 368 KiB
+of byte buffers for eight connections. Slots, the route index, and stack frames
+add a separate bounded amount of storage.
+
+| Setting | Default and meaning |
+| --- | --- |
+| `config.server` | The same header/body/request/write limits as `hosted.Config`; backlog 256. |
+| `config.server.max_connections` | Zero serves until cancelled; a positive value stops acceptance after that many connections and drains active slots. It does not set concurrency. |
+| `config.requests_per_connection` | 100; the final response advertises `Connection: close`. Set 1 to disable reuse. |
+| `config.idle_timeout_ms` | 15,000; bounds waiting between requests. |
+| `config.events_per_turn` | 16; bounds protocol work per ready slot before other slots run. |
+
+All timeout durations, the request limit, and the event budget must be nonzero.
+The first header deadline starts on acceptance. Reused connections start a new
+request budget when their next bytes arrive or are processed from buffered
+pipeline input. Bodies remain buffered before dispatch. HEAD, 204, 304,
+`100-continue`, size limits, and error responses follow the hosted server rules.
+Malformed requests and handler failures close their connection after the error
+response; a failure after final output starts closes without a second response.
+
+`serve_with(..., config, clock, cancel)` accepts explicit clock and cancellation
+providers. Cancellation closes all active sockets, including partially read
+requests. `Report.completed` counts delivered successful dispatches, so it can
+exceed `Report.accepted` with keep-alive. Rejected dispatches and failed
+connections have separate counters. Idle expiration and clean keep-alive EOF
+are normal closure.
+
+Handlers still run synchronously on the serving thread. A long-running handler
+blocks that thread until it returns; this API provides concurrent socket progress,
+not parallel application callbacks. Slots, bodies, and reuse remain bounded.
+The reactor serves plain HTTP; the existing explicit TLS acceptor remains
+available through `std/http/https` and the serial hosted API.
 
 ## API and contracts
 
@@ -109,8 +187,20 @@ Construct `Router.new(&routes)` from caller-owned `Route` entries, each with a
 byte method, decoded UTF-8 pattern and application-selected integer ID. The router
 borrows its table and pattern strings. Construction validates every route and
 rejects duplicate method/pattern shapes, including `/:first` versus `/:second`.
-Construction is quadratic in table size; matching scans the table with work
-bounded by route count and path length. There is no allocation or hidden cache.
+Sorted tables containing only literal paths use binary search. Other tables use
+one scan that selects path specificity and method together. Construction of an
+unsorted or dynamic table with `Router.new` checks ambiguity pairwise.
+
+`Router.indexed(&routes, &mut index)` adds an allocation-free hash index for
+literal paths. Supply at least twice as many `usize` slots as routes. Construction
+checks duplicates while inserting literals and compares dynamic route shapes;
+collisions always compare the complete path. Both the route table and index
+remain borrowed by the router; failed construction may modify index storage.
+Literal matches avoid scanning dynamic routes, preserving the same precedence
+and method rules. Dynamic matches still scan. The serial hosted server selects
+this index for 17–1,024 routes, and the reactor for up to 1,024 routes. Larger
+tables use the ordinary router; explicitly supplied index storage has no such
+route-count ceiling. There is no allocation or hidden cache.
 
 | Pattern | Meaning |
 | --- | --- |
@@ -181,6 +271,22 @@ and call `consume_body(count)`. The borrow checker prevents refilling storage wh
 that view remains live. `send_body` copies accepted bytes into output; flush them
 before encoding another fragment. `finish_body` writes final chunks/trailers or
 validates the promised length. Dropping discards pending data without hidden I/O.
+
+`append_body` can place body bytes after entirely unsent output, allowing a small
+response head and body to share one write. Once flushing starts, finish flushing
+before appending. `poll_body(stream, bytes)` writes fixed-length or close-delimited
+body bytes directly from the caller's slice in at most one transport operation.
+It retains no borrow after return; advance the source by the reported progress.
+Flush pending output first. Chunked bodies continue through `send_body` and
+`poll_flush`. Hosted adapters use these paths automatically.
+
+`Connection.suspend()` consumes a driver and returns its opaque `State` without
+buffer borrows. `Connection.resume(state, workspace, input, output)` reattaches
+the same buffer contents and checks capacities. Preserve each state's association
+with its buffers; capacity checks cannot detect unrelated or overwritten bytes.
+`Parser.suspend()` / `Parser.resume()` provide the equivalent parser operation.
+This lets the reactor keep per-peer protocol state while borrowing one slot's
+buffers only for its current turn.
 
 `std/web/stream.PendingBody` applies the same discipline to any polling writer.
 It borrows the source until delivered, and one `step` makes at most one writer

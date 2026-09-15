@@ -1,0 +1,687 @@
+package reactor
+
+import "core/bytes"
+import "core/mem"
+import "core/slice"
+import "std/http"
+import "std/http/connection"
+import "std/http/hosting"
+import "std/io"
+import "std/net"
+import "std/net/native"
+import "std/web"
+import "std/web/hosted"
+
+pub const WORKSPACE_BYTES: usize = hosted.WORKSPACE_BYTES
+pub struct Config {
+    pub server: hosted.Config
+    pub requests_per_connection: usize
+    pub idle_timeout_ms: u64
+    pub events_per_turn: usize
+    pub fn defaults() -> Config {
+        return Config { server: hosted.Config.defaults(), requests_per_connection: 100,
+        idle_timeout_ms: 15000, events_per_turn: 16 }
+    }
+}
+enum Step {
+    Pending, Progress, Complete, Rejected, Closed, Failed
+}
+
+// No buffer borrows survive a turn. Each slot owns one socket and opaque HTTP
+// state; disjoint caller-owned byte ranges accompany it when it is resumed.
+pub struct Slot {
+    socket: native.TcpConnection
+    state: connection.State
+    active: bool
+    runnable: bool
+    writing: bool
+    poll_index: usize
+    phase: u8 // 0 headers, 1 body, 2 response, 3 idle, 4 error response
+    deadline: u64
+    request_until: u64
+    body_used: usize
+    path_used: usize
+    route_id: usize
+    request_id: u64
+    requests: usize
+    head: bool
+    expect_continue: bool
+    reuse: bool
+    final_started: bool
+    finished: bool
+    response_length: usize
+    response_offset: usize
+    reject_code: u16
+    pub fn new() -> Slot {
+        return Slot { socket: native.TcpConnection.closed(), state: connection.State.new(http.Role.Request, http.Limits.defaults()),
+        active: false, runnable: false, writing: false, poll_index: 0, phase: 0, deadline: 0, request_until: 0,
+        body_used: 0, path_used: 0, route_id: 0, request_id: 0, requests: 0, head: false, expect_continue: false,
+        reuse: false, final_started: false, finished: false, response_length: 0, response_offset: 0, reject_code: 0 }
+    }
+    fn close(&mut self) {
+        match self.socket.close() {
+            ok() => {}
+            err(_) => {}
+        }
+        self.active = false
+        self.runnable = false
+    }
+    fn begin(&mut self, now: u64, config: &Config) {
+        self.phase = 0
+        self.request_until = hosting.deadline(now, config.server.request_timeout_ms)
+        self.deadline = hosting.earlier(self.request_until, hosting.deadline(now, config.server.header_timeout_ms))
+        self.body_used = 0
+        self.path_used = 0
+        self.head = false
+        self.expect_continue = false
+        self.final_started = false
+        self.finished = false
+        self.response_length = 0
+        self.response_offset = 0
+        self.reject_code = 0
+        self.writing = false
+    }
+    fn start(&mut self, socket: native.TcpConnection, now: u64, config: &Config, capacity: usize) {
+        self.socket = socket
+        self.state = connection.State.new(http.Role.Request, config.server.limits(capacity))
+        self.requests = 0
+        self.active = true
+        self.runnable = true
+        self.begin(now, config)
+    }
+    fn flush(&mut self, driver: &mut connection.Connection) -> Step!hosting.Error {
+        match driver.poll_flush(&mut self.socket) {
+            ok(progress) => {
+                if progress.transferred != 0 {
+                    // A partially written informational head cannot be followed
+                    // by an error head either. Once that head is fully flushed,
+                    // a later request error may still send its final response.
+                    self.final_started = self.phase == 2 || driver.pending_output() != 0
+                }
+                if progress.state == io.PollState.Pending {
+                    return ok(Step.Pending)
+                }
+                return ok(Step.Progress)
+            }
+            err(reason) => {
+                return err(hosting.connection_error(reason))
+            }
+        }
+    }
+    fn advance<H, C, X>(&mut self, driver: &mut connection.Connection, router: &web.Router, handler: &mut H,
+    path: &mut[u8], request: &mut[u8], response: &mut[u8], config: &Config, clock: &mut C,
+    next_id: &mut u64, cancel: &X) -> Step!hosting.Error {
+        if driver.pending_output() != 0 {
+            if self.phase == 2 && self.response_offset == 0 && self.response_length != 0 {
+                match driver.append_body(&response[..self.response_length]) {
+                    ok(count) => {
+                        self.response_offset = count
+                    }
+                    err(reason) => {
+                        if reason.kind != connection.ErrorKind.Backpressure {
+                            return err(hosting.connection_error(reason))
+                        }
+                    }
+                }
+            }
+            return self.flush(driver)
+        }
+        if self.phase == 2 {
+            if self.response_offset < self.response_length {
+                match driver.poll_body(&mut self.socket, &response[self.response_offset..self.response_length]) {
+                    ok(progress) => {
+                        self.response_offset += progress.transferred
+                        if progress.transferred != 0 {
+                            self.final_started = true
+                        }
+                        if progress.state == io.PollState.Pending {
+                            return ok(Step.Pending)
+                        }
+                        return ok(Step.Progress)
+                    }
+                    err(reason) => {
+                        return err(hosting.connection_error(reason))
+                    }
+                }
+            }
+            if!self.finished {
+                trailers: [0]http.Header = []
+                match driver.finish_body(&trailers) {
+                    ok() => {
+                        self.finished = true
+                    }
+                    err(reason) => {
+                        return err(hosting.connection_error(reason))
+                    }
+                }
+                if driver.pending_output() != 0 {
+                    return ok(Step.Progress)
+                }
+            }
+            if!driver.output_complete() {
+                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            }
+            self.requests += 1
+            if self.reuse && driver.reusable() {
+                match driver.next_message() {
+                    ok() => {}
+                    err(reason) => {
+                        return err(hosting.connection_error(reason))
+                    }
+                }
+                self.phase = 3
+                self.deadline = hosting.deadline(clock.now_ms(), config.idle_timeout_ms)
+            } else {
+                self.close()
+            }
+            return ok(Step.Complete)
+        }
+        // A pipelined message may already be buffered. Reset the preceding
+        // response flags before parsing it, including its error paths.
+        if self.phase == 3 && driver.unread().len != 0 {
+            self.begin(clock.now_ms(), config)
+        }
+        event: http.Event
+        match driver.poll_event(&mut self.socket) {
+            ok(value) => {
+                event = value
+            }
+            err(reason) => {
+                return err(hosting.connection_error(reason))
+            }
+        }
+        if self.phase == 3 {
+            if event.kind == http.EventKind.NeedInput && driver.unread().len == 0 {
+                if driver.input_ended() {
+                    self.close();
+                    return ok(Step.Closed)
+                }
+                return ok(Step.Pending)
+            }
+            self.begin(clock.now_ms(), config)
+        }
+        if event.kind == http.EventKind.NeedInput {
+            if driver.unread().len != 0 {
+                return ok(Step.Progress)
+            }
+            if driver.input_ended() {
+                return err(hosting.protocol_error(http.failure(http.ErrorKind.UnexpectedEof, 0)))
+            }
+            return ok(Step.Pending)
+        }
+        if event.kind == http.EventKind.Header {
+            name: &[u8]
+            match driver.field(event.name_offset, event.name_length) {
+                ok(value) => {
+                    name = value
+                }
+                err(reason) => {
+                    return err(hosting.protocol_error(reason))
+                }
+            }
+            if http.equal_ascii(name, b"Expect") {
+                value: &[u8]
+                match driver.field(event.value_offset, event.value_length) {
+                    ok(data) => {
+                        value = data
+                    }
+                    err(reason) => {
+                        return err(hosting.protocol_error(reason))
+                    }
+                }
+                if!http.equal_ascii(value, b"100-continue") {
+                    return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+                }
+                self.expect_continue = true
+            }
+        }
+        if event.kind == http.EventKind.HeadersComplete {
+            self.phase = 1
+            self.deadline = hosting.earlier(self.request_until, hosting.deadline(clock.now_ms(), config.server.body_timeout_ms))
+            uri: http.Uri
+            match http.Uri.parse(driver.target()) {
+                ok(value) => {
+                    uri = value
+                }
+                err(reason) => {
+                    return err(hosting.protocol_error(reason))
+                }
+            }
+            raw := uri.path()
+            if raw.len == 0 {
+                raw = b"/"
+            }
+            match web.decode_path(raw, path) {
+                ok(count) => {
+                    self.path_used = count
+                }
+                err(_) => {
+                    return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+                }
+            }
+            match router.find(driver.method(), &path[..self.path_used]) {
+                ok(found) => {
+                    self.route_id = found.id;
+                    self.head = found.head
+                }
+                err(reason) => {
+                    policy := web.ErrorResponses.defaults()
+                    self.reject_code = policy.status(reason)
+                    return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+                }
+            }
+            if *next_id == 18446744073709551615u64 {
+                *next_id = 0
+            }
+            *next_id += 1
+            self.request_id = *next_id
+            if self.expect_continue {
+                headers: [0]http.Header = []
+                interim := http.Response { status: 100, reason: b"Continue", headers: &headers, body: http.Body.empty() }
+                match driver.informational(&interim) {
+                    ok() => {}
+                    err(reason) => {
+                        return err(hosting.connection_error(reason))
+                    }
+                }
+            }
+        }
+        if event.kind == http.EventKind.Body {
+            count := driver.body().len
+            if count > request.len - self.body_used {
+                return err(hosting.failure(hosting.ErrorKind.BodyLimit))
+            }
+            match bytes.copy_from(&mut request[self.body_used..self.body_used + count], driver.body()) {
+                ok() => {
+                    self.body_used += count
+                }
+                err(_) => {
+                    return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+                }
+            }
+            match driver.consume_body(count) {
+                ok() => {}
+                err(reason) => {
+                    return err(hosting.connection_error(reason))
+                }
+            }
+        }
+        if event.kind == http.EventKind.Upgrade {
+            return err(hosting.failure(hosting.ErrorKind.Protocol))
+        }
+        if event.kind == http.EventKind.Complete {
+            if clock.now_ms() >= self.request_until {
+                return err(hosting.failure(hosting.ErrorKind.TimedOut))
+            }
+            input := io.MemoryReader.new(&request[..self.body_used])
+            capacity := response.len
+            if capacity > config.server.response_bytes {
+                capacity = config.server.response_bytes
+            }
+            output := io.MemoryWriter.new(&mut response[..capacity])
+            context := web.Context { method: driver.method(), path: &path[..self.path_used], route_id: self.route_id,
+            request_id: self.request_id, cancelled: false }
+            code := 500u16
+            match web.handle(handler, &mut context, &mut input, &mut output) {
+                ok(value) => {
+                    code = value
+                }
+                err(reason) => {
+                    policy := web.ErrorResponses.defaults()
+                    self.reject_code = policy.status(reason)
+                    return err(hosting.failure(hosting.ErrorKind.Handler))
+                }
+            }
+            core.drop(context)
+            if cancel.cancelled() {
+                return err(hosting.failure(hosting.ErrorKind.Cancelled))
+            }
+            now := clock.now_ms()
+            if now >= self.request_until {
+                return err(hosting.failure(hosting.ErrorKind.TimedOut))
+            }
+            if code < 200 || code > 599 {
+                return err(hosting.failure(hosting.ErrorKind.Handler))
+            }
+            self.response_length = output.position()
+            framing := http.Body.sized(self.response_length as u64)
+            if code == 204 {
+                framing = http.Body.empty()
+            }
+            if self.head || code == 204 || code == 304 {
+                self.response_length = 0
+            }
+            self.reuse = self.requests < config.requests_per_connection - 1 && driver.incoming_reusable()
+            connection_value := b"close"
+            if self.reuse {
+                connection_value = b"keep-alive"
+            }
+            headers := [http.Header { name: b"Content-Type", value: b"text/plain; charset=utf-8" },
+            http.Header { name: b"Connection", value: connection_value }]
+            head := http.Response { status: code, reason: b"", headers: &headers, body: framing }
+            match driver.response(&head) {
+                ok() => {}
+                err(reason) => {
+                    return err(hosting.connection_error(reason))
+                }
+            }
+            self.phase = 2
+            self.deadline = hosting.earlier(self.request_until, hosting.deadline(now, config.server.write_timeout_ms))
+        }
+        return ok(Step.Progress)
+    }
+    fn drive<H, C, X>(&mut self, workspace: &mut[u8], request: &mut[u8], response: &mut[u8], router: &web.Router,
+    handler: &mut H, config: &Config, clock: &mut C, next_id: &mut u64, cancel: &X) -> Step!hosting.Error {
+        let some(slice.SplitMut { left: parser, right: rest }) = slice.split_at_mut(workspace, 16384) else {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        let some(slice.SplitMut { left: input, right: tail }) = slice.split_at_mut(rest, 4096) else {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        let some(slice.SplitMut { left: output, right: path }) = slice.split_at_mut(tail, 16384) else {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        state := mem.replace(&mut self.state, connection.State.new(http.Role.Request, http.Limits.defaults()))
+        driver: connection.Connection
+        match connection.Connection.resume(state, parser, input, output) {
+            ok(value) => {
+                driver = value
+            }
+            err(reason) => {
+                return err(hosting.connection_error(reason))
+            }
+        }
+        for i in 0usize..config.events_per_turn {
+            match self.advance(&mut driver, router, handler, &mut path[..2048], request, response, config, clock, next_id, cancel) {
+                ok(step) => {
+                    if step != Step.Progress {
+                        self.writing = self.phase == 2 || driver.pending_output() != 0
+                        self.state = driver.suspend()
+                        return ok(step)
+                    }
+                }
+                err(reason) => {
+                    self.state = driver.suspend()
+                    return err(reason)
+                }
+            }
+        }
+        self.writing = self.phase == 2 || driver.pending_output() != 0
+        self.state = driver.suspend()
+        return ok(Step.Progress)
+    }
+    fn reject(&mut self, workspace: &mut[u8], code: u16, now: u64, config: &Config) -> Step {
+        if self.final_started {
+            self.close();
+            return Step.Failed
+        }
+        headers := [http.Header { name: b"Connection", value: b"close" }]
+        response := http.Response { status: code, reason: b"", headers: &headers, body: http.Body.empty() }
+        match http.write_response(&response, &mut workspace[20480..36864]) {
+            ok(count) => {
+                self.response_length = count
+            }
+            err(_) => {
+                self.close();
+                return Step.Failed
+            }
+        }
+        self.phase = 4
+        self.response_offset = 0
+        self.writing = true
+        self.deadline = hosting.deadline(now, config.server.write_timeout_ms)
+        return Step.Progress
+    }
+    fn poll<H, C, X>(&mut self, workspace: &mut[u8], request: &mut[u8], response: &mut[u8], router: &web.Router,
+    handler: &mut H, config: &Config, clock: &mut C, next_id: &mut u64, cancel: &X) -> Step {
+        if cancel.cancelled() {
+            self.close();
+            return Step.Closed
+        }
+        now := clock.now_ms()
+        if now >= self.deadline {
+            if self.phase == 3 {
+                self.close();
+                return Step.Closed
+            }
+            if self.phase == 4 {
+                self.close();
+                return Step.Failed
+            }
+            return self.reject(workspace, 408, now, config)
+        }
+        if self.phase == 4 {
+            match io.poll_write_once(&mut self.socket, &workspace[20480 + self.response_offset..20480 + self.response_length]) {
+                ok(progress) => {
+                    self.response_offset += progress.transferred
+                    if self.response_offset == self.response_length {
+                        self.close();
+                        return Step.Rejected
+                    }
+                    if progress.state == io.PollState.Pending {
+                        return Step.Pending
+                    }
+                    return Step.Progress
+                }
+                err(_) => {
+                    self.close();
+                    return Step.Failed
+                }
+            }
+        }
+        match self.drive(workspace, request, response, router, handler, config, clock, next_id, cancel) {
+            ok(step) => {
+                return step
+            }
+            err(reason) => {
+                if reason.kind == hosting.ErrorKind.Cancelled {
+                    self.close();
+                    return Step.Closed
+                }
+                if reason.kind == hosting.ErrorKind.Transport {
+                    self.close();
+                    return Step.Failed
+                }
+                code := self.reject_code
+                if code == 0 {
+                    code = 400
+                    if reason.kind == hosting.ErrorKind.HeaderLimit {
+                        code = 431
+                    }
+                    if reason.kind == hosting.ErrorKind.BodyLimit {
+                        code = 413
+                    }
+                    if reason.kind == hosting.ErrorKind.Handler {
+                        code = 500
+                    }
+                    if reason.kind == hosting.ErrorKind.TimedOut {
+                        code = 408
+                    }
+                }
+                return self.reject(workspace, code, clock.now_ms(), config)
+            }
+        }
+    }
+}
+// A small ready-to-use slot array. Applications may instead supply any array
+// or owned collection with 1..255 Slot.new() values and matching byte storage.
+pub fn slots() -> [8]Slot {
+    return [Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new()]
+}
+struct Owner {
+    slots: &mut[Slot]
+    fn drop(&mut self) {
+        for i in 0usize..self.slots.len {
+            self.slots[i].close()
+        }
+    }
+}
+pub fn serve<H>(address: &[u8], routes: &[web.Route], handler: &mut H, slots: &mut[Slot], workspace: &mut[u8],
+request: &mut[u8], response: &mut[u8], config: Config) -> hosted.Report!hosting.Error {
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    return serve_with(address, routes, handler, slots, workspace, request, response, config, &mut clock, &cancel)
+}
+// Handlers run synchronously on this thread; waiting sockets do not block peers.
+// Cancellation closes all owned sockets, including every error/return path.
+pub fn serve_with<H, C, X>(address: &[u8], routes: &[web.Route], handler: &mut H, slots: &mut[Slot], workspace: &mut[u8],
+request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
+    if slots.len == 0 || slots.len >= native.POLL_CAPACITY || workspace.len / slots.len < WORKSPACE_BYTES ||
+        config.requests_per_connection == 0 || config.idle_timeout_ms == 0 || config.events_per_turn == 0 ||
+        config.server.backlog == 0 || config.server.header_bytes == 0 || config.server.header_bytes > 16384 ||
+        config.server.header_fields == 0 || config.server.header_fields > 100 || config.server.header_timeout_ms == 0 ||
+        config.server.body_timeout_ms == 0 || config.server.request_timeout_ms == 0 || config.server.write_timeout_ms == 0 {
+        return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+    }
+    owner := Owner { slots: slots }
+    request_size := request.len / owner.slots.len
+    response_size := response.len / owner.slots.len
+    index := [0usize; 2048]
+    router: web.Router
+    if routes.len <= index.len / 2 {
+        match web.Router.indexed(routes, &mut index) {
+            ok(value) => {
+                router = value
+            }
+            err(_) => {
+                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            }
+        }
+    } else {
+        match web.Router.new(routes) {
+            ok(value) => {
+                router = value
+            }
+            err(_) => {
+                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            }
+        }
+    }
+    local: net.SocketAddress
+    match net.parse_socket(address) {
+        ok(value) => {
+            local = value
+        }
+        err(reason) => {
+            return err(hosting.network_error(reason, hosting.ErrorKind.InvalidInput))
+        }
+    }
+    listener: native.TcpListener
+    match native.TcpListener.bind(&local, config.server.backlog) {
+        ok(value) => {
+            listener = value
+        }
+        err(reason) => {
+            return err(hosting.network_error(reason, hosting.ErrorKind.Connect))
+        }
+    }
+    report := hosted.Report { accepted: 0, completed: 0, rejected: 0, failed: 0, cancelled: false }
+    next_id := 0u64
+    readiness := native.PollSet.new()
+    for true {
+        if cancel.cancelled() {
+            report.cancelled = true;
+            return ok(report)
+        }
+        readiness.clear()
+        active := 0usize
+        timeout := 10u32
+        now := clock.now_ms()
+        for i in 0usize..owner.slots.len {
+            if owner.slots[i].active {
+                active += 1
+                interest := net.Interest.Read
+                if owner.slots[i].writing {
+                    interest = net.Interest.Write
+                }
+                match owner.slots[i].socket.register(&mut readiness, interest) {
+                    ok(value) => {
+                        owner.slots[i].poll_index = value
+                    }
+                    err(reason) => {
+                        return err(hosting.network_error(reason, hosting.ErrorKind.Transport))
+                    }
+                }
+                if owner.slots[i].runnable || now >= owner.slots[i].deadline {
+                    timeout = 0
+                } else if owner.slots[i].deadline - now < timeout as u64 {
+                    timeout = (owner.slots[i].deadline - now) as u32
+                }
+            }
+        }
+        accepting := config.server.max_connections == 0 || report.accepted < config.server.max_connections
+        if!accepting && active == 0 {
+            return ok(report)
+        }
+        listener_index := native.POLL_CAPACITY
+        if accepting && active < owner.slots.len {
+            match listener.register(&mut readiness) {
+                ok(value) => {
+                    listener_index = value
+                }
+                err(reason) => {
+                    return err(hosting.network_error(reason, hosting.ErrorKind.Transport))
+                }
+            }
+        }
+        match readiness.wait(timeout) {
+            ok(_) => {}
+            err(reason) => {
+                if reason.kind == net.ErrorKind.Interrupted {
+                    continue
+                }
+                return err(hosting.network_error(reason, hosting.ErrorKind.Transport))
+            }
+        }
+        if cancel.cancelled() {
+            report.cancelled = true;
+            return ok(report)
+        }
+        if listener_index != native.POLL_CAPACITY && readiness.ready(listener_index) {
+            for i in 0usize..owner.slots.len {
+                if config.server.max_connections != 0 && report.accepted >= config.server.max_connections {
+                    break
+                }
+                if!owner.slots[i].active {
+                    match listener.accept() {
+                        ok(pending) => {
+                            match pending {
+                                some(socket) => {
+                                    owner.slots[i].start(socket, clock.now_ms(), &config, request_size)
+                                    report.accepted += 1
+                                }
+                                none => {
+                                    break
+                                }
+                            }
+                        }
+                        err(reason) => {
+                            if reason.kind == net.ErrorKind.Interrupted {
+                                break
+                            }
+                            return err(hosting.network_error(reason, hosting.ErrorKind.Transport))
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0usize..owner.slots.len {
+            if owner.slots[i].active && (owner.slots[i].runnable || readiness.ready(owner.slots[i].poll_index) || clock.now_ms() >= owner.slots[i].deadline) {
+                step := owner.slots[i].poll(&mut workspace[i * WORKSPACE_BYTES..(i + 1) * WORKSPACE_BYTES],
+                &mut request[i * request_size..(i + 1) * request_size], &mut response[i * response_size..(i + 1) * response_size],
+                &router, handler, &config, clock, &mut next_id, cancel)
+                owner.slots[i].runnable = step == Step.Progress || step == Step.Complete
+                if step == Step.Complete {
+                    report.completed += 1
+                }
+                if step == Step.Rejected {
+                    report.rejected += 1
+                }
+                if step == Step.Failed {
+                    report.failed += 1
+                }
+            }
+        }
+    }
+    return ok(report)
+}

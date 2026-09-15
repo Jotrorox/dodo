@@ -25,7 +25,7 @@ pub struct Config {
     // Zero means serve until cancelled. One request per accepted connection.
     pub max_connections: usize
     pub fn defaults() -> Config {
-        return Config { backlog: 16, header_bytes: 16384, header_fields: 100,
+        return Config { backlog: 256, header_bytes: 16384, header_fields: 100,
         body_bytes: 65536, response_bytes: 65536, header_timeout_ms: 10000,
         body_timeout_ms: 30000, request_timeout_ms: 30000, write_timeout_ms: 30000, max_connections: 0 }
     }
@@ -366,13 +366,25 @@ clock: &mut C, cancel: &X) -> Report!hosting.Error {
         config.request_timeout_ms == 0 || config.write_timeout_ms == 0 {
         return err(hosting.failure(hosting.ErrorKind.InvalidInput))
     }
+    index := [0usize; 2048]
     router: web.Router
-    match web.Router.new(routes) {
-        ok(value) => {
-            router = value
+    if routes.len > 16 && routes.len <= index.len / 2 {
+        match web.Router.indexed(routes, &mut index) {
+            ok(value) => {
+                router = value
+            }
+            err(_) => {
+                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            }
         }
-        err(_) => {
-            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+    } else {
+        match web.Router.new(routes) {
+            ok(value) => {
+                router = value
+            }
+            err(_) => {
+                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            }
         }
     }
     local: net.SocketAddress

@@ -1,0 +1,84 @@
+package reactor_checks
+import "std/console"
+import "std/io"
+import "std/net/native"
+import "std/web"
+import "std/web/hosted"
+import "std/web/reactor"
+
+const STOP_MS: u64 = 30000
+pub struct Stop {
+    until: u64
+    pub fn cancelled(&self) -> bool {
+        clock := native.MonotonicClock {}
+        return clock.now_ms() >= self.until
+    }
+}
+pub struct Handler {
+    pub fn handle<B, W>(&mut self, context: &mut web.Context, body: &mut B, output: &mut W) -> u16!web.Error {
+        if context.route_id == 1 {
+            data := [0u8; 4096]
+            count := 0usize
+            match io.read_up_to(body, &mut data) {
+                ok(value) => {
+                    count = value
+                }
+                err(_) => {
+                    return err(web.Error.Handler)
+                }
+            }
+            return hosted.text(output, &data[..count])
+        }
+        if context.route_id == 2 {
+            return err(web.Error.Handler)
+        }
+        if context.route_id == 3 {
+            return ok(204)
+        }
+        if context.route_id == 4 {
+            status := hosted.text(output, b"ignored")?
+            return ok(304)
+        }
+        if context.route_id == 5 {
+            data := [120u8; 65536]
+            return hosted.text(output, &data)
+        }
+        return hosted.text(output, b"Hello, Dodo!\n")
+    }
+}
+fn main() -> i32 {
+    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 },
+    web.Route { method: b"POST", pattern: b"/echo", id: 1 },
+    web.Route { method: b"GET", pattern: b"/fail", id: 2 },
+    web.Route { method: b"GET", pattern: b"/empty", id: 3 },
+    web.Route { method: b"GET", pattern: b"/not-modified", id: 4 },
+    web.Route { method: b"GET", pattern: b"/large", id: 5 }]
+    slots := reactor.slots()
+    workspace := [0u8; reactor.WORKSPACE_BYTES *8]
+    request := [0u8; 4096 *8]
+    response := [0u8; 65536 *8]
+    handler := Handler {}
+    config := reactor.Config.defaults()
+    config.requests_per_connection = 3
+    config.idle_timeout_ms = 100
+    config.server.header_timeout_ms = 300
+    config.server.body_timeout_ms = 300
+    config.server.write_timeout_ms = 300
+    clock := native.MonotonicClock {}
+    stop := Stop { until: clock.now_ms() + STOP_MS }
+    match reactor.serve_with(b"127.0.0.1:@@PORT@@", &routes, &mut handler, &mut slots,
+    &mut workspace, &mut request, &mut response, config, &mut clock, &stop) {
+        ok(report) => {
+            assert(report.cancelled);
+            return 0
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println_value(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            return 1
+        }
+    }
+}

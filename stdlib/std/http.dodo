@@ -5,6 +5,7 @@ import "std/io"
 import "core/ascii"
 import "core/bytes"
 import "core/mem"
+import "core/ptr"
 import "std/net"
 
 // Allocation-free HTTP/1.1, RFC 9110/9112. This module owns no device, clock,
@@ -106,10 +107,23 @@ pub fn valid_token(data: &[u8]) -> bool {
     return true
 }
 pub fn valid_value(data: &[u8]) -> bool {
-    for i in 0usize..data.len {
+    i := 0usize
+    // Fast ordinary/obs-text spans. Tabs and exceptional bytes use the exact
+    // byte validator below. Every unaligned read stays inside the input slice.
+    for data.len - i >= 8 {
+        word := unsafe {
+            ptr.read_unaligned(ptr.as_ptr(&data[i..]) as *const u64)
+        }
+        if contains_zero(word & 0xe0e0e0e0e0e0e0e0u64) || contains_zero(word ^ 0x7f7f7f7f7f7f7f7fu64) {
+            break
+        }
+        i += 8
+    }
+    for i < data.len {
         if (data[i] < 32 && data[i] != 9) || data[i] == 127 {
             return false
         }
+        i += 1
     }
     return true
 }
@@ -418,11 +432,45 @@ pub fn forbidden_trailer(name: &[u8]) -> bool {
         eq(name, "content-type") || eq(name, "content-range")
 }
 
+fn contains_zero(word: u64) -> bool {
+    return (core.wrapping_sub(word, 0x0101010101010101u64) & ~word & 0x8080808080808080u64) != 0
+}
+// The caller supplies equally sized, disjoint slices. Complete eight-byte
+// loads/stores are unaligned and stay inside both slices; no sentinel read or
+// target-specific SIMD is needed. The byte tail stops before either CR or LF.
+fn copy_line_span(input: &[u8], output: &mut[u8]) -> usize {
+    count := 0usize
+    limit := input.len
+    if output.len < limit {
+        limit = output.len
+    }
+    for limit - count >= 8 {
+        word := unsafe {
+            ptr.read_unaligned(ptr.as_ptr(&input[count..]) as *const u64)
+        }
+        if contains_zero(word ^ 0x0d0d0d0d0d0d0d0du64) || contains_zero(word ^ 0x0a0a0a0a0a0a0a0au64) {
+            break
+        }
+        unsafe {
+            ptr.write_unaligned(ptr.as_mut_ptr(&mut output[count..]) as *mut u64, word)
+        }
+        count += 8
+    }
+    for count < limit {
+        value := input[count]
+        if value == 13 || value == 10 {
+            break
+        }
+        output[count] = value
+        count += 1
+    }
+    return count
+}
+
 // States: 0 start, 1 headers, 2 length, 3 chunk-size, 4 chunk-data,
 // 5 chunk CR, 6 chunk LF, 7 trailers, 8 close-body, 9 complete-pending,
 // 10 complete, 11 upgrade, 12 informational-pending, 13 restart, 255 poisoned.
-pub struct Parser {
-    workspace: &mut[u8]
+pub struct ParserState {
     limits: Limits
     role: Role
     state: u8
@@ -448,102 +496,125 @@ pub struct Parser {
     remaining: u64
     total: u64
     body: BodyKind
-    pub fn new(role: Role, workspace: &mut[u8], limits: Limits) -> Parser from(workspace) {
-        return Parser { workspace: workspace, limits: limits, role: role, state: 0,
+    pub fn new(role: Role, limits: Limits) -> ParserState {
+        return ParserState { limits: limits, role: role, state: 0,
         used: 0, line_start: 0, head_end: 0, cr: false, fields: 0, trailer_count: 0,
         trailer_used: 0, method_end: 0, target_start: 0, target_end: 0, status_code: 0,
         seen_host: false, seen_length: false, seen_encoding: false, close: false,
         connection_upgrade: false, has_upgrade: false, head_response: false,
         connect_response: false, remaining: 0, total: 0, body: BodyKind.None }
     }
+}
+pub struct Parser {
+    workspace: &mut[u8]
+    inner: ParserState
+    pub fn new(role: Role, workspace: &mut[u8], limits: Limits) -> Parser from(workspace) {
+        return Parser { workspace: workspace, inner: ParserState.new(role, limits) }
+    }
+    // The state owns no buffers. Resume with the same workspace contents;
+    // offsets remain bounds checked if the caller supplies smaller storage.
+    pub fn resume(workspace: &mut[u8], state: ParserState) -> Parser!Error from(workspace) {
+        if state.used > workspace.len {
+            return err(failure(ErrorKind.BufferFull, 0))
+        }
+        return ok(Parser { workspace: workspace, inner: state })
+    }
+    pub fn take_state(&mut self) -> ParserState {
+        replacement := ParserState.new(Role.Request, Limits.defaults())
+        replacement.state = 255
+        return mem.replace(&mut self.inner, replacement)
+    }
+    pub fn suspend(self) -> ParserState {
+        return self.take_state()
+    }
     pub fn method(&self) -> &[u8] {
-        return &self.workspace[..self.method_end]
+        return &self.workspace[..self.inner.method_end]
     }
     pub fn target(&self) -> &[u8] {
-        return &self.workspace[self.target_start..self.target_end]
+        return &self.workspace[self.inner.target_start..self.inner.target_end]
     }
     pub fn status(&self) -> u16 {
-        return self.status_code
+        return self.inner.status_code
     }
     pub fn body_kind(&self) -> BodyKind {
-        if self.body == BodyKind.Length {
+        if self.inner.body == BodyKind.Length {
             return BodyKind.Length
         }
-        if self.body == BodyKind.Chunked {
+        if self.inner.body == BodyKind.Chunked {
             return BodyKind.Chunked
         }
-        if self.body == BodyKind.Close {
+        if self.inner.body == BodyKind.Close {
             return BodyKind.Close
         }
         return BodyKind.None
     }
     pub fn body_remaining(&self) -> u64 {
-        return self.remaining
+        return self.inner.remaining
     }
     pub fn body_received(&self) -> u64 {
-        return self.total
+        return self.inner.total
     }
     pub fn field(&self, offset: usize, length: usize) -> &[u8]!Error from(self) {
-        if offset > self.used || length > self.used - offset {
+        if offset > self.inner.used || length > self.inner.used - offset {
             return err(failure(ErrorKind.OutOfBounds, offset))
         }
         return ok(&self.workspace[offset..offset + length])
     }
     pub fn reusable(&self) -> bool {
-        return self.state == 10 && !self.close
+        return self.inner.state == 10 && !self.inner.close
     }
     pub fn poisoned(&self) -> bool {
-        return self.state == 255
+        return self.inner.state == 255
     }
     pub fn expect_head(&mut self, value: bool) {
-        self.head_response = value
+        self.inner.head_response = value
     }
     pub fn expect_connect(&mut self, value: bool) {
-        self.connect_response = value
+        self.inner.connect_response = value
     }
     pub fn poison(&mut self) {
-        self.state = 255
+        self.inner.state = 255
     }
     fn reset(&mut self) {
-        self.state = 0;
-        self.used = 0;
-        self.line_start = 0;
-        self.head_end = 0;
-        self.cr = false
-        self.fields = 0;
-        self.trailer_count = 0;
-        self.trailer_used = 0;
-        self.method_end = 0
-        self.target_start = 0;
-        self.target_end = 0;
-        self.status_code = 0;
-        self.seen_host = false
-        self.seen_length = false;
-        self.seen_encoding = false;
-        self.close = false
-        self.connection_upgrade = false;
-        self.has_upgrade = false;
-        self.remaining = 0
-        self.total = 0;
-        self.body = BodyKind.None
+        self.inner.state = 0;
+        self.inner.used = 0;
+        self.inner.line_start = 0;
+        self.inner.head_end = 0;
+        self.inner.cr = false
+        self.inner.fields = 0;
+        self.inner.trailer_count = 0;
+        self.inner.trailer_used = 0;
+        self.inner.method_end = 0
+        self.inner.target_start = 0;
+        self.inner.target_end = 0;
+        self.inner.status_code = 0;
+        self.inner.seen_host = false
+        self.inner.seen_length = false;
+        self.inner.seen_encoding = false;
+        self.inner.close = false
+        self.inner.connection_upgrade = false;
+        self.inner.has_upgrade = false;
+        self.inner.remaining = 0
+        self.inner.total = 0;
+        self.inner.body = BodyKind.None
     }
     pub fn next_message(&mut self) -> void!Error {
         if!self.reusable() {
             return err(failure(ErrorKind.InvalidState, 0))
         }
         self.reset()
-        self.head_response = false;
-        self.connect_response = false
+        self.inner.head_response = false;
+        self.inner.connect_response = false
         return ok()
     }
     pub fn eof(&mut self) -> Event!Error {
-        if self.state == 8 || self.state == 9 || self.state == 10 {
-            self.close = true;
-            self.state = 10
+        if self.inner.state == 8 || self.inner.state == 9 || self.inner.state == 10 {
+            self.inner.close = true;
+            self.inner.state = 10
             return ok(event(EventKind.Complete, 0))
         }
-        self.state = 255
-        return err(failure(ErrorKind.UnexpectedEof, self.used))
+        self.inner.state = 255
+        return err(failure(ErrorKind.UnexpectedEof, self.inner.used))
     }
     pub fn feed(&mut self, input: &[u8]) -> Event!Error {
         match self.advance(input) {
@@ -551,14 +622,14 @@ pub struct Parser {
                 return ok(progress)
             }
             err(reason) => {
-                self.state = 255;
+                self.inner.state = 255;
                 return err(reason)
             }
         }
     }
     fn start_line(&mut self, end: usize) -> void!Error {
         line := &self.workspace[..end]
-        if self.role == Role.Response {
+        if self.inner.role == Role.Response {
             if end < 13 || !bytes.starts_with(line, mem.str_bytes("HTTP/1.1 ")) || line[12] != 32 {
                 return err(failure(ErrorKind.InvalidStartLine, 0))
             }
@@ -566,7 +637,7 @@ pub struct Parser {
             if code < 100 || code > 599 || !valid_value(&line[13..]) {
                 return err(failure(ErrorKind.InvalidStatus, 9))
             }
-            self.status_code = code as u16
+            self.inner.status_code = code as u16
         } else {
             first := 0usize
             for first < end && line[first] != 32 {
@@ -592,11 +663,11 @@ pub struct Parser {
                     return err(failure(ErrorKind.InvalidUri, first + 1))
                 }
             }
-            self.method_end = first;
-            self.target_start = first + 1;
-            self.target_end = second
+            self.inner.method_end = first;
+            self.inner.target_start = first + 1;
+            self.inner.target_end = second
         }
-        self.state = 1
+        self.inner.state = 1
         return ok()
     }
     fn header(&mut self, start: usize, end: usize, trailer: bool) -> Event!Error {
@@ -625,46 +696,46 @@ pub struct Parser {
             if forbidden_trailer(name) {
                 return err(failure(ErrorKind.ForbiddenTrailer, start))
             }
-            self.trailer_count += 1
-            if self.trailer_count > self.limits.trailer_fields {
+            self.inner.trailer_count += 1
+            if self.inner.trailer_count > self.inner.limits.trailer_fields {
                 return err(failure(ErrorKind.HeaderLimit, start))
             }
             kind = EventKind.Trailer
         } else {
-            self.fields += 1
-            if self.fields > self.limits.header_fields {
+            self.inner.fields += 1
+            if self.inner.fields > self.inner.limits.header_fields {
                 return err(failure(ErrorKind.HeaderLimit, start))
             }
             if eq(name, "content-length") {
-                if self.seen_length || self.seen_encoding {
+                if self.inner.seen_length || self.inner.seen_encoding {
                     return err(failure(ErrorKind.InvalidFraming, start))
                 }
-                self.remaining = decimal(value)?;
-                self.seen_length = true
+                self.inner.remaining = decimal(value)?;
+                self.inner.seen_length = true
             }
             if eq(name, "transfer-encoding") {
-                if self.seen_encoding || self.seen_length || !eq(value, "chunked") {
+                if self.inner.seen_encoding || self.inner.seen_length || !eq(value, "chunked") {
                     return err(failure(ErrorKind.InvalidFraming, start))
                 }
-                self.seen_encoding = true
+                self.inner.seen_encoding = true
             }
             if eq(name, "host") {
-                if self.seen_host || value.len == 0 {
+                if self.inner.seen_host || value.len == 0 {
                     return err(failure(ErrorKind.InvalidHeader, start))
                 }
                 if!valid_authority(value, false) {
                     return err(failure(ErrorKind.InvalidHeader, value_start))
                 }
-                self.seen_host = true
+                self.inner.seen_host = true
             }
             if eq(name, "connection") {
                 close := list_contains(value, "close")?
                 upgrade := list_contains(value, "upgrade")?
-                self.close = self.close || close;
-                self.connection_upgrade = self.connection_upgrade || upgrade
+                self.inner.close = self.inner.close || close;
+                self.inner.connection_upgrade = self.inner.connection_upgrade || upgrade
             }
             if eq(name, "upgrade") {
-                self.has_upgrade = value.len != 0
+                self.inner.has_upgrade = value.len != 0
             }
         }
         result := event(kind, 0)
@@ -675,58 +746,58 @@ pub struct Parser {
         return ok(result)
     }
     fn headers_done(&mut self) -> void!Error {
-        self.head_end = self.used
-        if self.role == Role.Request && !self.seen_host {
-            return err(failure(ErrorKind.InvalidHeader, self.used))
+        self.inner.head_end = self.inner.used
+        if self.inner.role == Role.Request && !self.inner.seen_host {
+            return err(failure(ErrorKind.InvalidHeader, self.inner.used))
         }
-        if self.role == Role.Response {
-            code := self.status_code
-            if (code < 200 || code == 204) && (self.seen_length || self.seen_encoding) {
-                return err(failure(ErrorKind.InvalidFraming, self.used))
+        if self.inner.role == Role.Response {
+            code := self.inner.status_code
+            if (code < 200 || code == 204) && (self.inner.seen_length || self.inner.seen_encoding) {
+                return err(failure(ErrorKind.InvalidFraming, self.inner.used))
             }
             if code == 101 {
-                if!self.connection_upgrade || !self.has_upgrade {
-                    return err(failure(ErrorKind.InvalidFraming, self.used))
+                if!self.inner.connection_upgrade || !self.inner.has_upgrade {
+                    return err(failure(ErrorKind.InvalidFraming, self.inner.used))
                 }
-                self.state = 11;
-                self.close = true;
+                self.inner.state = 11;
+                self.inner.close = true;
                 return ok()
             }
-            if self.connect_response && code >= 200 && code < 300 {
-                self.state = 11;
-                self.close = true;
+            if self.inner.connect_response && code >= 200 && code < 300 {
+                self.inner.state = 11;
+                self.inner.close = true;
                 return ok()
             }
             if code < 200 {
-                self.state = 12;
+                self.inner.state = 12;
                 return ok()
             }
-            if self.head_response || code == 204 || code == 304 {
-                self.state = 9;
+            if self.inner.head_response || code == 204 || code == 304 {
+                self.inner.state = 9;
                 return ok()
             }
         }
-        if self.seen_encoding {
-            self.body = BodyKind.Chunked;
-            self.state = 3;
+        if self.inner.seen_encoding {
+            self.inner.body = BodyKind.Chunked;
+            self.inner.state = 3;
             return ok()
         }
-        if self.seen_length {
-            if self.remaining > self.limits.body_bytes {
-                return err(failure(ErrorKind.BodyLimit, self.used))
+        if self.inner.seen_length {
+            if self.inner.remaining > self.inner.limits.body_bytes {
+                return err(failure(ErrorKind.BodyLimit, self.inner.used))
             }
-            self.body = BodyKind.Length;
-            self.state = 2
-            if self.remaining == 0 {
-                self.state = 9
+            self.inner.body = BodyKind.Length;
+            self.inner.state = 2
+            if self.inner.remaining == 0 {
+                self.inner.state = 9
             }
             return ok()
         }
-        self.state = 9
-        if self.role == Role.Response {
-            self.state = 8;
-            self.body = BodyKind.Close;
-            self.close = true
+        self.inner.state = 9
+        if self.inner.role == Role.Response {
+            self.inner.state = 8;
+            self.inner.body = BodyKind.Close;
+            self.inner.close = true
         }
         return ok()
     }
@@ -812,110 +883,129 @@ pub struct Parser {
                 }
             }
         }
-        if size > self.limits.body_bytes - self.total {
+        if size > self.inner.limits.body_bytes - self.inner.total {
             return err(failure(ErrorKind.BodyLimit, start))
         }
-        self.remaining = size;
-        self.state = 4
+        self.inner.remaining = size;
+        self.inner.state = 4
         if size == 0 {
-            self.state = 7
+            self.inner.state = 7
         }
         return ok()
     }
     fn advance(&mut self, input: &[u8]) -> Event!Error {
-        if self.state == 255 {
+        if self.inner.state == 255 {
             return err(failure(ErrorKind.Poisoned, 0))
         }
-        if self.state == 10 {
+        if self.inner.state == 10 {
             return err(failure(ErrorKind.InvalidState, 0))
         }
-        if self.state == 9 {
-            self.state = 10;
+        if self.inner.state == 9 {
+            self.inner.state = 10;
             return ok(event(EventKind.Complete, 0))
         }
-        if self.state == 11 {
+        if self.inner.state == 11 {
             return ok(event(EventKind.Upgrade, 0))
         }
-        if self.state == 12 {
-            self.state = 13;
+        if self.inner.state == 12 {
+            self.inner.state = 13;
             return ok(event(EventKind.Informational, 0))
         }
-        if self.state == 13 {
+        if self.inner.state == 13 {
             self.reset()
         }
         consumed := 0usize
         for consumed < input.len {
-            if self.state == 2 || self.state == 4 || self.state == 8 {
+            if self.inner.state == 2 || self.inner.state == 4 || self.inner.state == 8 {
                 count := input.len - consumed
-                if self.state != 8 && (count as u64) > self.remaining {
-                    count = self.remaining as usize
+                if self.inner.state != 8 && (count as u64) > self.inner.remaining {
+                    count = self.inner.remaining as usize
                 }
-                if (count as u64) > self.limits.body_bytes - self.total {
+                if (count as u64) > self.inner.limits.body_bytes - self.inner.total {
                     return err(failure(ErrorKind.BodyLimit, consumed))
                 }
                 result := event(EventKind.Body, consumed + count)
                 result.offset = consumed;
                 result.length = count
-                self.total += count as u64
-                if self.state != 8 {
-                    self.remaining -= count as u64
-                    if self.remaining == 0 {
-                        if self.state == 2 {
-                            self.state = 9
+                self.inner.total += count as u64
+                if self.inner.state != 8 {
+                    self.inner.remaining -= count as u64
+                    if self.inner.remaining == 0 {
+                        if self.inner.state == 2 {
+                            self.inner.state = 9
                         } else {
-                            self.state = 5
+                            self.inner.state = 5
                         }
                     }
                 }
                 return ok(result)
             }
-            if self.state == 5 || self.state == 6 {
+            if self.inner.state == 5 || self.inner.state == 6 {
                 expected := 13u8
-                if self.state == 6 {
+                if self.inner.state == 6 {
                     expected = 10
                 }
                 if input[consumed] != expected {
                     return err(failure(ErrorKind.InvalidChunk, consumed))
                 }
                 consumed += 1
-                if self.state == 5 {
-                    self.state = 6
+                if self.inner.state == 5 {
+                    self.inner.state = 6
                 } else {
-                    self.state = 3
+                    self.inner.state = 3
                 }
             } else {
-                if self.used == self.workspace.len {
+                if self.inner.used == self.workspace.len {
                     return err(failure(ErrorKind.BufferFull, consumed))
                 }
-                if self.state <= 1 && self.used >= self.limits.header_bytes {
+                if self.inner.state <= 1 && self.inner.used >= self.inner.limits.header_bytes {
                     return err(failure(ErrorKind.HeaderLimit, consumed))
                 }
-                if self.state == 3 && self.used - self.line_start >= self.limits.chunk_line_bytes {
+                if self.inner.state == 3 && self.inner.used - self.inner.line_start >= self.inner.limits.chunk_line_bytes {
                     return err(failure(ErrorKind.HeaderLimit, consumed))
                 }
-                if self.state == 7 {
-                    if self.trailer_used >= self.limits.trailer_bytes {
+                if self.inner.state == 7 {
+                    if self.inner.trailer_used >= self.inner.limits.trailer_bytes {
                         return err(failure(ErrorKind.HeaderLimit, consumed))
                     }
-                    self.trailer_used += 1
+                    self.inner.trailer_used += 1
+                }
+                // Scan an ordinary start/header-line span with its bounds checked
+                // once. CR/LF and all line/framing validation stay on the shared
+                // incremental path, including fragments ending at a limit.
+                if self.inner.state <= 1 && !self.inner.cr && input.len - consumed >= 8 {
+                    available := input.len - consumed
+                    if available > self.workspace.len - self.inner.used {
+                        available = self.workspace.len - self.inner.used
+                    }
+                    if available > self.inner.limits.header_bytes - self.inner.used {
+                        available = self.inner.limits.header_bytes - self.inner.used
+                    }
+                    count := copy_line_span(&input[consumed..consumed + available],
+                    &mut self.workspace[self.inner.used..self.inner.used + available])
+                    if count != 0 {
+                        self.inner.used += count
+                        consumed += count
+                        continue
+                    }
                 }
                 c := input[consumed]
-                if (self.cr && c != 10) || (!self.cr && c == 10) {
+                if (self.inner.cr && c != 10) || (!self.inner.cr && c == 10) {
                     return err(failure(ErrorKind.InvalidHeader, consumed))
                 }
-                self.workspace[self.used] = c;
-                self.used += 1;
+                self.workspace[self.inner.used] = c;
+                self.inner.used += 1;
                 consumed += 1
                 if c == 10 {
-                    self.cr = false;
-                    start := self.line_start;
-                    end := self.used - 2
-                    self.line_start = self.used
-                    if self.state == 0 {
+                    self.inner.cr = false;
+                    start := self.inner.line_start;
+                    end := self.inner.used - 2
+                    self.inner.line_start = self.inner.used
+                    if self.inner.state == 0 {
                         self.start_line(end)?;;
                         return ok(event(EventKind.StartLine, consumed))
                     }
-                    if self.state == 1 {
+                    if self.inner.state == 1 {
                         if start == end {
                             self.headers_done()?;;
                             return ok(event(EventKind.HeadersComplete, consumed))
@@ -924,13 +1014,13 @@ pub struct Parser {
                         result.consumed = consumed;
                         return ok(result)
                     }
-                    if self.state == 3 {
+                    if self.inner.state == 3 {
                         self.chunk_size(start, end)?;
-                        self.used = self.head_end;
-                        self.line_start = self.used
+                        self.inner.used = self.inner.head_end;
+                        self.inner.line_start = self.inner.used
                     } else {
                         if start == end {
-                            self.state = 10;
+                            self.inner.state = 10;
                             return ok(event(EventKind.Complete, consumed))
                         }
                         result := self.header(start, end, true)?;
@@ -938,7 +1028,7 @@ pub struct Parser {
                         return ok(result)
                     }
                 } else {
-                    self.cr = c == 13
+                    self.inner.cr = c == 13
                 }
             }
         }
@@ -1149,6 +1239,29 @@ pub struct Sender {
             self.remaining -= count as u64
         }
         return ok(Encoded { consumed: count, written: count })
+    }
+    // Length/close-delimited bytes may go straight to a transport. Chunked
+    // bodies still require frame(). Validate before exposing any source bytes.
+    pub fn direct(&mut self, count: usize) -> bool!Error {
+        if self.failed {
+            return err(failure(ErrorKind.Poisoned, 0))
+        }
+        if self.done || self.kind == BodyKind.None ||
+            (self.kind == BodyKind.Length && (count as u64) > self.remaining) {
+            self.failed = true
+            return err(failure(ErrorKind.InvalidState, 0))
+        }
+        return ok(self.kind != BodyKind.Chunked)
+    }
+    pub fn advance_direct(&mut self, count: usize) -> void!Error {
+        if!self.direct(count)? {
+            self.failed = true
+            return err(failure(ErrorKind.InvalidState, 0))
+        }
+        if self.kind == BodyKind.Length {
+            self.remaining -= count as u64
+        }
+        return ok()
     }
     pub fn finish(&mut self, trailers: &[Header], destination: &mut[u8]) -> usize!Error {
         if self.failed {
