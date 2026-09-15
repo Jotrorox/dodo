@@ -152,6 +152,10 @@ jobs:
         run: python3 scripts/test_build_release.py
       - name: Test Windows fixture startup ABI
         run: python3 scripts/test_windows_startup.py
+      - name: Test Windows LLVM library path handling
+        run: |
+          rustc --edition=2024 --test scripts/windows-llvm-config.rs -o "$RUNNER_TEMP/test-windows-llvm-config"
+          "$RUNNER_TEMP/test-windows-llvm-config"
       - name: Verify generated mathematical constants
         run: python3 scripts/generate_math_constants.py --check
       - name: Clippy
@@ -254,12 +258,12 @@ jobs:
           "LLVM_SYS_231_PREFIX=$prefix" >> $env:GITHUB_ENV
           "$prefix/bin" >> $env:GITHUB_PATH
           "image=$env:ImageVersion" >> $env:GITHUB_OUTPUT
-      - name: Restore Windows LLVM and static XML support
+      - name: Restore Windows LLVM and static support libraries
         id: windows-llvm-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/llvm-windows
-          key: llvm-windows-2022-${{ runner.arch }}-${{ steps.windows-toolchain.outputs.image }}-${{ hashFiles('.github/workflows/ci.yml', 'scripts/build-windows-llvm-support.py') }}
+          key: llvm-windows-2022-${{ runner.arch }}-${{ steps.windows-toolchain.outputs.image }}-${{ hashFiles('.github/workflows/ci.yml', 'scripts/build-windows-llvm-support.py', 'scripts/windows-llvm-config.rs') }}
       - name: Download and verify the official LLVM 23 Windows archive
         if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
         timeout-minutes: 15
@@ -297,10 +301,24 @@ jobs:
           tar -xf $tarArchive -C $prefix --strip-components=1 @members
           if ($LASTEXITCODE -ne 0) { throw 'LLVM archive extraction failed' }
           Remove-Item $archive, $tarArchive
-      - name: Build LLVM's missing static XML library and collect notices
+      - name: Build LLVM's missing static support libraries and collect notices
         if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
         run: python scripts/build-windows-llvm-support.py
-      - name: Save Windows LLVM and static XML support
+      - name: Verify Windows LLVM system libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = "$env:LLVM_SYS_231_PREFIX/bin/llvm-config-23.exe"
+          $version = & $config --version
+          if ($LASTEXITCODE -ne 0 -or $version -ne '23.1.1') { throw 'Unexpected Windows LLVM version' }
+          $libraries = & $config --link-static --system-libs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows LLVM system library verification failed' }
+          Write-Host "LLVM system libraries: $libraries"
+          if ($libraries -match '[:/\\]') { throw 'LLVM system libraries must use bare library names' }
+          foreach ($library in @('xml2s.lib', 'zs.lib', 'zstd_static.lib')) {
+            if (!(Test-Path "$env:LLVM_SYS_231_PREFIX/lib/$library")) { throw "Missing LLVM dependency: $library" }
+          }
+      - name: Save Windows LLVM and static support libraries
         if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

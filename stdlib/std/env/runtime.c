@@ -10,12 +10,11 @@
 #include <limits.h>
 #define DODO_INVALID (-1)
 #define DODO_LIMIT (-3)
-static int dodo_argc;
-static char **dodo_argv;
-void dodo_env_init_args(int32_t argc, char **argv) { dodo_argc = argc; dodo_argv = argv; }
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+/* Windows reads the native UTF-16 command line in dodo_env_arguments. */
+void dodo_env_init_args(int32_t argc, char **argv) { (void)argc; (void)argv; }
 int32_t dodo_env_lookup(const void *name, void *storage, size_t capacity, size_t *used, int32_t *found) {
     *used = 0; *found = 0;
     if (capacity > UINT32_MAX) return DODO_INVALID;
@@ -93,6 +92,9 @@ int32_t dodo_env_name_equal(const void *left, size_t left_len, const void *right
 #include <errno.h>
 #include <unistd.h>
 extern char **environ;
+static int dodo_argc;
+static char **dodo_argv;
+void dodo_env_init_args(int32_t argc, char **argv) { dodo_argc = argc; dodo_argv = argv; }
 int32_t dodo_env_lookup(const void *name, void *storage, size_t capacity, size_t *used, int32_t *found) {
     *used = 0; *found = 0;
     const char *value = getenv(name);

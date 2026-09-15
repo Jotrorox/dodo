@@ -84,7 +84,8 @@ def main() -> None:
 
         shutil.copy2(args.llvm_prefix / "LICENSE.txt", notices / "LLVM-LICENSE.txt")
         if windows:
-            shutil.copy2(args.llvm_prefix / "libxml2-Copyright", notices / "libxml2-Copyright")
+            for notice in ("libxml2-Copyright", "zlib-LICENSE", "zstd-LICENSE", "zstd-COPYING"):
+                shutil.copy2(args.llvm_prefix / notice, notices / notice)
         else:
             # These files describe the native libraries installed by the Ubuntu CI job.
             system_packages = ("zlib1g-dev", "libzstd-dev", "libxml2-dev", "libffi-dev")
