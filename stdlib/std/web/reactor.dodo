@@ -31,12 +31,14 @@ enum Step {
 // state; disjoint caller-owned byte ranges accompany it when it is resumed.
 pub struct Slot {
     socket: native.TcpConnection
+    established: bool
     state: connection.State
     active: bool
     runnable: bool
     writing: bool
     poll_index: usize
     phase: u8 // 0 headers, 1 body, 2 response, 3 idle, 4 error response
+    // Closing phases: 5 successful response, 6 rejection, 7 idle/peer EOF.
     deadline: u64
     request_until: u64
     body_used: usize
@@ -57,7 +59,7 @@ pub struct Slot {
     response_offset: usize
     pub fn new() -> Slot {
         return Slot { socket: native.TcpConnection.closed(), state: connection.State.new(http.Role.Request, http.Limits.defaults()),
-        active: false, runnable: false, writing: false, poll_index: 0, phase: 0, deadline: 0, request_until: 0,
+        established: false, active: false, runnable: false, writing: false, poll_index: 0, phase: 0, deadline: 0, request_until: 0,
         body_used: 0, path_used: 0, route_id: 0, route_index: 0, query_used: 0, header_used: 0, header_count: 0, last_error: none, request_id: 0, requests: 0, expect_continue: false,
         reuse: false, final_started: false, finished: false, response_length: 0, response_offset: 0 }
     }
@@ -85,16 +87,18 @@ pub struct Slot {
         self.response_offset = 0
         self.writing = false
     }
-    fn start(&mut self, socket: native.TcpConnection, now: u64, config: &Config, capacity: usize) {
+    fn start(&mut self, socket: native.TcpConnection, now: u64, config: &Config, capacity: usize, established: bool) {
         self.socket = socket
         self.state = connection.State.new(http.Role.Request, config.server.limits(capacity))
         self.requests = 0
+        self.established = established
+        self.last_error = none
         self.active = true
         self.runnable = true
         self.begin(now, config)
     }
-    fn flush(&mut self, driver: &mut connection.Connection) -> Step!hosting.Error {
-        match driver.poll_flush(&mut self.socket) {
+    fn flush<S>(&mut self, stream: &mut S, driver: &mut connection.Connection) -> Step!hosting.Error {
+        match driver.poll_flush(stream) {
             ok(progress) => {
                 if progress.transferred != 0 {
                     // A partially written informational head cannot be followed
@@ -112,7 +116,7 @@ pub struct Slot {
             }
         }
     }
-    fn advance<H, C, X>(&mut self, driver: &mut connection.Connection, router: &web.Router, handler: &mut H,
+    fn advance<S, H, C, X>(&mut self, stream: &mut S, driver: &mut connection.Connection, router: &web.Router, handler: &mut H,
     path: &mut[u8], query: &mut[u8], retained: &mut[u8], response_headers: &mut[u8], request: &mut[u8], response: &mut[u8], config: &Config, clock: &mut C,
     next_id: &mut u64, cancel: &X) -> Step!hosting.Error {
         if driver.pending_output() != 0 {
@@ -128,11 +132,11 @@ pub struct Slot {
                     }
                 }
             }
-            return self.flush(driver)
+            return self.flush(stream, driver)
         }
         if self.phase == 2 {
             if self.response_offset < self.response_length {
-                match driver.poll_body(&mut self.socket, &response[self.response_offset..self.response_length]) {
+                match driver.poll_body(stream, &response[self.response_offset..self.response_length]) {
                     ok(progress) => {
                         self.response_offset += progress.transferred
                         if progress.transferred != 0 {
@@ -165,6 +169,9 @@ pub struct Slot {
             if!driver.output_complete() {
                 return err(hosting.failure(hosting.ErrorKind.InvalidInput))
             }
+            if!stream.flush()? {
+                return ok(Step.Pending)
+            }
             self.requests += 1
             if self.reuse && driver.reusable() {
                 match driver.next_message() {
@@ -176,7 +183,8 @@ pub struct Slot {
                 self.phase = 3
                 self.deadline = hosting.deadline(clock.now_ms(), config.idle_timeout_ms)
             } else {
-                self.close()
+                self.phase = 5
+                return ok(Step.Progress)
             }
             return ok(Step.Complete)
         }
@@ -186,7 +194,7 @@ pub struct Slot {
             self.begin(clock.now_ms(), config)
         }
         event: http.Event
-        match driver.poll_event(&mut self.socket) {
+        match driver.poll_event(stream) {
             ok(value) => {
                 event = value
             }
@@ -197,8 +205,9 @@ pub struct Slot {
         if self.phase == 3 {
             if event.kind == http.EventKind.NeedInput && driver.unread().len == 0 {
                 if driver.input_ended() {
-                    self.close();
-                    return ok(Step.Closed)
+                    self.phase = 7
+                    self.deadline = hosting.deadline(clock.now_ms(), config.server.write_timeout_ms)
+                    return ok(Step.Progress)
                 }
                 return ok(Step.Pending)
             }
@@ -352,7 +361,7 @@ pub struct Slot {
         }
         return ok(Step.Progress)
     }
-    fn drive<H, C, X>(&mut self, workspace: &mut[u8], request: &mut[u8], response: &mut[u8], router: &web.Router,
+    fn drive<S, H, C, X>(&mut self, stream: &mut S, workspace: &mut[u8], request: &mut[u8], response: &mut[u8], router: &web.Router,
     handler: &mut H, config: &Config, clock: &mut C, next_id: &mut u64, cancel: &X) -> Step!hosting.Error {
         let some(slice.SplitMut { left: parser, right: rest }) = slice.split_at_mut(workspace, 16384) else {
             return err(hosting.failure(hosting.ErrorKind.Workspace))
@@ -383,9 +392,9 @@ pub struct Slot {
             }
         }
         for i in 0usize..config.events_per_turn {
-            match self.advance(&mut driver, router, handler, path, query, retained, response_headers, request, response, config, clock, next_id, cancel) {
+            match self.advance(stream, &mut driver, router, handler, path, query, retained, response_headers, request, response, config, clock, next_id, cancel) {
                 ok(step) => {
-                    if step != Step.Progress {
+                    if step != Step.Progress || self.phase >= 5 {
                         self.writing = self.phase == 2 || driver.pending_output() != 0
                         self.state = driver.suspend()
                         return ok(step)
@@ -423,7 +432,7 @@ pub struct Slot {
         self.deadline = hosting.deadline(now, config.server.write_timeout_ms)
         return Step.Progress
     }
-    fn poll<H, C, X>(&mut self, workspace: &mut[u8], request: &mut[u8], response: &mut[u8], router: &web.Router,
+    fn poll<S, H, C, X>(&mut self, stream: &mut S, workspace: &mut[u8], request: &mut[u8], response: &mut[u8], router: &web.Router,
     handler: &mut H, config: &Config, clock: &mut C, next_id: &mut u64, cancel: &X) -> Step {
         if cancel.cancelled() {
             self.close();
@@ -431,24 +440,64 @@ pub struct Slot {
         }
         now := clock.now_ms()
         if now >= self.deadline {
-            if self.phase == 3 {
-                self.close();
-                return Step.Closed
+            if self.established && self.phase == 3 {
+                self.phase = 7
+                self.deadline = hosting.deadline(now, config.server.write_timeout_ms)
+            } else {
+                self.last_error = some(hosting.failure(hosting.ErrorKind.TimedOut))
+                if!self.established || self.phase >= 4 {
+                    self.close();
+                    return Step.Failed
+                }
+                return self.reject(workspace, 408, now, config)
             }
-            self.last_error = some(hosting.failure(hosting.ErrorKind.TimedOut))
-            if self.phase == 4 {
-                self.close();
-                return Step.Failed
+        }
+        if!self.established {
+            match stream.handshake() {
+                ok(ready) => {
+                    if!ready {
+                        return Step.Pending
+                    }
+                    self.established = true
+                    self.begin(now, config)
+                }
+                err(reason) => {
+                    self.last_error = some(reason)
+                    self.close();
+                    return Step.Failed
+                }
             }
-            return self.reject(workspace, 408, now, config)
+        }
+        if self.phase >= 5 {
+            match stream.finish() {
+                ok(ready) => {
+                    if!ready {
+                        return Step.Pending
+                    }
+                    phase := self.phase
+                    self.close()
+                    if phase == 5 {
+                        return Step.Complete
+                    }
+                    if phase == 6 {
+                        return Step.Rejected
+                    }
+                    return Step.Closed
+                }
+                err(reason) => {
+                    self.last_error = some(reason)
+                    self.close();
+                    return Step.Failed
+                }
+            }
         }
         if self.phase == 4 {
-            match io.poll_write_once(&mut self.socket, &workspace[20480 + self.response_offset..20480 + self.response_length]) {
+            match io.poll_write_once(stream, &workspace[20480 + self.response_offset..20480 + self.response_length]) {
                 ok(progress) => {
                     self.response_offset += progress.transferred
                     if self.response_offset == self.response_length {
-                        self.close();
-                        return Step.Rejected
+                        self.phase = 6;
+                        return Step.Progress
                     }
                     if progress.state == io.PollState.Pending {
                         return Step.Pending
@@ -456,22 +505,37 @@ pub struct Slot {
                     return Step.Progress
                 }
                 err(reason) => {
-                    self.last_error = some(hosting.io_error(reason))
+                    match stream.take_error() {
+                        some(cause) => {
+                            self.last_error = some(cause)
+                        }
+                        none => {
+                            self.last_error = some(hosting.io_error(reason))
+                        }
+                    }
                     self.close();
                     return Step.Failed
                 }
             }
         }
-        match self.drive(workspace, request, response, router, handler, config, clock, next_id, cancel) {
+        match self.drive(stream, workspace, request, response, router, handler, config, clock, next_id, cancel) {
             ok(step) => {
                 return step
             }
             err(reason) => {
+                match stream.take_error() {
+                    some(cause) => {
+                        self.last_error = some(cause)
+                        self.close();
+                        return Step.Failed
+                    }
+                    none => {}
+                }
                 if reason.kind == hosting.ErrorKind.Cancelled {
                     self.close();
                     return Step.Closed
                 }
-                if reason.kind == hosting.ErrorKind.Transport {
+                if reason.kind == hosting.ErrorKind.Transport || reason.kind == hosting.ErrorKind.Tls {
                     self.last_error = some(reason)
                     self.close();
                     return Step.Failed
@@ -482,6 +546,54 @@ pub struct Slot {
             }
         }
     }
+    fn poll_transport<P, H, C, X>(&mut self, provider: &mut P, index: usize, workspace: &mut[u8],
+    request: &mut[u8], response: &mut[u8], router: &web.Router, handler: &mut H,
+    config: &Config, clock: &mut C, next_id: &mut u64, cancel: &X) -> Step {
+        let some(slice.SplitMut { left: protocol, right: staging }) = slice.split_at_mut(workspace, WORKSPACE_BYTES) else {
+            self.last_error = some(hosting.failure(hosting.ErrorKind.Workspace))
+            self.close();
+            return Step.Failed
+        }
+        // The resumed transport borrows the socket separately from HTTP state.
+        // A close during this turn is applied to the real socket after suspend.
+        socket := mem.replace(&mut self.socket, native.TcpConnection.closed())
+        step := Step.Failed
+        match provider.open(index, &mut socket, staging) {
+            ok(stream) => {
+                step = self.poll(&mut stream, protocol, request, response, router, handler, config, clock, next_id, cancel)
+                if self.active && step != Step.Complete {
+                    // TLS can produce ciphertext while reading, and consume
+                    // input while writing. Drain it before choosing readiness.
+                    match stream.prepare() {
+                        ok(progressed) => {
+                            if progressed && step == Step.Pending {
+                                step = Step.Progress
+                            }
+                            self.writing = stream.writing(self.writing)
+                        }
+                        err(reason) => {
+                            self.last_error = some(reason)
+                            self.close()
+                            step = Step.Failed
+                        }
+                    }
+                }
+                state := stream.suspend()
+                provider.save(index, state)
+            }
+            err(reason) => {
+                self.last_error = some(reason)
+                self.close()
+            }
+        }
+        self.socket = socket
+        if!self.active {
+            provider.close(index)
+            self.close()
+        }
+        return step
+    }
+
 }
 // A small ready-to-use slot array. Applications may instead supply any array
 // or owned collection with 1..255 Slot.new() values and matching byte storage.
@@ -496,6 +608,15 @@ struct Owner {
         }
     }
 }
+struct TransportOwner<P> {
+    provider: &mut P
+    count: usize
+    fn drop(&mut self) {
+        for i in 0usize..self.count {
+            self.provider.close(i)
+        }
+    }
+}
 pub fn serve<H>(address: &[u8], routes: &[web.Route], handler: &mut H, slots: &mut[Slot], workspace: &mut[u8],
 request: &mut[u8], response: &mut[u8], config: Config) -> hosted.Report!hosting.Error {
     clock := native.MonotonicClock {}
@@ -506,12 +627,24 @@ request: &mut[u8], response: &mut[u8], config: Config) -> hosted.Report!hosting.
 // Cancellation closes all owned sockets, including every error/return path.
 pub fn serve_with<H, C, X>(address: &[u8], routes: &[web.Route], handler: &mut H, slots: &mut[Slot], workspace: &mut[u8],
 request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
-    if slots.len == 0 || slots.len >= native.POLL_CAPACITY || workspace.len / slots.len < WORKSPACE_BYTES ||
+    provider := PlainProvider {}
+    return serve_using(address, routes, handler, slots, workspace, request, response, config, &mut provider, clock, cancel)
+}
+// Providers declare staging_bytes and handshake_required.
+// Provider.open(index, socket, staging) resumes a polling session; save retains
+// its movable state and close releases it. Sessions supply polling I/O,
+// handshake, flush, finish, prepare, writing, take_error and suspend methods.
+// No session or byte-buffer borrow survives a reactor turn.
+pub fn serve_using<P, H, C, X>(address: &[u8], routes: &[web.Route], handler: &mut H, slots: &mut[Slot], workspace: &mut[u8],
+request: &mut[u8], response: &mut[u8], config: Config, provider: &mut P, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
+    stride := WORKSPACE_BYTES + provider.staging_bytes()
+    if slots.len == 0 || slots.len >= native.POLL_CAPACITY || workspace.len / slots.len < stride ||
         config.requests_per_connection == 0 || config.idle_timeout_ms == 0 || config.events_per_turn == 0 ||
         !config.server.valid() {
         return err(hosting.failure(hosting.ErrorKind.InvalidInput))
     }
     owner := Owner { slots: slots }
+    transport := TransportOwner { provider: provider, count: owner.slots.len }
     request_size := request.len / owner.slots.len
     response_size := response.len / owner.slots.len
     index := [0usize; 2048]
@@ -625,7 +758,7 @@ request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X
                         ok(pending) => {
                             match pending {
                                 some(socket) => {
-                                    owner.slots[i].start(socket, clock.now_ms(), &config, request_size)
+                                    owner.slots[i].start(socket, clock.now_ms(), &config, request_size,!transport.provider.handshake_required())
                                     report.accepted += 1
                                 }
                                 none => {
@@ -645,7 +778,7 @@ request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X
         }
         for i in 0usize..owner.slots.len {
             if owner.slots[i].active && (owner.slots[i].runnable || readiness.ready(owner.slots[i].poll_index) || clock.now_ms() >= owner.slots[i].deadline) {
-                step := owner.slots[i].poll(&mut workspace[i * WORKSPACE_BYTES..(i + 1) * WORKSPACE_BYTES],
+                step := owner.slots[i].poll_transport(transport.provider, i, &mut workspace[i * stride..(i + 1) * stride],
                 &mut request[i * request_size..(i + 1) * request_size], &mut response[i * response_size..(i + 1) * response_size],
                 &router, handler, &config, clock, &mut next_id, cancel)
                 owner.slots[i].runnable = step == Step.Progress || step == Step.Complete
@@ -668,4 +801,49 @@ request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X
         }
     }
     return ok(report)
+}
+
+// Plain HTTP selects no TLS implementation or extra storage.
+pub struct PlainProvider {
+    pub fn handshake_required(&self) -> bool {
+        return false
+    }
+    pub fn staging_bytes(&self) -> usize {
+        return 0
+    }
+    pub fn open(&mut self, index: usize, socket: &mut native.TcpConnection, staging: &mut[u8]) -> PlainStream!hosting.Error from(socket) {
+        return ok(PlainStream { socket: socket })
+    }
+    pub fn save(&mut self, index: usize, state: bool) {}
+    pub fn close(&mut self, index: usize) {}
+}
+pub struct PlainStream {
+    socket: &mut native.TcpConnection
+    pub fn poll_read(&mut self, data: &mut[u8]) -> io.Poll!io.Error {
+        return self.socket.poll_read(data)
+    }
+    pub fn poll_write(&mut self, data: &[u8]) -> io.Poll!io.Error {
+        return self.socket.poll_write(data)
+    }
+    pub fn handshake(&mut self) -> bool!hosting.Error {
+        return ok(true)
+    }
+    pub fn flush(&mut self) -> bool!hosting.Error {
+        return ok(true)
+    }
+    pub fn finish(&mut self) -> bool!hosting.Error {
+        return ok(true)
+    }
+    pub fn prepare(&mut self) -> bool!hosting.Error {
+        return ok(false)
+    }
+    pub fn writing(&self, http_writing: bool) -> bool {
+        return http_writing
+    }
+    pub fn take_error(&mut self) -> Option<hosting.Error> {
+        return none
+    }
+    pub fn suspend(self) -> bool {
+        return false
+    }
 }

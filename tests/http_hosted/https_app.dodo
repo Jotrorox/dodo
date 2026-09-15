@@ -2,6 +2,7 @@ package https_app_checks
 import "std/web"
 import "std/web/app"
 import "std/web/https"
+import "std/web/reactor"
 import "std/http/hosting"
 import "std/net"
 import "std/net/native"
@@ -14,6 +15,10 @@ fn main() -> i32 {
     server.request(b"GET", b"/").expect_status(200).expect_body(b"hello")
     report := identity.serve_until(server, b"127.0.0.1:0", &cancel)!
     assert(report.cancelled && report.accepted == 0)
+
+    concurrent := app.new().get(b"/", web.text(b"hello")).concurrent().build()!
+    concurrent_report := identity.serve_until(concurrent, b"127.0.0.1:0", &cancel)!
+    assert(concurrent_report.cancelled && concurrent_report.accepted == 0)
 
     workspace := [0u8; app.WORKSPACE_BYTES]
     request := [0u8; 8192]
@@ -56,6 +61,62 @@ fn main() -> i32 {
         workspace[0] = 0
         request[0] = 0
         response[0] = 0
+    }
+    tls_workspace := [0u8; https.WORKSPACE_BYTES *2]
+    slots := [reactor.Slot.new(), reactor.Slot.new()]
+    for case in 0usize..6 {
+        builder := app.new().get(b"/", web.text(b"hello")).concurrent()
+        if case == 2 {
+            builder.config.timeouts.idle_ms = 0
+        }
+        if case == 3 {
+            builder.config.requests_per_connection = 0
+        }
+        if case == 4 {
+            builder.config.events_per_turn = 0
+        }
+        server := builder.build()!
+        size := tls_workspace.len
+        if case == 1 {
+            size -= 1
+        }
+        storage := app.Storage.concurrent(&mut tls_workspace[..size], &mut request, &mut response, &mut slots)
+        match identity.serve_with(server, b"127.0.0.1:0", &mut storage, &mut clock, &cancel) {
+            ok(report) => {
+                assert((case == 0 || case == 5) && report.cancelled && report.accepted == 0)
+            }
+            err(reason) => {
+                match &reason.serving {
+                    some(cause) => {
+                        assert(case >= 1 && case <= 4 && cause.kind == hosting.ErrorKind.InvalidInput)
+                    }
+                    none => {
+                        assert(false)
+                    }
+                }
+            }
+        }
+        core.drop(storage)
+        tls_workspace[0] = 0
+        request[0] = 0
+        response[0] = 0
+    }
+    missing_slots := app.new().get(b"/", web.text(b"hello")).concurrent().build()!
+    serial_storage := app.Storage.new(&mut workspace, &mut request, &mut response)
+    match identity.serve_with(missing_slots, b"127.0.0.1:0", &mut serial_storage, &mut clock, &cancel) {
+        ok(_) => {
+            assert(false)
+        }
+        err(reason) => {
+            match &reason.serving {
+                some(cause) => {
+                    assert(cause.kind == hosting.ErrorKind.Workspace)
+                }
+                none => {
+                    assert(false)
+                }
+            }
+        }
     }
     return 0
 }

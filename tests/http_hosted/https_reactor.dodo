@@ -1,0 +1,81 @@
+package reactor_checks
+import "std/console"
+import "std/net/native"
+import "std/web"
+import "std/web/app"
+import "std/web/https"
+import "std/web/reactor"
+
+const STOP_MS: u64 = 30000
+pub struct Stop {
+    until: u64
+    pub fn cancelled(&self) -> bool {
+        clock := native.MonotonicClock {}
+        return clock.now_ms() >= self.until
+    }
+}
+pub struct Handler {
+    id: usize
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        if self.id == 1 {
+            return response.bytes(request.body())
+        }
+        if self.id == 2 {
+            return err(web.failure(web.Error.Handler))
+        }
+        if self.id == 3 {
+            return response.set_status(204)
+        }
+        if self.id == 4 {
+            response.text(b"ignored")?;
+            return response.set_status(304)
+        }
+        if self.id == 5 {
+            data := [120u8; 65536];
+            return response.text(&data)
+        }
+        return response.text(b"Hello, Dodo!\n")
+    }
+}
+fn main() -> i32 {
+    builder := app.new()
+        .get(b"/", Handler { id: 0 })
+        .post(b"/echo", Handler { id: 1 })
+        .get(b"/fail", Handler { id: 2 })
+        .get(b"/empty", Handler { id: 3 })
+        .get(b"/not-modified", Handler { id: 4 })
+        .get(b"/large", Handler { id: 5 })
+        .concurrent()
+    builder.config.requests_per_connection = 3
+    builder.config.timeouts.idle_ms = 100
+    builder.config.timeouts.header_ms = 300
+    builder.config.timeouts.body_ms = 300
+    builder.config.timeouts.write_ms = 1000
+    builder.config.limits.response_bytes = 65536
+    builder.config.events_per_turn = @@EVENTS@@
+    server := builder.build()!
+    slots := reactor.slots()
+    workspace := [0u8; https.WORKSPACE_BYTES *8]
+    request := [0u8; 4096 *8]
+    response := [0u8; 65536 *8]
+    // Exercise a custom slot count and buffers larger than the defaults.
+    storage := app.Storage.concurrent(&mut workspace[..https.WORKSPACE_BYTES * 3],
+    &mut request[..4096 * 3], &mut response[..65536 * 3], &mut slots[..3])
+    clock := native.MonotonicClock {}
+    stop := Stop { until: clock.now_ms() + STOP_MS }
+    identity := https.files("cert.pem", "key.pem")
+    match identity.serve_with(server, b"127.0.0.1:@@PORT@@", &mut storage, &mut clock, &stop) {
+        ok(report) => {
+            assert(report.cancelled);
+            return 0
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            return 1
+        }
+    }
+}

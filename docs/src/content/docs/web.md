@@ -278,6 +278,7 @@ import "std/web/https"
 fn main() -> i32 {
     return app.new()
         .get(b"/", web.text(b"Hello, Dodo!\n"))
+        .concurrent()
         .run_with(b"127.0.0.1:8443", https.files("cert.pem", "key.pem"))
 }
 ```
@@ -290,10 +291,19 @@ checked first. `run_with` prints failures and uses the same exit codes as `run`:
 0 on success, 1 for startup failure, and 2 for failed connections.
 
 The HTTPS adapter uses `app.Config` limits and timeouts, bounded default buffers,
-middleware, and the same request/response helpers. It serves serially, with one
-request per connection. Combining it with `.concurrent()` produces an explicit
-startup error. Importing `std/web/https` selects OpenSSL 3.5+; ordinary
-`std/web/app` programs retain their existing dependencies.
+middleware, and the same request/response helpers. Add `.concurrent()` before
+`.run_with(...)` to enable concurrent TLS handshakes, keep-alive, and ordered
+HTTP/1.1 pipelining through the reactor. The request limit, idle timeout, and
+per-turn event budget apply just as they do for concurrent HTTP. A stalled
+handshake or socket does not block other connections; handlers run synchronously.
+The header timeout bounds the TLS handshake, then a fresh header and request
+budget starts for HTTP. Responses are complete only after their encrypted output
+has drained. Normal closure sends TLS `close_notify`; cancellation aborts all
+active connections immediately. The default serial mode still handles one
+request per connection.
+
+Importing `std/web/https` selects OpenSSL 3.5+; ordinary `std/web/app` programs
+retain their existing dependencies.
 
 For typed errors and cooperative cancellation, build the app and call the
 transport directly:
@@ -307,11 +317,18 @@ report := identity.serve_until(server, b"127.0.0.1:8443", &cancel)!
 Here `cancel` supplies `cancelled(&self) -> bool`, as in the configuration
 example above. `identity.serve(server, address)` uses default cancellation;
 `identity.serve_with(server, address, &mut storage, &mut clock, &cancel)` accepts
-the same `app.Storage` used for custom HTTP buffers. These calls consume the
-server and return `hosted.Report!https.Error`. Errors retain the file cause or
-underlying `hosting.Error`; a file error borrows its path from `identity`.
-For larger credential buffers or explicit OpenSSL settings, use
-`std/http/https` and its existing acceptor API.
+the same `app.Storage` used for custom HTTP buffers. For concurrent HTTPS, use
+`app.Storage.concurrent` with 1–255 reactor slots and at least
+`https.WORKSPACE_BYTES` (69,632 bytes) per slot. This includes 8 KiB of TLS
+ciphertext staging in addition to the HTTP workspace. Request and response
+buffers are divided equally among the slots. Default concurrent HTTPS reserves
+608 KiB for eight slots' byte buffers, plus slot bookkeeping and OpenSSL's
+internal allocations. Serial storage uses `app.WORKSPACE_BYTES` as before.
+These calls consume the server and return `hosted.Report!https.Error`. Errors
+retain the file cause or underlying `hosting.Error`; a file error borrows its path from `identity`.
+For larger credential buffers or explicit OpenSSL settings, pass
+`https.Provider.new(identity)` to `Server.serve_concurrent_with`, where `identity`
+is an `openssl.Config`. The existing serial acceptor API is in `std/http/https`.
 
 See [complete local HTTPS setup](hosted-http.md#complete-local-https-setup) for
 generating test credentials and running a verified client.
@@ -323,8 +340,9 @@ The server object uses the existing serial `std/web/hosted` and concurrent
 custom dispatchers and transport adapters. `Builder.run_with(address, transport)`
 accepts a transport with `serve(server, address) -> hosted.Report!E`, where `E`
 is printable. `Server.serve_serial_with` exposes the serial acceptor hook with
-custom storage, clock, and cancellation. HTTPS uses the explicit TLS acceptor
-through the convenience adapter above. Streaming bodies, upgrades, and
+custom storage, clock, and cancellation. `Server.serve_concurrent_with` exposes
+the reactor transport hook. HTTPS selects the corresponding runner through the
+convenience adapter above. Streaming bodies, upgrades, and
 caller-driven execution use `std/web/server`, `std/web/stream`, `std/web/response`, and
 `std/http/connection`; none acquire a hosted dependency. Rooted static files
 remain an optional `std/web/static_files` import.
@@ -395,8 +413,9 @@ are normal closure.
 Handlers still run synchronously on the serving thread. A long-running handler
 blocks that thread until it returns; this API provides concurrent socket progress,
 not parallel application callbacks. Slots, bodies, and reuse remain bounded.
-The reactor serves plain HTTP; the existing explicit TLS acceptor remains
-available through `std/http/https` and the serial hosted API.
+The reactor serves HTTP and, through `std/web/https`, HTTPS. Custom polling
+transports can use `reactor.serve_using`; the explicit serial TLS acceptor
+remains available through `std/http/https`.
 
 ## API and contracts
 

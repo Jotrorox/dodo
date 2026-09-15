@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Check fluent HTTPS, bounded credentials, startup errors, and cancellation."""
+"""Check serial/concurrent HTTPS, bounded reuse, credentials, and cancellation."""
 import argparse
+import contextlib
 from pathlib import Path
 import ssl
+import socket
+import time
 import subprocess
 import tempfile
 
 from test_hosted_http import credentials
 from test_http_web import ROOT, connect, port, run
 from test_web_developer import cases
-from test_web_reactor import request, response
+from test_web_reactor import checks, request, response
 
 
 def build(compiler, work, name, source, optimization):
@@ -21,7 +24,7 @@ def build(compiler, work, name, source, optimization):
 
 
 def startup(compiler, work, optimization):
-    source = (ROOT / "examples/https_server.dodo").read_text().replace("127.0.0.1:8443", "invalid address")
+    source = (ROOT / "examples/https_server.dodo").read_text().replace("127.0.0.1:8443", "invalid address").replace(".concurrent()", "")
     binary = build(compiler, work, "startup", source, optimization)
     scratch = work / f"credentials-{optimization}"
     scratch.mkdir()
@@ -57,7 +60,7 @@ def startup(compiler, work, optimization):
 
     concurrent = source.replace(".run_with(", ".concurrent().run_with(")
     binary = build(compiler, work, "concurrent", concurrent, optimization)
-    rejected(b"concurrent HTTPS is not supported; use serial execution")
+    rejected(b"http hosted: InvalidInput")
     duplicate = source.replace('.get(b"/",', '.get(b"/", web.text(b"duplicate")).get(b"/",')
     binary = build(compiler, work, "duplicate", duplicate, optimization)
     # Registration errors win even when credential files are missing.
@@ -66,7 +69,7 @@ def startup(compiler, work, optimization):
     print(f"PASS HTTPS startup diagnostics and credential bounds -O{optimization}", flush=True)
 
 
-def serving(compiler, work, optimization):
+def serving(compiler, work, optimization, policy):
     number = port()
     exchanges = list(cases())
     source = (ROOT / "tests/http_hosted/developer.dodo").read_text()
@@ -79,9 +82,9 @@ def serving(compiler, work, optimization):
         extra += f'.get(b"/extra/{index}", web.text(b"extra"))\n        '
         exchanges.append((request(path=f"/extra/{index}"), 200, b"extra", {}))
     source = source.replace(".max_connections(", extra + ".max_connections(")
-    for name, value in dict(PORT=number, COUNT=len(exchanges), POLICY="Serial").items():
+    for name, value in dict(PORT=number, COUNT=len(exchanges), POLICY=policy).items():
         source = source.replace(f"@@{name}@@", str(value))
-    binary = build(compiler, work, "routes", source, optimization)
+    binary = build(compiler, work, f"routes-{policy}", source, optimization)
     context = ssl.create_default_context(cafile=str(work / "ca.pem"))
     context.set_alpn_protocols(["http/1.1"])
     process = subprocess.Popen([str(binary)], cwd=work, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -101,14 +104,16 @@ def serving(compiler, work, optimization):
         if process.poll() is None:
             process.kill()
         process.communicate(timeout=5)
-    print(f"PASS fluent HTTPS routes, middleware, and rejections -O{optimization}", flush=True)
+    print(f"PASS fluent {policy} HTTPS routes, middleware, and rejections -O{optimization}", flush=True)
 
 
-def connection_failure(compiler, work, optimization):
+def connection_failure(compiler, work, optimization, concurrent=False):
     number = port()
-    source = (ROOT / "examples/https_server.dodo").read_text().replace(":8443", f":{number}")
+    source = (ROOT / "examples/https_server.dodo").read_text().replace(":8443", f":{number}").replace(".concurrent()", "")
     source = source.replace(".run_with(", ".max_connections(1).run_with(")
-    binary = build(compiler, work, "failed-peer", source, optimization)
+    if concurrent:
+        source = source.replace(".run_with(", ".concurrent().run_with(")
+    binary = build(compiler, work, f"failed-peer-{concurrent}", source, optimization)
     process = subprocess.Popen([str(binary)], cwd=work, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         # A plaintext peer fails its TLS handshake and is reported as exit 2.
@@ -124,6 +129,149 @@ def connection_failure(compiler, work, optimization):
     print(f"PASS HTTPS connection failure reporting -O{optimization}", flush=True)
 
 
+@contextlib.contextmanager
+def running(binary, work):
+    process = subprocess.Popen([str(binary)], cwd=work, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+def concurrent_serving(compiler, work, optimization):
+    context = ssl.create_default_context(cafile=str(work / "ca.pem"))
+    context.set_alpn_protocols(["http/1.1"])
+
+    def encrypted(number, process):
+        raw = connect(number, process)
+        try:
+            peer = context.wrap_socket(raw, server_hostname="localhost", suppress_ragged_eofs=False)
+            assert peer.selected_alpn_protocol() == "http/1.1"
+            return peer
+        except BaseException:
+            raw.close()
+            raise
+
+    template = (ROOT / "tests/http_hosted/https_reactor.dodo").read_text()
+    # A one-event turn stresses all suspend/resume boundaries and buffered TLS
+    # records; the regular budget also exercises multiple events per resume.
+    for events in (1, 16):
+        number = port()
+        source = template.replace("@@PORT@@", str(number)).replace("@@EVENTS@@", str(events))
+        binary = build(compiler, work, f"reactor-{events}", source, optimization)
+        with running(binary, work) as process:
+            for name in checks(number, process, encrypted):
+                print(f"PASS HTTPS reactor {name}, events={events} -O{optimization}", flush=True)
+            # An accepted socket may delay its ClientHello without blocking a
+            # second handshake or request. Complete both before either expires.
+            with connect(number, process) as slow:
+                with encrypted(number, process) as fast:
+                    fast.sendall(request())
+                    assert response(fast)[2] == b"Hello, Dodo!\n"
+                    assert fast.recv(1) == b""
+                with context.wrap_socket(slow, server_hostname="localhost") as peer:
+                    peer.sendall(request())
+                    assert response(peer)[0] == 200
+            # A partial TLS record times out with no plaintext HTTP response.
+            incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+            client = context.wrap_bio(incoming, outgoing, server_hostname="localhost")
+            try:
+                client.do_handshake()
+            except ssl.SSLWantReadError:
+                pass
+            hello = outgoing.read()
+            with connect(number, process) as slow:
+                slow.sendall(hello[:8])
+                with encrypted(number, process) as fast:
+                    fast.sendall(request())
+                    assert response(fast)[0] == 200
+                assert slow.recv(1) == b""
+            print(f"PASS HTTPS independent and bounded handshakes, events={events} -O{optimization}", flush=True)
+
+    # Queue enough encrypted output to exceed socket/TLS staging while the
+    # first client pauses reading; another connection must still complete.
+    number = port()
+    source = template.replace("@@PORT@@", str(number)).replace("@@EVENTS@@", "16")
+    source = source.replace("requests_per_connection = 3", "requests_per_connection = 100")
+    source = source.replace("builder.config.timeouts.write_ms = 1000", "builder.config.timeouts.write_ms = 10000")
+    source = source.replace("server := builder.build()!", "builder.config.max_connections = 2\n    server := builder.build()!")
+    source = source.replace("assert(report.cancelled)",
+                            "assert(!report.cancelled && report.accepted == 2 && report.completed == 101 && report.failed == 0 && report.rejected == 0)")
+    binary = build(compiler, work, "reactor-output", source, optimization)
+    with running(binary, work) as process:
+        with encrypted(number, process) as slow:
+            slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            slow.sendall(request(path="/large", close=False) * 100)
+            time.sleep(.05)
+            with encrypted(number, process) as fast:
+                fast.sendall(request())
+                assert response(fast)[2] == b"Hello, Dodo!\n"
+                assert fast.recv(1) == b""
+            wire = bytearray()
+            while part := slow.recv(65536):
+                wire += part
+            frames = bytes(wire).split(b"HTTP/1.1 ")[1:]
+            assert len(frames) == 100, len(frames)
+            assert all(frame.startswith(b"200 ") and frame.split(b"\r\n\r\n", 1)[1] == b"x" * 65536 for frame in frames)
+            assert b"Connection: close\r\n" in frames[-1]
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 0, (stdout, stderr)
+    print(f"PASS HTTPS slow reader, ciphertext flushing, and completion counts -O{optimization}", flush=True)
+
+    # Reuse the same slot for successful dispatches, an HTTP rejection, and a
+    # TLS protocol failure. Report counters distinguish requests/connections.
+    number = port()
+    source = template.replace("@@PORT@@", str(number)).replace("@@EVENTS@@", "1")
+    source = source.replace("server := builder.build()!", "builder.config.max_connections = 3\n    server := builder.build()!")
+    source = source.replace("assert(report.cancelled)",
+                            "assert(!report.cancelled && report.accepted == 3 && report.completed == 3 && report.rejected == 1 && report.failed == 1)")
+    binary = build(compiler, work, "reactor-report", source, optimization)
+    with running(binary, work) as process:
+        with encrypted(number, process) as peer:
+            for _ in range(3):
+                peer.sendall(request(close=False))
+                assert response(peer)[0] == 200
+            assert peer.recv(1) == b""
+        with encrypted(number, process) as peer:
+            peer.sendall(request(path="/absent"))
+            assert response(peer)[0] == 404
+            assert peer.recv(1) == b""
+        with connect(number, process) as peer:
+            peer.sendall(request())
+            try:
+                assert peer.recv(1) == b""
+            except ConnectionResetError:
+                pass
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 0, (stdout, stderr)
+    print(f"PASS HTTPS connection/request accounting and slot cleanup -O{optimization}", flush=True)
+
+    number = port()
+    source = template.replace("@@PORT@@", str(number)).replace("@@EVENTS@@", "1")
+    source = source.replace("STOP_MS: u64 = 30000", "STOP_MS: u64 = 1000")
+    source = source.replace("idle_ms = 100", "idle_ms = 5000").replace("header_ms = 300", "header_ms = 5000")
+    binary = build(compiler, work, "reactor-cancel", source, optimization)
+    with running(binary, work) as process:
+        with encrypted(number, process) as idle:
+            idle.sendall(request(close=False))
+            assert response(idle)[0] == 200
+            with encrypted(number, process) as pending, connect(number, process) as handshake:
+                pending.sendall(b"GET / HTTP/1.1\r\nHost: ")
+                stdout, stderr = process.communicate(timeout=3)
+                assert process.returncode == 0, (stdout, stderr)
+                assert handshake.recv(1) == b""
+                # Cancellation aborts TLS immediately instead of waiting for
+                # close_notify. Python reports the intentional abrupt EOF.
+                for peer in (idle, pending):
+                    try:
+                        assert peer.recv(1) == b""
+                    except ssl.SSLEOFError:
+                        pass
+    print(f"PASS HTTPS cancellation closes idle, request, and handshake slots -O{optimization}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, default=ROOT / "target/debug/dodo")
@@ -134,8 +282,11 @@ def main():
         credentials(work)
         for optimization in (0, 3):
             startup(compiler, work, optimization)
-            serving(compiler, work, optimization)
-            connection_failure(compiler, work, optimization)
+            for policy in ("Serial", "Concurrent"):
+                serving(compiler, work, optimization, policy)
+            for concurrent in (False, True):
+                connection_failure(compiler, work, optimization, concurrent)
+            concurrent_serving(compiler, work, optimization)
             source = (ROOT / "tests/http_hosted/https_app.dodo").read_text()
             binary = build(compiler, work, "config", source, optimization)
             run([str(binary)], cwd=work)

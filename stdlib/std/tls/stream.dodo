@@ -4,6 +4,23 @@ import "core/option"
 import "std/io"
 import "std/tls"
 
+// Movable TLS state; the same ciphertext buffers must accompany each resume.
+// No socket or buffer borrow survives suspension.
+pub struct State<E> {
+    engine: E
+    input_start: usize
+    input_end: usize
+    output_start: usize
+    output_end: usize
+    failed: bool
+    last_error: Option<tls.Error>
+    transport_eof: bool
+    pub fn new(engine: E) -> State<E> from(engine) {
+        return State { engine: engine, input_start: 0, input_end: 0,
+        output_start: 0, output_end: 0, failed: false, last_error: none, transport_eof: false }
+    }
+}
+
 // Generic composition: E is a TLS engine, T is an io polling transport.
 // Caller-provided bounded staging; exclusive transport and buffer borrows retained
 // through destruction. Each pump makes at most one transport read and write.
@@ -20,12 +37,27 @@ pub struct Stream<E, T> {
     last_error: Option<tls.Error>
     transport_eof: bool
     pub fn new(engine: E, transport: &mut T, incoming: &mut[u8], outgoing: &mut[u8]) -> Stream<E, T>!tls.Error from(transport, incoming, outgoing) {
-        if incoming.len == 0 || outgoing.len == 0 {
+        return Stream.resume(State.new(engine), transport, incoming, outgoing)
+    }
+    pub fn resume(state: State<E>, transport: &mut T, incoming: &mut[u8], outgoing: &mut[u8]) -> Stream<E, T>!tls.Error from(state, transport, incoming, outgoing) {
+        if incoming.len == 0 || outgoing.len == 0 || state.input_end > incoming.len || state.output_end > outgoing.len {
             return err(tls.failure(tls.ErrorKind.InvalidInput, 0))
         }
+        let State { engine: engine, input_start: input_start, input_end: input_end,
+        output_start: output_start, output_end: output_end, failed: failed,
+        last_error: last_error, transport_eof: transport_eof } = state
         return ok(Stream<E, T> { engine: engine, transport: transport,
-        incoming: incoming, outgoing: outgoing, input_start: 0,
-        input_end: 0, output_start: 0, output_end: 0, failed: false, last_error: none, transport_eof: false })
+        incoming: incoming, outgoing: outgoing, input_start: input_start,
+        input_end: input_end, output_start: output_start, output_end: output_end,
+        failed: failed, last_error: last_error, transport_eof: transport_eof })
+    }
+    pub fn suspend(self) -> State<E> {
+        let Stream { engine: engine, transport: transport, incoming: incoming, outgoing: outgoing,
+        input_start: input_start, input_end: input_end, output_start: output_start,
+        output_end: output_end, failed: failed, last_error: last_error, transport_eof: transport_eof } = self
+        return State { engine: engine, input_start: input_start, input_end: input_end,
+        output_start: output_start, output_end: output_end, failed: failed,
+        last_error: last_error, transport_eof: transport_eof }
     }
     pub fn pump(&mut self) -> bool!tls.Error {
         if self.failed {
@@ -105,11 +137,17 @@ pub struct Stream<E, T> {
         return self.handshake()
     }
     // Preserve the typed TLS cause when adapting to the std/io contract.
-    pub fn take_error(&mut self) -> Option<tls.Error> { return option.take(&mut self.last_error) }
+    pub fn take_error(&mut self) -> Option<tls.Error> {
+        return option.take(&mut self.last_error)
+    }
     fn io_failure(&mut self, reason: tls.Error) -> io.Error {
         kind := io.ErrorKind.Other
-        if reason.kind == tls.ErrorKind.InvalidInput { kind = io.ErrorKind.InvalidInput }
-        if reason.kind == tls.ErrorKind.Truncated { kind = io.ErrorKind.UnexpectedEof }
+        if reason.kind == tls.ErrorKind.InvalidInput {
+            kind = io.ErrorKind.InvalidInput
+        }
+        if reason.kind == tls.ErrorKind.Truncated {
+            kind = io.ErrorKind.UnexpectedEof
+        }
         mapped := io.Error { kind: kind, code: reason.code, transferred: reason.transferred }
         self.last_error = some(reason)
         return mapped
@@ -199,8 +237,12 @@ pub struct Stream<E, T> {
     }
     // Checked read-only transport access enables hosted readiness without
     // extending the portable polling transport contract.
-    pub fn transport(&self) -> &T from(self) { return self.transport }
-    pub fn output_pending(&self) -> bool { return self.output_start != self.output_end }
+    pub fn transport(&self) -> &T from(self) {
+        return self.transport
+    }
+    pub fn output_pending(&self) -> bool {
+        return self.output_start != self.output_end
+    }
     pub fn abort(&mut self) {
         self.failed = true
         self.engine.abort()
