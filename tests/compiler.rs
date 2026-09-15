@@ -1690,6 +1690,27 @@ fn constant_cycles_width_and_expansion_limits_are_diagnosed() {
 }
 
 #[test]
+fn local_constant_expansion_is_bounded_before_cloning() {
+    for nested in [false, true] {
+        let mut source = String::from("package constants\nfn main() {\nconst C0: usize = 1\n");
+        for n in 1..18 {
+            if nested {
+                source.push_str("{\n");
+            }
+            source.push_str(&format!("const C{n}: usize = C{} + C{}\n", n - 1, n - 1));
+        }
+        if nested {
+            source.push_str(&"}\n".repeat(17));
+        }
+        source.push_str("}\n");
+        rejects(
+            &source,
+            "constant expansion exceeds the supported size limit",
+        );
+    }
+}
+
+#[test]
 fn slice_source_and_bounds_evaluate_once_in_order() {
     native_at_all_levels(
         r#"package slice_order

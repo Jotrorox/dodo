@@ -1291,9 +1291,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             ExprKind::Constant(value, _) => self.expr(value)?,
             ExprKind::Repeat(value, _) => {
                 let value = self.expr(value)?;
-                let storage = self.alloca(self.ty(&e.ty)?, "repeat.array")?;
-                self.initialize_repeat(storage, &e.ty, value)?;
-                self.load(storage, &e.ty)?
+                if value.is_null() {
+                    // Returning a zero-filled array (also inside a struct)
+                    // should start as one aggregate zero. A fill loop followed
+                    // by an aggregate load makes GVN build a fresh array
+                    // constant for each element, retaining quadratic memory.
+                    self.ty(&e.ty)?.const_zero()
+                } else {
+                    let storage = self.alloca(self.ty(&e.ty)?, "repeat.array")?;
+                    self.initialize_repeat(storage, &e.ty, value)?;
+                    self.load(storage, &e.ty)?
+                }
             }
             ExprKind::ValueBlock(body) => {
                 let ptr = self.alloca(self.storage_ty(&e.ty)?, "block.value")?;

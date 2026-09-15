@@ -4,6 +4,33 @@ use dodoc::{package::Source, parser, sema};
 use std::path::Path;
 
 #[test]
+fn returned_zero_arrays_remain_compact_during_optimization() {
+    let mut program = parser::parse(
+        "package arrays\n\
+         pub struct Buffer { pub data: [8192]u64 }\n\
+         pub fn zeroes() -> [8192]u64 { return [0u64; 8192] }\n\
+         pub fn nested() -> Buffer { return Buffer { data: [0u64; 8192] } }\n",
+    )
+    .unwrap();
+    sema::check(&mut program).unwrap();
+    for optimization in 0..=3 {
+        let context = Context::create();
+        let options = Options {
+            optimization,
+            ..Default::default()
+        };
+        let generated = codegen::generate(&context, &program, &options).unwrap();
+        let ir = generated.module.print_to_string();
+        assert!(ir.contains("ret [8192 x i64] zeroinitializer"), "{ir}");
+        assert!(
+            ir.len() < 4096,
+            "zero array initialization expanded: {} bytes",
+            ir.len()
+        );
+    }
+}
+
+#[test]
 fn invalid_target_options_return_errors() {
     for options in [
         Options {

@@ -161,6 +161,39 @@ impl Drop for Context {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_constants_are_canonical_at_their_llvm_width() {
+        let context = Context::create();
+        for bits in [1, 8, 16, 32, 64] {
+            let ty = context
+                .custom_width_int_type(std::num::NonZeroU32::new(bits).unwrap())
+                .unwrap();
+            let mask = u64::MAX >> (64 - bits);
+            for value in [0, 1, 127, 128, u64::MAX - 127, u64::MAX] {
+                for sign in [false, true] {
+                    let constant = ty.const_int(value, sign);
+                    // Printed IR can hide noncanonical high bits. Check the
+                    // stored value and LLVM's uniquing identity directly.
+                    assert_eq!(
+                        unsafe { LLVMConstIntGetZExtValue(constant.0) },
+                        value & mask
+                    );
+                    assert_eq!(constant.0, ty.const_int(value & mask, false).0);
+                }
+            }
+        }
+        let wide = context
+            .custom_width_int_type(std::num::NonZeroU32::new(128).unwrap())
+            .unwrap();
+        assert_eq!(wide.const_int(u64::MAX, true).0, wide.const_all_ones().0);
+        assert_ne!(wide.const_int(u64::MAX, false).0, wide.const_all_ones().0);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LlvmType<'ctx>(LLVMTypeRef, PhantomData<&'ctx Context>);
 impl<'ctx> LlvmType<'ctx> {
@@ -196,6 +229,16 @@ impl<'ctx> LlvmType<'ctx> {
         )
     }
     pub(super) fn const_int(self, value: u64, sign: bool) -> Value<'ctx> {
+        // LLVM 23 requires the input to fit the integer width. In particular,
+        // negative pattern bounds and folded constants arrive as u64 bit
+        // patterns; passing their high bits through creates noncanonical APInts
+        // in release LLVM builds and can make SimplifyCFG allocate indefinitely.
+        let bits = unsafe { LLVMGetIntTypeWidth(self.0) };
+        let (value, sign) = if bits < u64::BITS {
+            (value & ((1u64 << bits) - 1), false)
+        } else {
+            (value, sign)
+        };
         Value(
             unsafe { LLVMConstInt(self.0, value, sign.into()) },
             PhantomData,

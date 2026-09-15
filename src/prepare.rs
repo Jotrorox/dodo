@@ -4,7 +4,7 @@ use crate::diagnostic::Diagnostic;
 use std::collections::{HashMap, HashSet};
 
 type Check<T> = Result<T, Diagnostic>;
-type Locals = HashMap<String, Option<(Type, Expr)>>;
+type Locals = HashMap<String, Option<(Type, Expr, usize)>>;
 
 pub fn prepare(program: &mut Program, bits: u32) -> Check<()> {
     let mut resolver = Resolver {
@@ -91,16 +91,20 @@ struct Resolver {
     nodes: usize,
 }
 impl Resolver {
+    fn account_nodes(&mut self, nodes: usize, span: Span) -> Check<()> {
+        self.nodes = self.nodes.saturating_add(nodes);
+        if self.nodes > 200_000 {
+            return Err(Diagnostic::new(
+                span,
+                "constant expansion exceeds the supported size limit",
+            ));
+        }
+        Ok(())
+    }
     fn global(&mut self, name: &str, span: Span) -> Check<Constant> {
-        if let Some(c) = self.ready.get(name) {
-            self.nodes = self.nodes.saturating_add(self.sizes[name]);
-            if self.nodes > 200_000 {
-                return Err(Diagnostic::new(
-                    span,
-                    "constant expansion exceeds the supported size limit",
-                ));
-            }
-            return Ok(c.clone());
+        if self.ready.contains_key(name) {
+            self.account_nodes(self.sizes[name], span)?;
+            return Ok(self.ready[name].clone());
         }
         let initial_nodes = self.nodes;
         if self.active.len() >= 128 || !self.active.insert(name.into()) {
@@ -155,15 +159,13 @@ impl Resolver {
         Ok(())
     }
     fn expr(&mut self, e: &mut Expr, locals: &Locals, ns: &str, constant: bool) -> Check<()> {
-        self.nodes += 1;
-        if self.nodes > 200_000 {
-            return Err(Diagnostic::new(
-                e.span,
-                "constant expansion exceeds the supported size limit",
-            ));
-        }
+        self.account_nodes(1, e.span)?;
         if constant && let Some(name) = path(e) {
-            if let Some(Some((ty, value))) = locals.get(&name) {
+            if let Some(Some((ty, value, nodes))) = locals.get(&name) {
+                // Charge the expanded tree before cloning it, just as for
+                // globals. Counting only the name allowed local constants to
+                // double their retained AST on every declaration.
+                self.account_nodes(*nodes, e.span)?;
                 e.kind = ExprKind::Constant(Box::new(value.clone()), ty.clone());
                 return Ok(());
             }
@@ -270,13 +272,16 @@ impl Resolver {
                 ..
             } => {
                 self.ty(ty, locals, ns, s.span)?;
+                let initial_nodes = self.nodes;
                 if let Some(v) = value {
                     self.expr(v, locals, ns, *constant)?;
                 }
                 locals.insert(
                     name.clone(),
                     if *constant {
-                        value.as_ref().map(|v| (ty.clone(), v.clone()))
+                        value
+                            .as_ref()
+                            .map(|v| (ty.clone(), v.clone(), self.nodes - initial_nodes))
                     } else {
                         None
                     },
