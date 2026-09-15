@@ -29,8 +29,69 @@ Mutating slice algorithms and unrestricted mutable element views require plain,
 borrow-free, Result-free payloads. `get_mut` and `as_mut_slice` therefore remain
 available for plain allocated elements, but cannot expose stored references.
 Heap swaps and ordered-map replacement use ownership movement internally.
-To edit an owned String element, remove it, edit the owned value, and reinsert it;
-mutable String element views are not supported in this scope.
+Vectors and hash-map values also support scoped `try_update` callbacks for owned
+String edits. Mutable String element views remain unavailable.
+
+## Scoped owned-element mutation
+
+Use `vector.try_update(index, &mut mutation)` or
+`hash_map.try_update(&key, &mut mutation)`. The mutation object supplies a public
+`apply(&mut self, value: &mut T) -> void!E` method (with `V` for map values).
+The error type `E` must be borrow-free and Result-free. Annotate the call's
+`bool!E` result to supply the error type for generic inference:
+
+```dodo test
+package example
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/collections/shared_vector"
+import "std/text_shared"
+
+pub struct Append {
+    suffix: &str
+    pub fn apply(&mut self, value: &mut text_shared.String) -> void!error.AllocError {
+        return value.append_str(self.suffix)
+    }
+}
+fn run() -> void!error.AllocError {
+    bytes := [0u8; 4096]
+    arena := shared_arena.SharedArena.new(&mut bytes)?
+    values := shared_vector.new::<text_shared.String>(arena.handle())
+    values.push(text_shared.from_str(arena.handle(), "Dodo", 64)?)?
+    append := Append { suffix: " bird" }
+    updated: bool!error.AllocError = values.try_update(0, &mut append)
+    core.assert(updated?)
+    match values.get(0) {
+        some(value) => { core.assert_eq(value.as_str(), "Dodo bird") },
+        none => { core.assert(false) },
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match run() { ok() => { return 0 }, err(_) => { return 1 } }
+}
+```
+
+`ok(true)` means the callback succeeded. A missing index or key returns
+`ok(false)` without calling it. The Result must be handled even for a missing
+element. The callback's error is propagated **after restoring ownership of the
+element**. Changes made before an error remain; this operation does not roll
+them back. Length, capacity, vector order, map keys and bucket placement stay
+unchanged. The update itself allocates nothing; the callback may allocate.
+Vector access takes O(1), and map access uses the ordinary key lookup.
+
+This API uses checked `ptr.take`/`ptr.store` around a local owned value. The
+callback receives a temporary exclusive borrow. It cannot retain that borrow,
+return borrowed errors, reenter the collection through an alias, or introduce
+new stored sources. Existing views prevent an update, and the complete stored
+source union remains retained after success or failure. String methods such as
+append, truncate and clear work because they preserve their allocator dependency.
+
+This scope does not enable replacing stored references or reference-bearing
+fields, replacing a stored String wholesale, storing Results,
+or exposing unrestricted mutable String views. Other container kinds still use
+their existing removal and insertion APIs. Broader mutation effects and indexed
+Result handling need separate ownership and error-handling analysis.
 
 ## Allocation and text
 
@@ -202,10 +263,14 @@ heaps, relocation and destructor counters. `shared_text_collections.dodo` covers
 safe constructors, shared allocator strings, limits, UTF-8 boundaries, allocation
 failure and owned string maps. Existing collection fixtures continue to test
 move-only values, zero-sized destruction, collisions and allocation failures.
+`collection_mutation.dodo` covers scoped String updates, missing entries,
+callback errors, allocation/UTF-8 failures and exactly-once destruction.
+`tests/collection_mutation.rs` checks callback escape and dependency restrictions
+without requiring LLVM.
 
 Run the focused checks with:
 
 ```sh
-cargo test --locked --lib --test container_elements --test collections_library --test owned_storage --test stdlib_safety --test std_text --test hash_library
+cargo test --locked --lib --test collection_mutation --test container_elements --test collections_library --test owned_storage --test stdlib_safety --test std_text --test hash_library
 target/debug/dodo test docs --doc
 ```

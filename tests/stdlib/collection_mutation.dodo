@@ -1,0 +1,245 @@
+package collection_mutation
+
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/collections/shared_vector"
+import "std/collections/shared_hash_map"
+import "std/text_shared"
+import "std/text"
+import "core/ptr"
+
+pub struct Append {
+    suffix: &str
+    calls: usize
+    pub fn apply(&mut self, value: &mut text_shared.String) -> void!error.AllocError {
+        self.calls = self.calls + 1
+        return value.append_str(self.suffix)
+    }
+}
+
+pub struct FailAfterAppend {
+    pub fn apply(&mut self, value: &mut text_shared.String) -> void!error.AllocError {
+        value.append_str("!")?
+        return err(error.AllocError.UnsupportedLayout)
+    }
+}
+pub struct Truncate {
+    length: usize
+    pub fn apply(&mut self, value: &mut text_shared.String) -> void!text.Error {
+        return value.truncate(self.length)
+    }
+}
+pub struct Item {
+    drops: *mut i32
+    value: i32
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.drops, ptr.read(self.drops) + 1)
+        }
+    }
+}
+pub struct EditItem {
+    pub fn apply(&mut self, value: &mut Item) -> void!u8 {
+        value.value = value.value + 1
+        return err(7u8)
+    }
+}
+pub struct Collision {
+    pub fn hash(&self, key: &i32) -> u64 {
+        return 0u64
+    }
+    pub fn equal(&self, a: &i32, b: &i32) -> bool {
+        return *a == *b
+    }
+}
+
+fn verify() -> void!error.AllocError {
+    backing := [0u8; 8192]
+    arena := shared_arena.SharedArena.new(&mut backing)?
+    values := shared_vector.new::<text_shared.String>(arena.handle())
+    values.push(text_shared.from_str(arena.handle(), "Dodo", 64)?)?
+    capacity := values.capacity()
+    append := Append { suffix: " bird", calls: 0 }
+    updated: bool!error.AllocError = values.try_update(0, &mut append)
+    core.assert(updated?)
+    missing: bool!error.AllocError = values.try_update(1, &mut append)
+    core.assert(!missing?)
+    core.assert(append.calls == 1)
+    core.assert(values.len() == 1)
+    core.assert(values.capacity() == capacity)
+    match values.get(0) {
+        some(value) => {
+            core.assert_eq(value.as_str(), "Dodo bird")
+        },
+        none => {
+            core.assert(false)
+        },
+    }
+    // Copied text from the mutation object must not become a stored source.
+    suffix := text_shared.from_str(arena.handle(), "s", 64)?
+    {
+        borrowed := Append { suffix: suffix.as_str(), calls: 0 }
+        copied: bool!error.AllocError = values.try_update(0, &mut borrowed)
+        core.assert(copied?)
+    }
+    suffix.clear()
+    fail := FailAfterAppend {}
+    failed: bool!error.AllocError = values.try_update(0, &mut fail)
+    match failed {
+        ok(_) => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    match values.get(0) {
+        some(value) => {
+            core.assert_eq(value.as_str(), "Dodo birds!")
+        },
+        none => {
+            core.assert(false)
+        },
+    }
+    // UTF-8 errors preserve the element; error types are chosen by the caller.
+    values.push(text_shared.from_str(arena.handle(), "hé", 64)?)?
+    truncate := Truncate { length: 2 }
+    invalid_boundary: bool!text.Error = values.try_update(1, &mut truncate)
+    match invalid_boundary {
+        ok(_) => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    truncate.length = 1
+    shortened: bool!text.Error = values.try_update(1, &mut truncate)
+    match shortened {
+        ok(found) => {
+            core.assert(found)
+        }, err(_) => {
+            core.assert(false)
+        }
+    }
+    match values.get(1) {
+        some(value) => {
+            core.assert_eq(value.as_str(), "h")
+        },
+        none => {
+            core.assert(false)
+        },
+    }
+    // Failed growth in a separate allocator leaves the original string owned.
+    small_backing := [0u8; 32]
+    small := shared_arena.SharedArena.new(&mut small_backing)?
+    small_values := shared_vector.new::<text_shared.String>(arena.handle())
+    small_values.push(text_shared.from_str(small.handle(), "abc", 1000)?)?
+    too_large := Append { suffix: "this append cannot fit into the small arena backing storage", calls: 0 }
+    exhausted: bool!error.AllocError = small_values.try_update(0, &mut too_large)
+    match exhausted {
+        ok(_) => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    match small_values.get(0) {
+        some(value) => {
+            core.assert_eq(value.as_str(), "abc")
+        },
+        none => {
+            core.assert(false)
+        },
+    }
+
+    map := shared_hash_map.new::<text_shared.String, text_shared.String, text_shared.Key>(arena.handle(), text_shared.Key {})
+    core.drop(map.insert(text_shared.from_str(arena.handle(), "name", 64)?, text_shared.from_str(arena.handle(), "Dodo", 64)?)?)
+    query := text_shared.from_str(arena.handle(), "name", 64)?
+    missing_key := text_shared.from_str(arena.handle(), "missing", 64)?
+    buckets := map.bucket_count()
+    changed: bool!error.AllocError = map.try_update(&query, &mut append)
+    core.assert(changed?)
+    absent: bool!error.AllocError = map.try_update(&missing_key, &mut append)
+    core.assert(!absent?)
+    core.assert(append.calls == 2)
+    failed_value: bool!error.AllocError = map.try_update(&query, &mut fail)
+    match failed_value {
+        ok(_) => {
+            core.assert(false)
+        }, err(_) => {}
+    }
+    core.assert(map.len() == 1)
+    core.assert(map.bucket_count() == buckets)
+    removed := map.remove(&query)
+    core.drop(map)
+    match removed {
+        some(value) => {
+            core.assert_eq(value.as_str(), "Dodo bird!")
+        },
+        none => {
+            core.assert(false)
+        },
+    }
+
+    // A callback error must neither lose nor duplicate a move-only element.
+    drops := 0i32
+    unsafe {
+        items := shared_vector.new::<Item>(arena.handle())
+        items.push(Item { drops: ptr.from_mut(&mut drops), value: 10 })?
+        edit := EditItem {}
+        failed_item: bool!u8 = items.try_update(0, &mut edit)
+        match failed_item {
+            ok(_) => {
+                core.assert(false)
+            }, err(code) => {
+                core.assert(code == 7)
+            }
+        }
+        core.assert(drops == 0)
+        match items.get(0) {
+            some(item) => {
+                core.assert(item.value == 11)
+            }, none => {
+                core.assert(false)
+            }
+        }
+        items.clear()
+        core.assert(drops == 1)
+        absent_item: bool!u8 = items.try_update(0, &mut edit)
+        match absent_item {
+            ok(found) => {
+                core.assert(!found)
+            }, err(_) => {
+                core.assert(false)
+            }
+        }
+        core.drop(items)
+        core.assert(drops == 1)
+        collision_map := shared_hash_map.new::<i32, Item, Collision>(arena.handle(), Collision {})
+        for i in 0i32..3 {
+            core.drop(collision_map.insert(i, Item { drops: ptr.from_mut(&mut drops), value: i })?)
+        }
+        key := 1i32
+        failed_collision: bool!u8 = collision_map.try_update(&key, &mut edit)
+        match failed_collision {
+            ok(_) => {
+                core.assert(false)
+            }, err(_) => {}
+        }
+        core.assert(drops == 1)
+        match collision_map.remove(&key) {
+            some(item) => {
+                core.assert(item.value == 2)
+            }, none => {
+                core.assert(false)
+            }
+        }
+        core.assert(drops == 2)
+        core.drop(collision_map)
+        core.assert(drops == 4)
+    }
+    return ok()
+}
+
+fn main() -> i32 {
+    match verify() {
+        ok() => {
+            return 0
+        }, err(_) => {
+            return 1
+        }
+    }
+}

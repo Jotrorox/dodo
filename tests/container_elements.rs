@@ -271,7 +271,11 @@ fn owned_text_sources_and_allocation_obligations_cannot_be_discarded() {
 #[test]
 fn shared_reference_collections_and_owned_text_execute_at_o0_and_o3() {
     let w = Workspace::new();
-    for fixture in ["reference_collections", "shared_text_collections"] {
+    for fixture in [
+        "reference_collections",
+        "shared_text_collections",
+        "collection_mutation",
+    ] {
         for level in ["0", "3"] {
             let exe =
                 w.0.join(format!("{fixture}-{level}{}", std::env::consts::EXE_SUFFIX));

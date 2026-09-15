@@ -119,6 +119,29 @@ pub struct Map<K, V, H, A> {
         }
         return none
     }
+    // Scoped value mutation; keys and bucket occupancy stay unchanged.
+    // M.apply(&mut V)->void!E cannot retain the temporary value borrow or
+    // introduce stored sources. Restore the bucket before propagating errors.
+    pub fn try_update<M, E>(&mut self, key: &K, mutation: &mut M) -> bool!E requires_plain(E) {
+        match self.find(key) {
+            some(index) => {
+                unsafe {
+                    destination := ptr.offset(self.pointer, index as isize)
+                    match ptr.take(destination, self) {
+                        some(entry) => {
+                            result: void!E = mutation.apply(&mut entry.value)
+                            ptr.store(destination, some(entry), self)
+                            result?
+                            return ok(true)
+                        }, none => {
+                            ptr.store(destination, none, self)
+                        },
+                    }
+                }
+            }, none => {},
+        }
+        return ok(false)
+    }
     // Requires free capacity; moves an entry into an empty bucket.
     fn place(&mut self, entry: Entry<K, V>) stores(self, entry) {
         index := self.start(&entry.key)

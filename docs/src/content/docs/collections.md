@@ -85,6 +85,18 @@ its allocator dependency, and allocation failures remain explicit. See the
 [complete string-keyed map example](https://github.com/Jotrorox/dodo/blob/main/examples/string_map.dodo)
 and [supported element combinations](container-elements.md).
 
+### Editing stored owned values
+
+Vectors and hash maps provide `try_update(index_or_key, &mut mutation)` for
+scoped edits, including appending to a stored `text_shared.String`. A public
+`apply(&mut self, value: &mut T) -> void!E` method performs the edit; hash maps
+pass only the value. Annotate the call result as `bool!E`, where `E` is
+borrow-free and Result-free. `ok(false)` means the element was absent;
+`ok(true)` means the edit succeeded. Callback errors preserve ownership of the
+element and any edits already made. Updates retain lengths, capacity, keys and
+ordering, and allocate only if the callback does. See the
+[complete example and checked restrictions](container-elements.md#scoped-owned-element-mutation).
+
 ## Algorithms and customization
 
 `find`, `equal`, and lexicographic `compare` take a policy value by checked shared
@@ -139,7 +151,7 @@ Clear retains capacity. There is no shrinking API yet. With the bump arena,
 individual deallocation does not reclaim bytes, so growth consumes additional
 backing space until the caller drops all handles and resets the arena.
 
-Owned operations return mandatory `Result<_, alloc/error.AllocError>`.
+Owned allocation operations return mandatory `Result<_, alloc/error.AllocError>`.
 `vector.insert` currently reports an invalid index as `UnsupportedLayout`;
 allocation failures distinguish `Exhausted` from `SizeOverflow` and invalid
 allocator layouts. No operation silently falls back to a process heap.
