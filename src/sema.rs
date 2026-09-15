@@ -694,6 +694,12 @@ struct LoopUse {
     implicit: bool,
 }
 #[derive(Clone)]
+struct LoopState {
+    depth: usize,
+    breaks: Option<Vec<Vec<Variable>>>,
+    continues: Option<Vec<Vec<Variable>>>,
+}
+#[derive(Clone)]
 struct YieldContext {
     expected: Option<Type>,
     depth: usize,
@@ -717,7 +723,7 @@ struct Checker<'a> {
     binding_uses: HashMap<(usize, String), Span>,
     position: usize,
     unsafe_depth: usize,
-    loop_depth: usize,
+    loops: Vec<LoopState>,
     storage_loops: std::cell::RefCell<Vec<storage::StorageLoop>>,
     temporary: Vec<Loan>,
     protected: Vec<Loan>,
@@ -750,7 +756,7 @@ impl<'a> Checker<'a> {
             binding_uses: HashMap::new(),
             position: 0,
             unsafe_depth: 0,
-            loop_depth: 0,
+            loops: vec![],
             storage_loops: std::cell::RefCell::new(vec![]),
             temporary: vec![],
             protected: vec![],
@@ -1456,7 +1462,7 @@ impl<'a> Checker<'a> {
                         .collect(),
                 );
                 self.begin_storage_loop();
-                self.loop_depth += 1;
+                self.begin_loop();
                 let first_partition = self.next_partition;
                 let split_depth = self.scopes.len();
                 if let Some(e) = condition {
@@ -1464,16 +1470,24 @@ impl<'a> Checker<'a> {
                     self.expect(&Type::Bool, &val.ty, e.span)?;
                     self.temporary.clear();
                 }
-                self.block(body, true)?;
+                let condition_exit = condition.as_ref().map(|_| self.scopes.clone());
+                let terminated = self.block(body, true)?;
+                let repeats = self.join_loop_continues(terminated);
+                if !repeats {
+                    // Still type-check and annotate an unreachable step, but
+                    // do not feed a break/return path through it.
+                    self.scopes = before.clone();
+                }
                 if let Some(step) = step {
                     self.statement(step)?;
                     self.temporary.clear();
                 }
-                self.end_storage_loop(span)?;
-                self.loop_depth -= 1;
+                self.end_loop(&before, repeats, span)?;
+                if let Some(condition_exit) = condition_exit {
+                    self.scopes = merge_states(self.scopes.clone(), condition_exit);
+                }
                 self.check_split_loop_escape(first_partition, split_depth, span)?;
                 self.loop_uses.pop();
-                self.check_loop_moves(&before, span)?;
                 self.scopes = merge_states(before, self.scopes.clone());
                 self.finish_scope(span)?;
                 self.scopes.pop();
@@ -1621,11 +1635,11 @@ impl<'a> Checker<'a> {
                 }
                 self.loop_uses.push(loop_uses);
                 self.begin_storage_loop();
-                self.loop_depth += 1;
+                self.begin_loop();
                 let first_partition = self.next_partition;
-                self.block(body, false)?;
-                self.end_storage_loop(span)?;
-                self.loop_depth -= 1;
+                let terminated = self.block(body, false)?;
+                let repeats = self.join_loop_continues(terminated);
+                self.end_loop(&before, repeats, span)?;
                 self.check_split_loop_escape(first_partition, self.scopes.len() - 1, span)?;
                 self.loop_uses.pop();
                 if mutable {
@@ -1651,7 +1665,6 @@ impl<'a> Checker<'a> {
                 }
                 self.finish_scope(span)?;
                 self.scopes.pop();
-                self.check_loop_moves(&before, span)?;
                 self.scopes = merge_states(before, self.scopes.clone());
             }
             StmtKind::IfLet {
@@ -1783,13 +1796,24 @@ impl<'a> Checker<'a> {
                 return Ok(all_terminate);
             }
             StmtKind::Break | StmtKind::Continue => {
-                if self.loop_depth == 0 {
+                let Some(state) = self.loops.last_mut() else {
                     return Err(Diagnostic::new(
                         span,
                         "break and continue require an enclosing for loop",
                     ));
-                }
-                // The containing loop joins all exits conservatively.
+                };
+                // Branch joins exclude terminating arms. Preserve their facts
+                // at the destination in the innermost enclosing loop instead.
+                let incoming = self.scopes[..state.depth].to_vec();
+                let edge = if matches!(statement.kind, StmtKind::Break) {
+                    &mut state.breaks
+                } else {
+                    &mut state.continues
+                };
+                *edge = Some(match edge.take() {
+                    Some(previous) => merge_states(previous, incoming),
+                    None => incoming,
+                });
                 return Ok(true);
             }
             StmtKind::Block(block) => return self.block(block, true),
@@ -1839,6 +1863,42 @@ impl<'a> Checker<'a> {
             }
         }
         Ok(())
+    }
+    fn begin_loop(&mut self) {
+        self.loops.push(LoopState {
+            depth: self.scopes.len(),
+            breaks: None,
+            continues: None,
+        });
+    }
+    fn join_loop_continues(&mut self, terminated: bool) -> bool {
+        let continues = self.loops.last_mut().unwrap().continues.take();
+        if let Some(continues) = continues {
+            self.scopes = if terminated {
+                continues
+            } else {
+                merge_states(self.scopes.clone(), continues)
+            };
+            true
+        } else {
+            !terminated
+        }
+    }
+    fn end_loop(&mut self, before: &[Vec<Variable>], repeats: bool, span: Span) -> Check<()> {
+        if repeats {
+            // A value block in the step can also continue the loop.
+            self.join_loop_continues(false);
+            self.check_loop_moves(before, span)?;
+        } else {
+            // There is no back edge: discard return paths and any effects of
+            // type-checking an unreachable step. Break states are joined below.
+            self.scopes[..before.len()].clone_from_slice(before);
+        }
+        let state = self.loops.pop().unwrap();
+        if let Some(breaks) = state.breaks {
+            self.scopes = merge_states(self.scopes.clone(), breaks);
+        }
+        self.end_storage_loop(span)
     }
     fn check_loop_moves(&self, before: &[Vec<Variable>], span: Span) -> Check<()> {
         for old in before.iter().flatten() {
@@ -5532,6 +5592,127 @@ mod tests {
             "struct S {}\nfn take(s: S) -> void {}\nfn f() -> void {\n s := S{}\n for i := 0; i < 2; i += 1 { take(s) }\n}",
             "moved in a loop",
         );
+    }
+    #[test]
+    fn moves_survive_conditional_loop_edges() {
+        for header in [
+            "for",
+            "for b",
+            "for i := 0; i < 2; i += 1",
+            "for i in 0..2",
+            "for value in values",
+        ] {
+            for exit in ["break", "continue"] {
+                for branch in [
+                    format!("if b {{ take(s)\n{exit} }}"),
+                    format!("if b {{}} else {{ take(s)\n{exit} }}"),
+                    format!("match b {{ true => {{ take(s)\n{exit} }} false => {{}} }}"),
+                    format!("if let some(n) = &option {{ take(s)\n{exit} }}"),
+                    format!("let some(n) = &option else {{ take(s)\n{exit} }}"),
+                ] {
+                    let body = format!(
+                        "struct S {{ u8 n }}\nfn take(s: S) {{}}\nfn f(s: S, b: bool, option: Option<u8>) {{\nvalues := [2]u8{{1, 2}}\n{header} {{\n{branch}\ns = S{{n: 0}}\n}}\ntake(s)\n}}"
+                    );
+                    // Reinitializing the fallthrough path cannot repair either
+                    // terminating branch. Keep the original move in diagnostics.
+                    let error = checked(&body).unwrap_err();
+                    assert!(error.message.contains("moved"), "{error:?}\n{body}");
+                    assert_eq!(
+                        error.message.contains("moved in a loop"),
+                        exit == "continue",
+                        "{error:?}\n{body}"
+                    );
+                    let source = format!("package test\n{body}\n");
+                    let moved = error
+                        .labels
+                        .iter()
+                        .find(|label| label.message.contains("is moved here"))
+                        .unwrap();
+                    assert_eq!(
+                        moved.span.start,
+                        source.find("take(s)").unwrap() + "take(".len()
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn loop_edges_allow_reinitialization_and_single_moves() {
+        let prefix = "struct S {}\nfn take(s: S) {}\nfn fresh() -> S { return S{} }\n";
+        for body in [
+            "for b { if b { take(s)\ns = fresh()\ncontinue } }\ntake(s)",
+            "for { if b { take(s)\ns = fresh()\nbreak } }\ntake(s)",
+            "for b { if b { take(s)\nbreak } }",
+            "for b { if b { take(s)\nreturn } }\ntake(s)",
+            "for { if b { take(s)\nreturn } else { break } }\ntake(s)",
+            "for { take(s)\nbreak }",
+            "for { take(s)\nreturn }",
+            "for ; b; take(s) { take(s)\nbreak }",
+            "for ; b; take(s) { take(s)\nreturn }\ntake(s)",
+            "for ; b; s = fresh() { if b { take(s)\ncontinue } }\ntake(s)",
+            "for ; b; s = fresh() { take(s)\ncontinue }\ntake(s)",
+            "for { for { take(s)\nbreak }\ns = fresh() }",
+            "for b { s := fresh()\nif b { take(s)\ncontinue } }\ntake(s)",
+            "for b { s := fresh()\nif b { take(s)\nbreak } }\ntake(s)",
+            "values := [2]u8{1, 2}\nfor value in values { if b { take(s)\ns = fresh()\ncontinue } }\ntake(s)",
+            "values := [2]u8{1, 2}\nfor value in values { take(s)\nbreak }",
+        ] {
+            accepts(&format!("{prefix}fn f(s: S, b: bool) {{ {body} }}"));
+        }
+    }
+    #[test]
+    fn loop_steps_and_nested_loops_preserve_moves() {
+        let prefix = "struct S {}\nfn take(s: S) {}\nfn fresh() -> S { return S{} }\nfn consume(s: S) -> bool { return true }\n";
+        for (body, message) in [
+            ("for ; b; take(s) { if b { take(s)\ncontinue } }", "moved"),
+            (
+                "for ; b; s = fresh() { if b { take(s)\nbreak } }\ntake(s)",
+                "moved",
+            ),
+            (
+                "for ; b; s = if b { take(s)\ncontinue } else { fresh() } {}",
+                "moved in a loop",
+            ),
+            (
+                "for ; b; s = if b { take(s)\nbreak } else { fresh() } {}\ntake(s)",
+                "moved",
+            ),
+            (
+                "for { if b { take(s)\nbreak } else { break } }\ntake(s)",
+                "moved",
+            ),
+            (
+                "for b { if b { take(s)\ncontinue } else { continue } }",
+                "moved in a loop",
+            ),
+            (
+                "for { if b { take(s)\nbreak } else { continue } }\ntake(s)",
+                "moved",
+            ),
+            (
+                "for b { if b { take(s)\ncontinue } else { return } }",
+                "moved in a loop",
+            ),
+            (
+                "for b { for { if b { take(s)\nbreak } } }",
+                "moved in a loop",
+            ),
+            (
+                "for { for { if b { take(s)\nbreak } }\ncontinue }",
+                "moved in a loop",
+            ),
+            (
+                "for b { for b { if b { take(s)\ncontinue } }\ns = fresh() }",
+                "moved in a loop",
+            ),
+            ("for consume(s) { return }\ntake(s)", "moved"),
+            ("for consume(s) { s = fresh() }\ntake(s)", "moved"),
+        ] {
+            rejects(
+                &format!("{prefix}fn f(s: S, b: bool) {{ {body} }}"),
+                message,
+            );
+        }
     }
     #[test]
     fn samples_spec_example() {
