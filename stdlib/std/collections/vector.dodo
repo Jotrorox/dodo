@@ -59,6 +59,23 @@ pub struct Vector<T, A> {
             return some(ptr.borrow_mut(ptr.offset(self.pointer, index as isize), self))
         }
     }
+    // Scoped mutation: M.apply(&mut T)->void!E may edit an owned payload,
+    // but cannot retain its temporary borrow or add new stored dependencies.
+    // Restore the occupied slot before propagating errors; edits are not rolled
+    // back. Missing indices return ok(false) without calling the mutation.
+    pub fn try_update<M, E>(&mut self, index: usize, mutation: &mut M) -> bool!E requires_plain(E) {
+        if index >= self.length {
+            return ok(false)
+        }
+        unsafe {
+            destination := ptr.offset(self.pointer, index as isize)
+            value := ptr.take(destination, self)
+            result: void!E = mutation.apply(&mut value)
+            ptr.store(destination, value, self)
+            result?
+        }
+        return ok(true)
+    }
     // Geometric growth; failure preserves all existing values and capacity.
     pub fn reserve(&mut self, additional: usize) -> void!error.AllocError {
         if additional > layout.max_size() - self.length {
