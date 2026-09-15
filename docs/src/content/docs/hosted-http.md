@@ -6,7 +6,7 @@ order: 159.5
 ---
 
 Use `std/http/hosted` for a hosted HTTP client, `std/http/https` for verified
-HTTP/HTTPS, and `std/web/hosted` for a serial web server. These modules own the
+HTTP/HTTPS, and `std/web/app` for a configured web server. These modules own the
 ordinary resolution, connect, readiness, framing, body transfer, and cleanup
 loops. The portable `std/http`, `std/http/client`, `std/http/connection`,
 `std/web`, and `std/web/server` APIs remain independently usable.
@@ -47,26 +47,37 @@ fn main() -> i32 {
 
 Save this companion as `server_example.dodo`; it needs no files, credentials,
 external libraries beyond the target C runtime, or Internet service. The route
-and text literal are borrowed; the three arrays bound protocol and body storage:
+and handler live in a server object with bounded default protocol and body storage:
 
 ```dodo
 package server_example
 import "std/console"
 import "std/web"
-import "std/web/hosted"
+import "std/web/application"
+import "std/web/app"
 
+pub struct Hello {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.text(b"Hello, Dodo!\n")
+    }
+}
 fn main() -> i32 {
-    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
-    handler := hosted.Text.new(b"Hello, Dodo!\n")
-    workspace := [0u8; hosted.WORKSPACE_BYTES]
-    request := [0u8; 4096]
-    response := [0u8; 4096]
-    match hosted.serve(b"127.0.0.1:8080", &routes, &mut handler,
-        &mut workspace, &mut request, &mut response, hosted.Config.defaults()) {
-        ok(report) => { if report.failed != 0 { return 2 }; return 0 }
+    routes := application.new().get(b"/", Hello {})!
+    server := app.Server.new(routes)
+    server.config.max_connections = 0 // Serve until stopped; tests set a finite count.
+    match server.serve(b"127.0.0.1:8080") {
+        ok(report) => {
+            if report.failed != 0 {
+                return 2
+            };
+            return 0
+        }
         err(reason) => {
             errors := console.stderr()
-            match errors.println(&reason) { ok(_) => {} err(_) => {} }
+            match errors.println(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
             return 1
         }
     }
@@ -232,6 +243,9 @@ cancellation is required. Zero timeout durations are rejected.
 
 ## Serial server, handlers, and shutdown
 
+Start with [`app.Server`](web.md#configuration-and-storage) for automatic route
+registration, grouped configuration, bounded default buffers, and explicit
+serial or concurrent execution. The lower-level
 `web/hosted.serve(address, routes, handler, workspace, request_body,
 response_body, config)` parses a numeric bind address, validates the router,
 binds one listener, and accepts repeated connections. It handles one request
@@ -271,7 +285,7 @@ The reactor requires this workspace per slot. Buffers never grow.
 | `path_bytes` | 2,048; configurable downward, nonzero |
 | `query_bytes`, `query_fields` | 2,048 / 100; configurable downward, including zero |
 | `response_header_bytes`, `response_header_fields` | 4,096 / 32; configurable downward, including zero |
-| `body_bytes`, `response_bytes` | 65,536 each; effective cap is also bounded by the supplied body arrays |
+| `body_bytes`, `response_bytes` | 65,536 each in `hosted.Config` (4,096 in `app.Config`); effective cap is also bounded by the supplied body arrays |
 
 Header field limits include application-added defaults such as Content-Type;
 the generated Connection and Content-Length do not consume application header

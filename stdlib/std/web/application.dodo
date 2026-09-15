@@ -1,0 +1,59 @@
+package application
+
+import "std/web"
+
+// Fixed registration storage. Handler values are owned inline in a typed chain.
+pub const ROUTE_CAPACITY: usize = 8
+pub struct Table {
+    entries: [8]web.Route
+    count: usize
+    pub fn routes(&self) -> &[web.Route] {
+        return &self.entries[..self.count]
+    }
+}
+pub struct Empty {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return err(web.failure(web.Error.NotFound))
+    }
+}
+pub struct Handlers<A, H> {
+    previous: A
+    current: H
+    id: usize
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        if request.route_id == self.id {
+            return web.handle(&mut self.current, request, response)
+        }
+        return self.previous.handle(request, response)
+    }
+}
+pub struct Application<H> {
+    pub table: Table
+    pub handler: H
+    // Registration consumes the previous application because each handler can
+    // have a different type. No function values, erasure, or allocation.
+    pub fn route<N>(self, method: &[u8], pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, method, pattern, handler) {
+        if self.table.count == ROUTE_CAPACITY {
+            return err(web.Error.BufferFull)
+        }
+        id := self.table.count
+        self.table.entries[id] = web.Route { method: method, pattern: pattern, id: id }
+        self.table.count += 1
+        router := web.Router.new(self.table.routes())?
+        core.drop(router)
+        let Application { table: table, handler: previous } = self
+        return ok(Application { table: table, handler: Handlers { previous: previous, current: handler, id: id } })
+    }
+    pub fn get<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
+        return self.route(b"GET", pattern, handler)
+    }
+    pub fn post<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
+        return self.route(b"POST", pattern, handler)
+    }
+}
+fn empty_route() -> web.Route from(static) {
+    return web.Route { method: b"", pattern: b"", id: 0 }
+}
+pub fn new() -> Application<Empty> from(static) {
+    return Application { table: Table { entries: [empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route()], count: 0 }, handler: Empty {} }
+}

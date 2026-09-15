@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `std/web/app.Server` with bounded default storage, grouped limits and
+  timeouts, custom buffers, cooperative cancellation, and explicit serial or
+  concurrent execution. Add portable named-handler registration without manual
+  route IDs; update the server examples and add a three-route HTML/parameter demo.
+
 - Remove `std/text_unicode` and its Unicode data license notice. Text trimming
   uses the ASCII rules in `Text.trim_ascii`.
 - Add postfix `!` to unwrap a Result or panic on error, preserving `?` for

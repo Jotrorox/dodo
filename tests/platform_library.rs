@@ -85,7 +85,7 @@ fn protocol_imports_remain_portable_and_backends_link_independently() {
         std::env::temp_dir().join(format!("dodo-protocol-imports-{}", std::process::id()));
     fs::create_dir_all(&scratch).unwrap();
     let source = scratch.join("portable.dodo");
-    fs::write(&source, "package portable\nimport \"std/net\"\nimport \"std/net/dns\"\nimport \"std/tls\"\nimport \"std/http\"\nimport \"std/web\"\nimport \"std/web/server\"\nimport \"std/web/response\"\nfn main() {}\n").unwrap();
+    fs::write(&source, "package portable\nimport \"std/net\"\nimport \"std/net/dns\"\nimport \"std/tls\"\nimport \"std/http\"\nimport \"std/web\"\nimport \"std/web/server\"\nimport \"std/web/application\"\nimport \"std/web/response\"\nfn main() {}\n").unwrap();
     for target in [
         "x86_64-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",

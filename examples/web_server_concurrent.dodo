@@ -1,19 +1,19 @@
 package web_server_concurrent
 import "std/console"
 import "std/web"
-import "std/web/hosted"
-import "std/web/reactor"
+import "std/web/application"
+import "std/web/app"
 
+pub struct Hello {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.text(b"Hello, Dodo!\n")
+    }
+}
 fn main() -> i32 {
-    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
-    handler := hosted.Text.new(b"Hello, Dodo!\n")
-    slots := reactor.slots()
-    workspace := [0u8; reactor.WORKSPACE_BYTES *8]
-    request := [0u8; 4096 *8]
-    response := [0u8; 4096 *8]
-    config := reactor.Config.defaults()
-    match reactor.serve(b"127.0.0.1:8080", &routes, &mut handler, &mut slots,
-    &mut workspace, &mut request, &mut response, config) {
+    routes := application.new().get(b"/", Hello {})!
+    server := app.Server.new(routes)
+    server.config.execution = app.Execution.Concurrent
+    match server.serve(b"127.0.0.1:8080") {
         ok(report) => {
             if report.failed != 0 {
                 return 2
