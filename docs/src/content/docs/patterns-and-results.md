@@ -11,9 +11,9 @@ for the copy, move, and cleanup rules these operations preserve.
 
 ## Handle every Result
 
-A `Result` must be forwarded, propagated, or matched with explicit `ok` and `err`
-arms. Binding it and leaving scope, overwriting it unhandled, assigning it to
-`_`, or passing it to `core.drop` is rejected.
+A `Result` must be forwarded, propagated with `?`, unwrapped with `!`, or matched
+with explicit `ok` and `err` arms. Binding it and leaving scope, overwriting it
+unhandled, assigning it to `_`, or passing it to `core.drop` is rejected.
 
 After matching by reference, replacing the whole owned binding creates a fresh
 handling obligation. Assignments of Result-containing values through a field,
@@ -22,6 +22,33 @@ the checker cannot transfer their handling state to the storage owner. Matching
 plain payloads through `&mut` still permits mutation of non-Result data. The
 [container element design](container-elements.md) explains why storing and
 destroying pending Results needs additional checker support.
+
+## Unwrap or panic with `!`
+
+Postfix `!` evaluates a Result once and produces its success value. On error it
+panics at the expression's source location using the configured panic handler.
+It works in any function, including `fn main()`:
+
+```dodo test
+package main
+
+import "std/console"
+
+fn main() {
+    console.println("Hello, world!")!
+}
+```
+
+`?` instead returns the error from the enclosing function, which must return a
+Result with the same error type. `!` never propagates: panic terminates execution
+without unwinding or running destructors. On success, `!` consumes the Result
+and preserves the payload's ownership and borrow dependencies. A nested Result
+still needs handling. A `void` success payload produces no value.
+
+Postfix `!` has the same precedence as `?` and supports chaining, for example
+`nested()!!` or `read()!.field` when the payload is a reference. Bind an owned
+array or struct payload to a local before indexing or accessing its fields.
+Prefix `!flag` remains Boolean negation; `T!E` remains Result type shorthand.
 
 ## Match patterns and guards
 

@@ -334,7 +334,8 @@ impl HoverIndex<'_> {
             | ExprKind::Unary(_, value)
             | ExprKind::Field(value, _)
             | ExprKind::Cast(value, _)
-            | ExprKind::Try(value) => self.expression(value),
+            | ExprKind::Try(value)
+            | ExprKind::Unwrap(value) => self.expression(value),
             ExprKind::Binary(_, left, right)
             | ExprKind::Index(left, right)
             | ExprKind::Range(left, right) => {
@@ -655,6 +656,29 @@ mod tests {
                 .unwrap()
                 .contains("i32")
         );
+    }
+
+    #[test]
+    fn postfix_unwrap_retains_operand_hover_and_payload_type() {
+        let document = Document::new(
+            "package test\nfn read(value: i32) -> i32!u8 { ok(value) }\nfn main() { number := read(42)! }\n".into(),
+        );
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        for (needle, expected) in [
+            ("number :=", "number: i32"),
+            ("read(42)", "read(value: i32)"),
+        ] {
+            assert!(
+                hover_at(&document, needle)["contents"]["value"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected)
+            );
+        }
     }
 
     #[test]

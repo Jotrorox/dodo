@@ -424,6 +424,109 @@ fn hello_uses_safe_hosted_console() {
 }
 
 #[test]
+fn postfix_unwrap_success_chaining_and_evaluation_order() {
+    native_at_all_levels(
+        r#"package unwrap
+struct Cell<T> {
+    value: T
+    fn read(self) -> T!u8 { ok(self.value) }
+}
+fn identity<T>(value: T) -> T { value }
+fn once(count: &mut i32) -> i32!u8 {
+    *count += 1
+    ok(*count)
+}
+fn done() -> void!u8 { ok() }
+fn nested() -> Result<Result<i32, u8>, bool> { ok(ok(7)) }
+fn propagate_inner() -> i32!u8 { ok(nested()!?) }
+fn propagate_outer() -> i32!bool { ok(nested()?!) }
+fn view(value: &mut i32) -> &mut i32!u8 from(value) { ok(value) }
+fn main() {
+    count := 0i32
+    assert_eq(once(&mut count)! + once(&mut count)!, 3)
+    assert_eq(count, 2)
+    pending := done()
+    done()!
+    pending!
+    assert_eq(identity(Cell<i32>{value: 42}.read()!), 42)
+    assert_eq(nested()!!, 7)
+    assert_eq(propagate_inner()!, 7)
+    assert_eq(propagate_outer()!, 7)
+    array: [2]u8!bool = ok([4, 9])
+    values := array!
+    slice: &[u8]!bool = ok(&values[..])
+    assert_eq(slice![1], 9u8)
+    result: Cell<i32>!u8 = ok(Cell<i32>{value: 6})
+    cell := result!
+    borrowed: &Cell<i32>!u8 = ok(&cell)
+    assert_eq(borrowed!.value, 6)
+    flag: bool!u8 = ok(false)
+    assert(!flag!)
+    assert(once(&mut count)! != 0)
+    reference := view(&mut count)!
+    *reference += 1
+    assert_eq(count, 4)
+}
+"#,
+        0,
+        "",
+    );
+}
+
+#[test]
+fn postfix_unwrap_preserves_payload_ownership_and_cleanup() {
+    let source = format!(
+        "package unwrap_cleanup\n{DROP_TYPE}\n{}",
+        r#"fn make(character: i32) -> Guard!u8 { ok(Guard{character}) }
+fn consume(value: Guard) {}
+fn main() {
+    result := make(65)
+    owned := result!
+    consume(owned)
+    make(66)!
+    remaining := make(67)!
+}
+"#
+    );
+    native_at_all_levels(&source, 0, "ABC");
+}
+
+#[test]
+fn postfix_unwrap_rejects_invalid_types_moves_and_borrows() {
+    for (source, message) in [
+        ("fn f() { 1! }", "postfix `!` requires a Result"),
+        ("fn f() { true! }", "postfix `!` requires a Result"),
+        (
+            "fn f(x: Option<i32>) { x! }",
+            "postfix `!` requires a Result",
+        ),
+        (
+            "fn f(x: &Result<i32, u8>) { x! }",
+            "postfix `!` requires a Result",
+        ),
+        ("fn f(x: i32!u8) { x!\nx! }", "moved"),
+        (
+            "fn f(x: Result<Result<i32, u8>, bool>) { x! }",
+            "Result must be handled",
+        ),
+        (
+            "fn f(x: i32!u8) { r := &x\nx!\nmatch r { ok(_) => {}, err(_) => {} } }",
+            "borrow",
+        ),
+        (
+            "fn view(x: &i32) -> &i32!u8 from(x) { ok(x) }\nfn f() -> &i32 from(static) { x := 1i32\nview(&x)! }",
+            "local",
+        ),
+        (
+            "fn view(x: &mut i32) -> &mut i32!u8 from(x) { ok(x) }\nfn f() { x := 1i32\nr := view(&mut x)!\nx = 2\n_ = *r }",
+            "borrow",
+        ),
+    ] {
+        rejects(&format!("package invalid\n{source}\n"), message);
+    }
+}
+
+#[test]
 fn specification_samples_returns_131() {
     native_at_all_levels(include_str!("../examples/samples.dodo"), 131, "");
 }

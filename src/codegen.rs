@@ -1499,32 +1499,38 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let v = self.expr(x)?;
                 self.cast(v, &x.ty, t)?
             }
-            ExprKind::Try(x) => {
+            ExprKind::Try(x) | ExprKind::Unwrap(x) => {
+                let propagate = matches!(e.kind, ExprKind::Try(_));
+                let operation = if propagate { "propagate" } else { "unwrap" };
                 let v = self.expr(x)?;
                 let Type::Result(success, failure) = &x.ty else {
-                    return Err(error("propagation requires a Result"));
+                    return Err(error(format!("{operation} requires a Result")));
                 };
                 let st = v.get_type();
-                let ptr = self.alloca(st, "propagate.value")?;
+                let ptr = self.alloca(st, &format!("{operation}.value"))?;
                 self.builder.build_store(ptr, v)?;
                 let p = self.builder.build_struct_gep(st, ptr, 1, "payload")?;
                 let tag = self.builder.build_extract_value(v, 0, "is.error")?;
-                let err = self.bb("propagate.error");
-                let ok = self.bb("propagate.ok");
+                let err = self.bb(&format!("{operation}.error"));
+                let ok = self.bb(&format!("{operation}.ok"));
                 self.builder.build_conditional_branch(tag, err, ok)?;
                 self.builder.position_at_end(err);
-                let payload = if **failure == Type::Void {
-                    None
+                if propagate {
+                    let payload = if **failure == Type::Void {
+                        None
+                    } else {
+                        Some(self.load(p, failure)?)
+                    };
+                    let ret = self.tagged_value(
+                        self.ty(&self.return_type)?,
+                        self.context.bool_type().const_int(1, false),
+                        payload,
+                    )?;
+                    self.cleanup_to(0)?;
+                    self.builder.build_return(Some(&ret))?;
                 } else {
-                    Some(self.load(p, failure)?)
-                };
-                let ret = self.tagged_value(
-                    self.ty(&self.return_type)?,
-                    self.context.bool_type().const_int(1, false),
-                    payload,
-                )?;
-                self.cleanup_to(0)?;
-                self.builder.build_return(Some(&ret))?;
+                    self.panic("result unwrap")?;
+                }
                 self.builder.position_at_end(ok);
                 if **success == Type::Void {
                     self.context.i8_type().const_zero()

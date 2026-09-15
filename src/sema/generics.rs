@@ -786,7 +786,7 @@ impl Expander {
                             .collect::<Vec<_>>(),
                     )
                 }),
-            ExprKind::Try(e) => self.guess(e).and_then(|t| {
+            ExprKind::Try(e) | ExprKind::Unwrap(e) => self.guess(e).and_then(|t| {
                 if let Type::Result(t, _) = t {
                     Some(*t)
                 } else {
@@ -1319,7 +1319,7 @@ impl Expander {
                     _ => Type::Unknown,
                 }
             }
-            ExprKind::Try(value) => {
+            ExprKind::Try(value) | ExprKind::Unwrap(value) => {
                 let actual = self.expression(value, substitutions, None)?;
                 if let Type::Result(t, _) = actual {
                     *t

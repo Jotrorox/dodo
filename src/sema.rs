@@ -1004,7 +1004,7 @@ impl<'a> Checker<'a> {
                     variable.span,
                     format!("Result `{}` is never handled", variable.name),
                 )
-                .note("match both variants, return the Result, or propagate it with `?`"));
+                .note("match both variants, return the Result, propagate it with `?`, or unwrap it with `!`"));
             }
         }
         for variable in self
@@ -2465,6 +2465,20 @@ impl<'a> Checker<'a> {
                     ));
                 }
             }
+            ExprKind::Unwrap(operand) => {
+                let value = self.expr(operand, None, true)?;
+                let Type::Result(success, _) = value.ty else {
+                    return Err(Diagnostic::new(span, "postfix `!` requires a Result value"));
+                };
+                Value {
+                    deps: if self.context.carries_borrow(&success) {
+                        value.deps
+                    } else {
+                        vec![]
+                    },
+                    ty: *success,
+                }
+            }
             ExprKind::Try(operand) => {
                 let value = self.expr(operand, None, true)?;
                 let (success, error) = match &value.ty {
@@ -2709,7 +2723,7 @@ impl<'a> Checker<'a> {
                     None
                 }
             }
-            ExprKind::Try(e) => self.peek_type(e).and_then(|t| match t {
+            ExprKind::Try(e) | ExprKind::Unwrap(e) => self.peek_type(e).and_then(|t| match t {
                 Type::Result(t, _) => Some(*t),
                 _ => None,
             }),
@@ -3011,6 +3025,7 @@ impl<'a> Checker<'a> {
             | ExprKind::String(..)
             | ExprKind::MethodCall { .. }
             | ExprKind::Slice { .. }
+            | ExprKind::Unwrap(_)
             | ExprKind::ValueBlock(..) => {
                 let value = self.expr(expression, None, false)?;
                 if !matches!(value.ty, Type::Ref(..) | Type::Slice(..) | Type::Str) {

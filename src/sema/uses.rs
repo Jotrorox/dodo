@@ -19,6 +19,7 @@ pub(super) fn names_expr(expression: &Expr, names: &mut HashMap<String, Span>) {
         | ExprKind::Field(e, _)
         | ExprKind::Cast(e, _)
         | ExprKind::Try(e)
+        | ExprKind::Unwrap(e)
         | ExprKind::Constant(e, _)
         | ExprKind::Repeat(e, _) => names_expr(e, names),
         ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
@@ -171,6 +172,7 @@ pub(super) fn binding_use_spans(function: &Function) -> HashMap<(usize, String),
                 | ExprKind::Field(e, _)
                 | ExprKind::Cast(e, _)
                 | ExprKind::Try(e)
+                | ExprKind::Unwrap(e)
                 | ExprKind::Constant(e, _)
                 | ExprKind::Repeat(e, _) => self.expr(e),
                 ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {

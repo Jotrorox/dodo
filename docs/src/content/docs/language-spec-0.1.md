@@ -105,7 +105,8 @@ and scheduling belong in libraries, rather than mandatory runtime services.
 - Checked references are non-null and statically borrow-checked.
 - Overlapping memory permits multiple shared readers or one mutable writer,
   never both while those accesses are live.
-- Errors are ordinary `Result` values. A call site marks propagation with `?`.
+- Errors are ordinary `Result` values. A call site marks propagation with `?`
+  or unwraps with `!` to panic on error.
 - Explicit `unsafe` syntax contains unchecked operations.
 - Explicit core-library primitives provide hardware access; ordinary mutable
   references must not be fabricated for device memory.
@@ -739,7 +740,7 @@ associate left; prefix operators nest right; postfix operations chain left.
 | 10 | `*`, `/`, `%` |
 | 11 | `as Type` |
 | 12 | Prefix `-`, `!`, `~`, `*`, `&`, `&mut` |
-| 13 | Calls, `.field`, `[index]`, subslices, postfix `?` |
+| 13 | Calls, `.field`, `[index]`, subslices, postfix `?` and `!` |
 
 Parentheses override precedence. `=` and the compound assignments `+=`, `-=`,
 `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=` are statements, not expressions.
@@ -995,8 +996,25 @@ translation explicitly matches a source error and constructs a destination error
 ### 12.4. Mandatory handling
 
 Discarding a `Result`, including through `_ =`, is a compile-time error. A
-program must forward it, propagate it, or explicitly handle both variants with
-`match`. An intentionally empty error arm counts as handling.
+program must forward it, propagate it, unwrap it with `!`, or explicitly handle
+both variants with `match`. An intentionally empty error arm counts as handling.
+
+### 12.5. Unwrap or panic
+
+A postfix `!` evaluates an owned `Result<T, E>` once and produces its `ok`
+payload of type `T`. An `err` triggers a `result unwrap` panic at the expression's
+source location using the selected panic strategy (ID-TRAP). Panic does not
+unwind or run destructors. Unlike `?`, `!` works in functions with any return
+type and does not return an error to the caller.
+
+The Result is consumed. On success, its payload retains ownership and borrow
+dependencies and is destroyed normally when its owner leaves scope. `void`
+success produces no value; a nested Result still requires handling. `!` has the
+same precedence as postfix `?` and chains with field access, indexing, and calls.
+Field access and indexing on an owned aggregate payload require binding it to
+a local first; reference and slice payloads can be accessed directly.
+Prefix `!` remains Boolean negation, and `!` in type syntax remains Result
+shorthand.
 
 ## 13. Unsafe code
 

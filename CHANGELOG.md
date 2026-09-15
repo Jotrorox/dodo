@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add postfix `!` to unwrap a Result or panic on error, preserving `?` for
+  propagation. Shorten hello world to a single console call in `fn main()`.
 - Update the Rust toolchain to 1.98.1 and the compiler backend to LLVM 23.1.1
   with llvm-sys 231.0.0. Source builds now use `LLVM_SYS_231_PREFIX`.
 - Update Rust and npm package dependencies, including TypeScript 7.

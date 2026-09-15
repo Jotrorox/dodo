@@ -16,17 +16,15 @@ it requires no global allocator or application unsafe code. `std/io` and
 package hello
 import "std/console"
 
-fn main() -> i32 {
-    match console.println("Hello, world!") {
-        ok(_) => { return 0 }
-        err(_) => { return 1 }
-    }
+fn main() {
+    console.println("Hello, world!")!
 }
 ```
 
 Save this as `main.dodo` and run `dodo run`. It prints `Hello, world!` followed
-by LF and returns exit status zero. Failure returns status one. Printing returns
-a Result and must be handled; fallible helper functions can propagate it with `?`.
+by LF and returns exit status zero. Printing returns a Result; postfix `!`
+unwraps success and panics on failure. Fallible helper functions can propagate
+errors with `?`, or use `match` to recover locally.
 
 ## Public API
 

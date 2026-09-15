@@ -449,6 +449,7 @@ pub enum ExprKind {
     Index(Box<Expr>, Box<Expr>),
     Cast(Box<Expr>, Type),
     Try(Box<Expr>),
+    Unwrap(Box<Expr>),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOp {

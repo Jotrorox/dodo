@@ -1124,7 +1124,8 @@ fn walk_expr(e: &Expr, stmt: &mut impl FnMut(&Stmt), expr: &mut impl FnMut(&Expr
         | ExprKind::Unary(_, e)
         | ExprKind::Field(e, _)
         | ExprKind::Cast(e, _)
-        | ExprKind::Try(e) => walk_expr(e, stmt, expr),
+        | ExprKind::Try(e)
+        | ExprKind::Unwrap(e) => walk_expr(e, stmt, expr),
         ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
             walk_expr(a, stmt, expr);
             walk_expr(b, stmt, expr);

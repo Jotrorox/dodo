@@ -1632,6 +1632,10 @@ impl Parser {
                     lhs = Expr::new(ExprKind::Try(Box::new(lhs)), self.since(start));
                     continue;
                 }
+                if self.eat("!") {
+                    lhs = Expr::new(ExprKind::Unwrap(Box::new(lhs)), self.since(start));
+                    continue;
+                }
                 if self.eat("[") {
                     self.soft_newlines += 1;
                     self.newlines();
@@ -2120,6 +2124,31 @@ mod tests {
         assert!(
             matches!(&value.kind, ExprKind::Binary(BinaryOp::Add, lhs, _) if matches!(&lhs.kind, ExprKind::Cast(inner, _) if matches!(inner.kind, ExprKind::Try(_))))
         );
+    }
+    #[test]
+    fn postfix_unwrap_precedence_and_newlines() {
+        let statements = body("f()! as u32 + 1\n!flag()!\nr!!\nleft != right\nr!\n!flag");
+        let expressions: Vec<_> = statements
+            .iter()
+            .map(|statement| match &statement.kind {
+                StmtKind::Expr(value) => &value.kind,
+                _ => panic!("expected expression"),
+            })
+            .collect();
+        assert_eq!(expressions.len(), 6);
+        assert!(
+            matches!(expressions[0], ExprKind::Binary(BinaryOp::Add, lhs, _)
+            if matches!(&lhs.kind, ExprKind::Cast(value, _) if matches!(value.kind, ExprKind::Unwrap(_))))
+        );
+        assert!(
+            matches!(expressions[1], ExprKind::Unary(UnaryOp::Not, value)
+            if matches!(value.kind, ExprKind::Unwrap(_)))
+        );
+        assert!(matches!(expressions[2], ExprKind::Unwrap(value)
+            if matches!(value.kind, ExprKind::Unwrap(_))));
+        assert!(matches!(expressions[3], ExprKind::Binary(BinaryOp::Ne, ..)));
+        assert!(matches!(expressions[4], ExprKind::Unwrap(_)));
+        assert!(matches!(expressions[5], ExprKind::Unary(UnaryOp::Not, _)));
     }
     #[test]
     fn all_for_forms() {

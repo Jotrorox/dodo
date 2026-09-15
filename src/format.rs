@@ -70,6 +70,7 @@ struct Plan<'a> {
     tokens: &'a [Token],
     edits: Vec<Edit>,
     binary: HashSet<usize>,
+    postfix: HashSet<usize>,
     literal_braces: HashSet<usize>,
     header_semicolons: HashSet<usize>,
 }
@@ -81,6 +82,7 @@ impl<'a> Plan<'a> {
             tokens,
             edits: Vec::new(),
             binary: HashSet::new(),
+            postfix: HashSet::new(),
             literal_braces: HashSet::new(),
             header_semicolons: HashSet::new(),
         }
@@ -387,6 +389,15 @@ impl<'a> Plan<'a> {
                 self.expression(left);
                 self.expression(right);
             }
+            ExprKind::Unwrap(value) => {
+                if let Some(token) = self
+                    .between(value.span.end, expression.span.end)
+                    .find(|token| matches!(token.kind, TokenKind::Symbol("!")))
+                {
+                    self.postfix.insert(token.span.start);
+                }
+                self.expression(value);
+            }
             ExprKind::Repeat(value, _)
             | ExprKind::Constant(value, _)
             | ExprKind::Unary(_, value)
@@ -588,6 +599,7 @@ fn render(source: &str, tokens: &[Token], plan: &Plan<'_>) -> String {
                     });
                     if !next.is_some_and(|(token, text)| {
                         plan.binary.contains(&token.span.start)
+                            || plan.postfix.contains(&token.span.start)
                             || matches!(
                                 text,
                                 "else" | "," | ";" | ")" | "]" | "." | "?" | "as" | "(" | "["
@@ -656,7 +668,9 @@ fn needs_space(
     if previous == "&" && text == "&" {
         return true;
     }
-    if matches!(previous, "&" | "*" | "!" | "~") {
+    if matches!(previous, "&" | "*" | "~")
+        || previous == "!" && !plan.postfix.contains(&before.span.start)
+    {
         return false;
     }
     if previous == "-" && !plan.binary.contains(&before.span.start) {
@@ -766,6 +780,23 @@ mod tests {
         formatted(
             "package p\nfn f(){x := a < b; y := a > b; z := -x * (*p + 2); a:=1; b:=2;for i:=0;i<10;i+=1{a+=i};for ;true;{}; a=[1;3][0];return}\n",
         );
+    }
+    #[test]
+    fn preserves_postfix_unwrap_and_boolean_negation() {
+        let output = formatted(
+            "package p\nfn f(r:i32!u8){a:=r!as i32;b:=!flag; c:=r!!; d:=r! != 2; e:=(r!) as i32; f:={r}!; g:=r!\n!flag\n}\n",
+        );
+        for text in [
+            "r! as i32",
+            "!flag",
+            "r!!",
+            "r! != 2",
+            "(r!) as i32",
+            "}!",
+            "r!\n    !flag",
+        ] {
+            assert!(output.contains(text), "missing {text}: {output}");
+        }
     }
     #[test]
     fn preserves_immutable_bindings_and_explicit_tail_semicolons() {

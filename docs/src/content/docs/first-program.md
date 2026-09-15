@@ -25,22 +25,19 @@ package main
 
 import "std/console"
 
-fn main() -> i32 {
-    match console.println("Hello, world!") {
-        ok(_) => { return 0 }
-        err(_) => { return 1 }
-    }
+fn main() {
+    console.println("Hello, world!")!
 }
 ```
 
 - `package main` names the package that contains this file.
 - `import "std/console"` loads safe hosted console I/O from the bundled library.
 - `fn main()` defines the function that runs when the program starts.
-- `-> i32` says that `main` returns a 32-bit integer.
 - `console.println("Hello, world!")` writes the greeting followed by a newline.
-- `match` handles the Result: `ok(_)` means all bytes were written; `err(_)` means
-  an I/O operation failed. `_` explicitly discards the count or error details.
-- `return 0` sets a success exit status; `return 1` reports failure.
+- Postfix `!` handles the Result: it unwraps the written byte count on success
+  and panics if printing fails. Use `?` in a Result-returning function to
+  propagate an error, or `match` to recover from it.
+- Reaching the end of `main` sets a success exit status.
 
 Braces surround the function body. Each statement can end at a newline, so this
 program needs no semicolons.
@@ -60,8 +57,8 @@ The program prints:
 Hello, world!
 ```
 
-Your terminal returns to its prompt when the program finishes. Returning `0`
-sets the exit status; it does not print the number. Console access supports
+Your terminal returns to its prompt when the program finishes. Completing
+`main` sets exit status `0`; it does not print the number. Console access supports
 Linux GNU x86-64 and Windows x64 and needs no unsafe code in your program.
 
 On a Linux shell, you can see that status by running this immediately afterward:

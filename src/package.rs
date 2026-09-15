@@ -878,9 +878,10 @@ impl Names<'_> {
                     self.expr(value, locals, generics);
                 }
             }
-            ExprKind::Unary(_, value) | ExprKind::Try(value) | ExprKind::Field(value, _) => {
-                self.expr(value, locals, generics)
-            }
+            ExprKind::Unary(_, value)
+            | ExprKind::Try(value)
+            | ExprKind::Unwrap(value)
+            | ExprKind::Field(value, _) => self.expr(value, locals, generics),
             ExprKind::Binary(_, left, right)
             | ExprKind::Index(left, right)
             | ExprKind::Range(left, right) => {
@@ -1116,6 +1117,7 @@ fn shift_expr(expression: &mut Expr, offset: usize) {
         }
         ExprKind::Unary(_, value)
         | ExprKind::Try(value)
+        | ExprKind::Unwrap(value)
         | ExprKind::Field(value, _)
         | ExprKind::Cast(value, _)
         | ExprKind::Constant(value, _)

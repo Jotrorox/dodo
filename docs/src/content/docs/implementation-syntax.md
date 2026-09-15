@@ -38,7 +38,8 @@ string allocation or mandatory NUL terminator.
 From lowest to highest, binary precedence is `||`, `&&`, `|`, `^`, `&`, equality
 (`==`, `!=`), ordering (`<`, `<=`, `>`, `>=`), shifts (`<<`, `>>`), addition and
 subtraction, multiplication/division/remainder, then `as`. Prefix operators
-bind more tightly, followed by calls, fields, indices, and propagation `?`.
+bind more tightly, followed by calls, fields, indices, propagation `?`, and
+unwrap-or-panic `!`.
 Binary operators associate left. Operands, call arguments, and literal fields
 are evaluated left to right; `&&` and `||` short-circuit. Compound assignment
 evaluates the destination address once, then its previous value, then the right

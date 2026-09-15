@@ -197,9 +197,10 @@ impl Resolver {
                 self.ty(t, locals, ns, e.span)?;
                 self.expr(v, locals, ns, constant)?;
             }
-            ExprKind::Unary(_, v) | ExprKind::Try(v) | ExprKind::Field(v, _) => {
-                self.expr(v, locals, ns, constant)?
-            }
+            ExprKind::Unary(_, v)
+            | ExprKind::Try(v)
+            | ExprKind::Unwrap(v)
+            | ExprKind::Field(v, _) => self.expr(v, locals, ns, constant)?,
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
                 self.expr(a, locals, ns, constant)?;
                 self.expr(b, locals, ns, constant)?;

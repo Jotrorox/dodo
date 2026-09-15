@@ -246,8 +246,9 @@ fn failures_name_checks_and_exact_locations_with_and_without_debug() {
         ("300.0f64 as u8", "numeric conversion"),
         ("values[index]", "index bounds"),
         ("values[0usize..index + 1usize]", "slice bounds"),
+        ("fail()!", "result unwrap"),
     ] {
-        let source = w.file("failure.dodo", &format!("package failure\nfn main() {{\n    values := [1i32, 2]\n    index := 2usize\n    _ = {expression}\n}}\n"));
+        let source = w.file("failure.dodo", &format!("package failure\nfn main() {{\n    values := [1i32, 2]\n    index := 2usize\n    _ = {expression}\n}}\nfn fail() -> i32!u8 {{ err(1) }}\n"));
         for level in ["0", "3"] {
             for debug in [false, true] {
                 let program = w.0.join("failure");
@@ -270,6 +271,50 @@ fn failures_name_checks_and_exact_locations_with_and_without_debug() {
 }
 
 #[test]
+fn postfix_unwrap_panics_without_propagation_cleanup_or_later_evaluation() {
+    let w = Workspace::new();
+    for (ty, statement) in [("i32", "_ = fail()! + later()"), ("void", "fail()!")] {
+        let source = w.file(
+            "unwrap.dodo",
+            &format!(
+                r#"package unwrap
+struct Sentinel {{
+    fn drop(self: &mut Self) {{ assert(false) }}
+}}
+fn fail() -> {ty}!Sentinel {{ err(Sentinel{{}}) }}
+fn later() -> i32 {{ assert(false)
+    1
+}}
+fn attempt() -> i32!bool {{
+    local := Sentinel{{}}
+    {statement}
+    assert(false)
+    ok(0)
+}}
+fn main() -> i32 {{
+    match attempt() {{ ok(_) => 71, err(_) => 72 }}
+}}
+"#
+            ),
+        );
+        for level in ["0", "3"] {
+            let program = w.0.join("unwrap");
+            w.build(&source, &program, &["-O", level]);
+            let output = Command::new(&program).output().unwrap();
+            assert!(!output.status.success());
+            let column = if ty == "void" { 5 } else { 9 };
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!(
+                    "dodo: result unwrap check failed at {}:11:{column}\n",
+                    source.display()
+                )
+            );
+        }
+    }
+}
+
+#[test]
 fn nonreturning_panic_hooks_receive_checks_and_assertion_locations() {
     let w = Workspace::new();
     let c = w.file(
@@ -285,8 +330,9 @@ fn nonreturning_panic_hooks_receive_checks_and_assertion_locations() {
         ("assert(false)", "assert", 5),
         ("assert_eq(1, 2, \"numbers differ\")", "assert_eq", 5),
         ("assert_ne(\"same\", \"same\")", "assert_ne", 5),
+        ("fail()!", "result unwrap", 5),
     ] {
-        let source = w.file("hook.dodo", &format!("package hook\nfn main() -> i32 {{\n    values := [1i32, 2]\n    index := 2usize\n    {statement}\n    return 0\n}}\n"));
+        let source = w.file("hook.dodo", &format!("package hook\nfn main() -> i32 {{\n    values := [1i32, 2]\n    index := 2usize\n    {statement}\n    return 0\n}}\nfn fail() -> i32!u8 {{ err(1) }}\n"));
         for level in ["0", "3"] {
             for debug in [false, true] {
                 let program = w.0.join("hook");
@@ -318,7 +364,7 @@ fn freestanding_checks_need_only_the_selected_hook() {
     let w = Workspace::new();
     let source = w.file(
         "board.dodo",
-        "package board\npub fn add(a:u32,b:u32)->u32 { return a+b }\npub fn verify(a:u32,b:u32) { assert(a > 0)\nassert_eq(a, b)\nassert_ne(a, 0) }\n",
+        "package board\npub fn add(a:u32,b:u32)->u32 { return a+b }\npub fn verify(a:u32,b:u32) { assert(a > 0)\nassert_eq(a, b)\nassert_ne(a, 0) }\npub fn unwrap(value: u32!u8) -> u32 { value! }\n",
     );
     for target in ["thumbv7em-none-eabi", "wasm32-unknown-unknown"] {
         for level in ["0", "3"] {

@@ -25,11 +25,8 @@ package main
 
 import "std/console"
 
-fn main() -> i32 {
-    match console.println("Hello, world!") {
-        ok(_) => { return 0 }
-        err(_) => { return 1 }
-    }
+fn main() {
+    console.println("Hello, world!")!
 }
 ```
 
@@ -41,7 +38,8 @@ dodo run
 
 The program prints `Hello, world!` and exits successfully. `console.println`
 returns a Result: `ok` reports the written byte count, and `err` reports an I/O
-failure. The example returns exit status 1 if printing fails. A project needs
+failure. Postfix `!` unwraps success or panics if printing fails; `?` propagates
+errors from functions returning a Result. A project needs
 only `main.dodo`: no manifest, lockfile, or package manager. Put shared code in
 ordinary subfolders and import it by path.
 The [first program guide](https://jotrorox.github.io/dodo/first-program/)
