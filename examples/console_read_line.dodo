@@ -27,13 +27,11 @@ fn run() -> void!io.Error {
     }
     match text.Text.new(&storage[..length]) {
         ok(name) => {
-            console.print("Hello, ")?
-            console.print(name.as_str())?
-            console.println("!")?
+            console.printf("Hello, {}!\n", name.as_str())?
         }
         err(reason) => {
             errors := console.stderr()
-            errors.println_value(&reason)?
+            errors.println(&reason)?
         }
     }
     return ok()
@@ -45,7 +43,7 @@ fn main() -> i32 {
         }
         err(reason) => {
             errors := console.stderr()
-            match errors.println_value(&reason) {
+            match errors.println(&reason) {
                 ok(_) => {}, err(_) => {}
             }
             return 1

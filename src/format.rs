@@ -720,6 +720,17 @@ mod tests {
         result
     }
     #[test]
+    fn preserves_printing_prototypes_and_literal_formats() {
+        let source = r#"package formatting
+@compiler(printf)
+pub fn printf<W>(sink: &mut W, format: &str) -> usize!io.Error
+fn main(){console.printf("{{{:08x}}} {}\n",42,true)!}
+"#;
+        let output = formatted(source);
+        assert!(output.contains("@compiler(printf)"));
+        assert!(output.contains(r#""{{{:08x}}} {}\n""#));
+    }
+    #[test]
     fn migrates_declarations_and_generic_calls() {
         let output = formatted(
             "package p\nconst u32 LIMIT=3\nstruct Box<T>{pub T value}\nenum E{Some(u8 value),Other(code:u32),Plain(u8)}\nfn id<T>(value:T)->T{return value}\nfn main(){u32 total=0;const u8 n=1;result:=id<u32>(total)}\n",

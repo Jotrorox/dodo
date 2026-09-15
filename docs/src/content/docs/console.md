@@ -32,17 +32,16 @@ errors with `?`, or use `match` to recover locally.
 | --- | --- |
 | `console.stdin()` | `console.Input`, a borrowed standard input wrapper. |
 | `console.stdout()`, `console.stderr()` | `console.Output`, a borrowed standard output/error wrapper. |
-| `console.print(text: &str)` | `usize!io.Error`, all UTF-8 bytes to stdout. |
-| `console.println(text: &str)` | Same, followed by one LF, even for empty text. |
-| `console.print_value(value: &T)` | `usize!io.Error`, custom or wrapped primitive formatting to stdout. |
-| `console.println_value(value: &T)` | Same, followed by one LF. |
-| `Output.print`, `println`, `print_value`, `println_value` | The same operations on the selected output, including stderr. |
+| `console.print(value)` | `usize!io.Error`, automatic primitive or custom formatting to stdout. |
+| `console.println(value)` | Same, followed by one LF, even for empty text. |
+| `console.printf("literal", args...)` | Compile-time checked placeholders and heterogeneous arguments. No implicit LF. |
+| `Output.print`, `println`, `printf` | The same operations on the selected output, including stderr. |
 | `Input.read(&mut[u8])` | `usize!io.Error`, the structural reader contract. |
 | `Output.write(&[u8])` | `usize!io.Error`, the structural writer contract; short writes are allowed. |
 | `Input.read_line(&mut[u8])` | `io.Line!io.Error`, bounded line input. |
 | `io.read_line(&mut reader, &mut[u8])` | The same portable algorithm for any structural reader. |
-| `fmt.print(&mut writer, text)`, `fmt.println(&mut writer, text)` | The text helpers for any structural writer. |
-| `fmt.value(&mut writer, &value)`, `fmt.value_line(&mut writer, &value)` | The value helpers for any structural writer. |
+| `fmt.print(&mut writer, value)`, `fmt.println(&mut writer, value)` | The same operations for any structural writer. |
+| `fmt.printf(&mut writer, "literal", args...)` | The same checked formatting for any structural writer. |
 
 Printing completes short writes and retries interruptions. On failure,
 `Error.transferred` counts all bytes emitted by that call, including partial
@@ -53,44 +52,46 @@ stream. Output is unbuffered, so prompts do not require a flush.
 
 ## Print values
 
-Wrap primitives explicitly with `std/fmt`; Dodo specializes ordinary generics
-and does not require primitive methods or format-string syntax:
+Pass values directly. No primitive wrappers or widening casts are needed:
 
 ```dodo test
-package print_value
+package printing
 import "std/console"
-import "std/fmt"
 
-fn main() -> i32 {
-    value := fmt.signed(42)
-    match console.println_value(&value) {
-        ok(_) => { return 0 }
-        err(_) => { return 1 }
-    }
+fn main() {
+    console.println(42)!
+    console.printf("Answer: {}, enabled: {}\n", 42, true)!
+    console.stderr().printf("Status: {}\n", "ready")!
 }
 ```
 
-| Wrapper | Default rendering |
+| Value | Default rendering |
 | --- | --- |
-| `fmt.signed(i64)` | Decimal integer, minus sign only for negative values. |
-| `fmt.unsigned(u64)` | Decimal integer. |
-| `fmt.boolean(bool)` | `true` or `false`. |
-| `fmt.floating(f64)` | Scientific notation with six fraction digits, such as `1.250000e+00`. |
-| `fmt.codepoint(u32)` | One UTF-8 Unicode scalar; invalid scalars return `InvalidInput`. |
+| All signed and unsigned integers | Decimal integer; a minus sign for negatives. |
+| `bool` | `true` or `false`. |
+| `&str` | UTF-8 bytes, unchanged. |
+| `f32`, `f64` | Scientific notation with six fraction digits, such as `1.250000e+00`. |
+| `fmt.codepoint(u32)` or `printf("{:c}", scalar)` | One UTF-8 scalar; invalid scalars return `InvalidInput`. |
 
-Widen smaller integers or `f32` with `as`. Integer formatting supports the full
-64-bit ranges. Floats round to nearest, ties to even; negative zero retains its
-sign, infinities print `inf`/`-inf`, and NaNs print `nan` without payloads.
-Use `fmt.Formatter` for width, radix, alignment, float style, and precision;
-see the [formatting reference](formatting.md). Custom values implement
+Integer formatting supports the full 64-bit ranges. Floats round to nearest,
+ties to even; negative zero retains its sign, infinities print `inf`/`-inf`,
+and NaNs print `nan` without payloads. References to printable values also work.
+Custom values implement
 `pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error`.
+Passing a custom value place borrows it; passing a temporary formats and then
+drops it. The borrow checker protects both arguments and the destination.
+
+`print` and `println` do not interpret braces in strings. `printf` requires a
+literal: `{}` consumes the next argument; `{{` and `}}` emit literal braces.
+The compiler checks syntax, argument count, and each argument's formatting
+options. See [formatting options and evaluation](formatting.md#checked-format-strings).
 
 Run `dodo run examples/console_formatting.dodo` from the source checkout to see
 text, an integer, a boolean, and a floating value.
 
 ## Report an error
 
-Use `errors := console.stderr()` and `errors.println_value(&reason)` to format
+Use `errors := console.stderr()` and `errors.println(&reason)` to format
 I/O, platform, text, network, TLS, or HTTP errors directly. For example, a closed
 stream may print `io: Closed code=9 transferred=0`. The native platform domain
 is errno on Linux and GetLastError on Windows; a library-generated code is zero.

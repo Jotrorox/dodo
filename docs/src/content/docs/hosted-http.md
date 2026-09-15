@@ -38,7 +38,7 @@ fn main() -> i32 {
         ok(code) => { return code }
         err(reason) => {
             errors := console.stderr()
-            match errors.println_value(&reason) { ok(_) => {} err(_) => {} }
+            match errors.println(&reason) { ok(_) => {} err(_) => {} }
             return 1
         }
     }
@@ -66,7 +66,7 @@ fn main() -> i32 {
         ok(report) => { if report.failed != 0 { return 2 }; return 0 }
         err(reason) => {
             errors := console.stderr()
-            match errors.println_value(&reason) { ok(_) => {} err(_) => {} }
+            match errors.println(&reason) { ok(_) => {} err(_) => {} }
             return 1
         }
     }

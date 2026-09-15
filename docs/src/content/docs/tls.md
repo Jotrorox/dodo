@@ -97,7 +97,7 @@ fn main() -> i32 {
                 ok(code) => { return code },
                 err(reason) => {
                     errors := console.stderr()
-                    match errors.println_value(&reason) {
+                    match errors.println(&reason) {
                         ok(_) => {}, err(_) => {},
                     }
                     return 1

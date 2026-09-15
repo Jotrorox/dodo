@@ -273,6 +273,8 @@ pub struct Function {
     pub public: bool,
     pub unsafe_: bool,
     pub extern_: bool,
+    /// Reserved printing entry points; retained on fixed helpers for editor signatures.
+    pub printing: Option<Printing>,
     pub generics: Vec<String>,
     /// Compiler-generated specialization: declared borrow sources may become
     /// borrow-free after type substitution and then contribute no dependencies.
@@ -288,6 +290,12 @@ pub struct Function {
     pub from_span: Option<Span>,
     pub body: Option<Block>,
     pub span: Span,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Printing {
+    Print,
+    Println,
+    Printf,
 }
 #[derive(Clone, Debug)]
 pub struct Param {

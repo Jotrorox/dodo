@@ -50,7 +50,7 @@ fn main() -> i32 {
         err(reason) => {
             if reason.kind == hosting.ErrorKind.BodyLimit { return 4 }
             errors := console.stderr()
-            match errors.println_value(&reason) {
+            match errors.println(&reason) {
                 ok(_) => {}, err(_) => {},
             }
             return 1

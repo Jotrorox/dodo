@@ -42,7 +42,7 @@ fn main() -> i32 {
         err(reason) => {
             if reason.cause.kind == error.Kind.NotFound { return 4 }
             errors := console.stderr()
-            match errors.println_value(&reason.cause) {
+            match errors.println(&reason.cause) {
                 ok(_) => {}, err(_) => {},
             }
             return 1

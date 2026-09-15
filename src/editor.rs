@@ -186,6 +186,9 @@ impl HoverIndex<'_> {
 
     fn program(&mut self) {
         for function in &self.program.functions {
+            if function.printing.is_some() && function.generic_instance {
+                continue;
+            }
             let markdown = signature(function);
             if let Some(span) = self.name_span(function.span, short_name(&function.name)) {
                 self.add(span, markdown.clone());
@@ -419,13 +422,39 @@ fn short_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn signature(function: &Function) -> String {
-    let params = function
+// Printing prototypes describe the source API, including the compiler-checked
+// heterogeneous argument tail; lowered helpers must not expose synthetic names.
+fn display_parameters(function: &Function) -> Vec<String> {
+    if let Some(operation) = function.printing {
+        let mut params = vec![];
+        if let Some(p) = function.params.first().filter(|p| {
+            matches!(
+                p.name.strip_prefix("$print_").unwrap_or(&p.name),
+                "sink" | "self"
+            )
+        }) {
+            params.push(format!(
+                "{}: {}",
+                p.name.strip_prefix("$print_").unwrap_or(&p.name),
+                p.ty
+            ));
+        }
+        if operation == Printing::Printf {
+            params.extend(["format: &str".into(), "args...".into()]);
+        } else {
+            params.push("value: T".into());
+        }
+        return params;
+    }
+    function
         .params
         .iter()
         .map(|p| format!("{}: {}", p.name, p.ty))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect()
+}
+
+fn signature(function: &Function) -> String {
+    let params = display_parameters(function).join(", ");
     let from = if function.from.is_empty() {
         String::new()
     } else {
@@ -452,10 +481,17 @@ fn signature(function: &Function) -> String {
     let mut markdown = code(&format!(
         "{}fn {}({params}) -> {}{from}{stores}{requires}",
         if function.unsafe_ { "unsafe " } else { "" },
-        function.name,
+        function.name.split("$print").next().unwrap(),
         function.ret
     ));
-    if let Some(receiver) = function.params.first().filter(|p| p.name == "self") {
+    if function.printing == Some(Printing::Printf) {
+        markdown.push_str("\n\nLiteral format checked at compile time. `{}` consumes an argument; `{{` and `}}` escape braces. Arguments evaluate once, left to right, before output.");
+    }
+    if let Some(receiver) = function
+        .params
+        .first()
+        .filter(|p| p.name == "self" || p.name == "$print_self")
+    {
         markdown.push_str(match receiver.ty {
             Type::Ref(false, _) => "\n\nReceiver: shared borrow (`&self`).",
             Type::Ref(true, _) => "\n\nReceiver: mutable borrow (`&mut self`).",

@@ -41,7 +41,7 @@ pub struct Partial {
 fn equal<T>(value: &T, expected: &[u8]) -> void!io.Error {
     storage := [0u8; 512]
     sink := io.MemoryWriter.new(&mut storage)
-    count := fmt.value(&mut sink, value)?
+    count := fmt.print(&mut sink, value)?
     assert(count == expected.len && raw.equal(sink.written(), expected))
     return ok()
 }
@@ -51,30 +51,30 @@ fn from_bits(bits: u64) -> f64 {
     }
 }
 fn verify() -> void!io.Error {
-    a := fmt.signed(-9223372036854775807 - 1)
+    a := -9223372036854775807i64 - 1
     equal(&a, b"-9223372036854775808")?
-    b := fmt.unsigned(18446744073709551615)
+    b := 18446744073709551615u64
     equal(&b, b"18446744073709551615")?
-    c := fmt.boolean(true)
+    c := true
     equal(&c, b"true")?
-    d := fmt.boolean(false)
+    d := false
     equal(&d, b"false")?
-    e := fmt.floating(1.25)
+    e := 1.25
     equal(&e, b"1.250000e+00")?
-    f := fmt.floating(-0.0)
+    f := -0.0
     equal(&f, b"-0.000000e+00")?
-    g := fmt.floating(from_bits(0x7ff0000000000000))
+    g := from_bits(0x7ff0000000000000)
     equal(&g, b"inf")?
-    h := fmt.floating(from_bits(0xfff8000000000001))
+    h := from_bits(0xfff8000000000001)
     equal(&h, b"nan")?
     i := fmt.codepoint(233)
     equal(&i, b"\xc3\xa9")?
-    j := fmt.signed(0)
+    j := 0
     equal(&j, b"0")?
-    k := fmt.floating(from_bits(1))
+    k := from_bits(1)
     equal(&k, b"4.940656e-324")?
     small: i8 = -7
-    wide := fmt.signed(small as i64)
+    wide := small as i64
     equal(&wide, b"-7")?
     issue := io.Error { kind: io.ErrorKind.BrokenPipe, transferred: 3, code: 32 }
     equal(&issue, b"io: BrokenPipe code=32 transferred=3")?
@@ -125,7 +125,7 @@ fn verify() -> void!io.Error {
     {
         sink := io.MemoryWriter.new(&mut storage)
         invalid := fmt.codepoint(0xd800)
-        match fmt.value_line(&mut sink, &invalid) {
+        match fmt.println(&mut sink, &invalid) {
             ok(_) => {
                 assert(false)
             }
@@ -153,8 +153,8 @@ fn verify() -> void!io.Error {
     }
     {
         sink := Partial { storage: &mut storage, used: 0, calls: 0, stop: 2, zero: true }
-        number := fmt.signed(123)
-        match fmt.value_line(&mut sink, &number) {
+        number := 123
+        match fmt.println(&mut sink, &number) {
             ok(_) => {
                 assert(false)
             }
@@ -170,7 +170,7 @@ fn verify() -> void!io.Error {
     }
     {
         sink := io.MemoryWriter.new(&mut storage[..2])
-        match fmt.value(&mut sink, &issue) {
+        match fmt.print(&mut sink, &issue) {
             ok(_) => {
                 assert(false)
             }

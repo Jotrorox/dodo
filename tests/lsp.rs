@@ -1976,3 +1976,43 @@ fn lsp_internal_notification_validation_is_atomic_and_response_free() {
     assert!(stderr.contains("LSP:"));
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
+
+#[test]
+fn lsp_printing_signatures_and_hovers_survive_lowering() {
+    let workspace = Workspace::new();
+    let source = "package app\nimport \"std/console\" as terminal\nfn main() {\nterminal.printf(\"Answer: {}, enabled: {}\\n\", 42, true)!\noutput := terminal.stderr()\noutput.printf(\"{} {}\", 7, false)!\n}\n";
+    let uri = workspace.uri("main.dodo");
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&uri, source, 1);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    for needle in ["true)!", "false)!"] {
+        let response = query(
+            &mut client,
+            "signatureHelp",
+            &uri,
+            source,
+            needle,
+            json!({}),
+        );
+        assert_eq!(response["result"]["activeParameter"], 1, "{response}");
+        let parameters = &response["result"]["signatures"][0]["parameters"];
+        assert_eq!(parameters[0]["label"], "format: &str", "{response}");
+        assert_eq!(parameters[1]["label"], "args...", "{response}");
+    }
+    let hover = query(
+        &mut client,
+        "hover",
+        &uri,
+        source,
+        "printf(\"Answer",
+        json!({}),
+    );
+    let text = hover["result"]["contents"]["value"].as_str().unwrap();
+    assert!(text.contains("printf(format: &str, args...)"), "{hover}");
+    assert!(
+        !text.contains("$print") && !text.contains("arg0"),
+        "{hover}"
+    );
+    assert!(client.shutdown().is_empty());
+}

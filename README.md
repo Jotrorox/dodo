@@ -48,6 +48,12 @@ Use the [console guide](docs/src/content/docs/console.md) to print primitive val
 report errors to stderr, and read a line into a fixed buffer. Hosted console
 access supports Linux GNU x86-64 and Windows x64.
 
+Use `console.print(value)` and `console.println(value)` for strings, primitives,
+and custom printable values. `console.printf("Answer: {}, enabled: {}\n", 42, true)!`
+checks a literal format and heterogeneous arguments at compile time. The same
+methods work on `console.stdout()` and `console.stderr()`. See the
+[formatting reference](docs/src/content/docs/formatting.md) for options and error handling.
+
 ## Everyday commands
 
 ```sh

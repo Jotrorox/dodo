@@ -62,6 +62,7 @@ struct Parser {
 
 #[derive(Default)]
 struct Modifiers {
+    printing: Option<Printing>,
     test: bool,
     ignore: Option<String>,
     public: bool,
@@ -256,6 +257,9 @@ impl Parser {
         }
         let start = self.span().start;
         let mods = self.modifiers()?;
+        if mods.printing.is_some() && !self.at("fn") {
+            return Err(self.error("@compiler applies only to printing functions"));
+        }
         if (mods.test || mods.ignore.is_some()) && !self.at("fn") {
             return Err(self.error("@test and @ignore apply only to functions"));
         }
@@ -350,6 +354,21 @@ impl Parser {
                 }
             } else if self.eat("@") {
                 let name = self.identifier()?;
+                if name == "compiler" {
+                    if mods.printing.is_some() {
+                        return Err(self.error("duplicate @compiler attribute"));
+                    }
+                    self.expect("(")?;
+                    mods.printing = Some(match self.identifier()?.as_str() {
+                        "print" => Printing::Print,
+                        "println" => Printing::Println,
+                        "printf" => Printing::Printf,
+                        _ => return Err(self.error("expected print, println, or printf")),
+                    });
+                    self.expect(")")?;
+                    self.newlines();
+                    continue;
+                }
                 if name == "test" {
                     if mods.test {
                         return Err(self.error("duplicate @test attribute"));
@@ -649,6 +668,9 @@ impl Parser {
             }
             let field_start = self.span().start;
             let field_mods = self.modifiers()?;
+            if field_mods.printing.is_some() && !self.at("fn") {
+                return Err(self.error("@compiler applies only to printing functions"));
+            }
             if field_mods.test || field_mods.ignore.is_some() {
                 return Err(self.error("@test and @ignore apply only to top-level functions"));
             }
@@ -886,7 +908,16 @@ impl Parser {
         // Foreign prototypes end at the line; an optional body may start on the next line.
         let saved = self.cursor;
         self.newlines();
-        let body = if self.at("{") {
+        let body = if mods.printing.is_some() {
+            if self.at("{") || mods.extern_ || mods.unsafe_ || mods.test {
+                return Err(
+                    self.error("compiler printing declarations are safe prototypes without bodies")
+                );
+            }
+            self.cursor = saved;
+            self.end_statement()?;
+            None
+        } else if self.at("{") {
             let mut body = self.block()?;
             if ret != Type::Void {
                 self.lower_tail(&mut body, true);
@@ -927,6 +958,7 @@ impl Parser {
             public: mods.public,
             unsafe_: mods.unsafe_,
             extern_: mods.extern_,
+            printing: mods.printing,
             generics,
             params,
             ret,

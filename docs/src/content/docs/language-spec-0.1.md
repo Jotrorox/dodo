@@ -7,7 +7,7 @@ order: 240
 
 **Language specification 0.1**
 
-**Edition:** 14 September 2026
+**Edition:** 15 September 2026
 
 **Status:** Normative specification of the implemented 0.1 language
 
@@ -582,6 +582,31 @@ check the function body against its declared or inferred contract. A contract
 does not extend a lifetime and never permits a reference to a local destroyed on
 return. Source-based contracts replace user-written lifetime parameters, not
 lifetime checking.
+
+### 6.5. Compiler-checked printing
+
+The `std/console` and `std/fmt` printing entry points are a narrow exception to
+ordinary fixed-arity calls. `print(value)` and `println(value)` select primitive
+formatting automatically and shared-borrow custom value places. `printf` takes
+a literal format string and heterogeneous arguments; the compiler checks its
+placeholders, argument count, and formatting compatibility. The portable `fmt`
+forms take an explicit mutable writer first. `console.Output` supplies equivalent
+methods. All forms return `usize!io.Error` and preserve ordinary Result handling.
+
+`{}` consumes the next argument; `{{` and `}}` escape braces. Initial options
+and type compatibility are specified in the [formatting reference](formatting.md#checked-format-strings).
+Receiver/writer and argument expressions evaluate once, left to right, before
+output. Custom temporaries are owned during formatting and cleaned up on normal
+success or error. Custom values use a public shared `format` method returning
+`void!io.Error`; the existing structural formatter contract remains valid.
+
+These calls lower to ordinary statically typed functions and checked borrows.
+One formatter records cumulative progress across the whole call, including a
+failing write's partial progress. No C variadics, runtime format parsing, or
+allocation are introduced. The bodyless `@compiler(print)`,
+`@compiler(println)`, and `@compiler(printf)` declarations are reserved for the
+bundled `std/fmt` and `std/console` packages; user packages cannot declare them.
+This facility does not provide general argument packs or function overloading.
 
 ## 7. Ownership and moves
 
