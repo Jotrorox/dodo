@@ -1,0 +1,45 @@
+package web_response
+import "std/web"
+import "std/web/hosted"
+
+pub struct Greeting {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        response.header(b"X-Method", request.method())?
+        match request.parameter(b"name") {
+            some(name) => {
+                response.header(b"X-Name", name)?
+            }
+            none => {}
+        }
+        match request.query(b"format", 0) {
+            some(format) => {
+                if format.len != 0 {
+                    // Byte responses can use any application content type.
+                    response.header(b"Content-Type", b"application/json")?
+                    return response.bytes(b"{\"hello\":\"Dodo\"}")
+                }
+            }
+            none => {}
+        }
+        return response.html(b"<!doctype html><h1>Hello, Dodo!</h1>")
+    }
+}
+fn main() -> i32 {
+    routes := [web.Route { method: b"GET", pattern: b"/hello/:name", id: 1 }]
+    handler := Greeting {}
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    request := [0u8; 4096]
+    response := [0u8; 4096]
+    match hosted.serve(b"127.0.0.1:8080", &routes, &mut handler, &mut workspace,
+    &mut request, &mut response, hosted.Config.defaults()) {
+        ok(report) => {
+            if report.failed != 0 {
+                return 2
+            };
+            return 0
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

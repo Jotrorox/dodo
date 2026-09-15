@@ -35,6 +35,7 @@ fn routing_middleware_and_backpressure_execute_and_remain_portable() {
     let scratch = Workspace::new();
     for fixture in [
         "web_checks",
+        "web_request_response_checks",
         "http_connection_checks",
         "http_fast_checks",
         "web_application_checks",
@@ -94,6 +95,38 @@ fn router_context_and_pending_body_borrows_cannot_escape() {
         (
             "context",
             "fn escape() -> web.Context from(static) { path := [47u8]\n return web.Context { method: b\"GET\", path: &path, route_id: 0, request_id: 0, cancelled: false } }",
+        ),
+        (
+            "response-storage",
+            "fn bad() { headers := [0u8; 64]\n data := [0u8; 64]\n response := web.Response.new(&mut headers, 4, &mut data)\n data[0] = 99\n count := response.body().len }",
+        ),
+        (
+            "response-view",
+            "fn bad(response: &mut web.Response) { view := response.body()\n match response.bytes(b\"new\") { ok() => {} err(_) => {} }\n count := view.len }",
+        ),
+        (
+            "request-view",
+            "pub struct Bad { data: &[u8]\n pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure { self.data = request.body()\n return ok() } }",
+        ),
+        (
+            "request-header-view",
+            "pub struct Bad { data: &[u8]\n pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure { match request.header(b\"X\", 0) { some(value) => { self.data = value } none => {} }\n return ok() } }",
+        ),
+        (
+            "request-query-view",
+            "pub struct Bad { data: &[u8]\n pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure { match request.query(b\"q\", 0) { some(value) => { self.data = value } none => {} }\n return ok() } }",
+        ),
+        (
+            "request-parameter-view",
+            "pub struct Bad { data: &[u8]\n pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure { match request.parameter(b\"id\") { some(value) => { self.data = value } none => {} }\n return ok() } }",
+        ),
+        (
+            "response-header-view",
+            "fn bad(response: &mut web.Response) { view := response.header_at(0)\n match response.header(b\"X\", b\"new\") { ok() => {} err(_) => {} }\n match view { some(field) => { count := field.value.len } none => {} } }",
+        ),
+        (
+            "response-escape",
+            "fn escape() -> web.Response from(static) { headers := [0u8; 64]\n data := [0u8; 64]\n return web.Response.new(&mut headers, 4, &mut data) }",
         ),
         (
             "body-view",
@@ -203,4 +236,17 @@ fn concurrent_server_cross_compiles_for_windows() {
                 .unwrap(),
         );
     }
+}
+
+#[test]
+fn buffered_requests_and_responses_interoperate_with_independent_peers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    success(
+        Command::new("python3")
+            .arg(root.join("scripts/test_web_request_response.py"))
+            .arg("--compiler")
+            .arg(env!("CARGO_BIN_EXE_dodo"))
+            .output()
+            .unwrap(),
+    );
 }

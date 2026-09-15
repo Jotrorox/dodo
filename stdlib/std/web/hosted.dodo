@@ -5,19 +5,28 @@ import "core/slice"
 import "std/http"
 import "std/http/connection"
 import "std/http/hosting"
-import "std/io"
 import "std/net"
 import "std/net/native"
 import "std/web"
 
-// Parser/input/output/path plus caller-sized request and response storage.
-pub const WORKSPACE_BYTES: usize = 38912
+// Fixed protocol, path, query and header storage; body buffers are separate.
+pub const PATH_BYTES: usize = 2048
+pub const QUERY_BYTES: usize = 2048
+pub const REQUEST_HEADER_BYTES: usize = 16384
+pub const RESPONSE_HEADER_BYTES: usize = 4096
+pub const RESPONSE_HEADER_FIELDS: usize = 32
+pub const WORKSPACE_BYTES: usize = 61440
 pub struct Config {
     pub backlog: u32
     pub header_bytes: usize
     pub header_fields: usize
     pub body_bytes: usize
     pub response_bytes: usize
+    pub path_bytes: usize
+    pub query_bytes: usize
+    pub query_fields: usize
+    pub response_header_bytes: usize
+    pub response_header_fields: usize
     pub header_timeout_ms: u64
     pub body_timeout_ms: u64
     pub request_timeout_ms: u64
@@ -26,8 +35,16 @@ pub struct Config {
     pub max_connections: usize
     pub fn defaults() -> Config {
         return Config { backlog: 256, header_bytes: 16384, header_fields: 100,
-        body_bytes: 65536, response_bytes: 65536, header_timeout_ms: 10000,
+        body_bytes: 65536, response_bytes: 65536, path_bytes: PATH_BYTES, query_bytes: QUERY_BYTES,
+        query_fields: 100, response_header_bytes: RESPONSE_HEADER_BYTES, response_header_fields: RESPONSE_HEADER_FIELDS, header_timeout_ms: 10000,
         body_timeout_ms: 30000, request_timeout_ms: 30000, write_timeout_ms: 30000, max_connections: 0 }
+    }
+    pub fn valid(&self) -> bool {
+        return self.header_bytes != 0 && self.header_bytes <= 16384 && self.header_fields != 0 && self.header_fields <= 100 &&
+            self.path_bytes != 0 && self.path_bytes <= PATH_BYTES && self.query_bytes <= QUERY_BYTES &&
+            self.query_fields <= 100 && self.response_header_bytes <= RESPONSE_HEADER_BYTES &&
+            self.response_header_fields <= RESPONSE_HEADER_FIELDS && self.backlog != 0 &&
+            self.header_timeout_ms != 0 && self.body_timeout_ms != 0 && self.request_timeout_ms != 0 && self.write_timeout_ms != 0
     }
     pub fn limits(&self, capacity: usize) -> http.Limits {
         limits := http.Limits.defaults()
@@ -46,28 +63,18 @@ pub struct Report {
     pub rejected: usize
     pub failed: usize
     pub cancelled: bool
-}
-// Convenience for the ordinary structural handler's output writer.
-pub fn text<W>(output: &mut W, body: &[u8]) -> u16!web.Error {
-    match io.write_all(output, body) {
-        ok(_) => {
-            return ok(200)
-        }
-        err(_) => {
-            return err(web.Error.BufferFull)
-        }
-    }
+    pub last_error: Option<hosting.Error>
 }
 pub struct Text {
     body: &[u8]
     pub fn new(body: &[u8]) -> Text from(body) {
         return Text { body: body }
     }
-    pub fn handle<B, W>(&mut self, context: &mut web.Context, body: &mut B, output: &mut W) -> u16!web.Error {
-        return text(output, self.body)
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.text(self.body)
     }
 }
-fn status(reason: &hosting.Error) -> u16 {
+pub fn status(reason: &hosting.Error) -> u16 {
     if reason.kind == hosting.ErrorKind.BodyLimit {
         return 413
     }
@@ -79,6 +86,23 @@ fn status(reason: &hosting.Error) -> u16 {
     }
     if reason.kind == hosting.ErrorKind.Handler {
         return 500
+    }
+    match &reason.application {
+        some(problem) => {
+            if problem.kind == web.Error.NotFound {
+                return 404
+            }
+            if problem.kind == web.Error.MethodNotAllowed {
+                return 405
+            }
+            if problem.kind == web.Error.HeaderLimit {
+                return 431
+            }
+            if problem.kind == web.Error.QueryLimit || problem.kind == web.Error.BufferFull {
+                return 414
+            }
+        }
+        none => {}
     }
     return 400
 }
@@ -98,19 +122,70 @@ pub fn error_response<S, C, X>(stream: &mut S, code: u16, output: &mut[u8], cloc
     }
     return hosting.write(stream, &output[..count], clock, cancel, until)
 }
-fn routed_status(reason: web.Error) -> u16 {
-    if reason == web.Error.NotFound {
-        return 404
-    }
-    if reason == web.Error.MethodNotAllowed {
-        return 405
-    }
-    if reason == web.Error.InvalidPath || reason == web.Error.InvalidMethod {
-        return 400
-    }
-    return 500
+pub fn request_error(reason: web.Failure) -> hosting.Error {
+    return hosting.web_error(reason, hosting.ErrorKind.InvalidInput)
 }
-fn decode_target(target: &[u8], output: &mut[u8]) -> usize!hosting.Error {
+// Materialize borrowed header views only during serialization. The response's
+// copied bytes outlive these local views; the connection retains no view.
+fn empty_header() -> http.Header from(static) {
+    return http.Header { name: b"", value: b"" }
+}
+pub fn response_head(driver: &mut connection.Connection, response: &web.Response, connection_value: &[u8]) -> void!hosting.Error {
+    headers := [empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(),
+    empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(),
+    empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(),
+    empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(),
+    empty_header()]
+    count := 0usize
+    for count < RESPONSE_HEADER_FIELDS {
+        match response.header_at(count) {
+            none => {
+                break
+            }
+            some(field) => {
+                headers[count] = field
+            }
+        }
+        count += 1
+    }
+    match response.header_at(RESPONSE_HEADER_FIELDS) {
+        some(_) => {
+            return err(hosting.web_error(web.failure(web.Error.HeaderLimit), hosting.ErrorKind.Handler))
+        }
+        none => {}
+    }
+    headers[count] = http.Header { name: b"Connection", value: connection_value }
+    framing := http.Body.sized(response.body().len as u64)
+    if response.status() == 204 {
+        framing = http.Body.empty()
+    }
+    if response.status() == 205 {
+        framing = http.Body.sized(0)
+    }
+    message := http.Response { status: response.status(), reason: b"", headers: &headers[..count + 1], body: framing }
+    match driver.response(&message) {
+        ok() => {
+            return ok()
+        }
+        err(reason) => {
+            result := hosting.connection_error(reason)
+            result.kind = hosting.ErrorKind.Handler
+            return err(result)
+        }
+    }
+}
+pub fn bodyless(method: &[u8], code: u16) -> bool {
+    return bytes.equal(method, b"HEAD") || code == 204 || code == 205 || code == 304
+}
+pub struct Target {
+    pub path: usize;
+    pub query: usize
+}
+pub fn decode_target(target: &[u8], path_buffer: &mut[u8], query_buffer: &mut[u8], config: &Config) -> Target!hosting.Error {
+    if config.path_bytes > path_buffer.len || config.query_bytes > query_buffer.len {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    result := Target { path: 0, query: 0 }
     uri: http.Uri
     match http.Uri.parse(target) {
         ok(value) => {
@@ -120,21 +195,30 @@ fn decode_target(target: &[u8], output: &mut[u8]) -> usize!hosting.Error {
             return err(hosting.protocol_error(reason))
         }
     }
-    path := uri.path()
-    if path.len == 0 {
-        path = b"/"
+    raw := uri.path()
+    if raw.len == 0 {
+        raw = b"/"
     }
-    match web.decode_path(path, output) {
+    match web.decode_path(raw, &mut path_buffer[..config.path_bytes]) {
         ok(count) => {
-            return ok(count)
+            result.path = count
         }
-        err(_) => {
-            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+        err(reason) => {
+            return err(request_error(web.failure(reason)))
         }
     }
+    match web.decode_query(uri.query(), &mut query_buffer[..config.query_bytes], config.query_fields) {
+        ok(count) => {
+            result.query = count
+        }
+        err(reason) => {
+            return err(request_error(reason))
+        }
+    }
+    return ok(result)
 }
 // A request is buffered before dispatch. No unchecked callback borrow survives.
-// Handler.handle(&mut Context, &mut MemoryReader, &mut MemoryWriter)->u16!web.Error.
+// Handler.handle(&mut web.Request, &mut web.Response) -> void!web.Failure.
 // Callback execution itself is cooperative: checks occur before and after it.
 fn respond<S, H, C, X>(stream: &mut S, router: &web.Router, handler: &mut H, workspace: &mut[u8],
 request_body: &mut[u8], response_body: &mut[u8], config: &Config, request_id: u64,
@@ -148,9 +232,19 @@ clock: &mut C, cancel: &X, response_started: &mut bool) -> bool!hosting.Error {
     let some(slice.SplitMut { left: input_buffer, right: rest_output }) = slice.split_at_mut(rest, 4096) else {
         return err(hosting.failure(hosting.ErrorKind.Workspace))
     }
-    let some(slice.SplitMut { left: transmit, right: path_buffer }) = slice.split_at_mut(rest_output, 16384) else {
+    let some(slice.SplitMut { left: transmit, right: metadata }) = slice.split_at_mut(rest_output, 16384) else {
         return err(hosting.failure(hosting.ErrorKind.Workspace))
     }
+    let some(slice.SplitMut { left: path_buffer, right: after_path }) = slice.split_at_mut(metadata, PATH_BYTES) else {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    let some(slice.SplitMut { left: query_buffer, right: after_query }) = slice.split_at_mut(after_path, QUERY_BYTES) else {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    let some(slice.SplitMut { left: header_buffer, right: response_headers }) = slice.split_at_mut(after_query, REQUEST_HEADER_BYTES) else {
+        return err(hosting.failure(hosting.ErrorKind.Workspace))
+    }
+    retained := web.Fields.new(header_buffer, config.header_fields)
     driver: connection.Connection
     match connection.Connection.new(http.Role.Request, parser, input_buffer, transmit, config.limits(request_body.len)) {
         ok(value) => {
@@ -163,7 +257,8 @@ clock: &mut C, cancel: &X, response_started: &mut bool) -> bool!hosting.Error {
     body_used := 0usize
     path_used := 0usize
     route_id := 0usize
-    head := false
+    route_index := 0usize
+    query_used := 0usize
     expect_continue := false
     for true {
         hosting.check(clock, cancel, phase_until)?
@@ -195,6 +290,12 @@ clock: &mut C, cancel: &X, response_started: &mut bool) -> bool!hosting.Error {
                     return err(hosting.protocol_error(reason))
                 }
             }
+            match retained.append(name, value) {
+                ok() => {}
+                err(reason) => {
+                    return err(request_error(reason))
+                }
+            }
             if http.equal_ascii(name, b"Expect") {
                 if!http.equal_ascii(value, b"100-continue") {
                     return err(hosting.failure(hosting.ErrorKind.InvalidInput))
@@ -204,19 +305,16 @@ clock: &mut C, cancel: &X, response_started: &mut bool) -> bool!hosting.Error {
         }
         if event.kind == http.EventKind.HeadersComplete {
             phase_until = hosting.earlier(request_until, hosting.deadline(clock.now_ms(), config.body_timeout_ms))
-            path_used = decode_target(driver.target(), &mut path_buffer[..2048])?
+            target := decode_target(driver.target(), path_buffer, query_buffer, config)?
+            path_used = target.path
+            query_used = target.query
             match router.find(driver.method(), &path_buffer[..path_used]) {
                 ok(found) => {
                     route_id = found.id;
-                    head = found.head
+                    route_index = found.index
                 }
                 err(reason) => {
-                    code := routed_status(reason)
-                    core.drop(driver)
-                    *response_started = true
-                    write_until := hosting.earlier(request_until, hosting.deadline(clock.now_ms(), config.write_timeout_ms))
-                    error_response(stream, code, transmit, clock, cancel, write_until)?
-                    return ok(false)
+                    return err(request_error(web.failure(reason)))
                 }
             }
             if expect_continue {
@@ -261,52 +359,29 @@ clock: &mut C, cancel: &X, response_started: &mut bool) -> bool!hosting.Error {
         }
     }
     hosting.check(clock, cancel, request_until)?
-    input := io.MemoryReader.new(&request_body[..body_used])
     capacity := response_body.len
     if capacity > config.response_bytes {
         capacity = config.response_bytes
     }
-    output := io.MemoryWriter.new(&mut response_body[..capacity])
-    context := web.Context { method: driver.method(), path: &path_buffer[..path_used],
-    route_id: route_id, request_id: request_id, cancelled: false }
-    code := 500u16
-    match web.handle(handler, &mut context, &mut input, &mut output) {
-        ok(value) => {
-            code = value
-        }
-        err(reason) => {
-            core.drop(context)
-            core.drop(driver)
-            *response_started = true
-            write_until := hosting.earlier(request_until, hosting.deadline(clock.now_ms(), config.write_timeout_ms))
-            error_response(stream, routed_status(reason), transmit, clock, cancel, write_until)?
-            return ok(false)
-        }
-    }
-    core.drop(context)
-    hosting.check(clock, cancel, request_until)?
-    if code < 200 || code > 599 {
-        return err(hosting.failure(hosting.ErrorKind.Handler))
-    }
-    headers := [http.Header { name: b"Content-Type", value: b"text/plain; charset=utf-8" },
-    http.Header { name: b"Connection", value: b"close" }]
-    framing := http.Body.sized(output.position() as u64)
-    if code == 204 {
-        framing = http.Body.empty()
-    }
-    response := http.Response { status: code, reason: b"", headers: &headers, body: framing }
-    match driver.response(&response) {
+    response := web.Response.new(&mut response_headers[..config.response_header_bytes], config.response_header_fields, &mut response_body[..capacity])
+    request := web.Request.new(driver.method(), &path_buffer[..path_used], retained.bytes(), &query_buffer[..query_used],
+    &request_body[..body_used], router, route_index, route_id, request_id)
+    match web.handle(handler, &mut request, &mut response) {
         ok() => {}
         err(reason) => {
-            return err(hosting.connection_error(reason))
+            return err(hosting.web_error(reason, hosting.ErrorKind.Handler))
         }
     }
+    head := bodyless(request.method(), response.status())
+    core.drop(request)
+    hosting.check(clock, cancel, request_until)?
+    response_head(&mut driver, &response, b"close")?
     until := hosting.earlier(request_until, hosting.deadline(clock.now_ms(), config.write_timeout_ms))
     *response_started = true
-    if head || code == 204 || code == 304 {
+    if head {
         hosting.send(&mut driver, stream, b"", clock, cancel, until)?
     } else {
-        hosting.send(&mut driver, stream, output.written(), clock, cancel, until)?
+        hosting.send(&mut driver, stream, response.body(), clock, cancel, until)?
     }
     return ok(true)
 }
@@ -318,6 +393,9 @@ clock: &mut C, cancel: &X) -> bool!hosting.Error {
     if workspace.len < WORKSPACE_BYTES {
         return err(hosting.failure(hosting.ErrorKind.Workspace))
     }
+    if!config.valid() {
+        return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+    }
     response_started := false
     match respond(stream, router, handler, workspace, request_body, response_body, config, request_id, clock, cancel, &mut response_started) {
         ok(value) => {
@@ -328,7 +406,8 @@ clock: &mut C, cancel: &X) -> bool!hosting.Error {
                 until := hosting.deadline(clock.now_ms(), config.write_timeout_ms)
                 match error_response(stream, status(&reason), &mut workspace[20480..36864], clock, cancel, until) {
                     ok() => {
-                        return ok(false)
+                        reason.responded = true
+                        return err(reason)
                     }
                     err(_) => {}
                 }
@@ -361,9 +440,7 @@ clock: &mut C, cancel: &X) -> Report!hosting.Error {
     if workspace.len < WORKSPACE_BYTES {
         return err(hosting.failure(hosting.ErrorKind.Workspace))
     }
-    if config.header_bytes == 0 || config.header_bytes > 16384 || config.header_fields == 0 || config.header_fields > 100 ||
-        config.backlog == 0 || config.header_timeout_ms == 0 || config.body_timeout_ms == 0 ||
-        config.request_timeout_ms == 0 || config.write_timeout_ms == 0 {
+    if!config.valid() {
         return err(hosting.failure(hosting.ErrorKind.InvalidInput))
     }
     index := [0usize; 2048]
@@ -373,8 +450,8 @@ clock: &mut C, cancel: &X) -> Report!hosting.Error {
             ok(value) => {
                 router = value
             }
-            err(_) => {
-                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            err(reason) => {
+                return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
             }
         }
     } else {
@@ -382,8 +459,8 @@ clock: &mut C, cancel: &X) -> Report!hosting.Error {
             ok(value) => {
                 router = value
             }
-            err(_) => {
-                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            err(reason) => {
+                return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
             }
         }
     }
@@ -405,7 +482,7 @@ clock: &mut C, cancel: &X) -> Report!hosting.Error {
             return err(hosting.network_error(reason, hosting.ErrorKind.Connect))
         }
     }
-    report := Report { accepted: 0, completed: 0, rejected: 0, failed: 0, cancelled: false }
+    report := Report { accepted: 0, completed: 0, rejected: 0, failed: 0, cancelled: false, last_error: none }
     for config.max_connections == 0 || report.accepted < config.max_connections {
         if cancel.cancelled() {
             report.cancelled = true;
@@ -445,7 +522,12 @@ clock: &mut C, cancel: &X) -> Report!hosting.Error {
                                     report.cancelled = true;
                                     return ok(report)
                                 }
-                                report.failed += 1
+                                if reason.responded {
+                                    report.rejected += 1
+                                } else {
+                                    report.failed += 1
+                                }
+                                report.last_error = some(reason)
                             }
                         }
                     }

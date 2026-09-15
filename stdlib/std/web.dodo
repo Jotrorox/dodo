@@ -2,12 +2,15 @@ package web
 
 import "core/bytes"
 import "std/text"
+import "std/http"
+import "std/io"
 
 // Portable routing: byte paths decoded exactly once into caller storage.
 // No allocation, I/O, clock, filesystem, TLS, or scheduler dependency.
 pub enum Error {
     InvalidPath, InvalidPattern, InvalidMethod, AmbiguousRoute, BufferFull,
-    NotFound, MethodNotAllowed, Cancelled, Handler, InvalidProgress
+    NotFound, MethodNotAllowed, Cancelled, Handler, InvalidProgress,
+    InvalidQuery, QueryLimit, InvalidHeader, InvalidStatus, HeaderLimit
 }
 
 fn hex(value: u8) -> u8!Error {
@@ -452,47 +455,456 @@ pub struct Context {
     pub request_id: u64
     pub cancelled: bool
 }
-// Structural contracts are compiler checked at each specialization. A handler
-// owns its state; borrowed context/body/output cannot escape their checked call.
-// Handler.handle(context, request_body, response_output) -> u16!web.Error.
-pub fn handle<H, B, W>(handler: &mut H, context: &mut Context, body: &mut B, output: &mut W) -> u16!Error {
-    if context.cancelled {
-        return err(Error.Cancelled)
+// Buffered application failures retain the protocol or UTF-8 diagnostic.
+// Routing/streaming keep the small Error enum above for compatibility.
+pub struct Failure {
+    pub kind: Error
+    pub protocol: Option<http.Error>
+    pub encoding: Option<text.Error>
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("web: ")?
+        match &self.kind {
+            Error.InvalidPath => {
+                output.string("InvalidPath")?
+            }
+            Error.InvalidPattern => {
+                output.string("InvalidPattern")?
+            }
+            Error.InvalidMethod => {
+                output.string("InvalidMethod")?
+            }
+            Error.AmbiguousRoute => {
+                output.string("AmbiguousRoute")?
+            }
+            Error.BufferFull => {
+                output.string("BufferFull")?
+            }
+            Error.NotFound => {
+                output.string("NotFound")?
+            }
+            Error.MethodNotAllowed => {
+                output.string("MethodNotAllowed")?
+            }
+            Error.Cancelled => {
+                output.string("Cancelled")?
+            }
+            Error.Handler => {
+                output.string("Handler")?
+            }
+            Error.InvalidProgress => {
+                output.string("InvalidProgress")?
+            }
+            Error.InvalidQuery => {
+                output.string("InvalidQuery")?
+            }
+            Error.QueryLimit => {
+                output.string("QueryLimit")?
+            }
+            Error.InvalidHeader => {
+                output.string("InvalidHeader")?
+            }
+            Error.InvalidStatus => {
+                output.string("InvalidStatus")?
+            }
+            Error.HeaderLimit => {
+                output.string("HeaderLimit")?
+            }
+        }
+        match &self.protocol {
+            some(reason) => {
+                output.string("; ")?;
+                reason.format(output)?
+            }
+            none => {}
+        }
+        match &self.encoding {
+            some(reason) => {
+                output.string("; ")?;
+                reason.format(output)?
+            }
+            none => {}
+        }
+        return ok()
     }
-    return handler.handle(context, body, output)
+
+}
+pub fn failure(kind: Error) -> Failure {
+    return Failure { kind: kind, protocol: none, encoding: none }
+}
+pub fn protocol_failure(kind: Error, reason: http.Error) -> Failure {
+    result := failure(kind)
+    result.protocol = some(reason)
+    return result
+}
+fn encoding_failure(kind: Error, reason: text.Error) -> Failure {
+    result := failure(kind)
+    result.encoding = some(reason)
+    return result
 }
 
-// Middleware nesting runs before outer-to-inner, after inner-to-outer.
+// NUL-delimited name/value pairs. Only validated fields enter this storage.
+// Mutators copy bytes, never retain their arguments. A failed append is atomic.
+pub struct Fields {
+    data: &mut[u8]
+    used: usize
+    count: usize
+    limit: usize
+    pub fn new(data: &mut[u8], limit: usize) -> Fields from(data) {
+        return Fields { data: data, used: 0, count: 0, limit: limit }
+    }
+    pub fn resume(data: &mut[u8], used: usize, count: usize, limit: usize) -> Fields!Failure from(data) {
+        if used > data.len || count > limit {
+            return err(failure(Error.BufferFull))
+        }
+        return ok(Fields { data: data, used: used, count: count, limit: limit })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        return &self.data[..self.used]
+    }
+    pub fn len(&self) -> usize {
+        return self.count
+    }
+    pub fn append(&mut self, name: &[u8], value: &[u8]) -> void!Failure {
+        if!http.valid_token(name) || !http.valid_value(value) {
+            return err(protocol_failure(Error.InvalidHeader, http.failure(http.ErrorKind.InvalidHeader, self.count)))
+        }
+        if self.count == self.limit || name.len > self.data.len - self.used ||
+            self.data.len - self.used - name.len < 2 || value.len > self.data.len - self.used - name.len - 2 {
+            return err(protocol_failure(Error.HeaderLimit, http.failure(http.ErrorKind.BufferFull, self.count)))
+        }
+        for i in 0usize..name.len {
+            self.data[self.used + i] = name[i]
+        }
+        self.used += name.len
+        self.data[self.used] = 0
+        self.used += 1
+        for i in 0usize..value.len {
+            self.data[self.used + i] = value[i]
+        }
+        self.used += value.len
+        self.data[self.used] = 0
+        self.used += 1
+        self.count += 1
+        return ok()
+    }
+}
+pub fn field_at(data: &[u8], index: usize) -> Option<http.Header> from(data) {
+    at := 0usize
+    number := 0usize
+    for at < data.len {
+        end := at
+        for end < data.len && data[end] != 0 {
+            end += 1
+        }
+        if end == data.len {
+            return none
+        }
+        start := end + 1
+        last := start
+        for last < data.len && data[last] != 0 {
+            last += 1
+        }
+        if last == data.len {
+            return none
+        }
+        if number == index {
+            return some(http.Header { name: &data[at..end], value: &data[start..last] })
+        }
+        number += 1
+        at = last + 1
+    }
+    return none
+}
+fn lookup(data: &[u8], name: &[u8], occurrence: usize, insensitive: bool) -> Option<&[u8]> from(data) {
+    at := 0usize
+    found := 0usize
+    for at < data.len {
+        end := at
+        for end < data.len && data[end] != 0 {
+            end += 1
+        }
+        if end == data.len {
+            return none
+        }
+        start := end + 1
+        last := start
+        for last < data.len && data[last] != 0 {
+            last += 1
+        }
+        if last == data.len {
+            return none
+        }
+        equal := bytes.equal(&data[at..end], name)
+        if insensitive {
+            equal = http.equal_ascii(&data[at..end], name)
+        }
+        if equal {
+            if found == occurrence {
+                return some(&data[start..last])
+            }
+            found += 1
+        }
+        at = last + 1
+    }
+    return none
+}
+fn has_field(data: &[u8], name: &[u8]) -> bool {
+    match lookup(data, name, 0, true) {
+        some(_) => {
+            return true
+        }
+        none => {
+            return false
+        }
+    }
+}
+fn query_part(raw: &[u8], output: &mut[u8], base: usize) -> usize!Failure {
+    at := 0usize
+    used := 0usize
+    for at < raw.len {
+        value := raw[at]
+        position := at
+        at += 1
+        if value == 37 {
+            if raw.len - at < 2 {
+                return err(protocol_failure(Error.InvalidQuery, http.failure(http.ErrorKind.InvalidUri, base + position)))
+            }
+            high := 0u8
+            low := 0u8
+            match hex(raw[at]) {
+                ok(v) => {
+                    high = v
+                }
+                err(_) => {
+                    return err(protocol_failure(Error.InvalidQuery, http.failure(http.ErrorKind.InvalidUri, base + at)))
+                }
+            }
+            match hex(raw[at + 1]) {
+                ok(v) => {
+                    low = v
+                }
+                err(_) => {
+                    return err(protocol_failure(Error.InvalidQuery, http.failure(http.ErrorKind.InvalidUri, base + at + 1)))
+                }
+            }
+            value = high * 16 + low
+            at += 2
+        } else if value == 43 {
+            value = 32
+        }
+        if value < 32 || value == 127 || value == 35 && raw[position] != 37 {
+            return err(protocol_failure(Error.InvalidQuery, http.failure(http.ErrorKind.InvalidUri, base + position)))
+        }
+        if used == output.len {
+            return err(failure(Error.QueryLimit))
+        }
+        output[used] = value
+        used += 1
+    }
+    match text.validate(&output[..used]) {
+        ok() => {}
+        err(reason) => {
+            return err(encoding_failure(Error.InvalidQuery, reason))
+        }
+    }
+    return ok(used)
+}
+// Form-style query: split on &, then first =, then percent-decode once and
+// turn + into space. Empty components are skipped; bare keys have empty values.
+// Names are case sensitive. Controls and invalid UTF-8 are rejected.
+// Failure may modify a prefix: only the successful prefix may be used.
+pub fn decode_query(raw: &[u8], output: &mut[u8], limit: usize) -> usize!Failure {
+    at := 0usize
+    used := 0usize
+    count := 0usize
+    for at < raw.len {
+        end := at
+        for end < raw.len && raw[end] != 38 {
+            end += 1
+        }
+        if end != at {
+            if count == limit {
+                return err(failure(Error.QueryLimit))
+            }
+            split := at
+            for split < end && raw[split] != 61 {
+                split += 1
+            }
+            used += query_part(&raw[at..split], &mut output[used..], at)?
+            if used == output.len {
+                return err(failure(Error.QueryLimit))
+            }
+            output[used] = 0
+            used += 1
+            start := split
+            if start < end {
+                start += 1
+            }
+            used += query_part(&raw[start..end], &mut output[used..], start)?
+            if used == output.len {
+                return err(failure(Error.QueryLimit))
+            }
+            output[used] = 0
+            used += 1
+            count += 1
+        }
+        at = end + 1
+    }
+    return ok(used)
+}
+
+pub struct Request {
+    verb: &[u8]
+    decoded_path: &[u8]
+    headers: &[u8]
+    queries: &[u8]
+    data: &[u8]
+    router: &Router
+    route: usize
+    pub route_id: usize
+    pub request_id: u64
+    pub cancelled: bool
+    // Header/query storage is the initialized prefix of Fields/decode_query.
+    pub fn new(method: &[u8], path: &[u8], headers: &[u8], query: &[u8], body: &[u8],
+    router: &Router, route: usize, route_id: usize, request_id: u64) -> Request from(method, path, headers, query, body, router) {
+        return Request { verb: method, decoded_path: path, headers: headers, queries: query, data: body,
+        router: router, route: route, route_id: route_id, request_id: request_id, cancelled: false }
+    }
+    pub fn method(&self) -> &[u8] {
+        return self.verb
+    }
+    pub fn path(&self) -> &[u8] {
+        return self.decoded_path
+    }
+    pub fn body(&self) -> &[u8] {
+        return self.data
+    }
+    pub fn header(&self, name: &[u8], occurrence: usize) -> Option<&[u8]> from(self) {
+        return lookup(self.headers, name, occurrence, true)
+    }
+    pub fn query(&self, name: &[u8], occurrence: usize) -> Option<&[u8]> from(self) {
+        return lookup(self.queries, name, occurrence, false)
+    }
+    pub fn parameter(&self, name: &[u8]) -> Option<&[u8]> from(self) {
+        match self.router.parameter(self.route, self.decoded_path, name) {
+            some(part) => {
+                return some(&self.decoded_path[part.start..part.end])
+            }
+            none => {
+                return none
+            }
+        }
+    }
+}
+
+// Response owns no allocation and stores no handler borrows. Headers and body
+// are copied into explicit caller storage; getters borrow only this response.
+pub struct Response {
+    code: u16
+    fields: Fields
+    data: &mut[u8]
+    used: usize
+    pub fn new(headers: &mut[u8], header_fields: usize, body: &mut[u8]) -> Response from(headers, body) {
+        return Response { code: 200, fields: Fields.new(headers, header_fields), data: body, used: 0 }
+    }
+    pub fn status(&self) -> u16 {
+        return self.code
+    }
+    pub fn set_status(&mut self, code: u16) -> void!Failure {
+        if code < 200 || code > 599 {
+            return err(protocol_failure(Error.InvalidStatus, http.failure(http.ErrorKind.InvalidStatus, code as usize)))
+        }
+        self.code = code
+        return ok()
+    }
+    // Append preserves duplicates in insertion order, including Set-Cookie.
+    // Framing and connection management belong to the runner.
+    pub fn header(&mut self, name: &[u8], value: &[u8]) -> void!Failure {
+        if http.equal_ascii(name, b"Content-Length") || http.equal_ascii(name, b"Transfer-Encoding") ||
+            http.equal_ascii(name, b"Connection") || http.equal_ascii(name, b"Trailer") ||
+            http.equal_ascii(name, b"TE") || http.equal_ascii(name, b"Upgrade") ||
+            http.equal_ascii(name, b"Keep-Alive") || http.equal_ascii(name, b"Proxy-Connection") ||
+            http.equal_ascii(name, b"Content-Type") && has_field(self.fields.bytes(), b"Content-Type") {
+            return err(protocol_failure(Error.InvalidHeader, http.failure(http.ErrorKind.InvalidHeader, self.fields.len())))
+        }
+        return self.fields.append(name, value)
+    }
+    pub fn header_at(&self, index: usize) -> Option<http.Header> from(self) {
+        return field_at(self.fields.bytes(), index)
+    }
+    pub fn body(&self) -> &[u8] {
+        return &self.data[..self.used]
+    }
+    pub fn bytes(&mut self, body: &[u8]) -> void!Failure {
+        if body.len > self.data.len {
+            return err(protocol_failure(Error.BufferFull, http.failure(http.ErrorKind.BufferFull, body.len)))
+        }
+        for i in 0usize..body.len {
+            self.data[i] = body[i]
+        }
+        self.used = body.len
+        return ok()
+    }
+    fn textual(&mut self, body: &[u8], content_type: &[u8]) -> void!Failure {
+        if body.len > self.data.len {
+            return err(protocol_failure(Error.BufferFull, http.failure(http.ErrorKind.BufferFull, body.len)))
+        }
+        match text.validate(body) {
+            ok() => {}
+            err(reason) => {
+                return err(encoding_failure(Error.Handler, reason))
+            }
+        }
+        if!has_field(self.fields.bytes(), b"Content-Type") {
+            self.header(b"Content-Type", content_type)?
+        }
+        return self.bytes(body)
+    }
+    pub fn text(&mut self, body: &[u8]) -> void!Failure {
+        return self.textual(body, b"text/plain; charset=utf-8")
+    }
+    pub fn html(&mut self, body: &[u8]) -> void!Failure {
+        return self.textual(body, b"text/html; charset=utf-8")
+    }
+}
+
+// The callback cannot retain request or response borrows in handler state.
+pub fn handle<H>(handler: &mut H, request: &mut Request, response: &mut Response) -> void!Failure {
+    if request.cancelled {
+        return err(failure(Error.Cancelled))
+    }
+    return handler.handle(request, response)
+}
 pub struct Chain<A, B> {
     pub outer: A
     pub inner: B
-    pub fn before(&mut self, context: &mut Context) -> void!Error {
-        self.outer.before(context)?
-        return self.inner.before(context)
+    pub fn before(&mut self, request: &mut Request) -> void!Failure {
+        self.outer.before(request)?
+        return self.inner.before(request)
     }
-    pub fn after(&mut self, context: &mut Context, status: u16) {
-        self.inner.after(context, status)
-        self.outer.after(context, status)
+    pub fn after(&mut self, request: &mut Request, status: u16) {
+        self.inner.after(request, status)
+        self.outer.after(request, status)
     }
 }
 pub struct NoMiddleware {
-    pub fn before(&mut self, context: &mut Context) -> void!Error {
+    pub fn before(&mut self, request: &mut Request) -> void!Failure {
         return ok()
     }
-    pub fn after(&mut self, context: &mut Context, status: u16) {}
+    pub fn after(&mut self, request: &mut Request, status: u16) {}
 }
-pub fn dispatch<M, H, B, W>(middleware: &mut M, handler: &mut H, context: &mut Context, body: &mut B, output: &mut W) -> u16!Error {
-    if context.cancelled {
-        return err(Error.Cancelled)
+pub fn dispatch<M, H>(middleware: &mut M, handler: &mut H, request: &mut Request, response: &mut Response) -> void!Failure {
+    if request.cancelled {
+        return err(failure(Error.Cancelled))
     }
-    middleware.before(context)?
-    match handle(handler, context, body, output) {
-        ok(status) => {
-            middleware.after(context, status)
-            return ok(status)
+    middleware.before(request)?
+    match handle(handler, request, response) {
+        ok() => {
+            middleware.after(request, response.status());
+            return ok()
         }
         err(reason) => {
-            middleware.after(context, 500)
+            middleware.after(request, 500);
             return err(reason)
         }
     }

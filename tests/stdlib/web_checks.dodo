@@ -19,18 +19,18 @@ pub struct Slow {
 }
 pub struct Layer {
     digit: u64
-    pub fn before(&mut self, context: &mut web.Context) -> void!web.Error {
+    pub fn before(&mut self, context: &mut web.Request) -> void!web.Failure {
         context.request_id = context.request_id * 10 + self.digit
         return ok()
     }
-    pub fn after(&mut self, context: &mut web.Context, status: u16) {
+    pub fn after(&mut self, context: &mut web.Request, status: u16) {
         context.request_id = context.request_id * 10 + self.digit
     }
 }
 pub struct Handler {
-    pub fn handle<B, W>(&mut self, context: &mut web.Context, body: &mut B, output: &mut W) -> u16!web.Error {
+    pub fn handle(&mut self, context: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
         context.request_id = context.request_id * 10 + 3
-        return ok(200)
+        return response.set_status(200)
     }
 }
 fn checks() -> i32!web.Error {
@@ -116,24 +116,27 @@ fn checks() -> i32!web.Error {
             }
         }
     }
-    context := web.Context { method: b"GET", path: b"/", route_id: 0, request_id: 0, cancelled: false }
+    context := web.Request.new(b"GET", b"/", b"", b"", b"abc", &router, 0, 0, 0)
     middleware := web.Chain<Layer, Layer> { outer: Layer { digit: 1 }, inner: Layer { digit: 2 } }
     handler := Handler {}
-    body := io.MemoryReader.new(b"abc")
-    output := io.MemoryWriter.new(&mut data)
-    if web.dispatch(&mut middleware, &mut handler, &mut context, &mut body, &mut output)? != 200 {
-        return ok(16)
+    headers := [0u8; 128]
+    output := web.Response.new(&mut headers, 4, &mut data)
+    match web.dispatch(&mut middleware, &mut handler, &mut context, &mut output) {
+        ok() => {}
+        err(_) => {
+            return ok(16)
+        }
     }
     if context.request_id != 12321 {
         return ok(17)
     }
     context.cancelled = true
-    match web.dispatch(&mut middleware, &mut handler, &mut context, &mut body, &mut output) {
-        ok(_) => {
+    match web.dispatch(&mut middleware, &mut handler, &mut context, &mut output) {
+        ok() => {
             return ok(18)
         }
         err(reason) => {
-            if reason != web.Error.Cancelled {
+            if reason.kind != web.Error.Cancelled {
                 return ok(19)
             }
         }

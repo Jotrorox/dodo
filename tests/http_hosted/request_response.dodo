@@ -1,0 +1,211 @@
+package request_response_checks
+import "core/bytes"
+import "std/http"
+import "std/web"
+import "std/web/hosted"
+import "std/web/reactor"
+
+pub struct Handler {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        response.header(b"X-Handled", b"yes")?
+        if request.route_id == 1 {
+            response.set_status(201)?
+            response.header(b"content-type", b"application/json")?
+            response.header(b"Set-Cookie", b"a=1")?
+            response.header(b"Set-Cookie", b"b=2")?
+            return response.text(b"{\"ok\":true}")
+        }
+        if request.route_id == 2 {
+            return response.html(b"<h1>Hello</h1>")
+        }
+        if request.route_id == 3 {
+            response.header(b"Content-Type", b"application/octet-stream")?
+            data := [0u8, 255, 128, 13, 10]
+            return response.bytes(&data)
+        }
+        if request.route_id == 4 {
+            response.header(b"X-Method", request.method())?
+            response.header(b"X-Path", request.path())?
+            match request.parameter(b"id") {
+                some(value) => {
+                    response.header(b"X-Id", value)?
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+            match request.query(b"q", 0) {
+                some(value) => {
+                    response.header(b"X-Q-First", value)?
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+            match request.query(b"q", 1) {
+                some(value) => {
+                    response.header(b"X-Q-Second", value)?
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+            match request.header(b"x-input", 1) {
+                some(value) => {
+                    response.header(b"X-Input-Second", value)?
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+            match request.header(b"X-Trailer", 0) {
+                some(_) => {
+                    return err(web.failure(web.Error.Handler))
+                }
+                none => {}
+            }
+            return response.bytes(request.body())
+        }
+        if request.route_id == 5 {
+            response.text(b"ignored")?
+            return response.set_status(204)
+        }
+        if request.route_id == 6 {
+            response.text(b"ignored")?
+            return response.set_status(304)
+        }
+        if request.route_id == 7 {
+            response.text(b"ignored")?
+            return response.set_status(205)
+        }
+        if request.route_id == 8 {
+            data := [120u8; 129];
+            return response.bytes(&data)
+        }
+        if request.route_id == 9 {
+            for i in 0usize..8 {
+                response.header(b"X-Full", b"x")?
+            }
+            return ok()
+        }
+        if request.route_id == 10 {
+            data := [120u8; 256];
+            return response.header(b"X-Full", &data)
+        }
+        if request.route_id == 11 {
+            return response.header(b"content-length", b"999")
+        }
+        if request.route_id == 12 {
+            return response.header(b"X-Injected", b"yes\r\nBad: true")
+        }
+        if request.route_id == 13 {
+            return response.set_status(199)
+        }
+        if request.route_id == 14 {
+            data := [255u8];
+            return response.text(&data)
+        }
+        if request.route_id == 15 {
+            response.header(b"Content-Type", b"application/json")?
+            return response.header(b"CONTENT-TYPE", b"text/html")
+        }
+        if request.route_id == 16 {
+            match request.query(b"", 0) {
+                some(v) => {
+                    if!bytes.equal(v, b"empty") {
+                        return err(web.failure(web.Error.Handler))
+                    }
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+            match request.query(b"bare", 0) {
+                some(v) => {
+                    if v.len != 0 {
+                        return err(web.failure(web.Error.Handler))
+                    }
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+            match request.query(b"q", 0) {
+                some(v) => {
+                    return response.bytes(v)
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+        }
+        return response.text(b"explicit HEAD")
+    }
+}
+fn main() -> i32 {
+    routes := [web.Route { method: b"GET", pattern: b"/json", id: 1 },
+    web.Route { method: b"GET", pattern: b"/html", id: 2 },
+    web.Route { method: b"GET", pattern: b"/bytes", id: 3 },
+    web.Route { method: b"POST", pattern: b"/inspect/:id", id: 4 },
+    web.Route { method: b"GET", pattern: b"/empty", id: 5 },
+    web.Route { method: b"GET", pattern: b"/not-modified", id: 6 },
+    web.Route { method: b"GET", pattern: b"/reset", id: 7 },
+    web.Route { method: b"GET", pattern: b"/body-full", id: 8 },
+    web.Route { method: b"GET", pattern: b"/fields-full", id: 9 },
+    web.Route { method: b"GET", pattern: b"/headers-full", id: 10 },
+    web.Route { method: b"GET", pattern: b"/framing", id: 11 },
+    web.Route { method: b"GET", pattern: b"/bad-header", id: 12 },
+    web.Route { method: b"GET", pattern: b"/bad-status", id: 13 },
+    web.Route { method: b"GET", pattern: b"/bad-text", id: 14 },
+    web.Route { method: b"GET", pattern: b"/duplicate-type", id: 15 },
+    web.Route { method: b"GET", pattern: b"/query", id: 16 },
+    web.Route { method: b"HEAD", pattern: b"/json", id: 17 }]
+    handler := Handler {}
+    config := hosted.Config.defaults()
+    config.max_connections = 1 // @@COUNT@@
+    config.header_bytes = 512
+    config.header_fields = 8
+    config.path_bytes = 64
+    config.query_bytes = 128
+    config.query_fields = 4
+    config.response_header_bytes = 256
+    config.response_header_fields = 8
+    config.body_bytes = 128
+    config.response_bytes = 128
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    request := [0u8; 128]
+    response := [0u8; 128]
+    // @@SERVE@@
+    match hosted.serve(b"127.0.0.1:@@PORT@@", &routes, &mut handler, &mut workspace, &mut request, &mut response, config) {
+        ok(report) => {
+            assert(report.failed == 0)
+            match &report.last_error {
+                some(reason) => {
+                    match &reason.application {
+                        some(problem) => {
+                            assert(problem.kind == web.Error.InvalidHeader)
+                            match &problem.protocol {
+                                some(cause) => {
+                                    assert(cause.kind == http.ErrorKind.InvalidHeader)
+                                }
+                                none => {
+                                    return 3
+                                }
+                            }
+                        }
+                        none => {
+                            return 4
+                        }
+                    }
+                }
+                none => {
+                    return 5
+                }
+            }
+            return 0
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

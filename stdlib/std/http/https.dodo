@@ -230,6 +230,10 @@ pub struct Acceptor {
                         return err(hosting.tls_error(cause))
                     }
                     none => {
+                        if reason.responded {
+                            close_until := hosting.deadline(clock.now_ms(), config.write_timeout_ms)
+                            transport.finish(clock, cancel, close_until)?
+                        }
                         return err(reason)
                     }
                 }
