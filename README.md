@@ -91,10 +91,8 @@ breakpoints and local variables. Hosted runtime checks report their kind and
 location; embedded builds can select a non-returning C ABI board handler with
 `--panic-hook` for fault reporting, halt, or reset behavior. For
 diagnostics, completion, navigation, rename, signature help, and formatting,
-install the [Dodo VS Code extension](editor-support/dodo-vscode) or
-[Dodo Zed extension](editor-support/dodo-zed), which also add syntax highlighting,
-or configure your editor's LSP client to run
-`dodo lsp` and follow the
+install the [Dodo VS Code extension](editor-support/dodo-vscode), which also adds
+syntax highlighting, or configure your editor's LSP client to run `dodo lsp` and follow the
 [editor setup guide](https://jotrorox.github.io/dodo/editors/).
 
 ## Language and reference
@@ -140,10 +138,8 @@ cargo run --locked -- test
 cargo run --locked -- test -O 3
 ```
 
-Editor integrations have separate checks documented in the
-[VS Code](editor-support/dodo-vscode/README.md),
-[Zed](editor-support/dodo-zed/README.md), and
-[Tree-sitter grammar](editor-support/tree-sitter-dodo/README.md) READMEs.
+The VS Code extension has separate checks documented in its
+[README](editor-support/dodo-vscode/README.md).
 
 To change the website, edit Markdown in
 [docs/src/content/docs](docs/src/content/docs) and follow
@@ -170,7 +166,7 @@ and publishes documentation changes from `main`.
 | [tests/](tests) | Compiler regression tests, native programs, and standard-library fixtures. |
 | [examples/](examples) | Small Dodo programs to read, check, and run. |
 | [docs/](docs) | Astro website, Markdown guides, and the canonical language specification. |
-| [editor-support/](editor-support) | VS Code and Zed integrations and the Tree-sitter grammar. |
+| [editor-support/](editor-support) | VS Code integration. |
 | [scripts/](scripts) | Release packaging, platform checks, documentation validation, and benchmarks. |
 | [.github/workflows/](.github/workflows) | Compiler, editor, release, and documentation automation. |
 
@@ -186,19 +182,15 @@ are no longer needed:
 | Output | Recreate with |
 | --- | --- |
 | `target/` | Cargo build or test commands. If you installed LLVM under `target/llvm-linux`, removing `target/` also removes that toolchain. |
-| `build/` | The compiler or release scripts that produced each output; `python3 editor-support/dodo-zed/prepare-dev.py` recreates the Zed development directories. Keep those directories while using the dev extension. |
+| `build/` | The compiler or release scripts that produced each output. |
 | `docs/node_modules/`, `docs/.astro/`, `docs/dist/` | `npm ci --prefix docs` followed by `npm run build --prefix docs`. |
 | `docs/public/downloads/language-spec-0.1.txt` and `.pdf` | `python3 scripts/render_spec.py` or the website build. |
 | `editor-support/dodo-vscode/node_modules/`, `dist/`, `.vscode-test/`, and `*.vsix` | The extension's install, build, integration-test, and packaging commands. |
-| `editor-support/dodo-zed/target/`, `extension.wasm`, and `grammars/` | The Zed extension's Cargo build or Zed's dev-extension build. |
-| `editor-support/tree-sitter-dodo/node_modules/` and compiled grammar libraries | `npm ci` and `npm test` in the grammar directory. |
 | Python `__pycache__/` directories | Running the corresponding Python scripts. |
 
-Keep tracked source files, lockfiles, licenses, and the generated Tree-sitter
-files under `editor-support/tree-sitter-dodo/src/`: those parser files are needed
-to build the extension. Commit or back up unfinished work before cleaning a
-checkout. `git clean -ndX` previews ignored outputs; remove only the paths you
-have reviewed. `cargo clean` removes Cargo build outputs.
+Keep tracked source files, lockfiles, and licenses. Commit or back up unfinished
+work before cleaning a checkout. `git clean -ndX` previews ignored outputs; remove
+only the paths you have reviewed. `cargo clean` removes Cargo build outputs.
 
 To synchronize a clean `main` checkout and inspect branches and worktrees:
 
