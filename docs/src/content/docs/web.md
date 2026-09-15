@@ -5,138 +5,191 @@ section: "Standard library"
 order: 160
 ---
 
-Use `std/web/app.Server` to run a small HTTP application on Linux GNU x86-64
-or Windows x64. Register named handler structs with `std/web/application`;
-route IDs and bounded default buffers are supplied by the library. The portable
-registration package and `std/web` do not import sockets or start a server.
+Build a small HTTP application with `std/web/app`. Register routes, use ready-made
+response handlers or your own structs, and run it on Linux GNU x86-64 or Windows
+x64. The portable `std/web/application` package supports the same fluent routing
+and in-process tests without importing sockets.
 
 ## Quickstart
 
-Save this as `serve_route.dodo`:
+Save this as `main.dodo`:
 
 ```dodo
-package serve_route
-import "std/console"
+package main
 import "std/web"
-import "std/web/application"
 import "std/web/app"
 
-pub struct Hello {
-    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
-        return response.text(b"Hello, Dodo!\n")
-    }
-}
 fn main() -> i32 {
-    routes := application.new().get(b"/", Hello {})!
-    server := app.Server.new(routes)
-    server.config.max_connections = 1
-    match server.serve(b"127.0.0.1:8080") {
-        ok(report) => {
-            if report.failed != 0 {
-                return 2
-            };
-            return 0
-        }
-        err(reason) => {
-            errors := console.stderr()
-            match errors.println(&reason) {
-                ok(_) => {}
-                err(_) => {}
-            }
-            return 1
-        }
-    }
+    return app.new()
+        .get(b"/", web.text(b"Hello, Dodo!\n"))
+        .run(b"127.0.0.1:8080")
 }
 ```
 
-```sh
-dodo run serve_route.dodo
-```
+Start it with `dodo run`, then visit `http://127.0.0.1:8080` or run
+`curl http://127.0.0.1:8080` in another terminal. Ctrl+C stops the process.
+`run(address)` returns an exit code for `main`: 0 after clean shutdown, 1 for a
+setup/startup error, or 2 if serving returns with failed connections. It prints
+startup errors and the last available connection failure to stderr.
 
-The server waits silently for one connection. In terminal 2:
-
-```sh
-python3 -c "import http.client; c = http.client.HTTPConnection('127.0.0.1', 8080, timeout=5); c.request('GET', '/'); r = c.getresponse(); print(r.status); print(r.read().decode(), end=''); c.close()"
-```
-
-The client prints `200` and `Hello, Dodo!`; the server exits. Set
-`server.config.max_connections = 0` (the default) to keep accepting connections.
-Ctrl+C stops the process. For cooperative shutdown that returns a report, use
-`serve_until(address, cancel)` with a public `cancelled(&self) -> bool` method.
-`max_connections` counts accepted connections, including rejected requests.
-
-A successful serving Result contains a `hosted.Report`: inspect `completed`,
-`rejected`, `failed`, `accepted`, `cancelled`, and `last_error`. For example, a
-request to `/missing` gets 404 and increments `rejected`. Startup errors return
-`hosting.Error`. The example prints these errors and exits 1; connection failures
-make it exit 2. Binding does not enable address reuse; a recently closed port
-may need time to become reusable, or choose a different port.
+Use `serve(address)` when you want to handle the Result and serving report
+yourself. `serve_until(address, cancel)` supports cooperative shutdown with a
+public `cancelled(&self) -> bool` method. Serving accepts connections until
+cancelled by default; setting `config.max_connections` bounds the total accepted
+connections. Routing rejections such as 404 and 405 are counted separately from
+connection failures.
 
 ## Several routes
 
-[`examples/web_routes.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/web_routes.dodo)
-registers three different named handler types:
+Static responses need no custom handler. Dynamic handlers receive a request and
+write into a response:
 
 ```dodo
 package web_routes
 import "std/web"
-import "std/web/application"
 import "std/web/app"
 
-pub struct Home {
-    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
-        return response.html(b"<!doctype html><h1>Dodo</h1><a href=\"/hello/Dodo\">Say hello</a>")
-    }
-}
 pub struct Greeting {
     pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
-        match request.parameter(b"name") {
-            some(name) => { return response.text(name) }
-            none => { return err(web.failure(web.Error.NotFound)) }
-        }
-    }
-}
-pub struct Echo {
-    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
-        return response.bytes(request.body())
+        response.text(b"Hello, ")?
+        response.append(request.param(b"name")?)?
+        return response.append(request.query_or(b"suffix", b"!"))
     }
 }
 fn main() -> i32 {
-    routes := application.new()
-        .get(b"/", Home {})!
-        .get(b"/hello/:name", Greeting {})!
-        .post(b"/echo", Echo {})!
-    server := app.Server.new(routes)
-    match server.serve(b"127.0.0.1:8080") {
-        ok(report) => { if report.failed != 0 { return 2 }; return 0 }
-        err(_) => { return 1 }
-    }
+    return app.new()
+        .get(b"/", web.html(b"<h1>Dodo</h1>"))
+        .get(b"/hello/:name", Greeting {})
+        .post(b"/created", web.json(b"{\"created\":true}").status(201))
+        .get(b"/old", web.redirect(b"/"))
+        .run(b"127.0.0.1:8080")
 }
 ```
 
-`get(pattern, handler)`, `post(pattern, handler)`, and
-`route(method, pattern, handler)` consume the previous application and return a
-Result containing the extended application. These examples unwrap literal
-registration errors with `!`; use `?` or `match` for fallible setup. Registration
-checks patterns, methods, ambiguous routes, and the eight-route
-`application.ROUTE_CAPACITY` bound. A ninth registration returns
-`web.Error.BufferFull`. Route IDs are assigned in registration order; handlers
-use request parameters and metadata without an ID dispatch switch. Literal
-precedence, parameter/wildcard matching, HEAD fallback, and 404/405 behavior
-come from the existing router.
+`/hello/Ada` responds with `Hello, Ada!`; `/hello/Ada?suffix=+friend` responds
+with `Hello, Ada friend`. See the complete [multi-route example](https://github.com/Jotrorox/dodo/blob/main/examples/web_routes.dodo)
+for a body echo route too.
 
-Handlers are owned inline in a generic chain and keep their state between
-requests. Dodo supports named structs with public `handle` methods; it has no
-closures or ordinary function values. The bounded chain suits small applications;
-deeply nested generic types are expensive in the current compiler. Larger route
-tables can use `web.Router` and the existing runners with their own dispatcher.
-Route patterns and any handler borrows must outlive the application.
+| Registration | Purpose |
+| --- | --- |
+| `.get`, `.post`, `.put`, `.patch`, `.delete`, `.head`, `.options` | Register a method and path pattern |
+| `.route(method, pattern, handler)` | Register another case-sensitive method |
+| `.middleware(value)` | Apply middleware to every matched route |
+| `.concurrent()` | Enable concurrent socket progress on the hosted builder |
+| `.max_connections(count)` | Stop after this many accepted connections; zero is unlimited |
+| `.build()` | Validate setup and obtain a reusable application/server for tests or configuration |
+| `.run(address)` | Serve with error printing and a process exit code |
+| `.serve(address)`, `.serve_until(address, cancel)` | Serve with a Result and detailed report |
 
-`Server.new(application)` owns the application and configuration. Serving consumes
-the server, unpacks routes and handlers into separate local values, and drops
-handler state when serving returns. This accommodates Dodo's conservative
-borrowing rules without pointer erasure or callbacks retaining request storage.
-Borrow external state in a handler when it must remain available after serving.
+Registration consumes the builder and returns its new type, so chain calls or
+bind their result. It retains the **first** registration error; `build`, `serve`,
+and `run` report it before binding a socket. A duplicate route produces a
+printable diagnostic such as:
+
+```text
+web route #2 (GET /:second): web: AmbiguousRoute; this method and path shape are already registered
+```
+
+`RegistrationError` exposes `kind`, `method`, `pattern`, and the zero-based
+`index`. Fluent serving returns `app.Error`, with either `registration` or
+`serving` populated. `build()` returns `application.RegistrationError` directly;
+serving on a built `Server` returns the underlying `hosting.Error`.
+
+Routes use `/users/:id` for a segment and `/files/*rest` for a final wildcard.
+Literal paths take precedence. HEAD falls back to GET, unmatched paths return
+404, and unsupported methods on a matching path return 405. There is no automatic
+OPTIONS response or trailing-slash redirect.
+
+The fluent builder stores up to eight routes (`application.ROUTE_CAPACITY`).
+Handlers are owned inline, retain state between requests, and use ordinary
+compiler-checked methods. Dodo currently has no closures or function values;
+large generic chains are costly to compile. Larger tables can use `web.Router`
+and an explicit dispatcher. Route patterns and handler borrows must outlive the
+application. No request/response borrow can escape into handler state.
+
+### Ready-made responses
+
+`web.text(body)`, `web.html(body)`, `web.json(body)`, and `web.bytes(body)` return
+ordinary handlers. `.status(code)` changes their status; validation occurs when
+they handle a request. `web.redirect(location)` defaults to 303 (See Other);
+`.status(301)`, 302, 307, and 308 select other redirect behaviors.
+
+Text and HTML validate UTF-8. JSON accepts **already serialized UTF-8 JSON**; it
+does not serialize structs or validate JSON syntax. HTML helpers do not escape
+untrusted text. Body and header bytes are copied into bounded response storage.
+
+## Test without a server
+
+Use `application.builder()` for portable application tests. It offers the same
+route and middleware methods; `build()` returns an `Application` without hosted
+configuration. `request(method, target)` decodes and dispatches a request in
+process, returning an owned response:
+
+```dodo test
+package web_test
+import "std/web"
+import "std/web/application"
+
+@test
+fn health_check() {
+    site := application.builder()
+        .get(b"/health", web.json(b"{\"ok\":true}"))
+        .build()!
+
+    site.request(b"GET", b"/health")
+        .expect_status(200)
+        .expect_header(b"Content-Type", b"application/json")
+        .expect_body(b"{\"ok\":true}")
+    site.request(b"GET", b"/missing").expect_status(404)
+    site.request(b"HEAD", b"/health").expect_status(200).expect_body(b"")
+}
+```
+
+Run `dodo test`. Responses own their bytes and remain valid after another request
+or after dropping the application. Inspect `status()`, `body()`, `header(name)`,
+or `header_at(index)` directly, or chain the consuming `expect_*` assertions.
+The response's `failure` field retains a handler/decoding failure for debugging;
+HTTP error bodies stay empty and partial handler output is discarded.
+
+For headers and request bodies, import `std/web/testing`:
+
+```dodo test
+package echo_test
+import "std/web"
+import "std/web/application"
+import "std/web/testing"
+
+pub struct Echo {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        response.header(b"X-Token", request.require_header(b"X-Token")?)?
+        return response.bytes(request.body())
+    }
+}
+@test
+fn echoes_body() {
+    site := application.builder().post(b"/echo", Echo {}).build()!
+    input := testing.Request.new(b"POST", b"/echo").body(b"hello")
+    input.header(b"X-Token", b"test")!
+    site.request_with(&input)
+        .expect_status(200)
+        .expect_header(b"X-Token", b"test")
+        .expect_body(b"hello")
+}
+```
+
+Built hosted servers expose the same `request` and `request_with` methods.
+Tests run the real router, decoding, handler state, and middleware. They use fixed
+4 KiB bodies, 4 KiB/32-field headers, and 2 KiB path and query buffers (100 query
+pairs). They do not simulate HTTP framing, socket behavior, deadlines, or custom
+server limits. Request IDs are 1 for each synthetic request. Keep independent
+HTTP integration tests for those boundaries.
+
+### Existing registration API
+
+`application.new().get(pattern, handler)!` and `app.Server.new(routes)` remain
+available. Each registration returns a Result immediately. This API now also
+has all seven method shortcuts and the same in-process testing methods. The
+fluent builder is the simpler default for new apps.
 
 ## Configuration and storage
 
@@ -241,36 +294,14 @@ Select concurrent execution on the same server object:
 
 ```dodo
 package web_server_concurrent
-import "std/console"
 import "std/web"
-import "std/web/application"
 import "std/web/app"
 
-pub struct Hello {
-    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
-        return response.text(b"Hello, Dodo!\n")
-    }
-}
 fn main() -> i32 {
-    routes := application.new().get(b"/", Hello {})!
-    server := app.Server.new(routes)
-    server.config.execution = app.Execution.Concurrent
-    match server.serve(b"127.0.0.1:8080") {
-        ok(report) => {
-            if report.failed != 0 {
-                return 2
-            };
-            return 0
-        }
-        err(reason) => {
-            errors := console.stderr()
-            match errors.println(&reason) {
-                ok(_) => {}
-                err(_) => {}
-            }
-            return 1
-        }
-    }
+    return app.new()
+        .get(b"/", web.text(b"Hello, Dodo!\n"))
+        .concurrent()
+        .run(b"127.0.0.1:8080")
 }
 ```
 
@@ -388,14 +419,13 @@ pub struct Greeting {
     pub fn handle(&mut self, request: &mut web.Request,
         response: &mut web.Response) -> void!web.Failure {
         response.set_status(201)?
-        response.header(b"Content-Type", b"application/json")?
         response.header(b"X-Request-Method", request.method())?
-        return response.text(b"{\"hello\":\"Dodo\"}")
+        return response.json(b"{\"hello\":\"Dodo\"}")
     }
 }
 ```
 
-Register this handler with `application.new().get(b"/hello/:name", Greeting {})!` and pass the application to `app.Server.new`. See the complete
+Register this handler with `app.new().get(b"/hello/:name", Greeting {})`. See the complete
 [`web_response.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/web_response.dodo)
 example for HTML and route/query access.
 
@@ -409,6 +439,12 @@ example for HTML and route/query access.
 | `request.header(name, occurrence)` | `Option<&[u8]>`; ASCII case-insensitive name |
 | `request.query(name, occurrence)` | `Option<&[u8]>`; case-sensitive decoded name |
 | `request.parameter(name)` | `Option<&[u8]>`; named route capture in the decoded path |
+| `request.param(name)` | Required route capture; use `?` to reject missing input with 400 |
+| `request.param_u64(name)` | Required ASCII decimal capture, checked for overflow; invalid input returns 400 |
+| `request.header_value(name)`, `query_value(name)` | First occurrence as an Option |
+| `request.require_header(name)`, `require_query(name)` | First occurrence as a Result; missing input returns 400 |
+| `request.query_or(name, fallback)` | First value, or fallback when absent; preserves empty values |
+| `request.query_u64(name, fallback)` | First ASCII decimal value; missing uses fallback, empty/invalid/overflow returns 400 |
 
 Occurrences start at zero. Headers and query pairs preserve duplicates in wire
 order; lookup never combines comma-separated values or chooses a last value.
@@ -441,6 +477,12 @@ The checker enforces this without unchecked pointers or callback lifetime casts.
 | Method | Behavior |
 | --- | --- |
 | `response.set_status(code)` | Select a final status, 200–599 |
+| `response.json(bytes)` | Copy already serialized UTF-8 JSON; default type `application/json` |
+| `response.append(bytes)` | Append bytes to the current body within its capacity |
+| `response.empty(code)` | Set a status and clear the body |
+| `response.redirect(location)` | Empty 303 response with a validated Location header |
+| `response.redirect_to(location, code)` | Redirect with 301, 302, 303, 307, or 308 |
+| `response.header_value(name)` | Inspect the first response header without case sensitivity |
 | `response.header(name, value)` | Copy and append a validated header |
 | `response.text(bytes)` | Validate UTF-8 and copy the body; default type `text/plain; charset=utf-8` |
 | `response.html(bytes)` | Validate UTF-8 and copy the body; default type `text/html; charset=utf-8` |
@@ -469,6 +511,12 @@ of handler locals or request data. Failed setters leave the existing response
 unchanged. Propagate errors with `?` to discard the whole response; a handler may
 also catch an error and deliberately build a smaller response.
 
+Use `return err(web.reject(401))` for an intentional HTTP rejection, or propagate
+required/numeric input failures with `?`. Valid rejection codes are 400–599;
+invalid codes become internal 500 errors. `Failure.status()` exposes the selected
+status. Ordinary `web.failure(...)` values remain internal 500 errors when
+returned by a handler. Serial, concurrent, and in-process dispatch agree.
+
 `web.Failure` keeps a `kind: web.Error`, plus optional underlying `http.Error`
 and `text.Error` diagnostics. Response capacity and header/status validation errors retain
 protocol kind and position; invalid UTF-8 retains its exact text diagnostic.
@@ -479,10 +527,46 @@ them. `serve_connection` returns the original error even when it successfully
 sends an error response (`reason.responded == true`); the serial server counts
 these as rejected connections. Inspect reports as well as startup Results.
 
+### Middleware composition
+
+Register a struct with public `before` and `after` methods using
+`.middleware(value)`. It applies to **every matched route**, including routes
+added earlier or later. Multiple middleware values run `before` in registration
+order and `after` in reverse order. Routing errors occur before middleware.
+
+```dodo test
+package middleware_test
+import "std/web"
+import "std/web/application"
+
+pub struct RequireToken {
+    pub fn before(&mut self, request: &mut web.Request) -> void!web.Failure {
+        match request.header_value(b"Authorization") {
+            some(_) => { return ok() }
+            none => { return err(web.reject(401)) }
+        }
+    }
+    pub fn after(&mut self, request: &mut web.Request, status: u16) {}
+}
+@test
+fn rejects_missing_token() {
+    site := application.builder()
+        .get(b"/private", web.text(b"Hello"))
+        .middleware(RequireToken {})
+        .build()!
+    site.request(b"GET", b"/private").expect_status(401).expect_body(b"")
+}
+```
+
+This demonstrates a header-presence check; a real authentication middleware also
+validates the token. For middleware on one route, register
+`web.with(handler, middleware)` as its handler.
+
 `Chain<A,B>` invokes `before(request)` outer-to-inner and `after(request, status)`
 inner-to-outer. `before` returns `void!web.Failure`; a failure short-circuits
 without invoking the handler or `after`. Handler failure invokes `after` with
-500 and preserves the failure. Cancellation before dispatch invokes neither.
+the failure’s HTTP status (500 by default) and preserves the failure. Cancellation
+before dispatch invokes neither.
 Applications own any additional handler or middleware state.
 
 The lower-level streaming `Context` remains separate. `ErrorResponses` maps its

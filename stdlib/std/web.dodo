@@ -1,7 +1,7 @@
 package web
 
-import "core/bytes"
-import "std/text"
+import "core/bytes" as raw
+import "std/text" as utf8
 import "std/http"
 import "std/io"
 
@@ -65,7 +65,7 @@ pub fn validate_path(path: &[u8]) -> void!Error {
     if path.len == 0 || path[0] != 47 {
         return err(Error.InvalidPath)
     }
-    match text.validate(path) {
+    match utf8.validate(path) {
         ok() => {}
         err(_) => {
             return err(Error.InvalidPath)
@@ -75,7 +75,7 @@ pub fn validate_path(path: &[u8]) -> void!Error {
     for at in 1usize..path.len + 1 {
         if at == path.len || path[at] == 47 {
             part := &path[start..at]
-            if bytes.equal(part, b".") || bytes.equal(part, b"..") {
+            if raw.equal(part, b".") || raw.equal(part, b"..") {
                 return err(Error.InvalidPath)
             }
             start = at + 1
@@ -154,7 +154,7 @@ fn validate_pattern(path: &[u8]) -> void!Error {
             for previous < at {
                 previous_end := end_segment(path, previous)
                 if segment_kind(path, previous, previous_end) != 3 &&
-                    bytes.equal(&path[previous + 1..previous_end], &path[at + 1..end]) {
+                    raw.equal(&path[previous + 1..previous_end], &path[at + 1..end]) {
                     return err(Error.InvalidPattern)
                 }
                 previous = previous_end + 1
@@ -179,7 +179,7 @@ fn same_shape(a: &[u8], b: &[u8]) -> bool {
         be := end_segment(b, bi)
         ak := segment_kind(a, ai, ae)
         bk := segment_kind(b, bi, be)
-        if ak != bk || (ak == 3 && !bytes.equal(&a[ai..ae], &b[bi..be])) {
+        if ak != bk || (ak == 3 && !raw.equal(&a[ai..ae], &b[bi..be])) {
             return false
         }
         ai = ae + 1
@@ -200,7 +200,7 @@ fn matches_path(pattern: &[u8], path: &[u8]) -> bool {
         if kind == 2 && se == si {
             return false
         }
-        if kind == 3 && !bytes.equal(&pattern[pi..pe], &path[si..se]) {
+        if kind == 3 && !raw.equal(&pattern[pi..pe], &path[si..se]) {
             return false
         }
         pi = pe + 1
@@ -270,7 +270,7 @@ pub struct Router {
                 dynamic = true;
                 sorted = false
             }
-            if i != 0 && bytes.compare(routes[i - 1].pattern, routes[i].pattern) > 0 {
+            if i != 0 && raw.compare(routes[i - 1].pattern, routes[i].pattern) > 0 {
                 sorted = false
             }
         }
@@ -278,10 +278,10 @@ pub struct Router {
             j := i
             for j != 0 {
                 j -= 1
-                if sorted && !bytes.equal(routes[i].pattern, routes[j].pattern) {
+                if sorted && !raw.equal(routes[i].pattern, routes[j].pattern) {
                     break
                 }
-                if bytes.equal(routes[i].method, routes[j].method) && same_shape(routes[i].pattern, routes[j].pattern) {
+                if raw.equal(routes[i].method, routes[j].method) && same_shape(routes[i].pattern, routes[j].pattern) {
                     return err(Error.AmbiguousRoute)
                 }
             }
@@ -310,7 +310,7 @@ pub struct Router {
                 at := path_hash(routes[i].pattern) % storage.len
                 for storage[at] != 0 {
                     previous := storage[at] - 1
-                    if bytes.equal(routes[i].pattern, routes[previous].pattern) && bytes.equal(routes[i].method, routes[previous].method) {
+                    if raw.equal(routes[i].pattern, routes[previous].pattern) && raw.equal(routes[i].method, routes[previous].method) {
                         return err(Error.AmbiguousRoute)
                     }
                     at = (at + 1) % storage.len
@@ -319,7 +319,7 @@ pub struct Router {
             } else {
                 dynamic = true
                 for j in 0usize..i {
-                    if bytes.equal(routes[i].method, routes[j].method) && same_shape(routes[i].pattern, routes[j].pattern) {
+                    if raw.equal(routes[i].method, routes[j].method) && same_shape(routes[i].pattern, routes[j].pattern) {
                         return err(Error.AmbiguousRoute)
                     }
                 }
@@ -333,19 +333,19 @@ pub struct Router {
             return err(Error.InvalidMethod)
         }
         validate_path(path)?
-        head := bytes.equal(method, b"HEAD")
+        head := raw.equal(method, b"HEAD")
         fallback := self.routes.len
         if self.index.len != 0 {
             at := path_hash(path) % self.index.len
             matched := false
             for self.index[at] != 0 {
                 i := self.index[at] - 1
-                if bytes.equal(self.routes[i].pattern, path) {
+                if raw.equal(self.routes[i].pattern, path) {
                     matched = true
-                    if bytes.equal(method, self.routes[i].method) {
+                    if raw.equal(method, self.routes[i].method) {
                         return ok(Match { index: i, id: self.routes[i].id, head: head })
                     }
-                    if head && bytes.equal(self.routes[i].method, b"GET") {
+                    if head && raw.equal(self.routes[i].method, b"GET") {
                         fallback = i
                     }
                 }
@@ -365,19 +365,19 @@ pub struct Router {
             upper := self.routes.len
             for lower < upper {
                 middle := lower + (upper - lower) / 2
-                if bytes.compare(self.routes[middle].pattern, path) < 0 {
+                if raw.compare(self.routes[middle].pattern, path) < 0 {
                     lower = middle + 1
                 } else {
                     upper = middle
                 }
             }
             matched := false
-            for lower < self.routes.len && bytes.equal(self.routes[lower].pattern, path) {
+            for lower < self.routes.len && raw.equal(self.routes[lower].pattern, path) {
                 matched = true
-                if bytes.equal(method, self.routes[lower].method) {
+                if raw.equal(method, self.routes[lower].method) {
                     return ok(Match { index: lower, id: self.routes[lower].id, head: head })
                 }
-                if head && bytes.equal(self.routes[lower].method, b"GET") {
+                if head && raw.equal(self.routes[lower].method, b"GET") {
                     fallback = lower
                 }
                 lower += 1
@@ -401,10 +401,10 @@ pub struct Router {
                 } else if!same_shape(self.routes[i].pattern, self.routes[best].pattern) {
                     continue
                 }
-                if bytes.equal(method, self.routes[i].method) {
+                if raw.equal(method, self.routes[i].method) {
                     selected = i
                 }
-                if head && bytes.equal(self.routes[i].method, b"GET") {
+                if head && raw.equal(self.routes[i].method, b"GET") {
                     fallback = i
                 }
             }
@@ -435,7 +435,7 @@ pub struct Router {
             pe := end_segment(pattern, pi)
             se := end_segment(path, si)
             kind := segment_kind(pattern, pi, pe)
-            if kind != 3 && bytes.equal(&pattern[pi + 1..pe], name) {
+            if kind != 3 && raw.equal(&pattern[pi + 1..pe], name) {
                 if kind == 1 {
                     se = path.len
                 }
@@ -460,7 +460,15 @@ pub struct Context {
 pub struct Failure {
     pub kind: Error
     pub protocol: Option<http.Error>
-    pub encoding: Option<text.Error>
+    pub encoding: Option<utf8.Error>
+    // Zero keeps internal failures private (500); reject() sets an HTTP status.
+    pub response_status: u16
+    pub fn status(&self) -> u16 {
+        if self.response_status >= 400 && self.response_status <= 599 {
+            return self.response_status
+        }
+        return 500
+    }
     pub fn format<F>(&self, output: &mut F) -> void!io.Error {
         output.string("web: ")?
         match &self.kind {
@@ -524,19 +532,32 @@ pub struct Failure {
             }
             none => {}
         }
+        if self.response_status != 0 {
+            output.string("; HTTP ")?
+            output.natural(self.status() as u64)?
+        }
         return ok()
     }
 
 }
 pub fn failure(kind: Error) -> Failure {
-    return Failure { kind: kind, protocol: none, encoding: none }
+    return Failure { kind: kind, protocol: none, encoding: none, response_status: 0 }
+}
+// An intentional HTTP rejection. Invalid codes remain internal errors.
+pub fn reject(status: u16) -> Failure {
+    if status < 400 || status > 599 {
+        return failure(Error.InvalidStatus)
+    }
+    result := failure(Error.Handler)
+    result.response_status = status
+    return result
 }
 pub fn protocol_failure(kind: Error, reason: http.Error) -> Failure {
     result := failure(kind)
     result.protocol = some(reason)
     return result
 }
-fn encoding_failure(kind: Error, reason: text.Error) -> Failure {
+fn encoding_failure(kind: Error, reason: utf8.Error) -> Failure {
     result := failure(kind)
     result.encoding = some(reason)
     return result
@@ -634,7 +655,7 @@ fn lookup(data: &[u8], name: &[u8], occurrence: usize, insensitive: bool) -> Opt
         if last == data.len {
             return none
         }
-        equal := bytes.equal(&data[at..end], name)
+        equal := raw.equal(&data[at..end], name)
         if insensitive {
             equal = http.equal_ascii(&data[at..end], name)
         }
@@ -701,7 +722,7 @@ fn query_part(raw: &[u8], output: &mut[u8], base: usize) -> usize!Failure {
         output[used] = value
         used += 1
     }
-    match text.validate(&output[..used]) {
+    match utf8.validate(&output[..used]) {
         ok() => {}
         err(reason) => {
             return err(encoding_failure(Error.InvalidQuery, reason))
@@ -785,6 +806,66 @@ pub struct Request {
     pub fn query(&self, name: &[u8], occurrence: usize) -> Option<&[u8]> from(self) {
         return lookup(self.queries, name, occurrence, false)
     }
+    // Common single-value access; occurrence-based access remains available.
+    pub fn header_value(&self, name: &[u8]) -> Option<&[u8]> from(self) {
+        return self.header(name, 0)
+    }
+    pub fn query_value(&self, name: &[u8]) -> Option<&[u8]> from(self) {
+        return self.query(name, 0)
+    }
+    pub fn query_or(&self, name: &[u8], fallback: &[u8]) -> &[u8] from(self, fallback) {
+        match self.query_value(name) {
+            some(value) => {
+                return value
+            }
+            none => {
+                return fallback
+            }
+        }
+    }
+    pub fn require_query(&self, name: &[u8]) -> &[u8]!Failure from(self) {
+        match self.query_value(name) {
+            some(value) => {
+                return ok(value)
+            }
+            none => {
+                return err(reject(400))
+            }
+        }
+    }
+    pub fn require_header(&self, name: &[u8]) -> &[u8]!Failure from(self) {
+        match self.header_value(name) {
+            some(value) => {
+                return ok(value)
+            }
+            none => {
+                return err(reject(400))
+            }
+        }
+    }
+    pub fn param(&self, name: &[u8]) -> &[u8]!Failure from(self) {
+        match self.parameter(name) {
+            some(value) => {
+                return ok(value)
+            }
+            none => {
+                return err(reject(400))
+            }
+        }
+    }
+    pub fn param_u64(&self, name: &[u8]) -> u64!Failure {
+        return decimal(self.param(name)?)
+    }
+    pub fn query_u64(&self, name: &[u8], fallback: u64) -> u64!Failure {
+        match self.query_value(name) {
+            some(value) => {
+                return decimal(value)
+            }
+            none => {
+                return ok(fallback)
+            }
+        }
+    }
     pub fn parameter(&self, name: &[u8]) -> Option<&[u8]> from(self) {
         match self.router.parameter(self.route, self.decoded_path, name) {
             some(part) => {
@@ -793,6 +874,23 @@ pub struct Request {
             none => {
                 return none
             }
+        }
+    }
+}
+
+// HTTP numeric inputs are nonempty ASCII decimal digits; no signs or spaces.
+fn decimal(value: &[u8]) -> u64!Failure {
+    for digit in value {
+        if *digit < 48 || *digit > 57 {
+            return err(reject(400))
+        }
+    }
+    match utf8.parse_u64(value, 10) {
+        ok(number) => {
+            return ok(number)
+        }
+        err(_) => {
+            return err(reject(400))
         }
     }
 }
@@ -832,6 +930,9 @@ pub struct Response {
     pub fn header_at(&self, index: usize) -> Option<http.Header> from(self) {
         return field_at(self.fields.bytes(), index)
     }
+    pub fn header_value(&self, name: &[u8]) -> Option<&[u8]> from(self) {
+        return lookup(self.fields.bytes(), name, 0, true)
+    }
     pub fn body(&self) -> &[u8] {
         return &self.data[..self.used]
     }
@@ -845,11 +946,40 @@ pub struct Response {
         self.used = body.len
         return ok()
     }
+    // Append supports small dynamic responses without a second scratch buffer.
+    pub fn append(&mut self, body: &[u8]) -> void!Failure {
+        if body.len > self.data.len - self.used {
+            return err(protocol_failure(Error.BufferFull, http.failure(http.ErrorKind.BufferFull, body.len)))
+        }
+        for i in 0usize..body.len {
+            self.data[self.used + i] = body[i]
+        }
+        self.used += body.len
+        return ok()
+    }
+    pub fn empty(&mut self, status: u16) -> void!Failure {
+        self.set_status(status)?
+        self.used = 0
+        return ok()
+    }
+    pub fn redirect(&mut self, location: &[u8]) -> void!Failure {
+        return self.redirect_to(location, 303)
+    }
+    pub fn redirect_to(&mut self, location: &[u8], status: u16) -> void!Failure {
+        if status != 301 && status != 302 && status != 303 && status != 307 && status != 308 {
+            return err(failure(Error.InvalidStatus))
+        }
+        if location.len == 0 || has_field(self.fields.bytes(), b"Location") {
+            return err(failure(Error.InvalidHeader))
+        }
+        self.header(b"Location", location)?
+        return self.empty(status)
+    }
     fn textual(&mut self, body: &[u8], content_type: &[u8]) -> void!Failure {
         if body.len > self.data.len {
             return err(protocol_failure(Error.BufferFull, http.failure(http.ErrorKind.BufferFull, body.len)))
         }
-        match text.validate(body) {
+        match utf8.validate(body) {
             ok() => {}
             err(reason) => {
                 return err(encoding_failure(Error.Handler, reason))
@@ -866,6 +996,16 @@ pub struct Response {
     pub fn html(&mut self, body: &[u8]) -> void!Failure {
         return self.textual(body, b"text/html; charset=utf-8")
     }
+    // Already serialized JSON; validates UTF-8, not JSON syntax.
+    pub fn json(&mut self, body: &[u8]) -> void!Failure {
+        return self.textual(body, b"application/json")
+    }
+
+}
+
+// Shared buffered-response policy for hosted and in-process dispatch.
+pub fn bodyless(method: &[u8], status: u16) -> bool {
+    return raw.equal(method, b"HEAD") || status == 204 || status == 205 || status == 304
 }
 
 // The callback cannot retain request or response borrows in handler state.
@@ -874,6 +1014,53 @@ pub fn handle<H>(handler: &mut H, request: &mut Request, response: &mut Response
         return err(failure(Error.Cancelled))
     }
     return handler.handle(request, response)
+}
+// Static responses are ordinary handlers and work with every runner.
+pub struct Reply {
+    data: &[u8]
+    content_type: &[u8]
+    location: &[u8]
+    redirecting: bool
+    code: u16
+    pub fn status(self, code: u16) -> Reply from(self) {
+        self.code = code
+        return self
+    }
+    pub fn handle(&mut self, request: &mut Request, response: &mut Response) -> void!Failure {
+        if self.redirecting {
+            return response.redirect_to(self.location, self.code)
+        }
+        response.set_status(self.code)?
+        if self.content_type.len == 0 {
+            return response.bytes(self.data)
+        }
+        return response.textual(self.data, self.content_type)
+    }
+}
+pub fn text(body: &[u8]) -> Reply from(body) {
+    return Reply { data: body, content_type: b"text/plain; charset=utf-8", location: b"", redirecting: false, code: 200 }
+}
+pub fn html(body: &[u8]) -> Reply from(body) {
+    return Reply { data: body, content_type: b"text/html; charset=utf-8", location: b"", redirecting: false, code: 200 }
+}
+pub fn json(body: &[u8]) -> Reply from(body) {
+    return Reply { data: body, content_type: b"application/json", location: b"", redirecting: false, code: 200 }
+}
+pub fn bytes(body: &[u8]) -> Reply from(body) {
+    return Reply { data: body, content_type: b"", location: b"", redirecting: false, code: 200 }
+}
+pub fn redirect(location: &[u8]) -> Reply from(location) {
+    return Reply { data: b"", content_type: b"", location: location, redirecting: true, code: 303 }
+}
+pub struct WithMiddleware<H, M> {
+    pub handler: H
+    pub middleware: M
+    pub fn handle(&mut self, request: &mut Request, response: &mut Response) -> void!Failure {
+        return dispatch(&mut self.middleware, &mut self.handler, request, response)
+    }
+}
+pub fn with<H, M>(handler: H, middleware: M) -> WithMiddleware<H, M> from(handler, middleware) {
+    return WithMiddleware { handler: handler, middleware: middleware }
 }
 pub struct Chain<A, B> {
     pub outer: A
@@ -904,7 +1091,7 @@ pub fn dispatch<M, H>(middleware: &mut M, handler: &mut H, request: &mut Request
             return ok()
         }
         err(reason) => {
-            middleware.after(request, 500);
+            middleware.after(request, reason.status());
             return err(reason)
         }
     }

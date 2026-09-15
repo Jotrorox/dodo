@@ -32,6 +32,22 @@ fn dispatch<H>(table: &application.Table, handler: &mut H, method: &[u8], path: 
     assert(bytes.equal(response.body(), expected))
 }
 fn main() -> i32 {
+    match application.builder()
+        .get(b"/1", web.text(b"")).get(b"/2", web.text(b""))
+        .get(b"/3", web.text(b"")).get(b"/4", web.text(b""))
+        .get(b"/5", web.text(b"")).get(b"/6", web.text(b""))
+        .get(b"/7", web.text(b"")).get(b"/8", web.text(b""))
+        .get(b"/overflow", web.text(b"")).build() {
+        err(reason) => {
+            assert(reason.kind == web.Error.BufferFull)
+            assert_eq(reason.index, application.ROUTE_CAPACITY)
+            assert(bytes.equal(reason.pattern, b"/overflow"))
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+
     routes := application.new()
         .get(b"/hello/:name", Parameter {})!
         .get(b"/hello/fixed", Text { body: b"literal" })!

@@ -1,6 +1,10 @@
 package app
 
 import "std/web/application"
+import "std/web"
+import "std/web/testing"
+import "std/io"
+import "std/console"
 import "std/web/hosted"
 import "std/web/reactor"
 import "std/http/hosting"
@@ -94,6 +98,12 @@ pub struct Server<H> {
     pub fn new(application: application.Application<H>) -> Server<H> from(application) {
         return Server { application: application, config: Config.defaults() }
     }
+    pub fn request(&mut self, method: &[u8], target: &[u8]) -> testing.Response {
+        return self.application.request(method, target)
+    }
+    pub fn request_with(&mut self, input: &testing.Request) -> testing.Response {
+        return self.application.request_with(input)
+    }
     pub fn serve(self, address: &[u8]) -> hosted.Report!hosting.Error {
         cancel := net.NeverCancel {}
         return self.serve_until(address, &cancel)
@@ -145,4 +155,124 @@ pub struct Server<H> {
         return hosted.serve_with(address, table.routes(), &mut handler,
         storage.workspace, storage.request, storage.response, config.serial(), &mut acceptor, clock, cancel)
     }
+}
+
+// One error boundary for fluent setup and hosted serving.
+pub struct Error {
+    pub registration: Option<application.RegistrationError>
+    pub serving: Option<hosting.Error>
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        match &self.registration {
+            some(reason) => {
+                return reason.format(output)
+            }
+            none => {}
+        }
+        match &self.serving {
+            some(reason) => {
+                return reason.format(output)
+            }
+            none => {
+                return output.string("web: unknown startup failure")
+            }
+        }
+    }
+}
+pub struct Builder<H, M> {
+    routes: application.Builder<H, M>
+    pub config: Config
+    pub fn route<N>(self, method: &[u8], pattern: &[u8], handler: N) -> Builder<application.Handlers<H, N>, M> from(self, method, pattern, handler) {
+        let Builder { routes: routes, config: config } = self
+        return Builder { routes: routes.route(method, pattern, handler), config: config }
+    }
+    pub fn get<N>(self, pattern: &[u8], handler: N) -> Builder<application.Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"GET", pattern, handler)
+    }
+    pub fn post<N>(self, pattern: &[u8], handler: N) -> Builder<application.Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"POST", pattern, handler)
+    }
+    pub fn put<N>(self, pattern: &[u8], handler: N) -> Builder<application.Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"PUT", pattern, handler)
+    }
+    pub fn patch<N>(self, pattern: &[u8], handler: N) -> Builder<application.Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"PATCH", pattern, handler)
+    }
+    pub fn delete<N>(self, pattern: &[u8], handler: N) -> Builder<application.Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"DELETE", pattern, handler)
+    }
+    pub fn head<N>(self, pattern: &[u8], handler: N) -> Builder<application.Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"HEAD", pattern, handler)
+    }
+    pub fn options<N>(self, pattern: &[u8], handler: N) -> Builder<application.Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"OPTIONS", pattern, handler)
+    }
+    pub fn middleware<N>(self, middleware: N) -> Builder<H, web.Chain<M, N>> from(self, middleware) {
+        let Builder { routes: routes, config: config } = self
+        return Builder { routes: routes.middleware(middleware), config: config }
+    }
+    pub fn concurrent(self) -> Builder<H, M> from(self) {
+        self.config.execution = Execution.Concurrent
+        return self
+    }
+    pub fn max_connections(self, count: usize) -> Builder<H, M> from(self) {
+        self.config.max_connections = count
+        return self
+    }
+    pub fn build(self) -> Server<web.WithMiddleware<H, M>>!application.RegistrationError from(self) {
+        let Builder { routes: routes, config: config } = self
+        return ok(Server { application: routes.build()?, config: config })
+    }
+    // Main-function convenience: printable startup failures and an exit code.
+    pub fn run(self, address: &[u8]) -> i32 {
+        match self.serve(address) {
+            ok(report) => {
+                if report.failed != 0 {
+                    match &report.last_error {
+                        some(reason) => {
+                            errors := console.stderr()
+                            match errors.println(reason) {
+                                ok(_) => {}
+                                err(_) => {}
+                            }
+                        }
+                        none => {}
+                    }
+                    return 2
+                }
+                return 0
+            }
+            err(reason) => {
+                errors := console.stderr()
+                match errors.println(&reason) {
+                    ok(_) => {}
+                    err(_) => {}
+                }
+                return 1
+            }
+        }
+    }
+    pub fn serve(self, address: &[u8]) -> hosted.Report!Error from(self) {
+        cancel := net.NeverCancel {}
+        return self.serve_until(address, &cancel)
+    }
+    pub fn serve_until<X>(self, address: &[u8], cancel: &X) -> hosted.Report!Error from(self) {
+        match self.build() {
+            ok(server) => {
+                match server.serve_until(address, cancel) {
+                    ok(report) => {
+                        return ok(report)
+                    }
+                    err(reason) => {
+                        return err(Error { registration: none, serving: some(reason) })
+                    }
+                }
+            }
+            err(reason) => {
+                return err(Error { registration: some(reason), serving: none })
+            }
+        }
+    }
+}
+pub fn new() -> Builder<application.Empty, web.NoMiddleware> from(static) {
+    return Builder { routes: application.builder(), config: Config.defaults() }
 }

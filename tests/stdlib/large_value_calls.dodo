@@ -1,0 +1,110 @@
+package large_value_calls
+import "core/ptr"
+
+struct Guard {
+    drops: *mut i32
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.drops, ptr.read(self.drops) + 1)
+        }
+    }
+}
+struct Buffer {
+    data: [1024]u8
+    guard: Guard
+}
+fn make(drops: *mut i32) -> Buffer {
+    value := Buffer { data: [0u8; 1024], guard: Guard { drops: drops } }
+    value.data[0] = 17
+    value.data[1023] = 93
+    return value
+}
+fn recurse(value: Buffer, count: usize) -> Buffer {
+    if count == 0 {
+        return value
+    }
+    value.data[count] = count as u8
+    return recurse(value, count - 1)
+}
+fn through(value: Buffer, fail: bool) -> Buffer!i32 {
+    if fail {
+        return err(7)
+    }
+    return ok(recurse(value, 3))
+}
+fn propagate(value: Buffer, fail: bool) -> Buffer!i32 {
+    result := through(value, fail)?
+    return ok(result)
+}
+fn fail_large(drops: *mut i32) -> i32!Buffer {
+    return err(make(drops))
+}
+fn propagate_large(drops: *mut i32) -> i32!Buffer {
+    value := fail_large(drops)?
+    return ok(value)
+}
+fn copied(value: [1024]u8) -> [1024]u8 {
+    value[0] = 99
+    return value
+}
+struct Plain {
+    data: [1025]u8
+}
+struct MutateOnDrop {
+    target: *mut u8
+    fn drop(&mut self) {
+        unsafe {
+            ptr.write(self.target, 99u8)
+        }
+    }
+}
+fn captured_before_cleanup() -> Plain {
+    value := Plain { data: [17u8; 1025] }
+    guard := MutateOnDrop { target: ptr.from_mut(&mut value.data[0]) }
+    // Returning captures value before dropping guard. A bulk copy must not
+    // reread the source after cleanup has changed it through a valid raw view.
+    return value
+}
+fn main() -> i32 {
+    captured := captured_before_cleanup()
+    assert_eq(captured.data[0], 17)
+    assert_eq(captured.data[1024], 17)
+
+    drops := 0i32
+    counter := ptr.from_mut(&mut drops)
+    unsafe {
+        buffer := propagate(make(counter), false)!
+        assert_eq(buffer.data[0], 17)
+        assert_eq(buffer.data[3], 3)
+        assert_eq(buffer.data[1023], 93)
+        core.drop(buffer)
+        assert_eq(drops, 1)
+        match propagate(make(counter), true) {
+            err(code) => {
+                assert_eq(code, 7)
+            }
+            ok(_) => {
+                assert(false)
+            }
+        }
+        assert_eq(drops, 2)
+        match propagate_large(counter) {
+            err(buffer) => {
+                assert_eq(buffer.data[1023], 93)
+            }
+            ok(_) => {
+                assert(false)
+            }
+        }
+        assert_eq(drops, 3)
+    }
+    original := [11u8; 1024]
+    changed := copied(original)
+    assert_eq(changed[0], 99)
+    assert_eq(changed[1023], 11)
+    return 0
+}
+@test
+fn large_owned_values() {
+    assert_eq(main(), 0)
+}

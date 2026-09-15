@@ -1,6 +1,8 @@
 package application
 
 import "std/web"
+import "std/web/testing"
+import "std/io"
 
 // Fixed registration storage. Handler values are owned inline in a typed chain.
 pub const ROUTE_CAPACITY: usize = 8
@@ -10,6 +12,39 @@ pub struct Table {
     pub fn routes(&self) -> &[web.Route] {
         return &self.entries[..self.count]
     }
+    // Failed insertion restores the initialized route prefix.
+    fn insert(self, method: &[u8], pattern: &[u8]) -> Insertion from(self, method, pattern) {
+        if self.count == ROUTE_CAPACITY {
+            return Insertion { table: self, problem: some(web.Error.BufferFull) }
+        }
+        id := self.count
+        self.entries[id] = web.Route { method: method, pattern: pattern, id: id }
+        self.count += 1
+        problem: Option<web.Error> = none
+        match web.Router.new(self.routes()) {
+            ok(router) => {
+                core.drop(router)
+            }
+            err(reason) => {
+                problem = some(reason)
+            }
+        }
+        match problem {
+            some(reason) => {
+                self.count -= 1
+                self.entries[id] = empty_route()
+                return Insertion { table: self, problem: some(reason) }
+            }
+            none => {
+                return Insertion { table: self, problem: none }
+            }
+        }
+    }
+
+}
+struct Insertion {
+    pub table: Table
+    pub problem: Option<web.Error>
 }
 pub struct Empty {
     pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
@@ -33,15 +68,15 @@ pub struct Application<H> {
     // Registration consumes the previous application because each handler can
     // have a different type. No function values, erasure, or allocation.
     pub fn route<N>(self, method: &[u8], pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, method, pattern, handler) {
-        if self.table.count == ROUTE_CAPACITY {
-            return err(web.Error.BufferFull)
+        let Application { table: previous_table, handler: previous } = self
+        id := previous_table.count
+        let Insertion { table: table, problem: problem } = previous_table.insert(method, pattern)
+        match problem {
+            some(reason) => {
+                return err(reason)
+            }
+            none => {}
         }
-        id := self.table.count
-        self.table.entries[id] = web.Route { method: method, pattern: pattern, id: id }
-        self.table.count += 1
-        router := web.Router.new(self.table.routes())?
-        core.drop(router)
-        let Application { table: table, handler: previous } = self
         return ok(Application { table: table, handler: Handlers { previous: previous, current: handler, id: id } })
     }
     pub fn get<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
@@ -50,10 +85,159 @@ pub struct Application<H> {
     pub fn post<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
         return self.route(b"POST", pattern, handler)
     }
+    pub fn request(&mut self, method: &[u8], target: &[u8]) -> testing.Response {
+        input := testing.Request.new(method, target)
+        return self.request_with(&input)
+    }
+    pub fn request_with(&mut self, input: &testing.Request) -> testing.Response {
+        return testing.send(self.table.routes(), &mut self.handler, input)
+    }
+
+    pub fn put<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
+        return self.route(b"PUT", pattern, handler)
+    }
+
+    pub fn patch<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
+        return self.route(b"PATCH", pattern, handler)
+    }
+
+    pub fn delete<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
+        return self.route(b"DELETE", pattern, handler)
+    }
+
+    pub fn head<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
+        return self.route(b"HEAD", pattern, handler)
+    }
+
+    pub fn options<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
+        return self.route(b"OPTIONS", pattern, handler)
+    }
+
 }
 fn empty_route() -> web.Route from(static) {
     return web.Route { method: b"", pattern: b"", id: 0 }
 }
 pub fn new() -> Application<Empty> from(static) {
     return Application { table: Table { entries: [empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route()], count: 0 }, handler: Empty {} }
+}
+
+// The fluent builder retains the first setup error and validates before use.
+// Borrowed method/pattern bytes remain available in a useful diagnostic.
+pub struct RegistrationError {
+    pub kind: web.Error
+    pub method: &[u8]
+    pub pattern: &[u8]
+    pub index: usize
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("web route #")?
+        output.natural((self.index + 1) as u64)?
+        output.string(" (")?
+        output.bytes(self.method)?
+        output.string(" ")?
+        output.bytes(self.pattern)?
+        output.string("): ")?
+        output.string("web: ")?
+        match &self.kind {
+            web.Error.InvalidMethod => {
+                output.string("InvalidMethod")?
+            }
+            web.Error.InvalidPath => {
+                output.string("InvalidPath")?
+            }
+            web.Error.InvalidPattern => {
+                output.string("InvalidPattern")?
+            }
+            web.Error.AmbiguousRoute => {
+                output.string("AmbiguousRoute")?
+            }
+            web.Error.BufferFull => {
+                output.string("BufferFull")?
+            }
+            _ => {
+                output.string("invalid route")?
+            }
+        }
+        if self.kind == web.Error.AmbiguousRoute {
+            output.string("; this method and path shape are already registered")?
+        }
+        if self.kind == web.Error.InvalidPattern || self.kind == web.Error.InvalidPath {
+            output.string("; use /path, /:name, or a final /*rest")?
+        }
+        if self.kind == web.Error.BufferFull {
+            output.string("; route capacity is ")?
+            output.natural(ROUTE_CAPACITY as u64)?
+        }
+        return ok()
+    }
+}
+pub struct Builder<H, M> {
+    table: Table
+    handler: H
+    middleware: M
+    problem: Option<RegistrationError>
+    pub fn route<N>(self, method: &[u8], pattern: &[u8], handler: N) -> Builder<Handlers<H, N>, M> from(self, method, pattern, handler) {
+        failed := false
+        match &self.problem {
+            some(_) => {
+                failed = true
+            }
+            none => {}
+        }
+        let Builder { table: previous_table, handler: previous, middleware: middleware, problem: previous_problem } = self
+        id := previous_table.count
+        if failed {
+            return Builder { table: previous_table, handler: Handlers { previous: previous, current: handler, id: id }, middleware: middleware, problem: previous_problem }
+        }
+        let Insertion { table: table, problem: problem } = previous_table.insert(method, pattern)
+        diagnostic: Option<RegistrationError> = none
+        match problem {
+            some(reason) => {
+                diagnostic = some(RegistrationError { kind: reason, method: method, pattern: pattern, index: id })
+            }
+            none => {}
+        }
+        return Builder { table: table, handler: Handlers { previous: previous, current: handler, id: id }, middleware: middleware, problem: diagnostic }
+    }
+    pub fn get<N>(self, pattern: &[u8], handler: N) -> Builder<Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"GET", pattern, handler)
+    }
+    pub fn post<N>(self, pattern: &[u8], handler: N) -> Builder<Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"POST", pattern, handler)
+    }
+    pub fn put<N>(self, pattern: &[u8], handler: N) -> Builder<Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"PUT", pattern, handler)
+    }
+    pub fn patch<N>(self, pattern: &[u8], handler: N) -> Builder<Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"PATCH", pattern, handler)
+    }
+    pub fn delete<N>(self, pattern: &[u8], handler: N) -> Builder<Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"DELETE", pattern, handler)
+    }
+    pub fn head<N>(self, pattern: &[u8], handler: N) -> Builder<Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"HEAD", pattern, handler)
+    }
+    pub fn options<N>(self, pattern: &[u8], handler: N) -> Builder<Handlers<H, N>, M> from(self, pattern, handler) {
+        return self.route(b"OPTIONS", pattern, handler)
+    }
+    // Middleware applies to all routes regardless of registration order.
+    // First registered is outermost: before runs forward, after in reverse.
+    pub fn middleware<N>(self, middleware: N) -> Builder<H, web.Chain<M, N>> from(self, middleware) {
+        let Builder { table: table, handler: handler, middleware: previous, problem: problem } = self
+        return Builder { table: table, handler: handler, middleware: web.Chain { outer: previous, inner: middleware }, problem: problem }
+    }
+    pub fn build(self) -> Application<web.WithMiddleware<H, M>>!RegistrationError from(self) {
+        let Builder { table: table, handler: handler, middleware: middleware, problem: problem } = self
+        match problem {
+            some(reason) => {
+                return err(reason)
+            }
+            none => {
+                return ok(Application { table: table, handler: web.with(handler, middleware) })
+            }
+        }
+    }
+}
+pub fn builder() -> Builder<Empty, web.NoMiddleware> from(static) {
+    let Application { table: table, handler: handler } = new()
+    return Builder { table: table, handler: handler, middleware: web.NoMiddleware {}, problem: none }
 }
