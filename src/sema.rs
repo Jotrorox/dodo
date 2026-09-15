@@ -1483,10 +1483,12 @@ impl<'a> Checker<'a> {
                     self.temporary.clear();
                 }
                 self.end_loop(&before, repeats, span)?;
+                // Check iteration-local views before the zero-iteration path
+                // makes bindings assigned only in the body uninitialized.
+                self.check_split_loop_escape(first_partition, split_depth, span)?;
                 if let Some(condition_exit) = condition_exit {
                     self.scopes = merge_states(self.scopes.clone(), condition_exit);
                 }
-                self.check_split_loop_escape(first_partition, split_depth, span)?;
                 self.loop_uses.pop();
                 self.scopes = merge_states(before, self.scopes.clone());
                 self.finish_scope(span)?;

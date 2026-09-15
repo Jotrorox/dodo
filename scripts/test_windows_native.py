@@ -98,7 +98,7 @@ def main():
                 print(f"RUN native Windows x64: {source.name} -O{optimization}", flush=True)
                 run([str(compiler), "build", str(source), "--target", "x86_64-pc-windows-msvc",
                      "-O", str(optimization), "-o", str(exe), "--linker", linker,
-                     "--link-arg=-Wl,/stack:8388608"], cwd=work, env=env)
+                     "--link-arg", "-Wl,/stack:8388608"], cwd=work, env=env)
                 run([str(exe)], cwd=work, env=env)
                 executions += 1
                 print(f"PASS native Windows x64: {source.name} -O{optimization}", flush=True)

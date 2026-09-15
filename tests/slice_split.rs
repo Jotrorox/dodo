@@ -214,6 +214,34 @@ fn split_rejects_escapes_moves_parent_reuse_and_forged_pairs() {
 }
 
 #[test]
+fn split_loop_escape_is_checked_before_zero_iteration_initialization() {
+    for header in [
+        "for true",
+        "for mid := 0usize; mid < 2; mid += 1",
+        "for mid in 0usize..2usize",
+    ] {
+        for edge in ["", "continue"] {
+            // No post-loop read: an uninitialized-use diagnostic must not mask
+            // failure to reject a split view stored across the back edge.
+            rejects(
+                &format!(
+                    r#"fn main() {{
+    a := [1i32, 2i32]
+    out: &mut[i32]
+    {header} {{
+        let some(slice.SplitMut{{left, right: _}}) = slice.split_at_mut(&mut a, 1) else {{ return }}
+        out = left
+        {edge}
+    }}
+}}"#
+                ),
+                "split view cannot escape its loop iteration",
+            );
+        }
+    }
+}
+
+#[test]
 fn split_zero_sized_elements_and_destruction() {
     Workspace::new().run(r#"
 unsafe extern "C" fn putchar(n: i32) -> i32
