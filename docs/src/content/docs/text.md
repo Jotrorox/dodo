@@ -49,9 +49,8 @@ For `Text.new` failures, reject malformed UTF-8 or explicitly choose replacement
 decoding; do not reinterpret arbitrary bytes as valid text.
 
 Start with this fixed builder. When text must grow, start with `std/text_alloc.from_str(&mut arena, value, limit)`
-using an `alloc/arena` and an explicit byte limit. The separately
-imported `std/text_unicode` adds Unicode whitespace trimming. It does not change
-the ASCII-only behavior of `Text.trim_ascii` or provide general normalization.
+using an `alloc/arena` and an explicit byte limit. Use `Text.trim_ascii` to trim
+ASCII whitespace.
 
 ## Portable text and owned UTF-8
 
@@ -72,11 +71,9 @@ terminal columns, or grapheme clusters.
 The scalar and UTF-8 definitions follow Unicode **16.0.0**. Validation requires
 no Unicode tables. This package deliberately provides ASCII trimming and exact
 UTF-8 searching; it does not silently apply normalization, locale-sensitive
-matching, Unicode whitespace, case folding, or grapheme segmentation. The
-independent `std/text_unicode` import adds the Unicode 16.0.0 White_Space
-property and trimming; see the supplement below. Larger property tables and
-advanced algorithms such as normalization or grapheme segmentation are not
-implemented.
+matching, Unicode whitespace, case folding, or grapheme segmentation. Unicode
+property tables and advanced algorithms such as normalization or grapheme
+segmentation are not implemented.
 
 ### Validation, decoding, and encoding
 
@@ -208,31 +205,6 @@ floating-point ties/subnormals, growing allocations, failure preservation, and
 allocation cleanup. `tests/std_text.rs` also generates 263 decimal/reference
 comparisons (including values near subnormal and finite limits), executes them
 at both optimization levels, and rejects nine invalid borrow/Result programs.
-
-
-### Optional Unicode whitespace supplement
-
-`std/text_unicode` is independently imported; `std/text` does not depend on it.
-`UNICODE_VERSION` is `"16.0.0"`. `is_whitespace(scalar)` implements all 25
-scalars in the `White_Space` property from the primary
-[Unicode 16.0.0 PropList](https://www.unicode.org/Public/16.0.0/ucd/PropList.txt).
-Invalid scalars return false. The data is distributed under Unicode License V3,
-with the full copyright and permission notice in `stdlib/std/LICENSE.unicode`.
-
-`trim(input: &text.Text) -> text.Text from(input)` removes Unicode whitespace
-scalars at both ends, keeps interior bytes exactly, and preserves the source
-borrow. Empty or entirely whitespace input produces an empty view. It scans
-the input once using fixed stack space, allocates nothing, and cannot fail for
-validated `Text`. Unlike ASCII trimming, this includes U+0085, U+00A0, U+1680,
-U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. U+180E, U+200B, and
-U+FEFF are not stripped. This property does not promise grapheme boundaries,
-normalization, locale behavior, or display-width handling.
-
-`tests/stdlib/std_text_unicode.dodo` checks the property over all Unicode code
-points, tests all 25 whitespace values, and exercises trimming with multibyte
-scalars and combining marks. It executes at `-O0`/`-O3` and emits WebAssembly
-and Cortex-M0 objects. Additional rejection cases ensure trimmed views cannot
-escape source storage or survive invalidating mutation.
 
 
 ## Shared owned strings

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Remove `std/text_unicode` and its Unicode data license notice. Text trimming
+  uses the ASCII rules in `Text.trim_ascii`.
 - Add postfix `!` to unwrap a Result or panic on error, preserving `?` for
   propagation. Shorten hello world to a single console call in `fn main()`.
 - Update the Rust toolchain to 1.98.1 and the compiler backend to LLVM 23.1.1

@@ -59,7 +59,7 @@ fn execute(source: &std::path::Path, scratch: &Scratch, stem: &str) {
 fn text_executes_and_cross_compiles() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new();
-    for fixture in ["std_text", "std_text_alloc", "std_text_unicode"] {
+    for fixture in ["std_text", "std_text_alloc"] {
         let source = root.join(format!("tests/stdlib/{fixture}.dodo"));
         execute(&source, &scratch, fixture);
         for target in ["wasm32-unknown-unknown", "thumbv6m-none-eabi"] {
@@ -134,11 +134,11 @@ fn text_views_preserve_borrows_and_results() {
     let source = scratch.0.join("rejected.dodo");
     let cases = [
         (
-            "package bad\nimport \"std/text\"\nimport \"std/text_unicode\"\nfn escape() -> text.Text from(static) { storage := [65u8]\nmatch text.Text.new(&storage) { ok(value) => { return text_unicode.trim(&value) }, err(_) => { return text.Text.from_str(\"\") } } }\n",
+            "package bad\nimport \"std/text\"\nfn escape() -> text.Text from(static) { storage := [65u8]\nmatch text.Text.new(&storage) { ok(value) => { return value.trim_ascii() }, err(_) => { return text.Text.from_str(\"\") } } }\n",
             "borrow",
         ),
         (
-            "package bad\nimport \"std/text\"\nimport \"std/text_unicode\"\nfn main() -> i32 { storage := [0u8; 8]\nbuilder := text.Builder.new(&mut storage)\nview := builder.as_text()\ntrimmed := text_unicode.trim(&view)\nbuilder.clear()\nreturn trimmed.len_bytes() as i32 }\n",
+            "package bad\nimport \"std/text\"\nfn main() -> i32 { storage := [0u8; 8]\nbuilder := text.Builder.new(&mut storage)\nview := builder.as_text()\ntrimmed := view.trim_ascii()\nbuilder.clear()\nreturn trimmed.len_bytes() as i32 }\n",
             "borrow",
         ),
         (

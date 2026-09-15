@@ -89,7 +89,7 @@ importing a parent does not import all its children.
 | [Byte I/O](io.md) | `std/io`, `std/io_alloc` | Portable. |
 | [Console I/O](console.md) | `std/console` | Hosted. |
 | [Formatting](formatting.md) | `std/fmt`, `std/fmt/errors`, `std/fmt_alloc` | Portable. |
-| [UTF-8 text](text.md) | `std/text`, `std/text_alloc`, `std/text_shared`, `std/text_unicode` | Portable. |
+| [UTF-8 text](text.md) | `std/text`, `std/text_alloc`, `std/text_shared` | Portable. |
 | [Collections](collections.md) | `std/collections`, `std/collections/deque`, `std/collections/fixed_deque`, `std/collections/fixed_map`, `std/collections/fixed_set`, `std/collections/fixed_vector`, `std/collections/hash_map`, `std/collections/hash_set`, `std/collections/heap`, `std/collections/ordered_map`, `std/collections/ordered_set`, `std/collections/shared_deque`, `std/collections/shared_hash_map`, `std/collections/shared_hash_set`, `std/collections/shared_heap`, `std/collections/shared_ordered_map`, `std/collections/shared_ordered_set`, `std/collections/shared_vector`, `std/collections/vector` | Portable. |
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
@@ -198,9 +198,8 @@ See the [text guide](text.md) for a runnable quickstart and the full contracts.
 <span id="borrowed-text"></span>
 <span id="fixed-and-allocated-builders"></span>
 <span id="explicit-numeric-parsing"></span>
-<span id="optional-unicode-whitespace-supplement"></span>
 
-The [text guide](text.md) retains these text and Unicode contracts.
+The [text guide](text.md) retains these text and UTF-8 contracts.
 
 ## Sharing an explicit allocator
 

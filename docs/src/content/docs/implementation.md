@@ -74,7 +74,7 @@ The bundled [standard library](standard-library.md) provides opaque
 arenas and pools, and owned boxes with explicit allocator lifetimes. Portable
 `std/io`, `std/fmt`, `std/bytes`, and `std/text` add byte I/O contracts, formatting,
 binary views, UTF-8, numeric parsing, and separately imported growing buffers
-and strings. `std/text_unicode` supplies optional Unicode 16 whitespace rules.
+and strings.
 Checked views into allocated storage retain their owner's borrow. Import aliases
 separate packages with the same final path component, and generic formatting
 methods are statically dispatched.
