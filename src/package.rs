@@ -161,7 +161,7 @@ pub fn load_with_overlays_for_target(
     overlays: &BTreeMap<PathBuf, String>,
     target: &str,
 ) -> Result<Loaded, LoadError> {
-    load_internal(path, overlays, target, false)
+    load_internal(ModuleId::Local(source_path(path)), overlays, target, false)
 }
 
 /// Recover syntax in editor buffers and dependencies without weakening builds.
@@ -170,11 +170,40 @@ pub fn load_for_editor(
     overlays: &BTreeMap<PathBuf, String>,
     target: &str,
 ) -> Result<Loaded, LoadError> {
-    load_internal(path, overlays, target, true)
+    load_internal(ModuleId::Local(source_path(path)), overlays, target, true)
+}
+
+/// Look up a compiler-owned source by its internal path, never on disk.
+#[cfg(feature = "llvm")]
+pub(crate) fn bundled_source(path: &Path) -> Option<&'static str> {
+    let name = path.strip_prefix("<stdlib>").ok()?.to_str()?;
+    let name = name.replace('\\', "/");
+    let name = name.strip_suffix(".dodo")?;
+    BUNDLED_SOURCES
+        .iter()
+        .find(|(import, _)| name == *import)
+        .map(|(_, text)| *text)
+}
+
+/// Check a bundled source as an editor document, preserving its library identity.
+#[cfg(feature = "llvm")]
+pub(crate) fn load_bundled_for_editor(path: &Path, target: &str) -> Result<Loaded, LoadError> {
+    let name = path
+        .strip_prefix("<stdlib>")
+        .ok()
+        .and_then(|path| path.to_str())
+        .and_then(|name| name.strip_suffix(".dodo"))
+        .ok_or_else(|| "invalid bundled source path".to_owned())?;
+    load_internal(
+        ModuleId::Bundled(name.replace('\\', "/")),
+        &BTreeMap::new(),
+        target,
+        true,
+    )
 }
 
 fn load_internal(
-    path: &Path,
+    root: ModuleId,
     overlays: &BTreeMap<PathBuf, String>,
     target: &str,
     recover: bool,
@@ -185,7 +214,7 @@ fn load_internal(
         target: target.to_owned(),
         ..Loader::default()
     };
-    let root = loader.module(ModuleId::Local(source_path(path)), None)?;
+    let root = loader.module(root, None)?;
     let mut program = Program::default();
     // Keep familiar names when unique, but package identity is its resolved path,
     // never its final component. Every module resolves its own local aliases.

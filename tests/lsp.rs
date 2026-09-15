@@ -195,6 +195,15 @@ impl Client {
         );
     }
 
+    fn disk_change(&mut self, uri: &str, kind: i32) {
+        self.notify(
+            "workspace/didChangeWatchedFiles",
+            json!({
+                "changes": [{"uri": uri, "type": kind}]
+            }),
+        );
+    }
+
     // An unsupported request acts as a barrier after synchronous notifications.
     // This catches unexpected replies to notifications without timed sleeps.
     fn diagnostics(&mut self) -> BTreeMap<String, Value> {
@@ -1007,6 +1016,550 @@ fn lsp_cross_file_alias_navigation_references_rename_and_completion() {
         library
     );
     assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_bundled_definitions_open_authoritative_read_only_sources() {
+    let workspace = Workspace::new();
+    let source =
+        "package app\nimport \"std/math\" as numbers\nfn main() { _ = numbers.abs(-1.0) }\n";
+    let root = workspace.uri("main.dodo");
+    let uri = "dodo-stdlib:/std/math.dodo";
+    let library = include_str!("../stdlib/std/math.dodo");
+    for mode in ["file", "package"] {
+        let mut client = Client::start("lsp");
+        assert_eq!(
+            client.initialize(mode)["result"]["capabilities"]["experimental"]["dodoStdlibSource"],
+            true
+        );
+        client.open(&root, source, 1);
+        assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+        let definition = query(&mut client, "definition", &root, source, "abs(-", json!({}));
+        assert_eq!(definition["result"]["uri"], uri, "{definition}");
+        assert_eq!(
+            definition["result"]["range"]["start"],
+            at(library, "abs(value:")
+        );
+        let content = client.request(json!(2), "dodo/stdlibSource", json!({"uri": uri}));
+        assert_eq!(content["result"], library);
+        let refs = query(
+            &mut client,
+            "references",
+            &root,
+            source,
+            "abs(-",
+            json!({"context":{"includeDeclaration":true}}),
+        );
+        assert!(
+            refs["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|location| location["uri"] == uri)
+        );
+        assert_eq!(
+            query(
+                &mut client,
+                "prepareRename",
+                &root,
+                source,
+                "abs(-",
+                json!({})
+            )["result"],
+            Value::Null
+        );
+        assert_eq!(
+            query(
+                &mut client,
+                "rename",
+                &root,
+                source,
+                "abs(-",
+                json!({"newName":"absolute"})
+            )["error"]["code"],
+            -32803
+        );
+
+        // Opening the virtual source cannot turn it into a mutable local overlay.
+        client.open(uri, INVALID, 1);
+        assert_eq!(client.diagnostics()[uri]["diagnostics"], json!([]));
+        client.change(uri, INVALID, 2);
+        client.save(uri);
+        assert!(client.diagnostics().is_empty());
+        client.close(&root);
+        client.diagnostics();
+        let definition = query(
+            &mut client,
+            "definition",
+            uri,
+            library,
+            "from_bits(0x7ff",
+            json!({}),
+        );
+        assert_eq!(definition["result"]["uri"], uri);
+        assert_eq!(
+            definition["result"]["range"]["start"],
+            at(library, "from_bits(value:")
+        );
+        let hover = query(&mut client, "hover", uri, library, "abs(value:", json!({}));
+        assert!(hover["result"].to_string().contains("f64"), "{hover}");
+        // Parameters and local bindings inside library sources are read-only too.
+        assert_eq!(
+            query(
+                &mut client,
+                "prepareRename",
+                uri,
+                library,
+                "value: f64",
+                json!({})
+            )["result"],
+            Value::Null
+        );
+        assert_eq!(
+            query(
+                &mut client,
+                "rename",
+                uri,
+                library,
+                "value: f64",
+                json!({"newName":"number"})
+            )["error"]["code"],
+            -32803
+        );
+        let formatting = client.request(
+            json!(3),
+            "textDocument/formatting",
+            json!({
+                "textDocument":{"uri":uri}, "options":{"tabSize":4,"insertSpaces":true}
+            }),
+        );
+        assert_eq!(formatting["error"]["code"], -32803);
+        let trig_uri = "dodo-stdlib:/std/math/trig.dodo";
+        let trig = include_str!("../stdlib/std/math/trig.dodo");
+        client.open(trig_uri, trig, 1);
+        client.diagnostics();
+        let definition = query(
+            &mut client,
+            "definition",
+            trig_uri,
+            trig,
+            "abs(value)",
+            json!({}),
+        );
+        assert_eq!(definition["result"]["uri"], uri);
+        assert_eq!(
+            definition["result"]["range"]["start"],
+            at(library, "abs(value:")
+        );
+        assert!(client.shutdown().is_empty());
+    }
+}
+
+#[test]
+fn lsp_bundled_source_requests_reject_unknown_or_noncanonical_uris() {
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    for uri in [
+        "dodo-stdlib:/std/missing.dodo",
+        "dodo-stdlib:/std/../std/math.dodo",
+        "dodo-stdlib:/std/./math.dodo",
+        "dodo-stdlib:/std//math.dodo",
+        "dodo-stdlib:/std/math.dodo?query",
+        "dodo-stdlib:/std/math.dodo#fragment",
+        "dodo-stdlib://host/std/math.dodo",
+        "dodo-stdlib:///std/math.dodo",
+        "dodo-stdlib:/std/%6dath.dodo",
+        "dodo-stdlib:/std\\math.dodo",
+        "file:///std/math.dodo",
+        "untitled:stdlib",
+    ] {
+        let response = client.request(json!(2), "dodo/stdlibSource", json!({"uri":uri}));
+        assert_eq!(response["error"]["code"], -32602, "{uri}: {response}");
+    }
+    for params in [Value::Null, json!({}), json!({"uri":7})] {
+        assert_eq!(
+            client.request(json!(2), "dodo/stdlibSource", params)["error"]["code"],
+            -32602
+        );
+    }
+    // Sources outside the current import graph are still served by the compiler.
+    assert_eq!(
+        client.request(
+            json!(3),
+            "dodo/stdlibSource",
+            json!({"uri":"dodo-stdlib:/core/option.dodo"})
+        )["result"],
+        include_str!("../stdlib/core/option.dodo")
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_watched_imports_refresh_diagnostics_navigation_and_preserve_overlays() {
+    let workspace = Workspace::new();
+    let source = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n";
+    let good = "package lib\npub fn value() -> i32 { return 7 }\n";
+    let root = workspace.uri("main.dodo");
+    let dependency = workspace.uri("lib/value.dodo");
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 9);
+    assert!(
+        !client.diagnostics()[&root]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // Creation repairs a previously unresolved directory import without a save.
+    workspace.file("lib/value.dodo", good);
+    client.disk_change(&dependency, 1);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    let moved = format!("// moved 😀\n{good}");
+    workspace.file("lib/value.dodo", &moved);
+    client.disk_change(&dependency, 2);
+    assert_eq!(client.diagnostics()[&root]["version"], 9);
+    let definition = query(
+        &mut client,
+        "definition",
+        &root,
+        source,
+        "value()",
+        json!({}),
+    );
+    assert_eq!(definition["result"]["uri"], dependency);
+    assert_eq!(
+        definition["result"]["range"]["start"],
+        at(&moved, "value()")
+    );
+    workspace.file(
+        "lib/value.dodo",
+        "package lib\npub fn value() -> i32 { return missing }\n",
+    );
+    client.disk_change(&dependency, 2);
+    assert!(
+        client.diagnostics()[&dependency]["diagnostics"]
+            .to_string()
+            .contains("missing")
+    );
+
+    client.open(&dependency, good, 3);
+    assert_eq!(client.diagnostics()[&dependency]["diagnostics"], json!([]));
+    workspace.file(
+        "lib/value.dodo",
+        "package lib\npub fn value() -> bool { return true }\n",
+    );
+    client.disk_change(&dependency, 2);
+    assert!(client.diagnostics().is_empty());
+    let hover = query(&mut client, "hover", &root, source, "value()", json!({}));
+    assert!(hover["result"].to_string().contains("i32"), "{hover}");
+    client.close(&dependency);
+    assert!(
+        !client.diagnostics()[&root]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    workspace.file("lib/value.dodo", good);
+    client.disk_change(&dependency, 2);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    fs::remove_file(workspace.0.join("lib/value.dodo")).unwrap();
+    client.disk_change(&dependency, 3);
+    assert!(
+        !client.diagnostics()[&root]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        query(
+            &mut client,
+            "definition",
+            &root,
+            source,
+            "value()",
+            json!({})
+        )["result"],
+        Value::Null
+    );
+    workspace.file("lib/value.dodo", good);
+    client.disk_change(&dependency, 1);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_watched_transitive_imports_and_package_siblings_refresh() {
+    let workspace = Workspace::new();
+    let root = workspace.uri("main.dodo");
+    let source = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n";
+    workspace.file(
+        "lib/value.dodo",
+        "package lib\nimport \"nested\"\npub fn value() -> i32 { return nested.number() }\n",
+    );
+    let dependency = workspace.file(
+        "lib/nested/number.dodo",
+        "package nested\npub fn number() -> i32 { return 1 }\n",
+    );
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 1);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    workspace.file(
+        "lib/nested/number.dodo",
+        "package nested\npub fn number() -> i32 { return absent }\n",
+    );
+    client.disk_change(&dependency, 2);
+    assert!(
+        client.diagnostics()[&dependency]["diagnostics"]
+            .to_string()
+            .contains("absent")
+    );
+    client.change(&root, VALID, 2);
+    assert_eq!(client.diagnostics()[&dependency]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
+
+    let mut client = Client::start("lsp");
+    client.initialize("package");
+    client.open(
+        &root,
+        "package app\nfn main() -> i32 { return helper() }\n",
+        1,
+    );
+    client.diagnostics();
+    let sibling = workspace.file(
+        "helper.dodo",
+        "package app\nfn helper() -> i32 { return 1 }\n",
+    );
+    client.disk_change(&sibling, 1);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    fs::remove_file(workspace.0.join("helper.dodo")).unwrap();
+    client.disk_change(&sibling, 3);
+    assert!(
+        client.diagnostics()[&root]["diagnostics"]
+            .to_string()
+            .contains("helper")
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_watched_file_batches_validate_atomically_and_ignore_unrelated_events() {
+    let workspace = Workspace::new();
+    let other = Workspace::new();
+    let root = workspace.uri("main.dodo");
+    let dependency = workspace.file(
+        "lib.dodo",
+        "package lib\npub fn value() -> i32 { return 1 }\n",
+    );
+    let source = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 1);
+    client.diagnostics();
+    workspace.file(
+        "lib.dodo",
+        "package lib\npub fn value() -> i32 { return missing }\n",
+    );
+    for params in [
+        Value::Null,
+        json!({}),
+        json!({"changes":{}}),
+        json!({"changes":[null]}),
+    ] {
+        client.notify("workspace/didChangeWatchedFiles", params);
+    }
+    for event in [
+        json!({}),
+        json!({"uri":dependency,"type":0}),
+        json!({"uri":dependency,"type":4}),
+        json!({"uri":dependency,"type":2.0}),
+        json!({"uri":dependency,"type":"2"}),
+        json!({"uri":"https://example.com/lib.dodo","type":2}),
+        json!({"uri":"file:///invalid%xx.dodo","type":2}),
+        json!({"uri":"dodo-stdlib:/std/math.dodo","type":2}),
+    ] {
+        client.notify(
+            "workspace/didChangeWatchedFiles",
+            json!({"changes":[{"uri":dependency,"type":2},event]}),
+        );
+    }
+    client.notify("workspace/didChangeWatchedFiles", json!({"changes":[]}));
+    client.disk_change(&other.uri("unrelated.dodo"), 2);
+    client.disk_change(&workspace.uri("notes.txt"), 2);
+    assert!(client.diagnostics().is_empty());
+    client.disk_change(&dependency, 2);
+    assert!(
+        client.diagnostics()[&dependency]["diagnostics"]
+            .to_string()
+            .contains("missing")
+    );
+    let stderr = client.shutdown();
+    assert!(stderr.contains("LSP:"));
+    assert!(!stderr.contains("panicked"));
+}
+
+#[cfg(unix)]
+#[test]
+fn lsp_watches_external_symlink_dependencies_through_load_failures() {
+    let workspace = Workspace::new();
+    let external = Workspace::new();
+    std::os::unix::fs::symlink(&external.0, workspace.0.join("lib")).unwrap();
+    let root = workspace.uri("main.dodo");
+    let good = "package lib\npub fn value() -> i32 { return 1 }\n";
+    let dependency = external.file("value.dodo", good);
+    let source = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 1);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    external.file(
+        "value.dodo",
+        "package lib\npub fn value() -> i32 { return missing }\n",
+    );
+    client.disk_change(&dependency, 2);
+    assert!(
+        client.diagnostics()[&dependency]["diagnostics"]
+            .to_string()
+            .contains("missing")
+    );
+    fs::remove_file(external.0.join("value.dodo")).unwrap();
+    client.disk_change(&dependency, 3);
+    let diagnostics = client.diagnostics();
+    assert_eq!(diagnostics[&dependency]["diagnostics"], json!([]));
+    assert!(
+        !diagnostics[&root]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    external.file("value.dodo", good);
+    client.disk_change(&dependency, 1);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    client.change(&root, VALID, 2);
+    client.diagnostics();
+    client.disk_change(&dependency, 2);
+    assert!(client.diagnostics().is_empty());
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_registers_watches_after_initialized_and_releases_them_after_close() {
+    for relative in [false, true] {
+        let workspace = Workspace::new();
+        let root = workspace.uri("main.dodo");
+        let sibling = workspace.uri("extra.dodo");
+        let mut client = Client::start("lsp");
+        let initialized = client.request(
+            json!(1),
+            "initialize",
+            json!({
+                "capabilities":{"workspace":{"didChangeWatchedFiles":{
+                    "dynamicRegistration":true,"relativePatternSupport":relative
+                }}}
+            }),
+        );
+        assert!(initialized.get("error").is_none());
+        client.open(&root, VALID, 1);
+        client.diagnostics(); // No server requests until the initialized notification.
+        client.notify("initialized", json!({}));
+        let request = client.receive();
+        assert_eq!(request["method"], "client/registerCapability");
+        let registration = &request["params"]["registrations"][0];
+        assert_eq!(registration["method"], "workspace/didChangeWatchedFiles");
+        let watchers = registration["registerOptions"]["watchers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(watchers.len(), 1);
+        assert_eq!(watchers[0]["kind"], 7);
+        if relative {
+            assert_eq!(
+                watchers[0]["globPattern"]["baseUri"],
+                workspace.uri("").trim_end_matches('/')
+            );
+            assert_eq!(watchers[0]["globPattern"]["pattern"], "**/*.dodo");
+        } else {
+            assert!(
+                watchers[0]["globPattern"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("/**/*.dodo")
+            );
+        }
+        client.send(json!({"jsonrpc":"2.0","id":request["id"],"result":null}));
+        client.open(&sibling, VALID, 1);
+        client.diagnostics(); // Siblings reuse the same directory watch.
+        client.close(&root);
+        client.diagnostics();
+        client.close(&sibling);
+        assert_eq!(
+            client.receive()["method"],
+            "textDocument/publishDiagnostics"
+        );
+        let unregister = client.receive();
+        assert_eq!(unregister["method"], "client/unregisterCapability");
+        assert_eq!(
+            unregister["params"]["unregisterations"][0]["id"],
+            registration["id"]
+        );
+        client.send(json!({"jsonrpc":"2.0","id":unregister["id"],"result":null}));
+        assert!(client.diagnostics().is_empty());
+        assert!(client.shutdown().is_empty());
+    }
+}
+
+#[test]
+fn lsp_rejected_watch_registration_keeps_save_refresh_available() {
+    let workspace = Workspace::new();
+    let root = workspace.uri("main.dodo");
+    let dependency = workspace.file(
+        "lib.dodo",
+        "package lib\npub fn value() -> i32 { return 1 }\n",
+    );
+    let source = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n";
+    let mut client = Client::start("lsp");
+    for capability in [
+        json!(false),
+        json!({"dynamicRegistration": "yes"}),
+        json!({"relativePatternSupport": 1}),
+    ] {
+        assert_eq!(
+            client.request(
+                json!(1),
+                "initialize",
+                json!({
+                    "capabilities":{"workspace":{"didChangeWatchedFiles":capability}}
+                })
+            )["error"]["code"],
+            -32602
+        );
+    }
+    assert!(client.request(json!(1), "initialize", json!({
+        "capabilities":{"workspace":{"didChangeWatchedFiles":{"dynamicRegistration":true}}}
+    })).get("error").is_none());
+    client.notify("initialized", json!({}));
+    client.open(&root, source, 1);
+    assert_eq!(
+        client.receive()["method"],
+        "textDocument/publishDiagnostics"
+    );
+    let registration = client.receive();
+    assert_eq!(registration["method"], "client/registerCapability");
+    client.send(json!({"jsonrpc":"2.0", "id":registration["id"], "error":{"code":-32603,"message":"watching unavailable"}}));
+    assert!(client.diagnostics().is_empty());
+    workspace.file(
+        "lib.dodo",
+        "package lib\npub fn value() -> i32 { return missing }\n",
+    );
+    client.save(&root);
+    assert!(
+        client.diagnostics()[&dependency]["diagnostics"]
+            .to_string()
+            .contains("missing")
+    );
+    client.close(&root);
+    client.diagnostics(); // Failed registrations are not retried on every update.
+    assert!(client.shutdown().contains("client rejected file watches"));
 }
 
 #[test]

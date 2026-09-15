@@ -98,11 +98,21 @@ point to the same source expressions as the command-line labels.
 The server supports initialization, shutdown, full-document open/change/close
 synchronization, save notifications, hover, completion, definition, references,
 prepare-rename/rename, signature help, document formatting, and published diagnostics.
-It accepts local `file:` URIs and uses zero-based LSP line numbers and UTF-16 columns.
+It accepts local `file:` URIs, untitled buffers, and read-only `dodo-stdlib:`
+documents, using zero-based LSP line numbers and UTF-16 columns.
 Open buffers supply unsaved source, including new files;
 local imports use those buffers when available. Changes recheck open documents,
 saves refresh diagnostics, and closing a buffer restores its imported contents
 from disk.
+
+Clients supporting `workspace.didChangeWatchedFiles.dynamicRegistration` receive
+file-watch registrations after initialization. These watch `.dodo` files under
+open documents' source directories and loaded dependency directories, including
+new imports and package siblings. Create, change, and delete events refresh
+diagnostics and navigation without a save. Open buffers remain authoritative.
+Watches are shared across documents and removed when no open document needs them.
+Clients without dynamic registration can send `workspace/didChangeWatchedFiles`
+notifications themselves, or save an open document to refresh dependencies.
 
 Untitled buffers receive standalone analysis and editing tools.
 
@@ -114,6 +124,9 @@ Untitled buffers receive standalone analysis and editing tools.
 - Go-to-definition and references use source locations across the loaded package
   and imports. Local bindings retain their identity through nested shadowing.
   References honor the client's option to include the declaration.
+- Bundled library definitions open read-only source documents, including navigation
+  within those documents. The source comes from the running compiler, so no
+  compiler checkout or separate standard-library installation is needed.
 - Rename returns a workspace edit for the identified declaration and its indexed
   uses. It excludes comments and strings, rejects invalid names and possible name
   capture, and includes open-buffer versions when the client supports versioned
@@ -121,6 +134,23 @@ Untitled buffers receive standalone analysis and editing tools.
 - Signature help triggers on `(` and `,`, selects the active argument, and omits
   the implicit receiver parameter for instance methods. It also works while a
   call's argument list is incomplete.
+
+### Bundled sources in other clients
+
+The VS Code extension handles bundled source documents automatically. Other
+clients need a read-only document provider for `dodo-stdlib:` URIs. For example,
+when a definition returns `dodo-stdlib:/std/math.dodo`, request its UTF-8 text with:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"dodo/stdlibSource","params":{"uri":"dodo-stdlib:/std/math.dodo"}}
+```
+
+The result is the source string. The server advertises this extension as
+`capabilities.experimental.dodoStdlibSource: true`. Use the URI unchanged, assign
+the `dodo` language, and synchronize open/close notifications to enable hover and
+navigation inside it. Unknown or noncanonical URIs return `InvalidParams`.
+Bundled text cannot be changed through document synchronization, formatting, or
+rename. Compiler intrinsics without Dodo source have no source definition.
 
 ## Formatting
 
@@ -167,16 +197,14 @@ can leave some expressions without inferred types or produce follow-on errors.
 Compilation and formatting retain strict error handling.
 
 Navigation and rename cover open documents and the packages/imports they load;
-there is no scan of unopened workspace roots or reverse dependencies. Bundled
-standard-library declarations contribute completion and signatures, but currently
-have no editor-readable source URI for navigation or edits. Rename conservatively
+there is no scan of unopened workspace roots or reverse dependencies. Rename conservatively
 refuses possible collisions, generic parameters, destructuring bindings, and fields
 or bindings requiring shorthand/pattern expansion. These restrictions avoid edits
 that could change a different binding or leave a partial rename.
 
-Checks remain synchronous and rebuild full-document analysis. There is no
-incremental analysis or background file watcher. Save a document to refresh its
-on-disk dependencies. See the [responsiveness measurements](lsp-performance.md)
+Checks remain synchronous and rebuild full-document analysis, including after
+file-watch notifications; there is no incremental analysis. File watching is
+performed by the editor client. See the [responsiveness measurements](lsp-performance.md)
 and benchmark commands before changing the analysis model.
 
 See [ownership diagnostics](diagnostics-and-editors.md) for annotated examples

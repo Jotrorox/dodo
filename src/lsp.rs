@@ -4,7 +4,9 @@
 //! by another document. Editor recovery retains independent valid syntax/bodies.
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::{codegen, editor, file_uri, format, package, sema};
+mod bundled;
 mod protocol;
+mod watch;
 use crate::json::{Value, json};
 use protocol::{
     DocumentChange, ErrorCode, InitializeParams, Location, Message, Notification, OpenDocument,
@@ -29,6 +31,7 @@ struct Document {
     text: String,
     version: i32,
     analysis: Option<editor::Document>,
+    watch_roots: BTreeSet<PathBuf>,
 }
 
 #[derive(Default)]
@@ -40,6 +43,7 @@ struct Server {
     target: String,
     pointer_bits: u32,
     document_changes: bool,
+    watches: watch::Watches,
 }
 
 /// Serve LSP messages until `exit` or EOF. Stdout contains only framed JSON-RPC.
@@ -72,6 +76,10 @@ pub fn run(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<i32>
                     Ok(false) => (),
                     Err(error) => eprintln!("LSP: {error}"),
                 }
+                server.sync_watches(output)?;
+            }
+            Message::Response { id, error } if server.state == State::Running => {
+                server.watches.response(&id, error.as_deref());
             }
             // Unknown notifications, responses, and notifications outside the
             // initialized lifetime never receive a JSON-RPC response.
@@ -147,6 +155,8 @@ impl Server {
             self.target = target;
             self.pointer_bits = bits;
             self.document_changes = params.document_changes;
+            self.watches.supported = params.dynamic_watches;
+            self.watches.relative = params.relative_watches;
             self.state = State::Running;
             return Response::new_ok(
                 request.id,
@@ -160,6 +170,7 @@ impl Server {
                         "renameProvider": {"prepareProvider": true},
                         "signatureHelpProvider": {"triggerCharacters": ["(", ","], "retriggerCharacters": [","]},
                         "documentFormattingProvider": true,
+                        "experimental": {"dodoStdlibSource": true},
                         "textDocumentSync": {
                             "openClose": true,
                             "change": 1,
@@ -180,10 +191,20 @@ impl Server {
             self.state = State::Shutdown;
             return Response::new_ok(request.id, Value::Null);
         }
+        if request.method == "dodo/stdlibSource" {
+            let Ok(uri) = protocol::bundled_source_uri(&request.params) else {
+                return error(ErrorCode::InvalidParams, "invalid bundled source URI");
+            };
+            let path = bundled::path(&uri).unwrap();
+            return Response::new_ok(request.id, json!(package::bundled_source(&path).unwrap()));
+        }
         if request.method == "textDocument/formatting" {
             let Ok(uri) = protocol::formatting_uri(&request.params) else {
                 return error(ErrorCode::InvalidParams, "invalid formatting parameters");
             };
+            if bundled::path(&uri).is_some() {
+                return error(ErrorCode::RequestFailed, "bundled sources are read-only");
+            }
             let Some(document) = self.documents.get(uri.as_str()) else {
                 return Response::new_ok(request.id, Value::Null);
             };
@@ -337,9 +358,19 @@ impl Server {
 
     fn notification(&mut self, notification: Notification) -> Result<bool, String> {
         match notification.method.as_str() {
+            "initialized" => {
+                if !notification.params.is_object() {
+                    return Err("invalid initialized parameters".into());
+                }
+                self.watches.initialized = true;
+                return Ok(false);
+            }
             "textDocument/didOpen" => {
-                let document = OpenDocument::parse(&notification.params)?;
-                let path = if document.uri.as_str().starts_with("untitled:") {
+                let mut document = OpenDocument::parse(&notification.params)?;
+                let path = if let Some(path) = bundled::path(&document.uri) {
+                    document.text = package::bundled_source(&path).unwrap().to_owned();
+                    Some(path)
+                } else if document.uri.as_str().starts_with("untitled:") {
                     None
                 } else {
                     Some(uri_path(&document.uri)?)
@@ -352,11 +383,15 @@ impl Server {
                         text: document.text,
                         version: document.version,
                         analysis: None,
+                        watch_roots: BTreeSet::new(),
                     },
                 );
             }
             "textDocument/didChange" => {
                 let params = DocumentChange::parse(&notification.params)?;
+                if bundled::path(&params.uri).is_some() {
+                    return Ok(false);
+                }
                 let Some(document) = self.documents.get_mut(params.uri.as_str()) else {
                     return Ok(false);
                 };
@@ -370,6 +405,9 @@ impl Server {
             }
             "textDocument/didSave" => {
                 let uri = protocol::saved_uri(&notification.params)?;
+                if bundled::path(&uri).is_some() {
+                    return Ok(false);
+                }
                 if !self.documents.contains_key(&uri) {
                     return Ok(false);
                 }
@@ -382,16 +420,52 @@ impl Server {
                     return Ok(false);
                 }
             }
+            "workspace/didChangeWatchedFiles" => {
+                let paths = protocol::watched_paths(&notification.params)?;
+                return Ok(paths.iter().any(|path| {
+                    self.watches.contains(path)
+                        && !self
+                            .documents
+                            .values()
+                            .any(|document| document.path.as_ref() == Some(path))
+                }));
+            }
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    fn root<'a>(&self, path: &'a Path) -> &'a Path {
+        if self.check_packages && path.is_absolute() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        }
+    }
+
+    fn sync_watches(&mut self, output: &mut impl Write) -> io::Result<()> {
+        let mut roots = BTreeSet::new();
+        for document in self.documents.values() {
+            if let Some(path) = &document.path
+                && path.is_absolute()
+                && let Some(parent) = path.parent()
+            {
+                roots.insert(parent.to_path_buf());
+            }
+            roots.extend(document.watch_roots.iter().cloned());
+        }
+        self.watches.sync(roots, output)
     }
 
     fn publish(&mut self, output: &mut impl Write) -> io::Result<()> {
         let overlays = self
             .documents
             .values()
-            .filter_map(|document| Some((document.path.clone()?, document.text.clone())))
+            .filter_map(|document| {
+                let path = document.path.as_ref()?;
+                path.is_absolute()
+                    .then(|| (path.clone(), document.text.clone()))
+            })
             .collect();
         let mut diagnostics: BTreeMap<String, PublishDiagnosticsParams> = self
             .documents
@@ -409,6 +483,7 @@ impl Server {
             .collect();
         let mut checked = BTreeSet::new();
         let mut analyses = BTreeMap::new();
+        let mut watch_roots = BTreeMap::new();
         for (key, document) in &self.documents {
             let Some(path) = &document.path else {
                 let analysis = editor::Document::standalone(
@@ -422,15 +497,16 @@ impl Server {
                 analyses.insert(key.clone(), analysis);
                 continue;
             };
-            let root = if self.check_packages {
-                path.parent().unwrap_or(path)
-            } else {
-                path
-            };
+            let root = self.root(path);
             if !checked.insert(root) {
                 continue;
             }
-            match package::load_for_editor(root, &overlays, &self.target) {
+            let loaded = if bundled::uri(root).is_some() {
+                package::load_bundled_for_editor(root, &self.target)
+            } else {
+                package::load_for_editor(root, &overlays, &self.target)
+            };
+            match loaded {
                 Ok(mut loaded) => {
                     let original = loaded.program.clone();
                     let semantic = sema::check_recovering(&mut loaded.program, self.pointer_bits);
@@ -451,17 +527,24 @@ impl Server {
                         let Some(target_path) = &target.path else {
                             continue;
                         };
-                        let target_root = if self.check_packages {
-                            target_path.parent().unwrap_or(target_path)
-                        } else {
-                            target_path
-                        };
+                        let target_root = self.root(target_path);
                         if target_root == root
                             && let Some(source) = loaded
                                 .sources
                                 .iter()
                                 .find(|source| source.path == *target_path)
                         {
+                            watch_roots.insert(
+                                key.clone(),
+                                loaded
+                                    .sources
+                                    .iter()
+                                    .filter(|source| source.path.is_absolute())
+                                    .filter_map(|source| {
+                                        source.path.parent().map(Path::to_path_buf)
+                                    })
+                                    .collect(),
+                            );
                             analyses.insert(
                                 key.clone(),
                                 editor::Document::from_checked(
@@ -489,11 +572,7 @@ impl Server {
                         let Some(target_path) = &target.path else {
                             continue;
                         };
-                        let target_root = if self.check_packages {
-                            target_path.parent().unwrap_or(target_path)
-                        } else {
-                            target_path
-                        };
+                        let target_root = self.root(target_path);
                         if target_root == root {
                             analyses.insert(
                                 key.clone(),
@@ -509,7 +588,11 @@ impl Server {
             }
         }
         for (key, analysis) in analyses {
-            self.documents.get_mut(&key).unwrap().analysis = Some(analysis);
+            let document = self.documents.get_mut(&key).unwrap();
+            document.analysis = Some(analysis);
+            if let Some(roots) = watch_roots.remove(&key) {
+                document.watch_roots = roots;
+            }
         }
         // Replacing the complete set also clears errors in fixed dependencies,
         // closed documents, and files that are no longer imported.
@@ -614,6 +697,7 @@ impl Server {
                     || (document.path.is_none() && Path::new(document.uri.as_str()) == path)
             })
             .map(|document| document.uri.clone())
+            .or_else(|| bundled::uri(path))
             .or_else(|| file_uri::from_path(path).ok())
     }
 }

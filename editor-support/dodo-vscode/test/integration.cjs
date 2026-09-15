@@ -65,6 +65,45 @@ exports.run = async function () {
   await vscode.commands.executeCommand("dodo.restartServer");
   await eventually("hover after restart", async () => (await hover())?.length);
 
+  await replace(document, "package editor_test\nimport \"std/math\"\nfn main() { _ = math.abs(-1.0) }\n");
+  const libraryDefinitions = await eventually("bundled definition", async () => {
+    const result = await vscode.commands.executeCommand("vscode.executeDefinitionProvider", uri, at("abs", 1));
+    return result?.some((item) => (item.uri || item.targetUri).scheme === "dodo-stdlib") && result;
+  });
+  const libraryLocation = libraryDefinitions[0];
+  const libraryUri = libraryLocation.uri || libraryLocation.targetUri;
+  const libraryDocument = await vscode.workspace.openTextDocument(libraryUri);
+  assert.equal(libraryDocument.languageId, "dodo");
+  assert.match(libraryDocument.lineAt((libraryLocation.range || libraryLocation.targetRange).start.line).text, /pub fn abs/);
+  await vscode.window.showTextDocument(libraryDocument);
+  const libraryPosition = libraryDocument.positionAt(libraryDocument.getText().indexOf("from_bits(0x7ff"));
+  await eventually("navigation inside bundled source", async () => {
+    const result = await vscode.commands.executeCommand("vscode.executeDefinitionProvider", libraryUri, libraryPosition);
+    return result?.some((item) => (item.uri || item.targetUri).toString() === libraryUri.toString());
+  });
+  await vscode.commands.executeCommand("dodo.restartServer");
+  await eventually("bundled hover after restart", async () =>
+    (await vscode.commands.executeCommand("vscode.executeHoverProvider", libraryUri, libraryPosition))?.length);
+
+  // Change a closed import on disk without saving or editing its open caller.
+  const dependencyUri = vscode.Uri.file(path.join(folder, "lib", "value.dodo"));
+  const dependencySource = "package lib\npub fn value() -> i32 { return 7 }\n";
+  await fs.mkdir(path.dirname(dependencyUri.fsPath));
+  await fs.writeFile(dependencyUri.fsPath, dependencySource);
+  await replace(document, "package editor_test\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n");
+  await eventually("import navigation", async () => {
+    const result = await vscode.commands.executeCommand("vscode.executeDefinitionProvider", uri, at("value", 1));
+    return result?.some((item) => (item.uri || item.targetUri).toString() === dependencyUri.toString());
+  });
+  await fs.writeFile(dependencyUri.fsPath, dependencySource.replace("return 7", "return missing_disk"));
+  await eventually("watched dependency diagnostics", () => vscode.languages.getDiagnostics(dependencyUri).some((d) => /missing_disk/.test(d.message)));
+  await fs.writeFile(dependencyUri.fsPath, dependencySource);
+  await eventually("watched dependency repair", () => vscode.languages.getDiagnostics(dependencyUri).length === 0);
+  await fs.unlink(dependencyUri.fsPath);
+  await eventually("watched dependency deletion", () => vscode.languages.getDiagnostics(uri).some((d) => /no .dodo|cannot resolve/.test(d.message)));
+  await fs.writeFile(dependencyUri.fsPath, dependencySource);
+  await eventually("watched dependency recreation", () => vscode.languages.getDiagnostics(uri).length === 0);
+
   // A workspace option must actually reach the server and take effect after restart.
   const config = vscode.workspace.getConfiguration("dodo");
   await config.update("checkMode", "package", vscode.ConfigurationTarget.Workspace);
@@ -103,5 +142,5 @@ exports.run = async function () {
   await eventually("disabled server", async () => !(await scratchHover())?.length);
   await config.update("server.enabled", true, vscode.ConfigurationTarget.Workspace);
   await eventually("reenabled server", async () => (await scratchHover())?.length);
-  console.log("Dodo integration passed: activation, hover, completion, definition, references, rename, signatures, diagnostics, formatting, restart, settings, overlays, untitled buffers, snippets, and disable.");
+  console.log("Dodo integration passed: activation, hover, completion, definition, bundled sources, watched dependencies, references, rename, signatures, diagnostics, formatting, restart, settings, overlays, untitled buffers, snippets, and disable.");
 };
