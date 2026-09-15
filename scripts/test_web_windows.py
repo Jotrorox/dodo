@@ -36,7 +36,7 @@ def main():
     parser.add_argument("--kernel32", type=Path)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
-    clang = tool(["clang-22", "clang"])
+    clang = tool(["clang-23", "clang"])
     linker = tool(["lld-link-22", "lld-link"])
     wine = str(args.wine.absolute()) if args.wine else tool(["wine64", "wine"])
     wineserver = str(args.wineserver.absolute()) if args.wineserver else tool(["wineserver64", "wineserver"])

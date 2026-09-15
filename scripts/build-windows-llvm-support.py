@@ -31,18 +31,18 @@ def download(url: str, destination: Path, checksum: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--llvm-prefix", type=Path, default=os.environ.get("LLVM_SYS_221_PREFIX"))
+    parser.add_argument("--llvm-prefix", type=Path, default=os.environ.get("LLVM_SYS_231_PREFIX"))
     parser.add_argument("--cmake-toolchain", type=Path, help="MSVC cross toolchain when building on Linux")
     args = parser.parse_args()
     if not args.llvm_prefix or not (args.llvm_prefix / "bin/llvm-config.exe").is_file():
-        parser.error("set --llvm-prefix or LLVM_SYS_221_PREFIX to the extracted Windows LLVM archive")
+        parser.error("set --llvm-prefix or LLVM_SYS_231_PREFIX to the extracted Windows LLVM archive")
     if os.name != "nt" and not args.cmake_toolchain:
         parser.error("cross compilation requires --cmake-toolchain")
     prefix = args.llvm_prefix.resolve()
     cache = ROOT / "target/windows-llvm-support"
     cache.mkdir(parents=True, exist_ok=True)
     archive = cache / "libxml2.tar.gz"
-    # Match LLVM's llvmorg-22.1.8/llvm/utils/release/build_llvm_release.bat.
+    # Match LLVM's llvmorg-23.1.1/llvm/utils/release/build_llvm_release.bat.
     download("https://gitlab.gnome.org/GNOME/libxml2/-/archive/v2.9.12/libxml2-v2.9.12.tar.gz",
              archive, "98bfa7a9a5e2a75638422050740448ee9f02bf4dc2075c9822d7747d5ff9e617")
     source = cache / "libxml2-v2.9.12"
@@ -69,7 +69,7 @@ def main() -> None:
     # llvm-config reports xml2s.lib even though libxml2 installs libxml2s.lib.
     shutil.copy2(prefix / "lib/libxml2s.lib", prefix / "lib/xml2s.lib")
     shutil.copy2(source / "Copyright", prefix / "libxml2-Copyright")
-    download("https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-22.1.8/llvm/LICENSE.TXT",
+    download("https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.1/llvm/LICENSE.TXT",
              prefix / "LICENSE.txt", "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee")
     print(f"Windows LLVM support libraries and notices: {prefix}")
 

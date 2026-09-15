@@ -14,7 +14,7 @@ client to get diagnostics, ownership information, and editing tools for `.dodo` 
 The [Dodo VS Code extension](https://github.com/Jotrorox/dodo/tree/main/editor-support/dodo-vscode)
 connects to `dodo lsp` automatically and adds syntax highlighting, bracket and
 comment support, and snippets for programs, functions, types, loops, matches,
-and tests. It requires VS Code 1.91 or newer and Dodo 0.1.2 or newer.
+and tests. It requires VS Code 1.137 or newer and Dodo 0.1.2 or newer.
 
 Download `dodo-vscode-0.1.2.vsix` from
 [GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.2), then install it:

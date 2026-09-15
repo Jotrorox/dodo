@@ -24,7 +24,7 @@ code --install-extension dodo-vscode-0.1.2.vsix
 ```
 
 You can also use **Extensions: Install from VSIX...** in VS Code and select the
-downloaded file. Open a `.dodo` file to activate the extension. VS Code 1.91 or
+downloaded file. Open a `.dodo` file to activate the extension. VS Code 1.137 or
 newer is required.
 
 ### Build from source
@@ -154,7 +154,7 @@ repository root with `cargo build --locked --bin dodo`, then run here:
 npm run test:integration
 ```
 
-The runner downloads VS Code 1.91.1 to test the minimum supported version and uses
+The runner downloads VS Code 1.137.0 to test the minimum supported version and uses
 an isolated temporary workspace and profile. It exercises LSP features, settings
 changes, restart, unsaved overlays, untitled buffers, and snippet insertion.
 Set `DODO_TEST_SERVER` to an absolute compiler path to use another build, and

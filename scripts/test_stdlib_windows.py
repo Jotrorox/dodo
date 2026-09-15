@@ -173,7 +173,7 @@ def main():
     compiler = args.compiler.resolve()
     if not compiler.is_file():
         raise SystemExit(f"Build the compiler first: {compiler}")
-    clang = tool(["clang-22", "clang"])
+    clang = tool(["clang-23", "clang"])
     linker = tool(["lld-link-22", "lld-link"])
     wine = str(args.wine.absolute()) if args.wine else tool(["wine64", "wine", "/usr/lib/wine/wine64"])
     wineserver = str(args.wineserver.absolute()) if args.wineserver else tool(["wineserver", "/usr/lib/wine/wineserver64", "/usr/lib/wine/wineserver"])

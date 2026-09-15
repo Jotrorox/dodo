@@ -54,7 +54,7 @@ class ReleasePrerequisiteTests(unittest.TestCase):
             "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
             "CC": shutil.which("cc"),
             "LIBRARY_PATH": str(self.libraries),
-            "LLVM_SYS_221_PREFIX": str(self.directory),
+            "LLVM_SYS_231_PREFIX": str(self.directory),
             "DODO_TEST_FLAGS": str(self.flags_file),
             "DODO_TEST_ARGS": str(self.args_file),
         }

@@ -65,7 +65,7 @@ Examples:
   dodo compile examples/hello.dodo -o build/hello
   dodo compile examples/gpio.dodo --emit llvm-ir -o build/gpio.ll
 
-LLVM 22 is embedded; no LLVM installation is needed to use this compiler.
+LLVM 23 is embedded; no LLVM installation is needed to use this compiler.
 Linking executables requires a C toolchain (cc, --linker, or DODO_CC).
 "#
 );
@@ -669,7 +669,7 @@ fn main() -> ExitCode {
             Ok(0)
         }
         Ok(Parsed::Version) => {
-            println!("dodo {} (LLVM 22, BSD-2-Clause)", env!("CARGO_PKG_VERSION"));
+            println!("dodo {} (LLVM 23, BSD-2-Clause)", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
         Ok(Parsed::Args(args)) => execute(*args),

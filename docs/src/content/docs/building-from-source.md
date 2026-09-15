@@ -21,8 +21,8 @@ instead. Run the commands on this page from the repository root.
 
 ## Install build prerequisites
 
-Building Dodo **from source** requires Rust 1.95.0 (pinned in
-`rust-toolchain.toml`), LLVM 22 development files and a C toolchain.
+Building Dodo **from source** requires Rust 1.98.1 (pinned in
+`rust-toolchain.toml`), LLVM 23 development files and a C toolchain.
 [`llvm-sys`](https://docs.rs/crate/llvm-sys/latest) provides the LLVM C API
 bindings; the language server implements its JSON encoding and decoding,
 JSON-RPC messages, LSP parameter validation, and file
@@ -31,22 +31,22 @@ fixes the dependencies. Ordinary Cargo builds prefer static LLVM and fall back
 to a shared LLVM library if static linking is unavailable. A compiler linked to
 shared LLVM needs that library installed at runtime.
 
-On Fedora with LLVM 22 packages:
+On Fedora with LLVM 23 packages:
 
 ```sh
 sudo dnf install llvm-devel llvm-static clang gcc gcc-c++ zlib-ng-compat-devel libzstd-devel libxml2-devel libffi-devel
-export LLVM_SYS_221_PREFIX=/usr/lib64/llvm22
+export LLVM_SYS_231_PREFIX=/usr/lib64/llvm23
 cargo build --locked --release
 cargo install --locked --path .
 ```
 
-On Ubuntu 24.04, install LLVM 22 from the
+On Ubuntu 24.04, install LLVM 23 from the
 [official LLVM package repository](https://apt.llvm.org/) and a C compiler:
 
 ```sh
-# After configuring the signed LLVM 22 apt repository:
-sudo apt-get install llvm-22-dev libpolly-22-dev build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev
-export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
+# After configuring the signed LLVM 23 apt repository:
+sudo apt-get install llvm-23-dev libpolly-23-dev build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev
+export LLVM_SYS_231_PREFIX=/usr/lib/llvm-23
 cargo build --locked --release
 cargo install --locked --path .
 ```
@@ -54,7 +54,7 @@ cargo install --locked --path .
 The Ubuntu packages are suitable for ordinary Cargo builds. CI uses the
 [official prebuilt LLVM archive](#fully-static-linux-compiler) for releases,
 so the compiler does not depend on Z3. If LLVM is installed elsewhere, set
-`LLVM_SYS_221_PREFIX` to its installation prefix containing `bin/llvm-config`.
+`LLVM_SYS_231_PREFIX` to its installation prefix containing `bin/llvm-config`.
 To prefer shared LLVM explicitly, use:
 
 ```sh
@@ -97,7 +97,7 @@ On an x86-64 Ubuntu 24.04 build machine, install the
 [release toolchain below](#fully-static-linux-compiler), then run:
 
 ```sh
-export LLVM_SYS_221_PREFIX="$PWD/target/llvm-linux"
+export LLVM_SYS_231_PREFIX="$PWD/target/llvm-linux"
 bash scripts/build-release.sh
 install -Dm755 target/x86_64-unknown-linux-gnu/release/dodo "$HOME/.local/bin/dodo"
 ```
@@ -111,7 +111,7 @@ needed on the build machine. Keeping every LLVM target increases the binary
 size compared with the old shared-LLVM build.
 
 The script requires Python 3 and `readelf` (binutils) for verification and honors
-`LLVM_SYS_221_PREFIX`, `CC`, and `CARGO_TARGET_DIR`. Other native x86-64 GNU/Linux
+`LLVM_SYS_231_PREFIX`, `CC`, and `CARGO_TARGET_DIR`. Other native x86-64 GNU/Linux
 build hosts need the same development libraries, including `libz.a`,
 `libzstd.a`, `libstdc++.a`, and `libffi.a`. Their runtime glibc requirement depends
 on the build host. Other platforms can use the ordinary Cargo build above;
@@ -127,17 +127,17 @@ then builds and runs a program with only the C toolchain added.
 
 The Windows release targets `x86_64-pc-windows-msvc`. It embeds LLVM and links
 the compiler's C and C++ runtimes statically. Building it requires the Visual
-Studio C++ Build Tools with a Windows SDK, Rust 1.95.0, and the official
-`clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz` development archive from
-[LLVM 22.1.8](https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.8).
+Studio C++ Build Tools with a Windows SDK, Rust 1.98.1, and the official
+`clang+llvm-23.1.1-x86_64-pc-windows-msvc.tar.xz` development archive from
+[LLVM 23.1.1](https://github.com/llvm/llvm-project/releases/tag/llvmorg-23.1.1).
 Use the development archive containing `llvm-config.exe` and static libraries.
 The CI workflow pins and verifies its download.
 
-From PowerShell, after extracting LLVM to `C:\llvm-22`:
+From PowerShell, after extracting LLVM to `C:\llvm-23`:
 
 ```powershell
-$env:LLVM_SYS_221_PREFIX = "C:\llvm-22"
-$env:PATH = "$env:LLVM_SYS_221_PREFIX\bin;$env:PATH"
+$env:LLVM_SYS_231_PREFIX = "C:\llvm-23"
+$env:PATH = "$env:LLVM_SYS_231_PREFIX\bin;$env:PATH"
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
 rustup target add x86_64-pc-windows-msvc
 rustup component add rust-docs
@@ -150,7 +150,7 @@ python scripts/test_windows_release.py build/release-assets/dodo-0.1.2-x86_64-pc
 The support script requires CMake and Visual Studio 2022. It builds the static
 XML support library omitted from LLVM's archive, using the same configuration
 as LLVM's Windows release, and installs it and the dependency notices into
-`LLVM_SYS_221_PREFIX`. For cross builds, its `--cmake-toolchain` option accepts
+`LLVM_SYS_231_PREFIX`. For cross builds, its `--cmake-toolchain` option accepts
 an MSVC CMake toolchain such as the one generated by `cargo-xwin`.
 
 The packaging script writes the Windows ZIP to `build/release-assets/` alongside
@@ -173,23 +173,23 @@ Install static archives for the C and math runtimes, the C++ standard library,
 zlib, zstd, libffi, and any additional libraries listed by
 `llvm-config --link-static --system-libs`.
 
-CI uses the official LLVM 22.1.8 Linux x86-64 archive, which has Z3 disabled.
+CI uses the official LLVM 23.1.1 Linux x86-64 archive, which has Z3 disabled.
 On Ubuntu 24.04, install its prerequisites and the same toolchain:
 
 ```sh
 sudo apt-get install build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev python3 curl xz-utils
-export LLVM_SYS_221_PREFIX="$PWD/target/llvm-linux"
+export LLVM_SYS_231_PREFIX="$PWD/target/llvm-linux"
 python3 scripts/install-linux-llvm.py
-export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH"
+export PATH="$LLVM_SYS_231_PREFIX/bin:$PATH"
 ```
 
 The installer verifies pinned SHA-256 checksums and extracts LLVM's static
 libraries, headers, required tools, and license. The download is about 1.9 GB;
 CI caches the extracted installation. To reuse a downloaded archive, pass
-`--archive /path/to/LLVM-22.1.8-Linux-X64.tar.xz`. No LLVM or Z3 source build is
+`--archive /path/to/LLVM-23.1.1-Linux-X64.tar.xz`. No LLVM or Z3 source build is
 needed.
 
-Ubuntu's `llvm-22-dev` package enables Z3 and cannot use this fully static recipe
+Ubuntu's `llvm-23-dev` package enables Z3 and cannot use this fully static recipe
 without an additional static Z3 library. Use the official archive above or an
 LLVM build configured with
 [`-DLLVM_ENABLE_Z3_SOLVER=OFF`](https://llvm.org/docs/CMake.html#llvm-enable-z3-solver).
@@ -204,7 +204,7 @@ Archives in custom locations can be made available through `LIBRARY_PATH`.
 On a native x86-64 GNU/Linux build host, use:
 
 ```sh
-# Keep LLVM_SYS_221_PREFIX set to the selected LLVM installation.
+# Keep LLVM_SYS_231_PREFIX set to the selected LLVM installation.
 bash scripts/build-release.sh release-small-static
 # Binary: target/x86_64-unknown-linux-gnu/release-small-static/dodo
 ```
@@ -265,7 +265,7 @@ library, an [`LSP server`](https://github.com/Jotrorox/dodo/blob/main/src/lsp.rs
 For documentation changes and website checks, see [Edit these docs](contributing.md).
 
 Debugger smoke tests in `tests/debugging.rs` run batch GDB sessions and validate
-DWARF with `llvm-dwarfdump-22`. Install both tools and run:
+DWARF with `llvm-dwarfdump-23`. Install both tools and run:
 
 ```sh
 DODO_REQUIRE_DEBUGGER_TESTS=1 cargo test --locked --test debugging

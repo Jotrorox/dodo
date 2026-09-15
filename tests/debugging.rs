@@ -105,10 +105,10 @@ fn debug_is_opt_in_and_survives_all_artifact_formats() {
             }
         }
     }
-    if tool("llvm-dwarfdump-22") {
+    if tool("llvm-dwarfdump-23") {
         for level in ["0", "3"] {
             success(
-                &Command::new("llvm-dwarfdump-22")
+                &Command::new("llvm-dwarfdump-23")
                     .arg("--verify")
                     .arg(w.0.join(format!("debug-{level}.o")))
                     .output()
@@ -122,7 +122,7 @@ fn debug_is_opt_in_and_survives_all_artifact_formats() {
 fn recursive_and_aggregate_debug_types_use_the_target_layout() {
     let w = Workspace::new();
     let source = w.file("types.dodo", "package types\npub struct Node { flag:bool, next:*const Node, value:i64 }\npub enum Choice { Empty, Value(i32) }\npub fn inspect(node:&Node, slice:&[i32], array:[3]u16, text:&str, option:Option<i32>, result:Result<i32,u8>, choice:Choice, storage:MaybeUninit<i64>, number:f64) {\ncore.drop(node)\ncore.drop(slice)\ncore.drop(array)\ncore.drop(text)\ncore.drop(option)\nmatch result { ok(value) => { core.drop(value) }, err(error) => { core.drop(error) } }\ncore.drop(choice)\ncore.drop(storage)\ncore.drop(number)\n}\n");
-    let dwarf = tool("llvm-dwarfdump-22");
+    let dwarf = tool("llvm-dwarfdump-23");
     for target in [
         "x86_64-unknown-linux-gnu",
         "thumbv7em-none-eabi",
@@ -137,13 +137,13 @@ fn recursive_and_aggregate_debug_types_use_the_target_layout() {
         );
         if dwarf {
             success(
-                &Command::new("llvm-dwarfdump-22")
+                &Command::new("llvm-dwarfdump-23")
                     .arg("--verify")
                     .arg(&object)
                     .output()
                     .unwrap(),
             );
-            let output = Command::new("llvm-dwarfdump-22")
+            let output = Command::new("llvm-dwarfdump-23")
                 .arg("--debug-info")
                 .arg(&object)
                 .output()

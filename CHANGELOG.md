@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Update the Rust toolchain to 1.98.1 and the compiler backend to LLVM 23.1.1
+  with llvm-sys 231.0.0. Source builds now use `LLVM_SYS_231_PREFIX`.
+- Update Rust and npm package dependencies, including TypeScript 7 and
+  Tree-sitter 0.27. The VS Code extension now requires VS Code 1.137 or newer.
+
 ## 0.1.2 — 2026-09-14
 
 Dodo 0.1.2 adds a portable and hosted standard library, native testing, source

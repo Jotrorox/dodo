@@ -24,7 +24,7 @@ async function main() {
       "editor.formatOnSave": false,
     }));
     await runTests({
-      version: process.env.VSCODE_TEST_VERSION || "1.91.1",
+      version: process.env.VSCODE_TEST_VERSION || "1.137.0",
       extensionDevelopmentPath: extension,
       extensionTestsPath: path.join(__dirname, "integration.cjs"),
       launchArgs: [

@@ -24,13 +24,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"),
                         default="x86_64-unknown-linux-gnu")
-    parser.add_argument("--llvm-prefix", type=Path, default=os.environ.get("LLVM_SYS_221_PREFIX"),
+    parser.add_argument("--llvm-prefix", type=Path, default=os.environ.get("LLVM_SYS_231_PREFIX"),
                         help="LLVM installation, including its license notices")
     parser.add_argument("--runner", help="Run the Windows compiler with Wine when packaging on Linux")
     args = parser.parse_args()
     windows = args.target == "x86_64-pc-windows-msvc"
     if not args.llvm_prefix:
-        parser.error("packaging requires --llvm-prefix or LLVM_SYS_221_PREFIX")
+        parser.error("packaging requires --llvm-prefix or LLVM_SYS_231_PREFIX")
     if args.runner and not windows:
         parser.error("--runner is only supported for Windows packaging")
 
@@ -42,7 +42,7 @@ def main() -> None:
     if not windows:
         subprocess.run([sys.executable, "scripts/check-linkage.py", str(binary), "--release"], cwd=ROOT, check=True)
     runner = [args.runner] if args.runner else []
-    if output(*runner, str(binary), "--version") != f"dodo {version} (LLVM 22, BSD-2-Clause)":
+    if output(*runner, str(binary), "--version") != f"dodo {version} (LLVM 23, BSD-2-Clause)":
         raise ValueError("Release binary version does not match Cargo.toml")
 
     destination = ROOT / "build/release-assets"

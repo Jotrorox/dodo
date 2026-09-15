@@ -47,7 +47,7 @@ def main():
     args = parser.parse_args()
     compiler = args.compiler.resolve()
     backend = args.openssl_source.resolve()
-    clang = harness.tool(["clang-22", "clang"])
+    clang = harness.tool(["clang-23", "clang"])
     linker = harness.tool(["lld-link-22", "lld-link"])
     temporary = tempfile.TemporaryDirectory(prefix="dodo-tls-windows-")
     work = args.work.resolve() if args.work else Path(temporary.name)

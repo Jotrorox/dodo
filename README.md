@@ -1,7 +1,7 @@
 # Dodo
 
 Dodo is an ahead-of-time systems language with checked borrowing and explicit
-hardware access. Its Rust and LLVM 22 compiler produces native executables,
+hardware access. Its Rust and LLVM 23 compiler produces native executables,
 object files, assembly, LLVM IR, and bitcode. Ordinary generated code needs no
 garbage collector, heap allocator, scheduler, or Dodo runtime.
 
@@ -115,9 +115,9 @@ and conservative borrow checking are documented alongside the specification.
 
 ## Build and contribute
 
-Source builds require Rust 1.95.0, LLVM 22 development files, and a C toolchain.
+Source builds require Rust 1.98.1, LLVM 23 development files, and a C toolchain.
 Cargo prefers static LLVM and allows a shared-library fallback. After installing
-the prerequisites and setting `LLVM_SYS_221_PREFIX` for your LLVM installation:
+the prerequisites and setting `LLVM_SYS_231_PREFIX` for your LLVM installation:
 
 ```sh
 git clone https://github.com/Jotrorox/dodo.git

@@ -61,7 +61,7 @@ def main() -> None:
 
         def run(*command: str, tools: bool = False) -> str:
             env = dict(os.environ)
-            env.pop("LLVM_SYS_221_PREFIX", None)
+            env.pop("LLVM_SYS_231_PREFIX", None)
             if os.name == "nt" and not tools:
                 # Windows os.environ keys are uppercase after copying to a dict.
                 env["PATH"] = str(Path(env["SYSTEMROOT"]) / "System32")
@@ -71,7 +71,7 @@ def main() -> None:
                 raise RuntimeError(f"Failed: {command}\n{result.stdout}\n{result.stderr}")
             return result.stdout.strip()
 
-        assert run(compiler, "--version") == f"dodo {version} (LLVM 22, BSD-2-Clause)"
+        assert run(compiler, "--version") == f"dodo {version} (LLVM 23, BSD-2-Clause)"
         # Test sources come from the checkout and stay outside the extracted bundle.
         examples = Path(__file__).resolve().parent.parent / "examples"
         for name in ("hello.dodo", "io.dodo", "bytes.dodo"):

@@ -33,13 +33,13 @@ if [[ "$profile" == release-small-static ]]; then
 
     # LLVM builds can have additional dependencies (for example libxml2).
     # The static linker adapter also handles llvm-sys's dynamic declarations.
-    if [[ -n "${LLVM_SYS_221_PREFIX:-}" ]]; then
-        llvm_config="$LLVM_SYS_221_PREFIX/bin/llvm-config"
+    if [[ -n "${LLVM_SYS_231_PREFIX:-}" ]]; then
+        llvm_config="$LLVM_SYS_231_PREFIX/bin/llvm-config"
     else
-        llvm_config=$(command -v llvm-config-22 || command -v llvm-config22 || command -v llvm-config || true)
+        llvm_config=$(command -v llvm-config-23 || command -v llvm-config23 || command -v llvm-config || true)
     fi
     if [[ ! -x "$llvm_config" ]]; then
-        echo "Set LLVM_SYS_221_PREFIX to the LLVM 22 installation for the static build." >&2
+        echo "Set LLVM_SYS_231_PREFIX to the LLVM 23 installation for the static build." >&2
         exit 1
     fi
     system_libraries=$("$llvm_config" --link-static --system-libs)

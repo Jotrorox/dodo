@@ -11,9 +11,9 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "22.1.8"
+VERSION = "23.1.1"
 ARCHIVE_NAME = f"LLVM-{VERSION}-Linux-X64"
-ARCHIVE_SHA256 = "df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384"
+ARCHIVE_SHA256 = "832aeb58d105de1cabc7b982dd2c65de0610f7377df48ae8fc2dd8e97420a15c"
 LICENSE_SHA256 = "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
 
 
@@ -35,7 +35,7 @@ def verify(path: Path, checksum: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--llvm-prefix", type=Path,
-                        default=os.environ.get("LLVM_SYS_221_PREFIX", ROOT / "target/llvm-linux"))
+                        default=os.environ.get("LLVM_SYS_231_PREFIX", ROOT / "target/llvm-linux"))
     parser.add_argument("--archive", type=Path, help="Use an already downloaded archive (checksum verified)")
     args = parser.parse_args()
     if platform.system() != "Linux" or platform.machine() != "x86_64":
@@ -53,8 +53,8 @@ def main() -> None:
         # test tools; omit unrelated executables and Clang/MLIR static libraries.
         members = [
             "include/llvm", "include/llvm-c", "lib/libLLVM*.a", "lib/libPolly*.a",
-            "lib/clang/22/include", "bin/llvm-config", "bin/llvm-dwarfdump",
-            "bin/clang", "bin/clang-22", "bin/lld", "bin/ld.lld", "bin/lld-link",
+            "lib/clang/23/include", "bin/llvm-config", "bin/llvm-dwarfdump",
+            "bin/clang", "bin/clang-23", "bin/lld", "bin/ld.lld", "bin/lld-link",
         ]
         subprocess.run([
             "tar", "-xJf", str(archive), "-C", str(prefix), "--strip-components=1", "--no-same-owner",
@@ -65,7 +65,7 @@ def main() -> None:
         verify(prefix / "LICENSE.txt", LICENSE_SHA256)
 
     # Existing debugger fixtures use the versioned Ubuntu tool name.
-    dwarf = prefix / "bin/llvm-dwarfdump-22"
+    dwarf = prefix / "bin/llvm-dwarfdump-23"
     if not dwarf.exists():
         dwarf.symlink_to("llvm-dwarfdump")
     config = str(prefix / "bin/llvm-config")
