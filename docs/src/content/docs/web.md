@@ -5,10 +5,10 @@ section: "Standard library"
 order: 160
 ---
 
-Use `std/web/hosted.serve` with `hosted.Text.new` to serve one text route on
-Linux GNU x86-64 or Windows x64. Start with this serial, bounded server and
-caller-owned buffers. `std/web` supplies the portable route table; importing it
-alone does not create sockets or start a server.
+Use `std/web/app.Server` to run a small HTTP application on Linux GNU x86-64
+or Windows x64. Register named handler structs with `std/web/application`;
+route IDs and bounded default buffers are supplied by the library. The portable
+registration package and `std/web` do not import sockets or start a server.
 
 ## Quickstart
 
@@ -16,32 +16,35 @@ Save this as `serve_route.dodo`:
 
 ```dodo
 package serve_route
-import "std/web"
-import "std/web/hosted"
 import "std/console"
+import "std/web"
+import "std/web/application"
+import "std/web/app"
 
+pub struct Hello {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.text(b"Hello, Dodo!\n")
+    }
+}
 fn main() -> i32 {
-    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
-    handler := hosted.Text.new(b"Hello, Dodo!\n")
-    workspace := [0u8; hosted.WORKSPACE_BYTES]
-    request_body := [0u8; 1024]
-    response_body := [0u8; 1024]
-    config := hosted.Config.defaults()
-    config.max_connections = 1
-    match hosted.serve(b"127.0.0.1:8080", &routes, &mut handler, &mut workspace,
-        &mut request_body, &mut response_body, config) {
+    routes := application.new().get(b"/", Hello {})!
+    server := app.Server.new(routes)
+    server.config.max_connections = 1
+    match server.serve(b"127.0.0.1:8080") {
         ok(report) => {
-            if report.failed != 0 { return 2 }
-            if report.completed != 1 { return 3 }
+            if report.failed != 0 {
+                return 2
+            };
             return 0
-        },
+        }
         err(reason) => {
             errors := console.stderr()
             match errors.println(&reason) {
-                ok(_) => {}, err(_) => {},
+                ok(_) => {}
+                err(_) => {}
             }
             return 1
-        },
+        }
     }
 }
 ```
@@ -50,54 +53,174 @@ fn main() -> i32 {
 dodo run serve_route.dodo
 ```
 
-The server waits silently for one connection. In terminal 2, request the route
-with Python 3 (or run the [Dodo HTTP quickstart](http.md)):
+The server waits silently for one connection. In terminal 2:
 
 ```sh
 python3 -c "import http.client; c = http.client.HTTPConnection('127.0.0.1', 8080, timeout=5); c.request('GET', '/'); r = c.getresponse(); print(r.status); print(r.read().decode(), end=''); c.close()"
 ```
 
-Expected client stdout:
+The client prints `200` and `Hello, Dodo!`; the server exits. Set
+`server.config.max_connections = 0` (the default) to keep accepting connections.
+Ctrl+C stops the process. For cooperative shutdown that returns a report, use
+`serve_until(address, cancel)` with a public `cancelled(&self) -> bool` method.
+`max_connections` counts accepted connections, including rejected requests.
 
-```text
-200
-Hello, Dodo!
+A successful serving Result contains a `hosted.Report`: inspect `completed`,
+`rejected`, `failed`, `accepted`, `cancelled`, and `last_error`. For example, a
+request to `/missing` gets 404 and increments `rejected`. Startup errors return
+`hosting.Error`. The example prints these errors and exits 1; connection failures
+make it exit 2. Binding does not enable address reuse; a recently closed port
+may need time to become reusable, or choose a different port.
+
+## Several routes
+
+[`examples/web_routes.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/web_routes.dodo)
+registers three different named handler types:
+
+```dodo
+package web_routes
+import "std/web"
+import "std/web/application"
+import "std/web/app"
+
+pub struct Home {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.html(b"<!doctype html><h1>Dodo</h1><a href=\"/hello/Dodo\">Say hello</a>")
+    }
+}
+pub struct Greeting {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        match request.parameter(b"name") {
+            some(name) => { return response.text(name) }
+            none => { return err(web.failure(web.Error.NotFound)) }
+        }
+    }
+}
+pub struct Echo {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.bytes(request.body())
+    }
+}
+fn main() -> i32 {
+    routes := application.new()
+        .get(b"/", Home {})!
+        .get(b"/hello/:name", Greeting {})!
+        .post(b"/echo", Echo {})!
+    server := app.Server.new(routes)
+    match server.serve(b"127.0.0.1:8080") {
+        ok(report) => { if report.failed != 0 { return 2 }; return 0 }
+        err(_) => { return 1 }
+    }
+}
 ```
 
-The server then exits 0. Restart it for another request. Stop an idle server
-with Ctrl+C; `max_connections = 1` counts accepted connections, not an idle
-acceptance timeout. Start the server before the client; if the client races
-compilation and reports connection refused, retry once the server is running.
+`get(pattern, handler)`, `post(pattern, handler)`, and
+`route(method, pattern, handler)` consume the previous application and return a
+Result containing the extended application. These examples unwrap literal
+registration errors with `!`; use `?` or `match` for fallible setup. Registration
+checks patterns, methods, ambiguous routes, and the eight-route
+`application.ROUTE_CAPACITY` bound. A ninth registration returns
+`web.Error.BufferFull`. Route IDs are assigned in registration order; handlers
+use request parameters and metadata without an ID dispatch switch. Literal
+precedence, parameter/wildcard matching, HEAD fallback, and 404/405 behavior
+come from the existing router.
 
-The workspace covers HTTP framing and paths. Separate 1024-byte arrays bound
-request and response bodies; `Text` borrows the literal. No allocator, thread
-pool, external files or credentials are required.
+Handlers are owned inline in a generic chain and keep their state between
+requests. Dodo supports named structs with public `handle` methods; it has no
+closures or ordinary function values. The bounded chain suits small applications;
+deeply nested generic types are expensive in the current compiler. Larger route
+tables can use `web.Router` and the existing runners with their own dispatcher.
+Route patterns and any handler borrows must outlive the application.
 
-Exit 1 means startup failed: inspect the hosted error, check the address and
-whether a previous server owns port 8080. The adapter does not set socket
-address-reuse options; the OS can retain a recently closed port temporarily.
-Wait for it to become reusable or change 8080 in both server and client.
-`console` is imported only to report startup errors on stderr. Exit 2 means an accepted connection
-failed; check protocol/body limits or deadlines. Exit 3 means the request was
-rejected instead of completed. Try `/missing` after restarting: the client gets
-404 and this example exits 3. A successful `serve` Result still requires checking
-its report; individual connection failures are counted there.
+`Server.new(application)` owns the application and configuration. Serving consumes
+the server, unpacks routes and handlers into separate local values, and drops
+handler state when serving returns. This accommodates Dodo's conservative
+borrowing rules without pointer erasure or callbacks retaining request storage.
+Borrow external state in a handler when it must remain available after serving.
+
+## Configuration and storage
+
+`app.Config.defaults()` is grouped by purpose:
+
+| Setting | Default |
+| --- | --- |
+| `config.execution` | `app.Execution.Serial`: one request per connection, one socket at a time |
+| `config.limits.header_bytes`, `header_fields` | 16,384 bytes, 100 fields |
+| `config.limits.body_bytes`, `response_bytes` | 4,096 bytes each |
+| `config.limits.path_bytes` | 2,048 bytes |
+| `config.limits.query_bytes`, `query_fields` | 2,048 bytes, 100 pairs |
+| `config.limits.response_header_bytes`, `response_header_fields` | 4,096 bytes, 32 fields |
+| `config.timeouts.header_ms` | 10,000 ms |
+| `config.timeouts.body_ms`, `request_ms`, `write_ms` | 30,000 ms each |
+| `config.timeouts.idle_ms` | 15,000 ms, concurrent mode only |
+| `config.backlog`, `max_connections` | 256; zero (accept until cancelled) |
+| `config.requests_per_connection`, `events_per_turn` | 100; 16, concurrent mode only |
+
+Each request/response body limit is the smaller of the configured value and available storage.
+Raising a limit does not enlarge a buffer. Protocol/path/query/header hard caps
+are the same as [the underlying hosted runner](hosted-http.md#serial-server-handlers-and-shutdown).
+Invalid settings fail before binding. Concurrent-only settings are validated
+when concurrent execution is selected. Zero body capacities allow empty bodies;
+zero query or response-header capacities disable those fields. All active
+timeouts, backlog, request counts, and event budgets must be nonzero.
+
+`serve(address)` and `serve_until(address, cancel)` supply fixed local buffers:
+68 KiB for serial execution (`app.WORKSPACE_BYTES` is 61,440 protocol bytes, plus two 4 KiB body buffers),
+or 544 KiB for eight concurrent slots. Handler values, route metadata, slot
+state, the route index, and stack frames add bounded storage. There is no heap
+allocation, buffer growth, per-peer thread, or task queue in this layer. Ensure
+the serving thread has enough stack, especially in concurrent mode; custom
+storage lets the caller choose where buffers live.
+
+`serve_in(address, storage)` uses caller storage and the native clock.
+`serve_with(address, storage, clock, cancel)` also accepts a monotonic
+`now_ms(&mut self) -> u64` clock and cooperative cancellation. Both consume the
+server and borrow the storage for the call. The storage wrapper retains its
+buffer borrows until dropped. For example:
+
+```dodo
+package custom_storage
+import "std/web"
+import "std/web/application"
+import "std/web/app"
+import "std/web/hosted"
+import "std/net"
+import "std/net/native"
+
+fn main() -> i32 {
+    routes := application.new().get(b"/", hosted.Text.new(b"Hello!"))!
+    server := app.Server.new(routes)
+    server.config.limits.body_bytes = 8192
+    server.config.limits.response_bytes = 8192
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    request := [0u8; 8192]
+    response := [0u8; 8192]
+    storage := app.Storage.new(&mut workspace, &mut request, &mut response)
+    clock := native.MonotonicClock {}
+    cancel := net.Cancellation.new()
+    cancel.cancel() // Demonstrate returning without accepting requests.
+    report := server.serve_with(b"127.0.0.1:8080", &mut storage, &mut clock, &cancel)!
+    assert(report.cancelled)
+    return 0
+}
+```
+
+For custom concurrency, select `app.Execution.Concurrent` and use
+`app.Storage.concurrent(workspace, request, response, slots)`. Supply 1–255
+`reactor.Slot.new()` values and at least `hosted.WORKSPACE_BYTES` per slot.
+Request and response buffers are divided equally among slots; trailing remainders
+are unused. A concurrent server given serial storage returns a workspace error.
+The slot count, rather than `max_connections`, bounds simultaneous connections.
 
 ## Hosted server choices
 
-`Config` supplies header/body/request/write budgets and buffer limits. The
-starter handles one request per connection, serially, and buffers the body
-before invoking the handler. Custom public handlers receive `web.Request` and
-`web.Response`; `response.text`, `response.html`, and `response.bytes` copy a body
-into bounded storage. Status and response headers are selected by the handler.
-`serve_with` lets an application select acceptor, clock and cancellation.
-Cancellation is cooperative; a handler that never returns cannot be preempted.
-For concurrent plain HTTP and keep-alive, use `std/web/reactor` below with the
-same handler interface. The default listen backlog for both hosted servers is 256.
-For streaming bodies or custom execution use `std/web/server`,
-`std/web/stream`, `std/web/response` and `std/http/connection` below.
-`std/web/static_files` is an optional filesystem entry point with its own
-rooted-path restrictions.
+The server object uses the existing serial `std/web/hosted` and concurrent
+`std/web/reactor` runners. Those lower-level functions remain available for
+custom dispatchers and transport adapters. HTTPS continues to use the explicit
+TLS acceptor. Streaming bodies, upgrades, and caller-driven execution use
+`std/web/server`, `std/web/stream`, `std/web/response`, and
+`std/http/connection`; none acquire a hosted dependency. Rooted static files
+remain an optional `std/web/static_files` import.
 
 ## Concurrent HTTP/1.1 server
 
@@ -114,29 +237,44 @@ dodo compile examples/web_server_concurrent.dodo -O 3 -o build/web-server
 ./build/web-server
 ```
 
-The essential setup is:
+Select concurrent execution on the same server object:
 
 ```dodo
-package concurrent_web
+package web_server_concurrent
+import "std/console"
 import "std/web"
-import "std/web/hosted"
-import "std/web/reactor"
+import "std/web/application"
+import "std/web/app"
 
+pub struct Hello {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.text(b"Hello, Dodo!\n")
+    }
+}
 fn main() -> i32 {
-    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
-    handler := hosted.Text.new(b"Hello, Dodo!\n")
-    slots := reactor.slots()
-    workspace := [0u8; reactor.WORKSPACE_BYTES * 8]
-    request := [0u8; 4096 * 8]
-    response := [0u8; 4096 * 8]
-    config := reactor.Config.defaults()
-    match reactor.serve(b"127.0.0.1:8080", &routes, &mut handler, &mut slots,
-        &mut workspace, &mut request, &mut response, config) {
-        ok(report) => { if report.failed != 0 { return 2 }; return 0 }
-        err(_) => { return 1 }
+    routes := application.new().get(b"/", Hello {})!
+    server := app.Server.new(routes)
+    server.config.execution = app.Execution.Concurrent
+    match server.serve(b"127.0.0.1:8080") {
+        ok(report) => {
+            if report.failed != 0 {
+                return 2
+            };
+            return 0
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            return 1
+        }
     }
 }
 ```
+
+The lower-level reactor also accepts custom slot arrays and configuration:
 
 `slots()` constructs eight `Slot.new()` values. The slot count bounds active
 connections; applications may supply another array or owned collection with
@@ -257,7 +395,7 @@ pub struct Greeting {
 }
 ```
 
-Use this handler with the quickstart's `hosted.serve`. See the complete
+Register this handler with `application.new().get(b"/hello/:name", Greeting {})!` and pass the application to `app.Server.new`. See the complete
 [`web_response.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/web_response.dodo)
 example for HTML and route/query access.
 
@@ -459,8 +597,8 @@ integrations are separate extension work. HTTPS uses an independently supplied
 
 ## Hosted convenience layer
 
-Use `std/web/hosted` for a bounded serial listener with ordinary structural
-handlers and library-owned connection, readiness, deadline, and body-transfer
-loops. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs,
+Use `std/web/app.Server` for grouped application setup and bounded default
+storage. Its underlying `std/web/hosted` runner provides serial connection,
+readiness, deadline, and body-transfer loops. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs,
 explicit storage bounds, resolver/deadline scope, cancellation, and a generated
 local HTTPS setup. Protocol and routing APIs remain usable independently.

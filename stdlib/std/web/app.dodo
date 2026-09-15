@@ -1,0 +1,148 @@
+package app
+
+import "std/web/application"
+import "std/web/hosted"
+import "std/web/reactor"
+import "std/http/hosting"
+import "std/net"
+import "std/net/native"
+
+pub const WORKSPACE_BYTES: usize = hosted.WORKSPACE_BYTES
+pub const BODY_BYTES: usize = 4096
+pub const DEFAULT_CONNECTIONS: usize = 8
+
+pub struct Limits {
+    pub header_bytes: usize
+    pub header_fields: usize
+    pub body_bytes: usize
+    pub response_bytes: usize
+    pub path_bytes: usize
+    pub query_bytes: usize
+    pub query_fields: usize
+    pub response_header_bytes: usize
+    pub response_header_fields: usize
+    pub fn defaults() -> Limits {
+        return Limits { header_bytes: 16384, header_fields: 100, body_bytes: BODY_BYTES,
+        response_bytes: BODY_BYTES, path_bytes: hosted.PATH_BYTES, query_bytes: hosted.QUERY_BYTES,
+        query_fields: 100, response_header_bytes: hosted.RESPONSE_HEADER_BYTES,
+        response_header_fields: hosted.RESPONSE_HEADER_FIELDS }
+    }
+}
+pub struct Timeouts {
+    pub header_ms: u64
+    pub body_ms: u64
+    pub request_ms: u64
+    pub write_ms: u64
+    pub idle_ms: u64
+    pub fn defaults() -> Timeouts {
+        return Timeouts { header_ms: 10000, body_ms: 30000, request_ms: 30000, write_ms: 30000, idle_ms: 15000 }
+    }
+}
+pub enum Execution {
+    Serial, Concurrent
+}
+pub struct Config {
+    pub limits: Limits
+    pub timeouts: Timeouts
+    pub execution: Execution
+    pub backlog: u32
+    // Total accepted connections, not simultaneous connections. Zero is unlimited.
+    pub max_connections: usize
+    pub requests_per_connection: usize
+    pub events_per_turn: usize
+    pub fn defaults() -> Config {
+        return Config { limits: Limits.defaults(), timeouts: Timeouts.defaults(), execution: Execution.Serial,
+        backlog: 256, max_connections: 0, requests_per_connection: 100, events_per_turn: 16 }
+    }
+    pub fn serial(&self) -> hosted.Config {
+        return hosted.Config { backlog: self.backlog, max_connections: self.max_connections,
+        header_bytes: self.limits.header_bytes, header_fields: self.limits.header_fields,
+        body_bytes: self.limits.body_bytes, response_bytes: self.limits.response_bytes,
+        path_bytes: self.limits.path_bytes, query_bytes: self.limits.query_bytes,
+        query_fields: self.limits.query_fields, response_header_bytes: self.limits.response_header_bytes,
+        response_header_fields: self.limits.response_header_fields,
+        header_timeout_ms: self.timeouts.header_ms, body_timeout_ms: self.timeouts.body_ms,
+        request_timeout_ms: self.timeouts.request_ms, write_timeout_ms: self.timeouts.write_ms }
+    }
+    pub fn concurrent(&self) -> reactor.Config {
+        return reactor.Config { server: self.serial(), requests_per_connection: self.requests_per_connection,
+        idle_timeout_ms: self.timeouts.idle_ms, events_per_turn: self.events_per_turn }
+    }
+}
+
+// Borrowed storage is reusable after serving returns. Body capacities are per
+// slot in concurrent mode; trailing bytes after equal division are unused.
+pub struct Storage {
+    workspace: &mut[u8]
+    request: &mut[u8]
+    response: &mut[u8]
+    slots: Option<&mut[reactor.Slot]>
+    pub fn new(workspace: &mut[u8], request: &mut[u8], response: &mut[u8]) -> Storage from(workspace, request, response) {
+        return Storage { workspace: workspace, request: request, response: response, slots: none }
+    }
+    pub fn concurrent(workspace: &mut[u8], request: &mut[u8], response: &mut[u8], slots: &mut[reactor.Slot]) -> Storage from(workspace, request, response, slots) {
+        return Storage { workspace: workspace, request: request, response: response, slots: some(slots) }
+    }
+}
+
+// Owns route metadata, named handler values, and grouped configuration. The
+// default storage lives only for a serving call; no self-referential borrows.
+// Serving consumes this object. Custom Storage is borrowed and can be reused.
+pub struct Server<H> {
+    pub application: application.Application<H>
+    pub config: Config
+    pub fn new(application: application.Application<H>) -> Server<H> from(application) {
+        return Server { application: application, config: Config.defaults() }
+    }
+    pub fn serve(self, address: &[u8]) -> hosted.Report!hosting.Error {
+        cancel := net.NeverCancel {}
+        return self.serve_until(address, &cancel)
+    }
+    pub fn serve_until<X>(self, address: &[u8], cancel: &X) -> hosted.Report!hosting.Error {
+        if self.config.execution == Execution.Concurrent {
+            return self.concurrent_defaults(address, cancel)
+        }
+        return self.serial_defaults(address, cancel)
+    }
+    fn serial_defaults<X>(self, address: &[u8], cancel: &X) -> hosted.Report!hosting.Error {
+        workspace := [0u8; hosted.WORKSPACE_BYTES]
+        request := [0u8; BODY_BYTES]
+        response := [0u8; BODY_BYTES]
+        storage := Storage.new(&mut workspace, &mut request, &mut response)
+        clock := native.MonotonicClock {}
+        return self.serve_with(address, &mut storage, &mut clock, cancel)
+    }
+    fn concurrent_defaults<X>(self, address: &[u8], cancel: &X) -> hosted.Report!hosting.Error {
+        slots := reactor.slots()
+        workspace := [0u8; hosted.WORKSPACE_BYTES *DEFAULT_CONNECTIONS]
+        request := [0u8; BODY_BYTES *DEFAULT_CONNECTIONS]
+        response := [0u8; BODY_BYTES *DEFAULT_CONNECTIONS]
+        storage := Storage.concurrent(&mut workspace, &mut request, &mut response, &mut slots)
+        clock := native.MonotonicClock {}
+        return self.serve_with(address, &mut storage, &mut clock, cancel)
+    }
+    pub fn serve_in(self, address: &[u8], storage: &mut Storage) -> hosted.Report!hosting.Error {
+        clock := native.MonotonicClock {}
+        cancel := net.NeverCancel {}
+        return self.serve_with(address, storage, &mut clock, &cancel)
+    }
+    pub fn serve_with<C, X>(self, address: &[u8], storage: &mut Storage, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
+        let Server { application: application, config: config } = self
+        let application.Application { table: table, handler: owned_handler } = application
+        handler := owned_handler
+        if config.execution == Execution.Concurrent {
+            match &mut storage.slots {
+                some(active) => {
+                    return reactor.serve_with(address, table.routes(), &mut handler,
+                    *active, storage.workspace, storage.request, storage.response, config.concurrent(), clock, cancel)
+                }
+                none => {
+                    return err(hosting.failure(hosting.ErrorKind.Workspace))
+                }
+            }
+        }
+        acceptor := hosted.PlainAcceptor {}
+        return hosted.serve_with(address, table.routes(), &mut handler,
+        storage.workspace, storage.request, storage.response, config.serial(), &mut acceptor, clock, cancel)
+    }
+}

@@ -1,6 +1,7 @@
 package web_response
 import "std/web"
-import "std/web/hosted"
+import "std/web/application"
+import "std/web/app"
 
 pub struct Greeting {
     pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
@@ -25,13 +26,9 @@ pub struct Greeting {
     }
 }
 fn main() -> i32 {
-    routes := [web.Route { method: b"GET", pattern: b"/hello/:name", id: 1 }]
-    handler := Greeting {}
-    workspace := [0u8; hosted.WORKSPACE_BYTES]
-    request := [0u8; 4096]
-    response := [0u8; 4096]
-    match hosted.serve(b"127.0.0.1:8080", &routes, &mut handler, &mut workspace,
-    &mut request, &mut response, hosted.Config.defaults()) {
+    routes := application.new().get(b"/hello/:name", Greeting {})!
+    server := app.Server.new(routes)
+    match server.serve(b"127.0.0.1:8080") {
         ok(report) => {
             if report.failed != 0 {
                 return 2

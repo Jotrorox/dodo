@@ -39,6 +39,7 @@ fn routing_middleware_and_backpressure_execute_and_remain_portable() {
         "http_connection_checks",
         "http_fast_checks",
         "web_application_checks",
+        "web_registration_checks",
     ] {
         let source =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/stdlib/{fixture}.dodo"));
@@ -80,6 +81,18 @@ fn routing_middleware_and_backpressure_execute_and_remain_portable() {
 fn router_context_and_pending_body_borrows_cannot_escape() {
     let scratch = Workspace::new();
     for (name, body) in [
+        (
+            "registration-pattern",
+            "fn bad() { path := [47u8]\n routes := application.new().get(&path, hosted.Text.new(b\"hello\"))!\n path[0] = 65\n count := routes.table.routes().len }",
+        ),
+        (
+            "registration-handler",
+            "fn bad() { body := [65u8]\n routes := application.new().get(b\"/\", hosted.Text.new(&body))!\n body[0] = 66\n count := routes.table.routes().len }",
+        ),
+        (
+            "application-storage",
+            "fn bad() { workspace := [0u8; hosted.WORKSPACE_BYTES]\n input := [0u8; 8]\n output := [0u8; 8]\n storage := app.Storage.new(&mut workspace, &mut input, &mut output)\n input[0] = 1\n routes := application.new().get(b\"/\", hosted.Text.new(b\"hello\"))!\n server := app.Server.new(routes)\n match server.serve_in(b\"invalid\", &mut storage) { ok(_) => {} err(_) => {} } }",
+        ),
         (
             "router",
             "fn escape() -> web.Router!web.Error from(static) { routes := [web.Route { method: b\"GET\", pattern: b\"/\", id: 1 }]\n return web.Router.new(&routes) }",
@@ -138,7 +151,7 @@ fn router_context_and_pending_body_borrows_cannot_escape() {
         ),
     ] {
         let source = scratch.0.join(format!("{name}.dodo"));
-        fs::write(&source, format!("package rejected\nimport \"std/web\"\nimport \"std/web/stream\"\nimport \"std/http/connection\"\n{body}\n")).unwrap();
+        fs::write(&source, format!("package rejected\nimport \"std/web\"\nimport \"std/web/stream\"\nimport \"std/web/application\"\nimport \"std/web/app\"\nimport \"std/web/hosted\"\nimport \"std/http/connection\"\n{body}\n")).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_dodo"))
             .arg("check")
             .arg(source)
@@ -213,28 +226,34 @@ fn concurrent_server_keeps_peers_independent_and_bounds_reuse() {
 }
 
 #[test]
-fn concurrent_server_cross_compiles_for_windows() {
+fn application_examples_cross_compile_for_windows() {
     let scratch = Workspace::new();
-    let source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/web_server_concurrent.dodo");
-    for optimization in ["0", "3"] {
-        success(
-            Command::new(env!("CARGO_BIN_EXE_dodo"))
-                .arg("compile")
-                .arg(&source)
-                .args([
-                    "-O",
-                    optimization,
-                    "--target",
-                    "x86_64-pc-windows-msvc",
-                    "--emit",
-                    "obj",
-                    "-o",
-                ])
-                .arg(scratch.0.join(format!("reactor-{optimization}.o")))
-                .output()
-                .unwrap(),
-        );
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for example in [
+        "web_server",
+        "web_server_concurrent",
+        "web_routes",
+        "web_response",
+    ] {
+        for optimization in ["0", "3"] {
+            success(
+                Command::new(env!("CARGO_BIN_EXE_dodo"))
+                    .arg("compile")
+                    .arg(root.join(format!("examples/{example}.dodo")))
+                    .args([
+                        "-O",
+                        optimization,
+                        "--target",
+                        "x86_64-pc-windows-msvc",
+                        "--emit",
+                        "obj",
+                        "-o",
+                    ])
+                    .arg(scratch.0.join(format!("{example}-{optimization}.o")))
+                    .output()
+                    .unwrap(),
+            );
+        }
     }
 }
 
@@ -244,6 +263,33 @@ fn buffered_requests_and_responses_interoperate_with_independent_peers() {
     success(
         Command::new("python3")
             .arg(root.join("scripts/test_web_request_response.py"))
+            .arg("--compiler")
+            .arg(env!("CARGO_BIN_EXE_dodo"))
+            .output()
+            .unwrap(),
+    );
+}
+
+#[test]
+fn application_setup_limits_and_shutdown_execute() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Workspace::new();
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!("app-config-{optimization}"));
+        success(
+            Command::new(env!("CARGO_BIN_EXE_dodo"))
+                .arg("build")
+                .arg(root.join("tests/http_hosted/app_config.dodo"))
+                .args(["-O", optimization, "-o"])
+                .arg(&executable)
+                .output()
+                .unwrap(),
+        );
+        success(Command::new(executable).output().unwrap());
+    }
+    success(
+        Command::new("python3")
+            .arg(root.join("scripts/test_web_app.py"))
             .arg("--compiler")
             .arg(env!("CARGO_BIN_EXE_dodo"))
             .output()

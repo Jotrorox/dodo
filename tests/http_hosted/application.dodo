@@ -1,0 +1,89 @@
+package application_server_checks
+import "std/console"
+import "std/web"
+import "std/web/application"
+import "std/web/app"
+import "std/web/hosted"
+import "std/web/reactor"
+import "std/net/native"
+
+pub struct Home {
+    calls: usize
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        self.calls += 1
+        // State belongs to the registered handler and persists across requests.
+        if self.calls == 1 { return response.html(b"<h1>first</h1>") }
+        return response.html(b"<h1>again</h1>")
+    }
+}
+pub struct Parameter {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        match request.parameter(b"name") {
+            some(name) => { return response.text(name) }
+            none => { return err(web.failure(web.Error.Handler)) }
+        }
+    }
+}
+pub struct Echo {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.bytes(request.body())
+    }
+}
+pub struct Large {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.text(b"0123456789012345678901234567890123456789")
+    }
+}
+pub struct Headers {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        response.header(b"X-One", b"one")?
+        response.header(b"X-Two", b"two")?
+        return response.text(b"body")
+    }
+}
+pub struct Stop {
+    until: u64
+    pub fn cancelled(&self) -> bool {
+        clock := native.MonotonicClock {}
+        return clock.now_ms() >= self.until
+    }
+}
+fn main() -> i32 {
+    routes := application.new().get(b"/", Home { calls: 0 })!
+        .get(b"/hello/:name", Parameter {})!
+        .post(b"/echo", Echo {})!
+        .get(b"/large", Large {})!
+        .get(b"/headers", Headers {})!
+    server := app.Server.new(routes)
+    server.config.max_connections = @@COUNT@@
+    server.config.execution = app.Execution.@@POLICY@@
+    server.config.requests_per_connection = 2
+    server.config.limits.body_bytes = 16
+    server.config.limits.response_bytes = 32
+    server.config.limits.header_bytes = 256
+    server.config.limits.header_fields = 4
+    server.config.limits.path_bytes = 32
+    server.config.limits.query_bytes = 16
+    server.config.limits.query_fields = 1
+    server.config.limits.response_header_fields = 2
+    server.config.timeouts.header_ms = 500
+    server.config.timeouts.body_ms = 500
+    clock := native.MonotonicClock {}
+    cancel := Stop { until: clock.now_ms() + @@STOP_MS@@ }
+    // @@STORAGE@@
+    match server.serve_until(b"127.0.0.1:@@PORT@@", &cancel) {
+        ok(report) => {
+            assert(report.cancelled == @@CANCELLED@@)
+            assert(report.accepted == @@COUNT@@)
+            assert(report.failed == 0)
+            assert(report.completed == @@COMPLETED@@)
+            assert(report.rejected == @@REJECTED@@)
+            console.println("stopped")!
+            input := console.stdin()
+            gate := [0u8; 1]
+            input.read(&mut gate)!
+            return 0
+        }
+        err(_) => { return 1 }
+    }
+}

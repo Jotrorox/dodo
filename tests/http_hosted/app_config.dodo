@@ -1,0 +1,141 @@
+package app_config_checks
+import "std/web"
+import "std/web/application"
+import "std/web/app"
+import "std/web/hosted"
+import "std/web/reactor"
+import "std/http/hosting"
+import "std/net"
+import "std/net/native"
+
+pub struct Hello {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        assert(false, "cancelled or invalid server dispatched a handler")
+        return ok()
+    }
+}
+fn main() -> i32 {
+    for concurrent in 0usize..2 {
+        for case in 0usize..12 {
+            routes := application.new().get(b"/", Hello {})!
+            server := app.Server.new(routes)
+            if concurrent != 0 {
+                server.config.execution = app.Execution.Concurrent
+            }
+            if case == 0 {
+                server.config.limits.header_bytes = 16385
+            }
+            if case == 1 {
+                server.config.limits.header_fields = 0
+            }
+            if case == 2 {
+                server.config.limits.path_bytes = 0
+            }
+            if case == 3 {
+                server.config.limits.query_bytes = hosted.QUERY_BYTES + 1
+            }
+            if case == 4 {
+                server.config.limits.query_fields = 101
+            }
+            if case == 5 {
+                server.config.limits.response_header_bytes = hosted.RESPONSE_HEADER_BYTES + 1
+            }
+            if case == 6 {
+                server.config.limits.response_header_fields = hosted.RESPONSE_HEADER_FIELDS + 1
+            }
+            if case == 7 {
+                server.config.timeouts.header_ms = 0
+            }
+            if case == 8 {
+                server.config.timeouts.body_ms = 0
+            }
+            if case == 9 {
+                server.config.timeouts.request_ms = 0
+            }
+            if case == 10 {
+                server.config.timeouts.write_ms = 0
+            }
+            if case == 11 {
+                server.config.backlog = 0
+            }
+            // Validation happens before the intentionally invalid bind address.
+            match server.serve(b"invalid address") {
+                err(reason) => {
+                    assert(reason.kind == hosting.ErrorKind.InvalidInput)
+                    assert(reason.network.kind == net.ErrorKind.Other)
+                }
+                ok(_) => {
+                    assert(false)
+                }
+            }
+        }
+        routes := application.new().get(b"/", Hello {})!
+        server := app.Server.new(routes)
+        if concurrent != 0 {
+            server.config.execution = app.Execution.Concurrent
+        }
+        cancel := net.Cancellation.new()
+        cancel.cancel()
+        report := server.serve_until(b"127.0.0.1:0", &cancel)!
+        assert(report.cancelled && report.accepted == 0 && report.completed == 0)
+    }
+    for case in 0usize..5 {
+        routes := application.new().get(b"/", Hello {})!
+        server := app.Server.new(routes)
+        server.config.execution = app.Execution.Concurrent
+        if case == 0 {
+            server.config.requests_per_connection = 0
+        }
+        if case == 1 {
+            server.config.events_per_turn = 0
+        }
+        if case == 2 {
+            server.config.timeouts.idle_ms = 0
+        }
+        slots := [reactor.Slot.new()]
+        workspace := [0u8; hosted.WORKSPACE_BYTES]
+        input := [0u8; 1]
+        output := [0u8; 1]
+        active := 1usize
+        if case == 3 {
+            active = 0
+        }
+        size := workspace.len
+        if case == 4 {
+            size -= 1
+        }
+        storage := app.Storage.concurrent(&mut workspace[..size], &mut input, &mut output, &mut slots[..active])
+        match server.serve_in(b"invalid address", &mut storage) {
+            err(reason) => {
+                assert(reason.kind == hosting.ErrorKind.InvalidInput)
+            }
+            ok(_) => {
+                assert(false)
+            }
+        }
+    }
+    for case in 0usize..2 {
+        routes := application.new().get(b"/", Hello {})!
+        server := app.Server.new(routes)
+        if case == 1 {
+            server.config.execution = app.Execution.Concurrent
+        }
+        workspace := [0u8; 1]
+        input := [0u8; 1]
+        output := [0u8; 1]
+        storage := app.Storage.new(&mut workspace, &mut input, &mut output)
+        clock := native.MonotonicClock {}
+        cancel := net.NeverCancel {}
+        match server.serve_with(b"invalid address", &mut storage, &mut clock, &cancel) {
+            err(reason) => {
+                assert(reason.kind == hosting.ErrorKind.Workspace)
+            }
+            ok(_) => {
+                assert(false)
+            }
+        }
+        core.drop(storage)
+        workspace[0] = 1 // Storage borrows end on drop, including error returns.
+    }
+    return 0
+}

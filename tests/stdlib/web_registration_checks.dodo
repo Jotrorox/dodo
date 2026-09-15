@@ -1,0 +1,106 @@
+package web_registration_checks
+import "core/bytes"
+import "std/web"
+import "std/web/application"
+
+pub struct Text {
+    body: &[u8]
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.text(self.body)
+    }
+}
+pub struct Parameter {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        match request.parameter(b"name") {
+            some(name) => {
+                return response.text(name)
+            }
+            none => {
+                return err(web.failure(web.Error.NotFound))
+            }
+        }
+    }
+}
+fn dispatch<H>(table: &application.Table, handler: &mut H, method: &[u8], path: &[u8], expected: &[u8]) {
+    router := web.Router.new(table.routes())!
+    found := router.find(method, path)!
+    headers := [0u8; 128]
+    body := [0u8; 64]
+    response := web.Response.new(&mut headers, 4, &mut body)
+    request := web.Request.new(method, path, b"", b"", b"", &router, found.index, found.id, 1)
+    web.handle(handler, &mut request, &mut response)!
+    assert(bytes.equal(response.body(), expected))
+}
+fn main() -> i32 {
+    routes := application.new()
+        .get(b"/hello/:name", Parameter {})!
+        .get(b"/hello/fixed", Text { body: b"literal" })!
+        .post(b"/hello/fixed", Text { body: b"post" })!
+        .route(b"HEAD", b"/hello/fixed", Text { body: b"head" })!
+    let application.Application { table: table, handler: owned } = routes
+    handler := owned
+    dispatch(&table, &mut handler, b"GET", b"/hello/Dodo", b"Dodo")
+    dispatch(&table, &mut handler, b"HEAD", b"/hello/Dodo", b"Dodo")
+    dispatch(&table, &mut handler, b"GET", b"/hello/fixed", b"literal")
+    dispatch(&table, &mut handler, b"POST", b"/hello/fixed", b"post")
+    dispatch(&table, &mut handler, b"HEAD", b"/hello/fixed", b"head")
+    // A second dispatch proves that the correct handler stays selected.
+    dispatch(&table, &mut handler, b"GET", b"/hello/again", b"again")
+    router := web.Router.new(table.routes())!
+    match router.find(b"GET", b"/missing") {
+        err(reason) => {
+            assert(reason == web.Error.NotFound)
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    match router.find(b"PUT", b"/hello/fixed") {
+        err(reason) => {
+            assert(reason == web.Error.MethodNotAllowed)
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    match application.new().get(b"/:bad-name", Text { body: b"" }) {
+        err(reason) => {
+            assert(reason == web.Error.InvalidPattern)
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    match application.new().route(b"bad method", b"/", Text { body: b"" }) {
+        err(reason) => {
+            assert(reason == web.Error.InvalidMethod)
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    first := application.new().get(b"/:one", Text { body: b"" })!
+    match first.get(b"/:two", Parameter {}) {
+        err(reason) => {
+            assert(reason == web.Error.AmbiguousRoute)
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    full := application.new().get(b"/1", Text { body: b"" })!
+        .get(b"/2", Text { body: b"" })!.get(b"/3", Text { body: b"" })!
+        .get(b"/4", Text { body: b"" })!.get(b"/5", Text { body: b"" })!
+        .get(b"/6", Text { body: b"" })!.get(b"/7", Text { body: b"" })!
+        .get(b"/8", Text { body: b"" })!
+    assert(full.table.routes().len == application.ROUTE_CAPACITY)
+    match full.get(b"/overflow", Text { body: b"" }) {
+        err(reason) => {
+            assert(reason == web.Error.BufferFull)
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    return 0
+}
