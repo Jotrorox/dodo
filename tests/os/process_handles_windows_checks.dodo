@@ -1,0 +1,203 @@
+package process_handles_windows_checks
+
+import "core/ptr"
+import "core/mem"
+import "std/platform/windows"
+import "std/platform/error"
+import "std/process"
+import "std/io"
+import "std/fmt"
+import "std/thread"
+import "std/fs"
+import "std/net"
+import "std/net/windows" as sockets
+
+unsafe extern "C" fn GetCurrentProcess() -> isize
+unsafe extern "C" fn GetProcessHandleCount(process: isize, count: *mut u32) -> i32
+unsafe extern "C" fn GetHandleInformation(handle: isize, flags: *mut u32) -> i32
+unsafe extern "C" fn SetHandleInformation(handle: isize, mask: u32, flags: u32) -> i32
+unsafe extern "C" fn CreateEventW(security: *mut u8, manual: i32, initial: i32, name: *const u16) -> isize
+unsafe extern "C" fn SetEvent(event: isize) -> i32
+unsafe extern "C" fn ResetEvent(event: isize) -> i32
+unsafe extern "C" fn WaitForSingleObject(handle: isize, milliseconds: u32) -> u32
+
+fn handle_count() -> u32 {
+    count := 0u32
+    unsafe {
+        assert(GetProcessHandleCount(GetCurrentProcess(), ptr.from_mut(&mut count)) != 0)
+    }
+    return count
+}
+
+fn check_inheritance() -> void!error.Error {
+    raw := unsafe {
+        CreateEventW(0usize as *mut u8, 1, 0, 0usize as *const u16)
+    }
+    assert(raw != 0)
+    event := unsafe {
+        windows.Handle.from_raw(raw)
+    }
+    unsafe {
+        assert(SetHandleInformation(event.raw(), 1, 1) != 0)
+        flags := 0u32
+        assert(GetHandleInformation(event.raw(), ptr.from_mut(&mut flags)) != 0 && (flags & 1) != 0)
+        assert(SetEvent(event.raw()) != 0)
+        assert(WaitForSingleObject(event.raw(), 0) == 0)
+        assert(ResetEvent(event.raw()) != 0)
+    }
+    argument := [0u8; 32]
+    writer := io.MemoryWriter.new(&mut argument)
+    count := match fmt.print(&mut writer, event.raw() as usize) {
+        ok(value) => { value }, err(_) => { return err(error.failure(error.Kind.Other)) }
+    }
+    core.drop(writer)
+    storage := process.CommandStorage.new()
+    command := process.Command.new("./os child.exe", &mut storage)?
+    command.arg("signal-handle")?
+    text := unsafe { mem.str_from_utf8(&argument[..count]) }
+    command.arg(text)?
+    output := [0u8; 16]
+    errors := [0u8; 16]
+    // Check both duplicated inherited standard streams and captured pipes.
+    for mode in 0..2 {
+        if mode == 1 {
+            command.options = process.Options.capture()
+        }
+        child := command.spawn()?
+        match child.collect(&mut output, &mut errors, 5000) {
+            ok(report) => { assert(report.status.success()) }
+            err(_) => { assert(false, "handle inheritance child failed") }
+        }
+        unsafe {
+            assert(WaitForSingleObject(event.raw(), 0) == 258,
+                   "spawn leaked an unrelated inheritable handle")
+        }
+    }
+    return ok()
+}
+
+fn process_cycle() -> void!error.Error {
+    storage := process.CommandStorage.new()
+    echo := process.Command.new("./os child.exe", &mut storage)?
+    echo.arg("echo")?
+    echo.options = process.Options.capture()
+    echo.options.stdin = process.Stdio.Piped
+    child := echo.spawn()?
+    sleeper_storage := process.CommandStorage.new()
+    sleeper := process.Command.new("./os child.exe", &mut sleeper_storage)?
+    sleeper.arg("sleep")?
+    sleeper.options = process.Options.capture()
+    other := sleeper.spawn()?
+    // The second child stays alive while the first receives EOF. A leaked
+    // parent pipe handle in that child would hold the first child's stdin open.
+    match child.take_stdin() {
+        some(pipe) => {
+            pipe.close()?
+            pipe.close()?
+        }, none => { assert(false, "missing parent stdin pipe") }
+    }
+    output := [0u8; 8]
+    errors := [0u8; 8]
+    match child.collect(&mut output, &mut errors, 5000) {
+        ok(report) => {
+            assert(report.status.success() && report.stdout_len == 0 && report.stderr_len == 0)
+        }
+        err(_) => { assert(false, "stdin EOF held open by another process") }
+    }
+    // Drop must terminate, wait, and release process and pipe handles.
+    core.drop(other)
+    missing_storage := process.CommandStorage.new()
+    missing := process.Command.new("./missing child.exe", &mut missing_storage)?
+    missing.options = process.Options.capture()
+    missing.options.stdin = process.Stdio.Piped
+    match missing.spawn() {
+        ok(_) => { assert(false) }
+        err(reason) => { assert(reason.kind == error.Kind.NotFound) }
+    }
+    return ok()
+}
+
+pub struct Task {
+    pub fn run(self) -> usize { return 42 }
+}
+
+fn thread_cycle() -> void!thread.ThreadError {
+    storage := thread.Storage.new::<Task, usize>()
+    joined := thread.spawn(&mut storage, Task {})?
+    assert(joined.join() == 42)
+    dropped := thread.spawn(&mut storage, Task {})?
+    core.drop(dropped)
+    return ok()
+}
+
+fn socket_handles() -> void!net.Error {
+    bind := net.parse_socket(b"127.0.0.1:0")?
+    listener := sockets.TcpListener.bind(&bind, 1)?
+    address := listener.local_address()?
+    clock := sockets.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    deadline := net.Operation.until(clock.now_ms() + 5000)
+    client := sockets.connect_with(&address, &deadline, &mut clock, &cancel)?
+    assert(listener.wait_ready(5000)?)
+    match listener.accept()? {
+        some(server) => {
+            unsafe {
+                flags := 0u32
+                assert(GetHandleInformation(client.raw_handle(), ptr.from_mut(&mut flags)) != 0)
+                assert((flags & 1) == 0, "connected socket must not be inheritable")
+                assert(GetHandleInformation(server.raw_handle(), ptr.from_mut(&mut flags)) != 0)
+                assert((flags & 1) == 0, "accepted socket must not be inheritable")
+            }
+            server.close()?
+            server.close()?
+        }
+        none => { assert(false, "missing loopback connection") }
+    }
+    client.close()?
+    listener.close()?
+    return ok()
+}
+
+fn file_cycle() -> void!error.Error {
+    workspace := windows.Workspace.new()
+    options := fs.OpenOptions.new()
+    options.write = true
+    options.create = true
+    file := fs.File.open_utf8("handle count Ω.txt", &options, &mut workspace)?
+    file.close()?
+    file.close()?
+    path := workspace.get()?
+    // Also exercise the destructor path independently of explicit close.
+    dropped := fs.File.open(&path, &options)?
+    core.drop(dropped)
+    return ok()
+}
+
+fn cycle() {
+    match process_cycle() {
+        ok() => {}, err(_) => { assert(false, "process handle cycle failed") }
+    }
+    match thread_cycle() {
+        ok() => {}, err(_) => { assert(false, "thread handle cycle failed") }
+    }
+    match file_cycle() {
+        ok() => {}, err(_) => { assert(false, "file handle cycle failed") }
+    }
+}
+
+fn main() {
+    match check_inheritance() {
+        ok() => {}, err(_) => { assert(false, "handle inheritance setup failed") }
+    }
+    match socket_handles() {
+        ok() => {}, err(_) => { assert(false, "socket handle check failed") }
+    }
+    // Warm CRT/OS lazy initialization before measuring repeated ownership
+    // cycles. A small allowance tolerates background runtime activity while
+    // still catching even one leaked handle per iteration.
+    cycle()
+    before := handle_count()
+    for i in 0..32 { cycle() }
+    after := handle_count()
+    assert(after <= before + 4, "file, process, pipe, or thread handles leaked")
+}

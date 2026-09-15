@@ -6,6 +6,9 @@ import "std/platform/native"
 import "std/platform/error"
 import "std/io"
 import "core/bytes"
+import "core/ptr"
+
+unsafe extern "C" fn GetHandleInformation(handle: isize, flags: *mut u32) -> i32
 
 fn verify() -> i32!error.Error {
     source := [110u16, 55296, 0]
@@ -30,6 +33,11 @@ fn verify() -> i32!error.Error {
     path := native.from_utf8("windows sharing.txt", &mut b, &mut w)?
     create := fs.OpenOptions.create_new()
     owner := windows_ext.open(&path, &create, 0)?
+    flags := 0u32
+    unsafe {
+        assert(GetHandleInformation(owner.raw_handle(), ptr.from_mut(&mut flags)) != 0)
+    }
+    assert((flags & 1) == 0, "file handles must not be inheritable")
     read := fs.OpenOptions.read_only()
     match fs.File.open(&path, &read) {
         ok(_) => {
@@ -51,10 +59,35 @@ fn verify() -> i32!error.Error {
             }
         }
     }
+    renamed_bytes := [0u8; 256]
+    renamed_wide := [0u16; 256]
+    renamed := native.from_utf8("renamed Ω.txt", &mut renamed_bytes, &mut renamed_wide)?
+    match fs.rename(&path, &renamed, false) {
+        ok() => {
+            assert(false, "rename must respect sharing restrictions")
+        }, err(reason) => {
+            assert(reason.code == 32)
+        }
+    }
     owner.close()?
-    owner = fs.File.open(&path, &read)?
+    // Closing an already closed owner must not close a newly allocated handle,
+    // even when Windows reuses the same numeric handle value.
+    replacement := fs.File.open(&path, &read)?
     owner.close()?
-    fs.remove_file(&path)?
+    core.drop(owner)
+    before := replacement.metadata()?
+    // The default sharing flags allow renaming and deletion while still open.
+    fs.rename(&path, &renamed, false)?
+    after := fs.metadata(&renamed)?
+    assert(before.device == after.device && before.inode == after.inode)
+    fs.remove_file(&renamed)?
+    still_open := replacement.metadata()?
+    assert(still_open.inode == before.inode)
+    replacement.close()?
+    // A pending deletion completes when the last owning handle is released.
+    recreated := fs.File.open(&renamed, &create)?
+    recreated.close()?
+    fs.remove_file(&renamed)?
     return ok(0)
 }
 fn main() -> i32 {

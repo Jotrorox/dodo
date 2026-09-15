@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -11,6 +12,25 @@
 #endif
 int main(int argc, char **argv) {
     if (argc < 2) return 90;
+#ifdef _WIN32
+    if (!strcmp(argv[1], "signal-handle")) {
+        if (argc != 3) return 104;
+        /* The parent observes its event, so an unrelated handle that happens
+         * to reuse this number in the child cannot cause a false failure. */
+        /* Parse locally so the Wine harness still links against legacy msvcrt
+         * without adding a C99 conversion helper from MinGW's runtime. */
+        uintptr_t value = 0;
+        for (const char *digit = argv[2]; *digit; ++digit) {
+            if (*digit < '0' || *digit > '9') return 105;
+            uintptr_t part = (uintptr_t)(*digit - '0');
+            if (value > (UINTPTR_MAX - part) / 10) return 105;
+            value = value * 10 + part;
+        }
+        if (!value) return 105;
+        (void)SetEvent((HANDLE)value);
+        return 0;
+    }
+#endif
     if (!strcmp(argv[1], "arguments")) {
         for (int i = 2; i < argc; ++i) {
             size_t count = strlen(argv[i]) + 1;
