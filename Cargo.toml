@@ -10,13 +10,18 @@ repository = "https://github.com/Jotrorox/dodo"
 [lib]
 name = "dodoc"
 
+[features]
+default = ["llvm"]
+# Native code generation, the LSP server, and the CLI.
+llvm = ["dep:llvm-sys", "dep:libc"]
+
 [dependencies]
 # llvm-sys defaults to preferring static LLVM, with a shared-library fallback.
 # Release packaging explicitly enables llvm-sys/force-static.
-llvm-sys = "231.0.0"
+llvm-sys = { version = "231.0.0", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.189"
+libc = { version = "0.2.189", optional = true }
 
 [profile.release]
 lto = "thin"
@@ -38,3 +43,155 @@ inherits = "release-small"
 [[bin]]
 name = "dodo"
 path = "src/main.rs"
+required-features = ["llvm"]
+
+# Tests that invoke the CLI or LLVM backend need the default feature.
+# Frontend integration tests remain automatically discovered by Cargo.
+
+[[test]]
+name = "alloc_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "array_storage"
+required-features = ["llvm"]
+
+[[test]]
+name = "collections_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "compiler"
+required-features = ["llvm"]
+
+[[test]]
+name = "console_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "container_elements"
+required-features = ["llvm"]
+
+[[test]]
+name = "core_intrinsics"
+required-features = ["llvm"]
+
+[[test]]
+name = "core_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "debugging"
+required-features = ["llvm"]
+
+[[test]]
+name = "env_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "format_cli"
+required-features = ["llvm"]
+
+[[test]]
+name = "fs_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "hash_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "hosted_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "http_hosted_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "http_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "llvm_backend"
+required-features = ["llvm"]
+
+[[test]]
+name = "lsp"
+required-features = ["llvm"]
+
+[[test]]
+name = "math_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "net_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "owned_storage"
+required-features = ["llvm"]
+
+[[test]]
+name = "process_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "reachability"
+required-features = ["llvm"]
+
+[[test]]
+name = "regressions"
+required-features = ["llvm"]
+
+[[test]]
+name = "slice_split"
+required-features = ["llvm"]
+
+[[test]]
+name = "specification"
+required-features = ["llvm"]
+
+[[test]]
+name = "std_bytes"
+required-features = ["llvm"]
+
+[[test]]
+name = "std_fmt"
+required-features = ["llvm"]
+
+[[test]]
+name = "std_io"
+required-features = ["llvm"]
+
+[[test]]
+name = "std_text"
+required-features = ["llvm"]
+
+[[test]]
+name = "stdlib_safety"
+required-features = ["llvm"]
+
+[[test]]
+name = "sync_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "test_cli"
+required-features = ["llvm"]
+
+[[test]]
+name = "thread_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "time_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "tls_library"
+required-features = ["llvm"]
+
+[[test]]
+name = "web_library"
+required-features = ["llvm"]

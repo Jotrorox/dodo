@@ -3,6 +3,7 @@ use dodoc::{ast::Type, diagnostic::Diagnostic, package};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(feature = "llvm")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,6 +41,7 @@ impl Drop for Workspace {
     }
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn copied_compiler_loads_bundled_sources_from_an_unrelated_directory() {
     let workspace = Workspace::new();

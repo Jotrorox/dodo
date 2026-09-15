@@ -153,8 +153,7 @@ pub fn load_with_overlays(
     path: &Path,
     overlays: &BTreeMap<PathBuf, String>,
 ) -> Result<Loaded, LoadError> {
-    let target = crate::codegen::TargetMachine::get_default_triple();
-    load_with_overlays_for_target(path, overlays, &target.as_str().to_string_lossy())
+    load_with_overlays_for_target(path, overlays, env!("DODO_HOST_TARGET"))
 }
 
 pub fn load_with_overlays_for_target(

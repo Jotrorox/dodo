@@ -2,9 +2,13 @@
 
 use dodoc::ast::{ExprKind, StmtKind, Type};
 use dodoc::{parser, sema};
+#[cfg(feature = "llvm")]
 use std::fs;
+#[cfg(feature = "llvm")]
 use std::path::PathBuf;
+#[cfg(feature = "llvm")]
 use std::process::Command;
+#[cfg(feature = "llvm")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const ARRAYS: &str = r#"package arrays
@@ -120,8 +124,10 @@ fn annotations_reject_other_expressions_and_cannot_replace_existing_constraints(
     }
 }
 
+#[cfg(feature = "llvm")]
 struct Workspace(PathBuf);
 
+#[cfg(feature = "llvm")]
 impl Workspace {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -140,12 +146,14 @@ impl Workspace {
     }
 }
 
+#[cfg(feature = "llvm")]
 impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn annotated_arrays_execute_at_both_optimization_levels() {
     let workspace = Workspace::new();

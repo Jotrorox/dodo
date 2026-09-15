@@ -22,6 +22,12 @@ fn collect(directory: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn main() {
+    // Use the compiler's Rust target, including when cross-compiling Dodo.
+    // Frontend package loading must not depend on LLVM to select host adapters.
+    println!(
+        "cargo:rustc-env=DODO_HOST_TARGET={}",
+        env::var("TARGET").unwrap()
+    );
     println!("cargo:rerun-if-changed=stdlib");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let root = manifest.join("stdlib");

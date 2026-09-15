@@ -400,6 +400,7 @@ fn arbitrary_bytes_and_mutated_documents_never_panic() {
     }
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn lsp_wire_fixtures_have_exact_encoding_and_recover_from_parse_errors() {
     use std::io::Write;

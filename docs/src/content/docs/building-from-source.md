@@ -21,7 +21,10 @@ instead. Run the commands on this page from the repository root.
 
 ## Install build prerequisites
 
-Building Dodo **from source** requires Rust 1.98.1 (pinned in
+To work on the frontend, install Rust 1.98.1 and its platform linker, then follow
+[frontend development without LLVM](#frontend-development-without-llvm).
+
+Building the full Dodo compiler **from source** requires Rust 1.98.1 (pinned in
 `rust-toolchain.toml`), LLVM 23 development files and a C toolchain.
 [`llvm-sys`](https://docs.rs/crate/llvm-sys/latest) provides the LLVM C API
 bindings; the language server implements its JSON encoding and decoding,
@@ -228,6 +231,34 @@ still needs a C toolchain. Only native x86-64 GNU/Linux builds are supported by
 this recipe.
 
 ## Development
+
+### Frontend development without LLVM
+
+The parser, semantic checker, constant evaluation, package loader, formatter,
+and editor analysis can be built and tested without LLVM development files:
+
+```sh
+cargo test --locked --no-default-features --all-targets
+cargo clippy --locked --no-default-features --all-targets -- -D warnings
+# Run only parser or semantic checker unit tests:
+cargo test --locked --no-default-features --lib parser::tests
+cargo test --locked --no-default-features --lib sema::tests
+```
+
+The default `llvm` Cargo feature enables `llvm-sys`, native code generation, the
+LSP server (which validates targets through LLVM), and the `dodo` binary. With
+`--no-default-features`, Cargo skips the binary and integration tests that require
+it or LLVM; frontend cases in mixed test files still run. Package loading uses
+the compiler's Rust target to select host standard library adapters, and callers
+can use `package::load_for_target` to select another target explicitly.
+
+CI runs these checks in a separate job without installing LLVM. Library users
+can select the same frontend with `default-features = false` on their `dodo`
+dependency; its Rust crate name remains `dodoc`.
+
+### Full compiler checks
+
+With LLVM 23 and the native prerequisites installed:
 
 ```sh
 cargo fmt --all --check
