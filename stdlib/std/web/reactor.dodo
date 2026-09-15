@@ -42,21 +42,24 @@ pub struct Slot {
     body_used: usize
     path_used: usize
     route_id: usize
+    route_index: usize
+    query_used: usize
+    header_used: usize
+    header_count: usize
+    last_error: Option<hosting.Error>
     request_id: u64
     requests: usize
-    head: bool
     expect_continue: bool
     reuse: bool
     final_started: bool
     finished: bool
     response_length: usize
     response_offset: usize
-    reject_code: u16
     pub fn new() -> Slot {
         return Slot { socket: native.TcpConnection.closed(), state: connection.State.new(http.Role.Request, http.Limits.defaults()),
         active: false, runnable: false, writing: false, poll_index: 0, phase: 0, deadline: 0, request_until: 0,
-        body_used: 0, path_used: 0, route_id: 0, request_id: 0, requests: 0, head: false, expect_continue: false,
-        reuse: false, final_started: false, finished: false, response_length: 0, response_offset: 0, reject_code: 0 }
+        body_used: 0, path_used: 0, route_id: 0, route_index: 0, query_used: 0, header_used: 0, header_count: 0, last_error: none, request_id: 0, requests: 0, expect_continue: false,
+        reuse: false, final_started: false, finished: false, response_length: 0, response_offset: 0 }
     }
     fn close(&mut self) {
         match self.socket.close() {
@@ -72,13 +75,14 @@ pub struct Slot {
         self.deadline = hosting.earlier(self.request_until, hosting.deadline(now, config.server.header_timeout_ms))
         self.body_used = 0
         self.path_used = 0
-        self.head = false
+        self.query_used = 0
+        self.header_used = 0
+        self.header_count = 0
         self.expect_continue = false
         self.final_started = false
         self.finished = false
         self.response_length = 0
         self.response_offset = 0
-        self.reject_code = 0
         self.writing = false
     }
     fn start(&mut self, socket: native.TcpConnection, now: u64, config: &Config, capacity: usize) {
@@ -109,7 +113,7 @@ pub struct Slot {
         }
     }
     fn advance<H, C, X>(&mut self, driver: &mut connection.Connection, router: &web.Router, handler: &mut H,
-    path: &mut[u8], request: &mut[u8], response: &mut[u8], config: &Config, clock: &mut C,
+    path: &mut[u8], query: &mut[u8], retained: &mut[u8], response_headers: &mut[u8], request: &mut[u8], response: &mut[u8], config: &Config, clock: &mut C,
     next_id: &mut u64, cancel: &X) -> Step!hosting.Error {
         if driver.pending_output() != 0 {
             if self.phase == 2 && self.response_offset == 0 && self.response_length != 0 {
@@ -219,16 +223,34 @@ pub struct Slot {
                     return err(hosting.protocol_error(reason))
                 }
             }
-            if http.equal_ascii(name, b"Expect") {
-                value: &[u8]
-                match driver.field(event.value_offset, event.value_length) {
-                    ok(data) => {
-                        value = data
-                    }
-                    err(reason) => {
-                        return err(hosting.protocol_error(reason))
-                    }
+            value: &[u8]
+            match driver.field(event.value_offset, event.value_length) {
+                ok(data) => {
+                    value = data
                 }
+                err(reason) => {
+                    return err(hosting.protocol_error(reason))
+                }
+            }
+            fields: web.Fields
+            match web.Fields.resume(retained, self.header_used, self.header_count, config.server.header_fields) {
+                ok(value) => {
+                    fields = value
+                }
+                err(reason) => {
+                    return err(hosted.request_error(reason))
+                }
+            }
+            match fields.append(name, value) {
+                ok() => {
+                    self.header_used = fields.bytes().len;
+                    self.header_count = fields.len()
+                }
+                err(reason) => {
+                    return err(hosted.request_error(reason))
+                }
+            }
+            if http.equal_ascii(name, b"Expect") {
                 if!http.equal_ascii(value, b"100-continue") {
                     return err(hosting.failure(hosting.ErrorKind.InvalidInput))
                 }
@@ -238,36 +260,16 @@ pub struct Slot {
         if event.kind == http.EventKind.HeadersComplete {
             self.phase = 1
             self.deadline = hosting.earlier(self.request_until, hosting.deadline(clock.now_ms(), config.server.body_timeout_ms))
-            uri: http.Uri
-            match http.Uri.parse(driver.target()) {
-                ok(value) => {
-                    uri = value
-                }
-                err(reason) => {
-                    return err(hosting.protocol_error(reason))
-                }
-            }
-            raw := uri.path()
-            if raw.len == 0 {
-                raw = b"/"
-            }
-            match web.decode_path(raw, path) {
-                ok(count) => {
-                    self.path_used = count
-                }
-                err(_) => {
-                    return err(hosting.failure(hosting.ErrorKind.InvalidInput))
-                }
-            }
+            target := hosted.decode_target(driver.target(), path, query, &config.server)?
+            self.path_used = target.path
+            self.query_used = target.query
             match router.find(driver.method(), &path[..self.path_used]) {
                 ok(found) => {
                     self.route_id = found.id;
-                    self.head = found.head
+                    self.route_index = found.index;
                 }
                 err(reason) => {
-                    policy := web.ErrorResponses.defaults()
-                    self.reject_code = policy.status(reason)
-                    return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+                    return err(hosted.request_error(web.failure(reason)))
                 }
             }
             if *next_id == 18446744073709551615u64 {
@@ -313,25 +315,20 @@ pub struct Slot {
             if clock.now_ms() >= self.request_until {
                 return err(hosting.failure(hosting.ErrorKind.TimedOut))
             }
-            input := io.MemoryReader.new(&request[..self.body_used])
             capacity := response.len
             if capacity > config.server.response_bytes {
                 capacity = config.server.response_bytes
             }
-            output := io.MemoryWriter.new(&mut response[..capacity])
-            context := web.Context { method: driver.method(), path: &path[..self.path_used], route_id: self.route_id,
-            request_id: self.request_id, cancelled: false }
-            code := 500u16
-            match web.handle(handler, &mut context, &mut input, &mut output) {
-                ok(value) => {
-                    code = value
-                }
+            output := web.Response.new(&mut response_headers[..config.server.response_header_bytes], config.server.response_header_fields, &mut response[..capacity])
+            context := web.Request.new(driver.method(), &path[..self.path_used], &retained[..self.header_used], &query[..self.query_used],
+            &request[..self.body_used], router, self.route_index, self.route_id, self.request_id)
+            match web.handle(handler, &mut context, &mut output) {
+                ok() => {}
                 err(reason) => {
-                    policy := web.ErrorResponses.defaults()
-                    self.reject_code = policy.status(reason)
-                    return err(hosting.failure(hosting.ErrorKind.Handler))
+                    return err(hosting.web_error(reason, hosting.ErrorKind.Handler))
                 }
             }
+            bodyless := hosted.bodyless(context.method(), output.status())
             core.drop(context)
             if cancel.cancelled() {
                 return err(hosting.failure(hosting.ErrorKind.Cancelled))
@@ -340,15 +337,8 @@ pub struct Slot {
             if now >= self.request_until {
                 return err(hosting.failure(hosting.ErrorKind.TimedOut))
             }
-            if code < 200 || code > 599 {
-                return err(hosting.failure(hosting.ErrorKind.Handler))
-            }
-            self.response_length = output.position()
-            framing := http.Body.sized(self.response_length as u64)
-            if code == 204 {
-                framing = http.Body.empty()
-            }
-            if self.head || code == 204 || code == 304 {
+            self.response_length = output.body().len
+            if bodyless {
                 self.response_length = 0
             }
             self.reuse = self.requests < config.requests_per_connection - 1 && driver.incoming_reusable()
@@ -356,15 +346,7 @@ pub struct Slot {
             if self.reuse {
                 connection_value = b"keep-alive"
             }
-            headers := [http.Header { name: b"Content-Type", value: b"text/plain; charset=utf-8" },
-            http.Header { name: b"Connection", value: connection_value }]
-            head := http.Response { status: code, reason: b"", headers: &headers, body: framing }
-            match driver.response(&head) {
-                ok() => {}
-                err(reason) => {
-                    return err(hosting.connection_error(reason))
-                }
-            }
+            hosted.response_head(driver, &output, connection_value)?
             self.phase = 2
             self.deadline = hosting.earlier(self.request_until, hosting.deadline(now, config.server.write_timeout_ms))
         }
@@ -378,7 +360,16 @@ pub struct Slot {
         let some(slice.SplitMut { left: input, right: tail }) = slice.split_at_mut(rest, 4096) else {
             return err(hosting.failure(hosting.ErrorKind.Workspace))
         }
-        let some(slice.SplitMut { left: output, right: path }) = slice.split_at_mut(tail, 16384) else {
+        let some(slice.SplitMut { left: output, right: metadata }) = slice.split_at_mut(tail, 16384) else {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        let some(slice.SplitMut { left: path, right: after_path }) = slice.split_at_mut(metadata, hosted.PATH_BYTES) else {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        let some(slice.SplitMut { left: query, right: after_query }) = slice.split_at_mut(after_path, hosted.QUERY_BYTES) else {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        let some(slice.SplitMut { left: retained, right: response_headers }) = slice.split_at_mut(after_query, hosted.REQUEST_HEADER_BYTES) else {
             return err(hosting.failure(hosting.ErrorKind.Workspace))
         }
         state := mem.replace(&mut self.state, connection.State.new(http.Role.Request, http.Limits.defaults()))
@@ -392,7 +383,7 @@ pub struct Slot {
             }
         }
         for i in 0usize..config.events_per_turn {
-            match self.advance(&mut driver, router, handler, &mut path[..2048], request, response, config, clock, next_id, cancel) {
+            match self.advance(&mut driver, router, handler, path, query, retained, response_headers, request, response, config, clock, next_id, cancel) {
                 ok(step) => {
                     if step != Step.Progress {
                         self.writing = self.phase == 2 || driver.pending_output() != 0
@@ -444,6 +435,7 @@ pub struct Slot {
                 self.close();
                 return Step.Closed
             }
+            self.last_error = some(hosting.failure(hosting.ErrorKind.TimedOut))
             if self.phase == 4 {
                 self.close();
                 return Step.Failed
@@ -463,7 +455,8 @@ pub struct Slot {
                     }
                     return Step.Progress
                 }
-                err(_) => {
+                err(reason) => {
+                    self.last_error = some(hosting.io_error(reason))
                     self.close();
                     return Step.Failed
                 }
@@ -479,25 +472,12 @@ pub struct Slot {
                     return Step.Closed
                 }
                 if reason.kind == hosting.ErrorKind.Transport {
+                    self.last_error = some(reason)
                     self.close();
                     return Step.Failed
                 }
-                code := self.reject_code
-                if code == 0 {
-                    code = 400
-                    if reason.kind == hosting.ErrorKind.HeaderLimit {
-                        code = 431
-                    }
-                    if reason.kind == hosting.ErrorKind.BodyLimit {
-                        code = 413
-                    }
-                    if reason.kind == hosting.ErrorKind.Handler {
-                        code = 500
-                    }
-                    if reason.kind == hosting.ErrorKind.TimedOut {
-                        code = 408
-                    }
-                }
+                code := hosted.status(&reason)
+                self.last_error = some(reason)
                 return self.reject(workspace, code, clock.now_ms(), config)
             }
         }
@@ -528,9 +508,7 @@ pub fn serve_with<H, C, X>(address: &[u8], routes: &[web.Route], handler: &mut H
 request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X) -> hosted.Report!hosting.Error {
     if slots.len == 0 || slots.len >= native.POLL_CAPACITY || workspace.len / slots.len < WORKSPACE_BYTES ||
         config.requests_per_connection == 0 || config.idle_timeout_ms == 0 || config.events_per_turn == 0 ||
-        config.server.backlog == 0 || config.server.header_bytes == 0 || config.server.header_bytes > 16384 ||
-        config.server.header_fields == 0 || config.server.header_fields > 100 || config.server.header_timeout_ms == 0 ||
-        config.server.body_timeout_ms == 0 || config.server.request_timeout_ms == 0 || config.server.write_timeout_ms == 0 {
+        !config.server.valid() {
         return err(hosting.failure(hosting.ErrorKind.InvalidInput))
     }
     owner := Owner { slots: slots }
@@ -543,8 +521,8 @@ request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X
             ok(value) => {
                 router = value
             }
-            err(_) => {
-                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            err(reason) => {
+                return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
             }
         }
     } else {
@@ -552,8 +530,8 @@ request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X
             ok(value) => {
                 router = value
             }
-            err(_) => {
-                return err(hosting.failure(hosting.ErrorKind.InvalidInput))
+            err(reason) => {
+                return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
             }
         }
     }
@@ -575,7 +553,7 @@ request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X
             return err(hosting.network_error(reason, hosting.ErrorKind.Connect))
         }
     }
-    report := hosted.Report { accepted: 0, completed: 0, rejected: 0, failed: 0, cancelled: false }
+    report := hosted.Report { accepted: 0, completed: 0, rejected: 0, failed: 0, cancelled: false, last_error: none }
     next_id := 0u64
     readiness := native.PollSet.new()
     for true {
@@ -673,6 +651,12 @@ request: &mut[u8], response: &mut[u8], config: Config, clock: &mut C, cancel: &X
                 owner.slots[i].runnable = step == Step.Progress || step == Step.Complete
                 if step == Step.Complete {
                     report.completed += 1
+                }
+                match mem.replace(&mut owner.slots[i].last_error, none) {
+                    some(reason) => {
+                        report.last_error = some(reason)
+                    }
+                    none => {}
                 }
                 if step == Step.Rejected {
                     report.rejected += 1

@@ -1,0 +1,122 @@
+package web_request_response_checks
+import "core/bytes"
+import "std/http"
+import "std/web"
+
+fn checks() -> void!web.Failure {
+    headers := [0u8; 64]
+    body := [0u8; 4]
+    response := web.Response.new(&mut headers, 2, &mut body)
+    local := [65u8, 66]
+    response.header(b"X-Test", &local)?
+    response.bytes(&local)?
+    local[0] = 90
+    assert(bytes.equal(response.body(), b"AB"))
+    match response.header_at(0) {
+        some(field) => {
+            assert(bytes.equal(field.value, b"AB"))
+        }
+        none => {
+            return err(web.failure(web.Error.Handler))
+        }
+    }
+    response.header(b"x-test", b"second")?
+    match response.header(b"X-Full", b"overflow") {
+        ok() => {
+            return err(web.failure(web.Error.Handler))
+        }
+        err(reason) => {
+            assert(reason.kind == web.Error.HeaderLimit)
+            match &reason.protocol {
+                some(cause) => {
+                    assert(cause.kind == http.ErrorKind.BufferFull);
+                    assert(cause.position == 2)
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+        }
+    }
+    match response.bytes(b"12345") {
+        ok() => {
+            return err(web.failure(web.Error.Handler))
+        }
+        err(_) => {}
+    }
+    assert(bytes.equal(response.body(), b"AB"))
+    response.bytes(b"1234")?
+    assert(bytes.equal(response.body(), b"1234"))
+    match response.set_status(600) {
+        ok() => {
+            return err(web.failure(web.Error.Handler))
+        }
+        err(_) => {}
+    }
+    assert(response.status() == 200)
+    query := [0u8; 4]
+    count := web.decode_query(b"a=b", &mut query, 1)?
+    assert(count == 4)
+    match web.decode_query(b"a=bb", &mut query, 1) {
+        ok(_) => {
+            return err(web.failure(web.Error.Handler))
+        }
+        err(reason) => {
+            assert(reason.kind == web.Error.QueryLimit)
+        }
+    }
+    match web.decode_query(b"a=b", &mut query, 0) {
+        ok(_) => {
+            return err(web.failure(web.Error.Handler))
+        }
+        err(reason) => {
+            assert(reason.kind == web.Error.QueryLimit)
+        }
+    }
+    match web.decode_query(b"x=%G0", &mut query, 1) {
+        ok(_) => {
+            return err(web.failure(web.Error.Handler))
+        }
+        err(reason) => {
+            match &reason.protocol {
+                some(cause) => {
+                    assert(cause.kind == http.ErrorKind.InvalidUri);
+                    assert(cause.position == 3)
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+        }
+    }
+    match web.decode_query(b"x=%FF", &mut query, 1) {
+        ok(_) => {
+            return err(web.failure(web.Error.Handler))
+        }
+        err(reason) => {
+            match &reason.encoding {
+                some(cause) => {
+                    assert(cause.position == 0)
+                }
+                none => {
+                    return err(web.failure(web.Error.Handler))
+                }
+            }
+        }
+    }
+    return ok()
+}
+fn main() -> i32 {
+    match checks() {
+        ok() => {
+            return 0
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}
+@test
+fn web_request_response_checks_suite() {
+    assert_eq(main(), 0, "buffered request/response failed")
+}

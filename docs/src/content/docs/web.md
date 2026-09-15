@@ -87,13 +87,14 @@ its report; individual connection failures are counted there.
 
 `Config` supplies header/body/request/write budgets and buffer limits. The
 starter handles one request per connection, serially, and buffers the body
-before invoking the handler. `hosted.text(output, bytes)` builds a text response
-from a custom public handler with the structural `handle` method.
+before invoking the handler. Custom public handlers receive `web.Request` and
+`web.Response`; `response.text`, `response.html`, and `response.bytes` copy a body
+into bounded storage. Status and response headers are selected by the handler.
 `serve_with` lets an application select acceptor, clock and cancellation.
 Cancellation is cooperative; a handler that never returns cannot be preempted.
 For concurrent plain HTTP and keep-alive, use `std/web/reactor` below with the
 same handler interface. The default listen backlog for both hosted servers is 256.
-For streaming bodies, middleware, or custom execution use `std/web/server`,
+For streaming bodies or custom execution use `std/web/server`,
 `std/web/stream`, `std/web/response` and `std/http/connection` below.
 `std/web/static_files` is an optional filesystem entry point with its own
 rooted-path restrictions.
@@ -141,7 +142,7 @@ fn main() -> i32 {
 connections; applications may supply another array or owned collection with
 1–255 slots. Allocate `WORKSPACE_BYTES * slots.len` workspace bytes. Request and
 response arrays are divided equally between slots, with any trailing remainder
-unused. The example supplies 4 KiB per request and response, totaling 368 KiB
+unused. The example supplies 4 KiB per request and response, totaling 544 KiB
 of byte buffers for eight connections. Slots, the route index, and stack frames
 add a separate bounded amount of storage.
 
@@ -233,33 +234,122 @@ its router does not implement authority/virtual-host selection or OPTIONS `*`.
 
 ## Handlers and middleware
 
-`Context` contains borrowed method/path, route ID, explicit request ID and a
-cancellation flag. Applications own additional state in handler structs.
-`handle` and `dispatch` use ordinary generic methods, checked and monomorphized
-by the compiler, without closures, runtime vtables or native function-pointer
-casts. A handler implements `handle(context, body, output) -> u16!web.Error`.
-The caller selects its body reader and response writer; no full buffering is
-required. Serialization packages can integrate through `std/io` when supplied
-by an application; none is imported implicitly.
+Buffered handlers implement one ordinary, compiler-checked method:
 
-`Chain<A,B>` invokes `before` outer-to-inner and `after` inner-to-outer. Failed
-`before` short-circuits without calling the handler or any `after`. Handler failure
-invokes `after` with status 500 and preserves the typed error. Cancellation before
-dispatch invokes neither middleware nor handler. Middleware owns any logging,
-authentication or serialization capabilities it needs.
+```dodo
+pub fn handle(&mut self, request: &mut web.Request,
+    response: &mut web.Response) -> void!web.Failure
+```
 
-Borrowed context, parser fields and body fragments cannot escape into handler
-state. The checker rejects replacing borrow-carrying storage through a mutable
-reference, including external callback receivers. Copy required bytes into
-caller-backed or owned storage and retain lengths/offsets instead. Moving an
-entire owned aggregate preserves its inferred or explicit `from(...)` sources.
+The serial, HTTPS and concurrent servers all use it. `web.handle(handler,
+request, response)` also works without a server. A response starts at status
+200 with no headers and an empty body. For example:
 
-`ErrorResponses` provides configurable routing-error statuses (defaults 400, 404,
-405, 500). Applications select response content and headers, including `Allow`
-when publishing 405. No internal error, path or credential is automatically
-formatted into a public response. `std/web/response.Builder` validates a status
-and selected prefix of preinitialized caller header slots, then builds a borrowed
-`http.Response`. Its body describes framing; it does not buffer content.
+```dodo
+pub struct Greeting {
+    pub fn handle(&mut self, request: &mut web.Request,
+        response: &mut web.Response) -> void!web.Failure {
+        response.set_status(201)?
+        response.header(b"Content-Type", b"application/json")?
+        response.header(b"X-Request-Method", request.method())?
+        return response.text(b"{\"hello\":\"Dodo\"}")
+    }
+}
+```
+
+Use this handler with the quickstart's `hosted.serve`. See the complete
+[`web_response.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/web_response.dodo)
+example for HTML and route/query access.
+
+### Request access and decoding
+
+| Method | Result |
+| --- | --- |
+| `request.method()` | Original, case-sensitive method bytes |
+| `request.path()` | Validated UTF-8 path, percent-decoded once, without query |
+| `request.body()` | Complete bounded body bytes, after HTTP transfer decoding |
+| `request.header(name, occurrence)` | `Option<&[u8]>`; ASCII case-insensitive name |
+| `request.query(name, occurrence)` | `Option<&[u8]>`; case-sensitive decoded name |
+| `request.parameter(name)` | `Option<&[u8]>`; named route capture in the decoded path |
+
+Occurrences start at zero. Headers and query pairs preserve duplicates in wire
+order; lookup never combines comma-separated values or chooses a last value.
+Missing values return `none`, while present empty values return `some(b"")`.
+Headers retain their value bytes after the HTTP parser trims surrounding spaces
+and tabs. Header values need not be UTF-8. Trailers are validated by HTTP but
+are not exposed as request headers. Framing headers retain the HTTP parser's
+strict duplicate rules. Bodies are arbitrary bytes; there is no automatic
+JSON, form-body, multipart, charset or content-encoding conversion.
+
+Queries split on `&`, then on the first `=`, before decoding. `%HH` is decoded
+exactly once; `+` becomes space. Encoded `&`, `=`, `+`, `#` and `/` remain value
+characters. Empty components between ampersands are skipped, a bare key has an
+empty value, and an empty key is allowed. Malformed escapes, controls (including
+NUL and DEL), fragments and invalid UTF-8 are rejected before dispatch.
+Semicolons do not delimit pairs. `decode_query` percent-error positions refer to
+the raw query; HTTP URI errors refer to the whole target. UTF-8 error positions
+refer to the decoded key or value. Route captures are not
+decoded again: `/users/a%252Fb` captures `a%2Fb`; encoded path separators such as
+`%2F` are rejected. There is no normalization or Unicode case folding.
+
+`route_id`, `request_id` and `cancelled` are public request metadata. The route
+index used for captures is retained separately from the application route ID.
+All accessor views borrow the request. Neither request views nor response
+storage views may escape into handler state or survive a conflicting mutation.
+The checker enforces this without unchecked pointers or callback lifetime casts.
+
+### Response construction
+
+| Method | Behavior |
+| --- | --- |
+| `response.set_status(code)` | Select a final status, 200–599 |
+| `response.header(name, value)` | Copy and append a validated header |
+| `response.text(bytes)` | Validate UTF-8 and copy the body; default type `text/plain; charset=utf-8` |
+| `response.html(bytes)` | Validate UTF-8 and copy the body; default type `text/html; charset=utf-8` |
+| `response.bytes(bytes)` | Copy arbitrary body bytes; add no Content-Type |
+| `response.status()`, `response.body()` | Read status or borrow copied body bytes |
+| `response.header_at(index)` | Borrow a copied header by insertion index |
+
+Each body call replaces the previous body. Text/HTML add their default type only
+when no Content-Type has been supplied; set a custom type before calling them.
+A second Content-Type is rejected case-insensitively. Other duplicate response
+headers are appended in insertion order, including separate Set-Cookie fields;
+the application must respect each field's HTTP semantics. Header names must be
+HTTP tokens; CR, LF, NUL and invalid field-value controls are rejected.
+
+The runner generates Content-Length and Connection. Handlers cannot supply
+Content-Length, Transfer-Encoding, Connection, Trailer, TE, Upgrade, Keep-Alive
+or Proxy-Connection. HEAD invokes the selected handler and sends its headers
+and representation length, without body bytes. 204 omits Content-Length; 205
+sends length zero; 304 sends the buffered representation length. None of these
+statuses sends body bytes. Informational responses and streaming framing remain
+available through the lower-level connection API.
+
+`Response.new(header_storage, header_field_limit, body_storage)` borrows two
+caller-owned byte buffers. Mutators copy their arguments and retain no borrow
+of handler locals or request data. Failed setters leave the existing response
+unchanged. Propagate errors with `?` to discard the whole response; a handler may
+also catch an error and deliberately build a smaller response.
+
+`web.Failure` keeps a `kind: web.Error`, plus optional underlying `http.Error`
+and `text.Error` diagnostics. Response capacity and header/status validation errors retain
+protocol kind and position; invalid UTF-8 retains its exact text diagnostic.
+Hosted failures retain this value in `hosting.Error.application`, and server
+`Report.last_error` retains the latest observed connection failure. Public error
+responses are empty; internal errors and request data are never formatted into
+them. `serve_connection` returns the original error even when it successfully
+sends an error response (`reason.responded == true`); the serial server counts
+these as rejected connections. Inspect reports as well as startup Results.
+
+`Chain<A,B>` invokes `before(request)` outer-to-inner and `after(request, status)`
+inner-to-outer. `before` returns `void!web.Failure`; a failure short-circuits
+without invoking the handler or `after`. Handler failure invokes `after` with
+500 and preserves the failure. Cancellation before dispatch invokes neither.
+Applications own any additional handler or middleware state.
+
+The lower-level streaming `Context` remains separate. `ErrorResponses` maps its
+routing errors, and `std/web/response.Builder` still builds borrowed HTTP framing
+metadata from preinitialized header slots.
 
 ## Streaming composition and execution
 

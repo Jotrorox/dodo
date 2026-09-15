@@ -1,6 +1,5 @@
 package reactor_checks
 import "std/console"
-import "std/io"
 import "std/net/native"
 import "std/web"
 import "std/web/hosted"
@@ -15,35 +14,25 @@ pub struct Stop {
     }
 }
 pub struct Handler {
-    pub fn handle<B, W>(&mut self, context: &mut web.Context, body: &mut B, output: &mut W) -> u16!web.Error {
-        if context.route_id == 1 {
-            data := [0u8; 4096]
-            count := 0usize
-            match io.read_up_to(body, &mut data) {
-                ok(value) => {
-                    count = value
-                }
-                err(_) => {
-                    return err(web.Error.Handler)
-                }
-            }
-            return hosted.text(output, &data[..count])
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        if request.route_id == 1 {
+            return response.bytes(request.body())
         }
-        if context.route_id == 2 {
-            return err(web.Error.Handler)
+        if request.route_id == 2 {
+            return err(web.failure(web.Error.Handler))
         }
-        if context.route_id == 3 {
-            return ok(204)
+        if request.route_id == 3 {
+            return response.set_status(204)
         }
-        if context.route_id == 4 {
-            status := hosted.text(output, b"ignored")?
-            return ok(304)
+        if request.route_id == 4 {
+            response.text(b"ignored")?;
+            return response.set_status(304)
         }
-        if context.route_id == 5 {
-            data := [120u8; 65536]
-            return hosted.text(output, &data)
+        if request.route_id == 5 {
+            data := [120u8; 65536];
+            return response.text(&data)
         }
-        return hosted.text(output, b"Hello, Dodo!\n")
+        return response.text(b"Hello, Dodo!\n")
     }
 }
 fn main() -> i32 {

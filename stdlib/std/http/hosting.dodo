@@ -8,6 +8,7 @@ import "std/net"
 import "std/net/native"
 import "std/tls"
 import "std/thread"
+import "std/web"
 
 // Shared hosted driving primitives. Portable HTTP never imports this module.
 pub enum ErrorKind {
@@ -22,6 +23,8 @@ pub struct Error {
     pub security: tls.Error
     // Response bytes accepted by the client sink before success/failure.
     pub delivered: u64
+    pub application: Option<web.Failure>
+    pub responded: bool
     pub fn format<F>(&self, output: &mut F) -> void!io.Error {
         output.string("http hosted: ")?
         match &self.kind {
@@ -81,6 +84,13 @@ pub struct Error {
             output.string("; ")?;
             self.transport.format(output)?
         }
+        match &self.application {
+            some(reason) => {
+                output.string("; ")?;
+                reason.format(output)?
+            }
+            none => {}
+        }
         return ok()
     }
 
@@ -88,7 +98,12 @@ pub struct Error {
 pub fn failure(kind: ErrorKind) -> Error {
     return Error { kind: kind, network: net.failure(net.ErrorKind.Other),
     protocol: http.failure(http.ErrorKind.InvalidState, 0),
-    transport: io.failure(io.ErrorKind.Other, 0), security: tls.failure(tls.ErrorKind.Backend, 0), delivered: 0 }
+    transport: io.failure(io.ErrorKind.Other, 0), security: tls.failure(tls.ErrorKind.Backend, 0), delivered: 0, application: none, responded: false }
+}
+pub fn web_error(reason: web.Failure, kind: ErrorKind) -> Error {
+    result := failure(kind)
+    result.application = some(reason)
+    return result
 }
 pub fn network_error(reason: net.Error, kind: ErrorKind) -> Error {
     result := failure(kind)

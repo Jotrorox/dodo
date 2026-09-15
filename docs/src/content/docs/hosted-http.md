@@ -240,38 +240,61 @@ queue allocation, keep-alive pipeline, or unbounded task creation. The OS listen
 backlog defaults to 256. A slow client occupies the single execution lane until
 its limit, deadline, or cancellation fires.
 
-The server uses the existing ordinary structural interface:
+The serial, HTTPS and concurrent servers share the buffered handler interface:
 
 ```dodo
-handle<B, W>(&mut self, context: &mut web.Context,
-    body: &mut B, output: &mut W) -> u16!web.Error
+pub fn handle(&mut self, request: &mut web.Request,
+    response: &mut web.Response) -> void!web.Failure
 ```
 
-The supplied body is an `io.MemoryReader` over the complete bounded decoded
-request; output is an `io.MemoryWriter` over bounded response storage. The
-handler returns the status. `hosted.text(output, bytes)` writes text and returns
-200; `hosted.Text.new(bytes)` supplies a complete constant-text handler. Existing
-handlers using `web.handle` work directly. Response Content-Type is currently
-`text/plain; charset=utf-8`. Applications needing arbitrary response headers,
-streaming request callbacks (`head`/`poll_write`/`complete`), streaming response
-production, middleware-controlled I/O, or upgrades should keep
-using the independently available portable application/connection drivers.
-For concurrent socket progress and HTTP/1.1 connection reuse with the same
-buffered handler interface, use [`std/web/reactor`](../web/#concurrent-http11-server).
+The request exposes method, decoded path, headers, query pairs, route parameters
+and the complete decoded body. The response copies status, headers and text,
+HTML or byte bodies into caller-owned storage. `hosted.Text.new(bytes)` remains
+a complete constant-text handler. See [request and response contracts](../web/#handlers-and-middleware)
+for duplicate handling, decoding, checked borrowing, middleware and examples.
+Streaming request callbacks (`head`/`poll_write`/`complete`), response production
+and upgrades remain available through the portable application/connection APIs.
+[`std/web/reactor`](../web/#concurrent-http11-server) provides concurrent socket
+progress and connection reuse with the same buffered handler.
 
-The fixed server workspace is 38,912 bytes (16 KiB parser, 4 KiB input, 16 KiB
-output, 2 KiB decoded path). A bounded route index also uses stack storage.
-Body arrays are separate and explicit. Request and
-response capacities are the smaller of the supplied arrays and the configured
-`body_bytes` / `response_bytes`, each defaulting to 65,536. Headers default to
-16,384 bytes and 100 fields. Overlarge requests get 413, oversized heads 431,
-malformed framing/path 400, absent routes 404, wrong methods 405, and handler
-failures/response-storage exhaustion 500. Errors have empty bodies. HEAD runs
-the same handler and emits the corresponding Content-Length, without body
-bytes. 204 and 304 also suppress body bytes. Valid `Expect: 100-continue` is
-answered before body reading. Malformed framing poisons the protocol driver;
-error responses use a separate fresh serializer. After final response output
-starts, any failure closes the connection without another status line.
+The fixed server workspace is **61,440 bytes**: 16 KiB parser, 4 KiB input,
+16 KiB output, 2 KiB decoded path, 2 KiB decoded query pairs, 16 KiB retained
+request headers and 4 KiB copied response headers. Each retained/copied pair uses
+its name and value length plus two delimiter bytes. Protocol wire-head bytes are
+bounded separately. Per-call stack storage includes a 2,048-entry route index
+and 33 temporary response header views (32 application fields plus Connection).
+The reactor requires this workspace per slot. Buffers never grow.
+
+| Config setting | Default / hard cap |
+| --- | --- |
+| `header_bytes`, `header_fields` | 16,384 / 100; configurable downward |
+| `path_bytes` | 2,048; configurable downward, nonzero |
+| `query_bytes`, `query_fields` | 2,048 / 100; configurable downward, including zero |
+| `response_header_bytes`, `response_header_fields` | 4,096 / 32; configurable downward, including zero |
+| `body_bytes`, `response_bytes` | 65,536 each; effective cap is also bounded by the supplied body arrays |
+
+Header field limits include application-added defaults such as Content-Type;
+the generated Connection and Content-Length do not consume application header
+storage. Zero query fields permits no nonempty query components; zero response header
+capacity still permits byte responses without application headers. Each body
+buffer is separate from the workspace. Serialized response heads fit within the
+16 KiB output slice even at the maximum response field/byte limits.
+
+Overlarge request bodies get 413, oversized heads 431, path/query capacity
+exhaustion 414, malformed framing/path/query 400, absent routes 404 and wrong
+methods 405. Handler errors (including invalid headers/status, invalid text and
+response capacity exhaustion) get 500. A failed handler's partial response is
+never sent. HEAD and 204/205/304 suppress body bytes with the framing rules in
+the web guide. Valid `Expect: 100-continue` is answered after validating the
+request target and route, before reading the body. After final output starts,
+a failure closes the connection without another status line.
+
+`hosting.Error.application` retains a buffered API failure and its underlying
+protocol/text diagnostic. `Report.last_error` retains the latest observed
+connection failure; the counters still distinguish completed, rejected and
+failed connections. `serve_connection` returns errors after sending a public
+rejection, with `responded` set when that write completed. The ordinary server
+counts these as rejected and continues accepting.
 
 Server timeouts are nonzero and absolute within their scopes:
 
