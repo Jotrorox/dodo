@@ -34,7 +34,17 @@ async function stopServer(): Promise<void> {
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   shuttingDown = false;
   const output = vscode.window.createOutputChannel("Dodo Language Server", { log: true });
-  context.subscriptions.push(output);
+  const bundledSources = new vscode.EventEmitter<vscode.Uri>();
+  context.subscriptions.push(output, bundledSources);
+  context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider("dodo-stdlib", {
+    onDidChange: bundledSources.event,
+    async provideTextDocumentContent(uri, token): Promise<string> {
+      if (!client) {
+        throw new Error("Start the Dodo language server to view bundled library sources.");
+      }
+      return client.sendRequest<string>("dodo/stdlibSource", { uri: uri.toString() }, token);
+    },
+  }));
 
   // Serialize configuration changes and manual restarts so only one process owns
   // the open-document overlays. Recreating the client resends initialization options.
@@ -66,6 +76,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         documentSelector: [
           { scheme: "file", language: "dodo" },
           { scheme: "untitled", language: "dodo" },
+          { scheme: "dodo-stdlib", language: "dodo" },
         ],
         initializationOptions: {
           checkMode: config.get<string>("checkMode", "file"),
@@ -77,6 +88,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Server options intentionally have window scope, matching that lifetime.
       });
       await client.start();
+      for (const document of vscode.workspace.textDocuments) {
+        if (document.uri.scheme === "dodo-stdlib") {
+          bundledSources.fire(document.uri);
+        }
+      }
     }).catch(async (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       output.error(`Language server failed: ${message}`);

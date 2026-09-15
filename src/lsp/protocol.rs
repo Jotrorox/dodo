@@ -36,8 +36,7 @@ pub(super) struct Notification {
 pub(super) enum Message {
     Request(Request),
     Notification(Notification),
-    // Dodo does not issue requests, but clients may send unsolicited responses.
-    Response,
+    Response { id: Value, error: Option<String> },
 }
 
 fn request_id(id: &Value) -> bool {
@@ -78,7 +77,10 @@ impl Message {
             return Err(invalid());
         }
         match (object.get("result"), object.get("error")) {
-            (Some(_), None) => Ok(Self::Response),
+            (Some(_), None) => Ok(Self::Response {
+                id: id.clone(),
+                error: None,
+            }),
             (None, Some(error))
                 if error.is_object()
                     && error["code"]
@@ -86,7 +88,10 @@ impl Message {
                         .is_some_and(|n| i32::try_from(n).is_ok())
                     && error["message"].is_string() =>
             {
-                Ok(Self::Response)
+                Ok(Self::Response {
+                    id: id.clone(),
+                    error: Some(error["message"].as_str().unwrap().to_owned()),
+                })
             }
             _ => Err(invalid()),
         }
@@ -164,7 +169,9 @@ fn optional_object(value: &Value) -> Result<&Value> {
 
 fn uri(value: &Value) -> Result<String> {
     let uri = string(value)?;
-    file_uri::validate(uri)?;
+    if super::bundled::path(uri).is_none() {
+        file_uri::validate(uri)?;
+    }
     Ok(uri.to_owned())
 }
 
@@ -175,6 +182,8 @@ pub(super) fn document_uri(params: &Value) -> Result<String> {
 pub(super) struct InitializeParams {
     pub initialization_options: Value,
     pub document_changes: bool,
+    pub dynamic_watches: bool,
+    pub relative_watches: bool,
 }
 
 impl InitializeParams {
@@ -187,11 +196,39 @@ impl InitializeParams {
         };
         let workspace = optional_object(&capabilities["workspace"])?;
         let edits = optional_object(&workspace["workspaceEdit"])?;
+        let watches = optional_object(&workspace["didChangeWatchedFiles"])?;
         Ok(Self {
             initialization_options: value["initializationOptions"].clone(),
             document_changes: optional(&edits["documentChanges"], boolean)?.unwrap_or(false),
+            dynamic_watches: optional(&watches["dynamicRegistration"], boolean)?.unwrap_or(false),
+            relative_watches: optional(&watches["relativePatternSupport"], boolean)?
+                .unwrap_or(false),
         })
     }
+}
+
+pub(super) fn bundled_source_uri(params: &Value) -> Result<String> {
+    let uri = string(&object(params)?["uri"])?;
+    super::bundled::path(uri).ok_or("unknown bundled source URI")?;
+    Ok(uri.to_owned())
+}
+
+pub(super) fn watched_paths(params: &Value) -> Result<Vec<std::path::PathBuf>> {
+    let changes = object(params)?["changes"]
+        .as_array()
+        .ok_or("expected file changes")?;
+    // Validate the complete batch before refreshing any analysis.
+    changes
+        .iter()
+        .map(|change| {
+            let change = object(change)?;
+            if !matches!(integer(&change["type"])?, 1..=3) {
+                return Err("invalid file change type");
+            }
+            let path = file_uri::to_path(string(&change["uri"])?)?;
+            Ok(crate::package::source_path(&path))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

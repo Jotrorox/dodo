@@ -126,9 +126,11 @@ language server starts after the workspace is trusted. It supports file and
 untitled documents in desktop/remote VS Code; virtual workspace files and a
 browser-only extension host cannot run the native compiler.
 
-Navigation and rename cover open documents and loaded imports. Standard-library
-definitions currently have no navigable source URI. The server does not watch
-on-disk dependencies; save a document to refresh them. See the
+Navigation and rename cover open documents and loaded imports. Bundled library
+definitions open read-only sources supplied by the running compiler, with hover
+and navigation available inside them. Imported `.dodo` files are watched for
+disk changes: creating, editing, or deleting a dependency refreshes diagnostics
+and navigation automatically. Unsaved open buffers keep their contents. See the
 [editor guide](https://jotrorox.github.io/dodo/editors/) for the server's current limits.
 
 ## Develop and test

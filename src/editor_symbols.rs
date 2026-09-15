@@ -330,7 +330,7 @@ impl Index {
             },
             public: false,
             receiver: false,
-            renameable: renameable && name != "self",
+            renameable: renameable && name != "self" && !source.path.starts_with("<stdlib>"),
         });
         self.declarations.insert(span.start, id);
     }
