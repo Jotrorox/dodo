@@ -2,6 +2,49 @@
 use dodoc::package;
 use std::fs;
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_pointer_width = "64",
+    any(
+        all(target_os = "linux", target_env = "gnu"),
+        all(target_os = "windows", any(target_env = "msvc", target_env = "gnu"))
+    )
+))]
+#[test]
+fn default_loaders_select_host_adapters_without_llvm() {
+    let scratch = std::env::temp_dir().join(format!("dodo-host-adapter-{}", std::process::id()));
+    fs::create_dir_all(&scratch).unwrap();
+    let source = scratch.join("main.dodo");
+    fs::write(&source, "package app\nimport \"std/fs\"\nfn main() {}\n").unwrap();
+    let adapter = if cfg!(windows) { "windows" } else { "linux" };
+    let loaded = package::load(&source).unwrap();
+    assert!(
+        loaded
+            .sources
+            .iter()
+            .any(|s| s.path.ends_with(format!("fs/{adapter}.dodo")))
+    );
+
+    let overlays = std::collections::BTreeMap::from([(
+        package::source_path(&source),
+        "package app\nimport \"std/env\"\nfn main() {}\n".to_owned(),
+    )]);
+    let loaded = package::load_with_overlays(&source, &overlays).unwrap();
+    assert!(
+        loaded
+            .sources
+            .iter()
+            .any(|s| s.path.ends_with(format!("env/{adapter}.dodo")))
+    );
+    assert!(
+        loaded
+            .sources
+            .iter()
+            .all(|s| !s.path.ends_with(format!("fs/{adapter}.dodo")))
+    );
+    fs::remove_dir_all(scratch).unwrap();
+}
+
 #[test]
 fn adapters_are_selected_independently_and_reject_wrong_targets() {
     let scratch = std::env::temp_dir().join(format!("dodo-platform-{}", std::process::id()));

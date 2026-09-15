@@ -1,13 +1,21 @@
 //! Source-level ownership diagnostics and the editor's public stdio interface.
 use dodoc::{parser, sema};
+#[cfg(feature = "llvm")]
 use std::fs;
+#[cfg(feature = "llvm")]
 use std::io::Write;
+#[cfg(feature = "llvm")]
 use std::path::PathBuf;
+#[cfg(feature = "llvm")]
 use std::process::{Command, Stdio};
+#[cfg(feature = "llvm")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "llvm")]
 static NEXT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "llvm")]
 struct Workspace(PathBuf);
+#[cfg(feature = "llvm")]
 impl Workspace {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
@@ -28,12 +36,14 @@ impl Workspace {
             .unwrap()
     }
 }
+#[cfg(feature = "llvm")]
 impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn borrow_conflict_cli_shows_origin_access_and_live_use() {
     let workspace = Workspace::new();
@@ -57,6 +67,7 @@ fn borrow_conflict_cli_shows_origin_access_and_live_use() {
     assert!(stderr.contains("----"), "{stderr}");
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn move_cli_shows_move_and_rejected_use() {
     let workspace = Workspace::new();
@@ -71,6 +82,7 @@ fn move_cli_shows_move_and_rejected_use() {
     assert!(!stderr.contains("source byte"), "{stderr}");
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn return_contract_cli_shows_contract_source_and_return() {
     let workspace = Workspace::new();
@@ -86,6 +98,7 @@ fn return_contract_cli_shows_contract_source_and_return() {
     assert!(!stderr.contains("source byte"), "{stderr}");
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn borrowing_example_checks_and_runs() {
     let workspace = Workspace::new();
@@ -130,6 +143,7 @@ fn borrow_labels_retain_exact_expression_ranges() {
     );
 }
 
+#[cfg(feature = "llvm")]
 fn lsp(messages: &[dodoc::json::Value]) -> Vec<dodoc::json::Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dodo"))
         .arg("lsp")
@@ -173,6 +187,7 @@ fn lsp(messages: &[dodoc::json::Value]) -> Vec<dodoc::json::Value> {
     replies
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn editor_stdio_reports_inferred_types_and_clears_changed_diagnostics() {
     use dodoc::json::json;
@@ -221,6 +236,7 @@ fn editor_stdio_reports_inferred_types_and_clears_changed_diagnostics() {
     );
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn editor_stdio_exposes_receiver_ownership_and_borrowed_return_sources() {
     use dodoc::json::json;

@@ -41,6 +41,29 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  frontend:
+    name: Rust frontend / no LLVM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - name: Cache frontend build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: frontend-no-llvm
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy without LLVM
+        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+      - name: Test frontend without LLVM
+        run: cargo test --locked --no-default-features --all-targets
+
   compiler:
     name: Rust and LLVM 23 / Ubuntu 24.04
     runs-on: ubuntu-24.04

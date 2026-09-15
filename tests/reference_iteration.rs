@@ -2,9 +2,13 @@
 
 use dodoc::ast::{ExprKind, StmtKind, Type};
 use dodoc::{parser, sema};
+#[cfg(feature = "llvm")]
 use std::fs;
+#[cfg(feature = "llvm")]
 use std::path::PathBuf;
+#[cfg(feature = "llvm")]
 use std::process::Command;
+#[cfg(feature = "llvm")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn program(source: &str) -> dodoc::ast::Program {
@@ -202,8 +206,10 @@ fn temporary_collection_expressions_keep_transitive_payload_loans() {
     );
 }
 
+#[cfg(feature = "llvm")]
 struct Workspace(PathBuf);
 
+#[cfg(feature = "llvm")]
 impl Workspace {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -222,12 +228,14 @@ impl Workspace {
     }
 }
 
+#[cfg(feature = "llvm")]
 impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn native_copy_iteration_preserves_values_control_flow_and_reference_iteration() {
     let workspace = Workspace::new();

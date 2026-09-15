@@ -137,9 +137,23 @@ and conservative borrow checking are documented alongside the specification.
 
 ## Build and contribute
 
-Source builds require Rust 1.98.1, LLVM 23 development files, and a C toolchain.
-Cargo prefers static LLVM and allows a shared-library fallback. After installing
-the prerequisites and setting `LLVM_SYS_231_PREFIX` for your LLVM installation:
+Frontend development requires Rust 1.98.1 and its platform linker, with no LLVM
+installation. Run the parser, checker, package loader, formatter, and editor
+analysis tests with:
+
+```sh
+cargo test --locked --no-default-features --all-targets
+cargo clippy --locked --no-default-features --all-targets -- -D warnings
+```
+
+The default `llvm` feature enables native code generation, the LSP server, and
+the `dodo` CLI. Disabling it skips CLI and native backend tests while retaining
+frontend tests, including those in mixed frontend/native test files.
+
+Full compiler source builds require Rust 1.98.1, LLVM 23 development files, and
+a C toolchain. Cargo prefers static LLVM and allows a shared-library fallback.
+After installing the prerequisites and setting `LLVM_SYS_231_PREFIX` for your
+LLVM installation:
 
 ```sh
 git clone https://github.com/Jotrorox/dodo.git

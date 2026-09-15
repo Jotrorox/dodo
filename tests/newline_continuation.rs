@@ -2,9 +2,13 @@
 
 use dodoc::ast::{BinaryOp, Block, Expr, ExprKind, StmtKind};
 use dodoc::parser::parse;
+#[cfg(feature = "llvm")]
 use std::fs;
+#[cfg(feature = "llvm")]
 use std::path::PathBuf;
+#[cfg(feature = "llvm")]
 use std::process::Command;
+#[cfg(feature = "llvm")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn body(source: &str) -> Block {
@@ -141,8 +145,10 @@ fn existing_operator_and_delimiter_continuations_still_work() {
     );
 }
 
+#[cfg(feature = "llvm")]
 struct Workspace(PathBuf);
 
+#[cfg(feature = "llvm")]
 impl Workspace {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -159,12 +165,14 @@ impl Workspace {
     }
 }
 
+#[cfg(feature = "llvm")]
 impl Drop for Workspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
 
+#[cfg(feature = "llvm")]
 #[test]
 fn method_and_field_chains_execute_at_both_optimization_levels() {
     let workspace = Workspace::new();

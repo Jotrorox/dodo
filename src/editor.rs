@@ -8,11 +8,14 @@ use crate::lexer::{self, Token, TokenKind};
 use crate::{package, parser, sema};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+// Symbol queries are consumed by the optional LSP server.
 #[path = "editor_symbols.rs"]
+#[cfg_attr(not(feature = "llvm"), allow(dead_code))]
 pub(crate) mod symbols;
 use crate::json::{Value, json};
+#[cfg(any(feature = "llvm", test))]
 use std::io::{self, BufRead, Write};
-#[cfg(test)]
+#[cfg(all(test, any(feature = "llvm", unix)))]
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -26,7 +29,9 @@ pub struct Document {
     text: String,
     start: usize,
     entries: Vec<HoverEntry>,
+    #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
     pub(crate) diagnostics: Vec<Diagnostic>,
+    #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
     pub(crate) index: Arc<symbols::Index>,
 }
 
@@ -563,10 +568,12 @@ fn range(text: &str, span: Span) -> Value {
 
 #[cfg(all(test, unix))]
 fn file_path(uri: &str) -> Option<PathBuf> {
-    crate::lsp::uri_path(uri).ok()
+    crate::file_uri::to_path(uri)
+        .ok()
+        .map(|path| package::source_path(&path))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "llvm", unix)))]
 fn file_uri(path: &Path) -> String {
     crate::file_uri::from_path(path)
         .unwrap()
@@ -576,16 +583,19 @@ fn file_uri(path: &Path) -> String {
 
 /// Serve LSP JSON-RPC over framed streams. Returns the process exit status.
 /// The shared server supports full-document synchronization and package checking.
+#[cfg(feature = "llvm")]
 pub fn serve(mut reader: impl BufRead, mut writer: impl Write) -> io::Result<i32> {
     crate::lsp::run(&mut reader, &mut writer)
 }
 
+#[cfg(any(feature = "llvm", test))]
 pub(crate) fn write_message(writer: &mut impl Write, message: &Value) -> io::Result<()> {
     let body = crate::json::to_vec(message);
     write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
     writer.write_all(&body)?;
     writer.flush()
 }
+#[cfg(any(feature = "llvm", test))]
 pub(crate) fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     let mut length = None;
     let mut headers = 0;
@@ -837,6 +847,7 @@ mod tests {
         assert_eq!(file_path("untitled:main"), None);
     }
 
+    #[cfg(feature = "llvm")]
     fn protocol(messages: &[Value]) -> (i32, Vec<Value>) {
         let mut input = Vec::new();
         for message in messages {
@@ -852,6 +863,7 @@ mod tests {
         (status, messages)
     }
 
+    #[cfg(feature = "llvm")]
     #[test]
     fn protocol_lifecycle_unknown_methods_and_unopened_documents() {
         let (status, messages) = protocol(&[
@@ -878,6 +890,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "llvm")]
     #[test]
     fn full_sync_rejects_stale_versions_and_incremental_changes() {
         let source = "package test\nfn main() { number := 1u32 }";
@@ -997,6 +1010,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "llvm")]
     #[test]
     fn invalid_json_rpc_receives_an_error_and_server_keeps_running() {
         let (_, messages) = protocol(&[
@@ -1011,6 +1025,7 @@ mod tests {
         assert_eq!(messages[2]["id"], 1);
     }
 
+    #[cfg(feature = "llvm")]
     #[test]
     fn imported_buffer_changes_refresh_caller_hovers_without_writing_files() {
         use std::fs;
