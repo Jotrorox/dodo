@@ -297,6 +297,35 @@ impl<'ctx> Value<'ctx> {
     fn optional(raw: LLVMValueRef) -> Option<Self> {
         (!raw.is_null()).then_some(Self(raw, PhantomData))
     }
+    pub(super) fn loaded_pointer(self, builder: &Builder<'ctx>) -> Option<Self> {
+        unsafe {
+            if LLVMIsALoadInst(self.0).is_null()
+                || LLVMGetVolatile(self.0) != 0
+                || LLVMGetOrdering(self.0) != LLVMAtomicOrdering::LLVMAtomicOrderingNotAtomic
+            {
+                return None;
+            }
+            // Reloading is only equivalent while the source is unchanged.
+            // Cleanup calls, stores, and control flow must keep the SSA value
+            // captured by the original load, even when it is a large record.
+            if LLVMGetInstructionParent(self.0) != LLVMGetInsertBlock(builder.0) {
+                return None;
+            }
+            let mut next = LLVMGetNextInstruction(self.0);
+            while !next.is_null() {
+                if !matches!(
+                    LLVMGetInstructionOpcode(next),
+                    LLVMOpcode::LLVMGetElementPtr
+                        | LLVMOpcode::LLVMBitCast
+                        | LLVMOpcode::LLVMAlloca
+                ) {
+                    return None;
+                }
+                next = LLVMGetNextInstruction(next);
+            }
+            Some(Value(LLVMGetOperand(self.0, 0), PhantomData))
+        }
+    }
     pub(super) fn get_type(self) -> LlvmType<'ctx> {
         LlvmType(
             unsafe {

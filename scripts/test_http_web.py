@@ -52,7 +52,7 @@ def main():
             programs = {}
             for example in ("http_client", "web_server", "http_memory"):
                 source = scratch / f"{example}.dodo"
-                source.write_text((ROOT / f"examples/{example}.dodo").read_text().replace(":8080", f":{number}").replace("config.max_connections = 0", "config.max_connections = 1"))
+                source.write_text((ROOT / f"examples/{example}.dodo").read_text().replace(":8080", f":{number}").replace("config.max_connections = 0", "config.max_connections = 1").replace(".run(b", ".max_connections(1).run(b"))
                 executable = scratch / f"{example}-{optimization}"
                 run([compiler, "build", str(source), "-O", str(optimization), "-o", str(executable)])
                 programs[example] = executable
@@ -62,7 +62,7 @@ def main():
                 if case != "dodo_client":
                     number = port()
                     source = scratch / "web_server.dodo"
-                    source.write_text((ROOT / "examples/web_server.dodo").read_text().replace(":8080", f":{number}").replace("config.max_connections = 0", "config.max_connections = 1"))
+                    source.write_text((ROOT / "examples/web_server.dodo").read_text().replace(":8080", f":{number}").replace("config.max_connections = 0", "config.max_connections = 1").replace(".run(b", ".max_connections(1).run(b"))
                     run([compiler, "build", str(source), "-O", str(optimization), "-o", str(programs["web_server"])])
                 process = subprocess.Popen([str(programs["web_server"])], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:

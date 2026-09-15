@@ -85,7 +85,14 @@ pub fn status(reason: &hosting.Error) -> u16 {
         return 408
     }
     if reason.kind == hosting.ErrorKind.Handler {
-        return 500
+        match &reason.application {
+            some(problem) => {
+                return problem.status()
+            }
+            none => {
+                return 500
+            }
+        }
     }
     match &reason.application {
         some(problem) => {
@@ -175,7 +182,7 @@ pub fn response_head(driver: &mut connection.Connection, response: &web.Response
     }
 }
 pub fn bodyless(method: &[u8], code: u16) -> bool {
-    return bytes.equal(method, b"HEAD") || code == 204 || code == 205 || code == 304
+    return web.bodyless(method, code)
 }
 pub struct Target {
     pub path: usize;

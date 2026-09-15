@@ -120,3 +120,61 @@ fn repetition_keeps_copy_and_reference_requirements() {
     }
     fs::remove_dir_all(scratch).unwrap();
 }
+
+#[test]
+fn large_internal_calls_preserve_values_and_ownership() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = std::env::temp_dir().join(format!("dodo-large-calls-{}", std::process::id()));
+    fs::create_dir_all(&scratch).unwrap();
+    let source = root.join("tests/stdlib/large_value_calls.dodo");
+    for level in ["0", "3"] {
+        let executable = scratch.join(format!("calls-{level}{}", std::env::consts::EXE_SUFFIX));
+        success(
+            Command::new(env!("CARGO_BIN_EXE_dodo"))
+                .arg("build")
+                .arg(&source)
+                .args(["-O", level, "-o"])
+                .arg(&executable)
+                .output()
+                .unwrap(),
+            "compile large internal calls",
+        );
+        success(
+            Command::new(&executable).output().unwrap(),
+            "execute large internal calls",
+        );
+        for target in [
+            "wasm32-unknown-unknown",
+            "thumbv6m-none-eabi",
+            "x86_64-pc-windows-msvc",
+        ] {
+            success(
+                Command::new(env!("CARGO_BIN_EXE_dodo"))
+                    .arg("build")
+                    .arg(&source)
+                    .args(["-O", level, "--target", target, "--emit", "obj", "-o"])
+                    .arg(scratch.join(format!("{target}-{level}.o")))
+                    .output()
+                    .unwrap(),
+                "cross-compile large internal calls",
+            );
+        }
+    }
+    let ir = scratch.join("calls.ll");
+    success(
+        Command::new(env!("CARGO_BIN_EXE_dodo"))
+            .arg("build")
+            .arg(&source)
+            .args(["--emit", "llvm-ir", "-o"])
+            .arg(&ir)
+            .output()
+            .unwrap(),
+        "inspect large internal call ABI",
+    );
+    let ir = fs::read_to_string(ir).unwrap();
+    assert!(
+        ir.contains("define internal void @dodo.large_value_calls.through(ptr"),
+        "large Result must return through caller storage"
+    );
+    fs::remove_dir_all(scratch).unwrap();
+}

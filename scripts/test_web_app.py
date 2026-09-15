@@ -116,7 +116,7 @@ def check_server(binary, number, exchanges, policy, stopping):
 def check_example(compiler, scratch, optimization):
     number = port()
     source = (ROOT / "examples/web_routes.dodo").read_text().replace(":8080", f":{number}")
-    source = source.replace("server := app.Server.new(routes)", "server := app.Server.new(routes)\n    server.config.max_connections = 4")
+    source = source.replace(".run(b", ".max_connections(4).run(b")
     path = scratch / f"routes-{optimization}.dodo"
     path.write_text(source)
     binary = path.with_suffix("")

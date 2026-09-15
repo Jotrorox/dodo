@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Add fluent `app.new()` and portable `application.builder()` APIs with all HTTP
+  method shortcuts, route-specific setup diagnostics, global middleware, and
+  `run()` error reporting. Add ready-made text/HTML/JSON/redirect handlers,
+  required and numeric request accessors, explicit HTTP rejections, response
+  helpers, and owned in-process test responses with chainable assertions.
+  Update the web quickstart and examples while retaining checked registration.
+- Keep large internal function arguments and results in caller-owned storage,
+  and compact aggregate copies before LLVM lowering, so owned response buffers
+  remain practical in unoptimized builds. Exported and C signatures stay stable.
+
 - Add `std/web/app.Server` with bounded default storage, grouped limits and
   timeouts, custom buffers, cooperative cancellation, and explicit serial or
   concurrent execution. Add portable named-handler registration without manual

@@ -1,0 +1,43 @@
+package developer
+import "core/bytes"
+import "std/web"
+import "std/web/app"
+
+pub struct Number {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        id := request.param_u64(b"id")?
+        limit := request.query_u64(b"limit", 10)?
+        if id != 42 { return err(web.reject(404)) }
+        if limit != 10 { return err(web.reject(422)) }
+        return response.json(b"{\"id\":42}")
+    }
+}
+pub struct Echo {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        response.header(b"X-Query", request.require_query(b"q")?)?
+        return response.bytes(request.body())
+    }
+}
+pub struct Gate {
+    pub fn before(&mut self, request: &mut web.Request) -> void!web.Failure {
+        if bytes.equal(request.path(), b"/echo") {
+            match request.header_value(b"Authorization") {
+                some(_) => { return ok() }
+                none => { return err(web.reject(401)) }
+            }
+        }
+        return ok()
+    }
+    pub fn after(&mut self, request: &mut web.Request, status: u16) {}
+}
+fn main() -> i32 {
+    builder := app.new()
+        .get(b"/", web.html(b"<h1>Home</h1>"))
+        .get(b"/numbers/:id", Number {})
+        .middleware(Gate {})
+        .post(b"/echo", Echo {})
+        .get(b"/old", web.redirect(b"/"))
+        .max_connections(@@COUNT@@)
+    builder.config.execution = app.Execution.@@POLICY@@
+    return builder.run(b"127.0.0.1:@@PORT@@")
+}

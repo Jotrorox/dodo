@@ -1,42 +1,21 @@
 package web_response
+import "core/bytes"
 import "std/web"
-import "std/web/application"
 import "std/web/app"
 
 pub struct Greeting {
     pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
         response.header(b"X-Method", request.method())?
-        match request.parameter(b"name") {
-            some(name) => {
-                response.header(b"X-Name", name)?
-            }
-            none => {}
-        }
-        match request.query(b"format", 0) {
-            some(format) => {
-                if format.len != 0 {
-                    // Byte responses can use any application content type.
-                    response.header(b"Content-Type", b"application/json")?
-                    return response.bytes(b"{\"hello\":\"Dodo\"}")
-                }
-            }
-            none => {}
+        response.header(b"X-Name", request.param(b"name")?)?
+        if bytes.equal(request.query_or(b"format", b"html"), b"json") {
+            return response.json(b"{\"hello\":\"Dodo\"}")
         }
         return response.html(b"<!doctype html><h1>Hello, Dodo!</h1>")
     }
 }
 fn main() -> i32 {
-    routes := application.new().get(b"/hello/:name", Greeting {})!
-    server := app.Server.new(routes)
-    match server.serve(b"127.0.0.1:8080") {
-        ok(report) => {
-            if report.failed != 0 {
-                return 2
-            };
-            return 0
-        }
-        err(_) => {
-            return 1
-        }
-    }
+    return app.new()
+        .get(b"/hello/:name", Greeting {})
+        .get(b"/", web.redirect(b"/hello/Dodo"))
+        .run(b"127.0.0.1:8080")
 }

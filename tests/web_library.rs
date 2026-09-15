@@ -40,6 +40,7 @@ fn routing_middleware_and_backpressure_execute_and_remain_portable() {
         "http_fast_checks",
         "web_application_checks",
         "web_registration_checks",
+        "web_developer_checks",
     ] {
         let source =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/stdlib/{fixture}.dodo"));
@@ -81,6 +82,18 @@ fn routing_middleware_and_backpressure_execute_and_remain_portable() {
 fn router_context_and_pending_body_borrows_cannot_escape() {
     let scratch = Workspace::new();
     for (name, body) in [
+        (
+            "fluent-pattern",
+            "fn bad() { path := [47u8]\n routes := application.builder().get(&path, web.text(b\"hello\"))\n path[0] = 65\n built := routes.build()! }",
+        ),
+        (
+            "fluent-handler",
+            "fn bad() { body := [65u8]\n routes := application.builder().get(b\"/\", web.text(&body))\n body[0] = 66\n built := routes.build()! }",
+        ),
+        (
+            "required-parameter-view",
+            "pub struct Bad { data: &[u8]\n pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure { self.data = request.param(b\"id\")?\n return ok() } }",
+        ),
         (
             "registration-pattern",
             "fn bad() { path := [47u8]\n routes := application.new().get(&path, hosted.Text.new(b\"hello\"))!\n path[0] = 65\n count := routes.table.routes().len }",
@@ -290,6 +303,19 @@ fn application_setup_limits_and_shutdown_execute() {
     success(
         Command::new("python3")
             .arg(root.join("scripts/test_web_app.py"))
+            .arg("--compiler")
+            .arg(env!("CARGO_BIN_EXE_dodo"))
+            .output()
+            .unwrap(),
+    );
+}
+
+#[test]
+fn fluent_applications_interoperate_with_independent_peers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    success(
+        Command::new("python3")
+            .arg(root.join("scripts/test_web_developer.py"))
             .arg("--compiler")
             .arg(env!("CARGO_BIN_EXE_dodo"))
             .output()

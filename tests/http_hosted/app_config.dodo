@@ -15,6 +15,54 @@ pub struct Hello {
     }
 }
 fn main() -> i32 {
+    // Fluent setup failures retain the first offending route, before binding.
+    match app.new().get(b"/:one", web.text(b"one")).get(b"/:two", web.text(b"two"))
+        .serve(b"invalid address") {
+        err(reason) => {
+            match &reason.registration {
+                some(route) => {
+                    assert(route.kind == web.Error.AmbiguousRoute)
+                    assert_eq(route.index, 1)
+                }
+                none => {
+                    assert(false)
+                }
+            }
+            match &reason.serving {
+                none => {}
+                some(_) => {
+                    assert(false)
+                }
+            }
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    builder := app.new().get(b"/", web.text(b"hello"))
+    builder.config.timeouts.header_ms = 0
+    match builder.serve(b"invalid address") {
+        err(reason) => {
+            match &reason.serving {
+                some(startup) => {
+                    assert(startup.kind == hosting.ErrorKind.InvalidInput)
+                }
+                none => {
+                    assert(false)
+                }
+            }
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    cancel := net.Cancellation.new()
+    cancel.cancel()
+    report := app.new().get(b"/", web.text(b"hello")).serve_until(b"127.0.0.1:0", &cancel)!
+    assert(report.cancelled && report.accepted == 0)
+    built := app.new().get(b"/", web.text(b"hello")).build()!
+    built.request(b"GET", b"/").expect_status(200).expect_body(b"hello")
+
     for concurrent in 0usize..2 {
         for case in 0usize..12 {
             routes := application.new().get(b"/", Hello {})!

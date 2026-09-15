@@ -1,0 +1,264 @@
+package web_developer_checks
+import "std/web"
+import "std/web/application"
+import "std/web/testing"
+import "std/fmt"
+import "std/io"
+import "core/bytes"
+
+pub struct Greeting {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        name := request.param(b"name")?
+        response.text(b"Hello, ")?
+        response.append(name)?
+        response.append(request.query_or(b"suffix", b"!"))?
+        return ok()
+    }
+}
+pub struct Number {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        id := request.param_u64(b"id")?
+        limit := request.query_u64(b"limit", 10)?
+        if id != 18446744073709551615u64 || limit != 10 {
+            return err(web.reject(422))
+        }
+        return response.empty(204)
+    }
+}
+pub struct Echo {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        response.header(b"X-Token", request.require_header(b"x-token")?)?
+        response.header(b"X-Query", request.require_query(b"q")?)?
+        return response.bytes(request.body())
+    }
+}
+pub struct Counter {
+    calls: usize
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        self.calls += 1
+        if self.calls == 1 {
+            return response.text(b"first")
+        }
+        return response.text(b"again")
+    }
+}
+pub struct Gate {
+    pub calls: usize
+    pub status: u16
+    pub fn before(&mut self, request: &mut web.Request) -> void!web.Failure {
+        self.calls += 1
+        if bytes.equal(request.path(), b"/private") {
+            return err(web.reject(401))
+        }
+        return ok()
+    }
+    pub fn after(&mut self, request: &mut web.Request, status: u16) {
+        self.status = status
+    }
+}
+pub struct Broken {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        response.header(b"X-Partial", b"must disappear")?
+        response.text(b"private details")?
+        return err(web.reject(422))
+    }
+}
+fn routing_and_responses() {
+    site := application.builder()
+        .get(b"/", web.html(b"<h1>Home</h1>"))
+        .get(b"/hello/:name", Greeting {})
+        .post(b"/json", web.json(b"{\"created\":true}").status(201))
+        .get(b"/old", web.redirect(b"/"))
+        .build()!
+    result := site.request(b"GET", b"/")
+    assert_eq(result.status(), 200)
+    assert(bytes.equal(result.body(), b"<h1>Home</h1>"))
+    match result.header(b"content-type") {
+        some(value) => {
+            assert(bytes.equal(value, b"text/html; charset=utf-8"))
+        }
+        none => {
+            assert(false)
+        }
+    }
+    greeting := site.request(b"GET", b"/hello/A%2520B?suffix=+friend")
+    assert(bytes.equal(greeting.body(), b"Hello, A%20B friend"))
+    // An owned response is still valid after another request.
+    next := site.request(b"POST", b"/json")
+    assert_eq(next.status(), 201)
+    assert(bytes.equal(greeting.body(), b"Hello, A%20B friend"))
+    match next.header(b"Content-Type") {
+        some(value) => {
+            assert(bytes.equal(value, b"application/json"))
+        }
+        none => {
+            assert(false)
+        }
+    }
+    moved := site.request(b"GET", b"/old")
+    assert_eq(moved.status(), 303)
+    assert_eq(moved.body().len, 0)
+    match moved.header(b"Location") {
+        some(value) => {
+            assert(bytes.equal(value, b"/"))
+        }
+        none => {
+            assert(false)
+        }
+    }
+    site.request(b"HEAD", b"/hello/Dodo").expect_body(b"")
+    site.request(b"PUT", b"/").expect_status(405)
+    site.request(b"GET", b"/missing").expect_status(404)
+    site.request(b"GET", b"/hello/%2F").expect_status(400)
+    site.request(b"GET", b"/hello/A?suffix=%GG").expect_status(400)
+    absolute := site.request(b"GET", b"http://localhost/hello/Ada")
+    assert(bytes.equal(absolute.body(), b"Hello, Ada!"))
+}
+fn extraction() {
+    site := application.builder().get(b"/numbers/:id", Number {}).post(b"/echo", Echo {}).build()!
+    site.request(b"GET", b"/numbers/18446744073709551615").expect_status(204)
+    site.request(b"GET", b"/numbers/18446744073709551616").expect_status(400)
+    site.request(b"GET", b"/numbers/+1").expect_status(400)
+    site.request(b"GET", b"/numbers/1?limit=").expect_status(400)
+    site.request(b"GET", b"/numbers/1?limit=-1").expect_status(400)
+    site.request(b"GET", b"/numbers/1?limit=9").expect_status(422)
+    input := testing.Request.new(b"POST", b"/echo?q=first&q=second").body(b"payload")
+    input.header(b"X-Token", b"secret")!
+    echoed := site.request_with(&input)
+    assert_eq(echoed.status(), 200)
+    assert(bytes.equal(echoed.body(), b"payload"))
+    match echoed.header(b"X-Query") {
+        some(value) => {
+            assert(bytes.equal(value, b"first"))
+        }
+        none => {
+            assert(false)
+        }
+    }
+    site.request(b"POST", b"/echo?q=ok").expect_status(400)
+    missing := testing.Request.new(b"POST", b"/echo")
+    missing.header(b"X-Token", b"secret")!
+    site.request_with(&missing).expect_status(400)
+    invalid := testing.Request.new(b"GET", b"/")
+    match invalid.header(b"X-Token", b"bad\r\nInjected: yes") {
+        err(_) => {}
+        ok() => {
+            assert(false)
+        }
+    }
+}
+fn middleware_and_state() {
+    site := application.builder()
+        .get(b"/", Counter { calls: 0 })
+        .middleware(Gate { calls: 0, status: 0 })
+        .get(b"/private", web.text(b"secret"))
+        .get(b"/broken", Broken {})
+        .build()!
+    first := site.request(b"GET", b"/")
+    second := site.request(b"GET", b"/")
+    assert(bytes.equal(first.body(), b"first"))
+    assert(bytes.equal(second.body(), b"again"))
+    site.request(b"GET", b"/private").expect_status(401)
+    broken := site.request(b"GET", b"/broken")
+    assert_eq(broken.status(), 422)
+    assert_eq(broken.body().len, 0)
+    match broken.header(b"X-Partial") {
+        none => {}
+        some(_) => {
+            assert(false)
+        }
+    }
+    assert_eq(site.handler.middleware.inner.calls, 4)
+    assert_eq(site.handler.middleware.inner.status, 422)
+    match &broken.failure {
+        some(reason) => {
+            assert_eq(reason.status(), 422)
+        }
+        none => {
+            assert(false)
+        }
+    }
+}
+fn setup_errors_and_verbs() {
+    match application.builder().get(b"/:one", web.text(b"1")).get(b"/:two", web.text(b"2"))
+        .route(b"bad method", b"/invalid", web.text(b"3")).build() {
+        err(reason) => {
+            assert(reason.kind == web.Error.AmbiguousRoute)
+            assert_eq(reason.index, 1)
+            assert(bytes.equal(reason.method, b"GET"))
+            assert(bytes.equal(reason.pattern, b"/:two"))
+            buffer := [0u8; 256]
+            writer := io.MemoryWriter.new(&mut buffer)
+            fmt.print(&mut writer, &reason)!
+            assert(bytes.equal(writer.written(), b"web route #2 (GET /:two): web: AmbiguousRoute; this method and path shape are already registered"))
+        }
+        ok(_) => {
+            assert(false)
+        }
+    }
+    site := application.builder().put(b"/", web.text(b"put")).patch(b"/", web.text(b"patch"))
+        .delete(b"/", web.bytes(b"").status(204)).head(b"/", web.text(b"head"))
+        .options(b"/", web.bytes(b"ignored").status(205))
+        .route(b"head", b"/", web.text(b"case sensitive")).build()!
+    site.request(b"PUT", b"/").expect_body(b"put")
+    site.request(b"PATCH", b"/").expect_body(b"patch")
+    site.request(b"DELETE", b"/").expect_status(204)
+    site.request(b"HEAD", b"/").expect_body(b"")
+    site.request(b"OPTIONS", b"/").expect_status(205).expect_body(b"")
+    site.request(b"head", b"/").expect_status(200).expect_body(b"case sensitive")
+    invalid := web.reject(200)
+    assert_eq(invalid.status(), 500)
+}
+fn response_errors() {
+    headers := [0u8; 128]
+    body := [0u8; 8]
+    output := web.Response.new(&mut headers, 4, &mut body)
+    output.text(b"before")!
+    match output.append(b"too large") {
+        err(_) => {}
+        ok() => {
+            assert(false)
+        }
+    }
+    assert(bytes.equal(output.body(), b"before"))
+    match output.redirect_to(b"/next", 200) {
+        err(_) => {}
+        ok() => {
+            assert(false)
+        }
+    }
+    match output.redirect(b"/next\r\nX: evil") {
+        err(_) => {}
+        ok() => {
+            assert(false)
+        }
+    }
+    assert_eq(output.status(), 200)
+    assert(bytes.equal(output.body(), b"before"))
+    match output.header_value(b"Location") {
+        none => {}
+        some(_) => {
+            assert(false)
+        }
+    }
+    output.redirect_to(b"/next", 307)!
+    assert_eq(output.status(), 307)
+    assert_eq(output.body().len, 0)
+    bad := application.builder().get(b"/", web.redirect(b"")).build()!
+    bad.request(b"GET", b"/").expect_status(500)
+    long_body := [65u8; 4097]
+    input := testing.Request.new(b"GET", b"/").body(&long_body)
+    bad.request_with(&input).expect_status(413)
+}
+fn main() -> i32 {
+    routing_and_responses()
+    extraction()
+    middleware_and_state()
+    setup_errors_and_verbs()
+    response_errors()
+    return 0
+}
+@test
+fn web_developer_experience() {
+    assert_eq(main(), 0)
+}

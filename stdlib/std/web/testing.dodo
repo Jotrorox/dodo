@@ -1,0 +1,217 @@
+package testing
+
+import "std/web"
+import "std/http"
+import "core/bytes"
+
+pub const BODY_BYTES: usize = 4096
+pub const HEADER_BYTES: usize = 4096
+pub const HEADER_FIELDS: usize = 32
+
+// An in-process request. Header values are copied; target and body are borrowed.
+pub struct Request {
+    method: &[u8]
+    target: &[u8]
+    data: &[u8]
+    headers: [4096]u8
+    header_used: usize
+    header_count: usize
+    pub fn new(method: &[u8], target: &[u8]) -> Request from(method, target) {
+        return Request { method: method, target: target, data: b"", headers: [0u8; HEADER_BYTES], header_used: 0, header_count: 0 }
+    }
+    pub fn body(self, data: &[u8]) -> Request from(self, data) {
+        self.data = data
+        return self
+    }
+    pub fn header(&mut self, name: &[u8], value: &[u8]) -> void!web.Failure {
+        fields := web.Fields.resume(&mut self.headers, self.header_used, self.header_count, HEADER_FIELDS)?
+        fields.append(name, value)?
+        used := fields.bytes().len
+        count := fields.len()
+        core.drop(fields)
+        self.header_used = used
+        self.header_count = count
+        return ok()
+    }
+}
+
+// Owns its bytes, so a response survives the next request and application drop.
+// Failure diagnostics are available to tests but never included in HTTP bodies.
+pub struct Response {
+    code: u16
+    header_used: usize
+    headers: [4096]u8
+    data: [4096]u8
+    used: usize
+    pub failure: Option<web.Failure>
+    pub fn expect_status(self, expected: u16) -> Response {
+        assert_eq(self.code, expected, "unexpected HTTP status")
+        return self
+    }
+    pub fn expect_body(self, expected: &[u8]) -> Response {
+        assert(bytes.equal(self.body(), expected), "unexpected response body")
+        return self
+    }
+    pub fn expect_header(self, name: &[u8], expected: &[u8]) -> Response {
+        match self.header(name) {
+            some(value) => {
+                assert(bytes.equal(value, expected), "unexpected response header value")
+            }
+            none => {
+                assert(false, "missing response header")
+            }
+        }
+        return self
+    }
+    pub fn status(&self) -> u16 {
+        return self.code
+    }
+    pub fn body(&self) -> &[u8] {
+        return &self.data[..self.used]
+    }
+    pub fn header(&self, name: &[u8]) -> Option<&[u8]> from(self) {
+        for i in 0usize..HEADER_FIELDS {
+            match web.field_at(&self.headers[..self.header_used], i) {
+                some(field) => {
+                    if http.equal_ascii(field.name, name) {
+                        return some(field.value)
+                    }
+                }
+                none => {
+                    return none
+                }
+            }
+        }
+        return none
+    }
+    pub fn header_at(&self, index: usize) -> Option<http.Header> from(self) {
+        return web.field_at(&self.headers[..self.header_used], index)
+    }
+}
+fn rejection(reason: web.Error, status: u16) -> web.Failure {
+    result := web.failure(reason)
+    result.response_status = status
+    return result
+}
+fn execute<H>(router: &web.Router, handler: &mut H, input: &Request, output: &mut web.Response) -> void!web.Failure {
+    if!web.valid_method(input.method) {
+        return err(rejection(web.Error.InvalidMethod, 400))
+    }
+    if input.data.len > BODY_BYTES {
+        return err(rejection(web.Error.BufferFull, 413))
+    }
+    uri: http.Uri
+    match http.Uri.parse(input.target) {
+        ok(value) => {
+            uri = value
+        }
+        err(reason) => {
+            failure := web.protocol_failure(web.Error.InvalidPath, reason)
+            failure.response_status = 400
+            return err(failure)
+        }
+    }
+    path := [0u8; 2048]
+    query := [0u8; 2048]
+    raw := uri.path()
+    if raw.len == 0 {
+        raw = b"/"
+    }
+    path_used := 0usize
+    match web.decode_path(raw, &mut path) {
+        ok(count) => {
+            path_used = count
+        }
+        err(reason) => {
+            code := 400u16
+            if reason == web.Error.BufferFull {
+                code = 414
+            }
+            return err(rejection(reason, code))
+        }
+    }
+    query_used := 0usize
+    match web.decode_query(uri.query(), &mut query, 100) {
+        ok(count) => {
+            query_used = count
+        }
+        err(reason) => {
+            reason.response_status = 400
+            if reason.kind == web.Error.QueryLimit || reason.kind == web.Error.BufferFull {
+                reason.response_status = 414
+            }
+            return err(reason)
+        }
+    }
+    found: web.Match
+    match router.find(input.method, &path[..path_used]) {
+        ok(value) => {
+            found = value
+        }
+        err(reason) => {
+            code := 404u16
+            if reason == web.Error.MethodNotAllowed {
+                code = 405
+            }
+            return err(rejection(reason, code))
+        }
+    }
+    request := web.Request.new(input.method, &path[..path_used], &input.headers[..input.header_used],
+    &query[..query_used], input.data, router, found.index, found.id, 1)
+    return web.handle(handler, &mut request, output)
+}
+
+// Exercises decoding, routing, middleware, state, and response helpers. It does
+// not simulate the wire parser, transport, timeouts, or custom server limits.
+pub fn send<H>(routes: &[web.Route], handler: &mut H, input: &Request) -> Response {
+    result := Response { code: 0, header_used: 0, headers: [0u8; HEADER_BYTES], data: [0u8; BODY_BYTES], used: 0, failure: none }
+    router: web.Router
+    match web.Router.new(routes) {
+        ok(value) => {
+            router = value
+        }
+        err(reason) => {
+            result.code = 500
+            result.failure = some(web.failure(reason))
+            return result
+        }
+    }
+    output := web.Response.new(&mut result.headers, HEADER_FIELDS, &mut result.data)
+    problem: Option<web.Failure> = none
+    match execute(&router, handler, input, &mut output) {
+        ok() => {}
+        err(reason) => {
+            problem = some(reason)
+        }
+    }
+    code := output.status()
+    used := output.body().len
+    header_used := 0usize
+    for i in 0usize..HEADER_FIELDS {
+        match output.header_at(i) {
+            some(field) => {
+                header_used += field.name.len + field.value.len + 2
+            }
+            none => {
+                break
+            }
+        }
+    }
+    core.drop(output)
+    match &problem {
+        some(reason) => {
+            code = reason.status()
+            used = 0
+            header_used = 0
+        }
+        none => {}
+    }
+    if web.bodyless(input.method, code) {
+        used = 0
+    }
+    result.code = code
+    result.header_used = header_used
+    result.used = used
+    result.failure = problem
+    return result
+}

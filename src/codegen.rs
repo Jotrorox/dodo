@@ -105,6 +105,8 @@ pub fn generate<'ctx>(
         yields: vec![],
         function: None,
         return_type: Type::Void,
+        return_storage: None,
+        indirect: HashMap::new(),
         bits,
         sources,
         debug,
@@ -135,8 +137,16 @@ pub fn generate<'ctx>(
     // Work from lowered references, including implicit drops, callback addresses,
     // and the hosted/test entry point. Run at O0 too, and again after optimizations
     // that can remove the last reference to an internal function.
+    // At O0, fold aggregate load/store pairs before instruction selection.
+    // Optimized pipelines already schedule memcpyopt after scalar replacement;
+    // running it early there would materialize inactive tagged payload bytes.
+    let copies = if options.optimization == 0 {
+        "function(memcpyopt),"
+    } else {
+        ""
+    };
     let passes = format!(
-        "globaldce,default<O{}>,globaldce",
+        "globaldce,{copies}default<O{}>,globaldce",
         options.optimization.min(3)
     );
     cg.module.run_passes(&passes, &machine)?;
@@ -184,6 +194,9 @@ struct Codegen<'a, 'ctx> {
     yields: Vec<YieldTarget<'ctx>>,
     function: Option<Value<'ctx>>,
     return_type: Type,
+    return_storage: Option<Value<'ctx>>,
+    // Internal calls pass large owned values through caller-owned storage.
+    indirect: HashMap<String, (bool, Vec<bool>)>,
     bits: u32,
     sources: SourceMap<'a>,
     span: Span,
@@ -371,7 +384,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let ptr = self.alloca(ty, "tagged.value")?;
         self.builder.build_store(ptr, value)?;
         let p = self.builder.build_struct_gep(ty, ptr, 1, "payload")?;
-        self.builder.build_store(p, payload)?;
+        self.store_value(p, payload)?;
         self.builder.build_load(ty, ptr, "tagged")
     }
     fn declare_functions(&mut self) -> Result<()> {
@@ -379,16 +392,38 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             if !f.generics.is_empty() {
                 continue;
             }
-            let params = f
+            // Keep exported and C signatures stable. Internal aggregate values
+            // otherwise flatten into thousands of ABI operands at -O0, making
+            // ordinary owned-buffer APIs prohibitively expensive to compile.
+            let internal =
+                !f.extern_ && f.name != "main" && (f.imported || !f.public || f.generic_instance);
+            let large = |ty: &Type| -> Result<bool> {
+                Ok(internal && *ty != Type::Void && self.data.get_abi_size(&self.ty(ty)?) > 1024)
+            };
+            let indirect_return = large(&f.ret)?;
+            let indirect_params = f
                 .params
                 .iter()
-                .map(|p| self.ty(&p.ty))
+                .map(|p| large(&p.ty))
                 .collect::<Result<Vec<_>>>()?;
-            let ty = if f.ret == Type::Void {
+            let mut params = Vec::new();
+            if indirect_return {
+                params.push(self.context.ptr_type(0));
+            }
+            for (p, indirect) in f.params.iter().zip(&indirect_params) {
+                params.push(if *indirect {
+                    self.context.ptr_type(0)
+                } else {
+                    self.ty(&p.ty)?
+                });
+            }
+            let ty = if f.ret == Type::Void || indirect_return {
                 self.context.void_type().fn_type(&params, false)
             } else {
                 self.ty(&f.ret)?.fn_type(&params, false)
             };
+            self.indirect
+                .insert(f.name.clone(), (indirect_return, indirect_params));
             let symbol = if f.extern_ {
                 f.name.rsplit('.').next().unwrap_or(&f.name).to_owned()
             } else {
@@ -604,16 +639,32 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let function = self.functions[&f.name];
         self.function = Some(function);
         self.return_type = f.ret.clone();
+        let (indirect_return, indirect_params) = self.indirect[&f.name].clone();
+        self.return_storage = if indirect_return {
+            function.get_nth_param(0)
+        } else {
+            None
+        };
         self.scopes = vec![vec![]];
         self.loops.clear();
         self.debug_function(f, function)?;
         self.location(f.span);
         self.builder
             .position_at_end(self.context.append_basic_block(function, "entry"));
-        for (index, (p, v)) in f.params.iter().zip(function.get_param_iter()).enumerate() {
+        for (index, (p, v)) in f
+            .params
+            .iter()
+            .zip(function.get_param_iter().skip(usize::from(indirect_return)))
+            .enumerate()
+        {
             self.parameter = index as u32 + 1;
             self.location(p.span);
-            self.bind(&p.name, &p.ty, Some(v))?;
+            let value = if indirect_params[index] {
+                self.load(v, &p.ty)?
+            } else {
+                v
+            };
+            self.bind(&p.name, &p.ty, Some(value))?;
         }
         self.parameter = 0;
         self.location(f.span);
@@ -627,6 +678,42 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
         }
         self.scopes.clear();
+        Ok(())
+    }
+    // Keep large record copies in memory. Letting SROA first split their
+    // aggregate loads can build thousands of byte insertions even at O3.
+    // Tagged unions are deliberately excluded: copying their inactive payload
+    // would defeat the compact constructors used on freestanding targets.
+    fn store_value(&self, destination: Value<'ctx>, value: Value<'ctx>) -> Result<()> {
+        let ty = value.get_type();
+        let size = self.data.get_abi_size(&ty);
+        if size > 1024
+            && self
+                .program
+                .structs
+                .iter()
+                .any(|s| self.structs.get(&s.name) == Some(&ty))
+            && let Some(source) = value.loaded_pointer(&self.builder)
+        {
+            self.builder.build_memmove(
+                destination,
+                1,
+                source,
+                1,
+                self.usize_type().const_int(size, false),
+            )?;
+        } else {
+            self.builder.build_store(destination, value)?;
+        }
+        Ok(())
+    }
+    fn return_value(&self, value: Value<'ctx>) -> Result<()> {
+        if let Some(storage) = self.return_storage {
+            self.store_value(storage, value)?;
+            self.builder.build_return(None)?;
+        } else {
+            self.builder.build_return(Some(&value))?;
+        }
         Ok(())
     }
     fn entry(&mut self, tests: &[String]) -> Result<()> {
@@ -764,7 +851,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn bind(&mut self, name: &str, ty: &Type, value: Option<Value<'ctx>>) -> Result<Binding<'ctx>> {
         let ptr = self.alloca(self.ty(ty)?, name)?;
         if let Some(v) = value {
-            self.builder.build_store(ptr, v)?;
+            self.store_value(ptr, v)?;
         }
         let live = if self.needs_drop(ty) {
             let flag = self.alloca(self.context.bool_type(), "initialized")?;
@@ -1058,7 +1145,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             StmtKind::Expr(e) => {
                 let v = self.expr(e)?;
-                if !e.ty.is_copy() {
+                if self.needs_drop(&e.ty) {
                     let p = self.alloca(self.ty(&e.ty)?, "temporary")?;
                     self.builder.build_store(p, v)?;
                     self.drop_ptr(p, &e.ty)?;
@@ -1083,7 +1170,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 if self.return_type == Type::Void {
                     self.builder.build_return(None)?;
                 } else if let Some(v) = v {
-                    self.builder.build_return(Some(&v))?;
+                    self.return_value(v)?;
                 } else {
                     return Err(error("non-void return is missing its value"));
                 }
@@ -1392,6 +1479,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .find(|s| s.name == *n)
                     .unwrap()
                     .clone();
+                // Initialize large records field by field. Building one SSA
+                // aggregate with dynamic metadata and large zero buffers makes
+                // instruction selection expand the buffers into scalar stores.
+                let storage = if self.data.get_abi_size(&st) > 256 {
+                    Some(self.alloca(st, "struct.storage")?)
+                } else {
+                    None
+                };
                 let mut v = st.const_zero();
                 let mut pending = Vec::new();
                 for (name, e) in fields {
@@ -1401,10 +1496,21 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         .position(|f| f.name == *name)
                         .ok_or_else(|| error("unknown field"))?;
                     let x = self.stage(e, &mut pending)?;
-                    v = self.builder.build_insert_value(v, x, i as u32, "struct")?;
+                    if let Some(storage) = storage {
+                        let field =
+                            self.builder
+                                .build_struct_gep(st, storage, i as u32, "struct.field")?;
+                        self.store_value(field, x)?;
+                    } else {
+                        v = self.builder.build_insert_value(v, x, i as u32, "struct")?;
+                    }
                 }
                 self.transfer(&pending)?;
-                v
+                if let Some(storage) = storage {
+                    self.builder.build_load(st, storage, "struct.value")?
+                } else {
+                    v
+                }
             }
             ExprKind::Unary(op, x) => match op {
                 UnaryOp::Borrow | UnaryOp::BorrowMut => {
@@ -1527,7 +1633,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                         payload,
                     )?;
                     self.cleanup_to(0)?;
-                    self.builder.build_return(Some(&ret))?;
+                    self.return_value(ret)?;
                 } else {
                     self.panic("result unwrap")?;
                 }
@@ -2658,15 +2764,37 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .get(name)
             .copied()
             .ok_or_else(|| error(format!("unknown function {name}")))?;
+        let (indirect_return, indirect_params) = self.indirect[name].clone();
+        let storage = if indirect_return {
+            Some(self.alloca(self.ty(ret)?, "call.result")?)
+        } else {
+            None
+        };
         let mut pending = Vec::new();
-        let vs = args
-            .iter()
-            .map(|e| self.stage(e, &mut pending))
-            .collect::<Result<Vec<_>>>()?;
+        let mut vs = Vec::new();
+        if let Some(storage) = storage {
+            vs.push(storage);
+        }
+        for (e, indirect) in args.iter().zip(&indirect_params) {
+            let value = self.stage(e, &mut pending)?;
+            if *indirect {
+                let argument = self.alloca(self.ty(&e.ty)?, "call.argument")?;
+                self.store_value(argument, value)?;
+                vs.push(argument);
+            } else {
+                vs.push(value);
+            }
+        }
         self.transfer(&pending)?;
-        let call = self
-            .builder
-            .build_call(f, &vs, if *ret == Type::Void { "" } else { "call" })?;
+        let call = self.builder.build_call(
+            f,
+            &vs,
+            if *ret == Type::Void || indirect_return {
+                ""
+            } else {
+                "call"
+            },
+        )?;
         if let Some(function) = self
             .program
             .functions
@@ -2677,7 +2805,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 call.add_attribute(location, attribute);
             }
         }
-        Ok(call.basic().unwrap_or(unit))
+        if let Some(storage) = storage {
+            self.load(storage, ret)
+        } else {
+            Ok(call.basic().unwrap_or(unit))
+        }
     }
     fn foreach(
         &mut self,
