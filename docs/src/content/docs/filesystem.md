@@ -302,8 +302,9 @@ Validation includes native fixtures at `-O0` and `-O3`, a 64-combination
 open-mode matrix for both existing and missing files, Unicode/space paths,
 Unix non-UTF-8 names, symlinks, permissions, directory-buffer retries, copying
 limits, cross-device failure preservation, and descriptor cleanup on failure.
-The Windows harness links and executes real PE fixtures under Wine, including
-sharing denial and strict/lossy unpaired-surrogate conversion. Rejection tests
+The Windows fixtures run both natively in Windows CI and under Wine, including
+sharing denial, rename/delete with open handles, non-inheritable file handles,
+repeated close, and strict/lossy unpaired-surrogate conversion. Rejection tests
 cover escaping native paths, mutable aliases, iterator name lifetimes, ignored
 Results, and private resource construction.
 

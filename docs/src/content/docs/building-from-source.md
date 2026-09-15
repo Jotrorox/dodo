@@ -143,6 +143,7 @@ rustup target add x86_64-pc-windows-msvc
 rustup component add rust-docs
 python scripts/build-windows-llvm-support.py
 cargo build --locked --features llvm-sys/force-static --release --bin dodo --target x86_64-pc-windows-msvc
+python scripts/test_windows_native.py --linker clang
 python scripts/package-release.py --target x86_64-pc-windows-msvc
 python scripts/test_windows_release.py build/release-assets/dodo-0.1.2-x86_64-pc-windows-msvc.zip --linker clang
 ```
@@ -170,6 +171,19 @@ to both packaging and testing to use a cross-built Windows compiler. Set
 `WINEPREFIX` to an isolated prefix, supply a Windows Clang executable with
 `--linker`, and use repeated `--link-arg=ARG` options for the MSVC SDK and runtime
 library search paths required by that toolchain.
+
+The native Windows CI job also runs `scripts/test_windows_native.py` before
+packaging. It builds and executes filesystem, process, console-handle, TCP/UDP,
+thread, and synchronization fixtures at `-O0` and `-O3` with the normal compiler
+linking path. Tests cover Unicode paths, sharing restrictions, rename/delete
+with open handles, child pipe EOF and inheritance, IPv4/IPv6 loopback, socket
+inheritability, condition waits, cancellation, and repeated handle cleanup.
+Each execution uses a separate temporary working directory; failed commands
+report their output and exit code, and timeouts terminate the process tree.
+Use `--compiler PATH` to select a compiler and repeat
+`--fixture tests/os/fs_windows_checks.dodo` to select individual fixtures.
+The runner requires native Windows, Clang, and the Visual Studio C++/Windows SDK
+libraries. The separate Wine suite remains available for cross-platform checks.
 
 ## Fully static Linux compiler
 

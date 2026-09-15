@@ -318,8 +318,10 @@ cleanup, name-resolution errors, independent Rust TCP peers, parser properties
 and malformed DNS input, checked borrowing and moved socket rejection. Portable
 fixtures cross-compile for wasm32 and Cortex-M0; native fixtures cross-compile to
 Windows x64. `scripts/test_stdlib_windows.py --fixture tests/net/native_checks.dodo`
-executes real Windows binaries under Wine, including UDP truncation. Wine success
-still requires native Windows verification of provider behavior under real
-network drivers, IPv6 interface scopes, resolver configuration, socket exhaustion,
-and scheduling/load. No Internet endpoint is required: the negative resolver case uses an invalid
+executes real Windows binaries under Wine, including UDP truncation. Native
+Windows CI runs the loopback and backpressure fixtures at both optimization
+levels and checks connected/accepted socket inheritability with
+`scripts/test_windows_native.py`. This does not cover all network drivers,
+IPv6 interface scopes, resolver configurations, socket exhaustion, or load.
+No Internet endpoint is required: the negative resolver case uses an invalid
 numeric address with `AI_NUMERICHOST`, and hostname resolution uses `localhost`.

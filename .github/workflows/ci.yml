@@ -152,6 +152,8 @@ jobs:
         run: python3 scripts/test_build_release.py
       - name: Test Windows fixture startup ABI
         run: python3 scripts/test_windows_startup.py
+      - name: Test native Windows fixture runner diagnostics
+        run: python3 scripts/test_windows_native_harness.py
       - name: Test Windows LLVM library path handling
         run: |
           rustc --edition=2024 --test scripts/windows-llvm-config.rs -o "$RUNNER_TEMP/test-windows-llvm-config"
@@ -333,6 +335,14 @@ jobs:
           cache-on-failure: true
       - name: Build the Windows compiler with static runtimes
         run: cargo build --locked --features llvm-sys/force-static --release --bin dodo --target x86_64-pc-windows-msvc
+      - name: Test native Windows filesystem, processes, networking, and synchronization
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          python scripts/test_windows_native_harness.py
+          if ($LASTEXITCODE -ne 0) { throw 'Windows fixture runner tests failed' }
+          python scripts/test_windows_native.py --linker "$env:LLVM_SYS_231_PREFIX/bin/clang.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows platform tests failed' }
       - name: Package the Windows release
         run: python scripts/package-release.py --target x86_64-pc-windows-msvc
       - name: Test the extracted Windows release
