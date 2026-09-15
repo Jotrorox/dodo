@@ -1,0 +1,61 @@
+package https_app_checks
+import "std/web"
+import "std/web/app"
+import "std/web/https"
+import "std/http/hosting"
+import "std/net"
+import "std/net/native"
+
+fn main() -> i32 {
+    identity := https.files("cert.pem", "key.pem")
+    cancel := net.Cancellation.new()
+    cancel.cancel()
+    server := app.new().get(b"/", web.text(b"hello")).build()!
+    server.request(b"GET", b"/").expect_status(200).expect_body(b"hello")
+    report := identity.serve_until(server, b"127.0.0.1:0", &cancel)!
+    assert(report.cancelled && report.accepted == 0)
+
+    workspace := [0u8; app.WORKSPACE_BYTES]
+    request := [0u8; 8192]
+    response := [0u8; 8192]
+    clock := native.MonotonicClock {}
+    for case in 0usize..3 {
+        builder := app.new().get(b"/", web.text(b"hello"))
+        builder.config.limits.body_bytes = 8192
+        builder.config.limits.response_bytes = 8192
+        if case == 2 {
+            builder.config.timeouts.header_ms = 0
+        }
+        server := builder.build()!
+        size := workspace.len
+        if case == 1 {
+            size -= 1
+        }
+        storage := app.Storage.new(&mut workspace[..size], &mut request, &mut response)
+        match identity.serve_with(server, b"127.0.0.1:0", &mut storage, &mut clock, &cancel) {
+            ok(report) => {
+                assert(case == 0 && report.cancelled && report.accepted == 0)
+            }
+            err(reason) => {
+                assert(reason.kind == https.ErrorKind.Serving)
+                match &reason.serving {
+                    some(cause) => {
+                        if case == 1 {
+                            assert(cause.kind == hosting.ErrorKind.Workspace)
+                        } else {
+                            assert(case == 2 && cause.kind == hosting.ErrorKind.InvalidInput)
+                        }
+                    }
+                    none => {
+                        assert(false)
+                    }
+                }
+            }
+        }
+        core.drop(storage)
+        workspace[0] = 0
+        request[0] = 0
+        response[0] = 0
+    }
+    return 0
+}

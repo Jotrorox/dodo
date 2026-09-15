@@ -1,58 +1,10 @@
 package https_server
-import "std/console"
-import "std/fs"
-import "std/platform"
-import "std/http/hosting"
-import "std/http/https"
-import "std/tls/openssl"
 import "std/web"
-import "std/web/hosted"
+import "std/web/app"
+import "std/web/https"
 
-fn load(path: &str, output: &mut[u8]) -> usize!hosting.Error {
-    paths := platform.workspace()
-    match fs.read_file(path, output, &mut paths) {
-        ok(report) => {
-            if!report.eof {
-                return err(hosting.failure(hosting.ErrorKind.Workspace))
-            }
-            return ok(report.read)
-        }
-        err(_) => {
-            return err(hosting.failure(hosting.ErrorKind.InvalidInput))
-        }
-    }
-}
-fn run() -> i32!hosting.Error {
-    certificate := [0u8; 8192]
-    key := [0u8; 8192]
-    certificate_bytes := load("cert.pem", &mut certificate)?
-    key_bytes := load("key.pem", &mut key)?
-    identity := openssl.Config.server(&certificate[..certificate_bytes], &key[..key_bytes])
-    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
-    handler := hosted.Text.new(b"Hello, Dodo!\n")
-    workspace := [0u8; hosted.WORKSPACE_BYTES]
-    request := [0u8; 4096]
-    response := [0u8; 4096]
-    config := hosted.Config.defaults()
-    config.max_connections = 0
-    report := https.serve(b"127.0.0.1:8443", &routes, &mut handler, &mut workspace, &mut request, &mut response, config, identity)?
-    if report.failed != 0 {
-        return ok(2)
-    }
-    return ok(0)
-}
 fn main() -> i32 {
-    match run() {
-        ok(code) => {
-            return code
-        }
-        err(reason) => {
-            errors := console.stderr()
-            match errors.println(&reason) {
-                ok(_) => {}
-                err(_) => {}
-            }
-            return 1
-        }
-    }
+    return app.new()
+        .get(b"/", web.text(b"Hello, Dodo!\n"))
+        .run_with(b"127.0.0.1:8443", https.files("cert.pem", "key.pem"))
 }

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Bring the HTTPS server example onto the fluent web API with
+  `run_with(address, https.files(certificate, key))`. Add bounded PEM loading,
+  file-specific startup diagnostics, custom storage and cooperative cancellation
+  through `std/web/https`; TLS remains an explicit import and serial transport.
+- Allow up to 4,096 generic specializations for composed web/TLS applications,
+  with a separate limit of 64 nested specializations for recursive expansion.
+
 - Add fluent `app.new()` and portable `application.builder()` APIs with all HTTP
   method shortcuts, route-specific setup diagnostics, global middleware, and
   `run()` error reporting. Add ready-made text/HTML/JSON/redirect handlers,

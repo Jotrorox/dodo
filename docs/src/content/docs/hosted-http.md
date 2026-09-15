@@ -6,7 +6,8 @@ order: 159.5
 ---
 
 Use `std/http/hosted` for a hosted HTTP client, `std/http/https` for verified
-HTTP/HTTPS, and `std/web/app` for a configured web server. These modules own the
+HTTP/HTTPS, and `std/web/app` for a configured web server. Add `std/web/https`
+for file-based TLS with the fluent web API. These modules own the
 ordinary resolution, connect, readiness, framing, body transfer, and cleanup
 loops. The portable `std/http`, `std/http/client`, `std/http/connection`,
 `std/web`, and `std/web/server` APIs remain independently usable.
@@ -51,36 +52,13 @@ and handler live in a server object with bounded default protocol and body stora
 
 ```dodo
 package server_example
-import "std/console"
 import "std/web"
-import "std/web/application"
 import "std/web/app"
 
-pub struct Hello {
-    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
-        return response.text(b"Hello, Dodo!\n")
-    }
-}
 fn main() -> i32 {
-    routes := application.new().get(b"/", Hello {})!
-    server := app.Server.new(routes)
-    server.config.max_connections = 0 // Serve until stopped; tests set a finite count.
-    match server.serve(b"127.0.0.1:8080") {
-        ok(report) => {
-            if report.failed != 0 {
-                return 2
-            };
-            return 0
-        }
-        err(reason) => {
-            errors := console.stderr()
-            match errors.println(&reason) {
-                ok(_) => {}
-                err(_) => {}
-            }
-            return 1
-        }
-    }
+    return app.new()
+        .get(b"/", web.text(b"Hello, Dodo!\n"))
+        .run(b"127.0.0.1:8080")
 }
 ```
 
@@ -337,13 +315,36 @@ a peer is holding an incomplete request.
 
 ## Complete local HTTPS setup
 
+The HTTPS server uses the same fluent app API:
+
+```dodo
+package https_server
+import "std/web"
+import "std/web/app"
+import "std/web/https"
+
+fn main() -> i32 {
+    return app.new()
+        .get(b"/", web.text(b"Hello, Dodo!\n"))
+        .run_with(b"127.0.0.1:8443", https.files("cert.pem", "key.pem"))
+}
+```
+
+`https.files` loads each PEM file once into bounded storage (8,192 bytes per
+file), validates the identity before binding, and supplies default HTTP buffers.
+It reports file paths and underlying errors on startup failure. Routes,
+middleware, limits, and timeouts are configured on the ordinary app builder.
+The HTTPS transport is serial; requesting concurrent execution fails at startup.
+See [HTTPS web applications](web.md#https) for custom storage and cancellation.
+
 The HTTPS import selects the existing OpenSSL backend and requires **OpenSSL
 3.5+ development headers and libraries**, plus a target C toolchain. Hosted
 linking adds libssl/libcrypto. Matching dynamic libraries/provider modules must
 be available at runtime. This is also required if an HTTPS-enabled program only
 uses an HTTP URL. Plain `http/hosted` does not link OpenSSL.
 
-`https.Trust.system()` uses OpenSSL's configured default paths; on Windows this
+In the client module `std/http/https`, `https.Trust.system()` uses OpenSSL's
+configured default paths; on Windows this
 does **not** import the Windows certificate store. `https.Trust.pem_roots(pem)`
 uses only explicit PEM roots. A `Trust` value can enable both modes. Every HTTPS
 connection verifies the chain, validity, purpose, and URL hostname/IP SAN and
@@ -376,12 +377,15 @@ command requires curl; the Dodo client has no curl dependency.
 The script runs reproducible OpenSSL commands to generate a fresh local CA and
 one-day DNS-only localhost leaf, saves private keys with restricted permissions,
 and copies the complete `examples/https_client.dodo` and `https_server.dodo`
-programs. Credential bytes intentionally vary on every run. The examples read
-bounded PEM files at runtime, handle all Results, and use `https.serve` with an
-explicit `openssl.Config.server(certificate, key)`. Use `localhost`, not
+programs. Credential bytes intentionally vary on every run. The server uses
+`app.new().get(...).run_with(..., https.files(...))`; the client reads its bounded
+trust file at runtime and verifies the server. The lower-level `https.serve`
+and explicit `openssl.Config.server(certificate, key)` remain available for
+custom identities. Use `localhost`, not
 `127.0.0.1`, with this DNS-only certificate. Re-run the generator into a new
 directory after expiry. Stop the demonstration listener with Ctrl-C; applications
-can use the cooperative `serve_with` API described above.
+can use `https.files(...).serve_until(server, address, &cancel)` for cooperative
+shutdown.
 
 ## Validation and platform limits
 
@@ -393,6 +397,9 @@ collection, malformed framing/EOF, body/header/time limits, redirect method and
 body handling, chain/hostname rejection, repeated requests, cancellation, and
 socket cleanup. The existing HTTP/web, TLS, and Windows harnesses continue to
 exercise the lower layers. `--skip-tls` is an explicit reduced test selection.
+`python3 scripts/test_web_https.py` additionally checks fluent routes, middleware,
+credential bounds and diagnostics, custom storage, and cancellation at O0/O3;
+it also runs through `cargo test --test http_hosted_library`.
 
 Supported hosted adapters are x86-64 Linux GNU and Windows x64 MSVC/GNU.
 Linux musl/x32, AArch64 Linux, macOS and freestanding ABIs are unsupported by

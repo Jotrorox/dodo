@@ -1,0 +1,124 @@
+package https
+
+import "std/web/app"
+import "std/web/hosted"
+import "std/http/https" as transport
+import "std/http/hosting"
+import "std/tls/openssl"
+import "std/fs"
+import "std/platform"
+import "std/io"
+import "std/net"
+import "std/net/native"
+
+// Explicit OpenSSL selection. Files are read once per serving call into fixed
+// storage and remain alive until all accepted TLS connections have closed.
+pub const PEM_BYTES: usize = 8192
+
+pub enum ErrorKind {
+    File, CredentialLimit, Serving, UnsupportedExecution
+}
+pub struct Error {
+    pub kind: ErrorKind
+    pub path: &str
+    pub file: Option<fs.FileError>
+    pub serving: Option<hosting.Error>
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("web HTTPS: ")?
+        match &self.kind {
+            ErrorKind.File => {
+                output.string("cannot read credential file: ")?
+                output.string(self.path)?
+            }
+            ErrorKind.CredentialLimit => {
+                output.string("credential file exceeds 8192 bytes: ")?
+                output.string(self.path)?
+            }
+            ErrorKind.Serving => {
+                output.string("serving failed")?
+            }
+            ErrorKind.UnsupportedExecution => {
+                output.string("concurrent HTTPS is not supported; use serial execution")?
+            }
+        }
+        match &self.file {
+            some(reason) => {
+                output.string("; ")?;
+                reason.cause.format(output)?
+            }
+            none => {}
+        }
+        match &self.serving {
+            some(reason) => {
+                output.string("; ")?;
+                reason.format(output)?
+            }
+            none => {}
+        }
+        return ok()
+    }
+}
+fn serving_error(reason: hosting.Error) -> Error from(static) {
+    return Error { kind: ErrorKind.Serving, path: "", file: none, serving: some(reason) }
+}
+fn load(path: &str, output: &mut[u8]) -> usize!Error from(path) {
+    paths := platform.workspace()
+    match fs.read_file(path, output, &mut paths) {
+        ok(report) => {
+            if!report.eof {
+                return err(Error { kind: ErrorKind.CredentialLimit, path: path, file: none, serving: none })
+            }
+            return ok(report.read)
+        }
+        err(reason) => {
+            return err(Error { kind: ErrorKind.File, path: path, file: some(reason), serving: none })
+        }
+    }
+}
+
+pub struct Files {
+    certificate: &str
+    key: &str
+    pub fn serve<H>(&self, server: app.Server<H>, address: &[u8]) -> hosted.Report!Error from(self) {
+        cancel := net.NeverCancel {}
+        return self.serve_until(server, address, &cancel)
+    }
+    pub fn serve_until<H, X>(&self, server: app.Server<H>, address: &[u8], cancel: &X) -> hosted.Report!Error from(self) {
+        workspace := [0u8; app.WORKSPACE_BYTES]
+        request := [0u8; app.BODY_BYTES]
+        response := [0u8; app.BODY_BYTES]
+        storage := app.Storage.new(&mut workspace, &mut request, &mut response)
+        clock := native.MonotonicClock {}
+        return self.serve_with(server, address, &mut storage, &mut clock, cancel)
+    }
+    pub fn serve_with<H, C, X>(&self, server: app.Server<H>, address: &[u8], storage: &mut app.Storage,
+    clock: &mut C, cancel: &X) -> hosted.Report!Error from(self) {
+        if server.config.execution != app.Execution.Serial {
+            return err(Error { kind: ErrorKind.UnsupportedExecution, path: "", file: none, serving: none })
+        }
+        certificate := [0u8; PEM_BYTES]
+        key := [0u8; PEM_BYTES]
+        certificate_bytes := load(self.certificate, &mut certificate)?
+        key_bytes := load(self.key, &mut key)?
+        identity := openssl.Config.server(&certificate[..certificate_bytes], &key[..key_bytes])
+        // Reject malformed PEM and mismatched keys before binding a listener.
+        match openssl.Engine.server(&identity) {
+            ok(_) => {}
+            err(reason) => {
+                return err(serving_error(hosting.tls_error(reason)))
+            }
+        }
+        acceptor := transport.Acceptor.new(identity)
+        match server.serve_serial_with(address, storage, &mut acceptor, clock, cancel) {
+            ok(report) => {
+                return ok(report)
+            }
+            err(reason) => {
+                return err(serving_error(reason))
+            }
+        }
+    }
+}
+pub fn files(certificate: &str, key: &str) -> Files from(certificate, key) {
+    return Files { certificate: certificate, key: key }
+}
