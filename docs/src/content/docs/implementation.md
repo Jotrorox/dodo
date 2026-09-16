@@ -1,17 +1,17 @@
 ---
 title: "Compiler support and limits"
-description: "What Dodo 0.1.2 implements, where to find reference details, and which design features remain open."
+description: "What Dodo 0.1.3 implements, where to find reference details, and which design features remain open."
 section: "Language reference"
 order: 200
 ---
 
-Dodo 0.1.2 implements a hosted compiler, local packages, checked borrowing,
+Dodo 0.1.3 implements a hosted compiler, local packages, checked borrowing,
 and target object emission. This guide describes compiler behavior. The
 [0.1 language specification](language-spec-0.1.md) defines the retained language
 rules and connects them to conformance tests. Its Appendix C records the
 implementation-defined choices for this compiler and the excluded features.
 
-Compiler releases and language versions are separate: this compiler is 0.1.2,
+Compiler releases and language versions are separate: this compiler is 0.1.3,
 and the language specification remains 0.1. The implemented September 2026
 ergonomics revision includes name-first declarations, immutable `let` bindings,
 final-expression returns, inference, patterns, and canonical formatting.
@@ -89,8 +89,10 @@ compose existing generic methods and checked buffers. Borrow-carrying assignment
 through external mutable references are rejected as well as local reborrows;
 callbacks cannot retain request storage by assigning it into their receiver.
 
-The broad design's disjoint mutable slice splitting, trait-based checked allocator
-interfaces, DMA/interrupt-safe abstractions, general target barriers, inline
+Checked [mutable slice splitting](slice-splitting.md) is supported through
+`core/slice.split_at_mut`, with disjoint views and retained source lifetimes.
+The broad design's trait-based checked allocator interfaces,
+DMA/interrupt-safe abstractions, general target barriers, inline
 assembly, and section/alignment/export/interrupt attributes are not implemented.
 Unsupported syntax and unknown intrinsics produce diagnostics. Hosted runtime
 failures report their check and source location before aborting. Freestanding

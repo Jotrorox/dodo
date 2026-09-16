@@ -5,10 +5,10 @@ hardware access. Its Rust and LLVM 23 compiler produces native executables,
 object files, assembly, LLVM IR, and bitcode. Ordinary generated code needs no
 garbage collector, heap allocator, scheduler, or Dodo runtime.
 
-**Compiler release: 0.1.2 · Language version: 0.1 · [BSD-2-Clause](LICENSE)**
+**Compiler release: 0.1.3 · Language version: 0.1 · [BSD-2-Clause](LICENSE)**
 
 This README describes `main`, which can include changes made after the latest
-release. Use the [`v0.1.2` tag](https://github.com/Jotrorox/dodo/tree/v0.1.2) for
+release. Use the [`v0.1.3` tag](https://github.com/Jotrorox/dodo/tree/v0.1.3) for
 the released source and [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Get started
@@ -133,7 +133,7 @@ and conservative borrow checking are documented alongside the specification.
 - [Web applications](https://jotrorox.github.io/dodo/web/): fluent routes, ready-made responses, middleware, and in-process tests; see [the multi-route example](examples/web_routes.dodo).
 - [Standard library](https://jotrorox.github.io/dodo/standard-library/): portable foundations, explicit allocation, I/O, text, collections, mathematics, hashing, time, networking, TLS, HTTP/1.1 and web routing, with independently selected operating-system and execution providers.
 - [Mutable slice splitting](docs/src/content/docs/slice-splitting.md): checked, disjoint mutable views with ordinary ownership and source lifetimes.
-- [Container element safety](docs/src/content/docs/container-elements.md): current restrictions and proposed checker changes; reference and Result elements remain limited.
+- [Container element safety](docs/src/content/docs/container-elements.md): checked shared-reference collections, owned strings, scoped mutation, and remaining element restrictions.
 
 ## Build and contribute
 

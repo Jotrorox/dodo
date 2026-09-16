@@ -10,7 +10,7 @@ and explicit hardware access. Its compiler produces native executables, object
 files, assembly, LLVM IR, and bitcode. Ordinary generated code needs no garbage
 collector, heap allocator, scheduler, or Dodo runtime.
 
-The current compiler release is **0.1.2**, implementing part of the **Dodo 0.1**
+The current compiler release is **0.1.3**, implementing part of the **Dodo 0.1**
 language design. See [implementation decisions and limits](implementation.md)
 for supported features and remaining work.
 

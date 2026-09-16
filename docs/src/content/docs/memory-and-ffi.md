@@ -1,12 +1,12 @@
 ---
 title: "Memory and foreign calls"
-description: "Implemented layouts, C interoperation, pointer intrinsics, and MMIO limits in Dodo 0.1.2."
+description: "Implemented layouts, C interoperation, pointer intrinsics, and MMIO limits in Dodo 0.1.3."
 section: "Language reference"
 order: 230
 ---
 
 This page covers the implemented memory layout and low-level interfaces in
-Dodo 0.1.2. The normative allocation, cast, and aliasing contracts are in
+Dodo 0.1.3. The normative allocation, cast, and aliasing contracts are in
 [specification section 14](language-spec-0.1.md#14-raw-memory-validity); layout and
 ABI rules are in [section 16](language-spec-0.1.md#16-foreign-interfaces-layout-and-target-attributes).
 See the [compiler overview](implementation.md#remaining-design-surface)

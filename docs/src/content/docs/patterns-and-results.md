@@ -1,6 +1,6 @@
 ---
 title: "Patterns and Results"
-description: "Match coverage, guards, destructuring, and mandatory Result handling in Dodo 0.1.2."
+description: "Match coverage, guards, destructuring, and mandatory Result handling in Dodo 0.1.3."
 section: "Language reference"
 order: 225
 ---

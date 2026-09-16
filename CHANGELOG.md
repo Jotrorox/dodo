@@ -1,39 +1,64 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 — 2026-09-16
 
-- Bring the HTTPS server example onto the fluent web API with
-  `run_with(address, https.files(certificate, key))`. Add bounded PEM loading,
-  file-specific startup diagnostics, custom storage and cooperative cancellation
-  through `std/web/https`; TLS remains an explicit import and serial transport.
-- Allow up to 4,096 generic specializations for composed web/TLS applications,
-  with a separate limit of 64 nested specializations for recursive expansion.
+Dodo 0.1.3 adds simpler printing and web application APIs, concurrent HTTPS,
+checked mutable slice splitting, reference collections, and improved editor
+navigation. The language specification remains version 0.1.
 
-- Add fluent `app.new()` and portable `application.builder()` APIs with all HTTP
-  method shortcuts, route-specific setup diagnostics, global middleware, and
-  `run()` error reporting. Add ready-made text/HTML/JSON/redirect handlers,
-  required and numeric request accessors, explicit HTTP rejections, response
-  helpers, and owned in-process test responses with chainable assertions.
-  Update the web quickstart and examples while retaining checked registration.
-- Keep large internal function arguments and results in caller-owned storage,
-  and compact aggregate copies before LLVM lowering, so owned response buffers
-  remain practical in unoptimized builds. Exported and C signatures stay stable.
-
-- Add `std/web/app.Server` with bounded default storage, grouped limits and
-  timeouts, custom buffers, cooperative cancellation, and explicit serial or
-  concurrent execution. Add portable named-handler registration without manual
-  route IDs; update the server examples and add a three-route HTML/parameter demo.
-
-- Remove `std/text_unicode` and its Unicode data license notice. Text trimming
-  uses the ASCII rules in `Text.trim_ascii`.
 - Add postfix `!` to unwrap a Result or panic on error, preserving `?` for
   propagation. Shorten hello world to a single console call in `fn main()`.
-- Update the Rust toolchain to 1.98.1 and the compiler backend to LLVM 23.1.1
-  with llvm-sys 231.0.0. Source builds now use `LLVM_SYS_231_PREFIX`.
-- Update Rust and npm package dependencies, including TypeScript 7.
-  The VS Code extension now requires VS Code 1.137 or newer.
-- Remove the Zed extension and Tree-sitter grammar, including their CI checks
-  and setup documentation.
+- Add safe hosted console input/output and compiler-checked `print`, `println`,
+  and `printf` for primitives and custom printable values. Check literal format
+  strings and heterogeneous arguments at compile time.
+- Add bounded UTF-8 console and file helpers, command output capture,
+  environment conveniences, native clocks, and runnable standard-library
+  onboarding guides.
+- Add checked `core/slice.split_at_mut` with disjoint mutable views, nested
+  splitting, and source lifetimes preserved through moves and returns.
+- Support checked shared-reference collection elements and shared-arena owned
+  strings. Add scoped `try_update` mutation for vector elements and hash-map
+  values, retaining ownership and allocator dependencies on success or error.
+  Result-bearing and exclusive-reference elements remain restricted.
+- Fix ownership tracking across `break` and `continue`, including loop-carried
+  borrows, moved values, and reachable exits.
+- Add bounded hosted HTTP/HTTPS clients and fluent `app.new()` and portable
+  `application.builder()` APIs. Provide method shortcuts, named handlers,
+  middleware, route diagnostics, text/HTML/JSON/redirect responses, request
+  accessors, explicit rejections, and owned in-process test responses.
+- Add `std/web/app.Server` with bounded default storage, grouped limits and
+  timeouts, custom buffers, cooperative cancellation, and explicit serial or
+  concurrent execution. The bounded HTTP reactor supports connection reuse and
+  ordered pipelined requests.
+- Add `std/web/https` with bounded PEM loading, file-specific startup diagnostics,
+  and `run_with(address, https.files(certificate, key))`. Support concurrent TLS
+  handshakes and requests, HTTPS keep-alive, and graceful connection shutdown;
+  TLS remains an explicit import.
+- Keep large internal function arguments and results in caller-owned storage
+  and compact aggregate copies before LLVM lowering, reducing memory use for
+  composed web applications. Exported and C signatures stay stable. Allow up
+  to 4,096 generic specializations with a separate nesting limit of 64.
+- Open bundled standard-library definitions as read-only sources in VS Code,
+  with hover and navigation inside them. Refresh diagnostics and navigation
+  when imported files change, preserving unsaved buffers. Add printing
+  completions, signature help, and snippets.
+- Make frontend tests and Clippy runnable without LLVM through
+  `--no-default-features`. Expand native Windows filesystem, process, console,
+  thread, synchronization, and networking coverage at `-O0` and `-O3`. Give
+  refused-connection checks a fresh deadline and actionable error diagnostics.
+- Migrate the backend from Inkwell to llvm-sys 231.0.0 and LLVM 23.1.1; source
+  builds now use `LLVM_SYS_231_PREFIX`. Update Rust to 1.98.1, refresh Rust/npm
+  dependencies, and adopt TypeScript 7. The VS Code extension requires
+  VS Code 1.137 or newer.
+- Slim compiler archives to the executable, installation instructions, and
+  license notices; documentation and examples remain available online and in
+  the source repository. Fix Windows LLVM support-library and linker handling.
+- Remove `std/text_unicode` and its Unicode data license notice; text trimming
+  uses `Text.trim_ascii`. Remove the Zed extension and Tree-sitter grammar.
+
+The compiler still implements a subset of the language design. See the
+[implementation status and limits](https://jotrorox.github.io/dodo/implementation/)
+for supported behavior and remaining work.
 
 ## 0.1.2 — 2026-09-14
 

@@ -1,11 +1,11 @@
 ---
 title: "Syntax and expressions"
-description: "Implemented syntax, inference, constants, control flow, and numeric behavior in Dodo 0.1.2."
+description: "Implemented syntax, inference, constants, control flow, and numeric behavior in Dodo 0.1.3."
 section: "Language reference"
 order: 210
 ---
 
-This page describes syntax accepted by Dodo 0.1.2. Start with
+This page describes syntax accepted by Dodo 0.1.3. Start with
 [your first program](first-program.md) for a short introduction, or use the
 [full language specification](language-spec-0.1.md) for the design's complete
 syntax and worked examples.

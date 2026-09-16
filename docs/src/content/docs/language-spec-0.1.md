@@ -33,7 +33,7 @@ accepted for compatibility. The ownership categories are unchanged.
 **Implementation-defined** means an implementation must document its choice for
 each supported target; a program may depend on that documented choice, but may
 then require changes on another implementation or target. Appendix C records
-these choices for compiler 0.1.2. **Unspecified** means a choice need not be
+these choices for compiler 0.1.3. **Unspecified** means a choice need not be
 documented and may vary between evaluations. **Undefined behavior** means a
 program has violated a runtime validity requirement and this specification
 imposes no requirements on that execution. An unsafe precondition violation is
@@ -1235,7 +1235,7 @@ unsafe fn write32(address: usize, value: u32) -> void
 **CORE-MMIO.** These operations address device memory directly without fabricating an ordinary
 mutable reference. Only access widths supported by the target are accepted.
 Unsupported widths must not silently become multiple narrower accesses. The
-0.1.2 profile accepts 8, 16, 32, and 64 bits up to the target pointer width;
+0.1.3 profile accepts 8, 16, 32, and 64 bits up to the target pointer width;
 actual device legality is a platform precondition (ID-HW).
 
 Valid addresses, permissions, device side effects, and configuration are unsafe
@@ -1725,16 +1725,16 @@ not establish another target's ABI or hardware behavior.
 
 An implementation must publish choices for the IDs below, including the compiler
 version and target. Changing an implementation-defined choice must not silently
-change the source-level rules above. The following is the compiler 0.1.2 profile;
+change the source-level rules above. The following is the compiler 0.1.3 profile;
 tests constrain the documented choice, not every possible conforming choice.
 
-| Choice | Compiler 0.1.2 definition and evidence |
+| Choice | Compiler 0.1.3 definition and evidence |
 | --- | --- |
 | ID-TARGET: widths, endianness, alignment, object format | Uses the selected LLVM 23 target triple and its data layout. Default is the compiler host triple. `x86_64-unknown-linux-gnu` has 64-bit pointers and little-endian storage; `i686-unknown-linux-gnu` has 32-bit pointers and little-endian storage; `powerpc64-unknown-linux-gnu` has 64-bit pointers and big-endian storage. Scalar/aggregate alignment is the target data layout's ABI alignment, observable with core layout queries; emitted IR must include the triple/data layout. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `aggregate_layout_tags_and_string_byte_lengths` (E). |
 | ID-FLOAT: floating environment and constant precision | Runtime uses LLVM non-fast floating operations with default round-to-nearest, ties-to-even. Native tests assume gradual underflow and masked floating exceptions; no source facility changes rounding/exception modes. Constant scalar evaluation computes floating operations in host binary64 and rounds to the expression's type at each node; integer-to-f32 constants pass through binary64. This can introduce an extra rounding compared with runtime conversion. Decimal literal conversion also passes through binary64. An explicit constant floating cast to f32 must be finite and in range even if its operand is already f32. NaN payload/sign is unspecified. Evidence: `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap` (E); `spec::constant_float_precision_is_documented_separately_from_runtime` (E/R). |
 | ID-PTR: address representation | The integral default-address-space profile uses LLVM data pointers and integer casts, with zero as null; pointer offsets use element-scaled address computation. No hidden runtime provenance table is maintained. Non-default address spaces and capability/non-integral pointer interfaces are outside this profile; LLVM emission alone does not establish their conformance. Evidence: `spec::pointer_integer_round_trip_offsets_and_byte_access` (E), `unsafe_pointer_conversions_and_unsupported_abi_are_rejected` (R). |
 | ID-C: target C argument/result passing | Uses LLVM C calling convention. On x86 SysV, i8/i16 use sign extension and u8/u16/bool use zero extension on declarations and calls; Windows uses its target convention without those SysV attributes. Other scalar and pointer passing follows the selected target. Duplicate extern declarations are compared by lowered LLVM function type, which does not distinguish signed/unsigned integers of the same width; the author must keep those contracts consistent. Evidence: `spec::c_scalar_results_and_struct_pointer_layout_interoperate` (E), `incompatible_lowered_foreign_declarations_fail_before_linking` (R), `regressions::foreign_narrow_integer_arguments_follow_the_c_abi` (E), `compiler::repeated_foreign_declarations_across_packages_share_a_c_symbol` (E). |
-| ID-NATIVE: Dodo ABI and symbols | Parameters/results lower directly to the scalar/aggregate LLVM types in sections 4.8 and 16.2, using LLVM's default calling convention without C aggregate classification. Symbols are `dodo.<root-package>.<qualified-name>`. Root declarations have no package prefix in qualified-name; imported packages use their name when unique and generated `__dodo_package_...` prefixes when necessary. Root-package public non-generic functions and methods, root main, and all C ABI definitions have external linkage; imported Dodo functions and generic instances have internal linkage. Unreachable internal functions are eliminated at every optimization level, following lowered references including implicit drops and callback addresses. ELF and COFF functions use separate code sections for linker garbage collection. Mangling of generic instances and collision prefixes is compiler-internal and may depend on the loaded graph. Link native objects only with a matching compiler/target configuration. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `compiler::generic_struct_methods_keep_borrowed_returns` (E). |
+| ID-NATIVE: Dodo ABI and symbols | Parameters/results use the scalar/aggregate LLVM types in sections 4.8 and 16.2 with LLVM's default calling convention and no C aggregate classification. Internal parameters/results larger than 1,024 target ABI bytes pass indirectly through caller-owned storage; exported and C signatures retain direct lowering. Symbols are `dodo.<root-package>.<qualified-name>`. Root declarations have no package prefix in qualified-name; imported packages use their name when unique and generated `__dodo_package_...` prefixes when necessary. Root-package public non-generic functions and methods, root main, and all C ABI definitions have external linkage; imported Dodo functions and generic instances have internal linkage. Unreachable internal functions are eliminated at every optimization level, following lowered references including implicit drops and callback addresses. ELF and COFF functions use separate code sections for linker garbage collection. Mangling of generic instances and collision prefixes is compiler-internal and may depend on the loaded graph. Link native objects only with a matching compiler/target configuration. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `compiler::generic_struct_methods_keep_borrowed_returns` (E). |
 | ID-FS: filesystem identity | Uses the host filesystem's path canonicalization and case sensitivity; directory entries are sorted using canonical host paths. Symlink entries are excluded from directory source enumeration, but an explicit input/import path may resolve through a symlink. No registry, network resolver, or lockfile participates. Evidence: `spec::canonical_package_identity_and_symlink_enumeration` (E, Unix), `package::root_directory_collects_only_immediate_dodo_files` (A), `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected` (R). |
 | ID-LIB: bundled platform selection | Imports are embedded in the compiler. `std/{platform,fs,process,env,thread,sync,net,tls,web}/native` selects `linux` for x86_64 Linux GNU and `windows` for x86_64 Windows GNU/MSVC. An explicit mismatching adapter or unsupported target is rejected. Portable packages need no hosted adapter. Evidence: `tests/platform_library.rs` and `packages::portable_package_dependencies_are_independent_and_reserved` (A/R). |
 | ID-RUNTIME: startup and linking | Hosted builds use a native C linker driver. Importing std/env initializes its argument runtime from the C main arguments before source main; other library facilities initialize through explicit calls. Raw object/IR emission supplies no startup. Freestanding startup, linker scripts, system libraries, and OS exit-status encoding are supplied by the target/toolchain. Evidence: `spec::hosted_entry_signatures_and_c_definitions` (A/R/E), `tests/env_library.rs` (E), `compiler::emits_llvm_ir_bitcode_assembly_and_object_files` (T). |
@@ -1750,9 +1750,10 @@ partial field moves, a package registry, package initializers, re-exports,
 variadic/C aggregate-by-value calls, inline assembly, user section/alignment/export
 attributes, interrupt ABI declarations, and panic-handler registration are not
 part of 0.1. The compiler must reject syntax presented as these features rather
-than assign it an undocumented meaning. General checked mutable slice splitting,
-DMA abstractions, and interrupt-safe allocators require future library/compiler
-work. The named rules above replace the former open questions about fundamental
+than assign it an undocumented meaning. Checked mutable slice splitting is
+available through `core/slice.split_at_mut` and its compiler-recognized
+`SplitMut<T>` result. General user-defined disjointness proofs, DMA abstractions,
+and interrupt-safe allocators require future library/compiler work. The named rules above replace the former open questions about fundamental
 execution, representation, provenance, ABI, and packages; they do not assert a
 formal proof of memory safety or complete platform support.
 

@@ -1,11 +1,11 @@
 ---
 title: "Ownership and borrowing"
-description: "Copy and move rules, borrow lifetimes, borrowed returns, and cleanup in Dodo 0.1.2."
+description: "Copy and move rules, borrow lifetimes, borrowed returns, and cleanup in Dodo 0.1.3."
 section: "Language reference"
 order: 220
 ---
 
-These are the ownership rules and checker limits implemented in Dodo 0.1.2.
+These are the ownership rules and checker limits implemented in Dodo 0.1.3.
 For pattern matching and mandatory error handling, continue to
 [patterns and Results](patterns-and-results.md).
 

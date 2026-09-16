@@ -2,6 +2,7 @@ package native_checks
 import "std/net"
 import "std/net/native"
 import "std/io"
+import "std/console"
 import "core/bytes"
 
 fn read_byte(connection: &mut native.TcpConnection, expected: u8) -> i32!net.Error {
@@ -124,13 +125,16 @@ fn tcp(ip: net.IpAddress) -> i32!net.Error {
     }
     client.close()?
     listener.close()?
-    // The closed port deterministically refuses a new connection.
-    match native.connect_with(&address, &operation, &mut clock, &cancel) {
+    // Use a fresh deadline: Windows can retry a refused loopback connection
+    // before reporting it, and the earlier I/O must not consume this budget.
+    refused := net.Operation.until(clock.now_ms() + 10000)
+    match native.connect_with(&address, &refused, &mut clock, &cancel) {
         ok(_) => {
             return ok(17)
         }
         err(reason) => {
             if reason.kind != net.ErrorKind.ConnectionRefused {
+                console.stderr().printf("expected ConnectionRefused, got {}\n", reason)!
                 return ok(18)
             }
         }
@@ -290,7 +294,8 @@ fn main() -> i32 {
         ok(code) => {
             return code
         }
-        err(_) => {
+        err(reason) => {
+            console.stderr().printf("native networking failed: {}\n", reason)!
             return 99
         }
     }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.3 — 2026-09-16
+
+- Open bundled standard-library definitions as read-only documents with hover
+  and navigation, and refresh them when the language server restarts.
+- Refresh diagnostics and navigation when imported files change on disk,
+  preserving unsaved editor buffers.
+- Add printing completions, signature help, and a checked `printf` snippet.
+- Update language-client and build dependencies, including TypeScript 7;
+  require VS Code 1.137 or newer and Dodo 0.1.3 for the new server features.
+- Publish the VSIX alongside the Dodo 0.1.3 compiler in GitHub Releases.
+
 ## 0.1.2 — 2026-09-14
 
 - Publish the VSIX alongside the Dodo 0.1.2 compiler in GitHub Releases.
