@@ -174,7 +174,8 @@ class Peer:
         self.pid = process.pid
         try:
             stdout, stderr = process.communicate(timeout=30)
-            assert process.returncode == 0, (process.returncode, stdout, stderr)
+            assert process.returncode == 0, (process.returncode, stdout, stderr,
+                                             self.requests[-1:], self.errors)
         finally:
             if process.poll() is None:
                 process.kill()

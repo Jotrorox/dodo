@@ -28,12 +28,16 @@ fn rejected(url: &[u8], kind: hosting.ErrorKind, cap: usize) -> void!hosting.Err
     config.body_bytes = 8
     config.header_bytes = 512
     config.max_redirects = 2
-    config.request_timeout_ms = 150
+    // Protocol/limit errors must not race the CI scheduler. Only the stalled
+    // response case intentionally uses a short deadline.
+    config.request_timeout_ms = 5000
+    if kind == hosting.ErrorKind.TimedOut { config.request_timeout_ms = 150 }
     client := hosted.Client.new(&mut workspace, config)?
     body := [0u8; 32]
     match client.get(url, &mut body[..cap]) {
         ok(_) => { assert(false, "expected request failure") }
         err(reason) => {
+            if reason.kind != kind { console.stderr().println(&reason)! }
             assert(reason.kind == kind, "wrong hosted error")
             match client.header(b"X-Test", 0) { some(_) => { assert(false, "stale header") } none => {} }
         }

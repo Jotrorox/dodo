@@ -45,7 +45,8 @@ navigation. The language specification remains version 0.1.
 - Make frontend tests and Clippy runnable without LLVM through
   `--no-default-features`. Expand native Windows filesystem, process, console,
   thread, synchronization, and networking coverage at `-O0` and `-O3`. Give
-  refused-connection checks a fresh deadline and actionable error diagnostics.
+  refused-connection checks a fresh deadline and actionable error diagnostics;
+  separate HTTP protocol-error checks from short timeout-test deadlines.
 - Migrate the backend from Inkwell to llvm-sys 231.0.0 and LLVM 23.1.1; source
   builds now use `LLVM_SYS_231_PREFIX`. Update Rust to 1.98.1, refresh Rust/npm
   dependencies, and adopt TypeScript 7. The VS Code extension requires
