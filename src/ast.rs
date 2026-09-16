@@ -224,6 +224,8 @@ pub struct Program {
     pub imports: Vec<String>,
     /// Explicit local names, paired with their original import paths.
     pub import_aliases: Vec<(String, String)>,
+    /// Compiler-generated aliases, normalized across sibling source files.
+    pub implicit_import_aliases: Vec<(String, String)>,
     pub structs: Vec<Struct>,
     pub enums: Vec<Enum>,
     pub functions: Vec<Function>,

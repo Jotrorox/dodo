@@ -1,0 +1,43 @@
+package json_example
+
+import "std/encoding/json"
+import "std/bytes"
+
+@derive(Json)
+struct Person {
+    name: json.String
+    age: u8
+    nickname: Option<json.String>
+}
+
+fn round_trip() -> void!json.Error {
+    source := b"{\"name\":\"Ada\",\"age\":36,\"nickname\":null}"
+    person := json.decode::<Person>(source)?
+    assert_eq(person.age, 36u8)
+
+    storage := [0u8; 128]
+    written := json.to_slice(&person, &mut storage)?
+    assert(bytes.equal(&storage[..written], source))
+
+    created := Person {
+        name: json.String.from_str("Grace"),
+        age: 85,
+        nickname: none,
+    }
+    second := [0u8; 128]
+    size := json.to_slice(&created, &mut second)?
+    decoded := json.decode::<Person>(&second[..size])?
+    assert_eq(decoded.age, 85u8)
+    return ok()
+}
+
+fn main() -> i32 {
+    match round_trip() {
+        ok() => {
+            return 0
+        },
+        err(_) => {
+            return 1
+        },
+    }
+}

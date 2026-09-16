@@ -1,0 +1,74 @@
+package json
+
+import "core/mem"
+import "std/io"
+
+// User-defined codecs have encode_json(encoder) and static decode_json(value).
+// @derive(Json) generates these same ordinarily checked methods.
+pub fn decode<T>(input: &[u8]) -> T!Error from(input) {
+    value := parse(input)?
+    return T.decode_json(value)
+}
+pub fn decode_str<T>(input: &str) -> T!Error from(input) {
+    return decode::<T>(mem.str_bytes(input))
+}
+pub fn from_value<T>(value: Value) -> T!Error from(value) {
+    return T.decode_json(value)
+}
+pub fn encode<T, W>(value: &T, sink: &mut W) -> usize!Error {
+    encoder: Encoder<W> = Encoder.new(sink)
+    value.encode_json(&mut encoder)?
+    return encoder.finish()
+}
+pub fn encode_pretty<T, W>(value: &T, sink: &mut W) -> usize!Error {
+    encoder: Encoder<W> = Encoder.pretty(sink)
+    value.encode_json(&mut encoder)?
+    return encoder.finish()
+}
+pub fn to_slice<T>(value: &T, destination: &mut[u8]) -> usize!Error {
+    sink := io.MemoryWriter.new(destination)
+    return encode(value, &mut sink)
+}
+pub fn to_slice_pretty<T>(value: &T, destination: &mut[u8]) -> usize!Error {
+    sink := io.MemoryWriter.new(destination)
+    return encode_pretty(value, &mut sink)
+}
+pub fn validate(input: &[u8]) -> void!Error {
+    value := parse(input)?
+    core.drop(value)
+    return ok()
+}
+
+// Read one complete document to EOF into explicit caller-owned storage. When
+// full, std/io probes and consumes one byte to distinguish exact fit from
+// exhaustion. Returned views borrow storage, never the reader.
+pub fn parse_reader<R>(reader: &mut R, storage: &mut[u8]) -> Value!Error from(storage) {
+    report := match io.read_bounded(reader, storage) {
+        ok(report) => {
+            report
+        },
+        err(reason) => {
+            return err(failure(ErrorKind.Io, reason.transferred))
+        },
+    }
+    if!report.eof {
+        return err(failure(ErrorKind.BufferFull, report.read))
+    }
+    return parse(&storage[..report.read])
+}
+pub fn decode_reader<T, R>(reader: &mut R, storage: &mut[u8]) -> T!Error from(storage) {
+    value := parse_reader(reader, storage)?
+    return T.decode_json(value)
+}
+
+// Transform a validated document without interpreting numeric lexemes.
+pub fn compact<W>(input: &[u8], sink: &mut W) -> usize!Error {
+    value := parse(input)?
+    encoder: Encoder<W> = Encoder.new(sink)
+    encoder.value(&value)?
+    return encoder.finish()
+}
+pub fn pretty<W>(input: &[u8], sink: &mut W) -> usize!Error {
+    value := parse(input)?
+    return encode_pretty(&value, sink)
+}

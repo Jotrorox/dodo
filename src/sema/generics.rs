@@ -850,6 +850,7 @@ impl Expander {
             && let Some(prefix) = qualified_name(receiver)
             && !self.locals.contains_key(&prefix)
             && (self.signatures.contains_key(&format!("{prefix}.{name}"))
+                || substitutions.contains_key(&prefix)
                 || self.known_enums.contains_key(&prefix)
                 || intrinsic_result_type(&format!("{prefix}.{name}"), &[], &[]).is_some())
         {
@@ -1058,6 +1059,24 @@ impl Expander {
                 type_args,
                 args,
             } => {
+                // Static methods on a type parameter must follow the same
+                // substitution as parameter and return types. This enables
+                // ordinary checked protocols such as T.decode_json(value).
+                if let Some((owner, method)) = name.rsplit_once('.')
+                    && !self.signatures.contains_key(name)
+                    && let Some(replacement) = substitutions.get(owner).cloned()
+                {
+                    let method = method.to_owned();
+                    let mut owner_type = replacement;
+                    self.ty(&mut owner_type, substitutions, span)?;
+                    let Type::Named(owner) = owner_type else {
+                        return Err(Diagnostic::new(
+                            span,
+                            format!("type `{owner_type}` has no static method `{method}`"),
+                        ));
+                    };
+                    *name = format!("{owner}.{method}");
+                }
                 for t in type_args.iter_mut() {
                     self.ty(t, substitutions, span)?;
                 }

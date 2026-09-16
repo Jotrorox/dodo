@@ -22,6 +22,14 @@ fn collect(directory: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn main() {
+    // LLVM's recursive instruction selection can exhaust Windows' 1 MiB
+    // default stack when compiling generated codecs, especially at -O0.
+    // Reserve address space up front; Windows commits stack pages on demand.
+    if env::var("TARGET").is_ok_and(|target| target.ends_with("windows-msvc"))
+        && env::var_os("CARGO_FEATURE_LLVM").is_some()
+    {
+        println!("cargo:rustc-link-arg-bin=dodo=/STACK:8388608");
+    }
     // Use the compiler's Rust target, including when cross-compiling Dodo.
     // Frontend package loading must not depend on LLVM to select host adapters.
     println!(

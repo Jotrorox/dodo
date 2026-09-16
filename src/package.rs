@@ -174,7 +174,6 @@ pub fn load_for_editor(
 }
 
 /// Look up a compiler-owned source by its internal path, never on disk.
-#[cfg(feature = "llvm")]
 pub(crate) fn bundled_source(path: &Path) -> Option<&'static str> {
     let name = path.strip_prefix("<stdlib>").ok()?.to_str()?;
     let name = name.replace('\\', "/");
@@ -194,12 +193,18 @@ pub(crate) fn load_bundled_for_editor(path: &Path, target: &str) -> Result<Loade
         .and_then(|path| path.to_str())
         .and_then(|name| name.strip_suffix(".dodo"))
         .ok_or_else(|| "invalid bundled source path".to_owned())?;
-    load_internal(
-        ModuleId::Bundled(name.replace('\\', "/")),
-        &BTreeMap::new(),
-        target,
-        true,
-    )
+    let mut name = name.replace('\\', "/");
+    // Directory packages must be checked with their siblings, just like local
+    // directory packages. Keep the individual source paths for navigation.
+    if let Some((parent, _)) = name.rsplit_once('/')
+        && !BUNDLED_SOURCES.iter().any(|(import, _)| *import == parent)
+        && let Some(source) = bundled_source(path)
+        && let Ok(unit) = parser::parse(source)
+        && parent.rsplit('/').next() == Some(unit.package.as_str())
+    {
+        name = parent.to_owned();
+    }
+    load_internal(ModuleId::Bundled(name), &BTreeMap::new(), target, true)
 }
 
 fn load_internal(
@@ -403,7 +408,20 @@ impl Loader<'_> {
         self.loading.push(id.clone());
         let files = match &id {
             ModuleId::Local(_) => source_files(&path, self.overlays)?,
-            ModuleId::Bundled(_) => vec![path.clone()],
+            ModuleId::Bundled(import) => {
+                if BUNDLED_SOURCES.iter().any(|(name, _)| name == import) {
+                    vec![path.clone()]
+                } else {
+                    BUNDLED_SOURCES
+                        .iter()
+                        .filter(|(name, _)| {
+                            name.rsplit_once('/')
+                                .is_some_and(|(parent, _)| parent == import)
+                        })
+                        .map(|(name, _)| ModuleId::Bundled((*name).to_owned()).path())
+                        .collect()
+                }
+            }
         };
         let directory = if path.is_dir() {
             path.as_path()
@@ -411,13 +429,13 @@ impl Loader<'_> {
             path.parent().unwrap_or(Path::new("."))
         };
         let mut program = Program::default();
+        let mut units = Vec::new();
+        let first_source = self.sources.len();
         let source_paths = files.clone();
         for file in files {
             let text = match &id {
-                ModuleId::Bundled(import) => BUNDLED_SOURCES
-                    .iter()
-                    .find(|(name, _)| name == import)
-                    .map(|(_, text)| (*text).to_owned())
+                ModuleId::Bundled(import) => bundled_source(&file)
+                    .map(str::to_owned)
                     .ok_or_else(|| format!("unknown standard library import `{import}`"))?,
                 ModuleId::Local(_) => match self.overlays.get(&file) {
                     Some(text) => text.clone(),
@@ -477,6 +495,49 @@ impl Loader<'_> {
                 .checked_add(self.sources.last().map_or(0, |source| source.text.len()))
                 .and_then(|value| value.checked_add(1))
                 .ok_or_else(|| "source input is too large".to_owned())?;
+            units.push(unit);
+        }
+        // A derive can introduce an import without a source-level alias. Pick
+        // names that are fresh across the entire directory, then rewrite each
+        // source independently before its names enter the shared namespace.
+        let mut implicit = BTreeMap::new();
+        let mut candidate = 0usize;
+        for unit in &units {
+            for (import, _) in &unit.implicit_import_aliases {
+                if implicit.contains_key(import) {
+                    continue;
+                }
+                let alias = loop {
+                    let alias = format!("__dodo_import_{candidate}");
+                    candidate += 1;
+                    if !self.sources[first_source..]
+                        .iter()
+                        .any(|source| source.text.contains(&alias))
+                    {
+                        break alias;
+                    }
+                };
+                implicit.insert(import.clone(), alias);
+            }
+        }
+        for mut unit in units {
+            let renames = unit
+                .implicit_import_aliases
+                .iter()
+                .map(|(import, name)| (name.clone(), implicit[import].clone()))
+                .collect();
+            rename_implicit_imports(&mut unit, &renames);
+            for (import, alias) in &mut unit.import_aliases {
+                if unit
+                    .implicit_import_aliases
+                    .contains(&(import.clone(), alias.clone()))
+                {
+                    *alias = implicit[import].clone();
+                }
+            }
+            for (import, alias) in &mut unit.implicit_import_aliases {
+                *alias = implicit[import].clone();
+            }
             append(&mut program, unit);
         }
         let alias = program.package.clone();
@@ -504,6 +565,12 @@ impl Loader<'_> {
         import_aliases.insert(alias.clone(), id.clone());
         let mut explicit_aliases = BTreeMap::new();
         for (import, name) in &program.import_aliases {
+            if program
+                .implicit_import_aliases
+                .contains(&(import.clone(), name.clone()))
+            {
+                continue;
+            }
             if let Some(previous) = explicit_aliases.insert(import.clone(), name.clone())
                 && previous != *name
             {
@@ -547,13 +614,21 @@ impl Loader<'_> {
                 .ok_or_else(|| format!("invalid import path `{import}`"))?;
             let local_alias = explicit_aliases
                 .get(&import)
+                .or_else(|| implicit.get(&import))
                 .map_or(import_alias, String::as_str);
             let standard = matches!(import.split('/').next(), Some("core" | "alloc" | "std"));
             let dependency = if INTRINSIC_IMPORTS.contains(&import.as_str()) {
                 ModuleId::Bundled(import.clone())
             } else if standard {
                 let selected = self.native_import(&import)?;
-                if !BUNDLED_SOURCES.iter().any(|(name, _)| *name == selected) {
+                if !selected.contains('/')
+                    || !BUNDLED_SOURCES.iter().any(|(name, _)| {
+                        *name == selected
+                            || name
+                                .rsplit_once('/')
+                                .is_some_and(|(parent, _)| parent == selected)
+                    })
+                {
                     return Err(format!(
                         "unknown standard library import `{import}` in {}",
                         path.display()
@@ -585,6 +660,9 @@ impl Loader<'_> {
                     path.display()
                 )
                 .into());
+            }
+            if let Some(name) = implicit.get(&import) {
+                import_aliases.insert(name.clone(), dependency);
             }
         }
         self.loading.pop();
@@ -691,10 +769,41 @@ fn resolve_import(
 fn append(target: &mut Program, mut source: Program) {
     target.imports.append(&mut source.imports);
     target.import_aliases.append(&mut source.import_aliases);
+    target
+        .implicit_import_aliases
+        .append(&mut source.implicit_import_aliases);
     target.structs.append(&mut source.structs);
     target.enums.append(&mut source.enums);
     target.functions.append(&mut source.functions);
     target.constants.append(&mut source.constants);
+}
+
+// Only generated functions can mention a fresh implicit alias. Reuse the AST
+// name visitor without checking unrelated import visibility at this early pass.
+fn rename_implicit_imports(program: &mut Program, aliases: &BTreeMap<String, String>) {
+    if aliases.is_empty() {
+        return;
+    }
+    let empty = BTreeSet::new();
+    let names = Names {
+        prefix: "",
+        symbols: &empty,
+        known_packages: &empty,
+        visible_packages: aliases,
+        missing_imports: RefCell::new(BTreeSet::new()),
+    };
+    for function in &mut program.functions {
+        let generics = function.generics.iter().cloned().collect();
+        let mut locals = BTreeSet::new();
+        for parameter in &mut function.params {
+            locals.insert(parameter.name.clone());
+            names.ty(&mut parameter.ty, &generics);
+        }
+        names.ty(&mut function.ret, &generics);
+        if let Some(body) = &mut function.body {
+            names.block(body, &mut locals, &generics);
+        }
+    }
 }
 
 /// Rewrite declarations and their references while preserving local shadowing.
@@ -1273,6 +1382,25 @@ fn shift_stmt(statement: &mut Stmt, offset: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "llvm")]
+    #[test]
+    fn bundled_directory_editor_loads_all_sibling_sources() {
+        let mut loaded = super::load_bundled_for_editor(
+            std::path::Path::new("<stdlib>/std/encoding/json/encoder.dodo"),
+            env!("DODO_HOST_TARGET"),
+        )
+        .unwrap();
+        for file in ["api", "encoder", "ownership", "value"] {
+            assert!(loaded.sources.iter().any(|source| {
+                source
+                    .path
+                    .ends_with(format!("std/encoding/json/{file}.dodo"))
+            }));
+        }
+        crate::sema::check(&mut loaded.program)
+            .unwrap_or_else(|error| panic!("{}", loaded.render(&error)));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);

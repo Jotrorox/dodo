@@ -4977,10 +4977,22 @@ fn validate_public_interfaces(program: &Program) -> Check<()> {
         visit(&constant.ty, constant.span, &[], &private)?;
     }
     for function in program.functions.iter().filter(|f| f.public) {
-        for parameter in &function.params {
-            visit(&parameter.ty, parameter.span, &function.generics, &private)?;
+        let mut allowed = function.generics.clone();
+        if let Some((owner, _)) = function.name.rsplit_once('.')
+            && program
+                .structs
+                .iter()
+                .any(|structure| structure.name == owner)
+        {
+            // Public methods of a private type are usable through generic
+            // protocols without publishing that type's private name. The
+            // method may therefore mention its own receiver/return type.
+            allowed.push(owner.to_owned());
         }
-        visit(&function.ret, function.span, &function.generics, &private)?;
+        for parameter in &function.params {
+            visit(&parameter.ty, parameter.span, &allowed, &private)?;
+        }
+        visit(&function.ret, function.span, &allowed, &private)?;
     }
     Ok(())
 }

@@ -144,13 +144,15 @@ def native_sources(source):
         if path in seen:
             return
         seen.add(path)
-        for name in re.findall(r'^\s*import\s+"([^"]+)"', path.read_text(), re.MULTILINE):
+        for name in re.findall(r'^\s*import\s+"([^"]+)"', path.read_text(encoding="utf-8"), re.MULTILINE):
             if not name.startswith(("std/", "core/", "alloc/")):
                 continue
             if name.endswith("/native"):
                 name = name[:-6] + "windows"
-            dependency = ROOT / "stdlib" / (name + ".dodo")
-            if dependency.is_file():
+            module = ROOT / "stdlib" / (name + ".dodo")
+            directory = ROOT / "stdlib" / name
+            dependencies = [module] if module.is_file() else sorted(directory.glob("*.dodo"))
+            for dependency in dependencies:
                 boundary = dependency.parent / "runtime.c"
                 if boundary.is_file() and dependency.stem in ("linux", "windows"):
                     runtime.add(boundary)

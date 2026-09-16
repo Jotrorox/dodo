@@ -22,6 +22,7 @@ compiler binary: if an older binary reports an unknown package or method,
 | Get an environment variable | `env.get` with `env.Workspace.new()` | [Environment](environment.md) |
 | Run a command | `process.Command.new` and `output` | [Processes](processes.md) |
 | Build a string | `text.Builder.new` with a byte array | [Text](text.md) |
+| Decode or encode JSON | `@derive(Json)` and `json.decode<T>` | [JSON](json.md) |
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
@@ -54,7 +55,7 @@ optional adapters for enum errors. Check I/O prefix counts before retrying.
 
 ## Portable and hosted functionality
 
-Portable core, allocation, bytes, text, collections, math, hashes, time values,
+Portable core, allocation, bytes, text, JSON, collections, math, hashes, time values,
 DNS/TLS contracts, HTTP/1.1 protocol engines and web routing require no OS,
 libc, global allocator, scheduler or garbage collector. Portable fixture checks
 emit `wasm32-unknown-unknown` and `thumbv6m-none-eabi` objects at O0 and O3.
@@ -71,7 +72,7 @@ needs OpenSSL 3.5 or newer. See [platform adapters](platform.md) and [TLS](tls.m
 OS/C-library calls may allocate internally even when Dodo storage is fixed.
 
 HTTP/1.1 clients, servers, streaming framing, and web routing **are implemented**.
-HTTP/2, HTTP/3/QUIC, WebSockets, JSON/TOML serialization and general peripheral
+HTTP/2, HTTP/3/QUIC, WebSockets, TOML serialization and general peripheral
 drivers are remaining work. MMIO primitives alone do not configure a device.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
 remain relevant: check them when using references or Results as stored elements.
@@ -90,6 +91,7 @@ importing a parent does not import all its children.
 | [Console I/O](console.md) | `std/console` | Hosted. |
 | [Formatting](formatting.md) | `std/fmt`, `std/fmt/errors`, `std/fmt_alloc` | Portable. |
 | [UTF-8 text](text.md) | `std/text`, `std/text_alloc`, `std/text_shared` | Portable. |
+| [JSON](json.md) | `std/encoding/json` | Portable; borrowed views and caller-supplied output storage. |
 | [Collections](collections.md) | `std/collections`, `std/collections/deque`, `std/collections/fixed_deque`, `std/collections/fixed_map`, `std/collections/fixed_set`, `std/collections/fixed_vector`, `std/collections/hash_map`, `std/collections/hash_set`, `std/collections/heap`, `std/collections/ordered_map`, `std/collections/ordered_set`, `std/collections/shared_deque`, `std/collections/shared_hash_map`, `std/collections/shared_hash_set`, `std/collections/shared_heap`, `std/collections/shared_ordered_map`, `std/collections/shared_ordered_set`, `std/collections/shared_vector`, `std/collections/vector` | Portable. |
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |

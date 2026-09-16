@@ -42,6 +42,9 @@ Only directly imported package names are available in a package.
 Declarations and fields are private unless `pub`; public functions cannot expose
 private types. Public enum variants are available with the enum. Struct methods
 are statically dispatched; associated functions use `Type.name(...)`.
+Public methods of a private struct may mention their own struct type, allowing
+the struct to implement generic protocols without publishing its name. Other
+private types remain prohibited in public signatures.
 
 An import makes public declarations available to the source checker; it does
 not export every imported function from the compiled object. The compiler keeps

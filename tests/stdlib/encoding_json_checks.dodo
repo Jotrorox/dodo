@@ -1,0 +1,294 @@
+package encoding_json_checks
+
+import "std/encoding/json"
+import "std/bytes"
+import "std/io"
+
+@derive(Json)
+struct Detail {
+    enabled: bool
+    samples: [2]u16
+}
+
+@derive(Json)
+struct Person {
+    @json_name("displayName")
+    name: json.String
+    age: u8
+    detail: Detail
+    nickname: Option<json.String>
+}
+
+@derive(Json)
+@json_deny_unknown
+struct Strict {
+    count: u32
+}
+
+@derive(Json)
+struct Borrowed {
+    text: &str
+}
+
+fn struct_round_trip() -> void!json.Error {
+    source := b"{\"displayName\":\"Ada\",\"age\":36,\"detail\":{\"enabled\":true,\"samples\":[7,65535]},\"nickname\":null}"
+    person := json.decode::<Person>(source)?
+    assert(person.name.equals("Ada"))
+    assert_eq(person.age, 36u8)
+    assert(person.detail.enabled)
+    assert_eq(person.detail.samples[0], 7u16)
+    assert_eq(person.detail.samples[1], 65535u16)
+    match &person.nickname {
+        none => {},
+        some(_) => {
+            assert(false)
+        },
+    }
+    storage := [0u8; 256]
+    count := json.to_slice(&person, &mut storage)?
+    assert(bytes.equal(&storage[..count], source))
+
+    // Missing optional fields, unknown fields, key order, and escaped key names.
+    reordered := json.decode::<Person>(b"{\"extra\":[1,{\"x\":null}],\"detail\":{\"samples\":[7,65535],\"enabled\":true},\"age\":36,\"display\\u004eame\":\"Ada\"}")?
+    assert(reordered.name.equals("Ada"))
+    match &reordered.nickname {
+        none => {},
+        some(_) => {
+            assert(false)
+        },
+    }
+    return ok()
+}
+
+fn string_storage() -> void!json.Error {
+    person := json.decode::<Person>(b"{\"displayName\":\"A\\u0064a\\n\\ud83d\\ude00\",\"age\":36,\"detail\":{\"enabled\":false,\"samples\":[0,1]},\"nickname\":\"Countess\"}")?
+    assert(person.name.equals("Ada\n😀"))
+    assert_eq(person.name.decoded_len(), 8usize)
+    destination := [0u8; 8]
+    decoded := person.name.decode(&mut destination)?
+    assert_eq(decoded, "Ada\n😀")
+    match &person.nickname {
+        some(value) => {
+            assert(value.equals("Countess"))
+        },
+        none => {
+            assert(false)
+        },
+    }
+    match person.name.as_str() {
+        ok(_) => {
+            assert(false)
+        },
+        err(problem) => {
+            assert(problem.kind == json.ErrorKind.EscapedString)
+        },
+    }
+    borrowed := json.decode::<Borrowed>(b"{\"text\":\"hello\"}")?
+    assert_eq(borrowed.text, "hello")
+    match json.decode::<Borrowed>(b"{\"text\":\"he\\u006clo\"}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(problem) => {
+            assert(problem.kind == json.ErrorKind.EscapedString)
+        },
+    }
+    return ok()
+}
+
+fn reject_person(input: &[u8]) {
+    match json.decode::<Person>(input) {
+        ok(_) => {
+            assert(false)
+        },
+        err(_) => {},
+    }
+}
+
+fn schema_errors() {
+    reject_person(b"null")
+    reject_person(b"[]")
+    reject_person(b"{\"displayName\":\"Ada\",\"detail\":{\"enabled\":true,\"samples\":[0,1]}}")
+    reject_person(b"{\"displayName\":null,\"age\":36,\"detail\":{\"enabled\":true,\"samples\":[0,1]}}")
+    reject_person(b"{\"displayName\":\"Ada\",\"age\":256,\"detail\":{\"enabled\":true,\"samples\":[0,1]}}")
+    reject_person(b"{\"displayName\":\"Ada\",\"age\":-1,\"detail\":{\"enabled\":true,\"samples\":[0,1]}}")
+    reject_person(b"{\"displayName\":\"Ada\",\"age\":36.0,\"detail\":{\"enabled\":true,\"samples\":[0,1]}}")
+    reject_person(b"{\"displayName\":\"Ada\",\"age\":36,\"detail\":{\"enabled\":1,\"samples\":[0,1]}}")
+    reject_person(b"{\"displayName\":\"Ada\",\"age\":36,\"detail\":{\"enabled\":true,\"samples\":[0]}}")
+    reject_person(b"{\"displayName\":\"Ada\",\"age\":36,\"detail\":{\"enabled\":true,\"samples\":[0,1,2]}}")
+    reject_person(b"{\"displayName\":\"Ada\",\"age\":36,\"age\":37,\"detail\":{\"enabled\":true,\"samples\":[0,1]}}")
+    reject_person(b"{\"displayName\":\"Ada\",\"age\":36,\"\\u0061ge\":37,\"detail\":{\"enabled\":true,\"samples\":[0,1]}}")
+    match json.decode::<Strict>(b"{\"count\":1,\"extra\":2}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(problem) => {
+            assert(problem.kind == json.ErrorKind.UnknownField)
+        },
+    }
+    match json.decode::<Strict>(b"{}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(problem) => {
+            assert(problem.kind == json.ErrorKind.MissingField)
+        },
+    }
+    match json.decode::<Strict>(b"{\"count\":1e0}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(_) => {},
+    }
+}
+
+fn reject_json(input: &[u8]) {
+    match json.parse(input) {
+        ok(_) => {
+            assert(false)
+        },
+        err(_) => {},
+    }
+}
+
+fn malformed_documents() {
+    reject_json(b"")
+    reject_json(b" \t\r\n")
+    reject_json(b"null false")
+    reject_json(b"01")
+    reject_json(b"+1")
+    reject_json(b"1.")
+    reject_json(b"1e+")
+    reject_json(b"[1,]")
+    reject_json(b"{\"a\":1,}")
+    reject_json(b"{a:1}")
+    reject_json(b"//comment\nnull")
+    reject_json(b"\"\\ud800\"")
+    reject_json(b"\"\\udc00\"")
+    reject_json(b"\"\\ud800\\u0000\"")
+    reject_json(b"\"\\x20\"")
+    reject_json(b"\"unterminated")
+    invalid_utf8 := [34u8, 192, 175, 34]
+    reject_json(&invalid_utf8)
+    unescaped_control := [34u8, 10, 34]
+    reject_json(&unescaped_control)
+}
+
+fn number_precision() -> void!json.Error {
+    exact := json.parse(b"9007199254740993")?
+    assert_eq(exact.as_u64()?, 9007199254740993u64)
+    maximum := json.parse(b"18446744073709551615")?
+    assert_eq(maximum.as_u64()?, 18446744073709551615u64)
+    minimum := json.parse(b"-9223372036854775808")?
+    assert_eq(minimum.as_i64()?, -9223372036854775807i64 - 1i64)
+    match maximum.as_i64() {
+        ok(_) => {
+            assert(false)
+        },
+        err(problem) => {
+            assert(problem.kind == json.ErrorKind.NumberRange)
+        },
+    }
+    fraction := json.parse(b"1.5")?
+    assert_eq(fraction.as_f64()?, 1.5)
+    match fraction.as_i64() {
+        ok(_) => {
+            assert(false)
+        },
+        err(_) => {},
+    }
+    return ok()
+}
+
+fn output_boundaries() -> void!json.Error {
+    value := Strict { count: 42 }
+    empty: [0]u8 = []
+    match json.to_slice(&value, &mut empty) {
+        ok(_) => {
+            assert(false)
+        },
+        err(_) => {},
+    }
+    tiny := [99u8; 2]
+    match json.to_slice(&value, &mut tiny[..1]) {
+        ok(_) => {
+            assert(false)
+        },
+        err(_) => {},
+    }
+    assert_eq(tiny[1], 99u8)
+    storage := [0u8; 128]
+    sink := io.MemoryWriter.new(&mut storage)
+    count := json.encode_pretty(&value, &mut sink)?
+    assert(count > 12usize)
+    // Drop the writer's exclusive borrow before inspecting its storage.
+    core.drop(sink)
+    decoded := json.decode::<Strict>(&storage[..count])?
+    assert_eq(decoded.count, 42u32)
+    return ok()
+}
+
+fn reader_and_transform_helpers() -> void!json.Error {
+    source := b" \n{ \"count\" : 4294967295 }\t"
+    reader := io.MemoryReader.new(source)
+    storage := [0u8; 64]
+    value := json.parse_reader(&mut reader, &mut storage)?
+    member := value.require("count")?
+    assert_eq(member.as_u64()?, 4294967295u64)
+    core.drop(member)
+    core.drop(value)
+    assert_eq(reader.position(), source.len)
+
+    typed_reader := io.MemoryReader.new(b"{\"count\":42}")
+    typed_storage := [0u8; 32]
+    typed := json.decode_reader::<Strict, io.MemoryReader>(&mut typed_reader, &mut typed_storage)?
+    assert_eq(typed.count, 42u32)
+
+    // Exactly full storage must succeed after the EOF probe.
+    exact_reader := io.MemoryReader.new(b"null")
+    exact_storage := [0u8; 4]
+    exact := json.parse_reader(&mut exact_reader, &mut exact_storage)?
+    assert(exact.is_null())
+    core.drop(exact)
+    assert_eq(exact_reader.position(), 4usize)
+
+    // The overflow probe consumes one byte past the full output storage.
+    large_reader := io.MemoryReader.new(b"[true]")
+    short := [0u8; 5]
+    match json.parse_reader(&mut large_reader, &mut short) {
+        ok(_) => {
+            assert(false)
+        },
+        err(problem) => {
+            assert(problem.kind == json.ErrorKind.BufferFull)
+            assert_eq(problem.position, 5usize)
+        },
+    }
+    assert_eq(large_reader.position(), 6usize)
+
+    compact_storage := [0u8; 64]
+    compact_writer := io.MemoryWriter.new(&mut compact_storage)
+    count := json.compact(source, &mut compact_writer)?
+    assert_eq(count, 20usize)
+    assert(bytes.equal(compact_writer.written(), b"{\"count\":4294967295}"))
+
+    pretty_storage := [0u8; 64]
+    pretty_writer := io.MemoryWriter.new(&mut pretty_storage)
+    pretty_count := json.pretty(source, &mut pretty_writer)?
+    assert(pretty_count > count)
+    parsed := json.parse(pretty_writer.written())?
+    decoded := json.from_value::<Strict>(parsed)?
+    assert_eq(decoded.count, 4294967295u32)
+    return ok()
+}
+
+fn main() -> i32 {
+    struct_round_trip()!
+    string_storage()!
+    schema_errors()
+    malformed_documents()
+    number_precision()!
+    output_boundaries()!
+    reader_and_transform_helpers()!
+    return 0
+}

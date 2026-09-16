@@ -191,7 +191,9 @@ for bundled platform adapters is implementation-defined (ID-LIB).
 ### 2.3. Visibility
 
 **PKG-VIS.** Declarations and fields are package-private unless marked `pub`. Letter case
-has no visibility meaning. A public API must not expose a private type. A public
+has no visibility meaning. A public API must not expose a private type, except
+that a public method of a private struct may mention its own struct type in
+parameters or its return type to participate in generic protocols. A public
 enum exposes its variants.
 
 Wildcard imports and re-export declarations are not supported.
@@ -1342,8 +1344,12 @@ alternative requires a valid value or owns resources; padding and inactive bytes
 are unspecified. These storage rules do not constitute a C enum or C union ABI.
 Target scalar and aggregate alignment remain implementation-defined (ID-TARGET).
 
-The only accepted struct attributes are `@repr(C)`, `@unsafe_send`, and
-`@unsafe_sync`; thread contracts are described in the
+Accepted struct attributes are `@repr(C)`, `@unsafe_send`, `@unsafe_sync`,
+`@derive(Json)`, and `@json_deny_unknown`; the latter requires `@derive(Json)`.
+Derived JSON structs may rename fields with `@json_name("name")`. JSON derivation
+generates ordinary type- and borrow-checked methods for concrete structs;
+supported field types and encoding policies are specified in the
+[JSON reference](json.md). Thread contracts are described in the
 [thread reference](threads.md). Enum declarations support only `pub`. Unknown,
 duplicate, or misplaced attributes/modifiers must be rejected. Attributes are
 not programmable macros.

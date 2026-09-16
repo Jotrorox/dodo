@@ -39,6 +39,7 @@ impl Parser {
             depth: 0,
             slice_first: false,
             discarded_tails: HashSet::new(),
+            json_derives: Vec::new(),
         }
     }
 }
@@ -58,6 +59,7 @@ struct Parser {
     // Explicit semicolons suppress implicit block values without changing the
     // statement AST used by semantic analysis and the backend.
     discarded_tails: HashSet<usize>,
+    json_derives: Vec<crate::json_derive::Derive>,
 }
 
 #[derive(Default)]
@@ -71,6 +73,9 @@ struct Modifiers {
     repr_c: bool,
     unsafe_send: bool,
     unsafe_sync: bool,
+    derive_json: bool,
+    json_name: Option<String>,
+    json_deny_unknown: bool,
 }
 
 impl Parser {
@@ -227,6 +232,23 @@ impl Parser {
                 self.synchronize(cursor, true);
             }
         }
+        let derives = std::mem::take(&mut self.json_derives);
+        if !derives.is_empty() {
+            let identifiers = self
+                .tokens
+                .iter()
+                .filter_map(|token| match &token.kind {
+                    TokenKind::Ident(name) => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if let Err(error) = crate::json_derive::expand(&mut program, derives, &identifiers) {
+                if !self.recover {
+                    return Err(error);
+                }
+                self.diagnostics.push(error);
+            }
+        }
         Ok(program)
     }
     fn declaration(&mut self, program: &mut Program) -> ParseResult<()> {
@@ -257,6 +279,12 @@ impl Parser {
         }
         let start = self.span().start;
         let mods = self.modifiers()?;
+        if (mods.derive_json || mods.json_deny_unknown) && !self.at("struct") {
+            return Err(self.error("@derive(Json) and @json_deny_unknown apply only to structs"));
+        }
+        if mods.json_name.is_some() {
+            return Err(self.error("@json_name applies only to fields of @derive(Json) structs"));
+        }
         if mods.printing.is_some() && !self.at("fn") {
             return Err(self.error("@compiler applies only to printing functions"));
         }
@@ -354,6 +382,43 @@ impl Parser {
                 }
             } else if self.eat("@") {
                 let name = self.identifier()?;
+                if name == "derive" {
+                    if mods.derive_json {
+                        return Err(self.error("duplicate @derive(Json) attribute"));
+                    }
+                    self.expect("(")?;
+                    if !self.eat("Json") {
+                        return Err(self.error("supported derive: @derive(Json)"));
+                    }
+                    self.expect(")")?;
+                    mods.derive_json = true;
+                    self.newlines();
+                    continue;
+                }
+                if name == "json_deny_unknown" {
+                    if mods.json_deny_unknown {
+                        return Err(self.error("duplicate @json_deny_unknown attribute"));
+                    }
+                    mods.json_deny_unknown = true;
+                    self.newlines();
+                    continue;
+                }
+                if name == "json_name" {
+                    if mods.json_name.is_some() {
+                        return Err(self.error("duplicate @json_name attribute"));
+                    }
+                    self.expect("(")?;
+                    let TokenKind::String(value, false) = self.bump().kind else {
+                        return Err(self.error("@json_name expects a string field name"));
+                    };
+                    mods.json_name = Some(
+                        String::from_utf8(value)
+                            .map_err(|_| self.error("JSON field name must be UTF-8"))?,
+                    );
+                    self.expect(")")?;
+                    self.newlines();
+                    continue;
+                }
                 if name == "compiler" {
                     if mods.printing.is_some() {
                         return Err(self.error("duplicate @compiler attribute"));
@@ -408,7 +473,7 @@ impl Parser {
                 }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\")"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown"
                     )));
                 }
                 if mods.repr_c {
@@ -648,6 +713,9 @@ impl Parser {
         start: usize,
     ) -> ParseResult<()> {
         self.expect("struct")?;
+        if mods.json_deny_unknown && !mods.derive_json {
+            return Err(self.error("@json_deny_unknown requires @derive(Json)"));
+        }
         let name = self.identifier()?;
         let generics = self.generic_params()?;
         self.self_type = Some(if generics.is_empty() {
@@ -662,12 +730,23 @@ impl Parser {
         self.expect("{")?;
         self.separators();
         let mut fields = Vec::new();
+        let mut json_names = Vec::new();
         while !self.eat("}") {
             if self.eof() {
                 return Err(self.error("unclosed struct declaration; expected `}`"));
             }
             let field_start = self.span().start;
             let field_mods = self.modifiers()?;
+            if field_mods.derive_json || field_mods.json_deny_unknown {
+                return Err(
+                    self.error("@derive(Json) and @json_deny_unknown apply only to structs")
+                );
+            }
+            if field_mods.json_name.is_some() && (!mods.derive_json || self.at("fn")) {
+                return Err(
+                    self.error("@json_name applies only to fields of @derive(Json) structs")
+                );
+            }
             if field_mods.printing.is_some() && !self.at("fn") {
                 return Err(self.error("@compiler applies only to printing functions"));
             }
@@ -700,7 +779,15 @@ impl Parser {
                 {
                     return Err(self.error("struct fields only support the `pub` modifier"));
                 }
+                let field_start = if field_mods.json_name.is_some() {
+                    // Attribute text is preserved by the formatter, independently
+                    // from the field declaration that follows it.
+                    self.span().start
+                } else {
+                    field_start
+                };
                 let (field_name, ty) = self.typed_name()?;
+                json_names.push(field_mods.json_name.unwrap_or_else(|| field_name.clone()));
                 fields.push(Field {
                     name: field_name,
                     ty,
@@ -716,6 +803,13 @@ impl Parser {
             self.separators();
         }
         self.self_type = None;
+        if mods.derive_json {
+            self.json_derives.push(crate::json_derive::Derive {
+                name: name.clone(),
+                json_names,
+                deny_unknown: mods.json_deny_unknown,
+            });
+        }
         program.structs.push(Struct {
             name,
             public: mods.public,

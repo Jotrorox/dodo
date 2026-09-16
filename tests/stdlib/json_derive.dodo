@@ -1,0 +1,229 @@
+package json_derive
+
+import "std/encoding/json"
+import "std/bytes"
+
+@derive(Json)
+struct Numbers {
+    a: i8
+    b: u8
+    c: i16
+    d: u16
+    e: i32
+    f: u32
+    g: i64
+    h: u64
+    i: isize
+    j: usize
+    k: f32
+    l: f64
+    flag: bool
+}
+
+@derive(Json)
+struct Inner {
+    text: json.String
+}
+
+@derive(Json)
+struct BorrowedArrays {
+    name: &str
+    inner: Inner
+    texts: [2]json.String
+    optional_texts: [2]Option<&str>
+    matrix: [2][2]i16
+    optional_array: Option<[2]u32>
+    nothing: [0]u8
+}
+
+@derive(Json)
+struct Narrow {
+    signed: i8
+    unsigned: u8
+}
+
+@derive(Json)
+struct Float32 {
+    value: f32
+}
+
+@derive(Json)
+struct Empty {}
+
+@derive(Json)
+@json_deny_unknown
+struct StrictEmpty {}
+
+// A user-defined codec uses the same checked protocol as derived structs.
+struct Identifier {
+    value: u32
+
+    fn encode_json<W>(&self, encoder: &mut json.Encoder<W>) -> void!json.Error {
+        return encoder.unsigned(self.value as u64)
+    }
+    fn decode_json(value: json.Value) -> Self!json.Error {
+        number := value.as_u64()?
+        if number > 4294967295u64 {
+            return err(json.Error { kind: json.ErrorKind.NumberRange, position: value.position() })
+        }
+        return ok(Self { value: number as u32 })
+    }
+}
+
+@derive(Json)
+struct Custom {
+    @json_name("external-id")
+    id: Identifier
+    enabled: Option<bool>
+}
+
+fn primitive_boundaries() -> void!json.Error {
+    input := b"{\"a\":-128,\"b\":255,\"c\":-32768,\"d\":65535,\"e\":-2147483648,\"f\":4294967295,\"g\":-9223372036854775808,\"h\":18446744073709551615,\"i\":-123,\"j\":456,\"k\":1.5,\"l\":-2.25,\"flag\":true}"
+    record := json.decode::<Numbers>(input)?
+    assert_eq(record.a, -128i8)
+    assert_eq(record.b, 255u8)
+    assert_eq(record.c, -32768i16)
+    assert_eq(record.d, 65535u16)
+    assert_eq(record.e, -2147483648i32)
+    assert_eq(record.f, 4294967295u32)
+    assert_eq(record.g, -9223372036854775808i64)
+    assert_eq(record.h, 18446744073709551615u64)
+    assert_eq(record.i, -123isize)
+    assert_eq(record.j, 456usize)
+    assert_eq(record.k, 1.5f32)
+    assert_eq(record.l, -2.25f64)
+    assert(record.flag)
+    storage := [0u8; 512]
+    written := json.to_slice(&record, &mut storage)?
+    again := json.decode::<Numbers>(&storage[..written])?
+    assert_eq(again.a, record.a)
+    assert_eq(again.h, record.h)
+    assert_eq(again.k, record.k)
+    assert_eq(again.l, record.l)
+    return ok()
+}
+
+fn borrowed_composition() -> void!json.Error {
+    input := b"{\"name\":\"root\",\"inner\":{\"text\":\"n\\u0065sted\"},\"texts\":[\"A\\nB\",\"C\"],\"optional_texts\":[null,\"some\"],\"matrix\":[[-32768,32767],[0,-1]],\"optional_array\":[0,4294967295],\"nothing\":[]}"
+    record := json.decode::<BorrowedArrays>(input)?
+    assert_eq(record.name, "root")
+    assert(record.inner.text.equals("nested"))
+    assert(record.texts[0].equals("A\nB"))
+    assert(record.texts[1].equals("C"))
+    match &record.optional_texts[0] {
+        none => {}, some(_) => {
+            assert(false)
+        }
+    }
+    match &record.optional_texts[1] {
+        some(text) => {
+            assert_eq(*text, "some")
+        },
+        none => {
+            assert(false)
+        },
+    }
+    assert_eq(record.matrix[0][0], -32768i16)
+    assert_eq(record.matrix[0][1], 32767i16)
+    assert_eq(record.matrix[1][1], -1i16)
+    match &record.optional_array {
+        some(values) => {
+            assert_eq(values[1], 4294967295u32)
+        },
+        none => {
+            assert(false)
+        },
+    }
+    assert_eq(record.nothing.len, 0usize)
+    storage := [0u8; 512]
+    written := json.to_slice(&record, &mut storage)?
+    again := json.decode::<BorrowedArrays>(&storage[..written])?
+    assert(again.inner.text.equals("nested"))
+    assert(again.texts[0].equals("A\nB"))
+    assert_eq(again.name, "root")
+    return ok()
+}
+
+fn validation_and_custom_codecs() -> void!json.Error {
+    bad_numbers := [
+        b"{\"signed\":128,\"unsigned\":0}",
+        b"{\"signed\":-129,\"unsigned\":0}",
+        b"{\"signed\":0,\"unsigned\":256}",
+        b"{\"signed\":0,\"unsigned\":-1}",
+    ]
+    for input in &bad_numbers {
+        match json.decode::<Narrow>(*input) {
+            ok(_) => {
+                assert(false)
+            },
+            err(reason) => {
+                assert_eq(reason.kind, json.ErrorKind.NumberRange)
+            },
+        }
+    }
+    match json.decode::<Narrow>(b"{\"signed\":128,\"unsigned\":0}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.position, 10usize)
+        },
+    }
+    match json.decode::<Float32>(b"{\"value\":1e39}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.NumberRange)
+        },
+    }
+    match json.decode::<Empty>(b"[]") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.TypeMismatch)
+        },
+    }
+    empty := json.decode::<Empty>(b"{\"extra\":1}")?
+    output := [0u8; 64]
+    count := json.to_slice(&empty, &mut output)?
+    assert(bytes.equal(&output[..count], b"{}"))
+    match json.decode::<StrictEmpty>(b"{\"extra\":1}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.UnknownField)
+        },
+    }
+    custom := json.decode::<Custom>(b"{\"external-id\":42}")?
+    assert_eq(custom.id.value, 42u32)
+    match &custom.enabled {
+        none => {}, some(_) => {
+            assert(false)
+        }
+    }
+    count = json.to_slice(&custom, &mut output)?
+    assert(bytes.equal(&output[..count], b"{\"external-id\":42,\"enabled\":null}"))
+    custom_some := json.decode::<Custom>(b"{\"external-id\":7,\"enabled\":true}")?
+    match &custom_some.enabled {
+        some(flag) => {
+            assert(*flag)
+        }, none => {
+            assert(false)
+        }
+    }
+    return ok()
+}
+
+fn main() {
+    primitive_boundaries()!
+    borrowed_composition()!
+    validation_and_custom_codecs()!
+}
+
+@test
+fn derived_json_suite() {
+    main()
+}

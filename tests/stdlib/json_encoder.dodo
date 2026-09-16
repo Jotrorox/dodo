@@ -1,0 +1,276 @@
+package json_encoder
+
+import "std/encoding/json"
+import "std/io"
+import "std/bytes"
+import "core/ptr"
+import "core/mem"
+
+fn expect_error(result: void!json.Error, kind: json.ErrorKind) {
+    match result {
+        ok() => {
+            assert(false)
+        },
+        err(problem) => {
+            assert(problem.kind == kind)
+        },
+    }
+}
+
+fn compact_tokens() -> void!json.Error {
+    storage := [0u8; 256]
+    writer := io.MemoryWriter.new(&mut storage)
+    output := json.Encoder.new(&mut writer)
+    output.begin_object()?
+    output.key("a\n\"\\")?
+    output.begin_array()?
+    output.null()?
+    output.boolean(true)?
+    output.boolean(false)?
+    output.signed(-9223372036854775807i64 - 1i64)?
+    output.unsigned(18446744073709551615u64)?
+    output.begin_object()?
+    output.end_object()?
+    output.begin_array()?
+    output.end_array()?
+    output.end_array()?
+    output.key("text")?
+    output.string("é😀/\n\t\r\"\\")?
+    output.end_object()?
+    count := output.finish()?
+    assert_eq(count, output.written())
+    core.drop(output)
+    assert(bytes.equal(writer.written(), mem.str_bytes("{\"a\\n\\\"\\\\\":[null,true,false,-9223372036854775808,18446744073709551615,{},[]],\"text\":\"é😀/\\n\\t\\r\\\"\\\\\"}")))
+    return ok()
+}
+
+fn all_control_characters() -> void!json.Error {
+    controls := [0u8; 32]
+    for i in 0usize..controls.len {
+        controls[i] = i as u8
+    }
+    // Every ASCII byte, including NUL, is valid UTF-8 text.
+    input := unsafe {
+        mem.str_from_utf8(&controls)
+    }
+    storage := [0u8; 256]
+    writer := io.MemoryWriter.new(&mut storage)
+    output := json.Encoder.new(&mut writer)
+    output.string(input)?
+    count := output.finish()?
+    core.drop(output)
+    core.drop(writer)
+    value := json.parse(&storage[..count])?
+    string := value.as_string()?
+    decoded := [0u8; 32]
+    actual := string.decode(&mut decoded)?
+    assert_eq(actual, input)
+    return ok()
+}
+
+fn f64_bits(value: f64) -> u64 {
+    unsafe {
+        return ptr.read_unaligned(ptr.from_ref(&value) as *const u64)
+    }
+}
+
+fn f64_from_bits(value: u64) -> f64 {
+    unsafe {
+        return ptr.read_unaligned(ptr.from_ref(&value) as *const f64)
+    }
+}
+
+fn floating_boundaries() -> void!json.Error {
+    cases := [
+        0u64, 0x8000000000000000u64,
+        1u64, 0x8000000000000001u64,
+        0x000fffffffffffffu64, 0x0010000000000000u64,
+        0x3fb999999999999au64, 0x3ff0000000000001u64,
+        0x433fffffffffffffu64, 0x4340000000000001u64,
+        0x7fefffffffffffffu64, 0xffefffffffffffffu64,
+    ]
+    for i in 0usize..cases.len {
+        storage := [0u8; 64]
+        writer := io.MemoryWriter.new(&mut storage)
+        output := json.Encoder.new(&mut writer)
+        output.floating(f64_from_bits(cases[i]))?
+        count := output.finish()?
+        core.drop(output)
+        core.drop(writer)
+        value := json.parse(&storage[..count])?
+        assert_eq(f64_bits(value.as_f64()?), cases[i])
+    }
+    nonfinite := [0x7ff0000000000000u64, 0xfff0000000000000u64, 0x7ff8000000000000u64]
+    for i in 0usize..nonfinite.len {
+        storage := [0u8; 64]
+        writer := io.MemoryWriter.new(&mut storage)
+        output := json.Encoder.new(&mut writer)
+        expect_error(output.floating(f64_from_bits(nonfinite[i])), json.ErrorKind.NumberRange)
+        assert_eq(output.written(), 0usize)
+        expect_error(output.null(), json.ErrorKind.Io)
+    }
+    return ok()
+}
+
+fn state_errors() -> void!json.Error {
+    // Each malformed sequence gets a fresh writer so no failure masks another.
+    for scenario in 0usize..8 {
+        storage := [0u8; 64]
+        writer := io.MemoryWriter.new(&mut storage)
+        output := json.Encoder.new(&mut writer)
+        if scenario == 0 {
+            expect_error(output.key("x"), json.ErrorKind.Syntax)
+        } else if scenario == 1 {
+            expect_error(output.end_array(), json.ErrorKind.Syntax)
+        } else if scenario == 2 {
+            output.begin_array()?
+            expect_error(output.end_object(), json.ErrorKind.Syntax)
+        } else if scenario == 3 {
+            output.begin_object()?
+            expect_error(output.null(), json.ErrorKind.Syntax)
+        } else if scenario == 4 {
+            output.begin_object()?
+            output.key("x")?
+            expect_error(output.key("y"), json.ErrorKind.Syntax)
+        } else if scenario == 5 {
+            output.begin_object()?
+            output.key("x")?
+            expect_error(output.end_object(), json.ErrorKind.Syntax)
+        } else if scenario == 6 {
+            output.null()?
+            expect_error(output.boolean(true), json.ErrorKind.Syntax)
+        } else {
+            match output.finish() {
+                ok(_) => {
+                    assert(false)
+                },
+                err(problem) => {
+                    assert(problem.kind == json.ErrorKind.Syntax)
+                },
+            }
+        }
+        expect_error(output.null(), json.ErrorKind.Io)
+        match output.finish() {
+            ok(_) => {
+                assert(false)
+            },
+            err(problem) => {
+                assert(problem.kind == json.ErrorKind.Io)
+            },
+        }
+    }
+    return ok()
+}
+
+pub struct PartialWriter {
+    storage: &mut[u8]
+    position: usize
+    calls: usize
+    pub fn write(&mut self, input: &[u8]) -> usize!io.Error {
+        self.calls += 1
+        available := 3usize - self.position
+        count := input.len
+        if count > available {
+            count = available
+        }
+        for i in 0usize..count {
+            self.storage[self.position + i] = input[i]
+        }
+        self.position += count
+        if count != input.len {
+            return err(io.failure(io.ErrorKind.Other, count))
+        }
+        return ok(count)
+    }
+}
+
+pub struct ZeroWriter {
+    pub fn write(&mut self, input: &[u8]) -> usize!io.Error {
+        return ok(0)
+    }
+}
+
+fn io_failures() {
+    storage := [99u8; 8]
+    writer := PartialWriter { storage: &mut storage, position: 0, calls: 0 }
+    output := json.Encoder.new(&mut writer)
+    match output.string("hello") {
+        ok() => {
+            assert(false)
+        },
+        err(problem) => {
+            assert(problem.kind == json.ErrorKind.Io)
+            assert_eq(problem.position, 3usize)
+        },
+    }
+    assert_eq(output.written(), 3usize)
+    expect_error(output.null(), json.ErrorKind.Io)
+    core.drop(output)
+    assert_eq(writer.calls, 2usize)
+    core.drop(writer)
+    assert_eq(storage[0], 34u8)
+    assert_eq(storage[1], 104u8)
+    assert_eq(storage[2], 101u8)
+    assert_eq(storage[3], 99u8)
+
+    zero := ZeroWriter {}
+    stalled := json.Encoder.new(&mut zero)
+    expect_error(stalled.null(), json.ErrorKind.Io)
+    assert_eq(stalled.written(), 0usize)
+}
+
+fn raw_and_pretty() -> void!json.Error {
+    original := json.parse(b"{\"a\":[1,{\"b\\u0063\":\"x\\ny\"},[]],\"z\":{}}")?
+    storage := [0u8; 256]
+    count := json.to_slice_pretty(&original, &mut storage)?
+    parsed := json.parse(&storage[..count])?
+    assert_eq(parsed.len()?, 2usize)
+    items := parsed.require("a")?
+    nested := match items.at(1) {
+        some(value) => {
+            value
+        },
+        none => {
+            return err(json.failure(json.ErrorKind.MissingField, 0))
+        },
+    }
+    text := nested.require("bc")?
+    decoded := text.as_string()?
+    assert(decoded.equals("x\ny"))
+
+    // Raw data must be validated before writing a single byte.
+    invalid_storage := [99u8; 16]
+    writer := io.MemoryWriter.new(&mut invalid_storage)
+    output := json.Encoder.new(&mut writer)
+    expect_error(output.raw(b"[] true"), json.ErrorKind.TrailingData)
+    assert_eq(output.written(), 0usize)
+    expect_error(output.null(), json.ErrorKind.Io)
+    core.drop(output)
+    core.drop(writer)
+    assert_eq(invalid_storage[0], 99u8)
+    return ok()
+}
+
+fn combined_depth_limit() -> void!json.Error {
+    storage := [0u8; 512]
+    writer := io.MemoryWriter.new(&mut storage)
+    output := json.Encoder.new(&mut writer)
+    for i in 0usize..128 {
+        output.begin_array()?
+    }
+    expect_error(output.raw(b"[]"), json.ErrorKind.Depth)
+    assert_eq(output.written(), 128usize)
+    expect_error(output.end_array(), json.ErrorKind.Io)
+    return ok()
+}
+
+fn main() -> i32 {
+    compact_tokens()!
+    all_control_characters()!
+    floating_boundaries()!
+    state_errors()!
+    io_failures()
+    raw_and_pretty()!
+    combined_depth_limit()!
+    return 0
+}

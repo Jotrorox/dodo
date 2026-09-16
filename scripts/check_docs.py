@@ -49,6 +49,21 @@ class Page(HTMLParser):
             self.in_navigation = False
 
 
+def bundled_modules() -> set[str]:
+    modules: set[str] = set()
+    for source in (ROOT / "stdlib").rglob("*.dodo"):
+        relative = source.relative_to(ROOT / "stdlib")
+        package = re.search(r"^package\s+([a-zA-Z_][a-zA-Z_0-9]*)", source.read_text(encoding="utf-8"), re.M)
+        # A directory package can split one public import across several files.
+        # Standalone modules still use their file stem as the import path.
+        if (package and package[1] == source.parent.name
+                and not source.parent.with_suffix(".dodo").is_file()):
+            modules.add(relative.parent.as_posix())
+        else:
+            modules.add(relative.with_suffix("").as_posix())
+    return modules
+
+
 def main() -> int:
     pages = {path: Page(path) for path in DIST.rglob("*.html")}
     errors: list[str] = []
@@ -61,10 +76,7 @@ def main() -> int:
     documented = set(re.findall(
         r"`((?:core|alloc|std)/[a-z0-9_/]+)`", inventory.read_text(encoding="utf-8")
     ))
-    modules = {
-        source.relative_to(ROOT / "stdlib").with_suffix("").as_posix()
-        for source in (ROOT / "stdlib").rglob("*.dodo")
-    }
+    modules = bundled_modules()
     for module in sorted(modules - documented):
         errors.append(f"standard-library.md: package missing from inventory: {module}")
 

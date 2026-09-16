@@ -11,6 +11,7 @@ pub mod diagnostic;
 pub mod editor;
 pub mod format;
 pub mod json;
+mod json_derive;
 pub mod lexer;
 #[cfg(feature = "llvm")]
 pub mod lsp;

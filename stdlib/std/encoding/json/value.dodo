@@ -1,0 +1,1002 @@
+package json
+
+import "core/mem"
+import "std/text"
+import "std/io"
+
+pub const MAX_DEPTH: usize = 128
+
+pub enum Kind {
+    Null, Bool, Number, String, Array, Object
+}
+pub enum ErrorKind {
+    Syntax, TypeMismatch, MissingField, DuplicateField, UnknownField,
+    NumberRange, BufferFull, Io, Depth, TrailingData, EscapedString
+}
+pub struct Error {
+    pub kind: ErrorKind
+    pub position: usize
+
+    pub fn clone(&self) -> Error {
+        return failure(copy_kind(&self.kind), self.position)
+    }
+
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("json: ")?
+        match &self.kind {
+            ErrorKind.Syntax => {
+                output.string("Syntax")?
+            }
+            ErrorKind.TypeMismatch => {
+                output.string("TypeMismatch")?
+            }
+            ErrorKind.MissingField => {
+                output.string("MissingField")?
+            }
+            ErrorKind.DuplicateField => {
+                output.string("DuplicateField")?
+            }
+            ErrorKind.UnknownField => {
+                output.string("UnknownField")?
+            }
+            ErrorKind.NumberRange => {
+                output.string("NumberRange")?
+            }
+            ErrorKind.BufferFull => {
+                output.string("BufferFull")?
+            }
+            ErrorKind.Io => {
+                output.string("Io")?
+            }
+            ErrorKind.Depth => {
+                output.string("Depth")?
+            }
+            ErrorKind.TrailingData => {
+                output.string("TrailingData")?
+            }
+            ErrorKind.EscapedString => {
+                output.string("EscapedString")?
+            }
+        }
+        output.string(" position=")?
+        output.natural(self.position as u64)?
+        return ok()
+    }
+}
+pub fn failure(kind: ErrorKind, position: usize) -> Error {
+    return Error { kind: kind, position: position }
+}
+fn copy_kind(kind: &ErrorKind) -> ErrorKind {
+    match kind {
+        ErrorKind.Syntax => {
+            return ErrorKind.Syntax
+        }
+        ErrorKind.TypeMismatch => {
+            return ErrorKind.TypeMismatch
+        }
+        ErrorKind.MissingField => {
+            return ErrorKind.MissingField
+        }
+        ErrorKind.DuplicateField => {
+            return ErrorKind.DuplicateField
+        }
+        ErrorKind.UnknownField => {
+            return ErrorKind.UnknownField
+        }
+        ErrorKind.NumberRange => {
+            return ErrorKind.NumberRange
+        }
+        ErrorKind.BufferFull => {
+            return ErrorKind.BufferFull
+        }
+        ErrorKind.Io => {
+            return ErrorKind.Io
+        }
+        ErrorKind.Depth => {
+            return ErrorKind.Depth
+        }
+        ErrorKind.TrailingData => {
+            return ErrorKind.TrailingData
+        }
+        ErrorKind.EscapedString => {
+            return ErrorKind.EscapedString
+        }
+    }
+}
+fn whitespace(byte: u8) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 13
+}
+fn skip_space(data: &[u8], offset: usize) -> usize {
+    for offset < data.len && whitespace(data[offset]) {
+        offset += 1
+    }
+    return offset
+}
+fn digit(byte: u8) -> bool {
+    return byte >= 48 && byte <= 57
+}
+fn hex(byte: u8) -> u32 {
+    if byte >= 48 && byte <= 57 {
+        return (byte - 48) as u32
+    }
+    if byte >= 65 && byte <= 70 {
+        return (byte - 55) as u32
+    }
+    if byte >= 97 && byte <= 102 {
+        return (byte - 87) as u32
+    }
+    return 16
+}
+fn hex4(data: &[u8], offset: usize) -> u32!Error {
+    if offset > data.len || data.len - offset < 4 {
+        return err(failure(ErrorKind.Syntax, data.len))
+    }
+    value := 0u32
+    for i in offset..offset + 4 {
+        part := hex(data[i])
+        if part == 16 {
+            return err(failure(ErrorKind.Syntax, i))
+        }
+        value = value * 16 + part
+    }
+    return ok(value)
+}
+// Decodes one scalar; offsets are relative to data. Surrogate pairs are atomic.
+fn scalar(data: &[u8], offset: usize, escaped: bool) -> text.Decoded!Error {
+    if offset >= data.len {
+        return err(failure(ErrorKind.Syntax, data.len))
+    }
+    if!escaped || data[offset] != 92 {
+        match text.decode(data, offset) {
+            ok(decoded) => {
+                return ok(decoded)
+            },
+            err(reason) => {
+                return err(failure(ErrorKind.Syntax, reason.position))
+            }
+        }
+    }
+    if data.len - offset < 2 {
+        return err(failure(ErrorKind.Syntax, data.len))
+    }
+    byte := data[offset + 1]
+    value := 0u32
+    if byte == 34 || byte == 92 || byte == 47 {
+        value = byte as u32
+    } else if byte == 98 {
+        value = 8
+    } else if byte == 102 {
+        value = 12
+    } else if byte == 110 {
+        value = 10
+    } else if byte == 114 {
+        value = 13
+    } else if byte == 116 {
+        value = 9
+    } else if byte == 117 {
+        value = hex4(data, offset + 2)?
+        if value >= 55296 && value <= 56319 {
+            if data.len - offset < 12 {
+                return err(failure(ErrorKind.Syntax, data.len))
+            }
+            if data[offset + 6] != 92 || data[offset + 7] != 117 {
+                return err(failure(ErrorKind.Syntax, offset + 6))
+            }
+            low := hex4(data, offset + 8)?
+            if low < 56320 || low > 57343 {
+                return err(failure(ErrorKind.Syntax, offset + 8))
+            }
+            value = 65536 + (value - 55296) * 1024 + low - 56320
+            return ok(text.Decoded { scalar: value, next: offset + 12 })
+        }
+        if value >= 56320 && value <= 57343 {
+            return err(failure(ErrorKind.Syntax, offset + 2))
+        }
+        return ok(text.Decoded { scalar: value, next: offset + 6 })
+    } else {
+        return err(failure(ErrorKind.Syntax, offset + 1))
+    }
+    return ok(text.Decoded { scalar: value, next: offset + 2 })
+}
+fn string_end(data: &[u8], start: usize) -> usize!Error {
+    offset := start + 1
+    for offset < data.len {
+        byte := data[offset]
+        if byte == 34 {
+            return ok(offset + 1)
+        }
+        if byte < 32 {
+            return err(failure(ErrorKind.Syntax, offset))
+        }
+        decoded := scalar(data, offset, true)?
+        offset = decoded.next
+    }
+    return err(failure(ErrorKind.Syntax, data.len))
+}
+fn number_end(data: &[u8], start: usize) -> usize!Error {
+    offset := start
+    if data[offset] == 45 {
+        offset += 1
+    }
+    if offset == data.len {
+        return err(failure(ErrorKind.Syntax, offset))
+    }
+    if data[offset] == 48 {
+        offset += 1
+    } else {
+        if data[offset] < 49 || data[offset] > 57 {
+            return err(failure(ErrorKind.Syntax, offset))
+        }
+        for offset < data.len && digit(data[offset]) {
+            offset += 1
+        }
+    }
+    if offset < data.len && data[offset] == 46 {
+        offset += 1
+        begin := offset
+        for offset < data.len && digit(data[offset]) {
+            offset += 1
+        }
+        if offset == begin {
+            return err(failure(ErrorKind.Syntax, offset))
+        }
+    }
+    if offset < data.len && (data[offset] == 101 || data[offset] == 69) {
+        offset += 1
+        if offset < data.len && (data[offset] == 43 || data[offset] == 45) {
+            offset += 1
+        }
+        begin := offset
+        for offset < data.len && digit(data[offset]) {
+            offset += 1
+        }
+        if offset == begin {
+            return err(failure(ErrorKind.Syntax, offset))
+        }
+    }
+    return ok(offset)
+}
+fn literal_end(data: &[u8], start: usize, expected: &str) -> usize!Error {
+    bytes := mem.str_bytes(expected)
+    for i in 0usize..bytes.len {
+        if i >= data.len - start {
+            return err(failure(ErrorKind.Syntax, data.len))
+        }
+        if data[start + i] != bytes[i] {
+            return err(failure(ErrorKind.Syntax, start + i))
+        }
+    }
+    return ok(start + bytes.len)
+}
+// Only called on validated values. This avoids recursive reparsing during
+// iteration and duplicate detection, and requires constant auxiliary space.
+fn skip_validated(data: &[u8], start: usize) -> usize {
+    offset := start
+    nesting := 0usize
+    quoted := false
+    for offset < data.len {
+        byte := data[offset]
+        if quoted {
+            if byte == 92 {
+                offset += 2
+                continue
+            }
+            if byte == 34 {
+                quoted = false
+                if nesting == 0 {
+                    return offset + 1
+                }
+            }
+        } else {
+            if byte == 34 {
+                quoted = true
+            } else if byte == 91 || byte == 123 {
+                nesting += 1
+            } else if byte == 93 || byte == 125 {
+                if nesting == 0 {
+                    return offset
+                }
+                nesting -= 1
+                if nesting == 0 {
+                    return offset + 1
+                }
+            } else if nesting == 0 && (byte == 44 || whitespace(byte)) {
+                return offset
+            }
+        }
+        offset += 1
+    }
+    return offset
+}
+fn has_escape(data: &[u8]) -> bool {
+    for i in 0usize..data.len {
+        if data[i] == 92 {
+            return true
+        }
+    }
+    return false
+}
+fn json_string(data: &[u8], start: usize, end: usize) -> String from(data) {
+    content := &data[start + 1..end - 1]
+    return String { data: content, escaped: has_escape(content), position: start + 1 }
+}
+fn pointer_key(key: &String, token: &[u8]) -> bool {
+    left := 0usize
+    right := 0usize
+    for left < key.data.len && right < token.len {
+        decoded := match scalar(key.data, left, key.escaped) {
+            ok(value) => {
+                value
+            }, err(_) => {
+                return false
+            }
+        }
+        expected := 0u32
+        if token[right] == 126 {
+            expected = 126
+            if token[right + 1] == 49 {
+                expected = 47
+            }
+            right += 2
+        } else {
+            value := match text.decode(token, right) {
+                ok(value) => {
+                    value
+                }, err(_) => {
+                    return false
+                }
+            }
+            expected = value.scalar
+            right = value.next
+        }
+        if decoded.scalar != expected {
+            return false
+        }
+        left = decoded.next
+    }
+    return left == key.data.len && right == token.len
+}
+fn scan(data: &[u8], start: usize, depth: usize) -> usize!Error {
+    if start == data.len {
+        return err(failure(ErrorKind.Syntax, start))
+    }
+    byte := data[start]
+    if byte == 34 {
+        return string_end(data, start)
+    }
+    if byte == 110 {
+        return literal_end(data, start, "null")
+    }
+    if byte == 116 {
+        return literal_end(data, start, "true")
+    }
+    if byte == 102 {
+        return literal_end(data, start, "false")
+    }
+    if byte == 45 || digit(byte) {
+        return number_end(data, start)
+    }
+    if byte != 91 && byte != 123 {
+        return err(failure(ErrorKind.Syntax, start))
+    }
+    if depth >= MAX_DEPTH {
+        return err(failure(ErrorKind.Depth, start))
+    }
+    object := byte == 123
+    close := 93u8
+    if object {
+        close = 125
+    }
+    offset := skip_space(data, start + 1)
+    if offset < data.len && data[offset] == close {
+        return ok(offset + 1)
+    }
+    for {
+        if object {
+            if offset == data.len || data[offset] != 34 {
+                return err(failure(ErrorKind.Syntax, offset))
+            }
+            end := string_end(data, offset)?
+            key := json_string(data, offset, end)
+            previous := skip_space(data, start + 1)
+            for previous < offset {
+                prior_end := skip_validated(data, previous)
+                prior := json_string(data, previous, prior_end)
+                if key.equal(&prior) {
+                    return err(failure(ErrorKind.DuplicateField, offset))
+                }
+                previous = skip_space(data, prior_end)
+                previous = skip_space(data, previous + 1)
+                previous = skip_space(data, skip_validated(data, previous))
+                previous = skip_space(data, previous + 1)
+            }
+            offset = skip_space(data, end)
+            if offset == data.len || data[offset] != 58 {
+                return err(failure(ErrorKind.Syntax, offset))
+            }
+            offset = skip_space(data, offset + 1)
+        }
+        offset = scan(data, offset, depth + 1)?
+        offset = skip_space(data, offset)
+        if offset == data.len {
+            return err(failure(ErrorKind.Syntax, offset))
+        }
+        if data[offset] == close {
+            return ok(offset + 1)
+        }
+        if data[offset] != 44 {
+            return err(failure(ErrorKind.Syntax, offset))
+        }
+        offset = skip_space(data, offset + 1)
+    }
+}
+
+// An immutable view of one completely validated JSON value. Number spellings
+// are retained exactly and conversion is explicit, so parsing never loses bits.
+pub struct Value {
+    data: &[u8]
+    start: usize
+    end: usize
+
+    pub fn kind(&self) -> Kind {
+        byte := self.data[self.start]
+        if byte == 110 {
+            return Kind.Null
+        }
+        if byte == 116 || byte == 102 {
+            return Kind.Bool
+        }
+        if byte == 34 {
+            return Kind.String
+        }
+        if byte == 91 {
+            return Kind.Array
+        }
+        if byte == 123 {
+            return Kind.Object
+        }
+        return Kind.Number
+    }
+    pub fn position(&self) -> usize {
+        return self.start
+    }
+    pub fn raw(&self) -> &[u8] from(self) {
+        return &self.data[self.start..self.end]
+    }
+    pub fn is_null(&self) -> bool {
+        return self.kind() == Kind.Null
+    }
+    // RFC 6901 JSON Pointer, not the URI-fragment representation. Syntax errors
+    // point into path; lookup/type errors point into the JSON source document.
+    pub fn pointer(&self, path: &str) -> Value!Error from(self) {
+        tokens := mem.str_bytes(path)
+        current_start := self.start
+        current_end := self.end
+        if tokens.len == 0 {
+            return ok(Value { data: self.data, start: current_start, end: current_end })
+        }
+        if tokens[0] != 47 {
+            return err(failure(ErrorKind.Syntax, 0))
+        }
+        offset := 1usize
+        for {
+            token_end := offset
+            for token_end < tokens.len && tokens[token_end] != 47 {
+                if tokens[token_end] == 126 {
+                    if tokens.len - token_end < 2 || (tokens[token_end + 1] != 48 && tokens[token_end + 1] != 49) {
+                        return err(failure(ErrorKind.Syntax, token_end))
+                    }
+                    token_end += 1
+                }
+                token_end += 1
+            }
+            token := &tokens[offset..token_end]
+            byte := self.data[current_start]
+            found := false
+            next_start := current_start
+            next_end := current_end
+            cursor := skip_space(self.data, current_start + 1)
+            if byte == 123 {
+                for cursor < current_end - 1 {
+                    key_end := skip_validated(self.data, cursor)
+                    key := json_string(self.data, cursor, key_end)
+                    begin := skip_space(self.data, skip_space(self.data, key_end) + 1)
+                    end := skip_validated(self.data, begin)
+                    if pointer_key(&key, token) {
+                        found = true
+                        next_start = begin
+                        next_end = end
+                        break
+                    }
+                    cursor = skip_space(self.data, end)
+                    if cursor < current_end - 1 {
+                        cursor = skip_space(self.data, cursor + 1)
+                    }
+                }
+            } else if byte == 91 {
+                if token.len == 0 || (token.len > 1 && token[0] == 48) {
+                    return err(failure(ErrorKind.Syntax, offset))
+                }
+                if token.len == 1 && token[0] == 45 {
+                    return err(failure(ErrorKind.MissingField, current_start))
+                }
+                index := 0usize
+                for i in 0usize..token.len {
+                    if!digit(token[i]) {
+                        return err(failure(ErrorKind.Syntax, offset + i))
+                    }
+                    part := (token[i] - 48) as usize
+                    if index > (~0usize - part) / 10 {
+                        return err(failure(ErrorKind.MissingField, current_start))
+                    }
+                    index = index * 10 + part
+                }
+                count := 0usize
+                for cursor < current_end - 1 {
+                    end := skip_validated(self.data, cursor)
+                    if count == index {
+                        found = true
+                        next_start = cursor
+                        next_end = end
+                        break
+                    }
+                    count += 1
+                    cursor = skip_space(self.data, end)
+                    if cursor < current_end - 1 {
+                        cursor = skip_space(self.data, cursor + 1)
+                    }
+                }
+            } else {
+                return err(failure(ErrorKind.TypeMismatch, current_start))
+            }
+            if!found {
+                return err(failure(ErrorKind.MissingField, current_start))
+            }
+            current_start = next_start
+            current_end = next_end
+            if token_end == tokens.len {
+                return ok(Value { data: self.data, start: current_start, end: current_end })
+            }
+            offset = token_end + 1
+        }
+    }
+    pub fn decode_json(value: Value) -> Value!Error from(value) {
+        return ok(value)
+    }
+    pub fn encode_json<W>(&self, encoder: &mut Encoder<W>) -> void!Error {
+        return encoder.value(self)
+    }
+    pub fn require_object(&self) -> void!Error {
+        if self.kind() != Kind.Object {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        return ok()
+    }
+    pub fn check_fields(&self, keys: &[&str], deny_unknown: bool) -> void!Error {
+        self.require_object()?
+        if!deny_unknown {
+            return ok()
+        }
+        offset := skip_space(self.data, self.start + 1)
+        for offset < self.end - 1 {
+            key_end := skip_validated(self.data, offset)
+            name := json_string(self.data, offset, key_end)
+            found := false
+            for i in 0usize..keys.len {
+                if name.equals(keys[i]) {
+                    found = true
+                }
+            }
+            if!found {
+                return err(failure(ErrorKind.UnknownField, offset))
+            }
+            begin := skip_space(self.data, skip_space(self.data, key_end) + 1)
+            offset = skip_space(self.data, skip_validated(self.data, begin))
+            if offset < self.end - 1 {
+                offset = skip_space(self.data, offset + 1)
+            }
+        }
+        return ok()
+    }
+    pub fn len(&self) -> usize!Error {
+        object := self.kind() == Kind.Object
+        if!object && self.kind() != Kind.Array {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        count := 0usize
+        offset := skip_space(self.data, self.start + 1)
+        for offset < self.end - 1 {
+            if object {
+                offset = skip_space(self.data, skip_space(self.data, skip_validated(self.data, offset)) + 1)
+            }
+            offset = skip_space(self.data, skip_validated(self.data, offset))
+            count += 1
+            if offset < self.end - 1 {
+                offset = skip_space(self.data, offset + 1)
+            }
+        }
+        return ok(count)
+    }
+    pub fn as_bool(&self) -> bool!Error {
+        if self.kind() != Kind.Bool {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        return ok(self.data[self.start] == 116)
+    }
+    pub fn as_i64(&self) -> i64!Error {
+        if self.kind() != Kind.Number {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        match text.parse_i64(self.raw(), 10) {
+            ok(number) => {
+                return ok(number)
+            },
+            err(reason) => {
+                return err(failure(ErrorKind.NumberRange, self.start + reason.position))
+            }
+        }
+    }
+    pub fn as_u64(&self) -> u64!Error {
+        if self.kind() != Kind.Number {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        match text.parse_u64(self.raw(), 10) {
+            ok(number) => {
+                return ok(number)
+            },
+            err(reason) => {
+                return err(failure(ErrorKind.NumberRange, self.start + reason.position))
+            }
+        }
+    }
+    pub fn as_f64(&self) -> f64!Error {
+        if self.kind() != Kind.Number {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        match text.parse_f64(self.raw()) {
+            ok(number) => {
+                return ok(number)
+            },
+            err(reason) => {
+                return err(failure(ErrorKind.NumberRange, self.start + reason.position))
+            }
+        }
+    }
+    pub fn as_string(&self) -> String!Error from(self) {
+        if self.kind() != Kind.String {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        return ok(json_string(self.data, self.start, self.end))
+    }
+    // Consuming conversions preserve the input borrow without tying the result
+    // to a temporary Value wrapper. Codecs use these when returning structures.
+    pub fn into_raw(self) -> &[u8] from(self) {
+        return &self.data[self.start..self.end]
+    }
+    pub fn into_string(self) -> String!Error from(self) {
+        if self.kind() != Kind.String {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        return ok(json_string(self.data, self.start, self.end))
+    }
+    pub fn into_str(self) -> &str!Error from(self) {
+        if self.kind() != Kind.String {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        content := &self.data[self.start + 1..self.end - 1]
+        if has_escape(content) {
+            return err(failure(ErrorKind.EscapedString, self.start + 1))
+        }
+        unsafe {
+            return ok(mem.str_from_utf8(content))
+        }
+    }
+    pub fn as_str(&self) -> &str!Error from(self) {
+        if self.kind() != Kind.String {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        content := &self.data[self.start + 1..self.end - 1]
+        if has_escape(content) {
+            return err(failure(ErrorKind.EscapedString, self.start + 1))
+        }
+        unsafe {
+            return ok(mem.str_from_utf8(content))
+        }
+    }
+    pub fn get(&self, key: &str) -> Option<Value> from(self) {
+        if self.kind() != Kind.Object {
+            return none
+        }
+        offset := skip_space(self.data, self.start + 1)
+        for offset < self.end - 1 {
+            key_end := skip_validated(self.data, offset)
+            name := json_string(self.data, offset, key_end)
+            begin := skip_space(self.data, skip_space(self.data, key_end) + 1)
+            end := skip_validated(self.data, begin)
+            if name.equals(key) {
+                return some(Value { data: self.data, start: begin, end: end })
+            }
+            offset = skip_space(self.data, end)
+            if offset < self.end - 1 {
+                offset = skip_space(self.data, offset + 1)
+            }
+        }
+        return none
+    }
+    pub fn require(&self, key: &str) -> Value!Error from(self) {
+        if self.kind() != Kind.Object {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        match self.get(key) {
+            some(value) => {
+                return ok(value)
+            },
+            none => {
+                return err(failure(ErrorKind.MissingField, self.start))
+            }
+        }
+    }
+    pub fn at(&self, index: usize) -> Option<Value> from(self) {
+        if self.kind() != Kind.Array {
+            return none
+        }
+        offset := skip_space(self.data, self.start + 1)
+        current := 0usize
+        for offset < self.end - 1 {
+            end := skip_validated(self.data, offset)
+            if current == index {
+                return some(Value { data: self.data, start: offset, end: end })
+            }
+            current += 1
+            offset = skip_space(self.data, end)
+            if offset < self.end - 1 {
+                offset = skip_space(self.data, offset + 1)
+            }
+        }
+        return none
+    }
+    pub fn array(&self) -> Array!Error from(self) {
+        if self.kind() != Kind.Array {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        return ok(Array { data: self.data, offset: skip_space(self.data, self.start + 1), end: self.end - 1 })
+    }
+    pub fn object(&self) -> Object!Error from(self) {
+        if self.kind() != Kind.Object {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        return ok(Object { data: self.data, offset: skip_space(self.data, self.start + 1), end: self.end - 1 })
+    }
+}
+
+// JSON string content, without surrounding quotes. This view stores escapes
+// without allocation; equals compares decoded scalars and decode uses storage
+// supplied by the caller. from_str represents already decoded UTF-8 content.
+pub struct String {
+    data: &[u8]
+    escaped: bool
+    position: usize
+
+    pub fn from_str(value: &str) -> String from(value) {
+        return String { data: mem.str_bytes(value), escaped: false, position: 0 }
+    }
+    pub fn decode_json(value: Value) -> String!Error from(value) {
+        return value.into_string()
+    }
+    pub fn encode_json<W>(&self, encoder: &mut Encoder<W>) -> void!Error {
+        return encoder.json_string(self)
+    }
+    pub fn raw(&self) -> &[u8] from(self) {
+        return self.data
+    }
+    pub fn is_escaped(&self) -> bool {
+        return self.escaped
+    }
+    pub fn into_str(self) -> &str!Error from(self) {
+        if self.escaped {
+            return err(failure(ErrorKind.EscapedString, self.position))
+        }
+        unsafe {
+            return ok(mem.str_from_utf8(self.data))
+        }
+    }
+    pub fn as_str(&self) -> &str!Error from(self) {
+        if self.escaped {
+            return err(failure(ErrorKind.EscapedString, self.position))
+        }
+        unsafe {
+            return ok(mem.str_from_utf8(self.data))
+        }
+    }
+    pub fn equals(&self, other: &str) -> bool {
+        decoded := String.from_str(other)
+        return self.equal(&decoded)
+    }
+    pub fn equal(&self, other: &String) -> bool {
+        left := 0usize
+        right := 0usize
+        for left < self.data.len && right < other.data.len {
+            a := match scalar(self.data, left, self.escaped) {
+                ok(value) => {
+                    value
+                }, err(_) => {
+                    return false
+                }
+            }
+            b := match scalar(other.data, right, other.escaped) {
+                ok(value) => {
+                    value
+                }, err(_) => {
+                    return false
+                }
+            }
+            if a.scalar != b.scalar {
+                return false
+            }
+            left = a.next
+            right = b.next
+        }
+        return left == self.data.len && right == other.data.len
+    }
+    pub fn decoded_len(&self) -> usize {
+        count := 0usize
+        offset := 0usize
+        for offset < self.data.len {
+            decoded := match scalar(self.data, offset, self.escaped) {
+                ok(value) => {
+                    value
+                }, err(_) => {
+                    return 0
+                }
+            }
+            value := decoded.scalar
+            if value < 128 {
+                count += 1
+            } else if value < 2048 {
+                count += 2
+            } else if value < 65536 {
+                count += 3
+            } else {
+                count += 4
+            }
+            offset = decoded.next
+        }
+        return count
+    }
+    // Capacity is checked before any writes. Returned text borrows destination,
+    // so the source JSON can be released as soon as decoding completes.
+    pub fn decode(&self, destination: &mut[u8]) -> &str!Error from(destination) {
+        count := self.decoded_len()
+        if count > destination.len {
+            return err(failure(ErrorKind.BufferFull, destination.len))
+        }
+        offset := 0usize
+        written := 0usize
+        for offset < self.data.len {
+            decoded := scalar(self.data, offset, self.escaped)?
+            match text.encode(decoded.scalar, &mut destination[written..]) {
+                ok(size) => {
+                    written += size
+                },
+                err(_) => {
+                    return err(failure(ErrorKind.BufferFull, written))
+                }
+            }
+            offset = decoded.next
+        }
+        unsafe {
+            return ok(mem.str_from_utf8(&destination[..written]))
+        }
+    }
+}
+
+pub struct Array {
+    data: &[u8]
+    offset: usize
+    end: usize
+    pub fn next(&mut self) -> Option<Value> from(self) {
+        if self.offset >= self.end {
+            return none
+        }
+        start := self.offset
+        end := skip_validated(self.data, start)
+        self.offset = skip_space(self.data, end)
+        if self.offset < self.end {
+            self.offset = skip_space(self.data, self.offset + 1)
+        }
+        return some(Value { data: self.data, start: start, end: end })
+    }
+}
+pub struct Entry {
+    pub key: String
+    pub value: Value
+}
+pub struct Object {
+    data: &[u8]
+    offset: usize
+    end: usize
+    pub fn next(&mut self) -> Option<Entry> from(self) {
+        if self.offset >= self.end {
+            return none
+        }
+        key_start := self.offset
+        key_end := skip_validated(self.data, key_start)
+        start := skip_space(self.data, skip_space(self.data, key_end) + 1)
+        end := skip_validated(self.data, start)
+        self.offset = skip_space(self.data, end)
+        if self.offset < self.end {
+            self.offset = skip_space(self.data, self.offset + 1)
+        }
+        data := self.data
+        return some(Entry { key: json_string(data, key_start, key_end), value: Value { data: data, start: start, end: end } })
+    }
+}
+
+// Strict RFC 8259 document: exactly one value, valid Unicode scalar strings,
+// no duplicate object names after escape decoding, and at most 128 containers.
+// No allocator or operating-system services are required. Duplicate detection
+// uses quadratic time in each object's member count and constant extra memory.
+pub fn parse(input: &[u8]) -> Value!Error from(input) {
+    start := skip_space(input, 0)
+    end := scan(input, start, 0)?
+    tail := skip_space(input, end)
+    if tail != input.len {
+        return err(failure(ErrorKind.TrailingData, tail))
+    }
+    return ok(Value { data: input, start: start, end: end })
+}
+pub fn parse_str(input: &str) -> Value!Error from(input) {
+    return parse(mem.str_bytes(input))
+}
+
+// A cursor over whitespace-separated JSON documents, including NDJSON. This
+// borrows an existing input buffer; it does not buffer an external reader.
+// A failed document does not advance the cursor, and subsequent calls return
+// the same error. Values borrow the decoder and prevent advancing while live.
+pub struct Decoder {
+    data: &[u8]
+    offset: usize
+    failed: bool
+    failure_kind: ErrorKind
+    failure_position: usize
+
+    pub fn new(input: &[u8]) -> Decoder from(input) {
+        return Decoder { data: input, offset: 0, failed: false,
+        failure_kind: ErrorKind.Syntax, failure_position: 0 }
+    }
+    pub fn from_str(input: &str) -> Decoder from(input) {
+        return Decoder.new(mem.str_bytes(input))
+    }
+    pub fn position(&self) -> usize {
+        return self.offset
+    }
+    pub fn next(&mut self) -> Option<Value>!Error from(self) {
+        if self.failed {
+            return err(failure(copy_kind(&self.failure_kind), self.failure_position))
+        }
+        start := skip_space(self.data, self.offset)
+        if start == self.data.len {
+            self.offset = start
+            return ok(none)
+        }
+        end := match scan(self.data, start, 0) {
+            ok(value) => {
+                value
+            },
+            err(reason) => {
+                self.failed = true
+                self.failure_kind = copy_kind(&reason.kind)
+                self.failure_position = reason.position
+                return err(reason)
+            }
+        }
+        if end < self.data.len && !whitespace(self.data[end]) {
+            self.failed = true
+            self.failure_kind = ErrorKind.Syntax
+            self.failure_position = end
+            return err(failure(ErrorKind.Syntax, end))
+        }
+        self.offset = end
+        return ok(some(Value { data: self.data, start: start, end: end }))
+    }
+}

@@ -1,0 +1,332 @@
+package json
+
+import "core/mem"
+import "core/ptr"
+import "core/num"
+import "std/io"
+import "std/text"
+import "std/float_decimal"
+
+// A checked streaming JSON writer. The sink follows std/io's writer contract.
+// Errors latch: after partial output, further calls cannot report success.
+pub struct Encoder<W> {
+    sink: &mut W
+    count: usize
+    depth: usize
+    states: [128]u8
+    sizes: [128]usize
+    pretty: bool
+    started: bool
+    failed: bool
+
+    pub fn new(sink: &mut W) -> Encoder<W> from(sink) {
+        return Encoder<W> { sink: sink, count: 0, depth: 0,
+        states: [0u8; 128], sizes: [0usize; 128], pretty: false,
+        started: false, failed: false }
+    }
+    pub fn pretty(sink: &mut W) -> Encoder<W> from(sink) {
+        result: Encoder<W> = Encoder.new(sink)
+        result.pretty = true
+        return result
+    }
+    pub fn written(&self) -> usize {
+        return self.count
+    }
+    fn reject(&mut self, kind: ErrorKind) -> void!Error {
+        self.failed = true
+        return err(failure(kind, self.count))
+    }
+    fn bytes(&mut self, data: &[u8]) -> void!Error {
+        if self.failed {
+            return err(failure(ErrorKind.Io, self.count))
+        }
+        if data.len > num.MAX - self.count {
+            return self.reject(ErrorKind.NumberRange)
+        }
+        match io.write_all(self.sink, data) {
+            ok(size) => {
+                self.count += size
+            },
+            err(reason) => {
+                self.count += reason.transferred
+                self.failed = true
+                if reason.kind == io.ErrorKind.BufferFull {
+                    return err(failure(ErrorKind.BufferFull, self.count))
+                }
+                return err(failure(ErrorKind.Io, self.count))
+            },
+        }
+        return ok()
+    }
+    fn indent(&mut self) -> void!Error {
+        if self.pretty {
+            self.bytes(b"\n")?
+            for i in 0usize..self.depth {
+                self.bytes(b"  ")?
+            }
+        }
+        return ok()
+    }
+    fn before(&mut self) -> void!Error {
+        if self.failed {
+            return err(failure(ErrorKind.Io, self.count))
+        }
+        if self.depth == 0 {
+            if self.started {
+                return self.reject(ErrorKind.Syntax)
+            }
+            self.started = true
+            return ok()
+        }
+        index := self.depth - 1
+        if self.states[index] == 1 {
+            if self.sizes[index] != 0 {
+                self.bytes(b",")?
+            }
+            self.indent()?
+            self.sizes[index] += 1
+        } else if self.states[index] == 3 {
+            self.states[index] = 2
+        } else {
+            return self.reject(ErrorKind.Syntax)
+        }
+        return ok()
+    }
+    fn begin(&mut self, state: u8, token: &[u8]) -> void!Error {
+        if self.depth == 128 {
+            return self.reject(ErrorKind.Depth)
+        }
+        self.before()?
+        self.bytes(token)?
+        self.states[self.depth] = state
+        self.sizes[self.depth] = 0
+        self.depth += 1
+        return ok()
+    }
+    pub fn begin_object(&mut self) -> void!Error {
+        return self.begin(2, b"{")
+    }
+    pub fn begin_array(&mut self) -> void!Error {
+        return self.begin(1, b"[")
+    }
+    fn end(&mut self, state: u8, token: &[u8]) -> void!Error {
+        if self.depth == 0 {
+            return self.reject(ErrorKind.Syntax)
+        }
+        if self.states[self.depth - 1] != state {
+            return self.reject(ErrorKind.Syntax)
+        }
+        size := self.sizes[self.depth - 1]
+        self.depth -= 1
+        if size != 0 {
+            self.indent()?
+        }
+        return self.bytes(token)
+    }
+    pub fn end_object(&mut self) -> void!Error {
+        return self.end(2, b"}")
+    }
+    pub fn end_array(&mut self) -> void!Error {
+        return self.end(1, b"]")
+    }
+    fn quoted(&mut self, data: &[u8]) -> void!Error {
+        match text.validate(data) {
+            ok() => {}, err(_) => {
+                return self.reject(ErrorKind.Syntax)
+            },
+        }
+        self.bytes(b"\"")?
+        start := 0usize
+        for i in 0usize..data.len {
+            byte := data[i]
+            if byte < 32 || byte == 34 || byte == 92 {
+                self.bytes(&data[start..i])?
+                if byte == 34 {
+                    self.bytes(b"\\\"")?
+                } else if byte == 92 {
+                    self.bytes(b"\\\\")?
+                } else if byte == 8 {
+                    self.bytes(b"\\b")?
+                } else if byte == 12 {
+                    self.bytes(b"\\f")?
+                } else if byte == 10 {
+                    self.bytes(b"\\n")?
+                } else if byte == 13 {
+                    self.bytes(b"\\r")?
+                } else if byte == 9 {
+                    self.bytes(b"\\t")?
+                } else {
+                    digits := b"0123456789abcdef"
+                    escape := [92u8, 117u8, 48u8, 48u8, digits[(byte / 16) as usize], digits[(byte % 16) as usize]]
+                    self.bytes(&escape)?
+                }
+                start = i + 1
+            }
+        }
+        self.bytes(&data[start..])?
+        return self.bytes(b"\"")
+    }
+    fn before_key(&mut self) -> void!Error {
+        if self.depth == 0 {
+            return self.reject(ErrorKind.Syntax)
+        }
+        index := self.depth - 1
+        if self.states[index] != 2 {
+            return self.reject(ErrorKind.Syntax)
+        }
+        if self.sizes[index] != 0 {
+            self.bytes(b",")?
+        }
+        self.indent()?
+        self.sizes[index] += 1
+        self.states[index] = 3
+        return ok()
+    }
+    fn colon(&mut self) -> void!Error {
+        if self.pretty {
+            return self.bytes(b": ")
+        }
+        return self.bytes(b":")
+    }
+    pub fn key(&mut self, name: &str) -> void!Error {
+        self.before_key()?
+        self.quoted(mem.str_bytes(name))?
+        return self.colon()
+    }
+    pub fn null(&mut self) -> void!Error {
+        self.before()?
+        return self.bytes(b"null")
+    }
+    pub fn boolean(&mut self, value: bool) -> void!Error {
+        self.before()?
+        if value {
+            return self.bytes(b"true")
+        }
+        return self.bytes(b"false")
+    }
+    fn digits(&mut self, value: u64) -> void!Error {
+        buffer := [0u8; 20]
+        start := 20usize
+        for {
+            start -= 1
+            buffer[start] = 48 + (value % 10) as u8
+            value /= 10
+            if value == 0 {
+                break
+            }
+        }
+        return self.bytes(&buffer[start..])
+    }
+    pub fn unsigned(&mut self, value: u64) -> void!Error {
+        self.before()?
+        return self.digits(value)
+    }
+    pub fn signed(&mut self, value: i64) -> void!Error {
+        self.before()?
+        if value < 0 {
+            self.bytes(b"-")?
+            return self.digits((0 - (value + 1)) as u64 + 1)
+        }
+        return self.digits(value as u64)
+    }
+    pub fn floating(&mut self, value: f64) -> void!Error {
+        bits := unsafe {
+            ptr.read_unaligned(ptr.from_ref(&value) as *const u64)
+        }
+        if (bits & 0x7ff0000000000000u64) == 0x7ff0000000000000u64 {
+            return self.reject(ErrorKind.NumberRange)
+        }
+        self.before()?
+        magnitude := value
+        if (bits >> 63) != 0 {
+            self.bytes(b"-")?;
+            magnitude = 0.0 - value
+        }
+        buffer := [0u8; 32]
+        size := match float_decimal.convert(&mut buffer, magnitude, 16, true) {
+            ok(size) => {
+                size
+            }, err(_) => {
+                return self.reject(ErrorKind.NumberRange)
+            },
+        }
+        return self.bytes(&buffer[..size])
+    }
+    pub fn string(&mut self, value: &str) -> void!Error {
+        self.before()?
+        return self.quoted(mem.str_bytes(value))
+    }
+    fn string_body(&mut self, value: &String) -> void!Error {
+        if value.is_escaped() {
+            self.bytes(b"\"")?
+            self.bytes(value.raw())?
+            return self.bytes(b"\"")
+        }
+        return self.quoted(value.raw())
+    }
+    pub fn json_string(&mut self, value: &String) -> void!Error {
+        self.before()?
+        return self.string_body(value)
+    }
+    pub fn value(&mut self, value: &Value) -> void!Error {
+        match value.kind() {
+            Kind.Array => {
+                self.begin_array()?
+                items := value.array()?
+                for {
+                    match items.next() {
+                        some(item) => {
+                            self.value(&item)?
+                        }, none => {
+                            break
+                        },
+                    }
+                }
+                return self.end_array()
+            },
+            Kind.Object => {
+                self.begin_object()?
+                items := value.object()?
+                for {
+                    match items.next() {
+                        some(item) => {
+                            self.before_key()?
+                            self.string_body(&item.key)?
+                            self.colon()?
+                            self.value(&item.value)?
+                        }, none => {
+                            break
+                        },
+                    }
+                }
+                return self.end_object()
+            },
+            _ => {
+                self.before()?;
+                return self.bytes(value.raw())
+            },
+        }
+    }
+    // Raw insertion is validated as one complete JSON value before writing.
+    pub fn raw(&mut self, data: &[u8]) -> void!Error {
+        value := match parse(data) {
+            ok(value) => {
+                value
+            }, err(reason) => {
+                self.failed = true
+                return err(reason)
+            },
+        }
+        return self.value(&value)
+    }
+    pub fn finish(&mut self) -> usize!Error {
+        if self.failed {
+            return err(failure(ErrorKind.Io, self.count))
+        }
+        if!self.started || self.depth != 0 {
+            self.failed = true
+            return err(failure(ErrorKind.Syntax, self.count))
+        }
+        return ok(self.count)
+    }
+}

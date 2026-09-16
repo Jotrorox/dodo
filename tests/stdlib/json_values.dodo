@@ -1,0 +1,493 @@
+package json_values
+
+import "std/encoding/json"
+import "core/bytes"
+import "core/mem"
+
+fn rejects(input: &str) -> bool {
+    match json.parse_str(input) {
+        ok(_) => {
+            return false
+        },
+        err(_) => {
+            return true
+        }
+    }
+}
+fn text_view(input: &[u8]) -> &str!json.Error from(input) {
+    value := json.parse(input)?
+    return value.into_str()
+}
+fn string_view(input: &[u8]) -> json.String!json.Error from(input) {
+    value := json.parse(input)?
+    return value.into_string()
+}
+fn string_text_view(input: &[u8]) -> &str!json.Error from(input) {
+    value := string_view(input)?
+    return value.into_str()
+}
+fn raw_view(input: &[u8]) -> &[u8]!json.Error from(input) {
+    value := json.parse(input)?
+    return ok(value.into_raw())
+}
+fn checks() -> i32!json.Error {
+    document := json.parse_str(" \r\n{\"name\":\"Dodo\",\"items\":[null,true,false,-17,0.125],\"escaped\":\"A\\u00df\\uD83D\\uDE00\\n\"}\t")?
+    if document.kind() != json.Kind.Object || document.position() != 3 || document.len()? != 3 {
+        return ok(1)
+    }
+    name := document.require("name")?
+    if!bytes.equal(mem.str_bytes(name.as_str()?), b"Dodo") {
+        return ok(2)
+    }
+    array := document.require("items")?
+    if array.len()? != 5 {
+        return ok(3)
+    }
+    match array.at(0) {
+        some(value) => {
+            if!value.is_null() {
+                return ok(4)
+            }
+        }, none => {
+            return ok(5)
+        }
+    }
+    match array.at(1) {
+        some(value) => {
+            if!value.as_bool()? {
+                return ok(6)
+            }
+        }, none => {
+            return ok(7)
+        }
+    }
+    match array.at(2) {
+        some(value) => {
+            if value.as_bool()? {
+                return ok(8)
+            }
+        }, none => {
+            return ok(9)
+        }
+    }
+    match array.at(3) {
+        some(value) => {
+            if value.as_i64()? != -17 {
+                return ok(10)
+            }
+        }, none => {
+            return ok(11)
+        }
+    }
+    match array.at(4) {
+        some(value) => {
+            if value.as_f64()? != 0.125 {
+                return ok(12)
+            }
+        }, none => {
+            return ok(13)
+        }
+    }
+    match array.at(5) {
+        some(_) => {
+            return ok(14)
+        }, none => {}
+    }
+    match document.get("absent") {
+        some(_) => {
+            return ok(15)
+        }, none => {}
+    }
+    match document.require("absent") {
+        ok(_) => {
+            return ok(16)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.MissingField {
+                return ok(17)
+            }
+        }
+    }
+    escaped := document.require("escaped")?
+    string := escaped.as_string()?
+    if!string.is_escaped() || string.decoded_len() != 8 || !string.equals("Aß😀\n") {
+        return ok(18)
+    }
+    short := [99u8; 7]
+    match string.decode(&mut short) {
+        ok(_) => {
+            return ok(19)
+        },
+        err(reason) => {
+            if reason.kind != json.ErrorKind.BufferFull || short[0] != 99 || short[6] != 99 {
+                return ok(20)
+            }
+        }
+    }
+    decoded := [0u8; 8]
+    if!bytes.equal(mem.str_bytes(string.decode(&mut decoded)?), mem.str_bytes("Aß😀\n")) {
+        return ok(21)
+    }
+    match string.as_str() {
+        ok(_) => {
+            return ok(22)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.EscapedString {
+                return ok(23)
+            }
+        }
+    }
+    members := document.object()?
+    count := 0usize
+    for {
+        match members.next() {
+            some(entry) => {
+                if count == 0 && !entry.key.equals("name") {
+                    return ok(24)
+                }
+                count += 1
+            }, none => {
+                break
+            }
+        }
+    }
+    if count != 3 {
+        return ok(25)
+    }
+    elements := array.array()?
+    count = 0
+    for {
+        match elements.next() {
+            some(_) => {
+                count += 1
+            }, none => {
+                break
+            }
+        }
+    }
+    if count != 5 {
+        return ok(26)
+    }
+    allowed := ["name", "items", "escaped"]
+    document.check_fields(&allowed, true)?
+    narrow := ["name"]
+    document.check_fields(&narrow, false)?
+    match document.check_fields(&narrow, true) {
+        ok() => {
+            return ok(27)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.UnknownField {
+                return ok(28)
+            }
+        }
+    }
+    unsigned := json.parse_str("18446744073709551615")?
+    if unsigned.as_u64()? != 18446744073709551615u64 {
+        return ok(29)
+    }
+    match unsigned.as_i64() {
+        ok(_) => {
+            return ok(30)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.NumberRange {
+                return ok(31)
+            }
+        }
+    }
+    signed := json.parse_str("-9223372036854775808")?
+    if signed.as_i64()? != -9223372036854775807i64 - 1 {
+        return ok(32)
+    }
+    too_big := json.parse_str("18446744073709551616")?
+    match too_big.as_u64() {
+        ok(_) => {
+            return ok(33)
+        }, err(_) => {}
+    }
+    huge := json.parse_str("1e99999")?
+    if!bytes.equal(huge.raw(), b"1e99999") {
+        return ok(34)
+    }
+    match huge.as_f64() {
+        ok(_) => {
+            return ok(35)
+        }, err(_) => {}
+    }
+    negative := json.parse_str("-1")?
+    match negative.as_u64() {
+        ok(_) => {
+            return ok(36)
+        }, err(_) => {}
+    }
+    decimal := json.parse_str("1.0")?
+    match decimal.as_i64() {
+        ok(_) => {
+            return ok(37)
+        }, err(_) => {}
+    }
+    duplicate := json.parse_str("{\"a\":1,\"\\u0061\":2}")
+    match duplicate {
+        ok(_) => {
+            return ok(38)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.DuplicateField || reason.position != 7 {
+                return ok(39)
+            }
+        }
+    }
+    nested := json.parse_str("{\"a\":{\"a\":1},\"b\":[{\"a\":2}]}")?
+    if nested.len()? != 2 {
+        return ok(40)
+    }
+    decoded_key := json.parse_str("{\"\\u0061\":9}")?
+    keyed := decoded_key.require("a")?
+    if keyed.as_i64()? != 9 {
+        return ok(41)
+    }
+    malformed := ["", " ", "01", "-01", "+1", ".1", "1.", "1e", "1e+", "NaN", "Infinity", "true false", "nullx", "[1,]", "{\"a\":1,}", "{a:1}", "{\"a\" 1}", "[1 2]", "[", "{", "\"", "\"\\q\"", "\"\\uD800\"", "\"\\uDC00\"", "\"\\uD800\\u0041\"", "\"\\uZZZZ\"", "\"a\nb\"", "/*x*/null", "\u{FEFF}null"]
+    for i in 0usize..malformed.len {
+        if!rejects(malformed[i]) {
+            return ok(42)
+        }
+    }
+    invalid_utf8 := [34u8, 237, 160, 128, 34]
+    match json.parse(&invalid_utf8) {
+        ok(_) => {
+            return ok(43)
+        }, err(_) => {}
+    }
+    overlong := [34u8, 192, 128, 34]
+    match json.parse(&overlong) {
+        ok(_) => {
+            return ok(44)
+        }, err(_) => {}
+    }
+    incomplete := [34u8, 240, 159]
+    match json.parse(&incomplete) {
+        ok(_) => {
+            return ok(45)
+        }, err(_) => {}
+    }
+    controls := [34u8, 0, 34]
+    match json.parse(&controls) {
+        ok(_) => {
+            return ok(46)
+        }, err(_) => {}
+    }
+    boundaries := [0u8; 257]
+    for i in 0usize..128 {
+        boundaries[i] = 91
+    }
+    boundaries[128] = 48
+    for i in 129usize..257 {
+        boundaries[i] = 93
+    }
+    deep := json.parse(&boundaries)?
+    if deep.kind() != json.Kind.Array {
+        return ok(47)
+    }
+    too_deep := [0u8; 259]
+    for i in 0usize..129 {
+        too_deep[i] = 91
+    }
+    too_deep[129] = 48
+    for i in 130usize..259 {
+        too_deep[i] = 93
+    }
+    match json.parse(&too_deep) {
+        ok(_) => {
+            return ok(48)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.Depth {
+                return ok(49)
+            }
+        }
+    }
+    all_escapes := json.parse_str("\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0000\"")?
+    escaped_all := all_escapes.as_string()?
+    if!escaped_all.equals("\"\\/\x08\x0c\n\r\t\0") {
+        return ok(50)
+    }
+    stream := json.Decoder.from_str("null\n{\"n\":2}\r\n[3]\ttrue ")
+    documents := 0usize
+    for {
+        match stream.next()? {
+            some(value) => {
+                if documents == 0 && !value.is_null() {
+                    return ok(51)
+                }
+                if documents == 1 && value.kind() != json.Kind.Object {
+                    return ok(52)
+                }
+                if documents == 2 && value.kind() != json.Kind.Array {
+                    return ok(53)
+                }
+                if documents == 3 && !value.as_bool()? {
+                    return ok(54)
+                }
+                documents += 1
+            }, none => {
+                break
+            }
+        }
+    }
+    if documents != 4 || stream.position() != 23 {
+        return ok(55)
+    }
+    broken := json.Decoder.from_str("null\n[1,]")
+    match broken.next()? {
+        some(value) => {
+            if!value.is_null() {
+                return ok(56)
+            }
+        }, none => {
+            return ok(57)
+        }
+    }
+    for attempt in 0usize..2 {
+        match broken.next() {
+            ok(_) => {
+                return ok(58)
+            },
+            err(reason) => {
+                if reason.kind != json.ErrorKind.Syntax || reason.position != 8 {
+                    return ok(59)
+                }
+            }
+        }
+        if broken.position() != 4 {
+            return ok(60)
+        }
+    }
+    joined := json.Decoder.from_str("01")
+    match joined.next() {
+        ok(_) => {
+            return ok(61)
+        }, err(reason) => {
+            if reason.position != 1 {
+                return ok(62)
+            }
+        }
+    }
+    root_pointer := document.pointer("")?
+    if root_pointer.kind() != json.Kind.Object {
+        return ok(63)
+    }
+    item_pointer := document.pointer("/items/3")?
+    if item_pointer.as_i64()? != -17 {
+        return ok(64)
+    }
+    special_keys := json.parse_str("{\"a/b\":{\"~name\":[42]},\"\":7,\"\\u0061\":8,\"~1\":9}")?
+    special_pointer := special_keys.pointer("/a~1b/~0name/0")?
+    if special_pointer.as_i64()? != 42 {
+        return ok(65)
+    }
+    empty_pointer := special_keys.pointer("/")?
+    if empty_pointer.as_i64()? != 7 {
+        return ok(66)
+    }
+    escaped_pointer := special_keys.pointer("/a")?
+    if escaped_pointer.as_i64()? != 8 {
+        return ok(67)
+    }
+    single_pass := special_keys.pointer("/~01")?
+    if single_pass.as_i64()? != 9 {
+        return ok(68)
+    }
+    bad_pointers := ["items/0", "/items/01", "/items/+1", "/items/", "/~2", "/~"]
+    for i in 0usize..bad_pointers.len {
+        match document.pointer(bad_pointers[i]) {
+            ok(_) => {
+                return ok(69)
+            }, err(reason) => {
+                if reason.kind != json.ErrorKind.Syntax {
+                    return ok(70)
+                }
+            }
+        }
+    }
+    match document.pointer("/items/8") {
+        ok(_) => {
+            return ok(71)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.MissingField {
+                return ok(72)
+            }
+        }
+    }
+    match document.pointer("/name/0") {
+        ok(_) => {
+            return ok(73)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.TypeMismatch {
+                return ok(74)
+            }
+        }
+    }
+    match document.pointer("/items/-") {
+        ok(_) => {
+            return ok(75)
+        }, err(reason) => {
+            if reason.kind != json.ErrorKind.MissingField {
+                return ok(76)
+            }
+        }
+    }
+    backing := [34u8, 104, 105, 34]
+    {
+        borrowed := text_view(&backing)?
+        if!bytes.equal(mem.str_bytes(borrowed), b"hi") {
+            return ok(77)
+        }
+        preserved := string_view(&backing)?
+        if!preserved.equals("hi") {
+            return ok(78)
+        }
+        raw := raw_view(&backing)?
+        if!bytes.equal(raw, &backing) {
+            return ok(79)
+        }
+        through_string := string_text_view(&backing)?
+        if!bytes.equal(mem.str_bytes(through_string), b"hi") {
+            return ok(80)
+        }
+    }
+    backing[1] = 98
+    fresh := text_view(&backing)?
+    if!bytes.equal(mem.str_bytes(fresh), b"bi") {
+        return ok(81)
+    }
+    match text_view(b"\"h\\u0069\"") {
+        ok(_) => {
+            return ok(82)
+        },
+        err(reason) => {
+            if reason.kind != json.ErrorKind.EscapedString {
+                return ok(83)
+            }
+        }
+    }
+    match string_text_view(b"\"h\\u0069\"") {
+        ok(_) => {
+            return ok(84)
+        },
+        err(reason) => {
+            if reason.kind != json.ErrorKind.EscapedString {
+                return ok(85)
+            }
+        }
+    }
+    scalar_boundaries := string_view(b"\"\\ud7ff\\ue000\\ud800\\udc00\\udbff\\udfff\"")?
+    if!scalar_boundaries.equals("\u{d7ff}\u{e000}\u{10000}\u{10ffff}") {
+        return ok(86)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    match checks() {
+        ok(code) => {
+            return code
+        }, err(_) => {
+            return 100
+        }
+    }
+}

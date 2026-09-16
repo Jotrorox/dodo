@@ -1,0 +1,72 @@
+package json
+
+// Ownership-preserving projection for derived decoders. Taking a Value by
+// value transfers its input borrow, rather than borrowing a stack-local view.
+// Both returned views retain exactly that original input dependency.
+pub struct Field {
+    pub rest: Value
+    pub value: Value
+}
+pub struct OptionalField {
+    pub rest: Value
+    pub value: Option<Value>
+}
+pub fn take_field(source: Value, name: &str) -> Field!Error from(source) {
+    child := source.require(name)?
+    start := child.start
+    end := child.end
+    data := source.data
+    first := source.start
+    last := source.end
+    return ok(Field {
+        rest: Value { data: data, start: first, end: last },
+        value: Value { data: data, start: start, end: end }
+    })
+}
+pub fn take_optional_field(source: Value, name: &str) -> OptionalField!Error from(source) {
+    source.require_object()?
+    start := 0usize
+    end := 0usize
+    found := false
+    match source.get(name) {
+        some(child) => {
+            start = child.start;
+            end = child.end;
+            found = true
+        },
+        none => {},
+    }
+    data := source.data
+    first := source.start
+    last := source.end
+    value: Option<Value> = none
+    if found {
+        value = some(Value { data: data, start: start, end: end })
+    }
+    return ok(OptionalField {
+        rest: Value { data: data, start: first, end: last }, value: value
+    })
+}
+pub fn take_element(source: Value, index: usize) -> Field!Error from(source) {
+    if source.kind() != Kind.Array {
+        return err(failure(ErrorKind.TypeMismatch, source.start))
+    }
+    start := 0usize
+    end := 0usize
+    match source.at(index) {
+        some(child) => {
+            start = child.start;
+            end = child.end
+        },
+        none => {
+            return err(failure(ErrorKind.MissingField, source.start))
+        },
+    }
+    data := source.data
+    first := source.start
+    last := source.end
+    return ok(Field {
+        rest: Value { data: data, start: first, end: last },
+        value: Value { data: data, start: start, end: end }
+    })
+}

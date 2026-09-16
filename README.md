@@ -131,6 +131,7 @@ and conservative borrow checking are documented alongside the specification.
 - [Language specification](https://jotrorox.github.io/dodo/language-spec-0.1/): the Dodo 0.1 design, also available as [plain text](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.txt) and [PDF](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.pdf).
 - [Examples](examples): programs covering borrowing, patterns, generics, and hardware access.
 - [Web applications](https://jotrorox.github.io/dodo/web/): fluent routes, ready-made responses, middleware, and in-process tests; see [the multi-route example](examples/web_routes.dodo).
+- [JSON](docs/src/content/docs/json.md): typed struct decoding and encoding with `@derive(Json)`, borrowed strings, and explicit output storage; see [the round-trip example](examples/json.dodo).
 - [Standard library](https://jotrorox.github.io/dodo/standard-library/): portable foundations, explicit allocation, I/O, text, collections, mathematics, hashing, time, networking, TLS, HTTP/1.1 and web routing, with independently selected operating-system and execution providers.
 - [Mutable slice splitting](docs/src/content/docs/slice-splitting.md): checked, disjoint mutable views with ordinary ownership and source lifetimes.
 - [Container element safety](docs/src/content/docs/container-elements.md): checked shared-reference collections, owned strings, scoped mutation, and remaining element restrictions.
