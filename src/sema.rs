@@ -1482,7 +1482,34 @@ impl<'a> Checker<'a> {
                     self.statement(step)?;
                     self.temporary.clear();
                 }
+                // Only break edges reach the end of an unconditional loop.
+                // Save their initialization facts before the conservative
+                // ownership joins also include entry and back-edge states.
+                let break_initialization = self
+                    .loops
+                    .last()
+                    .unwrap()
+                    .breaks
+                    .as_ref()
+                    .filter(|_| condition.is_none())
+                    .map(|scopes| {
+                        scopes
+                            .iter()
+                            .flatten()
+                            .map(|v| (v.id, v.initialized, v.moved_at))
+                            .collect::<Vec<_>>()
+                    });
                 self.end_loop(&before, repeats, span)?;
+                if condition.is_none() {
+                    self.scopes = merge_states(before.clone(), self.scopes.clone());
+                    if let Some(initialization) = break_initialization {
+                        for (id, initialized, moved_at) in initialization {
+                            let variable = self.by_id_mut(id).unwrap();
+                            variable.initialized = initialized;
+                            variable.moved_at = moved_at;
+                        }
+                    }
+                }
                 // Check iteration-local views before the zero-iteration path
                 // makes bindings assigned only in the body uninitialized.
                 self.check_split_loop_escape(first_partition, split_depth, span)?;
@@ -1490,7 +1517,9 @@ impl<'a> Checker<'a> {
                     self.scopes = merge_states(self.scopes.clone(), condition_exit);
                 }
                 self.loop_uses.pop();
-                self.scopes = merge_states(before, self.scopes.clone());
+                if condition.is_some() {
+                    self.scopes = merge_states(before, self.scopes.clone());
+                }
                 self.finish_scope(span)?;
                 self.scopes.pop();
                 // A forever loop is a diverging statement unless it can break.
@@ -5077,6 +5106,73 @@ mod tests {
     #[test]
     fn early_return_initialization() {
         accepts("fn f(b: bool) -> u8 {\n u8 x\n if b { return 0 } else { x = 1 }\n return x\n}");
+    }
+    #[test]
+    fn loop_exit_initialization() {
+        for body in [
+            "x = 1\nbreak",
+            "if b { x = 1\nbreak } else { x = 2\nbreak }",
+            "if b { continue }\nx = 1\nbreak",
+            "if b { x = 1\nbreak }",
+            "if b { return 0 }\nx = 1\nbreak",
+            "if b { for {} }\nx = 1\nbreak",
+            "for { x = 1\nbreak }\nbreak",
+            "match b { true => { x = 1\nbreak } false => { x = 2\nbreak } }",
+            "if let some(n) = &option { x = *n\nbreak } else { x = 2\nbreak }",
+            "let some(n) = &option else { x = 1\nbreak }\nx = *n\nbreak",
+        ] {
+            accepts(&format!(
+                "fn f(b: bool, option: Option<u8>) -> u8 {{ u8 x\nfor {{ {body} }}\nreturn x }}"
+            ));
+        }
+    }
+    #[test]
+    fn loop_exit_initialization_requires_every_exit() {
+        for body in [
+            "for b { x = 1\nbreak }",
+            "for i := 0; i < 2; i += 1 { x = 1\nbreak }",
+            "for i in 0..2 { x = 1\nbreak }",
+            "for value in values { x = 1\nbreak }",
+            "for { if b { break }\nx = 1\nbreak }",
+            "for { if b { x = 1\nbreak } else { break } }",
+            "for { if b { x = 1\ncontinue }\nbreak }",
+            "for { for { if b { break }\nx = 1\nbreak }\nbreak }",
+            "for { x := 1u8\nbreak }",
+        ] {
+            rejects(
+                &format!(
+                    "fn f(b: bool) -> u8 {{ values := [2]u8{{1, 2}}\nu8 x\n{body}\nreturn x }}"
+                ),
+                "uninitialized",
+            );
+        }
+    }
+    #[test]
+    fn loop_exit_initialization_preserves_ownership() {
+        accepts(
+            "struct S { u8 n }\nfn take(s: S) {}\nfn f(s: S) -> S { take(s)\nfor { s = S{n: 1}\nbreak }\nreturn s }",
+        );
+        rejects(
+            "struct S { u8 n }\nfn take(s: S) {}\nfn f(b: bool) -> S { S s\nfor { s = S{n: 1}\nif b { take(s)\nbreak }\nbreak }\nreturn s }",
+            "moved",
+        );
+        rejects(
+            "fn f() -> u8 { x := 1u8\n&u8 r\nfor { r = &x\nbreak }\nx = 2\nreturn *r }",
+            "live shared borrow",
+        );
+        // A borrow acquired on a continuing iteration can reach a later break.
+        rejects(
+            "fn f(b: bool) -> u8 { x := 1u8\ny := 2u8\nr := &x\nfor { if b { break }\nr = &y }\ny = 3\nreturn *r }",
+            "live shared borrow",
+        );
+        rejects(
+            "fn f() -> u8 { &u8 r\nfor { x := 1u8\nr = &x\nbreak }\nreturn *r }",
+            "outlives its source",
+        );
+        rejects(
+            "enum E { Bad }\nfn value() -> u8!E { return ok(1) }\nfn f() { u8!E r\nfor { r = value()\nbreak } }",
+            "never handled",
+        );
     }
     #[test]
     fn move_invalidation_and_reinitialization() {

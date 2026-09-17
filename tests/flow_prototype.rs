@@ -112,13 +112,13 @@ fn call_arguments_move_in_evaluation_order() {
 }
 
 #[test]
-fn loop_exit_initialization_is_more_precise() {
+fn loop_exit_initialization_agrees() {
     for body in [
         "fn f() -> u8 { u8 x\nfor { x = 1\nbreak }\nreturn x }",
         "fn f(b: bool) -> u8 { u8 x\nfor { if b { x = 1\nbreak } else { x = 2\nbreak } }\nreturn x }",
         "fn f(b: bool) -> u8 { u8 x\nfor { if b { continue }\nx = 1\nbreak }\nreturn x }",
     ] {
-        compare(body, Some("uninitialized"), &[]);
+        compare(body, None, &[]);
     }
     // A zero-iteration path and a break that skips assignment must still fail.
     compare(
