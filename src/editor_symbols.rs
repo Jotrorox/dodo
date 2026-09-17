@@ -593,7 +593,7 @@ impl Index {
         }
     }
 
-    fn namespace(&self, at: usize) -> Option<&BTreeMap<String, String>> {
+    pub(super) fn namespace(&self, at: usize) -> Option<&BTreeMap<String, String>> {
         self.namespaces
             .get(&self.source(Span { start: at, end: at })?.path)
     }

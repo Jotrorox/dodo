@@ -1,6 +1,8 @@
 //! UTF-8 hosted conveniences use controlled files, environment and local children.
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +35,7 @@ fn success(output: Output, context: &str) {
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
+#[cfg(target_os = "linux")]
 fn build(source: &Path, executable: &Path, optimization: &str) {
     success(
         Command::new(env!("CARGO_BIN_EXE_dodo"))

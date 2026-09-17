@@ -345,7 +345,7 @@ fn imported_tests_are_unique_and_helper_failures_keep_their_original_location() 
     for level in ["0", "3"] {
         let output = w.test(&["-O", level]);
         failure(&output);
-        let text = text(&output);
+        let text = text(&output).replace('\\', "/");
         for expected in [
             "Discovered 3 tests",
             "lib/part.dodo:2:",

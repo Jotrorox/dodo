@@ -49,6 +49,12 @@ fn success(output: &Output) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// The Windows CRT expands LF to CRLF for hosted stderr and C panic hooks.
+// Compare logical output while keeping the check name and source span exact.
+fn stderr_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n")
+}
 fn tool(name: &str) -> bool {
     let present = Command::new(name)
         .arg("--version")
@@ -234,7 +240,7 @@ fn main() -> i32 {
 #[test]
 fn failures_name_checks_and_exact_locations_with_and_without_debug() {
     let w = Workspace::new();
-    for (expression, reason) in [
+    for (case, (expression, reason)) in [
         ("255u8 + 1u8", "arithmetic overflow"),
         ("0u8 - 1u8", "arithmetic overflow"),
         ("200u8 * 2u8", "arithmetic overflow"),
@@ -247,11 +253,17 @@ fn failures_name_checks_and_exact_locations_with_and_without_debug() {
         ("values[index]", "index bounds"),
         ("values[0usize..index + 1usize]", "slice bounds"),
         ("fail()!", "result unwrap"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let source = w.file("failure.dodo", &format!("package failure\nfn main() {{\n    values := [1i32, 2]\n    index := 2usize\n    _ = {expression}\n}}\nfn fail() -> i32!u8 {{ err(1) }}\n"));
         for level in ["0", "3"] {
             for debug in [false, true] {
-                let program = w.0.join("failure");
+                let program = w.0.join(format!(
+                    "failure-{case}-{level}-{debug}{}",
+                    std::env::consts::EXE_SUFFIX
+                ));
                 let mut args = vec!["-O", level];
                 if debug {
                     args.push("-g");
@@ -261,7 +273,7 @@ fn failures_name_checks_and_exact_locations_with_and_without_debug() {
                 assert!(!output.status.success(), "{expression} did not fail");
                 let expected = format!("dodo: {reason} check failed at {}:5:9\n", source.display());
                 assert_eq!(
-                    String::from_utf8_lossy(&output.stderr),
+                    stderr_text(&output),
                     expected,
                     "{expression}, -O{level}, debug={debug}"
                 );
@@ -298,13 +310,16 @@ fn main() -> i32 {{
             ),
         );
         for level in ["0", "3"] {
-            let program = w.0.join("unwrap");
+            let program = w.0.join(format!(
+                "unwrap-{ty}-{level}{}",
+                std::env::consts::EXE_SUFFIX
+            ));
             w.build(&source, &program, &["-O", level]);
             let output = Command::new(&program).output().unwrap();
             assert!(!output.status.success());
             let column = if ty == "void" { 5 } else { 9 };
             assert_eq!(
-                String::from_utf8_lossy(&output.stderr),
+                stderr_text(&output),
                 format!(
                     "dodo: result unwrap check failed at {}:11:{column}\n",
                     source.display()
@@ -321,7 +336,7 @@ fn nonreturning_panic_hooks_receive_checks_and_assertion_locations() {
         "hook.c",
         "#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n_Noreturn void board_panic(const char *check, const char *file, uint32_t line, uint32_t column) { fprintf(stderr, \"HOOK %s %s:%u:%u\\n\", check, file, line, column); _Exit(73); }\n",
     );
-    for (statement, check, column) in [
+    for (case, (statement, check, column)) in [
         ("_ = 12 / 0", "division by zero", 9),
         ("_ = 255u8 + 1u8", "arithmetic overflow", 9),
         ("_ = 256u32 as u8", "numeric conversion", 9),
@@ -331,11 +346,17 @@ fn nonreturning_panic_hooks_receive_checks_and_assertion_locations() {
         ("assert_eq(1, 2, \"numbers differ\")", "assert_eq", 5),
         ("assert_ne(\"same\", \"same\")", "assert_ne", 5),
         ("fail()!", "result unwrap", 5),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let source = w.file("hook.dodo", &format!("package hook\nfn main() -> i32 {{\n    values := [1i32, 2]\n    index := 2usize\n    {statement}\n    return 0\n}}\nfn fail() -> i32!u8 {{ err(1) }}\n"));
         for level in ["0", "3"] {
             for debug in [false, true] {
-                let program = w.0.join("hook");
+                let program = w.0.join(format!(
+                    "hook-{case}-{level}-{debug}{}",
+                    std::env::consts::EXE_SUFFIX
+                ));
                 let mut args = vec![
                     "-O",
                     level,
@@ -351,7 +372,7 @@ fn nonreturning_panic_hooks_receive_checks_and_assertion_locations() {
                 let output = Command::new(&program).output().unwrap();
                 assert_eq!(output.status.code(), Some(73), "{statement}, -O{level}");
                 assert_eq!(
-                    String::from_utf8_lossy(&output.stderr),
+                    stderr_text(&output),
                     format!("HOOK {check} {}:5:{column}\n", source.display())
                 );
             }
@@ -545,7 +566,7 @@ fn gdb_failure_backtraces_and_generic_import_locations_survive_optimization() {
         w.build(&source, &program, &["-g", "-O", level]);
         let output = Command::new(&program).output().unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
+            stderr_text(&output),
             format!(
                 "dodo: division by zero check failed at {}:3:12\n",
                 helper.display()

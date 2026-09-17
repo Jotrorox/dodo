@@ -9,6 +9,11 @@ use crate::{package, parser, sema};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 // Symbol queries are consumed by the optional LSP server.
+#[path = "editor_actions.rs"]
+#[cfg_attr(not(feature = "llvm"), allow(dead_code))]
+pub(crate) mod actions;
+#[path = "editor_inlay.rs"]
+mod inlay;
 #[path = "editor_symbols.rs"]
 #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
 pub(crate) mod symbols;
@@ -29,6 +34,7 @@ pub struct Document {
     text: String,
     start: usize,
     entries: Vec<HoverEntry>,
+    hints: Vec<inlay::Hint>,
     #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
     pub(crate) diagnostics: Vec<Diagnostic>,
     #[cfg_attr(not(feature = "llvm"), allow(dead_code))]
@@ -83,12 +89,15 @@ impl Document {
             tokens: &tokens,
             start,
             entries: vec![],
+            inlays: inlay::Index::new(&tokens, start, text.len(), symbols.namespace(start)),
+            inlays_enabled: true,
         };
         index.program();
         Self {
             text,
             start,
             entries: index.entries,
+            hints: index.inlays.finish(),
             diagnostics,
             index: symbols,
         }
@@ -107,6 +116,40 @@ impl Document {
             "range": range(&self.text, local_span(entry.span, self.start))
         }))
     }
+
+    /// Return inferred binding types within a zero-based UTF-16, half-open range.
+    pub fn inlay_hints(
+        &self,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+    ) -> Vec<Value> {
+        let start = (start_line, start_character);
+        let end = (end_line, end_character);
+        if start >= end {
+            return vec![];
+        }
+        self.hints
+            .iter()
+            .filter_map(|hint| {
+                let position = position(&self.text, hint.offset);
+                let at = (
+                    position["line"].as_u64()? as u32,
+                    position["character"].as_u64()? as u32,
+                );
+                (start <= at && at < end).then(|| {
+                    json!({
+                        "position": position,
+                        "label": hint.label,
+                        "kind": 1,
+                        "paddingLeft": false,
+                        "paddingRight": false
+                    })
+                })
+            })
+            .collect()
+    }
 }
 
 struct HoverIndex<'a> {
@@ -114,6 +157,8 @@ struct HoverIndex<'a> {
     tokens: &'a [Token],
     start: usize,
     entries: Vec<HoverEntry>,
+    inlays: inlay::Index<'a>,
+    inlays_enabled: bool,
 }
 
 impl HoverIndex<'_> {
@@ -194,6 +239,8 @@ impl HoverIndex<'_> {
             if function.printing.is_some() && function.generic_instance {
                 continue;
             }
+            // Specializations share source spans but may infer different types.
+            self.inlays_enabled = !function.generic_instance;
             let markdown = signature(function);
             if let Some(span) = self.name_span(function.span, short_name(&function.name)) {
                 self.add(span, markdown.clone());
@@ -209,6 +256,7 @@ impl HoverIndex<'_> {
                 self.block(body);
             }
         }
+        self.inlays_enabled = true;
         for constant in &self.program.constants {
             self.binding(constant.span, &constant.name, &constant.ty);
             self.expression(&constant.value);
@@ -230,6 +278,9 @@ impl HoverIndex<'_> {
     }
 
     fn statement(&mut self, statement: &Stmt) {
+        if self.inlays_enabled {
+            self.inlays.statement(statement);
+        }
         match &statement.kind {
             StmtKind::Let {
                 name, ty, value, ..
@@ -524,7 +575,7 @@ fn local_span(span: Span, start: usize) -> Span {
     }
 }
 
-fn byte_offset(text: &str, line: u32, character: u32) -> Option<usize> {
+pub(crate) fn byte_offset(text: &str, line: u32, character: u32) -> Option<usize> {
     let mut start = 0;
     for _ in 0..line {
         start += text.get(start..)?.find('\n')? + 1;

@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import http.client
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -25,8 +26,12 @@ def connect(number, process):
     until = time.monotonic() + 5
     while True:
         try:
-            return socket.create_connection(("127.0.0.1", number), timeout=3)
-        except ConnectionRefusedError:
+            # A refused Windows loopback connect can consume a full second,
+            # longer than the cancellation fixture's lifetime. Retry promptly.
+            connection = socket.create_connection(("127.0.0.1", number), timeout=.1)
+            connection.settimeout(3)
+            return connection
+        except (ConnectionRefusedError, TimeoutError):
             if process.poll() is not None or time.monotonic() >= until:
                 raise
             time.sleep(.01)
@@ -220,7 +225,10 @@ def main():
                     content = content.replace("idle_timeout_ms = 100", "idle_timeout_ms = 5000").replace("header_timeout_ms = 300", "header_timeout_ms = 5000")
                 source.write_text(content)
                 binary = source.with_suffix("")
-                built = subprocess.run([str(args.compiler.resolve()), "compile", str(source), "-O", str(optimization), "-o", str(binary)], capture_output=True, text=True)
+                # The bounded eight-slot fixture needs the same 8 MiB stack
+                # used by the dedicated Windows native/Wine harnesses.
+                link_args = ["--link-arg", "-Wl,/stack:8388608"] if os.name == "nt" else []
+                built = subprocess.run([str(args.compiler.resolve()), "compile", str(source), "-O", str(optimization), "-o", str(binary), *link_args], capture_output=True, text=True)
                 assert built.returncode == 0, built.stderr
                 with running(binary) as process:
                     if stopping:

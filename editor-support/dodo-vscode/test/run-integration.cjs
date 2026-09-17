@@ -9,7 +9,9 @@ async function main() {
   const extension = path.resolve(__dirname, "..");
   const server = path.resolve(process.env.DODO_TEST_SERVER || path.join(extension, "../../target/debug/dodo" + (process.platform === "win32" ? ".exe" : "")));
   await fs.access(server);
-  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "dodo-vscode-test-"));
+  // Windows TEMP can contain an 8.3 username alias; match the server's canonical
+  // source paths when comparing navigation results from the real client.
+  const temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "dodo-vscode-test-")));
   const workspace = path.join(temporary, "workspace with spaces");
   try {
     await fs.mkdir(path.join(workspace, ".vscode"), { recursive: true });

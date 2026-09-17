@@ -10,6 +10,7 @@ fn rejects(source: &str, diagnostic: &str) {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    let path = dodoc::package::source_path(&path);
     let overlays = std::collections::BTreeMap::from([(path.clone(), source.to_owned())]);
     let mut loaded = dodoc::package::load_with_overlays(&path, &overlays).unwrap();
     let error = dodoc::sema::check(&mut loaded.program)

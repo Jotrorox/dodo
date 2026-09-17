@@ -5,8 +5,9 @@ built-in `dodo lsp` language server.
 
 - Syntax highlighting for declarations, types, attributes, strings, byte literals,
   numeric literals, borrowing, and operators.
-- Diagnostics, completion, hover information, go-to-definition, references,
-  rename, signature help, and document formatting.
+- Diagnostics, actionable quick fixes, inferred type inlay hints, completion,
+  hover information, go-to-definition, references, rename, signature help, and
+  document formatting.
 - Comment toggling, bracket pairing, indentation, folding, and snippets.
 - Unsaved file and untitled buffer support, with compiler target and package-checking settings.
 
@@ -115,6 +116,34 @@ Type a snippet prefix and select it from completion, or use **Insert Snippet**:
 | `unsafe` | Unsafe block with a safety comment |
 | `test`, `assert_eq` | Native tests and assertions |
 
+## Inlay hints and quick fixes
+
+Inferred local types appear beside their binding names: `let answer = 42i32`
+shows an `: i32` hint after `answer`. Explicit type annotations suppress the
+corresponding hint. Hints follow unsaved edits and use VS Code's
+**Editor: Inlay Hints: Enabled** setting. To enable them specifically for Dodo:
+
+```json
+{
+  "[dodo]": {
+    "editor.inlayHints.enabled": "on"
+  }
+}
+```
+
+Place the cursor on a diagnostic and open **Quick Fix...** (`Ctrl+.` on Windows
+and Linux, `Cmd+.` on macOS). For a direct assignment to, or mutable borrow of,
+an immutable local binding, **Make `count` mutable** changes `let count = 1`
+to `count := 1`. For a missing package qualifier such as `math.answer()`,
+**Import `math`** inserts
+the matching import when the server can resolve a public member in a bundled
+library or nearby local package. Unqualified names require a manual import.
+
+Quick fixes apply normal editor edits, so they can be undone and do not save
+the file. Diagnostics and hints refresh after the edit. Some diagnostics have
+no safe automatic fix, and unresolved types have no inlay hint. These features
+require a compiler build with inlay-hint and code-action support.
+
 ## Troubleshooting and limits
 
 If the server fails to start, open its output channel and check the executable
@@ -157,8 +186,9 @@ npm run test:integration
 ```
 
 The runner downloads VS Code 1.137.0 to test the minimum supported version and uses
-an isolated temporary workspace and profile. It exercises LSP features, settings
-changes, restart, unsaved overlays, untitled buffers, and snippet insertion.
+an isolated temporary workspace and profile. It exercises LSP features, including
+inferred type hints and applying missing-import and mutability quick fixes, plus
+settings changes, restart, unsaved overlays, untitled buffers, and snippet insertion.
 Set `DODO_TEST_SERVER` to an absolute compiler path to use another build, and
 `VSCODE_TEST_VERSION=stable` to test current VS Code. Linux needs a display; on a
 headless machine use `xvfb-run -a npm run test:integration`.

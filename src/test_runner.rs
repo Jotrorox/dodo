@@ -212,6 +212,9 @@ struct Unit {
 
 fn display_path(path: &Path) -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
+    // Discovery canonicalizes paths. Match that representation on Windows,
+    // where canonical paths carry a verbatim prefix and the cwd does not.
+    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
     path.strip_prefix(cwd)
         .unwrap_or(path)
         .display()

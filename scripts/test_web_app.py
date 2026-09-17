@@ -3,9 +3,10 @@
 import argparse
 from pathlib import Path
 import socket
-import selectors
+import queue
 import subprocess
 import tempfile
+import threading
 
 from test_http_web import ROOT, connect, port, run
 from test_web_reactor import request, response
@@ -67,10 +68,15 @@ def build(compiler, scratch, optimization, policy, custom, stopping=False):
 
 
 def returned(process):
-    with selectors.DefaultSelector() as ready:
-        ready.register(process.stdout, selectors.EVENT_READ)
-        assert ready.select(5), "serving did not return"
-    assert process.stdout.readline() == b"stopped\n", "server failed before returning"
+    # Windows select() accepts sockets only, so wait for the pipe on a reader
+    # thread. Keep the timeout and the check that serving returns before exit.
+    lines = queue.Queue()
+    threading.Thread(target=lambda: lines.put(process.stdout.readline()), daemon=True).start()
+    try:
+        line = lines.get(timeout=5)
+    except queue.Empty:
+        raise AssertionError("serving did not return") from None
+    assert line == b"stopped\n", "server failed before returning"
     assert process.poll() is None, "shutdown must be checked while the process is alive"
 
 
@@ -101,7 +107,8 @@ def check_server(binary, number, exchanges, policy, stopping):
         # The program is blocked on stdin after serving returned: OS process
         # cleanup cannot mask a leaked listener or accepted socket.
         try:
-            with socket.create_connection(("127.0.0.1", number), timeout=.2):
+            # Windows can take about a second to report a refused connection.
+            with socket.create_connection(("127.0.0.1", number), timeout=3):
                 raise AssertionError("listener survived shutdown")
         except ConnectionRefusedError:
             pass

@@ -25,7 +25,9 @@ impl Workspace {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             match fs::create_dir(&path) {
-                Ok(()) => return Self(path),
+                // Overlay keys use canonical paths, including Windows' verbatim
+                // prefix; URI fixtures below independently encode that path.
+                Ok(()) => return Self(fs::canonicalize(path).unwrap()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
                 Err(error) => panic!("create workspace: {error}"),
             }
@@ -39,7 +41,12 @@ impl Workspace {
         #[cfg(not(windows))]
         let bytes = path.as_os_str().as_encoded_bytes();
         #[cfg(windows)]
-        let path = path.to_str().unwrap().replace('\\', "/");
+        let path = path.to_str().unwrap();
+        #[cfg(windows)]
+        let path = path
+            .strip_prefix(r"\\?\")
+            .unwrap_or(path)
+            .replace('\\', "/");
         #[cfg(windows)]
         let bytes = path.as_bytes();
         let mut uri = String::from(if cfg!(windows) { "file:///" } else { "file://" });
@@ -286,6 +293,11 @@ fn lsp_lifecycle_capabilities_and_request_errors() {
         client.notify("$/cancelRequest", json!({"id": 123}));
         client.notify("unknown/notification", Value::Null);
         assert_eq!(capabilities["hoverProvider"], true);
+        assert_eq!(capabilities["inlayHintProvider"], true);
+        assert_eq!(
+            capabilities["codeActionProvider"]["codeActionKinds"],
+            json!(["quickfix"])
+        );
         let response = client.request(json!("hover"), "textDocument/hover", json!({}));
         assert_eq!(response["error"]["code"], -32602);
         assert!(client.shutdown().is_empty());
@@ -863,6 +875,361 @@ fn at(text: &str, needle: &str) -> Value {
         "character":prefix.rsplit('\n').next().unwrap().encode_utf16().count()})
 }
 
+fn full_range(text: &str) -> Value {
+    json!({"start":{"line":0,"character":0}, "end": {
+        "line": text.bytes().filter(|b| *b == b'\n').count(),
+        "character": text.rsplit('\n').next().unwrap().trim_end_matches('\r').encode_utf16().count()
+    }})
+}
+
+fn range_query(
+    client: &mut Client,
+    method: &str,
+    uri: &str,
+    range: Value,
+    context: Value,
+) -> Value {
+    client.request(
+        json!("range"),
+        &format!("textDocument/{method}"),
+        json!({"textDocument":{"uri":uri},"range":range,"context":context}),
+    )
+}
+
+#[test]
+fn lsp_inlay_hints_follow_unsaved_types_ranges_and_package_offsets() {
+    let workspace = Workspace::new();
+    let uri = workspace.uri("z.dodo");
+    workspace.file("a.dodo", "package app\nfn number() -> i32 { return 42 }\n");
+    let source = "package app\r\nfn main() -> i32 {\r\n_ = \"😀\"; let answer = number()\r\nlet explicit: i32 = answer\r\nreturn explicit\r\n}\r\n";
+    let mut client = Client::start("lsp");
+    client.initialize("package");
+    client.open(&uri, source, 1);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    let response = range_query(
+        &mut client,
+        "inlayHint",
+        &uri,
+        full_range(source),
+        Value::Null,
+    );
+    let hints = response["result"].as_array().unwrap();
+    assert_eq!(hints.len(), 1, "{response}");
+    assert_eq!(hints[0]["label"], ": i32");
+    assert_eq!(hints[0]["kind"], 1);
+    assert_eq!(hints[0]["position"], at(source, " = number()"));
+    let response = range_query(
+        &mut client,
+        "inlayHint",
+        &uri,
+        json!({"start":{"line":3,"character":0},"end":{"line":4,"character":0}}),
+        Value::Null,
+    );
+    assert_eq!(response["result"], json!([]));
+    let changed = source
+        .replace("number()", "true")
+        .replace("let explicit: i32 = answer", "let explicit: i32 = 1");
+    client.change(&uri, &changed, 2);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    let response = range_query(
+        &mut client,
+        "inlayHint",
+        &uri,
+        full_range(&changed),
+        Value::Null,
+    );
+    assert_eq!(response["result"][0]["label"], ": bool");
+    assert!(!workspace.0.join("z.dodo").exists());
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_quick_fixes_apply_imports_and_mutability_and_clear_diagnostics() {
+    let workspace = Workspace::new();
+    workspace.file(
+        "numbers.dodo",
+        "package numbers\npub fn value() -> i32 { return 42 }\n",
+    );
+    let uri = workspace.uri("main.dodo");
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    for (version, source, title) in [
+        (
+            1,
+            "// 😀 keep this header\r\npackage app\r\nfn main() -> i32 { return numbers.value() }\r\n",
+            "import",
+        ),
+        (
+            3,
+            "package app\nfn main() -> i32 {\n_ = \"😀\"; let count = 1i32\ncount = 2\nreturn count\n}\n",
+            "mutable",
+        ),
+    ] {
+        if version == 1 {
+            client.open(&uri, source, version);
+        } else {
+            client.change(&uri, source, version);
+        }
+        let diagnostics = client.diagnostics()[&uri]["diagnostics"].clone();
+        assert!(!diagnostics.as_array().unwrap().is_empty());
+        let response = range_query(
+            &mut client,
+            "codeAction",
+            &uri,
+            full_range(source),
+            json!({"diagnostics":diagnostics}),
+        );
+        let actions = response["result"].as_array().unwrap();
+        let action = actions
+            .iter()
+            .find(|action| {
+                action["title"]
+                    .as_str()
+                    .unwrap()
+                    .to_lowercase()
+                    .contains(title)
+            })
+            .expect("actionable fix");
+        assert_eq!(action["kind"], "quickfix");
+        assert!(!action["diagnostics"].as_array().unwrap().is_empty());
+        let fixed = apply_text_edits(source, &action["edit"]["changes"][&uri]);
+        assert_ne!(fixed, source);
+        if title == "import" {
+            assert!(
+                fixed.starts_with("// 😀 keep this header\r\npackage app\r\n"),
+                "{fixed}"
+            );
+            assert!(fixed.contains("import \"numbers\"\r\n"), "{fixed}");
+        }
+        client.change(&uri, &fixed, version + 1);
+        assert_eq!(
+            client.diagnostics()[&uri]["diagnostics"],
+            json!([]),
+            "{fixed}"
+        );
+        let stale = range_query(
+            &mut client,
+            "codeAction",
+            &uri,
+            full_range(&fixed),
+            json!({"diagnostics":diagnostics}),
+        );
+        assert_eq!(
+            stale["result"],
+            json!([]),
+            "stale client diagnostics must not create edits"
+        );
+    }
+    assert!(!workspace.0.join("main.dodo").exists());
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_quick_fixes_use_versions_and_unsaved_import_candidates() {
+    let workspace = Workspace::new();
+    let uri = workspace.uri("main.dodo");
+    let imported = workspace.uri("values.dodo");
+    let source = "package app\nfn main() -> i32 { return values.answer() }\n";
+    let mut client = Client::start("lsp");
+    let response = client.request(
+        json!(1),
+        "initialize",
+        json!({"capabilities":{"workspace":{"workspaceEdit":{"documentChanges":true}}}}),
+    );
+    assert!(response.get("error").is_none());
+    client.open(
+        &imported,
+        "package values\npub fn answer() -> i32 { return 42 }\n",
+        1,
+    );
+    client.diagnostics();
+    client.open(&uri, source, 7);
+    let diagnostics = client.diagnostics()[&uri]["diagnostics"].clone();
+    let response = range_query(
+        &mut client,
+        "codeAction",
+        &uri,
+        full_range(source),
+        json!({"diagnostics":diagnostics,"only":["quickfix"]}),
+    );
+    let edit = &response["result"][0]["edit"]["documentChanges"][0];
+    assert_eq!(
+        edit["textDocument"],
+        json!({"uri":uri,"version":7}),
+        "{response}"
+    );
+    let fixed = apply_text_edits(source, &edit["edits"]);
+    client.change(&uri, &fixed, 8);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    assert!(!workspace.0.join("values.dodo").exists());
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_range_requests_validate_parameters_and_filter_action_kinds() {
+    let workspace = Workspace::new();
+    let uri = workspace.uri("main.dodo");
+    let source = "package app\nfn main() { let count = 1i32; count = 2 }\n";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&uri, source, 1);
+    client.diagnostics();
+    for method in ["inlayHint", "codeAction"] {
+        for range in [
+            Value::Null,
+            json!({"start":{"line":-1,"character":0},"end":{"line":0,"character":0}}),
+            json!({"start":{"line":1,"character":0},"end":{"line":0,"character":0}}),
+            json!({"start":{"line":0,"character":false},"end":{"line":0,"character":0}}),
+        ] {
+            let response = range_query(&mut client, method, &uri, range, json!({"diagnostics":[]}));
+            assert_eq!(response["error"]["code"], -32602, "{response}");
+        }
+    }
+    for context in [
+        Value::Null,
+        json!({}),
+        json!({"diagnostics":false}),
+        json!({"diagnostics":[{}]}),
+        json!({"diagnostics":[],"only":[1]}),
+        json!({"diagnostics":[],"triggerKind":3}),
+    ] {
+        let response = range_query(&mut client, "codeAction", &uri, full_range(source), context);
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+    }
+    for only in [
+        json!([]),
+        json!(["source.organizeImports"]),
+        json!(["refactor"]),
+    ] {
+        let response = range_query(
+            &mut client,
+            "codeAction",
+            &uri,
+            full_range(source),
+            json!({"diagnostics":[],"only":only}),
+        );
+        assert_eq!(response["result"], json!([]));
+    }
+    let response = range_query(
+        &mut client,
+        "codeAction",
+        &uri,
+        json!({"start":{"line":0,"character":0},"end":{"line":0,"character":0}}),
+        json!({"diagnostics":[]}),
+    );
+    assert_eq!(response["result"], json!([]));
+    let response = range_query(
+        &mut client,
+        "inlayHint",
+        "untitled:unopened",
+        full_range(source),
+        Value::Null,
+    );
+    assert_eq!(response["result"], json!([]));
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_untitled_quick_fix_updates_inferred_hint_without_saving() {
+    let uri = "untitled:quick-fix";
+    let source = "package app\nfn main() { let value = 1u32; value = 2 }\n";
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(uri, source, 1);
+    let diagnostics = client.diagnostics()[uri]["diagnostics"].clone();
+    let response = range_query(
+        &mut client,
+        "codeAction",
+        uri,
+        diagnostics[0]["range"].clone(),
+        json!({"diagnostics": diagnostics}),
+    );
+    let fixed = apply_text_edits(source, &response["result"][0]["edit"]["changes"][uri]);
+    client.change(uri, &fixed, 2);
+    assert_eq!(client.diagnostics()[uri]["diagnostics"], json!([]));
+    let hints = range_query(
+        &mut client,
+        "inlayHint",
+        uri,
+        full_range(&fixed),
+        Value::Null,
+    );
+    assert_eq!(hints["result"][0]["label"], ": u32");
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_inlay_refresh_rechecks_dependents_and_honors_client_support() {
+    fn receive_refresh(client: &mut Client) -> Value {
+        loop {
+            let message = client.receive();
+            if message["method"] == "workspace/inlayHint/refresh" {
+                return message["id"].clone();
+            }
+            assert_eq!(
+                message["method"], "textDocument/publishDiagnostics",
+                "{message}"
+            );
+        }
+    }
+    let workspace = Workspace::new();
+    let root = workspace.uri("main.dodo");
+    let dependency = workspace.file(
+        "values.dodo",
+        "package values\npub fn answer() -> i32 { return 42 }\n",
+    );
+    let source = "package app\nimport \"values\"\nfn main() { let answer = values.answer() }\n";
+    let mut client = Client::start("lsp");
+    let initialized = client.request(
+        json!(1),
+        "initialize",
+        json!({"capabilities":{"workspace":{"inlayHint":{"refreshSupport":true}}}}),
+    );
+    assert!(initialized.get("error").is_none());
+    client.notify("initialized", json!({}));
+    client.open(&root, source, 1);
+    let id = receive_refresh(&mut client);
+    client.send(json!({"jsonrpc":"2.0","id":id,"result":null}));
+    let before = range_query(
+        &mut client,
+        "inlayHint",
+        &root,
+        full_range(source),
+        Value::Null,
+    );
+    assert_eq!(before["result"][0]["label"], ": i32");
+    client.open(
+        &dependency,
+        "package values\npub fn answer() -> bool { return true }\n",
+        1,
+    );
+    let next = receive_refresh(&mut client);
+    assert_ne!(id, next);
+    client.send(json!({"jsonrpc":"2.0","id":next,"result":null}));
+    let after = range_query(
+        &mut client,
+        "inlayHint",
+        &root,
+        full_range(source),
+        Value::Null,
+    );
+    assert_eq!(after["result"][0]["label"], ": bool");
+    client.change(
+        &dependency,
+        "package values\npub fn answer() -> u8 { return 1 }\n",
+        2,
+    );
+    let id = receive_refresh(&mut client);
+    client.send(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"unsupported"}}));
+    client.change(
+        &dependency,
+        "package values\npub fn answer() -> i32 { return 2 }\n",
+        3,
+    );
+    client.diagnostics(); // Rejected refresh requests are not repeatedly sent.
+    assert!(client.shutdown().is_empty());
+}
+
 fn query(
     client: &mut Client,
     method: &str,
@@ -1103,6 +1470,22 @@ fn lsp_bundled_definitions_open_authoritative_read_only_sources() {
         );
         let hover = query(&mut client, "hover", uri, library, "abs(value:", json!({}));
         assert!(hover["result"].to_string().contains("f64"), "{hover}");
+        let hints = range_query(
+            &mut client,
+            "inlayHint",
+            uri,
+            full_range(library),
+            Value::Null,
+        );
+        assert!(hints["result"].as_array().is_some(), "{hints}");
+        let actions = range_query(
+            &mut client,
+            "codeAction",
+            uri,
+            full_range(library),
+            json!({"diagnostics":[]}),
+        );
+        assert_eq!(actions["result"], json!([]));
         // Parameters and local bindings inside library sources are read-only too.
         assert_eq!(
             query(

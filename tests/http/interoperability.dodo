@@ -1,13 +1,12 @@
 package interoperability
 import "std/http"
 import "core/mem"
-unsafe extern "C" fn putchar(value: i32) -> i32
+import "std/console"
+import "std/io"
 fn emit(data: &[u8]) {
-    for i in 0usize..data.len {
-        unsafe {
-            putchar(data[i] as i32)
-        }
-    }
+    // Keep protocol bytes intact, including CRLF, on Windows stdout.
+    output := console.stdout()
+    io.write_all(&mut output, data)!
 }
 fn main() -> i32 {
     headers := [http.Header { name: mem.str_bytes("Content-Type"), value: mem.str_bytes("text/plain") }]

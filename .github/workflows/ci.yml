@@ -42,9 +42,13 @@ jobs:
           retention-days: 7
 
   frontend:
-    name: Rust frontend / no LLVM
-    runs-on: ubuntu-24.04
+    name: Rust frontend / no LLVM / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -56,7 +60,7 @@ jobs:
       - name: Cache frontend build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: frontend-no-llvm
+          key: frontend-no-llvm-${{ matrix.os }}
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy without LLVM

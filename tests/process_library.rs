@@ -1,7 +1,11 @@
 //! Native process ownership, bounded concurrent pipe draining and arguments.
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Output;
+#[cfg(target_os = "linux")]
 fn success(output: Output, context: &str) {
     assert!(
         output.status.success(),

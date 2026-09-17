@@ -55,6 +55,62 @@ exports.run = async function () {
   await replace(document, source);
   await eventually("cleared diagnostics", () => vscode.languages.getDiagnostics(uri).length === 0);
 
+  // Real client conversion preserves type hints, their exact positions, and ranges.
+  const hintSource = "package editor_test\nfn main() -> i32 {\nlet answer = 42i32\nlet annotated: i32 = 7\nreturn answer + annotated\n}\n";
+  await replace(document, hintSource);
+  const inlayHints = (range = new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length))) =>
+    vscode.commands.executeCommand("vscode.executeInlayHintProvider", uri, range);
+  const labelText = (hint) => typeof hint.label === "string" ? hint.label : hint.label.map((part) => part.value).join("");
+  const answerPosition = document.positionAt(hintSource.indexOf("answer") + "answer".length);
+  const hints = await eventually("inferred type inlay hint", async () => {
+    const result = await inlayHints();
+    return result?.some((hint) => hint.position.isEqual(answerPosition) && labelText(hint) === ": i32") && result;
+  });
+  const answerHint = hints.find((hint) => hint.position.isEqual(answerPosition));
+  assert.equal(answerHint.kind, vscode.InlayHintKind.Type);
+  assert.ok(!hints.some((hint) => hint.position.line === 3), "explicit annotation has no redundant hint");
+  const otherLineHints = await inlayHints(new vscode.Range(3, 0, 4, 0));
+  assert.ok(!otherLineHints.some((hint) => hint.position.isEqual(answerPosition)), "hint requests respect their range");
+  await replace(document, hintSource.replace("let answer =", "let answer: i32 ="));
+  await eventually("inlay hints update for unsaved annotations", async () => (await inlayHints())?.length === 0);
+
+  const quickFix = async (diagnostic, title) => {
+    const actions = await vscode.commands.executeCommand(
+      "vscode.executeCodeActionProvider", uri, diagnostic.range, vscode.CodeActionKind.QuickFix.value);
+    return actions?.find((action) => action.title === title && action.edit);
+  };
+  await replace(document, "package editor_test\nfn main() -> i32 {\nlet count = 1i32\ncount = 2\nreturn count\n}\n");
+  const immutableDiagnostic = await eventually("immutable assignment diagnostic", () =>
+    vscode.languages.getDiagnostics(uri).find((diagnostic) => /immutable binding/.test(diagnostic.message)));
+  const mutableFix = await eventually("make mutable quick fix", () => quickFix(immutableDiagnostic, "Make `count` mutable"));
+  assert.equal(mutableFix.kind.value, vscode.CodeActionKind.QuickFix.value);
+  assert.ok(await vscode.workspace.applyEdit(mutableFix.edit));
+  assert.match(document.getText(), /\ncount := 1i32\n/);
+  await eventually("mutable quick fix clears diagnostics", () => vscode.languages.getDiagnostics(uri).length === 0);
+  await vscode.commands.executeCommand("undo");
+  assert.match(document.getText(), /\nlet count = 1i32\n/);
+  await eventually("undo restores immutable assignment diagnostic", () =>
+    vscode.languages.getDiagnostics(uri).some((diagnostic) => /immutable binding/.test(diagnostic.message)));
+  await vscode.commands.executeCommand("redo");
+  assert.match(document.getText(), /\ncount := 1i32\n/);
+  await eventually("redo clears immutable assignment diagnostic", () => vscode.languages.getDiagnostics(uri).length === 0);
+
+  const missingImportUri = vscode.Uri.file(path.join(folder, "math.dodo"));
+  await fs.writeFile(missingImportUri.fsPath, "package math\npub fn answer() -> i32 { return 42 }\n");
+  await replace(document, "package editor_test\nfn main() -> i32 { return math.answer() }\n");
+  const importDiagnostic = await eventually("missing import diagnostic", () =>
+    vscode.languages.getDiagnostics(uri).find((diagnostic) =>
+      /cannot resolve the receiver type|unknown.*math/.test(diagnostic.message)));
+  const importFix = await eventually("missing import quick fix", () => quickFix(importDiagnostic, "Import `math`"));
+  assert.equal(importFix.kind.value, vscode.CodeActionKind.QuickFix.value);
+  assert.ok(await vscode.workspace.applyEdit(importFix.edit));
+  assert.match(document.getText(), /\bimport "math"/);
+  await eventually("import quick fix clears diagnostics", () => vscode.languages.getDiagnostics(uri).length === 0);
+  assert.equal(await fs.readFile(uri.fsPath, "utf8"), source, "quick fixes edit the unsaved buffer");
+  await replace(document, source);
+  await fs.unlink(missingImportUri.fsPath);
+  await eventually("quick fix fixture cleanup", () => vscode.languages.getDiagnostics(uri).length === 0);
+
   const formatted = await vscode.commands.executeCommand("vscode.executeFormatDocumentProvider", uri, { tabSize: 2, insertSpaces: true });
   assert.ok(formatted.length);
   const formattingEdit = new vscode.WorkspaceEdit();
@@ -91,9 +147,12 @@ exports.run = async function () {
   await fs.mkdir(path.dirname(dependencyUri.fsPath));
   await fs.writeFile(dependencyUri.fsPath, dependencySource);
   await replace(document, "package editor_test\nimport \"lib\"\nfn main() -> i32 { return lib.value() }\n");
+  let dependencyDefinitions;
   await eventually("import navigation", async () => {
-    const result = await vscode.commands.executeCommand("vscode.executeDefinitionProvider", uri, at("value", 1));
-    return result?.some((item) => (item.uri || item.targetUri).toString() === dependencyUri.toString());
+    dependencyDefinitions = await vscode.commands.executeCommand("vscode.executeDefinitionProvider", uri, at("value", 1));
+    return dependencyDefinitions?.some((item) => (item.uri || item.targetUri).toString() === dependencyUri.toString());
+  }).catch((error) => {
+    throw new Error(`${error.message}: expected ${dependencyUri.toString()}, got ${JSON.stringify(dependencyDefinitions)}; diagnostics: ${JSON.stringify(vscode.languages.getDiagnostics(uri))}`, { cause: error });
   });
   await fs.writeFile(dependencyUri.fsPath, dependencySource.replace("return 7", "return missing_disk"));
   await eventually("watched dependency diagnostics", () => vscode.languages.getDiagnostics(dependencyUri).some((d) => /missing_disk/.test(d.message)));
@@ -142,5 +201,5 @@ exports.run = async function () {
   await eventually("disabled server", async () => !(await scratchHover())?.length);
   await config.update("server.enabled", true, vscode.ConfigurationTarget.Workspace);
   await eventually("reenabled server", async () => (await scratchHover())?.length);
-  console.log("Dodo integration passed: activation, hover, completion, definition, bundled sources, watched dependencies, references, rename, signatures, diagnostics, formatting, restart, settings, overlays, untitled buffers, snippets, and disable.");
+  console.log("Dodo integration passed: activation, hover, completion, definition, bundled sources, watched dependencies, references, rename, signatures, diagnostics, type inlay hints, mutable and missing-import quick fixes, formatting, restart, settings, overlays, untitled buffers, snippets, and disable.");
 };

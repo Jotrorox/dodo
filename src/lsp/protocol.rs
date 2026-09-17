@@ -184,6 +184,7 @@ pub(super) struct InitializeParams {
     pub document_changes: bool,
     pub dynamic_watches: bool,
     pub relative_watches: bool,
+    pub inlay_refresh: bool,
 }
 
 impl InitializeParams {
@@ -197,12 +198,14 @@ impl InitializeParams {
         let workspace = optional_object(&capabilities["workspace"])?;
         let edits = optional_object(&workspace["workspaceEdit"])?;
         let watches = optional_object(&workspace["didChangeWatchedFiles"])?;
+        let inlays = optional_object(&workspace["inlayHint"])?;
         Ok(Self {
             initialization_options: value["initializationOptions"].clone(),
             document_changes: optional(&edits["documentChanges"], boolean)?.unwrap_or(false),
             dynamic_watches: optional(&watches["dynamicRegistration"], boolean)?.unwrap_or(false),
             relative_watches: optional(&watches["relativePatternSupport"], boolean)?
                 .unwrap_or(false),
+            inlay_refresh: optional(&inlays["refreshSupport"], boolean)?.unwrap_or(false),
         })
     }
 }
@@ -311,6 +314,53 @@ pub(super) struct QueryParams {
     pub position: Position,
     pub include_declaration: bool,
     pub new_name: Option<String>,
+}
+
+/// Range requests share validation, while code actions additionally require a
+/// diagnostic context. Actions are computed from the current document analysis.
+pub(super) struct RangeParams {
+    pub uri: String,
+    pub range: Range,
+    pub quick_fixes: bool,
+}
+
+impl RangeParams {
+    pub fn parse(value: &Value, method: &str) -> Result<Self> {
+        let uri = document_uri(value)?;
+        let range = Range::parse(&value["range"])?;
+        if (range.start.line, range.start.character) > (range.end.line, range.end.character) {
+            return Err("range ends before it starts");
+        }
+        let mut quick_fixes = true;
+        if method == "textDocument/codeAction" {
+            let context = object(&value["context"])?;
+            let diagnostics = context["diagnostics"]
+                .as_array()
+                .ok_or("expected diagnostics")?;
+            for diagnostic in diagnostics {
+                let diagnostic = object(diagnostic)?;
+                Range::parse(&diagnostic["range"])?;
+                string(&diagnostic["message"])?;
+            }
+            if let Some(only) = context.get("only") {
+                let only = only.as_array().ok_or("expected action kinds")?;
+                quick_fixes = false;
+                for kind in only {
+                    quick_fixes |= matches!(string(kind)?, "" | "quickfix");
+                }
+            }
+            if let Some(trigger) = context.get("triggerKind")
+                && !matches!(unsigned(trigger)?, 1 | 2)
+            {
+                return Err("invalid code action trigger kind");
+            }
+        }
+        Ok(Self {
+            uri,
+            range,
+            quick_fixes,
+        })
+    }
 }
 
 impl QueryParams {

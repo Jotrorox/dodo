@@ -1,6 +1,6 @@
 ---
 title: "Editor setup"
-description: "Configure dodo lsp for completion, navigation, rename, signatures, formatting, and target-aware diagnostics."
+description: "Configure dodo lsp for type inlay hints, diagnostic quick fixes, completion, navigation, formatting, and target-aware diagnostics."
 section: "Using Dodo"
 order: 120
 ---
@@ -93,11 +93,50 @@ names `view`, `replace`, and `finish`, and the `choose` call to inspect these
 details. Ownership errors appear as editor diagnostics; their related locations
 point to the same source expressions as the command-line labels.
 
+## Inferred type hints and quick fixes
+
+The server provides inline type hints for inferred local bindings. For example,
+`let answer = 42i32` displays `: i32` after `answer`. An explicitly annotated
+binding such as `let answer: i32 = 42` needs no hint. Hints reflect unsaved text;
+editing an initializer updates its type, and adding an annotation removes the
+redundant hint. Clients supporting `workspace/inlayHint/refresh` also refresh
+visible hints when a loaded dependency changes. Types unavailable after a
+diagnostic are omitted.
+
+In VS Code, control visibility with **Editor: Inlay Hints: Enabled**, or set
+`"editor.inlayHints.enabled": "on"` inside the `"[dodo]"` settings block.
+Other clients use the standard `textDocument/inlayHint` request with the visible
+document range. Hints have the LSP `Type` kind.
+
+Use your editor's quick-fix action on a diagnostic. In VS Code, choose
+**Quick Fix...** or press `Ctrl+.` (`Cmd+.` on macOS). Supported actions include:
+
+- **Make `count` mutable** for a direct assignment to, or mutable borrow of, an
+  immutable local binding: changes `let count = 1` to `count := 1`, preserving
+  an explicit type annotation when present.
+- **Import `math`** for a missing package qualifier such as `math.answer()`:
+  inserts the import when a matching package can be resolved.
+
+Clients request `textDocument/codeAction`; these actions have the `quickfix`
+kind and carry workspace edits. Applying an action updates diagnostics through
+normal document synchronization. The editor handles undo and saving; the server
+never writes the edit to disk. Not every diagnostic has an automatic fix.
+Use a compiler build that supports these requests.
+
+Missing-import suggestions cover qualified names and check that the requested
+member is public. They search bundled libraries, matching sibling files and
+package directories, and locations inferred from existing imports. They respect
+the compilation target and existing imports. They do not scan every project file
+or rewrite unqualified names. Mutability fixes are limited to direct local
+bindings; changing a borrowed reference or an ownership contract needs a manual
+edit.
+
 ## Documents and synchronization
 
 The server supports initialization, shutdown, full-document open/change/close
 synchronization, save notifications, hover, completion, definition, references,
-prepare-rename/rename, signature help, document formatting, and published diagnostics.
+prepare-rename/rename, signature help, type inlay hints, diagnostic code actions,
+document formatting, and published diagnostics.
 It accepts local `file:` URIs, untitled buffers, and read-only `dodo-stdlib:`
 documents, using zero-based LSP line numbers and UTF-16 columns.
 Open buffers supply unsaved source, including new files;

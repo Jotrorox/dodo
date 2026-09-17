@@ -10,7 +10,7 @@ mod watch;
 use crate::json::{Value, json};
 use protocol::{
     DocumentChange, ErrorCode, InitializeParams, Location, Message, Notification, OpenDocument,
-    Position, PublishDiagnosticsParams, QueryParams, Range, Request, Response,
+    Position, PublishDiagnosticsParams, QueryParams, Range, RangeParams, Request, Response,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufRead, Write};
@@ -43,6 +43,8 @@ struct Server {
     target: String,
     pointer_bits: u32,
     document_changes: bool,
+    inlay_refresh: bool,
+    next_inlay_refresh: u64,
     watches: watch::Watches,
 }
 
@@ -80,6 +82,13 @@ pub fn run(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<i32>
             }
             Message::Response { id, error } if server.state == State::Running => {
                 server.watches.response(&id, error.as_deref());
+                if error.is_some()
+                    && id
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("dodo/inlayHint/"))
+                {
+                    server.inlay_refresh = false;
+                }
             }
             // Unknown notifications, responses, and notifications outside the
             // initialized lifetime never receive a JSON-RPC response.
@@ -155,6 +164,7 @@ impl Server {
             self.target = target;
             self.pointer_bits = bits;
             self.document_changes = params.document_changes;
+            self.inlay_refresh = params.inlay_refresh;
             self.watches.supported = params.dynamic_watches;
             self.watches.relative = params.relative_watches;
             self.state = State::Running;
@@ -170,6 +180,8 @@ impl Server {
                         "renameProvider": {"prepareProvider": true},
                         "signatureHelpProvider": {"triggerCharacters": ["(", ","], "retriggerCharacters": [","]},
                         "documentFormattingProvider": true,
+                        "inlayHintProvider": true,
+                        "codeActionProvider": {"codeActionKinds": ["quickfix"]},
                         "experimental": {"dodoStdlibSource": true},
                         "textDocumentSync": {
                             "openClose": true,
@@ -219,6 +231,104 @@ impl Server {
                 ),
                 Err(diagnostic) => error(ErrorCode::RequestFailed, &diagnostic.message),
             };
+        }
+        if matches!(
+            request.method.as_str(),
+            "textDocument/inlayHint" | "textDocument/codeAction"
+        ) {
+            let Ok(params) = RangeParams::parse(&request.params, &request.method) else {
+                return error(
+                    ErrorCode::InvalidParams,
+                    "invalid document range parameters",
+                );
+            };
+            let Some(document) = self.documents.get(&params.uri) else {
+                return Response::new_ok(request.id, json!([]));
+            };
+            let Some(analysis) = &document.analysis else {
+                return Response::new_ok(request.id, json!([]));
+            };
+            let Range { start, end } = params.range;
+            if request.method == "textDocument/inlayHint" {
+                return Response::new_ok(
+                    request.id,
+                    json!(analysis.inlay_hints(
+                        start.line,
+                        start.character,
+                        end.line,
+                        end.character,
+                    )),
+                );
+            }
+            if !params.quick_fixes || bundled::path(&document.uri).is_some() {
+                return Response::new_ok(request.id, json!([]));
+            }
+            let (Some(start), Some(end)) = (
+                editor::byte_offset(&document.text, start.line, start.character),
+                editor::byte_offset(&document.text, end.line, end.character),
+            ) else {
+                return Response::new_ok(request.id, json!([]));
+            };
+            let path = document
+                .path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(&document.uri));
+            let Some(source) = analysis
+                .index
+                .sources
+                .iter()
+                .find(|source| source.path == path)
+            else {
+                return Response::new_ok(request.id, json!([]));
+            };
+            let overlays = self
+                .documents
+                .values()
+                .filter_map(|document| {
+                    let path = document.path.as_ref()?;
+                    path.is_absolute()
+                        .then(|| (path.clone(), document.text.clone()))
+                })
+                .collect();
+            let fixes = editor::actions::quick_fixes(
+                &document.text,
+                source.start,
+                &analysis.index,
+                &analysis.diagnostics,
+                crate::ast::Span { start, end },
+                &self.target,
+                &overlays,
+            );
+            let actions: Vec<_> = fixes.into_iter().filter_map(|fix| {
+                let mut changes: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+                for edit in fix.edits {
+                    let source = analysis.index.sources.iter().find(|source| source.path == edit.path)?;
+                    let uri = self.source_uri(&edit.path)?;
+                    if bundled::path(&uri).is_some() {
+                        return None;
+                    }
+                    changes.entry(uri).or_default().push(json!({
+                        "range": Range::new(position(&source.text, edit.span.start), position(&source.text, edit.span.end)).to_json(),
+                        "newText": edit.new_text,
+                    }));
+                }
+                let edit = if self.document_changes {
+                    json!({"documentChanges": changes.into_iter().map(|(uri, edits)| {
+                        let version = self.documents.get(&uri).map(|document| document.version);
+                        json!({"textDocument":{"uri":uri,"version":version},"edits":edits})
+                    }).collect::<Vec<_>>()})
+                } else {
+                    json!({"changes": changes})
+                };
+                Some(json!({
+                    "title": fix.title,
+                    "kind": "quickfix",
+                    "diagnostics": [to_diagnostic(&fix.diagnostic, &document.text, source.start)],
+                    "isPreferred": fix.preferred,
+                    "edit": edit,
+                }))
+            }).collect();
+            return Response::new_ok(request.id, json!(actions));
         }
         if !matches!(
             request.method.as_str(),
@@ -620,6 +730,18 @@ impl Server {
             )?;
         }
         self.published = current;
+        // A dependency edit can change hints in an unchanged open buffer. Let
+        // capable clients invalidate their cached hints after each fresh check.
+        if self.inlay_refresh && self.watches.initialized {
+            let id = format!("dodo/inlayHint/{}", self.next_inlay_refresh);
+            self.next_inlay_refresh += 1;
+            editor::write_message(
+                output,
+                &json!({
+                    "jsonrpc":"2.0", "id":id, "method":"workspace/inlayHint/refresh"
+                }),
+            )?;
+        }
         Ok(())
     }
 

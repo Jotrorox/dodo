@@ -184,6 +184,47 @@ pub(crate) fn bundled_source(path: &Path) -> Option<&'static str> {
         .map(|(_, text)| *text)
 }
 
+/// Editor import suggestions use the embedded inventory, never a checkout-wide
+/// search. A directory package consists only of its immediate source files.
+pub(crate) fn bundled_import_candidates(
+    namespace: &str,
+    target: &str,
+) -> Vec<(String, Vec<&'static str>)> {
+    let mut candidates: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+    for &(import, text) in BUNDLED_SOURCES {
+        if import.rsplit('/').next() == Some(namespace) {
+            candidates.entry(import.to_owned()).or_default().push(text);
+        }
+        if let Some((parent, _)) = import.rsplit_once('/')
+            && parent.rsplit('/').next() == Some(namespace)
+            && !BUNDLED_SOURCES.iter().any(|(name, _)| *name == parent)
+        {
+            candidates.entry(parent.to_owned()).or_default().push(text);
+        }
+    }
+    // Native is a virtual, target-selected alias rather than an inventory file.
+    // Use the loader's selection rules so unsupported adapters are not offered.
+    let loader = Loader {
+        target: target.to_owned(),
+        ..Loader::default()
+    };
+    if namespace == "native" {
+        for &(import, _) in BUNDLED_SOURCES {
+            if import.ends_with("/linux") || import.ends_with("/windows") {
+                let candidate = format!("{}/native", import.rsplit_once('/').unwrap().0);
+                if let Ok(selected) = loader.native_import(&candidate)
+                    && let Some((_, text)) =
+                        BUNDLED_SOURCES.iter().find(|(name, _)| *name == selected)
+                {
+                    candidates.insert(candidate, vec![*text]);
+                }
+            }
+        }
+    }
+    candidates.retain(|import, _| loader.native_import(import).is_ok());
+    candidates.into_iter().collect()
+}
+
 /// Check a bundled source as an editor document, preserving its library identity.
 #[cfg(feature = "llvm")]
 pub(crate) fn load_bundled_for_editor(path: &Path, target: &str) -> Result<Loaded, LoadError> {
