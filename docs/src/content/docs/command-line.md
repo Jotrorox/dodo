@@ -9,6 +9,18 @@ These examples build on [your first program](first-program.md). Run commands
 from the `hello` project folder containing `main.dodo`. Use `dodo --help` for the
 complete option list and `dodo --version` for the compiler version.
 
+## Follow a repeatable workflow
+
+During development, save your files, run `dodo fmt`, then `dodo check`, then
+`dodo test`. Run the application with `dodo run` when the checks pass. Use
+`dodo compile` when you need a persistent executable to distribute or debug.
+Formatting changes layout; checking catches language errors; testing runs the
+behaviors you assert. None of those steps substitutes for the others.
+
+For a first project, the commands in the next table are enough. Output formats,
+cross-target linking, and panic hooks are advanced options you can return to
+when your project needs them.
+
 ## Everyday commands
 
 | Command | What it does |
@@ -32,6 +44,12 @@ Choose a different location with `-o` or `--output`:
 dodo compile -o build/my-program
 ./build/my-program
 ```
+
+On Windows, an explicit extension makes a persistent executable easy to launch
+from PowerShell: `dodo compile -o build/my-program.exe`, then
+`.\build\my-program.exe`. See [installation](installation.md) if the compiler
+cannot find `cc`; use `--linker clang` or set `DODO_CC` after configuring Clang
+and the Windows C++/SDK toolchain.
 
 `run` cleans up its temporary executable and returns the program's exit status.
 Arguments after `--` are passed to the executable;
@@ -152,10 +170,10 @@ Add `-g` (or `--debug`) to emit DWARF source locations, function signatures,
 parameters, local variables, lexical scopes, and type layouts:
 
 ```sh
-dodo compile hello.dodo -g -O 0 -o build/hello
+dodo compile main.dodo -g -O 0 -o build/hello
 gdb build/hello
 # In GDB:
-# break hello.dodo:4
+# break main.dodo:6
 # run
 # next
 # info locals
@@ -226,17 +244,34 @@ The last `--panic` or `--panic-hook` option selects the strategy.
 ## Targets and linking
 
 `--target`, `--cpu`, and `--features` select LLVM code generation. All LLVM
-targets are included in the compiler. For example, emit a WebAssembly object:
+targets are included in the compiler. A supported code-generation target does
+not imply that every hosted library package supports that operating system.
+For example, `std/console` is not an import for a freestanding WebAssembly build.
+
+Save this portable library as `arithmetic.dodo`:
+
+```dodo
+package arithmetic
+
+pub fn add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+```
+
+Emit a WebAssembly **object file** (not a standalone browser application):
 
 ```sh
-dodo compile --emit obj --target wasm32-unknown-unknown -o build/hello.wasm
+dodo compile arithmetic.dodo --emit obj --target wasm32-unknown-unknown -o build/arithmetic.o
 ```
 
 Cross-target object generation needs no host entry point or C runtime. Linking
 firmware still requires the platform's startup code, linker script, and an
-appropriate linker. `run` executes only the host target. Linux x86-64 native
-execution and wasm32 object generation are covered by tests; other LLVM targets
-have not been validated.
+appropriate linker. `run` executes only the host target. The repository exercises
+hosted Linux GNU x86-64 and Windows x64 programs, and portable standard-library
+object generation for WebAssembly and Cortex-M0. Object-generation tests do not
+verify board startup or hardware execution. See
+[library availability](standard-library.md#portable-and-hosted-functionality)
+for the distinctions that affect imported APIs.
 
 For executables, `--linker` selects the C linker driver, overriding `DODO_CC` and
 the default `cc`. Use repeatable `--link-arg` options to pass arguments to it:
@@ -247,3 +282,41 @@ dodo compile --linker cc --link-arg -s -o build/hello
 
 The argument `-s` in this Linux example asks the linker to strip symbols. Linker
 arguments depend on the selected toolchain.
+
+## Compiler option reference
+
+| Option | Meaning / default |
+| --- | --- |
+| `-o PATH`, `--output PATH` | Persistent artifact destination; defaults to `build/<project or source name>`. |
+| `--emit KIND` | `exe`, `obj`, `asm`, `llvm-ir`, or `bitcode`; default `exe`. |
+| `-O LEVEL`, `--opt-level LEVEL` | `0`, `1`, `2`, or `3`; default `0`. Runtime checks remain active. |
+| `-g`, `--debug` | Include source-level DWARF debug information. |
+| `--target TRIPLE` | Select the compilation target; default compiler host. |
+| `--cpu NAME` | Select target CPU features; default `generic`. |
+| `--features LIST` | Explicit LLVM target features, for example `+sse4.2`. |
+| `--linker PATH` | C linker driver; overrides `DODO_CC`, which overrides `cc`. |
+| `--link-arg ARG` | Append a linker argument; repeat for multiple arguments. |
+| `--panic MODE` | Runtime failure policy: `auto`, `hosted`, or `trap`. |
+| `--panic-hook NAME` | Use a non-returning C ABI failure handler; see the contract above. |
+| `-h`, `--help` | Show help. Use `dodo test --help` for test-specific options. |
+| `-V`, `--version` | Show the compiler version. |
+
+`run` accepts program arguments after `--`; it owns its temporary output path
+and rejects attempts to select a persistent output artifact. Linker arguments
+apply to executable output. The last panic policy or panic-hook option wins.
+Formatting and testing have their own options, described above and in
+[testing](testing.md).
+
+## Identify which stage failed
+
+| Stage | Typical symptom | Next action |
+| --- | --- | --- |
+| Command discovery | The shell cannot find `dodo`. | Fix PATH or run the executable by its absolute path. |
+| Source loading | `main.dodo` or an import is missing. | Check the current directory and [import paths](packages.md). |
+| Parsing / type checking | A diagnostic points at source code. | Read the first error and its related labels; see [diagnostics](diagnostics-and-editors.md). |
+| Linking | The driver cannot run, or symbols/libraries are missing. | Verify the selected toolchain and required native dependencies. |
+| Execution | The program returns an error code or reports a runtime check failure. | Inspect the program's Result handling, inputs, and reported source location. |
+
+Use `dodo check path/to/file.dodo` to separate language errors from linker
+configuration. For runtime investigation, rebuild with `-g -O 0` and keep the
+source files available to your debugger.

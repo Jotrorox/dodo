@@ -5,12 +5,33 @@ section: "Standard library"
 order: 159.5
 ---
 
-Use `std/http/hosted` for a hosted HTTP client, `std/http/https` for verified
-HTTP/HTTPS, and `std/web/app` for a configured web server. Add `std/web/https`
-for file-based TLS with the fluent web API. These modules own the
-ordinary resolution, connect, readiness, framing, body transfer, and cleanup
-loops. The portable `std/http`, `std/http/client`, `std/http/connection`,
-`std/web`, and `std/web/server` APIs remain independently usable.
+This guide connects the HTTP pieces into complete programs. Use
+`std/http/hosted` for an HTTP client, `std/http/https` for an HTTP/HTTPS client
+with verified TLS, and `std/web/app` for a configured server. `std/web/https`
+adds a certificate/key identity to that server.
+
+The hosted layer runs resolution, connection, readiness, framing, body transfer,
+and cleanup loops for you. You still choose storage limits, timeouts, trust,
+and how to handle results. It supports Linux GNU x86-64 and Windows x64
+MSVC/GNU; portable protocol APIs are documented in [HTTP](http.md) and
+application behavior in [Web applications](web.md).
+
+## Plan the request
+
+Before constructing a client, choose these independent limits:
+
+1. **Protocol workspace:** use `hosted.WORKSPACE_BYTES` for parser, I/O, and
+   retained response headers. The client borrows it until dropped.
+2. **Response destination:** use `get(url, &mut buffer)` for a bounded in-memory
+   result, or `get_to(url, &mut writer)` to process bytes as they arrive.
+3. **Body policy:** `config.body_bytes` caps decoded bytes even with a streaming
+   writer. A smaller collection buffer adds its own tighter limit.
+4. **Time policy:** resolution, connection, and request budgets have distinct
+   scopes. See [timeouts](#precisely-scoped-timeouts-and-cancellation).
+5. **Trust:** for HTTPS, choose explicit PEM roots or OpenSSL's configured roots.
+
+Start with a local server so you can distinguish protocol or program errors
+from external DNS, trust, and connectivity problems.
 
 ## Quickstart
 
@@ -171,6 +192,33 @@ rewound and no failed exchange is retried, even for GET. Address fallback occurs
 only before any HTTP request bytes are sent. There are no ambient proxies,
 cookies, decompression, connection pools, or credential forwarding across origins.
 
+## Handle status, errors, and partial output
+
+`ok(response)` means a complete response reached your sink, even if its status
+is 404 or 500. `err(reason)` means the operation did not complete. Handle the
+outer Result before examining HTTP status. A sink can already have received
+bytes before a later framing, deadline, or transport failure.
+
+| `hosting.ErrorKind` | Relevant details | Decision |
+| --- | --- | --- |
+| `InvalidInput`, `Workspace` | Configuration, URL, or storage is invalid. | Correct the input/capacity before another request. |
+| `Resolve`, `Connect` | `reason.network` | Check the host, address, service, and network policy. |
+| `Transport` | `reason.transport` | Preserve `delivered`; investigate the I/O source or sink. |
+| `Protocol`, `HeaderLimit` | `reason.protocol` | Inspect malformed framing or configured bounds. |
+| `Tls` | `reason.security` | Check trust, peer identity, and the [TLS failure contract](tls.md#verification). |
+| `BodyLimit` | `reason.delivered` | Increase a deliberate bound or choose another sink strategy. |
+| `TimedOut`, `Cancelled` | `reason.delivered` | The connection is closed; application retry is a new exchange. |
+| `Redirect` | Redirect policy refused another hop. | Inspect policy and destination rather than silently following. |
+
+Only inspect a nested cause when its error kind makes that cause relevant;
+other fields may contain placeholder values. `delivered` counts bytes accepted
+by the selected sink. A file sink can contain a partial file; a console sink
+may already have displayed a prefix. Replaying a request does not erase those
+side effects, and repeating a non-idempotent method may repeat server work.
+
+The default client performs no automatic failed-exchange retry. Reusing the
+client reuses its workspace, while each request creates a fresh connection.
+
 ## Precisely scoped timeouts and cancellation
 
 Client configuration uses nonzero millisecond durations:
@@ -220,6 +268,17 @@ writer can thus exceed a deadline too; use a nonblocking writer when bounded
 cancellation is required. Zero timeout durations are rejected.
 
 ## Serial server, handlers, and shutdown
+
+The buffered serving lifecycle is: accept, parse the complete bounded request,
+decode and select a route, run the handler, serialize the response, and clean
+up the connection. The serial runner handles one connection through that whole
+sequence before accepting the next. Concurrent execution lets other sockets
+advance while one waits, but handlers still execute synchronously on the
+serving thread.
+
+Choose the [web guide](web.md) for routing, middleware, and application tests.
+The details below explain the lower-level runner's capacities and failure
+behavior when you supply custom storage or execution providers.
 
 Start with [`app.Server`](web.md#configuration-and-storage) for automatic route
 registration, grouped configuration, bounded default buffers, and explicit
@@ -412,3 +471,7 @@ application callbacks have the blocking limitations above. The existing native
 listener does not enable address reuse: after closing active connections,
 TCP TIME_WAIT can prevent immediate rebinding of the same port even though all
 listener/connection descriptors were released.
+
+## Complete API reference
+
+For every public type, field, constant, and function signature, see [std/http/hosted](api/std/http/hosted.md), [std/http/https](api/std/http/https.md), [std/http/hosting](api/std/http/hosting.md), [std/web/hosted](api/std/web/hosted.md).

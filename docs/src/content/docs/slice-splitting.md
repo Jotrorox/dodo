@@ -2,10 +2,17 @@
 title: "Mutable slice splitting"
 description: "Checked disjoint mutable views with source lifetimes and ordinary move semantics."
 section: "Language reference"
-order: 225
+order: 235
 ---
 
-Import `core/slice` for checked splitting:
+Use `slice.split_at_mut` when you need to update two separate regions of one
+array or slice at the same time. Ordinary index or slice syntax does not prove
+that two mutable views are disjoint, even when their indices look different.
+The splitter provides that proof through its return type.
+
+Read [ownership and borrowing](ownership.md#fields-indices-and-disjoint-views)
+first if mutable references are new to you. No unsafe code is needed to use this
+API. Import `core/slice`:
 
 ```text
 pub fn split_at_mut<T>(data: &mut[T], mid: usize)
@@ -20,7 +27,9 @@ constant time, allocates nothing, and does not move or destroy any elements.
 
 Use ordinary owned struct patterns to obtain the two mutable views:
 
-```dodo
+```dodo test
+package main
+
 import "core/slice"
 
 fn update(data: &mut[i32]) {
@@ -35,11 +44,40 @@ fn update(data: &mut[i32]) {
     // Both views have reached their last use.
     data[0] += 3
 }
+
+fn main() {
+    data := [10i32, 20, 30, 40]
+    update(&mut data)
+    core.assert_eq(data[0], 14i32)
+    core.assert_eq(data[2], 32i32)
+}
 ```
+
+The first `let` unwraps the successful Option or returns early. The second
+destructures and consumes the pair, giving `left` and `right` separate mutable
+views. After their last uses, the original `data` becomes available again.
+An immutable `let` binding can still modify elements through its stored mutable
+slice; it cannot replace the slice binding itself.
 
 The combined pattern `let some(slice.SplitMut{left, right}) = ... else { ... }`
 also works. Fields may be renamed or discarded in the pattern. No tuple syntax,
 traits, or lifetime parameters are needed.
+
+## Handle every boundary
+
+For an input of length `n`:
+
+| Midpoint | Left length | Right length | Result |
+| --- | --- | --- | --- |
+| `0` | `0` | `n` | `some(parts)` |
+| `n` | `n` | `0` | `some(parts)` |
+| Between `0` and `n` | `mid` | `n - mid` | `some(parts)` |
+| Greater than `n` | — | — | `none` |
+
+A successful split does not imply both halves are nonempty. Check `.len` before
+indexing, as the example does. If you need a checked shared or exclusive single
+subrange instead of two disjoint views, use `slice.subslice` or
+`slice.subslice_mut`; see [core utilities](core.md).
 
 ## Ownership and reborrowing
 
@@ -71,6 +109,10 @@ views; an ordinary user-defined aggregate of borrowed fields still follows the
 ordinary aggregate rules.
 
 ## Why the views are disjoint
+
+The details in this section are useful when implementing low-level containers
+or understanding a compiler rejection. They are not additional steps a caller
+must perform.
 
 The library uses the safe, narrowly typed intrinsic
 `mem.split_at_mut::<slice.SplitMut<T>>(data, mid)`. It checks `mid <= len` itself

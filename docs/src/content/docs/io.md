@@ -1,6 +1,6 @@
 ---
 title: "Byte I/O"
-description: "Byte I/O: a runnable starting point, storage choices, and detailed contracts."
+description: "Understand short reads, partial writes, progress errors, bounded input, buffering, and polling with portable byte I/O."
 section: "Standard library"
 order: 144
 ---
@@ -10,6 +10,11 @@ Use `std/io.read_exact` when a task needs a known number of bytes, and
 `MemoryReader` and `MemoryWriter`, then use the same helpers with [files](filesystem.md).
 For standard streams and bounded `read_line`, see [console I/O](console.md).
 For portable printing to any writer, see [formatting](formatting.md).
+
+Reading and writing are allowed to make **partial progress**. A five-byte
+request may transfer two bytes successfully; that does not imply end-of-file.
+Completion helpers perform the repeated calls for you. Errors can also carry
+progress, so a failed operation does not imply that nothing happened.
 
 ## Quickstart
 
@@ -57,6 +62,25 @@ transfer limit, then choose [allocated bytes](bytes.md) if the result must grow.
 
 ## Portable byte I/O (`std/io`)
 
+### Choose a helper by completion rule
+
+| Requirement | Helper | How it stops |
+| --- | --- | --- |
+| Make one attempt | `read_once`, `write_once` | After at most one provider call |
+| Fill as much of a slice as is available | `read_up_to` | Full destination or EOF; a short result is successful |
+| Read a fixed-size record | `read_exact` | Full destination; early EOF is an error |
+| Deliver an entire slice | `write_all` | All bytes accepted or an error |
+| Transfer a bounded stream | `copy` | EOF, limit, or an error; reports separate read/write counts |
+| Read a whole bounded document | `read_bounded` | Destination plus one probe byte; detects excess input |
+| Read through LF or a full fragment | `read_line` | Returns `Newline`, `Eof`, or `Full` |
+| Attempt nonblocking progress | `poll_read_once`, `poll_write_once` | One attempt, including an explicit `Pending` state |
+
+EOF means the input has ended. `Pending` means no further progress is available
+right now. An adapter must provide the matching blocking or polling method;
+the helpers do not turn a blocking device into a nonblocking one.
+
+### Implementing a reader or writer
+
 `std/io` imports only `core/bytes`, `core/num`, and `core/mem`. It operates on bytes and checked
 borrowed slices, with no OS, libc, heap, locale, scheduler, global initialization,
 or device discovery. Files, sockets, UARTs, and other platform adapters implement
@@ -76,6 +100,8 @@ Dodo monomorphizes calls to the concrete public methods; no trait objects,
 reflection, closures, or scheduler are required. An adapter type exposing public
 methods must itself be public. See `examples/io.dodo`
 for memory-to-memory copying through caller scratch space.
+
+### Successful and failed progress
 
 A successful primitive operation returns its processed prefix length. A reader
 may initialize only that prefix; a writer accepts only that prefix. Counts must
@@ -104,8 +130,10 @@ indefinitely. They return total progress for the entire helper invocation,
 preserving a terminal device error and code even if its prefix finished the
 requested byte count. None rolls back bytes already read or written.
 
+### Memory, limits, and copying
+
 `MemoryReader.new(&bytes)` retains a shared borrow and exposes `position`,
-`remaining`, `read`, `poll_read`, and absolute `seek`. `MemoryWriter.new(&mut
+`remaining` (the unread byte slice), `read`, `poll_read`, and absolute `seek`. `MemoryWriter.new(&mut
 bytes)` retains an exclusive borrow and exposes `position`, remaining capacity,
 `written`, `write`, and `poll_write`. `Cursor.new(&mut bytes)` reads and overwrites
 initialized fixed-size storage, with `bytes`, `position`, and `seek`. It never
@@ -130,6 +158,8 @@ precedence. Scratch retains the most recently read chunk, including its unwritte
 suffix. The explicit limit bounds every count and prevents count overflow; pass
 `core/num.MAX` when that target-sized limit is suitable.
 
+### Buffering requires explicit completion
+
 `BufferedReader.new(&mut reader, &mut storage)` and
 `BufferedWriter.new(&mut writer, &mut storage)` reject empty storage and retain
 exclusive checked borrows of both arguments. The reader exposes its current
@@ -146,6 +176,45 @@ bytes reports zero accepted bytes from its current input. There is deliberately
 no I/O in destruction: dropping a writer discards pending bytes. Call `flush`
 and handle its `Result` explicitly before releasing the device. Neither adapter
 implicitly calls an optional platform flush operation such as a disk sync.
+
+Here the outer writer accepts five bytes, but only `flush()` guarantees that
+all five reach the underlying memory writer. Use the same pattern for a file or
+socket; always handle the flush result before allowing the buffer to drop.
+
+```dodo test
+package buffered_output
+import "std/io"
+import "core/bytes"
+
+fn example() -> void!io.Error {
+    destination := [0u8; 8]
+    sink := io.MemoryWriter.new(&mut destination)
+    scratch := [0u8; 3]
+    {
+        buffered := io.BufferedWriter.new(&mut sink, &mut scratch)?
+        accepted := io.write_all(&mut buffered, b"hello")?
+        assert_eq(accepted, 5usize)
+        core.drop(buffered.flush()?)
+    }
+    assert(bytes.equal(sink.written(), b"hello"))
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `buffered_output.dodo` and run `dodo run buffered_output.dodo`. It
+exits with zero and prints nothing. The inner block ends the buffered writer's
+exclusive borrow of `sink` before the final assertion. `core.drop` explicitly
+discards the successful physical byte count; the preceding `?` still handles
+flush failure.
+
+### Polling without a scheduler
 
 `Poll` contains `transferred` and `PollState.Ready`, `Pending`, or `Eof`. Pending
 may accompany positive progress. Callers consume that prefix and decide when to
@@ -197,3 +266,9 @@ process that fragment and call again to resume. Empty storage returns `Full`
 without reading. Errors preserve the initialized prefix, even if it ends in LF.
 Only `Interrupted` is retried. Neither helper decodes UTF-8 or allocates.
 See [bounded console input](console.md#read-a-bounded-line) for standard streams.
+
+Use `read_line` repeatedly when arbitrarily long lines should be processed in
+fragments. Use `read_bounded` when an entire document must fit and an oversize
+document should be rejected. Neither helper validates text; pass the accepted
+bytes to `text.Text.new` before treating external input as UTF-8.
+The [API reference](stdlib-api.md) lists all adapter and result declarations.

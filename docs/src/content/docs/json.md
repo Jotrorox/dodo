@@ -10,6 +10,26 @@ decode its fields. JSON types are checked during decoding, and ordinary Dodo
 field access remains statically typed. The module is portable and needs no
 allocator, operating system, or runtime reflection.
 
+JSON has six value kinds: null, boolean, number, string, array, and object. An
+object associates string names with values; an array stores values in order.
+Choose a typed struct when you know the expected fields, or a borrowed `Value`
+when you need to inspect a document whose shape varies.
+
+| Goal | Starting point |
+| --- | --- |
+| Decode a known object shape | `@derive(Json)` and `json.decode::<T>(bytes)` |
+| Inspect a document or primitive root | `json.parse(bytes)` and `Value` accessors |
+| Accept escaped external strings | A `json.String` field and its `decode` method |
+| Encode your own struct | `json.to_slice(&value, &mut storage)` |
+| Generate values one token at a time | `json.Encoder.new(&mut writer)` |
+| Read a complete bounded document from I/O | `json.parse_reader` or `decode_reader` |
+| Read several whitespace-separated documents | `json.Decoder` over existing bytes |
+
+Decoding generally returns views into the input rather than copying its text.
+Keep the input alive until all decoded views are finished. Encoding needs a
+destination whose capacity you choose. [Byte I/O](io.md), [UTF-8 text](text.md),
+and [Results](patterns-and-results.md) provide the underlying concepts.
+
 ## Quickstart
 
 Save this as `json_start.dodo`:
@@ -58,6 +78,12 @@ or encoding failed. Increase output capacity when handling `BufferFull`; reject
 malformed input or inspect its error before retrying. The complete
 [`examples/json.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/json.dodo)
 also constructs a struct with `json.String.from_str("Grace")`.
+
+The steps are: declare the expected fields, decode and validate a complete
+document, use ordinary typed fields, then encode into a separate destination.
+The output matches this particular input because its field order and compact
+representation match the derived encoder. In general, decode/encode preserves
+the JSON value, not original whitespace or escape spellings.
 
 ## Structs and field names
 
@@ -142,6 +168,8 @@ the cursor unchanged and subsequent calls return the same error.
 
 ## Borrowed values and strings
 
+### Input ownership
+
 `Value` and decoded `json.String` retain checked shared borrows of their input.
 Keep the input alive and unchanged while using them. A decoded struct containing
 either view has the same lifetime dependency. Decoding an object does not build
@@ -166,6 +194,42 @@ field of type `&str`; use `json.String` for arbitrary external JSON strings.
 `is_escaped()` identifies encoded string content. `into_str()` consumes the
 string wrapper while transferring its input borrow; it likewise rejects escapes.
 
+### Decode an escaped string into your own storage
+
+The input below represents a JSON string whose final letter is written as a
+Unicode escape. Its decoded value is `café`. Four Unicode scalars need five
+UTF-8 bytes, so capacity should be based on `decoded_len`, not character count.
+
+```dodo test
+package json_string_bytes
+import "std/encoding/json"
+
+fn example() -> void!json.Error {
+    root := json.parse(b"\"caf\\u00e9\"")?
+    value := root.as_string()?
+    assert(value.is_escaped())
+    assert(value.equals("café"))
+    assert_eq(value.decoded_len(), 5usize)
+    storage := [0u8; 16]
+    decoded := value.decode(&mut storage)?
+    assert_eq(decoded, "café")
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `json_string_bytes.dodo` and run `dodo run json_string_bytes.dodo`.
+It exits with zero and prints nothing. The final `decoded` view borrows
+`storage`; it does not depend on the original JSON bytes. Calling `as_str()`
+on `value` instead would return `EscapedString` because the representation
+contains an escape sequence.
+
 ## Inspecting JSON without a struct
 
 `Value.kind()` identifies the JSON kind. Fallible conversions `as_bool()`,
@@ -174,6 +238,51 @@ string wrapper while transferring its input borrow; it likewise rejects escapes.
 member, while `require(name)` reports a missing field. `at(index)` selects an
 array element. `len()` reports an array or object's member count. Array and
 object iterators expose members without allocating a collection.
+
+`get(name)` returns `Option<Value>` and returns `none` for a missing member or
+a non-object. `at(index)` likewise returns `none` for a missing index or a
+non-array. Use `require(name)`, `require_object()`, `array()`, or `object()`
+when you need a type error rather than an absent optional value.
+
+### Iterate an array
+
+`array()` checks the root kind once and creates a cursor. `next()` returns a
+borrowed child or `none` at the end; its input is already validated, so advancing
+the iterator does not return a parsing `Result`. Each scalar conversion still
+checks the child's type and range.
+
+```dodo test
+package json_array_values
+import "std/encoding/json"
+
+fn example() -> void!json.Error {
+    root := json.parse(b"[10,20,30]")?
+    values := root.array()?
+    total := 0i64
+    for {
+        match values.next() {
+            some(value) => { total += value.as_i64()? },
+            none => { break },
+        }
+    }
+    assert_eq(total, 60i64)
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `json_array_values.dodo` and run `dodo run json_array_values.dodo`.
+Success exits with zero. `object()?.next()` uses the same pattern and returns
+`Entry { key: json.String, value: json.Value }`. Consume or finish using the
+current child before advancing either iterator again.
+
+### Navigate with a pointer or move a borrowed view
 
 `pointer("/users/0/name")` navigates an RFC 6901 JSON Pointer. An empty pointer
 selects the current value; `~0` represents a literal `~` and `~1` represents a
@@ -210,6 +319,17 @@ the number of output bytes already emitted. Handle errors with `match`, propagat
 them with `?`, or use `!` only when failure should terminate the program.
 See [Results](patterns-and-results.md).
 
+| Error kind | Typical cause | Response |
+| --- | --- | --- |
+| `Syntax`, `TrailingData`, `Depth` | Malformed input, extra data, or excessive nesting | Reject the document and inspect the byte position. |
+| `TypeMismatch`, `NumberRange` | A value does not fit the requested Dodo field type | Correct the schema or reject that input. |
+| `MissingField`, `DuplicateField`, `UnknownField` | An object violates the required field rules | Correct the document or choose the intended unknown-field policy. |
+| `BufferFull` | Caller storage cannot hold the input, decoded text, or output | Increase the relevant bound or reject the oversized value. |
+| `EscapedString` | Borrowing `&str` would require unescaping | Use `json.String.decode` into caller-owned storage. |
+| `Io` | The underlying reader or writer failed | Treat an emitted prefix as incomplete and inspect `Error` metadata. |
+
+## Custom codecs and token-by-token encoding
+
 Custom `encode_json<W>` methods receive `&mut json.Encoder<W>` and return
 `void!json.Error`; custom `decode_json` methods consume a `json.Value` and return
 `Self!json.Error from(value)`. `json.from_value<T>(value)` likewise consumes the
@@ -220,6 +340,64 @@ supplies `begin_object`, `key`, `end_object`,
 members and invalid token order. Custom object encoders must supply unique key
 names. `raw` validates a complete encoded value before insertion. A failed
 encoder stays failed, and `finish()` checks that one complete value was written.
+
+`Encoder.pretty(&mut writer)` selects indentation; `Encoder.new` selects compact
+output. `written()` is the emitted byte count so far. Both maintain the same
+nesting, token-order, and error checks. They borrow the destination exclusively,
+so end the encoder's scope before inspecting the destination directly.
+
+The encoder is useful when producing a simple object or a primitive root without
+declaring a struct. It writes punctuation and escapes strings for you. A key
+must be followed by exactly one value, and every opened container must be closed.
+
+```dodo test
+package json_tokens
+import "std/encoding/json"
+import "std/io"
+import "core/bytes"
+
+fn example() -> void!json.Error {
+    storage := [0u8; 64]
+    writer := io.MemoryWriter.new(&mut storage)
+    {
+        encoder := json.Encoder.new(&mut writer)
+        encoder.begin_object()?
+        encoder.key("ok")?
+        encoder.boolean(true)?
+        encoder.key("n")?
+        encoder.unsigned(3)?
+        encoder.end_object()?
+        core.drop(encoder.finish()?)
+    }
+    assert(bytes.equal(writer.written(), b"{\"ok\":true,\"n\":3}"))
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `json_tokens.dodo` and run `dodo run json_tokens.dodo`. The assertion
+checks the complete compact output. To write a primitive root, use just the
+appropriate value method and `finish()`, without `begin_object` or `key`.
+
+For custom decoding that must return input-borrowing fields, `take_field(value,
+name)` and `take_element(value, index)` consume their parent view and return
+`Field { rest, value }`. Both outputs retain the original input borrow; `rest`
+still views the complete parent, so it can be used to extract another field.
+`take_optional_field` returns `OptionalField { rest, value: Option<Value> }`.
+These helpers do not delete members or modify input; they transfer checked
+ownership dependencies. `check_fields(keys, deny_unknown)` requires an object
+and rejects unlisted names when `deny_unknown` is true; required-field checks
+still happen when extracting each field. Prefer derivation until you need a custom
+representation or validation rule.
+
+The [API reference](stdlib-api.md) includes every encoder, decoder, projection,
+iterator, and error declaration.
 
 The parser, derivation, and public entry points have native execution tests at
 O0 and O3 plus freestanding object-emission tests for

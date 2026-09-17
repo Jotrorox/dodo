@@ -1,6 +1,6 @@
 ---
 title: "Binary bytes and buffers"
-description: "Binary bytes and buffers: a runnable starting point, storage choices, and detailed contracts."
+description: "Read and write binary records with checked cursors, byte order, fixed storage, and explicitly allocated buffers."
 section: "Standard library"
 order: 143
 ---
@@ -8,6 +8,11 @@ order: 143
 Use `std/bytes.Writer.new` and `Reader.new` to build and inspect binary messages
 in a fixed byte array. They are portable, allocation-free cursors. Use
 [UTF-8 text](text.md) when the contents are human-readable strings.
+
+A byte slice (`&[u8]`) is a borrowed view into existing storage. A reader or
+writer adds a position that advances after each successful field. An owned
+buffer manages an allocation and can grow. These are separate choices: most
+binary records need only an array and a cursor.
 
 ## Quickstart
 
@@ -52,6 +57,23 @@ explains their storage lifetime and failure behavior.
 
 ## Binary bytes and growing buffers
 
+### Choose a byte API
+
+| Task | API | Storage |
+| --- | --- | --- |
+| Inspect a field at a known offset | `bytes.read_u32_be(data, offset)` | Borrowed input |
+| Read consecutive fields | `bytes.Reader.new(data)` | Borrowed input and a cursor |
+| Write a fixed-size message | `bytes.Writer.new(&mut storage)` | Caller-owned mutable bytes |
+| Select a checked range | `bytes.view(data, offset, count)` | Borrowed input; no copy |
+| Append an unknown amount up to a limit | `arena_bytes.new(&mut arena, capacity, limit)` | Explicit allocator |
+| Transfer bytes from a file or socket | `io.read_exact`, `io.write_all` | See [byte I/O](io.md) |
+
+`bytes.view` takes **offset and count**. This differs from `data[start..end]`
+and `core/slice.subslice`, whose second endpoint is exclusive. For example,
+offset 2 and count 3 select indices 2, 3, and 4.
+
+### Views, searching, and byte order
+
 `std/bytes` imports `core/bytes` under an explicit alias. It operates on ordinary
 checked byte slices and never allocates. `check_range(length, offset, count)`
 uses subtraction before addition, so overflowing and reversed extents produce
@@ -59,7 +81,12 @@ uses subtraction before addition, so overflowing and reversed extents produce
 slices. Valid zero-length views include the end of the input. `find` and `rfind`
 search byte subsequences (an empty needle matches the start/end respectively);
 `find_byte`, `equal`, `compare`, `starts_with`, and `ends_with` reuse core helpers.
-No operation interprets UTF-8 or requires aligned storage.
+No operation interprets UTF-8 or requires aligned storage. Suffix `le` means
+little-endian (least significant byte first); `be` means big-endian (most
+significant byte first). A protocol's byte order determines which to use,
+regardless of the computer running the program.
+
+### Reader and writer cursors
 
 `Reader.new(data)` has `position`, `remaining`, `rest`, checked absolute `seek`,
 `skip`, `take(count)`, `read_u8`, and `read_u16_le`/`read_u16_be` through 32/64-bit
@@ -70,6 +97,49 @@ before changing data or position. `written()` is the prefix ending at the
 current cursor, including after a seek; it is not a high-water mark. `std/bytes`
 also provides offset-based endian free functions with the same names. Fixed
 writers never grow or allocate. See `examples/bytes.dodo`.
+
+### Encode a record with several fields
+
+This record contains a one-byte version, a two-byte big-endian payload length,
+and the payload. Each `?` stops at the first failed field. A successful `take`
+returns a view, so finish using that view before advancing the reader again.
+
+```dodo test
+package binary_record
+import "std/bytes"
+
+fn example() -> void!bytes.RangeError {
+    storage := [0u8; 7]
+    writer := bytes.Writer.new(&mut storage)
+    writer.write_u8(1)?
+    writer.write_u16_be(4)?
+    writer.put(b"Dodo")?
+    assert_eq(writer.position(), 7usize)
+
+    reader := bytes.Reader.new(writer.written())
+    assert_eq(reader.read_u8()?, 1u8)
+    length := reader.read_u16_be()?
+    payload := reader.take(length as usize)?
+    assert(bytes.equal(payload, b"Dodo"))
+    assert_eq(reader.remaining(), 0usize)
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `binary_record.dodo` and run `dodo run binary_record.dodo`. The program
+exits with zero and prints nothing. Seven bytes are sufficient: 1 + 2 + 4.
+Each failed operation preserves its own position and destination, but earlier
+successful operations remain committed. Building a whole message is not one
+transaction: discard a partially built record if a later field fails.
+
+### Owned buffers and capacity limits
 
 `std/bytes_alloc.Buffer<A>` is imported separately. Safe constructors
 `arena_bytes.new(&mut arena, capacity, limit)` and
@@ -99,3 +169,8 @@ itself. Moving a buffer transfers ownership and its allocator dependency; it
 does not clone the allocation. The unsafe generic `bytes_alloc.new` constructor
 requires an allocator honoring the documented unique-storage and deallocation
 contracts. Its methods must be public for static dispatch.
+
+The logical maximum is not a promise that the allocator has enough backing
+space. Budget for alignment and temporary old/new allocations too. Consult
+[allocation](allocation.md) before choosing arena and pool sizes, and use the
+[API reference](stdlib-api.md) for the full byte and buffer signatures.

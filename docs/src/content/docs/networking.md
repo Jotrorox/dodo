@@ -5,10 +5,26 @@ section: "Standard library"
 order: 157
 ---
 
-Use `std/net.parse_socket` for a literal address and `std/net/native.connect_with`
-for a TCP connection with an explicit deadline. Start with a literal loopback
-address so DNS and external services are unnecessary. `net` values are portable;
-`native` sockets and the monotonic clock require a supported hosted target.
+Networking has three separate steps: identify an address, open a transport, and
+exchange bytes or datagrams. `std/net` provides portable address values and
+operation policies; `std/net/native` opens operating-system sockets. Start with
+a loopback address and `native.connect_with` so you can learn the connection
+contract without DNS or an external service.
+
+| Task | Package/API | What it does not do |
+| --- | --- | --- |
+| Parse or print an IP address | `std/net` | No socket or DNS lookup. |
+| Resolve a hostname | `native.resolve` | Does not connect; the system lookup may block. |
+| Connect with a deadline | `native.connect_with` | Does not encrypt or frame application messages. |
+| Read/write under a policy | `std/net/operations` | Does not allocate or start a scheduler. |
+| Exchange separate packets | `native.UdpSocket` | No ordering, delivery, or stream semantics. |
+| Encode/decode DNS packets | `std/net/dns` | No ready-made DNS resolver, cache, or retries. |
+| Fetch an HTTP URL | [Hosted HTTP](hosted-http.md) | Select [HTTPS](tls.md) explicitly for TLS. |
+
+TCP is a byte stream: one write need not correspond to one peer read. Define a
+message boundary (a length, delimiter, or protocol such as HTTP) before building
+a request/response exchange. UDP preserves each message boundary, but delivery
+and ordering belong to your application protocol.
 
 ## Quickstart
 
@@ -32,7 +48,9 @@ import "std/net/native"
 fn connect() -> void!net.Error {
     address := net.parse_socket(b"127.0.0.1:8081")?
     clock := native.MonotonicClock {}
-    operation := net.Operation.until(clock.now_ms() + 5000)
+    now := clock.now_ms()
+    if now > (~0u64) - 5000 { return err(net.failure(net.ErrorKind.TimedOut)) }
+    operation := net.Operation.until(now + 5000)
     cancel := net.NeverCancel {}
     stream := native.connect_with(&address, &operation, &mut clock, &cancel)?
     peer := stream.peer_address()?
@@ -89,6 +107,24 @@ package in this release.
 
 ## Addresses and storage
 
+Address parsing and formatting can be tested without a network. This example
+normalizes IPv6 spelling and checks the port, using a fixed output array:
+
+```dodo test
+package address_example
+import "core/bytes"
+import "std/net"
+
+@test
+fn normalizes_a_socket_address() {
+    address := net.parse_socket(b"[2001:0DB8:0:0:0:0:0:1]:443")!
+    assert_eq(address.port, 443u16)
+    output := [0u8; 64]
+    count := net.format_socket(&address, &mut output)!
+    assert(bytes.equal(&output[..count], b"[2001:db8::1]:443"))
+}
+```
+
 `IpAddress` contains `family: Family.V4 | Family.V6` and `[16]u8` network-order
 `octets`. `IpAddress.v4(a, b, c, d)` uses the first four octets and clears the
 remaining twelve; `IpAddress.v6(octets)` uses all sixteen. `clone()` makes an
@@ -132,7 +168,9 @@ fn connect_local() -> native.TcpConnection!net.Error {
     address := net.parse_socket(b"127.0.0.1:8080")?
     clock := native.MonotonicClock {}
     cancel := net.NeverCancel {}
-    operation := net.Operation.until(clock.now_ms() + 2000)
+    now := clock.now_ms()
+    if now > (~0u64) - 2000 { return err(net.failure(net.ErrorKind.TimedOut)) }
+    operation := net.Operation.until(now + 2000)
     return native.connect_with(&address, &operation, &mut clock, &cancel)
 }
 ```
@@ -196,6 +234,27 @@ an operation can still return `WouldBlock`. Waits are one synchronous poll call,
 clamped to `INT_MAX` milliseconds, and may return `Interrupted`.
 
 ## Deadlines, cancellation and execution
+
+A nonblocking call is an attempt, not a loop that waits for completion. Handle
+its result according to progress:
+
+| Result | Action |
+| --- | --- |
+| A positive byte count | Advance by exactly that count before trying the remainder. |
+| Zero from a nonempty TCP read | Finish reading: the peer sent EOF. |
+| `WouldBlock` or `PollState.Pending` | Wait for relevant readiness, then retry under your operation policy. |
+| `Interrupted` | Recheck cancellation/deadline before retrying. |
+| Another error | Preserve any reported progress and end or explicitly recover the operation. |
+
+For example, if an eight-byte message is accepted in chunks of three and five,
+the second write receives `message[3..]`. Re-sending all eight bytes would
+duplicate the prefix. `operations.write_all` maintains that offset for you.
+
+A deadline is an **absolute** millisecond value, whereas `wait_ready` takes a
+**relative** wait duration. Form the deadline once and keep it across partial
+progress; recomputing `now + timeout` after every byte can let a slow peer keep
+an operation alive indefinitely. Check integer addition before constructing it,
+as the quickstart does; a failed native clock reads as the maximum `u64`.
 
 `Operation.until(absolute_milliseconds)` carries a deadline in the supplied
 clock's domain. `Operation.unlimited()` has no deadline. Structural clock providers
@@ -325,3 +384,7 @@ levels and checks connected/accepted socket inheritability with
 IPv6 interface scopes, resolver configurations, socket exhaustion, or load.
 No Internet endpoint is required: the negative resolver case uses an invalid
 numeric address with `AI_NUMERICHOST`, and hostname resolution uses `localhost`.
+
+## Complete API reference
+
+For every public type, field, constant, and function signature, see [std/net](api/std/net.md), [std/net/operations](api/std/net/operations.md), [std/net/dns](api/std/net/dns.md), [std/net/linux](api/std/net/linux.md), [std/net/windows](api/std/net/windows.md).

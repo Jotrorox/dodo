@@ -1,6 +1,6 @@
 ---
 title: "Collections"
-description: "Borrowed algorithms, caller-backed containers, and explicit fallible ownership."
+description: "Choose a list, queue, map, set, or heap; sort slices; and manage container capacity, iteration, and ownership."
 section: "Standard library"
 order: 147
 ---
@@ -9,6 +9,12 @@ Use `std/collections/fixed_vector.Vector.new` to store a small bounded list.
 Its `Option<T>` slots are caller-owned storage; this portable path needs no
 allocator. Import the container directly; the parent `std/collections` package
 contains slice algorithms, not all child constructors.
+
+A **sequence** stores values in a chosen order; a **map** associates keys with
+values; a **set** stores unique values; a **heap** gives access to the greatest
+value first. Choose the shape of your data first, then choose fixed storage or
+an explicitly allocated container. The element type and borrowing rules are the
+same language concepts used outside collections.
 
 ## Quickstart
 
@@ -52,6 +58,8 @@ reference-bearing and Result-bearing elements, even through nested aggregates.
 
 ## API and contracts
 
+### Choose a container
+
 `std/collections` supplies algorithms over checked borrowed slices. Its child
 packages provide independently imported containers. Nothing starts a runtime,
 requests entropy, or selects a global allocator.
@@ -67,6 +75,26 @@ requests entropy, or selects a global allocator.
 | `std/collections/hash_map`, `hash_set` | Open addressing, linear probing, unspecified bucket order. |
 | `std/collections/ordered_map`, `ordered_set` | Sorted contiguous entries, ascending key order. |
 | `std/collections/heap` | Maximum binary heap; heap order is not sorted order. |
+
+Use a vector for an indexed list, a deque for a queue, a hash map for frequent
+key lookup, an ordered map when traversal must be sorted, and a heap for a
+priority queue. Fixed maps/sets are useful for small bounded tables because
+their setup is simple and they need no allocator. Their lookups scan entries.
+
+| Container family | Main operations |
+| --- | --- |
+| Vectors | `push`, `pop`, `get`, `insert`, `remove`, `swap_remove`, `replace`, `clear` |
+| Deques | `push_front`, `push_back`, `pop_front`, `pop_back`, `get`, `clear` |
+| Maps | `insert`, `get`, `contains`, `remove`, `clear` |
+| Sets | `insert`, `contains`, `remove`, `clear` |
+| Heap | `push`, `peek`, `pop`, `clear` |
+
+`get` borrows an element, while `pop` and `remove` return its ownership. Each
+container provides `len`, `capacity`, and cursor-based `next`; additional views
+and mutation methods differ by container. The [API reference](stdlib-api.md)
+lists those differences rather than implying every family has identical methods.
+
+### Choose an allocator for growth
 
 Each owned container has an independent `std/collections/shared_*` adapter:
 `shared_vector`, `shared_deque`, `shared_hash_map`, `shared_hash_set`,
@@ -99,6 +127,39 @@ ordering, and allocate only if the callback does. See the
 
 ## Algorithms and customization
 
+### Sort before using binary search
+
+The policy tells a generic algorithm how to compare your elements. This complete
+program uses the supplied signed-32-bit policy; it sorts an ordinary array and
+finds the first equal element. No collection or allocator is needed.
+
+```dodo test
+package sorted_lookup
+import "std/collections"
+
+fn main() -> i32 {
+    values := [30i32, 10, 20, 20]
+    policy := collections.I32 {}
+    collections.sort(&mut values, &policy)
+    assert_eq(values[0], 10)
+    key := 20i32
+    match collections.binary_search(&values, &key, &policy) {
+        some(index) => { assert_eq(index, 1usize) },
+        none => { return 1 },
+    }
+    assert_eq(collections.lower_bound(&values, &key, &policy), 1usize)
+    assert_eq(collections.upper_bound(&values, &key, &policy), 3usize)
+    return 0
+}
+```
+
+Save as `sorted_lookup.dodo` and run `dodo run sorted_lookup.dodo`. Success
+exits with zero. The half-open range `1..3` contains both values equal to 20.
+Binary search is meaningful only while the sequence remains sorted according
+to the same comparison policy.
+
+### Policy methods and algorithm costs
+
 `find`, `equal`, and lexicographic `compare` take a policy value by checked shared
 reference. `find` returns the first matching index. Length breaks equal-prefix
 lexicographic ties. Comparison results are normalized to -1, 0, or 1.
@@ -124,6 +185,8 @@ out-of-bounds input; it never destroys either exchanged value.
 
 ## Capacity, ownership, and failure
 
+### Fixed storage
+
 Caller-backed constructors take `&mut[Option<T>]`, destroy any preexisting slot
 payloads, and start empty. The backing array length fixes capacity. Construction,
 insertion, removal, and destruction never allocate. Destruction empties all
@@ -139,6 +202,8 @@ container. An invalid `replace` destroys its replacement and returns `none`.
 Vector `remove` and `insert` preserve order with O(n) shifting; `swap_remove`
 replaces the hole with the final value in O(1). Vector push/pop and ring
 push/pop at either end take O(1) without growth.
+
+### Growth and allocation errors
 
 Owned constructors initially allocate nothing. Vector capacity grows
 geometrically from four elements, doubling until sufficient; reserve validates
@@ -164,6 +229,8 @@ aligned, valid until exactly one matching deallocation, and remain alive while
 the capability lives. Shared arena adapters establish that contract in safe
 code. Allocator operations are single-threaded; concurrency requires a separate
 allocator adapter with its own synchronization contract.
+
+### Element types and retained borrows
 
 Zero-sized elements have ordinary independent lengths, moves and destructor
 calls while requiring zero allocation bytes. No default construction or cloning
@@ -197,6 +264,52 @@ values retain their checked dependencies; these owners are not automatically
 thread-transferable.
 
 ## Maps, sets, and heaps
+
+### Insert, replace, and look up a map value
+
+Map insertion has two independent outcomes: allocation can fail (`err`), and a
+successful insertion can either create a key (`none`) or replace its old value
+(`some(old)`). `?` handles the outer `Result`; `match` handles the inner `Option`.
+
+```dodo test
+package map_values
+import "alloc/error"
+import "alloc/shared_arena"
+import "std/collections/shared_hash_map"
+import "std/hash"
+
+fn example() -> void!error.AllocError {
+    storage := [0u8; 2048]
+    allocator := shared_arena.SharedArena.new(&mut storage)?
+    counts := shared_hash_map.new::<i32, i32, hash.I32>(allocator.handle(), hash.I32 {})
+    core.drop(counts.insert(7, 1)?)
+    match counts.insert(7, 2)? {
+        some(previous) => { assert_eq(previous, 1) },
+        none => { assert(false, "the key was already present") },
+    }
+    key := 7i32
+    match counts.get(&key) {
+        some(value) => { assert_eq(*value, 2) },
+        none => { assert(false, "the inserted key must exist") },
+    }
+    assert_eq(counts.len(), 1usize)
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `map_values.dodo` and run `dodo run map_values.dodo`; success exits with
+zero. `hash.I32` is a deterministic policy for trusted integer keys. For text
+keys, see the complete [string-map example](https://github.com/Jotrorox/dodo/blob/main/examples/string_map.dodo)
+and the policy choices below.
+
+### Key identity and ordering
 
 Map insertion preserves the first equal key object and replaces its value,
 returning the previous value as `some(old)`; inserting a new key returns `none`.
@@ -253,25 +366,6 @@ mutation. No safe iterator survives insertion, removal, reserve, clear, or
 container destruction, even when an operation happens not to relocate storage.
 Unrelated containers sharing the allocator can still mutate independently.
 Keys are never exposed mutably by map/set APIs.
-
-```dodo test
-package example
-import "std/collections"
-import "std/collections/fixed_vector"
-
-fn main() -> i32 {
-    slots: [3]Option<i32> = [none, none, none]
-    values := fixed_vector.Vector.new(&mut slots)
-    match values.push(42) {
-        ok() => {},
-        err(_) => { return 1 },
-    }
-    match values.pop() {
-        some(value) => { return value - 42 },
-        none => { return 2 },
-    }
-}
-```
 
 See `examples/collections.dodo` for safe sharing of an explicit allocator.
 The collection fixtures run at `-O0` and `-O3`, exercise deterministic models,

@@ -9,6 +9,20 @@ Use `std/math.checked_add` for recoverable signed arithmetic and `math.hypot`
 for a vector length. Import `std/math/trig` separately when you need angles.
 These portable modules need no allocator or native libm.
 
+The library separates exact integer operations from approximate floating-point
+operations. A checked integer sum is either exact or an error. An `f64` result
+can be rounded even when the operation succeeds. Choose the numeric type and
+the error policy before choosing a function.
+
+| Input or task | Package/API | Result style |
+| --- | --- | --- |
+| Byte counts, lengths, target-sized arithmetic | `core/num` | Checked `usize`, plus saturating/wrapping helpers |
+| Signed whole numbers | `math.checked_*` | Exact `i64` or `MathError` |
+| GCD, integer square root, powers of two | `math.gcd`, `isqrt`, `checked_next_power_of_two` | Exact `u64`; potentially overflowing operations are checked |
+| Roots, logs, exponentials, real powers | `std/math` | Approximate `f64`; invalid domains/finite overflow can be errors |
+| Angles | `std/math/trig` | Radians; checked and infallible operations as listed below |
+| Parse or print numbers | `std/text`, `std/fmt` | See [parsing](text.md#explicit-numeric-parsing) and [formatting](formatting.md) |
+
 ## Quickstart
 
 Save this as `math_start.dodo`:
@@ -64,6 +78,24 @@ fn reconstructs_the_horizontal_component() {
 
 See `examples/math_portable.dodo` for an executable example. All checked results
 must be handled or propagated with `?`; math does not bypass Result checking.
+To run the test-only example above, save it as `vector_example.dodo` and run
+`dodo test vector_example.dodo`. `atan2` takes `(y, x)`, so `(4, 3)` measures the
+angle of the vector whose horizontal component is 3 and vertical component is 4.
+
+## Use angles and tolerances deliberately
+
+Convert degrees to radians with `degrees * math.PI / 180.0`, and radians to
+degrees with `radians * 180.0 / math.PI`. Use `atan2(y, x)` when deriving an
+angle from coordinates: it preserves quadrant information that `atan(y / x)`
+loses and handles zero coordinates explicitly.
+
+For tests near zero, an absolute tolerance such as
+`math.abs(actual - expected) < 1e-12` can be appropriate. For quantities with a
+large range of magnitudes, combine absolute and relative tolerances chosen for
+the application. `math.EPSILON` describes the spacing near 1.0; it is not a
+universal error bound for every result or algorithm. Reject non-finite inputs
+with `is_finite` when your application requires finite values, since a successful
+checked operation can still return NaN or infinity under the contracts below.
 
 ## Integers
 
@@ -98,6 +130,9 @@ zero. `abs` clears the sign bit; `copy_sign` replaces only the sign bit. Constan
 include `PI`, `TAU`, `E`, `LN_2`, `LN_10`, `EPSILON`, `MIN_NORMAL`, and `MAX_FINITE`.
 `infinity()` and `nan()` construct positive infinity and a quiet NaN.
 
+`I64_MIN`, `I64_MAX`, and `U64_MAX` provide the exact integer boundaries. The
+[API reference](stdlib-api.md) lists all constants, classifiers, and functions.
+
 `trunc`, `floor`, and `ceil` round toward zero, negative infinity, and positive
 infinity. `round` rounds to nearest with ties away from zero; `round_even` uses
 ties to even. Integral rounding is exact, passes through NaNs and infinities,
@@ -113,6 +148,17 @@ the numerical accuracy contract. No floating-point exception flags, signaling
 NaN behavior, or preservation of NaN payloads through arithmetic are promised.
 Binary32 functions are not yet supplied; callers may explicitly promote `f32`
 inputs and use the binary64 results.
+
+| Rounding operation | `2.5` | `-2.5` | Rule |
+| --- | --- | --- | --- |
+| `trunc` | `2.0` | `-2.0` | Toward zero |
+| `floor` | `2.0` | `-3.0` | Toward negative infinity |
+| `ceil` | `3.0` | `-2.0` | Toward positive infinity |
+| `round` | `3.0` | `-3.0` | Nearest, halfway away from zero |
+| `round_even` | `2.0` | `-2.0` | Nearest, halfway to an even integer |
+
+These functions still return `f64`. Rounding a floating-point value does not
+by itself prove that a later conversion to an integer will fit.
 
 ## Elementary functions and exceptional inputs
 

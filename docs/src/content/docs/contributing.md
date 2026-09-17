@@ -10,6 +10,24 @@ The entire `docs/` directory is an Astro website. Documentation lives in
 dependencies are Astro and its Markdown renderer. Search runs locally in the
 browser.
 
+There are three kinds of content. Edit tutorials and reference guides directly.
+Edit the canonical specification only when its design requirements change.
+For generated API pages under `api/`, edit the corresponding library declaration
+or its adjacent source comment, then regenerate. Do not hand-edit generated
+Markdown; it is ignored by Git and replaced by the next build.
+
+## Choose the right place
+
+| Change | Source to edit |
+| --- | --- |
+| A reader's first steps | `index.md`, `installation.md`, `first-program.md`, or a `Learn Dodo` chapter. |
+| Explain a language rule | The relevant language reference page; cross-check the parser, checker, and tests. |
+| Explain a library task or contract | The relevant standard-library guide. |
+| Add or change a public API | Its source in `stdlib/`, its guide, and examples. The signature reference regenerates automatically. |
+| Change API extraction or its layout | `scripts/generate_api_docs.py` and its regression tests. |
+| Change the normative language design | `language-spec-0.1.md`, requirements/evidence, and relevant implementation notes. |
+| Change site navigation | Page frontmatter, `src/lib/docs.ts`, and the content schema when adding sections. |
+
 ## Edit or add a page
 
 Edit an existing `.md` file, or add a new one under `docs/src/content/docs/` with
@@ -68,14 +86,21 @@ The sidebar groups pages by their `section` field in this fixed order:
 | Section | Purpose | Suggested `order` values |
 | --- | --- | --- |
 | `Start here` | Overview, installation, and a first program. | 0–99 |
+| `Learn Dodo` | Sequential lessons, exercises, and a complete small application. | 0–99 |
 | `Using Dodo` | Practical guides for everyday compiler use. | 100–199 |
-| `Standard library` | Task-first module guides and package inventory. | 140–199 |
 | `Language reference` | Language topics and the full specification. | 200–299 |
+| `Standard library` | Task-first module guides and package inventory. | 140–199 |
+| `API reference` | API notation, generated package directory, and declarations. | Generated |
 | `Project` | Implementation, requirements, and contributing. | 300 and above |
 
 Within a section, the numeric `order` controls the page position. Leave gaps
 between values so a new page can fit between existing ones. Pages with the same
 order sort by title. Previous and next links follow the same sequence.
+
+Generated API pages also set `navigationGroup` to keep the long package directory
+in expandable sidebar groups. The current page's group opens automatically.
+Their `source` field makes the edit link lead to the library source instead of
+an ignored generated file.
 
 Use one of the section names exactly as written above. Pages without a `section`
 fall back to `Project` for compatibility; set it explicitly on new pages.
@@ -103,6 +128,20 @@ npm run dev
 
 Open the local URL printed by Astro. Markdown edits update the preview.
 
+The `predev` and `prebuild` scripts invoke `python3` to render the specification
+and generate the API pages before Astro starts. If Windows provides Python as
+`python` instead, run those preparation commands explicitly and start Astro
+directly from `docs/`:
+
+```powershell
+python ../scripts/render_spec.py
+python ../scripts/generate_api_docs.py
+npx astro dev
+```
+
+Use `npx astro build` for the production build after the same preparation.
+This is also useful when Python is selected by a full executable path.
+
 ## Check the production website
 
 From `docs/`, build the site and check its generated links:
@@ -112,6 +151,20 @@ npm run build
 python3 ../scripts/check_docs.py
 npm run preview
 ```
+
+Verify generated source and extraction behavior from the repository root:
+
+```sh
+python3 scripts/generate_api_docs.py --check
+python3 scripts/test_generate_api_docs.py
+dodo test docs --doc
+dodo test docs --doc -O 3
+```
+
+The executable checks need a matching Dodo compiler and C linker. Use
+`--linker PATH` or `DODO_CC` when the driver is not named `cc`. Example discovery
+alone (`--list`) does not check or run a program. Test intentionally invalid
+examples separately as rejections; do not mark them as executable success tests.
 
 The build generates static pages, specification downloads, and a search index
 in `docs/dist/`. The link checker validates internal pages, heading anchors,
@@ -158,6 +211,33 @@ specification; keep the frontmatter title on one line. When changing a language
 rule, update its acceptance, rejection, or execution evidence in Appendix B.
 Keep the implementation-defined choices and excluded features in Appendix C
 distinct from the normative source-language requirements.
+
+## Regenerate the API reference
+
+From the repository root:
+
+```sh
+python3 scripts/generate_api_docs.py
+python3 scripts/generate_api_docs.py --check
+```
+
+The generator groups directory packages, extracts public declarations, fields,
+variants, attributes, and adjacent source comments, and writes one page per
+source import under `docs/src/content/docs/api/`. It also writes the package
+directory. It does not execute library code or copy function bodies. The build
+fails on unrecognized public declaration forms instead of silently omitting
+them. Compiler intrinsics and virtual imports live in the authored
+[API overview](stdlib-api.md).
+
+Keep source comments useful to callers: explain constraints, failure state,
+ownership transfer, invalidation, and unsafe preconditions. The generator cannot
+invent behavioral documentation from a signature. Put worked examples and
+broader explanations in the guide, with links to the exact API page where useful.
+
+The API Markdown, specification downloads, `docs/.astro/`, and `docs/dist/` are
+generated and ignored by Git. A fresh checkout's `npm run build` recreates them.
+Library-source changes trigger the documentation workflow so the published
+reference follows the code.
 
 ## Publish
 

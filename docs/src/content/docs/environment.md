@@ -5,10 +5,15 @@ section: "Standard library"
 order: 153
 ---
 
-Use `std/env.get` to read one environment variable as UTF-8. `env.Workspace`
-owns reusable native name/value storage; the returned text lives in your output
-array. Import `std/platform` to choose strict conversion and `std/console` to
-print the value. This is hosted Linux GNU x86-64 / Windows x64 functionality.
+`std/env` reads command-line arguments, environment variables, and the current
+directory. Start with `get` for one variable or `Arguments.capture` for arguments.
+Both copy into caller-owned storage, making capacity and text conversion explicit.
+These APIs run on Linux GNU x86-64 and Windows x64.
+
+An environment value is optional: missing and empty are different states.
+It can also fail to fit or decode. Accordingly, `env.get` returns a Result
+containing an Option: first handle lookup/conversion failure, then handle
+presence or absence. The quickstart demonstrates both levels.
 
 ## Quickstart
 
@@ -66,13 +71,85 @@ configuration variable as missing. Exit 1 means lookup/conversion failed:
 increase the 128-byte output for `BufferTooSmall`, or reject malformed text.
 Each native workspace has a fixed 4096-unit bound. Exit 2 means printing failed.
 
-`env.Arguments.capture(&mut storage, TextPolicy.Strict)` is the recommended argument API:
+## Read command-line arguments
+
+`env.Arguments.capture(&mut storage, platform.TextPolicy.Strict)` is the recommended argument API:
 `next(&mut output)` and `get(index, &mut output)` return optional strings,
 including `argv[0]`. Create `storage` with `platform.list_workspace()`; the
 argument view keeps it borrowed until the view is dropped. Its native snapshot is bounded to 32768 units. A failed
 conversion does not advance `next`, allowing a larger output-buffer retry.
 Use the native snapshot and child-environment APIs below only when you need
 full native entries or explicit child configuration.
+
+Save the following as `arguments.dodo`. It prints each argument on its own line,
+including the executable name at index zero. Compile it with
+`dodo compile arguments.dodo -o arguments.exe`, then run
+`./arguments.exe first "two words"`. The last two output lines are `first`
+and `two words`; quotes group an argument in your shell and are not part of it.
+
+```dodo
+package arguments_example
+import "std/env"
+import "std/platform"
+import "std/console"
+
+fn main() {
+    storage := platform.list_workspace()
+    arguments := env.Arguments.capture(&mut storage, platform.TextPolicy.Strict)!
+    output := [0u8; 1024]
+    for true {
+        match arguments.next(&mut output)! {
+            some(value) => { console.println(value)! },
+            none => { break },
+        }
+    }
+}
+```
+
+Each `value` borrows `output`, so printing finishes before the next iteration
+overwrites it. Copy a value into separate storage if it must survive subsequent
+calls. Use `get(1, &mut output)` to read just the first user argument without
+advancing the iterator. This small example uses `!`; handle `BufferTooSmall`
+explicitly in a CLI that needs to report or retry oversized arguments.
+
+## Choose a capture strategy
+
+| Need | API | Storage/lifetime |
+| --- | --- | --- |
+| One UTF-8 variable | `env.get` | Reusable `env.Workspace` plus UTF-8 output. |
+| Indexed or sequential UTF-8 arguments | `Arguments.capture` | A `platform.list_workspace()` borrowed by the capture. |
+| Every native environment entry | `env.snapshot` | Caller byte/wide storage borrowed by `Snapshot`. |
+| Arguments without text conversion | `env.arguments` | Caller byte/wide storage borrowed by `Snapshot`. |
+| A child-specific environment | `env.child_environment` | A bounded mutable builder, then an immutable snapshot. |
+| Native current directory | `env.current_dir` | Caller byte/wide storage borrowed by the returned name. |
+
+## UTF-8 storage and conversion
+
+`env.get(name, output, workspace, policy)` copies just one variable, so unrelated
+large environment entries do not consume the workspace. `none` leaves output
+unchanged. `some("")` succeeds with zero output capacity. Names must be nonempty
+and contain neither NUL nor `=`. Linux compares names case sensitively; Windows
+uses the OS case-insensitive lookup. A native name or value must fit 4096 units,
+including NUL; output needs the UTF-8 byte count, without NUL. Windows surrogate
+pairs can expand to four UTF-8 bytes. Native lookup/capacity failures leave output
+unchanged; conversion errors can leave a prefix but return no string or valid
+prefix count. Do not use output after such an error as a complete value.
+
+`Arguments.get` and `next` use the policy supplied at capture. Strict conversion
+rejects malformed native text; replacement emits U+FFFD per malformed Linux byte
+or unpaired Windows surrogate. Missing indices return `none`; empty arguments
+return `some("")`. `len()` includes the executable at index zero. `rewind()`
+resets iteration. Capture copies at most 32768 native units, counting each NUL;
+failed capture clears the logical list and returns no argument view. Native
+`arguments` remains available for larger snapshots and full native text.
+
+Foreign process-global environment mutation must be synchronized with lookups
+as well as snapshots. Dodo never mutates it implicitly. Linux arguments come
+from startup `argv`; Windows parses the wide process command line using CRT
+backslash/quote rules, with separate executable-name rules.
+
+The complete [environment example](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_environment.dodo)
+prints a present value or reports absence. An empty value prints an empty line.
 
 ## API and contracts
 
@@ -165,30 +242,6 @@ executables. Object-only consumers must compile and link
 adapter selection, while `core`, `alloc`, `std/io`, `std/text`, and `std/time`
 remain independently cross-compilable for freestanding targets.
 
-## UTF-8 storage and conversion
+## Complete API reference
 
-`env.get(name, output, workspace, policy)` copies just one variable, so unrelated
-large environment entries do not consume the workspace. `none` leaves output
-unchanged. `some("")` succeeds with zero output capacity. Names must be nonempty
-and contain neither NUL nor `=`. Linux compares names case sensitively; Windows
-uses the OS case-insensitive lookup. A native name or value must fit 4096 units,
-including NUL; output needs the UTF-8 byte count, without NUL. Windows surrogate
-pairs can expand to four UTF-8 bytes. Native lookup/capacity failures leave output
-unchanged; conversion errors can leave a prefix but return no string or valid
-prefix count. Do not use output after such an error as a complete value.
-
-`Arguments.get` and `next` use the policy supplied at capture. Strict conversion
-rejects malformed native text; replacement emits U+FFFD per malformed Linux byte
-or unpaired Windows surrogate. Missing indices return `none`; empty arguments
-return `some("")`. `len()` includes the executable at index zero. `rewind()`
-resets iteration. Capture copies at most 32768 native units, counting each NUL;
-failed capture clears the logical list and returns no argument view. Native
-`arguments` remains available for larger snapshots and full native text.
-
-Foreign process-global environment mutation must be synchronized with lookups
-as well as snapshots. Dodo never mutates it implicitly. Linux arguments come
-from startup `argv`; Windows parses the wide process command line using CRT
-backslash/quote rules, with separate executable-name rules.
-
-The complete [environment example](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_environment.dodo)
-prints a present value or reports absence. An empty value prints an empty line.
+For every public type, field, constant, and function signature, see [std/env](api/std/env.md), [std/env/linux](api/std/env/linux.md), [std/env/windows](api/std/env/windows.md).

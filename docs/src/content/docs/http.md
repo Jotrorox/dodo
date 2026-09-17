@@ -5,10 +5,28 @@ section: "Standard library"
 order: 159
 ---
 
-Use `std/http/hosted.Client.new` and `get` to fetch a URL on Linux GNU x86-64
-or Windows x64. The hosted wrapper handles resolution, connection and polling;
-start with its fixed workspace and a bounded body buffer. Portable `std/http`
-and `std/http/client` remain available for custom transports and executors.
+HTTP exchanges a request and a response. Each has a start line, headers, and a
+body whose boundaries are defined by framing rules. A successful HTTP exchange
+can still return a status such as 404; the status is application information,
+separate from a transport or parsing failure.
+
+Start with `std/http/hosted.Client` to fetch a URL on Linux GNU x86-64 or Windows
+x64. It handles resolution, connection, and polling with explicit storage and
+limits. Continue into the portable parser and sender when you need custom
+transports, incremental bodies, or control over each I/O step.
+
+## Choose an HTTP layer
+
+| Layer | Use it when | You supply |
+| --- | --- | --- |
+| `std/http/hosted` or `std/http/https` | You want a complete URL request. | Workspace, body sink/buffer, policy; explicit trust for HTTPS. |
+| `std/http/client` | You already own a transport and execution loop. | Origin, three buffers, clock observations, polling, and readiness. |
+| `std/http/connection` | You are composing a client/server protocol driver. | Transport, buffer storage, event/body consumption, and execution policy. |
+| `std/http` | You need HTTP values, parsing, or serialization only. | Input bytes and bounded output/workspace. |
+| [std/web/app](web.md) | You want routes, handlers, and a hosted server. | Application behavior and explicit server limits. |
+
+The portable layers do not open connections or read clocks. Importing HTTP
+does not select TLS; choose the HTTPS adapter or a verified custom transport.
 
 ## Quickstart
 
@@ -149,6 +167,46 @@ offsets do not carry a message generation identifier.
 
 ## Incremental parsing
 
+### Parse a complete in-memory request
+
+You can learn the parser without a socket. This complete test repeatedly feeds
+the unconsumed suffix of one HTTP/1.1 request and counts its body bytes:
+
+```dodo test
+package parse_request
+import "std/http"
+
+@test
+fn reads_a_framed_body() {
+    workspace := [0u8; 1024]
+    parser := http.Parser.new(http.Role.Request, &mut workspace, http.Limits.defaults())
+    input := b"POST /items HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nabc"
+    cursor := 0usize
+    body_bytes := 0usize
+    for true {
+        event := parser.feed(&input[cursor..])!
+        cursor += event.consumed
+        if event.kind == http.EventKind.Body {
+            body_bytes += event.length
+        }
+        if event.kind == http.EventKind.Complete { break }
+        assert(event.kind != http.EventKind.NeedInput,
+            "the complete test message must provide every required byte")
+    }
+    assert_eq(cursor, input.len)
+    assert_eq(body_bytes, 3usize)
+    assert(parser.reusable())
+}
+```
+
+One `feed` can consume fewer bytes than it receives because it stops at the
+next event. It may also emit an event while consuming zero bytes. The loop
+therefore advances by `event.consumed`, not by the length of the supplied input.
+In a network program, `NeedInput` means to obtain more bytes; it does not mean
+EOF. The test asserts against it because all bytes are already available.
+
+### Drive events and retain the right storage
+
 Create `Parser.new(Role.Request, &mut workspace, Limits.defaults())` for a server
 or `Role.Response` for a client. Call `feed(input)` and advance the input cursor
 by `Event.consumed`. Continue feeding the unconsumed suffix. A single call
@@ -241,6 +299,16 @@ retry policy never turns an incomplete exchange into a reusable connection.
 
 ## Serialization and streaming output
 
+Serialization has two stages: write the head, then frame and deliver the body.
+`write_request` and `write_response` write into memory; they do not send those
+bytes to a socket. Likewise, `Sender.frame` reports encoded bytes ready for
+delivery, not bytes received by a peer.
+
+For a length-delimited body, declare the length before sending and finish only
+after accepting exactly that many bytes. For a chunked body, stage chunks as
+data becomes available and finish with the final zero chunk. In both cases,
+retain unsent encoded bytes across partial transport writes.
+
 `write_request(&request, destination)` and `write_response(&response,
 destination)` produce a complete head into caller memory and return its length.
 Publish only a successful returned prefix: errors can leave unpublished partial
@@ -267,6 +335,20 @@ must call `poison()`. A sender has no implicit flush, destructor I/O, body repla
 allocation, or deadline.
 
 ## Explicit policies
+
+Different layers report different kinds of incompleteness:
+
+| Signal | May you retry on the same state? | Required action |
+| --- | --- | --- |
+| Parser `NeedInput` | Yes | Supply the next bytes, or call `eof()` only for clean transport EOF. |
+| Driver `Backpressure` | Yes | Consume the pending body or flush pending output before retrying. |
+| Sender `BufferFull` | Yes | Provide sufficient encoding workspace. |
+| Parser syntax/framing/capacity error | No | Close the poisoned connection. |
+| Transport/TLS error or cancellation | No implicit reuse | Poison/end the exchange and handle any delivered prefix. |
+
+Always examine the layer returning an error. A retryable sender output shortage
+does not make parser workspace exhaustion retryable, and an HTTP 500 response
+is a completed protocol response rather than a parser failure.
 
 `RedirectPolicy.defaults()` disables automatic redirects. `permits` receives
 explicit source/target origins, hop count, and body replayability; HTTPS downgrade
@@ -381,3 +463,7 @@ HTTPS. They drive connection, readiness, deadline, and body-transfer loops.
 See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit
 storage bounds, resolver/deadline scope, cancellation, and a generated local
 HTTPS setup. The protocol APIs on this page remain usable independently.
+
+## Complete API reference
+
+For every public type, field, constant, and function signature, see [std/http](api/std/http.md), [std/http/connection](api/std/http/connection.md), [std/http/client](api/std/http/client.md), [std/http/server](api/std/http/server.md).

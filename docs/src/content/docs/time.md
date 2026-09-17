@@ -5,10 +5,22 @@ section: "Standard library"
 order: 150
 ---
 
-Use `std/time/hosted.WallClock.new().wall_now()` to read the current UTC timestamp
-on Linux GNU x86-64 or Windows x64. Import `std/console` and `std/fmt` to print
-Unix seconds. For elapsed time and deadlines use `hosted.MonotonicClock` instead:
-a wall clock can jump when the system time changes.
+Time values and clocks answer different questions. `std/time` represents
+durations, UTC timestamps, calendar dates, and clock-specific instants.
+`std/time/hosted` observes the operating system's clocks on Linux GNU x86-64 or
+Windows x64. Reading the clock is an explicit operation that can fail.
+
+| Question | Type/provider | Example use |
+| --- | --- | --- |
+| How long? | `Duration` | A 250 ms timeout interval. |
+| When in UTC? | `Timestamp`, hosted `WallClock` | A log entry or persisted event time. |
+| How much time has elapsed? | `Instant`, hosted `MonotonicClock` | Measuring work or enforcing a deadline. |
+| Which calendar components? | `Date`, `TimeOfDay`, `DateTime` | Formatting a timestamp in UTC. |
+| Has an explicit deadline arrived? | `clock.Deadline` or `timer.FakeTimer` | Polling with a chosen clock. |
+
+A wall clock can jump when system time changes. Measure elapsed time with two
+instants from the same monotonic clock; use timestamps for communication and
+storage. A timer value does not start a thread or sleep automatically.
 
 ## Quickstart
 
@@ -63,6 +75,34 @@ fail closed. `WallClock` returns UTC timestamps, with no local-time conversion.
 rounds up; `timeout_millis()` additionally rejects the all-ones infinite-wait
 sentinel. All overflowing conversions fail. These helpers do not sleep.
 
+## Native providers and elapsed measurements
+
+Import `std/time/hosted` explicitly for OS observations. Its `MonotonicClock.now`
+and `WallClock.wall_now` implement the `std/time/clock` structural contracts;
+`now_native` and `wall_now_native` preserve `std/platform/error.Error` with the
+native error code (with kind `Other`). The portable contracts map failures to `TimeError.ClockFailure`.
+There is no allocation, sleeping, scheduler, or timezone lookup.
+
+Linux reads `CLOCK_MONOTONIC` (which excludes suspended time) and `CLOCK_REALTIME`.
+Windows uses `QueryPerformanceCounter`/`QueryPerformanceFrequency` for monotonic
+time and `GetSystemTimePreciseAsFileTime` for wall time (Windows 8 or later).
+Windows performance-counter elapsed time includes sleep/hibernation. Wall times
+use the Unix epoch; Windows 100 ns ticks are converted to normalized seconds and
+nanoseconds. Precision of the value type does not imply equal clock resolution.
+Both monotonic clocks can return equal consecutive values; wall clocks can jump.
+
+`hosted.MonotonicClock.now_ms` and legacy `std/net/native.MonotonicClock.now_ms`
+use the same provider and truncation, so their millisecond domains agree. Both
+return the maximum timestamp on failure for existing network deadline contracts.
+Synchronization's `milliseconds` uses `Duration.timeout_millis` and maps conversion
+failures to its `InvalidInput`. Portable clocks/durations do not import these
+hosted integrations. Native monotonic IDs are reserved for this adapter;
+application clocks must choose a different identity.
+
+[hosted_elapsed.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_elapsed.dodo)
+is a complete elapsed-time example: it prints nanoseconds between two observations.
+Place work between those observations to measure it; zero is a valid result.
+
 ## API and contracts
 
 `std/time` contains allocation-free values and arithmetic. Importing it does
@@ -84,6 +124,34 @@ conversions use O(1) work and storage. Parsing/formatting scans bounded fields
 and uses only caller-provided buffers.
 
 ## Duration and timestamp guarantees
+
+### Work with explicit units
+
+The following test is portable and reads no clock. It shows exact nanosecond
+storage and the difference between truncating and rounding a timeout upward:
+
+```dodo test
+package duration_units
+import "std/time"
+
+@test
+fn rounds_a_timeout_up() {
+    interval := time.Duration.from_micros(1500)
+    assert_eq(interval.to_millis()!, 1u64)
+    assert_eq(interval.to_millis_ceil()!, 2u64)
+    assert_eq(interval.to_nanos()!, 1500000u64)
+    extra := time.Duration.from_millis(500)
+    total := interval.checked_add(&extra)!
+    assert_eq(total.to_micros()!, 501500u64)
+}
+```
+
+Use named constructors at the boundary of your application rather than passing
+an unexplained integer between APIs. When adapting a Duration to a finite wait,
+use `timeout_millis()` so a small nonzero interval does not become zero and an
+overflow does not become an infinite wait.
+
+### Representation and arithmetic
 
 `Duration` is nonnegative, with u64 whole seconds and a normalized nanosecond
 fraction in 0..999999999. The maximum is 2^64−1 seconds plus 999999999 ns.
@@ -220,6 +288,25 @@ fn deadline_expires_after_the_interval() {
 
 ## Parsing and formatting
 
+Use a 30-byte output array for the canonical UTC timestamp representation.
+The format result is a byte count; only that prefix is output. The following
+test parses a timestamp with millisecond precision and writes the same instant
+with nine fractional digits:
+
+```dodo test
+package timestamp_text
+import "core/bytes"
+import "std/time/iso8601"
+
+@test
+fn normalizes_timestamp_precision() {
+    stamp := iso8601.parse_timestamp(b"2026-09-17T12:30:00.125Z")!
+    output := [0u8; 30]
+    count := iso8601.format_timestamp(&mut output, &stamp)!
+    assert(bytes.equal(&output[..count], b"2026-09-17T12:30:00.125000000Z"))
+}
+```
+
 The `iso8601` package accepts ASCII bytes with explicit syntax:
 
 - `parse_date`: `YYYY-MM-DD`, exactly four year digits.
@@ -258,30 +345,6 @@ Result handling, and distinct monotonic/wall-time types. Portable object checks
 do not execute an OS clock or board startup. See `examples/time.dodo` for a
 complete executable example.
 
-## Native providers and elapsed measurements
+## Complete API reference
 
-Import `std/time/hosted` explicitly for OS observations. Its `MonotonicClock.now`
-and `WallClock.wall_now` implement the `std/time/clock` structural contracts;
-`now_native` and `wall_now_native` preserve `std/platform/error.Error` with the
-native error code (with kind `Other`). The portable contracts map failures to `TimeError.ClockFailure`.
-There is no allocation, sleeping, scheduler, or timezone lookup.
-
-Linux reads `CLOCK_MONOTONIC` (which excludes suspended time) and `CLOCK_REALTIME`.
-Windows uses `QueryPerformanceCounter`/`QueryPerformanceFrequency` for monotonic
-time and `GetSystemTimePreciseAsFileTime` for wall time (Windows 8 or later).
-Windows performance-counter elapsed time includes sleep/hibernation. Wall times
-use the Unix epoch; Windows 100 ns ticks are converted to normalized seconds and
-nanoseconds. Precision of the value type does not imply equal clock resolution.
-Both monotonic clocks can return equal consecutive values; wall clocks can jump.
-
-`hosted.MonotonicClock.now_ms` and legacy `std/net/native.MonotonicClock.now_ms`
-use the same provider and truncation, so their millisecond domains agree. Both
-return the maximum timestamp on failure for existing network deadline contracts.
-Synchronization's `milliseconds` uses `Duration.timeout_millis` and maps conversion
-failures to its `InvalidInput`. Portable clocks/durations do not import these
-hosted integrations. Native monotonic IDs are reserved for this adapter;
-application clocks must choose a different identity.
-
-[hosted_elapsed.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_elapsed.dodo)
-is a complete elapsed-time example: it prints nanoseconds between two observations.
-Place work between those observations to measure it; zero is a valid result.
+For every public type, field, constant, and function signature, see [std/time](api/std/time.md), [std/time/clock](api/std/time/clock.md), [std/time/timer](api/std/time/timer.md), [std/time/iso8601](api/std/time/iso8601.md), [std/time/hosted](api/std/time/hosted.md).

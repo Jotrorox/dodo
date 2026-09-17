@@ -5,10 +5,30 @@ section: "Standard library"
 order: 151
 ---
 
-Use `std/platform.workspace()` when a hosted operation needs reusable native
-path storage. It owns 4096 native units (bytes on Linux, UTF-16 on Windows),
-including the terminator. This is the recommended starting point instead of
-managing two scratch arrays. Import `std/platform/error` to name failures.
+Hosted packages call operating-system services such as files, processes, and
+standard streams. `std/platform` provides the native string storage those calls
+share; `std/platform/error` provides their common error type. Most programs
+start with a higher-level package such as `std/fs` or `std/process` and use this
+page when they need to understand its path, storage, or target requirements.
+
+A **native unit** is one byte on Linux and one UTF-16 code unit on Windows.
+`platform.workspace()` owns 4096 such units, including the terminating NUL.
+That number is a storage limit, not a character limit or a promise that the OS
+will accept every path of that size.
+
+## Choose the right layer
+
+| Task | Starting API | When to use the lower-level native API |
+| --- | --- | --- |
+| Print or read a line | [std/console](console.md) | Compose a borrowed standard-stream handle. |
+| Open a UTF-8 file path | [fs.File.open_utf8](filesystem.md) | Preserve non-UTF-8 Unix names or unpaired Windows surrogates. |
+| Look up configuration | [env.get](environment.md) | Capture all native environment entries. |
+| Run a program | [process.Command](processes.md) | Pass native argument/environment lists. |
+| Convert a native name for display | `platform.decode` | Supply larger byte/wide scratch explicitly. |
+
+These are independent adapters. A program that prints does not automatically
+import the process manager or network stack. Portable libraries such as
+`std/io`, `std/text`, and `std/time` work without an OS provider.
 
 ## Quickstart
 
@@ -60,6 +80,18 @@ that verifies object emission, not execution or board startup.
 
 ## API and contracts
 
+The basic native-string workflow is:
+
+1. Own storage, for example `workspace := platform.workspace()`.
+2. Copy UTF-8 into it with `workspace.set("report.txt")?`.
+3. Obtain a borrowed native view with `workspace.get()?`.
+4. Use that view in a native operation, then let the view's borrow end before
+   changing the workspace.
+
+The workspace stores a name; it does not open the resource named by it. A
+successful `fs.File.open` returns a separate owner, and does not retain the path
+buffer. By contrast, a `NativeString` continues to borrow its backing storage.
+
 [Filesystem](filesystem.md), [processes](processes.md),
 [environment](environment.md), [threads](threads.md),
 [synchronization](synchronization.md), [clocks](time.md), [networking](networking.md),
@@ -69,17 +101,22 @@ adapters independently. [Console](console.md) uses the platform stream adapter.
 compilation target, including `dodo check --target ...`. Explicitly importing an
 incompatible adapter produces a diagnostic.
 
-Supported hosted ABIs are x86-64 Linux GNU and Windows x64 MSVC/GNU. Linux x32,
-musl, AArch64, Darwin, freestanding targets, and other ABIs receive hosted adapter
-diagnostics. This restriction concerns these OS packages; portable core, alloc,
-I/O, text, time, and the other portable packages still cross-compile independently
-for WebAssembly and Cortex-M0.
+The compilation target chooses the adapter, even when the compiler runs on a
+different operating system. Target selection validates the supported ABI; it
+does not install that target's C headers, linker, or native libraries. See the
+linking requirements below before building a hosted executable for another OS.
 
 `std/platform/error` defines recoverable error kinds plus the native error code:
 Linux errno or Windows GetLastError. Synthetic library errors use code zero.
 Thread-start failures retain their native thread error domain. Synchronization
 has a separate typed error enum; it does not expose native implementation error
 numbers as portable values.
+
+Use `kind` for portable control flow and `code` for diagnostics. For example,
+handle `NotFound` as a missing path rather than comparing a Linux errno with a
+Windows error number. `BufferTooSmall` describes a caller-selected storage bound;
+`Unsupported` describes an operation or platform capability that a larger
+buffer will not fix.
 
 `std/platform/native` centralizes checked native strings and owned I/O handles.
 Unix strings use bytes; Windows uses UTF-16 code units and preserves unpaired
@@ -164,3 +201,7 @@ The hosted fixtures also emit Windows objects; execute them with
 available. That does not substitute for native Windows execution. The portable
 `io_bounded`, time, and lexical-path fixtures continue to emit WebAssembly and
 Cortex-M0 objects without hosted providers.
+
+## Complete API reference
+
+For every public type, field, constant, and function signature, see [std/platform](api/std/platform.md), [std/platform/error](api/std/platform/error.md), [std/platform/linux](api/std/platform/linux.md), [std/platform/windows](api/std/platform/windows.md).

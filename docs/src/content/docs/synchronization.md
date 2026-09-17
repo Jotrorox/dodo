@@ -5,10 +5,27 @@ section: "Standard library"
 order: 156
 ---
 
-Use `std/sync.Storage.new` and `sync.Mutex.new` to protect a value in caller
-storage on supported hosted targets. `std/sync/error` names lock failures.
-Start here for local ownership; use `std/sync/allocated` when independent
-owners must move into [native tasks](threads.md).
+Synchronization coordinates access to values shared by threads. A mutex grants
+one guard at a time; a channel moves messages between participants; an atomic
+provides individual synchronized integer operations. Start with a mutex unless
+another primitive directly matches your protocol.
+
+`std/sync` keeps native synchronization state in caller-owned storage on the
+supported hosted targets. `std/sync/allocated` creates independently owned,
+clonable values that can move into [native tasks](threads.md). `std/sync/error`
+names failures, and `std/sync/atomic` supplies inline integer atomics.
+
+## Choose a primitive
+
+| Need | Primitive | Key obligation |
+| --- | --- | --- |
+| Change a value or several related fields together | `Mutex<T>` | Keep all accesses under a guard. |
+| Many readers, occasional exclusive changes | `RwLock<T>` | Release read guards before attempting a write. |
+| Wait until protected state satisfies a predicate | Mutex condition | Recheck the predicate after every wakeup. |
+| Initialize shared state once | `Once<T>` | Avoid recursively initializing the same owner. |
+| Rendezvous a fixed number of participants | `Barrier` | Every participant must arrive in each generation. |
+| Transfer bounded messages | `Channel<T>` | Explicitly close/cancel when peers should stop waiting. |
+| One synchronized integer | `Atomic<T>` | Choose a memory-ordering protocol; several calls are not one transaction. |
 
 ## Quickstart
 
@@ -86,6 +103,49 @@ the obligations described in the [thread guide](threads.md).
 
 ## Locks, guards, and waits
 
+### Share a counter with a worker
+
+The quickstart's mutex borrows local storage. For a value shared by independently
+owned tasks, choose the allocated form and clone its owner into each task. A
+clone points to the same protected value; it does not copy the counter.
+
+```dodo test
+package shared_counter
+import "std/sync/allocated"
+import "std/thread"
+
+pub struct Increment {
+    counter: allocated.Mutex<usize>
+    pub fn run(self) -> bool {
+        match self.counter.lock(1000) {
+            ok(guard) => {
+                value := guard.get_mut()
+                *value += 1
+                return true
+            },
+            err(_) => { return false },
+        }
+    }
+}
+
+@test
+fn shares_a_counter() {
+    counter := allocated.Mutex.new(allocated.PageAllocator.new(), 0usize)!
+    storage := thread.Storage.new::<Increment, bool>()
+    worker := thread.spawn(&mut storage, Increment { counter: counter.clone() })!
+    assert(worker.join())
+    guard := counter.lock(1000)!
+    assert_eq(*guard.get(), 1usize)
+}
+```
+
+The task handles its lock Result before returning the transferable `bool`.
+The parent joins before taking its own guard. Holding the parent guard while
+joining would stop the worker from obtaining the lock. The last mutex owner
+releases the allocated storage on normal scope exit.
+
+### Guard lifetimes
+
 `mutex.lock(timeout_ms)` returns a guard. Its `get()` and `get_mut()` views borrow
 that guard, preventing unlock, wait, movement, destruction, or lifetime escape
 while a view is live. Guards are thread-affine and release locks on normal scope
@@ -127,6 +187,13 @@ the mutex. The rules follow the
 [POSIX condition API](https://man7.org/linux/man-pages/man3/pthread_cond_wait.3.html)
 and [Windows condition API](https://learn.microsoft.com/en-us/windows/win32/sync/condition-variables).
 
+The state is the source of truth; a notification is only a reason to check it
+again. Release every `guard.get()` or `get_mut()` view before `wait`, because
+waiting temporarily allows another thread to mutate the payload. A repeated
+relative timeout inside a predicate loop can exceed your intended total wait;
+track a monotonic deadline and pass the remaining budget when a total bound
+matters.
+
 ## Once and barriers
 
 `Once.new::<T>(storage)` and its allocated counterpart serialize
@@ -164,6 +231,27 @@ peers to exit.
 
 ## Atomics
 
+This test illustrates the return values without requiring a worker thread.
+`fetch_add` returns the old value; compare-exchange reports both the observed
+value and whether it replaced it. Every ordering-sensitive call is fallible.
+
+```dodo test
+package atomic_example
+import "std/sync/atomic"
+
+@test
+fn increments_and_replaces() {
+    counter := atomic.Atomic.new(10usize)
+    previous := counter.fetch_add(2, atomic.Ordering.SeqCst)!
+    assert_eq(previous, 10usize)
+    result := counter.compare_exchange(12, 20,
+        atomic.Ordering.SeqCst, atomic.Ordering.SeqCst)!
+    assert(result.exchanged)
+    assert_eq(result.previous, 12usize)
+    assert_eq(counter.load(atomic.Ordering.SeqCst)!, 20usize)
+}
+```
+
 `atomic.Atomic.new(value)` stores an inline integer. `allocated.Atomic` supplies
 a retained stable allocation for sharing the same atomic across move tasks.
 Both expose `load`, `store`, `exchange`, `fetch_add`, and strong
@@ -190,8 +278,23 @@ have no lock-free guarantee.
 
 ## Destruction and limits
 
+Treat `TimedOut`, `Closed`, and `Cancelled` differently. A live channel can be
+retried after timeout. A closed channel rejects sends but still yields queued
+messages, then `none`. Cancellation is permanent and wakes waiters; it is not
+a temporary pause. A failed `send` has already consumed and destroyed its
+argument, so retrying requires a newly owned value.
+
+Avoid holding a guard while joining a worker that needs the same lock: the
+join waits for the worker, and the worker waits for the guard. End the guard's
+scope before blocking on dependent work. Scope-based unlock prevents forgotten
+unlocks, but cannot prove an application's lock ordering is deadlock-free.
+
 Dodo traps abort without unwinding. Poisoning is therefore not meaningful: no
 surviving Dodo caller can recover a poisoned guard after a trap. Impossible native
 ownership/destruction failures abort rather than release storage still in use.
 The library supplies no scheduler, asynchronous cancellation, process-shared
 locks, robust mutexes, priority inheritance, or Dodo thread-local storage API.
+
+## Complete API reference
+
+For every public type, field, constant, and function signature, see [std/sync](api/std/sync.md), [std/sync/allocated](api/std/sync/allocated.md), [std/sync/atomic](api/std/sync/atomic.md), [std/sync/error](api/std/sync/error.md).

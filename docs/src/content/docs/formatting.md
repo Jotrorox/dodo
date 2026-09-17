@@ -1,6 +1,6 @@
 ---
 title: "Formatting and console output"
-description: "Formatting and console output: a runnable starting point, storage choices, and detailed contracts."
+description: "Print values, build checked format strings, write to fixed buffers, and implement custom formatting."
 section: "Standard library"
 order: 145
 ---
@@ -12,6 +12,8 @@ x86-64 and Windows x64; `fmt` works with any structural writer on all targets.
 
 ## Quickstart
 
+Save this as `printing.dodo`:
+
 ```dodo test
 package printing
 import "std/console"
@@ -19,6 +21,10 @@ import "std/console"
 fn main() {
     console.printf("Answer: {}, enabled: {}\n", 42, true)!
 }
+```
+
+```sh
+dodo run printing.dodo
 ```
 
 Expected stdout is `Answer: 42, enabled: true` followed by LF. Postfix `!`
@@ -38,6 +44,54 @@ Start with `io.MemoryWriter.new(&mut storage)` over a fixed byte array. Choose
 [safe byte-buffer constructors](bytes.md). `std/float_decimal` is an internal
 conversion helper.
 
+## Choose a formatting layer
+
+| Task | Use | What it returns |
+| --- | --- | --- |
+| Print a value to standard output | `console.print(value)` or `console.println(value)` | Byte count or `io.Error` |
+| Combine a literal and values | `console.printf("{}", value)` | Byte count or `io.Error` |
+| Write the same output to a file or memory | `fmt.print`, `fmt.println`, `fmt.printf` with a writer | Byte count or `io.Error` |
+| Select formatting options at runtime | `fmt.Formatter` methods and `fmt.Options` | `void!io.Error`; query `written()` |
+| Build an owned UTF-8 string | `fmt_alloc.string(buffer, &value)` | Owned string or `fmt_alloc.Error` |
+
+All byte counts include UTF-8 bytes and any newline. Successful output is not
+automatically flushed or synchronized to a device. See [byte I/O](io.md) for
+buffering and progress on failure.
+
+### Format into caller-owned bytes
+
+This complete program demonstrates decimal zero padding, hexadecimal, and fixed
+precision. It uses the same literal-format checks as console output, with no
+console or allocation dependency.
+
+```dodo test
+package format_into_memory
+import "std/fmt"
+import "std/io"
+import "core/bytes"
+
+fn example() -> void!io.Error {
+    storage := [0u8; 64]
+    writer := io.MemoryWriter.new(&mut storage)
+    count := fmt.printf(&mut writer, "id={:04d} hex={:x} value={:.2f}", 7, 255, 3.5)?
+    assert_eq(count, 25usize)
+    assert(bytes.equal(writer.written(), b"id=0007 hex=ff value=3.50"))
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `format_into_memory.dodo` and run `dodo run format_into_memory.dodo`.
+It exits with zero and prints nothing. Read only `writer.written()`; the
+remainder of the backing array is unused capacity. Reduce the array size to
+observe `BufferFull`, which can leave a valid output prefix.
+
 ## Checked format strings
 
 `printf` accepts a **string literal**, followed by zero or more heterogeneous
@@ -48,7 +102,7 @@ The compiler rejects malformed braces, missing or surplus arguments, unsupported
 options, and types incompatible with their placeholders. Variables and constants
 containing format strings are not accepted; print dynamic text with `print`.
 
-The initial placeholder grammar is:
+The placeholder grammar is:
 
 ```text
 {} or {:[[fill]align][sign][0][width][.precision][type]}
@@ -173,6 +227,51 @@ byte count. The method may compose all standard formatting operations and
 propagate failures with `?`. It requires no traits, closures, reflection,
 vtables, scheduler, or allocation. See `examples/formatting.dodo`.
 
+### Give your own type a printable representation
+
+The type and its method must be public so `std/fmt` can call the method from
+another package. `W` is the concrete destination type, selected by the caller.
+Each `?` propagates output failure without discarding its accumulated progress.
+
+```dodo test
+package custom_display
+import "std/fmt"
+import "std/io"
+import "core/bytes"
+
+pub struct Point {
+    x: i64
+    y: i64
+
+    pub fn format<W>(&self, output: &mut fmt.Formatter<W>) -> void!io.Error {
+        output.string("(")?
+        output.decimal(self.x)?
+        output.string(", ")?
+        output.decimal(self.y)?
+        output.string(")")?
+        return ok()
+    }
+}
+
+fn main() -> i32 {
+    storage := [0u8; 32]
+    writer := io.MemoryWriter.new(&mut storage)
+    point := Point { x: 3, y: 4 }
+    match fmt.print(&mut writer, &point) {
+        ok(count) => { assert_eq(count, 6usize) },
+        err(_) => { return 1 },
+    }
+    assert(bytes.equal(writer.written(), b"(3, 4)"))
+    return 0
+}
+```
+
+Save as `custom_display.dodo` and run `dodo run custom_display.dodo`. The
+assertion checks the six output bytes. The same `Point` also works with
+`console.println(point)` and a `{}` field in `printf`.
+
+### Fixed decimal fields and allocated strings
+
 `write_u32_padded(destination, value, width)` is an allocation-free convenience
 for decimal output into a caller-owned byte slice, built on the same formatter
 and memory-writer contracts. It writes at least `width` digits, adding leading
@@ -213,3 +312,6 @@ directly. Optional `std/fmt/errors` supplies displays for enum errors with
 `time`. Every display works with `fmt.print`, `fmt.println`, `fmt.printf`, and console
 printing. Built-in error output includes fixed kinds and numeric metadata only.
 It does not capture sensitive input or native error-message strings.
+
+Consult the [API reference](stdlib-api.md) for `Options`, `Formatter`, error
+display wrappers, and the allocation adapter signatures.

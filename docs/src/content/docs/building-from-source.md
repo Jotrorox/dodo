@@ -5,8 +5,24 @@ section: "Project"
 order: 310
 ---
 
-Build from source to work on the compiler or choose its linking profile. To use
-a downloaded compiler, follow [installation](installation.md) instead.
+Build from source when you are changing the compiler, need an unreleased API,
+or cannot use a prebuilt archive. If your goal is to write Dodo programs, start
+with [installation](installation.md); a source build is optional.
+
+## Choose a build path
+
+| Goal | Start with | LLVM needed? |
+| --- | --- | --- |
+| Work on parsing, checking, formatting, or editor analysis | [Frontend development](#frontend-development-without-llvm) | No. |
+| Build a local `dodo` CLI with code generation | The prerequisites and ordinary Cargo build below | Yes, LLVM 23 development files. |
+| Produce a Windows release archive | [Windows release archive](#windows-release-archive) | Yes, plus static support libraries. |
+| Produce a Linux binary with bundled LLVM support libraries | [Self-contained Linux release](#self-contained-linux-release) | Yes, on the build host. |
+| Minimize executable size | [Size-focused build](#size-focused-compiler-build) | Yes; size depends on the LLVM libraries too. |
+
+Run repository commands from its root unless a section says otherwise. The Rust
+toolchain is pinned in `rust-toolchain.toml`; the compiler's bundled library is
+compiled into the binary, so rebuild Dodo after changing `stdlib/` before testing
+those changes with the CLI.
 
 ## Get the source
 

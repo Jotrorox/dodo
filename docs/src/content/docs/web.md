@@ -5,10 +5,25 @@ section: "Standard library"
 order: 160
 ---
 
-Build a small HTTP application with `std/web/app`. Register routes, use ready-made
-response handlers or your own structs, and run it on Linux GNU x86-64 or Windows
-x64. The portable `std/web/application` package supports the same fluent routing
-and in-process tests without importing sockets.
+A web application maps an HTTP method and path to a handler. The handler reads
+validated request data and builds a bounded response. Start with `std/web/app`
+to register routes and run a server on Linux GNU x86-64 or Windows x64.
+Use `std/web/application` for the same routing and handlers in portable,
+in-process tests.
+
+Work through the first server, several routes, and tests before configuring
+concurrency or TLS. The later sections explain exact routing precedence,
+request decoding, response limits, streaming, and static files.
+
+| Application need | Starting point |
+| --- | --- |
+| A fixed page or health endpoint | `web.text`, `html`, `json`, or `bytes` with `app.new().get(...)` |
+| Request-dependent output | A public struct with `handle(&mut self, request, response)` |
+| Several routes plus shared policy | Fluent registrations and `.middleware(...)` |
+| Repeatable behavior tests | `application.builder()` and `site.request(...)` |
+| Multiple sockets progressing together | `.concurrent()`; synchronous handlers still share one thread |
+| HTTPS | `.run_with(address, https.files(certificate, key))` |
+| Streaming bodies/custom execution | `std/web/server` and `std/http/connection` |
 
 ## Quickstart
 
@@ -40,6 +55,11 @@ connections. Routing rejections such as 404 and 405 are counted separately from
 connection failures.
 
 ## Several routes
+
+For `/hello/Ada?suffix=+friend`, the method and decoded path select a route,
+`:name` captures `Ada`, and the query helper returns ` friend`. Path captures
+and query values are separate inputs; the `+` convention applies only to query
+decoding. Read [request access](#request-access-and-decoding) for the exact rules.
 
 Static responses need no custom handler. Dynamic handlers receive a request and
 write into a response:
@@ -120,6 +140,11 @@ untrusted text. Body and header bytes are copied into bounded response storage.
 
 ## Test without a server
 
+Test application behavior before introducing sockets. Start with successful
+requests, then add missing paths, wrong methods, missing required input,
+invalid numeric input, and handler failures. These tests use the real router
+and handler, so a rejected request should assert both status and public body.
+
 Use `application.builder()` for portable application tests. It offers the same
 route and middleware methods; `build()` returns an `Application` without hosted
 configuration. `request(method, target)` decodes and dispatches a request in
@@ -184,6 +209,40 @@ pairs). They do not simulate HTTP framing, socket behavior, deadlines, or custom
 server limits. Request IDs are 1 for each synthetic request. Keep independent
 HTTP integration tests for those boundaries.
 
+### Test validated input and failure responses
+
+This handler requires a decimal route parameter. A malformed ID automatically
+becomes a 400 response through `?`; a valid but unknown ID is an explicit 404.
+There is no need to build an error body for either case.
+
+```dodo test
+package validated_route
+import "std/web"
+import "std/web/application"
+
+pub struct Item {
+    pub fn handle(&mut self, request: &mut web.Request,
+        response: &mut web.Response) -> void!web.Failure {
+        id := request.param_u64(b"id")?
+        if id != 7 { return err(web.reject(404)) }
+        return response.text(b"item seven")
+    }
+}
+
+@test
+fn distinguishes_bad_input_from_missing_items() {
+    site := application.builder().get(b"/items/:id", Item {}).build()!
+    site.request(b"GET", b"/items/7").expect_status(200).expect_body(b"item seven")
+    site.request(b"GET", b"/items/seven").expect_status(400).expect_body(b"")
+    site.request(b"GET", b"/items/8").expect_status(404).expect_body(b"")
+    site.request(b"POST", b"/items/7").expect_status(405)
+}
+```
+
+The 404 produced by the handler is distinct from the router's 404 for an
+unmatched path, even though the public status can be identical. Inspect a test
+response's `failure` or the hosted serving report when diagnosing the cause.
+
 ### Existing registration API
 
 `application.new().get(pattern, handler)!` and `app.Server.new(routes)` remain
@@ -192,6 +251,11 @@ has all seven method shortcuts and the same in-process testing methods. The
 fluent builder is the simpler default for new apps.
 
 ## Configuration and storage
+
+Choose bounds from the messages your application accepts. Increasing a numeric
+limit alone does not add storage: the effective body limit is also constrained
+by the actual request/response buffers. A response body is assembled before it
+is sent, so large downloads belong on the streaming path described later.
 
 `app.Config.defaults()` is grouped by purpose:
 
@@ -476,6 +540,19 @@ its router does not implement authority/virtual-host selection or OPTIONS `*`.
 
 ## Handlers and middleware
 
+The buffered request lifecycle is:
+
+1. HTTP framing and bounded body collection complete.
+2. The target is decoded and a route/method selected.
+3. Middleware `before` methods run in order.
+4. The selected handler reads the request and writes a response.
+5. Middleware `after` methods run in reverse order, subject to the failure rules
+   below, and the runner sends the response.
+
+Handlers retain their own state between requests, but request and response
+views are temporary. Copy the particular data you need into appropriately
+owned state; do not retain a borrowed path, header, body, or response slice.
+
 Buffered handlers implement one ordinary, compiler-checked method:
 
 ```dodo
@@ -759,3 +836,7 @@ storage. Its underlying `std/web/hosted` runner provides serial connection,
 readiness, deadline, and body-transfer loops. See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs,
 explicit storage bounds, resolver/deadline scope, cancellation, and a generated
 local HTTPS setup. Protocol and routing APIs remain usable independently.
+
+## Complete API reference
+
+For every public type, field, constant, and function signature, see [std/web](api/std/web.md), [std/web/application](api/std/web/application.md), [std/web/app](api/std/web/app.md), [std/web/testing](api/std/web/testing.md), [std/web/https](api/std/web/https.md), [std/web/reactor](api/std/web/reactor.md), [std/web/server](api/std/web/server.md), [std/web/static_files](api/std/web/static_files.md).

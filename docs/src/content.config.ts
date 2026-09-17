@@ -11,8 +11,10 @@ const docs = defineCollection({
   schema: z.object({
     title: z.string(),
     description: z.string(),
-    section: z.enum(['Start here', 'Using Dodo', 'Standard library', 'Language reference', 'Project']).default('Project'),
+    section: z.enum(['Start here', 'Learn Dodo', 'Using Dodo', 'Language reference', 'Standard library', 'API reference', 'Project']).default('Project'),
     order: z.number(),
+    navigationGroup: z.string().optional(),
+    source: z.string().optional(),
   }),
 });
 

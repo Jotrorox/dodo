@@ -170,6 +170,18 @@ const updateNavigation = () => { navigation.open = !mobile.matches; };
 updateNavigation();
 mobile.addEventListener('change', updateNavigation);
 
+// Keep the current package visible even when the API directory is long. Scroll
+// only the sidebar, preserving the document's heading anchor and reading position.
+const currentPage = navigation.querySelector<HTMLElement>('[aria-current="page"]');
+const sidebar = document.querySelector<HTMLElement>('.sidebar');
+if (!mobile.matches && currentPage && sidebar) {
+  const item = currentPage.getBoundingClientRect();
+  const panel = sidebar.getBoundingClientRect();
+  if (item.top < panel.top || item.bottom > panel.bottom) {
+    sidebar.scrollTop += item.top - panel.top - (sidebar.clientHeight - item.height) / 2;
+  }
+}
+
 const tocLinks = [...document.querySelectorAll<HTMLAnchorElement>('.toc a[href^="#"]')];
 const headingLinks = new Map(tocLinks.map((link) => [decodeURIComponent(link.hash.slice(1)), link]));
 const observer = new IntersectionObserver((entries) => {

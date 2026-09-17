@@ -1,14 +1,33 @@
 ---
 title: "Allocation and boxes"
-description: "Allocation and boxes: a runnable starting point, storage choices, and detailed contracts."
+description: "Understand explicit storage, choose an arena or pool, and safely own values with boxes and shared allocator handles."
 section: "Standard library"
 order: 142
 ---
 
-Use `alloc/arena.Arena.new` plus the safe `alloc/arena_box.new` constructor to
-own one value in an explicit byte array. Allocation is portable and fallible.
-Start with fixed storage for ordinary text and collections; use an allocator
-when you need an owning box or growth.
+An allocator gives parts of a storage region to values that need them. Dodo
+does not select a global heap for you: you supply the storage, choose its
+allocation policy, and handle exhaustion. A box owns one initialized value in
+that storage. A growing buffer or collection owns space for several values.
+
+For a first example, use `alloc/arena` and `alloc/arena_box`. All the allocation
+packages on this page are portable; the examples use ordinary local byte arrays.
+Learn [ownership](ownership.md) first if moving and borrowing values are new.
+
+## Choose a storage strategy
+
+| Requirement | Starting point | When space is reusable |
+| --- | --- | --- |
+| A small string or list with a fixed maximum | `text.Builder`, `collections/fixed_vector` | As entries are removed or the builder is cleared; no allocator is involved. |
+| One owner borrowing an allocator | `arena.Arena`, `arena_box.new` | All arena space is reclaimed together by unsafe `reset`. |
+| Several independent owners sharing storage | `shared_arena.SharedArena`, `shared_box.new`, `collections/shared_*` | All arena space is reclaimed together after owners and handles are gone. |
+| Repeated allocations of a fixed block size | `pool.Pool`, `pool_box.new` | Each block is reusable after its owner is destroyed. |
+| A custom allocation implementation | `layout`, `block`, `boxed` | According to your allocator's explicit contract. |
+
+Dropping a value and reclaiming arena bytes are different operations. Destruction
+runs the value's cleanup. An arena's bump cursor stays advanced until reset,
+including when a collection replaces an old allocation during growth.
+See the [API reference](stdlib-api.md) for exact declarations.
 
 ## Quickstart
 
@@ -64,9 +83,15 @@ for the appended field and `layout()` for the combined layout. Use
 `layout.of::<T>()` and `layout.array::<T>(count)` use the target's ABI.
 Arithmetic failures return an error without wrapping or trapping.
 
-`AllocError` distinguishes `InvalidAlignment`, `SizeOverflow`, `Exhausted`,
-and `UnsupportedLayout`. There is no implicit process termination on allocation
-failure and no global allocator fallback.
+| `AllocError` | Meaning | Typical response |
+| --- | --- | --- |
+| `InvalidAlignment` | An alignment is zero or not a power of two. | Correct the layout or reject the request. |
+| `SizeOverflow` | A size computation or target layout limit was exceeded. | Reject the input; increasing backing storage does not fix arithmetic overflow. |
+| `Exhausted` | The allocator or an explicit logical limit has no space for the request. | Reduce the request, increase storage, or report the limit. |
+| `UnsupportedLayout` | The allocator cannot provide the requested layout. | Choose a suitable pool block configuration or another allocator. |
+
+There is no implicit process termination on allocation failure and no global
+allocator fallback. A `Result` must be handled even when you expect ample space.
 
 ## Arenas, pools, and raw blocks
 
@@ -92,7 +117,9 @@ reuses a block, and unsafe `reset` invalidates every outstanding allocation.
 Zero-sized allocations consume no arena bytes or pool blocks. Their pointers
 are nonnull and aligned but may dangle; they must not be accessed as nonzero
 storage. Raw `Block` descriptors do not keep an allocator alive and do not free
-or destroy anything when dropped. Their pointer access is unsafe. Deallocation
+or destroy anything when dropped. `as_ptr()` safely exposes a raw pointer;
+dereferencing it or creating references from it requires an unsafe operation and
+proof that the allocation is still valid. Deallocation
 must use the exact originating allocator, with a live descriptor, at most once.
 `Block.from_raw_parts` is unsafe and requires a valid, exclusive raw allocation
 matching its layout.
@@ -106,24 +133,7 @@ The resulting `Box<T, A>` holds an exclusive checked borrow of its allocator,
 keeping the allocator and its backing storage live until the box is destroyed
 or consumed. This initial API permits one live box per borrowed allocator.
 
-```dodo test
-package ownership
-
-import "alloc/arena"
-import "alloc/arena_box"
-
-fn main() -> i32 {
-    storage := [0u8; 64]
-    allocator := arena.Arena.new(&mut storage)
-    match arena_box.new(&mut allocator, 42i32) {
-        ok(value) => { return value.into_inner() - 42 },
-        err(_) => { return 1 },
-    }
-}
-```
-
-Save as `ownership.dodo` and run `dodo run ownership.dodo`; success exits with
-status zero and prints nothing. Dropping a box destroys its value exactly once,
+Dropping a box destroys its value exactly once,
 then deallocates the block. `into_inner` moves the value out and still releases
 the allocation. `replace(value)` installs a new value and returns the old one
 without destroying it. Allocation failure destroys the supplied value exactly once.
@@ -170,3 +180,41 @@ handles directly from the arena avoids tying their lifetimes to each other.
 `get`, `get_mut`, moving `replace`/`into_inner`, and deterministic destruction.
 Each `std/collections/shared_*` adapter uses the same capability. The original
 arena/pool Box interfaces retain their exclusive borrowing behavior.
+
+### Keep two boxes alive together
+
+This program obtains separate handles from one arena. Each box keeps the arena
+alive, while each box's own value can be edited independently.
+
+```dodo test
+package shared_boxes
+import "alloc/error"
+import "alloc/shared_arena"
+import "alloc/shared_box"
+
+fn example() -> void!error.AllocError {
+    storage := [0u8; 256]
+    allocator := shared_arena.SharedArena.new(&mut storage)?
+    first := shared_box.new(allocator.handle(), 20i32)?
+    second := shared_box.new(allocator.handle(), 22i32)?
+    assert_eq(*first.get() + *second.get(), 42)
+    previous := first.replace(30)
+    assert_eq(previous, 20)
+    assert_eq(first.into_inner(), 30)
+    assert_eq(second.into_inner(), 22)
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `shared_boxes.dodo` and run `dodo run shared_boxes.dodo`. Success exits
+with zero and prints nothing. The helper returns the same `AllocError` type
+from arena construction and both box allocations, so `?` can propagate each
+failure to one `match` in `main`. `into_inner` consumes each box: it returns the
+value and ends that owner's allocator dependency. No manual free is needed.

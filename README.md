@@ -1,26 +1,18 @@
 # Dodo
 
-Dodo is an ahead-of-time systems language with checked borrowing and explicit
-hardware access. Its Rust and LLVM 23 compiler produces native executables,
-object files, assembly, LLVM IR, and bitcode. Ordinary generated code needs no
-garbage collector, heap allocator, scheduler, or Dodo runtime.
+Dodo is an ahead-of-time compiled systems language with checked borrowing,
+explicit memory ownership, and native output. Start with small terminal programs;
+use the same language for portable libraries, hosted applications, and low-level
+hardware code.
 
-**Compiler release: 0.1.3 · Language version: 0.1 · [BSD-2-Clause](LICENSE)**
+**Compiler 0.1.3 · Language design 0.1 · [BSD-2-Clause](LICENSE)**
 
-This README describes `main`, which can include changes made after the latest
-release. Use the [`v0.1.3` tag](https://github.com/Jotrorox/dodo/tree/v0.1.3) for
-the released source and [CHANGELOG.md](CHANGELOG.md) for release notes.
+## Start in five minutes
 
-## Get started
+[Install Dodo and a C toolchain](https://jotrorox.github.io/dodo/installation/),
+create a folder named `hello`, and save this as `main.dodo` inside it:
 
-Download a compiler from [GitHub Releases](https://github.com/Jotrorox/dodo/releases)
-and follow the [installation guide](https://jotrorox.github.io/dodo/installation/).
-Prebuilt compilers include LLVM; running Dodo programs also requires a C
-toolchain such as `cc`.
-
-Create a project folder named `hello` and save this as `main.dodo` inside it:
-
-```dodo
+```dodo test
 package main
 
 import "std/console"
@@ -30,223 +22,145 @@ fn main() {
 }
 ```
 
-Run it from the same directory:
+From that folder, run:
 
 ```sh
 dodo run
 ```
 
-The program prints `Hello, world!` and exits successfully. `console.println`
-returns a Result: `ok` reports the written byte count, and `err` reports an I/O
-failure. Postfix `!` unwraps success or panics if printing fails; `?` propagates
-errors from functions returning a Result. A project needs
-only `main.dodo`: no manifest, lockfile, or package manager. Put shared code in
-ordinary subfolders and import it by path.
-The [first program guide](https://jotrorox.github.io/dodo/first-program/)
-explains each line and shows how to check the program and keep an executable.
-Use the [console guide](docs/src/content/docs/console.md) to print primitive values,
-report errors to stderr, and read a line into a fixed buffer. Hosted console
-access supports Linux GNU x86-64 and Windows x64.
+It prints `Hello, world!`. `println` returns a Result because output can fail;
+postfix `!` takes success or panics on failure. The
+[first-program tutorial](https://jotrorox.github.io/dodo/first-program/) explains
+every line, shows how to change the program, and builds a persistent executable
+on Linux or Windows.
 
-Use `console.print(value)` and `console.println(value)` for strings, primitives,
-and custom printable values. `console.printf("Answer: {}, enabled: {}\n", 42, true)!`
-checks a literal format and heterogeneous arguments at compile time. The same
-methods work on `console.stdout()` and `console.stderr()`. See the
-[formatting reference](docs/src/content/docs/formatting.md) for options and error handling.
+The standard library is embedded in the compiler. Projects use ordinary folders
+and imports; no manifest, lockfile, or package manager is needed.
+
+## Learn the language
+
+The [documentation](https://jotrorox.github.io/dodo/) has a sequential learning
+path and a separate reference:
+
+1. [Variables, values, and expressions](https://jotrorox.github.io/dodo/language-basics/)
+2. [Types and functions](https://jotrorox.github.io/dodo/types-and-functions/)
+3. [Control flow](https://jotrorox.github.io/dodo/control-flow/)
+4. [Ownership and borrowing](https://jotrorox.github.io/dodo/ownership/)
+5. [Patterns, options, and Results](https://jotrorox.github.io/dodo/patterns-and-results/)
+6. [Generics](https://jotrorox.github.io/dodo/generics/)
+7. [A complete temperature-report walkthrough](https://jotrorox.github.io/dodo/practical-program/)
+8. [Packages and imports](https://jotrorox.github.io/dodo/packages/) and [testing](https://jotrorox.github.io/dodo/testing/)
+
+Use the [glossary](https://jotrorox.github.io/dodo/glossary/) for unfamiliar terms,
+the [syntax reference](https://jotrorox.github.io/dodo/implementation-syntax/) for
+exact rules, and [diagnostics](https://jotrorox.github.io/dodo/diagnostics-and-editors/)
+when a program is rejected. Runnable examples are also in [examples/](examples).
+
+Dodo implements part of the broader 0.1 design. Read
+[implementation decisions and limits](https://jotrorox.github.io/dodo/implementation/)
+alongside the [language specification](https://jotrorox.github.io/dodo/language-spec-0.1/).
+The specification is also available as
+[plain text](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.txt) and
+[PDF](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.pdf).
+
+These docs follow `main`, which can contain APIs added after a release. Use the
+[`v0.1.3` tag](https://github.com/Jotrorox/dodo/tree/v0.1.3) for released source
+and [CHANGELOG.md](CHANGELOG.md) for version changes.
+
+## Find a library
+
+The [standard-library guide](https://jotrorox.github.io/dodo/standard-library/)
+helps you choose a package. The
+[API reference](https://jotrorox.github.io/dodo/stdlib-api/) contains exact public
+signatures, types, fields, methods, and source contracts for every bundled source
+package. It is generated from the library at each documentation build.
+
+| Build with | Guides |
+| --- | --- |
+| Terminal input/output | [Console](https://jotrorox.github.io/dodo/console/), [formatting](https://jotrorox.github.io/dodo/formatting/) |
+| Data and storage | [Bytes](https://jotrorox.github.io/dodo/bytes/), [UTF-8 text](https://jotrorox.github.io/dodo/text/), [JSON](https://jotrorox.github.io/dodo/json/), [collections](https://jotrorox.github.io/dodo/collections/), [allocation](https://jotrorox.github.io/dodo/allocation/) |
+| Calculations | [Core](https://jotrorox.github.io/dodo/core/), [math](https://jotrorox.github.io/dodo/math/), [hashing](https://jotrorox.github.io/dodo/hash/), [time](https://jotrorox.github.io/dodo/time/) |
+| OS services | [Files](https://jotrorox.github.io/dodo/filesystem/), [environment](https://jotrorox.github.io/dodo/environment/), [processes](https://jotrorox.github.io/dodo/processes/), [threads](https://jotrorox.github.io/dodo/threads/), [synchronization](https://jotrorox.github.io/dodo/synchronization/) |
+| Network applications | [Sockets and DNS](https://jotrorox.github.io/dodo/networking/), [TLS](https://jotrorox.github.io/dodo/tls/), [HTTP](https://jotrorox.github.io/dodo/http/), [web servers](https://jotrorox.github.io/dodo/web/) |
+
+Portable packages work with explicit storage and no required OS, global
+allocator, or scheduler. Hosted adapters currently support Linux GNU x86-64 and
+Windows x64. Each guide documents its actual target and dependency requirements.
 
 ## Everyday commands
 
 ```sh
 dodo fmt
 dodo check
+dodo run
 dodo test
 dodo compile -O 2
-./build/hello
 dodo --help
 ```
 
-`run`, `check`, and `compile` default to `main.dodo` in the current folder.
-`build` remains an alias for `compile`. An explicit folder selects its
-`main.dodo`; you can also pass another source file directly. The default output
-uses the project folder name: `hello/main.dodo` compiles to `build/hello`.
+`check`, `run`, and `compile` select `main.dodo` by default. Pass a filename or
+project folder to choose another input. `build` is an alias for `compile`.
+`dodo test` discovers named tests and explicitly executable Markdown examples.
 
-`dodo test` scans the current folder recursively for `@test` functions,
-`test_` functions, and Markdown examples marked `dodo test`. Add a test beside
-your code and run it without a manifest or a test dependency:
-
-```dodo test
-package example
-
-@test
-fn adds_numbers() {
-    assert_eq(20 + 22, 42)
-}
-```
-
-Each test runs in its own process, so a trap fails only that test. Use
-`dodo test --list`, `--filter TEXT`, and `--show-output` to inspect the suite.
-The [testing guide](https://jotrorox.github.io/dodo/testing/) covers companion
-test files, assertions, failure locations, timeouts, and executable docs.
-
-Use [the command-line guide](https://jotrorox.github.io/dodo/command-line/) for
-formatting options, project folders, compiler outputs, optimization, and
-cross-target builds. Add `-g -O 0` to debug generated programs with source
-breakpoints and local variables. Hosted runtime checks report their kind and
-location; embedded builds can select a non-returning C ABI board handler with
-`--panic-hook` for fault reporting, halt, or reset behavior. For
-diagnostics, completion, navigation, rename, signature help, and formatting,
-install the [Dodo VS Code extension](editor-support/dodo-vscode), which also adds
-syntax highlighting, or configure your editor's LSP client to run `dodo lsp` and follow the
-[editor setup guide](https://jotrorox.github.io/dodo/editors/).
-
-## Build a web app
-
-```dodo
-package main
-import "std/web"
-import "std/web/app"
-
-fn main() -> i32 {
-    return app.new()
-        .get(b"/", web.text(b"Hello, Dodo!\n"))
-        .get(b"/health", web.json(b"{\"ok\":true}"))
-        .run(b"127.0.0.1:8080")
-}
-```
-
-Save as `main.dodo`, run `dodo run`, and open `http://127.0.0.1:8080`.
-The [web guide](docs/src/content/docs/web.md) covers custom handlers, request
-parameters, middleware, configuration, and testing routes without a socket.
-
-## Language and reference
-
-Dodo supports numeric types, arrays and slices, structs and enums, generics,
-pattern matching, local packages, checked references, deterministic destruction,
-and explicit unsafe operations for foreign calls and hardware access. The
-compiler implements a subset of the broader language design; its current limits
-and conservative borrow checking are documented alongside the specification.
-
-- [Documentation home](https://jotrorox.github.io/dodo/): guides and reference pages.
-- [Implementation decisions and limits](https://jotrorox.github.io/dodo/implementation/): supported behavior and remaining work.
-- [Language specification](https://jotrorox.github.io/dodo/language-spec-0.1/): the Dodo 0.1 design, also available as [plain text](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.txt) and [PDF](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.pdf).
-- [Examples](examples): programs covering borrowing, patterns, generics, and hardware access.
-- [Web applications](https://jotrorox.github.io/dodo/web/): fluent routes, ready-made responses, middleware, and in-process tests; see [the multi-route example](examples/web_routes.dodo).
-- [JSON](docs/src/content/docs/json.md): typed struct decoding and encoding with `@derive(Json)`, borrowed strings, and explicit output storage; see [the round-trip example](examples/json.dodo).
-- [Standard library](https://jotrorox.github.io/dodo/standard-library/): portable foundations, explicit allocation, I/O, text, collections, mathematics, hashing, time, networking, TLS, HTTP/1.1 and web routing, with independently selected operating-system and execution providers.
-- [Mutable slice splitting](docs/src/content/docs/slice-splitting.md): checked, disjoint mutable views with ordinary ownership and source lifetimes.
-- [Container element safety](docs/src/content/docs/container-elements.md): checked shared-reference collections, owned strings, scoped mutation, and remaining element restrictions.
+See the [command-line guide](https://jotrorox.github.io/dodo/command-line/) for
+output paths, debug information, optimization, cross-compilation, and linkers.
+The [VS Code extension](editor-support/dodo-vscode) supplies highlighting and
+connects to `dodo lsp`; other editors can use the same
+[language server](https://jotrorox.github.io/dodo/editors/).
 
 ## Build and contribute
 
-Frontend development requires Rust 1.98.1 and its platform linker, with no LLVM
-installation. Run the parser, checker, package loader, formatter, and editor
-analysis tests with:
+Frontend development needs Rust 1.98.1 and its platform linker. LLVM is optional
+for parser, checker, formatter, package-loader, and editor-analysis tests:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
 cargo clippy --locked --no-default-features --all-targets -- -D warnings
 ```
 
-The default `llvm` feature enables native code generation, the LSP server, and
-the `dodo` CLI. Disabling it skips CLI and native backend tests while retaining
-frontend tests, including those in mixed frontend/native test files.
-
-Full compiler source builds require Rust 1.98.1, LLVM 23 development files, and
-a C toolchain. Cargo prefers static LLVM and allows a shared-library fallback.
-After installing the prerequisites and setting `LLVM_SYS_231_PREFIX` for your
-LLVM installation:
+A full compiler build additionally needs LLVM 23 development files and a C
+toolchain. The [source-build guide](docs/src/content/docs/building-from-source.md)
+explains prerequisites, Windows setup, release builds, debugging checks, and CI.
+After configuring `LLVM_SYS_231_PREFIX`:
 
 ```sh
-git clone https://github.com/Jotrorox/dodo.git
-cd dodo
-cargo build --locked --release
-cargo install --locked --path .
-```
-
-The [source build guide](https://jotrorox.github.io/dodo/building-from-source/)
-contains Fedora and Ubuntu prerequisites, size-focused and fully static Linux
-builds, runtime requirements, and development checks. Its
-[Markdown source](docs/src/content/docs/building-from-source.md) is available in
-this checkout. Run the core development checks from the repository root:
-
-```sh
-cargo fmt --all --check
-cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked
 cargo test --locked --all-targets
 cargo run --locked -- test
 cargo run --locked -- test -O 3
 ```
 
-The VS Code extension has separate checks documented in its
-[README](editor-support/dodo-vscode/README.md).
-
-To change the website, edit Markdown in
-[docs/src/content/docs](docs/src/content/docs) and follow
-[Edit these docs](https://jotrorox.github.io/dodo/contributing/) for local preview,
-navigation, and specification downloads. With Node.js 24 or newer and Python
-3.10 or newer installed, build and validate the website from the repository root:
+To edit and verify documentation with Node.js 24+ and Python 3.10+:
 
 ```sh
 npm ci --prefix docs
 npm run build --prefix docs
+python3 scripts/generate_api_docs.py --check
 python3 scripts/render_spec.py --check
 python3 scripts/check_docs.py
 ```
 
-Use `npm run dev --prefix docs` for local preview. GitHub Actions checks changes
-and publishes documentation changes from `main`.
+`npm run dev --prefix docs` previews the site. Follow
+[Edit these docs](docs/src/content/docs/contributing.md) for writing standards,
+executable examples, generated API pages, and navigation. The existing GitHub
+Actions workflow publishes documentation changes on `main`.
 
 ## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| [src/](src) | Compiler library, CLI, formatter, and language server. Semantic checker helpers live in `src/sema/`. |
-| [stdlib/](stdlib) | Embedded Dodo standard library and its dependency notices. |
-| [tests/](tests) | Compiler regression tests, native programs, and standard-library fixtures. |
-| [examples/](examples) | Small Dodo programs to read, check, and run. |
-| [docs/](docs) | Astro website, Markdown guides, and the canonical language specification. |
-| [editor-support/](editor-support) | VS Code integration. |
-| [scripts/](scripts) | Release packaging, platform checks, documentation validation, and benchmarks. |
+| [src/](src) | Compiler, CLI, formatter, semantic checker, and language server. |
+| [stdlib/](stdlib) | Bundled Dodo library sources and dependency notices. |
+| [examples/](examples) | Small programs to read, check, and run. |
+| [tests/](tests) | Acceptance, rejection, execution, and platform fixtures. |
+| [docs/](docs) | Guides, canonical specification, generated API reference, and Astro site. |
+| [editor-support/](editor-support) | VS Code extension and editor instructions. |
+| [scripts/](scripts) | Documentation generation, release tooling, and validation. |
 | [.github/workflows/](.github/workflows) | Compiler, editor, release, and documentation automation. |
 
-The [semantic checker experiment](docs/sema-flow-prototype.md) explains the
-test-only control-flow prototype in `tests/support/flow/`. It is development
-evidence and does not replace the production checker.
-
-## Generated files and repository cleanup
-
-The following local outputs are ignored by Git and can be regenerated when they
-are no longer needed:
-
-| Output | Recreate with |
-| --- | --- |
-| `target/` | Cargo build or test commands. If you installed LLVM under `target/llvm-linux`, removing `target/` also removes that toolchain. |
-| `build/` | The compiler or release scripts that produced each output. |
-| `docs/node_modules/`, `docs/.astro/`, `docs/dist/` | `npm ci --prefix docs` followed by `npm run build --prefix docs`. |
-| `docs/public/downloads/language-spec-0.1.txt` and `.pdf` | `python3 scripts/render_spec.py` or the website build. |
-| `editor-support/dodo-vscode/node_modules/`, `dist/`, `.vscode-test/`, and `*.vsix` | The extension's install, build, integration-test, and packaging commands. |
-| Python `__pycache__/` directories | Running the corresponding Python scripts. |
-
-Keep tracked source files, lockfiles, and licenses. Commit or back up unfinished
-work before cleaning a checkout. `git clean -ndX` previews ignored outputs; remove
-only the paths you have reviewed. `cargo clean` removes Cargo build outputs.
-
-To synchronize a clean `main` checkout and inspect branches and worktrees:
-
-```sh
-git switch main
-git fetch --prune origin
-git merge --ff-only origin/main
-git worktree list
-git branch --merged origin/main
-```
-
-After a feature is merged and its worktree has no unfinished work, remove that
-worktree with `git worktree remove PATH`, then its local branch with
-`git branch -d BRANCH`. Delete the merged remote branch with
-`git push origin --delete BRANCH` if it still exists. Use `git worktree prune`
-to clear registrations for worktree directories that were already removed.
-
----
+Generated `target/`, `build/`, documentation build outputs, and extension packages
+are ignored by Git. They can contain local toolchains or unfinished work; inspect
+paths before deleting them. The [contributor guide](docs/src/content/docs/contributing.md)
+explains which documentation files are generated.
 
 Copyright © 2026 Johannes Müller and Dodo contributors. Licensed under [BSD-2-Clause](LICENSE).

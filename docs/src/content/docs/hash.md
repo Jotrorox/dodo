@@ -1,6 +1,6 @@
 ---
 title: "Hashing and checksums"
-description: "Portable incremental hashing, keyed map policies, and independent checksums."
+description: "Choose hashes and checksums, process chunks incrementally, frame composite keys, and provide keyed collection policies."
 section: "Standard library"
 order: 149
 ---
@@ -8,6 +8,12 @@ order: 149
 Use `std/hash.fnv1a64` for a stable fingerprint of trusted bytes and
 `std/checksum.crc32` for accidental-corruption checks. These separate portable
 imports use only fixed-size state and do not request an allocator or entropy.
+
+A hash condenses input into a fixed-width integer. Different inputs can produce
+the same integer: this is a collision. A hash map therefore uses both a hash
+and an equality test. A checksum helps detect accidental changes in bytes; it
+does not prove who created them. Match the algorithm to that purpose before
+copying a hash into a file format or using it as an identifier.
 
 ## Quickstart
 
@@ -46,6 +52,8 @@ bytes; there are no large tables or native-layout reads.
 
 ## Algorithms and stable results
 
+### Choose an algorithm
+
 | API | Definition | Intended use |
 | --- | --- | --- |
 | `hash.Fnv1a64`, `hash.fnv1a64` | FNV-1a-64; offset basis 14695981039346656037, prime 1099511628211, unsigned arithmetic modulo 2^64 | Trusted byte keys, stable noncryptographic fingerprints |
@@ -60,6 +68,8 @@ protocol byte order. No algorithm reads padding or a native struct layout.
 All algorithm arithmetic is explicitly modular where specified, independently
 of Dodo's ordinary checked integer arithmetic.
 
+### Hash chunks without joining them
+
 All state types expose `update(&mut self, &[u8])`, `finish(&self)`, and
 `reset(&mut self)`. `finish` returns a snapshot without consuming, modifying,
 or resetting state; repeated calls agree, and further updates continue the
@@ -70,20 +80,28 @@ The one-shot helpers produce the same result as `new`, `update`, `finish`.
 SipHash accepts any stream length and encodes the length modulo 256 in its
 final block as specified by the algorithm.
 
+The following complete example hashes two input chunks as one stream. It also
+checks that taking a snapshot does not consume the state.
+
 ```dodo test
-package example
+package hash_chunks
 import "std/hash"
 
 fn main() -> i32 {
-    part1 := [104u8, 101]
-    part2 := [108u8, 108, 111]
     state := hash.Fnv1a64.new()
-    state.update(&part1)
-    state.update(&part2)
-    if state.finish() != 0xa430d84680aabd0bu64 { return 1 }
+    state.update(b"he")
+    assert_eq(state.finish(), hash.fnv1a64(b"he"))
+    state.update(b"llo")
+    assert_eq(state.finish(), hash.fnv1a64(b"hello"))
+    state.reset()
+    assert_eq(state.finish(), hash.fnv1a64(b""))
     return 0
 }
 ```
+
+Save as `hash_chunks.dodo` and run `dodo run hash_chunks.dodo`; success exits
+with zero and prints nothing. Chunk boundaries have no effect on the result.
+The checksum state types work the same way, but return `u32` rather than `u64`.
 
 ## Keyed hashing and caller-supplied keys
 
@@ -117,6 +135,8 @@ no protection against an adversary who can choose or alter the bytes.
 
 ## Statically dispatched contracts and value encodings
 
+### Encode composite keys unambiguously
+
 Generic hashing helpers expect `H.update(&mut self, data: &[u8])`. A complete
 incremental state additionally supplies `finish(&self) -> u64` and
 `reset(&mut self)`. Calls are monomorphized; there are no traits, closures,
@@ -131,6 +151,32 @@ from `a`,`bc`. User-defined records should hash logical fields explicitly,
 including a discriminant where variants require one; never hash their memory
 representation. Floating-point keys need an explicit equality policy and
 matching treatment of signed zero and NaNs; no default floating policy exists.
+
+The important distinction is between a byte stream and a sequence of fields.
+Updating with `b"ab"` and then `b"c"` hashes the same stream as `b"a"` and then
+`b"bc"`. Use `write_bytes` for each field when that boundary is part of the key:
+
+```dodo test
+package framed_hash
+import "std/hash"
+
+fn main() -> i32 {
+    first := hash.Fnv1a64.new()
+    hash.write_bytes(&mut first, b"ab")
+    hash.write_bytes(&mut first, b"c")
+    second := hash.Fnv1a64.new()
+    hash.write_bytes(&mut second, b"a")
+    hash.write_bytes(&mut second, b"bc")
+    assert_ne(first.finish(), second.finish())
+    return 0
+}
+```
+
+Save as `framed_hash.dodo` and run `dodo run framed_hash.dodo`. These particular
+inputs have different hashes. Framing prevents ambiguous field encodings; it
+does not eliminate collisions in the finite hash output.
+
+### Use policies in collections
 
 Map policies provide `hash(&self, key: &K) -> u64` and
 `equal(&self, a: &K, b: &K) -> bool`. Equal keys must hash equally; equality
@@ -147,6 +193,12 @@ For UTF-8 keys, `hash.Str {}` handles `&str` and `hash.Text {}` handles
 `text_shared.String` keys. See the
 [string-keyed map example](https://github.com/Jotrorox/dodo/blob/main/examples/string_map.dodo)
 and [collection lifetime restrictions](container-elements.md).
+
+Hashing a string means hashing its UTF-8 bytes, not its address. These policies
+do not normalize Unicode or ignore case. Prepare a normalized representation
+yourself if the application's equality rules require one, and use that same
+representation for both equality and hashing. See the [API reference](stdlib-api.md)
+for state constructors, policy methods, and key-source declarations.
 
 ## Attribution and validation
 

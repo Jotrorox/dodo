@@ -1,14 +1,29 @@
 ---
 title: "Core utilities"
-description: "Core utilities: a runnable starting point, storage choices, and detailed contracts."
+description: "Choose checked arithmetic, byte and slice operations, ASCII helpers, and explicit memory primitives."
 section: "Standard library"
 order: 141
 ---
 
-Use `core/num.checked_add` for size calculations that can fail. The `core/*`
-family also covers bytes, slices, ASCII, options, memory and device primitives.
-These APIs are portable and need no allocator. Start with checked values and
-slices; raw pointers and MMIO are for explicit unsafe integration.
+The `core` packages provide operations on values and storage you already have.
+They do not allocate memory or require an operating system. Start with checked
+arithmetic and slices: these let you validate a size or index before using it.
+Raw memory and device access are useful later, when integrating with foreign
+code or hardware.
+
+| You need to… | Import | Start with |
+| --- | --- | --- |
+| Calculate sizes without trapping on overflow | `core/num` | `checked_add`, `checked_mul`, `align_up` |
+| Compare, copy, or decode bytes | `core/bytes` | `equal`, `copy_from`, `read_u32_le` |
+| Access an optional element or range | `core/slice` | `get`, `subslice`, `split_at_mut` |
+| Recognize ASCII protocol characters | `core/ascii` | `is_digit`, `is_whitespace`, `hex_value` |
+| Move a value out of an optional slot | `core/option` | `take`, `replace`, `unwrap_or` |
+| Describe or manipulate typed storage | `core/mem` | `size_of`, `align_of`, `replace`, `swap` |
+| Integrate raw memory or device registers | `core/ptr`, `core/mmio` | See [memory and FFI](memory-and-ffi.md) |
+
+Read [Results and options](patterns-and-results.md) if `ok`/`err` and
+`some`/`none` are unfamiliar. Exact declarations are in the
+[standard-library API reference](stdlib-api.md).
 
 ## Quickstart
 
@@ -60,6 +75,14 @@ is a hardware template, not a desktop program.
 
 ## Portable core utilities
 
+### Choose an arithmetic policy
+
+Ordinary arithmetic checks overflow and traps when it occurs. Use `checked_*`
+when overflow is an expected input error, `saturating_*` when a counter should
+stop at its boundary, and `wrapping_*` only when modular arithmetic is part of
+the intended algorithm. For example, a requested allocation size should use
+checked arithmetic; a binary checksum may deliberately wrap.
+
 `num.MAX` and `num.MIN` follow the selected target's pointer width. The functions
 `checked_add`, `checked_sub`, `checked_mul`, `checked_div`, `checked_rem`,
 `checked_shl`, and `checked_shr` return `Result<usize, ArithmeticError>`.
@@ -78,7 +101,9 @@ type argument, such as `core.wrapping_mul::<u32>(a, b)`, selects that type.
 Results wrap modulo 2 to the power of the type's width, including for signed
 integers. Ordinary arithmetic operators continue to check overflow.
 
-`bytes` operates on borrowed byte slices. `equal`, `compare`, `starts_with`,
+### Work with byte slices
+
+`core/bytes` operates on borrowed byte slices. `equal`, `compare`, `starts_with`,
 `ends_with`, and `find` do not allocate. `compare` returns -1, 0, or 1 in
 lexicographic order. `fill` and `reverse` mutate a slice in place. `copy_from`
 requires equal lengths and returns a `BufferError.LengthMismatch` otherwise.
@@ -88,6 +113,12 @@ and 64-bit unsigned integers, with both `le` and `be` forms. They take a byte
 offset, permit unaligned byte positions, and return `BufferError.OutOfBounds`
 for invalid ranges, including overflowing offsets. Writes validate the entire
 range before changing any byte. They work independently of CPU endianness.
+
+The core `find(data, byte)` searches for one byte. For a subsequence such as
+`b"\r\n"`, use `std/bytes.find(data, needle)` instead. `copy_from` copies
+the whole source; select equally sized slices first when copying just a prefix.
+
+### Check indices before accessing elements
 
 `slice.get`, `get_mut`, `first`, and `last` return optional checked references;
 `subslice` and `subslice_mut` return optional views using an exclusive end
@@ -99,6 +130,26 @@ with any element type.
 the pair with a struct pattern to obtain simultaneously usable, disjoint mutable
 halves. See [mutable slice splitting](slice-splitting.md) for bounds, reborrowing,
 source dependencies, and the pair's construction and mutation restrictions.
+
+This complete example changes an element only when it exists. A returned
+reference is dereferenced with `*`; `none` is an ordinary missing-index case.
+
+```dodo test
+package checked_element
+import "core/slice"
+
+fn main() -> i32 {
+    values := [10i32, 20, 30]
+    match slice.get_mut(&mut values, 1) {
+        some(value) => { *value = 42 },
+        none => { return 1 },
+    }
+    assert_eq(values[1], 42)
+    return 0
+}
+```
+
+### Recognize ASCII and move optional values
 
 `ascii` classifies bytes with `is_ascii`, `is_digit`, `is_hex_digit`,
 `is_lowercase`, `is_uppercase`, `is_alphabetic`, `is_alphanumeric`,

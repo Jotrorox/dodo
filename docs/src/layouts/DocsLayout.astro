@@ -15,6 +15,7 @@ const sections = docSections.map((title) => ({
   title,
   pages: pages.filter((page) => page.data.section === title),
 })).filter((section) => section.pages.length > 0);
+const apiGroups = [...new Set(pages.map((page) => page.data.navigationGroup).filter(Boolean))];
 const current = pages.findIndex((page) => page.id === entry.id);
 const previous = pages[current - 1];
 const next = pages[current + 1];
@@ -76,10 +77,18 @@ const canonical = new URL(pageUrl(entry.id), Astro.site);
               <section class="nav-section" aria-labelledby={`nav-section-${index}`}>
                 <h2 class="nav-label" id={`nav-section-${index}`}>{section.title}</h2>
                 <ul>
-                  {section.pages.map((page) => (
+                  {section.pages.filter((page) => !page.data.navigationGroup).map((page) => (
                     <li><a href={pageUrl(page.id)} aria-current={entry.id === page.id ? 'page' : undefined}>{page.data.title}</a></li>
                   ))}
                 </ul>
+                {section.title === 'API reference' && apiGroups.map((group) => (
+                  <details class="api-group" open={entry.data.navigationGroup === group}>
+                    <summary>{group}</summary>
+                    <ul>{section.pages.filter((page) => page.data.navigationGroup === group).map((page) => (
+                      <li><a href={pageUrl(page.id)} aria-current={entry.id === page.id ? 'page' : undefined}>{page.data.title}</a></li>
+                    ))}</ul>
+                  </details>
+                ))}
               </section>
             ))}
           </nav>
@@ -104,7 +113,7 @@ const canonical = new URL(pageUrl(entry.id), Astro.site);
         )}
         <article class="prose"><slot /></article>
         <footer class="page-footer">
-          <a class="edit-link" href={`${repository}/edit/main/docs/src/content/docs/${entry.id}.md`}>Edit this page on GitHub <span aria-hidden="true">↗</span></a>
+          <a class="edit-link" href={`${repository}/edit/main/${entry.data.source ?? `docs/src/content/docs/${entry.id}.md`}`}>{entry.data.source ? 'Edit API source on GitHub' : 'Edit this page on GitHub'} <span aria-hidden="true">↗</span></a>
           <nav class="page-navigation" aria-label="Previous and next pages">
             {previous ? <a href={pageUrl(previous.id)} rel="prev"><span>← Previous</span><strong>{previous.data.title}</strong></a> : <span />}
             {next ? <a href={pageUrl(next.id)} rel="next"><span>Next →</span><strong>{next.data.title}</strong></a> : <span />}

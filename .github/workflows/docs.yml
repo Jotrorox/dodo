@@ -7,12 +7,18 @@ on:
       - 'docs/**'
       - 'scripts/render_spec.py'
       - 'scripts/check_docs.py'
+      - 'scripts/generate_api_docs.py'
+      - 'scripts/test_generate_api_docs.py'
+      - 'stdlib/**'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - 'docs/**'
       - 'scripts/render_spec.py'
       - 'scripts/check_docs.py'
+      - 'scripts/generate_api_docs.py'
+      - 'scripts/test_generate_api_docs.py'
+      - 'stdlib/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -44,7 +50,10 @@ jobs:
         working-directory: docs
         run: npm run build
       - name: Check generated documents
-        run: python3 scripts/render_spec.py --check
+        run: |
+          python3 scripts/render_spec.py --check
+          python3 scripts/generate_api_docs.py --check
+          python3 scripts/test_generate_api_docs.py
       - name: Check links and search index
         run: python3 scripts/check_docs.py
       - name: Upload GitHub Pages artifact

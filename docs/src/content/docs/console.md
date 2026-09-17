@@ -5,10 +5,15 @@ section: "Standard library"
 order: 143.5
 ---
 
-Import `std/console` to use process stdin, stdout, and stderr on Linux GNU
-x86-64 and Windows x64 MSVC/GNU targets. This adapter needs a hosted C toolchain;
-it requires no global allocator or application unsafe code. `std/io` and
-`std/fmt` remain independently usable without an OS.
+`std/console` reads and writes the process's three standard streams: stdin for
+input, stdout for normal output, and stderr for diagnostics. Start with
+`println` for a line of text, `printf` for a formatted message, and `read_line`
+for bounded input. Each operation can fail, so every Result must be handled.
+
+Console programs run on Linux GNU x86-64 and Windows x64 MSVC/GNU with a hosted
+C toolchain. They need no global allocator or application unsafe code. For
+memory buffers and custom devices, use the same reader/writer contracts through
+[I/O](io.md) and [formatting](formatting.md).
 
 ## Print a greeting
 
@@ -25,6 +30,25 @@ Save this as `main.dodo` and run `dodo run`. It prints `Hello, world!` followed
 by LF and returns exit status zero. Printing returns a Result; postfix `!`
 unwraps success and panics on failure. Fallible helper functions can propagate
 errors with `?`, or use `match` to recover locally.
+
+The string is `&str`, a borrowed UTF-8 view. Printing does not consume or change
+its contents. The returned `usize` is the number of bytes written, not the
+number of displayed characters. `println("é")` writes three bytes: two for
+the character and one LF. Use a byte writer when the input is arbitrary bytes.
+
+## Choose an output operation
+
+| You have | Use | Example |
+| --- | --- | --- |
+| A single value | `print` or `println` | `console.println(42)!` |
+| Several values in a sentence | `printf` | `console.printf("{} of {}\n", 2, 5)!` |
+| A diagnostic | A stderr wrapper | `console.stderr().println("missing input")!` |
+| Raw bytes | `io.write_all` on an output wrapper | See the [file reader](filesystem.md#quickstart). |
+| A custom destination | `fmt.print` / `fmt.printf` | See [custom writers](io.md). |
+
+`!` is useful for small demonstrations where failure should stop the program.
+In a command-line application, match a write failure or propagate it from a
+fallible helper. Writing an error message to stderr can fail too.
 
 ## Public API
 
@@ -111,6 +135,38 @@ I/O Result. Run `dodo run examples/console_error.dodo` for a complete stderr exa
 
 ## Read a bounded line
 
+The following complete program reads one line and writes exactly those bytes
+back. Save it as `echo_line.dodo` and run `dodo run echo_line.dodo`, then type a
+line and press Enter. It deliberately uses byte I/O, so it also works for
+redirected input that is not UTF-8.
+
+```dodo
+package echo_line
+import "std/console"
+import "std/io"
+
+fn main() -> i32 {
+    input := console.stdin()
+    storage := [0u8; 128]
+    line := match input.read_line(&mut storage) {
+        ok(value) => { value },
+        err(_) => { return 1 },
+    }
+    output := console.stdout()
+    match io.write_all(&mut output, &storage[..line.count]) {
+        ok(_) => {},
+        err(_) => { return 2 },
+    }
+    if line.end == io.LineEnd.Full { return 3 }
+    return 0
+}
+```
+
+Exit 3 means the buffer contains only the first piece of a longer line; the
+program has not read the remainder. To build a line-processing loop, handle
+`Full` by processing that piece and reading again, `Newline` by ending the
+current line, and `Eof` by processing any final bytes before stopping.
+
 Allocate a fixed array, obtain `input := console.stdin()`, then call
 `input.read_line(&mut storage)`. `io.Line` contains `count: usize` and
 `end: io.LineEnd`; the bytes are `storage[..line.count]`.
@@ -159,3 +215,7 @@ use the terminal's configured code pages; configure UTF-8 input/output code page
 for non-ASCII terminal text. The library does not alter process-wide terminal
 modes or code pages. Windows redirected input is covered separately from terminal
 rendering; terminal rendering is not established by cross-compilation checks.
+
+## Complete API reference
+
+For every public type, field, constant, and function signature, see [std/console](api/std/console.md), [std/io](api/std/io.md), [std/fmt](api/std/fmt.md), [std/fmt/errors](api/std/fmt/errors.md).

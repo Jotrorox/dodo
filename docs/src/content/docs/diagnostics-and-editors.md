@@ -1,6 +1,6 @@
 ---
-title: "Ownership diagnostics"
-description: "Read borrow conflicts, move errors, and borrowed-return labels from dodo check."
+title: "Diagnostics and common mistakes"
+description: "Read compiler errors, fix beginner mistakes, and follow borrow, move, and returned-reference diagnostics."
 section: "Using Dodo"
 order: 110
 ---
@@ -10,6 +10,37 @@ uses `^` for the rejected operation; related labels use `-` to explain where the
 borrow or move began and which use still needs it. Every snippet includes its
 source filename and line/column. Labels from imported files retain their own
 locations.
+
+## Read an error in order
+
+1. Read the first diagnostic message before changing several unrelated lines.
+2. Open the file and line shown by its primary label. Imported code can have a
+   different filename from your entry file.
+3. Read the related labels: they often identify the earlier declaration, move,
+   or borrow that explains the conflict.
+4. Make one change and run `dodo check` again. Later errors may disappear once
+   the first error is fixed.
+
+An editor can show the same diagnostics as you type. A successful `check`
+verifies the language rules; it does not link the program or prove that runtime
+inputs will never overflow, exceed bounds, or trigger a library error.
+
+## Common beginner mistakes
+
+| Problem | Why it happens | How to proceed |
+| --- | --- | --- |
+| Assigning to a `let` binding | `let` is immutable. | Use `:=` or a typed mutable binding if reassignment is intended. |
+| Ignoring a fallible call | A `T!E` Result must be handled. | Use `match`, propagate with `?`, or deliberately unwrap with `!`. |
+| Using `?` in ordinary `main` | Propagation needs a compatible Result-returning function. | Put fallible work in a helper and match its Result in `main`. |
+| Adding a loop element to a number | Ordinary collection iteration yields references. | Dereference the element or use `for &value in values` for copyable values. |
+| Returning a reference to a local array | Its storage disappears at function exit. | Return an owned value or borrow storage supplied by the caller. |
+| An ambiguous generic or empty value | Inference has no concrete type to choose. | Add a binding type or an explicit generic argument at the call. |
+| A missing method or package | The import, alias, or compiler version differs. | Check the [API signature](stdlib-api.md), import path, and installed compiler. |
+| `check` works but `run` fails to link | Linking is a separate stage. | Configure the [C toolchain](installation.md); inspect missing dependencies. |
+
+See [bindings](language-basics.md), [Results](patterns-and-results.md),
+[generics](generics.md), and [ownership](ownership.md) for complete working
+examples of these rules.
 
 ## Borrow conflicts
 

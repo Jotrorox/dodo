@@ -5,11 +5,29 @@ section: "Standard library"
 order: 158
 ---
 
+TLS encrypts a connection and authenticates its peer. An HTTPS client must trust
+the server's certificate chain **and** verify that the certificate names the
+requested host or IP. Selecting roots establishes who may issue certificates;
+selecting the URL hostname establishes which server you intend to reach.
+
 For an HTTPS request, start with `std/http/https.Client.new` and explicit trust.
-It composes the hosted HTTP client with verified OpenSSL TLS. This example uses
-only a local Python peer and a certificate generated in your example directory.
-For non-HTTP TLS, the starting engine is `openssl.Engine.client` with
-`Config.client(hostname)`; the stream and engine contracts follow the quickstart.
+It combines the hosted HTTP client with verified OpenSSL TLS. The quickstart
+uses a local Python peer and a temporary certificate, so no Internet service or
+existing credentials are required.
+
+## Choose a TLS integration
+
+| Need | Starting point | Your responsibility |
+| --- | --- | --- |
+| Fetch an HTTPS URL | `std/http/https.Client` | Supply trust, workspace, and response limits. |
+| Serve an HTTPS application | `std/web/https.files` with `std/web/app` | Supply the certificate chain and matching private key. |
+| Encrypt a custom byte protocol | `std/tls/stream.Stream` plus an engine | Drive readiness, deadlines, flush, and shutdown. |
+| Drive TLS records directly | `std/tls/openssl.Engine` | Feed/drain encrypted bytes and handle engine progress. |
+| Supply a different backend | Portable `std/tls` contracts | Implement verification and provider lifecycle obligations. |
+
+The lower-level engine never opens sockets. The transport wrapper never chooses
+your trust policy. HTTPS is the layer that connects the URL, TCP transport,
+verified TLS engine, and HTTP exchange.
 
 ## Quickstart
 
@@ -176,6 +194,20 @@ targets when composed with compatible custom providers.
 
 ## Verification and providers
 
+There are three different certificate inputs:
+
+| Input | What it contains | Used by |
+| --- | --- | --- |
+| Trust roots | Certificates for issuers you choose to trust | A client verifying a server, or an mTLS server verifying clients. |
+| Certificate chain | The local leaf certificate, then intermediates | A server identity or optional client identity. |
+| Private key | The private key matching that local leaf | The endpoint presenting the identity. |
+
+The client needs the test certificate as a root in this self-signed quickstart;
+it does not need the server's private key. A real CA-issued server normally
+sends its leaf and intermediate certificates while the client independently
+selects trusted roots. Loading an identity and trusting a peer are separate
+configuration decisions.
+
 `openssl.Config.client(hostname)` enables certificate-chain verification and
 requires a nonempty hostname. DNS names use certificate hostname checks with
 partial-label wildcards disabled; IP literals use iPAddress SAN matching. DNS
@@ -216,6 +248,18 @@ remain mandatory for clients.
 
 ## Incremental engine and ownership
 
+An incremental engine makes a bounded amount of progress on each call. A
+`NeedInput` result means more encrypted peer bytes are required; `NeedOutput`
+means encrypted output must be drained and delivered. Neither means the
+handshake failed. On either state, preserve offsets for already consumed or
+accepted bytes and arrange transport progress before retrying.
+
+The lifecycle is: construct an engine, finish the handshake, exchange plaintext,
+flush accepted output, exchange TLS `close_notify`, and release resources.
+Dropping an engine performs resource cleanup but does not send a TLS shutdown
+message. Applications that require a clean protocol shutdown must drive it
+explicitly before dropping the transport.
+
 Create an `openssl.Engine` with `client(&config)` or `server(&config)`. Construction
 copies/parses configuration; no configuration borrow survives. The engine owns
 the context, SSL state, credentials, encrypted rings and plaintext retry storage.
@@ -247,6 +291,12 @@ acceptance is not acknowledgement by the peer. Errors expose numeric backend
 codes, never plaintext, keys, certificates, or secret diagnostic formatting.
 
 ## Transport composition and limits
+
+TLS may need both read and write progress even when the application is doing
+only one of them. For example, a plaintext write can require a peer handshake
+message, and a read can generate encrypted output. Drive the stream's pending
+ciphertext as well as the requested application operation; assuming that a
+read can only need socket readability can stall a connection.
 
 `stream.Stream.new(engine, &mut transport, incoming, outgoing)` returns a Result,
 owns the engine, and exclusively borrows an `std/io` polling transport plus two
@@ -296,6 +346,20 @@ Dodo global allocator choice hidden inside portable protocol packages.
 
 ## Verification
 
+Common runtime failures have different remedies:
+
+| Kind | Meaning and next step |
+| --- | --- |
+| `VerificationFailed` | Check trust roots, the URL/hostname or IP SAN, validity dates, and verification time. |
+| `Truncated` | Transport EOF arrived without a valid TLS close notification; do not treat it as a clean end of plaintext. |
+| `TimedOut` / `Cancelled` | The stream has aborted; close its transport and start a new exchange only under an explicit retry policy. |
+| `LimitExceeded` | Check the documented field/buffer bounds; larger application buffers cannot remove backend hard caps. |
+| `Backend` / `Protocol` | Inspect the numeric cause and discard the invalid session. |
+
+At the HTTPS layer these causes appear in `hosting.Error.security` when
+`kind == hosting.ErrorKind.Tls`. Preserve any reported delivered body prefix;
+an error does not retract bytes already handed to a sink.
+
 `cargo test --test tls_library` generates a local CA and short-lived leaf/key,
 then compiles and runs Dodo fixtures at `-O0` and `-O3`. It checks one-byte
 handshake fragmentation, ALPN selection/mismatch, mutual authentication and
@@ -325,3 +389,7 @@ library-owned connection, readiness, deadline, and body-transfer loops.
 See [Hosted HTTP and HTTPS](hosted-http.md) for complete small programs, explicit
 storage bounds, resolver/deadline scope, cancellation, and a generated local
 HTTPS setup. The TLS engine and transport APIs remain usable independently.
+
+## Complete API reference
+
+For every public type, field, constant, and function signature, see [std/tls](api/std/tls.md), [std/tls/stream](api/std/tls/stream.md), [std/tls/openssl](api/std/tls/openssl.md).

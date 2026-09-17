@@ -1,17 +1,38 @@
 ---
-title: "Standard library"
-description: "Find a module, copy a runnable example, and choose portable or hosted APIs."
+title: "Choose a library"
+description: "Find the right package, understand explicit storage and errors, and navigate the full standard library."
 section: "Standard library"
 order: 140
 ---
 
-Dodo embeds its standard-library sources in the compiler. Imports work from any
-directory with no registry or separate library installation. Start with one of
-the tasks below; each guide includes a complete program, its run command,
-expected output, and common failure handling before the detailed contracts.
-These guides follow the current source checkout. The library belongs to your
-compiler binary: if an older binary reports an unknown package or method,
-[build the matching source revision](building-from-source.md).
+Dodo's standard library supplies reusable packages for data, storage, operating
+system services, and network applications. It is embedded in the compiler:
+`import "std/text"` works without downloading or installing another dependency.
+
+Start with a task below and follow its guide. For the exact signature of any
+public type, field, function, or method, use the [API reference](stdlib-api.md)
+and [complete package directory](api/index.md). The generated reference covers
+every bundled source package; [compiler intrinsics](stdlib-api.md#compiler-intrinsics)
+and [virtual imports](stdlib-api.md#virtual-imports-and-target-providers) are
+documented separately because they are implemented by the compiler.
+
+These guides follow the source checkout. If an older compiler reports an unknown
+package or method, compare `dodo --version` with the docs revision and
+[build the matching source](building-from-source.md) if needed.
+
+## Learn the library in stages
+
+After the [language basics](language-basics.md), begin with
+[console](console.md), [formatting](formatting.md), and [text](text.md).
+Then learn [fixed-capacity collections](collections.md) and [byte I/O](io.md).
+These packages make the central ideas concrete: storage has an owner, views
+borrow it, and operations report errors through Results.
+
+Use [allocation](allocation.md) when a fixed capacity no longer fits your task.
+Add [filesystem](filesystem.md), [processes](processes.md), or
+[networking](networking.md) when a program needs external services. Raw memory,
+custom allocators, provider internals, and concurrency are advanced topics;
+they are not prerequisites for using the safe entry APIs.
 
 ## Choose a task
 
@@ -26,7 +47,7 @@ compiler binary: if an older binary reports an unknown package or method,
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
-| Serve a route | `web/app.Server` with named handler structs | [Web applications](web.md) |
+| Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
 
 Use a fresh directory for each copied example and run the commands there.
 A marked `dodo test` example also runs through
@@ -35,10 +56,19 @@ shown in their guides; none requires a public Internet service.
 
 ## Imports, storage, and failures
 
+### Import names are explicit
+
 Import only the packages you use. The last path component becomes its name:
 `import "std/text"` exposes `text.Builder`. Alias duplicate names explicitly,
 for example `import "std/http/hosted" as client`. Imports are not re-exports;
 application code must import the types and helpers it names. See [packages](packages.md).
+
+The top-level families describe dependencies, not an automatic module hierarchy:
+`core` provides low-level portable operations, `alloc` supplies explicit
+allocation capabilities, and `std` contains higher-level services. Importing
+`std/collections` does not also import `std/collections/fixed_vector`.
+
+### Choose where data lives
 
 Start with fixed arrays and the recommended workspace/constructor in each guide.
 They keep capacity visible and need no global heap. Choose shared-arena owned
@@ -46,12 +76,30 @@ containers when growth or several independent owners are needed; use raw/generic
 allocator constructors only when implementing a custom allocator. The library
 never silently selects an allocator on exhaustion.
 
+| Storage choice | Use it when | What you manage |
+| --- | --- | --- |
+| Borrowed view | Input or existing data already has an owner. | Keep that owner alive and avoid conflicting mutation. |
+| Fixed array / caller-backed builder | You know a reasonable bound. | Capacity and the Result returned when it fills. |
+| Hosted workspace | A hosted API offers a bounded convenience owner. | Workspace lifetime, documented limits, and whether outputs borrow it. |
+| Arena / pool / owned container | Data needs separately owned storage or controlled growth. | An explicit allocator capability and its backing storage. |
+
+Owning a value and allocating memory are different ideas. A struct can own an
+inline array without using an allocator, and a slice can borrow allocated memory
+without owning it. The [ownership guide](ownership.md) explains moves and borrows.
+
+### Decide how to handle failure
+
 Results must be handled. Examples use `match` at `main` and propagate with `?`
 inside helpers. A nonzero exit status denotes failure; the text beside each
 example explains the codes. For user-facing diagnostics use
 `console.stderr().println` with a formatted error; `std/fmt/errors` supplies
 optional adapters for enum errors. Check I/O prefix counts before retrying.
 [Patterns and Results](patterns-and-results.md) explains the syntax.
+
+Read each guide's failure behavior as well as its error type. A full container
+may reject and destroy the supplied value, a writer may have transferred a
+prefix before failing, and a returned view may borrow a reusable workspace.
+Those details determine whether retrying or reusing storage is valid.
 
 ## Portable and hosted functionality
 
@@ -81,6 +129,9 @@ remain relevant: check them when using references or Results as stored elements.
 
 Every application-facing family has a guide. Child packages are separate imports;
 importing a parent does not import all its children.
+
+The [API package directory](api/index.md) expands this family inventory into
+individual modules and links every public declaration back to its source.
 
 | Family and guide | Imports | Availability |
 | --- | --- | --- |
@@ -152,60 +203,19 @@ collection modules are allocator-author building blocks; use the linked safe
 concrete constructors first. `core/mem`, `core/ptr` and `core/mmio` are compiler
 intrinsics, not source packages.
 
-The sections below retain older overview anchors and point to the relocated
-contracts.
+## Storage and data guides
 
-## Portable core utilities
+The package inventory above links to complete guides. These topic links help
+when you know the operation you need but not the package name.
 
-See the [core guide](core.md) for a runnable quickstart and the full contracts.
-
-## Opaque storage and moving values
-
-See the [core guide](core.md) for a runnable quickstart and the full contracts.
-
-## Allocation layouts and failures
-
-See the [allocation guide](allocation.md) for a runnable quickstart and the full contracts.
-
-## Arenas, pools, and raw blocks
-
-See the [allocation guide](allocation.md) for a runnable quickstart and the full contracts.
-
-## Owning a value
-
-See the [allocation guide](allocation.md) for a runnable quickstart and the full contracts.
-
-## Binary bytes and growing buffers
-
-See the [bytes guide](bytes.md) for a runnable quickstart and the full contracts.
-
-## Portable byte I/O (`std/io`)
-
-See the [io guide](io.md) for a runnable quickstart and the full contracts.
-
-## Allocation-dependent I/O (`std/io_alloc`)
-
-See the [io guide](io.md) for a runnable quickstart and the full contracts.
-
-## Byte formatting
-
-See the [formatting guide](formatting.md) for a runnable quickstart and the full contracts.
-
-## Portable text and owned UTF-8
-
-See the [text guide](text.md) for a runnable quickstart and the full contracts.
-
-<span id="bytes-scalars-and-graphemes"></span>
-<span id="validation-decoding-and-encoding"></span>
-<span id="borrowed-text"></span>
-<span id="fixed-and-allocated-builders"></span>
-<span id="explicit-numeric-parsing"></span>
-
-The [text guide](text.md) retains these text and UTF-8 contracts.
-
-## Sharing an explicit allocator
-
-See the [allocation guide](allocation.md) for a runnable quickstart and the full contracts.
+| Topic | Guide |
+| --- | --- |
+| <span id="portable-core-utilities"></span><span id="opaque-storage-and-moving-values"></span>Checked sizes, byte operations, moving values, and opaque storage | [Core utilities](core.md) |
+| <span id="allocation-layouts-and-failures"></span><span id="arenas-pools-and-raw-blocks"></span><span id="owning-a-value"></span><span id="sharing-an-explicit-allocator"></span>Layouts, arenas, pools, boxes, and shared allocator capabilities | [Allocation](allocation.md) |
+| <span id="binary-bytes-and-growing-buffers"></span>Cursors and growing byte buffers | [Binary bytes](bytes.md) |
+| <span id="portable-byte-io-stdio"></span><span id="allocation-dependent-io-stdio_alloc"></span>Reader/writer contracts, bounded adapters, and allocated I/O | [Byte I/O](io.md) |
+| <span id="byte-formatting"></span>Formatting numbers, strings, and custom values | [Formatting](formatting.md) |
+| <span id="portable-text-and-owned-utf-8"></span><span id="bytes-scalars-and-graphemes"></span><span id="validation-decoding-and-encoding"></span><span id="borrowed-text"></span><span id="fixed-and-allocated-builders"></span><span id="explicit-numeric-parsing"></span>UTF-8 validation, borrowed text, builders, and numeric parsing | [Text](text.md) |
 
 ## Dependency boundaries
 

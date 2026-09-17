@@ -5,10 +5,15 @@ section: "Standard library"
 order: 155
 ---
 
-Use `std/thread.Storage.new` and `thread.spawn` to run one native task and
-`join` to retrieve its result. Start with caller-backed storage and join before
-returning; detached, explicitly allocated ownership is an advanced choice.
-This is hosted functionality on Linux GNU x86-64 and Windows x64.
+`std/thread` starts an operating-system thread to run a task value's public
+`run` method. The task moves into the worker; `join` waits for completion and
+moves its result back. Start with caller-owned `Storage` and an explicit join.
+This hosted package supports Linux GNU x86-64 and Windows x64.
+
+Read [ownership](ownership.md) before sharing data between threads. Being safe
+to move within one thread does not necessarily mean a value can move to another
+thread. Borrowed references, raw pointers, and resource owners need additional
+transfer guarantees. The simple task below contains only an owned integer.
 
 ## Quickstart
 
@@ -59,29 +64,40 @@ be public so the standard package can call them. Ownership moves into the
 worker, and the return value moves back through `join`. For a task without data
 to return, use `thread.Unit` instead of `void`.
 
+| Choice | Storage | End-of-scope behavior | Can detach? |
+| --- | --- | --- | --- |
+| `spawn(&mut storage, task)` | Caller-owned `Storage<T, R>` | Dropping `Join` waits and destroys the unclaimed result. | No |
+| `spawn_owned(&allocator, task)` | Explicit native mapping | Dropping `OwnedJoin` also waits. | Yes, by consuming `detach()` |
+
+Create several storage owners and spawn all workers before joining them if they
+should overlap. Spawning and immediately joining inside one loop runs tasks
+one after another. `join` is a synchronization point, not a cancellation request.
+
+### A task with no return data
+
+Use `thread.Unit` for a task whose completion is the only result. This complete
+test still joins the worker, so it never leaves background work behind:
+
 ```dodo test
-package thread_example
+package unit_task
 import "std/thread"
 
-pub struct Double {
-    value: usize
-    pub fn run(self) -> usize { return self.value * 2 }
-}
-
-fn example() -> usize!thread.ThreadError {
-    storage := thread.Storage.new::<Double, usize>()
-    worker := thread.spawn(&mut storage, Double { value: 21 })?
-    return ok(worker.join())
+pub struct Work {
+    pub fn run(self) -> thread.Unit {
+        return thread.Unit {}
+    }
 }
 
 @test
-fn joined_worker_returns_its_result() {
-    match example() {
-        ok(value) => { assert_eq(value, 42) },
-        err(_) => { assert(false, "the example worker must start and join") },
-    }
+fn joins_a_task_without_data() {
+    storage := thread.Storage.new::<Work, thread.Unit>()
+    worker := thread.spawn(&mut storage, Work {})!
+    completed := worker.join()
+    core.drop(completed)
 }
 ```
+
+### Caller-owned storage
 
 `Storage<T, R>` contains caller-provided task, result, and native-handle storage.
 The native implementation may allocate operating-system resources such as the
@@ -97,6 +113,8 @@ storage on any supported normal exit path. Checked-reference capture is not
 supported: a scoped storage borrow is not a proof that a captured reference is
 safe on another thread. Borrowing task APIs will require a separate lifetime
 and sharing proof. Caller-backed join handles cannot detach.
+
+### Owned and detached workers
 
 `spawn_owned::<T, R>(&thread.NativeAllocator, task)` explicitly requests an
 independent native mapping. Construct the allocation token with
@@ -114,6 +132,8 @@ atomic handoff covers both completion-before-detach and detach-before-completion
 without leaking or releasing storage twice. Process exit does not wait for
 detached workers.
 
+### Completion, yielding, and cancellation
+
 `is_finished(&self)` provides an acquire observation of result publication;
 `join` still performs the native wait and handle closure. `yield_now()` is a
 scheduling hint. `sleep_ms(u32)` requests a finite delay, subject to
@@ -124,6 +144,8 @@ operation supplies fairness or realtime guarantees. Applications can use
 token in the task. There is no forcible thread termination or implicit
 cancellation. Dropping a worker handle can therefore wait indefinitely if its
 task never completes.
+
+## What can cross a thread boundary
 
 Compiler thread capability checks are separate from borrowing checks.
 `core.mem.assert_send::<T>()` checks ownership transfer;
@@ -153,6 +175,8 @@ value or an explicit non-Result status enum. Silently dropping an unhandled
 `Result` through a join handle is rejected. This restriction also applies to
 nested fields.
 
+## Native callbacks and abnormal termination
+
 The compiler's unsafe `mem.callback::<Types...>(function_name)` specializes a
 statically named function and supplies its native address. It requires the
 exact signature `unsafe fn(*mut u8) -> void`, an unsafe block, and normal package
@@ -170,6 +194,12 @@ violate the lifetime guarantee. Safe ownership excludes joining oneself or
 joining an already-consumed handle. Linux workers disable POSIX cancellation.
 Normal native thread return runs supported native runtime TLS destructors;
 Dodo has no language-level thread-local declaration/destructor facility yet.
+
+## Atomic primitives
+
+For ordinary application code, start with [synchronization](synchronization.md)
+for guards, channels, and checked atomic operations. The following raw
+intrinsics are primarily for implementing ownership and synchronization adapters.
 
 Raw integer atomics are independent of OS blocking adapters. The compiler
 currently supports 8/16/32/64-bit integer operations up to pointer width on x86-64
@@ -194,3 +224,9 @@ The native ABI and ordering rules follow the
 [LLVM atomic memory model](https://llvm.org/docs/Atomics.html),
 [POSIX pthread join contract](https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_join.html),
 and [Windows CRT thread creation contract](https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex).
+
+## Complete API reference
+
+For every public type, field, constant, and function signature in the thread
+package, see [std/thread](api/std/thread.md). Compiler-provided `core.mem`
+intrinsics are covered in [memory and FFI](memory-and-ffi.md).

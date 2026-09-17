@@ -5,9 +5,27 @@ section: "Standard library"
 order: 152
 ---
 
-Use `std/fs.read_file` to read a small file into a fixed byte array. Import
-`std/platform` for reusable path-conversion storage and `std/console` to display
-the returned bytes. These are hosted APIs for Linux GNU x86-64 and Windows x64.
+`std/fs` reads and writes files, inspects metadata, and works with directories
+and links. Start with `read_file` for a small file and an explicit buffer size.
+Use `File` when you need to stream, seek, append, or control creation and
+durability. Files contain bytes; interpreting those bytes as UTF-8 is a separate
+step through [std/text](text.md).
+
+These hosted APIs support Linux GNU x86-64 and Windows x64. Import
+`std/platform` for reusable path-conversion storage. The portable
+`std/fs/path` module only manipulates path spellings and requires no filesystem.
+
+## Choose a file operation
+
+| Goal | API | Decision to make |
+| --- | --- | --- |
+| Read a bounded whole file | `fs.read_file` | How many bytes may the file contain? Check `report.eof`. |
+| Replace existing contents | `fs.write_file` | Existing contents are truncated before writing. |
+| Create without overwriting | `File.open_utf8` with `OpenOptions.create_new()` | Treat `AlreadyExists` as a separate outcome. |
+| Stream a large file | `File` with `io.read_up_to`, `write_all`, or `copy` | Choose scratch size and a transfer limit. |
+| Inspect a link itself | `fs.symlink_metadata` | `fs.metadata` follows the final link. |
+| Enumerate a directory | `fs.Directory` | Provide name storage and retry a too-small buffer. |
+| Normalize a spelling only | `fs/path.lexical_unix` or `lexical_windows` | No existence or identity check is performed. |
 
 ## Quickstart
 
@@ -68,17 +86,46 @@ Do not treat a partial read as the whole file.
 
 ## Whole-file convenience operations
 
-`read_file(path, output, workspace)` opens a fresh cursor and closes it before
-returning. `ReadReport.read` is the retained prefix and `eof` distinguishes a
-complete file from capacity exhaustion. An exact fit uses a discarded one-byte
-EOF probe. This is not a snapshot against concurrent writers.
-`File.open_utf8(path, options, workspace)` gives explicit streaming ownership.
+| Call | Success result | Resource lifetime |
+| --- | --- | --- |
+| `read_file(path, output, workspace)` | `io.ReadReport` with retained `read` count and observed `eof` | Opens a fresh cursor and closes before returning. |
+| `write_file(path, bytes, workspace)` | `ok()` after all bytes and successful close | Creates or **truncates** the destination, then closes. |
+| `File.open_utf8(path, options, workspace)` | An owned `File` | You control streaming, seeking, synchronization, and close. |
 
-`write_file(path, bytes, workspace)` creates or **truncates** the destination,
-follows symlinks, and leaves partial/truncated data on failure. It does not sync
-or atomically replace. For exclusive creation use `OpenOptions.create_new()`
-with `File.open_utf8` and `io.write_all`; for durability handle `File.sync`.
-`FileError` preserves native causes and transferred-byte counts.
+All paths are interpreted relative to the process's current working directory
+unless absolute; they are not relative to the source file. A relative filename
+can therefore refer to different files when you run the same executable from
+different directories. Whole-file helpers do not create parent directories.
+
+## Whole-file boundaries and errors
+
+`read_file` reports `io.ReadReport { read, eof }`. The returned byte count always
+fits the destination. `eof=false` means more data was observed: do not treat the
+retained prefix as a whole file. A one-byte probe distinguishes an exact fit
+from exhaustion, including a zero-byte buffer and empty file. The probe byte is
+discarded; no unbounded allocation or metadata-size guess is used. Reads retry
+interruptions and may block, including on special files and during the probe.
+There is no file-operation timeout. `io.read_bounded` exposes this same portable
+algorithm for structural readers without importing any hosted module.
+
+On errors, only `output[..reason.transferred]` is retained output. Open/path
+conversion failures transfer zero bytes and leave output unchanged. Close errors
+preserve the full read count. The first operation error wins over cleanup errors;
+owners still attempt deterministic cleanup. File mutation during the read is
+observable; completion means observed EOF, not a consistent filesystem snapshot.
+
+`write_file` returns only after writing every input byte and successfully closing.
+It creates a missing file and truncates an existing one before writing, even for
+empty input. Unix creation mode is 0666 filtered by umask; Windows sharing allows
+read/write/delete. It follows symlinks. It does not create parent directories,
+replace atomically, or request durable storage. On failure, a created/truncated
+file and its written prefix remain; `transferred` counts accepted bytes, including
+all bytes if only close failed. Use `File.open_utf8` with explicit options for
+exclusive creation, append, or an explicit `sync` request.
+
+The complete [file example](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_files.dodo)
+creates/truncates `hosted-example.txt`, reads it through a 64-byte buffer, and
+prints it. Run it in a disposable directory to keep its output isolated.
 
 ## API and contracts
 
@@ -135,6 +182,34 @@ fn inspect() -> u64!error.Error {
 ```
 
 ## Files and open modes
+
+A `File` owns the opened OS handle. A path is only used during `open`; it can
+be converted into the same workspace again once opening returns. A file's
+cursor advances as reads/writes succeed, so reading twice normally reads two
+successive regions. To start over, seek to offset zero or open a fresh file.
+
+This complete program creates a new file and writes all bytes. Run it only in a
+directory where `new-report.txt` does not already exist. `!` makes any failure
+stop this demonstration; a reusable function should match or propagate errors.
+
+```dodo
+package exclusive_file
+import "std/fs"
+import "std/platform"
+import "std/io"
+
+fn main() {
+    workspace := platform.workspace()
+    options := fs.OpenOptions.create_new()
+    file := fs.File.open_utf8("new-report.txt", &options, &mut workspace)!
+    io.write_all(&mut file, b"A new report\n")!
+    file.close()!
+}
+```
+
+The second run fails with `AlreadyExists` and preserves the existing file.
+`OpenOptions.new()` plus `write = true` would instead open an existing file for
+overwriting at its cursor; it would not automatically create or truncate it.
 
 `OpenOptions.new()` disables every access mode. At least one of `read`, `write`,
 or `append` must be enabled. `read_only()` enables reading; `create_new()`
@@ -282,6 +357,23 @@ untouched. This package cross-compiles to freestanding targets.
 
 ## Errors and current scope
 
+Distinguish a failed operation from a successful bounded prefix:
+
+| Outcome | What remains usable | Typical next step |
+| --- | --- | --- |
+| `read_file`: success, `eof=true` | The complete observed file in `output[..read]` | Decode or process it. |
+| `read_file`: success, `eof=false` | A prefix, with more data observed | Increase the bound or use streaming. |
+| `FileError` | Only the reported transferred prefix | Inspect `cause.kind`; do not treat it as complete. |
+| Open `NotFound` | No file owner was created | Check the path or choose a creation mode. |
+| Exclusive open `AlreadyExists` | Existing destination is preserved | Choose another name or an explicit replacement policy. |
+| Write/close failure | Already accepted bytes may remain in the file | Report partial output; do not assume rollback. |
+
+`File.read` and `File.write` return `io.Error`, while path operations and
+metadata generally return `platform/error.Error`. Whole-file operations use
+`FileError` to add progress to that native cause. A helper using all three
+should explicitly map or match those errors; `?` does not invent a common
+application error type.
+
 `std/platform/error.Error` combines a portable `Kind` with an unmodified native
 `code`: errno on Linux, a Win32 error number on Windows, and zero for a library
 validation error. `capabilities()` reports symbolic-link API availability,
@@ -308,32 +400,6 @@ repeated close, and strict/lossy unpaired-surrogate conversion. Rejection tests
 cover escaping native paths, mutable aliases, iterator name lifetimes, ignored
 Results, and private resource construction.
 
-## Whole-file boundaries and errors
+## Complete API reference
 
-`read_file` reports `io.ReadReport { read, eof }`. The returned byte count always
-fits the destination. `eof=false` means more data was observed: do not treat the
-retained prefix as a whole file. A one-byte probe distinguishes an exact fit
-from exhaustion, including a zero-byte buffer and empty file. The probe byte is
-discarded; no unbounded allocation or metadata-size guess is used. Reads retry
-interruptions and may block, including on special files and during the probe.
-There is no file-operation timeout. `io.read_bounded` exposes this same portable
-algorithm for structural readers without importing any hosted module.
-
-On errors, only `output[..reason.transferred]` is retained output. Open/path
-conversion failures transfer zero bytes and leave output unchanged. Close errors
-preserve the full read count. The first operation error wins over cleanup errors;
-owners still attempt deterministic cleanup. File mutation during the read is
-observable; completion means observed EOF, not a consistent filesystem snapshot.
-
-`write_file` returns only after writing every input byte and successfully closing.
-It creates a missing file and truncates an existing one before writing, even for
-empty input. Unix creation mode is 0666 filtered by umask; Windows sharing allows
-read/write/delete. It follows symlinks. It does not create parent directories,
-replace atomically, or request durable storage. On failure, a created/truncated
-file and its written prefix remain; `transferred` counts accepted bytes, including
-all bytes if only close failed. Use `File.open_utf8` with explicit options for
-exclusive creation, append, or an explicit `sync` request.
-
-The complete [file example](https://github.com/Jotrorox/dodo/blob/main/examples/hosted_files.dodo)
-creates/truncates `hosted-example.txt`, reads it through a 64-byte buffer, and
-prints it. Run it in a disposable directory to keep its output isolated.
+For every public type, field, constant, and function signature, see [std/fs](api/std/fs.md), [std/fs/types](api/std/fs/types.md), [std/fs/path](api/std/fs/path.md), [std/fs/unix](api/std/fs/unix.md), [std/fs/windows_ext](api/std/fs/windows_ext.md).

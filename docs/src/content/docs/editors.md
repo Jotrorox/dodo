@@ -9,6 +9,18 @@ Dodo includes a Language Server Protocol (LSP) server. After
 [installing the compiler](installation.md), connect it to your editor's LSP
 client to get diagnostics, ownership information, and editing tools for `.dodo` files.
 
+## Verify the compiler before the editor
+
+Run `dodo --version` and `dodo check path/to/main.dodo` in a terminal first.
+This separates installation or source errors from editor configuration. The
+language server checks code; it does not need a working executable linker just
+to show diagnostics. To run or test programs, finish the C toolchain setup in
+[installation](installation.md).
+
+If you are new to Dodo, use the VS Code path below. Other editors need an LSP
+client configured to launch `dodo lsp` over standard input/output. You do not
+need to run a separate server in a terminal while editing.
+
 ## Visual Studio Code
 
 The [Dodo VS Code extension](https://github.com/Jotrorox/dodo/tree/main/editor-support/dodo-vscode)

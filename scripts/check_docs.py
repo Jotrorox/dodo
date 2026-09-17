@@ -10,6 +10,8 @@ import json
 import re
 import sys
 
+from generate_api_docs import generate
+
 
 DIST = Path(__file__).resolve().parent.parent / "docs" / "dist"
 ROOT = DIST.parent.parent
@@ -71,6 +73,15 @@ def main() -> int:
     if DIST / "index.html" not in pages:
         print("Missing docs/dist/index.html; run npm run build in docs first.", file=sys.stderr)
         return 1
+
+    api_files, api_packages, api_declarations = generate()
+    content_root = ROOT / "docs/src/content/docs"
+    for path, expected in api_files.items():
+        if not path.is_file() or path.read_text(encoding="utf-8") != expected:
+            errors.append(f"{path.relative_to(ROOT)}: generated API page missing or stale; rebuild docs")
+        output = DIST / path.relative_to(content_root).with_suffix("") / "index.html"
+        if output not in pages:
+            errors.append(f"{output.relative_to(DIST)}: API page missing from site; rebuild docs")
 
     inventory = ROOT / "docs/src/content/docs/standard-library.md"
     documented = set(re.findall(
@@ -156,7 +167,8 @@ def main() -> int:
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print(f"Checked {len(pages)} pages, navigation, and {checked} internal links, assets, and search targets.")
+    print(f"Checked {len(pages)} pages, {api_packages} API packages ({api_declarations} declarations), "
+          f"navigation, and {checked} internal links, assets, and search targets.")
     return 0
 
 

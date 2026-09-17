@@ -1,6 +1,6 @@
 ---
 title: "UTF-8 text and strings"
-description: "UTF-8 text and strings: a runnable starting point, storage choices, and detailed contracts."
+description: "Validate UTF-8, distinguish bytes from Unicode scalars, slice and split text, parse numbers, and build owned strings."
 section: "Standard library"
 order: 146
 ---
@@ -9,6 +9,19 @@ Use `std/text.Builder.new` with a byte array to build a short string.
 `Text.from_str` wraps a known-valid string literal without copying; `Text.new`
 validates bytes received from a file or network. Both and the fixed builder are
 portable and require no allocator.
+
+| Representation | What it owns | Use it for |
+| --- | --- | --- |
+| Language `&str` | A shared view of valid UTF-8 | Literals, parameters, and existing string views |
+| `text.Text` | A validated view of existing bytes | UTF-8 boundaries, searching, splitting, and scalar iteration |
+| `text.Builder` | An exclusive borrow of your fixed byte array | Building text with a known maximum size |
+| `text_alloc.String<A>` | A growable buffer that borrows one allocator exclusively | One owned string using an arena or pool buffer |
+| `text_shared.String` | Growable storage plus a shared arena handle | Several owned strings and collections sharing an arena |
+
+Constructing a view does not copy its text. A view's source must stay alive and
+unchanged until its last use. An owned string controls its allocation, but still
+depends on the allocator and its backing storage. See [ownership](ownership.md)
+and [allocation](allocation.md) for those two lifetimes.
 
 ## Quickstart
 
@@ -100,6 +113,8 @@ never silently replace invalid input.
 
 ### Borrowed text
 
+#### Validate once, then use text operations
+
 `Text.new(bytes) -> Text!Error from(bytes)` validates a checked immutable byte
 slice. `Text.from_str(value)` takes a language string without revalidation.
 `as_bytes()` and `as_str()` expose shared views retaining the original storage
@@ -114,6 +129,42 @@ explicit; the rounding methods reject positions past the end. `byte_offset`
 maps a scalar index to a byte boundary, including one-past-the-end;
 `slice_scalars` slices by scalar indices. These operations do not split scalars,
 but can split a grapheme cluster. Scalar indexing is linear in the byte length.
+
+#### Slice Unicode at valid boundaries
+
+In `café`, the final scalar occupies two UTF-8 bytes. This example demonstrates
+why a byte count and scalar count are different, and how to select the whole
+final scalar without slicing inside its encoding.
+
+```dodo test
+package unicode_boundaries
+import "std/text"
+
+fn example() -> void!text.Error {
+    word := text.Text.from_str("café")
+    assert_eq(word.len_bytes(), 5usize)
+    assert_eq(word.len_scalars(), 4usize)
+    assert(word.is_boundary(3))
+    assert(!word.is_boundary(4))
+    last := word.slice_scalars(3, 4)?
+    assert_eq(last.as_str(), "é")
+    assert_eq(word.byte_offset(4)?, 5usize)
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `unicode_boundaries.dodo` and run `dodo run unicode_boundaries.dodo`.
+Success exits with zero and prints nothing. `slice(3, 5)` selects the same
+bytes as `slice_scalars(3, 4)`; `slice(3, 4)` fails with a boundary error.
+
+#### Iterate, search, and split
 
 `scalars()` returns a stateful `Scalars`; `next()` returns `Option<Scalar>` with
 public `value`, `start`, and `end` fields. Repeated calls after EOF return `none`.
@@ -160,6 +211,39 @@ global allocator fallback.
 
 ### Explicit numeric parsing
 
+These functions take bytes, so they also work directly on numeric protocol
+fields. Parsing consumes the entire field. Trim or remove a protocol prefix
+explicitly before parsing if your input format permits it.
+
+```dodo test
+package numeric_fields
+import "std/text"
+
+fn example() -> void!text.Error {
+    assert_eq(text.parse_u64(b"ff", 16)?, 255u64)
+    assert_eq(text.parse_i64(b"-42", 10)?, -42i64)
+    assert_eq(text.parse_f64(b"1.25e2")?, 125.0)
+    match text.parse_u64(b"12px", 10) {
+        ok(_) => { assert(false, "the whole field must be numeric") },
+        err(reason) => { assert_eq(reason.position, 2usize) },
+    }
+    return ok()
+}
+
+fn main() -> i32 {
+    match example() {
+        ok() => { return 0 },
+        err(_) => { return 1 },
+    }
+}
+```
+
+Save as `numeric_fields.dodo` and run `dodo run numeric_fields.dodo`. The final
+match handles an expected error at byte offset 2 (`p`). The other failures
+propagate to `main`. Success exits with zero and prints nothing.
+
+#### Integers
+
 `parse_u64(bytes, radix)` and `parse_i64(bytes, radix)` consume the entire input.
 Radices 2 through 36 accept ASCII digits and case-insensitive ASCII letters.
 An optional leading `+` is supported; only the signed parser accepts `-`.
@@ -174,6 +258,8 @@ and rejects signs, whitespace, and separators. Its `ParseError` distinguishes
 `Empty`, `InvalidDigit`, and `Overflow`; leading zeroes are permitted. It reuses
 the integer parser with the `u32` range limit. The [time parser](time.md#parsing-and-formatting)
 uses it after validating field positions and punctuation.
+
+#### Floating-point numbers
 
 `parse_f64(bytes)` accepts finite decimal syntax:
 `[+-]?(digits(.digits?)?|.digits)([eE][+-]?digits)?`.
@@ -223,3 +309,8 @@ hashing for owned string keys. Use it for trusted keys; it does not acquire an
 unpredictable hash seed. Reference/Result element acceptance still depends on
 the [current container rules](container-elements.md); an owned string constructor
 does not waive a container's element restrictions.
+
+Choose a logical byte limit for each string and a total storage budget for its
+arena. For a practical example that owns two strings while storing their views
+in a map, see [collections](collections.md#maps-sets-and-heaps). Exact signatures
+and error variants are listed in the [API reference](stdlib-api.md).

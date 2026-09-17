@@ -1,15 +1,68 @@
 ---
 title: "Container element safety"
 description: "Checked storage provenance, mutation effects, supported shared elements, and mandatory Result restrictions."
-section: "Project"
-order: 310
+section: "Language reference"
+order: 237
 ---
+
+This chapter answers three practical questions: which values can go in a
+collection, how long their referenced sources stay borrowed, and how stored
+strings can be edited safely. Start with the [collections guide](collections.md)
+for ordinary construction, insertion, access, and removal.
+
+An allocated collection owns its elements, but an element may itself refer to
+something else. For example, a vector of `&i32` owns its reference values while
+the original integers remain elsewhere. Dodo tracks those sources so the
+collection cannot leave a reference dangling.
 
 Allocated vectors, deques, hash maps/sets, ordered maps/sets, and heaps support
 shared-reference elements and owned strings with shared allocator dependencies.
-The acceptance scope below was established before implementation. Caller-backed
-moving containers retain their previous restrictions. Result elements remain
-unsupported; a capacity/allocation Result is always mandatory to handle.
+Caller-backed moving containers have stricter element restrictions. Result
+elements remain unsupported; a Result returned by insertion or allocation must
+still be handled.
+
+## A vector of borrowed values
+
+```dodo test
+package main
+
+import "alloc/shared_arena"
+import "std/collections/shared_vector"
+
+fn main() {
+    bytes := [0u8; 2048]
+    arena := shared_arena.SharedArena.new(&mut bytes)!
+    source := 42i32
+    values := shared_vector.new::<&i32>(arena.handle())
+    values.push(&source)!
+
+    removed := values.pop()
+    core.drop(values)
+    match removed {
+        some(reference) => { core.assert_eq(*reference, 42i32) },
+        none => { core.assert(false) },
+    }
+}
+```
+
+The backing bytes outlive the arena; the arena and `source` outlive the vector.
+`pop` transfers ownership of the stored reference. That reference can outlive
+the vector, but it still cannot outlive `source`. The postfix `!` handles
+allocation failure by panicking; use `?` or `match` when the caller should recover.
+
+Three kinds of dependency are relevant:
+
+| Dependency | Example | What must remain valid |
+| --- | --- | --- |
+| Storage borrow | `values.get(0)` or `values.as_slice()` | The collection's element storage; mutation and reallocation must wait. |
+| Allocator or policy dependency | A shared arena handle retained by the vector. | The allocator or policy's sources. |
+| Stored-element source | `&source` inserted into the vector. | The original referent, even though the reference is stored elsewhere. |
+
+The compiler keeps a conservative union of all stored-element sources. Removing
+one element or calling `clear` does not release a particular source from that
+union. Whole-owner replacement or destruction releases the container's union;
+previously removed values still retain their own source dependencies. This can
+keep a source borrowed longer than its last actual element requires.
 
 ## Supported combinations
 
@@ -111,6 +164,9 @@ supported reference-bearing element because it retains an exclusive dependency.
 The buffer-taking `text_alloc.String.new` remains available for UTF-8 validation.
 
 ## Checked region invariant
+
+The rest of this chapter specifies the library implementation contracts. You
+do not need to write these primitives to use the safe collections above.
 
 Three facts stay separate: the storage loan protecting a container, ordinary
 allocator/policy dependencies, and the union of sources retained by its stored
@@ -233,7 +289,8 @@ contents. `hash.SipStr` accepts explicit caller-provided keys for keyed hashing.
 
 ## Negative acceptance and Results
 
-The following operations remain errors in the example above:
+The following are separate examples of rejected operations, assuming the
+corresponding bindings from the earlier vector example are still in scope:
 
 ```dodo
 values.push(&source)?

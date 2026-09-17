@@ -37,6 +37,16 @@ The output includes `arithmetic.dodo::adds_numbers ... ok` and a summary of
 passed, failed, ignored, and filtered tests. A failing assertion reports the
 source file, line, column, expression, and comparison values.
 
+Temporarily change the expected `42` to `41` and run the test again. It should
+fail at that assertion. Restore `42` afterward. This checks that you are running
+the intended file and that the assertion can detect a mistake.
+
+Test the behavior a caller depends on: a normal input, a boundary such as an
+empty slice, and a recoverable error. Keep calculations in functions separate
+from console, files, or sockets when practical, so most tests need no external
+setup. The [temperature-report walkthrough](practical-program.md#add-a-test-beside-the-code)
+shows that separation in a complete application.
+
 ## Choose where tests live
 
 Any `.dodo` file can contain `@test` functions. Functions named `test_...` are
@@ -200,6 +210,20 @@ dodo test docs --doc
 ```
 
 ## Test this repository
+
+For your own project's CI, format source once locally, then check formatting
+without rewriting files and run tests:
+
+```sh
+dodo fmt --check .
+dodo check main.dodo
+dodo test
+```
+
+Run `check` on your actual entry file; a library-only project need not have
+`main.dodo`. A `--list` result proves discovery only, not compilation or execution.
+Ensure the CI machine also has the [linker prerequisites](installation.md).
+Use `--allow-empty` only when having no tests is intentional.
 
 From a source checkout, build the compiler and run the same command application
 authors use:

@@ -1,58 +1,105 @@
 ---
 title: "Dodo documentation"
-description: "Install Dodo, write your first program, and find guides to the language and compiler."
+description: "Learn Dodo step by step, build useful programs, and look up the complete language and standard library."
 section: "Start here"
 order: 0
 ---
 
-Dodo is a small, ahead-of-time compiled systems language with checked borrowing
-and explicit hardware access. Its compiler produces native executables, object
-files, assembly, LLVM IR, and bitcode. Ordinary generated code needs no garbage
-collector, heap allocator, scheduler, or Dodo runtime.
+Dodo is a compiled systems language: you write `.dodo` source files, and the
+compiler turns them into native programs. It checks types and borrowing before
+your program runs. Memory ownership is explicit, resources are released when
+their owners leave scope, and ordinary generated code needs no garbage collector
+or scheduler.
 
-The current compiler release is **0.1.3**, implementing part of the **Dodo 0.1**
-language design. See [implementation decisions and limits](implementation.md)
-for supported features and remaining work.
+You can begin with small terminal programs and fixed arrays. You do not need to
+understand raw pointers, allocators, or hardware to get started.
 
 ## Start here
 
-1. [Install Dodo](installation.md): get the compiler and check your setup.
-2. [Write your first program](first-program.md): create a folder with `main.dodo` and run it.
-3. [Use the command line](command-line.md): format, check, build, and choose output formats.
+1. [Install Dodo](installation.md). Set up the compiler and linker for your system.
+2. [Write your first program](first-program.md). Print a message, change it, check
+   it, and keep an executable.
+3. [Learn variables and expressions](language-basics.md). Work with values,
+   numbers, strings, and arrays.
+4. [Define types and functions](types-and-functions.md). Break a program into
+   named operations and model data with structs and enums.
+5. [Make decisions and repeat work](control-flow.md). Use `if`, loops, and `match`.
+6. [Understand ownership](ownership.md) and [handle errors](patterns-and-results.md).
+   Learn why values move, when references are valid, and how Results work.
+7. [Reuse code with generics](generics.md), [split a project into packages](packages.md),
+   and [write tests](testing.md).
 
-## Use Dodo in a project
+The chapters include complete examples you can save and run. A **Try it** exercise
+asks you to change working code; reference pages then explain the exact rules.
+If a term is unfamiliar, use the [glossary](glossary.md).
 
-Set up [editor diagnostics and hovers](editors.md), then explore
-the [example programs](https://github.com/Jotrorox/dodo/tree/main/examples).
-The command-line guide also covers [project folders](command-line.md#project-folders-and-source-files)
-and [target selection](command-line.md#targets-and-linking).
+<span id="use-dodo-in-a-project"></span>
 
-Find a task in the [standard-library guide](standard-library.md):
-[print a value](formatting.md), [read a file](filesystem.md),
-[get an environment variable](environment.md), [run a command](processes.md),
-[build a string](text.md), [store values](collections.md),
-[read time](time.md), [fetch a URL](http.md), or [serve a route](web.md).
+## Choose a path
 
-## Look up language behavior
+| You want to… | Go to |
+| --- | --- |
+| Learn from the beginning | [Your first program](first-program.md), then [language basics](language-basics.md) |
+| Build a small program using several features | [Build a temperature report](practical-program.md) |
+| Check, format, test, or debug code | [Command line](command-line.md), [testing](testing.md), [editor setup](editors.md) |
+| Understand a compiler error | [Diagnostics and common mistakes](diagnostics-and-editors.md) |
+| Find a library for a task | [Standard library](standard-library.md) |
+| Look up a function, type, field, or method | [API reference](stdlib-api.md), [all packages](api/index.md) |
+| Check an exact language rule | [Syntax](implementation-syntax.md), [ownership](ownership.md), [language specification](language-spec-0.1.md) |
+| Work on the compiler or documentation | [Build from source](building-from-source.md), [edit these docs](contributing.md) |
 
-- [Language specification](language-spec-0.1.md): normative syntax, types,
-  ownership rules, worked examples, conformance tests, and implementation-defined choices.
-- [Implementation decisions and limits](implementation.md): the behavior of the
-  current compiler, including differences from the broader design.
-- [Syntax and expressions](implementation-syntax.md), [ownership and borrowing](ownership.md),
-  and [patterns and Results](patterns-and-results.md): focused language references.
-- [Implementation requirements](spec-requirements.md): a checklist for reviewing
-  behavior and planning conformance tests.
+## What you can build
 
-## Work on Dodo
+The standard library includes portable byte and UTF-8 text processing, JSON,
+collections, mathematics, hashing, time values, and protocol engines. Hosted
+adapters add console I/O, files, environment variables, processes, threads,
+synchronization, sockets, TLS, HTTP clients, and web servers.
 
-Follow [Build Dodo from source](building-from-source.md) for compiler prerequisites,
-build profiles, and development checks. Follow [Edit these docs](contributing.md)
-to add or improve a documentation page and preview the website locally.
+Start with [console output](console.md), [text](text.md), and
+[collections](collections.md). For an application, follow [reading files](filesystem.md),
+[JSON](json.md), or [web routing](web.md). Each guide introduces storage and
+failure handling before its detailed contracts. The
+[package inventory](standard-library.md#packages) distinguishes portable code
+from APIs that require a supported operating system.
+
+<span id="look-up-language-behavior"></span>
+
+## Which version these docs describe
+
+The compiler release is **0.1.3** and the language design is **Dodo 0.1**. This
+website follows the repository's `main` branch, which may contain changes after
+that release. The library is embedded in your compiler; check `dodo --version`
+when an example uses an API your binary does not recognize.
+
+The tutorials and guides describe implemented behavior. The
+[language specification](language-spec-0.1.md) also defines design requirements;
+[implementation decisions and limits](implementation.md) records the supported
+subset and differences. For an exact release, use its
+[tagged source](https://github.com/Jotrorox/dodo/tree/v0.1.3) and
+[release notes](https://github.com/Jotrorox/dodo/blob/main/CHANGELOG.md).
+
+## How to use the examples
+
+A complete example includes `package`, imports if needed, and either `main` or
+named tests. Save each standalone program in its own file or fresh project
+folder. Run the command shown beside it. Smaller snippets illustrate one rule
+and may need surrounding code; deliberately invalid examples are labeled.
+
+Fences marked `dodo test` are executable documentation. From a compiler checkout,
+`dodo test docs --doc` checks them. File, network, and device examples explain
+any extra setup instead of assuming an external service is available.
+
+Use **Ctrl+K** or **Cmd+K** to search pages and API declarations. The sidebar
+separates the learning sequence, practical tooling, language reference, library
+guides, and exact API declarations.
+
+<span id="work-on-dodo"></span>
 
 ## Read offline
 
-Download the language specification as
-[plain text](/downloads/language-spec-0.1.txt) or a
-[PDF with searchable text and section bookmarks](/downloads/language-spec-0.1.pdf).
-Both are generated from the same Markdown source used by this site.
+The Markdown guides live in
+[docs/src/content/docs](https://github.com/Jotrorox/dodo/tree/main/docs/src/content/docs).
+Download the language specification as [plain text](/downloads/language-spec-0.1.txt)
+or [PDF](/downloads/language-spec-0.1.pdf). Both are generated from the same
+canonical Markdown. A [local site build](contributing.md#preview-locally) also
+creates the full searchable library reference from the bundled sources.
