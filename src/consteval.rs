@@ -135,6 +135,9 @@ pub fn eval(e: &Expr, bits: u32) -> Result<Scalar, String> {
             }
         }
         E::Cast(x, t) => match (eval(x, bits)?, t) {
+            // Round the integer directly to binary32 before storing it in the
+            // binary64 scalar; an intermediate binary64 rounding can lose bits.
+            (Scalar::Int(v), Type::Float(32)) => Scalar::Float((v as f32) as f64),
             (Scalar::Int(v), Type::Float(_)) => Scalar::Float(v as f64),
             (Scalar::Float(v), Type::Int { .. }) => {
                 let (lo, hi) = range(t, bits).unwrap();

@@ -163,11 +163,13 @@ nonnegative and smaller than the value's bit width. Integer conversions check
 range; they do not truncate or wrap. Float-to-integer conversion truncates toward
 zero after checking the finite source against the destination's half-open range
 before truncation (`-0.5 as u8` traps; `255.75 as u8` is 255).
-Integer-to-float conversion rounds to the target floating representation.
+Integer-to-float conversion rounds directly to the target floating representation,
+with identical results for constant and runtime conversions.
 Narrowing floats checks finite range, rejecting NaN and infinity. Floating
 arithmetic follows LLVM's IEEE operations without fast-math flags. Constant
-floating evaluation uses binary64 intermediates, including integer-to-f32
-conversion, and can round differently from runtime conversion; the precise
-implementation-defined choice is recorded as ID-FLOAT in
+floating arithmetic uses binary64 intermediates and rounds to the expression's
+type at each node. Integer-to-f32 casts round directly to binary32; an explicit
+cast through f64 still performs both conversions. Decimal literals are parsed
+through binary64. These implementation-defined choices are recorded as ID-FLOAT in
 [specification Appendix C](language-spec-0.1.md#c1-required-implementation-profile).
 There are no named wrapping operations yet.

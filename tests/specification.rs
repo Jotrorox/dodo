@@ -180,16 +180,35 @@ fn main() -> i32 {
 }
 
 #[test]
-fn constant_float_precision_is_documented_separately_from_runtime() {
+fn constant_integer_to_float_matches_runtime() {
     native(
         r#"package constant_float
-// ID-FLOAT: the constant evaluator rounds via binary64. This integer lies
-// just above a binary32 midpoint but rounds to that midpoint in binary64.
-const ROUNDED:f32 = 9007199791611905u64 as f32
-fn convert(value:u64)->f32 { value as f32 }
+// These integers lie around binary32 midpoints. Converting through binary64
+// would lose the low bits and round some values in the wrong direction.
+const BELOW:f32 = 9007199791611903u64 as f32
+const TIE:f32 = 9007199791611904u64 as f32
+const ABOVE:f32 = 9007199791611905u64 as f32
+const ODD_BELOW:f32 = 9007200865353727u64 as f32
+const ODD_TIE:f32 = 9007200865353728u64 as f32
+const NEGATIVE:f32 = -9007199791611905i64 as f32
+const HIGH:f32 = 9223372586610589697u64 as f32
+const MAXIMUM:f32 = 18446744073709551615u64 as f32
+const VIA_F64:f32 = 9007199791611905u64 as f64 as f32
+fn unsigned(value:u64)->f32 { value as f32 }
+fn signed(value:i64)->f32 { value as f32 }
+fn via_f64(value:u64)->f32 { value as f64 as f32 }
 fn main()->i32 {
-    if ROUNDED != 9007199254740992f32 { return 1 }
-    if convert(9007199791611905u64) != 9007200328482816f32 { return 2 }
+    if BELOW != unsigned(9007199791611903u64) || BELOW != 9007199254740992f32 { return 1 }
+    if TIE != unsigned(9007199791611904u64) || TIE != 9007199254740992f32 { return 2 }
+    if ABOVE != unsigned(9007199791611905u64) || ABOVE != 9007200328482816f32 { return 3 }
+    if ODD_BELOW != unsigned(9007200865353727u64) || ODD_BELOW != 9007200328482816f32 { return 4 }
+    if ODD_TIE != unsigned(9007200865353728u64) || ODD_TIE != 9007201402224640f32 { return 5 }
+    if NEGATIVE != signed(-9007199791611905i64) || NEGATIVE != -9007200328482816f32 { return 6 }
+    if HIGH != unsigned(9223372586610589697u64) || HIGH != 9223373136366403584f32 { return 7 }
+    if MAXIMUM != unsigned(18446744073709551615u64) || MAXIMUM != 18446744073709551616f32 { return 8 }
+    if VIA_F64 != via_f64(9007199791611905u64) || VIA_F64 != 9007199254740992f32 { return 9 }
+    const LOCAL:f32 = (9007199791611904u64 + 1u64) as f32
+    if LOCAL != unsigned(9007199791611905u64) { return 10 }
     0
 }
 "#,
