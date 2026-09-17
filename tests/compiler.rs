@@ -348,15 +348,33 @@ fn cli_check_does_not_need_main_and_reports_source_locations() {
 #[test]
 fn cli_run_preserves_program_exit_status() {
     let workspace = Workspace::new();
-    let source = workspace.source("package app\nfn main() -> i32 { return 23 }\n");
-    let output = workspace
-        .compiler()
-        .arg("run")
-        .arg(source)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(23));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked at"));
+    for code in [0, 23, 255, -1, 256, -256, i32::MIN, i32::MAX] {
+        let source = workspace.source(&format!(
+            "package app\nfn main() -> i32 {{ return {code} }}\n"
+        ));
+        // Windows preserves all 32 bits; Unix exposes the low eight bits.
+        let expected = if cfg!(windows) {
+            code
+        } else {
+            i32::from(code as u8)
+        };
+        for optimization in [0, 3] {
+            let output = workspace
+                .compiler()
+                .arg("run")
+                .arg(&source)
+                .arg("-O")
+                .arg(optimization.to_string())
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "return {code} at O{optimization}: {output:?}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked at"));
+        }
+    }
 }
 
 #[test]

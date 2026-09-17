@@ -5,7 +5,7 @@ use dodoc::{codegen, lsp, package, sema};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod test_runner;
@@ -662,7 +662,7 @@ fn execute_format(args: FormatArgs) -> Result<i32, String> {
     Ok(0)
 }
 
-fn main() -> ExitCode {
+fn main() {
     let result = match parse(std::env::args_os().skip(1)) {
         Ok(Parsed::Help) => {
             print!("{HELP}");
@@ -683,8 +683,8 @@ fn main() -> ExitCode {
         }
         Err(e) => Err(e),
     };
-    match result {
-        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+    let code = match result {
+        Ok(code) => code,
         Err(e) => {
             eprintln!(
                 "{}{}",
@@ -695,9 +695,11 @@ fn main() -> ExitCode {
                 },
                 e
             );
-            ExitCode::FAILURE
+            1
         }
-    }
+    };
+    // Command resources have been dropped; preserve all 32 exit-status bits on Windows.
+    std::process::exit(code);
 }
 #[cfg(test)]
 mod tests {

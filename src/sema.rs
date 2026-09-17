@@ -1237,7 +1237,25 @@ impl<'a> Checker<'a> {
                     self.conflict(loan, Access::Write, target.span)?;
                 }
                 self.check_split_field_assignment(target)?;
-                let val = self.expr(value, Some(&place.ty), true)?;
+                // Codegen captures the destination address before evaluating the
+                // RHS. Keep projected storage alive even across value-block
+                // statements, whose temporary loans are cleared. A shared
+                // reservation permits reads and disjoint field edits, but not
+                // moving or replacing the owner of the captured destination.
+                // Whole bindings can be moved and reinitialized: their drop
+                // flags track whether an old value still needs destruction.
+                let protected_len = self.protected.len();
+                if place.direct.is_none() {
+                    self.protected
+                        .extend(place.loans.iter().cloned().map(|mut loan| {
+                            loan.mutable = false;
+                            loan.origin = target.span;
+                            loan
+                        }));
+                }
+                let val = self.expr(value, Some(&place.ty), true);
+                self.protected.truncate(protected_len);
+                let val = val?;
                 self.expect(&place.ty, &val.ty, value.span)?;
                 if let Some(binary) = op {
                     self.binary_type(*binary, &place.ty, span)?;
@@ -2514,9 +2532,17 @@ impl<'a> Checker<'a> {
                     .or_else(|| self.peek_type(left))
                     .or_else(|| self.peek_type(right));
                 let lhs = self.expr(left, inferred.as_ref(), false)?;
+                // The RHS may be skipped, but the LHS always runs. Join both
+                // paths so RHS assignments are not definite and possible moves
+                // and borrows from either path remain visible.
+                let skipped =
+                    matches!(op, BinaryOp::And | BinaryOp::Or).then(|| self.scopes.clone());
                 let rhs = self.expr(right, Some(&lhs.ty), false)?;
                 self.expect(&lhs.ty, &rhs.ty, right.span)?;
                 let ty = self.binary_type(*op, &lhs.ty, span)?;
+                if let Some(skipped) = skipped {
+                    self.scopes = merge_states(skipped, std::mem::take(&mut self.scopes));
+                }
                 Value { ty, deps: vec![] }
             }
             ExprKind::Call {
@@ -5123,6 +5149,81 @@ mod tests {
         );
     }
     #[test]
+    fn short_circuit_rhs_does_not_establish_initialization() {
+        for expression in [
+            "false && { x = 123; true }",
+            "true || { x = 123; false }",
+            "b && { x = 123; true }",
+            "b || { x = 123; false }",
+            "(b && { x = 123; true }) || false",
+            "(b || { x = 123; false }) && true",
+        ] {
+            rejects(
+                &format!("fn f(b: bool) -> i32 {{ i32 x\n_ = {expression}\nreturn x }}"),
+                "`x` is uninitialized",
+            );
+        }
+    }
+    #[test]
+    fn short_circuit_rhs_initialization_does_not_reach_later_operands() {
+        for expression in [
+            "(b && { x = 123; true }) == (x == 123)",
+            "(b || { x = 123; false }) == (x == 123)",
+        ] {
+            rejects(
+                &format!("fn f(b: bool) -> bool {{ i32 x\nreturn {expression} }}"),
+                "`x` is uninitialized",
+            );
+        }
+    }
+    #[test]
+    fn short_circuit_preserves_unconditional_initialization() {
+        for op in ["&&", "||"] {
+            accepts(&format!(
+                "fn f(b: bool) -> i32 {{ i32 x\n_ = {{ x = 123; b }} {op} (x == 123)\nreturn x }}"
+            ));
+            accepts(&format!(
+                "fn f(b: bool) -> i32 {{ x := 1i32\n_ = b {op} {{ x = 123; x == 123 }}\nreturn x }}"
+            ));
+        }
+        accepts("fn f() -> i32 { i32 x\n_ = 1i32 & { x = 123; x }\nreturn x }");
+    }
+    #[test]
+    fn short_circuit_still_checks_skipped_operands() {
+        rejects("fn f() { _ = false && 123 }", "expected `bool`");
+        rejects("fn f() { _ = true || missing }", "unknown binding");
+    }
+    #[test]
+    fn short_circuit_joins_moves_and_reinitialization() {
+        for op in ["&&", "||"] {
+            rejects(
+                &format!(
+                    "struct S {{ i32 n }}\nfn take(s: S) {{}}\nfn f(b: bool, s: S) -> i32 {{ _ = b {op} {{ take(s); true }}\nreturn s.n }}"
+                ),
+                "moved",
+            );
+            rejects(
+                &format!(
+                    "struct S {{ i32 n }}\nfn take(s: S) {{}}\nfn f(b: bool, s: S) -> i32 {{ take(s)\n_ = b {op} {{ s = S{{n: 123}}; true }}\nreturn s.n }}"
+                ),
+                "moved",
+            );
+        }
+    }
+    #[test]
+    fn short_circuit_preserves_borrows_from_both_paths() {
+        for op in ["&&", "||"] {
+            for source in ["x", "y"] {
+                rejects(
+                    &format!(
+                        "fn f(b: bool) -> i32 {{ x := 1i32\ny := 2i32\nr := &x\n_ = b {op} {{ r = &y; true }}\n{source} = 3\nreturn *r }}"
+                    ),
+                    "live shared borrow",
+                );
+            }
+        }
+    }
+    #[test]
     fn early_return_initialization() {
         accepts("fn f(b: bool) -> u8 {\n u8 x\n if b { return 0 } else { x = 1 }\n return x\n}");
     }
@@ -5646,6 +5747,65 @@ mod tests {
         rejects(
             "import \"core/mmio\"\nfn f(address: usize) -> u32 { return mmio.read32(address) }",
             "explicit unsafe block",
+        );
+    }
+    #[test]
+    fn assignment_rhs_cannot_destroy_destination_owner() {
+        let declarations = "struct Token { n: i32\nfn drop(&mut self) {} }\nstruct Owner { token: Token, n: i32 }\nfn replace(owner: Owner) -> Token { Token { n: 2 } }";
+        for body in [
+            "owner.token = replace(owner)",
+            "owner.token = { core.drop(owner); Token { n: 2 } }",
+            "owner.token = { if flag { core.drop(owner) }; Token { n: 2 } }",
+            "owner.token = { owner = Owner { token: Token { n: 3 }, n: 0 }; Token { n: 2 } }",
+            "owner.token = { core.drop(owner); owner = Owner { token: Token { n: 3 }, n: 0 }; Token { n: 2 } }",
+            "owner.n += { core.drop(owner); 1 }",
+            "r := &mut owner.token\n*r = { core.drop(owner); Token { n: 2 } }",
+            "r := &mut owner\nr.token = { core.drop(owner); Token { n: 2 } }",
+        ] {
+            rejects(
+                &format!("{declarations}\nfn f(flag: bool, owner: Owner) {{ {body} }}"),
+                "overlapping borrows within the same expression",
+            );
+        }
+        for (target, setup) in [
+            ("items[0]", ""),
+            ("view[0]", "view := &mut items"),
+            ("view[0]", "view: &mut [Token] = &mut items"),
+        ] {
+            rejects(
+                &format!(
+                    "{declarations}\nfn f() {{ items := [Token {{ n: 1 }}]\n{setup}\n{target} = {{ core.drop(items); Token {{ n: 2 }} }} }}"
+                ),
+                "overlapping borrows within the same expression",
+            );
+        }
+    }
+    #[test]
+    fn assignment_rhs_preserves_reads_disjoint_fields_and_whole_binding_moves() {
+        accepts(
+            r#"struct Token { n: i32
+    fn drop(&mut self) {}
+}
+struct Owner { token: Token, n: i32 }
+fn identity(t: Token) -> Token { t }
+fn f(owner: Owner) {
+    owner.token = { owner.n += 1; Token { n: owner.token.n + owner.n } }
+    owner.n += owner.n
+    r := &mut owner.token
+    *r = Token { n: r.n + 1 }
+    items := [Token { n: 1 }]
+    items[0] = Token { n: items[0].n + 1 }
+    token := Token { n: 1 }
+    token = identity(token)
+    token = token
+    token = { core.drop(token); Token { n: 2 } }
+    core.drop(token)
+    Token uninitialized
+    uninitialized = Token { n: 3 }
+    core.drop(uninitialized)
+    core.drop(owner)
+    core.drop(items)
+}"#,
         );
     }
     #[test]

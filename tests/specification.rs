@@ -139,6 +139,38 @@ fn main() -> i32 {
 }
 
 #[test]
+fn assignment_preserves_projected_and_whole_binding_cleanup() {
+    native(
+        r#"package assignment_cleanup
+unsafe extern "C" fn putchar(ch: i32) -> i32
+struct Token { id: i32
+    fn drop(&mut self) { unsafe { putchar(self.id) } }
+}
+struct Owner { token: Token, count: i32 }
+fn identity(token: Token) -> Token { token }
+fn main() -> i32 {
+    owner := Owner { token: Token { id: 65 }, count: 0 }
+    owner.token = { owner.count += 1; Token { id: owner.token.id + 1 } }
+    if owner.count != 1 { return 1 }
+    r := &mut owner.token
+    *r = Token { id: r.id + 1 }
+    core.drop(owner)
+    items := [Token { id: 68 }]
+    items[0] = Token { id: items[0].id + 1 }
+    core.drop(items)
+    token := Token { id: 70 }
+    token = identity(token)
+    token = token
+    token = { core.drop(token); Token { id: 71 } }
+    core.drop(token)
+    0
+}
+"#,
+        b"ABCDEFG",
+    );
+}
+
+#[test]
 fn scalar_representations_and_float_comparisons() {
     native(
         r#"package representation
