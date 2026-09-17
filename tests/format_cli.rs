@@ -109,9 +109,13 @@ fn directory_validation_precedes_all_writes_and_traversal_skips_artifacts() {
     for ignored in [
         "target/ignored.dodo",
         "build/ignored.dodo",
+        "dist/ignored.dodo",
+        "node_modules/ignored.dodo",
+        "vendor/ignored.dodo",
         ".git/ignored.dodo",
     ] {
         workspace.file(ignored, "this is not Dodo");
+        workspace.file(&format!("nested/{ignored}"), "this is not Dodo");
     }
     workspace.file("notes.txt", "this is not Dodo");
     let output = workspace.fmt(&[]);
@@ -125,6 +129,40 @@ fn directory_validation_precedes_all_writes_and_traversal_skips_artifacts() {
     assert!(fs::read_to_string(nested).unwrap().contains("value: i32"));
     success(&workspace.fmt(&["--check"]));
     assert!(!workspace.fmt(&["--stdout", "."]).status.success());
+}
+
+#[test]
+fn excluded_directories_are_untouched_unless_explicitly_selected() {
+    let workspace = Workspace::new();
+    let legacy = "package app\nfn main(){i32 value=1}\n";
+    for directory in [
+        "build",
+        "target",
+        "dist",
+        "node_modules",
+        "vendor",
+        ".hidden",
+    ] {
+        let filename = format!("{directory}/source.dodo");
+        let path = workspace.file(&filename, legacy);
+        // Exclusions apply to directory names, not similarly named source files.
+        let included = workspace.file(&format!("{directory}_source.dodo"), legacy);
+        success(&workspace.fmt(&["."]));
+        success(&workspace.fmt(&["--check", "."]));
+        assert_eq!(fs::read_to_string(&path).unwrap(), legacy);
+        assert!(fs::read_to_string(included).unwrap().contains("value: i32"));
+
+        assert_eq!(
+            workspace.fmt(&["--check", &filename]).status.code(),
+            Some(1)
+        );
+        success(&workspace.fmt(&[&filename]));
+        assert!(fs::read_to_string(&path).unwrap().contains("value: i32"));
+
+        fs::write(&path, legacy).unwrap();
+        success(&workspace.fmt(&[directory]));
+        assert!(fs::read_to_string(path).unwrap().contains("value: i32"));
+    }
 }
 
 #[test]

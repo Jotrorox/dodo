@@ -317,8 +317,10 @@ zero after checking the finite source against the destination's half-open range
 before truncation (`-0.5 as u8` traps; `255.75 as u8` is 255).
 Integer-to-float conversion rounds directly to the target floating representation,
 with identical results for constant and runtime conversions.
-Narrowing floats checks finite range, rejecting NaN and infinity. Floating
-arithmetic follows LLVM's IEEE operations without fast-math flags. Constant
+Narrowing floats checks finite range, rejecting NaN and infinity. Identity and
+widening float casts preserve NaN, infinities, and signed zero in both constant
+expressions and runtime code. Floating arithmetic follows LLVM's IEEE operations
+without fast-math flags. Constant
 floating arithmetic uses binary64 intermediates and rounds to the expression's
 type at each node. Integer-to-f32 casts round directly to binary32; an explicit
 cast through f64 still performs both conversions. Decimal literals are parsed

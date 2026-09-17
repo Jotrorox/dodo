@@ -2,6 +2,26 @@ package fs_path_checks
 import "std/fs/path"
 import "std/platform/error"
 import "core/bytes"
+
+// ASCII cases stay readable while exercising the UTF-16 API at minimum capacity.
+fn windows_path_matches(input: &[u8], expected: &[u8]) -> bool!error.Error {
+    source := [0u16; 64]
+    output := [65535u16; 65]
+    for i in 0usize..input.len {
+        source[i] = input[i] as u16
+    }
+    count := path.lexical_windows(&source[..input.len], &mut output[..input.len + 1])?
+    if count != expected.len || output[count] != 0 || output[input.len + 1] != 65535 {
+        return ok(false)
+    }
+    for i in 0usize..count {
+        if output[i] != expected[i] as u16 {
+            return ok(false)
+        }
+    }
+    return ok(true)
+}
+
 fn verify() -> i32!error.Error {
     output := [0u8; 64]
     n := path.lexical_unix(b"//a/./b//../c/", &mut output)?
@@ -40,6 +60,36 @@ fn verify() -> i32!error.Error {
                 return ok(7)
             }
         }
+    }
+    if!windows_path_matches(b"C:./", b"C:.\\")? {
+        return ok(8)
+    }
+    if!windows_path_matches(b"C:.\\", b"C:.\\")? {
+        return ok(9)
+    }
+    if!windows_path_matches(b"C:./.\\.//", b"C:.\\")? {
+        return ok(10)
+    }
+    if!windows_path_matches(b"C:", b"C:")? {
+        return ok(11)
+    }
+    if!windows_path_matches(b"C:.", b"C:")? {
+        return ok(12)
+    }
+    if!windows_path_matches(b"C:./file/", b"C:file\\")? {
+        return ok(13)
+    }
+    if!windows_path_matches(b"C:../", b"C:..\\")? {
+        return ok(14)
+    }
+    if!windows_path_matches(b"C:/./", b"C:\\")? {
+        return ok(15)
+    }
+    if!windows_path_matches(b"./", b".\\")? {
+        return ok(16)
+    }
+    if!windows_path_matches(b"//server/share/./", b"\\\\server\\share\\")? {
+        return ok(17)
     }
     return ok(0)
 }

@@ -56,7 +56,12 @@ impl Document {
             .iter()
             .map(|import| {
                 let name = import.rsplit('/').next().unwrap().to_owned();
-                (name.clone(), name)
+                let alias = program
+                    .import_aliases
+                    .iter()
+                    .find(|(path, _)| path == import)
+                    .map_or_else(|| name.clone(), |(_, alias)| alias.clone());
+                (alias, name)
             })
             .collect();
         aliases.insert(String::new(), String::new());
@@ -723,6 +728,27 @@ mod tests {
                 position["character"].as_u64().unwrap() as u32,
             )
             .unwrap_or_else(|| panic!("missing hover for {needle}"))
+    }
+
+    #[test]
+    fn standalone_rename_rejects_import_qualifier_collisions() {
+        for (import, qualifier) in [
+            ("import \"lib\"", "lib"),
+            ("import \"lib\" as util", "util"),
+            ("import \"nested/lib\"", "lib"),
+        ] {
+            let document = Document::new(format!(
+                "package app\n{import}\nfn main() -> i32 {{\ncount := 1\nreturn count + {qualifier}.answer()\n}}\n"
+            ));
+            let symbol = document
+                .index
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == "count")
+                .unwrap();
+            assert!(document.index.can_rename(symbol, "total"));
+            assert!(!document.index.can_rename(symbol, qualifier), "{import}");
+        }
     }
 
     #[test]

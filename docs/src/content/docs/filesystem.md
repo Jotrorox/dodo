@@ -348,11 +348,12 @@ snapshot, not a stable capability that prevents subsequent replacement.
 `std/fs/path.lexical_unix` and `lexical_windows` perform a separate, conservative
 lexical operation using no OS calls. They collapse redundant separators and
 `.` components, preserve all `..` components, and retain Unix double-root and
-Windows drive-relative/UNC forms. They never claim that two names identify the
-same object. Windows device/verbatim prefixes return `Unsupported` because
-their rules differ. Input excludes a NUL; output requires input length plus
-one units, includes a final NUL, and the returned count excludes it. Empty
-input and interior NULs are invalid. Validation/capacity failure leaves output
+Windows drive-relative/UNC forms. A trailing separator is retained; `C:./`
+becomes `C:.\` to preserve its drive-relative meaning. They never claim that two
+names identify the same object. Windows device/verbatim prefixes return
+`Unsupported` because their rules differ. Input excludes a NUL; output requires
+input length plus one units, includes a final NUL, and the returned count excludes
+it. Empty input and interior NULs are invalid. Validation/capacity failure leaves output
 untouched. This package cross-compiles to freestanding targets.
 
 ## Errors and current scope

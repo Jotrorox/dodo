@@ -2,7 +2,7 @@
 use dodoc::codegen::Context;
 use dodoc::codegen::FileType;
 use dodoc::{codegen, lsp, package, sema};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -547,6 +547,16 @@ fn execute(mut args: Args) -> Result<i32, String> {
     Ok(0)
 }
 
+// Shared by formatting and test discovery; explicit input paths bypass this filter.
+fn excluded_source_directory(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.')
+        || matches!(
+            name.as_ref(),
+            "build" | "target" | "dist" | "node_modules" | "vendor"
+        )
+}
+
 fn format_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = fs::read_dir(directory)
         .map_err(|e| format!("cannot read directory {}: {e}", directory.display()))?;
@@ -555,8 +565,7 @@ fn format_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String
         let kind = entry.file_type().map_err(|e| e.to_string())?;
         let path = entry.path();
         if kind.is_dir() {
-            let name = entry.file_name();
-            if !name.to_string_lossy().starts_with('.') && name != "target" && name != "build" {
+            if !excluded_source_directory(&entry.file_name()) {
                 format_files(&path, files)?;
             }
         } else if kind.is_file() && path.extension().is_some_and(|e| e == "dodo") {

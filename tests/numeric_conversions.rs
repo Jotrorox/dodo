@@ -95,3 +95,60 @@ fn explicit_f64_intermediate_keeps_its_own_rounding() {
         9007199254740992.0
     );
 }
+
+#[test]
+fn float_identity_and_widening_constants_preserve_special_values() {
+    for (source_bits, target_bits) in [(32, 32), (64, 64), (32, 64)] {
+        for (expression, expected) in [
+            (format!("0f{source_bits} / 0f{source_bits}"), f64::NAN),
+            (format!("1f{source_bits} / 0f{source_bits}"), f64::INFINITY),
+            (
+                format!("-1f{source_bits} / 0f{source_bits}"),
+                f64::NEG_INFINITY,
+            ),
+            (format!("-0f{source_bits}"), -0.0),
+            (format!("0f{source_bits}"), 0.0),
+            (format!("1.5f{source_bits}"), 1.5),
+        ] {
+            for pointer_bits in [32, 64] {
+                let cast = format!("({expression}) as f{target_bits}");
+                let actual = constant_float(&cast, target_bits, pointer_bits);
+                if expected.is_nan() {
+                    assert!(actual.is_nan(), "{cast}, {pointer_bits}-bit target");
+                } else {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{cast}, {pointer_bits}-bit target"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn constant_float_narrowing_still_rejects_non_finite_and_out_of_range_values() {
+    for expression in [
+        "(0f64 / 0f64) as f32",
+        "(1f64 / 0f64) as f32",
+        "(-1f64 / 0f64) as f32",
+        "3.5e38f64 as f32",
+        "-3.5e38f64 as f32",
+        "(0f32 / 0f32) as f32 as f64 as f32",
+        "(1f32 / 0f32) as f32 as f64 as f32",
+    ] {
+        for pointer_bits in [32, 64] {
+            let source = format!("package numeric\nconst VALUE: f32 = {expression}\n");
+            let mut program = parser::parse(&source).unwrap();
+            let error = sema::check_for_target(&mut program, pointer_bits).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("constant floating conversion out of range"),
+                "{}",
+                error.render("numeric.dodo", &source)
+            );
+        }
+    }
+}

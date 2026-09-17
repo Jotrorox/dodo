@@ -100,6 +100,36 @@ fn no_arguments_discover_inline_companion_nested_and_documentation_tests() {
 }
 
 #[test]
+fn directory_discovery_skips_artifacts_at_every_depth() {
+    let w = Workspace::new();
+    w.file("main.dodo", "package app\n@test fn root() {}\n");
+    w.file("nested/main.dodo", "package nested\n@test fn nested() {}\n");
+    for directory in [
+        "build",
+        "target",
+        "dist",
+        "node_modules",
+        "vendor",
+        ".hidden",
+    ] {
+        w.file(&format!("{directory}/broken.dodo"), "@test fn broken(");
+        w.file(
+            &format!("nested/{directory}/broken.dodo"),
+            "@test fn broken(",
+        );
+    }
+    for args in [vec!["--list"], vec!["--list", "."]] {
+        let output = w.test(&args);
+        success(&output);
+        assert!(
+            text(&output).contains("2 tests listed; 0 filtered out; 0 discovery errors"),
+            "{}",
+            text(&output)
+        );
+    }
+}
+
+#[test]
 fn assertions_evaluate_once_and_preserve_types_at_all_optimization_levels() {
     let w = Workspace::new();
     w.file(

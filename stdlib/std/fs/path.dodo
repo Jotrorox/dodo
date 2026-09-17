@@ -134,6 +134,11 @@ pub fn lexical_windows(input: &[u16], output: &mut[u16]) -> usize!error.Error {
         used = 1
     }
     if ((input[input.len - 1] == 47 || input[input.len - 1] == 92)) && output[used - 1] != 92 {
+        // Keep a dot before the trailing separator so a bare drive stays relative.
+        if drive_relative && used == 2 {
+            output[used] = 46
+            used += 1
+        }
         output[used] = 92
         used += 1
     }

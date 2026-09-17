@@ -2255,6 +2255,57 @@ fn lsp_versioned_rename_and_collision_rejection() {
 }
 
 #[test]
+fn lsp_rename_rejects_import_qualifier_collisions() {
+    for (import, alias, qualifier) in [
+        ("lib", "", "lib"),
+        ("lib", " as util", "util"),
+        ("nested/lib", "", "lib"),
+    ] {
+        let workspace = Workspace::new();
+        let source = format!(
+            "package app\nimport \"{import}\"{alias}\nfn calculate(input: i32) -> i32 {{\ncount := input\nreturn count + {qualifier}.answer()\n}}\nfn main() -> i32 {{ return calculate(1) }}\n"
+        );
+        let library = "package lib\npub fn answer() -> i32 { return 42 }\n";
+        let uri = workspace.uri("main.dodo");
+        workspace.file(&format!("{import}.dodo"), library);
+        let mut client = Client::start("lsp");
+        client.initialize("file");
+        client.open(&uri, &source, 1);
+        assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+        for needle in ["count :=", "input: i32"] {
+            let response = query(
+                &mut client,
+                "rename",
+                &uri,
+                &source,
+                needle,
+                json!({"newName":qualifier}),
+            );
+            assert_eq!(response["error"]["code"], -32803, "{response}");
+            assert!(response.get("result").is_none(), "{response}");
+        }
+        let response = query(
+            &mut client,
+            "rename",
+            &uri,
+            &source,
+            "count :=",
+            json!({"newName":"total"}),
+        );
+        let edits = &response["result"]["changes"][&uri];
+        assert_eq!(edits.as_array().unwrap().len(), 2, "{response}");
+        let renamed = apply_text_edits(&source, edits);
+        assert_eq!(renamed, source.replace("count", "total"));
+        let path = workspace.0.join("main.dodo");
+        let mut loaded =
+            dodoc::package::load_with_overlays(&path, &BTreeMap::from([(path.clone(), renamed)]))
+                .unwrap();
+        dodoc::sema::check(&mut loaded.program).unwrap();
+        assert!(client.shutdown().is_empty());
+    }
+}
+
+#[test]
 fn lsp_recovery_preserves_import_locations_and_does_not_weaken_cli_checks() {
     let workspace = Workspace::new();
     let source = "package app\nimport \"lib\"\nfn main() -> i32 { return lib.good() }\n";

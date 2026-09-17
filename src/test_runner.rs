@@ -229,15 +229,11 @@ fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let kind = entry.file_type().map_err(|e| e.to_string())?;
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if kind.is_symlink() || name.starts_with('.') {
+        if kind.is_symlink() || name.to_string_lossy().starts_with('.') {
             continue;
         }
         if kind.is_dir() {
-            if !matches!(
-                name.as_ref(),
-                "build" | "target" | "dist" | "node_modules" | "vendor"
-            ) {
+            if !super::excluded_source_directory(&name) {
                 collect(&entry.path(), files)?;
             }
         } else if kind.is_file()

@@ -147,7 +147,9 @@ pub fn eval(e: &Expr, bits: u32) -> Result<Scalar, String> {
                 }
                 Scalar::Int(v.trunc() as i128)
             }
-            (Scalar::Float(v), Type::Float(32)) => {
+            // The scalar storage is always binary64, but only an actual
+            // f64-to-f32 narrowing cast requires a finite, in-range source.
+            (Scalar::Float(v), Type::Float(32)) if x.ty == Type::Float(64) => {
                 if !v.is_finite() || v.abs() > f32::MAX as f64 {
                     return Err("constant floating conversion out of range".into());
                 }

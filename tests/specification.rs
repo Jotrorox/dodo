@@ -246,9 +246,54 @@ fn main()->i32 {
 "#,
         b"",
     );
-    Workspace::new().reject(
-        "package invalid\nconst X:f32 = (0f32 / 0f32) as f32\n",
-        "constant floating conversion",
+}
+
+#[test]
+fn constant_float_identity_and_widening_match_runtime() {
+    native(
+        r#"package float_identity
+const NAN:f32 = (0f32 / 0f32) as f32
+const INF:f32 = (1f32 / 0f32) as f32
+const NEG_INF:f32 = (-1f32 / 0f32) as f32
+const NEG_ZERO:f32 = -0f32 as f32
+const MAX:f32 = 3.4028234663852886e38f32 as f32
+const TINY:f32 = (1.17549435e-38f32 * 0.5f32) as f32
+const OVERFLOW:f32 = (3.4028234663852886e38f32 * 2f32) as f32
+const NAN64:f64 = (0f64 / 0f64) as f64
+const INF64:f64 = (1f64 / 0f64) as f64
+const NEG_INF64:f64 = (-1f64 / 0f64) as f64
+const NEG_ZERO64:f64 = -0f64 as f64
+const WIDE_NAN:f64 = NAN as f64
+const WIDE_INF:f64 = INF as f64
+const WIDE_NEG_INF:f64 = NEG_INF as f64
+const WIDE_NEG_ZERO:f64 = NEG_ZERO as f64
+fn identity(value:f32)->f32 { value as f32 }
+fn identity64(value:f64)->f64 { value as f64 }
+fn widen(value:f32)->f64 { value as f64 }
+fn main()->i32 {
+    nan := identity(0f32 / 0f32)
+    inf := identity(1f32 / 0f32)
+    neg_inf := identity(-1f32 / 0f32)
+    if NAN == NAN || nan == nan { return 1 }
+    if INF != inf || NEG_INF != neg_inf || INF <= 0f32 || NEG_INF >= 0f32 { return 2 }
+    if 1f32 / NEG_ZERO != neg_inf || 1f32 / identity(-0f32) != neg_inf { return 3 }
+    if MAX != identity(3.4028234663852886e38f32) { return 4 }
+    if TINY != identity(1.17549435e-38f32 * 0.5f32) || TINY <= 0f32 { return 5 }
+    if OVERFLOW != inf || identity(MAX * 2f32) != inf { return 6 }
+    nan64 := identity64(0f64 / 0f64)
+    if NAN64 == NAN64 || nan64 == nan64 { return 7 }
+    if INF64 != identity64(1f64 / 0f64) || NEG_INF64 != identity64(-1f64 / 0f64) { return 8 }
+    if 1f64 / NEG_ZERO64 != NEG_INF64 || 1f64 / identity64(-0f64) != NEG_INF64 { return 9 }
+    wide_nan := widen(nan)
+    if WIDE_NAN == WIDE_NAN || wide_nan == wide_nan { return 10 }
+    if WIDE_INF != widen(inf) || WIDE_NEG_INF != widen(neg_inf) { return 11 }
+    if 1f64 / WIDE_NEG_ZERO != NEG_INF64 || 1f64 / widen(-0f32) != NEG_INF64 { return 12 }
+    const LOCAL:f32 = NAN as f32 as f32
+    if LOCAL == LOCAL { return 13 }
+    0
+}
+"#,
+        b"",
     );
 }
 
@@ -263,7 +308,11 @@ fn checked_float_cast_boundaries_trap() {
         "(1.0 / 0.0) as i32",
         "(0.0 / 0.0) as f32",
         "(1.0 / 0.0) as f32",
+        "(-1.0 / 0.0) as f32",
+        "(0f32 / 0f32) as f32 as f64 as f32",
+        "(1f32 / 0f32) as f32 as f64 as f32",
         "3.5e38 as f32",
+        "-3.5e38 as f32",
     ] {
         let source = workspace.file(
             "trap.dodo",

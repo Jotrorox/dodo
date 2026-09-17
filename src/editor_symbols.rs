@@ -764,10 +764,15 @@ impl Index {
         }
         // Conservatively reject possible capture, including a global renamed to
         // a local in a caller. A refused rename is preferable to changing binding.
+        // Package qualifiers and import aliases do not have Symbol entries.
         !self
             .symbols
             .iter()
             .any(|s| s.key != symbol.key && s.name == new_name)
+            && !self
+                .namespaces
+                .values()
+                .any(|namespace| namespace.contains_key(new_name))
     }
 
     pub fn prepare_rename(&self, symbol: &Symbol, span: Span) -> Option<Value> {

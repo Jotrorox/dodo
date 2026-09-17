@@ -107,7 +107,10 @@ another project folder. Use `-o` to choose a different path.
 
 `fmt` accepts a file or directory. With no path, it formats the current directory.
 Directory inputs recursively include `.dodo` files, skipping hidden directories,
-`target`, `build`, and symlinks.
+`target`, `build`, `dist`, `node_modules`, `vendor`, and symlinks, using the same
+directory exclusions as test discovery. An explicitly selected file or directory
+is still processed, even when its name or parent directory would be excluded
+during recursive discovery.
 
 ```sh
 dodo fmt main.dodo
