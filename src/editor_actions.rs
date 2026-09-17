@@ -2,7 +2,7 @@
 //! layer converts them to UTF-16 and attaches the open document's version.
 use super::{local_span, symbols};
 use crate::ast::{Program, Span};
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::lexer::{self, Token, TokenKind};
 use crate::{package, parser};
 use std::collections::{BTreeMap, BTreeSet};
@@ -133,9 +133,9 @@ fn mutable_binding(
     index: &symbols::Index,
     diagnostic: &Diagnostic,
 ) -> Option<(String, Vec<Edit>)> {
-    let borrow = match diagnostic.message.as_ref() {
-        "cannot assign through an immutable binding or shared reference" => false,
-        "cannot mutably borrow an immutable binding or shared reference" => true,
+    let (borrow, binding) = match &diagnostic.kind {
+        DiagnosticKind::ImmutableAssignment(Some(binding)) => (false, binding),
+        DiagnosticKind::ImmutableBorrow(Some(binding)) => (true, binding),
         _ => return None,
     };
     let span = local_span(diagnostic.span, start);
@@ -160,15 +160,24 @@ fn mutable_binding(
         }
         _ => return None,
     };
-    let TokenKind::Ident(_) = name.kind else {
+    let TokenKind::Ident(ref name_text) = name.kind else {
         return None;
     };
+    if *name_text != binding.name || name.span != local_span(binding.usage, start) {
+        return None;
+    }
     let occurrence = index.occurrences.iter().find(|occurrence| {
         !occurrence.declaration
             && occurrence.span.start == start + name.span.start
             && occurrence.span.end == start + name.span.end
     })?;
     let symbol = &index.symbols[occurrence.symbol];
+    if symbol.name != binding.name
+        || symbol.span.start < binding.declaration.start
+        || symbol.span.end > binding.declaration.end
+    {
+        return None;
+    }
     if symbol.span.start < start || symbol.span.end > start + tokens.last()?.span.end {
         return None;
     }
@@ -218,31 +227,17 @@ fn missing_namespace(
     index: &symbols::Index,
     diagnostic: &Diagnostic,
 ) -> Option<(String, String)> {
-    let message = diagnostic.message.as_ref();
-    let unresolved_receiver = message == "cannot resolve the receiver type";
-    if !unresolved_receiver
-        && ![
-            "unknown function `",
-            "unknown binding `",
-            "unknown type `",
-            "unknown struct `",
-            "unknown variant `",
-        ]
-        .iter()
-        .any(|prefix| message.starts_with(prefix))
-    {
-        return None;
-    }
-    let span = local_span(diagnostic.span, start);
-    let namespace = if unresolved_receiver {
-        let token = tokens.iter().find(|token| token.span.start == span.start)?;
-        let TokenKind::Ident(name) = &token.kind else {
-            return None;
-        };
-        name.as_str()
-    } else {
-        message.split('`').nth(1)?.split('.').next()?
+    let name = match &diagnostic.kind {
+        DiagnosticKind::UnknownFunction(name)
+        | DiagnosticKind::UnknownBinding(name)
+        | DiagnosticKind::UnknownType(name)
+        | DiagnosticKind::UnknownStruct(name)
+        | DiagnosticKind::UnknownVariant(name)
+        | DiagnosticKind::UnresolvedReceiver(Some(name)) => name,
+        _ => return None,
     };
+    let span = local_span(diagnostic.span, start);
+    let namespace = name.split('.').next()?;
     let begin = tokens.iter().position(|token| {
         token.span.start >= span.start
             && token.span.start < span.end
@@ -535,6 +530,77 @@ mod tests {
         overlays.insert(path.to_path_buf(), text);
         let mut loaded = package::load_with_overlays(path, &overlays).unwrap();
         sema::check(&mut loaded.program).unwrap();
+    }
+
+    #[test]
+    fn mutable_fixes_use_binding_metadata_after_diagnostics_are_reworded() {
+        for source in [
+            "package app\nfn main() { let count = 1; count = 2 }\n",
+            "package app\nfn main() { let count: i32 = 1; count = 2 }\n",
+            "package app\nfn main() { let count = 1; value := &mut count; *value = 2 }\n",
+            "package app\nfn main() { let count = 1; { let count = 2; count = 3 }; _ = count }\n",
+        ] {
+            let mut document = Document::new(source.into());
+            let original = fixes(&document, &BTreeMap::new());
+            assert_eq!(original.len(), 1, "{:?}", document.diagnostics);
+            for diagnostic in &mut document.diagnostics {
+                diagnostic.message = "Reworded diagnostic without a quoted name".into();
+            }
+            let reworded = fixes(&document, &BTreeMap::new());
+            assert_eq!(reworded.len(), 1);
+            assert_eq!(reworded[0].title, original[0].title);
+            assert_eq!(reworded[0].preferred, original[0].preferred);
+            let fixed = apply(source, &reworded[0]);
+            assert_eq!(fixed, apply(source, &original[0]));
+            checked(&fixed);
+        }
+    }
+
+    #[test]
+    fn import_fixes_use_unresolved_names_after_diagnostics_are_reworded() {
+        let fixture = Fixture::new();
+        let path = fixture.path("main.dodo");
+        let overlays = BTreeMap::from([(
+            fixture.path("math.dodo"),
+            "package math\npub fn answer() -> i32 { return 42 }\npub struct Number { pub value: i32 }\npub const answer_value: i32 = 42\n".into(),
+        )]);
+        for source in [
+            "package app\nfn main() -> i32 { return math.answer() }\n",
+            "package app\nfn main(value: math.Number) {}\n",
+            "package app\nfn main() { value := math.Number { value: 42 } }\n",
+            "package app\nfn main() -> i32 { return math.answer_value }\n",
+        ] {
+            let mut document = Document::standalone(source.into(), 64, path.clone());
+            let original = fixes(&document, &overlays);
+            assert_eq!(original.len(), 1, "{:?}", document.diagnostics);
+            for diagnostic in &mut document.diagnostics {
+                diagnostic.message = "Reworded diagnostic mentioning `unrelated.symbol`".into();
+            }
+            let reworded = fixes(&document, &overlays);
+            assert_eq!(reworded.len(), 1, "{source}");
+            assert_eq!(reworded[0].title, original[0].title);
+            assert_eq!(reworded[0].preferred, original[0].preferred);
+            let fixed = apply(source, &reworded[0]);
+            assert_eq!(fixed, apply(source, &original[0]));
+            recheck(&path, fixed, &overlays);
+        }
+    }
+
+    #[test]
+    fn diagnostic_wording_alone_does_not_authorize_a_fix() {
+        for source in [
+            "package app\nfn main() { let count = 1; count = 2 }\n",
+            "package app\nfn main() { let count = 1; value := &mut count }\n",
+            "package app\nfn main() -> usize { return num.min(2, 3) }\n",
+            "package app\nfn main(value: num.ArithmeticError) {}\n",
+        ] {
+            let mut document = Document::new(source.into());
+            assert!(!fixes(&document, &BTreeMap::new()).is_empty(), "{source}");
+            for diagnostic in &mut document.diagnostics {
+                diagnostic.kind = DiagnosticKind::Unclassified;
+            }
+            assert!(fixes(&document, &BTreeMap::new()).is_empty(), "{source}");
+        }
     }
 
     #[test]

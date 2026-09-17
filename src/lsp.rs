@@ -848,7 +848,7 @@ fn to_diagnostic(diagnostic: &Diagnostic, text: &str, offset: usize) -> Value {
         message.push_str("\nnote: ");
         message.push_str(note);
     }
-    json!({
+    let mut result = json!({
         "range": Range::new(position(text, start), position(text, end)).to_json(),
         "severity": match diagnostic.severity {
             Severity::Error => 1,
@@ -856,7 +856,11 @@ fn to_diagnostic(diagnostic: &Diagnostic, text: &str, offset: usize) -> Value {
         },
         "source": "dodo",
         "message": message,
-    })
+    });
+    if let Some(code) = diagnostic.kind.code() {
+        result["code"] = json!(code);
+    }
+    result
 }
 
 /// Compiler spans are UTF-8 byte offsets; LSP columns default to UTF-16 units.

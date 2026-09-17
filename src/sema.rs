@@ -4,7 +4,7 @@
 //! based on future uses, extended across loop back edges and custom destruction.
 //! This is an intentionally conservative checker, not a formal safety proof.
 use crate::ast::*;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, DiagnosticBinding, DiagnosticKind};
 use std::collections::{HashMap, HashSet};
 
 mod generics;
@@ -468,7 +468,8 @@ impl Context {
             Type::Named(name)
                 if !self.structs.contains_key(name) && !self.enums.contains_key(name) =>
             {
-                Err(Diagnostic::new(span, format!("unknown type `{name}`")))
+                Err(Diagnostic::new(span, format!("unknown type `{name}`"))
+                    .with_kind(DiagnosticKind::UnknownType(name.as_str().into())))
             }
             Type::Generic(..) => Err(Diagnostic::new(span, "unresolved generic type")),
             Type::Array(_, t)
@@ -779,6 +780,14 @@ impl<'a> Checker<'a> {
     }
     fn by_id_mut(&mut self, id: usize) -> Option<&mut Variable> {
         self.scopes.iter_mut().flatten().find(|v| v.id == id)
+    }
+    fn diagnostic_binding(&self, place: &Place, usage: Span) -> Option<Box<DiagnosticBinding>> {
+        let variable = self.by_id(place.direct?)?;
+        Some(Box::new(DiagnosticBinding {
+            name: variable.name.clone(),
+            declaration: variable.span,
+            usage,
+        }))
     }
     fn bind(
         &mut self,
@@ -1219,7 +1228,10 @@ impl<'a> Checker<'a> {
                     return Err(Diagnostic::new(
                         target.span,
                         "cannot assign through an immutable binding or shared reference",
-                    ));
+                    )
+                    .with_kind(DiagnosticKind::ImmutableAssignment(
+                        self.diagnostic_binding(&place, target.span),
+                    )));
                 }
                 for loan in &place.loans {
                     self.conflict(loan, Access::Write, target.span)?;
@@ -2005,7 +2017,11 @@ impl<'a> Checker<'a> {
         } = &mut expression.kind
         {
             let receiver_ty = self.peek_type(receiver).ok_or_else(|| {
-                Diagnostic::new(receiver.span, "cannot resolve the receiver type")
+                Diagnostic::new(receiver.span, "cannot resolve the receiver type").with_kind(
+                    DiagnosticKind::UnresolvedReceiver(
+                        qualified_name(receiver).map(String::into_boxed_str),
+                    ),
+                )
             })?;
             let owner = match dereferenced(&receiver_ty) {
                 Type::Named(n) => n.clone(),
@@ -2351,12 +2367,10 @@ impl<'a> Checker<'a> {
                         "SplitMut must be constructed by slice.split_at_mut",
                     ));
                 }
-                let declaration = self
-                    .context
-                    .structs
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| Diagnostic::new(span, format!("unknown struct `{name}`")))?;
+                let declaration = self.context.structs.get(name).cloned().ok_or_else(|| {
+                    Diagnostic::new(span, format!("unknown struct `{name}`"))
+                        .with_kind(DiagnosticKind::UnknownStruct(name.as_str().into()))
+                })?;
                 let mut initialized = HashSet::new();
                 let mut deps = vec![];
                 for (name, expression) in fields {
@@ -2424,7 +2438,10 @@ impl<'a> Checker<'a> {
                     return Err(Diagnostic::new(
                         span,
                         "cannot mutably borrow an immutable binding or shared reference",
-                    ));
+                    )
+                    .with_kind(DiagnosticKind::ImmutableBorrow(
+                        self.diagnostic_binding(&place, operand.span),
+                    )));
                 }
                 if place.loans.is_empty() {
                     return Err(Diagnostic::new(
@@ -2981,7 +2998,8 @@ impl<'a> Checker<'a> {
                         direct: None,
                     }
                 } else {
-                    return Err(Diagnostic::new(span, format!("unknown binding `{name}`")));
+                    return Err(Diagnostic::new(span, format!("unknown binding `{name}`"))
+                        .with_kind(DiagnosticKind::UnknownBinding(name.as_str().into())));
                 }
             }
             ExprKind::Unary(UnaryOp::Deref, operand) => {
@@ -3229,7 +3247,10 @@ impl<'a> Checker<'a> {
                 .iter()
                 .find(|v| v.name == variant)
                 .cloned()
-                .ok_or_else(|| Diagnostic::new(span, format!("unknown variant `{name}`")))?;
+                .ok_or_else(|| {
+                    Diagnostic::new(span, format!("unknown variant `{name}`"))
+                        .with_kind(DiagnosticKind::UnknownVariant(name.as_str().into()))
+                })?;
             if args.len() != variant.fields.len() {
                 return Err(Diagnostic::new(
                     span,
@@ -3291,12 +3312,10 @@ impl<'a> Checker<'a> {
             *name = normalized;
             return self.intrinsic(name, type_args, args, expected, span);
         }
-        let signature = self
-            .context
-            .functions
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Diagnostic::new(span, format!("unknown function `{name}`")))?;
+        let signature = self.context.functions.get(name).cloned().ok_or_else(|| {
+            Diagnostic::new(span, format!("unknown function `{name}`"))
+                .with_kind(DiagnosticKind::UnknownFunction(name.as_str().into()))
+        })?;
         if signature.unavailable {
             return Err(Diagnostic::new(
                 span,

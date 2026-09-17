@@ -78,3 +78,14 @@ Library consumers can inspect `Diagnostic.labels` directly instead of parsing
 terminal output. Spans are byte offsets into the source passed to the parser;
 package-loaded spans use the offsets in `Loaded.sources`. Render package errors
 with `Loaded::render` so each label resolves to the correct file.
+
+Diagnostics used by quick fixes also expose a `Diagnostic.kind`. Its typed
+payload identifies the affected local binding (name, declaration span, and use
+span) or the unresolved symbol name. Use this metadata instead of matching
+English messages or extracting names from backticks. Indirect storage has no
+direct binding payload, and complex unresolved receivers have no name payload.
+
+`DiagnosticKind::code()` returns stable codes, also published in LSP diagnostics:
+`immutable-assignment`, `immutable-borrow`, `unknown-function`, `unknown-binding`,
+`unknown-type`, `unknown-struct`, `unknown-variant`, and `unresolved-receiver`.
+Other diagnostics remain `Unclassified` and have no code.

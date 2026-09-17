@@ -953,16 +953,18 @@ fn lsp_quick_fixes_apply_imports_and_mutability_and_clear_diagnostics() {
     let uri = workspace.uri("main.dodo");
     let mut client = Client::start("lsp");
     client.initialize("file");
-    for (version, source, title) in [
+    for (version, source, title, code) in [
         (
             1,
             "// 😀 keep this header\r\npackage app\r\nfn main() -> i32 { return numbers.value() }\r\n",
             "import",
+            "unresolved-receiver",
         ),
         (
             3,
             "package app\nfn main() -> i32 {\n_ = \"😀\"; let count = 1i32\ncount = 2\nreturn count\n}\n",
             "mutable",
+            "immutable-assignment",
         ),
     ] {
         if version == 1 {
@@ -972,6 +974,7 @@ fn lsp_quick_fixes_apply_imports_and_mutability_and_clear_diagnostics() {
         }
         let diagnostics = client.diagnostics()[&uri]["diagnostics"].clone();
         assert!(!diagnostics.as_array().unwrap().is_empty());
+        assert_eq!(diagnostics[0]["code"], code);
         let response = range_query(
             &mut client,
             "codeAction",
@@ -992,6 +995,7 @@ fn lsp_quick_fixes_apply_imports_and_mutability_and_clear_diagnostics() {
             .expect("actionable fix");
         assert_eq!(action["kind"], "quickfix");
         assert!(!action["diagnostics"].as_array().unwrap().is_empty());
+        assert_eq!(action["diagnostics"][0]["code"], code);
         let fixed = apply_text_edits(source, &action["edit"]["changes"][&uri]);
         assert_ne!(fixed, source);
         if title == "import" {

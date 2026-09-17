@@ -1,4 +1,5 @@
 //! Source-level ownership diagnostics and the editor's public stdio interface.
+use dodoc::diagnostic::DiagnosticKind;
 use dodoc::{parser, sema};
 #[cfg(feature = "llvm")]
 use std::fs;
@@ -119,6 +120,93 @@ fn borrowing_example_checks_and_runs() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn unresolved_diagnostics_expose_kinds_codes_and_symbol_names() {
+    for (source, expected, code) in [
+        (
+            "package app\nfn main() { missing() }\n",
+            DiagnosticKind::UnknownFunction("missing".into()),
+            "unknown-function",
+        ),
+        (
+            "package app\nfn main() { _ = missing }\n",
+            DiagnosticKind::UnknownBinding("missing".into()),
+            "unknown-binding",
+        ),
+        (
+            "package app\nfn main(value: missing.Type) {}\n",
+            DiagnosticKind::UnknownType("missing.Type".into()),
+            "unknown-type",
+        ),
+        (
+            "package app\nfn main() { _ = missing.Record { value: 1 } }\n",
+            DiagnosticKind::UnknownStruct("missing.Record".into()),
+            "unknown-struct",
+        ),
+        (
+            "package app\nenum Choice { Yes }\nfn main() { _ = Choice.No() }\n",
+            DiagnosticKind::UnknownVariant("Choice.No".into()),
+            "unknown-variant",
+        ),
+        (
+            "package app\nfn main() { missing.answer() }\n",
+            DiagnosticKind::UnresolvedReceiver(Some("missing".into())),
+            "unresolved-receiver",
+        ),
+    ] {
+        let mut program = parser::parse(source).unwrap();
+        let diagnostic = sema::check(&mut program).unwrap_err();
+        assert_eq!(diagnostic.kind, expected, "{diagnostic:?}");
+        assert_eq!(diagnostic.kind.code(), Some(code));
+    }
+}
+
+#[test]
+fn immutable_diagnostics_identify_the_affected_binding_and_usage() {
+    for (operation, code) in [
+        ("count = 3", "immutable-assignment"),
+        ("_ = &mut count", "immutable-borrow"),
+    ] {
+        let source = format!(
+            "package app\nfn main() {{ let count = 1; {{ let count = 2; {operation} }}; _ = count }}\n"
+        );
+        let mut program = parser::parse(&source).unwrap();
+        let diagnostic = sema::check(&mut program).unwrap_err();
+        assert_eq!(diagnostic.kind.code(), Some(code));
+        let (DiagnosticKind::ImmutableAssignment(Some(binding))
+        | DiagnosticKind::ImmutableBorrow(Some(binding))) = diagnostic.kind
+        else {
+            panic!("missing binding metadata: {diagnostic:?}");
+        };
+        assert_eq!(binding.name, "count");
+        assert_eq!(
+            binding.declaration.start,
+            source.find("let count = 2").unwrap()
+        );
+        assert_eq!(&source[binding.usage.start..binding.usage.end], "count");
+        assert!(binding.usage.start >= source.find(operation).unwrap());
+    }
+}
+
+#[test]
+fn immutable_indirect_storage_does_not_identify_a_direct_binding() {
+    for source in [
+        "package app\nfn main() { let value = 1; let view = &value; *view = 2 }\n",
+        "package app\nfn main() { let value = 1; let view = &value; _ = &mut *view }\n",
+        "package app\nstruct S { n: i32 }\nfn main() { let value = S { n: 1 }; value.n = 2 }\n",
+    ] {
+        let mut program = parser::parse(source).unwrap();
+        let diagnostic = sema::check(&mut program).unwrap_err();
+        assert!(
+            matches!(
+                diagnostic.kind,
+                DiagnosticKind::ImmutableAssignment(None) | DiagnosticKind::ImmutableBorrow(None)
+            ),
+            "{diagnostic:?}"
+        );
+    }
 }
 
 #[test]

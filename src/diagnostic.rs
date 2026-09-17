@@ -30,9 +30,55 @@ pub struct DiagnosticLabel {
     pub style: LabelStyle,
 }
 
+/// A direct local binding affected by an operation. These spans use the same
+/// (possibly package-wide) byte offsets as the diagnostic's primary span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticBinding {
+    pub name: String,
+    pub declaration: Span,
+    pub usage: Span,
+}
+
+/// Machine-readable meaning, independent of the diagnostic's displayed text.
+/// Payloads are boxed to keep recursive parser results compact. Names may be
+/// qualified; binding metadata is absent for indirect storage such as fields
+/// and dereferences. Unresolved receivers have a name only for a simple path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DiagnosticKind {
+    #[default]
+    Unclassified,
+    ImmutableAssignment(Option<Box<DiagnosticBinding>>),
+    ImmutableBorrow(Option<Box<DiagnosticBinding>>),
+    UnknownFunction(Box<str>),
+    UnknownBinding(Box<str>),
+    UnknownType(Box<str>),
+    UnknownStruct(Box<str>),
+    UnknownVariant(Box<str>),
+    UnresolvedReceiver(Option<Box<str>>),
+}
+
+impl DiagnosticKind {
+    /// Stable public codes for editor and library consumers. Unclassified
+    /// diagnostics intentionally have no code until their meaning is modeled.
+    pub fn code(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Unclassified => return None,
+            Self::ImmutableAssignment(_) => "immutable-assignment",
+            Self::ImmutableBorrow(_) => "immutable-borrow",
+            Self::UnknownFunction(_) => "unknown-function",
+            Self::UnknownBinding(_) => "unknown-binding",
+            Self::UnknownType(_) => "unknown-type",
+            Self::UnknownStruct(_) => "unknown-struct",
+            Self::UnknownVariant(_) => "unknown-variant",
+            Self::UnresolvedReceiver(_) => "unresolved-receiver",
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub severity: Severity,
+    pub kind: DiagnosticKind,
     pub span: Span,
     // A boxed message keeps recursive parser results compact alongside metadata.
     pub message: Box<str>,
@@ -43,6 +89,7 @@ impl Diagnostic {
     pub fn new(span: Span, message: impl Into<String>) -> Self {
         Self {
             severity: Severity::Error,
+            kind: DiagnosticKind::Unclassified,
             span,
             message: message.into().into_boxed_str(),
             notes: vec![],
@@ -54,6 +101,10 @@ impl Diagnostic {
             severity: Severity::Warning,
             ..Self::new(span, message)
         }
+    }
+    pub fn with_kind(mut self, kind: DiagnosticKind) -> Self {
+        self.kind = kind;
+        self
     }
     pub fn note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
