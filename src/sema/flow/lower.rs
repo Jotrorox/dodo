@@ -1,7 +1,7 @@
 //! A deliberately small source adapter, independent of sema and AST annotations.
 //! Failure discards the entire body; unsupported nodes never become no-ops.
 use super::*;
-use dodoc::ast::{self, Expr, ExprKind, Function, Program, StmtKind, UnaryOp};
+use crate::ast::{self, BinaryOp, Expr, ExprKind, Function, Program, StmtKind, UnaryOp};
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -21,6 +21,47 @@ fn unsupported<T>(span: Span, reason: &str) -> Result<T> {
 /// Signatures are checked, but calls assume normal return and no hidden moves.
 /// Neither this adapter nor initialization() validates borrowing or full Dodo.
 pub fn lower(program: &Program, name: &str) -> Result<Body> {
+    lower_for_target(program, name, 64)
+}
+
+pub fn lower_for_target(program: &Program, name: &str, pointer_bits: u32) -> Result<Body> {
+    Adapter::new(program, pointer_bits)?.lower(name)
+}
+
+/// Validate the declaration subset once when checking a complete program.
+pub(crate) struct Adapter<'a> {
+    program: &'a Program,
+    pointer_bits: u32,
+}
+impl<'a> Adapter<'a> {
+    pub(crate) fn new(program: &'a Program, pointer_bits: u32) -> Result<Self> {
+        validate(program, pointer_bits)?;
+        Ok(Self {
+            program,
+            pointer_bits,
+        })
+    }
+    fn lower(&self, name: &str) -> Result<Body> {
+        let function = self
+            .program
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| Limitation {
+                span: Span::default(),
+                reason: format!("missing function `{name}`"),
+            })?;
+        self.lower_function(function)
+    }
+    pub(crate) fn lower_function(&self, function: &Function) -> Result<Body> {
+        lower_function(self.program, function, self.pointer_bits)
+    }
+}
+
+fn validate(program: &Program, pointer_bits: u32) -> Result<()> {
+    if !matches!(pointer_bits, 32 | 64) {
+        return unsupported(Span::default(), "unsupported target pointer width");
+    }
     if !program.imports.is_empty() || !program.constants.is_empty() || !program.enums.is_empty() {
         return unsupported(
             Span::default(),
@@ -71,14 +112,10 @@ pub fn lower(program: &Program, name: &str) -> Result<Body> {
             }
         }
     }
-    let function = program
-        .functions
-        .iter()
-        .find(|f| f.name == name)
-        .ok_or_else(|| Limitation {
-            span: Span::default(),
-            reason: format!("missing function `{name}`"),
-        })?;
+    Ok(())
+}
+
+fn lower_function(program: &Program, function: &Function, pointer_bits: u32) -> Result<Body> {
     let body = function.body.as_ref().ok_or_else(|| Limitation {
         span: function.span,
         reason: "bodyless functions are unsupported".into(),
@@ -93,6 +130,7 @@ pub fn lower(program: &Program, name: &str) -> Result<Body> {
         scopes: vec![Scope::default()],
         loops: vec![],
         current: Some(0),
+        pointer_bits,
     };
     lower.block_id();
     for parameter in &function.params {
@@ -147,6 +185,7 @@ struct Lower<'a> {
     scopes: Vec<Scope>,
     loops: Vec<Loop>,
     current: Option<BlockId>,
+    pointer_bits: u32,
 }
 impl Lower<'_> {
     fn block_id(&mut self) -> BlockId {
@@ -214,6 +253,118 @@ impl Lower<'_> {
             Operand::Move(place)
         }
     }
+    fn constant(&mut self, ty: Type, span: Span) -> Place {
+        let target = self.local("$computed", ty.clone(), span);
+        self.emit(
+            Operation::Assign {
+                target,
+                value: Operand::Constant(ty),
+            },
+            span,
+        );
+        target
+    }
+
+    // Projection roots are stable local identities; their address is captured
+    // once, before any RHS evaluation. Aliasing/reservations remain in sema.
+    fn destination(&self, expression: &Expr, write: bool) -> Result<Destination> {
+        match &expression.kind {
+            ExprKind::Name(_) => {
+                let root = self.place(expression, write)?;
+                Ok(Destination {
+                    root,
+                    projections: vec![],
+                    ty: self.body.locals[root.0].ty.clone(),
+                })
+            }
+            ExprKind::Unary(UnaryOp::Deref, base) => {
+                let mut destination = self.destination(base, false)?;
+                let Type::Ref(mutable, inner) = destination.ty else {
+                    return unsupported(
+                        expression.span,
+                        "dereference requires a checked reference",
+                    );
+                };
+                if write && !mutable {
+                    return unsupported(expression.span, "write through shared reference");
+                }
+                destination.ty = *inner;
+                destination.projections.push(Projection::Deref);
+                Ok(destination)
+            }
+            ExprKind::Field(base, name) => {
+                let mut destination = self.destination(base, false)?;
+                if matches!(destination.ty, Type::Ref(..)) {
+                    let Type::Ref(mutable, inner) = destination.ty else {
+                        unreachable!()
+                    };
+                    if write && !mutable {
+                        return unsupported(expression.span, "write through shared reference");
+                    }
+                    destination.ty = *inner;
+                    destination.projections.push(Projection::Deref);
+                } else if write {
+                    // Enforce binding mutability when no reference grants access.
+                    self.destination(base, true)?;
+                }
+                let Type::Named(structure) = &destination.ty else {
+                    return unsupported(expression.span, "field requires a struct");
+                };
+                let Some(field) = self
+                    .program
+                    .structs
+                    .iter()
+                    .find(|s| &s.name == structure)
+                    .and_then(|s| s.fields.iter().find(|f| &f.name == name))
+                else {
+                    return unsupported(expression.span, "unknown struct field");
+                };
+                destination.ty = field.ty.clone();
+                destination
+                    .projections
+                    .push(Projection::Field(name.clone()));
+                Ok(destination)
+            }
+            _ => unsupported(expression.span, "assignment destination outside subset"),
+        }
+    }
+    fn capture(&mut self, destination: Destination, span: Span) -> Place {
+        let target = self.local(
+            "$address",
+            Type::Ref(true, Box::new(destination.ty.clone())),
+            span,
+        );
+        self.emit(
+            Operation::Capture {
+                target,
+                destination,
+            },
+            span,
+        );
+        target
+    }
+    fn load(&mut self, address: Place, span: Span) -> Place {
+        let Type::Ref(_, ty) = &self.body.locals[address.0].ty else {
+            unreachable!()
+        };
+        let target = self.local("$loaded", *ty.clone(), span);
+        self.emit(Operation::Load { target, address }, span);
+        target
+    }
+    fn binary_type(&self, op: BinaryOp, ty: &Type, span: Span) -> Result<Type> {
+        use BinaryOp::*;
+        match op {
+            And | Or if *ty == Type::Bool => Ok(Type::Bool),
+            Eq | Ne if scalar(ty) => Ok(Type::Bool),
+            Lt | Le | Gt | Ge if ty.is_integer() => Ok(Type::Bool),
+            Add | Sub | Mul | Div | Rem | BitAnd | BitOr | BitXor | Shl | Shr
+                if ty.is_integer() =>
+            {
+                Ok(ty.clone())
+            }
+            _ => unsupported(span, "operator type mismatch"),
+        }
+    }
     fn expect(&self, expected: &Type, actual: &Type, span: Span) -> Result<()> {
         if expected == actual {
             Ok(())
@@ -237,6 +388,30 @@ impl Lower<'_> {
             }
         }
     }
+    fn finish_temporaries(&mut self, start: usize, span: Span) {
+        let mut departing = Vec::new();
+        for scope in &mut self.scopes {
+            scope.locals.retain(|place| {
+                let temporary = place.0 >= start && self.body.locals[place.0].name.starts_with('$');
+                if temporary {
+                    departing.push(*place);
+                }
+                !temporary
+            });
+        }
+        departing.sort_by_key(|place| std::cmp::Reverse(place.0));
+        for place in departing {
+            self.emit(Operation::Cleanup(place), span);
+        }
+    }
+    fn condition(&mut self, expression: &Expr) -> Result<Operand> {
+        let start = self.body.locals.len();
+        self.expr(expression, Some(&Type::Bool))?;
+        self.finish_temporaries(start, expression.span);
+        // Values are abstract: the expression's reads/moves have happened, and
+        // both Boolean successors remain possible even for literal conditions.
+        Ok(Operand::Constant(Type::Bool))
+    }
     fn scoped(&mut self, block: &ast::Block, span: Span) -> Result<()> {
         self.scopes.push(Scope::default());
         self.statements(block)?;
@@ -246,7 +421,7 @@ impl Lower<'_> {
         self.scopes.pop();
         Ok(())
     }
-    fn statements(&mut self, block: &ast::Block) -> Result<()> {
+    fn statements(&mut self, block: &[ast::Stmt]) -> Result<()> {
         for statement in block {
             if self.current.is_none() {
                 return unsupported(
@@ -255,6 +430,7 @@ impl Lower<'_> {
                 );
             }
             let span = statement.span;
+            let temporary_start = self.body.locals.len();
             match &statement.kind {
                 StmtKind::Let {
                     name,
@@ -293,24 +469,49 @@ impl Lower<'_> {
                     }
                 }
                 StmtKind::Assign { target, op, value } => {
-                    if op.is_some() {
-                        return unsupported(span, "compound assignment is unsupported");
-                    }
                     if matches!(&target.kind, ExprKind::Name(n) if n == "_") {
+                        if op.is_some() {
+                            return unsupported(span, "compound discard is unsupported");
+                        }
                         let value = self.expr(value, None)?;
                         self.emit(Operation::Cleanup(value), span);
                     } else {
-                        let target = self.place(target, true)?;
-                        let ty = self.body.locals[target.0].ty.clone();
+                        let destination = self.destination(target, true)?;
+                        let ty = destination.ty.clone();
+                        let root = destination.root;
+                        let address = if destination.projections.is_empty() {
+                            None
+                        } else {
+                            Some(self.capture(destination, target.span))
+                        };
+                        if let Some(op) = op {
+                            self.binary_type(*op, &ty, span)?;
+                            // Read the previous value before evaluating the RHS.
+                            if let Some(address) = address {
+                                self.load(address, target.span);
+                            } else {
+                                self.expr(target, Some(&ty))?;
+                            }
+                        }
                         let value = self.expr(value, Some(&ty))?;
-                        self.emit(Operation::Cleanup(target), span);
-                        self.emit(
-                            Operation::Assign {
-                                target,
-                                value: self.operand(value),
-                            },
-                            span,
-                        );
+                        if let Some(address) = address {
+                            self.emit(
+                                Operation::Store {
+                                    address,
+                                    value: self.operand(value),
+                                },
+                                span,
+                            );
+                        } else {
+                            self.emit(Operation::Cleanup(root), span);
+                            self.emit(
+                                Operation::Assign {
+                                    target: root,
+                                    value: self.operand(value),
+                                },
+                                span,
+                            );
+                        }
                     }
                 }
                 StmtKind::Expr(expression) => {
@@ -336,18 +537,11 @@ impl Lower<'_> {
                     then_block,
                     else_block,
                 } => {
-                    let condition = self.expr(condition, Some(&Type::Bool))?;
+                    let condition = self.condition(condition)?;
                     let yes = self.block_id();
                     let no = self.block_id();
                     let join = self.block_id();
-                    self.end(
-                        Terminator::Branch {
-                            condition: self.operand(condition),
-                            yes,
-                            no,
-                        },
-                        span,
-                    );
+                    self.end(Terminator::Branch { condition, yes, no }, span);
                     self.current = Some(yes);
                     self.scoped(then_block, span)?;
                     let then_continues = self.current.is_some();
@@ -374,10 +568,10 @@ impl Lower<'_> {
                     self.end(Terminator::Goto(header), span);
                     self.current = Some(header);
                     if let Some(condition) = condition {
-                        let condition = self.expr(condition, Some(&Type::Bool))?;
+                        let condition = self.condition(condition)?;
                         self.end(
                             Terminator::Branch {
-                                condition: self.operand(condition),
+                                condition,
                                 yes: run,
                                 no: exit,
                             },
@@ -418,6 +612,9 @@ impl Lower<'_> {
                     );
                 }
             }
+            if self.current.is_some() {
+                self.finish_temporaries(temporary_start, span);
+            }
         }
         Ok(())
     }
@@ -447,15 +644,11 @@ impl Lower<'_> {
                 let Type::Int { signed, bits } = ty else {
                     return unsupported(span, "integer literal requires integer type");
                 };
-                // Bound the adapter to 64-bit targets; production width handling is unchanged.
-                let bits = if bits == 0 { 64 } else { bits };
+                let bits = if bits == 0 { self.pointer_bits } else { bits };
                 if !(1..=64).contains(&bits)
                     || u128::from(*number) >= (1u128 << (bits - u32::from(signed)))
                 {
-                    return unsupported(
-                        span,
-                        "integer literal outside 64-bit prototype target range",
-                    );
+                    return unsupported(span, "integer literal outside target range");
                 }
                 let target = self.local("$integer", ty.clone(), span);
                 self.emit(
@@ -478,6 +671,110 @@ impl Lower<'_> {
                     span,
                 );
                 target
+            }
+            ExprKind::ValueBlock(block) => {
+                let Some((last, statements)) = block.split_last() else {
+                    return unsupported(span, "empty value block");
+                };
+                let StmtKind::Yield(value) = &last.kind else {
+                    return unsupported(span, "value block requires a final yield");
+                };
+                self.scopes.push(Scope::default());
+                self.statements(statements)?;
+                if self.current.is_none() {
+                    return unsupported(span, "diverging value block is unsupported");
+                }
+                let value = self.expr(value, expected)?;
+                // The yielded temporary leaves this scope with its value intact.
+                self.cleanup(self.scopes.len() - 1, Some(value), span);
+                self.scopes.pop();
+                self.scopes.last_mut().unwrap().locals.push(value);
+                value
+            }
+            ExprKind::Binary(op @ (BinaryOp::And | BinaryOp::Or), left, right) => {
+                let left = self.expr(left, Some(&Type::Bool))?;
+                let target = self.local("$logical", Type::Bool, span);
+                let evaluate = self.block_id();
+                let skipped = self.block_id();
+                let join = self.block_id();
+                let (yes, no) = if *op == BinaryOp::And {
+                    (evaluate, skipped)
+                } else {
+                    (skipped, evaluate)
+                };
+                self.end(
+                    Terminator::Branch {
+                        condition: self.operand(left),
+                        yes,
+                        no,
+                    },
+                    span,
+                );
+                self.current = Some(evaluate);
+                let right = self.expr(right, Some(&Type::Bool))?;
+                self.emit(
+                    Operation::Assign {
+                        target,
+                        value: self.operand(right),
+                    },
+                    span,
+                );
+                self.end(Terminator::Goto(join), span);
+                self.current = Some(skipped);
+                self.emit(
+                    Operation::Assign {
+                        target,
+                        value: Operand::Constant(Type::Bool),
+                    },
+                    span,
+                );
+                self.end(Terminator::Goto(join), span);
+                self.current = Some(join);
+                target
+            }
+            ExprKind::Binary(op, left, right) => {
+                let left = self.expr(left, expected.filter(|ty| ty.is_integer()))?;
+                let ty = self.body.locals[left.0].ty.clone();
+                self.expr(right, Some(&ty))?;
+                let result_ty = self.binary_type(*op, &ty, span)?;
+                self.constant(result_ty, span)
+            }
+            ExprKind::Unary(op @ (UnaryOp::Not | UnaryOp::BitNot), value) => {
+                let value = self.expr(value, expected)?;
+                let ty = self.body.locals[value.0].ty.clone();
+                if !matches!((op, &ty), (UnaryOp::Not, Type::Bool))
+                    && !(*op == UnaryOp::BitNot && ty.is_integer())
+                {
+                    return unsupported(span, "unary operator type mismatch");
+                }
+                self.constant(ty, span)
+            }
+            ExprKind::Field(..) | ExprKind::Unary(UnaryOp::Deref, _) => {
+                let destination = self.destination(expression, false)?;
+                if !destination.ty.is_copy() {
+                    return unsupported(span, "moves out of projected storage are unsupported");
+                }
+                let address = self.capture(destination, span);
+                self.load(address, span)
+            }
+            ExprKind::Struct(name, fields) => {
+                let Some(structure) = self.program.structs.iter().find(|s| &s.name == name) else {
+                    return unsupported(span, "unknown struct");
+                };
+                let mut seen = std::collections::HashSet::new();
+                for (name, value) in fields {
+                    let Some(field) = structure.fields.iter().find(|f| &f.name == name) else {
+                        return unsupported(value.span, "unknown struct field");
+                    };
+                    if !seen.insert(name) {
+                        return unsupported(value.span, "duplicate struct field");
+                    }
+                    self.expr(value, Some(&field.ty))?;
+                }
+                if seen.len() != structure.fields.len() {
+                    return unsupported(span, "missing struct field");
+                }
+                self.constant(Type::Named(name.clone()), span)
             }
             ExprKind::Unary(op @ (UnaryOp::Borrow | UnaryOp::BorrowMut), source) => {
                 let mutable = *op == UnaryOp::BorrowMut;
@@ -533,7 +830,7 @@ impl Lower<'_> {
             _ => {
                 return unsupported(
                     span,
-                    "expression outside subset (operators, projections, aggregates, methods, casts, or propagation)",
+                    "expression outside subset (unsupported operator, projection, aggregate, method, cast, or propagation)",
                 );
             }
         };

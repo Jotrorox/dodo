@@ -7,6 +7,8 @@ use crate::ast::*;
 use crate::diagnostic::{Diagnostic, DiagnosticBinding, DiagnosticKind};
 use std::collections::{HashMap, HashSet};
 
+#[doc(hidden)]
+pub mod flow;
 mod generics;
 mod ownership;
 mod slices;
@@ -75,7 +77,31 @@ fn check_program(
             diagnostics.push(error);
         }
     }
-    for function in &mut program.functions {
+    // First adoption stage: an additional initialization/move check for bodies
+    // fully covered by the adapter. Lower before AST checking mutates bodies;
+    // unsupported bodies keep the existing checker, and its diagnostics win.
+    // Keep only diagnostics, not every body's graph or fixed-point states.
+    let flow_adapter = flow::Adapter::new(program, pointer_bits).ok();
+    let flow_diagnostics: Vec<_> = program
+        .functions
+        .iter()
+        .map(|function| {
+            if function.body.is_none() || context.functions[&function.name].unavailable {
+                return None;
+            }
+            flow_adapter
+                .as_ref()?
+                .lower_function(function)
+                .ok()
+                .and_then(|body| {
+                    body.initialization()
+                        .issues
+                        .first()
+                        .map(|issue| issue.diagnostic())
+                })
+        })
+        .collect();
+    for (function, flow_diagnostic) in program.functions.iter_mut().zip(flow_diagnostics) {
         if function.body.is_none() || context.functions[&function.name].unavailable {
             continue;
         }
@@ -151,6 +177,9 @@ fn check_program(
                 ));
             }
             checker.finish_scope(function.span)?;
+            if !had_errors && let Some(diagnostic) = flow_diagnostic {
+                return Err(diagnostic);
+            }
             Ok(())
         })();
         if let Err(error) = result {
