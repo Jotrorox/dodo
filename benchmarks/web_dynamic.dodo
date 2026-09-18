@@ -1,0 +1,42 @@
+package web_dynamic
+import "core/ptr"
+import "std/console"
+import "std/io"
+import "std/time/hosted"
+import "std/web"
+
+fn main() {
+    input := console.stdin()
+    header := [0u8; 16]
+    io.read_exact(&mut input, &mut header)!
+    iterations := 0u64
+    for i in 0usize..8 {
+        iterations |=(header[i] as u64) << ((i * 8) as u64)
+    }
+    routes := [
+        // ROUTES
+    ]
+    paths := [
+        // PATHS
+    ]
+    index := [0usize; 512]
+    router := if header[8] == 0 {
+        web.Router.new(&routes)!
+    } else {
+        web.Router.indexed(&routes, &mut index)!
+    }
+    checksum := 0u64
+    clock := hosted.MonotonicClock.new()
+    start := clock.now()!
+    for i in 0u64..iterations {
+        index := (unsafe {
+            ptr.read_volatile(ptr.from_ref(&i))
+        } % routes.len as u64) as usize
+        found := router.find(b"GET", paths[index])!
+        assert_eq(found.id, index)
+        checksum += found.id as u64
+    }
+    end := clock.now()!
+    elapsed := end.duration_since(&start)!
+    console.printf("{} {}\n", elapsed.to_nanos()!, checksum)!
+}

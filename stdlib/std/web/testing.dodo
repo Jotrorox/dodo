@@ -70,8 +70,9 @@ pub struct Response {
         return &self.data[..self.used]
     }
     pub fn header(&self, name: &[u8]) -> Option<&[u8]> from(self) {
-        for i in 0usize..HEADER_FIELDS {
-            match web.field_at(&self.headers[..self.header_used], i) {
+        cursor := 0usize
+        for true {
+            match self.header_next(&mut cursor) {
                 some(field) => {
                     if http.equal_ascii(field.name, name) {
                         return some(field.value)
@@ -86,6 +87,9 @@ pub struct Response {
     }
     pub fn header_at(&self, index: usize) -> Option<http.Header> from(self) {
         return web.field_at(&self.headers[..self.header_used], index)
+    }
+    pub fn header_next(&self, cursor: &mut usize) -> Option<http.Header> from(self) {
+        return web.field_next(&self.headers[..self.header_used], cursor)
     }
 }
 fn rejection(reason: web.Error, status: u16) -> web.Failure {
@@ -117,10 +121,10 @@ fn execute<H>(router: &web.Router, handler: &mut H, input: &Request, output: &mu
     if raw.len == 0 {
         raw = b"/"
     }
-    path_used := 0usize
-    match web.decode_path(raw, &mut path) {
-        ok(count) => {
-            path_used = count
+    decoded: web.Path
+    match web.Path.decode(raw, &mut path) {
+        ok(value) => {
+            decoded = value
         }
         err(reason) => {
             code := 400u16
@@ -144,7 +148,7 @@ fn execute<H>(router: &web.Router, handler: &mut H, input: &Request, output: &mu
         }
     }
     found: web.Match
-    match router.find(input.method, &path[..path_used]) {
+    match router.find_path(input.method, &decoded) {
         ok(value) => {
             found = value
         }
@@ -156,7 +160,7 @@ fn execute<H>(router: &web.Router, handler: &mut H, input: &Request, output: &mu
             return err(rejection(reason, code))
         }
     }
-    request := web.Request.new(input.method, &path[..path_used], &input.headers[..input.header_used],
+    request := web.Request.new(input.method, decoded.bytes(), &input.headers[..input.header_used],
     &query[..query_used], input.data, router, found.index, found.id, 1)
     return web.handle(handler, &mut request, output)
 }
@@ -164,21 +168,23 @@ fn execute<H>(router: &web.Router, handler: &mut H, input: &Request, output: &mu
 // Exercises decoding, routing, middleware, state, and response helpers. It does
 // not simulate the wire parser, transport, timeouts, or custom server limits.
 pub fn send<H>(routes: &[web.Route], handler: &mut H, input: &Request) -> Response {
-    result := Response { code: 0, header_used: 0, headers: [0u8; HEADER_BYTES], data: [0u8; BODY_BYTES], used: 0, failure: none }
     router: web.Router
     match web.Router.new(routes) {
         ok(value) => {
             router = value
         }
         err(reason) => {
-            result.code = 500
-            result.failure = some(web.failure(reason))
-            return result
+            return Response { code: 500, header_used: 0, headers: [0u8; HEADER_BYTES], data: [0u8; BODY_BYTES], used: 0, failure: some(web.failure(reason)) }
         }
     }
+    return send_router(&router, handler, input)
+}
+// Reuse a previously validated route table for repeated in-process requests.
+pub fn send_router<H>(router: &web.Router, handler: &mut H, input: &Request) -> Response {
+    result := Response { code: 0, header_used: 0, headers: [0u8; HEADER_BYTES], data: [0u8; BODY_BYTES], used: 0, failure: none }
     output := web.Response.new(&mut result.headers, HEADER_FIELDS, &mut result.data)
     problem: Option<web.Failure> = none
-    match execute(&router, handler, input, &mut output) {
+    match execute(router, handler, input, &mut output) {
         ok() => {}
         err(reason) => {
             problem = some(reason)
@@ -186,17 +192,7 @@ pub fn send<H>(routes: &[web.Route], handler: &mut H, input: &Request) -> Respon
     }
     code := output.status()
     used := output.body().len
-    header_used := 0usize
-    for i in 0usize..HEADER_FIELDS {
-        match output.header_at(i) {
-            some(field) => {
-                header_used += field.name.len + field.value.len + 2
-            }
-            none => {
-                break
-            }
-        }
-    }
+    header_used := output.header_bytes()
     core.drop(output)
     match &problem {
         some(reason) => {

@@ -6,6 +6,8 @@ library changes. Baseline numbers are in [RESULTS.md](RESULTS.md). The key-index
 proposal has since been implemented; see [measurements and validation](JSON-INDEXED.md).
 Sequential array decoding has also been implemented; see its
 [before/after measurements](JSON-ARRAYS.md).
+The four primary web changes are also implemented; see [web measurements and
+validation](WEB.md) for their scope and remaining prefix-group scans.
 
 The best first targets are JSON duplicate detection and derived decoding, plus
 web header traversal and reuse of validated route metadata in in-process

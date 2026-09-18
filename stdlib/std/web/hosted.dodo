@@ -2,6 +2,10 @@ package hosted
 
 import "core/bytes"
 import "core/slice"
+import "core/mem"
+import "core/ptr"
+import "alloc/layout"
+import "std/thread/native" as allocation
 import "std/http"
 import "std/http/connection"
 import "std/http/hosting"
@@ -16,6 +20,52 @@ pub const REQUEST_HEADER_BYTES: usize = 16384
 pub const RESPONSE_HEADER_BYTES: usize = 4096
 pub const RESPONSE_HEADER_FIELDS: usize = 32
 pub const WORKSPACE_BYTES: usize = 61440
+
+// Use the runner's inline buffer when it fits; otherwise own one allocation
+// for the serving lifetime. The owner itself stays small and movable.
+pub struct RouteIndex {
+    small: &mut[usize]
+    pointer: *mut usize
+    length: usize
+    pub fn new(routes: usize, small: &mut[usize]) -> RouteIndex!hosting.Error from(small) {
+        if routes > layout.max_size() / mem.size_of::<usize>() / 2 {
+            return err(hosting.failure(hosting.ErrorKind.Workspace))
+        }
+        empty := unsafe {
+            0usize as *mut usize
+        }
+        result := RouteIndex { small: small, pointer: empty, length: routes * 2 }
+        if result.length > result.small.len {
+            code := 0i32
+            unsafe {
+                result.pointer = allocation.dodo_thread_allocate(result.length * mem.size_of::<usize>(),
+                mem.align_of::<usize>(), ptr.from_mut(&mut code)) as *mut usize
+                if ptr.is_null(result.pointer) {
+                    return err(hosting.failure(hosting.ErrorKind.Workspace))
+                }
+                for i in 0usize..result.length {
+                    ptr.write(ptr.offset(result.pointer, i as isize), 0usize)
+                }
+            }
+        }
+        return ok(result)
+    }
+    pub fn storage(&mut self) -> &mut[usize] {
+        if self.length <= self.small.len {
+            return &mut self.small[..self.length]
+        }
+        unsafe {
+            return ptr.borrow_slice_mut(self.pointer, self.length, self)
+        }
+    }
+    fn drop(&mut self) {
+        if!ptr.is_null(self.pointer) {
+            unsafe {
+                allocation.dodo_thread_free(self.pointer as *mut u8, self.length * mem.size_of::<usize>())
+            }
+        }
+    }
+}
 pub struct Config {
     pub backlog: u32
     pub header_bytes: usize
@@ -144,8 +194,9 @@ pub fn response_head(driver: &mut connection.Connection, response: &web.Response
     empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(), empty_header(),
     empty_header()]
     count := 0usize
+    cursor := 0usize
     for count < RESPONSE_HEADER_FIELDS {
-        match response.header_at(count) {
+        match response.header_next(&mut cursor) {
             none => {
                 break
             }
@@ -155,7 +206,7 @@ pub fn response_head(driver: &mut connection.Connection, response: &web.Response
         }
         count += 1
     }
-    match response.header_at(RESPONSE_HEADER_FIELDS) {
+    match response.header_next(&mut cursor) {
         some(_) => {
             return err(hosting.web_error(web.failure(web.Error.HeaderLimit), hosting.ErrorKind.Handler))
         }
@@ -186,13 +237,15 @@ pub fn bodyless(method: &[u8], code: u16) -> bool {
 }
 pub struct Target {
     pub path: usize;
+    pub validated: web.Path;
     pub query: usize
 }
-pub fn decode_target(target: &[u8], path_buffer: &mut[u8], query_buffer: &mut[u8], config: &Config) -> Target!hosting.Error {
+pub fn decode_target(target: &[u8], path_buffer: &mut[u8], query_buffer: &mut[u8], config: &Config) -> Target!hosting.Error from(path_buffer) {
     if config.path_bytes > path_buffer.len || config.query_bytes > query_buffer.len {
         return err(hosting.failure(hosting.ErrorKind.Workspace))
     }
-    result := Target { path: 0, query: 0 }
+    path: web.Path
+    query := 0usize
     uri: http.Uri
     match http.Uri.parse(target) {
         ok(value) => {
@@ -206,9 +259,9 @@ pub fn decode_target(target: &[u8], path_buffer: &mut[u8], query_buffer: &mut[u8
     if raw.len == 0 {
         raw = b"/"
     }
-    match web.decode_path(raw, &mut path_buffer[..config.path_bytes]) {
-        ok(count) => {
-            result.path = count
+    match web.Path.decode(raw, &mut path_buffer[..config.path_bytes]) {
+        ok(value) => {
+            path = value
         }
         err(reason) => {
             return err(request_error(web.failure(reason)))
@@ -216,13 +269,14 @@ pub fn decode_target(target: &[u8], path_buffer: &mut[u8], query_buffer: &mut[u8
     }
     match web.decode_query(uri.query(), &mut query_buffer[..config.query_bytes], config.query_fields) {
         ok(count) => {
-            result.query = count
+            query = count
         }
         err(reason) => {
             return err(request_error(reason))
         }
     }
-    return ok(result)
+    used := path.bytes().len
+    return ok(Target { path: used, validated: path, query: query })
 }
 // A request is buffered before dispatch. No unchecked callback borrow survives.
 // Handler.handle(&mut web.Request, &mut web.Response) -> void!web.Failure.
@@ -315,7 +369,7 @@ clock: &mut C, cancel: &X, response_started: &mut bool) -> bool!hosting.Error {
             target := decode_target(driver.target(), path_buffer, query_buffer, config)?
             path_used = target.path
             query_used = target.query
-            match router.find(driver.method(), &path_buffer[..path_used]) {
+            match router.find_path(driver.method(), &target.validated) {
                 ok(found) => {
                     route_id = found.id;
                     route_index = found.index
@@ -450,25 +504,15 @@ clock: &mut C, cancel: &X) -> Report!hosting.Error {
     if!config.valid() {
         return err(hosting.failure(hosting.ErrorKind.InvalidInput))
     }
-    index := [0usize; 2048]
+    small_index := [0usize; 2048]
+    index := RouteIndex.new(routes.len, &mut small_index)?
     router: web.Router
-    if routes.len > 16 && routes.len <= index.len / 2 {
-        match web.Router.indexed(routes, &mut index) {
-            ok(value) => {
-                router = value
-            }
-            err(reason) => {
-                return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
-            }
+    match web.Router.indexed(routes, index.storage()) {
+        ok(value) => {
+            router = value
         }
-    } else {
-        match web.Router.new(routes) {
-            ok(value) => {
-                router = value
-            }
-            err(reason) => {
-                return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
-            }
+        err(reason) => {
+            return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
         }
     }
     local: net.SocketAddress

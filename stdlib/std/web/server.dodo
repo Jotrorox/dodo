@@ -19,13 +19,13 @@ pub struct Event {
 pub struct NoObserver {
     pub fn event(&mut self, event: &Event) {}
 }
-fn decode_target(target: &[u8], output: &mut[u8]) -> usize!web.Error {
+fn decode_target(target: &[u8], output: &mut[u8]) -> web.Path!web.Error from(output) {
     match http.Uri.parse(target) {
         ok(uri) => {
             if uri.path().len == 0 {
-                return web.decode_path(b"/", output)
+                return web.Path.decode(b"/", output)
             }
-            return web.decode_path(uri.path(), output)
+            return web.Path.decode(uri.path(), output)
         }
         err(_) => {
             return err(web.Error.InvalidPath)
@@ -109,21 +109,22 @@ pub struct Application {
             return ok(Step.Pending)
         }
         if event.kind == http.EventKind.HeadersComplete {
-            used := 0usize
+            path: web.Path
             match decode_target(driver.target(), self.path) {
-                ok(count) => {
-                    used = count
+                ok(value) => {
+                    path = value
                 }
                 err(reason) => {
                     return err(self.reject(driver, observer, reason))
                 }
             }
             found: web.Match
-            match self.router.find(driver.method(), &self.path[..used]) {
+            match self.router.find_path(driver.method(), &path) {
                 ok(value) => {
                     found = value
                 }
                 err(reason) => {
+                    core.drop(path)
                     return err(self.reject(driver, observer, reason))
                 }
             }
@@ -131,16 +132,18 @@ pub struct Application {
                 self.request_id = 0
             }
             self.request_id += 1
-            context := web.Context { method: driver.method(), path: &self.path[..used],
+            context := web.Context { method: driver.method(), path: path.bytes(),
             route_id: found.id, request_id: self.request_id, cancelled: false }
             match handler.head(&mut context) {
                 ok() => {}
                 err(reason) => {
                     core.drop(context)
+                    core.drop(path)
                     return err(self.reject(driver, observer, reason))
                 }
             }
             core.drop(context)
+            core.drop(path)
             observed := Event { kind: EventKind.Head, request_id: self.request_id, bytes: 0, status: 0 }
             observer.event(&observed)
         }

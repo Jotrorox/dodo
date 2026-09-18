@@ -86,6 +86,22 @@ pub fn validate_path(path: &[u8]) -> void!Error {
     return ok()
 }
 
+// A borrowed proof of validation; the bytes cannot change while it is live.
+pub struct Path {
+    data: &[u8]
+    pub fn new(data: &[u8]) -> Path!Error from(data) {
+        validate_path(data)?
+        return ok(Path { data: data })
+    }
+    pub fn decode(target: &[u8], output: &mut[u8]) -> Path!Error from(output) {
+        used := decode_path(target, output)?
+        return ok(Path { data: &output[..used] })
+    }
+    pub fn bytes(&self) -> &[u8] {
+        return self.data
+    }
+}
+
 pub fn valid_method(method: &[u8]) -> bool {
     if method.len == 0 {
         return false
@@ -253,6 +269,15 @@ fn path_hash(path: &[u8]) -> usize {
     }
     return hash
 }
+// Dynamic keys end immediately before their first parameter or wildcard.
+fn literal_prefix(pattern: &[u8]) -> usize {
+    for i in 0usize..pattern.len {
+        if pattern[i] == 58 || pattern[i] == 42 {
+            return i
+        }
+    }
+    return pattern.len
+}
 pub struct Router {
     routes: &[Route]
     index: &[usize]
@@ -288,8 +313,7 @@ pub struct Router {
         }
         return ok(Router { routes: routes, index: &EMPTY_INDEX, literal_sorted: sorted, dynamic: dynamic })
     }
-    // Optional caller-owned hash table. Literal matches are independent of
-    // registration order; parameters/wildcards retain the specificity scan.
+    // Caller-owned hash table for literals and dynamic literal prefixes.
     // No allocation, route-count ceiling, or probabilistic match is involved.
     pub fn indexed(routes: &[Route], storage: &mut[usize]) -> Router!Error from(routes, storage) {
         if routes.len > storage.len / 2 {
@@ -306,23 +330,22 @@ pub struct Router {
             storage[i] = 0
         }
         for i in 0usize..routes.len {
-            if literal_pattern(routes[i].pattern) {
-                at := path_hash(routes[i].pattern) % storage.len
-                for storage[at] != 0 {
-                    previous := storage[at] - 1
-                    if raw.equal(routes[i].pattern, routes[previous].pattern) && raw.equal(routes[i].method, routes[previous].method) {
-                        return err(Error.AmbiguousRoute)
-                    }
-                    at = (at + 1) % storage.len
-                }
-                storage[at] = i + 1
-            } else {
+            prefix := literal_prefix(routes[i].pattern)
+            if prefix != routes[i].pattern.len {
                 dynamic = true
-                for j in 0usize..i {
-                    if raw.equal(routes[i].method, routes[j].method) && same_shape(routes[i].pattern, routes[j].pattern) {
-                        return err(Error.AmbiguousRoute)
-                    }
+            }
+            at := path_hash(&routes[i].pattern[..prefix]) % storage.len
+            for storage[at] != 0 {
+                previous := (storage[at] - 1) / 2
+                if raw.equal(routes[i].method, routes[previous].method) && same_shape(routes[i].pattern, routes[previous].pattern) {
+                    return err(Error.AmbiguousRoute)
                 }
+                at = (at + 1) % storage.len
+            }
+            // The low bit distinguishes dynamic prefixes from literal paths.
+            storage[at] = i * 2 + 1
+            if prefix != routes[i].pattern.len {
+                storage[at] += 1
             }
         }
         return ok(Router { routes: routes, index: storage, literal_sorted: false, dynamic: dynamic })
@@ -333,14 +356,23 @@ pub struct Router {
             return err(Error.InvalidMethod)
         }
         validate_path(path)?
+        return self.find_validated(method, path)
+    }
+    pub fn find_path(&self, method: &[u8], validated: &Path) -> Match!Error {
+        if!valid_method(method) {
+            return err(Error.InvalidMethod)
+        }
+        return self.find_validated(method, validated.data)
+    }
+    fn find_validated(&self, method: &[u8], path: &[u8]) -> Match!Error {
         head := raw.equal(method, b"HEAD")
         fallback := self.routes.len
         if self.index.len != 0 {
             at := path_hash(path) % self.index.len
             matched := false
             for self.index[at] != 0 {
-                i := self.index[at] - 1
-                if raw.equal(self.routes[i].pattern, path) {
+                i := (self.index[at] - 1) / 2
+                if self.index[at] % 2 == 1 && raw.equal(self.routes[i].pattern, path) {
                     matched = true
                     if raw.equal(method, self.routes[i].method) {
                         return ok(Match { index: i, id: self.routes[i].id, head: head })
@@ -392,7 +424,43 @@ pub struct Router {
         }
         best := self.routes.len
         selected := self.routes.len
-        for i in 0usize..self.routes.len {
+        // For an indexed table, visit only buckets for prefixes ending at a
+        // segment boundary. Hash collisions still require complete matching.
+        prefix := 0usize
+        at := 0usize
+        if self.index.len != 0 {
+            prefix = 1
+            at = path_hash(&path[..prefix]) % self.index.len
+        }
+        scanned := 0usize
+        for self.index.len != 0 || scanned < self.routes.len {
+            i := scanned
+            if self.index.len != 0 {
+                if self.index[at] == 0 {
+                    for prefix < path.len && path[prefix] != 47 {
+                        prefix += 1
+                    }
+                    if prefix == path.len {
+                        break
+                    }
+                    prefix += 1
+                    at = path_hash(&path[..prefix]) % self.index.len
+                    continue
+                }
+                entry := self.index[at]
+                i = (entry - 1) / 2
+                at = (at + 1) % self.index.len
+                if entry % 2 == 1 {
+                    continue
+                }
+                key := literal_prefix(self.routes[i].pattern)
+                if key != prefix ||
+                    !raw.equal(&self.routes[i].pattern[..key], &path[..prefix]) {
+                    continue
+                }
+            } else {
+                scanned += 1
+            }
             if matches_path(self.routes[i].pattern, path) {
                 if best == self.routes.len || more_specific(self.routes[i].pattern, self.routes[best].pattern) {
                     best = i
@@ -429,6 +497,10 @@ pub struct Router {
         if!matches_path(pattern, path) {
             return none
         }
+        return self.parameter_matched(route, path, name)
+    }
+    fn parameter_matched(&self, route: usize, path: &[u8], name: &[u8]) -> Option<Parameter> {
+        pattern := self.routes[route].pattern
         pi := 1usize
         si := 1usize
         for pi <= pattern.len && si <= path.len {
@@ -446,6 +518,62 @@ pub struct Router {
         }
         return none
     }
+}
+
+// Movable registration storage: cached indices contain no self-borrows.
+// Mutation validates and rebuilds metadata; router() only borrows that metadata.
+fn empty_route() -> Route from(static) {
+    return Route { method: b"", pattern: b"", id: 0 }
+}
+pub struct RouteTable {
+    entries: [8]Route
+    count: usize
+    index: [16]usize
+    dynamic: bool
+    pub fn new() -> RouteTable from(static) {
+        return RouteTable { entries: [empty_route(), empty_route(), empty_route(), empty_route(),
+        empty_route(), empty_route(), empty_route(), empty_route()], count: 0, index: [0usize; 16], dynamic: false }
+    }
+    pub fn routes(&self) -> &[Route] {
+        return &self.entries[..self.count]
+    }
+    pub fn router(&self) -> Router from(self) {
+        return Router { routes: self.routes(), index: &self.index, literal_sorted: false, dynamic: self.dynamic }
+    }
+    pub fn insert(self, method: &[u8], pattern: &[u8]) -> RouteInsertion from(self, method, pattern) {
+        if self.count == 8 {
+            return RouteInsertion { table: self, problem: some(Error.BufferFull) }
+        }
+        id := self.count
+        self.entries[id] = Route { method: method, pattern: pattern, id: id }
+        // Build into scratch so a failed insertion preserves the old index.
+        index := [0usize; 16]
+        problem: Option<Error> = none
+        dynamic := false
+        match Router.indexed(&self.entries[..id + 1], &mut index) {
+            ok(router) => {
+                dynamic = router.dynamic
+            }
+            err(reason) => {
+                problem = some(reason)
+            }
+        }
+        match problem {
+            some(reason) => {
+                self.entries[id] = Route { method: b"", pattern: b"", id: 0 }
+                return RouteInsertion { table: self, problem: some(reason) }
+            }
+            none => {}
+        }
+        self.count += 1
+        self.index = index
+        self.dynamic = dynamic
+        return RouteInsertion { table: self, problem: none }
+    }
+}
+pub struct RouteInsertion {
+    pub table: RouteTable
+    pub problem: Option<Error>
 }
 
 pub struct Context {
@@ -585,6 +713,9 @@ pub struct Fields {
     pub fn len(&self) -> usize {
         return self.count
     }
+    pub fn next(&self, cursor: &mut usize) -> Option<http.Header> from(self) {
+        return field_next(self.bytes(), cursor)
+    }
     pub fn append(&mut self, name: &[u8], value: &[u8]) -> void!Failure {
         if!http.valid_token(name) || !http.valid_value(value) {
             return err(protocol_failure(Error.InvalidHeader, http.failure(http.ErrorKind.InvalidHeader, self.count)))
@@ -633,6 +764,32 @@ pub fn field_at(data: &[u8], index: usize) -> Option<http.Header> from(data) {
         }
         number += 1
         at = last + 1
+    }
+    return none
+}
+// Start at zero; each successful call advances past one complete field.
+// Truncated fields and exhaustion return none and leave the cursor at the end.
+pub fn field_next(data: &[u8], cursor: &mut usize) -> Option<http.Header> from(data) {
+    at := *cursor
+    *cursor = data.len
+    if at < data.len {
+        end := at
+        for end < data.len && data[end] != 0 {
+            end += 1
+        }
+        if end == data.len {
+            return none
+        }
+        start := end + 1
+        last := start
+        for last < data.len && data[last] != 0 {
+            last += 1
+        }
+        if last == data.len {
+            return none
+        }
+        *cursor = last + 1
+        return some(http.Header { name: &data[at..end], value: &data[start..last] })
     }
     return none
 }
@@ -782,14 +939,55 @@ pub struct Request {
     data: &[u8]
     router: &Router
     route: usize
+    captures: [32]usize
+    capture_count: usize
+    matched: bool
+    capture_overflow: bool
     pub route_id: usize
     pub request_id: u64
     pub cancelled: bool
     // Header/query storage is the initialized prefix of Fields/decode_query.
     pub fn new(method: &[u8], path: &[u8], headers: &[u8], query: &[u8], body: &[u8],
     router: &Router, route: usize, route_id: usize, request_id: u64) -> Request from(method, path, headers, query, body, router) {
-        return Request { verb: method, decoded_path: path, headers: headers, queries: query, data: body,
-        router: router, route: route, route_id: route_id, request_id: request_id, cancelled: false }
+        result := Request { verb: method, decoded_path: path, headers: headers, queries: query, data: body,
+        router: router, route: route, captures: [0usize; 32], capture_count: 0, matched: false, capture_overflow: false,
+        route_id: route_id, request_id: request_id, cancelled: false }
+        if route < router.routes.len {
+            pattern := router.routes[route].pattern
+            pi := 1usize
+            si := 1usize
+            for pi <= pattern.len && si <= path.len {
+                pe := end_segment(pattern, pi)
+                se := end_segment(path, si)
+                kind := segment_kind(pattern, pi, pe)
+                if (kind == 2 && se == si) || (kind == 3 && !raw.equal(&pattern[pi..pe], &path[si..se])) {
+                    return result
+                }
+                if kind != 3 {
+                    if kind == 1 {
+                        se = path.len
+                    }
+                    if result.capture_count == 8 {
+                        result.capture_overflow = true
+                    } else {
+                        at := result.capture_count * 4
+                        result.captures[at] = pi + 1
+                        result.captures[at + 1] = pe
+                        result.captures[at + 2] = si
+                        result.captures[at + 3] = se
+                        result.capture_count += 1
+                    }
+                    if kind == 1 {
+                        result.matched = true
+                        return result
+                    }
+                }
+                pi = pe + 1
+                si = se + 1
+            }
+            result.matched = pi > pattern.len && si > path.len
+        }
+        return result
     }
     pub fn method(&self) -> &[u8] {
         return self.verb
@@ -867,7 +1065,20 @@ pub struct Request {
         }
     }
     pub fn parameter(&self, name: &[u8]) -> Option<&[u8]> from(self) {
-        match self.router.parameter(self.route, self.decoded_path, name) {
+        if!self.matched {
+            return none
+        }
+        pattern := self.router.routes[self.route].pattern
+        for i in 0usize..self.capture_count {
+            at := i * 4
+            if raw.equal(&pattern[self.captures[at]..self.captures[at + 1]], name) {
+                return some(&self.decoded_path[self.captures[at + 2]..self.captures[at + 3]])
+            }
+        }
+        if!self.capture_overflow {
+            return none
+        }
+        match self.router.parameter_matched(self.route, self.decoded_path, name) {
             some(part) => {
                 return some(&self.decoded_path[part.start..part.end])
             }
@@ -929,6 +1140,12 @@ pub struct Response {
     }
     pub fn header_at(&self, index: usize) -> Option<http.Header> from(self) {
         return field_at(self.fields.bytes(), index)
+    }
+    pub fn header_next(&self, cursor: &mut usize) -> Option<http.Header> from(self) {
+        return self.fields.next(cursor)
+    }
+    pub fn header_bytes(&self) -> usize {
+        return self.fields.bytes().len
     }
     pub fn header_value(&self, name: &[u8]) -> Option<&[u8]> from(self) {
         return lookup(self.fields.bytes(), name, 0, true)

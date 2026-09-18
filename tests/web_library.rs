@@ -41,6 +41,7 @@ fn routing_middleware_and_backpressure_execute_and_remain_portable() {
         "web_application_checks",
         "web_registration_checks",
         "web_developer_checks",
+        "web_fast_checks",
     ] {
         let source =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/stdlib/{fixture}.dodo"));
@@ -135,6 +136,18 @@ fn router_context_and_pending_body_borrows_cannot_escape() {
             "pub struct Bad { data: &[u8]\n pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure { self.data = request.body()\n return ok() } }",
         ),
         (
+            "validated-path",
+            "fn bad() { data := [47u8]\n path := web.Path.new(&data)!\n data[0] = 65\n count := path.bytes().len }",
+        ),
+        (
+            "owned-route-index",
+            "fn bad() { small := [0usize; 2]\n index := hosted.RouteIndex.new(1025, &mut small)!\n storage := index.storage()\n core.drop(index)\n count := storage.len }",
+        ),
+        (
+            "sequential-header-view",
+            "fn bad(response: &mut web.Response) { cursor := 0usize\n view := response.header_next(&mut cursor)\n response.header(b\"X\", b\"new\")!\n match view { some(field) => { count := field.value.len } none => {} } }",
+        ),
+        (
             "request-header-view",
             "pub struct Bad { data: &[u8]\n pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure { match request.header(b\"X\", 0) { some(value) => { self.data = value } none => {} }\n return ok() } }",
         ),
@@ -176,6 +189,59 @@ fn router_context_and_pending_body_borrows_cannot_escape() {
             "{name}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[test]
+fn hosted_route_indices_scale_past_inline_storage() {
+    let scratch = Workspace::new();
+    let mut source = String::from(
+        "package large_routes\nimport \"std/web\"\nimport \"std/web/hosted\"\nimport \"std/http/hosting\"\nimport \"alloc/layout\"\n\
+         fn main() {\n routes := [\n",
+    );
+    for i in (0..1026).rev() {
+        let suffix = if i % 2 == 0 { "/:id" } else { "/fixed" };
+        source.push_str(&format!(
+            "web.Route {{ method: b\"GET\", pattern: b\"/group/{i:04}{suffix}\", id: {i} }},\n"
+        ));
+    }
+    source.push_str(
+        "]\n small := [0usize; 2048]\n storage := hosted.RouteIndex.new(routes.len, &mut small)!\n\
+         router := web.Router.indexed(&routes, storage.storage())!\n",
+    );
+    for i in [0, 1, 511, 512, 1023, 1024, 1025] {
+        let suffix = if i % 2 == 0 { "/42" } else { "/fixed" };
+        source.push_str(&format!(
+            "found_{i} := router.find(b\"HEAD\", b\"/group/{i:04}{suffix}\")!\n\
+             assert_eq(found_{i}.id, {i}usize)\nassert(found_{i}.head)\n"
+        ));
+    }
+    source.push_str(
+        "core.drop(router)\n core.drop(storage)\n\
+         counts := [0usize, 1usize, 1024usize, 1025usize, 4096usize]\n for count in counts {\n\
+           inline := [0usize; 2048]\n owner := hosted.RouteIndex.new(*count, &mut inline)!\n data := owner.storage()\n\
+           assert_eq(data.len, *count * 2)\n\
+           for i in 0usize..data.len { assert_eq(data[i], 0usize); data[i] = i }\n\
+         }\n\
+         match hosted.RouteIndex.new(layout.max_size(), &mut small) {\n\
+           ok(_) => { assert(false) }\n\
+           err(reason) => { assert(reason.kind == hosting.ErrorKind.Workspace) }\n\
+         }\n }\n",
+    );
+    let path = scratch.0.join("large_routes.dodo");
+    fs::write(&path, source).unwrap();
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!("large-routes-{optimization}"));
+        success(
+            Command::new(env!("CARGO_BIN_EXE_dodo"))
+                .arg("build")
+                .arg(&path)
+                .args(["-O", optimization, "-o"])
+                .arg(&executable)
+                .output()
+                .unwrap(),
+        );
+        success(Command::new(executable).output().unwrap());
     }
 }
 

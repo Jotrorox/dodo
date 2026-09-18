@@ -5,6 +5,8 @@ The [indexed JSON comparison](JSON-INDEXED.md) measures the implemented key inde
 The [sequential array comparison](JSON-ARRAYS.md) measures generated decoding.
 The [single-pass struct comparison](JSON-STRUCTS.md) measures field dispatch.
 The [ordinary-string comparison](JSON-STRINGS.md) measures string fast paths.
+The [web comparison](WEB.md) measures header traversal, retained routing metadata,
+validated paths, captures, and dynamic route indexing.
 See [optimization opportunities](OPTIMIZATION-NOTES.md) for source-level analysis
 and additional decoding/header probes.
 
@@ -55,7 +57,11 @@ and local HTTP servers are stopped when the runner finishes or fails.
 | JSON fixed-array decoding | Parsing and derived decoding of objects containing 16, 64, and 256 integers. Run alone with `--suite json-arrays`; also included in `json` and `all`. |
 | JSON struct decoding | Derived decoding of 16 and 64 integer fields in reverse schema order, with both ordinary and indexed validation. Indexed parsing is measured separately. Run alone with `--suite json-structs`; also included in `json` and `all`. Use `--struct-sizes` to select widths from 1 through 256. |
 | JSON wide objects | Parsing 32, 256, and 1,024 distinct keys with both `parse` and `parse_indexed`, including duplicate-name checks. Indexed cases use 5,120 scratch words (1,024 live members); index reset and construction are timed. |
-| Web router | Successful GET lookup cycling through every route in tables of 8, 64, and 256 literal routes: sorted, indexed, and unsorted. The optional hash index uses twice as many slots as routes. |
+| Web router | Successful GET lookup cycling through every route in tables of 8, 64, 256, and 2,048 literal routes: sorted, indexed, and unsorted. Select sizes with `--route-sizes`. The optional hash index uses twice as many slots as routes. |
+| Web dynamic routing | Scanned versus indexed lookup of `/group/NNNN/:id` routes at the same table sizes. |
+| Web headers | Enumerating 32 copied headers by ordinal lookup versus a sequential byte cursor. |
+| Web parameters | Repeated named lookup with full pattern matching versus captured request offsets. |
+| Web validated paths | Router lookup with path validation versus reuse of a borrowed `web.Path`. |
 | Web path | Percent-decoding and validating two alternating paths, excluding their query strings. |
 | Web application | Three registered routes; a request with an escaped path, path parameter, and query parameter; handler execution and construction of an owned response. |
 | HTTP | A `/health` JSON response over IPv4 loopback: serial execution with one client and a new connection per request; concurrent execution with one or eight persistent clients. |
@@ -80,6 +86,10 @@ detection dominating the result. Ordinary decoding retains that validation cost.
 `web.dodo` is a source template: the runner fills its route table before
 compiling it. Its router construction, registration validation, and optional
 index construction happen outside the timed region.
+`web_dynamic.dodo` similarly fills route patterns and matching concrete paths.
+`web_operations.dodo` compares ordinal and sequential header access, parameter
+access, and validated-path lookup. Its capture and path-proof construction are
+outside timing; the application benchmark includes request construction.
 
 ## Measurement boundaries
 
@@ -108,9 +118,10 @@ The serial and concurrent modes have different connection lifetimes, so their
 rates do not isolate execution-policy costs. Python and the shared machine can
 limit throughput; these results do not establish the server's maximum capacity.
 
-The router cases use successful literal matches. The application case exercises
-parameter matching and query decoding, but this suite does not characterize
-large dynamic-route tables, errors, large bodies, streaming, TLS, or remote
+The router cases use successful literal and parameterized matches. Dynamic
+tables have distinct literal prefixes; routes sharing a prefix still scan within
+their group. The application case exercises parameter matching and query decoding.
+This suite does not characterize errors, large bodies, streaming, TLS, or remote
 network behavior. Keep the same machine, inputs, optimization, sample settings,
 and connection policy for before/after comparisons. There are no performance
 thresholds or claims of statistical significance.

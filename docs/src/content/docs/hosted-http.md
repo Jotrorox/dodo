@@ -314,7 +314,10 @@ request headers and 4 KiB copied response headers. Each retained/copied pair use
 its name and value length plus two delimiter bytes. Protocol wire-head bytes are
 bounded separately. Per-call stack storage includes a 2,048-entry route index
 and 33 temporary response header views (32 application fields plus Connection).
-The reactor requires this workspace per slot. Buffers never grow.
+Tables above 1,024 routes use a separately owned index with two `usize` slots per
+route, allocated once before binding and freed when serving returns. Both runners
+retain indexing for these larger tables. The reactor requires protocol workspace
+per slot. Request and response buffers never grow.
 
 | Config setting | Default / hard cap |
 | --- | --- |

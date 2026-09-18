@@ -1,0 +1,86 @@
+package web_operations
+import "core/ptr"
+import "std/console"
+import "std/io"
+import "std/time/hosted"
+import "std/web"
+
+fn main() {
+    input := console.stdin()
+    header := [0u8; 16]
+    io.read_exact(&mut input, &mut header)!
+    iterations := 0u64
+    for i in 0usize..8 {
+        iterations |=(header[i] as u64) << ((i * 8) as u64)
+    }
+    mode := header[8]
+    checksum := 0u64
+    clock := hosted.MonotonicClock.new()
+    if mode <= 1 {
+        storage := [0u8; 2048]
+        fields := web.Fields.new(&mut storage, 32)
+        for i in 0usize..32 {
+            fields.append(b"X-Header", b"value")!
+        }
+        start := clock.now()!
+        for i in 0u64..iterations {
+            cursor := 0usize
+            for j in 0usize..32 {
+                number := unsafe {
+                    ptr.read_volatile(ptr.from_ref(&j))
+                }
+                field := if mode == 0 {
+                    web.field_at(fields.bytes(), number)
+                } else {
+                    fields.next(&mut cursor)
+                }
+                match field {
+                    some(value) => {
+                        checksum +=(value.name.len + value.value.len) as u64
+                    }
+                    none => {
+                        assert(false)
+                    }
+                }
+            }
+        }
+        end := clock.now()!
+        elapsed := end.duration_since(&start)!
+        console.printf("{} {}\n", elapsed.to_nanos()!, checksum)!
+        return
+    }
+    routes := [web.Route { method: b"GET", pattern: b"/teams/:team/users/:user/files/*rest", id: 1 }]
+    router := web.Router.new(&routes)!
+    path := web.Path.new(b"/teams/dodo/users/42/files/a/b")!
+    request := web.Request.new(b"GET", path.bytes(), b"", b"", b"", &router, 0, 1, 1)
+    names := [b"team", b"user", b"rest"]
+    paths := [web.Path.new(b"/teams/dodo/users/42/files/a/b")!,
+    web.Path.new(b"/teams/dodo/users/43/files/c/d")!, web.Path.new(b"/teams/dodo/users/44/files/e/f")!]
+    start := clock.now()!
+    for i in 0u64..iterations {
+        index := (unsafe {
+            ptr.read_volatile(ptr.from_ref(&i))
+        } % 3) as usize
+        if mode == 2 {
+            match router.parameter(0, path.bytes(), names[index]) {
+                some(part) => {
+                    checksum +=(part.end - part.start) as u64
+                }
+                none => {
+                    assert(false)
+                }
+            }
+        } else if mode == 3 {
+            checksum += request.param(names[index])!.len as u64
+        } else if mode == 4 {
+            found := router.find(b"GET", paths[index].bytes())!
+            checksum += found.id as u64
+        } else {
+            found := router.find_path(b"GET", &paths[index])!
+            checksum += found.id as u64
+        }
+    }
+    end := clock.now()!
+    elapsed := end.duration_since(&start)!
+    console.printf("{} {}\n", elapsed.to_nanos()!, checksum)!
+}

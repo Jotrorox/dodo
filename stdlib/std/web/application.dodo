@@ -7,38 +7,18 @@ import "std/io"
 // Fixed registration storage. Handler values are owned inline in a typed chain.
 pub const ROUTE_CAPACITY: usize = 8
 pub struct Table {
-    entries: [8]web.Route
-    count: usize
+    routing: web.RouteTable
     pub fn routes(&self) -> &[web.Route] {
-        return &self.entries[..self.count]
+        return self.routing.routes()
+    }
+    pub fn router(&self) -> web.Router from(self) {
+        return self.routing.router()
     }
     // Failed insertion restores the initialized route prefix.
     fn insert(self, method: &[u8], pattern: &[u8]) -> Insertion from(self, method, pattern) {
-        if self.count == ROUTE_CAPACITY {
-            return Insertion { table: self, problem: some(web.Error.BufferFull) }
-        }
-        id := self.count
-        self.entries[id] = web.Route { method: method, pattern: pattern, id: id }
-        self.count += 1
-        problem: Option<web.Error> = none
-        match web.Router.new(self.routes()) {
-            ok(router) => {
-                core.drop(router)
-            }
-            err(reason) => {
-                problem = some(reason)
-            }
-        }
-        match problem {
-            some(reason) => {
-                self.count -= 1
-                self.entries[id] = empty_route()
-                return Insertion { table: self, problem: some(reason) }
-            }
-            none => {
-                return Insertion { table: self, problem: none }
-            }
-        }
+        let Table { routing: routing } = self
+        let web.RouteInsertion { table: table, problem: problem } = routing.insert(method, pattern)
+        return Insertion { table: Table { routing: table }, problem: problem }
     }
 
 }
@@ -69,7 +49,7 @@ pub struct Application<H> {
     // have a different type. No function values, erasure, or allocation.
     pub fn route<N>(self, method: &[u8], pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, method, pattern, handler) {
         let Application { table: previous_table, handler: previous } = self
-        id := previous_table.count
+        id := previous_table.routes().len
         let Insertion { table: table, problem: problem } = previous_table.insert(method, pattern)
         match problem {
             some(reason) => {
@@ -90,7 +70,8 @@ pub struct Application<H> {
         return self.request_with(&input)
     }
     pub fn request_with(&mut self, input: &testing.Request) -> testing.Response {
-        return testing.send(self.table.routes(), &mut self.handler, input)
+        router := self.table.router()
+        return testing.send_router(&router, &mut self.handler, input)
     }
 
     pub fn put<N>(self, pattern: &[u8], handler: N) -> Application<Handlers<H, N>>!web.Error from(self, pattern, handler) {
@@ -114,11 +95,8 @@ pub struct Application<H> {
     }
 
 }
-fn empty_route() -> web.Route from(static) {
-    return web.Route { method: b"", pattern: b"", id: 0 }
-}
 pub fn new() -> Application<Empty> from(static) {
-    return Application { table: Table { entries: [empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route(), empty_route()], count: 0 }, handler: Empty {} }
+    return Application { table: Table { routing: web.RouteTable.new() }, handler: Empty {} }
 }
 
 // The fluent builder retains the first setup error and validates before use.
@@ -184,7 +162,7 @@ pub struct Builder<H, M> {
             none => {}
         }
         let Builder { table: previous_table, handler: previous, middleware: middleware, problem: previous_problem } = self
-        id := previous_table.count
+        id := previous_table.routes().len
         if failed {
             return Builder { table: previous_table, handler: Handlers { previous: previous, current: handler, id: id }, middleware: middleware, problem: previous_problem }
         }

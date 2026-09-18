@@ -173,6 +173,10 @@ fn health_check() {
 Run `dodo test`. Responses own their bytes and remain valid after another request
 or after dropping the application. Inspect `status()`, `body()`, `header(name)`,
 or `header_at(index)` directly, or chain the consuming `expect_*` assertions.
+For enumeration, initialize `cursor := 0usize` and call
+`header_next(&mut cursor)` until it returns `none`. The cursor tracks a byte
+offset, so each header is visited once. This also works on `web.Response`;
+`Fields.next` and `web.field_next` expose the same traversal for field storage.
 The response's `failure` field retains a handler/decoding failure for debugging;
 HTTP error bodies stay empty and partial handler output is discarded.
 
@@ -499,15 +503,25 @@ one scan that selects path specificity and method together. Construction of an
 unsorted or dynamic table with `Router.new` checks ambiguity pairwise.
 
 `Router.indexed(&routes, &mut index)` adds an allocation-free hash index for
-literal paths. Supply at least twice as many `usize` slots as routes. Construction
-checks duplicates while inserting literals and compares dynamic route shapes;
-collisions always compare the complete path. Both the route table and index
-remain borrowed by the router; failed construction may modify index storage.
-Literal matches avoid scanning dynamic routes, preserving the same precedence
-and method rules. Dynamic matches still scan. The serial hosted server selects
-this index for 17–1,024 routes, and the reactor for up to 1,024 routes. Larger
-tables use the ordinary router; explicitly supplied index storage has no such
-route-count ceiling. There is no allocation or hidden cache.
+literal paths and the literal prefix before a route's first parameter or wildcard.
+Supply at least twice as many `usize` slots as routes. Construction checks
+duplicate shapes while inserting; hash collisions always require full comparison.
+Both the route table and index remain borrowed by the router; failed construction
+may modify index storage. Dynamic lookup probes prefixes at segment boundaries
+and checks candidates with those prefixes. Routes sharing a prefix still scan
+within that group, including routes beginning with a parameter or wildcard.
+Literal precedence, method selection, and HEAD fallback remain identical.
+
+Application registration retains its validated index. `table.router()` borrows
+it without rebuilding or revalidating; in-process application requests reuse this
+view. `testing.send_router(&router, &mut handler, &input)` also accepts an existing
+router, while `testing.send(routes, ...)` validates raw routes on each call.
+
+Both hosted runners automatically index every table. Up to 1,024 routes use
+inline storage; larger tables allocate an index once at startup and free it when
+serving returns. The index has two `usize` slots per route; allocation or size
+failure returns `hosting.ErrorKind.Workspace` before binding. Request routing
+does not allocate. Portable `Router.indexed` continues to use only caller storage.
 
 | Pattern | Meaning |
 | --- | --- |
@@ -526,6 +540,10 @@ returns `MethodNotAllowed`; an unmatched path returns `NotFound`. Parameter name
 contain ASCII letters, digits or underscore, and cannot repeat in a pattern.
 `parameter()` returns offsets into the decoded path, not raw pointers.
 
+`Request` captures the first eight named parameter spans during construction.
+Repeated parameter reads reuse those offsets; routes with more parameters remain
+supported and look up later names without repeating the full pattern match.
+
 Before routing an HTTP target, call `decode_path(target, output)`. It strips the
 query and decodes percent escapes **once** into caller storage, respecting the
 component distinction in [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html).
@@ -535,7 +553,11 @@ percent remains literal: routing never decodes it again. Repeated and trailing
 slashes remain significant. Patterns contain decoded UTF-8 literals, not percent
 escapes. Insufficient output returns `BufferFull`; an error may leave a modified
 prefix that must not be used as a path. `Router.find` accepts already-decoded
-paths. The server composition also extracts paths from absolute-form HTTP targets;
+paths and validates them. `Path.decode(target, output)` decodes and returns a
+validated borrowed path; `Path.new(bytes)` validates an already-decoded path.
+Pass either to `Router.find_path(method, &path)` to reuse validation. The path
+holds a checked borrow, so its bytes cannot change while that proof is in use.
+The server composition also extracts paths from absolute-form HTTP targets;
 its router does not implement authority/virtual-host selection or OPTIONS `*`.
 
 ## Handlers and middleware
@@ -639,6 +661,7 @@ The checker enforces this without unchecked pointers or callback lifetime casts.
 | `response.bytes(bytes)` | Copy arbitrary body bytes; add no Content-Type |
 | `response.status()`, `response.body()` | Read status or borrow copied body bytes |
 | `response.header_at(index)` | Borrow a copied header by insertion index |
+| `response.header_next(&mut cursor)` | Iterate headers in insertion order; start the byte cursor at zero |
 
 Each body call replaces the previous body. Text/HTML add their default type only
 when no Content-Type has been supplied; set a custom type before calling them.

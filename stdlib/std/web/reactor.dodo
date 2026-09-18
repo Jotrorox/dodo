@@ -272,7 +272,7 @@ pub struct Slot {
             target := hosted.decode_target(driver.target(), path, query, &config.server)?
             self.path_used = target.path
             self.query_used = target.query
-            match router.find(driver.method(), &path[..self.path_used]) {
+            match router.find_path(driver.method(), &target.validated) {
                 ok(found) => {
                     self.route_id = found.id;
                     self.route_index = found.index;
@@ -647,25 +647,15 @@ request: &mut[u8], response: &mut[u8], config: Config, provider: &mut P, clock: 
     transport := TransportOwner { provider: provider, count: owner.slots.len }
     request_size := request.len / owner.slots.len
     response_size := response.len / owner.slots.len
-    index := [0usize; 2048]
+    small_index := [0usize; 2048]
+    index := hosted.RouteIndex.new(routes.len, &mut small_index)?
     router: web.Router
-    if routes.len <= index.len / 2 {
-        match web.Router.indexed(routes, &mut index) {
-            ok(value) => {
-                router = value
-            }
-            err(reason) => {
-                return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
-            }
+    match web.Router.indexed(routes, index.storage()) {
+        ok(value) => {
+            router = value
         }
-    } else {
-        match web.Router.new(routes) {
-            ok(value) => {
-                router = value
-            }
-            err(reason) => {
-                return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
-            }
+        err(reason) => {
+            return err(hosting.web_error(web.failure(reason), hosting.ErrorKind.InvalidInput))
         }
     }
     local: net.SocketAddress

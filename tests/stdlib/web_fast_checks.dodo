@@ -1,0 +1,205 @@
+package web_fast_checks
+import "core/bytes"
+import "std/web"
+import "std/web/application"
+
+fn headers() {
+    storage := [0u8; 1024]
+    fields := web.Fields.new(&mut storage, 32)
+    for i in 0usize..32 {
+        value := [i as u8 + 32u8]
+        fields.append(b"X-Repeat", &value)!
+    }
+    cursor := 0usize
+    for i in 0usize..32 {
+        match fields.next(&mut cursor) {
+            some(field) => {
+                assert(bytes.equal(field.name, b"X-Repeat"))
+                assert_eq(field.value[0], i as u8 + 32u8)
+            }
+            none => {
+                assert(false)
+            }
+        }
+    }
+    assert_eq(cursor, fields.bytes().len)
+    for i in 0usize..2 {
+        match fields.next(&mut cursor) {
+            some(_) => {
+                assert(false)
+            }
+            none => {}
+        }
+    }
+    malformed := [88u8, 0u8, 65u8]
+    cursor = 0
+    match web.field_next(&malformed, &mut cursor) {
+        some(_) => {
+            assert(false)
+        }
+        none => {}
+    }
+    assert_eq(cursor, malformed.len)
+    cursor = 99
+    match web.field_next(&malformed, &mut cursor) {
+        some(_) => {
+            assert(false)
+        }
+        none => {}
+    }
+    empty := [88u8, 0u8, 0u8]
+    cursor = 0
+    match web.field_next(&empty, &mut cursor) {
+        some(field) => {
+            assert_eq(field.value.len, 0usize)
+        }
+        none => {
+            assert(false)
+        }
+    }
+}
+
+fn routes() {
+    routes := [
+        web.Route { method: b"GET", pattern: b"/*rest", id: 1 },
+        web.Route { method: b"POST", pattern: b"/:root/fixed", id: 2 },
+        web.Route { method: b"GET", pattern: b"/a/:id", id: 3 },
+        web.Route { method: b"HEAD", pattern: b"/a/:id", id: 4 },
+        web.Route { method: b"POST", pattern: b"/a/fixed", id: 5 },
+        web.Route { method: b"GET", pattern: b"/a/*tail", id: 6 },
+        web.Route { method: b"GET", pattern: b"/b/:id/end", id: 7 },
+        web.Route { method: b"GET", pattern: b"/b/:id/:last", id: 8 },
+        web.Route { method: b"PUT", pattern: b"/b/:id/end", id: 9 },
+        web.Route { method: b"GET", pattern: b"//:empty", id: 10 },
+        web.Route { method: b"GET", pattern: b"/a/:id/", id: 11 },
+        web.Route { method: b"GET", pattern: b"/a/", id: 12 }]
+    index := [0usize; 24]
+    indexed := web.Router.indexed(&routes, &mut index)!
+    plain := web.Router.new(&routes)!
+    methods := [b"GET", b"POST", b"HEAD", b"PUT", b"DELETE"]
+    paths := [b"/", b"/a/", b"/a/x", b"/a/fixed", b"/a/:id", b"/a/*tail",
+    b"/a/x/", b"/a/x/y", b"/b/42/end", b"/b/42/other", b"/b//end", b"//x", b"/z/fixed", b"/missing"]
+    for method in methods {
+        for path in paths {
+            validated := web.Path.new(*path)!
+            match plain.find(*method, *path) {
+                ok(expected) => {
+                    actual := indexed.find_path(*method, &validated)!
+                    assert_eq(actual.id, expected.id)
+                    assert_eq(actual.head, expected.head)
+                }
+                err(expected) => {
+                    match indexed.find_path(*method, &validated) {
+                        ok(_) => {
+                            assert(false)
+                        }
+                        err(actual) => {
+                            assert(actual == expected)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bad := [b"", b"relative", b"/../x", b"/x/.", b"/a#b"]
+    for path in bad {
+        match web.Path.new(*path) {
+            ok(_) => {
+                assert(false)
+            }
+            err(_) => {}
+        }
+    }
+    decoded_storage := [0u8; 32]
+    decoded := web.Path.decode(b"/a/%41da?q=yes", &mut decoded_storage)!
+    found := indexed.find_path(b"GET", &decoded)!
+    request := web.Request.new(b"GET", decoded.bytes(), b"", b"", b"", &indexed, found.index, found.id, 1)
+    for i in 0usize..4 {
+        assert(bytes.equal(request.param(b"id")!, b"Ada"))
+    }
+}
+
+fn captures() {
+    routes := [web.Route { method: b"GET", pattern: b"/:a/:b/:c/:d/:e/:f/:g/:h/:i/*rest", id: 77 }]
+    router := web.Router.new(&routes)!
+    request := web.Request.new(b"GET", b"/1/2/3/4/5/6/7/8/9/tail/end", b"", b"", b"", &router, 0, 77, 1)
+    for i in 0usize..3 {
+        assert(bytes.equal(request.param(b"a")!, b"1"))
+        assert(bytes.equal(request.param(b"h")!, b"8"))
+        assert(bytes.equal(request.param(b"i")!, b"9"))
+        assert(bytes.equal(request.param(b"rest")!, b"tail/end"))
+        match request.parameter(b"missing") {
+            some(_) => {
+                assert(false)
+            }
+            none => {}
+        }
+    }
+    invalid := web.Request.new(b"GET", b"/1", b"", b"", b"", &router, 0, 77, 1)
+    match invalid.parameter(b"a") {
+        some(_) => {
+            assert(false)
+        }
+        none => {}
+    }
+    outside := web.Request.new(b"GET", b"/1", b"", b"", b"", &router, 99, 77, 1)
+    match outside.parameter(b"a") {
+        some(_) => {
+            assert(false)
+        }
+        none => {}
+    }
+    wildcards := [web.Route { method: b"GET", pattern: b"/files/*rest", id: 1 }]
+    wildcard := web.Router.new(&wildcards)!
+    empty := web.Request.new(b"GET", b"/files/", b"", b"", b"", &wildcard, 0, 1, 1)
+    assert_eq(empty.param(b"rest")!.len, 0usize)
+}
+
+fn registration() {
+    first := web.RouteTable.new().insert(b"GET", b"/:id")
+    let web.RouteInsertion { table: table, problem: problem } = first
+    match problem {
+        some(_) => {
+            assert(false)
+        }
+        none => {}
+    }
+    rejected := table.insert(b"GET", b"/:other")
+    let web.RouteInsertion { table: restored, problem: rejected_problem } = rejected
+    match rejected_problem {
+        some(reason) => {
+            assert(reason == web.Error.AmbiguousRoute)
+        }
+        none => {
+            assert(false)
+        }
+    }
+    router := restored.router()
+    kept := router.find(b"GET", b"/kept")!
+    assert_eq(kept.id, 0usize)
+    core.drop(router)
+    inserted := restored.insert(b"POST", b"/fixed")
+    let web.RouteInsertion { table: updated, problem: updated_problem } = inserted
+    match updated_problem {
+        some(_) => {
+            assert(false)
+        }
+        none => {}
+    }
+    updated_router := updated.router()
+    fixed := updated_router.find(b"POST", b"/fixed")!
+    assert_eq(fixed.id, 1usize)
+    site := application.builder().get(b"/:id", web.text(b"dynamic")).post(b"/fixed", web.text(b"literal")).build()!
+    for i in 0usize..3 {
+        site.request(b"GET", b"/new").expect_status(200).expect_body(b"dynamic")
+        site.request(b"GET", b"/fixed").expect_status(405)
+        site.request(b"HEAD", b"/new").expect_status(200).expect_body(b"")
+    }
+}
+
+fn main() {
+    headers();
+    routes();
+    captures();
+    registration()
+}
