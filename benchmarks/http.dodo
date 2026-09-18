@@ -1,0 +1,21 @@
+package http_bench
+
+import "std/console"
+import "std/io"
+import "std/web"
+import "std/web/app"
+
+fn main() -> i32 {
+    input := console.stdin()
+    mode := [0u8; 1]
+    io.read_exact(&mut input, &mut mode)!
+    address := [0u8; 64]
+    report := io.read_bounded(&mut input, &mut address)!
+    assert(report.eof)
+    server := app.new().get(b"/health", web.json(b"{\"ok\":true}"))
+    server.config.requests_per_connection = 1000000
+    if mode[0] == 1 {
+        server.config.execution = app.Execution.Concurrent
+    }
+    return server.run(&address[..report.read])
+}

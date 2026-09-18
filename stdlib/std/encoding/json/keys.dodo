@@ -1,0 +1,127 @@
+package json
+
+import "core/num"
+
+// Scratch words per simultaneously live object member for parse_indexed.
+pub const KEY_INDEX_WORDS: usize = 5
+
+// Keep the constant-space scanner's hot recursive path unchanged. Tokens use
+// its existing validators; this container loop differs only in key indexing.
+// The indexed fixture checks acceptance and exact error parity with scan.
+fn scan_indexed(data: &[u8], start: usize, depth: usize, keys: &mut IndexedKeys) -> usize!Error {
+    if start == data.len || (data[start] != 91 && data[start] != 123) {
+        return scan(data, start, depth)
+    }
+    if depth >= MAX_DEPTH {
+        return err(failure(ErrorKind.Depth, start))
+    }
+    object := data[start] == 123
+    close := 93u8
+    if object {
+        close = 125
+    }
+    offset := skip_space(data, start + 1)
+    if offset < data.len && data[offset] == close {
+        return ok(offset + 1)
+    }
+    mark := keys.checkpoint()
+    for {
+        if object {
+            if offset == data.len || data[offset] != 34 {
+                return err(failure(ErrorKind.Syntax, offset))
+            }
+            end := string_end(data, offset)?
+            keys.insert(data, mark, offset, end)?
+            offset = skip_space(data, end)
+            if offset == data.len || data[offset] != 58 {
+                return err(failure(ErrorKind.Syntax, offset))
+            }
+            offset = skip_space(data, offset + 1)
+        }
+        offset = scan_indexed(data, offset, depth + 1, keys)?
+        offset = skip_space(data, offset)
+        if offset == data.len {
+            return err(failure(ErrorKind.Syntax, offset))
+        }
+        if data[offset] == close {
+            keys.restore(mark)
+            return ok(offset + 1)
+        }
+        if data[offset] != 44 {
+            return err(failure(ErrorKind.Syntax, offset))
+        }
+        offset = skip_space(data, offset + 1)
+    }
+}
+
+// Each five-word slot contains an independent bucket head, then an entry's
+// next link, bucket number, and source start/end. Links are one-based; zero is
+// empty. Entries form a stack shared by all active objects. Closing an object
+// removes its entries in reverse insertion order, restoring each bucket head.
+// No tombstones or per-depth tables are needed, even for arrays of objects.
+struct IndexedKeys {
+    slots: &mut[usize]
+    capacity: usize
+    used: usize
+
+    fn new(scratch: &mut[usize]) -> IndexedKeys from(scratch) {
+        capacity := scratch.len / KEY_INDEX_WORDS
+        for i in 0usize..capacity {
+            scratch[i * KEY_INDEX_WORDS] = 0
+        }
+        return IndexedKeys { slots: scratch, capacity: capacity, used: 0 }
+    }
+    fn checkpoint(&self) -> usize {
+        return self.used
+    }
+    fn restore(&mut self, mark: usize) {
+        for self.used > mark {
+            self.used -= 1
+            entry := self.used * KEY_INDEX_WORDS
+            bucket := self.slots[entry + 2]
+            self.slots[bucket * KEY_INDEX_WORDS] = self.slots[entry + 1]
+        }
+    }
+    fn insert(&mut self, data: &[u8], mark: usize, start: usize, end: usize) -> void!Error {
+        if self.capacity == 0 {
+            return err(failure(ErrorKind.BufferFull, start))
+        }
+        // Hash decoded scalars so literal UTF-8, short escapes, and Unicode
+        // escapes agree. The hash is an index only, never proof of equality.
+        hash := 2166136261usize
+        offset := start + 1
+        for offset < end - 1 {
+            decoded := scalar(data, offset, true)?
+            hash = num.wrapping_mul(hash ^ (decoded.scalar as usize), 16777619)
+            offset = decoded.next
+        }
+        bucket := num.wrapping_mul(hash ^ mark, 16777619) % self.capacity
+        head := self.slots[bucket * KEY_INDEX_WORDS]
+        link := head
+        key := json_string(data, start, end)
+        for link != 0 {
+            index := link - 1
+            // Entries below the checkpoint belong to ancestor objects.
+            if index < mark {
+                break
+            }
+            entry := index * KEY_INDEX_WORDS
+            prior := json_string(data, self.slots[entry + 3], self.slots[entry + 4])
+            if key.equal(&prior) {
+                return err(failure(ErrorKind.DuplicateField, start))
+            }
+            link = self.slots[entry + 1]
+        }
+        if self.used == self.capacity {
+            return err(failure(ErrorKind.BufferFull, start))
+        }
+        entry := self.used * KEY_INDEX_WORDS
+        self.slots[entry + 1] = head
+        self.slots[entry + 2] = bucket
+        self.slots[entry + 3] = start
+        self.slots[entry + 4] = end
+        self.used += 1
+        self.slots[bucket * KEY_INDEX_WORDS] = self.used
+        return ok()
+    }
+}

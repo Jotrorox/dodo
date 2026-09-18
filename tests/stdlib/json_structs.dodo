@@ -1,0 +1,205 @@
+package json_structs
+
+import "std/encoding/json"
+
+@derive(Json)
+struct Inner {
+    text: json.String
+}
+
+@derive(Json)
+@json_deny_unknown
+struct Names {
+    @json_name("")
+    empty: &str
+    @json_name("é😀")
+    unicode: Inner
+    @json_name("line\n\"\\")
+    escaped: Option<json.String>
+    raw: json.Value
+}
+
+// These distinct names collide in the generated 32-bit field hash.
+@derive(Json)
+@json_deny_unknown
+struct Collision {
+    costarring: u32
+    liquid: json.String
+}
+
+@derive(Json)
+@json_deny_unknown
+struct StrictCollision {
+    costarring: u32
+}
+
+@derive(Json)
+struct LooseCollision {
+    costarring: u32
+}
+
+static mut struct_decode_drops: usize = 0
+static mut struct_decode_order: u64 = 0
+
+struct Tracked {
+    value: u64
+
+    fn decode_json(input: json.Value) -> Self!json.Error {
+        value := input.as_u64()?
+        unsafe {
+            struct_decode_order = struct_decode_order * 10 + value
+        }
+        return ok(Self { value: value })
+    }
+    fn encode_json<W>(&self, encoder: &mut json.Encoder<W>) -> void!json.Error {
+        return encoder.unsigned(self.value)
+    }
+    fn drop(&mut self) {
+        unsafe {
+            struct_decode_drops += 1
+        }
+    }
+}
+
+@derive(Json)
+@json_deny_unknown
+struct Owners {
+    first: Tracked
+    optional: Option<Tracked>
+    last: Tracked
+}
+
+fn reset() {
+    unsafe {
+        struct_decode_drops = 0
+        struct_decode_order = 0
+    }
+}
+
+fn check_state(expected_order: u64, expected_drops: usize) {
+    unsafe {
+        assert_eq(struct_decode_order, expected_order)
+        assert_eq(struct_decode_drops, expected_drops)
+    }
+}
+
+fn expect_error(input: &[u8], kind: json.ErrorKind, position: usize, expected_order: u64, expected_drops: usize) {
+    reset()
+    match json.decode::<Owners>(input) {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, kind)
+            assert_eq(reason.position, position)
+        },
+    }
+    check_state(expected_order, expected_drops)
+}
+
+fn names_and_collisions() -> void!json.Error {
+    names := json.decode::<Names>(b"{\"raw\":[{\"nested\":\"],}\\\"\"}],\"line\\n\\\"\\\\\":\"yes\",\"\\u00e9\\ud83d\\ude00\":{\"text\":\"hello\"},\"\":\"empty\"}")?
+    assert_eq(names.empty, "empty")
+    assert(names.unicode.text.equals("hello"))
+    assert_eq(names.raw.len()?, 1usize)
+    match &names.escaped {
+        some(value) => {
+            assert(value.equals("yes"))
+        },
+        none => {
+            assert(false)
+        },
+    }
+    literal := json.decode_str::<Names>("{\"\":\"literal\",\"é😀\":{\"text\":\"ok\"},\"raw\":null}")?
+    assert_eq(literal.empty, "literal")
+    assert(literal.unicode.text.equals("ok"))
+    assert(literal.raw.is_null())
+    match &literal.escaped {
+        some(_) => {
+            assert(false)
+        },
+        none => {},
+    }
+    collision := json.decode::<Collision>(b"{\"liquid\":\"water\",\"costarring\":42}")?
+    assert_eq(collision.costarring, 42u32)
+    assert(collision.liquid.equals("water"))
+    escaped := json.decode::<Collision>(b"{\"costarring\":7,\"li\\u0071uid\":\"ice\"}")?
+    assert_eq(escaped.costarring, 7u32)
+    assert(escaped.liquid.equals("ice"))
+    match json.decode::<StrictCollision>(b"{\"costarring\":1,\"liquid\":2}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.UnknownField)
+            assert_eq(reason.position, 16usize)
+        },
+    }
+    loose := json.decode::<LooseCollision>(b"{\"liquid\":{\"ignored\":[1,2,3]},\"costarring\":5,\"extra\":false}")?
+    assert_eq(loose.costarring, 5u32)
+    match json.decode::<LooseCollision>(b"{\"liquid\":2}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.MissingField)
+        },
+    }
+    // Duplicate rejection still belongs to validation, including escape aliases.
+    match json.decode::<Collision>(b"{\"costarring\":1,\"liquid\":\"a\",\"li\\u0071uid\":\"b\"}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.DuplicateField)
+            assert_eq(reason.position, 29usize)
+        },
+    }
+    return ok()
+}
+
+fn ownership_and_errors() -> void!json.Error {
+    reset()
+    {
+        owners := json.decode::<Owners>(b"{\"last\":3,\"optional\":2,\"first\":1}")?
+        assert_eq(owners.first.value, 1u64)
+        assert_eq(owners.last.value, 3u64)
+        check_state(123, 0)
+    }
+    check_state(123, 3)
+    optional_inputs := [b"{\"last\":3,\"first\":1}", b"{\"optional\":null,\"last\":3,\"first\":1}"]
+    for input in &optional_inputs {
+        reset()
+        {
+            owners := json.decode::<Owners>(*input)?
+            match &owners.optional {
+                some(_) => {
+                    assert(false)
+                },
+                none => {},
+            }
+            check_state(13, 0)
+        }
+        check_state(13, 2)
+    }
+    expect_error(b"  {}", json.ErrorKind.MissingField, 2, 0, 0)
+    expect_error(b"{\"last\":false}", json.ErrorKind.MissingField, 0, 0, 0)
+    expect_error(b"{\"first\":1,\"optional\":2}", json.ErrorKind.MissingField, 0, 12, 2)
+    expect_error(b"{\"last\":false,\"first\":1}", json.ErrorKind.TypeMismatch, 8, 1, 1)
+    expect_error(b"{\"first\":null,\"last\":3}", json.ErrorKind.TypeMismatch, 9, 0, 0)
+    expect_error(b"{\"first\":1,\"optional\":false,\"last\":3}", json.ErrorKind.TypeMismatch, 22, 1, 1)
+    expect_error(b"{\"first\":false,\"extra\":0}", json.ErrorKind.UnknownField, 15, 0, 0)
+    expect_error(b"{\"first\":1,\"last\":3,\"extra\":0}", json.ErrorKind.UnknownField, 20, 0, 0)
+    expect_error(b" []", json.ErrorKind.TypeMismatch, 1, 0, 0)
+    return ok()
+}
+
+fn main() {
+    names_and_collisions()!
+    ownership_and_errors()!
+}
+
+@test
+fn single_pass_struct_decoding() {
+    main()
+}

@@ -87,12 +87,67 @@ fn public_json_api_and_example_execute_and_cross_compile() {
     for (source, stem) in [
         ("tests/stdlib/encoding_json_checks.dodo", "json-api"),
         ("tests/stdlib/json_values.dodo", "json-values"),
+        ("tests/stdlib/json_strings.dodo", "json-strings"),
+        ("tests/stdlib/json_indexed.dodo", "json-indexed"),
         ("tests/stdlib/json_derive.dodo", "json-derive"),
+        ("tests/stdlib/json_structs.dodo", "json-structs"),
         ("tests/stdlib/json_encoder.dodo", "json-encoder"),
         ("examples/json.dodo", "json-example"),
     ] {
         execute_and_cross_compile(&root.join(source), &scratch, stem);
     }
+}
+
+#[test]
+fn wide_derived_structs_track_required_and_optional_fields() {
+    use std::fmt::Write;
+
+    let scratch = Scratch::new();
+    let source = scratch.0.join("wide.dodo");
+    let mut program =
+        "package wide\nimport \"std/encoding/json\"\n@derive(Json)\nstruct Wide {\n".to_owned();
+    for i in 0..70 {
+        let ty = if i % 2 == 0 { "Option<u32>" } else { "u32" };
+        writeln!(program, "field{i}: {ty}").unwrap();
+    }
+    program.push_str("}\nfn main() {\n");
+    for omit_optional in [false, true] {
+        let members = (0..70)
+            .rev()
+            .filter(|i| !omit_optional || i % 2 != 0)
+            .map(|i| format!("\"field{i}\":{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = format!("{{{members}}}");
+        writeln!(program, "{{\nrecord := json.decode::<Wide>(b{input:?})!").unwrap();
+        for i in 0..70 {
+            if i % 2 != 0 {
+                writeln!(program, "assert_eq(record.field{i}, {i}u32)").unwrap();
+            } else if omit_optional {
+                writeln!(
+                    program,
+                    "match &record.field{i} {{ some(_) => {{ assert(false) }}, none => {{}}, }}"
+                )
+                .unwrap();
+            } else {
+                writeln!(program, "match &record.field{i} {{ some(value) => {{ assert_eq(*value, {i}u32) }}, none => {{ assert(false) }}, }}").unwrap();
+            }
+        }
+        program.push_str("}\n");
+    }
+    // Missing required fields at either end and in the middle must be found.
+    for missing in [1, 35, 69] {
+        let members = (0..70)
+            .filter(|i| *i != missing)
+            .map(|i| format!("\"field{i}\":{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = format!("{{{members}}}");
+        writeln!(program, "match json.decode::<Wide>(b{input:?}) {{ ok(_) => {{ assert(false) }}, err(reason) => {{ assert_eq(reason.kind, json.ErrorKind.MissingField) }}, }}").unwrap();
+    }
+    program.push_str("}\n");
+    fs::write(&source, program).unwrap();
+    execute_and_cross_compile(&source, &scratch, "json-wide-struct");
 }
 
 #[test]

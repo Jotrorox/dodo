@@ -37,6 +37,51 @@ struct BorrowedArrays {
 }
 
 @derive(Json)
+struct Pair {
+    values: [2]u8
+}
+
+@derive(Json)
+struct NoValues {
+    values: [0]u8
+}
+
+@derive(Json)
+struct NestedArrays {
+    values: [2][2]Option<Inner>
+}
+
+@derive(Json)
+struct PrimitiveArrays {
+    flags: [2]bool
+    signed: [2]i8
+    unsigned: [2]u64
+    floats: [2]f32
+    doubles: [2]f64
+}
+
+static mut array_drops: usize = 0
+struct Tracked {
+    value: u64
+
+    fn decode_json(value: json.Value) -> Self!json.Error {
+        return ok(Self { value: value.as_u64()? })
+    }
+    fn encode_json<W>(&self, encoder: &mut json.Encoder<W>) -> void!json.Error {
+        return encoder.unsigned(self.value)
+    }
+    fn drop(&mut self) {
+        unsafe {
+            array_drops += 1
+        }
+    }
+}
+@derive(Json)
+struct TrackedArray {
+    values: [2]Tracked
+}
+
+@derive(Json)
 struct Narrow {
     signed: i8
     unsigned: u8
@@ -217,10 +262,188 @@ fn validation_and_custom_codecs() -> void!json.Error {
     return ok()
 }
 
+fn array_validation() -> void!json.Error {
+    primitives := json.decode::<PrimitiveArrays>(b"{\"flags\":[true,false],\"signed\":[-128,127],\"unsigned\":[0,18446744073709551615],\"floats\":[1.5,-2.25],\"doubles\":[-3.5,4.25]}")?
+    assert(primitives.flags[0] && !primitives.flags[1])
+    assert_eq(primitives.signed[0], -128i8)
+    assert_eq(primitives.signed[1], 127i8)
+    assert_eq(primitives.unsigned[0], 0u64)
+    assert_eq(primitives.unsigned[1], 18446744073709551615u64)
+    assert_eq(primitives.floats[0], 1.5f32)
+    assert_eq(primitives.floats[1], -2.25f32)
+    assert_eq(primitives.doubles[0], -3.5f64)
+    assert_eq(primitives.doubles[1], 4.25f64)
+    pair := json.decode::<Pair>(b"{\"values\": [ 1 , 255 ] }")?
+    assert_eq(pair.values[0], 1u8)
+    assert_eq(pair.values[1], 255u8)
+    invalid := [
+        b"{\"values\":null}",
+        b"{\"values\":{}}",
+        b"{\"values\":[]}",
+        b"{\"values\":[1]}",
+        b"{\"values\":[1,2,3]}",
+    ]
+    for input in &invalid {
+        match json.decode::<Pair>(*input) {
+            ok(_) => {
+                assert(false)
+            },
+            err(reason) => {
+                assert_eq(reason.kind, json.ErrorKind.TypeMismatch)
+                assert_eq(reason.position, 10usize)
+            },
+        }
+    }
+    empty := json.decode::<NoValues>(b"{\"values\": [ \n\t ] }")?
+    assert_eq(empty.values.len, 0usize)
+    invalid_empty := [b"{\"values\":[1]}", b"{\"values\":null}"]
+    for input in &invalid_empty {
+        match json.decode::<NoValues>(*input) {
+            ok(_) => {
+                assert(false)
+            },
+            err(reason) => {
+                assert_eq(reason.kind, json.ErrorKind.TypeMismatch)
+                assert_eq(reason.position, 10usize)
+            },
+        }
+    }
+    match json.decode::<Pair>(b"{\"values\":[1,256]}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.NumberRange)
+            assert_eq(reason.position, 13usize)
+        },
+    }
+    match json.decode::<Pair>(b"{\"values\":[1,false]}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.TypeMismatch)
+            assert_eq(reason.position, 13usize)
+        },
+    }
+    nested := json.decode::<NestedArrays>(b"{\"values\":[[{\"text\":\"A],\\\"[\"},null],[null,{\"text\":\"B\\u0043\"}]]}")?
+    match &nested.values[0][0] {
+        some(inner) => {
+            assert(inner.text.equals("A],\"["))
+        },
+        none => {
+            assert(false)
+        },
+    }
+    match &nested.values[1][1] {
+        some(inner) => {
+            assert(inner.text.equals("BC"))
+        },
+        none => {
+            assert(false)
+        },
+    }
+    invalid_nested := [
+        b"{\"values\":[[],[null,null]]}",
+        b"{\"values\":[[null],[null,null]]}",
+        b"{\"values\":[[null,null,null],[null,null]]}",
+        b"{\"values\":[null,[null,null]]}",
+    ]
+    for input in &invalid_nested {
+        match json.decode::<NestedArrays>(*input) {
+            ok(_) => {
+                assert(false)
+            },
+            err(reason) => {
+                assert_eq(reason.kind, json.ErrorKind.TypeMismatch)
+                assert_eq(reason.position, 11usize)
+            },
+        }
+    }
+    return ok()
+}
+
+fn array_failure_cleanup() -> void!json.Error {
+    // Failure converting the second element drops the first decoded owner.
+    unsafe {
+        array_drops = 0
+    }
+    match json.decode::<TrackedArray>(b"{\"values\":[1,false]}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.TypeMismatch)
+        },
+    }
+    unsafe {
+        assert_eq(array_drops, 1usize)
+    }
+    // Too few elements and the final check for too many also clean up owners.
+    unsafe {
+        array_drops = 0
+    }
+    match json.decode::<TrackedArray>(b"{\"values\":[1]}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.TypeMismatch)
+        },
+    }
+    unsafe {
+        assert_eq(array_drops, 1usize)
+    }
+    unsafe {
+        array_drops = 0
+    }
+    match json.decode::<TrackedArray>(b"{\"values\":[1,2,3]}") {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert_eq(reason.kind, json.ErrorKind.TypeMismatch)
+        },
+    }
+    unsafe {
+        assert_eq(array_drops, 2usize)
+    }
+    unsafe {
+        array_drops = 0
+    }
+    {
+        record := json.decode::<TrackedArray>(b"{\"values\":[1,2]}")?
+        assert_eq(record.values[0].value, 1u64)
+        assert_eq(record.values[1].value, 2u64)
+        unsafe {
+            assert_eq(array_drops, 0usize)
+        }
+    }
+    unsafe {
+        assert_eq(array_drops, 2usize)
+    }
+    return ok()
+}
+
+fn borrowed_cursor(input: &[u8]) -> [2] &str!json.Error from(input) {
+    cursor := json.ArrayCursor.new(json.parse(input)?)?
+    let json.ArrayElement { rest: tail, value: first } = cursor.take()?
+    a := first.into_str()?
+    let json.ArrayElement { rest: end, value: second } = tail.take()?
+    b := second.into_str()?
+    end.finish()?
+    return ok([a, b])
+}
+
 fn main() {
     primitive_boundaries()!
     borrowed_composition()!
     validation_and_custom_codecs()!
+    array_validation()!
+    array_failure_cleanup()!
+    strings := borrowed_cursor(b"[ \"first\", \"second\" ]")!
+    assert_eq(strings[0], "first")
+    assert_eq(strings[1], "second")
 }
 
 @test

@@ -4,7 +4,7 @@
 //! checker. No JSON operation receives privileged access to memory or lifetimes.
 use crate::ast::*;
 use crate::diagnostic::Diagnostic;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 
 pub(crate) struct Derive {
@@ -96,7 +96,6 @@ pub(crate) fn expand(
         let writer = generator.fresh("__JsonWriter");
         let encoder = generator.fresh("encoder");
         let value = generator.fresh("value");
-        let key_binding = generator.fresh("__json_keys");
         generator.encoder = encoder.clone();
         // A private type can still participate in a public generic protocol.
         // Its name remains private, while the generic caller can invoke its
@@ -114,40 +113,56 @@ pub(crate) fn expand(
             generator.encode(&field.ty, &format!("self.{}", field.name), false);
         }
         writeln!(generator.source, "{encoder}.end_object()?\nreturn ok()\n}}\n{visibility}fn decode_json({value}: {alias}.Value) -> Self!{alias}.Error {{").unwrap();
-        let keys = derive
-            .json_names
-            .iter()
-            .map(|name| format!("{name:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let position = generator.local();
+        let cursor = generator.local();
         writeln!(
             generator.source,
-            "{key_binding} := ([{keys}]: [{}]&str)\n{value}.check_fields(&{key_binding}, {})?",
-            derive.json_names.len(),
-            derive.deny_unknown
+            "{position} := {value}.position()\n{cursor} := {alias}.ObjectCursor.new({value})?"
         )
         .unwrap();
+        // Optional raw views track presence without requiring default values
+        // for user types. Decode them in declaration order after dispatch so
+        // unknown-field errors, custom codecs and cleanup keep their ordering.
+        let mut slots = Vec::new();
+        let mut dispatch = BTreeMap::<u32, Vec<(String, String)>>::new();
+        for name in &derive.json_names {
+            let slot = generator.local();
+            writeln!(generator.source, "{slot}: Option<{alias}.Value> = none").unwrap();
+            dispatch
+                .entry(field_hash(name))
+                .or_default()
+                .push((name.clone(), slot.clone()));
+            slots.push(slot);
+        }
+        let member_position = generator.local();
+        let rest = generator.local();
+        let key = generator.local();
+        let hash = generator.local();
+        let raw = generator.local();
+        writeln!(generator.source, "for {cursor}.has_next() {{\n{member_position} := {cursor}.position()\nlet {alias}.ObjectField {{ rest: {rest}, key: {key}, hash: {hash}, value: {raw} }} = {cursor}.take()?\n{cursor} = {rest}").unwrap();
+        generator.dispatch_fields(&dispatch.into_iter().collect::<Vec<_>>(), &hash, &key, &raw);
+        if derive.deny_unknown {
+            writeln!(generator.source, "return err({alias}.Error {{ kind: {alias}.ErrorKind.UnknownField, position: {member_position} }})").unwrap();
+        }
+        writeln!(generator.source, "}}").unwrap();
         let mut decoded = Vec::new();
-        for (field, name) in structure.fields.iter().zip(&derive.json_names) {
-            let result = if let Type::Option(inner) = &field.ty {
-                let output = generator.local();
-                let raw = generator.local();
-                let rest = generator.local();
-                let optional = generator.local();
-                writeln!(generator.source, "let {alias}.OptionalField {{ rest: {rest}, value: {optional} }} = {alias}.take_optional_field({value}, {name:?})?\n{value} = {rest}\n{output}: {} = none\nmatch {optional} {{\nsome({raw}) => {{\nif {raw}.kind() != {alias}.Kind.Null {{", field.ty).unwrap();
-                let item = generator.decode(inner, &raw);
-                writeln!(
-                    generator.source,
-                    "{output} = some({item})\n}}\n}},\nnone => {{}},\n}}"
-                )
-                .unwrap();
-                output
+        for (field, slot) in structure.fields.iter().zip(&slots) {
+            let result = generator.local();
+            let raw = generator.local();
+            writeln!(
+                generator.source,
+                "{result}: {} = match {slot} {{\nsome({raw}) => {{",
+                field.ty
+            )
+            .unwrap();
+            let item = generator.decode(&field.ty, &raw);
+            writeln!(generator.source, "{item}\n}},\nnone => {{").unwrap();
+            if matches!(field.ty, Type::Option(_)) {
+                writeln!(generator.source, "none").unwrap();
             } else {
-                let raw = generator.local();
-                let rest = generator.local();
-                writeln!(generator.source, "let {alias}.Field {{ rest: {rest}, value: {raw} }} = {alias}.take_field({value}, {name:?})?\n{value} = {rest}").unwrap();
-                generator.decode(&field.ty, &raw)
-            };
+                writeln!(generator.source, "return err({alias}.Error {{ kind: {alias}.ErrorKind.MissingField, position: {position} }})").unwrap();
+            }
+            writeln!(generator.source, "}},\n}}").unwrap();
             decoded.push(format!("{}: {result}", field.name));
         }
         writeln!(
@@ -182,6 +197,14 @@ pub(crate) fn expand(
         program.functions.extend(expanded.functions);
     }
     Ok(())
+}
+
+// Keep in sync with ObjectCursor.take: FNV-1a over decoded Unicode scalars,
+// using u32 on every target. Hash collisions always receive a full name check.
+fn field_hash(name: &str) -> u32 {
+    name.chars().fold(2_166_136_261, |hash, scalar| {
+        (hash ^ scalar as u32).wrapping_mul(16_777_619)
+    })
 }
 
 fn expansion_cost(ty: &Type) -> usize {
@@ -225,6 +248,34 @@ struct Generator<'a> {
 }
 
 impl Generator<'_> {
+    fn dispatch_fields(
+        &mut self,
+        buckets: &[(u32, Vec<(String, String)>)],
+        hash: &str,
+        key: &str,
+        value: &str,
+    ) {
+        if buckets.len() > 1 {
+            // A balanced tree bounds dispatch even without LLVM optimization.
+            let middle = buckets.len() / 2;
+            writeln!(self.source, "if {hash} < {}u32 {{", buckets[middle].0).unwrap();
+            self.dispatch_fields(&buckets[..middle], hash, key, value);
+            writeln!(self.source, "}} else {{").unwrap();
+            self.dispatch_fields(&buckets[middle..], hash, key, value);
+            writeln!(self.source, "}}").unwrap();
+        } else if let Some((expected, fields)) = buckets.first() {
+            writeln!(self.source, "if {hash} == {expected}u32 {{").unwrap();
+            for (name, slot) in fields {
+                writeln!(
+                    self.source,
+                    "if {key}.equals({name:?}) {{\n{slot} = some({value})\ncontinue\n}}"
+                )
+                .unwrap();
+            }
+            writeln!(self.source, "}}").unwrap();
+        }
+    }
+
     fn fresh(&mut self, base: &str) -> String {
         let mut name = base.to_owned();
         while !self.used_names.insert(name.clone()) {
@@ -361,21 +412,58 @@ impl Generator<'_> {
             }
             Type::Array(size, inner) => {
                 let array = self.local();
-                writeln!(self.source, "{array} := {value}").unwrap();
-                let value = array.as_str();
-                writeln!(self.source, "if {value}.kind() != {}.Kind.Array {{ {} }}\nif {value}.len()? != {size}usize {{ {} }}", self.json, self.fail("TypeMismatch", value), self.fail("TypeMismatch", value)).unwrap();
+                writeln!(
+                    self.source,
+                    "{array} := {}.ArrayCursor.new({value})?",
+                    self.json
+                )
+                .unwrap();
+                // Primitive elements can be initialized and replaced in a loop.
+                // Keep individual locals for borrowed/custom values so ordinary
+                // ownership checking and failure cleanup still apply to them.
+                let initial = match inner.as_ref() {
+                    Type::Bool => Some("false".to_owned()),
+                    Type::Int { .. } | Type::Float(_) => Some(format!("0 as {inner}")),
+                    _ => None,
+                };
+                if let Some(initial) = initial {
+                    let index = self.local();
+                    writeln!(
+                        self.source,
+                        "{output}: {ty} = [{initial}; {size}]\nfor {index} in 0usize..{size}usize {{"
+                    )
+                    .unwrap();
+                    let raw = self.take_array_element(&array);
+                    let item = self.decode(inner, &raw);
+                    writeln!(
+                        self.source,
+                        "{output}[{index}] = {item}\n}}\n{array}.finish()?"
+                    )
+                    .unwrap();
+                    return output;
+                }
                 let mut items = Vec::new();
-                for index in 0..*size {
-                    let raw = self.local();
-                    let rest = self.local();
-                    writeln!(self.source, "let {}.Field {{ rest: {rest}, value: {raw} }} = {}.take_element({value}, {index}usize)?\n{value} = {rest}", self.json, self.json).unwrap();
+                for _ in 0..*size {
+                    let raw = self.take_array_element(&array);
                     items.push(self.decode(inner, &raw));
                 }
-                writeln!(self.source, "{output} := ([{}]: {ty})", items.join(", ")).unwrap();
+                writeln!(
+                    self.source,
+                    "{array}.finish()?\n{output} := ([{}]: {ty})",
+                    items.join(", ")
+                )
+                .unwrap();
             }
             _ => unreachable!("types validated before expansion"),
         }
         output
+    }
+
+    fn take_array_element(&mut self, array: &str) -> String {
+        let raw = self.local();
+        let rest = self.local();
+        writeln!(self.source, "let {}.ArrayElement {{ rest: {rest}, value: {raw} }} = {array}.take()?\n{array} = {rest}", self.json).unwrap();
+        raw
     }
 }
 

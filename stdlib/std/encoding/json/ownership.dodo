@@ -11,6 +11,109 @@ pub struct OptionalField {
     pub rest: Value
     pub value: Option<Value>
 }
+
+// Consuming object traversal transfers the source borrow to each field and
+// the remaining cursor. Retained fields never borrow the cursor itself.
+pub struct ObjectCursor {
+    data: &[u8]
+    start: usize
+    offset: usize
+    end: usize
+
+    pub fn new(source: Value) -> ObjectCursor!Error from(source) {
+        source.require_object()?
+        return ok(ObjectCursor {
+            data: source.data, start: source.start,
+            offset: skip_space(source.data, source.start + 1), end: source.end - 1
+        })
+    }
+    pub fn has_next(&self) -> bool {
+        return self.offset < self.end
+    }
+    pub fn position(&self) -> usize {
+        return self.offset
+    }
+    pub fn take(self) -> ObjectField!Error from(self) {
+        if self.offset >= self.end {
+            return err(failure(ErrorKind.MissingField, self.start))
+        }
+        key_start := self.offset
+        key_end := skip_validated(self.data, key_start)
+        // FNV-1a over decoded scalars, in sync with the derive generator.
+        // A hash selects candidates only; generated dispatch checks equality.
+        hash := 2166136261u32
+        offset := key_start + 1
+        for offset < key_end - 1 {
+            decoded := scalar(self.data, offset, true)?
+            hash = core.wrapping_mul(hash ^ decoded.scalar, 16777619u32)
+            offset = decoded.next
+        }
+        start := skip_space(self.data, skip_space(self.data, key_end) + 1)
+        end := skip_validated(self.data, start)
+        offset = skip_space(self.data, end)
+        if offset < self.end {
+            offset = skip_space(self.data, offset + 1)
+        }
+        data := self.data
+        return ok(ObjectField {
+            rest: ObjectCursor { data: data, start: self.start, offset: offset, end: self.end },
+            key: json_string(data, key_start, key_end), hash: hash,
+            value: Value { data: data, start: start, end: end }
+        })
+    }
+}
+pub struct ObjectField {
+    pub rest: ObjectCursor
+    pub key: String
+    pub hash: u32
+    pub value: Value
+}
+
+// A consuming cursor lets decoded children retain the original input borrow
+// while subsequent elements are extracted. Each take scans only the next value.
+pub struct ArrayCursor {
+    data: &[u8]
+    start: usize
+    offset: usize
+    end: usize
+
+    pub fn new(source: Value) -> ArrayCursor!Error from(source) {
+        if source.kind() != Kind.Array {
+            return err(failure(ErrorKind.TypeMismatch, source.start))
+        }
+        start := source.start
+        offset := skip_space(source.data, start + 1)
+        end := source.end - 1
+        return ok(ArrayCursor { data: source.data, start: start, offset: offset, end: end })
+    }
+    pub fn take(self) -> ArrayElement!Error from(self) {
+        if self.offset >= self.end {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        start := self.offset
+        end := skip_validated(self.data, start)
+        offset := skip_space(self.data, end)
+        if offset < self.end {
+            offset = skip_space(self.data, offset + 1)
+        }
+        data := self.data
+        return ok(ArrayElement {
+            rest: ArrayCursor { data: data, start: self.start, offset: offset, end: self.end },
+            value: Value { data: data, start: start, end: end }
+        })
+    }
+    pub fn finish(self) -> void!Error {
+        if self.offset < self.end {
+            return err(failure(ErrorKind.TypeMismatch, self.start))
+        }
+        return ok()
+    }
+}
+pub struct ArrayElement {
+    pub rest: ArrayCursor
+    pub value: Value
+}
+
 pub fn take_field(source: Value, name: &str) -> Field!Error from(source) {
     child := source.require(name)?
     start := child.start

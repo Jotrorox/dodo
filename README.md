@@ -130,6 +130,9 @@ cargo run --locked -- test
 cargo run --locked -- test -O 3
 ```
 
+For repeatable JSON, routing, and loopback HTTP performance measurements, see
+the [stdlib benchmark guide](benchmarks/README.md) and [recorded baseline](benchmarks/RESULTS.md).
+
 To edit and verify documentation with Node.js 24+ and Python 3.10+:
 
 ```sh

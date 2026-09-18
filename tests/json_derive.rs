@@ -103,6 +103,14 @@ fn derived_arrays_and_custom_codecs_typecheck() {
 }
 
 #[test]
+fn derived_struct_dispatch_and_cleanup_typecheck() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stdlib/json_structs.dodo");
+    let mut loaded = package::load(&path).unwrap_or_else(|error| panic!("{error}"));
+    sema::check(&mut loaded.program).unwrap_or_else(|error| panic!("{}", loaded.render(&error)));
+}
+
+#[test]
 fn derived_codecs_work_across_packages_with_import_aliases() {
     let directory =
         std::env::temp_dir().join(format!("dodo-json-derive-imports-{}", std::process::id()));
@@ -190,6 +198,31 @@ fn derives_do_not_allow_borrowed_strings_to_escape_local_input() {
         "{}",
         loaded.render(&error)
     );
+}
+
+#[test]
+fn derived_nested_arrays_preserve_input_borrows() {
+    let directory =
+        std::env::temp_dir().join(format!("dodo-json-array-borrows-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("main.dodo");
+    for element in ["&str", "json.String", "Option<json.String>", "json.Value"] {
+        for body in [
+            "fn escape() -> Record!json.Error from(static) { input := [123u8,34,118,97,108,117,101,115,34,58,91,91,34,120,34,93,93,125]\nreturn json.decode<Record>(&input) }",
+            "fn invalid() -> usize!json.Error { input := [123u8,34,118,97,108,117,101,115,34,58,91,91,34,120,34,93,93,125]\nrecord := json.decode<Record>(&input)?\ninput[13] = 121\nreturn ok(record.values.len) }",
+        ] {
+            std::fs::write(&source, format!("package bad\nimport \"std/encoding/json\"\n@derive(Json)\nstruct Record {{ values: [1][1]{element} }}\n{body}\n")).unwrap();
+            let mut loaded = package::load(&source).unwrap_or_else(|error| panic!("{error}"));
+            let error = sema::check(&mut loaded.program)
+                .expect_err("derived array escaped or invalidated its backing input");
+            assert!(
+                error.message.contains("borrow"),
+                "{}",
+                loaded.render(&error)
+            );
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

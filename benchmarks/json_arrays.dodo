@@ -1,0 +1,52 @@
+package json_arrays_bench
+
+import "core/ptr"
+import "std/console"
+import "std/io"
+import "std/time/hosted"
+import "std/encoding/json"
+
+@derive(Json)
+struct Record {
+    values: [16]u32 // The runner substitutes each measured array length.
+}
+
+fn main() {
+    input := console.stdin()
+    header := [0u8; 16]
+    io.read_exact(&mut input, &mut header)!
+    iterations := 0u64
+    for i in 0usize..8 {
+        iterations |=(header[i] as u64) << ((i * 8) as u64)
+    }
+    storage := [0u8; 65536]
+    report := io.read_bounded(&mut input, &mut storage)!
+    assert(report.eof && report.read > 0 && iterations > 0)
+    mode := header[8]
+    checksum := 0u64
+    clock := hosted.MonotonicClock.new()
+    start := clock.now()!
+    for i in 0u64..iterations {
+        digit := (unsafe {
+            ptr.read_volatile(ptr.from_ref(&i))
+        } % 10) as u8
+        storage[11] = 48 + digit
+        if mode == 0 {
+            value := json.parse(&storage[..report.read])!
+            checksum += value.raw().len as u64 + digit as u64
+        } else {
+            record := json.decode::<Record>(&storage[..report.read])!
+            checksum += record.values[0] as u64 + record.values[record.values.len - 1] as u64
+        }
+    }
+    end := clock.now()!
+    elapsed := end.duration_since(&start)!
+    nanos := elapsed.to_nanos()!
+    // Validate every decoded element outside the timed region.
+    record := json.decode::<Record>(&storage[..report.read])!
+    assert_eq(record.values[0], ((iterations - 1) % 10) as u32)
+    for index in 1usize..record.values.len {
+        assert_eq(record.values[index], index as u32)
+    }
+    console.printf("{} {}\n", nanos, checksum)!
+}

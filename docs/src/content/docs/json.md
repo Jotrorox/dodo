@@ -19,6 +19,7 @@ when you need to inspect a document whose shape varies.
 | --- | --- |
 | Decode a known object shape | `@derive(Json)` and `json.decode::<T>(bytes)` |
 | Inspect a document or primitive root | `json.parse(bytes)` and `Value` accessors |
+| Parse wide objects with a key index | `json.parse_indexed(bytes, &mut scratch)` |
 | Accept escaped external strings | A `json.String` field and its `decode` method |
 | Encode your own struct | `json.to_slice(&value, &mut storage)` |
 | Generate values one token at a time | `json.Encoder.new(&mut writer)` |
@@ -111,6 +112,14 @@ members are ignored by default; `@json_deny_unknown` rejects them. Required fiel
 must be present and have the declared type. `Option<T>` accepts a missing member
 or JSON `null` as `none`; `some(value)` decodes the underlying type. Encoding
 `none` emits `null`. Fixed arrays require exactly their declared element count.
+Derived array decoders advance through elements sequentially, with no repeated
+index lookup or separate length pass. Primitive arrays use a generated loop.
+Derived struct decoders traverse the object once, dispatching decoded field names
+through a generated hash decision tree and tracking which members were present.
+They retain field views in storage proportional to the schema size, then convert
+them in declaration order. Unknown-field checks precede conversion, and borrowed
+fields keep their dependency on the input. Hash collisions receive full name
+comparisons. Document validation, including duplicate detection, is separate.
 Decoding does not coerce strings into numbers, numbers into booleans, or `null`
 into a required field's zero value.
 
@@ -136,6 +145,8 @@ directly through derivation.
 | Decode an inspected value | `json.from_value<T>(value) -> T!json.Error` |
 | Inspect JSON dynamically | `json.parse(input) -> json.Value!json.Error` |
 | Inspect a language string | `json.parse_str(input) -> json.Value!json.Error` |
+| Inspect JSON using a scratch key index | `json.parse_indexed(input, &mut scratch) -> json.Value!json.Error` |
+| Inspect text using a scratch key index | `json.parse_str_indexed(input, &mut scratch) -> json.Value!json.Error` |
 | Encode to caller-owned bytes | `json.to_slice(&value, &mut storage) -> usize!json.Error` |
 | Encode through a byte writer | `json.encode(&value, &mut writer) -> usize!json.Error` |
 | Encode readable output | `json.encode_pretty(&value, &mut writer) -> usize!json.Error` |
@@ -166,6 +177,48 @@ without a special line parser. Use or drop each returned view before advancing
 the decoder. `position()` reports the byte cursor; a malformed document leaves
 the cursor unchanged and subsequent calls return the same error.
 
+### Indexed parsing
+
+For wide objects, `parse_indexed` and `parse_str_indexed` use caller-provided
+`&mut[usize]` scratch storage to avoid repeatedly scanning earlier members.
+They enforce the same JSON syntax, decoded-name uniqueness, and nesting limit
+as `parse`. Hash collisions are resolved by comparing complete decoded names.
+
+```dodo test
+package indexed_json
+import "std/encoding/json"
+
+fn main() {
+    scratch := [0usize; 128 * json.KEY_INDEX_WORDS]
+    value := json.parse_indexed(b"{\"name\":\"Ada\",\"age\":36}", &mut scratch)!
+    // Scratch can be reused while earlier input-backed values remain live.
+    next := json.parse_str_indexed("{\"ok\":true}", &mut scratch)!
+    age := value.require("age")!
+    ok := next.require("ok")!
+    assert_eq(age.as_u64()!, 36u64)
+    assert(ok.as_bool()!)
+}
+```
+
+Each live object member requires `json.KEY_INDEX_WORDS` (five) words. Capacity
+is `scratch.len / json.KEY_INDEX_WORDS`; any remaining words are unused. Entries
+belong to open objects and are released when those objects close, so nested
+objects share the same storage and successive objects in an array reuse it.
+Size scratch for the largest combined number of members already encountered in
+all currently open objects, including the member whose value is being parsed.
+A flat 1,024-field object needs 5,120 words (40 KiB on a 64-bit target).
+
+Insufficient capacity returns `BufferFull` at the new key's opening quote; it
+does not silently fall back to rescanning. Empty scratch accepts documents
+without object members. Each call resets the index, including after a failed
+parse, and returned values borrow only the input. Use `json.from_value::<T>`
+to decode an indexed result with an existing derived or custom codec.
+
+Index setup takes time proportional to scratch capacity. With well-distributed
+hashes, validation takes expected linear time in input size plus that setup;
+deliberately colliding keys can still cause quadratic comparisons. The original
+`parse` entry points keep their constant-extra-memory duplicate detection.
+
 ## Borrowed values and strings
 
 ### Input ownership
@@ -174,10 +227,11 @@ the cursor unchanged and subsequent calls return the same error.
 Keep the input alive and unchanged while using them. A decoded struct containing
 either view has the same lifetime dependency. Decoding an object does not build
 an owned heap tree; array/object navigation scans the validated source. Repeated
-lookups can therefore repeat work. Duplicate-name validation uses constant extra
-storage and compares earlier members; its work grows quadratically with the
-number of object members. Apply application input limits to large external
-documents.
+lookups can therefore repeat work. The `parse` and `parse_str` entry points use
+constant extra storage for duplicate-name validation and compare earlier
+members; their work grows quadratically with the number of object members.
+Use indexed parsing to supply scratch storage for this check. Apply application
+input limits to large external documents.
 
 `json.String` represents a complete JSON string, including escaped content.
 `equals("text")` compares its decoded contents; `equal(&other)` compares two JSON
@@ -395,6 +449,16 @@ ownership dependencies. `check_fields(keys, deny_unknown)` requires an object
 and rejects unlisted names when `deny_unknown` is true; required-field checks
 still happen when extracting each field. Prefer derivation until you need a custom
 representation or validation rule.
+
+For sequential extraction, `ArrayCursor.new(value)` consumes an array view.
+Each consuming `take()` returns `ArrayElement { rest, value }`: decode the child
+and continue with `rest`. Children retain the original input borrow and can
+remain live while the cursor advances. `take()` reports `TypeMismatch` at the
+array's position if there are no elements left; `finish()` reports the same
+error if any remain. Taking the expected number of elements and then calling
+`finish()` checks a fixed array's length without counting it first. Conversion
+errors are reported as elements are decoded, so an invalid element can be
+reported before a length mismatch later in the array.
 
 The [API reference](stdlib-api.md) includes every encoder, decoder, projection,
 iterator, and error declaration.

@@ -18,6 +18,16 @@ fn json_value_fixture_typechecks() {
 }
 
 #[test]
+fn json_string_fixture_typechecks() {
+    check_fixture("tests/stdlib/json_strings.dodo");
+}
+
+#[test]
+fn json_indexed_fixture_typechecks() {
+    check_fixture("tests/stdlib/json_indexed.dodo");
+}
+
+#[test]
 fn json_independent_checks_typecheck() {
     check_fixture("tests/stdlib/encoding_json_checks.dodo");
 }
@@ -42,6 +52,8 @@ fn json_views_preserve_input_and_destination_borrows() {
     fs::create_dir_all(&scratch).unwrap();
     let source = scratch.join("bad.dodo");
     for body in [
+        "fn escape() -> json.Value!json.Error from(static) { input := [110u8,117,108,108]\nscratch := [0usize; 5]\nreturn json.parse_indexed(&input, &mut scratch) }",
+        "fn invalid() -> usize!json.Error { input := [110u8,117,108,108]\nscratch := [0usize; 5]\nvalue := json.parse_indexed(&input, &mut scratch)?\ninput[0] = 120\nreturn ok(value.raw().len) }",
         "fn escape() -> json.Value!json.Error from(static) { input := [110u8, 117, 108, 108]\nreturn json.parse(&input) }",
         "fn escape() -> json.String!json.Error from(static) { input := [34u8, 120, 34]\nvalue := json.parse(&input)?\nreturn value.as_string() }",
         "fn escape() -> json.String!json.Error from(static) { input := [34u8, 120, 34]\nvalue := json.parse(&input)?\nreturn value.into_string() }",

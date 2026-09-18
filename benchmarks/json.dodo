@@ -1,0 +1,86 @@
+package json_bench
+
+import "core/ptr"
+import "std/console"
+import "std/io"
+import "std/encoding/json"
+import "std/time/hosted"
+
+@derive(Json)
+struct Record {
+    id: u64
+    name: json.String
+    active: bool
+    scores: [4]u32
+}
+
+fn main() {
+    input := console.stdin()
+    header := [0u8; 16]
+    io.read_exact(&mut input, &mut header)!
+    iterations := 0u64
+    for i in 0usize..8 {
+        iterations |=(header[i] as u64) << ((i * 8) as u64)
+    }
+    mode := header[8]
+    storage := [0u8; 65536]
+    report := io.read_bounded(&mut input, &mut storage)!
+    assert(report.eof && report.read > 0 && iterations > 0)
+    count := report.read
+    output := [0u8; 65536]
+    key_index := [0usize; 5120]
+    checksum := 0u64
+    clock := hosted.MonotonicClock.new()
+    if mode == 2 {
+        record := json.decode::<Record>(&storage[..count])!
+        written := 0usize
+        start := clock.now()!
+        for i in 0u64..iterations {
+            // A volatile read makes the changed field opaque to optimization.
+            record.id = unsafe {
+                ptr.read_volatile(ptr.from_ref(&i))
+            } % 10
+            written = json.to_slice(&record, &mut output)!
+            checksum += written as u64 + output[6] as u64
+        }
+        end := clock.now()!
+        elapsed := end.duration_since(&start)!
+        nanos := elapsed.to_nanos()!
+        // Check the last complete serialization outside the timed region.
+        again := json.decode::<Record>(&output[..written])!
+        assert_eq(again.id, (iterations - 1) % 10)
+        assert(again.name.equals("Dodo") && again.active && again.scores[3] == 4)
+        console.printf("{} {}\n", nanos, checksum)!
+        return
+    }
+    start := clock.now()!
+    for i in 0u64..iterations {
+        // All generated documents start with a single digit at byte 1 (arrays)
+        // or byte 6 (objects). Changing it prevents invariant parsing.
+        digit := (unsafe {
+            ptr.read_volatile(ptr.from_ref(&i))
+        } % 10) as u8
+        if mode == 1 {
+            storage[6] = 48 + digit
+            record := json.decode::<Record>(&storage[..count])!
+            checksum += record.id + record.scores[3] as u64
+        } else {
+            if storage[0] == 91 {
+                storage[1] = 48 + digit
+            } else {
+                storage[6] = 48 + digit
+            }
+            if mode == 3 {
+                value := json.parse_indexed(&storage[..count], &mut key_index)!
+                checksum += value.raw().len as u64 + digit as u64
+            } else {
+                value := json.parse(&storage[..count])!
+                checksum += value.raw().len as u64 + digit as u64
+            }
+        }
+    }
+    end := clock.now()!
+    elapsed := end.duration_since(&start)!
+    nanos := elapsed.to_nanos()!
+    console.printf("{} {}\n", nanos, checksum)!
+}

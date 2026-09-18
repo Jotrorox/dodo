@@ -1,0 +1,146 @@
+package json_strings
+
+import "core/bytes"
+import "core/mem"
+import "std/encoding/json"
+
+fn check_storage(value: &json.String, expected: &str) {
+    raw := mem.str_bytes(expected)
+    assert(value.equals(expected))
+    assert_eq(value.decoded_len(), raw.len)
+    plain := json.String.from_str(expected)
+    assert(value.equal(&plain) && plain.equal(value))
+
+    storage := [165u8; 96]
+    assert_eq(value.decode(&mut storage[..raw.len])!, expected)
+    assert(bytes.equal(&storage[..raw.len], raw))
+    for i in raw.len..storage.len {
+        assert_eq(storage[i], 165u8)
+    }
+    bytes.fill(&mut storage, 165)
+    assert_eq(value.decode(&mut storage)!, expected)
+    for i in raw.len..storage.len {
+        assert_eq(storage[i], 165u8)
+    }
+
+    // Every insufficient capacity must fail before modifying any byte.
+    for capacity in 0usize..raw.len {
+        bytes.fill(&mut storage, 165)
+        match value.decode(&mut storage[..capacity]) {
+            ok(_) => {
+                assert(false)
+            },
+            err(reason) => {
+                assert(reason.kind == json.ErrorKind.BufferFull)
+                assert_eq(reason.position, capacity)
+            },
+        }
+        for i in 0usize..storage.len {
+            assert_eq(storage[i], 165u8)
+        }
+    }
+}
+
+fn check_pair(input: &str, expected: &str, escaped: bool) {
+    parsed := json.parse_str(input)!
+    value := parsed.as_string()!
+    assert_eq(value.is_escaped(), escaped)
+    check_storage(&value, expected)
+}
+
+fn strings_and_storage() {
+    check_pair("\"\"", "", false)
+    check_pair("\"ordinary ASCII / ~ text\"", "ordinary ASCII / ~ text", false)
+    check_pair("\"Aß€😀Z\"", "Aß€😀Z", false)
+    check_pair("\" ~\u{7f}\"", " ~\u{7f}", false)
+    check_pair("\"prefix\\u0041ß\\u20ac\\ud83d\\ude00suffix\"", "prefixAß€😀suffix", true)
+    check_pair("\"\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0000\"", "\"\\/\u{8}\u{c}\n\r\t\u{0}", true)
+
+    // from_str already contains decoded text, even with literal backslashes,
+    // quotes, control characters, or text that looks like a JSON escape.
+    plain := json.String.from_str("literal \\u0041\"\n\u{0}😀")
+    assert(!plain.is_escaped())
+    check_storage(&plain, "literal \\u0041\"\n\u{0}😀")
+    escaped := json.parse_str("\"literal \\\\u0041\\\"\\n\\u0000\\ud83d\\ude00\"")!
+    escaped_string := escaped.as_string()!
+    assert(plain.equal(&escaped_string) && escaped_string.equal(&plain))
+
+    left := json.parse_str("\"\\u0041\\u00df€\\ud83d\\ude00\"")!
+    right := json.parse_str("\"Aß\\u20ac😀\"")!
+    a := left.as_string()!
+    b := right.as_string()!
+    assert(a.equal(&b) && b.equal(&a))
+    assert(!a.equals("Aß€😁") && !a.equals("Aß€😀x"))
+
+    distinct := ["", "a", "ab", "ac", "é", "ê", "😀", "😁", "e\u{301}"]
+    for i in 0usize..distinct.len {
+        for j in 0usize..distinct.len {
+            a := json.String.from_str(distinct[i])
+            b := json.String.from_str(distinct[j])
+            assert_eq(a.equal(&b), i == j)
+            assert_eq(a.equals(distinct[j]), i == j)
+        }
+    }
+}
+
+fn expect_error(input: &[u8], kind: json.ErrorKind, position: usize) {
+    match json.parse(input) {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert(reason.kind == kind)
+            assert_eq(reason.position, position)
+        },
+    }
+    scratch := [0usize; 20]
+    match json.parse_indexed(input, &mut scratch) {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert(reason.kind == kind)
+            assert_eq(reason.position, position)
+        },
+    }
+}
+
+fn validation_and_keys() {
+    expect_error(b"\"prefix", json.ErrorKind.Syntax, 7)
+    expect_error(b"\"prefix\n\"", json.ErrorKind.Syntax, 7)
+    expect_error(b"\"prefix\\q\"", json.ErrorKind.Syntax, 8)
+    expect_error(b"\"prefix\\", json.ErrorKind.Syntax, 8)
+    expect_error(b"\"prefix\\uD800\"", json.ErrorKind.Syntax, 14)
+    expect_error(b"\"prefix\\uDC00\"", json.ErrorKind.Syntax, 9)
+    expect_error(b"\"prefix\xc0\x80\"", json.ErrorKind.Syntax, 7)
+    expect_error(b"\"prefix\x80\"", json.ErrorKind.Syntax, 7)
+    expect_error(b"\"prefix\xe2\x82", json.ErrorKind.Syntax, 9)
+    expect_error(b"\"prefix\xe2x\xac\"", json.ErrorKind.Syntax, 8)
+    expect_error(b"\"prefix\xed\xa0\x80\"", json.ErrorKind.Syntax, 8)
+    expect_error(b"\"prefix\xf4\x90\x80\x80\"", json.ErrorKind.Syntax, 8)
+    expect_error(b"{\"same\":0,\"same\":1}", json.ErrorKind.DuplicateField, 10)
+    expect_error(b"{\"same\":0,\"s\\u0061me\":1}", json.ErrorKind.DuplicateField, 10)
+    expect_error(b"{\"s\\u0061me\":0,\"same\":1}", json.ErrorKind.DuplicateField, 15)
+    expect_error(mem.str_bytes("{\"😀\":0,\"\\ud83d\\ude00\":1}"), json.ErrorKind.DuplicateField, 10)
+
+    object := json.parse_str("{\"prefix\":1,\"prefix-long\":2,\"préfix\":3,\"prêfix\":4}")!
+    names := ["prefix", "prefix-long", "préfix", "prêfix"]
+    for i in 0usize..names.len {
+        field := object.require(names[i])!
+        assert_eq(field.as_u64()!, i as u64 + 1)
+    }
+}
+
+fn decode_local(destination: &mut[u8]) -> &str!json.Error from(destination) {
+    source := [34u8, 68, 111, 100, 111, 34]
+    parsed := json.parse(&source)?
+    value := parsed.as_string()?
+    return value.decode(destination)
+}
+
+fn main() {
+    strings_and_storage()
+    validation_and_keys()
+    storage := [0u8; 4]
+    assert_eq(decode_local(&mut storage)!, "Dodo")
+}

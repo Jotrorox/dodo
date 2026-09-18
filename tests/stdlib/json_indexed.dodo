@@ -1,0 +1,188 @@
+package json_indexed
+
+import "std/encoding/json"
+import "std/bytes"
+import "core/mem"
+
+@derive(Json)
+@json_deny_unknown
+struct Strict {
+    a: u32
+}
+
+fn expect_error(input: &[u8], scratch: &mut[usize], kind: json.ErrorKind, position: usize) {
+    match json.parse_indexed(input, scratch) {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert(reason.kind == kind)
+            assert_eq(reason.position, position)
+        },
+    }
+}
+
+// Compare both acceptance and the exact error, including its byte position.
+fn compare(input: &[u8]) {
+    scratch := [0usize; 640]
+    match json.parse(input) {
+        ok(expected) => {
+            actual := json.parse_indexed(input, &mut scratch)!
+            assert(bytes.equal(actual.raw(), expected.raw()))
+            assert_eq(actual.position(), expected.position())
+        },
+        err(expected) => {
+            let json.Error { kind, position } = expected
+            expect_error(input, &mut scratch, kind, position)
+        },
+    }
+}
+
+// The result may outlive local scratch, but still borrows the input.
+fn local_index(input: &[u8]) -> json.Value!json.Error from(input) {
+    scratch := [0usize; 20]
+    return json.parse_indexed(input, &mut scratch)
+}
+
+fn scopes_and_collisions() {
+    // These keys share a bucket with a four-entry table on 32- and 64-bit
+    // targets. Distinct colliding keys must remain distinct.
+    scratch := [99usize; 20]
+    value := json.parse_indexed(b"{\"a\":1,\"e\":2,\"i\":3,\"m\":4}", &mut scratch)!
+    assert_eq(value.len()!, 4usize)
+    expect_error(b"{\"a\":1,\"e\":2,\"i\":3,\"m\":4,\"a\":5}", &mut scratch,
+    json.ErrorKind.DuplicateField, 25)
+    expect_error(b"{\"a\":1,\"e\":2,\"i\":3,\"m\":4,\"q\":5}", &mut scratch,
+    json.ErrorKind.BufferFull, 25)
+    // Reusing scratch never invalidates earlier Values.
+    field := value.require("e")!
+    assert_eq(field.as_u64()!, 2u64)
+
+    // Children reuse stack entries; equal ancestor/sibling keys are legal.
+    nested := b"{\"a\":{\"a\":1,\"e\":2},\"e\":[{\"a\":3,\"e\":4},{\"a\":5,\"e\":6}]}"
+    nested_value := json.parse_indexed(nested, &mut scratch)!
+    nested_field := nested_value.pointer("/e/1/e")!
+    assert_eq(nested_field.as_u64()!, 6u64)
+    expect_error(b"{\"a\":{\"a\":0},\"a\":1}", &mut scratch,
+    json.ErrorKind.DuplicateField, 13)
+    expect_error(b"{\"a\":{\"a\":0,\"a\":1}}", &mut scratch,
+    json.ErrorKind.DuplicateField, 12)
+    // The first child's b/f entries share the ancestor a's bucket. Closing
+    // the child must restore the ancestor link before checking the next key.
+    colliding := json.parse_indexed(b"{\"a\":{\"b\":1,\"f\":2},\"e\":{\"b\":3,\"f\":4}}", &mut scratch)!
+    assert_eq(colliding.len()!, 2usize)
+    expect_error(b"{\"a\":{\"b\":1,\"f\":2},\"a\":3}", &mut scratch,
+    json.ErrorKind.DuplicateField, 19)
+
+    // Many sibling objects need only one live entry, even with nested arrays.
+    one := [0usize; 5]
+    array_value := json.parse_indexed(b"[{\"a\":0},[{\"a\":1},{\"a\":2}],{\"a\":3}]", &mut one)!
+    assert_eq(array_value.len()!, 3usize)
+    expect_error(b"{\"a\":{\"a\":0}}", &mut one, json.ErrorKind.BufferFull, 6)
+    // Both syntax errors and exhaustion leave storage reusable.
+    expect_error(b"{\"a\":}", &mut one, json.ErrorKind.Syntax, 5)
+    recovered_value := json.parse_indexed(b"{\"a\":7}", &mut one)!
+    recovered_field := recovered_value.require("a")!
+    assert_eq(recovered_field.as_u64()!, 7u64)
+
+    // Partial slots are ignored; zero capacity still accepts key-free values.
+    partial := [42usize; 9]
+    partial_value := json.parse_indexed(b"{\"a\":1}", &mut partial)!
+    assert_eq(partial_value.len()!, 1usize)
+    assert_eq(partial[8], 42usize)
+    expect_error(b"{\"a\":1,\"b\":2}", &mut partial, json.ErrorKind.BufferFull, 7)
+    for size in 0usize..5 {
+        empty := json.parse_indexed(b"[{},[],true,null,123,\"x\"]", &mut partial[..size])!
+        assert_eq(empty.len()!, 6usize)
+        expect_error(b"{\"a\":1}", &mut partial[..size], json.ErrorKind.BufferFull, 1)
+    }
+    view := local_index(b"{\"a\":17}")!
+    view_field := view.require("a")!
+    assert_eq(view_field.as_u64()!, 17u64)
+}
+
+fn escaped_keys() {
+    cases := [
+        "{\"a\":1,\"\\u0061\":2}",
+        "{\"\\u0061\":1,\"a\":2}",
+        "{\"é\":1,\"\\u00e9\":2}",
+        "{\"😀\":1,\"\\ud83d\\ude00\":2}",
+        "{\"\\uD83D\\uDE00\":1,\"😀\":2}",
+        "{\"\\n\":1,\"\\u000a\":2}",
+        "{\"/\":1,\"\\/\":2}",
+        "{\"\\\"\":1,\"\\u0022\":2}",
+        "{\"\\\\\":1,\"\\u005c\":2}",
+        "{\"\":0,\"\":1}",
+        "{\"\\u0000a\":0,\"\\u0000b\":1}",
+        "{\"a\":0,\"ab\":1,\"é\":2,\"é\":3}",
+    ]
+    for i in 0usize..cases.len {
+        compare(mem.str_bytes(cases[i]))
+    }
+    scratch := [0usize; 10]
+    value := json.parse_str_indexed("{\"\\u0061\":7}", &mut scratch)!
+    decoded := json.from_value::<Strict>(value)!
+    assert_eq(decoded.a, 7u32)
+    unknown := json.parse_indexed(b"{\"a\":1,\"unknown\":2}", &mut scratch)!
+    match json.from_value::<Strict>(unknown) {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert(reason.kind == json.ErrorKind.UnknownField)
+        },
+    }
+}
+
+fn syntax_parity() {
+    cases := ["", " \t\n", "null false", "01", "+1", "1.", "1e+", "[1,]",
+    "{\"a\":1,}", "{a:1}", "//comment\nnull", "\"\\ud800\"", "\"\\udc00\"",
+    "{\"\\ud800\\u0000\":0}", "{\"\\x20\":0}", "\"unterminated",
+    "{\"a\":1,\"a\"}", "{\"a\":[{\"b\":0}],\"a\":}"]
+    for i in 0usize..cases.len {
+        compare(mem.str_bytes(cases[i]))
+    }
+    // All prefixes and single-byte mutations exercise token boundaries,
+    // malformed UTF-8/escapes, containers, and cleanup on partially read keys.
+    original := mem.str_bytes(" {\"é\":{\"\\u0061\":1},\"b\":[true,null,\"😀\"]} \n")
+    data := [0u8; 128]
+    for i in 0usize..original.len {
+        data[i] = original[i]
+    }
+    for size in 0usize..original.len + 1 {
+        compare(&data[..size])
+    }
+    for i in 0usize..original.len {
+        for byte in 0usize..256 {
+            data[i] = byte as u8
+            compare(&data[..original.len])
+        }
+        data[i] = original[i]
+    }
+}
+
+fn depth_limits() {
+    data := [0u8; 1024]
+    prefix := b"{\"a\":"
+    for depth in 127usize..130 {
+        for i in 0usize..depth {
+            for j in 0usize..prefix.len {
+                data[i * prefix.len + j] = prefix[j]
+            }
+        }
+        data[depth * 5] = 48
+        for i in 0usize..depth {
+            data[depth * 5 + 1 + i] = 125
+        }
+        compare(&data[..depth * 6 + 1])
+    }
+    scratch := [0usize; 640]
+    expect_error(&data[..775], &mut scratch, json.ErrorKind.Depth, 640)
+}
+
+fn main() {
+    scopes_and_collisions()
+    escaped_keys()
+    syntax_parity()
+    depth_limits()
+}
