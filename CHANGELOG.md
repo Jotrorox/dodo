@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.1.4 — 2026-09-20
+
+Dodo 0.1.4 adds optional project manifests, typed JSON codecs, editor inlay
+hints and quick fixes, and a complete standard-library API reference. It also
+improves compiler correctness and JSON and web performance. The language
+specification remains version 0.1.
 
 - Add optional `dodo.toml` manifests with named targets, profiles, saved run
   arguments, hosted test settings, and configuration inspection. Preserve
@@ -13,6 +18,33 @@
   platform settings when the manifest changes.
 - Send build/check status to stderr and return exit 2 for CLI usage errors.
   Build/configuration/test failures retain exit 1; run preserves the child status.
+- Add portable `std/encoding/json` codecs with `@derive(Json)` for structs,
+  checked field conversion, field renaming, optional unknown-field rejection,
+  borrowed values and strings, caller-owned output, and streaming I/O helpers.
+- Optimize JSON validation, escaped strings, indexed object lookup, and derived
+  array and struct decoding. Add repeatable benchmarks and recorded results.
+- Reuse web routing metadata and validated paths, index dynamic route prefixes,
+  preserve captured parameters, and scan HTTP headers sequentially. Expand
+  routing regression tests and loopback HTTP performance measurements.
+- Add inferred local-type inlay hints and diagnostic quick fixes for mutable
+  bindings and missing package imports. Use structured diagnostic data for
+  fixes, and reject editor renames that would introduce name collisions.
+- Fix definite initialization at unconditional loop exits, ownership checks,
+  and short-circuit expression state. Extend control-flow analysis and use it
+  for supported function bodies while retaining checks for other bodies.
+- Make constant integer-to-`f32` conversions match runtime conversions and fix
+  floating-point cast edge cases. Correct Windows child-process exit statuses
+  and filesystem path discovery edge cases.
+- Fix overlapping borrows when moving fixed-vector elements between slots,
+  restoring checked vector insertion, removal, and collection mutation.
+- Rework documentation into beginner guides and a separate reference. Add a
+  generated API reference covering every bundled standard-library package,
+  runnable examples, project-manifest guidance, and stronger documentation
+  link and search checks.
+
+The compiler still implements a subset of the language design. See the
+[implementation status and limits](https://jotrorox.github.io/dodo/implementation/)
+for supported behavior and remaining work.
 
 ## 0.1.3 — 2026-09-16
 

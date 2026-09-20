@@ -26,13 +26,13 @@ need to run a separate server in a terminal while editing.
 The [Dodo VS Code extension](https://github.com/Jotrorox/dodo/tree/main/editor-support/dodo-vscode)
 connects to `dodo lsp` automatically and adds syntax highlighting, bracket and
 comment support, and snippets for programs, functions, types, loops, matches,
-and tests. It requires VS Code 1.137 or newer and Dodo 0.1.3 or newer.
+and tests. It requires VS Code 1.137 or newer and Dodo 0.1.4 or newer.
 
-Download `dodo-vscode-0.1.3.vsix` from
-[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.3), then install it:
+Download `dodo-vscode-0.1.4.vsix` from
+[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.4), then install it:
 
 ```sh
-code --install-extension dodo-vscode-0.1.3.vsix
+code --install-extension dodo-vscode-0.1.4.vsix
 ```
 
 To build the extension from a checkout with Node.js 22 or newer:
@@ -41,7 +41,7 @@ To build the extension from a checkout with Node.js 22 or newer:
 cd editor-support/dodo-vscode
 npm ci
 npm run package
-code --install-extension dodo-vscode-0.1.3.vsix
+code --install-extension dodo-vscode-0.1.4.vsix
 ```
 
 Alternatively, select the VSIX with **Extensions: Install from VSIX...**.

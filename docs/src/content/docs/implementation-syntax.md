@@ -1,11 +1,11 @@
 ---
 title: "Syntax and expressions"
-description: "Implemented syntax, inference, constants, control flow, and numeric behavior in Dodo 0.1.3."
+description: "Implemented syntax, inference, constants, control flow, and numeric behavior in Dodo 0.1.4."
 section: "Language reference"
 order: 210
 ---
 
-This is the compact reference for syntax accepted by Dodo 0.1.3. New to the
+This is the compact reference for syntax accepted by Dodo 0.1.4. New to the
 language? Begin with [values and arrays](language-basics.md),
 [functions and data types](types-and-functions.md), and [control flow](control-flow.md).
 The [language specification](language-spec-0.1.md) states the normative rules;

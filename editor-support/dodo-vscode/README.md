@@ -13,15 +13,15 @@ built-in `dodo lsp` language server.
 
 ## Install
 
-Install [Dodo](https://jotrorox.github.io/dodo/installation/) 0.1.3 or newer and
+Install [Dodo](https://jotrorox.github.io/dodo/installation/) 0.1.4 or newer and
 ensure `dodo --version` works. The extension uses an existing compiler; the VSIX
 does not contain the compiler or LLVM.
 
-Download `dodo-vscode-0.1.3.vsix` from
-[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.3), then run:
+Download `dodo-vscode-0.1.4.vsix` from
+[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.4), then run:
 
 ```sh
-code --install-extension dodo-vscode-0.1.3.vsix
+code --install-extension dodo-vscode-0.1.4.vsix
 ```
 
 You can also use **Extensions: Install from VSIX...** in VS Code and select the
@@ -36,7 +36,7 @@ With Node.js 22 or newer, run these commands from this repository's root:
 cd editor-support/dodo-vscode
 npm ci
 npm run package
-code --install-extension dodo-vscode-0.1.3.vsix
+code --install-extension dodo-vscode-0.1.4.vsix
 ```
 
 Building the VSIX does not require Rust or LLVM.

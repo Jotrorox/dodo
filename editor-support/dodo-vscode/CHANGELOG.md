@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.4 — 2026-09-20
+
+- Show inferred local types as inlay hints that follow unsaved edits.
+- Add diagnostic quick fixes to make bindings mutable and import resolvable
+  packages, using structured compiler diagnostics.
+- Select named `dodo.toml` targets with `dodo.buildTarget` and configure manifest
+  discovery with `dodo.manifestPath`. Reload platform settings when the manifest
+  changes.
+- Reject renames that would introduce name collisions.
+- Expand editor integration coverage and document the new settings and actions.
+- Require Dodo 0.1.4 for the new server features and publish the VSIX alongside
+  the compiler in GitHub Releases.
+
 ## 0.1.3 — 2026-09-16
 
 - Open bundled standard-library definitions as read-only documents with hover

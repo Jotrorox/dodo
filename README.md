@@ -5,7 +5,7 @@ explicit memory ownership, and native output. Start with small terminal programs
 use the same language for portable libraries, hosted applications, and low-level
 hardware code.
 
-**Compiler 0.1.3 · Language design 0.1 · [BSD-2-Clause](LICENSE)**
+**Compiler 0.1.4 · Language design 0.1 · [BSD-2-Clause](LICENSE)**
 
 ## Start in five minutes
 
@@ -64,7 +64,7 @@ The specification is also available as
 [PDF](https://jotrorox.github.io/dodo/downloads/language-spec-0.1.pdf).
 
 These docs follow `main`, which can contain APIs added after a release. Use the
-[`v0.1.3` tag](https://github.com/Jotrorox/dodo/tree/v0.1.3) for released source
+[`v0.1.4` tag](https://github.com/Jotrorox/dodo/tree/v0.1.4) for released source
 and [CHANGELOG.md](CHANGELOG.md) for version changes.
 
 ## Find a library

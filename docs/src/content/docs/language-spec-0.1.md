@@ -33,7 +33,7 @@ accepted for compatibility. The ownership categories are unchanged.
 **Implementation-defined** means an implementation must document its choice for
 each supported target; a program may depend on that documented choice, but may
 then require changes on another implementation or target. Appendix C records
-these choices for compiler 0.1.3. **Unspecified** means a choice need not be
+these choices for compiler 0.1.4. **Unspecified** means a choice need not be
 documented and may vary between evaluations. **Undefined behavior** means a
 program has violated a runtime validity requirement and this specification
 imposes no requirements on that execution. An unsafe precondition violation is
@@ -1243,7 +1243,7 @@ unsafe fn write32(address: usize, value: u32) -> void
 **CORE-MMIO.** These operations address device memory directly without fabricating an ordinary
 mutable reference. Only access widths supported by the target are accepted.
 Unsupported widths must not silently become multiple narrower accesses. The
-0.1.3 profile accepts 8, 16, 32, and 64 bits up to the target pointer width;
+0.1.4 profile accepts 8, 16, 32, and 64 bits up to the target pointer width;
 actual device legality is a platform precondition (ID-HW).
 
 Valid addresses, permissions, device side effects, and configuration are unsafe
@@ -1737,10 +1737,10 @@ not establish another target's ABI or hardware behavior.
 
 An implementation must publish choices for the IDs below, including the compiler
 version and target. Changing an implementation-defined choice must not silently
-change the source-level rules above. The following is the compiler 0.1.3 profile;
+change the source-level rules above. The following is the compiler 0.1.4 profile;
 tests constrain the documented choice, not every possible conforming choice.
 
-| Choice | Compiler 0.1.3 definition and evidence |
+| Choice | Compiler 0.1.4 definition and evidence |
 | --- | --- |
 | ID-TARGET: widths, endianness, alignment, object format | Uses the selected LLVM 23 target triple and its data layout. Default is the compiler host triple. `x86_64-unknown-linux-gnu` has 64-bit pointers and little-endian storage; `i686-unknown-linux-gnu` has 32-bit pointers and little-endian storage; `powerpc64-unknown-linux-gnu` has 64-bit pointers and big-endian storage. Scalar/aggregate alignment is the target data layout's ABI alignment, observable with core layout queries; emitted IR must include the triple/data layout. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `aggregate_layout_tags_and_string_byte_lengths` (E). |
 | ID-FLOAT: floating environment and constant precision | Runtime uses LLVM non-fast floating operations with default round-to-nearest, ties-to-even. Native tests assume gradual underflow and masked floating exceptions; no source facility changes rounding/exception modes. Constant scalar evaluation computes floating operations in host binary64 and rounds to the expression's type at each node. Integer-to-float constants round directly to the destination representation using round-to-nearest, ties-to-even, matching runtime conversion; an explicit cast through f64 still performs both conversions. Decimal literal conversion passes through binary64. Only narrowing f64 to f32 requires a finite, in-range source; identity and widening floating casts preserve NaN, infinities, and signed zero in constants and at runtime. NaN payload/sign is unspecified. Evidence: `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`, `constant_integer_to_float_matches_runtime`, `constant_float_identity_and_widening_match_runtime` (E); `numeric_conversions::constant_float_narrowing_still_rejects_non_finite_and_out_of_range_values` (R). |

@@ -66,7 +66,7 @@ from APIs that require a supported operating system.
 
 ## Which version these docs describe
 
-The compiler release is **0.1.3** and the language design is **Dodo 0.1**. This
+The compiler release is **0.1.4** and the language design is **Dodo 0.1**. This
 website follows the repository's `main` branch, which may contain changes after
 that release. The library is embedded in your compiler; check `dodo --version`
 when an example uses an API your binary does not recognize.
@@ -75,7 +75,7 @@ The tutorials and guides describe implemented behavior. The
 [language specification](language-spec-0.1.md) also defines design requirements;
 [implementation decisions and limits](implementation.md) records the supported
 subset and differences. For an exact release, use its
-[tagged source](https://github.com/Jotrorox/dodo/tree/v0.1.3) and
+[tagged source](https://github.com/Jotrorox/dodo/tree/v0.1.4) and
 [release notes](https://github.com/Jotrorox/dodo/blob/main/CHANGELOG.md).
 
 ## How to use the examples
