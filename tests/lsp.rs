@@ -3007,3 +3007,72 @@ fn lsp_printing_signatures_and_hovers_survive_lowering() {
     );
     assert!(client.shutdown().is_empty());
 }
+
+#[test]
+fn lsp_manifest_target_and_disk_changes_update_platform_diagnostics() {
+    let w = Workspace::new();
+    fs::create_dir(w.0.join("config")).unwrap();
+    let manifest=w.file("dodo.toml","schema=1\n[targets.wasm]\nentry='main.dodo'\nemit='obj'\ntriple='wasm32-unknown-unknown'\n");
+    let uri = w.uri("main.dodo");
+    let source = "package app\nfn big() -> usize { return 4294967296usize }\n";
+    let mut client = Client::start("lsp");
+    let response = client.request(
+        json!(1),
+        "initialize",
+        json!({
+            "rootUri": w.uri(""), "capabilities": {},
+            "initializationOptions": {
+                "buildTarget": "wasm", "manifestPath": "config/../dodo.toml"
+            }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    client.open(&uri, source, 1);
+    assert!(
+        !client.diagnostics()[&uri]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    w.file("dodo.toml","schema=1\n[targets.wasm]\nentry='main.dodo'\nemit='obj'\ntriple='x86_64-unknown-linux-gnu'\n");
+    client.disk_change(&manifest, 2);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    w.file("dodo.toml", "schema=2");
+    client.disk_change(&manifest, 2);
+    let error = client.receive();
+    assert_eq!(error["method"], "window/showMessage");
+    assert!(
+        error["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("schema")
+    );
+    // A malformed edit does not replace the last valid configuration.
+    client.diagnostics();
+    client.change(&uri, source, 2);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
+fn lsp_manifest_selection_errors_and_explicit_platform_override() {
+    let w = Workspace::new();
+    w.file("dodo.toml","schema=1\n[targets.wasm]\nentry='main.dodo'\ntriple='wasm32-unknown-unknown'\n[targets.native]\nentry='main.dodo'\n");
+    let mut client = Client::start("lsp");
+    let response = client.request(
+        json!(1),
+        "initialize",
+        json!({"rootUri":w.uri(""),"capabilities":{}}),
+    );
+    assert_eq!(response["error"]["code"], -32602);
+    let response=client.request(json!(2),"initialize",json!({"rootUri":w.uri(""),"capabilities":{},"initializationOptions":{"buildTarget":"wasm","target":"x86_64-unknown-linux-gnu"}}));
+    assert!(response.get("error").is_none(), "{response}");
+    let uri = w.uri("main.dodo");
+    client.open(
+        &uri,
+        "package app\nfn big() -> usize { return 4294967296usize }\n",
+        1,
+    );
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
+}

@@ -11,6 +11,7 @@ pub(super) struct Watches {
     pub supported: bool,
     pub relative: bool,
     pub initialized: bool,
+    pub manifest: Option<PathBuf>,
     roots: BTreeSet<PathBuf>,
     registered: BTreeSet<PathBuf>,
     registration: Option<String>,
@@ -20,8 +21,11 @@ pub(super) struct Watches {
 
 impl Watches {
     pub fn contains(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|ext| ext == "dodo")
-            && self.roots.iter().any(|root| path.starts_with(root))
+        self.manifest
+            .as_deref()
+            .is_some_and(|manifest| crate::package::source_path(manifest) == path)
+            || path.extension().is_some_and(|ext| ext == "dodo")
+                && self.roots.iter().any(|root| path.starts_with(root))
     }
 
     pub fn sync(&mut self, roots: BTreeSet<PathBuf>, output: &mut impl Write) -> io::Result<()> {
@@ -48,7 +52,7 @@ impl Watches {
                 }),
             )?;
         }
-        let watchers: Vec<_> = self
+        let mut watchers: Vec<_> = self
             .roots
             .iter()
             .filter_map(|root| {
@@ -75,6 +79,23 @@ impl Watches {
                 Some(json!({"globPattern": pattern, "kind": 7}))
             })
             .collect();
+        if let Some(path) = &self.manifest
+            && let Ok(uri) = file_uri::from_path(path)
+            && let Ok(path) = file_uri::to_path(&uri)
+            && let Some(path) = path.to_str()
+        {
+            let mut pattern = String::new();
+            for c in path.replace('\\', "/").chars() {
+                if "*?[]{}".contains(c) {
+                    pattern.push('[');
+                    pattern.push(c);
+                    pattern.push(']');
+                } else {
+                    pattern.push(c);
+                }
+            }
+            watchers.push(json!({"globPattern":pattern,"kind":7}));
+        }
         if !watchers.is_empty() {
             let id = format!("dodo/watchedFiles/{}", self.next_id);
             self.request(

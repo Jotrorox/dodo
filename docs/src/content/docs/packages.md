@@ -17,14 +17,15 @@ Three names have different jobs:
 | Package declaration | `package math` | The package named by a source unit. |
 | Import path and local qualifier | `import "math"`, then `math.answer()` | Find a dependency and access its public declarations. |
 
-There is no manifest, lockfile, package manager, dependency cache, or separate
-library project type. Follow the [complete shared-code example](#a-project-with-shared-code)
+An optional [dodo.toml](project-manifests.md) can select entries and save build
+settings. No manifest is required. There is no lockfile, package manager,
+dependency cache, or separate library project type. Follow the [complete shared-code example](#a-project-with-shared-code)
 below to make a two-package project.
 
 ## Project entry and subfolders
 
-Run `dodo run`, `dodo check`, or `dodo compile` from the project folder to use
-`main.dodo`. `dodo build` is an alias for `dodo compile`. Passing a project
+Without a manifest, run `dodo run`, `dodo check`, or `dodo build` from the project folder to use
+`main.dodo`. `dodo compile` is an alias for `dodo build`. Passing a project
 folder explicitly selects the same entry: `dodo run app` uses `app/main.dodo`.
 Passing a file, such as `dodo run app/main.dodo`, uses that file directly.
 

@@ -248,3 +248,12 @@ The Rust suite remains responsible for compiler rejection tests, cross-target
 emission, and integration fixtures needing external peers or platform setup.
 Run it with `cargo test --locked --all-targets`. CI runs both suites, including
 the native suite at optimization levels 0 and 3.
+
+## Save test settings
+
+An optional [project manifest](project-manifests.md#configure-hosted-tests) can
+save a discovery root, timeout, and hosted compiler settings. `dodo test -g`
+emits debug information; `--release` and `--profile NAME` select profiles.
+Tests use their own `[test.build]` settings, so an application target configured
+for firmware does not change the hosted test runner. Use `--print-config` to
+inspect effective settings without discovery or execution.

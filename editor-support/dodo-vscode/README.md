@@ -62,7 +62,9 @@ WSL, or a dev container, install the extension and Dodo on that remote host.
 | `dodo.server.enabled` | `true` | Start the language server. |
 | `dodo.server.path` | `"dodo"` | Executable on PATH or an absolute/relative compiler path. |
 | `dodo.checkMode` | `"file"` | Check each file and its imports, or use `"package"` for all immediate sibling `.dodo` files. |
-| `dodo.target` | `""` | LLVM target triple; empty uses the host target. |
+| `dodo.target` | `""` | LLVM triple override; empty uses the manifest target, otherwise the host. |
+| `dodo.buildTarget` | `""` | Named target from the workspace manifest; empty uses its default. |
+| `dodo.manifestPath` | `""` | Manifest path relative to the first workspace root, or absolute; empty discovers `dodo.toml`. |
 | `dodo.trace.server` | `"messages"` | LSP trace detail: `"messages"` or `"verbose"`. Requires the output channel's Trace log level. |
 
 Compiler settings apply to the whole VS Code window. One server handles all

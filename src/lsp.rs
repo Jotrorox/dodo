@@ -3,8 +3,9 @@
 //! Open documents are authoritative in-memory overlays, including when imported
 //! by another document. Editor recovery retains independent valid syntax/bodies.
 use crate::diagnostic::{Diagnostic, Severity};
-use crate::{codegen, editor, file_uri, format, package, sema};
+use crate::{editor, file_uri, format, package, sema};
 mod bundled;
+mod project_config;
 mod protocol;
 mod watch;
 use crate::json::{Value, json};
@@ -41,6 +42,8 @@ struct Server {
     published: BTreeMap<String, String>,
     check_packages: bool,
     target: String,
+    project_config: project_config::ProjectConfig,
+    project_error: Option<String>,
     pointer_bits: u32,
     document_changes: bool,
     inlay_refresh: bool,
@@ -133,33 +136,17 @@ impl Server {
                     );
                 }
             }
-            let target = match params.initialization_options.get("target") {
-                None | Some(Value::Null) => codegen::TargetMachine::get_default_triple()
-                    .as_str()
-                    .to_string_lossy()
-                    .into_owned(),
-                Some(Value::String(target))
-                    if !target.is_empty()
-                        && target.bytes().all(|b| {
-                            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
-                        }) =>
-                {
-                    target.clone()
-                }
-                Some(_) => {
-                    return error(
-                        ErrorCode::InvalidParams,
-                        "target must be an LLVM target triple",
-                    );
-                }
+            let project_config =
+                match project_config::ProjectConfig::from_initialize(&request.params) {
+                    Ok(config) => config,
+                    Err(message) => return error(ErrorCode::InvalidParams, &message),
+                };
+            let (target, bits) = match project_config.settings() {
+                Ok(settings) => settings,
+                Err(message) => return error(ErrorCode::InvalidParams, &message),
             };
-            let bits = match codegen::pointer_bits(&codegen::Options {
-                target: Some(target.clone()),
-                ..Default::default()
-            }) {
-                Ok(bits) => bits,
-                Err(e) => return error(ErrorCode::InvalidParams, &format!("invalid target: {e}")),
-            };
+            self.watches.manifest = project_config.path.clone();
+            self.project_config = project_config;
             self.check_packages = check_packages;
             self.target = target;
             self.pointer_bits = bits;
@@ -532,6 +519,22 @@ impl Server {
             }
             "workspace/didChangeWatchedFiles" => {
                 let paths = protocol::watched_paths(&notification.params)?;
+                if self
+                    .project_config
+                    .path
+                    .as_ref()
+                    .is_some_and(|manifest| paths.contains(&package::source_path(manifest)))
+                {
+                    match self.project_config.settings() {
+                        Ok((target, bits)) => {
+                            self.target = target;
+                            self.pointer_bits = bits;
+                            self.project_error = None;
+                        }
+                        Err(message) => self.project_error = Some(message),
+                    }
+                    return Ok(true);
+                }
                 return Ok(paths.iter().any(|path| {
                     self.watches.contains(path)
                         && !self
@@ -555,6 +558,9 @@ impl Server {
 
     fn sync_watches(&mut self, output: &mut impl Write) -> io::Result<()> {
         let mut roots = BTreeSet::new();
+        if let Some(parent) = self.project_config.path.as_ref().and_then(|p| p.parent()) {
+            roots.insert(parent.to_path_buf());
+        }
         for document in self.documents.values() {
             if let Some(path) = &document.path
                 && path.is_absolute()
@@ -568,6 +574,13 @@ impl Server {
     }
 
     fn publish(&mut self, output: &mut impl Write) -> io::Result<()> {
+        if let Some(message) = self.project_error.take() {
+            protocol::write_notification(
+                output,
+                "window/showMessage",
+                json!({"type":1,"message":format!("Dodo project configuration: {message}. Keeping the last valid target.")}),
+            )?;
+        }
         let overlays = self
             .documents
             .values()

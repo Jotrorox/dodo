@@ -134,14 +134,17 @@ package samples
 ```
 
 **PKG-UNIT.** Every source file must start with a package declaration, apart from
-whitespace, comments, and empty semicolon statements. A project is a folder with
-a `main.dodo` entry file. With no input, `dodo run`, `dodo check`, and
-`dodo compile` select `main.dodo` in the current folder; `build` is an alias for
-`compile`. An explicit CLI directory input selects that directory's `main.dodo`.
-A missing entry is an error, without searching parents or alternative filenames.
-A file input includes exactly that file and its imports; other root files are
-not implicitly included. No manifest, package manager, lockfile, or separate
-library project type participates in project selection.
+whitespace, comments, and empty semicolon statements. Without a manifest, a
+project is a folder with a `main.dodo` entry file. With no input, `dodo run`,
+`dodo check`, and `dodo build` select the current folder; `compile` remains an
+alias for `build`. An explicit CLI directory input selects that folder. An
+optional `dodo.toml` in the selected folder can choose a named target's entry
+file; otherwise the entry is `main.dodo`. A missing entry is an error, without
+searching parents or alternative filenames. An explicit file input bypasses
+manifests and includes exactly that file and its imports; other root files are
+not implicitly included. Manifest selection does not change source import
+resolution. No package manager, lockfile, or separate library project type is
+required.
 
 An imported directory includes its immediate regular files with extension `.dodo`,
 sorted by canonical path; it must contain at least one such file. Subdirectories

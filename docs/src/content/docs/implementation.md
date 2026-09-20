@@ -59,7 +59,7 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 | Ownership | Moves, shared/exclusive loans, source-based returns, deterministic destruction. | Conservative indexing, joins, loops, and aggregate lifetime tracking. |
 | Errors | Mandatory Result handling, explicit matching, `?`, panic-on-error `!`. | No exceptions, automatic error conversion, or panic unwinding. |
 | Generic behavior | Concrete specialization and statically checked public method protocols. | No general trait/constraint system or separately compiled generic interfaces. |
-| Packages | Single-file and directory imports, aliases, public/private declarations, embedded library. | Local dependencies only; no manifest, package manager, registry, or re-exports. |
+| Packages | Single-file and directory imports, aliases, public/private declarations, embedded library. | Optional build manifest; local dependencies only, with no package manager, registry, or re-exports. |
 | Foreign and hardware code | C primitive/pointer calls, raw storage, volatile MMIO, layout queries. | No C aggregate-by-value calls, C variadics, inline assembly, or interrupt attributes. |
 | Hosted library | Files, processes, environment, threads, atomics, synchronization, networking, TLS, HTTP, web routing. | Availability and native dependencies vary by target; see [platform support](platform.md). |
 
@@ -79,8 +79,10 @@ remain accepted; `dodo fmt` migrates them to the canonical syntax.
 [Projects and imports](packages.md) explains the `main.dodo` project entry,
 ordinary imported subfolders, local import resolution, and visibility.
 `dodo run`, `dodo check`, and `dodo compile` default to `main.dodo` in the current
-folder; `build` is an alias for `compile`. There is no manifest, package manager,
-registry, network resolver, or separate library project type.
+folder without a manifest; `compile` is an alias for `build`. An optional
+[dodo.toml](project-manifests.md) selects entries, profiles, and compiler settings.
+There is no package manager, registry, network resolver, or separate library
+project type.
 
 ## Ownership and generics
 

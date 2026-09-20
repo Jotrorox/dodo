@@ -215,6 +215,7 @@ fn filters_ignored_tests_empty_suites_and_options_are_explicit() {
     failure(&w.test(&["--ignored"]));
     failure(&w.test(&["--include-ignored"]));
     success(&w.test(&["--help"]));
+    failure(&w.test(&["missing.dodo"]));
     for args in [
         vec!["--timeout", "NaN"],
         vec!["--timeout", "-1"],
@@ -226,9 +227,9 @@ fn filters_ignored_tests_empty_suites_and_options_are_explicit() {
         vec!["--target", "wasm32-unknown-unknown"],
         vec!["--emit", "obj"],
         vec!["--link-arg", "-ofoo"],
-        vec!["missing.dodo"],
     ] {
-        failure(&w.test(&args));
+        let output = w.test(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
     }
 }
 

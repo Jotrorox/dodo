@@ -265,7 +265,8 @@ this recipe.
 ### Frontend development without LLVM
 
 The parser, semantic checker, constant evaluation, package loader, formatter,
-and editor analysis can be built and tested without LLVM development files:
+editor analysis, owned TOML parser, project resolver, and CLI option parser can
+be built and tested without LLVM development files:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
@@ -273,6 +274,8 @@ cargo clippy --locked --no-default-features --all-targets -- -D warnings
 # Run only parser or semantic checker unit tests:
 cargo test --locked --no-default-features --lib parser::tests
 cargo test --locked --no-default-features --lib sema::tests
+# Focus on project manifests and CLI parsing:
+cargo test --locked --no-default-features --test toml --test project --test cli_options
 ```
 
 The default `llvm` Cargo feature enables `llvm-sys`, native code generation, the
@@ -303,6 +306,11 @@ python3 scripts/test_check_linkage.py
 python3 scripts/test_build_release.py
 bash scripts/build-release.sh # x86-64 GNU/Linux release dependency check
 ```
+
+`cargo test --locked --test project_cli` checks manifest discovery, argument and
+profile overrides, output preservation, initialization, hosted tests, and real
+linker/program working directories. LSP tests also cover manifest platform
+selection and configuration reloads.
 
 CI runs these checks, including native Dodo tests and executable documentation.
 Tests include rejected programs, specification examples,

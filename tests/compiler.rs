@@ -156,7 +156,7 @@ fn cli_projects_default_to_main_and_compile_keeps_an_executable() {
     workspace.file("unused/broken.dodo", "invalid source");
     let output = workspace.compiler().arg("check").output().unwrap();
     assert_success(&output, "check the default entry");
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Checked main.dodo"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Checked main.dodo"));
     let output = workspace.compiler().arg("run").output().unwrap();
     assert_eq!(output.status.code(), Some(23), "{output:?}");
     assert!(!workspace.0.join("build").exists());

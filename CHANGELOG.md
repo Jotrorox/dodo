@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Add optional `dodo.toml` manifests with named targets, profiles, saved run
+  arguments, hosted test settings, and configuration inspection. Preserve
+  standalone source compilation and the `compile` alias.
+- Add an owned TOML 1.0 parser and shared CLI option definitions without adding
+  dependencies. Improve command help, option syntax, and diagnostics; support
+  `-b`, standalone `--release`, test debug information, and quiet/verbose output.
+- Add non-overwriting project initialization and shell completion generation.
+  Let the language server and VS Code select manifest targets and reload their
+  platform settings when the manifest changes.
+- Send build/check status to stderr and return exit 2 for CLI usage errors.
+  Build/configuration/test failures retain exit 1; run preserves the child status.
+
 ## 0.1.3 — 2026-09-16
 
 Dodo 0.1.3 adds simpler printing and web application APIs, concurrent HTTPS,

@@ -94,13 +94,17 @@ dodo fmt
 dodo check
 dodo run
 dodo test
-dodo compile -O 2
+dodo build --release
 dodo --help
 ```
 
 `check`, `run`, and `compile` select `main.dodo` by default. Pass a filename or
-project folder to choose another input. `build` is an alias for `compile`.
+project folder to choose another input. `compile` is an alias for `build`.
 `dodo test` discovers named tests and explicitly executable Markdown examples.
+Add an optional [`dodo.toml`](https://jotrorox.github.io/dodo/project-manifests/)
+for named targets, profiles, and saved arguments. Use `dodo build -b NAME`,
+`dodo targets`, and `dodo build --print-config` to work with configured projects.
+`dodo init` creates a small project without overwriting files.
 
 See the [command-line guide](https://jotrorox.github.io/dodo/command-line/) for
 output paths, debug information, optimization, cross-compilation, and linkers.

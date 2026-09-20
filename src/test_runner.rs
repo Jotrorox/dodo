@@ -1,5 +1,5 @@
-//! Manifest-free test discovery and hosted process isolation.
-use super::{Action, Args, Emit, Parsed, TempDir, compile};
+//! Hosted test discovery and process isolation, with optional project settings.
+use super::{Args, TempDir, compile};
 use dodoc::ast::{Function, Type};
 use dodoc::lexer::{self, TokenKind};
 use dodoc::{codegen, package, parser, sema};
@@ -11,191 +11,33 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub const HELP: &str = r#"Usage: dodo test [FILE|DIRECTORY] [OPTIONS]
-
-With no path, recursively scan the current folder. Write @test fn name() {}
-or fn test_name() {} in any .dodo file. Tests take no arguments and return void.
-Use assert(condition), assert_eq(left, right), or assert_ne(left, right), each
-with an optional string message. No imports or main function are needed.
-
-Discovery:
-  Inline tests load their file and imports, just like dodo run.
-  *_test.dodo and *.test.dodo load their folder as a package, including helpers.
-  Markdown fences marked `dodo test` contain executable documentation examples.
-  Hidden paths, build, target, dist, node_modules, vendor, and symlinks are skipped.
-
-Options:
-      --list                List matching tests and locations without compiling
-      --filter TEXT         Match a test name or path (substring; repeatable OR)
-      --exact               Match filters against the whole name or path::name
-      --skip TEXT           Exclude names containing TEXT; repeatable
-      --ignored             Run only tests marked @ignore("reason")
-      --include-ignored     Also run ignored tests
-      --show-output         Show captured stdout/stderr for passing tests too
-      --fail-fast           Stop after the first build or test failure
-      --timeout SECONDS     Per-test execution deadline (default: 30; 0 disables)
-      --doc                 Discover only executable Markdown examples
-      --no-doc              Discover only Dodo source tests
-      --allow-empty         Succeed when no tests match (default: exit 1)
-  -O, --opt-level LEVEL      0, 1, 2, 3 (default: 0)
-      --cpu NAME            Target CPU (default: generic)
-      --features LIST       LLVM target features
-      --linker PATH         C linker driver (default: DODO_CC or cc)
-      --link-arg ARG        Additional linker argument; repeatable
-  -h, --help                Show this help
-
-Every test runs in a fresh process with the caller's working directory.
-Output is captured and shown on failure, along with source locations. A trap
-fails only its test. Exit status: 0 = success; 1 = failures, errors, or no matches.
-
-Examples:
-  dodo test
-  dodo test --list
-  dodo test --filter addition
-  dodo test tests --include-ignored -O 3
-  dodo test docs --doc
-"#;
-
 pub struct TestArgs {
     compiler: Args,
     input: PathBuf,
-    list: bool,
-    filters: Vec<String>,
-    skips: Vec<String>,
-    exact: bool,
-    ignored: bool,
-    include_ignored: bool,
-    show_output: bool,
-    fail_fast: bool,
+    options: dodoc::cli::TestOptions,
     timeout: Duration,
-    doc: bool,
-    no_doc: bool,
-    allow_empty: bool,
 }
-
-pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
-    let mut args = args.into_iter();
-    let mut result = TestArgs {
-        compiler: Args {
-            action: Action::Build,
-            input: PathBuf::new(),
-            output: None,
-            emit: Emit::Exe,
-            options: codegen::Options::default(),
-            linker: std::env::var_os("DODO_CC").unwrap_or_else(|| "cc".into()),
-            link_args: vec![],
-            run_args: vec![],
-        },
-        input: PathBuf::from("."),
-        list: false,
-        filters: vec![],
-        skips: vec![],
-        exact: false,
-        ignored: false,
-        include_ignored: false,
-        show_output: false,
-        fail_fast: false,
-        timeout: Duration::from_secs(30),
-        doc: false,
-        no_doc: false,
-        allow_empty: false,
-    };
-    let mut input = None;
-    let mut positional = false;
-    while let Some(arg) = args.next() {
-        let mut value = |name: &str| {
-            args.next()
-                .ok_or_else(|| format!("{name} requires a value"))
-        };
-        if !positional {
-            match arg.to_str() {
-                Some("-h" | "--help") => return Ok(Parsed::TestHelp),
-                Some("--") => {
-                    positional = true;
-                    continue;
-                }
-                Some("--list") => result.list = true,
-                Some("--filter") => result
-                    .filters
-                    .push(super::string(value("--filter")?, "filter")?),
-                Some("--skip") => result.skips.push(super::string(value("--skip")?, "skip")?),
-                Some("--exact") => result.exact = true,
-                Some("--ignored") => result.ignored = true,
-                Some("--include-ignored") => result.include_ignored = true,
-                Some("--show-output") => result.show_output = true,
-                Some("--fail-fast") => result.fail_fast = true,
-                Some("--doc") => result.doc = true,
-                Some("--no-doc") => result.no_doc = true,
-                Some("--allow-empty") => result.allow_empty = true,
-                Some("--timeout") => {
-                    let text = super::string(value("--timeout")?, "timeout")?;
-                    let seconds: f64 = text
-                        .parse()
-                        .map_err(|_| "--timeout requires a nonnegative number of seconds")?;
-                    result.timeout = Duration::try_from_secs_f64(seconds).map_err(
-                        |_| "--timeout requires a finite, nonnegative number of seconds",
-                    )?;
-                    if seconds > 0.0 && result.timeout.is_zero() {
-                        return Err(
-                            "--timeout is too small; use at least 0.000000001 seconds".into()
-                        );
-                    }
-                }
-                Some("-O" | "--opt-level") => {
-                    result.compiler.options.optimization = super::optimization(&super::string(
-                        value("--opt-level")?,
-                        "optimization level",
-                    )?)?
-                }
-                Some(s) if s.starts_with("-O") && s.len() > 2 => {
-                    result.compiler.options.optimization = super::optimization(&s[2..])?
-                }
-                Some("--cpu") => {
-                    result.compiler.options.cpu = Some(super::string(value("--cpu")?, "CPU")?)
-                }
-                Some("--features") => {
-                    result.compiler.options.features =
-                        super::string(value("--features")?, "features")?
-                }
-                Some("--linker") => result.compiler.linker = value("--linker")?,
-                Some("--link-arg") => {
-                    let value = value("--link-arg")?;
-                    if value.to_string_lossy().starts_with("-o") {
-                        return Err("test manages its temporary output path; --link-arg cannot select an output".into());
-                    }
-                    result.compiler.link_args.push(value);
-                }
-                Some(s) if s.starts_with('-') => {
-                    return Err(format!("unknown test option '{s}'; use dodo test --help"));
-                }
-                _ => {
-                    if input.replace(PathBuf::from(arg)).is_some() {
-                        return Err(
-                            "test accepts one file or directory; use --filter to select names"
-                                .into(),
-                        );
-                    }
-                }
-            }
-        } else if input.replace(PathBuf::from(arg)).is_some() {
-            return Err("test accepts one file or directory".into());
+impl TestArgs {
+    pub fn new(
+        compiler: Args,
+        input: PathBuf,
+        options: dodoc::cli::TestOptions,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            compiler,
+            input,
+            options,
+            timeout,
         }
     }
-    if result.doc && result.no_doc {
-        return Err("--doc and --no-doc cannot be combined".into());
-    }
-    if result.ignored && result.include_ignored {
-        return Err("--ignored and --include-ignored cannot be combined".into());
-    }
-    if result.exact && result.filters.is_empty() {
-        return Err("--exact requires --filter NAME".into());
-    }
-    if let Some(input) = input {
-        result.input = input;
-    }
-    Ok(Parsed::Test(Box::new(result)))
 }
-
+impl std::ops::Deref for TestArgs {
+    type Target = dodoc::cli::TestOptions;
+    fn deref(&self) -> &Self::Target {
+        &self.options
+    }
+}
 struct Case {
     name: String,
     id: String,
@@ -512,10 +354,14 @@ fn run(
     index: usize,
     timeout: Duration,
     temporary: &Path,
+    cwd: Option<&Path>,
 ) -> Result<(bool, String), String> {
     let stdout = fs::File::create(temporary.join("stdout")).map_err(|e| e.to_string())?;
     let stderr = fs::File::create(temporary.join("stderr")).map_err(|e| e.to_string())?;
     let mut command = Command::new(exe);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     command
         .arg(index.to_string())
         .stdin(Stdio::null())
@@ -595,10 +441,12 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
                 );
             }
         }
-        println!(
-            "\n{selected} tests listed; {filtered} filtered out; {} discovery errors",
-            errors.len()
-        );
+        if !args.compiler.quiet || !errors.is_empty() {
+            println!(
+                "\n{selected} tests listed; {filtered} filtered out; {} discovery errors",
+                errors.len()
+            );
+        }
     }
     if selected == 0 {
         if !errors.is_empty() {
@@ -608,17 +456,21 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
             );
             return Ok(1);
         }
-        println!(
-            "No tests {} in {}.\nAdd @test fn example() {{ assert_eq(2 + 2, 4) }} to a .dodo file.\nUse dodo test --list or dodo test --help to inspect discovery.",
-            if discovered == 0 { "found" } else { "matched" },
-            args.input.display()
-        );
+        if !args.compiler.quiet || !args.allow_empty {
+            println!(
+                "No tests {} in {}.\nAdd @test fn example() {{ assert_eq(2 + 2, 4) }} to a .dodo file.\nUse dodo test --list or dodo test --help to inspect discovery.",
+                if discovered == 0 { "found" } else { "matched" },
+                args.input.display()
+            );
+        }
         return Ok(i32::from(!args.allow_empty || !errors.is_empty()));
     }
     if args.list {
         return Ok(i32::from(!errors.is_empty()));
     }
-    println!("Discovered {discovered} tests; {selected} selected; {filtered} filtered out\n");
+    if !args.compiler.quiet {
+        println!("Discovered {discovered} tests; {selected} selected; {filtered} filtered out\n");
+    }
     let temporary = TempDir::new(&std::env::temp_dir())?;
     let mut passed = 0;
     let mut failed = vec![];
@@ -632,7 +484,9 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
                 && !args.include_ignored
                 && !args.ignored
             {
-                println!("test {} ... ignored ({reason})", case.id);
+                if !args.compiler.quiet {
+                    println!("test {} ... ignored ({reason})", case.id);
+                }
                 ignored += 1;
                 completed += 1;
             } else {
@@ -642,7 +496,9 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
         if active.is_empty() {
             continue;
         }
-        println!("Compiling {}", display_path(&unit.path));
+        if !args.compiler.quiet {
+            eprintln!("Compiling {}", display_path(&unit.path));
+        }
         let _ = std::io::stdout().flush();
         let exe = temporary.0.join(format!(
             "tests-{unit_index}{}",
@@ -684,17 +540,30 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
             continue;
         }
         for (index, case) in active.iter().enumerate() {
-            print!("test {} ... ", case.id);
+            if !args.compiler.quiet {
+                print!("test {} ... ", case.id);
+            }
             let _ = std::io::stdout().flush();
             let start = Instant::now();
-            let (success, status) =
-                run(&exe, index, args.timeout, &temporary.0).unwrap_or_else(|e| (false, e));
+            let (success, status) = run(
+                &exe,
+                index,
+                args.timeout,
+                &temporary.0,
+                args.compiler.run_cwd.as_deref(),
+            )
+            .unwrap_or_else(|e| (false, e));
             completed += 1;
             if success {
                 passed += 1;
-                println!("ok ({:.2}s)", start.elapsed().as_secs_f64());
+                if !args.compiler.quiet {
+                    println!("ok ({:.2}s)", start.elapsed().as_secs_f64());
+                }
             } else {
                 failed.push(case.id.clone());
+                if args.compiler.quiet {
+                    print!("test {} ... ", case.id);
+                }
                 println!("FAILED ({status}; {})", case.location);
             }
             if !success || args.show_output {
@@ -725,6 +594,23 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
             "-O".into(),
             args.compiler.options.optimization.to_string().into(),
         ];
+        if let Some(manifest) = &args.compiler.manifest {
+            command.extend(["--manifest-path".into(), manifest.as_os_str().into()]);
+        } else {
+            command.push("--no-manifest".into());
+        }
+        if let Some(profile) = &args.compiler.profile {
+            command.extend(["--profile".into(), profile.into()]);
+        }
+        command.push(
+            if args.compiler.options.debug {
+                "--debug"
+            } else {
+                "--no-debug"
+            }
+            .into(),
+        );
+        command.push("--clear-link-args".into());
         command.extend([OsString::from("--linker"), args.compiler.linker.clone()]);
         for arg in &args.compiler.link_args {
             command.extend([OsString::from("--link-arg"), arg.clone()]);
@@ -732,12 +618,10 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
         if let Some(cpu) = &args.compiler.options.cpu {
             command.extend([OsString::from("--cpu"), cpu.into()]);
         }
-        if !args.compiler.options.features.is_empty() {
-            command.extend([
-                OsString::from("--features"),
-                args.compiler.options.features.clone().into(),
-            ]);
-        }
+        command.extend([
+            OsString::from("--features"),
+            args.compiler.options.features.clone().into(),
+        ]);
         command.extend([
             OsString::from("--timeout"),
             args.timeout.as_secs_f64().to_string().into(),
@@ -752,14 +636,16 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
         );
     }
     let success = failed.is_empty() && errors.is_empty();
-    println!(
-        "\nTest result: {}. {passed} passed; {} failed; {ignored} ignored; {filtered} filtered out; {} not run; {} discovery errors ({:.2}s)",
-        if success { "ok" } else { "FAILED" },
-        failed.len(),
-        selected - completed,
-        errors.len(),
-        started.elapsed().as_secs_f64()
-    );
+    if !args.compiler.quiet || !success {
+        println!(
+            "\nTest result: {}. {passed} passed; {} failed; {ignored} ignored; {filtered} filtered out; {} not run; {} discovery errors ({:.2}s)",
+            if success { "ok" } else { "FAILED" },
+            failed.len(),
+            selected - completed,
+            errors.len(),
+            started.elapsed().as_secs_f64()
+        );
+    }
     Ok(i32::from(!success))
 }
 

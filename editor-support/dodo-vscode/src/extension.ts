@@ -65,6 +65,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       const command = serverPath(config.get<string>("server.path", "dodo"), folder);
       const target = config.get<string>("target", "").trim();
+      const buildTarget = config.get<string>("buildTarget", "").trim();
+      const manifestPath = config.get<string>("manifestPath", "").trim();
       output.info(`Starting ${command} lsp`);
       client = new LanguageClient("dodo", "Dodo Language Server", {
         command,
@@ -81,6 +83,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         initializationOptions: {
           checkMode: config.get<string>("checkMode", "file"),
           ...(target ? { target } : {}),
+          ...(buildTarget ? { buildTarget } : {}),
+          ...(manifestPath ? { manifestPath } : {}),
         },
         outputChannel: output,
         traceOutputChannel: output,
@@ -121,7 +125,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.onDidGrantWorkspaceTrust(() => { void restart(); }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => { void restart(); }),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (["dodo.server", "dodo.checkMode", "dodo.target"].some((key) => event.affectsConfiguration(key))) {
+      if (["dodo.server", "dodo.checkMode", "dodo.target", "dodo.buildTarget", "dodo.manifestPath"].some((key) => event.affectsConfiguration(key))) {
         void restart();
       }
     }),

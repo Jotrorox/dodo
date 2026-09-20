@@ -1,88 +1,15 @@
 //! Command-line driver. Linking is an explicit process invocation, never a shell command.
-use dodoc::codegen::Context;
-use dodoc::codegen::FileType;
-use dodoc::{codegen, lsp, package, sema};
+use cli::{Action, Invocation, Parsed};
+use dodoc::codegen::{Context, FileType};
+use dodoc::{cli, codegen, lsp, package, project, sema, toml};
+use project::{Emit, Purpose, Resolved};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-
 mod test_runner;
 
-const HELP: &str = concat!(
-    "Dodo ",
-    env!("CARGO_PKG_VERSION"),
-    r#" — ahead-of-time systems language compiler
-
-Usage: dodo <COMMAND> [FILE|DIRECTORY] [OPTIONS]
-       dodo lsp
-
-Commands:
-  check    Parse and check types, ownership, and borrowing
-  compile  Compile a native executable or compiler artifact (alias: build)
-  run      Compile and run a program; arguments follow --
-  test     Discover and run tests recursively (default: current directory)
-  lsp      Run the language server over standard input/output (alias: --lsp)
-  fmt      Format and migrate syntax (default input: current directory)
-
-Projects:
-  check, compile, build, and run default to main.dodo in the current folder.
-  A directory input selects its main.dodo. Explicit source files are supported.
-  Import local subfolders to share code. No manifest or package manager is needed.
-
-Formatting options:
-      --check            Report unformatted files without writing
-      --stdout           Print one formatted file without writing
-  Use - as the fmt input to read stdin and write stdout.
-
-Compiler options:
-  -o, --output PATH       Output path (default: build/<project folder name>)
-      --emit KIND         exe (default), obj, asm, llvm-ir, bitcode
-  -g, --debug             Emit source locations, variables, and types
-      --panic MODE       Runtime failure: auto (default), hosted, trap
-      --panic-hook NAME  Call a non-returning C ABI board failure handler
-  -O, --opt-level LEVEL   Optimization level: 0, 1, 2, 3 (default: 0)
-      --target TRIPLE     LLVM target triple (default: host)
-      --cpu NAME          Target CPU (default: generic)
-      --features LIST     LLVM target features, e.g. +sse4.2
-      --linker PATH       C linker driver (default: DODO_CC or cc)
-      --link-arg ARG      Pass an argument to the linker; repeatable
-  -h, --help             Print help
-  -V, --version          Print compiler version
-
-Examples:
-  dodo run
-  dodo check
-  dodo compile -O 2
-  dodo run -- example-argument
-  dodo fmt
-  dodo fmt --check
-  dodo test
-  dodo test --filter addition
-  dodo test --help
-  dodo run examples/samples.dodo -O 2
-  dodo compile examples/hello.dodo -o build/hello
-  dodo compile examples/gpio.dodo --emit llvm-ir -o build/gpio.ll
-
-LLVM 23 is embedded; no LLVM installation is needed to use this compiler.
-Linking executables requires a C toolchain (cc, --linker, or DODO_CC).
-"#
-);
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Action {
-    Check,
-    Build,
-    Run,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Emit {
-    Exe,
-    Obj,
-    Asm,
-    Ir,
-    Bitcode,
-}
 struct Args {
     action: Action,
     input: PathBuf,
@@ -92,227 +19,437 @@ struct Args {
     linker: OsString,
     link_args: Vec<OsString>,
     run_args: Vec<OsString>,
+    link_cwd: Option<PathBuf>,
+    run_cwd: Option<PathBuf>,
+    quiet: bool,
+    verbose: bool,
+    manifest: Option<PathBuf>,
+    profile: Option<String>,
 }
-enum Parsed {
-    Help,
-    Version,
-    Lsp,
-    Args(Box<Args>),
-    Format(FormatArgs),
-    Test(Box<test_runner::TestArgs>),
-    TestHelp,
-}
-
 struct FormatArgs {
     input: PathBuf,
     check: bool,
     stdout: bool,
+    quiet: bool,
+    verbose: bool,
 }
-
-fn parse_format(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
-    let mut input = None;
-    let mut check = false;
-    let mut stdout = false;
-    let mut positional = false;
-    for arg in args {
-        match arg.to_str() {
-            Some("--help" | "-h") if !positional => return Ok(Parsed::Help),
-            Some("--check") if !positional => check = true,
-            Some("--stdout") if !positional => stdout = true,
-            Some("--") if !positional => positional = true,
-            Some(s) if !positional && s.starts_with('-') && s != "-" => {
-                return Err(format!("unknown fmt option '{s}'; use dodo --help"));
-            }
-            _ => {
-                if input.replace(PathBuf::from(arg)).is_some() {
-                    return Err("fmt accepts one file or directory; omit the path to format the current directory".into());
-                }
-            }
-        }
+fn host_triple() -> String {
+    codegen::TargetMachine::get_default_triple()
+        .as_str()
+        .to_string_lossy()
+        .into_owned()
+}
+fn codegen_options(settings: &project::Settings) -> codegen::Options {
+    codegen::Options {
+        target: settings.triple.clone(),
+        cpu: settings.cpu.clone(),
+        features: settings.features.clone().unwrap_or_default(),
+        optimization: settings.opt_level.unwrap_or(0),
+        debug: settings.debug.unwrap_or(false),
+        panic: match settings.panic.as_ref().unwrap_or(&project::Panic::Auto) {
+            project::Panic::Auto => codegen::PanicStrategy::Auto,
+            project::Panic::Hosted => codegen::PanicStrategy::Hosted,
+            project::Panic::Trap => codegen::PanicStrategy::Trap,
+            project::Panic::Hook(s) => codegen::PanicStrategy::Hook(s.clone()),
+        },
+        ..Default::default()
     }
-    if check && stdout {
-        return Err("fmt --check and --stdout cannot be combined".into());
+}
+fn from_resolved(i: &Invocation, r: &Resolved) -> Args {
+    Args {
+        action: i.action,
+        input: r.entry.clone().unwrap(),
+        output: r.output.clone(),
+        emit: r.emit,
+        options: codegen_options(&r.settings),
+        linker: r.settings.linker.clone().unwrap(),
+        link_args: r.settings.link_args.clone().unwrap(),
+        run_args: r.run_args.clone(),
+        link_cwd: r.link_cwd.clone(),
+        run_cwd: r.run_cwd.clone(),
+        quiet: i.quiet,
+        verbose: i.verbose,
+        manifest: r.manifest.clone(),
+        profile: r.profile.clone(),
     }
-    Ok(Parsed::Format(FormatArgs {
-        input: input.unwrap_or_else(|| PathBuf::from(".")),
-        check,
-        stdout,
-    }))
 }
-fn string(value: OsString, name: &str) -> Result<String, String> {
-    value
-        .into_string()
-        .map_err(|_| format!("{name} must be valid UTF-8"))
-}
-fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String> {
-    let mut args = args.into_iter();
-    let Some(command) = args.next() else {
-        return Ok(Parsed::Help);
+fn prepare(
+    i: &Invocation,
+    m: Option<&project::Manifest>,
+    target: Option<&str>,
+    cwd: &Path,
+    host: &str,
+) -> Result<Resolved, String> {
+    let env_linker = std::env::var_os("DODO_CC");
+    let purpose = match i.action {
+        Action::Check => Purpose::Check,
+        Action::Run => Purpose::Run,
+        Action::Test => Purpose::Test,
+        _ => Purpose::Build,
     };
-    let action = match command.to_str() {
-        Some("-h" | "--help" | "help") => return Ok(Parsed::Help),
-        Some("-V" | "--version") => return Ok(Parsed::Version),
-        Some("--lsp" | "lsp") => {
-            return match args.next().as_deref() {
-                None => Ok(Parsed::Lsp),
-                Some(arg) if arg == "--help" || arg == "-h" => Ok(Parsed::Help),
-                Some(_) => Err("LSP mode takes no source path or compiler options".into()),
-            };
+    let mut r = project::resolve(project::Request {
+        manifest: m,
+        target,
+        profile: i.profile.as_deref(),
+        purpose,
+        overrides: &i.settings,
+        link_args: &i.link_args,
+        clear_link_args: i.clear_link_args,
+        env_linker: env_linker.as_deref(),
+        cwd,
+        host,
+    })?;
+    if i.action == Action::Test {
+        if i.manifest_path.is_some()
+            && let Some(path) = &i.input
+        {
+            r.entry = Some(project::absolute(path, cwd));
         }
-        Some("fmt") => return parse_format(args),
-        Some("test") => return test_runner::parse(args),
-        Some("check") => Action::Check,
-        Some("compile" | "build") => Action::Build,
-        Some("run") => Action::Run,
-        _ => {
-            return Err(format!(
-                "unknown command '{}'; use dodo --help",
-                command.to_string_lossy()
+        if r.entry.is_none() {
+            r.entry = Some(project::absolute(
+                i.input.as_deref().unwrap_or(Path::new(".")),
+                cwd,
             ));
         }
+        if let Some(timeout) = i.test.timeout {
+            r.timeout = timeout;
+        }
+    } else if r.entry.is_none() {
+        let input = i.input.as_deref().unwrap_or(Path::new("."));
+        r.entry = Some(if input == Path::new(".") {
+            PathBuf::from("main.dodo")
+        } else if input.is_dir() {
+            input.join("main.dodo")
+        } else {
+            input.into()
+        });
+    }
+    if let Some(emit) = i.emit {
+        r.emit = emit;
+        if let (Some(m), Some(name)) = (m, &r.target) {
+            r.output = Some(
+                m.out_dir
+                    .join(r.profile.as_deref().unwrap_or("dev"))
+                    .join(r.settings.triple.as_ref().unwrap())
+                    .join(format!(
+                        "{name}{}",
+                        emit.extension(r.settings.triple.as_ref().unwrap())
+                    )),
+            );
+        }
+    }
+    if let Some(output) = &i.output {
+        r.output = Some(project::absolute(output, cwd));
+    }
+    if let Some(args) = &i.run_args {
+        r.run_args = args.clone();
+    }
+    if i.action != Action::Build {
+        r.output = None;
+    } else if r.output.is_none() {
+        let input = r.entry.as_ref().unwrap();
+        let mut name = if input.file_name().is_some_and(|n| n == "main.dodo") {
+            let parent = input
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            project::absolute(parent, cwd)
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.file_name().map(OsStr::to_os_string))
+        } else {
+            input.file_stem().map(OsStr::to_os_string)
+        }
+        .unwrap_or_else(|| "program".into());
+        name.push(if r.emit == Emit::Exe {
+            ""
+        } else {
+            r.emit.extension(host)
+        });
+        r.output = Some(cwd.join("build").join(name));
+    }
+    if i.action == Action::Run
+        && (r.emit != Emit::Exe || r.settings.triple.as_deref() != Some(host))
+    {
+        return Err(format!(
+            "run requires a host executable; use dodo build{} for this target",
+            r.target
+                .as_ref()
+                .map(|n| format!(" -b {n}"))
+                .unwrap_or_default()
+        ));
+    }
+    if i.action == Action::Build
+        && r.emit != Emit::Exe
+        && !r.settings.link_args.as_ref().unwrap().is_empty()
+    {
+        return Err("link-args applies only to executables; clear inherited arguments with --clear-link-args or link-args = []".into());
+    }
+    if !(i.action == Action::Test && (i.test.list || i.print_config)) {
+        codegen::pointer_bits(&codegen_options(&r.settings)).map_err(|e| {
+            let triple = r.settings.triple.as_deref().unwrap();
+            if m.is_some_and(|m| m.targets.contains_key(triple)) {
+                format!(
+                    "{e}\n  '{triple}' is a project target; use -b {triple}, not --target {triple}"
+                )
+            } else {
+                e.to_string()
+            }
+        })?;
+    }
+    if i.action == Action::Run
+        && let Some(dir) = &r.run_cwd
+        && !dir.is_dir()
+    {
+        return Err(format!("run.cwd is not a directory: {}", dir.display()));
+    }
+    Ok(r)
+}
+fn inspect(i: &Invocation, r: &Resolved, cwd: &Path) -> String {
+    let mut text = r.report();
+    if let Some(input) = &r.entry {
+        let original = format!("input = {}", toml::quote(&input.to_string_lossy()));
+        text = text.replace(
+            &original,
+            &format!(
+                "input = {}",
+                toml::quote(&project::absolute(input, cwd).to_string_lossy())
+            ),
+        );
+    }
+    if i.action == Action::Check {
+        text.insert_str(0,"# check uses input/triple/cpu/features; emission, linking, debug, optimization and runtime fields below are unused.\n");
+    }
+    if i.action == Action::Test {
+        text.push_str(&format!(
+            concat!(
+                "\n[test]\ntimeout = {}\nfilter = {}\nskip = {}\nexact = {}\n",
+                "ignored = {}\ninclude-ignored = {}\ndoc = {}\nno-doc = {}\n",
+                "allow-empty = {}\nshow-output = {}\nfail-fast = {}\n"
+            ),
+            r.timeout.as_secs_f64(),
+            project::argv(
+                &i.test
+                    .filters
+                    .iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            ),
+            project::argv(&i.test.skips.iter().map(OsString::from).collect::<Vec<_>>()),
+            i.test.exact,
+            i.test.ignored,
+            i.test.include_ignored,
+            i.test.doc,
+            i.test.no_doc,
+            i.test.allow_empty,
+            i.test.show_output,
+            i.test.fail_fast,
+        ));
+    }
+    text
+}
+fn dispatch(i: Invocation) -> Result<i32, String> {
+    match i.action {
+        Action::Lsp => {
+            return lsp::run(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
+                .map_err(|e| format!("LSP transport failed: {e}"));
+        }
+        Action::Fmt => {
+            return execute_format(FormatArgs {
+                input: i.input.unwrap_or_else(|| ".".into()),
+                check: i.fmt_check,
+                stdout: i.fmt_stdout,
+                quiet: i.quiet,
+                verbose: i.verbose,
+            });
+        }
+        Action::Init => return init(&i),
+        Action::Completions => {
+            let shell = i
+                .input
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .ok_or("completions requires a shell: bash, zsh, fish, powershell")?;
+            print!("{}", cli::completions(shell)?);
+            return Ok(0);
+        }
+        _ => (),
+    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let host = host_triple();
+    let manifest = project::discover(
+        i.input.as_deref(),
+        i.manifest_path.as_deref(),
+        i.no_manifest,
+        &cwd,
+    )?;
+    if i.action == Action::Targets {
+        let m = manifest
+            .as_ref()
+            .ok_or("no dodo.toml found; select a project directory or --manifest-path PATH")?;
+        if i.verbose {
+            eprintln!("Manifest: {}", m.path.display());
+        }
+        for (name, t) in &m.targets {
+            let default = m
+                .default_target
+                .as_ref()
+                .map_or(m.targets.len() == 1, |d| d == name);
+            println!(
+                "{name}{}\t{}\t{}\t{}",
+                if default { " (default)" } else { "" },
+                t.entry.strip_prefix(&m.root).unwrap_or(&t.entry).display(),
+                t.emit.name(),
+                t.settings
+                    .triple
+                    .as_ref()
+                    .or(m.build.triple.as_ref())
+                    .unwrap_or(&host)
+            );
+        }
+        return Ok(0);
+    }
+    if (i.build_target.is_some() || i.all_targets) && i.input.as_ref().is_some_and(|p| !p.is_dir())
+    {
+        return Err(
+            "an explicit source file cannot be combined with project target selectors".into(),
+        );
+    }
+    if i.all_targets && manifest.is_none() {
+        return Err(
+            "--all-targets requires dodo.toml; use --manifest-path PATH to select a manifest"
+                .into(),
+        );
+    }
+    let names = if i.all_targets {
+        manifest
+            .as_ref()
+            .unwrap()
+            .targets
+            .keys()
+            .map(|s| Some(s.as_str()))
+            .collect::<Vec<_>>()
+    } else {
+        vec![i.build_target.as_deref()]
     };
-    let mut result = Args {
-        action,
-        input: PathBuf::new(),
-        output: None,
-        emit: Emit::Exe,
-        options: codegen::Options::default(),
-        linker: std::env::var_os("DODO_CC").unwrap_or_else(|| "cc".into()),
-        link_args: vec![],
-        run_args: vec![],
-    };
-    let mut emit_given = false;
-    while let Some(arg) = args.next() {
-        let mut value = |name: &str| {
-            args.next()
-                .ok_or_else(|| format!("{name} requires a value"))
-        };
-        match arg.to_str() {
-            Some("--help" | "-h") => return Ok(Parsed::Help),
-            Some("--version" | "-V") => return Ok(Parsed::Version),
-            Some("--") => {
-                if action == Action::Run {
-                    result.run_args.extend(args);
-                    break;
-                }
-                for path in args {
-                    if !result.input.as_os_str().is_empty() {
-                        return Err(
-                            "only one input path is accepted; pass a source file or project folder"
-                                .into(),
-                        );
-                    }
-                    result.input = path.into();
-                }
-                break;
+    let mut resolved = vec![];
+    for name in names {
+        resolved.push(prepare(&i, manifest.as_ref(), name, &cwd, &host)?);
+    }
+    if i.print_config {
+        for r in &resolved {
+            if i.all_targets {
+                println!("[[resolved]]");
             }
-            Some("-o" | "--output") => {
-                if result.output.is_some() {
-                    return Err("output specified more than once".into());
-                }
-                result.output = Some(value("--output")?.into());
+            print!("{}", inspect(&i, r, &cwd));
+        }
+        return Ok(0);
+    }
+    // Validate all selected entries and output destinations before starting any build.
+    if i.action != Action::Test {
+        for r in &resolved {
+            let input = r.entry.as_ref().unwrap();
+            if !input.is_file() {
+                return Err(if let Some(name) = &r.target {
+                    format!(
+                        "targets.{name}.entry: expected source file {}",
+                        input.display()
+                    )
+                } else if input.file_name().is_some_and(|n| n == "main.dodo") {
+                    format!(
+                        "expected project entry file {}; create main.dodo in this folder or pass an explicit source file",
+                        input.display()
+                    )
+                } else {
+                    format!("cannot open {}: no such source file", input.display())
+                });
             }
-            Some("--emit") => {
-                emit_given = true;
-                result.emit = match string(value("--emit")?, "emission kind")?.as_str() {
-                    "exe" => Emit::Exe,
-                    "obj" | "object" => Emit::Obj,
-                    "asm" | "assembly" => Emit::Asm,
-                    "llvm-ir" | "ir" => Emit::Ir,
-                    "bitcode" | "bc" => Emit::Bitcode,
-                    s => {
-                        return Err(format!(
-                            "unknown emission kind '{s}'; expected exe, obj, asm, llvm-ir, or bitcode"
-                        ));
-                    }
-                };
-            }
-            Some("-g" | "--debug") => result.options.debug = true,
-            Some("--panic") => {
-                result.options.panic = match string(value("--panic")?, "panic mode")?.as_str() {
-                    "auto" => codegen::PanicStrategy::Auto,
-                    "hosted" => codegen::PanicStrategy::Hosted,
-                    "trap" => codegen::PanicStrategy::Trap,
-                    mode => {
-                        return Err(format!(
-                            "invalid panic mode '{mode}'; expected auto, hosted, or trap"
-                        ));
-                    }
-                };
-            }
-            Some("--panic-hook") => {
-                let name = string(value("--panic-hook")?, "panic hook")?;
-                if name.is_empty()
-                    || !name.bytes().enumerate().all(|(i, b)| {
-                        b == b'_' || b.is_ascii_alphabetic() || (i != 0 && b.is_ascii_digit())
-                    })
-                {
-                    return Err("panic hook must be a C symbol name".into());
-                }
-                result.options.panic = codegen::PanicStrategy::Hook(name);
-            }
-            Some("-O" | "--opt-level") => {
-                result.options.optimization =
-                    optimization(&string(value("--opt-level")?, "optimization level")?)?;
-            }
-            Some(s) if s.starts_with("-O") && s.len() > 2 => {
-                result.options.optimization = optimization(&s[2..])?;
-            }
-            Some("--target") => result.options.target = Some(string(value("--target")?, "target")?),
-            Some("--cpu") => result.options.cpu = Some(string(value("--cpu")?, "CPU")?),
-            Some("--features") => {
-                result.options.features = string(value("--features")?, "features")?
-            }
-            Some("--linker") => result.linker = value("--linker")?,
-            Some("--link-arg") => {
-                let v = value("--link-arg")?;
-                if v == "-o" || v.to_string_lossy().starts_with("-o") {
-                    return Err("use --output to choose the output path".into());
-                }
-                result.link_args.push(v);
-            }
-            Some(s) if s.starts_with('-') => {
-                return Err(format!("unknown option '{s}'; use dodo --help"));
-            }
-            _ => {
-                if !result.input.as_os_str().is_empty() {
-                    return Err(
-                        "only one input path is accepted; pass a source file or project folder"
-                            .into(),
-                    );
-                }
-                result.input = arg.into();
+            if let Some(output) = &r.output {
+                protect_output(output, input, r.manifest.as_deref())?;
             }
         }
     }
-    if result.input.as_os_str().is_empty() {
-        result.input = PathBuf::from(".");
+    for notice in &i.notices {
+        eprintln!("note: {notice}");
     }
-    if action == Action::Check
-        && (result.output.is_some() || emit_given || !result.link_args.is_empty())
-    {
-        return Err("check does not produce output or invoke a linker".into());
+    for r in resolved {
+        if i.verbose {
+            eprintln!("{}", inspect(&i, &r, &cwd));
+        }
+        let args = from_resolved(&i, &r);
+        let status = if i.action == Action::Test {
+            test_runner::execute(test_runner::TestArgs::new(
+                args,
+                r.entry.unwrap(),
+                i.test.clone(),
+                r.timeout,
+            ))?
+        } else {
+            execute(args)?
+        };
+        if status != 0 {
+            return Ok(status);
+        }
     }
-    if action == Action::Run && (result.output.is_some() || emit_given) {
-        return Err(
-            "run builds a temporary executable; use compile to select an output artifact".into(),
+    Ok(0)
+}
+fn protect_output(output: &Path, input: &Path, manifest: Option<&Path>) -> Result<(), String> {
+    if let Ok(path) = fs::canonicalize(output) {
+        if fs::canonicalize(input).is_ok_and(|p| p == path) {
+            return Err("output path would overwrite the source input".into());
+        }
+        if manifest.is_some_and(|m| fs::canonicalize(m).is_ok_and(|p| p == path)) {
+            return Err("output path would overwrite the project manifest".into());
+        }
+        if output.extension().is_some_and(|e| e == "dodo") {
+            return Err("output path must not replace a Dodo source file".into());
+        }
+    }
+    Ok(())
+}
+fn init(i: &Invocation) -> Result<i32, String> {
+    use std::io::Write;
+    let root = i.input.as_deref().unwrap_or(Path::new("."));
+    let manifest = root.join("dodo.toml");
+    let main = root.join("main.dodo");
+    if manifest.symlink_metadata().is_ok() {
+        return Err(format!(
+            "{} already exists; no files were changed",
+            manifest.display()
+        ));
+    }
+    if i.manifest_only {
+        if !main.is_file() {
+            return Err("--manifest-only requires an existing main.dodo".into());
+        }
+    } else if main.symlink_metadata().is_ok() {
+        return Err("main.dodo already exists; use dodo init --manifest-only".into());
+    }
+    fs::create_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    if !i.manifest_only {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&main)
+            .and_then(|mut f| f.write_all(b"package app\n\nfn main() {}\n"))
+            .map_err(|e| format!("cannot create {}: {e}", main.display()))?;
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest)
+        .and_then(|mut f| {
+            f.write_all(b"schema = 1\n\n[targets.app]\nentry = \"main.dodo\"\n\n[profiles.dev]\ndebug = true\n")
+        })
+        .map_err(|e| format!("cannot create {}: {e}", manifest.display()))?;
+    if !i.quiet {
+        eprintln!(
+            "Created {}; run dodo run {}",
+            manifest.display(),
+            root.display()
         );
     }
-    if result.emit != Emit::Exe && !result.link_args.is_empty() {
-        return Err("--link-arg applies only to executables".into());
-    }
-    Ok(Parsed::Args(Box::new(result)))
-}
-fn optimization(s: &str) -> Result<u8, String> {
-    match s {
-        "0" => Ok(0),
-        "1" => Ok(1),
-        "2" => Ok(2),
-        "3" => Ok(3),
-        _ => Err(format!(
-            "invalid optimization level '{s}'; expected 0, 1, 2, or 3"
-        )),
-    }
+    Ok(0)
 }
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -320,6 +457,13 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(parent: &Path) -> Result<Self, String> {
         for _ in 0..100 {
+            let parent = if parent.is_absolute() {
+                parent.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| e.to_string())?
+                    .join(parent)
+            };
             let path = parent.join(format!(
                 ".dodo-{}-{}",
                 std::process::id(),
@@ -381,6 +525,9 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 .write_to_file(&generated.module, FileType::Object, &object)
                 .map_err(|e| e.to_string())?;
             let mut linker = Command::new(&args.linker);
+            if let Some(cwd) = &args.link_cwd {
+                linker.current_dir(cwd);
+            }
             linker.arg(&object);
             if options.debug {
                 linker.arg("-g");
@@ -422,7 +569,16 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                     linker.args(["-lssl", "-lcrypto"]);
                 }
             }
-            let output = linker.args(&args.link_args).arg("-o").arg(out).output().map_err(|e|format!("could not execute linker '{}': {e}; install a C toolchain or select --linker",args.linker.to_string_lossy()))?;
+            linker.args(&args.link_args).arg("-o").arg(out);
+            if args.verbose {
+                eprintln!("Linking: {linker:?}");
+            }
+            let output = linker.output().map_err(|e| {
+                format!(
+                    "could not execute linker '{}': {e}; install a C toolchain or select --linker",
+                    args.linker.to_string_lossy()
+                )
+            })?;
             if !output.status.success() {
                 return Err(format!(
                     "linker failed ({}):\n{}{}",
@@ -464,7 +620,9 @@ fn execute(mut args: Args) -> Result<i32, String> {
     let bits = codegen::pointer_bits(&args.options).map_err(|e| e.to_string())?;
     sema::check_for_target(&mut loaded.program, bits).map_err(|d| loaded.render(&d))?;
     if args.action == Action::Check {
-        println!("Checked {}", args.input.display());
+        if !args.quiet {
+            eprintln!("Checked {}", args.input.display());
+        }
         return Ok(0);
     }
     if args.action == Action::Run {
@@ -480,8 +638,15 @@ fn execute(mut args: Args) -> Result<i32, String> {
         let exe = temp.0.join("program");
         args.emit = Emit::Exe;
         compile(&args, &loaded, &exe)?;
-        let status = Command::new(&exe)
-            .args(&args.run_args)
+        let mut program = Command::new(&exe);
+        program.args(&args.run_args);
+        if let Some(cwd) = &args.run_cwd {
+            program.current_dir(cwd);
+        }
+        if args.verbose {
+            eprintln!("Running: {program:?}");
+        }
+        let status = program
             .status()
             .map_err(|e| format!("could not run program: {e}"))?;
         if let Some(code) = status.code() {
@@ -525,6 +690,7 @@ fn execute(mut args: Args) -> Result<i32, String> {
         });
         PathBuf::from("build").join(name)
     });
+    protect_output(&output, &args.input, args.manifest.as_deref())?;
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -543,7 +709,9 @@ fn execute(mut args: Args) -> Result<i32, String> {
     let staged = temporary.0.join("artifact");
     compile(&args, &loaded, &staged)?;
     fs::rename(&staged, &output).map_err(|e| format!("cannot write {}: {e}", output.display()))?;
-    println!("Built {}", output.display());
+    if !args.quiet {
+        eprintln!("Built {}", output.display());
+    }
     Ok(0)
 }
 
@@ -580,6 +748,9 @@ fn format_source(path: &Path, source: &str) -> Result<String, String> {
 }
 
 fn execute_format(args: FormatArgs) -> Result<i32, String> {
+    if args.verbose {
+        eprintln!("Formatting {}", args.input.display());
+    }
     if args.input == Path::new("-") {
         use std::io::{Read, Write};
         let mut source = String::new();
@@ -665,6 +836,9 @@ fn execute_format(args: FormatArgs) -> Result<i32, String> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
     for path in formatted_paths {
+        if args.quiet {
+            continue;
+        }
         writeln!(stdout, "Formatted {}", path.display())
             .map_err(|e| format!("cannot write stdout: {e}"))?;
     }
@@ -672,87 +846,34 @@ fn execute_format(args: FormatArgs) -> Result<i32, String> {
 }
 
 fn main() {
-    let result = match parse(std::env::args_os().skip(1)) {
-        Ok(Parsed::Help) => {
-            print!("{HELP}");
-            Ok(0)
+    let code = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(Parsed::Help(action)) => {
+            print!("{}", cli::help(action));
+            0
         }
         Ok(Parsed::Version) => {
             println!("dodo {} (LLVM 23, BSD-2-Clause)", env!("CARGO_PKG_VERSION"));
-            Ok(0)
+            0
         }
-        Ok(Parsed::Args(args)) => execute(*args),
-        Ok(Parsed::Lsp) => lsp::run(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
-            .map_err(|error| format!("LSP transport failed: {error}")),
-        Ok(Parsed::Format(args)) => execute_format(args),
-        Ok(Parsed::Test(args)) => test_runner::execute(*args),
-        Ok(Parsed::TestHelp) => {
-            print!("{}", test_runner::HELP);
-            Ok(0)
-        }
-        Err(e) => Err(e),
-    };
-    let code = match result {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!(
-                "{}{}",
-                if e.starts_with("error:") {
-                    ""
-                } else {
-                    "error: "
-                },
-                e
-            );
-            1
+        Ok(Parsed::Invoke(invocation)) => match dispatch(*invocation) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!(
+                    "{}{}",
+                    if error.starts_with("error:") {
+                        ""
+                    } else {
+                        "error: "
+                    },
+                    error
+                );
+                1
+            }
+        },
+        Err(error) => {
+            eprintln!("error: {error}");
+            2
         }
     };
-    // Command resources have been dropped; preserve all 32 exit-status bits on Windows.
     std::process::exit(code);
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn args(xs: &[&str]) -> Result<Parsed, String> {
-        parse(xs.iter().map(OsString::from))
-    }
-    #[test]
-    fn invalid_options() {
-        for xs in [
-            &["build", "x.dodo", "-O9"][..],
-            &["check", "x.dodo", "-o", "x"],
-            &["run", "x.dodo", "--emit", "obj"],
-            &["build", "x.dodo", "--target"],
-            &["build", "x.dodo", "--wat"],
-        ] {
-            assert!(args(xs).is_err());
-        }
-    }
-    #[test]
-    fn run_arguments_are_preserved() {
-        let Parsed::Args(a) = args(&["run", "x.dodo", "-O2", "--", "--flag", "a b"]).unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(
-            a.run_args,
-            vec![OsString::from("--flag"), OsString::from("a b")]
-        );
-        assert_eq!(a.options.optimization, 2);
-    }
-    #[test]
-    fn help_and_version() {
-        assert!(matches!(args(&[]), Ok(Parsed::Help)));
-        assert!(matches!(args(&["--version"]), Ok(Parsed::Version)));
-    }
-
-    #[test]
-    fn lsp_does_not_require_a_source_or_accept_build_options() {
-        for command in ["--lsp", "lsp"] {
-            assert!(matches!(args(&[command]), Ok(Parsed::Lsp)));
-            assert!(matches!(args(&[command, "--help"]), Ok(Parsed::Help)));
-            assert!(args(&[command, "input.dodo"]).is_err());
-            assert!(args(&[command, "-O2"]).is_err());
-        }
-    }
 }

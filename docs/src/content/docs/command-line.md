@@ -6,14 +6,15 @@ order: 100
 ---
 
 These examples build on [your first program](first-program.md). Run commands
-from the `hello` project folder containing `main.dodo`. Use `dodo --help` for the
-complete option list and `dodo --version` for the compiler version.
+from the `hello` project folder containing `main.dodo`. Use `dodo --help` for
+commands, `dodo help build` for compiler options, and `dodo --version` for the
+compiler version.
 
 ## Follow a repeatable workflow
 
 During development, save your files, run `dodo fmt`, then `dodo check`, then
 `dodo test`. Run the application with `dodo run` when the checks pass. Use
-`dodo compile` when you need a persistent executable to distribute or debug.
+`dodo build` when you need a persistent executable to distribute or debug.
 Formatting changes layout; checking catches language errors; testing runs the
 behaviors you assert. None of those steps substitutes for the others.
 
@@ -29,8 +30,10 @@ when your project needs them.
 | `dodo check` | Check syntax, types, ownership, and borrowing. |
 | `dodo run` | Build a temporary executable and run it. |
 | `dodo test` | Discover and run tests recursively, in isolated processes. |
-| `dodo compile` | Keep an executable at `build/hello`. |
-| `dodo build` | Alias for `dodo compile`. |
+| `dodo build` | Keep an executable at `build/hello` without a manifest. |
+| `dodo compile` | Alias for `dodo build`. |
+| `dodo targets` | List named targets from `dodo.toml`. |
+| `dodo init` | Create a small project without overwriting files. |
 | `dodo lsp` | Start the language server for an editor. |
 
 `check` does not need a `main` function or a C toolchain. Building and running an
@@ -70,10 +73,11 @@ reports. Testing does not require `main.dodo`.
 
 ## Project folders and source files
 
-With no input path, `check`, `compile`, `build`, and `run` select `main.dodo`
-in the current folder. Compiler options can follow the command directly.
-An explicit directory also selects its `main.dodo`. A project requires no
-manifest, lockfile, package manager, or special library folder.
+Without a manifest or input path, `check`, `compile`, `build`, and `run` select
+`main.dodo` in the current folder. Compiler options can follow the command
+directly. An explicit directory first looks for `dodo.toml`, otherwise selects
+its `main.dodo`. A project requires no manifest, lockfile, package manager, or
+special library folder.
 
 ```sh
 dodo check
@@ -85,7 +89,7 @@ dodo run examples/hello.dodo
 ```
 
 The entry file and its imports are loaded. Other files beside `main.dodo` and
-unimported subfolders are not automatically included. If `main.dodo` is missing,
+unimported subfolders are not automatically included. If the selected entry is missing,
 the command reports an error; it does not search parent folders, `src/`, or
 alternate entry names. Pass an explicit source file to use another filename.
 
@@ -94,14 +98,43 @@ its immediate `.dodo` files into one package; those files must declare the same
 package, and need no `main.dodo` or `lib.dodo`. See
 [projects and imports](packages.md) for a complete example and import rules.
 
-The default output uses the folder containing `main.dodo`: a project named
-`hello` produces `build/hello`. This applies whether you omit the input, pass a
+Without a manifest, the default output uses the folder containing `main.dodo`:
+a project named `hello` produces `build/hello`. This applies whether you omit the input, pass a
 project folder, or pass its `main.dodo` explicitly. Other explicit source files
 use `build/<source name>`. Artifact extensions are appended to the full name,
 such as `build/hello.ll` for LLVM IR.
 
-Output paths are relative to the shell's current folder, even when compiling
+CLI output paths are relative to the shell's current folder, even when compiling
 another project folder. Use `-o` to choose a different path.
+
+## Optional configuration and CLI conveniences
+
+Save targets, profiles, and default arguments in [dodo.toml](project-manifests.md).
+Use `-b NAME` for a named target, and `--target TRIPLE` for an LLVM platform.
+`--release` works with both manifests and standalone files. Explicit source
+files bypass manifests; `--no-manifest` bypasses a folder's manifest.
+
+```sh
+dodo build -b server --release
+dodo build --print-config
+dodo help run
+dodo completions bash
+```
+
+Long value options support both `--option value` and `--option=value`.
+`-O2`, `-oPATH`, and `-bNAME` are accepted. `--no-debug` disables saved debug
+information; `--clear-link-args` clears saved linker arguments before appending
+explicit ones. `-v` / `--verbose` displays configuration and subprocess commands;
+`-q` / `--quiet` suppresses progress and success messages, never program output.
+
+Build/check status goes to stderr. Primary output, including formatted source,
+configuration reports, help, and program output, goes to stdout. Invalid CLI
+usage exits with 2; configuration, compilation, and test failures use 1.
+`run` preserves the child's exit status. `fmt --check` uses 1 for differences.
+
+Each command has its own help. `check` accepts legacy debug, optimization, panic,
+and linker options with a notice that they have no effect; saved build settings
+are simply unused during checking.
 
 ## Format source
 
@@ -293,7 +326,7 @@ arguments depend on the selected toolchain.
 | `-o PATH`, `--output PATH` | Persistent artifact destination; defaults to `build/<project or source name>`. |
 | `--emit KIND` | `exe`, `obj`, `asm`, `llvm-ir`, or `bitcode`; default `exe`. |
 | `-O LEVEL`, `--opt-level LEVEL` | `0`, `1`, `2`, or `3`; default `0`. Runtime checks remain active. |
-| `-g`, `--debug` | Include source-level DWARF debug information. |
+| `-g`, `--debug` | Include source-level DWARF debug information; `--no-debug` disables it. |
 | `--target TRIPLE` | Select the compilation target; default compiler host. |
 | `--cpu NAME` | Select target CPU features; default `generic`. |
 | `--features LIST` | Explicit LLVM target features, for example `+sse4.2`. |
@@ -301,7 +334,7 @@ arguments depend on the selected toolchain.
 | `--link-arg ARG` | Append a linker argument; repeat for multiple arguments. |
 | `--panic MODE` | Runtime failure policy: `auto`, `hosted`, or `trap`. |
 | `--panic-hook NAME` | Use a non-returning C ABI failure handler; see the contract above. |
-| `-h`, `--help` | Show help. Use `dodo test --help` for test-specific options. |
+| `-h`, `--help` | Show help for the selected command. |
 | `-V`, `--version` | Show the compiler version. |
 
 `run` accepts program arguments after `--`; it owns its temporary output path

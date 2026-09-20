@@ -212,6 +212,22 @@ override the canonical style. It returns one whole-document edit, or no edits if
 the buffer is already formatted. Invalid syntax produces a request error and
 leaves the buffer untouched.
 
+## Project manifest
+
+The server reads `dodo.toml` from `rootUri` (or the first workspace folder), with
+no parent search. `initializationOptions.buildTarget` selects a named target;
+`initializationOptions.manifestPath` selects another manifest, relative to the
+workspace root. `initializationOptions.target` overrides its LLVM triple.
+VS Code exposes these as `dodo.buildTarget`, `dodo.manifestPath`, and
+`dodo.target`; changing them restarts the server. This server-wide selection
+applies across open documents, including multi-folder workspaces.
+
+Manifest file-watch events reload the selected platform and refresh diagnostics.
+Invalid edits report an error while keeping the last valid target. Editors that
+do not support file-watch registration must restart the server after changing
+configuration. Source files and unsaved imports retain the existing checking
+mode below. Reading a manifest never executes a build, linker, or program.
+
 ## Compilation target
 
 Set `initializationOptions.target` to the same LLVM triple used by your project's
@@ -224,8 +240,9 @@ Set `initializationOptions.target` to the same LLVM triple used by your project'
 The target controls both pointer-width checking (`usize`, `isize`, array bounds)
 and selection of hosted imports such as `std/fs/native`. It applies to file,
 package, dependency, fallback, and untitled analysis. Invalid triples are rejected
-during initialization. The default is LLVM's host target. Restart the server after
-changing the initialization options; there is no project manifest to infer them from.
+during initialization. Restart the server after
+changing the initialization options. Without an explicit target, the server uses
+the selected target from `dodo.toml` in the workspace root, otherwise the host.
 
 ## File and package checking
 
