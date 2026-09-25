@@ -4,14 +4,34 @@ use super::*;
 use crate::ast::{self, BinaryOp, Expr, ExprKind, Function, Program, StmtKind, UnaryOp};
 use std::collections::HashMap;
 
-#[derive(Debug)]
+/// Machine-readable fallback families; messages retain the specific restriction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LimitationKind {
+    Target,
+    Imports,
+    Constants,
+    Enums,
+    StructDeclaration,
+    FunctionDeclaration,
+    Type,
+    Statement,
+    Expression,
+    UnsupportedConstruct,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Limitation {
+    pub kind: LimitationKind,
     pub span: Span,
     pub reason: String,
 }
 type Result<T> = std::result::Result<T, Limitation>;
 fn unsupported<T>(span: Span, reason: &str) -> Result<T> {
+    limited(LimitationKind::UnsupportedConstruct, span, reason)
+}
+fn limited<T>(kind: LimitationKind, span: Span, reason: &str) -> Result<T> {
     Err(Limitation {
+        kind,
         span,
         reason: reason.into(),
     })
@@ -48,6 +68,7 @@ impl<'a> Adapter<'a> {
             .iter()
             .find(|f| f.name == name)
             .ok_or_else(|| Limitation {
+                kind: LimitationKind::FunctionDeclaration,
                 span: Span::default(),
                 reason: format!("missing function `{name}`"),
             })?;
@@ -60,18 +81,39 @@ impl<'a> Adapter<'a> {
 
 fn validate(program: &Program, pointer_bits: u32) -> Result<()> {
     if !matches!(pointer_bits, 32 | 64) {
-        return unsupported(Span::default(), "unsupported target pointer width");
-    }
-    if !program.imports.is_empty() || !program.constants.is_empty() || !program.enums.is_empty() {
-        return unsupported(
+        return limited(
+            LimitationKind::Target,
             Span::default(),
-            "imports, globals, and enums are unsupported",
+            "unsupported target pointer width",
+        );
+    }
+    if !program.imports.is_empty() {
+        // Program currently stores import names, but not their source spans.
+        return limited(
+            LimitationKind::Imports,
+            Span::default(),
+            "imports are unsupported",
+        );
+    }
+    if let Some(constant) = program.constants.first() {
+        return limited(
+            LimitationKind::Constants,
+            constant.span,
+            "globals are unsupported",
+        );
+    }
+    if let Some(enumeration) = program.enums.first() {
+        return limited(
+            LimitationKind::Enums,
+            enumeration.span,
+            "enums are unsupported",
         );
     }
     let mut names = std::collections::HashSet::new();
     for structure in &program.structs {
         if !names.insert(&structure.name) || !structure.generics.is_empty() {
-            return unsupported(
+            return limited(
+                LimitationKind::StructDeclaration,
                 structure.span,
                 "duplicate or generic structs are unsupported",
             );
@@ -79,7 +121,8 @@ fn validate(program: &Program, pointer_bits: u32) -> Result<()> {
         let mut fields = std::collections::HashSet::new();
         for field in &structure.fields {
             if !fields.insert(&field.name) || !scalar(&field.ty) {
-                return unsupported(
+                return limited(
+                    LimitationKind::StructDeclaration,
                     field.span,
                     "only structs with distinct scalar fields are supported",
                 );
@@ -96,19 +139,28 @@ fn validate(program: &Program, pointer_bits: u32) -> Result<()> {
             || function.name.contains('.')
             || !function.from.is_empty()
         {
-            return unsupported(
+            return limited(
+                LimitationKind::FunctionDeclaration,
                 function.span,
                 "generics, methods, destructors, FFI, and borrow contracts are unsupported",
             );
         }
         supported_type(program, &function.ret, function.ret_span)?;
         if matches!(function.ret, Type::Ref(..)) {
-            return unsupported(function.ret_span, "borrowed returns are unsupported");
+            return limited(
+                LimitationKind::FunctionDeclaration,
+                function.ret_span,
+                "borrowed returns are unsupported",
+            );
         }
         for param in &function.params {
             supported_type(program, &param.ty, param.span)?;
             if param.ty == Type::Void {
-                return unsupported(param.span, "void parameters are unsupported");
+                return limited(
+                    LimitationKind::FunctionDeclaration,
+                    param.span,
+                    "void parameters are unsupported",
+                );
             }
         }
     }
@@ -117,6 +169,7 @@ fn validate(program: &Program, pointer_bits: u32) -> Result<()> {
 
 fn lower_function(program: &Program, function: &Function, pointer_bits: u32) -> Result<Body> {
     let body = function.body.as_ref().ok_or_else(|| Limitation {
+        kind: LimitationKind::FunctionDeclaration,
         span: function.span,
         reason: "bodyless functions are unsupported".into(),
     })?;
@@ -160,7 +213,8 @@ fn supported_type(program: &Program, ty: &Type, span: Span) -> Result<()> {
     {
         Ok(())
     } else {
-        unsupported(
+        limited(
+            LimitationKind::Type,
             span,
             "type is outside the scalar, scalar-field struct, and direct-reference subset",
         )
@@ -370,6 +424,7 @@ impl Lower<'_> {
             Ok(())
         } else {
             Err(Limitation {
+                kind: LimitationKind::Type,
                 span,
                 reason: format!("type mismatch: expected {expected}, found {actual}"),
             })
@@ -606,7 +661,8 @@ impl Lower<'_> {
                     self.end(Terminator::Goto(target), span);
                 }
                 _ => {
-                    return unsupported(
+                    return limited(
+                        LimitationKind::Statement,
                         span,
                         "statement outside subset (patterns, foreach, for init/step, unsafe, or yield)",
                     );
@@ -828,7 +884,8 @@ impl Lower<'_> {
                 target
             }
             _ => {
-                return unsupported(
+                return limited(
+                    LimitationKind::Expression,
                     span,
                     "expression outside subset (unsupported operator, projection, aggregate, method, cast, or propagation)",
                 );

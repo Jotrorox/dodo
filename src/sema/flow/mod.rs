@@ -2,12 +2,17 @@
 //! supported subset. Borrow safety, Results, and native destruction remain with
 //! the AST checker/backend. See docs/sema-flow-prototype.md.
 mod lower;
+mod report;
 
 use crate::ast::{Span, Type};
 use std::collections::VecDeque;
 
 pub(super) use lower::Adapter;
-pub use lower::{lower, lower_for_target};
+pub use lower::{Limitation, LimitationKind, lower, lower_for_target};
+pub use report::{
+    BodyReport, BodyStatus, CheckReport, CheckerComparison, CoverageReport, SkipScope,
+    check_with_report, compare_checkers,
+};
 
 /// Stable whole-local identity. Projections live in `Destination`; they do not
 /// have independent initialization or partial-move facts.
