@@ -4,8 +4,47 @@ use dodoc::{parser, sema};
 use flow::{Operation, Terminator};
 use sema::flow;
 
+#[path = "flow_prototype/reporting.rs"]
+mod reporting;
+
 fn compare(source: &str, production_error: Option<&str>, uninitialized: &[&str]) -> flow::Body {
     let program = parser::parse(&format!("package experiment\n{source}")).unwrap();
+    let comparison = flow::compare_checkers(&program, 64);
+    // Both checkers are compared with the specified outcome, never with each
+    // other as an oracle. Each run prepares/instantiates a fresh parse clone.
+    for (name, report) in [("AST", &comparison.ast), ("combined", &comparison.combined)] {
+        match (report.diagnostics.first(), production_error) {
+            (None, None) => (),
+            (Some(error), Some(expected)) => {
+                assert!(error.message.contains(expected), "{name}: {error:?}")
+            }
+            (actual, expected) => {
+                panic!("{name} mismatch: {actual:?}, expected {expected:?}\n{source}")
+            }
+        }
+    }
+    assert!(comparison.ast.coverage.is_none());
+    assert_eq!(comparison.flow.coverage, comparison.combined.coverage);
+    let coverage = comparison
+        .flow
+        .coverage
+        .as_ref()
+        .expect("flow integration reached");
+    let status = &coverage
+        .bodies
+        .iter()
+        .find(|body| body.name == "f")
+        .unwrap()
+        .status;
+    let names: Vec<_> = match status {
+        flow::BodyStatus::Analyzed => vec![],
+        flow::BodyStatus::Diagnostics(issues) => {
+            issues.iter().map(|issue| issue.name.as_str()).collect()
+        }
+        other => panic!("expected analyzed body, got {other:?}\n{source}"),
+    };
+    assert_eq!(names, uninitialized, "prepared flow run: {source}");
+    // Also lock down the normal fail-fast entry point.
     let mut checked = program.clone();
     match (sema::check(&mut checked), production_error) {
         (Ok(()), None) => (),
@@ -14,7 +53,8 @@ fn compare(source: &str, production_error: Option<&str>, uninitialized: &[&str])
             panic!("production mismatch: {actual:?}, expected {expected:?}\n{source}")
         }
     }
-    // Use the original parse, not the partly annotated tree left by a failed check.
+    // Raw lowering remains useful for graph assertions, but is not the
+    // independent checker comparison or the production coverage measurement.
     let body = flow::lower(&program, "f").unwrap_or_else(|error| panic!("{error:?}\n{source}"));
     let result = body.initialization();
     let names: Vec<_> = result

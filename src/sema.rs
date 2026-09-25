@@ -23,19 +23,42 @@ use uses::{binding_use_spans, names_block, names_expr, names_stmt};
 
 type Check<T> = Result<T, Diagnostic>;
 
+// Private body-checker selection, used only by the developer comparison helper.
+// Every compiler entry point below always uses Combined.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckMode {
+    AstOnly,
+    FlowOnly,
+    Combined,
+}
+
 pub fn check(program: &mut Program) -> Check<()> {
     check_for_target(program, 64)
 }
 
 pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
-    check_program(program, pointer_bits, false, &mut Vec::new())
+    check_program(
+        program,
+        pointer_bits,
+        false,
+        &mut Vec::new(),
+        CheckMode::Combined,
+        None,
+    )
 }
 
 /// Check independent bodies after an error without reusing failed borrow state.
 /// Errors in shared declarations/preparation still stop checking that program.
 pub fn check_recovering(program: &mut Program, pointer_bits: u32) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    if let Err(error) = check_program(program, pointer_bits, true, &mut diagnostics) {
+    if let Err(error) = check_program(
+        program,
+        pointer_bits,
+        true,
+        &mut diagnostics,
+        CheckMode::Combined,
+        None,
+    ) {
         diagnostics.push(error);
     }
     diagnostics
@@ -46,6 +69,8 @@ fn check_program(
     pointer_bits: u32,
     recover: bool,
     diagnostics: &mut Vec<Diagnostic>,
+    mode: CheckMode,
+    mut report: Option<&mut Option<flow::CoverageReport>>,
 ) -> Check<()> {
     crate::prepare::prepare(program, pointer_bits)?;
     validate_public_interfaces(program)?;
@@ -80,27 +105,63 @@ fn check_program(
     // First adoption stage: an additional initialization/move check for bodies
     // fully covered by the adapter. Lower before AST checking mutates bodies;
     // unsupported bodies keep the existing checker, and its diagnostics win.
-    // Keep only diagnostics, not every body's graph or fixed-point states.
-    let flow_adapter = flow::Adapter::new(program, pointer_bits).ok();
-    let flow_diagnostics: Vec<_> = program
-        .functions
-        .iter()
-        .map(|function| {
-            if function.body.is_none() || context.functions[&function.name].unavailable {
-                return None;
-            }
-            flow_adapter
-                .as_ref()?
-                .lower_function(function)
-                .ok()
-                .and_then(|body| {
-                    body.initialization()
-                        .issues
-                        .first()
-                        .map(|issue| issue.diagnostic())
-                })
-        })
-        .collect();
+    // Keep only the first diagnostic per body in normal checking. Developer
+    // reports retain findings and limitations, never graphs/fixed-point states.
+    // Measure here, after preparation/instantiation, not on the original parse.
+    let flow_diagnostics: Vec<_> = if mode == CheckMode::AstOnly {
+        (0..program.functions.len()).map(|_| None).collect()
+    } else {
+        use flow::{BodyStatus, SkipScope};
+        let flow_adapter = flow::Adapter::new(program, pointer_bits);
+        if let Some(report) = report.as_deref_mut() {
+            *report = Some(flow::CoverageReport::default());
+        }
+        program
+            .functions
+            .iter()
+            .map(|function| {
+                let status = if function.body.is_none() {
+                    BodyStatus::NoBody
+                } else if context.functions[&function.name].unavailable {
+                    BodyStatus::Unavailable
+                } else {
+                    match &flow_adapter {
+                        Err(limitation) => BodyStatus::Skipped {
+                            scope: SkipScope::Program,
+                            limitation: limitation.clone(),
+                        },
+                        Ok(adapter) => match adapter.lower_function(function) {
+                            Err(limitation) => BodyStatus::Skipped {
+                                scope: SkipScope::Body,
+                                limitation,
+                            },
+                            Ok(body) => {
+                                let issues = body.initialization().issues;
+                                if issues.is_empty() {
+                                    BodyStatus::Analyzed
+                                } else {
+                                    BodyStatus::Diagnostics(issues)
+                                }
+                            }
+                        },
+                    }
+                };
+                let diagnostic = status.diagnostic();
+                if let Some(Some(report)) = report.as_deref_mut() {
+                    report.bodies.push(flow::BodyReport {
+                        name: function.name.clone(),
+                        span: function.span,
+                        status,
+                    });
+                }
+                diagnostic
+            })
+            .collect()
+    };
+    if mode == CheckMode::FlowOnly {
+        diagnostics.extend(flow_diagnostics.into_iter().flatten());
+        return Ok(());
+    }
     for (function, flow_diagnostic) in program.functions.iter_mut().zip(flow_diagnostics) {
         if function.body.is_none() || context.functions[&function.name].unavailable {
             continue;

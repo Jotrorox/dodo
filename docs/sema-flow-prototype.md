@@ -11,10 +11,71 @@ not as a stable public IR API.
 
 Graphs are built before body checking mutates the AST, using the selected 32- or
 64-bit target width. Declaration-subset validation is shared across functions.
-Only the first graph diagnostic per body is retained during
+Only the first graph diagnostic per body is retained during normal
 production checking, so graphs and fixed-point states are released as each body
-is analyzed. `tests/flow_prototype.rs` imports this production implementation and
-also lowers original parses independently, including programs rejected by sema.
+is analyzed. Developer reports retain all initialization/move findings, but still
+release graphs and fixed-point states immediately.
+
+## Coverage reporting and independent comparisons
+
+The hidden developer API `sema::flow::check_with_report(program, pointer_bits)`
+runs combined production recovery checking and collects coverage at the actual
+integration point in `check_program()`: after preparation, generic instantiation,
+contract inference, and global-initializer checking, before AST body checking.
+It does not independently lower the original parse. Each prepared function name
+and span has one of these statuses:
+
+- `Analyzed`: lowering and initialization analysis completed without findings.
+- `Diagnostics`: analysis completed with initialization/move findings, including
+  use/declaration spans and move provenance. These may be suppressed in the
+  user-visible result by AST diagnostic precedence.
+- `Skipped`: a structured `LimitationKind`, span, and readable reason, scoped to
+  either a **program-wide** adapter restriction or **body-local** lowering failure.
+- `NoBody` or `Unavailable`: not eligible for body analysis. Unavailable functions
+  are recorded before normal checking removes them from the program.
+
+Coverage is `None` if shared preparation/declaration checks stop before the
+integration point; this is not successful empty analysis. Unused generic templates
+may disappear before measurement, while instantiated bodies appear under their
+prepared names. Import spans are currently unavailable in `Program`, so import
+limitations use the default span; other declaration restrictions retain their
+source spans. No fallback reasons become normal compiler warnings.
+
+`CoverageReport::skip_counts()` groups skipped bodies by scope and category.
+These are **first-blocker frequencies**, not an exhaustive inventory: validation
+and lowering stop at the first restriction, and a program restriction counts once
+for each eligible body it excludes. Per-body messages provide further detail.
+
+Run the bounded representative corpus (real examples, diagnostic fixtures, and
+loaded bundled imports) with per-body statuses and a ranked fallback summary:
+
+```sh
+cargo test --locked --no-default-features --test flow_prototype representative_corpus_coverage -- --nocapture
+```
+
+`sema::flow::compare_checkers(program, pointer_bits)` is a hidden test/developer
+helper that always runs three configurations on fresh clones:
+
+| Configuration | Purpose |
+| --- | --- |
+| AST only | Existing body checker without adapter construction or flow findings |
+| Flow only | Initialization/move findings and explicit subset skips, without AST body checking |
+| Combined | Production recovery checking, including AST diagnostic precedence |
+
+All configurations share preparation and declaration checks. A flow-only empty
+diagnostic list is **not acceptance**: inspect coverage, and remember that flow
+does not check borrowing or full type safety. AST-only coverage is intentionally
+`None`. The configuration selector is private; there is no compiler flag to
+disable safety checks, and the comparison helper returns reports, not unchecked
+programs for compilation.
+
+`tests/flow_prototype.rs` checks these configurations against independently
+specified expected acceptance/rejection and initialization findings; the AST
+checker is not the oracle. It additionally checks normal fail-fast behavior and
+lowers original parses for graph-shape assertions. `tests/flow_prototype/reporting.rs`
+locks down prepared/instantiated coverage, whole-program restrictions, complete
+graph discard on late lowering failure, continued AST checking, and diagnostic
+precedence without duplicates.
 
 ## Representation and analysis
 
