@@ -306,10 +306,10 @@ fn unsupported_and_ill_typed_inputs_never_produce_analysis_success() {
         ("fn f() { unsafe {} }", "statement outside subset"),
         ("fn f<T>(x: T) {}", "generics"),
         (
-            "struct S { u8 n\nfn drop(&mut self) {} }\nfn f() {}",
+            "struct S { u8 n\nfn drop(&mut self) {} }\nfn f(s: S) {}",
             "destructors",
         ),
-        ("struct S { &u8 n }\nfn f() {}", "scalar fields"),
+        ("struct S { &u8 n }\nfn f(s: S) {}", "scalar fields"),
         ("fn f(x: &u8) -> &u8 { return x }", "borrowed returns"),
         (
             "fn f() { x := 1u8\n_ = x as u32 }",

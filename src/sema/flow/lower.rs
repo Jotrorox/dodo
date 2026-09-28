@@ -48,14 +48,20 @@ pub fn lower_for_target(program: &Program, name: &str, pointer_bits: u32) -> Res
     Adapter::new(program, pointer_bits)?.lower(name)
 }
 
-/// Validate the declaration subset once when checking a complete program.
+/// Share program context; declaration restrictions apply only to bodies that use them.
 pub(crate) struct Adapter<'a> {
     program: &'a Program,
     pointer_bits: u32,
 }
 impl<'a> Adapter<'a> {
     pub(crate) fn new(program: &'a Program, pointer_bits: u32) -> Result<Self> {
-        validate(program, pointer_bits)?;
+        if !matches!(pointer_bits, 32 | 64) {
+            return limited(
+                LimitationKind::Target,
+                Span::default(),
+                "unsupported target pointer width",
+            );
+        }
         Ok(Self {
             program,
             pointer_bits,
@@ -79,95 +85,99 @@ impl<'a> Adapter<'a> {
     }
 }
 
-fn validate(program: &Program, pointer_bits: u32) -> Result<()> {
-    if !matches!(pointer_bits, 32 | 64) {
+// Ambiguous declarations are a local limitation too: unrelated duplicates do
+// not prevent lowering, but a referenced name must have exactly one meaning.
+fn unique_declaration(program: &Program, name: &str) -> bool {
+    program.structs.iter().filter(|s| s.name == name).count()
+        + program.functions.iter().filter(|f| f.name == name).count()
+        + program.enums.iter().filter(|e| e.name == name).count()
+        + program.constants.iter().filter(|c| c.name == name).count()
+        == 1
+}
+
+fn validate_struct(program: &Program, structure: &ast::Struct) -> Result<()> {
+    if !unique_declaration(program, &structure.name) || !structure.generics.is_empty() {
         return limited(
-            LimitationKind::Target,
-            Span::default(),
-            "unsupported target pointer width",
+            LimitationKind::StructDeclaration,
+            structure.span,
+            "duplicate or generic structs are unsupported",
         );
     }
-    if !program.imports.is_empty() {
-        // Program currently stores import names, but not their source spans.
-        return limited(
-            LimitationKind::Imports,
-            Span::default(),
-            "imports are unsupported",
-        );
-    }
-    if let Some(constant) = program.constants.first() {
-        return limited(
-            LimitationKind::Constants,
-            constant.span,
-            "globals are unsupported",
-        );
-    }
-    if let Some(enumeration) = program.enums.first() {
-        return limited(
-            LimitationKind::Enums,
-            enumeration.span,
-            "enums are unsupported",
-        );
-    }
-    let mut names = std::collections::HashSet::new();
-    for structure in &program.structs {
-        if !names.insert(&structure.name) || !structure.generics.is_empty() {
+    let mut fields = std::collections::HashSet::new();
+    for field in &structure.fields {
+        if !fields.insert(&field.name) || !scalar(&field.ty) {
             return limited(
                 LimitationKind::StructDeclaration,
-                structure.span,
-                "duplicate or generic structs are unsupported",
+                field.span,
+                "only structs with distinct scalar fields are supported",
             );
-        }
-        let mut fields = std::collections::HashSet::new();
-        for field in &structure.fields {
-            if !fields.insert(&field.name) || !scalar(&field.ty) {
-                return limited(
-                    LimitationKind::StructDeclaration,
-                    field.span,
-                    "only structs with distinct scalar fields are supported",
-                );
-            }
         }
     }
-    for function in &program.functions {
-        if !names.insert(&function.name)
-            || !function.generics.is_empty()
-            || function.generic_instance
-            || function.unsafe_
-            || function.extern_
-            || function.imported
-            || function.name.contains('.')
-            || !function.from.is_empty()
-        {
+    // Previously the program-wide method restriction also excluded these
+    // types. Keep that boundary for every use, including implicit cleanup.
+    let destructor = format!("{}.drop", structure.name);
+    if let Some(function) = program.functions.iter().find(|f| f.name == destructor) {
+        return limited(
+            LimitationKind::StructDeclaration,
+            function.span,
+            "structs with custom destructors are unsupported",
+        );
+    }
+    Ok(())
+}
+
+// Check signatures at the body entry and at direct calls, without requiring
+// the callee's body to lower (or recursively inspecting the call graph).
+fn validate_function(program: &Program, function: &Function) -> Result<()> {
+    // Package loading qualifies imported names as package.function (or
+    // package.Struct.method). The package prefix is not a method boundary.
+    let local_name = if function.imported {
+        function
+            .name
+            .split_once('.')
+            .map_or(function.name.as_str(), |(_, name)| name)
+    } else {
+        &function.name
+    };
+    if !unique_declaration(program, &function.name)
+        || !function.generics.is_empty()
+        || function.generic_instance
+        || function.unsafe_
+        || function.extern_
+        || local_name.contains('.')
+        || !function.from.is_empty()
+        || !function.stores.is_empty()
+        || !function.requires_plain.is_empty()
+    {
+        return limited(
+            LimitationKind::FunctionDeclaration,
+            function.span,
+            "duplicate functions, generics, methods, destructors, FFI, and borrow contracts are unsupported",
+        );
+    }
+    supported_type(program, &function.ret, function.ret_span)?;
+    if matches!(function.ret, Type::Ref(..)) {
+        return limited(
+            LimitationKind::FunctionDeclaration,
+            function.ret_span,
+            "borrowed returns are unsupported",
+        );
+    }
+    for param in &function.params {
+        supported_type(program, &param.ty, param.span)?;
+        if param.ty == Type::Void {
             return limited(
                 LimitationKind::FunctionDeclaration,
-                function.span,
-                "generics, methods, destructors, FFI, and borrow contracts are unsupported",
+                param.span,
+                "void parameters are unsupported",
             );
-        }
-        supported_type(program, &function.ret, function.ret_span)?;
-        if matches!(function.ret, Type::Ref(..)) {
-            return limited(
-                LimitationKind::FunctionDeclaration,
-                function.ret_span,
-                "borrowed returns are unsupported",
-            );
-        }
-        for param in &function.params {
-            supported_type(program, &param.ty, param.span)?;
-            if param.ty == Type::Void {
-                return limited(
-                    LimitationKind::FunctionDeclaration,
-                    param.span,
-                    "void parameters are unsupported",
-                );
-            }
         }
     }
     Ok(())
 }
 
 fn lower_function(program: &Program, function: &Function, pointer_bits: u32) -> Result<Body> {
+    validate_function(program, function)?;
     let body = function.body.as_ref().ok_or_else(|| Limitation {
         kind: LimitationKind::FunctionDeclaration,
         span: function.span,
@@ -204,21 +214,24 @@ fn scalar(ty: &Type) -> bool {
     matches!(ty, Type::Bool | Type::Int { .. })
 }
 fn supported_type(program: &Program, ty: &Type, span: Span) -> Result<()> {
-    let owned =
-        |ty: &Type| matches!(ty, Type::Named(n) if program.structs.iter().any(|s| &s.name == n));
-    if *ty == Type::Void
-        || scalar(ty)
-        || owned(ty)
-        || matches!(ty, Type::Ref(_, inner) if scalar(inner) || owned(inner))
-    {
-        Ok(())
-    } else {
-        limited(
-            LimitationKind::Type,
-            span,
-            "type is outside the scalar, scalar-field struct, and direct-reference subset",
-        )
+    let value = match ty {
+        Type::Void => return Ok(()),
+        Type::Ref(_, inner) => inner.as_ref(),
+        _ => ty,
+    };
+    if scalar(value) {
+        return Ok(());
     }
+    if let Type::Named(name) = value
+        && let Some(structure) = program.structs.iter().find(|s| &s.name == name)
+    {
+        return validate_struct(program, structure);
+    }
+    limited(
+        LimitationKind::Type,
+        span,
+        "type is outside the scalar, scalar-field struct, and direct-reference subset",
+    )
 }
 
 #[derive(Default)]
@@ -817,6 +830,7 @@ impl Lower<'_> {
                 let Some(structure) = self.program.structs.iter().find(|s| &s.name == name) else {
                     return unsupported(span, "unknown struct");
                 };
+                validate_struct(self.program, structure)?;
                 let mut seen = std::collections::HashSet::new();
                 for (name, value) in fields {
                     let Some(field) = structure.fields.iter().find(|f| &f.name == name) else {
@@ -856,6 +870,7 @@ impl Lower<'_> {
                 let Some(function) = self.program.functions.iter().find(|f| &f.name == name) else {
                     return unsupported(span, "unresolved or intrinsic call is unsupported");
                 };
+                validate_function(self.program, function)?;
                 if args.len() != function.params.len() {
                     return unsupported(span, "call arity mismatch");
                 }

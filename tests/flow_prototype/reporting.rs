@@ -53,54 +53,180 @@ fn coverage_distinguishes_success_findings_and_body_fallback() {
 }
 
 #[test]
-fn declaration_restrictions_exclude_even_simple_bodies_without_warnings() {
-    for (declaration, kind) in [
-        ("import \"core/mem\"", LimitationKind::Imports),
-        ("const u8 N = 1", LimitationKind::Constants),
-        ("enum E { A }", LimitationKind::Enums),
-        ("struct S { &u8 value }", LimitationKind::StructDeclaration),
-        (
-            "fn borrowed(x: &u8) -> &u8 { return x }",
-            LimitationKind::FunctionDeclaration,
-        ),
+fn unrelated_declarations_do_not_exclude_supported_bodies() {
+    for declaration in [
+        "import \"core/mem\"",
+        "const u8 N = 1",
+        "enum E { A }",
+        "struct S { &u8 value }",
+        "struct S { u8 n\nfn drop(&mut self) {} }",
+        "fn borrowed(x: &u8) -> &u8 { return x }",
+        "unsafe fn dangerous() {}",
+        "extern \"C\" fn external()",
     ] {
-        let source = format!("package experiment\n{declaration}\nfn f() {{}}\nfn g() {{}}");
+        let source =
+            format!("package experiment\n{declaration}\nfn f() {{}}\nfn g() {{ u8 x\n_ = x }}");
         let program = parser::parse(&source).unwrap();
-        let report = flow::check_with_report(&mut program.clone(), 64);
-        assert!(report.diagnostics.is_empty(), "{report:?}");
-        assert!(sema::check(&mut program.clone()).is_ok());
-        for name in ["f", "g"] {
-            let BodyStatus::Skipped { scope, limitation } = status(&report, name) else {
-                panic!("{report:?}")
-            };
-            assert_eq!(*scope, SkipScope::Program);
-            assert_eq!(limitation.kind, kind);
-            assert!(!limitation.reason.is_empty());
-            if kind != LimitationKind::Imports {
-                assert!(limitation.span.end > limitation.span.start);
-                assert!(declaration.contains(&source[limitation.span.start..limitation.span.end]));
-            }
-        }
-        let counts = report.coverage.as_ref().unwrap().skip_counts();
-        assert_eq!(counts.len(), 1);
-        assert!(counts[&(SkipScope::Program, kind)] >= 2);
+        assert!(flow::lower(&program, "f").is_ok(), "{declaration}");
+        let comparison = flow::compare_checkers(&program, 64);
+        assert_eq!(status(&comparison.flow, "f"), &BodyStatus::Analyzed);
+        assert!(matches!(
+            status(&comparison.flow, "g"),
+            BodyStatus::Diagnostics(_)
+        ));
+        assert_eq!(comparison.flow.diagnostics.len(), 1);
+        assert_eq!(messages(&comparison.combined), messages(&comparison.ast));
+        assert_eq!(comparison.combined.diagnostics.len(), 1);
+        assert!(
+            comparison.combined.diagnostics[0]
+                .message
+                .contains("uninitialized")
+        );
+        let coverage = comparison.flow.coverage.as_ref().unwrap();
+        assert!(
+            coverage
+                .skip_counts()
+                .keys()
+                .all(|(scope, _)| *scope == SkipScope::Body)
+        );
     }
 }
 
 #[test]
+fn referenced_declarations_fall_back_only_for_the_dependent_body() {
+    for (declaration, body, kind) in [
+        (
+            "const u8 N = 1",
+            "_ = N",
+            LimitationKind::UnsupportedConstruct,
+        ),
+        ("enum E { A }", "E value", LimitationKind::Type),
+        (
+            "struct S { &u8 value }",
+            "S value",
+            LimitationKind::StructDeclaration,
+        ),
+        (
+            "struct S { u8 n\nfn drop(&mut self) {} }",
+            "_ = S{n: 1}",
+            LimitationKind::StructDeclaration,
+        ),
+        (
+            "fn borrowed(x: &u8) -> &u8 { return x }",
+            "x := 1u8\n_ = borrowed(&x)",
+            LimitationKind::FunctionDeclaration,
+        ),
+        (
+            "extern \"C\" fn external()",
+            "external()",
+            LimitationKind::FunctionDeclaration,
+        ),
+    ] {
+        let program = parse(&format!("{declaration}\nfn f() {{ {body} }}\nfn g() {{}}"));
+        let comparison = flow::compare_checkers(&program, 64);
+        let BodyStatus::Skipped { scope, limitation } = status(&comparison.flow, "f") else {
+            panic!("{comparison:?}");
+        };
+        assert_eq!(*scope, SkipScope::Body);
+        assert_eq!(limitation.kind, kind);
+        assert!(!limitation.reason.is_empty());
+        assert!(limitation.span.end > limitation.span.start);
+        assert_eq!(status(&comparison.flow, "g"), &BodyStatus::Analyzed);
+        assert_eq!(messages(&comparison.combined), messages(&comparison.ast));
+    }
+}
+
+#[test]
+fn supported_callee_signatures_do_not_require_supported_bodies() {
+    let program = parse(
+        "fn callee(x: u8) -> u8 { _ = [1]u8{1}\nreturn x }\nfn f() -> u8 { return callee(1) }",
+    );
+    let comparison = flow::compare_checkers(&program, 64);
+    assert!(comparison.combined.diagnostics.is_empty(), "{comparison:?}");
+    assert!(matches!(
+        status(&comparison.flow, "callee"),
+        BodyStatus::Skipped {
+            scope: SkipScope::Body,
+            ..
+        }
+    ));
+    assert_eq!(status(&comparison.flow, "f"), &BodyStatus::Analyzed);
+}
+
+#[test]
+fn raw_lowering_validates_every_referenced_struct_and_callee() {
+    for declaration in [
+        "struct S { &u8 n }",
+        "struct S<T> { u8 n }",
+        "struct S { u8 n\nu8 n }",
+        "struct S { u8 n }\nstruct S { u8 n }",
+        "struct S { u8 n\nfn drop(&mut self) {} }",
+    ] {
+        for function in [
+            "fn f(s: S) {}",
+            "fn f(s: &S) {}",
+            "fn f() -> S { return S{n: 1} }",
+            "fn f() { S s }",
+            "fn f() { _ = S{n: 1} }",
+            "fn make() -> S { return S{n: 1} }\nfn f() { _ = make() }",
+        ] {
+            let program = parse(&format!("{declaration}\n{function}\nfn independent() {{}}"));
+            assert_eq!(
+                flow::lower(&program, "f").unwrap_err().kind,
+                LimitationKind::StructDeclaration
+            );
+            assert!(flow::lower(&program, "independent").is_ok());
+        }
+    }
+    for declaration in [
+        "unsafe fn callee() {}",
+        "extern \"C\" fn callee()",
+        "fn callee<T>() {}",
+        "fn callee() -> &u8 { u8 x\nreturn &x }",
+        "fn callee(x: &[u8]) {}",
+        "fn callee() {}\nfn callee() {}",
+        "struct callee {}\nfn callee() {}",
+    ] {
+        let program = parse(&format!(
+            "{declaration}\nfn f() {{ callee() }}\nfn independent() {{}}"
+        ));
+        let limitation = flow::lower(&program, "f").unwrap_err();
+        assert!(matches!(
+            limitation.kind,
+            LimitationKind::FunctionDeclaration | LimitationKind::Type
+        ));
+        assert!(flow::lower(&program, "independent").is_ok());
+    }
+}
+
+#[test]
+fn recursive_calls_need_only_supported_signatures() {
+    let program = parse("fn f(b: bool) { if b { g(b) } }\nfn g(b: bool) { f(b) }");
+    assert!(flow::lower(&program, "f").is_ok());
+    assert!(flow::lower(&program, "g").is_ok());
+    assert_eq!(
+        flow::lower_for_target(&program, "f", 16).unwrap_err().kind,
+        LimitationKind::Target
+    );
+}
+
+#[test]
 fn coverage_measures_preparation_and_instantiation_not_the_raw_parse() {
-    // The unused generic template is removed, and the implicit return is
-    // prepared before the production adapter is constructed.
+    // The unused generic template no longer blocks raw lowering of f, and is
+    // removed before production coverage is collected.
     let program = parse("fn unused<T>(x: T) -> T { x }\nfn f() -> u8 { 1 }");
-    assert!(flow::lower(&program, "f").is_err());
+    assert!(flow::lower(&program, "f").is_ok());
+    assert!(flow::lower(&program, "unused").is_err());
     let report = flow::check_with_report(&mut program.clone(), 64);
     assert!(report.diagnostics.is_empty(), "{report:?}");
     assert_eq!(status(&report, "f"), &BodyStatus::Analyzed);
     assert_eq!(report.coverage.as_ref().unwrap().bodies.len(), 1);
 
-    // Instantiation adds a specialized body; its signature currently blocks
-    // the adapter for the whole program, including f's simple scalar body.
-    let mut program = parse("fn identity<T>(x: T) -> T { x }\nfn f() -> u8 { identity(1u8) }");
+    // Instantiation adds a specialized body. It and its caller fall back,
+    // while an independent body still lowers.
+    let mut program = parse(
+        "fn identity<T>(x: T) -> T { x }\nfn f() -> u8 { identity(1u8) }\nfn independent() {}",
+    );
     let report = flow::check_with_report(&mut program, 64);
     assert!(report.diagnostics.is_empty(), "{report:?}");
     let instance = program
@@ -109,18 +235,23 @@ fn coverage_measures_preparation_and_instantiation_not_the_raw_parse() {
         .find(|f| f.generic_instance)
         .unwrap();
     let coverage = report.coverage.as_ref().unwrap();
-    assert_eq!(coverage.bodies.len(), 2);
+    assert_eq!(coverage.bodies.len(), 3);
+    assert_eq!(status(&report, "independent"), &BodyStatus::Analyzed);
     assert!(
         coverage
             .bodies
             .iter()
             .any(|body| body.name == instance.name)
     );
-    for body in &coverage.bodies {
+    for body in coverage
+        .bodies
+        .iter()
+        .filter(|body| body.name != "independent")
+    {
         let BodyStatus::Skipped { scope, limitation } = &body.status else {
             panic!("{body:?}")
         };
-        assert_eq!(*scope, SkipScope::Program);
+        assert_eq!(*scope, SkipScope::Body);
         assert_eq!(limitation.kind, LimitationKind::FunctionDeclaration);
         assert_eq!(limitation.span, instance.span);
     }
@@ -157,14 +288,15 @@ fn failed_lowering_discards_all_partial_findings_and_does_not_poison_other_bodie
             .contains("uninitialized")
     );
 
-    // A program-wide fallback must also leave AST checking active.
-    let program = parse("enum E { A }\nfn f() { u8 x\n_ = x }");
+    // A referenced unsupported declaration also leaves AST checking active,
+    // and discards initialization findings from the already lowered prefix.
+    let program = parse("enum E { A }\nfn f() { u8 x\n_ = x\nE value }");
     let comparison = flow::compare_checkers(&program, 64);
     assert!(comparison.flow.diagnostics.is_empty());
     assert!(matches!(
         status(&comparison.flow, "f"),
         BodyStatus::Skipped {
-            scope: SkipScope::Program,
+            scope: SkipScope::Body,
             ..
         }
     ));
@@ -295,7 +427,41 @@ fn representative_corpus_coverage() {
                 report.diagnostics
             ),
         }
+        if fixture == "examples/hello.dodo" {
+            // These loaded dependency bodies include qualified direct calls.
+            // Import provenance and package qualification are not limitations.
+            for name in [
+                "ascii.is_ascii",
+                "ascii.is_alphabetic",
+                "ascii.to_uppercase",
+            ] {
+                assert_eq!(status(&report, name), &BodyStatus::Analyzed);
+            }
+            assert!(matches!(
+                status(&report, "console.Input.read"),
+                BodyStatus::Skipped {
+                    scope: SkipScope::Body,
+                    limitation: flow::Limitation {
+                        kind: LimitationKind::FunctionDeclaration,
+                        ..
+                    },
+                }
+            ));
+            assert!(
+                loaded
+                    .program
+                    .functions
+                    .iter()
+                    .any(|f| f.name == "ascii.is_ascii" && f.imported)
+            );
+        }
         let coverage = report.coverage.expect(fixture);
+        assert!(
+            coverage
+                .skip_counts()
+                .keys()
+                .all(|(scope, _)| *scope == SkipScope::Body)
+        );
         for body in &coverage.bodies {
             println!(
                 "{fixture}: {} @ {:?}: {:?}",

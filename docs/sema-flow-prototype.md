@@ -10,7 +10,10 @@ body with the existing checker. The module is exposed for differential testing,
 not as a stable public IR API.
 
 Graphs are built before body checking mutates the AST, using the selected 32- or
-64-bit target width. Declaration-subset validation is shared across functions.
+64-bit target width. Each body validates its own signature and the declarations
+it uses: direct callee signatures and referenced struct definitions. Callee bodies
+are analyzed independently, so unsupported syntax in one does not exclude its
+callers. Unrelated declarations and imports do not block supported bodies.
 Only the first graph diagnostic per body is retained during normal
 production checking, so graphs and fixed-point states are released as each body
 is analyzed. Developer reports retain all initialization/move findings, but still
@@ -30,16 +33,16 @@ and span has one of these statuses:
   use/declaration spans and move provenance. These may be suppressed in the
   user-visible result by AST diagnostic precedence.
 - `Skipped`: a structured `LimitationKind`, span, and readable reason, scoped to
-  either a **program-wide** adapter restriction or **body-local** lowering failure.
+  either a **program-wide** target restriction or **body-local** lowering failure
+  (including restrictions on declarations used by that body).
 - `NoBody` or `Unavailable`: not eligible for body analysis. Unavailable functions
   are recorded before normal checking removes them from the program.
 
 Coverage is `None` if shared preparation/declaration checks stop before the
 integration point; this is not successful empty analysis. Unused generic templates
 may disappear before measurement, while instantiated bodies appear under their
-prepared names. Import spans are currently unavailable in `Program`, so import
-limitations use the default span; other declaration restrictions retain their
-source spans. No fallback reasons become normal compiler warnings.
+prepared names. Referenced declaration restrictions retain the offending
+declaration's source span. No fallback reasons become normal compiler warnings.
 
 `CoverageReport::skip_counts()` groups skipped bodies by scope and category.
 These are **first-blocker frequencies**, not an exhaustive inventory: validation
@@ -73,9 +76,9 @@ programs for compilation.
 specified expected acceptance/rejection and initialization findings; the AST
 checker is not the oracle. It additionally checks normal fail-fast behavior and
 lowers original parses for graph-shape assertions. `tests/flow_prototype/reporting.rs`
-locks down prepared/instantiated coverage, whole-program restrictions, complete
-graph discard on late lowering failure, continued AST checking, and diagnostic
-precedence without duplicates.
+locks down prepared/instantiated coverage, declaration-local fallback, imported
+free functions, complete graph discard on late lowering failure, continued AST
+checking, and diagnostic precedence without duplicates.
 
 ## Representation and analysis
 
@@ -120,9 +123,15 @@ assignments, plain value blocks with a final value, blocks, `if`, basic `for`,
 return, break, and continue. Reference arguments requiring implicit mutable
 reborrowing are still excluded. Projected moves are rejected explicitly.
 
-Program declarations currently exclude imports, globals, enums, generics,
-methods/custom destructors, FFI, borrowed returns, and borrow contracts. Arrays,
-slices, indexing, casts, propagation, patterns, for-init/step, unsafe blocks,
+Imports and unrelated globals, enums, structs, and functions do not restrict
+analysis. Imported free functions and their qualified direct calls use the same
+subset checks as local functions. Globals and enums remain unsupported when used
+by a body. Generic functions, methods, FFI, borrowed returns, and borrow contracts
+still require fallback for the affected function and its callers. Referenced
+structs must have distinct scalar fields, no generic parameters, and no custom
+destructor; this applies to signatures, locals, literals, and callee signatures.
+Ambiguous referenced names also require fallback. Arrays, slices, indexing,
+casts, propagation, patterns, for-init/step, unsafe blocks,
 diverging value blocks, and nested yield exits are outside the body subset.
 Lowering is not a complete type checker or proof of safety. Tests keep examples
 where initialization succeeds but borrowing correctly fails in production.
