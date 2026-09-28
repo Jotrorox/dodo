@@ -28,7 +28,7 @@ fn messages(report: &flow::CheckReport) -> Vec<&str> {
 #[test]
 fn coverage_distinguishes_success_findings_and_body_fallback() {
     let source =
-        "package experiment\nfn clean() {}\nfn bad() { u8 x\n_ = x }\nfn array() { _ = [1]u8{1} }";
+        "package experiment\nfn clean() {}\nfn bad() { u8 x\n_ = x }\nfn cast() { _ = 1u8 as u32 }";
     let mut program = parser::parse(source).unwrap();
     let report = flow::check_with_report(&mut program, 64);
     assert_eq!(status(&report, "clean"), &BodyStatus::Analyzed);
@@ -38,7 +38,7 @@ fn coverage_distinguishes_success_findings_and_body_fallback() {
     assert_eq!(issues.len(), 1);
     assert_eq!(&source[issues[0].span.start..issues[0].span.end], "x");
     assert!(source[issues[0].declaration.start..issues[0].declaration.end].contains("u8 x"));
-    let BodyStatus::Skipped { scope, limitation } = status(&report, "array") else {
+    let BodyStatus::Skipped { scope, limitation } = status(&report, "cast") else {
         panic!("{report:?}")
     };
     assert_eq!(*scope, SkipScope::Body);
@@ -46,7 +46,7 @@ fn coverage_distinguishes_success_findings_and_body_fallback() {
     assert!(limitation.reason.contains("expression outside subset"));
     assert_eq!(
         &source[limitation.span.start..limitation.span.end],
-        "[1]u8{1}"
+        "1u8 as u32"
     );
     assert_eq!(report.diagnostics.len(), 1);
     assert!(report.diagnostics[0].message.contains("uninitialized"));
@@ -139,7 +139,7 @@ fn referenced_declarations_fall_back_only_for_the_dependent_body() {
 #[test]
 fn supported_callee_signatures_do_not_require_supported_bodies() {
     let program = parse(
-        "fn callee(x: u8) -> u8 { _ = [1]u8{1}\nreturn x }\nfn f() -> u8 { return callee(1) }",
+        "fn callee(x: u8) -> u8 { _ = 1u8 as u32\nreturn x }\nfn f() -> u8 { return callee(1) }",
     );
     let comparison = flow::compare_checkers(&program, 64);
     assert!(comparison.combined.diagnostics.is_empty(), "{comparison:?}");
@@ -183,7 +183,7 @@ fn raw_lowering_validates_every_referenced_struct_and_callee() {
         "extern \"C\" fn callee()",
         "fn callee<T>() {}",
         "fn callee() -> &u8 { u8 x\nreturn &x }",
-        "fn callee(x: &[u8]) {}",
+        "fn callee(x: &[&u8]) {}",
         "fn callee() {}\nfn callee() {}",
         "struct callee {}\nfn callee() {}",
     ] {
@@ -259,9 +259,9 @@ fn coverage_measures_preparation_and_instantiation_not_the_raw_parse() {
 
 #[test]
 fn failed_lowering_discards_all_partial_findings_and_does_not_poison_other_bodies() {
-    // A prefix graph would diagnose x. A late unsupported array must discard
+    // A prefix graph would diagnose x. A late unsupported cast must discard
     // that graph, not analyze it or let it contaminate the next function.
-    let program = parse("fn f() { u8 x\n_ = x\n_ = [1]u8{1} }\nfn g() {}");
+    let program = parse("fn f() { u8 x\n_ = x\n_ = 1u8 as u32 }\nfn g() {}");
     assert!(flow::lower(&program, "f").is_err());
     let comparison = flow::compare_checkers(&program, 64);
     assert!(comparison.flow.diagnostics.is_empty());
@@ -434,8 +434,23 @@ fn representative_corpus_coverage() {
                 "ascii.is_ascii",
                 "ascii.is_alphabetic",
                 "ascii.to_uppercase",
+                "bytes.starts_with",
+                "bytes.ends_with",
             ] {
                 assert_eq!(status(&report, name), &BodyStatus::Analyzed);
+            }
+            // Arrays/slices no longer hide the next concrete body blocker.
+            for name in [
+                "bytes.equal",
+                "bytes.compare",
+                "bytes.fill",
+                "bytes.reverse",
+            ] {
+                let BodyStatus::Skipped { limitation, .. } = status(&report, name) else {
+                    panic!("expected range iteration fallback for {name}");
+                };
+                assert_eq!(limitation.kind, LimitationKind::Statement);
+                assert!(limitation.reason.contains("range foreach iteration"));
             }
             assert!(matches!(
                 status(&report, "console.Input.read"),

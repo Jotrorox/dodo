@@ -47,12 +47,17 @@ pub struct Destination {
 pub enum Projection {
     Field(String),
     Deref,
+    Index(Place),
 }
 #[derive(Clone, Debug)]
 pub enum Operation {
     Assign {
         target: Place,
         value: Operand,
+    },
+    Aggregate {
+        target: Place,
+        elements: Vec<Operand>,
     },
     Borrow {
         target: Place,
@@ -282,6 +287,12 @@ impl Body {
                     operand(value, state, span, issue);
                     state[target.0] = Availability::initialized();
                 }
+                Operation::Aggregate { target, elements } => {
+                    for element in elements {
+                        operand(element, state, span, issue);
+                    }
+                    state[target.0] = Availability::initialized();
+                }
                 Operation::Borrow {
                     target,
                     source,
@@ -314,6 +325,11 @@ impl Body {
                         Type::Ref(true, Box::new(destination.ty.clone()))
                     );
                     read(destination.root, state, span, issue);
+                    for projection in &destination.projections {
+                        if let Projection::Index(index) = projection {
+                            read(*index, state, span, issue);
+                        }
+                    }
                     state[target.0] = Availability::initialized();
                 }
                 Operation::Load { target, address } => {

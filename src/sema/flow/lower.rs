@@ -156,7 +156,7 @@ fn validate_function(program: &Program, function: &Function) -> Result<()> {
         );
     }
     supported_type(program, &function.ret, function.ret_span)?;
-    if matches!(function.ret, Type::Ref(..)) {
+    if matches!(function.ret, Type::Ref(..) | Type::Slice(..)) {
         return limited(
             LimitationKind::FunctionDeclaration,
             function.ret_span,
@@ -214,15 +214,23 @@ fn scalar(ty: &Type) -> bool {
     matches!(ty, Type::Bool | Type::Int { .. })
 }
 fn supported_type(program: &Program, ty: &Type, span: Span) -> Result<()> {
-    let value = match ty {
-        Type::Void => return Ok(()),
-        Type::Ref(_, inner) => inner.as_ref(),
-        _ => ty,
-    };
-    if scalar(value) {
+    match ty {
+        Type::Void => Ok(()),
+        Type::Ref(_, inner) | Type::Slice(_, inner) => plain_type(program, inner, span),
+        _ => plain_type(program, ty, span),
+    }
+}
+
+// Owned aggregates deliberately exclude references and custom destructors.
+// Their whole-slot moves are modeled; partial moves and native drops are not.
+fn plain_type(program: &Program, ty: &Type, span: Span) -> Result<()> {
+    if scalar(ty) {
         return Ok(());
     }
-    if let Type::Named(name) = value
+    if let Type::Array(_, element) = ty {
+        return plain_type(program, element, span);
+    }
+    if let Type::Named(name) = ty
         && let Some(structure) = program.structs.iter().find(|s| &s.name == name)
     {
         return validate_struct(program, structure);
@@ -230,7 +238,7 @@ fn supported_type(program: &Program, ty: &Type, span: Span) -> Result<()> {
     limited(
         LimitationKind::Type,
         span,
-        "type is outside the scalar, scalar-field struct, and direct-reference subset",
+        "type is outside the scalar, scalar-field struct, plain array, and direct-reference/slice subset",
     )
 }
 
@@ -334,45 +342,54 @@ impl Lower<'_> {
 
     // Projection roots are stable local identities; their address is captured
     // once, before any RHS evaluation. Aliasing/reservations remain in sema.
-    fn destination(&self, expression: &Expr, write: bool) -> Result<Destination> {
+    fn destination(&mut self, expression: &Expr, write: bool) -> Result<Destination> {
+        let (destination, mutable) = self.destination_access(expression)?;
+        if write && !mutable {
+            return unsupported(
+                expression.span,
+                "write through shared reference or immutable binding",
+            );
+        }
+        Ok(destination)
+    }
+
+    // Resolve access once: recursively rechecking mutability would evaluate
+    // index expressions twice. References grant access independently of the
+    // mutability of the local holding them.
+    fn destination_access(&mut self, expression: &Expr) -> Result<(Destination, bool)> {
         match &expression.kind {
             ExprKind::Name(_) => {
-                let root = self.place(expression, write)?;
-                Ok(Destination {
-                    root,
-                    projections: vec![],
-                    ty: self.body.locals[root.0].ty.clone(),
-                })
+                let root = self.place(expression, false)?;
+                let mutable = self.place(expression, true).is_ok();
+                Ok((
+                    Destination {
+                        root,
+                        projections: vec![],
+                        ty: self.body.locals[root.0].ty.clone(),
+                    },
+                    mutable,
+                ))
             }
             ExprKind::Unary(UnaryOp::Deref, base) => {
-                let mut destination = self.destination(base, false)?;
+                let (mut destination, _) = self.destination_access(base)?;
                 let Type::Ref(mutable, inner) = destination.ty else {
                     return unsupported(
                         expression.span,
                         "dereference requires a checked reference",
                     );
                 };
-                if write && !mutable {
-                    return unsupported(expression.span, "write through shared reference");
-                }
                 destination.ty = *inner;
                 destination.projections.push(Projection::Deref);
-                Ok(destination)
+                Ok((destination, mutable))
             }
             ExprKind::Field(base, name) => {
-                let mut destination = self.destination(base, false)?;
-                if matches!(destination.ty, Type::Ref(..)) {
-                    let Type::Ref(mutable, inner) = destination.ty else {
-                        unreachable!()
-                    };
-                    if write && !mutable {
-                        return unsupported(expression.span, "write through shared reference");
-                    }
-                    destination.ty = *inner;
-                    destination.projections.push(Projection::Deref);
-                } else if write {
-                    // Enforce binding mutability when no reference grants access.
-                    self.destination(base, true)?;
+                let (mut destination, mutable) = self.autoderef_destination(base)?;
+                if name == "len" && matches!(destination.ty, Type::Array(..) | Type::Slice(..)) {
+                    destination.ty = Type::usize();
+                    destination
+                        .projections
+                        .push(Projection::Field(name.clone()));
+                    return Ok((destination, false));
                 }
                 let Type::Named(structure) = &destination.ty else {
                     return unsupported(expression.span, "field requires a struct");
@@ -390,10 +407,64 @@ impl Lower<'_> {
                 destination
                     .projections
                     .push(Projection::Field(name.clone()));
-                Ok(destination)
+                Ok((destination, mutable))
+            }
+            ExprKind::Index(base, index) => {
+                let (destination, mutable) = self.autoderef_destination(base)?;
+                let (element, mutable) = match &destination.ty {
+                    Type::Array(length, element) => {
+                        if let ExprKind::Int(index, _) = index.kind
+                            && index >= *length as u64
+                        {
+                            return unsupported(
+                                expression.span,
+                                "constant index outside array length",
+                            );
+                        }
+                        (*element.clone(), mutable)
+                    }
+                    Type::Slice(mutable, element) => (*element.clone(), *mutable),
+                    _ => {
+                        return unsupported(expression.span, "indexing requires an array or slice");
+                    }
+                };
+                // Capture/read the base before the index. A side effect in the
+                // index cannot retroactively initialize it. The captured address
+                // survives until the eventual load/store; sema owns reservations.
+                let address = self.capture(destination, base.span);
+                let index = self.index_value(index)?;
+                Ok((
+                    Destination {
+                        root: address,
+                        projections: vec![Projection::Deref, Projection::Index(index)],
+                        ty: element,
+                    },
+                    mutable,
+                ))
             }
             _ => unsupported(expression.span, "assignment destination outside subset"),
         }
+    }
+    fn autoderef_destination(&mut self, expression: &Expr) -> Result<(Destination, bool)> {
+        let (mut destination, mut mutable) = self.destination_access(expression)?;
+        if let Type::Ref(access, inner) = destination.ty {
+            mutable = access;
+            destination.ty = *inner;
+            destination.projections.push(Projection::Deref);
+        }
+        Ok((destination, mutable))
+    }
+    fn index_value(&mut self, expression: &Expr) -> Result<Place> {
+        // A suffix or local's actual integer width need not be usize.
+        let hint = matches!(expression.kind, ExprKind::Int(_, None)).then(Type::usize);
+        let value = self.expr(expression, hint.as_ref())?;
+        if !self.body.locals[value.0].ty.is_integer() {
+            return unsupported(
+                expression.span,
+                "index or slice bound requires integer type",
+            );
+        }
+        Ok(value)
     }
     fn capture(&mut self, destination: Destination, span: Span) -> Place {
         let target = self.local(
@@ -673,6 +744,21 @@ impl Lower<'_> {
                     };
                     self.end(Terminator::Goto(target), span);
                 }
+                StmtKind::ForEach { iterable, .. } => {
+                    let reason = if matches!(iterable.kind, ExprKind::Range(..)) {
+                        "statement outside subset (range foreach iteration)"
+                    } else {
+                        "statement outside subset (collection foreach iteration)"
+                    };
+                    return limited(LimitationKind::Statement, span, reason);
+                }
+                StmtKind::Match { .. } => {
+                    return limited(
+                        LimitationKind::Statement,
+                        span,
+                        "statement outside subset (match patterns)",
+                    );
+                }
                 _ => {
                     return limited(
                         LimitationKind::Statement,
@@ -818,13 +904,76 @@ impl Lower<'_> {
                 }
                 self.constant(ty, span)
             }
-            ExprKind::Field(..) | ExprKind::Unary(UnaryOp::Deref, _) => {
+            ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::Unary(UnaryOp::Deref, _) => {
                 let destination = self.destination(expression, false)?;
                 if !destination.ty.is_copy() {
                     return unsupported(span, "moves out of projected storage are unsupported");
                 }
                 let address = self.capture(destination, span);
                 self.load(address, span)
+            }
+            ExprKind::Array(ty, items) => {
+                let Type::Array(length, declared) = ty else {
+                    return unsupported(span, "unresolved array length");
+                };
+                if items.len() != *length {
+                    return unsupported(span, "array literal length mismatch");
+                }
+                let mut element = if **declared != Type::Unknown {
+                    Some(*declared.clone())
+                } else if let Some(Type::Array(_, element)) = expected {
+                    Some(*element.clone())
+                } else {
+                    items.iter().find_map(|item| match &item.kind {
+                        ExprKind::Int(_, Some(ty)) => Some(ty.clone()),
+                        ExprKind::Bool(_) => Some(Type::Bool),
+                        ExprKind::Name(_) => self
+                            .place(item, false)
+                            .ok()
+                            .map(|p| self.body.locals[p.0].ty.clone()),
+                        ExprKind::Struct(name, _) => Some(Type::Named(name.clone())),
+                        _ => None,
+                    })
+                };
+                let mut elements = vec![];
+                for item in items {
+                    let value = self.expr(item, element.as_ref())?;
+                    elements.push(self.operand(value));
+                    element = Some(self.body.locals[value.0].ty.clone());
+                }
+                let Some(element) = element else {
+                    return unsupported(span, "empty array needs an element type");
+                };
+                plain_type(self.program, &element, span)?;
+                let target = self.local("$array", Type::Array(*length, Box::new(element)), span);
+                self.emit(Operation::Aggregate { target, elements }, span);
+                target
+            }
+            ExprKind::Slice {
+                base,
+                start,
+                end,
+                mutable,
+            } => {
+                let (destination, access) = self.autoderef_destination(base)?;
+                let (element, access) = match &destination.ty {
+                    Type::Array(_, element) => (*element.clone(), access),
+                    Type::Slice(access, element) => (*element.clone(), *access),
+                    _ => return unsupported(span, "slicing requires an array or slice"),
+                };
+                if *mutable && !access {
+                    return unsupported(
+                        span,
+                        "mutable slice through shared reference or immutable binding",
+                    );
+                }
+                self.capture(destination, base.span);
+                for bound in start.iter().chain(end) {
+                    self.index_value(bound)?;
+                }
+                // Only availability is represented. Slice provenance, bounds,
+                // aliasing, and reservation conflicts remain with sema/codegen.
+                self.constant(Type::Slice(*mutable, Box::new(element)), span)
             }
             ExprKind::Struct(name, fields) => {
                 let Some(structure) = self.program.structs.iter().find(|s| &s.name == name) else {
@@ -876,8 +1025,12 @@ impl Lower<'_> {
                 }
                 let mut operands = vec![];
                 for (argument, parameter) in args.iter().zip(&function.params) {
-                    if matches!(parameter.ty, Type::Ref(true, _))
-                        && !matches!(argument.kind, ExprKind::Unary(UnaryOp::BorrowMut, _))
+                    if matches!(parameter.ty, Type::Ref(true, _) | Type::Slice(true, _))
+                        && !matches!(
+                            argument.kind,
+                            ExprKind::Unary(UnaryOp::BorrowMut, _)
+                                | ExprKind::Slice { mutable: true, .. }
+                        )
                     {
                         return unsupported(
                             argument.span,

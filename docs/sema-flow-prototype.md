@@ -102,8 +102,11 @@ conservative AST checker and ensuring skipped syntax is still checked.
 Whole-binding assignment does not read the destination; it evaluates the RHS,
 conditionally cleans up the previous slot, and writes the new value. For fields
 and checked-reference dereferences, an explicit capture reads the initialized
-root before the RHS. Compound assignment additionally loads the old value before
-the RHS. A projected store never initializes the whole root and never introduces
+root before the RHS. Indexing captures the base before evaluating the index,
+then captures the element address before the RHS. Nested projections evaluate
+each index exactly once, from left to right. Slices likewise read the base before
+evaluating their bounds. Compound assignment additionally loads the old value
+before the RHS. A projected store never initializes the whole root and never introduces
 partial-move facts. Capture operations describe abstract addresses, not loans;
 the AST checker's reservation rules still prevent their invalidation by the RHS.
 
@@ -116,12 +119,25 @@ plan, and the LLVM backend does not consume them yet.
 
 ## Current subset and next adoption steps
 
-The adapter supports Boolean/integer scalars, structs with scalar fields, direct
-references, struct literals, whole-local moves, direct calls, scalar operators
-(except unary negation), field/dereference reads and assignments, compound
-assignments, plain value blocks with a final value, blocks, `if`, basic `for`,
-return, break, and continue. Reference arguments requiring implicit mutable
-reborrowing are still excluded. Projected moves are rejected explicitly.
+The adapter supports Boolean/integer scalars, structs with scalar fields, arrays
+of those values (including nested arrays), direct references and slices of those
+values, struct and array literals, whole-local moves, direct calls, scalar
+operators (except unary negation), field/dereference/index reads and assignments,
+array/slice `.len`, slice expressions, compound assignments, plain value blocks
+with a final value, blocks, `if`, basic `for`, return, break, and continue.
+Reference and slice arguments requiring implicit mutable reborrowing are still
+excluded. Projected moves are rejected explicitly. Array literals transfer their
+elements left to right; moving an array kills the whole binding, and only a
+whole-binding assignment restores it. Writing an element requires an initialized
+base and does not establish element-level or whole-array initialization.
+
+Array lengths must already be resolved. Repetition expressions and some inferred
+literal forms still require fallback. Arrays and slice elements containing
+references or custom destructors remain excluded. Index/bound evaluation records
+initialization effects; bounds safety, slice provenance, captured-address
+reservations, and loan conflicts remain responsibilities of the existing
+checker/backend. Abstract cleanup records slot availability only; it does not
+schedule array element destruction.
 
 Imports and unrelated globals, enums, structs, and functions do not restrict
 analysis. Imported free functions and their qualified direct calls use the same
@@ -130,11 +146,36 @@ by a body. Generic functions, methods, FFI, borrowed returns, and borrow contrac
 still require fallback for the affected function and its callers. Referenced
 structs must have distinct scalar fields, no generic parameters, and no custom
 destructor; this applies to signatures, locals, literals, and callee signatures.
-Ambiguous referenced names also require fallback. Arrays, slices, indexing,
-casts, propagation, patterns, for-init/step, unsafe blocks,
-diverging value blocks, and nested yield exits are outside the body subset.
+Ambiguous referenced names also require fallback. Casts, Result propagation,
+patterns, foreach, for-init/step, unsafe blocks, diverging value blocks, and nested
+yield exits are outside the body subset.
 Lowering is not a complete type checker or proof of safety. Tests keep examples
 where initialization succeeds but borrowing correctly fails in production.
+
+The representative corpus was rerun after the array/index/slice extension:
+
+| Outcome / first blocker | Before | After |
+| --- | ---: | ---: |
+| Analyzed without findings | 28 | 30 |
+| Initialization/move findings | 1 | 1 |
+| Skipped bodies | 231 | 229 |
+| Function declaration | 152 | 152 |
+| Type | 50 | 43 |
+| Struct declaration | 12 | 12 |
+| Unsupported construct | 11 | 11 |
+| Statement | 1 | 7 |
+| Expression | 5 | 4 |
+
+`bytes.starts_with` and `bytes.ends_with` are newly analyzed. The next selected
+construct is **range foreach iteration**: `bytes.equal`, `bytes.compare`,
+`bytes.fill`, and `bytes.reverse` now reach that explicit first blocker. Collection
+foreach is exposed in `fibonacci_known_sequence`, and match patterns in
+`io.transfer`; the existing `patterns.category` match blocker remains. Result
+signatures still account for many type skips, but propagation requires additional
+payload and early-return modeling. These counts identify the next incremental
+step, not a promise that removing one blocker completes each body (for example,
+`bytes.compare` also contains unary negation). Coverage regressions assert the
+newly analyzed bodies and the four newly exposed range-loop blockers.
 
 This is the first production adoption stage: graph findings can reject a body
 after the existing checks succeed, while existing accepted/rejected behavior is

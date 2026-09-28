@@ -289,11 +289,8 @@ fn issues_keep_use_and_declaration_spans() {
 #[test]
 fn unsupported_and_ill_typed_inputs_never_produce_analysis_success() {
     for (source, reason) in [
-        (
-            "fn f() { values := [2]u8{1,2} }",
-            "expression outside subset",
-        ),
-        ("fn f(values: &[u8]) {}", "type is outside"),
+        ("fn f() { values := [1u8; 2] }", "expression outside subset"),
+        ("fn f(values: &[&u8]) {}", "type is outside"),
         ("fn f() { for x in 0..2 {} }", "statement outside subset"),
         (
             "fn f() { for i := 0; true; i += 1 {} }",
@@ -676,10 +673,9 @@ fn target_width_and_unsupported_bodies_keep_explicit_fallback() {
             .contains("range")
     );
     assert!(sema::check_for_target(&mut program.clone(), 32).is_err());
-    let mut program = parser::parse(
-        "package experiment\nfn f() { x := 1u8\nx += 2 }\nfn g() { values := [2]u8{1,2} }",
-    )
-    .unwrap();
+    let mut program =
+        parser::parse("package experiment\nfn f() { x := 1u8\nx += 2 }\nfn g() { _ = 1u8 as u32 }")
+            .unwrap();
     assert!(flow::lower(&program, "f").is_ok());
     assert!(flow::lower(&program, "g").is_err());
     sema::check(&mut program).unwrap();
@@ -740,5 +736,241 @@ fn loop_condition_temporaries_are_cleaned_before_either_successor() {
         && site.kind == flow::CleanupKind::Always));
     for successor in [yes, no] {
         assert!(!result.incoming[successor].as_ref().unwrap()[call].maybe_initialized);
+    }
+}
+
+#[test]
+fn array_literals_moves_and_reinitialization_have_independent_outcomes() {
+    compare("fn f() -> u8 { a := [1u8, 2]\nreturn a[1] }", None, &[]);
+    compare("fn f() { [0]u8 a = []\n_ = a.len }", None, &[]);
+    compare(
+        "fn f() { u8 x\n_ = [2]u8{x, 1} }",
+        Some("uninitialized"),
+        &["x"],
+    );
+    let prefix = "fn take(a: [2]u8) {}\n";
+    for (body, error, issues) in [
+        (
+            "fn f(a: [2]u8) { take(a)\n_ = a[0] }",
+            Some("moved"),
+            vec!["a"],
+        ),
+        (
+            "fn f(a: [2]u8) { take(a)\na = [2]u8{3,4}\n_ = a[0] }",
+            None,
+            vec![],
+        ),
+        (
+            "fn f(a: [2]u8, b: bool) { if b { take(a) }\n_ = a.len }",
+            Some("moved"),
+            vec!["a"],
+        ),
+        (
+            "fn f(a: [2]u8, b: bool) { if b { take(a)\nreturn }\n_ = a[0] }",
+            None,
+            vec![],
+        ),
+        (
+            "fn f(a: [2]u8) { take(a)\na[0] = 3\n_ = a[0] }",
+            Some("moved"),
+            vec!["a", "a"],
+        ),
+    ] {
+        compare(&format!("{prefix}{body}"), error, &issues);
+    }
+    // Array construction transfers non-copy elements in source order.
+    compare(
+        "struct S { u8 n }\nfn f(s: S) { _ = [2]S{s,s} }",
+        Some("moved"),
+        &["s"],
+    );
+    let body = compare("struct S { u8 n }\nfn f(s: S) { _ = [1]S{s} }", None, &[]);
+    let value = body.locals.iter().position(|l| l.name == "$value").unwrap();
+    assert!(
+        body.initialization()
+            .cleanup
+            .iter()
+            .any(|site| site.place.0 == value && site.kind == flow::CleanupKind::Never)
+    );
+}
+
+#[test]
+fn indexed_destinations_read_base_then_index_before_rhs() {
+    compare(
+        "fn f() { [2]u8 a\na[0] = 1\n_ = a[0] }",
+        Some("uninitialized"),
+        &["a", "a"],
+    );
+    compare(
+        "fn f(a: [2]u8) { usize i\na[i] = 1 }",
+        Some("uninitialized"),
+        &["i"],
+    );
+    compare(
+        "fn f() { [2]u8 a\n_ = a[{ a = [2]u8{1,2}\n0usize }] }",
+        Some("uninitialized"),
+        &["a"],
+    );
+    compare(
+        "fn f(a: [2]u8) { usize i\na[i] = { i = 0\n1 } }",
+        Some("uninitialized"),
+        &["i"],
+    );
+    compare("fn f(a: [2]u8) { a[1u8] += 1\n_ = a[1u8] }", None, &[]);
+    let body = compare(
+        "fn index() -> usize { return 0 }\nfn rhs() -> u8 { return 1 }\nfn f(a: [2]u8) { a[index()] += rhs() }",
+        None,
+        &[],
+    );
+    let operations: Vec<_> = body.blocks[0]
+        .instructions
+        .iter()
+        .map(|i| &i.operation)
+        .collect();
+    let base = operations
+        .iter()
+        .position(|op| matches!(op, Operation::Capture { .. }))
+        .unwrap();
+    let index = operations
+        .iter()
+        .position(|op| matches!(op, Operation::Call { function, .. } if function == "index"))
+        .unwrap();
+    let load = operations
+        .iter()
+        .position(|op| matches!(op, Operation::Load { .. }))
+        .unwrap();
+    let rhs = operations
+        .iter()
+        .position(|op| matches!(op, Operation::Call { function, .. } if function == "rhs"))
+        .unwrap();
+    let store = operations
+        .iter()
+        .position(|op| matches!(op, Operation::Store { .. }))
+        .unwrap();
+    assert!(base < index && index < load && load < rhs && rhs < store);
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|op| matches!(op, Operation::Call { function, .. } if function == "index"))
+            .count(),
+        1
+    );
+    compare(
+        "struct S { u8 n }\nfn index() -> usize { return 0 }\nfn f(a: [1]S) { a[index()].n += 1 }",
+        None,
+        &[],
+    );
+    compare("fn f(a: [2][2]u8) { a[0][1] = 3\n_ = a[0][1] }", None, &[]);
+}
+
+#[test]
+fn array_loop_moves_reinitialization_and_exits_have_independent_outcomes() {
+    let prefix = "fn take(a: [1]u8) {}\n";
+    for (body, error, issues) in [
+        (
+            "fn f(a: [1]u8, b: bool) { for b { take(a) } }",
+            Some("moved in a loop"),
+            vec!["a"],
+        ),
+        (
+            "fn f(a: [1]u8, b: bool) { for b { take(a)\na = [1]u8{1}\ncontinue } }",
+            None,
+            vec![],
+        ),
+        (
+            "fn f(a: [1]u8) { for { take(a)\nbreak }\n_ = a[0] }",
+            Some("moved"),
+            vec!["a"],
+        ),
+        (
+            "fn f(a: [1]u8) { for { take(a)\na = [1]u8{1}\nbreak }\n_ = a[0] }",
+            None,
+            vec![],
+        ),
+        ("fn f(a: [1]u8) { for { take(a)\nreturn } }", None, vec![]),
+        (
+            "fn f() { [1]u8 a\nfor { a = [1]u8{1}\nbreak }\n_ = a[0] }",
+            None,
+            vec![],
+        ),
+        (
+            "fn f(b: bool) { [1]u8 a\nfor b { a = [1]u8{1}\nbreak }\n_ = a[0] }",
+            Some("uninitialized"),
+            vec!["a"],
+        ),
+    ] {
+        compare(&format!("{prefix}{body}"), error, &issues);
+    }
+}
+
+#[test]
+fn slice_availability_does_not_establish_borrow_safety() {
+    compare("fn f(a: &[u8]) -> u8 { return a[0] }", None, &[]);
+    compare("fn f(a: &mut[u8]) { a[0] += 1 }", None, &[]);
+    compare("fn f(a: &mut [2]u8) { a[0] = 1 }", None, &[]);
+    compare(
+        "fn f() { &[u8] a\n_ = a.len }",
+        Some("uninitialized"),
+        &["a"],
+    );
+    compare(
+        "fn f() { [2]u8 a\n_ = &a[..] }",
+        Some("uninitialized"),
+        &["a"],
+    );
+    compare(
+        "fn f(a: [2]u8) { usize end\n_ = &a[..end] }",
+        Some("uninitialized"),
+        &["end"],
+    );
+    compare(
+        "fn f(a: [2]u8) { s := &mut a[..]\ns[0] = 1\n_ = s.len }",
+        None,
+        &[],
+    );
+    compare(
+        "fn observe(s: &[u8]) {}\nfn f(a: [2]u8) { s := &a[..]\na[0] = 1\nobserve(s) }",
+        Some("borrow"),
+        &[],
+    );
+    compare(
+        "fn take(a: [2]u8) {}\nfn f(a: [2]u8) { a[0] = { take(a)\na = [2]u8{1,2}\n3 } }",
+        Some("borrow"),
+        &[],
+    );
+    compare(
+        "fn take(a: [2]u8) {}\nfn f(a: [2]u8) { _ = &a[..{ take(a)\na = [2]u8{1,2}\n1usize }] }",
+        Some("borrow"),
+        &[],
+    );
+}
+
+#[test]
+fn unsupported_array_operations_discard_the_entire_graph() {
+    for (source, reason) in [
+        ("fn f(a: [1]u8) { _ = a[1] }", "outside array length"),
+        ("fn f(a: [1]u8) { _ = a[false] }", "integer type"),
+        ("fn f() { _ = [2]u8{1} }", "length mismatch"),
+        ("fn f(a: &[u8]) { a[0] = 1 }", "shared reference"),
+        ("fn f(a: &[u8]) { _ = &mut a[..] }", "shared reference"),
+        ("fn f(a: [1]u8) { a.len = 1 }", "immutable binding"),
+        (
+            "struct S { u8 n }\nfn f(a: [1]S) { _ = a[0] }",
+            "moves out of projected",
+        ),
+        ("fn f(a: [1]&u8) {}", "type is outside"),
+        (
+            "struct S { u8 n\nfn drop(&mut self) {} }\nfn f(a: [1]S) {}",
+            "custom destructors",
+        ),
+        (
+            "fn take(a: &mut[u8]) {}\nfn f(a: &mut[u8]) { take(a) }",
+            "reborrow",
+        ),
+        ("fn f(a: &[u8]) -> &[u8] { return a }", "borrowed returns"),
+    ] {
+        let program = parser::parse(&format!("package experiment\n{source}")).unwrap();
+        let error = flow::lower(&program, "f").expect_err(source);
+        assert!(error.reason.contains(reason), "{error:?}: {source}");
     }
 }
