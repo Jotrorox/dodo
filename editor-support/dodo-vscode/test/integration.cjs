@@ -2,16 +2,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const vscode = require("vscode");
-
-async function eventually(label, check) {
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    const value = await check();
-    if (value) return value;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error(`Timed out waiting for ${label}`);
-}
+const { eventually } = require("./eventually.cjs");
 
 async function replace(document, text) {
   const edit = new vscode.WorkspaceEdit();
@@ -26,7 +17,7 @@ exports.run = async function () {
   await fs.writeFile(uri.fsPath, source);
   const document = await vscode.workspace.openTextDocument(uri);
   assert.equal(document.languageId, "dodo", "file association");
-  await vscode.window.showTextDocument(document);
+  await eventually("opening the main editor", () => vscode.window.showTextDocument(document));
   const extension = vscode.extensions.getExtension("Jotrorox.dodo-vscode");
   assert.ok(extension);
   await extension.activate();
@@ -131,7 +122,7 @@ exports.run = async function () {
   const libraryDocument = await vscode.workspace.openTextDocument(libraryUri);
   assert.equal(libraryDocument.languageId, "dodo");
   assert.match(libraryDocument.lineAt((libraryLocation.range || libraryLocation.targetRange).start.line).text, /pub fn abs/);
-  await vscode.window.showTextDocument(libraryDocument);
+  await eventually("opening the bundled source editor", () => vscode.window.showTextDocument(libraryDocument));
   const libraryPosition = libraryDocument.positionAt(libraryDocument.getText().indexOf("from_bits(0x7ff"));
   await eventually("navigation inside bundled source", async () => {
     const result = await vscode.commands.executeCommand("vscode.executeDefinitionProvider", libraryUri, libraryPosition);
@@ -184,13 +175,13 @@ exports.run = async function () {
   await eventually("32-bit target diagnostics", () => vscode.languages.getDiagnostics(uri).some((d) => /usize|range|fit/.test(d.message)));
 
   const untitled = await vscode.workspace.openTextDocument({ language: "dodo", content: "package scratch\nfn main() -> i32 { return missing_scratch }\n" });
-  await vscode.window.showTextDocument(untitled);
+  await eventually("opening the untitled editor", () => vscode.window.showTextDocument(untitled));
   await eventually("untitled diagnostics", () => vscode.languages.getDiagnostics(untitled.uri).some((d) => /missing_scratch/.test(d.message)));
 
   // Use VS Code's snippet parser and the real server to validate a complete program.
   const snippets = JSON.parse(await fs.readFile(path.join(extension.extensionPath, "snippets/dodo.json"), "utf8"));
   await replace(untitled, "");
-  const editor = await vscode.window.showTextDocument(untitled);
+  const editor = await eventually("opening the snippet editor", () => vscode.window.showTextDocument(untitled));
   assert.ok(await editor.insertSnippet(new vscode.SnippetString(snippets["Main program"].body.join("\n"))));
   assert.match(untitled.getText(), /package main/);
   await eventually("snippet diagnostics clear", () => vscode.languages.getDiagnostics(untitled.uri).length === 0);
