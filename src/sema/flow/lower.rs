@@ -1,8 +1,9 @@
 //! A deliberately small source adapter, independent of sema and AST annotations.
 //! Failure discards the entire body; unsupported nodes never become no-ops.
 use super::*;
-use crate::ast::{self, BinaryOp, Expr, ExprKind, Function, Program, StmtKind, UnaryOp};
-use std::collections::HashMap;
+use crate::ast::{self, BinaryOp, Expr, ExprKind, Function, Pattern, Program, StmtKind, UnaryOp};
+use std::collections::{HashMap, HashSet};
+mod patterns;
 
 /// Machine-readable fallback families; messages retain the specific restriction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -96,34 +97,11 @@ fn unique_declaration(program: &Program, name: &str) -> bool {
 }
 
 fn validate_struct(program: &Program, structure: &ast::Struct) -> Result<()> {
-    if !unique_declaration(program, &structure.name) || !structure.generics.is_empty() {
-        return limited(
-            LimitationKind::StructDeclaration,
-            structure.span,
-            "duplicate or generic structs are unsupported",
-        );
-    }
-    let mut fields = std::collections::HashSet::new();
-    for field in &structure.fields {
-        if !fields.insert(&field.name) || !scalar(&field.ty) {
-            return limited(
-                LimitationKind::StructDeclaration,
-                field.span,
-                "only structs with distinct scalar fields are supported",
-            );
-        }
-    }
-    // Previously the program-wide method restriction also excluded these
-    // types. Keep that boundary for every use, including implicit cleanup.
-    let destructor = format!("{}.drop", structure.name);
-    if let Some(function) = program.functions.iter().find(|f| f.name == destructor) {
-        return limited(
-            LimitationKind::StructDeclaration,
-            function.span,
-            "structs with custom destructors are unsupported",
-        );
-    }
-    Ok(())
+    plain_type(
+        program,
+        &Type::Named(structure.name.clone()),
+        structure.span,
+    )
 }
 
 // Check signatures at the body entry and at direct calls, without requiring
@@ -192,8 +170,10 @@ fn lower_function(program: &Program, function: &Function, pointer_bits: u32) -> 
         },
         scopes: vec![Scope::default()],
         loops: vec![],
+        yields: vec![],
         current: Some(0),
         pointer_bits,
+        guard: false,
     };
     lower.block_id();
     for parameter in &function.params {
@@ -224,22 +204,113 @@ fn supported_type(program: &Program, ty: &Type, span: Span) -> Result<()> {
 // Owned aggregates deliberately exclude references and custom destructors.
 // Their whole-slot moves are modeled; partial moves and native drops are not.
 fn plain_type(program: &Program, ty: &Type, span: Span) -> Result<()> {
+    validate_plain(program, ty, span, &mut HashSet::new())
+}
+fn validate_plain(
+    program: &Program,
+    ty: &Type,
+    span: Span,
+    visiting: &mut HashSet<String>,
+) -> Result<()> {
     if scalar(ty) {
         return Ok(());
     }
-    if let Type::Array(_, element) = ty {
-        return plain_type(program, element, span);
+    match ty {
+        Type::Array(_, element) | Type::Option(element) => {
+            validate_plain(program, element, span, visiting)
+        }
+        Type::Result(success, error) => {
+            if **success != Type::Void {
+                validate_plain(program, success, span, visiting)?;
+            }
+            validate_plain(program, error, span, visiting)
+        }
+        Type::Named(name) => {
+            let (kind, declaration_span, generics) =
+                if let Some(s) = program.structs.iter().find(|s| &s.name == name) {
+                    (LimitationKind::StructDeclaration, s.span, &s.generics)
+                } else if let Some(e) = program.enums.iter().find(|e| &e.name == name) {
+                    (LimitationKind::Enums, e.span, &e.generics)
+                } else {
+                    return limited(LimitationKind::Type, span, "unknown aggregate type");
+                };
+            if !unique_declaration(program, name) || !generics.is_empty() {
+                return limited(
+                    kind,
+                    declaration_span,
+                    "duplicate or generic aggregates are unsupported",
+                );
+            }
+            if !visiting.insert(name.clone()) {
+                return limited(
+                    kind,
+                    declaration_span,
+                    "recursive aggregates are unsupported",
+                );
+            }
+            if let Some(drop) = program
+                .functions
+                .iter()
+                .find(|f| f.name == format!("{name}.drop"))
+            {
+                return limited(
+                    kind,
+                    drop.span,
+                    "aggregates with custom destructors are unsupported",
+                );
+            }
+            let groups: Vec<_> = if let Some(s) = program.structs.iter().find(|s| &s.name == name) {
+                vec![&s.fields]
+            } else {
+                let e = program.enums.iter().find(|e| &e.name == name).unwrap();
+                let mut variants = HashSet::new();
+                for variant in &e.variants {
+                    if !variants.insert(&variant.name) {
+                        return limited(
+                            kind,
+                            variant.span,
+                            "duplicate enum variants are unsupported",
+                        );
+                    }
+                }
+                e.variants.iter().map(|v| &v.fields).collect()
+            };
+            for fields in groups {
+                let mut seen = HashSet::new();
+                for field in fields {
+                    if !seen.insert(&field.name) {
+                        return limited(
+                            kind,
+                            field.span,
+                            "duplicate aggregate fields are unsupported",
+                        );
+                    }
+                    if let Err(error) = validate_plain(program, &field.ty, field.span, visiting) {
+                        return Err(if error.kind == LimitationKind::Type {
+                            Limitation { kind, ..error }
+                        } else {
+                            error
+                        });
+                    }
+                }
+            }
+            visiting.remove(name);
+            Ok(())
+        }
+        _ => limited(
+            LimitationKind::Type,
+            span,
+            "type is outside the scalar, plain aggregate, and direct-reference/slice subset",
+        ),
     }
-    if let Type::Named(name) = ty
-        && let Some(structure) = program.structs.iter().find(|s| &s.name == name)
-    {
-        return validate_struct(program, structure);
+}
+
+fn qualified_name(expression: &Expr) -> Option<String> {
+    match &expression.kind {
+        ExprKind::Name(name) => Some(name.clone()),
+        ExprKind::Field(base, field) => Some(format!("{}.{field}", qualified_name(base)?)),
+        _ => None,
     }
-    limited(
-        LimitationKind::Type,
-        span,
-        "type is outside the scalar, scalar-field struct, plain array, and direct-reference/slice subset",
-    )
 }
 
 #[derive(Default)]
@@ -253,14 +324,22 @@ struct Loop {
     exit: BlockId,
     depth: usize,
 }
+struct Yield {
+    exit: BlockId,
+    depth: usize,
+    expected: Option<Type>,
+    target: Option<Place>,
+}
 struct Lower<'a> {
     program: &'a Program,
     function: &'a Function,
     body: Body,
     scopes: Vec<Scope>,
     loops: Vec<Loop>,
+    yields: Vec<Yield>,
     current: Option<BlockId>,
     pointer_bits: u32,
+    guard: bool,
 }
 impl Lower<'_> {
     fn block_id(&mut self) -> BlockId {
@@ -338,6 +417,89 @@ impl Lower<'_> {
             span,
         );
         target
+    }
+
+    fn tagged(&mut self, ty: Type, variant: &str, fields: Vec<Operand>, span: Span) -> Place {
+        let target = self.local("$tagged", ty, span);
+        self.emit(
+            Operation::Tagged {
+                target,
+                variant: variant.into(),
+                fields,
+            },
+            span,
+        );
+        target
+    }
+
+    fn variant_fields(&self, ty: &Type, name: &str, span: Span) -> Result<Vec<Type>> {
+        let short = if let Some((owner, short)) = name.rsplit_once('.') {
+            self.expect(&Type::Named(owner.into()), ty, span)?;
+            short
+        } else {
+            name
+        };
+        let fields = match (ty, short) {
+            (Type::Option(inner), "some") => Some(vec![*inner.clone()]),
+            (Type::Option(_), "none") => Some(vec![]),
+            (Type::Result(success, _), "ok") => Some(if **success == Type::Void {
+                vec![]
+            } else {
+                vec![*success.clone()]
+            }),
+            (Type::Result(_, error), "err") => Some(vec![*error.clone()]),
+            (Type::Named(owner), _) => self
+                .program
+                .enums
+                .iter()
+                .find(|e| &e.name == owner)
+                .and_then(|e| e.variants.iter().find(|v| v.name == short))
+                .map(|v| v.fields.iter().map(|f| f.ty.clone()).collect()),
+            _ => None,
+        };
+        fields.ok_or_else(|| Limitation {
+            kind: LimitationKind::UnsupportedConstruct,
+            span,
+            reason: format!("unknown variant `{name}` for `{ty}`"),
+        })
+    }
+
+    fn constructor(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        expected: Option<&Type>,
+        span: Span,
+    ) -> Result<Place> {
+        if name == "some" && expected.is_none() {
+            let [argument] = args else {
+                return unsupported(span, "some expects one argument");
+            };
+            let value = self.expr(argument, None)?;
+            let ty = Type::Option(Box::new(self.body.locals[value.0].ty.clone()));
+            plain_type(self.program, &ty, span)?;
+            return Ok(self.tagged(ty, name, vec![self.operand(value)], span));
+        }
+        let ty = if matches!(name, "some" | "none" | "ok" | "err") {
+            expected.cloned().ok_or_else(|| Limitation {
+                kind: LimitationKind::Type,
+                span,
+                reason: "constructor requires a Result or Option context".into(),
+            })?
+        } else {
+            Type::Named(name.rsplit_once('.').unwrap().0.into())
+        };
+        plain_type(self.program, &ty, span)?;
+        let fields = self.variant_fields(&ty, name, span)?;
+        if args.len() != fields.len() {
+            return unsupported(span, "variant constructor arity mismatch");
+        }
+        let mut operands = vec![];
+        for (argument, ty) in args.iter().zip(&fields) {
+            let value = self.expr(argument, Some(ty))?;
+            operands.push(self.operand(value));
+        }
+        Ok(self.tagged(ty, name.rsplit('.').next().unwrap(), operands, span))
     }
 
     fn integer_literal(
@@ -437,6 +599,10 @@ impl Lower<'_> {
                 .iter()
                 .find(|f| &f.name == name)
                 .map(|f| f.ret.clone()),
+            ExprKind::Try(value) | ExprKind::Unwrap(value) => match self.peek_type(value)? {
+                Type::Result(success, _) => Some(*success),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -959,6 +1125,9 @@ impl Lower<'_> {
                     }
                 }
                 StmtKind::Assign { target, op, value } => {
+                    if self.guard {
+                        return unsupported(span, "assignments in pattern guards are unsupported");
+                    }
                     if matches!(&target.kind, ExprKind::Name(n) if n == "_") {
                         if op.is_some() {
                             return unsupported(span, "compound discard is unsupported");
@@ -1020,6 +1189,38 @@ impl Lower<'_> {
                     // The returned temporary survives cleanup until the return consumes it.
                     self.cleanup(0, value, span);
                     self.end(Terminator::Return(value.map(|p| self.operand(p))), span);
+                }
+                StmtKind::Yield(expression) => {
+                    let Some(context) = self.yields.last() else {
+                        return unsupported(span, "yield outside a value block");
+                    };
+                    let (depth, exit, target, expected) = (
+                        context.depth,
+                        context.exit,
+                        context.target,
+                        context.expected.clone(),
+                    );
+                    let value = self.expr(expression, expected.as_ref())?;
+                    let ty = self.body.locals[value.0].ty.clone();
+                    let target = if let Some(target) = target {
+                        self.expect(&self.body.locals[target.0].ty, &ty, span)?;
+                        target
+                    } else {
+                        let target = self.local("$yield", ty, span);
+                        self.scopes.last_mut().unwrap().locals.pop();
+                        self.scopes[depth - 1].locals.push(target);
+                        self.yields.last_mut().unwrap().target = Some(target);
+                        target
+                    };
+                    self.emit(
+                        Operation::Assign {
+                            target,
+                            value: self.operand(value),
+                        },
+                        span,
+                    );
+                    self.cleanup(depth, None, span);
+                    self.end(Terminator::Goto(exit), span);
                 }
                 StmtKind::Block(block) => self.scoped(block, span)?,
                 StmtKind::If {
@@ -1115,13 +1316,19 @@ impl Lower<'_> {
                         self.foreach(index.as_deref(), name, *copy, iterable, body, span)?;
                     }
                 }
-                StmtKind::Match { .. } => {
-                    return limited(
-                        LimitationKind::Statement,
-                        span,
-                        "statement outside subset (match patterns)",
-                    );
-                }
+                StmtKind::Match { value, arms } => self.match_statement(value, arms, span)?,
+                StmtKind::IfLet {
+                    pattern,
+                    value,
+                    then_block,
+                    else_block,
+                } => self.if_let(pattern, value, then_block, else_block, span)?,
+                StmtKind::LetPattern {
+                    pattern,
+                    ty,
+                    value,
+                    else_block,
+                } => self.let_pattern(pattern, ty, value, else_block.as_ref(), span)?,
                 _ => {
                     return limited(
                         LimitationKind::Statement,
@@ -1156,8 +1363,14 @@ impl Lower<'_> {
             ExprKind::Int(number, suffix) => {
                 self.integer_literal(*number, suffix.as_ref(), expected, false, span)?
             }
+            ExprKind::Name(name) if name == "none" => {
+                self.constructor(name, &[], expected, span)?
+            }
             ExprKind::Name(_) => {
                 let source = self.place(expression, false)?;
+                if self.guard && !self.body.locals[source.0].ty.is_copy() {
+                    return unsupported(span, "moves in pattern guards are unsupported");
+                }
                 let target = self.local("$value", self.body.locals[source.0].ty.clone(), span);
                 self.emit(
                     Operation::Assign {
@@ -1169,23 +1382,28 @@ impl Lower<'_> {
                 target
             }
             ExprKind::ValueBlock(block) => {
-                let Some((last, statements)) = block.split_last() else {
+                if block.is_empty() {
                     return unsupported(span, "empty value block");
-                };
-                let StmtKind::Yield(value) = &last.kind else {
-                    return unsupported(span, "value block requires a final yield");
-                };
-                self.scopes.push(Scope::default());
-                self.statements(statements)?;
-                if self.current.is_none() {
-                    return unsupported(span, "diverging value block is unsupported");
                 }
-                let value = self.expr(value, expected)?;
-                // The yielded temporary leaves this scope with its value intact.
-                self.cleanup(self.scopes.len() - 1, Some(value), span);
+                let depth = self.scopes.len();
+                let exit = self.block_id();
+                self.yields.push(Yield {
+                    exit,
+                    depth,
+                    expected: expected.cloned(),
+                    target: None,
+                });
+                self.scopes.push(Scope::default());
+                self.statements(block)?;
+                if self.current.is_some() {
+                    return unsupported(span, "value block path without a yield");
+                }
                 self.scopes.pop();
-                self.scopes.last_mut().unwrap().locals.push(value);
-                value
+                let Some(target) = self.yields.pop().unwrap().target else {
+                    return unsupported(span, "diverging value block is unsupported");
+                };
+                self.current = Some(exit);
+                target
             }
             ExprKind::Binary(op @ (BinaryOp::And | BinaryOp::Or), left, right) => {
                 let left = self.expr(left, Some(&Type::Bool))?;
@@ -1252,6 +1470,13 @@ impl Lower<'_> {
                     return unsupported(span, "unary operator type mismatch");
                 }
                 self.constant(ty, span)
+            }
+            ExprKind::Field(base, variant)
+                if qualified_name(base)
+                    .is_some_and(|name| self.program.enums.iter().any(|e| e.name == name)) =>
+            {
+                let name = format!("{}.{variant}", qualified_name(base).unwrap());
+                self.constructor(&name, &[], expected, span)?
             }
             ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::Unary(UnaryOp::Deref, _) => {
                 let destination = self.destination(expression, false)?;
@@ -1330,6 +1555,7 @@ impl Lower<'_> {
                 };
                 validate_struct(self.program, structure)?;
                 let mut seen = std::collections::HashSet::new();
+                let mut elements = vec![];
                 for (name, value) in fields {
                     let Some(field) = structure.fields.iter().find(|f| &f.name == name) else {
                         return unsupported(value.span, "unknown struct field");
@@ -1337,15 +1563,21 @@ impl Lower<'_> {
                     if !seen.insert(name) {
                         return unsupported(value.span, "duplicate struct field");
                     }
-                    self.expr(value, Some(&field.ty))?;
+                    let value = self.expr(value, Some(&field.ty))?;
+                    elements.push(self.operand(value));
                 }
                 if seen.len() != structure.fields.len() {
                     return unsupported(span, "missing struct field");
                 }
-                self.constant(Type::Named(name.clone()), span)
+                let target = self.local("$struct", Type::Named(name.clone()), span);
+                self.emit(Operation::Aggregate { target, elements }, span);
+                target
             }
             ExprKind::Unary(op @ (UnaryOp::Borrow | UnaryOp::BorrowMut), source) => {
                 let mutable = *op == UnaryOp::BorrowMut;
+                if self.guard && mutable {
+                    return unsupported(span, "mutable borrows in pattern guards are unsupported");
+                }
                 let source = self.place(source, mutable)?;
                 let ty = Type::Ref(mutable, Box::new(self.body.locals[source.0].ty.clone()));
                 supported_type(self.program, &ty, span)?;
@@ -1358,6 +1590,113 @@ impl Lower<'_> {
                     },
                     span,
                 );
+                target
+            }
+            ExprKind::Call {
+                name,
+                type_args,
+                args,
+            } if type_args.is_empty()
+                && (matches!(name.as_str(), "ok" | "err" | "some" | "none")
+                    || name.rsplit_once('.').is_some_and(|(owner, _)| {
+                        self.program.enums.iter().any(|e| e.name == owner)
+                    })) =>
+            {
+                self.constructor(name, args, expected, span)?
+            }
+            ExprKind::MethodCall {
+                receiver,
+                name,
+                args,
+            } if qualified_name(receiver)
+                .is_some_and(|owner| self.program.enums.iter().any(|e| e.name == owner)) =>
+            {
+                let name = format!("{}.{name}", qualified_name(receiver).unwrap());
+                self.constructor(&name, args, expected, span)?
+            }
+            ExprKind::Try(value) | ExprKind::Unwrap(value) => {
+                if self.guard {
+                    return unsupported(span, "Result exits in pattern guards are unsupported");
+                }
+                let source = self.expr(value, None)?;
+                let Type::Result(success, error) = self.body.locals[source.0].ty.clone() else {
+                    return unsupported(span, "Result propagation requires a Result operand");
+                };
+                let propagate = matches!(expression.kind, ExprKind::Try(_));
+                if propagate {
+                    let Type::Result(_, expected_error) = &self.function.ret else {
+                        return unsupported(span, "propagation requires a Result return type");
+                    };
+                    self.expect(expected_error, &error, span)?;
+                }
+                let yes = self.block_id();
+                let no = self.block_id();
+                self.test_branch(
+                    source,
+                    &[],
+                    PatternTest::Variant("ok".into()),
+                    yes,
+                    no,
+                    span,
+                );
+                self.current = Some(no);
+                if propagate {
+                    let payload = self.local("$error", *error, span);
+                    self.emit(
+                        Operation::PatternBind {
+                            source: self.operand(source),
+                            bindings: vec![PayloadBinding {
+                                target: payload,
+                                projections: vec![PatternProjection::Payload {
+                                    variant: "err".into(),
+                                    index: 0,
+                                }],
+                            }],
+                            mode: PatternMode::Owned,
+                        },
+                        span,
+                    );
+                    let returned = self.tagged(
+                        self.function.ret.clone(),
+                        "err",
+                        vec![self.operand(payload)],
+                        span,
+                    );
+                    self.cleanup(0, Some(returned), span);
+                    self.end(Terminator::Return(Some(self.operand(returned))), span);
+                } else {
+                    // Unwrap panics without unwinding or scope cleanup.
+                    self.end(Terminator::Unreachable, span);
+                }
+                self.current = Some(yes);
+                let target = self.local("$success", *success.clone(), span);
+                self.emit(
+                    Operation::PatternBind {
+                        source: self.operand(source),
+                        bindings: if *success == Type::Void {
+                            vec![]
+                        } else {
+                            vec![PayloadBinding {
+                                target,
+                                projections: vec![PatternProjection::Payload {
+                                    variant: "ok".into(),
+                                    index: 0,
+                                }],
+                            }]
+                        },
+                        mode: PatternMode::Owned,
+                    },
+                    span,
+                );
+                if *success == Type::Void {
+                    self.emit(
+                        Operation::Assign {
+                            target,
+                            value: Operand::Constant(Type::Void),
+                        },
+                        span,
+                    );
+                }
                 target
             }
             ExprKind::Call {

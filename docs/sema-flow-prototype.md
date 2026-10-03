@@ -81,6 +81,9 @@ lowers original parses for graph-shape assertions. `tests/flow_prototype/reporti
 locks down prepared/instantiated coverage, declaration-local fallback, imported
 free functions, complete graph discard on late lowering failure, continued AST
 checking, and diagnostic precedence without duplicates.
+`tests/flow_prototype/tagged.rs` adds independently specified tagged-value,
+pattern, and propagation outcomes, including payload moves, guard retries,
+borrowed bindings, value-block exits, and cleanup on early error returns.
 
 ## Representation and analysis
 
@@ -132,14 +135,58 @@ classify each reachable site as `Never`, `Always`, or `Conditional` from the
 converged must/may state. These are slot-liveness facts, not a native destructor
 plan, and the LLVM backend does not consume them yet.
 
+## Tagged values, patterns, and Result exits
+
+Tagged-value adoption has three stages:
+
+1. **Representation and construction.** Non-generic enums, `Option<T>`, and
+   `Result<T, E>` accept recursively plain payloads, including structs, arrays,
+   and nested tagged values. Structs now accept these plain fields too. Tagged
+   construction transfers payload operands in source order; structs and arrays
+   likewise transfer their elements. Whole-slot moves and reinitialization keep
+   the same must/may facts as other owned values. `void` success Results use
+   `ok()` with no payload. Borrow-containing aggregates, custom destructors,
+   unresolved types, and recursive or ambiguous declarations still cause
+   body-local fallback with the offending declaration or field span.
+2. **Pattern selection and payload transfer.** `match`, `if let`, and
+   destructuring `let` support bindings, wildcards, scalar literals/ranges,
+   structs, variants, recursive patterns, and alternatives. Tests read the
+   scrutinee without consuming it, checking a variant before testing its
+   payload. Alternatives expand within a 4,096-plan limit and share a selected
+   body. Guard bindings are non-owning previews: a false guard cleans up its
+   preview slots and retries the next alternative, while a true guard commits
+   ownership exactly once. Owned selection transfers all bound payloads in one
+   operation and discards the remainder of the scrutinee temporary. Reference
+   selection creates shared/mutable payload references while preserving the
+   owner's availability. Conditional patterns consume owned scrutinees on both
+   success and failure. Match-arm, scope, return, loop-exit, and value-block
+   cleanup preserve the selected payload's slot until it is transferred.
+3. **Result exits.** `?` evaluates its operand once and branches on its tag. The
+   success edge consumes the Result and extracts its payload; the error edge
+   transfers the owned error into the enclosing return type, cleans up live
+   scopes in reverse order, and returns that temporary intact. This includes
+   partially evaluated call arguments, constructors, and captured destinations.
+   Error returns do not reach ordinary joins or loop back edges. Nested Results
+   and `void` success payloads use the same operations. Postfix `!` shares the
+   success extraction but ends its error path without unwinding or cleanup.
+
+The analysis tracks slot availability, not tag values or exhaustiveness. Both
+successors of a pattern test remain possible. Failed exhaustive matches and
+unmatched irrefutable lets have unreachable terminators; the AST checker still
+validates exhaustiveness, let-else divergence, guard restrictions, Result handling
+obligations, borrowing, and destruction. Payload projection paths describe an
+atomic transfer from a matched temporary; they do not introduce partial-move
+facts on user storage or a native payload destruction plan.
+
 ## Current subset and next adoption steps
 
-The adapter supports Boolean/integer scalars, structs with scalar fields, arrays
-of those values (including nested arrays), direct references and slices of those
-values, struct and array literals, whole-local moves, direct calls, scalar
-operators (including signed integer negation), field/dereference/index reads and
-assignments, array/slice `.len`, slice expressions, compound assignments, plain
-value blocks with a final value, blocks, `if`, basic `for`, integer range foreach,
+The adapter supports Boolean/integer scalars, recursively plain structs/enums,
+Options, Results, arrays of those values (including nested arrays), direct
+references and slices of those values, aggregate and tagged literals, whole-local
+moves, direct calls, scalar operators (including signed integer negation),
+field/dereference/index reads and assignments, array/slice `.len`, slice
+expressions, compound assignments, value blocks with branch-local yields,
+patterns, Result propagation/unwrap, blocks, `if`, basic `for`, integer range foreach,
 array/slice foreach (including indexed, reference, and shared copy forms), return,
 break, and continue.
 Reference and slice arguments requiring implicit mutable reborrowing are still
@@ -160,7 +207,7 @@ preserves operand reads/effects and accepts minimum-value literals using the
 selected target width (for example, `-128i8` and 32-bit `-2147483648isize`).
 
 Array lengths must already be resolved. Repetition expressions and some inferred
-literal forms still require fallback. Arrays and slice elements containing
+literal forms still require fallback. Owned aggregates and slice elements containing
 references or custom destructors remain excluded. Index/bound evaluation records
 initialization effects; bounds safety, slice provenance, captured-address
 reservations, collection/element loan lifetimes, and loan conflicts remain
@@ -169,48 +216,51 @@ availability only; it does not schedule array element destruction.
 
 Imports and unrelated globals, enums, structs, and functions do not restrict
 analysis. Imported free functions and their qualified direct calls use the same
-subset checks as local functions. Globals and enums remain unsupported when used
-by a body. Generic functions, methods, FFI, borrowed returns, and borrow contracts
+subset checks as local functions. Globals remain unsupported when used by a
+body. Generic functions, methods, FFI, borrowed returns, and borrow contracts
 still require fallback for the affected function and its callers. Referenced
-structs must have distinct scalar fields, no generic parameters, and no custom
-destructor; this applies to signatures, locals, literals, and callee signatures.
-Ambiguous referenced names also require fallback. Casts, Result propagation,
-patterns, for-init/step, unsafe blocks, diverging value blocks, and nested yield
-exits are outside the body subset.
+structs/enums must have distinct plain fields/variants, no generic parameters,
+and no custom destructor; this applies to signatures, locals, literals, and
+callee signatures. Ambiguous referenced names also require fallback. Casts,
+for-init/step, unsafe blocks, and value blocks with no yielding path
+remain outside the body subset. Guard assignments, moves, mutable borrows, and
+Result exits cause explicit fallback.
 Lowering is not a complete type checker or proof of safety. Tests keep examples
 where initialization succeeds but borrowing correctly fails in production.
 
-The representative corpus now uses an explicit `x86_64-unknown-linux-gnu` package
-target so hosted dependencies are independent of test hosts. After combining the
-range-loop/negation and collection foreach extensions, a sample run reports:
+The representative corpus now uses an explicit `x86_64-unknown-linux-gnu`
+package-loading target, so its hosted dependencies are comparable across hosts.
+Sampled runs on main with range and collection loops and after the tagged-value
+extension produced:
 
-| Outcome / first blocker | Bodies |
-| --- | ---: |
-| Analyzed without findings | 34 |
-| Initialization/move findings | 1 |
-| Skipped bodies | 221 |
-| Function declaration | 148 |
-| Type | 43 |
-| Struct declaration | 12 |
-| Unsupported construct | 12 |
-| Statement | 2 |
-| Expression | 4 |
+| Outcome / first blocker | Before | After |
+| --- | ---: | ---: |
+| Analyzed without findings | 34 | 55 |
+| Initialization/move findings | 1 | 1 |
+| Skipped bodies | 221 | 204 |
+| Function declaration | 148 | 154 |
+| Type | 43 | 4 |
+| Struct declaration | 12 | 1 |
+| Unsupported construct | 12 | 24 |
+| Statement | 2 | 3 |
+| Expression | 4 | 18 |
 
-`bytes.starts_with`, `bytes.ends_with`, `bytes.equal`, `bytes.compare`,
-`bytes.fill`, and `bytes.reverse` are analyzed. Prepared generic method instance
-counts, and consequently function-declaration skips and total skipped bodies,
-can vary between runs; coverage regressions require these six dependency bodies
-to be analyzed without findings. `fibonacci_known_sequence` now lowers its
-collection loop and reaches the assertion intrinsic blocker; its body still
-requires fallback (and contains a cast). Match patterns remain the first blocker
-in `io.transfer` and `patterns.category`. Result signatures still account for
-many type skips, but propagation requires additional payload and early-return
-modeling. These counts identify the next incremental
-step, not a promise that removing one blocker completes each body. Coverage
-regressions also require Fibonacci's newly exposed assertion blocker.
-Differential loop fixtures exercise both loop forms and their nesting,
-evaluation order, fresh bindings, zero-iteration joins, loop exits, and cleanup
-without claiming borrow safety.
+Prepared generic specialization counts and consequently function-declaration
+skips and total skipped bodies vary between runs; assertions lock down named
+outcomes instead of total counts. `patterns.unpack` and `patterns.category` are newly analyzed, along with
+`ascii.digit_value`, `ascii.hex_value`, `num.checked_sub`, `num.checked_div`,
+`num.checked_rem`, `num.align_up`, `io.failure`, `text.validate`,
+`text.encoded_len`, `text.parse_u64`, and several plain error/adapter helpers.
+`io.transfer` now reaches the implicit mutable-reborrow restriction instead of
+its match blocker. `bytes.copy_from` is now analyzed because its Result signature
+and range loop are both supported. Coverage also preserves analysis of
+`bytes.equal`, `bytes.compare`, `bytes.fill`, and `bytes.reverse` from the
+range-loop extension. `fibonacci_known_sequence` lowers its collection loop and
+reaches the assertion intrinsic blocker; its body still requires fallback and
+contains a cast. Differential fixtures exercise range and collection loop
+nesting, fresh bindings, zero-iteration joins, loop exits, and cleanup.
+Casts and implicit mutable reborrows remain subsequent incremental work;
+removing one restriction does not necessarily complete a body.
 
 This is the first production adoption stage: graph findings can reject a body
 after the existing checks succeed, while existing accepted/rejected behavior is

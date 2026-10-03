@@ -1,5 +1,5 @@
 //! Whole-local control-flow analysis, adopted as an additional check for the
-//! supported subset. Borrow safety, Results, and native destruction remain with
+//! supported subset. Borrow safety, Result obligations, and native destruction remain with
 //! the AST checker/backend. See docs/sema-flow-prototype.md.
 mod lower;
 mod report;
@@ -49,6 +49,35 @@ pub enum Projection {
     Deref,
     Index(Place),
 }
+/// Paths into a matched temporary. They never establish partial-move facts on
+/// user storage: owned scrutinees have already moved into a whole local.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PatternProjection {
+    Deref,
+    Field(String),
+    Payload { variant: String, index: usize },
+}
+#[derive(Clone, Debug)]
+pub enum PatternTest {
+    Variant(String),
+    Bool(bool),
+    Int(u64),
+    Range(u64, u64, bool),
+}
+#[derive(Clone, Debug)]
+pub struct PayloadBinding {
+    pub target: Place,
+    pub projections: Vec<PatternProjection>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatternMode {
+    /// Non-owning guard values. Ownership transfers only after a true guard.
+    Preview,
+    /// Transfer selected payloads and discard the remainder of the temporary.
+    /// This is an abstract whole-slot consumption, not a native drop plan.
+    Owned,
+    Borrowed(bool),
+}
 #[derive(Clone, Debug)]
 pub enum Operation {
     Assign {
@@ -58,6 +87,24 @@ pub enum Operation {
     Aggregate {
         target: Place,
         elements: Vec<Operand>,
+    },
+    Tagged {
+        target: Place,
+        variant: String,
+        fields: Vec<Operand>,
+    },
+    PatternTest {
+        target: Place,
+        source: Place,
+        projections: Vec<PatternProjection>,
+        test: PatternTest,
+    },
+    /// Tests and previews preserve the subject; an owned commit consumes it
+    /// once, initializing all selected payload slots together.
+    PatternBind {
+        source: Operand,
+        bindings: Vec<PayloadBinding>,
+        mode: PatternMode,
     },
     Borrow {
         target: Place,
@@ -295,11 +342,28 @@ impl Body {
                     operand(value, state, span, issue);
                     state[target.0] = Availability::initialized();
                 }
-                Operation::Aggregate { target, elements } => {
+                Operation::Aggregate { target, elements }
+                | Operation::Tagged {
+                    target,
+                    fields: elements,
+                    ..
+                } => {
                     for element in elements {
                         operand(element, state, span, issue);
                     }
                     state[target.0] = Availability::initialized();
+                }
+                Operation::PatternTest { target, source, .. } => {
+                    read(*source, state, span, issue);
+                    state[target.0] = Availability::initialized();
+                }
+                Operation::PatternBind {
+                    source, bindings, ..
+                } => {
+                    operand(source, state, span, issue);
+                    for binding in bindings {
+                        state[binding.target.0] = Availability::initialized();
+                    }
                 }
                 Operation::Borrow {
                     target,
