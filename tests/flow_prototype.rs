@@ -6,6 +6,8 @@ use sema::flow;
 
 #[path = "flow_prototype/reporting.rs"]
 mod reporting;
+#[path = "flow_prototype/tagged.rs"]
+mod tagged;
 
 fn compare(source: &str, production_error: Option<&str>, uninitialized: &[&str]) -> flow::Body {
     let program = parser::parse(&format!("package experiment\n{source}")).unwrap();
@@ -296,17 +298,13 @@ fn unsupported_and_ill_typed_inputs_never_produce_analysis_success() {
             "fn f() { for i := 0; true; i += 1 {} }",
             "statement outside subset",
         ),
-        (
-            "fn f(x: bool) { match x { true => {} false => {} } }",
-            "statement outside subset",
-        ),
         ("fn f() { unsafe {} }", "statement outside subset"),
         ("fn f<T>(x: T) {}", "generics"),
         (
             "struct S { u8 n\nfn drop(&mut self) {} }\nfn f(s: S) {}",
             "destructors",
         ),
-        ("struct S { &u8 n }\nfn f(s: S) {}", "scalar fields"),
+        ("struct S { &u8 n }\nfn f(s: S) {}", "type is outside"),
         ("fn f(x: &u8) -> &u8 { return x }", "borrowed returns"),
         (
             "fn f() { x := 1u8\n_ = x as u32 }",
@@ -640,7 +638,7 @@ fn value_block_moves_its_result_out_before_cleaning_up_locals() {
         result
             .cleanup
             .iter()
-            .any(|site| body.locals[site.place.0].name == "$value"
+            .any(|site| body.locals[site.place.0].name == "$yield"
                 && site.kind == flow::CleanupKind::Always)
     );
 }

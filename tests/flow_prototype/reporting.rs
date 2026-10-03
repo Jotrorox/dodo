@@ -100,7 +100,7 @@ fn referenced_declarations_fall_back_only_for_the_dependent_body() {
             "_ = N",
             LimitationKind::UnsupportedConstruct,
         ),
-        ("enum E { A }", "E value", LimitationKind::Type),
+        ("enum E { A(&u8) }", "E value", LimitationKind::Enums),
         (
             "struct S { &u8 value }",
             "S value",
@@ -290,7 +290,7 @@ fn failed_lowering_discards_all_partial_findings_and_does_not_poison_other_bodie
 
     // A referenced unsupported declaration also leaves AST checking active,
     // and discards initialization findings from the already lowered prefix.
-    let program = parse("enum E { A }\nfn f() { u8 x\n_ = x\nE value }");
+    let program = parse("enum E { A(&u8) }\nfn f() { u8 x\n_ = x\nE value }");
     let comparison = flow::compare_checkers(&program, 64);
     assert!(comparison.flow.diagnostics.is_empty());
     assert!(matches!(
@@ -409,8 +409,11 @@ fn representative_corpus_coverage() {
         ("examples/diagnostics/moved_value.dodo", Some("moved")),
         ("examples/diagnostics/return_source.dodo", Some("return")),
     ] {
-        let mut loaded =
-            package::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture)).unwrap();
+        let mut loaded = package::load_for_target(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture),
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
         let report = flow::check_with_report(&mut loaded.program, 64);
         match expected_error {
             None => assert!(
@@ -427,6 +430,11 @@ fn representative_corpus_coverage() {
                 report.diagnostics
             ),
         }
+        if fixture == "examples/patterns.dodo" {
+            for name in ["unpack", "category"] {
+                assert_eq!(status(&report, name), &BodyStatus::Analyzed);
+            }
+        }
         if fixture == "examples/hello.dodo" {
             // These loaded dependency bodies include qualified direct calls.
             // Import provenance and package qualification are not limitations.
@@ -436,9 +444,23 @@ fn representative_corpus_coverage() {
                 "ascii.to_uppercase",
                 "bytes.starts_with",
                 "bytes.ends_with",
+                "ascii.digit_value",
+                "ascii.hex_value",
+                "num.checked_sub",
+                "num.checked_div",
+                "num.checked_rem",
+                "num.align_up",
+                "io.failure",
+                "text.validate",
+                "text.encoded_len",
+                "text.parse_u64",
             ] {
                 assert_eq!(status(&report, name), &BodyStatus::Analyzed);
             }
+            let BodyStatus::Skipped { limitation, .. } = status(&report, "io.transfer") else {
+                panic!("expected mutable reborrow fallback for io.transfer");
+            };
+            assert!(limitation.reason.contains("implicit mutable reborrow"));
             // Arrays/slices no longer hide the next concrete body blocker.
             for name in [
                 "bytes.equal",
