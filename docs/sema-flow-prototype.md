@@ -101,6 +101,19 @@ Nested expressions, value-block assignments, and loop back edges use the same
 joins. Literal conditions deliberately keep both successors, matching the
 conservative AST checker and ensuring skipped syntax is still checked.
 
+Collection foreach evaluates and captures its array or slice once before the
+loop header, without consuming the owner or a stored mutable view. Projection
+indices, slice bounds, and value-block effects run in source order before any
+iteration, and their evaluation temporaries are cleaned up before the header.
+The captured view survives until loop exit. An `Iteration` operation reads it
+and initializes fresh `usize` index and element slots on every body entry.
+Elements are shared/exclusive references, or copied values for `&value` patterns;
+discarded copy elements create no binding. The graph retains both loop-header
+successors, including a conservative zero-iteration path for fixed arrays.
+Iteration bindings and body locals are cleaned up before fallthrough and
+continue back edges, and before break exits. The captured collection is cleaned
+up after break or exhaustion, and together with all departing scopes on return.
+
 Whole-binding assignment does not read the destination; it evaluates the RHS,
 conditionally cleans up the previous slot, and writes the new value. For fields
 and checked-reference dereferences, an explicit capture reads the initialized
@@ -125,8 +138,9 @@ The adapter supports Boolean/integer scalars, structs with scalar fields, arrays
 of those values (including nested arrays), direct references and slices of those
 values, struct and array literals, whole-local moves, direct calls, scalar
 operators (including signed integer negation), field/dereference/index reads and
-assignments, array/slice `.len`, slice expressions, compound assignments, plain value blocks
-with a final value, blocks, `if`, basic `for`, integer range foreach, return,
+assignments, array/slice `.len`, slice expressions, compound assignments, plain
+value blocks with a final value, blocks, `if`, basic `for`, integer range foreach,
+array/slice foreach (including indexed, reference, and shared copy forms), return,
 break, and continue.
 Reference and slice arguments requiring implicit mutable reborrowing are still
 excluded. Projected moves are rejected explicitly. Array literals transfer their
@@ -149,9 +163,9 @@ Array lengths must already be resolved. Repetition expressions and some inferred
 literal forms still require fallback. Arrays and slice elements containing
 references or custom destructors remain excluded. Index/bound evaluation records
 initialization effects; bounds safety, slice provenance, captured-address
-reservations, and loan conflicts remain responsibilities of the existing
-checker/backend. Abstract cleanup records slot availability only; it does not
-schedule array element destruction.
+reservations, collection/element loan lifetimes, and loan conflicts remain
+responsibilities of the existing checker/backend. Abstract cleanup records slot
+availability only; it does not schedule array element destruction.
 
 Imports and unrelated globals, enums, structs, and functions do not restrict
 analysis. Imported free functions and their qualified direct calls use the same
@@ -161,38 +175,42 @@ still require fallback for the affected function and its callers. Referenced
 structs must have distinct scalar fields, no generic parameters, and no custom
 destructor; this applies to signatures, locals, literals, and callee signatures.
 Ambiguous referenced names also require fallback. Casts, Result propagation,
-patterns, collection foreach, for-init/step, unsafe blocks, diverging value blocks,
-and nested yield exits are outside the body subset.
+patterns, for-init/step, unsafe blocks, diverging value blocks, and nested yield
+exits are outside the body subset.
 Lowering is not a complete type checker or proof of safety. Tests keep examples
 where initialization succeeds but borrowing correctly fails in production.
 
-The representative corpus was rerun after the range-loop/negation extension:
+The representative corpus now uses an explicit `x86_64-unknown-linux-gnu` package
+target so hosted dependencies are independent of test hosts. After combining the
+range-loop/negation and collection foreach extensions, a sample run reports:
 
-| Outcome / first blocker | Before | After |
-| --- | ---: | ---: |
-| Analyzed without findings | 30 | 34 |
-| Initialization/move findings | 1 | 1 |
-| Skipped bodies | 229 | 225 |
-| Function declaration | 152 | 152 |
-| Type | 43 | 43 |
-| Struct declaration | 12 | 12 |
-| Unsupported construct | 11 | 11 |
-| Statement | 7 | 3 |
-| Expression | 4 | 4 |
+| Outcome / first blocker | Bodies |
+| --- | ---: |
+| Analyzed without findings | 34 |
+| Initialization/move findings | 1 |
+| Skipped bodies | 221 |
+| Function declaration | 148 |
+| Type | 43 |
+| Struct declaration | 12 |
+| Unsupported construct | 12 |
+| Statement | 2 |
+| Expression | 4 |
 
-`bytes.equal`, `bytes.compare`, `bytes.fill`, and `bytes.reverse` are newly
-analyzed, completing the previously selected range-iteration step. Coverage
-regressions require all four bodies, plus `bytes.starts_with` and
-`bytes.ends_with`, to be analyzed without findings. These are sample counts;
-prepared generic method instance counts, and consequently function-declaration
-skips and total skipped bodies, vary between runs. The four new analyzed bodies
-and the reduction in statement skips are stable.
-
-Collection foreach remains exposed in `fibonacci_known_sequence`, and match
-patterns in `io.transfer` and `patterns.category`. Result signatures still account
-for many type skips, but propagation requires additional payload and early-return
-modeling. These first blockers identify remaining incremental work, not a promise
-that removing one blocker completes each body.
+`bytes.starts_with`, `bytes.ends_with`, `bytes.equal`, `bytes.compare`,
+`bytes.fill`, and `bytes.reverse` are analyzed. Prepared generic method instance
+counts, and consequently function-declaration skips and total skipped bodies,
+can vary between runs; coverage regressions require these six dependency bodies
+to be analyzed without findings. `fibonacci_known_sequence` now lowers its
+collection loop and reaches the assertion intrinsic blocker; its body still
+requires fallback (and contains a cast). Match patterns remain the first blocker
+in `io.transfer` and `patterns.category`. Result signatures still account for
+many type skips, but propagation requires additional payload and early-return
+modeling. These counts identify the next incremental
+step, not a promise that removing one blocker completes each body. Coverage
+regressions also require Fibonacci's newly exposed assertion blocker.
+Differential loop fixtures exercise both loop forms and their nesting,
+evaluation order, fresh bindings, zero-iteration joins, loop exits, and cleanup
+without claiming borrow safety.
 
 This is the first production adoption stage: graph findings can reject a body
 after the existing checks succeed, while existing accepted/rejected behavior is

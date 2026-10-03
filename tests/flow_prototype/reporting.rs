@@ -431,6 +431,16 @@ fn representative_corpus_coverage() {
                 report.diagnostics
             ),
         }
+        if fixture == "examples/fibonacci.dodo" {
+            // Foreach now lowers; the assertion intrinsic is the next blocker.
+            let BodyStatus::Skipped { limitation, .. } =
+                status(&report, "fibonacci_known_sequence")
+            else {
+                panic!("expected the remaining assertion fallback");
+            };
+            assert_eq!(limitation.kind, LimitationKind::UnsupportedConstruct);
+            assert!(limitation.reason.contains("intrinsic call"));
+        }
         if fixture == "examples/hello.dodo" {
             // These loaded dependency bodies include qualified direct calls.
             // Import provenance and package qualification are not limitations.
