@@ -50,7 +50,9 @@ and lowering stop at the first restriction, and a program restriction counts onc
 for each eligible body it excludes. Per-body messages provide further detail.
 
 Run the bounded representative corpus (real examples, diagnostic fixtures, and
-loaded bundled imports) with per-body statuses and a ranked fallback summary:
+loaded bundled imports) with per-body statuses and a ranked fallback summary.
+The corpus explicitly loads the `x86_64-unknown-linux-gnu` target so hosted
+imports are independent of the machine running the frontend tests:
 
 ```sh
 cargo test --locked --no-default-features --test flow_prototype representative_corpus_coverage -- --nocapture
@@ -135,15 +137,27 @@ plan, and the LLVM backend does not consume them yet.
 The adapter supports Boolean/integer scalars, structs with scalar fields, arrays
 of those values (including nested arrays), direct references and slices of those
 values, struct and array literals, whole-local moves, direct calls, scalar
-operators (except unary negation), field/dereference/index reads and assignments,
-array/slice `.len`, slice expressions, compound assignments, plain value blocks
-with a final value, blocks, `if`, basic `for`, array/slice foreach (including
-indexed, reference, and shared copy forms), return, break, and continue.
+operators (including signed integer negation), field/dereference/index reads and
+assignments, array/slice `.len`, slice expressions, compound assignments, plain
+value blocks with a final value, blocks, `if`, basic `for`, integer range foreach,
+array/slice foreach (including indexed, reference, and shared copy forms), return,
+break, and continue.
 Reference and slice arguments requiring implicit mutable reborrowing are still
 excluded. Projected moves are rejected explicitly. Array literals transfer their
 elements left to right; moving an array kills the whole binding, and only a
 whole-binding assignment restores it. Writing an element requires an initialized
 base and does not establish element-level or whole-array initialization.
+
+Range bounds have a common integer type, inferred without evaluating them. They
+execute once, left to right, before the loop header, and their captured values
+survive every back edge. Each iteration initializes a fresh scoped value binding
+from a separate counter; `_` omits that binding. Reassigning the binding does not
+change the counter. Continue cleans up iteration locals and reaches the increment;
+break skips the increment and exits the range scope. The header keeps both
+successors, including for literal empty/reversed ranges, so assignments in the
+body never establish initialization on the zero-iteration path. Signed negation
+preserves operand reads/effects and accepts minimum-value literals using the
+selected target width (for example, `-128i8` and 32-bit `-2147483648isize`).
 
 Array lengths must already be resolved. Repetition expressions and some inferred
 literal forms still require fallback. Arrays and slice elements containing
@@ -151,8 +165,7 @@ references or custom destructors remain excluded. Index/bound evaluation records
 initialization effects; bounds safety, slice provenance, captured-address
 reservations, collection/element loan lifetimes, and loan conflicts remain
 responsibilities of the existing checker/backend. Abstract cleanup records slot
-availability only; it does not
-schedule array element destruction.
+availability only; it does not schedule array element destruction.
 
 Imports and unrelated globals, enums, structs, and functions do not restrict
 analysis. Imported free functions and their qualified direct calls use the same
@@ -162,41 +175,42 @@ still require fallback for the affected function and its callers. Referenced
 structs must have distinct scalar fields, no generic parameters, and no custom
 destructor; this applies to signatures, locals, literals, and callee signatures.
 Ambiguous referenced names also require fallback. Casts, Result propagation,
-patterns, range foreach, for-init/step, unsafe blocks, diverging value blocks, and nested
-yield exits are outside the body subset.
+patterns, for-init/step, unsafe blocks, diverging value blocks, and nested yield
+exits are outside the body subset.
 Lowering is not a complete type checker or proof of safety. Tests keep examples
 where initialization succeeds but borrowing correctly fails in production.
 
 The representative corpus now uses an explicit `x86_64-unknown-linux-gnu` package
-target so hosted dependencies and counts are stable across test hosts. After the
-collection foreach extension it reports:
+target so hosted dependencies are independent of test hosts. After combining the
+range-loop/negation and collection foreach extensions, a sample run reports:
 
 | Outcome / first blocker | Bodies |
 | --- | ---: |
-| Analyzed without findings | 30 |
+| Analyzed without findings | 34 |
 | Initialization/move findings | 1 |
-| Skipped bodies | 225 |
+| Skipped bodies | 221 |
 | Function declaration | 148 |
 | Type | 43 |
 | Struct declaration | 12 |
 | Unsupported construct | 12 |
-| Statement | 6 |
+| Statement | 2 |
 | Expression | 4 |
 
-`bytes.starts_with` and `bytes.ends_with` remain analyzed. Range foreach iteration
-remains the explicit first blocker for `bytes.equal`, `bytes.compare`,
-`bytes.fill`, and `bytes.reverse`. `fibonacci_known_sequence` now lowers its
+`bytes.starts_with`, `bytes.ends_with`, `bytes.equal`, `bytes.compare`,
+`bytes.fill`, and `bytes.reverse` are analyzed. Prepared generic method instance
+counts, and consequently function-declaration skips and total skipped bodies,
+can vary between runs; coverage regressions require these six dependency bodies
+to be analyzed without findings. `fibonacci_known_sequence` now lowers its
 collection loop and reaches the assertion intrinsic blocker; its body still
 requires fallback (and contains a cast). Match patterns remain the first blocker
-in `io.transfer` and `patterns.category`. Result
-signatures still account for many type skips, but propagation requires additional
-payload and early-return modeling. These counts identify the next incremental
-step, not a promise that removing one blocker completes each body (for example,
-`bytes.compare` also contains unary negation). Coverage regressions assert the
-analyzed dependency bodies, remaining range-loop blockers, and Fibonacci's newly
-exposed assertion blocker. Differential collection-loop fixtures separately
-exercise supported forms, evaluation order, fresh bindings, zero-iteration
-joins, loop exits, and cleanup without claiming borrow safety.
+in `io.transfer` and `patterns.category`. Result signatures still account for
+many type skips, but propagation requires additional payload and early-return
+modeling. These counts identify the next incremental
+step, not a promise that removing one blocker completes each body. Coverage
+regressions also require Fibonacci's newly exposed assertion blocker.
+Differential loop fixtures exercise both loop forms and their nesting,
+evaluation order, fresh bindings, zero-iteration joins, loop exits, and cleanup
+without claiming borrow safety.
 
 This is the first production adoption stage: graph findings can reject a body
 after the existing checks succeed, while existing accepted/rejected behavior is

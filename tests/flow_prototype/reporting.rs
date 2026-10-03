@@ -397,6 +397,7 @@ fn representative_corpus_coverage() {
     let (mut analyzed, mut findings, mut skipped) = (0, 0, 0);
     // Use the package loader (including bundled imports), then the actual
     // recovering production pipeline, not independently lowered raw parses.
+    // Pin the corpus target so hosted imports and counts are host-independent.
     for (fixture, expected_error) in [
         ("examples/fibonacci.dodo", None),
         ("examples/patterns.dodo", None),
@@ -409,8 +410,6 @@ fn representative_corpus_coverage() {
         ("examples/diagnostics/moved_value.dodo", Some("moved")),
         ("examples/diagnostics/return_source.dodo", Some("return")),
     ] {
-        // Keep this corpus stable across hosts, including hosted dependencies
-        // that cannot be loaded for the native macOS target.
         let mut loaded = package::load_for_target(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture),
             "x86_64-unknown-linux-gnu",
@@ -451,21 +450,12 @@ fn representative_corpus_coverage() {
                 "ascii.to_uppercase",
                 "bytes.starts_with",
                 "bytes.ends_with",
-            ] {
-                assert_eq!(status(&report, name), &BodyStatus::Analyzed);
-            }
-            // Arrays/slices no longer hide the next concrete body blocker.
-            for name in [
                 "bytes.equal",
                 "bytes.compare",
                 "bytes.fill",
                 "bytes.reverse",
             ] {
-                let BodyStatus::Skipped { limitation, .. } = status(&report, name) else {
-                    panic!("expected range iteration fallback for {name}");
-                };
-                assert_eq!(limitation.kind, LimitationKind::Statement);
-                assert!(limitation.reason.contains("range foreach iteration"));
+                assert_eq!(status(&report, name), &BodyStatus::Analyzed, "{name}");
             }
             assert!(matches!(
                 status(&report, "console.Input.read"),

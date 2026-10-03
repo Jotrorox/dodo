@@ -220,6 +220,26 @@ fn foreach_joins_zero_iterations_breaks_and_continue_back_edges() {
 }
 
 #[test]
+fn range_and_collection_loops_preserve_nested_exit_targets() {
+    for source in [
+        "fn f(a: &[u8], b: bool) { for &value in a { for i in 0usize..a.len { if b { continue }\n_ = i }\nif b { continue }\n_ = value } }",
+        "fn f(a: &[u8], b: bool) { for i in 0usize..a.len { for value in a { if b { continue }\nbreak }\nif b { continue }\n_ = i } }",
+    ] {
+        compare(source, None, &[]);
+    }
+    for loops in [
+        "for value in a { for i in 0..2 { take(s)\nbreak } }",
+        "for i in 0..2 { for value in a { take(s)\nbreak } }",
+    ] {
+        compare(
+            &format!("struct S {{ u8 n }}\nfn take(s: S) {{}}\nfn f(a: &[u8], s: S) {{ {loops} }}"),
+            Some("moved in a loop"),
+            &["s"],
+        );
+    }
+}
+
+#[test]
 fn foreach_cleanup_respects_collection_and_iteration_lifetimes() {
     for exit in ["break", "continue", "return"] {
         let body = compare(
@@ -357,7 +377,7 @@ fn foreach_borrow_safety_stays_with_the_ast_checker() {
 #[test]
 fn unsupported_foreach_forms_and_late_body_failures_discard_the_graph() {
     for (source, reason) in [
-        ("fn f() { for i in 0..2 {} }", "range foreach iteration"),
+        ("fn f() { for &i in 0..2 {} }", "one integer value binding"),
         (
             "struct S { u8 n }\nfn f(a: [2]S) { for &value in a {} }",
             "copyable",
