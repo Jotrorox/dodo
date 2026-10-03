@@ -50,7 +50,9 @@ and lowering stop at the first restriction, and a program restriction counts onc
 for each eligible body it excludes. Per-body messages provide further detail.
 
 Run the bounded representative corpus (real examples, diagnostic fixtures, and
-loaded bundled imports) with per-body statuses and a ranked fallback summary:
+loaded bundled imports) with per-body statuses and a ranked fallback summary.
+The corpus explicitly loads the `x86_64-unknown-linux-gnu` target so hosted
+imports are independent of the machine running the frontend tests:
 
 ```sh
 cargo test --locked --no-default-features --test flow_prototype representative_corpus_coverage -- --nocapture
@@ -122,14 +124,26 @@ plan, and the LLVM backend does not consume them yet.
 The adapter supports Boolean/integer scalars, structs with scalar fields, arrays
 of those values (including nested arrays), direct references and slices of those
 values, struct and array literals, whole-local moves, direct calls, scalar
-operators (except unary negation), field/dereference/index reads and assignments,
-array/slice `.len`, slice expressions, compound assignments, plain value blocks
-with a final value, blocks, `if`, basic `for`, return, break, and continue.
+operators (including signed integer negation), field/dereference/index reads and
+assignments, array/slice `.len`, slice expressions, compound assignments, plain value blocks
+with a final value, blocks, `if`, basic `for`, integer range foreach, return,
+break, and continue.
 Reference and slice arguments requiring implicit mutable reborrowing are still
 excluded. Projected moves are rejected explicitly. Array literals transfer their
 elements left to right; moving an array kills the whole binding, and only a
 whole-binding assignment restores it. Writing an element requires an initialized
 base and does not establish element-level or whole-array initialization.
+
+Range bounds have a common integer type, inferred without evaluating them. They
+execute once, left to right, before the loop header, and their captured values
+survive every back edge. Each iteration initializes a fresh scoped value binding
+from a separate counter; `_` omits that binding. Reassigning the binding does not
+change the counter. Continue cleans up iteration locals and reaches the increment;
+break skips the increment and exits the range scope. The header keeps both
+successors, including for literal empty/reversed ranges, so assignments in the
+body never establish initialization on the zero-iteration path. Signed negation
+preserves operand reads/effects and accepts minimum-value literals using the
+selected target width (for example, `-128i8` and 32-bit `-2147483648isize`).
 
 Array lengths must already be resolved. Repetition expressions and some inferred
 literal forms still require fallback. Arrays and slice elements containing
@@ -147,35 +161,38 @@ still require fallback for the affected function and its callers. Referenced
 structs must have distinct scalar fields, no generic parameters, and no custom
 destructor; this applies to signatures, locals, literals, and callee signatures.
 Ambiguous referenced names also require fallback. Casts, Result propagation,
-patterns, foreach, for-init/step, unsafe blocks, diverging value blocks, and nested
-yield exits are outside the body subset.
+patterns, collection foreach, for-init/step, unsafe blocks, diverging value blocks,
+and nested yield exits are outside the body subset.
 Lowering is not a complete type checker or proof of safety. Tests keep examples
 where initialization succeeds but borrowing correctly fails in production.
 
-The representative corpus was rerun after the array/index/slice extension:
+The representative corpus was rerun after the range-loop/negation extension:
 
 | Outcome / first blocker | Before | After |
 | --- | ---: | ---: |
-| Analyzed without findings | 28 | 30 |
+| Analyzed without findings | 30 | 34 |
 | Initialization/move findings | 1 | 1 |
-| Skipped bodies | 231 | 229 |
+| Skipped bodies | 229 | 225 |
 | Function declaration | 152 | 152 |
-| Type | 50 | 43 |
+| Type | 43 | 43 |
 | Struct declaration | 12 | 12 |
 | Unsupported construct | 11 | 11 |
-| Statement | 1 | 7 |
-| Expression | 5 | 4 |
+| Statement | 7 | 3 |
+| Expression | 4 | 4 |
 
-`bytes.starts_with` and `bytes.ends_with` are newly analyzed. The next selected
-construct is **range foreach iteration**: `bytes.equal`, `bytes.compare`,
-`bytes.fill`, and `bytes.reverse` now reach that explicit first blocker. Collection
-foreach is exposed in `fibonacci_known_sequence`, and match patterns in
-`io.transfer`; the existing `patterns.category` match blocker remains. Result
-signatures still account for many type skips, but propagation requires additional
-payload and early-return modeling. These counts identify the next incremental
-step, not a promise that removing one blocker completes each body (for example,
-`bytes.compare` also contains unary negation). Coverage regressions assert the
-newly analyzed bodies and the four newly exposed range-loop blockers.
+`bytes.equal`, `bytes.compare`, `bytes.fill`, and `bytes.reverse` are newly
+analyzed, completing the previously selected range-iteration step. Coverage
+regressions require all four bodies, plus `bytes.starts_with` and
+`bytes.ends_with`, to be analyzed without findings. These are sample counts;
+prepared generic method instance counts, and consequently function-declaration
+skips and total skipped bodies, vary between runs. The four new analyzed bodies
+and the reduction in statement skips are stable.
+
+Collection foreach remains exposed in `fibonacci_known_sequence`, and match
+patterns in `io.transfer` and `patterns.category`. Result signatures still account
+for many type skips, but propagation requires additional payload and early-return
+modeling. These first blockers identify remaining incremental work, not a promise
+that removing one blocker completes each body.
 
 This is the first production adoption stage: graph findings can reject a body
 after the existing checks succeed, while existing accepted/rejected behavior is

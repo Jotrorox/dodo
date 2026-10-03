@@ -172,6 +172,214 @@ fn loop_exit_initialization_agrees() {
 }
 
 #[test]
+fn range_loops_preserve_zero_iteration_and_exit_initialization() {
+    compare(
+        "fn f(n: u8) -> u8 { x := 0u8\nfor i in 0..n { x += i }\nreturn x }",
+        None,
+        &[],
+    );
+    for bounds in ["0..2", "2..2", "3..2"] {
+        compare(
+            &format!("fn f() -> u8 {{ u8 x\nfor i in {bounds} {{ x = 1\nbreak }}\nreturn x }}"),
+            Some("uninitialized"),
+            &["x"],
+        );
+    }
+    compare(
+        "fn f() { for i in 0..2 { u8 x\nif i == 0 { x = 1 }\n_ = x } }",
+        Some("uninitialized"),
+        &["x"],
+    );
+}
+
+#[test]
+fn range_loop_moves_follow_back_edges_and_nested_exits() {
+    let prefix = "struct S { u8 n }\nfn take(s: S) {}\n";
+    for (body, error, issues) in [
+        (
+            "fn f(s: S) { for i in 0..2 { take(s) } }",
+            Some("moved in a loop"),
+            vec!["s"],
+        ),
+        (
+            "fn f(s: S, b: bool) { for i in 0..2 { if b { take(s)\ncontinue } } }",
+            Some("moved in a loop"),
+            vec!["s"],
+        ),
+        (
+            "fn f(s: S) { for i in 0..2 { take(s)\ns = S{n: 1}\ncontinue } }",
+            None,
+            vec![],
+        ),
+        (
+            "fn f(s: S) { for i in 0..2 { take(s)\nbreak } }",
+            None,
+            vec![],
+        ),
+        (
+            "fn f(s: S) { for i in 0..2 { take(s)\nreturn } }",
+            None,
+            vec![],
+        ),
+        (
+            "fn f(s: S) { for i in 0..2 { take(s)\nbreak }\ntake(s) }",
+            Some("moved"),
+            vec!["s"],
+        ),
+        (
+            "fn f(s: S) { for i in 0..2 { for j in 0..2 { take(s)\nbreak } } }",
+            Some("moved in a loop"),
+            vec!["s"],
+        ),
+    ] {
+        compare(&format!("{prefix}{body}"), error, &issues);
+    }
+}
+
+#[test]
+fn range_bindings_are_fresh_scoped_values_independent_of_the_counter() {
+    let body = compare(
+        "fn f() -> u8 { i := 7u8\nfor i in -2i8..2i8 { _ = i\ni = 1\ncontinue }\nfor _ in 0..2 {}\nreturn i }",
+        None,
+        &[],
+    );
+    let bindings: Vec<_> = body
+        .locals
+        .iter()
+        .filter(|local| local.name == "i")
+        .collect();
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0].ty, dodoc::ast::Type::u8());
+    assert_eq!(
+        bindings[1].ty,
+        dodoc::ast::Type::Int {
+            signed: true,
+            bits: 8
+        }
+    );
+    let counter = body
+        .locals
+        .iter()
+        .position(|local| local.name == "$range.index")
+        .unwrap();
+    let iteration = body
+        .locals
+        .iter()
+        .position(|local| local.name == "i" && local.ty == bindings[1].ty)
+        .unwrap();
+    let step = body.blocks.iter().position(|block| block.instructions.iter().any(|instruction|
+        matches!(instruction.operation, Operation::Assign { target, value: flow::Operand::Copy(source) }
+            if target == flow::Place(counter) && source == target))).unwrap();
+    let continue_block = body.blocks.iter().find(|block| {
+        matches!(block.terminator, Terminator::Goto(target) if target == step)
+            && block.instructions.iter().any(|instruction|
+                matches!(instruction.operation, Operation::Cleanup(place) if place == flow::Place(iteration)))
+    }).unwrap();
+    assert!(!continue_block.instructions.iter().any(|instruction|
+        matches!(instruction.operation, Operation::Cleanup(place) if place == flow::Place(counter))));
+    let result = body.initialization();
+    assert!(
+        result
+            .cleanup
+            .iter()
+            .filter(|site| site.place == flow::Place(iteration))
+            .all(|site| site.kind == flow::CleanupKind::Always)
+    );
+}
+
+#[test]
+fn range_bounds_execute_once_left_to_right_before_iteration() {
+    let body = compare(
+        "fn first() -> i16 { return -2 }\nfn last() -> i16 { return 2 }\nfn f() { for i in first()..last() { _ = i\ncontinue } }",
+        None,
+        &[],
+    );
+    let calls: Vec<_> =
+        body.blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(id, block)| {
+                block.instructions.iter().filter_map(move |instruction| {
+                    match &instruction.operation {
+                        Operation::Call { function, .. } => Some((id, function.as_str())),
+                        _ => None,
+                    }
+                })
+            })
+            .collect();
+    assert_eq!(calls, [(0, "first"), (0, "last")]);
+    compare(
+        "fn f() -> u8 { u8 x\nfor i in { x = 1\n0 }..{ _ = x\n2 } {}\nreturn x }",
+        None,
+        &[],
+    );
+    compare(
+        "fn f() { u8 x\nfor i in { _ = x\n0 }..{ x = 1\n2 } {} }",
+        Some("uninitialized"),
+        &["x"],
+    );
+    compare(
+        "struct S { u8 n }\nfn bound(s: S) -> u8 { return 2 }\nfn f(s: S) { for i in bound(s)..bound(s) {} }",
+        Some("moved"),
+        &["s"],
+    );
+    compare(
+        "fn f() { u8 n\nfor i in 0..n {} }",
+        Some("uninitialized"),
+        &["n"],
+    );
+}
+
+#[test]
+fn range_bound_type_inference_supports_integer_expressions() {
+    for source in [
+        "fn f(n: u8) { for i in 0..n + 1 { _ = i } }",
+        "fn f(values: &[u8]) { for i in 0..values.len / 2 { _ = values[i] } }",
+        "struct S { i16 n }\nfn f(s: &S) { for i in -1..s.n { _ = i } }",
+        "fn f(n: &i16) { for i in -1..*n { _ = i } }",
+        "fn f(values: &[i16]) { for i in -1..values[0] { _ = i } }",
+    ] {
+        compare(source, None, &[]);
+    }
+}
+
+#[test]
+fn unary_negation_checks_reads_and_signed_minimum_literals() {
+    compare("fn f() -> i8 { return -128 }", None, &[]);
+    compare(
+        "fn f() -> i64 { return -9223372036854775808i64 }",
+        None,
+        &[],
+    );
+    compare("fn f(n: i32) -> i32 { return -n }", None, &[]);
+    compare(
+        "fn f() -> i32 { i32 n\nreturn -n }",
+        Some("uninitialized"),
+        &["n"],
+    );
+    compare("fn f() -> i8 { i8 n\nreturn -{ n = 1\nn } }", None, &[]);
+    for (source, error) in [
+        ("fn f() -> i8 { return -129 }", "out of range"),
+        ("fn f() { _ = -1u8 }", "unary operator"),
+        ("fn f() { _ = -true }", "unary operator"),
+    ] {
+        let program = parser::parse(&format!("package experiment\n{source}")).unwrap();
+        assert!(flow::lower(&program, "f").is_err());
+        let comparison = flow::compare_checkers(&program, 64);
+        for report in [&comparison.ast, &comparison.combined] {
+            assert!(report.diagnostics[0].message.contains(error), "{report:?}");
+        }
+    }
+    let program =
+        parser::parse("package experiment\nfn f() -> isize { return -2147483648 }").unwrap();
+    assert!(flow::lower_for_target(&program, "f", 32).is_ok());
+    let too_small =
+        parser::parse("package experiment\nfn f() -> isize { return -2147483649 }").unwrap();
+    assert!(flow::lower_for_target(&too_small, "f", 32).is_err());
+    assert!(flow::lower_for_target(&too_small, "f", 64).is_ok());
+}
+
+#[test]
 fn moves_on_exiting_loop_paths_do_not_reach_a_back_edge() {
     for exit in ["break", "return"] {
         compare(
@@ -291,7 +499,24 @@ fn unsupported_and_ill_typed_inputs_never_produce_analysis_success() {
     for (source, reason) in [
         ("fn f() { values := [1u8; 2] }", "expression outside subset"),
         ("fn f(values: &[&u8]) {}", "type is outside"),
-        ("fn f() { for x in 0..2 {} }", "statement outside subset"),
+        (
+            "fn f(values: &[u8]) { for x in values {} }",
+            "collection foreach iteration",
+        ),
+        ("fn f() { for &x in 0..2 {} }", "one integer value binding"),
+        (
+            "fn f() { for i, x in 0..2 {} }",
+            "one integer value binding",
+        ),
+        (
+            "fn f() { for x in false..true {} }",
+            "range bounds require integers",
+        ),
+        ("fn f() { for x in 0u8..2u16 {} }", "type mismatch"),
+        (
+            "fn f() { for x in 0..2 { _ = 1u8 as u32 } }",
+            "expression outside subset",
+        ),
         (
             "fn f() { for i := 0; true; i += 1 {} }",
             "statement outside subset",
