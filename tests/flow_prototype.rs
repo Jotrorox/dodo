@@ -7,6 +7,9 @@ use sema::flow;
 #[path = "flow_prototype/reporting.rs"]
 mod reporting;
 
+#[path = "flow_prototype/collection_iteration.rs"]
+mod collection_iteration;
+
 fn compare(source: &str, production_error: Option<&str>, uninitialized: &[&str]) -> flow::Body {
     let program = parser::parse(&format!("package experiment\n{source}")).unwrap();
     let comparison = flow::compare_checkers(&program, 64);

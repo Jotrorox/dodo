@@ -81,6 +81,14 @@ pub enum Operation {
         address: Place,
         value: Operand,
     },
+    /// Read the captured collection and initialize fresh iteration bindings.
+    /// Elements are borrowed, or copied by a shared reference pattern; the
+    /// collection is never consumed. Counter values and bounds are abstract.
+    Iteration {
+        collection: Place,
+        index: Option<Place>,
+        element: Option<Place>,
+    },
     /// Conditional cleanup: kill the slot if initialized; no read obligation.
     /// Custom destructors and reference-containing aggregates are unsupported.
     Cleanup(Place),
@@ -343,6 +351,27 @@ impl Body {
                         if inner.as_ref() == self.operand_type(value)));
                     read(*address, state, span, issue);
                     operand(value, state, span, issue);
+                }
+                Operation::Iteration {
+                    collection,
+                    index,
+                    element,
+                } => {
+                    let Type::Slice(mutable, ty) = &self.locals[collection.0].ty else {
+                        unreachable!("iteration requires a captured slice")
+                    };
+                    read(*collection, state, span, issue);
+                    if let Some(index) = index {
+                        debug_assert_eq!(self.locals[index.0].ty, Type::usize());
+                        state[index.0] = Availability::initialized();
+                    }
+                    if let Some(element) = element {
+                        debug_assert!(
+                            self.locals[element.0].ty == Type::Ref(*mutable, ty.clone())
+                                || (!mutable && ty.is_copy() && self.locals[element.0].ty == **ty)
+                        );
+                        state[element.0] = Availability::initialized();
+                    }
                 }
                 Operation::Cleanup(place) => {
                     let slot = state[place.0];

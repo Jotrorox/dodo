@@ -560,6 +560,155 @@ impl Lower<'_> {
         self.scopes.pop();
         Ok(())
     }
+
+    // Capture collection storage without moving its owner or a stored mutable
+    // view. Projection indices and slice bounds execute only before the loop.
+    fn collection(&mut self, iterable: &Expr, copy: bool) -> Result<Place> {
+        let span = iterable.span;
+        let collection = match &iterable.kind {
+            ExprKind::ValueBlock(block) => {
+                let Some((last, statements)) = block.split_last() else {
+                    return unsupported(span, "empty value block");
+                };
+                let StmtKind::Yield(value) = &last.kind else {
+                    return unsupported(span, "value block requires a final yield");
+                };
+                self.scopes.push(Scope::default());
+                self.statements(statements)?;
+                if self.current.is_none() {
+                    return unsupported(span, "diverging value block is unsupported");
+                }
+                let collection = self.collection(value, copy)?;
+                self.cleanup(self.scopes.len() - 1, Some(collection), span);
+                self.scopes.pop();
+                self.scopes.last_mut().unwrap().locals.push(collection);
+                collection
+            }
+            ExprKind::Slice { .. } | ExprKind::Call { .. } => self.expr(iterable, None)?,
+            _ => {
+                let (destination, mutable, exclusive) = match &iterable.kind {
+                    ExprKind::Unary(op @ (UnaryOp::Borrow | UnaryOp::BorrowMut), source) => {
+                        let mutable = *op == UnaryOp::BorrowMut;
+                        let destination = self.destination(source, mutable)?;
+                        if !matches!(destination.ty, Type::Array(..)) {
+                            return unsupported(span, "foreach borrow requires an array");
+                        }
+                        (destination, mutable, mutable)
+                    }
+                    _ => {
+                        let mut destination = self.destination(iterable, false)?;
+                        // Match sema: bare array places yield shared elements,
+                        // while stored slices retain their element access. An
+                        // exclusive array reference still disallows copying.
+                        let exclusive = matches!(destination.ty, Type::Ref(true, _));
+                        let mutable = matches!(destination.ty, Type::Slice(true, _));
+                        if let Type::Ref(_, inner) = destination.ty {
+                            destination.ty = *inner;
+                            destination.projections.push(Projection::Deref);
+                        }
+                        (destination, mutable, exclusive)
+                    }
+                };
+                let element = match &destination.ty {
+                    Type::Array(_, element) | Type::Slice(_, element) => element.clone(),
+                    _ => return unsupported(span, "foreach requires an array or slice"),
+                };
+                if copy && exclusive {
+                    return unsupported(span, "copy foreach requires shared iteration");
+                }
+                self.capture(destination, span);
+                self.constant(Type::Slice(mutable, element), span)
+            }
+        };
+        let Type::Slice(mutable, element) = &self.body.locals[collection.0].ty else {
+            return unsupported(span, "foreach requires an array or slice");
+        };
+        plain_type(self.program, element, span)?;
+        if copy && (*mutable || !element.is_copy()) {
+            return unsupported(span, "copy foreach requires shared, copyable elements");
+        }
+        Ok(collection)
+    }
+
+    fn foreach(
+        &mut self,
+        index: Option<&str>,
+        name: &str,
+        copy: bool,
+        iterable: &Expr,
+        body: &ast::Block,
+        span: Span,
+    ) -> Result<()> {
+        // The collection has loop lifetime; evaluation temporaries do not.
+        self.scopes.push(Scope::default());
+        let collection = self.collection(iterable, copy)?;
+        self.body.locals[collection.0].name = "$collection".into();
+        self.cleanup(self.scopes.len() - 1, Some(collection), iterable.span);
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .locals
+            .retain(|p| *p == collection);
+        let Type::Slice(mutable, element) = self.body.locals[collection.0].ty.clone() else {
+            unreachable!()
+        };
+
+        let header = self.block_id();
+        let run = self.block_id();
+        let exit = self.block_id();
+        self.end(Terminator::Goto(header), span);
+        self.current = Some(header);
+        // Even fixed arrays retain the conservative zero-iteration path.
+        self.end(
+            Terminator::Branch {
+                condition: Operand::Constant(Type::Bool),
+                yes: run,
+                no: exit,
+            },
+            span,
+        );
+        let depth = self.scopes.len();
+        self.loops.push(Loop {
+            header,
+            exit,
+            depth,
+        });
+        self.current = Some(run);
+        self.scopes.push(Scope::default());
+        let index = index
+            .map(|name| self.bind(name, Type::usize(), true, span))
+            .transpose()?;
+        let element = if copy && name == "_" {
+            None
+        } else {
+            let ty = if copy {
+                *element
+            } else {
+                Type::Ref(mutable, element)
+            };
+            Some(self.bind(name, ty, true, span)?)
+        };
+        self.emit(
+            Operation::Iteration {
+                collection,
+                index,
+                element,
+            },
+            span,
+        );
+        self.statements(body)?;
+        if self.current.is_some() {
+            self.cleanup(depth, None, span);
+            self.end(Terminator::Goto(header), span);
+        }
+        self.scopes.pop();
+        self.loops.pop();
+        self.current = Some(exit);
+        self.cleanup(depth - 1, None, span);
+        self.scopes.pop();
+        Ok(())
+    }
+
     fn statements(&mut self, block: &[ast::Stmt]) -> Result<()> {
         for statement in block {
             if self.current.is_none() {
@@ -744,13 +893,21 @@ impl Lower<'_> {
                     };
                     self.end(Terminator::Goto(target), span);
                 }
-                StmtKind::ForEach { iterable, .. } => {
-                    let reason = if matches!(iterable.kind, ExprKind::Range(..)) {
-                        "statement outside subset (range foreach iteration)"
-                    } else {
-                        "statement outside subset (collection foreach iteration)"
-                    };
-                    return limited(LimitationKind::Statement, span, reason);
+                StmtKind::ForEach {
+                    index,
+                    name,
+                    copy,
+                    iterable,
+                    body,
+                } => {
+                    if matches!(iterable.kind, ExprKind::Range(..)) {
+                        return limited(
+                            LimitationKind::Statement,
+                            span,
+                            "statement outside subset (range foreach iteration)",
+                        );
+                    }
+                    self.foreach(index.as_deref(), name, *copy, iterable, body, span)?;
                 }
                 StmtKind::Match { .. } => {
                     return limited(
@@ -763,7 +920,7 @@ impl Lower<'_> {
                     return limited(
                         LimitationKind::Statement,
                         span,
-                        "statement outside subset (patterns, foreach, for init/step, unsafe, or yield)",
+                        "statement outside subset (patterns, for init/step, unsafe, or yield)",
                     );
                 }
             }

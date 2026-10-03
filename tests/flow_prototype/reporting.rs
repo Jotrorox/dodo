@@ -409,8 +409,13 @@ fn representative_corpus_coverage() {
         ("examples/diagnostics/moved_value.dodo", Some("moved")),
         ("examples/diagnostics/return_source.dodo", Some("return")),
     ] {
-        let mut loaded =
-            package::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture)).unwrap();
+        // Keep this corpus stable across hosts, including hosted dependencies
+        // that cannot be loaded for the native macOS target.
+        let mut loaded = package::load_for_target(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture),
+            "x86_64-unknown-linux-gnu",
+        )
+        .unwrap();
         let report = flow::check_with_report(&mut loaded.program, 64);
         match expected_error {
             None => assert!(
@@ -426,6 +431,16 @@ fn representative_corpus_coverage() {
                 "{fixture}: {:?}",
                 report.diagnostics
             ),
+        }
+        if fixture == "examples/fibonacci.dodo" {
+            // Foreach now lowers; the assertion intrinsic is the next blocker.
+            let BodyStatus::Skipped { limitation, .. } =
+                status(&report, "fibonacci_known_sequence")
+            else {
+                panic!("expected the remaining assertion fallback");
+            };
+            assert_eq!(limitation.kind, LimitationKind::UnsupportedConstruct);
+            assert!(limitation.reason.contains("intrinsic call"));
         }
         if fixture == "examples/hello.dodo" {
             // These loaded dependency bodies include qualified direct calls.
