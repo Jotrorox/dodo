@@ -9,6 +9,9 @@ mod reporting;
 #[path = "flow_prototype/tagged.rs"]
 mod tagged;
 
+#[path = "flow_prototype/collection_iteration.rs"]
+mod collection_iteration;
+
 fn compare(source: &str, production_error: Option<&str>, uninitialized: &[&str]) -> flow::Body {
     let program = parser::parse(&format!("package experiment\n{source}")).unwrap();
     let comparison = flow::compare_checkers(&program, 64);
@@ -502,8 +505,8 @@ fn unsupported_and_ill_typed_inputs_never_produce_analysis_success() {
         ("fn f() { values := [1u8; 2] }", "expression outside subset"),
         ("fn f(values: &[&u8]) {}", "type is outside"),
         (
-            "fn f(values: &[u8]) { for x in values {} }",
-            "collection foreach iteration",
+            "fn f(values: u8) { for x in values {} }",
+            "foreach requires an array or slice",
         ),
         ("fn f() { for &x in 0..2 {} }", "one integer value binding"),
         (

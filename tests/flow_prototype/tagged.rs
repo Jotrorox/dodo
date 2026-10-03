@@ -668,3 +668,52 @@ fn range_loops_combine_patterns_with_result_exits_and_bound_cleanup() {
         &[],
     );
 }
+
+#[test]
+fn collection_loops_combine_borrowed_patterns_with_result_exit_cleanup() {
+    let body = compare(
+        "enum E { Item(Option<u8>), Empty }\nfn limit() -> usize!u8 { return ok(2) }\nfn f(a: [2]E) -> u8!u8 { total := 0u8\nfor i, value in a[..limit()?] { match value { E.Item(some(n)) => { total += *n }, _ => { continue } }\nsaved := some(total)\n_ = limit()?\n_ = saved\n_ = i }\n_ = a.len\nreturn ok(total) }",
+        None,
+        &[],
+    );
+    let errors: Vec<_> = body
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            block.instructions.iter().any(|instruction|
+                matches!(&instruction.operation, Operation::Tagged { variant, .. } if variant == "err")
+            ).then_some(index)
+        })
+        .collect();
+    assert_eq!(errors.len(), 2);
+    let initialization = body.initialization();
+    let cleanup: Vec<_> = initialization
+        .cleanup
+        .iter()
+        .filter(|site| site.block == errors[1])
+        .filter_map(|site| {
+            let name = body.locals[site.place.0].name.as_str();
+            matches!(name, "saved" | "value" | "i" | "$collection" | "a")
+                .then_some((name, site.kind))
+        })
+        .collect();
+    assert_eq!(
+        cleanup,
+        vec![
+            ("saved", CleanupKind::Always),
+            ("value", CleanupKind::Always),
+            ("i", CleanupKind::Always),
+            ("$collection", CleanupKind::Always),
+            ("a", CleanupKind::Always),
+        ]
+    );
+    assert!(
+        initialization
+            .cleanup
+            .iter()
+            .any(|site| site.block == errors[0]
+                && body.locals[site.place.0].name == "a"
+                && site.kind == CleanupKind::Always)
+    );
+}
