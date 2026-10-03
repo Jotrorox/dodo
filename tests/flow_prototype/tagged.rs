@@ -629,3 +629,42 @@ fn pattern_limits_and_enum_fallbacks_remain_body_local() {
         flow::BodyStatus::Analyzed
     );
 }
+
+#[test]
+fn range_loops_combine_patterns_with_result_exits_and_bound_cleanup() {
+    let body = compare(
+        "fn limit() -> u8!u8 { return ok(2) }\nfn f() -> u8!u8 { total := 0u8\nfor i in 0..limit()? { let some(n) = some(i) else { continue }\ntotal += n\n_ = limit()? }\nreturn ok(total) }",
+        None,
+        &[],
+    );
+    let error = body
+        .blocks
+        .iter()
+        .position(|block| {
+            block.instructions.iter().any(|instruction|
+        matches!(&instruction.operation, Operation::Tagged { variant, .. } if variant == "err"))
+        })
+        .unwrap();
+    let initialization = body.initialization();
+    for (name, kind) in [
+        ("$range.index", CleanupKind::Always),
+        ("$range.end", CleanupKind::Never),
+    ] {
+        let slot = body
+            .locals
+            .iter()
+            .position(|local| local.name == name)
+            .unwrap();
+        assert!(
+            initialization
+                .cleanup
+                .iter()
+                .any(|site| site.block == error && site.place.0 == slot && site.kind == kind)
+        );
+    }
+    compare(
+        "fn limit() -> u8!u8 { return ok(2) }\nfn f() { for i in 0..limit()! { _ = i } }",
+        None,
+        &[],
+    );
+}

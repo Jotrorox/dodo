@@ -397,6 +397,7 @@ fn representative_corpus_coverage() {
     let (mut analyzed, mut findings, mut skipped) = (0, 0, 0);
     // Use the package loader (including bundled imports), then the actual
     // recovering production pipeline, not independently lowered raw parses.
+    // Pin the corpus target so hosted imports and counts are host-independent.
     for (fixture, expected_error) in [
         ("examples/fibonacci.dodo", None),
         ("examples/patterns.dodo", None),
@@ -444,6 +445,7 @@ fn representative_corpus_coverage() {
                 "ascii.to_uppercase",
                 "bytes.starts_with",
                 "bytes.ends_with",
+                "bytes.copy_from",
                 "ascii.digit_value",
                 "ascii.hex_value",
                 "num.checked_sub",
@@ -461,18 +463,14 @@ fn representative_corpus_coverage() {
                 panic!("expected mutable reborrow fallback for io.transfer");
             };
             assert!(limitation.reason.contains("implicit mutable reborrow"));
-            // Arrays/slices no longer hide the next concrete body blocker.
+            // Preserve coverage from the range-loop extension on main.
             for name in [
                 "bytes.equal",
                 "bytes.compare",
                 "bytes.fill",
                 "bytes.reverse",
             ] {
-                let BodyStatus::Skipped { limitation, .. } = status(&report, name) else {
-                    panic!("expected range iteration fallback for {name}");
-                };
-                assert_eq!(limitation.kind, LimitationKind::Statement);
-                assert!(limitation.reason.contains("range foreach iteration"));
+                assert_eq!(status(&report, name), &BodyStatus::Analyzed, "{name}");
             }
             assert!(matches!(
                 status(&report, "console.Input.read"),

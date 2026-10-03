@@ -50,7 +50,9 @@ and lowering stop at the first restriction, and a program restriction counts onc
 for each eligible body it excludes. Per-body messages provide further detail.
 
 Run the bounded representative corpus (real examples, diagnostic fixtures, and
-loaded bundled imports) with per-body statuses and a ranked fallback summary:
+loaded bundled imports) with per-body statuses and a ranked fallback summary.
+The corpus explicitly loads the `x86_64-unknown-linux-gnu` target so hosted
+imports are independent of the machine running the frontend tests:
 
 ```sh
 cargo test --locked --no-default-features --test flow_prototype representative_corpus_coverage -- --nocapture
@@ -168,16 +170,27 @@ facts on user storage or a native payload destruction plan.
 The adapter supports Boolean/integer scalars, recursively plain structs/enums,
 Options, Results, arrays of those values (including nested arrays), direct
 references and slices of those values, aggregate and tagged literals, whole-local
-moves, direct calls, scalar operators (except unary negation),
+moves, direct calls, scalar operators (including signed integer negation),
 field/dereference/index reads and assignments, array/slice `.len`, slice
 expressions, compound assignments, value blocks with branch-local yields,
-patterns, Result propagation/unwrap, blocks, `if`, basic `for`, return, break,
+patterns, Result propagation/unwrap, blocks, `if`, basic `for`, integer range foreach, return, break,
 and continue.
 Reference and slice arguments requiring implicit mutable reborrowing are still
 excluded. Projected moves are rejected explicitly. Array literals transfer their
 elements left to right; moving an array kills the whole binding, and only a
 whole-binding assignment restores it. Writing an element requires an initialized
 base and does not establish element-level or whole-array initialization.
+
+Range bounds have a common integer type, inferred without evaluating them. They
+execute once, left to right, before the loop header, and their captured values
+survive every back edge. Each iteration initializes a fresh scoped value binding
+from a separate counter; `_` omits that binding. Reassigning the binding does not
+change the counter. Continue cleans up iteration locals and reaches the increment;
+break skips the increment and exits the range scope. The header keeps both
+successors, including for literal empty/reversed ranges, so assignments in the
+body never establish initialization on the zero-iteration path. Signed negation
+preserves operand reads/effects and accepts minimum-value literals using the
+selected target width (for example, `-128i8` and 32-bit `-2147483648isize`).
 
 Array lengths must already be resolved. Repetition expressions and some inferred
 literal forms still require fallback. Owned aggregates and slice elements containing
@@ -195,7 +208,7 @@ still require fallback for the affected function and its callers. Referenced
 structs/enums must have distinct plain fields/variants, no generic parameters,
 and no custom destructor; this applies to signatures, locals, literals, and
 callee signatures. Ambiguous referenced names also require fallback. Casts,
-foreach, for-init/step, unsafe blocks, and value blocks with no yielding path
+collection foreach, for-init/step, unsafe blocks, and value blocks with no yielding path
 remain outside the body subset. Guard assignments, moves, mutable borrows, and
 Result exits cause explicit fallback.
 Lowering is not a complete type checker or proof of safety. Tests keep examples
@@ -203,31 +216,34 @@ where initialization succeeds but borrowing correctly fails in production.
 
 The representative corpus now uses an explicit `x86_64-unknown-linux-gnu`
 package-loading target, so its hosted dependencies are comparable across hosts.
-A sampled run before and after the tagged-value extension produced:
+Sampled runs on main with range loops and after the tagged-value extension
+produced:
 
 | Outcome / first blocker | Before | After |
 | --- | ---: | ---: |
-| Analyzed without findings | 30 | 49 |
+| Analyzed without findings | 34 | 55 |
 | Initialization/move findings | 1 | 1 |
-| Skipped bodies | 231 | 212 |
-| Function declaration | 154 | 156 |
+| Skipped bodies | 225 | 206 |
+| Function declaration | 152 | 156 |
 | Type | 43 | 4 |
 | Struct declaration | 12 | 1 |
 | Unsupported construct | 11 | 23 |
-| Statement | 7 | 13 |
-| Expression | 4 | 15 |
+| Statement | 3 | 4 |
+| Expression | 4 | 18 |
 
-Prepared generic specialization counts can vary by two excluded
-`fmt.Formatter.bytes` bodies; assertions lock down named outcomes instead of total
-counts. `patterns.unpack` and `patterns.category` are newly analyzed, along with
+Prepared generic specialization counts and consequently function-declaration
+skips and total skipped bodies vary between runs; assertions lock down named
+outcomes instead of total counts. `patterns.unpack` and `patterns.category` are newly analyzed, along with
 `ascii.digit_value`, `ascii.hex_value`, `num.checked_sub`, `num.checked_div`,
 `num.checked_rem`, `num.align_up`, `io.failure`, `text.validate`,
 `text.encoded_len`, `text.parse_u64`, and several plain error/adapter helpers.
 `io.transfer` now reaches the implicit mutable-reborrow restriction instead of
-its match blocker. `bytes.copy_from` reaches range foreach iteration; the
-existing range-loop blockers in `bytes.equal`, `bytes.compare`, `bytes.fill`,
-and `bytes.reverse` remain. These first blockers identify subsequent incremental
-work, not a promise that removing one restriction completes each body.
+its match blocker. `bytes.copy_from` is now analyzed because its Result signature
+and range loop are both supported. Coverage also preserves analysis of
+`bytes.equal`, `bytes.compare`, `bytes.fill`, and `bytes.reverse` from the
+range-loop extension. Collection iteration, casts, and implicit mutable reborrows
+remain subsequent incremental work; removing one restriction does not necessarily
+complete a body.
 
 This is the first production adoption stage: graph findings can reject a body
 after the existing checks succeed, while existing accepted/rejected behavior is

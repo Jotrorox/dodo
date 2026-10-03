@@ -320,7 +320,7 @@ struct Scope {
 }
 #[derive(Clone, Copy)]
 struct Loop {
-    header: BlockId,
+    continue_target: BlockId,
     exit: BlockId,
     depth: usize,
 }
@@ -500,6 +500,212 @@ impl Lower<'_> {
             operands.push(self.operand(value));
         }
         Ok(self.tagged(ty, name.rsplit('.').next().unwrap(), operands, span))
+    }
+
+    fn integer_literal(
+        &mut self,
+        number: u64,
+        suffix: Option<&Type>,
+        expected: Option<&Type>,
+        negative: bool,
+        span: Span,
+    ) -> Result<Place> {
+        let ty = suffix.or(expected).cloned().unwrap_or(Type::isize());
+        let Type::Int { signed, bits } = ty else {
+            return unsupported(span, "integer literal requires integer type");
+        };
+        let bits = if bits == 0 { self.pointer_bits } else { bits };
+        if !(1..=64).contains(&bits) {
+            return unsupported(span, "integer literal outside target range");
+        }
+        let max = (1u128 << (bits - u32::from(signed))) - u128::from(!(signed && negative));
+        if u128::from(number) > max {
+            return unsupported(span, "integer literal outside target range");
+        }
+        Ok(self.constant(ty, span))
+    }
+
+    // Infer a range's common bound type without evaluating either bound or
+    // relying on AST annotations. Actual lowering still validates every node.
+    fn peek_type(&self, expression: &Expr) -> Option<Type> {
+        match &expression.kind {
+            ExprKind::Int(_, suffix) => suffix.clone(),
+            ExprKind::Bool(_) => Some(Type::Bool),
+            ExprKind::Name(_) => self
+                .place(expression, false)
+                .ok()
+                .map(|p| self.body.locals[p.0].ty.clone()),
+            ExprKind::Unary(UnaryOp::Deref, value) => match self.peek_type(value)? {
+                Type::Ref(_, inner) => Some(*inner),
+                _ => None,
+            },
+            ExprKind::Unary(op @ (UnaryOp::Borrow | UnaryOp::BorrowMut), value) => self
+                .peek_type(value)
+                .map(|ty| Type::Ref(*op == UnaryOp::BorrowMut, Box::new(ty))),
+            ExprKind::Unary(_, value) => self.peek_type(value),
+            ExprKind::Binary(op, left, right) => {
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::And
+                        | BinaryOp::Or
+                ) {
+                    Some(Type::Bool)
+                } else {
+                    self.peek_type(left).or_else(|| self.peek_type(right))
+                }
+            }
+            ExprKind::Field(base, field) => {
+                let ty = self.peek_type(base)?;
+                let ty = if let Type::Ref(_, inner) = &ty {
+                    inner
+                } else {
+                    &ty
+                };
+                match ty {
+                    Type::Array(..) | Type::Slice(..) if field == "len" => Some(Type::usize()),
+                    Type::Named(name) => self
+                        .program
+                        .structs
+                        .iter()
+                        .find(|s| &s.name == name)?
+                        .fields
+                        .iter()
+                        .find(|f| &f.name == field)
+                        .map(|f| f.ty.clone()),
+                    _ => None,
+                }
+            }
+            ExprKind::Index(base, _) => {
+                let ty = self.peek_type(base)?;
+                let ty = if let Type::Ref(_, inner) = &ty {
+                    inner
+                } else {
+                    &ty
+                };
+                match ty {
+                    Type::Array(_, inner) | Type::Slice(_, inner) => Some(*inner.clone()),
+                    _ => None,
+                }
+            }
+            ExprKind::Call { name, .. } => self
+                .program
+                .functions
+                .iter()
+                .find(|f| &f.name == name)
+                .map(|f| f.ret.clone()),
+            ExprKind::Try(value) | ExprKind::Unwrap(value) => match self.peek_type(value)? {
+                Type::Result(success, _) => Some(*success),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn range_loop(
+        &mut self,
+        name: &str,
+        start: &Expr,
+        end: &Expr,
+        body: &ast::Block,
+        span: Span,
+    ) -> Result<()> {
+        let ty = self
+            .peek_type(start)
+            .or_else(|| self.peek_type(end))
+            .unwrap_or(Type::isize());
+        if !ty.is_integer() {
+            return unsupported(span, "range bounds require integers of the same type");
+        }
+        self.scopes.push(Scope::default());
+        // Allocate persistent slots before bound-expression temporaries. Bounds
+        // execute once, left to right, outside every loop back edge.
+        let counter = self.local("$range.index", ty.clone(), span);
+        let upper = self.local("$range.end", ty.clone(), span);
+        for (bound, target) in [(start, counter), (end, upper)] {
+            let temporary_start = self.body.locals.len();
+            let value = self.expr(bound, Some(&ty))?;
+            self.emit(
+                Operation::Assign {
+                    target,
+                    value: self.operand(value),
+                },
+                bound.span,
+            );
+            self.finish_temporaries(temporary_start, bound.span);
+        }
+        let header = self.block_id();
+        let run = self.block_id();
+        let step = self.block_id();
+        let exit = self.block_id();
+        self.end(Terminator::Goto(header), span);
+        self.current = Some(header);
+        let temporary_start = self.body.locals.len();
+        // As for scalar binary expressions, record the reads and abstract away
+        // the comparison value. Even literal empty ranges keep both edges.
+        for source in [counter, upper] {
+            let target = self.local("$value", ty.clone(), span);
+            self.emit(
+                Operation::Assign {
+                    target,
+                    value: Operand::Copy(source),
+                },
+                span,
+            );
+        }
+        self.finish_temporaries(temporary_start, span);
+        self.end(
+            Terminator::Branch {
+                condition: Operand::Constant(Type::Bool),
+                yes: run,
+                no: exit,
+            },
+            span,
+        );
+        self.loops.push(Loop {
+            continue_target: step,
+            exit,
+            depth: self.scopes.len(),
+        });
+        self.current = Some(run);
+        self.scopes.push(Scope::default());
+        if name != "_" {
+            let target = self.bind(name, ty.clone(), true, span)?;
+            self.emit(
+                Operation::Assign {
+                    target,
+                    value: Operand::Copy(counter),
+                },
+                span,
+            );
+        }
+        self.statements(body)?;
+        if self.current.is_some() {
+            self.cleanup(self.scopes.len() - 1, None, span);
+            self.end(Terminator::Goto(step), span);
+        }
+        self.scopes.pop();
+        self.loops.pop();
+        self.current = Some(step);
+        // The increment is a pure scalar operation; only its read/write facts
+        // matter. Continue reaches it after cleaning iteration-local bindings.
+        self.emit(
+            Operation::Assign {
+                target: counter,
+                value: Operand::Copy(counter),
+            },
+            span,
+        );
+        self.end(Terminator::Goto(header), span);
+        self.current = Some(exit);
+        self.cleanup(self.scopes.len() - 1, None, span);
+        self.scopes.pop();
+        Ok(())
     }
 
     // Projection roots are stable local identities; their address is captured
@@ -917,7 +1123,7 @@ impl Lower<'_> {
                         self.end(Terminator::Goto(run), span);
                     }
                     self.loops.push(Loop {
-                        header,
+                        continue_target: header,
                         exit,
                         depth: self.scopes.len(),
                     });
@@ -937,17 +1143,32 @@ impl Lower<'_> {
                     let target = if matches!(statement.kind, StmtKind::Break) {
                         loop_.exit
                     } else {
-                        loop_.header
+                        loop_.continue_target
                     };
                     self.end(Terminator::Goto(target), span);
                 }
-                StmtKind::ForEach { iterable, .. } => {
-                    let reason = if matches!(iterable.kind, ExprKind::Range(..)) {
-                        "statement outside subset (range foreach iteration)"
-                    } else {
-                        "statement outside subset (collection foreach iteration)"
+                StmtKind::ForEach {
+                    index,
+                    name,
+                    copy,
+                    iterable,
+                    body,
+                } => {
+                    let ExprKind::Range(start, end) = &iterable.kind else {
+                        return limited(
+                            LimitationKind::Statement,
+                            span,
+                            "statement outside subset (collection foreach iteration)",
+                        );
                     };
-                    return limited(LimitationKind::Statement, span, reason);
+                    if *copy || index.is_some() {
+                        return limited(
+                            LimitationKind::Statement,
+                            span,
+                            "range loops require one integer value binding",
+                        );
+                    }
+                    self.range_loop(name, start, end, body, span)?;
                 }
                 StmtKind::Match { value, arms } => self.match_statement(value, arms, span)?,
                 StmtKind::IfLet {
@@ -994,29 +1215,7 @@ impl Lower<'_> {
                 target
             }
             ExprKind::Int(number, suffix) => {
-                let ty = suffix
-                    .as_ref()
-                    .or(expected)
-                    .cloned()
-                    .unwrap_or(Type::isize());
-                let Type::Int { signed, bits } = ty else {
-                    return unsupported(span, "integer literal requires integer type");
-                };
-                let bits = if bits == 0 { self.pointer_bits } else { bits };
-                if !(1..=64).contains(&bits)
-                    || u128::from(*number) >= (1u128 << (bits - u32::from(signed)))
-                {
-                    return unsupported(span, "integer literal outside target range");
-                }
-                let target = self.local("$integer", ty.clone(), span);
-                self.emit(
-                    Operation::Assign {
-                        target,
-                        value: Operand::Constant(ty),
-                    },
-                    span,
-                );
-                target
+                self.integer_literal(*number, suffix.as_ref(), expected, false, span)?
             }
             ExprKind::Name(name) if name == "none" => {
                 self.constructor(name, &[], expected, span)?
@@ -1108,11 +1307,19 @@ impl Lower<'_> {
                 let result_ty = self.binary_type(*op, &ty, span)?;
                 self.constant(result_ty, span)
             }
-            ExprKind::Unary(op @ (UnaryOp::Not | UnaryOp::BitNot), value) => {
-                let value = self.expr(value, expected)?;
+            ExprKind::Unary(op @ (UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot), value) => {
+                let value = if *op == UnaryOp::Neg
+                    && let ExprKind::Int(number, suffix) = &value.kind
+                {
+                    self.integer_literal(*number, suffix.as_ref(), expected, true, span)?
+                } else {
+                    self.expr(value, expected)?
+                };
                 let ty = self.body.locals[value.0].ty.clone();
-                if !matches!((op, &ty), (UnaryOp::Not, Type::Bool))
-                    && !(*op == UnaryOp::BitNot && ty.is_integer())
+                if !matches!(
+                    (op, &ty),
+                    (UnaryOp::Not, Type::Bool) | (UnaryOp::Neg, Type::Int { signed: true, .. })
+                ) && !(*op == UnaryOp::BitNot && ty.is_integer())
                 {
                     return unsupported(span, "unary operator type mismatch");
                 }

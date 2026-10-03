@@ -1,0 +1,4314 @@
+{
+  "date": "2026-10-03",
+  "methodology": {
+    "builds": "Cargo release profile, locked dependencies, default LLVM feature; Rust 1.99.0 and LLVM 23.1.2.",
+    "baseline": "326003d545364e209faf2515702f2ef2682e9bb4 (0.1.4, before the latest flow-analysis refinements; already includes the earlier flow checker).",
+    "current": "388f463f6c96adcb3f8f72bd274c121b21dc10d7.",
+    "ordering": "Each compiler built before measurement; cases run sequentially. Main current series precedes the baseline series. Repeats follow both series.",
+    "sampling": "Five warmup changes per fixture. 100 timed changes except 5,000-local stress and 2,000-local comment controls (30 each). No inter-sample delay.",
+    "paths": "Absolute repository paths in compiler and command fields normalized to repository-relative paths for publication.",
+    "host_observation": "4,362.56 MiB swap allocated during the series; a later memory_pressure query reported 44% memory free. These observations do not identify the cause of long tails.",
+    "limits": "Single host, one server process per fixture. Percentiles describe these runs, not CI thresholds or a measured cache speedup."
+  },
+  "runs": [
+    {
+      "build": "current",
+      "case": "five_files",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:54:44.194244+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-five_files.json",
+          "--size",
+          "200",
+          "--documents",
+          "5"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 9233,
+            "other2.dodo": 9233,
+            "other3.dodo": 9233,
+            "other4.dodo": 9233
+          },
+          "documents": 5,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 9.806,
+              "p95": 9.999,
+              "max": 10.083
+            },
+            "hover": {
+              "p50": 0.029,
+              "p95": 0.036,
+              "max": 0.041
+            },
+            "completion": {
+              "p50": 0.467,
+              "p95": 0.486,
+              "max": 1.323
+            },
+            "definition": {
+              "p50": 0.041,
+              "p95": 0.047,
+              "max": 0.074
+            },
+            "signatureHelp": {
+              "p50": 0.027,
+              "p95": 0.033,
+              "max": 0.043
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "generic_comments",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:01:07.908400+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-generic_comments.json",
+          "--workload",
+          "generic-imports",
+          "--size",
+          "100",
+          "--edit",
+          "comment"
+        ]
+      },
+      "results": [
+        {
+          "workload": "generic-imports",
+          "size": 100,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 33889,
+          "document_bytes": {
+            "main.dodo": 33889
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 107.329,
+              "p95": 114.174,
+              "max": 122.835
+            },
+            "hover": {
+              "p50": 0.073,
+              "p95": 0.088,
+              "max": 0.102
+            },
+            "completion": {
+              "p50": 0.157,
+              "p95": 0.174,
+              "max": 0.182
+            },
+            "definition": {
+              "p50": 0.06,
+              "p95": 0.07,
+              "max": 0.077
+            },
+            "signatureHelp": {
+              "p50": 0.051,
+              "p95": 0.064,
+              "max": 0.074
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "large_assignments",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:00:20.652857+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-large_assignments.json",
+          "--workload",
+          "large-function",
+          "--size",
+          "5000",
+          "--body-shape",
+          "assignments"
+        ]
+      },
+      "results": [
+        {
+          "workload": "large-function",
+          "size": 5000,
+          "edit": "body",
+          "body_shape": "assignments",
+          "functions": null,
+          "bytes_per_document": 234029,
+          "document_bytes": {
+            "main.dodo": 234029
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 273.319,
+              "p95": 294.121,
+              "max": 341.365
+            },
+            "hover": {
+              "p50": 0.16,
+              "p95": 0.184,
+              "max": 0.39
+            },
+            "completion": {
+              "p50": 0.209,
+              "p95": 0.265,
+              "max": 0.341
+            },
+            "definition": {
+              "p50": 0.109,
+              "p95": 0.127,
+              "max": 0.159
+            },
+            "signatureHelp": {
+              "p50": 0.143,
+              "p95": 0.166,
+              "max": 0.376
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "large_comments",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:00:50.547123+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-large_comments.json",
+          "--workload",
+          "large-function",
+          "--size",
+          "2000",
+          "--edit",
+          "comment",
+          "--samples",
+          "30"
+        ]
+      },
+      "results": [
+        {
+          "workload": "large-function",
+          "size": 2000,
+          "edit": "comment",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 104789,
+          "document_bytes": {
+            "main.dodo": 104789
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 30,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 468.198,
+              "p95": 510.155,
+              "max": 518.284
+            },
+            "hover": {
+              "p50": 0.089,
+              "p95": 0.116,
+              "max": 0.152
+            },
+            "completion": {
+              "p50": 0.133,
+              "p95": 0.155,
+              "max": 0.252
+            },
+            "definition": {
+              "p50": 0.073,
+              "p95": 0.097,
+              "max": 0.106
+            },
+            "signatureHelp": {
+              "p50": 0.073,
+              "p95": 0.085,
+              "max": 0.138
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "large_stress",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:58:07.454047+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-large_stress.json",
+          "--workload",
+          "large-function",
+          "--size",
+          "5000",
+          "--samples",
+          "30"
+        ]
+      },
+      "results": [
+        {
+          "workload": "large-function",
+          "size": 5000,
+          "edit": "body",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 266789,
+          "document_bytes": {
+            "main.dodo": 266789
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 30,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 3049.677,
+              "p95": 3153.568,
+              "max": 3185.311
+            },
+            "hover": {
+              "p50": 0.171,
+              "p95": 0.187,
+              "max": 0.187
+            },
+            "completion": {
+              "p50": 0.265,
+              "p95": 0.312,
+              "max": 0.316
+            },
+            "definition": {
+              "p50": 0.115,
+              "p95": 0.13,
+              "max": 0.132
+            },
+            "signatureHelp": {
+              "p50": 0.141,
+              "p95": 0.156,
+              "max": 0.17
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "original_comments",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:54:40.060557+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-original_comments.json",
+          "--edit",
+          "comment"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 20,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": 20,
+          "bytes_per_document": 933,
+          "document_bytes": {
+            "main.dodo": 933
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 0.2,
+              "p95": 0.217,
+              "max": 0.253
+            },
+            "hover": {
+              "p50": 0.018,
+              "p95": 0.023,
+              "max": 0.035
+            },
+            "completion": {
+              "p50": 0.075,
+              "p95": 0.081,
+              "max": 0.091
+            },
+            "definition": {
+              "p50": 0.021,
+              "p95": 0.026,
+              "max": 0.037
+            },
+            "signatureHelp": {
+              "p50": 0.017,
+              "p95": 0.022,
+              "max": 0.031
+            }
+          }
+        },
+        {
+          "workload": "functions",
+          "size": 200,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 1.974,
+              "p95": 2.066,
+              "max": 2.179
+            },
+            "hover": {
+              "p50": 0.026,
+              "p95": 0.033,
+              "max": 0.038
+            },
+            "completion": {
+              "p50": 0.46,
+              "p95": 0.477,
+              "max": 1.355
+            },
+            "definition": {
+              "p50": 0.039,
+              "p95": 0.046,
+              "max": 0.053
+            },
+            "signatureHelp": {
+              "p50": 0.024,
+              "p95": 0.032,
+              "max": 0.039
+            }
+          }
+        },
+        {
+          "workload": "functions",
+          "size": 1000,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": 1000,
+          "bytes_per_document": 46833,
+          "document_bytes": {
+            "main.dodo": 46833
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 25.735,
+              "p95": 26.136,
+              "max": 26.559
+            },
+            "hover": {
+              "p50": 0.051,
+              "p95": 0.058,
+              "max": 0.066
+            },
+            "completion": {
+              "p50": 2.306,
+              "p95": 3.113,
+              "max": 4.091
+            },
+            "definition": {
+              "p50": 0.113,
+              "p95": 0.125,
+              "max": 0.136
+            },
+            "signatureHelp": {
+              "p50": 0.052,
+              "p95": 0.059,
+              "max": 0.063
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "project_file_five",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:54:50.267273+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-project_file_five.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "5",
+          "--check-mode",
+          "file"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 10.114,
+              "p95": 10.571,
+              "max": 11.718
+            },
+            "hover": {
+              "p50": 0.031,
+              "p95": 0.046,
+              "max": 0.073
+            },
+            "completion": {
+              "p50": 0.481,
+              "p95": 0.542,
+              "max": 1.385
+            },
+            "definition": {
+              "p50": 0.045,
+              "p95": 0.055,
+              "max": 0.071
+            },
+            "signatureHelp": {
+              "p50": 0.028,
+              "p95": 0.039,
+              "max": 0.045
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "project_file_twenty",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:54:51.624726+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-project_file_twenty.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "20",
+          "--check-mode",
+          "file"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594,
+            "other5.dodo": 10594,
+            "other6.dodo": 10594,
+            "other7.dodo": 10594,
+            "other8.dodo": 10594,
+            "other9.dodo": 10594,
+            "other10.dodo": 10794,
+            "other11.dodo": 10794,
+            "other12.dodo": 10794,
+            "other13.dodo": 10794,
+            "other14.dodo": 10794,
+            "other15.dodo": 10794,
+            "other16.dodo": 10794,
+            "other17.dodo": 10794,
+            "other18.dodo": 10794,
+            "other19.dodo": 10794
+          },
+          "documents": 20,
+          "project_files": 20,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 39.956,
+              "p95": 40.711,
+              "max": 41.698
+            },
+            "hover": {
+              "p50": 0.032,
+              "p95": 0.043,
+              "max": 0.049
+            },
+            "completion": {
+              "p50": 0.489,
+              "p95": 0.51,
+              "max": 1.952
+            },
+            "definition": {
+              "p50": 0.044,
+              "p95": 0.054,
+              "max": 0.059
+            },
+            "signatureHelp": {
+              "p50": 0.03,
+              "p95": 0.036,
+              "max": 0.042
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "project_manifest",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:56:43.022056+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-project_manifest.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--edit",
+          "manifest"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "manifest",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "manifest_to_diagnostics": {
+              "p50": 649.929,
+              "p95": 908.443,
+              "max": 2942.16
+            },
+            "hover": {
+              "p50": 0.283,
+              "p95": 0.909,
+              "max": 1.522
+            },
+            "completion": {
+              "p50": 5.441,
+              "p95": 8.775,
+              "max": 36.198
+            },
+            "definition": {
+              "p50": 0.29,
+              "p95": 1.187,
+              "max": 3.435
+            },
+            "signatureHelp": {
+              "p50": 0.367,
+              "p95": 0.959,
+              "max": 1.482
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "project_manifest_repeat",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:11:56.878596+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-project_manifest_repeat.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--edit",
+          "manifest"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "manifest",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "manifest_to_diagnostics": {
+              "p50": 274.787,
+              "p95": 303.693,
+              "max": 394.623
+            },
+            "hover": {
+              "p50": 0.059,
+              "p95": 0.073,
+              "max": 0.088
+            },
+            "completion": {
+              "p50": 2.278,
+              "p95": 2.671,
+              "max": 3.43
+            },
+            "definition": {
+              "p50": 0.069,
+              "p95": 0.08,
+              "max": 0.114
+            },
+            "signatureHelp": {
+              "p50": 0.079,
+              "p95": 0.109,
+              "max": 0.136
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "project_package_one",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:54:56.520406+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-project_package_one.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "1"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233
+          },
+          "documents": 1,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 209.35,
+              "p95": 210.893,
+              "max": 213.643
+            },
+            "hover": {
+              "p50": 0.054,
+              "p95": 0.061,
+              "max": 0.074
+            },
+            "completion": {
+              "p50": 2.211,
+              "p95": 2.296,
+              "max": 3.494
+            },
+            "definition": {
+              "p50": 0.06,
+              "p95": 0.067,
+              "max": 0.081
+            },
+            "signatureHelp": {
+              "p50": 0.072,
+              "p95": 0.086,
+              "max": 0.165
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "project_package_twenty",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:55:19.110260+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-project_package_twenty.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "20"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594,
+            "other5.dodo": 10594,
+            "other6.dodo": 10594,
+            "other7.dodo": 10594,
+            "other8.dodo": 10594,
+            "other9.dodo": 10594,
+            "other10.dodo": 10794,
+            "other11.dodo": 10794,
+            "other12.dodo": 10794,
+            "other13.dodo": 10794,
+            "other14.dodo": 10794,
+            "other15.dodo": 10794,
+            "other16.dodo": 10794,
+            "other17.dodo": 10794,
+            "other18.dodo": 10794,
+            "other19.dodo": 10794
+          },
+          "documents": 20,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 513.89,
+              "p95": 1309.451,
+              "max": 1416.636
+            },
+            "hover": {
+              "p50": 0.059,
+              "p95": 0.658,
+              "max": 1.13
+            },
+            "completion": {
+              "p50": 2.299,
+              "p95": 7.476,
+              "max": 12.741
+            },
+            "definition": {
+              "p50": 0.069,
+              "p95": 0.591,
+              "max": 1.562
+            },
+            "signatureHelp": {
+              "p50": 0.082,
+              "p95": 0.713,
+              "max": 1.157
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "project_package_twenty_repeat",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:09:54.180862+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-project_package_twenty_repeat.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "20"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594,
+            "other5.dodo": 10594,
+            "other6.dodo": 10594,
+            "other7.dodo": 10594,
+            "other8.dodo": 10594,
+            "other9.dodo": 10594,
+            "other10.dodo": 10794,
+            "other11.dodo": 10794,
+            "other12.dodo": 10794,
+            "other13.dodo": 10794,
+            "other14.dodo": 10794,
+            "other15.dodo": 10794,
+            "other16.dodo": 10794,
+            "other17.dodo": 10794,
+            "other18.dodo": 10794,
+            "other19.dodo": 10794
+          },
+          "documents": 20,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 520.686,
+              "p95": 542.03,
+              "max": 600.246
+            },
+            "hover": {
+              "p50": 0.059,
+              "p95": 0.069,
+              "max": 0.087
+            },
+            "completion": {
+              "p50": 2.31,
+              "p95": 2.582,
+              "max": 6.412
+            },
+            "definition": {
+              "p50": 0.069,
+              "p95": 0.082,
+              "max": 0.089
+            },
+            "signatureHelp": {
+              "p50": 0.079,
+              "p95": 0.106,
+              "max": 0.254
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "stdlib_math",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:54:43.696886+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-stdlib_math.json",
+          "--size",
+          "20",
+          "--stdlib",
+          "--edit",
+          "comment"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 20,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": 20,
+          "bytes_per_document": 951,
+          "document_bytes": {
+            "main.dodo": 951
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": true,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 2.699,
+              "p95": 2.77,
+              "max": 3.038
+            },
+            "hover": {
+              "p50": 0.021,
+              "p95": 0.03,
+              "max": 0.047
+            },
+            "completion": {
+              "p50": 0.089,
+              "p95": 0.097,
+              "max": 0.104
+            },
+            "definition": {
+              "p50": 0.024,
+              "p95": 0.031,
+              "max": 0.043
+            },
+            "signatureHelp": {
+              "p50": 0.023,
+              "p95": 0.031,
+              "max": 0.04
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "suite",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:52:45.086212+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-suite.json",
+          "--workload",
+          "functions",
+          "large-function",
+          "errors",
+          "generic-imports",
+          "project"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 20,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 20,
+          "bytes_per_document": 933,
+          "document_bytes": {
+            "main.dodo": 933
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 0.214,
+              "p95": 0.24,
+              "max": 0.404
+            },
+            "hover": {
+              "p50": 0.022,
+              "p95": 0.025,
+              "max": 0.031
+            },
+            "completion": {
+              "p50": 0.068,
+              "p95": 0.073,
+              "max": 0.112
+            },
+            "definition": {
+              "p50": 0.024,
+              "p95": 0.027,
+              "max": 0.029
+            },
+            "signatureHelp": {
+              "p50": 0.021,
+              "p95": 0.024,
+              "max": 0.029
+            }
+          }
+        },
+        {
+          "workload": "functions",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 2.097,
+              "p95": 2.247,
+              "max": 2.377
+            },
+            "hover": {
+              "p50": 0.028,
+              "p95": 0.035,
+              "max": 0.064
+            },
+            "completion": {
+              "p50": 0.469,
+              "p95": 0.54,
+              "max": 1.523
+            },
+            "definition": {
+              "p50": 0.043,
+              "p95": 0.055,
+              "max": 0.064
+            },
+            "signatureHelp": {
+              "p50": 0.027,
+              "p95": 0.033,
+              "max": 0.039
+            }
+          }
+        },
+        {
+          "workload": "functions",
+          "size": 1000,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 1000,
+          "bytes_per_document": 46833,
+          "document_bytes": {
+            "main.dodo": 46833
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 26.692,
+              "p95": 30.931,
+              "max": 32.347
+            },
+            "hover": {
+              "p50": 0.057,
+              "p95": 0.07,
+              "max": 0.126
+            },
+            "completion": {
+              "p50": 2.475,
+              "p95": 3.047,
+              "max": 3.543
+            },
+            "definition": {
+              "p50": 0.129,
+              "p95": 0.153,
+              "max": 0.219
+            },
+            "signatureHelp": {
+              "p50": 0.061,
+              "p95": 0.074,
+              "max": 0.086
+            }
+          }
+        },
+        {
+          "workload": "large-function",
+          "size": 200,
+          "edit": "body",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 9989,
+          "document_bytes": {
+            "main.dodo": 9989
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 5.47,
+              "p95": 5.73,
+              "max": 6.177
+            },
+            "hover": {
+              "p50": 0.029,
+              "p95": 0.035,
+              "max": 0.055
+            },
+            "completion": {
+              "p50": 0.041,
+              "p95": 0.055,
+              "max": 0.077
+            },
+            "definition": {
+              "p50": 0.027,
+              "p95": 0.037,
+              "max": 0.056
+            },
+            "signatureHelp": {
+              "p50": 0.026,
+              "p95": 0.034,
+              "max": 0.042
+            }
+          }
+        },
+        {
+          "workload": "large-function",
+          "size": 1000,
+          "edit": "body",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 50789,
+          "document_bytes": {
+            "main.dodo": 50789
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 112.925,
+              "p95": 119.459,
+              "max": 124.717
+            },
+            "hover": {
+              "p50": 0.056,
+              "p95": 0.071,
+              "max": 0.179
+            },
+            "completion": {
+              "p50": 0.09,
+              "p95": 0.109,
+              "max": 0.207
+            },
+            "definition": {
+              "p50": 0.055,
+              "p95": 0.069,
+              "max": 0.11
+            },
+            "signatureHelp": {
+              "p50": 0.049,
+              "p95": 0.057,
+              "max": 0.11
+            }
+          }
+        },
+        {
+          "workload": "large-function",
+          "size": 2000,
+          "edit": "body",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 104789,
+          "document_bytes": {
+            "main.dodo": 104789
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 463.316,
+              "p95": 488.258,
+              "max": 500.173
+            },
+            "hover": {
+              "p50": 0.084,
+              "p95": 0.097,
+              "max": 0.105
+            },
+            "completion": {
+              "p50": 0.127,
+              "p95": 0.149,
+              "max": 0.157
+            },
+            "definition": {
+              "p50": 0.07,
+              "p95": 0.079,
+              "max": 0.092
+            },
+            "signatureHelp": {
+              "p50": 0.07,
+              "p95": 0.078,
+              "max": 0.11
+            }
+          }
+        },
+        {
+          "workload": "errors",
+          "size": 20,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 851,
+          "document_bytes": {
+            "main.dodo": 851
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 20,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 0.198,
+              "p95": 0.229,
+              "max": 0.257
+            },
+            "hover": {
+              "p50": 0.019,
+              "p95": 0.022,
+              "max": 0.037
+            },
+            "completion": {
+              "p50": 0.034,
+              "p95": 0.043,
+              "max": 0.054
+            },
+            "definition": {
+              "p50": 0.019,
+              "p95": 0.024,
+              "max": 0.027
+            },
+            "signatureHelp": {
+              "p50": 0.018,
+              "p95": 0.023,
+              "max": 0.03
+            }
+          }
+        },
+        {
+          "workload": "errors",
+          "size": 100,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 3931,
+          "document_bytes": {
+            "main.dodo": 3931
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 100,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 0.728,
+              "p95": 0.754,
+              "max": 0.813
+            },
+            "hover": {
+              "p50": 0.02,
+              "p95": 0.028,
+              "max": 0.032
+            },
+            "completion": {
+              "p50": 0.052,
+              "p95": 0.056,
+              "max": 0.065
+            },
+            "definition": {
+              "p50": 0.02,
+              "p95": 0.026,
+              "max": 0.035
+            },
+            "signatureHelp": {
+              "p50": 0.02,
+              "p95": 0.026,
+              "max": 0.031
+            }
+          }
+        },
+        {
+          "workload": "errors",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 7931,
+          "document_bytes": {
+            "main.dodo": 7931
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 200,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 1.619,
+              "p95": 1.668,
+              "max": 2.52
+            },
+            "hover": {
+              "p50": 0.026,
+              "p95": 0.03,
+              "max": 0.036
+            },
+            "completion": {
+              "p50": 0.073,
+              "p95": 0.077,
+              "max": 0.086
+            },
+            "definition": {
+              "p50": 0.024,
+              "p95": 0.03,
+              "max": 0.035
+            },
+            "signatureHelp": {
+              "p50": 0.024,
+              "p95": 0.029,
+              "max": 0.036
+            }
+          }
+        },
+        {
+          "workload": "generic-imports",
+          "size": 10,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 3559,
+          "document_bytes": {
+            "main.dodo": 3559
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 9.496,
+              "p95": 9.748,
+              "max": 9.874
+            },
+            "hover": {
+              "p50": 0.025,
+              "p95": 0.037,
+              "max": 0.042
+            },
+            "completion": {
+              "p50": 0.06,
+              "p95": 0.075,
+              "max": 0.079
+            },
+            "definition": {
+              "p50": 0.021,
+              "p95": 0.041,
+              "max": 0.049
+            },
+            "signatureHelp": {
+              "p50": 0.027,
+              "p95": 0.033,
+              "max": 0.038
+            }
+          }
+        },
+        {
+          "workload": "generic-imports",
+          "size": 50,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 17039,
+          "document_bytes": {
+            "main.dodo": 17039
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 41.25,
+              "p95": 43.589,
+              "max": 43.954
+            },
+            "hover": {
+              "p50": 0.048,
+              "p95": 0.061,
+              "max": 0.068
+            },
+            "completion": {
+              "p50": 0.107,
+              "p95": 0.115,
+              "max": 0.123
+            },
+            "definition": {
+              "p50": 0.046,
+              "p95": 0.056,
+              "max": 0.06
+            },
+            "signatureHelp": {
+              "p50": 0.039,
+              "p95": 0.045,
+              "max": 0.055
+            }
+          }
+        },
+        {
+          "workload": "generic-imports",
+          "size": 100,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 33889,
+          "document_bytes": {
+            "main.dodo": 33889
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 113.265,
+              "p95": 121.747,
+              "max": 143.307
+            },
+            "hover": {
+              "p50": 0.071,
+              "p95": 0.082,
+              "max": 0.088
+            },
+            "completion": {
+              "p50": 0.162,
+              "p95": 0.173,
+              "max": 0.21
+            },
+            "definition": {
+              "p50": 0.059,
+              "p95": 0.066,
+              "max": 0.075
+            },
+            "signatureHelp": {
+              "p50": 0.05,
+              "p95": 0.059,
+              "max": 0.063
+            }
+          }
+        },
+        {
+          "workload": "project",
+          "size": 20,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 20,
+          "bytes_per_document": 933,
+          "document_bytes": {
+            "main.dodo": 933,
+            "other1.dodo": 1034,
+            "other2.dodo": 1034,
+            "other3.dodo": 1034,
+            "other4.dodo": 1034
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 5.923,
+              "p95": 6.166,
+              "max": 6.198
+            },
+            "hover": {
+              "p50": 0.02,
+              "p95": 0.028,
+              "max": 0.035
+            },
+            "completion": {
+              "p50": 0.245,
+              "p95": 0.255,
+              "max": 0.263
+            },
+            "definition": {
+              "p50": 0.023,
+              "p95": 0.03,
+              "max": 0.034
+            },
+            "signatureHelp": {
+              "p50": 0.023,
+              "p95": 0.028,
+              "max": 0.033
+            }
+          }
+        },
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 274.593,
+              "p95": 275.603,
+              "max": 278.29
+            },
+            "hover": {
+              "p50": 0.053,
+              "p95": 0.062,
+              "max": 0.067
+            },
+            "completion": {
+              "p50": 2.221,
+              "p95": 2.349,
+              "max": 3.144
+            },
+            "definition": {
+              "p50": 0.062,
+              "p95": 0.075,
+              "max": 0.079
+            },
+            "signatureHelp": {
+              "p50": 0.072,
+              "p95": 0.081,
+              "max": 0.088
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "current",
+      "case": "twenty_files",
+      "environment": {
+        "timestamp_utc": "2026-10-03T18:54:45.510236+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "build_profile": "release",
+        "compiler_sha256": "8c277117c230cc795a839e2d72c96c187b4c54771fb39668af1b141321a8d8c7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/current-twenty_files.json",
+          "--size",
+          "200",
+          "--documents",
+          "20"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 9233,
+            "other2.dodo": 9233,
+            "other3.dodo": 9233,
+            "other4.dodo": 9233,
+            "other5.dodo": 9233,
+            "other6.dodo": 9233,
+            "other7.dodo": 9233,
+            "other8.dodo": 9233,
+            "other9.dodo": 9233,
+            "other10.dodo": 9233,
+            "other11.dodo": 9233,
+            "other12.dodo": 9233,
+            "other13.dodo": 9233,
+            "other14.dodo": 9233,
+            "other15.dodo": 9233,
+            "other16.dodo": 9233,
+            "other17.dodo": 9233,
+            "other18.dodo": 9233,
+            "other19.dodo": 9233
+          },
+          "documents": 20,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 38.778,
+              "p95": 39.608,
+              "max": 42.746
+            },
+            "hover": {
+              "p50": 0.032,
+              "p95": 0.043,
+              "max": 0.048
+            },
+            "completion": {
+              "p50": 0.49,
+              "p95": 0.519,
+              "max": 1.836
+            },
+            "definition": {
+              "p50": 0.046,
+              "p95": 0.058,
+              "max": 0.069
+            },
+            "signatureHelp": {
+              "p50": 0.03,
+              "p95": 0.038,
+              "max": 0.058
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "five_files",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:03:14.583488+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-five_files.json",
+          "--size",
+          "200",
+          "--documents",
+          "5"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 9233,
+            "other2.dodo": 9233,
+            "other3.dodo": 9233,
+            "other4.dodo": 9233
+          },
+          "documents": 5,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 10.373,
+              "p95": 12.945,
+              "max": 24.281
+            },
+            "hover": {
+              "p50": 0.033,
+              "p95": 0.065,
+              "max": 0.105
+            },
+            "completion": {
+              "p50": 0.546,
+              "p95": 0.823,
+              "max": 2.457
+            },
+            "definition": {
+              "p50": 0.052,
+              "p95": 0.075,
+              "max": 1.353
+            },
+            "signatureHelp": {
+              "p50": 0.031,
+              "p95": 0.058,
+              "max": 0.097
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "generic_comments",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:07:56.247458+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-generic_comments.json",
+          "--workload",
+          "generic-imports",
+          "--size",
+          "100",
+          "--edit",
+          "comment"
+        ]
+      },
+      "results": [
+        {
+          "workload": "generic-imports",
+          "size": 100,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 33889,
+          "document_bytes": {
+            "main.dodo": 33889
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 108.041,
+              "p95": 127.348,
+              "max": 229.814
+            },
+            "hover": {
+              "p50": 0.079,
+              "p95": 0.098,
+              "max": 0.265
+            },
+            "completion": {
+              "p50": 0.17,
+              "p95": 0.218,
+              "max": 4.703
+            },
+            "definition": {
+              "p50": 0.063,
+              "p95": 0.076,
+              "max": 1.281
+            },
+            "signatureHelp": {
+              "p50": 0.058,
+              "p95": 0.079,
+              "max": 0.391
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "large_assignments",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:07:07.140874+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-large_assignments.json",
+          "--workload",
+          "large-function",
+          "--size",
+          "5000",
+          "--body-shape",
+          "assignments"
+        ]
+      },
+      "results": [
+        {
+          "workload": "large-function",
+          "size": 5000,
+          "edit": "body",
+          "body_shape": "assignments",
+          "functions": null,
+          "bytes_per_document": 234029,
+          "document_bytes": {
+            "main.dodo": 234029
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 273.139,
+              "p95": 308.041,
+              "max": 451.972
+            },
+            "hover": {
+              "p50": 0.16,
+              "p95": 0.183,
+              "max": 0.192
+            },
+            "completion": {
+              "p50": 0.211,
+              "p95": 0.298,
+              "max": 0.379
+            },
+            "definition": {
+              "p50": 0.111,
+              "p95": 0.122,
+              "max": 0.135
+            },
+            "signatureHelp": {
+              "p50": 0.158,
+              "p95": 0.179,
+              "max": 0.195
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "large_comments",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:07:37.386821+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-large_comments.json",
+          "--workload",
+          "large-function",
+          "--size",
+          "2000",
+          "--edit",
+          "comment",
+          "--samples",
+          "30"
+        ]
+      },
+      "results": [
+        {
+          "workload": "large-function",
+          "size": 2000,
+          "edit": "comment",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 104789,
+          "document_bytes": {
+            "main.dodo": 104789
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 30,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 485.739,
+              "p95": 752.811,
+              "max": 783.251
+            },
+            "hover": {
+              "p50": 0.091,
+              "p95": 0.134,
+              "max": 0.164
+            },
+            "completion": {
+              "p50": 0.144,
+              "p95": 0.195,
+              "max": 0.248
+            },
+            "definition": {
+              "p50": 0.072,
+              "p95": 0.106,
+              "max": 0.108
+            },
+            "signatureHelp": {
+              "p50": 0.081,
+              "p95": 0.11,
+              "max": 0.167
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "large_stress",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:05:29.200237+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-large_stress.json",
+          "--workload",
+          "large-function",
+          "--size",
+          "5000",
+          "--samples",
+          "30"
+        ]
+      },
+      "results": [
+        {
+          "workload": "large-function",
+          "size": 5000,
+          "edit": "body",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 266789,
+          "document_bytes": {
+            "main.dodo": 266789
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 30,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 2694.917,
+              "p95": 2921.841,
+              "max": 2982.212
+            },
+            "hover": {
+              "p50": 0.173,
+              "p95": 0.192,
+              "max": 0.193
+            },
+            "completion": {
+              "p50": 0.263,
+              "p95": 0.369,
+              "max": 0.407
+            },
+            "definition": {
+              "p50": 0.114,
+              "p95": 0.129,
+              "max": 0.132
+            },
+            "signatureHelp": {
+              "p50": 0.159,
+              "p95": 0.177,
+              "max": 0.196
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "original_comments",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:03:10.499740+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-original_comments.json",
+          "--edit",
+          "comment"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 20,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": 20,
+          "bytes_per_document": 933,
+          "document_bytes": {
+            "main.dodo": 933
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 0.231,
+              "p95": 0.639,
+              "max": 2.89
+            },
+            "hover": {
+              "p50": 0.024,
+              "p95": 0.106,
+              "max": 0.349
+            },
+            "completion": {
+              "p50": 0.081,
+              "p95": 0.202,
+              "max": 0.363
+            },
+            "definition": {
+              "p50": 0.027,
+              "p95": 0.109,
+              "max": 0.291
+            },
+            "signatureHelp": {
+              "p50": 0.022,
+              "p95": 0.085,
+              "max": 0.288
+            }
+          }
+        },
+        {
+          "workload": "functions",
+          "size": 200,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 2.081,
+              "p95": 2.639,
+              "max": 3.074
+            },
+            "hover": {
+              "p50": 0.028,
+              "p95": 0.042,
+              "max": 0.124
+            },
+            "completion": {
+              "p50": 0.484,
+              "p95": 0.592,
+              "max": 2.04
+            },
+            "definition": {
+              "p50": 0.042,
+              "p95": 0.064,
+              "max": 0.14
+            },
+            "signatureHelp": {
+              "p50": 0.028,
+              "p95": 0.041,
+              "max": 0.056
+            }
+          }
+        },
+        {
+          "workload": "functions",
+          "size": 1000,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": 1000,
+          "bytes_per_document": 46833,
+          "document_bytes": {
+            "main.dodo": 46833
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 23.991,
+              "p95": 26.28,
+              "max": 26.875
+            },
+            "hover": {
+              "p50": 0.052,
+              "p95": 0.063,
+              "max": 0.066
+            },
+            "completion": {
+              "p50": 2.322,
+              "p95": 3.065,
+              "max": 4.665
+            },
+            "definition": {
+              "p50": 0.118,
+              "p95": 0.135,
+              "max": 0.161
+            },
+            "signatureHelp": {
+              "p50": 0.059,
+              "p95": 0.067,
+              "max": 0.081
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "project_file_five",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:03:20.852349+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-project_file_five.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "5",
+          "--check-mode",
+          "file"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 9.857,
+              "p95": 10.658,
+              "max": 11.108
+            },
+            "hover": {
+              "p50": 0.03,
+              "p95": 0.041,
+              "max": 0.054
+            },
+            "completion": {
+              "p50": 0.482,
+              "p95": 0.543,
+              "max": 1.361
+            },
+            "definition": {
+              "p50": 0.043,
+              "p95": 0.058,
+              "max": 0.074
+            },
+            "signatureHelp": {
+              "p50": 0.029,
+              "p95": 0.036,
+              "max": 0.049
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "project_file_twenty",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:03:22.220486+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-project_file_twenty.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "20",
+          "--check-mode",
+          "file"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594,
+            "other5.dodo": 10594,
+            "other6.dodo": 10594,
+            "other7.dodo": 10594,
+            "other8.dodo": 10594,
+            "other9.dodo": 10594,
+            "other10.dodo": 10794,
+            "other11.dodo": 10794,
+            "other12.dodo": 10794,
+            "other13.dodo": 10794,
+            "other14.dodo": 10794,
+            "other15.dodo": 10794,
+            "other16.dodo": 10794,
+            "other17.dodo": 10794,
+            "other18.dodo": 10794,
+            "other19.dodo": 10794
+          },
+          "documents": 20,
+          "project_files": 20,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 39.806,
+              "p95": 45.754,
+              "max": 84.515
+            },
+            "hover": {
+              "p50": 0.039,
+              "p95": 0.055,
+              "max": 0.17
+            },
+            "completion": {
+              "p50": 0.516,
+              "p95": 0.69,
+              "max": 1.411
+            },
+            "definition": {
+              "p50": 0.055,
+              "p95": 0.072,
+              "max": 0.153
+            },
+            "signatureHelp": {
+              "p50": 0.033,
+              "p95": 0.047,
+              "max": 0.117
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "project_manifest",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:05:01.949246+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-project_manifest.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--edit",
+          "manifest"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "manifest",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "manifest_to_diagnostics": {
+              "p50": 242.133,
+              "p95": 249.147,
+              "max": 258.196
+            },
+            "hover": {
+              "p50": 0.054,
+              "p95": 0.064,
+              "max": 0.069
+            },
+            "completion": {
+              "p50": 2.236,
+              "p95": 2.444,
+              "max": 3.084
+            },
+            "definition": {
+              "p50": 0.06,
+              "p95": 0.07,
+              "max": 0.076
+            },
+            "signatureHelp": {
+              "p50": 0.075,
+              "p95": 0.086,
+              "max": 0.101
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "project_package_one",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:03:27.283050+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-project_package_one.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "1"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233
+          },
+          "documents": 1,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 201.004,
+              "p95": 351.692,
+              "max": 417.991
+            },
+            "hover": {
+              "p50": 0.061,
+              "p95": 0.11,
+              "max": 3.595
+            },
+            "completion": {
+              "p50": 2.47,
+              "p95": 4.542,
+              "max": 5.422
+            },
+            "definition": {
+              "p50": 0.071,
+              "p95": 0.14,
+              "max": 3.583
+            },
+            "signatureHelp": {
+              "p50": 0.088,
+              "p95": 0.247,
+              "max": 1.3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "project_package_twenty",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:03:51.082485+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-project_package_twenty.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "20"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594,
+            "other5.dodo": 10594,
+            "other6.dodo": 10594,
+            "other7.dodo": 10594,
+            "other8.dodo": 10594,
+            "other9.dodo": 10594,
+            "other10.dodo": 10794,
+            "other11.dodo": 10794,
+            "other12.dodo": 10794,
+            "other13.dodo": 10794,
+            "other14.dodo": 10794,
+            "other15.dodo": 10794,
+            "other16.dodo": 10794,
+            "other17.dodo": 10794,
+            "other18.dodo": 10794,
+            "other19.dodo": 10794
+          },
+          "documents": 20,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 576.279,
+              "p95": 835.483,
+              "max": 1162.08
+            },
+            "hover": {
+              "p50": 0.065,
+              "p95": 0.123,
+              "max": 0.18
+            },
+            "completion": {
+              "p50": 2.781,
+              "p95": 4.439,
+              "max": 7.661
+            },
+            "definition": {
+              "p50": 0.076,
+              "p95": 0.143,
+              "max": 0.225
+            },
+            "signatureHelp": {
+              "p50": 0.099,
+              "p95": 0.268,
+              "max": 0.622
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "project_package_twenty_repeat",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:10:57.629187+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-project_package_twenty_repeat.json",
+          "--workload",
+          "project",
+          "--size",
+          "200",
+          "--documents",
+          "20"
+        ]
+      },
+      "results": [
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594,
+            "other5.dodo": 10594,
+            "other6.dodo": 10594,
+            "other7.dodo": 10594,
+            "other8.dodo": 10594,
+            "other9.dodo": 10594,
+            "other10.dodo": 10794,
+            "other11.dodo": 10794,
+            "other12.dodo": 10794,
+            "other13.dodo": 10794,
+            "other14.dodo": 10794,
+            "other15.dodo": 10794,
+            "other16.dodo": 10794,
+            "other17.dodo": 10794,
+            "other18.dodo": 10794,
+            "other19.dodo": 10794
+          },
+          "documents": 20,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 482.597,
+              "p95": 531.789,
+              "max": 598.835
+            },
+            "hover": {
+              "p50": 0.058,
+              "p95": 0.069,
+              "max": 0.078
+            },
+            "completion": {
+              "p50": 2.251,
+              "p95": 2.528,
+              "max": 3.312
+            },
+            "definition": {
+              "p50": 0.065,
+              "p95": 0.08,
+              "max": 0.086
+            },
+            "signatureHelp": {
+              "p50": 0.078,
+              "p95": 0.1,
+              "max": 0.104
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "stdlib_math",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:03:14.072361+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-stdlib_math.json",
+          "--size",
+          "20",
+          "--stdlib",
+          "--edit",
+          "comment"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 20,
+          "edit": "comment",
+          "body_shape": null,
+          "functions": 20,
+          "bytes_per_document": 951,
+          "document_bytes": {
+            "main.dodo": 951
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": true,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 2.659,
+              "p95": 2.833,
+              "max": 3.32
+            },
+            "hover": {
+              "p50": 0.025,
+              "p95": 0.031,
+              "max": 0.061
+            },
+            "completion": {
+              "p50": 0.092,
+              "p95": 0.115,
+              "max": 0.139
+            },
+            "definition": {
+              "p50": 0.028,
+              "p95": 0.039,
+              "max": 0.114
+            },
+            "signatureHelp": {
+              "p50": 0.024,
+              "p95": 0.034,
+              "max": 0.045
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "suite",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:01:19.752010+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-suite.json",
+          "--workload",
+          "functions",
+          "large-function",
+          "errors",
+          "generic-imports",
+          "project"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 20,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 20,
+          "bytes_per_document": 933,
+          "document_bytes": {
+            "main.dodo": 933
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 0.202,
+              "p95": 0.22,
+              "max": 0.258
+            },
+            "hover": {
+              "p50": 0.018,
+              "p95": 0.024,
+              "max": 0.042
+            },
+            "completion": {
+              "p50": 0.075,
+              "p95": 0.079,
+              "max": 0.094
+            },
+            "definition": {
+              "p50": 0.021,
+              "p95": 0.026,
+              "max": 0.037
+            },
+            "signatureHelp": {
+              "p50": 0.017,
+              "p95": 0.021,
+              "max": 0.025
+            }
+          }
+        },
+        {
+          "workload": "functions",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 1.903,
+              "p95": 2.029,
+              "max": 2.13
+            },
+            "hover": {
+              "p50": 0.026,
+              "p95": 0.034,
+              "max": 0.042
+            },
+            "completion": {
+              "p50": 0.452,
+              "p95": 0.482,
+              "max": 1.318
+            },
+            "definition": {
+              "p50": 0.038,
+              "p95": 0.044,
+              "max": 0.061
+            },
+            "signatureHelp": {
+              "p50": 0.025,
+              "p95": 0.033,
+              "max": 0.044
+            }
+          }
+        },
+        {
+          "workload": "functions",
+          "size": 1000,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 1000,
+          "bytes_per_document": 46833,
+          "document_bytes": {
+            "main.dodo": 46833
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 23.269,
+              "p95": 23.896,
+              "max": 24.246
+            },
+            "hover": {
+              "p50": 0.052,
+              "p95": 0.06,
+              "max": 0.069
+            },
+            "completion": {
+              "p50": 2.26,
+              "p95": 2.535,
+              "max": 3.222
+            },
+            "definition": {
+              "p50": 0.114,
+              "p95": 0.129,
+              "max": 0.147
+            },
+            "signatureHelp": {
+              "p50": 0.056,
+              "p95": 0.066,
+              "max": 0.075
+            }
+          }
+        },
+        {
+          "workload": "large-function",
+          "size": 200,
+          "edit": "body",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 9989,
+          "document_bytes": {
+            "main.dodo": 9989
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 4.78,
+              "p95": 4.897,
+              "max": 4.986
+            },
+            "hover": {
+              "p50": 0.027,
+              "p95": 0.029,
+              "max": 0.036
+            },
+            "completion": {
+              "p50": 0.036,
+              "p95": 0.044,
+              "max": 0.055
+            },
+            "definition": {
+              "p50": 0.024,
+              "p95": 0.029,
+              "max": 0.034
+            },
+            "signatureHelp": {
+              "p50": 0.025,
+              "p95": 0.029,
+              "max": 0.033
+            }
+          }
+        },
+        {
+          "workload": "large-function",
+          "size": 1000,
+          "edit": "body",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 50789,
+          "document_bytes": {
+            "main.dodo": 50789
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 104.299,
+              "p95": 115.238,
+              "max": 130.285
+            },
+            "hover": {
+              "p50": 0.052,
+              "p95": 0.067,
+              "max": 0.14
+            },
+            "completion": {
+              "p50": 0.077,
+              "p95": 0.102,
+              "max": 0.187
+            },
+            "definition": {
+              "p50": 0.048,
+              "p95": 0.063,
+              "max": 0.16
+            },
+            "signatureHelp": {
+              "p50": 0.049,
+              "p95": 0.062,
+              "max": 0.156
+            }
+          }
+        },
+        {
+          "workload": "large-function",
+          "size": 2000,
+          "edit": "body",
+          "body_shape": "locals",
+          "functions": null,
+          "bytes_per_document": 104789,
+          "document_bytes": {
+            "main.dodo": 104789
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 443.457,
+              "p95": 481.955,
+              "max": 505.521
+            },
+            "hover": {
+              "p50": 0.084,
+              "p95": 0.098,
+              "max": 0.117
+            },
+            "completion": {
+              "p50": 0.129,
+              "p95": 0.151,
+              "max": 0.172
+            },
+            "definition": {
+              "p50": 0.07,
+              "p95": 0.079,
+              "max": 0.091
+            },
+            "signatureHelp": {
+              "p50": 0.076,
+              "p95": 0.09,
+              "max": 0.098
+            }
+          }
+        },
+        {
+          "workload": "errors",
+          "size": 20,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 851,
+          "document_bytes": {
+            "main.dodo": 851
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 20,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 0.193,
+              "p95": 0.208,
+              "max": 0.255
+            },
+            "hover": {
+              "p50": 0.018,
+              "p95": 0.028,
+              "max": 0.04
+            },
+            "completion": {
+              "p50": 0.033,
+              "p95": 0.042,
+              "max": 0.049
+            },
+            "definition": {
+              "p50": 0.019,
+              "p95": 0.025,
+              "max": 0.033
+            },
+            "signatureHelp": {
+              "p50": 0.017,
+              "p95": 0.022,
+              "max": 0.028
+            }
+          }
+        },
+        {
+          "workload": "errors",
+          "size": 100,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 3931,
+          "document_bytes": {
+            "main.dodo": 3931
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 100,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 0.724,
+              "p95": 0.772,
+              "max": 0.819
+            },
+            "hover": {
+              "p50": 0.019,
+              "p95": 0.031,
+              "max": 0.061
+            },
+            "completion": {
+              "p50": 0.05,
+              "p95": 0.062,
+              "max": 0.065
+            },
+            "definition": {
+              "p50": 0.019,
+              "p95": 0.027,
+              "max": 0.031
+            },
+            "signatureHelp": {
+              "p50": 0.019,
+              "p95": 0.028,
+              "max": 0.034
+            }
+          }
+        },
+        {
+          "workload": "errors",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 7931,
+          "document_bytes": {
+            "main.dodo": 7931
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 200,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 1.612,
+              "p95": 1.684,
+              "max": 2.544
+            },
+            "hover": {
+              "p50": 0.025,
+              "p95": 0.029,
+              "max": 0.038
+            },
+            "completion": {
+              "p50": 0.07,
+              "p95": 0.076,
+              "max": 0.086
+            },
+            "definition": {
+              "p50": 0.023,
+              "p95": 0.028,
+              "max": 0.041
+            },
+            "signatureHelp": {
+              "p50": 0.025,
+              "p95": 0.029,
+              "max": 0.036
+            }
+          }
+        },
+        {
+          "workload": "generic-imports",
+          "size": 10,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 3559,
+          "document_bytes": {
+            "main.dodo": 3559
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 9.052,
+              "p95": 9.395,
+              "max": 9.546
+            },
+            "hover": {
+              "p50": 0.027,
+              "p95": 0.038,
+              "max": 0.045
+            },
+            "completion": {
+              "p50": 0.06,
+              "p95": 0.073,
+              "max": 0.078
+            },
+            "definition": {
+              "p50": 0.025,
+              "p95": 0.041,
+              "max": 0.046
+            },
+            "signatureHelp": {
+              "p50": 0.029,
+              "p95": 0.037,
+              "max": 0.041
+            }
+          }
+        },
+        {
+          "workload": "generic-imports",
+          "size": 50,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 17039,
+          "document_bytes": {
+            "main.dodo": 17039
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 40.269,
+              "p95": 42.615,
+              "max": 43.309
+            },
+            "hover": {
+              "p50": 0.05,
+              "p95": 0.067,
+              "max": 0.159
+            },
+            "completion": {
+              "p50": 0.108,
+              "p95": 0.128,
+              "max": 0.29
+            },
+            "definition": {
+              "p50": 0.047,
+              "p95": 0.057,
+              "max": 0.145
+            },
+            "signatureHelp": {
+              "p50": 0.041,
+              "p95": 0.054,
+              "max": 0.1
+            }
+          }
+        },
+        {
+          "workload": "generic-imports",
+          "size": 100,
+          "edit": "body",
+          "body_shape": null,
+          "functions": null,
+          "bytes_per_document": 33889,
+          "document_bytes": {
+            "main.dodo": 33889
+          },
+          "documents": 1,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 103.163,
+              "p95": 110.706,
+              "max": 121.665
+            },
+            "hover": {
+              "p50": 0.072,
+              "p95": 0.09,
+              "max": 0.106
+            },
+            "completion": {
+              "p50": 0.156,
+              "p95": 0.172,
+              "max": 0.218
+            },
+            "definition": {
+              "p50": 0.06,
+              "p95": 0.069,
+              "max": 0.084
+            },
+            "signatureHelp": {
+              "p50": 0.055,
+              "p95": 0.071,
+              "max": 0.079
+            }
+          }
+        },
+        {
+          "workload": "project",
+          "size": 20,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 20,
+          "bytes_per_document": 933,
+          "document_bytes": {
+            "main.dodo": 933,
+            "other1.dodo": 1034,
+            "other2.dodo": 1034,
+            "other3.dodo": 1034,
+            "other4.dodo": 1034
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 5.764,
+              "p95": 5.977,
+              "max": 6.073
+            },
+            "hover": {
+              "p50": 0.024,
+              "p95": 0.03,
+              "max": 0.045
+            },
+            "completion": {
+              "p50": 0.249,
+              "p95": 0.265,
+              "max": 0.277
+            },
+            "definition": {
+              "p50": 0.025,
+              "p95": 0.034,
+              "max": 0.038
+            },
+            "signatureHelp": {
+              "p50": 0.024,
+              "p95": 0.03,
+              "max": 0.035
+            }
+          }
+        },
+        {
+          "workload": "project",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 10594,
+            "other2.dodo": 10594,
+            "other3.dodo": 10594,
+            "other4.dodo": 10594
+          },
+          "documents": 5,
+          "project_files": 20,
+          "check_mode": "package",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 266.212,
+              "p95": 381.001,
+              "max": 574.45
+            },
+            "hover": {
+              "p50": 0.059,
+              "p95": 0.118,
+              "max": 0.179
+            },
+            "completion": {
+              "p50": 2.501,
+              "p95": 3.38,
+              "max": 5.582
+            },
+            "definition": {
+              "p50": 0.069,
+              "p95": 0.136,
+              "max": 0.288
+            },
+            "signatureHelp": {
+              "p50": 0.086,
+              "p95": 0.178,
+              "max": 0.349
+            }
+          }
+        }
+      ]
+    },
+    {
+      "build": "baseline",
+      "case": "twenty_files",
+      "environment": {
+        "timestamp_utc": "2026-10-03T19:03:16.031001+00:00",
+        "platform": "macOS-27.0.1-arm64-arm-64bit",
+        "machine": "arm64",
+        "processor": "Apple M5",
+        "logical_cpus": 10,
+        "python": "3.9.6",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1",
+        "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+        "llvm": "23.1.2",
+        "compiler": "target/lsp-baseline-build/release/dodo",
+        "compiler_version": "dodo 0.1.4 (LLVM 23, BSD-2-Clause)",
+        "compiler_revision": "326003d545364e209faf2515702f2ef2682e9bb4",
+        "build_profile": "release",
+        "compiler_sha256": "7c2b0572e77d0eb3b7fb4f77c6af025cd02600f18dd2fb3c75d0ccf1d8f0daf7",
+        "benchmark_sha256": "57434faf5cd86391104f5a2e52eb33adc0b2d31f85ab465a0a43ba466b66981b",
+        "git_commit": "388f463f6c96adcb3f8f72bd274c121b21dc10d7",
+        "git_status": "M docs/src/content/docs/lsp-performance.md\n M scripts/bench_lsp.py\n?? scripts/test_bench_lsp.py",
+        "command": [
+          "scripts/bench_lsp.py",
+          "target/lsp-baseline-build/release/dodo",
+          "--features",
+          "--samples",
+          "100",
+          "--compiler-revision",
+          "326003d545364e209faf2515702f2ef2682e9bb4",
+          "--build-profile",
+          "release",
+          "--report",
+          "target/lsp-performance/pre_flow-twenty_files.json",
+          "--size",
+          "200",
+          "--documents",
+          "20"
+        ]
+      },
+      "results": [
+        {
+          "workload": "functions",
+          "size": 200,
+          "edit": "body",
+          "body_shape": null,
+          "functions": 200,
+          "bytes_per_document": 9233,
+          "document_bytes": {
+            "main.dodo": 9233,
+            "other1.dodo": 9233,
+            "other2.dodo": 9233,
+            "other3.dodo": 9233,
+            "other4.dodo": 9233,
+            "other5.dodo": 9233,
+            "other6.dodo": 9233,
+            "other7.dodo": 9233,
+            "other8.dodo": 9233,
+            "other9.dodo": 9233,
+            "other10.dodo": 9233,
+            "other11.dodo": 9233,
+            "other12.dodo": 9233,
+            "other13.dodo": 9233,
+            "other14.dodo": 9233,
+            "other15.dodo": 9233,
+            "other16.dodo": 9233,
+            "other17.dodo": 9233,
+            "other18.dodo": 9233,
+            "other19.dodo": 9233
+          },
+          "documents": 20,
+          "project_files": null,
+          "check_mode": "file",
+          "stdlib_math": false,
+          "expected_errors_per_document": 0,
+          "samples": 100,
+          "warmup": 5,
+          "milliseconds": {
+            "change_to_diagnostics": {
+              "p50": 38.659,
+              "p95": 40.392,
+              "max": 42.034
+            },
+            "hover": {
+              "p50": 0.032,
+              "p95": 0.047,
+              "max": 0.051
+            },
+            "completion": {
+              "p50": 0.504,
+              "p95": 0.55,
+              "max": 1.478
+            },
+            "definition": {
+              "p50": 0.047,
+              "p95": 0.064,
+              "max": 0.076
+            },
+            "signatureHelp": {
+              "p50": 0.031,
+              "p95": 0.041,
+              "max": 0.058
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
