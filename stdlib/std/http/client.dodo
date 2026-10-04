@@ -31,7 +31,7 @@ hops: usize, replayable: bool, method: &[u8]) -> RedirectAction {
         return RedirectAction.Reject
     }
     discard_body := status == 303 && !bytes.equal(method, b"HEAD")
-    if!policy.redirects.permits(source, destination, hops, replayable || discard_body) {
+    if !policy.redirects.permits(source, destination, hops, replayable || discard_body) {
         return RedirectAction.Reject
     }
     if discard_body {
@@ -98,7 +98,7 @@ pub struct Pool {
         if index >= self.slots.len || self.slots[index].state != SlotState.Busy {
             return false
         }
-        if!connection.reusable() {
+        if !connection.reusable() {
             self.slots[index].state = SlotState.Vacant
             return false
         }
@@ -246,7 +246,7 @@ pub struct Client {
         return self.deadline_ms
     }
     pub fn check(&mut self, now_ms: u64, cancelled: bool) -> void!connection.Error {
-        if!self.active {
+        if !self.active {
             self.inner.poison();
             return err(invalid())
         }
@@ -258,7 +258,7 @@ pub struct Client {
         return self.inner.check(now_ms, self.deadline_ms, cancelled)
     }
     fn validate_request(&self, request: &http.Request) -> bool {
-        if!self.tunnel_ready || bytes.equal(request.method, b"CONNECT") {
+        if !self.tunnel_ready || bytes.equal(request.method, b"CONNECT") {
             return false
         }
         if self.policy.proxy == Proxy.Forward {
@@ -269,7 +269,7 @@ pub struct Client {
             }
             match http.Uri.parse(request.target) {
                 ok(target) => {
-                    if!self.origin.same_origin(&target) {
+                    if !self.origin.same_origin(&target) {
                         return false
                     }
                 }

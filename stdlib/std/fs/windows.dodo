@@ -81,7 +81,7 @@ pub fn open_file(path: &native.NativeString, read: bool, write: bool, append: bo
         creation = 1
     }
     flags := 33554432u32 // FILE_FLAG_BACKUP_SEMANTICS permits directory handles.
-    if!follow {
+    if !follow {
         flags |= 2097152
     }
     unsafe {
@@ -90,7 +90,7 @@ pub fn open_file(path: &native.NativeString, read: bool, write: bool, append: bo
             return err(native.last_error())
         }
         owned := native.Handle.from_raw(handle as isize)
-        if!follow {
+        if !follow {
             value := handle_metadata(&owned)?
             if value.kind == types.FileKind.SymbolicLink {
                 return err(error.failure(error.Kind.InvalidInput))
@@ -132,7 +132,7 @@ pub fn handle_metadata(handle: &native.Handle) -> types.Metadata!error.Error {
 }
 pub fn metadata(path: &native.NativeString, follow: bool) -> types.Metadata!error.Error {
     flags := 33554432u32
-    if!follow {
+    if !follow {
         flags |= 2097152
     }
     unsafe {
@@ -342,7 +342,7 @@ pub struct Directory {
             return ok(none)
         }
         for true {
-            if!self.pending {
+            if !self.pending {
                 unsafe {
                     if FindNextFileW(self.handle as *mut u8, ptr.from_mut(&mut self.data)) == 0 {
                         reason := native.last_error()

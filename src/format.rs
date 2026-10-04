@@ -71,6 +71,7 @@ struct Plan<'a> {
     edits: Vec<Edit>,
     binary: HashSet<usize>,
     postfix: HashSet<usize>,
+    prefix: HashSet<usize>,
     literal_braces: HashSet<usize>,
     header_semicolons: HashSet<usize>,
 }
@@ -83,6 +84,7 @@ impl<'a> Plan<'a> {
             edits: Vec::new(),
             binary: HashSet::new(),
             postfix: HashSet::new(),
+            prefix: HashSet::new(),
             literal_braces: HashSet::new(),
             header_semicolons: HashSet::new(),
         }
@@ -398,9 +400,12 @@ impl<'a> Plan<'a> {
                 }
                 self.expression(value);
             }
+            ExprKind::Unary(_, value) => {
+                self.prefix.insert(expression.span.start);
+                self.expression(value);
+            }
             ExprKind::Repeat(value, _)
             | ExprKind::Constant(value, _)
-            | ExprKind::Unary(_, value)
             | ExprKind::Field(value, _)
             | ExprKind::Cast(value, _)
             | ExprKind::Try(value) => self.expression(value),
@@ -679,8 +684,10 @@ fn needs_space(
     if previous == "]" && matches!(current.kind, TokenKind::Ident(_)) {
         return matches!(text, "as" | "in" | "from" | "stores" | "requires_plain");
     }
+    // Prefix `!` spaces like any operand; other `!` tokens are postfix unwraps
+    // or the separator in `T!E` error types.
     if text == "!" {
-        return false;
+        return plan.prefix.contains(&current.span.start);
     }
     true
 }
@@ -805,6 +812,36 @@ fn main(){console.printf("{{{:08x}}} {}\n",42,true)!}
             "(r!) as i32",
             "}!",
             "r!\n    !flag",
+        ] {
+            assert!(output.contains(text), "missing {text}: {output}");
+        }
+    }
+    #[test]
+    fn separates_prefix_operators_from_preceding_tokens() {
+        let output = formatted(
+            "package p\nstruct S{v:bool}\nfn f(x:bool,y:i32,p:&i32)->bool{if !x{return !x}\nfor !x{break}\nc:=match !x{true=>!x,false=>x}\na:=!x;a=!x;b:=q(x,!x);s:=S{v:!x};g:=[!x,!x];h:=(!x);i:=!!x\nif -y>0{return x}\nif ~y==0{return x}\nif *p==0{return x}\nif &x==&x{return x}\nreturn !x}\nfn g(x:i32)->i32{return -x}\nfn h(x:i32)->i32{return ~x}\nfn k(x:&i32)->i32{return *x}\nfn m(x:i32)->&i32{return &x}\n",
+        );
+        for text in [
+            "if !x {",
+            "return !x\n",
+            "for !x {",
+            "match !x {",
+            "true => !x,",
+            "a := !x",
+            "a = !x",
+            "q(x, !x)",
+            "S { v: !x }",
+            "[!x, !x]",
+            "(!x)",
+            "i := !!x",
+            "if -y > 0",
+            "if ~y == 0",
+            "if *p == 0",
+            "if &x == &x",
+            "return -x",
+            "return ~x",
+            "return *x",
+            "return &x",
         ] {
             assert!(output.contains(text), "missing {text}: {output}");
         }
