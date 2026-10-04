@@ -26,6 +26,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "benchmarks"
+ROUTE_SHAPES = ("distinct", "shared", "nested", "wildcard", "mixed")
+ROUTE_REQUESTS = ("hit", "miss", "head", "method_not_allowed")
 
 
 def run(command, **kwargs):
@@ -57,6 +59,76 @@ def route_checksum(iterations, size, unsorted):
     return total + (size - 1 if unsorted and rest else 0)
 
 
+def sequence_checksum(iterations, values):
+    groups, rest = divmod(iterations, len(values))
+    return groups * sum(values) + sum(values[:rest])
+
+
+def dynamic_fixture(size, shape):
+    """Generate exact route IDs/errors independently of either router implementation."""
+    routes, hits = [], []
+    for i in range(size):
+        tenant = f"tenant-{i % 2:02}"
+        identifier = str(i % 97)
+        method = "GET"
+        if shape == "distinct":
+            pattern = f"/group/{i:04}/:id"
+            path = f"/group/{i:04}/{identifier}"
+            missing = path + "/missing"
+        else:
+            group = i // 4 if shape == "mixed" else i
+            pattern = f"/api/tenants/:tenant/resource{group:04}"
+            path = f"/api/tenants/{tenant}/resource{group:04}"
+            missing = f"/api/tenants/{tenant}/missing{group:04}/{identifier}"
+            if shape == "nested":
+                pattern = f"/api/tenants/:tenant/projects/:project/resource{i:04}"
+                path = f"/api/tenants/{tenant}/projects/demo/resource{i:04}"
+                missing = f"/api/tenants/{tenant}/projects/demo/missing{i:04}/{identifier}"
+            if shape == "wildcard" or (shape == "mixed" and i % 4 == 3):
+                pattern += "/*rest"
+                path += f"/{identifier}/logs/latest"
+            elif shape == "mixed" and i % 4 == 2:
+                pattern += "/new"
+                path += "/new"
+            else:
+                pattern += "/:id"
+                path += f"/{identifier}"
+                if shape == "mixed" and i % 4 == 1:
+                    method = "POST"
+        routes.append((method, pattern, i))
+        hits.append((method, path, i, 0, False, missing))
+
+    queries, checksums = [], {}
+    for request in ROUTE_REQUESTS:
+        values = []
+        for method, path, identifier, error, head, missing in hits:
+            if request == "miss":
+                method, path, identifier, error = "GET", missing, 0, 404
+            elif request == "head":
+                method, head = "HEAD", True
+                if shape == "mixed" and identifier % 4 == 1:
+                    identifier -= 1  # HEAD falls back to GET, never POST.
+            elif request == "method_not_allowed":
+                method, identifier, error = "DELETE", 0, 405
+            queries.append(f'Query {{ method: b"{method}", path: b"{path}", '
+                           f'id: {identifier}, error: {error}, head: {str(head).lower()} }}')
+            values.append(error if error else identifier + 1)
+        checksums[request] = values
+
+    prefixes = {}
+    for _, pattern, _ in routes:
+        prefix = pattern[:min((pattern.index(marker) for marker in (":", "*") if marker in pattern),
+                             default=len(pattern))]
+        prefixes[prefix] = prefixes.get(prefix, 0) + 1
+    source = (FIXTURES / "web_dynamic.dodo").read_text(encoding="utf-8")
+    entries = ",\n".join(f'web.Route {{ method: b"{method}", pattern: b"{pattern}", id: {identifier} }}'
+                         for method, pattern, identifier in routes)
+    source = source.replace("// ROUTES", entries).replace("// QUERIES", ",\n".join(queries))
+    source = source.replace("[0usize; 512]", f"[0usize; {size * 2}]")
+    return source, checksums, {"route_shape": shape, "prefix_groups": len(prefixes),
+                               "largest_prefix_group": max(prefixes.values())}
+
+
 def measure(binary, mode, payload, iterations, expected):
     data = struct.pack("<QB7x", iterations, mode) + payload
     output = run([str(binary)], input=data).decode().split()
@@ -69,8 +141,9 @@ def measure(binary, mode, payload, iterations, expected):
     return nanos
 
 
-def benchmark(binary, name, mode, payload, expected, args, **metadata):
-    iterations = 1
+def calibrate(binary, mode, payload, expected, args):
+    # A single fast lookup can fall below the host clock's tick resolution.
+    iterations = 100
     # Discard calibration passes; reach the requested duration without timing
     # process startup, compilation, stdin, stdout, or fixture construction.
     for _ in range(8):
@@ -81,8 +154,10 @@ def benchmark(binary, name, mode, payload, expected, args, **metadata):
         if adjusted == iterations:
             break
         iterations = adjusted
-    samples = [measure(binary, mode, payload, iterations, expected)
-               for _ in range(args.samples)]
+    return iterations
+
+
+def benchmark_result(name, payload, iterations, samples, **metadata):
     timings = stats([value / iterations for value in samples])
     record = {"name": name, "kind": "in_process", "iterations": iterations,
               "elapsed_ns": samples, "ns_per_op": timings,
@@ -95,7 +170,27 @@ def benchmark(binary, name, mode, payload, expected, args, **metadata):
     return record
 
 
-def compile_fixture(compiler, linker, scratch, name, optimization, source=None):
+def benchmark(binary, name, mode, payload, expected, args, **metadata):
+    iterations = calibrate(binary, mode, payload, expected, args)
+    samples = [measure(binary, mode, payload, iterations, expected)
+               for _ in range(args.samples)]
+    return benchmark_result(name, payload, iterations, samples, **metadata)
+
+
+def benchmark_pair(binary, cases, expected, args, **metadata):
+    """Alternate scan/index order to reduce warmup and host drift bias."""
+    iterations = [calibrate(binary, mode, b"", expected, args) for _, mode in cases]
+    for (_, mode), count in zip(cases, iterations):
+        measure(binary, mode, b"", count, expected)  # Discard one warmup per mode.
+    samples = [[], []]
+    for sample in range(args.samples):
+        for at in ((0, 1) if sample % 2 == 0 else (1, 0)):
+            samples[at].append(measure(binary, cases[at][1], b"", iterations[at], expected))
+    return [benchmark_result(name, b"", count, values, sample_order="alternating_scan_indexed", **metadata)
+            for (name, _), count, values in zip(cases, iterations, samples)]
+
+
+def compile_fixture(compiler, linker, scratch, name, optimization, source=None, link_sources=()):
     path = FIXTURES / f"{name}.dodo"
     if source is not None:
         path = scratch / f"{name}.dodo"
@@ -104,9 +199,14 @@ def compile_fixture(compiler, linker, scratch, name, optimization, source=None):
     command = [compiler, "compile", str(path), "-O", str(optimization), "-o", str(binary)]
     if linker:
         command += ["--linker", linker]
+    for native_source in link_sources:
+        command += ["--link-arg", str(native_source)]
     start = time.perf_counter()
     run(command)
     return binary, {"fixture": name, "optimization": optimization,
+                    "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "native_source_sha256": {str(item.relative_to(ROOT)): hashlib.sha256(item.read_bytes()).hexdigest()
+                                             for item in link_sources},
                     "seconds": time.perf_counter() - start,
                     "binary_bytes": binary.stat().st_size, "command": command}
 
@@ -233,11 +333,13 @@ def main():
     parser.add_argument("--compiler", type=Path, default=ROOT / "target/debug" / ("dodo.exe" if os.name == "nt" else "dodo"))
     parser.add_argument("--linker", help="C compiler driver, e.g. clang or an absolute path")
     parser.add_argument("--optimization", type=int, choices=range(4), nargs="+", default=[3])
-    parser.add_argument("--suite", choices=("json", "json-arrays", "json-structs", "json-strings", "web", "http", "all"), default="all")
+    parser.add_argument("--suite", choices=("json", "json-arrays", "json-structs", "json-strings", "web", "web-dynamic", "http", "all"), default="all")
     parser.add_argument("--struct-sizes", type=int, nargs="+", default=[16, 64],
                         help="field counts for json-structs (1 through 256)")
     parser.add_argument("--route-sizes", type=int, nargs="+", default=[8, 64, 256, 2048],
                         help="route counts for web benchmarks (at least 2)")
+    parser.add_argument("--route-shapes", choices=ROUTE_SHAPES, nargs="+", default=list(ROUTE_SHAPES),
+                        help="dynamic route layouts (web and web-dynamic suites)")
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--seconds", type=float, default=0.2, help="target seconds per in-process sample")
     parser.add_argument("--http-requests", type=int, default=200, help="requests per client per sample")
@@ -264,7 +366,8 @@ def main():
               "git_commit": run(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip(),
               "git_status": run(["git", "status", "--short"], cwd=ROOT).decode().strip(),
               "source_sha256": {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-                                for path in [Path(__file__).resolve(), *sorted(FIXTURES.glob("*.dodo"))]},
+                                for path in [Path(__file__).resolve(), *sorted(FIXTURES.glob("*.dodo")),
+                                             *sorted(FIXTURES.glob("*.c"))]},
               "samples": args.samples, "target_sample_seconds": args.seconds,
               "builds": [], "results": []}
     args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -355,19 +458,6 @@ def main():
                             report["results"].append(benchmark(binary, name, mode, b"", expected,
                                                                args, optimization=optimization))
                     save()
-                    source = (FIXTURES / "web_dynamic.dodo").read_text(encoding="utf-8")
-                    routes = ",\n".join(f'web.Route {{ method: b"GET", pattern: b"/group/{i:04}/:id", id: {i} }}'
-                                         for i in range(size))
-                    paths = ",\n".join(f'b"/group/{i:04}/42"' for i in range(size))
-                    source = source.replace("// ROUTES", routes).replace("// PATHS", paths)
-                    source = source.replace("[0usize; 512]", f"[0usize; {size * 2}]")
-                    binary, build = compile_fixture(compiler, linker, scratch, f"web_dynamic_{size}", optimization, source)
-                    report["builds"].append(build)
-                    for mode, kind in ((0, "scan"), (1, "indexed")):
-                        expected = lambda n, size=size: route_checksum(n, size, False)
-                        report["results"].append(benchmark(binary, f"web.dynamic.{kind}.{size}", mode, b"", expected,
-                                                           args, optimization=optimization, routes=size))
-                    save()
                 binary, build = compile_fixture(compiler, linker, scratch, "web_operations", optimization)
                 report["builds"].append(build)
                 for name, mode, expected in (
@@ -380,6 +470,23 @@ def main():
                 ):
                     report["results"].append(benchmark(binary, name, mode, b"", expected, args, optimization=optimization))
                 save()
+            if args.suite in ("web", "web-dynamic", "all"):
+                for size in args.route_sizes:
+                    for shape in args.route_shapes:
+                        source, checksums, metadata = dynamic_fixture(size, shape)
+                        binary, build = compile_fixture(compiler, linker, scratch, f"web_dynamic_{shape}_{size}",
+                                                        optimization, source,
+                                                        (FIXTURES / "web_dynamic_runtime.c",
+                                                         ROOT / "stdlib/std/time/runtime.c"))
+                        report["builds"].append(build)
+                        for request_mode, request in enumerate(ROUTE_REQUESTS):
+                            expected = lambda n, values=checksums[request]: sequence_checksum(n, values)
+                            cases = [(f"web.dynamic.{shape}.{request}.{kind}.{size}", request_mode * 2 + index_mode)
+                                     for index_mode, kind in ((0, "scan"), (1, "indexed"))]
+                            report["results"].extend(benchmark_pair(binary, cases, expected, args,
+                                                                   optimization=optimization, routes=size,
+                                                                   request=request, **metadata))
+                            save()
             if args.suite in ("http", "all"):
                 binary, build = compile_fixture(compiler, linker, scratch, "http", optimization)
                 report["builds"].append(build)

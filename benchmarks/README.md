@@ -7,6 +7,8 @@ The [single-pass struct comparison](JSON-STRUCTS.md) measures field dispatch.
 The [ordinary-string comparison](JSON-STRINGS.md) measures string fast paths.
 The [web comparison](WEB.md) measures header traversal, retained routing metadata,
 validated paths, captures, and dynamic route indexing.
+The [shared-prefix comparison](WEB-SHARED-PREFIX.md) measures dynamic layouts
+whose resource segments follow parameters and assesses a segment index.
 See [optimization opportunities](OPTIMIZATION-NOTES.md) for source-level analysis
 and additional decoding/header probes.
 
@@ -33,6 +35,7 @@ python scripts/bench_stdlib.py --suite json-arrays --optimization 0 3 --linker c
 python scripts/bench_stdlib.py --suite json-structs --optimization 0 3 --linker clang
 python scripts/bench_stdlib.py --suite json-strings --optimization 0 3 --linker clang
 python scripts/bench_stdlib.py --suite web --samples 9 --seconds 0.5 --linker clang
+python scripts/bench_stdlib.py --suite web-dynamic --route-sizes 8 64 256 2048 --linker clang
 python scripts/bench_stdlib.py --suite http --http-requests 500 --linker clang
 
 # Short execution/correctness check, not a performance baseline.
@@ -45,6 +48,9 @@ The report includes the compiler version/hash, Git revision/status, fixture and
 runner hashes, OS/CPU/Python information, compilation time, executable size,
 iteration counts, and timing distributions. Temporary executables are removed
 and local HTTP servers are stopped when the runner finishes or fails.
+Generated fixture sources and linked C sources have their own hashes in each
+build record. Dynamic routing results also record the literal-prefix group count
+and largest group size.
 
 ## Workloads
 
@@ -58,7 +64,7 @@ and local HTTP servers are stopped when the runner finishes or fails.
 | JSON struct decoding | Derived decoding of 16 and 64 integer fields in reverse schema order, with both ordinary and indexed validation. Indexed parsing is measured separately. Run alone with `--suite json-structs`; also included in `json` and `all`. Use `--struct-sizes` to select widths from 1 through 256. |
 | JSON wide objects | Parsing 32, 256, and 1,024 distinct keys with both `parse` and `parse_indexed`, including duplicate-name checks. Indexed cases use 5,120 scratch words (1,024 live members); index reset and construction are timed. |
 | Web router | Successful GET lookup cycling through every route in tables of 8, 64, 256, and 2,048 literal routes: sorted, indexed, and unsorted. Select sizes with `--route-sizes`. The optional hash index uses twice as many slots as routes. |
-| Web dynamic routing | Scanned versus indexed lookup of `/group/NNNN/:id` routes at the same table sizes. |
+| Web dynamic routing | Scanned versus indexed lookup at the same table sizes: distinct prefixes, tenant resources sharing one prefix, nested tenant/project resources, terminal wildcards, and mixed literal/parameter/wildcard routes with GET/POST methods. Each layout measures hits, shared-prefix misses (404), HEAD fallback, and rejected methods (405). Run alone with `--suite web-dynamic`; select layouts with `--route-shapes distinct shared nested wildcard mixed`. |
 | Web headers | Enumerating 32 copied headers by ordinal lookup versus a sequential byte cursor. |
 | Web parameters | Repeated named lookup with full pattern matching versus captured request offsets. |
 | Web validated paths | Router lookup with path validation versus reuse of a borrowed `web.Path`. |
@@ -86,7 +92,25 @@ detection dominating the result. Ordinary decoding retains that validation cost.
 `web.dodo` is a source template: the runner fills its route table before
 compiling it. Its router construction, registration validation, and optional
 index construction happen outside the timed region.
-`web_dynamic.dodo` similarly fills route patterns and matching concrete paths.
+`web_dynamic.dodo` similarly fills route patterns and independently expected
+request results. It preflights every generated request outside timing, then
+cycles uniformly through the selected request class. Tenant values and IDs vary;
+the nested case includes a project parameter. Mixed tables repeat four entries:
+GET/POST `/:id`, GET `/new`, and GET `/*rest`. The `/new` hit tests literal
+precedence, the `/:id` hit tests parameter precedence over a wildcard, and HEAD
+on the POST request must select the corresponding GET route. Nonmultiples of
+four keep the final partial group.
+
+Dynamic routing uses benchmark-only C stdin/stdout calls and the existing
+`std/time/runtime.c` monotonic clock at timer boundaries. All routing remains in
+the compiled Dodo fixture, and there are no C calls inside the lookup loop.
+This suite can run on hosts such as macOS without Dodo hosted adapters; the
+other suites require supported hosted targets. Each scan/index pair discards
+calibration and one warmup per mode, then alternates execution order across
+measured batches. IDs, HEAD flags, and exact 404/405 errors are asserted in the
+loop; Python checks checksums, including partial route cycles. Run correctness
+guards with `python scripts/test_bench_stdlib.py` after building Dodo (O0/O3,
+all five layouts and four request classes, including an incomplete mixed group).
 `web_operations.dodo` compares ordinal and sequential header access, parameter
 access, and validated-path lookup. Its capture and path-proof construction are
 outside timing; the application benchmark includes request construction.
@@ -94,8 +118,9 @@ outside timing; the application benchmark includes request construction.
 ## Measurement boundaries
 
 In-process cases use `std/time/hosted.MonotonicClock` inside the compiled Dodo
-program. Calibration passes are discarded. Each of seven measured batches aims
-for 0.2 seconds by default (at least one operation), and the report summarizes
+program, or the same C clock backend for dynamic routing. Calibration passes are
+discarded. Each of seven measured batches aims for 0.2 seconds by default (at
+least one operation), and the report summarizes
 batch-average nanoseconds per operation. Process startup, input/output, fixture
 construction, and compilation are excluded. Byte throughput uses the full input
 length; derived encoding emits the same number of bytes as its input fixture.
@@ -118,10 +143,14 @@ The serial and concurrent modes have different connection lifetimes, so their
 rates do not isolate execution-policy costs. Python and the shared machine can
 limit throughput; these results do not establish the server's maximum capacity.
 
-The router cases use successful literal and parameterized matches. Dynamic
-tables have distinct literal prefixes; routes sharing a prefix still scan within
-their group. The application case exercises parameter matching and query decoding.
-This suite does not characterize errors, large bodies, streaming, TLS, or remote
-network behavior. Keep the same machine, inputs, optimization, sample settings,
+The literal router cases use successful matches. Dynamic tables cover both
+distinct prefixes and single-prefix groups, including routing misses and method
+errors. These are controlled synthetic layouts modeled on tenant-scoped APIs,
+with uniform requests rather than a production traffic distribution. The 2,048
+route case is a scaling stress case. Index construction and the quadratic
+ambiguity checks are excluded from lookup times. The application case exercises
+parameter matching and query decoding.
+This suite does not characterize transport errors, large bodies, streaming, TLS,
+or remote network behavior. Keep the same machine, inputs, optimization, sample settings,
 and connection policy for before/after comparisons. There are no performance
 thresholds or claims of statistical significance.
