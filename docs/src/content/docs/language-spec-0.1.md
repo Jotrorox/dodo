@@ -183,12 +183,12 @@ same unit. Only direct imports are in scope; imports are not re-exports.
 
 **PKG-CORE.** Imports starting with `core/`, `alloc/`, or `std/` must resolve from
 the compiler's bundled library, never local files. Unknown bundled imports are
-errors. `core/mem`, `core/ptr`, and `core/mmio` are compiler intrinsics and must
-be directly imported to use their calls. `core.drop`, `core.wrapping_add`,
-`core.wrapping_sub`, and `core.wrapping_mul` are available without an import.
-Package names `core`, `mem`, `ptr`, and `mmio` are reserved. These aliases
-are also reserved except for a matching `core/mem`, `core/ptr`, or `core/mmio`
-import. A bundled package cannot depend on a local package. Target selection
+errors. `core/mem`, `core/ptr`, `core/mmio`, and `core/cpu` are compiler
+intrinsics and must be directly imported to use their calls. `core.drop`,
+`core.wrapping_add`, `core.wrapping_sub`, and `core.wrapping_mul` are available
+without an import. Package names `core`, `mem`, `ptr`, `mmio`, and `cpu` are
+reserved. These aliases are also reserved except for a matching `core/mem`,
+`core/ptr`, `core/mmio`, or `core/cpu` import. A bundled package cannot depend on a local package. Target selection
 for bundled platform adapters is implementation-defined (ID-LIB).
 
 ### 2.3. Visibility
@@ -1122,7 +1122,7 @@ for ownership and eventual destruction is the unsafe caller's obligation.
 **PTR-ALIAS.** Raw-pointer copying alone does not create an exclusive loan.
 However, every raw access must respect live checked loans: shared-borrowed
 storage must not be mutated or invalidated except through the specified atomic
-storage primitives of section 15.4, and exclusively borrowed storage
+storage primitives of section 15.5, and exclusively borrowed storage
 must not be accessed through an independent route while that loan is live.
 Access through a pointer derived from the active exclusive reference is allowed
 with its permissions and reborrow restrictions. Raw pointer casts cannot upgrade
@@ -1258,7 +1258,30 @@ CPU barriers, or synchronization operations.
 Interrupts, DMA, and multiple cores require appropriate atomics, target
 barriers, or correctly scoped critical sections.
 
-### 15.4. Mutable static state
+### 15.4. Processor control
+
+`core.cpu` supplies the processor operations that device code cannot express
+with memory accesses:
+
+```dodo
+fn fence() -> void
+fn disable_interrupts() -> bool
+unsafe fn restore_interrupts(enabled: bool) -> void
+fn wait_for_interrupt() -> void
+```
+
+**CORE-CPU.** `fence` is a sequentially consistent hardware memory barrier on
+every target. `disable_interrupts` masks maskable interrupts on the executing
+core and returns whether they were enabled; `restore_interrupts` re-enables them
+only when its argument is true. Restoring is unsafe because it may end an
+enclosing critical section; its argument must come from the matching
+`disable_interrupts`. `wait_for_interrupt` may suspend the core until an
+interrupt is pending. Masking interrupts never excludes other threads or cores.
+Targets without an interrupt mask visible to the program treat masking and
+waiting as no-operations; a target that has one but is unsupported must reject
+any reachable use rather than silently weaken a critical section (ID-HW).
+
+### 15.5. Mutable static state
 
 Mutable static globals require unsafe access unless a synchronization primitive
 encapsulates them. Core atomics are the narrow exception to ordinary immutable
@@ -1268,7 +1291,7 @@ storage accessible concurrently.
 Interrupt-safe wrappers must account for every context that can reach the
 underlying storage.
 
-### 15.5. DMA
+### 15.6. DMA
 
 A DMA wrapper must keep its transfer buffer alive and unavailable for conflicting
 CPU access until completion. Dropping an active transfer must safely stop it or
@@ -1380,7 +1403,7 @@ encoding, and environment initialization are implementation-defined (ID-RUNTIME)
 ### 16.4. Assembly and barriers
 
 Inline assembly, user alignment/section/export attributes, custom interrupt ABI,
-general target barriers, and custom panic-handler syntax are outside 0.1 and
+target barriers beyond `cpu.fence`, and custom panic-handler syntax are outside 0.1 and
 must not be silently accepted as those features. Unaligned data requires explicit
 unaligned operations; ordinary references with invalid alignment must not be
 created. Device/interrupt/DMA libraries must supply appropriate platform contracts.
@@ -1720,6 +1743,7 @@ execution cases and enforced static boundaries are identified separately.
 | PTR-ALIAS, PTR-VIEW | E `spec::pointer_integer_round_trip_offsets_and_byte_access`, `owner_view_arguments_keep_their_effects_and_order`; R `storage::owned_views_are_unsafe_to_construct_and_require_matching_access`, `views_cannot_escape_owner_or_erase_underlying_dependencies`, `live_views_prevent_replacement_removal_and_destruction`, `opaque_views_reject_nested_reference_and_result_payloads`; E/R `storage::shared_dependencies_do_not_become_exclusive_when_mutating_owned_fields`. These reject checked conflicts; they do not dynamically validate raw accesses. |
 | PTR-BYTES, CORE-MEM | E `spec::pointer_integer_round_trip_offsets_and_byte_access`, `core::core_storage_pointers_and_owned_exchange`, `opaque_storage_moves_without_dropping_contents`; R `core::pointer_and_storage_errors_are_diagnostics`. |
 | CORE-MMIO, sections 15.2–15.3 | T `compiler::gpio_emits_volatile_accesses_without_host_execution`; R `sema::mmio_checked`; board address/width legality remains an unsafe precondition. |
+| CORE-CPU, section 15.4 | R `sema::cpu_operations_checked`; T `hal_library::interrupt_control_lowers_to_each_architecture_mask`; R/T `hal_library::freestanding_targets_without_an_interrupt_model_are_rejected`; E `hal_library::registers_protocols_and_fakes_execute_on_the_host`. |
 | ABI-C | E `spec::c_scalar_results_and_struct_pointer_layout_interoperate`; R `spec::incompatible_lowered_foreign_declarations_fail_before_linking`; E `regressions::foreign_narrow_integer_arguments_follow_the_c_abi`, `compiler::hello_uses_native_c_abi`, `imported_foreign_declarations_keep_their_c_symbol_name`, `repeated_foreign_declarations_across_packages_share_a_c_symbol`; E/R `spec::hosted_entry_signatures_and_c_definitions`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`. |
 | ABI-NATIVE, ABI-ENTRY | T `spec::target_profiles_publish_width_endianness_and_native_symbols`; A/R/E `spec::hosted_entry_signatures_and_c_definitions`; E `compiler::cli_run_preserves_program_exit_status`; T `compiler::emits_llvm_ir_bitcode_assembly_and_object_files`. |
 | Bindings, returns, patterns, sections 5–6 and 11–12 | E `compiler::immutable_runtime_bindings_preserve_mutable_references_and_function_tails`, `recursive_patterns_ranges_guards_and_conditional_bindings_execute`, `alternative_patterns_retry_guards_in_order`; R `compiler::new_binding_and_pattern_forms_reject_invalid_programs`, `rejects_unhandled_results_and_incompatible_propagation`; A/R/E `tests/reference_iteration.rs`. |
@@ -1751,7 +1775,7 @@ tests constrain the documented choice, not every possible conforming choice.
 | ID-LIB: bundled platform selection | Imports are embedded in the compiler. `std/{platform,fs,process,env,thread,sync,net,tls,web}/native` selects `linux` for x86_64 Linux GNU and `windows` for x86_64 Windows GNU/MSVC. An explicit mismatching adapter or unsupported target is rejected. Portable packages need no hosted adapter. Evidence: `tests/platform_library.rs` and `packages::portable_package_dependencies_are_independent_and_reserved` (A/R). |
 | ID-RUNTIME: startup and linking | Hosted builds use a native C linker driver. Importing std/env initializes its argument runtime from the C main arguments before source main; other library facilities initialize through explicit calls. Raw object/IR emission supplies no startup. Freestanding startup, linker scripts, system libraries, and OS exit-status encoding are supplied by the target/toolchain. Evidence: `spec::hosted_entry_signatures_and_c_definitions` (A/R/E), `tests/env_library.rs` (E), `compiler::emits_llvm_ir_bitcode_assembly_and_object_files` (T). |
 | ID-TRAP: failure mechanism | `--panic auto` writes the check kind, file, line, and column to stderr and calls C `abort` on supported hosted targets; other targets use `llvm.trap`, which may itself lower to C `abort`. `--panic hosted`, `--panic trap`, and `--panic-hook SYMBOL` select behavior explicitly for checked operations and ordinary assertions. The non-returning C ABI hook receives static NUL-terminated check/file strings and u32 line/column and owns termination without a fallback trap; returning is undefined behavior. The hosted test runner uses its own reporting and trap behavior. No mode unwinds, runs destructors, or supplies a reset driver. Instruction, signal/exception, and exit encoding are target-specific. Evidence: `tests/debugging.rs`, `compiler::arithmetic_and_index_traps_survive_optimization`, `spec::checked_float_cast_boundaries_trap` (E/T). |
-| ID-HW: device access and atomics | MMIO widths are restricted as in CORE-MMIO and use volatile loads/stores; board address legality is an unsafe precondition. Native integer atomic capabilities/orderings are target-restricted; unsupported operations are diagnosed, with no implicit libatomic fallback. Evidence: `compiler::gpio_emits_volatile_accesses_without_host_execution` (T), `tests/thread_library.rs::atomic_ordering_and_target_capabilities_are_checked` (R/T). |
+| ID-HW: device access and atomics | MMIO widths are restricted as in CORE-MMIO and use volatile loads/stores; board address legality is an unsafe precondition. CORE-CPU masks PRIMASK on bare-metal Arm M-profile targets and `mstatus.MIE` on bare-metal RISC-V (machine mode); hosted Linux, Windows, Apple, BSD, Android, and WASI targets have no program-visible mask, so masking and waiting are no-ops there; other targets reject reachable masking or waiting after dead-code elimination. Native integer atomic capabilities/orderings are target-restricted; unsupported operations are diagnosed, with no implicit libatomic fallback. Evidence: `compiler::gpio_emits_volatile_accesses_without_host_execution` (T), `tests/thread_library.rs::atomic_ordering_and_target_capabilities_are_checked` (R/T). |
 | ID-LIMIT: resource limits | Parser nesting: 64 levels. Constant dependency depth: 128; expansion work: 200,000 nodes. Array count must fit target usize and u32; nonzero repeated constants are limited to 1,000,000 elements. Generic instantiation: 4,096 specializations and 64 nested specializations (including generated methods). Pattern expansion: 4096 alternatives; exhaustiveness work has a 131,072-unit budget (charged for matrix rows and type columns); exhaustion must diagnose, not assume coverage. Evidence: `compiler::generic_specialization_breadth_and_depth_have_separate_limits` (R), `compiler::constant_cycles_width_and_expansion_limits_are_diagnosed` (R), `sema::excessive_pattern_expansion_reports_a_diagnostic` (R), `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors` (R). |
 | ID-DIAG: diagnostic presentation | Errors identify a source location where available. Text wording, ordering, number of follow-on errors, and CLI/LSP presentation are not a stable machine-readable language ABI. Editor transport is separately documented. Evidence: `tests/diagnostics.rs`, `tests/lsp.rs`, `package::diagnostic_labels_resolve_each_file_independently` (A/R). |
 

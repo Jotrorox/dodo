@@ -1,36 +1,118 @@
 package gpio
-import "core/mmio"
 
-pub struct Pin {
-    set_address: usize
-    clear_address: usize
-    mask: u32
+import "std/hal"
 
-    // SAFETY: The caller supplies valid, aligned 32-bit SET/CLEAR registers,
-    // a valid mask, and exclusive peripheral access for the handle's lifetime.
-    // The peripheral must remain powered and configured while the handle exists.
-    pub unsafe fn claim(set: usize, clear: usize, mask: u32) -> Pin {
-        return Pin { set_address: set, clear_address: clear, mask }
+// Chip support for the RP2040 single-cycle I/O (SIO) block: the layer that
+// turns datasheet addresses into the portable `std/hal` pin protocol. Driver
+// code written against that protocol runs unchanged here and, with
+// `std/hal/fake`, in desktop tests.
+//
+// This is a hardware template, not a desktop program. It assumes the board's
+// startup code already routed the pins to SIO (IO_BANK0 function 5).
+//
+// Build an object for the chip with:
+//     dodo build examples/gpio.dodo --emit obj --target thumbv6m-none-eabi -o gpio.o
+
+const SIO_BASE: usize = 0xD000_0000
+const GPIO_IN: usize = SIO_BASE + 0x004
+const GPIO_OUT_SET: usize = SIO_BASE + 0x014
+const GPIO_OUT_CLR: usize = SIO_BASE + 0x018
+const GPIO_OE_SET: usize = SIO_BASE + 0x024
+const GPIO_OE_CLR: usize = SIO_BASE + 0x028
+const PIN_COUNT: u32 = 30
+
+// The 30 user GPIOs. Each pin can be taken once, so two drivers can never
+// own the same pin.
+pub struct Port {
+    taken: u32
+
+    // SAFETY: call once at startup; the program must not otherwise touch the
+    // SIO GPIO registers while this Port or any Pin taken from it exists.
+    pub unsafe fn take() -> Port {
+        return Port { taken: 0 }
     }
 
-    pub fn high(&mut self) {
-        // SAFETY: claim's contract guarantees a valid exclusive SET register.
+    // Claim pin `number` as a push-pull output, initially low.
+    pub fn output(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.claim(number)?
+        pin.set_low()
+        // SAFETY: the SET/CLR aliases change only this pin's bit.
         unsafe {
-            mmio.write32(self.set_address, self.mask)
+            enable: hal.Reg<u32> = hal.Reg.at(GPIO_OE_SET)
+            enable.write(pin.mask)
         }
+        return ok(pin)
     }
 
-    pub fn low(&mut self) {
-        // SAFETY: claim's contract guarantees a valid exclusive CLEAR register.
+    // Claim pin `number` as an input.
+    pub fn input(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.claim(number)?
+        // SAFETY: the SET/CLR aliases change only this pin's bit.
         unsafe {
-            mmio.write32(self.clear_address, self.mask)
+            disable: hal.Reg<u32> = hal.Reg.at(GPIO_OE_CLR)
+            disable.write(pin.mask)
+        }
+        return ok(pin)
+    }
+
+    fn claim(&mut self, number: u32) -> Pin!hal.Error {
+        if number >= PIN_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        mask := 1u32 << number
+        if (self.taken & mask) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.taken |= mask
+        // SAFETY: SET and CLR are write-only per-bit aliases and IN is
+        // read-only, so pins sharing them never conflict; `taken` makes this
+        // pin's bit exclusive to the returned handle.
+        unsafe {
+            return ok(Pin {
+                set: hal.Reg.at(GPIO_OUT_SET),
+                clear: hal.Reg.at(GPIO_OUT_CLR),
+                input: hal.Reg.at(GPIO_IN),
+                mask,
+            })
         }
     }
 }
 
-pub fn pulse(pin: &mut Pin, count: usize) {
-    for _ in 0..count {
-        pin.high()
-        pin.low()
+// One GPIO. Implements the `std/hal` output and input pin protocols.
+pub struct Pin {
+    set: hal.Reg<u32>
+    clear: hal.Reg<u32>
+    input: hal.Reg<u32>
+    mask: u32
+
+    pub fn set_high(&mut self) {
+        self.set.write(self.mask)
     }
+
+    pub fn set_low(&mut self) {
+        self.clear.write(self.mask)
+    }
+
+    pub fn is_high(&self) -> bool {
+        return self.input.any(self.mask)
+    }
+}
+
+// Portable code: works with this chip's Pin, a fake pin, or any other pin.
+pub fn pulse<P>(pin: &mut P, count: usize) {
+    for _ in 0..count {
+        pin.set_high()
+        pin.set_low()
+    }
+}
+
+// An entry point the board's startup code can call.
+pub fn blink_led() -> void!hal.Error {
+    // SAFETY: this is the only code that uses the SIO GPIO registers.
+    port := unsafe {
+        Port.take()
+    }
+    led := port.output(25)?
+    pulse(&mut led, 3)
+    return ok()
 }

@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STDLIB = ROOT / "stdlib"
 OUTPUT = ROOT / "docs/src/content/docs/api"
 REPOSITORY = "https://github.com/Jotrorox/dodo/blob/main/"
-INTRINSIC_IMPORTS = {"core/mem", "core/ptr", "core/mmio"}
+INTRINSIC_IMPORTS = {"core/mem", "core/ptr", "core/mmio", "core/cpu"}
 VIRTUAL_IMPORTS = {
     f"std/{family}/native"
     for family in ("platform", "fs", "env", "process", "thread", "sync", "net", "time", "tls", "web")
@@ -296,7 +296,7 @@ def guide_for(module: str) -> str:
         "text_alloc": "text", "text_shared": "text", "float_decimal": "text",
         "encoding": "json", "checksum": "hash", "fs": "filesystem",
         "env": "environment", "process": "processes", "thread": "threads",
-        "sync": "synchronization", "net": "networking",
+        "sync": "synchronization", "net": "networking", "hal": "hardware",
     }.get(family, family)
 
 

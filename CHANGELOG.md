@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Add `std/hal`, a portable hardware abstraction layer: typed volatile
+  registers (`hal.Reg<T>`) with mask-constant fields, interrupt-masking
+  `hal.Critical` sections, one shared `hal.Error`, statically checked pin,
+  delay, I2C, and SPI protocols with register and chip-select helpers, and
+  serial ports through the existing `std/io` protocols.
+- Add `std/hal/fake` in-memory pins, delays, and I2C/SPI buses so drivers run
+  under `dodo test` on a desktop.
+- Add the `core/cpu` intrinsics `fence`, `disable_interrupts`,
+  `restore_interrupts`, and `wait_for_interrupt` (spec CORE-CPU). They lower to
+  PRIMASK on bare-metal Cortex-M and `mstatus.MIE` on bare-metal RISC-V, are
+  no-ops on hosted targets, and are rejected on other targets only when
+  reachable. `cpu` is now a reserved package name.
+- Rework the GPIO example into RP2040 chip support built on `std/hal`, add a
+  desktop-testable I2C sensor driver example, and add the
+  [hardware and embedded guide](https://jotrorox.github.io/dodo/hardware/).
+
 ## 0.1.4 — 2026-09-20
 
 Dodo 0.1.4 adds optional project manifests, typed JSON codecs, editor inlay

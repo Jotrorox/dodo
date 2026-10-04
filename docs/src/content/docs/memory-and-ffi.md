@@ -167,6 +167,10 @@ respective references.
 | `mem.uninit_as_mut_ptr(&mut storage)` | `*mut T` | Requires an exclusive reference to the storage. |
 | `mmio.read8/16/32/64(address)` | Corresponding unsigned integer | Unsafe; `address: usize`. |
 | `mmio.write8/16/32/64(address, value)` | `void` | Unsafe; width-matched value. |
+| `cpu.fence()` | `void` | Safe; full hardware memory barrier. |
+| `cpu.disable_interrupts()` | `bool` | Safe; masks interrupts, returns whether they were enabled. |
+| `cpu.restore_interrupts(enabled)` | `void` | Unsafe; re-enables only if `enabled`. |
+| `cpu.wait_for_interrupt()` | `void` | Safe; sleeps until an interrupt is pending. |
 | `ptr.read(pointer)` | Pointee value | Unsafe; raw pointer. |
 | `ptr.write(pointer, value)` | `void` | Unsafe; mutable raw pointer; overwrites without dropping. |
 | `ptr.read_unaligned(pointer)` | Pointee value | Unsafe; load alignment one. |
@@ -204,7 +208,7 @@ The following compiler calls support checked library implementations:
 
 Atomic raw-storage intrinsics are described [below](#atomic-storage-intrinsics).
 There is no user-defined intrinsic mechanism. Each package must directly import
-`core/mem`, `core/ptr`, or `core/mmio` for the corresponding calls.
+`core/mem`, `core/ptr`, `core/mmio`, or `core/cpu` for the corresponding calls.
 
 ## Initialize opaque storage
 
@@ -324,14 +328,39 @@ are in [standard library](standard-library.md).
 
 ## MMIO and volatile access
 
-MMIO uses LLVM volatile loads/stores directly, without fabricating checked
-references. The compiler rejects widths above the target pointer width; actual
+Prefer the typed `hal.Reg<T>` handles in [hardware and embedded](hardware.md);
+they lower to exactly these operations. MMIO uses LLVM volatile loads/stores
+directly, without fabricating checked references. The compiler rejects widths above the target pointer width; actual
 device access legality remains a target/board obligation. Volatile operations
 are not atomics or CPU barriers.
 
 LLVM lowering follows the [LLVM Language Reference](https://llvm.org/docs/LangRef.html),
 including explicit overflow intrinsics, volatile instructions, and x86 SysV
 C-ABI integer extension attributes on declarations and call sites.
+
+## CPU control
+
+`core/cpu` exposes the few processor operations that device code cannot
+express with memory accesses. `std/hal` builds its `Critical` section on them.
+
+| Target | `disable_interrupts` / `restore_interrupts` | `wait_for_interrupt` |
+| --- | --- | --- |
+| Bare-metal Arm Cortex-M (`thumbv6m`, `thumbv7m`, `thumbv7em`, `thumbv8m*`) | `mrs PRIMASK` + `cpsid i` / `msr PRIMASK` | `wfi` |
+| Bare-metal RISC-V machine mode (`riscv32`, `riscv64`) | `csrrci mstatus, 8` / `csrs mstatus` | `wfi` |
+| Hosted OS targets (Linux, Windows, macOS, BSDs, WASI) | No-op; returns `false` | No-op |
+| Other freestanding targets | Rejected if the call is reachable | Rejected if reachable |
+
+`cpu.fence()` is available on every target and lowers to a sequentially
+consistent LLVM `fence` (`dmb` on Arm, `fence rw, rw` on RISC-V). Use it to order
+ordinary memory writes, such as a DMA buffer, before the volatile access that
+starts a device.
+
+Restoring is unsafe because enabling interrupts inside an enclosing critical
+section would end that section early; pass back exactly the value returned by
+the matching `disable_interrupts`. Masking interrupts never excludes other
+threads or cores. Hosted programs have no interrupt mask to change, which is
+why the operations are no-ops there and why drivers that use critical sections
+can still be tested on a desktop.
 
 ## Atomic storage intrinsics
 

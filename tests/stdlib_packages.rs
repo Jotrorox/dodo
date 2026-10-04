@@ -181,7 +181,7 @@ fn local_packages_cannot_conflict_with_bundled_or_intrinsic_aliases() {
             .unwrap_err()
             .contains("reserved for compiler intrinsics")
     );
-    for alias in ["mem", "ptr", "mmio"] {
+    for alias in ["mem", "ptr", "mmio", "cpu"] {
         let source = workspace.write("main.dodo", &format!("package {alias}\n"));
         let error = package::load(&source).unwrap_err();
         assert!(error.contains("conflicting package name"), "{error}");

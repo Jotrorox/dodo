@@ -60,7 +60,7 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 | Errors | Mandatory Result handling, explicit matching, `?`, panic-on-error `!`. | No exceptions, automatic error conversion, or panic unwinding. |
 | Generic behavior | Concrete specialization and statically checked public method protocols. | No general trait/constraint system or separately compiled generic interfaces. |
 | Packages | Single-file and directory imports, aliases, public/private declarations, embedded library. | Optional build manifest; local dependencies only, with no package manager, registry, or re-exports. |
-| Foreign and hardware code | C primitive/pointer calls, raw storage, volatile MMIO, layout queries. | No C aggregate-by-value calls, C variadics, inline assembly, or interrupt attributes. |
+| Foreign and hardware code | C primitive/pointer calls, raw storage, volatile MMIO, typed registers, interrupt masking, layout queries. | No C aggregate-by-value calls, C variadics, user inline assembly, or interrupt attributes. |
 | Hosted library | Files, processes, environment, threads, atomics, synchronization, networking, TLS, HTTP, web routing. | Availability and native dependencies vary by target; see [platform support](platform.md). |
 
 Named omission here means unavailable syntax or behavior, not a suggestion to

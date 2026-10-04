@@ -2108,7 +2108,7 @@ impl<'a> Checker<'a> {
                     || self.context.enums.contains_key(&prefix)
                     || prefix == "core"
                     || prefix.starts_with("core.")
-                    || matches!(prefix.as_str(), "mmio" | "mem" | "ptr"))
+                    || matches!(prefix.as_str(), "mmio" | "mem" | "ptr" | "cpu"))
             {
                 expression.kind = ExprKind::Call {
                     name: qualified,
@@ -3410,7 +3410,7 @@ impl<'a> Checker<'a> {
             });
         }
         let normalized = if let Some((prefix, suffix)) = name.split_once('.') {
-            if matches!(prefix, "mem" | "ptr" | "mmio") {
+            if matches!(prefix, "mem" | "ptr" | "mmio" | "cpu") {
                 if !self.context.imports.contains(&format!("core/{prefix}")) {
                     return Err(Diagnostic::new(
                         span,
@@ -4086,6 +4086,35 @@ impl<'a> Checker<'a> {
             self.arguments(args, &expected, span)?;
             return Ok(Value {
                 ty: if write { Type::Void } else { ty },
+                deps: vec![],
+            });
+        }
+        if let Some(operation) = name.strip_prefix("core.cpu.") {
+            if !type_args.is_empty() {
+                return Err(Diagnostic::new(
+                    span,
+                    "CPU operations do not accept type arguments",
+                ));
+            }
+            // Masking is safe, as in a critical section's entry; restoring may
+            // end an enclosing critical section, so its caller must uphold that.
+            let (parameters, result) = match operation {
+                "fence" | "wait_for_interrupt" => (vec![], Type::Void),
+                "disable_interrupts" => (vec![], Type::Bool),
+                "restore_interrupts" => {
+                    self.unsafe_required(span, "restoring the interrupt mask")?;
+                    (vec![Type::Bool], Type::Void)
+                }
+                _ => {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("unknown CPU operation `{operation}`"),
+                    ));
+                }
+            };
+            self.arguments(args, &parameters, span)?;
+            return Ok(Value {
+                ty: result,
                 deps: vec![],
             });
         }
@@ -5837,6 +5866,28 @@ mod tests {
         rejects(
             "import \"core/mmio\"\nfn f(address: usize) -> u32 { return mmio.read32(address) }",
             "explicit unsafe block",
+        );
+    }
+    #[test]
+    fn cpu_operations_checked() {
+        accepts(
+            "import \"core/cpu\"\nfn f() -> void {\n cpu.fence()\n cpu.wait_for_interrupt()\n was := cpu.disable_interrupts()\n unsafe { cpu.restore_interrupts(was) }\n}",
+        );
+        rejects(
+            "import \"core/cpu\"\nfn f() -> void { cpu.restore_interrupts(true) }",
+            "explicit unsafe block",
+        );
+        rejects(
+            "import \"core/cpu\"\nfn f() -> void { cpu.halt() }",
+            "unknown CPU operation",
+        );
+        rejects(
+            "import \"core/cpu\"\nfn f() -> void { unsafe { cpu.restore_interrupts(1) } }",
+            "",
+        );
+        rejects(
+            "fn f() -> void { cpu.fence() }",
+            "requires `import \"core/cpu\"`",
         );
     }
     #[test]

@@ -1,0 +1,183 @@
+package fake
+
+import "core/option"
+import "std/hal"
+
+// In-memory devices implementing the `std/hal` protocols. They let driver
+// code run under `dodo test` on a desktop with no hardware attached, and
+// record what the driver did so tests can assert on it.
+
+// An output and input pin. It starts low.
+pub struct Pin {
+    high: bool
+    changes: u32
+
+    pub fn new() -> Pin {
+        return Pin { high: false, changes: 0 }
+    }
+
+    pub fn set_high(&mut self) {
+        if !self.high {
+            self.changes += 1
+        }
+        self.high = true
+    }
+
+    pub fn set_low(&mut self) {
+        if self.high {
+            self.changes += 1
+        }
+        self.high = false
+    }
+
+    pub fn is_high(&self) -> bool {
+        return self.high
+    }
+
+    // Number of level changes so far, for example 2 per blink.
+    pub fn changes(&self) -> u32 {
+        return self.changes
+    }
+}
+
+// A delay that returns immediately and adds up the requested time.
+pub struct Delay {
+    elapsed: u64
+
+    pub fn new() -> Delay {
+        return Delay { elapsed: 0 }
+    }
+
+    pub fn delay_us(&mut self, microseconds: u32) {
+        self.elapsed += microseconds as u64
+    }
+
+    pub fn elapsed_us(&self) -> u64 {
+        return self.elapsed
+    }
+}
+
+// One I2C device with 256 numbered 8-bit registers, the layout used by most
+// sensors. A write sets the register pointer from its first byte and stores
+// any following bytes at successive registers; a read continues from the
+// pointer. Other addresses report NoAcknowledge.
+pub struct I2c {
+    address: u8
+    registers: [256]u8
+    pointer: u8
+    failure: Option<hal.Error>
+
+    pub fn new(address: u8) -> I2c {
+        return I2c { address, registers: [0; 256], pointer: 0, failure: none }
+    }
+
+    pub fn register(&self, index: u8) -> u8 {
+        return self.registers[index as usize]
+    }
+
+    pub fn set_register(&mut self, index: u8, value: u8) {
+        self.registers[index as usize] = value
+    }
+
+    // Make the next transaction fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+
+    fn begin(&mut self, address: u8) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if address != self.address {
+            return err(hal.Error.NoAcknowledge)
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        self.begin(address)?
+        if bytes.len == 0 {
+            return ok()
+        }
+        self.pointer = bytes[0]
+        for index in 1..bytes.len {
+            self.registers[self.pointer as usize] = bytes[index]
+            self.pointer = core.wrapping_add(self.pointer, 1)
+        }
+        return ok()
+    }
+
+    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
+        self.begin(address)?
+        for index in 0..buffer.len {
+            buffer[index] = self.registers[self.pointer as usize]
+            self.pointer = core.wrapping_add(self.pointer, 1)
+        }
+        return ok()
+    }
+
+    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        self.write(address, bytes)?
+        return self.read(address, buffer)
+    }
+}
+
+// An SPI bus that records the most recent 64 bytes sent and answers each
+// byte from a programmed reply, then with zeros.
+pub struct Spi {
+    sent: [64]u8
+    sent_length: usize
+    reply: [64]u8
+    reply_length: usize
+    reply_position: usize
+
+    pub fn new() -> Spi {
+        return Spi { sent: [0; 64], sent_length: 0, reply: [0; 64], reply_length: 0, reply_position: 0 }
+    }
+
+    // Bytes the device answers with, in order. At most 64.
+    pub fn reply_with(&mut self, bytes: &[u8]) {
+        core.assert(bytes.len <= 64)
+        for index in 0..bytes.len {
+            self.reply[index] = bytes[index]
+        }
+        self.reply_length = bytes.len
+        self.reply_position = 0
+    }
+
+    // Bytes sent since the last call to `clear`, up to the first 64.
+    pub fn sent(&self) -> &[u8] {
+        return self.sent[0..self.sent_length]
+    }
+
+    pub fn clear(&mut self) {
+        self.sent_length = 0
+    }
+
+    fn exchange(&mut self, byte: u8) -> u8 {
+        if self.sent_length < 64 {
+            self.sent[self.sent_length] = byte
+            self.sent_length += 1
+        }
+        if self.reply_position < self.reply_length {
+            answer := self.reply[self.reply_position]
+            self.reply_position += 1
+            return answer
+        }
+        return 0
+    }
+
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        for index in 0..bytes.len {
+            bytes[index] = self.exchange(bytes[index])
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        for index in 0..bytes.len {
+            self.exchange(bytes[index])
+        }
+        return ok()
+    }
+}

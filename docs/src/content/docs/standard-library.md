@@ -121,7 +121,8 @@ OS/C-library calls may allocate internally even when Dodo storage is fixed.
 
 HTTP/1.1 clients, servers, streaming framing, and web routing **are implemented**.
 HTTP/2, HTTP/3/QUIC, WebSockets, TOML serialization and general peripheral
-drivers are remaining work. MMIO primitives alone do not configure a device.
+chip support packages are remaining work. [`std/hal`](hardware.md) supplies typed
+registers and portable device protocols; it does not configure a particular chip.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
 remain relevant: check them when using references or Results as stored elements.
 
@@ -135,7 +136,7 @@ individual modules and links every public declaration back to its source.
 
 | Family and guide | Imports | Availability |
 | --- | --- | --- |
-| [Core utilities](core.md) | `core/mem`, `core/ptr`, `core/mmio`, `core/ascii`, `core/bytes`, `core/num`, `core/option`, `core/slice` | Portable. |
+| [Core utilities](core.md) | `core/mem`, `core/ptr`, `core/mmio`, `core/cpu`, `core/ascii`, `core/bytes`, `core/num`, `core/option`, `core/slice` | Portable. |
 | [Allocation and boxes](allocation.md) | `alloc/arena`, `alloc/arena_box`, `alloc/block`, `alloc/boxed`, `alloc/error`, `alloc/layout`, `alloc/pool`, `alloc/pool_box`, `alloc/shared_arena`, `alloc/shared_box` | Portable. |
 | [Binary bytes](bytes.md) | `std/arena_bytes`, `std/bytes`, `std/bytes_alloc`, `std/pool_bytes` | Portable. |
 | [Byte I/O](io.md) | `std/io`, `std/io_alloc` | Portable. |
@@ -157,6 +158,7 @@ individual modules and links every public declaration back to its source.
 | [TLS](tls.md) | `std/tls`, `std/tls/openssl`, `std/tls/stream` | Contracts/stream portable; OpenSSL hosted. |
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
+| [Hardware and embedded](hardware.md) | `std/hal`, `std/hal/fake` | Portable; interrupt masking on bare-metal Cortex-M and RISC-V. |
 
 ## Implementation and adapter packages
 
@@ -200,8 +202,8 @@ implementation boundaries, not Dodo imports.
 `alloc/error` and `alloc/layout` are public supporting types. `alloc/block` and
 the unsafe generic constructors in `alloc/boxed`, `std/bytes_alloc`, and owned
 collection modules are allocator-author building blocks; use the linked safe
-concrete constructors first. `core/mem`, `core/ptr` and `core/mmio` are compiler
-intrinsics, not source packages.
+concrete constructors first. `core/mem`, `core/ptr`, `core/mmio` and `core/cpu` are
+compiler intrinsics, not source packages.
 
 ## Storage and data guides
 
