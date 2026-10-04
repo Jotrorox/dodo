@@ -1,0 +1,23 @@
+[package]
+name = "dodo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dodoc = { package = "dodo", path = "..", default-features = false }
+
+# Keep the optional fuzzing dependencies out of normal frontend builds.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "compiler_safety"
+path = "fuzz_targets/compiler_safety.rs"
+test = false
+doc = false
+bench = false
