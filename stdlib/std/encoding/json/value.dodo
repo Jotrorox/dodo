@@ -147,7 +147,7 @@ fn scalar(data: &[u8], offset: usize, escaped: bool) -> text.Decoded!Error {
     if offset >= data.len {
         return err(failure(ErrorKind.Syntax, data.len))
     }
-    if!escaped || data[offset] != 92 {
+    if !escaped || data[offset] != 92 {
         match text.decode(data, offset) {
             ok(decoded) => {
                 return ok(decoded)
@@ -529,7 +529,7 @@ pub struct Value {
                 }
                 index := 0usize
                 for i in 0usize..token.len {
-                    if!digit(token[i]) {
+                    if !digit(token[i]) {
                         return err(failure(ErrorKind.Syntax, offset + i))
                     }
                     part := (token[i] - 48) as usize
@@ -556,7 +556,7 @@ pub struct Value {
             } else {
                 return err(failure(ErrorKind.TypeMismatch, current_start))
             }
-            if!found {
+            if !found {
                 return err(failure(ErrorKind.MissingField, current_start))
             }
             current_start = next_start
@@ -581,7 +581,7 @@ pub struct Value {
     }
     pub fn check_fields(&self, keys: &[&str], deny_unknown: bool) -> void!Error {
         self.require_object()?
-        if!deny_unknown {
+        if !deny_unknown {
             return ok()
         }
         offset := skip_space(self.data, self.start + 1)
@@ -594,7 +594,7 @@ pub struct Value {
                     found = true
                 }
             }
-            if!found {
+            if !found {
                 return err(failure(ErrorKind.UnknownField, offset))
             }
             begin := skip_space(self.data, skip_space(self.data, key_end) + 1)
@@ -607,7 +607,7 @@ pub struct Value {
     }
     pub fn len(&self) -> usize!Error {
         object := self.kind() == Kind.Object
-        if!object && self.kind() != Kind.Array {
+        if !object && self.kind() != Kind.Array {
             return err(failure(ErrorKind.TypeMismatch, self.start))
         }
         count := 0usize
@@ -821,7 +821,7 @@ pub struct String {
         return self.equal(&decoded)
     }
     pub fn equal(&self, other: &String) -> bool {
-        if!self.escaped && !other.escaped {
+        if !self.escaped && !other.escaped {
             return bytes.equal(self.data, other.data)
         }
         left := 0usize
@@ -850,7 +850,7 @@ pub struct String {
         return left == self.data.len && right == other.data.len
     }
     pub fn decoded_len(&self) -> usize {
-        if!self.escaped {
+        if !self.escaped {
             return self.data.len
         }
         count := 0usize
@@ -884,7 +884,7 @@ pub struct String {
         if count > destination.len {
             return err(failure(ErrorKind.BufferFull, destination.len))
         }
-        if!self.escaped {
+        if !self.escaped {
             for i in 0usize..count {
                 destination[i] = self.data[i]
             }

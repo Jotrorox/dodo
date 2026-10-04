@@ -112,7 +112,7 @@ pub fn decode(data: &[u8], offset: usize) -> Decoded!Error {
             return err(failure(ErrorKind.Truncated, data.len))
         }
         byte := data[offset + i]
-        if!continuation(byte) {
+        if !continuation(byte) {
             return err(failure(ErrorKind.InvalidContinuation, offset + i))
         }
         if i == 1 {
@@ -148,7 +148,7 @@ pub fn decode_replacement(data: &[u8], offset: usize) -> Option<Decoded> {
     }
 }
 pub fn encoded_len(scalar: u32) -> usize!Error {
-    if!is_scalar(scalar) {
+    if !is_scalar(scalar) {
         return err(failure(ErrorKind.InvalidScalar, 0))
     }
     if scalar < 128 {
@@ -198,7 +198,7 @@ pub struct Text {
     pub fn from_str(value: &str) -> Text from(value) {
         return Text { data: mem.str_bytes(value) }
     }
-    pub fn as_bytes(&self) -> &[u8]from(self) {
+    pub fn as_bytes(&self) -> &[u8] from(self) {
         return self.data
     }
     pub fn as_str(&self) -> &str from(self) {
@@ -219,7 +219,7 @@ pub struct Text {
         if offset > self.data.len {
             return err(failure(ErrorKind.OutOfBounds, offset))
         }
-        for!self.is_boundary(offset) {
+        for !self.is_boundary(offset) {
             offset -= 1
         }
         return ok(offset)
@@ -228,7 +228,7 @@ pub struct Text {
         if offset > self.data.len {
             return err(failure(ErrorKind.OutOfBounds, offset))
         }
-        for!self.is_boundary(offset) {
+        for !self.is_boundary(offset) {
             offset += 1
         }
         return ok(offset)
@@ -237,10 +237,10 @@ pub struct Text {
         if start > end || end > self.data.len {
             return err(failure(ErrorKind.OutOfBounds, end))
         }
-        if!self.is_boundary(start) {
+        if !self.is_boundary(start) {
             return err(failure(ErrorKind.NotBoundary, start))
         }
-        if!self.is_boundary(end) {
+        if !self.is_boundary(end) {
             return err(failure(ErrorKind.NotBoundary, end))
         }
         return ok(Text { data: &self.data[start..end] })
@@ -251,7 +251,7 @@ pub struct Text {
     pub fn len_scalars(&self) -> usize {
         count := 0usize
         for i in 0usize..self.data.len {
-            if!continuation(self.data[i]) {
+            if !continuation(self.data[i]) {
                 count += 1
             }
         }
@@ -261,7 +261,7 @@ pub struct Text {
     pub fn byte_offset(&self, scalar_index: usize) -> usize!Error {
         count := 0usize
         for i in 0usize..self.data.len {
-            if!continuation(self.data[i]) {
+            if !continuation(self.data[i]) {
                 if count == scalar_index {
                     return ok(i)
                 }
@@ -649,7 +649,7 @@ pub fn parse_f64(data: &[u8]) -> f64!Error {
     if offset != data.len {
         return err(failure(ErrorKind.InvalidNumber, offset))
     }
-    if!nonzero {
+    if !nonzero {
         return ok(signed_float(0.0, negative))
     }
     exponent -= fraction

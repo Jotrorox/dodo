@@ -108,7 +108,7 @@ pub fn valid_method(method: &[u8]) -> bool {
     }
     for at in 0usize..method.len {
         value := method[at]
-        if!((value >= 65 && value <= 90) || (value >= 97 && value <= 122) ||
+        if !((value >= 65 && value <= 90) || (value >= 97 && value <= 122) ||
             (value >= 48 && value <= 57) || value == 33 || value == 35 ||
             value == 36 || value == 37 || value == 38 || value == 39 ||
             value == 42 || value == 43 || value == 45 || value == 46 ||
@@ -149,7 +149,7 @@ fn valid_name(name: &[u8]) -> bool {
     }
     for at in 0usize..name.len {
         value := name[at]
-        if!((value >= 65 && value <= 90) || (value >= 97 && value <= 122) ||
+        if !((value >= 65 && value <= 90) || (value >= 97 && value <= 122) ||
             (value >= 48 && value <= 57) || value == 95) {
             return false
         }
@@ -163,7 +163,7 @@ fn validate_pattern(path: &[u8]) -> void!Error {
         end := end_segment(path, at)
         kind := segment_kind(path, at, end)
         if kind != 3 {
-            if!valid_name(&path[at + 1..end]) || (kind == 1 && end != path.len) {
+            if !valid_name(&path[at + 1..end]) || (kind == 1 && end != path.len) {
                 return err(Error.InvalidPattern)
             }
             previous := 1usize
@@ -287,11 +287,11 @@ pub struct Router {
         sorted := true
         dynamic := false
         for i in 0usize..routes.len {
-            if!valid_method(routes[i].method) {
+            if !valid_method(routes[i].method) {
                 return err(Error.InvalidMethod)
             }
             validate_pattern(routes[i].pattern)?
-            if!literal_pattern(routes[i].pattern) {
+            if !literal_pattern(routes[i].pattern) {
                 dynamic = true;
                 sorted = false
             }
@@ -321,7 +321,7 @@ pub struct Router {
         }
         dynamic := false
         for i in 0usize..routes.len {
-            if!valid_method(routes[i].method) {
+            if !valid_method(routes[i].method) {
                 return err(Error.InvalidMethod)
             }
             validate_pattern(routes[i].pattern)?
@@ -352,14 +352,14 @@ pub struct Router {
     }
 
     pub fn find(&self, method: &[u8], path: &[u8]) -> Match!Error {
-        if!valid_method(method) {
+        if !valid_method(method) {
             return err(Error.InvalidMethod)
         }
         validate_path(path)?
         return self.find_validated(method, path)
     }
     pub fn find_path(&self, method: &[u8], validated: &Path) -> Match!Error {
-        if!valid_method(method) {
+        if !valid_method(method) {
             return err(Error.InvalidMethod)
         }
         return self.find_validated(method, validated.data)
@@ -389,7 +389,7 @@ pub struct Router {
             if matched {
                 return err(Error.MethodNotAllowed)
             }
-            if!self.dynamic {
+            if !self.dynamic {
                 return err(Error.NotFound)
             }
         } else if self.literal_sorted {
@@ -466,7 +466,7 @@ pub struct Router {
                     best = i
                     selected = self.routes.len
                     fallback = self.routes.len
-                } else if!same_shape(self.routes[i].pattern, self.routes[best].pattern) {
+                } else if !same_shape(self.routes[i].pattern, self.routes[best].pattern) {
                     continue
                 }
                 if raw.equal(method, self.routes[i].method) {
@@ -494,7 +494,7 @@ pub struct Router {
             return none
         }
         pattern := self.routes[route].pattern
-        if!matches_path(pattern, path) {
+        if !matches_path(pattern, path) {
             return none
         }
         return self.parameter_matched(route, path, name)
@@ -717,7 +717,7 @@ pub struct Fields {
         return field_next(self.bytes(), cursor)
     }
     pub fn append(&mut self, name: &[u8], value: &[u8]) -> void!Failure {
-        if!http.valid_token(name) || !http.valid_value(value) {
+        if !http.valid_token(name) || !http.valid_value(value) {
             return err(protocol_failure(Error.InvalidHeader, http.failure(http.ErrorKind.InvalidHeader, self.count)))
         }
         if self.count == self.limit || name.len > self.data.len - self.used ||
@@ -1065,7 +1065,7 @@ pub struct Request {
         }
     }
     pub fn parameter(&self, name: &[u8]) -> Option<&[u8]> from(self) {
-        if!self.matched {
+        if !self.matched {
             return none
         }
         pattern := self.router.routes[self.route].pattern
@@ -1075,7 +1075,7 @@ pub struct Request {
                 return some(&self.decoded_path[self.captures[at + 2]..self.captures[at + 3]])
             }
         }
-        if!self.capture_overflow {
+        if !self.capture_overflow {
             return none
         }
         match self.router.parameter_matched(self.route, self.decoded_path, name) {
@@ -1202,7 +1202,7 @@ pub struct Response {
                 return err(encoding_failure(Error.Handler, reason))
             }
         }
-        if!has_field(self.fields.bytes(), b"Content-Type") {
+        if !has_field(self.fields.bytes(), b"Content-Type") {
             self.header(b"Content-Type", content_type)?
         }
         return self.bytes(body)

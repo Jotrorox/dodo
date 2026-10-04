@@ -207,7 +207,7 @@ pub struct Connection {
         return self.sending && self.sender.complete() && self.pending_start == self.pending_end && !self.failed
     }
     pub fn reusable(&self) -> bool {
-        return!self.failed && !self.outbound_close && !self.eof && self.received && self.parser.reusable() && self.output_complete() && self.body_start == self.body_end
+        return !self.failed && !self.outbound_close && !self.eof && self.received && self.parser.reusable() && self.output_complete() && self.body_start == self.body_end
     }
     pub fn request(&mut self, request: &http.Request) -> void!Error {
         if self.server || self.failed || self.sending || self.pending_start != self.pending_end {
@@ -230,7 +230,7 @@ pub struct Connection {
         return ok()
     }
     pub fn response(&mut self, response: &http.Response) -> void!Error {
-        if!self.server || self.failed || self.sending || self.pending_start != self.pending_end {
+        if !self.server || self.failed || self.sending || self.pending_start != self.pending_end {
             return err(failure(ErrorKind.InvalidState))
         }
         match http.write_response(response, self.output) {
@@ -254,7 +254,7 @@ pub struct Connection {
     // Informational heads do not finish or replace the final response sender.
     // Flush each head before queuing another. 101 is an explicit upgrade.
     pub fn informational(&mut self, response: &http.Response) -> void!Error {
-        if!self.server || self.failed || self.sending || self.pending_start != self.pending_end ||
+        if !self.server || self.failed || self.sending || self.pending_start != self.pending_end ||
             response.status < 100 || response.status >= 200 || response.status == 101 {
             return err(failure(ErrorKind.InvalidState))
         }
@@ -338,7 +338,7 @@ pub struct Connection {
         }
         match self.sender.direct(source.len) {
             ok(supported) => {
-                if!supported {
+                if !supported {
                     return err(failure(ErrorKind.Backpressure))
                 }
             }
@@ -467,7 +467,7 @@ pub struct Connection {
         return &self.input[self.start..self.end]
     }
     pub fn next_message(&mut self) -> void!Error {
-        if!self.reusable() {
+        if !self.reusable() {
             return err(failure(ErrorKind.InvalidState))
         }
         match self.parser.next_message() {

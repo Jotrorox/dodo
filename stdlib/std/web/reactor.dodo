@@ -152,7 +152,7 @@ pub struct Slot {
                     }
                 }
             }
-            if!self.finished {
+            if !self.finished {
                 trailers: [0]http.Header = []
                 match driver.finish_body(&trailers) {
                     ok() => {
@@ -166,10 +166,10 @@ pub struct Slot {
                     return ok(Step.Progress)
                 }
             }
-            if!driver.output_complete() {
+            if !driver.output_complete() {
                 return err(hosting.failure(hosting.ErrorKind.InvalidInput))
             }
-            if!stream.flush()? {
+            if !stream.flush()? {
                 return ok(Step.Pending)
             }
             self.requests += 1
@@ -260,7 +260,7 @@ pub struct Slot {
                 }
             }
             if http.equal_ascii(name, b"Expect") {
-                if!http.equal_ascii(value, b"100-continue") {
+                if !http.equal_ascii(value, b"100-continue") {
                     return err(hosting.failure(hosting.ErrorKind.InvalidInput))
                 }
                 self.expect_continue = true
@@ -445,17 +445,17 @@ pub struct Slot {
                 self.deadline = hosting.deadline(now, config.server.write_timeout_ms)
             } else {
                 self.last_error = some(hosting.failure(hosting.ErrorKind.TimedOut))
-                if!self.established || self.phase >= 4 {
+                if !self.established || self.phase >= 4 {
                     self.close();
                     return Step.Failed
                 }
                 return self.reject(workspace, 408, now, config)
             }
         }
-        if!self.established {
+        if !self.established {
             match stream.handshake() {
                 ok(ready) => {
-                    if!ready {
+                    if !ready {
                         return Step.Pending
                     }
                     self.established = true
@@ -471,7 +471,7 @@ pub struct Slot {
         if self.phase >= 5 {
             match stream.finish() {
                 ok(ready) => {
-                    if!ready {
+                    if !ready {
                         return Step.Pending
                     }
                     phase := self.phase
@@ -587,7 +587,7 @@ pub struct Slot {
             }
         }
         self.socket = socket
-        if!self.active {
+        if !self.active {
             provider.close(index)
             self.close()
         }
@@ -711,7 +711,7 @@ request: &mut[u8], response: &mut[u8], config: Config, provider: &mut P, clock: 
             }
         }
         accepting := config.server.max_connections == 0 || report.accepted < config.server.max_connections
-        if!accepting && active == 0 {
+        if !accepting && active == 0 {
             return ok(report)
         }
         listener_index := native.POLL_CAPACITY
@@ -743,12 +743,12 @@ request: &mut[u8], response: &mut[u8], config: Config, provider: &mut P, clock: 
                 if config.server.max_connections != 0 && report.accepted >= config.server.max_connections {
                     break
                 }
-                if!owner.slots[i].active {
+                if !owner.slots[i].active {
                     match listener.accept() {
                         ok(pending) => {
                             match pending {
                                 some(socket) => {
-                                    owner.slots[i].start(socket, clock.now_ms(), &config, request_size,!transport.provider.handshake_required())
+                                    owner.slots[i].start(socket, clock.now_ms(), &config, request_size, !transport.provider.handshake_required())
                                     report.accepted += 1
                                 }
                                 none => {

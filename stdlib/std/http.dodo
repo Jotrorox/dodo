@@ -100,7 +100,7 @@ pub fn valid_token(data: &[u8]) -> bool {
         return false
     }
     for i in 0usize..data.len {
-        if!token_byte(data[i]) {
+        if !token_byte(data[i]) {
             return false
         }
     }
@@ -130,7 +130,7 @@ pub fn valid_value(data: &[u8]) -> bool {
 pub struct Method {
     value: &[u8]
     pub fn new(value: &[u8]) -> Method!Error from(value) {
-        if!valid_token(value) {
+        if !valid_token(value) {
             return err(failure(ErrorKind.InvalidMethod, 0))
         }
         return ok(Method { value: value })
@@ -182,7 +182,7 @@ pub fn valid_authority(data: &[u8], require_port: bool) -> bool {
     } else {
         for end < data.len && data[end] != 58 {
             c := data[end]
-            if!(ascii.is_alphanumeric(c) || c == 45 || c == 46 || c == 95 || c == 126 ||
+            if !(ascii.is_alphanumeric(c) || c == 45 || c == 46 || c == 95 || c == 126 ||
                 c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 ||
                 c == 42 || c == 43 || c == 59 || c == 61 || c == 37) {
                 return false
@@ -200,7 +200,7 @@ pub fn valid_authority(data: &[u8], require_port: bool) -> bool {
         }
     }
     if end == data.len {
-        return!require_port
+        return !require_port
     }
     if data[end] != 58 || end + 1 == data.len {
         return false
@@ -236,7 +236,7 @@ pub struct Uri {
         i := 0usize
         for i < data.len {
             c := data[i]
-            if!uri_byte(c) {
+            if !uri_byte(c) {
                 return err(failure(ErrorKind.InvalidUri, i))
             }
             if c == 37 {
@@ -267,7 +267,7 @@ pub struct Uri {
                 }
                 end += 1
             }
-            if!valid_authority(&data[authority..end], false) {
+            if !valid_authority(&data[authority..end], false) {
                 return err(failure(ErrorKind.InvalidUri, end))
             }
             path = end
@@ -384,7 +384,7 @@ fn decimal(data: &[u8]) -> u64!Error {
     }
     value := 0u64
     for i in 0usize..data.len {
-        if!ascii.is_digit(data[i]) {
+        if !ascii.is_digit(data[i]) {
             return err(failure(ErrorKind.InvalidFraming, i))
         }
         digit := (data[i] - 48) as u64
@@ -599,7 +599,7 @@ pub struct Parser {
         self.inner.body = BodyKind.None
     }
     pub fn next_message(&mut self) -> void!Error {
-        if!self.reusable() {
+        if !self.reusable() {
             return err(failure(ErrorKind.InvalidState, 0))
         }
         self.reset()
@@ -643,7 +643,7 @@ pub struct Parser {
             for first < end && line[first] != 32 {
                 first += 1
             }
-            if!valid_token(&line[..first]) || first == end {
+            if !valid_token(&line[..first]) || first == end {
                 return err(failure(ErrorKind.InvalidMethod, 0))
             }
             second := first + 1
@@ -654,7 +654,7 @@ pub struct Parser {
                 return err(failure(ErrorKind.InvalidStartLine, second))
             }
             if bytes.equal(&line[..first], mem.str_bytes("CONNECT")) {
-                if!valid_authority(&line[first + 1..second], true) {
+                if !valid_authority(&line[first + 1..second], true) {
                     return err(failure(ErrorKind.InvalidUri, first + 1))
                 }
             } else {
@@ -688,7 +688,7 @@ pub struct Parser {
         }
         name := &self.workspace[start..colon]
         value := &self.workspace[value_start..value_end]
-        if!valid_value(value) {
+        if !valid_value(value) {
             return err(failure(ErrorKind.InvalidHeader, value_start))
         }
         kind := EventKind.Header
@@ -723,7 +723,7 @@ pub struct Parser {
                 if self.inner.seen_host || value.len == 0 {
                     return err(failure(ErrorKind.InvalidHeader, start))
                 }
-                if!valid_authority(value, false) {
+                if !valid_authority(value, false) {
                     return err(failure(ErrorKind.InvalidHeader, value_start))
                 }
                 self.inner.seen_host = true
@@ -756,7 +756,7 @@ pub struct Parser {
                 return err(failure(ErrorKind.InvalidFraming, self.inner.used))
             }
             if code == 101 {
-                if!self.inner.connection_upgrade || !self.inner.has_upgrade {
+                if !self.inner.connection_upgrade || !self.inner.has_upgrade {
                     return err(failure(ErrorKind.InvalidFraming, self.inner.used))
                 }
                 self.inner.state = 11;
@@ -869,7 +869,7 @@ pub struct Parser {
                             return err(failure(ErrorKind.InvalidChunk, i))
                         }
                     }
-                    if!closed {
+                    if !closed {
                         return err(failure(ErrorKind.InvalidChunk, i))
                     }
                 } else {
@@ -1076,7 +1076,7 @@ struct Output {
         for i in 0usize..headers.len {
             name := headers[i].name;
             value := headers[i].value
-            if!valid_token(name) || !valid_value(value) {
+            if !valid_token(name) || !valid_value(value) {
                 return err(failure(ErrorKind.InvalidHeader, i))
             }
             if eq(name, "content-length") || eq(name, "transfer-encoding") {
@@ -1087,7 +1087,7 @@ struct Output {
                     return err(failure(ErrorKind.InvalidHeader, i))
                 }
                 host = true
-                if!valid_authority(value, false) {
+                if !valid_authority(value, false) {
                     return err(failure(ErrorKind.InvalidHeader, i))
                 }
             }
@@ -1115,7 +1115,7 @@ struct Output {
             if request {
                 return err(failure(ErrorKind.InvalidFraming, 0))
             }
-            if!close {
+            if !close {
                 self.literal("Connection: close\r\n")?
             }
         }
@@ -1126,11 +1126,11 @@ struct Output {
 // Caller must not transmit a buffer when serialization fails. Input headers
 // cannot supply framing fields: Body is their sole authority.
 pub fn write_request(request: &Request, destination: &mut[u8]) -> usize!Error {
-    if!valid_token(request.method) {
+    if !valid_token(request.method) {
         return err(failure(ErrorKind.InvalidMethod, 0))
     }
     if bytes.equal(request.method, mem.str_bytes("CONNECT")) {
-        if!valid_authority(request.target, true) {
+        if !valid_authority(request.target, true) {
             return err(failure(ErrorKind.InvalidUri, 0))
         }
     } else {
@@ -1254,7 +1254,7 @@ pub struct Sender {
         return ok(self.kind != BodyKind.Chunked)
     }
     pub fn advance_direct(&mut self, count: usize) -> void!Error {
-        if!self.direct(count)? {
+        if !self.direct(count)? {
             self.failed = true
             return err(failure(ErrorKind.InvalidState, 0))
         }
