@@ -128,6 +128,7 @@ pub fn generate<'ctx>(
     if options.entry {
         cg.entry(&options.test_functions)?;
     }
+    cg.mark_nounwind();
     if let Some(debug) = &cg.debug {
         debug.builder.finalize();
     }
@@ -458,6 +459,33 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.functions.insert(f.name.clone(), function);
         }
         Ok(())
+    }
+    fn mark_nounwind(&self) {
+        // Dodo never unwinds (traps abort), so neither its functions nor the
+        // C, panic-hook, and runtime declarations it calls can throw. Without
+        // this, Arm EHABI targets reference `__aeabi_unwind_cpp_pr0`.
+        let nounwind = self
+            .context
+            .create_enum_attribute(Attribute::get_named_enum_kind_id("nounwind"), 0);
+        // Keep asynchronous unwind tables for debuggers, profilers, and crash
+        // backtraces, except on 32-bit Arm, where EHABI tables for nounwind
+        // functions would reintroduce the personality routine reference.
+        let triple = self.module.get_triple();
+        let triple = triple.as_str().to_string_lossy();
+        let ehabi = (triple.starts_with("arm") && !triple.starts_with("arm64"))
+            || triple.starts_with("thumb");
+        let uwtable = (!ehabi).then(|| {
+            self.context
+                .create_enum_attribute(Attribute::get_named_enum_kind_id("uwtable"), 2)
+        });
+        for function in self.module.functions() {
+            if !function.get_name().to_bytes().starts_with(b"llvm.") {
+                function.add_attribute(AttributeLoc::Function, nounwind);
+                if let Some(uwtable) = uwtable.filter(|_| function.count_basic_blocks() != 0) {
+                    function.add_attribute(AttributeLoc::Function, uwtable);
+                }
+            }
+        }
     }
     fn function_sections(&self) {
         let triple = TargetMachine::normalize_triple(&self.module.get_triple());

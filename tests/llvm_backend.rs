@@ -124,3 +124,65 @@ fn failed_output_does_not_invalidate_the_module_or_target_machine() {
             .any(|section| section.size > 0)
     );
 }
+
+#[test]
+fn objects_never_reference_unwinding_personality_routines() {
+    let text = "package add\npub fn add(a: u32, b: u32) -> u32 { return a + b }\n";
+    let mut program = parser::parse(text).unwrap();
+    sema::check(&mut program).unwrap();
+    let context = Context::create();
+    let object = |target: &str, optimization, debug| {
+        let options = Options {
+            target: Some(target.into()),
+            optimization,
+            debug,
+            panic: PanicStrategy::Hook("board_panic".into()),
+            sources: vec![Source {
+                path: "add.dodo".into(),
+                text: text.into(),
+                start: 0,
+            }],
+            ..Default::default()
+        };
+        let generated = codegen::generate(&context, &program, &options).unwrap();
+        generated
+            .machine
+            .write_to_memory_buffer(&generated.module, FileType::Object)
+            .unwrap()
+            .sections()
+            .unwrap()
+    };
+    // Dodo traps instead of unwinding, so Arm EHABI index entries must not pull
+    // in libgcc's personality routines when firmware links with -nostdlib.
+    for target in ["thumbv6m-none-eabi", "thumbv7em-none-eabihf"] {
+        for optimization in [0, 2] {
+            for debug in [false, true] {
+                let sections = object(target, optimization, debug);
+                let symbols: Vec<_> = sections
+                    .iter()
+                    .flat_map(|section| &section.relocation_symbols)
+                    .collect();
+                assert!(
+                    symbols.iter().any(|symbol| *symbol == "board_panic"),
+                    "{target} -O{optimization}: {symbols:?}"
+                );
+                assert!(
+                    !symbols
+                        .iter()
+                        .any(|symbol| symbol.starts_with("__aeabi_unwind_cpp_pr")),
+                    "{target} -O{optimization} debug={debug}: {symbols:?}"
+                );
+            }
+        }
+    }
+    // Hosted targets keep unwind tables for debuggers and crash backtraces.
+    let sections = object("x86_64-unknown-linux-gnu", 2, false);
+    assert!(
+        sections.iter().any(|section| section.name == ".eh_frame"),
+        "{:?}",
+        sections
+            .iter()
+            .map(|section| &section.name)
+            .collect::<Vec<_>>()
+    );
+}
