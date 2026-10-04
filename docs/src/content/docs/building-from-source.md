@@ -285,9 +285,10 @@ it or LLVM; frontend cases in mixed test files still run. Package loading uses
 the compiler's Rust target to select host standard library adapters, and callers
 can use `package::load_for_target` to select another target explicitly.
 
-CI runs these checks in a separate job without installing LLVM. Library users
-can select the same frontend with `default-features = false` on their `dodo`
-dependency; its Rust crate name remains `dodoc`.
+CI runs formatting, Clippy, and frontend tests without installing LLVM on Linux,
+Windows, and macOS (Apple Silicon). Library users can select the same frontend
+with `default-features = false` on their `dodo` dependency; its Rust crate name
+remains `dodoc`.
 
 ### Full compiler checks
 
