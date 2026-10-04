@@ -42,6 +42,8 @@ struct Server {
     published: BTreeMap<String, String>,
     check_packages: bool,
     target: String,
+    /// The firmware board or chip from the project, for `std/embedded/board`.
+    platform: Option<crate::hardware::Platform>,
     project_config: project_config::ProjectConfig,
     project_error: Option<String>,
     pointer_bits: u32,
@@ -141,7 +143,7 @@ impl Server {
                     Ok(config) => config,
                     Err(message) => return error(ErrorCode::InvalidParams, &message),
                 };
-            let (target, bits) = match project_config.settings() {
+            let (target, bits, platform) = match project_config.settings() {
                 Ok(settings) => settings,
                 Err(message) => return error(ErrorCode::InvalidParams, &message),
             };
@@ -149,6 +151,7 @@ impl Server {
             self.project_config = project_config;
             self.check_packages = check_packages;
             self.target = target;
+            self.platform = platform;
             self.pointer_bits = bits;
             self.document_changes = params.document_changes;
             self.inlay_refresh = params.inlay_refresh;
@@ -526,8 +529,9 @@ impl Server {
                     .is_some_and(|manifest| paths.contains(&package::source_path(manifest)))
                 {
                     match self.project_config.settings() {
-                        Ok((target, bits)) => {
+                        Ok((target, bits, platform)) => {
                             self.target = target;
+                            self.platform = platform;
                             self.pointer_bits = bits;
                             self.project_error = None;
                         }
@@ -625,9 +629,9 @@ impl Server {
                 continue;
             }
             let loaded = if bundled::uri(root).is_some() {
-                package::load_bundled_for_editor(root, &self.target)
+                package::load_bundled_for_editor(root, &self.target, self.platform)
             } else {
-                package::load_for_editor(root, &overlays, &self.target)
+                package::load_for_editor(root, &overlays, &self.target, self.platform)
             };
             match loaded {
                 Ok(mut loaded) => {

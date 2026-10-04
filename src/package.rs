@@ -8,6 +8,7 @@
 //! an implicit dependency cache.
 use crate::ast::*;
 use crate::diagnostic::Diagnostic;
+use crate::hardware::{self, Platform};
 use crate::parser;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -120,6 +121,23 @@ pub fn load_for_target(path: &Path, target: &str) -> Result<Loaded, String> {
     load_with_overlays_for_target(path, &BTreeMap::new(), target).map_err(|error| error.to_string())
 }
 
+/// Load for a firmware build: `std/embedded/board` and `std/embedded/chip`
+/// resolve to the packages of the selected board and chip.
+pub fn load_for_platform(
+    path: &Path,
+    target: &str,
+    platform: Option<Platform>,
+) -> Result<Loaded, String> {
+    load_internal(
+        ModuleId::Local(source_path(path)),
+        &BTreeMap::new(),
+        target,
+        platform,
+        false,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// C boundaries are embedded alongside the Dodo sources for relocated compilers.
 pub fn native_sources(loaded: &Loaded) -> Vec<(&'static str, &'static str)> {
     BUNDLED_NATIVE_SOURCES
@@ -161,7 +179,13 @@ pub fn load_with_overlays_for_target(
     overlays: &BTreeMap<PathBuf, String>,
     target: &str,
 ) -> Result<Loaded, LoadError> {
-    load_internal(ModuleId::Local(source_path(path)), overlays, target, false)
+    load_internal(
+        ModuleId::Local(source_path(path)),
+        overlays,
+        target,
+        None,
+        false,
+    )
 }
 
 /// Recover syntax in editor buffers and dependencies without weakening builds.
@@ -169,8 +193,15 @@ pub fn load_for_editor(
     path: &Path,
     overlays: &BTreeMap<PathBuf, String>,
     target: &str,
+    platform: Option<Platform>,
 ) -> Result<Loaded, LoadError> {
-    load_internal(ModuleId::Local(source_path(path)), overlays, target, true)
+    load_internal(
+        ModuleId::Local(source_path(path)),
+        overlays,
+        target,
+        platform,
+        true,
+    )
 }
 
 /// Look up a compiler-owned source by its internal path, never on disk.
@@ -227,7 +258,11 @@ pub(crate) fn bundled_import_candidates(
 
 /// Check a bundled source as an editor document, preserving its library identity.
 #[cfg(feature = "llvm")]
-pub(crate) fn load_bundled_for_editor(path: &Path, target: &str) -> Result<Loaded, LoadError> {
+pub(crate) fn load_bundled_for_editor(
+    path: &Path,
+    target: &str,
+    platform: Option<Platform>,
+) -> Result<Loaded, LoadError> {
     let name = path
         .strip_prefix("<stdlib>")
         .ok()
@@ -245,19 +280,27 @@ pub(crate) fn load_bundled_for_editor(path: &Path, target: &str) -> Result<Loade
     {
         name = parent.to_owned();
     }
-    load_internal(ModuleId::Bundled(name), &BTreeMap::new(), target, true)
+    load_internal(
+        ModuleId::Bundled(name),
+        &BTreeMap::new(),
+        target,
+        platform,
+        true,
+    )
 }
 
 fn load_internal(
     root: ModuleId,
     overlays: &BTreeMap<PathBuf, String>,
     target: &str,
+    platform: Option<Platform>,
     recover: bool,
 ) -> Result<Loaded, LoadError> {
     let mut loader = Loader {
         overlays,
         recover,
         target: target.to_owned(),
+        platform,
         ..Loader::default()
     };
     let root = loader.module(root, None)?;
@@ -348,6 +391,7 @@ struct Loader<'a> {
     recover: bool,
     diagnostics: Vec<Diagnostic>,
     target: String,
+    platform: Option<Platform>,
     overlays: &'a BTreeMap<PathBuf, String>,
     modules: BTreeMap<ModuleId, Module>,
     loading: Vec<ModuleId>,
@@ -362,6 +406,7 @@ impl Default for Loader<'_> {
             recover: false,
             diagnostics: vec![],
             target: String::new(),
+            platform: None,
             overlays: &EMPTY,
             modules: BTreeMap::new(),
             loading: vec![],
@@ -372,7 +417,37 @@ impl Default for Loader<'_> {
 }
 
 impl Loader<'_> {
+    /// `std/embedded/board` and `std/embedded/chip` name the packages of the
+    /// board and chip the build selects, so firmware is not tied to one board.
+    fn platform_import(&self, import: &str) -> Result<String, LoadError> {
+        let boards = || {
+            hardware::BOARDS
+                .iter()
+                .map(|board| board.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match (import, self.platform) {
+            ("std/embedded/board", Some(Platform { board: Some(board), .. })) => Ok(board.package.into()),
+            ("std/embedded/chip", Some(platform)) => Ok(platform.chip.package.into()),
+            ("std/embedded/board", Some(platform)) => Err(format!(
+                "`std/embedded/board` needs a board, but this build selects only chip '{}'; import `std/embedded/chip` or set board = \"NAME\" (available boards: {})",
+                platform.chip.name,
+                boards()
+            )
+            .into()),
+            _ => Err(format!(
+                "`{import}` needs a firmware board; set board = \"NAME\" in dodo.toml or pass --board NAME (available boards: {})",
+                boards()
+            )
+            .into()),
+        }
+    }
+
     fn native_import(&self, import: &str) -> Result<String, LoadError> {
+        if import == "std/embedded/board" || import == "std/embedded/chip" {
+            return self.platform_import(import);
+        }
         let parts: Vec<_> = import.split('/').collect();
         if parts.len() != 3
             || parts[0] != "std"
@@ -1429,6 +1504,7 @@ mod tests {
         let mut loaded = super::load_bundled_for_editor(
             std::path::Path::new("<stdlib>/std/encoding/json/encoder.dodo"),
             env!("DODO_HOST_TARGET"),
+            None,
         )
         .unwrap();
         for file in ["api", "encoder", "ownership", "value"] {

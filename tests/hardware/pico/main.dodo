@@ -1,0 +1,230 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+
+// Hardware self-test for the `pico` board: the RP2040 startup runtime,
+// std/embedded/chip/rp2040 (clocks, timer, single ownership, configuration
+// checks), std/embedded/board/pico, and the runtime's integer helpers. Every
+// outcome ends in the USB bootloader with a record that scripts/test_pico.py
+// reads over USB with picotool. Words at RECORD (SRAM, kept by the boot ROM):
+//
+//   [0] 0x600D_00nn  finished after nn checks; [1] = failed-check bits
+//       0xDEAD_llll  panicked at line llll;    [1] = column
+//       0x5747_00nn  hung or faulted after check nn (watchdog reset)
+//   [2] clk_sys in kHz  [3] a 10 ms delay in timer us  [4] its SysTick cycles
+//   [5] failed-check bits for checks 32 to 63
+//
+// A copy of [0] and [1] in watchdog SCRATCH2/3 survives the watchdog reset
+// that reports a hang.
+
+const RECORD: usize = 0x2003_F000
+const SCRATCH: usize = 0x4005_8014
+const RUNNING: u32 = 0x5747_0000
+static mut CHECKS: u32 = 0
+// Failed-check bits: checks 0 to 31, then 32 to 63.
+static mut FAILURES: u32 = 0
+static mut MORE_FAILURES: u32 = 0
+// Initialized data: checks that the reset handler copies .data from flash.
+static mut DATA: [3]u32 = [0xDEAD_BEEFu32, 7, 0x1234_5678]
+
+fn store(address: usize, value: u32) {
+    // SAFETY: RECORD is SRAM this program never otherwise uses, and the
+    // watchdog scratch registers are free for software.
+    unsafe {
+        word: hal.Reg<u32> = hal.Reg.at(address)
+        word.write(value)
+    }
+}
+
+fn record(state: u32, detail: u32) {
+    store(RECORD, state)
+    store(RECORD + 4, detail)
+    store(SCRATCH, state)
+    store(SCRATCH + 4, detail)
+}
+
+fn check(ok: bool) {
+    unsafe {
+        if !ok && CHECKS < 32 {
+            FAILURES |= 1u32 << CHECKS
+        } else if !ok && CHECKS < 64 {
+            MORE_FAILURES |= 1u32 << (CHECKS - 32)
+        }
+        CHECKS += 1
+        record(RUNNING | CHECKS, FAILURES)
+    }
+}
+
+// Replaces the board runtime's default panic hook.
+extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    record(0xDEAD_0000 | (line & 0xFFFF), column)
+    board.reboot_to_bootloader()
+}
+
+// clk_sys in kHz from the CLOCKS frequency counter, against clk_ref.
+fn clk_sys_khz() -> u32 {
+    unsafe {
+        reference: hal.Reg<u32> = hal.Reg.at(0x4000_8080)
+        minimum: hal.Reg<u32> = hal.Reg.at(0x4000_8084)
+        maximum: hal.Reg<u32> = hal.Reg.at(0x4000_8088)
+        interval: hal.Reg<u32> = hal.Reg.at(0x4000_8090)
+        source: hal.Reg<u32> = hal.Reg.at(0x4000_8094)
+        status: hal.Reg<u32> = hal.Reg.at(0x4000_8098)
+        result: hal.Reg<u32> = hal.Reg.at(0x4000_809C)
+        reference.write(12_000)
+        interval.write(10)
+        minimum.write(0)
+        maximum.write(0xFFFF_FFFF)
+        source.write(0x09)
+        match status.wait_set(1 << 4, 10_000_000) {
+            ok() => {}
+            err(_) => {
+                return 0
+            }
+        }
+        return result.read() >> 5
+    }
+}
+
+fn main() {
+    // A previous run hung and the watchdog reset the chip: report it.
+    unsafe {
+        reason: hal.Reg<u32> = hal.Reg.at(0x4005_8008)
+        state: hal.Reg<u32> = hal.Reg.at(SCRATCH)
+        if (reason.read() & 1) != 0 && (state.read() & 0xFFFF_0000) == RUNNING {
+            board.reboot_to_bootloader()
+        }
+    }
+    record(RUNNING, 0)
+    b := board.take()!
+    // Watchdog: reset everything but the oscillators after 3 s (the
+    // RP2040 watchdog counts down twice per microsecond tick).
+    unsafe {
+        select: hal.Reg<u32> = hal.Reg.at(0x4001_0008)
+        select.write(0x1_FFFC)
+        load: hal.Reg<u32> = hal.Reg.at(0x4005_8004)
+        load.write(6_000_000)
+        control: hal.Reg<u32> = hal.Reg.at(0x4005_8000)
+        control.write(1 << 30)
+    }
+    b.led.set_high()
+
+    // A second take must be refused.
+    match board.take() {
+        ok(_) => {
+            check(false)
+        }
+        err(error) => {
+            check(error == hal.Error.Busy)
+        }
+    }
+    unsafe {
+        check(DATA[0] == 0xDEAD_BEEF && DATA[1] == 7 && DATA[2] == 0x1234_5678)
+    }
+
+    // Clocks: 125 MHz system clock.
+    khz := clk_sys_khz()
+    check(khz > 124_000 && khz < 126_000)
+
+    // Timer: a 10 ms delay is 1.25 M SysTick cycles at 125 MHz.
+    unsafe {
+        reload: hal.Reg<u32> = hal.Reg.at(0xE000_E014)
+        current: hal.Reg<u32> = hal.Reg.at(0xE000_E018)
+        control: hal.Reg<u32> = hal.Reg.at(0xE000_E010)
+        reload.write(0x00FF_FFFF)
+        current.write(0)
+        control.write(0b101)
+        start := current.read()
+        before := b.timer.now_us()
+        b.timer.delay_us(10_000)
+        after := b.timer.now_us()
+        cycles := start - current.read()
+        delta := (after - before) as u32
+        // SysTick counts clk_sys: 125 cycles per timer microsecond.
+        check(cycles > 124 * delta && cycles < 127 * delta)
+        store(RECORD + 8, khz)
+        store(RECORD + 12, delta)
+        store(RECORD + 16, cycles)
+        check(delta >= 10_000 && delta < 10_200)
+    }
+
+    // Runtime helpers: zero at run time, unknown to the optimizer.
+    z := b.timer.now_us() >> 63
+    z32 := z as u32
+    check((1_000_000_007u32 ^ z32) / 13 == 76_923_077)
+    check((1_000_000_007u32 ^ z32) % 13 == 6)
+    check((0xFFFF_FFFFu32 ^ z32) / 0x8000_0001 == 1)
+    check((0xFFFF_FFFFu32 ^ z32) % 0x8000_0001 == 0x7FFF_FFFE)
+    check((0xFFFF_FFFEu32 ^ z32) / 0xFFFF_FFFF == 0)
+    i := z32 as i32
+    check((-1_000_000_007 + i) / 13 == -76_923_077)
+    check((-1_000_000_007 + i) % 13 == -6)
+    check((7 + i) / -2 == -3)
+    check((7 + i) % -2 == 1)
+    check((-2_147_483_647 + i) / -3 == 715_827_882)
+    check((0xFEDC_BA98_7654_3210u64 ^ z) / 0x12345 == 0xE000_4FA0_1C4D)
+    check((0xFEDC_BA98_7654_3210u64 ^ z) % 0x12345 == 0x10A4F)
+    check((0xFFFF_FFFF_FFFF_FFFFu64 ^ z) / 0x8000_0000_0000_0001 == 1)
+    check((0xFFFF_FFFF_FFFF_FFFFu64 ^ z) % 0x8000_0000_0000_0001 == 0x7FFF_FFFF_FFFF_FFFE)
+    check((0x0123_4567_89AB_CDEFu64 ^ z) / 0xFFFF_FFFF == 0x123_4567)
+    check((0x0123_4567_89AB_CDEFu64 ^ z) % 0xFFFF_FFFF == 0x8ACF_1356)
+    j := z as i64
+    check((-81_985_529_216_486_895 + j) / 4660 == -17_593_461_205_254)
+    check((-81_985_529_216_486_895 + j) % 4660 == -3255)
+    check((9_223_372_036_854_775_807 - j) / -7 == -1_317_624_576_693_539_401)
+    check(core.wrapping_mul(0x1_2345_6789u64 ^ z, 0xA_BCDE_F012) == 0x379A_AAB7_F0BF_B7A2)
+    check(core.wrapping_mul(0xFFFF_FFFF_FFFF_FFFFu64 ^ z, 0xFFFF_FFFF) == 0xFFFF_FFFF_0000_0001)
+    x := 0x8000_0000_0000_0001u64 ^ z
+    s := -9_223_372_036_854_775_807 + j
+    check((3u64 ^ z) << (1 + z) == 6)
+    check((3u64 ^ z) << (31 + z) == 0x1_8000_0000)
+    check(x >> (31 + z) == 0x1_0000_0000)
+    check(x >> (32 + z) == 0x8000_0000)
+    check((1u64 ^ z) << (33 + z) == 0x2_0000_0000)
+    check((1u64 ^ z) << (63 + z) == 0x8000_0000_0000_0000)
+    check(x >> (63 + z) == 1)
+    check(s >> (32 + j) == -2_147_483_648)
+    check(s >> (63 + j) == -1)
+
+    // memcpy/memset through large copies.
+    big: [64]u32 = [0; 64]
+    for k in 0..64 {
+        big[k] = k as u32 + z32
+    }
+    copy := big
+    check(copy[63] == 63 && copy[0] == 0)
+
+    // Configuration is validated before ownership: an unusable crystal is
+    // InvalidInput, a valid one is Busy because the board already took it.
+    match chip.take(chip.Config { crystal_hz: 7_000_000 }) {
+        ok(_) => {
+            check(false)
+        }
+        err(error) => {
+            check(error == hal.Error.InvalidInput)
+        }
+    }
+    match chip.take(chip.Config { crystal_hz: 12_000_000 }) {
+        ok(_) => {
+            check(false)
+        }
+        err(error) => {
+            check(error == hal.Error.Busy)
+        }
+    }
+    start := b.timer.now_us()
+    b.timer.delay_ms(10)
+    elapsed := b.timer.now_us() - start
+    check(elapsed >= 10_000 && elapsed < 10_100)
+    check(board.NAME.len == 17)
+
+    unsafe {
+        control: hal.Reg<u32> = hal.Reg.at(0x4005_8000)
+        control.write(0)
+        store(RECORD + 20, MORE_FAILURES)
+        record(0x600D_0000 | CHECKS, FAILURES)
+    }
+    board.reboot_to_bootloader()
+}

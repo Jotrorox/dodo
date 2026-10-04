@@ -128,7 +128,7 @@ fn freestanding_targets_without_an_interrupt_model_are_rejected() {
     let scratch = Scratch::new("rejected");
     let critical = scratch.write(
         "critical.dodo",
-        "package critical\nimport \"std/hal\"\npub fn section() {\n guard := hal.Critical.enter()\n core.drop(guard)\n}\n",
+        "package critical\nimport \"std/embedded/hal\"\npub fn section() {\n guard := hal.Critical.enter()\n core.drop(guard)\n}\n",
     );
     let output = dodo(
         &[
@@ -152,7 +152,7 @@ fn freestanding_targets_without_an_interrupt_model_are_rejected() {
     // The rest of the HAL stays portable to the same target.
     let registers = scratch.write(
         "registers.dodo",
-        "package registers\nimport \"std/hal\"\npub fn enable(address: usize) {\n r: hal.Reg<u32> = unsafe { hal.Reg.at(address) }\n r.set(0x70, 3)\n}\n",
+        "package registers\nimport \"std/embedded/hal\"\npub fn enable(address: usize) {\n r: hal.Reg<u32> = unsafe { hal.Reg.at(address) }\n r.set(0x70, 3)\n}\n",
     );
     success(
         &dodo(
@@ -176,7 +176,7 @@ fn field_values_that_do_not_fit_trap() {
     let scratch = Scratch::new("trap");
     let source = scratch.write(
         "main.dodo",
-        "package main\nimport \"std/hal\"\nfn main() {\n value := hal.encode(0x70u32, 8)\n core.assert_eq(value, 0u32)\n}\n",
+        "package main\nimport \"std/embedded/hal\"\nfn main() {\n value := hal.encode(0x70u32, 8)\n core.assert_eq(value, 0u32)\n}\n",
     );
     let executable = scratch
         .0

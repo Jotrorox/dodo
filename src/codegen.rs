@@ -8,11 +8,33 @@ use llvm_sys::{
     LLVMIntPredicate as IntPredicate, LLVMRealPredicate as FloatPredicate,
 };
 use std::collections::HashMap;
+use std::path::Path;
 
 mod debug;
 mod llvm;
 mod panic;
 use debug::{DebugInfo, SourceMap};
+
+/// Compile LLVM IR text, such as a board runtime, to an object file for the
+/// target in `options`. Only code generation runs, never the IR optimization
+/// pipeline, so hand-written runtime helpers are not rewritten into calls to
+/// the library functions they implement.
+pub fn compile_ir_object(options: &Options, name: &str, text: &str, path: &Path) -> Result<()> {
+    let context = Context::create();
+    let module = Module::parse_ir(&context, name, text)?;
+    let machine = target_machine(options)?;
+    module.set_triple(&machine.get_triple());
+    module.set_data_layout(&machine.get_target_data().get_data_layout());
+    module.verify()?;
+    // One ELF section per function, so the linker drops unused helpers.
+    for function in module.functions() {
+        if function.count_basic_blocks() != 0 {
+            let name = function.get_name().to_string_lossy();
+            function.set_section(Some(&format!(".text.{name}")));
+        }
+    }
+    machine.write_to_file(&module, FileType::Object, path)
+}
 
 #[derive(Clone, Debug, Default)]
 pub enum PanicStrategy {

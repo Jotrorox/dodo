@@ -1,32 +1,38 @@
 ---
 title: "Hardware and embedded"
-description: "Typed registers, interrupts, portable device drivers, and desktop testing with std/hal."
+description: "Typed registers, interrupts, portable device drivers, and desktop testing with std/embedded/hal."
 section: "Standard library"
 order: 161
 ---
 
 Dodo programs can talk to hardware directly, with no separate embedded
 dialect. The same language, compiler, and test runner build a desktop tool and
-a microcontroller firmware image. Hardware support is an ordinary library,
-`std/hal`, on top of two small compiler packages:
+a microcontroller firmware image. Hardware support is ordinary library code,
+grouped under `std/embedded` in layers, on top of two small compiler packages:
 
 | Layer | Import | What it gives you |
 | --- | --- | --- |
-| Device protocols | `std/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
-| Typed registers | `std/hal` | `hal.Reg<T>` handles and mask constants for memory-mapped registers. |
-| Interrupts | `std/hal` | `hal.Critical`, a section that masks interrupts until it is dropped. |
-| Desktop testing | `std/hal/fake` | In-memory pins, delays, and buses that record what a driver did. |
+| Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
+| Typed registers | `std/embedded/hal` | `hal.Reg<T>` handles and mask constants for memory-mapped registers. |
+| Interrupts | `std/embedded/hal` | `hal.Critical`, a section that masks interrupts until it is dropped. |
+| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, and buses that record what a driver did. |
+| Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
+| Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Raw access | `core/mmio`, `core/cpu` | Volatile loads/stores, barriers, interrupt masking, `wfi`. |
 
-Most code needs only `std/hal`. Three kinds of code meet here:
+Four kinds of code meet here:
 
-- **Chip support** knows datasheet addresses. It turns registers into values
-  that implement the protocols, for example a `Pin` with `set_high`.
+- **Chip support** (`std/embedded/chip/NAME`) knows datasheet addresses. It turns
+  registers into values that implement the protocols, for example a `Pin`
+  with `set_high`.
+- **Board support** (`std/embedded/board/NAME`) configures its chip for one circuit
+  board: crystal frequency, which pin drives the LED, what is wired where.
 - **Drivers** know a device, such as a sensor. They are generic over any value
   with the protocol's methods and never mention a chip.
-- **Applications** take the chip's values and hand them to drivers.
+- **Applications** take the board's values and hand them to drivers.
 
 Drivers therefore run unchanged on any chip, and on a desktop with fakes.
+Applications that import `std/embedded/board` build unchanged for every board.
 
 ## Quickstart: a driver and its tests
 
@@ -35,8 +41,8 @@ Save this as `blink.dodo` and run `dodo test blink.dodo`. No hardware is needed:
 ```dodo test
 package blink
 
-import "std/hal"
-import "std/hal/fake"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
 
 // Works with any output pin and any delay.
 pub fn blink<P, D>(led: &mut P, delay: &mut D, times: u32) {
@@ -110,8 +116,8 @@ transactions never overlap:
 ```dodo test
 package spi_example
 
-import "std/hal"
-import "std/hal/fake"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
 
 fn main() {
     bus := fake.Spi.new()
@@ -140,8 +146,8 @@ hanging:
 ```dodo test
 package sensor
 
-import "std/hal"
-import "std/hal/fake"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
 
 const ADDRESS: u8 = 0x48
 const CONTROL: u8 = 0x01
@@ -205,7 +211,7 @@ fn reports_missing_device() {
 
 ## Testing with fakes
 
-`std/hal/fake` implements every protocol in memory:
+`std/embedded/hal/fake` implements every protocol in memory:
 
 | Fake | Behaves like | Inspect with |
 | --- | --- | --- |
@@ -238,7 +244,7 @@ datasheet or C header does. A mask must be nonzero and contiguous:
 ```dodo
 package uart
 
-import "std/hal"
+import "std/embedded/hal"
 import "std/io"
 
 const BASE: usize = 0x4003_4000
@@ -307,11 +313,14 @@ alias registers, which many microcontrollers provide for exactly this reason.
 
 ### Owning peripherals once
 
-Chip support usually hands each peripheral out once. The
+Chip support usually hands each peripheral out once. The bundled
+[`std/embedded/chip/rp2040`](#the-rp2040-and-raspberry-pi-pico) package does this with a
+safe `rp2040.take(config)` that returns `hal.Error.Busy` on a second call, and
+`pins.output(n)` calls that return `hal.Error.Busy` if a pin is claimed twice.
+The
 [GPIO example](https://github.com/Jotrorox/dodo/blob/main/examples/gpio.dodo)
-shows the full pattern for the RP2040: an unsafe `Port.take()` at startup, and
-safe `port.output(25)` calls that return `hal.Error.Busy` if a pin is claimed
-twice. Its `Pin` implements the output and input protocols with single stores to
+shows the same pattern as a minimal template for writing support for another
+chip: an unsafe `Port.take()` at startup and safe per-pin claims. Its `Pin` implements the output and input protocols with single stores to
 the chip's set/clear registers, and the whole abstraction compiles to the same
 instructions as hand-written register code.
 
@@ -324,7 +333,7 @@ startup code puts in the vector table. Firmware entry points work the same way:
 package firmware
 
 import "core/cpu"
-import "std/hal"
+import "std/embedded/hal"
 
 static mut TICKS: u32 = 0
 
@@ -376,8 +385,146 @@ never call it on a reachable path stay portable to every target.
 
 ## Building firmware
 
-Compile to an object for the chip and link it with the board's startup code and
-linker script using the chip vendor's or the Arm/RISC-V C toolchain:
+### Boards
+
+Select a board in `dodo.toml` and import `std/embedded/board`. Install an ELF linker
+once (`brew install lld`, or `apt install lld`), then save this as `main.dodo`:
+
+```dodo
+package main
+
+import "std/embedded/board"
+
+fn main() {
+    b := board.take()!
+    for {
+        b.led.toggle()
+        b.timer.delay_ms(500)
+    }
+}
+```
+
+and this as `dodo.toml` in the same folder:
+
+```toml
+schema = 1
+
+[targets.blink]
+entry = "main.dodo"
+board = "pico"
+```
+
+Hold the Pico's BOOTSEL button while connecting it over USB, so it appears as
+the `RPI-RP2` drive, then run:
+
+```sh
+dodo run
+```
+
+Dodo builds the firmware, copies it to the drive, and the board restarts into
+it: the LED blinks once a second. `dodo build` writes
+`build/dev/thumbv6m-none-eabi/blink.elf` for debuggers and `blink.uf2` next to
+it for drag-and-drop flashing. Without a manifest, pass `--board pico` to
+`dodo build`, `dodo run`, or `dodo check`. Editors use the manifest's board
+too.
+
+The `board` setting selects the chip's instruction set, its startup code and
+linker script, and the package `std/embedded/board` resolves to. That package is
+`std/embedded/board/pico` here, and every board package offers the same entry points,
+so changing the board in `dodo.toml` is the only change a program needs:
+
+| Entry point | Purpose |
+| --- | --- |
+| `board.NAME` | The board's name. |
+| `board.take() -> Board!hal.Error` | Start the chip once: clocks, resets, LED. `Busy` on a second call. |
+| `b.led` | The user LED: an output pin, on when high, with `toggle()`. |
+| `b.pins` | The other GPIOs: `output(n)` and `input(n)` return pins that implement the [pin protocols](#device-protocols), or `Busy` if taken. |
+| `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`. |
+| `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
+
+Board packages also export what is specific to their board, such as
+`pico.LED_PIN`. Drivers written against the protocols take `b.pins` values
+directly. Programs that build without a board, such as desktop tests, cannot
+import `std/embedded/board`; keep that code in drivers and test them with fakes.
+
+| Board | Chip | Package |
+| --- | --- | --- |
+| `pico` | `rp2040` | `std/embedded/board/pico`: Raspberry Pi Pico, 2 MiB flash, LED on GP25. |
+
+### The RP2040 and Raspberry Pi Pico
+
+The `rp2040` chip compiles for `thumbv6m-none-eabi` and the Cortex-M0+. The
+compiler adds what a desktop operating system would otherwise provide:
+
+| Part | What it does |
+| --- | --- |
+| Boot stage 2 | Configures the flash interface for execute-in-place with the standard `03h` read command. The compiler adds the checksum the boot ROM verifies. |
+| Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `extern "C"` function of the same name replaces. |
+| Reset handler | Copies initialized statics to RAM, zeroes the rest, and calls `main`. If `main` returns, the core sleeps. |
+| Panic hook | `dodo_board_panic` masks interrupts and halts. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
+| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, and the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware. |
+| Linker script | Flash at `0x10000000` (size from the board), 264 KiB of RAM, and the stack at the top of RAM. |
+
+`std/embedded/chip/rp2040` is the chip support. `rp2040.take(config)` starts the
+crystal, runs the CPU at 125 MHz from the system PLL, takes GPIO and the timer
+out of reset, and returns the peripherals once. `rp2040.Config` holds what the
+circuit board decides, the crystal frequency; a crystal the clock tree cannot
+use is `InvalidInput`. Pins, the timer, and `reboot_to_bootloader(led)` are
+the types and functions the Pico board package exposes. Interrupt handlers use
+the datasheet names: `SysTick_Handler`, `HardFault_Handler`, `TIMER_IRQ_0` to
+`TIMER_IRQ_3`, `UART0_IRQ`, `IO_IRQ_BANK0`, and so on.
+
+### Custom boards
+
+For a circuit board of your own, set `chip` instead of `board` and configure
+the chip yourself through `std/embedded/chip`:
+
+```dodo
+package main
+
+import "std/embedded/chip"
+
+fn main() {
+    p := chip.take(chip.Config { crystal_hz: 12_000_000 })!
+    led := p.pins.output(15)!
+    for {
+        led.toggle()
+        p.timer.delay_ms(250)
+    }
+}
+```
+
+```toml
+[targets.firmware]
+entry = "main.dodo"
+chip = "rp2040"
+```
+
+A chip alone assumes 2 MiB of flash. To give the board a name that
+`std/embedded/board` resolves to, add it to the compiler (see below).
+
+### Adding chips and boards
+
+Board and chip support is split the same way in the compiler and the library,
+so each new board or chip is a small, self-contained addition:
+
+- **A board** on an existing chip is one entry in `BOARDS` in
+  `src/hardware.rs` (name, chip, flash size) and a `std/embedded/board/NAME` package
+  that configures the chip and provides the entry points above.
+- **A chip** is a `src/hardware/NAME.rs` descriptor (target triple, CPU,
+  memory map, image format, and image fixups such as boot checksums), its
+  startup runtime as LLVM IR and linker script, an entry in `CHIPS`, and a
+  `std/embedded/chip/NAME` package with its peripherals.
+
+The compiler compiles the runtime itself with the selected target machine, so
+no assembler or C toolchain is involved. `scripts/test_pico.py` shows how to
+check a chip on real hardware.
+
+### Unsupported chips
+
+For microcontrollers without a chip descriptor, compile to an object for the chip and link it with
+the board's startup code and linker script using the chip vendor's or the
+Arm/RISC-V C toolchain:
 
 ```sh
 dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
@@ -399,8 +546,13 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 ## Current limits
 
-- Chip support packages for specific microcontrollers are not bundled yet;
-  write them with `hal.Reg` as above, or start from the GPIO example.
+- `pico` is the only board and `rp2040` the only chip so far.
+  `std/embedded/chip/rp2040` covers clocks, GPIO, and the timer; UART, I2C, SPI, PWM,
+  and USB are not bundled yet. Write them with `hal.Reg` as above.
+- Floating-point arithmetic does not link in firmware yet: the Cortex-M0+ has
+  no floating-point unit and the runtime has no software implementation. The
+  linker error says so.
+- Only core 0 runs; core 1 stays in the boot ROM.
 - `std/sync/atomic` currently supports x86-64 and AArch64 only. On
   microcontrollers, share state with interrupt handlers through a critical
   section.

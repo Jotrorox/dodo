@@ -5,7 +5,8 @@ import "core/ptr"
 
 // Portable hardware abstraction layer. Nothing here requires an OS, allocator,
 // or particular chip, and every package that imports it also compiles for
-// hosted targets, so drivers can be tested on a desktop with `std/hal/fake`.
+// hosted targets, so drivers can be tested on a desktop with
+// `std/embedded/hal/fake`.
 //
 // Three layers, from the bottom up:
 //
@@ -31,6 +32,22 @@ import "core/ptr"
 //
 // Addresses are 7-bit I2C addresses. Pin and delay operations cannot fail;
 // bus operations report the shared `Error` below.
+//
+// Chips and boards. A chip package (`std/embedded/chip/NAME`) turns one
+// microcontroller's registers into values with the protocols above. A board
+// package (`std/embedded/board/NAME`) configures its chip for one circuit
+// board and names what is wired on it. Firmware builds select both with
+// `board = "NAME"` in dodo.toml, and `import "std/embedded/board"` (or
+// `std/embedded/chip` for a custom board) resolves to the selected package.
+// Every board package provides the same entry points, so applications move
+// between boards unchanged:
+//
+//    NAME: &str                    the board's name
+//    take() -> Board!Error         start the chip once; Busy on a second call
+//    Board.led                     the user LED, an output pin, on when high
+//    Board.pins                    output(n) / input(n) -> Pin!Error per GPIO
+//    Board.timer                   delay_us, delay_ms, now_us(&self) -> u64
+//    reboot_to_bootloader()        restart into the board's flashing mode
 
 // Bus and device failures shared by every driver and chip implementation.
 // A single payload-free enum keeps drivers composable and comparable with ==.

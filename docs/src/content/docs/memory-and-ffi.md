@@ -341,7 +341,7 @@ C-ABI integer extension attributes on declarations and call sites.
 ## CPU control
 
 `core/cpu` exposes the few processor operations that device code cannot
-express with memory accesses. `std/hal` builds its `Critical` section on them.
+express with memory accesses. `std/embedded/hal` builds its `Critical` section on them.
 
 | Target | `disable_interrupts` / `restore_interrupts` | `wait_for_interrupt` |
 | --- | --- | --- |

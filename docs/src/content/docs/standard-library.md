@@ -120,9 +120,10 @@ needs OpenSSL 3.5 or newer. See [platform adapters](platform.md) and [TLS](tls.m
 OS/C-library calls may allocate internally even when Dodo storage is fixed.
 
 HTTP/1.1 clients, servers, streaming framing, and web routing **are implemented**.
-HTTP/2, HTTP/3/QUIC, WebSockets, TOML serialization and general peripheral
-chip support packages are remaining work. [`std/hal`](hardware.md) supplies typed
-registers and portable device protocols; it does not configure a particular chip.
+HTTP/2, HTTP/3/QUIC, WebSockets, TOML serialization and chip support beyond
+the RP2040 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
+registers and portable device protocols; `std/embedded/chip/rp2040` and
+`std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
 remain relevant: check them when using references or Results as stored elements.
 
@@ -158,7 +159,7 @@ individual modules and links every public declaration back to its source.
 | [TLS](tls.md) | `std/tls`, `std/tls/openssl`, `std/tls/stream` | Contracts/stream portable; OpenSSL hosted. |
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
-| [Hardware and embedded](hardware.md) | `std/hal`, `std/hal/fake` | Portable; interrupt masking on bare-metal Cortex-M and RISC-V. |
+| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/board`, `std/embedded/chip` | `std/embedded/hal` is portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico` and `std/embedded/chip/rp2040`. |
 
 ## Implementation and adapter packages
 

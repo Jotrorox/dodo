@@ -479,6 +479,30 @@ impl<'ctx> BasicBlock<'ctx> {
 
 pub struct Module<'ctx>(LLVMModuleRef, PhantomData<&'ctx Context>);
 impl<'ctx> Module<'ctx> {
+    /// Parse textual LLVM IR, such as an embedded board runtime.
+    pub(super) fn parse_ir(context: &'ctx Context, name: &str, text: &str) -> Result<Self> {
+        let name = cstring(name);
+        unsafe {
+            let buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
+                text.as_ptr().cast(),
+                text.len(),
+                name.as_ptr(),
+            );
+            let mut module = ptr::null_mut();
+            let mut msg = ptr::null_mut();
+            let failed = ir_reader::LLVMParseIRInContext2(context.0, buffer, &mut module, &mut msg);
+            LLVMDisposeMemoryBuffer(buffer);
+            let msg = message(msg);
+            if failed != 0 {
+                Err(error(format!(
+                    "invalid LLVM IR in {}: {msg}",
+                    name.to_string_lossy()
+                )))
+            } else {
+                Ok(Self(module, PhantomData))
+            }
+        }
+    }
     pub(super) fn set_source_file_name(&self, name: &str) {
         unsafe { LLVMSetSourceFileName(self.0, name.as_ptr().cast(), name.len()) }
     }

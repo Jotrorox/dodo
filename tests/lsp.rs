@@ -3055,6 +3055,37 @@ fn lsp_manifest_target_and_disk_changes_update_platform_diagnostics() {
 }
 
 #[test]
+fn lsp_resolves_std_board_from_the_manifest_board() {
+    let w = Workspace::new();
+    let manifest = w.file(
+        "dodo.toml",
+        "schema=1\n[targets.blink]\nentry='main.dodo'\nboard='pico'\n",
+    );
+    let uri = w.uri("main.dodo");
+    let source = "package main\nimport \"std/embedded/board\"\nfn main() {\n b := board.take()!\n b.led.toggle()\n b.timer.delay_ms(500)\n}\n";
+    let mut client = Client::start("lsp");
+    let response = client.request(
+        json!(1),
+        "initialize",
+        json!({"rootUri": w.uri(""), "capabilities": {}}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    client.open(&uri, source, 1);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    w.file(
+        "dodo.toml",
+        "schema=1\n[targets.blink]\nentry='main.dodo'\n",
+    );
+    client.disk_change(&manifest, 2);
+    let diagnostics = client.diagnostics()[&uri]["diagnostics"].to_string();
+    assert!(
+        diagnostics.contains("needs a firmware board"),
+        "{diagnostics}"
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
 fn lsp_manifest_selection_errors_and_explicit_platform_override() {
     let w = Workspace::new();
     w.file("dodo.toml","schema=1\n[targets.wasm]\nentry='main.dodo'\ntriple='wasm32-unknown-unknown'\n[targets.native]\nentry='main.dodo'\n");

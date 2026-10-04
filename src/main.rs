@@ -1,6 +1,7 @@
 //! Command-line driver. Linking is an explicit process invocation, never a shell command.
 use cli::{Action, Invocation, Parsed};
 use dodoc::codegen::{Context, FileType};
+use dodoc::hardware::{Platform, image};
 use dodoc::{cli, codegen, lsp, package, project, sema, toml};
 use project::{Emit, Purpose, Resolved};
 use std::ffi::{OsStr, OsString};
@@ -25,6 +26,7 @@ struct Args {
     verbose: bool,
     manifest: Option<PathBuf>,
     profile: Option<String>,
+    platform: Option<Platform>,
 }
 struct FormatArgs {
     input: PathBuf,
@@ -71,6 +73,8 @@ fn from_resolved(i: &Invocation, r: &Resolved) -> Args {
         verbose: i.verbose,
         manifest: r.manifest.clone(),
         profile: r.profile.clone(),
+        // Resolution already validated the board and chip names.
+        platform: r.settings.platform().ok().flatten(),
     }
 }
 fn prepare(
@@ -131,10 +135,7 @@ fn prepare(
                 m.out_dir
                     .join(r.profile.as_deref().unwrap_or("dev"))
                     .join(r.settings.triple.as_ref().unwrap())
-                    .join(format!(
-                        "{name}{}",
-                        emit.extension(r.settings.triple.as_ref().unwrap())
-                    )),
+                    .join(format!("{name}{}", project::extension(emit, &r.settings))),
             );
         }
     }
@@ -161,15 +162,17 @@ fn prepare(
             input.file_stem().map(OsStr::to_os_string)
         }
         .unwrap_or_else(|| "program".into());
-        name.push(if r.emit == Emit::Exe {
+        let firmware = r.settings.board.is_some() || r.settings.chip.is_some();
+        name.push(if r.emit == Emit::Exe && !firmware {
             ""
         } else {
-            r.emit.extension(host)
+            project::extension(r.emit, &r.settings)
         });
         r.output = Some(cwd.join("build").join(name));
     }
+    let firmware = r.settings.board.is_some() || r.settings.chip.is_some();
     if i.action == Action::Run
-        && (r.emit != Emit::Exe || r.settings.triple.as_deref() != Some(host))
+        && (r.emit != Emit::Exe || !firmware && r.settings.triple.as_deref() != Some(host))
     {
         return Err(format!(
             "run requires a host executable; use dodo build{} for this target",
@@ -524,6 +527,9 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 .machine
                 .write_to_file(&generated.module, FileType::Object, &object)
                 .map_err(|e| e.to_string())?;
+            if let Some(platform) = args.platform {
+                return link_firmware(args, platform, loaded, &temporary.0, &object, out);
+            }
             let mut linker = Command::new(&args.linker);
             if let Some(cwd) = &args.link_cwd {
                 linker.current_dir(cwd);
@@ -591,6 +597,136 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
     }
     Ok(())
 }
+/// The flashable image written next to a firmware ELF.
+fn image_path(elf: &Path, platform: Platform) -> PathBuf {
+    elf.with_extension(platform.image_extension())
+}
+/// Link firmware from the program object and the chip's runtime, then write
+/// the flashable image next to the ELF.
+fn link_firmware(
+    args: &Args,
+    platform: Platform,
+    loaded: &package::Loaded,
+    temporary: &Path,
+    object: &Path,
+    out: &Path,
+) -> Result<(), String> {
+    let name = platform.name();
+    if let Some((source, _)) = package::native_sources(loaded).first() {
+        return Err(format!(
+            "{source} needs a hosted C runtime, which '{name}' firmware does not have"
+        ));
+    }
+    let runtime = temporary.join("runtime.o");
+    codegen::compile_ir_object(
+        &args.options,
+        platform.chip.name,
+        platform.chip.runtime,
+        &runtime,
+    )
+    .map_err(|e| format!("cannot build the {} runtime: {e}", platform.chip.name))?;
+    let script = temporary.join("memory.ld");
+    fs::write(&script, platform.linker_script()).map_err(|e| e.to_string())?;
+    let mut linker = Command::new(&args.linker);
+    if let Some(cwd) = &args.link_cwd {
+        linker.current_dir(cwd);
+    }
+    linker
+        .arg(object)
+        .arg(&runtime)
+        .arg("-T")
+        .arg(&script)
+        .arg("--gc-sections")
+        .args(&args.link_args)
+        .arg("-o")
+        .arg(out);
+    if args.verbose {
+        eprintln!("Linking: {linker:?}");
+    }
+    let output = linker.output().map_err(|e| {
+        format!(
+            "could not execute linker '{}': {e}; '{name}' firmware needs an ELF linker such as ld.lld (LLVM's lld package), or select one with --linker",
+            args.linker.to_string_lossy(),
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let floating = [
+            "__aeabi_f",
+            "__aeabi_d",
+            "sf3",
+            "df3",
+            "sf2",
+            "df2",
+            "sfdi",
+            "dfdi",
+        ];
+        let hint = if stderr.lines().any(|line| {
+            line.contains("undefined symbol") && floating.iter().any(|name| line.contains(name))
+        }) {
+            "\nnote: floating-point arithmetic is not supported in firmware yet"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "linker failed ({}):\n{}{stderr}{hint}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+        ));
+    }
+    let mut elf = fs::read(out).map_err(|e| format!("cannot read {}: {e}", out.display()))?;
+    let flashable = platform.finish(&mut elf)?;
+    fs::write(out, &elf).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    let path = image_path(out, platform);
+    fs::write(&path, flashable).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+/// Build firmware and copy it to the platform's mounted bootloader drive.
+fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Result<i32, String> {
+    let drives = platform.bootloader_drives();
+    let drive = match drives.as_slice() {
+        [drive] => drive,
+        [] => {
+            return Err(format!(
+                "no {} bootloader drive is mounted; hold BOOTSEL while connecting the {} over USB, then run again",
+                platform.bootloader_drive_name(),
+                platform.description()
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "several {} bootloader drives are mounted ({}); connect one board at a time",
+                platform.bootloader_drive_name(),
+                drives
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    };
+    let temp = TempDir::new(&std::env::temp_dir())?;
+    let elf = temp.0.join("firmware.elf");
+    args.emit = Emit::Exe;
+    compile(args, loaded, &elf)?;
+    let flashable = fs::read(image_path(&elf, platform)).map_err(|e| e.to_string())?;
+    if args.verbose {
+        eprintln!(
+            "Flashing: {} -> {}",
+            image_path(&elf, platform).display(),
+            drive.display()
+        );
+    }
+    image::write_uf2_drive(&flashable, drive)?;
+    if !args.quiet {
+        eprintln!(
+            "Flashed {} ({} KiB) to {}",
+            args.input.display(),
+            flashable.len() / 2 / 1024,
+            drive.display()
+        );
+    }
+    Ok(0)
+}
 fn execute(mut args: Args) -> Result<i32, String> {
     // A project folder selects its entry file. Directory imports are still
     // loaded as ordinary packages by the source loader.
@@ -616,7 +752,7 @@ fn execute(mut args: Args) -> Result<i32, String> {
             .to_string_lossy()
             .into_owned()
     });
-    let mut loaded = package::load_for_target(&args.input, &target)?;
+    let mut loaded = package::load_for_platform(&args.input, &target, args.platform)?;
     let bits = codegen::pointer_bits(&args.options).map_err(|e| e.to_string())?;
     sema::check_for_target(&mut loaded.program, bits).map_err(|d| loaded.render(&d))?;
     if args.action == Action::Check {
@@ -624,6 +760,11 @@ fn execute(mut args: Args) -> Result<i32, String> {
             eprintln!("Checked {}", args.input.display());
         }
         return Ok(0);
+    }
+    if args.action == Action::Run
+        && let Some(platform) = args.platform
+    {
+        return flash(&mut args, platform, &loaded);
     }
     if args.action == Action::Run {
         if let Some(target) = &args.options.target
@@ -682,6 +823,7 @@ fn execute(mut args: Args) -> Result<i32, String> {
         }
         .unwrap_or_else(|| OsString::from("program"));
         name.push(match args.emit {
+            Emit::Exe if args.platform.is_some() => ".elf",
             Emit::Exe => "",
             Emit::Obj => ".o",
             Emit::Asm => ".s",
@@ -709,8 +851,18 @@ fn execute(mut args: Args) -> Result<i32, String> {
     let staged = temporary.0.join("artifact");
     compile(&args, &loaded, &staged)?;
     fs::rename(&staged, &output).map_err(|e| format!("cannot write {}: {e}", output.display()))?;
+    let flashable = args
+        .platform
+        .filter(|_| args.emit == Emit::Exe)
+        .map(|platform| (image_path(&staged, platform), image_path(&output, platform)));
+    if let Some((staged, path)) = &flashable {
+        fs::rename(staged, path).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    }
     if !args.quiet {
-        eprintln!("Built {}", output.display());
+        match &flashable {
+            Some((_, path)) => eprintln!("Built {} and {}", output.display(), path.display()),
+            None => eprintln!("Built {}", output.display()),
+        }
     }
     Ok(0)
 }

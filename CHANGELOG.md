@@ -2,19 +2,37 @@
 
 ## Unreleased
 
-- Add `std/hal`, a portable hardware abstraction layer: typed volatile
+- Add firmware builds for microcontroller boards, starting with the Raspberry
+  Pi Pico. `board = "pico"` in a `dodo.toml` target (or `--board pico`) selects
+  the board's chip: its target and CPU, a startup runtime the compiler builds
+  itself (boot stage 2, vector table, reset handler, memory and integer
+  helpers), a linker script, and `ld.lld`. Builds write a flashable `.uf2`
+  next to the `.elf`, and `dodo run` copies it to a board in BOOTSEL mode.
+  `chip = "rp2040"` (or `--chip`) builds for a custom board. Floating point
+  does not link in firmware yet.
+- Add `import "std/embedded/board"` and `import "std/embedded/chip"`, which resolve to the
+  packages of the build's board and chip, so firmware is not tied to one
+  board. Every board package provides `take()`, an LED, GPIO pins, a timer,
+  and `reboot_to_bootloader()`. Editors follow the manifest's board.
+- Add `std/embedded/chip/rp2040` (clocks from a configurable crystal, 125 MHz system
+  PLL, GPIO pins implementing the `std/embedded/hal` pin protocols, the microsecond
+  timer, and the boot ROM's USB bootloader) and `std/embedded/board/pico`.
+- Add the `examples/blink` project and a hardware self-test,
+  `scripts/test_pico.py`, that checks startup, clocks, timing, ownership, and
+  the runtime helpers on a connected Pico.
+- Add `std/embedded/hal`, a portable hardware abstraction layer: typed volatile
   registers (`hal.Reg<T>`) with mask-constant fields, interrupt-masking
   `hal.Critical` sections, one shared `hal.Error`, statically checked pin,
   delay, I2C, and SPI protocols with register and chip-select helpers, and
   serial ports through the existing `std/io` protocols.
-- Add `std/hal/fake` in-memory pins, delays, and I2C/SPI buses so drivers run
+- Add `std/embedded/hal/fake` in-memory pins, delays, and I2C/SPI buses so drivers run
   under `dodo test` on a desktop.
 - Add the `core/cpu` intrinsics `fence`, `disable_interrupts`,
   `restore_interrupts`, and `wait_for_interrupt` (spec CORE-CPU). They lower to
   PRIMASK on bare-metal Cortex-M and `mstatus.MIE` on bare-metal RISC-V, are
   no-ops on hosted targets, and are rejected on other targets only when
   reachable. `cpu` is now a reserved package name.
-- Rework the GPIO example into RP2040 chip support built on `std/hal`, add a
+- Rework the GPIO example into RP2040 chip support built on `std/embedded/hal`, add a
   desktop-testable I2C sensor driver example, and add the
   [hardware and embedded guide](https://jotrorox.github.io/dodo/hardware/).
 

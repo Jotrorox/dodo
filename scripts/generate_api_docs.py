@@ -296,7 +296,7 @@ def guide_for(module: str) -> str:
         "text_alloc": "text", "text_shared": "text", "float_decimal": "text",
         "encoding": "json", "checksum": "hash", "fs": "filesystem",
         "env": "environment", "process": "processes", "thread": "threads",
-        "sync": "synchronization", "net": "networking", "hal": "hardware",
+        "sync": "synchronization", "net": "networking", "embedded": "hardware",
     }.get(family, family)
 
 
