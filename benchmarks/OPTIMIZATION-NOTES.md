@@ -8,6 +8,9 @@ Sequential array decoding has also been implemented; see its
 [before/after measurements](JSON-ARRAYS.md).
 The four primary web changes are also implemented; see [web measurements and
 validation](WEB.md) for their scope and remaining prefix-group scans.
+The [shared-prefix follow-up](WEB-SHARED-PREFIX.md) now measures those scans
+with tenant, nested, wildcard, and mixed tables, and records the segment-index
+tradeoffs. The original proposals below retain their original baseline context.
 
 The best first targets are JSON duplicate detection and derived decoding, plus
 web header traversal and reuse of validated route metadata in in-process

@@ -1,14 +1,49 @@
 package web_dynamic
 import "core/ptr"
-import "std/console"
-import "std/io"
-import "std/time/hosted"
 import "std/web"
 
+// Benchmark-only C I/O and clock calls keep the portable router measurable on
+// hosts without Dodo's hosted adapters. No foreign calls occur inside the loop.
+unsafe extern "C" fn dodo_bench_header(output: *mut u8) -> i32
+unsafe extern "C" fn dodo_bench_nanos() -> u64
+unsafe extern "C" fn dodo_bench_output(nanos: u64, checksum: u64)
+
+struct Query {
+    method: &[u8]
+    path: &[u8]
+    id: usize
+    error: usize
+    head: bool
+}
+
+fn check(router: &web.Router, query: &Query) -> u64 {
+    match router.find(query.method, query.path) {
+        ok(found) => {
+            assert_eq(query.error, 0usize)
+            assert_eq(found.id, query.id)
+            assert_eq(found.head, query.head)
+            return found.id as u64 + 1
+        }
+        err(reason) => {
+            status := if reason == web.Error.NotFound {
+                404usize
+            } else if reason == web.Error.MethodNotAllowed {
+                405usize
+            } else {
+                0usize
+            }
+            assert(query.error != 0)
+            assert_eq(status, query.error)
+            return status as u64
+        }
+    }
+}
+
 fn main() {
-    input := console.stdin()
     header := [0u8; 16]
-    io.read_exact(&mut input, &mut header)!
+    assert_eq(unsafe {
+        dodo_bench_header(ptr.from_mut(&mut header[0]))
+    }, 0i32)
     iterations := 0u64
     for i in 0usize..8 {
         iterations |=(header[i] as u64) << ((i * 8) as u64)
@@ -16,27 +51,36 @@ fn main() {
     routes := [
         // ROUTES
     ]
-    paths := [
-        // PATHS
+    queries := [
+        // QUERIES
     ]
     index := [0usize; 512]
-    router := if header[8] == 0 {
+    router := if header[8] % 2 == 0 {
         web.Router.new(&routes)!
     } else {
         web.Router.indexed(&routes, &mut index)!
     }
+    // Check every request before calibration, including tables larger than the
+    // timed iteration count. Construction and this preflight are not timed.
+    for query in queries {
+        check(&router, query)
+    }
+    request := (header[8] / 2) as usize
+    assert(request < 4)
     checksum := 0u64
-    clock := hosted.MonotonicClock.new()
-    start := clock.now()!
+    start := unsafe {
+        dodo_bench_nanos()
+    }
     for i in 0u64..iterations {
         index := (unsafe {
             ptr.read_volatile(ptr.from_ref(&i))
         } % routes.len as u64) as usize
-        found := router.find(b"GET", paths[index])!
-        assert_eq(found.id, index)
-        checksum += found.id as u64
+        checksum += check(&router, &queries[request * routes.len + index])
     }
-    end := clock.now()!
-    elapsed := end.duration_since(&start)!
-    console.printf("{} {}\n", elapsed.to_nanos()!, checksum)!
+    end := unsafe {
+        dodo_bench_nanos()
+    }
+    unsafe {
+        dodo_bench_output(end - start, checksum)
+    }
 }

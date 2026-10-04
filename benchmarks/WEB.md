@@ -23,6 +23,10 @@ inline index storage through 1,024 routes and one owned native allocation for
 larger tables; request routing does not allocate. Portable routers continue to
 use caller-owned storage.
 
+The [shared-prefix follow-up](WEB-SHARED-PREFIX.md) measures tenant-scoped,
+nested, wildcard, and mixed layouts, including HEAD and 404/405 requests,
+and evaluates the case for a segment index.
+
 ## Measurements
 
 Windows 11 x64 build 26200, Intel Core Ultra 5 125U, native Dodo 0.1.3 / LLVM 23,
