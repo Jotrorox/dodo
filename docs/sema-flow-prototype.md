@@ -85,6 +85,13 @@ checking, and diagnostic precedence without duplicates.
 pattern, and propagation outcomes, including payload moves, guard retries,
 borrowed bindings, value-block exits, and cleanup on early error returns.
 
+`tests/compiler_safety_generated.rs` adds bounded generated programs and byte
+mutation fuzzing at both target widths. Its independent path-execution oracle
+checks each configuration's outcome and all flow findings, including shadowed
+declaration identities, use spans, and move provenance. Missing coverage or
+subset skips fail these tests. The same generator/oracle powers a libFuzzer
+target and stable-toolchain seed/artifact replay; see [fuzz/README.md](../fuzz/README.md).
+
 ## Representation and analysis
 
 Each parameter, binding, and expression temporary has a stable local identity.
