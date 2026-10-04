@@ -152,10 +152,11 @@ package for the generator to extract. It remains part of the documented API:
 | `core/mem` | [Layout, initialization, string views, and exchange](memory-and-ffi.md#implemented-core-calls) |
 | `core/ptr` | [Pointers and unsafe memory access](memory-and-ffi.md#implemented-core-calls) |
 | `core/mmio` | [Volatile hardware access](memory-and-ffi.md#mmio-and-volatile-access) |
+| `core/cpu` | [Barriers, interrupt masking, and waiting](memory-and-ffi.md#cpu-control) |
 | Typed storage intrinsics | [Container elements](container-elements.md), [typed allocated storage](memory-and-ffi.md#typed-allocated-storage) |
 | Atomic compiler operations used by `std/sync/atomic` | [Atomics](synchronization.md#atomics) |
 
-Import `core/mem`, `core/ptr`, or `core/mmio` before using its short package name.
+Import `core/mem`, `core/ptr`, `core/mmio`, or `core/cpu` before using its short package name.
 `core.drop`, wrapping arithmetic, and assertions need no import. Prefer safe
 library abstractions over the storage intrinsics they use internally.
 

@@ -19,7 +19,7 @@ code or hardware.
 | Recognize ASCII protocol characters | `core/ascii` | `is_digit`, `is_whitespace`, `hex_value` |
 | Move a value out of an optional slot | `core/option` | `take`, `replace`, `unwrap_or` |
 | Describe or manipulate typed storage | `core/mem` | `size_of`, `align_of`, `replace`, `swap` |
-| Integrate raw memory or device registers | `core/ptr`, `core/mmio` | See [memory and FFI](memory-and-ffi.md) |
+| Integrate raw memory or device registers | `core/ptr`, `core/mmio`, `core/cpu` | Prefer [`std/hal`](hardware.md); raw forms in [memory and FFI](memory-and-ffi.md) |
 
 Read [Results and options](patterns-and-results.md) if `ok`/`err` and
 `some`/`none` are unfamiliar. Exact declarations are in the
@@ -66,11 +66,13 @@ Imports expose their final component (`num`, `ascii`, `slice`); assertions and
 `core/bytes` handles raw byte operations; [binary bytes](bytes.md) adds cursors.
 [Slice splitting](slice-splitting.md) covers disjoint mutable views.
 
-`core/mem`, `core/ptr`, and `core/mmio` are compiler intrinsic packages.
-Use `mem.size_of::<T>()` for layouts, checked references for ordinary access,
-and [memory and FFI](memory-and-ffi.md) for raw-pointer contracts. MMIO requires
-a board-specific valid device address and access width; there is no universally
-runnable hosted MMIO example. The [GPIO example](https://github.com/Jotrorox/dodo/blob/main/examples/gpio.dodo)
+`core/mem`, `core/ptr`, `core/mmio`, and `core/cpu` are compiler intrinsic
+packages. Use `mem.size_of::<T>()` for layouts, checked references for ordinary
+access, and [memory and FFI](memory-and-ffi.md) for raw-pointer contracts. For
+device registers, interrupts, and drivers, start with
+[hardware and embedded](hardware.md): `std/hal` wraps `core/mmio` and `core/cpu`
+in typed registers and portable device protocols. The
+[GPIO example](https://github.com/Jotrorox/dodo/blob/main/examples/gpio.dodo)
 is a hardware template, not a desktop program.
 
 ## Portable core utilities

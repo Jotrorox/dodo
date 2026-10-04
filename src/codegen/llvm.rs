@@ -1158,6 +1158,54 @@ impl<'ctx> Builder<'ctx> {
             PhantomData,
         ))
     }
+    pub(super) fn build_fence(&self, order: LLVMAtomicOrdering) -> Result<Value<'ctx>> {
+        self.positioned()?;
+        Ok(Value(
+            unsafe { LLVMBuildFence(self.0, order, 0, c"".as_ptr()) },
+            PhantomData,
+        ))
+    }
+    /// Calls side-effecting inline assembly of type `ty`; the constraints must
+    /// declare every clobber, including `~{memory}` for compiler barriers.
+    pub(super) fn build_inline_asm(
+        &self,
+        ty: LlvmType<'ctx>,
+        assembly: &str,
+        constraints: &str,
+        args: &[Value<'ctx>],
+        name: &str,
+    ) -> Result<Value<'ctx>> {
+        let asm = unsafe {
+            LLVMGetInlineAsm(
+                ty.0,
+                assembly.as_ptr().cast_mut().cast(),
+                assembly.len(),
+                constraints.as_ptr().cast_mut().cast(),
+                constraints.len(),
+                1,
+                0,
+                LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+                0,
+            )
+        };
+        self.positioned()?;
+        let mut args: Vec<_> = args.iter().map(|v| v.0).collect();
+        let returns =
+            unsafe { LLVMGetTypeKind(LLVMGetReturnType(ty.0)) } != LLVMTypeKind::LLVMVoidTypeKind;
+        Ok(Value(
+            unsafe {
+                LLVMBuildCall2(
+                    self.0,
+                    ty.0,
+                    asm,
+                    args.as_mut_ptr(),
+                    args.len() as u32,
+                    cstring(if returns { name } else { "" }).as_ptr(),
+                )
+            },
+            PhantomData,
+        ))
+    }
     pub(super) fn build_atomicrmw(
         &self,
         op: LLVMAtomicRMWBinOp,

@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 include!(concat!(env!("OUT_DIR"), "/stdlib_sources.rs"));
 
-const INTRINSIC_IMPORTS: &[&str] = &["core/mem", "core/ptr", "core/mmio"];
+const INTRINSIC_IMPORTS: &[&str] = &["core/mem", "core/ptr", "core/mmio", "core/cpu"];
 
 /// Distinct identities prevent a local path from impersonating a bundled source.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -269,7 +269,7 @@ fn load_internal(
         *counts.entry(module.alias.clone()).or_default() += 1;
     }
     let mut known_packages: BTreeSet<String> = counts.keys().cloned().collect();
-    known_packages.extend(["mem", "ptr", "mmio"].map(str::to_owned));
+    known_packages.extend(["mem", "ptr", "mmio", "cpu"].map(str::to_owned));
     let mut prefixes = BTreeMap::new();
     for (index, (id, module)) in loader.modules.iter().enumerate() {
         let prefix = if id == &root {
@@ -596,7 +596,7 @@ impl Loader<'_> {
                 expected_alias.unwrap_or_default()
             ).into());
         }
-        if matches!(alias.as_str(), "mem" | "ptr" | "mmio") {
+        if matches!(alias.as_str(), "mem" | "ptr" | "mmio" | "cpu") {
             return Err(format!(
                 "conflicting package name `{alias}`: reserved for compiler intrinsics"
             )
@@ -622,7 +622,7 @@ impl Loader<'_> {
                 .into());
             }
             if name == "core"
-                || matches!(name.as_str(), "mem" | "ptr" | "mmio")
+                || matches!(name.as_str(), "mem" | "ptr" | "mmio" | "cpu")
                     && import != &format!("core/{name}")
             {
                 return Err(
@@ -933,12 +933,12 @@ struct Names<'a> {
 impl Names<'_> {
     fn name(&self, name: &str, excluded: &BTreeSet<String>) -> String {
         // Fully qualified intrinsic calls must obey the same per-package import
-        // rules as their shorter `mem`, `ptr`, and `mmio` spellings. `core.drop`
+        // rules as their shorter `mem`, `ptr`, `mmio`, and `cpu` spellings. `core.drop`
         // remains available without any import.
         if let Some(intrinsic) = name
             .strip_prefix("core.")
             .and_then(|suffix| suffix.split('.').next())
-            .filter(|prefix| matches!(*prefix, "mem" | "ptr" | "mmio"))
+            .filter(|prefix| matches!(*prefix, "mem" | "ptr" | "mmio" | "cpu"))
             && !self
                 .visible_packages
                 .values()

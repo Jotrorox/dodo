@@ -73,6 +73,9 @@ pub fn pointer_bits(options: &Options) -> Result<u32> {
         .get_pointer_byte_size()
         * 8)
 }
+/// Declared for reachable `core/cpu` calls the target cannot lower.
+const UNSUPPORTED_CPU: &str = "dodo.unsupported.cpu.";
+
 pub fn generate<'ctx>(
     context: &'ctx Context,
     program: &Program,
@@ -150,6 +153,19 @@ pub fn generate<'ctx>(
         options.optimization.min(3)
     );
     cg.module.run_passes(&passes, &machine)?;
+    if let Some(op) = cg.module.functions().find_map(|f| {
+        f.get_name()
+            .to_str()
+            .ok()?
+            .strip_prefix(UNSUPPORTED_CPU)
+            .map(str::to_owned)
+    }) {
+        let triple = cg.module.get_triple();
+        return Err(error(format!(
+            "`cpu.{op}` is not supported for target `{}`; interrupt control is available for bare-metal Cortex-M and RISC-V targets and is a no-op on hosted OS targets",
+            triple.as_str().to_string_lossy()
+        )));
+    }
     cg.function_sections();
     cg.module
         .verify()
@@ -2268,6 +2284,141 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             ))),
         }
     }
+    /// Lowers `core/cpu`. Bare-metal Cortex-M and RISC-V (machine mode) use the
+    /// architectural interrupt mask; hosted OS targets expose no interrupt mask
+    /// to programs, so masking and waiting there are no-ops. Other freestanding
+    /// targets are rejected rather than silently given a non-exclusive section.
+    fn cpu_operation(&mut self, op: &str, args: &[Expr], unit: Value<'ctx>) -> Result<Value<'ctx>> {
+        if op == "fence" {
+            self.builder
+                .build_fence(AtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent)?;
+            return Ok(unit);
+        }
+        let argument = match args.first() {
+            Some(arg) => Some(self.expr(arg)?),
+            None => None,
+        };
+        let triple = self
+            .module
+            .get_triple()
+            .as_str()
+            .to_string_lossy()
+            .into_owned();
+        let arch = triple.split('-').next().unwrap_or_default();
+        let hosted = [
+            "-linux", "-windows", "-darwin", "-macos", "-ios", "-freebsd", "-netbsd", "-openbsd",
+            "-android", "-wasi",
+        ]
+        .iter()
+        .any(|os| triple.contains(os));
+        let cortex_m = ["thumbv6m", "thumbv7m", "thumbv7em", "thumbv8m"]
+            .iter()
+            .any(|prefix| arch.starts_with(prefix));
+        let riscv = arch.starts_with("riscv32") || arch.starts_with("riscv64");
+        let void = self.context.void_type();
+        if hosted {
+            return Ok(match op {
+                "disable_interrupts" => self.context.bool_type().const_zero(),
+                _ => unit,
+            });
+        }
+        if !cortex_m && !riscv {
+            // Diagnosed after dead-code elimination (see `generate`), so a
+            // package that merely contains interrupt control stays portable.
+            let name = format!("{UNSUPPORTED_CPU}{op}");
+            let result = if op == "disable_interrupts" {
+                self.context.bool_type()
+            } else {
+                void
+            };
+            let marker = self.module.lookup_function(&name).unwrap_or_else(|| {
+                self.module
+                    .add_function(&name, result.fn_type(&[], false), None)
+            });
+            let value = self.builder.build_call(marker, &[], "cpu.unsupported")?;
+            return Ok(if op == "disable_interrupts" {
+                value
+            } else {
+                unit
+            });
+        }
+        // Cortex-M PRIMASK bit 0 masks interrupts; RISC-V mstatus.MIE is bit 3.
+        let (register, enable_bit) = if cortex_m {
+            (self.context.i32_type(), 1)
+        } else {
+            (self.usize_type(), 8)
+        };
+        match op {
+            "wait_for_interrupt" => {
+                self.builder.build_inline_asm(
+                    void.fn_type(&[], false),
+                    "wfi",
+                    "~{memory}",
+                    &[],
+                    "",
+                )?;
+                Ok(unit)
+            }
+            "disable_interrupts" => {
+                let assembly = if cortex_m {
+                    "mrs $0, PRIMASK\ncpsid i"
+                } else {
+                    "csrrci $0, mstatus, 8"
+                };
+                let previous = self.builder.build_inline_asm(
+                    register.fn_type(&[], false),
+                    assembly,
+                    "=r,~{memory}",
+                    &[],
+                    "cpu.previous",
+                )?;
+                let bit = register.const_int(enable_bit, false);
+                let masked = self.builder.build_and(previous, bit, "cpu.mask")?;
+                // PRIMASK set means masked; mstatus.MIE set means enabled.
+                let predicate = if cortex_m {
+                    IntPredicate::LLVMIntEQ
+                } else {
+                    IntPredicate::LLVMIntNE
+                };
+                self.builder.build_int_compare(
+                    predicate,
+                    masked,
+                    register.const_zero(),
+                    "cpu.were_enabled",
+                )
+            }
+            "restore_interrupts" => {
+                let enabled = argument.ok_or_else(|| error("missing interrupt state"))?;
+                let wide = self
+                    .builder
+                    .build_int_z_extend(enabled, register, "cpu.state")?;
+                // Branch-free restore: Cortex-M writes the old PRIMASK value;
+                // RISC-V sets MIE only when it was previously set.
+                let (assembly, value) = if cortex_m {
+                    let one = register.const_int(1, false);
+                    (
+                        "msr PRIMASK, $0",
+                        self.builder.build_xor(wide, one, "cpu.primask")?,
+                    )
+                } else {
+                    let shift = register.const_int(3, false);
+                    (
+                        "csrs mstatus, $0",
+                        self.builder.build_left_shift(wide, shift, "cpu.mie")?,
+                    )
+                };
+                self.builder.build_inline_asm(
+                    void.fn_type(&[register], false),
+                    assembly,
+                    "r,~{memory}",
+                    &[value],
+                    "",
+                )?;
+                Ok(unit)
+            }
+            _ => Err(error(format!("unknown CPU operation `{op}`"))),
+        }
+    }
     fn call(
         &mut self,
         name: &str,
@@ -2592,6 +2743,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
                 _ => (),
             }
+        }
+        if let Some(op) = name.strip_prefix("core.cpu.") {
+            return self.cpu_operation(op, args, unit);
         }
         let mmio = name
             .strip_prefix("mmio.")

@@ -1,0 +1,312 @@
+package hal
+
+import "core/cpu"
+import "core/ptr"
+
+// Portable hardware abstraction layer. Nothing here requires an OS, allocator,
+// or particular chip, and every package that imports it also compiles for
+// hosted targets, so drivers can be tested on a desktop with `std/hal/fake`.
+//
+// Three layers, from the bottom up:
+//
+// 1. Registers. `Reg<T>` gives typed volatile access to one memory-mapped
+//    register, and mask constants name its fields. Creating a register is the single unsafe step;
+//    reading and writing an owned handle afterwards is safe.
+// 2. Interrupts. `Critical` masks interrupts on the current core until it is
+//    dropped. It never excludes other threads or cores.
+// 3. Device protocols. Drivers are generic functions or structs over any value
+//    with the methods below (statically checked, no runtime interface object):
+//
+//    Output pin:  set_high(&mut self) -> void
+//                 set_low(&mut self) -> void
+//    Input pin:   is_high(&self) -> bool
+//    Delay:       delay_us(&mut self, microseconds: u32) -> void
+//    I2C bus:     write(&mut self, address: u8, bytes: &[u8]) -> void!Error
+//                 read(&mut self, address: u8, buffer: &mut[u8]) -> void!Error
+//                 write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!Error
+//    SPI bus:     transfer(&mut self, bytes: &mut[u8]) -> void!Error
+//                 write(&mut self, bytes: &[u8]) -> void!Error
+//    Serial port: the `std/io` Reader and Writer protocols, so ports work with
+//                 `std/io` helpers and `std/fmt` formatting unchanged.
+//
+// Addresses are 7-bit I2C addresses. Pin and delay operations cannot fail;
+// bus operations report the shared `Error` below.
+
+// Bus and device failures shared by every driver and chip implementation.
+// A single payload-free enum keeps drivers composable and comparable with ==.
+pub enum Error {
+    // The device did not respond or a flag did not change in time.
+    Timeout,
+    // No device acknowledged its address or a data byte.
+    NoAcknowledge,
+    // Electrical or protocol fault, including lost bus arbitration.
+    Bus,
+    // Data arrived faster than it was consumed.
+    Overrun,
+    // The peripheral is in use or not ready for this request.
+    Busy,
+    // An argument is outside what the device or bus accepts.
+    InvalidInput,
+    // The implementation does not support this operation.
+    Unsupported
+}
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.Timeout => {
+            return "Timeout"
+        }
+        Error.NoAcknowledge => {
+            return "NoAcknowledge"
+        }
+        Error.Bus => {
+            return "Bus"
+        }
+        Error.Overrun => {
+            return "Overrun"
+        }
+        Error.Busy => {
+            return "Busy"
+        }
+        Error.InvalidInput => {
+            return "InvalidInput"
+        }
+        Error.Unsupported => {
+            return "Unsupported"
+        }
+    }
+}
+
+// Register fields are plain mask constants of the register's type, as in a
+// datasheet or C header, so they cost nothing and can be reused freely:
+//
+//     const ENABLE: u32 = 1 << 0
+//     const MODE: u32 = 0b111 << 4
+//
+// A mask must be nonzero and its bits contiguous.
+
+// The lowest set bit of a nonzero mask, the factor that moves a field value
+// into register position. Division and multiplication by it compile to shifts.
+fn unit<T>(mask: T) -> T {
+    one: T = 1
+    return mask & ~(mask - one)
+}
+
+// `value` moved into the position of `mask`. Traps if it does not fit, so a
+// wrong value never silently changes a neighbouring field.
+pub fn encode<T>(mask: T, value: T) -> T {
+    step := unit(mask)
+    core.assert(value <= mask / step)
+    return value * step
+}
+
+// The field `mask` extracted from a whole register value.
+pub fn decode<T>(mask: T, register: T) -> T {
+    return (register & mask) / unit(mask)
+}
+
+// One memory-mapped register holding T (u8, u16, u32, or u64 up to the target
+// pointer width). Every access is a single volatile load or store of T; the
+// compiler never merges, removes, or splits it.
+//
+// A Reg is move-only. Owning it is the permission to touch that register, so
+// build peripheral structs from Reg fields and hand them out once.
+pub struct Reg<T> {
+    address: usize
+
+    // SAFETY: `address` must be a valid, T-aligned device register for this
+    // target, accessible with T-sized loads and stores, and no other handle
+    // or code may access it in a conflicting way while this handle exists.
+    pub unsafe fn at(address: usize) -> Reg<T> {
+        return Reg<T> { address }
+    }
+
+    pub fn address(&self) -> usize {
+        return self.address
+    }
+
+    pub fn read(&self) -> T {
+        // SAFETY: `at` guarantees a valid register owned by this handle.
+        unsafe {
+            return ptr.read_volatile(self.address as *const T)
+        }
+    }
+
+    pub fn write(&mut self, value: T) {
+        // SAFETY: `at` guarantees a valid register owned by this handle.
+        unsafe {
+            ptr.write_volatile(self.address as *mut T, value)
+        }
+    }
+
+    // Read-modify-write: clear the `clear` bits, then set the `set` bits.
+    // Not atomic with respect to interrupts; wrap shared registers in a
+    // `Critical` section or use the chip's set/clear aliases instead.
+    pub fn modify(&mut self, clear: T, set: T) {
+        value := self.read()
+        self.write((value & ~clear) | set)
+    }
+
+    pub fn set_bits(&mut self, mask: T) {
+        value := self.read()
+        self.write(value | mask)
+    }
+
+    pub fn clear_bits(&mut self, mask: T) {
+        value := self.read()
+        self.write(value & ~mask)
+    }
+
+    // True when any bit in `mask` reads as one.
+    pub fn any(&self, mask: T) -> bool {
+        zero: T = 0
+        return (self.read() & mask) != zero
+    }
+
+    // The value of the field `mask`.
+    pub fn get(&self, mask: T) -> T {
+        return decode(mask, self.read())
+    }
+
+    // Read-modify-write of the field `mask`. Traps if `value` does not fit.
+    pub fn set(&mut self, mask: T, value: T) {
+        bits := encode(mask, value)
+        self.modify(mask, bits)
+    }
+
+    // Poll until every bit in `mask` reads one, at most `attempts` reads.
+    // Use it for ready flags; a stuck device then yields Error.Timeout
+    // instead of hanging forever.
+    pub fn wait_set(&self, mask: T, attempts: u32) -> void!Error {
+        for _ in 0..attempts {
+            if (self.read() & mask) == mask {
+                return ok()
+            }
+        }
+        return err(Error.Timeout)
+    }
+
+    // Poll until every bit in `mask` reads zero, at most `attempts` reads.
+    pub fn wait_clear(&self, mask: T, attempts: u32) -> void!Error {
+        zero: T = 0
+        for _ in 0..attempts {
+            if (self.read() & mask) == zero {
+                return ok()
+            }
+        }
+        return err(Error.Timeout)
+    }
+}
+
+// Masks interrupts on the current core while it is alive and restores the
+// previous state when dropped, so sections nest correctly:
+//
+//     section := hal.Critical.enter()
+//     unsafe { TICKS += 1 }
+//     core.drop(section)
+//
+// Bare-metal Cortex-M and RISC-V mask interrupts; hosted OS targets have no
+// interrupts visible to programs and make this a no-op. It never excludes
+// other threads or cores; use `std/sync` for those.
+pub struct Critical {
+    were_enabled: bool
+
+    pub fn enter() -> Critical {
+        return Critical { were_enabled: cpu.disable_interrupts() }
+    }
+
+    fn drop(&mut self) {
+        // SAFETY: restores exactly the state saved by the matching enter.
+        unsafe {
+            cpu.restore_interrupts(self.were_enabled)
+        }
+    }
+}
+
+// Drive an output pin to `high`.
+pub fn write_pin<P>(pin: &mut P, high: bool) {
+    if high {
+        pin.set_high()
+    } else {
+        pin.set_low()
+    }
+}
+
+pub fn delay_ms<D>(delay: &mut D, milliseconds: u32) {
+    for _ in 0..milliseconds {
+        delay.delay_us(1000)
+    }
+}
+
+// Most I2C sensors expose numbered 8-bit registers. These helpers implement
+// the common "write register number, then read or write data" transactions.
+
+pub fn read_register<B>(bus: &mut B, address: u8, register: u8) -> u8!Error {
+    command: [1]u8 = [register]
+    value: [1]u8 = [0]
+    bus.write_read(address, &command, &mut value)?
+    return ok(value[0])
+}
+
+pub fn read_registers<B>(bus: &mut B, address: u8, first: u8, buffer: &mut[u8]) -> void!Error {
+    command: [1]u8 = [first]
+    return bus.write_read(address, &command, buffer)
+}
+
+pub fn write_register<B>(bus: &mut B, address: u8, register: u8, value: u8) -> void!Error {
+    command: [2]u8 = [register, value]
+    return bus.write(address, &command)
+}
+
+// One device on a shared SPI bus, selected by an active-low chip-select pin.
+// The device owns its pin; the bus is passed to each transaction, so several
+// devices share one bus and the borrow checker keeps transactions apart.
+pub struct SpiDevice<P> {
+    select: P
+
+    // Takes the chip-select pin and deselects the device.
+    pub fn new(select: P) -> SpiDevice<P> {
+        device := SpiDevice<P> { select }
+        device.select.set_high()
+        return device
+    }
+
+    // Full-duplex exchange in place with the device selected.
+    pub fn transfer<B>(&mut self, bus: &mut B, bytes: &mut[u8]) -> void!Error {
+        self.select.set_low()
+        result := bus.transfer(bytes)
+        self.select.set_high()
+        return result
+    }
+
+    pub fn write<B>(&mut self, bus: &mut B, bytes: &[u8]) -> void!Error {
+        self.select.set_low()
+        result := bus.write(bytes)
+        self.select.set_high()
+        return result
+    }
+
+    // Write `command`, then read `buffer.len` bytes in the same selection.
+    pub fn write_read<B>(&mut self, bus: &mut B, command: &[u8], buffer: &mut[u8]) -> void!Error {
+        self.select.set_low()
+        match bus.write(command) {
+            ok() => {}
+            err(error) => {
+                self.select.set_high()
+                return err(error)
+            }
+        }
+        for index in 0..buffer.len {
+            buffer[index] = 0
+        }
+        result := bus.transfer(buffer)
+        self.select.set_high()
+        return result
+    }
+
+    // Give back the chip-select pin.
+    pub fn release(self) -> P {
+        let SpiDevice { select } = self
+        return select
+    }
+}

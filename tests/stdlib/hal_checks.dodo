@@ -1,0 +1,184 @@
+package main
+
+import "core/ptr"
+import "std/hal"
+import "std/hal/fake"
+
+// A portable driver, written once against the HAL protocols.
+struct Thermometer<B> {
+    bus: B
+    address: u8
+
+    fn new(bus: B, address: u8) -> Thermometer<B> {
+        return Thermometer<B> { bus, address }
+    }
+
+    fn enable(&mut self) -> void!hal.Error {
+        return hal.write_register(&mut self.bus, self.address, 0x01, 0x80)
+    }
+
+    // Tenths of a degree, from a big-endian 16-bit register pair.
+    fn read_tenths(&mut self) -> i32!hal.Error {
+        raw: [2]u8 = [0, 0]
+        hal.read_registers(&mut self.bus, self.address, 0x10, &mut raw)?
+        return ok(((raw[0] as i32) << 8) | raw[1] as i32)
+    }
+
+    fn release(self) -> B {
+        let Thermometer { bus, address } = self
+        return bus
+    }
+}
+
+fn blink<P, D>(led: &mut P, delay: &mut D, times: u32) {
+    for _ in 0..times {
+        led.set_high()
+        hal.delay_ms(delay, 500)
+        led.set_low()
+        hal.delay_ms(delay, 500)
+    }
+}
+
+const ENABLE: u32 = 1 << 0
+const MODE: u32 = 0b111 << 4
+const WHOLE: u32 = 0xFFFF_FFFF
+const HIGH_NIBBLE: u8 = 0xF0
+
+fn registers() {
+    storage: u32 = 0
+    address := unsafe {
+        ptr.from_mut(&mut storage) as usize
+    }
+    control: hal.Reg<u32> = unsafe {
+        hal.Reg.at(address)
+    }
+
+    core.assert_eq(control.address(), address)
+    control.write(ENABLE | hal.encode(MODE, 5))
+    core.assert_eq(control.read(), 0x51u32)
+    core.assert_eq(control.get(MODE), 5u32)
+    core.assert(control.any(ENABLE))
+
+    control.set(MODE, 2)
+    core.assert_eq(control.read(), 0x21u32)
+    control.clear_bits(ENABLE)
+    core.assert(!control.any(ENABLE))
+    control.set_bits(0x8000_0000)
+    core.assert_eq(control.get(WHOLE), 0x8000_0020u32)
+    control.modify(WHOLE, 0x7)
+    core.assert_eq(control.read(), 7u32)
+    core.assert_eq(hal.decode(MODE, 0xFFu32), 7u32)
+    core.assert_eq(hal.encode(WHOLE, 9), 9u32)
+
+    control.write(0x30)
+    control.wait_set(0x30, 1)!
+    control.wait_clear(ENABLE, 1)!
+    match control.wait_set(0x70, 3) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    match control.wait_clear(0x10, 3) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+
+    byte_storage: u8 = 0xA5
+    byte_address := unsafe {
+        ptr.from_mut(&mut byte_storage) as usize
+    }
+    status: hal.Reg<u8> = unsafe {
+        hal.Reg.at(byte_address)
+    }
+    core.assert_eq(status.get(HIGH_NIBBLE), 0xAu8)
+}
+
+fn pins_and_delays() {
+    led := fake.Pin.new()
+    delay := fake.Delay.new()
+    blink(&mut led, &mut delay, 3)
+    core.assert_eq(led.changes(), 6u32)
+    core.assert(!led.is_high())
+    core.assert_eq(delay.elapsed_us(), 3_000_000u64)
+    hal.write_pin(&mut led, true)
+    core.assert(led.is_high())
+}
+
+fn i2c_driver() {
+    bus := fake.I2c.new(0x48)
+    bus.set_register(0x10, 0x01)
+    bus.set_register(0x11, 0x2C)
+    sensor := Thermometer.new(bus, 0x48)
+    sensor.enable()!
+    core.assert_eq(sensor.read_tenths()!, 300i32)
+
+    bus = sensor.release()
+    core.assert_eq(bus.register(0x01), 0x80u8)
+    core.assert_eq(hal.read_register(&mut bus, 0x48, 0x11)!, 0x2Cu8)
+
+    bus.fail_next(hal.Error.Bus)
+    match hal.read_register(&mut bus, 0x48, 0x11) {
+        ok(value) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Bus)
+        }
+    }
+    match hal.write_register(&mut bus, 0x49, 0, 0) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.NoAcknowledge)
+            core.assert_eq(hal.error_name(error), "NoAcknowledge")
+        }
+    }
+}
+
+fn spi_devices() {
+    bus := fake.Spi.new()
+    flash := hal.SpiDevice.new(fake.Pin.new())
+    display := hal.SpiDevice.new(fake.Pin.new())
+
+    reply: [3]u8 = [0x00, 0xEF, 0x40]
+    bus.reply_with(&reply)
+    id: [2]u8 = [0, 0]
+    command: [1]u8 = [0x9F]
+    flash.write_read(&mut bus, &command, &mut id)!
+    core.assert_eq(id[0], 0xEFu8)
+    core.assert_eq(id[1], 0x40u8)
+    core.assert_eq(bus.sent().len, 3usize)
+    core.assert_eq(bus.sent()[0], 0x9Fu8)
+
+    bus.clear()
+    pixels: [4]u8 = [1, 2, 3, 4]
+    display.write(&mut bus, &pixels)!
+    core.assert_eq(bus.sent().len, 4usize)
+
+    select := flash.release()
+    core.assert(select.is_high())
+    core.assert_eq(select.changes(), 3u32)
+}
+
+fn critical_sections() {
+    outer := hal.Critical.enter()
+    inner := hal.Critical.enter()
+    core.drop(inner)
+    core.drop(outer)
+}
+
+fn main() {
+    registers()
+    pins_and_delays()
+    i2c_driver()
+    spi_devices()
+    critical_sections()
+}
