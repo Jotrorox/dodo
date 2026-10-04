@@ -912,12 +912,14 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn local_uris_round_trip_escaped_characters() {
-        let path = PathBuf::from("/tmp/dodo é #?.dodo");
+        // /tmp is a symlink on macOS; file_path resolves source directories.
+        let directory = std::fs::canonicalize("/tmp").unwrap();
+        let path = directory.join("dodo é #?.dodo");
         let uri = file_uri(&path);
         assert_eq!(file_path(&uri), Some(path));
         assert_eq!(
             file_path("file://localhost/tmp/example.dodo"),
-            Some(PathBuf::from("/tmp/example.dodo"))
+            Some(directory.join("example.dodo"))
         );
         assert_eq!(file_path("file://other-host/tmp/a.dodo"), None);
         assert_eq!(file_path("file:///tmp/%zz"), None);
