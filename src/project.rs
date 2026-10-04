@@ -1,5 +1,6 @@
 //! Optional project manifests and deterministic configuration resolution.
 //! This module does not inspect process environment, change directories, or use LLVM.
+use crate::hardware::{self, Platform};
 use crate::toml::{self, Kind, Value};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -89,6 +90,8 @@ pub struct Settings {
     pub panic: Option<Panic>,
     pub linker: Option<OsString>,
     pub link_args: Option<Vec<OsString>>,
+    pub board: Option<String>,
+    pub chip: Option<String>,
 }
 impl Settings {
     fn overlay(&mut self, other: &Self, source: &str, origins: &mut BTreeMap<String, String>) {
@@ -108,6 +111,8 @@ impl Settings {
         field!(panic, "panic");
         field!(linker, "linker");
         field!(link_args, "link-args");
+        field!(board, "board");
+        field!(chip, "chip");
     }
 }
 #[derive(Clone, Debug)]
@@ -204,6 +209,8 @@ const SETTINGS: &[&str] = &[
     "panic-hook",
     "linker",
     "link-args",
+    "board",
+    "chip",
 ];
 fn settings(t: &Fields, root: &Path) -> ParseResult<Settings> {
     if let (Some(_), Some(hook)) = (t.get("panic"), t.get("panic-hook")) {
@@ -220,8 +227,20 @@ fn settings(t: &Fields, root: &Path) -> ParseResult<Settings> {
         features: optional_string(t, "features")?,
         linker: optional_string(t, "linker")?.map(|s| linker_path(OsStr::new(&s), root)),
         link_args: t.get("link-args").map(strings).transpose()?,
+        board: optional_string(t, "board")?,
+        chip: optional_string(t, "chip")?,
         ..Default::default()
     };
+    if let Some(name) = &result.board
+        && hardware::board(name).is_none()
+    {
+        return Err(error(&t["board"], hardware::unknown_board(name)));
+    }
+    if let Some(name) = &result.chip
+        && hardware::chip(name).is_none()
+    {
+        return Err(error(&t["chip"], hardware::unknown_chip(name)));
+    }
     if let Some(v) = t.get("panic") {
         result.panic = Some(Panic::parse(&string(v)?).map_err(|e| error(v, e))?);
     }
@@ -613,6 +632,8 @@ pub fn resolve(request: Request<'_>) -> Result<Resolved, String> {
             panic: Some(Panic::Auto),
             linker: Some("cc".into()),
             link_args: Some(vec![]),
+            board: None,
+            chip: None,
         },
         "compiler defaults",
         &mut r.origins,
@@ -699,6 +720,9 @@ pub fn resolve(request: Request<'_>) -> Result<Resolved, String> {
         let origin = r.origins.get_mut("link-args").unwrap();
         origin.push_str(" + CLI");
     }
+    if let Some(platform) = r.settings.platform()? {
+        apply_platform(&mut r, platform)?;
+    }
     let triple = r.settings.triple.as_ref().unwrap();
     if triple.is_empty()
         || !triple
@@ -716,10 +740,61 @@ pub fn resolve(request: Request<'_>) -> Result<Resolved, String> {
             m.out_dir
                 .join(r.profile.as_deref().unwrap_or("dev"))
                 .join(triple)
-                .join(format!("{name}{}", r.emit.extension(triple))),
+                .join(format!("{name}{}", extension(r.emit, &r.settings))),
         );
     }
     Ok(r)
+}
+/// A board or chip fills in every platform setting still at its compiler
+/// default. Explicit settings win, except a target triple the chip cannot run.
+fn apply_platform(r: &mut Resolved, platform: Platform) -> Result<(), String> {
+    let chip = platform.chip;
+    let origin = match platform.board {
+        Some(board) => format!("board {}", board.name),
+        None => format!("chip {}", chip.name),
+    };
+    let defaulted = |r: &Resolved, key: &str| r.origins[key] == "compiler defaults";
+    if r.settings.triple.as_deref() != Some(chip.triple) {
+        if !defaulted(r, "triple") {
+            return Err(format!(
+                "{origin} requires target {}, but {} sets triple = {}",
+                chip.triple,
+                r.origins["triple"],
+                toml::quote(r.settings.triple.as_deref().unwrap())
+            ));
+        }
+        r.settings.triple = Some(chip.triple.into());
+        r.origins.insert("triple".into(), origin.clone());
+    }
+    if defaulted(r, "cpu") {
+        r.settings.cpu = Some(chip.cpu.into());
+        r.origins.insert("cpu".into(), origin.clone());
+    }
+    if defaulted(r, "panic") {
+        r.settings.panic = Some(Panic::Hook(chip.panic_hook.into()));
+        r.origins.insert("panic".into(), origin.clone());
+    }
+    // DODO_CC selects a C driver for hosted links; firmware links ELF directly.
+    if defaulted(r, "linker") || r.origins["linker"] == "DODO_CC" {
+        r.settings.linker = Some(chip.linker.into());
+        r.origins.insert("linker".into(), origin);
+    }
+    Ok(())
+}
+impl Settings {
+    /// The firmware platform selected by `board` and `chip`, if any.
+    pub fn platform(&self) -> Result<Option<Platform>, String> {
+        Platform::select(self.board.as_deref(), self.chip.as_deref())
+    }
+}
+/// Output file extension. Firmware executables are ELF images; the flashable
+/// image is written next to them.
+pub fn extension(emit: Emit, settings: &Settings) -> &'static str {
+    if emit == Emit::Exe && (settings.board.is_some() || settings.chip.is_some()) {
+        ".elf"
+    } else {
+        emit.extension(settings.triple.as_deref().unwrap_or(""))
+    }
 }
 impl Resolved {
     pub fn report(&self) -> String {
@@ -773,6 +848,12 @@ impl Resolved {
             ("link-args", argv(s.link_args.as_ref().unwrap())),
         ] {
             add(key, value, &self.origins[key]);
+        }
+        if let Some(board) = &s.board {
+            add("board", toml::quote(board), &self.origins["board"]);
+        }
+        if let Some(chip) = &s.chip {
+            add("chip", toml::quote(chip), &self.origins["chip"]);
         }
         let (key, value) = match s.panic.as_ref().unwrap() {
             Panic::Auto => ("panic", "auto"),

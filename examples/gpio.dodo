@@ -1,14 +1,17 @@
 package gpio
 
-import "std/hal"
+import "std/embedded/hal"
 
 // Chip support for the RP2040 single-cycle I/O (SIO) block: the layer that
-// turns datasheet addresses into the portable `std/hal` pin protocol. Driver
-// code written against that protocol runs unchanged here and, with
-// `std/hal/fake`, in desktop tests.
+// turns datasheet addresses into the portable `std/embedded/hal` pin protocol.
+// Driver code written against that protocol runs unchanged here and, with
+// `std/embedded/hal/fake`, in desktop tests.
 //
-// This is a hardware template, not a desktop program. It assumes the board's
-// startup code already routed the pins to SIO (IO_BANK0 function 5).
+// This is a minimal template for writing chip support, not a desktop program.
+// It assumes startup code already routed the pins to SIO (IO_BANK0 function 5).
+// For a complete, flashable RP2040 program use the bundled
+// `std/embedded/chip/rp2040` support through `board = "pico"` and
+// `std/embedded/board` instead; see examples/blink.
 //
 // Build an object for the chip with:
 //     dodo build examples/gpio.dodo --emit obj --target thumbv6m-none-eabi -o gpio.o
@@ -78,7 +81,7 @@ pub struct Port {
     }
 }
 
-// One GPIO. Implements the `std/hal` output and input pin protocols.
+// One GPIO. Implements the `std/embedded/hal` output and input pin protocols.
 pub struct Pin {
     set: hal.Reg<u32>
     clear: hal.Reg<u32>

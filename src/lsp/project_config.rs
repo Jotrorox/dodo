@@ -1,4 +1,5 @@
 //! Editor project selection. Reads configuration only; never runs build commands.
+use crate::hardware::Platform;
 use crate::{codegen, file_uri, json::Value, project};
 use std::path::{Path, PathBuf};
 #[derive(Default)]
@@ -48,7 +49,7 @@ impl ProjectConfig {
             target: string("target")?,
         })
     }
-    pub fn settings(&self) -> Result<(String, u32), String> {
+    pub fn settings(&self) -> Result<(String, u32, Option<Platform>), String> {
         let manifest = if let Some(path) = &self.path {
             match std::fs::symlink_metadata(path) {
                 Ok(_) => Some(project::Manifest::read(path)?),
@@ -79,6 +80,7 @@ impl ProjectConfig {
             host: &host,
         })?;
         let settings = resolved.settings;
+        let platform = settings.platform()?;
         let bits = codegen::pointer_bits(&codegen::Options {
             target: settings.triple.clone(),
             cpu: settings.cpu,
@@ -86,6 +88,6 @@ impl ProjectConfig {
             ..Default::default()
         })
         .map_err(|e| format!("invalid target: {e}"))?;
-        Ok((settings.triple.unwrap(), bits))
+        Ok((settings.triple.unwrap(), bits, platform))
     }
 }

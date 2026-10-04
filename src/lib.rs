@@ -11,6 +11,7 @@ pub mod consteval;
 pub mod diagnostic;
 pub mod editor;
 pub mod format;
+pub mod hardware;
 pub mod json;
 mod json_derive;
 pub mod lexer;

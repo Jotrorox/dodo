@@ -248,6 +248,22 @@ const OPTIONS: &[OptionSpec] = &[
         "LLVM target triple (default: host); not a project target name"
     ),
     option!(
+        "board",
+        None,
+        Some("NAME"),
+        B | R | C,
+        "Platform",
+        "Firmware board, e.g. pico: target, CPU, startup code, linker, flashable image"
+    ),
+    option!(
+        "chip",
+        None,
+        Some("NAME"),
+        B | R | C,
+        "Platform",
+        "Firmware chip for a custom board, e.g. rp2040; implied by --board"
+    ),
+    option!(
         "cpu",
         None,
         Some("NAME"),
@@ -648,6 +664,17 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, String>
                 });
             }
             "target" => invocation.settings.triple = Some(utf8(value, "target")?),
+            "board" => {
+                let name = utf8(value, "board")?;
+                crate::hardware::board(&name)
+                    .ok_or_else(|| crate::hardware::unknown_board(&name))?;
+                invocation.settings.board = Some(name)
+            }
+            "chip" => {
+                let name = utf8(value, "chip")?;
+                crate::hardware::chip(&name).ok_or_else(|| crate::hardware::unknown_chip(&name))?;
+                invocation.settings.chip = Some(name)
+            }
             "cpu" => invocation.settings.cpu = Some(utf8(value, "CPU")?),
             "features" => invocation.settings.features = Some(utf8(value, "features")?),
             "panic" => invocation.settings.panic = Some(Panic::parse(&utf8(value, "panic mode")?)?),

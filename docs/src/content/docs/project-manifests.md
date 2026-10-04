@@ -134,16 +134,36 @@ custom profiles require one. `check` does not use profiles.
 | `[tool.NAME]` | Data reserved for other tools; Dodo does not interpret it. |
 
 Compiler settings are `opt-level` (integer 0–3), `debug` (boolean), `triple`,
-`cpu`, `features`, `panic`, `panic-hook`, `linker`, and `link-args`. Features are
-an LLVM CPU-feature string such as `"+sse4.2,-avx"`. `emit` accepts `exe` (default),
-`obj`, `asm`, `llvm-ir`, or `bitcode`.
+`cpu`, `features`, `panic`, `panic-hook`, `linker`, `link-args`, `board`, and
+`chip`.
+Features are an LLVM CPU-feature string such as `"+sse4.2,-avx"`. `emit` accepts
+`exe` (default), `obj`, `asm`, `llvm-ir`, or `bitcode`.
+
+`board` selects firmware hardware, currently `"pico"` for the Raspberry Pi
+Pico; `chip` (currently `"rp2040"`) selects only the microcontroller, for a
+custom board. Either fills in `triple`, `cpu`, the panic hook, and the linker
+wherever they are not set explicitly, makes `exe` output a flashable firmware
+image (the target's `.elf` plus, for example, a `.uf2` beside it), and selects
+the packages `import "std/embedded/board"` and `import "std/embedded/chip"` resolve to. `run`
+flashes the board instead of executing on the host. A `triple` the chip cannot
+run, or a `chip` that is not the board's, is an error. See
+[hardware and embedded](hardware.md#boards).
+
+```toml
+schema = 1
+
+[targets.blink]
+entry = "main.dodo"
+board = "pico"
+```
 
 `panic` accepts `auto`, `hosted`, or `trap`; `panic-hook` names a non-returning
 C ABI handler. A table may set one of these, and a later layer replaces the
 whole policy. `--panic trap` therefore clears an inherited hook.
 
 Linker selection is `--linker`, then `DODO_CC`, then the resolved manifest
-setting, then `cc`. A target's `link-args` replaces the shared array; `[]` clears
+setting, then `cc`. Board targets link ELF directly, so they ignore `DODO_CC`
+and default to the board's linker instead of `cc`. A target's `link-args` replaces the shared array; `[]` clears
 it. CLI `--link-arg` values append. `--clear-link-args` discards all inherited
 arguments before appending CLI arguments. Non-executable builds require an
 empty linker-argument list; checking never invokes a linker.

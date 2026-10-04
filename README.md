@@ -82,7 +82,7 @@ package. It is generated from the library at each documentation build.
 | Calculations | [Core](https://jotrorox.github.io/dodo/core/), [math](https://jotrorox.github.io/dodo/math/), [hashing](https://jotrorox.github.io/dodo/hash/), [time](https://jotrorox.github.io/dodo/time/) |
 | OS services | [Files](https://jotrorox.github.io/dodo/filesystem/), [environment](https://jotrorox.github.io/dodo/environment/), [processes](https://jotrorox.github.io/dodo/processes/), [threads](https://jotrorox.github.io/dodo/threads/), [synchronization](https://jotrorox.github.io/dodo/synchronization/) |
 | Network applications | [Sockets and DNS](https://jotrorox.github.io/dodo/networking/), [TLS](https://jotrorox.github.io/dodo/tls/), [HTTP](https://jotrorox.github.io/dodo/http/), [web servers](https://jotrorox.github.io/dodo/web/) |
-| Hardware and firmware | [Registers, interrupts, and portable drivers](https://jotrorox.github.io/dodo/hardware/) |
+| Hardware and firmware | [Registers, interrupts, and portable drivers](https://jotrorox.github.io/dodo/hardware/); [firmware for boards such as the Raspberry Pi Pico](https://jotrorox.github.io/dodo/hardware/#boards) |
 
 Portable packages work with explicit storage and no required OS, global
 allocator, or scheduler. Hosted adapters currently support Linux GNU x86-64 and
