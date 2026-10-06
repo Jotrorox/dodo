@@ -49,7 +49,7 @@ fn image_def_check(
         .find(|s| s.address == origin)
         .ok_or("firmware has no vector table at the start of flash")?;
     let head = &elf[first.offset..first.offset + first.size.min(4096)];
-    if head.chunks_exact(4).any(|word| word == START) {
+    if head.as_chunks::<4>().0.contains(&START) {
         Ok(())
     } else {
         Err("firmware has no RP2350 IMAGE_DEF block in the first 4 KiB of flash".into())
