@@ -31,6 +31,11 @@ Download the matching archive from
 The examples below describe release 0.1.4. Documentation on `main` may contain
 APIs added after that release.
 
+Releases after 0.1.4 include a `SHA256SUMS` file and GitHub build provenance
+attestations. To verify a download, place `SHA256SUMS` next to it and run
+`sha256sum --check --ignore-missing SHA256SUMS`, or, with the GitHub CLI,
+`gh attestation verify <archive> --repo Jotrorox/dodo`.
+
 ### Linux
 
 From the extracted directory containing `dodo`, install it into your user bin

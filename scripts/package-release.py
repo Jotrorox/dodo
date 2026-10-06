@@ -5,6 +5,7 @@ from pathlib import Path
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -96,7 +97,15 @@ def main() -> None:
                 raise ValueError("Missing GCC runtime copyright notices")
             for source in gcc_notices:
                 shutil.copy2(source, notices / f"{source.parent.name}-copyright")
-            shutil.copytree("/usr/share/common-licenses", notices / "common-licenses")
+            # Copy only the shared license texts these notices refer to, not the whole directory.
+            common_licenses = Path("/usr/share/common-licenses")
+            referenced = set()
+            for notice in notices.glob("*-copyright"):
+                referenced.update(re.findall(r"/usr/share/common-licenses/([A-Za-z0-9+-]+(?:\.[0-9]+)*)",
+                                             notice.read_text(errors="replace")))
+            (notices / "common-licenses").mkdir()
+            for license_name in sorted(referenced):
+                shutil.copy2(common_licenses / license_name, notices / "common-licenses" / license_name)
 
         platform = "x86-64 Windows" if windows else "x86-64 Linux (Ubuntu 24.04 / glibc 2.39 or newer)"
         toolchain = (
@@ -116,13 +125,14 @@ def main() -> None:
         )
         if windows:
             archive = destination / f"{name}.zip"
-            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_archive:
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_archive:
                 for source in sorted(bundle.rglob("*")):
                     if source.is_file():
                         zip_archive.write(source, source.relative_to(bundle.parent))
         else:
-            archive = destination / f"{name}.tar.gz"
-            with tarfile.open(archive, "w:gz") as tar:
+            # XZ compresses the embedded LLVM much better than gzip; every tar extracts it.
+            archive = destination / f"{name}.tar.xz"
+            with tarfile.open(archive, "w:xz", preset=9) as tar:
                 tar.add(bundle, arcname=name)
 
     print(f"Packaged {archive} ({archive.stat().st_size:,} bytes)")
