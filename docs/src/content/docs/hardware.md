@@ -415,7 +415,7 @@ board = "pico"
 ```
 
 Hold the Pico's BOOTSEL button while connecting it over USB, so it appears as
-the `RPI-RP2` drive, then run:
+the `RPI-RP2` drive (`RP2350` for a Pico 2 with `board = "pico2"`), then run:
 
 ```sh
 dodo run
@@ -424,7 +424,8 @@ dodo run
 Dodo builds the firmware, copies it to the drive, and the board restarts into
 it: the LED blinks once a second. `dodo build` writes
 `build/dev/thumbv6m-none-eabi/blink.elf` for debuggers and `blink.uf2` next to
-it for drag-and-drop flashing. Without a manifest, pass `--board pico` to
+it for drag-and-drop flashing (`thumbv8m.main-none-eabi` for the Pico 2).
+Without a manifest, pass `--board pico` to
 `dodo build`, `dodo run`, or `dodo check`. Editors use the manifest's board
 too.
 
@@ -450,6 +451,7 @@ import `std/embedded/board`; keep that code in drivers and test them with fakes.
 | Board | Chip | Package |
 | --- | --- | --- |
 | `pico` | `rp2040` | `std/embedded/board/pico`: Raspberry Pi Pico, 2 MiB flash, LED on GP25. |
+| `pico2` | `rp2350` | `std/embedded/board/pico2`: Raspberry Pi Pico 2, 4 MiB flash, LED on GP25. |
 
 ### The RP2040 and Raspberry Pi Pico
 
@@ -473,6 +475,34 @@ use is `InvalidInput`. Pins, the timer, and `reboot_to_bootloader(led)` are
 the types and functions the Pico board package exposes. Interrupt handlers use
 the datasheet names: `SysTick_Handler`, `HardFault_Handler`, `TIMER_IRQ_0` to
 `TIMER_IRQ_3`, `UART0_IRQ`, `IO_IRQ_BANK0`, and so on.
+
+### The RP2350 and Raspberry Pi Pico 2
+
+The `rp2350` chip runs on the RP2350's Arm cores and compiles for
+`thumbv8m.main-none-eabi` and the Cortex-M33. Its boot ROM sets up
+execute-in-place flash itself, so the compiler's runtime differs from the
+RP2040's:
+
+| Part | What it does |
+| --- | --- |
+| Vector table | At the start of flash, where the boot ROM enters Arm images. Weak defaults for the Cortex-M33 exceptions (including `SecureFault_Handler`) and all 52 interrupts. |
+| Image definition | The `IMAGE_DEF` block, in the first 4 KiB of flash, that marks the image as a secure Arm RP2350 executable. The boot ROM runs nothing without it. |
+| Reset handler | Clears the stack limit, installs the vector table, enables the FPU, initializes RAM, and calls `main`. |
+| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. |
+| Linker script | Flash at `0x10000000` (size from the board), 520 KiB of RAM, and the stack at the top of RAM. |
+
+`std/embedded/chip/rp2350` mirrors the RP2040 package: `rp2350.take(config)`
+starts the crystal, runs the CPU at 150 MHz from the system PLL, starts the
+1 MHz ticks for TIMER0 and the watchdog, and hands out pins and the timer
+once. Pins are released from pad isolation when claimed, as the RP2350
+requires. `reboot_to_bootloader(led)` uses the boot ROM's reboot function;
+the activity LED is skipped on chip revision A2, whose boot ROM mishandles it.
+Interrupt handlers use the datasheet names, for example `TIMER0_IRQ_0` and
+`IO_IRQ_BANK0`. GPIO 0 to 29 are supported, all of the RP2350A; the RP2350B's
+extra pins are not yet.
+
+Unlike the RP2040, the RP2350 boot ROM clears RAM when it starts, so nothing
+in RAM survives a reboot into the bootloader.
 
 ### Custom boards
 
@@ -500,7 +530,7 @@ entry = "main.dodo"
 chip = "rp2040"
 ```
 
-A chip alone assumes 2 MiB of flash. To give the board a name that
+A chip alone assumes 2 MiB of flash (4 MiB for `chip = "rp2350"`). To give the board a name that
 `std/embedded/board` resolves to, add it to the compiler (see below).
 
 ### Adding chips and boards
@@ -517,8 +547,8 @@ so each new board or chip is a small, self-contained addition:
   `std/embedded/chip/NAME` package with its peripherals.
 
 The compiler compiles the runtime itself with the selected target machine, so
-no assembler or C toolchain is involved. `scripts/test_pico.py` shows how to
-check a chip on real hardware.
+no assembler or C toolchain is involved. `scripts/test_pico.py` (with
+`--board pico` or `--board pico2`) shows how to check a chip on real hardware.
 
 ### Unsupported chips
 
@@ -546,13 +576,15 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 ## Current limits
 
-- `pico` is the only board and `rp2040` the only chip so far.
-  `std/embedded/chip/rp2040` covers clocks, GPIO, and the timer; UART, I2C, SPI, PWM,
-  and USB are not bundled yet. Write them with `hal.Reg` as above.
+- The boards are `pico` and `pico2`, on the `rp2040` and `rp2350` chips. The
+  chip packages cover clocks, GPIO, and the timer; UART, I2C, SPI, PWM, and
+  USB are not bundled yet. Write them with `hal.Reg` as above.
 - Floating-point arithmetic does not link in firmware yet: the Cortex-M0+ has
   no floating-point unit and the runtime has no software implementation. The
-  linker error says so.
-- Only core 0 runs; core 1 stays in the boot ROM.
+  linker error says so. The RP2350's Cortex-M33 FPU is enabled at startup,
+  but `f64` and conversions still need the missing helpers.
+- Only core 0 runs; core 1 stays in the boot ROM. The RP2350's RISC-V cores
+  are not supported.
 - `std/sync/atomic` currently supports x86-64 and AArch64 only. On
   microcontrollers, share state with interrupt handlers through a critical
   section.

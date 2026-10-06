@@ -17,9 +17,19 @@
 - Add `std/embedded/chip/rp2040` (clocks from a configurable crystal, 125 MHz system
   PLL, GPIO pins implementing the `std/embedded/hal` pin protocols, the microsecond
   timer, and the boot ROM's USB bootloader) and `std/embedded/board/pico`.
+- Add the Raspberry Pi Pico 2: `board = "pico2"` on the new `rp2350` chip
+  (Arm Cortex-M33 cores, `thumbv8m.main-none-eabi`). The compiler's RP2350
+  runtime provides the vector table, the `IMAGE_DEF` block the boot ROM
+  requires, and a reset handler that enables the FPU; images use the
+  `rp2350-arm-s` UF2 family and flash to the `RP2350` drive.
+  `std/embedded/chip/rp2350` runs the system clock at 150 MHz and provides
+  GPIO pins, the TIMER0 microsecond timer, and the boot ROM's USB bootloader;
+  `std/embedded/board/pico2` follows the board contract, so `examples/blink`
+  builds unchanged with `--board pico2`. The memory and integer helpers are
+  now shared by both Arm chip runtimes.
 - Add the `examples/blink` project and a hardware self-test,
   `scripts/test_pico.py`, that checks startup, clocks, timing, ownership, and
-  the runtime helpers on a connected Pico.
+  the runtime helpers on a connected Pico (`--board pico2` for a Pico 2).
 - Add `std/embedded/hal`, a portable hardware abstraction layer: typed volatile
   registers (`hal.Reg<T>`) with mask-constant fields, interrupt-masking
   `hal.Critical` sections, one shared `hal.Error`, statically checked pin,

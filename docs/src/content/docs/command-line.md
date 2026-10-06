@@ -317,8 +317,8 @@ package it as `lld`). See [hardware and embedded](hardware.md#boards).
 Otherwise `run` executes only the host target. The repository exercises
 hosted Linux GNU x86-64 and Windows x64 programs, portable standard-library
 object generation for WebAssembly and Cortex-M0, and firmware images for the
-Pico. Hardware execution is checked with `scripts/test_pico.py` on a connected
-board. See
+Pico and Pico 2. Hardware execution is checked with `scripts/test_pico.py` on a
+connected board. See
 [library availability](standard-library.md#portable-and-hosted-functionality)
 for the distinctions that affect imported APIs.
 
@@ -341,8 +341,8 @@ arguments depend on the selected toolchain.
 | `-O LEVEL`, `--opt-level LEVEL` | `0`, `1`, `2`, or `3`; default `0`. Runtime checks remain active. |
 | `-g`, `--debug` | Include source-level DWARF debug information; `--no-debug` disables it. |
 | `--target TRIPLE` | Select the compilation target; default compiler host. |
-| `--board NAME` | Firmware board (`pico`): its chip's target, CPU, panic hook, linker, startup code, and flashable image, and the package `std/embedded/board` resolves to. `run` flashes the board. |
-| `--chip NAME` | Firmware chip for a custom board (`rp2040`); implied by `--board`. `std/embedded/chip` resolves to its package. |
+| `--board NAME` | Firmware board (`pico`, `pico2`): its chip's target, CPU, panic hook, linker, startup code, and flashable image, and the package `std/embedded/board` resolves to. `run` flashes the board. |
+| `--chip NAME` | Firmware chip for a custom board (`rp2040`, `rp2350`); implied by `--board`. `std/embedded/chip` resolves to its package. |
 | `--cpu NAME` | Select target CPU features; default `generic`. |
 | `--features LIST` | Explicit LLVM target features, for example `+sse4.2`. |
 | `--linker PATH` | C linker driver; overrides `DODO_CC`, which overrides `cc`. |

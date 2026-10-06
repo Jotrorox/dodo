@@ -14,7 +14,10 @@ pub static CHIP: Chip = Chip {
         origin: 0x2000_0000,
         length: 264 * 1024,
     },
-    runtime: include_str!("rp2040/runtime.ll"),
+    runtime: concat!(
+        include_str!("rp2040/runtime.ll"),
+        include_str!("arm_eabi.ll")
+    ),
     linker_script: include_str!("rp2040/link.ld"),
     panic_hook: "dodo_board_panic",
     linker: "ld.lld",

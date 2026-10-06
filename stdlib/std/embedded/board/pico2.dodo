@@ -1,0 +1,53 @@
+package pico2
+
+import "std/embedded/hal"
+import "std/embedded/chip/rp2350"
+
+// Raspberry Pi Pico 2: an RP2350A with a 12 MHz crystal, 4 MiB of flash, and
+// a green user LED on GP25. Build with `board = "pico2"` and import this
+// package as `std/embedded/board`, so the program also builds for other
+// boards:
+//
+//     import "std/embedded/board"
+//
+//     fn main() {
+//         b := board.take()!
+//         for {
+//             b.led.toggle()
+//             b.timer.delay_ms(500)
+//         }
+//     }
+//
+// It follows the board contract described in std/embedded/hal. GP0 to GP22 and
+// GP26 to GP28 are on the header; GP23 (power-supply mode), GP24 (VBUS sense),
+// and GP29 (VSYS/3 on ADC3) are wired on the board. The Pico 2 W wires its LED
+// to the wireless chip instead and needs its own board package.
+
+pub const NAME: &str = "Raspberry Pi Pico 2"
+pub const LED_PIN: u32 = 25
+pub const CRYSTAL_HZ: u32 = 12_000_000
+
+pub struct Board {
+    // The user LED, an output pin that is on when high.
+    pub led: rp2350.Pin
+    // The remaining GPIOs; GP25 is already taken by `led`.
+    pub pins: rp2350.Pins
+    // The 1 MHz system timer: delay_us, delay_ms, and now_us.
+    pub timer: rp2350.Timer
+}
+
+// Start the chip with the Pico 2's crystal and claim the LED. A second call
+// returns hal.Error.Busy.
+pub fn take() -> Board!hal.Error {
+    chip := rp2350.take(rp2350.Config { crystal_hz: CRYSTAL_HZ })?
+    led := chip.pins.output(LED_PIN)?
+    let rp2350.Peripherals { pins, timer } = chip
+    return ok(Board { led, pins, timer })
+}
+
+// Restart into the USB bootloader, as if BOOTSEL were held at power-up: the
+// Pico 2 reappears as the RP2350 drive, ready for `dodo run`. The LED shows
+// drive activity on chip revisions after A2. Does not return.
+pub fn reboot_to_bootloader() {
+    rp2350.reboot_to_bootloader(LED_PIN)
+}

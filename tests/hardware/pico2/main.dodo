@@ -1,0 +1,258 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+
+// Hardware self-test for the `pico2` board: the RP2350 startup runtime,
+// std/embedded/chip/rp2350 (clocks, timer, single ownership, configuration
+// checks), std/embedded/board/pico2, and the runtime's integer helpers. Every
+// outcome ends in the USB bootloader with a record that
+// `scripts/test_pico.py --board pico2` reads over USB with picotool. The
+// RP2350 boot ROM clears SRAM when it starts, so the record is staged at
+// RECORD in SRAM and written to the last flash sector before rebooting.
+// Words of the record:
+//
+//   [0] 0x600D_00nn  finished after nn checks; [1] = failed-check bits
+//       0xDEAD_llll  panicked at line llll;    [1] = column
+//       0x5747_00nn  hung or faulted after check nn (watchdog reset)
+//   [2] clk_sys in kHz  [3] a 10 ms delay in timer us  [4] its SysTick cycles
+//   [5] failed-check bits for checks 32 to 63
+//
+// A copy of [0] and [1] in watchdog SCRATCH0/1 survives the watchdog reset
+// that reports a hang. (The boot ROM's reboot uses SCRATCH2 to 7.)
+
+const RECORD: usize = 0x2007_F000
+// The last 4 KiB sector of the Pico 2's flash, by its execute-in-place
+// address. (Without a partition table, flash_op refuses storage offsets.)
+const FLASH_RECORD: u32 = 0x103F_F000
+// Boot ROM flash_op ('F' | 'O' << 8): erase or program, secure, at a
+// runtime (execute-in-place) address.
+const ROM_FLASH_OP: u32 = 0x4F46
+const FLASH_ERASE: u32 = 0x0_0101
+const FLASH_PROGRAM: u32 = 0x1_0101
+const WATCHDOG: usize = 0x400D_8000
+const SCRATCH: usize = WATCHDOG + 0x0C
+const RUNNING: u32 = 0x5747_0000
+static mut CHECKS: u32 = 0
+// Failed-check bits: checks 0 to 31, then 32 to 63.
+static mut FAILURES: u32 = 0
+static mut MORE_FAILURES: u32 = 0
+// Initialized data: checks that the reset handler copies .data from flash.
+static mut DATA: [3]u32 = [0xDEAD_BEEFu32, 7, 0x1234_5678]
+
+fn store(address: usize, value: u32) {
+    // SAFETY: RECORD is SRAM this program never otherwise uses, and the
+    // watchdog scratch registers are free for software.
+    unsafe {
+        word: hal.Reg<u32> = hal.Reg.at(address)
+        word.write(value)
+    }
+}
+
+fn record(state: u32, detail: u32) {
+    store(RECORD, state)
+    store(RECORD + 4, detail)
+    store(SCRATCH, state)
+    store(SCRATCH + 4, detail)
+}
+
+// Provided by the compiler's RP2350 firmware runtime.
+unsafe extern "C" fn dodo_rp2350_rom_call(code: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> i32
+
+// Write the 256-byte record page to flash and restart into the bootloader.
+// flash_op leaves flash in execute-in-place mode, so this code keeps
+// running from flash.
+fn report() {
+    unsafe {
+        dodo_rp2350_rom_call(ROM_FLASH_OP, FLASH_ERASE, FLASH_RECORD, 4096, 0)
+        dodo_rp2350_rom_call(ROM_FLASH_OP, FLASH_PROGRAM, FLASH_RECORD, 256, RECORD as u32)
+    }
+    board.reboot_to_bootloader()
+}
+
+fn check(ok: bool) {
+    unsafe {
+        if !ok && CHECKS < 32 {
+            FAILURES |= 1u32 << CHECKS
+        } else if !ok && CHECKS < 64 {
+            MORE_FAILURES |= 1u32 << (CHECKS - 32)
+        }
+        CHECKS += 1
+        record(RUNNING | CHECKS, FAILURES)
+    }
+}
+
+// Replaces the board runtime's default panic hook.
+extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    record(0xDEAD_0000 | (line & 0xFFFF), column)
+    report()
+}
+
+// clk_sys in kHz from the CLOCKS frequency counter, against clk_ref.
+fn clk_sys_khz() -> u32 {
+    unsafe {
+        reference: hal.Reg<u32> = hal.Reg.at(0x4001_008C)
+        minimum: hal.Reg<u32> = hal.Reg.at(0x4001_0090)
+        maximum: hal.Reg<u32> = hal.Reg.at(0x4001_0094)
+        interval: hal.Reg<u32> = hal.Reg.at(0x4001_009C)
+        source: hal.Reg<u32> = hal.Reg.at(0x4001_00A0)
+        status: hal.Reg<u32> = hal.Reg.at(0x4001_00A4)
+        result: hal.Reg<u32> = hal.Reg.at(0x4001_00A8)
+        reference.write(12_000)
+        interval.write(10)
+        minimum.write(0)
+        maximum.write(0xFFFF_FFFF)
+        source.write(0x09)
+        match status.wait_set(1 << 4, 10_000_000) {
+            ok() => {}
+            err(_) => {
+                return 0
+            }
+        }
+        return result.read() >> 5
+    }
+}
+
+fn main() {
+    // A previous run hung and the watchdog reset the chip: report it.
+    unsafe {
+        reason: hal.Reg<u32> = hal.Reg.at(WATCHDOG + 0x08)
+        state: hal.Reg<u32> = hal.Reg.at(SCRATCH)
+        if (reason.read() & 1) != 0 && (state.read() & 0xFFFF_0000) == RUNNING {
+            detail: hal.Reg<u32> = hal.Reg.at(SCRATCH + 4)
+            record(state.read(), detail.read())
+            report()
+        }
+    }
+    record(RUNNING, 0)
+    b := board.take()!
+    // Watchdog: reset everything but the oscillators after 3 s. It counts
+    // down once per microsecond tick, which board.take() started.
+    unsafe {
+        select: hal.Reg<u32> = hal.Reg.at(0x4001_8008)
+        select.write(0x1FF_FFF3)
+        load: hal.Reg<u32> = hal.Reg.at(WATCHDOG + 0x04)
+        load.write(3_000_000)
+        control: hal.Reg<u32> = hal.Reg.at(WATCHDOG)
+        control.write(1 << 30)
+    }
+    b.led.set_high()
+
+    // A second take must be refused.
+    match board.take() {
+        ok(_) => {
+            check(false)
+        }
+        err(error) => {
+            check(error == hal.Error.Busy)
+        }
+    }
+    unsafe {
+        check(DATA[0] == 0xDEAD_BEEF && DATA[1] == 7 && DATA[2] == 0x1234_5678)
+    }
+
+    // Clocks: 150 MHz system clock.
+    khz := clk_sys_khz()
+    check(khz > 149_000 && khz < 151_000)
+
+    // Timer: a 10 ms delay is 1.5 M SysTick cycles at 150 MHz.
+    unsafe {
+        reload: hal.Reg<u32> = hal.Reg.at(0xE000_E014)
+        current: hal.Reg<u32> = hal.Reg.at(0xE000_E018)
+        control: hal.Reg<u32> = hal.Reg.at(0xE000_E010)
+        reload.write(0x00FF_FFFF)
+        current.write(0)
+        control.write(0b101)
+        start := current.read()
+        before := b.timer.now_us()
+        b.timer.delay_us(10_000)
+        after := b.timer.now_us()
+        cycles := start - current.read()
+        delta := (after - before) as u32
+        // SysTick counts clk_sys: 150 cycles per timer microsecond.
+        check(cycles > 149 * delta && cycles < 152 * delta)
+        store(RECORD + 8, khz)
+        store(RECORD + 12, delta)
+        store(RECORD + 16, cycles)
+        check(delta >= 10_000 && delta < 10_200)
+    }
+
+    // Runtime helpers: zero at run time, unknown to the optimizer.
+    z := b.timer.now_us() >> 63
+    z32 := z as u32
+    check((1_000_000_007u32 ^ z32) / 13 == 76_923_077)
+    check((1_000_000_007u32 ^ z32) % 13 == 6)
+    check((0xFFFF_FFFFu32 ^ z32) / 0x8000_0001 == 1)
+    check((0xFFFF_FFFFu32 ^ z32) % 0x8000_0001 == 0x7FFF_FFFE)
+    check((0xFFFF_FFFEu32 ^ z32) / 0xFFFF_FFFF == 0)
+    i := z32 as i32
+    check((-1_000_000_007 + i) / 13 == -76_923_077)
+    check((-1_000_000_007 + i) % 13 == -6)
+    check((7 + i) / -2 == -3)
+    check((7 + i) % -2 == 1)
+    check((-2_147_483_647 + i) / -3 == 715_827_882)
+    check((0xFEDC_BA98_7654_3210u64 ^ z) / 0x12345 == 0xE000_4FA0_1C4D)
+    check((0xFEDC_BA98_7654_3210u64 ^ z) % 0x12345 == 0x10A4F)
+    check((0xFFFF_FFFF_FFFF_FFFFu64 ^ z) / 0x8000_0000_0000_0001 == 1)
+    check((0xFFFF_FFFF_FFFF_FFFFu64 ^ z) % 0x8000_0000_0000_0001 == 0x7FFF_FFFF_FFFF_FFFE)
+    check((0x0123_4567_89AB_CDEFu64 ^ z) / 0xFFFF_FFFF == 0x123_4567)
+    check((0x0123_4567_89AB_CDEFu64 ^ z) % 0xFFFF_FFFF == 0x8ACF_1356)
+    j := z as i64
+    check((-81_985_529_216_486_895 + j) / 4660 == -17_593_461_205_254)
+    check((-81_985_529_216_486_895 + j) % 4660 == -3255)
+    check((9_223_372_036_854_775_807 - j) / -7 == -1_317_624_576_693_539_401)
+    check(core.wrapping_mul(0x1_2345_6789u64 ^ z, 0xA_BCDE_F012) == 0x379A_AAB7_F0BF_B7A2)
+    check(core.wrapping_mul(0xFFFF_FFFF_FFFF_FFFFu64 ^ z, 0xFFFF_FFFF) == 0xFFFF_FFFF_0000_0001)
+    x := 0x8000_0000_0000_0001u64 ^ z
+    s := -9_223_372_036_854_775_807 + j
+    check((3u64 ^ z) << (1 + z) == 6)
+    check((3u64 ^ z) << (31 + z) == 0x1_8000_0000)
+    check(x >> (31 + z) == 0x1_0000_0000)
+    check(x >> (32 + z) == 0x8000_0000)
+    check((1u64 ^ z) << (33 + z) == 0x2_0000_0000)
+    check((1u64 ^ z) << (63 + z) == 0x8000_0000_0000_0000)
+    check(x >> (63 + z) == 1)
+    check(s >> (32 + j) == -2_147_483_648)
+    check(s >> (63 + j) == -1)
+
+    // memcpy/memset through large copies.
+    big: [64]u32 = [0; 64]
+    for k in 0..64 {
+        big[k] = k as u32 + z32
+    }
+    copy := big
+    check(copy[63] == 63 && copy[0] == 0)
+
+    // Configuration is validated before ownership: an unusable crystal is
+    // InvalidInput, a valid one is Busy because the board already took it.
+    match chip.take(chip.Config { crystal_hz: 7_000_000 }) {
+        ok(_) => {
+            check(false)
+        }
+        err(error) => {
+            check(error == hal.Error.InvalidInput)
+        }
+    }
+    match chip.take(chip.Config { crystal_hz: 12_000_000 }) {
+        ok(_) => {
+            check(false)
+        }
+        err(error) => {
+            check(error == hal.Error.Busy)
+        }
+    }
+    start := b.timer.now_us()
+    b.timer.delay_ms(10)
+    elapsed := b.timer.now_us() - start
+    check(elapsed >= 10_000 && elapsed < 10_100)
+    check(board.NAME.len == 19)
+
+    unsafe {
+        control: hal.Reg<u32> = hal.Reg.at(WATCHDOG)
+        control.write(0)
+        store(RECORD + 20, MORE_FAILURES)
+        record(0x600D_0000 | CHECKS, FAILURES)
+    }
+    report()
+}

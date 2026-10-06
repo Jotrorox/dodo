@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 pub mod image;
 mod rp2040;
+mod rp2350;
 
 #[derive(Debug)]
 pub struct Chip {
@@ -77,15 +78,24 @@ pub struct Board {
     pub package: &'static str,
 }
 
-pub static CHIPS: &[&Chip] = &[&rp2040::CHIP];
+pub static CHIPS: &[&Chip] = &[&rp2040::CHIP, &rp2350::CHIP];
 
-pub static BOARDS: &[Board] = &[Board {
-    name: "pico",
-    description: "Raspberry Pi Pico",
-    chip: &rp2040::CHIP,
-    flash_size: 2 * 1024 * 1024,
-    package: "std/embedded/board/pico",
-}];
+pub static BOARDS: &[Board] = &[
+    Board {
+        name: "pico",
+        description: "Raspberry Pi Pico",
+        chip: &rp2040::CHIP,
+        flash_size: 2 * 1024 * 1024,
+        package: "std/embedded/board/pico",
+    },
+    Board {
+        name: "pico2",
+        description: "Raspberry Pi Pico 2",
+        chip: &rp2350::CHIP,
+        flash_size: 4 * 1024 * 1024,
+        package: "std/embedded/board/pico2",
+    },
+];
 
 pub fn chip(name: &str) -> Option<&'static Chip> {
     CHIPS.iter().copied().find(|chip| chip.name == name)
@@ -270,7 +280,7 @@ mod tests {
         assert!(
             Platform::select(None, Some("rp2041"))
                 .unwrap_err()
-                .contains("available chips: rp2040")
+                .contains("available chips: rp2040, rp2350")
         );
     }
 
@@ -309,6 +319,33 @@ mod tests {
         assert_eq!(word(1, 5), 1);
         assert_eq!(&image[512 + 32..512 + 35], &tail);
         assert_eq!(word(1, 127), 0x0AB1_6F30);
+    }
+
+    #[test]
+    fn rp2350_images_need_an_image_def_and_use_the_arm_secure_family() {
+        let platform = Platform::select(Some("pico2"), None).unwrap().unwrap();
+        assert_eq!(platform.chip.name, "rp2350");
+        assert_eq!(platform.bootloader_drive_name(), "RP2350");
+        let mut block = [0u8; 0x124];
+        block[0x110..0x114].copy_from_slice(&0xFFFF_DED3u32.to_le_bytes());
+        let mut file = elf(&[(0x1000_0000, &block)]);
+        let image = platform.finish(&mut file).unwrap();
+        assert_eq!(image.len(), 2 * 512);
+        assert_eq!(
+            u32::from_le_bytes(image[28..32].try_into().unwrap()),
+            0xE48B_FF59
+        );
+
+        let mut file = elf(&[(0x1000_0000, &[0; 0x124])]);
+        assert!(
+            platform
+                .finish(&mut file)
+                .unwrap_err()
+                .contains("IMAGE_DEF")
+        );
+        let script = platform.linker_script();
+        assert!(script.contains("FLASH (rx) : ORIGIN = 0x10000000, LENGTH = 0x400000"));
+        assert!(script.contains("RAM (rwx) : ORIGIN = 0x20000000, LENGTH = 0x82000"));
     }
 
     #[test]
