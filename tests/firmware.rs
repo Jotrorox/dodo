@@ -1,6 +1,7 @@
 //! Firmware platforms: board and chip settings, `std/embedded/board` and `std/embedded/chip`
 //! resolution, the embedded chip runtimes, and (when ld.lld is installed)
-//! linking flashable images. Running on a real board is scripts/test_pico.py.
+//! linking flashable images. Running on a real board is scripts/test_pico.py
+//! (`--board pico` or `--board pico2`).
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -181,6 +182,18 @@ fn std_board_and_std_chip_follow_the_selected_platform() {
         "package main\nimport \"std/embedded/board/pico\"\nimport \"std/embedded/chip/rp2040\"\nfn blink(led: &mut rp2040.Pin) {\n led.toggle()\n}\nfn main() {\n b := pico.take()!\n blink(&mut b.led)\n}\n",
     );
     stdout(&dodo(&["check", explicit.to_str().unwrap()]));
+    let explicit = scratch.write(
+        "explicit2.dodo",
+        "package main\nimport \"std/embedded/board/pico2\"\nimport \"std/embedded/chip/rp2350\"\nfn blink(led: &mut rp2350.Pin) {\n led.toggle()\n}\nfn main() {\n b := pico2.take()!\n blink(&mut b.led)\n}\n",
+    );
+    stdout(&dodo(&["check", explicit.to_str().unwrap()]));
+    stdout(&dodo(&["check", blink, "--board", "pico2"]));
+    stdout(&dodo(&[
+        "check",
+        custom.to_str().unwrap(),
+        "--chip",
+        "rp2350",
+    ]));
 }
 
 #[test]
@@ -215,6 +228,20 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "__ashrdi3",
     ] {
         assert!(text.contains(name), "rp2040 runtime lacks {name}");
+    }
+    let rp2350 = fs::read(scratch.0.join("rp2350.o")).unwrap();
+    let text = String::from_utf8_lossy(&rp2350);
+    for name in [
+        ".picobin_block",
+        ".vector_table",
+        "dodo_rp2350_rom_call",
+        "SecureFault_Handler",
+        "TIMER0_IRQ_0",
+        "POWMAN_IRQ_TIMER",
+        "__aeabi_uldivmod",
+        "__udivdi3",
+    ] {
+        assert!(text.contains(name), "rp2350 runtime lacks {name}");
     }
 }
 
@@ -254,7 +281,7 @@ fn crc32_mpeg2(bytes: &[u8]) -> u32 {
 }
 
 /// The UF2 payload as one flash image starting at 0x10000000.
-fn flash_image(uf2: &[u8]) -> Vec<u8> {
+fn flash_image(uf2: &[u8], family: u32) -> Vec<u8> {
     assert_eq!(uf2.len() % 512, 0);
     let blocks = uf2.len() / 512;
     let mut image = vec![];
@@ -265,7 +292,7 @@ fn flash_image(uf2: &[u8]) -> Vec<u8> {
         assert_eq!(word(block, 16), 256);
         assert_eq!(word(block, 20) as usize, index);
         assert_eq!(word(block, 24) as usize, blocks);
-        assert_eq!(word(block, 28), 0xE48B_FF56, "RP2040 family");
+        assert_eq!(word(block, 28), family, "UF2 family");
         assert_eq!(word(block, 508), 0x0AB1_6F30);
         let offset = (word(block, 12) - 0x1000_0000) as usize;
         image.resize(image.len().max(offset + 256), 0);
@@ -275,7 +302,7 @@ fn flash_image(uf2: &[u8]) -> Vec<u8> {
 }
 
 fn check_rp2040_firmware(elf: &Path) {
-    let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap());
+    let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), 0xE48B_FF56);
     // The boot ROM checks stage 2's CRC before running it.
     assert_eq!(word(&image, 252), crc32_mpeg2(&image[..252]));
     // Vector table: stack at the top of SRAM, Thumb reset handler = ELF entry.
@@ -283,6 +310,24 @@ fn check_rp2040_firmware(elf: &Path) {
     let entry = word(&fs::read(elf).unwrap(), 0x18);
     assert_eq!(word(&image, 0x104), entry);
     assert_eq!(entry & 1, 1);
+}
+
+fn check_rp2350_firmware(elf: &Path) {
+    let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), 0xE48B_FF59);
+    // The boot ROM enters through the vector table at the start of flash:
+    // stack at the top of SRAM, Thumb reset handler = ELF entry.
+    assert_eq!(word(&image, 0), 0x2008_2000);
+    let entry = word(&fs::read(elf).unwrap(), 0x18);
+    assert_eq!(word(&image, 4), entry);
+    assert_eq!(entry & 1, 1);
+    // A secure Arm RP2350 IMAGE_DEF block in the first 4 KiB.
+    let block = (0..4096)
+        .step_by(4)
+        .find(|&at| word(&image, at) == 0xFFFF_DED3)
+        .expect("IMAGE_DEF block");
+    assert_eq!(word(&image, block + 4), 0x1021_0142);
+    assert_eq!(word(&image, block + 8), 0x0000_01FF);
+    assert_eq!(word(&image, block + 16), 0xAB12_3579);
 }
 
 fn build(args: &[&str]) {
@@ -324,6 +369,42 @@ fn rp2040_projects_link_to_flashable_firmware() {
         &elf,
     ]);
     check_rp2040_firmware(Path::new(&elf));
+}
+
+#[test]
+fn rp2350_projects_link_to_flashable_firmware() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("link-rp2350");
+    let blink = root().join("examples/blink");
+    let selftest = root().join("tests/hardware/pico2");
+    for (project, name, board) in [
+        (&blink, "blink", &["--board", "pico2"][..]),
+        (&selftest, "selftest", &[][..]),
+    ] {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("{name}-O{level}.elf"));
+            let mut args = vec!["build", project.to_str().unwrap(), "-O", level, "-o", &elf];
+            args.extend(board);
+            build(&args);
+            check_rp2350_firmware(Path::new(&elf));
+        }
+    }
+    let custom = scratch.write(
+        "custom.dodo",
+        "package main\nimport \"std/embedded/chip\"\nfn main() {\n p := chip.take(chip.Config { crystal_hz: 12_000_000 })!\n led := p.pins.output(15)!\n led.set_high()\n}\n",
+    );
+    let elf = scratch.path("custom.elf");
+    build(&[
+        "build",
+        custom.to_str().unwrap(),
+        "--chip",
+        "rp2350",
+        "-o",
+        &elf,
+    ]);
+    check_rp2350_firmware(Path::new(&elf));
 }
 
 #[test]

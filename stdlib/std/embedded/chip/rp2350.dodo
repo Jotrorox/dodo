@@ -1,0 +1,419 @@
+package rp2350
+
+import "std/embedded/hal"
+
+// Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
+// the microsecond timer, and the boot ROM. `take(config)` brings the chip
+// from its boot state (ring oscillator, peripherals held in reset) to a known
+// configuration and hands out the peripherals once. Pins implement the
+// std/embedded/hal output and input pin protocols and the timer implements
+// the delay protocol, so portable drivers use them unchanged.
+//
+// Applications normally use a board package instead, which supplies the
+// board's Config and wiring: `import "std/embedded/board"` with
+// `board = "pico2"`, or `import "std/embedded/chip"` for a custom RP2350
+// board with `chip = "rp2350"`.
+//
+// Clocks after take(): clk_ref = the crystal, clk_sys = 150 MHz from PLL_SYS,
+// clk_peri = clk_sys, and 1 MHz ticks for TIMER0 and the watchdog. The flash
+// keeps the boot ROM's execute-in-place setup. Section numbers below refer to
+// the RP2350 datasheet.
+//
+// GPIO 0 to 29 are supported, all the RP2350A (QFN-60) has; the RP2350B's
+// GPIO 30 to 47 are not yet.
+
+// clk_sys, the processor and peripheral clock, after take().
+pub const SYS_HZ: u32 = 150_000_000
+// User GPIOs 0 to 29.
+pub const PIN_COUNT: u32 = 30
+
+// Each register also has atomic XOR, set, and clear aliases (2.1.3).
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// Resets (7.5). Writing 1 holds a block in reset.
+const RESETS_BASE: usize = 0x4002_0000
+const RESET: usize = RESETS_BASE + 0x0
+const RESET_DONE: usize = RESETS_BASE + 0x8
+const RESET_IO_BANK0: u32 = 1 << 6
+const RESET_PADS_BANK0: u32 = 1 << 9
+const RESET_PLL_SYS: u32 = 1 << 14
+const RESET_TIMER0: u32 = 1 << 23
+
+// Crystal oscillator (8.2).
+const XOSC_BASE: usize = 0x4004_8000
+const XOSC_CTRL: usize = XOSC_BASE + 0x00
+const XOSC_STATUS: usize = XOSC_BASE + 0x04
+const XOSC_STARTUP: usize = XOSC_BASE + 0x0C
+const XOSC_RANGE_1_15MHZ: u32 = 0xAA0
+const XOSC_ENABLE: u32 = 0xFAB << 12
+const XOSC_STABLE: u32 = 1 << 31
+
+// PLL_SYS (8.6): crystal / REFDIV 1 * FBDIV = 1500 MHz VCO,
+// / POSTDIV1 5 / POSTDIV2 2 = 150 MHz.
+const VCO_HZ: u32 = 1_500_000_000
+const PLL_SYS_BASE: usize = 0x4005_0000
+const PLL_CS: usize = PLL_SYS_BASE + 0x0
+const PLL_PWR: usize = PLL_SYS_BASE + 0x4
+const PLL_FBDIV_INT: usize = PLL_SYS_BASE + 0x8
+const PLL_PRIM: usize = PLL_SYS_BASE + 0xC
+const PLL_LOCK: u32 = 1 << 31
+const PLL_POWER_DOWN: u32 = 1 << 0
+const PLL_POSTDIV_POWER_DOWN: u32 = 1 << 3
+const PLL_VCO_POWER_DOWN: u32 = 1 << 5
+const PLL_POSTDIV1: u32 = 0b111 << 16
+const PLL_POSTDIV2: u32 = 0b111 << 12
+
+// Clock generators (8.1).
+const CLOCKS_BASE: usize = 0x4001_0000
+const CLK_REF_CTRL: usize = CLOCKS_BASE + 0x30
+const CLK_REF_DIV: usize = CLOCKS_BASE + 0x34
+const CLK_REF_SELECTED: usize = CLOCKS_BASE + 0x38
+const CLK_SYS_CTRL: usize = CLOCKS_BASE + 0x3C
+const CLK_SYS_DIV: usize = CLOCKS_BASE + 0x40
+const CLK_SYS_SELECTED: usize = CLOCKS_BASE + 0x44
+const CLK_PERI_CTRL: usize = CLOCKS_BASE + 0x48
+const CLK_SYS_RESUS_CTRL: usize = CLOCKS_BASE + 0x84
+const CLK_REF_SRC: u32 = 0b11
+const CLK_REF_SRC_XOSC: u32 = 2
+const CLK_SYS_SRC_AUX: u32 = 1
+const CLK_SYS_AUXSRC: u32 = 0b111 << 5
+const CLK_ENABLE: u32 = 1 << 11
+// The integer part of both dividers is bits 16 and up; 0x1_0000 divides by
+// one.
+const DIVIDE_BY_ONE: u32 = 0x1_0000
+
+// Tick generators (8.5) divide clk_ref down to the 1 MHz ticks of the timers
+// and the watchdog. Each has CTRL, CYCLES, and COUNT registers.
+const TICKS_BASE: usize = 0x4010_8000
+const TICK_TIMER0: usize = TICKS_BASE + 0x18
+const TICK_WATCHDOG: usize = TICKS_BASE + 0x30
+const TICK_ENABLE: u32 = 1 << 0
+
+// Microsecond timer TIMER0 (12.8). The raw registers read without latching.
+const TIMER0_BASE: usize = 0x400B_0000
+const TIMER_RAW_HIGH: usize = TIMER0_BASE + 0x24
+const TIMER_RAW_LOW: usize = TIMER0_BASE + 0x28
+
+// User bank GPIO control (9.11.1) and pads (9.11.3).
+const IO_BANK0_BASE: usize = 0x4002_8000
+const PADS_BANK0_BASE: usize = 0x4003_8000
+const FUNCSEL: u32 = 0b11111
+const FUNCSEL_SIO: u32 = 5
+const PAD_INPUT_ENABLE: u32 = 1 << 6
+const PAD_OUTPUT_DISABLE: u32 = 1 << 7
+// Pads come out of reset isolated, latching their last state, until
+// software clears this bit.
+const PAD_ISOLATE: u32 = 1 << 8
+
+// Single-cycle I/O (3.1). The GPIO_HI registers for pins 32 and up sit
+// between these.
+const SIO_BASE: usize = 0xD000_0000
+const GPIO_IN: usize = SIO_BASE + 0x004
+const GPIO_OUT_SET: usize = SIO_BASE + 0x018
+const GPIO_OUT_CLR: usize = SIO_BASE + 0x020
+const GPIO_OUT_XOR: usize = SIO_BASE + 0x028
+const GPIO_OE_SET: usize = SIO_BASE + 0x038
+const GPIO_OE_CLR: usize = SIO_BASE + 0x040
+
+// Boot ROM reboot() (5.4.8.24): its lookup code and arguments.
+const ROM_REBOOT: u32 = 0x4252
+const REBOOT_TYPE_BOOTSEL: u32 = 0x2
+const REBOOT_NO_RETURN_ON_SUCCESS: u32 = 0x100
+const BOOTSEL_GPIO_PIN_SPECIFIED: u32 = 0x20
+// The ROM version is the top byte of the word at 0x10, after the 'M' 'u'
+// magic and the chip marker.
+const ROM_VERSION_WORD: usize = 0x10
+
+// Polls before a clock or reset is reported as stuck. The slowest wait,
+// crystal start-up, takes about 1 ms at the ring oscillator's boot clock.
+const ATTEMPTS: u32 = 1_000_000
+
+static mut TAKEN: bool = false
+
+// Provided by the compiler's RP2350 firmware runtime: call the boot ROM
+// function with lookup code `code` ('R' | 'B' << 8 for reboot), or return -1
+// if there is none.
+unsafe extern "C" fn dodo_rp2350_rom_call(code: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> i32
+
+// Restart into the boot ROM's USB bootloader, as if BOOTSEL were held at
+// power-up: the board reappears as the RP2350 drive and accepts new
+// firmware, for example from `dodo run`. Pin `activity_led`, if below
+// PIN_COUNT, lights while the drive is accessed, except on chip revision
+// A2, whose boot ROM mishandles it on the Arm cores (erratum in the Pico
+// SDK's rom_reset_usb_boot). Does not return.
+pub fn reboot_to_bootloader(activity_led: u32) {
+    flags := 0u32
+    pin := 0u32
+    rom_version := 0u32
+    // SAFETY: the ROM is always readable, and the word is never written.
+    unsafe {
+        version: hal.Reg<u32> = hal.Reg.at(ROM_VERSION_WORD)
+        rom_version = version.read() >> 24
+    }
+    if activity_led < PIN_COUNT && rom_version > 2 {
+        flags = BOOTSEL_GPIO_PIN_SPECIFIED
+        pin = activity_led
+    }
+    // SAFETY: on success the ROM resets the chip after 10 ms and never
+    // returns, so no peripheral owned by this program is used afterwards.
+    unsafe {
+        dodo_rp2350_rom_call(ROM_REBOOT, REBOOT_TYPE_BOOTSEL | REBOOT_NO_RETURN_ON_SUCCESS, 10, flags, pin)
+    }
+    for {}
+}
+
+// What the circuit board decides. Board packages pass theirs to `take`.
+pub struct Config {
+    // The crystal on XIN/XOUT, in hertz: 1 to 15 MHz, a whole number of
+    // megahertz (for the 1 MHz ticks) that divides 1.5 GHz (for the PLL).
+    // 12 MHz, as on the Raspberry Pi Pico 2, is the usual choice.
+    pub crystal_hz: u32
+}
+
+// The chip's peripherals, handed out once by `take`.
+pub struct Peripherals {
+    pub pins: Pins
+    pub timer: Timer
+}
+
+// Configure clocks, take GPIO and the timer out of reset, and return the
+// peripherals. A second call returns Error.Busy, so no two owners exist; an
+// unusable crystal frequency returns Error.InvalidInput, and a crystal or PLL
+// that does not start returns Error.Timeout.
+pub fn take(config: Config) -> Peripherals!hal.Error {
+    crystal := config.crystal_hz
+    if crystal < 1_000_000 || crystal > 15_000_000 || crystal % 1_000_000 != 0 || VCO_HZ % crystal != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked, so the flag is read and set atomically
+    // on this core. Core 1 stays parked in the boot ROM.
+    taken := unsafe {
+        TAKEN
+    }
+    unsafe {
+        TAKEN = true
+    }
+    core.drop(section)
+    if taken {
+        return err(hal.Error.Busy)
+    }
+    // SAFETY: TAKEN guarantees this runs once, so this code is the only
+    // user of the clock, reset, PLL, and tick registers.
+    unsafe {
+        start_clocks(crystal)?
+        reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER0)?
+    }
+    // SAFETY: the timer was just taken out of reset; Timer only reads its
+    // free-running counter registers.
+    timer := unsafe {
+        Timer { high: hal.Reg.at(TIMER_RAW_HIGH), low: hal.Reg.at(TIMER_RAW_LOW) }
+    }
+    return ok(Peripherals { pins: Pins { taken: 0 }, timer })
+}
+
+// SAFETY: the caller owns `address`, a 32-bit RP2350 register.
+unsafe fn reg(address: usize) -> hal.Reg<u32> {
+    unsafe {
+        return hal.Reg.at(address)
+    }
+}
+
+// Pulse the reset of `blocks` and wait until they are running again.
+// SAFETY: the caller owns the reset controller and `blocks`.
+unsafe fn reset_blocks(blocks: u32) -> void!hal.Error {
+    unsafe {
+        hold := reg(RESET + SET_ALIAS)
+        hold.write(blocks)
+        release := reg(RESET + CLEAR_ALIAS)
+        release.write(blocks)
+        done := reg(RESET_DONE)
+        return done.wait_set(blocks, ATTEMPTS)
+    }
+}
+
+// Start a tick generator: `cycles` of clk_ref per tick.
+// SAFETY: the caller owns the tick generator at `base`.
+unsafe fn start_tick(base: usize, cycles: u32) {
+    unsafe {
+        control := reg(base)
+        control.write(0)
+        count := reg(base + 4)
+        count.write(cycles)
+        control.write(TICK_ENABLE)
+    }
+}
+
+// SAFETY: the caller owns the clock, XOSC, PLL_SYS, and tick registers, and
+// nothing may depend on the current clock rates.
+unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
+    unsafe {
+        resus := reg(CLK_SYS_RESUS_CTRL)
+        resus.write(0)
+
+        // Crystal: ~1 ms start-up delay in units of 256 cycles.
+        xosc_ctrl := reg(XOSC_CTRL)
+        xosc_ctrl.write(XOSC_RANGE_1_15MHZ)
+        startup := reg(XOSC_STARTUP)
+        startup.write((crystal_hz / 1000 + 128) / 256)
+        xosc_ctrl.write(XOSC_RANGE_1_15MHZ | XOSC_ENABLE)
+        xosc_status := reg(XOSC_STATUS)
+        xosc_status.wait_set(XOSC_STABLE, ATTEMPTS)?
+
+        // Run clk_sys from clk_ref while the PLL is reconfigured.
+        sys_ctrl := reg(CLK_SYS_CTRL)
+        sys_ctrl.clear_bits(CLK_SYS_SRC_AUX)
+        sys_selected := reg(CLK_SYS_SELECTED)
+        sys_selected.wait_set(1, ATTEMPTS)?
+
+        reset_blocks(RESET_PLL_SYS)?
+        cs := reg(PLL_CS)
+        cs.write(1)
+        feedback := reg(PLL_FBDIV_INT)
+        feedback.write(VCO_HZ / crystal_hz)
+        power_on := reg(PLL_PWR + CLEAR_ALIAS)
+        power_on.write(PLL_POWER_DOWN | PLL_VCO_POWER_DOWN)
+        cs.wait_set(PLL_LOCK, ATTEMPTS)?
+        prim := reg(PLL_PRIM)
+        prim.write(hal.encode(PLL_POSTDIV1, 5) | hal.encode(PLL_POSTDIV2, 2))
+        power_on.write(PLL_POSTDIV_POWER_DOWN)
+
+        // clk_ref from the crystal.
+        ref_ctrl := reg(CLK_REF_CTRL)
+        ref_ctrl.set(CLK_REF_SRC, CLK_REF_SRC_XOSC)
+        ref_selected := reg(CLK_REF_SELECTED)
+        ref_selected.wait_set(1 << CLK_REF_SRC_XOSC, ATTEMPTS)?
+        ref_div := reg(CLK_REF_DIV)
+        ref_div.write(DIVIDE_BY_ONE)
+
+        // clk_sys from PLL_SYS (aux source 0) through the glitchless mux.
+        sys_ctrl.clear_bits(CLK_SYS_AUXSRC)
+        sys_div := reg(CLK_SYS_DIV)
+        sys_div.write(DIVIDE_BY_ONE)
+        sys_ctrl.set_bits(CLK_SYS_SRC_AUX)
+        sys_selected.wait_set(1 << 1, ATTEMPTS)?
+
+        // clk_peri from clk_sys (aux source 0), for UART and SPI.
+        peri := reg(CLK_PERI_CTRL)
+        peri.write(0)
+        peri.write(CLK_ENABLE)
+
+        // 1 MHz ticks for TIMER0 and the watchdog, derived from clk_ref.
+        start_tick(TICK_TIMER0, crystal_hz / 1_000_000)
+        start_tick(TICK_WATCHDOG, crystal_hz / 1_000_000)
+        return ok()
+    }
+}
+
+// The 30 user GPIOs. Each pin can be taken once.
+pub struct Pins {
+    taken: u32
+
+    // Claim pin `number` as a push-pull output, initially low.
+    pub fn output(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.claim(number)?
+        pin.set_low()
+        // SAFETY: the SET alias changes only this pin's output-enable bit.
+        unsafe {
+            enable := reg(GPIO_OE_SET)
+            enable.write(pin.mask)
+        }
+        return ok(pin)
+    }
+
+    // Claim pin `number` as an input.
+    pub fn input(&mut self, number: u32) -> Pin!hal.Error {
+        pin := self.claim(number)?
+        // SAFETY: the CLR alias changes only this pin's output-enable bit.
+        unsafe {
+            disable := reg(GPIO_OE_CLR)
+            disable.write(pin.mask)
+        }
+        return ok(pin)
+    }
+
+    fn claim(&mut self, number: u32) -> Pin!hal.Error {
+        if number >= PIN_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        mask := 1u32 << number
+        if (self.taken & mask) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.taken |= mask
+        index := number as usize
+        // SAFETY: `taken` makes this pin's control and pad registers
+        // exclusive to the returned Pin. SIO SET/CLR/XOR are write-only
+        // per-bit aliases and IN is read-only, so pins never conflict there.
+        unsafe {
+            pad := reg(PADS_BANK0_BASE + 4 + 4 * index)
+            pad.modify(PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
+            control := reg(IO_BANK0_BASE + 8 * index + 4)
+            control.set(FUNCSEL, FUNCSEL_SIO)
+            // Release the pad only once SIO drives it (9.7).
+            pad.clear_bits(PAD_ISOLATE)
+            return ok(Pin {
+                set: reg(GPIO_OUT_SET),
+                clear: reg(GPIO_OUT_CLR),
+                toggle: reg(GPIO_OUT_XOR),
+                input: reg(GPIO_IN),
+                mask,
+            })
+        }
+    }
+}
+
+// One GPIO driven by the single-cycle I/O block. Implements the
+// std/embedded/hal output and input pin protocols.
+pub struct Pin {
+    set: hal.Reg<u32>
+    clear: hal.Reg<u32>
+    toggle: hal.Reg<u32>
+    input: hal.Reg<u32>
+    mask: u32
+
+    pub fn set_high(&mut self) {
+        self.set.write(self.mask)
+    }
+
+    pub fn set_low(&mut self) {
+        self.clear.write(self.mask)
+    }
+
+    pub fn toggle(&mut self) {
+        self.toggle.write(self.mask)
+    }
+
+    pub fn is_high(&self) -> bool {
+        return self.input.any(self.mask)
+    }
+}
+
+// The free-running 64-bit microsecond counter of TIMER0. Implements the
+// std/embedded/hal delay protocol.
+pub struct Timer {
+    high: hal.Reg<u32>
+    low: hal.Reg<u32>
+
+    // Microseconds since take().
+    pub fn now_us(&self) -> u64 {
+        for {
+            high := self.high.read()
+            low := self.low.read()
+            if self.high.read() == high {
+                return ((high as u64) << 32) | low as u64
+            }
+        }
+    }
+
+    pub fn delay_us(&mut self, microseconds: u32) {
+        start := self.low.read()
+        for core.wrapping_sub(self.low.read(), start) < microseconds {}
+    }
+
+    pub fn delay_ms(&mut self, milliseconds: u32) {
+        end := self.now_us() + (milliseconds as u64) * 1000
+        for self.now_us() < end {}
+    }
+}

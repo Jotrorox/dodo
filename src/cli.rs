@@ -253,7 +253,7 @@ const OPTIONS: &[OptionSpec] = &[
         Some("NAME"),
         B | R | C,
         "Platform",
-        "Firmware board, e.g. pico: target, CPU, startup code, linker, flashable image"
+        "Firmware board, e.g. pico or pico2: target, CPU, startup code, linker, flashable image"
     ),
     option!(
         "chip",
@@ -261,7 +261,7 @@ const OPTIONS: &[OptionSpec] = &[
         Some("NAME"),
         B | R | C,
         "Platform",
-        "Firmware chip for a custom board, e.g. rp2040; implied by --board"
+        "Firmware chip for a custom board, e.g. rp2040 or rp2350; implied by --board"
     ),
     option!(
         "cpu",
