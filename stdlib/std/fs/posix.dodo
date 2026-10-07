@@ -1,4 +1,4 @@
-package linux
+package posix
 
 import "core/ptr"
 import "core/mem"
@@ -6,33 +6,28 @@ import "std/platform/native"
 import "std/platform/error"
 import "std/fs/types"
 
-// Verified x86_64 Linux GNU ABI; target selection rejects other ABIs.
+// Dodo-owned metadata record. The C adapter copies it out of the target's
+// `struct stat`, so its layout never depends on the architecture's libc ABI.
 @repr(C)
 struct Stat {
     device: u64
     inode: u64
     links: u64
+    size: i64
+    modified_seconds: i64
+    modified_nanos: i64
     mode: u32
     uid: u32
     gid: u32
     padding: u32
-    rdevice: u64
-    size: i64
-    block_size: i64
-    blocks: i64
-    access_seconds: i64
-    access_nanos: i64
-    modified_seconds: i64
-    modified_nanos: i64
-    changed_seconds: i64
-    changed_nanos: i64
-    reserved: [3]i64
 }
-// The tiny C adapter supplies the correct variadic libc ABI.
-unsafe extern "C" fn dodo_fs_open(path: *const u8, flags: i32, mode: u32) -> i32
-unsafe extern "C" fn stat(path: *const u8, output: *mut Stat) -> i32
-unsafe extern "C" fn lstat(path: *const u8, output: *mut Stat) -> i32
-unsafe extern "C" fn fstat(fd: i32, output: *mut Stat) -> i32
+// The tiny C adapter supplies the variadic open ABI and maps the portable
+// flag bits in open_file to the target's O_* values, which differ by
+// architecture (O_NOFOLLOW is 0o400000 on x86-64 but 0o100000 on AArch64).
+unsafe extern "C" fn dodo_fs_open(path: *const u8, flags: u32, mode: u32) -> i32
+unsafe extern "C" fn dodo_fs_stat(path: *const u8, follow: i32, output: *mut Stat) -> i32
+unsafe extern "C" fn dodo_fs_fstat(fd: i32, output: *mut Stat) -> i32
+unsafe extern "C" fn dodo_fs_entry_name(entry: *mut u8) -> *const u8
 unsafe extern "C" fn mkdir(path: *const u8, mode: u32) -> i32
 unsafe extern "C" fn unlink(path: *const u8) -> i32
 unsafe extern "C" fn rmdir(path: *const u8) -> i32
@@ -40,36 +35,41 @@ unsafe extern "C" fn rename(old: *const u8, new: *const u8) -> i32
 unsafe extern "C" fn chmod(path: *const u8, mode: u32) -> i32
 unsafe extern "C" fn symlink(target: *const u8, path: *const u8) -> i32
 unsafe extern "C" fn readlink(path: *const u8, output: *mut u8, capacity: usize) -> isize
-unsafe extern "C" fn realpath(path: *const u8, output: *mut u8) -> *mut u8
-unsafe extern "C" fn opendir(path: *const u8) -> *mut u8
-unsafe extern "C" fn readdir(directory: *mut u8) -> *mut u8
-unsafe extern "C" fn closedir(directory: *mut u8) -> i32
-unsafe extern "C" fn __errno_location() -> *mut i32
+// Darwin x86-64 binds these to $INODE64/$DARWIN_EXTSN symbol variants, which
+// only its C headers select; the adapter keeps them behind the C boundary.
+unsafe extern "C" fn dodo_fs_realpath(path: *const u8, output: *mut u8, capacity: usize) -> *mut u8
+unsafe extern "C" fn dodo_fs_open_directory(path: *const u8) -> *mut u8
+unsafe extern "C" fn dodo_fs_read_directory(directory: *mut u8) -> *mut u8
+unsafe extern "C" fn dodo_fs_close_directory(directory: *mut u8) -> i32
+unsafe extern "C" fn dodo_fs_rename_exclusive(old: *const u8, new: *const u8) -> i32
 
 pub fn capabilities() -> types.Capabilities {
     return types.Capabilities { symbolic_links: true, unix_permissions: true, windows_sharing: false, directory_sync: true }
 }
 pub fn open_file(path: &native.NativeString, read: bool, write: bool, append: bool, truncate: bool, create: bool, exclusive: bool, follow: bool, mode: u32, sharing: u32) -> native.Handle!error.Error {
-    flags := 524288i32 // O_CLOEXEC: creation and inheritance restriction atomic.
-    if read && (write || append) {
-        flags |= 2
-    } else if write || append {
+    // Close-on-exec is always requested, so creation and inheritance
+    // restriction stay atomic.
+    flags := 0u32
+    if read {
         flags |= 1
     }
+    if write {
+        flags |= 2
+    }
     if append {
-        flags |= 1024
+        flags |= 4
     }
     if truncate {
-        flags |= 512
+        flags |= 8
     }
     if create {
-        flags |= 64
+        flags |= 16
     }
     if exclusive {
-        flags |= 128
+        flags |= 32
     }
     if !follow {
-        flags |= 131072
+        flags |= 64
     }
     unsafe {
         fd := dodo_fs_open(path.as_ptr(), flags, mode)
@@ -100,15 +100,13 @@ fn convert(value: &Stat) -> types.Metadata {
 pub fn metadata(path: &native.NativeString, follow: bool) -> types.Metadata!error.Error {
     data := mem.uninit::<Stat>()
     unsafe {
-        // Initialize reserved members before the OS fills its public fields.
+        // Initialize padding before the adapter fills the public fields.
         ptr.write_bytes(mem.uninit_as_mut_ptr(&mut data), 0u8, 1)
-        code := 0i32
+        follow_links := 0i32
         if follow {
-            code = stat(path.as_ptr(), mem.uninit_as_mut_ptr(&mut data))
-        } else {
-            code = lstat(path.as_ptr(), mem.uninit_as_mut_ptr(&mut data))
+            follow_links = 1
         }
-        if code != 0 {
+        if dodo_fs_stat(path.as_ptr(), follow_links, mem.uninit_as_mut_ptr(&mut data)) != 0 {
             return err(native.last_error())
         }
         initialized := mem.assume_init(data)
@@ -118,9 +116,9 @@ pub fn metadata(path: &native.NativeString, follow: bool) -> types.Metadata!erro
 pub fn handle_metadata(handle: &native.Handle) -> types.Metadata!error.Error {
     data := mem.uninit::<Stat>()
     unsafe {
-        // Initialize reserved members before the OS fills its public fields.
+        // Initialize padding before the adapter fills the public fields.
         ptr.write_bytes(mem.uninit_as_mut_ptr(&mut data), 0u8, 1)
-        if fstat(handle.raw() as i32, mem.uninit_as_mut_ptr(&mut data)) != 0 {
+        if dodo_fs_fstat(handle.raw() as i32, mem.uninit_as_mut_ptr(&mut data)) != 0 {
             return err(native.last_error())
         }
         initialized := mem.assume_init(data)
@@ -152,8 +150,9 @@ pub fn remove_directory(path: &native.NativeString) -> void!error.Error {
     return ok()
 }
 pub fn rename_path(old: &native.NativeString, new: &native.NativeString, replace: bool) -> void!error.Error {
-    // renameat2's atomic NOREPLACE is intentionally a separate supported
-    // Linux syscall adapter; no check-then-rename race or copy/delete fallback.
+    // Atomic no-replace rename (renameat2 RENAME_NOREPLACE on Linux,
+    // renamex_np RENAME_EXCL on Darwin); no check-then-rename race or
+    // copy/delete fallback.
     if !replace {
         return rename_exclusive(old, new)
     }
@@ -164,10 +163,9 @@ pub fn rename_path(old: &native.NativeString, new: &native.NativeString, replace
     }
     return ok()
 }
-unsafe extern "C" fn renameat2(old_directory: i32, old: *const u8, new_directory: i32, new: *const u8, flags: u32) -> i32
 fn rename_exclusive(old: &native.NativeString, new: &native.NativeString) -> void!error.Error {
     unsafe {
-        if renameat2(-100, old.as_ptr(), -100, new.as_ptr(), 1) != 0 {
+        if dodo_fs_rename_exclusive(old.as_ptr(), new.as_ptr()) != 0 {
             return err(native.last_error())
         }
     }
@@ -221,12 +219,13 @@ pub fn read_symlink(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]
     }
 }
 pub fn canonicalize(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> native.NativeString!error.Error from(bytes, wide) {
-    // Linux realpath's nonallocating API requires PATH_MAX writable bytes.
+    // realpath's nonallocating API requires PATH_MAX writable bytes (4096 on
+    // Linux, 1024 on Darwin); the adapter requires the larger bound everywhere.
     if bytes.len < 4096 {
         return err(error.failure(error.Kind.BufferTooSmall))
     }
     unsafe {
-        if ptr.is_null(realpath(path.as_ptr(), ptr.as_mut_ptr(bytes))) {
+        if ptr.is_null(dodo_fs_realpath(path.as_ptr(), ptr.as_mut_ptr(bytes), bytes.len)) {
             return err(native.last_error())
         }
     }
@@ -246,7 +245,7 @@ pub struct Directory {
     ended: bool
     pub fn open(path: &native.NativeString, bytes: &mut[u8], wide: &mut[u16]) -> Directory!error.Error {
         unsafe {
-            handle := opendir(path.as_ptr())
+            handle := dodo_fs_open_directory(path.as_ptr())
             if ptr.is_null(handle) {
                 return err(native.last_error())
             }
@@ -264,7 +263,7 @@ pub struct Directory {
         }
         self.ended = true
         unsafe {
-            if closedir(handle) != 0 {
+            if dodo_fs_close_directory(handle) != 0 {
                 return err(native.last_error())
             }
         }
@@ -285,8 +284,8 @@ pub struct Directory {
         unsafe {
             for true {
                 if ptr.is_null(self.pending) {
-                    ptr.write(__errno_location(), 0)
-                    self.pending = readdir(self.handle)
+                    // Returns null with errno zero at the end of the stream.
+                    self.pending = dodo_fs_read_directory(self.handle)
                     if ptr.is_null(self.pending) {
                         reason := native.last_error()
                         if reason.code != 0 {
@@ -296,23 +295,24 @@ pub struct Directory {
                         return ok(none)
                     }
                 }
-                // struct dirent x86_64: ino64, off64, reclen16, type8, name[].
+                // d_name's offset in struct dirent is libc- and ABI-specific.
+                name_ptr := dodo_fs_entry_name(self.pending)
                 length := 0usize
-                for length < 256 && ptr.read(ptr.offset(self.pending, (19 + length) as isize)) != 0 {
+                for length < 256 && ptr.read(ptr.offset(name_ptr, length as isize)) != 0 {
                     length += 1
                 }
                 if length == 256 {
                     return err(error.failure(error.Kind.Other))
                 }
-                first := ptr.read(ptr.offset(self.pending, 19))
-                second := ptr.read(ptr.offset(self.pending, 20))
+                first := ptr.read(name_ptr)
+                second := ptr.read(ptr.offset(name_ptr, 1))
                 if (length == 1 && first == 46) || (length == 2 && first == 46 && second == 46) {
                     self.pending = 0usize as *mut u8
                 } else {
                     if bytes.len <= length {
                         return err(error.failure(error.Kind.BufferTooSmall))
                     }
-                    ptr.copy_nonoverlapping(ptr.offset(self.pending, 19), ptr.as_mut_ptr(bytes), length + 1)
+                    ptr.copy_nonoverlapping(name_ptr, ptr.as_mut_ptr(bytes), length + 1)
                     self.pending = 0usize as *mut u8
                     name := native.NativeString.new(&bytes[..length + 1])?
                     return ok(some(name))

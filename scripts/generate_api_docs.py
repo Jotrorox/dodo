@@ -338,7 +338,7 @@ def render_module(module: str, sources: list[Path], order: int,
              "Signatures and adjacent source comments are reproduced below; "
              "the linked guide explains usage, storage, failures, and platform support.", "",
              "```dodo", f'import "{module}"', "```", ""]
-    if module.endswith(("/linux", "/windows", "/native")) or module == "std/float_decimal":
+    if module.endswith(("/posix", "/windows", "/native")) or module == "std/float_decimal":
         lines += ["> This is a provider or implementation package. Start with the linked "
                   "guide's application API; native declarations depend on the selected target.", ""]
     imports: dict[tuple[str, str], list[Path]] = defaultdict(list)

@@ -1,4 +1,4 @@
-package fs_linux_checks
+package fs_unix_checks
 
 import "std/fs"
 import "std/fs/unix"
@@ -12,7 +12,7 @@ import "core/ptr"
 unsafe extern "C" fn pipe(descriptors: *mut i32) -> i32
 
 fn count_descriptors() -> usize!error.Error {
-    source := native.NativeString.new(b"/proc/self/fd\x00")?
+    source := native.NativeString.new(b"/dev/fd\x00")?
     b := [0u8; 512]
     w := [0u16; 1]
     dir := fs.Directory.open(&source, &mut b, &mut w)?
@@ -68,8 +68,11 @@ fn verify() -> i32!error.Error {
     if!bytes.equal(value.units(), path.units()) {
         return ok(5)
     }
+    // Native text policy is independent of what the file system can store
+    // (macOS only stores UTF-8 names), so decode an in-memory Unix name.
+    invalid := native.NativeString.new(b"invalid-\xFF name\x00")?
     output := [0u8; 128]
-    match native.to_utf8(&value, &mut output, false) {
+    match native.to_utf8(&invalid, &mut output, false) {
         ok(_) => {
             return ok(6)
         }
@@ -79,8 +82,8 @@ fn verify() -> i32!error.Error {
             }
         }
     }
-    n := native.to_utf8(&value, &mut output, true)?
-    if!bytes.equal(&output[..n], b"nonutf-\xEF\xBF\xBD file") {
+    n := native.to_utf8(&invalid, &mut output, true)?
+    if!bytes.equal(&output[..n], b"invalid-\xEF\xBF\xBD name") {
         return ok(8)
     }
     core.drop(value)

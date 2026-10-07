@@ -7,7 +7,7 @@ order: 150
 
 Time values and clocks answer different questions. `std/time` represents
 durations, UTC timestamps, calendar dates, and clock-specific instants.
-`std/time/hosted` observes the operating system's clocks on Linux GNU x86-64 or
+`std/time/hosted` observes the operating system's clocks on Linux GNU, macOS, or
 Windows x64. Reading the clock is an explicit operation that can fail.
 
 | Question | Type/provider | Example use |
@@ -66,7 +66,10 @@ portable timer contract. Those imports are independent of the hosted provider.
 `hosted.MonotonicClock.new().now()` returns an `Instant` with the reserved native
 clock identity `hosted.MONOTONIC_ID`. All native instances share an origin;
 custom and fake clocks must use other IDs. Do not persist or serialize monotonic
-observations as portable deadlines. `now_native` retains platform errors;
+observations as portable deadlines. The native clock is `CLOCK_MONOTONIC` on
+Linux and macOS and `QueryPerformanceCounter` on Windows; Linux's pauses while
+the system is suspended, while macOS's keeps counting. `now_native` retains
+platform errors;
 `now` maps them to `TimeError.ClockFailure`. `now_ms` supports network clock
 contracts and returns the maximum u64 on failure, causing deadline checks to
 fail closed. `WallClock` returns UTC timestamps, with no local-time conversion.

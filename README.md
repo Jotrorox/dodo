@@ -32,7 +32,7 @@ It prints `Hello, world!`. `println` returns a Result because output can fail;
 postfix `!` takes success or panics on failure. The
 [first-program tutorial](https://jotrorox.github.io/dodo/first-program/) explains
 every line, shows how to change the program, and builds a persistent executable
-on Linux or Windows.
+on Linux, macOS, or Windows.
 
 The standard library is embedded in the compiler. Projects use ordinary folders
 and imports; no manifest, lockfile, or package manager is needed.
@@ -85,8 +85,8 @@ package. It is generated from the library at each documentation build.
 | Hardware and firmware | [Registers, interrupts, and portable drivers](https://jotrorox.github.io/dodo/hardware/); [firmware for boards such as the Raspberry Pi Pico](https://jotrorox.github.io/dodo/hardware/#boards) |
 
 Portable packages work with explicit storage and no required OS, global
-allocator, or scheduler. Hosted adapters currently support Linux GNU x86-64 and
-Windows x64. Each guide documents its actual target and dependency requirements.
+allocator, or scheduler. Hosted adapters currently support Linux GNU (x86-64 and
+AArch64), macOS, and Windows x64. Each guide documents its actual target and dependency requirements.
 
 ## Everyday commands
 

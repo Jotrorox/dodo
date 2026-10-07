@@ -23,10 +23,12 @@ pub fn milliseconds(duration: &time.Duration) -> u64!error.Error {
 
 // Storage is caller-owned and cannot move while an initialized owner exists.
 // The C boundary checks actual target size and alignment at initialization.
+// 384 bytes: the largest target state is Darwin's (pthread mutex and two
+// condition variables, about 272 bytes).
 pub struct Storage {
-    words: [32]u64
+    words: [48]u64
     pub fn new() -> Storage {
-        return Storage { words: [0u64; 32] }
+        return Storage { words: [0u64; 48] }
     }
 }
 

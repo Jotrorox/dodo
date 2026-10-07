@@ -85,7 +85,7 @@ fn environment_snapshot_borrows_and_results_are_checked() {
     fs::remove_dir_all(scratch).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn unix_environment_and_arguments_preserve_non_unicode_bytes() {
     use std::os::unix::ffi::OsStringExt;

@@ -78,7 +78,7 @@ fn native_threads_join_detach_contention_and_destruction() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn startup_and_allocation_failures_destroy_tasks_and_release_mappings() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = Workspace::new();
@@ -90,15 +90,20 @@ fn startup_and_allocation_failures_destroy_tasks_and_release_mappings() {
                 .arg(root.join("tests/os/thread_failures.dodo"))
                 .args(["-O", level, "--link-arg"])
                 .arg(root.join("tests/os/thread_failures.c"))
-                .args([
-                    "--link-arg",
-                    "-Wl,--wrap=pthread_create",
-                    "--link-arg",
-                    "-Wl,--wrap=mmap",
-                    "--link-arg",
-                    "-Wl,--wrap=munmap",
-                    "-o",
-                ])
+                // macOS replaces these by definition instead; see the fixture.
+                .args(if cfg!(target_os = "macos") {
+                    &[][..]
+                } else {
+                    &[
+                        "--link-arg",
+                        "-Wl,--wrap=pthread_create",
+                        "--link-arg",
+                        "-Wl,--wrap=mmap",
+                        "--link-arg",
+                        "-Wl,--wrap=munmap",
+                    ][..]
+                })
+                .arg("-o")
                 .arg(&executable)
                 .output()
                 .unwrap(),

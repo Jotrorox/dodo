@@ -11,7 +11,7 @@ Use `File` when you need to stream, seek, append, or control creation and
 durability. Files contain bytes; interpreting those bytes as UTF-8 is a separate
 step through [std/text](text.md).
 
-These hosted APIs support Linux GNU x86-64 and Windows x64. Import
+These hosted APIs support Linux GNU, macOS, and Windows x64. Import
 `std/platform` for reusable path-conversion storage. The portable
 `std/fs/path` module only manipulates path spellings and requires no filesystem.
 
@@ -130,11 +130,15 @@ prints it. Run it in a disposable directory to keep its output isolated.
 ## API and contracts
 
 `std/fs` provides synchronous, recoverable filesystem operations. It imports
-`std/io` and independently selects `std/fs/linux` or `std/fs/windows` through
+`std/io` and independently selects `std/fs/posix` or `std/fs/windows` through
 `std/fs/native`. It does not import processes, environment, threads, a scheduler,
-or an allocator. The supported native ABIs are x86_64 Linux GNU and Win64.
-Other targets, including Linux musl and non-x86_64 Linux, receive a build
-diagnostic rather than silently using an incompatible `stat` layout.
+or an allocator. The supported native ABIs are x86-64 and AArch64 Linux GNU,
+macOS, and Win64. The POSIX adapter's C boundary copies `struct stat`,
+directory entries, open flags and errno values from the target's own headers,
+so no operating system's or architecture's layout is hard-coded in Dodo. Other
+targets, including Linux musl, receive a build diagnostic. macOS file systems
+(APFS, HFS+) only store UTF-8 names: creating a name with other bytes fails
+with `InvalidInput` and native code 92 (`EILSEQ`).
 `core`, `alloc`, portable I/O, text, time, and `std/fs/path` remain freestanding.
 
 ## Native paths and storage
@@ -376,7 +380,7 @@ should explicitly map or match those errors; `?` does not invent a common
 application error type.
 
 `std/platform/error.Error` combines a portable `Kind` with an unmodified native
-`code`: errno on Linux, a Win32 error number on Windows, and zero for a library
+`code`: errno on Linux and macOS, a Win32 error number on Windows, and zero for a library
 validation error. `capabilities()` reports symbolic-link API availability,
 Unix permissions, Windows sharing modes, and directory sync independently.
 Availability does not promise that a particular filesystem or account permits

@@ -17,6 +17,7 @@ with [installation](installation.md); a source build is optional.
 | Build a local `dodo` CLI with code generation | The prerequisites and ordinary Cargo build below | Yes, LLVM 23 development files. |
 | Produce a Windows release archive | [Windows release archive](#windows-release-archive) | Yes, plus static support libraries. |
 | Produce a Linux binary with bundled LLVM support libraries | [Self-contained Linux release](#self-contained-linux-release) | Yes, on the build host. |
+| Produce a macOS binary that needs only system libraries | [Self-contained macOS release](#self-contained-macos-release) | Yes, Homebrew's `llvm@23`. |
 | Minimize executable size | [Size-focused build](#size-focused-compiler-build) | Yes; size depends on the LLVM libraries too. |
 
 Run repository commands from its root unless a section says otherwise. The Rust
@@ -70,6 +71,24 @@ cargo build --locked --release
 cargo install --locked --path .
 ```
 
+On macOS, install the Command Line Tools (`xcode-select --install`) and LLVM 23
+from Homebrew:
+
+```sh
+brew install llvm@23 zstd
+export LLVM_SYS_231_PREFIX="$(brew --prefix llvm@23)"
+export LIBRARY_PATH="$(brew --prefix)/lib"
+cargo build --locked --release
+cargo install --locked --path .
+```
+
+Homebrew's LLVM enables Z3 and links zstd from Homebrew, so this compiler needs
+those Homebrew libraries at runtime; the
+[self-contained macOS recipe](#self-contained-macos-release) removes both.
+To test the TLS backend, also run `brew install openssl@3` and set
+`CPATH="$(brew --prefix openssl@3)/include"` and add
+`$(brew --prefix openssl@3)/lib` to `LIBRARY_PATH`.
+
 The Ubuntu packages are suitable for ordinary Cargo builds. CI uses the
 [official prebuilt LLVM archive](#fully-static-linux-compiler) for releases,
 so the compiler does not depend on Z3. If LLVM is installed elsewhere, set
@@ -112,7 +131,7 @@ For the self-contained Linux recipe below, run
 
 ## Self-contained Linux release
 
-On an x86-64 Ubuntu 24.04 build machine, install the
+On an x86-64 or AArch64 Ubuntu 24.04 build machine, install the
 [release toolchain below](#fully-static-linux-compiler), then run:
 
 ```sh
@@ -124,13 +143,13 @@ install -Dm755 target/x86_64-unknown-linux-gnu/release/dodo "$HOME/.local/bin/do
 The resulting binary contains LLVM, the C++ standard library, zlib, zstd, and
 any needed libffi code. Its only permitted shared dependencies are the standard
 Linux C runtime (`libc.so.6`), math library (`libm.so.6`), unwind library
-(`libgcc_s.so.1`), and ELF loader. The tested runtime baseline is x86-64 Linux
-with glibc 2.39 or newer (Ubuntu 24.04). LLVM and its support packages are only
+(`libgcc_s.so.1`), and ELF loader. The tested runtime baselines are x86-64 and
+AArch64 Linux with glibc 2.39 or newer (Ubuntu 24.04). LLVM and its support packages are only
 needed on the build machine. Keeping every LLVM target increases the binary
 size compared with the old shared-LLVM build.
 
 The script requires Python 3 and `readelf` (binutils) for verification and honors
-`LLVM_SYS_231_PREFIX`, `CC`, and `CARGO_TARGET_DIR`. Other native x86-64 GNU/Linux
+`LLVM_SYS_231_PREFIX`, `CC`, and `CARGO_TARGET_DIR`. Other native x86-64 or AArch64 GNU/Linux
 build hosts need the same development libraries, including `libz.a`,
 `libzstd.a`, `libstdc++.a`, and `libffi.a`. Their runtime glibc requirement depends
 on the build host. Other platforms can use the ordinary Cargo build above;
@@ -210,13 +229,14 @@ Install static archives for the C and math runtimes, the C++ standard library,
 zlib, zstd, libffi, and any additional libraries listed by
 `llvm-config --link-static --system-libs`.
 
-CI uses the official LLVM 23.1.1 Linux x86-64 archive, which has Z3 disabled.
+CI uses the official LLVM 23.1.1 Linux x86-64 and ARM64 archives, which have
+Z3 disabled.
 On Ubuntu 24.04, install its prerequisites and the same toolchain:
 
 ```sh
 sudo apt-get install build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev python3 curl xz-utils
 export LLVM_SYS_231_PREFIX="$PWD/target/llvm-linux"
-python3 scripts/install-linux-llvm.py
+python3 scripts/install-llvm.py
 export PATH="$LLVM_SYS_231_PREFIX/bin:$PATH"
 ```
 
@@ -238,12 +258,12 @@ On Fedora, additionally install `glibc-static`, `libstdc++-static`,
 libxml2. If your distribution does not ship `libffi.a`, build a static libffi.
 Archives in custom locations can be made available through `LIBRARY_PATH`.
 
-On a native x86-64 GNU/Linux build host, use:
+On a native x86-64 or AArch64 GNU/Linux build host, use:
 
 ```sh
 # Keep LLVM_SYS_231_PREFIX set to the selected LLVM installation.
 bash scripts/build-release.sh release-small-static
-# Binary: target/x86_64-unknown-linux-gnu/release-small-static/dodo
+# Binary: target/<x86_64|aarch64>-unknown-linux-gnu/release-small-static/dodo
 ```
 
 `release-small-static` inherits all `release-small` size settings. The script
@@ -257,8 +277,34 @@ and linker options; the size still depends on the prebuilt LLVM archives and
 platform libraries. It includes glibc, so it can be larger than `release-small`
 despite having no shared-library dependencies. Checking code and emitting
 compiler artifacts need no external tools; linking and running Dodo programs
-still needs a C toolchain. Only native x86-64 GNU/Linux builds are supported by
-this recipe.
+still needs a C toolchain. Only native x86-64 and AArch64 GNU/Linux builds are
+supported by this recipe.
+
+## Self-contained macOS release
+
+On an Apple silicon Mac with the Command Line Tools and Homebrew, run:
+
+```sh
+brew install llvm@23 zstd
+bash scripts/build-release-macos.sh
+install -m 755 target/aarch64-apple-darwin/release/dodo "$HOME/.local/bin/dodo"
+```
+
+The script uses `$(brew --prefix llvm@23)` unless `LLVM_SYS_231_PREFIX` is set.
+It links LLVM and zstd statically and passes `-dead_strip_dylibs`, so LLVM's
+unused Z3 solver leaves no library reference behind. It then checks the binary
+with `scripts/check-linkage.py --release`, which accepts only libraries under
+`/usr/lib` and `/System/Library`, such as `libSystem`, `libc++`, and `libz`.
+`MACOSX_DEPLOYMENT_TARGET` defaults to 15.0, matching the oldest macOS that
+Homebrew's archives on the build machine support; set it explicitly for a
+different floor. The script runs on the bash 3.2 that macOS ships.
+
+The official LLVM release archive for macOS cannot be used here: its static
+libraries contain ThinLTO bitcode rather than machine code, and Rust's own LLVM
+cannot link bitcode produced by LLVM 23.
+
+`python3 scripts/package-release.py --target aarch64-apple-darwin` packages the
+result with its license notices, as CI does.
 
 ## Development
 
@@ -305,7 +351,8 @@ python3 scripts/render_spec.py
 python3 scripts/render_spec.py --check
 python3 scripts/test_check_linkage.py
 python3 scripts/test_build_release.py
-bash scripts/build-release.sh # x86-64 GNU/Linux release dependency check
+bash scripts/build-release.sh # x86-64/AArch64 GNU/Linux release dependency check
+bash scripts/build-release-macos.sh # macOS release dependency check
 ```
 
 `cargo test --locked --test project_cli` checks manifest discovery, argument and

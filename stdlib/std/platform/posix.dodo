@@ -1,4 +1,4 @@
-package linux
+package posix
 
 import "core/ptr"
 import "core/mem"
@@ -80,7 +80,11 @@ fn io_error(reason: error.Error) -> io.Error {
     return io.Error { kind: kind, transferred: 0, code: reason.code }
 }
 
-unsafe extern "C" fn __errno_location() -> *mut i32
+// errno's location and numbering are C-library ABI (`__errno_location` on
+// glibc, `__error` on Darwin; EAGAIN is 11 on Linux and 35 on macOS), so the
+// C boundary reads errno and classifies it by name into stable tags.
+unsafe extern "C" fn dodo_platform_errno() -> i32
+unsafe extern "C" fn dodo_platform_error_tag(code: i32) -> u32
 unsafe extern "C" fn close(fd: i32) -> i32
 unsafe extern "C" fn read(fd: i32, data: *mut u8, count: usize) -> isize
 unsafe extern "C" fn dodo_platform_write(fd: i32, data: *const u8, count: usize) -> isize
@@ -88,61 +92,66 @@ unsafe extern "C" fn lseek(fd: i32, offset: i64, origin: i32) -> i64
 unsafe extern "C" fn fsync(fd: i32) -> i32
 unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32
 
+// Tags are defined by dodo_platform_error_tag in std/platform/runtime.c.
 pub fn from_code(code: i32) -> error.Error {
     kind := error.Kind.Other
-    if code == 2 {
+    tag := 0u32
+    unsafe {
+        tag = dodo_platform_error_tag(code)
+    }
+    if tag == 1 {
         kind = error.Kind.NotFound
     }
-    if code == 17 {
+    if tag == 2 {
         kind = error.Kind.AlreadyExists
     }
-    if code == 1 || code == 13 {
+    if tag == 3 {
         kind = error.Kind.PermissionDenied
     }
-    if code == 4 {
+    if tag == 4 {
         kind = error.Kind.Interrupted
     }
-    if code == 11 {
+    if tag == 5 {
         kind = error.Kind.WouldBlock
     }
-    if code == 18 {
+    if tag == 6 {
         kind = error.Kind.CrossDevice
     }
-    if code == 20 {
+    if tag == 7 {
         kind = error.Kind.NotDirectory
     }
-    if code == 21 {
+    if tag == 8 {
         kind = error.Kind.IsDirectory
     }
-    if code == 22 {
+    if tag == 9 {
         kind = error.Kind.InvalidInput
     }
-    if code == 38 || code == 95 {
+    if tag == 10 {
         kind = error.Kind.Unsupported
     }
-    if code == 39 {
+    if tag == 11 {
         kind = error.Kind.DirectoryNotEmpty
     }
-    if code == 110 {
+    if tag == 12 {
         kind = error.Kind.TimedOut
     }
-    if code == 125 {
+    if tag == 13 {
         kind = error.Kind.Cancelled
     }
-    if code == 34 || code == 36 {
+    if tag == 14 {
         kind = error.Kind.BufferTooSmall
     }
-    if code == 32 {
+    if tag == 15 {
         kind = error.Kind.BrokenPipe
     }
-    if code == 9 {
+    if tag == 16 {
         kind = error.Kind.Closed
     }
     return error.Error { kind: kind, code: code }
 }
 pub fn last_error() -> error.Error {
     unsafe {
-        return from_code(ptr.read(__errno_location()))
+        return from_code(dodo_platform_errno())
     }
 }
 

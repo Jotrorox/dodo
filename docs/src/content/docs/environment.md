@@ -8,7 +8,7 @@ order: 153
 `std/env` reads command-line arguments, environment variables, and the current
 directory. Start with `get` for one variable or `Arguments.capture` for arguments.
 Both copy into caller-owned storage, making capacity and text conversion explicit.
-These APIs run on Linux GNU x86-64 and Windows x64.
+These APIs run on Linux GNU, macOS, and Windows x64.
 
 An environment value is optional: missing and empty are different states.
 It can also fail to fit or decode. Accordingly, `env.get` returns a Result
@@ -154,7 +154,7 @@ prints a present value or reports absence. An empty value prints an empty line.
 ## API and contracts
 
 `std/env` observes process arguments, environment entries, and the current
-directory on x86-64 Linux/glibc and Windows x64. Its independently selected
+directory on x86-64 and AArch64 Linux/glibc, macOS, and Windows x64. Its independently selected
 `std/env/native` adapter does not import filesystem, processes, threads, or
 synchronization. Portable foundation packages never read the environment
 implicitly.
@@ -244,4 +244,4 @@ remain independently cross-compilable for freestanding targets.
 
 ## Complete API reference
 
-For every public type, field, constant, and function signature, see [std/env](api/std/env.md), [std/env/linux](api/std/env/linux.md), [std/env/windows](api/std/env/windows.md).
+For every public type, field, constant, and function signature, see [std/env](api/std/env.md), [std/env/posix](api/std/env/posix.md), [std/env/windows](api/std/env/windows.md).

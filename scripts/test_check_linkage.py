@@ -1,4 +1,4 @@
-"""Exercise the linkage check against ELF files produced by the system linker."""
+"""Exercise the linkage check against ELF and Mach-O files produced by the system linker."""
 
 import os
 from pathlib import Path
@@ -12,7 +12,8 @@ import unittest
 CHECKER = Path(__file__).with_name("check-linkage.py")
 
 
-@unittest.skipUnless(shutil.which("cc") and shutil.which("readelf"), "requires cc and readelf")
+@unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("cc") and shutil.which("readelf"),
+                     "requires Linux, cc and readelf")
 class LinkageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -110,6 +111,71 @@ class LinkageTests(unittest.TestCase):
         result = self.check("static", env={**os.environ, "PATH": ""})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("readelf", result.stderr)
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("cc") and shutil.which("otool"),
+                     "requires macOS, cc and otool")
+class MachOLinkageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="dodo-linkage-")
+        cls.directory = Path(cls.temporary.name)
+        cls.compile("dynamic", "int main(void) { return 0; }")
+        for library in ("LLVM-fixture", "support-fixture"):
+            cls.compile(f"lib{library}.dylib", "void fixture(void) {}", "-dynamiclib")
+        cls.compile("llvm", "void fixture(void); int main(void) { fixture(); return 0; }",
+                    "-L" + str(cls.directory), "-lLLVM-fixture")
+        cls.compile("support", "void fixture(void); int main(void) { fixture(); return 0; }",
+                    "-L" + str(cls.directory), "-lsupport-fixture")
+        cls.compile("object", "int value;", "-c")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    @classmethod
+    def compile(cls, name, source, *flags):
+        subprocess.run(
+            ["cc", "-x", "c", "-", *flags, "-o", str(cls.directory / name)],
+            input=source, text=True, capture_output=True, check=True,
+        )
+
+    def check(self, name, *flags):
+        return subprocess.run(
+            [sys.executable, str(CHECKER), str(self.directory / name), *flags],
+            capture_output=True, text=True,
+        )
+
+    def test_system_libraries_pass_default_and_release(self):
+        for flags in [(), ("--release",)]:
+            with self.subTest(flags=flags):
+                result = self.check("dynamic", *flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("/usr/lib/libSystem", result.stdout)
+
+    def test_default_rejects_shared_llvm(self):
+        result = self.check("llvm")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("libLLVM-fixture.dylib", result.stderr)
+
+    def test_default_allows_and_release_rejects_other_libraries(self):
+        self.assertEqual(self.check("support").returncode, 0)
+        result = self.check("support", "--release")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("libsupport-fixture.dylib", result.stderr)
+
+    def test_static_mode_is_unsupported(self):
+        result = self.check("dynamic", "--static")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fully static", result.stderr)
+
+    def test_objects_and_truncated_files_fail(self):
+        (self.directory / "truncated").write_bytes((self.directory / "dynamic").read_bytes()[:8])
+        for name in ["object", "truncated"]:
+            with self.subTest(name=name):
+                result = self.check(name)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("linkage check failed", result.stderr)
 
 
 if __name__ == "__main__":

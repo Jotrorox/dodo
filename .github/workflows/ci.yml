@@ -70,9 +70,21 @@ jobs:
         run: cargo test --locked --no-default-features --all-targets
 
   compiler:
-    name: Rust and LLVM 23 / Ubuntu 24.04
-    runs-on: ubuntu-24.04
+    name: Rust and LLVM 23 / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 x86-64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-x86_64-compilers
+          - name: Ubuntu 24.04 AArch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: linux-aarch64-compilers
     env:
       CARGO_TERM_COLOR: always
       DODO_REQUIRE_DEBUGGER_TESTS: "1"
@@ -104,10 +116,10 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.LLVM_SYS_231_PREFIX }}
-          key: llvm-linux-x64-${{ hashFiles('scripts/install-linux-llvm.py') }}
+          key: llvm-linux-${{ runner.arch }}-${{ hashFiles('scripts/install-llvm.py') }}
       - name: Download and verify the official LLVM 23 Linux archive
         if: steps.linux-llvm-cache.outputs.cache-hit != 'true'
-        run: python3 scripts/install-linux-llvm.py
+        run: python3 scripts/install-llvm.py
       - name: Configure and verify LLVM
         shell: bash
         run: |
@@ -168,7 +180,7 @@ jobs:
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: ubuntu-24.04-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/ci.yml', 'scripts/build-release.sh', 'scripts/link-static.sh', 'scripts/install-linux-llvm.py') }}
+          key: ${{ matrix.os }}-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/ci.yml', 'scripts/build-release.sh', 'scripts/link-static.sh', 'scripts/install-llvm.py') }}
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS CPATH LIBRARY_PATH
           cache-bin: false
           cache-on-failure: true
@@ -178,11 +190,15 @@ jobs:
         run: python3 scripts/test_check_linkage.py
       - name: Test static release prerequisites
         run: python3 scripts/test_build_release.py
+      # Windows cross-checks use x86-64 MinGW and Wine; run them once.
       - name: Test Windows fixture startup ABI
+        if: runner.arch == 'X64'
         run: python3 scripts/test_windows_startup.py
       - name: Test native Windows fixture runner diagnostics
+        if: runner.arch == 'X64'
         run: python3 scripts/test_windows_native_harness.py
       - name: Test Windows LLVM library path handling
+        if: runner.arch == 'X64'
         run: |
           rustc --edition=2024 --test scripts/windows-llvm-config.rs -o "$RUNNER_TEMP/test-windows-llvm-config"
           "$RUNNER_TEMP/test-windows-llvm-config"
@@ -202,25 +218,29 @@ jobs:
           target/debug/dodo test
           target/debug/dodo test -O 3
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: runner.arch == 'X64'
         with:
           node-version: '24'
           cache: npm
           cache-dependency-path: editor-support/dodo-vscode/package-lock.json
       - name: Test VS Code against the built compiler
+        if: runner.arch == 'X64'
         working-directory: editor-support/dodo-vscode
         run: |
           npm ci
           xvfb-run -a npm run test:integration
       - name: Install Windows standard-library test tools
+        if: runner.arch == 'X64'
         run: sudo apt-get install --no-install-recommends -y wine64 mingw-w64-x86-64-dev
       - name: Execute Windows core and alloc programs in Wine
+        if: runner.arch == 'X64'
         run: python3 scripts/test_stdlib_windows.py
       - name: Verify default builds embed LLVM
         run: python3 scripts/check-linkage.py target/debug/dodo
       - name: Build self-contained release compiler
         run: bash scripts/build-release.sh
       - name: Verify release only needs standard Linux runtime libraries
-        run: python3 scripts/check-linkage.py target/x86_64-unknown-linux-gnu/release/dodo --release
+        run: python3 scripts/check-linkage.py target/${{ matrix.target }}/release/dodo --release
       - name: Build and verify fully static size-focused compiler
         run: bash scripts/build-release.sh release-small-static
       - name: Compile and run without an LLVM installation
@@ -229,7 +249,7 @@ jobs:
           set -euo pipefail
           for profile in release release-small-static; do
             docker run --rm \
-              --mount type=bind,source="$PWD/target/x86_64-unknown-linux-gnu/$profile/dodo",target=/usr/local/bin/dodo,readonly \
+              --mount type=bind,source="$PWD/target/${{ matrix.target }}/$profile/dodo",target=/usr/local/bin/dodo,readonly \
               --mount type=bind,source="$PWD/examples",target=/examples,readonly \
               ubuntu:24.04 bash -euo pipefail -c '
                 if command -v llvm-config || command -v cc; then
@@ -256,13 +276,93 @@ jobs:
               '
           done
       - name: Package the verified Linux release
-        run: python3 scripts/package-release.py
+        run: python3 scripts/package-release.py --target ${{ matrix.target }}
       - name: Upload verified Linux compilers
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: linux-x86_64-compilers
+          name: ${{ matrix.artifact }}
           path: build/release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-compiler:
+    name: Rust and LLVM 23 / macOS 15 Apple silicon
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: Install native build prerequisites
+        id: llvm
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Homebrew's llvm@23 ships native static libraries; the official
+          # macOS LLVM archive ships ThinLTO bitcode that Rust cannot link.
+          # zstd is an LLVM support library outside the macOS SDK; releases
+          # link its static archive. OpenSSL 3.5+ backs the TLS fixtures.
+          brew install llvm@23 zstd openssl@3
+          llvm_prefix=$(brew --prefix llvm@23)
+          version=$("$llvm_prefix/bin/llvm-config" --version)
+          test "${version%%.*}" = 23
+          openssl_prefix=$(brew --prefix openssl@3)
+          "$openssl_prefix/bin/openssl" version
+          echo "LLVM_SYS_231_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
+          echo "CPATH=$openssl_prefix/include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$openssl_prefix/lib:$(brew --prefix)/lib" >> "$GITHUB_ENV"
+          echo "$openssl_prefix/bin" >> "$GITHUB_PATH"
+          echo "fingerprint=$version" >> "$GITHUB_OUTPUT"
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-15-llvm-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/ci.yml', 'scripts/build-release-macos.sh') }}
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS CPATH LIBRARY_PATH
+          cache-bin: false
+          cache-on-failure: true
+      - name: Test Mach-O dependency checks
+        run: python3 scripts/test_check_linkage.py
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test compiler, native output, and runtime checks
+        run: cargo test --locked --all-targets
+      - name: Test routing benchmark correctness at O0 and O3
+        run: python3 scripts/test_bench_stdlib.py
+      - name: Run native Dodo tests and executable documentation
+        run: |
+          target/debug/dodo test
+          target/debug/dodo test -O 3
+      - name: Build self-contained release compiler
+        run: bash scripts/build-release-macos.sh
+      - name: Package the verified macOS release
+        run: python3 scripts/package-release.py --target aarch64-apple-darwin
+      - name: Test the extracted macOS release
+        shell: bash
+        run: |
+          set -euo pipefail
+          extracted="$RUNNER_TEMP/dodo-release"
+          mkdir -p "$extracted"
+          tar -xzf build/release-assets/dodo-*-aarch64-apple-darwin.tar.gz -C "$extracted"
+          dodo=$(echo "$extracted"/dodo-*/dodo)
+          python3 scripts/check-linkage.py "$dodo" --release
+          # Run without the build environment's LLVM or Homebrew libraries.
+          env -i PATH=/usr/bin:/bin HOME="$HOME" "$dodo" --version
+          env -i PATH=/usr/bin:/bin HOME="$HOME" "$dodo" build examples/hello.dodo -O 2 -o "$RUNNER_TEMP/hello"
+          test "$("$RUNNER_TEMP/hello")" = "Hello, world!"
+          test "$(env -i PATH=/usr/bin:/bin HOME="$HOME" "$dodo" run examples/hello.dodo -O 2)" = "Hello, world!"
+      - name: Upload the verified macOS compiler
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-arm64-compiler
+          path: build/release-assets/*.tar.gz
           if-no-files-found: error
           retention-days: 7
 

@@ -12,7 +12,7 @@ adds a certificate/key identity to that server.
 
 The hosted layer runs resolution, connection, readiness, framing, body transfer,
 and cleanup loops for you. You still choose storage limits, timeouts, trust,
-and how to handle results. It supports Linux GNU x86-64 and Windows x64
+and how to handle results. It supports Linux GNU, macOS, and Windows x64
 MSVC/GNU; portable protocol APIs are documented in [HTTP](http.md) and
 application behavior in [Web applications](web.md).
 
@@ -39,7 +39,7 @@ This GET streams to the existing console writer. Non-2xx statuses are valid
 HTTP responses; the application decides whether they are successful. Save it as
 `get_example.dodo`. `hosted.WORKSPACE_BYTES` is fixed caller-owned protocol
 storage; `console` chooses the body sink and `hosting` names the error type.
-The hosted APIs support Linux GNU x86-64 and Windows x64 MSVC/GNU.
+The hosted APIs support Linux GNU, macOS, and Windows x64 MSVC/GNU.
 
 ```dodo
 package get_example
@@ -465,9 +465,9 @@ exercise the lower layers. `--skip-tls` is an explicit reduced test selection.
 credential bounds and diagnostics, custom storage, and cancellation at O0/O3;
 it also runs through `cargo test --test http_hosted_library`.
 
-Supported hosted adapters are x86-64 Linux GNU and Windows x64 MSVC/GNU.
-Linux musl/x32, AArch64 Linux, macOS and freestanding ABIs are unsupported by
-these hosted adapters. Native Windows TLS uses
+Supported hosted adapters are x86-64 and AArch64 Linux GNU, macOS, and Windows
+x64 MSVC/GNU. Linux musl/x32 and freestanding ABIs are unsupported by these
+hosted adapters. Native Windows TLS uses
 OpenSSL; Wine checks cannot prove installed trust paths or native entropy and
 provider behavior. These conveniences are HTTP/1.1 only. Platform DNS and
 application callbacks have the blocking limitations above. The existing native

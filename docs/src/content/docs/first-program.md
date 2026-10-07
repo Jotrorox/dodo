@@ -11,7 +11,7 @@ executable you can run yourself. You need a text editor, a terminal, and
 borrowing or systems programming is required.
 
 Commands go in your terminal. Dodo code goes in a `.dodo` file. The examples use
-Linux shell commands unless a PowerShell version is shown; `dodo` commands work
+Linux and macOS shell commands unless a PowerShell version is shown; `dodo` commands work
 in either shell.
 
 ## 1. Create a project folder
@@ -85,7 +85,7 @@ The exclamation mark *inside* the greeting is just printed text.
 
 A newline ends each statement here; semicolons are optional. Reaching the end of
 this `main` returns success, exit status `0`. That status is not printed. To see
-it immediately after a run, use `echo $?` on Linux or `$LASTEXITCODE` in PowerShell.
+it immediately after a run, use `echo $?` on Linux or macOS, or `$LASTEXITCODE` in PowerShell.
 
 ## 4. Change the program
 
@@ -143,7 +143,7 @@ overflow, and failures reported by library calls still matter when a program run
 ## 6. Keep an executable
 
 `run` removes its temporary executable afterward. Use `compile` when you want a
-file to keep. On Linux:
+file to keep. On Linux or macOS:
 
 ```sh
 dodo compile

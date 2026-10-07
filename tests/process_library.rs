@@ -1,11 +1,14 @@
 //! Native process ownership, bounded concurrent pipe draining and arguments.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "support/timeout.rs"]
+mod timeout;
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Output;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn success(output: Output, context: &str) {
     assert!(
         output.status.success(),
@@ -15,7 +18,7 @@ fn success(output: Output, context: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn process_native_fixtures_at_o0_and_o3() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -57,13 +60,12 @@ fn process_native_fixtures_at_o0_and_o3() {
             "compile process fixture",
         );
         success(
-            Command::new("timeout")
-                .arg("25")
-                .arg(&executable)
-                .current_dir(&scratch)
-                .env("DODO_PARENT_ONLY", "must not leak")
-                .output()
-                .unwrap(),
+            timeout::output_with_timeout(
+                Command::new(&executable)
+                    .current_dir(&scratch)
+                    .env("DODO_PARENT_ONLY", "must not leak"),
+                std::time::Duration::from_secs(25),
+            ),
             "execute process fixture",
         );
     }

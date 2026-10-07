@@ -1,6 +1,9 @@
 /* Dodo process boundary: no shell, caller-backed strings and output storage.
  * Only primitive/pointer values cross the Dodo/C ABI. */
-#ifndef _GNU_SOURCE
+#if defined(__APPLE__)
+/* posix_spawn's Darwin extensions are hidden by strict POSIX mode. */
+#define _DARWIN_C_SOURCE
+#elif !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
 #include <stdint.h>
@@ -14,7 +17,7 @@ typedef struct {
     intptr_t input, output, error;
     int32_t done, kind, code;
 } dodo_child;
-_Static_assert(sizeof(void *) == 8 && sizeof(dodo_child) == 48, "Dodo process runtime requires x64 ABI");
+_Static_assert(sizeof(void *) == 8 && sizeof(dodo_child) == 48, "Dodo process runtime requires an LP64 ABI");
 _Static_assert(offsetof(dodo_child, done) == 32 && offsetof(dodo_child, code) == 40, "Dodo child ABI offsets");
 /* Negative codes are portable runtime errors; positive codes are native. */
 #define DODO_INVALID (-1)
@@ -200,6 +203,31 @@ static uint64_t now_ms(void) {
     return (uint64_t)value.tv_sec * 1000 + (uint64_t)value.tv_nsec / 1000000;
 }
 static void pause_ms(void) { struct timespec delay = {0, 1000000}; nanosleep(&delay, NULL); }
+/* Darwin has no pipe2. The window before FD_CLOEXEC cannot leak into Dodo
+ * children: Darwin spawns use POSIX_SPAWN_CLOEXEC_DEFAULT below. */
+static int cloexec_pipe(int pipefd[2]) {
+#if defined(__APPLE__)
+    if (pipe(pipefd)) return -1;
+    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) || fcntl(pipefd[1], F_SETFD, FD_CLOEXEC)) {
+        int saved = errno; close(pipefd[0]); close(pipefd[1]); errno = saved; return -1;
+    }
+    return 0;
+#else
+    return pipe2(pipefd, O_CLOEXEC);
+#endif
+}
+/* Consume a SIGPIPE that the calling thread's failed write generated while
+ * the signal was blocked. Darwin lacks sigtimedwait, but the signal is
+ * already pending there, so sigwait returns without blocking. */
+static void consume_sigpipe(const sigset_t *set) {
+#if defined(__APPLE__)
+    sigset_t pending; int signal_number;
+    if (sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE) == 1) (void)sigwait(set, &signal_number);
+#else
+    struct timespec zero = {0, 0};
+    while (sigtimedwait(set, NULL, &zero) < 0 && errno == EINTR) {}
+#endif
+}
 int32_t dodo_process_spawn(const void *exe, const void *args_raw, size_t arg_units,
     const void *env_raw, size_t env_units, int32_t inherit_env, const void *cwd,
     int32_t input, int32_t output, int32_t error, int32_t search_path, dodo_child *result) {
@@ -227,12 +255,17 @@ int32_t dodo_process_spawn(const void *exe, const void *args_raw, size_t arg_uni
     int modes[3] = {input, output, error};
     intptr_t parents[3] = {-1, -1, -1}, children[3] = {-1, -1, -1};
     for (int i = 0; !code && i < 3; ++i) {
+#if defined(__APPLE__)
+        /* POSIX_SPAWN_CLOEXEC_DEFAULT closes inherited streams unless named. */
+        if (modes[i] == 0) { code = posix_spawn_file_actions_addinherit_np(&actions, i); continue; }
+#else
         if (modes[i] == 0) continue;
+#endif
         if (modes[i] == 2) {
             code = posix_spawn_file_actions_addopen(&actions, i, "/dev/null", i ? O_WRONLY : O_RDONLY, 0);
         } else {
             int pipefd[2];
-            if (pipe2(pipefd, O_CLOEXEC)) { code = errno; break; }
+            if (cloexec_pipe(pipefd)) { code = errno; break; }
             /* Move descriptors away from standard-stream numbers. */
             for (int j = 0; j < 2; ++j) if (pipefd[j] < 3) {
                 int moved = fcntl(pipefd[j], F_DUPFD_CLOEXEC, 3);
@@ -245,14 +278,35 @@ int32_t dodo_process_spawn(const void *exe, const void *args_raw, size_t arg_uni
             code = posix_spawn_file_actions_adddup2(&actions, (int)children[i], i);
         }
     }
+#if defined(__APPLE__)
+    /* The _np form runs on every supported macOS; the POSIX 2024 name that
+     * replaces it exists only from macOS 26. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
     if (!code && cwd) code = posix_spawn_file_actions_addchdir_np(&actions, cwd);
-    /* Linux/glibc closefrom action closes unrelated parent descriptors too. */
+#if defined(__APPLE__)
+#pragma clang diagnostic pop
+#endif
+    /* Close unrelated parent descriptors in the child too: the glibc closefrom
+     * action on Linux, Darwin's close-on-exec-by-default spawn attribute. */
+    posix_spawnattr_t *attributes_used = NULL;
+#if defined(__APPLE__)
+    posix_spawnattr_t attributes;
+    if (!code) code = posix_spawnattr_init(&attributes);
+    if (!code) {
+        attributes_used = &attributes;
+        code = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
+    }
+#else
     if (!code) code = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+#endif
     pid_t pid = 0;
     if (!code) {
-        code = search_path ? posix_spawnp(&pid, exe, &actions, NULL, argv, inherit_env ? environ : envp)
-                           : posix_spawn(&pid, exe, &actions, NULL, argv, inherit_env ? environ : envp);
+        code = search_path ? posix_spawnp(&pid, exe, &actions, attributes_used, argv, inherit_env ? environ : envp)
+                           : posix_spawn(&pid, exe, &actions, attributes_used, argv, inherit_env ? environ : envp);
     }
+    if (attributes_used) posix_spawnattr_destroy(attributes_used);
     posix_spawn_file_actions_destroy(&actions);
     for (int i = 0; i < 3; ++i) close_stream(children + i);
     if (code) { for (int i = 0; i < 3; ++i) close_stream(parents + i); return code; }
@@ -373,10 +427,7 @@ int32_t dodo_process_pipe_write(intptr_t handle, const unsigned char *data, size
     sigpending(&pending); int was_pending = sigismember(&pending, SIGPIPE);
     ssize_t actual = write((int)handle, data, count);
     int saved = actual < 0 ? errno : 0;
-    if (saved == EPIPE && !was_pending) {
-        struct timespec zero = {0, 0};
-        while (sigtimedwait(&set, NULL, &zero) < 0 && errno == EINTR) {}
-    }
+    if (saved == EPIPE && !was_pending) consume_sigpipe(&set);
     pthread_sigmask(SIG_SETMASK, &old, NULL);
     if (actual >= 0) *written = (size_t)actual;
     return saved;

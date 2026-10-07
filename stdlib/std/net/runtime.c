@@ -1,9 +1,12 @@
 /* Dodo BSD-2-Clause socket ABI. Synchronous nonblocking syscalls never retain
  * caller pointers. Native address layouts are compiled against target headers. */
-#ifndef _WIN32
+#if defined(__APPLE__)
+/* SO_NOSIGPIPE is a Darwin extension hidden by strict POSIX mode. */
+#define _DARWIN_C_SOURCE
+#elif !defined(_WIN32)
 #define _GNU_SOURCE
-#endif
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -40,6 +43,18 @@ typedef socklen_t dodo_socklen;
 static int initialize(void) { return 0; }
 static int last_error(void) { return errno; }
 static int socket_close(dodo_socket s) { return close(s); }
+#if defined(__APPLE__)
+/* Darwin has no SOCK_NONBLOCK/SOCK_CLOEXEC/accept4 or MSG_NOSIGNAL. Apply the
+ * same properties after creation; SO_NOSIGPIPE turns writes to a closed peer
+ * into EPIPE. Dodo's process spawning closes undeclared descriptors in the
+ * child, so the window before FD_CLOEXEC cannot leak into Dodo children. */
+static int configure_socket(dodo_socket s) {
+    int one = 1, flags = fcntl(s, F_GETFL);
+    if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) != 0) return -1;
+    if (fcntl(s, F_SETFD, FD_CLOEXEC) != 0) return -1;
+    return setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+}
+#endif
 #endif
 /* Stable category tags independent of errno/WSA numeric values. */
 uint32_t dodo_net_error_kind(int32_t error) {
@@ -108,7 +123,14 @@ intptr_t dodo_net_open(const uint8_t *wire, uint32_t mode, uint32_t backlog, int
     #ifdef _WIN32
     dodo_socket socket_value = WSASocketW(address.ss_family, mode == 2 ? SOCK_DGRAM : SOCK_STREAM, 0, NULL, 0, WSA_FLAG_NO_HANDLE_INHERIT);
 #else
+#if defined(__APPLE__)
+    dodo_socket socket_value = socket(address.ss_family, mode == 2 ? SOCK_DGRAM : SOCK_STREAM, 0);
+    if (socket_value >= 0 && configure_socket(socket_value) != 0) {
+        *error = last_error(); socket_close(socket_value); return -1;
+    }
+#else
     dodo_socket socket_value = socket(address.ss_family, (mode == 2 ? SOCK_DGRAM : SOCK_STREAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+#endif
 #endif
     if ((intptr_t)socket_value == -1) { *error = last_error(); return -1; }
 #ifdef _WIN32
@@ -139,7 +161,14 @@ intptr_t dodo_net_accept(intptr_t raw, int32_t *error) {
 #ifdef _WIN32
     dodo_socket accepted = accept((dodo_socket)raw, NULL, NULL);
 #else
+#if defined(__APPLE__)
+    dodo_socket accepted = accept((dodo_socket)raw, NULL, NULL);
+    if (accepted >= 0 && configure_socket(accepted) != 0) {
+        *error = last_error(); socket_close(accepted); return -1;
+    }
+#else
     dodo_socket accepted = accept4((dodo_socket)raw, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#endif
 #endif
     *error = 0;
     if ((intptr_t)accepted == -1) { *error = last_error(); return -1; }
@@ -219,7 +248,11 @@ intptr_t dodo_net_write(intptr_t raw, const uint8_t *buffer, size_t length, int3
 #ifdef _WIN32
     int flags = 0;
 #else
+#if defined(__APPLE__)
+    int flags = 0; /* SO_NOSIGPIPE is set on every Darwin socket. */
+#else
     int flags = MSG_NOSIGNAL;
+#endif
 #endif
     intptr_t result = send((dodo_socket)raw, (const char *)buffer, (int)count, flags);
     *error = result < 0 ? last_error() : 0; return result;
@@ -251,10 +284,24 @@ intptr_t dodo_net_recvfrom(intptr_t raw, uint8_t *buffer, size_t capacity, uint8
     } else *original = bytes;
     encode_address((struct sockaddr *)&address, wire); return bytes;
 #else
+#if defined(__APPLE__)
+    /* Darwin reports truncation only through msg_flags, not the datagram's
+     * original length; report it as unknown, like Winsock. */
+    struct iovec data = { buffer, count };
+    struct msghdr message; memset(&message, 0, sizeof(message));
+    message.msg_name = &address; message.msg_namelen = size;
+    message.msg_iov = &data; message.msg_iovlen = 1;
+    intptr_t result = recvmsg((int)raw, &message, 0);
+    if (result < 0) { *error = last_error(); return -1; }
+    if (message.msg_flags & MSG_TRUNC) { *truncated = 1; *original = SIZE_MAX; }
+    else *original = (size_t)result;
+    encode_address((struct sockaddr *)&address, wire); return result;
+#else
     intptr_t result = recvfrom((int)raw, buffer, count, MSG_TRUNC, (struct sockaddr *)&address, &size);
     if (result < 0) { *error = last_error(); return -1; }
     *original = (size_t)result; *truncated = (size_t)result > count;
     encode_address((struct sockaddr *)&address, wire); return (size_t)result > count ? (intptr_t)count : result;
+#endif
 #endif
 }
 /* Resolver is explicitly synchronous; libc/Winsock owns its internal allocation

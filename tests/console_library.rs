@@ -125,7 +125,8 @@ fn console_is_embedded_and_only_selects_the_platform_boundary() {
         "package app\nimport \"std/console\"\nfn main() {}\n",
     );
     for (target, adapter) in [
-        ("x86_64-unknown-linux-gnu", "linux"),
+        ("x86_64-unknown-linux-gnu", "posix"),
+        ("aarch64-apple-darwin", "posix"),
         ("x86_64-pc-windows-msvc", "windows"),
         ("x86_64-w64-windows-gnu", "windows"),
     ] {
@@ -168,7 +169,7 @@ fn console_is_embedded_and_only_selects_the_platform_boundary() {
         "wasm32-unknown-unknown",
         "thumbv6m-none-eabi",
         "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
     ] {
         assert!(
             package::load_for_target(&source, target)
@@ -291,48 +292,69 @@ fn console_windows_objects_and_borrow_rejections() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn linux_closed_nonblocking_and_broken_streams_are_recoverable() {
+fn unix_closed_nonblocking_and_broken_streams_are_recoverable() {
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     fn pipe() -> (fs::File, fs::File) {
         let mut fds = [0; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
-            0
-        );
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            unsafe {
+                assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                assert_eq!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK), 0);
+            }
+        }
         unsafe { (fs::File::from_raw_fd(fds[0]), fs::File::from_raw_fd(fds[1])) }
     }
     let work = Workspace::new();
     for optimization in ["0", "3"] {
         for (name, operation, kind, code, progress) in [
-            ("closed", "console.println(\"x\")", "Closed", 9, 0),
-            ("broken", "console.println(\"x\")", "BrokenPipe", 32, 0),
+            ("closed", "console.println(\"x\")", "Closed", libc::EBADF, 0),
+            (
+                "broken",
+                "console.println(\"x\")",
+                "BrokenPipe",
+                libc::EPIPE,
+                0,
+            ),
             (
                 "closed_printf",
                 "console.printf(\"{}\", 42)",
                 "Closed",
-                9,
+                libc::EBADF,
                 0,
             ),
             (
                 "broken_printf",
                 "console.stdout().printf(\"{}\", true)",
                 "BrokenPipe",
-                32,
+                libc::EPIPE,
                 0,
             ),
-            ("blocked", "input.read(&mut bytes)", "WouldBlock", 11, 0),
+            (
+                "blocked",
+                "input.read(&mut bytes)",
+                "WouldBlock",
+                libc::EAGAIN,
+                0,
+            ),
             (
                 "partial",
                 "io.write_all(&mut output, &bytes)",
                 "WouldBlock",
-                11,
+                libc::EAGAIN,
                 4096,
             ),
         ] {
+            // Only Linux can shrink a pipe (F_SETPIPE_SZ) to force a partial
+            // write; the transferred-prefix accounting is OS-independent.
+            if name == "partial" && !cfg!(target_os = "linux") {
+                continue;
+            }
             let source = work.source(name, &format!(r#"package native_failure
 import "std/console"
 import "std/io"
@@ -362,6 +384,7 @@ fn main() -> i32 {{
             } else {
                 write.as_raw_fd()
             };
+            #[cfg(target_os = "linux")]
             if name == "partial" {
                 assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, 4096) }, 4096);
             }

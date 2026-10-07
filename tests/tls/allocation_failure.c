@@ -5,11 +5,27 @@
 #include <stdint.h>
 #include <string.h>
 
+static int fails(size_t size, const char *file) {
+    return size >= 16384 && size < 17408 && strstr(file, "runtime.c");
+}
+#if defined(__APPLE__)
+/* ld64 has no --wrap. A definition in the executable binds the TLS runtime's
+ * calls; two-level namespaces keep libcrypto's internal calls on its own. */
+#include <dlfcn.h>
+void *CRYPTO_zalloc(size_t size, const char *file, int line) {
+    typedef void *(*allocator)(size_t, const char *, int);
+    static allocator real;
+    if (fails(size, file)) return NULL;
+    if (!real) *(void **)&real = dlsym(RTLD_NEXT, "CRYPTO_zalloc");
+    return real(size, file, line);
+}
+#else
 void *__real_CRYPTO_zalloc(size_t, const char *, int);
 void *__wrap_CRYPTO_zalloc(size_t size, const char *file, int line) {
-    if (size >= 16384 && size < 17408 && strstr(file, "runtime.c")) return NULL;
+    if (fails(size, file)) return NULL;
     return __real_CRYPTO_zalloc(size, file, line);
 }
+#endif
 extern void *dodo_tls_new(int, const unsigned char *, size_t, const unsigned char *, size_t,
                          const unsigned char *, size_t, const unsigned char *, size_t,
                          const unsigned char *, size_t, int, int, int64_t, int *);

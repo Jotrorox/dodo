@@ -112,8 +112,8 @@ Freestanding links supply startup, memory helpers and any soft-float support.
 
 Hosted console, filesystem, environment, processes, clocks, threads,
 synchronization, sockets, TLS backends and HTTP/web wrappers support **x86-64
-Linux GNU and Windows x64 MSVC/GNU**. They reject Linux x32/musl, AArch64 Linux,
-macOS and other unsupported ABIs. Atomic operations have a separate
+and AArch64 Linux GNU, macOS, and Windows x64 MSVC/GNU**. They reject Linux
+x32/musl and other unsupported ABIs. Atomic operations have a separate
 [x86-64/AArch64 target contract](synchronization.md#atomics).
 Hosted linking needs a target C toolchain and headers; OpenSSL-backed TLS also
 needs OpenSSL 3.5 or newer. See [platform adapters](platform.md) and [TLS](tls.md).
@@ -170,28 +170,28 @@ select providers; they are not additional recommended starting paths.
 
 | Imports | Role and entry point |
 | --- | --- |
-| `std/env/linux` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
+| `std/env/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/env/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/float_decimal` | Internal decimal conversion; use [formatting](formatting.md) or [text parsing](text.md). |
-| `std/fs/linux` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
+| `std/fs/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/fs/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/http/hosting` | Shared hosted driving/error support; use [HTTP](http.md) or [web serving](web.md). Import this only when naming its shared Error type or building a provider. |
-| `std/net/linux` | Selected socket adapter; use [networking](networking.md). |
+| `std/net/posix` | Selected socket adapter; use [networking](networking.md). |
 | `std/net/windows` | Selected socket adapter; use [networking](networking.md). |
-| `std/platform/linux` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
+| `std/platform/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/platform/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
-| `std/process/linux` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
+| `std/process/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/process/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
-| `std/sync/linux` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
+| `std/sync/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/sync/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
-| `std/thread/linux` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
+| `std/thread/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/thread/native` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/thread/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
-| `std/time/linux` | Native clock boundary; use [hosted clocks](time.md). |
+| `std/time/posix` | Native clock boundary; use [hosted clocks](time.md). |
 | `std/time/windows` | Native clock boundary; use [hosted clocks](time.md). |
-| `std/tls/linux` | Native OpenSSL boundary; use [TLS](tls.md). |
+| `std/tls/posix` | Native OpenSSL boundary; use [TLS](tls.md). |
 | `std/tls/windows` | Native OpenSSL boundary; use [TLS](tls.md). |
-| `std/web/linux` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
+| `std/web/posix` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
 | `std/web/windows` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,

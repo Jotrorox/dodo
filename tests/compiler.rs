@@ -309,7 +309,7 @@ fn cli_missing_project_entry_does_not_search_parents_or_other_files() {
     assert_success(&output, "an explicit file can have any name");
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[test]
 fn cli_default_run_passes_program_arguments_after_options() {
     let workspace = Workspace::new();
@@ -1248,7 +1248,15 @@ fn emits_llvm_ir_bitcode_assembly_and_object_files() {
             assert!(ir.contains("dodo.output.add"));
             assert!(ir.contains("llvm.trap"));
         } else if format == "bitcode" {
-            assert!(bytes.starts_with(b"BC\xc0\xde"));
+            // Darwin targets wrap bitcode in Apple's 0x0B17C0DE header, whose
+            // third little-endian word is the offset of the bitcode itself.
+            let bitcode = if bytes.starts_with(&[0xde, 0xc0, 0x17, 0x0b]) {
+                let offset = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                &bytes[offset as usize..]
+            } else {
+                &bytes[..]
+            };
+            assert!(bitcode.starts_with(b"BC\xc0\xde"));
         }
     }
 }
