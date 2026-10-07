@@ -69,6 +69,15 @@
 - Rework the GPIO example into RP2040 chip support built on `std/embedded/hal`, add a
   desktop-testable I2C sensor driver example, and add the
   [hardware and embedded guide](https://jotrorox.github.io/dodo/hardware/).
+- Publish GitHub Releases from `v*` tags. The release workflow checks the tag
+  against `Cargo.toml`, the VS Code extension version, and `CHANGELOG.md`, then
+  attaches the tested x86-64 and AArch64 Linux, Apple silicon macOS, and x86-64
+  Windows archives, the `.vsix`, a `SHA256SUMS`
+  file, and build provenance attestations.
+- Shrink the release archives: the Linux and macOS archives are `.tar.xz`, release
+  binaries no longer carry a symbol table, the Windows ZIP uses maximum
+  compression, and the Linux archives include only the shared license texts
+  its notices reference.
 
 ## 0.1.4 — 2026-09-20
 
