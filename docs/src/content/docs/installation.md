@@ -1,6 +1,6 @@
 ---
 title: "Install Dodo"
-description: "Set up the compiler, choose a linker, and verify your installation on Linux or Windows."
+description: "Set up the compiler, choose a linker, and verify your installation on Linux, macOS, or Windows."
 section: "Start here"
 order: 10
 ---
@@ -20,7 +20,8 @@ Rust or a separate LLVM installation unless you are building the compiler itself
 | Build the Dodo compiler from source | Rust, LLVM development files, and a C toolchain; see [source builds](building-from-source.md). |
 
 The published 0.1.4 archives target x86-64 Linux with glibc 2.39 or newer (such
-as Ubuntu 24.04), and x86-64 Windows. The hosted standard library's supported
+as Ubuntu 24.04), and x86-64 Windows. Builds from `main` add AArch64 Linux and
+Apple silicon macOS 15 or newer archives. The hosted standard library's supported
 platforms are a separate question from LLVM's accepted code-generation targets;
 see [platform support](standard-library.md#portable-and-hosted-functionality).
 
@@ -30,6 +31,12 @@ Download the matching archive from
 [GitHub Releases](https://github.com/Jotrorox/dodo/releases) and extract it.
 The examples below describe release 0.1.4. Documentation on `main` may contain
 APIs added after that release.
+
+Releases after 0.1.4 include a `SHA256SUMS` file and GitHub build provenance
+attestations. To verify a download, place `SHA256SUMS` next to it and run
+`sha256sum --check --ignore-missing SHA256SUMS` (on macOS,
+`shasum -a 256 --check --ignore-missing SHA256SUMS`), or, with the GitHub CLI,
+`gh attestation verify <archive> --repo Jotrorox/dodo`.
 
 ### Linux
 
@@ -46,6 +53,23 @@ The output begins with `dodo 0.1.4`. `PATH` is the list of directories your shel
 searches for commands. The `export` above changes only this terminal. If your
 shell does not already include `~/.local/bin`, add that export to its startup
 configuration and open a new terminal to verify it persists.
+
+### macOS
+
+From the extracted directory containing `dodo`, install it into a folder on
+your `PATH`:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+install -m 755 dodo "$HOME/.local/bin/dodo"
+export PATH="$HOME/.local/bin:$PATH"
+dodo --version
+```
+
+zsh, the default macOS shell, reads `~/.zprofile` and `~/.zshrc`; add the
+`export` line to one of them to keep it in new terminals. If macOS reports that
+the downloaded program cannot be verified, remove the download quarantine
+attribute with `xattr -d com.apple.quarantine "$HOME/.local/bin/dodo"`.
 
 ### Windows
 
@@ -97,6 +121,21 @@ cc --version
 If your selected driver is Clang instead, use `dodo run --linker clang` or set
 `export DODO_CC=clang` in your shell.
 
+### macOS toolchain
+
+Install Apple's Command Line Tools, which provide `cc` (Clang) and the macOS SDK:
+
+```sh
+xcode-select --install
+cc --version
+```
+
+A full Xcode installation also works. The same toolchain links both Apple
+silicon and Intel executables: `dodo build --target x86_64-apple-darwin` builds
+for Intel Macs. Programs that use [TLS](tls.md) also need OpenSSL 3.5 or newer;
+`brew install openssl@3` provides it, and Dodo finds Homebrew's copy
+automatically.
+
 ### Windows toolchain
 
 Install Clang and the Visual Studio C++ Build Tools with a Windows SDK. Open an
@@ -142,6 +181,8 @@ command. You can use `check` while configuring the linker.
 | The compiler cannot execute `cc` | Install a C toolchain or select a working driver with `--linker` / `DODO_CC`. |
 | Clang runs, but linking reports missing Windows libraries or headers | Install the C++ Build Tools and Windows SDK; use their x64 developer terminal. |
 | The Linux binary reports a missing glibc version | Use a compatible system or build Dodo on your intended host. |
+| macOS reports that `dodo` cannot be opened or verified | Remove the quarantine attribute: `xattr -d com.apple.quarantine dodo`. |
+| macOS linking reports `xcrun: error: invalid active developer path` | Install the Command Line Tools with `xcode-select --install`. |
 | A bundled package or method is unknown | Compare compiler version and documentation revision; update the compiler or use its matching tagged docs. |
 | `main.dodo` cannot be found | Change to your project folder or pass the path to the source file. |
 

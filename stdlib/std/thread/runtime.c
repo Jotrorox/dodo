@@ -1,8 +1,13 @@
 /* Native thread ABI boundary. No Dodo pointers escape the lifetime established
  * by Join, except detached owned contexts whose callback releases the storage.
  * Thread cancellation is never enabled or exposed by this runtime. */
+#if defined(__APPLE__)
+/* MAP_ANONYMOUS is a Darwin extension hidden by strict POSIX mode. */
+#define _DARWIN_C_SOURCE
+#else
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>

@@ -116,6 +116,32 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     load_with_overlays(path, &BTreeMap::new()).map_err(|error| error.to_string())
 }
 
+/// The operating-system name and adapter file serving a hosted target.
+/// Linux (glibc) and macOS share the POSIX adapter: their C boundaries are
+/// compiled against the target's own headers, so struct layouts, flag values
+/// and errno numbers are never hard-coded in Dodo sources.
+fn hosted_os(target: &str) -> Option<(&'static str, &'static str)> {
+    let mut parts = target.split('-');
+    let arch = parts.next()?;
+    let vendor = parts.next()?;
+    let os = parts.next().unwrap_or_default();
+    let environment = parts.next().unwrap_or_default();
+    match (arch, vendor) {
+        ("x86_64" | "aarch64", _) if os == "linux" && environment == "gnu" => {
+            Some(("linux", "posix"))
+        }
+        ("x86_64" | "aarch64" | "arm64", "apple")
+            if os.starts_with("darwin") || os.starts_with("macos") =>
+        {
+            Some(("macos", "posix"))
+        }
+        ("x86_64", _) if os == "windows" && matches!(environment, "msvc" | "gnu") => {
+            Some(("windows", "windows"))
+        }
+        _ => None,
+    }
+}
+
 /// Select each hosted adapter independently using the compilation target.
 pub fn load_for_target(path: &Path, target: &str) -> Result<Loaded, String> {
     load_with_overlays_for_target(path, &BTreeMap::new(), target).map_err(|error| error.to_string())
@@ -150,7 +176,7 @@ pub fn native_sources(loaded: &Loaded) -> Vec<(&'static str, &'static str)> {
                     && source
                         .path
                         .file_stem()
-                        .is_some_and(|stem| stem == "linux" || stem == "windows")
+                        .is_some_and(|stem| stem == "posix" || stem == "windows")
             })
         })
         .collect()
@@ -241,7 +267,7 @@ pub(crate) fn bundled_import_candidates(
     };
     if namespace == "native" {
         for &(import, _) in BUNDLED_SOURCES {
-            if import.ends_with("/linux") || import.ends_with("/windows") {
+            if import.ends_with("/posix") || import.ends_with("/windows") {
                 let candidate = format!("{}/native", import.rsplit_once('/').unwrap().0);
                 if let Ok(selected) = loader.native_import(&candidate)
                     && let Some((_, text)) =
@@ -464,25 +490,17 @@ impl Loader<'_> {
                     | "web"
                     | "time"
             )
-            || !matches!(parts[2], "native" | "linux" | "windows")
+            || !matches!(parts[2], "native" | "posix" | "linux" | "macos" | "windows")
         {
             return Ok(import.to_owned());
         }
-        let adapter = if self.target.starts_with("x86_64-")
-            && self.target.contains("-linux-")
-            && self.target.ends_with("-gnu")
-        {
-            "linux"
-        } else if self.target.starts_with("x86_64-")
-            && self.target.contains("-windows-")
-            && (self.target.ends_with("-msvc") || self.target.ends_with("-gnu"))
-        {
-            "windows"
-        } else {
-            return Err(format!("`{import}` is unsupported for target `{}`; hosted adapters require x86_64 Linux GNU or Windows (MSVC/GNU)", self.target).into());
+        let Some((os, adapter)) = hosted_os(&self.target) else {
+            return Err(format!("`{import}` is unsupported for target `{}`; hosted adapters require x86_64 or aarch64 Linux GNU, x86_64 or arm64 macOS, or x86_64 Windows (MSVC/GNU)", self.target).into());
         };
-        if parts[2] != "native" && parts[2] != adapter {
-            return Err(format!("`{import}` cannot be used for target `{}`; select `std/{}/native` or the `{adapter}` adapter", self.target, parts[1]).into());
+        // `std/AREA/linux` and `std/AREA/macos` name the shared POSIX adapter
+        // on their own operating system only.
+        if !matches!(parts[2], "native") && parts[2] != adapter && parts[2] != os {
+            return Err(format!("`{import}` cannot be used for target `{}`; select `std/{}/native` or the `{os}` adapter", self.target, parts[1]).into());
         }
         Ok(format!("std/{}/{adapter}", parts[1]))
     }

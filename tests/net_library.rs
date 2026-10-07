@@ -120,7 +120,7 @@ fn windows_network_adapter_cross_compiles_at_o0_and_o3() {
         }
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn descriptor_exhaustion_unwinds_all_socket_owners() {
     let workspace = Workspace::new();

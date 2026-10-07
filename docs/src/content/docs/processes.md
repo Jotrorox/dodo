@@ -8,7 +8,7 @@ order: 154
 `std/process` runs another executable and manages its lifetime. Start with
 `Command.output` to collect stdout and stderr together into bounded buffers.
 Choose `Command.spawn` when you need to manage a running child yourself.
-This hosted API supports Linux GNU x86-64 and Windows x64.
+This hosted API supports Linux GNU, macOS, and Windows x64.
 
 An executable and its arguments are separate values. `Command.arg("two words")`
 passes one argument containing a space; do not add shell quotes around it.
@@ -138,8 +138,8 @@ and [hosted_child.dodo](https://github.com/Jotrorox/dodo/blob/main/examples/host
 
 ## API and contracts
 
-`std/process` provides direct executable execution on x86-64 Linux/glibc and
-Windows x64. Its selected `std/process/native` adapter uses an explicit C ABI
+`std/process` provides direct executable execution on x86-64 and AArch64
+Linux/glibc, macOS, and Windows x64. Its selected `std/process/native` adapter uses an explicit C ABI
 boundary. Importing it does not import filesystem, environment, threading, or
 synchronization packages. The compiler links its small native boundary only
 when needed; object-only consumers must also compile and link
@@ -160,7 +160,7 @@ command.arg("")?
 This passes three arguments. The final one is empty. Use `current_dir("work")`
 to choose the child's directory; it does not change the parent's directory.
 Use an absolute executable path if you also change the child directory and
-need identical resolution behavior on Linux and Windows.
+need identical resolution behavior on Linux, macOS, and Windows.
 
 | Execution API | Owns the child after return? | Captures output? |
 | --- | --- | --- |

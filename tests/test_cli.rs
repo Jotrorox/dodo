@@ -721,7 +721,7 @@ fn rerun_commands_preserve_literal_paths_and_do_not_execute_shell_substitutions(
     assert!(!w.0.join("injected").exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn timeouts_terminate_descendants_in_the_test_process_group() {
     let w = Workspace::new();

@@ -8,7 +8,7 @@ order: 155
 `std/thread` starts an operating-system thread to run a task value's public
 `run` method. The task moves into the worker; `join` waits for completion and
 moves its result back. Start with caller-owned `Storage` and an explicit join.
-This hosted package supports Linux GNU x86-64 and Windows x64.
+This hosted package supports Linux GNU, macOS, and Windows x64.
 
 Read [ownership](ownership.md) before sharing data between threads. Being safe
 to move within one thread does not necessarily mean a value can move to another

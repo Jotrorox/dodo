@@ -154,7 +154,7 @@ def native_sources(source):
             dependencies = [module] if module.is_file() else sorted(directory.glob("*.dodo"))
             for dependency in dependencies:
                 boundary = dependency.parent / "runtime.c"
-                if boundary.is_file() and dependency.stem in ("linux", "windows"):
+                if boundary.is_file() and dependency.stem in ("posix", "windows"):
                     runtime.add(boundary)
                 visit(dependency)
 
@@ -194,7 +194,7 @@ def main():
     fixtures = [path.resolve() for path in args.fixture] if args.fixture else (
         sorted((ROOT / "tests/stdlib").glob("*.dodo")) +
         sorted(path for path in (ROOT / "tests/os").glob("*.dodo")
-               if "_linux_" not in path.name and path.name not in (
+               if "_unix_" not in path.name and path.name not in (
                    "process_checks.dodo", "env_native_checks.dodo", "thread_failures.dodo")))
     if not fixtures:
         raise SystemExit("No standard-library fixtures found")

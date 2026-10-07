@@ -101,8 +101,8 @@ thread, filesystem, TLS backend or scheduler.
 
 `std/net/native` selects the Linux or Windows socket adapter. Its public API is
 identical on Linux x86-64 GNU and Windows x64. Other hosted ABIs currently produce
-a compiler error. `std/net/linux` and `std/net/windows` may be imported explicitly
-only for their matching target. There is no allocating network convenience
+a compiler error. `std/net/linux`, `std/net/macos` and `std/net/windows` may be imported
+explicitly only for their matching target. There is no allocating network convenience
 package in this release.
 
 ## Addresses and storage
@@ -301,8 +301,8 @@ fail; they are never split into multiple datagrams.
 are discarded, never exposed as the next read. A zero-capacity destination still
 consumes a packet, reporting truncation if it was nonempty. Empty datagrams are
 successful messages, not EOF. `original_size` is `some(full_length)` on Linux;
-Windows reports `none` for an oversized packet because Winsock does not provide
-the original length after consuming it. The copied prefix is always initialized
+Windows and macOS report `none` for an oversized packet because Winsock and
+Darwin's sockets do not provide the original length after consuming it. The copied prefix is always initialized
 and bounded by the supplied slice. UDP has no stream `read`/`write` methods,
 preventing accidental loss of message boundaries.
 
@@ -387,4 +387,4 @@ numeric address with `AI_NUMERICHOST`, and hostname resolution uses `localhost`.
 
 ## Complete API reference
 
-For every public type, field, constant, and function signature, see [std/net](api/std/net.md), [std/net/operations](api/std/net/operations.md), [std/net/dns](api/std/net/dns.md), [std/net/linux](api/std/net/linux.md), [std/net/windows](api/std/net/windows.md).
+For every public type, field, constant, and function signature, see [std/net](api/std/net.md), [std/net/operations](api/std/net/operations.md), [std/net/dns](api/std/net/dns.md), [std/net/posix](api/std/net/posix.md), [std/net/windows](api/std/net/windows.md).

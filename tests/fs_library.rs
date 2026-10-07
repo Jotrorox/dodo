@@ -50,15 +50,24 @@ fn filesystem_native_fixtures_at_o0_and_o3() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Workspace::new();
     let mut fixtures = vec!["fs_checks", "fs_modes", "fs_path_checks"];
-    if cfg!(target_os = "linux") {
-        fixtures.push("fs_linux_checks");
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        fixtures.push("fs_unix_checks");
     }
     if cfg!(target_os = "windows") {
         fixtures.push("fs_windows_checks");
     }
     for fixture in fixtures {
         for optimization in ["0", "3"] {
-            let source = root.join(format!("tests/os/{fixture}.dodo"));
+            let mut source = root.join(format!("tests/os/{fixture}.dodo"));
+            // APFS rejects file names that are not UTF-8 (EILSEQ), so macOS
+            // checks native-byte preservation with a non-ASCII UTF-8 name.
+            if fixture == "fs_unix_checks" && cfg!(target_os = "macos") {
+                let text = fs::read_to_string(&source).unwrap();
+                let name = r#"b"nonutf-\xFF file\x00""#;
+                assert!(text.contains(name));
+                source = scratch.0.join(format!("{fixture}.dodo"));
+                fs::write(&source, text.replace(name, r#"b"utf8-\xC3\xA9 file\x00""#)).unwrap();
+            }
             let executable = scratch.0.join(format!(
                 "{fixture}-O{optimization}{}",
                 std::env::consts::EXE_SUFFIX
@@ -181,6 +190,46 @@ fn filesystem_borrows_and_results_are_checked() {
 }
 
 #[test]
+fn filesystem_hosted_adapter_emits_for_every_supported_posix_target() {
+    let scratch = Workspace::new();
+    let source = scratch.0.join("hosted.dodo");
+    fs::write(
+        &source,
+        "package hosted\nimport \"std/fs\"\nimport \"std/platform\"\nfn main() -> i32 {\n    workspace := platform.workspace()\n    match fs.write_file(\"hosted.txt\", b\"ok\", &mut workspace) {\n        ok() => {}, err(_) => { return 1 }\n    }\n    match workspace.set(\"hosted.txt\") {\n        ok() => {}, err(_) => { return 2 }\n    }\n    match workspace.get() {\n        ok(path) => {\n            match fs.metadata(&path) {\n                ok(_) => { return 0 }, err(_) => { return 3 }\n            }\n        }\n        err(_) => { return 2 }\n    }\n}\n",
+    )
+    .unwrap();
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+    ] {
+        for optimization in ["0", "3"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_dodo"))
+                .arg("build")
+                .arg(&source)
+                .args([
+                    "--target",
+                    target,
+                    "--emit",
+                    "obj",
+                    "-O",
+                    optimization,
+                    "-o",
+                ])
+                .arg(scratch.0.join("hosted.o"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{target} -O{optimization}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn filesystem_hosted_dependencies_reject_freestanding_and_wrong_abis() {
     let scratch = Workspace::new();
     let source = scratch.0.join("hosted.dodo");
@@ -192,7 +241,7 @@ fn filesystem_hosted_dependencies_reject_freestanding_and_wrong_abis() {
     for target in [
         "wasm32-unknown-unknown",
         "thumbv6m-none-eabi",
-        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
         "x86_64-unknown-linux-musl",
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_dodo"))

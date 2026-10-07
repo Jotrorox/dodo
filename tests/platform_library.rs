@@ -2,12 +2,15 @@
 use dodoc::package;
 use std::fs;
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_pointer_width = "64",
-    any(
-        all(target_os = "linux", target_env = "gnu"),
-        all(target_os = "windows", any(target_env = "msvc", target_env = "gnu"))
+#[cfg(any(
+    all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")
+    ),
+    all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        any(target_env = "msvc", target_env = "gnu")
     )
 ))]
 #[test]
@@ -16,7 +19,7 @@ fn default_loaders_select_host_adapters_without_llvm() {
     fs::create_dir_all(&scratch).unwrap();
     let source = scratch.join("main.dodo");
     fs::write(&source, "package app\nimport \"std/fs\"\nfn main() {}\n").unwrap();
-    let adapter = if cfg!(windows) { "windows" } else { "linux" };
+    let adapter = if cfg!(windows) { "windows" } else { "posix" };
     let loaded = package::load(&source).unwrap();
     assert!(
         loaded
@@ -58,7 +61,11 @@ fn adapters_are_selected_independently_and_reject_wrong_targets() {
         )
         .unwrap();
         for (target, adapter) in [
-            ("x86_64-unknown-linux-gnu", "linux"),
+            ("x86_64-unknown-linux-gnu", "posix"),
+            ("aarch64-unknown-linux-gnu", "posix"),
+            ("aarch64-apple-darwin", "posix"),
+            ("arm64-apple-macosx15.0.0", "posix"),
+            ("x86_64-apple-darwin", "posix"),
             ("x86_64-pc-windows-msvc", "windows"),
         ] {
             let loaded = package::load_for_target(&source, target).unwrap();
@@ -83,9 +90,10 @@ fn adapters_are_selected_independently_and_reject_wrong_targets() {
         for target in [
             "thumbv6m-none-eabi",
             "wasm32-unknown-unknown",
-            "aarch64-unknown-linux-gnu",
+            "aarch64-unknown-linux-musl",
             "x86_64-unknown-linux-musl",
             "x86_64-unknown-linux-gnux32",
+            "aarch64-apple-ios",
         ] {
             let error = package::load_for_target(&source, target).unwrap_err();
             assert!(error.contains("unsupported for target"), "{error}");
@@ -97,11 +105,50 @@ fn adapters_are_selected_independently_and_reject_wrong_targets() {
         "package wrong\nimport \"std/fs/linux\"\nfn main() {}\n",
     )
     .unwrap();
-    assert!(
-        package::load_for_target(&source, "x86_64-pc-windows-msvc")
-            .unwrap_err()
-            .contains("cannot be used")
-    );
+    for target in ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"] {
+        assert!(
+            package::load_for_target(&source, target)
+                .unwrap_err()
+                .contains("cannot be used")
+        );
+    }
+    // OS-named adapters alias the shared POSIX adapter on their own OS only.
+    for (import, accepted, rejected) in [
+        (
+            "std/fs/linux",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+        ),
+        (
+            "std/fs/macos",
+            "arm64-apple-darwin27.0.0",
+            "x86_64-unknown-linux-gnu",
+        ),
+        (
+            "std/fs/posix",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ),
+    ] {
+        fs::write(
+            &source,
+            format!("package wrong\nimport \"{import}\"\nfn main() {{}}\n"),
+        )
+        .unwrap();
+        let loaded = package::load_for_target(&source, accepted).unwrap();
+        assert!(
+            loaded
+                .sources
+                .iter()
+                .any(|s| s.path.ends_with("fs/posix.dodo"))
+        );
+        assert!(
+            package::load_for_target(&source, rejected)
+                .unwrap_err()
+                .contains("cannot be used"),
+            "{import} accepted for {rejected}"
+        );
+    }
     fs::remove_dir_all(scratch).unwrap();
 }
 

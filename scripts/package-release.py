@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Package a Linux or Windows compiler, installation instructions, and license notices."""
+"""Package a Linux, macOS, or Windows compiler, installation instructions, and license notices."""
 
 from pathlib import Path
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,12 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
+PLATFORMS = {
+    "x86_64-unknown-linux-gnu": "x86-64 Linux (Ubuntu 24.04 / glibc 2.39 or newer)",
+    "aarch64-unknown-linux-gnu": "AArch64 Linux (Ubuntu 24.04 / glibc 2.39 or newer)",
+    "aarch64-apple-darwin": "Apple silicon macOS 15 or newer",
+    "x86_64-pc-windows-msvc": "x86-64 Windows",
+}
 
 
 def output(*args: str) -> str:
@@ -22,13 +29,13 @@ def output(*args: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", choices=("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"),
-                        default="x86_64-unknown-linux-gnu")
+    parser.add_argument("--target", choices=tuple(PLATFORMS), default="x86_64-unknown-linux-gnu")
     parser.add_argument("--llvm-prefix", type=Path, default=os.environ.get("LLVM_SYS_231_PREFIX"),
                         help="LLVM installation, including its license notices")
     parser.add_argument("--runner", help="Run the Windows compiler with Wine when packaging on Linux")
     args = parser.parse_args()
     windows = args.target == "x86_64-pc-windows-msvc"
+    macos = args.target.endswith("-apple-darwin")
     if not args.llvm_prefix:
         parser.error("packaging requires --llvm-prefix or LLVM_SYS_231_PREFIX")
     if args.runner and not windows:
@@ -85,6 +92,12 @@ def main() -> None:
         if windows:
             for notice in ("libxml2-Copyright", "zlib-LICENSE", "zstd-LICENSE", "zstd-COPYING"):
                 shutil.copy2(args.llvm_prefix / notice, notices / notice)
+        elif macos:
+            # zstd is linked statically from Homebrew; zlib, libxml2, libiconv
+            # and libc++ are macOS system libraries and are not redistributed.
+            zstd = Path(output("brew", "--prefix", "zstd"))
+            for notice in ("LICENSE", "COPYING"):
+                shutil.copy2(zstd / notice, notices / f"zstd-{notice}")
         else:
             # These files describe the native libraries installed by the Ubuntu CI job.
             system_packages = ("zlib1g-dev", "libzstd-dev", "libxml2-dev", "libffi-dev")
@@ -96,14 +109,29 @@ def main() -> None:
                 raise ValueError("Missing GCC runtime copyright notices")
             for source in gcc_notices:
                 shutil.copy2(source, notices / f"{source.parent.name}-copyright")
-            shutil.copytree("/usr/share/common-licenses", notices / "common-licenses")
+            # Copy only the shared license texts these notices refer to, not the whole directory.
+            common_licenses = Path("/usr/share/common-licenses")
+            referenced = set()
+            for notice in notices.glob("*-copyright"):
+                referenced.update(re.findall(r"/usr/share/common-licenses/([A-Za-z0-9+-]+(?:\.[0-9]+)*)",
+                                             notice.read_text(errors="replace")))
+            (notices / "common-licenses").mkdir()
+            for license_name in sorted(referenced):
+                shutil.copy2(common_licenses / license_name, notices / "common-licenses" / license_name)
 
-        platform = "x86-64 Windows" if windows else "x86-64 Linux (Ubuntu 24.04 / glibc 2.39 or newer)"
-        toolchain = (
-            "To build or run native executables, install Clang and the Visual Studio C++ Build Tools\n"
-            "with a Windows SDK, then use --linker clang or set DODO_CC=clang.\n"
-            if windows else "To build or run native executables, install a C toolchain providing cc.\n"
-        )
+        platform = PLATFORMS[args.target]
+        if windows:
+            toolchain = (
+                "To build or run native executables, install Clang and the Visual Studio C++ Build Tools\n"
+                "with a Windows SDK, then use --linker clang or set DODO_CC=clang.\n"
+            )
+        elif macos:
+            toolchain = (
+                "To build or run native executables, install the Xcode Command Line Tools:\n"
+                "xcode-select --install\n"
+            )
+        else:
+            toolchain = "To build or run native executables, install a C toolchain providing cc.\n"
         (bundle / "INSTALL.txt").write_text(
             f"Dodo {version} for {platform}\n\n"
             f"Copy {executable} to a directory on PATH, then run dodo --version.\n"
@@ -116,13 +144,14 @@ def main() -> None:
         )
         if windows:
             archive = destination / f"{name}.zip"
-            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_archive:
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zip_archive:
                 for source in sorted(bundle.rglob("*")):
                     if source.is_file():
                         zip_archive.write(source, source.relative_to(bundle.parent))
         else:
-            archive = destination / f"{name}.tar.gz"
-            with tarfile.open(archive, "w:gz") as tar:
+            # XZ compresses the embedded LLVM much better than gzip; every tar extracts it.
+            archive = destination / f"{name}.tar.xz"
+            with tarfile.open(archive, "w:xz", preset=9) as tar:
                 tar.add(bundle, arcname=name)
 
     print(f"Packaged {archive} ({archive.stat().st_size:,} bytes)")

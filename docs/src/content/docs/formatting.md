@@ -7,8 +7,8 @@ order: 145
 
 Use `console.print(value)`, `console.println(value)`, and
 `console.printf("literal", args...)` for everyday output. All return
-`usize!io.Error`, including the written byte count. `console` supports Linux GNU
-x86-64 and Windows x64; `fmt` works with any structural writer on all targets.
+`usize!io.Error`, including the written byte count. `console` supports Linux GNU,
+macOS, and Windows x64; `fmt` works with any structural writer on all targets.
 
 ## Quickstart
 

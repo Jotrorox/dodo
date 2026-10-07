@@ -85,7 +85,9 @@ Fallible operations return Results that programs must handle.
 Create `sync.Storage.new()` and pass its exclusive borrow to `Mutex.new`,
 `RwLock.new`, `Barrier.new`, or `Once.new`. The returned owner keeps storage
 alive and immovable until destruction. Channels also borrow uninitialized
-`MaybeUninit<T>` slots. These owners do not allocate.
+`MaybeUninit<T>` slots. These owners do not allocate. `Storage` is 384 bytes
+on every target so that one value fits the largest native state, which is
+macOS's (a pthread mutex and two condition variables).
 
 Shared allocated constructors explicitly consume `allocated.PageAllocator.new()`.
 For example, `allocated.Mutex.new(allocated.PageAllocator.new(), 0usize)` maps

@@ -10,7 +10,7 @@ body whose boundaries are defined by framing rules. A successful HTTP exchange
 can still return a status such as 404; the status is application information,
 separate from a transport or parsing failure.
 
-Start with `std/http/hosted.Client` to fetch a URL on Linux GNU x86-64 or Windows
+Start with `std/http/hosted.Client` to fetch a URL on Linux GNU, macOS, or Windows
 x64. It handles resolution, connection, and polling with explicit storage and
 limits. Continue into the portable parser and sender when you need custom
 transports, incremental bodies, or control over each I/O step.

@@ -31,9 +31,11 @@ verified TLS engine, and HTTP exchange.
 
 ## Quickstart
 
-This hosted example requires Linux GNU x86-64 or Windows x64, Python 3 with
+This hosted example requires Linux GNU, macOS, or Windows x64, Python 3 with
 `ssl`, and **OpenSSL 3.5+ headers, libssl and libcrypto** for the target C toolchain.
-On Fedora install `openssl-devel`; elsewhere use matching development packages
+On Fedora install `openssl-devel`; on macOS run `brew install openssl@3`, which
+Dodo finds automatically unless `CPATH` or `LIBRARY_PATH` is set; elsewhere use
+matching development packages
 or the pinned source-build procedure in the
 [compiler workflow](https://github.com/Jotrorox/dodo/blob/main/.github/workflows/ci.yml).
 A runtime-only `openssl` command is not enough to compile a TLS program.
@@ -165,7 +167,7 @@ HTTP has no dependency on a particular TLS backend.
 
 ## Backend and build
 
-The implemented Linux and Windows x64 provider requires **OpenSSL 3.5 or later**;
+The implemented Linux, macOS, and Windows x64 provider requires **OpenSSL 3.5 or later**;
 the verification environment uses **3.5.8**. The maintained 3.5 LTS branch is
 [supported through April 2030](https://openssl-library.org/post/2025-02-20-openssl-3.5-lts/).
 OpenSSL 3.x uses the [Apache License 2.0](https://openssl-library.org/source/license/).

@@ -11,4 +11,8 @@ for arg in "$@"; do
         *) args+=("$arg") ;;
     esac
 done
+# Rust emits the C runtime before llvm-sys's trailing libraries (libstdc++
+# among them), and -nodefaultlibs drops the driver's own copy. Resolve their
+# glibc and libgcc references (gettext, outline atomics) after the fact.
+args+=(-lc -lgcc_eh -lgcc -lc)
 exec "${CC:-cc}" "${args[@]}"

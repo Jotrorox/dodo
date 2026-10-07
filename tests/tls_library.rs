@@ -229,7 +229,7 @@ fn main() {{
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tls_stream_interoperates_with_python_ssl_over_loopback() {
     let workspace = Workspace::new();
     credentials(&workspace.0);
@@ -250,7 +250,7 @@ fn tls_stream_interoperates_with_python_ssl_over_loopback() {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tls_owned_staging_allocation_failure_unwinds_cleanly() {
     let workspace = Workspace::new();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -261,7 +261,13 @@ fn tls_owned_staging_allocation_failure_unwinds_cleanly() {
                 .args(["-std=c11", "-Wall", "-Wextra", "-Werror", level])
                 .arg(root.join("stdlib/std/tls/runtime.c"))
                 .arg(root.join("tests/tls/allocation_failure.c"))
-                .args(["-Wl,--wrap=CRYPTO_zalloc", "-lssl", "-lcrypto", "-o"])
+                // macOS replaces the allocator by definition instead; see the fixture.
+                .args(if cfg!(target_os = "macos") {
+                    &[][..]
+                } else {
+                    &["-Wl,--wrap=CRYPTO_zalloc"][..]
+                })
+                .args(["-lssl", "-lcrypto", "-o"])
                 .arg(&executable)
                 .output()
                 .unwrap(),

@@ -15,7 +15,9 @@ impl Workspace {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
-        Self(root)
+        // Paths are reported canonically; macOS's temporary directory lives
+        // behind the /var -> /private/var symlink.
+        Self(root.canonicalize().unwrap())
     }
     fn file(&self, path: &str, source: &str) {
         let p = self.0.join(path);
@@ -310,7 +312,7 @@ fn init_and_completion_generation_do_not_overwrite_files() {
         assert!(text(&o).contains("--build-target"));
     }
 }
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[test]
 fn saved_arguments_override_and_empty_separator_clear_them() {
     let w = Workspace::new();

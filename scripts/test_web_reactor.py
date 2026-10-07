@@ -31,7 +31,7 @@ def connect(number, process):
             connection = socket.create_connection(("127.0.0.1", number), timeout=.1)
             connection.settimeout(3)
             return connection
-        except (ConnectionRefusedError, TimeoutError):
+        except (ConnectionRefusedError, TimeoutError, socket.timeout):  # Distinct before Python 3.10.
             if process.poll() is not None or time.monotonic() >= until:
                 raise
             time.sleep(.01)

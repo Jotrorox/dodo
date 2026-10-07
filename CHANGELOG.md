@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Support macOS in the hosted standard library: console, files,
+  environment, processes, threads, synchronization, clocks, sockets, TLS
+  and HTTP/web, on Apple silicon (`aarch64-apple-darwin`, tested natively)
+  and Intel (`x86_64-apple-darwin`, built and linked). macOS uses
+  libSystem: `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`,
+  `SO_NOSIGPIPE` sockets, `renamex_np` for no-replace renames, and relative
+  condition-variable waits on the monotonic clock. Apple arm64 calls now
+  extend narrow integer arguments as Apple's ABI requires, atomics accept
+  LLVM's `arm64` spelling, and links pass `-arch` so
+  `--target x86_64-apple-darwin` works on Apple silicon. TLS programs find
+  Homebrew's OpenSSL 3 automatically. CI builds, tests and packages a
+  self-contained macOS compiler that needs only system libraries.
+- Support AArch64 Linux (glibc). CI builds, tests and packages the compiler
+  on native AArch64 runners.
+- Linux and macOS share one hosted adapter, `std/AREA/posix`; the C
+  boundary now owns every OS- and architecture-specific detail (`struct
+  stat` and `struct dirent` layouts, `O_*` flags, errno numbering and
+  access, SIGPIPE handling). This fixes `O_NOFOLLOW`, whose value differs
+  on AArch64. `std/AREA/native` is unchanged; `std/AREA/linux` and the new
+  `std/AREA/macos` select the POSIX adapter on their own OS.
+- `sync.Storage` grows from 256 to 384 bytes so that it holds macOS's
+  pthread state; allocated synchronization objects reserve a 512-byte
+  header. `EILSEQ` (APFS rejecting a non-UTF-8 file name) maps to
+  `InvalidInput`.
 - Add firmware builds for microcontroller boards, starting with the Raspberry
   Pi Pico. `board = "pico"` in a `dodo.toml` target (or `--board pico`) selects
   the board's chip: its target and CPU, a startup runtime the compiler builds
@@ -45,6 +69,15 @@
 - Rework the GPIO example into RP2040 chip support built on `std/embedded/hal`, add a
   desktop-testable I2C sensor driver example, and add the
   [hardware and embedded guide](https://jotrorox.github.io/dodo/hardware/).
+- Publish GitHub Releases from `v*` tags. The release workflow checks the tag
+  against `Cargo.toml`, the VS Code extension version, and `CHANGELOG.md`, then
+  attaches the tested x86-64 and AArch64 Linux, Apple silicon macOS, and x86-64
+  Windows archives, the `.vsix`, a `SHA256SUMS`
+  file, and build provenance attestations.
+- Shrink the release archives: the Linux and macOS archives are `.tar.xz`, release
+  binaries no longer carry a symbol table, the Windows ZIP uses maximum
+  compression, and the Linux archives include only the shared license texts
+  its notices reference.
 
 ## 0.1.4 — 2026-09-20
 

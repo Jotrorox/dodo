@@ -10,13 +10,15 @@ if [[ $# -gt 1 || ( "$profile" != release && "$profile" != release-small && "$pr
     exit 1
 fi
 
-target=x86_64-unknown-linux-gnu
 host=$(rustc -vV | sed -n 's/^host: //p')
-if [[ "$host" != "$target" ]]; then
-    echo "The self-contained release build currently supports native $target hosts." >&2
-    echo "Use cargo build --locked --release for other hosts." >&2
-    exit 1
-fi
+case "$host" in
+    x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) target=$host ;;
+    *)
+        echo "The self-contained release build currently supports native x86_64 and aarch64 Linux GNU hosts." >&2
+        echo "Use cargo build --locked --release for other hosts." >&2
+        exit 1
+        ;;
+esac
 
 # An explicit target keeps these flags off host build scripts and proc macros.
 # Explicitly request static LLVM below; bundle its support libraries too.

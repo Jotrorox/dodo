@@ -67,7 +67,7 @@ class Peer:
         while not self.stop.is_set():
             try:
                 connection, _ = self.listener.accept()
-            except TimeoutError:
+            except (TimeoutError, socket.timeout):  # Distinct before Python 3.10.
                 continue
             except OSError:
                 break

@@ -1,6 +1,9 @@
 //! UTF-8 hosted conveniences use controlled files, environment and local children.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "support/timeout.rs"]
+mod timeout;
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -35,7 +38,7 @@ fn success(output: Output, context: &str) {
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn build(source: &Path, executable: &Path, optimization: &str) {
     success(
         Command::new(env!("CARGO_BIN_EXE_dodo"))
@@ -48,7 +51,7 @@ fn build(source: &Path, executable: &Path, optimization: &str) {
         "compile hosted fixture",
     );
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn hosted_native_conveniences_at_o0_and_o3() {
     let scratch = Scratch::new();
@@ -88,10 +91,8 @@ fn hosted_native_conveniences_at_o0_and_o3() {
                 &executable,
                 optimization,
             );
-            let mut run = Command::new("timeout");
-            run.arg("30")
-                .arg(&executable)
-                .current_dir(&scratch.0)
+            let mut run = Command::new(&executable);
+            run.current_dir(&scratch.0)
                 .env("DODO_PARENT_ONLY", "must not leak")
                 .env_remove("DODO_HOSTED_ABSENT")
                 .env("DODO_HOSTED_EMPTY", "")
@@ -100,7 +101,7 @@ fn hosted_native_conveniences_at_o0_and_o3() {
                 run.args(["space arg", "é", ""]);
             }
             success(
-                run.output().unwrap(),
+                timeout::output_with_timeout(&mut run, std::time::Duration::from_secs(30)),
                 &format!("run {fixture} -O{optimization}"),
             );
             if fixture == "hosted_process" {
@@ -193,7 +194,7 @@ fn hosted_borrows_and_private_storage_are_checked() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn invalid_native_text_and_clock_failures() {
     use std::os::unix::ffi::OsStringExt;
@@ -245,7 +246,7 @@ fn invalid_native_text_and_clock_failures() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn arguments_and_environment_capacity_failures() {
     let scratch = Scratch::new();

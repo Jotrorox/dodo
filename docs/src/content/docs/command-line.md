@@ -315,7 +315,7 @@ second copies the image to a Raspberry Pi Pico held in BOOTSEL mode. Boards need
 an ELF linker, `ld.lld` by default (Homebrew and most Linux distributions
 package it as `lld`). See [hardware and embedded](hardware.md#boards).
 Otherwise `run` executes only the host target. The repository exercises
-hosted Linux GNU x86-64 and Windows x64 programs, portable standard-library
+hosted Linux GNU, macOS, and Windows x64 programs, portable standard-library
 object generation for WebAssembly and Cortex-M0, and firmware images for the
 Pico and Pico 2. Hardware execution is checked with `scripts/test_pico.py` on a
 connected board. See

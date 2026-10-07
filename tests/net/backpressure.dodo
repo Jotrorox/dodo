@@ -36,17 +36,26 @@ fn run() -> i32!net.Error {
             if!pending {
                 return ok(2)
             }
-            // Slow peer and deadline stop explicit write completion.
-            timeout := net.Operation.until(clock.now_ms() + 20)
-            match operations.write_all(&mut server, &buffer, &timeout, &mut clock, &cancel) {
-                ok(_) => {
-                    return ok(3)
-                }
-                err(reason) => {
-                    if reason.kind != io.ErrorKind.TimedOut || reason.transferred > buffer.len {
-                        return ok(4)
+            // Slow peer and deadline stop explicit write completion. Some
+            // kernels (macOS auto-tuning) grow the send buffer after EAGAIN,
+            // so keep filling until a deadline expires; 64 MiB exceeds every
+            // supported kernel's buffer limit.
+            timed_out := false
+            for attempt in 0usize..1024 {
+                timeout := net.Operation.until(clock.now_ms() + 20)
+                match operations.write_all(&mut server, &buffer, &timeout, &mut clock, &cancel) {
+                    ok(_) => {}
+                    err(reason) => {
+                        if reason.kind != io.ErrorKind.TimedOut || reason.transferred > buffer.len {
+                            return ok(4)
+                        }
+                        timed_out = true
+                        break
                     }
                 }
+            }
+            if!timed_out {
+                return ok(3)
             }
             // Closing the peer releases buffers without pending OS ownership.
             client.close()?

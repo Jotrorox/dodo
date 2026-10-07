@@ -534,6 +534,18 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
             if let Some(cwd) = &args.link_cwd {
                 linker.current_dir(cwd);
             }
+            let target = args.options.target.clone().unwrap_or_else(|| {
+                codegen::TargetMachine::get_default_triple()
+                    .as_str()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            let apple = target.contains("-apple-");
+            if apple {
+                // The macOS SDK serves every architecture; select the target's
+                // so the C runtime and the link match the emitted object.
+                linker.args(["-arch", apple_arch(&target)]);
+            }
             linker.arg(&object);
             if options.debug {
                 linker.arg("-g");
@@ -556,12 +568,6 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 linker
                     .arg("-std=c11")
                     .arg(format!("-O{}", args.options.optimization));
-                let target = args.options.target.clone().unwrap_or_else(|| {
-                    codegen::TargetMachine::get_default_triple()
-                        .as_str()
-                        .to_string_lossy()
-                        .into_owned()
-                });
                 if target.contains("-linux-") {
                     linker.arg("-pthread");
                 }
@@ -572,6 +578,9 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                     }
                 }
                 if native.iter().any(|(name, _)| name.starts_with("std/tls/")) {
+                    if apple {
+                        homebrew_openssl(&mut linker);
+                    }
                     linker.args(["-lssl", "-lcrypto"]);
                 }
             }
@@ -596,6 +605,32 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
         }
     }
     Ok(())
+}
+/// The `-arch` name Apple's toolchain uses for a target triple.
+fn apple_arch(target: &str) -> &str {
+    match target.split('-').next().unwrap_or_default() {
+        "aarch64" => "arm64",
+        arch => arch,
+    }
+}
+/// macOS does not ship OpenSSL headers or libraries. Unless the caller chose
+/// search paths, use Homebrew's OpenSSL 3 from its standard prefixes.
+fn homebrew_openssl(linker: &mut Command) {
+    let chosen = ["CPATH", "C_INCLUDE_PATH", "LIBRARY_PATH"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    if chosen {
+        return;
+    }
+    for prefix in ["/opt/homebrew/opt/openssl@3", "/usr/local/opt/openssl@3"] {
+        let prefix = Path::new(prefix);
+        if prefix.join("include/openssl/ssl.h").is_file() {
+            linker
+                .arg(format!("-I{}", prefix.join("include").display()))
+                .arg(format!("-L{}", prefix.join("lib").display()));
+            return;
+        }
+    }
 }
 /// The flashable image written next to a firmware ELF.
 fn image_path(elf: &Path, platform: Platform) -> PathBuf {

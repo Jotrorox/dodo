@@ -7,7 +7,7 @@ order: 160
 
 A web application maps an HTTP method and path to a handler. The handler reads
 validated request data and builds a bounded response. Start with `std/web/app`
-to register routes and run a server on Linux GNU x86-64 or Windows x64.
+to register routes and run a server on Linux GNU, macOS, or Windows x64.
 Use `std/web/application` for the same routing and handlers in portable,
 in-process tests.
 

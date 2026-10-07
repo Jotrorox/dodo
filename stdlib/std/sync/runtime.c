@@ -1,7 +1,12 @@
 /* Explicit hosted blocking boundary. No scheduler, heap or process-global state.
  * Public Dodo owners keep these caller-backed objects at stable addresses.
  * Layouts come from target headers; no pthread or Win32 layout is guessed. */
+#if defined(__APPLE__)
+/* MAP_ANONYMOUS and pthread_cond_timedwait_relative_np are Darwin extensions. */
+#define _DARWIN_C_SOURCE
+#else
 #define _GNU_SOURCE
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -33,7 +38,11 @@ typedef struct {
     size_t stride, capacity, head, count;
     size_t references, mapping_size;
 } State;
-_Static_assert(sizeof(State) <= 256, "Dodo sync storage is too small on this ABI");
+/* DODO_SYNC_STORAGE is sizeof(sync.Storage); DODO_SYNC_HEADER is HEADER in
+ * std/sync/allocated.dodo and stays a multiple of the 256-byte alignment cap. */
+#define DODO_SYNC_STORAGE 384
+#define DODO_SYNC_HEADER 512
+_Static_assert(sizeof(State) <= DODO_SYNC_STORAGE, "Dodo sync storage is too small on this ABI");
 _Static_assert(_Alignof(State) <= 8, "Dodo sync storage alignment unsupported");
 
 static uint64_t ticks(void) {
@@ -87,8 +96,18 @@ static int wait_condition(State *s, Condition *condition, uint64_t end) {
     int code;
     if (end == UINT64_MAX) code = pthread_cond_wait(condition, &s->gate);
     else {
+#if defined(__APPLE__)
+        /* Darwin condition variables cannot use CLOCK_MONOTONIC deadlines;
+         * wait for the remaining monotonic interval instead. */
+        uint64_t now = ticks();
+        if (now >= end) return 1;
+        uint64_t remaining = end - now;
+        struct timespec t = {(time_t)(remaining / 1000), (long)(remaining % 1000) * 1000000};
+        code = pthread_cond_timedwait_relative_np(condition, &s->gate, &t);
+#else
         struct timespec t = {(time_t)(end / 1000), (long)(end % 1000) * 1000000};
         code = pthread_cond_timedwait(condition, &s->gate, &t);
+#endif
     }
     return code == 0 ? 0 : code == ETIMEDOUT ? 1 : 5;
 #endif
@@ -118,7 +137,11 @@ int32_t dodo_sync_init(void *memory, size_t bytes) {
     if (code) return 5;
     pthread_condattr_t attr;
     if (pthread_condattr_init(&attr)) { pthread_mutex_destroy(&s->gate); return 5; }
+#if defined(__APPLE__)
+    code = 0; /* Timed waits are relative; see wait_condition. */
+#else
     code = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+#endif
     if (!code) code = pthread_cond_init(&s->changed, &attr);
     if (!code) {
         code = pthread_cond_init(&s->notified, &attr);
@@ -274,10 +297,11 @@ void dodo_sync_close(void *memory) {
     enter(s); s->closed = 1; wake(s, 1); leave(s);
 }
 /* Explicit page allocator. Each allocation is independent of libc malloc and
- * survives moving its Dodo owner. Payload begins after a 256-byte header. */
+ * survives moving its Dodo owner. Payload begins after a DODO_SYNC_HEADER-byte
+ * header. */
 void *dodo_sync_allocate(size_t payload, size_t alignment) {
-    if (!alignment || alignment > 256 || (alignment & (alignment - 1)) || payload > SIZE_MAX - 256) return NULL;
-    size_t bytes = payload + 256;
+    if (!alignment || alignment > 256 || (alignment & (alignment - 1)) || payload > SIZE_MAX - DODO_SYNC_HEADER) return NULL;
+    size_t bytes = payload + DODO_SYNC_HEADER;
 #ifdef _WIN32
     void *p = VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
@@ -285,7 +309,7 @@ void *dodo_sync_allocate(size_t payload, size_t alignment) {
     if (p == MAP_FAILED) p = NULL;
 #endif
     if (!p) return NULL;
-    if (dodo_sync_init(p, 256)) {
+    if (dodo_sync_init(p, DODO_SYNC_HEADER)) {
 #ifdef _WIN32
         VirtualFree(p, 0, MEM_RELEASE);
 #else

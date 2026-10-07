@@ -712,7 +712,8 @@ fn lsp_rejects_invalid_file_uris_and_recovers() {
 }
 
 #[test]
-#[cfg(unix)]
+// APFS and HFS+ reject file names that are not UTF-8 (EILSEQ).
+#[cfg(all(unix, not(target_os = "macos")))]
 fn lsp_reports_imports_in_non_utf8_directories() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;

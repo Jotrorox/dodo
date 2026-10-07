@@ -10,8 +10,8 @@ input, stdout for normal output, and stderr for diagnostics. Start with
 `println` for a line of text, `printf` for a formatted message, and `read_line`
 for bounded input. Each operation can fail, so every Result must be handled.
 
-Console programs run on Linux GNU x86-64 and Windows x64 MSVC/GNU with a hosted
-C toolchain. They need no global allocator or application unsafe code. For
+Console programs run on Linux GNU, macOS, and Windows x64 MSVC/GNU with a
+hosted C toolchain. They need no global allocator or application unsafe code. For
 memory buffers and custom devices, use the same reader/writer contracts through
 [I/O](io.md) and [formatting](formatting.md).
 
@@ -118,7 +118,7 @@ text, an integer, a boolean, and a floating value.
 Use `errors := console.stderr()` and `errors.println(&reason)` to format
 I/O, platform, text, network, TLS, or HTTP errors directly. For example, a closed
 stream may print `io: Closed code=9 transferred=0`. The native platform domain
-is errno on Linux and GetLastError on Windows; a library-generated code is zero.
+is errno on Linux and macOS and GetLastError on Windows; a library-generated code is zero.
 Codes are retained numerically, without native message lookups.
 
 Enum errors cannot have methods in the current language. Import the optional

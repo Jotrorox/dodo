@@ -14,7 +14,9 @@ impl Workspace {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
-        Self(path)
+        // Diagnostics name canonical source paths; macOS's temporary
+        // directory lives behind the /var -> /private/var symlink.
+        Self(path.canonicalize().unwrap())
     }
     fn file(&self, name: &str, text: &str) -> PathBuf {
         let path = self.0.join(name);

@@ -560,12 +560,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn c_abi_attributes(&self, function: &Function) -> Vec<(AttributeLoc, Attribute<'ctx>)> {
         let triple = self.module.get_triple();
         let triple = triple.as_str().to_string_lossy();
-        // SysV x86 C promotes narrow arguments/results in registers. LLVM needs
-        // this promise on both declarations and calls (LangRef parameter attrs).
+        // SysV x86 C promotes narrow arguments/results in registers, and so
+        // does Apple's arm64 ABI (unlike AAPCS64, where the callee extends).
+        // LLVM needs this promise on both declarations and calls (LangRef
+        // parameter attrs).
         let x86 = ["x86_64-", "i386-", "i486-", "i586-", "i686-"]
             .iter()
             .any(|arch| triple.starts_with(arch));
-        if !x86 || triple.contains("windows") {
+        let apple_arm64 = (triple.starts_with("aarch64-") || triple.starts_with("arm64"))
+            && triple.contains("-apple-");
+        if !(x86 || apple_arm64) || triple.contains("windows") {
             return Vec::new();
         }
         std::iter::once((AttributeLoc::Return, &function.ret))
@@ -2660,7 +2664,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .as_str()
                     .to_string_lossy()
                     .into_owned();
-                if !["x86_64-", "aarch64-"]
+                // LLVM spells Apple's AArch64 as `arm64` (and `arm64e`).
+                if !["x86_64-", "aarch64-", "arm64-", "arm64e-"]
                     .iter()
                     .any(|arch| triple.starts_with(arch))
                 {

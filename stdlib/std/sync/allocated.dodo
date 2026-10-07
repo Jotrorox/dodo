@@ -14,9 +14,13 @@ pub struct PageAllocator {
     }
 }
 
+// Bytes before each payload, matching dodo_sync_allocate in runtime.c. A
+// multiple of 256 keeps every supported payload alignment.
+const HEADER: usize = 512
+
 unsafe fn allocate(allocator: PageAllocator, bytes: usize, alignment: usize) -> *mut u8!error.Error {
     core.drop(allocator)
-    if alignment > 256 || bytes > 9223372036854775551usize {
+    if alignment > 256 || bytes > 9223372036854775807usize - HEADER {
         return err(error.Error.InvalidInput)
     }
     unsafe {
@@ -40,7 +44,7 @@ pub struct Mutex<T> {
         mem.assert_send::<T>()
         unsafe {
             address := allocate(allocator, mem.size_of::<T>(), mem.align_of::<T>())?
-            pointer := ptr.offset(address, 256) as *mut T
+            pointer := ptr.offset(address, HEADER as isize) as *mut T
             initialized := mem.init(value)
             ptr.write(pointer, mem.assume_init(initialized))
             return ok(Mutex<T> { address: address, pointer: pointer })
@@ -123,7 +127,7 @@ pub struct RwLock<T> {
         mem.assert_sync::<T>()
         unsafe {
             address := allocate(allocator, mem.size_of::<T>(), mem.align_of::<T>())?
-            pointer := ptr.offset(address, 256) as *mut T
+            pointer := ptr.offset(address, HEADER as isize) as *mut T
             initialized := mem.init(value)
             ptr.write(pointer, mem.assume_init(initialized))
             return ok(RwLock<T> { address: address, pointer: pointer })
@@ -272,7 +276,7 @@ pub struct Channel<T> {
         }
         unsafe {
             address := allocate(allocator, capacity * stride, mem.align_of::<T>())?
-            pointer := ptr.offset(address, 256)
+            pointer := ptr.offset(address, HEADER as isize)
             match error.check(native.dodo_sync_channel_init(address, pointer, capacity, stride)) {
                 ok() => {}, err(reason) => {
                     native.dodo_sync_free(address);
@@ -382,7 +386,7 @@ pub struct Atomic<T> {
         mem.assert_send::<T>()
         unsafe {
             address := allocate(allocator, mem.size_of::<atomic.Atomic<T>>(), mem.align_of::<atomic.Atomic<T>>())?
-            pointer := ptr.offset(address, 256) as *mut atomic.Atomic<T>
+            pointer := ptr.offset(address, HEADER as isize) as *mut atomic.Atomic<T>
             initialized := mem.init(atomic.Atomic.new(value))
             ptr.write(pointer, mem.assume_init(initialized))
             return ok(Atomic<T> { address: address, pointer: pointer })

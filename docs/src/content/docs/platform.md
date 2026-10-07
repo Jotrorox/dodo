@@ -73,10 +73,23 @@ though it may have written a prefix.
 Prefer `process.Command` and `env.get` for their respective tasks. Native
 workspace views borrow the workspace; finish using one before calling `set`.
 
-Hosted adapters support **x86-64 Linux GNU and Windows x64 MSVC/GNU**. They
-reject Linux musl/x32, AArch64 Linux, macOS and freestanding ABIs. Portable
-fixtures are checked for `wasm32-unknown-unknown` and `thumbv6m-none-eabi`;
-that verifies object emission, not execution or board startup.
+Hosted adapters support:
+
+| Operating system | Targets | Adapter | Tested by |
+| --- | --- | --- | --- |
+| Linux (glibc) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` | `posix` | Native CI on both architectures |
+| macOS | `aarch64-apple-darwin` (Apple silicon), `x86_64-apple-darwin` | `posix` | Native CI on Apple silicon; Intel builds are compiled and linked only |
+| Windows | `x86_64-pc-windows-msvc`, `x86_64-w64-windows-gnu` | `windows` | Native CI |
+
+They reject Linux musl/x32, iOS and other Apple platforms, and freestanding
+ABIs. Portable fixtures are checked for `wasm32-unknown-unknown` and
+`thumbv6m-none-eabi`; that verifies object emission, not execution or board
+startup.
+
+Linux and macOS share one POSIX adapter. Everything that differs between their
+C libraries (struct layouts, flag values, errno numbers and how errno is read,
+SIGPIPE handling, socket and process-spawning options) lives in the adapter's
+small C boundary, which is compiled against the target's own headers.
 
 ## API and contracts
 
@@ -97,9 +110,10 @@ buffer. By contrast, a `NativeString` continues to borrow its backing storage.
 [synchronization](synchronization.md), [clocks](time.md), [networking](networking.md),
 [TLS](tls.md) and [web static files](web.md#optional-static-files) select their
 adapters independently. [Console](console.md) uses the platform stream adapter.
-`std/AREA/native` resolves to `std/AREA/linux` or `std/AREA/windows` using the
-compilation target, including `dodo check --target ...`. Explicitly importing an
-incompatible adapter produces a diagnostic.
+`std/AREA/native` resolves to `std/AREA/posix` or `std/AREA/windows` using the
+compilation target, including `dodo check --target ...`. `std/AREA/linux` and
+`std/AREA/macos` name the POSIX adapter on their own operating system only.
+Explicitly importing an incompatible adapter produces a diagnostic.
 
 The compilation target chooses the adapter, even when the compiler runs on a
 different operating system. Target selection validates the supported ABI; it
@@ -107,14 +121,15 @@ does not install that target's C headers, linker, or native libraries. See the
 linking requirements below before building a hosted executable for another OS.
 
 `std/platform/error` defines recoverable error kinds plus the native error code:
-Linux errno or Windows GetLastError. Synthetic library errors use code zero.
+errno on Linux and macOS (the numbers differ between them) or GetLastError on
+Windows. Synthetic library errors use code zero.
 Thread-start failures retain their native thread error domain. Synchronization
 has a separate typed error enum; it does not expose native implementation error
 numbers as portable values.
 
 Use `kind` for portable control flow and `code` for diagnostics. For example,
-handle `NotFound` as a missing path rather than comparing a Linux errno with a
-Windows error number. `BufferTooSmall` describes a caller-selected storage bound;
+handle `NotFound` as a missing path rather than comparing an errno, whose value
+differs between Linux and macOS, with a Windows error number. `BufferTooSmall` describes a caller-selected storage bound;
 `Unsupported` describes an operation or platform capability that a larger
 buffer will not fix.
 
@@ -204,4 +219,4 @@ Cortex-M0 objects without hosted providers.
 
 ## Complete API reference
 
-For every public type, field, constant, and function signature, see [std/platform](api/std/platform.md), [std/platform/error](api/std/platform/error.md), [std/platform/linux](api/std/platform/linux.md), [std/platform/windows](api/std/platform/windows.md).
+For every public type, field, constant, and function signature, see [std/platform](api/std/platform.md), [std/platform/error](api/std/platform/error.md), [std/platform/posix](api/std/platform/posix.md), [std/platform/windows](api/std/platform/windows.md).
