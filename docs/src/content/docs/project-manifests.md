@@ -139,8 +139,8 @@ Compiler settings are `opt-level` (integer 0–3), `debug` (boolean), `triple`,
 Features are an LLVM CPU-feature string such as `"+sse4.2,-avx"`. `emit` accepts
 `exe` (default), `obj`, `asm`, `llvm-ir`, or `bitcode`.
 
-`board` selects firmware hardware: `"pico"` for the Raspberry Pi Pico or
-`"pico2"` for the Pico 2; `chip` (`"rp2040"` or `"rp2350"`) selects only the
+`board` selects firmware hardware: `"pico"` for the Raspberry Pi Pico,
+`"pico2"` for the Pico 2, or `"pico2_w"` for the Pico 2 W; `chip` (`"rp2040"` or `"rp2350"`) selects only the
 microcontroller, for a custom board. Either fills in `triple`, `cpu`, the panic hook, and the linker
 wherever they are not set explicitly, makes `exe` output a flashable firmware
 image (the target's `.elf` plus, for example, a `.uf2` beside it), and selects

@@ -1,0 +1,132 @@
+package pico2_w
+
+import "std/embedded/wireless/cyw43"
+import "std/embedded/hal"
+import "std/embedded/chip/rp2350"
+
+// Raspberry Pi Pico 2 W: a Pico 2 (RP2350A, 12 MHz crystal, 4 MiB of flash)
+// with an Infineon CYW43439 wireless chip. The green user LED hangs off the
+// wireless chip's GPIO 0, not off an RP2350 pin, so `led` talks to the
+// wireless chip over its gSPI bus. Build with `board = "pico2_w"` and import
+// this package as `std/embedded/board`, so the program also builds for other
+// boards:
+//
+//     import "std/embedded/board"
+//
+//     fn main() {
+//         b := board.take()!
+//         for {
+//             b.led.toggle()
+//             b.timer.delay_ms(500)
+//         }
+//     }
+//
+// It follows the board contract described in std/embedded/hal. The wireless
+// chip uses GP23 (power), GP24 (gSPI data), GP25 (gSPI chip select), and
+// GP29 (gSPI clock), so `pins` refuses those; GP0 to GP22 and GP26 to GP28
+// are on the header. Wi-Fi and Bluetooth are not supported yet.
+
+pub const NAME: &str = "Raspberry Pi Pico 2 W"
+pub const CRYSTAL_HZ: u32 = 12_000_000
+// The wireless chip's GPIO that drives the LED.
+pub const LED_GPIO: u32 = 0
+// The wireless chip's GPIO that reads high while USB power (VBUS) is present.
+pub const VBUS_GPIO: u32 = 2
+// RP2350 pins wired to the wireless chip.
+pub const WL_POWER_PIN: u32 = 23
+pub const WL_DATA_PIN: u32 = 24
+pub const WL_SELECT_PIN: u32 = 25
+pub const WL_CLOCK_PIN: u32 = 29
+
+pub struct Board {
+    // The user LED, on when high. Changing it is one gSPI write to the
+    // wireless chip, about 20 us with -O2.
+    pub led: Led
+    // The remaining GPIOs; GP23 to GP25 and GP29 are taken by the wireless
+    // chip.
+    pub pins: rp2350.Pins
+    // The 1 MHz system timer: delay_us, delay_ms, and now_us.
+    pub timer: rp2350.Timer
+}
+
+// Start the chip with the Pico 2 W's crystal, power up the wireless chip,
+// and turn the LED off. Takes about 270 ms, most of it the wireless chip's
+// power-up. A second call returns hal.Error.Busy; a wireless chip that does
+// not answer returns hal.Error.Timeout.
+pub fn take() -> Board!hal.Error {
+    chip := rp2350.take(rp2350.Config { crystal_hz: CRYSTAL_HZ })?
+    power := chip.pins.output(WL_POWER_PIN)?
+    data := chip.pins.output(WL_DATA_PIN)?
+    select := chip.pins.output(WL_SELECT_PIN)?
+    clock := chip.pins.output(WL_CLOCK_PIN)?
+    wireless := cyw43.Device.new(cyw43.Spi.new(select, clock, data), power)
+    wireless.init(&mut chip.timer)?
+    led := Led { wireless, on: false }
+    led.set_low()
+    let rp2350.Peripherals { pins, timer } = chip
+    return ok(Board { led, pins, timer })
+}
+
+// The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal
+// output pin protocol, plus toggle and is_high like an RP2350 pin.
+pub struct Led {
+    wireless: cyw43.Device<cyw43.Spi<rp2350.Pin, rp2350.Pin, rp2350.Pin>, rp2350.Pin>
+    on: bool
+
+    pub fn set_high(&mut self) {
+        self.set(true)
+    }
+
+    pub fn set_low(&mut self) {
+        self.set(false)
+    }
+
+    pub fn toggle(&mut self) {
+        on := !self.on
+        self.set(on)
+    }
+
+    // The level last written.
+    pub fn is_high(&self) -> bool {
+        return self.on
+    }
+
+    // The level on the LED's pin, read back from the wireless chip.
+    pub fn read_back(&mut self) -> bool {
+        return self.gpio(LED_GPIO)
+    }
+
+    // True while the board has USB power, from the wireless chip's VBUS
+    // sense input.
+    pub fn usb_powered(&mut self) -> bool {
+        return self.gpio(VBUS_GPIO)
+    }
+
+    fn gpio(&mut self, pin: u32) -> bool {
+        match self.wireless.gpio_is_high(pin) {
+            ok(high) => {
+                return high
+            }
+            err(_) => {
+                return false
+            }
+        }
+    }
+
+    fn set(&mut self, on: bool) {
+        // LED_GPIO is a valid chip GPIO, so this cannot fail.
+        match self.wireless.set_gpio(LED_GPIO, on) {
+            ok() => {}
+            err(_) => {}
+        }
+        self.on = on
+    }
+}
+
+// Restart into the USB bootloader, as if BOOTSEL were held at power-up: the
+// Pico 2 W reappears as the RP2350 drive, ready for `dodo run`. There is no
+// activity LED, since GP25 is the wireless chip's select line. Does not
+// return.
+pub fn reboot_to_bootloader() {
+    rp2350.reboot_to_bootloader(rp2350.PIN_COUNT)
+}

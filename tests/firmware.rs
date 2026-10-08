@@ -1,7 +1,7 @@
 //! Firmware platforms: board and chip settings, `std/embedded/board` and `std/embedded/chip`
 //! resolution, the embedded chip runtimes, and (when ld.lld is installed)
 //! linking flashable images. Running on a real board is scripts/test_pico.py
-//! (`--board pico` or `--board pico2`).
+//! (`--board pico`, `--board pico2`, or `--board pico2_w`).
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -188,6 +188,14 @@ fn std_board_and_std_chip_follow_the_selected_platform() {
     );
     stdout(&dodo(&["check", explicit.to_str().unwrap()]));
     stdout(&dodo(&["check", blink, "--board", "pico2"]));
+    // The Pico 2 W's LED is behind the wireless chip, but it is still an
+    // output pin to portable code.
+    let explicit = scratch.write(
+        "explicit2w.dodo",
+        "package main\nimport \"std/embedded/board/pico2_w\"\nimport \"std/embedded/hal\"\nfn main() {\n b := pico2_w.take()!\n hal.write_pin(&mut b.led, true)\n b.led.toggle()\n}\n",
+    );
+    stdout(&dodo(&["check", explicit.to_str().unwrap()]));
+    stdout(&dodo(&["check", blink, "--board", "pico2_w"]));
     stdout(&dodo(&[
         "check",
         custom.to_str().unwrap(),
@@ -379,9 +387,12 @@ fn rp2350_projects_link_to_flashable_firmware() {
     let scratch = Scratch::new("link-rp2350");
     let blink = root().join("examples/blink");
     let selftest = root().join("tests/hardware/pico2");
+    let selftest_w = root().join("tests/hardware/pico2_w");
     for (project, name, board) in [
         (&blink, "blink", &["--board", "pico2"][..]),
+        (&blink, "blink-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),
+        (&selftest_w, "selftest-w", &[][..]),
     ] {
         for level in ["0", "2"] {
             let elf = scratch.path(&format!("{name}-O{level}.elf"));

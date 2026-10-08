@@ -62,6 +62,25 @@ fn registers_protocols_and_fakes_execute_on_the_host() {
 }
 
 #[test]
+fn cyw43_driver_executes_against_simulated_pins_and_chip() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("cyw43");
+    let source = root.join("tests/stdlib/cyw43_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "cyw43-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile CYW43 fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute CYW43 fixture",
+        );
+    }
+}
+
+#[test]
 fn interrupt_control_lowers_to_each_architecture_mask() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("lowering");

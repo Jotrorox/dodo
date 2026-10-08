@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a board self-test on a connected Raspberry Pi Pico or Pico 2.
+"""Run a board self-test on a connected Raspberry Pi Pico, Pico 2, or Pico 2 W.
 
 The board must be in BOOTSEL mode (the RPI-RP2 or RP2350 drive is mounted).
 The test firmware always reboots into BOOTSEL when it finishes, panics, or
@@ -7,7 +7,7 @@ hangs, so this script can be run repeatedly without touching the board.
 
 Requires ld.lld and picotool. Usage:
 
-    python3 scripts/test_pico.py [--board pico|pico2] [--dodo target/debug/dodo] [-O LEVEL ...]
+    python3 scripts/test_pico.py [--board pico|pico2|pico2_w] [--dodo target/debug/dodo] [-O LEVEL ...]
 """
 import argparse
 import os
@@ -19,14 +19,23 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# Per board: the bootloader drive's volume name and where picotool reads the
-# self-test's result record. The RP2040 boot ROM keeps SRAM, so the record
-# stays at RECORD in tests/hardware/pico/main.dodo; the RP2350 boot ROM
-# clears SRAM, so tests/hardware/pico2/main.dodo writes it to the last flash
-# sector.
+# Per board: the bootloader drive's volume name, where picotool reads the
+# self-test's result record, and the names of board-specific checks that
+# follow the common first checks. The RP2040 boot ROM keeps SRAM, so the
+# record stays at RECORD in tests/hardware/pico/main.dodo; the RP2350 boot
+# ROM clears SRAM, so the RP2350 self-tests write it to the last flash sector.
+WIRELESS_CHECKS = [
+    "LED is off after take()",
+    "LED turns on and reads back high",
+    "LED toggles off and reads back low",
+    "wireless chip senses USB power",
+    "LED is off after 100 toggles",
+    "wireless chip pins are taken",
+]
 BOARDS = {
-    "pico": ("RPI-RP2", 0x2003F000),
-    "pico2": ("RP2350", 0x103FF000),
+    "pico": ("RPI-RP2", 0x2003F000, []),
+    "pico2": ("RP2350", 0x103FF000, []),
+    "pico2_w": ("RP2350", 0x103FF000, WIRELESS_CHECKS),
 }
 CHECK_NAMES = [
     "second take() is refused",
@@ -70,11 +79,13 @@ def read_record(picotool, record):
             check=True,
             stdout=subprocess.DEVNULL,
         )
-        return struct.unpack("<6I", path.read_bytes()[:24])
+        data = path.read_bytes()
+        return struct.unpack("<7I", data[:28]), data[32:96].split(b"\0")[0].decode(errors="replace")
 
 
 def run(dodo, picotool, board, level):
-    volume, record = BOARDS[board]
+    volume, record, board_checks = BOARDS[board]
+    check_names = CHECK_NAMES + board_checks
     project = ROOT / "tests/hardware" / board
     if record < 0x20000000:
         # A flash record: erase the previous run's so it cannot be misread.
@@ -89,9 +100,15 @@ def run(dodo, picotool, board, level):
     if wait_for_drive(candidate_drives(volume), 20) is None:
         print(f"-O{level}: the board did not return to BOOTSEL; check the LED and USB cable")
         return False
-    state, detail, khz, delay_us, cycles, more = read_record(picotool, record)
+    words, file = read_record(picotool, record)
+    state, detail, khz, delay_us, cycles, more, toggles_us = words
     kind, value = state >> 16, state & 0xFFFF
     if kind == 0xDEAD:
+        # Self-tests that record the panicking file name it; others panic in
+        # main.dodo as far as this script can tell.
+        if file and not file.endswith("main.dodo"):
+            print(f"-O{level}: panicked at ...{file}:{value}:{detail}")
+            return False
         source = (project / "main.dodo").read_text().splitlines()[value - 1].strip()
         print(f"-O{level}: panicked at main.dodo:{value}:{detail}: {source}")
         return False
@@ -105,10 +122,11 @@ def run(dodo, picotool, board, level):
     print(
         f"-O{level}: {value - len(failed)}/{value} checks passed; "
         f"clk_sys {khz} kHz, 10 ms delay {delay_us} us, {cycles} cycles"
+        + (f", 100 LED toggles {toggles_us} us" if board_checks else "")
     )
     for index in failed:
-        if index < len(CHECK_NAMES):
-            name = CHECK_NAMES[index]
+        if index < len(check_names):
+            name = check_names[index]
         elif index >= value - len(LAST_CHECKS):
             name = LAST_CHECKS[index - (value - len(LAST_CHECKS))]
         else:

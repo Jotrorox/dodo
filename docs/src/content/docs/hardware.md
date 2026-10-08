@@ -18,6 +18,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, and buses that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
+| Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
 | Raw access | `core/mmio`, `core/cpu` | Volatile loads/stores, barriers, interrupt masking, `wfi`. |
 
 Four kinds of code meet here:
@@ -415,7 +416,8 @@ board = "pico"
 ```
 
 Hold the Pico's BOOTSEL button while connecting it over USB, so it appears as
-the `RPI-RP2` drive (`RP2350` for a Pico 2 with `board = "pico2"`), then run:
+the `RPI-RP2` drive (`RP2350` for a Pico 2 or Pico 2 W with `board = "pico2"`
+or `board = "pico2_w"`), then run:
 
 ```sh
 dodo run
@@ -452,6 +454,7 @@ import `std/embedded/board`; keep that code in drivers and test them with fakes.
 | --- | --- | --- |
 | `pico` | `rp2040` | `std/embedded/board/pico`: Raspberry Pi Pico, 2 MiB flash, LED on GP25. |
 | `pico2` | `rp2350` | `std/embedded/board/pico2`: Raspberry Pi Pico 2, 4 MiB flash, LED on GP25. |
+| `pico2_w` | `rp2350` | `std/embedded/board/pico2_w`: Raspberry Pi Pico 2 W, 4 MiB flash, LED on the CYW43439 wireless chip. |
 
 ### The RP2040 and Raspberry Pi Pico
 
@@ -504,6 +507,31 @@ extra pins are not yet.
 Unlike the RP2040, the RP2350 boot ROM clears RAM when it starts, so nothing
 in RAM survives a reboot into the bootloader.
 
+### The Raspberry Pi Pico 2 W
+
+The Pico 2 W is a Pico 2 with an Infineon CYW43439 Wi-Fi and Bluetooth chip.
+Its LED is wired to the wireless chip's GPIO 0, not to an RP2350 pin, so
+`std/embedded/board/pico2_w` reaches it through the wireless chip. The same
+blink program works unchanged with `board = "pico2_w"`:
+
+| Part | What it does |
+| --- | --- |
+| `board.take()` | Starts the RP2350 as on the Pico 2, then power-cycles the wireless chip and brings up its gSPI bus. This takes about 270 ms, most of it the chip's power-up time. A chip that does not answer is `Timeout`. |
+| `b.led` | `set_high`, `set_low`, `toggle`, and `is_high`, like a pin. Each change is one gSPI write of about 20 µs at `-O2`. `read_back()` reads the level from the wireless chip. |
+| `b.led.usb_powered()` | True while USB power is present, from the wireless chip's VBUS sense input on its GPIO 2. |
+| `b.pins` | GP23 (wireless power), GP24 (gSPI data), GP25 (gSPI chip select), and GP29 (gSPI clock) belong to the wireless chip and return `Busy`. GP0 to GP22 and GP26 to GP28 are on the header. |
+| `board.reboot_to_bootloader()` | As on the Pico 2, but without an activity LED: GP25 is the wireless chip's select line. |
+
+`std/embedded/wireless/cyw43` is the driver. It is portable: `cyw43.Spi`
+bit-bangs the chip's half-duplex gSPI bus on any three pins, using
+`set_as_output` and `set_as_input` on the data pin to turn the line around,
+and `cyw43.Device` speaks the chip protocol over any bus with the same methods.
+`Device.init` checks the bus test patterns and the chip ID, starts the chip's
+backplane clock, and `set_gpio` and `gpio_is_high` drive and read the chip's
+own pins.
+It does not load the wireless firmware, so Wi-Fi and Bluetooth are not
+available yet.
+
 ### Custom boards
 
 For a circuit board of your own, set `chip` instead of `board` and configure
@@ -548,7 +576,8 @@ so each new board or chip is a small, self-contained addition:
 
 The compiler compiles the runtime itself with the selected target machine, so
 no assembler or C toolchain is involved. `scripts/test_pico.py` (with
-`--board pico` or `--board pico2`) shows how to check a chip on real hardware.
+`--board pico`, `--board pico2`, or `--board pico2_w`) shows how to check a chip
+on real hardware.
 
 ### Unsupported chips
 
@@ -576,9 +605,11 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 ## Current limits
 
-- The boards are `pico` and `pico2`, on the `rp2040` and `rp2350` chips. The
-  chip packages cover clocks, GPIO, and the timer; UART, I2C, SPI, PWM, and
-  USB are not bundled yet. Write them with `hal.Reg` as above.
+- The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
+  chips. The chip packages cover clocks, GPIO, and the timer; UART, I2C, SPI,
+  PWM, and USB are not bundled yet. Write them with `hal.Reg` as above. The
+  Pico 2 W's wireless chip drives only its LED and senses USB power; Wi-Fi
+  and Bluetooth need its firmware, which is not loaded yet.
 - Floating-point arithmetic does not link in firmware yet: the Cortex-M0+ has
   no floating-point unit and the runtime has no software implementation. The
   linker error says so. The RP2350's Cortex-M33 FPU is enabled at startup,

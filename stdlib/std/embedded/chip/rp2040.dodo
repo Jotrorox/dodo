@@ -269,22 +269,14 @@ pub struct Pins {
     pub fn output(&mut self, number: u32) -> Pin!hal.Error {
         pin := self.claim(number)?
         pin.set_low()
-        // SAFETY: the SET alias changes only this pin's output-enable bit.
-        unsafe {
-            enable := reg(GPIO_OE_SET)
-            enable.write(pin.mask)
-        }
+        pin.set_as_output()
         return ok(pin)
     }
 
     // Claim pin `number` as an input.
     pub fn input(&mut self, number: u32) -> Pin!hal.Error {
         pin := self.claim(number)?
-        // SAFETY: the CLR alias changes only this pin's output-enable bit.
-        unsafe {
-            disable := reg(GPIO_OE_CLR)
-            disable.write(pin.mask)
-        }
+        pin.set_as_input()
         return ok(pin)
     }
 
@@ -299,8 +291,9 @@ pub struct Pins {
         self.taken |= mask
         index := number as usize
         // SAFETY: `taken` makes this pin's control and pad registers
-        // exclusive to the returned Pin. SIO SET/CLR/XOR are write-only
-        // per-bit aliases and IN is read-only, so pins never conflict there.
+        // exclusive to the returned Pin. The SIO output SET/CLR/XOR and
+        // output-enable SET/CLR registers are write-only per-bit aliases and IN
+        // is read-only, so pins never conflict there.
         unsafe {
             control := reg(IO_BANK0_BASE + 8 * index + 4)
             control.set(FUNCSEL, FUNCSEL_SIO)
@@ -311,6 +304,8 @@ pub struct Pins {
                 clear: reg(GPIO_OUT_CLR),
                 toggle: reg(GPIO_OUT_XOR),
                 input: reg(GPIO_IN),
+                output_enable: reg(GPIO_OE_SET),
+                output_disable: reg(GPIO_OE_CLR),
                 mask,
             })
         }
@@ -324,6 +319,8 @@ pub struct Pin {
     clear: hal.Reg<u32>
     toggle: hal.Reg<u32>
     input: hal.Reg<u32>
+    output_enable: hal.Reg<u32>
+    output_disable: hal.Reg<u32>
     mask: u32
 
     pub fn set_high(&mut self) {
@@ -340,6 +337,17 @@ pub struct Pin {
 
     pub fn is_high(&self) -> bool {
         return self.input.any(self.mask)
+    }
+
+    // Drive the pin at its output level, for a line that changes direction
+    // such as a half-duplex data line. Pins claimed as inputs start released.
+    pub fn set_as_output(&mut self) {
+        self.output_enable.write(self.mask)
+    }
+
+    // Release the pin so another device can drive it; is_high reads it.
+    pub fn set_as_input(&mut self) {
+        self.output_disable.write(self.mask)
     }
 }
 
