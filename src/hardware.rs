@@ -95,6 +95,13 @@ pub static BOARDS: &[Board] = &[
         flash_size: 4 * 1024 * 1024,
         package: "std/embedded/board/pico2",
     },
+    Board {
+        name: "pico2_w",
+        description: "Raspberry Pi Pico 2 W",
+        chip: &rp2350::CHIP,
+        flash_size: 4 * 1024 * 1024,
+        package: "std/embedded/board/pico2_w",
+    },
 ];
 
 pub fn chip(name: &str) -> Option<&'static Chip> {
@@ -346,6 +353,11 @@ mod tests {
         let script = platform.linker_script();
         assert!(script.contains("FLASH (rx) : ORIGIN = 0x10000000, LENGTH = 0x400000"));
         assert!(script.contains("RAM (rwx) : ORIGIN = 0x20000000, LENGTH = 0x82000"));
+        let wireless = Platform::select(Some("pico2_w"), Some("rp2350"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(wireless.description(), "Raspberry Pi Pico 2 W");
+        assert_eq!(wireless.linker_script(), script);
     }
 
     #[test]

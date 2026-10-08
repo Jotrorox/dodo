@@ -136,6 +136,8 @@ fn main() {
         reload.write(0x00FF_FFFF)
         current.write(0)
         control.write(0b101)
+        // The counter reads 0 until SysTick loads RELOAD on its first tick.
+        for current.read() == 0 {}
         start := current.read()
         before := b.timer.now_us()
         b.timer.delay_us(10_000)

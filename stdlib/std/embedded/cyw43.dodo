@@ -1,0 +1,374 @@
+package cyw43
+
+import "std/embedded/hal"
+
+// Infineon CYW43439 wireless chip over its gSPI host interface, as wired on
+// the Raspberry Pi Pico W and Pico 2 W. This driver powers the chip up,
+// configures the bus, starts the chip's backplane clock, and drives the
+// chip's own GPIO pins through its ChipCommon core and pin multiplexer. The
+// Pico boards wire their user LED to the chip's GPIO 0, so this is all the
+// LED needs; it does not load the Wi-Fi or Bluetooth firmware.
+//
+// Two layers, so the driver itself is portable and testable on a desktop:
+//
+//   Spi<S, C, D>   gSPI word transfers bit-banged on three pins: chip select,
+//                  clock, and the shared half-duplex data line.
+//   Device<B, P>   the chip protocol over any bus B with the methods below,
+//                  and its power-enable pin P (WL_REG_ON).
+//
+// gSPI bus protocol, implemented by Spi:
+//
+//   write(&mut self, words: &[u32]) -> u32
+//       Select the chip, send `words` (a command word, then its data), and
+//       return the status word the chip appends.
+//   read(&mut self, command: u32, words: &mut[u32]) -> u32
+//       Send `command`, fill `words` with the reply, and return the status.
+//   prepare_reset(&mut self)
+//       Put the pins in their power-up state: deselected, data driven low.
+//
+// Words go out most significant bit first. A command word holds, from the
+// top: write (1 bit), address increment (1), function (2), address (17), and
+// length in bytes (11). Function 0 is the bus itself, 1 the backplane (the
+// chip's internal address space, through a 32 KiB window), and 2 and 3 the
+// Wi-Fi and Bluetooth packet paths.
+
+// gSPI functions.
+const FUNC_BUS: u32 = 0
+const FUNC_BACKPLANE: u32 = 1
+
+// Bus registers (function 0).
+const BUS_CONTROL: u32 = 0x00
+const BUS_TEST_RO: u32 = 0x14
+const BUS_TEST_RW: u32 = 0x18
+// Padding bytes before the data of a backplane read.
+const BUS_BACKPLANE_DELAY: u32 = 0x1D
+const FEEDBEAD: u32 = 0xFEED_BEAD
+const TEST_PATTERN: u32 = 0x1234_5678
+
+// BUS_CONTROL, written as one 32-bit word: control bits in byte 0, the
+// response delay in byte 1, and status reporting in byte 2.
+const WORD_LENGTH_32: u32 = 0x01
+const HIGH_SPEED: u32 = 0x10
+const INTERRUPT_POLARITY_HIGH: u32 = 0x20
+const WAKE_UP: u32 = 0x80
+const RESPONSE_DELAY_4: u32 = 4 << 8
+const STATUS_ENABLE: u32 = 0x01 << 16
+const INTERRUPT_WITH_STATUS: u32 = 0x02 << 16
+const BACKPLANE_PADDING: u32 = 4
+
+// Backplane registers (function 1).
+const WINDOW_LOW: u32 = 0x1000A
+const WINDOW_MID: u32 = 0x1000B
+const WINDOW_HIGH: u32 = 0x1000C
+const CHIP_CLOCK_CSR: u32 = 0x1000E
+const ALP_AVAILABLE_REQUEST: u32 = 0x08
+const ALP_AVAILABLE: u32 = 0x40
+const WINDOW_OFFSET: u32 = 0x7FFF
+const ACCESS_32_BIT: u32 = 0x8000
+// Matches no real window, so the next access writes all three bytes.
+const NO_WINDOW: u32 = 0xAAAA_AAAA
+
+// The ChipCommon core: chip identification and the chip's GPIO pins.
+const CHIPCOMMON: u32 = 0x1800_0000
+const GPIO_IN: u32 = CHIPCOMMON + 0x60
+const GPIO_OUT: u32 = CHIPCOMMON + 0x64
+const GPIO_OUT_ENABLE: u32 = CHIPCOMMON + 0x68
+// The pin multiplexer of the Global Chip Interface, inside ChipCommon:
+// indirect chip-control register 0 holds a 4-bit function for each of pins 0
+// to 7. Out of reset the pins have their hardware default function, which
+// leaves the ChipCommon GPIO outputs disconnected; function 1 connects pin n
+// to GPIO n.
+const GCI_INDIRECT_ADDRESS: u32 = CHIPCOMMON + 0xC40
+const GCI_CHIP_CONTROL: u32 = CHIPCOMMON + 0xE00
+const PIN_FUNCTION_GPIO: u32 = 1
+
+// The chip ID in the low 16 bits of ChipCommon's first register.
+pub const CHIP_ID: u32 = 43439
+// GPIOs of the chip itself, WL_GPIO0 to WL_GPIO2 on the Pico W boards.
+pub const GPIO_COUNT: u32 = 3
+
+// Time limits during init, generous for a chip that is slow to start.
+const BUS_READY_MS: u32 = 500
+const CLOCK_READY_POLLS: u32 = 1000
+
+// Reads of the data pin between clock edges. They space the edges about
+// 50 ns apart at 150 MHz, keeping the clock well below the chip's 50 MHz
+// maximum, and give a read bit time to pass the pin's input synchronizer.
+const SETTLE_READS: u32 = 8
+
+// A gSPI command word.
+pub fn command(write: bool, function: u32, address: u32, length: u32) -> u32 {
+    word := (1u32 << 30) | ((function & 0b11) << 28) | ((address & 0x1_FFFF) << 11) | (length & 0x7FF)
+    if write {
+        word |= 1u32 << 31
+    }
+    return word
+}
+
+// Exchange the 16-bit halves. Until the bus is set to 32-bit words, the
+// chip sends and receives 16-bit words, so 32-bit values travel low half
+// first.
+pub fn swap16(word: u32) -> u32 {
+    return ((word & 0xFFFF) << 16) | (word >> 16)
+}
+
+// gSPI bit-banged on three pins: `select` (active low), `clock` (idles low),
+// and `data`, which the host drives while sending and releases while the chip
+// replies. `data` needs set_as_output and set_as_input besides the output and
+// input pin protocols. The chip samples on the rising clock edge; replies are
+// read just before it.
+pub struct Spi<S, C, D> {
+    select: S
+    clock: C
+    data: D
+
+    pub fn new(select: S, clock: C, data: D) -> Spi<S, C, D> {
+        spi := Spi<S, C, D> { select, clock, data }
+        spi.prepare_reset()
+        return spi
+    }
+
+    pub fn prepare_reset(&mut self) {
+        self.select.set_high()
+        self.clock.set_low()
+        self.data.set_low()
+        self.data.set_as_output()
+    }
+
+    pub fn write(&mut self, words: &[u32]) -> u32 {
+        self.begin()
+        for index in 0..words.len {
+            self.send(words[index])
+        }
+        self.data.set_as_input()
+        status := self.receive()
+        self.select.set_high()
+        return status
+    }
+
+    pub fn read(&mut self, command: u32, words: &mut[u32]) -> u32 {
+        self.begin()
+        self.send(command)
+        self.data.set_as_input()
+        for index in 0..words.len {
+            words[index] = self.receive()
+        }
+        status := self.receive()
+        self.select.set_high()
+        return status
+    }
+
+    fn begin(&mut self) {
+        self.data.set_low()
+        self.data.set_as_output()
+        self.select.set_low()
+    }
+
+    fn settle(&self) {
+        for _ in 0..SETTLE_READS {
+            if self.data.is_high() {}
+        }
+    }
+
+    fn send(&mut self, word: u32) {
+        for bit in 0..32u32 {
+            if ((word >> (31 - bit)) & 1) != 0 {
+                self.data.set_high()
+            } else {
+                self.data.set_low()
+            }
+            self.settle()
+            self.clock.set_high()
+            self.settle()
+            self.clock.set_low()
+        }
+    }
+
+    // The chip changes the data line after the previous clock edge; sample it
+    // before raising the clock for the next bit.
+    fn receive(&mut self) -> u32 {
+        word := 0u32
+        for _ in 0..32 {
+            self.settle()
+            word <<= 1
+            if self.data.is_high() {
+                word |= 1
+            }
+            self.clock.set_high()
+            self.settle()
+            self.clock.set_low()
+        }
+        return word
+    }
+}
+
+// A CYW43439 on gSPI bus `bus`, powered through `power` (high is on).
+pub struct Device<B, P> {
+    bus: B
+    power: P
+    // Base of the backplane window the chip currently has selected.
+    window: u32
+    // Chip GPIOs set up as outputs, and the levels last written. Without
+    // firmware nothing else in the chip writes them.
+    outputs: u32
+    levels: u32
+
+    pub fn new(bus: B, power: P) -> Device<B, P> {
+        return Device<B, P> { bus, power, window: NO_WINDOW, outputs: 0, levels: 0 }
+    }
+
+    // Power-cycle the chip and bring up its bus and backplane clock. Takes
+    // about 270 ms. Returns Timeout if the chip does not answer, Bus if the
+    // bus test patterns read back wrong, and Unsupported for another chip.
+    pub fn init<D>(&mut self, delay: &mut D) -> void!hal.Error {
+        self.window = NO_WINDOW
+        self.outputs = 0
+        self.levels = 0
+        self.bus.prepare_reset()
+        self.power.set_low()
+        hal.delay_ms(delay, 20)
+        self.power.set_high()
+        hal.delay_ms(delay, 250)
+
+        // The fixed test register reads FEEDBEAD once the bus is up.
+        ready := false
+        for _ in 0..BUS_READY_MS {
+            if self.read32_swapped(BUS_TEST_RO) == FEEDBEAD {
+                ready = true
+                break
+            }
+            hal.delay_ms(delay, 1)
+        }
+        if !ready {
+            return err(hal.Error.Timeout)
+        }
+        self.write32_swapped(BUS_TEST_RW, TEST_PATTERN)
+        if self.read32_swapped(BUS_TEST_RW) != TEST_PATTERN {
+            return err(hal.Error.Bus)
+        }
+
+        // 32-bit words, little endian, a status word after every transfer.
+        control := WORD_LENGTH_32 | HIGH_SPEED | INTERRUPT_POLARITY_HIGH | WAKE_UP
+        self.write32_swapped(BUS_CONTROL, control | RESPONSE_DELAY_4 | STATUS_ENABLE | INTERRUPT_WITH_STATUS)
+        if self.read(FUNC_BUS, BUS_TEST_RO, 4) != FEEDBEAD || self.read(FUNC_BUS, BUS_TEST_RW, 4) != TEST_PATTERN {
+            return err(hal.Error.Bus)
+        }
+        self.write(FUNC_BUS, BUS_BACKPLANE_DELAY, BACKPLANE_PADDING, 1)
+
+        // Request the low-power (ALP) backplane clock and keep it requested,
+        // so ChipCommon stays accessible.
+        self.write(FUNC_BACKPLANE, CHIP_CLOCK_CSR, ALP_AVAILABLE_REQUEST, 1)
+        clocked := false
+        for _ in 0..CLOCK_READY_POLLS {
+            if (self.read(FUNC_BACKPLANE, CHIP_CLOCK_CSR, 1) & ALP_AVAILABLE) != 0 {
+                clocked = true
+                break
+            }
+        }
+        if !clocked {
+            return err(hal.Error.Timeout)
+        }
+        if self.chip_id() != CHIP_ID {
+            return err(hal.Error.Unsupported)
+        }
+        return ok()
+    }
+
+    // The chip ID from ChipCommon: CHIP_ID (43439) for a CYW43439.
+    pub fn chip_id(&mut self) -> u32 {
+        return self.backplane_read32(CHIPCOMMON) & 0xFFFF
+    }
+
+    // Drive chip GPIO `pin` (0 to GPIO_COUNT - 1) as an output at `high`.
+    // The first call for a pin also connects it to its GPIO; later calls are
+    // one gSPI write.
+    pub fn set_gpio(&mut self, pin: u32, high: bool) -> void!hal.Error {
+        if pin >= GPIO_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        mask := 1u32 << pin
+        self.levels &= ~mask
+        if high {
+            self.levels |= mask
+        }
+        levels := self.levels
+        self.backplane_write32(GPIO_OUT, levels)
+        if (self.outputs & mask) == 0 {
+            self.outputs |= mask
+            outputs := self.outputs
+            self.backplane_write32(GPIO_OUT_ENABLE, outputs)
+            self.backplane_write32(GCI_INDIRECT_ADDRESS, 0)
+            function := 0xFu32 << (4 * pin)
+            select := self.backplane_read32(GCI_CHIP_CONTROL) & ~function
+            self.backplane_write32(GCI_CHIP_CONTROL, select | (PIN_FUNCTION_GPIO << (4 * pin)))
+        }
+        return ok()
+    }
+
+    // The level on chip GPIO `pin`, whether the chip or something else
+    // drives it.
+    pub fn gpio_is_high(&mut self, pin: u32) -> bool!hal.Error {
+        if pin >= GPIO_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok((self.backplane_read32(GPIO_IN) & (1u32 << pin)) != 0)
+    }
+
+    // One 32-bit word of the chip's backplane address space.
+    pub fn backplane_read32(&mut self, address: u32) -> u32 {
+        self.select_window(address)
+        return self.read(FUNC_BACKPLANE, (address & WINDOW_OFFSET) | ACCESS_32_BIT, 4)
+    }
+
+    pub fn backplane_write32(&mut self, address: u32, value: u32) {
+        self.select_window(address)
+        self.write(FUNC_BACKPLANE, (address & WINDOW_OFFSET) | ACCESS_32_BIT, value, 4)
+    }
+
+    // Power the chip off. init powers it up again.
+    pub fn power_off(&mut self) {
+        self.power.set_low()
+    }
+
+    fn select_window(&mut self, address: u32) {
+        window := address & ~WINDOW_OFFSET
+        if (window >> 24) != (self.window >> 24) {
+            self.write(FUNC_BACKPLANE, WINDOW_HIGH, window >> 24, 1)
+        }
+        if ((window >> 16) & 0xFF) != ((self.window >> 16) & 0xFF) {
+            self.write(FUNC_BACKPLANE, WINDOW_MID, (window >> 16) & 0xFF, 1)
+        }
+        if ((window >> 8) & 0xFF) != ((self.window >> 8) & 0xFF) {
+            self.write(FUNC_BACKPLANE, WINDOW_LOW, (window >> 8) & 0xFF, 1)
+        }
+        self.window = window
+    }
+
+    // Read `length` (1 to 4) bytes. Backplane reads start with padding words.
+    fn read(&mut self, function: u32, address: u32, length: u32) -> u32 {
+        reply: [2]u32 = [0, 0]
+        if function == FUNC_BACKPLANE {
+            self.bus.read(command(false, function, address, length), &mut reply)
+            return reply[1]
+        }
+        one: [1]u32 = [0]
+        self.bus.read(command(false, function, address, length), &mut one)
+        return one[0]
+    }
+
+    fn write(&mut self, function: u32, address: u32, value: u32, length: u32) {
+        words: [2]u32 = [command(true, function, address, length), value]
+        self.bus.write(&words)
+    }
+
+    fn read32_swapped(&mut self, address: u32) -> u32 {
+        reply: [1]u32 = [0]
+        self.bus.read(swap16(command(false, FUNC_BUS, address, 4)), &mut reply)
+        return swap16(reply[0])
+    }
+
+    fn write32_swapped(&mut self, address: u32, value: u32) {
+        words: [2]u32 = [swap16(command(true, FUNC_BUS, address, 4)), swap16(value)]
+        self.bus.write(&words)
+    }
+}

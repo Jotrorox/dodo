@@ -1,0 +1,431 @@
+package main
+
+import "std/embedded/cyw43"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Host checks for std/embedded/cyw43: the bit-banged gSPI framing against
+// simulated pins, and the chip protocol against an in-memory CYW43439.
+
+// --- Pins sharing one simulated wire -----------------------------------
+
+// The wire between host and chip. The host drives DATA while it is an
+// output; otherwise the chip presents bit REPLY_BIT of REPLY.
+static mut SELECTED: bool = false
+static mut CLOCK: bool = false
+static mut HOST_DRIVES: bool = false
+static mut HOST_LEVEL: bool = false
+static mut RECEIVED: [4]u32 = [0u32, 0, 0, 0]
+static mut RECEIVED_BITS: u32 = 0
+static mut REPLY: [3]u32 = [0u32, 0, 0]
+static mut REPLY_BIT: u32 = 0
+static mut CLOCK_WHILE_DESELECTED: bool = false
+
+struct SelectPin {
+    pub fn set_high(&mut self) {
+        unsafe {
+            SELECTED = false
+        }
+    }
+
+    pub fn set_low(&mut self) {
+        unsafe {
+            SELECTED = true
+            RECEIVED_BITS = 0
+            REPLY_BIT = 0
+        }
+    }
+}
+
+// The chip samples the host's bit on the rising edge; while the host
+// listens, each rising edge moves to the next reply bit.
+struct ClockPin {
+    pub fn set_high(&mut self) {
+        unsafe {
+            if !SELECTED {
+                CLOCK_WHILE_DESELECTED = true
+            }
+            if HOST_DRIVES {
+                word := (RECEIVED_BITS / 32) as usize
+                if word < 4 {
+                    bit := 0u32
+                    if HOST_LEVEL {
+                        bit = 1
+                    }
+                    RECEIVED[word] = ((RECEIVED[word] & 0x7FFF_FFFF) << 1) | bit
+                }
+                RECEIVED_BITS += 1
+            } else {
+                REPLY_BIT += 1
+            }
+            CLOCK = true
+        }
+    }
+
+    pub fn set_low(&mut self) {
+        unsafe {
+            CLOCK = false
+        }
+    }
+}
+
+struct DataPin {
+    pub fn set_high(&mut self) {
+        unsafe {
+            HOST_LEVEL = true
+        }
+    }
+
+    pub fn set_low(&mut self) {
+        unsafe {
+            HOST_LEVEL = false
+        }
+    }
+
+    pub fn set_as_output(&mut self) {
+        unsafe {
+            HOST_DRIVES = true
+        }
+    }
+
+    pub fn set_as_input(&mut self) {
+        unsafe {
+            HOST_DRIVES = false
+        }
+    }
+
+    pub fn is_high(&self) -> bool {
+        unsafe {
+            if HOST_DRIVES {
+                return HOST_LEVEL
+            }
+            word := (REPLY_BIT / 32) as usize
+            if word >= 3 {
+                return false
+            }
+            return ((REPLY[word] >> (31 - REPLY_BIT % 32)) & 1) != 0
+        }
+    }
+}
+
+fn spi_framing() {
+    spi := cyw43.Spi.new(SelectPin {}, ClockPin {}, DataPin {})
+    unsafe {
+        core.assert(!SELECTED && HOST_DRIVES && !HOST_LEVEL && !CLOCK)
+    }
+
+    // A write sends every word most significant bit first, then reads the
+    // status word.
+    unsafe {
+        REPLY = [0x0000_0A05, 0, 0]
+    }
+    words: [2]u32 = [0x8000_0001, 0x1234_5678]
+    status := spi.write(&words)
+    unsafe {
+        core.assert_eq(RECEIVED_BITS, 64u32)
+        core.assert_eq(RECEIVED[0], 0x8000_0001u32)
+        core.assert_eq(RECEIVED[1], 0x1234_5678u32)
+        core.assert(!SELECTED)
+    }
+    core.assert_eq(status, 0x0000_0A05u32)
+
+    // A read sends the command, then reads the reply words and the status.
+    unsafe {
+        REPLY = [0xFEED_BEAD, 0x8000_0001, 0x5555_AAAA]
+    }
+    reply: [2]u32 = [0, 0]
+    status = spi.read(0x4000_A004, &mut reply)
+    unsafe {
+        core.assert_eq(RECEIVED_BITS, 32u32)
+        core.assert_eq(RECEIVED[0], 0x4000_A004u32)
+        core.assert(!SELECTED && !CLOCK_WHILE_DESELECTED)
+    }
+    core.assert_eq(reply[0], 0xFEED_BEADu32)
+    core.assert_eq(reply[1], 0x8000_0001u32)
+    core.assert_eq(status, 0x5555_AAAAu32)
+}
+
+// --- An in-memory CYW43439 behind the bus protocol ----------------------
+
+const FEEDBEAD: u32 = 0xFEED_BEAD
+const CHIPCOMMON: u32 = 0x1800_0000
+const VBUS: u32 = 1 << 2
+
+struct Chip {
+    // Answers at all, and after how many test-register reads.
+    alive: bool
+    reads_until_ready: u32
+    id: u32
+    words_32: bool
+    test: u32
+    padding: u32
+    window: u32
+    clock_requested: bool
+    gpio_out: u32
+    gpio_enable: u32
+    gci_address: u32
+    gci_control: u32
+    writes: u32
+    resets: u32
+
+    fn new(id: u32) -> Chip {
+        return Chip {
+            alive: true,
+            reads_until_ready: 3,
+            id,
+            words_32: false,
+            test: 0,
+            padding: 0,
+            window: 0,
+            clock_requested: false,
+            gpio_out: 0,
+            gpio_enable: 0,
+            // Hardware default function for every pin.
+            gci_address: 0,
+            gci_control: 0,
+            writes: 0,
+            resets: 0,
+        }
+    }
+
+    // A pin reads high when its output is enabled, driven high, and
+    // connected to GPIO n by function 1; VBUS is always present.
+    fn gpio_in(&self) -> u32 {
+        connected := 0u32
+        for pin in 0..8u32 {
+            if ((self.gci_control >> (4 * pin)) & 0xF) == 1 {
+                connected |= 1u32 << pin
+            }
+        }
+        return (self.gpio_out & self.gpio_enable & connected) | VBUS
+    }
+
+    fn decode(&self, command: u32) -> u32 {
+        if self.words_32 {
+            return command
+        }
+        return cyw43.swap16(command)
+    }
+
+    fn backplane(&self, address: u32) -> u32 {
+        if (address & 0x8000) != 0 {
+            return self.window | (address & 0x7FFF)
+        }
+        return address
+    }
+
+    // Power-up state; the chip is power-cycled right after.
+    pub fn prepare_reset(&mut self) {
+        self.resets += 1
+        self.reads_until_ready = 3
+        self.words_32 = false
+        self.padding = 0
+        self.window = 0
+        self.clock_requested = false
+        self.gpio_out = 0
+        self.gpio_enable = 0
+        self.gci_address = 0
+        self.gci_control = 0
+    }
+
+    pub fn read(&mut self, raw: u32, words: &mut[u32]) -> u32 {
+        if !self.alive {
+            for index in 0..words.len {
+                words[index] = 0xFFFF_FFFF
+            }
+            return 0
+        }
+        command := self.decode(raw)
+        core.assert((command >> 31) == 0)
+        function := (command >> 28) & 0b11
+        address := (command >> 11) & 0x1_FFFF
+        value := 0u32
+        if function == 0 && address == 0x14 {
+            if self.reads_until_ready > 0 {
+                self.reads_until_ready -= 1
+                value = 0
+            } else {
+                value = FEEDBEAD
+            }
+        } else if function == 0 && address == 0x18 {
+            value = self.test
+        } else if function == 1 && address == 0x1000E {
+            value = 0
+            if self.clock_requested {
+                value = 0x48
+            }
+        } else if function == 1 {
+            full := self.backplane(address)
+            if full == CHIPCOMMON {
+                value = 0x1000_0000 | self.id
+            } else if full == CHIPCOMMON + 0x60 {
+                value = self.gpio_in()
+            } else if full == CHIPCOMMON + 0x64 {
+                value = self.gpio_out
+            } else if full == CHIPCOMMON + 0x68 {
+                value = self.gpio_enable
+            } else if full == CHIPCOMMON + 0xE00 {
+                core.assert_eq(self.gci_address, 0u32)
+                value = self.gci_control
+            } else {
+                core.assert(false)
+            }
+        }
+        if function == 1 {
+            // The configured padding comes first.
+            core.assert_eq(self.padding, 4u32)
+            core.assert_eq(words.len, 2usize)
+            words[0] = 0
+            words[1] = value
+        } else {
+            core.assert_eq(words.len, 1usize)
+            if self.words_32 {
+                words[0] = value
+            } else {
+                words[0] = cyw43.swap16(value)
+            }
+        }
+        return 0
+    }
+
+    pub fn write(&mut self, words: &[u32]) -> u32 {
+        core.assert_eq(words.len, 2usize)
+        if !self.alive {
+            return 0
+        }
+        self.writes += 1
+        command := self.decode(words[0])
+        core.assert((command >> 31) == 1)
+        value := words[1]
+        if !self.words_32 {
+            value = cyw43.swap16(value)
+        }
+        function := (command >> 28) & 0b11
+        address := (command >> 11) & 0x1_FFFF
+        length := command & 0x7FF
+        if function == 0 && address == 0x18 {
+            self.test = value
+        } else if function == 0 && address == 0x00 {
+            // 32-bit words, high speed, and a 4-byte response delay.
+            core.assert_eq(value & 0xFF, 0xB1u32)
+            core.assert_eq((value >> 8) & 0xFF, 4u32)
+            self.words_32 = (value & 1) != 0
+        } else if function == 0 && address == 0x1D {
+            self.padding = value
+        } else if function == 1 && address == 0x1000E {
+            self.clock_requested = (value & 0x08) != 0
+        } else if function == 1 && address >= 0x1000A && address <= 0x1000C {
+            core.assert_eq(length, 1u32)
+            shift := 8 * (address - 0x1000A + 1)
+            self.window = (self.window & ~(0xFFu32 << shift)) | ((value & 0xFF) << shift)
+        } else if function == 1 {
+            core.assert_eq(length, 4u32)
+            full := self.backplane(address)
+            if full == CHIPCOMMON + 0x64 {
+                self.gpio_out = value
+            } else if full == CHIPCOMMON + 0x68 {
+                self.gpio_enable = value
+            } else if full == CHIPCOMMON + 0xC40 {
+                self.gci_address = value
+            } else if full == CHIPCOMMON + 0xE00 {
+                self.gci_control = value
+            } else {
+                core.assert(false)
+            }
+        } else {
+            core.assert(false)
+        }
+        return 0
+    }
+}
+
+fn command_words() {
+    core.assert_eq(cyw43.command(false, 0, 0x14, 4), 0x4000_A004u32)
+    core.assert_eq(cyw43.command(true, 1, 0x1000E, 1), 0xD800_7001u32)
+    core.assert_eq(cyw43.swap16(0x4000_A004), 0xA004_4000u32)
+}
+
+fn brings_up_the_chip_and_drives_its_gpios() {
+    power := fake.Pin.new()
+    device := cyw43.Device.new(Chip.new(cyw43.CHIP_ID), power)
+    delay := fake.Delay.new()
+    device.init(&mut delay)!
+    // Off for 20 ms, on for 250 ms, plus one retry per not-ready read.
+    core.assert_eq(delay.elapsed_us(), 273_000u64)
+    core.assert_eq(device.chip_id(), 43439u32)
+
+    core.assert(!device.gpio_is_high(0)!)
+    core.assert(device.gpio_is_high(2)!)
+    device.set_gpio(0, true)!
+    core.assert(device.gpio_is_high(0)!)
+    device.set_gpio(0, false)!
+    core.assert(!device.gpio_is_high(0)!)
+    device.set_gpio(1, true)!
+    core.assert(device.gpio_is_high(1)!)
+    core.assert(!device.gpio_is_high(0)!)
+    device.set_gpio(0, true)!
+    core.assert(device.gpio_is_high(0)! && device.gpio_is_high(1)!)
+
+    match device.set_gpio(3, true) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    match device.gpio_is_high(cyw43.GPIO_COUNT) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+
+    // A second init power-cycles the chip, which forgets its pin setup, so
+    // the next set_gpio connects the pin again.
+    device.init(&mut delay)!
+    core.assert(!device.gpio_is_high(0)!)
+    device.set_gpio(0, true)!
+    core.assert(device.gpio_is_high(0)!)
+    device.power_off()
+}
+
+fn a_silent_chip_times_out() {
+    chip := Chip.new(cyw43.CHIP_ID)
+    chip.alive = false
+    device := cyw43.Device.new(chip, fake.Pin.new())
+    delay := fake.Delay.new()
+    match device.init(&mut delay) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    // 270 ms of power-up, then 500 attempts 1 ms apart.
+    core.assert_eq(delay.elapsed_us(), 770_000u64)
+}
+
+fn another_chip_is_unsupported() {
+    device := cyw43.Device.new(Chip.new(0x4345), fake.Pin.new())
+    delay := fake.Delay.new()
+    match device.init(&mut delay) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Unsupported)
+        }
+    }
+}
+
+fn main() {
+    spi_framing()
+    command_words()
+    brings_up_the_chip_and_drives_its_gpios()
+    a_silent_chip_times_out()
+    another_chip_is_unsupported()
+}

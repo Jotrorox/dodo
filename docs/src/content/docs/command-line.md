@@ -341,7 +341,7 @@ arguments depend on the selected toolchain.
 | `-O LEVEL`, `--opt-level LEVEL` | `0`, `1`, `2`, or `3`; default `0`. Runtime checks remain active. |
 | `-g`, `--debug` | Include source-level DWARF debug information; `--no-debug` disables it. |
 | `--target TRIPLE` | Select the compilation target; default compiler host. |
-| `--board NAME` | Firmware board (`pico`, `pico2`): its chip's target, CPU, panic hook, linker, startup code, and flashable image, and the package `std/embedded/board` resolves to. `run` flashes the board. |
+| `--board NAME` | Firmware board (`pico`, `pico2`, `pico2_w`): its chip's target, CPU, panic hook, linker, startup code, and flashable image, and the package `std/embedded/board` resolves to. `run` flashes the board. |
 | `--chip NAME` | Firmware chip for a custom board (`rp2040`, `rp2350`); implied by `--board`. `std/embedded/chip` resolves to its package. |
 | `--cpu NAME` | Select target CPU features; default `generic`. |
 | `--features LIST` | Explicit LLVM target features, for example `+sse4.2`. |

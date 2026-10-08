@@ -36,7 +36,7 @@ Start with these frequently used packages:
 | Parse or encode JSON | [std/encoding/json](api/std/encoding/json.md) | [JSON](json.md) |
 | Read and write files | [std/fs](api/std/fs.md) | [Filesystem](filesystem.md) |
 | Serve an HTTP application | [std/web/app](api/std/web/app.md) | [Web](web.md) |
-| Program a microcontroller board | [std/embedded/hal](api/std/embedded/hal.md), [std/embedded/board/pico](api/std/embedded/board/pico.md), [std/embedded/chip/rp2040](api/std/embedded/chip/rp2040.md), [std/embedded/board/pico2](api/std/embedded/board/pico2.md), [std/embedded/chip/rp2350](api/std/embedded/chip/rp2350.md) | [Hardware](hardware.md#boards); `std/embedded/board` and `std/embedded/chip` name the build's board and chip |
+| Program a microcontroller board | [std/embedded/hal](api/std/embedded/hal.md), [std/embedded/board/pico](api/std/embedded/board/pico.md), [std/embedded/chip/rp2040](api/std/embedded/chip/rp2040.md), [std/embedded/board/pico2](api/std/embedded/board/pico2.md), [std/embedded/chip/rp2350](api/std/embedded/chip/rp2350.md), [std/embedded/board/pico2_w](api/std/embedded/board/pico2_w.md), [std/embedded/cyw43](api/std/embedded/cyw43.md) | [Hardware](hardware.md#boards); `std/embedded/board` and `std/embedded/chip` name the build's board and chip |
 
 ## Read a signature
 

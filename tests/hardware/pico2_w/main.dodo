@@ -1,14 +1,17 @@
 package main
 
+import "core/ptr"
 import "std/embedded/board"
 import "std/embedded/chip"
 import "std/embedded/hal"
 
-// Hardware self-test for the `pico2` board: the RP2350 startup runtime,
+// Hardware self-test for the `pico2_w` board: the RP2350 startup runtime,
 // std/embedded/chip/rp2350 (clocks, timer, single ownership, configuration
-// checks), std/embedded/board/pico2, and the runtime's integer helpers. Every
-// outcome ends in the USB bootloader with a record that
-// `scripts/test_pico.py --board pico2` reads over USB with picotool. The
+// checks), std/embedded/board/pico2_w with the CYW43439 driver in
+// std/embedded/cyw43 (gSPI bus bring-up, the LED and USB-power GPIOs of the
+// wireless chip), and the runtime's integer helpers. Every outcome ends in
+// the USB bootloader with a record that
+// `scripts/test_pico.py --board pico2_w` reads over USB with picotool. The
 // RP2350 boot ROM clears SRAM when it starts, so the record is staged at
 // RECORD in SRAM and written to the last flash sector before rebooting.
 // Words of the record:
@@ -18,12 +21,14 @@ import "std/embedded/hal"
 //       0x5747_00nn  hung or faulted after check nn (watchdog reset)
 //   [2] clk_sys in kHz  [3] a 10 ms delay in timer us  [4] its SysTick cycles
 //   [5] failed-check bits for checks 32 to 63
+//   [6] microseconds for 100 LED toggles over gSPI
+//   [8] to [23] after a panic: the end of the file's path, NUL-terminated
 //
 // A copy of [0] and [1] in watchdog SCRATCH0/1 survives the watchdog reset
 // that reports a hang. (The boot ROM's reboot uses SCRATCH2 to 7.)
 
 const RECORD: usize = 0x2007_F000
-// The last 4 KiB sector of the Pico 2's flash, by its execute-in-place
+// The last 4 KiB sector of the Pico 2 W's flash, by its execute-in-place
 // address. (Without a partition table, flash_op refuses storage offsets.)
 const FLASH_RECORD: u32 = 0x103F_F000
 // Boot ROM flash_op ('F' | 'O' << 8): erase or program, secure, at a
@@ -34,6 +39,8 @@ const FLASH_PROGRAM: u32 = 0x1_0101
 const WATCHDOG: usize = 0x400D_8000
 const SCRATCH: usize = WATCHDOG + 0x0C
 const RUNNING: u32 = 0x5747_0000
+const FILE_OFFSET: usize = 32
+const FILE_BYTES: usize = 64
 static mut CHECKS: u32 = 0
 // Failed-check bits: checks 0 to 31, then 32 to 63.
 static mut FAILURES: u32 = 0
@@ -83,9 +90,29 @@ fn check(ok: bool) {
     }
 }
 
-// Replaces the board runtime's default panic hook.
+// Replaces the board runtime's default panic hook. Panics in the standard
+// library report their own file, so the end of its path goes in the record
+// too.
 extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
     record(0xDEAD_0000 | (line & 0xFFFF), column)
+    unsafe {
+        length := 0usize
+        for ptr.read(ptr.offset(file, length as isize)) != 0 && length < 1024 {
+            length += 1
+        }
+        start := 0usize
+        if length > FILE_BYTES - 1 {
+            start = length - (FILE_BYTES - 1)
+        }
+        for index in 0..FILE_BYTES {
+            byte: hal.Reg<u8> = hal.Reg.at(RECORD + FILE_OFFSET + index)
+            if start + index < length {
+                byte.write(ptr.read(ptr.offset(file, (start + index) as isize)))
+            } else {
+                byte.write(0)
+            }
+        }
+    }
     report()
 }
 
@@ -137,7 +164,6 @@ fn main() {
         control: hal.Reg<u32> = hal.Reg.at(WATCHDOG)
         control.write(1 << 30)
     }
-    b.led.set_high()
 
     // A second take must be refused.
     match board.take() {
@@ -179,6 +205,33 @@ fn main() {
         store(RECORD + 16, cycles)
         check(delta >= 10_000 && delta < 10_200)
     }
+
+    // The LED is the wireless chip's GPIO 0: the level it drives reads back
+    // through the chip's GPIO input register, so each check is a full gSPI
+    // round trip. take() turned it off.
+    check(!b.led.is_high() && !b.led.read_back())
+    b.led.set_high()
+    check(b.led.is_high() && b.led.read_back())
+    b.led.toggle()
+    check(!b.led.is_high() && !b.led.read_back())
+    // The wireless chip senses USB power on its GPIO 2.
+    check(b.led.usb_powered())
+    before := b.timer.now_us()
+    for _ in 0..100 {
+        b.led.toggle()
+    }
+    store(RECORD + 24, (b.timer.now_us() - before) as u32)
+    check(!b.led.is_high() && !b.led.read_back())
+    // The wireless chip's pins belong to the LED.
+    match b.pins.output(board.WL_SELECT_PIN) {
+        ok(_) => {
+            check(false)
+        }
+        err(error) => {
+            check(error == hal.Error.Busy)
+        }
+    }
+    b.led.set_high()
 
     // Runtime helpers: zero at run time, unknown to the optimizer.
     z := b.timer.now_us() >> 63
@@ -248,7 +301,7 @@ fn main() {
     b.timer.delay_ms(10)
     elapsed := b.timer.now_us() - start
     check(elapsed >= 10_000 && elapsed < 10_100)
-    check(board.NAME.len == 19)
+    check(board.NAME.len == 21)
 
     unsafe {
         control: hal.Reg<u32> = hal.Reg.at(WATCHDOG)

@@ -51,9 +51,21 @@
   `std/embedded/board/pico2` follows the board contract, so `examples/blink`
   builds unchanged with `--board pico2`. The memory and integer helpers are
   now shared by both Arm chip runtimes.
+- Add the Raspberry Pi Pico 2 W: `board = "pico2_w"` on the `rp2350` chip.
+  Its LED hangs off the CYW43439 wireless chip, so the new
+  `std/embedded/cyw43` driver powers the chip up, bit-bangs its half-duplex
+  gSPI bus, starts its backplane clock, and drives its GPIO pins through
+  ChipCommon and the GCI pin multiplexer, without loading wireless firmware.
+  `std/embedded/board/pico2_w` follows the board contract, so
+  `examples/blink` builds unchanged; its LED also reads back the pin level
+  and senses USB power. RP2040 and RP2350 pins gain `set_as_output` and
+  `set_as_input` for lines that change direction. Wi-Fi and Bluetooth are
+  not supported yet.
 - Add the `examples/blink` project and a hardware self-test,
   `scripts/test_pico.py`, that checks startup, clocks, timing, ownership, and
-  the runtime helpers on a connected Pico (`--board pico2` for a Pico 2).
+  the runtime helpers on a connected Pico (`--board pico2` for a Pico 2,
+  `--board pico2_w` for a Pico 2 W, which also checks the wireless chip's
+  LED and USB-power GPIOs).
 - Add `std/embedded/hal`, a portable hardware abstraction layer: typed volatile
   registers (`hal.Reg<T>`) with mask-constant fields, interrupt-masking
   `hal.Critical` sections, one shared `hal.Error`, statically checked pin,
