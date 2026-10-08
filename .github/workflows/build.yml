@@ -13,6 +13,10 @@ on:
         description: Days to keep uploaded artifacts
         type: number
         default: 7
+      cache:
+        description: Restore and save dependency caches; false downloads and builds everything
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -32,7 +36,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
-          cache: npm
+          cache: ${{ inputs.cache && 'npm' || '' }}
           cache-dependency-path: editor-support/dodo-vscode/package-lock.json
       - run: npm ci
       - run: npm test
@@ -89,6 +93,7 @@ jobs:
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
           echo "LLVM_SYS_231_PREFIX=$RUNNER_TEMP/llvm-linux" >> "$GITHUB_ENV"
       - name: Restore official LLVM 23 without Z3
+        if: inputs.cache
         id: linux-llvm-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -110,12 +115,13 @@ jobs:
             exit 1
           fi
       - name: Save official LLVM 23
-        if: steps.linux-llvm-cache.outputs.cache-hit != 'true'
+        if: inputs.cache && steps.linux-llvm-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.LLVM_SYS_231_PREFIX }}
           key: ${{ steps.linux-llvm-cache.outputs.cache-primary-key }}
       - name: Restore OpenSSL for TLS fixtures
+        if: inputs.cache
         id: openssl-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -149,12 +155,13 @@ jobs:
           echo "$test_tls_prefix/bin" >> "$GITHUB_PATH"
       # Save native dependencies before later tests can fail or cancel the job.
       - name: Save OpenSSL for TLS fixtures
-        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        if: inputs.cache && steps.openssl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/dodo-openssl
           key: ${{ steps.openssl-cache.outputs.cache-primary-key }}
       - name: Cache Rust dependencies and build artifacts
+        if: inputs.cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.os }}-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/build.yml', 'scripts/build-release.sh', 'scripts/link-static.sh', 'scripts/install-llvm.py') }}
@@ -201,7 +208,7 @@ jobs:
         if: runner.arch == 'X64'
         with:
           node-version: '24'
-          cache: npm
+          cache: ${{ inputs.cache && 'npm' || '' }}
           cache-dependency-path: editor-support/dodo-vscode/package-lock.json
       - name: Test VS Code against the built compiler
         if: runner.arch == 'X64'
@@ -279,7 +286,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1
-          components: clippy
+          components: rustfmt, clippy
       - name: Install native build prerequisites
         id: llvm
         shell: bash
@@ -301,6 +308,7 @@ jobs:
           echo "$openssl_prefix/bin" >> "$GITHUB_PATH"
           echo "fingerprint=$version" >> "$GITHUB_OUTPUT"
       - name: Cache Rust dependencies and build artifacts
+        if: inputs.cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: macos-15-llvm-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/build.yml', 'scripts/build-release-macos.sh') }}
@@ -360,7 +368,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1
-          components: rust-docs
+          components: rustfmt, clippy, rust-docs
           targets: x86_64-pc-windows-msvc
       - name: Configure Windows LLVM
         id: windows-toolchain
@@ -371,6 +379,7 @@ jobs:
           "$prefix/bin" >> $env:GITHUB_PATH
           "image=$env:ImageVersion" >> $env:GITHUB_OUTPUT
       - name: Restore Windows LLVM and static support libraries
+        if: inputs.cache
         id: windows-llvm-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -431,12 +440,13 @@ jobs:
             if (!(Test-Path "$env:LLVM_SYS_231_PREFIX/lib/$library")) { throw "Missing LLVM dependency: $library" }
           }
       - name: Save Windows LLVM and static support libraries
-        if: steps.windows-llvm-cache.outputs.cache-hit != 'true'
+        if: inputs.cache && steps.windows-llvm-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/llvm-windows
           key: ${{ steps.windows-llvm-cache.outputs.cache-primary-key }}
       - name: Cache Rust dependencies and build artifacts
+        if: inputs.cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ steps.windows-llvm-cache.outputs.cache-primary-key }}

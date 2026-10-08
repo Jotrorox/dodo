@@ -53,7 +53,9 @@ cargo +nightly fuzz run compiler_safety -- -max_len=128 -max_total_time=60
 
 The fuzz package disables the compiler's LLVM feature and has its own lockfile.
 Its seed corpus is tracked; generated crash artifacts, coverage, and builds are
-ignored. libFuzzer minimizes failures with:
+ignored. The nightly `fuzz.yml` workflow fuzzes for 30 minutes, keeps the
+minimized generated corpus in the Actions cache, and uploads crash artifacts
+when it fails. libFuzzer minimizes failures with:
 
 ```sh
 cargo +nightly fuzz tmin compiler_safety fuzz/artifacts/compiler_safety/crash-<hash>
