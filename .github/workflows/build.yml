@@ -46,8 +46,246 @@ jobs:
           if-no-files-found: error
           retention-days: ${{ inputs.retention-days }}
 
-  compiler:
-    name: Rust and LLVM 23 / ${{ matrix.name }}
+  # The Linux compiler is built once per architecture and fanned out to
+  # parallel test jobs; checks and the release build need their own toolchain.
+  linux-checks:
+    name: Linux checks / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 x86-64
+            os: ubuntu-24.04
+          - name: Ubuntu 24.04 AArch64
+            os: ubuntu-24.04-arm
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/linux-toolchain
+        with:
+          rust-cache: checks
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Test ELF dependency checks
+        run: python3 scripts/test_check_linkage.py
+      - name: Test static release prerequisites
+        run: python3 scripts/test_build_release.py
+      - name: Test release tag checks
+        run: python3 scripts/test_check_release.py
+      - name: Verify generated mathematical constants
+        run: python3 scripts/generate_math_constants.py --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  linux-debug-build:
+    name: Linux debug compiler / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 x86-64
+            os: ubuntu-24.04
+            arch: x86_64
+          - name: Ubuntu 24.04 AArch64
+            os: ubuntu-24.04-arm
+            arch: aarch64
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/linux-toolchain
+        with:
+          rust-cache: debug-build
+      - name: Build the debug compiler
+        run: cargo build --locked --bin dodo
+      - name: Verify default builds embed LLVM
+        run: python3 scripts/check-linkage.py target/debug/dodo
+      - name: Upload the debug compiler for the test jobs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: debug-dodo-${{ matrix.arch }}
+          path: target/debug/dodo
+          if-no-files-found: error
+          retention-days: 1
+
+  linux-cargo-test:
+    name: Cargo tests / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 x86-64
+            os: ubuntu-24.04
+            arch: x86_64
+          - name: Ubuntu 24.04 AArch64
+            os: ubuntu-24.04-arm
+            arch: aarch64
+    env:
+      CARGO_TERM_COLOR: always
+      DODO_REQUIRE_DEBUGGER_TESTS: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/linux-toolchain
+        with:
+          packages: gdb
+          rust-cache: cargo-test
+      - name: Test compiler, native output, runtime checks, and debugger sessions
+        shell: bash
+        env:
+          # Failing tests leave their scratch directories here for diagnostics.
+          TMPDIR: ${{ runner.temp }}/dodo-tmp
+        run: |
+          mkdir -p "$TMPDIR" "$RUNNER_TEMP/dodo-logs"
+          ulimit -c 0
+          cargo test --locked --all-targets 2>&1 | tee "$RUNNER_TEMP/dodo-logs/cargo-test.log"
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-cargo-test-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/dodo-logs/
+            ${{ runner.temp }}/dodo-tmp/**/*.ll
+          if-no-files-found: ignore
+          retention-days: 7
+
+  linux-dodo-test:
+    name: Native Dodo tests / ${{ matrix.name }}
+    needs: linux-debug-build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 x86-64
+            os: ubuntu-24.04
+            arch: x86_64
+          - name: Ubuntu 24.04 AArch64
+            os: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # The debug compiler embeds LLVM; the tests only need a C toolchain and OpenSSL.
+      - uses: ./.github/actions/linux-toolchain
+        with:
+          llvm: 'false'
+          rust: 'false'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debug-dodo-${{ matrix.arch }}
+          path: target/debug
+      - run: chmod +x target/debug/dodo
+      - name: Test routing benchmark correctness at O0 and O3
+        run: python3 scripts/test_bench_stdlib.py
+      - name: Run native Dodo tests and executable documentation
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/dodo-tmp
+        run: |
+          mkdir -p "$TMPDIR" "$RUNNER_TEMP/dodo-logs"
+          target/debug/dodo test 2>&1 | tee "$RUNNER_TEMP/dodo-logs/dodo-test-O0.log"
+          target/debug/dodo test -O 3 2>&1 | tee "$RUNNER_TEMP/dodo-logs/dodo-test-O3.log"
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-dodo-test-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/dodo-logs/
+            ${{ runner.temp }}/dodo-tmp/**/*.ll
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Windows cross-checks use x86-64 MinGW and Wine; run them once.
+  linux-windows-cross:
+    name: Windows cross-checks / Wine
+    needs: linux-debug-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # LLVM provides clang and lld-link for the Windows targets.
+      - uses: ./.github/actions/linux-toolchain
+        with:
+          packages: wine64 mingw-w64-x86-64-dev
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debug-dodo-x86_64
+          path: target/debug
+      - run: chmod +x target/debug/dodo
+      - name: Test Windows fixture startup ABI
+        run: python3 scripts/test_windows_startup.py
+      - name: Test native Windows fixture runner diagnostics
+        run: python3 scripts/test_windows_native_harness.py
+      - name: Test Windows LLVM library path handling
+        run: |
+          rustc --edition=2024 --test scripts/windows-llvm-config.rs -o "$RUNNER_TEMP/test-windows-llvm-config"
+          "$RUNNER_TEMP/test-windows-llvm-config"
+      - name: Execute Windows core and alloc programs in Wine
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}/dodo-tmp
+        run: |
+          mkdir -p "$TMPDIR" "$RUNNER_TEMP/dodo-logs"
+          python3 scripts/test_stdlib_windows.py 2>&1 | tee "$RUNNER_TEMP/dodo-logs/stdlib-windows.log"
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-windows-cross
+          path: |
+            ${{ runner.temp }}/dodo-logs/
+            ${{ runner.temp }}/dodo-tmp/**/*.ll
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The editor integration test is platform independent; run it once.
+  vscode-integration:
+    name: VS Code against the built compiler
+    needs: linux-debug-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: editor-support/dodo-vscode
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: editor-support/dodo-vscode/package-lock.json
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debug-dodo-x86_64
+          path: target/debug
+      - run: chmod +x ../../target/debug/dodo
+      - run: sudo apt-get install --no-install-recommends -y xvfb
+      - run: npm ci
+      - run: xvfb-run -a npm run test:integration
+
+  linux-release:
+    name: Linux release / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -64,159 +302,13 @@ jobs:
             artifact: linux-aarch64-compilers
     env:
       CARGO_TERM_COLOR: always
-      DODO_REQUIRE_DEBUGGER_TESTS: "1"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: ./.github/actions/linux-toolchain
         with:
-          toolchain: 1.98.1
-          components: rustfmt, clippy
-      - name: Install native build prerequisites
-        id: llvm
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev curl xz-utils gdb xvfb
-          # Rebuild native caches when the installed compiler or libraries change.
-          fingerprint=$({
-            cc --version
-            c++ --version
-            dpkg-query -W gcc g++ libc6-dev zlib1g-dev libzstd-dev libxml2-dev libffi-dev
-          } | sha256sum | cut -d ' ' -f 1)
-          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
-          echo "LLVM_SYS_231_PREFIX=$RUNNER_TEMP/llvm-linux" >> "$GITHUB_ENV"
-      - name: Restore official LLVM 23 without Z3
-        id: linux-llvm-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.LLVM_SYS_231_PREFIX }}
-          key: llvm-linux-${{ runner.arch }}-${{ hashFiles('scripts/install-llvm.py') }}
-      - name: Download and verify the official LLVM 23 Linux archive
-        if: steps.linux-llvm-cache.outputs.cache-hit != 'true'
-        run: python3 scripts/install-llvm.py
-      - name: Configure and verify LLVM
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "$LLVM_SYS_231_PREFIX/bin" >> "$GITHUB_PATH"
-          test "$("$LLVM_SYS_231_PREFIX/bin/llvm-config" --version)" = 23.1.1
-          libraries=$("$LLVM_SYS_231_PREFIX/bin/llvm-config" --link-static --system-libs)
-          echo "LLVM system libraries: $libraries"
-          if [[ "$libraries" == *z3* ]]; then
-            echo 'The Linux release toolchain must not require Z3.' >&2
-            exit 1
-          fi
-      - name: Save official LLVM 23
-        if: steps.linux-llvm-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.LLVM_SYS_231_PREFIX }}
-          key: ${{ steps.linux-llvm-cache.outputs.cache-primary-key }}
-      - name: Restore OpenSSL for TLS fixtures
-        id: openssl-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/dodo-openssl
-          # The workflow contains the source checksum and Configure options.
-          key: openssl-ubuntu-24.04-${{ runner.arch }}-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/build.yml') }}
-      - name: Build the maintained OpenSSL backend for TLS fixtures
-        if: steps.openssl-cache.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          test_tls_prefix="$RUNNER_TEMP/dodo-openssl"
-          test_tls_archive="$RUNNER_TEMP/openssl-3.5.8.tar.gz"
-          curl --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 --retry-max-time 600 https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz -o "$test_tls_archive"
-          printf '%s  %s\n' a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2 "$test_tls_archive" | sha256sum --check
-          tar -xzf "$test_tls_archive" -C "$RUNNER_TEMP"
-          cd "$RUNNER_TEMP/openssl-3.5.8"
-          ./Configure --prefix="$test_tls_prefix" --libdir=lib no-shared no-tests
-          make -j2
-          # install_sw omits openssl.cnf, which TLS credential generation needs.
-          make install_sw install_ssldirs
-      - name: Configure OpenSSL for TLS fixtures
-        shell: bash
-        run: |
-          set -euo pipefail
-          test_tls_prefix="$RUNNER_TEMP/dodo-openssl"
-          test -s "$test_tls_prefix/ssl/openssl.cnf"
-          "$test_tls_prefix/bin/openssl" version
-          echo "CPATH=$test_tls_prefix/include" >> "$GITHUB_ENV"
-          echo "LIBRARY_PATH=$test_tls_prefix/lib" >> "$GITHUB_ENV"
-          echo "$test_tls_prefix/bin" >> "$GITHUB_PATH"
-      # Save native dependencies before later tests can fail or cancel the job.
-      - name: Save OpenSSL for TLS fixtures
-        if: steps.openssl-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/dodo-openssl
-          key: ${{ steps.openssl-cache.outputs.cache-primary-key }}
-      - name: Cache Rust dependencies and build artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ${{ matrix.os }}-${{ steps.llvm.outputs.fingerprint }}-${{ hashFiles('.github/workflows/build.yml', 'scripts/build-release.sh', 'scripts/link-static.sh', 'scripts/install-llvm.py') }}
-          env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS CPATH LIBRARY_PATH
-          cache-bin: false
-          cache-on-failure: true
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Test ELF dependency checks
-        run: python3 scripts/test_check_linkage.py
-      - name: Test static release prerequisites
-        run: python3 scripts/test_build_release.py
-      - name: Test release tag checks
-        run: python3 scripts/test_check_release.py
-      # Windows cross-checks use x86-64 MinGW and Wine; run them once.
-      - name: Test Windows fixture startup ABI
-        if: runner.arch == 'X64'
-        run: python3 scripts/test_windows_startup.py
-      - name: Test native Windows fixture runner diagnostics
-        if: runner.arch == 'X64'
-        run: python3 scripts/test_windows_native_harness.py
-      - name: Test Windows LLVM library path handling
-        if: runner.arch == 'X64'
-        run: |
-          rustc --edition=2024 --test scripts/windows-llvm-config.rs -o "$RUNNER_TEMP/test-windows-llvm-config"
-          "$RUNNER_TEMP/test-windows-llvm-config"
-      - name: Verify generated mathematical constants
-        run: python3 scripts/generate_math_constants.py --check
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Test compiler, native output, runtime checks, and debugger sessions
-        shell: bash
-        run: |
-          ulimit -c 0
-          cargo test --locked --all-targets
-      - name: Test routing benchmark correctness at O0 and O3
-        run: python3 scripts/test_bench_stdlib.py
-      - name: Run native Dodo tests and executable documentation
-        run: |
-          target/debug/dodo test
-          target/debug/dodo test -O 3
-      # The editor integration test is platform independent; run it once.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: runner.arch == 'X64'
-        with:
-          node-version: '24'
-          cache: npm
-          cache-dependency-path: editor-support/dodo-vscode/package-lock.json
-      - name: Test VS Code against the built compiler
-        if: runner.arch == 'X64'
-        working-directory: editor-support/dodo-vscode
-        run: |
-          npm ci
-          xvfb-run -a npm run test:integration
-      - name: Install Windows standard-library test tools
-        if: runner.arch == 'X64'
-        run: sudo apt-get install --no-install-recommends -y wine64 mingw-w64-x86-64-dev
-      - name: Execute Windows core and alloc programs in Wine
-        if: runner.arch == 'X64'
-        run: python3 scripts/test_stdlib_windows.py
-      - name: Verify default builds embed LLVM
-        run: python3 scripts/check-linkage.py target/debug/dodo
+          rust-cache: release
       - name: Build self-contained release compiler
         run: bash scripts/build-release.sh
       - name: Verify release only needs standard Linux runtime libraries

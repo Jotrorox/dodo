@@ -1,0 +1,123 @@
+name: Linux build toolchain
+description: >
+  Installs the native prerequisites, the official LLVM 23 archive, and the
+  OpenSSL backend for TLS fixtures, restoring each from the cache when possible.
+
+inputs:
+  packages:
+    description: Additional apt packages to install
+    default: ''
+  llvm:
+    description: Install LLVM 23 (jobs that only run a built compiler can skip it)
+    default: 'true'
+  rust:
+    description: Install the pinned Rust toolchain
+    default: 'true'
+  rust-cache:
+    description: Cache Rust dependencies and build artifacts under this job-specific key; empty disables the cache
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      if: inputs.rust == 'true'
+      with:
+        toolchain: 1.98.1
+        components: rustfmt, clippy
+    - name: Install native build prerequisites
+      id: native
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        # shellcheck disable=SC2086 # PACKAGES is a space-separated list.
+        sudo apt-get install --no-install-recommends -y build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev curl xz-utils $PACKAGES
+        # Rebuild native caches when the installed compiler or libraries change.
+        fingerprint=$({
+          cc --version
+          c++ --version
+          dpkg-query -W gcc g++ libc6-dev zlib1g-dev libzstd-dev libxml2-dev libffi-dev
+        } | sha256sum | cut -d ' ' -f 1)
+        echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+        echo "LLVM_SYS_231_PREFIX=$RUNNER_TEMP/llvm-linux" >> "$GITHUB_ENV"
+    - name: Restore official LLVM 23 without Z3
+      id: llvm-cache
+      if: inputs.llvm == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/llvm-linux
+        key: llvm-linux-${{ runner.arch }}-${{ hashFiles('scripts/install-llvm.py') }}
+    - name: Download and verify the official LLVM 23 Linux archive
+      if: inputs.llvm == 'true' && steps.llvm-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: python3 scripts/install-llvm.py
+    - name: Configure and verify LLVM
+      if: inputs.llvm == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "$LLVM_SYS_231_PREFIX/bin" >> "$GITHUB_PATH"
+        test "$("$LLVM_SYS_231_PREFIX/bin/llvm-config" --version)" = 23.1.1
+        libraries=$("$LLVM_SYS_231_PREFIX/bin/llvm-config" --link-static --system-libs)
+        echo "LLVM system libraries: $libraries"
+        if [[ "$libraries" == *z3* ]]; then
+          echo 'The Linux release toolchain must not require Z3.' >&2
+          exit 1
+        fi
+    # Parallel jobs may race to save a cold cache; the losers only warn.
+    - name: Save official LLVM 23
+      if: inputs.llvm == 'true' && steps.llvm-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/llvm-linux
+        key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+    - name: Restore OpenSSL for TLS fixtures
+      id: openssl-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/dodo-openssl
+        # This action contains the source checksum and Configure options.
+        key: openssl-ubuntu-24.04-${{ runner.arch }}-${{ steps.native.outputs.fingerprint }}-${{ hashFiles('.github/actions/linux-toolchain/action.yml') }}
+    - name: Build the maintained OpenSSL backend for TLS fixtures
+      if: steps.openssl-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        test_tls_prefix="$RUNNER_TEMP/dodo-openssl"
+        test_tls_archive="$RUNNER_TEMP/openssl-3.5.8.tar.gz"
+        curl --fail --silent --show-error --location --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 --retry-max-time 600 https://github.com/openssl/openssl/releases/download/openssl-3.5.8/openssl-3.5.8.tar.gz -o "$test_tls_archive"
+        printf '%s  %s\n' a8f84a39918ec6415ce765d9b429d313ba97b8143169c172e734b9514464f5b2 "$test_tls_archive" | sha256sum --check
+        tar -xzf "$test_tls_archive" -C "$RUNNER_TEMP"
+        cd "$RUNNER_TEMP/openssl-3.5.8"
+        ./Configure --prefix="$test_tls_prefix" --libdir=lib no-shared no-tests
+        make -j"$(nproc)"
+        # install_sw omits openssl.cnf, which TLS credential generation needs.
+        make install_sw install_ssldirs
+    - name: Configure OpenSSL for TLS fixtures
+      shell: bash
+      run: |
+        set -euo pipefail
+        test_tls_prefix="$RUNNER_TEMP/dodo-openssl"
+        test -s "$test_tls_prefix/ssl/openssl.cnf"
+        "$test_tls_prefix/bin/openssl" version
+        echo "CPATH=$test_tls_prefix/include" >> "$GITHUB_ENV"
+        echo "LIBRARY_PATH=$test_tls_prefix/lib" >> "$GITHUB_ENV"
+        echo "$test_tls_prefix/bin" >> "$GITHUB_PATH"
+    # Save native dependencies before later tests can fail or cancel the job.
+    - name: Save OpenSSL for TLS fixtures
+      if: steps.openssl-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/dodo-openssl
+        key: ${{ steps.openssl-cache.outputs.cache-primary-key }}
+    - name: Cache Rust dependencies and build artifacts
+      if: inputs.rust-cache != ''
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: ${{ inputs.rust-cache }}-${{ runner.arch }}-${{ steps.native.outputs.fingerprint }}-${{ hashFiles('.github/actions/linux-toolchain/action.yml', 'scripts/build-release.sh', 'scripts/link-static.sh', 'scripts/install-llvm.py') }}
+        env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS CPATH LIBRARY_PATH
+        cache-bin: false
+        cache-on-failure: true
