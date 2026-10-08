@@ -685,28 +685,11 @@ fn link_firmware(
         )
     })?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let floating = [
-            "__aeabi_f",
-            "__aeabi_d",
-            "sf3",
-            "df3",
-            "sf2",
-            "df2",
-            "sfdi",
-            "dfdi",
-        ];
-        let hint = if stderr.lines().any(|line| {
-            line.contains("undefined symbol") && floating.iter().any(|name| line.contains(name))
-        }) {
-            "\nnote: floating-point arithmetic is not supported in firmware yet"
-        } else {
-            ""
-        };
         return Err(format!(
-            "linker failed ({}):\n{}{stderr}{hint}",
+            "linker failed ({}):\n{}{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         ));
     }
     let mut elf = fs::read(out).map_err(|e| format!("cannot read {}: {e}", out.display()))?;

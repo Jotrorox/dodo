@@ -26,14 +26,41 @@ pub fn compile_ir_object(options: &Options, name: &str, text: &str, path: &Path)
     module.set_triple(&machine.get_triple());
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.verify()?;
-    // One ELF section per function, so the linker drops unused helpers.
+    function_sections(&module);
+    machine.write_to_file(&module, FileType::Object, path)
+}
+
+/// One section per defined function, so the linker can drop unused ones.
+fn function_sections(module: &Module<'_>) {
+    let triple = TargetMachine::normalize_triple(&module.get_triple());
+    let triple = triple.as_str().to_string_lossy();
+    // Mach-O and Wasm already allow dead stripping individual functions.
+    // Their section naming rules (and XCOFF's csects) differ from ELF/COFF.
+    if triple.starts_with("wasm")
+        || triple.split('-').any(|part| {
+            ["darwin", "macos", "ios", "tvos", "watchos", "xros", "aix"]
+                .iter()
+                .any(|os| part.starts_with(os))
+                || part == "macho"
+        })
+    {
+        return;
+    }
+    let coff = triple.contains("windows") || triple.contains("uefi") || triple.ends_with("-coff");
+    let prefix = if coff { ".text$" } else { ".text." };
+    // Assign after optimization so generated helpers get their own sections
+    // as well, and an unused exported API can be discarded by the linker.
     for function in module.functions() {
         if function.count_basic_blocks() != 0 {
             let name = function.get_name().to_string_lossy();
-            function.set_section(Some(&format!(".text.{name}")));
+            function.set_section(Some(&format!("{prefix}{name}")));
+            if coff {
+                // COFF dead stripping requires COMDAT sections. NoDuplicates
+                // preserves the duplicate-definition error for strong exports.
+                module.set_noduplicate_comdat(function, &name);
+            }
         }
     }
-    machine.write_to_file(&module, FileType::Object, path)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -189,7 +216,7 @@ pub fn generate<'ctx>(
             triple.as_str().to_string_lossy()
         )));
     }
-    cg.function_sections();
+    function_sections(&cg.module);
     cg.module
         .verify()
         .map_err(|e| error(format!("optimized LLVM verification failed: {e}")))?;
@@ -521,38 +548,6 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 function.add_attribute(AttributeLoc::Function, nounwind);
                 if let Some(uwtable) = uwtable.filter(|_| function.count_basic_blocks() != 0) {
                     function.add_attribute(AttributeLoc::Function, uwtable);
-                }
-            }
-        }
-    }
-    fn function_sections(&self) {
-        let triple = TargetMachine::normalize_triple(&self.module.get_triple());
-        let triple = triple.as_str().to_string_lossy();
-        // Mach-O and Wasm already allow dead stripping individual functions.
-        // Their section naming rules (and XCOFF's csects) differ from ELF/COFF.
-        if triple.starts_with("wasm")
-            || triple.split('-').any(|part| {
-                ["darwin", "macos", "ios", "tvos", "watchos", "xros", "aix"]
-                    .iter()
-                    .any(|os| part.starts_with(os))
-                    || part == "macho"
-            })
-        {
-            return;
-        }
-        let coff =
-            triple.contains("windows") || triple.contains("uefi") || triple.ends_with("-coff");
-        let prefix = if coff { ".text$" } else { ".text." };
-        // Assign after optimization so generated helpers get their own sections
-        // as well, and an unused exported API can be discarded by the linker.
-        for function in self.module.functions() {
-            if function.count_basic_blocks() != 0 {
-                let name = function.get_name().to_string_lossy();
-                function.set_section(Some(&format!("{prefix}{name}")));
-                if coff {
-                    // COFF dead stripping requires COMDAT sections. NoDuplicates
-                    // preserves the duplicate-definition error for strong exports.
-                    self.module.set_noduplicate_comdat(function, &name);
                 }
             }
         }

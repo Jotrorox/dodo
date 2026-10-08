@@ -32,8 +32,7 @@
   itself (boot stage 2, vector table, reset handler, memory and integer
   helpers), a linker script, and `ld.lld`. Builds write a flashable `.uf2`
   next to the `.elf`, and `dodo run` copies it to a board in BOOTSEL mode.
-  `chip = "rp2040"` (or `--chip`) builds for a custom board. Floating point
-  does not link in firmware yet.
+  `chip = "rp2040"` (or `--chip`) builds for a custom board.
 - Add `import "std/embedded/board"` and `import "std/embedded/chip"`, which resolve to the
   packages of the build's board and chip, so firmware is not tied to one
   board. Every board package provides `take()`, an LED, GPIO pins, a timer,
@@ -62,6 +61,14 @@
   and senses USB power. RP2040 and RP2350 pins gain `set_as_output` and
   `set_as_input` for lines that change direction. Wi-Fi and Bluetooth are
   not supported yet.
+- Floating point works in firmware. The shared Arm runtime gains IEEE 754
+  `f32` and `f64` addition, subtraction, multiplication, division, `%`,
+  comparisons, and conversions to and from integers and between the two
+  widths, correctly rounded to nearest with subnormals, under their GNU and
+  Arm EABI names. The RP2040 uses all of them; the RP2350's single-precision
+  FPU uses the `f64` ones and the conversions. A host test checks every helper
+  against hardware floating point on 1.5 million operands, and the board
+  self-tests check them on the chips.
 - Add the `examples/blink` project and a hardware self-test,
   `scripts/test_pico.py`, that checks startup, clocks, timing, ownership, and
   the runtime helpers on a connected Pico (`--board pico2` for a Pico 2,

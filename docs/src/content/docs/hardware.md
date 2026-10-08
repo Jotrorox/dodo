@@ -467,7 +467,7 @@ compiler adds what a desktop operating system would otherwise provide:
 | Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `extern "C"` function of the same name replaces. |
 | Reset handler | Copies initialized statics to RAM, zeroes the rest, and calls `main`. If `main` returns, the core sleeps. |
 | Panic hook | `dodo_board_panic` masks interrupts and halts. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
-| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, and the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware. |
+| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware, and software `f32` and `f64` arithmetic, comparisons, conversions, and `%`, since it has no floating-point unit. Results are correctly rounded IEEE 754, to nearest with ties to even, subnormals included. |
 | Linker script | Flash at `0x10000000` (size from the board), 264 KiB of RAM, and the stack at the top of RAM. |
 
 `std/embedded/chip/rp2040` is the chip support. `rp2040.take(config)` starts the
@@ -491,7 +491,7 @@ RP2040's:
 | Vector table | At the start of flash, where the boot ROM enters Arm images. Weak defaults for the Cortex-M33 exceptions (including `SecureFault_Handler`) and all 52 interrupts. |
 | Image definition | The `IMAGE_DEF` block, in the first 4 KiB of flash, that marks the image as a secure Arm RP2350 executable. The boot ROM runs nothing without it. |
 | Reset handler | Clears the stack limit, installs the vector table, enables the FPU, initializes RAM, and calls `main`. |
-| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. |
+| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. Its FPU does single precision only: `f32` arithmetic runs in hardware, and `f64`, `f32` `%`, and conversions between `f32` and `f64` or 64-bit integers use the software helpers. |
 | Linker script | Flash at `0x10000000` (size from the board), 520 KiB of RAM, and the stack at the top of RAM. |
 
 `std/embedded/chip/rp2350` mirrors the RP2040 package: `rp2350.take(config)`
@@ -610,10 +610,11 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   PWM, and USB are not bundled yet. Write them with `hal.Reg` as above. The
   Pico 2 W's wireless chip drives only its LED and senses USB power; Wi-Fi
   and Bluetooth need its firmware, which is not loaded yet.
-- Floating-point arithmetic does not link in firmware yet: the Cortex-M0+ has
-  no floating-point unit and the runtime has no software implementation. The
-  linker error says so. The RP2350's Cortex-M33 FPU is enabled at startup,
-  but `f64` and conversions still need the missing helpers.
+- The software floating-point helpers are written for correctness, not speed:
+  division, for example, computes one quotient bit per step, and `f32`
+  arithmetic on the Cortex-M0+ goes through `f64`. They raise no
+  floating-point exception flags and return the default quiet NaN for every
+  NaN result.
 - Only core 0 runs; core 1 stays in the boot ROM. The RP2350's RISC-V cores
   are not supported.
 - `std/sync/atomic` currently supports x86-64 and AArch64 only. On
