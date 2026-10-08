@@ -1,0 +1,114 @@
+name: Benchmarks
+
+# Records bench_stdlib.py timings on main and flags regressions. History lives
+# on the benchmark-data branch, created on the first run.
+on:
+  schedule:
+    - cron: '43 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stdlib:
+    name: Standard library / Ubuntu 24.04 x86-64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      # Push results to benchmark-data and comment on regressing commits.
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      DATA_BRANCH: benchmark-data
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - name: Install native build prerequisites
+        id: llvm
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential zlib1g-dev libzstd-dev libxml2-dev libffi-dev curl xz-utils
+          fingerprint=$({
+            cc --version
+            dpkg-query -W gcc libc6-dev zlib1g-dev libzstd-dev libxml2-dev libffi-dev
+          } | sha256sum | cut -d ' ' -f 1)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "LLVM_SYS_231_PREFIX=$RUNNER_TEMP/llvm-linux" >> "$GITHUB_ENV"
+      # Shares the build workflow's cache entry.
+      - name: Restore official LLVM 23
+        id: linux-llvm-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LLVM_SYS_231_PREFIX }}
+          key: llvm-linux-${{ runner.arch }}-${{ hashFiles('scripts/install-llvm.py') }}
+      - name: Download and verify the official LLVM 23 Linux archive
+        if: steps.linux-llvm-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/install-llvm.py
+      - name: Configure LLVM
+        run: echo "$LLVM_SYS_231_PREFIX/bin" >> "$GITHUB_PATH"
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: bench-${{ steps.llvm.outputs.fingerprint }}
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS
+          cache-bin: false
+      - name: Build the release compiler
+        run: cargo build --locked --release --bin dodo
+      - name: Run the standard library benchmarks
+        run: |
+          python3 scripts/bench_stdlib.py --compiler target/release/dodo --optimization 3 \
+            --report benchmark-data/stdlib.json
+          python3 scripts/bench_to_github.py benchmark-data/stdlib.json benchmark-data/github.json
+      - name: Upload the full report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stdlib-benchmarks
+          path: benchmark-data/
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: Create the benchmark data branch
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$remote" "$DATA_BRANCH" > /dev/null; then
+            exit 0
+          fi
+          scratch="$RUNNER_TEMP/benchmark-data-init"
+          git init --quiet --initial-branch "$DATA_BRANCH" "$scratch"
+          cd "$scratch"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit --quiet --allow-empty -m 'Start benchmark history'
+          git push "$remote" "$DATA_BRANCH"
+      - name: Record results and check for regressions
+        if: github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
+        with:
+          name: Standard library (Ubuntu 24.04 x86-64, -O3)
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-data/github.json
+          github-token: ${{ github.token }}
+          gh-pages-branch: ${{ env.DATA_BRANCH }}
+          benchmark-data-dir-path: stdlib
+          auto-push: true
+          # Shared runners vary between hosts; only flag large slowdowns.
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: true
+          summary-always: true
+          max-items-in-chart: 200
