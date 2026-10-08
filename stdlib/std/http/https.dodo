@@ -151,7 +151,17 @@ pub struct Connector {
         transport.handshake(clock, cancel, until)?
         match hosted.exchange(&mut transport, request, body, workspace, config, head, sink, clock, cancel, until, delivered) {
             ok(response) => {
-                transport.finish(clock, cancel, until)?
+                // HTTP framing already completed the response. A server that
+                // closes right after responding can reset our close_notify.
+                match transport.finish(clock, cancel, until) {
+                    ok() => {}
+                    err(reason) => {
+                        closed := reason.security.kind == tls.ErrorKind.Transport || reason.security.kind == tls.ErrorKind.Closed
+                        if reason.kind != hosting.ErrorKind.Tls || !closed {
+                            return err(reason)
+                        }
+                    }
+                }
                 return ok(response)
             }
             err(reason) => {

@@ -91,6 +91,10 @@
   binaries no longer carry a symbol table, the Windows ZIP uses maximum
   compression, and the Linux archives include only the shared license texts
   its notices reference.
+- Fix the HTTPS client failing an already complete response when the server
+  closes right after responding: a reset while sending the client's
+  `close_notify` is now ignored. This made the hosted HTTPS integration test
+  flaky on macOS.
 
 ## 0.1.4 — 2026-09-20
 
