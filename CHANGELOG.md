@@ -53,9 +53,10 @@
   now shared by both Arm chip runtimes.
 - Add the Raspberry Pi Pico 2 W: `board = "pico2_w"` on the `rp2350` chip.
   Its LED hangs off the CYW43439 wireless chip, so the new
-  `std/embedded/cyw43` driver powers the chip up, bit-bangs its half-duplex
-  gSPI bus, starts its backplane clock, and drives its GPIO pins through
-  ChipCommon and the GCI pin multiplexer, without loading wireless firmware.
+  `std/embedded/wireless/cyw43` driver powers the chip up, bit-bangs its
+  half-duplex gSPI bus, starts its backplane clock, and drives its GPIO pins
+  through ChipCommon and the GCI pin multiplexer, without loading wireless
+  firmware.
   `std/embedded/board/pico2_w` follows the board contract, so
   `examples/blink` builds unchanged; its LED also reads back the pin level
   and senses USB power. RP2040 and RP2350 pins gain `set_as_output` and

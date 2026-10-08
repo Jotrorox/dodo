@@ -18,7 +18,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, and buses that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
-| Wireless chip | `std/embedded/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
+| Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
 | Raw access | `core/mmio`, `core/cpu` | Volatile loads/stores, barriers, interrupt masking, `wfi`. |
 
 Four kinds of code meet here:
@@ -522,12 +522,13 @@ blink program works unchanged with `board = "pico2_w"`:
 | `b.pins` | GP23 (wireless power), GP24 (gSPI data), GP25 (gSPI chip select), and GP29 (gSPI clock) belong to the wireless chip and return `Busy`. GP0 to GP22 and GP26 to GP28 are on the header. |
 | `board.reboot_to_bootloader()` | As on the Pico 2, but without an activity LED: GP25 is the wireless chip's select line. |
 
-`std/embedded/cyw43` is the driver. It is portable: `cyw43.Spi` bit-bangs the
-chip's half-duplex gSPI bus on any three pins, using `set_as_output` and
-`set_as_input` on the data pin to turn the line around, and `cyw43.Device`
-speaks the chip protocol over any bus with the same methods. `Device.init`
-checks the bus test patterns and the chip ID, starts the chip's backplane
-clock, and `set_gpio` and `gpio_is_high` drive and read the chip's own pins.
+`std/embedded/wireless/cyw43` is the driver. It is portable: `cyw43.Spi`
+bit-bangs the chip's half-duplex gSPI bus on any three pins, using
+`set_as_output` and `set_as_input` on the data pin to turn the line around,
+and `cyw43.Device` speaks the chip protocol over any bus with the same methods.
+`Device.init` checks the bus test patterns and the chip ID, starts the chip's
+backplane clock, and `set_gpio` and `gpio_is_high` drive and read the chip's
+own pins.
 It does not load the wireless firmware, so Wi-Fi and Bluetooth are not
 available yet.
 
