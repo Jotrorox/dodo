@@ -9,7 +9,8 @@
 ; hardware and calls only the 64-bit ones. Unused helpers are removed by
 ; --gc-sections.
 ;
-; There is no libc or compiler-rt: floating point is not supported yet.
+; There is no libc or compiler-rt; the floating-point helpers are in
+; arm_float.ll.
 ; This module is not optimized by the IR pass pipeline, so the helpers below
 ; are never rewritten into calls to themselves.
 

@@ -16,7 +16,8 @@ pub static CHIP: Chip = Chip {
     },
     runtime: concat!(
         include_str!("rp2040/runtime.ll"),
-        include_str!("arm_eabi.ll")
+        include_str!("arm_eabi.ll"),
+        include_str!("arm_float.ll")
     ),
     linker_script: include_str!("rp2040/link.ld"),
     panic_hook: "dodo_board_panic",

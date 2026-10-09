@@ -234,6 +234,10 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "__udivdi3",
         "__muldi3",
         "__ashrdi3",
+        "__aeabi_fadd",
+        "__aeabi_dmul",
+        "__aeabi_f2d",
+        "fmodf",
     ] {
         assert!(text.contains(name), "rp2040 runtime lacks {name}");
     }
@@ -248,6 +252,9 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "POWMAN_IRQ_TIMER",
         "__aeabi_uldivmod",
         "__udivdi3",
+        "__aeabi_ddiv",
+        "__aeabi_l2f",
+        "fmod",
     ] {
         assert!(text.contains(name), "rp2350 runtime lacks {name}");
     }
@@ -419,23 +426,29 @@ fn rp2350_projects_link_to_flashable_firmware() {
 }
 
 #[test]
-fn floating_point_link_errors_explain_the_limit() {
+fn floating_point_links_in_firmware() {
     if !ld_lld() {
         return;
     }
     let scratch = Scratch::new("float");
+    // Operands from the timer, so the optimizer cannot fold the arithmetic.
     let source = scratch.write(
         "main.dodo",
-        "package main\nimport \"std/embedded/board\"\nfn main() {\n b := board.take()!\n t := b.timer.now_us() as f64\n if t * 1.5 > 1.0 {\n  board.reboot_to_bootloader()\n }\n}\n",
+        "package main\nimport \"std/embedded/board\"\nfn main() {\n b := board.take()!\n t := b.timer.now_us()\n x := (t as f64) * 1.5 / 3.0 + 0.25 - (t as f64) % 7.0\n y := (t as f32) * 1.5f32 / 3.0f32 + 0.25f32 - (t as f32) % 7.0f32\n n := (x as i64) + (y as i64) + (x as u32) as i64 + (y as f64 as i32) as i64\n if x < y as f64 || x >= 1e300 || n == 3 || (n as f32) > 2.0f32 {\n  board.reboot_to_bootloader()\n }\n}\n",
     );
-    let error = stderr(&dodo(&[
-        "build",
-        source.to_str().unwrap(),
-        "--board",
-        "pico",
-    ]));
-    assert!(
-        error.contains("floating-point arithmetic is not supported in firmware yet"),
-        "{error}"
-    );
+    for board in ["pico", "pico2"] {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("{board}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+        }
+    }
 }

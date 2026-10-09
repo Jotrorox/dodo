@@ -58,7 +58,8 @@ and binary64 (`f64`) mathematics. `std/math/trig` separately supplies trigonomet
 and its range-reduction table. Neither package imports an allocator, clock, OS,
 libc, libm, or runtime startup. No hardware backend is required or currently
 provided. Cortex-M0 builds use the target's ordinary compiler support routines
-for soft floating-point arithmetic; firmware supplies those when linking.
+for soft floating-point arithmetic; the compiler's firmware runtimes supply
+them for the Pico boards.
 
 ```dodo test
 package vector_example

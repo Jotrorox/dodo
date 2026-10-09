@@ -8,13 +8,13 @@ import "std/embedded/hal"
 // Hardware self-test for the `pico2_w` board: the RP2350 startup runtime,
 // std/embedded/chip/rp2350 (clocks, timer, single ownership, configuration
 // checks), std/embedded/board/pico2_w with the CYW43439 driver in
-// std/embedded/wireless/cyw43 (gSPI bus bring-up, the LED and USB-power
-// GPIOs of the wireless chip), and the runtime's integer helpers. Every
-// outcome ends in the USB bootloader with a record that
+// std/embedded/wireless/cyw43 (gSPI bus bring-up, the LED and USB-power GPIOs
+// of the wireless chip), and the runtime's integer and floating-point helpers.
+// Every outcome ends in the USB bootloader with a record that
 // `scripts/test_pico.py --board pico2_w` reads over USB with picotool. The
 // RP2350 boot ROM clears SRAM when it starts, so the record is staged at
-// RECORD in SRAM and written to the last flash sector before rebooting.
-// Words of the record:
+// RECORD in SRAM and written to the last flash sector before rebooting. Words
+// of the record:
 //
 //   [0] 0x600D_00nn  finished after nn checks; [1] = failed-check bits
 //       0xDEAD_llll  panicked at line llll;    [1] = column
@@ -270,6 +270,20 @@ fn main() {
     check(x >> (63 + z) == 1)
     check(s >> (32 + j) == -2_147_483_648)
     check(s >> (63 + j) == -1)
+
+    // Floating-point helpers: all of them on the RP2040, binary64 and the
+    // conversions on the RP2350's single-precision FPU.
+    d := z as f64
+    check((0.1 + d) + 0.2 == 0.30000000000000004 && (1.0 + d) / 3.0 * 3.0 == 1.0)
+    check((2.2250738585072014e-308 + d) / 4.0 == 5.562684646268003e-309 && (1e308 + d) * 10.0 > 1.7976931348623157e308)
+    check((10.5 + d) % 3.0 == 1.5 && (-7.25 + d) % 2.0 == -1.25)
+    nan := d / d
+    check(nan != nan && !(nan < 1.0) && !(nan >= 1.0) && -0.0 + d == 0.0)
+    check((-3.75 + d) as i32 == -3 && (1e19 + d) as u64 == 10_000_000_000_000_000_000 && (-1e18 + d) as i64 == -1_000_000_000_000_000_000)
+    check((0x1F_FFFF_FFFF_FFFFu64 ^ z) as f64 == 9007199254740991.0 && (0xFFFF_FFFF_FFFF_FFFFu64 ^ z) as f64 == 18446744073709551616.0 && (-5 + j) as f64 == -5.0)
+    e := z as f32
+    check((0.1f32 + e) + 0.2f32 == 0.3f32 && (1.1754944e-38f32 + e) / 8.0f32 == 1.469368e-39f32 && (10.5f32 + e) % 3.0f32 == 1.5f32)
+    check(((1.0f32 + e) / 3.0f32) as f64 == 0.3333333432674408 && (0.1 + d) as f32 == 0.1f32 && (16_777_217u64 ^ z) as f32 == 16_777_216.0f32 && (16_777_219u32 ^ z32) as f32 == 16_777_220.0f32)
 
     // memcpy/memset through large copies.
     big: [64]u32 = [0; 64]
