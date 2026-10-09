@@ -3,6 +3,7 @@ package rp2040
 import "std/embedded/hal"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl022"
+import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2040 chip support: clocks, resets, GPIO, I2C, SPI, the
 // microsecond timer, and the boot ROM. `take(config)` brings the chip from its
@@ -308,15 +309,14 @@ pub struct Pins {
     // two pins cannot form a bus or the frequency is out of range, Busy if a
     // pin or the controller is taken. The pads' own pull-ups (about 50 kOhm)
     // keep an idle bus high but are too weak for fast mode: most sensor
-    // boards add 4.7 kOhm pull-ups, and a bare bus needs them.
-    pub fn i2c(&mut self, sda: u32, scl: u32, frequency_hz: u32) -> I2c!hal.Error {
-        if sda >= PIN_COUNT || scl >= PIN_COUNT || sda % 2 != 0 || scl % 2 != 1 || (sda / 2) % 2 != (scl / 2) % 2 {
-            return err(hal.Error.InvalidInput)
-        }
+    // boards add 4.7 kOhm pull-ups, and a bare bus needs them. The
+    // designware_i2c driver documents the bus's errors.
+    pub fn i2c(&mut self, sda: u32, scl: u32, frequency_hz: u32) -> designware_i2c.Bus!hal.Error {
+        index := rp_pins.i2c_controller(sda, scl)?
         timing := designware_i2c.timing(SYS_HZ, frequency_hz)?
         controller := RESET_I2C0
         base := I2C0_BASE
-        if (sda / 2) % 2 == 1 {
+        if index == 1 {
             controller = RESET_I2C1
             base = I2C1_BASE
         }
@@ -324,11 +324,11 @@ pub struct Pins {
         // SAFETY: `reserve_reset` made the controller and both pins' control
         // and pad registers exclusive to this bus.
         unsafe {
-            bus := designware_i2c.Controller.new(hal.RegisterBlock.at(base), timing)
+            bus := designware_i2c.Bus.at(base, timing)
             // The controller pulls a line low by enabling the pad's output.
             route(sda, FUNCSEL_I2C, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
             route(scl, FUNCSEL_I2C, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
-            return ok(I2c { bus })
+            return ok(bus)
         }
     }
 
@@ -340,37 +340,25 @@ pub struct Pins {
     // belong to SPI0, GPIO 8 to 15 and 24 to 29 to SPI1. Give each device
     // an output pin as its chip select, through hal.SpiDevice. Errors as for
     // `i2c`.
-    pub fn spi(&mut self, clock: u32, tx: u32, rx: Option<u32>, mode: hal.SpiMode, frequency_hz: u32) -> Spi!hal.Error {
-        if clock >= PIN_COUNT || tx >= PIN_COUNT || clock % 4 != 2 || tx % 4 != 3 || (clock / 8) % 2 != (tx / 8) % 2 {
-            return err(hal.Error.InvalidInput)
-        }
-        pins := (1u32 << clock) | (1u32 << tx)
-        // PIN_COUNT when there is no receive pin.
-        input := PIN_COUNT
-        if let some(number) = rx {
-            if number >= PIN_COUNT || number % 4 != 0 || (number / 8) % 2 != (clock / 8) % 2 {
-                return err(hal.Error.InvalidInput)
-            }
-            input = number
-            pins |= 1u32 << input
-        }
+    pub fn spi(&mut self, clock: u32, tx: u32, rx: Option<u32>, mode: hal.SpiMode, frequency_hz: u32) -> pl022.Bus!hal.Error {
+        pins := rp_pins.spi_pins(clock, tx, rx)?
         divisors := pl022.divisors(SYS_HZ, frequency_hz)?
         controller := RESET_SPI0
         base := SPI0_BASE
-        if (clock / 8) % 2 == 1 {
+        if pins.controller == 1 {
             controller = RESET_SPI1
             base = SPI1_BASE
         }
-        self.reserve_reset(controller, pins)?
+        self.reserve_reset(controller, pins.mask)?
         // SAFETY: as for `i2c`.
         unsafe {
-            bus := pl022.Controller.new(hal.RegisterBlock.at(base), divisors, mode)
+            bus := pl022.Bus.at(base, divisors, mode)
             route(clock, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
             route(tx, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
-            if input < PIN_COUNT {
-                route(input, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
+            if pins.rx < rp_pins.PIN_COUNT {
+                route(pins.rx, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
             }
-            return ok(Spi { bus })
+            return ok(bus)
         }
     }
 
@@ -508,73 +496,5 @@ pub struct Timer {
     pub fn delay_ms(&mut self, milliseconds: u32) {
         end := self.now_us() + (milliseconds as u64) * 1000
         for self.now_us() < end {}
-    }
-}
-
-// An I2C bus on controller I2C0 or I2C1, from `Pins.i2c`. Implements the
-// std/embedded/hal I2C bus protocol with the DesignWare controller driver in
-// std/embedded/peripheral/designware_i2c, which documents its errors. Empty
-// transfers are InvalidInput: the controller cannot send them.
-pub struct I2c {
-    bus: designware_i2c.Controller<hal.RegisterBlock>
-
-    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
-        return self.bus.write(address, bytes)
-    }
-
-    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
-        return self.bus.read(address, buffer)
-    }
-
-    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
-        return self.bus.write_read(address, bytes, buffer)
-    }
-
-    // The SCL frequency, in hertz.
-    pub fn frequency_hz(&self) -> u32 {
-        return self.bus.frequency_hz()
-    }
-
-    // Change the SCL frequency between transactions.
-    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
-        return self.bus.set_frequency(frequency_hz)
-    }
-}
-
-// An SPI bus on controller SPI0 or SPI1, from `Pins.spi`. Implements the
-// std/embedded/hal SPI bus protocol with the PL022 controller driver in
-// std/embedded/peripheral/pl022.
-pub struct Spi {
-    bus: pl022.Controller<hal.RegisterBlock>
-
-    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
-        return self.bus.transfer(bytes)
-    }
-
-    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
-        return self.bus.write(bytes)
-    }
-
-    // The clock frequency, in hertz: the fastest the controller can make
-    // that does not exceed the requested one.
-    pub fn frequency_hz(&self) -> u32 {
-        return self.bus.frequency_hz()
-    }
-
-    // Change the clock between transfers, for devices with different limits
-    // on one bus.
-    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
-        return self.bus.set_frequency(frequency_hz)
-    }
-
-    // Change the clock polarity and phase between transfers.
-    pub fn set_mode(&mut self, mode: hal.SpiMode) {
-        self.bus.set_mode(mode)
-    }
-
-    // Loop the transmitter back to the receiver inside the chip, for
-    // self-tests: transfers read back what they send.
-    pub fn set_loopback(&mut self, on: bool) {
-        self.bus.set_loopback(on)
     }
 }

@@ -9,11 +9,11 @@ import "std/embedded/hal"
 // register block: a `hal.RegisterBlock` on the chip, or a simulated
 // controller in a desktop test.
 //
-// Chip packages pulse the controller's reset, route its two pins, and pass
-// the frequency of the clock that feeds it; applications then use the chip's
-// bus type. Supported: 7-bit addresses, standard, fast, and fast-plus speeds
-// (up to 1 MHz), and transfers of any length, with the register FIFOs kept
-// busy so bytes follow each other without gaps. Every wait is bounded, so a
+// Chip packages pulse the controller's reset, route its two pins, pass the
+// frequency of the clock that feeds it, and hand the controller to
+// applications as a `Bus`. Supported: 7-bit addresses, standard, fast,
+// and fast-plus speeds (up to 1 MHz), and transfers of any length, with the
+// register FIFOs kept busy so bytes follow each other without gaps. Every wait is bounded, so a
 // device that holds the clock low forever yields hal.Error.Timeout instead of
 // a hang. Not supported: 10-bit addresses, high-speed mode, target (slave)
 // mode, and empty transfers, which the controller cannot send: an address
@@ -429,5 +429,43 @@ pub struct Controller<R> {
             }
         }
         return err(hal.Error.Timeout)
+    }
+}
+
+// A DW_apb_i2c on the chip, as chip packages hand it to applications. It
+// implements the std/embedded/hal I2C bus protocol like Controller but keeps
+// the register block: `RegisterBlock` trusts its owner with every offset,
+// which only the driver may be.
+pub struct Bus {
+    controller: Controller<hal.RegisterBlock>
+
+    // SAFETY: as for hal.RegisterBlock.at, with `base` a DW_apb_i2c whose
+    // reset and pins the caller has set up and that only this bus uses.
+    pub unsafe fn at(base: usize, timing: Timing) -> Bus {
+        unsafe {
+            return Bus { controller: Controller.new(hal.RegisterBlock.at(base), timing) }
+        }
+    }
+
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        return self.controller.write(address, bytes)
+    }
+
+    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
+        return self.controller.read(address, buffer)
+    }
+
+    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        return self.controller.write_read(address, bytes, buffer)
+    }
+
+    // The SCL frequency, in hertz.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.controller.frequency_hz()
+    }
+
+    // Change the SCL frequency between transactions.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        return self.controller.set_frequency(frequency_hz)
     }
 }

@@ -36,9 +36,11 @@
   their drivers live once in the new `std/embedded/peripheral`:
   `designware_i2c` (Synopsys DW_apb_i2c, 7-bit master up to 1 MHz, with
   bounded waits) and `pl022` (Arm PL022 SPI master, all four modes,
-  internal loopback). Both run against any register block, the new
-  `hal.RegisterBlock` on a chip or a simulated controller in desktop tests,
-  which model FIFO pacing, aborts, and stuck buses. `hal` gains `SpiMode` and
+  internal loopback), whose `Bus` types `pins.i2c` and `pins.spi` return;
+  the pin assignments both chips share live in `std/embedded/chip/rp_pins`.
+  Both drivers run against any register block, the new `hal.RegisterBlock`
+  on a chip or a simulated controller in desktop tests, which model FIFO
+  pacing, aborts, and stuck buses. `hal` gains `SpiMode` and
   the `I2C_STANDARD_HZ`, `I2C_FAST_HZ`, and `I2C_FAST_PLUS_HZ` constants, and
   the board self-tests check both buses with nothing attached.
 - Add firmware builds for microcontroller boards, starting with the Raspberry

@@ -404,8 +404,10 @@ popping a FIFO.
 
 Both keep the controller's FIFOs busy without ever queueing more than the
 receive FIFO holds, and bound every wait on the bus, so a device that holds
-the I2C clock low yields `Timeout` instead of a hang. Chip packages wrap them
-in their own bus types.
+the I2C clock low yields `Timeout` instead of a hang. Chip packages hand out
+their controllers as each driver's `Bus`, which keeps the register block
+from the application: `pins.i2c` on the RP2040 and RP2350 returns a
+`designware_i2c.Bus`, and `pins.spi` a `pl022.Bus`.
 
 ### Owning peripherals once
 

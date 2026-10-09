@@ -249,3 +249,50 @@ pub struct Controller<R> {
         }
     }
 }
+
+// A PL022 on the chip, as chip packages hand it to applications. It
+// implements the std/embedded/hal SPI bus protocol like Controller but keeps
+// the register block: `RegisterBlock` trusts its owner with every offset,
+// which only the driver may be.
+pub struct Bus {
+    controller: Controller<hal.RegisterBlock>
+
+    // SAFETY: as for hal.RegisterBlock.at, with `base` a PL022 whose reset
+    // and pins the caller has set up and that only this bus uses.
+    pub unsafe fn at(base: usize, divisors: Divisors, mode: hal.SpiMode) -> Bus {
+        unsafe {
+            return Bus { controller: Controller.new(hal.RegisterBlock.at(base), divisors, mode) }
+        }
+    }
+
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        return self.controller.transfer(bytes)
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        return self.controller.write(bytes)
+    }
+
+    // The clock frequency, in hertz: the fastest the controller can make
+    // that does not exceed the requested one.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.controller.frequency_hz()
+    }
+
+    // Change the clock between transfers, for devices with different limits
+    // on one bus.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        return self.controller.set_frequency(frequency_hz)
+    }
+
+    // Change the clock polarity and phase between transfers.
+    pub fn set_mode(&mut self, mode: hal.SpiMode) {
+        self.controller.set_mode(mode)
+    }
+
+    // Loop the transmitter back to the receiver inside the chip, for
+    // self-tests: transfers read back what they send.
+    pub fn set_loopback(&mut self, on: bool) {
+        self.controller.set_loopback(on)
+    }
+}

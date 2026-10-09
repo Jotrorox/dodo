@@ -1,0 +1,52 @@
+package rp_pins
+
+import "std/embedded/hal"
+
+// The I2C and SPI pin assignments the RP2040 and RP2350 share. On both chips
+// GPIO 0 to 29 select the same controller signals, so the chip packages
+// check bus pins here before they route them.
+
+// The GPIOs whose functions both chips share.
+pub const PIN_COUNT: u32 = 30
+
+// The I2C controller, 0 or 1, that pins `sda` and `scl` form a bus on. Even
+// pins carry SDA and odd pins SCL. GPIO 0 and 1, 4 and 5, and so on in steps
+// of four belong to I2C0; GPIO 2 and 3, 6 and 7, and so on to I2C1.
+// InvalidInput if the two pins cannot form a bus.
+pub fn i2c_controller(sda: u32, scl: u32) -> u32!hal.Error {
+    if sda >= PIN_COUNT || scl >= PIN_COUNT || sda % 2 != 0 || scl % 2 != 1 || (sda / 2) % 2 != (scl / 2) % 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok((sda / 2) % 2)
+}
+
+// The pins of an SPI bus, from `spi_pins`.
+pub struct SpiPins {
+    // The controller, 0 or 1.
+    pub controller: u32
+    // The receive pin, or PIN_COUNT when there is none.
+    pub rx: u32
+    // Every pin of the bus, one bit each.
+    pub mask: u32
+}
+
+// The SPI bus that pins `clock`, `tx`, and `rx` (if any) form. GPIO n
+// carries RX when n % 4 is 0, the clock when it is 2, and TX when it is 3.
+// GPIO 0 to 7 and 16 to 23 belong to SPI0, GPIO 8 to 15 and 24 to 29 to
+// SPI1. InvalidInput if the pins cannot form a bus.
+pub fn spi_pins(clock: u32, tx: u32, rx: Option<u32>) -> SpiPins!hal.Error {
+    if clock >= PIN_COUNT || tx >= PIN_COUNT || clock % 4 != 2 || tx % 4 != 3 || (clock / 8) % 2 != (tx / 8) % 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    controller := (clock / 8) % 2
+    mask := (1u32 << clock) | (1u32 << tx)
+    input := PIN_COUNT
+    if let some(number) = rx {
+        if number >= PIN_COUNT || number % 4 != 0 || (number / 8) % 2 != controller {
+            return err(hal.Error.InvalidInput)
+        }
+        input = number
+        mask |= 1u32 << input
+    }
+    return ok(SpiPins { controller, rx: input, mask })
+}

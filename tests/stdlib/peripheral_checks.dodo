@@ -1,6 +1,7 @@
 package main
 
 import "std/embedded/hal"
+import "std/embedded/chip/rp_pins"
 import "std/embedded/hal/fake"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl022"
@@ -940,6 +941,61 @@ fn spi_overrun() {
     bus.transfer(&mut bytes)!
 }
 
+fn expect_invalid(result: u32!hal.Error) {
+    match result {
+        ok(controller) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn expect_invalid_spi(result: rp_pins.SpiPins!hal.Error) {
+    match result {
+        ok(pins) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn rp_pin_assignments() {
+    // I2C pairs repeat every four pins, alternating between the controllers.
+    core.assert_eq(rp_pins.i2c_controller(0, 1)!, 0u32)
+    core.assert_eq(rp_pins.i2c_controller(2, 3)!, 1u32)
+    core.assert_eq(rp_pins.i2c_controller(4, 5)!, 0u32)
+    core.assert_eq(rp_pins.i2c_controller(26, 27)!, 1u32)
+    // SDA and SCL of the same controller need not be neighbours.
+    core.assert_eq(rp_pins.i2c_controller(8, 1)!, 0u32)
+    expect_invalid(rp_pins.i2c_controller(5, 4))
+    expect_invalid(rp_pins.i2c_controller(0, 3))
+    expect_invalid(rp_pins.i2c_controller(28, 31))
+
+    // SPI pins come in blocks of eight, SPI0 then SPI1, with SPI1 again
+    // from GPIO 24.
+    pins := rp_pins.spi_pins(18, 19, some(16u32))!
+    core.assert_eq(pins.controller, 0u32)
+    core.assert_eq(pins.rx, 16u32)
+    core.assert_eq(pins.mask, 0xD_0000u32)
+    pins = rp_pins.spi_pins(10, 11, some(12u32))!
+    core.assert_eq(pins.controller, 1u32)
+    pins = rp_pins.spi_pins(26, 27, none)!
+    core.assert_eq(pins.controller, 1u32)
+    core.assert_eq(pins.rx, rp_pins.PIN_COUNT)
+    core.assert_eq(pins.mask, 0xC00_0000u32)
+    pins = rp_pins.spi_pins(2, 7, some(20u32))!
+    core.assert_eq(pins.controller, 0u32)
+    expect_invalid_spi(rp_pins.spi_pins(19, 18, none))
+    expect_invalid_spi(rp_pins.spi_pins(18, 11, none))
+    expect_invalid_spi(rp_pins.spi_pins(18, 19, some(17u32)))
+    expect_invalid_spi(rp_pins.spi_pins(18, 19, some(8u32)))
+    expect_invalid_spi(rp_pins.spi_pins(30, 31, none))
+}
+
 fn main() {
     i2c_timing()
     i2c_configuration()
@@ -951,4 +1007,5 @@ fn main() {
     spi_configuration()
     spi_transfers()
     spi_overrun()
+    rp_pin_assignments()
 }
