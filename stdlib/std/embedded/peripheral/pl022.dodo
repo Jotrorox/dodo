@@ -187,9 +187,11 @@ pub struct Controller<R> {
             if (status & RX_NOT_EMPTY) != 0 {
                 bytes[received] = (self.registers.read(DR) & 0xFF) as u8
                 received += 1
-            } else if sent == bytes.len && (status & BUSY) == 0 {
+            } else if sent == bytes.len && (self.registers.read(SR) & (BUSY | RX_NOT_EMPTY)) == 0 {
                 // Every frame is done, yet replies are missing: they were
-                // lost to an overflow, and waiting would never end.
+                // lost to an overflow, and waiting would never end. `status`
+                // may predate the last byte written above, when the
+                // controller still looked idle, so this reads it again.
                 self.registers.write(ICR, RX_OVERRUN)
                 return err(hal.Error.Overrun)
             }

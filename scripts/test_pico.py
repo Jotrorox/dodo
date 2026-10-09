@@ -54,7 +54,7 @@ LAST_CHECKS = [
     "SPI pins are validated",
     "SPI loopback reads back 16 bytes; controller is owned once",
     "SPI clock is 1 MHz",
-    "SPI mode 3 write and loopback",
+    "SPI mode 3 write and loopback, 16 bytes and 1",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",

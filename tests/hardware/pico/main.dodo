@@ -166,7 +166,11 @@ fn bus_checks<P, T>(pins: &mut P, timer: &mut T) {
     spi.set_mode(hal.SpiMode.Mode3)
     spi.write(&sent)!
     spi.transfer(&mut data)!
-    same = true
+    // A single byte, as when reading one register, starts on an idle
+    // controller.
+    one: [1]u8 = [0x3C]
+    spi.transfer(&mut one)!
+    same = one[0] == 0x3C
     for index in 0..16usize {
         same = same && data[index] == sent[index]
     }

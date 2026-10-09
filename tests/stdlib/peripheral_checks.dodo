@@ -862,6 +862,18 @@ fn spi_transfers() {
     model = bus.release()
     model.expect_sent(&long)
 
+    // A single byte, the usual register read: the controller is idle when
+    // it is queued, which must not pass for a lost reply.
+    single_reply: [1]u8 = [0x42]
+    model.reply_with(&single_reply)
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    single: [1]u8 = [0x0F]
+    bus.transfer(&mut single)!
+    core.assert_eq(single[0], 0x42u8)
+    model = bus.release()
+    single_sent: [1]u8 = [0x0F]
+    model.expect_sent(&single_sent)
+
     // Loopback reads back what was sent, without the device seeing it.
     bus = spi_bus(model, hal.SpiMode.Mode0)
     bus.set_loopback(true)
@@ -889,6 +901,19 @@ fn spi_transfers() {
     model = bus.release()
     id_command: [4]u8 = [0x9F, 0, 0, 0]
     model.expect_sent(&id_command)
+
+    // Reading one register reads a single byte after the command.
+    sensor := hal.SpiDevice.new(fake.Pin.new())
+    register_reply: [2]u8 = [0, 0x5D]
+    model.reply_with(&register_reply)
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    register: [1]u8 = [0x8F]
+    value: [1]u8 = [0]
+    sensor.write_read(&mut bus, &register, &mut value)!
+    core.assert_eq(value[0], 0x5Du8)
+    model = bus.release()
+    register_read: [2]u8 = [0x8F, 0]
+    model.expect_sent(&register_read)
 }
 
 fn spi_overrun() {
