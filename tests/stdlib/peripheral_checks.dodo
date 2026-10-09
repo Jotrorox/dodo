@@ -35,7 +35,7 @@ struct I2cModel {
     spike: u32
     hold: u32
     interrupt_mask: u32
-    // COMP_PARAM_1, which encodes the receive FIFO depth.
+    // COMP_PARAM_1, which encodes the receive and transmit FIFO depths.
     parameters: u32
     rx_depth: usize
     tx: [16]u32
@@ -79,7 +79,7 @@ struct I2cModel {
             spike: 0,
             hold: 0x0001_0001,
             interrupt_mask: 0x8FF,
-            parameters: ((rx_depth as u32 - 1) << 16) | 0x0F00,
+            parameters: ((I2C_FIFO as u32 - 1) << 16) | ((rx_depth as u32 - 1) << 8) | 0x6E,
             rx_depth,
             tx: [0; 16],
             tx_count: 0,
@@ -350,21 +350,22 @@ fn expect_error(result: void!hal.Error, expected: hal.Error) {
 }
 
 fn i2c_timing() {
+    // 313 cycles: high for 108 + 11 + 7, low for 186 + 1.
     fast := designware_i2c.timing(CLOCK_HZ, hal.I2C_FAST_HZ)!
-    core.assert_eq(fast.high, 126u32)
-    core.assert_eq(fast.low, 187u32)
+    core.assert_eq(fast.high, 108u32)
+    core.assert_eq(fast.low, 186u32)
     core.assert_eq(fast.spike, 11u32)
     core.assert_eq(fast.hold, 38u32)
     core.assert_eq(fast.frequency_hz, 399_361u32)
 
     standard := designware_i2c.timing(CLOCK_HZ, hal.I2C_STANDARD_HZ)!
-    core.assert_eq(standard.high + standard.low, 1250u32)
+    core.assert_eq(standard.high + standard.spike + 7 + standard.low + 1, 1250u32)
     core.assert_eq(standard.frequency_hz, 100_000u32)
 
     // Fast mode plus has a shorter SDA hold time.
     plus := designware_i2c.timing(150_000_000, hal.I2C_FAST_PLUS_HZ)!
-    core.assert_eq(plus.high, 60u32)
-    core.assert_eq(plus.low, 90u32)
+    core.assert_eq(plus.high, 48u32)
+    core.assert_eq(plus.low, 89u32)
     core.assert_eq(plus.hold, 19u32)
 
     invalid: [3]u32 = [0, 1_000_001, 1_000]
@@ -378,7 +379,11 @@ fn i2c_timing() {
             }
         }
     }
-    match designware_i2c.timing(12_000_000, hal.I2C_FAST_PLUS_HZ) {
+    // The controller's extra cycles leave too short a high count for 1 MHz
+    // below about 36 MHz.
+    lowest := designware_i2c.timing(36_000_000, hal.I2C_FAST_PLUS_HZ)!
+    core.assert_eq(lowest.frequency_hz, 1_000_000u32)
+    match designware_i2c.timing(34_000_000, hal.I2C_FAST_PLUS_HZ) {
         ok(_) => {
             core.assert(false)
         }
@@ -399,8 +404,8 @@ fn i2c_configuration() {
     // Master, fast-mode timing, repeated starts, target mode off, and
     // TX_EMPTY after the last command left.
     core.assert_eq(model.con, 0x165u32)
-    core.assert_eq(model.high, 126u32)
-    core.assert_eq(model.low, 187u32)
+    core.assert_eq(model.high, 108u32)
+    core.assert_eq(model.low, 186u32)
     core.assert_eq(model.spike, 11u32)
     // The receive hold time in the upper half is kept.
     core.assert_eq(model.hold, 0x0001_0026u32)
@@ -555,7 +560,7 @@ fn i2c_frequency() {
     core.assert_eq(bus.frequency_hz(), 100_000u32)
     bus.write(DEVICE, &one)!
     model := bus.release()
-    core.assert_eq(model.high + model.low, 1250u32)
+    core.assert_eq(model.high + model.spike + 7 + model.low + 1, 1250u32)
 }
 
 // --- A PL022 and the device answering on its bus -----------------------

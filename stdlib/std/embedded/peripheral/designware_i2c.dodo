@@ -78,9 +78,9 @@ const MASTER_ACTIVE: u32 = 1 << 5
 const NOT_ACKNOWLEDGED: u32 = 0b1_1111
 
 const SDA_TX_HOLD: u32 = 0xFFFF
-// COMP_PARAM_1: receive FIFO depth minus one. Zero when the integration
-// leaves the parameter register out.
-const RX_BUFFER_DEPTH: u32 = 0xFF << 16
+// COMP_PARAM_1: receive FIFO depth minus one (the transmit depth is in
+// bits 23:16). Zero when the integration leaves the parameter register out.
+const RX_BUFFER_DEPTH: u32 = 0xFF << 8
 // Every DW_apb_i2c configuration has FIFOs at least this deep.
 const MINIMUM_DEPTH: usize = 2
 
@@ -88,6 +88,16 @@ const MINIMUM_DEPTH: usize = 2
 // stuck: around a second at 125 MHz in an optimized build, several times
 // that unoptimized, and far beyond the clock stretching of real devices.
 const POLLS: u32 = 10_000_000
+// Polls for the abort and disable that follow a stuck bus. An abort
+// finishes within a byte time when the bus moves, 8 ms at the slowest
+// clock, and never while a device holds SCL low, so these waits must not
+// add seconds to the Timeout.
+const CLEANUP_POLLS: u32 = POLLS / 16
+
+// Input clock cycles the controller adds to every SCL period: the high
+// period lasts HCNT + SPKLEN + 7 cycles and the low period LCNT + 1.
+const HIGH_EXTRA: u64 = 7
+const LOW_EXTRA: u64 = 1
 
 // TAR before the first transaction, so the first one programs it.
 const NO_TARGET: u32 = 0xFFFF_FFFF
@@ -96,15 +106,16 @@ const NO_TARGET: u32 = 0xFFFF_FFFF
 pub struct Timing {
     // The controller's input clock, in hertz.
     pub clock_hz: u32
-    // SCL high and low periods, in input clock cycles.
+    // The SCL high and low count registers. SCL is high for
+    // `high + spike + 7` input clock cycles and low for `low + 1`.
     pub high: u32
     pub low: u32
     // Longest glitch the input filters suppress, in input clock cycles.
     pub spike: u32
     // How long SDA is held after SCL falls, in input clock cycles.
     pub hold: u32
-    // The resulting SCL frequency, in hertz, before the bus's rise times
-    // stretch it.
+    // The resulting SCL frequency, in hertz, counting the controller's
+    // extra cycles but not the bus's rise times, which stretch it further.
     pub frequency_hz: u32
 }
 
@@ -113,15 +124,31 @@ pub struct Timing {
 // of each period, which meets the I2C specification's minimum low times at
 // 100 kHz, 400 kHz, and 1 MHz. Returns InvalidInput for a frequency the
 // controller cannot produce from this clock: below about 1.2 kHz at 125 MHz,
-// or 1 MHz from a clock below about 18 MHz.
+// or 1 MHz from a clock below about 36 MHz.
 pub fn timing(clock_hz: u32, frequency_hz: u32) -> Timing!hal.Error {
     if frequency_hz == 0 || frequency_hz > hal.I2C_FAST_PLUS_HZ || clock_hz == 0 {
         return err(hal.Error.InvalidInput)
     }
     period := ((clock_hz as u64) + (frequency_hz / 2) as u64) / frequency_hz as u64
-    low := period * 3 / 5
-    high := period - low
-    if high < 8 || low < 8 || high > 0xFFFF || low > 0xFFFF {
+    low_cycles := period * 3 / 5
+    // Suppress glitches up to a sixteenth of the low period, which the
+    // 50 ns spikes the specification allows fit into at every speed.
+    spike := 1u64
+    if low_cycles >= 16 {
+        spike = low_cycles / 16
+    }
+    if spike > 0xFF {
+        spike = 0xFF
+    }
+    high_cycles := period - low_cycles
+    // The counts the databook allows: HCNT above SPKLEN + 5 and LCNT above
+    // SPKLEN + 7.
+    if high_cycles < HIGH_EXTRA + spike + spike + 6 || low_cycles < LOW_EXTRA + spike + 8 {
+        return err(hal.Error.InvalidInput)
+    }
+    high := high_cycles - HIGH_EXTRA - spike
+    low := low_cycles - LOW_EXTRA
+    if high > 0xFFFF || low > 0xFFFF {
         return err(hal.Error.InvalidInput)
     }
     // SDA must change at least 300 ns after SCL falls, 120 ns in fast mode
@@ -132,15 +159,6 @@ pub fn timing(clock_hz: u32, frequency_hz: u32) -> Timing!hal.Error {
     }
     if hold + 2 > low {
         return err(hal.Error.InvalidInput)
-    }
-    // Suppress glitches up to a sixteenth of the low period, which the
-    // 50 ns spikes the specification allows fit into at every speed.
-    spike := 1u64
-    if low >= 16 {
-        spike = low / 16
-    }
-    if spike > 0xFF {
-        spike = 0xFF
     }
     return ok(Timing {
         clock_hz,
@@ -183,7 +201,8 @@ pub struct Controller<R> {
         return bus
     }
 
-    // The SCL frequency, in hertz, as computed by `timing`.
+    // The SCL frequency, in hertz, as computed by `timing`: the request,
+    // rounded to whole input clock cycles.
     pub fn frequency_hz(&self) -> u32 {
         return self.timing.frequency_hz
     }
@@ -395,16 +414,19 @@ pub struct Controller<R> {
     // transaction starts afresh.
     fn stuck(&mut self) -> void!hal.Error {
         self.registers.write(ENABLE, ENABLED | ABORT)
-        for _ in 0..POLLS {
+        for _ in 0..CLEANUP_POLLS {
             if (self.registers.read(ENABLE) & ABORT) == 0 {
                 break
             }
         }
         self.registers.read(CLR_INTR)
         self.target = NO_TARGET
-        match self.disable() {
-            ok() => {}
-            err(_) => {}
+        // The next transaction disables it again if this gives up.
+        self.registers.write(ENABLE, 0)
+        for _ in 0..CLEANUP_POLLS {
+            if (self.registers.read(ENABLE_STATUS) & ENABLED) == 0 {
+                break
+            }
         }
         return err(hal.Error.Timeout)
     }

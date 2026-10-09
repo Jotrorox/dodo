@@ -320,12 +320,10 @@ pub struct Pins {
             controller = RESET_I2C1
             base = I2C1_BASE
         }
-        self.reserve(controller, (1u32 << sda) | (1u32 << scl))?
-        // SAFETY: `reserve` made the controller, its reset bit, and both
-        // pins' control and pad registers exclusive to this bus. The reset
-        // alias registers change only this controller's bit.
+        self.reserve_reset(controller, (1u32 << sda) | (1u32 << scl))?
+        // SAFETY: `reserve_reset` made the controller and both pins' control
+        // and pad registers exclusive to this bus.
         unsafe {
-            reset_blocks(controller)?
             bus := designware_i2c.Controller.new(hal.RegisterBlock.at(base), timing)
             // The controller pulls a line low by enabling the pad's output.
             route(sda, FUNCSEL_I2C, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
@@ -363,10 +361,9 @@ pub struct Pins {
             controller = RESET_SPI1
             base = SPI1_BASE
         }
-        self.reserve(controller, pins)?
+        self.reserve_reset(controller, pins)?
         // SAFETY: as for `i2c`.
         unsafe {
-            reset_blocks(controller)?
             bus := pl022.Controller.new(hal.RegisterBlock.at(base), divisors, mode)
             route(clock, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
             route(tx, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
@@ -398,6 +395,27 @@ pub struct Pins {
                 output_disable: reg(GPIO_OE_CLR),
                 mask,
             })
+        }
+    }
+
+    // Take `controller` (a RESET_ bit) and the pins in `pins`, then pulse
+    // the controller's reset. A reset that does not finish gives both back,
+    // so a later attempt can try again.
+    fn reserve_reset(&mut self, controller: u32, pins: u32) -> void!hal.Error {
+        self.reserve(controller, pins)?
+        // SAFETY: `reserve` made the controller's reset bit exclusive to the
+        // caller. The reset alias registers change only this bit.
+        unsafe {
+            match reset_blocks(controller) {
+                ok() => {
+                    return ok()
+                }
+                err(error) => {
+                    self.controllers &= ~controller
+                    self.taken &= ~pins
+                    return err(error)
+                }
+            }
         }
     }
 
