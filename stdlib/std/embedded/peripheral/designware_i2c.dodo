@@ -1,0 +1,411 @@
+package designware_i2c
+
+import "std/embedded/hal"
+
+// The Synopsys DesignWare DW_apb_i2c controller as the only master on an I2C
+// bus. Chip vendors license this controller, so the same registers appear in
+// many microcontrollers, among them the RP2040 and RP2350 (I2C0 and I2C1).
+// `Controller` implements the std/embedded/hal I2C bus protocol over any
+// register block: a `hal.RegisterBlock` on the chip, or a simulated
+// controller in a desktop test.
+//
+// Chip packages pulse the controller's reset, route its two pins, and pass
+// the frequency of the clock that feeds it; applications then use the chip's
+// bus type. Supported: 7-bit addresses, standard, fast, and fast-plus speeds
+// (up to 1 MHz), and transfers of any length, with the register FIFOs kept
+// busy so bytes follow each other without gaps. Every wait is bounded, so a
+// device that holds the clock low forever yields hal.Error.Timeout instead of
+// a hang. Not supported: 10-bit addresses, high-speed mode, target (slave)
+// mode, and empty transfers, which the controller cannot send: an address
+// probe has to read one byte.
+//
+// Register names follow the DW_apb_i2c databook, as reproduced in the RP2040
+// datasheet (4.3.17).
+
+const CON: usize = 0x00
+const TAR: usize = 0x04
+const DATA_CMD: usize = 0x10
+const FS_SCL_HCNT: usize = 0x1C
+const FS_SCL_LCNT: usize = 0x20
+const INTR_MASK: usize = 0x30
+const RAW_INTR_STAT: usize = 0x34
+const RX_TL: usize = 0x38
+const TX_TL: usize = 0x3C
+const CLR_INTR: usize = 0x40
+const CLR_TX_ABRT: usize = 0x54
+const CLR_STOP_DET: usize = 0x60
+const ENABLE: usize = 0x6C
+const STATUS: usize = 0x70
+const SDA_HOLD: usize = 0x7C
+const TX_ABRT_SOURCE: usize = 0x80
+const ENABLE_STATUS: usize = 0x9C
+const FS_SPKLEN: usize = 0xA0
+const COMP_PARAM_1: usize = 0xF4
+
+// CON: master only, fast-mode timing registers (which also serve standard
+// mode and fast mode plus), repeated starts, and TX_EMPTY only once the last
+// command has left the shift register.
+const MASTER_MODE: u32 = 1 << 0
+const SPEED: u32 = 0b11 << 1
+const SPEED_FAST: u32 = 2
+const RESTART_ENABLE: u32 = 1 << 5
+const SLAVE_DISABLE: u32 = 1 << 6
+const TX_EMPTY_CONTROL: u32 = 1 << 8
+
+// DATA_CMD: a data byte to send, or a read command, plus the condition to
+// generate around it.
+const READ: u32 = 1 << 8
+const STOP: u32 = 1 << 9
+const RESTART: u32 = 1 << 10
+
+// RAW_INTR_STAT.
+const TX_EMPTY: u32 = 1 << 4
+const TX_ABORT: u32 = 1 << 6
+const STOP_DETECTED: u32 = 1 << 9
+
+// ENABLE and ENABLE_STATUS.
+const ENABLED: u32 = 1 << 0
+const ABORT: u32 = 1 << 1
+
+// STATUS.
+const TX_NOT_FULL: u32 = 1 << 1
+const RX_NOT_EMPTY: u32 = 1 << 3
+const MASTER_ACTIVE: u32 = 1 << 5
+
+// TX_ABRT_SOURCE: an address or data byte, including a general call, that
+// no device acknowledged. Other sources, such as lost arbitration, are bus
+// faults.
+const NOT_ACKNOWLEDGED: u32 = 0b1_1111
+
+const SDA_TX_HOLD: u32 = 0xFFFF
+// COMP_PARAM_1: receive FIFO depth minus one. Zero when the integration
+// leaves the parameter register out.
+const RX_BUFFER_DEPTH: u32 = 0xFF << 16
+// Every DW_apb_i2c configuration has FIFOs at least this deep.
+const MINIMUM_DEPTH: usize = 2
+
+// Polls of a status register without progress before the bus counts as
+// stuck: around a second at 125 MHz in an optimized build, several times
+// that unoptimized, and far beyond the clock stretching of real devices.
+const POLLS: u32 = 10_000_000
+
+// TAR before the first transaction, so the first one programs it.
+const NO_TARGET: u32 = 0xFFFF_FFFF
+
+// The controller settings for one SCL frequency, from `timing`.
+pub struct Timing {
+    // The controller's input clock, in hertz.
+    pub clock_hz: u32
+    // SCL high and low periods, in input clock cycles.
+    pub high: u32
+    pub low: u32
+    // Longest glitch the input filters suppress, in input clock cycles.
+    pub spike: u32
+    // How long SDA is held after SCL falls, in input clock cycles.
+    pub hold: u32
+    // The resulting SCL frequency, in hertz, before the bus's rise times
+    // stretch it.
+    pub frequency_hz: u32
+}
+
+// Controller settings for an SCL frequency of `frequency_hz` (1 Hz to
+// hal.I2C_FAST_PLUS_HZ) from an input clock of `clock_hz`. SCL is low for 60%
+// of each period, which meets the I2C specification's minimum low times at
+// 100 kHz, 400 kHz, and 1 MHz. Returns InvalidInput for a frequency the
+// controller cannot produce from this clock: below about 1.2 kHz at 125 MHz,
+// or 1 MHz from a clock below about 18 MHz.
+pub fn timing(clock_hz: u32, frequency_hz: u32) -> Timing!hal.Error {
+    if frequency_hz == 0 || frequency_hz > hal.I2C_FAST_PLUS_HZ || clock_hz == 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    period := ((clock_hz as u64) + (frequency_hz / 2) as u64) / frequency_hz as u64
+    low := period * 3 / 5
+    high := period - low
+    if high < 8 || low < 8 || high > 0xFFFF || low > 0xFFFF {
+        return err(hal.Error.InvalidInput)
+    }
+    // SDA must change at least 300 ns after SCL falls, 120 ns in fast mode
+    // plus, to clear the falling edge's undefined region.
+    hold := (clock_hz as u64) * 3 / 10_000_000 + 1
+    if frequency_hz >= hal.I2C_FAST_PLUS_HZ {
+        hold = (clock_hz as u64) * 3 / 25_000_000 + 1
+    }
+    if hold + 2 > low {
+        return err(hal.Error.InvalidInput)
+    }
+    // Suppress glitches up to a sixteenth of the low period, which the
+    // 50 ns spikes the specification allows fit into at every speed.
+    spike := 1u64
+    if low >= 16 {
+        spike = low / 16
+    }
+    if spike > 0xFF {
+        spike = 0xFF
+    }
+    return ok(Timing {
+        clock_hz,
+        high: high as u32,
+        low: low as u32,
+        spike: spike as u32,
+        hold: hold as u32,
+        frequency_hz: (clock_hz as u64 / period) as u32,
+    })
+}
+
+// An I2C bus master on one DW_apb_i2c controller with registers R, a value
+// with the register block protocol of std/embedded/hal. Implements the
+// std/embedded/hal I2C bus protocol.
+pub struct Controller<R> {
+    registers: R
+    timing: Timing
+    // Read commands that may be outstanding without overflowing the
+    // receive FIFO.
+    rx_depth: usize
+    // The address programmed in TAR, or NO_TARGET.
+    target: u32
+
+    // Configure a controller fresh out of reset as the bus's only master,
+    // using `timing` from the same clock that feeds it. It is enabled by the
+    // first transaction.
+    pub fn new(registers: R, timing: Timing) -> Controller<R> {
+        bus := Controller<R> { registers, timing, rx_depth: MINIMUM_DEPTH, target: NO_TARGET }
+        bus.registers.write(ENABLE, 0)
+        bus.registers.write(CON, MASTER_MODE | hal.encode(SPEED, SPEED_FAST) | RESTART_ENABLE | SLAVE_DISABLE | TX_EMPTY_CONTROL)
+        // Transfers poll the FIFO levels; no interrupts or DMA requests.
+        bus.registers.write(INTR_MASK, 0)
+        bus.registers.write(TX_TL, 0)
+        bus.registers.write(RX_TL, 0)
+        bus.apply_timing()
+        depth := hal.decode(RX_BUFFER_DEPTH, bus.registers.read(COMP_PARAM_1)) as usize + 1
+        if depth > MINIMUM_DEPTH {
+            bus.rx_depth = depth
+        }
+        return bus
+    }
+
+    // The SCL frequency, in hertz, as computed by `timing`.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.timing.frequency_hz
+    }
+
+    // Change the SCL frequency between transactions, for example to talk to
+    // a slower device. InvalidInput leaves the frequency unchanged.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        settings := timing(self.timing.clock_hz, frequency_hz)?
+        self.disable()?
+        self.timing = settings
+        self.apply_timing()
+        return ok()
+    }
+
+    // Send `bytes` to the device at `address`, then a STOP condition.
+    // NoAcknowledge if the address or a byte is not acknowledged, Bus if
+    // another master won arbitration, Timeout if the bus is stuck, and
+    // InvalidInput for an empty transfer or an address above 0x7F.
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        if bytes.len == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.start(address)?
+        return self.send(bytes, true)
+    }
+
+    // Fill `buffer` from the device at `address`, then a STOP condition.
+    // Errors as for `write`.
+    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
+        if buffer.len == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.start(address)?
+        return self.receive(buffer, false)
+    }
+
+    // Send `bytes`, then fill `buffer` after a repeated START, all in one
+    // transaction, so no other master can get in between; the usual way to
+    // read a numbered register. Errors as for `write`, and InvalidInput only
+    // when both are empty.
+    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        if bytes.len == 0 {
+            return self.read(address, buffer)
+        }
+        if buffer.len == 0 {
+            return self.write(address, bytes)
+        }
+        self.start(address)?
+        self.send(bytes, false)?
+        return self.receive(buffer, true)
+    }
+
+    // Disable the controller and give back its registers.
+    pub fn release(self) -> R {
+        // A stuck controller is given back as it is.
+        match self.disable() {
+            ok() => {}
+            err(_) => {}
+        }
+        let Controller { registers, timing, rx_depth, target } = self
+        return registers
+    }
+
+    fn apply_timing(&mut self) {
+        self.registers.write(FS_SCL_HCNT, self.timing.high)
+        self.registers.write(FS_SCL_LCNT, self.timing.low)
+        self.registers.write(FS_SPKLEN, self.timing.spike)
+        hold := self.registers.read(SDA_HOLD)
+        self.registers.write(SDA_HOLD, (hold & ~SDA_TX_HOLD) | self.timing.hold)
+    }
+
+    // Address the device and clear what the last transaction left behind.
+    // TAR can change only while the controller is disabled.
+    fn start(&mut self, address: u8) -> void!hal.Error {
+        if address > 0x7F {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.target != address as u32 {
+            self.disable()?
+            self.registers.write(TAR, address as u32)
+            self.target = address as u32
+        }
+        // Reading CLR_INTR clears every flag, including a stale STOP.
+        self.registers.read(CLR_INTR)
+        self.registers.write(ENABLE, ENABLED)
+        return ok()
+    }
+
+    fn disable(&mut self) -> void!hal.Error {
+        self.registers.write(ENABLE, 0)
+        for _ in 0..POLLS {
+            if (self.registers.read(ENABLE_STATUS) & ENABLED) == 0 {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    // Queue `bytes` as fast as the FIFO accepts them and wait until the last
+    // one is on the wire, then for the STOP condition if `stop`.
+    fn send(&mut self, bytes: &[u8], stop: bool) -> void!hal.Error {
+        index := 0usize
+        polls := 0u32
+        for index < bytes.len {
+            if (self.registers.read(RAW_INTR_STAT) & TX_ABORT) != 0 {
+                return self.aborted()
+            }
+            if (self.registers.read(STATUS) & TX_NOT_FULL) != 0 {
+                command := bytes[index] as u32
+                if stop && index + 1 == bytes.len {
+                    command |= STOP
+                }
+                self.registers.write(DATA_CMD, command)
+                index += 1
+                polls = 0
+            } else {
+                polls += 1
+                if polls >= POLLS {
+                    return self.stuck()
+                }
+            }
+        }
+        if stop {
+            return self.finish(TX_EMPTY | STOP_DETECTED)
+        }
+        return self.finish(TX_EMPTY)
+    }
+
+    // Queue read commands, at most a receive FIFO's worth ahead of the bytes
+    // collected, so the FIFO never overflows. The first command repeats the
+    // START if `restart`; the last one ends with STOP.
+    fn receive(&mut self, buffer: &mut[u8], restart: bool) -> void!hal.Error {
+        issued := 0usize
+        received := 0usize
+        polls := 0u32
+        for received < buffer.len {
+            if (self.registers.read(RAW_INTR_STAT) & TX_ABORT) != 0 {
+                return self.aborted()
+            }
+            progress := false
+            if issued < buffer.len && issued - received < self.rx_depth && (self.registers.read(STATUS) & TX_NOT_FULL) != 0 {
+                command := READ
+                if restart && issued == 0 {
+                    command |= RESTART
+                }
+                if issued + 1 == buffer.len {
+                    command |= STOP
+                }
+                self.registers.write(DATA_CMD, command)
+                issued += 1
+                progress = true
+            }
+            if (self.registers.read(STATUS) & RX_NOT_EMPTY) != 0 {
+                buffer[received] = (self.registers.read(DATA_CMD) & 0xFF) as u8
+                received += 1
+                progress = true
+            }
+            if progress {
+                polls = 0
+            } else {
+                polls += 1
+                if polls >= POLLS {
+                    return self.stuck()
+                }
+            }
+        }
+        return self.finish(STOP_DETECTED)
+    }
+
+    // Wait until every flag in `flags` is raised, unless the transaction
+    // aborts first. An abort is flagged before the STOP it causes.
+    fn finish(&mut self, flags: u32) -> void!hal.Error {
+        for _ in 0..POLLS {
+            raw := self.registers.read(RAW_INTR_STAT)
+            if (raw & TX_ABORT) != 0 {
+                return self.aborted()
+            }
+            if (raw & flags) == flags {
+                if (flags & STOP_DETECTED) != 0 {
+                    self.registers.read(CLR_STOP_DET)
+                }
+                return ok()
+            }
+        }
+        return self.stuck()
+    }
+
+    // The controller gave up: it has flushed its FIFOs and, unless another
+    // master took over, sent a STOP. Report why, and release the FIFOs once
+    // the bus is idle.
+    fn aborted(&mut self) -> void!hal.Error {
+        source := self.registers.read(TX_ABRT_SOURCE)
+        for _ in 0..POLLS {
+            if (self.registers.read(STATUS) & MASTER_ACTIVE) == 0 {
+                break
+            }
+        }
+        self.registers.read(CLR_TX_ABRT)
+        self.registers.read(CLR_STOP_DET)
+        if (source & NOT_ACKNOWLEDGED) != 0 {
+            return err(hal.Error.NoAcknowledge)
+        }
+        // Lost arbitration, or a protocol fault.
+        return err(hal.Error.Bus)
+    }
+
+    // No progress within POLLS: a device holds SCL low or the controller
+    // hangs. Abort the transfer and disable the controller, so the next
+    // transaction starts afresh.
+    fn stuck(&mut self) -> void!hal.Error {
+        self.registers.write(ENABLE, ENABLED | ABORT)
+        for _ in 0..POLLS {
+            if (self.registers.read(ENABLE) & ABORT) == 0 {
+                break
+            }
+        }
+        self.registers.read(CLR_INTR)
+        self.target = NO_TARGET
+        match self.disable() {
+            ok() => {}
+            err(_) => {}
+        }
+        return err(hal.Error.Timeout)
+    }
+}

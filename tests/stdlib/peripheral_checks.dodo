@@ -1,0 +1,924 @@
+package main
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/embedded/peripheral/designware_i2c"
+import "std/embedded/peripheral/pl022"
+
+// Host checks for std/embedded/peripheral: the DesignWare I2C and PL022 SPI
+// controller drivers against behavioural models of the controllers. The
+// models enforce the hardware's rules (registers that may change only while
+// disabled, FIFO depths, the flushed state after an abort) and process
+// commands slower than the drivers poll, so FIFO back-pressure is exercised.
+
+const CLOCK_HZ: u32 = 125_000_000
+
+// --- A DW_apb_i2c controller and one device on its bus -----------------
+
+// Bus events, logged in order: conditions, address bytes (address << 1 |
+// read), and data bytes in either direction.
+const START: u32 = 0x100
+const RESTART: u32 = 0x200
+const STOP: u32 = 0x300
+const ADDRESS: u32 = 0x400
+
+const DEVICE: u8 = 0x48
+const I2C_FIFO: usize = 16
+
+struct I2cModel {
+    // Registers the driver configures.
+    con: u32
+    tar: u32
+    enabled: bool
+    high: u32
+    low: u32
+    spike: u32
+    hold: u32
+    interrupt_mask: u32
+    // COMP_PARAM_1, which encodes the receive FIFO depth.
+    parameters: u32
+    rx_depth: usize
+    tx: [16]u32
+    tx_count: usize
+    rx: [16]u8
+    rx_count: usize
+    aborted: bool
+    abort_source: u32
+    stop_detected: bool
+    // Bus state.
+    active: bool
+    reading: bool
+    first_write: bool
+    // The device: 256 registers behind an auto-incrementing pointer.
+    registers: [256]u8
+    pointer: u8
+    // Process one command every `period` register reads, or with `burst`
+    // every queued command at once, as if the CPU had been interrupted.
+    period: u32
+    burst: bool
+    reads: u32
+    // Failure injection: never finish a command, NACK the data byte after
+    // `ack_bytes` acknowledged ones, lose arbitration at the next address.
+    stuck: bool
+    ack_bytes: u32
+    acked: u32
+    lose_arbitration: bool
+    // Rule violations the driver must never cause.
+    tx_overflow: bool
+    rx_overflow: bool
+    log: [96]u32
+    log_count: usize
+
+    fn new(rx_depth: usize, period: u32) -> I2cModel {
+        return I2cModel {
+            con: 0,
+            tar: 0x55,
+            enabled: false,
+            high: 0,
+            low: 0,
+            spike: 0,
+            hold: 0x0001_0001,
+            interrupt_mask: 0x8FF,
+            parameters: ((rx_depth as u32 - 1) << 16) | 0x0F00,
+            rx_depth,
+            tx: [0; 16],
+            tx_count: 0,
+            rx: [0; 16],
+            rx_count: 0,
+            aborted: false,
+            abort_source: 0,
+            stop_detected: false,
+            active: false,
+            reading: false,
+            first_write: false,
+            registers: [0; 256],
+            pointer: 0,
+            period,
+            burst: false,
+            reads: 0,
+            stuck: false,
+            ack_bytes: 0xFFFF_FFFF,
+            acked: 0,
+            lose_arbitration: false,
+            tx_overflow: false,
+            rx_overflow: false,
+            log: [0; 96],
+            log_count: 0,
+        }
+    }
+
+    fn record(&mut self, event: u32) {
+        core.assert(self.log_count < 96)
+        self.log[self.log_count] = event
+        self.log_count += 1
+    }
+
+    fn expect(&mut self, events: &[u32]) {
+        core.assert_eq(self.log_count, events.len)
+        for index in 0..events.len {
+            core.assert_eq(self.log[index], events[index])
+        }
+        self.log_count = 0
+        core.assert(!self.tx_overflow && !self.rx_overflow)
+    }
+
+    // The controller gives up: it flushes both FIFOs and ends with STOP,
+    // and ignores new commands until the abort is cleared.
+    fn abort(&mut self, source: u32) {
+        self.aborted = true
+        self.abort_source = source
+        self.tx_count = 0
+        self.rx_count = 0
+        if self.active && (source & (1 << 12)) == 0 {
+            self.record(STOP)
+            self.stop_detected = true
+        }
+        self.active = false
+    }
+
+    fn step(&mut self) {
+        self.reads += 1
+        if self.stuck || self.reads % self.period != 0 {
+            return
+        }
+        self.process()
+        for self.burst && self.tx_count > 0 {
+            self.process()
+        }
+    }
+
+    fn process(&mut self) {
+        if self.tx_count == 0 {
+            return
+        }
+        command := self.tx[0]
+        for index in 1..self.tx_count {
+            self.tx[index - 1] = self.tx[index]
+        }
+        self.tx_count -= 1
+        read := (command & 0x100) != 0
+        if !self.active || (command & 0x400) != 0 || read != self.reading {
+            if self.active {
+                core.assert((self.con & (1 << 5)) != 0)
+                self.record(RESTART)
+            } else {
+                self.record(START)
+            }
+            self.active = true
+            if self.lose_arbitration {
+                self.lose_arbitration = false
+                self.abort(1 << 12)
+                return
+            }
+            direction := 0u32
+            if read {
+                direction = 1
+            }
+            target := self.tar
+            self.record(ADDRESS | (target << 1) | direction)
+            if self.tar != DEVICE as u32 {
+                self.abort(1 << 0)
+                return
+            }
+            self.reading = read
+            self.first_write = true
+        }
+        if read {
+            if self.rx_count == self.rx_depth {
+                self.rx_overflow = true
+            } else {
+                value := self.registers[self.pointer as usize]
+                self.record(value as u32)
+                self.rx[self.rx_count] = value
+                self.rx_count += 1
+                self.pointer = core.wrapping_add(self.pointer, 1)
+            }
+        } else {
+            value := (command & 0xFF) as u8
+            self.record(value as u32)
+            if self.acked == self.ack_bytes {
+                self.abort(1 << 3)
+                return
+            }
+            self.acked += 1
+            if self.first_write {
+                self.pointer = value
+                self.first_write = false
+            } else {
+                self.registers[self.pointer as usize] = value
+                self.pointer = core.wrapping_add(self.pointer, 1)
+            }
+        }
+        if (command & 0x200) != 0 {
+            self.record(STOP)
+            self.active = false
+            self.stop_detected = true
+        }
+    }
+
+    // The register block protocol.
+    pub fn read(&mut self, offset: usize) -> u32 {
+        self.step()
+        if offset == 0x10 {
+            core.assert(self.rx_count > 0)
+            value := self.rx[0]
+            for index in 1..self.rx_count {
+                self.rx[index - 1] = self.rx[index]
+            }
+            self.rx_count -= 1
+            return value as u32
+        } else if offset == 0x34 {
+            raw := 0u32
+            if self.tx_count == 0 && (self.con & (1 << 8)) != 0 && !self.stuck {
+                raw |= 1 << 4
+            }
+            if self.aborted {
+                raw |= 1 << 6
+            }
+            if self.stop_detected {
+                raw |= 1 << 9
+            }
+            return raw
+        } else if offset == 0x40 {
+            self.aborted = false
+            self.abort_source = 0
+            self.stop_detected = false
+            return 0
+        } else if offset == 0x54 {
+            self.aborted = false
+            self.abort_source = 0
+            return 0
+        } else if offset == 0x60 {
+            self.stop_detected = false
+            return 0
+        } else if offset == 0x6C {
+            if self.enabled {
+                return 1
+            }
+            return 0
+        } else if offset == 0x70 {
+            status := 0u32
+            if self.tx_count < I2C_FIFO {
+                status |= 1 << 1
+            }
+            if self.rx_count > 0 {
+                status |= 1 << 3
+            }
+            if self.active || self.tx_count > 0 {
+                status |= 1 << 5
+            }
+            return status
+        } else if offset == 0x7C {
+            return self.hold
+        } else if offset == 0x80 {
+            return self.abort_source
+        } else if offset == 0x9C {
+            if self.enabled {
+                return 1
+            }
+            return 0
+        } else if offset == 0xF4 {
+            return self.parameters
+        }
+        core.assert(false)
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x6C {
+            if (value & 2) != 0 {
+                core.assert(self.enabled)
+                self.abort(1 << 16)
+            }
+            self.enabled = (value & 1) != 0
+            if !self.enabled {
+                self.tx_count = 0
+                self.rx_count = 0
+                if self.active {
+                    self.record(STOP)
+                    self.active = false
+                }
+            }
+            return
+        }
+        if offset == 0x10 {
+            core.assert(self.enabled)
+            if self.aborted {
+                return
+            }
+            if self.tx_count == I2C_FIFO {
+                self.tx_overflow = true
+                return
+            }
+            self.tx[self.tx_count] = value
+            self.tx_count += 1
+            return
+        }
+        // Everything else is configuration, writable only while disabled.
+        core.assert(!self.enabled)
+        if offset == 0x00 {
+            self.con = value
+        } else if offset == 0x04 {
+            self.tar = value
+        } else if offset == 0x1C {
+            self.high = value
+        } else if offset == 0x20 {
+            self.low = value
+        } else if offset == 0x30 {
+            self.interrupt_mask = value
+        } else if offset == 0x38 || offset == 0x3C {
+            core.assert_eq(value, 0u32)
+        } else if offset == 0x7C {
+            self.hold = value
+        } else if offset == 0xA0 {
+            self.spike = value
+        } else {
+            core.assert(false)
+        }
+    }
+}
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn i2c_timing() {
+    fast := designware_i2c.timing(CLOCK_HZ, hal.I2C_FAST_HZ)!
+    core.assert_eq(fast.high, 126u32)
+    core.assert_eq(fast.low, 187u32)
+    core.assert_eq(fast.spike, 11u32)
+    core.assert_eq(fast.hold, 38u32)
+    core.assert_eq(fast.frequency_hz, 399_361u32)
+
+    standard := designware_i2c.timing(CLOCK_HZ, hal.I2C_STANDARD_HZ)!
+    core.assert_eq(standard.high + standard.low, 1250u32)
+    core.assert_eq(standard.frequency_hz, 100_000u32)
+
+    // Fast mode plus has a shorter SDA hold time.
+    plus := designware_i2c.timing(150_000_000, hal.I2C_FAST_PLUS_HZ)!
+    core.assert_eq(plus.high, 60u32)
+    core.assert_eq(plus.low, 90u32)
+    core.assert_eq(plus.hold, 19u32)
+
+    invalid: [3]u32 = [0, 1_000_001, 1_000]
+    for index in 0..3usize {
+        match designware_i2c.timing(CLOCK_HZ, invalid[index]) {
+            ok(_) => {
+                core.assert(false)
+            }
+            err(error) => {
+                core.assert(error == hal.Error.InvalidInput)
+            }
+        }
+    }
+    match designware_i2c.timing(12_000_000, hal.I2C_FAST_PLUS_HZ) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn i2c_bus(model: I2cModel) -> designware_i2c.Controller<I2cModel> {
+    return designware_i2c.Controller.new(model, designware_i2c.timing(CLOCK_HZ, hal.I2C_FAST_HZ)!)
+}
+
+fn i2c_configuration() {
+    bus := i2c_bus(I2cModel.new(16, 1))
+    core.assert_eq(bus.frequency_hz(), 399_361u32)
+    model := bus.release()
+    // Master, fast-mode timing, repeated starts, target mode off, and
+    // TX_EMPTY after the last command left.
+    core.assert_eq(model.con, 0x165u32)
+    core.assert_eq(model.high, 126u32)
+    core.assert_eq(model.low, 187u32)
+    core.assert_eq(model.spike, 11u32)
+    // The receive hold time in the upper half is kept.
+    core.assert_eq(model.hold, 0x0001_0026u32)
+    core.assert_eq(model.interrupt_mask, 0u32)
+    core.assert(!model.enabled)
+    nothing: [0]u32 = []
+    model.expect(&nothing)
+}
+
+fn i2c_transactions() {
+    bus := i2c_bus(I2cModel.new(16, 1))
+    address := ADDRESS | (DEVICE as u32 << 1)
+
+    // A register write is one transaction ending in STOP.
+    hal.write_register(&mut bus, DEVICE, 0x01, 0x80)!
+    // A register read writes the number, then reads after a repeated START.
+    model := bus.release()
+    core.assert_eq(model.registers[1], 0x80u8)
+    register_write: [5]u32 = [START, address, 0x01, 0x80, STOP]
+    model.expect(&register_write)
+    model.registers[0x10] = 0x01
+    model.registers[0x11] = 0x23
+    bus = i2c_bus(model)
+    raw: [2]u8 = [0, 0]
+    hal.read_registers(&mut bus, DEVICE, 0x10, &mut raw)!
+    core.assert_eq(raw[0], 0x01u8)
+    core.assert_eq(raw[1], 0x23u8)
+    core.assert_eq(hal.read_register(&mut bus, DEVICE, 0x11)!, 0x23u8)
+
+    // A plain read continues from the register pointer.
+    one: [1]u8 = [0]
+    bus.read(DEVICE, &mut one)!
+    model = bus.release()
+    register_reads: [19]u32 = [
+        START, address, 0x10, RESTART, address | 1, 0x01, 0x23, STOP,
+        START, address, 0x11, RESTART, address | 1, 0x23, STOP,
+        START, address | 1, 0x00, STOP
+    ]
+    model.expect(&register_reads)
+}
+
+fn i2c_long_transfers() {
+    // Commands complete slower than the driver queues them, so the transmit
+    // FIFO fills. Then the controller works off its whole queue at once, as
+    // while an interrupt delays the CPU: the reads in flight must fit the
+    // 2-entry receive FIFO.
+    model := I2cModel.new(2, 7)
+    for index in 0..40usize {
+        model.registers[0x40 + index] = (3 * index) as u8
+    }
+    bus := i2c_bus(model)
+    data: [41]u8 = [0; 41]
+    data[0] = 0x80
+    for index in 1..41usize {
+        data[index] = (200 - index) as u8
+    }
+    bus.write(DEVICE, &data)!
+    model = bus.release()
+    model.burst = true
+    bus = i2c_bus(model)
+    buffer: [40]u8 = [0; 40]
+    command: [1]u8 = [0x40]
+    bus.write_read(DEVICE, &command, &mut buffer)!
+    for index in 0..40usize {
+        core.assert_eq(buffer[index], (3 * index) as u8)
+    }
+    model = bus.release()
+    for index in 1..41usize {
+        core.assert_eq(model.registers[0x80 + index - 1], (200 - index) as u8)
+    }
+    core.assert(!model.tx_overflow && !model.rx_overflow)
+}
+
+fn i2c_failures() {
+    bus := i2c_bus(I2cModel.new(16, 3))
+    one: [1]u8 = [0x07]
+
+    // Nobody at the address: the controller aborts and sends STOP itself.
+    expect_error(bus.write(0x10, &one), hal.Error.NoAcknowledge)
+    expect_error(bus.read(0x10, &mut one), hal.Error.NoAcknowledge)
+    probe: [1]u8 = [0]
+    expect_error(bus.write_read(0x10, &one, &mut probe), hal.Error.NoAcknowledge)
+    // The bus recovers for the next transaction.
+    bus.write(DEVICE, &one)!
+    model := bus.release()
+    missing_device: [13]u32 = [
+        START, ADDRESS | 0x20, STOP,
+        START, ADDRESS | 0x21, STOP,
+        START, ADDRESS | 0x20, STOP,
+        START, ADDRESS | 0x90, 0x07, STOP
+    ]
+    model.expect(&missing_device)
+
+    // The device stops acknowledging data.
+    model.ack_bytes = model.acked + 2
+    bus = i2c_bus(model)
+    data: [4]u8 = [1, 2, 3, 4]
+    expect_error(bus.write(DEVICE, &data), hal.Error.NoAcknowledge)
+    model = bus.release()
+    data_refused: [6]u32 = [START, ADDRESS | 0x90, 1, 2, 3, STOP]
+    model.expect(&data_refused)
+    model.ack_bytes = 0xFFFF_FFFF
+
+    // Another master wins arbitration.
+    model.lose_arbitration = true
+    bus = i2c_bus(model)
+    expect_error(bus.write(DEVICE, &one), hal.Error.Bus)
+    bus.write(DEVICE, &one)!
+
+    // Arguments the controller cannot send.
+    empty: [0]u8 = []
+    nothing: [0]u8 = []
+    expect_error(bus.write(DEVICE, &empty), hal.Error.InvalidInput)
+    expect_error(bus.read(DEVICE, &mut nothing), hal.Error.InvalidInput)
+    expect_error(bus.write_read(DEVICE, &empty, &mut nothing), hal.Error.InvalidInput)
+    expect_error(bus.write(0x80, &one), hal.Error.InvalidInput)
+    // An empty half of write_read is a plain read or write.
+    bus.write_read(DEVICE, &one, &mut nothing)!
+    bus.write_read(DEVICE, &empty, &mut one)!
+
+    // A device that holds SCL low: Timeout, then a fresh start.
+    model = bus.release()
+    after_arbitration: [13]u32 = [
+        START,
+        START, ADDRESS | 0x90, 0x07, STOP,
+        START, ADDRESS | 0x90, 0x07, STOP,
+        START, ADDRESS | 0x91, 0x00, STOP
+    ]
+    model.expect(&after_arbitration)
+    model.stuck = true
+    bus = i2c_bus(model)
+    expect_error(bus.write(DEVICE, &one), hal.Error.Timeout)
+    model = bus.release()
+    core.assert(!model.enabled)
+    model.stuck = false
+    bus = i2c_bus(model)
+    bus.write(DEVICE, &one)!
+    model = bus.release()
+    after_timeout: [4]u32 = [START, ADDRESS | 0x90, 0x00, STOP]
+    model.expect(&after_timeout)
+}
+
+fn i2c_frequency() {
+    bus := i2c_bus(I2cModel.new(16, 1))
+    one: [1]u8 = [0]
+    bus.write(DEVICE, &one)!
+    // Timing registers change only while the controller is disabled; the
+    // model checks that.
+    bus.set_frequency(hal.I2C_STANDARD_HZ)!
+    core.assert_eq(bus.frequency_hz(), 100_000u32)
+    expect_error(bus.set_frequency(2_000_000), hal.Error.InvalidInput)
+    core.assert_eq(bus.frequency_hz(), 100_000u32)
+    bus.write(DEVICE, &one)!
+    model := bus.release()
+    core.assert_eq(model.high + model.low, 1250u32)
+}
+
+// --- A PL022 and the device answering on its bus -----------------------
+
+const SPI_FIFO: usize = 8
+
+struct SpiModel {
+    cr0: u32
+    cr1: u32
+    prescale: u32
+    interrupt_mask: u32
+    tx: [8]u8
+    tx_count: usize
+    // The frame in the shift register, between the FIFOs.
+    shifting: bool
+    shift_value: u8
+    rx: [8]u8
+    rx_count: usize
+    overrun: bool
+    // The device's reply, then zeros; or the sent byte in loopback mode.
+    reply: [64]u8
+    reply_length: usize
+    reply_position: usize
+    sent: [64]u8
+    sent_count: usize
+    // Shift one frame every `period` status reads. With `burst`, shift every
+    // queued frame at once whenever the transmit FIFO is full, as if an
+    // interrupt had delayed the CPU at the worst moment.
+    period: u32
+    burst: bool
+    reads: u32
+    // Lose the next received byte to an overflow.
+    lose_reply: bool
+    tx_overflow: bool
+
+    fn new(period: u32) -> SpiModel {
+        return SpiModel {
+            cr0: 0,
+            cr1: 0,
+            prescale: 0,
+            interrupt_mask: 0xF,
+            tx: [0; 8],
+            tx_count: 0,
+            shifting: false,
+            shift_value: 0,
+            rx: [0; 8],
+            rx_count: 0,
+            overrun: false,
+            reply: [0; 64],
+            reply_length: 0,
+            reply_position: 0,
+            sent: [0; 64],
+            sent_count: 0,
+            period,
+            burst: false,
+            reads: 0,
+            lose_reply: false,
+            tx_overflow: false,
+        }
+    }
+
+    fn reply_with(&mut self, bytes: &[u8]) {
+        for index in 0..bytes.len {
+            self.reply[index] = bytes[index]
+        }
+        self.reply_length = bytes.len
+        self.reply_position = 0
+    }
+
+    fn step(&mut self) {
+        self.reads += 1
+        if self.burst && self.tx_count == SPI_FIFO {
+            for self.tx_count > 0 || self.shifting {
+                self.shift()
+            }
+        } else if self.reads % self.period == 0 {
+            self.shift()
+        }
+    }
+
+    // Finish the frame in the shift register, then load the next one.
+    fn shift(&mut self) {
+        if self.shifting {
+            value := self.shift_value
+            answer := 0u8
+            if (self.cr1 & 1) != 0 {
+                answer = value
+            } else {
+                core.assert(self.sent_count < 64)
+                self.sent[self.sent_count] = value
+                self.sent_count += 1
+                if self.reply_position < self.reply_length {
+                    answer = self.reply[self.reply_position]
+                    self.reply_position += 1
+                }
+            }
+            if self.rx_count == SPI_FIFO || self.lose_reply {
+                self.overrun = true
+                self.lose_reply = false
+            } else {
+                self.rx[self.rx_count] = answer
+                self.rx_count += 1
+            }
+            self.shifting = false
+        }
+        if self.tx_count > 0 {
+            self.shift_value = self.tx[0]
+            for index in 1..self.tx_count {
+                self.tx[index - 1] = self.tx[index]
+            }
+            self.tx_count -= 1
+            self.shifting = true
+        }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x000 {
+            return self.cr0
+        } else if offset == 0x004 {
+            return self.cr1
+        } else if offset == 0x008 {
+            core.assert(self.rx_count > 0)
+            value := self.rx[0]
+            for index in 1..self.rx_count {
+                self.rx[index - 1] = self.rx[index]
+            }
+            self.rx_count -= 1
+            return value as u32
+        } else if offset == 0x00C {
+            self.step()
+            status := 0u32
+            if self.tx_count == 0 {
+                status |= 1 << 0
+            }
+            if self.tx_count < SPI_FIFO {
+                status |= 1 << 1
+            }
+            if self.rx_count > 0 {
+                status |= 1 << 2
+            }
+            if self.tx_count > 0 || self.shifting {
+                status |= 1 << 4
+            }
+            return status
+        } else if offset == 0x018 {
+            if self.overrun {
+                return 1
+            }
+            return 0
+        }
+        core.assert(false)
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        enabled := (self.cr1 & 2) != 0
+        if offset == 0x004 {
+            // Master mode only.
+            core.assert_eq(value & 4, 0u32)
+            self.cr1 = value
+        } else if offset == 0x008 {
+            core.assert(enabled)
+            if self.tx_count == SPI_FIFO {
+                self.tx_overflow = true
+            } else {
+                self.tx[self.tx_count] = value as u8
+                self.tx_count += 1
+            }
+        } else if offset == 0x020 {
+            if (value & 1) != 0 {
+                self.overrun = false
+            }
+        } else if offset == 0x014 {
+            self.interrupt_mask = value
+        } else {
+            // The format and clock change only while disabled.
+            core.assert(!enabled)
+            if offset == 0x000 {
+                self.cr0 = value
+            } else if offset == 0x010 {
+                self.prescale = value
+            } else {
+                core.assert(false)
+            }
+        }
+    }
+
+    fn expect_sent(&mut self, bytes: &[u8]) {
+        core.assert_eq(self.sent_count, bytes.len)
+        for index in 0..bytes.len {
+            core.assert_eq(self.sent[index], bytes[index])
+        }
+        self.sent_count = 0
+        core.assert(!self.tx_overflow && !self.overrun)
+        core.assert_eq(self.rx_count, 0usize)
+    }
+}
+
+fn spi_divisors() {
+    one := pl022.divisors(CLOCK_HZ, 1_000_000)!
+    core.assert_eq(one.prescale, 2u32)
+    core.assert_eq(one.rate, 63u32)
+    core.assert_eq(one.frequency_hz, 992_063u32)
+    // Requests above half the input clock get the fastest clock.
+    fastest := pl022.divisors(CLOCK_HZ, 100_000_000)!
+    core.assert_eq(fastest.prescale * fastest.rate, 2u32)
+    core.assert_eq(fastest.frequency_hz, 62_500_000u32)
+    // Near the bottom of the range the result still never exceeds the
+    // request.
+    slow := pl022.divisors(CLOCK_HZ, 2_000)!
+    core.assert(slow.frequency_hz <= 2_000 && slow.frequency_hz > 1_990)
+    core.assert(slow.prescale % 2 == 0 && slow.prescale <= 254 && slow.rate <= 256)
+    requests: [5]u32 = [3_000, 1_000_000, 4_000_000, 10_000_000, 33_333_333]
+    for index in 0..5usize {
+        frequency := requests[index]
+        result := pl022.divisors(150_000_000, frequency)!
+        core.assert(result.frequency_hz <= frequency)
+        core.assert_eq(result.frequency_hz, 150_000_000 / (result.prescale * result.rate))
+    }
+    match pl022.divisors(CLOCK_HZ, 1_900) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn spi_bus(model: SpiModel, mode: hal.SpiMode) -> pl022.Controller<SpiModel> {
+    return pl022.Controller.new(model, pl022.divisors(CLOCK_HZ, 1_000_000)!, mode)
+}
+
+fn spi_configuration() {
+    // 8-bit Motorola frames, the divisor, and polarity and phase per mode.
+    expected: [4]u32 = [0x3E07, 0x3E87, 0x3E47, 0x3EC7]
+    for index in 0..4usize {
+        mode := hal.SpiMode.Mode0
+        if index == 1 {
+            mode = hal.SpiMode.Mode1
+        } else if index == 2 {
+            mode = hal.SpiMode.Mode2
+        } else if index == 3 {
+            mode = hal.SpiMode.Mode3
+        }
+        bus := spi_bus(SpiModel.new(1), mode)
+        model := bus.release()
+        core.assert_eq(model.cr0, expected[index])
+        core.assert_eq(model.prescale, 2u32)
+        core.assert_eq(model.interrupt_mask, 0u32)
+        core.assert_eq(model.cr1, 0u32)
+    }
+    bus := spi_bus(SpiModel.new(1), hal.SpiMode.Mode0)
+    core.assert_eq(bus.frequency_hz(), 992_063u32)
+    bus.set_mode(hal.SpiMode.Mode3)
+    bus.set_frequency(10_000_000)!
+    core.assert_eq(bus.frequency_hz(), 8_928_571u32)
+    match bus.set_frequency(100) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    model := bus.release()
+    core.assert_eq(model.cr0, 0x06C7u32)
+    core.assert_eq(model.prescale, 2u32)
+}
+
+fn spi_transfers() {
+    // Frames shift slower than the driver queues them, so the transmit FIFO
+    // fills, and now and then all at once: the bytes in flight, including
+    // the one in the shift register, must fit the receive FIFO.
+    model := SpiModel.new(3)
+    model.burst = true
+    reply: [20]u8 = [0; 20]
+    for index in 0..20usize {
+        reply[index] = (100 + index) as u8
+    }
+    model.reply_with(&reply)
+    bus := spi_bus(model, hal.SpiMode.Mode0)
+    bytes: [20]u8 = [0; 20]
+    sent: [20]u8 = [0; 20]
+    for index in 0..20usize {
+        bytes[index] = index as u8
+        sent[index] = index as u8
+    }
+    bus.transfer(&mut bytes)!
+    for index in 0..20usize {
+        core.assert_eq(bytes[index], (100 + index) as u8)
+    }
+    model = bus.release()
+    model.expect_sent(&sent)
+
+    // A write sends everything, waits for the last frame, and leaves nothing
+    // behind in the receive FIFO.
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    long: [30]u8 = [0; 30]
+    for index in 0..30usize {
+        long[index] = (7 * index) as u8
+    }
+    bus.write(&long)!
+    model = bus.release()
+    model.expect_sent(&long)
+
+    // Loopback reads back what was sent, without the device seeing it.
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    bus.set_loopback(true)
+    echo: [3]u8 = [0xA5, 0x5A, 0xFF]
+    bus.transfer(&mut echo)!
+    core.assert_eq(echo[0], 0xA5u8)
+    core.assert_eq(echo[2], 0xFFu8)
+    bus.set_loopback(false)
+
+    // hal.SpiDevice drives a chip select around each transaction.
+    flash := hal.SpiDevice.new(fake.Pin.new())
+    model = bus.release()
+    flash_id: [4]u8 = [0, 0xEF, 0x40, 0x18]
+    model.reply_with(&flash_id)
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    command: [1]u8 = [0x9F]
+    id: [3]u8 = [0, 0, 0]
+    flash.write_read(&mut bus, &command, &mut id)!
+    core.assert_eq(id[0], 0xEFu8)
+    core.assert_eq(id[2], 0x18u8)
+    select := flash.release()
+    // Deselected by `new`, then selected once for the whole transaction.
+    core.assert(select.is_high())
+    core.assert_eq(select.changes(), 3u32)
+    model = bus.release()
+    id_command: [4]u8 = [0x9F, 0, 0, 0]
+    model.expect_sent(&id_command)
+}
+
+fn spi_overrun() {
+    // A receive FIFO that overflowed, for example because something else
+    // used the controller, is reported once and cleared.
+    bus := spi_bus(SpiModel.new(1), hal.SpiMode.Mode0)
+    model := bus.release()
+    model.overrun = true
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    bytes: [2]u8 = [1, 2]
+    expect_error(bus.transfer(&mut bytes), hal.Error.Overrun)
+    bus.transfer(&mut bytes)!
+
+    // A lost reply ends the transfer instead of waiting for it forever.
+    model = bus.release()
+    model.lose_reply = true
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    expect_error(bus.transfer(&mut bytes), hal.Error.Overrun)
+    bus.transfer(&mut bytes)!
+}
+
+fn main() {
+    i2c_timing()
+    i2c_configuration()
+    i2c_transactions()
+    i2c_long_transfers()
+    i2c_failures()
+    i2c_frequency()
+    spi_divisors()
+    spi_configuration()
+    spi_transfers()
+    spi_overrun()
+}

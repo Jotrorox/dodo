@@ -1,4 +1,5 @@
-//! Hardware abstraction layer: host execution with fakes, interrupt-control
+//! Hardware abstraction layer: host execution with fakes, the shared
+//! peripheral drivers against simulated controllers, interrupt-control
 //! lowering on bare-metal targets, and rejection where no mask exists.
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -78,6 +79,37 @@ fn cyw43_driver_executes_against_simulated_pins_and_chip() {
             "execute CYW43 fixture",
         );
     }
+}
+
+#[test]
+fn peripheral_drivers_execute_against_simulated_controllers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("peripheral");
+    let source = root.join("tests/stdlib/peripheral_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "peripheral-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile peripheral fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute peripheral fixture",
+        );
+    }
+}
+
+#[test]
+fn sensor_example_tests_pass_against_fakes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = dodo(&["test"], &root.join("examples/hal_sensor.dodo"));
+    success(&output, "test examples/hal_sensor.dodo");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("3 passed"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[test]

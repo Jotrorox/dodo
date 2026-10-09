@@ -11,8 +11,10 @@ import "core/ptr"
 // Three layers, from the bottom up:
 //
 // 1. Registers. `Reg<T>` gives typed volatile access to one memory-mapped
-//    register, and mask constants name its fields. Creating a register is the single unsafe step;
-//    reading and writing an owned handle afterwards is safe.
+//    register, and mask constants name its fields. `RegisterBlock` is a
+//    peripheral's run of 32-bit registers at offsets from one base address.
+//    Creating either is the single unsafe step; reading and writing an owned
+//    handle afterwards is safe.
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
 // 3. Device protocols. Drivers are generic functions or structs over any value
@@ -29,9 +31,21 @@ import "core/ptr"
 //                 write(&mut self, bytes: &[u8]) -> void!Error
 //    Serial port: the `std/io` Reader and Writer protocols, so ports work with
 //                 `std/io` helpers and `std/fmt` formatting unchanged.
+//    Register     read(&mut self, offset: usize) -> u32
+//    block:       write(&mut self, offset: usize, value: u32) -> void
 //
 // Addresses are 7-bit I2C addresses. Pin and delay operations cannot fail;
-// bus operations report the shared `Error` below.
+// bus operations report the shared `Error` below. A bus is configured when it
+// is created, with a frequency and for SPI a `SpiMode`; the protocols then
+// only move bytes, so drivers never depend on how a bus was set up.
+//
+// The register block protocol is for peripheral drivers rather than device
+// drivers. Microcontroller vendors license the same peripheral designs, so
+// one I2C or SPI controller appears in many chips at different addresses.
+// `std/embedded/peripheral` drives such controllers through any register
+// block: a `RegisterBlock` on the chip, or a simulated controller in a
+// desktop test. Reads take `&mut self` because reading a device register can
+// change it, for example by popping a FIFO.
 //
 // Chips and boards. A chip package (`std/embedded/chip/NAME`) turns one
 // microcontroller's registers into values with the protocols above. A board
@@ -45,8 +59,17 @@ import "core/ptr"
 //    NAME: &str                    the board's name
 //    take() -> Board!Error         start the chip once; Busy on a second call
 //    Board.led                     the user LED, an output pin, on when high
-//    Board.pins                    output(n) / input(n) -> Pin!Error per GPIO
+//    Board.pins                    output(n) / input(n) -> Pin!Error per GPIO,
+//                                  i2c(sda, scl, hz) -> I2c!Error, and
+//                                  spi(clock, tx, rx, mode, hz) -> Spi!Error
+//                                  with rx an Option<u32>, for buses on
+//                                  those pins (Busy if a pin or the
+//                                  controller is taken, InvalidInput if the
+//                                  pins cannot carry the bus)
 //    Board.timer                   delay_us, delay_ms, now_us(&self) -> u64
+//    I2C_SDA_PIN, I2C_SCL_PIN      the board's usual I2C pins
+//    SPI_CLOCK_PIN, SPI_TX_PIN,    the board's usual SPI pins, and a free
+//    SPI_RX_PIN, SPI_SELECT_PIN    pin for one device's chip select
 //    reboot_to_bootloader()        restart into the board's flashing mode
 
 // Bus and device failures shared by every driver and chip implementation.
@@ -92,6 +115,25 @@ pub fn error_name(error: Error) -> &str from(static) {
             return "Unsupported"
         }
     }
+}
+
+// Common I2C bus frequencies: standard mode, fast mode, and fast mode plus.
+// Every device supports standard mode; most sensors also fast mode.
+pub const I2C_STANDARD_HZ: u32 = 100_000
+pub const I2C_FAST_HZ: u32 = 400_000
+pub const I2C_FAST_PLUS_HZ: u32 = 1_000_000
+
+// SPI clock polarity and phase, as numbered in device datasheets. Mode 0,
+// clock idle low and data sampled on the rising edge, is the most common.
+pub enum SpiMode {
+    // Clock idles low; data is sampled on the rising (first) edge.
+    Mode0,
+    // Clock idles low; data is sampled on the falling (second) edge.
+    Mode1,
+    // Clock idles high; data is sampled on the falling (first) edge.
+    Mode2,
+    // Clock idles high; data is sampled on the rising (second) edge.
+    Mode3
 }
 
 // Register fields are plain mask constants of the register's type, as in a
@@ -212,6 +254,41 @@ pub struct Reg<T> {
             }
         }
         return err(Error.Timeout)
+    }
+}
+
+// A peripheral's 32-bit registers at byte offsets from one base address.
+// Implements the register block protocol, so drivers in
+// `std/embedded/peripheral` reach the hardware through it. Every access is
+// one volatile 32-bit load or store, like `Reg<u32>`. Move-only: owning it is
+// the permission to use the whole block.
+pub struct RegisterBlock {
+    base: usize
+
+    // SAFETY: `base` must be the 4-aligned base address of one peripheral on
+    // this target, every offset its driver uses must be a valid 32-bit
+    // register of it, and no other handle or code may access those registers
+    // in a conflicting way while this handle exists.
+    pub unsafe fn at(base: usize) -> RegisterBlock {
+        return RegisterBlock { base }
+    }
+
+    pub fn base(&self) -> usize {
+        return self.base
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        // SAFETY: `at` guarantees a valid register block owned by this handle.
+        unsafe {
+            return ptr.read_volatile((self.base + offset) as *const u32)
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        // SAFETY: `at` guarantees a valid register block owned by this handle.
+        unsafe {
+            ptr.write_volatile((self.base + offset) as *mut u32, value)
+        }
     }
 }
 

@@ -26,6 +26,21 @@
   pthread state; allocated synchronization objects reserve a 512-byte
   header. `EILSEQ` (APFS rejecting a non-UTF-8 file name) maps to
   `InvalidInput`.
+- Add I2C and SPI buses to the `rp2040` and `rp2350` chips, so portable
+  drivers run on a board unchanged: `examples/hal_sensor_board.dodo` runs
+  the `examples/hal_sensor.dodo` driver on a board's I2C bus. `pins.i2c(sda,
+  scl, hz)` and `pins.spi(clock, tx, rx, mode, hz)` validate the pins and
+  frequency, take the controller once, and return buses implementing the
+  `std/embedded/hal` I2C and SPI protocols; every board names its usual bus
+  pins (`I2C_SDA_PIN` and friends). The controllers are licensed designs, so
+  their drivers live once in the new `std/embedded/peripheral`:
+  `designware_i2c` (Synopsys DW_apb_i2c, 7-bit master up to 1 MHz, with
+  bounded waits) and `pl022` (Arm PL022 SPI master, all four modes,
+  internal loopback). Both run against any register block, the new
+  `hal.RegisterBlock` on a chip or a simulated controller in desktop tests,
+  which model FIFO pacing, aborts, and stuck buses. `hal` gains `SpiMode` and
+  the `I2C_STANDARD_HZ`, `I2C_FAST_HZ`, and `I2C_FAST_PLUS_HZ` constants, and
+  the board self-tests check both buses with nothing attached.
 - Add firmware builds for microcontroller boards, starting with the Raspberry
   Pi Pico. `board = "pico"` in a `dodo.toml` target (or `--board pico`) selects
   the board's chip: its target and CPU, a startup runtime the compiler builds

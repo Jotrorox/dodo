@@ -45,6 +45,16 @@ CHECK_NAMES = [
     "10 ms delay lasts 10 ms",
 ]
 LAST_CHECKS = [
+    "I2C pins and frequency are validated",
+    "I2C runs at 100 kHz",
+    "I2C controller and pins are owned once",
+    "I2C read from an absent device is NoAcknowledge",
+    "I2C address phase lasts about 100 us",
+    "I2C write and write_read to an absent device are NoAcknowledge",
+    "SPI pins are validated",
+    "SPI loopback reads back 16 bytes; controller is owned once",
+    "SPI clock is 1 MHz",
+    "SPI mode 3 write and loopback",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",
@@ -80,7 +90,7 @@ def read_record(picotool, record):
             stdout=subprocess.DEVNULL,
         )
         data = path.read_bytes()
-        return struct.unpack("<7I", data[:28]), data[32:96].split(b"\0")[0].decode(errors="replace")
+        return struct.unpack("<8I", data[:32]), data[32:96].split(b"\0")[0].decode(errors="replace")
 
 
 def run(dodo, picotool, board, level):
@@ -101,7 +111,7 @@ def run(dodo, picotool, board, level):
         print(f"-O{level}: the board did not return to BOOTSEL; check the LED and USB cable")
         return False
     words, file = read_record(picotool, record)
-    state, detail, khz, delay_us, cycles, more, toggles_us = words
+    state, detail, khz, delay_us, cycles, more, toggles_us, last = words
     kind, value = state >> 16, state & 0xFFFF
     if kind == 0xDEAD:
         # Self-tests that record the panicking file name it; others panic in
@@ -118,7 +128,7 @@ def run(dodo, picotool, board, level):
     if kind != 0x600D:
         print(f"-O{level}: no result record (read {state:#010x})")
         return False
-    failed = [index for index in range(64) if (detail | more << 32) >> index & 1]
+    failed = [index for index in range(96) if (detail | more << 32 | last << 64) >> index & 1]
     print(
         f"-O{level}: {value - len(failed)}/{value} checks passed; "
         f"clk_sys {khz} kHz, 10 ms delay {delay_us} us, {cycles} cycles"
