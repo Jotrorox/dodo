@@ -187,12 +187,13 @@ pub struct Controller<R> {
             if (status & RX_NOT_EMPTY) != 0 {
                 bytes[received] = (self.registers.read(DR) & 0xFF) as u8
                 received += 1
-            } else if sent == bytes.len && (self.registers.read(SR) & (BUSY | RX_NOT_EMPTY)) == 0 {
-                // Every frame is done, yet replies are missing: they were
-                // lost to an overflow, and waiting would never end. `status`
-                // may predate the last byte written above, when the
-                // controller still looked idle, so this reads it again.
-                self.registers.write(ICR, RX_OVERRUN)
+            } else if (self.registers.read(RIS) & RX_OVERRUN) != 0 {
+                // A reply was lost, and waiting for it would never end.
+                // Every frame either reaches the receive FIFO or raises this
+                // flag, so unlike the controller going idle, which it can do
+                // before the last reply has crossed into the FIFO, the flag
+                // never fires early.
+                self.settle()
                 return err(hal.Error.Overrun)
             }
         }
@@ -212,13 +213,7 @@ pub struct Controller<R> {
             }
             self.registers.write(DR, bytes[index] as u32)
         }
-        // BUSY stays set until the transmit FIFO is empty and the last
-        // frame is out.
-        for (self.registers.read(SR) & BUSY) != 0 {
-            self.drain()
-        }
-        self.drain()
-        self.registers.write(ICR, RX_OVERRUN)
+        self.settle()
         return ok()
     }
 
@@ -241,6 +236,17 @@ pub struct Controller<R> {
         self.registers.write(CR1, enabled & ~PORT_ENABLE)
         self.configure()
         self.registers.write(CR1, enabled)
+    }
+
+    // Wait until the last frame is out, then discard what arrived and the
+    // overflow it may have caused. BUSY stays set until the transmit FIFO is
+    // empty and the shift register idle.
+    fn settle(&mut self) {
+        for (self.registers.read(SR) & BUSY) != 0 {
+            self.drain()
+        }
+        self.drain()
+        self.registers.write(ICR, RX_OVERRUN)
     }
 
     fn drain(&mut self) {

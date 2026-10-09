@@ -64,6 +64,9 @@ struct I2cModel {
     ack_bytes: u32
     acked: u32
     lose_arbitration: bool
+    // A device holds SCL low once a transaction aborts, so the STOP never
+    // comes; only disabling the controller ends it.
+    hold_after_abort: bool
     // Rule violations the driver must never cause.
     tx_overflow: bool
     rx_overflow: bool
@@ -101,6 +104,7 @@ struct I2cModel {
             ack_bytes: 0xFFFF_FFFF,
             acked: 0,
             lose_arbitration: false,
+            hold_after_abort: false,
             tx_overflow: false,
             rx_overflow: false,
             log: [0; 96],
@@ -130,6 +134,9 @@ struct I2cModel {
         self.abort_source = source
         self.tx_count = 0
         self.rx_count = 0
+        if self.hold_after_abort {
+            return
+        }
         if self.active && (source & (1 << 12)) == 0 {
             self.record(STOP)
             self.stop_detected = true
@@ -547,6 +554,20 @@ fn i2c_failures() {
     model = bus.release()
     after_timeout: [4]u32 = [START, ADDRESS | 0x90, 0x00, STOP]
     model.expect(&after_timeout)
+
+    // An abort whose STOP never comes leaves the bus stuck as well: Timeout,
+    // not the reason for the abort.
+    model.hold_after_abort = true
+    bus = i2c_bus(model)
+    expect_error(bus.write(0x10, &one), hal.Error.Timeout)
+    model = bus.release()
+    core.assert(!model.enabled)
+    model.hold_after_abort = false
+    bus = i2c_bus(model)
+    bus.write(DEVICE, &one)!
+    model = bus.release()
+    held_abort: [7]u32 = [START, ADDRESS | 0x20, STOP, START, ADDRESS | 0x90, 0x00, STOP]
+    model.expect(&held_abort)
 }
 
 fn i2c_frequency() {
@@ -593,6 +614,13 @@ struct SpiModel {
     period: u32
     burst: bool
     reads: u32
+    // Status reads a finished frame takes to reach the receive FIFO, after
+    // the controller already reports idle, as the crossing between its
+    // clock domains may delay it at high SPI clocks. Zero stores it at once.
+    receive_delay: u32
+    landing: bool
+    landing_value: u8
+    landing_reads: u32
     // Lose the next received byte to an overflow.
     lose_reply: bool
     tx_overflow: bool
@@ -618,6 +646,10 @@ struct SpiModel {
             period,
             burst: false,
             reads: 0,
+            receive_delay: 0,
+            landing: false,
+            landing_value: 0,
+            landing_reads: 0,
             lose_reply: false,
             tx_overflow: false,
         }
@@ -633,6 +665,13 @@ struct SpiModel {
 
     fn step(&mut self) {
         self.reads += 1
+        if self.landing {
+            if self.landing_reads == 0 {
+                self.land()
+            } else {
+                self.landing_reads -= 1
+            }
+        }
         if self.burst && self.tx_count == SPI_FIFO {
             for self.tx_count > 0 || self.shifting {
                 self.shift()
@@ -658,12 +697,13 @@ struct SpiModel {
                     self.reply_position += 1
                 }
             }
-            if self.rx_count == SPI_FIFO || self.lose_reply {
-                self.overrun = true
-                self.lose_reply = false
+            if self.receive_delay == 0 {
+                self.store(answer)
             } else {
-                self.rx[self.rx_count] = answer
-                self.rx_count += 1
+                self.land()
+                self.landing = true
+                self.landing_value = answer
+                self.landing_reads = self.receive_delay
             }
             self.shifting = false
         }
@@ -674,6 +714,25 @@ struct SpiModel {
             }
             self.tx_count -= 1
             self.shifting = true
+        }
+    }
+
+    fn land(&mut self) {
+        if self.landing {
+            self.landing = false
+            value := self.landing_value
+            self.store(value)
+        }
+    }
+
+    // A received frame enters the receive FIFO, or is lost.
+    fn store(&mut self, answer: u8) {
+        if self.rx_count == SPI_FIFO || self.lose_reply {
+            self.overrun = true
+            self.lose_reply = false
+        } else {
+            self.rx[self.rx_count] = answer
+            self.rx_count += 1
         }
     }
 
@@ -756,7 +815,7 @@ struct SpiModel {
         }
         self.sent_count = 0
         core.assert(!self.tx_overflow && !self.overrun)
-        core.assert_eq(self.rx_count, 0usize)
+        core.assert(self.rx_count == 0 && !self.landing)
     }
 }
 
@@ -935,6 +994,32 @@ fn spi_overrun() {
 
     // A lost reply ends the transfer instead of waiting for it forever.
     model = bus.release()
+    model.lose_reply = true
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    expect_error(bus.transfer(&mut bytes), hal.Error.Overrun)
+    bus.transfer(&mut bytes)!
+
+    // Replies that reach the receive FIFO only after the controller looks
+    // idle are late, not lost.
+    model = bus.release()
+    model.receive_delay = 4
+    late_reply: [3]u8 = [0x11, 0x22, 0x33]
+    model.reply_with(&late_reply)
+    model.sent_count = 0
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    single: [1]u8 = [0x0F]
+    bus.transfer(&mut single)!
+    core.assert_eq(single[0], 0x11u8)
+    bytes[0] = 0x0A
+    bytes[1] = 0x0B
+    bus.transfer(&mut bytes)!
+    core.assert_eq(bytes[0], 0x22u8)
+    core.assert_eq(bytes[1], 0x33u8)
+    model = bus.release()
+    late_sent: [3]u8 = [0x0F, 0x0A, 0x0B]
+    model.expect_sent(&late_sent)
+
+    // A late reply that is lost still ends the transfer.
     model.lose_reply = true
     bus = spi_bus(model, hal.SpiMode.Mode0)
     expect_error(bus.transfer(&mut bytes), hal.Error.Overrun)

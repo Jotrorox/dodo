@@ -391,14 +391,21 @@ pub struct Controller<R> {
     }
 
     // The controller gave up: it has flushed its FIFOs and, unless another
-    // master took over, sent a STOP. Report why, and release the FIFOs once
-    // the bus is idle.
+    // master took over, sends a STOP. Report why, and release the FIFOs once
+    // the bus is idle. A STOP that never comes, because a device holds SCL
+    // low, makes the bus stuck: releasing the FIFOs then could let bytes of
+    // the aborted transfer into them.
     fn aborted(&mut self) -> void!hal.Error {
         source := self.registers.read(TX_ABRT_SOURCE)
+        idle := false
         for _ in 0..POLLS {
             if (self.registers.read(STATUS) & MASTER_ACTIVE) == 0 {
+                idle = true
                 break
             }
+        }
+        if !idle {
+            return self.stuck()
         }
         self.registers.read(CLR_TX_ABRT)
         self.registers.read(CLR_STOP_DET)
