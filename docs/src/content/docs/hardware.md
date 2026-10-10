@@ -637,6 +637,14 @@ select, as in Raspberry Pi's pinout diagrams.
 | Pins | Pull-ups enabled in the pads (about 50 kΩ): enough for an idle bus, too weak for 400 kHz. Most sensor boards bring 4.7 kΩ pull-ups; a bare bus needs them. | Chip select is not routed to the controller, which would pulse it between bytes; use an output pin and `hal.SpiDevice`. |
 | Errors | `NoAcknowledge` for a missing device or refused byte, `Bus` for lost arbitration, `Timeout` for a bus held low for around a second, `InvalidInput` for empty transfers, which the controller cannot send | `Overrun` only if received bytes were lost; transfers cannot time out |
 | Extra | | `set_loopback(true)` connects TX to RX inside the chip, for self-tests |
+| Giving it back | `pins.release_i2c(bus)` holds the controller in reset and disconnects the pins, which stay pulled up | `pins.release_spi(bus)` holds the controller in reset and disconnects the pins |
+
+Released pins can be claimed again, for a bus or as GPIOs, and
+`pins.release(pin)` gives back a GPIO. This frees a device that holds SDA
+low after an interrupted transfer, which makes every transaction `Timeout`:
+release the bus, claim SCL as an output and SDA as an input, pulse SCL
+until SDA reads high (at most nine times), release both pins, and claim the
+bus again.
 
 ### The Raspberry Pi Pico 2 W
 

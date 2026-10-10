@@ -343,7 +343,9 @@ pub struct Controller<R> {
                 return self.aborted()
             }
             progress := false
-            if issued < buffer.len && issued - received < self.rx_depth && (self.registers.read(STATUS) & TX_NOT_FULL) != 0 {
+            // Received bytes stay in the FIFO, so one read serves both checks.
+            status := self.registers.read(STATUS)
+            if issued < buffer.len && issued - received < self.rx_depth && (status & TX_NOT_FULL) != 0 {
                 command := READ
                 if restart && issued == 0 {
                     command |= RESTART
@@ -355,7 +357,7 @@ pub struct Controller<R> {
                 issued += 1
                 progress = true
             }
-            if (self.registers.read(STATUS) & RX_NOT_EMPTY) != 0 {
+            if (status & RX_NOT_EMPTY) != 0 {
                 buffer[received] = (self.registers.read(DATA_CMD) & 0xFF) as u8
                 received += 1
                 progress = true
@@ -474,5 +476,13 @@ pub struct Bus {
     // Change the SCL frequency between transactions.
     pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
         return self.controller.set_frequency(frequency_hz)
+    }
+
+    // Disable the controller and return its base address, for the chip
+    // package to take the bus back.
+    pub fn release(self) -> usize {
+        let Bus { controller } = self
+        registers := controller.release()
+        return registers.base()
     }
 }

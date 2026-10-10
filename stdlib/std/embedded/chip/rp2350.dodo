@@ -107,13 +107,6 @@ const TIMER_RAW_LOW: usize = TIMER0_BASE + 0x28
 const IO_BANK0_BASE: usize = 0x4002_8000
 const PADS_BANK0_BASE: usize = 0x4003_8000
 const FUNCSEL: u32 = 0b11111
-const FUNCSEL_SPI: u32 = 1
-const FUNCSEL_I2C: u32 = 3
-const FUNCSEL_SIO: u32 = 5
-const PAD_PULL_DOWN: u32 = 1 << 2
-const PAD_PULL_UP: u32 = 1 << 3
-const PAD_INPUT_ENABLE: u32 = 1 << 6
-const PAD_OUTPUT_DISABLE: u32 = 1 << 7
 // Pads come out of reset isolated, latching their last state, until
 // software clears this bit.
 const PAD_ISOLATE: u32 = 1 << 8
@@ -228,7 +221,13 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     timer := unsafe {
         Timer { high: hal.Reg.at(TIMER_RAW_HIGH), low: hal.Reg.at(TIMER_RAW_LOW) }
     }
-    return ok(Peripherals { pins: Pins { taken: 0, controllers: 0 }, timer })
+    // SAFETY: TAKEN guarantees one bank, and Chip is what the bank needs:
+    // the GPIOs' control and pad registers and the bus controllers are
+    // otherwise unused.
+    bank := unsafe {
+        rp_pins.Bank.new(Chip {})
+    }
+    return ok(Peripherals { pins: Pins { bank }, timer })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.
@@ -326,11 +325,9 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
 }
 
 // The 30 user GPIOs, and the I2C and SPI controllers that use them. Each pin
-// and each controller can be taken once.
+// and each controller can be taken once, and given back.
 pub struct Pins {
-    taken: u32
-    // The RESET_ bits of the controllers handed out.
-    controllers: u32
+    bank: rp_pins.Bank<Chip>
 
     // Claim pin `number` as a push-pull output, initially low.
     pub fn output(&mut self, number: u32) -> Pin!hal.Error {
@@ -347,6 +344,13 @@ pub struct Pins {
         return ok(pin)
     }
 
+    // Give back a pin from `output` or `input`. It stops driving and is
+    // disconnected until claimed again, for example as part of a bus.
+    pub fn release(&mut self, pin: Pin) {
+        pin.set_as_input()
+        self.bank.release_gpio(pin.mask)
+    }
+
     // Claim pins `sda` and `scl` as an I2C bus with an SCL frequency of
     // `frequency_hz`, at most hal.I2C_FAST_PLUS_HZ. Even pins carry SDA and
     // odd pins SCL. GPIO 0 and 1, 4 and 5, and so on in steps of four belong
@@ -357,24 +361,7 @@ pub struct Pins {
     // boards add 4.7 kOhm pull-ups, and a bare bus needs them. The
     // designware_i2c driver documents the bus's errors.
     pub fn i2c(&mut self, sda: u32, scl: u32, frequency_hz: u32) -> designware_i2c.Bus!hal.Error {
-        index := rp_pins.i2c_controller(sda, scl)?
-        timing := designware_i2c.timing(SYS_HZ, frequency_hz)?
-        controller := RESET_I2C0
-        base := I2C0_BASE
-        if index == 1 {
-            controller = RESET_I2C1
-            base = I2C1_BASE
-        }
-        self.reserve_reset(controller, (1u32 << sda) | (1u32 << scl))?
-        // SAFETY: `reserve_reset` made the controller and both pins' control
-        // and pad registers exclusive to this bus.
-        unsafe {
-            bus := designware_i2c.Bus.at(base, timing)
-            // The controller pulls a line low by enabling the pad's output.
-            route(sda, FUNCSEL_I2C, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
-            route(scl, FUNCSEL_I2C, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
-            return ok(bus)
-        }
+        return self.bank.i2c(sda, scl, frequency_hz)
     }
 
     // Claim pins as an SPI bus in `mode`, clocked at the fastest rate up to
@@ -386,39 +373,31 @@ pub struct Pins {
     // an output pin as its chip select, through hal.SpiDevice. Errors as for
     // `i2c`.
     pub fn spi(&mut self, clock: u32, tx: u32, rx: Option<u32>, mode: hal.SpiMode, frequency_hz: u32) -> pl022.Bus!hal.Error {
-        pins := rp_pins.spi_pins(clock, tx, rx)?
-        divisors := pl022.divisors(SYS_HZ, frequency_hz)?
-        controller := RESET_SPI0
-        base := SPI0_BASE
-        if pins.controller == 1 {
-            controller = RESET_SPI1
-            base = SPI1_BASE
-        }
-        self.reserve_reset(controller, pins.mask)?
-        // SAFETY: as for `i2c`.
-        unsafe {
-            bus := pl022.Bus.at(base, divisors, mode)
-            route(clock, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
-            route(tx, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
-            if pins.rx < rp_pins.PIN_COUNT {
-                route(pins.rx, FUNCSEL_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
-            }
-            return ok(bus)
-        }
+        return self.bank.spi(clock, tx, rx, mode, frequency_hz)
+    }
+
+    // Give back an I2C bus. Its controller is held in reset and its pins are
+    // disconnected but still pulled up, so the bus stays idle. A device that
+    // holds SDA low after an interrupted transfer, which makes the bus
+    // Timeout, can then be freed by claiming SCL as an output and clocking
+    // it by hand before claiming the bus again.
+    pub fn release_i2c(&mut self, bus: designware_i2c.Bus) {
+        self.bank.release_i2c(bus)
+    }
+
+    // Give back an SPI bus: its controller is held in reset and its pins
+    // are disconnected.
+    pub fn release_spi(&mut self, bus: pl022.Bus) {
+        self.bank.release_spi(bus)
     }
 
     fn claim(&mut self, number: u32) -> Pin!hal.Error {
-        if number >= PIN_COUNT {
-            return err(hal.Error.InvalidInput)
-        }
-        mask := 1u32 << number
-        self.reserve(0, mask)?
-        // SAFETY: `reserve` makes this pin's control and pad registers
+        mask := self.bank.gpio(number)?
+        // SAFETY: the bank makes this pin's control and pad registers
         // exclusive to the returned Pin. The SIO output SET/CLR/XOR and
         // output-enable SET/CLR registers are write-only per-bit aliases and IN
         // is read-only, so pins never conflict there.
         unsafe {
-            route(number, FUNCSEL_SIO, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
             return ok(Pin {
                 set: reg(GPIO_OUT_SET),
                 clear: reg(GPIO_OUT_CLR),
@@ -430,38 +409,59 @@ pub struct Pins {
             })
         }
     }
+}
 
-    // Take `controller` (a RESET_ bit) and the pins in `pins`, then pulse
-    // the controller's reset. A reset that does not finish gives both back,
-    // so a later attempt can try again.
-    fn reserve_reset(&mut self, controller: u32, pins: u32) -> void!hal.Error {
-        self.reserve(controller, pins)?
-        // SAFETY: `reserve` made the controller's reset bit exclusive to the
-        // caller. The reset alias registers change only this bit.
+// What rp_pins.Bank needs from this chip. Only the Bank in Pins has one.
+struct Chip {
+    pub fn route(&mut self, number: u32, function: u32, clear: u32, set: u32) {
+        // SAFETY: the bank routes only pins it holds.
         unsafe {
-            match reset_blocks(controller) {
-                ok() => {
-                    return ok()
-                }
-                err(error) => {
-                    self.controllers &= ~controller
-                    self.taken &= ~pins
-                    return err(error)
-                }
-            }
+            route(number, function, clear, set)
         }
     }
 
-    // Take `controller` (RESET_ bits, or 0) and the pins in `pins`, all or
-    // none.
-    fn reserve(&mut self, controller: u32, pins: u32) -> void!hal.Error {
-        if (self.controllers & controller) != 0 || (self.taken & pins) != 0 {
-            return err(hal.Error.Busy)
+    pub fn reset(&mut self, controller: u32) -> void!hal.Error {
+        // SAFETY: the bank resets only controllers it holds. The reset alias
+        // registers change only their bits.
+        unsafe {
+            return reset_blocks(controller_reset(controller))
         }
-        self.controllers |= controller
-        self.taken |= pins
-        return ok()
     }
+
+    pub fn hold(&mut self, controller: u32) {
+        // SAFETY: as for `reset`.
+        unsafe {
+            hold := reg(RESET + SET_ALIAS)
+            hold.write(controller_reset(controller))
+        }
+    }
+
+    pub fn base(&self, controller: u32) -> usize {
+        if controller == rp_pins.I2C0 {
+            return I2C0_BASE
+        } else if controller == rp_pins.I2C1 {
+            return I2C1_BASE
+        } else if controller == rp_pins.SPI0 {
+            return SPI0_BASE
+        }
+        return SPI1_BASE
+    }
+
+    pub fn clock_hz(&self) -> u32 {
+        return SYS_HZ
+    }
+}
+
+// The RESET_ bit of rp_pins controller number `controller`.
+fn controller_reset(controller: u32) -> u32 {
+    if controller == rp_pins.I2C0 {
+        return RESET_I2C0
+    } else if controller == rp_pins.I2C1 {
+        return RESET_I2C1
+    } else if controller == rp_pins.SPI0 {
+        return RESET_SPI0
+    }
+    return RESET_SPI1
 }
 
 // Connect GPIO `number` to peripheral `function`, and change its pad

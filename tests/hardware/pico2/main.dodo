@@ -142,9 +142,10 @@ fn failed_with(result: void!hal.Error, expected: hal.Error) -> bool {
     }
 }
 
-// I2C and SPI on the board's usual pins with nothing connected (10 checks):
+// I2C and SPI on the board's usual pins with nothing connected (13 checks):
 // pin and frequency validation, single ownership, an I2C address that no
-// device acknowledges, and SPI through the controller's internal loopback.
+// device acknowledges, SPI through the controller's internal loopback, and
+// giving the buses back and claiming them again.
 fn bus_checks<P, T>(pins: &mut P, timer: &mut T) {
     sda := board.I2C_SDA_PIN
     scl := board.I2C_SCL_PIN
@@ -200,6 +201,30 @@ fn bus_checks<P, T>(pins: &mut P, timer: &mut T) {
         same = same && data[index] == sent[index]
     }
     check(same)
+
+    // Released buses give back their pins and controllers. SCL can then be
+    // clocked by hand, as to free a device stuck holding SDA low, while the
+    // pads keep both lines pulled up; then the buses work again.
+    pins.release_i2c(i2c)
+    pins.release_spi(spi)
+    clock_line := pins.output(scl)!
+    data_line := pins.input(sda)!
+    for _ in 0..9 {
+        clock_line.set_low()
+        timer.delay_us(5)
+        clock_line.set_high()
+        timer.delay_us(5)
+    }
+    check(clock_line.is_high() && data_line.is_high())
+    pins.release(clock_line)
+    pins.release(data_line)
+    i2c_again := pins.i2c(sda, scl, standard)!
+    check(failed_with(i2c_again.read(0x7C, &mut byte), hal.Error.NoAcknowledge))
+    spi_again := pins.spi(clock, tx, some(rx), hal.SpiMode.Mode0, 1_000_000)!
+    spi_again.set_loopback(true)
+    one[0] = 0x5A
+    spi_again.transfer(&mut one)!
+    check(one[0] == 0x5A)
 }
 
 fn main() {

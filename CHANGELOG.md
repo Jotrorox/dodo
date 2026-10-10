@@ -37,7 +37,11 @@
   `designware_i2c` (Synopsys DW_apb_i2c, 7-bit master up to 1 MHz, with
   bounded waits) and `pl022` (Arm PL022 SPI master, all four modes,
   internal loopback), whose `Bus` types `pins.i2c` and `pins.spi` return;
-  the pin assignments both chips share live in `std/embedded/chip/rp_pins`.
+  the pin assignments and the pin and controller ownership both chips share
+  live in `std/embedded/chip/rp_pins`. `pins.release(pin)`,
+  `pins.release_i2c(bus)`, and `pins.release_spi(bus)` give pins and buses
+  back, so a stuck I2C bus can be clocked free by hand. The SPI clock is the
+  fastest at or below the request, searching every prescaler.
   Both drivers run against any register block, the new `hal.RegisterBlock`
   on a chip or a simulated controller in desktop tests, which model FIFO
   pacing, aborts, and stuck buses. `hal` gains `SpiMode` and

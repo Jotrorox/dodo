@@ -127,8 +127,8 @@ registers and portable device protocols; `std/embedded/chip/rp2040` and
 `std/embedded/chip/rp2350` with `std/embedded/board/pico2` and
 `std/embedded/board/pico2_w` the RP2350, Pico 2, and Pico 2 W, including
 their I2C and SPI buses through the shared controller drivers in
-`std/embedded/peripheral` and the shared pin assignments in
-`std/embedded/chip/rp_pins`.
+`std/embedded/peripheral` and the pin and controller ownership both chips
+share in `std/embedded/chip/rp_pins`.
 `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)

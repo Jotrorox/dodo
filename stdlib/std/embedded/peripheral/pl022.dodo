@@ -77,26 +77,31 @@ pub fn divisors(clock_hz: u32, frequency_hz: u32) -> Divisors!hal.Error {
         return err(hal.Error.InvalidInput)
     }
     clock := clock_hz as u64
-    requested := frequency_hz as u64
-    // The smallest prescaler with which the largest second divider gets
-    // down to the request; it leaves the finest choice of second divider.
+    // The clock stays at or below the request exactly when the total
+    // division is at least this.
+    needed := (clock + frequency_hz as u64 - 1) / frequency_hz as u64
+    // The smallest total division at or above `needed`: for each prescaler,
+    // the smallest second divider that gets there. On a tie the smaller
+    // prescaler wins.
+    best_prescale := 0u64
+    best_rate := 0u64
     prescale := 2u64
-    for prescale <= 254 && clock > prescale * 256 * requested {
+    for prescale <= 254 {
+        rate := (needed + prescale - 1) / prescale
+        if rate <= 256 && (best_prescale == 0 || prescale * rate < best_prescale * best_rate) {
+            best_prescale = prescale
+            best_rate = rate
+        }
         prescale += 2
     }
-    if prescale > 254 {
+    if best_prescale == 0 {
         return err(hal.Error.InvalidInput)
-    }
-    // The smallest second divider that does not exceed the request.
-    rate := 1u64
-    for clock > prescale * rate * requested {
-        rate += 1
     }
     return ok(Divisors {
         clock_hz,
-        prescale: prescale as u32,
-        rate: rate as u32,
-        frequency_hz: (clock / (prescale * rate)) as u32,
+        prescale: best_prescale as u32,
+        rate: best_rate as u32,
+        frequency_hz: (clock / (best_prescale * best_rate)) as u32,
     })
 }
 
@@ -300,5 +305,13 @@ pub struct Bus {
     // self-tests: transfers read back what they send.
     pub fn set_loopback(&mut self, on: bool) {
         self.controller.set_loopback(on)
+    }
+
+    // Disable the controller and return its base address, for the chip
+    // package to take the bus back.
+    pub fn release(self) -> usize {
+        let Bus { controller } = self
+        registers := controller.release()
+        return registers.base()
     }
 }

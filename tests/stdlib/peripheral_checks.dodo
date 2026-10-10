@@ -1,5 +1,7 @@
 package main
 
+import "core/option"
+import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_pins"
 import "std/embedded/hal/fake"
@@ -7,7 +9,8 @@ import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl022"
 
 // Host checks for std/embedded/peripheral: the DesignWare I2C and PL022 SPI
-// controller drivers against behavioural models of the controllers. The
+// controller drivers against behavioural models of the controllers, and the
+// pin and controller ownership of std/embedded/chip/rp_pins. The
 // models enforce the hardware's rules (registers that may change only while
 // disabled, FIFO depths, the flushed state after an abort) and process
 // commands slower than the drivers poll, so FIFO back-pressure is exercised.
@@ -840,6 +843,25 @@ fn spi_divisors() {
         core.assert(result.frequency_hz <= frequency)
         core.assert_eq(result.frequency_hz, 150_000_000 / (result.prescale * result.rate))
     }
+    // The fastest clock may need a larger prescaler than the smallest that
+    // reaches the request: 125 MHz / 1030 (10 * 103), not / 1032 (6 * 172).
+    close := pl022.divisors(CLOCK_HZ, 121_400)!
+    core.assert_eq(close.prescale * close.rate, 1030u32)
+    core.assert_eq(close.frequency_hz, 121_359u32)
+    // Exhaustively, at 125 MHz: no pair of dividers gets closer.
+    targets: [5]u32 = [3_000, 50_000, 121_400, 333_333, 2_000_001]
+    for index in 0..5usize {
+        request := targets[index]
+        result := pl022.divisors(CLOCK_HZ, request)!
+        for prescale in 1..128u32 {
+            for rate in 1..257u32 {
+                // Too fast if the exact clock, not just its whole hertz,
+                // is above the request.
+                total := 2 * prescale * rate
+                core.assert((total as u64) * (request as u64) < CLOCK_HZ as u64 || total >= result.prescale * result.rate)
+            }
+        }
+    }
     match pl022.divisors(CLOCK_HZ, 1_900) {
         ok(_) => {
             core.assert(false)
@@ -1048,6 +1070,12 @@ fn expect_invalid_spi(result: rp_pins.SpiPins!hal.Error) {
     }
 }
 
+// The receive pin, or PIN_COUNT for none.
+fn rx_pin(pins: rp_pins.SpiPins) -> u32 {
+    let rp_pins.SpiPins { controller, rx, mask } = pins
+    return option.unwrap_or(rx, rp_pins.PIN_COUNT)
+}
+
 fn rp_pin_assignments() {
     // I2C pairs repeat every four pins, alternating between the controllers.
     core.assert_eq(rp_pins.i2c_controller(0, 1)!, 0u32)
@@ -1064,14 +1092,14 @@ fn rp_pin_assignments() {
     // from GPIO 24.
     pins := rp_pins.spi_pins(18, 19, some(16u32))!
     core.assert_eq(pins.controller, 0u32)
-    core.assert_eq(pins.rx, 16u32)
     core.assert_eq(pins.mask, 0xD_0000u32)
+    core.assert_eq(rx_pin(pins), 16u32)
     pins = rp_pins.spi_pins(10, 11, some(12u32))!
     core.assert_eq(pins.controller, 1u32)
     pins = rp_pins.spi_pins(26, 27, none)!
     core.assert_eq(pins.controller, 1u32)
-    core.assert_eq(pins.rx, rp_pins.PIN_COUNT)
     core.assert_eq(pins.mask, 0xC00_0000u32)
+    core.assert_eq(rx_pin(pins), rp_pins.PIN_COUNT)
     pins = rp_pins.spi_pins(2, 7, some(20u32))!
     core.assert_eq(pins.controller, 0u32)
     expect_invalid_spi(rp_pins.spi_pins(19, 18, none))
@@ -1079,6 +1107,148 @@ fn rp_pin_assignments() {
     expect_invalid_spi(rp_pins.spi_pins(18, 19, some(17u32)))
     expect_invalid_spi(rp_pins.spi_pins(18, 19, some(8u32)))
     expect_invalid_spi(rp_pins.spi_pins(30, 31, none))
+}
+
+// --- rp_pins.Bank over a fake chip -----------------------------------------
+
+// What the bank asked of the chip: each pin's function and pad bits, resets
+// pulsed, and controllers held in reset, one bit each.
+static mut FUNCTIONS: [30]u32 = [0u32; 30]
+static mut PADS: [30]u32 = [0u32; 30]
+static mut RESETS: u32 = 0
+static mut HELD: u32 = 0
+static mut FAIL_RESET: bool = false
+// Plain memory standing in for the four controllers' register blocks: the
+// drivers only configure them and disable them again.
+static mut BLOCKS: [256]u32 = [0u32; 256]
+
+const SIO: u32 = 5
+const DISCONNECTED: u32 = 31
+const PULL_UP: u32 = 1 << 3
+
+struct FakeChip {
+    pub fn route(&mut self, pin: u32, function: u32, clear: u32, set: u32) {
+        unsafe {
+            FUNCTIONS[pin as usize] = function
+            PADS[pin as usize] = (PADS[pin as usize] & ~clear) | set
+        }
+    }
+
+    pub fn reset(&mut self, controller: u32) -> void!hal.Error {
+        unsafe {
+            if FAIL_RESET {
+                return err(hal.Error.Timeout)
+            }
+            RESETS += 1
+            HELD &= ~(1u32 << controller)
+        }
+        return ok()
+    }
+
+    pub fn hold(&mut self, controller: u32) {
+        unsafe {
+            HELD |= 1u32 << controller
+        }
+    }
+
+    pub fn base(&self, controller: u32) -> usize {
+        unsafe {
+            return ptr.from_mut(&mut BLOCKS) as usize + 0x100 * controller as usize
+        }
+    }
+
+    pub fn clock_hz(&self) -> u32 {
+        return CLOCK_HZ
+    }
+}
+
+fn function(pin: u32) -> u32 {
+    unsafe {
+        return FUNCTIONS[pin as usize]
+    }
+}
+
+fn expect_busy<T>(result: T!hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+}
+
+fn rp_bank() {
+    bank := unsafe {
+        rp_pins.Bank.new(FakeChip {})
+    }
+    led := bank.gpio(25)!
+    core.assert_eq(led, 1u32 << 25)
+    core.assert_eq(function(25), SIO)
+    expect_busy(bank.gpio(25))
+    expect_invalid(bank.gpio(30))
+
+    // A bus takes its controller out of reset and its pins.
+    i2c := bank.i2c(4, 5, hal.I2C_FAST_HZ)!
+    core.assert(function(4) == 3 && function(5) == 3)
+    unsafe {
+        core.assert((PADS[4] & PULL_UP) != 0 && RESETS == 1)
+    }
+    expect_busy(bank.i2c(8, 9, hal.I2C_FAST_HZ))
+    expect_busy(bank.gpio(5))
+    expect_busy(bank.spi(2, 3, some(4u32), hal.SpiMode.Mode0, 1_000_000))
+
+    // Released, its pins are free but still pulled up, and the controller is
+    // held in reset, until the bus is claimed again.
+    bank.release_i2c(i2c)
+    core.assert(function(4) == DISCONNECTED && function(5) == DISCONNECTED)
+    unsafe {
+        core.assert((PADS[4] & PULL_UP) != 0 && HELD == 1u32 << rp_pins.I2C0)
+    }
+    scl := bank.gpio(5)!
+    expect_busy(bank.i2c(4, 5, hal.I2C_FAST_HZ))
+    bank.release_gpio(scl)
+    core.assert_eq(function(5), DISCONNECTED)
+    again := bank.i2c(4, 5, hal.I2C_STANDARD_HZ)!
+    core.assert_eq(again.frequency_hz(), hal.I2C_STANDARD_HZ)
+    unsafe {
+        core.assert(RESETS == 2 && HELD == 0)
+    }
+
+    // Releasing one bus leaves the others alone.
+    other := bank.i2c(2, 3, hal.I2C_FAST_HZ)!
+    spi := bank.spi(18, 19, some(16u32), hal.SpiMode.Mode0, 1_000_000)!
+    core.assert(function(16) == 1 && function(18) == 1 && function(19) == 1)
+    bank.release_spi(spi)
+    core.assert(function(16) == DISCONNECTED && function(19) == DISCONNECTED && function(4) == 3 && function(2) == 3)
+    unsafe {
+        core.assert_eq(HELD, 1u32 << rp_pins.SPI0)
+    }
+    expect_busy(bank.gpio(2))
+    bank.release_i2c(other)
+    bank.release_i2c(again)
+    unsafe {
+        core.assert_eq(HELD, (1u32 << rp_pins.SPI0) | (1u32 << rp_pins.I2C0) | (1u32 << rp_pins.I2C1))
+    }
+
+    // A reset that does not finish gives the controller and pins back.
+    unsafe {
+        FAIL_RESET = true
+    }
+    match bank.spi(10, 11, none, hal.SpiMode.Mode0, 1_000_000) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    unsafe {
+        FAIL_RESET = false
+    }
+    last := bank.spi(10, 11, none, hal.SpiMode.Mode3, 1_000_000)!
+    core.assert(function(10) == 1 && function(11) == 1 && last.frequency_hz() == 992_063)
 }
 
 fn main() {
@@ -1093,4 +1263,5 @@ fn main() {
     spi_transfers()
     spi_overrun()
     rp_pin_assignments()
+    rp_bank()
 }
