@@ -13,7 +13,8 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Layer | Import | What it gives you |
 | --- | --- | --- |
 | Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
-| Typed registers | `std/embedded/hal` | `hal.Reg<T>` handles and mask constants for memory-mapped registers. |
+| Peripheral drivers | `std/embedded/peripheral/...` | I2C and SPI controller drivers, shared by every chip that contains the controller. |
+| Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal` | `hal.Critical`, a section that masks interrupts until it is dropped. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, and buses that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
@@ -21,11 +22,15 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
 | Raw access | `core/mmio`, `core/cpu` | Volatile loads/stores, barriers, interrupt masking, `wfi`. |
 
-Four kinds of code meet here:
+Five kinds of code meet here:
 
 - **Chip support** (`std/embedded/chip/NAME`) knows datasheet addresses. It turns
   registers into values that implement the protocols, for example a `Pin`
   with `set_high`.
+- **Peripheral drivers** (`std/embedded/peripheral/NAME`) know one controller
+  design that chip vendors license, such as Synopsys's DesignWare I2C
+  controller. Chip support hands them the controller's registers, so one
+  driver serves every chip that contains the design.
 - **Board support** (`std/embedded/board/NAME`) configures its chip for one circuit
   board: crystal frequency, which pin drives the LED, what is wired where.
 - **Drivers** know a device, such as a sensor. They are generic over any value
@@ -85,6 +90,15 @@ can be passed where a driver expects it:
 | I2C bus | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
 | SPI bus | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | Serial port | The [`std/io`](io.md) Reader and Writer protocols. |
+| Register block | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
+
+A bus is configured when it is created: its frequency, and for SPI a
+`hal.SpiMode` (`Mode0` to `Mode3`, the clock polarity and phase numbering of
+device datasheets). The protocols then only move bytes, so a driver works
+whatever speed the application chose. `hal.I2C_STANDARD_HZ`,
+`hal.I2C_FAST_HZ`, and `hal.I2C_FAST_PLUS_HZ` name the usual I2C speeds.
+The register block protocol is for [peripheral drivers](#register-blocks)
+rather than device drivers.
 
 Pins and delays cannot fail. Bus operations return `hal.Error`, one shared
 enum: `Timeout`, `NoAcknowledge`, `Bus`, `Overrun`, `Busy`, `InvalidInput`, and
@@ -210,6 +224,63 @@ fn reports_missing_device() {
 }
 ```
 
+## Running a driver on a board
+
+On a board, the chip's buses take the fakes' places. `b.pins.i2c` claims two
+pins as an I2C bus, and each board names its usual bus pins, so this program
+from
+[`examples/hal_sensor_board.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/hal_sensor_board.dodo)
+runs the sensor driver of
+[`examples/hal_sensor.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/hal_sensor.dodo),
+the one above, unchanged:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+import "hal_sensor"
+
+fn main() {
+    b := board.take()!
+    bus := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+    sensor := hal_sensor.Sensor.new(bus)
+    for {
+        match sensor.measure(&mut b.timer) {
+            ok(_) => {
+                b.led.set_high()
+            }
+            err(_) => {
+                b.led.set_low()
+            }
+        }
+        b.timer.delay_ms(1000)
+    }
+}
+```
+
+```sh
+dodo run examples/hal_sensor_board.dodo --board pico
+```
+
+The board's timer is the delay, and the sensor's `measure` is the same
+specialized code either way. SPI devices work the same way: claim the bus
+pins with `b.pins.spi`, and give each device an output pin as its chip
+select through `hal.SpiDevice`:
+
+```dodo
+b := board.take()!
+spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 1_000_000)!
+flash := hal.SpiDevice.new(b.pins.output(board.SPI_SELECT_PIN)!)
+command: [1]u8 = [0x9F]
+id: [3]u8 = [0, 0, 0]
+flash.write_read(&mut spi, &command, &mut id)!
+```
+
+Pass `none` instead of a receive pin for devices that only listen, such as
+many displays. See [I2C and SPI](#i2c-and-spi-on-the-rp2040-and-rp2350) for
+which pins can carry which bus.
+
 ## Testing with fakes
 
 `std/embedded/hal/fake` implements every protocol in memory:
@@ -222,7 +293,9 @@ fn reports_missing_device() {
 | `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. | `sent()`, `clear()`, `reply_with(bytes)` |
 
 `fail_next` makes the next I2C transaction fail, so error paths are as easy to
-test as success. For serial ports use `io.MemoryReader` and `io.MemoryWriter`
+test as success. Peripheral drivers are tested the same way one level down:
+a simulated controller implements the register block protocol, as in
+[`tests/stdlib/peripheral_checks.dodo`](https://github.com/Jotrorox/dodo/blob/main/tests/stdlib/peripheral_checks.dodo). For serial ports use `io.MemoryReader` and `io.MemoryWriter`
 from [`std/io`](io.md). A protocol is just methods, so writing your own fake for
 a device with special behavior takes a few lines.
 
@@ -311,6 +384,30 @@ traps instead of silently corrupting the neighbouring field.
 Read-modify-write is not atomic. If an interrupt handler can change the same
 register, wrap the update in a critical section or use the chip's set/clear
 alias registers, which many microcontrollers provide for exactly this reason.
+
+### Register blocks
+
+`hal.RegisterBlock` is a peripheral's 32-bit registers at byte offsets from
+one base address: `hal.RegisterBlock.at(base)` is unsafe like `Reg.at`, and
+`read(offset)` and `write(offset, value)` are each one volatile access.
+Peripheral drivers in `std/embedded/peripheral` are generic over the
+register block protocol rather than built from `Reg` fields, for two reasons:
+the same controller sits at different addresses in different chips, and a
+desktop test can pass a simulated controller instead. `read` takes
+`&mut self` because reading a device register can change it, for example by
+popping a FIFO.
+
+| Package | Controller | Implements |
+| --- | --- | --- |
+| `std/embedded/peripheral/designware_i2c` | Synopsys DesignWare DW_apb_i2c | The I2C bus protocol, as the only master: 7-bit addresses, up to 1 MHz. |
+| `std/embedded/peripheral/pl022` | Arm PrimeCell PL022 | The SPI bus protocol, as master: 8-bit frames, all four modes. |
+
+Both keep the controller's FIFOs busy without ever queueing more than the
+receive FIFO holds, and bound every wait on the bus, so a device that holds
+the I2C clock low yields `Timeout` instead of a hang. Chip packages hand out
+their controllers as each driver's `Bus`, which keeps the register block
+from the application: `pins.i2c` on the RP2040 and RP2350 returns a
+`designware_i2c.Bus`, and `pins.spi` a `pl022.Bus`.
 
 ### Owning peripherals once
 
@@ -442,6 +539,10 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.take() -> Board!hal.Error` | Start the chip once: clocks, resets, LED. `Busy` on a second call. |
 | `b.led` | The user LED: an output pin, on when high, with `toggle()`. |
 | `b.pins` | The other GPIOs: `output(n)` and `input(n)` return pins that implement the [pin protocols](#device-protocols), or `Busy` if taken. |
+| `b.pins.i2c(sda, scl, hz)` | An I2C bus on two pins, implementing the I2C bus protocol. |
+| `b.pins.spi(clock, tx, rx, mode, hz)` | An SPI bus, implementing the SPI bus protocol; `rx` is `some(pin)` or `none`. |
+| `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
+| `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`. |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
 
@@ -472,7 +573,9 @@ compiler adds what a desktop operating system would otherwise provide:
 
 `std/embedded/chip/rp2040` is the chip support. `rp2040.take(config)` starts the
 crystal, runs the CPU at 125 MHz from the system PLL, takes GPIO and the timer
-out of reset, and returns the peripherals once. `rp2040.Config` holds what the
+out of reset, and returns the peripherals once. Claiming an
+[I2C or SPI bus](#i2c-and-spi-on-the-rp2040-and-rp2350) takes its controller
+out of reset. `rp2040.Config` holds what the
 circuit board decides, the crystal frequency; a crystal the clock tree cannot
 use is `InvalidInput`. Pins, the timer, and `reboot_to_bootloader(led)` are
 the types and functions the Pico board package exposes. Interrupt handlers use
@@ -506,6 +609,42 @@ extra pins are not yet.
 
 Unlike the RP2040, the RP2350 boot ROM clears RAM when it starts, so nothing
 in RAM survives a reboot into the bootloader.
+
+### I2C and SPI on the RP2040 and RP2350
+
+Both chips have two I2C controllers (DesignWare) and two SPI controllers
+(PL022), each usable on fixed sets of pins. `pins.i2c` and `pins.spi` work
+out the controller from the pins, take it out of reset, and route the pins
+to it:
+
+| Bus | Pins (GPIO numbers) |
+| --- | --- |
+| I2C0 | SDA 0, 4, 8, 12, 16, 20, 24, 28; SCL 1, 5, 9, 13, 17, 21, 25, 29 |
+| I2C1 | SDA 2, 6, 10, 14, 18, 22, 26; SCL 3, 7, 11, 15, 19, 23, 27 |
+| SPI0 | clock 2, 6, 18, 22; TX 3, 7, 19, 23; RX 0, 4, 16, 20 |
+| SPI1 | clock 10, 14, 26; TX 11, 15, 27; RX 8, 12, 24, 28 |
+
+The pins of one bus must belong to the same controller; otherwise, or for a
+frequency the controller cannot make, the claim is `InvalidInput`. A pin or
+controller that is already taken is `Busy`. Every board in this guide uses
+I2C0 on GP4 and GP5 and SPI0 on GP16, GP18, and GP19, with GP17 as a chip
+select, as in Raspberry Pi's pinout diagrams.
+
+| | I2C | SPI |
+| --- | --- | --- |
+| Speed | Up to 1 MHz (`hal.I2C_FAST_PLUS_HZ`); `frequency_hz()` reports the result, the request rounded to whole clock cycles | The fastest rate up to the request, at most half the system clock: 62.5 MHz on the RP2040, 75 MHz on the RP2350 |
+| Changing it | `set_frequency(hz)` between transactions | `set_frequency(hz)` and `set_mode(mode)` between transfers |
+| Pins | Pull-ups enabled in the pads (about 50 kΩ): enough for an idle bus, too weak for 400 kHz. Most sensor boards bring 4.7 kΩ pull-ups; a bare bus needs them. | Chip select is not routed to the controller, which would pulse it between bytes; use an output pin and `hal.SpiDevice`. |
+| Errors | `NoAcknowledge` for a missing device or refused byte, `Bus` for lost arbitration, `Timeout` for a bus held low for around a second, `InvalidInput` for empty transfers, which the controller cannot send | `Overrun` only if received bytes were lost; transfers cannot time out |
+| Extra | | `set_loopback(true)` connects TX to RX inside the chip, for self-tests |
+| Giving it back | `pins.release_i2c(bus)` holds the controller in reset and disconnects the pins, which stay pulled up | `pins.release_spi(bus)` holds the controller in reset and disconnects the pins |
+
+Released pins can be claimed again, for a bus or as GPIOs, and
+`pins.release(pin)` gives back a GPIO. This frees a device that holds SDA
+low after an interrupted transfer, which makes every transaction `Timeout`:
+release the bus, claim SCL as an output and SDA as an input, pulse SCL
+until SDA reads high (at most nine times), release both pins, and claim the
+bus again.
 
 ### The Raspberry Pi Pico 2 W
 
@@ -573,6 +712,10 @@ so each new board or chip is a small, self-contained addition:
   memory map, image format, and image fixups such as boot checksums), its
   startup runtime as LLVM IR and linker script, an entry in `CHIPS`, and a
   `std/embedded/chip/NAME` package with its peripherals.
+- **A peripheral** that `std/embedded/peripheral` already drives needs only
+  its base address and input clock: the chip package hands the driver a
+  `hal.RegisterBlock`. A new controller design is a new package there, with a
+  simulated controller to test it on a desktop.
 
 The compiler compiles the runtime itself with the selected target machine, so
 no assembler or C toolchain is involved. `scripts/test_pico.py` (with
@@ -606,8 +749,11 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 ## Current limits
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
-  chips. The chip packages cover clocks, GPIO, and the timer; UART, I2C, SPI,
-  PWM, and USB are not bundled yet. Write them with `hal.Reg` as above. The
+  chips. The chip packages cover clocks, GPIO, I2C, SPI, and the timer; UART,
+  PWM, ADC, and USB are not bundled yet. Write them with `hal.Reg` as above.
+- I2C and SPI transfers are blocking and polled, without interrupts or DMA.
+  I2C supports 7-bit addresses as the bus's only master, not 10-bit
+  addresses or target (slave) mode; SPI uses 8-bit frames as master. The
   Pico 2 W's wireless chip drives only its LED and senses USB power; Wi-Fi
   and Bluetooth need its firmware, which is not loaded yet.
 - The software floating-point helpers are written for correctness, not speed:
