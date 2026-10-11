@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 — 2026-10-12
+
+- Follow the `dodo.toml` target's firmware board or chip, so diagnostics,
+  completion, and navigation resolve `std/embedded/board` and
+  `std/embedded/chip` imports for that board. Requires Dodo 0.1.5.
+- Retry transient language-server readiness cancellations in the integration
+  tests.
+
 ## 0.1.4 — 2026-09-20
 
 - Show inferred local types as inlay hints that follow unsaved edits.

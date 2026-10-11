@@ -19,9 +19,9 @@ Rust or a separate LLVM installation unless you are building the compiler itself
 | Run, test, or build an executable | Dodo plus a target-compatible C toolchain. |
 | Build the Dodo compiler from source | Rust, LLVM development files, and a C toolchain; see [source builds](building-from-source.md). |
 
-The published 0.1.4 archives target x86-64 Linux with glibc 2.39 or newer (such
-as Ubuntu 24.04), and x86-64 Windows. Builds from `main` add AArch64 Linux and
-Apple silicon macOS 15 or newer archives. The hosted standard library's supported
+The published 0.1.5 archives target x86-64 and AArch64 Linux with glibc 2.39 or
+newer (such as Ubuntu 24.04), Apple silicon macOS 15 or newer, and x86-64
+Windows. The hosted standard library's supported
 platforms are a separate question from LLVM's accepted code-generation targets;
 see [platform support](standard-library.md#portable-and-hosted-functionality).
 
@@ -29,10 +29,10 @@ see [platform support](standard-library.md#portable-and-hosted-functionality).
 
 Download the matching archive from
 [GitHub Releases](https://github.com/Jotrorox/dodo/releases) and extract it.
-The examples below describe release 0.1.4. Documentation on `main` may contain
+The examples below describe release 0.1.5. Documentation on `main` may contain
 APIs added after that release.
 
-Releases after 0.1.4 include a `SHA256SUMS` file and GitHub build provenance
+Releases from 0.1.5 on include a `SHA256SUMS` file and GitHub build provenance
 attestations. To verify a download, place `SHA256SUMS` next to it and run
 `sha256sum --check --ignore-missing SHA256SUMS` (on macOS,
 `shasum -a 256 --check --ignore-missing SHA256SUMS`), or, with the GitHub CLI,
@@ -49,7 +49,7 @@ export PATH="$HOME/.local/bin:$PATH"
 dodo --version
 ```
 
-The output begins with `dodo 0.1.4`. `PATH` is the list of directories your shell
+The output begins with `dodo 0.1.5`. `PATH` is the list of directories your shell
 searches for commands. The `export` above changes only this terminal. If your
 shell does not already include `~/.local/bin`, add that export to its startup
 configuration and open a new terminal to verify it persists.
