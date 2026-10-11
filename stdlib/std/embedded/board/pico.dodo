@@ -26,10 +26,23 @@ pub const NAME: &str = "Raspberry Pi Pico"
 pub const LED_PIN: u32 = 25
 pub const CRYSTAL_HZ: u32 = 12_000_000
 
+// The usual bus pins, as in the Pico SDK and Raspberry Pi's pinout diagrams:
+// I2C0 on GP4 (SDA) and GP5 (SCL), and SPI0 on GP16 (RX), GP18 (clock), and
+// GP19 (TX), with GP17 free for a chip select:
+//
+//     i2c := b.pins.i2c(I2C_SDA_PIN, I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+pub const I2C_SDA_PIN: u32 = 4
+pub const I2C_SCL_PIN: u32 = 5
+pub const SPI_RX_PIN: u32 = 16
+pub const SPI_SELECT_PIN: u32 = 17
+pub const SPI_CLOCK_PIN: u32 = 18
+pub const SPI_TX_PIN: u32 = 19
+
 pub struct Board {
     // The user LED, an output pin that is on when high.
     pub led: rp2040.Pin
-    // The remaining GPIOs; GP25 is already taken by `led`.
+    // The remaining GPIOs, and the I2C and SPI buses on them; GP25 is
+    // already taken by `led`.
     pub pins: rp2040.Pins
     // The 1 MHz system timer: delay_us, delay_ms, and now_us.
     pub timer: rp2040.Timer

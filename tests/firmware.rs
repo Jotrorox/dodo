@@ -384,6 +384,22 @@ fn rp2040_projects_link_to_flashable_firmware() {
         &elf,
     ]);
     check_rp2040_firmware(Path::new(&elf));
+    // A portable driver, tested with fakes, on the board's I2C bus.
+    let sensor = root().join("examples/hal_sensor_board.dodo");
+    for level in ["0", "2"] {
+        let elf = scratch.path(&format!("sensor-O{level}.elf"));
+        build(&[
+            "build",
+            sensor.to_str().unwrap(),
+            "--board",
+            "pico",
+            "-O",
+            level,
+            "-o",
+            &elf,
+        ]);
+        check_rp2040_firmware(Path::new(&elf));
+    }
 }
 
 #[test]
@@ -393,11 +409,14 @@ fn rp2350_projects_link_to_flashable_firmware() {
     }
     let scratch = Scratch::new("link-rp2350");
     let blink = root().join("examples/blink");
+    let sensor = root().join("examples/hal_sensor_board.dodo");
     let selftest = root().join("tests/hardware/pico2");
     let selftest_w = root().join("tests/hardware/pico2_w");
     for (project, name, board) in [
         (&blink, "blink", &["--board", "pico2"][..]),
         (&blink, "blink-w", &["--board", "pico2_w"][..]),
+        (&sensor, "sensor", &["--board", "pico2"][..]),
+        (&sensor, "sensor-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),
         (&selftest_w, "selftest-w", &[][..]),
     ] {

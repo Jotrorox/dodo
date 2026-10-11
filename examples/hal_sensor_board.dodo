@@ -1,0 +1,70 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+import "hal_sensor"
+
+// The sensor driver from hal_sensor.dodo, unchanged, on a real board. Its
+// tests run it against `fake.I2c` and `fake.Delay`; here the board's I2C bus
+// and timer take their places. Connect the sensor's SDA and SCL to the
+// board's I2C pins (GP4 and GP5 on the Raspberry Pi Pico boards), and its
+// power and ground, then flash the board from BOOTSEL mode with:
+//
+//     dodo run examples/hal_sensor_board.dodo --board pico
+//
+// (or --board pico2 or pico2_w). The LED reports each measurement, once a
+// second: one long flash for a reading, or short flashes counting the error,
+// as in `flashes`. The sensor's register map is a made-up example, so a real
+// chip at address 0x48 answers differently; with nothing connected, two
+// flashes (NoAcknowledge) show that the bus itself works.
+fn main() {
+    b := board.take()!
+    bus := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+    sensor := hal_sensor.Sensor.new(bus)
+    for {
+        match sensor.measure(&mut b.timer) {
+            ok(_) => {
+                b.led.set_high()
+                b.timer.delay_ms(600)
+                b.led.set_low()
+                b.timer.delay_ms(400)
+            }
+            err(error) => {
+                for _ in 0..flashes(error) {
+                    b.led.set_high()
+                    b.timer.delay_ms(100)
+                    b.led.set_low()
+                    b.timer.delay_ms(150)
+                }
+                b.timer.delay_ms(1000)
+            }
+        }
+    }
+}
+
+// Short LED flashes for each error, in the order hal.Error declares them.
+fn flashes(error: hal.Error) -> u32 {
+    match error {
+        hal.Error.Timeout => {
+            return 1
+        }
+        hal.Error.NoAcknowledge => {
+            return 2
+        }
+        hal.Error.Bus => {
+            return 3
+        }
+        hal.Error.Overrun => {
+            return 4
+        }
+        hal.Error.Busy => {
+            return 5
+        }
+        hal.Error.InvalidInput => {
+            return 6
+        }
+        hal.Error.Unsupported => {
+            return 7
+        }
+    }
+}

@@ -1,0 +1,232 @@
+package rp_pins
+
+import "std/embedded/hal"
+import "std/embedded/peripheral/designware_i2c"
+import "std/embedded/peripheral/pl022"
+
+// The GPIO, I2C, and SPI ownership the RP2040 and RP2350 share. On both chips
+// GPIO 0 to 29 select the same controller signals with the same function
+// numbers and pad bits, so the chip packages keep their pins in a `Bank`,
+// which checks bus pins, hands out each pin and controller once, and takes
+// them back.
+
+// The GPIOs whose functions both chips share.
+pub const PIN_COUNT: u32 = 30
+
+// The bus controllers, as `Bank` numbers them for its chip.
+pub const I2C0: u32 = 0
+pub const I2C1: u32 = 1
+pub const SPI0: u32 = 2
+pub const SPI1: u32 = 3
+const CONTROLLERS: usize = 4
+
+// GPIO functions (FUNCSEL). NULL disconnects the pin: it floats, apart from
+// its pad's pulls.
+const FUNCTION_SPI: u32 = 1
+const FUNCTION_I2C: u32 = 3
+const FUNCTION_SIO: u32 = 5
+const FUNCTION_NULL: u32 = 31
+
+// Pad controls.
+const PAD_PULL_DOWN: u32 = 1 << 2
+const PAD_PULL_UP: u32 = 1 << 3
+const PAD_INPUT_ENABLE: u32 = 1 << 6
+const PAD_OUTPUT_DISABLE: u32 = 1 << 7
+
+// The I2C controller, 0 or 1, that pins `sda` and `scl` form a bus on. Even
+// pins carry SDA and odd pins SCL. GPIO 0 and 1, 4 and 5, and so on in steps
+// of four belong to I2C0; GPIO 2 and 3, 6 and 7, and so on to I2C1.
+// InvalidInput if the two pins cannot form a bus.
+pub fn i2c_controller(sda: u32, scl: u32) -> u32!hal.Error {
+    if sda >= PIN_COUNT || scl >= PIN_COUNT || sda % 2 != 0 || scl % 2 != 1 || (sda / 2) % 2 != (scl / 2) % 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok((sda / 2) % 2)
+}
+
+// The pins of an SPI bus, from `spi_pins`.
+pub struct SpiPins {
+    // The controller, 0 or 1.
+    pub controller: u32
+    // The receive pin, if the bus has one.
+    pub rx: Option<u32>
+    // Every pin of the bus, one bit each.
+    pub mask: u32
+}
+
+// The SPI bus that pins `clock`, `tx`, and `rx` (if any) form. GPIO n
+// carries RX when n % 4 is 0, the clock when it is 2, and TX when it is 3.
+// GPIO 0 to 7 and 16 to 23 belong to SPI0, GPIO 8 to 15 and 24 to 29 to
+// SPI1. InvalidInput if the pins cannot form a bus.
+pub fn spi_pins(clock: u32, tx: u32, rx: Option<u32>) -> SpiPins!hal.Error {
+    if clock >= PIN_COUNT || tx >= PIN_COUNT || clock % 4 != 2 || tx % 4 != 3 || (clock / 8) % 2 != (tx / 8) % 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    controller := (clock / 8) % 2
+    mask := (1u32 << clock) | (1u32 << tx)
+    if let some(number) = rx {
+        if number >= PIN_COUNT || number % 4 != 0 || (number / 8) % 2 != controller {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(SpiPins { controller, rx: some(number), mask: mask | (1u32 << number) })
+    }
+    return ok(SpiPins { controller, rx: none, mask })
+}
+
+// GPIO 0 to 29 and the bus controllers of one chip C, each handed out once
+// and taken back by the release methods. C does what differs between the
+// chips, with these methods, `controller` numbered as I2C0 to SPI1 above:
+//
+//    route(&mut self, pin: u32, function: u32, clear: u32, set: u32)
+//        connect the pin to FUNCSEL `function`, then clear the `clear` and
+//        set the `set` bits of its pad
+//    reset(&mut self, controller: u32) -> void!hal.Error
+//        pulse the controller's reset and wait until it runs
+//    hold(&mut self, controller: u32)
+//        hold the controller in reset
+//    base(&self, controller: u32) -> usize
+//        the controller's register block
+//    clock_hz(&self) -> u32
+//        the frequency of the clock that feeds the controllers
+pub struct Bank<C> {
+    chip: C
+    // Pins in use, one bit each.
+    taken: u32
+    // The pins of each controller's bus, by controller number; 0 while the
+    // controller is free.
+    buses: [4]u32
+
+    // SAFETY: C's methods must do what the protocol above says, `base` must
+    // name the controller's PL022 or DW_apb_i2c, and the bank must be the
+    // only user of GPIO 0 to 29's control and pad registers, of the four
+    // controllers, and of their resets.
+    pub unsafe fn new(chip: C) -> Bank<C> {
+        return Bank<C> { chip, taken: 0, buses: [0u32; 4] }
+    }
+
+    // Claim pin `number` for the single-cycle I/O block. Returns its bit, for
+    // the chip's GPIO registers. InvalidInput above GPIO 29, Busy if taken.
+    pub fn gpio(&mut self, number: u32) -> u32!hal.Error {
+        if number >= PIN_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        mask := 1u32 << number
+        self.reserve(mask)?
+        self.chip.route(number, FUNCTION_SIO, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
+        return ok(mask)
+    }
+
+    // Give back the GPIO with bit `mask`, from `gpio`, which the caller has
+    // stopped driving. The pin is disconnected until it is claimed again.
+    pub fn release_gpio(&mut self, mask: u32) {
+        self.disconnect(mask)
+    }
+
+    // Claim pins `sda` and `scl` as an I2C bus with an SCL frequency of
+    // `frequency_hz`; see i2c_controller for the pins. InvalidInput if the
+    // two pins cannot form a bus or the frequency is out of range, Busy if a
+    // pin or the controller is taken. The pads' pull-ups (about 50 kOhm)
+    // keep an idle bus high but are too weak for fast mode.
+    pub fn i2c(&mut self, sda: u32, scl: u32, frequency_hz: u32) -> designware_i2c.Bus!hal.Error {
+        controller := I2C0 + i2c_controller(sda, scl)?
+        timing := designware_i2c.timing(self.chip.clock_hz(), frequency_hz)?
+        self.start(controller, (1u32 << sda) | (1u32 << scl))?
+        // SAFETY: `start` made the controller and both pins exclusive to
+        // this bus, and Bank.new vouches for the base address.
+        unsafe {
+            bus := designware_i2c.Bus.at(self.chip.base(controller), timing)
+            // The controller pulls a line low by enabling the pad's output.
+            self.connect(controller, FUNCTION_I2C, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
+            return ok(bus)
+        }
+    }
+
+    // Claim pins as an SPI bus in `mode`, clocked at the fastest rate up to
+    // `frequency_hz`; see spi_pins for the pins. Errors as for `i2c`.
+    pub fn spi(&mut self, clock: u32, tx: u32, rx: Option<u32>, mode: hal.SpiMode, frequency_hz: u32) -> pl022.Bus!hal.Error {
+        pins := spi_pins(clock, tx, rx)?
+        controller := SPI0 + pins.controller
+        divisors := pl022.divisors(self.chip.clock_hz(), frequency_hz)?
+        self.start(controller, pins.mask)?
+        // SAFETY: as for `i2c`.
+        unsafe {
+            bus := pl022.Bus.at(self.chip.base(controller), divisors, mode)
+            self.connect(controller, FUNCTION_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
+            return ok(bus)
+        }
+    }
+
+    // Give back an I2C bus from `i2c`: its pins are disconnected, still
+    // pulled up so the bus stays idle, and its controller held in reset.
+    // The pins can then be claimed as GPIOs, for example to clock a stuck
+    // device free, and the bus claimed again.
+    pub fn release_i2c(&mut self, bus: designware_i2c.Bus) {
+        self.stop(bus.release())
+    }
+
+    // Give back an SPI bus from `spi`, as for `release_i2c`.
+    pub fn release_spi(&mut self, bus: pl022.Bus) {
+        self.stop(bus.release())
+    }
+
+    // Take `controller` and the pins in `pins`, all or none, then pulse the
+    // controller's reset. A reset that does not finish gives both back, so a
+    // later attempt can try again.
+    fn start(&mut self, controller: u32, pins: u32) -> void!hal.Error {
+        if self.buses[controller as usize] != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.reserve(pins)?
+        self.buses[controller as usize] = pins
+        match self.chip.reset(controller) {
+            ok() => {
+                return ok()
+            }
+            err(error) => {
+                self.buses[controller as usize] = 0
+                self.taken &= ~pins
+                return err(error)
+            }
+        }
+    }
+
+    // Disconnect the pins of the controller with registers at `base` and
+    // hold it in reset.
+    fn stop(&mut self, base: usize) {
+        for controller in 0..CONTROLLERS {
+            pins := self.buses[controller]
+            if pins != 0 && self.chip.base(controller as u32) == base {
+                self.disconnect(pins)
+                self.chip.hold(controller as u32)
+                self.buses[controller] = 0
+            }
+        }
+    }
+
+    fn reserve(&mut self, pins: u32) -> void!hal.Error {
+        if (self.taken & pins) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.taken |= pins
+        return ok()
+    }
+
+    // Route every pin of `controller`'s bus to `function`.
+    fn connect(&mut self, controller: u32, function: u32, clear: u32, set: u32) {
+        pins := self.buses[controller as usize]
+        for number in 0..PIN_COUNT {
+            if (pins & (1u32 << number)) != 0 {
+                self.chip.route(number, function, clear, set)
+            }
+        }
+    }
+
+    fn disconnect(&mut self, pins: u32) {
+        for number in 0..PIN_COUNT {
+            if (pins & (1u32 << number)) != 0 {
+                self.chip.route(number, FUNCTION_NULL, 0, 0)
+            }
+        }
+        self.taken &= ~pins
+    }
+}

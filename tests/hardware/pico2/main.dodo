@@ -5,8 +5,8 @@ import "std/embedded/chip"
 import "std/embedded/hal"
 
 // Hardware self-test for the `pico2` board: the RP2350 startup runtime,
-// std/embedded/chip/rp2350 (clocks, timer, single ownership, configuration
-// checks), std/embedded/board/pico2, and the runtime's integer and
+// std/embedded/chip/rp2350 (clocks, timer, I2C, SPI, single ownership,
+// configuration checks), std/embedded/board/pico2, and the runtime's integer and
 // floating-point helpers. Every outcome ends in the USB bootloader with a
 // record that `scripts/test_pico.py --board pico2` reads over USB with
 // picotool. The RP2350 boot ROM clears SRAM when it starts, so the record is
@@ -18,6 +18,7 @@ import "std/embedded/hal"
 //       0x5747_00nn  hung or faulted after check nn (watchdog reset)
 //   [2] clk_sys in kHz  [3] a 10 ms delay in timer us  [4] its SysTick cycles
 //   [5] failed-check bits for checks 32 to 63
+//   [7] failed-check bits for checks 64 to 95
 //
 // A copy of [0] and [1] in watchdog SCRATCH0/1 survives the watchdog reset
 // that reports a hang. (The boot ROM's reboot uses SCRATCH2 to 7.)
@@ -35,9 +36,10 @@ const WATCHDOG: usize = 0x400D_8000
 const SCRATCH: usize = WATCHDOG + 0x0C
 const RUNNING: u32 = 0x5747_0000
 static mut CHECKS: u32 = 0
-// Failed-check bits: checks 0 to 31, then 32 to 63.
+// Failed-check bits: checks 0 to 31, 32 to 63, and 64 to 95.
 static mut FAILURES: u32 = 0
 static mut MORE_FAILURES: u32 = 0
+static mut LAST_FAILURES: u32 = 0
 // Initialized data: checks that the reset handler copies .data from flash.
 static mut DATA: [3]u32 = [0xDEAD_BEEFu32, 7, 0x1234_5678]
 
@@ -77,6 +79,8 @@ fn check(ok: bool) {
             FAILURES |= 1u32 << CHECKS
         } else if !ok && CHECKS < 64 {
             MORE_FAILURES |= 1u32 << (CHECKS - 32)
+        } else if !ok && CHECKS < 96 {
+            LAST_FAILURES |= 1u32 << (CHECKS - 64)
         }
         CHECKS += 1
         record(RUNNING | CHECKS, FAILURES)
@@ -112,6 +116,115 @@ fn clk_sys_khz() -> u32 {
         }
         return result.read() >> 5
     }
+}
+
+// A claim was refused with `expected`.
+fn refused<T>(result: T!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// A bus operation failed with `expected`.
+fn failed_with(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+// I2C and SPI on the board's usual pins with nothing connected (13 checks):
+// pin and frequency validation, single ownership, an I2C address that no
+// device acknowledges, SPI through the controller's internal loopback, and
+// giving the buses back and claiming them again.
+fn bus_checks<P, T>(pins: &mut P, timer: &mut T) {
+    sda := board.I2C_SDA_PIN
+    scl := board.I2C_SCL_PIN
+    standard := hal.I2C_STANDARD_HZ
+    check(refused(pins.i2c(scl, sda, standard), hal.Error.InvalidInput) && refused(pins.i2c(sda, sda + 3, standard), hal.Error.InvalidInput) && refused(pins.i2c(sda, scl, 2_000_000), hal.Error.InvalidInput))
+    i2c := pins.i2c(sda, scl, standard)!
+    check(i2c.frequency_hz() == standard)
+    // GP8 and GP9 are I2C0 too.
+    check(refused(pins.i2c(8, 9, standard), hal.Error.Busy) && refused(pins.output(sda), hal.Error.Busy))
+    // No device answers the reserved address 0x7C. The pads' pull-ups keep
+    // the idle bus high, so the controller sees a missing acknowledge, not
+    // a fault, and it ends the transaction itself.
+    byte: [1]u8 = [0]
+    start := timer.now_us()
+    check(failed_with(i2c.read(0x7C, &mut byte), hal.Error.NoAcknowledge))
+    elapsed := timer.now_us() - start
+    // START, the address byte and its acknowledge bit at 100 kHz, STOP.
+    check(elapsed >= 90 && elapsed < 500)
+    register: [1]u8 = [0]
+    check(failed_with(i2c.write(0x7C, &register), hal.Error.NoAcknowledge) && failed_with(i2c.write_read(0x7C, &register, &mut byte), hal.Error.NoAcknowledge))
+
+    clock := board.SPI_CLOCK_PIN
+    tx := board.SPI_TX_PIN
+    rx := board.SPI_RX_PIN
+    check(refused(pins.spi(tx, clock, none, hal.SpiMode.Mode0, 1_000_000), hal.Error.InvalidInput) && refused(pins.spi(clock, tx, some(board.SPI_SELECT_PIN), hal.SpiMode.Mode0, 1_000_000), hal.Error.InvalidInput))
+    spi := pins.spi(clock, tx, some(rx), hal.SpiMode.Mode0, 1_000_000)!
+    spi.set_loopback(true)
+    data: [16]u8 = [0; 16]
+    sent: [16]u8 = [0; 16]
+    for index in 0..16usize {
+        data[index] = (0xA5 ^ (17 * index)) as u8
+        sent[index] = data[index]
+    }
+    start = timer.now_us()
+    spi.transfer(&mut data)!
+    elapsed = timer.now_us() - start
+    same := true
+    for index in 0..16usize {
+        same = same && data[index] == sent[index]
+    }
+    check(same && refused(pins.spi(2, 3, none, hal.SpiMode.Mode0, 1_000_000), hal.Error.Busy))
+    // 128 bits at just under 1 MHz, back to back.
+    check(spi.frequency_hz() <= 1_000_000 && spi.frequency_hz() > 990_000 && elapsed >= 128 && elapsed < 200)
+    spi.set_mode(hal.SpiMode.Mode3)
+    spi.write(&sent)!
+    spi.transfer(&mut data)!
+    // A single byte, as when reading one register, starts on an idle
+    // controller.
+    one: [1]u8 = [0x3C]
+    spi.transfer(&mut one)!
+    same = one[0] == 0x3C
+    for index in 0..16usize {
+        same = same && data[index] == sent[index]
+    }
+    check(same)
+
+    // Released buses give back their pins and controllers. SCL can then be
+    // clocked by hand, as to free a device stuck holding SDA low, while the
+    // pads keep both lines pulled up; then the buses work again.
+    pins.release_i2c(i2c)
+    pins.release_spi(spi)
+    clock_line := pins.output(scl)!
+    data_line := pins.input(sda)!
+    for _ in 0..9 {
+        clock_line.set_low()
+        timer.delay_us(5)
+        clock_line.set_high()
+        timer.delay_us(5)
+    }
+    check(clock_line.is_high() && data_line.is_high())
+    pins.release(clock_line)
+    pins.release(data_line)
+    i2c_again := pins.i2c(sda, scl, standard)!
+    check(failed_with(i2c_again.read(0x7C, &mut byte), hal.Error.NoAcknowledge))
+    spi_again := pins.spi(clock, tx, some(rx), hal.SpiMode.Mode0, 1_000_000)!
+    spi_again.set_loopback(true)
+    one[0] = 0x5A
+    spi_again.transfer(&mut one)!
+    check(one[0] == 0x5A)
 }
 
 fn main() {
@@ -240,6 +353,8 @@ fn main() {
     copy := big
     check(copy[63] == 63 && copy[0] == 0)
 
+    bus_checks(&mut b.pins, &mut b.timer)
+
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.
     match chip.take(chip.Config { crystal_hz: 7_000_000 }) {
@@ -268,6 +383,7 @@ fn main() {
         control: hal.Reg<u32> = hal.Reg.at(WATCHDOG)
         control.write(0)
         store(RECORD + 20, MORE_FAILURES)
+        store(RECORD + 28, LAST_FAILURES)
         record(0x600D_0000 | CHECKS, FAILURES)
     }
     report()

@@ -1,0 +1,317 @@
+package pl022
+
+import "std/embedded/hal"
+
+// The Arm PrimeCell PL022 synchronous serial port as an SPI bus master. Chip
+// vendors license this controller, so the same registers appear in many
+// microcontrollers, among them the RP2040 and RP2350 (SPI0 and SPI1).
+// `Controller` implements the std/embedded/hal SPI bus protocol over any
+// register block: a `hal.RegisterBlock` on the chip, or a simulated
+// controller in a desktop test.
+//
+// Chip packages pulse the controller's reset, route its clock, transmit, and
+// receive pins, and pass the frequency of the clock that feeds it. Frames are
+// 8 bits, most significant bit first, in the Motorola SPI format with any of
+// the four hal.SpiMode settings. Transfers keep both 8-entry FIFOs busy, so
+// bytes follow each other without gaps, and never queue more than the
+// receive FIFO holds, so no byte is lost.
+//
+// Chip select is left to a GPIO and hal.SpiDevice: in modes 0 and 2 the
+// PL022's own frame signal rises between every two bytes, which most devices
+// take as the end of a command. As the master generates the clock itself, a
+// transfer always completes and SPI operations never time out.
+//
+// Register names follow the PrimeCell PL022 technical reference manual, as
+// reproduced in the RP2040 datasheet (4.4.4).
+
+const CR0: usize = 0x000
+const CR1: usize = 0x004
+const DR: usize = 0x008
+const SR: usize = 0x00C
+const CPSR: usize = 0x010
+const IMSC: usize = 0x014
+const RIS: usize = 0x018
+const ICR: usize = 0x020
+
+// CR0: data size minus one, frame format (0 is Motorola SPI), clock
+// polarity and phase, and the serial clock rate divisor minus one.
+const DATA_SIZE: u32 = 0b1111
+const FRAME_FORMAT: u32 = 0b11 << 4
+const CLOCK_POLARITY: u32 = 1 << 6
+const CLOCK_PHASE: u32 = 1 << 7
+const CLOCK_RATE: u32 = 0xFF << 8
+
+// CR1: internal loopback, port enable, and target (slave) mode.
+const LOOPBACK: u32 = 1 << 0
+const PORT_ENABLE: u32 = 1 << 1
+
+// SR.
+const TX_NOT_FULL: u32 = 1 << 1
+const RX_NOT_EMPTY: u32 = 1 << 2
+const BUSY: u32 = 1 << 4
+
+// RIS and ICR: the receive FIFO overflowed.
+const RX_OVERRUN: u32 = 1 << 0
+
+// Entries in each FIFO.
+const FIFO_DEPTH: usize = 8
+
+// The clock dividers for one SPI clock frequency, from `divisors`.
+pub struct Divisors {
+    // The controller's input clock, in hertz.
+    pub clock_hz: u32
+    // The prescaler, an even number from 2 to 254.
+    pub prescale: u32
+    // The second divider, 1 to 256.
+    pub rate: u32
+    // The resulting SPI clock, clock_hz / (prescale * rate), in hertz.
+    pub frequency_hz: u32
+}
+
+// The fastest SPI clock from an input clock of `clock_hz` that does not
+// exceed `frequency_hz`. The fastest possible is clock_hz / 2; a request
+// above it gets that. InvalidInput below clock_hz / 65024, about 1.9 kHz at
+// 125 MHz, the slowest possible.
+pub fn divisors(clock_hz: u32, frequency_hz: u32) -> Divisors!hal.Error {
+    if frequency_hz == 0 || clock_hz == 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    clock := clock_hz as u64
+    // The clock stays at or below the request exactly when the total
+    // division is at least this.
+    needed := (clock + frequency_hz as u64 - 1) / frequency_hz as u64
+    // The smallest total division at or above `needed`: for each prescaler,
+    // the smallest second divider that gets there. On a tie the smaller
+    // prescaler wins.
+    best_prescale := 0u64
+    best_rate := 0u64
+    prescale := 2u64
+    for prescale <= 254 {
+        rate := (needed + prescale - 1) / prescale
+        if rate <= 256 && (best_prescale == 0 || prescale * rate < best_prescale * best_rate) {
+            best_prescale = prescale
+            best_rate = rate
+        }
+        prescale += 2
+    }
+    if best_prescale == 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(Divisors {
+        clock_hz,
+        prescale: best_prescale as u32,
+        rate: best_rate as u32,
+        frequency_hz: (clock / (best_prescale * best_rate)) as u32,
+    })
+}
+
+// CR0's clock polarity and phase bits for `mode`.
+fn format(mode: hal.SpiMode) -> u32 {
+    match mode {
+        hal.SpiMode.Mode0 => {
+            return 0
+        }
+        hal.SpiMode.Mode1 => {
+            return CLOCK_PHASE
+        }
+        hal.SpiMode.Mode2 => {
+            return CLOCK_POLARITY
+        }
+        hal.SpiMode.Mode3 => {
+            return CLOCK_POLARITY | CLOCK_PHASE
+        }
+    }
+}
+
+// An SPI bus master on one PL022 with registers R, a value with the register
+// block protocol of std/embedded/hal. Implements the std/embedded/hal SPI bus
+// protocol.
+pub struct Controller<R> {
+    registers: R
+    divisors: Divisors
+    // CR0's clock polarity and phase bits for the mode.
+    format: u32
+
+    // Configure a controller fresh out of reset as a master with `divisors`,
+    // computed from the clock that feeds it, and `mode`, and enable it.
+    pub fn new(registers: R, divisors: Divisors, mode: hal.SpiMode) -> Controller<R> {
+        bus := Controller<R> { registers, divisors, format: format(mode) }
+        bus.registers.write(CR1, 0)
+        // Transfers poll the FIFO levels; no interrupts.
+        bus.registers.write(IMSC, 0)
+        bus.configure()
+        bus.registers.write(CR1, PORT_ENABLE)
+        return bus
+    }
+
+    // The SPI clock frequency, in hertz.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.divisors.frequency_hz
+    }
+
+    // Change the clock between transfers, for example to talk to devices
+    // with different limits on a shared bus. InvalidInput leaves it
+    // unchanged.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        self.divisors = divisors(self.divisors.clock_hz, frequency_hz)?
+        self.reconfigure()
+        return ok()
+    }
+
+    // Change the clock polarity and phase between transfers.
+    pub fn set_mode(&mut self, mode: hal.SpiMode) {
+        self.format = format(mode)
+        self.reconfigure()
+    }
+
+    // Connect the transmitter to the receiver inside the controller, so
+    // every transfer reads back what it sent and the pins stay idle. Meant
+    // for self-tests.
+    pub fn set_loopback(&mut self, on: bool) {
+        control := self.registers.read(CR1) & ~LOOPBACK
+        if on {
+            control |= LOOPBACK
+        }
+        self.registers.write(CR1, control)
+    }
+
+    // Send `bytes` and replace each with the byte received at the same
+    // time. Overrun if received bytes were lost to a full receive FIFO,
+    // which the driver's pacing prevents unless something else used the
+    // controller.
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        self.drain()
+        sent := 0usize
+        received := 0usize
+        for received < bytes.len {
+            status := self.registers.read(SR)
+            if sent < bytes.len && sent - received < FIFO_DEPTH && (status & TX_NOT_FULL) != 0 {
+                self.registers.write(DR, bytes[sent] as u32)
+                sent += 1
+            }
+            if (status & RX_NOT_EMPTY) != 0 {
+                bytes[received] = (self.registers.read(DR) & 0xFF) as u8
+                received += 1
+            } else if (self.registers.read(RIS) & RX_OVERRUN) != 0 {
+                // A reply was lost, and waiting for it would never end.
+                // Every frame either reaches the receive FIFO or raises this
+                // flag, so unlike the controller going idle, which it can do
+                // before the last reply has crossed into the FIFO, the flag
+                // never fires early.
+                self.settle()
+                return err(hal.Error.Overrun)
+            }
+        }
+        if (self.registers.read(RIS) & RX_OVERRUN) != 0 {
+            self.registers.write(ICR, RX_OVERRUN)
+            return err(hal.Error.Overrun)
+        }
+        return ok()
+    }
+
+    // Send `bytes` and discard what arrives. Returns once the last bit has
+    // left, so a chip select can be raised right after.
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        for index in 0..bytes.len {
+            for (self.registers.read(SR) & TX_NOT_FULL) == 0 {
+                self.drain()
+            }
+            self.registers.write(DR, bytes[index] as u32)
+        }
+        self.settle()
+        return ok()
+    }
+
+    // Disable the controller and give back its registers.
+    pub fn release(self) -> R {
+        self.registers.write(CR1, 0)
+        let Controller { registers, divisors, format } = self
+        return registers
+    }
+
+    fn configure(&mut self) {
+        control := hal.encode(DATA_SIZE, 7) | hal.encode(CLOCK_RATE, self.divisors.rate - 1) | self.format
+        self.registers.write(CPSR, self.divisors.prescale)
+        self.registers.write(CR0, control)
+    }
+
+    // The format registers may change only while the port is disabled.
+    fn reconfigure(&mut self) {
+        enabled := self.registers.read(CR1)
+        self.registers.write(CR1, enabled & ~PORT_ENABLE)
+        self.configure()
+        self.registers.write(CR1, enabled)
+    }
+
+    // Wait until the last frame is out, then discard what arrived and the
+    // overflow it may have caused. BUSY stays set until the transmit FIFO is
+    // empty and the shift register idle.
+    fn settle(&mut self) {
+        for (self.registers.read(SR) & BUSY) != 0 {
+            self.drain()
+        }
+        self.drain()
+        self.registers.write(ICR, RX_OVERRUN)
+    }
+
+    fn drain(&mut self) {
+        for (self.registers.read(SR) & RX_NOT_EMPTY) != 0 {
+            self.registers.read(DR)
+        }
+    }
+}
+
+// A PL022 on the chip, as chip packages hand it to applications. It
+// implements the std/embedded/hal SPI bus protocol like Controller but keeps
+// the register block: `RegisterBlock` trusts its owner with every offset,
+// which only the driver may be.
+pub struct Bus {
+    controller: Controller<hal.RegisterBlock>
+
+    // SAFETY: as for hal.RegisterBlock.at, with `base` a PL022 whose reset
+    // and pins the caller has set up and that only this bus uses.
+    pub unsafe fn at(base: usize, divisors: Divisors, mode: hal.SpiMode) -> Bus {
+        unsafe {
+            return Bus { controller: Controller.new(hal.RegisterBlock.at(base), divisors, mode) }
+        }
+    }
+
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        return self.controller.transfer(bytes)
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        return self.controller.write(bytes)
+    }
+
+    // The clock frequency, in hertz: the fastest the controller can make
+    // that does not exceed the requested one.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.controller.frequency_hz()
+    }
+
+    // Change the clock between transfers, for devices with different limits
+    // on one bus.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        return self.controller.set_frequency(frequency_hz)
+    }
+
+    // Change the clock polarity and phase between transfers.
+    pub fn set_mode(&mut self, mode: hal.SpiMode) {
+        self.controller.set_mode(mode)
+    }
+
+    // Loop the transmitter back to the receiver inside the chip, for
+    // self-tests: transfers read back what they send.
+    pub fn set_loopback(&mut self, on: bool) {
+        self.controller.set_loopback(on)
+    }
+
+    // Disable the controller and return its base address, for the chip
+    // package to take the bus back.
+    pub fn release(self) -> usize {
+        let Bus { controller } = self
+        registers := controller.release()
+        return registers.base()
+    }
+}
