@@ -30,10 +30,10 @@ those changes with the CLI.
 ```sh
 git clone https://github.com/Jotrorox/dodo.git
 cd dodo
-git checkout v0.1.4
+git checkout v0.1.5
 ```
 
-The tag selects compiler release 0.1.4. For compiler development, use `main`
+The tag selects compiler release 0.1.5. For compiler development, use `main`
 instead. Run the commands on this page from the repository root.
 
 ## Install build prerequisites
@@ -183,7 +183,7 @@ python scripts/build-windows-llvm-support.py
 cargo build --locked --features llvm-sys/force-static --release --bin dodo --target x86_64-pc-windows-msvc
 python scripts/test_windows_native.py --linker clang
 python scripts/package-release.py --target x86_64-pc-windows-msvc
-python scripts/test_windows_release.py build/release-assets/dodo-0.1.4-x86_64-pc-windows-msvc.zip --linker clang
+python scripts/test_windows_release.py build/release-assets/dodo-0.1.5-x86_64-pc-windows-msvc.zip --linker clang
 ```
 
 The support script requires CMake and Visual Studio 2022. It builds the libxml2,
@@ -315,12 +315,12 @@ the versions in `Cargo.toml` and `editor-support/dodo-vscode/package.json` and
 locally before tagging:
 
 ```sh
-python3 scripts/check_release.py v0.1.4
+python3 scripts/check_release.py v0.1.5
 ```
 
 The workflow then runs the same build, test, and packaging jobs as CI and
-creates a GitHub Release from the changelog entry. It attaches the Linux and
-Windows archives, the `.vsix`, and a `SHA256SUMS` file, and records build
+creates a GitHub Release from the changelog entry. It attaches the Linux, macOS,
+and Windows archives, the `.vsix`, and a `SHA256SUMS` file, and records build
 provenance attestations for each asset. Tags with a pre-release suffix, such as
 `v0.2.0-rc.1`, are published as pre-releases.
 

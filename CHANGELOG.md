@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.1.5 — 2026-10-12
+
+Dodo 0.1.5 brings the compiler and hosted standard library to macOS and AArch64
+Linux, and adds firmware builds for the Raspberry Pi Pico, Pico 2, and Pico 2
+W, with GPIO, timers, I2C, and SPI behind a portable hardware abstraction
+layer. Releases now ship x86-64 and AArch64 Linux, Apple silicon macOS, and
+x86-64 Windows archives with checksums and build provenance attestations. The
+language specification remains version 0.1.
 
 - Support macOS in the hosted standard library: console, files,
   environment, processes, threads, synchronization, clocks, sockets, TLS
@@ -110,6 +117,25 @@
 - Rework the GPIO example into RP2040 chip support built on `std/embedded/hal`, add a
   desktop-testable I2C sensor driver example, and add the
   [hardware and embedded guide](https://jotrorox.github.io/dodo/hardware/).
+- Mark every generated function `nounwind`. 32-bit Arm objects no longer
+  reference `__aeabi_unwind_cpp_pr0`, which broke firmware linked without
+  libgcc; hosted objects keep their unwind tables for debuggers and backtraces.
+- Extend the control-flow initialization analysis to integer range loops,
+  signed negation, arrays and slices (including `foreach` over them), enums,
+  `Option` and `Result`, patterns, and `Result` exits, so it checks more
+  function bodies. Only bodies that depend on unsupported constructs fall back
+  to the existing checks.
+- Fix `dodo fmt` gluing a prefix `!` to the preceding token (`if!x`,
+  `return!x`, `f(a,!x)`). `T!E` error types and postfix unwraps stay tight.
+- Fix the HTTPS client failing an already complete response when the server
+  closes right after responding: a reset while sending the client's
+  `close_notify` is now ignored. This made the hosted HTTPS integration test
+  flaky on macOS.
+- Add generated compiler safety tests and fuzz targets. CI now fuzzes on a
+  schedule, tracks benchmark results, tests cold-cache builds, and runs the
+  frontend tests on Apple silicon.
+- Publish broader language-server latency measurements and shared-prefix web
+  routing benchmarks.
 - Publish GitHub Releases from `v*` tags. The release workflow checks the tag
   against `Cargo.toml`, the VS Code extension version, and `CHANGELOG.md`, then
   attaches the tested x86-64 and AArch64 Linux, Apple silicon macOS, and x86-64
@@ -119,10 +145,10 @@
   binaries no longer carry a symbol table, the Windows ZIP uses maximum
   compression, and the Linux archives include only the shared license texts
   its notices reference.
-- Fix the HTTPS client failing an already complete response when the server
-  closes right after responding: a reset while sending the client's
-  `close_notify` is now ignored. This made the hosted HTTPS integration test
-  flaky on macOS.
+
+The compiler still implements a subset of the language design. See the
+[implementation status and limits](https://jotrorox.github.io/dodo/implementation/)
+for supported behavior and remaining work.
 
 ## 0.1.4 — 2026-09-20
 

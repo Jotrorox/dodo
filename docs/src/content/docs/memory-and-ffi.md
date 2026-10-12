@@ -1,6 +1,6 @@
 ---
 title: "Memory and foreign calls"
-description: "Implemented layouts, C interoperation, pointer intrinsics, and MMIO limits in Dodo 0.1.4."
+description: "Implemented layouts, C interoperation, pointer intrinsics, and MMIO limits in Dodo 0.1.5."
 section: "Language reference"
 order: 230
 ---
