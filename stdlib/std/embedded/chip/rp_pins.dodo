@@ -3,8 +3,9 @@ package rp_pins
 import "std/embedded/hal"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl022"
+import "std/embedded/peripheral/pl011"
 
-// The GPIO, I2C, and SPI ownership the RP2040 and RP2350 share. On both chips
+// The GPIO, I2C, SPI, and UART ownership the RP2040 and RP2350 share. On both chips
 // GPIO 0 to 29 select the same controller signals with the same function
 // numbers and pad bits, so the chip packages keep their pins in a `Bank`,
 // which checks bus pins, hands out each pin and controller once, and takes
@@ -18,11 +19,14 @@ pub const I2C0: u32 = 0
 pub const I2C1: u32 = 1
 pub const SPI0: u32 = 2
 pub const SPI1: u32 = 3
-const CONTROLLERS: usize = 4
+pub const UART0: u32 = 4
+pub const UART1: u32 = 5
+const CONTROLLERS: usize = 6
 
 // GPIO functions (FUNCSEL). NULL disconnects the pin: it floats, apart from
 // its pad's pulls.
 const FUNCTION_SPI: u32 = 1
+const FUNCTION_UART: u32 = 2
 const FUNCTION_I2C: u32 = 3
 const FUNCTION_SIO: u32 = 5
 const FUNCTION_NULL: u32 = 31
@@ -73,9 +77,19 @@ pub fn spi_pins(clock: u32, tx: u32, rx: Option<u32>) -> SpiPins!hal.Error {
     return ok(SpiPins { controller, rx: none, mask })
 }
 
+// The UART, 0 or 1, that TX and RX form. TX pins are multiples of four,
+// RX pins one higher. UART0 uses groups 0, 12, 16, 28; UART1 4, 8, 20, 24.
+// Signals can come from different groups belonging to the same controller.
+pub fn uart_controller(tx: u32, rx: u32) -> u32!hal.Error {
+    if tx >= PIN_COUNT || rx >= PIN_COUNT || tx % 4 != 0 || rx % 4 != 1 || ((tx + 4) / 8) % 2 != ((rx + 4) / 8) % 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(((tx + 4) / 8) % 2)
+}
+
 // GPIO 0 to 29 and the bus controllers of one chip C, each handed out once
 // and taken back by the release methods. C does what differs between the
-// chips, with these methods, `controller` numbered as I2C0 to SPI1 above:
+// chips, with these methods, `controller` numbered as I2C0 to UART1 above:
 //
 //    route(&mut self, pin: u32, function: u32, clear: u32, set: u32)
 //        connect the pin to FUNCSEL `function`, then clear the `clear` and
@@ -94,14 +108,14 @@ pub struct Bank<C> {
     taken: u32
     // The pins of each controller's bus, by controller number; 0 while the
     // controller is free.
-    buses: [4]u32
+    buses: [6]u32
 
     // SAFETY: C's methods must do what the protocol above says, `base` must
-    // name the controller's PL022 or DW_apb_i2c, and the bank must be the
-    // only user of GPIO 0 to 29's control and pad registers, of the four
+    // name the controller's PL022, PL011, or DW_apb_i2c, and the bank must be the
+    // only user of GPIO 0 to 29's control and pad registers, of the six
     // controllers, and of their resets.
     pub unsafe fn new(chip: C) -> Bank<C> {
-        return Bank<C> { chip, taken: 0, buses: [0u32; 4] }
+        return Bank<C> { chip, taken: 0, buses: [0u32; 6] }
     }
 
     // Claim pin `number` for the single-cycle I/O block. Returns its bit, for
@@ -154,6 +168,26 @@ pub struct Bank<C> {
             self.connect(controller, FUNCTION_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
             return ok(bus)
         }
+    }
+
+    // Claim a UART in 8N1 format. InvalidInput for incompatible pins or baud
+    // rates, Busy for a claimed pin or controller. Runtime I/O uses std/io.
+    pub fn uart(&mut self, tx: u32, rx: u32, baud_hz: u32) -> pl011.Port!hal.Error {
+        controller := UART0 + uart_controller(tx, rx)?
+        divisors := pl011.divisors(self.chip.clock_hz(), baud_hz)?
+        self.start(controller, (1u32 << tx) | (1u32 << rx))?
+        // SAFETY: start owns the UART and both pins; Bank.new vouches for base.
+        unsafe {
+            port := pl011.Port.at(self.chip.base(controller), divisors)
+            self.connect(controller, FUNCTION_UART, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
+            return ok(port)
+        }
+    }
+
+    // Disable and release a UART, disconnecting its pins and holding it in
+    // reset. Flush before release to finish queued output; release never waits.
+    pub fn release_uart(&mut self, port: pl011.Port) {
+        self.stop(port.release())
     }
 
     // Give back an I2C bus from `i2c`: its pins are disconnected, still

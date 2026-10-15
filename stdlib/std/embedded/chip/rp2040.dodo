@@ -3,9 +3,10 @@ package rp2040
 import "std/embedded/hal"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl022"
+import "std/embedded/peripheral/pl011"
 import "std/embedded/chip/rp_pins"
 
-// Raspberry Pi RP2040 chip support: clocks, resets, GPIO, I2C, SPI, the
+// Raspberry Pi RP2040 chip support: clocks, resets, GPIO, I2C, SPI, UART, the
 // microsecond timer, and the boot ROM. `take(config)` brings the chip from its
 // boot state (ring oscillator, peripherals held in reset) to a known
 // configuration and hands out the peripherals once. Pins implement the
@@ -42,6 +43,8 @@ const RESET_PADS_BANK0: u32 = 1 << 8
 const RESET_PLL_SYS: u32 = 1 << 12
 const RESET_SPI0: u32 = 1 << 16
 const RESET_SPI1: u32 = 1 << 17
+const RESET_UART0: u32 = 1 << 22
+const RESET_UART1: u32 = 1 << 23
 const RESET_TIMER: u32 = 1 << 21
 
 // Crystal oscillator (2.16).
@@ -105,6 +108,8 @@ const I2C0_BASE: usize = 0x4004_4000
 const I2C1_BASE: usize = 0x4004_8000
 const SPI0_BASE: usize = 0x4003_C000
 const SPI1_BASE: usize = 0x4004_0000
+const UART0_BASE: usize = 0x4003_4000
+const UART1_BASE: usize = 0x4003_8000
 
 // Single-cycle I/O (2.3.1).
 const SIO_BASE: usize = 0xD000_0000
@@ -279,7 +284,7 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
     }
 }
 
-// The 30 user GPIOs, and the I2C and SPI controllers that use them. Each pin
+// The 30 user GPIOs, and the I2C, SPI, and UART controllers that use them. Each pin
 // and each controller can be taken once, and given back.
 pub struct Pins {
     bank: rp_pins.Bank<Chip>
@@ -329,6 +334,21 @@ pub struct Pins {
     // `i2c`.
     pub fn spi(&mut self, clock: u32, tx: u32, rx: Option<u32>, mode: hal.SpiMode, frequency_hz: u32) -> pl022.Bus!hal.Error {
         return self.bank.spi(clock, tx, rx, mode, frequency_hz)
+    }
+
+    // Claim an 8N1 UART implementing std/io Reader and Writer. TX pins are
+    // 0, 12, 16, 28 for UART0; 4, 8, 20, 24 for UART1. RX pins are one
+    // higher, and may use another group of the same UART. InvalidInput for
+    // bad pins or baud, Busy if a pin or UART is taken. I/O waits are bounded;
+    // errors report partial progress. See pl011 for timeout and fault details.
+    pub fn uart(&mut self, tx: u32, rx: u32, baud_hz: u32) -> pl011.Port!hal.Error {
+        return self.bank.uart(tx, rx, baud_hz)
+    }
+
+    // Release without waiting; flush first to finish queued output. The
+    // pins are disconnected and the UART held in reset, ready to reclaim.
+    pub fn release_uart(&mut self, port: pl011.Port) {
+        self.bank.release_uart(port)
     }
 
     // Give back an I2C bus. Its controller is held in reset and its pins are
@@ -398,6 +418,10 @@ struct Chip {
             return I2C1_BASE
         } else if controller == rp_pins.SPI0 {
             return SPI0_BASE
+        } else if controller == rp_pins.UART0 {
+            return UART0_BASE
+        } else if controller == rp_pins.UART1 {
+            return UART1_BASE
         }
         return SPI1_BASE
     }
@@ -415,6 +439,10 @@ fn controller_reset(controller: u32) -> u32 {
         return RESET_I2C1
     } else if controller == rp_pins.SPI0 {
         return RESET_SPI0
+    } else if controller == rp_pins.UART0 {
+        return RESET_UART0
+    } else if controller == rp_pins.UART1 {
+        return RESET_UART1
     }
     return RESET_SPI1
 }

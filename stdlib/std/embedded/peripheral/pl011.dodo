@@ -1,0 +1,205 @@
+package pl011
+
+import "std/embedded/hal"
+import "std/io"
+
+// Arm PrimeCell PL011 UART, shared by chips including RP2040 and RP2350.
+// Controller works over the hal register block protocol, including models in
+// host tests. Chip packages reset the UART, route TX/RX, and supply clk_peri.
+// The format is 8 data bits, no parity, one stop bit, with FIFOs enabled and
+// no flow control, interrupts, DMA, allocation, or newline translation.
+const DR: usize = 0x000
+const ECR: usize = 0x004
+const FR: usize = 0x018
+const IBRD: usize = 0x024
+const FBRD: usize = 0x028
+const LCR_H: usize = 0x02C
+const CR: usize = 0x030
+const IMSC: usize = 0x038
+const ICR: usize = 0x044
+const DMACR: usize = 0x048
+
+const BUSY: u32 = 1 << 3
+const RX_EMPTY: u32 = 1 << 4
+const TX_FULL: u32 = 1 << 5
+const TX_EMPTY: u32 = 1 << 7
+const RECEIVE_ERRORS: u32 = 0xF00
+
+// Maximum consecutive unsuccessful status polls, reset after each byte.
+// This is a CPU polling budget, not a duration or a hardware timer deadline.
+pub const DEFAULT_POLL_LIMIT: u32 = 10_000_000
+
+pub struct Divisors {
+    pub clock_hz: u32
+    // Integer (1..65535) and fractional (0..63) baud rate divisors.
+    pub integer: u32
+    pub fractional: u32
+    pub baud_hz: u32
+}
+
+// Round clock_hz / (16 * baud_hz) to the nearest 1/64. Reject zero clocks
+// and rates outside the hardware's divisor range, without clamping them.
+pub fn divisors(clock_hz: u32, baud_hz: u32) -> Divisors!hal.Error {
+    if clock_hz == 0 || baud_hz == 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    scaled := clock_hz as u64 * 4
+    baud := baud_hz as u64
+    if baud * 64 > scaled || baud * 0x3F_FFFF < scaled {
+        return err(hal.Error.InvalidInput)
+    }
+    divisor := (scaled + baud / 2) / baud
+    return ok(Divisors {
+        clock_hz,
+        integer: (divisor / 64) as u32,
+        fractional: (divisor % 64) as u32,
+        baud_hz: (scaled / divisor) as u32,
+    })
+}
+
+pub struct Controller<R> {
+    registers: R
+    divisors: Divisors
+    poll_limit: u32
+
+    // Configure a UART fresh out of reset, using settings from divisors().
+    pub fn new(registers: R, divisors: Divisors) -> Controller<R> {
+        port := Controller<R> { registers, divisors, poll_limit: DEFAULT_POLL_LIMIT }
+        port.registers.write(CR, 0)
+        port.registers.write(IMSC, 0)
+        port.registers.write(DMACR, 0)
+        port.registers.write(ECR, 0)
+        port.registers.write(ICR, 0x7FF)
+        port.registers.write(IBRD, port.divisors.integer)
+        port.registers.write(FBRD, port.divisors.fractional)
+        // LCR_H must be written after the divisors to latch them.
+        port.registers.write(LCR_H, (3 << 5) | (1 << 4))
+        port.registers.write(CR, 1 | (1 << 8) | (1 << 9))
+        return port
+    }
+
+    pub fn baud_hz(&self) -> u32 {
+        return self.divisors.baud_hz
+    }
+
+    // Zero, like one, allows one status observation before timing out.
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.poll_limit = polls
+    }
+
+    // std/io Reader: fill the slice, or report the initialized prefix on
+    // timeout. An idle UART is never EOF. Empty requests touch no registers.
+    // Bad characters are consumed and discarded, excluded from transferred.
+    // Other carries raw DR error bits in code: framing=0x100, parity=0x200,
+    // break=0x400, overrun=0x800. Later calls can continue receiving.
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!io.Error {
+        count := 0usize
+        left := self.poll_limit
+        for count < destination.len {
+            if (self.registers.read(FR) & RX_EMPTY) != 0 {
+                if left <= 1 {
+                    return err(io.failure(io.ErrorKind.TimedOut, count))
+                }
+                left -= 1
+            } else {
+                data := self.registers.read(DR)
+                if (data & RECEIVE_ERRORS) != 0 {
+                    self.registers.write(ECR, 0)
+                    return err(io.Error { kind: io.ErrorKind.Other, transferred: count,
+                    code: (data & RECEIVE_ERRORS) as i32 })
+                }
+                destination[count] = (data & 0xFF) as u8
+                count += 1
+                left = self.poll_limit
+            }
+        }
+        return ok(count)
+    }
+
+    // std/io Writer: progress counts bytes accepted by the transmit FIFO,
+    // which may still be on the wire after return, including on timeout.
+    // Retry only the suffix. Use flush() to wait for physical completion.
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        count := 0usize
+        left := self.poll_limit
+        for count < source.len {
+            if (self.registers.read(FR) & TX_FULL) != 0 {
+                if left <= 1 {
+                    return err(io.failure(io.ErrorKind.TimedOut, count))
+                }
+                left -= 1
+            } else {
+                self.registers.write(DR, source[count] as u32)
+                count += 1
+                left = self.poll_limit
+            }
+        }
+        return ok(count)
+    }
+
+    // Wait for both FIFO and shift register to empty. A timeout has zero
+    // transferred: this call accepts no bytes, and never discards queued TX.
+    pub fn flush(&mut self) -> void!io.Error {
+        left := self.poll_limit
+        for true {
+            status := self.registers.read(FR)
+            if (status & (BUSY | TX_EMPTY)) == TX_EMPTY {
+                return ok()
+            }
+            if left <= 1 {
+                return err(io.failure(io.ErrorKind.TimedOut, 0))
+            }
+            left -= 1
+        }
+        return err(io.failure(io.ErrorKind.TimedOut, 0))
+    }
+
+    // Disable and return the registers without waiting. Flush first if
+    // queued output must complete; chip release may reset and discard it.
+    pub fn release(self) -> R {
+        self.registers.write(CR, 0)
+        let Controller { registers, divisors, poll_limit } = self
+        return registers
+    }
+}
+
+// An owned hardware UART. Keep the register block private: only the driver
+// may use its unchecked register offsets.
+pub struct Port {
+    controller: Controller<hal.RegisterBlock>
+
+    // SAFETY: as for hal.RegisterBlock.at, with base a PL011 fresh out of
+    // reset, its clock running, pins routed, and exclusive to this port.
+    pub unsafe fn at(base: usize, divisors: Divisors) -> Port {
+        unsafe {
+            return Port { controller: Controller.new(hal.RegisterBlock.at(base), divisors) }
+        }
+    }
+
+    pub fn baud_hz(&self) -> u32 {
+        return self.controller.baud_hz()
+    }
+
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.controller.set_poll_limit(polls)
+    }
+
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!io.Error {
+        return self.controller.read(destination)
+    }
+
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        return self.controller.write(source)
+    }
+
+    pub fn flush(&mut self) -> void!io.Error {
+        return self.controller.flush()
+    }
+
+    // Disable without waiting and return the base for the chip to reclaim.
+    pub fn release(self) -> usize {
+        let Port { controller } = self
+        registers := controller.release()
+        return registers.base()
+    }
+}
