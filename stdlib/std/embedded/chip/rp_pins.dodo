@@ -5,11 +5,11 @@ import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl022"
 import "std/embedded/peripheral/pl011"
 
-// The GPIO, I2C, SPI, and UART ownership the RP2040 and RP2350 share. On both chips
-// GPIO 0 to 29 select the same controller signals with the same function
-// numbers and pad bits, so the chip packages keep their pins in a `Bank`,
-// which checks bus pins, hands out each pin and controller once, and takes
-// them back.
+// The GPIO, I2C, SPI, and UART ownership the RP2040 and RP2350 share. On both
+// chips GPIO 0 to 29 select the same controller signals with the same
+// function numbers and pad bits, so the chip packages keep their pins in a
+// `Bank`, which checks bus pins, hands out each pin and controller once, and
+// takes them back.
 
 // The GPIOs whose functions both chips share.
 pub const PIN_COUNT: u32 = 30
@@ -111,8 +111,8 @@ pub struct Bank<C> {
     buses: [6]u32
 
     // SAFETY: C's methods must do what the protocol above says, `base` must
-    // name the controller's PL022, PL011, or DW_apb_i2c, and the bank must be the
-    // only user of GPIO 0 to 29's control and pad registers, of the six
+    // name the controller's PL022, PL011, or DW_apb_i2c, and the bank must be
+    // the only user of GPIO 0 to 29's control and pad registers, of the six
     // controllers, and of their resets.
     pub unsafe fn new(chip: C) -> Bank<C> {
         return Bank<C> { chip, taken: 0, buses: [0u32; 6] }

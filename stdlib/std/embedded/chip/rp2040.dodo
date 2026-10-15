@@ -11,8 +11,9 @@ import "std/embedded/chip/rp_pins"
 // boot state (ring oscillator, peripherals held in reset) to a known
 // configuration and hands out the peripherals once. Pins implement the
 // std/embedded/hal output and input pin protocols, I2C and SPI buses claimed
-// from `Pins` implement the bus protocols, and the timer implements the delay
-// protocol, so portable drivers use them unchanged.
+// from `Pins` implement the bus protocols, UART ports the std/io Reader and
+// Writer protocols, and the timer implements the delay protocol, so portable
+// drivers use them unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -284,8 +285,8 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
     }
 }
 
-// The 30 user GPIOs, and the I2C, SPI, and UART controllers that use them. Each pin
-// and each controller can be taken once, and given back.
+// The 30 user GPIOs, and the I2C, SPI, and UART controllers that use them.
+// Each pin and each controller can be taken once, and given back.
 pub struct Pins {
     bank: rp_pins.Bank<Chip>
 

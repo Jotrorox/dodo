@@ -101,6 +101,17 @@ fn expect_error(result: usize!io.Error, kind: io.ErrorKind, count: usize, code: 
     }
 }
 
+fn expect_invalid(result: pl011.Divisors!hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(reason) => {
+            core.assert(reason == hal.Error.InvalidInput)
+        }
+    }
+}
+
 fn baud_rates() {
     d := pl011.divisors(125_000_000, 115_200)!
     core.assert(d.integer == 67 && d.fractional == 52 && d.baud_hz == 115_207)
@@ -111,29 +122,19 @@ fn baud_rates() {
     core.assert(d.integer == 2 && d.fractional == 0)
     d = pl011.divisors(0xFFFF_FFFF, 115_200)!
     core.assert(d.integer > 0 && d.integer <= 65535)
-    d = pl011.divisors(1_048_575, 1)!
-    core.assert(d.integer == 65535 && d.fractional == 60)
+    d = pl011.divisors(1_048_560, 1)!
+    core.assert(d.integer == 65535 && d.fractional == 0)
+    // A rate that rounds to 1.0 is representable; above 65535.0 is not.
+    d = pl011.divisors(125_000_000, 7_812_501)!
+    core.assert(d.integer == 1 && d.fractional == 0)
     d = pl011.divisors(16, 1)!
     core.assert(d.integer == 1 && d.fractional == 0)
-    invalid: [5]u32 = [0, 1, 119, 7_812_501, 0xFFFF_FFFF]
+    invalid: [5]u32 = [0, 1, 119, 7_900_000, 0xFFFF_FFFF]
     for i in 0..invalid.len {
-        match pl011.divisors(125_000_000, invalid[i]) {
-            ok(_) => {
-                core.assert(false)
-            }
-            err(reason) => {
-                core.assert(reason == hal.Error.InvalidInput)
-            }
-        }
+        expect_invalid(pl011.divisors(125_000_000, invalid[i]))
     }
-    match pl011.divisors(0, 115_200) {
-        ok(_) => {
-            core.assert(false)
-        }
-        err(reason) => {
-            core.assert(reason == hal.Error.InvalidInput)
-        }
-    }
+    expect_invalid(pl011.divisors(1_048_561, 1))
+    expect_invalid(pl011.divisors(0, 115_200))
 }
 
 fn configuration_and_empty() {
