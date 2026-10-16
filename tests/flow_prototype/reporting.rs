@@ -28,7 +28,7 @@ fn messages(report: &flow::CheckReport) -> Vec<&str> {
 #[test]
 fn coverage_distinguishes_success_findings_and_body_fallback() {
     let source =
-        "package experiment\nfn clean() {}\nfn bad() { u8 x\n_ = x }\nfn cast() { _ = 1u8 as u32 }";
+        "package experiment\nfn clean() {}\nfn bad() { u8 x\n_ = x }\nfn cast() { _ = 1u8 as f32 }";
     let mut program = parser::parse(source).unwrap();
     let report = flow::check_with_report(&mut program, 64);
     assert_eq!(status(&report, "clean"), &BodyStatus::Analyzed);
@@ -42,11 +42,11 @@ fn coverage_distinguishes_success_findings_and_body_fallback() {
         panic!("{report:?}")
     };
     assert_eq!(*scope, SkipScope::Body);
-    assert_eq!(limitation.kind, LimitationKind::Expression);
-    assert!(limitation.reason.contains("expression outside subset"));
+    assert_eq!(limitation.kind, LimitationKind::UnsupportedConstruct);
+    assert!(limitation.reason.contains("only integer-to-integer casts"));
     assert_eq!(
         &source[limitation.span.start..limitation.span.end],
-        "1u8 as u32"
+        "1u8 as f32"
     );
     assert_eq!(report.diagnostics.len(), 1);
     assert!(report.diagnostics[0].message.contains("uninitialized"));
@@ -139,7 +139,7 @@ fn referenced_declarations_fall_back_only_for_the_dependent_body() {
 #[test]
 fn supported_callee_signatures_do_not_require_supported_bodies() {
     let program = parse(
-        "fn callee(x: u8) -> u8 { _ = 1u8 as u32\nreturn x }\nfn f() -> u8 { return callee(1) }",
+        "fn callee(x: u8) -> u8 { _ = 1u8 as f32\nreturn x }\nfn f() -> u8 { return callee(1) }",
     );
     let comparison = flow::compare_checkers(&program, 64);
     assert!(comparison.combined.diagnostics.is_empty(), "{comparison:?}");
@@ -259,9 +259,9 @@ fn coverage_measures_preparation_and_instantiation_not_the_raw_parse() {
 
 #[test]
 fn failed_lowering_discards_all_partial_findings_and_does_not_poison_other_bodies() {
-    // A prefix graph would diagnose x. A late unsupported cast must discard
+    // A prefix graph would diagnose x. A late float cast must discard
     // that graph, not analyze it or let it contaminate the next function.
-    let program = parse("fn f() { u8 x\n_ = x\n_ = 1u8 as u32 }\nfn g() {}");
+    let program = parse("fn f() { u8 x\n_ = x\n_ = 1u8 as f32 }\nfn g() {}");
     assert!(flow::lower(&program, "f").is_err());
     let comparison = flow::compare_checkers(&program, 64);
     assert!(comparison.flow.diagnostics.is_empty());
@@ -437,6 +437,7 @@ fn representative_corpus_coverage() {
             }
         }
         if fixture == "examples/fibonacci.dodo" {
+            assert_eq!(status(&report, "main"), &BodyStatus::Analyzed);
             // Foreach now lowers; the assertion intrinsic is the next blocker.
             let BodyStatus::Skipped { limitation, .. } =
                 status(&report, "fibonacci_known_sequence")
@@ -482,6 +483,29 @@ fn representative_corpus_coverage() {
             ] {
                 assert_eq!(status(&report, name), &BodyStatus::Analyzed, "{name}");
             }
+            // Integer casts expose these bodies to initialization analysis.
+            for name in [
+                "bytes.read",
+                "bytes.write",
+                "bytes.read_u16_le",
+                "bytes.read_u16_be",
+                "bytes.read_u32_le",
+                "bytes.read_u32_be",
+                "bytes.read_u64_le",
+                "bytes.read_u64_be",
+                "text.decode",
+                "text.encode",
+                "text.digit",
+                "text.magnitude",
+                "text.parse_i64",
+            ] {
+                assert_eq!(status(&report, name), &BodyStatus::Analyzed, "{name}");
+            }
+            let BodyStatus::Skipped { limitation, .. } = status(&report, "bytes.write_u16_le")
+            else {
+                panic!("expected mutable reborrow fallback for bytes.write_u16_le");
+            };
+            assert!(limitation.reason.contains("implicit mutable reborrow"));
             assert!(matches!(
                 status(&report, "console.Input.read"),
                 BodyStatus::Skipped {
