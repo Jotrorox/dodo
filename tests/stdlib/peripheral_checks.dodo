@@ -1048,7 +1048,7 @@ fn spi_overrun() {
     bus.transfer(&mut bytes)!
 }
 
-fn expect_invalid(result: u32!hal.Error) {
+fn expect_invalid<T>(result: T!hal.Error) {
     match result {
         ok(controller) => {
             core.assert(false)
@@ -1118,9 +1118,9 @@ static mut PADS: [30]u32 = [0u32; 30]
 static mut RESETS: u32 = 0
 static mut HELD: u32 = 0
 static mut FAIL_RESET: bool = false
-// Plain memory standing in for the four controllers' register blocks: the
+// Plain memory standing in for the six controllers' register blocks: the
 // drivers only configure them and disable them again.
-static mut BLOCKS: [256]u32 = [0u32; 256]
+static mut BLOCKS: [384]u32 = [0u32; 384]
 
 const SIO: u32 = 5
 const DISCONNECTED: u32 = 31
@@ -1249,6 +1249,61 @@ fn rp_bank() {
     }
     last := bank.spi(10, 11, none, hal.SpiMode.Mode3, 1_000_000)!
     core.assert(function(10) == 1 && function(11) == 1 && last.frequency_hz() == 992_063)
+    bank.release_spi(last)
+
+    // UART validation happens before claiming pins or resetting hardware.
+    expect_invalid(bank.uart(0, 5, 115_200))
+    expect_invalid(bank.uart(0, 1, 0))
+    for tx in 0u32..30 {
+        for rx in 0u32..30 {
+            valid := tx % 4 == 0 && rx % 4 == 1 && ((tx + 4) / 8) % 2 == ((rx + 4) / 8) % 2
+            match rp_pins.uart_controller(tx, rx) {
+                ok(controller) => {
+                    core.assert(valid)
+                    core.assert_eq(controller, ((tx + 4) / 8) % 2)
+                }
+                err(error) => {
+                    core.assert(!valid && error == hal.Error.InvalidInput)
+                }
+            }
+        }
+    }
+    expect_invalid(rp_pins.uart_controller(32, 1))
+    expect_invalid(rp_pins.uart_controller(0, 33))
+    uart := bank.uart(0, 13, 115_200)!
+    core.assert(function(0) == 2 && function(13) == 2)
+    expect_busy(bank.uart(16, 17, 9600))
+    expect_busy(bank.gpio(13))
+    expect_busy(bank.i2c(0, 1, hal.I2C_FAST_HZ))
+    expect_busy(bank.uart(4, 25, 9600))
+    bank.release_gpio(led)
+    second := bank.uart(4, 25, 9600)!
+    bank.release_uart(uart)
+    core.assert(function(0) == DISCONNECTED && function(13) == DISCONNECTED)
+    core.assert(function(4) == 2 && function(25) == 2)
+    unsafe {
+        core.assert((HELD & (1u32 << rp_pins.UART0)) != 0)
+    }
+    bank.release_uart(second)
+    // Failed reset must release both the controller and its pins.
+    unsafe {
+        FAIL_RESET = true
+    }
+    match bank.uart(0, 1, 115_200) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    unsafe {
+        FAIL_RESET = false
+    }
+    again_uart := bank.uart(0, 1, 115_200)!
+    bank.release_uart(again_uart)
+    free := bank.gpio(0)!
+    bank.release_gpio(free)
 }
 
 fn main() {

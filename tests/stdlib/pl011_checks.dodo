@@ -1,0 +1,282 @@
+package main
+
+import "std/embedded/hal"
+import "std/embedded/peripheral/pl011"
+import "std/io"
+
+// A UART model with four transmit FIFO entries, delayed status progress,
+// per-character receive errors, and independently stuck TX/RX/shift register.
+struct UartModel {
+    config: [19]u32
+    writes: usize
+    polls: usize
+    sent: [96]u8
+    accepted: usize
+    queued: usize
+    tx_limit: usize
+    rx: [96]u32
+    received: usize
+    rx_length: usize
+    delay: usize
+    busy: bool
+    clears: usize
+
+    fn new() -> UartModel {
+        return UartModel { config: [0; 19], writes: 0, polls: 0,
+        sent: [0; 96], accepted: 0, queued: 0, tx_limit: 96,
+        rx: [0; 96], received: 0, rx_length: 0, delay: 0,
+        busy: false, clears: 0 }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x18 {
+            self.polls += 1
+            // One frame leaves every three polls, exercising back-pressure.
+            if self.polls % 3 == 0 && self.queued != 0 {
+                self.queued -= 1
+            }
+            flags := 0u32
+            if self.received == self.rx_length || self.polls % 3 != 0 {
+                flags |= 1 << 4
+            }
+            if self.queued == 4 || self.accepted == self.tx_limit {
+                flags |= 1 << 5
+            }
+            if self.queued == 0 {
+                flags |= 1 << 7
+            }
+            if self.queued != 0 || self.busy {
+                flags |= 1 << 3
+            }
+            if self.delay != 0 {
+                self.delay -= 1
+                flags |=(1 << 4) | (1 << 5)
+            }
+            return flags
+        }
+        core.assert(offset == 0)
+        core.assert(self.received < self.rx_length)
+        value := self.rx[self.received]
+        self.received += 1
+        return value
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        self.writes += 1
+        if offset == 0 {
+            core.assert(self.queued < 4 && self.accepted < self.tx_limit)
+            core.assert_eq(self.config[0x30 / 4], 0x301u32)
+            self.sent[self.accepted] = value as u8
+            self.accepted += 1
+            self.queued += 1
+        } else {
+            if offset == 0x2C {
+                core.assert_eq(self.config[0x30 / 4], 0u32)
+                core.assert(self.config[0x24 / 4] != 0)
+            }
+            if offset == 4 {
+                self.clears += 1
+            }
+            self.config[offset / 4] = value
+        }
+    }
+}
+
+fn port(model: UartModel) -> pl011.Controller<UartModel> {
+    uart := pl011.Controller.new(model, pl011.divisors(125_000_000, 115_200)!)
+    uart.set_poll_limit(4)
+    return uart
+}
+
+fn expect_error(result: usize!io.Error, kind: io.ErrorKind, count: usize, code: i32) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(reason) => {
+            core.assert(reason.kind == kind)
+            core.assert_eq(reason.transferred, count)
+            core.assert_eq(reason.code, code)
+        }
+    }
+}
+
+fn expect_invalid(result: pl011.Divisors!hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(reason) => {
+            core.assert(reason == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn baud_rates() {
+    d := pl011.divisors(125_000_000, 115_200)!
+    core.assert(d.integer == 67 && d.fractional == 52 && d.baud_hz == 115_207)
+    d = pl011.divisors(150_000_000, 115_200)!
+    core.assert(d.integer == 81 && d.fractional == 24)
+    // Rounding carries from fractional into integer; arithmetic stays wide.
+    d = pl011.divisors(16_383, 512)!
+    core.assert(d.integer == 2 && d.fractional == 0)
+    d = pl011.divisors(0xFFFF_FFFF, 115_200)!
+    core.assert(d.integer > 0 && d.integer <= 65535)
+    d = pl011.divisors(1_048_560, 1)!
+    core.assert(d.integer == 65535 && d.fractional == 0)
+    // A rate that rounds to 1.0 is representable; above 65535.0 is not.
+    d = pl011.divisors(125_000_000, 7_812_501)!
+    core.assert(d.integer == 1 && d.fractional == 0)
+    d = pl011.divisors(16, 1)!
+    core.assert(d.integer == 1 && d.fractional == 0)
+    invalid: [5]u32 = [0, 1, 119, 7_900_000, 0xFFFF_FFFF]
+    for i in 0..invalid.len {
+        expect_invalid(pl011.divisors(125_000_000, invalid[i]))
+    }
+    expect_invalid(pl011.divisors(1_048_561, 1))
+    expect_invalid(pl011.divisors(0, 115_200))
+}
+
+fn configuration_and_empty() {
+    uart := port(UartModel.new())
+    core.assert_eq(uart.baud_hz(), 115_207u32)
+    empty := [0u8; 0]
+    core.assert_eq(uart.read(&mut empty)!, 0usize)
+    core.assert_eq(uart.write(&empty)!, 0usize)
+    model := uart.release()
+    core.assert_eq(model.polls, 0usize)
+    core.assert_eq(model.writes, 10usize)
+    core.assert_eq(model.config[0x24 / 4], 67u32)
+    core.assert_eq(model.config[0x28 / 4], 52u32)
+    core.assert_eq(model.config[0x2C / 4], 0x70u32)
+    core.assert_eq(model.config[0x38 / 4], 0u32)
+    core.assert_eq(model.config[0x48 / 4], 0u32)
+    core.assert_eq(model.config[0x30 / 4], 0u32)
+}
+
+fn transfers() {
+    model := UartModel.new()
+    model.rx_length = 80
+    for i in 0usize..80 {
+        model.rx[i] = (i * 3) as u32
+    }
+    uart := port(model)
+    bytes := [0u8; 80]
+    core.assert_eq(io.read_exact(&mut uart, &mut bytes)!, 80usize)
+    for i in 0usize..80 {
+        core.assert_eq(bytes[i], (i * 3) as u8)
+    }
+    core.assert_eq(io.write_all(&mut uart, &bytes)!, 80usize)
+    uart.set_poll_limit(16)
+    uart.flush()!
+    model = uart.release()
+    core.assert_eq(model.accepted, 80usize)
+    core.assert_eq(model.queued, 0usize)
+    for i in 0usize..80 {
+        core.assert_eq(model.sent[i], bytes[i])
+    }
+}
+
+fn timeouts() {
+    // No EOF for an idle UART, and exact partial read progress is retained.
+    model := UartModel.new()
+    model.rx_length = 2
+    model.rx[0] = 42
+    model.rx[1] = 43
+    uart := port(model)
+    bytes := [99u8; 4]
+    expect_error(io.read_exact(&mut uart, &mut bytes), io.ErrorKind.TimedOut, 2, 0)
+    core.assert(bytes[0] == 42 && bytes[1] == 43 && bytes[2] == 99 && bytes[3] == 99)
+    expect_error(uart.read(&mut bytes), io.ErrorKind.TimedOut, 0, 0)
+    model = uart.release()
+    core.assert_eq(model.polls, 14usize)
+
+    model = UartModel.new()
+    model.tx_limit = 2
+    uart = port(model)
+    expect_error(io.write_all(&mut uart, &bytes), io.ErrorKind.TimedOut, 2, 0)
+    expect_error(uart.write(&bytes), io.ErrorKind.TimedOut, 0, 0)
+    model = uart.release()
+    core.assert_eq(model.accepted, 2usize)
+    core.assert_eq(model.polls, 10usize)
+    // Reuse after timeout: accepted bytes are not resent or discarded.
+    model.tx_limit = 96
+    uart = port(model)
+    core.assert_eq(uart.write(&bytes[2..])!, 2usize)
+    uart.set_poll_limit(16)
+    uart.flush()!
+    model = uart.release()
+    core.assert_eq(model.accepted, 4usize)
+
+    // Progress resets the wait budget; immediate success works even at zero.
+    model = UartModel.new()
+    model.delay = 3
+    uart = port(model)
+    core.assert_eq(uart.write(&bytes)!, 4usize)
+    uart.set_poll_limit(16)
+    uart.flush()!
+    model = uart.release()
+    uart = port(model)
+    uart.set_poll_limit(0)
+    core.assert_eq(uart.write(&bytes[..1])!, 1usize)
+    expect_error(uart.read(&mut bytes), io.ErrorKind.TimedOut, 0, 0)
+}
+
+fn receive_faults() {
+    faults: [5]u32 = [0x100, 0x200, 0x400, 0x800, 0xF00]
+    for i in 0..faults.len {
+        model := UartModel.new()
+        model.rx_length = 3
+        model.rx[0] = 42
+        model.rx[1] = 43 | faults[i]
+        model.rx[2] = 44
+        uart := port(model)
+        bytes := [99u8; 3]
+        expect_error(io.read_exact(&mut uart, &mut bytes), io.ErrorKind.Other, 1, faults[i] as i32)
+        core.assert(bytes[0] == 42 && bytes[1] == 99 && bytes[2] == 99)
+        core.assert_eq(uart.read(&mut bytes[1..2])!, 1usize)
+        core.assert_eq(bytes[1], 44u8)
+        model = uart.release()
+        core.assert_eq(model.clears, 2usize)
+        core.assert_eq(model.received, 3usize)
+    }
+}
+
+fn flush_timeout() {
+    model := UartModel.new()
+    model.busy = true
+    uart := port(model)
+    match uart.flush() {
+        ok() => {
+            core.assert(false)
+        }
+        err(reason) => {
+            core.assert(reason.kind == io.ErrorKind.TimedOut && reason.transferred == 0)
+        }
+    }
+    model = uart.release()
+    core.assert_eq(model.polls, 4usize)
+    core.assert_eq(model.accepted, 0usize)
+    // A FIFO that has not drained must also prevent flush.
+    model.busy = false
+    model.queued = 4
+    uart = port(model)
+    uart.set_poll_limit(1)
+    match uart.flush() {
+        ok() => {
+            core.assert(false)
+        }
+        err(reason) => {
+            core.assert(reason.kind == io.ErrorKind.TimedOut)
+        }
+    }
+}
+
+fn main() {
+    baud_rates()
+    configuration_and_empty()
+    transfers()
+    timeouts()
+    receive_faults()
+    flush_timeout()
+}
