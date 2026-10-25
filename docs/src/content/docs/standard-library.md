@@ -126,7 +126,7 @@ registers and portable device protocols; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
 `std/embedded/chip/rp2350` with `std/embedded/board/pico2` and
 `std/embedded/board/pico2_w` the RP2350, Pico 2, and Pico 2 W, including
-their I2C and SPI buses through the shared controller drivers in
+their I2C and SPI buses and UART ports through the shared controller drivers in
 `std/embedded/peripheral` and the pin and controller ownership both chips
 share in `std/embedded/chip/rp_pins`.
 `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
@@ -166,7 +166,7 @@ individual modules and links every public declaration back to its source.
 | [TLS](tls.md) | `std/tls`, `std/tls/openssl`, `std/tls/stream` | Contracts/stream portable; OpenSSL hosted. |
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
-| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/wireless/cyw43` | `std/embedded/hal` is portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
+| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43` | `std/embedded/hal` is portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
 
 ## Implementation and adapter packages
 

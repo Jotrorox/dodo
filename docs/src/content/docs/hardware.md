@@ -13,7 +13,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Layer | Import | What it gives you |
 | --- | --- | --- |
 | Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
-| Peripheral drivers | `std/embedded/peripheral/...` | I2C and SPI controller drivers, shared by every chip that contains the controller. |
+| Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal` | `hal.Critical`, a section that masks interrupts until it is dropped. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, and buses that record what a driver did. |
@@ -408,6 +408,7 @@ popping a FIFO.
 | --- | --- | --- |
 | `std/embedded/peripheral/designware_i2c` | Synopsys DesignWare DW_apb_i2c | The I2C bus protocol, as the only master: 7-bit addresses, up to 1 MHz. |
 | `std/embedded/peripheral/pl022` | Arm PrimeCell PL022 | The SPI bus protocol, as master: 8-bit frames, all four modes. |
+| `std/embedded/peripheral/pl011` | Arm PrimeCell PL011 | The `std/io` Reader and Writer protocols: 8N1 UART, bounded polling, partial-transfer errors. |
 
 Both keep the controller's FIFOs busy without ever queueing more than the
 receive FIFO holds, and bound every wait on the bus, so a device that holds
@@ -415,6 +416,11 @@ the I2C clock low yields `Timeout` instead of a hang. Chip packages hand out
 their controllers as each driver's `Bus`, which keeps the register block
 from the application: `pins.i2c` on the RP2040 and RP2350 returns a
 `designware_i2c.Bus`, and `pins.spi` a `pl022.Bus`.
+
+`pins.uart(tx, rx, baud_hz)` returns a `pl011.Port`. Its generic
+`Controller<R>` also runs against register models on a desktop. Both implement
+the existing `std/io` protocols, so `io.read_exact`, `io.write_all`, buffering,
+and formatting work with UARTs.
 
 ### Owning peripherals once
 
@@ -548,6 +554,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `b.pins` | The other GPIOs: `output(n)` and `input(n)` return pins that implement the [pin protocols](#device-protocols), or `Busy` if taken. |
 | `b.pins.i2c(sda, scl, hz)` | An I2C bus on two pins, implementing the I2C bus protocol. |
 | `b.pins.spi(clock, tx, rx, mode, hz)` | An SPI bus, implementing the SPI bus protocol; `rx` is `some(pin)` or `none`. |
+| `b.pins.uart(tx, rx, baud_hz)` | An 8N1 UART, implementing `std/io` Reader and Writer. |
 | `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`. |
@@ -616,6 +623,59 @@ extra pins are not yet.
 
 Unlike the RP2040, the RP2350 boot ROM clears RAM when it starts, so nothing
 in RAM survives a reboot into the bootloader.
+
+### UART on the RP2040 and RP2350
+
+Both chips have two PL011 UARTs. Claim their pins with
+`pins.uart(tx, rx, baud_hz)` and give them back with `pins.release_uart(port)`.
+TX and RX must belong to the same controller, but may come from different
+pin groups. These are the shared function-2 routes; RP2350's additional
+function-11 routes are not exposed.
+
+| Port | TX pins | RX pins |
+| --- | --- | --- |
+| UART0 | 0, 12, 16, 28 | 1, 13, 17, 29 |
+| UART1 | 4, 8, 20, 24 | 5, 9, 21, 25 |
+
+Invalid pins or an unrepresentable baud rate return `hal.Error.InvalidInput`
+before claiming anything. An occupied pin or controller returns `Busy`.
+Baud divisors round to the nearest 1/64; `port.baud_hz()` reports the result.
+The format is eight data bits, no parity, one stop bit, with FIFOs enabled.
+There is no flow control or newline translation.
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/io"
+import "core/mem"
+
+fn main() {
+    b := board.take()!
+    port := b.pins.uart(0, 1, 115_200)!
+    io.write_all(&mut port, mem.str_bytes("hello\r\n"))!
+    port.flush()!
+    b.pins.release_uart(port)
+}
+```
+
+`read` fills the requested slice and `write` accepts it into the transmit
+FIFO. Every wait is bounded by consecutive unsuccessful status polls:
+10,000,000 by default, configurable with `set_poll_limit(polls)`, with zero
+allowing one observation. The budget restarts after each transferred byte;
+it measures CPU polls rather than elapsed time. An idle receiver returns
+`io.ErrorKind.TimedOut`, with `transferred` counting the initialized prefix;
+it never reports EOF. Write timeouts count the prefix accepted by the FIFO,
+which may still be transmitted. Retry only the remaining suffix. Empty reads
+and writes succeed without accessing registers.
+
+Framing, parity, break, and overrun faults return `io.ErrorKind.Other` with
+the PL011 DR error bits in `code` (`0x100`, `0x200`, `0x400`, `0x800`). The
+faulty character is consumed and discarded, excluded from `transferred`;
+the error latch is cleared so later reads can continue. `flush()` waits for
+the FIFO and shift register to empty, with the same bounded budget and zero
+transfer count on error. Release does not wait and resets the UART, so flush
+first when queued output must finish.
 
 ### I2C and SPI on the RP2040 and RP2350
 
@@ -756,9 +816,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 ## Current limits
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
-  chips. The chip packages cover clocks, GPIO, I2C, SPI, and the timer; UART,
+  chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, and the timer;
   PWM, ADC, and USB are not bundled yet. Write them with `hal.Reg` as above.
-- I2C and SPI transfers are blocking and polled, without interrupts or DMA.
+- I2C, SPI, and UART transfers are blocking and polled, without interrupts or DMA.
   I2C supports 7-bit addresses as the bus's only master, not 10-bit
   addresses or target (slave) mode; SPI uses 8-bit frames as master. The
   Pico 2 W's wireless chip drives only its LED and senses USB power; Wi-Fi

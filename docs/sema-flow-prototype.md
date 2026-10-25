@@ -191,7 +191,8 @@ The adapter supports Boolean/integer scalars, recursively plain structs/enums,
 Options, Results, arrays of those values (including nested arrays), direct
 references and slices of those values, aggregate and tagged literals, whole-local
 moves, direct calls, scalar operators (including signed integer negation),
-field/dereference/index reads and assignments, array/slice `.len`, slice
+integer-to-integer casts, field/dereference/index reads and assignments,
+array/slice `.len`, slice
 expressions, compound assignments, value blocks with branch-local yields,
 patterns, Result propagation/unwrap, blocks, `if`, basic `for`, integer range foreach,
 array/slice foreach (including indexed, reference, and shared copy forms), return,
@@ -213,6 +214,16 @@ body never establish initialization on the zero-iteration path. Signed negation
 preserves operand reads/effects and accepts minimum-value literals using the
 selected target width (for example, `-128i8` and 32-bit `-2147483648isize`).
 
+Integer casts evaluate their operand once, preserving its reads, moves, and
+initialization effects, and produce an abstract scalar of the destination type.
+Widening, narrowing, signedness changes, and casts to/from `isize` and `usize`
+use the same availability facts; flow does not track converted numeric values.
+The destination type does not supply an expected type to the operand: an
+unsuffixed literal still defaults to `isize` and must fit the selected target
+width before conversion. Cast destination types also participate in range-bound
+inference without evaluating either bound. Float, pointer, reference, Boolean,
+and aggregate conversions remain outside the supported cast subset.
+
 Array lengths must already be resolved. Repetition expressions and some inferred
 literal forms still require fallback. Owned aggregates and slice elements containing
 references or custom destructors remain excluded. Index/bound evaluation records
@@ -228,8 +239,8 @@ body. Generic functions, methods, FFI, borrowed returns, and borrow contracts
 still require fallback for the affected function and its callers. Referenced
 structs/enums must have distinct plain fields/variants, no generic parameters,
 and no custom destructor; this applies to signatures, locals, literals, and
-callee signatures. Ambiguous referenced names also require fallback. Casts,
-for-init/step, unsafe blocks, and value blocks with no yielding path
+callee signatures. Ambiguous referenced names also require fallback.
+Non-integer casts, for-init/step, unsafe blocks, and value blocks with no yielding path
 remain outside the body subset. Guard assignments, moves, mutable borrows, and
 Result exits cause explicit fallback.
 Lowering is not a complete type checker or proof of safety. Tests keep examples
@@ -264,10 +275,19 @@ and range loop are both supported. Coverage also preserves analysis of
 `bytes.equal`, `bytes.compare`, `bytes.fill`, and `bytes.reverse` from the
 range-loop extension. `fibonacci_known_sequence` lowers its collection loop and
 reaches the assertion intrinsic blocker; its body still requires fallback and
-contains a cast. Differential fixtures exercise range and collection loop
-nesting, fresh bindings, zero-iteration joins, loop exits, and cleanup.
-Casts and implicit mutable reborrows remain subsequent incremental work;
-removing one restriction does not necessarily complete a body.
+contains an integer cast that is now supported. Differential fixtures exercise
+range and collection loop nesting, fresh bindings, zero-iteration joins, loop
+exits, and cleanup. Non-integer casts and implicit mutable reborrows remain
+subsequent incremental work; removing one restriction does not necessarily
+complete a body.
+
+Integer-cast support additionally analyzes Fibonacci's `main`, `bytes.read`,
+`bytes.write`, the six `bytes.read_u{16,32,64}_{le,be}` wrappers, `text.decode`,
+`text.encode`, `text.digit`, `text.magnitude`, and `text.parse_i64`. The byte-write
+wrappers still require fallback for implicit mutable reborrowing. Named corpus
+assertions preserve these gains; target-width, literal-context, operand-order,
+and initialization/move regressions live in
+`tests/flow_prototype/integer_casts.rs`.
 
 This is the first production adoption stage: graph findings can reject a body
 after the existing checks succeed, while existing accepted/rejected behavior is

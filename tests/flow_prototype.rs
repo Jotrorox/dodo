@@ -12,6 +12,9 @@ mod tagged;
 #[path = "flow_prototype/collection_iteration.rs"]
 mod collection_iteration;
 
+#[path = "flow_prototype/integer_casts.rs"]
+mod integer_casts;
+
 fn compare(source: &str, production_error: Option<&str>, uninitialized: &[&str]) -> flow::Body {
     let program = parser::parse(&format!("package experiment\n{source}")).unwrap();
     let comparison = flow::compare_checkers(&program, 64);
@@ -519,8 +522,8 @@ fn unsupported_and_ill_typed_inputs_never_produce_analysis_success() {
         ),
         ("fn f() { for x in 0u8..2u16 {} }", "type mismatch"),
         (
-            "fn f() { for x in 0..2 { _ = 1u8 as u32 } }",
-            "expression outside subset",
+            "fn f() { for x in 0..2 { _ = 1u8 as f32 } }",
+            "only integer-to-integer casts",
         ),
         (
             "fn f() { for i := 0; true; i += 1 {} }",
@@ -535,8 +538,8 @@ fn unsupported_and_ill_typed_inputs_never_produce_analysis_success() {
         ("struct S { &u8 n }\nfn f(s: S) {}", "type is outside"),
         ("fn f(x: &u8) -> &u8 { return x }", "borrowed returns"),
         (
-            "fn f() { x := 1u8\n_ = x as u32 }",
-            "expression outside subset",
+            "fn f() { x := 1u8\n_ = x as f32 }",
+            "only integer-to-integer casts",
         ),
         (
             "fn f() { x := 1u8\n_ = x.missing }",
@@ -900,7 +903,7 @@ fn target_width_and_unsupported_bodies_keep_explicit_fallback() {
     );
     assert!(sema::check_for_target(&mut program.clone(), 32).is_err());
     let mut program =
-        parser::parse("package experiment\nfn f() { x := 1u8\nx += 2 }\nfn g() { _ = 1u8 as u32 }")
+        parser::parse("package experiment\nfn f() { x := 1u8\nx += 2 }\nfn g() { _ = 1u8 as f32 }")
             .unwrap();
     assert!(flow::lower(&program, "f").is_ok());
     assert!(flow::lower(&program, "g").is_err());
