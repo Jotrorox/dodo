@@ -51,7 +51,7 @@ import "std/embedded/hal"
 import "std/embedded/hal/fake"
 
 // Works with any output pin and any delay.
-pub fn blink<P, D>(led: &mut P, delay: &mut D, times: u32) {
+pub fn blink<P: hal.OutputPin, D: hal.Delay>(led: &mut P, delay: &mut D, times: u32) {
     for _ in 0..times {
         led.set_high()
         hal.delay_ms(delay, 250)
@@ -71,26 +71,33 @@ fn blinks_three_times() {
 }
 ```
 
-`blink` names no chip. `<P, D>` are type parameters: any pin with `set_high`
-and `set_low`, and any delay with `delay_us`, satisfy it. The compiler checks
-each use and generates code specialized for the real types, so the protocol
-costs nothing at run time. See [generics](generics.md#reusable-behavior-through-public-methods)
-for how these method protocols work.
+`blink` names no chip. `<P: hal.OutputPin, D: hal.Delay>` are bounded type
+parameters: any pin with `set_high` and `set_low`, and any delay with
+`delay_us`, satisfy them, and passing something else is reported at the call.
+The compiler generates code specialized for the real types, so the interfaces
+cost nothing at run time. See [interfaces](generics.md#interfaces) for how
+bounds work.
 
 ## Device protocols
 
-A protocol is a set of method signatures. Any struct with those public methods
-can be passed where a driver expects it:
+Each device protocol is an [interface](generics.md#interfaces) in
+`std/embedded/hal`: a set of method signatures. Any struct with those public
+methods implements it and can be passed where a driver expects it:
 
-| Device | Methods |
+| Interface | Methods |
 | --- | --- |
-| Output pin | `set_high(&mut self)`, `set_low(&mut self)` |
-| Input pin | `is_high(&self) -> bool` |
-| Delay | `delay_us(&mut self, microseconds: u32)` |
-| I2C bus | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
-| SPI bus | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
-| Serial port | The [`std/io`](io.md) Reader and Writer protocols. |
-| Register block | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
+| `hal.OutputPin` | `set_high(&mut self)`, `set_low(&mut self)` |
+| `hal.InputPin` | `is_high(&self) -> bool` |
+| `hal.Delay` | `delay_us(&mut self, microseconds: u32)` |
+| `hal.I2c` | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
+| `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
+| Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`. |
+| `hal.Registers` | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
+
+Write drivers against bounded parameters, `fn probe<B: hal.I2c>(bus: &mut B)`,
+for zero-cost static dispatch. Use `&mut dyn hal.I2c` (or any other interface)
+when the device is chosen at run time, or to keep different devices in one
+array, such as a list of sensors behind one interface of your own.
 
 A bus is configured when it is created: its frequency, and for SPI a
 `hal.SpiMode` (`Mode0` to `Mode3`, the clock polarity and phase numbering of

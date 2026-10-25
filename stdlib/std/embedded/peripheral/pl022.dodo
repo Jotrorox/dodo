@@ -123,10 +123,9 @@ fn format(mode: hal.SpiMode) -> u32 {
     }
 }
 
-// An SPI bus master on one PL022 with registers R, a value with the register
-// block protocol of std/embedded/hal. Implements the std/embedded/hal SPI bus
-// protocol.
-pub struct Controller<R> {
+// An SPI bus master on one PL022 with registers R, any hal.Registers, such as
+// a hal.RegisterBlock or a simulated controller in a test.
+pub struct Controller<R: hal.Registers>: hal.Spi {
     registers: R
     divisors: Divisors
     // CR0's clock polarity and phase bits for the mode.
@@ -262,10 +261,10 @@ pub struct Controller<R> {
 }
 
 // A PL022 on the chip, as chip packages hand it to applications. It
-// implements the std/embedded/hal SPI bus protocol like Controller but keeps
+// implements hal.Spi like Controller but keeps
 // the register block: `RegisterBlock` trusts its owner with every offset,
 // which only the driver may be.
-pub struct Bus {
+pub struct Bus: hal.Spi {
     controller: Controller<hal.RegisterBlock>
 
     // SAFETY: as for hal.RegisterBlock.at, with `base` a PL022 whose reset

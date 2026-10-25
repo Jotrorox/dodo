@@ -40,6 +40,7 @@ impl Parser {
             slice_first: false,
             discarded_tails: HashSet::new(),
             json_derives: Vec::new(),
+            in_interface: false,
         }
     }
 }
@@ -60,6 +61,8 @@ struct Parser {
     // statement AST used by semantic analysis and the backend.
     discarded_tails: HashSet<usize>,
     json_derives: Vec<crate::json_derive::Derive>,
+    // Interface methods are signatures without bodies.
+    in_interface: bool,
 }
 
 #[derive(Default)]
@@ -213,6 +216,7 @@ impl Parser {
                 program.constants.len(),
                 program.imports.len(),
                 program.import_aliases.len(),
+                program.interfaces.len(),
             );
             if let Err(error) = self.declaration(&mut program) {
                 if !self.recover {
@@ -227,8 +231,10 @@ impl Parser {
                 program.constants.truncate(lengths.3);
                 program.imports.truncate(lengths.4);
                 program.import_aliases.truncate(lengths.5);
+                program.interfaces.truncate(lengths.6);
                 self.soft_newlines = soft;
                 self.self_type = self_type;
+                self.in_interface = false;
                 self.synchronize(cursor, true);
             }
         }
@@ -279,6 +285,26 @@ impl Parser {
         }
         let start = self.span().start;
         let mods = self.modifiers()?;
+        if self.at("interface") {
+            if mods.unsafe_
+                || mods.extern_
+                || mods.repr_c
+                || mods.unsafe_send
+                || mods.unsafe_sync
+                || mods.derive_json
+                || mods.json_deny_unknown
+                || mods.json_name.is_some()
+                || mods.printing.is_some()
+                || mods.test
+                || mods.ignore.is_some()
+            {
+                return Err(self.error("interface declarations only support the `pub` modifier"));
+            }
+            program
+                .interfaces
+                .push(self.interface_decl(mods.public, start)?);
+            return Ok(());
+        }
         if (mods.derive_json || mods.json_deny_unknown) && !self.at("struct") {
             return Err(self.error("@derive(Json) and @json_deny_unknown apply only to structs"));
         }
@@ -312,9 +338,9 @@ impl Parser {
             }
             program.constants.push(self.constant(mods.public, start)?);
         } else {
-            return Err(
-                self.error("expected `fn`, `struct`, `enum`, `const`, or `static` declaration")
-            );
+            return Err(self.error(
+                "expected `fn`, `struct`, `enum`, `interface`, `const`, or `static` declaration",
+            ));
         }
         Ok(())
     }
@@ -333,6 +359,7 @@ impl Parser {
                     || self.at("pub")
                     || self.at("struct")
                     || self.at("enum")
+                    || self.at("interface")
                     || self.at("const")
                     || self.at("static")
                     || self.at("import"))
@@ -490,19 +517,31 @@ impl Parser {
         }
         Ok(mods)
     }
-    fn generic_params(&mut self) -> ParseResult<Vec<String>> {
+    fn generic_params(&mut self) -> ParseResult<(Vec<String>, Vec<Bound>)> {
+        let mut bounds = Vec::new();
         if !self.eat("<") {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), bounds));
         }
         self.newlines();
         let mut params = Vec::new();
         loop {
+            let start = self.span().start;
             let name = self.identifier()?;
             if params.contains(&name) {
                 return Err(self.error(format!("duplicate generic parameter `{name}`")));
             }
-            params.push(name);
+            params.push(name.clone());
             self.newlines();
+            if self.eat(":") {
+                self.newlines();
+                let interfaces = self.interface_list()?;
+                bounds.push(Bound {
+                    param: name,
+                    interfaces,
+                    span: self.since(start),
+                });
+                self.newlines();
+            }
             if self.eat(",") {
                 self.newlines();
                 if self.at(">") {
@@ -513,7 +552,95 @@ impl Parser {
             }
         }
         self.close_angle()?;
-        Ok(params)
+        Ok((params, bounds))
+    }
+    // `A + B + ...`, each a possibly package-qualified interface name.
+    fn interface_list(&mut self) -> ParseResult<Vec<String>> {
+        let mut names = vec![self.qualified_name()?];
+        while self.eat("+") {
+            self.newlines();
+            let name = self.qualified_name()?;
+            if names.contains(&name) {
+                return Err(self.error(format!("interface `{name}` is listed twice")));
+            }
+            names.push(name);
+        }
+        Ok(names)
+    }
+    fn interface_decl(&mut self, public: bool, start: usize) -> ParseResult<Interface> {
+        self.expect("interface")?;
+        let name = self.identifier()?;
+        if self.at("<") {
+            return Err(self.error("interfaces cannot have type parameters"));
+        }
+        let parents = if self.eat(":") {
+            self.newlines();
+            self.interface_list()?
+        } else {
+            Vec::new()
+        };
+        self.newlines();
+        self.expect("{")?;
+        self.separators();
+        self.self_type = Some(Type::Named("Self".into()));
+        self.in_interface = true;
+        let mut methods = Vec::new();
+        while !self.eat("}") {
+            if self.eof() {
+                return Err(self.error("unclosed interface declaration; expected `}`"));
+            }
+            let method_start = self.span().start;
+            let mods = self.modifiers()?;
+            if mods.public
+                || mods.extern_
+                || mods.repr_c
+                || mods.unsafe_send
+                || mods.unsafe_sync
+                || mods.derive_json
+                || mods.json_deny_unknown
+                || mods.json_name.is_some()
+                || mods.printing.is_some()
+                || mods.test
+                || mods.ignore.is_some()
+            {
+                return Err(self.error(
+                    "interface methods only support the `unsafe` modifier; they are public with their interface",
+                ));
+            }
+            if !self.at("fn") {
+                return Err(self.error("an interface contains only `fn` signatures"));
+            }
+            let method = self.function(mods, method_start)?;
+            if !method.generics.is_empty() {
+                return Err(Diagnostic::new(
+                    method.span,
+                    "interface methods cannot have type parameters",
+                ));
+            }
+            if !method.stores.is_empty() || !method.requires_plain.is_empty() {
+                return Err(Diagnostic::new(
+                    method.span,
+                    "interface methods cannot declare `stores(...)` or `requires_plain(...)`",
+                ));
+            }
+            if methods.iter().any(|m: &Function| m.name == method.name) {
+                return Err(Diagnostic::new(
+                    method.span,
+                    format!("duplicate interface method `{}`", method.name),
+                ));
+            }
+            methods.push(method);
+            self.separators();
+        }
+        self.self_type = None;
+        self.in_interface = false;
+        Ok(Interface {
+            name,
+            public,
+            parents,
+            methods,
+            span: self.since(start),
+        })
     }
     fn close_angle(&mut self) -> ParseResult<()> {
         if self.eat(">") {
@@ -631,6 +758,9 @@ impl Parser {
         if self.eat("void") {
             return Ok(Type::Void);
         }
+        if self.eat("dyn") {
+            return Ok(Type::Dyn(self.qualified_name()?));
+        }
         let start = self.span();
         let name = self.qualified_name()?;
         if name == "Self" {
@@ -717,7 +847,15 @@ impl Parser {
             return Err(self.error("@json_deny_unknown requires @derive(Json)"));
         }
         let name = self.identifier()?;
-        let generics = self.generic_params()?;
+        let (generics, bounds) = self.generic_params()?;
+        let mut implements = Vec::new();
+        if self.eat(":") {
+            self.newlines();
+            let start = self.span().start;
+            for interface in self.interface_list()? {
+                implements.push((interface, self.since(start)));
+            }
+        }
         self.self_type = Some(if generics.is_empty() {
             Type::Named(name.clone())
         } else {
@@ -769,6 +907,9 @@ impl Parser {
                     all_generics.push(generic.clone());
                 }
                 function.generics = all_generics;
+                let mut all_bounds = bounds.clone();
+                all_bounds.append(&mut function.bounds);
+                function.bounds = all_bounds;
                 program.functions.push(function);
             } else {
                 if field_mods.unsafe_
@@ -814,6 +955,8 @@ impl Parser {
             name,
             public: mods.public,
             generics,
+            bounds,
+            implements,
             fields,
             span: self.since(start),
             repr_c: mods.repr_c,
@@ -825,7 +968,7 @@ impl Parser {
     fn enum_decl(&mut self, public: bool, start: usize) -> ParseResult<Enum> {
         self.expect("enum")?;
         let name = self.identifier()?;
-        let generics = self.generic_params()?;
+        let (generics, bounds) = self.generic_params()?;
         self.newlines();
         self.expect("{")?;
         self.newlines();
@@ -886,6 +1029,7 @@ impl Parser {
             name,
             public,
             generics,
+            bounds,
             variants,
             span: self.since(start),
         })
@@ -893,7 +1037,7 @@ impl Parser {
     fn function(&mut self, mods: Modifiers, start: usize) -> ParseResult<Function> {
         self.expect("fn")?;
         let name = self.identifier()?;
-        let generics = self.generic_params()?;
+        let (generics, bounds) = self.generic_params()?;
         self.expect("(")?;
         self.newlines();
         let mut params = Vec::new();
@@ -1002,7 +1146,14 @@ impl Parser {
         // Foreign prototypes end at the line; an optional body may start on the next line.
         let saved = self.cursor;
         self.newlines();
-        let body = if mods.printing.is_some() {
+        let body = if self.in_interface {
+            if self.at("{") {
+                return Err(self.error("interface methods are signatures without a body"));
+            }
+            self.cursor = saved;
+            self.end_statement()?;
+            None
+        } else if mods.printing.is_some() {
             if self.at("{") || mods.extern_ || mods.unsafe_ || mods.test {
                 return Err(
                     self.error("compiler printing declarations are safe prototypes without bodies")
@@ -1054,6 +1205,7 @@ impl Parser {
             extern_: mods.extern_,
             printing: mods.printing,
             generics,
+            bounds,
             params,
             ret,
             ret_span,
@@ -2167,6 +2319,8 @@ pub(crate) fn reserved(name: &str) -> bool {
             | "fn"
             | "struct"
             | "enum"
+            | "interface"
+            | "dyn"
             | "const"
             | "let"
             | "return"

@@ -266,6 +266,24 @@ impl HoverIndex<'_> {
             self.binding(constant.span, &constant.name, &constant.ty);
             self.expression(&constant.value);
         }
+        for interface in &self.program.interfaces {
+            let mut lines = vec![format!("interface {} {{", interface.name)];
+            lines.extend(
+                interface
+                    .methods
+                    .iter()
+                    .map(|method| format!("    {}", crate::sema::interface_signature(method))),
+            );
+            lines.push("}".into());
+            if let Some(span) = self.name_span(interface.span, short_name(&interface.name)) {
+                self.add(span, code(&lines.join("\n")));
+            }
+            for method in &interface.methods {
+                if let Some(span) = self.name_span(method.span, &method.name) {
+                    self.add(span, code(&crate::sema::interface_signature(method)));
+                }
+            }
+        }
         for structure in &self.program.structs {
             if let Some(span) = self.name_span(structure.span, short_name(&structure.name)) {
                 self.add(span, code(&format!("struct {}", structure.name)));

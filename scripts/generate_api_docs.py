@@ -139,7 +139,8 @@ def declaration_head(items: list[Token], start: int) -> tuple[str, str] | None:
     while index < len(items) and (items[index].value in ("unsafe", "extern")
                                  or items[index].kind == "literal"):
         index += 1
-    if index + 1 < len(items) and items[index].value in ("fn", "struct", "enum", "const", "static"):
+    if index + 1 < len(items) and items[index].value in ("fn", "struct", "enum", "interface",
+                                                        "const", "static"):
         if items[index + 1].kind != "word":
             raise ValueError(f"Missing declaration name at offset {items[index].end}")
         return items[index].value, items[index + 1].value
@@ -201,13 +202,14 @@ def extract(source: str) -> list[Declaration]:
             raise ValueError(f"Unrecognized public declaration at line {source.count(chr(10), 0, token.start) + 1}")
         kind, name = head
         comment, attributes = leading_notes(source, token.start, notes, note_pairs)
-        if kind in ("struct", "enum"):
+        if kind in ("struct", "enum", "interface"):
             opening = next((i for i in range(index, len(items)) if items[i].value == "{"), None)
             if opening is None:
                 raise ValueError(f"Missing body for {kind} {name}")
             closing = pairs[opening]
             header = source[token.start:items[opening].start].strip()
-            if kind == "enum":
+            if kind in ("enum", "interface"):
+                # Every variant and interface method is part of the public API.
                 signature = source[token.start:items[closing].end]
             else:
                 fields: list[str] = []
@@ -413,7 +415,7 @@ def generate() -> tuple[dict[Path, str], int, int]:
         'description: "Every bundled source package, with links to its declarations and usage guide."',
         'section: "API reference"', "order: 1", 'source: "scripts/generate_api_docs.py"', "---", "",
         f"The library contains **{len(modules)} source packages** and **{total} public "
-        "type, function, method, and constant declarations**. Public fields and enum "
+        "type, interface, function, method, and constant declarations**. Public fields and enum "
         "variants are included with their types. This index is rebuilt from source.", "",
         "Read [API notation, compiler intrinsics, and virtual imports](../stdlib-api.md) "
         "before looking up a declaration. The [task-based library index](../standard-library.md) "

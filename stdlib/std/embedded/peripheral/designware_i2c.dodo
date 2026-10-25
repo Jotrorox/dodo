@@ -170,10 +170,10 @@ pub fn timing(clock_hz: u32, frequency_hz: u32) -> Timing!hal.Error {
     })
 }
 
-// An I2C bus master on one DW_apb_i2c controller with registers R, a value
-// with the register block protocol of std/embedded/hal. Implements the
-// std/embedded/hal I2C bus protocol.
-pub struct Controller<R> {
+// An I2C bus master on one DW_apb_i2c controller with registers R, any
+// hal.Registers, such as a hal.RegisterBlock or a simulated controller in a
+// test.
+pub struct Controller<R: hal.Registers>: hal.I2c {
     registers: R
     timing: Timing
     // Read commands that may be outstanding without overflowing the
@@ -442,10 +442,10 @@ pub struct Controller<R> {
 }
 
 // A DW_apb_i2c on the chip, as chip packages hand it to applications. It
-// implements the std/embedded/hal I2C bus protocol like Controller but keeps
+// implements hal.I2c like Controller but keeps
 // the register block: `RegisterBlock` trusts its owner with every offset,
 // which only the driver may be.
-pub struct Bus {
+pub struct Bus: hal.I2c {
     controller: Controller<hal.RegisterBlock>
 
     // SAFETY: as for hal.RegisterBlock.at, with `base` a DW_apb_i2c whose

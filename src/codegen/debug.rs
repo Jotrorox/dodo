@@ -274,7 +274,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .create_basic_type(&name, size, encoding, LLVMDIFlagZero)
                     .map_err(error)?)
             }
-            Type::Ref(_, inner) | Type::Raw(_, inner) => {
+            Type::Ref(_, inner) | Type::Raw(_, inner)
+                if !matches!(inner.as_ref(), Type::Dyn(_)) =>
+            {
                 let inner = self.debug_type(inner)?;
                 Ok(self
                     .debug
@@ -336,6 +338,22 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                                 Span::default(),
                             ),
                             ("len".into(), Type::usize(), Span::default()),
+                        ],
+                    ),
+                    // A `dyn` reference: the value's address and its method table.
+                    Type::Ref(..) => (
+                        Span::default(),
+                        vec![
+                            (
+                                "data".into(),
+                                Type::Raw(false, Box::new(Type::u8())),
+                                Span::default(),
+                            ),
+                            (
+                                "vtable".into(),
+                                Type::Raw(false, Box::new(Type::u8())),
+                                Span::default(),
+                            ),
                         ],
                     ),
                     Type::Slice(m, inner) => (

@@ -17,22 +17,15 @@ import "core/ptr"
 //    handle afterwards is safe.
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
-// 3. Device protocols. Drivers are generic functions or structs over any value
-//    with the methods below (statically checked, no runtime interface object):
-//
-//    Output pin:  set_high(&mut self) -> void
-//                 set_low(&mut self) -> void
-//    Input pin:   is_high(&self) -> bool
-//    Delay:       delay_us(&mut self, microseconds: u32) -> void
-//    I2C bus:     write(&mut self, address: u8, bytes: &[u8]) -> void!Error
-//                 read(&mut self, address: u8, buffer: &mut[u8]) -> void!Error
-//                 write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!Error
-//    SPI bus:     transfer(&mut self, bytes: &mut[u8]) -> void!Error
-//                 write(&mut self, bytes: &[u8]) -> void!Error
-//    Serial port: the `std/io` Reader and Writer protocols, so ports work with
-//                 `std/io` helpers and `std/fmt` formatting unchanged.
-//    Register     read(&mut self, offset: usize) -> u32
-//    block:       write(&mut self, offset: usize, value: u32) -> void
+// 3. Device protocols. The interfaces below (OutputPin, InputPin, Delay, I2c,
+//    Spi, and Registers) name what drivers need from a device. Any value with
+//    matching methods implements them. Drivers are usually generic over a
+//    bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
+//    statically dispatched and reports a wrong argument where it is passed.
+//    `&mut dyn hal.I2c` instead dispatches at run time, for drivers chosen at
+//    run time or a list of different devices. Serial ports implement the
+//    `std/io` Reader and Writer interfaces, so ports work with `std/io`
+//    helpers and `std/fmt` formatting unchanged.
 //
 // Addresses are 7-bit I2C addresses. Pin and delay operations cannot fail;
 // bus operations report the shared `Error` below. A bus is configured when it
@@ -117,6 +110,43 @@ pub fn error_name(error: Error) -> &str from(static) {
             return "Unsupported"
         }
     }
+}
+
+// A digital output, such as a pin driving an LED or a chip select.
+pub interface OutputPin {
+    fn set_high(&mut self)
+    fn set_low(&mut self)
+}
+
+// A digital input.
+pub interface InputPin {
+    fn is_high(&self) -> bool
+}
+
+// A busy-waiting delay source, such as a timer.
+pub interface Delay {
+    fn delay_us(&mut self, microseconds: u32)
+}
+
+// An I2C bus controller. Addresses are 7-bit device addresses.
+pub interface I2c {
+    fn write(&mut self, address: u8, bytes: &[u8]) -> void!Error
+    fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!Error
+    // Write `bytes`, then read `buffer.len` bytes without releasing the bus.
+    fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!Error
+}
+
+// An SPI bus controller. Chip select is a separate output pin; see SpiDevice.
+pub interface Spi {
+    // Full-duplex exchange in place: each byte sent is replaced by the byte read.
+    fn transfer(&mut self, bytes: &mut[u8]) -> void!Error
+    fn write(&mut self, bytes: &[u8]) -> void!Error
+}
+
+// A peripheral's 32-bit registers at byte offsets, for peripheral drivers.
+pub interface Registers {
+    fn read(&mut self, offset: usize) -> u32
+    fn write(&mut self, offset: usize, value: u32)
 }
 
 // Common I2C bus frequencies: standard mode, fast mode, and fast mode plus.
@@ -260,11 +290,11 @@ pub struct Reg<T> {
 }
 
 // A peripheral's 32-bit registers at byte offsets from one base address.
-// Implements the register block protocol, so drivers in
+// Implements Registers, so drivers in
 // `std/embedded/peripheral` reach the hardware through it. Every access is
 // one volatile 32-bit load or store, like `Reg<u32>`. Move-only: owning it is
 // the permission to use the whole block.
-pub struct RegisterBlock {
+pub struct RegisterBlock: Registers {
     base: usize
 
     // SAFETY: `base` must be the 4-aligned base address of one peripheral on
@@ -320,7 +350,7 @@ pub struct Critical {
 }
 
 // Drive an output pin to `high`.
-pub fn write_pin<P>(pin: &mut P, high: bool) {
+pub fn write_pin<P: OutputPin>(pin: &mut P, high: bool) {
     if high {
         pin.set_high()
     } else {
@@ -328,7 +358,7 @@ pub fn write_pin<P>(pin: &mut P, high: bool) {
     }
 }
 
-pub fn delay_ms<D>(delay: &mut D, milliseconds: u32) {
+pub fn delay_ms<D: Delay>(delay: &mut D, milliseconds: u32) {
     for _ in 0..milliseconds {
         delay.delay_us(1000)
     }
@@ -337,19 +367,19 @@ pub fn delay_ms<D>(delay: &mut D, milliseconds: u32) {
 // Most I2C sensors expose numbered 8-bit registers. These helpers implement
 // the common "write register number, then read or write data" transactions.
 
-pub fn read_register<B>(bus: &mut B, address: u8, register: u8) -> u8!Error {
+pub fn read_register<B: I2c>(bus: &mut B, address: u8, register: u8) -> u8!Error {
     command: [1]u8 = [register]
     value: [1]u8 = [0]
     bus.write_read(address, &command, &mut value)?
     return ok(value[0])
 }
 
-pub fn read_registers<B>(bus: &mut B, address: u8, first: u8, buffer: &mut[u8]) -> void!Error {
+pub fn read_registers<B: I2c>(bus: &mut B, address: u8, first: u8, buffer: &mut[u8]) -> void!Error {
     command: [1]u8 = [first]
     return bus.write_read(address, &command, buffer)
 }
 
-pub fn write_register<B>(bus: &mut B, address: u8, register: u8, value: u8) -> void!Error {
+pub fn write_register<B: I2c>(bus: &mut B, address: u8, register: u8, value: u8) -> void!Error {
     command: [2]u8 = [register, value]
     return bus.write(address, &command)
 }
@@ -357,7 +387,7 @@ pub fn write_register<B>(bus: &mut B, address: u8, register: u8, value: u8) -> v
 // One device on a shared SPI bus, selected by an active-low chip-select pin.
 // The device owns its pin; the bus is passed to each transaction, so several
 // devices share one bus and the borrow checker keeps transactions apart.
-pub struct SpiDevice<P> {
+pub struct SpiDevice<P: OutputPin> {
     select: P
 
     // Takes the chip-select pin and deselects the device.
@@ -368,14 +398,14 @@ pub struct SpiDevice<P> {
     }
 
     // Full-duplex exchange in place with the device selected.
-    pub fn transfer<B>(&mut self, bus: &mut B, bytes: &mut[u8]) -> void!Error {
+    pub fn transfer<B: Spi>(&mut self, bus: &mut B, bytes: &mut[u8]) -> void!Error {
         self.select.set_low()
         result := bus.transfer(bytes)
         self.select.set_high()
         return result
     }
 
-    pub fn write<B>(&mut self, bus: &mut B, bytes: &[u8]) -> void!Error {
+    pub fn write<B: Spi>(&mut self, bus: &mut B, bytes: &[u8]) -> void!Error {
         self.select.set_low()
         result := bus.write(bytes)
         self.select.set_high()
@@ -383,7 +413,7 @@ pub struct SpiDevice<P> {
     }
 
     // Write `command`, then read `buffer.len` bytes in the same selection.
-    pub fn write_read<B>(&mut self, bus: &mut B, command: &[u8], buffer: &mut[u8]) -> void!Error {
+    pub fn write_read<B: Spi>(&mut self, bus: &mut B, command: &[u8], buffer: &mut[u8]) -> void!Error {
         self.select.set_low()
         match bus.write(command) {
             ok() => {}

@@ -95,10 +95,15 @@ provides memory implementations; it does not open files or configure hardware.
 | Polling writer | `poll_write(&mut self, source: &[u8]) -> io.Poll!io.Error` |
 | Optional absolute seek | `seek(&mut self, position: usize) -> usize!io.Error` |
 
-These are structural contracts checked when generic helpers are instantiated.
-Dodo monomorphizes calls to the concrete public methods; no trait objects,
-reflection, closures, or scheduler are required. An adapter type exposing public
-methods must itself be public. See `examples/io.dodo`
+The blocking reader and writer are the `io.Reader` and `io.Writer`
+[interfaces](generics.md#interfaces), and `io.ReadWriter` combines them. Any
+type with matching public methods implements them. Helpers such as
+`io.read_exact` and `io.write_all` are bounded by them, so a stream with a
+different `read` or `write` is reported where it is passed. Calls are
+monomorphized to the concrete methods; use `&mut dyn io.Reader` or
+`&mut dyn io.Writer` where the stream's type should not appear in a signature.
+The polling and seek contracts remain unconstrained method protocols. An
+adapter type exposing public methods must itself be public. See `examples/io.dodo`
 for memory-to-memory copying through caller scratch space.
 
 ### Successful and failed progress

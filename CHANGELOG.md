@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- Add interfaces. `interface Name { fn method(&self) -> T }` declares method
+  signatures that any type with matching methods implements; an interface
+  can include others (`interface Sensor: Named`). Generic parameters take
+  bounds, `fn read_line<S: io.Reader + io.Writer>(...)` and
+  `struct Holder<S: Sensor>`, which are checked where the generic is used:
+  a wrong type is reported at the call, with each missing method or
+  mismatched signature, instead of inside the specialized body. A struct may
+  state `struct Uart: io.Reader + io.Writer` to have its conformance checked
+  where it is declared. Bounded generics are still specialized per type, so
+  they cost nothing at run time.
+- Add `dyn` references for run-time dispatch: `&dyn Sensor` and
+  `&mut dyn Sensor` refer to any value implementing `Sensor` together with a
+  constant method table, so different devices fit in one array, a struct
+  field, or a driver chosen at run time. References convert implicitly where
+  a `dyn` reference is expected (or with `as`), keep their borrows, and
+  convert to an interface's first parent. `dyn` types satisfy their own
+  bounds, so one specialization of a bounded generic can serve every type.
+- `std/io` declares `Reader`, `Writer`, and `ReadWriter`; its helpers
+  (`read_exact`, `write_all`, `copy`, `BufferedReader`, ...) are bounded by
+  them. `std/embedded/hal` declares `OutputPin`, `InputPin`, `Delay`, `I2c`,
+  `Spi`, and `Registers`, bounds its helpers and `SpiDevice`, and the
+  peripheral drivers declare the interfaces they implement.
+- Method calls reborrow through any number of references, so elements of an
+  array of references call their methods directly.
+
 ## 0.1.5 — 2026-10-12
 
 Dodo 0.1.5 brings the compiler and hosted standard library to macOS and AArch64

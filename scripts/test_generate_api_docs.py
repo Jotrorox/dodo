@@ -34,6 +34,23 @@ pub struct Packet {
 }""")
         self.assertEqual(declarations[1].signature, "pub fn len(&self) -> usize")
 
+    def test_interfaces_keep_their_method_signatures(self):
+        source = """package example
+// A source of bytes.
+pub interface Reader: Closer {
+    // Fill a prefix of `destination`.
+    fn read(&mut self, destination: &mut[u8]) -> usize!Error
+}
+pub fn copy<R: Reader>(reader: &mut R) -> usize { return 0 }
+"""
+        interface, function = api.extract(source)
+        self.assertEqual((interface.name, interface.kind, interface.comment), ("Reader", "interface", "A source of bytes."))
+        self.assertEqual(interface.signature, """pub interface Reader: Closer {
+    // Fill a prefix of `destination`.
+    fn read(&mut self, destination: &mut[u8]) -> usize!Error
+}""")
+        self.assertEqual(function.signature, "pub fn copy<R: Reader>(reader: &mut R) -> usize")
+
     def test_multiline_fields_do_not_split_generic_arguments(self):
         source = """pub struct Store {
     pub values:

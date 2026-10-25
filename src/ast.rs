@@ -129,6 +129,9 @@ pub enum Type {
     Option(Box<Type>),
     /// Opaque storage with the layout of T; never implicitly drops its contents.
     MaybeUninit(Box<Type>),
+    /// A value of an unknown type implementing the named interface. It has no
+    /// fixed size, so it only appears behind a reference: `&dyn I`, `&mut dyn I`.
+    Dyn(String),
 }
 impl Type {
     pub fn isize() -> Self {
@@ -214,6 +217,7 @@ impl std::fmt::Display for Type {
             Self::Result(t, e) => write!(f, "Result<{t}, {e}>"),
             Self::Option(t) => write!(f, "Option<{t}>"),
             Self::MaybeUninit(t) => write!(f, "MaybeUninit<{t}>"),
+            Self::Dyn(n) => write!(f, "dyn {n}"),
         }
     }
 }
@@ -230,12 +234,35 @@ pub struct Program {
     pub enums: Vec<Enum>,
     pub functions: Vec<Function>,
     pub constants: Vec<Constant>,
+    pub interfaces: Vec<Interface>,
+}
+/// A generic parameter's required interfaces: `T: io.Reader + io.Writer`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub param: String,
+    pub interfaces: Vec<String>,
+    pub span: Span,
+}
+/// A named set of method signatures. Any type whose methods match satisfies it;
+/// `dyn Name` values dispatch these methods through a table of function pointers.
+#[derive(Clone, Debug)]
+pub struct Interface {
+    pub name: String,
+    pub public: bool,
+    /// Interfaces whose methods this one includes.
+    pub parents: Vec<String>,
+    /// Bodiless signatures; a receiver's `Self` is the placeholder `Type::Named("Self")`.
+    pub methods: Vec<Function>,
+    pub span: Span,
 }
 #[derive(Clone, Debug)]
 pub struct Struct {
     pub name: String,
     pub public: bool,
     pub generics: Vec<String>,
+    pub bounds: Vec<Bound>,
+    /// Interfaces the declaration states it implements, checked where declared.
+    pub implements: Vec<(String, Span)>,
     pub fields: Vec<Field>,
     pub span: Span,
     pub repr_c: bool,
@@ -256,6 +283,7 @@ pub struct Enum {
     pub name: String,
     pub public: bool,
     pub generics: Vec<String>,
+    pub bounds: Vec<Bound>,
     pub variants: Vec<Variant>,
     pub span: Span,
 }
@@ -278,6 +306,7 @@ pub struct Function {
     /// Reserved printing entry points; retained on fixed helpers for editor signatures.
     pub printing: Option<Printing>,
     pub generics: Vec<String>,
+    pub bounds: Vec<Bound>,
     /// Compiler-generated specialization: declared borrow sources may become
     /// borrow-free after type substitution and then contribute no dependencies.
     pub generic_instance: bool,

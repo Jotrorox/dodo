@@ -910,6 +910,7 @@ fn append(target: &mut Program, mut source: Program) {
     target.enums.append(&mut source.enums);
     target.functions.append(&mut source.functions);
     target.constants.append(&mut source.constants);
+    target.interfaces.append(&mut source.interfaces);
 }
 
 // Only generated functions can mention a fresh implicit alias. Reuse the AST
@@ -953,6 +954,7 @@ fn namespace(
         .map(|item| item.name.clone())
         .chain(program.enums.iter().map(|item| item.name.clone()))
         .chain(program.constants.iter().map(|item| item.name.clone()))
+        .chain(program.interfaces.iter().map(|item| item.name.clone()))
         .chain(
             program
                 .functions
@@ -967,15 +969,40 @@ fn namespace(
         visible_packages,
         missing_imports: RefCell::new(BTreeSet::new()),
     };
+    let bounds = |bounds: &mut Vec<Bound>| {
+        for bound in bounds {
+            for interface in &mut bound.interfaces {
+                *interface = names.name(interface, &BTreeSet::new());
+            }
+        }
+    };
     for item in &mut program.structs {
         item.name = names.name(&item.name, &BTreeSet::new());
         let generics = item.generics.iter().cloned().collect();
         for field in &mut item.fields {
             names.ty(&mut field.ty, &generics);
         }
+        bounds(&mut item.bounds);
+        for (interface, _) in &mut item.implements {
+            *interface = names.name(interface, &BTreeSet::new());
+        }
+    }
+    for item in &mut program.interfaces {
+        item.name = names.name(&item.name, &BTreeSet::new());
+        for parent in &mut item.parents {
+            *parent = names.name(parent, &BTreeSet::new());
+        }
+        let generics = BTreeSet::from(["Self".to_owned()]);
+        for method in &mut item.methods {
+            for parameter in &mut method.params {
+                names.ty(&mut parameter.ty, &generics);
+            }
+            names.ty(&mut method.ret, &generics);
+        }
     }
     for item in &mut program.enums {
         item.name = names.name(&item.name, &BTreeSet::new());
+        bounds(&mut item.bounds);
         let generics = item.generics.iter().cloned().collect();
         for variant in &mut item.variants {
             for field in &mut variant.fields {
@@ -991,6 +1018,7 @@ fn namespace(
     for function in &mut program.functions {
         function.imported = !prefix.is_empty();
         function.name = names.name(&function.name, &BTreeSet::new());
+        bounds(&mut function.bounds);
         let generics = function.generics.iter().cloned().collect();
         let mut locals = BTreeSet::new();
         for parameter in &mut function.params {
@@ -1118,6 +1146,7 @@ impl Names<'_> {
     fn scoped_ty(&self, ty: &mut Type, locals: &BTreeSet<String>, generics: &BTreeSet<String>) {
         match ty {
             Type::Named(name) => *name = self.name(name, generics),
+            Type::Dyn(name) => *name = self.name(name, &BTreeSet::new()),
             Type::Generic(name, arguments) => {
                 *name = self.name(name, generics);
                 for ty in arguments {
@@ -1350,14 +1379,45 @@ fn shift(span: &mut Span, offset: usize) {
     span.start += offset;
     span.end += offset;
 }
+fn shift_function(function: &mut Function, offset: usize) {
+    shift(&mut function.span, offset);
+    shift(&mut function.ret_span, offset);
+    if let Some(span) = &mut function.from_span {
+        shift(span, offset);
+    }
+    for parameter in &mut function.params {
+        shift(&mut parameter.span, offset);
+    }
+    for bound in &mut function.bounds {
+        shift(&mut bound.span, offset);
+    }
+    if let Some(body) = &mut function.body {
+        shift_block(body, offset);
+    }
+}
 fn shift_program(program: &mut Program, offset: usize) {
     for item in &mut program.structs {
         shift(&mut item.span, offset);
         for field in &mut item.fields {
             shift(&mut field.span, offset);
         }
+        for bound in &mut item.bounds {
+            shift(&mut bound.span, offset);
+        }
+        for (_, span) in &mut item.implements {
+            shift(span, offset);
+        }
+    }
+    for item in &mut program.interfaces {
+        shift(&mut item.span, offset);
+        for method in &mut item.methods {
+            shift_function(method, offset);
+        }
     }
     for item in &mut program.enums {
+        for bound in &mut item.bounds {
+            shift(&mut bound.span, offset);
+        }
         shift(&mut item.span, offset);
         for variant in &mut item.variants {
             shift(&mut variant.span, offset);
@@ -1371,17 +1431,7 @@ fn shift_program(program: &mut Program, offset: usize) {
         shift_expr(&mut constant.value, offset);
     }
     for function in &mut program.functions {
-        shift(&mut function.span, offset);
-        shift(&mut function.ret_span, offset);
-        if let Some(span) = &mut function.from_span {
-            shift(span, offset);
-        }
-        for parameter in &mut function.params {
-            shift(&mut parameter.span, offset);
-        }
-        if let Some(body) = &mut function.body {
-            shift_block(body, offset);
-        }
+        shift_function(function, offset);
     }
 }
 fn shift_expr(expression: &mut Expr, offset: usize) {
