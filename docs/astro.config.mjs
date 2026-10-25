@@ -10,7 +10,7 @@ export default defineConfig({
   markdown: {
     processor: satteri({ mdastPlugins: [markdownLinks({ base: '/dodo' })] }),
     shikiConfig: {
-      themes: { light: 'min-light', dark: 'min-dark' },
+      themes: { light: 'github-light-default', dark: 'github-dark-default' },
       defaultColor: false,
       langAlias: { dodo: 'rust', ebnf: 'text' },
     },
