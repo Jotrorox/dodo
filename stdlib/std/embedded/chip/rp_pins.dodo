@@ -345,8 +345,16 @@ pub struct Bank<C> {
     pub fn uart_flow(&mut self, tx: u32, rx: u32, cts: u32, rts: u32, baud: u32) -> pl011.Port!hal.Error {
         pins := uart_flow_pins(tx, rx, cts, rts)?
         port := self.open_uart(pins, baud)?
-        port.set_flow_control(true, true)
-        return ok(port)
+        // Nothing is queued yet, so this does not wait.
+        match port.set_flow_control(true, true) {
+            ok() => {
+                return ok(port)
+            }
+            err(error) => {
+                self.release_uart(port)
+                return err(error)
+            }
+        }
     }
 
     // Give back an I2C bus from `i2c`: its pins are disconnected, still
@@ -498,7 +506,7 @@ pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column:
 // Write the report of report_panic to the PL011 with registers R, a value
 // with the register block protocol, as its owner configured it.
 // SAFETY: `check` and `file` must be NUL-terminated.
-pub unsafe fn write_failure<R>(registers: &mut R, check: *const u8, file: *const u8, line: u32, column: u32) {
+pub unsafe fn write_failure<R: hal.Registers>(registers: &mut R, check: *const u8, file: *const u8, line: u32, column: u32) {
     pl011.send(registers, b"\r\ndodo: ")
     unsafe {
         send_text(registers, check)
@@ -514,7 +522,7 @@ pub unsafe fn write_failure<R>(registers: &mut R, check: *const u8, file: *const
 
 // Send a NUL-terminated string, up to its first 1024 bytes.
 // SAFETY: `text` must be NUL-terminated.
-unsafe fn send_text<R>(registers: &mut R, text: *const u8) {
+unsafe fn send_text<R: hal.Registers>(registers: &mut R, text: *const u8) {
     chunk: [32]u8 = [0; 32]
     used := 0usize
     for index in 0..1024isize {
@@ -534,7 +542,7 @@ unsafe fn send_text<R>(registers: &mut R, text: *const u8) {
     pl011.send(registers, &chunk[..used])
 }
 
-fn send_number<R>(registers: &mut R, value: u32) {
+fn send_number<R: hal.Registers>(registers: &mut R, value: u32) {
     digits: [10]u8 = [0; 10]
     position := 10usize
     rest := value

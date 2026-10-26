@@ -224,6 +224,7 @@ shows complete programs with matching, `?`, and postfix `!`.
 | `*const T`, `*mut T` | Nullable raw pointers without checked lifetimes. | [Memory and foreign calls](memory-and-ffi.md) |
 | `MaybeUninit<T>` | Opaque storage that may not yet contain a valid `T`. | [Memory intrinsics](memory-and-ffi.md#implemented-core-calls) |
 
-There are no tuples, type aliases, trait objects, general function-value types,
-closures, or user-defined implicit conversions in this implementation. Use named
-struct fields and generic methods to express reusable data and behavior.
+There are no tuples, type aliases, general function-value types, closures, or
+user-defined implicit conversions in this implementation. Use named struct
+fields, generic methods, and [interfaces](generics.md#interfaces) to express
+reusable data and behavior.

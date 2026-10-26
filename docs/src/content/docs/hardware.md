@@ -51,7 +51,7 @@ import "std/embedded/hal"
 import "std/embedded/hal/fake"
 
 // Works with any output pin and any delay.
-pub fn blink<P, D>(led: &mut P, delay: &mut D, times: u32) {
+pub fn blink<P: hal.OutputPin, D: hal.Delay>(led: &mut P, delay: &mut D, times: u32) {
     for _ in 0..times {
         led.set_high()
         hal.delay_ms(delay, 250)
@@ -71,26 +71,33 @@ fn blinks_three_times() {
 }
 ```
 
-`blink` names no chip. `<P, D>` are type parameters: any pin with `set_high`
-and `set_low`, and any delay with `delay_us`, satisfy it. The compiler checks
-each use and generates code specialized for the real types, so the protocol
-costs nothing at run time. See [generics](generics.md#reusable-behavior-through-public-methods)
-for how these method protocols work.
+`blink` names no chip. `<P: hal.OutputPin, D: hal.Delay>` are bounded type
+parameters: any pin with `set_high` and `set_low`, and any delay with
+`delay_us`, satisfy them, and passing something else is reported at the call.
+The compiler generates code specialized for the real types, so the interfaces
+cost nothing at run time. See [interfaces](generics.md#interfaces) for how
+bounds work.
 
 ## Device protocols
 
-A protocol is a set of method signatures. Any struct with those public methods
-can be passed where a driver expects it:
+Each device protocol is an [interface](generics.md#interfaces) in
+`std/embedded/hal`: a set of method signatures. Any struct with those public
+methods implements it and can be passed where a driver expects it:
 
-| Device | Methods |
+| Interface | Methods |
 | --- | --- |
-| Output pin | `set_high(&mut self)`, `set_low(&mut self)` |
-| Input pin | `is_high(&self) -> bool` |
-| Delay | `delay_us(&mut self, microseconds: u32)` |
-| I2C bus | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
-| SPI bus | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
-| Serial port | The [`std/io`](io.md) Reader and Writer protocols. |
-| Register block | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
+| `hal.OutputPin` | `set_high(&mut self)`, `set_low(&mut self)` |
+| `hal.InputPin` | `is_high(&self) -> bool` |
+| `hal.Delay` | `delay_us(&mut self, microseconds: u32)` |
+| `hal.I2c` | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
+| `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
+| Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`. |
+| `hal.Registers` | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
+
+Write drivers against bounded parameters, `fn probe<B: hal.I2c>(bus: &mut B)`,
+for zero-cost static dispatch. Use `&mut dyn hal.I2c` (or any other interface)
+when the device is chosen at run time, or to keep different devices in one
+array, such as a list of sensors behind one interface of your own.
 
 A bus is configured when it is created: its frequency, and for SPI a
 `hal.SpiMode` (`Mode0` to `Mode3`, the clock polarity and phase numbering of
@@ -429,9 +436,9 @@ popping a FIFO.
 
 | Package | Controller | Implements |
 | --- | --- | --- |
-| `std/embedded/peripheral/designware_i2c` | Synopsys DesignWare DW_apb_i2c | The I2C bus protocol, as the only master: 7-bit addresses, up to 1 MHz. |
-| `std/embedded/peripheral/pl022` | Arm PrimeCell PL022 | The SPI bus protocol, as master: 8-bit frames, all four modes. |
-| `std/embedded/peripheral/pl011` | Arm PrimeCell PL011 | The `std/io` Reader and Writer, and their polling forms: 5 to 8 data bits, parity, 1 or 2 stop bits. |
+| `std/embedded/peripheral/designware_i2c` | Synopsys DesignWare DW_apb_i2c | The I2C bus protocol, as the only master or as a target: 7-bit and 10-bit addresses, up to 1 MHz. |
+| `std/embedded/peripheral/pl022` | Arm PrimeCell PL022 | The SPI bus protocol, as master or target: 4- to 16-bit frames, all four modes, TI and Microwire formats. |
+| `std/embedded/peripheral/pl011` | Arm PrimeCell PL011 | The `std/io` Reader and Writer, and their polling forms: 5 to 8 data bits, parity, 1 or 2 stop bits, flow control, breaks, bounded waits. |
 
 The bus drivers keep the controller's FIFOs busy without ever queueing more
 than the receive FIFO holds, and bound every wait on the bus, so a device
@@ -440,6 +447,12 @@ packages hand out their controllers as the driver's `Bus` or `Port`, which
 keeps the register block from the application: `pins.i2c` on the RP2040 and
 RP2350 returns a `designware_i2c.Bus`, `pins.spi` a `pl022.Bus`, and
 `pins.uart` a `pl011.Port`.
+
+Each driver's generic `Controller<R>` also runs against register models on
+a desktop. The PL011's implements the `std/io` Reader and Writer, so
+`io.read_exact`, `io.write_all`, buffering, and formatting work with UARTs.
+`designware_i2c` and `pl022` also have a `Target` for answering another
+master.
 
 ### Owning peripherals once
 
@@ -812,8 +825,8 @@ pulled up and nothing is sent, and `flush()` waits as long.
 | --- | --- |
 | Speed | From 120 baud (144 on the RP2350) up to a sixteenth of the system clock: 7.8 Mbaud on the RP2040, 9.4 Mbaud on the RP2350. `baud()` reports the rate the divider makes, within 0.1 % up to 921600 baud (`115_207` for `115_200`). |
 | Changing it | `set_baud(baud)`, and `set_format(data_bits, parity, stop_bits)` for 5 to 8 data bits, `pl011.Parity.None`, `Even`, or `Odd`, and 1 or 2 stop bits. Both wait until everything written is out. |
-| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits without waiting. Writes cannot fail. |
-| Reading | `read` waits for the first byte, then returns what has arrived; a serial port never reaches end of input. `poll_read` returns at once, `Pending` while nothing has arrived. Nothing buffers beyond the 32-byte receive FIFO, so read at least every 32 bytes' time (2.8 ms at 115200 baud) while data arrives. |
+| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits without waiting. A write or `flush()` that makes no progress for `pl011.DEFAULT_POLL_LIMIT` status polls (around a second), as when flow control holds the transmitter, fails with `TimedOut` and the bytes queued before it; `set_poll_limit(polls)` changes the limit, `pl011.NO_POLL_LIMIT` removes it. |
+| Reading | `read` waits for the first byte, as long as it takes unless `set_read_poll_limit(polls)` bounds it (then `TimedOut`), then returns what has arrived; a serial port never reaches end of input. `poll_read` returns at once, `Pending` while nothing has arrived. Nothing buffers beyond the 32-byte receive FIFO, so read at least every 32 bytes' time (2.8 ms at 115200 baud) while data arrives. |
 | Errors | A read fails with an `io.Error` of kind `Other` whose `code` holds `pl011.FRAMING_ERROR`, `PARITY_ERROR`, `BREAK`, or `OVERRUN`, after the good bytes before it (`transferred`). Bytes with framing or parity errors, and breaks, are dropped; an overrun means bytes were lost because the receive FIFO was full. The next read continues. |
 | Terminals | `set_crlf(true)` writes `"\n"` as `"\r\n"` and reads the CR that Enter sends, alone or followed by LF, as one `"\n"`, so `io.read_line` ends at Enter. Off at first, so binary protocols get their bytes unchanged. Terminals do not show what is typed unless the program echoes it. |
 | Pins | Pulled up in the pads, so an unconnected receiver and released pins idle high, as the line does between frames, instead of reading as a break. |

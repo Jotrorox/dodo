@@ -6,8 +6,8 @@ import "std/io"
 // The Arm PrimeCell PL011 UART, an asynchronous serial port. Chip vendors
 // license this controller, so the same registers appear in many
 // microcontrollers, among them the RP2040 and RP2350 (UART0 and UART1).
-// `Controller` implements the std/io Reader and Writer protocols over any
-// register block: a `hal.RegisterBlock` on the chip, or a simulated
+// `Controller` implements the std/io Reader and Writer interfaces over any
+// hal.Registers: a `hal.RegisterBlock` on the chip, or a simulated
 // controller in a desktop test. A port therefore works with every std/io
 // helper and with std/fmt formatting:
 //
@@ -25,6 +25,13 @@ import "std/io"
 // `set_flow_control`, the controller asks the other end to pause instead.
 // `set_break` holds the line low, for protocols that signal with breaks.
 //
+// Waits are counted in status polls, not time. A write, `flush`, and the
+// settings that wait for output give up with TimedOut after
+// DEFAULT_POLL_LIMIT polls without progress (around a second), which only a
+// transmitter held up by flow control reaches; `set_poll_limit` changes
+// that. A read waits for its first byte as long as it takes, as a terminal
+// does, unless `set_read_poll_limit` bounds it too.
+//
 // Register names follow the PrimeCell PL011 technical reference manual, as
 // reproduced in the RP2040 datasheet (4.2).
 
@@ -38,6 +45,7 @@ const CR: usize = 0x030
 const IFLS: usize = 0x034
 const IMSC: usize = 0x038
 const ICR: usize = 0x044
+const DMACR: usize = 0x048
 
 // DR: a received byte, and above it the errors it arrived with.
 const DATA: u32 = 0xFF
@@ -77,6 +85,14 @@ const FIFO_LEVELS: u32 = (0b011 << 3) | 0b010
 
 // ICR: every interrupt.
 const ALL_INTERRUPTS: u32 = 0x7FF
+
+// Status polls without progress before a wait for output gives up.
+pub const DEFAULT_POLL_LIMIT: u32 = 10_000_000
+// A poll limit of zero waits as long as it takes.
+pub const NO_POLL_LIMIT: u32 = 0
+
+// Entries in each FIFO.
+const FIFO_DEPTH: u32 = 32
 
 const LINE_FEED: u8 = 10
 const CARRIAGE_RETURN: u8 = 13
@@ -160,12 +176,15 @@ fn line_format(data_bits: u32, parity: Parity, stop_bits: u32) -> u32!hal.Error 
     return ok(line)
 }
 
-// A serial port on one PL011 with registers R, a value with the register
-// block protocol of std/embedded/hal. Implements the std/io Reader and
-// Writer protocols and their polling forms.
-pub struct Controller<R> {
+// A serial port on one PL011 with registers R, any hal.Registers. Implements
+// the std/io Reader and Writer interfaces and their polling forms.
+pub struct Controller<R: hal.Registers>: io.ReadWriter {
     registers: R
     divisors: Divisors
+    // Status polls without progress before a wait for output, or for the
+    // first byte of a read, gives up; NO_POLL_LIMIT for none.
+    poll_limit: u32
+    read_poll_limit: u32
     // LCR_H's format bits.
     format: u32
     // Translate newlines; see set_crlf.
@@ -184,14 +203,17 @@ pub struct Controller<R> {
         port := Controller<R> {
             registers,
             divisors,
+            poll_limit: DEFAULT_POLL_LIMIT,
+            read_poll_limit: NO_POLL_LIMIT,
             format: hal.encode(WORD_LENGTH, 3),
             crlf: false,
             after_return: false,
             feed_pending: false,
         }
         port.registers.write(CR, 0)
-        // Transfers poll the FIFO flags; no interrupts.
+        // Transfers poll the FIFO flags; no interrupts or DMA requests.
         port.registers.write(IMSC, 0)
+        port.registers.write(DMACR, 0)
         port.registers.write(IFLS, FIFO_LEVELS)
         port.registers.write(ICR, ALL_INTERRUPTS)
         port.registers.write(RSR, 0)
@@ -206,10 +228,27 @@ pub struct Controller<R> {
         return self.divisors.baud
     }
 
+    // Bound waits for output: status polls without progress before a
+    // write, `flush`, or a setting that waits for output gives up with
+    // TimedOut (Timeout for settings). NO_POLL_LIMIT waits as long as it
+    // takes.
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.poll_limit = polls
+    }
+
+    // Bound the wait for a read's first byte the same way; reads wait as
+    // long as it takes at first.
+    pub fn set_read_poll_limit(&mut self, polls: u32) {
+        self.read_poll_limit = polls
+    }
+
     // Change the baud rate. Waits until everything written is out first, so
-    // no byte goes out at the wrong rate. InvalidInput leaves it unchanged.
+    // no byte goes out at the wrong rate. InvalidInput or Timeout leaves it
+    // unchanged.
     pub fn set_baud(&mut self, baud: u32) -> void!hal.Error {
-        self.divisors = divisors(self.divisors.clock_hz, baud)?
+        settings := divisors(self.divisors.clock_hz, baud)?
+        self.settle()?
+        self.divisors = settings
         self.reconfigure()
         return ok()
     }
@@ -217,9 +256,11 @@ pub struct Controller<R> {
     // Change the frame format: 5 to 8 data bits, the parity bit, and 1 or 2
     // stop bits. Modbus devices, for example, use 8E1:
     // `set_format(8, pl011.Parity.Even, 1)`. Waits like set_baud;
-    // InvalidInput leaves the format unchanged.
+    // InvalidInput or Timeout leaves the format unchanged.
     pub fn set_format(&mut self, data_bits: u32, parity: Parity, stop_bits: u32) -> void!hal.Error {
-        self.format = line_format(data_bits, parity, stop_bits)?
+        line := line_format(data_bits, parity, stop_bits)?
+        self.settle()?
+        self.format = line
         self.reconfigure()
         return ok()
     }
@@ -240,9 +281,10 @@ pub struct Controller<R> {
     // FIFO has room and raises it, asking the other end to pause, from 24
     // bytes on, so input is not lost while the program is busy. Both need
     // the pins routed, which chip packages do for ports claimed with flow
-    // control. While CTS stays high nothing leaves, so `flush`, and
-    // anything that waits for it, waits as long.
-    pub fn set_flow_control(&mut self, cts: bool, rts: bool) {
+    // control. While CTS stays high nothing leaves, so waits for output
+    // end in TimedOut. Timeout, with flow control unchanged, if what was
+    // written does not get out.
+    pub fn set_flow_control(&mut self, cts: bool, rts: bool) -> void!hal.Error {
         control := self.registers.read(CR) & ~(CTS_FLOW | RTS_FLOW)
         if cts {
             control |= CTS_FLOW
@@ -250,18 +292,20 @@ pub struct Controller<R> {
         if rts {
             control |= RTS_FLOW
         }
-        self.flush()
+        self.settle()?
         self.registers.write(CR, control & ~ENABLE)
         self.registers.write(CR, control)
+        return ok()
     }
 
     // Hold the transmit line low, a break, from once everything written is
     // out until `set_break(false)`. A receiver sees a break when the line
     // stays low for longer than a frame, so keep it on for at least two
     // frame times (174 us at 115200 baud, 8N1); LIN and DMX, for example,
-    // start their frames with breaks.
-    pub fn set_break(&mut self, on: bool) {
-        self.flush()
+    // start their frames with breaks. Timeout if what was written does not
+    // get out.
+    pub fn set_break(&mut self, on: bool) -> void!hal.Error {
+        self.settle()?
         line := self.format | FIFO_ENABLE
         if on {
             line |= SEND_BREAK
@@ -269,27 +313,41 @@ pub struct Controller<R> {
         // Rewriting LCR_H latches the same divisor again, so a break may
         // start and end while the controller runs.
         self.registers.write(LCR_H, line)
+        return ok()
     }
 
     // Connect the transmitter to the receiver inside the controller, so
     // reads return what was written and the TX pin stays idle. Meant for
-    // self-tests.
-    pub fn set_loopback(&mut self, on: bool) {
+    // self-tests. Timeout if what was written does not get out.
+    pub fn set_loopback(&mut self, on: bool) -> void!hal.Error {
         control := self.registers.read(CR) & ~LOOPBACK
         if on {
             control |= LOOPBACK
         }
-        self.flush()
+        self.settle()?
         self.registers.write(CR, control & ~ENABLE)
         self.registers.write(CR, control)
+        return ok()
     }
 
     // Send `bytes`, waiting while the transmit FIFO is full. Returns once
-    // the last byte is queued; `flush` waits until it is sent. Never fails.
+    // the last byte is queued; `flush` waits until it is sent. TimedOut,
+    // with the bytes queued before it in `transferred`, if the FIFO stays
+    // full for the poll limit.
     pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
         sent := 0usize
+        polls := 0u32
         for sent < bytes.len {
-            sent += self.queue(&bytes[sent..])
+            count := self.queue(&bytes[sent..])
+            if count == 0 {
+                polls += 1
+                if self.poll_limit != NO_POLL_LIMIT && polls >= self.poll_limit {
+                    return err(io.failure(io.ErrorKind.TimedOut, sent))
+                }
+            } else {
+                sent += count
+                polls = 0
+            }
         }
         return ok(bytes.len)
     }
@@ -306,9 +364,13 @@ pub struct Controller<R> {
     }
 
     // Wait until every byte written has left, stop bits included: before
-    // the other end may power down, or before restarting.
-    pub fn flush(&mut self) {
-        for (self.registers.read(FR) & BUSY) != 0 {}
+    // the other end may power down, or before restarting. TimedOut, with
+    // nothing transferred and nothing discarded, after the poll limit.
+    pub fn flush(&mut self) -> void!io.Error {
+        if !self.idle() {
+            return err(io.failure(io.ErrorKind.TimedOut, 0))
+        }
+        return ok()
     }
 
     // Wait for the first byte, then return what has arrived, up to
@@ -317,10 +379,15 @@ pub struct Controller<R> {
     // before it are in buffer[..transferred] and io.Error.code holds its
     // bits; see FRAMING_ERROR. The next read continues after it.
     pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        polls := 0u32
         for {
             progress := self.poll_read(buffer)?
             if progress.transferred != 0 || buffer.len == 0 {
                 return ok(progress.transferred)
+            }
+            polls += 1
+            if self.read_poll_limit != NO_POLL_LIMIT && polls >= self.read_poll_limit {
+                return err(io.failure(io.ErrorKind.TimedOut, 0))
             }
         }
     }
@@ -363,13 +430,37 @@ pub struct Controller<R> {
         return ok(io.Poll { transferred: count, state })
     }
 
-    // Wait until everything written is out, disable the controller, and
-    // give back its registers.
+    // Wait until everything written is out, within the poll limit, disable
+    // the controller, and give back its registers. Output still stuck after
+    // the poll limit is dropped.
     pub fn release(self) -> R {
-        self.flush()
+        self.idle()
         self.registers.write(CR, 0)
-        let Controller { registers, divisors, format, crlf, after_return, feed_pending } = self
+        let Controller { registers, divisors, poll_limit, read_poll_limit, format, crlf, after_return, feed_pending } = self
         return registers
+    }
+
+    // Wait until everything written has left; false if it has not after
+    // the poll limit for each byte the transmit FIFO and shift register
+    // hold, as the controller does not show how far it got.
+    fn idle(&mut self) -> bool {
+        budget := self.poll_limit as u64 * (FIFO_DEPTH as u64 + 1)
+        polls := 0u64
+        for (self.registers.read(FR) & BUSY) != 0 {
+            polls += 1
+            if self.poll_limit != NO_POLL_LIMIT && polls >= budget {
+                return false
+            }
+        }
+        return true
+    }
+
+    // `idle` for the settings that may change only between frames.
+    fn settle(&mut self) -> void!hal.Error {
+        if !self.idle() {
+            return err(hal.Error.Timeout)
+        }
+        return ok()
     }
 
     // Report an overrun once, after `count` bytes read.
@@ -404,9 +495,9 @@ pub struct Controller<R> {
     }
 
     // The divisor and format registers may change only while the
-    // controller is disabled, and only between frames.
+    // controller is disabled, and only between frames: callers settle
+    // first.
     fn reconfigure(&mut self) {
-        self.flush()
         control := self.registers.read(CR)
         self.registers.write(CR, control & ~ENABLE)
         self.configure()
@@ -418,7 +509,7 @@ pub struct Controller<R> {
 // its owner, and wait until they are out. Does nothing if the transmitter
 // is off. This is for panic hooks, which run while the owner is suspended
 // for good; everything else goes through a Controller.
-pub fn send<R>(registers: &mut R, bytes: &[u8]) {
+pub fn send<R: hal.Registers>(registers: &mut R, bytes: &[u8]) {
     if (registers.read(CR) & (ENABLE | TX_ENABLE)) != (ENABLE | TX_ENABLE) {
         return
     }
@@ -433,7 +524,7 @@ pub fn send<R>(registers: &mut R, bytes: &[u8]) {
 // implements the std/io Reader and Writer protocols like Controller but keeps
 // the register block: `RegisterBlock` trusts its owner with every offset,
 // which only the driver may be.
-pub struct Port {
+pub struct Port: io.ReadWriter {
     controller: Controller<hal.RegisterBlock>
 
     // SAFETY: as for hal.RegisterBlock.at, with `base` a PL011 whose reset
@@ -445,7 +536,8 @@ pub struct Port {
     }
 
     // Send `bytes`, waiting while the transmit FIFO is full. Returns once
-    // the last byte is queued; `flush` waits until it is sent. Never fails.
+    // the last byte is queued; `flush` waits until it is sent. TimedOut
+    // after the poll limit.
     pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
         return self.controller.write(bytes)
     }
@@ -456,9 +548,20 @@ pub struct Port {
         return self.controller.poll_write(bytes)
     }
 
-    // Wait until every byte written has left.
-    pub fn flush(&mut self) {
-        self.controller.flush()
+    // Wait until every byte written has left; TimedOut after the poll
+    // limit.
+    pub fn flush(&mut self) -> void!io.Error {
+        return self.controller.flush()
+    }
+
+    // Bound waits for output, in status polls; see Controller.
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.controller.set_poll_limit(polls)
+    }
+
+    // Bound the wait for a read's first byte; unbounded at first.
+    pub fn set_read_poll_limit(&mut self, polls: u32) {
+        self.controller.set_read_poll_limit(polls)
     }
 
     // Wait for the first byte, then return what has arrived. A receive
@@ -498,24 +601,25 @@ pub struct Port {
     // Turn hardware flow control on or off: the transmitter waits for CTS,
     // and RTS asks the other end to pause while the receive FIFO is nearly
     // full. Needs a port claimed with its flow control pins.
-    pub fn set_flow_control(&mut self, cts: bool, rts: bool) {
-        self.controller.set_flow_control(cts, rts)
+    pub fn set_flow_control(&mut self, cts: bool, rts: bool) -> void!hal.Error {
+        return self.controller.set_flow_control(cts, rts)
     }
 
     // Hold the transmit line low, a break, once everything written is out,
     // until `set_break(false)`.
-    pub fn set_break(&mut self, on: bool) {
-        self.controller.set_break(on)
+    pub fn set_break(&mut self, on: bool) -> void!hal.Error {
+        return self.controller.set_break(on)
     }
 
     // Loop the transmitter back to the receiver inside the chip, for
     // self-tests: reads return what was written.
-    pub fn set_loopback(&mut self, on: bool) {
-        self.controller.set_loopback(on)
+    pub fn set_loopback(&mut self, on: bool) -> void!hal.Error {
+        return self.controller.set_loopback(on)
     }
 
-    // Wait until everything written is out, disable the controller, and
-    // return its base address, for the chip package to take the port back.
+    // Wait until everything written is out, within the poll limit, disable
+    // the controller, and return its base address, for the chip package to
+    // take the port back.
     pub fn release(self) -> usize {
         let Port { controller } = self
         registers := controller.release()

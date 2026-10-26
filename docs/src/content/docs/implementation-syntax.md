@@ -110,8 +110,10 @@ Integer literal magnitude must fit `u64`; `-` is a separate prefix operation.
 
 `Self` is valid inside a struct declaration and names its current type. Result
 shorthand binds outside references and slices: `&T!E` means `Result<&T, E>`.
-Use the full spelling to make nested type relationships clear. Tuples, type
-aliases, general function-value types, and trait objects are not implemented.
+Use the full spelling to make nested type relationships clear. `&dyn I` and
+`&mut dyn I` refer to a value implementing interface `I`; see
+[interfaces](generics.md#dynamic-dispatch-with-dyn). Tuples, type aliases, and
+general function-value types are not implemented.
 
 ## Operators and evaluation order
 
@@ -214,11 +216,13 @@ type arguments from arguments, fields, and expected result types. Examples are
 infers its Option payload. Ambiguous calls require explicit arguments, such as
 `make::<i32>()`; explicit forms remain accepted. Inference follows local expression
 context, not later uses of a binding. Function signatures remain declared.
-Constraints/traits, specialization, and separately compiled generic interfaces
-are not implemented. Recursive expansion is bounded and diagnosed.
+Type parameters may be bounded by interfaces, `<T: io.Reader + io.Writer>`,
+which are checked where the generic declaration is used. Specialization and
+separately compiled generic code are not implemented. Recursive expansion is
+bounded and diagnosed.
 
 The [generics tutorial](generics.md) explains generic structs, associated
-functions, and structural method protocols with executable examples.
+functions, interfaces, bounds, and `dyn` references with executable examples.
 
 ## Formatting and syntax migration
 

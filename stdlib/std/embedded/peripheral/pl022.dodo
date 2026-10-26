@@ -5,10 +5,9 @@ import "std/embedded/hal"
 // The Arm PrimeCell PL022 synchronous serial port, as an SPI bus master or
 // as a target (slave) that a master clocks. Chip vendors license this
 // controller, so the same registers appear in many microcontrollers, among
-// them the RP2040 and RP2350 (SPI0 and SPI1). `Controller` implements the
-// std/embedded/hal SPI bus protocol over any register block: a
-// `hal.RegisterBlock` on the chip, or a simulated controller in a desktop
-// test. `Target` answers another master.
+// them the RP2040 and RP2350 (SPI0 and SPI1). `Controller` implements
+// hal.Spi over any hal.Registers: a `hal.RegisterBlock` on the chip, or a
+// simulated controller in a desktop test. `Target` answers another master.
 //
 // Chip packages pulse the controller's reset, route its pins, and pass the
 // frequency of the clock that feeds it. Frames start as 8 bits, most
@@ -174,10 +173,9 @@ fn format(mode: hal.SpiMode) -> u32 {
     }
 }
 
-// An SPI bus master on one PL022 with registers R, a value with the register
-// block protocol of std/embedded/hal. Implements the std/embedded/hal SPI bus
-// protocol.
-pub struct Controller<R> {
+// An SPI bus master on one PL022 with registers R, any hal.Registers, such as
+// a hal.RegisterBlock or a simulated controller in a test.
+pub struct Controller<R: hal.Registers>: hal.Spi {
     registers: R
     divisors: Divisors
     // CR0's clock polarity and phase bits for the mode.
@@ -396,7 +394,7 @@ fn frame_mask(bits: u32) -> u32 {
 // raised between every two frames; masters that keep it low for a whole
 // transfer need modes 1 or 3. The frame size and format work as for
 // Controller.
-pub struct Target<R> {
+pub struct Target<R: hal.Registers> {
     registers: R
     mode: u32
     format: u32
@@ -572,10 +570,10 @@ pub struct Target<R> {
 }
 
 // A PL022 on the chip, as chip packages hand it to applications. It
-// implements the std/embedded/hal SPI bus protocol like Controller but keeps
+// implements hal.Spi like Controller but keeps
 // the register block: `RegisterBlock` trusts its owner with every offset,
 // which only the driver may be.
-pub struct Bus {
+pub struct Bus: hal.Spi {
     controller: Controller<hal.RegisterBlock>
 
     // SAFETY: as for hal.RegisterBlock.at, with `base` a PL022 whose reset

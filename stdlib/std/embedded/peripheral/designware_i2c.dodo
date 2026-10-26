@@ -6,9 +6,9 @@ import "std/embedded/hal"
 // I2C bus or as a target (slave) that a master addresses. Chip vendors
 // license this controller, so the same registers appear in many
 // microcontrollers, among them the RP2040 and RP2350 (I2C0 and I2C1).
-// `Controller` implements the std/embedded/hal I2C bus protocol over any
-// register block: a `hal.RegisterBlock` on the chip, or a simulated
-// controller in a desktop test. `Target` answers another master.
+// `Controller` implements hal.I2c over any hal.Registers: a
+// `hal.RegisterBlock` on the chip, or a simulated controller in a desktop
+// test. `Target` answers another master.
 //
 // Chip packages pulse the controller's reset, route its two pins, pass the
 // frequency of the clock that feeds it, and hand the controller to
@@ -214,10 +214,10 @@ fn ten_bit(address: u16) -> u32!hal.Error {
     return ok(TAR_TEN_BIT | address as u32)
 }
 
-// An I2C bus master on one DW_apb_i2c controller with registers R, a value
-// with the register block protocol of std/embedded/hal. Implements the
-// std/embedded/hal I2C bus protocol.
-pub struct Controller<R> {
+// An I2C bus master on one DW_apb_i2c controller with registers R, any
+// hal.Registers, such as a hal.RegisterBlock or a simulated controller in a
+// test.
+pub struct Controller<R: hal.Registers>: hal.I2c {
     registers: R
     timing: Timing
     // Read commands that may be outstanding without overflowing the
@@ -572,10 +572,9 @@ pub enum TargetEvent {
 const NO_ENTRY: u32 = 0xFFFF_FFFF
 
 // A target (slave) on an I2C bus, answering a master at one address with
-// one DW_apb_i2c controller with registers R, a value with the register
-// block protocol of std/embedded/hal. The program polls for what the master
-// does: written bytes arrive in order, each read waits for `respond`, and a
-// STOP ends the transaction.
+// one DW_apb_i2c controller with registers R, any hal.Registers. The
+// program polls for what the master does: written bytes arrive in order,
+// each read waits for `respond`, and a STOP ends the transaction.
 //
 //     match target.poll(&mut buffer) {
 //         designware_i2c.TargetEvent.Write(count, start) => { ... }
@@ -589,7 +588,7 @@ const NO_ENTRY: u32 = 0xFFFF_FFFF
 // their own (SMBus allows 25 ms). Bytes queued by `respond` beyond what the
 // master reads are dropped when it next reads. General calls (address 0)
 // are not acknowledged.
-pub struct Target<R> {
+pub struct Target<R: hal.Registers> {
     registers: R
     // A received FIFO entry that starts a new write, read by the last poll
     // and held back for the next, or NO_ENTRY.
@@ -748,10 +747,10 @@ pub struct Target<R> {
 }
 
 // A DW_apb_i2c on the chip, as chip packages hand it to applications. It
-// implements the std/embedded/hal I2C bus protocol like Controller but keeps
+// implements hal.I2c like Controller but keeps
 // the register block: `RegisterBlock` trusts its owner with every offset,
 // which only the driver may be.
-pub struct Bus {
+pub struct Bus: hal.I2c {
     controller: Controller<hal.RegisterBlock>
 
     // SAFETY: as for hal.RegisterBlock.at, with `base` a DW_apb_i2c whose

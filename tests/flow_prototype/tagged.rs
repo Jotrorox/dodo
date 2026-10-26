@@ -497,7 +497,7 @@ fn unsupported_payloads_patterns_and_guards_discard_the_whole_graph() {
     }
     // A late restriction must erase earlier initialization findings even after
     // the adapter has constructed pattern branches and Result return blocks.
-    let program = parser::parse("package experiment\nfn get() -> u8!u8 { return ok(1) }\nfn f() -> u8!u8 { u8 x\n_ = x\nn := get()?\n_ = n as u32\nreturn ok(n) }").unwrap();
+    let program = parser::parse("package experiment\nfn get() -> u8!u8 { return ok(1) }\nfn f() -> u8!u8 { u8 x\n_ = x\nn := get()?\n_ = n as f32\nreturn ok(n) }").unwrap();
     let comparison = flow::compare_checkers(&program, 64);
     assert!(comparison.flow.diagnostics.is_empty());
     let body = comparison

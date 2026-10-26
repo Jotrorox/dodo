@@ -38,7 +38,7 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 | --- | --- |
 | Declarations, literals, operators, inference, and control flow | [Syntax and expressions](implementation-syntax.md) |
 | Primitive and compound types, methods, and associated functions | [Functions, structs, and enums](types-and-functions.md) |
-| Generic declarations, inference, and method protocols | [Generics](generics.md) |
+| Generic declarations, inference, interfaces, and `dyn` references | [Generics](generics.md) |
 | Files, imports, and public declarations | [Projects and imports](packages.md) |
 | Copying, moving, borrows, and destruction | [Ownership and borrowing](ownership.md) |
 | Matching, guards, destructuring, and error handling | [Patterns and Results](patterns-and-results.md) |
@@ -53,12 +53,12 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 
 | Area | Implemented | Boundary to keep in mind |
 | --- | --- | --- |
-| Values | Integers, floats, bool, arrays, checked references/slices, strings, structs, enums, Options, Results, raw pointers. | No tuples, type aliases, trait objects, or general function-value types. |
+| Values | Integers, floats, bool, arrays, checked references/slices, strings, structs, enums, Options, Results, raw pointers, `dyn` interface references. | No tuples, type aliases, owned `dyn` values, or general function-value types. |
 | Functions | Declared signatures, final-expression returns, methods, associated functions, recursion, generics. | No overloads, inheritance, default/named arguments, closures, or specialization. |
 | Control flow | `if`, `match`, conditional patterns, four `for` forms, `break`, `continue`, `return`. | No `while`, `loop`, labels, general iterator protocol, or async/await. |
 | Ownership | Moves, shared/exclusive loans, source-based returns, deterministic destruction. | Conservative indexing, joins, loops, and aggregate lifetime tracking. |
 | Errors | Mandatory Result handling, explicit matching, `?`, panic-on-error `!`. | No exceptions, automatic error conversion, or panic unwinding. |
-| Generic behavior | Concrete specialization and statically checked public method protocols. | No general trait/constraint system or separately compiled generic interfaces. |
+| Generic behavior | Concrete specialization, structural interfaces with bounds checked at each use, and `dyn` references with method tables. | No generic interfaces, associated types, owned `dyn` values, or separately compiled generic code. |
 | Packages | Single-file and directory imports, aliases, public/private declarations, embedded library. | Optional build manifest; local dependencies only, with no package manager, registry, or re-exports. |
 | Foreign and hardware code | C primitive/pointer calls, raw storage, volatile MMIO, typed registers, interrupt masking, layout queries. | No C aggregate-by-value calls, C variadics, user inline assembly, or interrupt attributes. |
 | Hosted library | Files, processes, environment, threads, atomics, synchronization, networking, TLS, HTTP, web routing. | Availability and native dependencies vary by target; see [platform support](platform.md). |

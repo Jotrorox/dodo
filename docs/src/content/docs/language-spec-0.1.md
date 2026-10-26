@@ -251,8 +251,8 @@ normalization is performed on strings or comments. The following words are
 reserved and must not be used as identifiers:
 
 ```text
-package import pub fn struct enum const let return if else for in
-break continue match unsafe extern as from static void mut true false
+package import pub fn struct enum interface dyn const let return if else for
+in break continue match unsafe extern as from static void mut true false
 ```
 
 `Self`, `self`, primitive type names, and constructor names such as `some` have
@@ -416,8 +416,9 @@ runtime validity. Section 16.2 fixes their storage structure.
 ### 4.7. Generics
 
 Basic type-parameter generics use angle brackets, as in `Name<T>`. Every
-instantiation must satisfy ordinary type and ownership checks. There are no
-traits, specialization, user-defined implicit conversions, or metaprogramming.
+instantiation must satisfy ordinary type and ownership checks. A type parameter
+may be bounded by interfaces (Section 6.6). There is no specialization,
+user-defined implicit conversion, or metaprogramming.
 
 Function calls and struct literals infer omitted type arguments from their
 arguments or fields and an expected result type. For example, `identity(42i32)`
@@ -561,9 +562,11 @@ Methods are declared inside their struct. Their first parameter is named `self`:
 The equivalent explicit forms `self: &Self`, `self: &mut Self`, and
 `self: Self` remain accepted. Shorthand is valid only for struct receivers.
 
-`item.update()` automatically borrows or reborrows the receiver as needed. A
-function inside a struct without a receiver is called as `Type.name(...)`.
-Dispatch is static. There is no inheritance or separate implementation block.
+`item.update()` automatically borrows or reborrows the receiver as needed,
+through any number of reference layers. A function inside a struct without a
+receiver is called as `Type.name(...)`. Dispatch is static except through a
+`dyn` reference (Section 6.6). There is no inheritance or separate
+implementation block.
 
 ### 6.4. Borrowed returns
 
@@ -612,6 +615,56 @@ allocation are introduced. The bodyless `@compiler(print)`,
 `@compiler(println)`, and `@compiler(printf)` declarations are reserved for the
 bundled `std/fmt` and `std/console` packages; user packages cannot declare them.
 This facility does not provide general argument packs or function overloading.
+
+### 6.6. Interfaces and dynamic dispatch
+
+An interface declaration names method signatures without bodies:
+
+```dodo
+pub interface Sensor: Named {
+    fn read(&mut self) -> i32!Error
+}
+```
+
+Interfaces are top-level declarations sharing the type namespace and the
+visibility rules of structs. Methods may be `unsafe`, declare `from(...)`, and
+use `Self` for the implementing type; they cannot have type parameters,
+`stores(...)`, `requires_plain(...)`, or the name `drop`. `I: P + Q` includes
+the methods of `P` and `Q`, which must agree where names coincide; cycles are
+rejected. Interfaces have no type parameters.
+
+A type `T` implements `I` when, for every method `m` of `I` and its included
+interfaces, `T.m` exists, its receiver kind, parameter types, and return type
+equal those of `m` with `Self` replaced by `T`, it is not unsafe unless `m` is,
+it declares no storage contracts, and it is visible from the package that
+relies on the implementation. Its effective borrow sources must be a subset of
+`m`'s (with `static` always permitted). Implementation is structural; a struct
+may additionally declare `struct T: I + J`, which is checked at the declaration
+(per specialization for generic structs).
+
+A generic parameter may be bounded, as in `fn f<T: I + J>` or `struct S<T: I>`.
+Each specialization checks every bound of its arguments where the generic
+declaration is used, before its body is checked. Unbounded parameters keep the
+structural behavior of Section 4.7.
+
+`dyn I` is the type of an unknown value implementing `I`. It is unsized and
+valid only as the referent of `&dyn I` or `&mut dyn I`, including inside
+arrays, fields, Options, and Results. `I` must be object-safe: every method
+takes `&self` or `&mut self` and mentions `Self` nowhere else. A `dyn`
+reference is a pair of the value's address and a constant method table. These
+conversions are implicit where a `dyn` reference is expected, and explicit with
+`as`:
+
+1. `&T` or `&mut T` to `&dyn I`, and `&mut T` to `&mut dyn I`, when `T`
+   implements `I`.
+2. `&mut dyn I` to `&dyn I`.
+3. `&dyn I` to `&dyn P` (and likewise for `&mut`) when the methods of `P` are a
+   prefix of those of `I`, as for its first included interface.
+
+A conversion keeps the loans of its operand. Calling a method on a `dyn`
+reference calls the implementation recorded in its table, with the interface
+method's signature and borrow contract. `dyn I` implements `I` and satisfies
+bounds on `I`.
 
 ## 7. Ownership and moves
 
@@ -1781,7 +1834,7 @@ tests constrain the documented choice, not every possible conforming choice.
 
 ### C.2. Features excluded from this edition
 
-Trait constraints, specialization, user lifetime/variance syntax, standalone
+Specialization, user lifetime/variance syntax, standalone
 partial field moves, a package registry, package initializers, re-exports,
 variadic/C aggregate-by-value calls, inline assembly, user section/alignment/export
 attributes, interrupt ABI declarations, and panic-handler registration are not

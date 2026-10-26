@@ -244,14 +244,14 @@ fn uart_checks<P, T>(pins: &mut P, timer: &mut T) {
     // GP12 is UART0's too.
     check(serial.baud() == 115_207 && refused(pins.uart(12, none, 9600), hal.Error.Busy) && refused(pins.output(tx), hal.Error.Busy))
 
-    serial.set_loopback(true)
+    serial.set_loopback(true)!
     sent: [16]u8 = [0; 16]
     for index in 0..16usize {
         sent[index] = (0x3C + 13 * index) as u8
     }
     start := timer.now_us()
     serial.write(&sent)!
-    serial.flush()
+    serial.flush()!
     elapsed := timer.now_us() - start
     data: [16]u8 = [0; 16]
     io.read_exact(&mut serial, &mut data)!
@@ -265,7 +265,7 @@ fn uart_checks<P, T>(pins: &mut P, timer: &mut T) {
     // "\n" goes out as "\r\n", which reads back as one "\n".
     serial.set_crlf(true)
     serial.write(b"a\nb")!
-    serial.flush()
+    serial.flush()!
     three: [3]u8 = [0; 3]
     io.read_exact(&mut serial, &mut three)!
     empty := serial.poll_read(&mut data)!
@@ -283,7 +283,7 @@ fn uart_checks<P, T>(pins: &mut P, timer: &mut T) {
     }
     start = timer.now_us()
     serial.write(&burst)!
-    serial.flush()
+    serial.flush()!
     elapsed = timer.now_us() - start
     back: [40]u8 = [0; 40]
     received := 0usize
@@ -314,14 +314,14 @@ fn uart_checks<P, T>(pins: &mut P, timer: &mut T) {
 
     // Released, the pins stay pulled up, so the line idles high; then the
     // port is claimed again, to send only.
-    serial.set_loopback(false)
+    serial.set_loopback(false)!
     pins.release_uart(serial)
     line := pins.input(tx)!
     high := line.is_high()
     pins.release(line)
     again := pins.uart(tx, none, 115_200)!
     again.write(b"dodo\r\n")!
-    again.flush()
+    again.flush()!
     check(high && again.baud() == 115_207)
     pins.release_uart(again)
 }
@@ -397,10 +397,10 @@ fn protocol_checks<P, T>(pins: &mut P, timer: &mut T) {
     tx := board.UART_TX_PIN
     rx := board.UART_RX_PIN
     serial := pins.uart(tx, some(rx), 115_200)!
-    serial.set_loopback(true)
-    serial.set_break(true)
+    serial.set_loopback(true)!
+    serial.set_break(true)!
     timer.delay_us(200)
-    serial.set_break(false)
+    serial.set_break(false)!
     timer.delay_us(100)
     broke := false
     match serial.poll_read(&mut buffer) {
@@ -410,11 +410,11 @@ fn protocol_checks<P, T>(pins: &mut P, timer: &mut T) {
         }
     }
     serial.write(b"ok")!
-    serial.flush()
+    serial.flush()!
     two: [2]u8 = [0; 2]
     io.read_exact(&mut serial, &mut two)!
     check(broke && two[0] == 111 && two[1] == 107)
-    serial.set_loopback(false)
+    serial.set_loopback(false)!
     pins.release_uart(serial)
 
     // Flow control owns CTS and RTS too. With nothing on CTS the
@@ -423,9 +423,9 @@ fn protocol_checks<P, T>(pins: &mut P, timer: &mut T) {
     flow_refused := refused(pins.uart_flow(tx, rx, rx + 2, rx + 1, 115_200), hal.Error.InvalidInput)
     flow := pins.uart_flow(tx, rx, rx + 1, rx + 2, 115_200)!
     taken := refused(pins.output(rx + 2), hal.Error.Busy)
-    flow.set_flow_control(false, false)
+    flow.set_flow_control(false, false)!
     flow.write(b"\r\n")!
-    flow.flush()
+    flow.flush()!
     pins.release_uart(flow)
     free := pins.output(rx + 2)!
     pins.release(free)

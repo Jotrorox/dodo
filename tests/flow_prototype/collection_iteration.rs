@@ -386,11 +386,11 @@ fn unsupported_foreach_forms_and_late_body_failures_discard_the_graph() {
         ("fn f(a: &mut[2]u8) { for &value in a {} }", "shared"),
         ("fn f(a: [2]u8) { for &value in &mut a {} }", "shared"),
         (
-            "fn f(a: [2]u8) { for &value in a { _ = value as u32 } }",
+            "fn f(a: [2]u8) { for &value in a { _ = value as f32 } }",
             "cast",
         ),
         (
-            "fn f(a: [2]u8) { for &value in a {}\n_ = 1u8 as u32 }",
+            "fn f(a: [2]u8) { for &value in a {}\n_ = 1u8 as f32 }",
             "cast",
         ),
     ] {

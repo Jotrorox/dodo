@@ -1976,6 +1976,9 @@ struct UartModel {
         } else if offset == 0x034 {
             core.assert(!self.enabled())
             self.levels = value
+        } else if offset == 0x048 {
+            // No DMA requests.
+            core.assert_eq(value, 0u32)
         } else if offset == 0x044 {
             self.cleared |= value
         } else if offset == 0x02C && self.enabled() {
@@ -2045,6 +2048,21 @@ fn uart_divisors() {
     expect_uart_invalid(pl011.divisors(CLOCK_HZ, 7_900_000))
     expect_uart_invalid(pl011.divisors(CLOCK_HZ, 119))
     expect_uart_invalid(pl011.divisors(CLOCK_HZ, 0))
+    // Rounding carries from the fraction into the integer part, the
+    // arithmetic stays wide for any clock, and the divisor's range ends at
+    // exactly 1 and 65535.
+    carry := pl011.divisors(16_383, 512)!
+    core.assert(carry.integer == 2 && carry.fraction == 0)
+    widest := pl011.divisors(0xFFFF_FFFF, 115_200)!
+    core.assert(widest.integer > 0 && widest.integer <= 65_535)
+    top := pl011.divisors(1_048_560, 1)!
+    core.assert(top.integer == 65_535 && top.fraction == 0)
+    unit := pl011.divisors(16, 1)!
+    core.assert(unit.integer == 1 && unit.fraction == 0)
+    expect_uart_invalid(pl011.divisors(1_048_561, 1))
+    expect_uart_invalid(pl011.divisors(CLOCK_HZ, 1))
+    expect_uart_invalid(pl011.divisors(CLOCK_HZ, 0xFFFF_FFFF))
+    expect_uart_invalid(pl011.divisors(0, 115_200))
     // The usual rates come within 0.1 %, and the rate reported is the one
     // the divisor makes.
     rates: [12]u32 = [300, 1200, 2400, 9600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000]
@@ -2112,7 +2130,7 @@ fn uart_writes() {
         text[index] = (32 + index) as u8
     }
     core.assert_eq(port.write(&text)!, 100usize)
-    port.flush()
+    port.flush()!
     model := port.release()
     model.expect_sent(&text)
 
@@ -2208,13 +2226,13 @@ fn uart_reads() {
     // Bytes that arrive while the receive FIFO is full are lost; the next
     // read returns what the FIFO holds and then reports the overrun, once.
     port = uart_port(model)
-    port.set_loopback(true)
+    port.set_loopback(true)!
     full: [40]u8 = [0; 40]
     for index in 0..40usize {
         full[index] = index as u8
     }
     port.write(&full)!
-    port.flush()
+    port.flush()!
     match port.read(&mut full) {
         ok(_) => {
             core.assert(false)
@@ -2226,7 +2244,7 @@ fn uart_reads() {
     }
     after := port.poll_read(&mut full)!
     core.assert(after.transferred == 0 && after.state == io.PollState.Pending)
-    port.set_loopback(false)
+    port.set_loopback(false)!
     model = port.release()
 
     // An overrun flagged on a byte keeps that byte; a break is dropped.
@@ -2255,12 +2273,12 @@ fn uart_reads() {
     core.assert_eq(buffer[0], 114u8)
 
     // Loopback reads back what was written, and nothing reaches the line.
-    port.set_loopback(true)
+    port.set_loopback(true)!
     port.write(b"loop")!
-    port.flush()
+    port.flush()!
     core.assert_eq(io.read_exact(&mut port, &mut buffer[..4])!, 4usize)
     core.assert(buffer[0] == 108 && buffer[3] == 112)
-    port.set_loopback(false)
+    port.set_loopback(false)!
     model = port.release()
     model.expect_sent(b"")
     core.assert_eq(model.cr & (1 << 7), 0u32)
@@ -2270,24 +2288,24 @@ fn uart_flow_and_break() {
     // Flow control waits for what is queued, then changes while disabled.
     port := uart_port(UartModel.new(2))
     port.write(b"wait")!
-    port.set_flow_control(true, true)
+    port.set_flow_control(true, true)!
     model := port.release()
     model.expect_sent(b"wait")
     core.assert_eq(model.levels, 0x1Au32)
     port = uart_port(model)
-    port.set_flow_control(true, false)
-    port.set_flow_control(false, false)
+    port.set_flow_control(true, false)!
+    port.set_flow_control(false, false)!
     model = port.release()
 
     // A break waits for what is queued, then holds the line until it is
     // ended; in loopback the receiver reports it.
     port = uart_port(model)
     port.write(b"brk")!
-    port.set_break(true)
-    port.set_break(false)
-    port.set_loopback(true)
-    port.set_break(true)
-    port.set_break(false)
+    port.set_break(true)!
+    port.set_break(false)!
+    port.set_loopback(true)!
+    port.set_break(true)!
+    port.set_break(false)!
     buffer: [4]u8 = [0; 4]
     match port.read(&mut buffer) {
         ok(_) => {
@@ -2297,14 +2315,70 @@ fn uart_flow_and_break() {
             core.assert(error.code == (pl011.BREAK | pl011.FRAMING_ERROR) && error.transferred == 0)
         }
     }
-    port.set_loopback(false)
+    port.set_loopback(false)!
     // The format survives a break.
     port.set_format(7, pl011.Parity.Even, 1)!
-    port.set_break(true)
-    port.set_break(false)
+    port.set_break(true)!
+    port.set_break(false)!
     model = port.release()
     model.expect_sent(b"brk")
     core.assert(model.breaks == 3 && model.lcr_h == 0x56)
+}
+
+fn expect_timed_out(result: usize!io.Error, transferred: usize) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.kind == io.ErrorKind.TimedOut && error.transferred == transferred)
+        }
+    }
+}
+
+fn uart_poll_limits() {
+    // A transmitter that never moves, as one held up by CTS: writes give up
+    // after the poll limit with what was queued, flush and the settings
+    // that wait for output give up too, and nothing changes.
+    port := uart_port(UartModel.new(1))
+    port.set_poll_limit(4)
+    unsafe {
+        UART_STALLED = true
+    }
+    long: [40]u8 = [7; 40]
+    expect_timed_out(port.write(&long), UART_FIFO)
+    match port.flush() {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.kind == io.ErrorKind.TimedOut && error.transferred == 0)
+        }
+    }
+    expect_error(port.set_baud(9600), hal.Error.Timeout)
+    expect_error(port.set_format(7, pl011.Parity.Even, 1), hal.Error.Timeout)
+    expect_error(port.set_break(true), hal.Error.Timeout)
+    expect_error(port.set_flow_control(true, true), hal.Error.Timeout)
+    core.assert_eq(port.baud(), 115_207u32)
+    unsafe {
+        UART_STALLED = false
+    }
+    port.flush()!
+    model := port.release()
+    model.expect_sent(&long[..UART_FIFO])
+    core.assert(model.lcr_h == 0x70 && model.breaks == 0)
+
+    // Reads wait for their first byte as long as it takes, unless bounded.
+    port = uart_port(model)
+    port.set_read_poll_limit(3)
+    buffer: [4]u8 = [0; 4]
+    expect_timed_out(port.read(&mut buffer), 0)
+    model = port.release()
+    model.arrive_bytes(b"hi")
+    port = uart_port(model)
+    port.set_read_poll_limit(3)
+    core.assert_eq(port.read(&mut buffer)!, 2usize)
+    port.release()
 }
 
 // The panic report as the default panic hook writes it, from the strings
@@ -2333,7 +2407,7 @@ fn uart_panic_report() {
     model.expect_sent(b"")
 }
 
-fn expect_invalid(result: u32!hal.Error) {
+fn expect_invalid<T>(result: T!hal.Error) {
     match result {
         ok(controller) => {
             core.assert(false)
@@ -2739,6 +2813,69 @@ fn rp_bank() {
     core.assert(function(13) == DISCONNECTED && function(17) == DISCONNECTED)
 }
 
+// The UART pin rules exhaustively, and a claim whose reset fails.
+fn rp_bank_uart_rules() {
+    for tx in 0u32..30 {
+        for rx in 0u32..30 {
+            valid := tx % 4 == 0 && rx % 4 == 1 && ((tx + 4) / 8) % 2 == ((rx + 4) / 8) % 2
+            match rp_pins.uart_pins(tx, some(rx)) {
+                ok(pins) => {
+                    core.assert(valid)
+                    core.assert_eq(pins.controller, ((tx + 4) / 8) % 2)
+                    core.assert_eq(pins.mask, (1u32 << tx) | (1u32 << rx))
+                }
+                err(error) => {
+                    core.assert(!valid && error == hal.Error.InvalidInput)
+                }
+            }
+            aux_valid := (tx % 4 == 0 || tx % 4 == 2) && (rx % 4 == 1 || rx % 4 == 3) && ((tx + 4) / 8) % 2 == ((rx + 4) / 8) % 2
+            match rp_pins.uart_aux_pins(tx, some(rx)) {
+                ok(pins) => {
+                    core.assert(aux_valid)
+                    core.assert_eq(pins.controller, ((tx + 4) / 8) % 2)
+                }
+                err(error) => {
+                    core.assert(!aux_valid && error == hal.Error.InvalidInput)
+                }
+            }
+        }
+    }
+    bank := unsafe {
+        rp_pins.Bank.new(FakeChip {})
+    }
+    expect_invalid(bank.uart(0, some(5u32), 115_200))
+    expect_invalid(bank.uart(0, some(1u32), 0))
+    // RX may come from another group of the same UART.
+    uart := bank.uart(0, some(13u32), 115_200)!
+    core.assert(function(0) == UART && function(13) == UART)
+    expect_busy(bank.uart(16, some(17u32), 9600))
+    expect_busy(bank.gpio(13))
+    second := bank.uart(4, some(25u32), 9600)!
+    bank.release_uart(uart)
+    core.assert(function(0) == DISCONNECTED && function(13) == DISCONNECTED)
+    core.assert(function(4) == UART && function(25) == UART)
+    bank.release_uart(second)
+    // A failed reset gives back both the controller and its pins.
+    unsafe {
+        FAIL_RESET = true
+    }
+    match bank.uart(0, some(1u32), 115_200) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    unsafe {
+        FAIL_RESET = false
+    }
+    again := bank.uart(0, some(1u32), 115_200)!
+    bank.release_uart(again)
+    free := bank.gpio(0)!
+    bank.release_gpio(free)
+}
+
 fn main() {
     i2c_timing()
     i2c_configuration()
@@ -2760,7 +2897,9 @@ fn main() {
     uart_writes()
     uart_reads()
     uart_flow_and_break()
+    uart_poll_limits()
     uart_panic_report()
     rp_pin_assignments()
     rp_bank()
+    rp_bank_uart_rules()
 }

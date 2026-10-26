@@ -10,12 +10,17 @@ use std::collections::{HashMap, HashSet};
 #[doc(hidden)]
 pub mod flow;
 mod generics;
+mod interfaces;
 mod ownership;
 mod slices;
 mod storage;
 mod uses;
 
 use generics::{instantiate, intrinsic_result_type};
+#[cfg(feature = "llvm")]
+pub(crate) use interfaces::flattened_interfaces;
+pub(crate) use interfaces::signature_text as interface_signature;
+use interfaces::{InterfaceInfo, Obligation};
 use ownership::{
     Access, Loan, Place, Value, Variable, incompatible, merge_states, overlaps, static_loan,
 };
@@ -74,8 +79,23 @@ fn check_program(
 ) -> Check<()> {
     crate::prepare::prepare(program, pointer_bits)?;
     validate_public_interfaces(program)?;
-    instantiate(program)?;
+    interfaces::validate_bounds(program)?;
+    let obligations = instantiate(program)?;
     let context = Context::new(program, pointer_bits)?;
+    for obligation in &obligations {
+        if let Err(error) = context.check_obligation(obligation) {
+            if !recover {
+                return Err(error);
+            }
+            diagnostics.push(error);
+        }
+    }
+    if let Err(error) = context.check_declared_implementations(program) {
+        if !recover {
+            return Err(error);
+        }
+        diagnostics.push(error);
+    }
     // Publish inferred contracts before checking bodies, so editor queries can
     // inspect signatures even when a body has a diagnostic.
     for function in &mut program.functions {
@@ -290,10 +310,12 @@ struct Signature {
     unsafe_: bool,
     extern_: bool,
     public: bool,
+    span: Span,
 }
 struct Context {
     structs: HashMap<String, Struct>,
     enums: HashMap<String, Enum>,
+    interfaces: HashMap<String, InterfaceInfo>,
     functions: HashMap<String, Signature>,
     constants: HashMap<String, Constant>,
     pointer_bits: u32,
@@ -301,9 +323,11 @@ struct Context {
 }
 impl Context {
     fn new(program: &Program, pointer_bits: u32) -> Check<Self> {
+        let (interfaces, dispatch) = Self::interface_table(program)?;
         let mut context = Self {
             structs: HashMap::new(),
             enums: HashMap::new(),
+            interfaces,
             functions: HashMap::new(),
             constants: HashMap::new(),
             pointer_bits,
@@ -331,6 +355,14 @@ impl Context {
             context
                 .enums
                 .insert(declaration.name.clone(), declaration.clone());
+        }
+        for interface in &program.interfaces {
+            if !names.insert(interface.name.clone()) {
+                return Err(Diagnostic::new(
+                    interface.span,
+                    format!("duplicate declaration `{}`", interface.name),
+                ));
+            }
         }
         for constant in &program.constants {
             if !names.insert(constant.name.clone()) {
@@ -388,7 +420,30 @@ impl Context {
         for constant in &program.constants {
             context.validate_type(&constant.ty, constant.span, false)?;
         }
-        for function in &program.functions {
+        // Signatures of interfaces that `dyn` cannot use are still checked,
+        // with an arbitrary stand-in for `Self`.
+        for interface in &program.interfaces {
+            if context.interfaces[&interface.name]
+                .not_object_safe
+                .is_some()
+            {
+                for method in &interface.methods {
+                    for param in &method.params {
+                        context.validate_type(
+                            &interfaces::substitute_self(&param.ty, &Type::Bool),
+                            param.span,
+                            false,
+                        )?;
+                    }
+                    context.validate_type(
+                        &interfaces::substitute_self(&method.ret, &Type::Bool),
+                        method.span,
+                        true,
+                    )?;
+                }
+            }
+        }
+        for function in program.functions.iter().chain(&dispatch) {
             if !names.insert(function.name.clone()) {
                 return Err(Diagnostic::new(
                     function.span,
@@ -415,98 +470,7 @@ impl Context {
                     "destructors cannot have requires_plain constraints",
                 ));
             }
-            let mut from = function.from.clone();
-            for source in &from {
-                if let Some(owner) = source.strip_suffix(".stored") {
-                    context.validate_stored_source(function, owner)?;
-                }
-            }
-            if context.carries_borrow(&function.ret) {
-                if from.is_empty() {
-                    if let Some(receiver) = function
-                        .params
-                        .first()
-                        .filter(|p| p.name == "self" && context.carries_borrow(&p.ty))
-                    {
-                        from.push(receiver.name.clone());
-                    } else {
-                        let sources: Vec<_> = function
-                            .params
-                            .iter()
-                            .filter(|p| context.carries_borrow(&p.ty))
-                            .collect();
-                        if sources.len() != 1 {
-                            let mut diagnostic = Diagnostic::new(
-                                function.ret_span,
-                                "borrowed return needs an explicit `from(...)` contract",
-                            )
-                            .primary_label("specify the sources of this borrowed return");
-                            for source in sources {
-                                diagnostic = diagnostic.label(
-                                    source.span,
-                                    format!("possible borrowed source `{}`", source.name),
-                                );
-                            }
-                            return Err(diagnostic.note("name its borrowed input sources, or use `from(static)` for program-lifetime storage"));
-                        }
-                        from.push(sources[0].name.clone());
-                    }
-                }
-                for source in &from {
-                    let parameter_source = source.strip_suffix(".stored").unwrap_or(source);
-                    if source != "static"
-                        && !function.params.iter().any(|p| {
-                            p.name == parameter_source
-                                && (context.carries_borrow(&p.ty) || function.generic_instance)
-                        })
-                    {
-                        let mut diagnostic = Diagnostic::new(
-                            function.from_span.unwrap_or(function.ret_span),
-                            format!("borrow source `{source}` is not a borrow-carrying parameter"),
-                        )
-                        .primary_label(format!(
-                            "`{source}` cannot be used as a borrowed-return source"
-                        ))
-                        .label(function.ret_span, "borrowed return type is declared here");
-                        if let Some(parameter) = function
-                            .params
-                            .iter()
-                            .find(|parameter| parameter.name == *source)
-                        {
-                            diagnostic = diagnostic.label(
-                                parameter.span,
-                                format!("`{source}` does not carry a borrow"),
-                            );
-                        }
-                        return Err(diagnostic);
-                    }
-                }
-            } else if !from.is_empty() && function.generic_instance {
-                for source in &from {
-                    if source != "static"
-                        && !function
-                            .params
-                            .iter()
-                            .any(|p| p.name == source.strip_suffix(".stored").unwrap_or(source))
-                    {
-                        return Err(Diagnostic::new(
-                            function.from_span.unwrap_or(function.ret_span),
-                            format!("borrow source `{source}` is not a parameter"),
-                        ));
-                    }
-                }
-                from.clear();
-            } else if !from.is_empty() {
-                return Err(Diagnostic::new(
-                    function.from_span.unwrap_or(function.ret_span),
-                    "`from(...)` requires a borrow-carrying return type",
-                )
-                .primary_label("borrow sources do not apply to this return type")
-                .label(
-                    function.ret_span,
-                    "this return type does not carry a borrow",
-                ));
-            }
+            let from = context.borrow_sources(function)?;
             context.validate_stores(function)?;
             if function.name.ends_with(".drop") {
                 let owner = function.name.trim_end_matches(".drop");
@@ -543,10 +507,108 @@ impl Context {
                     unsafe_: function.unsafe_,
                     extern_: function.extern_,
                     public: function.public,
+                    span: signature_span(function),
                 },
             );
         }
         Ok(context)
+    }
+    /// The effective borrow sources of a function's result: its declared
+    /// `from(...)`, or the receiver or single borrowed parameter it implies.
+    fn borrow_sources(&self, function: &Function) -> Check<Vec<String>> {
+        let mut from = function.from.clone();
+        for source in &from {
+            if let Some(owner) = source.strip_suffix(".stored") {
+                self.validate_stored_source(function, owner)?;
+            }
+        }
+        if self.carries_borrow(&function.ret) {
+            if from.is_empty() {
+                if let Some(receiver) = function
+                    .params
+                    .first()
+                    .filter(|p| p.name == "self" && self.carries_borrow(&p.ty))
+                {
+                    from.push(receiver.name.clone());
+                } else {
+                    let sources: Vec<_> = function
+                        .params
+                        .iter()
+                        .filter(|p| self.carries_borrow(&p.ty))
+                        .collect();
+                    if sources.len() != 1 {
+                        let mut diagnostic = Diagnostic::new(
+                            function.ret_span,
+                            "borrowed return needs an explicit `from(...)` contract",
+                        )
+                        .primary_label("specify the sources of this borrowed return");
+                        for source in sources {
+                            diagnostic = diagnostic.label(
+                                source.span,
+                                format!("possible borrowed source `{}`", source.name),
+                            );
+                        }
+                        return Err(diagnostic.note("name its borrowed input sources, or use `from(static)` for program-lifetime storage"));
+                    }
+                    from.push(sources[0].name.clone());
+                }
+            }
+            for source in &from {
+                let parameter_source = source.strip_suffix(".stored").unwrap_or(source);
+                if source != "static"
+                    && !function.params.iter().any(|p| {
+                        p.name == parameter_source
+                            && (self.carries_borrow(&p.ty) || function.generic_instance)
+                    })
+                {
+                    let mut diagnostic = Diagnostic::new(
+                        function.from_span.unwrap_or(function.ret_span),
+                        format!("borrow source `{source}` is not a borrow-carrying parameter"),
+                    )
+                    .primary_label(format!(
+                        "`{source}` cannot be used as a borrowed-return source"
+                    ))
+                    .label(function.ret_span, "borrowed return type is declared here");
+                    if let Some(parameter) = function
+                        .params
+                        .iter()
+                        .find(|parameter| parameter.name == *source)
+                    {
+                        diagnostic = diagnostic.label(
+                            parameter.span,
+                            format!("`{source}` does not carry a borrow"),
+                        );
+                    }
+                    return Err(diagnostic);
+                }
+            }
+        } else if !from.is_empty() && function.generic_instance {
+            for source in &from {
+                if source != "static"
+                    && !function
+                        .params
+                        .iter()
+                        .any(|p| p.name == source.strip_suffix(".stored").unwrap_or(source))
+                {
+                    return Err(Diagnostic::new(
+                        function.from_span.unwrap_or(function.ret_span),
+                        format!("borrow source `{source}` is not a parameter"),
+                    ));
+                }
+            }
+            from.clear();
+        } else if !from.is_empty() {
+            return Err(Diagnostic::new(
+                function.from_span.unwrap_or(function.ret_span),
+                "`from(...)` requires a borrow-carrying return type",
+            )
+            .primary_label("borrow sources do not apply to this return type")
+            .label(
+                function.ret_span,
+                "this return type does not carry a borrow",
+            ));
+        }
+        Ok(from)
     }
     fn validate_type(&self, ty: &Type, span: Span, void: bool) -> Check<()> {
         match ty {
@@ -562,6 +624,14 @@ impl Context {
                     .with_kind(DiagnosticKind::UnknownType(name.as_str().into())))
             }
             Type::Generic(..) => Err(Diagnostic::new(span, "unresolved generic type")),
+            Type::Ref(_, t) if let Type::Dyn(name) = t.as_ref() => self.validate_dyn(name, span),
+            Type::Dyn(name) => Err(Diagnostic::new(
+                span,
+                format!("`dyn {name}` has no fixed size; use it behind a reference"),
+            )
+            .note(format!(
+                "write `&dyn {name}` or `&mut dyn {name}`; the reference carries the method table"
+            ))),
             Type::Array(_, t)
             | Type::Slice(_, t)
             | Type::Ref(_, t)
@@ -623,6 +693,7 @@ impl Context {
     fn function_namespace(&self, name: &str) -> String {
         if let Some((owner, _)) = name.rsplit_once('.') {
             if self.structs.contains_key(owner)
+                || self.interfaces.contains_key(owner)
                 || self.structs.keys().any(|concrete| {
                     concrete
                         .split_once('$')
@@ -2132,7 +2203,8 @@ impl<'a> Checker<'a> {
                 )
             })?;
             let owner = match dereferenced(&receiver_ty) {
-                Type::Named(n) => n.clone(),
+                // `dyn` receivers call `Interface.method`, dispatched at run time.
+                Type::Named(n) | Type::Dyn(n) => n.clone(),
                 _ => {
                     return Err(Diagnostic::new(
                         span,
@@ -2159,8 +2231,12 @@ impl<'a> Checker<'a> {
                 })?;
             let mut receiver = receiver.as_ref().clone();
             if let Type::Ref(mutable, _) = &first.ty {
-                if matches!(receiver_ty, Type::Ref(..)) {
+                // Reborrow through every reference layer, so `&&T` and
+                // elements of `[N]&dyn I` call their methods directly.
+                let mut layer = &receiver_ty;
+                while let Type::Ref(_, inner) = layer {
                     receiver = Expr::new(ExprKind::Unary(UnaryOp::Deref, Box::new(receiver)), span);
+                    layer = inner;
                 }
                 receiver = Expr::new(
                     ExprKind::Unary(
@@ -2676,6 +2752,46 @@ impl<'a> Checker<'a> {
                         ty: target.clone(),
                         deps: vec![],
                     }
+                } else if let (Type::Ref(mutable, actual), Type::Ref(wanted, object)) =
+                    (&value.ty, &*target)
+                    && let Type::Dyn(interface) = object.as_ref()
+                {
+                    if *wanted && !*mutable {
+                        return Err(Diagnostic::new(
+                            span,
+                            "shared reference cannot become a mutable `dyn` reference",
+                        ));
+                    }
+                    self.context.validate_dyn(interface, span)?;
+                    if let Type::Dyn(source) = actual.as_ref()
+                        && actual != object
+                        && !self.context.dyn_upcast(source, interface)
+                    {
+                        return Err(Diagnostic::new(
+                            span,
+                            format!("cannot convert `{}` to `{target}`", value.ty),
+                        ));
+                    }
+                    if !matches!(actual.as_ref(), Type::Dyn(_))
+                        && let Some(diagnostic) = self.context.implementation_diagnostic(
+                            actual,
+                            interface,
+                            &self.namespace,
+                            span,
+                        )
+                    {
+                        return Err(diagnostic);
+                    }
+                    let mut deps = value.deps;
+                    if !*wanted {
+                        for loan in &mut deps {
+                            loan.mutable = false;
+                        }
+                    }
+                    Value {
+                        ty: target.clone(),
+                        deps,
+                    }
                 } else if matches!(&value.ty, Type::Raw(..)) && matches!(target, Type::Ref(..)) {
                     self.unsafe_required(span, "raw pointer to checked-reference conversion")?;
                     return Err(Diagnostic::new(
@@ -2751,6 +2867,52 @@ impl<'a> Checker<'a> {
                     for loan in &mut result.deps {
                         loan.mutable = false;
                     }
+                }
+                // A reference to a concrete implementation becomes a `dyn`
+                // reference, keeping the original's loans. The cast node tells
+                // codegen which method table to attach.
+                (Type::Ref(mutable, actual), Type::Ref(wanted, target))
+                    if matches!(target.as_ref(), Type::Dyn(_))
+                        && !matches!(actual.as_ref(), Type::Ref(..))
+                        && actual != target
+                        && (*mutable || !*wanted) =>
+                {
+                    let Type::Dyn(interface) = target.as_ref() else {
+                        unreachable!()
+                    };
+                    self.context.validate_dyn(interface, span)?;
+                    if let Type::Dyn(source) = actual.as_ref() {
+                        if !self.context.dyn_upcast(source, interface) {
+                            return Err(Diagnostic::new(
+                                span,
+                                format!("cannot convert `{}` to `{expected}`", result.ty),
+                            )
+                            .note(format!(
+                                "a `dyn {source}` reference converts only to an interface whose methods begin its own, such as its first parent"
+                            )));
+                        }
+                    } else if let Some(diagnostic) = self.context.implementation_diagnostic(
+                        actual,
+                        interface,
+                        &self.namespace,
+                        span,
+                    ) {
+                        return Err(diagnostic.primary_label(format!(
+                            "`&{}{actual}` is converted to `{expected}` here",
+                            if *mutable { "mut " } else { "" }
+                        )));
+                    }
+                    if !*wanted {
+                        for loan in &mut result.deps {
+                            loan.mutable = false;
+                        }
+                    }
+                    expression.ty = result.ty.clone();
+                    let inner =
+                        std::mem::replace(expression, Expr::new(ExprKind::Bool(false), span));
+                    *expression =
+                        Expr::new(ExprKind::Cast(Box::new(inner), expected.clone()), span);
+                    result.ty = expected.clone();
                 }
                 _ => (),
             }
@@ -2938,7 +3100,7 @@ impl<'a> Checker<'a> {
                 }),
             ExprKind::MethodCall { receiver, name, .. } => {
                 let ty = self.peek_type(receiver)?;
-                if let Type::Named(owner) = dereferenced(&ty) {
+                if let Type::Named(owner) | Type::Dyn(owner) = dereferenced(&ty) {
                     self.context
                         .functions
                         .get(&format!("{owner}.{name}"))
@@ -5109,6 +5271,22 @@ fn constant_expression(expression: &Expr) -> bool {
     }
 }
 
+// A function's declaration line(s) without its body, for diagnostic labels.
+fn signature_span(function: &Function) -> Span {
+    let end = function
+        .from_span
+        .map_or(function.ret_span.end, |span| span.end)
+        .max(function.ret_span.end);
+    Span {
+        start: function.span.start,
+        end: if end > function.span.start {
+            end
+        } else {
+            function.span.end
+        },
+    }
+}
+
 // Public interfaces belong to source declarations. A specialization of a public
 // generic for a caller-private type does not publish that private type. Check
 // declarations before replacing their type parameters with concrete arguments.
@@ -5124,6 +5302,13 @@ fn validate_public_interfaces(program: &Program) -> Check<()> {
                 .iter()
                 .filter(|e| !e.public)
                 .map(|e| e.name.as_str()),
+        )
+        .chain(
+            program
+                .interfaces
+                .iter()
+                .filter(|i| !i.public)
+                .map(|i| i.name.as_str()),
         )
         .collect();
     fn visit(ty: &Type, span: Span, generic: &[String], private: &HashSet<&str>) -> Check<()> {
@@ -5152,11 +5337,52 @@ fn validate_public_interfaces(program: &Program) -> Check<()> {
                 visit(t, span, generic, private)?;
                 visit(e, span, generic, private)?;
             }
+            Type::Dyn(name) if private.contains(name.as_str()) => {
+                return Err(Diagnostic::new(
+                    span,
+                    format!("public API exposes private interface `{name}`"),
+                ));
+            }
             _ => (),
         }
         Ok(())
     }
+    let bounds = |bounds: &[Bound]| -> Check<()> {
+        for bound in bounds {
+            if let Some(name) = bound
+                .interfaces
+                .iter()
+                .find(|name| private.contains(name.as_str()))
+            {
+                return Err(Diagnostic::new(
+                    bound.span,
+                    format!("public API exposes private interface `{name}`"),
+                ));
+            }
+        }
+        Ok(())
+    };
+    for interface in program.interfaces.iter().filter(|i| i.public) {
+        if let Some(parent) = interface
+            .parents
+            .iter()
+            .find(|name| private.contains(name.as_str()))
+        {
+            return Err(Diagnostic::new(
+                interface.span,
+                format!("public interface extends private interface `{parent}`"),
+            ));
+        }
+        let allowed = ["Self".to_owned()];
+        for method in &interface.methods {
+            for parameter in &method.params {
+                visit(&parameter.ty, parameter.span, &allowed, &private)?;
+            }
+            visit(&method.ret, method.span, &allowed, &private)?;
+        }
+    }
     for structure in program.structs.iter().filter(|s| s.public) {
+        bounds(&structure.bounds)?;
         for field in structure.fields.iter().filter(|f| f.public) {
             visit(&field.ty, field.span, &structure.generics, &private)?;
         }
@@ -5170,6 +5396,7 @@ fn validate_public_interfaces(program: &Program) -> Check<()> {
         visit(&constant.ty, constant.span, &[], &private)?;
     }
     for function in program.functions.iter().filter(|f| f.public) {
+        bounds(&function.bounds)?;
         let mut allowed = function.generics.clone();
         if let Some((owner, _)) = function.name.rsplit_once('.')
             && program

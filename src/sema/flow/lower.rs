@@ -531,6 +531,7 @@ impl Lower<'_> {
         match &expression.kind {
             ExprKind::Int(_, suffix) => suffix.clone(),
             ExprKind::Bool(_) => Some(Type::Bool),
+            ExprKind::Cast(_, ty) => Some(ty.clone()),
             ExprKind::Name(_) => self
                 .place(expression, false)
                 .ok()
@@ -1363,6 +1364,18 @@ impl Lower<'_> {
             ExprKind::Int(number, suffix) => {
                 self.integer_literal(*number, suffix.as_ref(), expected, false, span)?
             }
+            ExprKind::Cast(value, ty) => {
+                if !ty.is_integer() {
+                    return unsupported(span, "only integer-to-integer casts are supported");
+                }
+                // The destination type does not provide context for the operand:
+                // unsuffixed literals retain their default, target-sized type.
+                let value = self.expr(value, None)?;
+                if !self.body.locals[value.0].ty.is_integer() {
+                    return unsupported(span, "only integer-to-integer casts are supported");
+                }
+                self.constant(ty.clone(), span)
+            }
             ExprKind::Name(name) if name == "none" => {
                 self.constructor(name, &[], expected, span)?
             }
@@ -1743,7 +1756,7 @@ impl Lower<'_> {
                 return limited(
                     LimitationKind::Expression,
                     span,
-                    "expression outside subset (unsupported operator, projection, aggregate, method, cast, or propagation)",
+                    "expression outside subset (unsupported operator, projection, aggregate, method, or propagation)",
                 );
             }
         };

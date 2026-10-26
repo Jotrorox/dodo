@@ -59,6 +59,44 @@ impl Drop for Scratch {
 const BLINK: &str = "package main\nimport \"std/embedded/board\"\nfn main() {\n b := board.take()!\n for {\n  b.led.toggle()\n  b.timer.delay_ms(500)\n }\n}\n";
 
 #[test]
+fn uart_ports_compile_for_both_chips() {
+    let scratch = Scratch::new("uart");
+    let source = scratch.write(
+        "uart.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/io"
+fn main() {
+    b := board.take()!
+    first := b.pins.uart(0, some(1u32), 115_200)!
+    second := b.pins.uart(4, some(5u32), 9600)!
+    first.set_poll_limit(1000)
+    second.set_read_poll_limit(1000)
+    data := [42u8; 3]
+    io.write_all(&mut first, &data)!
+    first.flush()!
+    io.read_exact(&mut second, &mut data)!
+    b.pins.release_uart(first)
+    b.pins.release_uart(second)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        let object = scratch.path(&format!("uart-{board}.o"));
+        stdout(&dodo(&[
+            "build",
+            source.to_str().unwrap(),
+            "--board",
+            board,
+            "--emit",
+            "obj",
+            "-o",
+            &object,
+        ]));
+    }
+}
+
+#[test]
 fn platforms_fill_settings_that_are_not_explicit() {
     let blink = root().join("examples/blink");
     let config = stdout(&dodo(&["build", blink.to_str().unwrap(), "--print-config"]));
