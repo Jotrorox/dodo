@@ -1,6 +1,6 @@
 //! Generic specialization before ordinary checking, including provisional type shapes.
 //! Every generated body still passes through the production checker.
-use super::{Check, dereferenced, match_subject, qualified_name};
+use super::{Check, Obligation, dereferenced, match_subject, qualified_name};
 use crate::ast::*;
 use crate::diagnostic::Diagnostic;
 use std::collections::{HashMap, HashSet};
@@ -16,7 +16,8 @@ const MAX_SPECIALIZATION_DEPTH: usize = 64;
 
 /// Explicit type arguments specialize generic declarations before type checking.
 /// Every emitted specialization goes through the same ordinary checker.
-pub(super) fn instantiate(program: &mut Program) -> Check<()> {
+/// Returns the interface bounds each specialization must satisfy.
+pub(super) fn instantiate(program: &mut Program) -> Check<Vec<Obligation>> {
     for function in &program.functions {
         if function.printing.is_some() && !function.imported {
             return Err(Diagnostic::new(
@@ -108,7 +109,17 @@ pub(super) fn instantiate(program: &mut Program) -> Check<()> {
         count: 0,
         depth: 0,
         printing_count: 0,
+        obligations: vec![],
+        required: HashSet::new(),
     };
+    for interface in &mut program.interfaces {
+        for method in &mut interface.methods {
+            for param in &mut method.params {
+                expander.ty(&mut param.ty, &HashMap::new(), param.span)?;
+            }
+            expander.ty(&mut method.ret, &HashMap::new(), method.span)?;
+        }
+    }
     program.structs.retain(|s| s.generics.is_empty());
     program.enums.retain(|e| e.generics.is_empty());
     program
@@ -140,7 +151,7 @@ pub(super) fn instantiate(program: &mut Program) -> Check<()> {
     program.structs.append(&mut expander.structs);
     program.enums.append(&mut expander.enums);
     program.functions.append(&mut expander.functions);
-    Ok(())
+    Ok(expander.obligations)
 }
 struct Expander {
     known_structs: HashMap<String, Struct>,
@@ -162,8 +173,45 @@ struct Expander {
     count: usize,
     depth: usize,
     printing_count: usize,
+    obligations: Vec<Obligation>,
+    required: HashSet<(String, String, String)>,
 }
 impl Expander {
+    // Record each specialization's bounds once per type, interface, and owner.
+    fn require_bounds(
+        &mut self,
+        owner: &str,
+        owner_is_type: bool,
+        parameters: &[String],
+        arguments: &[Type],
+        bounds: &[Bound],
+        span: Span,
+    ) {
+        for bound in bounds {
+            let Some(index) = parameters.iter().position(|p| *p == bound.param) else {
+                continue;
+            };
+            let Some(ty) = arguments.get(index) else {
+                continue;
+            };
+            for interface in &bound.interfaces {
+                if self
+                    .required
+                    .insert((ty.to_string(), interface.clone(), owner.to_owned()))
+                {
+                    self.obligations.push(Obligation {
+                        ty: ty.clone(),
+                        interface: interface.clone(),
+                        span,
+                        bound: bound.span,
+                        param: bound.param.clone(),
+                        owner: owner.to_owned(),
+                        owner_is_type,
+                    });
+                }
+            }
+        }
+    }
     fn begin_specialization(&mut self, span: Span) -> Check<()> {
         self.count += 1;
         if self.count > MAX_SPECIALIZATIONS {
@@ -243,9 +291,18 @@ impl Expander {
                     self.begin_specialization(span)?;
                     if let Some(mut structure) = self.struct_templates.get(name).cloned() {
                         let mapping = self.substitutions(&structure.generics, arguments, span)?;
+                        self.require_bounds(
+                            name,
+                            true,
+                            &structure.generics,
+                            arguments,
+                            &structure.bounds,
+                            span,
+                        );
                         let original_generics = structure.generics.clone();
                         structure.name = concrete.clone();
                         structure.generics.clear();
+                        structure.bounds.clear();
                         for field in &mut structure.fields {
                             self.ty(&mut field.ty, &mapping, field.span)?;
                         }
@@ -265,6 +322,7 @@ impl Expander {
                             let suffix = method.name.strip_prefix(name.as_str()).unwrap();
                             method.name = format!("{concrete}{suffix}");
                             method.generics.clear();
+                            method.bounds.clear();
                             method.generic_instance = true;
                             let mut mapping = mapping.clone();
                             mapping.insert(name.clone(), Type::Named(concrete.clone()));
@@ -277,8 +335,17 @@ impl Expander {
                         }
                     } else if let Some(mut enumeration) = self.enum_templates.get(name).cloned() {
                         let mapping = self.substitutions(&enumeration.generics, arguments, span)?;
+                        self.require_bounds(
+                            name,
+                            true,
+                            &enumeration.generics,
+                            arguments,
+                            &enumeration.bounds,
+                            span,
+                        );
                         enumeration.name = concrete.clone();
                         enumeration.generics.clear();
+                        enumeration.bounds.clear();
                         for variant in &mut enumeration.variants {
                             for field in &mut variant.fields {
                                 self.ty(&mut field.ty, &mapping, field.span)?;
@@ -1100,6 +1167,14 @@ impl Expander {
                         ));
                     }
                     let mapping = self.substitutions(&template.generics, type_args, span)?;
+                    self.require_bounds(
+                        &target,
+                        false,
+                        &template.generics,
+                        type_args,
+                        &template.bounds,
+                        span,
+                    );
                     let concrete = if template.generics.is_empty() {
                         target
                     } else {
@@ -1109,6 +1184,7 @@ impl Expander {
                             let mut function = template;
                             function.name = concrete.clone();
                             function.generics.clear();
+                            function.bounds.clear();
                             function.generic_instance = true;
                             self.function(&mut function, &mapping)?;
                             self.functions.push(function);
@@ -1160,12 +1236,21 @@ impl Expander {
                     let mut ret = Self::substitute(&template.ret, &mapping);
                     if !parameters.is_empty() {
                         let arguments = self.inferred_arguments(parameters, &mapping, span)?;
+                        self.require_bounds(
+                            name,
+                            false,
+                            parameters,
+                            &arguments,
+                            &template.bounds,
+                            span,
+                        );
                         let concrete = specialized(name, &arguments);
                         if self.generated_functions.insert(concrete.clone()) {
                             self.begin_specialization(span)?;
                             let mut function = template;
                             function.name = concrete.clone();
                             function.generics.clear();
+                            function.bounds.clear();
                             function.generic_instance = true;
                             self.function(&mut function, &mapping)?;
                             self.functions.push(function);

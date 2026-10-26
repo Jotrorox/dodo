@@ -138,6 +138,26 @@ impl Index {
                 );
             }
         }
+        for interface in &original.interfaces {
+            index.global(
+                &interface.name,
+                interface.span,
+                8,
+                Type::Dyn(interface.name.clone()),
+                interface.public,
+                None,
+            );
+            for method in &interface.methods {
+                index.global(
+                    &format!("{}.{}", interface.name, method.name),
+                    method.span,
+                    3,
+                    method.ret.clone(),
+                    interface.public,
+                    Some(method),
+                );
+            }
+        }
         for constant in &original.constants {
             index.global(
                 &constant.name,
@@ -184,6 +204,9 @@ impl Index {
             }
         }
         for function in &original.functions {
+            for bound in &function.bounds {
+                index.type_roles(bound.span);
+            }
             for parameter in &function.params {
                 index.type_roles(parameter.span);
             }
@@ -195,6 +218,33 @@ impl Index {
         for structure in &original.structs {
             for field in &structure.fields {
                 index.type_roles(field.span);
+            }
+            for bound in &structure.bounds {
+                index.type_roles(bound.span);
+            }
+            for (_, span) in &structure.implements {
+                index.type_roles(*span);
+            }
+        }
+        for interface in &original.interfaces {
+            // The header names parent interfaces.
+            index.type_roles(Span {
+                start: interface.span.start,
+                end: interface
+                    .methods
+                    .first()
+                    .map_or(interface.span.end, |method| method.span.start),
+            });
+            for method in &interface.methods {
+                for parameter in &method.params {
+                    index.type_roles(parameter.span);
+                }
+                index.type_roles(method.ret_span);
+            }
+        }
+        for enumeration in &original.enums {
+            for bound in &enumeration.bounds {
+                index.type_roles(bound.span);
             }
         }
         for constant in &original.constants {
@@ -632,6 +682,7 @@ impl Index {
     fn member_type(ty: &Type) -> Option<String> {
         match ty {
             Type::Named(n) | Type::Generic(n, _) => Some(n.split(['<', '$']).next()?.into()),
+            Type::Dyn(n) => Some(n.clone()),
             Type::Ref(_, t) | Type::Raw(_, t) => Self::member_type(t),
             _ => None,
         }
@@ -905,9 +956,38 @@ impl Index {
         }
         if !member {
             let mut words: BTreeSet<String> = [
-                "fn", "return", "if", "else", "for", "match", "let", "mut", "const", "struct",
-                "enum", "import", "pub", "unsafe", "true", "false", "void", "bool", "i8", "i16",
-                "i32", "i64", "u8", "u16", "u32", "u64", "usize", "isize", "f32", "f64",
+                "fn",
+                "return",
+                "if",
+                "else",
+                "for",
+                "match",
+                "let",
+                "mut",
+                "const",
+                "struct",
+                "enum",
+                "interface",
+                "dyn",
+                "import",
+                "pub",
+                "unsafe",
+                "true",
+                "false",
+                "void",
+                "bool",
+                "i8",
+                "i16",
+                "i32",
+                "i64",
+                "u8",
+                "u16",
+                "u32",
+                "u64",
+                "usize",
+                "isize",
+                "f32",
+                "f64",
             ]
             .into_iter()
             .map(str::to_owned)

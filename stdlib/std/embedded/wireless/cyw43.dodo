@@ -115,9 +115,9 @@ pub fn swap16(word: u32) -> u32 {
 // gSPI bit-banged on three pins: `select` (active low), `clock` (idles low),
 // and `data`, which the host drives while sending and releases while the chip
 // replies. `data` needs set_as_output and set_as_input besides the output and
-// input pin protocols. The chip samples on the rising clock edge; replies are
+// input pin interfaces. The chip samples on the rising clock edge; replies are
 // read just before it.
-pub struct Spi<S, C, D> {
+pub struct Spi<S: hal.OutputPin, C: hal.OutputPin, D: hal.OutputPin + hal.InputPin> {
     select: S
     clock: C
     data: D
@@ -203,7 +203,7 @@ pub struct Spi<S, C, D> {
 }
 
 // A CYW43439 on gSPI bus `bus`, powered through `power` (high is on).
-pub struct Device<B, P> {
+pub struct Device<B, P: hal.OutputPin> {
     bus: B
     power: P
     // Base of the backplane window the chip currently has selected.
@@ -220,7 +220,7 @@ pub struct Device<B, P> {
     // Power-cycle the chip and bring up its bus and backplane clock. Takes
     // about 270 ms. Returns Timeout if the chip does not answer, Bus if the
     // bus test patterns read back wrong, and Unsupported for another chip.
-    pub fn init<D>(&mut self, delay: &mut D) -> void!hal.Error {
+    pub fn init<D: hal.Delay>(&mut self, delay: &mut D) -> void!hal.Error {
         self.window = NO_WINDOW
         self.outputs = 0
         self.levels = 0

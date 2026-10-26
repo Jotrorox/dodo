@@ -4,7 +4,7 @@ import "std/embedded/hal"
 import "std/io"
 
 // Arm PrimeCell PL011 UART, shared by chips including RP2040 and RP2350.
-// Controller works over the hal register block protocol, including models in
+// Controller works over any hal.Registers, including models in
 // host tests. Chip packages reset the UART, route TX/RX, and supply clk_peri.
 // The format is 8 data bits, no parity, one stop bit, with FIFOs enabled and
 // no flow control, interrupts, DMA, allocation, or newline translation.
@@ -59,7 +59,7 @@ pub fn divisors(clock_hz: u32, baud_hz: u32) -> Divisors!hal.Error {
     })
 }
 
-pub struct Controller<R> {
+pub struct Controller<R: hal.Registers>: io.ReadWriter {
     registers: R
     divisors: Divisors
     poll_limit: u32
@@ -163,7 +163,7 @@ pub struct Controller<R> {
 
 // An owned hardware UART. Keep the register block private: only the driver
 // may use its unchecked register offsets.
-pub struct Port {
+pub struct Port: io.ReadWriter {
     controller: Controller<hal.RegisterBlock>
 
     // SAFETY: as for hal.RegisterBlock.at, with base a PL011 fresh out of

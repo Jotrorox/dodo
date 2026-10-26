@@ -4,9 +4,10 @@ import "core/bytes"
 import "core/num"
 import "core/mem"
 
-// Structural, statically dispatched contracts (no traits or runtime vtable):
-// Reader: read(&mut self, &mut[u8]) -> usize!Error.
-// Writer: write(&mut self, &[u8]) -> usize!Error.
+// Byte streams implement the Reader and Writer interfaces below. Any type with
+// matching methods does; helpers take them as bounded generic parameters
+// (statically dispatched) and `&mut dyn Reader` / `&mut dyn Writer` values
+// work wherever the concrete stream type should not be part of a signature.
 // Counts, including Error.transferred, refer to this call's slice prefix.
 // A nonempty successful read of zero bytes means EOF. A successful write of
 // zero bytes is converted to WriteZero by completion helpers. An empty request
@@ -83,6 +84,20 @@ pub struct Error {
         return ok()
     }
 }
+
+// A source of bytes: fills a prefix of `destination` and returns its length.
+pub interface Reader {
+    fn read(&mut self, destination: &mut[u8]) -> usize!Error
+}
+
+// A sink of bytes: consumes a prefix of `source` and returns its length.
+pub interface Writer {
+    fn write(&mut self, source: &[u8]) -> usize!Error
+}
+
+// A two-way stream such as a socket or serial port. `&mut dyn ReadWriter`
+// converts to `&mut dyn Reader`, its first parent.
+pub interface ReadWriter: Reader + Writer {}
 
 pub fn failure(kind: ErrorKind, transferred: usize) -> Error {
     return Error { kind: kind, transferred: transferred, code: 0 }
@@ -212,7 +227,7 @@ pub struct Cursor {
 
 // Validate an adapter's returned progress before using it as a slice offset.
 // Empty operations never invoke the adapter, even if it is currently failing.
-pub fn read_once<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
+pub fn read_once<R: Reader>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
     if destination.len == 0 {
         return ok(0)
     }
@@ -232,7 +247,7 @@ pub fn read_once<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
     }
 }
 
-pub fn write_once<W>(writer: &mut W, source: &[u8]) -> usize!Error {
+pub fn write_once<W: Writer>(writer: &mut W, source: &[u8]) -> usize!Error {
     if source.len == 0 {
         return ok(0)
     }
@@ -257,7 +272,7 @@ pub fn write_once<W>(writer: &mut W, source: &[u8]) -> usize!Error {
 
 // Fill until the slice is full or EOF is reached. EOF is successful here.
 // Failure reports the total initialized prefix, not merely the final call.
-pub fn read_up_to<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
+pub fn read_up_to<R: Reader>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
     total := 0usize
     for total < destination.len {
         match read_once(reader, &mut destination[total..]) {
@@ -279,7 +294,7 @@ pub fn read_up_to<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
     return ok(total)
 }
 
-pub fn read_exact<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
+pub fn read_exact<R: Reader>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
     count := read_up_to(reader, destination)?
     if count != destination.len {
         return err(failure(ErrorKind.UnexpectedEof, count))
@@ -289,7 +304,7 @@ pub fn read_exact<R>(reader: &mut R, destination: &mut[u8]) -> usize!Error {
 
 // Completion is blocking: Interrupted retries, including after partial progress.
 // A persistent interruption can therefore block indefinitely, like the device.
-pub fn write_all<W>(writer: &mut W, source: &[u8]) -> usize!Error {
+pub fn write_all<W: Writer>(writer: &mut W, source: &[u8]) -> usize!Error {
     total := 0usize
     for total < source.len {
         match write_once(writer, &source[total..]) {
@@ -310,7 +325,7 @@ pub fn write_all<W>(writer: &mut W, source: &[u8]) -> usize!Error {
 
 // A bounded reader consumes at most limit bytes, counting error progress too.
 // The limit is a synthetic EOF; its exhausted state never touches the reader.
-pub struct LimitReader<R> {
+pub struct LimitReader<R: Reader> {
     reader: &mut R
     left: usize
 
@@ -337,7 +352,7 @@ pub struct LimitReader<R> {
 
 // Discard exactly count bytes using caller storage. EOF before count is an
 // error. The scratch buffer may be empty only when count is zero.
-pub fn skip<R>(reader: &mut R, count: usize, scratch: &mut[u8]) -> usize!Error {
+pub fn skip<R: Reader>(reader: &mut R, count: usize, scratch: &mut[u8]) -> usize!Error {
     if count != 0 && scratch.len == 0 {
         return err(failure(ErrorKind.InvalidInput, 0))
     }
@@ -373,7 +388,7 @@ pub struct CopyError {
 // failure, read - written bytes were consumed but not delivered. A read error
 // with progress first attempts to deliver that prefix, then returns the error.
 // If that write also fails, its error takes precedence; both counts survive.
-pub fn copy<R, W>(reader: &mut R, writer: &mut W, scratch: &mut[u8], limit: usize) -> CopyReport!CopyError {
+pub fn copy<R: Reader, W: Writer>(reader: &mut R, writer: &mut W, scratch: &mut[u8], limit: usize) -> CopyReport!CopyError {
     read := 0usize
     written := 0usize
     if limit != 0 && scratch.len == 0 {
@@ -417,7 +432,7 @@ pub fn copy<R, W>(reader: &mut R, writer: &mut W, scratch: &mut[u8], limit: usiz
 
 // Caller-backed buffering. The reader owns no allocation and holds exclusive
 // borrows of both device and buffer. No read-ahead is discarded by read().
-pub struct BufferedReader<R> {
+pub struct BufferedReader<R: Reader> {
     reader: &mut R
     storage: &mut[u8]
     start: usize
@@ -469,7 +484,7 @@ pub struct BufferedReader<R> {
 // Accepted bytes belong to this adapter until flush succeeds. Dropping it does
 // not perform I/O: pending bytes are discarded. Call flush and handle its Result
 // before releasing the device. Failed flush preserves the unwritten suffix.
-pub struct BufferedWriter<W> {
+pub struct BufferedWriter<W: Writer> {
     writer: &mut W
     storage: &mut[u8]
     used: usize
@@ -605,7 +620,7 @@ pub struct ReadReport {
     pub read: usize
     pub eof: bool
 }
-pub fn read_bounded<R>(reader: &mut R, destination: &mut[u8]) -> ReadReport!Error {
+pub fn read_bounded<R: Reader>(reader: &mut R, destination: &mut[u8]) -> ReadReport!Error {
     used := 0usize
     for used < destination.len {
         match read_once(reader, &mut destination[used..]) {
@@ -659,7 +674,7 @@ pub struct Line {
 // Empty storage returns Full without reading. Eof with count=0 is end of input;
 // Eof with count>0 is a final unterminated line. Errors retain the initialized
 // prefix in transferred, even if its last byte is LF. Only Interrupted retries.
-pub fn read_line<R>(reader: &mut R, destination: &mut[u8]) -> Line!Error {
+pub fn read_line<R: Reader>(reader: &mut R, destination: &mut[u8]) -> Line!Error {
     used := 0usize
     for used < destination.len {
         count := 0usize

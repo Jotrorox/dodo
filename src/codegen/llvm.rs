@@ -1118,6 +1118,37 @@ impl<'ctx> Builder<'ctx> {
             PhantomData,
         ))
     }
+    /// Call through a function pointer of type `ty`.
+    pub(super) fn build_indirect_call(
+        &self,
+        ty: LlvmType<'ctx>,
+        function: Value<'ctx>,
+        args: &[Value<'ctx>],
+        name: &str,
+    ) -> Result<Value<'ctx>> {
+        self.positioned()?;
+        let mut args: Vec<_> = args.iter().map(|v| v.0).collect();
+        let name = if unsafe { LLVMGetTypeKind(LLVMGetReturnType(ty.0)) }
+            == LLVMTypeKind::LLVMVoidTypeKind
+        {
+            ""
+        } else {
+            name
+        };
+        Ok(Value(
+            unsafe {
+                LLVMBuildCall2(
+                    self.0,
+                    ty.0,
+                    function.0,
+                    args.as_mut_ptr(),
+                    args.len() as u32,
+                    cstring(name).as_ptr(),
+                )
+            },
+            PhantomData,
+        ))
+    }
     pub(super) fn build_global_string_ptr(&self, text: &str, name: &str) -> Result<Value<'ctx>> {
         self.positioned()?;
         let text =

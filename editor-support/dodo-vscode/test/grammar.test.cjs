@@ -35,6 +35,9 @@ function hasScope(line, text, scope) {
 test("declarations, borrowing, attributes, and generic calls", () => {
   hasScope("package hello", "hello", "entity.name.namespace.dodo");
   hasScope("pub struct Reading {", "Reading", "entity.name.type.dodo");
+  hasScope("pub interface Sensor: Named {", "Sensor", "entity.name.type.dodo");
+  hasScope("pub interface Sensor: Named {", "interface", "storage.type.dodo");
+  hasScope("fn poll(sensor: &mut dyn Sensor) {", "dyn", "storage.modifier.dodo");
   hasScope("pub fn view(&self) -> &i32 from(self) {", "view", "entity.name.function.dodo");
   hasScope("pub fn view(&self) -> &i32 from(self) {", "self", "variable.language.dodo");
   hasScope("pub fn view(&self) -> &i32 from(self) {", "from", "keyword.other.dodo");

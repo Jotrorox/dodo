@@ -86,6 +86,12 @@ impl std::fmt::Display for CodegenError {
 }
 impl std::error::Error for CodegenError {}
 type Result<T> = std::result::Result<T, CodegenError>;
+// Interface method signatures name `Self` only in the receiver, which slots
+// always take as an address.
+fn mentions_dyn_self(ty: &Type) -> bool {
+    matches!(ty, Type::Named(name) if name == "Self")
+}
+
 fn error(s: impl std::fmt::Display) -> CodegenError {
     CodegenError(s.to_string())
 }
@@ -168,6 +174,8 @@ pub fn generate<'ctx>(
         panic: options.panic.clone(),
         test_sources: &options.test_sources,
         testing: !options.test_functions.is_empty(),
+        interfaces: crate::sema::flattened_interfaces(program).map_err(|e| error(e.message))?,
+        vtables: HashMap::new(),
     };
     cg.declare_types()?;
     cg.declare_functions()?;
@@ -271,6 +279,9 @@ struct Codegen<'a, 'ctx> {
     panic: PanicStrategy,
     test_sources: &'a [crate::package::Source],
     testing: bool,
+    // Interface methods in vtable order, and the tables built so far.
+    interfaces: HashMap<String, Vec<Function>>,
+    vtables: HashMap<(String, String), Value<'ctx>>,
 }
 impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn ty(&self, t: &Type) -> Result<LlvmType<'ctx>> {
@@ -284,6 +295,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 .unwrap(),
             Type::Float(32) => self.context.f32_type(),
             Type::Float(64) => self.context.f64_type(),
+            // A `dyn` reference pairs the value's address with its method table.
+            Type::Ref(_, t) if matches!(t.as_ref(), Type::Dyn(_)) => self
+                .context
+                .struct_type(&[self.context.ptr_type(0), self.context.ptr_type(0)], false),
             Type::Ref(..) | Type::Raw(..) => self.context.ptr_type(0),
             Type::Slice(..) | Type::Str => self
                 .context
@@ -1578,6 +1593,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 }
             }
             ExprKind::Unary(op, x) => match op {
+                // `&*r` and `&mut *r` reborrow a `dyn` reference: the same
+                // address and method table.
+                UnaryOp::Borrow | UnaryOp::BorrowMut if matches!(&e.ty, Type::Ref(_, t) if matches!(t.as_ref(), Type::Dyn(_))) =>
+                {
+                    let ExprKind::Unary(UnaryOp::Deref, reference) = &x.kind else {
+                        return Err(error("a `dyn` value can only be reborrowed"));
+                    };
+                    self.expr(reference)?
+                }
                 UnaryOp::Borrow | UnaryOp::BorrowMut => {
                     let ptr = self.place(x)?;
                     if let Type::Slice(_, _) = &e.ty {
@@ -1665,6 +1689,23 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             ExprKind::Index(..) => {
                 let p = self.place(e)?;
                 self.load(p, &e.ty)?
+            }
+            ExprKind::Cast(x, t)
+                if let Type::Ref(_, object) = t
+                    && let Type::Dyn(interface) = object.as_ref() =>
+            {
+                let v = self.expr(x)?;
+                match &x.ty {
+                    Type::Ref(_, inner) if matches!(inner.as_ref(), Type::Dyn(_)) => v,
+                    Type::Ref(_, inner) => {
+                        let table = self.vtable(inner, interface)?;
+                        let fat = self.ty(t)?.get_undef();
+                        let fat = self.builder.build_insert_value(fat, v, 0, "dyn.data")?;
+                        self.builder
+                            .build_insert_value(fat, table, 1, "dyn.table")?
+                    }
+                    other => return Err(error(format!("cannot convert `{other}` to `{t}`"))),
+                }
             }
             ExprKind::Cast(x, t) => {
                 let v = self.expr(x)?;
@@ -2963,6 +3004,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.transfer(&pending)?;
             return Ok(v);
         }
+        if let Some((interface, method)) = name.rsplit_once('.')
+            && self.interfaces.contains_key(interface)
+        {
+            return self.dynamic_call(interface, method, args, ret);
+        }
         let f = self
             .functions
             .get(name)
@@ -3013,6 +3059,201 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             self.load(storage, ret)
         } else {
             Ok(call.basic().unwrap_or(unit))
+        }
+    }
+    /// Slot calling convention of an interface method: large values pass
+    /// through memory exactly as for internal functions, and the receiver is
+    /// the value's address.
+    fn dispatch_convention(&self, method: &Function) -> Result<(bool, Vec<bool>)> {
+        let large = |ty: &Type| -> Result<bool> {
+            Ok(*ty != Type::Void
+                && !mentions_dyn_self(ty)
+                && self.data.get_abi_size(&self.ty(ty)?) > 1024)
+        };
+        let params = method
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, p)| if index == 0 { Ok(false) } else { large(&p.ty) })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((large(&method.ret)?, params))
+    }
+    fn dispatch_type(&self, method: &Function) -> Result<LlvmType<'ctx>> {
+        let (indirect_return, indirect_params) = self.dispatch_convention(method)?;
+        let pointer = self.context.ptr_type(0);
+        let mut params = Vec::new();
+        if indirect_return {
+            params.push(pointer);
+        }
+        for (index, (p, indirect)) in method.params.iter().zip(&indirect_params).enumerate() {
+            params.push(if index == 0 || *indirect {
+                pointer
+            } else {
+                self.ty(&p.ty)?
+            });
+        }
+        Ok(if method.ret == Type::Void || indirect_return {
+            self.context.void_type().fn_type(&params, false)
+        } else {
+            self.ty(&method.ret)?.fn_type(&params, false)
+        })
+    }
+    /// The method table of `ty` for `interface`: one function per interface
+    /// method, in declaration order with parents first.
+    fn vtable(&mut self, ty: &Type, interface: &str) -> Result<Value<'ctx>> {
+        let key = (ty.to_string(), interface.to_owned());
+        if let Some(table) = self.vtables.get(&key) {
+            return Ok(*table);
+        }
+        let Type::Named(owner) = ty else {
+            return Err(error(format!(
+                "`{ty}` has no methods for `dyn {interface}`"
+            )));
+        };
+        let methods = self.interfaces[interface].clone();
+        let mut slots = Vec::new();
+        for method in &methods {
+            let name = format!("{owner}.{}", method.name);
+            let function = self
+                .functions
+                .get(&name)
+                .copied()
+                .ok_or_else(|| error(format!("missing method {name} for dyn {interface}")))?;
+            let wanted = self.dispatch_convention(method)?;
+            slots.push(if self.indirect[&name] == wanted {
+                function
+            } else {
+                self.dispatch_thunk(&name, method, function, wanted)?
+            });
+        }
+        let pointer = self.context.ptr_type(0);
+        let table_type = pointer.array_type(slots.len() as u32);
+        let table = self.module.add_global(
+            table_type,
+            None,
+            &format!("dodo.{}.vtable.{owner}.{interface}", self.program.package),
+        );
+        table.set_initializer(&pointer.const_array(&slots));
+        table.set_constant(true);
+        table.set_unnamed_addr(true);
+        table.set_linkage(LLVMInternalLinkage);
+        self.vtables.insert(key, table);
+        Ok(table)
+    }
+    /// Adapt a method whose parameters pass differently from its slot.
+    fn dispatch_thunk(
+        &self,
+        name: &str,
+        method: &Function,
+        target: Value<'ctx>,
+        (slot_return, slot_params): (bool, Vec<bool>),
+    ) -> Result<Value<'ctx>> {
+        let thunk = self.module.add_function(
+            &format!("dodo.{}.dispatch.{name}", self.program.package),
+            self.dispatch_type(method)?,
+            Some(LLVMInternalLinkage),
+        );
+        let builder = self.context.create_builder();
+        builder.position_at_end(self.context.append_basic_block(thunk, "entry"));
+        let (target_return, target_params) = self.indirect[name].clone();
+        let mut incoming = thunk.get_param_iter();
+        let slot_storage = if slot_return { incoming.next() } else { None };
+        let target_storage = if target_return {
+            Some(builder.build_alloca(self.ty(&method.ret)?, "result")?)
+        } else {
+            None
+        };
+        let mut args: Vec<Value<'ctx>> = target_storage.into_iter().collect();
+        for (index, (value, param)) in incoming.zip(&method.params).enumerate() {
+            let slot_indirect = slot_params[index];
+            let target_indirect = target_params[index];
+            args.push(match (slot_indirect, target_indirect) {
+                (true, false) => builder.build_load(self.ty(&param.ty)?, value, "argument")?,
+                (false, true) => {
+                    let storage = builder.build_alloca(self.ty(&param.ty)?, "argument")?;
+                    builder.build_store(storage, value)?;
+                    storage
+                }
+                _ => value,
+            });
+        }
+        let call = builder.build_call(target, &args, "result")?;
+        if method.ret == Type::Void {
+            builder.build_return(None)?;
+        } else {
+            let result = match target_storage {
+                Some(storage) => builder.build_load(self.ty(&method.ret)?, storage, "result")?,
+                None => call,
+            };
+            match slot_storage {
+                Some(storage) => {
+                    builder.build_store(storage, result)?;
+                    builder.build_return(None)?;
+                }
+                None => {
+                    builder.build_return(Some(&result))?;
+                }
+            }
+        }
+        Ok(thunk)
+    }
+    fn dynamic_call(
+        &mut self,
+        interface: &str,
+        method: &str,
+        args: &[Expr],
+        ret: &Type,
+    ) -> Result<Value<'ctx>> {
+        let methods = &self.interfaces[interface];
+        let slot = methods
+            .iter()
+            .position(|m| m.name == method)
+            .ok_or_else(|| error(format!("unknown interface method {interface}.{method}")))?;
+        let declaration = methods[slot].clone();
+        let (indirect_return, indirect_params) = self.dispatch_convention(&declaration)?;
+        let storage = if indirect_return {
+            Some(self.alloca(self.ty(ret)?, "call.result")?)
+        } else {
+            None
+        };
+        let mut pending = Vec::new();
+        let mut values: Vec<Value<'ctx>> = storage.into_iter().collect();
+        let mut table = None;
+        for (index, (e, indirect)) in args.iter().zip(&indirect_params).enumerate() {
+            let value = self.stage(e, &mut pending)?;
+            if index == 0 {
+                values.push(self.builder.build_extract_value(value, 0, "dyn.data")?);
+                table = Some(self.builder.build_extract_value(value, 1, "dyn.table")?);
+            } else if *indirect {
+                let argument = self.alloca(self.ty(&e.ty)?, "call.argument")?;
+                self.store_value(argument, value)?;
+                values.push(argument);
+            } else {
+                values.push(value);
+            }
+        }
+        self.transfer(&pending)?;
+        let table = table.ok_or_else(|| error("dynamic call without a receiver"))?;
+        let pointer = self.context.ptr_type(0);
+        let entry = unsafe {
+            self.builder.build_gep(
+                pointer,
+                table,
+                &[self.usize_type().const_int(slot as u64, false)],
+                "dyn.slot",
+            )?
+        };
+        let function = self.builder.build_load(pointer, entry, "dyn.method")?;
+        let call = self.builder.build_indirect_call(
+            self.dispatch_type(&declaration)?,
+            function,
+            &values,
+            "call",
+        )?;
+        if let Some(storage) = storage {
+            self.load(storage, ret)
+        } else {
+            Ok(call.basic().unwrap_or(self.context.i8_type().const_zero()))
         }
     }
     fn foreach(
