@@ -35,7 +35,7 @@ function search() {
   selectResult(-1);
   if (!index) return;
   if (!query) {
-    status.textContent = 'Type to search all documentation.';
+    status.textContent = 'Search every guide, reference page, and API declaration.';
     return;
   }
   const terms = query.split(/\s+/);
@@ -157,24 +157,59 @@ document.addEventListener('keydown', (event) => {
   }
 });
 
-document.querySelector('.theme-toggle')?.addEventListener('click', () => {
-  const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-  document.documentElement.dataset.theme = theme;
-  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#1a1a1a' : '#f6f6f6');
-  try { localStorage.setItem('dodo-theme', theme); } catch { /* Theme still works without storage. */ }
+// Appearance follows the system unless someone picks light or dark explicitly.
+type ThemeMode = 'system' | 'light' | 'dark';
+const themeLabels: Record<ThemeMode, string> = { system: 'match system', light: 'light', dark: 'dark' };
+const themeToggle = document.querySelector<HTMLButtonElement>('[data-theme-toggle]')!;
+const themeColors = document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]');
+function applyTheme(mode: ThemeMode) {
+  const root = document.documentElement;
+  root.dataset.themeMode = mode;
+  if (mode === 'system') delete root.dataset.theme; else root.dataset.theme = mode;
+  const color = mode === 'system' ? null : mode === 'dark' ? '#161618' : '#ffffff';
+  themeColors.forEach((meta) => meta.setAttribute('content', color ?? (meta.media.includes('dark') ? '#161618' : '#ffffff')));
+  const label = `Appearance: ${themeLabels[mode]}`;
+  themeToggle.setAttribute('aria-label', label);
+  themeToggle.title = label;
+}
+applyTheme((document.documentElement.dataset.theme as ThemeMode | undefined) ?? 'system');
+themeToggle.addEventListener('click', () => {
+  const order: ThemeMode[] = ['system', 'light', 'dark'];
+  const mode = order[(order.indexOf(document.documentElement.dataset.themeMode as ThemeMode) + 1) % order.length];
+  applyTheme(mode);
+  try {
+    if (mode === 'system') localStorage.removeItem('dodo-theme'); else localStorage.setItem('dodo-theme', mode);
+  } catch { /* The choice still applies to this page without storage. */ }
 });
 
-const navigation = document.querySelector<HTMLDetailsElement>('.navigation')!;
-const mobile = matchMedia('(max-width: 760px)');
-const updateNavigation = () => { navigation.open = !mobile.matches; };
-updateNavigation();
-mobile.addEventListener('change', updateNavigation);
+// At compact widths the sidebar is a sheet over the page.
+const sidebar = document.querySelector<HTMLElement>('#sidebar')!;
+const scrim = document.querySelector<HTMLElement>('.sidebar-scrim')!;
+const menuToggle = document.querySelector<HTMLButtonElement>('[data-menu-toggle]')!;
+const compact = matchMedia('(max-width: 820px)');
+function setNavigation(open: boolean, restoreFocus = true) {
+  document.body.classList.toggle('nav-open', open);
+  scrim.hidden = !open;
+  menuToggle.setAttribute('aria-expanded', String(open));
+  menuToggle.setAttribute('aria-label', open ? 'Hide navigation' : 'Show navigation');
+  document.querySelectorAll<HTMLElement>('main, .toc').forEach((region) => { region.inert = open; });
+  if (open) {
+    (sidebar.querySelector<HTMLElement>('[aria-current="page"]') ?? sidebar.querySelector<HTMLElement>('a, summary'))?.focus();
+  } else if (restoreFocus && sidebar.contains(document.activeElement)) {
+    menuToggle.focus();
+  }
+}
+menuToggle.addEventListener('click', () => setNavigation(!document.body.classList.contains('nav-open')));
+scrim.addEventListener('click', () => setNavigation(false));
+compact.addEventListener('change', () => setNavigation(false, false));
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && document.body.classList.contains('nav-open')) setNavigation(false);
+});
 
-// Keep the current package visible even when the API directory is long. Scroll
+// Keep the current page visible even when the API directory is long. Scroll
 // only the sidebar, preserving the document's heading anchor and reading position.
-const currentPage = navigation.querySelector<HTMLElement>('[aria-current="page"]');
-const sidebar = document.querySelector<HTMLElement>('.sidebar');
-if (!mobile.matches && currentPage && sidebar) {
+const currentPage = sidebar.querySelector<HTMLElement>('[aria-current="page"]');
+if (!compact.matches && currentPage) {
   const item = currentPage.getBoundingClientRect();
   const panel = sidebar.getBoundingClientRect();
   if (item.top < panel.top || item.bottom > panel.bottom) {
@@ -182,7 +217,53 @@ if (!mobile.matches && currentPage && sidebar) {
   }
 }
 
-const tocLinks = [...document.querySelectorAll<HTMLAnchorElement>('.toc a[href^="#"]')];
+// Code blocks get a language label and a copy control.
+const languageNames: Record<string, string> = {
+  dodo: 'Dodo', sh: 'Shell', powershell: 'PowerShell', toml: 'TOML', json: 'JSON',
+  yaml: 'YAML', python: 'Python', rust: 'Dodo', text: 'Text', ebnf: 'EBNF',
+};
+document.querySelectorAll<HTMLPreElement>('.prose pre').forEach((pre) => {
+  const block = document.createElement('div');
+  block.className = 'code-block';
+  const toolbar = document.createElement('div');
+  toolbar.className = 'code-toolbar';
+  const language = document.createElement('span');
+  language.className = 'code-language';
+  const name = pre.dataset.language ?? 'text';
+  language.textContent = languageNames[name] ?? name;
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'copy-button';
+  copy.textContent = 'Copy';
+  copy.setAttribute('aria-label', `Copy ${language.textContent} code`);
+  let reset: number | undefined;
+  copy.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(pre.innerText.replace(/\n$/, ''));
+      copy.textContent = 'Copied';
+      copy.dataset.copied = '';
+    } catch {
+      copy.textContent = 'Copy failed';
+    }
+    window.clearTimeout(reset);
+    reset = window.setTimeout(() => { copy.textContent = 'Copy'; delete copy.dataset.copied; }, 2000);
+  });
+  toolbar.append(language, copy);
+  pre.replaceWith(block);
+  block.append(toolbar, pre);
+});
+
+// Headings link to themselves.
+document.querySelectorAll<HTMLHeadingElement>('.prose :is(h2, h3, h4)[id]').forEach((heading) => {
+  const anchor = document.createElement('a');
+  anchor.className = 'heading-anchor';
+  anchor.href = `#${heading.id}`;
+  anchor.textContent = '#';
+  anchor.setAttribute('aria-label', `Link to “${heading.textContent}”`);
+  heading.prepend(anchor);
+});
+
+const tocLinks = [...document.querySelectorAll<HTMLAnchorElement>('.toc a[href^="#"]:not(.back-to-top)')];
 const headingLinks = new Map(tocLinks.map((link) => [decodeURIComponent(link.hash.slice(1)), link]));
 const observer = new IntersectionObserver((entries) => {
   const visible = entries.filter((entry) => entry.isIntersecting);

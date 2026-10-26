@@ -1,0 +1,57 @@
+---
+import { Code } from 'astro:components';
+import type { CollectionEntry } from 'astro:content';
+import { docSections, pageUrl, sectionSummaries } from '../lib/docs';
+
+interface Props { pages: CollectionEntry<'docs'>[] }
+
+const { pages } = Astro.props;
+const program = `package main
+
+import "std/console"
+
+fn main() {
+    console.println("Hello, world!")!
+}`;
+const destinations = docSections.filter((section) => section !== 'Start here').map((section) => {
+  const members = pages.filter((page) => page.data.section === section);
+  return { section, count: members.length, first: members[0] };
+}).filter(({ first }) => first);
+---
+
+<section class="hero" aria-labelledby="hero-title">
+  <div class="hero-copy">
+    <p class="hero-eyebrow">Dodo 0.1.5 documentation</p>
+    <h1 id="hero-title">A small language.<br /><span>Native by design.</span></h1>
+    <p class="hero-lede">
+      Dodo compiles to native programs, checks types and borrowing before anything runs,
+      and releases resources when their owners leave scope. Ordinary programs need no garbage
+      collector or scheduler.
+    </p>
+    <div class="hero-actions">
+      <a class="button button-primary" href={pageUrl('installation')}>Install Dodo</a>
+      <a class="button button-secondary" href={pageUrl('first-program')}>Write your first program <span aria-hidden="true">→</span></a>
+    </div>
+  </div>
+  <figure class="hero-sample" aria-label="A complete Dodo program and its output">
+    <div class="sample-bar">
+      <span class="sample-file">main.dodo</span>
+    </div>
+    <Code code={program} lang="rust" themes={{ light: 'github-light-default', dark: 'github-dark-default' }} defaultColor={false} />
+    <div class="sample-terminal">
+      <p><span class="prompt" aria-hidden="true">$</span> dodo run</p>
+      <p class="output">Hello, world!</p>
+    </div>
+  </figure>
+  <span class="hero-mark" aria-hidden="true"></span>
+</section>
+
+<nav class="destinations" aria-label="Documentation sections">
+  {destinations.map(({ section, count, first }) => (
+    <a class="destination" href={pageUrl(first!.id)}>
+      <span class="destination-title">{section}</span>
+      <span class="destination-summary">{sectionSummaries[section]}</span>
+      <span class="destination-meta">{count} {count === 1 ? 'page' : 'pages'} <span aria-hidden="true">→</span></span>
+    </a>
+  ))}
+</nav>
