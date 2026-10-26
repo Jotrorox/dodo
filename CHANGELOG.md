@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+- Add serial ports (UART) to the `rp2040` and `rp2350` chips, so firmware
+  can print. `pins.uart(tx, rx, baud)` validates the pins and the baud rate,
+  takes the UART once, and returns a port implementing the `std/io` Reader
+  and Writer, so `fmt.printf(&mut serial, ...)` and `io.read_line` work on
+  it unchanged; `rx` is `none` for a port that only sends. Every board names
+  its usual pins, `UART_TX_PIN` (GP0) and `UART_RX_PIN` (GP1), where the
+  Raspberry Pi Debug Probe connects. The driver is the new
+  `std/embedded/peripheral/pl011` (Arm PL011): 8N1 by default, `set_baud`
+  and `set_format` for 5 to 8 data bits, parity, and 1 or 2 stop bits,
+  polling `poll_read` and `poll_write`, `flush`, internal loopback, and
+  `set_crlf(true)` for terminals, which writes `\n` as CR LF and reads Enter
+  as `\n`. Framing, parity, break, and overrun errors fail a read after the
+  good bytes before them, with the error's bits in `io.Error.code`.
+  `pins.release_uart(port)` gives a port back. `examples/serial_console.dodo`
+  is a small command line.
+- Report panics on the serial port. The chip runtimes' default panic hook,
+  `dodo_board_panic`, now calls a reporter that `std/embedded/chip` links
+  in, which writes `dodo: index bounds check failed at main.dodo:41:46`, the
+  line a desktop program prints, to every serial port the program holds
+  before it halts. Nothing needs configuring, a program's own
+  `dodo_board_panic` still replaces the hook, and `board.report_panic`
+  writes the same report from it.
+- I2C reaches 10-bit addresses: `write_ten_bit`, `read_ten_bit`, and
+  `write_read_ten_bit` on a `designware_i2c` bus. `probe(address)` finds
+  devices with a one-byte read, since the controller cannot send an address
+  alone.
+- The RP2040 and RP2350 can be I2C and SPI targets (slaves).
+  `pins.i2c_target(sda, scl, address, ten_bit, hz)` answers a master at a
+  7-bit or 10-bit address; `poll` reports the bytes it writes, its STOPs,
+  and its reads, which hold the master up until `respond` answers.
+  `pins.spi_target(clock, tx, rx, select, mode)` follows a master's clock
+  and chip select, with polled `queue` and `read` and a waiting `transfer`.
+- SPI frames of 4 to 16 bits (`set_frame_bits`, with `transfer_words` and
+  `write_words` on `u16` words above 8 bits), the TI synchronous serial and
+  National Microwire formats (`set_frame_format`), and
+  `pins.spi_with_select`, which routes the controller's own chip select.
+- Serial ports gain hardware flow control: `pins.uart_flow(tx, rx, cts,
+  rts, baud)` claims the CTS and RTS pins, and RTS asks the other end to
+  pause from 24 received bytes on. `set_break` holds the line low. On the
+  RP2350, `pins.uart` also takes TX and RX on the UART_AUX pins (GPIO n
+  with n % 4 of 2 and 3).
+- `std/embedded/hal/fake` gains `fake.Serial`, an in-memory serial port for
+  testing drivers of devices on a serial line. The board self-tests check
+  the serial port's pins, ownership, timing at 115200 baud and 1 Mbaud,
+  newline translation, and overruns through the internal loopback, and
+  desktop tests run the driver against a PL011 model. The self-tests also
+  cover 10-bit addressing, both targets, 12-bit and TI frames through the
+  SPI loopback, breaks, and the flow control pins, and the desktop models
+  gain a DW_apb_i2c target driven by a scripted master.
+
 ## 0.1.5 — 2026-10-12
 
 Dodo 0.1.5 brings the compiler and hosted standard library to macOS and AArch64

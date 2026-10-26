@@ -6,14 +6,18 @@ import "std/embedded/hal"
 import "std/embedded/chip/rp_pins"
 import "std/embedded/hal/fake"
 import "std/embedded/peripheral/designware_i2c"
+import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
+import "std/fmt"
+import "std/io"
 
-// Host checks for std/embedded/peripheral: the DesignWare I2C and PL022 SPI
-// controller drivers against behavioural models of the controllers, and the
-// pin and controller ownership of std/embedded/chip/rp_pins. The
-// models enforce the hardware's rules (registers that may change only while
-// disabled, FIFO depths, the flushed state after an abort) and process
-// commands slower than the drivers poll, so FIFO back-pressure is exercised.
+// Host checks for std/embedded/peripheral: the DesignWare I2C, PL022 SPI, and
+// PL011 UART controller drivers against behavioural models of the
+// controllers, and the pin and controller ownership and panic reports of
+// std/embedded/chip/rp_pins. The models enforce the hardware's rules
+// (registers that may change only while disabled, FIFO depths, the flushed
+// state after an abort) and process commands slower than the drivers poll,
+// so FIFO back-pressure is exercised.
 
 const CLOCK_HZ: u32 = 125_000_000
 
@@ -27,6 +31,8 @@ const STOP: u32 = 0x300
 const ADDRESS: u32 = 0x400
 
 const DEVICE: u8 = 0x48
+// A second device, with a 10-bit address.
+const DEVICE10: u16 = 0x2A5
 const I2C_FIFO: usize = 16
 
 struct I2cModel {
@@ -53,6 +59,8 @@ struct I2cModel {
     active: bool
     reading: bool
     first_write: bool
+    // This transaction addressed the device for writing.
+    active_write: bool
     // The device: 256 registers behind an auto-incrementing pointer.
     registers: [256]u8
     pointer: u8
@@ -98,6 +106,7 @@ struct I2cModel {
             active: false,
             reading: false,
             first_write: false,
+            active_write: false,
             registers: [0; 256],
             pointer: 0,
             period,
@@ -174,6 +183,7 @@ struct I2cModel {
                 self.record(RESTART)
             } else {
                 self.record(START)
+                self.active_write = false
             }
             self.active = true
             if self.lose_arbitration {
@@ -185,12 +195,36 @@ struct I2cModel {
             if read {
                 direction = 1
             }
-            target := self.tar
-            self.record(ADDRESS | (target << 1) | direction)
-            if self.tar != DEVICE as u32 {
-                self.abort(1 << 0)
-                return
+            if (self.con & (1 << 4)) != 0 {
+                // 11110, the top two address bits, and the direction; a
+                // write, or a read that does not continue a write, first
+                // sends the low eight bits after a write header.
+                target := self.tar & 0x3FF
+                header := 0xF0 | ((target >> 7) & 0x6)
+                continued := read && self.active_write
+                if !continued {
+                    self.record(ADDRESS | header)
+                    self.record(ADDRESS | (target & 0xFF))
+                    if target != DEVICE10 as u32 {
+                        self.abort(1 << 2)
+                        return
+                    }
+                    if read {
+                        self.record(RESTART)
+                    }
+                }
+                if read {
+                    self.record(ADDRESS | header | 1)
+                }
+            } else {
+                target := self.tar
+                self.record(ADDRESS | (target << 1) | direction)
+                if self.tar != DEVICE as u32 {
+                    self.abort(1 << 0)
+                    return
+                }
             }
+            self.active_write = !read
             self.reading = read
             self.first_write = true
         }
@@ -588,6 +622,452 @@ fn i2c_frequency() {
     core.assert_eq(model.high + model.spike + 7 + model.low + 1, 1250u32)
 }
 
+fn i2c_ten_bit() {
+    bus := i2c_bus(I2cModel.new(16, 1))
+    data: [2]u8 = [0x05, 0x99]
+    bus.write_ten_bit(DEVICE10, &data)!
+    register: [1]u8 = [0x05]
+    value: [1]u8 = [0]
+    bus.write_read_ten_bit(DEVICE10, &register, &mut value)!
+    core.assert_eq(value[0], 0x99u8)
+    bus.read_ten_bit(DEVICE10, &mut value)!
+    core.assert_eq(value[0], 0u8)
+    // Nobody acknowledges the low address byte.
+    expect_error(bus.write_ten_bit(0x155, &data), hal.Error.NoAcknowledge)
+    expect_error(bus.write_ten_bit(0x400, &data), hal.Error.InvalidInput)
+    expect_error(bus.read_ten_bit(0x400, &mut value), hal.Error.InvalidInput)
+    // Back to a 7-bit device.
+    bus.write(DEVICE, &data)!
+    model := bus.release()
+    core.assert_eq(model.con & (1 << 4), 0u32)
+    header := ADDRESS | 0xF4
+    low := ADDRESS | 0xA5
+    ten_bit: [30]u32 = [
+        START, header, low, 0x05, 0x99, STOP,
+        START, header, low, 0x05, RESTART, header | 1, 0x99, STOP,
+        START, header, low, RESTART, header | 1, 0x00, STOP,
+        START, ADDRESS | 0xF2, ADDRESS | 0x55, STOP,
+        START, ADDRESS | 0x90, 0x05, 0x99, STOP
+    ]
+    model.expect(&ten_bit)
+}
+
+fn i2c_probe() {
+    bus := i2c_bus(I2cModel.new(16, 2))
+    core.assert(bus.probe(DEVICE)!)
+    core.assert(!bus.probe(0x10)!)
+    match bus.probe(0x80) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    model := bus.release()
+    probes: [7]u32 = [START, ADDRESS | 0x91, 0x00, STOP, START, ADDRESS | 0x21, STOP]
+    model.expect(&probes)
+}
+
+// --- A DW_apb_i2c as a target, and the master that addresses it ---------
+
+// What the master does, one step per register read: a byte it writes
+// (FIRST_BYTE when it follows the address), a STOP, or a read of a number of
+// bytes.
+const FIRST_BYTE: u32 = 1 << 11
+const MASTER_STOP: u32 = 0x1000
+const MASTER_READ: u32 = 0x2000
+const TARGET_ADDRESS: u16 = 0x3C
+
+struct I2cTargetModel {
+    con: u32
+    sar: u32
+    enabled: bool
+    interrupt_mask: u32
+    general_call: u32
+    spike: u32
+    hold: u32
+    rx: [16]u32
+    rx_count: usize
+    tx: [16]u8
+    tx_count: usize
+    // The controller flushed stale reply bytes and drops new ones until the
+    // abort is cleared.
+    aborted: bool
+    read_request: bool
+    rx_done: bool
+    stop_detected: bool
+    script: [64]u32
+    script_length: usize
+    position: usize
+    // Bytes left in the read under way, if it started.
+    reading: u32
+    read_started: bool
+    // What the master read.
+    received: [32]u8
+    received_count: usize
+    // Rule violations the driver must never cause.
+    tx_overflow: bool
+    rx_overflow: bool
+
+    fn new() -> I2cTargetModel {
+        return I2cTargetModel {
+            con: 0x7F,
+            sar: 0x55,
+            enabled: false,
+            interrupt_mask: 0x8FF,
+            general_call: 1,
+            spike: 0,
+            hold: 0x0001_0001,
+            rx: [0; 16],
+            rx_count: 0,
+            tx: [0; 16],
+            tx_count: 0,
+            aborted: false,
+            read_request: false,
+            rx_done: false,
+            stop_detected: false,
+            script: [0; 64],
+            script_length: 0,
+            position: 0,
+            reading: 0,
+            read_started: false,
+            received: [0; 32],
+            received_count: 0,
+            tx_overflow: false,
+            rx_overflow: false,
+        }
+    }
+
+    fn plan(&mut self, steps: &[u32]) {
+        for index in 0..steps.len {
+            core.assert(self.script_length < 64)
+            self.script[self.script_length] = steps[index]
+            self.script_length += 1
+        }
+    }
+
+    fn done(&self) -> bool {
+        return self.position == self.script_length
+    }
+
+    fn step(&mut self) {
+        if !self.enabled || self.done() {
+            return
+        }
+        item := self.script[self.position]
+        if (item & MASTER_READ) != 0 {
+            if !self.read_started {
+                self.read_started = true
+                self.reading = item & 0xFF
+                if self.tx_count > 0 {
+                    // Left over from an earlier reply.
+                    self.tx_count = 0
+                    self.aborted = true
+                }
+            }
+            if self.tx_count == 0 {
+                // SCL held low until the program answers.
+                self.read_request = true
+                return
+            }
+            core.assert(self.received_count < 32)
+            self.received[self.received_count] = self.tx[0]
+            self.received_count += 1
+            for index in 1..self.tx_count {
+                self.tx[index - 1] = self.tx[index]
+            }
+            self.tx_count -= 1
+            self.reading -= 1
+            if self.reading == 0 {
+                // The master does not acknowledge the last byte.
+                self.rx_done = true
+                self.read_started = false
+                self.position += 1
+            }
+        } else if item == MASTER_STOP {
+            self.stop_detected = true
+            self.position += 1
+        } else {
+            if self.rx_count == 16 {
+                if (self.con & (1 << 9)) == 0 {
+                    self.rx_overflow = true
+                    self.position += 1
+                }
+                return
+            }
+            self.rx[self.rx_count] = item
+            self.rx_count += 1
+            self.position += 1
+        }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        self.step()
+        if offset == 0x10 {
+            core.assert(self.rx_count > 0)
+            entry := self.rx[0]
+            for index in 1..self.rx_count {
+                self.rx[index - 1] = self.rx[index]
+            }
+            self.rx_count -= 1
+            return entry
+        } else if offset == 0x34 {
+            raw := 0u32
+            if self.read_request {
+                raw |= 1 << 5
+            }
+            if self.aborted {
+                raw |= 1 << 6
+            }
+            if self.rx_done {
+                raw |= 1 << 7
+            }
+            if self.stop_detected {
+                raw |= 1 << 9
+            }
+            return raw
+        } else if offset == 0x40 {
+            self.read_request = false
+            self.aborted = false
+            self.rx_done = false
+            self.stop_detected = false
+            return 0
+        } else if offset == 0x50 {
+            self.read_request = false
+            return 0
+        } else if offset == 0x54 {
+            self.aborted = false
+            return 0
+        } else if offset == 0x58 {
+            self.rx_done = false
+            return 0
+        } else if offset == 0x60 {
+            self.stop_detected = false
+            return 0
+        } else if offset == 0x70 {
+            status := 0u32
+            if self.tx_count < 16 {
+                status |= 1 << 1
+            }
+            if self.rx_count > 0 {
+                status |= 1 << 3
+            }
+            return status
+        } else if offset == 0x7C {
+            return self.hold
+        } else if offset == 0x00 {
+            return self.con
+        } else if offset == 0x9C {
+            if self.enabled {
+                return 1
+            }
+            return 0
+        }
+        core.assert(false)
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x6C {
+            core.assert_eq(value & 2, 0u32)
+            self.enabled = (value & 1) != 0
+            if !self.enabled {
+                self.tx_count = 0
+                self.rx_count = 0
+            }
+            return
+        }
+        if offset == 0x10 {
+            core.assert(self.enabled)
+            // Only data bytes: a target never issues read commands.
+            core.assert_eq(value & 0x700, 0u32)
+            if self.aborted {
+                return
+            }
+            if self.tx_count == 16 {
+                self.tx_overflow = true
+                return
+            }
+            self.tx[self.tx_count] = value as u8
+            self.tx_count += 1
+            return
+        }
+        core.assert(!self.enabled)
+        if offset == 0x00 {
+            self.con = value
+        } else if offset == 0x08 {
+            self.sar = value
+        } else if offset == 0x30 {
+            self.interrupt_mask = value
+        } else if offset == 0x38 || offset == 0x3C {
+            core.assert_eq(value, 0u32)
+        } else if offset == 0x98 {
+            self.general_call = value
+        } else if offset == 0x7C {
+            self.hold = value
+        } else if offset == 0xA0 {
+            self.spike = value
+        } else {
+            core.assert(false)
+        }
+    }
+}
+
+// A register device on the target: 64 registers behind a pointer that the
+// first byte of each write sets and every byte moves on. Polls until the
+// master's script is done and nothing is left to report; returns the STOPs
+// seen.
+struct Registers {
+    memory: [64]u8
+    pointer: usize
+    stops: u32
+    writes: u32
+}
+
+fn serve(target: &mut designware_i2c.Target<I2cTargetModel>, device: &mut Registers, buffer: &mut[u8], reply_length: usize) {
+    idle := 0u32
+    for idle < 50 {
+        match target.poll(buffer) {
+            designware_i2c.TargetEvent.Idle => {
+                idle += 1
+            }
+            designware_i2c.TargetEvent.Write(count, start) => {
+                idle = 0
+                first := 0usize
+                if start {
+                    device.pointer = buffer[0] as usize
+                    device.writes += 1
+                    first = 1
+                }
+                for index in first..count {
+                    device.memory[device.pointer % 64] = buffer[index]
+                    device.pointer += 1
+                }
+            }
+            designware_i2c.TargetEvent.Read => {
+                idle = 0
+                position := device.pointer % 64
+                end := position + reply_length
+                if end > 64 {
+                    end = 64
+                }
+                device.pointer += target.respond(&device.memory[position..end])
+            }
+            designware_i2c.TargetEvent.Stop => {
+                idle = 0
+                device.stops += 1
+            }
+        }
+    }
+}
+
+fn fast_timing() -> designware_i2c.Timing {
+    return designware_i2c.timing(CLOCK_HZ, hal.I2C_FAST_HZ)!
+}
+
+fn i2c_target() {
+    target := designware_i2c.Target.new(I2cTargetModel.new(), fast_timing(), TARGET_ADDRESS, false)
+    model := target.release()
+    // A target only: master mode and the target disable off, fast-mode
+    // spike filter, STOP only when addressed, SCL held while the receive
+    // FIFO is full; no interrupts, no general calls.
+    core.assert_eq(model.con, 0x284u32)
+    core.assert_eq(model.sar, 0x3Cu32)
+    core.assert(model.interrupt_mask == 0 && model.general_call == 0)
+    core.assert(model.spike == 11 && model.hold == 0x0001_0026)
+    core.assert(!model.enabled)
+
+    // A register write, a register read with a repeated START, and a
+    // write longer than the receive FIFO, which holds the master up
+    // instead of overflowing. The buffer is smaller than the writes, and
+    // they follow each other without waiting for the program.
+    long: [24]u32 = [0; 24]
+    long[0] = FIRST_BYTE | 0x20
+    for index in 1..24usize {
+        long[index] = (0x40 + index) as u32
+    }
+    script: [10]u32 = [
+        FIRST_BYTE | 0x10, 0x22, 0x33, MASTER_STOP,
+        FIRST_BYTE | 0x10, MASTER_READ | 2, MASTER_STOP,
+        FIRST_BYTE | 0x08, 0x77, MASTER_STOP
+    ]
+    model.plan(&script)
+    model.plan(&long)
+    final_stop: [1]u32 = [MASTER_STOP]
+    model.plan(&final_stop)
+    target = designware_i2c.Target.new(model, fast_timing(), TARGET_ADDRESS, false)
+    device := Registers { memory: [0; 64], pointer: 0, stops: 0, writes: 0 }
+    buffer: [4]u8 = [0; 4]
+    serve(&mut target, &mut device, &mut buffer, 1)
+    model = target.release()
+    core.assert(model.done() && !model.rx_overflow && !model.tx_overflow)
+    core.assert(device.memory[0x10] == 0x22 && device.memory[0x11] == 0x33 && device.memory[0x08] == 0x77)
+    for index in 1..24usize {
+        core.assert_eq(device.memory[0x20 + index - 1], (0x40 + index) as u8)
+    }
+    core.assert_eq(device.writes, 4u32)
+    core.assert(device.stops >= 1 && device.stops <= 4)
+    core.assert(model.received_count == 2 && model.received[0] == 0x22 && model.received[1] == 0x33)
+
+    // Replies queued in bulk: the master reads fewer than queued, and the
+    // rest is dropped when it next reads, so the second read starts afresh.
+    model.received_count = 0
+    bulk: [7]u32 = [FIRST_BYTE | 0x20, MASTER_READ | 3, MASTER_STOP, FIRST_BYTE | 0x10, MASTER_READ | 2, MASTER_STOP, MASTER_READ | 1]
+    model.plan(&bulk)
+    target = designware_i2c.Target.new(model, fast_timing(), TARGET_ADDRESS, false)
+    device.pointer = 0
+    serve(&mut target, &mut device, &mut buffer, 8)
+    model = target.release()
+    core.assert(model.done() && !model.tx_overflow)
+    core.assert_eq(model.received_count, 6usize)
+    core.assert(model.received[0] == 0x41 && model.received[2] == 0x43)
+    core.assert(model.received[3] == 0x22 && model.received[4] == 0x33)
+    // A read without a write first continues where the pointer is, past
+    // the eight bytes queued for the read before.
+    core.assert_eq(model.received[5], device.memory[0x18])
+
+    // A 10-bit address, and a change of address between transactions.
+    target = designware_i2c.Target.new(model, fast_timing(), 0x2A5, true)
+    target.set_address(0x51, false)!
+    match target.set_address(0x78, false) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    model = target.release()
+    core.assert(model.sar == 0x51 && (model.con & (1 << 3)) == 0)
+    target = designware_i2c.Target.new(model, fast_timing(), 0x2A5, true)
+    model = target.release()
+    core.assert(model.sar == 0x2A5 && (model.con & (1 << 3)) != 0)
+
+    // Reserved and out-of-range addresses.
+    invalid: [5]u16 = [0x00, 0x07, 0x78, 0x7F, 0x80]
+    for index in 0..5usize {
+        match designware_i2c.target_address(invalid[index], false) {
+            ok(_) => {
+                core.assert(false)
+            }
+            err(error) => {
+                core.assert(error == hal.Error.InvalidInput)
+            }
+        }
+    }
+    core.assert_eq(designware_i2c.target_address(0x08, false)!, 0x08u32)
+    core.assert_eq(designware_i2c.target_address(0x3FF, true)!, 0x3FFu32)
+    match designware_i2c.target_address(0x400, true) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
 // --- A PL022 and the device answering on its bus -----------------------
 
 const SPI_FIFO: usize = 8
@@ -597,19 +1077,19 @@ struct SpiModel {
     cr1: u32
     prescale: u32
     interrupt_mask: u32
-    tx: [8]u8
+    tx: [8]u16
     tx_count: usize
     // The frame in the shift register, between the FIFOs.
     shifting: bool
-    shift_value: u8
-    rx: [8]u8
+    shift_value: u16
+    rx: [8]u16
     rx_count: usize
     overrun: bool
     // The device's reply, then zeros; or the sent byte in loopback mode.
-    reply: [64]u8
+    reply: [64]u16
     reply_length: usize
     reply_position: usize
-    sent: [64]u8
+    sent: [64]u16
     sent_count: usize
     // Shift one frame every `period` status reads. With `burst`, shift every
     // queued frame at once whenever the transmit FIFO is full, as if an
@@ -622,11 +1102,17 @@ struct SpiModel {
     // clock domains may delay it at high SPI clocks. Zero stores it at once.
     receive_delay: u32
     landing: bool
-    landing_value: u8
+    landing_value: u16
     landing_reads: u32
     // Lose the next received byte to an overflow.
     lose_reply: bool
     tx_overflow: bool
+    // As a target: the frame sent last, which the controller repeats when
+    // the master clocks with the transmit FIFO empty, and how often it did.
+    last_sent: u16
+    underruns: u32
+    // Every CR1 bit ever written.
+    cr1_written: u32
 
     fn new(period: u32) -> SpiModel {
         return SpiModel {
@@ -655,19 +1141,63 @@ struct SpiModel {
             landing_reads: 0,
             lose_reply: false,
             tx_overflow: false,
+            last_sent: 0,
+            underruns: 0,
+            cr1_written: 0,
         }
     }
 
     fn reply_with(&mut self, bytes: &[u8]) {
         for index in 0..bytes.len {
-            self.reply[index] = bytes[index]
+            self.reply[index] = bytes[index] as u16
         }
         self.reply_length = bytes.len
         self.reply_position = 0
     }
 
+    fn reply_with_words(&mut self, words: &[u16]) {
+        for index in 0..words.len {
+            self.reply[index] = words[index]
+        }
+        self.reply_length = words.len
+        self.reply_position = 0
+    }
+
+    fn target(&self) -> bool {
+        return (self.cr1 & 4) != 0
+    }
+
+    // The bits of one frame.
+    fn mask(&self) -> u16 {
+        return ((1u32 << ((self.cr0 & 0xF) + 1)) - 1) as u16
+    }
+
     fn step(&mut self) {
         self.reads += 1
+        if self.target() {
+            // The master clocks a frame every `period` reads while it has
+            // frames to send, whether or not the target is ready.
+            if (self.cr1 & 2) != 0 && self.reads % self.period == 0 && self.reply_position < self.reply_length {
+                value := self.last_sent
+                if self.tx_count > 0 {
+                    value = self.tx[0]
+                    for index in 1..self.tx_count {
+                        self.tx[index - 1] = self.tx[index]
+                    }
+                    self.tx_count -= 1
+                } else {
+                    self.underruns += 1
+                }
+                self.last_sent = value
+                core.assert(self.sent_count < 64)
+                self.sent[self.sent_count] = value
+                self.sent_count += 1
+                answer := self.reply[self.reply_position] & self.mask()
+                self.reply_position += 1
+                self.store(answer)
+            }
+            return
+        }
         if self.landing {
             if self.landing_reads == 0 {
                 self.land()
@@ -688,7 +1218,7 @@ struct SpiModel {
     fn shift(&mut self) {
         if self.shifting {
             value := self.shift_value
-            answer := 0u8
+            answer := 0u16
             if (self.cr1 & 1) != 0 {
                 answer = value
             } else {
@@ -696,7 +1226,7 @@ struct SpiModel {
                 self.sent[self.sent_count] = value
                 self.sent_count += 1
                 if self.reply_position < self.reply_length {
-                    answer = self.reply[self.reply_position]
+                    answer = self.reply[self.reply_position] & self.mask()
                     self.reply_position += 1
                 }
             }
@@ -729,7 +1259,7 @@ struct SpiModel {
     }
 
     // A received frame enters the receive FIFO, or is lost.
-    fn store(&mut self, answer: u8) {
+    fn store(&mut self, answer: u16) {
         if self.rx_count == SPI_FIFO || self.lose_reply {
             self.overrun = true
             self.lose_reply = false
@@ -781,15 +1311,20 @@ struct SpiModel {
     pub fn write(&mut self, offset: usize, value: u32) {
         enabled := (self.cr1 & 2) != 0
         if offset == 0x004 {
-            // Master mode only.
-            core.assert_eq(value & 4, 0u32)
+            // Master or target mode changes only while disabled.
+            if (self.cr1 & 2) != 0 && (value & 2) != 0 {
+                core.assert_eq(value & 4, self.cr1 & 4)
+            }
             self.cr1 = value
+            self.cr1_written |= value
         } else if offset == 0x008 {
             core.assert(enabled)
             if self.tx_count == SPI_FIFO {
                 self.tx_overflow = true
             } else {
-                self.tx[self.tx_count] = value as u8
+                // Nothing above the frame size.
+                core.assert_eq(value & ~(self.mask() as u32), 0u32)
+                self.tx[self.tx_count] = value as u16
                 self.tx_count += 1
             }
         } else if offset == 0x020 {
@@ -802,6 +1337,9 @@ struct SpiModel {
             // The format and clock change only while disabled.
             core.assert(!enabled)
             if offset == 0x000 {
+                // The TI and Microwire formats have no polarity or phase.
+                core.assert((value & 0x30) == 0 || (value & 0xC0) == 0)
+                core.assert((value & 0x30) != 0x30)
                 self.cr0 = value
             } else if offset == 0x010 {
                 self.prescale = value
@@ -814,7 +1352,7 @@ struct SpiModel {
     fn expect_sent(&mut self, bytes: &[u8]) {
         core.assert_eq(self.sent_count, bytes.len)
         for index in 0..bytes.len {
-            core.assert_eq(self.sent[index], bytes[index])
+            core.assert_eq(self.sent[index], bytes[index] as u16)
         }
         self.sent_count = 0
         core.assert(!self.tx_overflow && !self.overrun)
@@ -1048,6 +1586,753 @@ fn spi_overrun() {
     bus.transfer(&mut bytes)!
 }
 
+fn expect_words(model: &mut SpiModel, words: &[u16]) {
+    core.assert_eq(model.sent_count, words.len)
+    for index in 0..words.len {
+        core.assert_eq(model.sent[index], words[index])
+    }
+    model.sent_count = 0
+    core.assert(!model.tx_overflow && !model.overrun)
+}
+
+fn spi_frames() {
+    // 12-bit frames: the word methods carry them, bits above the frame are
+    // dropped going out, and the byte methods refuse them.
+    model := SpiModel.new(2)
+    model.burst = true
+    replies: [12]u16 = [0; 12]
+    for index in 0..12usize {
+        replies[index] = (0xF000 | (0x111 * index)) as u16
+    }
+    model.reply_with_words(&replies)
+    bus := spi_bus(model, hal.SpiMode.Mode1)
+    bus.set_frame_bits(12)!
+    core.assert_eq(bus.frame_bits(), 12u32)
+    words: [12]u16 = [0; 12]
+    for index in 0..12usize {
+        words[index] = (0xA000 | (0x0AB + index)) as u16
+    }
+    bus.transfer_words(&mut words)!
+    for index in 0..12usize {
+        core.assert_eq(words[index], (0x111 * index) as u16)
+    }
+    bytes: [2]u8 = [1, 2]
+    expect_error(bus.transfer(&mut bytes), hal.Error.Unsupported)
+    expect_error(bus.write(&bytes), hal.Error.Unsupported)
+    expect_error(bus.set_frame_bits(3), hal.Error.InvalidInput)
+    expect_error(bus.set_frame_bits(17), hal.Error.InvalidInput)
+    core.assert_eq(bus.frame_bits(), 12u32)
+    model = bus.release()
+    core.assert_eq(model.cr0 & 0xFF, 0x8Bu32)
+    sent: [12]u16 = [0; 12]
+    for index in 0..12usize {
+        sent[index] = (0x0AB + index) as u16
+    }
+    expect_words(&mut model, &sent)
+
+    // 16-bit writes, then 4-bit frames through the byte methods.
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    bus.set_frame_bits(16)!
+    wide: [3]u16 = [0xFFFF, 0x1234, 0x8001]
+    bus.write_words(&wide)!
+    bus.set_frame_bits(4)!
+    nibble_replies: [2]u8 = [0x3C, 0x05]
+    model = bus.release()
+    expect_words(&mut model, &wide)
+    model.reply_with(&nibble_replies)
+    bus = spi_bus(model, hal.SpiMode.Mode0)
+    bus.set_frame_bits(4)!
+    nibbles: [2]u8 = [0x09, 0x0F]
+    bus.transfer(&mut nibbles)!
+    core.assert(nibbles[0] == 0x0C && nibbles[1] == 0x05)
+    model = bus.release()
+    nibbles_out: [2]u8 = [0x09, 0x0F]
+    model.expect_sent(&nibbles_out)
+
+    // The TI and Microwire formats clear polarity and phase, and the
+    // Motorola format brings the mode back.
+    bus = spi_bus(model, hal.SpiMode.Mode3)
+    bus.set_frame_format(pl022.FrameFormat.TexasInstruments)
+    model = bus.release()
+    core.assert_eq(model.cr0 & 0xF0, 0x10u32)
+    bus = spi_bus(model, hal.SpiMode.Mode3)
+    bus.set_frame_format(pl022.FrameFormat.Microwire)
+    bus.set_frame_bits(16)!
+    // A Microwire read: an 8-bit command, a 16-bit answer.
+    answer: [1]u16 = [0xBEEF]
+    model = bus.release()
+    core.assert_eq(model.cr0 & 0xFF, 0x2Fu32)
+    model.reply_with_words(&answer)
+    bus = spi_bus(model, hal.SpiMode.Mode3)
+    bus.set_frame_format(pl022.FrameFormat.Microwire)
+    bus.set_frame_bits(16)!
+    command: [1]u16 = [0x0086]
+    bus.transfer_words(&mut command)!
+    core.assert_eq(command[0], 0xBEEFu16)
+    bus.set_frame_format(pl022.FrameFormat.Motorola)
+    model = bus.release()
+    core.assert_eq(model.cr0 & 0xF0, 0xC0u32)
+    microwire_sent: [1]u16 = [0x0086]
+    expect_words(&mut model, &microwire_sent)
+}
+
+fn spi_target_bus(model: SpiModel) -> pl022.Target<SpiModel> {
+    return pl022.Target.new(model, hal.SpiMode.Mode3)
+}
+
+fn spi_target() {
+    // Configured as a target: CR1 says so before the port is enabled, and
+    // nothing interrupts.
+    target := spi_target_bus(SpiModel.new(1))
+    model := target.release()
+    core.assert_eq(model.cr0, 0xC7u32)
+    core.assert(model.cr1 == 0 && model.interrupt_mask == 0)
+
+    // The master sends 20 bytes while the target exchanges them, slower
+    // than the target refills, so no frame repeats.
+    model.period = 4
+    master: [20]u8 = [0; 20]
+    for index in 0..20usize {
+        master[index] = (0x80 + index) as u8
+    }
+    model.reply_with(&master)
+    target = spi_target_bus(model)
+    bytes: [20]u8 = [0; 20]
+    for index in 0..20usize {
+        bytes[index] = index as u8
+    }
+    target.transfer(&mut bytes)!
+    for index in 0..20usize {
+        core.assert_eq(bytes[index], (0x80 + index) as u8)
+    }
+    model = target.release()
+    core.assert_eq(model.underruns, 0u32)
+    sent: [20]u8 = [0; 20]
+    for index in 0..20usize {
+        sent[index] = index as u8
+    }
+    model.expect_sent(&sent)
+
+    // Polled: queue replies, read what came, and an overflowed receive FIFO
+    // reported once.
+    command: [3]u8 = [0x9F, 0, 0]
+    model.reply_with(&command)
+    target = spi_target_bus(model)
+    reply: [3]u8 = [0xFF, 0xEF, 0x40]
+    core.assert_eq(target.queue(&reply)!, 3usize)
+    received: [3]u8 = [0; 3]
+    count := 0usize
+    for count < 3 {
+        count += target.read(&mut received[count..])!
+    }
+    core.assert(received[0] == 0x9F && received[2] == 0)
+    model = target.release()
+    model.expect_sent(&reply)
+    model.overrun = true
+    model.lose_reply = true
+    lost: [1]u8 = [0x77]
+    model.reply_with(&lost)
+    target = spi_target_bus(model)
+    lost_count := 0u32
+    for lost_count == 0 {
+        match target.read(&mut received) {
+            ok(count) => {
+                core.assert_eq(count, 0usize)
+            }
+            err(error) => {
+                core.assert(error == hal.Error.Overrun)
+                lost_count += 1
+            }
+        }
+    }
+    core.assert_eq(target.read(&mut received)!, 0usize)
+    model = target.release()
+    model.sent_count = 0
+    model.cr1 = 0
+    target = spi_target_bus(model)
+
+    // 10-bit words, and the output turned off for a listening target.
+    target.set_frame_bits(10)!
+    target.set_output(false)
+    expect_error(target.transfer(&mut received), hal.Error.Unsupported)
+    model = target.release()
+    core.assert(model.cr0 == 0xC9 && (model.cr1_written & 8) != 0)
+    words: [2]u16 = [0x3FF, 0x155]
+    model.reply_with_words(&words)
+    model.cr1 = 0
+    target = spi_target_bus(model)
+    target.set_frame_bits(10)!
+    out: [2]u16 = [0x2AA, 0x001]
+    core.assert_eq(target.queue_words(&out), 2usize)
+    back: [2]u16 = [0, 0]
+    count = 0
+    for count < 2 {
+        count += target.read_words(&mut back[count..])!
+    }
+    core.assert(back[0] == 0x3FF && back[1] == 0x155)
+    model = target.release()
+    expect_words(&mut model, &out)
+
+    // A master that clocks with nothing queued gets the last frame again.
+    model.underruns = 0
+    model.reply_with(&command)
+    target = spi_target_bus(model)
+    one: [1]u8 = [0x42]
+    core.assert_eq(target.queue(&one)!, 1usize)
+    count = 0
+    for count < 3 {
+        count += target.read(&mut received[count..])!
+    }
+    model = target.release()
+    core.assert_eq(model.underruns, 2u32)
+    repeated: [3]u8 = [0x42, 0x42, 0x42]
+    model.expect_sent(&repeated)
+}
+
+// --- A PL011 and the line it drives ---------------------------------------
+
+const UART_FIFO: usize = 32
+// DR's error bits, as a received entry carries them.
+const FRAMING: u32 = 1 << 8
+const OVERRUN_BIT: u32 = 1 << 11
+const BREAK_BITS: u32 = (1 << 10) | (1 << 8)
+// While set, the line is stalled: the transmitter sends nothing.
+static mut UART_STALLED: bool = false
+
+struct UartModel {
+    cr: u32
+    lcr_h: u32
+    // IBRD and FBRD as written, and as the last LCR_H write latched them.
+    ibrd: u32
+    fbrd: u32
+    integer: u32
+    fraction: u32
+    interrupt_mask: u32
+    levels: u32
+    cleared: u32
+    tx: [32]u8
+    tx_count: usize
+    // The frame in the transmit shift register.
+    shifting: bool
+    shift_value: u8
+    // Received entries, data and error bits, as DR returns them.
+    rx: [32]u32
+    rx_count: usize
+    // RSR's overrun flag: an arrival found the receive FIFO full.
+    overrun: bool
+    // Frames that went out on the line.
+    sent: [160]u8
+    sent_count: usize
+    // Send one frame every `period` status reads.
+    period: u32
+    reads: u32
+    tx_overflow: bool
+    breaks: u32
+
+    fn new(period: u32) -> UartModel {
+        return UartModel {
+            cr: 0x300,
+            lcr_h: 0,
+            ibrd: 0,
+            fbrd: 0,
+            integer: 0,
+            fraction: 0,
+            interrupt_mask: 0x7FF,
+            levels: 0x12,
+            cleared: 0,
+            tx: [0; 32],
+            tx_count: 0,
+            shifting: false,
+            shift_value: 0,
+            rx: [0; 32],
+            rx_count: 0,
+            overrun: false,
+            sent: [0; 160],
+            sent_count: 0,
+            period,
+            reads: 0,
+            tx_overflow: false,
+            breaks: 0,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        return (self.cr & 1) != 0
+    }
+
+    // An entry arrives in the receive FIFO, or is lost if it is full.
+    fn arrive(&mut self, entry: u32) {
+        if self.rx_count == UART_FIFO {
+            self.overrun = true
+        } else {
+            self.rx[self.rx_count] = entry
+            self.rx_count += 1
+        }
+    }
+
+    fn arrive_bytes(&mut self, bytes: &[u8]) {
+        for index in 0..bytes.len {
+            self.arrive(bytes[index] as u32)
+        }
+    }
+
+    // Finish the frame in the shift register, then load the next one.
+    fn shift(&mut self) {
+        if self.shifting {
+            if (self.cr & (1 << 7)) != 0 {
+                entry := self.shift_value as u32
+                self.arrive(entry)
+            } else {
+                core.assert(self.sent_count < 160)
+                self.sent[self.sent_count] = self.shift_value
+                self.sent_count += 1
+            }
+            self.shifting = false
+        }
+        if self.tx_count > 0 && self.enabled() {
+            self.shift_value = self.tx[0]
+            for index in 1..self.tx_count {
+                self.tx[index - 1] = self.tx[index]
+            }
+            self.tx_count -= 1
+            self.shifting = true
+        }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x000 {
+            core.assert(self.rx_count > 0)
+            entry := self.rx[0]
+            for index in 1..self.rx_count {
+                self.rx[index - 1] = self.rx[index]
+            }
+            self.rx_count -= 1
+            return entry
+        } else if offset == 0x018 {
+            self.reads += 1
+            stalled := unsafe {
+                UART_STALLED
+            }
+            if !stalled && self.reads % self.period == 0 {
+                self.shift()
+            }
+            status := 0u32
+            if self.tx_count > 0 || self.shifting {
+                status |= 1 << 3
+            }
+            if self.rx_count == 0 {
+                status |= 1 << 4
+            }
+            if self.tx_count == UART_FIFO {
+                status |= 1 << 5
+            }
+            if self.rx_count == UART_FIFO {
+                status |= 1 << 6
+            }
+            if self.tx_count == 0 {
+                status |= 1 << 7
+            }
+            return status
+        } else if offset == 0x004 {
+            if self.overrun {
+                return 1 << 3
+            }
+            return 0
+        } else if offset == 0x02C {
+            return self.lcr_h
+        } else if offset == 0x030 {
+            return self.cr
+        }
+        core.assert(false)
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x000 {
+            core.assert(self.enabled() && (self.cr & (1 << 8)) != 0)
+            if self.tx_count == UART_FIFO {
+                self.tx_overflow = true
+            } else {
+                self.tx[self.tx_count] = value as u8
+                self.tx_count += 1
+            }
+        } else if offset == 0x004 {
+            core.assert_eq(value, 0u32)
+            self.overrun = false
+        } else if offset == 0x030 {
+            // Disabled only between frames, with nothing left to send.
+            if self.enabled() && (value & 1) == 0 {
+                core.assert(self.tx_count == 0 && !self.shifting)
+            }
+            // No IrDA.
+            core.assert_eq(value & 0x6, 0u32)
+            // Flow control changes only while disabled.
+            if self.enabled() && (value & 1) != 0 {
+                core.assert_eq(value & 0xC000, self.cr & 0xC000)
+            }
+            self.cr = value
+        } else if offset == 0x038 {
+            self.interrupt_mask = value
+        } else if offset == 0x034 {
+            core.assert(!self.enabled())
+            self.levels = value
+        } else if offset == 0x044 {
+            self.cleared |= value
+        } else if offset == 0x02C && self.enabled() {
+            // Running, only a break starts or ends, between frames.
+            core.assert_eq(value & ~1u32, self.lcr_h & ~1u32)
+            core.assert(self.tx_count == 0 && !self.shifting)
+            if (self.lcr_h & 1) != 0 && (value & 1) == 0 && (self.cr & (1 << 7)) != 0 {
+                // In loopback the receiver saw the line held low.
+                self.arrive(BREAK_BITS)
+            }
+            if (value & 1) != 0 {
+                self.breaks += 1
+            }
+            self.lcr_h = value
+        } else {
+            // The divisors and format change only while disabled.
+            core.assert(!self.enabled())
+            if offset == 0x024 {
+                self.ibrd = value
+            } else if offset == 0x028 {
+                self.fbrd = value
+            } else if offset == 0x02C {
+                self.lcr_h = value
+                self.integer = self.ibrd
+                self.fraction = self.fbrd
+            } else {
+                core.assert(false)
+            }
+        }
+    }
+
+    fn expect_sent(&mut self, bytes: &[u8]) {
+        core.assert_eq(self.sent_count, bytes.len)
+        for index in 0..bytes.len {
+            core.assert_eq(self.sent[index], bytes[index])
+        }
+        self.sent_count = 0
+        core.assert(!self.tx_overflow)
+    }
+}
+
+fn expect_uart_invalid(result: pl011.Divisors!hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn uart_divisors() {
+    // The Pico SDK's divisor for 115200 baud at 125 MHz: 67 + 52/64.
+    usual := pl011.divisors(CLOCK_HZ, 115_200)!
+    core.assert_eq(usual.integer, 67u32)
+    core.assert_eq(usual.fraction, 52u32)
+    core.assert_eq(usual.baud, 115_207u32)
+    rp2350 := pl011.divisors(150_000_000, 115_200)!
+    core.assert_eq(rp2350.integer, 81u32)
+    core.assert_eq(rp2350.fraction, 24u32)
+    // The fastest rate, a divisor of exactly one, and the slowest.
+    fastest := pl011.divisors(CLOCK_HZ, 7_812_500)!
+    core.assert(fastest.integer == 1 && fastest.fraction == 0 && fastest.baud == 7_812_500)
+    slowest := pl011.divisors(CLOCK_HZ, 120)!
+    core.assert(slowest.integer <= 65_535 && slowest.baud == 120)
+    expect_uart_invalid(pl011.divisors(CLOCK_HZ, 7_900_000))
+    expect_uart_invalid(pl011.divisors(CLOCK_HZ, 119))
+    expect_uart_invalid(pl011.divisors(CLOCK_HZ, 0))
+    // The usual rates come within 0.1 %, and the rate reported is the one
+    // the divisor makes.
+    rates: [12]u32 = [300, 1200, 2400, 9600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600, 1_000_000]
+    clocks: [2]u32 = [CLOCK_HZ, 150_000_000]
+    for clock_index in 0..2usize {
+        clock := clocks[clock_index]
+        for index in 0..12usize {
+            rate := rates[index]
+            result := pl011.divisors(clock, rate)!
+            core.assert(result.fraction < 64 && result.integer >= 1)
+            scaled := (64 * result.integer + result.fraction) as u64
+            exact := 4 * clock as u64
+            core.assert(result.baud as u64 * scaled <= exact + scaled && result.baud as u64 * scaled + scaled >= exact)
+            difference := result.baud as u64 * 1000
+            core.assert(difference <= rate as u64 * 1001 && difference >= rate as u64 * 999)
+        }
+    }
+}
+
+fn uart_port(model: UartModel) -> pl011.Controller<UartModel> {
+    return pl011.Controller.new(model, pl011.divisors(CLOCK_HZ, 115_200)!)
+}
+
+fn uart_configuration() {
+    // 8N1 with FIFOs, the divisor latched by LCR_H, no interrupts, and the
+    // transmitter and receiver on.
+    port := uart_port(UartModel.new(1))
+    core.assert_eq(port.baud(), 115_207u32)
+    model := port.release()
+    core.assert(model.integer == 67 && model.fraction == 52)
+    core.assert_eq(model.lcr_h, 0x70u32)
+    core.assert(model.interrupt_mask == 0 && model.cleared == 0x7FF)
+    core.assert_eq(model.cr, 0u32)
+
+    model.cr = 0
+    port = uart_port(model)
+    model = port.release()
+    port = uart_port(model)
+    port.set_format(8, pl011.Parity.Even, 1)!
+    port.set_format(7, pl011.Parity.Odd, 2)!
+    expect_error_io(port.set_format(9, pl011.Parity.None, 1))
+    expect_error_io(port.set_format(8, pl011.Parity.None, 3))
+    // Waits for queued bytes before it changes the rate.
+    port.write(b"slow down")!
+    port.set_baud(9600)!
+    core.assert_eq(port.baud(), 9600u32)
+    expect_error_io(port.set_baud(10_000_000))
+    core.assert_eq(port.baud(), 9600u32)
+    model = port.release()
+    model.expect_sent(b"slow down")
+    core.assert_eq(model.lcr_h, 0x5Au32)
+    core.assert(model.integer == 813 && model.fraction == 51)
+}
+
+fn expect_error_io(result: void!hal.Error) {
+    expect_error(result, hal.Error.InvalidInput)
+}
+
+fn uart_writes() {
+    // Frames leave slower than the driver queues them, so the transmit FIFO
+    // fills and the driver waits; nothing is ever lost.
+    port := uart_port(UartModel.new(3))
+    text: [100]u8 = [0; 100]
+    for index in 0..100usize {
+        text[index] = (32 + index) as u8
+    }
+    core.assert_eq(port.write(&text)!, 100usize)
+    port.flush()
+    model := port.release()
+    model.expect_sent(&text)
+
+    // std/fmt prints to a port, and with crlf every newline goes out as
+    // CR LF while the count is still of the bytes written.
+    port = uart_port(model)
+    fmt.printf(&mut port, "t={} ok\n", 25)!
+    port.set_crlf(true)
+    written := fmt.printf(&mut port, "a\nb\n")!
+    core.assert_eq(written, 4usize)
+    model = port.release()
+    model.expect_sent(b"t=25 ok\na\r\nb\r\n")
+
+    // A polled write queues what fits and stops when the FIFO is full; a
+    // newline whose LF no longer fits after its CR is not counted yet, and
+    // the next write, once the line moves again, sends only the LF.
+    model.period = 1
+    port = uart_port(model)
+    port.set_crlf(true)
+    long: [40]u8 = [0; 40]
+    for index in 0..40usize {
+        long[index] = 65
+    }
+    long[31] = 10
+    unsafe {
+        UART_STALLED = true
+    }
+    first := port.poll_write(&long)!
+    core.assert(first.transferred == 31 && first.state == io.PollState.Pending)
+    unsafe {
+        UART_STALLED = false
+    }
+    rest := port.poll_write(&long[31..])!
+    core.assert(rest.transferred == 9 && rest.state == io.PollState.Ready)
+    model = port.release()
+    expected: [41]u8 = [65; 41]
+    expected[31] = 13
+    expected[32] = 10
+    model.expect_sent(&expected)
+}
+
+fn uart_reads() {
+    model := UartModel.new(1)
+    port := uart_port(model)
+    buffer: [8]u8 = [0; 8]
+    // Nothing has arrived: a polled read is Pending.
+    empty := port.poll_read(&mut buffer)!
+    core.assert(empty.transferred == 0 && empty.state == io.PollState.Pending)
+    model = port.release()
+
+    // A read returns what has arrived, up to the buffer.
+    model.arrive_bytes(b"hello, world")
+    port = uart_port(model)
+    core.assert_eq(port.read(&mut buffer)!, 8usize)
+    core.assert_eq(buffer[7], 119u8)
+    core.assert_eq(port.read(&mut buffer)!, 4usize)
+    core.assert_eq(buffer[3], 100u8)
+    model = port.release()
+
+    // With crlf, Enter (CR, or CR LF) reads as one LF, so io.read_line
+    // ends there; a lone LF stays.
+    model.arrive_bytes(b"ab\r\ncd\re\nf")
+    port = uart_port(model)
+    port.set_crlf(true)
+    line: [16]u8 = [0; 16]
+    first := io.read_line(&mut port, &mut line)!
+    core.assert(first.count == 3 && line[2] == 10)
+    rest: [16]u8 = [0; 16]
+    progress := port.poll_read(&mut rest)!
+    core.assert_eq(progress.transferred, 6usize)
+    core.assert(rest[0] == 99 && rest[2] == 10 && rest[3] == 101 && rest[4] == 10 && rest[5] == 102)
+    model = port.release()
+
+    // A byte with a framing error is dropped and reported after the good
+    // bytes before it; the next read goes on after it.
+    model.arrive(120)
+    model.arrive(FRAMING | 121)
+    model.arrive(122)
+    port = uart_port(model)
+    match port.read(&mut buffer) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.kind == io.ErrorKind.Other && error.code == pl011.FRAMING_ERROR)
+            core.assert(error.transferred == 1 && buffer[0] == 120)
+        }
+    }
+    core.assert_eq(port.read(&mut buffer)!, 1usize)
+    core.assert_eq(buffer[0], 122u8)
+    model = port.release()
+
+    // Bytes that arrive while the receive FIFO is full are lost; the next
+    // read returns what the FIFO holds and then reports the overrun, once.
+    port = uart_port(model)
+    port.set_loopback(true)
+    full: [40]u8 = [0; 40]
+    for index in 0..40usize {
+        full[index] = index as u8
+    }
+    port.write(&full)!
+    port.flush()
+    match port.read(&mut full) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.code == pl011.OVERRUN && error.transferred == UART_FIFO)
+            core.assert(full[0] == 0 && full[31] == 31)
+        }
+    }
+    after := port.poll_read(&mut full)!
+    core.assert(after.transferred == 0 && after.state == io.PollState.Pending)
+    port.set_loopback(false)
+    model = port.release()
+
+    // An overrun flagged on a byte keeps that byte; a break is dropped.
+    model.arrive(112)
+    model.arrive(OVERRUN_BIT | 113)
+    model.arrive(BREAK_BITS)
+    model.arrive(114)
+    port = uart_port(model)
+    match port.read(&mut buffer) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.code == pl011.OVERRUN && error.transferred == 2 && buffer[1] == 113)
+        }
+    }
+    match port.read(&mut buffer) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.code == (pl011.BREAK | pl011.FRAMING_ERROR) && error.transferred == 0)
+        }
+    }
+    core.assert_eq(port.read(&mut buffer)!, 1usize)
+    core.assert_eq(buffer[0], 114u8)
+
+    // Loopback reads back what was written, and nothing reaches the line.
+    port.set_loopback(true)
+    port.write(b"loop")!
+    port.flush()
+    core.assert_eq(io.read_exact(&mut port, &mut buffer[..4])!, 4usize)
+    core.assert(buffer[0] == 108 && buffer[3] == 112)
+    port.set_loopback(false)
+    model = port.release()
+    model.expect_sent(b"")
+    core.assert_eq(model.cr & (1 << 7), 0u32)
+}
+
+fn uart_flow_and_break() {
+    // Flow control waits for what is queued, then changes while disabled.
+    port := uart_port(UartModel.new(2))
+    port.write(b"wait")!
+    port.set_flow_control(true, true)
+    model := port.release()
+    model.expect_sent(b"wait")
+    core.assert_eq(model.levels, 0x1Au32)
+    port = uart_port(model)
+    port.set_flow_control(true, false)
+    port.set_flow_control(false, false)
+    model = port.release()
+
+    // A break waits for what is queued, then holds the line until it is
+    // ended; in loopback the receiver reports it.
+    port = uart_port(model)
+    port.write(b"brk")!
+    port.set_break(true)
+    port.set_break(false)
+    port.set_loopback(true)
+    port.set_break(true)
+    port.set_break(false)
+    buffer: [4]u8 = [0; 4]
+    match port.read(&mut buffer) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.code == (pl011.BREAK | pl011.FRAMING_ERROR) && error.transferred == 0)
+        }
+    }
+    port.set_loopback(false)
+    // The format survives a break.
+    port.set_format(7, pl011.Parity.Even, 1)!
+    port.set_break(true)
+    port.set_break(false)
+    model = port.release()
+    model.expect_sent(b"brk")
+    core.assert(model.breaks == 3 && model.lcr_h == 0x56)
+}
+
+// The panic report as the default panic hook writes it, from the strings
+// the compiler passes; a path longer than the reporter's chunks.
+fn uart_panic_report() {
+    port := uart_port(UartModel.new(2))
+    model := port.release()
+    // As its owner left it: enabled, with the transmitter on.
+    model.cr = 0x301
+    check: [9]u8 = [111, 118, 101, 114, 102, 108, 111, 119, 0]
+    file: [48]u8 = [0; 48]
+    for index in 0..47usize {
+        file[index] = (97 + index % 26) as u8
+    }
+    unsafe {
+        rp_pins.write_failure(&mut model, ptr.as_ptr(&check), ptr.as_ptr(&file), 1234, 7)
+    }
+    // Everything is out before it returns.
+    core.assert(model.tx_count == 0 && !model.shifting)
+    model.expect_sent(b"\r\ndodo: overflow check failed at abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstu:1234:7\r\n")
+    // A disabled transmitter sends nothing, instead of waiting forever.
+    model.cr = 0
+    unsafe {
+        rp_pins.write_failure(&mut model, ptr.as_ptr(&check), ptr.as_ptr(&file), 1, 1)
+    }
+    model.expect_sent(b"")
+}
+
 fn expect_invalid(result: u32!hal.Error) {
     match result {
         ok(controller) => {
@@ -1060,6 +2345,17 @@ fn expect_invalid(result: u32!hal.Error) {
 }
 
 fn expect_invalid_spi(result: rp_pins.SpiPins!hal.Error) {
+    match result {
+        ok(pins) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn expect_invalid_uart(result: rp_pins.UartPins!hal.Error) {
     match result {
         ok(pins) => {
             core.assert(false)
@@ -1107,6 +2403,60 @@ fn rp_pin_assignments() {
     expect_invalid_spi(rp_pins.spi_pins(18, 19, some(17u32)))
     expect_invalid_spi(rp_pins.spi_pins(18, 19, some(8u32)))
     expect_invalid_spi(rp_pins.spi_pins(30, 31, none))
+
+    // UART pins come in groups of four, TX first and RX second: UART0,
+    // UART1 twice, UART0 twice, UART1 twice, and UART0 on GPIO 28 and 29.
+    uart := rp_pins.uart_pins(0, some(1u32))!
+    core.assert(uart.controller == 0 && uart.mask == 0x3)
+    uart = rp_pins.uart_pins(4, some(9u32))!
+    core.assert(uart.controller == 1 && uart.mask == 0x210)
+    uart = rp_pins.uart_pins(12, some(17u32))!
+    core.assert(uart.controller == 0 && uart.mask == 0x2_1000)
+    uart = rp_pins.uart_pins(24, none)!
+    core.assert(uart.controller == 1 && uart.mask == 0x100_0000)
+    uart = rp_pins.uart_pins(28, some(29u32))!
+    core.assert_eq(uart.controller, 0u32)
+    expect_invalid_uart(rp_pins.uart_pins(1, some(0u32)))
+    expect_invalid_uart(rp_pins.uart_pins(0, some(5u32)))
+    expect_invalid_uart(rp_pins.uart_pins(20, some(17u32)))
+    expect_invalid_uart(rp_pins.uart_pins(0, some(2u32)))
+    expect_invalid_uart(rp_pins.uart_pins(2, none))
+    expect_invalid_uart(rp_pins.uart_pins(32, none))
+    expect_invalid_uart(rp_pins.uart_pins(28, some(33u32)))
+
+    // Flow control pins: CTS third and RTS fourth in the group, on the
+    // same UART, which need not be the TX and RX pins' group.
+    flow := rp_pins.uart_flow_pins(0, 1, 2, 3)!
+    core.assert(flow.controller == 0 && flow.mask == 0xF)
+    flow = rp_pins.uart_flow_pins(4, 5, 26, 27)!
+    core.assert(flow.controller == 1 && flow.mask == 0xC00_0030)
+    flow = rp_pins.uart_flow_pins(12, 13, 18, 19)!
+    core.assert_eq(flow.controller, 0u32)
+    expect_invalid_uart(rp_pins.uart_flow_pins(0, 1, 3, 2))
+    expect_invalid_uart(rp_pins.uart_flow_pins(0, 1, 6, 7))
+    expect_invalid_uart(rp_pins.uart_flow_pins(4, 5, 2, 7))
+    expect_invalid_uart(rp_pins.uart_flow_pins(0, 2, 2, 3))
+
+    // On the RP2350, TX and RX also on the third and fourth pins.
+    aux := rp_pins.uart_aux_pins(2, some(3u32))!
+    core.assert(aux.controller == 0 && aux.mask == 0xC && aux.aux == 0xC)
+    aux = rp_pins.uart_aux_pins(26, some(9u32))!
+    core.assert(aux.controller == 1 && aux.mask == 0x400_0200 && aux.aux == 0x400_0000)
+    aux = rp_pins.uart_aux_pins(0, some(1u32))!
+    core.assert_eq(aux.aux, 0u32)
+    expect_invalid_uart(rp_pins.uart_aux_pins(1, none))
+    expect_invalid_uart(rp_pins.uart_aux_pins(2, some(2u32)))
+    expect_invalid_uart(rp_pins.uart_aux_pins(2, some(7u32)))
+    expect_invalid_uart(rp_pins.uart_pins(2, some(3u32)))
+
+    // SPI chip selects: the second pin of each group of four, in the
+    // controller's blocks.
+    core.assert_eq(rp_pins.spi_select_pin(0, 17)!, 1u32 << 17)
+    core.assert_eq(rp_pins.spi_select_pin(1, 29)!, 1u32 << 29)
+    core.assert_eq(rp_pins.spi_select_pin(0, 1)!, 2u32)
+    expect_invalid(rp_pins.spi_select_pin(0, 9))
+    expect_invalid(rp_pins.spi_select_pin(1, 16))
+    expect_invalid(rp_pins.spi_select_pin(0, 33))
 }
 
 // --- rp_pins.Bank over a fake chip -----------------------------------------
@@ -1118,13 +2468,21 @@ static mut PADS: [30]u32 = [0u32; 30]
 static mut RESETS: u32 = 0
 static mut HELD: u32 = 0
 static mut FAIL_RESET: bool = false
-// Plain memory standing in for the four controllers' register blocks: the
-// drivers only configure them and disable them again.
-static mut BLOCKS: [256]u32 = [0u32; 256]
+// The fake chip has the RP2350's UART_AUX function.
+static mut UART_AUX: bool = false
+// Plain memory standing in for the six controllers' register blocks: the
+// drivers only configure them and disable them again, and a panic report
+// leaves its last byte in a UART's data register.
+static mut BLOCKS: [384]u32 = [0u32; 384]
 
 const SIO: u32 = 5
+const UART: u32 = 2
 const DISCONNECTED: u32 = 31
+const PULL_DOWN: u32 = 1 << 2
 const PULL_UP: u32 = 1 << 3
+// The data register of each UART in BLOCKS.
+const UART0_DATA: usize = 64 * 4
+const UART1_DATA: usize = 64 * 5
 
 struct FakeChip {
     pub fn route(&mut self, pin: u32, function: u32, clear: u32, set: u32) {
@@ -1159,6 +2517,12 @@ struct FakeChip {
 
     pub fn clock_hz(&self) -> u32 {
         return CLOCK_HZ
+    }
+
+    pub fn uart_aux(&self) -> bool {
+        unsafe {
+            return UART_AUX
+        }
     }
 }
 
@@ -1249,6 +2613,130 @@ fn rp_bank() {
     }
     last := bank.spi(10, 11, none, hal.SpiMode.Mode3, 1_000_000)!
     core.assert(function(10) == 1 && function(11) == 1 && last.frequency_hz() == 992_063)
+
+    // A serial port: pulled up, so its line idles high, with its controller
+    // and pins owned once; the baud rate is checked before anything is
+    // taken.
+    serial := bank.uart(0, some(1u32), 115_200)!
+    core.assert(function(0) == UART && function(1) == UART && serial.baud() == 115_207)
+    unsafe {
+        core.assert((PADS[1] & PULL_UP) != 0 && (PADS[1] & PULL_DOWN) == 0)
+        core.assert((HELD & (1u32 << rp_pins.UART0)) == 0)
+    }
+    expect_busy(bank.uart(12, none, 115_200))
+    expect_busy(bank.gpio(1))
+    expect_busy(bank.i2c(0, 1, hal.I2C_STANDARD_HZ))
+    match bank.uart(4, some(5u32), 10_000_000) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    second := bank.uart(4, some(5u32), 9600)!
+    core.assert(function(4) == UART && second.baud() == 9600)
+
+    // A panic report goes to the ports that are claimed, once: the last
+    // byte of the message, LF, is in UART0's data register, and UART1 was
+    // released before the panic.
+    bank.release_uart(second)
+    core.assert(function(4) == DISCONNECTED && function(5) == DISCONNECTED)
+    unsafe {
+        core.assert((PADS[5] & PULL_UP) != 0 && (HELD & (1u32 << rp_pins.UART1)) != 0)
+    }
+    check: [6]u8 = [98, 111, 117, 110, 100, 0]
+    unsafe {
+        BLOCKS[UART0_DATA] = 0
+        BLOCKS[UART1_DATA] = 0
+        rp_pins.report_panic(ptr.as_ptr(&check), ptr.as_ptr(&check), 3, 4)
+        core.assert(BLOCKS[UART0_DATA] == 10 && BLOCKS[UART1_DATA] == 0)
+        BLOCKS[UART0_DATA] = 0
+        rp_pins.report_panic(ptr.as_ptr(&check), ptr.as_ptr(&check), 3, 4)
+        core.assert_eq(BLOCKS[UART0_DATA], 0u32)
+    }
+
+    // Released, the port's pins and controller can be claimed again.
+    bank.release_uart(serial)
+    core.assert(function(0) == DISCONNECTED && function(1) == DISCONNECTED)
+    unsafe {
+        core.assert((PADS[0] & PULL_UP) != 0 && (HELD & (1u32 << rp_pins.UART0)) != 0)
+    }
+    transmit_only := bank.uart(16, none, 115_200)!
+    core.assert(function(16) == UART && function(17) != UART)
+    bank.release_uart(transmit_only)
+
+    // Only a chip with UART_AUX takes TX and RX on those pins, routed to
+    // that function.
+    match bank.uart(14, some(15u32), 115_200) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    unsafe {
+        UART_AUX = true
+    }
+    auxiliary := bank.uart(14, some(13u32), 115_200)!
+    core.assert(function(14) == 11 && function(13) == UART)
+    bank.release_uart(auxiliary)
+    core.assert(function(14) == DISCONNECTED)
+    unsafe {
+        UART_AUX = false
+    }
+
+    // A port with flow control owns all four pins.
+    flow := bank.uart_flow(0, 1, 2, 3, 115_200)!
+    core.assert(function(2) == UART && function(3) == UART)
+    expect_busy(bank.gpio(3))
+    expect_busy(bank.uart(12, none, 9600))
+    bank.release_uart(flow)
+    core.assert(function(2) == DISCONNECTED && function(3) == DISCONNECTED)
+    second_flow := bank.uart_flow(4, 5, 6, 7, 9600)!
+    bank.release_uart(second_flow)
+
+    // An I2C target: the address is checked before anything is taken.
+    match bank.i2c_target(4, 5, 0x78, false, hal.I2C_FAST_HZ) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    target := bank.i2c_target(4, 5, 0x42, false, hal.I2C_FAST_HZ)!
+    core.assert(function(4) == 3 && function(5) == 3)
+    expect_busy(bank.i2c(8, 9, hal.I2C_FAST_HZ))
+    bank.release_i2c_target(target)
+    core.assert(function(4) == DISCONNECTED)
+    wide := bank.i2c_target(8, 9, 0x2A5, true, hal.I2C_STANDARD_HZ)!
+    bank.release_i2c_target(wide)
+
+    // An SPI bus with its own chip select, and a target on the other
+    // controller, whose select is pulled up so that it idles deselected.
+    bank.release_spi(last)
+    framed := bank.spi_with_select(18, 19, some(16u32), 17, hal.SpiMode.Mode0, 1_000_000)!
+    core.assert(function(17) == 1)
+    framed.set_frame_format(pl022.FrameFormat.TexasInstruments)
+    match bank.spi_with_select(10, 11, none, 17, hal.SpiMode.Mode0, 1_000_000) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    spi_target := bank.spi_target(10, 11, some(12u32), 13, hal.SpiMode.Mode3)!
+    core.assert(function(10) == 1 && function(13) == 1)
+    unsafe {
+        core.assert((PADS[13] & PULL_UP) != 0 && (PADS[13] & PULL_DOWN) == 0)
+    }
+    expect_busy(bank.spi(26, 27, none, hal.SpiMode.Mode0, 1_000_000))
+    bank.release_spi_target(spi_target)
+    bank.release_spi(framed)
+    core.assert(function(13) == DISCONNECTED && function(17) == DISCONNECTED)
 }
 
 fn main() {
@@ -1258,10 +2746,21 @@ fn main() {
     i2c_long_transfers()
     i2c_failures()
     i2c_frequency()
+    i2c_ten_bit()
+    i2c_probe()
+    i2c_target()
     spi_divisors()
     spi_configuration()
     spi_transfers()
     spi_overrun()
+    spi_frames()
+    spi_target()
+    uart_divisors()
+    uart_configuration()
+    uart_writes()
+    uart_reads()
+    uart_flow_and_break()
+    uart_panic_report()
     rp_pin_assignments()
     rp_bank()
 }

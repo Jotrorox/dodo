@@ -1,14 +1,17 @@
 package rp_pins
 
+import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/peripheral/designware_i2c"
+import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 
-// The GPIO, I2C, and SPI ownership the RP2040 and RP2350 share. On both chips
-// GPIO 0 to 29 select the same controller signals with the same function
-// numbers and pad bits, so the chip packages keep their pins in a `Bank`,
-// which checks bus pins, hands out each pin and controller once, and takes
-// them back.
+// The GPIO, I2C, SPI, and UART ownership the RP2040 and RP2350 share. On both
+// chips GPIO 0 to 29 select the same controller signals with the same
+// function numbers and pad bits, so the chip packages keep their pins in a
+// `Bank`, which checks bus pins, hands out each pin and controller once, and
+// takes them back. Serial ports claimed from a bank also report panics; see
+// report_panic.
 
 // The GPIOs whose functions both chips share.
 pub const PIN_COUNT: u32 = 30
@@ -18,13 +21,19 @@ pub const I2C0: u32 = 0
 pub const I2C1: u32 = 1
 pub const SPI0: u32 = 2
 pub const SPI1: u32 = 3
-const CONTROLLERS: usize = 4
+pub const UART0: u32 = 4
+pub const UART1: u32 = 5
+const CONTROLLERS: usize = 6
 
 // GPIO functions (FUNCSEL). NULL disconnects the pin: it floats, apart from
 // its pad's pulls.
 const FUNCTION_SPI: u32 = 1
+const FUNCTION_UART: u32 = 2
 const FUNCTION_I2C: u32 = 3
 const FUNCTION_SIO: u32 = 5
+// The RP2350's second UART function, TX and RX on the pins that otherwise
+// carry CTS and RTS.
+const FUNCTION_UART_AUX: u32 = 11
 const FUNCTION_NULL: u32 = 31
 
 // Pad controls.
@@ -73,9 +82,91 @@ pub fn spi_pins(clock: u32, tx: u32, rx: Option<u32>) -> SpiPins!hal.Error {
     return ok(SpiPins { controller, rx: none, mask })
 }
 
+// The chip select pin of SPI controller `controller` at GPIO `select`, as
+// a mask: GPIO n carries it when n % 4 is 1, in the same blocks of eight as
+// spi_pins. InvalidInput if the pin cannot.
+pub fn spi_select_pin(controller: u32, select: u32) -> u32!hal.Error {
+    if select >= PIN_COUNT || select % 4 != 1 || (select / 8) % 2 != controller {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(1u32 << select)
+}
+
+// The pins of a serial port, from `uart_pins`.
+pub struct UartPins {
+    // The controller, 0 or 1.
+    pub controller: u32
+    // Every pin of the port, one bit each.
+    pub mask: u32
+    // The pins among them on the RP2350's UART_AUX function.
+    pub aux: u32
+}
+
+// The serial port that pins `tx` and `rx` (if any) form. GPIO n carries TX
+// when n % 4 is 0 and RX when it is 1. GPIO 0 to 3, 12 to 19, 28, and 29
+// belong to UART0, GPIO 4 to 11 and 20 to 27 to UART1. InvalidInput if the
+// pins cannot form a port.
+pub fn uart_pins(tx: u32, rx: Option<u32>) -> UartPins!hal.Error {
+    if tx >= PIN_COUNT || tx % 4 != 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    controller := uart_of(tx)
+    mask := 1u32 << tx
+    if let some(number) = rx {
+        if number >= PIN_COUNT || number % 4 != 1 || uart_of(number) != controller {
+            return err(hal.Error.InvalidInput)
+        }
+        mask |= 1u32 << number
+    }
+    return ok(UartPins { controller, mask, aux: 0 })
+}
+
+// The serial port that pins `tx` and `rx` (if any) form on the RP2350,
+// which also carries TX on GPIO n with n % 4 = 2 and RX on n % 4 = 3, the
+// pins of its UART_AUX function; `aux` marks them. Pins of both kinds may
+// be mixed within a UART. InvalidInput if the pins cannot form a port.
+pub fn uart_aux_pins(tx: u32, rx: Option<u32>) -> UartPins!hal.Error {
+    if tx >= PIN_COUNT || (tx % 4 != 0 && tx % 4 != 2) {
+        return err(hal.Error.InvalidInput)
+    }
+    controller := uart_of(tx)
+    mask := 1u32 << tx
+    aux := 0u32
+    if tx % 4 == 2 {
+        aux = mask
+    }
+    if let some(number) = rx {
+        if number >= PIN_COUNT || (number % 4 != 1 && number % 4 != 3) || uart_of(number) != controller {
+            return err(hal.Error.InvalidInput)
+        }
+        mask |= 1u32 << number
+        if number % 4 == 3 {
+            aux |= 1u32 << number
+        }
+    }
+    return ok(UartPins { controller, mask, aux })
+}
+
+// The serial port of `uart_pins` with hardware flow control: GPIO n
+// carries CTS when n % 4 is 2 and RTS when it is 3, in the same groups of
+// four. InvalidInput if the pins cannot form the port.
+pub fn uart_flow_pins(tx: u32, rx: u32, cts: u32, rts: u32) -> UartPins!hal.Error {
+    pins := uart_pins(tx, some(rx))?
+    if cts >= PIN_COUNT || rts >= PIN_COUNT || cts % 4 != 2 || rts % 4 != 3 || uart_of(cts) != pins.controller || uart_of(rts) != pins.controller {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(UartPins { controller: pins.controller, mask: pins.mask | (1u32 << cts) | (1u32 << rts), aux: 0 })
+}
+
+// The UART of GPIO `number`'s group of four pins: groups 0, 3, 4, and 7 are
+// UART0's, groups 1, 2, 5, and 6 UART1's.
+fn uart_of(number: u32) -> u32 {
+    return ((number / 4 + 1) / 2) % 2
+}
+
 // GPIO 0 to 29 and the bus controllers of one chip C, each handed out once
 // and taken back by the release methods. C does what differs between the
-// chips, with these methods, `controller` numbered as I2C0 to SPI1 above:
+// chips, with these methods, `controller` numbered as I2C0 to UART1 above:
 //
 //    route(&mut self, pin: u32, function: u32, clear: u32, set: u32)
 //        connect the pin to FUNCSEL `function`, then clear the `clear` and
@@ -88,20 +179,22 @@ pub fn spi_pins(clock: u32, tx: u32, rx: Option<u32>) -> SpiPins!hal.Error {
 //        the controller's register block
 //    clock_hz(&self) -> u32
 //        the frequency of the clock that feeds the controllers
+//    uart_aux(&self) -> bool
+//        whether the chip has the UART_AUX function (the RP2350)
 pub struct Bank<C> {
     chip: C
     // Pins in use, one bit each.
     taken: u32
     // The pins of each controller's bus, by controller number; 0 while the
     // controller is free.
-    buses: [4]u32
+    buses: [6]u32
 
     // SAFETY: C's methods must do what the protocol above says, `base` must
-    // name the controller's PL022 or DW_apb_i2c, and the bank must be the
-    // only user of GPIO 0 to 29's control and pad registers, of the four
-    // controllers, and of their resets.
+    // name the controller's DW_apb_i2c, PL022, or PL011, and the bank must
+    // be the only bank, and the only user of GPIO 0 to 29's control and pad
+    // registers, of the six controllers, and of their resets.
     pub unsafe fn new(chip: C) -> Bank<C> {
-        return Bank<C> { chip, taken: 0, buses: [0u32; 4] }
+        return Bank<C> { chip, taken: 0, buses: [0u32; 6] }
     }
 
     // Claim pin `number` for the single-cycle I/O block. Returns its bit, for
@@ -156,6 +249,106 @@ pub struct Bank<C> {
         }
     }
 
+    // Claim pins `sda` and `scl` as an I2C target answering at `address`, a
+    // 10-bit address with `ten_bit`; see designware_i2c.target_address.
+    // `frequency_hz` is the master's SCL frequency, for the input filter.
+    // Errors as for `i2c`, and InvalidInput for a reserved address.
+    pub fn i2c_target(&mut self, sda: u32, scl: u32, address: u16, ten_bit: bool, frequency_hz: u32) -> designware_i2c.TargetBus!hal.Error {
+        controller := I2C0 + i2c_controller(sda, scl)?
+        designware_i2c.target_address(address, ten_bit)?
+        timing := designware_i2c.timing(self.chip.clock_hz(), frequency_hz)?
+        self.start(controller, (1u32 << sda) | (1u32 << scl))?
+        // SAFETY: as for `i2c`, with the address checked above.
+        unsafe {
+            target := designware_i2c.TargetBus.at(self.chip.base(controller), timing, address, ten_bit)
+            self.connect(controller, FUNCTION_I2C, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
+            return ok(target)
+        }
+    }
+
+    // `spi`, with the controller's own chip select on pin `select` as
+    // well; see spi_select_pin. The TI and Microwire frame formats need
+    // it. Errors as for `spi`.
+    pub fn spi_with_select(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode, frequency_hz: u32) -> pl022.Bus!hal.Error {
+        pins := spi_pins(clock, tx, rx)?
+        select_mask := spi_select_pin(pins.controller, select)?
+        controller := SPI0 + pins.controller
+        divisors := pl022.divisors(self.chip.clock_hz(), frequency_hz)?
+        self.start(controller, pins.mask | select_mask)?
+        // SAFETY: as for `i2c`.
+        unsafe {
+            bus := pl022.Bus.at(self.chip.base(controller), divisors, mode)
+            self.connect(controller, FUNCTION_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
+            return ok(bus)
+        }
+    }
+
+    // Claim pins as an SPI target in `mode`, clocked and selected by
+    // another master: `clock` and `select` are inputs, `rx` receives what
+    // the master sends, and `tx` answers it; see spi_pins and
+    // spi_select_pin. Pulled up, an unconnected select leaves the target
+    // deselected. Errors as for `spi`.
+    pub fn spi_target(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode) -> pl022.TargetBus!hal.Error {
+        pins := spi_pins(clock, tx, rx)?
+        select_mask := spi_select_pin(pins.controller, select)?
+        controller := SPI0 + pins.controller
+        self.start(controller, pins.mask | select_mask)?
+        // SAFETY: as for `i2c`.
+        unsafe {
+            target := pl022.TargetBus.at(self.chip.base(controller), mode)
+            self.connect(controller, FUNCTION_SPI, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
+            self.chip.route(select, FUNCTION_SPI, PAD_PULL_DOWN, PAD_PULL_UP)
+            return ok(target)
+        }
+    }
+
+    // Claim pin `tx`, and `rx` if any, as a serial port with 8N1 frames at
+    // the baud rate closest to `baud`; see uart_pins for the pins.
+    // InvalidInput if the pins cannot form a port or the baud rate is out of
+    // range, Busy if a pin or the controller is taken. Until the port is
+    // released, report_panic writes to it.
+    pub fn uart(&mut self, tx: u32, rx: Option<u32>, baud: u32) -> pl011.Port!hal.Error {
+        if self.chip.uart_aux() {
+            return self.open_uart(uart_aux_pins(tx, rx)?, baud)
+        }
+        return self.open_uart(uart_pins(tx, rx)?, baud)
+    }
+
+    fn open_uart(&mut self, pins: UartPins, baud: u32) -> pl011.Port!hal.Error {
+        controller := UART0 + pins.controller
+        divisors := pl011.divisors(self.chip.clock_hz(), baud)?
+        self.start(controller, pins.mask)?
+        // Pulled up, so a receiver with nothing connected, and the pins once
+        // released, idle high like a line between frames instead of reading
+        // as a break. Routed before the controller is enabled, as the Pico
+        // SDK's stdio does, so the receiver never starts on a low, unrouted
+        // input and reads a byte that was never sent.
+        self.connect(controller, FUNCTION_UART, PAD_OUTPUT_DISABLE | PAD_PULL_DOWN, PAD_INPUT_ENABLE | PAD_PULL_UP)
+        for number in 0..PIN_COUNT {
+            if (pins.aux & (1u32 << number)) != 0 {
+                self.chip.route(number, FUNCTION_UART_AUX, 0, 0)
+            }
+        }
+        base := self.chip.base(controller)
+        // SAFETY: as for `i2c`. Bank.new vouches that this is the only bank,
+        // so only it changes CONSOLES.
+        unsafe {
+            port := pl011.Port.at(base, divisors)
+            CONSOLES[(controller - UART0) as usize] = base
+            return ok(port)
+        }
+    }
+
+    // `uart` with hardware flow control on pins `cts` and `rts` as well,
+    // turned on; see uart_flow_pins and pl011's set_flow_control. Errors as
+    // for `uart`.
+    pub fn uart_flow(&mut self, tx: u32, rx: u32, cts: u32, rts: u32, baud: u32) -> pl011.Port!hal.Error {
+        pins := uart_flow_pins(tx, rx, cts, rts)?
+        port := self.open_uart(pins, baud)?
+        port.set_flow_control(true, true)
+        return ok(port)
+    }
+
     // Give back an I2C bus from `i2c`: its pins are disconnected, still
     // pulled up so the bus stays idle, and its controller held in reset.
     // The pins can then be claimed as GPIOs, for example to clock a stuck
@@ -164,9 +357,36 @@ pub struct Bank<C> {
         self.stop(bus.release())
     }
 
-    // Give back an SPI bus from `spi`, as for `release_i2c`.
+    // Give back an I2C target from `i2c_target`, as for `release_i2c`.
+    pub fn release_i2c_target(&mut self, target: designware_i2c.TargetBus) {
+        self.stop(target.release())
+    }
+
+    // Give back an SPI bus from `spi` or `spi_with_select`, as for
+    // `release_i2c`.
     pub fn release_spi(&mut self, bus: pl022.Bus) {
         self.stop(bus.release())
+    }
+
+    // Give back an SPI target from `spi_target`, as for `release_i2c`.
+    pub fn release_spi_target(&mut self, target: pl022.TargetBus) {
+        self.stop(target.release())
+    }
+
+    // Give back a serial port from `uart` or `uart_flow` once everything
+    // written to it is out, as for `release_i2c`: its pins stay pulled up,
+    // so the line stays idle.
+    pub fn release_uart(&mut self, port: pl011.Port) {
+        base := port.release()
+        // SAFETY: as for `uart`.
+        unsafe {
+            for index in 0..2usize {
+                if CONSOLES[index] == base {
+                    CONSOLES[index] = 0
+                }
+            }
+        }
+        self.stop(base)
     }
 
     // Take `controller` and the pins in `pins`, all or none, then pulse the
@@ -229,4 +449,102 @@ pub struct Bank<C> {
         }
         self.taken &= ~pins
     }
+}
+
+// The register blocks of the serial ports a Bank handed out and has not
+// taken back, by UART number; 0 for none. Panics are reported on them.
+static mut CONSOLES: [2]usize = [0usize; 2]
+// Set once a panic report starts, so a failure while reporting halts
+// instead of reporting again.
+static mut REPORTING: bool = false
+
+// The chip runtimes' default panic hook, dodo_board_panic, calls this weak
+// symbol, if a program defines it, before it halts. Every program that uses
+// std/embedded/chip defines it through this package; it writes nothing
+// until a serial port is claimed.
+extern "C" fn dodo_panic_report(check: *const u8, file: *const u8, line: u32, column: u32) {
+    // SAFETY: the compiler passes NUL-terminated strings, and the hook
+    // halts afterwards.
+    unsafe {
+        report_panic(check, file, line, column)
+    }
+}
+
+// Write a failed check, as the compiler passes it to a firmware panic hook,
+// to every serial port claimed from a Bank and not yet released, and wait
+// until it is out:
+//
+//     dodo: arithmetic overflow check failed at /home/me/blink/main.dodo:12:5
+//
+// the line a desktop program prints, on a line of its own. Only the first
+// call reports; a failure while reporting must not report again.
+// SAFETY: `check` and `file` must be NUL-terminated, and the caller must
+// halt or reset afterwards, as this takes the ports from their owners.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        if REPORTING {
+            return
+        }
+        REPORTING = true
+        for index in 0..2usize {
+            if CONSOLES[index] != 0 {
+                registers := hal.RegisterBlock.at(CONSOLES[index])
+                write_failure(&mut registers, check, file, line, column)
+            }
+        }
+    }
+}
+
+// Write the report of report_panic to the PL011 with registers R, a value
+// with the register block protocol, as its owner configured it.
+// SAFETY: `check` and `file` must be NUL-terminated.
+pub unsafe fn write_failure<R>(registers: &mut R, check: *const u8, file: *const u8, line: u32, column: u32) {
+    pl011.send(registers, b"\r\ndodo: ")
+    unsafe {
+        send_text(registers, check)
+        pl011.send(registers, b" check failed at ")
+        send_text(registers, file)
+    }
+    pl011.send(registers, b":")
+    send_number(registers, line)
+    pl011.send(registers, b":")
+    send_number(registers, column)
+    pl011.send(registers, b"\r\n")
+}
+
+// Send a NUL-terminated string, up to its first 1024 bytes.
+// SAFETY: `text` must be NUL-terminated.
+unsafe fn send_text<R>(registers: &mut R, text: *const u8) {
+    chunk: [32]u8 = [0; 32]
+    used := 0usize
+    for index in 0..1024isize {
+        byte := unsafe {
+            ptr.read(ptr.offset(text, index))
+        }
+        if byte == 0 {
+            break
+        }
+        chunk[used] = byte
+        used += 1
+        if used == 32 {
+            pl011.send(registers, &chunk)
+            used = 0
+        }
+    }
+    pl011.send(registers, &chunk[..used])
+}
+
+fn send_number<R>(registers: &mut R, value: u32) {
+    digits: [10]u8 = [0; 10]
+    position := 10usize
+    rest := value
+    for {
+        position -= 1
+        digits[position] = (48 + rest % 10) as u8
+        rest = rest / 10
+        if rest == 0 {
+            break
+        }
+    }
+    pl011.send(registers, &digits[position..])
 }

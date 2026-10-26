@@ -2,28 +2,35 @@ package designware_i2c
 
 import "std/embedded/hal"
 
-// The Synopsys DesignWare DW_apb_i2c controller as the only master on an I2C
-// bus. Chip vendors license this controller, so the same registers appear in
-// many microcontrollers, among them the RP2040 and RP2350 (I2C0 and I2C1).
+// The Synopsys DesignWare DW_apb_i2c controller, as the only master on an
+// I2C bus or as a target (slave) that a master addresses. Chip vendors
+// license this controller, so the same registers appear in many
+// microcontrollers, among them the RP2040 and RP2350 (I2C0 and I2C1).
 // `Controller` implements the std/embedded/hal I2C bus protocol over any
 // register block: a `hal.RegisterBlock` on the chip, or a simulated
-// controller in a desktop test.
+// controller in a desktop test. `Target` answers another master.
 //
 // Chip packages pulse the controller's reset, route its two pins, pass the
 // frequency of the clock that feeds it, and hand the controller to
-// applications as a `Bus`. Supported: 7-bit addresses, standard, fast,
-// and fast-plus speeds (up to 1 MHz), and transfers of any length, with the
-// register FIFOs kept busy so bytes follow each other without gaps. Every wait is bounded, so a
-// device that holds the clock low forever yields hal.Error.Timeout instead of
-// a hang. Not supported: 10-bit addresses, high-speed mode, target (slave)
-// mode, and empty transfers, which the controller cannot send: an address
-// probe has to read one byte.
+// applications as a `Bus` or `TargetBus`. A master supports 7-bit and
+// 10-bit addresses, standard, fast, and fast-plus speeds (up to 1 MHz), and
+// transfers of any length, with the register FIFOs kept busy so bytes follow
+// each other without gaps. Every wait is bounded, so a device that holds
+// the clock low forever yields hal.Error.Timeout instead of a hang.
+//
+// Two things the controller cannot do. It has no way to send an address
+// without at least one data byte after it, so empty transfers are
+// InvalidInput; `probe` finds devices with a one-byte read instead, as
+// i2cdetect does. And high-speed mode (3.4 MHz) needs timing registers and
+// a master code that the RP2040 and RP2350 leave out of their controllers:
+// their IC_CON accepts fast mode plus at most, so `timing` stops at 1 MHz.
 //
 // Register names follow the DW_apb_i2c databook, as reproduced in the RP2040
 // datasheet (4.3.17).
 
 const CON: usize = 0x00
 const TAR: usize = 0x04
+const SAR: usize = 0x08
 const DATA_CMD: usize = 0x10
 const FS_SCL_HCNT: usize = 0x1C
 const FS_SCL_LCNT: usize = 0x20
@@ -32,35 +39,52 @@ const RAW_INTR_STAT: usize = 0x34
 const RX_TL: usize = 0x38
 const TX_TL: usize = 0x3C
 const CLR_INTR: usize = 0x40
+const CLR_RD_REQ: usize = 0x50
 const CLR_TX_ABRT: usize = 0x54
+const CLR_RX_DONE: usize = 0x58
 const CLR_STOP_DET: usize = 0x60
 const ENABLE: usize = 0x6C
 const STATUS: usize = 0x70
 const SDA_HOLD: usize = 0x7C
 const TX_ABRT_SOURCE: usize = 0x80
+const ACK_GENERAL_CALL: usize = 0x98
 const ENABLE_STATUS: usize = 0x9C
 const FS_SPKLEN: usize = 0xA0
 const COMP_PARAM_1: usize = 0xF4
 
-// CON: master only, fast-mode timing registers (which also serve standard
-// mode and fast mode plus), repeated starts, and TX_EMPTY only once the last
-// command has left the shift register.
+// CON: master mode, fast-mode timing registers (which also serve standard
+// mode and fast mode plus), 10-bit addressing as a target and as a master,
+// repeated starts, the target disabled, STOP detected only in transactions
+// that address the target, TX_EMPTY only once the last command has left the
+// shift register, and SCL held low while the receive FIFO is full.
 const MASTER_MODE: u32 = 1 << 0
 const SPEED: u32 = 0b11 << 1
 const SPEED_FAST: u32 = 2
+const TARGET_TEN_BIT: u32 = 1 << 3
+const MASTER_TEN_BIT: u32 = 1 << 4
 const RESTART_ENABLE: u32 = 1 << 5
 const SLAVE_DISABLE: u32 = 1 << 6
+const STOP_IF_ADDRESSED: u32 = 1 << 7
 const TX_EMPTY_CONTROL: u32 = 1 << 8
+const RX_FULL_HOLD: u32 = 1 << 9
+
+// TAR: 10-bit addressing, where the integration lets TAR change it rather
+// than CON (I2C_DYNAMIC_TAR_UPDATE). The driver sets both.
+const TAR_TEN_BIT: u32 = 1 << 12
 
 // DATA_CMD: a data byte to send, or a read command, plus the condition to
-// generate around it.
+// generate around it. A received byte comes with FIRST_DATA_BYTE when it is
+// the first after an address.
 const READ: u32 = 1 << 8
 const STOP: u32 = 1 << 9
 const RESTART: u32 = 1 << 10
+const FIRST_DATA_BYTE: u32 = 1 << 11
 
 // RAW_INTR_STAT.
 const TX_EMPTY: u32 = 1 << 4
+const READ_REQUEST: u32 = 1 << 5
 const TX_ABORT: u32 = 1 << 6
+const RX_DONE: u32 = 1 << 7
 const STOP_DETECTED: u32 = 1 << 9
 
 // ENABLE and ENABLE_STATUS.
@@ -170,6 +194,26 @@ pub fn timing(clock_hz: u32, frequency_hz: u32) -> Timing!hal.Error {
     })
 }
 
+// CON for the bus's only master.
+fn master_control() -> u32 {
+    return MASTER_MODE | hal.encode(SPEED, SPEED_FAST) | RESTART_ENABLE | SLAVE_DISABLE | TX_EMPTY_CONTROL
+}
+
+// TAR for a 7-bit or a 10-bit address.
+fn seven_bit(address: u8) -> u32!hal.Error {
+    if address > 0x7F {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(address as u32)
+}
+
+fn ten_bit(address: u16) -> u32!hal.Error {
+    if address > 0x3FF {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(TAR_TEN_BIT | address as u32)
+}
+
 // An I2C bus master on one DW_apb_i2c controller with registers R, a value
 // with the register block protocol of std/embedded/hal. Implements the
 // std/embedded/hal I2C bus protocol.
@@ -188,7 +232,7 @@ pub struct Controller<R> {
     pub fn new(registers: R, timing: Timing) -> Controller<R> {
         bus := Controller<R> { registers, timing, rx_depth: MINIMUM_DEPTH, target: NO_TARGET }
         bus.registers.write(ENABLE, 0)
-        bus.registers.write(CON, MASTER_MODE | hal.encode(SPEED, SPEED_FAST) | RESTART_ENABLE | SLAVE_DISABLE | TX_EMPTY_CONTROL)
+        bus.registers.write(CON, master_control())
         // Transfers poll the FIFO levels; no interrupts or DMA requests.
         bus.registers.write(INTR_MASK, 0)
         bus.registers.write(TX_TL, 0)
@@ -222,21 +266,13 @@ pub struct Controller<R> {
     // another master won arbitration, Timeout if the bus is stuck, and
     // InvalidInput for an empty transfer or an address above 0x7F.
     pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
-        if bytes.len == 0 {
-            return err(hal.Error.InvalidInput)
-        }
-        self.start(address)?
-        return self.send(bytes, true)
+        return self.write_to(seven_bit(address)?, bytes)
     }
 
     // Fill `buffer` from the device at `address`, then a STOP condition.
     // Errors as for `write`.
     pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
-        if buffer.len == 0 {
-            return err(hal.Error.InvalidInput)
-        }
-        self.start(address)?
-        return self.receive(buffer, false)
+        return self.read_from(seven_bit(address)?, buffer)
     }
 
     // Send `bytes`, then fill `buffer` after a repeated START, all in one
@@ -244,15 +280,45 @@ pub struct Controller<R> {
     // read a numbered register. Errors as for `write`, and InvalidInput only
     // when both are empty.
     pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
-        if bytes.len == 0 {
-            return self.read(address, buffer)
+        return self.write_read_with(seven_bit(address)?, bytes, buffer)
+    }
+
+    // `write`, `read`, and `write_read` for a device with a 10-bit
+    // address, 0 to 0x3FF. The controller sends the two address bytes the
+    // I2C specification prescribes (11110, the top two bits, then the low
+    // eight) and repeats the first with the read bit before reading.
+    // InvalidInput for an address above 0x3FF.
+    pub fn write_ten_bit(&mut self, address: u16, bytes: &[u8]) -> void!hal.Error {
+        return self.write_to(ten_bit(address)?, bytes)
+    }
+
+    pub fn read_ten_bit(&mut self, address: u16, buffer: &mut[u8]) -> void!hal.Error {
+        return self.read_from(ten_bit(address)?, buffer)
+    }
+
+    pub fn write_read_ten_bit(&mut self, address: u16, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        return self.write_read_with(ten_bit(address)?, bytes, buffer)
+    }
+
+    // Whether a device acknowledges `address`, found by reading one byte
+    // from it, as `i2cdetect -r` does, since the controller cannot send an
+    // address alone. The byte is discarded. Errors other than NoAcknowledge
+    // as for `read`. A few write-only devices take an unexpected read
+    // badly; probe only addresses that may hold such a device if its
+    // datasheet allows reads.
+    pub fn probe(&mut self, address: u8) -> bool!hal.Error {
+        byte: [1]u8 = [0]
+        match self.read(address, &mut byte) {
+            ok() => {
+                return ok(true)
+            }
+            err(error) => {
+                if error == hal.Error.NoAcknowledge {
+                    return ok(false)
+                }
+                return err(error)
+            }
         }
-        if buffer.len == 0 {
-            return self.write(address, bytes)
-        }
-        self.start(address)?
-        self.send(bytes, false)?
-        return self.receive(buffer, true)
     }
 
     // Disable the controller and give back its registers.
@@ -266,6 +332,34 @@ pub struct Controller<R> {
         return registers
     }
 
+    fn write_to(&mut self, target: u32, bytes: &[u8]) -> void!hal.Error {
+        if bytes.len == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.start(target)?
+        return self.send(bytes, true)
+    }
+
+    fn read_from(&mut self, target: u32, buffer: &mut[u8]) -> void!hal.Error {
+        if buffer.len == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.start(target)?
+        return self.receive(buffer, false)
+    }
+
+    fn write_read_with(&mut self, target: u32, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        if bytes.len == 0 {
+            return self.read_from(target, buffer)
+        }
+        if buffer.len == 0 {
+            return self.write_to(target, bytes)
+        }
+        self.start(target)?
+        self.send(bytes, false)?
+        return self.receive(buffer, true)
+    }
+
     fn apply_timing(&mut self) {
         self.registers.write(FS_SCL_HCNT, self.timing.high)
         self.registers.write(FS_SCL_LCNT, self.timing.low)
@@ -274,16 +368,19 @@ pub struct Controller<R> {
         self.registers.write(SDA_HOLD, (hold & ~SDA_TX_HOLD) | self.timing.hold)
     }
 
-    // Address the device and clear what the last transaction left behind.
-    // TAR can change only while the controller is disabled.
-    fn start(&mut self, address: u8) -> void!hal.Error {
-        if address > 0x7F {
-            return err(hal.Error.InvalidInput)
-        }
-        if self.target != address as u32 {
+    // Address the device, a TAR value from seven_bit or ten_bit, and clear
+    // what the last transaction left behind. TAR and CON can change only
+    // while the controller is disabled.
+    fn start(&mut self, target: u32) -> void!hal.Error {
+        if self.target != target {
             self.disable()?
-            self.registers.write(TAR, address as u32)
-            self.target = address as u32
+            control := master_control()
+            if (target & TAR_TEN_BIT) != 0 {
+                control |= MASTER_TEN_BIT
+            }
+            self.registers.write(CON, control)
+            self.registers.write(TAR, target)
+            self.target = target
         }
         // Reading CLR_INTR clears every flag, including a stale STOP.
         self.registers.read(CLR_INTR)
@@ -441,6 +538,215 @@ pub struct Controller<R> {
     }
 }
 
+// The SAR value for a target address: a 7-bit address outside the ranges
+// the I2C specification reserves (0x00 to 0x07 and 0x78 to 0x7F), or with
+// `ten_bit` any 10-bit address, 0 to 0x3FF. InvalidInput otherwise.
+pub fn target_address(address: u16, ten_bit: bool) -> u32!hal.Error {
+    if ten_bit {
+        if address > 0x3FF {
+            return err(hal.Error.InvalidInput)
+        }
+    } else if address < 0x08 || address > 0x77 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(address as u32)
+}
+
+// What happened on the bus, from `Target.poll`.
+pub enum TargetEvent {
+    // Nothing since the last poll.
+    Idle,
+    // The master wrote `count` bytes, now at the start of the buffer given
+    // to `poll`. `start` is true when the first of them is the first byte
+    // after the target's address, so it begins a new write, for example a
+    // register number; the bytes of one poll never span two writes.
+    Write(count: usize, start: bool),
+    // The master reads and waits, with SCL held low, until `respond`
+    // queues the bytes for it.
+    Read,
+    // A transaction addressed to the target ended with a STOP condition.
+    Stop
+}
+
+// No byte held back between two polls.
+const NO_ENTRY: u32 = 0xFFFF_FFFF
+
+// A target (slave) on an I2C bus, answering a master at one address with
+// one DW_apb_i2c controller with registers R, a value with the register
+// block protocol of std/embedded/hal. The program polls for what the master
+// does: written bytes arrive in order, each read waits for `respond`, and a
+// STOP ends the transaction.
+//
+//     match target.poll(&mut buffer) {
+//         designware_i2c.TargetEvent.Write(count, start) => { ... }
+//         designware_i2c.TargetEvent.Read => { target.respond(&reply) }
+//         ...
+//     }
+//
+// The controller holds SCL low while its receive FIFO is full or a read
+// waits, so a slow program delays the master but loses nothing; masters
+// accept such clock stretching, unless they give up after a timeout of
+// their own (SMBus allows 25 ms). Bytes queued by `respond` beyond what the
+// master reads are dropped when it next reads. General calls (address 0)
+// are not acknowledged.
+pub struct Target<R> {
+    registers: R
+    // A received FIFO entry that starts a new write, read by the last poll
+    // and held back for the next, or NO_ENTRY.
+    held: u32
+
+    // Configure a controller fresh out of reset as a target at `address`,
+    // a 10-bit address with `ten_bit`, and enable it. The address must pass
+    // `target_address`; chip packages check it before they take the
+    // controller. `timing`, for the
+    // bus's SCL frequency from the clock that feeds the controller, sets
+    // the spike filter and SDA hold time; a target follows the master's
+    // clock whatever its frequency.
+    pub fn new(registers: R, timing: Timing, address: u16, ten_bit: bool) -> Target<R> {
+        sar := 0u32
+        match target_address(address, ten_bit) {
+            ok(value) => {
+                sar = value
+            }
+            err(_) => {
+                core.assert(false)
+            }
+        }
+        target := Target<R> { registers, held: NO_ENTRY }
+        target.registers.write(ENABLE, 0)
+        control := hal.encode(SPEED, SPEED_FAST) | STOP_IF_ADDRESSED | RX_FULL_HOLD
+        if ten_bit {
+            control |= TARGET_TEN_BIT
+        }
+        target.registers.write(CON, control)
+        target.registers.write(SAR, sar)
+        target.registers.write(INTR_MASK, 0)
+        target.registers.write(TX_TL, 0)
+        target.registers.write(RX_TL, 0)
+        target.registers.write(ACK_GENERAL_CALL, 0)
+        target.registers.write(FS_SPKLEN, timing.spike)
+        hold := target.registers.read(SDA_HOLD)
+        target.registers.write(SDA_HOLD, (hold & ~SDA_TX_HOLD) | timing.hold)
+        target.registers.read(CLR_INTR)
+        target.registers.write(ENABLE, ENABLED)
+        return target
+    }
+
+    // What the master did since the last poll, in order: first the bytes
+    // it wrote, as many as fit `buffer`, then a STOP, then a read that
+    // waits for `respond`. Never waits. A program that polls more slowly
+    // than whole transactions arrive may see one Stop for several; `start`
+    // still marks where each write begins.
+    pub fn poll(&mut self, buffer: &mut[u8]) -> TargetEvent {
+        raw := self.registers.read(RAW_INTR_STAT)
+        if (raw & TX_ABORT) != 0 {
+            // A read began while bytes of an earlier reply were still
+            // queued, and the controller dropped them. It refuses new
+            // bytes until this is cleared.
+            self.registers.read(CLR_TX_ABRT)
+        }
+        if (raw & RX_DONE) != 0 {
+            // The master acknowledged no more bytes of a reply.
+            self.registers.read(CLR_RX_DONE)
+        }
+        count := 0usize
+        start := false
+        for count < buffer.len {
+            entry := self.held
+            if entry == NO_ENTRY {
+                if (self.registers.read(STATUS) & RX_NOT_EMPTY) == 0 {
+                    break
+                }
+                entry = self.registers.read(DATA_CMD)
+            }
+            self.held = NO_ENTRY
+            first := (entry & FIRST_DATA_BYTE) != 0
+            if first && count > 0 {
+                self.held = entry
+                break
+            }
+            if count == 0 {
+                start = first
+            }
+            buffer[count] = (entry & 0xFF) as u8
+            count += 1
+        }
+        if count > 0 {
+            return TargetEvent.Write(count, start)
+        }
+        if self.held != NO_ENTRY || (self.registers.read(STATUS) & RX_NOT_EMPTY) != 0 {
+            // Written bytes wait for a buffer; anything after them is later.
+            return TargetEvent.Idle
+        }
+        // A STOP and a waiting read can both be flagged only when the STOP
+        // came first: the master cannot end a read the target holds up.
+        if (raw & STOP_DETECTED) != 0 {
+            self.registers.read(CLR_STOP_DET)
+            return TargetEvent.Stop
+        }
+        if (raw & READ_REQUEST) != 0 {
+            return TargetEvent.Read
+        }
+        return TargetEvent.Idle
+    }
+
+    // Answer a Read from `poll` with `bytes`, as many as the transmit FIFO
+    // holds; returns how many. The master reads them one by one and may
+    // stop early; if it reads on, the next poll reports another Read. An
+    // empty `bytes` sends 0xFF, which is what the master would read from an
+    // idle bus, so that it is never left waiting.
+    pub fn respond(&mut self, bytes: &[u8]) -> usize {
+        count := 0usize
+        if bytes.len == 0 {
+            self.registers.write(DATA_CMD, 0xFF)
+        }
+        for count < bytes.len && (self.registers.read(STATUS) & TX_NOT_FULL) != 0 {
+            self.registers.write(DATA_CMD, bytes[count] as u32)
+            count += 1
+        }
+        self.registers.read(CLR_RD_REQ)
+        return count
+    }
+
+    // Answer at `address` from the next transaction on, a 10-bit address
+    // with `ten_bit`, as for `target_address`. Waits, at most about a
+    // second, for the current transaction to end; Timeout if it does not,
+    // InvalidInput for a reserved or too large address. Either leaves the
+    // address unchanged.
+    pub fn set_address(&mut self, address: u16, ten_bit: bool) -> void!hal.Error {
+        sar := target_address(address, ten_bit)?
+        self.registers.write(ENABLE, 0)
+        for _ in 0..POLLS {
+            if (self.registers.read(ENABLE_STATUS) & ENABLED) == 0 {
+                control := self.registers.read(CON) & ~TARGET_TEN_BIT
+                if ten_bit {
+                    control |= TARGET_TEN_BIT
+                }
+                self.registers.write(CON, control)
+                self.registers.write(SAR, sar)
+                self.held = NO_ENTRY
+                self.registers.read(CLR_INTR)
+                self.registers.write(ENABLE, ENABLED)
+                return ok()
+            }
+        }
+        self.registers.write(ENABLE, ENABLED)
+        return err(hal.Error.Timeout)
+    }
+
+    // Stop answering, disable the controller, and give back its registers.
+    pub fn release(self) -> R {
+        self.registers.write(ENABLE, 0)
+        for _ in 0..CLEANUP_POLLS {
+            if (self.registers.read(ENABLE_STATUS) & ENABLED) == 0 {
+                break
+            }
+        }
+        let Target { registers, held } = self
+        return registers
+    }
+}
+
 // A DW_apb_i2c on the chip, as chip packages hand it to applications. It
 // implements the std/embedded/hal I2C bus protocol like Controller but keeps
 // the register block: `RegisterBlock` trusts its owner with every offset,
@@ -468,6 +774,24 @@ pub struct Bus {
         return self.controller.write_read(address, bytes, buffer)
     }
 
+    // The transactions above for a device with a 10-bit address.
+    pub fn write_ten_bit(&mut self, address: u16, bytes: &[u8]) -> void!hal.Error {
+        return self.controller.write_ten_bit(address, bytes)
+    }
+
+    pub fn read_ten_bit(&mut self, address: u16, buffer: &mut[u8]) -> void!hal.Error {
+        return self.controller.read_ten_bit(address, buffer)
+    }
+
+    pub fn write_read_ten_bit(&mut self, address: u16, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        return self.controller.write_read_ten_bit(address, bytes, buffer)
+    }
+
+    // Whether a device acknowledges `address`, from a one-byte read.
+    pub fn probe(&mut self, address: u8) -> bool!hal.Error {
+        return self.controller.probe(address)
+    }
+
     // The SCL frequency, in hertz.
     pub fn frequency_hz(&self) -> u32 {
         return self.controller.frequency_hz()
@@ -483,6 +807,43 @@ pub struct Bus {
     pub fn release(self) -> usize {
         let Bus { controller } = self
         registers := controller.release()
+        return registers.base()
+    }
+}
+
+// A DW_apb_i2c on the chip as a target, as chip packages hand it to
+// applications; see Target.
+pub struct TargetBus {
+    target: Target<hal.RegisterBlock>
+
+    // SAFETY: as for Bus.at. `address` and `ten_bit` must pass
+    // target_address.
+    pub unsafe fn at(base: usize, timing: Timing, address: u16, ten_bit: bool) -> TargetBus {
+        unsafe {
+            return TargetBus { target: Target.new(hal.RegisterBlock.at(base), timing, address, ten_bit) }
+        }
+    }
+
+    // What the master did since the last poll; see Target.poll.
+    pub fn poll(&mut self, buffer: &mut[u8]) -> TargetEvent {
+        return self.target.poll(buffer)
+    }
+
+    // Answer a Read with `bytes`; see Target.respond.
+    pub fn respond(&mut self, bytes: &[u8]) -> usize {
+        return self.target.respond(bytes)
+    }
+
+    // Answer at another address; see Target.set_address.
+    pub fn set_address(&mut self, address: u16, ten_bit: bool) -> void!hal.Error {
+        return self.target.set_address(address, ten_bit)
+    }
+
+    // Disable the controller and return its base address, for the chip
+    // package to take it back.
+    pub fn release(self) -> usize {
+        let TargetBus { target } = self
+        registers := target.release()
         return registers.base()
     }
 }
