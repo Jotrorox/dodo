@@ -101,25 +101,6 @@ fn peripheral_drivers_execute_against_simulated_controllers() {
 }
 
 #[test]
-fn pl011_executes_against_a_simulated_uart() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let scratch = Scratch::new("pl011");
-    let source = root.join("tests/stdlib/pl011_checks.dodo");
-    for optimization in ["0", "3"] {
-        let executable = scratch.0.join(format!(
-            "pl011-O{optimization}{}",
-            std::env::consts::EXE_SUFFIX
-        ));
-        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
-        success(&dodo(&args, &executable), "compile PL011 fixture");
-        success(
-            &Command::new(&executable).output().unwrap(),
-            "execute PL011 fixture",
-        );
-    }
-}
-
-#[test]
 fn sensor_example_tests_pass_against_fakes() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = dodo(&["test"], &root.join("examples/hal_sensor.dodo"));

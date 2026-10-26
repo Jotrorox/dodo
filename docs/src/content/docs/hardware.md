@@ -16,7 +16,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal` | `hal.Critical`, a section that masks interrupts until it is dropped. |
-| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, and buses that record what a driver did. |
+| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, and serial ports that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
@@ -115,7 +115,8 @@ errors through layers without conversions, and `==` compares them. Use
 
 A serial port is just a byte stream. Implement `std/io`'s `write` and `read`
 for a UART and every existing helper works with it, including `io.write_all` and
-[`std/fmt`](formatting.md) output.
+[`std/fmt`](formatting.md) output. The RP2040 and RP2350
+[serial ports](#serial-ports-on-the-rp2040-and-rp2350) do exactly that.
 
 ### Helpers
 
@@ -298,13 +299,42 @@ which pins can carry which bus.
 | `fake.Delay` | A delay that returns at once. | `elapsed_us()` |
 | `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. | `register(n)`, `set_register(n, v)`, `fail_next(error)` |
 | `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. | `sent()`, `clear()`, `reply_with(bytes)` |
+| `fake.Serial` | A serial port, the `std/io` Reader and Writer: it records what is written and reads back bytes given to `feed`, then reports end of input. | `sent()`, `clear()`, `feed(bytes)` |
 
 `fail_next` makes the next I2C transaction fail, so error paths are as easy to
-test as success. Peripheral drivers are tested the same way one level down:
-a simulated controller implements the register block protocol, as in
-[`tests/stdlib/peripheral_checks.dodo`](https://github.com/Jotrorox/dodo/blob/main/tests/stdlib/peripheral_checks.dodo). For serial ports use `io.MemoryReader` and `io.MemoryWriter`
-from [`std/io`](io.md). A protocol is just methods, so writing your own fake for
-a device with special behavior takes a few lines.
+test as success. A driver for a device on a serial line, such as a GPS or
+modem module, takes any reader and writer, so `fake.Serial` stands in for the
+board's port:
+
+```dodo test
+package probe
+
+import "std/embedded/hal/fake"
+import "std/fmt"
+import "std/io"
+
+// Send a command line and read the reply line into `reply`.
+pub fn query<S>(serial: &mut S, command: &str, reply: &mut[u8]) -> usize!io.Error {
+    fmt.printf(serial, "{}\r\n", command)?
+    line := io.read_line(serial, reply)?
+    return ok(line.count)
+}
+
+@test
+fn sends_a_command_and_reads_the_reply() {
+    serial := fake.Serial.new()
+    serial.feed(b"OK 21.5\n")
+    reply: [16]u8 = [0; 16]
+    assert_eq(query(&mut serial, "TEMP?", &mut reply)!, 8usize)
+    assert_eq(serial.sent().len, 7usize)
+}
+```
+
+Peripheral drivers are tested the same way one level down: a simulated
+controller implements the register block protocol, as in
+[`tests/stdlib/peripheral_checks.dodo`](https://github.com/Jotrorox/dodo/blob/main/tests/stdlib/peripheral_checks.dodo).
+A protocol is just methods, so writing your own fake for a device with
+special behavior takes a few lines.
 
 ## Registers
 
@@ -406,21 +436,23 @@ popping a FIFO.
 
 | Package | Controller | Implements |
 | --- | --- | --- |
-| `std/embedded/peripheral/designware_i2c` | Synopsys DesignWare DW_apb_i2c | The I2C bus protocol, as the only master: 7-bit addresses, up to 1 MHz. |
-| `std/embedded/peripheral/pl022` | Arm PrimeCell PL022 | The SPI bus protocol, as master: 8-bit frames, all four modes. |
-| `std/embedded/peripheral/pl011` | Arm PrimeCell PL011 | The `std/io` Reader and Writer protocols: 8N1 UART, bounded polling, partial-transfer errors. |
+| `std/embedded/peripheral/designware_i2c` | Synopsys DesignWare DW_apb_i2c | The I2C bus protocol, as the only master or as a target: 7-bit and 10-bit addresses, up to 1 MHz. |
+| `std/embedded/peripheral/pl022` | Arm PrimeCell PL022 | The SPI bus protocol, as master or target: 4- to 16-bit frames, all four modes, TI and Microwire formats. |
+| `std/embedded/peripheral/pl011` | Arm PrimeCell PL011 | The `std/io` Reader and Writer, and their polling forms: 5 to 8 data bits, parity, 1 or 2 stop bits, flow control, breaks, bounded waits. |
 
-Both keep the controller's FIFOs busy without ever queueing more than the
-receive FIFO holds, and bound every wait on the bus, so a device that holds
-the I2C clock low yields `Timeout` instead of a hang. Chip packages hand out
-their controllers as each driver's `Bus`, which keeps the register block
-from the application: `pins.i2c` on the RP2040 and RP2350 returns a
-`designware_i2c.Bus`, and `pins.spi` a `pl022.Bus`.
+The bus drivers keep the controller's FIFOs busy without ever queueing more
+than the receive FIFO holds, and bound every wait on the bus, so a device
+that holds the I2C clock low yields `Timeout` instead of a hang. Chip
+packages hand out their controllers as the driver's `Bus` or `Port`, which
+keeps the register block from the application: `pins.i2c` on the RP2040 and
+RP2350 returns a `designware_i2c.Bus`, `pins.spi` a `pl022.Bus`, and
+`pins.uart` a `pl011.Port`.
 
-`pins.uart(tx, rx, baud_hz)` returns a `pl011.Port`. Its generic
-`Controller<R>` also runs against register models on a desktop. Both implement
-the existing `std/io` protocols, so `io.read_exact`, `io.write_all`, buffering,
-and formatting work with UARTs.
+Each driver's generic `Controller<R>` also runs against register models on
+a desktop. The PL011's implements the `std/io` Reader and Writer, so
+`io.read_exact`, `io.write_all`, buffering, and formatting work with UARTs.
+`designware_i2c` and `pl022` also have a `Target` for answering another
+master.
 
 ### Owning peripherals once
 
@@ -554,11 +586,13 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `b.pins` | The other GPIOs: `output(n)` and `input(n)` return pins that implement the [pin protocols](#device-protocols), or `Busy` if taken. |
 | `b.pins.i2c(sda, scl, hz)` | An I2C bus on two pins, implementing the I2C bus protocol. |
 | `b.pins.spi(clock, tx, rx, mode, hz)` | An SPI bus, implementing the SPI bus protocol; `rx` is `some(pin)` or `none`. |
-| `b.pins.uart(tx, rx, baud_hz)` | An 8N1 UART, implementing `std/io` Reader and Writer. |
+| `b.pins.uart(tx, rx, baud)` | A [serial port](#serial-ports-on-the-rp2040-and-rp2350), implementing the `std/io` Reader and Writer; `rx` is `some(pin)` or `none`. |
 | `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
+| `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
 | `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`. |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
+| `board.report_panic(check, file, line, column)` | Unsafe. Write a failed check to the serial ports, as the [default panic hook](#panics-on-the-serial-port) does; for panic hooks of your own. |
 
 Board packages also export what is specific to their board, such as
 `pico.LED_PIN`. Drivers written against the protocols take `b.pins` values
@@ -581,7 +615,7 @@ compiler adds what a desktop operating system would otherwise provide:
 | Boot stage 2 | Configures the flash interface for execute-in-place with the standard `03h` read command. The compiler adds the checksum the boot ROM verifies. |
 | Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `extern "C"` function of the same name replaces. |
 | Reset handler | Copies initialized statics to RAM, zeroes the rest, and calls `main`. If `main` returns, the core sleeps. |
-| Panic hook | `dodo_board_panic` masks interrupts and halts. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
+| Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the program's [serial ports](#panics-on-the-serial-port), if it claimed any, and halts. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
 | Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware, and software `f32` and `f64` arithmetic, comparisons, conversions, and `%`, since it has no floating-point unit. Results are correctly rounded IEEE 754, to nearest with ties to even, subnormals included. |
 | Linker script | Flash at `0x10000000` (size from the board), 264 KiB of RAM, and the stack at the top of RAM. |
 
@@ -624,59 +658,6 @@ extra pins are not yet.
 Unlike the RP2040, the RP2350 boot ROM clears RAM when it starts, so nothing
 in RAM survives a reboot into the bootloader.
 
-### UART on the RP2040 and RP2350
-
-Both chips have two PL011 UARTs. Claim their pins with
-`pins.uart(tx, rx, baud_hz)` and give them back with `pins.release_uart(port)`.
-TX and RX must belong to the same controller, but may come from different
-pin groups. These are the shared function-2 routes; RP2350's additional
-function-11 routes are not exposed.
-
-| Port | TX pins | RX pins |
-| --- | --- | --- |
-| UART0 | 0, 12, 16, 28 | 1, 13, 17, 29 |
-| UART1 | 4, 8, 20, 24 | 5, 9, 21, 25 |
-
-Invalid pins or an unrepresentable baud rate return `hal.Error.InvalidInput`
-before claiming anything. An occupied pin or controller returns `Busy`.
-Baud divisors round to the nearest 1/64; `port.baud_hz()` reports the result.
-The format is eight data bits, no parity, one stop bit, with FIFOs enabled.
-There is no flow control or newline translation.
-
-```dodo
-package main
-
-import "std/embedded/board"
-import "std/io"
-import "core/mem"
-
-fn main() {
-    b := board.take()!
-    port := b.pins.uart(0, 1, 115_200)!
-    io.write_all(&mut port, mem.str_bytes("hello\r\n"))!
-    port.flush()!
-    b.pins.release_uart(port)
-}
-```
-
-`read` fills the requested slice and `write` accepts it into the transmit
-FIFO. Every wait is bounded by consecutive unsuccessful status polls:
-10,000,000 by default, configurable with `set_poll_limit(polls)`, with zero
-allowing one observation. The budget restarts after each transferred byte;
-it measures CPU polls rather than elapsed time. An idle receiver returns
-`io.ErrorKind.TimedOut`, with `transferred` counting the initialized prefix;
-it never reports EOF. Write timeouts count the prefix accepted by the FIFO,
-which may still be transmitted. Retry only the remaining suffix. Empty reads
-and writes succeed without accessing registers.
-
-Framing, parity, break, and overrun faults return `io.ErrorKind.Other` with
-the PL011 DR error bits in `code` (`0x100`, `0x200`, `0x400`, `0x800`). The
-faulty character is consumed and discarded, excluded from `transferred`;
-the error latch is cleared so later reads can continue. `flush()` waits for
-the FIFO and shift register to empty, with the same bounded budget and zero
-transfer count on error. Release does not wait and resets the UART, so flush
-first when queued output must finish.
-
 ### I2C and SPI on the RP2040 and RP2350
 
 Both chips have two I2C controllers (DesignWare) and two SPI controllers
@@ -688,8 +669,8 @@ to it:
 | --- | --- |
 | I2C0 | SDA 0, 4, 8, 12, 16, 20, 24, 28; SCL 1, 5, 9, 13, 17, 21, 25, 29 |
 | I2C1 | SDA 2, 6, 10, 14, 18, 22, 26; SCL 3, 7, 11, 15, 19, 23, 27 |
-| SPI0 | clock 2, 6, 18, 22; TX 3, 7, 19, 23; RX 0, 4, 16, 20 |
-| SPI1 | clock 10, 14, 26; TX 11, 15, 27; RX 8, 12, 24, 28 |
+| SPI0 | clock 2, 6, 18, 22; TX 3, 7, 19, 23; RX 0, 4, 16, 20; chip select 1, 5, 17, 21 |
+| SPI1 | clock 10, 14, 26; TX 11, 15, 27; RX 8, 12, 24, 28; chip select 9, 13, 25, 29 |
 
 The pins of one bus must belong to the same controller; otherwise, or for a
 frequency the controller cannot make, the claim is `InvalidInput`. A pin or
@@ -701,8 +682,10 @@ select, as in Raspberry Pi's pinout diagrams.
 | --- | --- | --- |
 | Speed | Up to 1 MHz (`hal.I2C_FAST_PLUS_HZ`); `frequency_hz()` reports the result, the request rounded to whole clock cycles | The fastest rate up to the request, at most half the system clock: 62.5 MHz on the RP2040, 75 MHz on the RP2350 |
 | Changing it | `set_frequency(hz)` between transactions | `set_frequency(hz)` and `set_mode(mode)` between transfers |
-| Pins | Pull-ups enabled in the pads (about 50 kΩ): enough for an idle bus, too weak for 400 kHz. Most sensor boards bring 4.7 kΩ pull-ups; a bare bus needs them. | Chip select is not routed to the controller, which would pulse it between bytes; use an output pin and `hal.SpiDevice`. |
-| Errors | `NoAcknowledge` for a missing device or refused byte, `Bus` for lost arbitration, `Timeout` for a bus held low for around a second, `InvalidInput` for empty transfers, which the controller cannot send | `Overrun` only if received bytes were lost; transfers cannot time out |
+| Addresses and frames | 7-bit addresses through the `hal` protocol; `write_ten_bit`, `read_ten_bit`, and `write_read_ten_bit` for 10-bit addresses (0 to `0x3FF`) | 8-bit frames at first; `set_frame_bits(bits)` chooses 4 to 16. Frames above 8 bits move with `transfer_words` and `write_words` on `u16` words; the byte methods then return `Unsupported`. |
+| Formats | Standard, fast, and fast-plus mode. High-speed mode (3.4 MHz) is not available: both chips leave its timing registers out of their controllers. | Motorola SPI in the four modes, and with `set_frame_format(pl022.FrameFormat.TexasInstruments)` or `.Microwire` the TI synchronous serial and National Microwire formats |
+| Pins | Pull-ups enabled in the pads (about 50 kΩ): enough for an idle bus, too weak for 400 kHz. Most sensor boards bring 4.7 kΩ pull-ups; a bare bus needs them. | `pins.spi` leaves chip select to an output pin and `hal.SpiDevice`, because the controller's own pulses between frames in modes 0 and 2. `pins.spi_with_select(clock, tx, rx, select, mode, hz)` routes the controller's chip select as well, which the TI and Microwire formats need. |
+| Errors | `NoAcknowledge` for a missing device or refused byte, `Bus` for lost arbitration, `Timeout` for a bus held low for around a second, `InvalidInput` for empty transfers, which the controller cannot send; `probe(address)` finds devices with a one-byte read instead | `Overrun` only if received bytes were lost; transfers cannot time out |
 | Extra | | `set_loopback(true)` connects TX to RX inside the chip, for self-tests |
 | Giving it back | `pins.release_i2c(bus)` holds the controller in reset and disconnects the pins, which stay pulled up | `pins.release_spi(bus)` holds the controller in reset and disconnects the pins |
 
@@ -712,6 +695,171 @@ low after an interrupted transfer, which makes every transaction `Timeout`:
 release the bus, claim SCL as an output and SDA as an input, pulse SCL
 until SDA reads high (at most nine times), release both pins, and claim the
 bus again.
+
+#### Answering another master
+
+Either chip can also be the device: `pins.i2c_target(sda, scl, address,
+ten_bit, hz)` answers a master at a 7-bit address (or a 10-bit one with
+`ten_bit`), and `pins.spi_target(clock, tx, rx, select, mode)` lets a master
+clock and select the controller. Both are polled. An I2C target reports
+what the master did, in order: the bytes it wrote, a STOP, and reads, which
+hold the master up (SCL low) until the program answers:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+import "std/embedded/peripheral/designware_i2c"
+
+// A register device at 0x42: the first byte of a write picks the
+// register, later bytes fill it, and reads continue from there.
+fn main() {
+    b := board.take()!
+    target := b.pins.i2c_target(board.I2C_SDA_PIN, board.I2C_SCL_PIN, 0x42, false, hal.I2C_FAST_HZ)!
+    memory: [16]u8 = [0; 16]
+    pointer := 0usize
+    buffer: [16]u8 = [0; 16]
+    for {
+        match target.poll(&mut buffer) {
+            designware_i2c.TargetEvent.Write(count, start) => {
+                first := 0usize
+                if start {
+                    pointer = buffer[0] as usize % 16
+                    first = 1
+                }
+                for index in first..count {
+                    memory[pointer] = buffer[index]
+                    pointer = (pointer + 1) % 16
+                }
+            }
+            designware_i2c.TargetEvent.Read => {
+                target.respond(&memory[pointer..pointer + 1])
+                pointer = (pointer + 1) % 16
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+`respond` can queue several bytes at once; what the master does not read is
+dropped when it next reads. Addresses that the I2C specification reserves
+(7-bit `0x00` to `0x07` and `0x78` to `0x7F`) are `InvalidInput`, and general
+calls are not acknowledged.
+
+An SPI target follows a clock of up to a twelfth of the system clock
+(10.4 MHz on the RP2040, 12.5 MHz on the RP2350). `queue` loads replies
+before the master clocks them, `read` collects what it sent, and `transfer`
+does both, waiting as long as the master takes. A frame clocked while
+nothing is queued repeats the last one, which the controller cannot detect.
+In modes 0 and 2 the master must raise chip select between frames; masters
+that keep it low for a whole transfer need modes 1 or 3. `set_output(false)`
+keeps a listening target off the data line. Both targets are given back with
+`pins.release_i2c_target` and `pins.release_spi_target`.
+
+### Serial ports on the RP2040 and RP2350
+
+Both chips have two UARTs (Arm PL011). `pins.uart(tx, rx, baud)` claims a
+transmit pin, and a receive pin or `none` to only send, and returns a
+`pl011.Port` sending 8N1 frames (eight data bits, no parity, one stop bit)
+at the rate closest to `baud`. A port is a `std/io` Reader and Writer, so
+[`std/fmt`](formatting.md) prints to it and `std/io` helpers such as
+`io.read_line` read from it:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/fmt"
+import "std/io"
+
+fn main() {
+    b := board.take()!
+    serial := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    serial.set_crlf(true)
+    fmt.printf(&mut serial, "Hello from {}!\n", board.NAME)!
+    line: [64]u8 = [0; 64]
+    for {
+        got := io.read_line(&mut serial, &mut line)!
+        b.led.toggle()
+        io.write_all(&mut serial, &line[..got.count])!
+    }
+}
+```
+
+Every board in this guide uses UART0 on GP0 (TX) and GP1 (RX), where the
+Raspberry Pi Debug Probe's UART connects. With a USB-to-serial adapter,
+connect the board's TX to the adapter's RX, its RX to the adapter's TX, and
+ground to ground, then open a terminal at the same rate, for example
+`picocom -b 115200 /dev/ttyACM0` on Linux or
+`screen /dev/tty.usbmodem* 115200` on macOS.
+[`examples/serial_console.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/serial_console.dodo)
+is a small command line with echo and backspace.
+
+| UART | TX pins (GPIO numbers) | RX pins |
+| --- | --- | --- |
+| UART0 | 0, 12, 16, 28 | 1, 13, 17, 29 |
+| UART1 | 4, 8, 20, 24 | 5, 9, 21, 25 |
+
+On the RP2350, TX also works on the pins listed for CTS below and RX on
+those for RTS (its UART_AUX function): UART0 TX on 2, 14, and 18 and RX on
+3, 15, and 19, UART1 TX on 6, 10, 22, and 26 and RX on 7, 11, 23, and 27.
+The two pins must belong to the same UART; otherwise, or for a rate out of
+range, the claim is `InvalidInput`. A pin or UART that is already taken is
+`Busy`.
+
+`pins.uart_flow(tx, rx, cts, rts, baud)` claims a port with hardware flow
+control. CTS is an input: the port sends only while the other end holds it
+low. RTS is an output: the port holds it low while its receive FIFO has
+room, and raises it from 24 bytes on, so a sender that honours it never
+overruns the port, even while the program is busy. Unconnected, CTS is
+pulled up and nothing is sent, and `flush()` waits as long.
+
+| UART | CTS pins | RTS pins |
+| --- | --- | --- |
+| UART0 | 2, 14, 18 | 3, 15, 19 |
+| UART1 | 6, 10, 22, 26 | 7, 11, 23, 27 |
+
+| | Serial port |
+| --- | --- |
+| Speed | From 120 baud (144 on the RP2350) up to a sixteenth of the system clock: 7.8 Mbaud on the RP2040, 9.4 Mbaud on the RP2350. `baud()` reports the rate the divider makes, within 0.1 % up to 921600 baud (`115_207` for `115_200`). |
+| Changing it | `set_baud(baud)`, and `set_format(data_bits, parity, stop_bits)` for 5 to 8 data bits, `pl011.Parity.None`, `Even`, or `Odd`, and 1 or 2 stop bits. Both wait until everything written is out. |
+| Writing | `write` waits while the 32-byte transmit FIFO is full and returns once the last byte is queued; `flush()` waits until it has left. `poll_write` queues what fits without waiting. A write or `flush()` that makes no progress for `pl011.DEFAULT_POLL_LIMIT` status polls (around a second), as when flow control holds the transmitter, fails with `TimedOut` and the bytes queued before it; `set_poll_limit(polls)` changes the limit, `pl011.NO_POLL_LIMIT` removes it. |
+| Reading | `read` waits for the first byte, as long as it takes unless `set_read_poll_limit(polls)` bounds it (then `TimedOut`), then returns what has arrived; a serial port never reaches end of input. `poll_read` returns at once, `Pending` while nothing has arrived. Nothing buffers beyond the 32-byte receive FIFO, so read at least every 32 bytes' time (2.8 ms at 115200 baud) while data arrives. |
+| Errors | A read fails with an `io.Error` of kind `Other` whose `code` holds `pl011.FRAMING_ERROR`, `PARITY_ERROR`, `BREAK`, or `OVERRUN`, after the good bytes before it (`transferred`). Bytes with framing or parity errors, and breaks, are dropped; an overrun means bytes were lost because the receive FIFO was full. The next read continues. |
+| Terminals | `set_crlf(true)` writes `"\n"` as `"\r\n"` and reads the CR that Enter sends, alone or followed by LF, as one `"\n"`, so `io.read_line` ends at Enter. Off at first, so binary protocols get their bytes unchanged. Terminals do not show what is typed unless the program echoes it. |
+| Pins | Pulled up in the pads, so an unconnected receiver and released pins idle high, as the line does between frames, instead of reading as a break. |
+| Flow control and breaks | `set_flow_control(cts, rts)` turns each half of hardware flow control on or off, on a port claimed with `uart_flow`. `set_break(true)` holds the line low once everything written is out, until `set_break(false)`; keep it on for at least two frame times (174 µs at 115200 baud, 8N1). |
+| Extra | `set_loopback(true)` connects TX to RX inside the chip, for self-tests. |
+| Giving it back | `pins.release_uart(port)` waits until everything written is out, holds the UART in reset, and disconnects the pins, which stay pulled up. |
+
+#### Panics on the serial port
+
+A failed check (an overflow, an index out of bounds, `core.assert`, or `!` on
+an error) calls the board runtime's panic hook. If the program has claimed a
+serial port, the hook first writes which check failed and where to every
+port it still holds, on a line of its own, the line a desktop program prints:
+
+```text
+dodo: index bounds check failed at /home/me/console/main.dodo:41:46
+```
+
+Then it masks interrupts and halts, as without a port. The message is out
+before the board halts, at the port's own rate and format; nothing needs to
+be configured. A panic hook of your own replaces all of this. To keep the
+report and do something else afterwards, call `board.report_panic` from it,
+for example to restart into the bootloader so `dodo run` works again without
+pressing BOOTSEL:
+
+```dodo
+extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        board.report_panic(check, file, line, column)
+    }
+    board.reboot_to_bootloader()
+}
+```
 
 ### The Raspberry Pi Pico 2 W
 
@@ -818,11 +966,12 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, and the timer;
   PWM, ADC, and USB are not bundled yet. Write them with `hal.Reg` as above.
-- I2C, SPI, and UART transfers are blocking and polled, without interrupts or DMA.
-  I2C supports 7-bit addresses as the bus's only master, not 10-bit
-  addresses or target (slave) mode; SPI uses 8-bit frames as master. The
-  Pico 2 W's wireless chip drives only its LED and senses USB power; Wi-Fi
-  and Bluetooth need its firmware, which is not loaded yet.
+- I2C, SPI, and UART transfers are polled, without interrupts or DMA, so a
+  serial port keeps no more input than its 32-byte FIFO unless the other end
+  honours RTS. An I2C master is the bus's only master, without high-speed
+  mode, which the chips' controllers lack, and cannot send empty transfers.
+  The Pico 2 W's wireless chip drives only its LED and senses USB power;
+  Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
 - The software floating-point helpers are written for correctness, not speed:
   division, for example, computes one quotient bit per step, and `f32`
   arithmetic on the Cortex-M0+ goes through `f64`. They raise no

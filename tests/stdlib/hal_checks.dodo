@@ -3,6 +3,8 @@ package main
 import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/hal/fake"
+import "std/fmt"
+import "std/io"
 
 // A portable driver, written once against the HAL protocols.
 struct Thermometer<B> {
@@ -168,6 +170,48 @@ fn spi_devices() {
     core.assert_eq(select.changes(), 3u32)
 }
 
+// A driver for a device that answers commands on a serial line, like many
+// GPS and modem modules: it sends a command line and reads one reply line.
+fn query<S>(serial: &mut S, command: &str, reply: &mut[u8]) -> usize!io.Error {
+    fmt.printf(serial, "{}\r\n", command)?
+    line := io.read_line(serial, reply)?
+    return ok(line.count)
+}
+
+fn serial_ports() {
+    serial := fake.Serial.new()
+    serial.feed(b"OK 21.5\nREADY\n")
+    reply: [16]u8 = [0; 16]
+    count := query(&mut serial, "TEMP?", &mut reply)!
+    core.assert_eq(count, 8usize)
+    core.assert_eq(reply[3], 50u8)
+    core.assert(bytes_equal(serial.sent(), b"TEMP?\r\n"))
+
+    // Unread input stays queued in front of new input; then end of input.
+    serial.feed(b"x")
+    rest: [16]u8 = [0; 16]
+    core.assert_eq(io.read_up_to(&mut serial, &mut rest)!, 7usize)
+    core.assert_eq(rest[5], 10u8)
+    core.assert_eq(rest[6], 120u8)
+    core.assert_eq(serial.read(&mut rest)!, 0usize)
+
+    serial.clear()
+    fmt.printf(&mut serial, "{} {}", 42, true)!
+    core.assert(bytes_equal(serial.sent(), b"42 true"))
+}
+
+fn bytes_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len != right.len {
+        return false
+    }
+    for index in 0..left.len {
+        if left[index] != right[index] {
+            return false
+        }
+    }
+    return true
+}
+
 fn critical_sections() {
     outer := hal.Critical.enter()
     inner := hal.Critical.enter()
@@ -180,5 +224,6 @@ fn main() {
     pins_and_delays()
     i2c_driver()
     spi_devices()
+    serial_ports()
     critical_sections()
 }

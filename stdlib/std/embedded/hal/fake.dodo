@@ -2,6 +2,7 @@ package fake
 
 import "core/option"
 import "std/embedded/hal"
+import "std/io"
 
 // In-memory devices implementing the `std/embedded/hal` protocols. They let
 // driver code run under `dodo test` on a desktop with no hardware attached, and
@@ -179,5 +180,66 @@ pub struct Spi {
             self.exchange(bytes[index])
         }
         return ok()
+    }
+}
+
+// A serial port that records the most recent 256 bytes written and reads
+// back bytes given to `feed`, as if they had arrived on its receive line;
+// once they are read, reads report end of input. Implements the std/io
+// Reader and Writer protocols like the chips' serial ports, so drivers for
+// devices on a UART, and std/fmt output, can be tested on a desktop.
+pub struct Serial {
+    sent: [256]u8
+    sent_length: usize
+    input: [256]u8
+    input_length: usize
+    input_position: usize
+
+    pub fn new() -> Serial {
+        return Serial { sent: [0; 256], sent_length: 0, input: [0; 256], input_length: 0, input_position: 0 }
+    }
+
+    // Bytes for reads to return, after any still unread. At most 256 can
+    // wait at once.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        unread := self.input_length - self.input_position
+        core.assert(unread + bytes.len <= 256)
+        for index in 0..unread {
+            self.input[index] = self.input[self.input_position + index]
+        }
+        for index in 0..bytes.len {
+            self.input[unread + index] = bytes[index]
+        }
+        self.input_position = 0
+        self.input_length = unread + bytes.len
+    }
+
+    // Bytes written since the last call to `clear`, up to the first 256.
+    pub fn sent(&self) -> &[u8] {
+        return self.sent[0..self.sent_length]
+    }
+
+    pub fn clear(&mut self) {
+        self.sent_length = 0
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        for index in 0..bytes.len {
+            if self.sent_length < 256 {
+                self.sent[self.sent_length] = bytes[index]
+                self.sent_length += 1
+            }
+        }
+        return ok(bytes.len)
+    }
+
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        count := 0usize
+        for count < buffer.len && self.input_position < self.input_length {
+            buffer[count] = self.input[self.input_position]
+            self.input_position += 1
+            count += 1
+        }
+        return ok(count)
     }
 }

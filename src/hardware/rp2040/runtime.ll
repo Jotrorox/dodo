@@ -17,8 +17,11 @@
 ;   dodo_rp2040_reset_usb_boot
 ;                  Restarts into the boot ROM's USB bootloader.
 ;   dodo_board_panic
-;                  The panic hook: masks interrupts and halts. Weak, so a
-;                  program can define its own to report the failure.
+;                  The panic hook: masks interrupts, passes its arguments to
+;                  dodo_panic_report if the program defines it, and halts.
+;                  std/embedded/chip/rp_pins defines that reporter, which
+;                  writes the failure to the serial ports the program
+;                  claimed. Weak, so a program can define its own hook.
 ;
 ; The memory and integer helpers LLVM calls on Armv6-M follow from
 ; src/hardware/arm_eabi.ll, which the compiler appends to this file.
@@ -117,13 +120,21 @@ module asm ".thumb_func"
 module asm "DefaultHandler:"
 module asm "    b DefaultHandler"
 
+; A weak reference: without a definition the linker makes it 0, and a
+; definition is kept by --gc-sections only while this hook is.
 module asm ".section .text.dodo_board_panic, \22ax\22, %progbits"
 module asm ".weak dodo_board_panic"
+module asm ".weak dodo_panic_report"
 module asm ".type dodo_board_panic, %function"
 module asm ".thumb_func"
 module asm "dodo_board_panic:"
 module asm "    cpsid i"
+module asm "    ldr r4, =dodo_panic_report"
+module asm "    cmp r4, #0"
+module asm "    beq 1f"
+module asm "    blx r4"                                 ; r0 to r3 are the hook's arguments
 module asm "1:  b 1b"
+module asm "    .ltorg"
 
 ; dodo_rp2040_reset_usb_boot(activity_pins, disabled_interfaces): look up the
 ; boot ROM's reset_usb_boot (code 'UB') and jump to it. It never returns.

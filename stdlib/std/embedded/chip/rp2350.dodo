@@ -2,8 +2,8 @@ package rp2350
 
 import "std/embedded/hal"
 import "std/embedded/peripheral/designware_i2c"
-import "std/embedded/peripheral/pl022"
 import "std/embedded/peripheral/pl011"
+import "std/embedded/peripheral/pl022"
 import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
@@ -11,7 +11,7 @@ import "std/embedded/chip/rp_pins"
 // brings the chip from its boot state (ring oscillator, peripherals held in
 // reset) to a known configuration and hands out the peripherals once. Pins
 // implement the std/embedded/hal output and input pin protocols, I2C and SPI
-// buses claimed from `Pins` implement the bus protocols, UART ports the
+// buses claimed from `Pins` implement the bus protocols, serial ports the
 // std/io Reader and Writer protocols, and the timer implements the delay
 // protocol, so portable drivers use them unchanged.
 //
@@ -115,13 +115,14 @@ const FUNCSEL: u32 = 0b11111
 // software clears this bit.
 const PAD_ISOLATE: u32 = 1 << 8
 
-// I2C (12.2) and SPI (12.3) controllers, clocked by clk_sys and clk_peri.
+// I2C (12.2), SPI (12.3), and UART (12.1) controllers, clocked by clk_sys
+// and clk_peri.
+const UART0_BASE: usize = 0x4007_0000
+const UART1_BASE: usize = 0x4007_8000
 const SPI0_BASE: usize = 0x4008_0000
 const SPI1_BASE: usize = 0x4008_8000
 const I2C0_BASE: usize = 0x4009_0000
 const I2C1_BASE: usize = 0x4009_8000
-const UART0_BASE: usize = 0x4007_0000
-const UART1_BASE: usize = 0x4007_8000
 
 // Single-cycle I/O (3.1). The GPIO_HI registers for pins 32 and up sit
 // between these.
@@ -178,6 +179,27 @@ pub fn reboot_to_bootloader(activity_led: u32) {
         dodo_rp2350_rom_call(ROM_REBOOT, REBOOT_TYPE_BOOTSEL | REBOOT_NO_RETURN_ON_SUCCESS, 10, flags, pin)
     }
     for {}
+}
+
+// Write a failed check's message to every serial port claimed from
+// `pins.uart` and not yet released, as the default panic hook does before it
+// halts: `dodo: arithmetic overflow check failed at main.dodo:12:5`. Call it
+// from a panic hook of your own that, for example, restarts into the
+// bootloader:
+//
+//     extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+//         unsafe {
+//             chip.report_panic(check, file, line, column)
+//         }
+//         chip.reboot_to_bootloader(25)
+//     }
+//
+// SAFETY: `check` and `file` must be the hook's NUL-terminated strings, and
+// the caller must halt or reset afterwards, as this takes over the ports.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        rp_pins.report_panic(check, file, line, column)
+    }
 }
 
 // What the circuit board decides. Board packages pass theirs to `take`.
@@ -382,19 +404,60 @@ pub struct Pins {
         return self.bank.spi(clock, tx, rx, mode, frequency_hz)
     }
 
-    // Claim an 8N1 UART implementing std/io Reader and Writer. TX pins are
-    // 0, 12, 16, 28 for UART0; 4, 8, 20, 24 for UART1. RX pins are one
-    // higher, and may use another group of the same UART. InvalidInput for
-    // bad pins or baud, Busy if a pin or UART is taken. I/O waits are bounded;
-    // errors report partial progress. See pl011 for timeout and fault details.
-    pub fn uart(&mut self, tx: u32, rx: u32, baud_hz: u32) -> pl011.Port!hal.Error {
-        return self.bank.uart(tx, rx, baud_hz)
+    // Claim pin `tx` as a serial port's transmit line (to the other end's
+    // RX), and `rx` as its receive line, or none to only send. Frames are
+    // 8N1 at the rate closest to `baud`, from 144 baud up to SYS_HZ / 16
+    // (9.4 Mbaud); 115_200 is the usual choice for a terminal. GPIO n
+    // carries TX when n % 4 is 0 or 2 and RX when it is 1 or 3 (the second
+    // of each through the RP2350's UART_AUX function, on the pins that
+    // otherwise carry CTS and RTS): UART0 has TX on 0, 2, 12, 14, 16, 18,
+    // and 28 and RX on 1, 3, 13, 15, 17, 19, and 29, UART1 TX on 4, 6, 8,
+    // 10, 20, 22, 24, and 26 and RX on 5, 7, 9, 11, 21, 23, 25, and 27.
+    // The port implements the std/io Reader
+    // and Writer protocols, so std/fmt prints to it; until it is released,
+    // a panic writes its failure message to it before the chip halts.
+    // InvalidInput if the pins cannot form a port or the baud rate is out
+    // of range, Busy if a pin or the controller is taken. The pl011 driver
+    // documents the port.
+    pub fn uart(&mut self, tx: u32, rx: Option<u32>, baud: u32) -> pl011.Port!hal.Error {
+        return self.bank.uart(tx, rx, baud)
     }
 
-    // Release without waiting; flush first to finish queued output. The
-    // pins are disconnected and the UART held in reset, ready to reclaim.
-    pub fn release_uart(&mut self, port: pl011.Port) {
-        self.bank.release_uart(port)
+    // `uart` with hardware flow control, turned on: `cts` is an input, low
+    // while the other end may receive, and `rts` an output, low while this
+    // port may. GPIO n carries CTS when n % 4 is 2 and RTS when it is 3, in
+    // the TX and RX pins' group of four: UART0 has CTS on 2, 14, 18 and RTS
+    // on 3, 15, 19, UART1 CTS on 6, 10, 22, 26 and RTS on 7, 11, 23, 27.
+    // Errors as for `uart`.
+    pub fn uart_flow(&mut self, tx: u32, rx: u32, cts: u32, rts: u32, baud: u32) -> pl011.Port!hal.Error {
+        return self.bank.uart_flow(tx, rx, cts, rts, baud)
+    }
+
+    // `spi` with the controller's own chip select on pin `select` as well,
+    // for devices in the TI and Microwire frame formats (see
+    // pl022.FrameFormat), which need its timing. GPIO n carries it when
+    // n % 4 is 1, in the bus's block of eight: SPI0 on 1, 5, 17, 21, SPI1
+    // on 9, 13, 25, 29. Errors as for `spi`.
+    pub fn spi_with_select(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode, frequency_hz: u32) -> pl022.Bus!hal.Error {
+        return self.bank.spi_with_select(clock, tx, rx, select, mode, frequency_hz)
+    }
+
+    // Claim pins as an SPI target (slave) in `mode`, for another master to
+    // clock, at up to SYS_HZ / 12 (12.5 MHz), and select: `rx` receives
+    // what it sends, `tx` answers, and the pins are numbered as for `spi`
+    // and `spi_with_select`. The pl022 driver documents the target.
+    pub fn spi_target(&mut self, clock: u32, tx: u32, rx: Option<u32>, select: u32, mode: hal.SpiMode) -> pl022.TargetBus!hal.Error {
+        return self.bank.spi_target(clock, tx, rx, select, mode)
+    }
+
+    // Claim pins `sda` and `scl`, numbered as for `i2c`, as an I2C target
+    // (slave) answering another master at `address`, a 10-bit address with
+    // `ten_bit`. `frequency_hz` is the master's SCL frequency, which sets
+    // the input filter. InvalidInput for an address the I2C specification
+    // reserves (7-bit 0x00 to 0x07 and 0x78 to 0x7F), otherwise errors as
+    // for `i2c`. The designware_i2c driver documents the target.
+    pub fn i2c_target(&mut self, sda: u32, scl: u32, address: u16, ten_bit: bool, frequency_hz: u32) -> designware_i2c.TargetBus!hal.Error {
+        return self.bank.i2c_target(sda, scl, address, ten_bit, frequency_hz)
     }
 
     // Give back an I2C bus. Its controller is held in reset and its pins are
@@ -410,6 +473,23 @@ pub struct Pins {
     // are disconnected.
     pub fn release_spi(&mut self, bus: pl022.Bus) {
         self.bank.release_spi(bus)
+    }
+
+    // Give back a serial port, once everything written to it is out: its
+    // controller is held in reset and its pins are disconnected but still
+    // pulled up, so the line stays idle.
+    pub fn release_uart(&mut self, port: pl011.Port) {
+        self.bank.release_uart(port)
+    }
+
+    // Give back an I2C target, as for `release_i2c`.
+    pub fn release_i2c_target(&mut self, target: designware_i2c.TargetBus) {
+        self.bank.release_i2c_target(target)
+    }
+
+    // Give back an SPI target, as for `release_spi`.
+    pub fn release_spi_target(&mut self, target: pl022.TargetBus) {
+        self.bank.release_spi_target(target)
     }
 
     fn claim(&mut self, number: u32) -> Pin!hal.Error {
@@ -464,16 +544,20 @@ struct Chip {
             return I2C1_BASE
         } else if controller == rp_pins.SPI0 {
             return SPI0_BASE
+        } else if controller == rp_pins.SPI1 {
+            return SPI1_BASE
         } else if controller == rp_pins.UART0 {
             return UART0_BASE
-        } else if controller == rp_pins.UART1 {
-            return UART1_BASE
         }
-        return SPI1_BASE
+        return UART1_BASE
     }
 
     pub fn clock_hz(&self) -> u32 {
         return SYS_HZ
+    }
+
+    pub fn uart_aux(&self) -> bool {
+        return true
     }
 }
 
@@ -485,12 +569,12 @@ fn controller_reset(controller: u32) -> u32 {
         return RESET_I2C1
     } else if controller == rp_pins.SPI0 {
         return RESET_SPI0
+    } else if controller == rp_pins.SPI1 {
+        return RESET_SPI1
     } else if controller == rp_pins.UART0 {
         return RESET_UART0
-    } else if controller == rp_pins.UART1 {
-        return RESET_UART1
     }
-    return RESET_SPI1
+    return RESET_UART1
 }
 
 // Connect GPIO `number` to peripheral `function`, and change its pad

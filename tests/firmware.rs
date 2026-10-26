@@ -68,9 +68,10 @@ import "std/embedded/board"
 import "std/io"
 fn main() {
     b := board.take()!
-    first := b.pins.uart(0, 1, 115_200)!
-    second := b.pins.uart(4, 5, 9600)!
+    first := b.pins.uart(0, some(1u32), 115_200)!
+    second := b.pins.uart(4, some(5u32), 9600)!
     first.set_poll_limit(1000)
+    second.set_read_poll_limit(1000)
     data := [42u8; 3]
     io.write_all(&mut first, &data)!
     first.flush()!
@@ -255,7 +256,13 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         dodoc::codegen::compile_ir_object(&options, chip.name, chip.runtime, &object).unwrap();
         let bytes = fs::read(&object).unwrap();
         let text = String::from_utf8_lossy(&bytes);
-        for name in ["Reset_Handler", chip.panic_hook, "memcpy", "memset"] {
+        for name in [
+            "Reset_Handler",
+            chip.panic_hook,
+            "dodo_panic_report",
+            "memcpy",
+            "memset",
+        ] {
             assert!(text.contains(name), "{} runtime lacks {name}", chip.name);
         }
     }
@@ -382,6 +389,35 @@ fn check_rp2350_firmware(elf: &Path) {
     assert_eq!(word(&image, block + 16), 0xAB12_3579);
 }
 
+/// The value of the ELF32 symbol `name`, if the file defines it.
+fn elf_symbol(elf: &[u8], name: &str) -> Option<u32> {
+    let half = |at: usize| u16::from_le_bytes(elf[at..at + 2].try_into().unwrap()) as usize;
+    let header = |index: usize| word(elf, 0x20) as usize + index * half(0x2E);
+    let symbols = (0..half(0x30))
+        .map(header)
+        .find(|&at| word(elf, at + 4) == 2)?;
+    let names = word(elf, header(word(elf, symbols + 24) as usize) + 16) as usize;
+    let start = word(elf, symbols + 16) as usize;
+    let end = start + word(elf, symbols + 20) as usize;
+    (start..end).step_by(16).find_map(|at| {
+        let offset = names + word(elf, at) as usize;
+        let length = elf[offset..].iter().position(|&b| b == 0)?;
+        let defined = half(at + 14) != 0;
+        (defined && &elf[offset..offset + length] == name.as_bytes()).then(|| word(elf, at + 4))
+    })
+}
+
+/// The address word in the literal pool of the runtime's panic hook, which
+/// it calls if nonzero: the reporter's address or 0.
+fn panic_hook_literal(elf: &Path, family: u32) -> u32 {
+    let bytes = fs::read(elf).unwrap();
+    let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), family);
+    let hook = (elf_symbol(&bytes, "dodo_board_panic").expect("panic hook") & !1) as usize;
+    // cpsid, ldr, cmp, beq, blx, b: six halfwords, then the aligned word.
+    let at = (hook - 0x1000_0000 + 12 + 3) & !3;
+    word(&image, at)
+}
+
 fn build(args: &[&str]) {
     let output = dodo(args);
     let message = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -506,5 +542,51 @@ fn floating_point_links_in_firmware() {
                 &elf,
             ]);
         }
+    }
+}
+
+#[test]
+fn the_default_panic_hook_reports_on_serial_ports() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("panic-report");
+    // The runtime's weak panic hook calls the reporter std/embedded/chip
+    // defines, which writes to the serial ports the program claimed.
+    let console = root().join("examples/serial_console.dodo");
+    let boards = [
+        ("pico", 0xE48B_FF56),
+        ("pico2", 0xE48B_FF59),
+        ("pico2_w", 0xE48B_FF59),
+    ];
+    for (board, family) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("console-{board}-O{level}.elf"));
+            let source = console.to_str().unwrap();
+            build(&["build", source, "--board", board, "-O", level, "-o", &elf]);
+            let report = elf_symbol(&fs::read(&elf).unwrap(), "dodo_panic_report")
+                .expect("the reporter is linked");
+            assert_eq!(report & 1, 1, "{board} -O{level}: a Thumb function");
+            assert_eq!(
+                panic_hook_literal(Path::new(&elf), family),
+                report,
+                "{board} -O{level}: the hook calls the reporter"
+            );
+        }
+    }
+    // Without std/embedded/chip there is no reporter: the weak reference
+    // links as 0, and the hook only halts.
+    let bare = scratch.write(
+        "bare.dodo",
+        "package main\nimport \"core/mmio\"\nfn main() {\n values: [4]u32 = [1, 2, 3, 4]\n index := unsafe { mmio.read32(0x2000_0000) } as usize\n unsafe { mmio.write32(0x2000_0004, values[index]) }\n}\n",
+    );
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(
+            elf_symbol(&fs::read(&elf).unwrap(), "dodo_panic_report"),
+            None
+        );
+        assert_eq!(panic_hook_literal(Path::new(&elf), family), 0, "{chip}");
     }
 }

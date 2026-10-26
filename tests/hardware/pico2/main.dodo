@@ -3,9 +3,13 @@ package main
 import "std/embedded/board"
 import "std/embedded/chip"
 import "std/embedded/hal"
+import "std/embedded/peripheral/designware_i2c"
+import "std/embedded/peripheral/pl011"
+import "std/embedded/peripheral/pl022"
+import "std/io"
 
 // Hardware self-test for the `pico2` board: the RP2350 startup runtime,
-// std/embedded/chip/rp2350 (clocks, timer, I2C, SPI, single ownership,
+// std/embedded/chip/rp2350 (clocks, timer, I2C, SPI, UART, single ownership,
 // configuration checks), std/embedded/board/pico2, and the runtime's integer and
 // floating-point helpers. Every outcome ends in the USB bootloader with a
 // record that `scripts/test_pico.py --board pico2` reads over USB with
@@ -227,6 +231,207 @@ fn bus_checks<P, T>(pins: &mut P, timer: &mut T) {
     check(one[0] == 0x5A)
 }
 
+// A serial port on the board's usual pins with nothing connected (6
+// checks): pin and baud rate validation, single ownership, the controller's
+// internal loopback timed at 115200 baud, newline translation, 8E2 frames
+// at 1 Mbaud through a full receive FIFO and the overrun after it, and
+// giving the port back and claiming it again.
+fn uart_checks<P, T>(pins: &mut P, timer: &mut T) {
+    tx := board.UART_TX_PIN
+    rx := board.UART_RX_PIN
+    check(refused(pins.uart(rx, some(tx), 115_200), hal.Error.InvalidInput) && refused(pins.uart(tx, some(5u32), 115_200), hal.Error.InvalidInput) && refused(pins.uart(tx, some(rx), 10_000_000), hal.Error.InvalidInput))
+    serial := pins.uart(tx, some(rx), 115_200)!
+    // GP12 is UART0's too.
+    check(serial.baud() == 115_207 && refused(pins.uart(12, none, 9600), hal.Error.Busy) && refused(pins.output(tx), hal.Error.Busy))
+
+    serial.set_loopback(true)!
+    sent: [16]u8 = [0; 16]
+    for index in 0..16usize {
+        sent[index] = (0x3C + 13 * index) as u8
+    }
+    start := timer.now_us()
+    serial.write(&sent)!
+    serial.flush()!
+    elapsed := timer.now_us() - start
+    data: [16]u8 = [0; 16]
+    io.read_exact(&mut serial, &mut data)!
+    same := true
+    for index in 0..16usize {
+        same = same && data[index] == sent[index]
+    }
+    // 16 frames of 10 bits at 115207 baud: 1389 us.
+    check(same && elapsed >= 1385 && elapsed < 1450)
+
+    // "\n" goes out as "\r\n", which reads back as one "\n".
+    serial.set_crlf(true)
+    serial.write(b"a\nb")!
+    serial.flush()!
+    three: [3]u8 = [0; 3]
+    io.read_exact(&mut serial, &mut three)!
+    empty := serial.poll_read(&mut data)!
+    check(three[0] == 97 && three[1] == 10 && three[2] == 98 && empty.transferred == 0 && empty.state == io.PollState.Pending)
+    serial.set_crlf(false)
+
+    // 40 frames of 12 bits (start, 8 data, parity, 2 stop) at exactly
+    // 1 Mbaud take 480 us; the receive FIFO keeps the first 32, and the
+    // rest are an overrun, reported once.
+    serial.set_format(8, pl011.Parity.Even, 2)!
+    serial.set_baud(1_000_000)!
+    burst: [40]u8 = [0; 40]
+    for index in 0..40usize {
+        burst[index] = (6 * index) as u8
+    }
+    start = timer.now_us()
+    serial.write(&burst)!
+    serial.flush()!
+    elapsed = timer.now_us() - start
+    back: [40]u8 = [0; 40]
+    received := 0usize
+    overruns := 0u32
+    for {
+        match serial.poll_read(&mut back[received..]) {
+            ok(progress) => {
+                received += progress.transferred
+                if progress.transferred == 0 {
+                    break
+                }
+            }
+            err(error) => {
+                received += error.transferred
+                if error.code == pl011.OVERRUN {
+                    overruns += 1
+                } else {
+                    overruns += 100
+                }
+            }
+        }
+    }
+    same = received == 32 && overruns == 1
+    for index in 0..32usize {
+        same = same && back[index] == burst[index]
+    }
+    check(same && serial.baud() == 1_000_000 && elapsed >= 478 && elapsed < 520)
+
+    // Released, the pins stay pulled up, so the line idles high; then the
+    // port is claimed again, to send only.
+    serial.set_loopback(false)!
+    pins.release_uart(serial)
+    line := pins.input(tx)!
+    high := line.is_high()
+    pins.release(line)
+    again := pins.uart(tx, none, 115_200)!
+    again.write(b"dodo\r\n")!
+    again.flush()!
+    check(high && again.baud() == 115_207)
+    pins.release_uart(again)
+}
+
+// The protocol options with nothing connected (7 checks): 10-bit I2C
+// addresses and probes, an I2C target, SPI with the controller's own chip
+// select in 12-bit Motorola and 16-bit TI frames through the internal
+// loopback, an SPI target without a master, a break through the UART's
+// loopback, and the flow control pins of a serial port.
+fn protocol_checks<P, T>(pins: &mut P, timer: &mut T) {
+    sda := board.I2C_SDA_PIN
+    scl := board.I2C_SCL_PIN
+    i2c := pins.i2c(sda, scl, hal.I2C_STANDARD_HZ)!
+    // Nobody answers a 10-bit address or 0x7C, and probing says so.
+    data: [1]u8 = [0]
+    absent := !i2c.probe(0x7C)!
+    check(absent && failed_with(i2c.write_ten_bit(0x2A5, &data), hal.Error.NoAcknowledge) && failed_with(i2c.read_ten_bit(0x2A5, &mut data), hal.Error.NoAcknowledge))
+    pins.release_i2c(i2c)
+
+    // A target takes the pins, refuses reserved addresses, and has nothing
+    // to report while no master talks to it.
+    reserved := refused(pins.i2c_target(sda, scl, 0x7A, false, hal.I2C_FAST_HZ), hal.Error.InvalidInput)
+    target := pins.i2c_target(sda, scl, 0x42, false, hal.I2C_FAST_HZ)!
+    buffer: [4]u8 = [0; 4]
+    idle := true
+    for _ in 0..100 {
+        match target.poll(&mut buffer) {
+            designware_i2c.TargetEvent.Idle => {}
+            _ => {
+                idle = false
+            }
+        }
+    }
+    check(reserved && idle && refused(pins.i2c(sda, scl, hal.I2C_STANDARD_HZ), hal.Error.Busy))
+    pins.release_i2c_target(target)
+
+    // SPI1 on GPIO 10 to 13, with GPIO 13 as its hardware chip select.
+    select_refused := refused(pins.spi_with_select(10, 11, some(12u32), 17, hal.SpiMode.Mode0, 1_000_000), hal.Error.InvalidInput)
+    spi := pins.spi_with_select(10, 11, some(12u32), 13, hal.SpiMode.Mode1, 1_000_000)!
+    spi.set_loopback(true)
+    spi.set_frame_bits(12)!
+    words: [8]u16 = [0; 8]
+    for index in 0..8usize {
+        words[index] = (0x0A5 * (index + 1)) as u16
+    }
+    spi.transfer_words(&mut words)!
+    same := true
+    for index in 0..8usize {
+        same = same && words[index] == ((0x0A5 * (index + 1)) & 0xFFF) as u16
+    }
+    bytes: [2]u8 = [1, 2]
+    check(select_refused && same && failed_with(spi.transfer(&mut bytes), hal.Error.Unsupported))
+    spi.set_frame_format(pl022.FrameFormat.TexasInstruments)
+    spi.set_frame_bits(16)!
+    wide: [4]u16 = [0xFFFF, 0x8001, 0x1234, 0xFEDC]
+    start := timer.now_us()
+    spi.transfer_words(&mut wide)!
+    elapsed := timer.now_us() - start
+    // 64 bits at just under 1 MHz, plus the frame pulses.
+    check(wide[0] == 0xFFFF && wide[1] == 0x8001 && wide[2] == 0x1234 && wide[3] == 0xFEDC && elapsed >= 64 && elapsed < 120)
+    pins.release_spi(spi)
+
+    // A target queues what its transmit FIFO holds and, with no master
+    // clocking, receives nothing.
+    spi_target := pins.spi_target(10, 11, some(12u32), 13, hal.SpiMode.Mode3)!
+    replies: [10]u8 = [0x55; 10]
+    queued := spi_target.queue(&replies)!
+    received := spi_target.read(&mut buffer)!
+    check(queued == 8 && received == 0 && refused(pins.spi(10, 11, none, hal.SpiMode.Mode0, 1_000_000), hal.Error.Busy))
+    pins.release_spi_target(spi_target)
+
+    // A break through the loopback reads as BREAK, and the port goes on.
+    tx := board.UART_TX_PIN
+    rx := board.UART_RX_PIN
+    serial := pins.uart(tx, some(rx), 115_200)!
+    serial.set_loopback(true)!
+    serial.set_break(true)!
+    timer.delay_us(200)
+    serial.set_break(false)!
+    timer.delay_us(100)
+    broke := false
+    match serial.poll_read(&mut buffer) {
+        ok(_) => {}
+        err(error) => {
+            broke = (error.code & pl011.BREAK) != 0
+        }
+    }
+    serial.write(b"ok")!
+    serial.flush()!
+    two: [2]u8 = [0; 2]
+    io.read_exact(&mut serial, &mut two)!
+    check(broke && two[0] == 111 && two[1] == 107)
+    serial.set_loopback(false)!
+    pins.release_uart(serial)
+
+    // Flow control owns CTS and RTS too. With nothing on CTS the
+    // transmitter would wait forever, so it is turned off before anything
+    // is sent.
+    flow_refused := refused(pins.uart_flow(tx, rx, rx + 2, rx + 1, 115_200), hal.Error.InvalidInput)
+    flow := pins.uart_flow(tx, rx, rx + 1, rx + 2, 115_200)!
+    taken := refused(pins.output(rx + 2), hal.Error.Busy)
+    flow.set_flow_control(false, false)!
+    flow.write(b"\r\n")!
+    flow.flush()!
+    pins.release_uart(flow)
+    free := pins.output(rx + 2)!
+    pins.release(free)
+    check(flow_refused && taken)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -354,6 +559,8 @@ fn main() {
     check(copy[63] == 63 && copy[0] == 0)
 
     bus_checks(&mut b.pins, &mut b.timer)
+    uart_checks(&mut b.pins, &mut b.timer)
+    protocol_checks(&mut b.pins, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.

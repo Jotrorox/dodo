@@ -28,16 +28,20 @@ pub const LED_PIN: u32 = 25
 pub const CRYSTAL_HZ: u32 = 12_000_000
 
 // The usual bus pins, as in the Pico SDK and Raspberry Pi's pinout diagrams:
-// I2C0 on GP4 (SDA) and GP5 (SCL), and SPI0 on GP16 (RX), GP18 (clock), and
-// GP19 (TX), with GP17 free for a chip select:
+// I2C0 on GP4 (SDA) and GP5 (SCL), SPI0 on GP16 (RX), GP18 (clock), and GP19
+// (TX), with GP17 free for a chip select, and UART0 on GP0 (TX) and GP1 (RX),
+// where the Raspberry Pi Debug Probe's UART connects:
 //
 //     i2c := b.pins.i2c(I2C_SDA_PIN, I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+//     serial := b.pins.uart(UART_TX_PIN, some(UART_RX_PIN), 115_200)!
 pub const I2C_SDA_PIN: u32 = 4
 pub const I2C_SCL_PIN: u32 = 5
 pub const SPI_RX_PIN: u32 = 16
 pub const SPI_SELECT_PIN: u32 = 17
 pub const SPI_CLOCK_PIN: u32 = 18
 pub const SPI_TX_PIN: u32 = 19
+pub const UART_TX_PIN: u32 = 0
+pub const UART_RX_PIN: u32 = 1
 
 pub struct Board {
     // The user LED, an output pin that is on when high.
@@ -56,6 +60,26 @@ pub fn take() -> Board!hal.Error {
     led := chip.pins.output(LED_PIN)?
     let rp2350.Peripherals { pins, timer } = chip
     return ok(Board { led, pins, timer })
+}
+
+// Write a failed check's message to every serial port claimed from
+// `b.pins.uart`, as the default panic hook does before it halts. For a panic
+// hook of your own, for example one that restarts into the bootloader so
+// `dodo run` works again without pressing BOOTSEL:
+//
+//     extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+//         unsafe {
+//             board.report_panic(check, file, line, column)
+//         }
+//         board.reboot_to_bootloader()
+//     }
+//
+// SAFETY: `check` and `file` must be the hook's NUL-terminated strings, and
+// the caller must halt or reset afterwards, as this takes over the ports.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        rp2350.report_panic(check, file, line, column)
+    }
 }
 
 // Restart into the USB bootloader, as if BOOTSEL were held at power-up: the
