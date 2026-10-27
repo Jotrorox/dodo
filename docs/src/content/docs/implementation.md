@@ -53,8 +53,8 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 
 | Area | Implemented | Boundary to keep in mind |
 | --- | --- | --- |
-| Values | Integers, floats, bool, arrays, tuples, checked references/slices, strings, structs, enums, Options, Results, raw pointers, `dyn` interface references, type aliases. | No owned `dyn` values, general function-value types, or automatic tuple equality. |
-| Functions | Declared signatures, final-expression returns, methods, associated functions, recursion, generics. | No overloads, inheritance, default/named arguments, closures, or specialization. |
+| Values | Integers, floats, bool, arrays, tuples, checked references/slices, strings, structs, enums, Options, Results, raw pointers, `dyn` interface references, type aliases. | No owned `dyn` values or closures, or automatic tuple equality. |
+| Functions | Declared signatures, final-expression returns, methods, associated functions, recursion, generics, function pointers, and closures that borrow what they capture. | No overloads, inheritance, default/named arguments, owning or heap-allocated closures, or specialization. |
 | Control flow | `if`, `match`, conditional patterns, four `for` forms, `break`, `continue`, `return`. | No `while`, `loop`, labels, general iterator protocol, or async/await. |
 | Ownership | Moves, shared/exclusive loans, source-based returns, deterministic destruction. | Conservative indexing, joins, loops, and aggregate lifetime tracking. |
 | Errors | Mandatory Result handling, explicit matching, `?`, panic-on-error `!`. | No exceptions, automatic error conversion, or panic unwinding. |
@@ -122,7 +122,9 @@ methods are statically dispatched.
 Hosted [platform packages](platform.md) add filesystem/process/environment APIs,
 native threads with checked move tasks, explicit unsafe transfer/sharing
 contracts, integer atomics, and guarded synchronization. Native callbacks use
-statically checked function specialization; closures remain unavailable.
+statically checked function specialization (`mem.callback`); Dodo function
+values do not use the C ABI. Closures are checked like references to what they
+capture, so they cannot be moved to another thread.
 
 [Networking](networking.md), [TLS](tls.md), [HTTP/1.1](http.md), and [web routing](web.md)
 compose existing generic methods and checked buffers. Borrow-carrying assignments

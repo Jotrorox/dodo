@@ -110,13 +110,16 @@ Integer literal magnitude must fit `u64`; `-` is a separate prefix operation.
 | `Option<T>` | `some(T)` or `none`. |
 | `Result<T, E>`, `T!E` | `ok(T)` or `err(E)`. |
 | `MaybeUninit<T>` | Opaque storage for potentially uninitialized `T`. |
+| `fn(A, B) -> R`, `fn(A)` | Function pointer; an omitted result means void. |
+| `&dyn fn(A) -> R`, `&mut dyn fn(A) -> R` | Closure reference that reads, or may modify, captured bindings. |
 
 `Self` is valid inside a struct declaration and names its current type. Result
 shorthand binds outside references and slices: `&T!E` means `Result<&T, E>`.
 Use the full spelling to make nested type relationships clear. `&dyn I` and
 `&mut dyn I` refer to a value implementing interface `I`; see
-[interfaces](generics.md#dynamic-dispatch-with-dyn). General function-value
-types are not implemented.
+[interfaces](generics.md#dynamic-dispatch-with-dyn). A function pointer's `-> R`
+extends to the end of the type, so `fn() -> u8!E` returns `Result<u8, E>`.
+`&fn(..)` is an ordinary reference to a function pointer.
 
 `type Name<T> = Type` declares a transparent alias: every use is replaced by the
 aliased type before checking, so the alias and the type are interchangeable. An
@@ -130,6 +133,21 @@ so `pair.0.1` is nested access. A tuple is a struct with public fields `0`,
 patterns `(p, q)` nest in every pattern position, and `for (a, b) in values`,
 `for &(a, b) in values`, and `for i, (a, b) in values` destructure elements.
 See [tuples and type aliases](types-and-functions.md#tuples-group-values-without-naming-them).
+
+## Closure literals and calls
+
+`fn(a: A, b) -> R { body }` is a closure literal. Parameter types and the result
+type may be omitted where the expected type supplies them; an omitted result
+without context is inferred from final expressions and `return` values, or is
+void. The body follows function rules for implicit returns, `return`, and `?`.
+A closure on one line with a single expression stays on one line when
+formatted; longer bodies are indented like a block.
+
+`name(args)` calls a local function value instead of a function of the same
+name. Other callee expressions are called with ordinary postfix syntax:
+`(table[i])(x)`, `make()(x)`, and `value.field(x)` when `value` has a
+function-valued `field` and no method of that name. Type arguments apply only
+to named generic functions, not to function values.
 
 ## Operators and evaluation order
 

@@ -241,7 +241,10 @@ impl HoverIndex<'_> {
 
     fn program(&mut self) {
         for function in &self.program.functions {
-            if function.printing.is_some() && function.generic_instance {
+            // Closure bodies are reached through their closure expressions.
+            if function.printing.is_some() && function.generic_instance
+                || function.environment.is_some()
+            {
                 continue;
             }
             // Specializations share source spans but may infer different types.
@@ -449,6 +452,18 @@ impl HoverIndex<'_> {
                 }
             }
             ExprKind::ValueBlock(block) => self.block(block),
+            ExprKind::Closure(closure) => {
+                for parameter in &closure.params {
+                    self.binding(parameter.span, &parameter.name, &parameter.ty);
+                }
+                self.block(&closure.body);
+            }
+            ExprKind::Invoke { callee, args } => {
+                self.expression(callee);
+                for arg in args {
+                    self.expression(arg);
+                }
+            }
             ExprKind::Int(..)
             | ExprKind::Float(..)
             | ExprKind::Bool(..)
@@ -778,6 +793,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn closures_show_parameter_capture_and_value_types() {
+        let document = Document::new(
+            "package test\nfn apply(f: &dyn fn(i32) -> i32) -> i32 { f(1) }\nfn main() {\noffset := 2i32\nresult := apply(fn(value) { value + offset })\nlocal := fn(x: u8) { inner := x }\n}\n".into(),
+        );
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        for (needle, expected) in [
+            ("value)", "value: i32"),
+            ("offset })", "i32"),
+            ("result :=", "result: i32"),
+            ("local :=", "local: fn(u8)"),
+            ("inner :=", "inner: u8"),
+        ] {
+            let hover = hover_at(&document, needle);
+            let text = hover["contents"]["value"].as_str().unwrap_or_default();
+            assert!(text.contains(expected), "{needle}: {text}");
+        }
+    }
     #[test]
     fn postfix_unwrap_retains_operand_hover_and_payload_type() {
         let document = Document::new(

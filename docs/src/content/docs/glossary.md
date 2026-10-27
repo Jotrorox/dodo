@@ -44,6 +44,10 @@ full rule or a worked example.
 | Generic | Code parameterized by types, such as `fn identity<T>(value: T) -> T`. See [generics](generics.md). |
 | Monomorphization | Generating specialized code for the concrete types used at generic calls. |
 | Receiver | The object on which a method is called: `self`, `&self`, or `&mut self` describes how the method uses it. |
+| Function pointer | A function used as a value, of type `fn(A) -> R`. It has no captured state. See [functions are values](types-and-functions.md#functions-are-values-and-closures-capture-locals). |
+| Closure | An anonymous function, `fn(x) { ... }`, that may use local variables of the surrounding code. |
+| Capture | A local variable a closure uses. Closures capture by reference, borrowing each variable while the closure can be called. |
+| Closure reference | `&dyn fn(A) -> R` (only reads its captures) or `&mut dyn fn(A) -> R` (may change them): a closure's code paired with its captured variables. |
 
 ## Ownership and storage
 

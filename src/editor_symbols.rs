@@ -95,6 +95,15 @@ impl Index {
                             .entry((expr.span.start, expr.span.end))
                             .or_insert_with(|| expr.ty.clone());
                     }
+                    // Closure parameters take omitted types from their context.
+                    if let ExprKind::Closure(closure) = &expr.kind {
+                        for param in &closure.params {
+                            index
+                                .types
+                                .entry((param.span.start, param.span.end))
+                                .or_insert_with(|| param.ty.clone());
+                        }
+                    }
                 });
             }
         }
@@ -212,6 +221,30 @@ impl Index {
                     &mut |statement| index.binding(statement, function.span),
                     &mut |_| {},
                 );
+                let mut closures = vec![];
+                walk_block(body, &mut |_| {}, &mut |expr| {
+                    if let ExprKind::Closure(closure) = &expr.kind {
+                        closures.push((expr.span, closure.params.clone()));
+                    }
+                });
+                for (scope, params) in closures {
+                    for parameter in params {
+                        let ty = index
+                            .types
+                            .get(&(parameter.span.start, parameter.span.end))
+                            .unwrap_or(&parameter.ty)
+                            .clone();
+                        index.local(
+                            &parameter.name,
+                            parameter.span,
+                            ty,
+                            scope,
+                            parameter.span.end,
+                            true,
+                        );
+                        index.type_roles(parameter.span);
+                    }
+                }
             }
         }
         for function in &original.functions {
@@ -1241,6 +1274,13 @@ fn walk_expr(e: &Expr, stmt: &mut impl FnMut(&Stmt), expr: &mut impl FnMut(&Expr
             }
         }
         ExprKind::ValueBlock(b) => walk_block(b, stmt, expr),
+        ExprKind::Closure(closure) => walk_block(&closure.body, stmt, expr),
+        ExprKind::Invoke { callee, args } => {
+            walk_expr(callee, stmt, expr);
+            for e in args {
+                walk_expr(e, stmt, expr);
+            }
+        }
         _ => (),
     }
 }

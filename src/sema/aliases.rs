@@ -172,10 +172,16 @@ fn bound_names(block: &[Stmt], names: &mut HashSet<String>) {
                 bound_names(else_block, names);
             }
             StmtKind::For {
-                init, step, body, ..
+                init,
+                condition,
+                step,
+                body,
             } => {
                 for statement in init.iter().chain(step) {
                     bound_names(std::slice::from_ref(statement.as_ref()), names);
+                }
+                if let Some(condition) = condition {
+                    expression_names(condition, names);
                 }
                 bound_names(body, names);
             }
@@ -202,18 +208,59 @@ fn bound_names(block: &[Stmt], names: &mut HashSet<String>) {
             StmtKind::Expr(value) | StmtKind::Yield(value) | StmtKind::Return(Some(value)) => {
                 expression_names(value, names)
             }
-            StmtKind::Assign { .. }
-            | StmtKind::Return(None)
-            | StmtKind::Break
-            | StmtKind::Continue => {}
+            StmtKind::Assign { target, value, .. } => {
+                expression_names(target, names);
+                expression_names(value, names);
+            }
+            StmtKind::Return(None) | StmtKind::Break | StmtKind::Continue => {}
         }
     }
 }
 
-// Value blocks (`x := { ... }`, `if`/`match` expressions) declare locals too.
+// Value blocks (`x := { ... }`, `if`/`match` expressions) and closures, which
+// may appear anywhere in an expression, declare locals too.
 fn expression_names(expression: &Expr, names: &mut HashSet<String>) {
-    if let ExprKind::ValueBlock(body) = &expression.kind {
-        bound_names(body, names);
+    match &expression.kind {
+        ExprKind::ValueBlock(body) => bound_names(body, names),
+        ExprKind::Closure(closure) => {
+            names.extend(closure.params.iter().map(|p| p.name.clone()));
+            bound_names(&closure.body, names);
+        }
+        ExprKind::Array(_, values) => values.iter().for_each(|v| expression_names(v, names)),
+        ExprKind::Struct(_, fields) => fields.iter().for_each(|(_, v)| expression_names(v, names)),
+        ExprKind::Call { args, .. } => args.iter().for_each(|v| expression_names(v, names)),
+        ExprKind::MethodCall { receiver, args, .. } => {
+            expression_names(receiver, names);
+            args.iter().for_each(|v| expression_names(v, names));
+        }
+        ExprKind::Invoke { callee, args } => {
+            expression_names(callee, names);
+            args.iter().for_each(|v| expression_names(v, names));
+        }
+        ExprKind::Repeat(value, _)
+        | ExprKind::Constant(value, _)
+        | ExprKind::Cast(value, _)
+        | ExprKind::Unary(_, value)
+        | ExprKind::Try(value)
+        | ExprKind::Unwrap(value)
+        | ExprKind::Field(value, _) => expression_names(value, names),
+        ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) | ExprKind::Range(a, b) => {
+            expression_names(a, names);
+            expression_names(b, names);
+        }
+        ExprKind::Slice {
+            base, start, end, ..
+        } => {
+            expression_names(base, names);
+            for value in start.iter().chain(end) {
+                expression_names(value, names);
+            }
+        }
+        ExprKind::Int(..)
+        | ExprKind::Float(..)
+        | ExprKind::Bool(_)
+        | ExprKind::String(..)
+        | ExprKind::Name(_) => {}
     }
 }
 
@@ -325,6 +372,12 @@ impl Resolver {
             Type::Result(ok, error) => {
                 self.ty(ok, scope, span, active)?;
                 self.ty(error, scope, span, active)?;
+            }
+            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+                for param in params {
+                    self.ty(param, scope, span, active)?;
+                }
+                self.ty(ret, scope, span, active)?;
             }
             Type::Unknown
             | Type::Void
@@ -659,6 +712,19 @@ impl Resolver {
                 }
             }
             ExprKind::ValueBlock(body) => self.block(body, scope, locals)?,
+            ExprKind::Closure(closure) => {
+                for param in &mut closure.params {
+                    self.ty(&mut param.ty, scope, param.span, &mut vec![])?;
+                }
+                self.ty(&mut closure.ret, scope, closure.ret_span, &mut vec![])?;
+                self.block(&mut closure.body, scope, locals)?;
+            }
+            ExprKind::Invoke { callee, args } => {
+                self.expr(callee, scope, locals)?;
+                for argument in args {
+                    self.expr(argument, scope, locals)?;
+                }
+            }
             ExprKind::Int(..)
             | ExprKind::Float(..)
             | ExprKind::Bool(_)
@@ -701,6 +767,14 @@ fn substitute(ty: &Type, mapping: &HashMap<String, Type>) -> Type {
         Type::Result(t, e) => Type::Result(
             Box::new(substitute(t, mapping)),
             Box::new(substitute(e, mapping)),
+        ),
+        Type::Fn(params, ret) => Type::Fn(
+            params.iter().map(|t| substitute(t, mapping)).collect(),
+            Box::new(substitute(ret, mapping)),
+        ),
+        Type::DynFn(params, ret) => Type::DynFn(
+            params.iter().map(|t| substitute(t, mapping)).collect(),
+            Box::new(substitute(ret, mapping)),
         ),
         Type::Unknown
         | Type::Void

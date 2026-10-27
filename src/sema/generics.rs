@@ -111,6 +111,7 @@ pub(super) fn instantiate(program: &mut Program) -> Check<Vec<Obligation>> {
         printing_count: 0,
         obligations: vec![],
         required: HashSet::new(),
+        pending: vec![],
     };
     for interface in &mut program.interfaces {
         for method in &mut interface.methods {
@@ -176,6 +177,8 @@ struct Expander {
     printing_count: usize,
     obligations: Vec<Obligation>,
     required: HashSet<(String, String, String)>,
+    // Generic parameters of the call whose arguments are being inferred.
+    pending: Vec<String>,
 }
 impl Expander {
     /// A generic struct declaration; every tuple arity has an implicit one with
@@ -210,6 +213,140 @@ impl Expander {
         self.struct_templates
             .insert(name.to_owned(), template.clone());
         Some(template)
+    }
+    /// The function pointer type of a named, non-generic function.
+    fn function_value_type(&self, name: &str) -> Option<Type> {
+        let function = self.signatures.get(name)?;
+        (function.generics.is_empty() && function.printing.is_none()).then(|| {
+            Type::Fn(
+                function.params.iter().map(|p| p.ty.clone()).collect(),
+                Box::new(function.ret.clone()),
+            )
+        })
+    }
+    /// A named function used as a value. Generic functions are specialized
+    /// from the expected function type, and the name becomes the specialization.
+    fn function_value(
+        &mut self,
+        name: &mut String,
+        expected: Option<&Type>,
+        span: Span,
+    ) -> Check<Option<Type>> {
+        let Some(template) = self.signatures.get(name.as_str()).cloned() else {
+            return Ok(None);
+        };
+        if template.printing.is_some() {
+            return Err(Diagnostic::new(
+                span,
+                "printing entry points cannot be used as function values; wrap a concrete call in an ordinary function",
+            ));
+        }
+        if template.generics.is_empty() {
+            return Ok(self.function_value_type(name));
+        }
+        let parameters = &template.generics;
+        let mut mapping = HashMap::new();
+        let pattern = Type::Fn(
+            template.params.iter().map(|p| p.ty.clone()).collect(),
+            Box::new(template.ret.clone()),
+        );
+        match expected.map(|t| t.callable_signature()) {
+            Some(Some((params, ret))) => {
+                let actual = Type::Fn(params.to_vec(), Box::new(ret.clone()));
+                self.unify(&pattern, &actual, parameters, &mut mapping, span)?;
+            }
+            _ => {
+                return Err(Diagnostic::new(
+                    span,
+                    format!(
+                        "generic function `{name}` needs a function type from its context to be used as a value"
+                    ),
+                ));
+            }
+        }
+        let arguments = self.inferred_arguments(parameters, &mapping, span)?;
+        self.require_bounds(name, false, parameters, &arguments, &template.bounds, span);
+        let concrete = specialized(name, &arguments);
+        if self.generated_functions.insert(concrete.clone()) {
+            self.begin_specialization(span)?;
+            let mut function = template.clone();
+            function.name = concrete.clone();
+            function.generics.clear();
+            function.bounds.clear();
+            function.generic_instance = true;
+            self.function(&mut function, &mapping)?;
+            self.functions.push(function);
+            self.depth -= 1;
+        }
+        *name = concrete;
+        let mut ty = Self::substitute(&pattern, &mapping);
+        self.ty(&mut ty, &HashMap::new(), span)?;
+        Ok(Some(ty))
+    }
+    /// Annotate a closure literal from its expected type and guess its type.
+    fn closure(
+        &mut self,
+        closure: &mut Closure,
+        substitutions: &HashMap<String, Type>,
+        expected: Option<&Type>,
+    ) -> Check<Type> {
+        let hint = expected
+            .and_then(|t| t.callable_signature())
+            .filter(|(params, _)| params.len() == closure.params.len())
+            .map(|(p, r)| (p.to_vec(), r.clone()));
+        let pending = self.pending.clone();
+        let known = |ty: &Type| ty != &Type::Unknown && Self::concrete(ty, &pending);
+        for (i, param) in closure.params.iter_mut().enumerate() {
+            self.ty(&mut param.ty, substitutions, param.span)?;
+            if param.ty == Type::Unknown
+                && let Some((params, _)) = &hint
+                && known(&params[i])
+            {
+                param.ty = params[i].clone();
+            }
+        }
+        self.ty(&mut closure.ret, substitutions, closure.ret_span)?;
+        let declared = if closure.ret != Type::Unknown {
+            closure.ret.clone()
+        } else {
+            hint.as_ref()
+                .map(|(_, r)| r.clone())
+                .filter(|r| known(r))
+                .unwrap_or(Type::Unknown)
+        };
+        let locals = self.locals.clone();
+        for param in &closure.params {
+            self.locals.insert(param.name.clone(), param.ty.clone());
+        }
+        let ret = std::mem::replace(&mut self.return_type, declared.clone());
+        let yielding = std::mem::replace(
+            &mut self.yield_type,
+            (declared != Type::Unknown).then(|| declared.clone()),
+        );
+        let pending = std::mem::take(&mut self.pending);
+        let result = self.block(&mut closure.body, substitutions);
+        self.pending = pending;
+        let returned = std::mem::replace(&mut self.return_type, ret);
+        let yielded = std::mem::replace(&mut self.yield_type, yielding);
+        self.locals = locals;
+        result?;
+        let ty = if declared != Type::Unknown {
+            declared
+        } else if let Some(ty) = yielded.filter(|t| *t != Type::Unknown) {
+            ty
+        } else if returned != Type::Unknown {
+            returned
+        } else if super::closures::has_tail(&closure.body)
+            || super::closures::returns(&closure.body)
+        {
+            Type::Unknown
+        } else {
+            Type::Void
+        };
+        Ok(Type::Fn(
+            closure.params.iter().map(|p| p.ty.clone()).collect(),
+            Box::new(ty),
+        ))
     }
     // Record each specialization's bounds once per type, interface, and owner.
     fn require_bounds(
@@ -311,6 +448,12 @@ impl Expander {
             Type::Result(t, e) => {
                 self.ty(t, substitutions, span)?;
                 self.ty(e, substitutions, span)?;
+            }
+            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+                for param in params.iter_mut() {
+                    self.ty(param, substitutions, span)?;
+                }
+                self.ty(ret, substitutions, span)?;
             }
             Type::Generic(name, arguments) => {
                 for argument in arguments.iter_mut() {
@@ -472,7 +615,16 @@ impl Expander {
                 self.expression(value, substitutions, Some(&ty))?;
             }
             StmtKind::Return(Some(e)) => {
-                self.expression(e, substitutions, Some(&self.return_type.clone()))?;
+                let expected = self.return_type.clone();
+                let actual = self.expression(
+                    e,
+                    substitutions,
+                    (expected != Type::Unknown).then_some(&expected),
+                )?;
+                // A closure without a declared result infers it from its returns.
+                if expected == Type::Unknown {
+                    self.return_type = actual;
+                }
             }
             StmtKind::Yield(e) => {
                 let ty = self.expression(e, substitutions, self.yield_type.clone().as_ref())?;
@@ -737,6 +889,20 @@ impl Expander {
                 n.clone(),
                 args.iter().map(|t| Self::substitute(t, mapping)).collect(),
             ),
+            Type::Fn(params, ret) => Type::Fn(
+                params
+                    .iter()
+                    .map(|t| Self::substitute(t, mapping))
+                    .collect(),
+                Box::new(Self::substitute(ret, mapping)),
+            ),
+            Type::DynFn(params, ret) => Type::DynFn(
+                params
+                    .iter()
+                    .map(|t| Self::substitute(t, mapping))
+                    .collect(),
+                Box::new(Self::substitute(ret, mapping)),
+            ),
             _ => ty.clone(),
         }
     }
@@ -752,6 +918,10 @@ impl Expander {
             | Type::MaybeUninit(t) => Self::concrete(t, parameters),
             Type::Result(t, e) => Self::concrete(t, parameters) && Self::concrete(e, parameters),
             Type::Generic(_, args) => args.iter().all(|t| Self::concrete(t, parameters)),
+            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+                params.iter().all(|t| Self::concrete(t, parameters))
+                    && Self::concrete(ret, parameters)
+            }
             _ => true,
         }
     }
@@ -807,6 +977,18 @@ impl Expander {
                     self.unify(p, a, parameters, mapping, span)?;
                 }
             }
+            (Type::Fn(ps, p) | Type::DynFn(ps, p), Type::Fn(args, a) | Type::DynFn(args, a))
+                if ps.len() == args.len() =>
+            {
+                for (p, a) in ps.iter().zip(args) {
+                    self.unify(p, a, parameters, mapping, span)?;
+                }
+                self.unify(p, a, parameters, mapping, span)?;
+            }
+            // A function pointer converts to a closure reference.
+            (Type::Ref(_, p), Type::Fn(..)) if matches!(p.as_ref(), Type::DynFn(..)) => {
+                self.unify(p, &actual, parameters, mapping, span)?
+            }
             _ => (),
         }
         Ok(())
@@ -819,7 +1001,29 @@ impl Expander {
                 .locals
                 .get(n)
                 .or_else(|| self.constants.get(n))
-                .cloned(),
+                .cloned()
+                .or_else(|| self.function_value_type(n)),
+            ExprKind::Field(..)
+                if let Some(path) = qualified_name(e)
+                    && !self
+                        .locals
+                        .contains_key(path.split('.').next().unwrap_or(""))
+                    && let Some(ty) = self.function_value_type(&path) =>
+            {
+                Some(ty)
+            }
+            ExprKind::Closure(closure)
+                if closure.ret != Type::Unknown
+                    && closure.params.iter().all(|p| p.ty != Type::Unknown) =>
+            {
+                Some(Type::Fn(
+                    closure.params.iter().map(|p| p.ty.clone()).collect(),
+                    Box::new(closure.ret.clone()),
+                ))
+            }
+            ExprKind::Invoke { callee, .. } => self
+                .guess(callee)
+                .and_then(|t| t.call_signature().map(|(_, r)| r.clone())),
             ExprKind::String(_, bytes) => Some(if *bytes {
                 Type::Slice(false, Box::new(Type::u8()))
             } else {
@@ -958,6 +1162,83 @@ impl Expander {
                 args: std::mem::take(args),
             };
         }
+        // A qualified function used as a value, such as `math.square`.
+        if let ExprKind::Field(..) = &e.kind
+            && let Some(path) = qualified_name(e)
+            && !self
+                .locals
+                .contains_key(path.split('.').next().unwrap_or(""))
+            && self.signatures.contains_key(&path)
+        {
+            e.kind = ExprKind::Name(path);
+        }
+        // A local function value shadows any function of the same name, and a
+        // constant or static holding a function value is called the same way.
+        if let ExprKind::MethodCall {
+            receiver,
+            name,
+            args,
+        } = &mut e.kind
+            && let Some(prefix) = qualified_name(receiver)
+            && !self.locals.contains_key(&prefix)
+            && self
+                .constants
+                .get(&format!("{prefix}.{name}"))
+                .is_some_and(|ty| ty.call_signature().is_some())
+        {
+            e.kind = ExprKind::Call {
+                name: format!("{prefix}.{name}"),
+                type_args: vec![],
+                args: std::mem::take(args),
+            };
+        }
+        if let ExprKind::Call {
+            name,
+            type_args,
+            args,
+        } = &mut e.kind
+            && type_args.is_empty()
+            && (self.locals.contains_key(name.as_str())
+                || self
+                    .constants
+                    .get(name.as_str())
+                    .is_some_and(|ty| ty.call_signature().is_some()))
+        {
+            e.kind = ExprKind::Invoke {
+                callee: Box::new(Expr::new(ExprKind::Name(std::mem::take(name)), span)),
+                args: std::mem::take(args),
+            };
+        }
+        // `value.field(args)` calls a function-valued field when no method exists.
+        if let ExprKind::MethodCall {
+            receiver,
+            name,
+            args,
+        } = &mut e.kind
+            && let Some(actual) = self.guess(receiver)
+            && let Type::Named(owner) = dereferenced(&actual)
+            && !self.signatures.contains_key(&format!("{owner}.{name}"))
+            && self.known_structs.get(owner).is_some_and(|s| {
+                s.fields
+                    .iter()
+                    .any(|f| f.name == *name && f.ty.callable_signature().is_some())
+            })
+        {
+            let field = Expr::new(
+                ExprKind::Field(
+                    Box::new(std::mem::replace(
+                        receiver.as_mut(),
+                        Expr::new(ExprKind::Bool(false), span),
+                    )),
+                    std::mem::take(name),
+                ),
+                span,
+            );
+            e.kind = ExprKind::Invoke {
+                callee: Box::new(field),
+                args: std::mem::take(args),
+            };
+        }
         Ok(match &mut e.kind {
             ExprKind::Int(_, suffix) => {
                 if let Some(t) = suffix {
@@ -982,13 +1263,27 @@ impl Expander {
                     Type::Str
                 }
             }
-            ExprKind::Name(n) => self
-                .locals
-                .get(n)
-                .or_else(|| self.constants.get(n))
-                .cloned()
-                .or_else(|| expected.cloned())
-                .unwrap_or(Type::Unknown),
+            ExprKind::Name(n) => {
+                if let Some(ty) = self.locals.get(n).or_else(|| self.constants.get(n)) {
+                    ty.clone()
+                } else if let Some(ty) = self.function_value(n, expected, span)? {
+                    ty
+                } else {
+                    expected.cloned().unwrap_or(Type::Unknown)
+                }
+            }
+            ExprKind::Closure(closure) => self.closure(closure, substitutions, expected)?,
+            ExprKind::Invoke { callee, args } => {
+                let callee = self.expression(callee, substitutions, None)?;
+                let signature = callee
+                    .call_signature()
+                    .map(|(p, r)| (p.to_vec(), r.clone()));
+                for (i, arg) in args.iter_mut().enumerate() {
+                    let hint = signature.as_ref().and_then(|(p, _)| p.get(i));
+                    self.expression(arg, substitutions, hint)?;
+                }
+                signature.map_or(Type::Unknown, |(_, r)| r)
+            }
             ExprKind::Constant(v, t) => {
                 self.ty(t, substitutions, span)?;
                 self.expression(v, substitutions, Some(t))?;
@@ -1061,7 +1356,7 @@ impl Expander {
                 };
                 for v in items {
                     let actual = self.expression(v, substitutions, hint.as_ref())?;
-                    if hint.is_none() && actual != Type::Unknown {
+                    if hint.is_none() && Self::concrete(&actual, &[]) {
                         hint = Some(actual);
                     }
                 }
@@ -1280,12 +1575,29 @@ impl Expander {
                             }
                         }
                     }
-                    for (i, arg) in args.iter_mut().enumerate() {
+                    // Closure literals take their parameter types from the
+                    // arguments before them, so check them after the others.
+                    let closure_last: Vec<_> = (0..args.len())
+                        .filter(|&i| !matches!(args[i].kind, ExprKind::Closure(_)))
+                        .chain(
+                            (0..args.len())
+                                .filter(|&i| matches!(args[i].kind, ExprKind::Closure(_))),
+                        )
+                        .collect();
+                    for i in closure_last {
+                        let arg = &mut args[i];
                         let param = template.params.get(i);
                         let hint = param
                             .map(|p| Self::substitute(&p.ty, &mapping))
-                            .filter(|t| Self::concrete(t, parameters));
-                        let actual = self.expression(arg, substitutions, hint.as_ref())?;
+                            .filter(|t| {
+                                Self::concrete(t, parameters)
+                                    || matches!(arg.kind, ExprKind::Closure(_))
+                                        && t.callable_signature().is_some()
+                            });
+                        let pending = std::mem::replace(&mut self.pending, parameters.clone());
+                        let actual = self.expression(arg, substitutions, hint.as_ref());
+                        self.pending = pending;
+                        let actual = actual?;
                         if !explicit && let Some(param) = param {
                             self.unify(&param.ty, &actual, parameters, &mut mapping, span)?;
                         }

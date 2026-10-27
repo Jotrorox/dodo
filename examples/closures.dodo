@@ -1,0 +1,74 @@
+package closures
+
+// Function values and closures: run with `dodo run examples/closures.dodo`.
+import "std/collections"
+import "std/console"
+import "std/io"
+
+struct Reading {
+    sensor: u32
+    celsius: i32
+}
+
+// A plain function pointer can be stored in a table and chosen at run time.
+fn to_fahrenheit(celsius: i32) -> i32 {
+    celsius * 9 / 5 + 32
+}
+
+fn to_kelvin(celsius: i32) -> i32 {
+    celsius + 273
+}
+
+const CONVERSIONS: [2]fn(i32) -> i32 = [to_fahrenheit, to_kelvin]
+
+// A closure reference lets the caller decide what happens to each reading.
+// `&mut dyn fn` accepts closures that change what they capture.
+fn each_reading(readings: &[Reading], visit: &mut dyn fn(&Reading)) {
+    for reading in readings {
+        visit(reading)
+    }
+}
+
+fn run() -> void!io.Error {
+    readings := [
+        Reading { sensor: 3, celsius: 21 },
+        Reading { sensor: 1, celsius: 35 },
+        Reading { sensor: 2, celsius: -4 },
+    ]
+
+    // Sort by a key, in a direction chosen by a captured local.
+    descending := false
+    collections.sort_by(&mut readings, fn(a, b) {
+        order := a.sensor as i32 - b.sensor as i32
+        if descending {
+            -order
+        } else {
+            order
+        }
+    })
+
+    // A closure that updates captured locals.
+    warmest := readings[0].celsius
+    count := 0
+    each_reading(&readings, fn(reading) {
+        if reading.celsius > warmest {
+            warmest = reading.celsius
+        }
+        count += 1
+    })
+    console.printf("{} readings, warmest {} C\n", count, warmest)?
+
+    limit := 30i32
+    hot := collections.count(&readings, fn(reading) { reading.celsius > limit })
+    console.printf("{} above {} C\n", hot, limit)?
+
+    for convert in &CONVERSIONS {
+        console.printf("{} ", convert(warmest))?
+    }
+    console.println("")?
+    return ok()
+}
+
+fn main() {
+    run()!
+}

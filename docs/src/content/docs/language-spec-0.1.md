@@ -26,7 +26,8 @@ local type inference, composable constants, value-producing blocks, ranges,
 immutable runtime bindings, implicit function returns, recursive patterns,
 conditional destructuring, subslices, explicit copying in collection loops, canonical formatting, and
 leading-dot continuation. Earlier type-first declarations and fully explicit forms remain
-accepted for compatibility. The ownership categories are unchanged.
+accepted for compatibility. The ownership categories are unchanged. The October
+2026 revision adds function values and closures (section 6.7).
 
 **Must**, **must not**, **shall**, and **shall not** express requirements.
 **May** expresses permission. **Should** expresses a recommendation.
@@ -116,8 +117,9 @@ and scheduling belong in libraries, rather than mandatory runtime services.
 ### 1.3. Deliberate omissions
 
 Version 0.1 has no operator or function overloading, inheritance, implicit
-constructors, exceptions, macros, reflection, closures, `async`/`await`, or
-language-level threads. It has no user-defined implicit conversions, iterator
+constructors, exceptions, macros, reflection, `async`/`await`, or
+language-level threads. Closures capture local bindings only by reference
+(section 6.7); there are no owning or heap-allocated closures. It has no user-defined implicit conversions, iterator
 protocol, specialization, or metaprogramming facilities.
 
 Operators are compiler-defined for primitive types and supported simple enums.
@@ -319,6 +321,9 @@ unterminated literals are errors.
 | `&str` | UTF-8 string view |
 | `Result<T, E>` | Success or error value |
 | `Option<T>` | Optional value, conceptually some(T) or none |
+| `fn(A, B) -> R` | Function pointer: code with no captured state |
+| `&dyn fn(A) -> R` | Shared closure reference: code and a borrowed environment |
+| `&mut dyn fn(A) -> R` | Exclusive closure reference that may modify what it captures |
 
 ### 4.2. Arrays and slices
 
@@ -703,14 +708,68 @@ reference calls the implementation recorded in its table, with the interface
 method's signature and borrow contract. `dyn I` implements `I` and satisfies
 bounds on `I`.
 
+### 6.7. Function values and closures
+
+**FN-VALUE.** `fn(A, B) -> R` is a function pointer type; an omitted `-> R`
+means void. Function pointers are copyable, carry no borrows, and may be stored
+in fields, arrays, Options, constants, and static storage. A named function,
+method (`Type.method`), or imported function (`package.name`) used as a value
+has the function pointer type of its signature. A generic function used as a
+value is specialized from the expected function type. Unsafe, foreign,
+destructor, interface-dispatch, and storage-contract (`stores`, `from(x.stored)`)
+functions are not function values. Function pointers do not use the C ABI; pass
+C callbacks with `mem.callback`. Two function pointers cannot be compared.
+
+`dyn fn(A) -> R` is an unknown callable that may capture local bindings. Like
+`dyn I` it has no fixed size and appears only behind a reference. A closure
+reference is a pair of code and an environment of captured binding addresses.
+`&dyn fn(..)` is copyable and may only read what it captures. `&mut dyn fn(..)`
+moves like any mutable reference and may modify what it captures. A function
+pointer converts implicitly (or with `as`) to either closure reference with no
+borrow, and `&dyn fn(..)` converts to `&mut dyn fn(..)`; `&mut dyn fn(..)`
+never becomes shared. `&fn(..)` is an ordinary reference to a function pointer.
+Closure references cannot be dereferenced.
+
+**FN-CLOSURE.** A closure literal is `fn(a: A, b) -> R { body }`. An omitted
+parameter type is taken from the expected function type and is otherwise an
+error. An omitted result type is taken from the expected function type, else
+from the body: its final expressions and `return` values, or void when it has
+neither. `?` requires a known Result result type. The body is checked as its own
+function: `return` and `?` leave the closure, and `break` and `continue` cannot
+cross it.
+
+A closure captures each enclosing local binding its body uses, including
+parameters and `self`, by reference. A capture is mutable when the body
+assigns to it, borrows it mutably, calls a mutating method or closure through
+it, or reborrows a mutable reference stored in it; otherwise it is shared. A
+closure without captures is a function pointer. With captures, it is
+`&mut dyn fn(..)` if any capture is mutable and `&dyn fn(..)` otherwise. The
+closure value keeps a loan of every captured binding, with that capture's
+mutability, for as long as the value or anything it is copied into may be used
+(section 8). Capturing therefore follows the ordinary borrowing rules at the
+point where the closure is created: a mutably captured binding cannot be read
+or written elsewhere while the closure is live, and a closure cannot outlive a
+captured local. A closure may not move a captured value, store a borrow into a
+captured binding, or modify an immutable `let` binding.
+
+**FN-CALL.** `f(args)` calls a function value when `f` names a local binding;
+any other callee expression, such as `(table[i])(x)` or `value.field(x)` (when
+the type has no method of that name), is called the same way. References to
+function values are dereferenced automatically. Calling a `&mut dyn fn(..)`
+reborrows it exclusively. Arguments follow section 6.2 and evaluate after the
+callee, left to right. When the result type carries a borrow, it is bounded by
+all borrow-carrying arguments, or is `static` when there are none; a closure
+body is checked against that contract, so it cannot return borrows of its
+captures.
+
 ## 7. Ownership and moves
 
 ### 7.1. Copy categories
 
 | Category | Types |
 | --- | --- |
-| Copy by default | Scalars, shared references, raw pointers |
-| Move by default | Structs, arrays, tagged values, mutable references |
+| Copy by default | Scalars, shared references, raw pointers, function pointers, `&dyn fn(..)` |
+| Move by default | Structs, arrays, tagged values, mutable references, `&mut dyn fn(..)` |
 
 Passing or assigning an owned move value transfers ownership. A moved-from
 binding cannot be read until reinitialized. Duplicating an aggregate requires an
@@ -1717,6 +1776,9 @@ type          = primitive-type
               | "*const", type | "*mut", type
               | "(", type, ")"
               | "(", type, ",", type, { ",", type }, [ "," ], ")"
+              | "fn", "(", [ type, { ",", type } ], ")", [ "->", type ]
+              | "&", [ "mut" ], "dyn", "fn", "(", [ type, { ",", type } ], ")",
+                [ "->", type ]
               | type, "!", type ;
 
 block         = "{", { statement }, "}" ;
@@ -1762,6 +1824,10 @@ match-expr    = "match", expression, "{", { value-arm }, "}" ;
 value-arm     = pattern, [ "if", expression ], "=>",
                 ( expression | value-block ), [ "," ] ;
 value-block   = "{", { statement }, expression, "}" ;
+closure       = "fn", "(", [ closure-param, { ",", closure-param } ], ")",
+                [ "->", type ], block ;
+closure-param = identifier, [ ":", type ] ;
+value-call    = expression, "(", [ expression, { ",", expression } ], ")" ;
 ```
 
 ## Appendix B. Conformance checklist
@@ -1808,6 +1874,7 @@ filters. Suite abbreviations refer to these files:
 - `core`: [tests/core_intrinsics.rs](https://github.com/Jotrorox/dodo/blob/main/tests/core_intrinsics.rs)
 - `packages`: [tests/stdlib_packages.rs](https://github.com/Jotrorox/dodo/blob/main/tests/stdlib_packages.rs)
 - `tuples_and_aliases`: [tests/tuples_and_aliases.rs](https://github.com/Jotrorox/dodo/blob/main/tests/tuples_and_aliases.rs)
+- `closures`: [tests/closures.rs](https://github.com/Jotrorox/dodo/blob/main/tests/closures.rs)
 - `lexer`, `parser`, `sema`, `package`: the `tests` modules in `src/lexer.rs`,
   `src/parser.rs`, `src/sema.rs`, and `src/package.rs` respectively.
 
@@ -1833,7 +1900,8 @@ execution cases and enforced static boundaries are identified separately.
 | REP-SCALAR, NUM-FLOAT | E `spec::scalar_representations_and_float_comparisons`; T `spec::target_profiles_publish_width_endianness_and_native_symbols`. |
 | REP-TAG, REP-VIEW, REP-LAYOUT | E `spec::aggregate_layout_tags_and_string_byte_lengths`, `shared_payload_values_survive_moves_borrows_and_propagation`, `shared_payload_cleanup_drops_only_the_active_alternative`; T `spec::shared_payload_layout_on_native_and_embedded_targets`; E `debugging::gdb_reads_shared_enum_and_result_payloads`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`; R `core::field_offsets_enforce_literal_direct_fields_and_package_privacy`. |
 | NUM-CAST, NUM-ARITH, TRAP | E `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`; E `compiler::arithmetic_and_index_traps_survive_optimization`, `invalid_subslice_bounds_trap_at_all_optimization_levels`; R `sema::constant_arithmetic_checked_before_codegen`; E/R/T `core::wrapping_arithmetic_boundaries_inference_and_evaluation_order`, `wrapping_arithmetic_rejects_invalid_arguments`, `wrapping_arithmetic_emits_plain_operations_at_each_target_width`. |
-| TUPLE, ALIAS | E `tuples_and_aliases::tuples_construct_return_index_and_destructure`, `tuple_patterns_match_and_loops_destructure_elements`, `tuples_own_and_drop_their_elements_and_borrow_fields_disjointly`, `type_aliases_name_types_structs_enums_and_generic_results`; R `tuples_and_aliases::tuple_and_alias_mistakes_have_source_level_diagnostics`, `private_aliases_stay_in_their_package`; A/R `parser::tuples_and_type_aliases`, `lexer::digits_after_a_dot_are_tuple_indices`. |
+| TUPLE, ALIAS | E `tuples_and_aliases::tuples_construct_return_index_and_destructure`, `tuple_patterns_match_and_loops_destructure_elements`, `tuples_own_and_drop_their_elements_and_borrow_fields_disjointly`, `type_aliases_name_types_structs_enums_and_generic_results`, `tuples_and_aliases_combine_with_function_values_and_closures`; R `tuples_and_aliases::tuple_and_alias_mistakes_have_source_level_diagnostics`, `private_aliases_stay_in_their_package`; A/R `parser::tuples_and_type_aliases`, `lexer::digits_after_a_dot_are_tuple_indices`. |
+| FN-VALUE, FN-CLOSURE, FN-CALL | E `closures::function_pointers_and_closures_run`, `generic_inference_methods_and_nested_captures`, `constant_tables_static_handlers_and_large_values`, `closures_return_results_and_borrows_from_parameters`, `collection_algorithms_take_closures`; R `closures::captured_bindings_keep_their_borrows`, `closure_types_follow_what_they_capture`, `function_values_are_checked_where_used`; A `parser::function_types_closures_and_value_calls`. |
 | GEN-INSTANCE, section 4.7 | E `compiler::generic_arguments_infer_from_values_parameters_and_return_context`, `generic_struct_methods_keep_borrowed_returns`; R `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors`. |
 | OWN-SUBOBJECT, sections 7–9 | R `sema::destructuring_preserves_borrows_moves_and_custom_drop`; E `compiler::cleanup_reverses_order_and_does_not_double_drop_moves`, `cleanup_runs_on_overwrite_explicit_drop_break_and_continue`, `custom_destructor_runs_before_nested_fields`, `nested_patterns_drop_ignored_values_and_guard_failures_once`. |
 | PTR-VALID, PTR-OFFSET | E valid ranges/reinterpretation `spec::pointer_integer_round_trip_offsets_and_byte_access`, `scalar_representations_and_float_comparisons`; E foreign allocated storage `storage::simultaneous_boxes_destruction_failure_alignment_and_zst`. Invalid runtime provenance is an unsafe precondition violation, not a required rejection. |
@@ -1868,7 +1936,7 @@ tests constrain the documented choice, not every possible conforming choice.
 | ID-FLOAT: floating environment and constant precision | Runtime uses LLVM non-fast floating operations with default round-to-nearest, ties-to-even. Native tests assume gradual underflow and masked floating exceptions; no source facility changes rounding/exception modes. Constant scalar evaluation computes floating operations in host binary64 and rounds to the expression's type at each node. Integer-to-float constants round directly to the destination representation using round-to-nearest, ties-to-even, matching runtime conversion; an explicit cast through f64 still performs both conversions. Decimal literal conversion passes through binary64. Only narrowing f64 to f32 requires a finite, in-range source; identity and widening floating casts preserve NaN, infinities, and signed zero in constants and at runtime. NaN payload/sign is unspecified. Evidence: `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`, `constant_integer_to_float_matches_runtime`, `constant_float_identity_and_widening_match_runtime` (E); `numeric_conversions::constant_float_narrowing_still_rejects_non_finite_and_out_of_range_values` (R). |
 | ID-PTR: address representation | The integral default-address-space profile uses LLVM data pointers and integer casts, with zero as null; pointer offsets use element-scaled address computation. No hidden runtime provenance table is maintained. Non-default address spaces and capability/non-integral pointer interfaces are outside this profile; LLVM emission alone does not establish their conformance. Evidence: `spec::pointer_integer_round_trip_offsets_and_byte_access` (E), `unsafe_pointer_conversions_and_unsupported_abi_are_rejected` (R). |
 | ID-C: target C argument/result passing | Uses LLVM C calling convention. On x86 SysV, i8/i16 use sign extension and u8/u16/bool use zero extension on declarations and calls; Windows uses its target convention without those SysV attributes. Other scalar and pointer passing follows the selected target. Duplicate extern declarations are compared by lowered LLVM function type, which does not distinguish signed/unsigned integers of the same width; the author must keep those contracts consistent. Evidence: `spec::c_scalar_results_and_struct_pointer_layout_interoperate` (E), `incompatible_lowered_foreign_declarations_fail_before_linking` (R), `regressions::foreign_narrow_integer_arguments_follow_the_c_abi` (E), `compiler::repeated_foreign_declarations_across_packages_share_a_c_symbol` (E). |
-| ID-NATIVE: Dodo ABI and symbols | Parameters/results use the scalar/aggregate LLVM types in sections 4.8 and 16.2 with LLVM's default calling convention and no C aggregate classification. Internal parameters/results larger than 1,024 target ABI bytes pass indirectly through caller-owned storage; exported and C signatures retain direct lowering. Symbols are `dodo.<root-package>.<qualified-name>`. Root declarations have no package prefix in qualified-name; imported packages use their name when unique and generated `__dodo_package_...` prefixes when necessary. Root-package public non-generic functions and methods, root main, and all C ABI definitions have external linkage; imported Dodo functions and generic instances have internal linkage. Unreachable internal functions are eliminated at every optimization level, following lowered references including implicit drops and callback addresses. ELF and COFF functions use separate code sections for linker garbage collection. Mangling of generic instances and collision prefixes is compiler-internal and may depend on the loaded graph. Link native objects only with a matching compiler/target configuration. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `compiler::generic_struct_methods_keep_borrowed_returns` (E). |
+| ID-NATIVE: Dodo ABI and symbols | Parameters/results use the scalar/aggregate LLVM types in sections 4.8 and 16.2 with LLVM's default calling convention and no C aggregate classification. Internal parameters/results larger than 1,024 target ABI bytes pass indirectly through caller-owned storage; exported and C signatures retain direct lowering. Symbols are `dodo.<root-package>.<qualified-name>`. Root declarations have no package prefix in qualified-name; imported packages use their name when unique and generated `__dodo_package_...` prefixes when necessary. Root-package public non-generic functions and methods, root main, and all C ABI definitions have external linkage; imported Dodo functions and generic instances have internal linkage. Unreachable internal functions are eliminated at every optimization level, following lowered references including implicit drops and callback addresses. ELF and COFF functions use separate code sections for linker garbage collection. Function pointers address code taking the parameters (results and parameters larger than 1,024 bytes through memory, result storage first); closure code takes the environment pointer after any result storage. A closure environment is an array of captured binding addresses in the creating function's frame; named functions whose own convention differs get internal adapter functions. Mangling of generic instances and collision prefixes is compiler-internal and may depend on the loaded graph. Link native objects only with a matching compiler/target configuration. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `compiler::generic_struct_methods_keep_borrowed_returns` (E). |
 | ID-FS: filesystem identity | Uses the host filesystem's path canonicalization and case sensitivity; directory entries are sorted using canonical host paths. Symlink entries are excluded from directory source enumeration, but an explicit input/import path may resolve through a symlink. No registry, network resolver, or lockfile participates. Evidence: `spec::canonical_package_identity_and_symlink_enumeration` (E, Unix), `package::root_directory_collects_only_immediate_dodo_files` (A), `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected` (R). |
 | ID-LIB: bundled platform selection | Imports are embedded in the compiler. `std/{platform,fs,process,env,thread,sync,net,tls,web}/native` selects the shared `posix` adapter for x86_64 and aarch64 Linux GNU and for macOS, and `windows` for x86_64 Windows GNU/MSVC. An explicit mismatching adapter or unsupported target is rejected. Portable packages need no hosted adapter. Evidence: `tests/platform_library.rs` and `packages::portable_package_dependencies_are_independent_and_reserved` (A/R). |
 | ID-RUNTIME: startup and linking | Hosted builds use a native C linker driver. Importing std/env initializes its argument runtime from the C main arguments before source main; other library facilities initialize through explicit calls. Raw object/IR emission supplies no startup. Freestanding startup, linker scripts, system libraries, and OS exit-status encoding are supplied by the target/toolchain. Evidence: `spec::hosted_entry_signatures_and_c_definitions` (A/R/E), `tests/env_library.rs` (E), `compiler::emits_llvm_ir_bitcode_assembly_and_object_files` (T). |

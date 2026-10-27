@@ -343,6 +343,48 @@ fn main() {
 }
 
 #[test]
+fn tuples_and_aliases_combine_with_function_values_and_closures() {
+    run(r#"
+import "std/collections"
+
+type Compare = fn(i32, i32) -> bool
+type Step<T> = &mut dyn fn(T)
+
+fn less(a: i32, b: i32) -> bool {
+    a < b
+}
+
+fn sum_pairs(values: &[(i32, i32)], step: Step<i32>) {
+    for &(a, b) in values {
+        step(a + b)
+    }
+}
+
+fn main() {
+    compare: Compare = less
+    assert(compare(1, 2))
+    both := (less, fn(a: i32, b: i32) -> bool { a > b })
+    greater := both.1
+    assert(greater(3, 2))
+    assert((both.0)(1, 2))
+
+    pairs := [(1i32, 2i32), (3, 4)]
+    total := 0i32
+    sum_pairs(&pairs, fn(x) { total += x })
+    assert_eq(total, 10)
+
+    keyed := [(3i32, 30u8), (1, 10), (2, 20)]
+    collections.sort_by(&mut keyed, fn(x, y) { x.0 - y.0 })
+    assert_eq(keyed[0].1, 10u8)
+
+    make := fn(n: i32) { (n, n * 2) }
+    made := make(4)
+    assert_eq(made.1, 8)
+}
+"#);
+}
+
+#[test]
 fn tuple_and_alias_mistakes_have_source_level_diagnostics() {
     rejects(
         "fn main() { x: (i32, bool) = (1, 2) }",

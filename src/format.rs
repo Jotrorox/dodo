@@ -435,6 +435,36 @@ impl<'a> Plan<'a> {
                 }
             }
             ExprKind::ValueBlock(body) => self.block(body),
+            ExprKind::Closure(closure) => {
+                // A closure written on one line with a single simple statement
+                // stays on one line, like `fn(a, b) { a < b }`.
+                let header_end = closure
+                    .params
+                    .last()
+                    .map_or(expression.span.start, |param| param.span.end)
+                    .max(closure.ret_span.end);
+                let single_line = !self.source[expression.span.start..expression.span.end]
+                    .contains(['\n', '/'])
+                    && closure.body.len() == 1
+                    && matches!(
+                        closure.body[0].kind,
+                        StmtKind::Expr(_) | StmtKind::Yield(_) | StmtKind::Return(_)
+                    );
+                if single_line
+                    && let Some(open) = self
+                        .between(header_end, expression.span.end)
+                        .find(|token| matches!(token.kind, TokenKind::Symbol("{")))
+                {
+                    self.literal_braces.insert(open.span.start);
+                }
+                self.block(&closure.body);
+            }
+            ExprKind::Invoke { callee, args } => {
+                self.expression(callee);
+                for arg in args {
+                    self.expression(arg);
+                }
+            }
             ExprKind::Int(..)
             | ExprKind::Float(..)
             | ExprKind::Bool(..)
@@ -932,6 +962,19 @@ fn main(){console.printf("{{{:08x}}} {}\n",42,true)!}
             include_str!("../examples/fibonacci.dodo"),
         ] {
             formatted(source);
+        }
+    }
+    #[test]
+    fn closures_keep_one_line_bodies_and_indent_blocks() {
+        let output = formatted(
+            "package p\nfn main(){\nsort(&mut v,fn(a,b){*a<*b})\neach(&v,fn(x:&i32){\ntotal+=*x})\nf:&dyn fn(i32)->i32=g\n}\n",
+        );
+        for text in [
+            "sort(&mut v, fn(a, b) { *a < *b })",
+            "each(&v, fn(x: &i32) {\n        total += *x\n    })",
+            "f: &dyn fn(i32) -> i32 = g",
+        ] {
+            assert!(output.contains(text), "missing {text:?}: {output}");
         }
     }
 }

@@ -124,9 +124,10 @@ fn main() {
 Such an unconstrained parameter accepts any type, and a type without `apply`
 is only reported inside `transform`'s specialized body. A private struct may
 expose public methods for this purpose without publishing its type name. Across
-package boundaries the called method must be public. Closures and general
-first-class function values are unavailable; use an object with fields to carry
-callback state.
+package boundaries the called method must be public. A method object can carry
+state that outlives the call; for a one-off callback, a
+[closure](types-and-functions.md#functions-are-values-and-closures-capture-locals)
+borrowing local variables is often shorter.
 
 ## Interfaces
 
