@@ -33,7 +33,8 @@ fn main() {
 ```
 
 Every source file starts with `package name`, apart from comments and separators.
-Top-level declarations are `fn`, `struct`, `enum`, `const`, and `static`; imports
+Top-level declarations are `fn`, `struct`, `enum`, `interface`, `type`, `const`,
+and `static`; imports
 make another package's public names available through a qualifier. There is no
 top-level executable statement or automatic `init` function. See
 [projects and imports](packages.md) for file discovery and visibility.
@@ -55,8 +56,9 @@ and a UTF-8 byte-order mark are unsupported. `///` is an ordinary line comment.
 Reserved keywords are:
 
 ```text
-package import pub fn struct enum const let return if else for in
-break continue match unsafe extern as from static void mut true false
+package import pub fn struct enum interface type dyn const let return if
+else for in break continue match unsafe extern as from static void mut
+true false
 ```
 
 `self`, `Self`, primitive type names, and constructor names have contextual
@@ -103,7 +105,8 @@ Integer literal magnitude must fit `u64`; `-` is a separate prefix operation.
 | `&[T]`, `&mut [T]` | Shared or exclusive slice. |
 | `&str` | Shared UTF-8 string view. |
 | `*const T`, `*mut T` | Nullable raw pointer. |
-| `Name`, `package.Name`, `Name<T, U>` | User-defined struct or enum type. |
+| `Name`, `package.Name`, `Name<T, U>` | User-defined struct or enum type, or a type alias. |
+| `(A, B, ...)` | A tuple of two or more elements; `(T)` only groups `T`. |
 | `Option<T>` | `some(T)` or `none`. |
 | `Result<T, E>`, `T!E` | `ok(T)` or `err(E)`. |
 | `MaybeUninit<T>` | Opaque storage for potentially uninitialized `T`. |
@@ -116,8 +119,20 @@ Use the full spelling to make nested type relationships clear. `&dyn I` and
 `&mut dyn I` refer to a value implementing interface `I`; see
 [interfaces](generics.md#dynamic-dispatch-with-dyn). A function pointer's `-> R`
 extends to the end of the type, so `fn() -> u8!E` returns `Result<u8, E>`.
-`&fn(..)` is an ordinary reference to a function pointer. Tuples and type
-aliases are not implemented.
+`&fn(..)` is an ordinary reference to a function pointer.
+
+`type Name<T> = Type` declares a transparent alias: every use is replaced by the
+aliased type before checking, so the alias and the type are interchangeable. An
+alias may be `pub`; its parameters cannot have bounds, aliases cannot form a
+cycle, and a public alias cannot expose a private type. An alias of a struct or
+enum is accepted in struct literals and patterns, variant paths, and static
+function calls. Tuple values are written `(a, b)` and their elements are read
+and assigned with `.0`, `.1`, ...; digits after `.` always form a tuple index,
+so `pair.0.1` is nested access. A tuple is a struct with public fields `0`,
+`1`, ...: it moves, owns its elements, and has no automatic equality. Tuple
+patterns `(p, q)` nest in every pattern position, and `for (a, b) in values`,
+`for &(a, b) in values`, and `for i, (a, b) in values` destructure elements.
+See [tuples and type aliases](types-and-functions.md#tuples-group-values-without-naming-them).
 
 ## Closure literals and calls
 
@@ -310,6 +325,9 @@ See [decisions and loops](control-flow.md) for examples of every form.
 and reversed ranges do not iterate. Loop bindings are fresh, and assigning them
 does not change the counter. Ranges have no general value or iterator protocol.
 Collection loops still bind shared `&T` elements or exclusive `&mut T` elements.
+A tuple pattern in place of the element name, `for (a, b) in values`, binds
+references to that element's fields; `for &(a, b) in values` copies each bound
+field and requires those fields to be copyable.
 `for &value in values` and `for index, &value in values` explicitly copy a shared
 element into a fresh `T` binding. `T` must satisfy the ordinary copyability rule;
 owned arrays, structs, enums, and mutable references/slices are rejected. Assigning

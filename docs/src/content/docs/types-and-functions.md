@@ -283,6 +283,109 @@ function is written `button.on_press(x)` when the struct has no method of that
 name. The [language specification](language-spec-0.1.md#67-function-values-and-closures)
 gives the complete rules.
 
+## Tuples group values without naming them
+
+A tuple holds a fixed number of values of possibly different types. Write the
+type as `(A, B)`, build a value with `(a, b)`, and read elements by position with
+`.0`, `.1`, and so on. Tuples are the natural way to return several values:
+
+```dodo test
+package main
+
+fn divmod(value: u32, divisor: u32) -> (u32, u32) {
+    (value / divisor, value % divisor)
+}
+
+fn main() {
+    let (quotient, remainder) = divmod(17, 5)
+    core.assert_eq(quotient, 3u32)
+    core.assert_eq(remainder, 2u32)
+
+    pair := divmod(9, 4)
+    core.assert_eq(pair.0 * 4 + pair.1, 9u32)
+    nested := (true, (1u8, 2u8))
+    core.assert_eq(nested.1.0 + nested.1.1, 3u8)
+}
+```
+
+A tuple has at least two elements; `()` is not a type, so use `void` for "no
+value", and `(T)` is just `T` in parentheses. Element types are inferred from the
+values unless context supplies them, so `pair: (u8, bool) = (1, true)` makes the
+`1` a `u8`. Elements are assignable places (`pair.0 += 1`), and a tuple pattern
+destructures in `let`, `match`, `if let`, and `for`:
+
+```dodo test
+package main
+
+fn main() {
+    scores := [(1u32, 10u32), (2, 20), (3, 30)]
+    total := 0u32
+    for &(id, score) in scores {
+        total += id * score
+    }
+    core.assert_eq(total, 140u32)
+    for (_, score) in &mut scores {
+        *score += 1
+    }
+    match &scores[0] {
+        (1, 11) => {}
+        (_, _) => core.assert(false),
+    }
+}
+```
+
+`for (id, score) in values` binds references to each element's fields, like
+destructuring any borrowed value; `for &(id, score) in values` copies each bound
+field instead, which requires copyable fields. A tuple behaves like a struct with
+public fields named `0`, `1`, ...: it moves rather than copies, it owns and
+destroys its elements, borrows of different elements do not conflict, and it has
+no automatic `==`. A function returning borrowed elements states their sources
+like any borrowed return: `fn split(text: &[u8]) -> (&[u8], &[u8]) from(text)`.
+Use a named struct when the meaning of each position is not obvious.
+
+## Type aliases name existing types
+
+`type Name = Type` introduces another name for a type. An alias is not a new
+type: it and the aliased type are interchangeable everywhere, so an alias adds
+readability without conversions. Aliases may take type parameters and may be
+public:
+
+```dodo test
+package main
+
+type Point = (i32, i32)
+type Grid<T> = [2][2]T
+pub type Outcome<T> = T!ParseError
+
+pub enum ParseError { Empty }
+
+fn origin() -> Point {
+    (0, 0)
+}
+
+fn parse(text: &str) -> Outcome<u32> {
+    if text.len == 0 {
+        return err(ParseError.Empty)
+    }
+    ok(text.len as u32)
+}
+
+fn main() {
+    point: Point = origin()
+    core.assert_eq(point.0 + point.1, 0i32)
+    grid: Grid<u8> = [[1, 2], [3, 4]]
+    core.assert_eq(grid[1][0], 3u8)
+    core.assert_eq(parse("abc")!, 3u32)
+}
+```
+
+An alias of a struct or enum also works where the type's name is written in
+code: struct literals and patterns (`Alias { x: 1 }`), enum variants
+(`Alias.Variant`), and static functions (`Alias.new()`). Aliases cannot form a
+cycle, their parameters cannot have interface bounds, and a public alias cannot
+expose a private type. Like other declarations, a private alias is visible only
+inside its package.
+
 ## Remaining type forms
 
 | Form | Purpose | Reference |
@@ -290,10 +393,11 @@ gives the complete rules.
 | `[N]T`, `&[T]`, `&mut [T]`, `&str` | Arrays and borrowed views. | [Values and arrays](language-basics.md#arrays-own-their-elements) |
 | `&T`, `&mut T` | Checked shared and exclusive references. | [Ownership](ownership.md) |
 | `Name<T>` | A struct or enum specialized for a type. | [Generics](generics.md) |
+| `(A, B)`, `type Name = T` | Tuples and type aliases. | [Tuples](#tuples-group-values-without-naming-them), [aliases](#type-aliases-name-existing-types) |
 | `*const T`, `*mut T` | Nullable raw pointers without checked lifetimes. | [Memory and foreign calls](memory-and-ffi.md) |
 | `MaybeUninit<T>` | Opaque storage that may not yet contain a valid `T`. | [Memory intrinsics](memory-and-ffi.md#implemented-core-calls) |
 | `fn(A) -> R`, `&dyn fn(A) -> R`, `&mut dyn fn(A) -> R` | Function pointers and closure references. | [Functions are values](#functions-are-values-and-closures-capture-locals) |
 
-There are no tuples, type aliases, or user-defined implicit conversions in this
-implementation. Use named struct fields, generic methods, closures, and
+There are no user-defined implicit conversions in this implementation. Use
+named struct fields, generic methods, closures, and
 [interfaces](generics.md#interfaces) to express reusable data and behavior.

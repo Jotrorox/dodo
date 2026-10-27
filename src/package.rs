@@ -911,6 +911,7 @@ fn append(target: &mut Program, mut source: Program) {
     target.functions.append(&mut source.functions);
     target.constants.append(&mut source.constants);
     target.interfaces.append(&mut source.interfaces);
+    target.aliases.append(&mut source.aliases);
 }
 
 // Only generated functions can mention a fresh implicit alias. Reuse the AST
@@ -955,6 +956,7 @@ fn namespace(
         .chain(program.enums.iter().map(|item| item.name.clone()))
         .chain(program.constants.iter().map(|item| item.name.clone()))
         .chain(program.interfaces.iter().map(|item| item.name.clone()))
+        .chain(program.aliases.iter().map(|item| item.name.clone()))
         .chain(
             program
                 .functions
@@ -1009,6 +1011,11 @@ fn namespace(
                 names.ty(&mut field.ty, &generics);
             }
         }
+    }
+    for item in &mut program.aliases {
+        item.name = names.name(&item.name, &BTreeSet::new());
+        let generics = item.generics.iter().cloned().collect();
+        names.ty(&mut item.ty, &generics);
     }
     for item in &mut program.constants {
         item.name = names.name(&item.name, &BTreeSet::new());
@@ -1446,6 +1453,9 @@ fn shift_program(program: &mut Program, offset: usize) {
                 shift(&mut field.span, offset);
             }
         }
+    }
+    for alias in &mut program.aliases {
+        shift(&mut alias.span, offset);
     }
     for constant in &mut program.constants {
         shift(&mut constant.span, offset);

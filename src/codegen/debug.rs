@@ -257,7 +257,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let llvm = self.storage_ty(ty)?;
         let size = self.data.get_abi_size(&llvm) * 8;
         let align = self.data.get_abi_alignment(&llvm) * 8;
-        let name = ty.to_string();
+        let name = crate::ast::source_names(&ty.to_string());
         match ty {
             Type::Void | Type::Bool | Type::Int { .. } | Type::Float(_) => {
                 let encoding = match ty {

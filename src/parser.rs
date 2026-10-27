@@ -217,6 +217,7 @@ impl Parser {
                 program.imports.len(),
                 program.import_aliases.len(),
                 program.interfaces.len(),
+                program.aliases.len(),
             );
             if let Err(error) = self.declaration(&mut program) {
                 if !self.recover {
@@ -232,6 +233,7 @@ impl Parser {
                 program.imports.truncate(lengths.4);
                 program.import_aliases.truncate(lengths.5);
                 program.interfaces.truncate(lengths.6);
+                program.aliases.truncate(lengths.7);
                 self.soft_newlines = soft;
                 self.self_type = self_type;
                 self.in_interface = false;
@@ -305,6 +307,24 @@ impl Parser {
                 .push(self.interface_decl(mods.public, start)?);
             return Ok(());
         }
+        if self.at("type") {
+            if mods.unsafe_
+                || mods.extern_
+                || mods.repr_c
+                || mods.unsafe_send
+                || mods.unsafe_sync
+                || mods.derive_json
+                || mods.json_deny_unknown
+                || mods.json_name.is_some()
+                || mods.printing.is_some()
+                || mods.test
+                || mods.ignore.is_some()
+            {
+                return Err(self.error("type aliases only support the `pub` modifier"));
+            }
+            program.aliases.push(self.type_alias(mods.public, start)?);
+            return Ok(());
+        }
         if (mods.derive_json || mods.json_deny_unknown) && !self.at("struct") {
             return Err(self.error("@derive(Json) and @json_deny_unknown apply only to structs"));
         }
@@ -339,7 +359,7 @@ impl Parser {
             program.constants.push(self.constant(mods.public, start)?);
         } else {
             return Err(self.error(
-                "expected `fn`, `struct`, `enum`, `interface`, `const`, or `static` declaration",
+                "expected `fn`, `struct`, `enum`, `interface`, `type`, `const`, or `static` declaration",
             ));
         }
         Ok(())
@@ -360,6 +380,7 @@ impl Parser {
                     || self.at("struct")
                     || self.at("enum")
                     || self.at("interface")
+                    || self.at("type")
                     || self.at("const")
                     || self.at("static")
                     || self.at("import"))
@@ -646,14 +667,18 @@ impl Parser {
         if self.eat(">") {
             return Ok(());
         }
-        // Keep the second `>` available for an enclosing generic argument list.
-        if self.at(">>") {
-            self.angle_splits.push((self.cursor, self.token().clone()));
-            self.tokens[self.cursor].kind = TokenKind::Symbol(">");
-            self.tokens[self.cursor].span.start += 1;
-            return Ok(());
-        }
-        Err(self.error("expected `>` after generic arguments"))
+        // Keep the rest of the token available: the second `>` for an enclosing
+        // generic argument list, or the `=` of `type Pair<T>=(T, T)`.
+        let rest = match &self.token().kind {
+            TokenKind::Symbol(">>") => ">",
+            TokenKind::Symbol(">=") => "=",
+            TokenKind::Symbol(">>=") => ">=",
+            _ => return Err(self.error("expected `>` after generic arguments")),
+        };
+        self.angle_splits.push((self.cursor, self.token().clone()));
+        self.tokens[self.cursor].kind = TokenKind::Symbol(rest);
+        self.tokens[self.cursor].span.start += 1;
+        Ok(())
     }
     fn restore_angles(&mut self, checkpoint: usize) {
         while self.angle_splits.len() > checkpoint {
@@ -754,6 +779,34 @@ impl Parser {
                 ),
                 _ => Type::ArrayExpr(Box::new(LengthExpr::from_expr(size)?), element),
             });
+        }
+        if self.eat("(") {
+            // `(T)` groups a type; two or more comma-separated types form a tuple.
+            self.newlines();
+            if self.at(")") {
+                return Err(
+                    self.error("tuples need at least two elements; use `void` for no value")
+                );
+            }
+            let mut elements = vec![self.ty()?];
+            let mut trailing = false;
+            self.newlines();
+            while self.eat(",") {
+                self.newlines();
+                trailing = true;
+                if self.at(")") {
+                    break;
+                }
+                elements.push(self.ty()?);
+                trailing = false;
+                self.newlines();
+            }
+            self.expect(")")?;
+            return match elements.len() {
+                1 if trailing => Err(self.error("tuples need at least two elements")),
+                1 => Ok(elements.remove(0)),
+                n => Ok(Type::Generic(tuple_name(n), elements)),
+            };
         }
         if self.eat("void") {
             return Ok(Type::Void);
@@ -865,6 +918,28 @@ impl Parser {
             ));
         }
         Ok(Type::Named(name))
+    }
+    fn type_alias(&mut self, public: bool, start: usize) -> ParseResult<TypeAlias> {
+        self.expect("type")?;
+        let name = self.identifier()?;
+        let (generics, bounds) = self.generic_params()?;
+        if let Some(bound) = bounds.first() {
+            return Err(Diagnostic::new(
+                bound.span,
+                "type alias parameters cannot have interface bounds",
+            ));
+        }
+        self.expect("=")?;
+        self.newlines();
+        let ty = self.ty()?;
+        self.end_statement()?;
+        Ok(TypeAlias {
+            name,
+            public,
+            generics,
+            ty,
+            span: self.since(start),
+        })
     }
     fn struct_decl(
         &mut self,
@@ -1570,30 +1645,44 @@ impl Parser {
                 body: self.block()?,
             });
         }
-        if self.at("&") || self.look(1, "in") || self.look(1, ",") {
+        if self.at("&") || self.look(1, "in") || self.look(1, ",") || self.loop_pattern_ahead() {
             let mut copy = self.eat("&");
             if copy && self.at("mut") {
                 return Err(self.error(
                     "`&mut` loop patterns are unsupported; use `for value in &mut values`",
                 ));
             }
-            let first = self.identifier()?;
-            let (index, name) = if self.eat(",") {
+            let pattern_start = self.span().start;
+            let mut element = if self.at("(") {
+                Err(self.pattern()?)
+            } else {
+                Ok(self.identifier()?)
+            };
+            let index = if self.eat(",") {
                 if copy {
                     return Err(self.error(
                         "loop indices are values; put `&` on the element: `for i, &value in values`",
                     ));
                 }
+                let Ok(index) = element else {
+                    return Err(self.error("a loop index must be a name"));
+                };
                 copy = self.eat("&");
                 if copy && self.at("mut") {
                     return Err(self.error(
                         "`&mut` loop patterns are unsupported; use `for i, value in &mut values`",
                     ));
                 }
-                (Some(first), self.identifier()?)
+                element = if self.at("(") {
+                    Err(self.pattern()?)
+                } else {
+                    Ok(self.identifier()?)
+                };
+                Some(index)
             } else {
-                (None, first)
+                None
             };
+            let pattern_span = self.since(pattern_start);
             self.expect("in")?;
             let mut iterable = self.expression(false)?;
             if self.eat("..") {
@@ -1605,7 +1694,57 @@ impl Parser {
                 );
             }
             self.newlines();
-            let body = self.block()?;
+            let mut body = self.block()?;
+            let name = match element {
+                Ok(name) => name,
+                Err(pattern) => {
+                    // `for (a, b) in pairs` destructures each element reference, so
+                    // the bindings borrow its fields. `for &(a, b) in pairs` copies
+                    // each bound field out of that borrow instead.
+                    let mut pattern = pattern;
+                    let mut prefix = Vec::new();
+                    if copy {
+                        for name in pattern.bindings() {
+                            prefix.push(Stmt {
+                                kind: StmtKind::Let {
+                                    name: name.clone(),
+                                    ty: Type::Unknown,
+                                    value: Some(Expr::new(
+                                        ExprKind::Unary(
+                                            UnaryOp::Deref,
+                                            Box::new(Expr::new(
+                                                ExprKind::Name(format!("${name}")),
+                                                pattern_span,
+                                            )),
+                                        ),
+                                        pattern_span,
+                                    )),
+                                    constant: false,
+                                    mutable: false,
+                                },
+                                span: pattern_span,
+                            });
+                        }
+                        pattern.rename_bindings(&|name| format!("${name}"));
+                        copy = false;
+                    }
+                    prefix.insert(
+                        0,
+                        Stmt {
+                            kind: StmtKind::LetPattern {
+                                pattern,
+                                ty: Type::Unknown,
+                                value: Expr::new(ExprKind::Name("$element".into()), pattern_span),
+                                else_block: None,
+                            },
+                            span: pattern_span,
+                        },
+                    );
+                    prefix.append(&mut body);
+                    body = prefix;
+                    "$element".into()
+                }
+            };
             return Ok(StmtKind::ForEach {
                 index,
                 name,
@@ -1671,6 +1810,19 @@ impl Parser {
                 body,
             })
         }
+    }
+    // `for (a, b) in`, `for &(a, b) in`, and `for i, (a, b) in` destructure
+    // elements; any other parenthesis starts a condition loop.
+    fn loop_pattern_ahead(&mut self) -> bool {
+        let saved = self.cursor;
+        let angles = self.angle_splits.len();
+        let diagnostics = self.diagnostics.len();
+        self.eat("&");
+        let found = self.at("(") && self.pattern().is_ok() && self.at("in");
+        self.cursor = saved;
+        self.restore_angles(angles);
+        self.diagnostics.truncate(diagnostics);
+        found
     }
     fn match_statement(&mut self, value_mode: bool) -> ParseResult<StmtKind> {
         let value = self.expression(false)?;
@@ -1799,8 +1951,34 @@ impl Parser {
             self.newlines();
             let pattern = self.pattern()?;
             self.newlines();
-            self.expect(")")?;
-            return Ok(pattern);
+            if !self.eat(",") {
+                self.expect(")")?;
+                return Ok(pattern);
+            }
+            let mut elements = vec![pattern];
+            self.newlines();
+            while !self.eat(")") {
+                elements.push(self.pattern()?);
+                self.newlines();
+                if self.eat(",") {
+                    self.newlines();
+                } else {
+                    self.expect(")")?;
+                    break;
+                }
+            }
+            if elements.len() < 2 {
+                return Err(self.error("tuple patterns need at least two elements"));
+            }
+            return Ok(Pattern::Struct(
+                tuple_name(elements.len()),
+                elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, pattern)| (index.to_string(), pattern))
+                    .collect(),
+                false,
+            ));
         }
         if self.eat("_") {
             return Ok(Pattern::Wildcard);
@@ -1979,7 +2157,12 @@ impl Parser {
                     continue;
                 }
                 if self.eat(".") {
-                    let field = self.identifier()?;
+                    let field = if let TokenKind::Int(index, None) = self.token().kind {
+                        self.bump();
+                        index.to_string()
+                    } else {
+                        self.identifier()?
+                    };
                     lhs = Expr::new(ExprKind::Field(Box::new(lhs), field), self.since(start));
                     continue;
                 }
@@ -2206,8 +2389,41 @@ impl Parser {
             }
             TokenKind::Symbol("(") => {
                 self.soft_newlines += 1;
+                self.newlines();
+                if self.at(")") {
+                    return Err(
+                        self.error("tuples need at least two elements; use `void` for no value")
+                    );
+                }
                 let mut value = self.expression(true)?;
                 self.newlines();
+                if self.eat(",") {
+                    let mut elements = vec![value];
+                    self.newlines();
+                    while !self.at(")") {
+                        elements.push(self.expression(true)?);
+                        self.newlines();
+                        if !self.eat(",") {
+                            break;
+                        }
+                        self.newlines();
+                    }
+                    self.expect(")")?;
+                    self.soft_newlines -= 1;
+                    if elements.len() < 2 {
+                        return Err(Diagnostic::new(
+                            self.since(start),
+                            "tuples need at least two elements",
+                        ));
+                    }
+                    let name = tuple_name(elements.len());
+                    let fields = elements
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| (index.to_string(), value))
+                        .collect();
+                    return Ok(Expr::new(ExprKind::Struct(name, fields), self.since(start)));
+                }
                 if self.eat(":") {
                     self.newlines();
                     let annotation = self.ty()?;
@@ -2410,6 +2626,7 @@ pub(crate) fn reserved(name: &str) -> bool {
             | "struct"
             | "enum"
             | "interface"
+            | "type"
             | "dyn"
             | "const"
             | "let"
@@ -2562,6 +2779,69 @@ mod tests {
         let program = parse("package sample\nstruct Box<T> { T value\n fn get(self: &Self) -> &T { return &self.value }\n}\nfn id<T>(value: T) -> T { return value }\nfn demo(x: Option<Result<u8, bool>>) -> void {\n y := id<u8>(1)\n z := id::<Option<u8>>(none)\n}\n").unwrap();
         assert_eq!(program.functions[0].generics, ["T"]);
         assert!(matches!(program.functions[2].params[0].ty, Type::Option(_)));
+    }
+    #[test]
+    fn tuples_and_type_aliases() {
+        let program = parse(
+            "package p\npub type Pair<T>=(T, T)\ntype Id = u32\nfn f(p: (u8, (bool, &str))) -> Pair<u8> {\nlet (a, (b, _)) = p\nfor &(x, y) in pairs { }\nfor (i < 3) { }\nreturn (p.0, p.1.0 as u8)\n}\n",
+        )
+        .unwrap();
+        assert_eq!(program.aliases.len(), 2);
+        assert!(program.aliases[0].public);
+        assert_eq!(program.aliases[0].generics, ["T"]);
+        assert_eq!(program.aliases[0].ty.to_string(), "(T, T)");
+        assert_eq!(
+            program.functions[0].params[0].ty.to_string(),
+            "(u8, (bool, &str))"
+        );
+        let body = program.functions[0].body.as_ref().unwrap();
+        assert!(matches!(
+            &body[0].kind,
+            StmtKind::LetPattern { pattern: Pattern::Struct(name, fields, false), .. }
+                if *name == tuple_name(2) && fields[1].0 == "1"
+        ));
+        // `&(x, y)` copies each bound element out of the element reference.
+        let StmtKind::ForEach {
+            name,
+            copy: false,
+            body: loop_body,
+            ..
+        } = &body[1].kind
+        else {
+            panic!("expected a destructuring loop");
+        };
+        assert_eq!(name, "$element");
+        assert_eq!(loop_body.len(), 3);
+        assert!(matches!(
+            &body[2].kind,
+            StmtKind::For {
+                condition: Some(_),
+                ..
+            }
+        ));
+        let StmtKind::Return(Some(Expr {
+            kind: ExprKind::Struct(name, fields),
+            ..
+        })) = &body[3].kind
+        else {
+            panic!("expected a tuple literal");
+        };
+        assert_eq!(*name, tuple_name(2));
+        assert!(matches!(&fields[1].1.kind, ExprKind::Cast(inner, _)
+            if matches!(&inner.kind, ExprKind::Field(base, index)
+                if index == "0" && matches!(&base.kind, ExprKind::Field(_, one) if one == "1"))));
+        for source in [
+            "package p\ntype = u8",
+            "package p\nunsafe type A = u8",
+            "package p\ntype A<T: I> = T",
+            "package p\nfn f() { x := () }",
+            "package p\nfn f() { x := (1,) }",
+            "package p\nfn f(x: ()) {}",
+            "package p\nfn f() { let (a,) = b }",
+            "package p\nfn f() { let type = 1 }",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
     }
     #[test]
     fn result_binds_outside_borrow_types() {

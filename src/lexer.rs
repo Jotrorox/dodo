@@ -74,6 +74,13 @@ impl Lexer<'_> {
                     continue;
                 }
                 _ => {
+                    let field_index = matches!(
+                        tokens.last(),
+                        Some(Token {
+                            kind: TokenKind::Symbol("."),
+                            ..
+                        })
+                    );
                     let result = (|| {
                         Ok(match ch {
                             b'"' => TokenKind::String(self.string(false, b'"')?, false),
@@ -106,6 +113,17 @@ impl Lexer<'_> {
                                     self.cursor += 1;
                                 }
                                 TokenKind::Ident(self.source[start..self.cursor].to_owned())
+                            }
+                            // `pair.0.1` names tuple elements, never a float.
+                            b'0'..=b'9' if field_index => {
+                                while self.current().is_some_and(|c| c.is_ascii_digit()) {
+                                    self.cursor += 1;
+                                }
+                                let value =
+                                    self.source[start..self.cursor].parse().map_err(|_| {
+                                        self.error(start, "tuple index is outside the u64 range")
+                                    })?;
+                                TokenKind::Int(value, None)
                             }
                             b'0'..=b'9' => self.number()?,
                             _ => {
@@ -406,6 +424,25 @@ mod tests {
         ));
         assert!(matches!(tokens[5].kind, TokenKind::Float(2000.0, None)));
         assert_eq!(tokens[6].kind, TokenKind::Symbol("<<="));
+    }
+    #[test]
+    fn digits_after_a_dot_are_tuple_indices() {
+        let tokens = lex("pair.0.1 x.10 1.5").unwrap();
+        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
+        assert_eq!(
+            kinds[..9],
+            [
+                TokenKind::Ident("pair".into()),
+                TokenKind::Symbol("."),
+                TokenKind::Int(0, None),
+                TokenKind::Symbol("."),
+                TokenKind::Int(1, None),
+                TokenKind::Ident("x".into()),
+                TokenKind::Symbol("."),
+                TokenKind::Int(10, None),
+                TokenKind::Float(1.5, None),
+            ]
+        );
     }
     #[test]
     fn utf8_and_byte_escapes() {

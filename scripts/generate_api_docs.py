@@ -140,7 +140,7 @@ def declaration_head(items: list[Token], start: int) -> tuple[str, str] | None:
                                  or items[index].kind == "literal"):
         index += 1
     if index + 1 < len(items) and items[index].value in ("fn", "struct", "enum", "interface",
-                                                        "const", "static"):
+                                                        "type", "const", "static"):
         if items[index + 1].kind != "word":
             raise ValueError(f"Missing declaration name at offset {items[index].end}")
         return items[index].value, items[index + 1].value
@@ -381,7 +381,8 @@ def render_module(module: str, sources: list[Path], order: int,
         for declaration in declarations:
             qualified = f"{declaration.owner}.{declaration.name}" if declaration.owner else declaration.name
             heading = "###" if declaration.owner else "##"
-            label = {"fn": "Function", "const": "Constant", "static": "Static value"}.get(
+            label = {"fn": "Function", "type": "Type alias", "const": "Constant",
+                     "static": "Static value"}.get(
                 declaration.kind, declaration.kind.capitalize())
             lines += [f"{heading} `{qualified}`", "",
                       f"{label} · [Source]({REPOSITORY}{path.relative_to(ROOT).as_posix()}#L{declaration.line})", ""]

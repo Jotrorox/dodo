@@ -238,6 +238,16 @@ impl std::fmt::Display for Type {
             Self::Ref(m, t) => write!(f, "&{}{t}", if *m { "mut " } else { "" }),
             Self::Raw(m, t) => write!(f, "*{} {t}", if *m { "mut" } else { "const" }),
             Self::Named(n) => write!(f, "{n}"),
+            Self::Generic(n, ts) if tuple_arity(n) == Some(ts.len()) => {
+                write!(f, "(")?;
+                for (i, t) in ts.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{t}")?;
+                }
+                write!(f, ")")
+            }
             Self::Generic(n, ts) => {
                 write!(f, "{n}<")?;
                 for (i, t) in ts.iter().enumerate() {
@@ -273,6 +283,70 @@ impl std::fmt::Display for Type {
     }
 }
 
+/// Tuples are anonymous generic structs: `(A, B)` is `Type::Generic("#2", [A, B])`
+/// and its elements are the public fields `0` and `1`. Source identifiers cannot
+/// start with `#`, so the name never collides with, or is qualified like, a
+/// declaration; generic specialization supplies the struct declaration.
+pub fn tuple_name(arity: usize) -> String {
+    format!("#{arity}")
+}
+/// The element count of a tuple's (possibly specialized) struct name.
+pub fn tuple_arity(name: &str) -> Option<usize> {
+    let digits = name.strip_prefix('#')?;
+    let digits = digits.split_once('$').map_or(digits, |(arity, _)| arity);
+    digits.parse().ok().filter(|arity| *arity >= 2)
+}
+
+/// Generic specialization encodes type arguments as hexadecimal after `$`.
+/// Present the source notation, including nested specialized types and tuples,
+/// wherever a user reads a type: diagnostics, hovers, and debug information.
+pub fn source_names(text: &str) -> String {
+    let Some(start) = text.find('$') else {
+        return text.to_owned();
+    };
+    let suffix = &text[start + 1..];
+    let end = suffix
+        .find(|ch: char| !ch.is_ascii_hexdigit() && ch != '_')
+        .unwrap_or(suffix.len());
+    let arguments: Option<Vec<_>> = suffix[..end]
+        .split('_')
+        .map(|argument| {
+            if argument.is_empty() || !argument.len().is_multiple_of(2) {
+                return None;
+            }
+            let bytes: Option<Vec<_>> = (0..argument.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&argument[i..i + 2], 16).ok())
+                .collect();
+            String::from_utf8(bytes?)
+                .ok()
+                .map(|argument| source_names(&argument))
+        })
+        .collect();
+    let prefix = &text[..start];
+    let digits = prefix.len() - prefix.bytes().rev().take_while(u8::is_ascii_digit).count();
+    let tuple = prefix[..digits]
+        .strip_suffix('#')
+        .filter(|_| digits < prefix.len());
+    match (arguments, tuple) {
+        (Some(arguments), Some(before))
+            if tuple_arity(&prefix[digits - 1..]) == Some(arguments.len()) =>
+        {
+            format!(
+                "{before}({}){}",
+                arguments.join(", "),
+                source_names(&suffix[end..])
+            )
+        }
+        (Some(arguments), _) => format!(
+            "{prefix}<{}>{}",
+            arguments.join(", "),
+            source_names(&suffix[end..])
+        ),
+        (None, _) => format!("{prefix}${}", source_names(suffix)),
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub package: String,
@@ -286,6 +360,17 @@ pub struct Program {
     pub functions: Vec<Function>,
     pub constants: Vec<Constant>,
     pub interfaces: Vec<Interface>,
+    pub aliases: Vec<TypeAlias>,
+}
+/// `type Name<T> = Type` introduces another name for a type. Aliases are
+/// transparent: semantic analysis replaces every use with the aliased type.
+#[derive(Clone, Debug)]
+pub struct TypeAlias {
+    pub name: String,
+    pub public: bool,
+    pub generics: Vec<String>,
+    pub ty: Type,
+    pub span: Span,
 }
 /// A generic parameter's required interfaces: `T: io.Reader + io.Writer`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -500,6 +585,19 @@ impl Pattern {
             Self::Struct(_, fields, _) => fields.iter().flat_map(|(_, p)| p.bindings()).collect(),
             Self::Or(alternatives) => alternatives.first().map_or_else(Vec::new, Self::bindings),
             Self::Wildcard | Self::Bool(_) | Self::Int(_) | Self::Range(..) => Vec::new(),
+        }
+    }
+    pub fn rename_bindings(&mut self, rename: &impl Fn(&str) -> String) {
+        match self {
+            Self::Binding(name) => *name = rename(name),
+            Self::Variant(_, fields) => fields.iter_mut().for_each(|p| p.rename_bindings(rename)),
+            Self::Struct(_, fields, _) => fields
+                .iter_mut()
+                .for_each(|(_, p)| p.rename_bindings(rename)),
+            Self::Or(alternatives) => alternatives
+                .iter_mut()
+                .for_each(|p| p.rename_bindings(rename)),
+            Self::Wildcard | Self::Bool(_) | Self::Int(_) | Self::Range(..) => {}
         }
     }
 }

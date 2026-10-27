@@ -236,11 +236,12 @@ fn main() {
 | `Command.Add(value)` | Match a user-defined enum variant and its payload. |
 | `Point { x, y: vertical }` | Bind struct fields, optionally renaming them. |
 | `Point { x, .. }` | Bind selected fields and ignore the remainder. |
+| `(first, _)` | Destructure a tuple by position. |
 | `pattern_a | pattern_b` | Match either alternative. |
 
 Range endpoints must be integer literals, fit the input type, and form a nonempty
-ordered range. Strings, floats, tuple patterns, and array/slice destructuring
-patterns are unavailable. Enum qualifiers can be omitted when the input type
+ordered range. Strings, floats, and array/slice destructuring patterns are
+unavailable. Enum qualifiers can be omitted when the input type
 identifies the variant, but qualified names are often clearer.
 
 Patterns nest recursively, as in `some(some(value))` or a struct field containing

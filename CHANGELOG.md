@@ -43,6 +43,24 @@
   called by name.
   Constants with private fields can be used outside their package, since
   their initializer is checked where it is declared.
+- Add tuples. `(A, B)` is a type, `(a, b)` builds a value, and `.0`, `.1`
+  read and assign elements, so a function can return several values without
+  declaring a struct: `fn divmod(a: u32, b: u32) -> (u32, u32)`. Tuple
+  patterns destructure in `let (q, r) = divmod(17, 5)`, `match`, `if let`, and
+  loops: `for (id, score) in scores` borrows each element's fields and
+  `for &(id, score) in scores` copies them. Tuples behave like structs with
+  public fields `0`, `1`, ...: they move, own and destroy their elements, and
+  borrows of different elements do not conflict.
+- Add type aliases. `type Point = (i32, i32)`, `pub type Outcome<T> = T!Error`,
+  and `type Grid<T> = [8][8]T` give existing types another name; an alias is
+  interchangeable with its type. An alias of a struct or enum also works in
+  struct literals and patterns, variant paths, and `Alias.new()` calls.
+  Private aliases stay in their package, and a public alias cannot expose a
+  private type.
+- Diagnostics name specialized generic types and tuples in source notation,
+  `Pair<i32, bool>` and `(i32, bool)`, instead of internal mangled names; so
+  do hovers and debugger type names.
+- `type` is now a reserved word.
 
 - Add interfaces. `interface Name { fn method(&self) -> T }` declares method
   signatures that any type with matching methods implements; an interface

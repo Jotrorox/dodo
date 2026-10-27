@@ -60,8 +60,8 @@ An immutable `let` binding can still modify elements through its stored mutable
 slice; it cannot replace the slice binding itself.
 
 The combined pattern `let some(slice.SplitMut{left, right}) = ... else { ... }`
-also works. Fields may be renamed or discarded in the pattern. No tuple syntax,
-traits, or lifetime parameters are needed.
+also works. Fields may be renamed or discarded in the pattern. No traits or
+lifetime parameters are needed.
 
 ## Handle every boundary
 

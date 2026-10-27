@@ -141,6 +141,20 @@ impl<'a> Plan<'a> {
     }
 
     fn program(&mut self, program: &Program) {
+        // `type Pair<T>=(T, T)` lexes `>=` as one operator; separate it.
+        for alias in &program.aliases {
+            let split =
+                self.between(alias.span.start, alias.span.end)
+                    .find_map(|token| match token.kind {
+                        TokenKind::Symbol(">=") => Some((token.span, "> =")),
+                        TokenKind::Symbol(">>=") => Some((token.span, ">> =")),
+                        TokenKind::Symbol("=") => Some((token.span, "=")),
+                        _ => None,
+                    });
+            if let Some((span, replacement)) = split.filter(|(_, r)| *r != "=") {
+                self.replace(span, replacement);
+            }
+        }
         for structure in &program.structs {
             for field in &structure.fields {
                 self.declaration(&field.name, field.span, None);
@@ -690,7 +704,18 @@ fn needs_space(
     if text == "(" {
         return matches!(
             previous,
-            "if" | "for" | "match" | "return" | "in" | "=" | ":=" | "=>" | "," | ":"
+            "if" | "for"
+                | "match"
+                | "return"
+                | "in"
+                | "let"
+                | "="
+                | ":="
+                | "=>"
+                | "->"
+                | "|"
+                | ","
+                | ":"
         );
     }
     if text == "[" {
@@ -904,6 +929,15 @@ fn main(){console.printf("{{{:08x}}} {}\n",42,true)!}
         assert!(output.contains("from(owner.stored)"));
         assert!(output.contains("stores(owner, value)"));
         assert!(output.contains("] requires_plain(T)"));
+    }
+    #[test]
+    fn formats_tuples_and_type_aliases() {
+        assert_eq!(
+            formatted(
+                "package p\npub   type Pair<T>=(T,T)\nfn f(p:Pair<u8>)->(u8,u8){let(a,b)=p\nmatch p{(1,_)|(_,1)=>{} _=>{}}\nfor &(x,y) in [p]{}\nreturn (p.0,p.1)}\n"
+            ),
+            "package p\npub type Pair<T> = (T, T)\nfn f(p: Pair<u8>) -> (u8, u8) {\n    let (a, b) = p\n    match p {\n        (1, _) | (_, 1) => {}\n        _ => {}\n    }\n    for &(x, y) in [p] {}\n    return (p.0, p.1)\n}\n"
+        );
     }
     #[test]
     fn rejects_invalid_input() {

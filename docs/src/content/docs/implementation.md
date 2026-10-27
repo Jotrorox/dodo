@@ -53,7 +53,7 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 
 | Area | Implemented | Boundary to keep in mind |
 | --- | --- | --- |
-| Values | Integers, floats, bool, arrays, checked references/slices, strings, structs, enums, Options, Results, raw pointers, `dyn` interface references. | No tuples, type aliases, or owned `dyn` values or closures. |
+| Values | Integers, floats, bool, arrays, tuples, checked references/slices, strings, structs, enums, Options, Results, raw pointers, `dyn` interface references, type aliases. | No owned `dyn` values or closures, or automatic tuple equality. |
 | Functions | Declared signatures, final-expression returns, methods, associated functions, recursion, generics, function pointers, and closures that borrow what they capture. | No overloads, inheritance, default/named arguments, owning or heap-allocated closures, or specialization. |
 | Control flow | `if`, `match`, conditional patterns, four `for` forms, `break`, `continue`, `return`. | No `while`, `loop`, labels, general iterator protocol, or async/await. |
 | Ownership | Moves, shared/exclusive loans, source-based returns, deterministic destruction. | Conservative indexing, joins, loops, and aggregate lifetime tracking. |
