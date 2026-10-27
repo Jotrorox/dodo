@@ -46,6 +46,10 @@ test("declarations, borrowing, attributes, and generic calls", () => {
   hasScope("pub fn view(&self) -> &i32 from(self) {", "self", "variable.language.dodo");
   hasScope("pub fn view(&self) -> &i32 from(self) {", "from", "keyword.other.dodo");
   hasScope("@ignore(\"reason\")", "ignore", "storage.type.annotation.dodo");
+  hasScope("@interrupt(TIMER_IRQ_0)", "interrupt", "storage.type.annotation.dodo");
+  hasScope("@section(\".ramfunc\") @align(4)", "align", "storage.type.annotation.dodo");
+  hasScope("value := asm(\"mrs {0}, primask\", out(reg) u32)", "asm", "keyword.other.asm.dodo");
+  hasScope("value := asm(\"mrs {0}, primask\", out(reg) u32)", "u32", "support.type.primitive.dodo");
   hasScope("identity::<Option<i32>>(some(42))", "identity", "entity.name.function.dodo");
   hasScope("identity::<Option<i32>>(some(42))", "Option", "support.type.dodo");
   hasScope("assert_eq(main(), 0)", "assert_eq", "support.function.builtin.dodo");

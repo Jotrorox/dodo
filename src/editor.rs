@@ -464,6 +464,11 @@ impl HoverIndex<'_> {
                     self.expression(arg);
                 }
             }
+            ExprKind::Asm(asm) => {
+                for value in asm.inputs() {
+                    self.expression(value);
+                }
+            }
             ExprKind::Int(..)
             | ExprKind::Float(..)
             | ExprKind::Bool(..)

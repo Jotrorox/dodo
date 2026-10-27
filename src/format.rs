@@ -74,6 +74,8 @@ struct Plan<'a> {
     prefix: HashSet<usize>,
     literal_braces: HashSet<usize>,
     header_semicolons: HashSet<usize>,
+    /// Operand keywords of `asm(...)`: `in(reg)` keeps its parenthesis.
+    asm_operands: HashSet<usize>,
 }
 
 impl<'a> Plan<'a> {
@@ -87,6 +89,7 @@ impl<'a> Plan<'a> {
             prefix: HashSet::new(),
             literal_braces: HashSet::new(),
             header_semicolons: HashSet::new(),
+            asm_operands: HashSet::new(),
         }
     }
 
@@ -109,7 +112,24 @@ impl<'a> Plan<'a> {
 
     fn declaration(&mut self, name: &str, span: Span, value: Option<&Expr>) {
         let end = value.map_or(span.end, |value| value.span.start);
-        let tokens: Vec<_> = self.between(span.start, end).collect();
+        let mut tokens: Vec<_> = self.between(span.start, end).collect();
+        // Attributes such as `@section(".noinit")` precede the declaration.
+        while tokens
+            .first()
+            .is_some_and(|token| matches!(token.kind, TokenKind::Symbol("@")))
+        {
+            let mut skip = 2.min(tokens.len());
+            if tokens
+                .get(skip)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Symbol("(")))
+            {
+                skip = tokens[skip..]
+                    .iter()
+                    .position(|token| matches!(token.kind, TokenKind::Symbol(")")))
+                    .map_or(tokens.len(), |close| skip + close + 1);
+            }
+            tokens.drain(..skip);
+        }
         if tokens
             .first()
             .is_some_and(|token| matches!(&token.kind, TokenKind::Ident(word) if word == "let"))
@@ -465,6 +485,14 @@ impl<'a> Plan<'a> {
                     self.expression(arg);
                 }
             }
+            ExprKind::Asm(asm) => {
+                for operand in &asm.operands {
+                    self.asm_operands.insert(operand.span.start);
+                }
+                for value in asm.inputs() {
+                    self.expression(value);
+                }
+            }
             ExprKind::Int(..)
             | ExprKind::Float(..)
             | ExprKind::Bool(..)
@@ -699,6 +727,9 @@ fn needs_space(
         return false;
     }
     if matches!(text, "<" | ">" | ">>") || previous == "<" {
+        return false;
+    }
+    if text == "(" && plan.asm_operands.contains(&before.span.start) {
         return false;
     }
     if text == "(" {

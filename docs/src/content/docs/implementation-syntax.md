@@ -411,6 +411,9 @@ conflicting aliases. Prefer passing state explicitly or using
 | `@derive(Json)` | Struct: generate supported JSON methods; see [JSON](json.md). |
 | `@json_name("name")` | Field of a JSON-derived struct: select its external key. |
 | `@json_deny_unknown` | JSON-derived struct: reject unknown fields. |
+| `@interrupt(VECTOR)` | Private, safe, nongeneric top-level `fn name()`: the hardware's handler for `VECTOR`; see [interrupts](hardware.md#interrupts). |
+| `@section("name")` | Function or `static`: place it in an object file section, and keep it even if unreferenced. |
+| `@align(N)` | Function or `static`: align it to `N` bytes, a power of two. |
 
 `@compiler(print)`, `@compiler(println)`, and `@compiler(printf)` are reserved for
 bundled printing declarations; user packages cannot define them. Other unknown
@@ -420,5 +423,6 @@ attributes are errors. There is no general macro or attribute-extension system.
 type checking, borrow checking, or checked indexing. An `unsafe fn` requires
 callers to satisfy its documented preconditions, and its body still needs
 explicit unsafe blocks around unchecked operations. `extern "C" fn` declares or
-defines a C-ABI function. The complete rules and examples are in
+defines a C-ABI function. `asm("template", operands...)` is inline assembly
+and needs an unsafe block. The complete rules and examples are in
 [memory and foreign calls](memory-and-ffi.md).

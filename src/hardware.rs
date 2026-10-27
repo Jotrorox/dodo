@@ -43,6 +43,10 @@ pub struct Chip {
     pub linker_script: &'static str,
     /// The C symbol the runtime defines weakly as the panic hook.
     pub panic_hook: &'static str,
+    /// The vector table entries a program may handle with
+    /// `@interrupt(NAME)`: the core's exceptions, then the chip's interrupts
+    /// in IRQ number order. The runtime defines each weakly.
+    pub interrupts: &'static [&'static str],
     /// The default ELF linker.
     pub linker: &'static str,
     /// The standard library package `import "std/embedded/chip"` selects.
@@ -358,6 +362,44 @@ mod tests {
             .unwrap();
         assert_eq!(wireless.description(), "Raspberry Pi Pico 2 W");
         assert_eq!(wireless.linker_script(), script);
+    }
+
+    /// Each `@interrupt` name is a weak vector table entry of the runtime, and
+    /// the IRQs follow the table's order, which the chip packages' IRQ numbers use.
+    #[test]
+    fn interrupt_names_match_the_runtime_vector_tables() {
+        for chip in CHIPS {
+            let weak: Vec<&str> = chip
+                .runtime
+                .lines()
+                .filter_map(|line| line.strip_prefix("module asm \".weak "))
+                .flat_map(|names| names.trim_end_matches('"').split(", "))
+                .filter(|name| !name.starts_with("dodo_"))
+                .collect();
+            assert_eq!(weak, chip.interrupts, "{}", chip.name);
+            let table: Vec<&str> = chip
+                .runtime
+                .lines()
+                .filter_map(|line| line.strip_prefix("module asm \"    .word "))
+                .flat_map(|names| {
+                    names
+                        .split(';')
+                        .next()
+                        .unwrap()
+                        .trim_end()
+                        .trim_end_matches('"')
+                        .split(", ")
+                })
+                .filter(|name| name.contains("_IRQ") || name.starts_with("IRQ"))
+                .collect();
+            let irqs: Vec<&str> = chip
+                .interrupts
+                .iter()
+                .copied()
+                .filter(|name| !name.ends_with("_Handler"))
+                .collect();
+            assert_eq!(table, irqs, "{}", chip.name);
+        }
     }
 
     #[test]

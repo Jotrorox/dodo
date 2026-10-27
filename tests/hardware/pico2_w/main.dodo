@@ -2,7 +2,9 @@ package main
 
 import "core/ptr"
 import "std/embedded/board"
+import "core/mem"
 import "std/embedded/chip"
+import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
@@ -459,6 +461,101 @@ fn protocol_checks<P, T>(pins: &mut P, timer: &mut T) {
     check(flow_refused && taken)
 }
 
+// Interrupts: `@interrupt` handlers, std/embedded/cortex_m, a timer alarm,
+// and a function placed in SRAM.
+static mut ALARM: Option<chip.Alarm> = none
+static mut ALARM_HITS: u32 = 0
+static mut PENDED_HITS: u32 = 0
+
+@interrupt(TIMER0_IRQ_0)
+fn alarm_fired() {
+    unsafe {
+        ALARM_HITS += 1
+        match &mut ALARM {
+            some(alarm) => {
+                alarm.clear()
+            }
+            none => {}
+        }
+    }
+}
+
+// Nothing else raises TRNG_IRQ; the checks pend it from software.
+@interrupt(TRNG_IRQ)
+fn pended() {
+    unsafe {
+        PENDED_HITS += 1
+    }
+}
+
+fn alarm_hits() -> u32 {
+    return unsafe {
+        ALARM_HITS
+    }
+}
+
+fn pended_hits() -> u32 {
+    return unsafe {
+        PENDED_HITS
+    }
+}
+
+@section(".ramfunc")
+fn from_sram(value: u32) -> u32 {
+    return core.wrapping_mul(value, 3) + 1
+}
+
+fn interrupt_checks(timer: &mut chip.Timer) {
+    // A pended interrupt waits until it is enabled, then runs once; masked,
+    // it waits for the critical section to end.
+    cortex_m.pend(chip.TRNG_IRQ)
+    waiting := cortex_m.is_pending(chip.TRNG_IRQ) && pended_hits() == 0
+    cortex_m.enable(chip.TRNG_IRQ)
+    cortex_m.instruction_barrier()
+    check(waiting && pended_hits() == 1 && !cortex_m.is_pending(chip.TRNG_IRQ) && cortex_m.is_enabled(chip.TRNG_IRQ))
+    section := hal.Critical.enter()
+    cortex_m.pend(chip.TRNG_IRQ)
+    cortex_m.instruction_barrier()
+    held := cortex_m.interrupts_masked() && pended_hits() == 1
+    core.drop(section)
+    cortex_m.instruction_barrier()
+    check(held && pended_hits() == 2 && !cortex_m.interrupts_masked())
+    cortex_m.disable(chip.TRNG_IRQ)
+    cortex_m.set_priority(chip.TRNG_IRQ, 0x80)
+    check(!cortex_m.is_enabled(chip.TRNG_IRQ) && cortex_m.priority(chip.TRNG_IRQ) == 0x80 && cortex_m.active_exception() == 0)
+    cortex_m.set_priority(chip.TRNG_IRQ, 0)
+
+    // Alarm 0, 2 ms ahead, raises its interrupt once.
+    alarm := timer.alarm(0)!
+    check(refused(timer.alarm(0), hal.Error.Busy) && refused(timer.alarm(chip.ALARM_COUNT), hal.Error.InvalidInput))
+    irq := alarm.irq()
+    alarm.listen()
+    start := timer.now_us()
+    alarm.schedule_in(2000)
+    armed := alarm.is_armed() && alarm.is_listening()
+    unsafe {
+        ALARM = some(alarm)
+    }
+    cortex_m.enable(irq)
+    for alarm_hits() == 0 && timer.now_us() - start < 10_000 {}
+    elapsed := timer.now_us() - start
+    timer.delay_us(3000)
+    cortex_m.disable(irq)
+    back := unsafe {
+        mem.replace(&mut ALARM, none)
+    }
+    match back {
+        some(alarm) => {
+            check(armed && alarm_hits() == 1 && !alarm.fired() && !alarm.is_armed() && elapsed >= 1900 && elapsed < 2600)
+            timer.release_alarm(alarm)
+        }
+        none => {
+            check(false)
+        }
+    }
+    check(from_sram(5) == 16)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -614,6 +711,7 @@ fn main() {
     bus_checks(&mut b.pins, &mut b.timer)
     uart_checks(&mut b.pins, &mut b.timer)
     protocol_checks(&mut b.pins, &mut b.timer)
+    interrupt_checks(&mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.

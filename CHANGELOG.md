@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Add `@interrupt(VECTOR)` handlers. `@interrupt(UART0_IRQ) fn received()`
+  is exported under the vector's name with the target's interrupt-entry
+  convention (the C ABI on Cortex-M, `mret` on bare-metal RISC-V), so it
+  replaces the runtime's default in the vector table. With a board or chip
+  selected, the compiler checks the name against the chip's vector table and
+  suggests the closest one, so `TIMER_IRQ0` is an error instead of a handler
+  that never runs. Code cannot call a handler or take it as a function value,
+  a vector has one handler, and no C function may take its symbol.
+- Add `@section("name")` and `@align(N)` for functions and statics. A
+  placed definition is kept even when nothing refers to it. The RP2040 and
+  RP2350 linker scripts copy `.ramfunc` sections to SRAM at reset and keep
+  `.noinit` statics in SRAM without loading or zeroing them, so they survive
+  a reset.
+- Add inline assembly: `asm("template", ..., in(reg) value, out(reg) Type,
+  inout("r0") value, clobber("r4"), options(pure, nomem))` in unsafe code.
+  The template names operands `{0}`, `{1}`, ...; the expression returns
+  nothing, the output, or a tuple of outputs. Templates are a memory barrier
+  unless `options(nomem)`, and the assembler's errors are compile errors
+  instead of aborting the compiler.
+- Add `std/embedded/cortex_m`: the NVIC (`enable`, `disable`, `pend`,
+  `unpend`, `set_priority`, ...), SysTick, the vector table base, PendSV,
+  and `wfe`, `sev`, `dsb`, `dmb`, `isb`, PRIMASK, and IPSR. The RP2040 and
+  RP2350 chip packages name every IRQ number after its vector
+  (`rp2040.UART0_IRQ`), and their timers hand out `Alarm`s that schedule a
+  one-shot interrupt. PL011 serial ports gain `listen`, `ignore`,
+  `pending_interrupts`, and `clear_interrupts` for their receive, receive
+  timeout, transmit, and error interrupts. `examples/interrupts` is an
+  interrupt-driven serial echo for every board.
+- Borrowing one static no longer conflicts with reading another static or a
+  constant: `match &mut PORT { some(port) => port.clear_interrupts(pl011.ERROR_INTERRUPTS) ... }`
+  is accepted, and conflicts on the same static name it.
 - `?` converts errors into the enclosing function's error enum. When a
   function returning `T!AppError` propagates an `io.Error`, and `AppError`
   has exactly one variant whose only payload is an `io.Error`, such as

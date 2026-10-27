@@ -33,9 +33,12 @@ SECTIONS
     .ARM.extab : { *(.ARM.extab* .gnu.linkonce.armextab.*) } > FLASH
     .ARM.exidx : { *(.ARM.exidx* .gnu.linkonce.armexidx.*) } > FLASH
 
+    /* Initialized statics, and functions placed with @section(".ramfunc")
+       to run from SRAM, copied from flash at reset. */
     .data : ALIGN(4)
     {
         __data_start = .;
+        *(.ramfunc .ramfunc.*)
         *(.data .data.*)
         . = ALIGN(4);
         __data_end = .;
@@ -50,10 +53,19 @@ SECTIONS
         __bss_end = .;
     } > RAM
 
+    /* Statics placed with @section(".noinit"): neither loaded nor zeroed, so
+       they keep their contents across a reset that leaves SRAM powered. */
+    .noinit (NOLOAD) : ALIGN(4)
+    {
+        *(.noinit .noinit.*)
+        . = ALIGN(4);
+        __noinit_end = .;
+    } > RAM
+
     /* The full-descending stack starts at the top of the 264 KiB of SRAM,
        striped banks and both scratch banks, as in the Pico SDK. */
     __stack_top = ORIGIN(RAM) + LENGTH(RAM);
-    ASSERT(__bss_end <= __stack_top - 4K, "RP2040 RAM: less than 4 KiB left for the stack")
+    ASSERT(__noinit_end <= __stack_top - 4K, "RP2040 RAM: less than 4 KiB left for the stack")
 
     /DISCARD/ : { *(.note .note.*) }
 }

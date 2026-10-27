@@ -52,6 +52,11 @@ pub(super) fn names_expr(expression: &Expr, names: &mut HashMap<String, Span>) {
                 names_expr(arg, names);
             }
         }
+        ExprKind::Asm(asm) => {
+            for value in asm.inputs() {
+                names_expr(value, names);
+            }
+        }
         ExprKind::Slice {
             base, start, end, ..
         } => {
@@ -217,6 +222,11 @@ pub(super) fn binding_use_spans(function: &Function) -> HashMap<(usize, String),
                     self.expr(callee);
                     for arg in args {
                         self.expr(arg);
+                    }
+                }
+                ExprKind::Asm(asm) => {
+                    for value in asm.inputs() {
+                        self.expr(value);
                     }
                 }
                 ExprKind::Slice {

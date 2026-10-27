@@ -398,6 +398,7 @@ fn load_internal(
     }
     program.imports.sort();
     program.imports.dedup();
+    program.interrupt_vectors = platform.map(|platform| platform.chip.interrupts);
     Ok(Loaded {
         program,
         sources: loader.sources,
@@ -1261,6 +1262,14 @@ impl Names<'_> {
                     self.expr(argument, locals, generics);
                 }
             }
+            ExprKind::Asm(asm) => {
+                for (ty, _) in asm.output_types_mut() {
+                    self.scoped_ty(ty, locals, generics);
+                }
+                for value in asm.inputs_mut() {
+                    self.expr(value, locals, generics);
+                }
+            }
             _ => {}
         }
     }
@@ -1522,6 +1531,15 @@ fn shift_expr(expression: &mut Expr, offset: usize) {
             shift_expr(callee, offset);
             for argument in args {
                 shift_expr(argument, offset);
+            }
+        }
+        ExprKind::Asm(asm) => {
+            shift(&mut asm.span, offset);
+            for operand in &mut asm.operands {
+                shift(&mut operand.span, offset);
+            }
+            for value in asm.inputs_mut() {
+                shift_expr(value, offset);
             }
         }
         _ => {}

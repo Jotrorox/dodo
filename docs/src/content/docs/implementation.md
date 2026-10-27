@@ -60,7 +60,7 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 | Errors | Mandatory Result handling, explicit matching, `?` with wrapping into an error enum's variant, panic-on-error `!`. | No exceptions, user-defined error conversion, or panic unwinding. |
 | Generic behavior | Concrete specialization, structural interfaces with bounds checked at each use, and `dyn` references with method tables. | No generic interfaces, associated types, owned `dyn` values, or separately compiled generic code. |
 | Packages | Single-file and directory imports, aliases, public/private declarations, embedded library. | Optional build manifest; local dependencies only, with no package manager, registry, or re-exports. |
-| Foreign and hardware code | C primitive/pointer calls, raw storage, volatile MMIO, typed registers, interrupt masking, layout queries. | No C aggregate-by-value calls, C variadics, user inline assembly, or interrupt attributes. |
+| Foreign and hardware code | C primitive/pointer calls, raw storage, volatile MMIO, typed registers, interrupt masking, layout queries, inline assembly, `@interrupt` handlers, `@section` and `@align` placement. | No C aggregate-by-value calls, C variadics, global or naked assembly, or export attributes. |
 | Hosted library | Files, processes, environment, threads, atomics, synchronization, networking, TLS, HTTP, web routing. | Availability and native dependencies vary by target; see [platform support](platform.md). |
 
 Named omission here means unavailable syntax or behavior, not a suggestion to
@@ -137,8 +137,8 @@ Checked [mutable slice splitting](slice-splitting.md) is supported through
 ### Features outside this release
 
 The broad design's trait-based checked allocator interfaces,
-DMA/interrupt-safe abstractions, general target barriers, inline
-assembly, and section/alignment/export/interrupt attributes are not implemented.
+DMA/interrupt-safe abstractions, global and naked assembly, and export
+attributes are not implemented.
 Unsupported syntax and unknown intrinsics produce diagnostics. Hosted runtime
 failures report their check and source location before aborting. Freestanding
 builds default to the target-dependent `llvm.trap`, which may lower to C `abort`.

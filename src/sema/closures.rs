@@ -298,6 +298,11 @@ impl Scan<'_> {
                     self.expr(arg);
                 }
             }
+            ExprKind::Asm(asm) => {
+                for value in asm.inputs_mut() {
+                    self.expr(value);
+                }
+            }
             ExprKind::Array(_, values) => {
                 for value in values {
                     self.expr(value);
@@ -363,6 +368,9 @@ impl Checker<'_> {
                 span,
                 format!("function `{name}` is private to its package"),
             ));
+        }
+        if let Some(vector) = &signature.interrupt {
+            return Err(super::interrupt_handler_use(name, vector, span));
         }
         if signature.unsafe_ || signature.extern_ {
             return Err(Diagnostic::new(
@@ -479,6 +487,8 @@ impl Checker<'_> {
             body: Some(std::mem::take(&mut closure.body)),
             span,
             environment: Some(captured.len()),
+            interrupt: None,
+            placement: Placement::default(),
         };
         let mut uses = HashMap::new();
         names_block(function.body.as_ref().unwrap(), &mut uses);
