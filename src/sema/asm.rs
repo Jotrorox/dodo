@@ -135,15 +135,14 @@ impl Checker<'_> {
             };
             let writes = !matches!(operand.kind, AsmOperandKind::In(_));
             let reads = !matches!(operand.kind, AsmOperandKind::Out(_));
-            if let Some(name) = &named {
-                if (writes && !written.insert(name.clone()))
-                    || (reads && !read.insert(name.clone()))
-                {
-                    return Err(Diagnostic::new(
-                        operand.span,
-                        format!("register \"{name}\" is used by two asm operands"),
-                    ));
-                }
+            if let Some(name) = &named
+                && ((writes && !written.insert(name.clone()))
+                    || (reads && !read.insert(name.clone())))
+            {
+                return Err(Diagnostic::new(
+                    operand.span,
+                    format!("register \"{name}\" is used by two asm operands"),
+                ));
             }
             match &mut operand.kind {
                 AsmOperandKind::In(value) | AsmOperandKind::InOut(value) => {
