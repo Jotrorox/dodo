@@ -360,6 +360,54 @@ pub struct Critical {
     }
 }
 
+// A slot for an interrupt handler registered at run time. The vector-table
+// entry point stays an `extern "C"` function with the interrupt's name and
+// calls `run`, so firmware can switch handlers without rebuilding:
+//
+//     static mut TIMER: hal.Handler = hal.NO_HANDLER
+//
+//     extern "C" fn TIMER_IRQ_0() {
+//         unsafe { TIMER.run() }
+//     }
+//
+//     section := hal.Critical.enter()
+//     unsafe { TIMER.set(on_tick) }
+//     core.drop(section)
+//
+// A handler is a plain function pointer, so it captures no locals and stays
+// valid for the whole program; it keeps state in `static mut` storage. Change
+// a shared slot inside a critical section, which also orders the store before
+// the next interrupt on this core.
+pub struct Handler {
+    function: Option<fn()>
+
+    pub fn set(&mut self, function: fn()) {
+        self.function = some(function)
+    }
+    pub fn clear(&mut self) {
+        self.function = none
+    }
+    pub fn is_set(&self) -> bool {
+        match &self.function {
+            some(_) => true,
+            none => false,
+        }
+    }
+    // Calls the registered handler; false when the slot is empty.
+    pub fn run(&self) -> bool {
+        match &self.function {
+            some(function) => {
+                function()
+                true
+            },
+            none => false,
+        }
+    }
+}
+
+// An empty handler slot, for initializing `static mut` storage.
+pub const NO_HANDLER: Handler = Handler { function: none }
+
 // Drive an output pin to `high`.
 pub fn write_pin<P: OutputPin>(pin: &mut P, high: bool) {
     if high {

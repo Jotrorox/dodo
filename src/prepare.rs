@@ -154,6 +154,12 @@ impl Resolver {
                     self.ty(arg, locals, ns, span)?;
                 }
             }
+            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+                for param in params {
+                    self.ty(param, locals, ns, span)?;
+                }
+                self.ty(ret, locals, ns, span)?;
+            }
             _ => (),
         }
         Ok(())
@@ -245,6 +251,22 @@ impl Resolver {
                 }
             }
             ExprKind::ValueBlock(body) => self.block(body, &mut locals.clone(), ns)?,
+            ExprKind::Closure(closure) => {
+                // Local constants of the enclosing body remain visible inside.
+                let mut inner = locals.clone();
+                for param in &mut closure.params {
+                    self.ty(&mut param.ty, locals, ns, param.span)?;
+                    inner.insert(param.name.clone(), None);
+                }
+                self.ty(&mut closure.ret, locals, ns, closure.ret_span)?;
+                self.block(&mut closure.body, &mut inner, ns)?;
+            }
+            ExprKind::Invoke { callee, args } => {
+                self.expr(callee, locals, ns, constant)?;
+                for v in args {
+                    self.expr(v, locals, ns, constant)?;
+                }
+            }
             ExprKind::Slice {
                 base, start, end, ..
             } => {

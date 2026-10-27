@@ -158,6 +158,60 @@ exits with zero. The half-open range `1..3` contains both values equal to 20.
 Binary search is meaningful only while the sequence remains sorted according
 to the same comparison policy.
 
+### Sort, search, and test with closures
+
+Every algorithm above also has a form that takes a closure instead of a policy
+value, so a comparison can use local variables. `compare(a, b)` returns a
+negative, zero, or positive `i32`; a predicate returns `bool`.
+
+```dodo test
+package closure_algorithms
+import "std/collections"
+
+struct Task {
+    priority: u32
+    minutes: u32
+}
+
+fn main() -> i32 {
+    tasks := [
+        Task { priority: 2, minutes: 30 },
+        Task { priority: 1, minutes: 10 },
+        Task { priority: 3, minutes: 45 },
+    ]
+    collections.stable_sort_by(&mut tasks, fn(a, b) {
+        a.priority as i32 - b.priority as i32
+    })
+    assert_eq(tasks[0].minutes, 10u32)
+    budget := 40u32
+    assert_eq(collections.count(&tasks, fn(task) { task.minutes <= budget }), 2usize)
+    total := collections.fold(&tasks, 0u32, fn(sum, task) { sum + task.minutes })
+    assert_eq(total, 85u32)
+    match collections.position(&tasks, fn(task) { task.minutes > budget }) {
+        some(index) => { assert_eq(index, 2usize) },
+        none => { return 1 },
+    }
+    return 0
+}
+```
+
+| Function | Closure | Result |
+| --- | --- | --- |
+| `sort_by`, `stable_sort_by` | `compare(&T, &T) -> i32` | Sorts in place; costs as `sort` and `stable_sort`. |
+| `is_sorted_by` | `compare(&T, &T) -> i32` | Whether the order holds. |
+| `binary_search_by` | `probe(&T) -> i32`, the element compared with the key | First equal index, or `none`. |
+| `position`, `any`, `all`, `count` | `test(&T) -> bool` | First match, existence, universality, or count. |
+| `partition_by` | `test(&T) -> bool` | Moves true values first; returns the boundary. |
+| `for_each`, `for_each_mut` | `visit(&T)`, `visit(&mut T)` | Calls `visit` on each element in order. |
+| `map` | `transform(&T) -> U` | Writes `output[i]`; returns how many were written. |
+| `fold` | `combine(A, &T) -> A` | Combines elements from first to last. |
+
+Each takes its closure as `&mut dyn fn(..)`, which accepts closures that read
+or change what they capture as well as plain function names.
+The closure runs once per visited element, in index order for the visiting
+forms. See [functions are values](types-and-functions.md#functions-are-values-and-closures-capture-locals)
+for how captures are borrowed.
+
 ### Policy methods and algorithm costs
 
 `find`, `equal`, and lexicographic `compare` take a policy value by checked shared
@@ -168,7 +222,8 @@ A comparison policy implements `compare(&self, a: &T, b: &T) -> i32`; only its
 sign matters. An equality policy implements `equal(&self, a: &T, b: &T) -> bool`.
 A partition predicate implements `test(&self, value: &T) -> bool`. These are
 ordinary generic methods resolved statically during compilation. There are no
-traits, closures, reflection, vtables, or const generics involved. Comparisons
+traits, closures, reflection, vtables, or const generics involved; the closure
+forms above call through a closure reference instead. Comparisons
 must define a consistent total order; equality must be an equivalence relation.
 
 `sort` is unstable in-place heapsort: O(n log n) worst-case time and O(1)

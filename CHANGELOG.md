@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Add function values and closures. `fn(A, B) -> R` is a function pointer
+  type: a named function, a method (`Point.length`), an imported function,
+  or a generic function specialized from the expected type can be stored in
+  locals, fields, arrays, Options, constants, and statics, and called like a
+  function. A closure literal, `fn(a, b) { a < b }`, takes omitted parameter
+  and result types from where it is passed and may use local variables of the
+  surrounding code. Closures capture by reference and are checked like
+  references to what they capture: a closure that only reads its captures is
+  a copyable `&dyn fn(..)`, one that changes them an exclusive
+  `&mut dyn fn(..)`, and a closure that captures nothing is a plain function
+  pointer. While a closure can still be called, its captured variables keep
+  the matching borrow, so it can never outlive them or alias a mutation.
+  Function pointers convert to closure references automatically. Calls work
+  on any callee expression, such as `(table[i])(x)` and `button.on_press(x)`.
+- `std/collections` gains closure forms of its algorithms: `sort_by`,
+  `stable_sort_by`, `is_sorted_by`, `binary_search_by`, `partition_by`,
+  `position`, `any`, `all`, `count`, `for_each`, `for_each_mut`, `map`, and
+  `fold`.
+- `std/embedded/hal.Handler` holds an interrupt handler chosen at run time:
+  a vector-table entry point calls `run`, and firmware swaps handlers with
+  `set` and `clear` inside a critical section. Statics start empty with
+  `hal.NO_HANDLER`.
+- Static and constant initializers accept `none`, function names, and closures
+  that capture nothing, and a constant or static holding a function value is
+  called by name.
+  Constants with private fields can be used outside their package, since
+  their initializer is checked where it is declared.
+
 - Add interfaces. `interface Name { fn method(&self) -> T }` declares method
   signatures that any type with matching methods implements; an interface
   can include others (`interface Sensor: Named`). Generic parameters take
