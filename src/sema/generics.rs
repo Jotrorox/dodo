@@ -1555,6 +1555,44 @@ fn specialized(name: &str, arguments: &[Type]) -> String {
     result
 }
 
+/// The source spelling of a type that may name specializations: `W$7538`
+/// becomes `W<u8>`, including specializations nested in arguments.
+pub(super) fn source_spelling(ty: &str) -> String {
+    let mut result = String::new();
+    let mut word = String::new();
+    for c in ty.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.') {
+            word.push(c);
+            continue;
+        }
+        match word.split_once('$') {
+            Some((base, arguments)) => {
+                let decoded: Option<Vec<_>> = arguments
+                    .split('_')
+                    .map(|hex| {
+                        let bytes = (0..hex.len())
+                            .step_by(2)
+                            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+                            .collect::<Option<Vec<_>>>()?;
+                        String::from_utf8(bytes).ok().map(|t| source_spelling(&t))
+                    })
+                    .collect();
+                match decoded {
+                    Some(arguments) => {
+                        result.push_str(&format!("{base}<{}>", arguments.join(", ")))
+                    }
+                    None => result.push_str(&word),
+                }
+            }
+            None => result.push_str(&word),
+        }
+        word.clear();
+        result.push(c);
+    }
+    result.pop();
+    result
+}
+
 // Intrinsic return shapes are needed before full checking so generic callers can
 // infer their parameters from an intrinsic expression.
 pub(super) fn intrinsic_result_type(name: &str, types: &[Type], args: &[Type]) -> Option<Type> {

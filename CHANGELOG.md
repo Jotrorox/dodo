@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `?` converts errors into the enclosing function's error enum. When a
+  function returning `T!AppError` propagates an `io.Error`, and `AppError`
+  has exactly one variant whose only payload is an `io.Error`, such as
+  `Io(io.Error)`, `?` returns the error wrapped in that variant. Code that
+  mixes stream and driver errors declares
+  `enum LogError { Sensor(hal.Error), Output(io.Error) }` and uses `?` on
+  both instead of matching every call. The conversion calls no function and
+  moves the error with its ownership and borrows; a missing or ambiguous
+  variant is reported with the candidates. `std/text_alloc`,
+  `std/text_shared`, and `std/fmt_alloc` use it internally. See
+  `examples/sensor_log.dodo`.
+- Fix `?` accepting a propagated error that borrows a local value or a
+  source outside the function's `from(...)` contract. The error path is now
+  checked like an explicit `return`.
+
 - Add interfaces. `interface Name { fn method(&self) -> T }` declares method
   signatures that any type with matching methods implements; an interface
   can include others (`interface Sensor: Named`). Generic parameters take

@@ -21,34 +21,15 @@ pub fn string<A, T>(buffer: bytes_alloc.Buffer<A>, value: &T) -> text_alloc.Stri
     buffer.clear()
     {
         writer := io_alloc.BufferWriter.new(&mut buffer)
-        match fmt.print(&mut writer, value) {
-            ok(_) => {},
-            err(reason) => {
-                return err(Error.Format(reason))
-            }
-        }
+        fmt.print(&mut writer, value)?
     }
-    match text_alloc.String.new(buffer) {
-        ok(result) => {
-            return ok(result)
-        },
-        err(reason) => {
-            return err(Error.Text(reason))
-        }
-    }
+    return ok(text_alloc.String.new(buffer)?)
 }
 
 // SAFETY: A must honor std/bytes_alloc.new's allocation contract. Prefer the
 // safe std/arena_bytes or std/pool_bytes constructors followed by string above.
 pub unsafe fn allocate<A, T>(allocator: &mut A, capacity: usize, limit: usize, value: &T) -> text_alloc.String<A>!Error from(allocator) {
     unsafe {
-        match bytes_alloc.new(allocator, capacity, limit) {
-            ok(buffer) => {
-                return string(buffer, value)
-            },
-            err(reason) => {
-                return err(Error.Allocation(reason))
-            }
-        }
+        return string(bytes_alloc.new(allocator, capacity, limit)?, value)
     }
 }

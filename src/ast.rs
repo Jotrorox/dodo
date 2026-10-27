@@ -287,6 +287,16 @@ pub struct Enum {
     pub variants: Vec<Variant>,
     pub span: Span,
 }
+impl Enum {
+    /// Variants whose only payload is a `source` value. `?` wraps a `source`
+    /// error in this enum when exactly one such variant exists.
+    pub fn wrapping_variants(&self, source: &Type) -> Vec<&Variant> {
+        self.variants
+            .iter()
+            .filter(|v| matches!(v.fields.as_slice(), [field] if field.ty == *source))
+            .collect()
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Variant {
     pub name: String,

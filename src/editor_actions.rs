@@ -57,6 +57,19 @@ pub(crate) fn quick_fixes(
                 });
             }
         }
+        if let Some((title, edit)) = error_variant(text, &tokens, start, diagnostic)
+            && seen.insert((title.clone(), edit.span.start))
+        {
+            fixes.push(QuickFix {
+                title,
+                diagnostic: diagnostic.clone(),
+                edits: vec![Edit {
+                    path: source.path.clone(),
+                    ..edit
+                }],
+                preferred: true,
+            });
+        }
         if let Some((namespace, member)) = missing_namespace(&tokens, start, index, diagnostic) {
             let (program, _) = parser::parse_recovering(text);
             let import_aliases: BTreeSet<_> = program
@@ -258,6 +271,157 @@ fn missing_namespace(
         return None;
     }
     Some((namespace.to_owned(), member.clone()))
+}
+
+/// Add a variant carrying the propagated error to an error enum declared in
+/// this source, so `?` can wrap the error. The edit's path is left empty.
+fn error_variant(
+    text: &str,
+    tokens: &[Token],
+    start: usize,
+    diagnostic: &Diagnostic,
+) -> Option<(String, Edit)> {
+    let DiagnosticKind::MissingErrorVariant(missing) = &diagnostic.kind else {
+        return None;
+    };
+    if missing.declaration.start < start || missing.declaration.end > start + text.len() {
+        return None;
+    }
+    let declaration = local_span(missing.declaration, start);
+    let inside: Vec<_> = tokens
+        .iter()
+        .filter(|token| token.span.start >= declaration.start && token.span.end <= declaration.end)
+        .collect();
+    let keyword = inside
+        .iter()
+        .position(|token| matches!(&token.kind, TokenKind::Ident(word) if word == "enum"))?;
+    let TokenKind::Ident(name) = &inside.get(keyword + 1)?.kind else {
+        return None;
+    };
+    let open = inside
+        .iter()
+        .find(|token| token.kind == TokenKind::Symbol("{"))?;
+    let (close, body) = inside.split_last()?;
+    if close.kind != TokenKind::Symbol("}") {
+        return None;
+    }
+    let last = body
+        .iter()
+        .rev()
+        .find(|token| token.kind != TokenKind::Newline)?;
+    // A type from another package must be spelled with a namespace this
+    // source imports; one from this package is spelled without one.
+    let (program, _) = parser::parse_recovering(text);
+    let source = match missing.source.rsplit_once('.') {
+        Some((namespace, member)) if namespace == program.package => member.to_owned(),
+        Some((namespace, _)) => {
+            let imported = program.imports.iter().any(|import| {
+                program
+                    .import_aliases
+                    .iter()
+                    .find(|(path, _)| path == import)
+                    .map_or_else(|| import.rsplit('/').next().unwrap(), |(_, alias)| alias)
+                    == namespace
+            });
+            if !imported || namespace.contains(|c: char| !c.is_alphanumeric() && c != '_') {
+                return None;
+            }
+            missing.source.clone()
+        }
+        None => missing.source.clone(),
+    };
+    let variant = format!(
+        "{}({source})",
+        error_variant_name(&missing.source, &missing.variants)?
+    );
+    let line_start = |offset: usize| text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let indentation = |offset: usize| {
+        let line = &text[line_start(offset)..];
+        line[..line.len() - line.trim_start_matches([' ', '\t']).len()].to_owned()
+    };
+    let (span, new_text) = if !text[last.span.end..close.span.start].contains('\n') {
+        // `enum E { A, B }`: stay on one line.
+        if last.kind == TokenKind::Symbol(",") {
+            (
+                Span {
+                    start: last.span.end,
+                    end: last.span.end,
+                },
+                format!(" {variant}"),
+            )
+        } else {
+            (
+                Span {
+                    start: last.span.end,
+                    end: last.span.end,
+                },
+                format!(", {variant}"),
+            )
+        }
+    } else {
+        // One variant per line: add a line after the last, past any comment,
+        // following its trailing-comma style.
+        let end = last.span.end
+            + text[last.span.end..close.span.start]
+                .find(['\r', '\n'])
+                .unwrap();
+        let indent = if line_start(last.span.start) <= open.span.start {
+            format!("{}    ", indentation(close.span.start))
+        } else {
+            indentation(last.span.start)
+        };
+        let comma = if last.kind == TokenKind::Symbol(",") {
+            ","
+        } else {
+            ""
+        };
+        let newline = if text[end..].starts_with("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        (
+            Span { start: end, end },
+            format!("{newline}{indent}{variant}{comma}"),
+        )
+    };
+    Some((
+        format!("Add variant `{variant}` to `{name}`"),
+        Edit {
+            path: PathBuf::new(),
+            span,
+            new_text,
+        },
+    ))
+}
+
+/// `io.Error` becomes `Io`, `ParseError` becomes `Parse`, and anything else
+/// without a usable name becomes `Wrapped`, unless that name is taken.
+fn error_variant_name(source: &str, existing: &[String]) -> Option<String> {
+    let segments: Vec<_> = source.split('.').collect();
+    let last = segments.last()?;
+    let stem = match last.strip_suffix("Error") {
+        Some("") if segments.len() > 1 => segments[segments.len() - 2],
+        Some("") | None => last,
+        Some(stem) => stem,
+    };
+    let name: String = stem
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().chain(characters).collect::<String>())
+                .unwrap_or_default()
+        })
+        .collect();
+    let usable = name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_alphanumeric());
+    [usable.then_some(name), Some("Wrapped".to_owned())]
+        .into_iter()
+        .flatten()
+        .find(|candidate| !existing.contains(candidate))
 }
 
 /// Insert after the package declaration and any contiguous imports. Token
@@ -584,6 +748,133 @@ mod tests {
             assert_eq!(fixed, apply(source, &original[0]));
             recheck(&path, fixed, &overlays);
         }
+    }
+
+    #[test]
+    fn adds_the_missing_error_variant_in_the_declaration_style() {
+        let prelude = "package app\npub enum ParseError { Bad }\n";
+        let user =
+            "fn digit() -> u8!ParseError { ok(1) }\nfn f() -> u8!AppError { ok(digit()?) }\n";
+        for (declaration, expected) in [
+            (
+                "enum AppError { Other }",
+                "enum AppError { Other, Parse(ParseError) }",
+            ),
+            (
+                "enum AppError { Other, }",
+                "enum AppError { Other, Parse(ParseError) }",
+            ),
+            (
+                "enum AppError {\n    Other,\n    Code(u32), // trailing\n}",
+                "enum AppError {\n    Other,\n    Code(u32), // trailing\n    Parse(ParseError),\n}",
+            ),
+            (
+                "pub enum AppError {\n  Other\n  Code(u32)\n}",
+                "pub enum AppError {\n  Other\n  Code(u32)\n  Parse(ParseError)\n}",
+            ),
+            (
+                "enum AppError { Other,\n}",
+                "enum AppError { Other,\n    Parse(ParseError),\n}",
+            ),
+            (
+                "enum AppError { Parse(u8) }",
+                "enum AppError { Parse(u8), Wrapped(ParseError) }",
+            ),
+        ] {
+            let source = format!("{prelude}{declaration}\n{user}");
+            let document = Document::new(source.clone());
+            let actions = fixes(&document, &BTreeMap::new());
+            assert_eq!(actions.len(), 1, "{source}\n{:#?}", document.diagnostics);
+            assert!(actions[0].preferred);
+            let fixed = apply(&source, &actions[0]);
+            assert_eq!(fixed, format!("{prelude}{expected}\n{user}"));
+            checked(&fixed);
+        }
+        let document = Document::new(format!("{prelude}enum AppError {{ Other }}\n{user}"));
+        assert_eq!(
+            fixes(&document, &BTreeMap::new())[0].title,
+            "Add variant `Parse(ParseError)` to `AppError`"
+        );
+    }
+
+    #[test]
+    fn error_variant_fix_uses_imported_namespaces_only() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "a.dodo",
+            "package app\nimport \"std/io\"\npub fn fails() -> u8!io.Error { err(io.failure(io.ErrorKind.Other, 0)) }\n",
+        );
+        let document = |source: &str| {
+            fixture.write("z.dodo", source);
+            let mut loaded = package::load(&fixture.0).unwrap();
+            let original = loaded.program.clone();
+            let diagnostics = sema::check_recovering(&mut loaded.program, 64);
+            let index = std::sync::Arc::new(symbols::Index::new(&loaded, &original));
+            let start = loaded
+                .sources
+                .iter()
+                .find(|source| source.path.ends_with("z.dodo"))
+                .unwrap()
+                .start;
+            Document::from_checked(source.into(), start, &loaded.program, diagnostics, index)
+        };
+        let source = "package app\nimport \"std/io\"\nenum AppError { Other }\nfn f() -> u8!AppError { ok(fails()?) }\n";
+        let checked_document = document(source);
+        assert!(checked_document.start > 0);
+        let actions = fixes(&checked_document, &BTreeMap::new());
+        assert_eq!(actions.len(), 1, "{:?}", checked_document.diagnostics);
+        assert_eq!(actions[0].title, "Add variant `Io(io.Error)` to `AppError`");
+        assert_eq!(actions[0].edits[0].path, fixture.path("z.dodo"));
+        let fixed = apply(source, &actions[0]);
+        assert!(fixed.contains("enum AppError { Other, Io(io.Error) }"));
+        fixture.write("z.dodo", &fixed);
+        let mut loaded = package::load(&fixture.0).unwrap();
+        sema::check(&mut loaded.program).unwrap();
+        // Without the import in this source, the type cannot be spelled.
+        let source =
+            "package app\nenum AppError { Other }\nfn f() -> u8!AppError { ok(fails()?) }\n";
+        let unimported = document(source);
+        assert!(!unimported.diagnostics.is_empty());
+        assert!(fixes(&unimported, &BTreeMap::new()).is_empty());
+        // No fix for an ambiguous enum, a non-enum error, or a generic template.
+        for source in [
+            "package app\nenum A { Bad }\nenum B { X(A), Y(A) }\nfn a() -> u8!A { ok(1) }\nfn f() -> u8!B { ok(a()?) }\n",
+            "package app\nenum A { Bad }\nfn a() -> u8!A { ok(1) }\nfn f() -> u8!u32 { ok(a()?) }\n",
+            "package app\nenum A { Bad }\nenum W<T> { Other(T) }\nfn a() -> u8!A { ok(1) }\nfn f() -> u8!W<u8> { ok(a()?) }\n",
+        ] {
+            let document = Document::new(source.into());
+            assert!(!document.diagnostics.is_empty(), "{source}");
+            assert!(fixes(&document, &BTreeMap::new()).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn error_variant_names_follow_the_error_type() {
+        for (source, expected) in [
+            ("io.Error", "Io"),
+            ("hal.Error", "Hal"),
+            ("ParseError", "Parse"),
+            ("text_alloc.Error", "TextAlloc"),
+            ("error.AllocError", "Alloc"),
+            ("Timeout", "Timeout"),
+            ("Error", "Error"),
+            ("u8", "U8"),
+            ("&str", "Wrapped"),
+        ] {
+            assert_eq!(
+                error_variant_name(source, &[]).as_deref(),
+                Some(expected),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            error_variant_name("io.Error", &["Io".into()]).as_deref(),
+            Some("Wrapped")
+        );
+        assert_eq!(
+            error_variant_name("io.Error", &["Io".into(), "Wrapped".into()]),
+            None
+        );
     }
 
     #[test]

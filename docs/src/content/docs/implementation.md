@@ -57,7 +57,7 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 | Functions | Declared signatures, final-expression returns, methods, associated functions, recursion, generics. | No overloads, inheritance, default/named arguments, closures, or specialization. |
 | Control flow | `if`, `match`, conditional patterns, four `for` forms, `break`, `continue`, `return`. | No `while`, `loop`, labels, general iterator protocol, or async/await. |
 | Ownership | Moves, shared/exclusive loans, source-based returns, deterministic destruction. | Conservative indexing, joins, loops, and aggregate lifetime tracking. |
-| Errors | Mandatory Result handling, explicit matching, `?`, panic-on-error `!`. | No exceptions, automatic error conversion, or panic unwinding. |
+| Errors | Mandatory Result handling, explicit matching, `?` with wrapping into an error enum's variant, panic-on-error `!`. | No exceptions, user-defined error conversion, or panic unwinding. |
 | Generic behavior | Concrete specialization, structural interfaces with bounds checked at each use, and `dyn` references with method tables. | No generic interfaces, associated types, owned `dyn` values, or separately compiled generic code. |
 | Packages | Single-file and directory imports, aliases, public/private declarations, embedded library. | Optional build manifest; local dependencies only, with no package manager, registry, or re-exports. |
 | Foreign and hardware code | C primitive/pointer calls, raw storage, volatile MMIO, typed registers, interrupt masking, layout queries. | No C aggregate-by-value calls, C variadics, user inline assembly, or interrupt attributes. |

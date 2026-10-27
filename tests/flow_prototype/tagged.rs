@@ -367,6 +367,42 @@ fn pattern_value_blocks_transfer_payloads_across_yield_cleanup() {
 }
 
 #[test]
+fn propagation_wraps_converted_errors_in_their_variant() {
+    let body = compare(
+        "struct S { u8 n }\nenum E { Other, Wrapped(S) }\nfn f(r: u8!S) -> u8!E { n := r?\nreturn ok(n) }",
+        None,
+        &[],
+    );
+    // The error payload moves into `E.Wrapped`, which is moved into the
+    // returned `err`; neither is dropped on the propagating path.
+    let wrapped = body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match &instruction.operation {
+            Operation::Tagged {
+                target, variant, ..
+            } if variant == "Wrapped" => Some(*target),
+            _ => None,
+        })
+        .expect("wrapping variant constructed");
+    assert_eq!(body.locals[wrapped.0].ty.to_string(), "E");
+    let result = body.initialization();
+    let payload = body.locals.iter().position(|l| l.name == "$error").unwrap();
+    assert!(
+        result
+            .cleanup
+            .iter()
+            .any(|s| s.place.0 == payload && s.kind == CleanupKind::Never)
+    );
+    compare(
+        "struct S { u8 n }\nenum E { Wrapped(u8) }\nfn get() -> S!u8 { return ok(S{n: 1}) }\nfn take(s: S) {}\nfn f() -> void!E { s := get()?\ntake(s)\ntake(s)\nreturn ok() }",
+        Some("moved"),
+        &["s"],
+    );
+}
+
+#[test]
 fn nested_results_and_owned_errors_transfer_only_the_selected_payload() {
     compare(
         "struct S { u8 n }\nfn f(r: Result<Result<S,u8>,u8>) -> S!u8 { s := r??\nreturn ok(s) }",
@@ -483,7 +519,11 @@ fn unsupported_payloads_patterns_and_guards_discard_the_whole_graph() {
         ),
         (
             "fn f(r: u8!u8) -> u8!u16 { return ok(r?) }",
-            "type mismatch",
+            "cannot convert",
+        ),
+        (
+            "enum E { A(u8), B(u8) }\nfn f(r: u8!u8) -> u8!E { return ok(r?) }",
+            "cannot convert",
         ),
         ("fn f(r: u8!u8) -> u8 { return r? }", "Result return type"),
         (

@@ -128,6 +128,11 @@ Use your editor's quick-fix action on a diagnostic. In VS Code, choose
   an explicit type annotation when present.
 - **Import `math`** for a missing package qualifier such as `math.answer()`:
   inserts the import when a matching package can be resolved.
+- **Add variant `Io(io.Error)` to `AppError`** when `?` propagates an error
+  that the enclosing function's error enum has no variant for: adds the variant
+  to the enum, so `?` [wraps the error](patterns-and-results.md#combine-error-types).
+  The fix is offered when the enum is declared in the same file and the error
+  type can be spelled there, and follows the enum's comma and line layout.
 
 Clients request `textDocument/codeAction`; these actions have the `quickfix`
 kind and carry workspace edits. Applying an action updates diagnostics through

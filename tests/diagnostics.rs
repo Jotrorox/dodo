@@ -164,6 +164,25 @@ fn unresolved_diagnostics_expose_kinds_codes_and_symbol_names() {
 }
 
 #[test]
+fn missing_error_variant_diagnostics_identify_the_enum_and_error() {
+    let source = "package app\nenum Parse { Bad }\nenum AppError { Other, Code(u32) }\nfn parse() -> u8!Parse { ok(1) }\nfn main() -> u8!AppError { ok(parse()?) }\n";
+    let mut program = parser::parse(source).unwrap();
+    let diagnostic = sema::check(&mut program).unwrap_err();
+    assert_eq!(diagnostic.kind.code(), Some("missing-error-variant"));
+    let DiagnosticKind::MissingErrorVariant(missing) = &diagnostic.kind else {
+        panic!("{diagnostic:?}");
+    };
+    let start = source.find("enum AppError").unwrap();
+    assert_eq!(
+        &source[missing.declaration.start..missing.declaration.end],
+        "enum AppError { Other, Code(u32) }"
+    );
+    assert_eq!(missing.declaration.start, start);
+    assert_eq!(missing.source, "Parse");
+    assert_eq!(missing.variants, ["Other", "Code"]);
+}
+
+#[test]
 fn immutable_diagnostics_identify_the_affected_binding_and_usage() {
     for (operation, code) in [
         ("count = 3", "immutable-assignment"),
