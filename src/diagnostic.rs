@@ -1,4 +1,4 @@
-use crate::ast::Span;
+use crate::ast::{Span, source_names};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -91,7 +91,7 @@ impl Diagnostic {
             severity: Severity::Error,
             kind: DiagnosticKind::Unclassified,
             span,
-            message: message.into().into_boxed_str(),
+            message: source_names(&message.into()).into_boxed_str(),
             notes: vec![],
             labels: vec![],
         }
@@ -107,14 +107,14 @@ impl Diagnostic {
         self
     }
     pub fn note(mut self, note: impl Into<String>) -> Self {
-        self.notes.push(note.into());
+        self.notes.push(source_names(&note.into()));
         self
     }
     /// Explain a related source location, underlined with dashes.
     pub fn label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.labels.push(DiagnosticLabel {
             span,
-            message: message.into(),
+            message: source_names(&message.into()),
             style: LabelStyle::Secondary,
         });
         self
@@ -125,7 +125,7 @@ impl Diagnostic {
             .retain(|label| label.style != LabelStyle::Primary);
         self.labels.push(DiagnosticLabel {
             span: self.span,
-            message: message.into(),
+            message: source_names(&message.into()),
             style: LabelStyle::Primary,
         });
         self

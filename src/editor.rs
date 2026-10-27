@@ -284,6 +284,19 @@ impl HoverIndex<'_> {
                 }
             }
         }
+        for alias in &self.program.aliases {
+            if let Some(span) = self.name_span(alias.span, short_name(&alias.name)) {
+                let generics = if alias.generics.is_empty() {
+                    String::new()
+                } else {
+                    format!("<{}>", alias.generics.join(", "))
+                };
+                self.add(
+                    span,
+                    code(&format!("type {}{generics} = {}", alias.name, alias.ty)),
+                );
+            }
+        }
         for structure in &self.program.structs {
             if let Some(span) = self.name_span(structure.span, short_name(&structure.name)) {
                 self.add(span, code(&format!("struct {}", structure.name)));
@@ -456,41 +469,7 @@ fn code(text: &str) -> String {
     format!("```dodo\n{}\n```", source_names(text))
 }
 
-// Semantic specialization encodes type arguments as hexadecimal after `$`.
-// Present the source notation in hovers, including nested specialized types.
-fn source_names(text: &str) -> String {
-    let Some(start) = text.find('$') else {
-        return text.to_owned();
-    };
-    let suffix = &text[start + 1..];
-    let end = suffix
-        .find(|ch: char| !ch.is_ascii_hexdigit() && ch != '_')
-        .unwrap_or(suffix.len());
-    let arguments: Option<Vec<_>> = suffix[..end]
-        .split('_')
-        .map(|argument| {
-            if argument.is_empty() || !argument.len().is_multiple_of(2) {
-                return None;
-            }
-            let bytes: Option<Vec<_>> = (0..argument.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&argument[i..i + 2], 16).ok())
-                .collect();
-            String::from_utf8(bytes?)
-                .ok()
-                .map(|argument| source_names(&argument))
-        })
-        .collect();
-    match arguments {
-        Some(arguments) => format!(
-            "{}<{}>{}",
-            &text[..start],
-            arguments.join(", "),
-            source_names(&suffix[end..])
-        ),
-        None => format!("{}${}", &text[..start], source_names(suffix)),
-    }
-}
+use crate::ast::source_names;
 
 fn short_name(name: &str) -> &str {
     name.rsplit('.')

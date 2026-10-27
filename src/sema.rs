@@ -7,6 +7,7 @@ use crate::ast::*;
 use crate::diagnostic::{Diagnostic, DiagnosticBinding, DiagnosticKind};
 use std::collections::{HashMap, HashSet};
 
+mod aliases;
 #[doc(hidden)]
 pub mod flow;
 mod generics;
@@ -77,6 +78,7 @@ fn check_program(
     mode: CheckMode,
     mut report: Option<&mut Option<flow::CoverageReport>>,
 ) -> Check<()> {
+    aliases::resolve(program)?;
     crate::prepare::prepare(program, pointer_bits)?;
     validate_public_interfaces(program)?;
     interfaces::validate_bounds(program)?;
@@ -5394,6 +5396,9 @@ fn validate_public_interfaces(program: &Program) -> Check<()> {
     }
     for constant in program.constants.iter().filter(|c| c.public) {
         visit(&constant.ty, constant.span, &[], &private)?;
+    }
+    for alias in program.aliases.iter().filter(|a| a.public) {
+        visit(&alias.ty, alias.span, &alias.generics, &private)?;
     }
     for function in program.functions.iter().filter(|f| f.public) {
         bounds(&function.bounds)?;

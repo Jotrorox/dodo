@@ -146,7 +146,8 @@ pub(super) fn instantiate(program: &mut Program) -> Check<Vec<Obligation>> {
     }
     for constant in &mut program.constants {
         expander.ty(&mut constant.ty, &substitutions, constant.span)?;
-        expander.expr(&mut constant.value, &substitutions)?;
+        let ty = constant.ty.clone();
+        expander.expression(&mut constant.value, &substitutions, Some(&ty))?;
     }
     program.structs.append(&mut expander.structs);
     program.enums.append(&mut expander.enums);
@@ -177,6 +178,39 @@ struct Expander {
     required: HashSet<(String, String, String)>,
 }
 impl Expander {
+    /// A generic struct declaration; every tuple arity has an implicit one with
+    /// public fields `0`, `1`, ... of types `T0`, `T1`, ...
+    fn struct_template(&mut self, name: &str) -> Option<Struct> {
+        if let Some(template) = self.struct_templates.get(name) {
+            return Some(template.clone());
+        }
+        let arity = tuple_arity(name).filter(|_| !name.contains('$'))?;
+        let generics: Vec<String> = (0..arity).map(|index| format!("T{index}")).collect();
+        let template = Struct {
+            name: name.to_owned(),
+            public: true,
+            generics: generics.clone(),
+            bounds: vec![],
+            implements: vec![],
+            fields: generics
+                .into_iter()
+                .enumerate()
+                .map(|(index, parameter)| Field {
+                    name: index.to_string(),
+                    ty: Type::Named(parameter),
+                    public: true,
+                    span: Span::default(),
+                })
+                .collect(),
+            span: Span::default(),
+            repr_c: false,
+            unsafe_send: false,
+            unsafe_sync: false,
+        };
+        self.struct_templates
+            .insert(name.to_owned(), template.clone());
+        Some(template)
+    }
     // Record each specialization's bounds once per type, interface, and owner.
     fn require_bounds(
         &mut self,
@@ -289,7 +323,7 @@ impl Expander {
                 );
                 if self.generated_types.insert(concrete.clone()) {
                     self.begin_specialization(span)?;
-                    if let Some(mut structure) = self.struct_templates.get(name).cloned() {
+                    if let Some(mut structure) = self.struct_template(name) {
                         let mapping = self.substitutions(&structure.generics, arguments, span)?;
                         self.require_bounds(
                             name,
@@ -899,9 +933,6 @@ impl Expander {
             _ => None,
         }
     }
-    fn expr(&mut self, e: &mut Expr, substitutions: &HashMap<String, Type>) -> Check<()> {
-        self.expression(e, substitutions, None).map(|_| ())
-    }
     fn expression(
         &mut self,
         e: &mut Expr,
@@ -1069,7 +1100,7 @@ impl Expander {
                         .unwrap_or_else(|| Type::Named(name.clone()))
                 };
                 if let Type::Named(owner) = &ty
-                    && let Some(template) = self.struct_templates.get(owner).cloned()
+                    && let Some(template) = self.struct_template(owner)
                 {
                     let parameters = &template.generics;
                     let mut mapping = HashMap::new();
@@ -1085,8 +1116,18 @@ impl Expander {
                             span,
                         )?;
                     }
+                    // An expected tuple type fixes its element types; the checker
+                    // then reports a mismatched element where it is written.
+                    let fixed: HashSet<String> = if tuple_arity(owner).is_some() {
+                        mapping.keys().cloned().collect()
+                    } else {
+                        HashSet::new()
+                    };
+                    let inferred =
+                        |field: &Field| !matches!(&field.ty, Type::Named(p) if fixed.contains(p));
                     for (n, v) in fields.iter() {
                         if let Some(field) = template.fields.iter().find(|f| f.name == *n)
+                            && inferred(field)
                             && let Some(actual) = self.guess(v)
                         {
                             self.unify(&field.ty, &actual, parameters, &mut mapping, span)?;
@@ -1098,14 +1139,30 @@ impl Expander {
                             .map(|f| Self::substitute(&f.ty, &mapping))
                             .filter(|t| Self::concrete(t, parameters));
                         let actual = self.expression(v, substitutions, hint.as_ref())?;
-                        if let Some(field) = field {
+                        if let Some(field) = field
+                            && inferred(field)
+                        {
                             self.unify(&field.ty, &actual, parameters, &mut mapping, span)?;
                         }
                     }
-                    ty = Type::Generic(
-                        owner.clone(),
-                        self.inferred_arguments(parameters, &mapping, span)?,
-                    );
+                    let arguments = if tuple_arity(owner).is_some() {
+                        // Tuple parameters are implicit, so name the element instead.
+                        parameters
+                            .iter()
+                            .enumerate()
+                            .map(|(index, n)| {
+                                mapping.get(n).cloned().filter(|t| Self::concrete(t, parameters)).ok_or_else(|| {
+                                    Diagnostic::new(
+                                        span,
+                                        format!("cannot infer the type of tuple element {index}; annotate the binding or the element"),
+                                    )
+                                })
+                            })
+                            .collect::<Check<Vec<_>>>()?
+                    } else {
+                        self.inferred_arguments(parameters, &mapping, span)?
+                    };
+                    ty = Type::Generic(owner.clone(), arguments);
                 }
                 self.ty(&mut ty, substitutions, span)?;
                 if let Type::Named(concrete) = &ty {

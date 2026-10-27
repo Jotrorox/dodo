@@ -37,6 +37,8 @@ full rule or a worked example.
 | Scope | The region where a name is available and its local resources are kept alive. Braces often introduce a scope. |
 | Struct | A named type with fields, and optionally methods, for grouping data. |
 | Enum / variant | A type with named alternatives; one active variant can carry payload values. |
+| Tuple | An unnamed group of two or more values, such as `(i32, bool)`, read by position with `.0` and `.1`. See [tuples](types-and-functions.md#tuples-group-values-without-naming-them). |
+| Type alias | Another name for an existing type, declared with `type Name = Type`. See [type aliases](types-and-functions.md#type-aliases-name-existing-types). |
 | Pattern | A shape used to select or unpack a value, for example `some(value)` in a match. |
 | Exhaustive match | A match that covers every possible input alternative, perhaps with `_` as a fallback. |
 | Generic | Code parameterized by types, such as `fn identity<T>(value: T) -> T`. See [generics](generics.md). |

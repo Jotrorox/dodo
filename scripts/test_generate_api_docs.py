@@ -51,6 +51,21 @@ pub fn copy<R: Reader>(reader: &mut R) -> usize { return 0 }
 }""")
         self.assertEqual(function.signature, "pub fn copy<R: Reader>(reader: &mut R) -> usize")
 
+    def test_type_aliases_keep_their_aliased_type(self):
+        source = """package example
+// Results of this package.
+pub type Outcome<T> = T!Error
+pub type Span = (usize,
+    usize)
+type Hidden = u8
+pub fn read() -> Outcome<Span> { return ok((0, 0)) }
+"""
+        outcome, span, function = api.extract(source)
+        self.assertEqual((outcome.name, outcome.kind, outcome.comment), ("Outcome", "type", "Results of this package."))
+        self.assertEqual(outcome.signature, "pub type Outcome<T> = T!Error")
+        self.assertEqual(span.signature, "pub type Span = (usize,\n    usize)")
+        self.assertEqual(function.signature, "pub fn read() -> Outcome<Span>")
+
     def test_multiline_fields_do_not_split_generic_arguments(self):
         source = """pub struct Store {
     pub values:
@@ -183,7 +198,7 @@ pub const LAST: u8 = 4
         self.assertEqual(declarations[2].signature, "pub const POINT: Point = Point { x: 1, y: 2 }")
 
     def test_bad_sources_fail_instead_of_silently_losing_api(self):
-        for source in ("pub type Alias = i32", "pub struct Broken {", 'pub const BAD = "unfinished'):
+        for source in ("pub trait Alias = i32", "pub struct Broken {", 'pub const BAD = "unfinished'):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 api.extract(source)
 

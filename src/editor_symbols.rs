@@ -158,6 +158,17 @@ impl Index {
                 );
             }
         }
+        for alias in &original.aliases {
+            // LSP has no alias kind; TypeParameter is the conventional choice.
+            index.global(
+                &alias.name,
+                alias.span,
+                26,
+                alias.ty.clone(),
+                alias.public,
+                None,
+            );
+        }
         for constant in &original.constants {
             index.global(
                 &constant.name,
@@ -247,6 +258,9 @@ impl Index {
                 index.type_roles(bound.span);
             }
         }
+        for alias in &original.aliases {
+            index.type_roles(alias.span);
+        }
         for constant in &original.constants {
             index.type_roles(Span {
                 start: constant.span.start,
@@ -264,6 +278,9 @@ impl Index {
         }
         for enumeration in &original.enums {
             index.generic_roles(enumeration.span, &enumeration.generics);
+        }
+        for alias in &original.aliases {
+            index.generic_roles(alias.span, &alias.generics);
         }
         index.resolve_tokens();
         index

@@ -38,6 +38,10 @@ test("declarations, borrowing, attributes, and generic calls", () => {
   hasScope("pub interface Sensor: Named {", "Sensor", "entity.name.type.dodo");
   hasScope("pub interface Sensor: Named {", "interface", "storage.type.dodo");
   hasScope("fn poll(sensor: &mut dyn Sensor) {", "dyn", "storage.modifier.dodo");
+  hasScope("pub type Pair<T> = (T, T)", "type", "storage.type.dodo");
+  hasScope("pub type Pair<T> = (T, T)", "Pair", "entity.name.type.dodo");
+  hasScope("total := pair.0.1 + 1.5", "1", "variable.other.member.dodo");
+  hasScope("total := pair.0.1 + 1.5", "1.5", "constant.numeric.float.dodo");
   hasScope("pub fn view(&self) -> &i32 from(self) {", "view", "entity.name.function.dodo");
   hasScope("pub fn view(&self) -> &i32 from(self) {", "self", "variable.language.dodo");
   hasScope("pub fn view(&self) -> &i32 from(self) {", "from", "keyword.other.dodo");

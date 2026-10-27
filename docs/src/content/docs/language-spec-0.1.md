@@ -251,14 +251,17 @@ normalization is performed on strings or comments. The following words are
 reserved and must not be used as identifiers:
 
 ```text
-package import pub fn struct enum interface dyn const let return if else for
-in break continue match unsafe extern as from static void mut true false
+package import pub fn struct enum interface type dyn const let return if
+else for in break continue match unsafe extern as from static void mut
+true false
 ```
 
 `Self`, `self`, primitive type names, and constructor names such as `some` have
 contextual meanings; they are not in the reserved-word set. Symbol tokens use
 the longest recognized spelling, including `..=` before `..`, and `>>=` before
-`>>`. There is no preprocessor.
+`>>`. Decimal digits immediately after a `.` token always form an integer
+token without a fraction or suffix, so `pair.0.1` indexes nested tuples rather
+than containing the float `0.1`. There is no preprocessor.
 
 ### 3.4. Literals
 
@@ -461,6 +464,40 @@ addresses, padding bytes, inactive payload bytes, and NaN payload/sign selection
 unspecified; programs must not use them as value identity or serialization.
 Only the explicitly initialized bytes of a value may be read as initialized
 bytes. Copying an object does not guarantee preservation of padding.
+
+### 4.9. Tuples
+
+**TUPLE.** `(T0, T1, ..., Tn)` with at least two element types is a tuple type;
+`(T)` denotes `T`, and `()` and one-element tuples are rejected. A tuple is an
+anonymous struct whose public fields are named `0` through `n`; tuples with the
+same element types in the same order are the same type in every package. The
+expression `(e0, ..., en)` constructs a tuple, evaluating its elements left to
+right, and infers element types from the elements and an expected tuple type as
+for generic struct literals (Section 4.7). `t.0` accesses an element as a
+struct field: it is a place for assignment and borrowing, element borrows are
+disjoint, and copyable elements are read by copy. Tuples follow the ownership,
+destruction, and layout rules of structs: they move, own their elements, are
+never copyable, and have no compiler-defined operators. A tuple pattern
+`(p0, ..., pn)` matches each element with its sub-pattern and may appear wherever
+a pattern is permitted. `for (p0, ...) in values` binds the pattern against each
+element reference; `for &(p0, ...) in values` binds the pattern the same way and
+then copies every bound field into a fresh binding, which requires each to be
+copyable.
+
+### 4.10. Type aliases
+
+**ALIAS.** `type Name = Type` and `type Name<P, ...> = Type` declare a
+transparent alias. Every use of the alias, with exactly as many type arguments
+as it has parameters, denotes the aliased type with arguments substituted; it is
+not a distinct type and introduces no conversion. Alias parameters cannot have
+bounds. An alias's own name, directly or through other aliases, must not occur in
+its expansion. Alias names share the package namespace with other declarations,
+and a private alias is usable only in its package. A `pub` alias is subject to
+the private-type exposure rule (Section 2.3) for its aliased type. Where a struct
+or enum name is written as a path, an alias naming that struct or enum is
+accepted: struct literals and patterns, enum variant expressions and patterns,
+and associated function calls. A local binding of the same name in the enclosing
+function takes precedence over an alias in such value paths.
 
 ## 5. Bindings and initialization
 
@@ -1654,8 +1691,9 @@ package-decl  = "package", identifier, newline ;
 import-decl   = "import", string-literal, [ "as", identifier ], newline ;
 
 declaration   = [ "pub" ],
-                ( function-decl | struct-decl | enum-decl )
+                ( function-decl | struct-decl | enum-decl | alias-decl )
               | const-decl ;
+alias-decl    = "type", identifier, [ type-params ], "=", type, newline ;
 const-decl    = "const", identifier, ":", type, "=", expression, newline ;
 
 function-decl = [ "unsafe" ], [ "extern", string-literal ],
@@ -1677,6 +1715,8 @@ type          = primitive-type
               | "&", [ "mut" ], type
               | "&", [ "mut" ], "[", type, "]"
               | "*const", type | "*mut", type
+              | "(", type, ")"
+              | "(", type, ",", type, { ",", type }, [ "," ], ")"
               | type, "!", type ;
 
 block         = "{", { statement }, "}" ;
@@ -1696,7 +1736,7 @@ for-stmt      = "for", block
               | "for", for-init, ";", expression, ";",
                 expression, block
               | "for", identifier, "in", expression, [ "..", expression ], block
-              | "for", [ identifier, "," ], [ "&" ], identifier,
+              | "for", [ identifier, "," ], [ "&" ], ( identifier | tuple-pattern ),
                 "in", expression, block ;
 match-stmt    = "match", expression, "{", { match-arm }, "}" ;
 match-arm     = pattern, [ "if", expression ], "=>",
@@ -1706,7 +1746,10 @@ pattern-atom  = "_" | identifier | boolean-literal | integer-literal
               | integer-literal, ( ".." | "..=" ), integer-literal
               | qualified-name, "(", [ pattern, { ",", pattern } ], ")"
               | qualified-name, "{", [ pattern-field, { ",", pattern-field } ], "}"
-              | "(", pattern, ")" ;
+              | "(", pattern, ")"
+              | tuple-pattern ;
+tuple-pattern = "(", pattern, ",", pattern, { ",", pattern }, [ "," ], ")" ;
+tuple         = "(", expression, ",", expression, { ",", expression }, [ "," ], ")" ;
 pattern-field = identifier, [ ":", pattern ] | ".." ;
 unsafe-block  = "unsafe", block ;
 array-list    = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
@@ -1764,6 +1807,7 @@ filters. Suite abbreviations refer to these files:
 - `storage`: [tests/owned_storage.rs](https://github.com/Jotrorox/dodo/blob/main/tests/owned_storage.rs)
 - `core`: [tests/core_intrinsics.rs](https://github.com/Jotrorox/dodo/blob/main/tests/core_intrinsics.rs)
 - `packages`: [tests/stdlib_packages.rs](https://github.com/Jotrorox/dodo/blob/main/tests/stdlib_packages.rs)
+- `tuples_and_aliases`: [tests/tuples_and_aliases.rs](https://github.com/Jotrorox/dodo/blob/main/tests/tuples_and_aliases.rs)
 - `lexer`, `parser`, `sema`, `package`: the `tests` modules in `src/lexer.rs`,
   `src/parser.rs`, `src/sema.rs`, and `src/package.rs` respectively.
 
@@ -1789,6 +1833,7 @@ execution cases and enforced static boundaries are identified separately.
 | REP-SCALAR, NUM-FLOAT | E `spec::scalar_representations_and_float_comparisons`; T `spec::target_profiles_publish_width_endianness_and_native_symbols`. |
 | REP-TAG, REP-VIEW, REP-LAYOUT | E `spec::aggregate_layout_tags_and_string_byte_lengths`, `shared_payload_values_survive_moves_borrows_and_propagation`, `shared_payload_cleanup_drops_only_the_active_alternative`; T `spec::shared_payload_layout_on_native_and_embedded_targets`; E `debugging::gdb_reads_shared_enum_and_result_payloads`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`; R `core::field_offsets_enforce_literal_direct_fields_and_package_privacy`. |
 | NUM-CAST, NUM-ARITH, TRAP | E `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`; E `compiler::arithmetic_and_index_traps_survive_optimization`, `invalid_subslice_bounds_trap_at_all_optimization_levels`; R `sema::constant_arithmetic_checked_before_codegen`; E/R/T `core::wrapping_arithmetic_boundaries_inference_and_evaluation_order`, `wrapping_arithmetic_rejects_invalid_arguments`, `wrapping_arithmetic_emits_plain_operations_at_each_target_width`. |
+| TUPLE, ALIAS | E `tuples_and_aliases::tuples_construct_return_index_and_destructure`, `tuple_patterns_match_and_loops_destructure_elements`, `tuples_own_and_drop_their_elements_and_borrow_fields_disjointly`, `type_aliases_name_types_structs_enums_and_generic_results`; R `tuples_and_aliases::tuple_and_alias_mistakes_have_source_level_diagnostics`, `private_aliases_stay_in_their_package`; A/R `parser::tuples_and_type_aliases`, `lexer::digits_after_a_dot_are_tuple_indices`. |
 | GEN-INSTANCE, section 4.7 | E `compiler::generic_arguments_infer_from_values_parameters_and_return_context`, `generic_struct_methods_keep_borrowed_returns`; R `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors`. |
 | OWN-SUBOBJECT, sections 7–9 | R `sema::destructuring_preserves_borrows_moves_and_custom_drop`; E `compiler::cleanup_reverses_order_and_does_not_double_drop_moves`, `cleanup_runs_on_overwrite_explicit_drop_break_and_continue`, `custom_destructor_runs_before_nested_fields`, `nested_patterns_drop_ignored_values_and_guard_failures_once`. |
 | PTR-VALID, PTR-OFFSET | E valid ranges/reinterpretation `spec::pointer_integer_round_trip_offsets_and_byte_access`, `scalar_representations_and_float_comparisons`; E foreign allocated storage `storage::simultaneous_boxes_destruction_failure_alignment_and_zst`. Invalid runtime provenance is an unsafe precondition violation, not a required rejection. |

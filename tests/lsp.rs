@@ -1391,6 +1391,54 @@ fn lsp_cross_file_alias_navigation_references_rename_and_completion() {
 }
 
 #[test]
+fn lsp_type_aliases_navigate_rename_and_hover_with_tuple_notation() {
+    let workspace = Workspace::new();
+    let source = "package app\ntype Point = (i32, bool)\nfn make() -> Point { return (1, true) }\nfn main() {\npoint := make()\nlet (x, flag) = point\n}\n";
+    let root = workspace.uri("main.dodo");
+    let mut client = Client::start("lsp");
+    client.initialize("file");
+    client.open(&root, source, 1);
+    assert_eq!(client.diagnostics()[&root]["diagnostics"], json!([]));
+    let definition = query(
+        &mut client,
+        "definition",
+        &root,
+        source,
+        "Point {",
+        json!({}),
+    );
+    assert_eq!(definition["result"]["uri"], root, "{definition}");
+    assert_eq!(
+        definition["result"]["range"]["start"],
+        at(source, "Point =")
+    );
+    for (needle, expected) in [
+        ("Point =", "type Point = (i32, bool)"),
+        ("point :=", "point: (i32, bool)"),
+        ("make()", "fn make() -> (i32, bool)"),
+    ] {
+        let hover = query(&mut client, "hover", &root, source, needle, json!({}));
+        let text = hover["result"]["contents"]["value"].as_str().unwrap_or("");
+        assert!(text.contains(expected), "{needle}: {hover}");
+        assert!(!text.contains('$') && !text.contains('#'), "{hover}");
+    }
+    let rename = query(
+        &mut client,
+        "rename",
+        &root,
+        source,
+        "Point =",
+        json!({"newName":"Pair"}),
+    );
+    assert_eq!(
+        rename["result"]["changes"][&root].as_array().unwrap().len(),
+        2,
+        "{rename}"
+    );
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
 fn lsp_bundled_definitions_open_authoritative_read_only_sources() {
     let workspace = Workspace::new();
     let source =
