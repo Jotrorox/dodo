@@ -132,6 +132,12 @@ pub enum Type {
     /// A value of an unknown type implementing the named interface. It has no
     /// fixed size, so it only appears behind a reference: `&dyn I`, `&mut dyn I`.
     Dyn(String),
+    /// `fn(A, B) -> R`: a plain function pointer with no captured state.
+    Fn(Vec<Type>, Box<Type>),
+    /// `dyn fn(A, B) -> R`: an unknown callable, which may capture locals. It
+    /// has no fixed size, so it only appears behind a reference: `&dyn fn(..)`
+    /// and `&mut dyn fn(..)` pair code with a borrowed environment.
+    DynFn(Vec<Type>, Box<Type>),
 }
 impl Type {
     pub fn isize() -> Self {
@@ -169,7 +175,35 @@ impl Type {
                 | Self::Ref(false, _)
                 | Self::Slice(false, _)
                 | Self::Raw(..)
+                | Self::Fn(..)
         )
+    }
+    /// The signature of a closure reference `&dyn fn(..)` or `&mut dyn fn(..)`.
+    pub fn closure_signature(&self) -> Option<(bool, &[Type], &Type)> {
+        match self {
+            Self::Ref(mutable, inner) => match inner.as_ref() {
+                Self::DynFn(params, ret) => Some((*mutable, params, ret)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    /// The signature a call of this value uses, looking through references to
+    /// function pointers and closure references.
+    pub fn call_signature(&self) -> Option<(&[Type], &Type)> {
+        match self {
+            Self::Ref(_, inner) if !matches!(inner.as_ref(), Self::DynFn(..)) => {
+                inner.call_signature()
+            }
+            _ => self.callable_signature(),
+        }
+    }
+    /// The signature of any callable value: a function pointer or a closure reference.
+    pub fn callable_signature(&self) -> Option<(&[Type], &Type)> {
+        match self {
+            Self::Fn(params, ret) => Some((params, ret)),
+            _ => self.closure_signature().map(|(_, p, r)| (p, r)),
+        }
     }
     pub fn carries_borrow(&self) -> bool {
         match self {
@@ -218,6 +252,23 @@ impl std::fmt::Display for Type {
             Self::Option(t) => write!(f, "Option<{t}>"),
             Self::MaybeUninit(t) => write!(f, "MaybeUninit<{t}>"),
             Self::Dyn(n) => write!(f, "dyn {n}"),
+            Self::Fn(params, ret) | Self::DynFn(params, ret) => {
+                if matches!(self, Self::DynFn(..)) {
+                    write!(f, "dyn ")?;
+                }
+                write!(f, "fn(")?;
+                for (i, t) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{t}")?;
+                }
+                write!(f, ")")?;
+                if **ret != Self::Void {
+                    write!(f, " -> {ret}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -331,6 +382,10 @@ pub struct Function {
     pub from_span: Option<Span>,
     pub body: Option<Block>,
     pub span: Span,
+    /// A closure body lifted out of its enclosing function: the number of
+    /// leading parameters that reference captured bindings through its
+    /// environment. Such functions use the closure calling convention.
+    pub environment: Option<usize>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Printing {
@@ -499,6 +554,33 @@ pub enum ExprKind {
     Cast(Box<Expr>, Type),
     Try(Box<Expr>),
     Unwrap(Box<Expr>),
+    /// `fn(x: T) -> R { body }`, an anonymous function that may capture locals.
+    Closure(Box<Closure>),
+    /// A call through a function value: `callback(x)`, `(table[i])(x)`.
+    Invoke {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+}
+#[derive(Clone, Debug)]
+pub struct Closure {
+    /// Parameter types are `Unknown` when omitted and taken from the expected type.
+    pub params: Vec<Param>,
+    /// `Unknown` when omitted: taken from the expected type or the body.
+    pub ret: Type,
+    pub ret_span: Span,
+    /// Final expressions are `Yield` statements until the result type is known.
+    pub body: Block,
+    /// Set by semantic analysis: the lifted function holding the body.
+    pub function: String,
+    /// Set by semantic analysis: captured bindings, in environment order.
+    pub captures: Vec<Capture>,
+}
+/// A local binding a closure reads (`mutable == false`) or modifies through its environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Capture {
+    pub name: String,
+    pub mutable: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOp {

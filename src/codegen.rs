@@ -10,6 +10,7 @@ use llvm_sys::{
 use std::collections::HashMap;
 use std::path::Path;
 
+mod closures;
 mod debug;
 mod llvm;
 mod panic;
@@ -176,6 +177,8 @@ pub fn generate<'ctx>(
         testing: !options.test_functions.is_empty(),
         interfaces: crate::sema::flattened_interfaces(program).map_err(|e| error(e.message))?,
         vtables: HashMap::new(),
+        fn_pointers: HashMap::new(),
+        trampolines: HashMap::new(),
     };
     cg.declare_types()?;
     cg.declare_functions()?;
@@ -282,6 +285,10 @@ struct Codegen<'a, 'ctx> {
     // Interface methods in vtable order, and the tables built so far.
     interfaces: HashMap<String, Vec<Function>>,
     vtables: HashMap<(String, String), Value<'ctx>>,
+    // Function-pointer entry points of named functions and closure bodies,
+    // and per-signature adapters from function pointers to closure references.
+    fn_pointers: HashMap<String, Value<'ctx>>,
+    trampolines: HashMap<String, Value<'ctx>>,
 }
 impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn ty(&self, t: &Type) -> Result<LlvmType<'ctx>> {
@@ -295,11 +302,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 .unwrap(),
             Type::Float(32) => self.context.f32_type(),
             Type::Float(64) => self.context.f64_type(),
-            // A `dyn` reference pairs the value's address with its method table.
-            Type::Ref(_, t) if matches!(t.as_ref(), Type::Dyn(_)) => self
+            // A `dyn` reference pairs the value's address with its method table;
+            // a closure reference pairs its code with its captured environment.
+            Type::Ref(_, t) if matches!(t.as_ref(), Type::Dyn(_) | Type::DynFn(..)) => self
                 .context
                 .struct_type(&[self.context.ptr_type(0), self.context.ptr_type(0)], false),
-            Type::Ref(..) | Type::Raw(..) => self.context.ptr_type(0),
+            Type::Ref(..) | Type::Raw(..) | Type::Fn(..) => self.context.ptr_type(0),
             Type::Slice(..) | Type::Str => self
                 .context
                 .struct_type(&[self.context.ptr_type(0), self.usize_type()], false),
@@ -473,6 +481,19 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             if !f.generics.is_empty() {
                 continue;
             }
+            if let Some(captures) = f.environment {
+                let params: Vec<Type> = f.params[captures..].iter().map(|p| p.ty.clone()).collect();
+                let convention = self.value_convention(&params, &f.ret)?;
+                let ty = self.value_fn_type(&params, &f.ret, true)?;
+                let function = self.module.add_function(
+                    &format!("dodo.{}.{}", self.program.package, f.name),
+                    ty,
+                    Some(LLVMInternalLinkage),
+                );
+                self.indirect.insert(f.name.clone(), convention);
+                self.functions.insert(f.name.clone(), function);
+                continue;
+            }
             // Keep exported and C signatures stable. Internal aggregate values
             // otherwise flatten into thousands of ABI operands at -O0, making
             // ordinary owned-buffer APIs prohibitively expensive to compile.
@@ -614,7 +635,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .collect()
     }
     fn declare_constants(&mut self) -> Result<()> {
-        for c in &self.program.constants {
+        let program = self.program;
+        for c in &program.constants {
             let val = self.constant(&c.value)?;
             let g = self.module.add_global(
                 self.ty(&c.ty)?,
@@ -643,9 +665,22 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .struct_type(&[self.context.ptr_type(0), self.usize_type()], false)
             .const_named_struct(&[g, self.usize_type().const_int(bytes.len() as u64, false)])
     }
-    fn constant(&self, e: &Expr) -> Result<Value<'ctx>> {
+    fn constant(&mut self, e: &Expr) -> Result<Value<'ctx>> {
         match &e.kind {
             ExprKind::String(bytes, _) => Ok(self.string_literal(bytes)),
+            ExprKind::Name(n) if matches!(e.ty, Type::Fn(..)) && self.functions.contains_key(n) => {
+                self.fn_pointer(n)
+            }
+            ExprKind::Name(n) if n == "none" => Ok(self.ty(&e.ty)?.const_zero()),
+            ExprKind::Closure(closure) if closure.captures.is_empty() => {
+                self.fn_pointer(&closure.function)
+            }
+            ExprKind::Cast(x, t) if t.closure_signature().is_some() => {
+                let pointer = self.constant(x)?;
+                let (params, ret) = t.callable_signature().unwrap();
+                let trampoline = self.trampoline(params, ret)?;
+                Ok(self.ty(t)?.const_named_struct(&[trampoline, pointer]))
+            }
             ExprKind::Name(n) => {
                 let c = self
                     .program
@@ -731,12 +766,26 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.location(f.span);
         self.builder
             .position_at_end(self.context.append_basic_block(function, "entry"));
-        for (index, (p, v)) in f
-            .params
-            .iter()
-            .zip(function.get_param_iter().skip(usize::from(indirect_return)))
-            .enumerate()
-        {
+        let mut incoming = function.get_param_iter().skip(usize::from(indirect_return));
+        let captures = f.environment.unwrap_or(0);
+        if f.environment.is_some() {
+            // A closure body reads its captured bindings' addresses from its environment.
+            let environment = incoming.next().unwrap();
+            let pointer = self.context.ptr_type(0);
+            let layout = self.context.struct_type(&vec![pointer; captures], false);
+            for (index, p) in f.params[..captures].iter().enumerate() {
+                self.location(p.span);
+                let slot = self.builder.build_struct_gep(
+                    layout,
+                    environment,
+                    index as u32,
+                    "capture.slot",
+                )?;
+                let address = self.builder.build_load(pointer, slot, "capture")?;
+                self.bind(&p.name, &p.ty, Some(address))?;
+            }
+        }
+        for (index, (p, v)) in f.params[captures..].iter().zip(incoming).enumerate() {
             self.parameter = index as u32 + 1;
             self.location(p.span);
             let value = if indirect_params[index] {
@@ -765,6 +814,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     // Tagged unions are deliberately excluded: copying their inactive payload
     // would defeat the compact constructors used on freestanding targets.
     fn store_value(&self, destination: Value<'ctx>, value: Value<'ctx>) -> Result<()> {
+        // A function used as a value is a pointer, not a sized aggregate.
+        if value.is_pointer_value() {
+            self.builder.build_store(destination, value)?;
+            return Ok(());
+        }
         let ty = value.get_type();
         let size = self.data.get_abi_size(&ty);
         if size > 1024
@@ -1451,6 +1505,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.load(b.ptr, &b.ty)?
                 } else if let Some((p, t)) = self.globals.get(n).cloned() {
                     self.load(p, &t)?
+                } else if self.functions.contains_key(n) {
+                    self.fn_pointer(n)?
                 } else {
                     return Err(error(format!("unknown value {n}")));
                 }
@@ -1690,6 +1746,22 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let p = self.place(e)?;
                 self.load(p, &e.ty)?
             }
+            ExprKind::Closure(closure) => self.closure(closure, &e.ty)?,
+            ExprKind::Invoke { callee, args } => self.invoke(callee, args, &e.ty)?,
+            ExprKind::Cast(x, t) if t.closure_signature().is_some() => match &x.kind {
+                // A closure without captures needs no environment.
+                ExprKind::Closure(closure) if closure.captures.is_empty() => {
+                    let code = self.functions[&closure.function];
+                    self.closure_value(code, self.context.ptr_type(0).const_zero())?
+                }
+                _ if matches!(x.ty, Type::Fn(..)) => {
+                    let pointer = self.expr(x)?;
+                    let (params, ret) = t.callable_signature().unwrap();
+                    let trampoline = self.trampoline(params, ret)?;
+                    self.closure_value(trampoline, pointer)?
+                }
+                _ => self.expr(x)?,
+            },
             ExprKind::Cast(x, t)
                 if let Type::Ref(_, object) = t
                     && let Type::Dyn(interface) = object.as_ref() =>

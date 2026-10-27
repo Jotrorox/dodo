@@ -274,8 +274,17 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .create_basic_type(&name, size, encoding, LLVMDIFlagZero)
                     .map_err(error)?)
             }
+            Type::Fn(..) => {
+                let inner = self.debug_type(&Type::u8())?;
+                Ok(self
+                    .debug
+                    .as_ref()
+                    .unwrap()
+                    .builder
+                    .create_pointer_type(&name, inner, size, align, 0))
+            }
             Type::Ref(_, inner) | Type::Raw(_, inner)
-                if !matches!(inner.as_ref(), Type::Dyn(_)) =>
+                if !matches!(inner.as_ref(), Type::Dyn(_) | Type::DynFn(..)) =>
             {
                 let inner = self.debug_type(inner)?;
                 Ok(self
@@ -338,6 +347,22 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                                 Span::default(),
                             ),
                             ("len".into(), Type::usize(), Span::default()),
+                        ],
+                    ),
+                    // A closure reference: its code and captured environment.
+                    Type::Ref(_, inner) if let Type::DynFn(params, ret) = inner.as_ref() => (
+                        Span::default(),
+                        vec![
+                            (
+                                "code".into(),
+                                Type::Fn(params.clone(), ret.clone()),
+                                Span::default(),
+                            ),
+                            (
+                                "environment".into(),
+                                Type::Raw(false, Box::new(Type::u8())),
+                                Span::default(),
+                            ),
                         ],
                     ),
                     // A `dyn` reference: the value's address and its method table.

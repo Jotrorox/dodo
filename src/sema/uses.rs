@@ -43,6 +43,15 @@ pub(super) fn names_expr(expression: &Expr, names: &mut HashMap<String, Span>) {
             }
         }
         ExprKind::ValueBlock(body) => names_block(body, names),
+        // Captured bindings are used where the closure is created, and their
+        // loans continue through the closure value's own uses.
+        ExprKind::Closure(closure) => names_block(&closure.body, names),
+        ExprKind::Invoke { callee, args } => {
+            names_expr(callee, names);
+            for arg in args {
+                names_expr(arg, names);
+            }
+        }
         ExprKind::Slice {
             base, start, end, ..
         } => {
@@ -196,6 +205,20 @@ pub(super) fn binding_use_spans(function: &Function) -> HashMap<(usize, String),
                     }
                 }
                 ExprKind::ValueBlock(body) => self.block(body, true),
+                ExprKind::Closure(closure) => {
+                    self.scopes.push(HashMap::new());
+                    for param in &closure.params {
+                        self.bind(&param.name, param.span);
+                    }
+                    self.block(&closure.body, false);
+                    self.scopes.pop();
+                }
+                ExprKind::Invoke { callee, args } => {
+                    self.expr(callee);
+                    for arg in args {
+                        self.expr(arg);
+                    }
+                }
                 ExprKind::Slice {
                     base, start, end, ..
                 } => {

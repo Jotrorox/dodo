@@ -214,6 +214,75 @@ to the division, including the signed minimum divided by `-1`. The next chapter
 explains [control flow](control-flow.md); [patterns and Results](patterns-and-results.md)
 shows complete programs with matching, `?`, and postfix `!`.
 
+## Functions are values, and closures capture locals
+
+A function can be stored, passed, and returned like any other value. Its type
+is written `fn(parameter types) -> result`; the `-> result` part is omitted for
+void. An anonymous function, or *closure*, uses the same spelling as a
+declaration without the name, and may use local variables from the code around
+it. Here a sort comparator reads a local, and a callback adds to one:
+
+```dodo test
+package callbacks
+
+import "std/collections"
+
+fn double(x: i32) -> i32 {
+    x * 2
+}
+
+// Calls `step` on every value: a shared closure reference may only read
+// what it captures, an exclusive one may also change it.
+fn each(values: &[i32], step: &mut dyn fn(i32)) {
+    for &value in values {
+        step(value)
+    }
+}
+
+fn main() -> i32 {
+    operation: fn(i32) -> i32 = double
+    assert_eq(operation(21), 42)
+
+    values := [5i32, 1, 4]
+    descending := true
+    collections.sort_by(&mut values, fn(a, b) {
+        if descending { *b - *a } else { *a - *b }
+    })
+    assert_eq(values[0], 5)
+
+    total := 0i32
+    each(&values, fn(value) { total += value })
+    assert_eq(total, 10)
+    return 0
+}
+```
+
+Omitted parameter and result types come from the type the closure is passed
+as, so `fn(a, b) { ... }` above knows that `a` and `b` are `&i32`. Without such
+a context, annotate the parameters: `twice := fn(x: i32) { x * 2 }` infers the
+`i32` result from the final expression.
+
+Closures capture variables by reference, never by copying them, and the borrow
+checker treats a closure like a reference to what it captures. While `add` in
+`add := fn(x: i32) { total += x }` can still be called, nothing else may read or
+change `total`; after its last call, `total` is free again. A closure therefore
+can never outlive a captured local. There are three function value types:
+
+| Type | Holds | Copy | Can be stored in statics |
+| --- | --- | --- | --- |
+| `fn(A) -> R` | A named function, or a closure that captures nothing | yes | yes |
+| `&dyn fn(A) -> R` | A closure that only reads its captures | yes | no |
+| `&mut dyn fn(A) -> R` | A closure that also changes its captures | no (moves) | no |
+
+A function pointer converts to either closure reference automatically, so an
+API taking `&mut dyn fn(..)` accepts all three. Accept a plain `fn(..)` when
+the value must be stored for later, for example as an
+[interrupt handler](hardware.md#handlers-registered-at-run-time). Methods are
+values too, written `Point.length`, and calling a struct field that holds a
+function is written `button.on_press(x)` when the struct has no method of that
+name. The [language specification](language-spec-0.1.md#67-function-values-and-closures)
+gives the complete rules.
+
 ## Remaining type forms
 
 | Form | Purpose | Reference |
@@ -223,8 +292,8 @@ shows complete programs with matching, `?`, and postfix `!`.
 | `Name<T>` | A struct or enum specialized for a type. | [Generics](generics.md) |
 | `*const T`, `*mut T` | Nullable raw pointers without checked lifetimes. | [Memory and foreign calls](memory-and-ffi.md) |
 | `MaybeUninit<T>` | Opaque storage that may not yet contain a valid `T`. | [Memory intrinsics](memory-and-ffi.md#implemented-core-calls) |
+| `fn(A) -> R`, `&dyn fn(A) -> R`, `&mut dyn fn(A) -> R` | Function pointers and closure references. | [Functions are values](#functions-are-values-and-closures-capture-locals) |
 
-There are no tuples, type aliases, general function-value types, closures, or
-user-defined implicit conversions in this implementation. Use named struct
-fields, generic methods, and [interfaces](generics.md#interfaces) to express
-reusable data and behavior.
+There are no tuples, type aliases, or user-defined implicit conversions in this
+implementation. Use named struct fields, generic methods, closures, and
+[interfaces](generics.md#interfaces) to express reusable data and behavior.

@@ -7,6 +7,7 @@ use crate::ast::*;
 use crate::diagnostic::{Diagnostic, DiagnosticBinding, DiagnosticKind, MissingErrorVariant};
 use std::collections::{HashMap, HashSet};
 
+mod closures;
 #[doc(hidden)]
 pub mod flow;
 mod generics;
@@ -101,10 +102,15 @@ fn check_program(
     for function in &mut program.functions {
         function.from = context.functions[&function.name].from.clone();
     }
+    let mut lifted = Vec::new();
     for constant in &mut program.constants {
         let result = (|| {
             let mut checker = Checker::new(&context, Type::Void, vec![], HashMap::new());
-            let value = checker.expr(&mut constant.value, Some(&constant.ty), true)?;
+            checker.namespace = context.function_namespace(&constant.name);
+            checker.function_name = constant.name.clone();
+            let value = checker.expr(&mut constant.value, Some(&constant.ty), true);
+            lifted.append(&mut checker.closures);
+            let value = value?;
             checker.expect(&constant.ty, &value.ty, constant.span)?;
             if !constant_expression(&constant.value) {
                 return Err(Diagnostic::new(
@@ -201,50 +207,13 @@ fn check_program(
             checker.binding_uses = binding_use_spans(function);
             checker.return_contract = Some(function.from_span.unwrap_or(function.ret_span));
             checker.inferred_contract = function.from_span.is_none();
+            checker.function_name = function.name.clone();
+            checker.imported = function.imported;
             for parameter in &function.params {
-                let id = checker.next_id;
-                let stored = context.contains_storage_witness(&parameter.ty);
-                let borrowed = matches!(parameter.ty, Type::Ref(..) | Type::Slice(..));
-                let mut deps = if context.carries_borrow(&parameter.ty) {
-                    vec![Loan {
-                        stored: stored && !borrowed,
-                        dependency: false,
-                        root: usize::MAX / 2 + id,
-                        fields: vec![],
-                        partitions: vec![],
-                        mutable: context.carries_mutable_borrow(&parameter.ty),
-                        origin: parameter.span,
-                        via: vec![],
-                        external: Some(parameter.name.clone()),
-                    }]
-                } else {
-                    vec![]
-                };
-                if let Type::Ref(_, inner) | Type::Slice(_, inner) = &parameter.ty
-                    && stored
-                    && context.carries_borrow(inner)
-                {
-                    deps.push(Loan {
-                        stored: true,
-                        dependency: true,
-                        root: usize::MAX / 4 + id,
-                        fields: vec![],
-                        partitions: vec![],
-                        mutable: context.carries_mutable_borrow(inner),
-                        origin: parameter.span,
-                        via: vec![],
-                        external: Some(format!("{}.stored", parameter.name)),
-                    });
-                }
-                checker.bind(
-                    parameter.name.clone(),
-                    parameter.ty.clone(),
-                    Some(deps),
-                    false,
-                    parameter.span,
-                )?;
+                checker.bind_parameter(&parameter.name, &parameter.ty, parameter.span)?;
             }
             let result = checker.block(function.body.as_mut().unwrap(), false);
+            lifted.append(&mut checker.closures);
             let had_errors = !checker.diagnostics.is_empty();
             diagnostics.append(&mut checker.diagnostics);
             let terminates = result?;
@@ -273,6 +242,17 @@ fn check_program(
     program
         .functions
         .retain(|f| !context.functions[&f.name].unavailable);
+    // Closure bodies become ordinary functions with an environment. A body
+    // checked more than once keeps only its final lowering.
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for function in lifted.into_iter().rev() {
+        if seen.insert(function.name.clone()) {
+            unique.push(function);
+        }
+    }
+    unique.reverse();
+    program.functions.extend(unique);
     Ok(())
 }
 
@@ -625,6 +605,25 @@ impl Context {
             }
             Type::Generic(..) => Err(Diagnostic::new(span, "unresolved generic type")),
             Type::Ref(_, t) if let Type::Dyn(name) = t.as_ref() => self.validate_dyn(name, span),
+            Type::Ref(_, t) if let Type::DynFn(params, ret) = t.as_ref() => {
+                for param in params {
+                    self.validate_type(param, span, false)?;
+                }
+                self.validate_type(ret, span, true)
+            }
+            Type::DynFn(..) => Err(Diagnostic::new(
+                span,
+                format!("`{ty}` has no fixed size; use it behind a reference"),
+            )
+            .note(format!(
+                "write `&{ty}` or `&mut {ty}`; the reference carries the captured environment"
+            ))),
+            Type::Fn(params, ret) => {
+                for param in params {
+                    self.validate_type(param, span, false)?;
+                }
+                self.validate_type(ret, span, true)
+            }
             Type::Dyn(name) => Err(Diagnostic::new(
                 span,
                 format!("`dyn {name}` has no fixed size; use it behind a reference"),
@@ -809,7 +808,8 @@ impl Context {
     // 'static merely by writing that contract on its surrounding struct.
     fn thread_safe(&self, ty: &Type, sharing: bool, seen: &mut HashSet<String>) -> bool {
         match ty {
-            Type::Void | Type::Bool | Type::Int { .. } | Type::Float(_) => true,
+            // Function pointers carry code addresses and no captured state.
+            Type::Void | Type::Bool | Type::Int { .. } | Type::Float(_) | Type::Fn(..) => true,
             Type::Array(_, t) | Type::Option(t) => self.thread_safe(t, sharing, seen),
             Type::Result(t, e) => {
                 self.thread_safe(t, sharing, seen) && self.thread_safe(e, sharing, seen)
@@ -894,6 +894,14 @@ struct Checker<'a> {
     namespace: String,
     guard_depth: usize,
     expression_deps: HashMap<(usize, usize), Vec<Loan>>,
+    // Closure lowering: the enclosing function, the lifted bodies, and, while
+    // checking a closure body, which environment references were mutated.
+    function_name: String,
+    imported: bool,
+    closures: Vec<Function>,
+    inlined_constant: usize,
+    capture_roots: HashMap<usize, String>,
+    mutated_captures: std::cell::RefCell<HashSet<String>>,
 }
 impl<'a> Checker<'a> {
     fn new(
@@ -927,6 +935,12 @@ impl<'a> Checker<'a> {
             namespace: String::new(),
             guard_depth: 0,
             expression_deps: HashMap::new(),
+            function_name: String::new(),
+            imported: false,
+            closures: vec![],
+            inlined_constant: 0,
+            capture_roots: HashMap::new(),
+            mutated_captures: std::cell::RefCell::new(HashSet::new()),
         }
     }
     fn lookup(&self, name: &str) -> Option<&Variable> {
@@ -994,6 +1008,45 @@ impl<'a> Checker<'a> {
         self.next_id += 1;
         self.scopes.last_mut().unwrap().push(variable);
         Ok(())
+    }
+    /// Bind a parameter whose borrows come from the caller.
+    fn bind_parameter(&mut self, name: &str, ty: &Type, span: Span) -> Check<()> {
+        let context = self.context;
+        let id = self.next_id;
+        let stored = context.contains_storage_witness(ty);
+        let borrowed = matches!(ty, Type::Ref(..) | Type::Slice(..));
+        let mut deps = if context.carries_borrow(ty) {
+            vec![Loan {
+                stored: stored && !borrowed,
+                dependency: false,
+                root: usize::MAX / 2 + id,
+                fields: vec![],
+                partitions: vec![],
+                mutable: context.carries_mutable_borrow(ty),
+                origin: span,
+                via: vec![],
+                external: Some(name.to_owned()),
+            }]
+        } else {
+            vec![]
+        };
+        if let Type::Ref(_, inner) | Type::Slice(_, inner) = ty
+            && stored
+            && context.carries_borrow(inner)
+        {
+            deps.push(Loan {
+                stored: true,
+                dependency: true,
+                root: usize::MAX / 4 + id,
+                fields: vec![],
+                partitions: vec![],
+                mutable: context.carries_mutable_borrow(inner),
+                origin: span,
+                via: vec![],
+                external: Some(format!("{name}.stored")),
+            });
+        }
+        self.bind(name.to_owned(), ty.clone(), Some(deps), false, span)
     }
     fn live(&self, v: &Variable) -> bool {
         v.initialized
@@ -1135,6 +1188,9 @@ impl<'a> Checker<'a> {
         }
     }
     fn conflict(&self, place: &Loan, access: Access, span: Span) -> Check<()> {
+        if matches!(access, Access::Write | Access::Move | Access::Borrow(true)) {
+            self.note_capture_mutation(std::slice::from_ref(place));
+        }
         if self.guard_depth > 0
             && matches!(access, Access::Write | Access::Move | Access::Borrow(true))
         {
@@ -1196,6 +1252,17 @@ impl<'a> Checker<'a> {
             }
         }
         Ok(())
+    }
+    /// Inside a closure body, record captured bindings reached mutably.
+    fn note_capture_mutation(&self, loans: &[Loan]) {
+        if self.capture_roots.is_empty() {
+            return;
+        }
+        for loan in loans {
+            if let Some(name) = self.capture_roots.get(&loan.root) {
+                self.mutated_captures.borrow_mut().insert(name.clone());
+            }
+        }
     }
     fn access_label(&self, place: &Loan, access: Access) -> String {
         let name = self.by_id(place.root).map_or_else(
@@ -1559,6 +1626,13 @@ impl<'a> Checker<'a> {
                         // External parameter storage has no local Variable entry.
                         // Checking only inside by_id_mut silently accepted storing
                         // a callback argument's short borrow through &mut self.
+                        if let Some(name) = self.capture_roots.get(&loan.root) {
+                            return Err(Diagnostic::new(
+                                span,
+                                format!("a closure cannot store a borrow in captured `{name}`"),
+                            )
+                            .note("captured bindings outlive the closure's own borrows; return the value from the closure instead"));
+                        }
                         if !loan.via.is_empty() || loan.external.is_some() {
                             return Err(Diagnostic::new(span, "replacing borrow-carrying fields through a reference is not supported in 0.1").note("replace the owned aggregate so its complete borrow dependencies can be checked"));
                         }
@@ -1638,13 +1712,20 @@ impl<'a> Checker<'a> {
                     .as_ref()
                     .map_or(span, |expression| expression.span);
                 let value = match expression {
-                    Some(e) => self.expr(e, Some(&expected), true)?,
+                    Some(e) => {
+                        self.expr(e, (expected != Type::Unknown).then_some(&expected), true)?
+                    }
                     None => Value {
                         ty: Type::Void,
                         deps: vec![],
                     },
                 };
-                self.expect(&expected, &value.ty, span)?;
+                // A closure without a declared result type takes its first return's.
+                if expected == Type::Unknown {
+                    self.return_ty = value.ty.clone();
+                } else {
+                    self.expect(&expected, &value.ty, span)?;
+                }
                 if self.context.carries_borrow(&value.ty) {
                     self.check_returned_borrows(&value.deps, return_span)?;
                 }
@@ -2235,6 +2316,77 @@ impl<'a> Checker<'a> {
             }
             expression.kind = ExprKind::Name(name);
         }
+        // `package.HANDLER(x)` calls a function value held in a constant or static.
+        if let ExprKind::MethodCall {
+            receiver,
+            name,
+            args,
+        } = &mut expression.kind
+            && let Some(prefix) = qualified_name(receiver)
+            && self.lookup(&prefix).is_none()
+            && self
+                .context
+                .constants
+                .get(&format!("{prefix}.{name}"))
+                .is_some_and(|c| c.ty.call_signature().is_some())
+        {
+            expression.kind = ExprKind::Call {
+                name: format!("{prefix}.{name}"),
+                type_args: vec![],
+                args: std::mem::take(args),
+            };
+        }
+        // A local function value shadows any function of the same name, and a
+        // constant or static holding a function value is called the same way.
+        if let ExprKind::Call {
+            name,
+            type_args,
+            args,
+        } = &mut expression.kind
+            && type_args.is_empty()
+            && (self.lookup(name).is_some()
+                || self
+                    .context
+                    .constants
+                    .get(name.as_str())
+                    .is_some_and(|c| c.ty.call_signature().is_some()))
+        {
+            expression.kind = ExprKind::Invoke {
+                callee: Box::new(Expr::new(ExprKind::Name(std::mem::take(name)), span)),
+                args: std::mem::take(args),
+            };
+        }
+        // `value.field(args)` calls a function-valued field when no method exists.
+        if let ExprKind::MethodCall {
+            receiver,
+            name,
+            args,
+        } = &mut expression.kind
+            && qualified_name(receiver).is_none_or(|prefix| {
+                self.lookup(prefix.split('.').next().unwrap_or_default())
+                    .is_some()
+            })
+            && let Some(receiver_ty) = self.peek_type(receiver)
+            && let Type::Named(owner) = dereferenced(&receiver_ty)
+            && !self
+                .context
+                .functions
+                .contains_key(&format!("{owner}.{name}"))
+            && self.context.structs.get(owner).is_some_and(|s| {
+                s.fields
+                    .iter()
+                    .any(|f| f.name == *name && f.ty.callable_signature().is_some())
+            })
+        {
+            let base = std::mem::replace(receiver.as_mut(), Expr::new(ExprKind::Bool(false), span));
+            expression.kind = ExprKind::Invoke {
+                callee: Box::new(Expr::new(
+                    ExprKind::Field(Box::new(base), std::mem::take(name)),
+                    span,
+                )),
+                args: std::mem::take(args),
+            };
+        }
         // Module-qualified and associated calls have no receiver argument.
         if let ExprKind::MethodCall {
             receiver,
@@ -2328,6 +2480,19 @@ impl<'a> Checker<'a> {
                 args: lowered,
             };
         }
+        // A named function used as a value, such as `square` or `math.square`.
+        let mut function_value = None;
+        if matches!(expression.kind, ExprKind::Name(_) | ExprKind::Field(..))
+            && let Some(name) = qualified_name(expression)
+            && self
+                .lookup(name.split('.').next().unwrap_or_default())
+                .is_none()
+            && !self.context.constants.contains_key(&name)
+            && self.context.functions.contains_key(&name)
+        {
+            function_value = Some(self.function_value(&name, span)?);
+            expression.kind = ExprKind::Name(name);
+        }
         let mut result = match &mut expression.kind {
             ExprKind::Int(number, suffix) => {
                 let ty = suffix
@@ -2371,6 +2536,9 @@ impl<'a> Checker<'a> {
                     })?;
                 Value { ty, deps: vec![] }
             }
+            ExprKind::Name(_) if let Some(ty) = function_value.take() => Value { ty, deps: vec![] },
+            ExprKind::Closure(closure) => self.closure(closure, expected, span)?,
+            ExprKind::Invoke { callee, args } => self.invoke(callee, args, span)?,
             ExprKind::Name(_)
             | ExprKind::Field(..)
             | ExprKind::Index(..)
@@ -2386,6 +2554,9 @@ impl<'a> Checker<'a> {
                     return Ok(result);
                 }
                 let place = self.place(expression, true)?;
+                if expected.is_some_and(mutable_borrow) && mutable_borrow(&place.ty) {
+                    self.note_capture_mutation(&place.loans);
+                }
                 if expected.is_some_and(mutable_borrow)
                     && mutable_borrow(&place.ty)
                     && self.through_shared_reference(expression)
@@ -2417,6 +2588,17 @@ impl<'a> Checker<'a> {
                         variable.initialized = false;
                         variable.moved_at = Some(span);
                         variable.pending_result = false;
+                    } else if let Some(name) = place
+                        .loans
+                        .iter()
+                        .find_map(|loan| self.capture_roots.get(&loan.root))
+                        .filter(|_| matches!(&expression.kind, ExprKind::Unary(UnaryOp::Deref, inner) if matches!(inner.kind, ExprKind::Name(_))))
+                    {
+                        return Err(Diagnostic::new(
+                            span,
+                            format!("a closure cannot move captured `{name}`; closures capture bindings by reference"),
+                        )
+                        .note("pass the value to the closure as a parameter, or borrow it inside the closure"));
                     } else {
                         return Err(Diagnostic::new(span, "moving a non-copy field or indexed element is not supported").note("move the complete owned value, borrow the subobject, or call an explicit clone function"));
                     }
@@ -2424,7 +2606,12 @@ impl<'a> Checker<'a> {
                 Value { ty: place.ty, deps }
             }
             ExprKind::Constant(value, ty) => {
-                let value = self.expr(value, Some(ty), true)?;
+                // The constant's declaration was checked in its own package,
+                // including the visibility of the fields it initializes.
+                self.inlined_constant += 1;
+                let value = self.expr(value, Some(ty), true);
+                self.inlined_constant -= 1;
+                let value = value?;
                 self.expect(ty, &value.ty, span)?;
                 value
             }
@@ -2641,7 +2828,10 @@ impl<'a> Checker<'a> {
                         .ok_or_else(|| {
                             Diagnostic::new(expression.span, format!("unknown field `{name}`"))
                         })?;
-                    if !field.public && type_namespace(&declaration.name) != self.namespace {
+                    if !field.public
+                        && type_namespace(&declaration.name) != self.namespace
+                        && self.inlined_constant == 0
+                    {
                         return Err(Diagnostic::new(
                             expression.span,
                             format!("field `{name}` is private to its package"),
@@ -2862,6 +3052,23 @@ impl<'a> Checker<'a> {
                         ty: target.clone(),
                         deps,
                     }
+                } else if let (Type::Fn(p, r), Some((_, q, s))) =
+                    (&value.ty, target.closure_signature())
+                    && p.as_slice() == q
+                    && **r == *s
+                {
+                    Value {
+                        ty: target.clone(),
+                        deps: vec![],
+                    }
+                } else if let (Some((false, ..)), Some((true, ..))) =
+                    (value.ty.closure_signature(), target.closure_signature())
+                    && value.ty.callable_signature() == target.callable_signature()
+                {
+                    Value {
+                        ty: target.clone(),
+                        deps: value.deps,
+                    }
                 } else if matches!(&value.ty, Type::Raw(..)) && matches!(target, Type::Ref(..)) {
                     self.unsafe_required(span, "raw pointer to checked-reference conversion")?;
                     return Err(Diagnostic::new(
@@ -2900,6 +3107,13 @@ impl<'a> Checker<'a> {
                     Type::Result(_, expected_error) => {
                         self.error_conversion(expected_error, &error, span)?;
                     }
+                    Type::Unknown => {
+                        return Err(Diagnostic::new(
+                            span,
+                            "`?` in a closure requires a declared Result return type",
+                        )
+                        .note("write the result type, as in `fn(text: &str) -> i32!Error { ... }`, or pass the closure where its function type is expected"));
+                    }
                     _ => {
                         return Err(Diagnostic::new(
                             span,
@@ -2928,6 +3142,27 @@ impl<'a> Checker<'a> {
         // conversions remain explicit, and references never gain mutability.
         if let Some(expected) = expected {
             match (&result.ty, expected) {
+                // A closure that may mutate its captures never becomes shared.
+                (Type::Ref(true, t), Type::Ref(false, _))
+                    if matches!(t.as_ref(), Type::DynFn(..)) => {}
+                // A closure that only reads its captures may be called exclusively.
+                (Type::Ref(false, t), Type::Ref(true, u))
+                    if matches!(t.as_ref(), Type::DynFn(..)) && t == u =>
+                {
+                    result.ty = expected.clone();
+                }
+                // A function pointer is a closure with an empty environment.
+                (Type::Fn(p, r), Type::Ref(_, target)) if matches!(target.as_ref(), Type::DynFn(q, s) if p == q && r == s) =>
+                {
+                    expression.ty = result.ty.clone();
+                    let inner =
+                        std::mem::replace(expression, Expr::new(ExprKind::Bool(false), span));
+                    *expression =
+                        Expr::new(ExprKind::Cast(Box::new(inner), expected.clone()), span);
+                    // The environment is the function pointer itself: no borrow.
+                    result.ty = expected.clone();
+                    result.deps = vec![];
+                }
                 (Type::Ref(true, t), Type::Ref(false, u)) if t == u => {
                     result.ty = expected.clone();
                     for loan in &mut result.deps {
@@ -3076,7 +3311,19 @@ impl<'a> Checker<'a> {
             ExprKind::Name(n) => self
                 .lookup(n)
                 .map(|v| v.ty.clone())
-                .or_else(|| self.context.constants.get(n).map(|c| c.ty.clone())),
+                .or_else(|| self.context.constants.get(n).map(|c| c.ty.clone()))
+                .or_else(|| {
+                    self.context.functions.get(n).map(|f| {
+                        Type::Fn(
+                            f.params.iter().map(|p| p.ty.clone()).collect(),
+                            Box::new(f.ret.clone()),
+                        )
+                    })
+                }),
+            ExprKind::Closure(_) => None,
+            ExprKind::Invoke { callee, .. } => self
+                .peek_type(callee)
+                .and_then(|t| t.call_signature().map(|(_, r)| r.clone())),
             ExprKind::Array(t, _)
             | ExprKind::Cast(_, t)
             | ExprKind::Constant(_, t)
@@ -3355,6 +3602,12 @@ impl<'a> Checker<'a> {
             ExprKind::Unary(UnaryOp::Deref, operand) => {
                 let value = self.expr(operand, None, false)?;
                 match value.ty {
+                    Type::Ref(_, ty) if matches!(*ty, Type::DynFn(..)) => {
+                        return Err(Diagnostic::new(
+                            span,
+                            "a closure reference cannot be dereferenced; call it directly",
+                        ));
+                    }
                     Type::Ref(mutable, ty) => Place {
                         ty: *ty,
                         loans: value.deps,
@@ -5321,6 +5574,12 @@ fn validate_constant(expression: &Expr, bits: u32) -> Check<()> {
             }
         }
         ExprKind::String(..) => (),
+        // Named functions are link-time constant code addresses.
+        ExprKind::Name(_) | ExprKind::Closure(_)
+            if matches!(expression.ty, Type::Fn(..) | Type::Option(_)) => {}
+        ExprKind::Cast(e, Type::Ref(_, target)) if matches!(target.as_ref(), Type::DynFn(..)) => {
+            validate_constant(e, bits)?
+        }
         ExprKind::Constant(e, _) | ExprKind::Repeat(e, _) => validate_constant(e, bits)?,
         _ => {
             crate::consteval::eval(expression, bits)
@@ -5332,6 +5591,12 @@ fn validate_constant(expression: &Expr, bits: u32) -> Check<()> {
 fn constant_expression(expression: &Expr) -> bool {
     match &expression.kind {
         ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::String(..) => true,
+        ExprKind::Name(name) => {
+            name == "none" && matches!(expression.ty, Type::Option(_))
+                || matches!(expression.ty, Type::Fn(..))
+        }
+        // A closure without captures is a function pointer.
+        ExprKind::Closure(_) => matches!(expression.ty, Type::Fn(..)),
         ExprKind::Unary(UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot, e)
         | ExprKind::Cast(e, _)
         | ExprKind::Constant(e, _)

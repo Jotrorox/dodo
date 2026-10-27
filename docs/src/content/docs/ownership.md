@@ -19,8 +19,8 @@ files, strings, vectors, and other resources.
 
 | Category | Types | Assignment or by-value argument |
 | --- | --- | --- |
-| Copy | Numbers, `bool`, `&T`, `&[T]`, `&str`, raw pointers | Copies the value; the source remains usable. |
-| Move | Structs, arrays, enums, `Result`, `Option`, `&mut T`, `&mut [T]` | Transfers ownership or exclusive access; the source cannot be read afterward. |
+| Copy | Numbers, `bool`, `&T`, `&[T]`, `&str`, raw pointers, `fn(..)`, `&dyn fn(..)` | Copies the value; the source remains usable. |
+| Move | Structs, arrays, enums, `Result`, `Option`, `&mut T`, `&mut [T]`, `&mut dyn fn(..)` | Transfers ownership or exclusive access; the source cannot be read afterward. |
 
 A struct moves even when every field is copyable. A shared reference copies the
 reference, without copying its referent. `&str` is a string view and copies;
@@ -152,6 +152,33 @@ overlapping. Two different index expressions or slice ranges are not proof that
 their mutable borrows are disjoint. Use
 [`slice.split_at_mut`](slice-splitting.md) to obtain two checked independent
 mutable slices, then borrow their elements.
+
+## Closures borrow what they capture
+
+A [closure](types-and-functions.md#functions-are-values-and-closures-capture-locals)
+uses local variables by reference. Creating it borrows each captured variable:
+shared when the closure only reads it, exclusive when the closure changes it.
+The borrow lasts as long as the closure can still be called, exactly like a
+reference stored in a local.
+
+```dodo test
+package main
+
+fn main() {
+    count := 0i32
+    bump := fn() { count += 1 }
+    bump()
+    bump()
+    // `bump` is no longer used, so `count` is free again.
+    core.assert_eq(count, 2i32)
+}
+```
+
+Reading `count` between the two calls would be rejected, because `bump` still
+holds exclusive access to it. A closure also cannot move a captured value out,
+store a borrow into a captured variable, or be returned past the variables it
+captures. Closures that capture nothing are plain function pointers and carry
+no borrow at all.
 
 ## Borrows and returned references
 

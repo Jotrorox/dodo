@@ -15,7 +15,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
 | Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
-| Interrupts | `std/embedded/hal` | `hal.Critical`, a section that masks interrupts until it is dropped. |
+| Interrupts | `std/embedded/hal` | `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, and serial ports that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
@@ -530,6 +530,51 @@ nest. Reading or writing `static mut` storage is unsafe in Dodo: the critical
 section is what makes it correct, and the `unsafe` block marks the place where
 you rely on it. Keep sections short, and remember they never exclude other
 threads or other cores.
+
+### Handlers registered at run time
+
+A vector-table entry is fixed when the firmware is linked. To choose or change
+the work an interrupt does while the program runs, keep a function pointer in a
+`hal.Handler` slot and call it from the entry point:
+
+```dodo
+package firmware
+
+import "std/embedded/hal"
+
+static mut TIMER: hal.Handler = hal.NO_HANDLER
+static mut TICKS: u32 = 0
+
+fn count_tick() {
+    unsafe {
+        TICKS += 1
+    }
+}
+
+extern "C" fn TIMER_IRQ_0() {
+    unsafe {
+        TIMER.run()
+    }
+}
+
+extern "C" fn firmware_main() {
+    section := hal.Critical.enter()
+    unsafe {
+        TIMER.set(count_tick)
+    }
+    core.drop(section)
+}
+```
+
+`set` stores the handler, `clear` empties the slot, `is_set` reports whether
+one is stored, and `run` calls it and returns false when the slot is empty. A
+handler is a plain [function pointer](types-and-functions.md#functions-are-values-and-closures-capture-locals)
+`fn()`: it captures no local variables, so it stays valid for the whole program
+and keeps its state in `static mut` storage. Closures that capture locals are
+references to those locals and cannot be stored in a static. Change a slot that
+an interrupt can read inside a critical section, as above. The same pattern
+works for any table of callbacks a driver wants to select at run time, such as
+`[4]Option<fn(u32)>`.
 
 `cpu.wait_for_interrupt()` sleeps until an interrupt is pending, which is the
 usual idle loop. `cpu.fence()` is a full hardware memory barrier, for example
