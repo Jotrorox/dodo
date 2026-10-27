@@ -122,8 +122,9 @@ OPTIONS response or trailing-slash redirect.
 
 The fluent builder stores up to eight routes (`application.ROUTE_CAPACITY`).
 Handlers are owned inline, retain state between requests, and use ordinary
-compiler-checked methods. Dodo currently has no closures or function values;
-large generic chains are costly to compile. Larger tables can use `web.Router`
+compiler-checked methods. Handlers are values rather than closures because a
+closure only borrows its captured locals and cannot be stored in a long-lived
+application; large generic chains are costly to compile. Larger tables can use `web.Router`
 and an explicit dispatcher. Route patterns and handler borrows must outlive the
 application. No request/response borrow can escape into handler state.
 

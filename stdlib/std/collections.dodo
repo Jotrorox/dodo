@@ -3,7 +3,8 @@ package collections
 import "core/mem"
 import "core/ptr"
 
-// Policies use statically resolved methods, without traits or function objects.
+// Policies use statically resolved methods; the closure forms at the end take a
+// closure reference instead.
 // compare(&T,&T) returns negative/zero/positive; equal(&T,&T) returns bool.
 pub struct I32 {
     pub fn compare(&self, a: &i32, b: &i32) -> i32 {
@@ -191,4 +192,150 @@ pub fn partition<T, P>(data: &mut[T], predicate: &P) -> usize {
         }
     }
     return boundary
+}
+
+// Closure forms of the algorithms above. The comparison or predicate is a
+// closure reference, so it may read or update captured locals; a named
+// function works too. `compare(a, b)` returns negative, zero, or positive,
+// and only its sign matters. Costs match the policy forms.
+fn sift_by<T>(data: &mut[T], start: usize, end: usize, compare: &mut dyn fn(&T, &T) -> i32) {
+    root := start
+    for root < end / 2 {
+        child := root * 2 + 1
+        if child + 1 < end && compare(&data[child], &data[child + 1]) < 0 {
+            child = child + 1
+        }
+        if compare(&data[root], &data[child]) >= 0 {
+            return
+        }
+        swap::<T>(data, root, child)
+        root = child
+    }
+}
+// In-place heapsort: O(n log n) worst case, O(1) storage, unstable.
+pub fn sort_by<T>(data: &mut[T], compare: &mut dyn fn(&T, &T) -> i32) {
+    start := data.len / 2
+    for start != 0 {
+        start = start - 1
+        sift_by::<T>(data, start, data.len, compare)
+    }
+    end := data.len
+    for end > 1 {
+        end = end - 1
+        swap::<T>(data, 0, end)
+        sift_by::<T>(data, 0, end, compare)
+    }
+}
+// Stable insertion sort: O(n²) worst case; O(n) for sorted input.
+pub fn stable_sort_by<T>(data: &mut[T], compare: &mut dyn fn(&T, &T) -> i32) {
+    for i in 1usize..data.len {
+        j := i
+        for j > 0 && compare(&data[j], &data[j - 1]) < 0 {
+            swap::<T>(data, j, j - 1)
+            j = j - 1
+        }
+    }
+}
+pub fn is_sorted_by<T>(data: &[T], compare: &mut dyn fn(&T, &T) -> i32) -> bool {
+    for i in 1usize..data.len {
+        if compare(&data[i - 1], &data[i]) > 0 {
+            return false
+        }
+    }
+    return true
+}
+// `probe(element)` compares one element with the sought key: negative when the
+// element sorts before it, zero when equal. Returns the first equal index.
+pub fn binary_search_by<T>(data: &[T], probe: &mut dyn fn(&T) -> i32) -> Option<usize> {
+    left := 0usize
+    right := data.len
+    for left < right {
+        middle := left + (right - left) / 2
+        if probe(&data[middle]) < 0 {
+            left = middle + 1
+        } else {
+            right = middle
+        }
+    }
+    if left < data.len && probe(&data[left]) == 0 {
+        return some(left)
+    }
+    return none
+}
+// True values precede false values. Returns the boundary; unstable.
+pub fn partition_by<T>(data: &mut[T], test: &mut dyn fn(&T) -> bool) -> usize {
+    boundary := 0usize
+    for i in 0usize..data.len {
+        if test(&data[i]) {
+            swap::<T>(data, boundary, i)
+            boundary = boundary + 1
+        }
+    }
+    return boundary
+}
+// The index of the first element for which `test` is true.
+pub fn position<T>(data: &[T], test: &mut dyn fn(&T) -> bool) -> Option<usize> {
+    for i in 0usize..data.len {
+        if test(&data[i]) {
+            return some(i)
+        }
+    }
+    return none
+}
+// Stops at the first element for which `test` is true.
+pub fn any<T>(data: &[T], test: &mut dyn fn(&T) -> bool) -> bool {
+    for value in data {
+        if test(value) {
+            return true
+        }
+    }
+    return false
+}
+// Stops at the first element for which `test` is false.
+pub fn all<T>(data: &[T], test: &mut dyn fn(&T) -> bool) -> bool {
+    for value in data {
+        if !test(value) {
+            return false
+        }
+    }
+    return true
+}
+pub fn count<T>(data: &[T], test: &mut dyn fn(&T) -> bool) -> usize {
+    total := 0usize
+    for value in data {
+        if test(value) {
+            total = total + 1
+        }
+    }
+    return total
+}
+pub fn for_each<T>(data: &[T], visit: &mut dyn fn(&T)) {
+    for value in data {
+        visit(value)
+    }
+}
+pub fn for_each_mut<T>(data: &mut[T], visit: &mut dyn fn(&mut T)) {
+    for value in data {
+        visit(value)
+    }
+}
+// Writes transform(input[i]) to output[i], replacing (and destroying) the old
+// value, for each index both slices have. Returns that count.
+pub fn map<T, U>(input: &[T], output: &mut[U], transform: &mut dyn fn(&T) -> U) -> usize {
+    length := input.len
+    if output.len < length {
+        length = output.len
+    }
+    for i in 0usize..length {
+        output[i] = transform(&input[i])
+    }
+    return length
+}
+// Combines the elements from first to last, starting with `initial`.
+pub fn fold<T, A>(data: &[T], initial: A, combine: &mut dyn fn(A, &T) -> A) -> A {
+    accumulator := initial
+    for value in data {
+        accumulator = combine(accumulator, value)
+    }
+    return accumulator
 }

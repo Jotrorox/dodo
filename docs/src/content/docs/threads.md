@@ -59,7 +59,8 @@ environment, and synchronization imports. Unsupported hosted targets produce a
 build diagnostic. No scheduler or global Dodo allocator is installed.
 
 Tasks are ordinary values with a public `run` method. Dodo statically dispatches
-that method; closures are not assumed. Both the task type and its method must
+that method. Closures cannot be tasks: they borrow the locals they capture,
+and those borrows cannot move to another thread. Both the task type and its method must
 be public so the standard package can call them. Ownership moves into the
 worker, and the return value moves back through `join`. For a task without data
 to return, use `thread.Unit` instead of `void`.

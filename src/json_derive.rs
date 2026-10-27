@@ -513,6 +513,19 @@ fn remap_expr(expression: &mut Expr, span: Span) {
                 remap_expr(value, span);
             }
         }
+        ExprKind::Closure(closure) => {
+            for param in &mut closure.params {
+                param.span = span;
+            }
+            closure.ret_span = span;
+            remap_block(&mut closure.body, span);
+        }
+        ExprKind::Invoke { callee, args } => {
+            remap_expr(callee, span);
+            for argument in args {
+                remap_expr(argument, span);
+            }
+        }
         _ => {}
     }
 }

@@ -758,8 +758,38 @@ impl Parser {
         if self.eat("void") {
             return Ok(Type::Void);
         }
-        if self.eat("dyn") {
+        let callable = self.at("dyn") && self.look(1, "fn");
+        if !callable && self.eat("dyn") {
             return Ok(Type::Dyn(self.qualified_name()?));
+        }
+        if callable {
+            self.bump();
+        }
+        if self.eat("fn") {
+            self.expect("(")?;
+            self.newlines();
+            let mut params = Vec::new();
+            while !self.eat(")") {
+                params.push(self.ty()?);
+                self.newlines();
+                if self.eat(",") {
+                    self.newlines();
+                } else {
+                    self.expect(")")?;
+                    break;
+                }
+            }
+            let ret = if self.eat("->") {
+                self.newlines();
+                self.ty()?
+            } else {
+                Type::Void
+            };
+            return Ok(if callable {
+                Type::DynFn(params, Box::new(ret))
+            } else {
+                Type::Fn(params, Box::new(ret))
+            });
         }
         let start = self.span();
         let name = self.qualified_name()?;
@@ -1215,6 +1245,7 @@ impl Parser {
             requires_plain,
             body,
             span: self.since(start),
+            environment: None,
         })
     }
     fn constant(&mut self, public: bool, start: usize) -> ParseResult<Constant> {
@@ -2051,10 +2082,14 @@ impl Parser {
                     }
                 }
             }
+            _ if type_args.is_empty() => ExprKind::Invoke {
+                callee: Box::new(callee),
+                args,
+            },
             _ => {
                 return Err(Diagnostic::new(
                     callee.span,
-                    "only named functions and methods can be called; Dodo has no function values",
+                    "type arguments require a named generic function",
                 ));
             }
         };
@@ -2147,6 +2182,7 @@ impl Parser {
             TokenKind::Ident(name) if name == "true" || name == "false" => {
                 ExprKind::Bool(name == "true")
             }
+            TokenKind::Ident(name) if name == "fn" => self.closure()?,
             TokenKind::Ident(name) if !reserved(&name) => {
                 if name == "Self" && self.self_type.is_none() {
                     return Err(Diagnostic::new(
@@ -2208,6 +2244,60 @@ impl Parser {
             _ => return Err(Diagnostic::new(token.span, "expected an expression")),
         };
         Ok(Expr::new(kind, self.since(start)))
+    }
+    /// `fn(a, b: T) -> R { body }` after its `fn` keyword. Omitted parameter
+    /// and result types come from the expected type during checking.
+    fn closure(&mut self) -> ParseResult<ExprKind> {
+        self.expect("(")?;
+        self.soft_newlines += 1;
+        self.newlines();
+        let mut params = Vec::new();
+        while !self.eat(")") {
+            let param_start = self.span().start;
+            let name = self.identifier()?;
+            let ty = if self.eat(":") {
+                self.newlines();
+                self.ty()?
+            } else {
+                Type::Unknown
+            };
+            params.push(Param {
+                name,
+                ty,
+                span: self.since(param_start),
+            });
+            self.newlines();
+            if self.eat(",") {
+                self.newlines();
+            } else {
+                self.expect(")")?;
+                break;
+            }
+        }
+        self.soft_newlines -= 1;
+        let ret_start = self.span().start;
+        let ret = if self.eat("->") {
+            self.newlines();
+            self.ty()?
+        } else {
+            Type::Unknown
+        };
+        let ret_span = self.since(ret_start);
+        // Closure bodies are statement blocks, even inside a parenthesized
+        // argument list where newlines would otherwise be insignificant.
+        let soft = std::mem::replace(&mut self.soft_newlines, 0);
+        let body = self.block();
+        self.soft_newlines = soft;
+        let mut body = body?;
+        self.lower_tail(&mut body, false);
+        Ok(ExprKind::Closure(Box::new(Closure {
+            params,
+            ret,
+            ret_span,
+            body,
+            function: String::new(),
+            captures: Vec::new(),
+        })))
     }
     fn array_literal(&mut self, start: usize) -> ParseResult<Expr> {
         self.cursor -= 1;
@@ -2667,6 +2757,56 @@ mod tests {
             arms.iter()
                 .all(|arm| matches!(arm.body.last().unwrap().kind, StmtKind::Yield(_)))
         );
+    }
+    #[test]
+    fn function_types_closures_and_value_calls() {
+        let program = parse(
+            "package p\nfn f(g: fn(i32, &u8) -> bool, h: &mut dyn fn(), k: &fn() -> u8!E) {\n\
+             c := fn(a, b: u32) -> u32 { a + b }\n\
+             d := fn() { total += 1; }\n\
+             (table[0])(1)\n\
+             c(1, 2)\n\
+             }\n",
+        )
+        .unwrap();
+        let params = &program.functions[0].params;
+        assert_eq!(params[0].ty.to_string(), "fn(i32, &u8) -> bool");
+        assert_eq!(params[1].ty.to_string(), "&mut dyn fn()");
+        // A function pointer's result type includes `!E`; `&fn` is a plain reference.
+        assert_eq!(params[2].ty.to_string(), "&fn() -> Result<u8, E>");
+        let body = program.functions[0].body.as_ref().unwrap();
+        let StmtKind::Let { value: Some(c), .. } = &body[0].kind else {
+            panic!("expected a binding");
+        };
+        let ExprKind::Closure(closure) = &c.kind else {
+            panic!("expected a closure");
+        };
+        assert_eq!(closure.params[0].ty, Type::Unknown);
+        assert_eq!(closure.params[1].ty.to_string(), "u32");
+        assert!(matches!(closure.body[0].kind, StmtKind::Yield(_)));
+        let StmtKind::Let { value: Some(d), .. } = &body[1].kind else {
+            panic!("expected a binding");
+        };
+        let ExprKind::Closure(discarded) = &d.kind else {
+            panic!("expected a closure");
+        };
+        assert_eq!(discarded.ret, Type::Unknown);
+        assert!(matches!(discarded.body[0].kind, StmtKind::Assign { .. }));
+        assert!(matches!(
+            &body[2].kind,
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Invoke { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            &body[3].kind,
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { .. },
+                ..
+            })
+        ));
+        assert!(parse("package p\nfn f() { (table[0])::<u8>(1) }\n").is_err());
     }
     #[test]
     fn function_tails_return_values_and_semicolons_discard_them() {

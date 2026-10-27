@@ -1167,6 +1167,12 @@ impl Names<'_> {
                 self.scoped_ty(ok, locals, generics);
                 self.scoped_ty(error, locals, generics);
             }
+            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+                for ty in params {
+                    self.scoped_ty(ty, locals, generics);
+                }
+                self.scoped_ty(ret, locals, generics);
+            }
             _ => {}
         }
     }
@@ -1231,6 +1237,21 @@ impl Names<'_> {
                 self.expr(base, locals, generics);
                 for value in start.iter_mut().chain(end) {
                     self.expr(value, locals, generics);
+                }
+            }
+            ExprKind::Closure(closure) => {
+                let mut inner = locals.clone();
+                for param in &mut closure.params {
+                    self.scoped_ty(&mut param.ty, locals, generics);
+                    inner.insert(param.name.clone());
+                }
+                self.scoped_ty(&mut closure.ret, locals, generics);
+                self.block(&mut closure.body, &mut inner, generics);
+            }
+            ExprKind::Invoke { callee, args } => {
+                self.expr(callee, locals, generics);
+                for argument in args {
+                    self.expr(argument, locals, generics);
                 }
             }
             _ => {}
@@ -1478,6 +1499,19 @@ fn shift_expr(expression: &mut Expr, offset: usize) {
             shift_expr(base, offset);
             for value in start.iter_mut().chain(end) {
                 shift_expr(value, offset);
+            }
+        }
+        ExprKind::Closure(closure) => {
+            for param in &mut closure.params {
+                shift(&mut param.span, offset);
+            }
+            shift(&mut closure.ret_span, offset);
+            shift_block(&mut closure.body, offset);
+        }
+        ExprKind::Invoke { callee, args } => {
+            shift_expr(callee, offset);
+            for argument in args {
+                shift_expr(argument, offset);
             }
         }
         _ => {}

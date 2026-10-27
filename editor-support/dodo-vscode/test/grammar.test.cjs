@@ -47,6 +47,14 @@ test("declarations, borrowing, attributes, and generic calls", () => {
   hasScope("assert_eq(main(), 0)", "assert_eq", "support.function.builtin.dodo");
 });
 
+test("function types and closure literals", () => {
+  hasScope("fn each(visit: &mut dyn fn(i32)) {", "dyn", "storage.modifier.dodo");
+  hasScope("fn each(visit: &mut dyn fn(i32)) {", "fn(i32)", "storage.type.dodo");
+  hasScope("handler: fn() -> u32", "fn", "storage.type.dodo");
+  hasScope("sort_by(&mut v, fn(a, b) { *a - *b })", "fn(a", "storage.type.dodo");
+  hasScope("sort_by(&mut v, fn(a, b) { *a - *b })", "sort_by", "entity.name.function.dodo");
+});
+
 test("numeric bases, suffixes, and ranges keep their boundaries", () => {
   for (const number of ["0xffu8", "0o77", "0b1010u32", "1_000usize", "42i64"]) {
     hasScope(number, number, "constant.numeric.integer.dodo");
