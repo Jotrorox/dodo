@@ -4,7 +4,7 @@
 //! based on future uses, extended across loop back edges and custom destruction.
 //! This is an intentionally conservative checker, not a formal safety proof.
 use crate::ast::*;
-use crate::diagnostic::{Diagnostic, DiagnosticBinding, DiagnosticKind};
+use crate::diagnostic::{Diagnostic, DiagnosticBinding, DiagnosticKind, MissingErrorVariant};
 use std::collections::{HashMap, HashSet};
 
 mod closures;
@@ -17,7 +17,7 @@ mod slices;
 mod storage;
 mod uses;
 
-use generics::{instantiate, intrinsic_result_type};
+use generics::{instantiate, intrinsic_result_type, source_spelling};
 #[cfg(feature = "llvm")]
 pub(crate) use interfaces::flattened_interfaces;
 pub(crate) use interfaces::signature_text as interface_signature;
@@ -1067,6 +1067,116 @@ impl<'a> Checker<'a> {
             Ok(())
         }
     }
+    /// Every loan in a returned value must come from the return contract.
+    fn check_returned_borrows(&self, deps: &[Loan], return_span: Span) -> Check<()> {
+        for loan in deps {
+            match &loan.external {
+                Some(source)
+                    if self.from.contains(source)
+                        || source == "static"
+                        || source
+                            .strip_suffix(".stored")
+                            .is_some_and(|s| self.from.iter().any(|f| f == s)) => {}
+                Some(source) => {
+                    let source_span = self.scopes[0]
+                        .iter()
+                        .find(|variable| &variable.name == source)
+                        .map_or(loan.origin, |variable| variable.span);
+                    return Err(self.label_return_contract(
+                        Diagnostic::new(
+                            return_span,
+                            format!(
+                                "returned borrow depends on `{source}`, outside the return contract"
+                            ),
+                        )
+                        .primary_label(format!("returned borrow comes from `{source}`"))
+                        .label(
+                            source_span,
+                            format!("borrowed source `{source}` is declared here"),
+                        ),
+                    ));
+                }
+                None => {
+                    let mut diagnostic =
+                        Diagnostic::new(return_span, "cannot return a borrow of a local value")
+                            .primary_label("local value does not live long enough to be returned")
+                            .label(loan.origin, "local borrow begins here");
+                    if let Some(source) = self.by_id(loan.root) {
+                        diagnostic = diagnostic.label(
+                            source.span,
+                            format!("local value `{}` is declared here", source.name),
+                        );
+                    }
+                    return Err(self.label_return_contract(diagnostic));
+                }
+            }
+        }
+        Ok(())
+    }
+    /// `?` propagates a `source` error from a function returning `target`
+    /// errors by wrapping it in the one `target` variant carrying a `source`.
+    fn error_conversion(&self, target_type: &Type, source_type: &Type, span: Span) -> Check<()> {
+        let target = source_spelling(&target_type.to_string());
+        let source = source_spelling(&source_type.to_string());
+        let message = format!(
+            "`?` cannot convert error type `{source}` to the enclosing function's error type `{target}`"
+        );
+        let Type::Named(name) = target_type else {
+            return Err(Diagnostic::new(span, message).note(
+                "`?` converts errors only into an enum with a variant whose single payload is the propagated error; match the Result to translate it explicitly",
+            ));
+        };
+        let Some(declaration) = self.context.enums.get(name) else {
+            return Err(Diagnostic::new(span, message).note(format!(
+                "`?` converts errors only into an enum; `{target}` is not one, so match the Result to translate the error explicitly"
+            )));
+        };
+        match declaration.wrapping_variants(source_type).as_slice() {
+            [_] => Ok(()),
+            [] => {
+                let mut diagnostic = Diagnostic::new(span, message)
+                    .label(
+                        declaration.span,
+                        format!("`{target}` has no variant carrying `{source}`"),
+                    )
+                    .note(format!(
+                        "add a variant such as `Wrapped({source})` to `{target}`, or match the Result to translate the error explicitly"
+                    ));
+                // A specialization's variants come from its generic template.
+                if !name.contains('$') {
+                    diagnostic = diagnostic.with_kind(DiagnosticKind::MissingErrorVariant(
+                        Box::new(MissingErrorVariant {
+                            declaration: declaration.span,
+                            source: source.clone(),
+                            variants: declaration
+                                .variants
+                                .iter()
+                                .map(|v| v.name.clone())
+                                .collect(),
+                        }),
+                    ));
+                }
+                Err(diagnostic)
+            }
+            variants => {
+                let mut diagnostic = Diagnostic::new(
+                    span,
+                    format!(
+                        "`?` cannot choose which `{target}` variant wraps error type `{source}`"
+                    ),
+                );
+                for variant in variants {
+                    diagnostic = diagnostic.label(
+                        variant.span,
+                        format!("`{target}.{}` carries `{source}`", variant.name),
+                    );
+                }
+                Err(diagnostic.note(
+                    "`?` wraps an error only when exactly one variant carries it; match the Result and construct the intended variant",
+                ))
+            }
+        }
+    }
     fn unsafe_required(&self, span: Span, operation: &str) -> Check<()> {
         if self.unsafe_depth == 0 {
             Err(Diagnostic::new(
@@ -1617,47 +1727,7 @@ impl<'a> Checker<'a> {
                     self.expect(&expected, &value.ty, span)?;
                 }
                 if self.context.carries_borrow(&value.ty) {
-                    for loan in &value.deps {
-                        match &loan.external {
-                            Some(source)
-                                if self.from.contains(source)
-                                    || source == "static"
-                                    || source
-                                        .strip_suffix(".stored")
-                                        .is_some_and(|s| self.from.iter().any(|f| f == s)) => {}
-                            Some(source) => {
-                                let source_span = self.scopes[0]
-                                    .iter()
-                                    .find(|variable| &variable.name == source)
-                                    .map_or(loan.origin, |variable| variable.span);
-                                return Err(self.label_return_contract(Diagnostic::new(
-                                    return_span,
-                                    format!(
-                                        "returned borrow depends on `{source}`, outside the return contract"
-                                    ),
-                                )
-                                .primary_label(format!("returned borrow comes from `{source}`"))
-                                .label(source_span, format!("borrowed source `{source}` is declared here"))));
-                            }
-                            None => {
-                                let mut diagnostic = Diagnostic::new(
-                                    return_span,
-                                    "cannot return a borrow of a local value",
-                                )
-                                .primary_label(
-                                    "local value does not live long enough to be returned",
-                                )
-                                .label(loan.origin, "local borrow begins here");
-                                if let Some(source) = self.by_id(loan.root) {
-                                    diagnostic = diagnostic.label(
-                                        source.span,
-                                        format!("local value `{}` is declared here", source.name),
-                                    );
-                                }
-                                return Err(self.label_return_contract(diagnostic));
-                            }
-                        }
-                    }
+                    self.check_returned_borrows(&value.deps, return_span)?;
                 }
                 self.check_pending_all(span)?;
                 return Ok(true);
@@ -3034,11 +3104,8 @@ impl<'a> Checker<'a> {
                 };
                 match &self.return_ty {
                     Type::Result(_, expected_error) if **expected_error == error => (),
-                    Type::Result(..) => {
-                        return Err(Diagnostic::new(
-                            span,
-                            "`?` error type differs from the enclosing function's error type",
-                        ));
+                    Type::Result(_, expected_error) => {
+                        self.error_conversion(expected_error, &error, span)?;
                     }
                     Type::Unknown => {
                         return Err(Diagnostic::new(
@@ -3053,6 +3120,11 @@ impl<'a> Checker<'a> {
                             "`?` requires an enclosing function returning Result",
                         ));
                     }
+                }
+                // The error path returns the operand's error. Its loans are not
+                // separated from the success payload's, so check all of them.
+                if self.context.carries_borrow(&error) {
+                    self.check_returned_borrows(&value.deps, span)?;
                 }
                 self.check_pending_all(span)?;
                 Value {
@@ -6314,10 +6386,49 @@ mod tests {
         );
     }
     #[test]
-    fn error_propagation_requires_same_error() {
+    fn error_propagation_requires_a_wrapping_variant() {
         rejects(
             "enum A { Bad }\nenum B { Bad }\nfn a() -> u8!A { return ok(1) }\nfn b() -> u8!B {\n x := a()?\n return ok(x)\n}",
-            "error type differs",
+            "cannot convert error type `A` to the enclosing function's error type `B`",
+        );
+        rejects(
+            "enum A { Bad }\nfn a() -> u8!A { return ok(1) }\nfn b() -> u8!u32 { return ok(a()?) }",
+            "cannot convert error type `A`",
+        );
+        rejects(
+            "struct A { u8 n }\nstruct B { u8 n }\nfn a() -> u8!A { return ok(1) }\nfn b() -> u8!B { return ok(a()?) }",
+            "cannot convert error type `A`",
+        );
+        rejects(
+            "enum A { Bad }\nenum B { First(A), Second(A) }\nfn a() -> u8!A { return ok(1) }\nfn b() -> u8!B { return ok(a()?) }",
+            "cannot choose which `B` variant wraps error type `A`",
+        );
+        // Only a variant whose single payload is the error wraps it.
+        rejects(
+            "enum A { Bad }\nenum B { Pair(A, u8) }\nfn a() -> u8!A { return ok(1) }\nfn b() -> u8!B { return ok(a()?) }",
+            "cannot convert",
+        );
+        rejects(
+            "enum A { Bad }\nenum B { Maybe(Option<A>) }\nfn a() -> u8!A { return ok(1) }\nfn b() -> u8!B { return ok(a()?) }",
+            "cannot convert",
+        );
+        // Specializations are named as written.
+        rejects(
+            "enum A { Bad }\nenum W<T> { Other(T) }\nfn a() -> u8!A { return ok(1) }\nfn b() -> u8!W<W<u8>> { return ok(a()?) }",
+            "error type `W<W<u8>>`",
+        );
+    }
+    #[test]
+    fn error_propagation_wraps_in_the_carrying_variant() {
+        accepts(
+            "enum A { Bad }\nenum C { Worse }\nenum B { Plain, FromA(A), FromC(C c), Code(u32) }\nfn a() -> u8!A { return ok(1) }\nfn c() -> void!C { return ok() }\nfn b() -> u8!B {\n x := a()?\n c()?\n return ok(x)\n}",
+        );
+        // Nested propagation converts each layer independently.
+        accepts(
+            "enum A { Bad }\nenum B { FromA(A) }\nfn f(r: Result<Result<u8, A>, B>) -> u8!B { return ok(r??) }",
+        );
+        accepts(
+            "enum A { Bad }\nenum B<T> { Wrapped(T) }\nfn a() -> u8!A { return ok(1) }\nfn b() -> u8!B<A> { return ok(a()?) }",
         );
     }
     #[test]

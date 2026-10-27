@@ -39,6 +39,18 @@ pub struct DiagnosticBinding {
     pub usage: Span,
 }
 
+/// An error enum that `?` cannot wrap a propagated error in, because no
+/// variant carries it. Spans use the diagnostic's byte offsets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingErrorVariant {
+    /// The enum's declaration, from its keyword through its closing brace.
+    pub declaration: Span,
+    /// The propagated error type, as printed in diagnostics.
+    pub source: String,
+    /// The enum's existing variant names.
+    pub variants: Vec<String>,
+}
+
 /// Machine-readable meaning, independent of the diagnostic's displayed text.
 /// Payloads are boxed to keep recursive parser results compact. Names may be
 /// qualified; binding metadata is absent for indirect storage such as fields
@@ -55,6 +67,7 @@ pub enum DiagnosticKind {
     UnknownStruct(Box<str>),
     UnknownVariant(Box<str>),
     UnresolvedReceiver(Option<Box<str>>),
+    MissingErrorVariant(Box<MissingErrorVariant>),
 }
 
 impl DiagnosticKind {
@@ -71,6 +84,7 @@ impl DiagnosticKind {
             Self::UnknownStruct(_) => "unknown-struct",
             Self::UnknownVariant(_) => "unknown-variant",
             Self::UnresolvedReceiver(_) => "unresolved-receiver",
+            Self::MissingErrorVariant(_) => "missing-error-variant",
         })
     }
 }

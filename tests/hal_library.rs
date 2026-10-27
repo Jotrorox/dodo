@@ -113,6 +113,18 @@ fn sensor_example_tests_pass_against_fakes() {
 }
 
 #[test]
+fn sensor_log_example_propagates_bus_and_stream_errors() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = dodo(&["test"], &root.join("examples/sensor_log.dodo"));
+    success(&output, "test examples/sensor_log.dodo");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("3 passed"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn interrupt_control_lowers_to_each_architecture_mask() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("lowering");

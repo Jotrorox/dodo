@@ -510,6 +510,117 @@ fn main() {
 }
 
 #[test]
+fn propagation_wraps_errors_in_the_carrying_variant() {
+    let source = format!(
+        "package error_conversion\n{DROP_TYPE}\n{}",
+        r#"enum ParseError { Digit(u8) }
+enum AppError { Plain, Parse(ParseError), Owned(Guard), Code(i32) }
+enum Wrapper<T> { Inner(T) }
+fn digit(byte: u8) -> u8!ParseError {
+    if byte < b'0' || byte > b'9' {
+        return err(ParseError.Digit(byte))
+    }
+    ok(byte - b'0')
+}
+fn parse(high: u8, low: u8) -> u8!AppError { ok(digit(high)? * 10 + digit(low)?) }
+fn guarded(fail: bool) -> i32!Guard {
+    if fail {
+        return err(Guard{character: 69})
+    }
+    ok(1)
+}
+// The local is destroyed on both paths; the owned error moves into the
+// returned variant and is destroyed once, by the caller.
+fn owned(fail: bool) -> i32!AppError {
+    local := Guard{character: 76}
+    ok(guarded(fail)?)
+}
+fn code(fail: bool) -> void!i32 {
+    if fail {
+        return err(7)
+    }
+    ok()
+}
+fn void_success(fail: bool) -> void!AppError {
+    code(fail)?
+    ok()
+}
+fn nested(r: Result<Result<u8, ParseError>, AppError>) -> u8!AppError { ok(r??) }
+fn generic(byte: u8) -> u8!Wrapper<ParseError> { ok(digit(byte)?) }
+fn main() -> i32 {
+    assert_eq(parse(b'4', b'2')!, 42u8)
+    match parse(b'4', b'x') {
+        ok(_) => { return 1 },
+        err(AppError.Parse(ParseError.Digit(byte))) => { assert_eq(byte, b'x') },
+        err(_) => { return 2 },
+    }
+    assert_eq(owned(false)!, 1)
+    match owned(true) {
+        ok(_) => { return 3 },
+        err(AppError.Owned(guard)) => { assert_eq(guard.character, 69) },
+        err(_) => { return 4 },
+    }
+    void_success(false)!
+    match void_success(true) {
+        ok() => { return 5 },
+        err(AppError.Code(value)) => { assert_eq(value, 7) },
+        err(_) => { return 6 },
+    }
+    assert_eq(nested(ok(ok(9)))!, 9u8)
+    match nested(ok(err(ParseError.Digit(b'y')))) {
+        ok(_) => { return 7 },
+        err(AppError.Parse(ParseError.Digit(byte))) => { assert_eq(byte, b'y') },
+        err(_) => { return 8 },
+    }
+    match nested(err(AppError.Plain)) {
+        ok(_) => { return 9 },
+        err(AppError.Plain) => {},
+        err(_) => { return 10 },
+    }
+    assert_eq(generic(b'3')!, 3u8)
+    match generic(b'z') {
+        ok(_) => { return 11 },
+        err(Wrapper.Inner(ParseError.Digit(byte))) => { assert_eq(byte, b'z') },
+    }
+    0
+}
+"#
+    );
+    native_at_all_levels(&source, 0, "LLE");
+}
+
+#[test]
+fn propagation_conversion_rejects_missing_ambiguous_and_escaping_errors() {
+    for (source, message) in [
+        (
+            "enum A { Bad }\nenum B { Other }\nfn a() -> u8!A { ok(1) }\nfn f() -> u8!B { ok(a()?) }",
+            "`B` has no variant carrying `A`",
+        ),
+        (
+            "enum A { Bad }\nenum B { First(A), Second(A) }\nfn a() -> u8!A { ok(1) }\nfn f() -> u8!B { ok(a()?) }",
+            "`B.Second` carries `A`",
+        ),
+        (
+            "enum A { Bad }\nfn a() -> u8!A { ok(1) }\nfn f() -> u8!i32 { ok(a()?) }",
+            "cannot convert error type `A` to the enclosing function's error type `i32`",
+        ),
+        (
+            "fn view(x: &i32) -> u8!&i32 from(x) { err(x) }\nfn f() -> u8!&i32 from(static) {\nx := 1i32\nok(view(&x)?)\n}",
+            "cannot return a borrow of a local value",
+        ),
+        (
+            "enum W { R(&i32) }\nfn view(x: &i32) -> u8!&i32 from(x) { err(x) }\nfn f() -> u8!W from(static) {\nx := 1i32\nok(view(&x)?)\n}",
+            "cannot return a borrow of a local value",
+        ),
+    ] {
+        rejects(
+            &format!("package main\n{source}\nfn main() {{}}\n"),
+            message,
+        );
+    }
+}
+
+#[test]
 fn postfix_unwrap_rejects_invalid_types_moves_and_borrows() {
     for (source, message) in [
         ("fn f() { 1! }", "postfix `!` requires a Result"),

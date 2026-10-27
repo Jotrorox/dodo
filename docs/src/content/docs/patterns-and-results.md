@@ -79,13 +79,73 @@ fn main() {
 ```
 
 If the first digit fails, the second call never executes. Locals already created
-receive normal cleanup. The enclosing function must return a Result with the
-**same error type**; Dodo does not insert error conversions. To translate errors,
-match the original error and construct a new error explicitly.
+receive normal cleanup. The enclosing function must return a Result whose error
+type is the same as the operand's, or an enum that wraps it, as the next section
+describes.
 
 A fallible operation with no success payload returns `void!E` and succeeds with
 `ok()`. `operation()?` performs it and continues without binding a value.
 `?` applies to Results, not to Options.
+
+## Combine error types
+
+A function that calls operations with different error types, such as an I/O
+stream and a device driver, declares an enum with one variant per source. `?`
+wraps an error in the variant whose single payload has its type:
+
+```dodo test
+package main
+
+enum ParseError { NotADigit }
+enum RangeError { TooLarge(u32) }
+
+enum InputError {
+    Parse(ParseError),
+    Range(RangeError),
+}
+
+fn digit(byte: u8) -> u32!ParseError {
+    if byte < b'0' || byte > b'9' {
+        return err(ParseError.NotADigit)
+    }
+    ok((byte - b'0') as u32)
+}
+
+fn at_most(value: u32, limit: u32) -> u32!RangeError {
+    if value > limit {
+        return err(RangeError.TooLarge(value))
+    }
+    ok(value)
+}
+
+fn percentage(high: u8, low: u8) -> u32!InputError {
+    value := digit(high)? * 10 + digit(low)?
+    ok(at_most(value, 100)?)
+}
+
+fn main() {
+    core.assert_eq(percentage(b'4', b'2')!, 42u32)
+    match percentage(b'4', b'x') {
+        ok(_) => { core.assert(false) },
+        err(InputError.Parse(ParseError.NotADigit)) => {},
+        err(InputError.Range(_)) => { core.assert(false) },
+    }
+}
+```
+
+`digit(high)?` in `percentage` returns `err(InputError.Parse(error))` on failure.
+The conversion is a compile-time choice of variant: it calls no function and
+moves the original error, with its ownership and borrows, into the new value.
+Exactly one variant of the enclosing function's error enum must have the
+propagated error type as its only payload. A missing or ambiguous variant is a
+compile-time error that names the candidates; resolve it by adding or removing
+a variant, or by matching the Result and constructing the intended error. There
+is no conversion between structs, from an error to a built-in type, or through
+several layers of enums. For anything else, such as translating one error kind
+into another, match the original error and construct the new error explicitly.
+
+Generic enums work as well: a function returning `T!Wrapper<ParseError>`, for
+`enum Wrapper<E> { Inner(E) }`, propagates `ParseError` with `?`.
 
 ## Handle every Result
 
@@ -97,6 +157,7 @@ unhandled, assigning it to `_`, or passing it to `core.drop` is rejected.
 | --- | --- |
 | Let the caller handle the same Result | `return operation()` |
 | Continue on success and return failure | `value := operation()?` |
+| Return failure wrapped in the function's error enum | `value := operation()?` with a variant such as `Io(io.Error)` |
 | Recover locally or translate errors | `match operation() { ok(value) => ..., err(error) => ... }` |
 | Treat failure as a terminating panic | `value := operation()!` |
 
@@ -130,7 +191,7 @@ fn main() {
 ```
 
 `?` instead returns the error from the enclosing function, which must return a
-Result with the same error type. `!` never propagates: panic terminates execution
+Result with the same error type or an enum wrapping it. `!` never propagates: panic terminates execution
 without unwinding or running destructors. On success, `!` consumes the Result
 and preserves the payload's ownership and borrow dependencies. A nested Result
 still needs handling. A `void` success payload produces no value.

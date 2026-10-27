@@ -1800,11 +1800,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.builder.build_conditional_branch(tag, err, ok)?;
                 self.builder.position_at_end(err);
                 if propagate {
-                    let payload = if **failure == Type::Void {
+                    let mut payload = if **failure == Type::Void {
                         None
                     } else {
                         Some(self.load(p, failure)?)
                     };
+                    if let Type::Result(_, target) = &self.return_type
+                        && **target != **failure
+                    {
+                        payload = Some(self.wrap_error(target, failure, payload)?);
+                    }
                     let ret = self.tagged_value(
                         self.ty(&self.return_type)?,
                         self.context.bool_type().const_int(1, false),
@@ -3940,6 +3945,43 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 .push(destinations[&name].clone());
         }
         Ok(())
+    }
+    /// `?` wraps a `source` error in the `target` variant carrying it.
+    fn wrap_error(
+        &self,
+        target: &Type,
+        source: &Type,
+        value: Option<Value<'ctx>>,
+    ) -> Result<Value<'ctx>> {
+        let Type::Named(name) = target else {
+            return Err(error(format!("cannot convert `{source}` to `{target}`")));
+        };
+        let decl = self
+            .program
+            .enums
+            .iter()
+            .find(|e| e.name == *name)
+            .ok_or_else(|| error(format!("cannot convert `{source}` to `{target}`")))?;
+        let variants = decl.wrapping_variants(source);
+        let [variant] = variants.as_slice() else {
+            return Err(error(format!("cannot convert `{source}` to `{target}`")));
+        };
+        let tag = decl
+            .variants
+            .iter()
+            .position(|v| v.name == variant.name)
+            .unwrap();
+        let mut payload = self.variant_ty(&variant.fields)?.const_zero();
+        if let Some(value) = value {
+            payload = self
+                .builder
+                .build_insert_value(payload, value, 0, "wrapped.error")?;
+        }
+        self.tagged_value(
+            self.ty(target)?,
+            self.context.i32_type().const_int(tag as u64, false),
+            Some(payload),
+        )
     }
     fn variant_tag(&self, t: &Type, name: &str) -> Result<u64> {
         let short = name.rsplit('.').next().unwrap_or(name);

@@ -1121,22 +1121,29 @@ one of these explicitly. A `void!E` function succeeds with `ok()`.
 ### 12.2. Propagation
 
 A trailing `?` on a call result produces the success value or immediately
-returns the same error from the enclosing function:
+returns its error from the enclosing function:
 
 ```dodo
 high := nibble(text[0])?
 low := nibble(text[1])?
 ```
 
-`?` is permitted only when the enclosing function returns a `Result` with the
-same error type. It performs no implicit conversion. Cleanup follows the normal
-return rules.
+`?` is permitted only when the enclosing function returns a `Result<T, F>`.
+If the operand's error type `E` is `F`, the error is returned unchanged.
+Otherwise `F` must be an enum with exactly one variant whose only payload has
+type `E`; the error is returned wrapped in that variant, as if by
+`return err(F.Variant(error))`. No other conversion exists: no function is
+called, and structs, built-in types, and multi-step wrapping do not convert. A
+missing or ambiguous variant is a compile-time error. Borrows held by the
+propagated error must satisfy the enclosing function's return contract, as for
+an explicit `return`. Cleanup follows the normal return rules.
 
 ### 12.3. Local recovery
 
 `match` handles failure locally. There are no exception classes, error traits,
-implicit error conversions, or configurable propagation operators. Error
-translation explicitly matches a source error and constructs a destination error.
+user-defined error conversions, or configurable propagation operators. Error
+translation other than the variant wrapping of section 12.2 explicitly matches a
+source error and constructs a destination error.
 
 ### 12.4. Mandatory handling
 

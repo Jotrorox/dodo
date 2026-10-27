@@ -69,24 +69,10 @@ pub struct String {
     }
     pub fn push(&mut self, scalar: u32) -> void!Error {
         storage := [0u8; 4]
-        count := match text.encode(scalar, &mut storage) {
-            ok(n) => {
-                n
-            }, err(problem) => {
-                return err(Error.Text(problem))
-            },
-        }
-        match self.reserve(count) {
-            ok() => {}, err(problem) => {
-                return err(Error.Allocation(problem))
-            },
-        }
+        count := text.encode(scalar, &mut storage)?
+        self.reserve(count)?
         for i in 0usize..count {
-            match self.buffer.push(storage[i]) {
-                ok() => {}, err(problem) => {
-                    return err(Error.Allocation(problem))
-                },
-            }
+            self.buffer.push(storage[i])?
         }
         return ok()
     }

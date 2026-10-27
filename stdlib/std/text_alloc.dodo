@@ -57,23 +57,9 @@ pub struct String<A> {
     }
     pub fn push(&mut self, scalar: u32) -> void!Error {
         storage := [0u8; 4]
-        count := 0usize
-        match text.encode(scalar, &mut storage) {
-            ok(value) => {
-                count = value
-            },
-            err(problem) => {
-                return err(Error.Text(problem))
-            },
-        }
-        match self.buffer.extend(&storage[..count]) {
-            ok() => {
-                return ok()
-            },
-            err(problem) => {
-                return err(Error.Allocation(problem))
-            },
-        }
+        count := text.encode(scalar, &mut storage)?
+        self.buffer.extend(&storage[..count])?
+        return ok()
     }
     pub fn clear(&mut self) {
         self.buffer.clear()

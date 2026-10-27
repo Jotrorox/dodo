@@ -118,6 +118,26 @@ for a UART and every existing helper works with it, including `io.write_all` and
 [`std/fmt`](formatting.md) output. The RP2040 and RP2350
 [serial ports](#serial-ports-on-the-rp2040-and-rp2350) do exactly that.
 
+Code that reads a device and writes to a stream sees both error types. Give it
+an error enum with a variant for each, and `?` wraps either error in its variant
+([combining error types](patterns-and-results.md#combine-error-types)):
+
+```dodo
+enum LogError {
+    Sensor(hal.Error),
+    Output(io.Error),
+}
+
+fn log_reading<B: hal.I2c, W: io.Writer>(bus: &mut B, output: &mut W) -> u8!LogError {
+    value := hal.read_register(bus, ADDRESS, TEMPERATURE)?
+    fmt.printf(output, "temperature {}\n", value)?
+    return ok(value)
+}
+```
+
+The repository's `examples/sensor_log.dodo` tests this function against a fake
+bus and a memory buffer.
+
 ### Helpers
 
 | Helper | Purpose |

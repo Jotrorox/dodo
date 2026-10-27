@@ -1,0 +1,81 @@
+package sensor_log
+
+import "core/bytes"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/fmt"
+import "std/io"
+
+// Log an I2C sensor's readings to a byte stream. The bus fails with
+// `hal.Error`, the stream with `io.Error`. `LogError` has one variant for
+// each, so `?` propagates both: a failure is wrapped in the variant whose
+// payload is its error type. On a board, pass the chip's I2C bus and a
+// serial port; on a desktop, `dodo test examples/sensor_log.dodo` runs it
+// against a fake bus and a memory buffer.
+
+const ADDRESS: u8 = 0x48
+const TEMPERATURE: u8 = 0x00
+
+pub enum LogError {
+    Sensor(hal.Error),
+    Output(io.Error),
+}
+
+// Read the temperature register and write one line such as
+// `temperature 21`, returning the reading.
+pub fn log_reading<B: hal.I2c, W: io.Writer>(bus: &mut B, output: &mut W) -> u8!LogError {
+    value := hal.read_register(bus, ADDRESS, TEMPERATURE)?
+    fmt.printf(output, "temperature {}\n", value)?
+    return ok(value)
+}
+
+@test
+fn logs_a_reading() {
+    bus := fake.I2c.new(ADDRESS)
+    bus.set_register(TEMPERATURE, 21)
+    storage: [32]u8 = [0; 32]
+    output := io.MemoryWriter.new(&mut storage)
+
+    assert_eq(log_reading(&mut bus, &mut output)!, 21u8)
+    assert(bytes.equal(output.written(), b"temperature 21\n"))
+}
+
+@test
+fn wraps_a_bus_failure() {
+    bus := fake.I2c.new(ADDRESS)
+    bus.fail_next(hal.Error.NoAcknowledge)
+    storage: [32]u8 = [0; 32]
+    output := io.MemoryWriter.new(&mut storage)
+
+    match log_reading(&mut bus, &mut output) {
+        ok(_) => {
+            assert(false)
+        }
+        err(LogError.Sensor(error)) => {
+            assert(error == hal.Error.NoAcknowledge)
+        }
+        err(LogError.Output(_)) => {
+            assert(false)
+        }
+    }
+    assert_eq(output.position(), 0usize)
+}
+
+@test
+fn wraps_a_stream_failure() {
+    bus := fake.I2c.new(ADDRESS)
+    storage: [8]u8 = [0; 8]
+    output := io.MemoryWriter.new(&mut storage)
+
+    match log_reading(&mut bus, &mut output) {
+        ok(_) => {
+            assert(false)
+        }
+        err(LogError.Sensor(_)) => {
+            assert(false)
+        }
+        err(LogError.Output(error)) => {
+            assert(error.kind == io.ErrorKind.BufferFull)
+        }
+    }
+}

@@ -872,6 +872,28 @@ impl Lower<'_> {
             _ => unsupported(span, "operator type mismatch"),
         }
     }
+    /// The enum variant `?` wraps a `source` error in for a `target` error.
+    fn error_wrapper(&self, target: &Type, source: &Type, span: Span) -> Result<(Type, String)> {
+        let variant = match target {
+            Type::Named(name) => self
+                .program
+                .enums
+                .iter()
+                .find(|e| &e.name == name)
+                .and_then(|e| match e.wrapping_variants(source).as_slice() {
+                    [variant] => Some(variant.name.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        variant
+            .map(|variant| (target.clone(), variant))
+            .ok_or_else(|| Limitation {
+                kind: LimitationKind::Type,
+                span,
+                reason: format!("`?` cannot convert {source} errors to {target}"),
+            })
+    }
     fn expect(&self, expected: &Type, actual: &Type, span: Span) -> Result<()> {
         if expected == actual {
             Ok(())
@@ -1636,11 +1658,15 @@ impl Lower<'_> {
                     return unsupported(span, "Result propagation requires a Result operand");
                 };
                 let propagate = matches!(expression.kind, ExprKind::Try(_));
+                // The variant wrapping a propagated error of another type.
+                let mut wrapper = None;
                 if propagate {
                     let Type::Result(_, expected_error) = &self.function.ret else {
                         return unsupported(span, "propagation requires a Result return type");
                     };
-                    self.expect(expected_error, &error, span)?;
+                    if **expected_error != *error {
+                        wrapper = Some(self.error_wrapper(expected_error, &error, span)?);
+                    }
                 }
                 let yes = self.block_id();
                 let no = self.block_id();
@@ -1669,6 +1695,12 @@ impl Lower<'_> {
                         },
                         span,
                     );
+                    let payload = match wrapper {
+                        Some((ty, variant)) => {
+                            self.tagged(ty, &variant, vec![self.operand(payload)], span)
+                        }
+                        None => payload,
+                    };
                     let returned = self.tagged(
                         self.function.ret.clone(),
                         "err",
