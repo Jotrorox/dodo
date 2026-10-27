@@ -44,6 +44,7 @@ const LCR_H: usize = 0x02C
 const CR: usize = 0x030
 const IFLS: usize = 0x034
 const IMSC: usize = 0x038
+const MIS: usize = 0x040
 const ICR: usize = 0x044
 const DMACR: usize = 0x048
 
@@ -85,6 +86,24 @@ const FIFO_LEVELS: u32 = (0b011 << 3) | 0b010
 
 // ICR: every interrupt.
 const ALL_INTERRUPTS: u32 = 0x7FF
+
+// Interrupt sources, as bits of `listen`, `ignore`, `pending_interrupts`,
+// and `clear_interrupts`. The controller raises its one interrupt line
+// while any listened-to source is pending; the chip package names the line,
+// such as UART0_IRQ, for an @interrupt handler.
+//
+// RX_INTERRUPT: the receive FIFO holds 24 bytes or more (3/4 full).
+// RX_TIMEOUT_INTERRUPT: received bytes have waited for 32 bit times with no
+// more arriving, so a handler also hears about a short message. Both stay
+// pending until reads drain the FIFO below their condition.
+pub const RX_INTERRUPT: u32 = 1 << 4
+// The transmit FIFO has drained to 16 bytes or fewer: room to write more.
+// Pending until writes fill it again or `clear_interrupts`.
+pub const TX_INTERRUPT: u32 = 1 << 5
+pub const RX_TIMEOUT_INTERRUPT: u32 = 1 << 6
+// A received frame had a framing or parity error, was a break, or found the
+// receive FIFO full. Pending until `clear_interrupts`.
+pub const ERROR_INTERRUPTS: u32 = 0xF << 7
 
 // Status polls without progress before a wait for output gives up.
 pub const DEFAULT_POLL_LIMIT: u32 = 10_000_000
@@ -298,6 +317,32 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
         return ok()
     }
 
+    // Raise the controller's interrupt for these sources, such as
+    // RX_INTERRUPT | RX_TIMEOUT_INTERRUPT, in addition to those already
+    // listened to. Ports start with none.
+    pub fn listen(&mut self, sources: u32) {
+        mask := self.registers.read(IMSC)
+        self.registers.write(IMSC, (mask | sources) & ALL_INTERRUPTS)
+    }
+
+    // Stop raising the interrupt for these sources.
+    pub fn ignore(&mut self, sources: u32) {
+        mask := self.registers.read(IMSC)
+        self.registers.write(IMSC, mask & ~sources)
+    }
+
+    // The listened-to sources that are pending now: what an interrupt
+    // handler has to serve.
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.registers.read(MIS)
+    }
+
+    // Acknowledge sources whose condition does not end by itself, such as
+    // TX_INTERRUPT or ERROR_INTERRUPTS.
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.registers.write(ICR, sources & ALL_INTERRUPTS)
+    }
+
     // Hold the transmit line low, a break, from once everything written is
     // out until `set_break(false)`. A receiver sees a break when the line
     // stays low for longer than a frame, so keep it on for at least two
@@ -436,6 +481,7 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
     pub fn release(self) -> R {
         self.idle()
         self.registers.write(CR, 0)
+        self.registers.write(IMSC, 0)
         let Controller { registers, divisors, poll_limit, read_poll_limit, format, crlf, after_return, feed_pending } = self
         return registers
     }
@@ -615,6 +661,27 @@ pub struct Port: io.ReadWriter {
     // self-tests: reads return what was written.
     pub fn set_loopback(&mut self, on: bool) -> void!hal.Error {
         return self.controller.set_loopback(on)
+    }
+
+    // Raise the port's interrupt for these sources, such as RX_INTERRUPT |
+    // RX_TIMEOUT_INTERRUPT; see Controller.listen.
+    pub fn listen(&mut self, sources: u32) {
+        self.controller.listen(sources)
+    }
+
+    // Stop raising the interrupt for these sources.
+    pub fn ignore(&mut self, sources: u32) {
+        self.controller.ignore(sources)
+    }
+
+    // The listened-to sources pending now.
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.controller.pending_interrupts()
+    }
+
+    // Acknowledge TX_INTERRUPT or ERROR_INTERRUPTS.
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.controller.clear_interrupts(sources)
     }
 
     // Wait until everything written is out, within the poll limit, disable

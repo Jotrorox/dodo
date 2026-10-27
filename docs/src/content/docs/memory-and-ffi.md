@@ -362,6 +362,71 @@ threads or cores. Hosted programs have no interrupt mask to change, which is
 why the operations are no-ops there and why drivers that use critical sections
 can still be tested on a desktop.
 
+## Inline assembly
+
+`asm(...)` emits instructions directly, for the few operations neither Dodo
+nor `core/cpu` expresses: special registers, barriers, supervisor calls, or a
+hand-tuned loop. It is an expression and requires an `unsafe` block:
+
+```dodo
+fn add(a: u64, b: u64) -> u64 {
+    // AArch64.
+    return unsafe { asm("add {0}, {1}, {2}", out(reg) u64, in(reg) a, in(reg) b) }
+}
+```
+
+Template strings come first. Several strings are joined with newlines, one
+instruction each. Operands follow, then optional clobbers and options:
+
+| Operand | Meaning |
+| --- | --- |
+| `in(reg) value` | Pass `value` in a general-purpose register the compiler chooses. |
+| `out(reg) Type` | The template leaves a `Type` in a register; the expression returns it. |
+| `inout(reg) value` | Pass `value` and return the register's final value. |
+| `in("r0") value`, `out("x9") u64`, ... | Use exactly this register, as calling conventions such as a supervisor call require. |
+| `clobber("r4", "lr")` | Further registers the template overwrites. |
+| `options(nomem)` | The template reads and writes no memory the program can see. |
+| `options(pure)` | Its only effect is its outputs: it may be removed if they are unused, or merged with an identical one. Needs an output. |
+
+The template refers to operands as `{0}`, `{1}`, ... in the order written, or
+`{}` for the next one. `{0:w}` passes an operand modifier to the assembler
+(here AArch64's 32-bit register name). Write `{{` and `}}` for literal braces.
+The result is `void` without outputs, the output's value with one, and a tuple
+with several:
+
+```dodo
+fn swap_halves(value: u32) -> (u32, u32) {
+    // Thumb.
+    return unsafe {
+        asm(
+            "lsrs {0}, {2}, #16",
+            "uxth {1}, {2}",
+            out(reg) u32,
+            out(reg) u32,
+            in(reg) value,
+        )
+    }
+}
+```
+
+Operands are integers up to the pointer width, raw pointers, or function
+pointers. Inputs are evaluated in order before the template runs; an `out`
+register never shares a register with an input, while `inout` reads and
+writes the same one.
+
+By default a template may read or write any memory and change the condition
+flags: the compiler neither moves memory accesses across it nor removes it.
+The `unsafe` block is your promise that the template matches its operands,
+clobbers, and options, and that it leaves the stack pointer and every
+unlisted register as it found them. Templates use the target assembler's
+syntax: unified syntax on Arm and Thumb, AT&T syntax on x86. A template the
+assembler rejects is a compile error with the assembler's message.
+
+`std/embedded/cortex_m` shows typical uses: `cpsie i`, `wfe`, `dsb`, and
+reading PRIMASK and IPSR. Firmware attributes that go with it,
+`@interrupt`, `@section`, and `@align`, are described in
+[hardware and embedded](hardware.md#interrupts).
+
 ## Atomic storage intrinsics
 
 Prefer the checked `std/sync/atomic` API documented in

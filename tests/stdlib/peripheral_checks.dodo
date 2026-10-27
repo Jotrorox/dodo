@@ -1942,6 +1942,25 @@ struct UartModel {
             return self.lcr_h
         } else if offset == 0x030 {
             return self.cr
+        } else if offset == 0x038 {
+            return self.interrupt_mask
+        } else if offset == 0x040 {
+            // Receive at 3/4 full, the timeout for anything waiting, and
+            // transmit at half empty.
+            raw := 0u32
+            if self.rx_count >= 24 {
+                raw |= 1 << 4
+            }
+            if self.tx_count <= 16 {
+                raw |= 1 << 5
+            }
+            if self.rx_count > 0 {
+                raw |= 1 << 6
+            }
+            if self.overrun {
+                raw |= 1 << 10
+            }
+            return raw & self.interrupt_mask
         }
         core.assert(false)
         return 0
@@ -2084,6 +2103,38 @@ fn uart_divisors() {
 
 fn uart_port(model: UartModel) -> pl011.Controller<UartModel> {
     return pl011.Controller.new(model, pl011.divisors(CLOCK_HZ, 115_200)!)
+}
+
+// Interrupt sources: listened-to ones show as pending, receive interrupts end
+// when reads drain the FIFO, and release masks everything.
+fn uart_interrupts() {
+    port := uart_port(UartModel.new(1))
+    core.assert_eq(port.pending_interrupts(), 0u32)
+    port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT)
+    port.listen(pl011.ERROR_INTERRUPTS)
+    port.ignore(pl011.ERROR_INTERRUPTS)
+    // Nothing received: the transmit source is raw but not listened to.
+    core.assert_eq(port.pending_interrupts(), 0u32)
+    model := port.release()
+    core.assert_eq(model.interrupt_mask, 0u32)
+    model.cr = 0
+    port = uart_port(model)
+    port.listen(pl011.RX_TIMEOUT_INTERRUPT | pl011.TX_INTERRUPT | 0xF000)
+    port.write(b"hi")!
+    port.flush()!
+    port.clear_interrupts(pl011.TX_INTERRUPT)
+    model = port.release()
+    core.assert((model.cleared & pl011.TX_INTERRUPT) != 0)
+    model.cr = 0
+    model.arrive_bytes(b"ping")
+    port = uart_port(model)
+    port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT)
+    core.assert_eq(port.pending_interrupts(), pl011.RX_TIMEOUT_INTERRUPT)
+    buffer := [0u8; 8]
+    count := port.read(&mut buffer)!
+    core.assert_eq(count, 4usize)
+    core.assert_eq(port.pending_interrupts(), 0u32)
+    port.release()
 }
 
 fn uart_configuration() {
@@ -2894,6 +2945,7 @@ fn main() {
     spi_target()
     uart_divisors()
     uart_configuration()
+    uart_interrupts()
     uart_writes()
     uart_reads()
     uart_flow_and_break()

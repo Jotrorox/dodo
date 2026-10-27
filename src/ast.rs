@@ -283,6 +283,15 @@ impl std::fmt::Display for Type {
     }
 }
 
+/// The type of an inline assembly expression with these outputs.
+pub fn asm_result(mut outputs: Vec<Type>) -> Type {
+    match outputs.len() {
+        0 => Type::Void,
+        1 => outputs.pop().unwrap(),
+        n => Type::Generic(tuple_name(n), outputs),
+    }
+}
+
 /// Tuples are anonymous generic structs: `(A, B)` is `Type::Generic("#2", [A, B])`
 /// and its elements are the public fields `0` and `1`. Source identifiers cannot
 /// start with `#`, so the name never collides with, or is qualified like, a
@@ -361,6 +370,9 @@ pub struct Program {
     pub constants: Vec<Constant>,
     pub interfaces: Vec<Interface>,
     pub aliases: Vec<TypeAlias>,
+    /// The vector names a firmware build's chip accepts in `@interrupt`; set
+    /// by package loading for a board or chip, `None` elsewhere.
+    pub interrupt_vectors: Option<&'static [&'static str]>,
 }
 /// `type Name<T> = Type` introduces another name for a type. Aliases are
 /// transparent: semantic analysis replaces every use with the aliased type.
@@ -471,6 +483,24 @@ pub struct Function {
     /// leading parameters that reference captured bindings through its
     /// environment. Such functions use the closure calling convention.
     pub environment: Option<usize>,
+    /// `@interrupt(VECTOR)`: the hardware runs this function for the named
+    /// exception or interrupt. It is exported under the vector's symbol name
+    /// and cannot be called from Dodo code.
+    pub interrupt: Option<String>,
+    pub placement: Placement,
+}
+/// Linker placement chosen by `@section("name")` and `@align(N)` on functions
+/// and statics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Placement {
+    pub section: Option<String>,
+    /// A power of two, in bytes.
+    pub align: Option<u32>,
+}
+impl Placement {
+    pub fn is_empty(&self) -> bool {
+        self.section.is_none() && self.align.is_none()
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Printing {
@@ -490,7 +520,10 @@ pub struct Constant {
     pub ty: Type,
     pub value: Expr,
     pub public: bool,
+    /// Declared with `static` rather than `const`.
+    pub static_: bool,
     pub mutable: bool,
+    pub placement: Placement,
     pub span: Span,
 }
 pub type Block = Vec<Stmt>;
@@ -659,6 +692,91 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `asm("template", operands...)`: inline assembly, valid only in unsafe code.
+    Asm(Box<InlineAsm>),
+}
+/// Inline assembly. The template refers to operands as `{0}`, `{1}`, ... in
+/// the order written (or `{}` for the next one), with an optional LLVM operand
+/// modifier: `{0:w}`. `{{` and `}}` are literal braces. The expression's value
+/// is `void` without outputs, the output's type with one, and a tuple of the
+/// output types, in order, with several.
+#[derive(Clone, Debug)]
+pub struct InlineAsm {
+    pub template: String,
+    pub operands: Vec<AsmOperand>,
+    /// Register names and `memory`, `cc`.
+    pub clobbers: Vec<String>,
+    /// `options(pure)`: no side effects beyond its outputs, so it may be
+    /// removed or merged; requires an output.
+    pub pure: bool,
+    /// `options(nomem)`: reads and writes no memory the program can see.
+    pub nomem: bool,
+    /// Set by generic specialization when there are several outputs: the
+    /// concrete tuple type.
+    pub tuple: Option<Type>,
+    pub span: Span,
+}
+impl InlineAsm {
+    /// Input values, in operand order: `in` and `inout` operands.
+    pub fn inputs(&self) -> impl Iterator<Item = &Expr> {
+        self.operands
+            .iter()
+            .filter_map(|operand| match &operand.kind {
+                AsmOperandKind::In(value) | AsmOperandKind::InOut(value) => Some(value),
+                AsmOperandKind::Out(_) => None,
+            })
+    }
+    pub fn inputs_mut(&mut self) -> impl Iterator<Item = &mut Expr> {
+        self.operands
+            .iter_mut()
+            .filter_map(|operand| match &mut operand.kind {
+                AsmOperandKind::In(value) | AsmOperandKind::InOut(value) => Some(value),
+                AsmOperandKind::Out(_) => None,
+            })
+    }
+    /// Declared `out` types, with the span of their operand.
+    pub fn output_types_mut(&mut self) -> impl Iterator<Item = (&mut Type, Span)> {
+        self.operands
+            .iter_mut()
+            .filter_map(|operand| match &mut operand.kind {
+                AsmOperandKind::Out(ty) => Some((ty, operand.span)),
+                _ => None,
+            })
+    }
+    /// The types the expression returns, in order: `out` types and the
+    /// checked types of `inout` values.
+    pub fn outputs(&self) -> Vec<Type> {
+        self.operands
+            .iter()
+            .filter_map(|operand| match &operand.kind {
+                AsmOperandKind::Out(ty) => Some(ty.clone()),
+                AsmOperandKind::InOut(value) => Some(value.ty.clone()),
+                AsmOperandKind::In(_) => None,
+            })
+            .collect()
+    }
+}
+#[derive(Clone, Debug)]
+pub struct AsmOperand {
+    pub kind: AsmOperandKind,
+    pub register: AsmRegister,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
+pub enum AsmOperandKind {
+    /// `in(reg) value`
+    In(Expr),
+    /// `out(reg) Type`: a value the expression returns.
+    Out(Type),
+    /// `inout(reg) value`: passed in, and its final value returned.
+    InOut(Expr),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AsmRegister {
+    /// `reg`: any general-purpose register the compiler picks.
+    Any,
+    /// `"r0"`: exactly this register.
+    Named(String),
 }
 #[derive(Clone, Debug)]
 pub struct Closure {

@@ -106,6 +106,64 @@ const TICK_ENABLE: u32 = 1 << 0
 const TIMER0_BASE: usize = 0x400B_0000
 const TIMER_RAW_HIGH: usize = TIMER0_BASE + 0x24
 const TIMER_RAW_LOW: usize = TIMER0_BASE + 0x28
+// Alarms (12.8.4): ALARMn arms when written and fires when the counter's
+// low 32 bits reach it, setting its INTR bit (write one to clear) and, while
+// its INTE bit is set, raising its interrupt. ARMED bits disarm when written.
+const TIMER_ALARM0: usize = TIMER0_BASE + 0x10
+const TIMER_ARMED: usize = TIMER0_BASE + 0x20
+const TIMER_INTR: usize = TIMER0_BASE + 0x3C
+const TIMER_INTE: usize = TIMER0_BASE + 0x40
+// Alarms 0 to 3, raising TIMER0_IRQ_0 + n.
+pub const ALARM_COUNT: u32 = 4
+
+// Interrupt numbers (3.2), for std/embedded/cortex_m's enable, pend, and
+// set_priority. Each is also the vector name of its `@interrupt` handler.
+pub const TIMER0_IRQ_0: u32 = 0
+pub const TIMER0_IRQ_1: u32 = 1
+pub const TIMER0_IRQ_2: u32 = 2
+pub const TIMER0_IRQ_3: u32 = 3
+pub const TIMER1_IRQ_0: u32 = 4
+pub const TIMER1_IRQ_1: u32 = 5
+pub const TIMER1_IRQ_2: u32 = 6
+pub const TIMER1_IRQ_3: u32 = 7
+pub const PWM_IRQ_WRAP_0: u32 = 8
+pub const PWM_IRQ_WRAP_1: u32 = 9
+pub const DMA_IRQ_0: u32 = 10
+pub const DMA_IRQ_1: u32 = 11
+pub const DMA_IRQ_2: u32 = 12
+pub const DMA_IRQ_3: u32 = 13
+pub const USBCTRL_IRQ: u32 = 14
+pub const PIO0_IRQ_0: u32 = 15
+pub const PIO0_IRQ_1: u32 = 16
+pub const PIO1_IRQ_0: u32 = 17
+pub const PIO1_IRQ_1: u32 = 18
+pub const PIO2_IRQ_0: u32 = 19
+pub const PIO2_IRQ_1: u32 = 20
+pub const IO_IRQ_BANK0: u32 = 21
+pub const IO_IRQ_BANK0_NS: u32 = 22
+pub const IO_IRQ_QSPI: u32 = 23
+pub const IO_IRQ_QSPI_NS: u32 = 24
+pub const SIO_IRQ_FIFO: u32 = 25
+pub const SIO_IRQ_BELL: u32 = 26
+pub const SIO_IRQ_FIFO_NS: u32 = 27
+pub const SIO_IRQ_BELL_NS: u32 = 28
+pub const SIO_IRQ_MTIMECMP: u32 = 29
+pub const CLOCKS_IRQ: u32 = 30
+pub const SPI0_IRQ: u32 = 31
+pub const SPI1_IRQ: u32 = 32
+pub const UART0_IRQ: u32 = 33
+pub const UART1_IRQ: u32 = 34
+pub const ADC_IRQ_FIFO: u32 = 35
+pub const I2C0_IRQ: u32 = 36
+pub const I2C1_IRQ: u32 = 37
+pub const OTP_IRQ: u32 = 38
+pub const TRNG_IRQ: u32 = 39
+pub const PROC0_IRQ_CTI: u32 = 40
+pub const PROC1_IRQ_CTI: u32 = 41
+pub const PLL_SYS_IRQ: u32 = 42
+pub const PLL_USB_IRQ: u32 = 43
+pub const POWMAN_IRQ_POW: u32 = 44
+pub const POWMAN_IRQ_TIMER: u32 = 45
 
 // User bank GPIO control (9.11.1) and pads (9.11.3).
 const IO_BANK0_BASE: usize = 0x4002_8000
@@ -247,7 +305,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     // SAFETY: the timer was just taken out of reset; Timer only reads its
     // free-running counter registers.
     timer := unsafe {
-        Timer { high: hal.Reg.at(TIMER_RAW_HIGH), low: hal.Reg.at(TIMER_RAW_LOW) }
+        Timer { high: hal.Reg.at(TIMER_RAW_HIGH), low: hal.Reg.at(TIMER_RAW_LOW), alarms: 0 }
     }
     // SAFETY: TAKEN guarantees one bank, and Chip is what the bank needs:
     // the GPIOs' control and pad registers and the bus controllers are
@@ -636,6 +694,47 @@ pub struct Pin {
 pub struct Timer {
     high: hal.Reg<u32>
     low: hal.Reg<u32>
+    // Claimed alarms, one bit each.
+    alarms: u32
+
+    // Claim alarm 0 to 3, to run code at a set time from its interrupt.
+    // Busy if it is claimed already; InvalidInput for another number.
+    pub fn alarm(&mut self, number: u32) -> Alarm!hal.Error {
+        if number >= ALARM_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << number
+        if (self.alarms & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.alarms |= bit
+        // SAFETY: the claim above makes this the only Alarm for `number`.
+        // It writes only its own ALARMn register and, through the
+        // write-one-to-clear registers and the atomic set and clear
+        // aliases, only its own bit of the shared ones.
+        alarm := unsafe {
+            Alarm {
+                number,
+                bit,
+                target: hal.Reg.at(TIMER_ALARM0 + 4 * number as usize),
+                low: hal.Reg.at(TIMER_RAW_LOW),
+                armed: hal.Reg.at(TIMER_ARMED),
+                raw: hal.Reg.at(TIMER_INTR),
+                listening: hal.Reg.at(TIMER_INTE),
+                listen_set: hal.Reg.at(TIMER_INTE + SET_ALIAS),
+                listen_clear: hal.Reg.at(TIMER_INTE + CLEAR_ALIAS),
+            }
+        }
+        return ok(alarm)
+    }
+
+    // Disarm an alarm, stop its interrupt, and take it back.
+    pub fn release_alarm(&mut self, alarm: Alarm) {
+        alarm.cancel()
+        alarm.ignore()
+        alarm.clear()
+        self.alarms &= ~alarm.bit
+    }
 
     // Microseconds since take().
     pub fn now_us(&self) -> u64 {
@@ -656,5 +755,87 @@ pub struct Timer {
     pub fn delay_ms(&mut self, milliseconds: u32) {
         end := self.now_us() + (milliseconds as u64) * 1000
         for self.now_us() < end {}
+    }
+}
+
+// One of the timer's four alarms, claimed with `Timer.alarm(n)`. An alarm
+// fires once when the microsecond counter reaches the time it was given;
+// with `listen` it raises interrupt TIMER0_IRQ_0 + n, whose handler calls
+// `clear` and may schedule the next time. Move it into a
+// `static mut Option<Alarm>` for the handler to use.
+pub struct Alarm {
+    number: u32
+    bit: u32
+    target: hal.Reg<u32>
+    low: hal.Reg<u32>
+    armed: hal.Reg<u32>
+    raw: hal.Reg<u32>
+    listening: hal.Reg<u32>
+    listen_set: hal.Reg<u32>
+    listen_clear: hal.Reg<u32>
+
+    // 0 to 3.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // The interrupt the alarm raises: its number for cortex_m.enable, and
+    // its vector name, TIMER0_IRQ_0 + n, for `@interrupt`.
+    pub fn irq(&self) -> u32 {
+        return TIMER0_IRQ_0 + self.number
+    }
+
+    // The low 32 bits of the microsecond counter, which alarm times use.
+    pub fn now(&self) -> u32 {
+        return self.low.read()
+    }
+
+    // Fire when the counter's low 32 bits equal `time`, replacing any
+    // earlier time. A time that has just passed fires only after the
+    // counter wraps, 71.6 minutes later.
+    pub fn schedule_at(&mut self, time: u32) {
+        self.target.write(time)
+    }
+
+    // Fire `microseconds` from now; at least 1, and below 2^31 so the time
+    // is still ahead when the write lands.
+    pub fn schedule_in(&mut self, microseconds: u32) {
+        self.target.write(core.wrapping_add(self.low.read(), microseconds))
+    }
+
+    // Disarm: a scheduled time no longer fires.
+    pub fn cancel(&mut self) {
+        self.armed.write(self.bit)
+    }
+
+    // True from scheduling until it fires or is cancelled.
+    pub fn is_armed(&self) -> bool {
+        return self.armed.any(self.bit)
+    }
+
+    // True once it has fired, until `clear`.
+    pub fn fired(&self) -> bool {
+        return self.raw.any(self.bit)
+    }
+
+    // Acknowledge that it fired. An interrupt handler has to, or the
+    // interrupt stays raised and the handler runs again at once.
+    pub fn clear(&mut self) {
+        self.raw.write(self.bit)
+    }
+
+    // Raise the interrupt when it fires. Enable the interrupt in the NVIC
+    // too: `cortex_m.enable(alarm.irq())`.
+    pub fn listen(&mut self) {
+        self.listen_set.write(self.bit)
+    }
+
+    // Stop raising the interrupt; `fired` still reports.
+    pub fn ignore(&mut self) {
+        self.listen_clear.write(self.bit)
+    }
+
+    pub fn is_listening(&self) -> bool {
+        return self.listening.any(self.bit)
     }
 }

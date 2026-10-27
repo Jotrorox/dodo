@@ -1,0 +1,294 @@
+package cortex_m
+
+import "core/mmio"
+import "std/embedded/hal"
+
+// The parts of an Arm Cortex-M core that every chip built on one shares: the
+// NVIC, which enables, pends, and prioritizes the chip's interrupts; the
+// SysTick timer; the vector table base; and instructions without a Dodo
+// expression, written with inline assembly. They work the same on the
+// Cortex-M0+ (Armv6-M), M3, M4, M7 (Armv7-M), and M33 (Armv8-M).
+//
+// Interrupts are numbered as in the chip's datasheet; the chip package names
+// them, such as rp2040.UART0_IRQ, which is also the vector name an
+// `@interrupt(UART0_IRQ)` handler uses. Exceptions such as SysTick and PendSV
+// have no IRQ number and are always enabled.
+//
+// This package addresses the core's System Control Space, so it only works
+// on a Cortex-M. Code that also runs on a desktop keeps these calls behind
+// its board or chip support.
+
+// NVIC (Armv7-M B3.4): one bit per interrupt, 32 per word.
+const NVIC_ISER: usize = 0xE000_E100
+const NVIC_ICER: usize = 0xE000_E180
+const NVIC_ISPR: usize = 0xE000_E200
+const NVIC_ICPR: usize = 0xE000_E280
+// One priority byte per interrupt. Armv6-M only allows word accesses.
+const NVIC_IPR: usize = 0xE000_E400
+// SCB: interrupt control and state, and the vector table offset.
+const SCB_ICSR: usize = 0xE000_ED04
+const SCB_VTOR: usize = 0xE000_ED08
+const PENDSV_SET: u32 = 1 << 28
+// SysTick (B3.3): control and status, reload, current value.
+const SYST_CSR: usize = 0xE000_E010
+const SYST_RVR: usize = 0xE000_E014
+const SYST_CVR: usize = 0xE000_E018
+const SYST_ENABLE: u32 = 1 << 0
+const SYST_TICKINT: u32 = 1 << 1
+const SYST_PROCESSOR_CLOCK: u32 = 1 << 2
+const SYST_COUNTFLAG: u32 = 1 << 16
+
+// Interrupt numbers below this exist on some Cortex-M: Armv7-M and Armv8-M
+// allow 496 (Armv8-M even 480 per security state), Armv6-M 32.
+pub const MAX_IRQS: u32 = 496
+
+// The largest SysTick reload value: the counter is 24 bits wide.
+pub const SYSTICK_MAX_RELOAD: u32 = 0xFF_FFFF
+
+fn bit_register(base: usize, irq: u32) -> usize {
+    core.assert(irq < MAX_IRQS)
+    return base + 4 * (irq / 32) as usize
+}
+
+fn bit(irq: u32) -> u32 {
+    return 1u32 << (irq % 32)
+}
+
+// Let interrupt `irq` reach the core. Its handler runs whenever the
+// peripheral raises it and interrupts are not masked.
+pub fn enable(irq: u32) {
+    // SAFETY: ISER is write-one-to-set; other interrupts' bits are unchanged.
+    unsafe {
+        mmio.write32(bit_register(NVIC_ISER, irq), bit(irq))
+    }
+}
+
+// Keep interrupt `irq` from reaching the core. It may still become pending.
+pub fn disable(irq: u32) {
+    // SAFETY: ICER is write-one-to-clear.
+    unsafe {
+        mmio.write32(bit_register(NVIC_ICER, irq), bit(irq))
+    }
+    // The core may already have taken the interrupt; wait until the write
+    // has reached the NVIC.
+    data_barrier()
+    instruction_barrier()
+}
+
+pub fn is_enabled(irq: u32) -> bool {
+    // SAFETY: reading ISER has no side effects.
+    word := unsafe {
+        mmio.read32(bit_register(NVIC_ISER, irq))
+    }
+    return (word & bit(irq)) != 0
+}
+
+// Make interrupt `irq` pending as if its peripheral had raised it, for
+// example to run its handler from software or in a self-test.
+pub fn pend(irq: u32) {
+    // SAFETY: ISPR is write-one-to-set.
+    unsafe {
+        mmio.write32(bit_register(NVIC_ISPR, irq), bit(irq))
+    }
+}
+
+// Forget that interrupt `irq` is pending, so its handler does not run for
+// what happened so far.
+pub fn unpend(irq: u32) {
+    // SAFETY: ICPR is write-one-to-clear.
+    unsafe {
+        mmio.write32(bit_register(NVIC_ICPR, irq), bit(irq))
+    }
+}
+
+pub fn is_pending(irq: u32) -> bool {
+    // SAFETY: reading ISPR has no side effects.
+    word := unsafe {
+        mmio.read32(bit_register(NVIC_ISPR, irq))
+    }
+    return (word & bit(irq)) != 0
+}
+
+// Set the priority of interrupt `irq`: 0 is the most urgent, and a handler
+// is interrupted only by more urgent ones. Cores implement only the high
+// bits of the byte: two on the Cortex-M0+ (0x00, 0x40, 0x80, 0xC0), four on
+// the RP2350's Cortex-M33. Every interrupt starts at 0.
+pub fn set_priority(irq: u32, priority: u8) {
+    address := NVIC_IPR + 4 * (irq / 4) as usize
+    shift := 8 * (irq % 4)
+    core.assert(irq < MAX_IRQS)
+    // SAFETY: the read-modify-write changes only this interrupt's byte; it
+    // runs with interrupts masked so a handler cannot change the word's
+    // other bytes in between.
+    section := hal.Critical.enter()
+    unsafe {
+        word := mmio.read32(address)
+        word = (word & ~(0xFFu32 << shift)) | ((priority as u32) << shift)
+        mmio.write32(address, word)
+    }
+    core.drop(section)
+}
+
+pub fn priority(irq: u32) -> u8 {
+    core.assert(irq < MAX_IRQS)
+    // SAFETY: reading IPR has no side effects.
+    word := unsafe {
+        mmio.read32(NVIC_IPR + 4 * (irq / 4) as usize)
+    }
+    return (word >> (8 * (irq % 4))) as u8
+}
+
+// Make the PendSV exception pending. Its handler, `@interrupt(PendSV_Handler)`,
+// runs once no more urgent handler is active: the usual way to defer work
+// out of an urgent interrupt.
+pub fn pend_sv() {
+    // SAFETY: ICSR's PENDSVSET is write-one-to-set; zeros elsewhere change
+    // nothing.
+    unsafe {
+        mmio.write32(SCB_ICSR, PENDSV_SET)
+    }
+}
+
+// Run handlers from the vector table at `address` from now on, for example a
+// table in RAM whose entries the program changes.
+//
+// SAFETY: `address` holds a complete vector table for this chip (initial
+// stack pointer, then one handler address with the Thumb bit set per
+// exception and interrupt), aligned to its size rounded up to a power of
+// two and at least 128 bytes, as `@align` can arrange; it stays valid while
+// it is installed.
+pub unsafe fn set_vector_table(address: usize) {
+    unsafe {
+        mmio.write32(SCB_VTOR, address as u32)
+    }
+    data_barrier()
+    instruction_barrier()
+}
+
+// The installed vector table's address.
+pub fn vector_table() -> usize {
+    // SAFETY: reading VTOR has no side effects.
+    return unsafe {
+        mmio.read32(SCB_VTOR)
+    } as usize
+}
+
+// Start SysTick counting down from `reload` to 0 at the processor clock,
+// then reloading, so a period is reload + 1 cycles. With `interrupt`, each
+// wrap runs `@interrupt(SysTick_Handler)`. InvalidInput unless reload is 1
+// to SYSTICK_MAX_RELOAD.
+pub fn systick_start(reload: u32, interrupt: bool) -> void!hal.Error {
+    if reload == 0 || reload > SYSTICK_MAX_RELOAD {
+        return err(hal.Error.InvalidInput)
+    }
+    control := SYST_ENABLE | SYST_PROCESSOR_CLOCK
+    if interrupt {
+        control |= SYST_TICKINT
+    }
+    // SAFETY: SysTick belongs to the core, not to a peripheral driver.
+    unsafe {
+        mmio.write32(SYST_CSR, 0)
+        mmio.write32(SYST_RVR, reload)
+        mmio.write32(SYST_CVR, 0)
+        mmio.write32(SYST_CSR, control)
+    }
+    return ok()
+}
+
+pub fn systick_stop() {
+    // SAFETY: as in systick_start.
+    unsafe {
+        mmio.write32(SYST_CSR, 0)
+    }
+}
+
+// The current count, from the reload value down to 0.
+pub fn systick_value() -> u32 {
+    // SAFETY: reading CVR has no side effects.
+    return unsafe {
+        mmio.read32(SYST_CVR)
+    }
+}
+
+// True once the counter has reached 0 since the last call: reading the
+// flag clears it.
+pub fn systick_wrapped() -> bool {
+    // SAFETY: as in systick_start; this read clears COUNTFLAG.
+    control := unsafe {
+        mmio.read32(SYST_CSR)
+    }
+    return (control & SYST_COUNTFLAG) != 0
+}
+
+// Unmask interrupts (`cpsie i`), as at reset.
+//
+// SAFETY: this ends any critical section the caller is in, including a
+// `hal.Critical` that is still alive.
+pub unsafe fn enable_interrupts() {
+    unsafe {
+        asm("cpsie i")
+    }
+}
+
+// Sleep until an event (`wfe`): an interrupt, or `send_event` on another
+// core.
+pub fn wait_for_event() {
+    // SAFETY: wfe only waits; it changes no state the program can see.
+    unsafe {
+        asm("wfe")
+    }
+}
+
+// Signal an event to every core (`sev`), waking one in `wait_for_event`.
+pub fn send_event() {
+    // SAFETY: sev only signals.
+    unsafe {
+        asm("sev")
+    }
+}
+
+// Complete every memory access before the next one starts (`dsb`), for
+// example after disabling an interrupt or before sleeping.
+pub fn data_barrier() {
+    // SAFETY: a barrier only orders accesses.
+    unsafe {
+        asm("dsb")
+    }
+}
+
+// Order memory accesses before and after (`dmb`), without waiting for them.
+pub fn memory_barrier() {
+    // SAFETY: a barrier only orders accesses.
+    unsafe {
+        asm("dmb")
+    }
+}
+
+// Fetch the following instructions again (`isb`), so they see a changed
+// vector table, interrupt mask, or code written to RAM.
+pub fn instruction_barrier() {
+    // SAFETY: a barrier only orders execution.
+    unsafe {
+        asm("isb")
+    }
+}
+
+// The interrupt mask (PRIMASK): true while interrupts are masked, as in a
+// `hal.Critical` section.
+pub fn interrupts_masked() -> bool {
+    // SAFETY: reading PRIMASK has no side effects.
+    primask := unsafe {
+        asm("mrs {0}, primask", out(reg) u32, options(nomem))
+    }
+    return (primask & 1) != 0
+}
+
+// The exception number of the running handler (IPSR): 0 in thread mode,
+// 15 in SysTick_Handler, and 16 + n in the handler of IRQ n.
+pub fn active_exception() -> u32 {
+    // SAFETY: reading IPSR has no side effects.
+    ipsr := unsafe {
+        asm("mrs {0}, ipsr", out(reg) u32, options(nomem))
+    }
+    return ipsr & 0x1FF
+}

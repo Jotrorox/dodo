@@ -2,7 +2,9 @@
 use crate::ast::*;
 use llvm::{Attribute, AttributeLoc, BasicBlock, Builder, LlvmType, Module, TargetData, Value};
 pub use llvm::{Context, FileType, TargetMachine};
-use llvm_sys::LLVMLinkage::{LLVMExternalLinkage, LLVMInternalLinkage, LLVMPrivateLinkage};
+use llvm_sys::LLVMLinkage::{
+    LLVMAppendingLinkage, LLVMExternalLinkage, LLVMInternalLinkage, LLVMPrivateLinkage,
+};
 use llvm_sys::{
     LLVMAtomicOrdering as AtomicOrdering, LLVMAtomicRMWBinOp as AtomicRMWBinOp,
     LLVMIntPredicate as IntPredicate, LLVMRealPredicate as FloatPredicate,
@@ -52,7 +54,8 @@ fn function_sections(module: &Module<'_>) {
     // Assign after optimization so generated helpers get their own sections
     // as well, and an unused exported API can be discarded by the linker.
     for function in module.functions() {
-        if function.count_basic_blocks() != 0 {
+        // `@section` placement is the program's choice.
+        if function.count_basic_blocks() != 0 && !function.has_section() {
             let name = function.get_name().to_string_lossy();
             function.set_section(Some(&format!("{prefix}{name}")));
             if coff {
@@ -179,6 +182,7 @@ pub fn generate<'ctx>(
         vtables: HashMap::new(),
         fn_pointers: HashMap::new(),
         trampolines: HashMap::new(),
+        used: vec![],
     };
     cg.declare_types()?;
     cg.declare_functions()?;
@@ -191,6 +195,7 @@ pub fn generate<'ctx>(
     if options.entry {
         cg.entry(&options.test_functions)?;
     }
+    cg.emit_used();
     cg.mark_nounwind();
     if let Some(debug) = &cg.debug {
         debug.builder.finalize();
@@ -289,6 +294,8 @@ struct Codegen<'a, 'ctx> {
     // and per-signature adapters from function pointers to closure references.
     fn_pointers: HashMap<String, Value<'ctx>>,
     trampolines: HashMap<String, Value<'ctx>>,
+    // Definitions with `@section`, kept through `llvm.used`.
+    used: Vec<Value<'ctx>>,
 }
 impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn ty(&self, t: &Type) -> Result<LlvmType<'ctx>> {
@@ -497,8 +504,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             // Keep exported and C signatures stable. Internal aggregate values
             // otherwise flatten into thousands of ABI operands at -O0, making
             // ordinary owned-buffer APIs prohibitively expensive to compile.
+            // Interrupt handlers are C functions the vector table names.
+            let exported = f.extern_ || f.interrupt.is_some();
             let internal =
-                !f.extern_ && f.name != "main" && (f.imported || !f.public || f.generic_instance);
+                !exported && f.name != "main" && (f.imported || !f.public || f.generic_instance);
             let large = |ty: &Type| -> Result<bool> {
                 Ok(internal && *ty != Type::Void && self.data.get_abi_size(&self.ty(ty)?) > 1024)
             };
@@ -526,7 +535,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             };
             self.indirect
                 .insert(f.name.clone(), (indirect_return, indirect_params));
-            let symbol = if f.extern_ {
+            let symbol = if let Some(vector) = &f.interrupt {
+                vector.clone()
+            } else if f.extern_ {
                 f.name.rsplit('.').next().unwrap_or(&f.name).to_owned()
             } else {
                 format!("dodo.{}.{}", self.program.package, f.name)
@@ -534,14 +545,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             // `pub` grants source visibility to importers; only the root package
             // exports a Dodo API from this compilation unit. Keep C definitions
             // externally visible even when they originate in an imported package.
-            let linkage = if f.extern_
-                || f.name == "main"
-                || (!f.imported && f.public && !f.generic_instance)
-            {
-                LLVMExternalLinkage
-            } else {
-                LLVMInternalLinkage
-            };
+            let linkage =
+                if exported || f.name == "main" || (!f.imported && f.public && !f.generic_instance)
+                {
+                    LLVMExternalLinkage
+                } else {
+                    LLVMInternalLinkage
+                };
             let function = if let Some(existing) = self.module.lookup_function(&symbol) {
                 if !f.extern_ || existing.get_type() != ty {
                     return Err(error(format!(
@@ -552,14 +562,69 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             } else {
                 self.module.add_function(&symbol, ty, Some(linkage))
             };
-            if f.extern_ {
+            if exported {
                 for (location, attribute) in self.c_abi_attributes(f) {
                     function.add_attribute(location, attribute);
                 }
             }
+            if f.interrupt.is_some() && self.riscv_bare_metal() {
+                // Save every register the handler uses and return with `mret`.
+                function.add_attribute(
+                    AttributeLoc::Function,
+                    self.context.create_string_attribute("interrupt", "machine"),
+                );
+            }
+            self.apply_placement(function, &f.placement, f.body.is_some(), 1)?;
             self.functions.insert(f.name.clone(), function);
         }
         Ok(())
+    }
+    /// Apply `@section` and `@align`. Placed definitions are kept even when
+    /// nothing in the program refers to them, like a header the linker script
+    /// positions: `llvm.used` survives LLVM's dead-code removal and marks the
+    /// section retained against the linker's garbage collection.
+    fn apply_placement(
+        &mut self,
+        value: Value<'ctx>,
+        placement: &Placement,
+        defined: bool,
+        natural: u32,
+    ) -> Result<()> {
+        if let Some(section) = &placement.section {
+            let triple = self.module.get_triple();
+            let triple = triple.as_str().to_string_lossy();
+            if (triple.contains("apple") || triple.contains("darwin")) && !section.contains(',') {
+                return Err(error(format!(
+                    "section \"{section}\" needs a Mach-O segment for target `{triple}`: write \"segment,section\", such as \"__DATA,{}\"",
+                    section.trim_start_matches('.')
+                )));
+            }
+            value.set_section(Some(section));
+            if defined {
+                self.used.push(value);
+            }
+        }
+        if let Some(align) = placement.align {
+            value.set_alignment(align.max(natural))?;
+        }
+        Ok(())
+    }
+    fn riscv_bare_metal(&self) -> bool {
+        let triple = self.module.get_triple();
+        let triple = triple.as_str().to_string_lossy();
+        triple.starts_with("riscv") && (triple.contains("-none") || triple.contains("-unknown-elf"))
+    }
+    /// Emit `llvm.used` for the definitions `place` retained.
+    fn emit_used(&self) {
+        if self.used.is_empty() {
+            return;
+        }
+        let pointer = self.context.ptr_type(0);
+        let array = pointer.array_type(self.used.len() as u32);
+        let global = self.module.add_global(array, None, "llvm.used");
+        global.set_initializer(&pointer.const_array(&self.used));
+        global.set_linkage(LLVMAppendingLinkage);
+        global.set_section(Some("llvm.metadata"));
     }
     fn mark_nounwind(&self) {
         // Dodo never unwinds (traps abort), so neither its functions nor the
@@ -645,6 +710,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             );
             g.set_initializer(&val);
             g.set_constant(!c.mutable);
+            let natural = self.data.get_abi_alignment(&self.ty(&c.ty)?);
+            self.apply_placement(g, &c.placement, true, natural)?;
             g.set_linkage(if c.public {
                 LLVMExternalLinkage
             } else {
@@ -1748,6 +1815,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             ExprKind::Closure(closure) => self.closure(closure, &e.ty)?,
             ExprKind::Invoke { callee, args } => self.invoke(callee, args, &e.ty)?,
+            ExprKind::Asm(asm) => self.inline_asm(asm, &e.ty)?,
             ExprKind::Cast(x, t) if t.closure_signature().is_some() => match &x.kind {
                 // A closure without captures needs no environment.
                 ExprKind::Closure(closure) if closure.captures.is_empty() => {
@@ -2450,6 +2518,113 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 "cannot lower conversion from {from} to {to}"
             ))),
         }
+    }
+    /// Lowers `asm(...)`. LLVM numbers outputs first, then `in` operands in
+    /// source order, then the inputs tied to `inout` outputs, which the template
+    /// cannot name separately. `out` operands are early-clobber: the template
+    /// may write them before it has read every input.
+    fn inline_asm(&mut self, asm: &InlineAsm, ty: &Type) -> Result<Value<'ctx>> {
+        let indices = crate::sema::asm::llvm_operand_indices(asm);
+        let template = crate::sema::asm::llvm_template(&asm.template, &indices).map_err(error)?;
+        let register = |register: &AsmRegister| match register {
+            AsmRegister::Any => "r".to_owned(),
+            AsmRegister::Named(name) => format!("{{{}}}", name.to_ascii_lowercase()),
+        };
+        // Evaluate inputs in source order, whatever their LLVM position.
+        let mut values = Vec::with_capacity(asm.operands.len());
+        for operand in &asm.operands {
+            values.push(match &operand.kind {
+                AsmOperandKind::In(value) | AsmOperandKind::InOut(value) => Some(self.expr(value)?),
+                AsmOperandKind::Out(_) => None,
+            });
+        }
+        let mut constraints = vec![];
+        let mut outputs = vec![];
+        for operand in &asm.operands {
+            match &operand.kind {
+                AsmOperandKind::Out(ty) => {
+                    constraints.push(format!("=&{}", register(&operand.register)));
+                    outputs.push(self.ty(ty)?);
+                }
+                AsmOperandKind::InOut(value) => {
+                    constraints.push(format!("={}", register(&operand.register)));
+                    outputs.push(self.ty(&value.ty)?);
+                }
+                AsmOperandKind::In(_) => {}
+            }
+        }
+        let mut args = vec![];
+        for (operand, value) in asm.operands.iter().zip(&values) {
+            if let (AsmOperandKind::In(_), Some(value)) = (&operand.kind, value) {
+                constraints.push(register(&operand.register));
+                args.push(*value);
+            }
+        }
+        let mut output = 0;
+        for (operand, value) in asm.operands.iter().zip(&values) {
+            match (&operand.kind, value) {
+                (AsmOperandKind::InOut(_), Some(value)) => {
+                    constraints.push(output.to_string());
+                    args.push(*value);
+                    output += 1;
+                }
+                (AsmOperandKind::Out(_), _) => output += 1,
+                _ => {}
+            }
+        }
+        for clobber in &asm.clobbers {
+            constraints.push(format!("~{{{}}}", clobber.to_ascii_lowercase()));
+        }
+        if !asm.nomem
+            && !asm
+                .clobbers
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("memory"))
+        {
+            constraints.push("~{memory}".into());
+        }
+        // Templates may change the condition flags, as GCC and Clang assume.
+        let triple = self.module.get_triple();
+        let arch = triple.as_str().to_string_lossy();
+        let arch = arch.split('-').next().unwrap_or_default();
+        if arch.starts_with("x86") || (arch.starts_with('i') && arch.ends_with("86")) {
+            constraints.extend(["~{dirflag}", "~{fpsr}", "~{flags}"].map(str::to_owned));
+        } else if ["arm", "thumb", "aarch64", "arm64"]
+            .iter()
+            .any(|prefix| arch.starts_with(prefix))
+        {
+            constraints.push("~{cc}".into());
+        }
+        let parameters: Vec<_> = args.iter().map(|value| value.get_type()).collect();
+        let result = match outputs.as_slice() {
+            [] => self.context.void_type(),
+            [single] => *single,
+            several => self.context.struct_type(several, false),
+        };
+        let value = self.builder.build_inline_asm_with(
+            result.fn_type(&parameters, false),
+            &template,
+            &constraints.join(","),
+            &args,
+            "asm",
+            !asm.pure,
+        )?;
+        Ok(match outputs.len() {
+            0 => self.context.i8_type().const_zero(),
+            1 => value,
+            count => {
+                let mut tuple = self.ty(ty)?.get_undef();
+                for index in 0..count as u32 {
+                    let element = self
+                        .builder
+                        .build_extract_value(value, index, "asm.output")?;
+                    tuple = self
+                        .builder
+                        .build_insert_value(tuple, element, index, "asm.tuple")?;
+                }
+                tuple
+            }
+        })
     }
     /// Lowers `core/cpu`. Bare-metal Cortex-M and RISC-V (machine mode) use the
     /// architectural interrupt mask; hosted OS targets expose no interrupt mask

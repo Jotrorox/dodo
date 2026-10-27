@@ -1021,6 +1021,16 @@ impl Expander {
                     Box::new(closure.ret.clone()),
                 ))
             }
+            ExprKind::Asm(asm) => asm
+                .operands
+                .iter()
+                .filter_map(|operand| match &operand.kind {
+                    AsmOperandKind::Out(ty) => Some(Some(ty.clone())),
+                    AsmOperandKind::InOut(value) => Some(self.guess(value)),
+                    AsmOperandKind::In(_) => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(asm_result),
             ExprKind::Invoke { callee, .. } => self
                 .guess(callee)
                 .and_then(|t| t.call_signature().map(|(_, r)| r.clone())),
@@ -1273,6 +1283,30 @@ impl Expander {
                 }
             }
             ExprKind::Closure(closure) => self.closure(closure, substitutions, expected)?,
+            ExprKind::Asm(asm) => {
+                let mut outputs = vec![];
+                for operand in &mut asm.operands {
+                    match &mut operand.kind {
+                        AsmOperandKind::In(value) => {
+                            self.expression(value, substitutions, None)?;
+                        }
+                        AsmOperandKind::InOut(value) => {
+                            outputs.push(self.expression(value, substitutions, None)?);
+                        }
+                        AsmOperandKind::Out(ty) => {
+                            self.ty(ty, substitutions, operand.span)?;
+                            outputs.push(ty.clone());
+                        }
+                    }
+                }
+                let several = outputs.len() > 1;
+                let mut ty = asm_result(outputs);
+                if several {
+                    self.ty(&mut ty, substitutions, span)?;
+                    asm.tuple = Some(ty.clone());
+                }
+                ty
+            }
             ExprKind::Invoke { callee, args } => {
                 let callee = self.expression(callee, substitutions, None)?;
                 let signature = callee

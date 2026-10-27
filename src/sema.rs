@@ -8,6 +8,8 @@ use crate::diagnostic::{Diagnostic, DiagnosticBinding, DiagnosticKind, MissingEr
 use std::collections::{HashMap, HashSet};
 
 mod aliases;
+#[cfg_attr(not(feature = "llvm"), allow(dead_code))]
+pub(crate) mod asm;
 mod closures;
 #[doc(hidden)]
 pub mod flow;
@@ -71,6 +73,61 @@ pub fn check_recovering(program: &mut Program, pointer_bits: u32) -> Vec<Diagnos
     diagnostics
 }
 
+/// The hardware calls an interrupt handler; code that needs the same work
+/// calls an ordinary function the handler calls too.
+fn interrupt_handler_use(name: &str, vector: &str, span: Span) -> Diagnostic {
+    Diagnostic::new(
+        span,
+        format!("`{name}` is the {vector} interrupt handler; only the hardware calls it"),
+    )
+    .note("move the work into an ordinary function and call that from the handler and from here")
+}
+
+/// One handler per vector, a vector the selected chip has, and no C function
+/// that takes the vector's symbol.
+fn validate_interrupt_handlers(program: &Program) -> Check<()> {
+    let mut handlers: HashMap<&str, &Function> = HashMap::new();
+    for function in &program.functions {
+        let Some(vector) = &function.interrupt else {
+            continue;
+        };
+        if let Some(vectors) = program.interrupt_vectors
+            && !vectors.contains(&vector.as_str())
+        {
+            return Err(Diagnostic::new(
+                signature_span(function),
+                format!(
+                    "unknown interrupt vector `{vector}` for this chip{}",
+                    crate::project::suggest(vector, vectors.iter().copied())
+                ),
+            )
+            .note(format!("the chip's vectors are: {}", vectors.join(", "))));
+        }
+        if let Some(first) = handlers.insert(vector, function) {
+            return Err(Diagnostic::new(
+                signature_span(function),
+                format!("`{vector}` already has a handler"),
+            )
+            .label(signature_span(first), "the first handler is here"));
+        }
+    }
+    for function in &program.functions {
+        let symbol = function.name.rsplit('.').next().unwrap_or(&function.name);
+        if function.extern_
+            && let Some(handler) = handlers.get(symbol)
+        {
+            return Err(Diagnostic::new(
+                signature_span(function),
+                format!(
+                    "extern \"C\" fn `{symbol}` uses the symbol of the @interrupt({symbol}) handler"
+                ),
+            )
+            .label(signature_span(handler), "the handler is here"));
+        }
+    }
+    Ok(())
+}
+
 fn check_program(
     program: &mut Program,
     pointer_bits: u32,
@@ -82,6 +139,7 @@ fn check_program(
     aliases::resolve(program)?;
     crate::prepare::prepare(program, pointer_bits)?;
     validate_public_interfaces(program)?;
+    validate_interrupt_handlers(program)?;
     interfaces::validate_bounds(program)?;
     let obligations = instantiate(program)?;
     let context = Context::new(program, pointer_bits)?;
@@ -292,6 +350,8 @@ struct Signature {
     unsafe_: bool,
     extern_: bool,
     public: bool,
+    /// The vector of an `@interrupt` handler, which code cannot call.
+    interrupt: Option<String>,
     span: Span,
 }
 struct Context {
@@ -489,6 +549,7 @@ impl Context {
                     unsafe_: function.unsafe_,
                     extern_: function.extern_,
                     public: function.public,
+                    interrupt: function.interrupt.clone(),
                     span: signature_span(function),
                 },
             );
@@ -1269,6 +1330,9 @@ impl<'a> Checker<'a> {
     fn access_label(&self, place: &Loan, access: Access) -> String {
         let name = self.by_id(place.root).map_or_else(
             || {
+                if let Some(name) = place.fields.first().and_then(|f| f.strip_prefix("static ")) {
+                    return format!("static `{}`", source_spelling(name));
+                }
                 place
                     .external
                     .clone()
@@ -2541,6 +2605,7 @@ impl<'a> Checker<'a> {
             ExprKind::Name(_) if let Some(ty) = function_value.take() => Value { ty, deps: vec![] },
             ExprKind::Closure(closure) => self.closure(closure, expected, span)?,
             ExprKind::Invoke { callee, args } => self.invoke(callee, args, span)?,
+            ExprKind::Asm(asm) => self.inline_asm(asm, span)?,
             ExprKind::Name(_)
             | ExprKind::Field(..)
             | ExprKind::Index(..)
@@ -3323,6 +3388,16 @@ impl<'a> Checker<'a> {
                     })
                 }),
             ExprKind::Closure(_) => None,
+            ExprKind::Asm(asm) => asm
+                .operands
+                .iter()
+                .filter_map(|operand| match &operand.kind {
+                    AsmOperandKind::Out(ty) => Some(Some(ty.clone())),
+                    AsmOperandKind::InOut(value) => Some(self.peek_type(value)),
+                    AsmOperandKind::In(_) => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(asm_result),
             ExprKind::Invoke { callee, .. } => self
                 .peek_type(callee)
                 .and_then(|t| t.call_signature().map(|(_, r)| r.clone())),
@@ -3590,9 +3665,13 @@ impl<'a> Checker<'a> {
                     if constant.mutable {
                         self.unsafe_required(span, "mutable static access")?;
                     }
+                    // Each static is its own place: borrowing one never
+                    // conflicts with reading another, or a constant.
+                    let mut loan = static_loan(span);
+                    loan.fields.push(format!("static {name}"));
                     Place {
                         ty: constant.ty.clone(),
-                        loans: vec![static_loan(span)],
+                        loans: vec![loan],
                         mutable: constant.mutable,
                         direct: None,
                     }
@@ -3932,6 +4011,9 @@ impl<'a> Checker<'a> {
                 span,
                 format!("function `{name}` is private to its package"),
             ));
+        }
+        if let Some(vector) = &signature.interrupt {
+            return Err(interrupt_handler_use(name, vector, span));
         }
         if signature.unsafe_ || signature.extern_ {
             self.unsafe_required(span, "calling an unsafe or foreign function")?;

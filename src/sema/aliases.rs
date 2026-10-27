@@ -237,6 +237,7 @@ fn expression_names(expression: &Expr, names: &mut HashSet<String>) {
             expression_names(callee, names);
             args.iter().for_each(|v| expression_names(v, names));
         }
+        ExprKind::Asm(asm) => asm.inputs().for_each(|v| expression_names(v, names)),
         ExprKind::Repeat(value, _)
         | ExprKind::Constant(value, _)
         | ExprKind::Cast(value, _)
@@ -723,6 +724,14 @@ impl Resolver {
                 self.expr(callee, scope, locals)?;
                 for argument in args {
                     self.expr(argument, scope, locals)?;
+                }
+            }
+            ExprKind::Asm(asm) => {
+                for (ty, span) in asm.output_types_mut() {
+                    self.ty(ty, scope, span, &mut vec![])?;
+                }
+                for value in asm.inputs_mut() {
+                    self.expr(value, scope, locals)?;
                 }
             }
             ExprKind::Int(..)

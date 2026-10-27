@@ -255,7 +255,7 @@ reserved and must not be used as identifiers:
 ```text
 package import pub fn struct enum interface type dyn const let return if
 else for in break continue match unsafe extern as from static void mut
-true false
+true false asm
 ```
 
 `Self`, `self`, primitive type names, and constructor names such as `some` have
@@ -1529,7 +1529,9 @@ alternative requires a valid value or owns resources; padding and inactive bytes
 are unspecified. These storage rules do not constitute a C enum or C union ABI.
 Target scalar and aggregate alignment remain implementation-defined (ID-TARGET).
 
-Accepted struct attributes are `@repr(C)`, `@unsafe_send`, `@unsafe_sync`,
+Function attributes are `@test`, `@ignore("reason")`, `@interrupt(VECTOR)`
+(section 16.6), `@section("name")`, and `@align(N)` (section 16.5); statics
+accept `@section` and `@align`. Accepted struct attributes are `@repr(C)`, `@unsafe_send`, `@unsafe_sync`,
 `@derive(Json)`, and `@json_deny_unknown`; the latter requires `@derive(Json)`.
 Derived JSON structs may rename fields with `@json_name("name")`. JSON derivation
 generates ordinary type- and borrow-checked methods for concrete structs;
@@ -1556,13 +1558,106 @@ main; `check`, object, assembly, bitcode, and IR emission must not demand a host
 entry signature or insert this wrapper. Platform startup, process exit-status
 encoding, and environment initialization are implementation-defined (ID-RUNTIME).
 
-### 16.4. Assembly and barriers
+### 16.4. Inline assembly
 
-Inline assembly, user alignment/section/export attributes, custom interrupt ABI,
-target barriers beyond `cpu.fence`, and custom panic-handler syntax are outside 0.1 and
-must not be silently accepted as those features. Unaligned data requires explicit
-unaligned operations; ordinary references with invalid alignment must not be
-created. Device/interrupt/DMA libraries must supply appropriate platform contracts.
+**ASM.** An inline assembly expression has the form:
+
+```dodo
+asm("template", ..., operand, ..., clobber("name", ...), options(option, ...))
+```
+
+One or more template strings come first; consecutive strings are joined with a
+newline, so each usually holds one instruction. Operands follow:
+
+| Operand | Meaning |
+| --- | --- |
+| `in(reg) expression` | Pass the value in a general-purpose register the compiler chooses. |
+| `in("r0") expression` | Pass it in exactly the named register. |
+| `out(reg) Type` | The template writes a value of `Type` to a register; the expression returns it. |
+| `inout(reg) expression` | Pass the value and return the register's final value, of the same type. |
+
+The template names operands `{0}`, `{1}`, ... in the order written, or `{}` for
+the next one; `{N:modifier}` applies a target operand modifier (letters only),
+and `{{` and `}}` are literal braces. A reference to a missing operand, an
+unmatched brace, or an empty modifier must be rejected. Operand values are
+integers no wider than the target pointer, raw pointers, or function pointers;
+other types must be rejected. One register must not serve two operands in the
+same direction, or both an output and a clobber.
+
+The expression's type is `void` without outputs, the output's type with one, and
+a tuple of the output types in order with several. Inputs are evaluated once, in
+source order, before the template runs. An `out` register may be written before
+every input has been read, so it never shares a register with an input.
+
+**ASM-EFFECT.** Unless options say otherwise, the template may read and write any
+memory the program can reach and change the condition flags, so it is a compiler
+barrier for memory accesses, and it is never removed, duplicated, or merged.
+`clobber("r4", ...)` names further registers the template overwrites, and
+`clobber("memory")` restates the default. `options(nomem)` promises that the
+template accesses no memory the program can see; `options(pure)` promises that
+its only effect is its outputs, so it may be removed when they are unused or
+merged with an identical one, and requires at least one output.
+
+Inline assembly requires an explicit unsafe block (section 13.1). The caller
+guarantees that the template is valid for the target, honors the declared
+operands, clobbers, and options, and leaves the stack pointer, the frame, and
+every unlisted register as it found them. Template syntax is the target
+assembler's: LLVM's integrated assembler with unified syntax on Arm and AT&T
+syntax on x86 (ID-ASM). A template the assembler rejects must be reported as a
+compile error, not accepted silently.
+
+### 16.5. Placement attributes
+
+**PLACE.** `@section("name")` places a function or a `static` in the named object
+file section, and `@align(N)` raises its alignment to `N` bytes, a power of two
+from 1 to 2^29. Both apply to functions, including methods, and to `static` and
+`static mut` declarations; on a `const`, a struct, an enum, a type alias, an
+interface, or an interface method they must be rejected. Alignment below the
+type's ABI alignment has no effect: storage keeps at least its natural
+alignment. A section name is non-empty printable ASCII without spaces, quotes,
+or backslashes; on Mach-O targets it must name a segment, as in
+`"__DATA,__name"`.
+
+A definition with `@section` is kept in the output even when nothing in the
+program refers to it, so a linker script can position it; whether the linker
+keeps its section is the linker script's decision. The section's meaning (load
+address, initialization, whether it is copied to RAM) is the platform's
+(ID-PLACE).
+
+### 16.6. Interrupt handlers
+
+**IRQ.** `@interrupt(VECTOR)` declares the handler the hardware runs for the
+exception or interrupt named `VECTOR`:
+
+```dodo
+@interrupt(TIMER_IRQ_0)
+fn alarm_fired() {
+    // ...
+}
+```
+
+A handler is a private, safe, non-generic, top-level function with a body, no
+parameters, and no result. It is exported under the vector's name with the
+target's interrupt-entry convention, so the platform's vector table refers to
+it. Code must not call it or use it as a function value; work shared with other
+code belongs in an ordinary function the handler calls. A program has at most
+one handler per vector, and a C function definition must not take a handler's
+symbol. When the build selects a chip, the vector must be one the chip's vector
+table names; without one, any identifier is accepted.
+
+A handler runs asynchronously with respect to the code it interrupts. It shares
+state with that code only through `static mut` storage, whose accesses are
+unsafe (section 15.5); the program must keep the two from observing each other's
+partial updates, for example with a critical section in the interrupted code.
+
+### 16.7. Barriers and alignment of references
+
+Target barriers beyond `cpu.fence`, interrupt priorities, and vector numbers
+are library facilities built on MMIO and inline assembly. Custom panic-handler
+syntax is outside 0.1 and must not be silently accepted. Unaligned data requires
+explicit unaligned operations; ordinary references with invalid alignment must
+not be created. Device, interrupt, and DMA libraries must supply appropriate
+platform contracts.
 
 ## 17. Traps and arithmetic failure
 
@@ -1756,11 +1851,13 @@ program       = package-decl, { import-decl | declaration } ;
 package-decl  = "package", identifier, newline ;
 import-decl   = "import", string-literal, [ "as", identifier ], newline ;
 
-declaration   = [ "pub" ],
+declaration   = { attribute }, [ "pub" ],
                 ( function-decl | struct-decl | enum-decl | alias-decl )
-              | const-decl ;
+              | { attribute }, const-decl ;
+attribute     = "@", identifier, [ "(", attribute-argument, ")" ], [ newline ] ;
 alias-decl    = "type", identifier, [ type-params ], "=", type, newline ;
-const-decl    = "const", identifier, ":", type, "=", expression, newline ;
+const-decl    = ( "const" | "static", [ "mut" ] ), identifier, ":", type, "=",
+                expression, newline ;
 
 function-decl = [ "unsafe" ], [ "extern", string-literal ],
                 "fn", identifier, [ type-params ], "(", [ parameters ], ")",
@@ -1835,6 +1932,13 @@ closure       = "fn", "(", [ closure-param, { ",", closure-param } ], ")",
                 [ "->", type ], block ;
 closure-param = identifier, [ ":", type ] ;
 value-call    = expression, "(", [ expression, { ",", expression } ], ")" ;
+inline-asm    = "asm", "(", string-literal, { ",", string-literal },
+                { ",", asm-operand }, [ "," ], ")" ;
+asm-operand   = ( "in" | "inout" ), "(", asm-register, ")", expression
+              | "out", "(", asm-register, ")", type
+              | "clobber", "(", string-literal, { ",", string-literal }, ")"
+              | "options", "(", identifier, { ",", identifier }, ")" ;
+asm-register  = "reg" | string-literal ;
 ```
 
 ## Appendix B. Conformance checklist
@@ -1861,6 +1965,8 @@ A compiler claiming Dodo 0.1 conformance must, at minimum:
 - Trap on safe overflow, division by zero, invalid shifts, and invalid indexing
   in every build profile.
 - Preserve volatile-access semantics.
+- Check inline assembly operands and templates, and keep its declared effects.
+- Export interrupt handlers under their vector names and reject direct calls.
 - Avoid a mandatory garbage collector, heap, scheduler, or exception runtime
   when the program does not request one.
 
@@ -1882,6 +1988,7 @@ filters. Suite abbreviations refer to these files:
 - `packages`: [tests/stdlib_packages.rs](https://github.com/Jotrorox/dodo/blob/main/tests/stdlib_packages.rs)
 - `tuples_and_aliases`: [tests/tuples_and_aliases.rs](https://github.com/Jotrorox/dodo/blob/main/tests/tuples_and_aliases.rs)
 - `closures`: [tests/closures.rs](https://github.com/Jotrorox/dodo/blob/main/tests/closures.rs)
+- `firmware_attributes`: [tests/firmware_attributes.rs](https://github.com/Jotrorox/dodo/blob/main/tests/firmware_attributes.rs)
 - `lexer`, `parser`, `sema`, `package`: the `tests` modules in `src/lexer.rs`,
   `src/parser.rs`, `src/sema.rs`, and `src/package.rs` respectively.
 
@@ -1917,6 +2024,9 @@ execution cases and enforced static boundaries are identified separately.
 | PTR-BYTES, CORE-MEM | E `spec::pointer_integer_round_trip_offsets_and_byte_access`, `core::core_storage_pointers_and_owned_exchange`, `opaque_storage_moves_without_dropping_contents`; R `core::pointer_and_storage_errors_are_diagnostics`. |
 | CORE-MMIO, sections 15.2–15.3 | T `compiler::gpio_emits_volatile_accesses_without_host_execution`; R `sema::mmio_checked`; board address/width legality remains an unsafe precondition. |
 | CORE-CPU, section 15.4 | R `sema::cpu_operations_checked`; T `hal_library::interrupt_control_lowers_to_each_architecture_mask`; R/T `hal_library::freestanding_targets_without_an_interrupt_model_are_rejected`; E `hal_library::registers_protocols_and_fakes_execute_on_the_host`. |
+| ASM, ASM-EFFECT | E `firmware_attributes::inline_assembly_runs_on_the_host`; R `firmware_attributes::inline_assembly_mistakes_are_diagnosed`; T `firmware_attributes::firmware_uses_inline_assembly_and_the_cortex_m_package`; A `sema::asm::tests::templates_number_outputs_before_inputs`, `parser::tests::firmware_attributes_and_inline_assembly`. |
+| PLACE | T `firmware_attributes::sections_and_alignment_place_code_and_data`; R `firmware_attributes::placement_mistakes_are_diagnosed`. |
+| IRQ | T `firmware_attributes::interrupt_handlers_fill_the_vector_table`, `riscv_interrupt_handlers_return_with_mret`; R `firmware_attributes::interrupt_handler_mistakes_are_diagnosed`; A `hardware::tests::interrupt_names_match_the_runtime_vector_tables`. |
 | ABI-C | E `spec::c_scalar_results_and_struct_pointer_layout_interoperate`; R `spec::incompatible_lowered_foreign_declarations_fail_before_linking`; E `regressions::foreign_narrow_integer_arguments_follow_the_c_abi`, `compiler::hello_uses_native_c_abi`, `imported_foreign_declarations_keep_their_c_symbol_name`, `repeated_foreign_declarations_across_packages_share_a_c_symbol`; E/R `spec::hosted_entry_signatures_and_c_definitions`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`. |
 | ABI-NATIVE, ABI-ENTRY | T `spec::target_profiles_publish_width_endianness_and_native_symbols`; A/R/E `spec::hosted_entry_signatures_and_c_definitions`; E `compiler::cli_run_preserves_program_exit_status`; T `compiler::emits_llvm_ir_bitcode_assembly_and_object_files`. |
 | Bindings, returns, patterns, sections 5–6 and 11–12 | E `compiler::immutable_runtime_bindings_preserve_mutable_references_and_function_tails`, `recursive_patterns_ranges_guards_and_conditional_bindings_execute`, `alternative_patterns_retry_guards_in_order`; R `compiler::new_binding_and_pattern_forms_reject_invalid_programs`, `rejects_unhandled_results_and_incompatible_propagation`; A/R/E `tests/reference_iteration.rs`. |
@@ -1949,6 +2059,8 @@ tests constrain the documented choice, not every possible conforming choice.
 | ID-RUNTIME: startup and linking | Hosted builds use a native C linker driver. Importing std/env initializes its argument runtime from the C main arguments before source main; other library facilities initialize through explicit calls. Raw object/IR emission supplies no startup. Freestanding startup, linker scripts, system libraries, and OS exit-status encoding are supplied by the target/toolchain. Evidence: `spec::hosted_entry_signatures_and_c_definitions` (A/R/E), `tests/env_library.rs` (E), `compiler::emits_llvm_ir_bitcode_assembly_and_object_files` (T). |
 | ID-TRAP: failure mechanism | `--panic auto` writes the check kind, file, line, and column to stderr and calls C `abort` on supported hosted targets; other targets use `llvm.trap`, which may itself lower to C `abort`. `--panic hosted`, `--panic trap`, and `--panic-hook SYMBOL` select behavior explicitly for checked operations and ordinary assertions. The non-returning C ABI hook receives static NUL-terminated check/file strings and u32 line/column and owns termination without a fallback trap; returning is undefined behavior. The hosted test runner uses its own reporting and trap behavior. No mode unwinds, runs destructors, or supplies a reset driver. Instruction, signal/exception, and exit encoding are target-specific. Evidence: `tests/debugging.rs`, `compiler::arithmetic_and_index_traps_survive_optimization`, `spec::checked_float_cast_boundaries_trap` (E/T). |
 | ID-HW: device access and atomics | MMIO widths are restricted as in CORE-MMIO and use volatile loads/stores; board address legality is an unsafe precondition. CORE-CPU masks PRIMASK on bare-metal Arm M-profile targets and `mstatus.MIE` on bare-metal RISC-V (machine mode); hosted Linux, Windows, Apple, BSD, Android, and WASI targets have no program-visible mask, so masking and waiting are no-ops there; other targets reject reachable masking or waiting after dead-code elimination. Native integer atomic capabilities/orderings are target-restricted; unsupported operations are diagnosed, with no implicit libatomic fallback. Evidence: `compiler::gpio_emits_volatile_accesses_without_host_execution` (T), `tests/thread_library.rs::atomic_ordering_and_target_capabilities_are_checked` (R/T). |
+| ID-ASM: inline assembly syntax | Templates are assembled by LLVM 23's integrated assembler for the selected target: unified syntax on Arm and Thumb, AT&T syntax on x86. `reg` is the general-purpose register class (`r` constraint); a named register is passed to LLVM as `{name}`. Every template is a memory barrier unless `options(nomem)`, and also clobbers the condition flags (`cc` on Arm and AArch64; `flags`, `fpsr`, and `dirflag` on x86). Assembler errors are reported as compile errors with the assembler's message. Evidence: `firmware_attributes::inline_assembly_runs_on_the_host` (E), `inline_assembly_mistakes_are_diagnosed` (R). |
+| ID-PLACE: sections and interrupts | Section names are passed to the object file unchanged, and placed definitions are listed in `llvm.used`. The RP2040 and RP2350 linker scripts copy `.ramfunc` sections to SRAM with `.data`, and keep `.noinit` sections in SRAM without loading or zeroing them. Interrupt handlers use the C calling convention on Arm M-profile targets, whose hardware saves the caller-saved registers, and the machine-mode interrupt convention (`mret`) on bare-metal RISC-V. Chip vector names are those of `std/embedded/chip/NAME`'s runtime vector table. Evidence: `firmware_attributes::sections_and_alignment_place_code_and_data`, `interrupt_handlers_fill_the_vector_table`, `riscv_interrupt_handlers_return_with_mret` (T). |
 | ID-LIMIT: resource limits | Parser nesting: 64 levels. Constant dependency depth: 128; expansion work: 200,000 nodes. Array count must fit target usize and u32; nonzero repeated constants are limited to 1,000,000 elements. Generic instantiation: 4,096 specializations and 64 nested specializations (including generated methods). Pattern expansion: 4096 alternatives; exhaustiveness work has a 131,072-unit budget (charged for matrix rows and type columns); exhaustion must diagnose, not assume coverage. Evidence: `compiler::generic_specialization_breadth_and_depth_have_separate_limits` (R), `compiler::constant_cycles_width_and_expansion_limits_are_diagnosed` (R), `sema::excessive_pattern_expansion_reports_a_diagnostic` (R), `compiler::new_forms_reject_invalid_types_moves_lifetimes_and_unhandled_errors` (R). |
 | ID-DIAG: diagnostic presentation | Errors identify a source location where available. Text wording, ordering, number of follow-on errors, and CLI/LSP presentation are not a stable machine-readable language ABI. Editor transport is separately documented. Evidence: `tests/diagnostics.rs`, `tests/lsp.rs`, `package::diagnostic_labels_resolve_each_file_independently` (A/R). |
 
@@ -1956,13 +2068,14 @@ tests constrain the documented choice, not every possible conforming choice.
 
 Specialization, user lifetime/variance syntax, standalone
 partial field moves, a package registry, package initializers, re-exports,
-variadic/C aggregate-by-value calls, inline assembly, user section/alignment/export
-attributes, interrupt ABI declarations, and panic-handler registration are not
+variadic/C aggregate-by-value calls, user export attributes, assembly outside
+functions (global or naked assembly), and panic-handler registration are not
 part of 0.1. The compiler must reject syntax presented as these features rather
 than assign it an undocumented meaning. Checked mutable slice splitting is
 available through `core/slice.split_at_mut` and its compiler-recognized
 `SplitMut<T>` result. General user-defined disjointness proofs, DMA abstractions,
-and interrupt-safe allocators require future library/compiler work. The named rules above replace the former open questions about fundamental
+and interrupt-safe allocators require future library/compiler work; interrupt
+handlers (section 16.6) give the entry points such libraries build on. The named rules above replace the former open questions about fundamental
 execution, representation, provenance, ABI, and packages; they do not assert a
 formal proof of memory safety or complete platform support.
 

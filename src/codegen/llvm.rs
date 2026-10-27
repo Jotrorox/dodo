@@ -35,9 +35,32 @@ unsafe fn message(raw: *mut std::ffi::c_char) -> String {
 }
 
 pub struct Context(LLVMContextRef);
+/// Errors LLVM reports through the context while generating code, such as an
+/// inline assembly template the target's assembler rejects. Without a handler
+/// LLVM prints them and exits the process.
+type Diagnostics = std::cell::RefCell<Vec<String>>;
+extern "C" fn collect_diagnostic(info: LLVMDiagnosticInfoRef, sink: *mut std::ffi::c_void) {
+    unsafe {
+        if LLVMGetDiagInfoSeverity(info) == LLVMDiagnosticSeverity::LLVMDSError {
+            let text = message(LLVMGetDiagInfoDescription(info));
+            (*sink.cast::<Diagnostics>()).borrow_mut().push(text);
+        }
+    }
+}
 impl Context {
     pub fn create() -> Self {
-        Self(unsafe { LLVMContextCreate() })
+        let context = unsafe { LLVMContextCreate() };
+        let sink = Box::into_raw(Box::new(Diagnostics::default()));
+        unsafe { LLVMContextSetDiagnosticHandler(context, Some(collect_diagnostic), sink.cast()) };
+        Self(context)
+    }
+    /// Take the errors LLVM reported since the last call.
+    fn take_errors(context: LLVMContextRef) -> Vec<String> {
+        let sink = unsafe { LLVMContextGetDiagnosticContext(context) }.cast::<Diagnostics>();
+        if sink.is_null() {
+            return vec![];
+        }
+        std::mem::take(&mut *unsafe { &*sink }.borrow_mut())
     }
     pub(super) fn create_module(&self, name: &str) -> Module<'_> {
         Module(
@@ -157,7 +180,13 @@ impl Context {
 }
 impl Drop for Context {
     fn drop(&mut self) {
-        unsafe { LLVMContextDispose(self.0) }
+        unsafe {
+            let sink = LLVMContextGetDiagnosticContext(self.0).cast::<Diagnostics>();
+            LLVMContextDispose(self.0);
+            if !sink.is_null() {
+                drop(Box::from_raw(sink));
+            }
+        }
     }
 }
 
@@ -390,6 +419,10 @@ impl<'ctx> Value<'ctx> {
     pub(super) fn set_section(self, section: Option<&str>) {
         unsafe { LLVMSetSection(self.0, cstring(section.unwrap_or("")).as_ptr()) }
     }
+    pub(super) fn has_section(self) -> bool {
+        let section = unsafe { LLVMGetSection(self.0) };
+        !section.is_null() && unsafe { *section } != 0
+    }
     pub(super) fn count_basic_blocks(self) -> u32 {
         unsafe { LLVMCountBasicBlocks(self.0) }
     }
@@ -501,6 +534,15 @@ impl<'ctx> Module<'ctx> {
             } else {
                 Ok(Self(module, PhantomData))
             }
+        }
+    }
+    /// Errors LLVM reported while emitting this module's code.
+    fn emission_errors(&self) -> Result<()> {
+        let errors = Context::take_errors(unsafe { LLVMGetModuleContext(self.0) });
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(error(errors.join("\n")))
         }
     }
     pub(super) fn set_source_file_name(&self, name: &str) {
@@ -732,7 +774,10 @@ impl TargetMachine {
             LLVMTargetMachineEmitToFile(self.0, module.0, path.as_ptr(), kind.raw(), &mut msg)
         };
         let msg = unsafe { message(msg) };
-        if failed != 0 { Err(error(msg)) } else { Ok(()) }
+        if failed != 0 {
+            return Err(error(msg));
+        }
+        module.emission_errors()
     }
     pub fn write_to_memory_buffer(
         &self,
@@ -746,10 +791,11 @@ impl TargetMachine {
         };
         let msg = unsafe { message(msg) };
         if failed != 0 {
-            Err(error(msg))
-        } else {
-            Ok(MemoryBuffer(buffer))
+            return Err(error(msg));
         }
+        let buffer = MemoryBuffer(buffer);
+        module.emission_errors()?;
+        Ok(buffer)
     }
 }
 impl Drop for TargetMachine {
@@ -1230,6 +1276,18 @@ impl<'ctx> Builder<'ctx> {
         args: &[Value<'ctx>],
         name: &str,
     ) -> Result<Value<'ctx>> {
+        self.build_inline_asm_with(ty, assembly, constraints, args, name, true)
+    }
+    /// Inline assembly that LLVM may remove or merge unless `side_effects`.
+    pub(super) fn build_inline_asm_with(
+        &self,
+        ty: LlvmType<'ctx>,
+        assembly: &str,
+        constraints: &str,
+        args: &[Value<'ctx>],
+        name: &str,
+        side_effects: bool,
+    ) -> Result<Value<'ctx>> {
         let asm = unsafe {
             LLVMGetInlineAsm(
                 ty.0,
@@ -1237,7 +1295,7 @@ impl<'ctx> Builder<'ctx> {
                 assembly.len(),
                 constraints.as_ptr().cast_mut().cast(),
                 constraints.len(),
-                1,
+                side_effects as LLVMBool,
                 0,
                 LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
                 0,

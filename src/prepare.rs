@@ -267,6 +267,14 @@ impl Resolver {
                     self.expr(v, locals, ns, constant)?;
                 }
             }
+            ExprKind::Asm(asm) => {
+                for (ty, span) in asm.output_types_mut() {
+                    self.ty(ty, locals, ns, span)?;
+                }
+                for v in asm.inputs_mut() {
+                    self.expr(v, locals, ns, constant)?;
+                }
+            }
             ExprKind::Slice {
                 base, start, end, ..
             } => {

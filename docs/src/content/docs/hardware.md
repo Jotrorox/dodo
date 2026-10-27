@@ -15,12 +15,12 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
 | Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
-| Interrupts | `std/embedded/hal` | `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time. |
+| Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, and serial ports that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
-| Raw access | `core/mmio`, `core/cpu` | Volatile loads/stores, barriers, interrupt masking, `wfi`. |
+| Raw access | `core/mmio`, `core/cpu`, `asm(...)` | Volatile loads/stores, barriers, interrupt masking, `wfi`, inline assembly. |
 
 Five kinds of code meet here:
 
@@ -489,24 +489,26 @@ instructions as hand-written register code.
 
 ## Interrupts
 
-An interrupt handler is an exported C-ABI function with the name your chip's
-startup code puts in the vector table. Firmware entry points work the same way:
+Mark a function with `@interrupt(VECTOR)` and the hardware runs it for that
+vector-table entry. The vector names are the datasheet's, and with a board or
+chip selected the compiler checks them, so a misspelled `TIMER_IRQ0` is an
+error rather than a handler that never runs:
 
 ```dodo
 package firmware
 
 import "core/cpu"
+import "std/embedded/cortex_m"
 import "std/embedded/hal"
 
 static mut TICKS: u32 = 0
 
 // Cortex-M SysTick exception.
-extern "C" fn SysTick_Handler() {
-    section := hal.Critical.enter()
+@interrupt(SysTick_Handler)
+fn tick() {
     unsafe {
         TICKS += 1
     }
-    core.drop(section)
 }
 
 fn ticks() -> u32 {
@@ -516,26 +518,110 @@ fn ticks() -> u32 {
     return value
 }
 
-// Called by the board's reset handler once RAM is initialized.
-extern "C" fn firmware_main() {
+fn main() {
+    // A tick every 125,000 cycles: 1 ms at 125 MHz.
+    cortex_m.systick_start(124_999, true)!
     for ticks() < 1000 {
         cpu.wait_for_interrupt()
     }
 }
 ```
 
-`hal.Critical.enter()` masks interrupts on the current core and remembers
-whether they were enabled; dropping it restores exactly that state, so sections
-nest. Reading or writing `static mut` storage is unsafe in Dodo: the critical
-section is what makes it correct, and the `unsafe` block marks the place where
-you rely on it. Keep sections short, and remember they never exclude other
-threads or other cores.
+A handler takes no arguments and returns nothing, and only the hardware calls
+it: calling `tick()` from code is an error. Put work that code also needs in an
+ordinary function and call that from the handler. A program has one handler
+per vector. The compiler exports it under the vector's name, which replaces
+the runtime's default, an endless loop. On Cortex-M the hardware saves the
+registers a C function may change, so a handler is an ordinary C-ABI function;
+on bare-metal RISC-V the compiler saves every register it uses and returns
+with `mret`.
+
+The handler and the code it interrupts share state through `static mut`
+storage. Reading or writing it is unsafe in Dodo, and keeping both sides
+consistent is the program's job: `hal.Critical.enter()` masks interrupts on the
+current core and remembers whether they were enabled; dropping it restores
+exactly that state, so sections nest. A handler cannot be interrupted by
+itself, so it needs no section for state only it and lower-priority code use.
+Keep sections short, and remember they never exclude other threads or cores.
+
+### An interrupt-driven driver
+
+A driver can live in a `static mut Option<...>` that the handler serves. The
+repository's
+[`examples/interrupts`](https://github.com/Jotrorox/dodo/blob/main/examples/interrupts/main.dodo)
+echoes a serial port this way: the UART's receive interrupt moves bytes into a
+queue, SysTick counts milliseconds, and the main loop sleeps until either has
+news:
+
+```dodo
+static mut SERIAL: Option<pl011.Port> = none
+
+@interrupt(UART0_IRQ)
+fn serial_received() {
+    unsafe {
+        match &mut SERIAL {
+            some(port) => {
+                buffer := [0u8; 32]
+                match port.poll_read(&mut buffer) {
+                    ok(progress) => {
+                        enqueue(&buffer[..progress.transferred])
+                    }
+                    err(failure) => {
+                        enqueue(&buffer[..failure.transferred])
+                        port.clear_interrupts(pl011.ERROR_INTERRUPTS)
+                    }
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT | pl011.ERROR_INTERRUPTS)
+    unsafe {
+        SERIAL = some(port)
+    }
+    cortex_m.enable(chip.UART0_IRQ)
+    // ... sleep with cpu.wait_for_interrupt() and drain the queue
+}
+```
+
+Three switches must all be on for a handler to run: the peripheral's own
+interrupt enable (`port.listen`, `alarm.listen`), the interrupt's line in the
+core's interrupt controller (`cortex_m.enable`), and the core's interrupt mask,
+which is open at reset and closed only inside critical sections.
+
+| Driver | Interrupt sources |
+| --- | --- |
+| `pl011.Port` and `Controller` | `listen(sources)`, `ignore(sources)`, `pending_interrupts()`, and `clear_interrupts(sources)` with `RX_INTERRUPT` (FIFO 3/4 full), `RX_TIMEOUT_INTERRUPT` (bytes waiting for 32 bit times), `TX_INTERRUPT`, and `ERROR_INTERRUPTS`. The receive sources end when reads drain the FIFO. |
+| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` that fires once at `schedule_at(time)` or `schedule_in(microseconds)`; `listen` raises `alarm.irq()`, and its handler calls `clear`. `release_alarm` gives it back. |
+
+### The Cortex-M core
+
+`std/embedded/cortex_m` drives what every Cortex-M core has, whatever the
+chip. Interrupt numbers are the chip package's constants, such as
+`rp2040.UART0_IRQ` (also reachable as `chip.UART0_IRQ`), which match the
+vector names:
+
+| Function | Effect |
+| --- | --- |
+| `enable(irq)`, `disable(irq)`, `is_enabled(irq)` | Let an interrupt reach the core, or hold it back. |
+| `pend(irq)`, `unpend(irq)`, `is_pending(irq)` | Raise or forget an interrupt from software, for example to test a handler. |
+| `set_priority(irq, priority)`, `priority(irq)` | 0 is the most urgent; a handler is interrupted only by more urgent ones. The Cortex-M0+ keeps the top 2 bits, the RP2350's M33 the top 4. |
+| `pend_sv()` | Run the `PendSV_Handler` once no more urgent handler is active, to defer work out of an urgent one. |
+| `systick_start(reload, interrupt)`, `systick_stop()`, `systick_value()`, `systick_wrapped()` | The core's 24-bit down-counter at the processor clock; with `interrupt`, `SysTick_Handler` runs at each wrap. |
+| `set_vector_table(address)` (unsafe), `vector_table()` | Move the vector table, for example to RAM. |
+| `enable_interrupts()` (unsafe), `interrupts_masked()`, `active_exception()` | `cpsie i`, PRIMASK, and IPSR: the running handler's exception number. |
+| `wait_for_event()`, `send_event()`, `data_barrier()`, `memory_barrier()`, `instruction_barrier()` | `wfe`, `sev`, `dsb`, `dmb`, and `isb`. |
 
 ### Handlers registered at run time
 
 A vector-table entry is fixed when the firmware is linked. To choose or change
 the work an interrupt does while the program runs, keep a function pointer in a
-`hal.Handler` slot and call it from the entry point:
+`hal.Handler` slot and call it from the handler:
 
 ```dodo
 package firmware
@@ -551,13 +637,14 @@ fn count_tick() {
     }
 }
 
-extern "C" fn TIMER_IRQ_0() {
+@interrupt(TIMER_IRQ_0)
+fn timer_fired() {
     unsafe {
         TIMER.run()
     }
 }
 
-extern "C" fn firmware_main() {
+fn main() {
     section := hal.Critical.enter()
     unsafe {
         TIMER.set(count_tick)
@@ -574,7 +661,69 @@ and keeps its state in `static mut` storage. Closures that capture locals are
 references to those locals and cannot be stored in a static. Change a slot that
 an interrupt can read inside a critical section, as above. The same pattern
 works for any table of callbacks a driver wants to select at run time, such as
-`[4]Option<fn(u32)>`.
+`[4]Option<fn(u32)>`. For a whole table, a RAM vector table installed with
+`cortex_m.set_vector_table` works too.
+
+### Sections and alignment
+
+`@section("name")` puts a function or static in a named section of the object
+file, and `@align(N)` aligns it to `N` bytes, a power of two. The RP2040 and
+RP2350 linker scripts give two sections a meaning:
+
+| Section | Effect |
+| --- | --- |
+| `.ramfunc` | Copied from flash to SRAM at reset with the initialized statics, so the function runs from SRAM: no flash wait states, and it keeps running while flash is being written. |
+| `.noinit` | In SRAM but neither loaded nor zeroed at reset, so the value survives a watchdog or software reset. Its value after power-up is unpredictable. |
+
+```dodo
+@section(".ramfunc")
+fn checksum(bytes: &[u8]) -> u32 {
+    // ...
+}
+
+// Counts resets that kept SRAM powered.
+@section(".noinit")
+static mut RESETS: u32 = 0
+
+// A vector table in RAM: VTOR needs it aligned to its size.
+@align(256)
+static mut VECTORS: [48]u32 = [0u32; 48]
+```
+
+A function or static with `@section` is kept even when nothing refers to it,
+so a custom linker script can place a header or table the hardware reads.
+Other section names land wherever the linker script's rules put them.
+`@align` never lowers a type's own alignment.
+
+### Inline assembly
+
+`asm(...)` runs instructions Dodo has no expression for, inside an `unsafe`
+block. Each template string is one instruction; `{0}`, `{1}`, ... name the
+operands in order:
+
+```dodo
+unsafe {
+    asm("cpsie i")
+    primask := asm("mrs {0}, primask", out(reg) u32, options(nomem))
+    sum := asm("adds {0}, {1}, {2}", out(reg) u32, in(reg) a, in(reg) b)
+    let (low, high) = asm(
+        "mrs {0}, msp",
+        "mrs {1}, psp",
+        out(reg) u32,
+        out(reg) u32,
+    )
+}
+```
+
+`in(reg) value` passes a value in a register, `out(reg) Type` returns one, and
+`inout(reg) value` does both; `in("r0") value` picks the register. The
+expression returns nothing, the one output, or a tuple of several. A template
+is a memory barrier and is never removed unless `options(nomem)` or
+`options(pure)` says otherwise, and `clobber("r4")` lists other registers it
+overwrites. See [memory and foreign calls](memory-and-ffi.md#inline-assembly)
+for the full rules.
+
+### Sleeping and other targets
 
 `cpu.wait_for_interrupt()` sleeps until an interrupt is pending, which is the
 usual idle loop. `cpu.fence()` is a full hardware memory barrier, for example
@@ -678,11 +827,11 @@ compiler adds what a desktop operating system would otherwise provide:
 | Part | What it does |
 | --- | --- |
 | Boot stage 2 | Configures the flash interface for execute-in-place with the standard `03h` read command. The compiler adds the checksum the boot ROM verifies. |
-| Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `extern "C"` function of the same name replaces. |
+| Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `@interrupt(NAME)` handler replaces. |
 | Reset handler | Copies initialized statics to RAM, zeroes the rest, and calls `main`. If `main` returns, the core sleeps. |
 | Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the program's [serial ports](#panics-on-the-serial-port), if it claimed any, and halts. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
 | Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware, and software `f32` and `f64` arithmetic, comparisons, conversions, and `%`, since it has no floating-point unit. Results are correctly rounded IEEE 754, to nearest with ties to even, subnormals included. |
-| Linker script | Flash at `0x10000000` (size from the board), 264 KiB of RAM, and the stack at the top of RAM. |
+| Linker script | Flash at `0x10000000` (size from the board), 264 KiB of RAM, and the stack at the top of RAM; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). |
 
 `std/embedded/chip/rp2040` is the chip support. `rp2040.take(config)` starts the
 crystal, runs the CPU at 125 MHz from the system PLL, takes GPIO and the timer
@@ -693,7 +842,9 @@ circuit board decides, the crystal frequency; a crystal the clock tree cannot
 use is `InvalidInput`. Pins, the timer, and `reboot_to_bootloader(led)` are
 the types and functions the Pico board package exposes. Interrupt handlers use
 the datasheet names: `SysTick_Handler`, `HardFault_Handler`, `TIMER_IRQ_0` to
-`TIMER_IRQ_3`, `UART0_IRQ`, `IO_IRQ_BANK0`, and so on.
+`TIMER_IRQ_3`, `UART0_IRQ`, `IO_IRQ_BANK0`, and so on; the package defines each
+IRQ's number under the same name, such as `rp2040.UART0_IRQ`, for
+[`std/embedded/cortex_m`](#the-cortex-m-core).
 
 ### The RP2350 and Raspberry Pi Pico 2
 
@@ -708,7 +859,7 @@ RP2040's:
 | Image definition | The `IMAGE_DEF` block, in the first 4 KiB of flash, that marks the image as a secure Arm RP2350 executable. The boot ROM runs nothing without it. |
 | Reset handler | Clears the stack limit, installs the vector table, enables the FPU, initializes RAM, and calls `main`. |
 | Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. Its FPU does single precision only: `f32` arithmetic runs in hardware, and `f64`, `f32` `%`, and conversions between `f32` and `f64` or 64-bit integers use the software helpers. |
-| Linker script | Flash at `0x10000000` (size from the board), 520 KiB of RAM, and the stack at the top of RAM. |
+| Linker script | Flash at `0x10000000` (size from the board), 520 KiB of RAM, and the stack at the top of RAM; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). |
 
 `std/embedded/chip/rp2350` mirrors the RP2040 package: `rp2350.take(config)`
 starts the crystal, runs the CPU at 150 MHz from the system PLL, starts the
@@ -716,8 +867,8 @@ starts the crystal, runs the CPU at 150 MHz from the system PLL, starts the
 once. Pins are released from pad isolation when claimed, as the RP2350
 requires. `reboot_to_bootloader(led)` uses the boot ROM's reboot function;
 the activity LED is skipped on chip revision A2, whose boot ROM mishandles it.
-Interrupt handlers use the datasheet names, for example `TIMER0_IRQ_0` and
-`IO_IRQ_BANK0`. GPIO 0 to 29 are supported, all of the RP2350A; the RP2350B's
+Interrupt handlers and IRQ number constants use the datasheet names, for
+example `TIMER0_IRQ_0` and `IO_IRQ_BANK0`. GPIO 0 to 29 are supported, all of the RP2350A; the RP2350B's
 extra pins are not yet.
 
 Unlike the RP2040, the RP2350 boot ROM clears RAM when it starts, so nothing
@@ -1019,7 +1170,7 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   check (overflow, bounds, assertion) and halt or reset. See
   [debugging and failure configuration](command-line.md).
 - The startup code initializes RAM, installs the vector table that names your
-  `extern "C"` handlers, and calls your entry function.
+  `@interrupt` handlers, and calls your entry function.
 - The compiler may call `memcpy`, `memmove`, and `memset`; freestanding links
   must provide them, as described in [core utilities](core.md).
 - Portable standard-library packages (bytes, text, JSON, collections, math,
@@ -1031,9 +1182,11 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, and the timer;
   PWM, ADC, and USB are not bundled yet. Write them with `hal.Reg` as above.
-- I2C, SPI, and UART transfers are polled, without interrupts or DMA, so a
-  serial port keeps no more input than its 32-byte FIFO unless the other end
-  honours RTS. An I2C master is the bus's only master, without high-speed
+- I2C and SPI transfers are polled, without interrupts or DMA. Serial ports
+  are polled too unless a program serves their interrupts, as in
+  [an interrupt-driven driver](#an-interrupt-driven-driver); without that a
+  port keeps no more input than its 32-byte FIFO unless the other end honours
+  RTS. An I2C master is the bus's only master, without high-speed
   mode, which the chips' controllers lack, and cannot send empty transfers.
   The Pico 2 W's wireless chip drives only its LED and senses USB power;
   Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
@@ -1047,9 +1200,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - `std/sync/atomic` currently supports x86-64 and AArch64 only. On
   microcontrollers, share state with interrupt handlers through a critical
   section.
-- There is no inline assembly, `@interrupt` attribute, or linker-section
-  attribute. Handlers use the C ABI, which is what Cortex-M vector tables
-  expect; RISC-V handlers need a small assembly trampoline in the startup code.
+- Inline assembly lives inside functions; there is no global or naked
+  assembly, so startup code and vector tables come from the chip runtime or a
+  `@section`-placed static.
 - ADC, PWM, timers, and DMA have no shared protocol yet. Expose them as methods
   on your chip's types.
 

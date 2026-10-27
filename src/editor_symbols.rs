@@ -1022,6 +1022,7 @@ impl Index {
                 "import",
                 "pub",
                 "unsafe",
+                "asm",
                 "true",
                 "false",
                 "void",
@@ -1278,6 +1279,11 @@ fn walk_expr(e: &Expr, stmt: &mut impl FnMut(&Stmt), expr: &mut impl FnMut(&Expr
         ExprKind::Invoke { callee, args } => {
             walk_expr(callee, stmt, expr);
             for e in args {
+                walk_expr(e, stmt, expr);
+            }
+        }
+        ExprKind::Asm(asm) => {
+            for e in asm.inputs() {
                 walk_expr(e, stmt, expr);
             }
         }

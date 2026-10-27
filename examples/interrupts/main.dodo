@@ -1,0 +1,129 @@
+package main
+
+import "core/cpu"
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/cortex_m"
+import "std/embedded/hal"
+import "std/embedded/peripheral/pl011"
+
+// Interrupt-driven firmware: the UART's receive interrupt moves arriving
+// bytes into a queue, SysTick counts milliseconds, and the main loop sleeps
+// until either has news, then echoes what arrived and blinks the LED.
+// Connect a USB serial adapter to GP0 (TX) and GP1 (RX) at 115200 baud.
+//
+// Handlers and the main loop share `static mut` state. The handlers run
+// with the interrupt that started them in progress; the main loop reads
+// and changes shared state inside a `hal.Critical` section, so a handler
+// never sees it half-updated.
+
+const QUEUE_SIZE: usize = 64
+const BLINK_MS: u32 = 250
+
+// The serial port, owned by the receive handler once main hands it over.
+static mut SERIAL: Option<pl011.Port> = none
+// Bytes received and not yet echoed: a ring buffer the handler fills.
+static mut QUEUE: [64]u8 = [0u8; 64]
+static mut QUEUE_START: usize = 0
+static mut QUEUED: usize = 0
+static mut DROPPED: u32 = 0
+static mut MILLISECONDS: u32 = 0
+
+// Add received bytes to the queue, dropping what does not fit.
+fn enqueue(bytes: &[u8]) {
+    for index in 0..bytes.len {
+        unsafe {
+            if QUEUED == QUEUE_SIZE {
+                DROPPED += 1
+            } else {
+                QUEUE[(QUEUE_START + QUEUED) % QUEUE_SIZE] = bytes[index]
+                QUEUED += 1
+            }
+        }
+    }
+}
+
+// UART0 raises its interrupt when its receive FIFO is 3/4 full, when bytes
+// have waited for 32 bit times, and on receive errors.
+@interrupt(UART0_IRQ)
+fn serial_received() {
+    unsafe {
+        match &mut SERIAL {
+            some(port) => {
+                buffer := [0u8; 32]
+                match port.poll_read(&mut buffer) {
+                    ok(progress) => {
+                        enqueue(&buffer[..progress.transferred])
+                    }
+                    err(failure) => {
+                        // A framing, parity, break, or overrun error: keep
+                        // the bytes before it and acknowledge it.
+                        enqueue(&buffer[..failure.transferred])
+                        port.clear_interrupts(pl011.ERROR_INTERRUPTS)
+                    }
+                }
+            }
+            none => {}
+        }
+    }
+}
+
+@interrupt(SysTick_Handler)
+fn tick() {
+    unsafe {
+        MILLISECONDS = core.wrapping_add(MILLISECONDS, 1)
+    }
+}
+
+fn main() {
+    b := board.take()!
+    port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    port.set_crlf(true)
+    port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT | pl011.ERROR_INTERRUPTS)
+    // The handler cannot run before its interrupt is enabled below.
+    unsafe {
+        SERIAL = some(port)
+    }
+    cortex_m.enable(chip.UART0_IRQ)
+    cortex_m.systick_start(chip.SYS_HZ / 1000 - 1, true)!
+
+    echo := [0u8; 64]
+    blinked := 0u32
+    for {
+        section := hal.Critical.enter()
+        count := 0usize
+        now := 0u32
+        unsafe {
+            for count < QUEUED {
+                echo[count] = QUEUE[(QUEUE_START + count) % QUEUE_SIZE]
+                count += 1
+            }
+            QUEUE_START = (QUEUE_START + count) % QUEUE_SIZE
+            QUEUED = 0
+            now = MILLISECONDS
+        }
+        if count == 0 && core.wrapping_sub(now, blinked) < BLINK_MS {
+            // Sleep with interrupts masked: a pending interrupt still wakes
+            // the core, and its handler runs when the section ends, so an
+            // interrupt between the check and the sleep is not missed.
+            cpu.wait_for_interrupt()
+        }
+        if count > 0 {
+            unsafe {
+                match &mut SERIAL {
+                    some(port) => {
+                        // The transmit FIFO holds 32 bytes; at 115200 baud
+                        // the queue never outruns it for long.
+                        port.write(&echo[..count])!
+                    }
+                    none => {}
+                }
+            }
+        }
+        core.drop(section)
+        if core.wrapping_sub(now, blinked) >= BLINK_MS {
+            b.led.toggle()
+            blinked = now
+        }
+    }
+}

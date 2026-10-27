@@ -526,6 +526,15 @@ fn remap_expr(expression: &mut Expr, span: Span) {
                 remap_expr(argument, span);
             }
         }
+        ExprKind::Asm(asm) => {
+            asm.span = span;
+            for operand in &mut asm.operands {
+                operand.span = span;
+            }
+            for value in asm.inputs_mut() {
+                remap_expr(value, span);
+            }
+        }
         _ => {}
     }
 }

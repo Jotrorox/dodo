@@ -4,6 +4,9 @@ use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind, lex};
 use std::collections::HashSet;
 
+/// The largest `@align` value, far above any section or MPU region alignment.
+const MAX_ALIGNMENT: u64 = 1 << 29;
+
 type ParseResult<T> = Result<T, Diagnostic>;
 
 pub fn parse(source: &str) -> ParseResult<Program> {
@@ -79,6 +82,8 @@ struct Modifiers {
     derive_json: bool,
     json_name: Option<String>,
     json_deny_unknown: bool,
+    interrupt: Option<String>,
+    placement: Placement,
 }
 
 impl Parser {
@@ -96,6 +101,9 @@ impl Parser {
     }
     fn span(&self) -> Span {
         self.token().span
+    }
+    fn previous_start(&self) -> usize {
+        self.tokens[self.cursor.saturating_sub(1)].span.start
     }
     fn previous_end(&self) -> usize {
         self.tokens[self.cursor.saturating_sub(1)].span.end
@@ -287,6 +295,12 @@ impl Parser {
         }
         let start = self.span().start;
         let mods = self.modifiers()?;
+        if mods.interrupt.is_some() && !self.at("fn") {
+            return Err(self.error("@interrupt applies only to functions"));
+        }
+        if !mods.placement.is_empty() && !self.at("fn") && !self.at("static") && !self.at("const") {
+            return Err(self.error("@section and @align apply only to functions and statics"));
+        }
         if self.at("interface") {
             if mods.unsafe_
                 || mods.extern_
@@ -356,7 +370,14 @@ impl Parser {
             if mods.unsafe_ || mods.extern_ || mods.repr_c || mods.unsafe_send || mods.unsafe_sync {
                 return Err(self.error("constant and static declarations only support `pub`"));
             }
-            program.constants.push(self.constant(mods.public, start)?);
+            if !mods.placement.is_empty() && !self.at("static") {
+                return Err(self.error(
+                    "@section and @align apply only to statics; a `const` has no storage of its own",
+                ));
+            }
+            program
+                .constants
+                .push(self.constant(mods.public, mods.placement, start)?);
         } else {
             return Err(self.error(
                 "expected `fn`, `struct`, `enum`, `interface`, `type`, `const`, or `static` declaration",
@@ -482,6 +503,77 @@ impl Parser {
                     self.newlines();
                     continue;
                 }
+                if name == "interrupt" {
+                    if mods.interrupt.is_some() {
+                        return Err(self.error("duplicate @interrupt attribute"));
+                    }
+                    self.expect("(")?;
+                    mods.interrupt = Some(self.identifier().map_err(|_| {
+                        self.error(
+                            "@interrupt expects a vector name, such as @interrupt(TIMER_IRQ_0)",
+                        )
+                    })?);
+                    self.expect(")")?;
+                    self.newlines();
+                    continue;
+                }
+                if name == "section" {
+                    if mods.placement.section.is_some() {
+                        return Err(self.error("duplicate @section attribute"));
+                    }
+                    self.expect("(")?;
+                    let token = self.bump();
+                    let TokenKind::String(value, false) = token.kind else {
+                        return Err(Diagnostic::new(
+                            token.span,
+                            "@section expects a string section name, such as @section(\".ramfunc\")",
+                        ));
+                    };
+                    let section = String::from_utf8(value)
+                        .ok()
+                        .filter(|name| {
+                            !name.is_empty()
+                                && name.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+                        })
+                        .ok_or_else(|| {
+                            Diagnostic::new(
+                                token.span,
+                                "a section name must be nonempty printable ASCII without spaces, quotes, or backslashes",
+                            )
+                        })?;
+                    mods.placement.section = Some(section);
+                    self.expect(")")?;
+                    self.newlines();
+                    continue;
+                }
+                if name == "align" {
+                    if mods.placement.align.is_some() {
+                        return Err(self.error("duplicate @align attribute"));
+                    }
+                    self.expect("(")?;
+                    let token = self.bump();
+                    let alignment = match token.kind {
+                        TokenKind::Int(value, None) => value,
+                        _ => {
+                            return Err(Diagnostic::new(
+                                token.span,
+                                "@align expects an integer byte count, such as @align(256)",
+                            ));
+                        }
+                    };
+                    if !alignment.is_power_of_two() || alignment > MAX_ALIGNMENT {
+                        return Err(Diagnostic::new(
+                            token.span,
+                            format!(
+                                "alignment must be a power of two from 1 to {MAX_ALIGNMENT} bytes"
+                            ),
+                        ));
+                    }
+                    mods.placement.align = Some(alignment as u32);
+                    self.expect(")")?;
+                    self.newlines();
+                    continue;
+                }
                 if name == "test" {
                     if mods.test {
                         return Err(self.error("duplicate @test attribute"));
@@ -521,7 +613,7 @@ impl Parser {
                 }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @section(\"name\"), @align(N)"
                     )));
                 }
                 if mods.repr_c {
@@ -996,6 +1088,12 @@ impl Parser {
             if field_mods.test || field_mods.ignore.is_some() {
                 return Err(self.error("@test and @ignore apply only to top-level functions"));
             }
+            if field_mods.interrupt.is_some() {
+                return Err(self.error("@interrupt applies only to top-level functions"));
+            }
+            if !field_mods.placement.is_empty() && !self.at("fn") {
+                return Err(self.error("@section and @align apply only to functions and statics"));
+            }
             if self.at("fn") {
                 if field_mods.repr_c || field_mods.unsafe_send || field_mods.unsafe_sync {
                     return Err(self.error("representation and thread contracts apply to structs"));
@@ -1252,6 +1350,12 @@ impl Parser {
         let saved = self.cursor;
         self.newlines();
         let body = if self.in_interface {
+            if !mods.placement.is_empty() || mods.interrupt.is_some() {
+                return Err(Diagnostic::new(
+                    self.since(start),
+                    "interface methods cannot have @interrupt, @section, or @align",
+                ));
+            }
             if self.at("{") {
                 return Err(self.error("interface methods are signatures without a body"));
             }
@@ -1284,6 +1388,21 @@ impl Parser {
             return Err(Diagnostic::new(
                 self.since(start),
                 "@ignore requires @test or a test_ function",
+            ));
+        }
+        if mods.interrupt.is_some()
+            && (mods.unsafe_
+                || mods.extern_
+                || mods.public
+                || mods.test
+                || !generics.is_empty()
+                || !params.is_empty()
+                || ret != Type::Void
+                || body.is_none())
+        {
+            return Err(Diagnostic::new(
+                self.since(start),
+                "@interrupt requires a private, safe, non-generic fn name() with a body and no result; the hardware calls it, so it takes no arguments, and code cannot call it",
             ));
         }
         if mods.test
@@ -1321,9 +1440,17 @@ impl Parser {
             body,
             span: self.since(start),
             environment: None,
+            interrupt: mods.interrupt,
+            placement: mods.placement,
         })
     }
-    fn constant(&mut self, public: bool, start: usize) -> ParseResult<Constant> {
+    fn constant(
+        &mut self,
+        public: bool,
+        placement: Placement,
+        start: usize,
+    ) -> ParseResult<Constant> {
+        let static_ = self.at("static");
         let mutable = if self.eat("static") {
             self.eat("mut")
         } else {
@@ -1341,7 +1468,9 @@ impl Parser {
             ty,
             value,
             public,
+            static_,
             mutable,
+            placement,
             span,
         })
     }
@@ -2366,6 +2495,7 @@ impl Parser {
                 ExprKind::Bool(name == "true")
             }
             TokenKind::Ident(name) if name == "fn" => self.closure()?,
+            TokenKind::Ident(name) if name == "asm" => self.inline_asm(start)?,
             TokenKind::Ident(name) if !reserved(&name) => {
                 if name == "Self" && self.self_type.is_none() {
                     return Err(Diagnostic::new(
@@ -2460,6 +2590,171 @@ impl Parser {
             _ => return Err(Diagnostic::new(token.span, "expected an expression")),
         };
         Ok(Expr::new(kind, self.since(start)))
+    }
+    /// `asm("template", ..., in(reg) value, out("r0") u32, clobber("memory"),
+    /// options(nomem))` after its `asm` keyword. Consecutive template strings
+    /// are joined with newlines, one instruction per string.
+    fn inline_asm(&mut self, start: usize) -> ParseResult<ExprKind> {
+        self.expect("(")?;
+        self.soft_newlines += 1;
+        self.newlines();
+        let mut lines = Vec::new();
+        while let TokenKind::String(..) = self.token().kind {
+            let token = self.bump();
+            let TokenKind::String(bytes, byte) = token.kind else {
+                unreachable!()
+            };
+            if byte {
+                return Err(Diagnostic::new(
+                    token.span,
+                    "an assembly template is a string, not a byte string",
+                ));
+            }
+            lines.push(
+                String::from_utf8(bytes).map_err(|_| {
+                    Diagnostic::new(token.span, "an assembly template must be UTF-8")
+                })?,
+            );
+            self.newlines();
+            if !self.eat(",") {
+                break;
+            }
+            self.newlines();
+        }
+        if lines.is_empty() {
+            return Err(self.error("asm expects a template string, such as asm(\"wfi\")"));
+        }
+        let mut asm = InlineAsm {
+            template: lines.join("\n"),
+            operands: vec![],
+            clobbers: vec![],
+            pure: false,
+            nomem: false,
+            tuple: None,
+            span: Span::default(),
+        };
+        let mut options = false;
+        while !self.at(")") {
+            let operand_start = self.span().start;
+            // `in` is a keyword elsewhere; here it names an operand kind.
+            let keyword = match &self.token().kind {
+                TokenKind::Ident(name) => {
+                    let name = name.clone();
+                    self.bump();
+                    name
+                }
+                _ => {
+                    return Err(self.error(
+                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, clobber(\"name\"), or options(...)",
+                    ));
+                }
+            };
+            match keyword.as_str() {
+                "in" | "out" | "inout" => {
+                    self.expect("(")?;
+                    let register = if self.eat("reg") {
+                        AsmRegister::Any
+                    } else {
+                        let token = self.bump();
+                        match token.kind {
+                            TokenKind::String(name, false)
+                                if !name.is_empty()
+                                    && name
+                                        .iter()
+                                        .all(|b| b.is_ascii_alphanumeric() || *b == b'_') =>
+                            {
+                                AsmRegister::Named(String::from_utf8(name).unwrap())
+                            }
+                            _ => {
+                                return Err(Diagnostic::new(
+                                    token.span,
+                                    "expected `reg` or a register name such as \"r0\"",
+                                ));
+                            }
+                        }
+                    };
+                    self.expect(")")?;
+                    let kind = match keyword.as_str() {
+                        "in" => AsmOperandKind::In(self.expression(true)?),
+                        "inout" => AsmOperandKind::InOut(self.expression(true)?),
+                        _ => AsmOperandKind::Out(self.ty()?),
+                    };
+                    asm.operands.push(AsmOperand {
+                        kind,
+                        register,
+                        span: self.since(operand_start),
+                    });
+                }
+                "clobber" => {
+                    self.expect("(")?;
+                    loop {
+                        self.newlines();
+                        let token = self.bump();
+                        match token.kind {
+                            TokenKind::String(name, false)
+                                if !name.is_empty()
+                                    && name
+                                        .iter()
+                                        .all(|b| b.is_ascii_alphanumeric() || *b == b'_') =>
+                            {
+                                asm.clobbers.push(String::from_utf8(name).unwrap());
+                            }
+                            _ => {
+                                return Err(Diagnostic::new(
+                                    token.span,
+                                    "expected a clobbered register name or \"memory\"",
+                                ));
+                            }
+                        }
+                        self.newlines();
+                        if !self.eat(",") {
+                            break;
+                        }
+                    }
+                    self.expect(")")?;
+                }
+                "options" => {
+                    if options {
+                        return Err(self.error("duplicate asm options"));
+                    }
+                    options = true;
+                    self.expect("(")?;
+                    loop {
+                        self.newlines();
+                        match self.identifier()?.as_str() {
+                            "pure" => asm.pure = true,
+                            "nomem" => asm.nomem = true,
+                            _ => {
+                                return Err(Diagnostic::new(
+                                    self.since(self.previous_start()),
+                                    "unknown asm option; supported: pure, nomem",
+                                ));
+                            }
+                        }
+                        self.newlines();
+                        if !self.eat(",") {
+                            break;
+                        }
+                    }
+                    self.expect(")")?;
+                }
+                _ => {
+                    return Err(Diagnostic::new(
+                        self.since(operand_start),
+                        "expected an asm operand: in(reg) value, out(reg) Type, inout(reg) value, clobber(\"name\"), or options(...)",
+                    ));
+                }
+            }
+            self.newlines();
+            if !self.eat(",") {
+                break;
+            }
+            self.newlines();
+        }
+        self.expect(")")?;
+        self.soft_newlines -= 1;
+        asm.span = self.since(start);
+        Ok(ExprKind::Asm(Box::new(asm)))
     }
     /// `fn(a, b: T) -> R { body }` after its `fn` keyword. Omitted parameter
     /// and result types come from the expected type during checking.
@@ -2649,6 +2944,7 @@ pub(crate) fn reserved(name: &str) -> bool {
             | "mut"
             | "true"
             | "false"
+            | "asm"
     )
 }
 
@@ -2779,6 +3075,66 @@ mod tests {
         let program = parse("package sample\nstruct Box<T> { T value\n fn get(self: &Self) -> &T { return &self.value }\n}\nfn id<T>(value: T) -> T { return value }\nfn demo(x: Option<Result<u8, bool>>) -> void {\n y := id<u8>(1)\n z := id::<Option<u8>>(none)\n}\n").unwrap();
         assert_eq!(program.functions[0].generics, ["T"]);
         assert!(matches!(program.functions[2].params[0].ty, Type::Option(_)));
+    }
+    #[test]
+    fn firmware_attributes_and_inline_assembly() {
+        let program = parse(
+            "package p\n@interrupt(TIMER_IRQ_0)\n@section(\".ramfunc\") @align(8)\nfn tick() {\n unsafe {\n  value := asm(\"mrs {0}, primask\", \"cpsid i\", out(reg) u32, in(\"r0\") 1u32, inout(reg) x, clobber(\"r1\", \"memory\"), options(pure, nomem),)\n }\n}\n@section(\".noinit\")\nstatic mut RESETS: u32 = 0\n",
+        )
+        .unwrap();
+        let tick = &program.functions[0];
+        assert_eq!(tick.interrupt.as_deref(), Some("TIMER_IRQ_0"));
+        assert_eq!(tick.placement.section.as_deref(), Some(".ramfunc"));
+        assert_eq!(tick.placement.align, Some(8));
+        let constant = &program.constants[0];
+        assert!(constant.static_ && constant.mutable);
+        assert_eq!(constant.placement.section.as_deref(), Some(".noinit"));
+        let StmtKind::Unsafe(body) = &tick.body.as_ref().unwrap()[0].kind else {
+            panic!("unsafe block");
+        };
+        let StmtKind::Let {
+            value: Some(value), ..
+        } = &body[0].kind
+        else {
+            panic!("binding");
+        };
+        let ExprKind::Asm(asm) = &value.kind else {
+            panic!("asm expression");
+        };
+        assert_eq!(asm.template, "mrs {0}, primask\ncpsid i");
+        assert_eq!(asm.operands.len(), 3);
+        assert!(matches!(
+            asm.operands[0].kind,
+            AsmOperandKind::Out(Type::Int { bits: 32, .. })
+        ));
+        assert_eq!(asm.operands[1].register, AsmRegister::Named("r0".into()));
+        assert!(matches!(asm.operands[2].kind, AsmOperandKind::InOut(_)));
+        assert_eq!(asm.clobbers, ["r1", "memory"]);
+        assert!(asm.pure && asm.nomem);
+        for (source, message) in [
+            (
+                "@interrupt(T)\nconst A: u32 = 1",
+                "@interrupt applies only to functions",
+            ),
+            ("@align(12)\nfn f() {}", "alignment must be a power of two"),
+            (
+                "@section(\".x\")\nenum E { A }",
+                "apply only to functions and statics",
+            ),
+            ("fn f() { asm() }", "asm expects a template string"),
+            ("fn f() { asm(\"nop\", in(reg)) }", "expected an expression"),
+            (
+                "fn f() { asm(\"nop\", sideways(reg) 1) }",
+                "expected an asm operand",
+            ),
+        ] {
+            let error = parse(&format!("package p\n{source}\n")).unwrap_err();
+            assert!(
+                error.message.contains(message),
+                "{source}: {}",
+                error.message
+            );
+        }
     }
     #[test]
     fn tuples_and_type_aliases() {
