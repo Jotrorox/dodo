@@ -1,0 +1,138 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
+import "std/embedded/peripheral/pl011"
+import "std/fmt"
+
+// Three tasks share the core with std/embedded/executor, and it sleeps
+// whenever none of them has work:
+//
+// - the LED blinks twice a second;
+// - a push button between GP15 and 3V3(OUT) counts presses, ignoring the
+//   contacts' bounce, woken by a GPIO interrupt;
+// - a serial console on GP0 (TX) and GP1 (RX) at 115200 baud echoes what is
+//   typed, answers each line with the uptime, and reports button presses,
+//   woken by the UART's receive interrupt and by the button task.
+//
+// Interrupt handlers do the least they can: hold their interrupt back and
+// raise a signal. The task that owns the peripheral then does the work and
+// lets the interrupt through again, so peripherals stay owned by one task
+// and need no `static mut`.
+
+const BUTTON_PIN: u32 = 15
+const DEBOUNCE_MS: u32 = 50
+const NEWLINE: u8 = 0x0A
+
+// Signals, numbered for the whole program.
+const SERIAL: executor.Signal = executor.Signal { id: 0 }
+const BUTTON: executor.Signal = executor.Signal { id: 1 }
+const PRESSES: executor.Signal = executor.Signal { id: 2 }
+
+@interrupt(UART0_IRQ)
+fn serial_interrupt() {
+    cortex_m.disable(chip.UART0_IRQ)
+    SERIAL.raise()
+}
+
+@interrupt(IO_IRQ_BANK0)
+fn gpio_interrupt() {
+    cortex_m.disable(chip.IO_IRQ_BANK0)
+    BUTTON.raise()
+}
+
+// Toggles the LED once per period.
+struct Blinker<L> {
+    led: &mut L
+    ticker: executor.Ticker
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.led.toggle()
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Counts rising edges on the button pin. An edge less than DEBOUNCE_MS
+// after the last one is the contacts bouncing, not a new press.
+struct Button {
+    pin: chip.Pin
+    quiet: executor.Timer
+    presses: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        BUTTON.take(cx)
+        self.quiet.expired(cx)
+        if (self.pin.events() & chip.RISING_EDGE) != 0 {
+            self.pin.clear_events(chip.RISING_EDGE)
+            if !self.quiet.is_running() {
+                self.presses += 1
+                PRESSES.send(self.presses)
+            }
+            self.quiet.start_ms(cx, DEBOUNCE_MS)
+        }
+        cortex_m.enable(chip.IO_IRQ_BANK0)
+        return executor.Poll.Pending
+    }
+}
+
+// Echoes input, and answers each line and each button press.
+struct Console {
+    port: pl011.Port
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        SERIAL.take(cx)
+        if let some(presses) = PRESSES.receive(cx) {
+            fmt.printf(&mut self.port, "button pressed {} times\n", presses)!
+        }
+        buffer := [0u8; 32]
+        for {
+            count := 0usize
+            match self.port.poll_read(&mut buffer) {
+                ok(progress) => {
+                    count = progress.transferred
+                }
+                err(failure) => {
+                    // A framing, parity, break, or overrun error: keep the
+                    // bytes before it and acknowledge it.
+                    count = failure.transferred
+                    self.port.clear_interrupts(pl011.ERROR_INTERRUPTS)
+                }
+            }
+            if count == 0 {
+                break
+            }
+            for index in 0..count {
+                byte := buffer[index]
+                if byte == NEWLINE {
+                    fmt.printf(&mut self.port, "\nup {} ms\n", cx.now_us() / 1000)!
+                } else {
+                    self.port.write(&buffer[index..index + 1])!
+                }
+            }
+        }
+        cortex_m.enable(chip.UART0_IRQ)
+        return executor.Poll.Pending
+    }
+}
+
+fn main() {
+    b := board.take()!
+    port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    port.set_crlf(true)
+    port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT | pl011.ERROR_INTERRUPTS)
+    fmt.printf(&mut port, "{}: type a line, or press the button on GP{}\n", board.NAME, BUTTON_PIN)!
+    pin := b.pins.input(BUTTON_PIN)!
+    pin.listen(chip.RISING_EDGE)
+    // Alarm 0 times the executor's sleeps.
+    clock := b.timer.alarm(0)!
+
+    blinker := Blinker { led: &mut b.led, ticker: executor.Ticker.every_ms(250) }
+    button := Button { pin, quiet: executor.Timer.new(), presses: 0 }
+    console := Console { port }
+    tasks: [3] &mut dyn executor.Task = [&mut blinker, &mut button, &mut console]
+    executor.run(&mut tasks, &mut clock)
+}

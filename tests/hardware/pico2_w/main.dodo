@@ -5,6 +5,7 @@ import "std/embedded/board"
 import "core/mem"
 import "std/embedded/chip"
 import "std/embedded/cortex_m"
+import "std/embedded/executor"
 import "std/embedded/hal"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
@@ -556,6 +557,143 @@ fn interrupt_checks(timer: &mut chip.Timer) {
     check(from_sram(5) == 16)
 }
 
+// The executor: a timer alarm as its clock, GPIO events, and tasks woken by
+// time and by an interrupt. GP22 is free on every board.
+const EVENT_PIN: u32 = 22
+const EDGE: executor.Signal = executor.Signal { id: 0 }
+
+@interrupt(IO_IRQ_BANK0)
+fn gpio_event() {
+    cortex_m.disable(chip.IO_IRQ_BANK0)
+    EDGE.raise()
+}
+
+// Finishes after five 1 ms ticks.
+struct Ticks {
+    ticker: executor.Ticker
+    count: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.count += 1
+            if self.count == 5 {
+                return executor.Poll.Ready
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Raises its pin 2 ms after its first poll.
+struct Driver {
+    pin: chip.Pin
+    timer: executor.Timer
+    started: bool
+    raised_at: u64
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if !self.started {
+            self.started = true
+            self.timer.start(cx, 2000)
+        }
+        if self.timer.expired(cx) {
+            self.pin.set_high()
+            self.raised_at = cx.now_us()
+            return executor.Poll.Ready
+        }
+        return executor.Poll.Pending
+    }
+
+    fn release(self) -> chip.Pin {
+        let Driver { pin, timer, started, raised_at } = self
+        return pin
+    }
+}
+
+// Finishes once the pin's edge has raised EDGE through its interrupt.
+struct Listener {
+    polls: u32
+    woke_at: u64
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        self.polls += 1
+        if EDGE.take(cx) {
+            self.woke_at = cx.now_us()
+            return executor.Poll.Ready
+        }
+        return executor.Poll.Pending
+    }
+}
+
+fn executor_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    // An alarm sleeps until its deadline; its interrupt, whose handler is
+    // the runtime's endless loop, is never taken.
+    alarm := timer.alarm(1)!
+    irq := alarm.irq()
+    start := alarm.now_us()
+    alarm.sleep_until(some(start + 2000))
+    slept := alarm.now_us() - start
+    check(slept >= 2000 && slept < 2100 && !alarm.fired() && !alarm.is_armed() && !alarm.is_listening() && !cortex_m.is_pending(irq) && !cortex_m.is_enabled(irq))
+
+    // A time already past returns at once, and so does a pending interrupt,
+    // whose handler runs when the critical section ends.
+    start = alarm.now_us()
+    alarm.sleep_until(some(start))
+    past := alarm.now_us() - start
+    cortex_m.enable(chip.TRNG_IRQ)
+    hits := pended_hits()
+    section := hal.Critical.enter()
+    cortex_m.pend(chip.TRNG_IRQ)
+    start = alarm.now_us()
+    alarm.sleep_until(some(start + 5000))
+    woke := alarm.now_us() - start
+    held := pended_hits() == hits
+    core.drop(section)
+    cortex_m.instruction_barrier()
+    cortex_m.disable(chip.TRNG_IRQ)
+    check(past < 50 && woke < 1000 && held && pended_hits() == hits + 1)
+
+    // GPIO events: an output pin sees its own edges and levels.
+    pin := pins.output(EVENT_PIN)!
+    pin.listen(chip.RISING_EDGE | chip.LEVEL_HIGH)
+    cortex_m.unpend(chip.IO_IRQ_BANK0)
+    quiet := pin.events() == 0 && !cortex_m.is_pending(chip.IO_IRQ_BANK0)
+    pin.set_high()
+    timer.delay_us(10)
+    raised := pin.events() == (chip.RISING_EDGE | chip.LEVEL_HIGH) && cortex_m.is_pending(chip.IO_IRQ_BANK0)
+    pin.clear_events(chip.RISING_EDGE)
+    level := pin.events() == chip.LEVEL_HIGH
+    pin.set_low()
+    timer.delay_us(10)
+    pin.ignore(chip.LEVEL_HIGH)
+    cortex_m.unpend(chip.IO_IRQ_BANK0)
+    check(quiet && raised && level && pin.events() == 0 && !cortex_m.is_pending(chip.IO_IRQ_BANK0))
+
+    // Three tasks: one on a 1 ms ticker, one that raises the pin after
+    // 2 ms, and one woken only by the pin's interrupt.
+    EDGE.reset()
+    cortex_m.enable(chip.IO_IRQ_BANK0)
+    ticks := Ticks { ticker: executor.Ticker.every(1000), count: 0 }
+    driver := Driver { pin, timer: executor.Timer.new(), started: false, raised_at: 0 }
+    listener := Listener { polls: 0, woke_at: 0 }
+    runner := executor.Executor.new()
+    start = alarm.now_us()
+    end := start + 20_000
+    finished := false
+    {
+        tasks: [3] &mut dyn executor.Task = [&mut listener, &mut ticks, &mut driver]
+        finished = runner.run_until(&mut tasks, &mut alarm, end)
+    }
+    elapsed := alarm.now_us() - start
+    raised_at := driver.raised_at
+    pin = driver.release()
+    latched := (pin.events() & chip.RISING_EDGE) != 0
+    check(finished && ticks.count == 5 && elapsed >= 5000 && elapsed < 5500 && listener.polls == 2 && listener.woke_at >= raised_at && listener.woke_at - raised_at < 500 && runner.sleeps() >= 5 && latched && !cortex_m.is_enabled(chip.IO_IRQ_BANK0))
+    pins.release(pin)
+    cortex_m.unpend(chip.IO_IRQ_BANK0)
+    timer.release_alarm(alarm)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -712,6 +850,7 @@ fn main() {
     uart_checks(&mut b.pins, &mut b.timer)
     protocol_checks(&mut b.pins, &mut b.timer)
     interrupt_checks(&mut b.timer)
+    executor_checks(&mut b.pins, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.
