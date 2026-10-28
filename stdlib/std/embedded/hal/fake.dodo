@@ -1,6 +1,7 @@
 package fake
 
 import "core/option"
+import "std/embedded/executor"
 import "std/embedded/hal"
 import "std/io"
 
@@ -241,5 +242,107 @@ pub struct Serial {
             count += 1
         }
         return ok(count)
+    }
+
+    // The polling read of the chips' serial ports: what has been fed and
+    // not read yet, up to `buffer.len`, or Pending while nothing is
+    // waiting, as on a UART, rather than end of input.
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        count := self.read(buffer)?
+        state := io.PollState.Ready
+        if count == 0 && buffer.len != 0 {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+}
+
+// A simulated clock for running std/embedded/executor tasks on a desktop.
+// Time stands still while tasks run and jumps forward when the executor
+// sleeps, to the time it asked for or to the next simulated interrupt,
+// whichever comes first. A simulated interrupt raises its signal at its
+// time, as a handler would, so tasks waiting for hardware events are tested
+// without hardware. A sleep that nothing could end, with no time and no
+// interrupt to come, traps instead of hanging the test.
+pub struct Clock {
+    now: u64
+    sleeps: u32
+    idle: u64
+    // Simulated interrupts: their times and signal ids, unordered.
+    times: [16]u64
+    signals: [16]u32
+    scheduled: usize
+
+    // A clock at time 0 with no interrupts to come.
+    pub fn new() -> Clock {
+        return Clock { now: 0, sleeps: 0, idle: 0, times: [0u64; 16], signals: [0u32; 16], scheduled: 0 }
+    }
+
+    pub fn now_us(&self) -> u64 {
+        return self.now
+    }
+
+    // Raise `signal` when the time reaches `time_us`, as an interrupt
+    // handler would; at most 16 can be waiting. A time already past raises
+    // it at the next sleep or advance.
+    pub fn interrupt_at(&mut self, time_us: u64, signal: &executor.Signal) {
+        core.assert(self.scheduled < 16)
+        self.times[self.scheduled] = time_us
+        self.signals[self.scheduled] = signal.id
+        self.scheduled += 1
+    }
+
+    // Let `microseconds` pass, as if a task were busy for that long, and
+    // raise the signals of interrupts that fall within it.
+    pub fn advance(&mut self, microseconds: u64) {
+        self.now += microseconds
+        self.fire()
+    }
+
+    // The executor's sleep: see the type's comment.
+    pub fn sleep_until(&mut self, deadline: Option<u64>) {
+        self.sleeps += 1
+        start := self.now
+        target := 0xFFFF_FFFF_FFFF_FFFFu64
+        if let some(time) = deadline {
+            target = time
+        }
+        for index in 0..self.scheduled {
+            if self.times[index] < target {
+                target = self.times[index]
+            }
+        }
+        // Nothing would ever end this sleep.
+        core.assert(target != 0xFFFF_FFFF_FFFF_FFFFu64)
+        if target > self.now {
+            self.now = target
+        }
+        self.idle += self.now - start
+        self.fire()
+    }
+
+    // How many times the executor slept, and for how long in all.
+    pub fn sleeps(&self) -> u32 {
+        return self.sleeps
+    }
+
+    pub fn idle_us(&self) -> u64 {
+        return self.idle
+    }
+
+    // Raise the signals of interrupts that are due, and forget them.
+    fn fire(&mut self) {
+        index := 0usize
+        for index < self.scheduled {
+            if self.times[index] <= self.now {
+                signal := executor.Signal { id: self.signals[index] }
+                signal.raise()
+                self.scheduled -= 1
+                self.times[index] = self.times[self.scheduled]
+                self.signals[index] = self.signals[self.scheduled]
+            } else {
+                index += 1
+            }
+        }
     }
 }

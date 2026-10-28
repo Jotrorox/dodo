@@ -1,0 +1,536 @@
+package executor
+
+import "std/embedded/hal"
+
+// A cooperative task executor for firmware: several activities share one
+// core, each runs only when something it waits for has happened, and the
+// core sleeps in between. Nothing here allocates, and like std/embedded/hal
+// the package also compiles for hosted targets, so tasks are tested on a
+// desktop with `std/embedded/hal/fake`'s simulated clock.
+//
+// A task is a value with a `poll` method, usually a struct whose fields hold
+// the peripherals it owns and where it is in its work:
+//
+//     struct Blinker<L> {
+//         led: L
+//         ticker: executor.Ticker
+//
+//         pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+//             if self.ticker.ready(cx) {
+//                 self.led.toggle()
+//             }
+//             return executor.Poll.Pending
+//         }
+//     }
+//
+// `poll` does whatever work is possible now, without waiting, and returns
+// Pending to be polled again later or Ready when the task is done. Before
+// returning Pending it says what should poll it again, through the context:
+// a time (`cx.wake_at`, or a `Ticker` or `Timer`) or a `Signal` it took. Each
+// poll states these anew; a task that arranges nothing is not polled again.
+// A task may also be polled when nothing it waits for has happened, and must
+// then simply check again.
+//
+// The executor polls every task once, then only tasks that are due:
+//
+//     fn main() {
+//         b := board.take()!
+//         blinker := Blinker { led: b.led, ticker: executor.Ticker.every_ms(500) }
+//         console := Console.new(...)
+//         clock := b.timer.alarm(0)!
+//         tasks: [2]&mut dyn executor.Task = [&mut blinker, &mut console]
+//         executor.run(&mut tasks, &mut clock)
+//     }
+//
+// When no task is due, it masks interrupts, checks once more, and asks the
+// clock to sleep until the earliest requested time or an interrupt; a chip's
+// timer alarm (`b.timer.alarm(n)` on the RP2040 and RP2350) does that with
+// `wfi`. The interrupt's handler runs when the mask is lifted and wakes the
+// tasks waiting for it by raising a signal. A task never interrupts another,
+// so tasks need no critical sections among themselves, and a task that
+// computes for long delays all the others.
+//
+// Signals carry events from interrupt handlers, and from other tasks, to the
+// tasks waiting for them. A program numbers its signals, 0 to MAX_SIGNALS - 1,
+// with constants that handlers and tasks both see:
+//
+//     const BUTTON: executor.Signal = executor.Signal { id: 0 }
+//
+//     @interrupt(IO_IRQ_BANK0)
+//     fn gpio_interrupt() {
+//         // Hold the interrupt back until the task has acknowledged it.
+//         cortex_m.disable(chip.IO_IRQ_BANK0)
+//         BUTTON.raise()
+//     }
+//
+// and the task that owns the button pin checks it with `BUTTON.take(cx)`,
+// acknowledges the pin, and enables the interrupt again. Raising and taking
+// a signal are safe anywhere: they use a critical section.
+//
+// One executor runs at a time per core; signals and the record of woken
+// tasks belong to the core, not to an executor value. On hosted targets,
+// where a critical section excludes nothing, use the executor and its
+// signals from one thread.
+
+// Tasks one executor runs, and signals a program can number.
+pub const MAX_TASKS: usize = 32
+pub const MAX_SIGNALS: u32 = 32
+
+// A time that never comes, for computing the earliest of several.
+const NEVER: u64 = 0xFFFF_FFFF_FFFF_FFFF
+// The task index of a context made outside an executor.
+const NO_TASK: u32 = 32
+
+// Tasks that a signal woke since the executor last looked, one bit each.
+static mut WOKEN: u32 = 0
+// Per signal: raises since the task last took it, the last value sent, and
+// the tasks waiting for it.
+static mut RAISES: [32]u32 = [0u32; 32]
+static mut VALUES: [32]u32 = [0u32; 32]
+static mut WAITERS: [32]u32 = [0u32; 32]
+
+// What a poll reports: Pending to be polled again, Ready when the task is
+// done and is not polled again.
+pub enum Poll {
+    Pending,
+    Ready
+}
+
+// A unit of work the executor runs. Implemented by any value with this
+// method; see the package comment.
+pub interface Task {
+    fn poll(&mut self, cx: &mut Context) -> Poll
+}
+
+// Where the time comes from and how the core sleeps. A chip's timer alarm
+// implements it on hardware, `std/embedded/hal/fake.Clock` on a desktop.
+pub interface Clock {
+    // Microseconds since some fixed start; never decreases.
+    fn now_us(&self) -> u64
+    // Sleep until an interrupt is pending or the time reaches `deadline`,
+    // whichever comes first; none waits for an interrupt only. Returning
+    // earlier is allowed. The executor calls this with interrupts masked, so
+    // an interrupt that arrives before or during the sleep still ends it,
+    // and its handler runs once the executor lifts the mask.
+    fn sleep_until(&mut self, deadline: Option<u64>)
+}
+
+// What a task sees while it is polled: the time, and where it records
+// when to be polled again.
+pub struct Context {
+    now: u64
+    task: u32
+    wake: u64
+
+    // A context at time `now_us` belonging to no executor, for calling a
+    // task's poll directly in a test. Signals taken through it register no
+    // waiting task; wake_time reports what the task asked for.
+    pub fn new(now_us: u64) -> Context {
+        return Context { now: now_us, task: NO_TASK, wake: NEVER }
+    }
+
+    // The time the poll started, in the clock's microseconds.
+    pub fn now_us(&self) -> u64 {
+        return self.now
+    }
+
+    // The polled task's position in the executor's task list.
+    pub fn task(&self) -> u32 {
+        return self.task
+    }
+
+    // Poll this task again once the clock reaches `time_us`. Of several
+    // requests the earliest counts; a time already past polls it again
+    // right after the tasks that are due now.
+    pub fn wake_at(&mut self, time_us: u64) {
+        if time_us < self.wake {
+            self.wake = time_us
+        }
+    }
+
+    // Poll this task again `microseconds` from the start of this poll.
+    pub fn wake_in(&mut self, microseconds: u64) {
+        time := later(self.now, microseconds)
+        self.wake_at(time)
+    }
+
+    // Poll this task again `milliseconds` from the start of this poll.
+    pub fn wake_in_ms(&mut self, milliseconds: u32) {
+        self.wake_in((milliseconds as u64) * 1000)
+    }
+
+    // Poll this task again as soon as the other due tasks have run, for
+    // work split into steps that should not delay them.
+    pub fn yield_now(&mut self) {
+        now := self.now
+        self.wake_at(now)
+    }
+
+    // The earliest time requested so far in this poll.
+    pub fn wake_time(&self) -> Option<u64> {
+        if self.wake == NEVER {
+            return none
+        }
+        return some(self.wake)
+    }
+}
+
+// `time` plus `microseconds`, or NEVER if that does not fit.
+fn later(time: u64, microseconds: u64) -> u64 {
+    if microseconds >= NEVER - time {
+        return NEVER
+    }
+    return time + microseconds
+}
+
+// An event that interrupt handlers or tasks raise and tasks wait for,
+// numbered by the program: `const RX: executor.Signal = executor.Signal { id: 1 }`.
+// A signal counts raises until a task takes them, and keeps the last value
+// sent with it. Raising wakes every task that took the signal since it was
+// last raised. Each id is one signal wherever it is used; an id of
+// MAX_SIGNALS or more traps when used.
+pub struct Signal {
+    pub id: u32
+
+    // Record one occurrence and wake the waiting tasks. Safe in interrupt
+    // handlers. The count stops at the largest u32.
+    pub fn raise(&self) {
+        index := self.slot()
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked on this core, which owns the tables.
+        unsafe {
+            if RAISES[index] != 0xFFFF_FFFF {
+                RAISES[index] += 1
+            }
+            WOKEN |= WAITERS[index]
+            WAITERS[index] = 0
+        }
+        core.drop(section)
+    }
+
+    // `raise`, keeping `value` for `receive`; a later value replaces it.
+    pub fn send(&self, value: u32) {
+        index := self.slot()
+        section := hal.Critical.enter()
+        // SAFETY: as in raise.
+        unsafe {
+            VALUES[index] = value
+        }
+        self.raise()
+        core.drop(section)
+    }
+
+    // True if the signal was raised since it was last taken, which it now
+    // is. Either way the polled task waits for the next raise, so a task
+    // that takes its signal on every poll never misses one.
+    pub fn take(&self, cx: &mut Context) -> bool {
+        return self.take_count(cx) != 0
+    }
+
+    // How many times the signal was raised since it was last taken, and
+    // take it, as `take` does.
+    pub fn take_count(&self, cx: &mut Context) -> u32 {
+        index := self.slot()
+        section := hal.Critical.enter()
+        // SAFETY: as in raise.
+        count := unsafe {
+            RAISES[index]
+        }
+        unsafe {
+            RAISES[index] = 0
+            if cx.task < NO_TASK {
+                WAITERS[index] |= 1u32 << cx.task
+            }
+        }
+        core.drop(section)
+        return count
+    }
+
+    // The last value sent, if the signal was raised since it was last
+    // taken; takes it, as `take` does.
+    pub fn receive(&self, cx: &mut Context) -> Option<u32> {
+        index := self.slot()
+        section := hal.Critical.enter()
+        raised := self.take_count(cx) != 0
+        // SAFETY: as in raise.
+        value := unsafe {
+            VALUES[index]
+        }
+        core.drop(section)
+        if raised {
+            return some(value)
+        }
+        return none
+    }
+
+    // True if the signal was raised since it was last taken. Takes nothing
+    // and waits for nothing.
+    pub fn is_raised(&self) -> bool {
+        index := self.slot()
+        section := hal.Critical.enter()
+        // SAFETY: as in raise.
+        count := unsafe {
+            RAISES[index]
+        }
+        core.drop(section)
+        return count != 0
+    }
+
+    // Forget raises, the value, and waiting tasks, for example before a
+    // test or when a program restarts the work the signal belongs to.
+    pub fn reset(&self) {
+        index := self.slot()
+        section := hal.Critical.enter()
+        // SAFETY: as in raise.
+        unsafe {
+            RAISES[index] = 0
+            VALUES[index] = 0
+            WAITERS[index] = 0
+        }
+        core.drop(section)
+    }
+
+    fn slot(&self) -> usize {
+        core.assert(self.id < MAX_SIGNALS)
+        return self.id as usize
+    }
+}
+
+// Periodic work: `ready` is true once per period. The first tick comes one
+// period after the first call. Ticks keep their schedule, so the period does
+// not drift with how late a poll runs; ticks missed entirely, because the
+// task was not polled for longer than a period, count as one.
+pub struct Ticker {
+    period: u64
+    next: u64
+    started: bool
+
+    // A ticker with a period of `microseconds`, at least 1.
+    pub fn every(microseconds: u64) -> Ticker {
+        core.assert(microseconds != 0)
+        return Ticker { period: microseconds, next: 0, started: false }
+    }
+
+    // A ticker with a period of `milliseconds`, at least 1.
+    pub fn every_ms(milliseconds: u32) -> Ticker {
+        return Ticker.every((milliseconds as u64) * 1000)
+    }
+
+    pub fn period_us(&self) -> u64 {
+        return self.period
+    }
+
+    // True if a tick is due, which it then consumes. Either way the polled
+    // task is woken for the next tick.
+    pub fn ready(&mut self, cx: &mut Context) -> bool {
+        now := cx.now_us()
+        if !self.started {
+            self.started = true
+            self.next = later(now, self.period)
+            cx.wake_at(self.next)
+            return false
+        }
+        if now < self.next {
+            cx.wake_at(self.next)
+            return false
+        }
+        missed := (now - self.next) / self.period
+        self.next = later(self.next, (missed + 1) * self.period)
+        cx.wake_at(self.next)
+        return true
+    }
+
+    // Start over: the next tick comes one period after the next call.
+    pub fn reset(&mut self) {
+        self.started = false
+    }
+}
+
+// A one-shot deadline: `start` it, and `expired` turns true once when the
+// time comes. A stopped timer never expires.
+pub struct Timer {
+    deadline: u64
+    running: bool
+
+    pub fn new() -> Timer {
+        return Timer { deadline: 0, running: false }
+    }
+
+    // Expire `microseconds` after the start of the current poll, replacing
+    // any earlier deadline, and wake the polled task then.
+    pub fn start(&mut self, cx: &mut Context, microseconds: u64) {
+        time := later(cx.now_us(), microseconds)
+        self.start_at(cx, time)
+    }
+
+    pub fn start_ms(&mut self, cx: &mut Context, milliseconds: u32) {
+        self.start(cx, (milliseconds as u64) * 1000)
+    }
+
+    // Expire at clock time `time_us`.
+    pub fn start_at(&mut self, cx: &mut Context, time_us: u64) {
+        self.deadline = time_us
+        self.running = true
+        cx.wake_at(time_us)
+    }
+
+    pub fn stop(&mut self) {
+        self.running = false
+    }
+
+    // True from start until it expires or is stopped.
+    pub fn is_running(&self) -> bool {
+        return self.running
+    }
+
+    // True once, when the deadline has passed; the timer then stops. While
+    // it runs, the polled task is woken at the deadline.
+    pub fn expired(&mut self, cx: &mut Context) -> bool {
+        if !self.running {
+            return false
+        }
+        if cx.now_us() >= self.deadline {
+            self.running = false
+            return true
+        }
+        cx.wake_at(self.deadline)
+        return false
+    }
+}
+
+// Runs tasks until they are all done, keeping what it knows about them
+// between calls of `run_until`, so a test can advance in steps.
+pub struct Executor {
+    // When each task asked to be polled, or NEVER.
+    wake: [32]u64
+    // Tasks to poll in the next pass, and tasks that are done.
+    ready: u32
+    finished: u32
+    started: bool
+    polls: u64
+    sleeps: u64
+
+    pub fn new() -> Executor {
+        return Executor { wake: [NEVER; 32], ready: 0, finished: 0, started: false, polls: 0, sleeps: 0 }
+    }
+
+    // Run until every task is done. Firmware whose tasks never finish
+    // stays here. Traps for more than MAX_TASKS tasks. Pass the same tasks
+    // in the same order on every call.
+    pub fn run<C: Clock>(&mut self, tasks: &mut[&mut dyn Task], clock: &mut C) {
+        self.run_until(tasks, clock, NEVER)
+    }
+
+    // Run until every task is done, true, or the clock reaches `end_us`,
+    // false.
+    pub fn run_until<C: Clock>(&mut self, tasks: &mut[&mut dyn Task], clock: &mut C, end_us: u64) -> bool {
+        count := tasks.len
+        core.assert(count <= MAX_TASKS)
+        all := 0xFFFF_FFFFu32
+        if count < MAX_TASKS {
+            all = (1u32 << count as u32) - 1
+        }
+        if !self.started {
+            // Every task runs once, and wakes recorded before the start
+            // belong to no task of this executor.
+            self.started = true
+            self.ready = all
+            take_woken()
+        }
+        for {
+            if (self.finished & all) == all {
+                return true
+            }
+            now := clock.now_us()
+            ready := (self.ready | take_woken()) & all & ~self.finished
+            self.ready = 0
+            next := NEVER
+            for index in 0..count {
+                bit := 1u32 << index as u32
+                if (self.finished & bit) == 0 {
+                    if self.wake[index] <= now {
+                        ready |= bit
+                    } else if self.wake[index] < next {
+                        next = self.wake[index]
+                    }
+                }
+            }
+            if ready != 0 && now <= end_us {
+                for index in 0..count {
+                    bit := 1u32 << index as u32
+                    if (ready & bit) != 0 {
+                        cx := Context { now: clock.now_us(), task: index as u32, wake: NEVER }
+                        poll := tasks[index].poll(&mut cx)
+                        self.polls += 1
+                        if poll == Poll.Ready {
+                            self.finished |= bit
+                            self.wake[index] = NEVER
+                        } else {
+                            self.wake[index] = cx.wake
+                        }
+                    }
+                }
+            } else if now >= end_us {
+                // Tasks still due, past the end because others kept the
+                // core busy, run first on the next call.
+                self.ready = ready
+                return false
+            } else {
+                if end_us < next {
+                    next = end_us
+                }
+                section := hal.Critical.enter()
+                // SAFETY: interrupts are masked, so no handler can raise a
+                // signal between this check and the sleep: one that becomes
+                // pending ends the sleep instead.
+                woken := unsafe {
+                    WOKEN
+                }
+                if woken == 0 {
+                    if next == NEVER {
+                        clock.sleep_until(none)
+                    } else {
+                        clock.sleep_until(some(next))
+                    }
+                    self.sleeps += 1
+                }
+                core.drop(section)
+            }
+        }
+    }
+
+    // Polls so far, over all tasks.
+    pub fn polls(&self) -> u64 {
+        return self.polls
+    }
+
+    // Times the executor asked the clock to sleep.
+    pub fn sleeps(&self) -> u64 {
+        return self.sleeps
+    }
+
+    // Whether task `index` returned Ready.
+    pub fn is_finished(&self, index: usize) -> bool {
+        return index < MAX_TASKS && (self.finished & (1u32 << index as u32)) != 0
+    }
+}
+
+// Run `tasks` with a new executor until they are all done; see Executor.run.
+pub fn run<C: Clock>(tasks: &mut[&mut dyn Task], clock: &mut C) {
+    executor := Executor.new()
+    executor.run(tasks, clock)
+}
+
+// Take the record of tasks that signals woke.
+fn take_woken() -> u32 {
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked on this core, which owns the record.
+    woken := unsafe {
+        WOKEN
+    }
+    unsafe {
+        WOKEN = 0
+    }
+    core.drop(section)
+    return woken
+}

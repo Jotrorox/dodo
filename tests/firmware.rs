@@ -96,6 +96,74 @@ fn main() {
     }
 }
 
+// The executor on a board: tasks woken by an alarm, a GPIO edge, and the
+// UART, with the alarm as the executor's clock. Needs no linker.
+#[test]
+fn executor_tasks_compile_for_every_board() {
+    let scratch = Scratch::new("executor");
+    let tasks = root().join("examples/tasks");
+    let source = scratch.write(
+        "clock.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/executor"
+struct Once {
+    timer: executor.Timer
+    started: bool
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if !self.started {
+            self.started = true
+            self.timer.start(cx, 1500)
+        }
+        if self.timer.expired(cx) {
+            return executor.Poll.Ready
+        }
+        return executor.Poll.Pending
+    }
+}
+fn main() {
+    b := board.take()!
+    pin := b.pins.input(15)!
+    pin.listen(chip.FALLING_EDGE | chip.LEVEL_HIGH)
+    core.assert(pin.events() <= 0xF)
+    pin.clear_events(chip.FALLING_EDGE)
+    pin.ignore(chip.LEVEL_HIGH)
+    core.assert(pin.irq() == chip.IO_IRQ_BANK0)
+    b.pins.release(pin)
+    alarm := b.timer.alarm(2)!
+    soon := alarm.now_us() + 10
+    alarm.sleep_until(some(soon))
+    once := Once { timer: executor.Timer.new(), started: false }
+    tasks: [1]&mut dyn executor.Task = [&mut once]
+    runner := executor.Executor.new()
+    end := alarm.now_us() + 10_000
+    core.assert(runner.run_until(&mut tasks, &mut alarm, end))
+    b.timer.release_alarm(alarm)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for (input, name) in [(tasks.as_path(), "tasks"), (source.as_path(), "clock")] {
+            for level in ["0", "2"] {
+                let object = scratch.path(&format!("{name}-{board}-O{level}.o"));
+                stdout(&dodo(&[
+                    "build",
+                    input.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "--emit",
+                    "obj",
+                    "-o",
+                    &object,
+                ]));
+            }
+        }
+    }
+}
+
 #[test]
 fn platforms_fill_settings_that_are_not_explicit() {
     let blink = root().join("examples/blink");
@@ -433,6 +501,7 @@ fn rp2040_projects_link_to_flashable_firmware() {
     let scratch = Scratch::new("link");
     for (project, name) in [
         ("examples/blink", "blink"),
+        ("examples/tasks", "tasks"),
         ("tests/hardware/pico", "selftest"),
     ] {
         for level in ["0", "2"] {
@@ -485,9 +554,12 @@ fn rp2350_projects_link_to_flashable_firmware() {
     let sensor = root().join("examples/hal_sensor_board.dodo");
     let selftest = root().join("tests/hardware/pico2");
     let selftest_w = root().join("tests/hardware/pico2_w");
+    let tasks = root().join("examples/tasks");
     for (project, name, board) in [
         (&blink, "blink", &["--board", "pico2"][..]),
         (&blink, "blink-w", &["--board", "pico2_w"][..]),
+        (&tasks, "tasks", &["--board", "pico2"][..]),
+        (&tasks, "tasks-w", &["--board", "pico2_w"][..]),
         (&sensor, "sensor", &["--board", "pico2"][..]),
         (&sensor, "sensor-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),

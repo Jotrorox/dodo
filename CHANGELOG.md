@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Add `std/embedded/executor`, a cooperative task executor for firmware.
+  A task is any value with `poll(&mut self, cx: &mut executor.Context) ->
+  executor.Poll`; the executor polls each task only when a time it asked for
+  (`cx.wake_at`, `executor.Ticker`, `executor.Timer`) arrives or a signal it
+  took is raised, and sleeps the core in between. `executor.Signal`s,
+  numbered by the program, are raised safely from interrupt handlers and
+  tasks, count raises, and carry a `u32` value. Up to 32 tasks and 32
+  signals; no allocation. The RP2040 and RP2350 timer alarms gain `now_us`
+  and `sleep_until`, which make an alarm the executor's clock: it sleeps
+  with `wfi` until its deadline or any interrupt, and needs no handler of
+  its own. `std/embedded/hal/fake` gains `Clock`, a simulated clock that
+  raises signals as simulated interrupts, so tasks are tested on a desktop,
+  and `Serial.poll_read`. `examples/tasks` runs a blinking LED, a debounced
+  button, and an interrupt-driven serial console as three tasks.
+- RP2040 and RP2350 pins raise `IO_IRQ_BANK0` on edges and levels:
+  `pin.listen(chip.RISING_EDGE | chip.FALLING_EDGE)`, `events()`,
+  `clear_events(edges)`, `ignore(events)`, and `irq()`.
 - Add a [JetBrains plugin](editor-support/dodo-jetbrains) for RustRover, CLion,
   and other JetBrains IDEs from 2026.2. It connects to `dodo lsp` like the VS
   Code extension and offers the same editing features, with live templates

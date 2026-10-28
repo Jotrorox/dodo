@@ -1,5 +1,7 @@
 package rp2040
 
+import "core/cpu"
+import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
@@ -105,6 +107,9 @@ const TIMER_ALARM0: usize = TIMER_BASE + 0x10
 const TIMER_ARMED: usize = TIMER_BASE + 0x20
 const TIMER_INTR: usize = TIMER_BASE + 0x34
 const TIMER_INTE: usize = TIMER_BASE + 0x38
+// The longest an alarm sleeps at once: below 2^31 us, so its 32-bit
+// target time is still ahead when the write lands.
+const MAX_ALARM_SLEEP_US: u64 = 0x7FFF_FFFF
 // Alarms 0 to 3, raising TIMER_IRQ_0 + n.
 pub const ALARM_COUNT: u32 = 4
 
@@ -141,6 +146,22 @@ pub const RTC_IRQ: u32 = 25
 const IO_BANK0_BASE: usize = 0x4001_4000
 const PADS_BANK0_BASE: usize = 0x4001_C000
 const FUNCSEL: u32 = 0b11111
+// GPIO interrupts (2.19.6.2): four bits per pin, eight pins per register.
+// INTR latches edges (write one to clear) and shows levels; PROC0_INTE
+// selects what raises IO_IRQ_BANK0 on core 0, and PROC0_INTS shows it.
+const GPIO_INTR: usize = IO_BANK0_BASE + 0x0F0
+const GPIO_PROC0_INTE: usize = IO_BANK0_BASE + 0x100
+const GPIO_PROC0_INTS: usize = IO_BANK0_BASE + 0x120
+
+// Pin events for `Pin.listen`, `ignore`, `events`, and `clear_events`:
+// the pin's level is low or high, or it fell or rose. Levels last as long
+// as the level does; edges stay latched until cleared.
+pub const LEVEL_LOW: u32 = 1 << 0
+pub const LEVEL_HIGH: u32 = 1 << 1
+pub const FALLING_EDGE: u32 = 1 << 2
+pub const RISING_EDGE: u32 = 1 << 3
+const EDGES: u32 = FALLING_EDGE | RISING_EDGE
+const ALL_EVENTS: u32 = 0xF
 
 // I2C (4.3), SPI (4.4), and UART (4.2) controllers, clocked by clk_sys and
 // clk_peri.
@@ -368,6 +389,8 @@ pub struct Pins {
     // Give back a pin from `output` or `input`. It stops driving and is
     // disconnected until claimed again, for example as part of a bus.
     pub fn release(&mut self, pin: Pin) {
+        pin.ignore(ALL_EVENTS)
+        pin.clear_events(ALL_EVENTS)
         pin.set_as_input()
         self.bank.release_gpio(pin.mask)
     }
@@ -484,10 +507,14 @@ pub struct Pins {
 
     fn claim(&mut self, number: u32) -> Pin!hal.Error {
         mask := self.bank.gpio(number)?
+        group := 4 * (number / 8) as usize
         // SAFETY: the bank makes this pin's control and pad registers
         // exclusive to the returned Pin. The SIO output SET/CLR/XOR and
         // output-enable SET/CLR registers are write-only per-bit aliases and IN
-        // is read-only, so pins never conflict there.
+        // is read-only, so pins never conflict there. Likewise the pin writes
+        // only its own bits of the shared interrupt registers, through the
+        // write-one-to-clear INTR and the INTE set and clear aliases, and
+        // INTS is read-only.
         unsafe {
             return ok(Pin {
                 set: reg(GPIO_OUT_SET),
@@ -497,6 +524,11 @@ pub struct Pins {
                 output_enable: reg(GPIO_OE_SET),
                 output_disable: reg(GPIO_OE_CLR),
                 mask,
+                raw_events: reg(GPIO_INTR + group),
+                listen_set: reg(GPIO_PROC0_INTE + group + SET_ALIAS),
+                listen_clear: reg(GPIO_PROC0_INTE + group + CLEAR_ALIAS),
+                status: reg(GPIO_PROC0_INTS + group),
+                shift: 4 * (number % 8),
             })
         }
     }
@@ -590,6 +622,13 @@ pub struct Pin {
     output_enable: hal.Reg<u32>
     output_disable: hal.Reg<u32>
     mask: u32
+    // This pin's interrupt bits: raw events, core 0's enables through the
+    // set and clear aliases, and core 0's status, at `shift`.
+    raw_events: hal.Reg<u32>
+    listen_set: hal.Reg<u32>
+    listen_clear: hal.Reg<u32>
+    status: hal.Reg<u32>
+    shift: u32
 
     pub fn set_high(&mut self) {
         self.set.write(self.mask)
@@ -616,6 +655,37 @@ pub struct Pin {
     // Release the pin so another device can drive it; is_high reads it.
     pub fn set_as_input(&mut self) {
         self.output_disable.write(self.mask)
+    }
+
+    // Raise IO_IRQ_BANK0 on `events`, any of LEVEL_LOW, LEVEL_HIGH,
+    // FALLING_EDGE, and RISING_EDGE, after forgetting edges seen so far.
+    // Enable the interrupt in the NVIC too: `cortex_m.enable(pin.irq())`.
+    // Every pin shares the one interrupt; its handler tells them apart with
+    // `events`.
+    pub fn listen(&mut self, events: u32) {
+        self.clear_events(events)
+        self.listen_set.write((events & ALL_EVENTS) << self.shift)
+    }
+
+    // Stop raising the interrupt on `events`.
+    pub fn ignore(&mut self, events: u32) {
+        self.listen_clear.write((events & ALL_EVENTS) << self.shift)
+    }
+
+    // The listened-to events that are raising the interrupt now.
+    pub fn events(&self) -> u32 {
+        return (self.status.read() >> self.shift) & ALL_EVENTS
+    }
+
+    // Forget the edges among `events`, acknowledging them; a handler or
+    // task must, or the interrupt stays raised. Levels cannot be cleared.
+    pub fn clear_events(&mut self, events: u32) {
+        self.raw_events.write((events & EDGES) << self.shift)
+    }
+
+    // The interrupt pin events raise, IO_IRQ_BANK0, for cortex_m.enable.
+    pub fn irq(&self) -> u32 {
+        return IO_IRQ_BANK0
     }
 }
 
@@ -647,6 +717,7 @@ pub struct Timer {
                 number,
                 bit,
                 target: hal.Reg.at(TIMER_ALARM0 + 4 * number as usize),
+                high: hal.Reg.at(TIMER_RAW_HIGH),
                 low: hal.Reg.at(TIMER_RAW_LOW),
                 armed: hal.Reg.at(TIMER_ARMED),
                 raw: hal.Reg.at(TIMER_INTR),
@@ -697,6 +768,7 @@ pub struct Alarm {
     number: u32
     bit: u32
     target: hal.Reg<u32>
+    high: hal.Reg<u32>
     low: hal.Reg<u32>
     armed: hal.Reg<u32>
     raw: hal.Reg<u32>
@@ -767,5 +839,59 @@ pub struct Alarm {
 
     pub fn is_listening(&self) -> bool {
         return self.listening.any(self.bit)
+    }
+
+    // Microseconds since take(), from the whole 64-bit counter, as
+    // Timer.now_us reads it.
+    pub fn now_us(&self) -> u64 {
+        for {
+            high := self.high.read()
+            low := self.low.read()
+            if self.high.read() == high {
+                return ((high as u64) << 32) | low as u64
+            }
+        }
+    }
+
+    // Sleep (`wfi`) until an interrupt is pending or the counter reaches
+    // `deadline`, a now_us time; none waits for an interrupt only. With
+    // now_us this is the std/embedded/executor clock, so an alarm runs an
+    // executor: `executor.run(&mut tasks, &mut alarm)`. The alarm's
+    // interrupt ends the sleep while interrupts are masked and is cleared
+    // before they are unmasked, so it needs no `@interrupt` handler; other
+    // interrupts' handlers run after the return, or once the caller's own
+    // critical section ends. Times more than 35 minutes ahead wake early.
+    // Leaves the alarm disarmed and not listening.
+    pub fn sleep_until(&mut self, deadline: Option<u64>) {
+        section := hal.Critical.enter()
+        if let some(time) = deadline {
+            now := self.now_us()
+            if time > now {
+                ahead := time - now
+                if ahead > MAX_ALARM_SLEEP_US {
+                    ahead = MAX_ALARM_SLEEP_US
+                }
+                irq := self.irq()
+                self.clear()
+                cortex_m.unpend(irq)
+                self.listen()
+                cortex_m.enable(irq)
+                self.schedule_at(core.wrapping_add((now & 0xFFFF_FFFF) as u32, ahead as u32))
+                // A time that passed before the alarm was armed would only
+                // fire once the counter wraps. One that passes after it
+                // makes the interrupt pending, which ends the sleep at once.
+                if self.now_us() < now + ahead {
+                    cpu.wait_for_interrupt()
+                }
+                self.cancel()
+                self.ignore()
+                self.clear()
+                cortex_m.disable(irq)
+                cortex_m.unpend(irq)
+            }
+        } else {
+            cpu.wait_for_interrupt()
+        }
+        core.drop(section)
     }
 }

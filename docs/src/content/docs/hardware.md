@@ -16,7 +16,8 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
-| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, and serial ports that record what a driver did. |
+| Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
+| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, and a simulated clock that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
@@ -319,7 +320,8 @@ which pins can carry which bus.
 | `fake.Delay` | A delay that returns at once. | `elapsed_us()` |
 | `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. | `register(n)`, `set_register(n, v)`, `fail_next(error)` |
 | `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. | `sent()`, `clear()`, `reply_with(bytes)` |
-| `fake.Serial` | A serial port, the `std/io` Reader and Writer: it records what is written and reads back bytes given to `feed`, then reports end of input. | `sent()`, `clear()`, `feed(bytes)` |
+| `fake.Serial` | A serial port, the `std/io` Reader and Writer: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)` |
+| `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
 `fail_next` makes the next I2C transaction fail, so error paths are as easy to
 test as success. A driver for a device on a serial line, such as a GPS or
@@ -597,7 +599,8 @@ which is open at reset and closed only inside critical sections.
 | Driver | Interrupt sources |
 | --- | --- |
 | `pl011.Port` and `Controller` | `listen(sources)`, `ignore(sources)`, `pending_interrupts()`, and `clear_interrupts(sources)` with `RX_INTERRUPT` (FIFO 3/4 full), `RX_TIMEOUT_INTERRUPT` (bytes waiting for 32 bit times), `TX_INTERRUPT`, and `ERROR_INTERRUPTS`. The receive sources end when reads drain the FIFO. |
-| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` that fires once at `schedule_at(time)` or `schedule_in(microseconds)`; `listen` raises `alarm.irq()`, and its handler calls `clear`. `release_alarm` gives it back. |
+| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` that fires once at `schedule_at(time)` or `schedule_in(microseconds)`; `listen` raises `alarm.irq()`, and its handler calls `clear`. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
+| `Pin` on the RP2040 and RP2350 | `listen(events)` raises `IO_IRQ_BANK0` for `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, or `LEVEL_LOW`; `events()` shows them, `clear_events(edges)` acknowledges edges, `ignore(events)` stops. |
 
 ### The Cortex-M core
 
@@ -740,6 +743,231 @@ Because hosted targets accept critical sections, code that uses them still
 builds and tests on a desktop. Packages that contain a critical section but
 never call it on a reachable path stay portable to every target.
 
+## Tasks and the executor
+
+A main loop that polls everything in turn works for blinking an LED. It stops
+working once a program does several things at their own pace: read a sensor
+every two seconds, answer a serial console, debounce a button, keep a radio
+link alive. `std/embedded/executor` lets each activity be a **task** of its own.
+The executor polls a task only when something it waits for has happened, a
+time arriving or an interrupt, and puts the core to sleep while none has work.
+
+A task is any value with a `poll` method, usually a struct that owns the
+peripherals it uses and remembers where it is in its work:
+
+```dodo
+struct Blinker<L> {
+    led: &mut L
+    ticker: executor.Ticker
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.led.toggle()
+        }
+        return executor.Poll.Pending
+    }
+}
+```
+
+`poll` does what it can right now, never waiting, and returns
+`executor.Poll.Pending` to be polled again later or `executor.Poll.Ready`
+when the task is done. Before it returns Pending it says what should poll it
+again: a time, through the context `cx` or a `Ticker` or `Timer`, or a
+`Signal` it took. Each poll states this anew, and a task that arranges
+nothing is not polled again. A task can also be polled when nothing it waits
+for has happened, and then simply checks again.
+
+Tasks run one after another and are never interrupted by each other, so they
+share nothing that needs a critical section. A task that computes for long,
+or busy-waits, delays every other task: split long work into steps with
+`cx.yield_now()`.
+
+### Running tasks on a board
+
+Put references to the tasks in an array of `&mut dyn executor.Task` and hand
+it to `executor.run` with a clock. On the RP2040 and RP2350 the clock is a
+timer alarm, `b.timer.alarm(n)`:
+
+```dodo
+fn main() {
+    b := board.take()!
+    clock := b.timer.alarm(0)!
+    blinker := Blinker { led: &mut b.led, ticker: executor.Ticker.every_ms(250) }
+    console := Console.new(b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!)
+    tasks: [2]&mut dyn executor.Task = [&mut blinker, &mut console]
+    executor.run(&mut tasks, &mut clock)
+}
+```
+
+`run` polls every task once, then only the tasks that are due, and returns
+when all of them are Ready; firmware whose tasks run forever stays in it.
+When no task is due, the executor masks interrupts, checks once more that no
+interrupt has woken a task, and calls the clock's `sleep_until` with the
+earliest time any task asked for. The alarm arms itself for that time and
+sleeps with `wfi`. An interrupt that arrives, the alarm's own included, ends
+the sleep; the alarm clears its interrupt before interrupts are unmasked, so
+it needs no handler, and other interrupts' handlers run as the executor lifts
+the mask. Nothing can slip in between the check and the sleep.
+
+| To wait for | Use | Notes |
+| --- | --- | --- |
+| A period | `executor.Ticker.every(us)`, `every_ms(ms)`; `ticker.ready(cx)` | True once per period, first one period after the first call. Keeps its schedule; missed periods count once. `reset()` starts over. |
+| A one-shot deadline | `executor.Timer.new()`; `start(cx, us)`, `start_ms`, `start_at`; `expired(cx)` | True once when the time has passed. `stop()`, `is_running()`. |
+| A time | `cx.wake_at(time)`, `wake_in(us)`, `wake_in_ms(ms)` | Clock microseconds; the earliest request counts. `cx.now_us()` is the time the poll started. |
+| The other due tasks | `cx.yield_now()` | Polled again right after them, without sleeping. |
+| An event | `SIGNAL.take(cx)`, `take_count(cx)`, `receive(cx)` | See below. |
+
+An `executor.Executor` value does the same as `run` and keeps its state
+between calls: `run_until(tasks, clock, end_us)` returns false when the clock
+reaches `end_us` before every task is done, so a program or test can advance
+in steps. `polls()`, `sleeps()`, and `is_finished(index)` report what it did.
+`executor.Context.new(now_us)` makes a context for calling a task's `poll`
+directly, and `cx.wake_time()` shows what the task asked for.
+
+### Waking tasks from interrupts
+
+A **signal** carries an event from an interrupt handler, or from another task,
+to the tasks waiting for it. A program numbers its signals from 0 to 31 with
+constants that handlers and tasks both see:
+
+```dodo
+const BUTTON: executor.Signal = executor.Signal { id: 1 }
+
+@interrupt(IO_IRQ_BANK0)
+fn gpio_interrupt() {
+    // Hold the interrupt back until the task has acknowledged the pin.
+    cortex_m.disable(chip.IO_IRQ_BANK0)
+    BUTTON.raise()
+}
+
+struct Button {
+    pin: chip.Pin
+    presses: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        BUTTON.take(cx)
+        if (self.pin.events() & chip.RISING_EDGE) != 0 {
+            self.pin.clear_events(chip.RISING_EDGE)
+            self.presses += 1
+        }
+        cortex_m.enable(chip.IO_IRQ_BANK0)
+        return executor.Poll.Pending
+    }
+}
+```
+
+`raise()` counts the event and wakes every task that took the signal since
+it was last raised. `take(cx)` reports whether it was raised since it was last
+taken, takes it, and in either case makes the polled task wait for the next
+raise, so a task that takes its signal on every poll never misses one.
+`take_count(cx)` returns how many raises there were. `send(value)` raises
+with a `u32` and `receive(cx)` returns the latest value, for example to
+pass a reading or a count from one task to another. `is_raised()` looks
+without taking and `reset()` forgets everything. Raising and taking are safe
+in handlers and tasks alike; they use a critical section.
+
+The handler above does the least it can: it holds its interrupt back in the
+interrupt controller and raises the signal. The task that owns the pin then
+acknowledges the event and lets the interrupt through again. Peripherals thus
+stay owned by one task, need no `static mut`, and a handler never has to
+share a driver with a task. The same pattern serves a serial port: listen for
+`pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT`, and let the task drain the
+port with `poll_read` before it enables `chip.UART0_IRQ` again. Read the port
+at least every 2.8 ms while bytes arrive at 115200 baud, as its FIFO holds
+32 bytes. The repository's
+[`examples/tasks`](https://github.com/Jotrorox/dodo/blob/main/examples/tasks/main.dodo)
+runs a blinking LED, a debounced button, and such a serial console together.
+
+| Interrupt source | Raise it | Acknowledge it |
+| --- | --- | --- |
+| GPIO pin (RP2040, RP2350) | `pin.listen(events)` with `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, `LEVEL_LOW`; all pins share `IO_IRQ_BANK0` (`pin.irq()`) | `pin.events()` shows what is raising it; `pin.clear_events(edges)` clears latched edges. Levels last as long as the level. `ignore(events)` stops. |
+| Serial port | `port.listen(sources)` | Reading drains the receive sources; `clear_interrupts` the errors. |
+| Timer alarm | `alarm.listen()` | `alarm.clear()`. An alarm used as the executor's clock is busy. |
+
+Several pins share `IO_IRQ_BANK0`, so give them one signal and let each
+task check its own pin's `events()`: raising wakes every waiting task.
+
+### Testing tasks on a desktop
+
+The executor and its signals compile for desktops too. `fake.Clock` from
+`std/embedded/hal/fake` is a simulated clock: time stands still while tasks
+run and jumps ahead when the executor sleeps, and `interrupt_at(time, &signal)`
+raises a signal at a set time as a handler would. A test runs in no time and
+checks exactly when things happened:
+
+```dodo test
+package blinker
+
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// Turns an LED on for `on_ms` whenever the button signal is raised.
+pub struct Flash<P: hal.OutputPin> {
+    led: P
+    on_ms: u32
+    timer: executor.Timer
+
+    pub fn new(led: P, on_ms: u32) -> Flash<P> {
+        return Flash<P> { led, on_ms, timer: executor.Timer.new() }
+    }
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if PRESSED.take(cx) {
+            self.led.set_high()
+            self.timer.start_ms(cx, self.on_ms)
+        }
+        if self.timer.expired(cx) {
+            self.led.set_low()
+        }
+        return executor.Poll.Pending
+    }
+}
+
+pub const PRESSED: executor.Signal = executor.Signal { id: 0 }
+
+@test
+fn flashes_once_per_press() {
+    PRESSED.reset()
+    clock := fake.Clock.new()
+    clock.interrupt_at(1_000, &PRESSED)
+    clock.interrupt_at(5_000, &PRESSED)
+    flash := Flash.new(fake.Pin.new(), 2)
+    runner := executor.Executor.new()
+    {
+        tasks: [1]&mut dyn executor.Task = [&mut flash]
+        assert(!runner.run_until(&mut tasks, &mut clock, 10_000))
+    }
+    assert_eq(flash.led.changes(), 4u32)
+    assert(!flash.led.is_high())
+    // Polled at the start, at each press, and when each flash ends.
+    assert_eq(runner.polls(), 5u64)
+    assert_eq(clock.idle_us(), 10_000u64)
+}
+```
+
+A sleep that nothing could end traps instead of hanging the test.
+`clock.advance(us)` lets time pass as if a task were busy, and `sleeps()` and
+`idle_us()` show how often and how long the executor slept. `fake.Serial` has
+the serial ports' `poll_read`, which returns Pending rather than end of input
+while nothing has been fed.
+
+### Rules and limits
+
+- One executor runs at a time on a core, with up to 32 tasks
+  (`executor.MAX_TASKS`) and 32 signals (`executor.MAX_SIGNALS`). Signal
+  numbers are one set for the whole program, so libraries that raise signals
+  take their numbers from the application.
+- Tasks are state machines written by hand: Dodo has no `async` functions
+  that the compiler would turn into them. Keep the state in the task's
+  fields, and do each step without waiting.
+- A task owns its peripherals. Tasks that share a bus are one task, or one
+  task owns the bus and the others send it requests with signals.
+- I2C and SPI transfers still wait for the bus inside `poll`; they are short
+  at usual speeds.
+- On a desktop, where a critical section excludes nothing, use the executor
+  and its signals from one thread.
+
 ## Building firmware
 
 ### Boards
@@ -804,7 +1032,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
-| `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`. |
+| `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`; `alarm(n)` claims an alarm, which can also run the [executor](#tasks-and-the-executor). |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
 | `board.report_panic(check, file, line, column)` | Unsafe. Write a failed check to the serial ports, as the [default panic hook](#panics-on-the-serial-port) does; for panic hooks of your own. |
 
@@ -1184,7 +1412,8 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   PWM, ADC, and USB are not bundled yet. Write them with `hal.Reg` as above.
 - I2C and SPI transfers are polled, without interrupts or DMA. Serial ports
   are polled too unless a program serves their interrupts, as in
-  [an interrupt-driven driver](#an-interrupt-driven-driver); without that a
+  [an interrupt-driven driver](#an-interrupt-driven-driver) or a
+  [task woken by them](#waking-tasks-from-interrupts); without that a
   port keeps no more input than its 32-byte FIFO unless the other end honours
   RTS. An I2C master is the bus's only master, without high-speed
   mode, which the chips' controllers lack, and cannot send empty transfers.
@@ -1195,7 +1424,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   arithmetic on the Cortex-M0+ goes through `f64`. They raise no
   floating-point exception flags and return the default quiet NaN for every
   NaN result.
-- Only core 0 runs; core 1 stays in the boot ROM. The RP2350's RISC-V cores
+- Only core 0 runs; core 1 stays in the boot ROM. Several activities share
+  core 0 as [executor tasks](#tasks-and-the-executor), which are
+  cooperative: there is no preemptive scheduler. The RP2350's RISC-V cores
   are not supported.
 - `std/sync/atomic` currently supports x86-64 and AArch64 only. On
   microcontrollers, share state with interrupt handlers through a critical
