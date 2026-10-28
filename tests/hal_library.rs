@@ -63,6 +63,25 @@ fn registers_protocols_and_fakes_execute_on_the_host() {
 }
 
 #[test]
+fn executor_runs_tasks_against_the_simulated_clock() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("executor");
+    let source = root.join("tests/stdlib/executor_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "executor-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile executor fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute executor fixture",
+        );
+    }
+}
+
+#[test]
 fn cyw43_driver_executes_against_simulated_pins_and_chip() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("cyw43");

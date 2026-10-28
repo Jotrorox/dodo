@@ -1,0 +1,386 @@
+package main
+
+import "core/bytes"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/io"
+
+// std/embedded/executor on the host: tasks as state machines, tickers,
+// timers, signals raised by simulated interrupts and by other tasks, and
+// the executor's sleeping, all against hal/fake's simulated clock.
+
+const BUTTON: executor.Signal = executor.Signal { id: 0 }
+const READING: executor.Signal = executor.Signal { id: 1 }
+const RX: executor.Signal = executor.Signal { id: 2 }
+const STEP: executor.Signal = executor.Signal { id: 31 }
+
+// Toggles a pin once per period, forever.
+struct Blinker<P> {
+    led: P
+    ticker: executor.Ticker
+    high: bool
+
+    fn new(led: P, period_ms: u32) -> Blinker<P> {
+        return Blinker<P> { led, ticker: executor.Ticker.every_ms(period_ms), high: false }
+    }
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.high = !self.high
+            hal.write_pin(&mut self.led, self.high)
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Counts button presses, polled only when the button signal is raised.
+struct Presses {
+    count: u32
+    polls: u32
+    last_us: u64
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        self.polls += 1
+        presses := BUTTON.take_count(cx)
+        if presses != 0 {
+            self.count += presses
+            self.last_us = cx.now_us()
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Waits `delay_us`, then finishes.
+struct Countdown {
+    timer: executor.Timer
+    delay_us: u64
+    started: bool
+    done_at: u64
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if !self.started {
+            self.started = true
+            self.timer.start(cx, self.delay_us)
+            return executor.Poll.Pending
+        }
+        if self.timer.expired(cx) {
+            self.done_at = cx.now_us()
+            return executor.Poll.Ready
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Sends a reading every 100 ms, five times.
+struct Producer {
+    ticker: executor.Ticker
+    sent: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.sent += 1
+            READING.send(self.sent * 10)
+            if self.sent == 5 {
+                return executor.Poll.Ready
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Adds up the readings it receives until it has seen the last one.
+struct Consumer {
+    total: u32
+    received: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if let some(value) = READING.receive(cx) {
+            self.total += value
+            self.received += 1
+            if value == 50 {
+                return executor.Poll.Ready
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Work in `steps` parts, yielding between them.
+struct Chunked {
+    steps: u32
+    done: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        self.done += 1
+        if self.done == self.steps {
+            return executor.Poll.Ready
+        }
+        cx.yield_now()
+        return executor.Poll.Pending
+    }
+}
+
+// Raises STEP for an earlier task, then finishes.
+struct Raiser {
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        STEP.raise()
+        return executor.Poll.Ready
+    }
+}
+
+// Finishes once STEP was raised.
+struct Waiter {
+    polls: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        self.polls += 1
+        if STEP.take(cx) {
+            return executor.Poll.Ready
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Echoes what arrives on a serial port, woken by its receive interrupt.
+struct Echo<S> {
+    serial: S
+    reads: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        RX.take(cx)
+        buffer := [0u8; 8]
+        for {
+            progress := self.serial.poll_read(&mut buffer)!
+            if progress.state == io.PollState.Pending {
+                return executor.Poll.Pending
+            }
+            self.reads += 1
+            io.write_all(&mut self.serial, &buffer[..progress.transferred])!
+        }
+    }
+}
+
+const NONE: u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+// When the task polled with `cx` asked to be polled again, or NONE.
+fn wake(cx: &executor.Context) -> u64 {
+    match cx.wake_time() {
+        some(time) => {
+            return time
+        }
+        none => {
+            return NONE
+        }
+    }
+}
+
+fn tickers_wake_on_time_and_the_clock_sleeps_between() {
+    clock := fake.Clock.new()
+    blinker := Blinker.new(fake.Pin.new(), 500)
+    runner := executor.Executor.new()
+    {
+        tasks: [1] &mut dyn executor.Task = [&mut blinker]
+        assert(!runner.run_until(&mut tasks, &mut clock, 2_000_000))
+    }
+    // Ticks at 0.5, 1, 1.5, and 2 s, each after one sleep.
+    assert_eq(blinker.led.changes(), 4u32)
+    assert(!blinker.led.is_high())
+    assert_eq(runner.polls(), 5u64)
+    assert_eq(runner.sleeps(), 4u64)
+    assert_eq(clock.sleeps(), 4u32)
+    assert_eq(clock.idle_us(), 2_000_000u64)
+    assert_eq(clock.now_us(), 2_000_000u64)
+    // The executor continues where it stopped.
+    {
+        tasks: [1] &mut dyn executor.Task = [&mut blinker]
+        assert(!runner.run_until(&mut tasks, &mut clock, 2_250_000))
+    }
+    assert_eq(blinker.led.changes(), 4u32)
+    {
+        tasks: [1] &mut dyn executor.Task = [&mut blinker]
+        assert(!runner.run_until(&mut tasks, &mut clock, 3_000_000))
+    }
+    assert_eq(blinker.led.changes(), 6u32)
+    assert_eq(clock.now_us(), 3_000_000u64)
+}
+
+fn finished_tasks_end_the_run() {
+    clock := fake.Clock.new()
+    short := Countdown { timer: executor.Timer.new(), delay_us: 1500, started: false, done_at: 0 }
+    long := Countdown { timer: executor.Timer.new(), delay_us: 40_000, started: false, done_at: 0 }
+    runner := executor.Executor.new()
+    {
+        tasks: [2] &mut dyn executor.Task = [&mut short, &mut long]
+        runner.run(&mut tasks, &mut clock)
+    }
+    assert_eq(short.done_at, 1500u64)
+    assert_eq(long.done_at, 40_000u64)
+    assert(runner.is_finished(0) && runner.is_finished(1) && !runner.is_finished(2))
+    assert_eq(runner.polls(), 4u64)
+    assert_eq(clock.sleeps(), 2u32)
+    // Nothing to run is done at once.
+    none_left: [0] &mut dyn executor.Task = []
+    idle := executor.Executor.new()
+    assert(idle.run_until(&mut none_left, &mut clock, 0))
+}
+
+fn simulated_interrupts_wake_only_waiting_tasks() {
+    BUTTON.reset()
+    clock := fake.Clock.new()
+    clock.interrupt_at(300_000, &BUTTON)
+    clock.interrupt_at(700_000, &BUTTON)
+    clock.interrupt_at(700_000, &BUTTON)
+    presses := Presses { count: 0, polls: 0, last_us: 0 }
+    blinker := Blinker.new(fake.Pin.new(), 250)
+    runner := executor.Executor.new()
+    {
+        tasks: [2] &mut dyn executor.Task = [&mut presses, &mut blinker]
+        assert(!runner.run_until(&mut tasks, &mut clock, 1_000_000))
+    }
+    // Polled at the start and once per interrupt time; both raises at
+    // 700 ms are counted in one poll.
+    assert_eq(presses.count, 3u32)
+    assert_eq(presses.polls, 3u32)
+    assert_eq(presses.last_us, 700_000u64)
+    assert_eq(blinker.led.changes(), 4u32)
+    // Raised before anyone waits: the first take sees it.
+    BUTTON.raise()
+    assert(BUTTON.is_raised())
+    cx := executor.Context.new(5)
+    assert_eq(BUTTON.take_count(&mut cx), 1u32)
+    assert(!BUTTON.is_raised() && !BUTTON.take(&mut cx))
+}
+
+fn tasks_signal_each_other() {
+    READING.reset()
+    clock := fake.Clock.new()
+    producer := Producer { ticker: executor.Ticker.every_ms(100), sent: 0 }
+    consumer := Consumer { total: 0, received: 0 }
+    {
+        tasks: [2] &mut dyn executor.Task = [&mut consumer, &mut producer]
+        executor.run(&mut tasks, &mut clock)
+    }
+    assert_eq(producer.sent, 5u32)
+    assert_eq(consumer.received, 5u32)
+    assert_eq(consumer.total, 150u32)
+    assert_eq(clock.now_us(), 500_000u64)
+    // A value sent twice before the receiver runs: the last one counts.
+    READING.send(1)
+    READING.send(2)
+    cx := executor.Context.new(0)
+    match READING.receive(&mut cx) {
+        some(value) => {
+            assert_eq(value, 2u32)
+        }
+        none => {
+            assert(false)
+        }
+    }
+    match READING.receive(&mut cx) {
+        some(_) => {
+            assert(false)
+        }
+        none => {}
+    }
+}
+
+fn yielding_tasks_run_without_sleeping() {
+    STEP.reset()
+    clock := fake.Clock.new()
+    chunked := Chunked { steps: 5, done: 0 }
+    waiter := Waiter { polls: 0 }
+    raiser := Raiser {}
+    runner := executor.Executor.new()
+    {
+        tasks: [3] &mut dyn executor.Task = [&mut waiter, &mut chunked, &mut raiser]
+        runner.run(&mut tasks, &mut clock)
+    }
+    assert_eq(chunked.done, 5u32)
+    // The waiter, polled first, sees the later task's raise next pass.
+    assert_eq(waiter.polls, 2u32)
+    assert_eq(clock.sleeps(), 0u32)
+    assert_eq(runner.sleeps(), 0u64)
+}
+
+fn tickers_and_timers_called_directly() {
+    ticker := executor.Ticker.every(1000)
+    cx := executor.Context.new(0)
+    assert(!ticker.ready(&mut cx))
+    assert_eq(wake(&cx), 1000u64)
+    cx = executor.Context.new(999)
+    assert(!ticker.ready(&mut cx))
+    cx = executor.Context.new(1000)
+    assert(ticker.ready(&mut cx))
+    assert_eq(wake(&cx), 2000u64)
+    // Three periods late: one tick, and the schedule is kept.
+    cx = executor.Context.new(4500)
+    assert(ticker.ready(&mut cx))
+    assert_eq(wake(&cx), 5000u64)
+    assert(!ticker.ready(&mut cx))
+    ticker.reset()
+    cx = executor.Context.new(10_000)
+    assert(!ticker.ready(&mut cx))
+    assert_eq(wake(&cx), 11_000u64)
+    slow := executor.Ticker.every_ms(2)
+    assert_eq(slow.period_us(), 2000u64)
+
+    timer := executor.Timer.new()
+    cx = executor.Context.new(100)
+    assert(!timer.is_running() && !timer.expired(&mut cx))
+    assert_eq(wake(&cx), NONE)
+    timer.start_ms(&mut cx, 3)
+    assert(timer.is_running())
+    assert_eq(wake(&cx), 3100u64)
+    cx = executor.Context.new(3099)
+    assert(!timer.expired(&mut cx))
+    assert_eq(wake(&cx), 3100u64)
+    cx = executor.Context.new(3100)
+    assert(timer.expired(&mut cx) && !timer.is_running() && !timer.expired(&mut cx))
+    timer.start(&mut cx, 10)
+    timer.stop()
+    cx = executor.Context.new(9999)
+    assert(!timer.expired(&mut cx))
+
+    // The earliest request wins; times that do not fit never come.
+    cx = executor.Context.new(50)
+    cx.wake_in(0xFFFF_FFFF_FFFF_FFF0)
+    assert_eq(wake(&cx), NONE)
+    cx.wake_in_ms(2)
+    cx.wake_at(5000)
+    cx.wake_in(10)
+    assert_eq(wake(&cx), 60u64)
+    cx.yield_now()
+    assert_eq(wake(&cx), 50u64)
+    assert_eq(cx.now_us(), 50u64)
+}
+
+fn serial_tasks_wake_on_receive_interrupts() {
+    RX.reset()
+    clock := fake.Clock.new()
+    serial := fake.Serial.new()
+    serial.feed(b"hello, executor")
+    clock.interrupt_at(1000, &RX)
+    echo := Echo { serial, reads: 0 }
+    runner := executor.Executor.new()
+    {
+        tasks: [1] &mut dyn executor.Task = [&mut echo]
+        assert(!runner.run_until(&mut tasks, &mut clock, 5000))
+    }
+    // The first poll already drains what is waiting; the interrupt at 1 ms
+    // finds nothing more.
+    assert(bytes.equal(echo.serial.sent(), b"hello, executor"))
+    assert_eq(echo.reads, 2u32)
+    assert_eq(runner.polls(), 2u64)
+    assert_eq(clock.idle_us(), 5000u64)
+}
+
+fn main() {
+    tickers_wake_on_time_and_the_clock_sleeps_between()
+    finished_tasks_end_the_run()
+    simulated_interrupts_wake_only_waiting_tasks()
+    tasks_signal_each_other()
+    yielding_tasks_run_without_sleeping()
+    tickers_and_timers_called_directly()
+    serial_tasks_wake_on_receive_interrupts()
+}
