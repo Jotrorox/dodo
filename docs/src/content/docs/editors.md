@@ -17,8 +17,8 @@ language server checks code; it does not need a working executable linker just
 to show diagnostics. To run or test programs, finish the C toolchain setup in
 [installation](installation.md).
 
-If you are new to Dodo, use the VS Code path below. Other editors need an LSP
-client configured to launch `dodo lsp` over standard input/output. You do not
+If you are new to Dodo, use the VS Code or JetBrains path below. Other editors
+need an LSP client configured to launch `dodo lsp` over standard input/output. You do not
 need to run a separate server in a terminal while editing.
 
 ## Visual Studio Code
@@ -75,6 +75,39 @@ channel's log level to **Trace** with **Developer: Set Log Level** for protocol
 logs; `dodo.trace.server` selects message or verbose detail. Highlighting and snippets work without the
 compiler; the language server runs only in trusted workspaces.
 
+## JetBrains IDEs
+
+The [Dodo JetBrains plugin](https://github.com/Jotrorox/dodo/tree/main/editor-support/dodo-jetbrains)
+works in RustRover, CLion, and other JetBrains IDEs from 2026.2 that include
+JetBrains' language server support. It connects to `dodo lsp` automatically and
+adds syntax highlighting, brace and comment support, folding, and live templates
+with the same abbreviations as the VS Code snippets. It requires Dodo 0.1.5 or newer.
+
+Download `dodo-jetbrains-0.1.5.zip` from
+[GitHub Releases](https://github.com/Jotrorox/dodo/releases/tag/v0.1.5). In
+**Settings | Plugins**, click the gear icon, choose **Install Plugin from Disk...**,
+and select the ZIP file. To build the plugin from a checkout with JDK 25 or newer:
+
+```sh
+cd editor-support/dodo-jetbrains
+./gradlew buildPlugin
+```
+
+The plugin is written to `build/distributions/`. Open a `.dodo` file in a trusted
+project to start the server. Configure it under
+**Settings | Languages & Frameworks | Dodo**: **Server path** defaults to `dodo`
+on the IDE's PATH, and a source build can use `$PROJECT_DIR$/target/debug/dodo`.
+The check mode, target triple, build target, and manifest path correspond to the
+initialization options described below. They are stored in `.idea/dodo.xml` and
+shared with the project, and applying a change restarts the server.
+
+Use **Tools | Dodo | Restart Dodo Language Server** after rebuilding the compiler.
+The **Dodo Language Server** tool window shows startup errors and server messages;
+set **Protocol trace** to log LSP messages there. Use **Code | Reformat File** to
+format, and press `Alt+Enter` (`Option+Return` on macOS) on a diagnostic for
+quick fixes. The IDE analyzes local files in the project's content roots; files
+outside the project and scratch files get highlighting but no diagnostics.
+
 ## Start the language server
 
 Configure your editor's LSP client with these settings:
@@ -116,7 +149,8 @@ visible hints when a loaded dependency changes. Types unavailable after a
 diagnostic are omitted.
 
 In VS Code, control visibility with **Editor: Inlay Hints: Enabled**, or set
-`"editor.inlayHints.enabled": "on"` inside the `"[dodo]"` settings block.
+`"editor.inlayHints.enabled": "on"` inside the `"[dodo]"` settings block. JetBrains
+IDEs control them under **Settings | Editor | Inlay Hints**.
 Other clients use the standard `textDocument/inlayHint` request with the visible
 document range. Hints have the LSP `Type` kind.
 
@@ -193,7 +227,8 @@ Untitled buffers receive standalone analysis and editing tools.
 
 ### Bundled sources in other clients
 
-The VS Code extension handles bundled source documents automatically. Other
+The VS Code extension and the JetBrains plugin handle bundled source documents
+automatically. Other
 clients need a read-only document provider for `dodo-stdlib:` URIs. For example,
 when a definition returns `dodo-stdlib:/std/math.dodo`, request its UTF-8 text with:
 

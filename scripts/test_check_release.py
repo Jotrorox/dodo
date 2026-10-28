@@ -34,14 +34,17 @@ class CheckReleaseTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="dodo-check-release-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.write_versions("1.2.3", "1.2.3")
+        self.write_versions("1.2.3", "1.2.3", "1.2.3")
         (self.root / "CHANGELOG.md").write_text(CHANGELOG)
 
-    def write_versions(self, cargo, extension):
+    def write_versions(self, cargo, extension, plugin):
         (self.root / "Cargo.toml").write_text(f'[package]\nname = "dodo"\nversion = "{cargo}"\n')
         package = self.root / "editor-support/dodo-vscode/package.json"
         package.parent.mkdir(parents=True, exist_ok=True)
         package.write_text(json.dumps({"name": "dodo-vscode", "version": extension}))
+        properties = self.root / "editor-support/dodo-jetbrains/gradle.properties"
+        properties.parent.mkdir(parents=True, exist_ok=True)
+        properties.write_text(f"pluginVersion = {plugin}\n# pluginVersion = 0.0.0\npluginSinceBuild = 262\n")
 
     def test_extracts_matching_release_notes(self):
         version, notes = check_release.check(self.root, "v1.2.3")
@@ -54,13 +57,18 @@ class CheckReleaseTests(unittest.TestCase):
                 check_release.check(self.root, tag)
 
     def test_rejects_cargo_version_mismatch(self):
-        self.write_versions("1.2.4", "1.2.3")
+        self.write_versions("1.2.4", "1.2.3", "1.2.3")
         with self.assertRaisesRegex(ValueError, "Cargo.toml"):
             check_release.check(self.root, "v1.2.3")
 
     def test_rejects_extension_version_mismatch(self):
-        self.write_versions("1.2.3", "1.2.2")
+        self.write_versions("1.2.3", "1.2.2", "1.2.3")
         with self.assertRaisesRegex(ValueError, "package.json"):
+            check_release.check(self.root, "v1.2.3")
+
+    def test_rejects_plugin_version_mismatch(self):
+        self.write_versions("1.2.3", "1.2.3", "1.2.2")
+        with self.assertRaisesRegex(ValueError, "gradle.properties"):
             check_release.check(self.root, "v1.2.3")
 
     def test_requires_dated_changelog_entry(self):
@@ -74,7 +82,7 @@ class CheckReleaseTests(unittest.TestCase):
             check_release.check(self.root, "v1.2.3")
 
     def test_accepts_prerelease_versions(self):
-        self.write_versions("1.3.0-rc.1", "1.3.0-rc.1")
+        self.write_versions("1.3.0-rc.1", "1.3.0-rc.1", "1.3.0-rc.1")
         (self.root / "CHANGELOG.md").write_text("## 1.3.0-rc.1 — 2026-10-05\n\n- Candidate.\n")
         self.assertEqual(check_release.check(self.root, "v1.3.0-rc.1"), ("1.3.0-rc.1", "- Candidate.\n"))
 

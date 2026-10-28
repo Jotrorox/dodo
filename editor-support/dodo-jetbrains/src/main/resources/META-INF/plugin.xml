@@ -1,0 +1,72 @@
+<idea-plugin>
+    <id>io.github.jotrorox.dodo</id>
+    <name>Dodo</name>
+    <vendor url="https://github.com/Jotrorox/dodo">Jotrorox</vendor>
+    <description><![CDATA[
+        <p>Language support for <a href="https://github.com/Jotrorox/dodo">Dodo</a> in RustRover, CLion,
+        and other JetBrains IDEs, using the compiler's built-in <code>dodo lsp</code> language server.</p>
+        <ul>
+            <li>Syntax highlighting for declarations, types, attributes, strings and escapes,
+                byte literals, numbers, borrowing, and operators.</li>
+            <li>Diagnostics, quick fixes, inferred type inlay hints, completion, hover documentation,
+                go to definition, find usages, rename, parameter info, and reformatting.</li>
+            <li>Read-only bundled library sources with hover and navigation.</li>
+            <li>Comment toggling, brace and quote pairing, indentation, folding, and live templates.</li>
+        </ul>
+        <p>Requires Dodo 0.1.5 or newer. Configure it in <b>Settings | Languages &amp; Frameworks | Dodo</b>.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lsp</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <fileType name="Dodo" language="Dodo" extensions="dodo" fieldName="INSTANCE"
+                  implementationClass="io.github.jotrorox.dodo.lang.DodoFileType"/>
+        <lang.parserDefinition language="Dodo" implementationClass="io.github.jotrorox.dodo.lang.DodoParserDefinition"/>
+        <lang.syntaxHighlighterFactory language="Dodo"
+                                       implementationClass="io.github.jotrorox.dodo.lang.DodoSyntaxHighlighterFactory"/>
+        <annotator language="Dodo" implementationClass="io.github.jotrorox.dodo.lang.DodoHighlightingAnnotator"/>
+        <colorSettingsPage implementation="io.github.jotrorox.dodo.editor.DodoColorSettingsPage"/>
+        <lang.commenter language="Dodo" implementationClass="io.github.jotrorox.dodo.editor.DodoCommenter"/>
+        <lang.braceMatcher language="Dodo" implementationClass="io.github.jotrorox.dodo.editor.DodoBraceMatcher"/>
+        <lang.quoteHandler language="Dodo" implementationClass="io.github.jotrorox.dodo.editor.DodoQuoteHandler"/>
+        <lang.foldingBuilder language="Dodo" implementationClass="io.github.jotrorox.dodo.editor.DodoFoldingBuilder"/>
+        <lineIndentProvider implementation="io.github.jotrorox.dodo.editor.DodoLineIndentProvider"/>
+        <typedHandler implementation="io.github.jotrorox.dodo.editor.DodoTypedHandler"/>
+        <langCodeStyleSettingsProvider implementation="io.github.jotrorox.dodo.editor.DodoCodeStyleSettingsProvider"/>
+        <defaultLiveTemplates file="/liveTemplates/Dodo.xml"/>
+        <liveTemplateContext contextId="DODO" implementation="io.github.jotrorox.dodo.editor.DodoTemplateContextType"/>
+
+        <platform.lsp.integrationProvider implementation="io.github.jotrorox.dodo.lsp.DodoLspIntegrationProvider"/>
+        <codeInsight.gotoDeclarationHandler implementation="io.github.jotrorox.dodo.lsp.DodoStdlibGotoDeclarationHandler"/>
+        <platform.backend.documentation.targetProvider
+                implementation="io.github.jotrorox.dodo.lsp.DodoStdlibDocumentationTargetProvider"/>
+        <projectConfigurable parentId="language" id="io.github.jotrorox.dodo.settings" displayName="Dodo"
+                             instance="io.github.jotrorox.dodo.settings.DodoConfigurable"/>
+        <toolWindow id="Dodo Language Server" anchor="bottom" icon="/icons/dodo.svg" canCloseContents="false"
+                    doNotActivateOnStart="true"
+                    factoryClass="io.github.jotrorox.dodo.lsp.DodoServerOutputToolWindowFactory"/>
+        <notificationGroup id="Dodo" displayType="BALLOON"/>
+    </extensions>
+
+    <projectListeners>
+        <listener class="io.github.jotrorox.dodo.lsp.DodoStdlibSources$EditorListener"
+                  topic="com.intellij.openapi.fileEditor.FileEditorManagerListener"/>
+    </projectListeners>
+    <applicationListeners>
+        <listener class="io.github.jotrorox.dodo.lsp.DodoTrustListener"
+                  topic="com.intellij.ide.trustedProjects.TrustedProjectsListener"/>
+    </applicationListeners>
+
+    <actions>
+        <group id="Dodo.Tools" text="Dodo" popup="true" icon="/icons/dodo.svg">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <action id="Dodo.RestartServer" class="io.github.jotrorox.dodo.lsp.DodoRestartServerAction"
+                    text="Restart Dodo Language Server"
+                    description="Stop the Dodo language server and start it with the current settings"/>
+            <action id="Dodo.ShowOutput" class="io.github.jotrorox.dodo.lsp.DodoShowOutputAction"
+                    text="Show Dodo Language Server Output"
+                    description="Open the Dodo Language Server tool window"/>
+        </group>
+    </actions>
+</idea-plugin>

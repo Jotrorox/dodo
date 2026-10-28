@@ -1,12 +1,12 @@
 name: Build
 
-# Tests and packages the compilers and the VS Code extension. CI runs this for
+# Tests and packages the compilers and the editor extensions. CI runs this for
 # every push and pull request; the release workflow publishes its artifacts.
 on:
   workflow_call:
     inputs:
       upload:
-        description: Upload the packaged compilers and VS Code extension as artifacts
+        description: Upload the packaged compilers and editor extensions as artifacts
         type: boolean
         default: false
       retention-days:
@@ -47,6 +47,35 @@ jobs:
         with:
           name: dodo-vscode
           path: editor-support/dodo-vscode/*.vsix
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+
+  jetbrains:
+    name: JetBrains plugin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: editor-support/dodo-jetbrains
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-disabled: ${{ !inputs.cache }}
+      # The language server test is skipped here and runs against the built compiler below.
+      - run: ./gradlew --no-daemon test buildPlugin verifyPlugin
+      - name: Upload the packaged JetBrains plugin
+        if: inputs.upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dodo-jetbrains
+          path: editor-support/dodo-jetbrains/build/distributions/*.zip
           if-no-files-found: error
           retention-days: ${{ inputs.retention-days }}
 
@@ -292,6 +321,33 @@ jobs:
       - run: sudo apt-get install --no-install-recommends -y xvfb
       - run: npm ci
       - run: xvfb-run -a npm run test:integration
+
+  jetbrains-integration:
+    name: JetBrains plugin against the built compiler
+    needs: linux-debug-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: editor-support/dodo-jetbrains
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-disabled: ${{ !inputs.cache }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: debug-dodo-x86_64
+          path: target/debug
+      # Fails if the artifact is missing, so the test cannot silently skip.
+      - run: chmod +x ../../target/debug/dodo
+      - run: ./gradlew --no-daemon test --tests '*DodoLspIntegrationTest'
 
   linux-release:
     name: Linux release / ${{ matrix.name }}

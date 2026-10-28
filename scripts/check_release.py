@@ -39,6 +39,14 @@ def cargo_version(manifest: str) -> str:
     return version.group(1)
 
 
+def gradle_property(properties: str, name: str) -> str:
+    """Return a property from a gradle.properties file."""
+    value = re.search(rf"^{re.escape(name)}\s*[=:]\s*(\S+)\s*$", properties, re.MULTILINE)
+    if not value:
+        raise ValueError(f"gradle.properties has no {name}")
+    return value.group(1)
+
+
 def check(root: Path, tag: str) -> tuple[str, str]:
     """Return the version and release notes for tag, or raise ValueError."""
     match = TAG.fullmatch(tag)
@@ -49,6 +57,8 @@ def check(root: Path, tag: str) -> tuple[str, str]:
         "Cargo.toml": cargo_version((root / "Cargo.toml").read_text()),
         "editor-support/dodo-vscode/package.json":
             json.loads((root / "editor-support/dodo-vscode/package.json").read_text())["version"],
+        "editor-support/dodo-jetbrains/gradle.properties":
+            gradle_property((root / "editor-support/dodo-jetbrains/gradle.properties").read_text(), "pluginVersion"),
     }
     for source, found in versions.items():
         if found != version:
