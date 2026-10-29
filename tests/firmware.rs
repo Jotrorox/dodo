@@ -526,21 +526,24 @@ fn rp2040_projects_link_to_flashable_firmware() {
         &elf,
     ]);
     check_rp2040_firmware(Path::new(&elf));
-    // A portable driver, tested with fakes, on the board's I2C bus.
-    let sensor = root().join("examples/hal_sensor_board.dodo");
-    for level in ["0", "2"] {
-        let elf = scratch.path(&format!("sensor-O{level}.elf"));
-        build(&[
-            "build",
-            sensor.to_str().unwrap(),
-            "--board",
-            "pico",
-            "-O",
-            level,
-            "-o",
-            &elf,
-        ]);
-        check_rp2040_firmware(Path::new(&elf));
+    // Portable drivers, tested with fakes, on the board's I2C bus and on
+    // an ADC input and a PWM output.
+    for name in ["hal_sensor_board", "dimmer_board"] {
+        let source = root().join(format!("examples/{name}.dodo"));
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("{name}-O{level}.elf"));
+            build(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                "pico",
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            check_rp2040_firmware(Path::new(&elf));
+        }
     }
 }
 
@@ -552,6 +555,7 @@ fn rp2350_projects_link_to_flashable_firmware() {
     let scratch = Scratch::new("link-rp2350");
     let blink = root().join("examples/blink");
     let sensor = root().join("examples/hal_sensor_board.dodo");
+    let dimmer = root().join("examples/dimmer_board.dodo");
     let selftest = root().join("tests/hardware/pico2");
     let selftest_w = root().join("tests/hardware/pico2_w");
     let tasks = root().join("examples/tasks");
@@ -562,6 +566,8 @@ fn rp2350_projects_link_to_flashable_firmware() {
         (&tasks, "tasks-w", &["--board", "pico2_w"][..]),
         (&sensor, "sensor", &["--board", "pico2"][..]),
         (&sensor, "sensor-w", &["--board", "pico2_w"][..]),
+        (&dimmer, "dimmer", &["--board", "pico2"][..]),
+        (&dimmer, "dimmer-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),
         (&selftest_w, "selftest-w", &[][..]),
     ] {

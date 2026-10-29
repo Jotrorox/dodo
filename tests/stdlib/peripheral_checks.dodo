@@ -3,7 +3,9 @@ package main
 import "core/option"
 import "core/ptr"
 import "std/embedded/hal"
+import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_pins"
+import "std/embedded/chip/rp_pwm"
 import "std/embedded/hal/fake"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
@@ -13,7 +15,8 @@ import "std/io"
 
 // Host checks for std/embedded/peripheral: the DesignWare I2C, PL022 SPI, and
 // PL011 UART controller drivers against behavioural models of the
-// controllers, and the pin and controller ownership and panic reports of
+// controllers, the RP2040 and RP2350 PWM and ADC drivers against models of
+// those blocks, and the pin and controller ownership and panic reports of
 // std/embedded/chip/rp_pins. The models enforce the hardware's rules
 // (registers that may change only while disabled, FIFO depths, the flushed
 // state after an abort) and process commands slower than the drivers poll,
@@ -2584,6 +2587,396 @@ fn rp_pin_assignments() {
     expect_invalid(rp_pins.spi_select_pin(0, 33))
 }
 
+// --- The RP PWM block ------------------------------------------------------
+
+// Eight slices' registers, with the block's XOR, set, and clear aliases.
+// Every Channel reaches the one block through its own PwmView, as on the
+// chip, where each holds a register block at the same base. Registers are
+// stored by word, slice * 5 + offset / 4: CSR, DIV, CTR, CC, and TOP.
+const PWM_WORDS: usize = 40
+static mut PWM_REGISTERS: [40]u32 = [0u32; 40]
+// Writes through the plain address of a compare register, which would
+// overwrite the other output's half.
+static mut PLAIN_COMPARE_WRITES: u32 = 0
+
+struct PwmView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(offset < 0x1000 && offset % 4 == 0)
+        word := offset / 4
+        unsafe {
+            value := PWM_REGISTERS[word]
+            // The counter advances between reads while the slice runs.
+            if word % 5 == 2 && (PWM_REGISTERS[word - 2] & 1) != 0 {
+                PWM_REGISTERS[word] = (value + 1) % (PWM_REGISTERS[word + 2] + 1)
+            }
+            return value
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        alias := offset & 0x3000
+        word := (offset & 0xFFF) / 4
+        core.assert(word < PWM_WORDS)
+        unsafe {
+            current := PWM_REGISTERS[word]
+            if word % 5 == 3 && alias == 0 {
+                PLAIN_COMPARE_WRITES += 1
+            }
+            if alias == 0 {
+                current = value
+            } else if alias == 0x1000 {
+                current ^= value
+            } else if alias == 0x2000 {
+                current |= value
+            } else {
+                current &= ~value
+            }
+            // CSR has 8 bits, DIV 12, the counter and TOP 16.
+            register := word % 5
+            if register == 0 {
+                current &= 0xFF
+            } else if register == 1 {
+                current &= 0xFFF
+            } else if register == 2 || register == 4 {
+                current &= 0xFFFF
+            }
+            PWM_REGISTERS[word] = current
+        }
+    }
+}
+
+struct PwmSlice {
+    csr: u32
+    div: u32
+    cc: u32
+    top: u32
+}
+
+fn pwm_csr(slice: usize) -> u32 {
+    unsafe {
+        return PWM_REGISTERS[5 * slice]
+    }
+}
+
+fn pwm_div(slice: usize) -> u32 {
+    unsafe {
+        return PWM_REGISTERS[5 * slice + 1]
+    }
+}
+
+fn pwm_cc(slice: usize) -> u32 {
+    unsafe {
+        return PWM_REGISTERS[5 * slice + 3]
+    }
+}
+
+fn pwm_top(slice: usize) -> u32 {
+    unsafe {
+        return PWM_REGISTERS[5 * slice + 4]
+    }
+}
+
+fn pwm_slice(slice: usize) -> PwmSlice {
+    unsafe {
+        return PwmSlice { csr: PWM_REGISTERS[5 * slice], div: PWM_REGISTERS[5 * slice + 1], cc: PWM_REGISTERS[5 * slice + 3], top: PWM_REGISTERS[5 * slice + 4] }
+    }
+}
+
+fn expect_pwm_error(result: rp_pwm.Channel<PwmView>!hal.Error, expected: hal.Error) {
+    match result {
+        ok(channel) => {
+            channel.release()
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn pwm_timing() {
+    // The smallest divider that fits a period in 65535 counts.
+    timing := rp_pwm.timing(CLOCK_HZ, 1000)!
+    core.assert(timing.divider == 31 && timing.top == 64515 && timing.frequency_hz() == 1000)
+    servo := rp_pwm.timing(CLOCK_HZ, 50)!
+    core.assert(servo.divider == 611 && servo.top == 65465 && servo.frequency_hz() == 50)
+    // A period is at most MAX_TOP + 1 counts, so full duty still fits.
+    slow := rp_pwm.timing(CLOCK_HZ, 1907)!
+    core.assert(slow.divider == 17 && slow.top <= rp_pwm.MAX_TOP)
+    exact := rp_pwm.timing(1_000_000, 10)!
+    core.assert(exact.divider == 25 && exact.top == 63999 && exact.frequency_hz() == 10)
+    // The range: clk_sys / 2 at the top, 8 Hz at the bottom.
+    fastest := rp_pwm.timing(CLOCK_HZ, 62_500_000)!
+    core.assert(fastest.divider == 16 && fastest.top == 1)
+    slowest := rp_pwm.timing(CLOCK_HZ, 8)!
+    core.assert(slowest.divider == 3815 && slowest.frequency_hz() == 8)
+    expect_invalid(rp_pwm.timing(CLOCK_HZ, 100_000_000))
+    expect_invalid(rp_pwm.timing(CLOCK_HZ, 7))
+    expect_invalid(rp_pwm.timing(CLOCK_HZ, 0))
+    // Given dividers and tops are only checked.
+    given := rp_pwm.divided(CLOCK_HZ, 16 * 125, 999)!
+    core.assert_eq(given.frequency_hz(), 1000u32)
+    expect_invalid(rp_pwm.divided(CLOCK_HZ, 15, 999))
+    expect_invalid(rp_pwm.divided(CLOCK_HZ, 4096, 999))
+    expect_invalid(rp_pwm.divided(CLOCK_HZ, 16, 0xFFFF))
+    // GPIO n is output n % 2 of slice (n / 2) % 8.
+    core.assert(rp_pwm.slice_of(0) == 0 && rp_pwm.output_of(0) == 0)
+    core.assert(rp_pwm.slice_of(15) == 7 && rp_pwm.output_of(15) == 1)
+    core.assert(rp_pwm.slice_of(16) == 0 && rp_pwm.slice_of(29) == 6)
+}
+
+fn pwm_channels() {
+    timing := rp_pwm.timing(CLOCK_HZ, 1000)!
+    // Output A of slice 2 starts the slice: low, at the timing.
+    a := unsafe {
+        rp_pwm.Channel.new(PwmView {}, 4, rp_pwm.timing(CLOCK_HZ, 1000)!)!
+    }
+    state := pwm_slice(2)
+    core.assert(state.csr == 1 && state.div == 31 && state.top == 64515 && state.cc == 0)
+    core.assert(a.slice() == 2 && a.output() == 0 && a.pin() == 4)
+    core.assert(a.max_duty() == 64516 && a.frequency_hz() == 1000)
+
+    // Each output writes only its half of the compare register.
+    a.set_duty(1000)!
+    b := unsafe {
+        rp_pwm.Channel.new(PwmView {}, 5, rp_pwm.timing(CLOCK_HZ, 1000)!)!
+    }
+    b.set_duty(64516)!
+    core.assert_eq(pwm_cc(2), (64516u32 << 16) | 1000)
+    a.set_duty(0)!
+    core.assert_eq(pwm_cc(2), 64516u32 << 16)
+    a.set_duty(32258)!
+    core.assert(a.duty() == 32258 && b.duty() == 64516)
+    core.assert_eq(pwm_cc(2), (64516u32 << 16) | 32258)
+    unsafe {
+        core.assert_eq(PLAIN_COMPARE_WRITES, 1u32)
+    }
+    expect_error(a.set_duty(64517), hal.Error.InvalidInput)
+    core.assert_eq(a.duty(), 32258u16)
+    hal.set_duty_percent(&mut b, 25)!
+    core.assert_eq(b.duty(), 16129u16)
+
+    // Inversion is per output.
+    b.set_inverted(true)
+    core.assert_eq(pwm_csr(2), 0b1001u32)
+    a.set_inverted(true)
+    a.set_inverted(false)
+    core.assert_eq(pwm_csr(2), 0b1001u32)
+    b.set_inverted(false)
+
+    // The slice's counter runs.
+    first := a.count()
+    core.assert(a.count() != first)
+
+    // The outputs share the frequency: the second output must match it, and
+    // neither changes it while the other is in use.
+    expect_pwm_error(unsafe {
+        rp_pwm.Channel.new(PwmView {}, 5, timing)
+    }, hal.Error.Busy)
+    expect_error(a.set_frequency(2000), hal.Error.Busy)
+    a.set_frequency(1000)!
+    core.assert_eq(pwm_div(2), 31u32)
+    // GPIO 20 carries the same output as GPIO 4, which is in use.
+    expect_pwm_error(unsafe {
+        rp_pwm.Channel.new(PwmView {}, 20, rp_pwm.timing(CLOCK_HZ, 1000)!)
+    }, hal.Error.Busy)
+    expect_pwm_error(unsafe {
+        rp_pwm.Channel.new(PwmView {}, 30, rp_pwm.timing(CLOCK_HZ, 1000)!)
+    }, hal.Error.InvalidInput)
+
+    // Released, B holds its output low and the slice keeps running for A,
+    // which may now change the frequency, keeping its duty cycle.
+    b.release()
+    core.assert(pwm_csr(2) == 1 && (pwm_cc(2) >> 16) == 0)
+    a.set_frequency(2000)!
+    core.assert(a.frequency_hz() == 2000 && a.max_duty() == 62500)
+    core.assert(a.duty() == 31250 && (pwm_cc(2) & 0xFFFF) == 31250)
+    a.set_timing(rp_pwm.divided(CLOCK_HZ, 16, 99)!)!
+    core.assert(a.duty() == 50 && pwm_top(2) == 99 && pwm_div(2) == 16)
+    // A second output may then join at that timing, and only that.
+    expect_pwm_error(unsafe {
+        rp_pwm.Channel.new(PwmView {}, 21, rp_pwm.timing(CLOCK_HZ, 1000)!)
+    }, hal.Error.Busy)
+    joined := unsafe {
+        rp_pwm.Channel.new(PwmView {}, 21, rp_pwm.divided(CLOCK_HZ, 16, 99)!)!
+    }
+    core.assert(joined.max_duty() == 100 && joined.duty() == 0)
+    core.assert_eq(pwm_cc(2), 50u32)
+    joined.release()
+
+    // The last output stops the slice.
+    a.release()
+    core.assert(pwm_csr(2) == 0 && pwm_cc(2) == 0)
+    // Other slices were never touched.
+    core.assert(pwm_csr(1) == 0 && pwm_csr(3) == 0)
+    again := unsafe {
+        rp_pwm.Channel.new(PwmView {}, 20, rp_pwm.timing(CLOCK_HZ, 50)!)!
+    }
+    core.assert(pwm_csr(2) == 1 && pwm_div(2) == 611)
+    again.release()
+}
+
+// --- The RP ADC ------------------------------------------------------------
+
+// The converter's CS and RESULT registers, with the set and clear aliases.
+// A conversion takes `delay` status reads; input 4 reads the temperature
+// sensor only while it is powered.
+struct AdcModel: hal.Registers {
+    cs: u32
+    result: u32
+    inputs: [5]u16
+    delay: u32
+    pending: u32
+    conversions: u32
+    // Failure injection: conversions never finish or report an error, or
+    // the converter never becomes ready.
+    stuck: bool
+    failing: bool
+    dead: bool
+
+    fn new() -> AdcModel {
+        return AdcModel { cs: 0, result: 0, inputs: [0u16; 5], delay: 3, pending: 0, conversions: 0, stuck: false, failing: false, dead: false }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x04 {
+            return self.result
+        }
+        core.assert_eq(offset, 0usize)
+        if self.pending > 0 && !self.stuck {
+            self.pending -= 1
+            if self.pending == 0 {
+                self.finish()
+            }
+        }
+        ready := 0u32
+        if (self.cs & 1) != 0 && self.pending == 0 && !self.dead {
+            ready = 1 << 8
+        }
+        return (self.cs & ~(1u32 << 8)) | ready
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        alias := offset & 0x3000
+        core.assert_eq(offset & 0xFFF, 0usize)
+        if alias == 0x2000 {
+            self.cs |= value
+        } else if alias == 0x3000 {
+            self.cs &= ~value
+        } else {
+            core.assert_eq(alias, 0usize)
+            // Selecting an input while converting corrupts the result.
+            core.assert(self.pending == 0)
+            // START_ONCE is a strobe; the error flag is read-only.
+            self.cs = (value & ~(1u32 << 2)) | (self.cs & (1u32 << 9))
+            if (value & (1u32 << 2)) != 0 {
+                core.assert((self.cs & 1) != 0)
+                self.pending = self.delay
+                self.conversions += 1
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        input := ((self.cs >> 12) & 0xF) as usize
+        core.assert(input <= 4)
+        value := self.inputs[input] as u32
+        if input == 4 && (self.cs & 2) == 0 {
+            value = 0
+        }
+        self.result = value
+        if self.failing {
+            self.cs |= 1 << 9
+        } else {
+            self.cs &= ~(1u32 << 9)
+        }
+    }
+}
+
+fn expect_read_error(result: u16!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn adc_inputs() {
+    core.assert_eq(rp_adc.input_of(26)!, 0u32)
+    core.assert_eq(rp_adc.input_of(29)!, 3u32)
+    expect_invalid(rp_adc.input_of(25))
+    expect_invalid(rp_adc.input_of(30))
+
+    model := AdcModel.new()
+    model.inputs = [100u16, 2048, 4095, 0, 891]
+    rp_adc.start(&mut model)!
+    core.assert_eq(model.cs, 1u32)
+    knob := unsafe {
+        rp_adc.Input.new(model, 0)
+    }
+    core.assert(knob.input() == 0 && knob.max_value() == 4095)
+    core.assert_eq(knob.read()!, 100u16)
+    core.assert_eq(hal.read_millivolts(&mut knob, 3300)!, 81u32)
+    model = knob.release()
+    core.assert_eq(model.conversions, 2u32)
+
+    // Each read selects its own input first.
+    full := unsafe {
+        rp_adc.Input.new(model, 2)
+    }
+    core.assert_eq(full.read()!, 4095u16)
+    model = full.release()
+    core.assert_eq((model.cs >> 12) & 0xF, 2u32)
+
+    // The temperature sensor is powered while its input is held.
+    sensor := unsafe {
+        rp_adc.Input.new(model, rp_adc.TEMPERATURE_INPUT)
+    }
+    value := sensor.read()!
+    core.assert_eq(value, 891u16)
+    celsius := rp_adc.millicelsius(value, 3300)
+    core.assert(celsius > 19_500 && celsius < 20_500)
+    model = sensor.release()
+    core.assert_eq(model.cs & 2, 0u32)
+    // 0.706 V is 27 C; the temperature falls as the voltage rises.
+    core.assert(rp_adc.millicelsius(876, 3300) >= 27_000 && rp_adc.millicelsius(876, 3300) < 27_300)
+    core.assert(rp_adc.millicelsius(1000, 3300) < rp_adc.millicelsius(900, 3300))
+    core.assert(rp_adc.millicelsius(0, 3300) > 400_000)
+
+    // A conversion that does not finish, and one that fails.
+    model.stuck = true
+    stuck := unsafe {
+        rp_adc.Input.new(model, 1)
+    }
+    expect_read_error(stuck.read(), hal.Error.Timeout)
+    model = stuck.release()
+    model.stuck = false
+    model.pending = 0
+    model.failing = true
+    failing := unsafe {
+        rp_adc.Input.new(model, 1)
+    }
+    expect_read_error(failing.read(), hal.Error.Bus)
+    model = failing.release()
+    model.failing = false
+
+    // A converter that never becomes ready.
+    rp_adc.stop(&mut model)
+    core.assert_eq(model.cs & 3, 0u32)
+    model.dead = true
+    match rp_adc.start(&mut model) {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+}
+
 // --- rp_pins.Bank over a fake chip -----------------------------------------
 
 // What the bank asked of the chip: each pin's function and pad bits, resets
@@ -2599,6 +2992,14 @@ static mut UART_AUX: bool = false
 // drivers only configure them and disable them again, and a panic report
 // leaves its last byte in a UART's data register.
 static mut BLOCKS: [384]u32 = [0u32; 384]
+// The PWM block and the ADC, with room for their atomic aliases, which
+// plain memory does not imitate: the bank only hands out their drivers.
+static mut PWM_MEMORY: [4096]u32 = [0u32; 4096]
+static mut ADC_MEMORY: [4096]u32 = [0u32; 4096]
+// ADC starts and stops, and whether the next start fails.
+static mut ADC_STARTS: u32 = 0
+static mut ADC_STOPS: u32 = 0
+static mut FAIL_ADC: bool = false
 
 const SIO: u32 = 5
 const UART: u32 = 2
@@ -2636,7 +3037,28 @@ struct FakeChip {
 
     pub fn base(&self, controller: u32) -> usize {
         unsafe {
+            if controller == rp_pins.PWM {
+                return ptr.from_mut(&mut PWM_MEMORY) as usize
+            } else if controller == rp_pins.ADC {
+                return ptr.from_mut(&mut ADC_MEMORY) as usize
+            }
             return ptr.from_mut(&mut BLOCKS) as usize + 0x100 * controller as usize
+        }
+    }
+
+    pub fn start_adc(&mut self) -> void!hal.Error {
+        unsafe {
+            if FAIL_ADC {
+                return err(hal.Error.Timeout)
+            }
+            ADC_STARTS += 1
+        }
+        return ok()
+    }
+
+    pub fn stop_adc(&mut self) {
+        unsafe {
+            ADC_STOPS += 1
         }
     }
 
@@ -2864,6 +3286,144 @@ fn rp_bank() {
     core.assert(function(13) == DISCONNECTED && function(17) == DISCONNECTED)
 }
 
+const PWM_FUNCTION: u32 = 4
+const INPUT_ENABLE: u32 = 1 << 6
+const OUTPUT_DISABLE: u32 = 1 << 7
+
+fn expect_pwm_busy(result: rp_pwm.Pwm!hal.Error) {
+    match result {
+        ok(output) => {
+            output.release()
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+}
+
+fn held(controller: u32) -> bool {
+    unsafe {
+        return (HELD & (1u32 << controller)) != 0
+    }
+}
+
+// PWM outputs and ADC inputs: pins and outputs owned once, the PWM block
+// out of reset while an output is in use, and the ADC running while an
+// input is.
+fn rp_bank_pwm_and_adc() {
+    bank := unsafe {
+        rp_pins.Bank.new(FakeChip {})
+    }
+    resets := unsafe {
+        RESETS
+    }
+    led := bank.pwm(15, 1000)!
+    core.assert(function(15) == PWM_FUNCTION && led.pin() == 15 && led.frequency_hz() == 1000)
+    unsafe {
+        core.assert((PADS[15] & OUTPUT_DISABLE) == 0 && RESETS == resets + 1)
+    }
+    core.assert(!held(rp_pins.PWM))
+    hal.set_duty_percent(&mut led, 50)!
+    expect_busy(bank.pwm(15, 1000))
+    expect_busy(bank.gpio(15))
+    expect_invalid(bank.pwm(30, 1000))
+    expect_invalid(bank.pwm(14, 0))
+
+    // The other output of the slice joins at the same frequency only; a
+    // failed claim gives its pin back.
+    expect_pwm_busy(bank.pwm(14, 2000))
+    free := bank.gpio(14)!
+    bank.release_gpio(free)
+    dim := bank.pwm(14, 1000)!
+    unsafe {
+        core.assert_eq(RESETS, resets + 1)
+    }
+    // GPIO 0 and 16 carry the same output.
+    first := bank.pwm_divided(0, 16, 99)!
+    core.assert_eq(first.max_duty(), 100u16)
+    expect_pwm_busy(bank.pwm_divided(16, 16, 99))
+    taken := bank.gpio(16)!
+    bank.release_gpio(taken)
+
+    // Released, outputs disconnect their pins; the last holds the block in
+    // reset.
+    bank.release_pwm(led)
+    core.assert(function(15) == DISCONNECTED && !held(rp_pins.PWM))
+    bank.release_pwm(dim)
+    bank.release_pwm(first)
+    core.assert(function(14) == DISCONNECTED && function(0) == DISCONNECTED && held(rp_pins.PWM))
+    unsafe {
+        FAIL_RESET = true
+    }
+    match bank.pwm(15, 1000) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    unsafe {
+        FAIL_RESET = false
+    }
+    again := bank.pwm(15, 50)!
+    core.assert_eq(again.frequency_hz(), 50u32)
+    bank.release_pwm(again)
+
+    // An analog input turns off its pin's digital input and pulls; the ADC
+    // starts with the first input and stops after the last.
+    knob := bank.analog(26)!
+    core.assert(function(26) == DISCONNECTED && knob.input() == 0 && knob.max_value() == 4095)
+    unsafe {
+        core.assert((PADS[26] & (INPUT_ENABLE | PULL_UP | PULL_DOWN)) == 0 && (PADS[26] & OUTPUT_DISABLE) != 0)
+        core.assert(ADC_STARTS == 1 && ADC_STOPS == 0)
+    }
+    expect_busy(bank.analog(26))
+    expect_busy(bank.gpio(26))
+    expect_invalid(bank.analog(25))
+    expect_invalid(bank.analog(30))
+    sensor := bank.temperature()!
+    core.assert_eq(sensor.input(), rp_adc.TEMPERATURE_INPUT)
+    expect_busy(bank.temperature())
+    supply := bank.analog(29)!
+    core.assert_eq(supply.input(), 3u32)
+    bank.release_analog(knob)
+    bank.release_analog(supply)
+    unsafe {
+        core.assert(ADC_STARTS == 1 && ADC_STOPS == 0)
+    }
+    bank.release_analog(sensor)
+    unsafe {
+        core.assert(ADC_STARTS == 1 && ADC_STOPS == 1)
+    }
+    pin := bank.gpio(26)!
+    bank.release_gpio(pin)
+
+    // An ADC that does not start gives the pin back.
+    unsafe {
+        FAIL_ADC = true
+    }
+    match bank.analog(27) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    unsafe {
+        FAIL_ADC = false
+    }
+    pin = bank.gpio(27)!
+    bank.release_gpio(pin)
+    sensor = bank.temperature()!
+    bank.release_analog(sensor)
+    unsafe {
+        core.assert(ADC_STARTS == 2 && ADC_STOPS == 2)
+    }
+}
+
 // The UART pin rules exhaustively, and a claim whose reset fails.
 fn rp_bank_uart_rules() {
     for tx in 0u32..30 {
@@ -2954,4 +3514,8 @@ fn main() {
     rp_pin_assignments()
     rp_bank()
     rp_bank_uart_rules()
+    pwm_timing()
+    pwm_channels()
+    adc_inputs()
+    rp_bank_pwm_and_adc()
 }

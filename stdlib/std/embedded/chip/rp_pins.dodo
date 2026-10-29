@@ -2,15 +2,17 @@ package rp_pins
 
 import "core/ptr"
 import "std/embedded/hal"
+import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_pwm"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 
-// The GPIO, I2C, SPI, and UART ownership the RP2040 and RP2350 share. On both
-// chips GPIO 0 to 29 select the same controller signals with the same
-// function numbers and pad bits, so the chip packages keep their pins in a
-// `Bank`, which checks bus pins, hands out each pin and controller once, and
-// takes them back. Serial ports claimed from a bank also report panics; see
+// The GPIO, I2C, SPI, UART, PWM, and ADC ownership the RP2040 and RP2350
+// share. On both chips GPIO 0 to 29 select the same controller signals with
+// the same function numbers and pad bits, so the chip packages keep their
+// pins in a `Bank`, which checks bus pins, hands out each pin and controller
+// once, and takes them back. Serial ports claimed from a bank also report panics; see
 // report_panic.
 
 // The GPIOs whose functions both chips share.
@@ -24,12 +26,16 @@ pub const SPI1: u32 = 3
 pub const UART0: u32 = 4
 pub const UART1: u32 = 5
 const CONTROLLERS: usize = 6
+// The PWM block and the ADC, which serve several pins each.
+pub const PWM: u32 = 6
+pub const ADC: u32 = 7
 
 // GPIO functions (FUNCSEL). NULL disconnects the pin: it floats, apart from
 // its pad's pulls.
 const FUNCTION_SPI: u32 = 1
 const FUNCTION_UART: u32 = 2
 const FUNCTION_I2C: u32 = 3
+const FUNCTION_PWM: u32 = 4
 const FUNCTION_SIO: u32 = 5
 // The RP2350's second UART function, TX and RX on the pins that otherwise
 // carry CTS and RTS.
@@ -164,21 +170,26 @@ fn uart_of(number: u32) -> u32 {
     return ((number / 4 + 1) / 2) % 2
 }
 
-// GPIO 0 to 29 and the bus controllers of one chip C, each handed out once
-// and taken back by the release methods. C does what differs between the
-// chips, with these methods, `controller` numbered as I2C0 to UART1 above:
+// GPIO 0 to 29, the bus controllers, and the PWM outputs and ADC inputs of
+// one chip C, each handed out once and taken back by the release methods. C
+// does what differs between the chips, with these methods, `controller`
+// numbered as I2C0 to ADC above:
 //
 //    route(&mut self, pin: u32, function: u32, clear: u32, set: u32)
 //        connect the pin to FUNCSEL `function`, then clear the `clear` and
 //        set the `set` bits of its pad
 //    reset(&mut self, controller: u32) -> void!hal.Error
-//        pulse the controller's reset and wait until it runs
+//        pulse the controller's reset and wait until it runs (I2C0 to PWM)
 //    hold(&mut self, controller: u32)
-//        hold the controller in reset
+//        hold the controller in reset (I2C0 to PWM)
 //    base(&self, controller: u32) -> usize
 //        the controller's register block
 //    clock_hz(&self) -> u32
-//        the frequency of the clock that feeds the controllers
+//        the frequency of the clock that feeds the controllers and PWM
+//    start_adc(&mut self) -> void!hal.Error
+//        start the ADC's 48 MHz clock, pulse its reset, and rp_adc.start it
+//    stop_adc(&mut self)
+//        rp_adc.stop the ADC, hold it in reset, and stop its clock
 //    uart_aux(&self) -> bool
 //        whether the chip has the UART_AUX function (the RP2350)
 pub struct Bank<C> {
@@ -188,13 +199,17 @@ pub struct Bank<C> {
     // The pins of each controller's bus, by controller number; 0 while the
     // controller is free.
     buses: [6]u32
+    // Pins driven by PWM outputs, and ADC inputs in use, one bit each.
+    pwm_pins: u32
+    analog_inputs: u32
 
     // SAFETY: C's methods must do what the protocol above says, `base` must
-    // name the controller's DW_apb_i2c, PL022, or PL011, and the bank must
-    // be the only bank, and the only user of GPIO 0 to 29's control and pad
-    // registers, of the six controllers, and of their resets.
+    // name the controller's DW_apb_i2c, PL022, or PL011, or the PWM block or
+    // ADC, and the bank must be the only bank, and the only user of GPIO 0
+    // to 29's control and pad registers, of the controllers, the PWM block,
+    // and the ADC, and of their resets and clocks.
     pub unsafe fn new(chip: C) -> Bank<C> {
-        return Bank<C> { chip, taken: 0, buses: [0u32; 6] }
+        return Bank<C> { chip, taken: 0, buses: [0u32; 6], pwm_pins: 0, analog_inputs: 0 }
     }
 
     // Claim pin `number` for the single-cycle I/O block. Returns its bit, for
@@ -354,6 +369,131 @@ pub struct Bank<C> {
                 self.release_uart(port)
                 return err(error)
             }
+        }
+    }
+
+    // Claim pin `pin` as a PWM output at the frequency closest to
+    // `frequency_hz`, low until a duty is set; see rp_pwm for the slices
+    // and the frequency range. InvalidInput above GPIO 29 or for a frequency
+    // out of range, Busy if the pin is taken, if its output is in use on
+    // another pin (GPIO n and n + 16 carry the same output), or if the
+    // other output of its slice runs at another frequency.
+    pub fn pwm(&mut self, pin: u32, frequency_hz: u32) -> rp_pwm.Pwm!hal.Error {
+        timing := rp_pwm.timing(self.chip.clock_hz(), frequency_hz)?
+        return self.open_pwm(pin, timing)
+    }
+
+    // `pwm` with the slice's divider, in sixteenths, and TOP given instead
+    // of a frequency; see rp_pwm.divided. Errors as for `pwm`.
+    pub fn pwm_divided(&mut self, pin: u32, divider: u32, top: u32) -> rp_pwm.Pwm!hal.Error {
+        timing := rp_pwm.divided(self.chip.clock_hz(), divider, top)?
+        return self.open_pwm(pin, timing)
+    }
+
+    fn open_pwm(&mut self, pin: u32, timing: rp_pwm.Timing) -> rp_pwm.Pwm!hal.Error {
+        if pin >= PIN_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        mask := 1u32 << pin
+        self.reserve(mask)?
+        if self.pwm_pins == 0 {
+            match self.chip.reset(PWM) {
+                ok() => {}
+                err(error) => {
+                    self.taken &= ~mask
+                    return err(error)
+                }
+            }
+        }
+        // SAFETY: Bank.new vouches for the base address, the reset above
+        // started the block, and only Channels use it.
+        base := self.chip.base(PWM)
+        opened := unsafe {
+            rp_pwm.Pwm.at(base, pin, timing)
+        }
+        match opened {
+            ok(output) => {
+                self.pwm_pins |= mask
+                self.chip.route(pin, FUNCTION_PWM, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
+                return ok(output)
+            }
+            err(error) => {
+                self.taken &= ~mask
+                if self.pwm_pins == 0 {
+                    self.chip.hold(PWM)
+                }
+                return err(error)
+            }
+        }
+    }
+
+    // Give back a PWM output from `pwm`: it stops driving its pin, which is
+    // disconnected, and the PWM block is held in reset once no output is
+    // left.
+    pub fn release_pwm(&mut self, output: rp_pwm.Pwm) {
+        mask := 1u32 << output.pin()
+        output.release()
+        self.pwm_pins &= ~mask
+        self.disconnect(mask)
+        if self.pwm_pins == 0 {
+            self.chip.hold(PWM)
+        }
+    }
+
+    // Claim pin `pin`, GPIO 26 to 29, as an ADC input. Its digital input
+    // and pulls are turned off, so they do not disturb the voltage. The ADC
+    // starts with its first input. InvalidInput for another pin, Busy if
+    // the pin is taken, and Timeout if the ADC or its clock does not start.
+    pub fn analog(&mut self, pin: u32) -> rp_adc.Analog!hal.Error {
+        input := rp_adc.input_of(pin)?
+        mask := 1u32 << pin
+        self.reserve(mask)?
+        match self.open_analog(input) {
+            ok(analog) => {
+                self.chip.route(pin, FUNCTION_NULL, PAD_INPUT_ENABLE | PAD_PULL_UP | PAD_PULL_DOWN, PAD_OUTPUT_DISABLE)
+                return ok(analog)
+            }
+            err(error) => {
+                self.taken &= ~mask
+                return err(error)
+            }
+        }
+    }
+
+    // Claim the temperature sensor, an ADC input; rp_adc.millicelsius
+    // converts its readings. Busy if it is claimed already, Timeout as for
+    // `analog`.
+    pub fn temperature(&mut self) -> rp_adc.Analog!hal.Error {
+        if (self.analog_inputs & (1u32 << rp_adc.TEMPERATURE_INPUT)) != 0 {
+            return err(hal.Error.Busy)
+        }
+        return self.open_analog(rp_adc.TEMPERATURE_INPUT)
+    }
+
+    fn open_analog(&mut self, input: u32) -> rp_adc.Analog!hal.Error {
+        if self.analog_inputs == 0 {
+            self.chip.start_adc()?
+        }
+        self.analog_inputs |= 1u32 << input
+        // SAFETY: Bank.new vouches for the base address, start_adc started
+        // the ADC, and each input is handed out once.
+        base := self.chip.base(ADC)
+        unsafe {
+            return ok(rp_adc.Analog.at(base, input))
+        }
+    }
+
+    // Give back an ADC input from `analog` or `temperature`. A pin is
+    // disconnected; the ADC stops, with its clock, once no input is left.
+    pub fn release_analog(&mut self, analog: rp_adc.Analog) {
+        input := analog.input()
+        analog.release()
+        if input < rp_adc.PIN_COUNT {
+            self.disconnect(1u32 << (rp_adc.FIRST_PIN + input))
+        }
+        self.analog_inputs &= ~(1u32 << input)
+        if self.analog_inputs == 0 {
+            self.chip.stop_adc()
         }
     }
 

@@ -1,0 +1,183 @@
+package rp_adc
+
+import "std/embedded/hal"
+
+// The analog-to-digital converter the RP2040 and RP2350 share (RP2040
+// datasheet 4.9, RP2350 datasheet 12.4): one 12-bit converter, clocked at
+// 48 MHz, that takes 96 clock cycles, 2 us, per conversion. Its inputs 0 to
+// 3 are GPIO 26 to 29, and input 4 is the on-chip temperature sensor. The
+// RP2350B's inputs on GPIO 40 to 47 are not supported.
+//
+// `Input` is one input over any hal.Registers: a `hal.RegisterBlock` at the
+// converter's base on the chip, or a simulated converter in a desktop test.
+// It implements hal.AnalogInput with polled reads. The inputs share the
+// converter, so each read selects its input and converts inside a critical
+// section, which masks interrupts for those 2 us; inputs held by an
+// interrupt handler and by the main program then never mix up their
+// conversions. The reference voltage is the chip's ADC_AVDD supply,
+// 3.3 V on the Pico boards.
+
+const CS: usize = 0x00
+const RESULT: usize = 0x04
+
+// Atomic register aliases (RP2040 datasheet 2.1.2).
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// CS: the converter is on, the temperature sensor is powered, start one
+// conversion, ready (idle), the last conversion failed, and, from bit 12,
+// the selected input.
+const ENABLE: u32 = 1 << 0
+const SENSOR_ENABLE: u32 = 1 << 1
+const START_ONCE: u32 = 1 << 2
+const READY: u32 = 1 << 8
+const FAILED: u32 = 1 << 9
+
+// The converter's 12-bit range.
+pub const MAX_VALUE: u16 = 4095
+// The input that measures the temperature sensor.
+pub const TEMPERATURE_INPUT: u32 = 4
+// GPIO 26 to 29 are inputs 0 to 3.
+pub const FIRST_PIN: u32 = 26
+pub const PIN_COUNT: u32 = 4
+
+// Status polls before a conversion that does not finish is reported as
+// Timeout. One takes 96 cycles of the 48 MHz clock, about 50 polls.
+const ATTEMPTS: u32 = 10_000
+
+// The input of GPIO `pin`; InvalidInput for a pin without one.
+pub fn input_of(pin: u32) -> u32!hal.Error {
+    if pin < FIRST_PIN || pin >= FIRST_PIN + PIN_COUNT {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(pin - FIRST_PIN)
+}
+
+// Turn the converter on and wait until it is ready, after its reset.
+// Timeout if it does not become ready.
+pub fn start<R: hal.Registers>(registers: &mut R) -> void!hal.Error {
+    registers.write(CS, ENABLE)
+    for _ in 0..ATTEMPTS {
+        if (registers.read(CS) & READY) != 0 {
+            return ok()
+        }
+    }
+    return err(hal.Error.Timeout)
+}
+
+// Turn the converter and the temperature sensor off.
+pub fn stop<R: hal.Registers>(registers: &mut R) {
+    registers.write(CS, 0)
+}
+
+// The temperature in thousandths of a degree Celsius that a reading of the
+// temperature sensor shows, for a converter whose reference is
+// `reference_mv`: 27 C at 706 mV, falling 1.721 mV per degree (RP2040
+// datasheet 4.9.5, RP2350 datasheet 12.4.6). The sensor is accurate to a
+// few degrees, and the result depends on the reference being exact.
+pub fn millicelsius(value: u16, reference_mv: u32) -> i32 {
+    microvolts := (value as i64 * reference_mv as i64 * 1000 + 2048) / 4096
+    return (27_000 - (microvolts - 706_000) * 1000 / 1721) as i32
+}
+
+// One input of the converter. Implements hal.AnalogInput.
+pub struct Input<R: hal.Registers>: hal.AnalogInput {
+    registers: R
+    input: u32
+
+    // Input `input`, 0 to 3 for GPIO 26 to 29 or TEMPERATURE_INPUT, which
+    // powers the temperature sensor until release.
+    // SAFETY: `registers` must be the converter's, started with `start`,
+    // and only Inputs may use it, one for each input number.
+    pub unsafe fn new(registers: R, input: u32) -> Input<R> {
+        core.assert(input <= TEMPERATURE_INPUT)
+        if input == TEMPERATURE_INPUT {
+            registers.write(CS + SET_ALIAS, SENSOR_ENABLE)
+        }
+        return Input<R> { registers, input }
+    }
+
+    pub fn max_value(&self) -> u16 {
+        return MAX_VALUE
+    }
+
+    // The input number, 0 to 4.
+    pub fn input(&self) -> u32 {
+        return self.input
+    }
+
+    // Convert once: 0 at ground to MAX_VALUE at the reference. Timeout if
+    // the conversion does not finish, Bus if the converter reports that it
+    // failed.
+    pub fn read(&mut self) -> u16!hal.Error {
+        section := hal.Critical.enter()
+        result := self.convert()
+        core.drop(section)
+        return result
+    }
+
+    // Stop the temperature sensor, if this is its input, and give back the
+    // registers.
+    pub fn release(self) -> R {
+        if self.input == TEMPERATURE_INPUT {
+            self.registers.write(CS + CLEAR_ALIAS, SENSOR_ENABLE)
+        }
+        let Input { registers, input } = self
+        return registers
+    }
+
+    fn convert(&mut self) -> u16!hal.Error {
+        self.wait_ready()?
+        // Keep the converter and sensor bits; select this input, then start.
+        selected := (self.registers.read(CS) & (ENABLE | SENSOR_ENABLE)) | (self.input << 12)
+        self.registers.write(CS, selected)
+        self.registers.write(CS, selected | START_ONCE)
+        self.wait_ready()?
+        if (self.registers.read(CS) & FAILED) != 0 {
+            return err(hal.Error.Bus)
+        }
+        return ok((self.registers.read(RESULT) & 0xFFF) as u16)
+    }
+
+    fn wait_ready(&mut self) -> void!hal.Error {
+        for _ in 0..ATTEMPTS {
+            if (self.registers.read(CS) & READY) != 0 {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+}
+
+// An input on the chip: an Input over the converter's registers, which the
+// chip packages hand out. Implements hal.AnalogInput.
+pub struct Analog: hal.AnalogInput {
+    input: Input<hal.RegisterBlock>
+
+    // Input.new over the converter at `base`.
+    // SAFETY: as for Input.new, with `base` the converter's base address.
+    pub unsafe fn at(base: usize, input: u32) -> Analog {
+        unsafe {
+            return Analog { input: Input.new(hal.RegisterBlock.at(base), input) }
+        }
+    }
+
+    pub fn max_value(&self) -> u16 {
+        return MAX_VALUE
+    }
+
+    pub fn read(&mut self) -> u16!hal.Error {
+        return self.input.read()
+    }
+
+    pub fn input(&self) -> u32 {
+        return self.input.input()
+    }
+
+    // Input.release; returns the converter's base address.
+    pub fn release(self) -> usize {
+        let Analog { input } = self
+        registers := input.release()
+        return registers.base()
+    }
+}

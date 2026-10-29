@@ -92,6 +92,8 @@ methods implements it and can be passed where a driver expects it:
 | `hal.Delay` | `delay_us(&mut self, microseconds: u32)` |
 | `hal.I2c` | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
+| `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
+| `hal.AnalogInput` | `max_value(&self) -> u16`<br>`read(&mut self) -> u16!hal.Error` |
 | Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`. |
 | `hal.Registers` | `read(&mut self, offset: usize) -> u32`<br>`write(&mut self, offset: usize, value: u32)` |
 
@@ -103,14 +105,20 @@ array, such as a list of sensors behind one interface of your own.
 A bus is configured when it is created: its frequency, and for SPI a
 `hal.SpiMode` (`Mode0` to `Mode3`, the clock polarity and phase numbering of
 device datasheets). The protocols then only move bytes, so a driver works
-whatever speed the application chose. `hal.I2C_STANDARD_HZ`,
+whatever speed the application chose. A PWM output is configured the same
+way, with its frequency, and the protocol then only sets its duty cycle: the
+output is high for `duty / max_duty()` of each period, so 0 holds it low and
+`max_duty()` holds it high. An analog input reads 0 at ground and
+`max_value()`, such as 4095 for a 12-bit converter, at the converter's
+reference voltage. `hal.I2C_STANDARD_HZ`,
 `hal.I2C_FAST_HZ`, and `hal.I2C_FAST_PLUS_HZ` name the usual I2C speeds.
 The register block protocol is for [peripheral drivers](#register-blocks)
 rather than device drivers.
 
-Pins and delays cannot fail. Bus operations return `hal.Error`, one shared
-enum: `Timeout`, `NoAcknowledge`, `Bus`, `Overrun`, `Busy`, `InvalidInput`, and
-`Unsupported`. Every driver and chip uses the same error type, so `?` passes
+Pins and delays cannot fail. Bus, PWM, and analog operations return
+`hal.Error`, one shared enum, because such a device may itself sit on a bus,
+as a PWM controller chip on I2C does: `Timeout`, `NoAcknowledge`, `Bus`,
+`Overrun`, `Busy`, `InvalidInput`, and `Unsupported`. Every driver and chip uses the same error type, so `?` passes
 errors through layers without conversions, and `==` compares them. Use
 `hal.error_name(error)` for a log message.
 
@@ -148,6 +156,10 @@ bus and a memory buffer.
 | `hal.read_register(&mut bus, address, register)` | Read one numbered 8-bit I2C register. |
 | `hal.read_registers(&mut bus, address, first, buffer)` | Read consecutive I2C registers. |
 | `hal.write_register(&mut bus, address, register, value)` | Write one I2C register. |
+| `hal.set_duty_percent(&mut output, percent)` | Set a PWM output high for 0 to 100% of each period. |
+| `hal.set_duty_fraction(&mut output, numerator, denominator)` | Set a PWM duty cycle to a fraction, rounded to the nearest step. |
+| `hal.set_pulse_us(&mut output, pulse_us, period_us)` | Set a PWM pulse length, as for a servo: `set_pulse_us(&mut servo, 1500, 20_000)` centres one on a 50 Hz output. |
+| `hal.read_millivolts(&mut input, reference_mv)` | Read an analog input as millivolts. |
 | `hal.SpiDevice<P>` | One SPI device and its chip-select pin; see below. |
 
 ### Several devices on one SPI bus
@@ -321,10 +333,15 @@ which pins can carry which bus.
 | `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. | `register(n)`, `set_register(n, v)`, `fail_next(error)` |
 | `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. | `sent()`, `clear()`, `reply_with(bytes)` |
 | `fake.Serial` | A serial port, the `std/io` Reader and Writer: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)` |
+| `fake.Pwm` | A PWM output with a given `max_duty`, initially at duty 0. | `duty()`, `changes()`, `fail_next(error)` |
+| `fake.Analog` | An analog input with a given `max_value` that reads the value given to `set`, after any given to `queue`, one per read. | `set(value)`, `queue(values)`, `reads()`, `fail_next(error)` |
 | `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
-`fail_next` makes the next I2C transaction fail, so error paths are as easy to
-test as success. A driver for a device on a serial line, such as a GPS or
+`fail_next` makes the next I2C transaction, duty change, or analog read fail,
+so error paths are as easy to test as success. The repository's
+`examples/dimmer.dodo` tests an LED dimmer, a knob on an analog input setting
+a PWM output, this way, and `examples/dimmer_board.dodo` runs it unchanged on
+a board. A driver for a device on a serial line, such as a GPS or
 modem module, takes any reader and writer, so `fake.Serial` stands in for the
 board's port:
 
@@ -538,13 +555,68 @@ registers a C function may change, so a handler is an ordinary C-ABI function;
 on bare-metal RISC-V the compiler saves every register it uses and returns
 with `mret`.
 
-The handler and the code it interrupts share state through `static mut`
-storage. Reading or writing it is unsafe in Dodo, and keeping both sides
-consistent is the program's job: `hal.Critical.enter()` masks interrupts on the
+The handler and the code it interrupts share state through static storage: a
+single integer through an [atomic](#sharing-state-with-atomics), anything else
+through `static mut` storage. Reading or writing `static mut` storage is unsafe
+in Dodo, and keeping both sides consistent is the program's job: `hal.Critical.enter()` masks interrupts on the
 current core and remembers whether they were enabled; dropping it restores
 exactly that state, so sections nest. A handler cannot be interrupted by
 itself, so it needs no section for state only it and lower-priority code use.
 Keep sections short, and remember they never exclude other threads or cores.
+
+### Sharing state with atomics
+
+An integer that a handler and the main program share needs neither `unsafe`
+nor a critical section when it is a `std/sync/atomic` atomic. A `static`
+(not `static mut`) holds it, initialized with `atomic.Atomic.new`, and both
+sides call its methods:
+
+```dodo
+package firmware
+
+import "core/cpu"
+import "std/embedded/cortex_m"
+import "std/sync/atomic"
+
+static TICKS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+
+@interrupt(SysTick_Handler)
+fn tick() {
+    TICKS.fetch_add(1, atomic.Ordering.Relaxed)!
+}
+
+fn main() {
+    cortex_m.systick_start(124_999, true)!
+    for TICKS.load(atomic.Ordering.Relaxed)! < 1000 {
+        cpu.wait_for_interrupt()
+    }
+}
+```
+
+Each call is one indivisible step that an interrupt cannot split, but two
+calls are two steps: to change a value based on what it was, use
+`fetch_add`, `exchange`, or a `compare_exchange` loop rather than a `load`
+followed by a `store`. `Ordering.Relaxed` is enough for a value read on its
+own, such as this counter. To hand over other data, write the data, then
+`store` a flag with `Ordering.Release`; the side that `load`s the flag with
+`Ordering.Acquire` and sees it set also sees the data.
+[Synchronization](synchronization.md#atomics) describes the methods and
+orderings.
+
+A static that holds an atomic is placed in RAM even though it is not `mut`.
+A `const` cannot hold one: each use of a constant is a separate copy.
+
+What the core provides decides which methods a build may use:
+
+| Core | Atomic operations |
+| --- | --- |
+| Cortex-M33 (RP2350), and Cortex-M3, M4, M7, M23, M55, and M85 | All, on 8-, 16-, and 32-bit integers, with exclusive loads and stores. |
+| Cortex-M0+ (RP2040) and Cortex-M0 | `load` and `store` only. `exchange`, `fetch_add`, or `compare_exchange` where the program can reach it is a build error, since the core has no instructions for them. |
+
+On the RP2040 an atomic still shares a value that only one side writes: the
+handler `load`s the count, adds one, and `store`s it, which is safe as long
+as nothing else stores to it. A value that both sides change needs a critical
+section there.
 
 ### An interrupt-driven driver
 
@@ -1029,6 +1101,8 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `b.pins.i2c(sda, scl, hz)` | An I2C bus on two pins, implementing the I2C bus protocol. |
 | `b.pins.spi(clock, tx, rx, mode, hz)` | An SPI bus, implementing the SPI bus protocol; `rx` is `some(pin)` or `none`. |
 | `b.pins.uart(tx, rx, baud)` | A [serial port](#serial-ports-on-the-rp2040-and-rp2350), implementing the `std/io` Reader and Writer; `rx` is `some(pin)` or `none`. |
+| `b.pins.pwm(pin, hz)` | A [PWM output](#pwm-and-the-adc-on-the-rp2040-and-rp2350), implementing the PWM output protocol. |
+| `b.pins.analog(pin)`, `b.pins.temperature()` | An ADC input on a pin, or the chip's temperature sensor, implementing the analog input protocol. |
 | `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
@@ -1305,6 +1379,91 @@ extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, col
 }
 ```
 
+### PWM and the ADC on the RP2040 and RP2350
+
+`pins.pwm(pin, frequency_hz)` claims any GPIO as a PWM output and returns an
+`rp_pwm.Pwm`, which implements `hal.PwmOutput`. It starts low; set its duty
+cycle directly or with the [helpers](#helpers):
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+
+fn main() {
+    b := board.take()!
+    led := b.pins.pwm(15, 1000)!
+    hal.set_duty_percent(&mut led, 25)!
+    // A hobby servo on GP16: 50 Hz, centred by 1.5 ms pulses.
+    servo := b.pins.pwm(16, 50)!
+    hal.set_pulse_us(&mut servo, 1500, 20_000)!
+}
+```
+
+The PWM block has eight slices, each a 16-bit counter with two outputs.
+GPIO n is output A (n even) or B (n odd) of slice (n / 2) % 8, so GPIO 0 and 1
+are slice 0, GPIO 14 and 15 slice 7, and GPIO 16 and 17 slice 0 again. Two
+pins on the same output, such as GPIO 0 and 16, would carry the same signal,
+so the second claim is `Busy`. The two outputs of a slice share its
+frequency: the second may join at the frequency the slice already runs at,
+and is `Busy` at another.
+
+A slice counts clk_sys (125 MHz on the RP2040, 150 MHz on the RP2350) through
+a divider from 1 to 255 15/16 and wraps after TOP. `pins.pwm` picks the
+smallest divider whose period fits in 65535 counts, so the output has as many
+duty steps as the frequency allows: `max_duty()` is TOP + 1, 64516 at 1 kHz on
+the RP2040. Frequencies run from 8 Hz (9 Hz on the RP2350) up to half of
+clk_sys. For a divider and TOP of your own,
+`pins.pwm_divided(pin, divider, top)` takes the divider in sixteenths, from
+16 to 4095, and TOP, up to 65534.
+
+| `rp_pwm.Pwm` | Purpose |
+| --- | --- |
+| `max_duty()`, `set_duty(duty)`, `duty()` | The PWM output protocol, and the duty last set. A new duty starts with the next period. |
+| `set_frequency(hz)`, `set_timing(timing)` | Change the frequency, or the divider and TOP of `rp_pwm.divided`, keeping the duty cycle. `Busy` while the slice's other output is claimed. |
+| `frequency_hz()`, `timing()` | The frequency, and the divider and TOP. |
+| `set_inverted(on)` | High while the count is at or above the compare value instead of below it. |
+| `pin()`, `slice()`, `output()`, `count()` | The GPIO, slice, output (0 for A), and the counter's value. |
+
+`pins.release_pwm(output)` drives the pin low, disconnects it, and stops the
+slice once neither output is in use. The two outputs of a slice write only
+their own bits of the registers they share, so one can be kept by an
+interrupt handler and the other by the main program.
+
+`pins.analog(pin)` claims GPIO 26 to 29, ADC inputs 0 to 3, and returns an
+`rp_adc.Analog`, which implements `hal.AnalogInput`: each `read()` converts
+once, 0 to 4095 for 0 V to the ADC's reference, the 3.3 V supply on the Pico
+boards. The pin's digital input and pulls are turned off, so they do not
+disturb the voltage. `pins.temperature()` claims the on-chip temperature
+sensor, ADC input 4, and `rp_adc.millicelsius(value, 3300)` converts its
+readings to thousandths of a degree Celsius:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_adc"
+import "std/embedded/hal"
+
+fn main() {
+    b := board.take()!
+    knob := b.pins.analog(26)!
+    sensor := b.pins.temperature()!
+    millivolts := hal.read_millivolts(&mut knob, 3300)!
+    celsius := rp_adc.millicelsius(sensor.read()!, 3300) / 1000
+}
+```
+
+The ADC is one converter shared by its inputs. A read selects its input and
+converts in about 2 us with interrupts masked, so inputs read by an interrupt
+handler and by the main program never mix up their conversions. A conversion
+that does not finish is `Timeout`, and one the converter flags as failed is
+`Bus`. The ADC needs a 48 MHz clock, so its first input starts PLL_USB, and
+releasing the last with `pins.release_analog(input)` stops both. The sensor
+is accurate to a few degrees and depends on the reference voltage; on the
+Pico and Pico 2, GP29 reads a third of the supply voltage VSYS.
+
 ### The Raspberry Pi Pico 2 W
 
 The Pico 2 W is a Pico 2 with an Infineon CYW43439 Wi-Fi and Bluetooth chip.
@@ -1408,8 +1567,12 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 ## Current limits
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
-  chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, and the timer;
-  PWM, ADC, and USB are not bundled yet. Write them with `hal.Reg` as above.
+  chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
+  and the timer; USB, PIO, and DMA are not bundled yet. Write them with
+  `hal.Reg` as above.
+- PWM outputs only generate; the slices' input modes, which count or time a
+  pin's pulses, and the PWM wrap interrupt are not exposed. ADC reads are
+  polled one at a time, without the round-robin sampler, FIFO, or DMA.
 - I2C and SPI transfers are polled, without interrupts or DMA. Serial ports
   are polled too unless a program serves their interrupts, as in
   [an interrupt-driven driver](#an-interrupt-driven-driver) or a
@@ -1428,13 +1591,12 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   core 0 as [executor tasks](#tasks-and-the-executor), which are
   cooperative: there is no preemptive scheduler. The RP2350's RISC-V cores
   are not supported.
-- `std/sync/atomic` currently supports x86-64 and AArch64 only. On
-  microcontrollers, share state with interrupt handlers through a critical
-  section.
+- On the Cortex-M0+ of the RP2040, atomics only load and store; see
+  [sharing state with atomics](#sharing-state-with-atomics).
 - Inline assembly lives inside functions; there is no global or naked
   assembly, so startup code and vector tables come from the chip runtime or a
   `@section`-placed static.
-- ADC, PWM, timers, and DMA have no shared protocol yet. Expose them as methods
-  on your chip's types.
+- Timers and DMA have no shared protocol yet. Expose them as methods on your
+  chip's types.
 
 For raw register and pointer contracts, see [memory and foreign calls](memory-and-ffi.md).

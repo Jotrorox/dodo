@@ -719,8 +719,21 @@ impl TargetMachine {
         };
         let cpu = CString::new(options.cpu.as_deref().unwrap_or("generic"))
             .map_err(|_| error("CPU contains a NUL byte"))?;
-        let features = CString::new(options.features.as_str())
-            .map_err(|_| error("target features contain a NUL byte"))?;
+        // ARMv6-M has no exclusive accesses, but its aligned loads and stores
+        // of up to 32 bits are single-copy atomic. Without this feature LLVM
+        // calls libatomic even for those; with it they become `ldr`/`str`
+        // and `dmb`. Codegen rejects the read-modify-write operations, which
+        // would otherwise become `__sync` calls (see `atomic_support`).
+        let mut features = options.features.clone();
+        let triple_text = triple.to_string_lossy();
+        if triple_text.starts_with("thumbv6m") && !features.contains("atomics-32") {
+            if !features.is_empty() {
+                features.push(',');
+            }
+            features.push_str("+atomics-32");
+        }
+        let features =
+            CString::new(features).map_err(|_| error("target features contain a NUL byte"))?;
         let mut target = ptr::null_mut();
         let mut msg = ptr::null_mut();
         unsafe {

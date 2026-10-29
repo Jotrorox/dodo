@@ -1,0 +1,34 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+import "dimmer"
+
+// The dimmer from dimmer.dodo, unchanged, on a real board. Its tests run it
+// against `fake.Analog` and `fake.Pwm`; here an ADC input and a PWM output
+// take their places. Connect a potentiometer's ends to 3V3 and ground and
+// its wiper to GP26, and an LED with a 330 ohm resistor from GP15 to
+// ground, then flash the board from BOOTSEL mode with:
+//
+//     dodo run examples/dimmer_board.dodo --board pico
+//
+// (or --board pico2 or pico2_w). Turning the knob dims the LED. The board's
+// own LED blinks if the ADC fails.
+fn main() {
+    b := board.take()!
+    knob := b.pins.analog(26)!
+    // 1 kHz is too fast to see flicker and gives 64516 duty steps.
+    led := b.pins.pwm(15, 1000)!
+    lamp := dimmer.Dimmer.new(knob, led)
+    for {
+        match lamp.update() {
+            ok(_) => {
+                b.timer.delay_ms(10)
+            }
+            err(_) => {
+                b.led.toggle()
+                b.timer.delay_ms(250)
+            }
+        }
+    }
+}

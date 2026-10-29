@@ -443,7 +443,10 @@ Prefer the checked `std/sync/atomic` API documented in
 
 All operations require `unsafe`. Modification requires a mutable raw pointer;
 load accepts a const pointer. Supported integer widths cannot exceed the target's
-supported lock-free width, which this compiler bounds by pointer width. An
+supported lock-free width, which this compiler bounds by pointer width. On
+ARMv6-M only loads and stores are available; a reachable exchange, fetch-add,
+or compare-exchange there is a build error, as is any atomic operation on a
+target without atomics ([synchronization](synchronization.md#atomics)). An
 optional explicit type argument must match the pointer's integer element type.
 
 Orders are compile-time integers: 0 Relaxed, 1 Acquire, 2 Release, 3 AcqRel,

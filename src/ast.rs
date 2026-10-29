@@ -374,6 +374,44 @@ pub struct Program {
     /// by package loading for a board or chip, `None` elsewhere.
     pub interrupt_vectors: Option<&'static [&'static str]>,
 }
+impl Program {
+    /// Whether a value of `ty` holds an interior-mutable struct (see
+    /// `Struct::interior_mutable`), directly or in a field, element, or payload.
+    pub fn holds_interior_mutable(&self, ty: &Type) -> bool {
+        fn visit<'a>(program: &'a Program, ty: &'a Type, seen: &mut Vec<&'a str>) -> bool {
+            match ty {
+                Type::Array(_, element) | Type::ArrayExpr(_, element) => {
+                    visit(program, element, seen)
+                }
+                Type::Option(inner) | Type::MaybeUninit(inner) => visit(program, inner, seen),
+                Type::Result(value, error) => {
+                    visit(program, value, seen) || visit(program, error, seen)
+                }
+                Type::Named(name) | Type::Generic(name, _) => {
+                    if seen.contains(&name.as_str()) {
+                        return false;
+                    }
+                    seen.push(name);
+                    if let Some(item) = program.structs.iter().find(|s| s.name == *name) {
+                        return item.interior_mutable
+                            || item.fields.iter().any(|f| visit(program, &f.ty, seen));
+                    }
+                    program
+                        .enums
+                        .iter()
+                        .find(|e| e.name == *name)
+                        .is_some_and(|item| {
+                            item.variants
+                                .iter()
+                                .any(|v| v.fields.iter().any(|f| visit(program, &f.ty, seen)))
+                        })
+                }
+                _ => false,
+            }
+        }
+        visit(self, ty, &mut Vec::new())
+    }
+}
 /// `type Name<T> = Type` introduces another name for a type. Aliases are
 /// transparent: semantic analysis replaces every use with the aliased type.
 #[derive(Clone, Debug)]
@@ -418,6 +456,10 @@ pub struct Struct {
     /// native threads. Checked borrows are never erased by these contracts.
     pub unsafe_send: bool,
     pub unsafe_sync: bool,
+    /// Changes through shared references: `std/sync/atomic`'s `Atomic`, set
+    /// by package loading. A non-mut static holding one is placed in writable
+    /// memory, and a `const`, which is copied at each use, cannot hold one.
+    pub interior_mutable: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Field {

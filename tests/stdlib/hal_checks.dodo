@@ -212,6 +212,112 @@ fn bytes_equal(left: &[u8], right: &[u8]) -> bool {
     return true
 }
 
+// A dimmer: an LED's brightness follows a potentiometer, written once
+// against the PWM output and analog input protocols.
+fn follow<A: hal.AnalogInput, P: hal.PwmOutput>(knob: &mut A, led: &mut P) -> void!hal.Error {
+    value := knob.read()?
+    return hal.set_duty_fraction(led, value as u32, knob.max_value() as u32)
+}
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_read_error(result: u16!hal.Error, expected: hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn pwm_outputs() {
+    led := fake.Pwm.new(1000)
+    core.assert_eq(led.duty(), 0u16)
+    hal.set_duty_percent(&mut led, 25)!
+    core.assert_eq(led.duty(), 250u16)
+    hal.set_duty_percent(&mut led, 100)!
+    core.assert_eq(led.duty(), 1000u16)
+    // Fractions round to the nearest step.
+    hal.set_duty_fraction(&mut led, 1, 3)!
+    core.assert_eq(led.duty(), 333u16)
+    hal.set_duty_fraction(&mut led, 2, 3)!
+    core.assert_eq(led.duty(), 667u16)
+    // A servo pulse: 1.5 ms of a 20 ms period.
+    hal.set_pulse_us(&mut led, 1500, 20_000)!
+    core.assert_eq(led.duty(), 75u16)
+    core.assert_eq(led.changes(), 5u32)
+
+    expect_error(hal.set_duty_percent(&mut led, 101), hal.Error.InvalidInput)
+    expect_error(hal.set_duty_fraction(&mut led, 1, 0), hal.Error.InvalidInput)
+    expect_error(led.set_duty(1001), hal.Error.InvalidInput)
+    led.fail_next(hal.Error.NoAcknowledge)
+    expect_error(hal.set_duty_percent(&mut led, 10), hal.Error.NoAcknowledge)
+    core.assert(led.duty() == 75 && led.changes() == 5)
+
+    // The full 16-bit range: max_duty 65535 still rounds exactly.
+    wide := fake.Pwm.new(65535)
+    hal.set_duty_percent(&mut wide, 50)!
+    core.assert_eq(wide.duty(), 32768u16)
+    hal.set_duty_fraction(&mut wide, 1, 1)!
+    core.assert_eq(wide.duty(), 65535u16)
+
+    // Through `dyn`, for outputs chosen at run time.
+    outputs: [2] &mut dyn hal.PwmOutput = [&mut led, &mut wide]
+    for index in 0..2usize {
+        outputs[index].set_duty(0)!
+    }
+    core.assert(led.duty() == 0 && wide.duty() == 0)
+}
+
+fn analog_inputs() {
+    knob := fake.Analog.new(4095)
+    core.assert_eq(knob.read()!, 0u16)
+    knob.set(4095)
+    core.assert_eq(hal.read_millivolts(&mut knob, 3300)!, 3300u32)
+    knob.set(1241)
+    core.assert_eq(hal.read_millivolts(&mut knob, 3300)!, 1000u32)
+
+    // Queued values come first, in order, then the set value again.
+    values: [3]u16 = [0, 2048, 4095]
+    knob.queue(&values)
+    more: [1]u16 = [100]
+    core.assert_eq(knob.read()!, 0u16)
+    knob.queue(&more)
+    core.assert_eq(knob.read()!, 2048u16)
+    core.assert_eq(knob.read()!, 4095u16)
+    core.assert_eq(knob.read()!, 100u16)
+    core.assert_eq(knob.read()!, 1241u16)
+    core.assert_eq(knob.reads(), 8u32)
+
+    knob.fail_next(hal.Error.Timeout)
+    expect_read_error(knob.read(), hal.Error.Timeout)
+    core.assert_eq(knob.reads(), 8u32)
+
+    // A driver over both protocols.
+    led := fake.Pwm.new(255)
+    knob.set(2048)
+    follow(&mut knob, &mut led)!
+    core.assert_eq(led.duty(), 128u16)
+    knob.fail_next(hal.Error.Bus)
+    expect_error(follow(&mut knob, &mut led), hal.Error.Bus)
+    core.assert_eq(led.changes(), 1u32)
+
+    input: &mut dyn hal.AnalogInput = &mut knob
+    core.assert_eq(input.max_value(), 4095u16)
+    core.assert_eq(input.read()!, 2048u16)
+}
+
 fn critical_sections() {
     outer := hal.Critical.enter()
     inner := hal.Critical.enter()
@@ -225,5 +331,7 @@ fn main() {
     i2c_driver()
     spi_devices()
     serial_ports()
+    pwm_outputs()
+    analog_inputs()
     critical_sections()
 }

@@ -3,19 +3,23 @@ package rp2350
 import "core/cpu"
 import "std/embedded/cortex_m"
 import "std/embedded/hal"
+import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_pwm"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
-// I2C, SPI, UART, the microsecond timer, and the boot ROM. `take(config)`
-// brings the chip from its boot state (ring oscillator, peripherals held in
-// reset) to a known configuration and hands out the peripherals once. Pins
-// implement the std/embedded/hal output and input pin protocols, I2C and SPI
-// buses claimed from `Pins` implement the bus protocols, serial ports the
-// std/io Reader and Writer protocols, and the timer implements the delay
-// protocol, so portable drivers use them unchanged.
+// I2C, SPI, UART, PWM, the ADC, the microsecond timer, and the boot ROM.
+// `take(config)` brings the chip from its boot state (ring oscillator,
+// peripherals held in reset) to a known configuration and hands out the
+// peripherals once. Pins implement the std/embedded/hal output and input pin
+// protocols, I2C and SPI buses claimed from `Pins` implement the bus
+// protocols, serial ports the std/io Reader and Writer protocols, PWM
+// outputs and ADC inputs the PWM output and analog input protocols, and the
+// timer implements the delay protocol, so portable drivers use them
+// unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -23,7 +27,8 @@ import "std/embedded/chip/rp_pins"
 // board with `chip = "rp2350"`.
 //
 // Clocks after take(): clk_ref = the crystal, clk_sys = 150 MHz from PLL_SYS,
-// clk_peri = clk_sys, and 1 MHz ticks for TIMER0 and the watchdog. The flash
+// clk_peri = clk_sys, and 1 MHz ticks for TIMER0 and the watchdog. clk_adc
+// runs at 48 MHz from PLL_USB while an ADC input is claimed. The flash
 // keeps the boot ROM's execute-in-place setup. Section numbers below refer to
 // the RP2350 datasheet.
 //
@@ -43,11 +48,14 @@ const CLEAR_ALIAS: usize = 0x3000
 const RESETS_BASE: usize = 0x4002_0000
 const RESET: usize = RESETS_BASE + 0x0
 const RESET_DONE: usize = RESETS_BASE + 0x8
+const RESET_ADC: u32 = 1 << 0
 const RESET_I2C0: u32 = 1 << 4
 const RESET_I2C1: u32 = 1 << 5
 const RESET_IO_BANK0: u32 = 1 << 6
 const RESET_PADS_BANK0: u32 = 1 << 9
 const RESET_PLL_SYS: u32 = 1 << 14
+const RESET_PLL_USB: u32 = 1 << 15
+const RESET_PWM: u32 = 1 << 16
 const RESET_SPI0: u32 = 1 << 18
 const RESET_SPI1: u32 = 1 << 19
 const RESET_UART0: u32 = 1 << 26
@@ -64,13 +72,17 @@ const XOSC_ENABLE: u32 = 0xFAB << 12
 const XOSC_STABLE: u32 = 1 << 31
 
 // PLL_SYS (8.6): crystal / REFDIV 1 * FBDIV = 1500 MHz VCO,
-// / POSTDIV1 5 / POSTDIV2 2 = 150 MHz.
+// / POSTDIV1 5 / POSTDIV2 2 = 150 MHz. PLL_USB: a 1200 MHz VCO,
+// / POSTDIV1 5 / POSTDIV2 5 = 48 MHz, for the ADC. Register offsets from
+// each PLL's base follow.
 const VCO_HZ: u32 = 1_500_000_000
+const USB_VCO_HZ: u32 = 1_200_000_000
 const PLL_SYS_BASE: usize = 0x4005_0000
-const PLL_CS: usize = PLL_SYS_BASE + 0x0
-const PLL_PWR: usize = PLL_SYS_BASE + 0x4
-const PLL_FBDIV_INT: usize = PLL_SYS_BASE + 0x8
-const PLL_PRIM: usize = PLL_SYS_BASE + 0xC
+const PLL_USB_BASE: usize = 0x4005_8000
+const PLL_CS: usize = 0x0
+const PLL_PWR: usize = 0x4
+const PLL_FBDIV_INT: usize = 0x8
+const PLL_PRIM: usize = 0xC
 const PLL_LOCK: u32 = 1 << 31
 const PLL_POWER_DOWN: u32 = 1 << 0
 const PLL_POSTDIV_POWER_DOWN: u32 = 1 << 3
@@ -87,6 +99,8 @@ const CLK_SYS_CTRL: usize = CLOCKS_BASE + 0x3C
 const CLK_SYS_DIV: usize = CLOCKS_BASE + 0x40
 const CLK_SYS_SELECTED: usize = CLOCKS_BASE + 0x44
 const CLK_PERI_CTRL: usize = CLOCKS_BASE + 0x48
+const CLK_ADC_CTRL: usize = CLOCKS_BASE + 0x6C
+const CLK_ADC_DIV: usize = CLOCKS_BASE + 0x70
 const CLK_SYS_RESUS_CTRL: usize = CLOCKS_BASE + 0x84
 const CLK_REF_SRC: u32 = 0b11
 const CLK_REF_SRC_XOSC: u32 = 2
@@ -202,6 +216,10 @@ const SPI0_BASE: usize = 0x4008_0000
 const SPI1_BASE: usize = 0x4008_8000
 const I2C0_BASE: usize = 0x4009_0000
 const I2C1_BASE: usize = 0x4009_8000
+
+// PWM (12.5), clocked by clk_sys, and the ADC (12.4), by clk_adc.
+const PWM_BASE: usize = 0x400A_8000
+const ADC_BASE: usize = 0x400A_0000
 
 // Single-cycle I/O (3.1). The GPIO_HI registers for pins 32 and up sit
 // between these.
@@ -332,7 +350,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     // the GPIOs' control and pad registers and the bus controllers are
     // otherwise unused.
     bank := unsafe {
-        rp_pins.Bank.new(Chip {})
+        rp_pins.Bank.new(Chip { crystal_hz: crystal })
     }
     return ok(Peripherals { pins: Pins { bank }, timer })
 }
@@ -370,6 +388,26 @@ unsafe fn start_tick(base: usize, cycles: u32) {
     }
 }
 
+// Start the PLL at `base`, held in reset by `reset`: a VCO at `vco_hz`
+// from the crystal, divided by `post1` and `post2`.
+// SAFETY: the caller owns the PLL, and nothing may use its output yet.
+unsafe fn start_pll(base: usize, reset: u32, crystal_hz: u32, vco_hz: u32, post1: u32, post2: u32) -> void!hal.Error {
+    unsafe {
+        reset_blocks(reset)?
+        cs := reg(base + PLL_CS)
+        cs.write(1)
+        feedback := reg(base + PLL_FBDIV_INT)
+        feedback.write(vco_hz / crystal_hz)
+        power_on := reg(base + PLL_PWR + CLEAR_ALIAS)
+        power_on.write(PLL_POWER_DOWN | PLL_VCO_POWER_DOWN)
+        cs.wait_set(PLL_LOCK, ATTEMPTS)?
+        prim := reg(base + PLL_PRIM)
+        prim.write(hal.encode(PLL_POSTDIV1, post1) | hal.encode(PLL_POSTDIV2, post2))
+        power_on.write(PLL_POSTDIV_POWER_DOWN)
+        return ok()
+    }
+}
+
 // SAFETY: the caller owns the clock, XOSC, PLL_SYS, and tick registers, and
 // nothing may depend on the current clock rates.
 unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
@@ -392,17 +430,7 @@ unsafe fn start_clocks(crystal_hz: u32) -> void!hal.Error {
         sys_selected := reg(CLK_SYS_SELECTED)
         sys_selected.wait_set(1, ATTEMPTS)?
 
-        reset_blocks(RESET_PLL_SYS)?
-        cs := reg(PLL_CS)
-        cs.write(1)
-        feedback := reg(PLL_FBDIV_INT)
-        feedback.write(VCO_HZ / crystal_hz)
-        power_on := reg(PLL_PWR + CLEAR_ALIAS)
-        power_on.write(PLL_POWER_DOWN | PLL_VCO_POWER_DOWN)
-        cs.wait_set(PLL_LOCK, ATTEMPTS)?
-        prim := reg(PLL_PRIM)
-        prim.write(hal.encode(PLL_POSTDIV1, 5) | hal.encode(PLL_POSTDIV2, 2))
-        power_on.write(PLL_POSTDIV_POWER_DOWN)
+        start_pll(PLL_SYS_BASE, RESET_PLL_SYS, crystal_hz, VCO_HZ, 5, 2)?
 
         // clk_ref from the crystal.
         ref_ctrl := reg(CLK_REF_CTRL)
@@ -541,6 +569,53 @@ pub struct Pins {
         return self.bank.i2c_target(sda, scl, address, ten_bit, frequency_hz)
     }
 
+    // Claim pin `pin` as a PWM output at the frequency closest to
+    // `frequency_hz`, from 9 Hz up to SYS_HZ / 2, low until a duty is set.
+    // GPIO n is output A (n even) or B (n odd) of PWM slice (n / 2) % 8:
+    // GPIO n and n + 16 carry the same output, and the two outputs of a
+    // slice share its frequency. The output implements hal.PwmOutput, with
+    // max_duty() steps up to 65535; rp_pwm documents it. InvalidInput above
+    // GPIO 29 or for a frequency out of range, Busy if the pin or its output
+    // is taken, or if the slice's other output runs at another frequency.
+    pub fn pwm(&mut self, pin: u32, frequency_hz: u32) -> rp_pwm.Pwm!hal.Error {
+        return self.bank.pwm(pin, frequency_hz)
+    }
+
+    // `pwm` with the slice's divider of clk_sys, in sixteenths from 16 (1)
+    // to 4095 (255 15/16), and its TOP, up to 65534, given instead: the
+    // output's frequency is SYS_HZ * 16 / divider / (top + 1), and its duty
+    // runs from 0 to top + 1. Errors as for `pwm`.
+    pub fn pwm_divided(&mut self, pin: u32, divider: u32, top: u32) -> rp_pwm.Pwm!hal.Error {
+        return self.bank.pwm_divided(pin, divider, top)
+    }
+
+    // Claim pin `pin`, GPIO 26 to 29 (ADC inputs 0 to 3), as an analog
+    // input, with its digital input and pulls turned off. It implements
+    // hal.AnalogInput: 12-bit polled reads, 0 to 4095 for 0 V to the ADC's
+    // reference, ADC_AVDD; rp_adc documents it. InvalidInput for another
+    // pin, Busy if the pin is taken, Timeout if the ADC does not start.
+    pub fn analog(&mut self, pin: u32) -> rp_adc.Analog!hal.Error {
+        return self.bank.analog(pin)
+    }
+
+    // Claim the on-chip temperature sensor, ADC input 4, an analog input
+    // like those of `analog`: rp_adc.millicelsius(value, 3300) converts a
+    // reading. Busy if it is claimed already.
+    pub fn temperature(&mut self) -> rp_adc.Analog!hal.Error {
+        return self.bank.temperature()
+    }
+
+    // Give back a PWM output. Its pin stops driving and is disconnected.
+    pub fn release_pwm(&mut self, output: rp_pwm.Pwm) {
+        self.bank.release_pwm(output)
+    }
+
+    // Give back an analog input or the temperature sensor; the ADC and its
+    // clock stop once no input is left.
+    pub fn release_analog(&mut self, input: rp_adc.Analog) {
+        self.bank.release_analog(input)
+    }
+
     // Give back an I2C bus. Its controller is held in reset and its pins are
     // disconnected but still pulled up, so the bus stays idle. A device that
     // holds SDA low after an interrupted transfer, which makes the bus
@@ -604,6 +679,8 @@ pub struct Pins {
 
 // What rp_pins.Bank needs from this chip. Only the Bank in Pins has one.
 struct Chip {
+    crystal_hz: u32
+
     pub fn route(&mut self, number: u32, function: u32, clear: u32, set: u32) {
         // SAFETY: the bank routes only pins it holds.
         unsafe {
@@ -638,12 +715,47 @@ struct Chip {
             return SPI1_BASE
         } else if controller == rp_pins.UART0 {
             return UART0_BASE
+        } else if controller == rp_pins.UART1 {
+            return UART1_BASE
+        } else if controller == rp_pins.PWM {
+            return PWM_BASE
         }
-        return UART1_BASE
+        return ADC_BASE
     }
 
     pub fn clock_hz(&self) -> u32 {
         return SYS_HZ
+    }
+
+    pub fn start_adc(&mut self) -> void!hal.Error {
+        // SAFETY: the bank starts the ADC only while it has no input, so
+        // nothing uses PLL_USB, clk_adc, or the ADC. The reset alias
+        // registers change only their bits.
+        unsafe {
+            start_pll(PLL_USB_BASE, RESET_PLL_USB, self.crystal_hz, USB_VCO_HZ, 5, 5)?
+            // clk_adc from PLL_USB (aux source 0), undivided.
+            control := reg(CLK_ADC_CTRL)
+            control.write(0)
+            divider := reg(CLK_ADC_DIV)
+            divider.write(DIVIDE_BY_ONE)
+            control.write(CLK_ENABLE)
+            reset_blocks(RESET_ADC)?
+            registers := hal.RegisterBlock.at(ADC_BASE)
+            return rp_adc.start(&mut registers)
+        }
+    }
+
+    pub fn stop_adc(&mut self) {
+        // SAFETY: the bank stops the ADC once its last input is given back.
+        unsafe {
+            registers := hal.RegisterBlock.at(ADC_BASE)
+            rp_adc.stop(&mut registers)
+            hold := reg(RESET + SET_ALIAS)
+            hold.write(RESET_ADC)
+            control := reg(CLK_ADC_CTRL)
+            control.write(0)
+            hold.write(RESET_PLL_USB)
+        }
     }
 
     pub fn uart_aux(&self) -> bool {
@@ -663,8 +775,10 @@ fn controller_reset(controller: u32) -> u32 {
         return RESET_SPI1
     } else if controller == rp_pins.UART0 {
         return RESET_UART0
+    } else if controller == rp_pins.UART1 {
+        return RESET_UART1
     }
-    return RESET_UART1
+    return RESET_PWM
 }
 
 // Connect GPIO `number` to peripheral `function`, and change its pad

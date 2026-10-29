@@ -377,6 +377,12 @@ fn load_internal(
         if key == root {
             program.package = module.program.package.clone();
         }
+        // Atomics change through shared references; see `Struct`.
+        if matches!(&key, ModuleId::Bundled(path) if path == "std/sync/atomic") {
+            for item in &mut module.program.structs {
+                item.interior_mutable = item.name == "Atomic";
+            }
+        }
         let mut visible_packages: BTreeMap<String, String> = module
             .import_aliases
             .iter()

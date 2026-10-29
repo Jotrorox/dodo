@@ -394,7 +394,12 @@ other comparisons are false. Dodo does not provide numeric casts to or from
 
 Package-level `static NAME: T = expression` declares immutable storage, and
 `static mut NAME: T = expression` declares mutable storage. Both initializers
-must be constant expressions. Static storage lasts for the program and is not
+must be constant expressions. A call to a constructor, a safe function whose
+body only returns a struct literal of its parameters and constants, counts as
+one when its arguments are constant: `static HITS: atomic.Atomic<u32> =
+atomic.Atomic.new(0u32)`. An immutable static that holds a `std/sync/atomic`
+atomic lives in writable memory and is changed through its methods without
+`unsafe`; a `const` cannot hold an atomic. Static storage lasts for the program and is not
 automatically destroyed at exit. A read or write of mutable static storage
 requires an explicit `unsafe` block; the programmer must prevent races and
 conflicting aliases. Prefer passing state explicitly or using

@@ -1,0 +1,74 @@
+package dimmer
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+// An LED dimmer: a potentiometer's position sets an LED's brightness. It is
+// written once against the `std/embedded/hal` analog input and PWM output
+// protocols. On a board, pass an ADC input and a PWM output, as
+// dimmer_board.dodo does; on a desktop,
+// `dodo test examples/dimmer.dodo` runs it against fakes.
+//
+// Eyes see brightness roughly as the square root of light, so the duty
+// cycle follows the square of the knob's position: half way round gives a
+// quarter of the light, which looks like half.
+
+pub struct Dimmer<A, P> {
+    knob: A
+    led: P
+
+    pub fn new(knob: A, led: P) -> Dimmer<A, P> {
+        return Dimmer<A, P> { knob, led }
+    }
+
+    // Read the knob once and set the LED to match. Returns the duty set.
+    pub fn update(&mut self) -> u16!hal.Error {
+        position := self.knob.read()? as u64
+        full := self.knob.max_value() as u64
+        steps := self.led.max_duty() as u64
+        duty := ((position * position * steps + full * full / 2) / (full * full)) as u16
+        self.led.set_duty(duty)?
+        return ok(duty)
+    }
+
+    // Give back the knob and the LED.
+    pub fn release(self) -> (A, P) {
+        let Dimmer { knob, led } = self
+        return (knob, led)
+    }
+}
+
+@test
+fn follows_the_knob() {
+    knob := fake.Analog.new(4095)
+    positions: [3]u16 = [0, 4095, 2048]
+    knob.queue(&positions)
+    dimmer := Dimmer.new(knob, fake.Pwm.new(1000))
+    assert_eq(dimmer.update()!, 0u16)
+    assert_eq(dimmer.update()!, 1000u16)
+    // Half way round: a quarter of the light.
+    assert_eq(dimmer.update()!, 250u16)
+    let (used, led) = dimmer.release()
+    assert_eq(used.reads(), 3u32)
+    assert_eq(led.duty(), 250u16)
+}
+
+@test
+fn keeps_the_led_when_the_knob_fails() {
+    knob := fake.Analog.new(4095)
+    knob.set(4095)
+    knob.fail_next(hal.Error.Timeout)
+    dimmer := Dimmer.new(knob, fake.Pwm.new(255))
+    match dimmer.update() {
+        ok(_) => {
+            assert(false)
+        }
+        err(error) => {
+            assert(error == hal.Error.Timeout)
+        }
+    }
+    // The next read works again.
+    assert_eq(dimmer.update()!, 255u16)
+    let (used, led) = dimmer.release()
+    assert(used.reads() == 1 && led.changes() == 1)
+}

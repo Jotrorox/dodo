@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- `std/sync/atomic` works on Arm Cortex-M. On cores with exclusive loads and
+  stores (ARMv7-M, ARMv7E-M, and ARMv8-M, such as the RP2350's Cortex-M33)
+  every operation lowers to native instructions for 8-, 16-, and 32-bit
+  integers. ARMv6-M (Cortex-M0 and M0+, as in the RP2040) has atomic loads and
+  stores only; `exchange`, `fetch_add`, and `compare_exchange` there are a
+  build error naming the reason. An operation a target cannot perform is now
+  diagnosed only where the program can reach it, so packages that merely
+  contain one build for every target.
+- Atomics in statics are shared without `unsafe`:
+  `static TICKS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)` is placed in
+  writable memory, and interrupt handlers, threads, and the main program call
+  its methods directly, without a critical section. A static initializer may
+  call a constructor, a safe function whose body only returns a struct
+  literal of its parameters and constants, with constant arguments. A
+  `const` cannot hold an atomic, since each use of a constant is a copy.
+- Add PWM and ADC protocols to `std/embedded/hal`: `PwmOutput` (`max_duty`,
+  `set_duty`) with `set_duty_percent`, `set_duty_fraction`, and
+  `set_pulse_us` helpers, and `AnalogInput` (`max_value`, `read`) with
+  `read_millivolts`. `std/embedded/hal/fake` gains `Pwm` and `Analog`, so
+  drivers for LEDs, motors, servos, and analog sensors are tested on a
+  desktop. `examples/dimmer.dodo` is a potentiometer-controlled LED dimmer,
+  tested with fakes, and `examples/dimmer_board.dodo` runs it on a board.
+- The RP2040 and RP2350 chip packages drive PWM and the ADC.
+  `pins.pwm(pin, hz)` claims any GPIO as a PWM output at the frequency
+  closest to `hz`, with as many duty steps as it allows (up to 65535), and
+  `pins.pwm_divided(pin, divider, top)` takes the slice's divider and TOP
+  instead. The two outputs of a slice share its frequency and write only their
+  own bits of its registers. `pins.analog(pin)` claims GPIO 26 to 29 as 12-bit
+  ADC inputs with polled reads, and `pins.temperature()` the on-chip
+  temperature sensor, read with `rp_adc.millicelsius`. The ADC's 48 MHz clock
+  runs from PLL_USB while an input is claimed. Both drivers,
+  `std/embedded/chip/rp_pwm` and `rp_adc`, run against simulated blocks in the
+  desktop tests, and the board self-tests check them with nothing connected.
 - Add `std/embedded/executor`, a cooperative task executor for firmware.
   A task is any value with `poll(&mut self, cx: &mut executor.Context) ->
   executor.Poll`; the executor polls each task only when a time it asked for

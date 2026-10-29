@@ -132,6 +132,18 @@ fn sensor_example_tests_pass_against_fakes() {
 }
 
 #[test]
+fn dimmer_example_tests_pass_against_fakes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = dodo(&["test"], &root.join("examples/dimmer.dodo"));
+    success(&output, "test examples/dimmer.dodo");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("2 passed"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn sensor_log_example_propagates_bus_and_stream_errors() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = dodo(&["test"], &root.join("examples/sensor_log.dodo"));
