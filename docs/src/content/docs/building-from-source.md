@@ -310,9 +310,10 @@ result with its license notices, as CI does.
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`. Before building, it
 runs `python3 scripts/check_release.py <tag>`, which requires the tag to match
-the versions in `Cargo.toml` and `editor-support/dodo-vscode/package.json` and
-`CHANGELOG.md` to contain a dated `## <version> — YYYY-MM-DD` entry. Run it
-locally before tagging:
+the versions in `Cargo.toml`, `editor-support/dodo-vscode/package.json`, and
+`editor-support/dodo-jetbrains/gradle.properties`, and requires `CHANGELOG.md`
+to contain a dated `## <version> — YYYY-MM-DD` entry. Run it locally before
+tagging:
 
 ```sh
 python3 scripts/check_release.py v0.1.5
@@ -320,8 +321,8 @@ python3 scripts/check_release.py v0.1.5
 
 The workflow then runs the same build, test, and packaging jobs as CI and
 creates a GitHub Release from the changelog entry. It attaches the Linux, macOS,
-and Windows archives, the `.vsix`, and a `SHA256SUMS` file, and records build
-provenance attestations for each asset. Tags with a pre-release suffix, such as
+and Windows archives, the `.vsix`, the JetBrains plugin `.zip`, and a
+`SHA256SUMS` file, and records build provenance attestations for each asset. Tags with a pre-release suffix, such as
 `v0.2.0-rc.1`, are published as pre-releases.
 
 ## Development

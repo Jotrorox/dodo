@@ -19,6 +19,11 @@
 - RP2040 and RP2350 pins raise `IO_IRQ_BANK0` on edges and levels:
   `pin.listen(chip.RISING_EDGE | chip.FALLING_EDGE)`, `events()`,
   `clear_events(edges)`, `ignore(events)`, and `irq()`.
+- Add a [JetBrains plugin](editor-support/dodo-jetbrains) for RustRover, CLion,
+  and other JetBrains IDEs from 2026.2. It connects to `dodo lsp` like the VS
+  Code extension and offers the same editing features, with live templates
+  generated from the extension's snippets. Releases include
+  `dodo-jetbrains-<version>.zip`.
 - Add `@interrupt(VECTOR)` handlers. `@interrupt(UART0_IRQ) fn received()`
   is exported under the vector's name with the target's interrupt-entry
   convention (the C ABI on Cortex-M, `mret` on bare-metal RISC-V), so it
