@@ -18,6 +18,8 @@
   when no bootloader drive is mounted, it finds the board's port on Linux
   and macOS, sets it to 1200 baud, which restarts the board into its
   bootloader, waits for the drive, and flashes.
+- Fix `dodo fmt` dropping the space after a compound assignment before a
+  parenthesis or bracket, which turned `x |= (y)` into `x |=(y)`.
 - Fix `set_break(false)` on PL011 serial ports, which waited for the
   transmitter to go idle while the break itself kept it busy, and so never
   returned.
