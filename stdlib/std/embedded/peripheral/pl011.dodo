@@ -348,13 +348,15 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
     // stays low for longer than a frame, so keep it on for at least two
     // frame times (174 us at 115200 baud, 8N1); LIN and DMX, for example,
     // start their frames with breaks. Timeout if what was written does not
-    // get out.
+    // get out before a break starts.
     pub fn set_break(&mut self, on: bool) -> void!hal.Error {
-        self.settle()?
         line := self.format | FIFO_ENABLE
         if on {
             line |= SEND_BREAK
+            self.settle()?
         }
+        // The controller reports BUSY for as long as a break lasts, so
+        // ending one must not wait for idle.
         // Rewriting LCR_H latches the same divisor again, so a break may
         // start and end while the controller runs.
         self.registers.write(LCR_H, line)
