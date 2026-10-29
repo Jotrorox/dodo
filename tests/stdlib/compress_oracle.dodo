@@ -1,0 +1,29 @@
+package compress_oracle
+
+import "std/compress/deflate"
+import "std/console"
+import "std/io"
+
+// Decode a single raw stream from stdin for independent differential tests.
+fn main() -> i32 {
+    input := [0u8; 131072]
+    output := [0u8; 262144]
+    source := console.stdin()
+    sink := console.stdout()
+    used := 0usize
+    for used < input.len {
+        n := match source.read(&mut input[used..]) {
+            ok(n) => { n }, err(_) => { return 1 }
+        }
+        if n == 0 { break }
+        used += n
+    }
+    report := match deflate.decode(&input[..used], &mut output) {
+        ok(result) => { result }, err(_) => { return 2 }
+    }
+    if report.input_consumed != used { return 3 }
+    match io.write_all(&mut sink, &output[..report.output_written]) {
+        ok(_) => {}, err(_) => { return 4 }
+    }
+    return 0
+}

@@ -1,0 +1,42 @@
+package deflate_store_checks
+import "std/compress/deflate_store"
+import "std/console"
+import "std/io"
+
+fn check_empty() -> bool {
+    encoder := deflate_store.Encoder.new()
+    result := [0u8; 5]
+    empty := [0u8; 0]
+    blocked := encoder.process(&empty, &mut result[..0], false)
+    if blocked.status != deflate_store.Status.NeedInput { return false }
+    blocked = encoder.process(&empty, &mut result[..0], true)
+    if blocked.status != deflate_store.Status.NeedOutput { return false }
+    for i in 0usize..5 {
+        p := encoder.process(&empty, &mut result[i..i + 1], true)
+        if p.output_written != 1 || p.input_consumed != 0 { return false }
+        if i != 4 && p.status != deflate_store.Status.NeedOutput { return false }
+        if i == 4 && p.status != deflate_store.Status.Done { return false }
+    }
+    return result[0] == 1 && result[1] == 0 && result[2] == 0 && result[3] == 255 && result[4] == 255
+}
+fn main() -> i32 {
+    if !check_empty() { return 4 }
+    data := [0u8; 70000]
+    for i in 0usize..data.len { data[i] = (i & 255) as u8 }
+    encoder := deflate_store.Encoder.new()
+    output := [0u8; 7]
+    sink := console.stdout()
+    pos := 0usize
+    for {
+        end := pos + 97
+        if end > data.len { end = data.len }
+        progress := encoder.process(&data[pos..end], &mut output, end == data.len)
+        pos += progress.input_consumed
+        match io.write_all(&mut sink, &output[..progress.output_written]) { ok(_) => {}, err(_) => { return 1 } }
+        if progress.status == deflate_store.Status.Done {
+            if pos != data.len { return 2 }
+            return 0
+        }
+        if progress.input_consumed == 0 && progress.output_written == 0 { return 3 }
+    }
+}

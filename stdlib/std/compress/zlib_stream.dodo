@@ -1,0 +1,139 @@
+package zlib_stream
+
+import "std/checksum"
+import "std/compress/inflate"
+
+pub enum Error {
+    InvalidData, UnsupportedDictionary, ChecksumMismatch
+}
+pub enum Status {
+    NeedInput, NeedOutput, Done
+}
+pub struct Progress {
+    pub input_consumed: usize
+    pub output_written: usize
+    pub status: Status
+}
+
+// Incremental zlib decoder. A decoder processes one stream; reset by creating
+// a new instance. Errors terminate the stream and the current call's progress
+// is unspecified. Preset dictionaries are not supported.
+pub struct Decoder {
+    last_input: usize
+    last_output: usize
+    raw: inflate.Decoder
+    adler: checksum.Adler32
+    phase: usize
+    header: u32
+    trailer: u32
+    count: usize
+    pub fn new() -> Decoder {
+        return Decoder { last_input: 0, last_output: 0, raw: inflate.Decoder.new(), adler: checksum.Adler32.new(), phase: 0, header: 0, trailer: 0, count: 0 }
+    }
+    pub fn last_input_consumed(&self) -> usize {
+        return self.last_input
+    }
+    pub fn last_output_written(&self) -> usize {
+        return self.last_output
+    }
+    pub fn process(&mut self, input: &[u8], output: &mut[u8]) -> Progress!Error {
+        self.last_input = 0
+        self.last_output = 0
+        used := 0usize
+        written := 0usize
+        for true {
+            if self.phase == 0 {
+                for self.count < 2 {
+                    if used == input.len {
+                        self.last_input = used;
+                        self.last_output = written;
+                        return ok(Progress { input_consumed: used, output_written: written, status: Status.NeedInput })
+                    }
+                    self.header = (self.header << 8) | (input[used] as u32)
+                    used += 1
+                    self.count += 1
+                }
+                cmf := self.header >> 8
+                flg := self.header & 255
+                if (cmf & 15) != 8 || (cmf >> 4) > 7 || self.header % 31 != 0 {
+                    self.last_input = used;
+                    self.last_output = written;
+                    return err(Error.InvalidData)
+                }
+                if (flg & 32) != 0 {
+                    self.last_input = used;
+                    self.last_output = written;
+                    return err(Error.UnsupportedDictionary)
+                }
+                match inflate.Decoder.new_with_window(1usize << (8 + (cmf >> 4) as usize)) {
+                    ok(raw) => {
+                        self.raw = raw
+                    },
+                    err(_) => {
+                        self.last_input = used + self.raw.last_input_consumed();
+                        self.last_output = written + self.raw.last_output_written();
+                        return err(Error.InvalidData)
+                    },
+                }
+                self.count = 0
+                self.phase = 1
+            }
+            if self.phase == 1 {
+                progress := match self.raw.process(&input[used..], &mut output[written..]) {
+                    ok(value) => {
+                        value
+                    },
+                    err(_) => {
+                        self.last_input = used + self.raw.last_input_consumed();
+                        self.last_output = written + self.raw.last_output_written();
+                        return err(Error.InvalidData)
+                    },
+                }
+                self.adler.update(&output[written..written + progress.output_written])
+                used += progress.input_consumed
+                written += progress.output_written
+                match &progress.status {
+                    inflate.Status.NeedInput => {
+                        self.last_input = used;
+                        self.last_output = written;
+                        return ok(Progress { input_consumed: used, output_written: written, status: Status.NeedInput })
+                    },
+                    inflate.Status.NeedOutput => {
+                        self.last_input = used;
+                        self.last_output = written;
+                        return ok(Progress { input_consumed: used, output_written: written, status: Status.NeedOutput })
+                    },
+                    inflate.Status.Done => {
+                        self.phase = 2
+                    },
+                }
+            }
+            if self.phase == 2 {
+                for self.count < 4 {
+                    if used == input.len {
+                        self.last_input = used;
+                        self.last_output = written;
+                        return ok(Progress { input_consumed: used, output_written: written, status: Status.NeedInput })
+                    }
+                    self.trailer = (self.trailer << 8) | (input[used] as u32)
+                    self.count += 1
+                    used += 1
+                }
+                if self.trailer != self.adler.finish() {
+                    self.last_input = used;
+                    self.last_output = written;
+                    return err(Error.ChecksumMismatch)
+                }
+                self.phase = 3
+            }
+            if self.phase == 3 {
+                self.last_input = used;
+                self.last_output = written;
+                return ok(Progress { input_consumed: used, output_written: written, status: Status.Done })
+            }
+        }
+        self.last_input = used;
+        self.last_output = written;
+        return err(Error.InvalidData)
+    }
+}

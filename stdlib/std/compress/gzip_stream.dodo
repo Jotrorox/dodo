@@ -1,0 +1,199 @@
+package gzip_stream
+
+import "std/checksum"
+import "std/compress/inflate"
+
+pub enum Error {
+    InvalidData, ChecksumMismatch
+}
+pub enum Status {
+    NeedInput, NeedOutput, Done
+}
+pub struct Progress {
+    pub input_consumed: usize
+    pub output_written: usize
+    pub status: Status
+}
+
+// Processes one gzip member. Create another decoder for the next member.
+// Optional fields are consumed incrementally without buffering their contents.
+// Errors terminate the member; progress in the failing call is unspecified.
+pub struct Decoder {
+    last_input: usize
+    last_output: usize
+    raw: inflate.Decoder
+    header_crc: checksum.Crc32
+    data_crc: checksum.Crc32
+    phase: usize
+    count: usize
+    flags: u8
+    extra: usize
+    header_check: u32
+    trailer_crc: u32
+    trailer_size: u32
+    size: u32
+    pub fn new() -> Decoder {
+        return Decoder { last_input: 0, last_output: 0, raw: inflate.Decoder.new(), header_crc: checksum.Crc32.new(), data_crc: checksum.Crc32.new(), phase: 0, count: 0, flags: 0, extra: 0, header_check: 0, trailer_crc: 0, trailer_size: 0, size: 0 }
+    }
+    pub fn last_input_consumed(&self) -> usize {
+        return self.last_input
+    }
+    pub fn last_output_written(&self) -> usize {
+        return self.last_output
+    }
+    pub fn process(&mut self, input: &[u8], output: &mut[u8]) -> Progress!Error {
+        self.last_input = 0
+        self.last_output = 0
+        used := 0usize
+        written := 0usize
+        for true {
+            // Skip optional fields that are absent. Field bodies and their
+            // terminating bytes participate in the header checksum.
+            if self.phase == 1 && (self.flags & 4) == 0 {
+                self.phase = 4
+            }
+            if self.phase == 4 && (self.flags & 8) == 0 {
+                self.phase = 5
+            }
+            if self.phase == 5 && (self.flags & 16) == 0 {
+                self.phase = 6
+            }
+            if self.phase == 6 && (self.flags & 2) == 0 {
+                self.phase = 7;
+                self.count = 0
+            }
+            if self.phase <= 6 {
+                if used == input.len {
+                    self.last_input = used;
+                    self.last_output = written;
+                    return ok(Progress { input_consumed: used, output_written: written, status: Status.NeedInput })
+                }
+                byte := input[used]
+                if self.phase != 6 {
+                    self.header_crc.update(&input[used..used + 1])
+                }
+                used += 1
+                if self.phase == 0 {
+                    if (self.count == 0 && byte != 31) || (self.count == 1 && byte != 139) || (self.count == 2 && byte != 8) {
+                        self.last_input = used;
+                        self.last_output = written;
+                        return err(Error.InvalidData)
+                    }
+                    if self.count == 3 {
+                        if (byte & 0xe0) != 0 {
+                            self.last_input = used;
+                            self.last_output = written;
+                            return err(Error.InvalidData)
+                        }
+                        self.flags = byte
+                    }
+                    self.count += 1
+                    if self.count == 10 {
+                        self.phase = 1;
+                        self.count = 0
+                    }
+                } else if self.phase == 1 {
+                    self.extra = byte as usize
+                    self.phase = 2
+                } else if self.phase == 2 {
+                    self.extra = self.extra | ((byte as usize) << 8)
+                    if self.extra == 0 {
+                        self.phase = 4
+                    } else {
+                        self.phase = 3
+                    }
+                } else if self.phase == 3 {
+                    self.extra -= 1
+                    if self.extra == 0 {
+                        self.phase = 4
+                    }
+                } else if self.phase == 4 {
+                    if byte == 0 {
+                        self.phase = 5
+                    }
+                } else if self.phase == 5 {
+                    if byte == 0 {
+                        self.phase = 6
+                    }
+                } else {
+                    self.header_check = self.header_check | ((byte as u32) << ((self.count * 8) as u32))
+                    self.count += 1
+                    if self.count == 2 {
+                        if self.header_check != (self.header_crc.finish() & 0xffff) {
+                            self.last_input = used;
+                            self.last_output = written;
+                            return err(Error.ChecksumMismatch)
+                        }
+                        self.count = 0
+                        self.phase = 7
+                    }
+                }
+            } else if self.phase == 7 {
+                progress := match self.raw.process(&input[used..], &mut output[written..]) {
+                    ok(value) => {
+                        value
+                    },
+                    err(_) => {
+                        self.last_input = used + self.raw.last_input_consumed();
+                        self.last_output = written + self.raw.last_output_written();
+                        return err(Error.InvalidData)
+                    },
+                }
+                self.data_crc.update(&output[written..written + progress.output_written])
+                // Increment modulo 2^32 without overflowing checked arithmetic.
+                for i in 0usize..progress.output_written {
+                    if self.size == 0xffffffffu32 {
+                        self.size = 0
+                    } else {
+                        self.size += 1
+                    }
+                }
+                used += progress.input_consumed
+                written += progress.output_written
+                match &progress.status {
+                    inflate.Status.NeedInput => {
+                        self.last_input = used;
+                        self.last_output = written;
+                        return ok(Progress { input_consumed: used, output_written: written, status: Status.NeedInput })
+                    },
+                    inflate.Status.NeedOutput => {
+                        self.last_input = used;
+                        self.last_output = written;
+                        return ok(Progress { input_consumed: used, output_written: written, status: Status.NeedOutput })
+                    },
+                    inflate.Status.Done => {
+                        self.phase = 8
+                    },
+                }
+            } else if self.phase == 8 {
+                for self.count < 8 {
+                    if used == input.len {
+                        self.last_input = used;
+                        self.last_output = written;
+                        return ok(Progress { input_consumed: used, output_written: written, status: Status.NeedInput })
+                    }
+                    if self.count < 4 {
+                        self.trailer_crc = self.trailer_crc | ((input[used] as u32) << ((self.count * 8) as u32))
+                    } else {
+                        self.trailer_size = self.trailer_size | ((input[used] as u32) << (((self.count - 4) * 8) as u32))
+                    }
+                    self.count += 1
+                    used += 1
+                }
+                if self.trailer_crc != self.data_crc.finish() || self.trailer_size != self.size {
+                    self.last_input = used;
+                    self.last_output = written;
+                    return err(Error.ChecksumMismatch)
+                }
+                self.phase = 9
+            } else {
+                self.last_input = used;
+                self.last_output = written;
+                return ok(Progress { input_consumed: used, output_written: written, status: Status.Done })
+            }
+        }
+        self.last_input = used;
+        self.last_output = written;
+        return err(Error.InvalidData)
+    }
+}

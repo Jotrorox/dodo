@@ -1,0 +1,145 @@
+package compress_stream_checks
+import "std/compress/io" as cio
+import "std/io"
+import "std/compress/deflate"
+import "std/compress/zlib"
+import "std/compress/gzip"
+
+fn exercise<C: cio.Codec>(decoder: &mut C, data: &[u8], end: usize, split: usize) {
+    output := [0u8; 17000]
+    used := 0usize
+    written := 0usize
+    available := split
+    for true {
+        count := 17usize
+        if output.len - written < count { count = output.len - written }
+        p := decoder.process(&data[used..available], &mut output[written..written + count])!
+        used += p.input_consumed
+        written += p.output_written
+        match &p.status {
+            cio.Status.Done => { break },
+            cio.Status.NeedInput => { available = data.len },
+            cio.Status.NeedOutput => {},
+        }
+    }
+    assert(used == end && written == 17000)
+    expected := b"hello streaming! "
+    for i in 0usize..written { assert(output[i] == expected[i % expected.len]) }
+}
+pub struct BrokenReader {
+    data: &[u8]
+    position: usize
+    pub fn read(&mut self, out: &mut[u8]) -> usize!io.Error {
+        if self.position == self.data.len { return ok(0) }
+        out[0] = self.data[self.position]
+        self.position += 1
+        if self.position == 8 { return err(io.failure(io.ErrorKind.Interrupted, 1)) }
+        if self.position == 10 { return err(io.Error { kind: io.ErrorKind.Other, transferred: 1, code: 77 }) }
+        return ok(1)
+    }
+}
+pub struct BrokenWriter {
+    data: [6000]u8
+    used: usize
+    calls: usize
+    pub fn write(&mut self, input: &[u8]) -> usize!io.Error {
+        self.calls += 1
+        count := input.len
+        if self.calls == 1 && count > 2 { count = 2 }
+        if self.calls == 2 && count > 1 { count = 1 }
+        for i in 0usize..count { self.data[self.used + i] = input[i] }
+        self.used += count
+        if self.calls == 1 { return err(io.Error { kind: io.ErrorKind.Other, transferred: count, code: 42 }) }
+        if self.calls == 2 { return err(io.failure(io.ErrorKind.Interrupted, count)) }
+        return ok(count)
+    }
+}
+fn writer_test<C: cio.EncoderCodec>(codec: C, kind: usize) {
+    sink := BrokenWriter { data: [0u8; 6000], used: 0, calls: 0 }
+    writer := cio.Writer.new(&mut sink, codec)
+    match writer.write(b"abc") {
+        ok(_) => { assert(false) },
+        err(e) => { assert(e.kind == io.ErrorKind.Other && e.code == 42 && e.transferred == 3) },
+    }
+    writer.finish()!
+    assert(writer.finish()! == 0)
+    match writer.write(b"x") { ok(_) => { assert(false) }, err(e) => { assert(e.kind == io.ErrorKind.Closed && e.transferred == 0) } }
+    out := [0u8; 4]
+    if kind == 0 { p := deflate.decode(&sink.data[..sink.used], &mut out)!; assert(p.output_written == 3) }
+    if kind == 1 { p := zlib.decode(&sink.data[..sink.used], &mut out)!; assert(p.output_written == 3) }
+    if kind == 2 { p := gzip.decode(&sink.data[..sink.used], &mut out)!; assert(p.output_written == 3) }
+    assert(out[0] == 97 && out[1] == 98 && out[2] == 99)
+}
+fn partial_writer_test<C: cio.EncoderCodec>(codec: C, kind: usize, fail: bool) {
+    calls := 3usize
+    if fail { calls = 0 }
+    sink := BrokenWriter { data: [0u8; 6000], used: 0, calls: calls }
+    writer := cio.Writer.new(&mut sink, codec)
+    input := [7u8; 5000]
+    match writer.write(&input) {
+        ok(count) => { assert(!fail && count == 4080) },
+        err(e) => { assert(fail && e.transferred == 4080) },
+    }
+    writer.finish()!
+    output := [0u8; 4080]
+    if kind == 0 { p := deflate.decode(&sink.data[..sink.used], &mut output)!; assert(p.output_written == 4080) }
+    if kind == 1 { p := zlib.decode(&sink.data[..sink.used], &mut output)!; assert(p.output_written == 4080) }
+    if kind == 2 { p := gzip.decode(&sink.data[..sink.used], &mut output)!; assert(p.output_written == 4080) }
+    for &value in &output { assert(value == 7) }
+}
+fn optional_header_test() {
+    input := [31u8,139,8,30,0,0,0,0,0,255,3,0,1,2,3,110,97,109,101,0,99,111,109,109,101,110,116,0,53,95,203,72,205,201,201,7,0,134,166,16,54,5,0,0,0]
+    decoder := cio.Gzip.new()
+    output := [0u8; 5]
+    used := 0usize
+    written := 0usize
+    for true {
+        limit := used + 1
+        if limit > input.len { limit = input.len }
+        space := written + 1
+        if space > output.len { space = output.len }
+        p := decoder.process(&input[used..limit], &mut output[written..space])!
+        used += p.input_consumed
+        written += p.output_written
+        if p.status == cio.Status.Done { break }
+    }
+    assert(used == input.len && written == 5)
+    assert(output[0] == 104 && output[1] == 101 && output[2] == 108 && output[3] == 108 && output[4] == 111)
+    input[28] = 0
+    bad := cio.Gzip.new()
+    match bad.process(&input, &mut output) { ok(_) => { assert(false) }, err(e) => { assert(e.kind == cio.ErrorKind.ChecksumMismatch) } }
+}
+fn main() {
+    optional_header_test()
+    partial_writer_test(cio.RawEncoder.new(), 0, false)
+    partial_writer_test(cio.ZlibEncoder.new(), 1, false)
+    partial_writer_test(cio.GzipEncoder.new(), 2, false)
+    partial_writer_test(cio.RawEncoder.new(), 0, true)
+    partial_writer_test(cio.ZlibEncoder.new(), 1, true)
+    partial_writer_test(cio.GzipEncoder.new(), 2, true)
+    writer_test(cio.RawEncoder.new(), 0)
+    writer_test(cio.ZlibEncoder.new(), 1)
+    writer_test(cio.GzipEncoder.new(), 2)
+    z := [120u8,156u8,237u8,200u8,219u8,9u8,0u8,16u8,0u8,0u8,192u8,85u8,24u8,205u8,135u8,80u8,30u8,133u8,253u8,179u8,135u8,238u8,62u8,175u8,230u8,222u8,87u8,56u8,119u8,231u8,52u8,218u8,44u8,49u8,84u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,241u8,99u8,60u8,192u8,125u8,103u8,129u8]
+    g := [31u8,139u8,8u8,0u8,0u8,0u8,0u8,0u8,2u8,255u8,237u8,200u8,219u8,9u8,0u8,16u8,0u8,0u8,192u8,85u8,24u8,205u8,135u8,80u8,30u8,133u8,253u8,179u8,135u8,238u8,62u8,175u8,230u8,222u8,87u8,56u8,119u8,231u8,52u8,218u8,44u8,49u8,84u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,33u8,132u8,16u8,66u8,8u8,241u8,99u8,60u8,73u8,104u8,187u8,150u8,104u8,66u8,0u8,0u8,88u8]
+    for split in 0usize..z.len + 1 { decoder := cio.Zlib.new(); exercise(&mut decoder, &z, z.len, split) }
+    for split in 0usize..g.len + 1 { decoder := cio.Gzip.new(); exercise(&mut decoder, &g, g.len - 1, split) }
+    stored := [120u8,1,1,3,0,252,255,97,98,99,2,77,1,39,88]
+    source := BrokenReader { data: &stored, position: 0 }
+    reader := cio.Reader.new(&mut source, cio.Zlib.new())
+    out := [0u8; 16]
+    match reader.read_checked(&mut out) {
+        ok(_) => { assert(false) },
+        err(error) => { assert(error.kind == cio.ErrorKind.Io && error.transferred == 3 && error.cause.transferred == 1 && error.cause.code == 77) },
+    }
+    assert(out[0] == 97 && out[1] == 98 && out[2] == 99)
+    assert(reader.read_checked(&mut out)! == 0)
+    assert(source.position == stored.len - 1)
+    bad := [120u8,1,1,3,0,252,255,97,98,99,2,77,1,38]
+    mem := io.MemoryReader.new(&bad)
+    reader2 := cio.Reader.new(&mut mem, cio.Zlib.new())
+    match reader2.read_checked(&mut out) {
+        ok(_) => { assert(false) },
+        err(error) => { assert(error.kind == cio.ErrorKind.ChecksumMismatch && error.transferred == 3) },
+    }
+}

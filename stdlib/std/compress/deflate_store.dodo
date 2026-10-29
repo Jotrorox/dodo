@@ -1,0 +1,80 @@
+package deflate_store
+
+// Incremental stored-block RFC 1951 encoder. `finish` declares that the
+// supplied input is the final suffix; keep it true until Done, resubmitting
+// any unconsumed input. Output and input counts refer to the current call.
+pub enum Status {
+    NeedInput, NeedOutput, Done
+}
+pub struct Progress {
+    pub input_consumed: usize
+    pub output_written: usize
+    pub status: Status
+}
+pub struct Encoder {
+    mode: usize
+    header: [5]u8
+    header_pos: usize
+    remaining: usize
+    final_block: bool
+    pub fn new() -> Encoder {
+        return Encoder { mode: 0, header: [0u8; 5], header_pos: 0, remaining: 0, final_block: false }
+    }
+    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> Progress {
+        ip := 0usize
+        op := 0usize
+        for {
+            if self.mode == 2 {
+                return Progress { input_consumed: ip, output_written: op, status: Status.Done }
+            }
+            if self.mode == 0 {
+                if ip == input.len && !finish {
+                    return Progress { input_consumed: ip, output_written: op, status: Status.NeedInput }
+                }
+                count := input.len - ip
+                if count > 65535 {
+                    count = 65535
+                }
+                self.final_block = finish && count == input.len - ip
+                len := count as u16
+                inverse := len ^ 0xffffu16
+                self.header[0] = 0
+                if self.final_block {
+                    self.header[0] = 1
+                }
+                self.header[1] = (len & 255) as u8
+                self.header[2] = (len >> 8) as u8
+                self.header[3] = (inverse & 255) as u8
+                self.header[4] = (inverse >> 8) as u8
+                self.header_pos = 0
+                self.remaining = count
+                self.mode = 1
+            }
+            for self.header_pos < 5 {
+                if op == output.len {
+                    return Progress { input_consumed: ip, output_written: op, status: Status.NeedOutput }
+                }
+                output[op] = self.header[self.header_pos]
+                op += 1
+                self.header_pos += 1
+            }
+            for self.remaining > 0 {
+                if op == output.len {
+                    return Progress { input_consumed: ip, output_written: op, status: Status.NeedOutput }
+                }
+                if ip == input.len {
+                    return Progress { input_consumed: ip, output_written: op, status: Status.NeedInput }
+                }
+                output[op] = input[ip]
+                ip += 1
+                op += 1
+                self.remaining -= 1
+            }
+            if self.final_block {
+                self.mode = 2
+            } else {
+                self.mode = 0
+            }
+        }
+    }
+}

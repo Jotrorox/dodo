@@ -1,0 +1,46 @@
+package compress_fuzz
+
+import "std/compress/deflate"
+
+// A deterministic, bounded malformed-input campaign. Inputs include mutations of
+// valid stored, fixed, and dynamic streams as well as arbitrary bytes. Neither
+// input nor output can exceed 256 bytes, so expansion is strictly bounded.
+fn next(state: &mut u32) -> u32 {
+    *state = *state ^ ((*state & 0x7ffffu32) << 13)
+    *state = *state ^ (*state >> 17)
+    *state = *state ^ ((*state & 0x7ffffffu32) << 5)
+    return *state
+}
+fn main() -> i32 {
+    state := 0x76a59327u32
+    input := [0u8; 256]
+    output := [0u8; 256]
+    fixed := [203u8, 72u8, 205u8, 201u8, 201u8, 87u8, 40u8, 207u8, 47u8, 202u8, 73u8, 81u8, 200u8, 24u8, 101u8, 15u8, 59u8, 54u8, 0u8]
+    dynamic := [21u8, 140u8, 1u8, 14u8, 192u8, 64u8, 8u8, 194u8, 166u8, 8u8, 253u8, 255u8, 143u8, 199u8, 197u8, 68u8, 129u8, 84u8, 96u8, 150u8, 228u8, 18u8, 175u8, 47u8, 96u8, 107u8, 62u8, 223u8, 61u8, 241u8, 221u8, 154u8, 8u8, 210u8, 57u8, 216u8, 82u8, 54u8, 126u8, 186u8, 55u8, 214u8, 101u8, 81u8, 109u8, 243u8, 150u8, 168u8, 217u8, 20u8, 85u8, 38u8, 18u8, 125u8, 238u8, 118u8, 126u8]
+    stored := [1u8, 3, 0, 252, 255, 65, 66, 67]
+    for iteration in 0usize..20000 {
+        length := (next(&mut state) as usize) % 257
+        for i in 0usize..length { input[i] = (next(&mut state) & 255) as u8 }
+        if iteration % 4 != 0 {
+            seed := &fixed[..]
+            if iteration % 4 == 2 { seed = &dynamic[..] }
+            if iteration % 4 == 3 { seed = &stored[..] }
+            length = seed.len
+            for i in 0usize..length { input[i] = seed[i] }
+            changes := (next(&mut state) as usize) % 5
+            for i in 0usize..changes {
+                index := (next(&mut state) as usize) % length
+                input[index] = input[index] ^ ((next(&mut state) & 255) as u8)
+            }
+            if iteration % 7 == 0 { length = (next(&mut state) as usize) % (length + 1) }
+        }
+        limit := (next(&mut state) as usize) % 257
+        match deflate.decode(&input[..length], &mut output[..limit]) {
+            ok(report) => {
+                if report.input_consumed > length || report.output_written > limit { return 1 }
+            }
+            err(_) => {}
+        }
+    }
+    return 0
+}

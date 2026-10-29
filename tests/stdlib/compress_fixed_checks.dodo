@@ -1,0 +1,94 @@
+package compress_fixed_checks
+import "std/compress/deflate_fixed"
+import "std/compress/deflate"
+import "std/compress/deflate_workspace"
+import "std/compress/zlib"
+import "std/compress/gzip"
+import "std/console"
+import "std/io"
+fn emit(input: &[u8], encoded: &mut[u8], decoded: &mut[u8]) -> i32 {
+    n := match deflate_fixed.encode(input, encoded) { ok(n) => { n }, err(_) => { return 1 } }
+    report := match deflate.decode(&encoded[..n], decoded) { ok(r) => { r }, err(_) => { return 2 } }
+    if report.output_written != input.len || report.input_consumed != n { return 3 }
+    for i in 0usize..input.len { if decoded[i] != input[i] { return 4 } }
+    stream := console.stdout()
+    prefix := [(n & 255) as u8, ((n >> 8) & 255) as u8, ((n >> 16) & 255) as u8, ((n >> 24) & 255) as u8]
+    match io.write_all(&mut stream, &prefix) { ok(_) => {}, err(_) => { return 5 } }
+    match io.write_all(&mut stream, &encoded[..n]) { ok(_) => {}, err(_) => { return 6 } }
+    return 0
+}
+fn main() -> i32 {
+    input := [0u8; 70000]
+    output := [0u8; 100000]
+    decoded := [0u8; 70000]
+    if emit(&input[..0], &mut output, &mut decoded) != 0 { return 10 }
+    for i in 0usize..input.len { input[i] = (i % 5 + 97) as u8 }
+    if emit(&input, &mut output, &mut decoded) != 0 { return 11 }
+    for i in 0usize..input.len { input[i] = ((i * 73 + (i / 251) * 13) & 255) as u8 }
+    if emit(&input, &mut output, &mut decoded) != 0 { return 12 }
+    for kind in 0usize..2 {
+        n := 0usize
+        if kind == 0 {
+            match zlib.encode_fixed(&input, &mut output) { ok(size) => { n = size }, err(_) => { return 14 } }
+        } else {
+            match gzip.encode_fixed(&input, &mut output) { ok(size) => { n = size }, err(_) => { return 15 } }
+        }
+        stream := console.stdout()
+        prefix := [(n & 255) as u8, ((n >> 8) & 255) as u8, ((n >> 16) & 255) as u8, ((n >> 24) & 255) as u8]
+        match io.write_all(&mut stream, &prefix) { ok(_) => {}, err(_) => { return 16 } }
+        match io.write_all(&mut stream, &output[..n]) { ok(_) => {}, err(_) => { return 17 } }
+    }
+    state := 0x76543210u32
+    for i in 0usize..1024 {
+        state = state ^ ((state & 0x7ffffu32) << 13)
+        state = state ^ (state >> 17)
+        state = state ^ ((state & 0x7ffffffu32) << 5)
+        input[i] = (state & 255) as u8
+    }
+    for level in 0usize..10 {
+        for kind in 0usize..3 {
+            n := 0usize
+            if kind == 0 {
+                match deflate_fixed.encode_level(&input[..1024], &mut output, level) { ok(size) => { n = size }, err(_) => { return 18 } }
+            } else if kind == 1 {
+                match zlib.encode_fixed_level(&input[..1024], &mut output, level) { ok(size) => { n = size }, err(_) => { return 19 } }
+            } else {
+                match gzip.encode_fixed_level(&input[..1024], &mut output, level) { ok(size) => { n = size }, err(_) => { return 20 } }
+            }
+            stream := console.stdout()
+            prefix := [(n & 255) as u8, ((n >> 8) & 255) as u8, ((n >> 16) & 255) as u8, ((n >> 24) & 255) as u8]
+            match io.write_all(&mut stream, &prefix) { ok(_) => {}, err(_) => { return 21 } }
+            match io.write_all(&mut stream, &output[..n]) { ok(_) => {}, err(_) => { return 22 } }
+        }
+    }
+    workspace := deflate_workspace.Workspace.new()
+    for level in 0usize..10 {
+        for kind in 0usize..3 {
+            n := 0usize
+            if kind == 0 {
+                match deflate_fixed.encode_with_workspace(&input[..1024], &mut output, level, &mut workspace) { ok(size) => { n = size }, err(_) => { return 33 } }
+            } else if kind == 1 {
+                match zlib.encode_fixed_with_workspace(&input[..1024], &mut output, level, &mut workspace) { ok(size) => { n = size }, err(_) => { return 34 } }
+            } else {
+                match gzip.encode_fixed_with_workspace(&input[..1024], &mut output, level, &mut workspace) { ok(size) => { n = size }, err(_) => { return 35 } }
+            }
+            stream := console.stdout()
+            prefix := [(n & 255) as u8, ((n >> 8) & 255) as u8, ((n >> 16) & 255) as u8, ((n >> 24) & 255) as u8]
+            match io.write_all(&mut stream, &prefix) { ok(_) => {}, err(_) => { return 36 } }
+            match io.write_all(&mut stream, &output[..n]) { ok(_) => {}, err(_) => { return 37 } }
+        }
+    }
+    match deflate_fixed.encode_level(&input, &mut output, 10) {
+        err(deflate.Error.InvalidData) => {}, ok(_) => { return 23 }, err(_) => { return 24 }
+    }
+    match zlib.encode_fixed_level(&input, &mut output, 10) { err(zlib.Error.InvalidData) => {}, ok(_) => { return 25 }, err(_) => { return 26 } }
+    match gzip.encode_fixed_level(&input, &mut output, 10) { err(gzip.Error.InvalidData) => {}, ok(_) => { return 27 }, err(_) => { return 28 } }
+    match zlib.encode_fixed(&input, &mut output[..6]) { err(zlib.Error.OutputFull) => {}, ok(_) => { return 29 }, err(_) => { return 30 } }
+    match gzip.encode_fixed(&input, &mut output[..18]) { err(gzip.Error.OutputFull) => {}, ok(_) => { return 31 }, err(_) => { return 32 } }
+    match deflate_fixed.encode(&input, &mut output[..1]) {
+        err(deflate.Error.OutputFull) => {},
+        ok(_) => { return 13 },
+        err(_) => { return 13 }
+    }
+    return 0
+}

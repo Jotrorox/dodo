@@ -1,0 +1,318 @@
+package gzip
+
+import "std/checksum"
+import "std/compress/deflate"
+import "std/compress/deflate_fixed"
+import "std/compress/deflate_dynamic"
+import "std/compress/deflate_workspace"
+
+pub enum Error {
+    Truncated, InvalidData, OutputFull, ChecksumMismatch
+}
+pub struct DecodeResult {
+    pub input_consumed: usize
+    pub output_written: usize
+}
+
+// Decode one gzip member. Concatenated members can be decoded by passing the
+// unconsumed suffix to another call. Optional header fields are validated.
+// This is a one-shot API; the output prefix is unspecified on error.
+pub fn decode(input: &[u8], output: &mut[u8]) -> DecodeResult!Error {
+    if input.len < 10 {
+        return err(Error.Truncated)
+    }
+    if input[0] != 31 || input[1] != 139 || input[2] != 8 || (input[3] & 0xe0) != 0 {
+        return err(Error.InvalidData)
+    }
+    flags := input[3]
+    offset := 10usize
+    if (flags & 4) != 0 {
+        if input.len - offset < 2 {
+            return err(Error.Truncated)
+        }
+        extra := (input[offset] as usize) | ((input[offset + 1] as usize) << 8)
+        offset += 2
+        if input.len - offset < extra {
+            return err(Error.Truncated)
+        }
+        offset += extra
+    }
+    if (flags & 8) != 0 {
+        for offset < input.len && input[offset] != 0 {
+            offset += 1
+        }
+        if offset == input.len {
+            return err(Error.Truncated)
+        }
+        offset += 1
+    }
+    if (flags & 16) != 0 {
+        for offset < input.len && input[offset] != 0 {
+            offset += 1
+        }
+        if offset == input.len {
+            return err(Error.Truncated)
+        }
+        offset += 1
+    }
+    if (flags & 2) != 0 {
+        if input.len - offset < 2 {
+            return err(Error.Truncated)
+        }
+        expected := (input[offset] as u32) | ((input[offset + 1] as u32) << 8)
+        if (checksum.crc32(&input[..offset]) & 0xffff) != expected {
+            return err(Error.ChecksumMismatch)
+        }
+        offset += 2
+    }
+    decoded := match deflate.decode(&input[offset..], output) {
+        ok(result) => {
+            result
+        },
+        err(reason) => {
+            match reason {
+                deflate.Error.Truncated => {
+                    return err(Error.Truncated)
+                },
+                deflate.Error.InvalidData => {
+                    return err(Error.InvalidData)
+                },
+                deflate.Error.OutputFull => {
+                    return err(Error.OutputFull)
+                },
+            }
+        },
+    }
+    offset += decoded.input_consumed
+    if input.len - offset < 8 {
+        return err(Error.Truncated)
+    }
+    expected_crc := (input[offset] as u32) | ((input[offset + 1] as u32) << 8) | ((input[offset + 2] as u32) << 16) | ((input[offset + 3] as u32) << 24)
+    expected_size := (input[offset + 4] as u32) | ((input[offset + 5] as u32) << 8) | ((input[offset + 6] as u32) << 16) | ((input[offset + 7] as u32) << 24)
+    if checksum.crc32(&output[..decoded.output_written]) != expected_crc || ((decoded.output_written & 0xffffffffusize) as u32) != expected_size {
+        return err(Error.ChecksumMismatch)
+    }
+    return ok(DecodeResult { input_consumed: offset + 8, output_written: decoded.output_written })
+}
+
+// Emits one gzip member using stored DEFLATE blocks, with deterministic header.
+pub fn encode(input: &[u8], output: &mut[u8]) -> usize!Error {
+    if output.len < 18 {
+        return err(Error.OutputFull)
+    }
+    output[0] = 31
+    output[1] = 139
+    output[2] = 8
+    for i in 3usize..9 {
+        output[i] = 0
+    }
+    output[9] = 255
+    written := match deflate.encode(input, &mut output[10..output.len - 8]) {
+        ok(count) => {
+            count
+        },
+        err(_) => {
+            return err(Error.OutputFull)
+        },
+    }
+    offset := 10 + written
+    sum := checksum.crc32(input)
+    size := (input.len & 0xffffffffusize) as u32
+    for i in 0usize..4 {
+        output[offset + i] = ((sum >> ((i * 8) as u32)) & 255) as u8
+        output[offset + 4 + i] = ((size >> ((i * 8) as u32)) & 255) as u8
+    }
+    return ok(offset + 8)
+}
+
+// Emits a stream using fixed Huffman codes and LZ77 matches.
+pub fn encode_fixed(input: &[u8], output: &mut[u8]) -> usize!Error {
+    if output.len < 18 {
+        return err(Error.OutputFull)
+    }
+    output[0] = 31
+    output[1] = 139
+    output[2] = 8
+    for i in 3usize..9 {
+        output[i] = 0
+    }
+    output[9] = 255
+    written := match deflate_fixed.encode(input, &mut output[10..output.len - 8]) {
+        ok(count) => {
+            count
+        },
+        err(_) => {
+            return err(Error.OutputFull)
+        },
+    }
+    offset := 10 + written
+    sum := checksum.crc32(input)
+    size := (input.len & 0xffffffffusize) as u32
+    for i in 0usize..4 {
+        output[offset + i] = ((sum >> ((i * 8) as u32)) & 255) as u8
+        output[offset + 4 + i] = ((size >> ((i * 8) as u32)) & 255) as u8
+    }
+    return ok(offset + 8)
+}
+
+// Emits a dynamic-Huffman stream using frequency-ranked trees.
+pub fn encode_dynamic(input: &[u8], output: &mut[u8]) -> usize!Error {
+    if output.len < 18 {
+        return err(Error.OutputFull)
+    }
+    output[0] = 31
+    output[1] = 139
+    output[2] = 8
+    for i in 3usize..9 {
+        output[i] = 0
+    }
+    output[9] = 255
+    written := match deflate_dynamic.encode(input, &mut output[10..output.len - 8]) {
+        ok(count) => {
+            count
+        },
+        err(_) => {
+            return err(Error.OutputFull)
+        },
+    }
+    offset := 10 + written
+    sum := checksum.crc32(input)
+    size := (input.len & 0xffffffffusize) as u32
+    for i in 0usize..4 {
+        output[offset + i] = ((sum >> ((i * 8) as u32)) & 255) as u8
+        output[offset + 4 + i] = ((size >> ((i * 8) as u32)) & 255) as u8
+    }
+    return ok(offset + 8)
+}
+
+// Compress using a specified match-search level from 0 through 9.
+pub fn encode_fixed_level(input: &[u8], output: &mut[u8], level: usize) -> usize!Error {
+    if level > 9 {
+        return err(Error.InvalidData)
+    }
+    if output.len < 18 {
+        return err(Error.OutputFull)
+    }
+    output[0] = 31
+    output[1] = 139
+    output[2] = 8
+    for i in 3usize..9 {
+        output[i] = 0
+    }
+    output[9] = 255
+    written := match deflate_fixed.encode_level(input, &mut output[10..output.len - 8], level) {
+        ok(count) => {
+            count
+        },
+        err(_) => {
+            return err(Error.OutputFull)
+        },
+    }
+    offset := 10 + written
+    sum := checksum.crc32(input)
+    size := (input.len & 0xffffffffusize) as u32
+    for i in 0usize..4 {
+        output[offset + i] = ((sum >> ((i * 8) as u32)) & 255) as u8
+        output[offset + 4 + i] = ((size >> ((i * 8) as u32)) & 255) as u8
+    }
+    return ok(offset + 8)
+}
+
+// Compress using a specified match-search level from 0 through 9.
+pub fn encode_dynamic_level(input: &[u8], output: &mut[u8], level: usize) -> usize!Error {
+    if level > 9 {
+        return err(Error.InvalidData)
+    }
+    if output.len < 18 {
+        return err(Error.OutputFull)
+    }
+    output[0] = 31
+    output[1] = 139
+    output[2] = 8
+    for i in 3usize..9 {
+        output[i] = 0
+    }
+    output[9] = 255
+    written := match deflate_dynamic.encode_level(input, &mut output[10..output.len - 8], level) {
+        ok(count) => {
+            count
+        },
+        err(_) => {
+            return err(Error.OutputFull)
+        },
+    }
+    offset := 10 + written
+    sum := checksum.crc32(input)
+    size := (input.len & 0xffffffffusize) as u32
+    for i in 0usize..4 {
+        output[offset + i] = ((sum >> ((i * 8) as u32)) & 255) as u8
+        output[offset + 4 + i] = ((size >> ((i * 8) as u32)) & 255) as u8
+    }
+    return ok(offset + 8)
+}
+
+// Compress with reusable caller-owned match-finder storage.
+pub fn encode_fixed_with_workspace(input: &[u8], output: &mut[u8], level: usize, workspace: &mut deflate_workspace.Workspace) -> usize!Error {
+    if level > 9 {
+        return err(Error.InvalidData)
+    }
+    if output.len < 18 {
+        return err(Error.OutputFull)
+    }
+    output[0] = 31
+    output[1] = 139
+    output[2] = 8
+    for i in 3usize..9 {
+        output[i] = 0
+    }
+    output[9] = 255
+    written := match deflate_fixed.encode_with_workspace(input, &mut output[10..output.len - 8], level, workspace) {
+        ok(count) => {
+            count
+        },
+        err(_) => {
+            return err(Error.OutputFull)
+        },
+    }
+    offset := 10 + written
+    sum := checksum.crc32(input)
+    size := (input.len & 0xffffffffusize) as u32
+    for i in 0usize..4 {
+        output[offset + i] = ((sum >> ((i * 8) as u32)) & 255) as u8
+        output[offset + 4 + i] = ((size >> ((i * 8) as u32)) & 255) as u8
+    }
+    return ok(offset + 8)
+}
+
+// Compress with reusable caller-owned match-finder storage.
+pub fn encode_dynamic_with_workspace(input: &[u8], output: &mut[u8], level: usize, workspace: &mut deflate_workspace.Workspace) -> usize!Error {
+    if level > 9 {
+        return err(Error.InvalidData)
+    }
+    if output.len < 18 {
+        return err(Error.OutputFull)
+    }
+    output[0] = 31
+    output[1] = 139
+    output[2] = 8
+    for i in 3usize..9 {
+        output[i] = 0
+    }
+    output[9] = 255
+    written := match deflate_dynamic.encode_with_workspace(input, &mut output[10..output.len - 8], level, workspace) {
+        ok(count) => {
+            count
+        },
+        err(_) => {
+            return err(Error.OutputFull)
+        },
+    }
+    offset := 10 + written
+    sum := checksum.crc32(input)
+    size := (input.len & 0xffffffffusize) as u32
+    for i in 0usize..4 {
+        output[offset + i] = ((sum >> ((i * 8) as u32)) & 255) as u8
+        output[offset + 4 + i] = ((size >> ((i * 8) as u32)) & 255) as u8
+    }
+    return ok(offset + 8)
+}

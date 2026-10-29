@@ -1,0 +1,69 @@
+package zlib_store
+import "std/checksum"
+import "std/compress/deflate_store"
+
+pub enum Status {
+    NeedInput, NeedOutput, Done
+}
+pub struct Progress {
+    pub input_consumed: usize, pub output_written: usize, pub status: Status
+}
+// Incremental zlib encoder using stored blocks. Keep finish true until Done.
+pub struct Encoder {
+    raw: deflate_store.Encoder
+    adler: checksum.Adler32
+    phase: usize
+    index: usize
+    trailer: [4]u8
+    pub fn new() -> Encoder {
+        return Encoder { raw: deflate_store.Encoder.new(), adler: checksum.Adler32.new(), phase: 0, index: 0, trailer: [0u8; 4] }
+    }
+    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> Progress {
+        used := 0usize
+        written := 0usize
+        for {
+            if self.phase == 0 {
+                header := [0x78u8, 0x01]
+                for self.index < 2 {
+                    if written == output.len {
+                        return Progress { input_consumed: used, output_written: written, status: Status.NeedOutput }
+                    }
+                    output[written] = header[self.index];
+                    written += 1;
+                    self.index += 1
+                }
+                self.phase = 1;
+                self.index = 0
+            } else if self.phase == 1 {
+                p := self.raw.process(&input[used..], &mut output[written..], finish)
+                self.adler.update(&input[used..used + p.input_consumed])
+                used += p.input_consumed;
+                written += p.output_written
+                if p.status == deflate_store.Status.NeedInput {
+                    return Progress { input_consumed: used, output_written: written, status: Status.NeedInput }
+                }
+                if p.status == deflate_store.Status.NeedOutput {
+                    return Progress { input_consumed: used, output_written: written, status: Status.NeedOutput }
+                }
+                sum := self.adler.finish()
+                self.trailer[0] = ((sum >> 24) & 255) as u8
+                self.trailer[1] = ((sum >> 16) & 255) as u8
+                self.trailer[2] = ((sum >> 8) & 255) as u8
+                self.trailer[3] = (sum & 255) as u8
+                self.phase = 2
+            } else if self.phase == 2 {
+                for self.index < 4 {
+                    if written == output.len {
+                        return Progress { input_consumed: used, output_written: written, status: Status.NeedOutput }
+                    }
+                    output[written] = self.trailer[self.index];
+                    written += 1;
+                    self.index += 1
+                }
+                self.phase = 3
+            } else {
+                return Progress { input_consumed: used, output_written: written, status: Status.Done }
+            }
+        }
+    }
+}

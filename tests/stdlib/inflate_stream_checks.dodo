@@ -1,0 +1,166 @@
+package inflate_stream_checks
+import "std/compress/inflate"
+import "std/compress/deflate"
+fn run(input: &[u8], expected: &[u8], chunk: usize) -> i32 {
+ d := inflate.Decoder.new()
+ out := [0u8; 40000]
+ ip := 0usize
+ op := 0usize
+ for turns in 0usize..100000 {
+  end := ip + chunk
+  if end > input.len { end = input.len }
+  endout := op + 1
+  if endout > out.len { endout = out.len }
+  match d.process(&input[ip..end], &mut out[op..endout]) {
+   ok(p) => {
+    ip += p.input_consumed; op += p.output_written
+    if p.status == inflate.Status.Done {
+     if ip != input.len - 2 || op != expected.len { return 1 }
+     for i in 0usize..op { if out[i] != expected[i] { return 2 } }
+     return 0
+    }
+    if p.input_consumed == 0 && p.output_written == 0 {
+     if p.status == inflate.Status.NeedInput && end == input.len { return 3 }
+     if p.status == inflate.Status.NeedOutput && endout == out.len { return 4 }
+    }
+   }, err(_) => { return 5 }
+  }
+ }
+ return 6
+}
+fn run_split(input: &[u8], expected: &[u8], split: usize) -> i32 {
+ d := inflate.Decoder.new()
+ out := [0u8; 40000]
+ ip := 0usize
+ op := 0usize
+ for turns in 0usize..100000 {
+  end := input.len
+  if ip < split { end = split }
+  endout := op + 1
+  if endout > out.len { endout = out.len }
+  match d.process(&input[ip..end], &mut out[op..endout]) {
+   ok(p) => {
+    ip += p.input_consumed; op += p.output_written
+    if p.status == inflate.Status.Done {
+     if ip != input.len - 2 || op != expected.len { return 1 }
+     for i in 0usize..op { if out[i] != expected[i] { return 2 } }
+     return 0
+    }
+    if p.input_consumed == 0 && p.output_written == 0 {
+     if p.status == inflate.Status.NeedInput && end == input.len { return 3 }
+     if p.status == inflate.Status.NeedOutput && endout == out.len { return 4 }
+    }
+   }, err(_) => { return 5 }
+  }
+ }
+ return 6
+}
+fn next(state: &mut u32) -> u32 {
+ *state = *state ^ ((*state & 0x7ffffu32) << 13)
+ *state = *state ^ (*state >> 17)
+ *state = *state ^ ((*state & 0x7ffffffu32) << 5)
+ return *state
+}
+fn fuzz() -> bool {
+ state := 0x76a59327u32
+ stored := [1u8, 3, 0, 252, 255, 65, 66, 67]
+ fixed := [203u8, 72, 205, 201, 201, 87, 40, 207, 47, 202, 73, 81, 200, 24, 101, 15, 59, 54, 0]
+ dynamic := [21u8, 140, 1, 14, 192, 64, 8, 194, 166, 8, 253, 255, 143, 199, 197, 68, 129, 84, 96, 150, 228, 18, 175, 47, 96, 107, 62, 223, 61, 241, 221, 154, 8, 210, 57, 216, 82, 54, 126, 186, 55, 214, 101, 81, 109, 243, 150, 168, 217, 20, 85, 38, 18, 125, 238, 118, 126]
+ for iteration in 0usize..5000 {
+  input := [0u8; 64]
+  output := [0u8; 256]
+  length := (next(&mut state) as usize) % 65
+  for i in 0usize..length { input[i] = (next(&mut state) & 255) as u8 }
+  if iteration % 4 != 0 {
+   seed := &stored[..]
+   if iteration % 4 == 2 { seed = &fixed[..] }
+   if iteration % 4 == 3 { seed = &dynamic[..] }
+   length = seed.len
+   for i in 0usize..length { input[i] = seed[i] }
+   changes := (next(&mut state) as usize) % 5
+   for i in 0usize..changes {
+    index := (next(&mut state) as usize) % length
+    input[index] = input[index] ^ ((next(&mut state) & 255) as u8)
+   }
+   if iteration % 7 == 0 { length = (next(&mut state) as usize) % (length + 1) }
+  }
+  d := inflate.Decoder.new()
+  ip := 0usize
+  op := 0usize
+  ended := false
+  for step in 0usize..1024 {
+   end := ip + 1
+   if end > length { end = length }
+   out_end := op + 1
+   if out_end > output.len { out_end = output.len }
+   match d.process(&input[ip..end], &mut output[op..out_end]) {
+    err(_) => {
+     if d.last_input_consumed() > end - ip || d.last_output_written() > out_end - op { return false }
+     ended = true; break
+    },
+    ok(p) => {
+     if p.input_consumed > end - ip || p.output_written > out_end - op { return false }
+     if d.last_input_consumed() != p.input_consumed || d.last_output_written() != p.output_written { return false }
+     ip += p.input_consumed; op += p.output_written
+     if p.status == inflate.Status.Done { ended = true; break }
+     if p.input_consumed == 0 && p.output_written == 0 {
+      if (p.status == inflate.Status.NeedInput && ip == length) || (p.status == inflate.Status.NeedOutput && op == output.len) { ended = true; break }
+      return false
+     }
+    }
+   }
+  }
+  if !ended { return false }
+ }
+ return true
+}
+fn main() -> i32 {
+ input_fixed: [356]u8 = [75u8,76,74,78,73,77,28,37,70,137,81,98,148,24,37,70,137,81,98,148,24,37,70,137,81,98,148,24,37,70,137,81,98,148,24,37,70,137,81,98,148,24,37,70,137,81,98,148,24,37,70,137,81,98,148,24,37,70,137,81,98,148,24,37,70,137,81,98,148,24,37,70,137,161,77,48,48,50,49,179,176,178,177,115,112,114,113,243,240,242,241,11,8,10,9,139,136,138,137,75,72,74,73,203,200,202,201,43,40,42,41,171,168,170,169,107,104,106,105,235,232,234,233,27,24,26,25,155,152,154,153,91,88,90,89,219,216,218,217,59,56,58,57,187,184,186,185,123,120,122,121,251,248,250,249,7,4,6,5,135,132,134,133,71,68,70,69,199,196,198,197,39,128,109,73,75,207,200,204,202,206,201,205,203,47,40,44,42,46,41,45,43,175,168,172,170,174,169,173,171,111,104,108,106,110,105,109,107,239,232,236,234,238,233,237,235,159,48,113,210,228,41,83,167,77,159,49,115,214,236,57,115,231,205,95,176,112,209,226,37,75,151,45,95,177,114,213,234,53,107,215,173,223,176,113,211,230,45,91,183,109,223,177,115,215,238,61,123,247,237,63,112,240,208,225,35,71,143,29,63,113,242,212,233,51,103,207,157,191,112,241,210,229,43,87,175,93,191,113,243,214,237,59,119,239,221,127,240,240,209,227,39,79,159,61,127,241,242,213,235,55,111,223,189,255,240,241,211,231,47,95,191,125,255,241,243,215,239,63,127,255,253,31,245,255,168,255,71,253,63,114,253,15,0,170,187]
+ input_dynamic: [82]u8 = [237u8,196,73,17,0,0,8,4,160,172,235,209,191,130,99,15,120,144,234,217,72,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,146,36,73,250,14,170,187]
+ expected := [0u8; 11280]
+ for i in 0usize..10000 { expected[i] = (97 + i % 5) as u8 }
+ for i in 0usize..1280 { expected[10000 + i] = (i % 256) as u8 }
+ encoded := [0u8; 11300]
+ n := deflate.encode(&expected, &mut encoded)!
+ encoded[n] = 170; encoded[n + 1] = 187
+ for chunk in 1usize..10 { if run(&encoded[..n + 2], &expected, chunk) != 0 { return 1 } }
+ for chunk in 1usize..10 { if run(&input_fixed, &expected, chunk) != 0 { return 2 } }
+ expected_dynamic := [0u8; 40000]
+ for i in 0usize..40000 { expected_dynamic[i] = (97 + i % 5) as u8 }
+ for chunk in 1usize..10 { if run(&input_dynamic, &expected_dynamic, chunk) != 0 { return 3 } }
+ for split in 1usize..input_fixed.len { if run_split(&input_fixed, &expected, split) != 0 { return 5 } }
+ for split in 1usize..input_dynamic.len { if run_split(&input_dynamic, &expected_dynamic, split) != 0 { return 6 } }
+
+ long_input := [0u8; 32790]
+ long_input[0] = 0; long_input[1] = 0; long_input[2] = 128; long_input[3] = 255; long_input[4] = 127
+ expected_long := [0u8; 32771]
+ for i in 0usize..32768 { long_input[i + 5] = (i % 251) as u8; expected_long[i] = (i % 251) as u8 }
+ expected_long[32768] = 0; expected_long[32769] = 1; expected_long[32770] = 2
+ long_input[32773] = 3
+ long_input[32774] = 222
+ long_input[32775] = 255
+ long_input[32776] = 15
+ long_input[32777] = 0
+ long_input[32778] = 170; long_input[32779] = 187
+ for chunk in 1usize..10 { if run(&long_input[..32780], &expected_long, chunk) != 0 { return 4 } }
+ short := [1u8, 3, 0, 252, 255, 65, 66, 67, 170, 187]
+ short_expected := [65u8, 66, 67]
+ for split in 1usize..short.len { if run_split(&short, &short_expected, split) != 0 { return 7 } }
+ invalid_type := [7u8]
+ invalid_stored := [1u8, 1, 0, 0, 0, 65]
+ invalid_distance := [3u8, 2, 0]
+ invalid_tree := [5u8, 0, 146, 4]
+ invalid_inputs := [&invalid_type[..], &invalid_stored[..], &invalid_distance[..], &invalid_tree[..]]
+ for &input in invalid_inputs {
+  d := inflate.Decoder.new()
+  buffer := [0u8; 32]
+  match d.process(input, &mut buffer) { ok(_) => { return 8 }, err(_) => {} }
+ }
+ partial_error := [0u8, 3, 0, 252, 255, 65, 66, 67, 7]
+ decoder := inflate.Decoder.new()
+ buffer := [0u8; 32]
+ match decoder.process(&partial_error, &mut buffer) { ok(_) => { return 9 }, err(_) => {} }
+ if decoder.last_input_consumed() != 9 || decoder.last_output_written() != 3 { return 10 }
+ if !fuzz() { return 11 }
+ return 0
+}

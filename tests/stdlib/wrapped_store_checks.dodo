@@ -1,0 +1,40 @@
+package wrapped_store_checks
+import "std/compress/zlib_store"
+import "std/compress/gzip_store"
+import "std/console"
+import "std/io"
+
+fn main() -> i32 {
+    data := [0u8; 10000]
+    for i in 0usize..data.len { data[i] = (i & 255) as u8 }
+    encoded := [0u8; 12000]
+    sink := console.stdout()
+    for format in 0usize..2 {
+        pos := 0usize
+        written := 0usize
+        zs := zlib_store.Encoder.new()
+        gs := gzip_store.Encoder.new()
+        for {
+            end := pos + 97
+            if end > data.len { end = data.len }
+            limit := written + 7
+            if limit > encoded.len { return 1 }
+            if format == 0 {
+                p := zs.process(&data[pos..end], &mut encoded[written..limit], end == data.len)
+                pos += p.input_consumed; written += p.output_written
+                if p.status == zlib_store.Status.Done { break }
+                if p.input_consumed == 0 && p.output_written == 0 { return 2 }
+            } else {
+                p := gs.process(&data[pos..end], &mut encoded[written..limit], end == data.len)
+                pos += p.input_consumed; written += p.output_written
+                if p.status == gzip_store.Status.Done { break }
+                if p.input_consumed == 0 && p.output_written == 0 { return 3 }
+            }
+        }
+        if pos != data.len { return 4 }
+        prefix := [(written & 255) as u8, ((written >> 8) & 255) as u8, ((written >> 16) & 255) as u8, ((written >> 24) & 255) as u8]
+        match io.write_all(&mut sink, &prefix) { ok(_) => {}, err(_) => { return 5 } }
+        match io.write_all(&mut sink, &encoded[..written]) { ok(_) => {}, err(_) => { return 6 } }
+    }
+    return 0
+}

@@ -1,0 +1,77 @@
+package gzip_store
+import "std/checksum"
+import "std/compress/deflate_store"
+
+pub enum Status {
+    NeedInput, NeedOutput, Done
+}
+pub struct Progress {
+    pub input_consumed: usize, pub output_written: usize, pub status: Status
+}
+// Incremental gzip encoder using stored blocks. Keep finish true until Done.
+pub struct Encoder {
+    raw: deflate_store.Encoder
+    crc: checksum.Crc32
+    size: u32
+    phase: usize
+    index: usize
+    trailer: [8]u8
+    pub fn new() -> Encoder {
+        return Encoder { raw: deflate_store.Encoder.new(), crc: checksum.Crc32.new(), size: 0, phase: 0, index: 0, trailer: [0u8; 8] }
+    }
+    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> Progress {
+        used := 0usize
+        written := 0usize
+        for {
+            if self.phase == 0 {
+                header := [31u8, 139, 8, 0, 0, 0, 0, 0, 0, 255]
+                for self.index < 10 {
+                    if written == output.len {
+                        return Progress { input_consumed: used, output_written: written, status: Status.NeedOutput }
+                    }
+                    output[written] = header[self.index];
+                    written += 1;
+                    self.index += 1
+                }
+                self.phase = 1;
+                self.index = 0
+            } else if self.phase == 1 {
+                p := self.raw.process(&input[used..], &mut output[written..], finish)
+                self.crc.update(&input[used..used + p.input_consumed])
+                for i in 0usize..p.input_consumed {
+                    if self.size == 0xffffffffu32 {
+                        self.size = 0
+                    } else {
+                        self.size += 1
+                    }
+                }
+                used += p.input_consumed;
+                written += p.output_written
+                if p.status == deflate_store.Status.NeedInput {
+                    return Progress { input_consumed: used, output_written: written, status: Status.NeedInput }
+                }
+                if p.status == deflate_store.Status.NeedOutput {
+                    return Progress { input_consumed: used, output_written: written, status: Status.NeedOutput }
+                }
+                sum := self.crc.finish()
+                for i in 0usize..4 {
+                    self.trailer[i] = ((sum >> ((i * 8) as u32)) & 255) as u8
+                    self.trailer[i + 4] = ((self.size >> ((i * 8) as u32)) & 255) as u8
+                }
+                self.phase = 2
+            } else if self.phase == 2 {
+                for self.index < 8 {
+                    if written == output.len {
+                        return Progress { input_consumed: used, output_written: written, status: Status.NeedOutput }
+                    }
+                    output[written] = self.trailer[self.index];
+                    written += 1;
+                    self.index += 1
+                }
+                self.phase = 3
+            } else {
+                return Progress { input_consumed: used, output_written: written, status: Status.Done }
+            }
+        }
+    }
+}
