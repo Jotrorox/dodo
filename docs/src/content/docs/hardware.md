@@ -955,6 +955,7 @@ runs a blinking LED, a debounced button, and such a serial console together.
 | GPIO pin (RP2040, RP2350) | `pin.listen(events)` with `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, `LEVEL_LOW`; all pins share `IO_IRQ_BANK0` (`pin.irq()`) | `pin.events()` shows what is raising it; `pin.clear_events(edges)` clears latched edges. Levels last as long as the level. `ignore(events)` stops. |
 | Serial port | `port.listen(sources)` | Reading drains the receive sources; `clear_interrupts` the errors. |
 | Timer alarm | `alarm.listen()` | `alarm.clear()`. An alarm used as the executor's clock is busy. |
+| USB serial port | `serial.set_signal(&SIGNAL)`: the port's own interrupt handler raises it | Nothing to acknowledge: read with `poll_read` until it is Pending. |
 
 Several pins share `IO_IRQ_BANK0`, so give them one signal and let each
 task check its own pin's `events()`: raising wakes every waiting task.
@@ -1080,7 +1081,11 @@ dodo run
 ```
 
 Dodo builds the firmware, copies it to the drive, and the board restarts into
-it: the LED blinks once a second. `dodo build` writes
+it: the LED blinks once a second. Firmware that opens the board's
+[USB serial port](#usb-serial-on-the-rp2040-and-rp2350) with `b.usb.serial()`
+spares you the button from then on: when no bootloader drive is mounted,
+`dodo run` finds the board's port, restarts the board into its bootloader
+through it, waits for the drive, and flashes. `dodo build` writes
 `build/dev/thumbv6m-none-eabi/blink.elf` for debuggers and `blink.uf2` next to
 it for drag-and-drop flashing (`thumbv8m.main-none-eabi` for the Pico 2).
 Without a manifest, pass `--board pico` to
@@ -1107,8 +1112,9 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
 | `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`; `alarm(n)` claims an alarm, which can also run the [executor](#tasks-and-the-executor). |
+| `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
-| `board.report_panic(check, file, line, column)` | Unsafe. Write a failed check to the serial ports, as the [default panic hook](#panics-on-the-serial-port) does; for panic hooks of your own. |
+| `board.report_panic(check, file, line, column)` | Unsafe. Write a failed check to the serial ports and the USB serial port, as the [default panic hook](#panics-on-the-serial-port) does; for panic hooks of your own. |
 
 Board packages also export what is specific to their board, such as
 `pico.LED_PIN`. Drivers written against the protocols take `b.pins` values
@@ -1129,9 +1135,9 @@ compiler adds what a desktop operating system would otherwise provide:
 | Part | What it does |
 | --- | --- |
 | Boot stage 2 | Configures the flash interface for execute-in-place with the standard `03h` read command. The compiler adds the checksum the boot ROM verifies. |
-| Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `@interrupt(NAME)` handler replaces. |
+| Vector table | Initial stack and reset handler. Every exception and interrupt is a weak default that an `@interrupt(NAME)` handler replaces. The default `USBCTRL_IRQ` serves the [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) while one is open. |
 | Reset handler | Copies initialized statics to RAM, zeroes the rest, and calls `main`. If `main` returns, the core sleeps. |
-| Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the program's [serial ports](#panics-on-the-serial-port), if it claimed any, and halts. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
+| Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the program's [serial ports](#panics-on-the-serial-port) and USB serial port, if it opened any, and halts, keeping an open USB serial port served. Define `extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32)` to report failures differently; it must not return. |
 | Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, the 32- and 64-bit division, 64-bit multiplication, and shift routines the Cortex-M0+ lacks in hardware, and software `f32` and `f64` arithmetic, comparisons, conversions, and `%`, since it has no floating-point unit. Results are correctly rounded IEEE 754, to nearest with ties to even, subnormals included. |
 | Linker script | Flash at `0x10000000` (size from the board), 264 KiB of RAM, and the stack at the top of RAM; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). |
 
@@ -1365,7 +1371,10 @@ dodo: index bounds check failed at /home/me/console/main.dodo:41:46
 
 Then it masks interrupts and halts, as without a port. The message is out
 before the board halts, at the port's own rate and format; nothing needs to
-be configured. A panic hook of your own replaces all of this. To keep the
+be configured. An open [USB serial port](#usb-serial-on-the-rp2040-and-rp2350)
+gets the report too, and stays served after the halt: a terminal opened later
+still shows the report, and `dodo run` can still restart the board into its
+bootloader. A panic hook of your own replaces all of this. To keep the
 report and do something else afterwards, call `board.report_panic` from it,
 for example to restart into the bootloader so `dodo run` works again without
 pressing BOOTSEL:
@@ -1378,6 +1387,121 @@ extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, col
     board.reboot_to_bootloader()
 }
 ```
+
+### USB serial on the RP2040 and RP2350
+
+Both chips have a USB controller on the board's USB connector, the one
+`dodo run` flashes through. `b.usb.serial()` makes the board a USB serial
+port (CDC-ACM), so it prints and reads over that same cable, with no adapter
+and no wiring. The host needs no driver: the port is `/dev/ttyACM0` on
+Linux, `/dev/cu.usbmodem...` on macOS, and a COM port on Windows. The port
+is a `std/io` Reader and Writer, like a UART's:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/fmt"
+
+fn main() {
+    b := board.take()!
+    usb := b.usb.serial()!
+    count := 0u32
+    for {
+        fmt.printf(&mut usb, "tick {}\n", count)!
+        count += 1
+        b.led.toggle()
+        b.timer.delay_ms(500)
+    }
+}
+```
+
+Open a terminal on the port, `picocom /dev/ttyACM0` or
+`screen /dev/cu.usbmodem*`, at any baud rate: over USB the rate means
+nothing. The port is served from its interrupt, `USBCTRL_IRQ`, so it keeps
+answering the host while the program busy-waits, as in `delay_ms` above.
+[`examples/usb_serial.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/usb_serial.dodo)
+is a small command line over USB.
+
+| | USB serial port |
+| --- | --- |
+| Writing | `write` queues its bytes and returns. While no terminal has the port open, the first 1024 bytes (`rp_usb.TX_CAPACITY`) wait for one and the rest are dropped, so the start of the output, such as a banner printed at startup, is shown when a terminal opens it. While one has it open, a full queue waits for the host, and output the host does not take within 100 ms is dropped. Printing never stops the program and never fails. `flush()` waits until the host has taken everything, within the same limit; `poll_write` queues what fits. |
+| Reading | `read` waits for the first byte, then returns what has arrived; `poll_read` returns at once, `Pending` while nothing has. Up to 256 bytes (`rp_usb.RX_CAPACITY`) are kept; beyond that the host waits until the program reads, so no input is lost. `available()` counts what is waiting. |
+| Terminals | Newline translation is on at first, unlike on a UART: `"\n"` goes out as `"\r\n"`, and the CR that Enter sends, alone or followed by LF, reads as `"\n"`. `set_crlf(false)` passes binary data unchanged. |
+| Connection | `is_connected()` is true while a program on the host has the port open (DTR set, as terminals do); `is_configured()` while the host has enumerated the board. `line_state()` returns `rp_usb.DTR` and `rp_usb.RTS`, and `baud()` the rate the host set, for a bridge to a UART. |
+| Tasks | `set_signal(&SIGNAL)` raises an [executor signal](#waking-tasks-from-interrupts) whenever bytes arrive, output leaves, or the host opens, closes, or suspends the port. |
+| Restarting into the bootloader | A host that sets the port to 1200 baud restarts the board into its USB bootloader once the request is answered, as with the Pico SDK and Arduino. `dodo run` does this when no bootloader drive is mounted, so after the first flash the board needs no BOOTSEL press. `set_bootloader_reset(false)` turns it off, for example for a bridge to a UART that may really run at 1200 baud. |
+| Panics | Until the port is released, a panic writes its report to it, and the default panic hook keeps serving the port after it halts: a terminal opened later still receives the report, and `dodo run` still works. |
+| Identity | By default, Raspberry Pi's vendor ID `0x2E8A` with the Pico SDK's USB serial product ID `0x000A`, manufacturer "Dodo", and the board's name as the product; `b.usb.serial_with(identity)` sets your own, [below](#usb-identity). `b.usb.serial()` claims the port once (`Busy` otherwise); `b.usb.release_serial(port)` disconnects from the host and stops the controller. |
+| Clocks | The controller runs at 48 MHz from PLL_USB, which the ADC shares: the PLL runs while either uses it. |
+| Limits | One serial port, in device mode only: no host mode and no other USB classes. The queues are fixed at 256 bytes in (`rp_usb.RX_CAPACITY`) and 1 KiB out (`rp_usb.TX_CAPACITY`). |
+
+#### USB identity
+
+A USB vendor and product ID identify a device and its USB firmware, not the
+library it was built with, so Dodo has no product ID of its own. The default
+identity is meant for development: the board behaves like the Pico SDK's USB
+serial port (CDC UART) and uses its IDs, so hosts need no driver and
+`dodo run` finds the board to restart it into the bootloader. Hosts and tools
+take it for a Pico running Pico SDK firmware, though, and may treat it like
+one, or confuse it with another Pico plugged in at the same time.
+
+A product you distribute with its own USB identity passes it to
+`b.usb.serial_with`:
+
+```dodo
+usb := b.usb.serial_with(rp_usb.Identity {
+    vendor_id: 0x1209,
+    product_id: 0x0001,
+    manufacturer: "Example Maker",
+    product: "Plant Monitor",
+})!
+```
+
+Use a vendor ID you own, or a product ID assigned to your product under
+someone else's vendor ID, such as one from a vendor's sublicensing program
+or the pid.codes registry (vendor ID `0x1209`, whose `0x0001` above is a test
+ID). Do not pick an unassigned product ID under Raspberry Pi's vendor ID
+`0x2E8A`. Strings are ASCII, cut at 32 bytes (`rp_usb.MAX_STRING_LENGTH`).
+`rp_usb.default_identity(name)` is the default with another product name.
+`dodo run` looks only for the default IDs, so a board with its own needs
+BOOTSEL held while it is connected to flash it.
+
+A task woken by the port reads until nothing is left:
+
+```dodo
+const USB_INPUT: executor.Signal = executor.Signal { id: 4 }
+
+struct Echo {
+    usb: rp_usb.Serial
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        USB_INPUT.take(cx)
+        buffer := [0u8; 64]
+        for {
+            got := self.usb.poll_read(&mut buffer)!
+            if got.transferred == 0 {
+                break
+            }
+            self.usb.write(&buffer[..got.transferred])!
+        }
+        return executor.Poll.Pending
+    }
+}
+```
+
+with `usb.set_signal(&USB_INPUT)` before the task starts. Import
+`std/embedded/chip/rp_usb` to name the `rp_usb.Serial` type.
+
+The driver, `std/embedded/chip/rp_usb`, is a `Device` over any
+`hal.Registers`, generic like the other drivers: the repository's desktop
+tests run it against a model of the controller and a simulated host that
+enumerates it, opens the port, and moves data both ways. On the chip, the
+runtime's default `USBCTRL_IRQ` handler serves it; a program's own
+`@interrupt(USBCTRL_IRQ)` replaces that handler, and with it the port, for
+example to run a USB stack of its own. A custom board that uses
+`std/embedded/chip` directly calls `p.usb.serial()`, named after the chip,
+or `p.usb.serial_with(identity, activity_led)`.
 
 ### PWM and the ADC on the RP2040 and RP2350
 
@@ -1568,8 +1692,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  and the timer; USB, PIO, and DMA are not bundled yet. Write them with
-  `hal.Reg` as above.
+  the timer, and a USB serial port; PIO, DMA, and other USB devices (HID,
+  mass storage, several functions at once) or USB host mode are not bundled
+  yet. Write them with `hal.Reg` as above.
 - PWM outputs only generate; the slices' input modes, which count or time a
   pin's pulses, and the PWM wrap interrupt are not exposed. ADC reads are
   polled one at a time, without the round-robin sampler, FIFO, or DMA.

@@ -33,7 +33,8 @@ pub fn compile_ir_object(options: &Options, name: &str, text: &str, path: &Path)
     machine.write_to_file(&module, FileType::Object, path)
 }
 
-/// One section per defined function, so the linker can drop unused ones.
+/// One section per defined function, and on ELF per defined global
+/// variable, so the linker can drop unused ones.
 fn function_sections(module: &Module<'_>) {
     let triple = TargetMachine::normalize_triple(&module.get_triple());
     let triple = triple.as_str().to_string_lossy();
@@ -64,6 +65,30 @@ fn function_sections(module: &Module<'_>) {
                 module.set_noduplicate_comdat(function, &name);
             }
         }
+    }
+    if coff {
+        return;
+    }
+    // Otherwise every constant shares one .rodata section, which a single
+    // reference keeps whole: firmware would carry every package's public
+    // constants.
+    for global in module.globals() {
+        let Some(initializer) = global.get_initializer() else {
+            continue;
+        };
+        let name = global.get_name().to_string_lossy();
+        // LLVM's own globals, such as llvm.global_ctors, are not data.
+        if global.has_section() || global.is_thread_local() || name.starts_with("llvm.") {
+            continue;
+        }
+        let kind = if global.is_global_constant() {
+            ".rodata."
+        } else if initializer.is_null() {
+            ".bss."
+        } else {
+            ".data."
+        };
+        global.set_section(Some(&format!("{kind}{name}")));
     }
 }
 

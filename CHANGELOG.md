@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- The RP2040 and RP2350 boards are USB serial ports on their own USB
+  connector: `b.usb.serial()` returns a CDC-ACM port with the `std/io` Reader
+  and Writer protocols, so `fmt.printf` prints over the USB cable with no
+  adapter. The port is served from `USBCTRL_IRQ`, so it keeps answering the
+  host while the program busy-waits. Output written before a terminal opens
+  the port waits for it, up to 1 KiB, and printing never blocks the program
+  for long or fails. Newlines go out as CR LF, `set_signal` wakes executor
+  tasks on input, and a panic is reported on the port, which the default
+  panic hook keeps serving after it halts. The driver,
+  `std/embedded/chip/rp_usb`, keeps its queues in the controller's own RAM
+  and runs against a model of the controller and a simulated host in the
+  desktop tests.
+- `dodo run` no longer needs BOOTSEL for firmware with a USB serial port:
+  when no bootloader drive is mounted, it finds the board's port on Linux
+  and macOS, sets it to 1200 baud, which restarts the board into its
+  bootloader, waits for the drive, and flashes.
+- Fix `dodo fmt` dropping the space after a compound assignment before a
+  parenthesis or bracket, which turned `x |= (y)` into `x |=(y)`.
+- Fix `set_break(false)` on PL011 serial ports, which waited for the
+  transmitter to go idle while the break itself kept it busy, and so never
+  returned.
+- Constants and statics get their own ELF sections, as functions already
+  did, so the linker drops the unused ones: firmware no longer carries every
+  imported package's public constants once it uses one string constant.
 - `std/sync/atomic` works on Arm Cortex-M. On cores with exclusive loads and
   stores (ARMv7-M, ARMv7E-M, and ARMv8-M, such as the RP2350's Cortex-M33)
   every operation lowers to native instructions for 8-, 16-, and 32-bit
@@ -216,6 +240,8 @@
   pause from 24 received bytes on. `set_break` holds the line low. On the
   RP2350, `pins.uart` also takes TX and RX on the UART_AUX pins (GPIO n
   with n % 4 of 2 and 3).
+- Fix `set_break(false)` waiting for the UART to go idle, which a break
+  prevents: ending a break now returns at once.
 - `std/embedded/hal/fake` gains `fake.Serial`, an in-memory serial port for
   testing drivers of devices on a serial line. The board self-tests check
   the serial port's pins, ownership, timing at 115200 baud and 1 Mbaud,

@@ -5,20 +5,22 @@ import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_pwm"
+import "std/embedded/chip/rp_usb"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2040 chip support: clocks, resets, GPIO, I2C, SPI, UART,
-// PWM, the ADC, the microsecond timer, and the boot ROM. `take(config)`
-// brings the chip from its boot state (ring oscillator, peripherals held in
-// reset) to a known configuration and hands out the peripherals once. Pins
-// implement the std/embedded/hal output and input pin protocols, I2C and SPI
-// buses claimed from `Pins` implement the bus protocols, serial ports the
-// std/io Reader and Writer protocols, PWM outputs and ADC inputs the PWM
-// output and analog input protocols, and the timer implements the delay
-// protocol, so portable drivers use them unchanged.
+// PWM, the ADC, the microsecond timer, a USB serial port, and the boot ROM.
+// `take(config)` brings the chip from its boot state (ring oscillator,
+// peripherals held in reset) to a known configuration and hands out the
+// peripherals once. Pins implement the std/embedded/hal output and input pin
+// protocols, I2C and SPI buses claimed from `Pins` implement the bus
+// protocols, serial ports the std/io Reader and Writer protocols, PWM
+// outputs and ADC inputs the PWM output and analog input protocols, and the
+// timer implements the delay protocol, so portable drivers use them
+// unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -26,9 +28,9 @@ import "std/embedded/chip/rp_pins"
 // with `chip = "rp2040"`.
 //
 // Clocks after take(): clk_ref = the crystal, clk_sys = 125 MHz from PLL_SYS,
-// clk_peri = clk_sys, and a 1 MHz timer tick. clk_adc runs at 48 MHz from
-// PLL_USB while an ADC input is claimed. Section numbers below refer to
-// the RP2040 datasheet.
+// clk_peri = clk_sys, and a 1 MHz timer tick. clk_adc and clk_usb run at
+// 48 MHz from PLL_USB while an ADC input or the USB serial port is claimed.
+// Section numbers below refer to the RP2040 datasheet.
 
 // clk_sys, the processor and peripheral clock, after take().
 pub const SYS_HZ: u32 = 125_000_000
@@ -55,6 +57,7 @@ const RESET_SPI0: u32 = 1 << 16
 const RESET_SPI1: u32 = 1 << 17
 const RESET_UART0: u32 = 1 << 22
 const RESET_UART1: u32 = 1 << 23
+const RESET_USBCTRL: u32 = 1 << 24
 const RESET_TIMER: u32 = 1 << 21
 
 // Crystal oscillator (2.16).
@@ -94,6 +97,8 @@ const CLK_SYS_CTRL: usize = CLOCKS_BASE + 0x3C
 const CLK_SYS_DIV: usize = CLOCKS_BASE + 0x40
 const CLK_SYS_SELECTED: usize = CLOCKS_BASE + 0x44
 const CLK_PERI_CTRL: usize = CLOCKS_BASE + 0x48
+const CLK_USB_CTRL: usize = CLOCKS_BASE + 0x54
+const CLK_USB_DIV: usize = CLOCKS_BASE + 0x58
 const CLK_ADC_CTRL: usize = CLOCKS_BASE + 0x60
 const CLK_ADC_DIV: usize = CLOCKS_BASE + 0x64
 const CLK_SYS_RESUS_CTRL: usize = CLOCKS_BASE + 0x78
@@ -189,6 +194,11 @@ const UART1_BASE: usize = 0x4003_8000
 const PWM_BASE: usize = 0x4005_0000
 const ADC_BASE: usize = 0x4004_C000
 
+// The USB controller (4.1): its registers and its 4 KiB of dual-port
+// RAM, clocked by clk_usb.
+const USBCTRL_DPRAM_BASE: usize = 0x5010_0000
+const USBCTRL_REGS_BASE: usize = 0x5011_0000
+
 // Single-cycle I/O (2.3.1).
 const SIO_BASE: usize = 0xD000_0000
 const GPIO_IN: usize = SIO_BASE + 0x004
@@ -203,6 +213,12 @@ const GPIO_OE_CLR: usize = SIO_BASE + 0x028
 const ATTEMPTS: u32 = 1_000_000
 
 static mut TAKEN: bool = false
+// What runs PLL_USB: the ADC and the USB controller, one each. It stops when
+// neither does.
+static mut PLL_USB_USERS: u32 = 0
+// The pin the USB bootloader lights while its drive is accessed, after the
+// USB serial port restarts the chip into it; PIN_COUNT for none.
+static mut USB_ACTIVITY_LED: u32 = PIN_COUNT
 
 // Provided by the compiler's RP2040 firmware runtime.
 unsafe extern "C" fn dodo_rp2040_reset_usb_boot(activity_pins: u32, disabled_interfaces: u32)
@@ -257,6 +273,7 @@ pub struct Config {
 pub struct Peripherals {
     pub pins: Pins
     pub timer: Timer
+    pub usb: Usb
 }
 
 // Configure clocks, take GPIO and the timer out of reset, and return the
@@ -298,7 +315,8 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     bank := unsafe {
         rp_pins.Bank.new(Chip { crystal_hz: crystal })
     }
-    return ok(Peripherals { pins: Pins { bank }, timer })
+    usb := Usb { crystal_hz: crystal, open: false }
+    return ok(Peripherals { pins: Pins { bank }, timer, usb })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2040 register.
@@ -339,6 +357,32 @@ unsafe fn start_pll(base: usize, reset: u32, crystal_hz: u32, vco_hz: u32, post1
         prim.write(hal.encode(PLL_POSTDIV1, post1) | hal.encode(PLL_POSTDIV2, post2))
         power_on.write(PLL_POSTDIV_POWER_DOWN)
         return ok()
+    }
+}
+
+// Start PLL_USB at 48 MHz for one more user, unless it already runs.
+// SAFETY: the caller owns its claim on PLL_USB until release_pll_usb, and
+// runs in the program, not in an interrupt handler.
+unsafe fn acquire_pll_usb(crystal_hz: u32) -> void!hal.Error {
+    unsafe {
+        if PLL_USB_USERS == 0 {
+            start_pll(PLL_USB_BASE, RESET_PLL_USB, crystal_hz, USB_VCO_HZ, 5, 5)?
+        }
+        PLL_USB_USERS += 1
+    }
+    return ok()
+}
+
+// Give up a claim on PLL_USB; the last one holds it in reset.
+// SAFETY: the caller must hold a claim from acquire_pll_usb and no longer
+// use the clocks it drives.
+unsafe fn release_pll_usb() {
+    unsafe {
+        PLL_USB_USERS -= 1
+        if PLL_USB_USERS == 0 {
+            hold := reg(RESET + SET_ALIAS)
+            hold.write(RESET_PLL_USB)
+        }
     }
 }
 
@@ -608,6 +652,89 @@ pub struct Pins {
     }
 }
 
+// The USB controller, as a USB serial port for the host the board is
+// plugged into. rp_usb documents the port.
+pub struct Usb {
+    crystal_hz: u32
+    open: bool
+
+    // Start the controller as a USB serial port (CDC-ACM) named "RP2040",
+    // with rp_usb's default identity, and return it. The host enumerates it within about a second; what is
+    // written before a terminal opens it is kept, up to rp_usb.TX_CAPACITY
+    // bytes. The port is served from the USBCTRL_IRQ interrupt, so it keeps
+    // working while the program busy-waits; a program's own USBCTRL_IRQ
+    // handler replaces that. Until it is released, a panic is reported on
+    // it, and a host that sets 1200 baud, as `dodo run` does, restarts the
+    // board into its bootloader. Busy if a port is open, Timeout if PLL_USB
+    // or the controller does not start.
+    pub fn serial(&mut self) -> rp_usb.Serial!hal.Error {
+        return self.serial_with(rp_usb.default_identity("RP2040"), PIN_COUNT)
+    }
+
+    // `serial`, with the `identity` the host sees, and the pin the USB
+    // bootloader lights while its drive is accessed after the host
+    // restarts the board into it, or PIN_COUNT for none. Board packages
+    // pass the default identity with the board's name, and the board's
+    // LED.
+    pub fn serial_with(&mut self, identity: rp_usb.Identity, activity_led: u32) -> rp_usb.Serial!hal.Error {
+        if self.open {
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: `open` makes this the only user of the controller, its
+        // reset bit, and clk_usb, and acquire_pll_usb shares PLL_USB with
+        // the ADC.
+        unsafe {
+            acquire_pll_usb(self.crystal_hz)?
+            // clk_usb from PLL_USB (aux source 0), undivided: 48 MHz.
+            control := reg(CLK_USB_CTRL)
+            control.write(0)
+            divider := reg(CLK_USB_DIV)
+            divider.write(DIVIDE_BY_ONE)
+            control.write(CLK_ENABLE)
+            match reset_blocks(RESET_USBCTRL) {
+                ok() => {}
+                err(error) => {
+                    control.write(0)
+                    release_pll_usb()
+                    return err(error)
+                }
+            }
+            USB_ACTIVITY_LED = activity_led
+            serial := rp_usb.open(USBCTRL_REGS_BASE, USBCTRL_DPRAM_BASE, identity, usb_bootloader)
+            cortex_m.enable(USBCTRL_IRQ)
+            self.open = true
+            return ok(serial)
+        }
+    }
+
+    // Give back the port: the board disconnects from the host, output not
+    // yet sent is dropped, and the controller and its clock stop.
+    pub fn release_serial(&mut self, serial: rp_usb.Serial) {
+        cortex_m.disable(USBCTRL_IRQ)
+        rp_usb.close(serial)
+        cortex_m.unpend(USBCTRL_IRQ)
+        // SAFETY: the port is closed, so nothing uses the controller or
+        // clk_usb, and this releases the port's claim on PLL_USB.
+        unsafe {
+            hold := reg(RESET + SET_ALIAS)
+            hold.write(RESET_USBCTRL)
+            control := reg(CLK_USB_CTRL)
+            control.write(0)
+            release_pll_usb()
+        }
+        self.open = false
+    }
+}
+
+// The USB serial port's restart into the bootloader, from its interrupt.
+fn usb_bootloader() {
+    // SAFETY: written only while the port is closed.
+    led := unsafe {
+        USB_ACTIVITY_LED
+    }
+    reboot_to_bootloader(led)
+}
+
 // What rp_pins.Bank needs from this chip. Only the Bank in Pins has one.
 struct Chip {
     crystal_hz: u32
@@ -660,10 +787,11 @@ struct Chip {
 
     pub fn start_adc(&mut self) -> void!hal.Error {
         // SAFETY: the bank starts the ADC only while it has no input, so
-        // nothing uses PLL_USB, clk_adc, or the ADC. The reset alias
-        // registers change only their bits.
+        // nothing uses clk_adc or the ADC, and acquire_pll_usb leaves a
+        // running PLL_USB alone. The reset alias registers change only
+        // their bits.
         unsafe {
-            start_pll(PLL_USB_BASE, RESET_PLL_USB, self.crystal_hz, USB_VCO_HZ, 5, 5)?
+            acquire_pll_usb(self.crystal_hz)?
             // clk_adc from PLL_USB (aux source 0), undivided.
             control := reg(CLK_ADC_CTRL)
             control.write(0)
@@ -685,7 +813,7 @@ struct Chip {
             hold.write(RESET_ADC)
             control := reg(CLK_ADC_CTRL)
             control.write(0)
-            hold.write(RESET_PLL_USB)
+            release_pll_usb()
         }
     }
 

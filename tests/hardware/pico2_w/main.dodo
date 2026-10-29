@@ -16,7 +16,7 @@ import "std/sync/atomic"
 
 // Hardware self-test for the `pico2_w` board: the RP2350 startup runtime,
 // std/embedded/chip/rp2350 (clocks, timer, I2C, SPI, UART, PWM, the ADC,
-// single ownership, configuration checks), std/embedded/board/pico2_w with the CYW43439 driver in
+// the USB serial port, single ownership, configuration checks), std/embedded/board/pico2_w with the CYW43439 driver in
 // std/embedded/wireless/cyw43 (gSPI bus bring-up, the LED and USB-power GPIOs
 // of the wireless chip), and the runtime's integer and floating-point helpers.
 // Every outcome ends in the USB bootloader with a record that
@@ -37,7 +37,7 @@ import "std/sync/atomic"
 // A copy of [0] and [1] in watchdog SCRATCH0/1 survives the watchdog reset
 // that reports a hang. (The boot ROM's reboot uses SCRATCH2 to 7.)
 
-const RECORD: usize = 0x2007_F000
+const RECORD: usize = 0x2007_0000
 // The last 4 KiB sector of the Pico 2 W's flash, by its execute-in-place
 // address. (Without a partition table, flash_op refuses storage offsets.)
 const FLASH_RECORD: u32 = 0x103F_F000
@@ -261,6 +261,8 @@ fn bus_checks<P, T>(pins: &mut P, timer: &mut T) {
     one[0] = 0x5A
     spi_again.transfer(&mut one)!
     check(one[0] == 0x5A)
+    pins.release_i2c(i2c_again)
+    pins.release_spi(spi_again)
 }
 
 // A serial port on the board's usual pins with nothing connected (6
@@ -774,6 +776,42 @@ fn pwm_adc_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
     check(inputs_owned && sensor_owned && in_range && restarted && elapsed >= 400 && elapsed < 1500 && celsius > 0 && celsius < 70_000)
 }
 
+// Restart the watchdog's 3 s countdown, for checks that wait on the host.
+fn feed_watchdog() {
+    unsafe {
+        load: hal.Reg<u32> = hal.Reg.at(WATCHDOG + 0x04)
+        load.write(3_000_000)
+    }
+}
+
+// The USB serial port: the host this test runs from enumerates it, writes
+// without a terminal never wait, and the ADC shares PLL_USB with it.
+fn usb_checks(usb: &mut board.Usb, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    feed_watchdog()
+    serial := usb.serial()!
+    owned := refused(usb.serial(), hal.Error.Busy)
+    start := timer.now_us()
+    for !serial.is_configured() && timer.now_us() - start < 2_000_000 {}
+    configured := serial.is_configured()
+    feed_watchdog()
+    // More than the 1024 bytes the port keeps, in small pieces: a large
+    // array would reach the result record below the top of the stack.
+    filler := [0x41u8; 100]
+    written := timer.now_us()
+    for _ in 0..15u32 {
+        io.write_all(&mut serial, &filler)!
+    }
+    quick := timer.now_us() - written < 100_000
+    knob := pins.analog(26)!
+    sampled := knob.read()! <= 4095
+    pins.release_analog(knob)
+    shared := sampled && serial.is_configured()
+    usb.release_serial(serial)
+    again := usb.serial()!
+    usb.release_serial(again)
+    check(owned && configured && quick && shared)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -782,6 +820,9 @@ fn main() {
         if (reason.read() & 1) != 0 && (state.read() & 0xFFFF_0000) == RUNNING {
             detail: hal.Reg<u32> = hal.Reg.at(SCRATCH + 4)
             record(state.read(), detail.read())
+            // The reset reason and scratch words outlive reflashing: forget
+            // this hang so the next run does not report it again.
+            state.write(0)
             report()
         }
     }
@@ -932,6 +973,7 @@ fn main() {
     interrupt_checks(&mut b.timer)
     executor_checks(&mut b.pins, &mut b.timer)
     pwm_adc_checks(&mut b.pins, &mut b.timer)
+    usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.

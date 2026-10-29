@@ -605,22 +605,48 @@ static mut CONSOLES: [2]usize = [0usize; 2]
 // Set once a panic report starts, so a failure while reporting halts
 // instead of reporting again.
 static mut REPORTING: bool = false
+// Another console's report, such as rp_usb's, and what the default hook
+// does after reporting instead of halting at once.
+static mut REPORTER: Option<fn(*const u8, *const u8, u32, u32)> = none
+static mut AFTER_REPORT: hal.Handler = hal.NO_HANDLER
+
+// Report panics on another console as well, through `reporter`, called
+// as report_panic is, and run `after` once the default panic hook has
+// reported, instead of halting at once; `after` should not return. The
+// chip packages register the USB serial port here while it is open.
+// SAFETY: call with interrupts masked; `reporter` and `after` must be
+// safe to call from a panic hook, with interrupts masked for good.
+pub unsafe fn set_panic_console(reporter: Option<fn(*const u8, *const u8, u32, u32)>, after: Option<fn()>) {
+    unsafe {
+        REPORTER = reporter
+        match after {
+            some(function) => {
+                AFTER_REPORT.set(function)
+            }
+            none => {
+                AFTER_REPORT.clear()
+            }
+        }
+    }
+}
 
 // The chip runtimes' default panic hook, dodo_board_panic, calls this weak
 // symbol, if a program defines it, before it halts. Every program that uses
 // std/embedded/chip defines it through this package; it writes nothing
-// until a serial port is claimed.
+// until a serial port is claimed. With a panic console's `after` (see
+// set_panic_console), it does not return.
 extern "C" fn dodo_panic_report(check: *const u8, file: *const u8, line: u32, column: u32) {
     // SAFETY: the compiler passes NUL-terminated strings, and the hook
     // halts afterwards.
     unsafe {
         report_panic(check, file, line, column)
+        AFTER_REPORT.run()
     }
 }
 
 // Write a failed check, as the compiler passes it to a firmware panic hook,
-// to every serial port claimed from a Bank and not yet released, and wait
-// until it is out:
+// to every serial port claimed from a Bank and not yet released, and to the
+// panic console of set_panic_console, and wait until it is out:
 //
 //     dodo: arithmetic overflow check failed at /home/me/blink/main.dodo:12:5
 //
@@ -639,6 +665,12 @@ pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column:
                 registers := hal.RegisterBlock.at(CONSOLES[index])
                 write_failure(&mut registers, check, file, line, column)
             }
+        }
+        match &REPORTER {
+            some(reporter) => {
+                reporter(check, file, line, column)
+            }
+            none => {}
         }
     }
 }

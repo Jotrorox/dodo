@@ -1,0 +1,1585 @@
+package rp_usb
+
+import "core/mem"
+import "core/ptr"
+import "std/embedded/chip/rp_pins"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/io"
+
+// A USB serial port (CDC-ACM) on the USB controller the RP2040 and RP2350
+// share (RP2040 datasheet 4.1, RP2350 datasheet 12.7): the board appears on
+// the host as /dev/ttyACM0 on Linux, /dev/cu.usbmodem... on macOS, or a COM
+// port on Windows, with no driver to install and no adapter. The device runs
+// at full speed (12 Mbit/s) with one serial port and no other functions.
+//
+// `Device` is the device over any hal.Registers: the controller's
+// registers and its 4 KiB of dual-port RAM (DPRAM) as `hal.RegisterBlock`s
+// on the chip, or a simulated controller and host in a desktop test. It
+// answers the host's control requests (enumeration, line coding, and the
+// DTR and RTS lines), moves data between the bulk endpoints and two queues,
+// and never waits. `serve` does all of its work and must run whenever the
+// controller raises its interrupt.
+//
+// On the chip, `open` keeps one Device in this package and serves it from
+// USBCTRL_IRQ, so a `Serial` handle prints and reads at any time, even
+// while the program busy-waits. A host that sets the line to 1200 baud, as
+// `dodo run` does, restarts the board into its bootloader. A panic is
+// reported on the port, and the default panic hook keeps the port alive
+// afterwards so that the report reaches a terminal opened later and
+// `dodo run` still works. Chip packages hand out the Serial:
+// `b.usb.serial()` on the Raspberry Pi Pico boards, or
+// `b.usb.serial_with(identity)` for a device with an `Identity` of its own.
+
+// Controller registers (RP2040 datasheet 4.1.4), from USBCTRL_REGS.
+const ADDR_ENDP: usize = 0x00
+const MAIN_CTRL: usize = 0x40
+const SOF_RD: usize = 0x48
+const SIE_CTRL: usize = 0x4C
+const SIE_STATUS: usize = 0x50
+const BUFF_STATUS: usize = 0x58
+const EP_STALL_ARM: usize = 0x68
+const USB_MUXING: usize = 0x74
+const USB_PWR: usize = 0x78
+const INTE: usize = 0x90
+const INTS: usize = 0x98
+
+// Atomic register aliases (RP2040 datasheet 2.1.2).
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// MAIN_CTRL: the controller is on, as a device. Writing the whole register
+// also clears the RP2350's PHY_ISO bit, which isolates the PHY until then.
+const CONTROLLER_ENABLE: u32 = 1 << 0
+// SIE_CTRL: connect the D+ pull-up, which tells the host a full-speed
+// device is attached, and raise BUFF_STATUS for each EP0 buffer.
+const PULLUP_ENABLE: u32 = 1 << 16
+const EP0_INTERRUPT_PER_BUFFER: u32 = 1 << 29
+// SIE_STATUS, write one to clear: suspended, resumed, a SETUP packet
+// arrived, and the host reset the bus.
+const STATUS_SUSPENDED: u32 = 1 << 4
+const STATUS_RESUME: u32 = 1 << 11
+const STATUS_SETUP: u32 = 1 << 17
+const STATUS_BUS_RESET: u32 = 1 << 19
+// USB_MUXING: the on-chip PHY, with software-controlled connection.
+const MUX_TO_PHY: u32 = 1 << 0
+const MUX_SOFTCON: u32 = 1 << 3
+// USB_PWR: report VBUS as present. The Pico boards do not wire VBUS
+// detection to the controller, and a device powered by the bus has it.
+const VBUS_DETECT: u32 = 1 << 2
+const VBUS_DETECT_OVERRIDE: u32 = 1 << 3
+// Interrupts: a buffer is done, the host reset the bus, suspended or
+// resumed it, or sent a SETUP packet.
+const INT_BUFFER: u32 = 1 << 4
+const INT_BUS_RESET: u32 = 1 << 12
+const INT_SUSPEND: u32 = 1 << 14
+const INT_RESUME: u32 = 1 << 15
+const INT_SETUP: u32 = 1 << 16
+const INTERRUPTS: u32 = INT_BUFFER | INT_BUS_RESET | INT_SUSPEND | INT_RESUME | INT_SETUP
+
+// DPRAM layout (RP2040 datasheet 4.1.2.5): the last SETUP packet, endpoint
+// control registers for endpoints 1 to 15, buffer control registers for
+// endpoints 0 to 15, then buffers. EP0's IN and OUT share one buffer.
+const SETUP_PACKET: usize = 0x00
+const EP0_BUFFER: usize = 0x100
+const NOTIFY_BUFFER: usize = 0x180
+const RX_BUFFER: usize = 0x1C0
+const TX_BUFFER: usize = 0x200
+const DPRAM_CONTROL_END: usize = 0x100
+// The rest of the DPRAM holds the device's queues, the control response
+// being sent, and the manufacturer and product strings, so that a Device
+// stays small.
+const TX_QUEUE: usize = 0x400
+const RX_QUEUE: usize = 0x800
+const CONTROL_AREA: usize = 0x900
+const MANUFACTURER_AREA: usize = 0x980
+const PRODUCT_AREA: usize = 0x9C0
+
+// Endpoint control: enabled, BUFF_STATUS raised per buffer, and the type.
+const EP_ENABLE: u32 = 1 << 31
+const EP_INTERRUPT_PER_BUFFER: u32 = 1 << 29
+const EP_TYPE_BULK: u32 = 2 << 26
+const EP_TYPE_INTERRUPT: u32 = 3 << 26
+
+// Buffer control, first buffer: full of data, the last in a transfer,
+// DATA1 rather than DATA0, stall, handed to the controller, and length.
+const BUF_FULL: u32 = 1 << 15
+const BUF_LAST: u32 = 1 << 14
+const BUF_DATA1: u32 = 1 << 13
+const BUF_STALL: u32 = 1 << 11
+const BUF_AVAILABLE: u32 = 1 << 10
+const BUF_LENGTH: u32 = 0x3FF
+
+// BUFF_STATUS and EP_STALL_ARM bits: 2n for endpoint n IN, 2n + 1 for OUT.
+const EP0_IN: u32 = 1 << 0
+const EP0_OUT: u32 = 1 << 1
+const DATA_IN: u32 = 1 << 4
+const DATA_OUT: u32 = 1 << 5
+
+// Endpoints: 1 IN carries CDC notifications (never sent), 2 OUT and 2 IN
+// the serial data.
+const NOTIFY_ENDPOINT: u32 = 1
+const DATA_ENDPOINT: u32 = 2
+pub const PACKET_SIZE: usize = 64
+
+// The device's identity on the bus: the vendor and product IDs a host
+// matches drivers and tools against, and the manufacturer and product
+// strings it shows. The IDs name the device and its firmware, not the
+// library it was built with.
+pub struct Identity {
+    pub vendor_id: u16
+    pub product_id: u16
+    // ASCII, cut at MAX_STRING_LENGTH bytes.
+    pub manufacturer: &str
+    pub product: &str
+}
+
+// The default identity's IDs, for development: Raspberry Pi's vendor ID
+// with the product ID of the Pico SDK's USB serial port (CDC UART). Hosts
+// and tools take a board using them for a Pico running Pico SDK firmware,
+// which the device behaves like, and `dodo run` finds it by them to
+// restart it into the bootloader. A product distributed with its own USB
+// identity uses a vendor ID its maker owns, or a product ID assigned to
+// it under someone else's, never another product ID under Raspberry Pi's.
+pub const DEFAULT_VENDOR_ID: u16 = 0x2E8A
+pub const DEFAULT_PRODUCT_ID: u16 = 0x000A
+pub const DEFAULT_MANUFACTURER: &str = "Dodo"
+// The longest manufacturer and product strings, in bytes of ASCII.
+pub const MAX_STRING_LENGTH: usize = 32
+
+// The default identity, with the default IDs and manufacturer, and
+// `product` as the product string.
+pub fn default_identity(product: &str) -> Identity {
+    return Identity {
+        vendor_id: DEFAULT_VENDOR_ID,
+        product_id: DEFAULT_PRODUCT_ID,
+        manufacturer: DEFAULT_MANUFACTURER,
+        product,
+    }
+}
+
+// Queue sizes. Output is kept while no terminal has the port open, up to
+// TX_CAPACITY bytes, and input until the program reads it: the host waits
+// while RX_CAPACITY - PACKET_SIZE bytes are unread.
+pub const TX_CAPACITY: usize = 1024
+pub const RX_CAPACITY: usize = 256
+
+// The baud rate that, set by the host, restarts the board into its USB
+// bootloader: the "1200 baud touch" of the Pico SDK and Arduino.
+pub const BOOTLOADER_BAUD: u32 = 1200
+
+// The control lines a terminal sets (SET_CONTROL_LINE_STATE).
+pub const DTR: u32 = 1 << 0
+pub const RTS: u32 = 1 << 1
+
+// What `serve` did, one bit each: bytes arrived, bytes left, the host
+// configured or deconfigured the device, changed DTR or RTS, suspended or
+// resumed it, and a 1200-baud line coding asks for the bootloader.
+pub const RECEIVED: u32 = 1 << 0
+pub const SENT: u32 = 1 << 1
+pub const LINE_CHANGED: u32 = 1 << 2
+pub const BOOTLOADER_REQUESTED: u32 = 1 << 3
+
+// Standard requests (USB 2.0 9.4) and CDC class requests (CDC PSTN 6.3).
+const GET_STATUS: u32 = 0
+const CLEAR_FEATURE: u32 = 1
+const SET_FEATURE: u32 = 3
+const SET_ADDRESS: u32 = 5
+const GET_DESCRIPTOR: u32 = 6
+const GET_CONFIGURATION: u32 = 8
+const SET_CONFIGURATION: u32 = 9
+const GET_INTERFACE: u32 = 10
+const SET_INTERFACE: u32 = 11
+const SET_LINE_CODING: u32 = 0x20
+const GET_LINE_CODING: u32 = 0x21
+const SET_CONTROL_LINE_STATE: u32 = 0x22
+const SEND_BREAK: u32 = 0x23
+
+// bmRequestType: device to host, and the type and recipient fields.
+const DIRECTION_IN: u32 = 0x80
+const TYPE_MASK: u32 = 0x60
+const TYPE_STANDARD: u32 = 0x00
+const TYPE_CLASS: u32 = 0x20
+const RECIPIENT_MASK: u32 = 0x1F
+const RECIPIENT_DEVICE: u32 = 0
+const RECIPIENT_INTERFACE: u32 = 1
+const RECIPIENT_ENDPOINT: u32 = 2
+
+const DESCRIPTOR_DEVICE: u32 = 1
+const DESCRIPTOR_CONFIGURATION: u32 = 2
+const DESCRIPTOR_STRING: u32 = 3
+
+// Device descriptor: USB 2.0, the CDC class, 64-byte EP0, the vendor and
+// product IDs (bytes 8 to 11, from the Identity), release 1.00,
+// manufacturer and product strings, no serial number, and one
+// configuration.
+const DEVICE_DESCRIPTOR: [18]u8 = [
+    18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
+    0, 0, 0, 0, 0x00, 0x01, 1, 2,
+    0, 1,
+]
+const VENDOR_ID_OFFSET: usize = 8
+const PRODUCT_ID_OFFSET: usize = 10
+
+// Configuration descriptor: bus-powered, 100 mA, with the CDC
+// communication interface (header, call management, ACM, and union
+// functional descriptors, and the notification endpoint) and the data
+// interface with its two bulk endpoints.
+const CONFIGURATION_DESCRIPTOR: [67]u8 = [
+    9, 2, 67, 0, 2, 1, 0, 0x80, 50,
+    9, 4, 0, 0, 1, 0x02, 0x02, 0x00, 0,
+    5, 0x24, 0x00, 0x20, 0x01,
+    5, 0x24, 0x01, 0x00, 1,
+    4, 0x24, 0x02, 0x02,
+    5, 0x24, 0x06, 0, 1,
+    7, 5, 0x81, 0x03, 8, 0, 16,
+    9, 4, 1, 0, 2, 0x0A, 0x00, 0x00, 0,
+    7, 5, 0x02, 0x02, 64, 0, 0,
+    7, 5, 0x82, 0x02, 64, 0, 0,
+]
+
+// String descriptor 0: US English.
+const LANGUAGES: [4]u8 = [4, 3, 0x09, 0x04]
+
+// Register reads after a buffer control write before AVAILABLE may be set:
+// the controller samples the other bits in clk_usb, which can run at a
+// sixth of clk_sys (RP2040 datasheet 4.1.2.5.1).
+const SETTLE_READS: u32 = 12
+
+const LINE_FEED: u8 = 0x0A
+const CARRIAGE_RETURN: u8 = 0x0D
+
+// The device over controller registers R. See the package comment.
+pub struct Device<R: hal.Registers> {
+    registers: R
+    ram: R
+    vendor_id: u16
+    product_id: u16
+    manufacturer_length: usize
+    product_length: usize
+
+    // Enumeration: the address to take once SET_ADDRESS's status stage is
+    // done, the configuration, and suspension.
+    pending_address: u32
+    address_pending: bool
+    configured: bool
+    suspended: bool
+    // The control transfer in progress: IN data still to send from
+    // CONTROL_AREA, a zero-length packet to end it, and the stage after it.
+    control_length: usize
+    control_sent: usize
+    control_zero_packet: bool
+    control_sending: bool
+    status_sending: bool
+    expecting_line_coding: bool
+    ep0_data1: bool
+    // CDC state: line coding (rate, stop bits, parity, data bits, as the
+    // host sent them) and DTR and RTS.
+    line_coding: [7]u8
+    line_state: u32
+    bootloader_reset: bool
+    bootloader_pending: bool
+    // Bulk endpoints: the next data PIDs, a packet in flight, the last one
+    // full, and a receive buffer handed to the controller.
+    tx_data1: bool
+    rx_data1: bool
+    tx_busy: bool
+    tx_in_flight: usize
+    tx_last_full: bool
+    rx_armed: bool
+    // Queues, as rings in the DPRAM.
+    tx_head: usize
+    tx_length: usize
+    rx_head: usize
+    rx_length: usize
+    // Newline translation for terminals.
+    crlf: bool
+    after_return: bool
+
+    // A stopped device on controller registers `registers` and DPRAM
+    // `ram`. Newline translation is on: see set_crlf.
+    pub fn new(registers: R, ram: R) -> Device<R> {
+        return Device<R> {
+            registers,
+            ram,
+            vendor_id: DEFAULT_VENDOR_ID,
+            product_id: DEFAULT_PRODUCT_ID,
+            manufacturer_length: 0,
+            product_length: 0,
+            pending_address: 0,
+            address_pending: false,
+            configured: false,
+            suspended: false,
+            control_length: 0,
+            control_sent: 0,
+            control_zero_packet: false,
+            control_sending: false,
+            status_sending: false,
+            expecting_line_coding: false,
+            ep0_data1: false,
+            line_coding: [0x00, 0xC2, 0x01, 0x00, 0, 0, 8],
+            line_state: 0,
+            bootloader_reset: true,
+            bootloader_pending: false,
+            tx_data1: false,
+            rx_data1: false,
+            tx_busy: false,
+            tx_in_flight: 0,
+            tx_last_full: false,
+            rx_armed: false,
+            tx_head: 0,
+            tx_length: 0,
+            rx_head: 0,
+            rx_length: 0,
+            crlf: true,
+            after_return: false,
+        }
+    }
+
+    // Power the controller up as a device with `identity` and connect to
+    // the host, which then enumerates it. The controller must be out of
+    // reset with clk_usb at 48 MHz.
+    pub fn start(&mut self, identity: Identity) {
+        // The DPRAM's control registers are undefined after reset.
+        offset := 0usize
+        for offset < DPRAM_CONTROL_END {
+            self.ram.write(offset, 0)
+            offset += 4
+        }
+        self.vendor_id = identity.vendor_id
+        self.product_id = identity.product_id
+        manufacturer_length := self.store_string(MANUFACTURER_AREA, mem.str_bytes(identity.manufacturer))
+        product_length := self.store_string(PRODUCT_AREA, mem.str_bytes(identity.product))
+        self.manufacturer_length = manufacturer_length
+        self.product_length = product_length
+        self.registers.write(USB_MUXING, MUX_TO_PHY | MUX_SOFTCON)
+        self.registers.write(USB_PWR, VBUS_DETECT | VBUS_DETECT_OVERRIDE)
+        self.registers.write(MAIN_CTRL, CONTROLLER_ENABLE)
+        self.registers.write(SIE_CTRL, EP0_INTERRUPT_PER_BUFFER)
+        self.registers.write(INTE, INTERRUPTS)
+        self.registers.write(SIE_CTRL + SET_ALIAS, PULLUP_ENABLE)
+    }
+
+    // Disconnect from the host and power the controller down. Queued
+    // output is dropped.
+    pub fn stop(&mut self) {
+        self.registers.write(SIE_CTRL + CLEAR_ALIAS, PULLUP_ENABLE)
+        self.registers.write(INTE, 0)
+        self.registers.write(MAIN_CTRL, 0)
+        self.reset_state()
+        self.tx_head = 0
+        self.tx_length = 0
+    }
+
+    // Answer the host: handle finished buffers, a SETUP packet, a bus
+    // reset, and suspension, and keep both bulk endpoints busy. Returns
+    // what happened, as RECEIVED, SENT, LINE_CHANGED, and
+    // BOOTLOADER_REQUESTED bits. Run it from the controller's interrupt,
+    // or poll it.
+    pub fn serve(&mut self) -> u32 {
+        events := 0u32
+        pending := self.registers.read(INTS)
+        if (pending & INT_BUFFER) != 0 {
+            done := self.registers.read(BUFF_STATUS)
+            self.registers.write(BUFF_STATUS, done)
+            events |= self.buffers_done(done)
+        }
+        if (pending & INT_SETUP) != 0 {
+            self.registers.write(SIE_STATUS, STATUS_SETUP)
+            events |= self.setup()
+        }
+        // The bus idles before the host first resets it, which reads as a
+        // suspension: a reset seen with it ends it.
+        if (pending & INT_SUSPEND) != 0 {
+            self.registers.write(SIE_STATUS, STATUS_SUSPENDED)
+            self.suspended = true
+            events |= LINE_CHANGED
+        }
+        if (pending & INT_RESUME) != 0 {
+            self.registers.write(SIE_STATUS, STATUS_RESUME)
+            self.suspended = false
+            events |= LINE_CHANGED
+        }
+        if (pending & INT_BUS_RESET) != 0 {
+            self.registers.write(SIE_STATUS, STATUS_BUS_RESET)
+            if self.configured || self.line_state != 0 {
+                events |= LINE_CHANGED
+            }
+            self.registers.write(ADDR_ENDP, 0)
+            self.reset_state()
+        }
+        self.start_sending()
+        self.start_receiving()
+        return events
+    }
+
+    // Queue the start of `bytes` for the host, as far as there is room,
+    // and return how many were queued. With newline translation, a "\n"
+    // goes out as "\r\n" and needs room for both.
+    pub fn queue(&mut self, bytes: &[u8]) -> usize {
+        count := 0usize
+        for count < bytes.len {
+            byte := bytes[count]
+            if self.crlf && byte == LINE_FEED {
+                if TX_CAPACITY - self.tx_length < 2 {
+                    break
+                }
+                self.push(CARRIAGE_RETURN)
+            } else if self.tx_length == TX_CAPACITY {
+                break
+            }
+            self.push(byte)
+            count += 1
+        }
+        self.start_sending()
+        return count
+    }
+
+    // Move received bytes into `buffer` and return how many. With newline
+    // translation, the CR that Enter sends, alone or followed by LF, reads
+    // as one "\n".
+    pub fn take(&mut self, buffer: &mut[u8]) -> usize {
+        count := 0usize
+        for count < buffer.len && self.rx_length > 0 {
+            position := RX_QUEUE + self.rx_head
+            byte := self.byte_at(position)
+            self.rx_head = (self.rx_head + 1) % RX_CAPACITY
+            self.rx_length -= 1
+            if self.crlf && self.after_return && byte == LINE_FEED {
+                self.after_return = false
+            } else {
+                self.after_return = self.crlf && byte == CARRIAGE_RETURN
+                if self.after_return {
+                    byte = LINE_FEED
+                }
+                buffer[count] = byte
+                count += 1
+            }
+        }
+        self.start_receiving()
+        return count
+    }
+
+    // Drop the oldest queued output until `count` bytes fit, for a message
+    // that must go out, such as a panic report.
+    pub fn make_room(&mut self, count: usize) {
+        for self.tx_length > 0 && TX_CAPACITY - self.tx_length < count {
+            self.tx_head = (self.tx_head + 1) % TX_CAPACITY
+            self.tx_length -= 1
+        }
+    }
+
+    // Write "\n" as "\r\n" and read Enter as "\n", for terminals. On at
+    // first; turn it off for binary data.
+    pub fn set_crlf(&mut self, on: bool) {
+        self.crlf = on
+        self.after_return = false
+    }
+
+    // Whether a 1200-baud line coding restarts the board into its
+    // bootloader; on at first.
+    pub fn set_bootloader_reset(&mut self, on: bool) {
+        self.bootloader_reset = on
+    }
+
+    // The host has configured the device: it is enumerated, and the port
+    // exists on the host.
+    pub fn is_configured(&self) -> bool {
+        return self.configured && !self.suspended
+    }
+
+    // A program on the host has the port open: configured, with DTR set,
+    // as terminals do while open.
+    pub fn is_connected(&self) -> bool {
+        return self.is_configured() && (self.line_state & DTR) != 0
+    }
+
+    // DTR and RTS as the host last set them.
+    pub fn line_state(&self) -> u32 {
+        return self.line_state
+    }
+
+    // The baud rate the host last set. It changes nothing on USB, but tells
+    // a bridge to another serial port what to use.
+    pub fn baud(&self) -> u32 {
+        return self.line_coding[0] as u32 | (self.line_coding[1] as u32 << 8) | (self.line_coding[2] as u32 << 16) | (self.line_coding[3] as u32 << 24)
+    }
+
+    // Bytes queued for the host and not yet taken by it.
+    pub fn unsent(&self) -> usize {
+        return self.tx_length + self.tx_in_flight
+    }
+
+    // Room for output, in bytes.
+    pub fn room(&self) -> usize {
+        return TX_CAPACITY - self.tx_length
+    }
+
+    // Received bytes not yet taken.
+    pub fn available(&self) -> usize {
+        return self.rx_length
+    }
+
+    // The frame number of the host's last start-of-frame, 0 to 2047,
+    // counting milliseconds while the bus runs.
+    pub fn frame(&mut self) -> u32 {
+        return self.registers.read(SOF_RD) & 0x7FF
+    }
+
+    // Give back the register blocks, after `stop`.
+    pub fn release(self) -> (R, R) {
+        let Device { registers, ram, vendor_id, product_id, manufacturer_length, product_length, pending_address, address_pending, configured, suspended, control_length, control_sent, control_zero_packet, control_sending, status_sending, expecting_line_coding, ep0_data1, line_coding, line_state, bootloader_reset, bootloader_pending, tx_data1, rx_data1, tx_busy, tx_in_flight, tx_last_full, rx_armed, tx_head, tx_length, rx_head, rx_length, crlf, after_return } = self
+        return (registers, ram)
+    }
+
+    fn push(&mut self, byte: u8) {
+        position := TX_QUEUE + (self.tx_head + self.tx_length) % TX_CAPACITY
+        self.set_byte(position, byte)
+        self.tx_length += 1
+    }
+
+    // Byte `offset` of the DPRAM, which takes only 32-bit accesses.
+    fn byte_at(&mut self, offset: usize) -> u8 {
+        word := self.ram.read(offset & ~3usize)
+        return ((word >> (8 * (offset & 3) as u32)) & 0xFF) as u8
+    }
+
+    fn set_byte(&mut self, offset: usize, byte: u8) {
+        aligned := offset & ~3usize
+        shift := 8 * (offset & 3) as u32
+        word := self.ram.read(aligned)
+        self.ram.write(aligned, (word & ~(0xFFu32 << shift)) | ((byte as u32) << shift))
+    }
+
+    fn set_control(&mut self, index: usize, byte: u8) {
+        self.set_byte(CONTROL_AREA + index, byte)
+    }
+
+    // Forget the host's state, after a bus reset or before stopping. Input
+    // already received stays.
+    fn reset_state(&mut self) {
+        self.address_pending = false
+        self.configured = false
+        self.suspended = false
+        self.control_sending = false
+        self.status_sending = false
+        self.expecting_line_coding = false
+        self.line_state = 0
+        self.bootloader_pending = false
+        self.disable_data_endpoints()
+    }
+
+    fn disable_data_endpoints(&mut self) {
+        self.ram.write(endpoint_control(NOTIFY_ENDPOINT, true), 0)
+        self.ram.write(endpoint_control(DATA_ENDPOINT, true), 0)
+        self.ram.write(endpoint_control(DATA_ENDPOINT, false), 0)
+        self.ram.write(buffer_control(DATA_ENDPOINT, true), 0)
+        self.ram.write(buffer_control(DATA_ENDPOINT, false), 0)
+        self.tx_busy = false
+        self.tx_in_flight = 0
+        self.tx_last_full = false
+        self.rx_armed = false
+        self.tx_data1 = false
+        self.rx_data1 = false
+    }
+
+    fn enable_data_endpoints(&mut self) {
+        self.disable_data_endpoints()
+        self.ram.write(endpoint_control(NOTIFY_ENDPOINT, true), EP_ENABLE | EP_TYPE_INTERRUPT | NOTIFY_BUFFER as u32)
+        self.ram.write(endpoint_control(DATA_ENDPOINT, false), EP_ENABLE | EP_INTERRUPT_PER_BUFFER | EP_TYPE_BULK | RX_BUFFER as u32)
+        self.ram.write(endpoint_control(DATA_ENDPOINT, true), EP_ENABLE | EP_INTERRUPT_PER_BUFFER | EP_TYPE_BULK | TX_BUFFER as u32)
+    }
+
+    fn buffers_done(&mut self, done: u32) -> u32 {
+        events := 0u32
+        if (done & EP0_IN) != 0 {
+            events |= self.control_in_done()
+        }
+        if (done & EP0_OUT) != 0 {
+            self.control_out_done()
+        }
+        if (done & DATA_IN) != 0 && self.tx_busy {
+            self.tx_busy = false
+            self.tx_in_flight = 0
+            events |= SENT
+        }
+        if (done & DATA_OUT) != 0 && self.rx_armed {
+            self.rx_armed = false
+            length := (self.ram.read(buffer_control(DATA_ENDPOINT, false)) & BUF_LENGTH) as usize
+            if length > PACKET_SIZE {
+                length = PACKET_SIZE
+            }
+            index := 0usize
+            for index < length {
+                word := self.ram.read(RX_BUFFER + index)
+                for lane in 0..4usize {
+                    if index + lane < length {
+                        position := RX_QUEUE + (self.rx_head + self.rx_length) % RX_CAPACITY
+                        self.set_byte(position, ((word >> (8 * lane as u32)) & 0xFF) as u8)
+                        self.rx_length += 1
+                    }
+                }
+                index += 4
+            }
+            if length > 0 {
+                events |= RECEIVED
+            }
+        }
+        return events
+    }
+
+    // Send the next packet of queued output if the IN endpoint is free:
+    // up to PACKET_SIZE bytes, or a zero-length packet after a full one
+    // that emptied the queue, so the host's read ends.
+    fn start_sending(&mut self) {
+        if !self.configured || self.tx_busy {
+            return
+        }
+        length := self.tx_length
+        if length > PACKET_SIZE {
+            length = PACKET_SIZE
+        }
+        if length == 0 && !self.tx_last_full {
+            return
+        }
+        index := 0usize
+        for index < length {
+            word := 0u32
+            for lane in 0..4usize {
+                if index + lane < length {
+                    position := TX_QUEUE + (self.tx_head + index + lane) % TX_CAPACITY
+                    byte := self.byte_at(position) as u32
+                    word |= byte << (8 * lane as u32)
+                }
+            }
+            self.ram.write(TX_BUFFER + index, word)
+            index += 4
+        }
+        self.tx_head = (self.tx_head + length) % TX_CAPACITY
+        self.tx_length -= length
+        self.tx_in_flight = length
+        self.tx_last_full = length == PACKET_SIZE
+        self.tx_busy = true
+        data1 := self.tx_data1
+        self.tx_data1 = !data1
+        self.arm(buffer_control(DATA_ENDPOINT, true), BUF_FULL | BUF_LAST | length as u32, data1)
+    }
+
+    // Hand the OUT endpoint a buffer while a whole packet fits in the
+    // receive queue; otherwise the host waits until the program reads.
+    fn start_receiving(&mut self) {
+        if !self.configured || self.rx_armed || RX_CAPACITY - self.rx_length < PACKET_SIZE {
+            return
+        }
+        self.rx_armed = true
+        data1 := self.rx_data1
+        self.rx_data1 = !data1
+        self.arm(buffer_control(DATA_ENDPOINT, false), BUF_LAST | PACKET_SIZE as u32, data1)
+    }
+
+    // Write buffer control `offset`, then hand the buffer to the
+    // controller once it has seen the other bits.
+    fn arm(&mut self, offset: usize, value: u32, data1: bool) {
+        control := value
+        if data1 {
+            control |= BUF_DATA1
+        }
+        self.ram.write(offset, control)
+        for _ in 0..SETTLE_READS {
+            self.ram.read(offset)
+        }
+        self.ram.write(offset, control | BUF_AVAILABLE)
+    }
+
+    // A SETUP packet arrived: start the control transfer it asks for.
+    fn setup(&mut self) -> u32 {
+        first := self.ram.read(SETUP_PACKET)
+        second := self.ram.read(SETUP_PACKET + 4)
+        request_type := first & 0xFF
+        request := (first >> 8) & 0xFF
+        value := first >> 16
+        index := second & 0xFFFF
+        length := (second >> 16) as usize
+        // A host that sends requests is not suspending the bus, and a SETUP
+        // packet ends the transfer before it.
+        self.suspended = false
+        self.ram.write(buffer_control(0, true), 0)
+        self.ram.write(buffer_control(0, false), 0)
+        self.control_sending = false
+        self.status_sending = false
+        self.expecting_line_coding = false
+        self.address_pending = false
+        self.bootloader_pending = false
+        kind := request_type & TYPE_MASK
+        recipient := request_type & RECIPIENT_MASK
+        incoming := (request_type & DIRECTION_IN) != 0
+        if kind == TYPE_STANDARD {
+            return self.standard_request(request, value, index, length, incoming, recipient)
+        }
+        if kind == TYPE_CLASS && recipient == RECIPIENT_INTERFACE {
+            return self.class_request(request, value, length, incoming)
+        }
+        self.stall()
+        return 0
+    }
+
+    fn standard_request(&mut self, request: u32, value: u32, index: u32, length: usize, incoming: bool, recipient: u32) -> u32 {
+        if incoming {
+            if request == GET_STATUS {
+                self.set_control(0, 0)
+                self.set_control(1, 0)
+                self.reply(2, length)
+            } else if request == GET_DESCRIPTOR && recipient == RECIPIENT_DEVICE {
+                self.send_descriptor(value >> 8, value & 0xFF, length)
+            } else if request == GET_CONFIGURATION {
+                configuration := 0u8
+                if self.configured {
+                    configuration = 1
+                }
+                self.set_control(0, configuration)
+                self.reply(1, length)
+            } else if request == GET_INTERFACE && recipient == RECIPIENT_INTERFACE && index < 2 {
+                self.set_control(0, 0)
+                self.reply(1, length)
+            } else {
+                self.stall()
+            }
+            return 0
+        }
+        if request == SET_ADDRESS && recipient == RECIPIENT_DEVICE {
+            // The new address applies once the status stage is done.
+            self.pending_address = value & 0x7F
+            self.acknowledge()
+            self.address_pending = true
+            return 0
+        }
+        if request == SET_CONFIGURATION && recipient == RECIPIENT_DEVICE && value <= 1 {
+            changed := self.configured != (value == 1)
+            if value == 1 {
+                self.enable_data_endpoints()
+                self.configured = true
+            } else {
+                self.disable_data_endpoints()
+                self.configured = false
+                self.line_state = 0
+            }
+            self.acknowledge()
+            if changed {
+                return LINE_CHANGED
+            }
+            return 0
+        }
+        if request == SET_INTERFACE && recipient == RECIPIENT_INTERFACE && value == 0 && index < 2 {
+            self.acknowledge()
+            return 0
+        }
+        if (request == CLEAR_FEATURE || request == SET_FEATURE) && recipient != RECIPIENT_INTERFACE {
+            // Remote wakeup and endpoint halt: nothing to change. Clearing
+            // a halt restarts the endpoint's data toggle.
+            if request == CLEAR_FEATURE && recipient == RECIPIENT_ENDPOINT && value == 0 {
+                endpoint := index & 0x0F
+                if endpoint == DATA_ENDPOINT && (index & 0x80) != 0 && !self.tx_busy {
+                    self.tx_data1 = false
+                } else if endpoint == DATA_ENDPOINT && (index & 0x80) == 0 && !self.rx_armed {
+                    self.rx_data1 = false
+                }
+            }
+            self.acknowledge()
+            return 0
+        }
+        self.stall()
+        return 0
+    }
+
+    fn class_request(&mut self, request: u32, value: u32, length: usize, incoming: bool) -> u32 {
+        if incoming && request == GET_LINE_CODING {
+            for index in 0..7usize {
+                byte := self.line_coding[index]
+                self.set_control(index, byte)
+            }
+            self.reply(7, length)
+            return 0
+        }
+        if !incoming && request == SET_LINE_CODING && length == 7 {
+            self.expecting_line_coding = true
+            self.arm(buffer_control(0, false), PACKET_SIZE as u32, true)
+            return 0
+        }
+        if !incoming && request == SET_CONTROL_LINE_STATE {
+            previous := self.line_state
+            self.line_state = value & (DTR | RTS)
+            self.acknowledge()
+            if previous != self.line_state {
+                return LINE_CHANGED
+            }
+            return 0
+        }
+        if !incoming && request == SEND_BREAK {
+            self.acknowledge()
+            return 0
+        }
+        self.stall()
+        return 0
+    }
+
+    fn send_descriptor(&mut self, kind: u32, index: u32, length: usize) {
+        if kind == DESCRIPTOR_DEVICE {
+            for position in 0..18usize {
+                self.set_control(position, DEVICE_DESCRIPTOR[position])
+            }
+            vendor_id := self.vendor_id
+            product_id := self.product_id
+            self.set_control(VENDOR_ID_OFFSET, (vendor_id & 0xFF) as u8)
+            self.set_control(VENDOR_ID_OFFSET + 1, (vendor_id >> 8) as u8)
+            self.set_control(PRODUCT_ID_OFFSET, (product_id & 0xFF) as u8)
+            self.set_control(PRODUCT_ID_OFFSET + 1, (product_id >> 8) as u8)
+            self.reply(18, length)
+        } else if kind == DESCRIPTOR_CONFIGURATION && index == 0 {
+            for position in 0..67usize {
+                self.set_control(position, CONFIGURATION_DESCRIPTOR[position])
+            }
+            self.reply(67, length)
+        } else if kind == DESCRIPTOR_STRING && index == 0 {
+            for position in 0..4usize {
+                self.set_control(position, LANGUAGES[position])
+            }
+            self.reply(4, length)
+        } else if kind == DESCRIPTOR_STRING && index == 1 {
+            used := self.manufacturer_length
+            self.send_stored_string(MANUFACTURER_AREA, used, length)
+        } else if kind == DESCRIPTOR_STRING && index == 2 {
+            used := self.product_length
+            self.send_stored_string(PRODUCT_AREA, used, length)
+        } else {
+            // Among others the device qualifier, which a full-speed-only
+            // device must refuse.
+            self.stall()
+        }
+    }
+
+    // Copy ASCII `text`, cut at MAX_STRING_LENGTH bytes, to the DPRAM at
+    // `area`, and return the length kept.
+    fn store_string(&mut self, area: usize, text: &[u8]) -> usize {
+        kept := 0usize
+        for kept < text.len && kept < MAX_STRING_LENGTH {
+            self.set_byte(area + kept, text[kept])
+            kept += 1
+        }
+        return kept
+    }
+
+    // The string descriptor of the `used` bytes stored at `area`.
+    fn send_stored_string(&mut self, area: usize, used: usize, length: usize) {
+        text := [0u8; MAX_STRING_LENGTH]
+        for position in 0..used {
+            text[position] = self.byte_at(area + position)
+        }
+        self.send_string(&text[..used], length)
+    }
+
+    // A string descriptor: ASCII `text` as UTF-16LE.
+    fn send_string(&mut self, text: &[u8], length: usize) {
+        size := 2 + 2 * text.len
+        self.set_control(0, size as u8)
+        self.set_control(1, DESCRIPTOR_STRING as u8)
+        for position in 0..text.len {
+            self.set_control(2 + 2 * position, text[position])
+            self.set_control(3 + 2 * position, 0)
+        }
+        self.reply(size, length)
+    }
+
+    // Send the first `size` bytes of CONTROL_AREA as the data stage, cut to
+    // the `requested` length the host asked for.
+    fn reply(&mut self, size: usize, requested: usize) {
+        length := size
+        if length > requested {
+            length = requested
+        }
+        self.control_length = length
+        self.control_sent = 0
+        // A response shorter than requested that ends with a full packet
+        // needs a zero-length packet to end it.
+        self.control_zero_packet = length < requested && length % PACKET_SIZE == 0
+        self.control_sending = true
+        self.ep0_data1 = true
+        self.send_control_packet()
+    }
+
+    fn send_control_packet(&mut self) {
+        length := self.control_length - self.control_sent
+        if length > PACKET_SIZE {
+            length = PACKET_SIZE
+        }
+        index := 0usize
+        for index < length {
+            word := 0u32
+            for lane in 0..4usize {
+                if index + lane < length {
+                    position := CONTROL_AREA + self.control_sent + index + lane
+                    byte := self.byte_at(position) as u32
+                    word |= byte << (8 * lane as u32)
+                }
+            }
+            self.ram.write(EP0_BUFFER + index, word)
+            index += 4
+        }
+        self.control_sent += length
+        if length == 0 {
+            self.control_zero_packet = false
+        }
+        data1 := self.ep0_data1
+        self.ep0_data1 = !data1
+        self.arm(buffer_control(0, true), BUF_FULL | length as u32, data1)
+    }
+
+    // The status stage of a request without IN data: a zero-length DATA1
+    // packet to the host.
+    fn acknowledge(&mut self) {
+        self.status_sending = true
+        self.arm(buffer_control(0, true), BUF_FULL, true)
+    }
+
+    // Refuse the request: both directions of EP0 stall until the next
+    // SETUP packet, which clears EP_STALL_ARM.
+    fn stall(&mut self) {
+        self.registers.write(EP_STALL_ARM, EP0_IN | EP0_OUT)
+        self.ram.write(buffer_control(0, true), BUF_STALL)
+        self.ram.write(buffer_control(0, false), BUF_STALL)
+    }
+
+    fn control_in_done(&mut self) -> u32 {
+        if self.control_sending {
+            if self.control_sent < self.control_length || self.control_zero_packet {
+                self.send_control_packet()
+            } else {
+                // The host ends the transfer with a zero-length OUT packet.
+                self.control_sending = false
+                self.arm(buffer_control(0, false), PACKET_SIZE as u32, true)
+            }
+            return 0
+        }
+        if self.status_sending {
+            self.status_sending = false
+            if self.address_pending {
+                self.address_pending = false
+                self.registers.write(ADDR_ENDP, self.pending_address)
+            }
+            if self.bootloader_pending {
+                self.bootloader_pending = false
+                return BOOTLOADER_REQUESTED
+            }
+        }
+        return 0
+    }
+
+    fn control_out_done(&mut self) {
+        if !self.expecting_line_coding {
+            // The status stage of an IN transfer.
+            return
+        }
+        self.expecting_line_coding = false
+        length := (self.ram.read(buffer_control(0, false)) & BUF_LENGTH) as usize
+        if length >= 7 {
+            first := self.ram.read(EP0_BUFFER)
+            second := self.ram.read(EP0_BUFFER + 4)
+            for lane in 0..4usize {
+                self.line_coding[lane] = ((first >> (8 * lane as u32)) & 0xFF) as u8
+            }
+            for lane in 0..3usize {
+                self.line_coding[4 + lane] = ((second >> (8 * lane as u32)) & 0xFF) as u8
+            }
+            if self.bootloader_reset && self.baud() == BOOTLOADER_BAUD {
+                self.bootloader_pending = true
+            }
+        }
+        self.acknowledge()
+    }
+}
+
+// The endpoint control register of endpoint 1 to 15, in the DPRAM.
+fn endpoint_control(endpoint: u32, incoming: bool) -> usize {
+    offset := 8 * (endpoint as usize - 1)
+    if incoming {
+        return offset + 0x08
+    }
+    return offset + 0x0C
+}
+
+// The buffer control register of endpoint 0 to 15, in the DPRAM.
+fn buffer_control(endpoint: u32, incoming: bool) -> usize {
+    offset := 0x80 + 8 * endpoint as usize
+    if incoming {
+        return offset
+    }
+    return offset + 4
+}
+
+// --- The port on the chip ---------------------------------------------
+
+// Frames (milliseconds) a write waits for the host to take output from a
+// full queue before it drops the rest, and status polls as a bound when
+// frames stop.
+pub const WRITE_TIMEOUT_FRAMES: u32 = 100
+const MAX_IDLE_POLLS: u32 = 2_000_000
+// Frames a panic report waits for the host to take it, and the room it
+// makes for itself by dropping older output.
+const PANIC_TIMEOUT_FRAMES: u32 = 250
+const PANIC_ROOM: usize = 512
+
+// The one device on the chip, served from USBCTRL_IRQ.
+static mut DEVICE: Option<Device<hal.RegisterBlock>> = none
+// What the interrupt runs: `serve_interrupt` while a port is open.
+static mut INTERRUPT: hal.Handler = hal.NO_HANDLER
+// The chip's restart into the bootloader, and the signal raised for the
+// program's tasks.
+static mut BOOTLOADER: hal.Handler = hal.NO_HANDLER
+static mut WAKE: Option<executor.Signal> = none
+static mut IDLING: bool = false
+
+// The chip runtimes' default USBCTRL_IRQ handler calls this weak symbol,
+// if a program defines it. Every program that uses std/embedded/chip
+// defines it through this package; it does nothing until a port is open.
+// A program's own `@interrupt(USBCTRL_IRQ)` replaces the default handler,
+// and with it the port.
+extern "C" fn dodo_usb_interrupt() {
+    // SAFETY: an interrupt handler is not interrupted by the code that
+    // changes the slot, which masks interrupts to do so.
+    unsafe {
+        INTERRUPT.run()
+    }
+}
+
+fn serve_interrupt() {
+    // SAFETY: the handler runs with the program suspended, and nothing of
+    // higher priority uses the device.
+    unsafe {
+        serve_device()
+    }
+}
+
+// Serve the device and act on what happened: raise the program's signal,
+// and restart into the bootloader when the host asks.
+// SAFETY: the caller must exclude the interrupt handler, as a handler or
+// within a critical section.
+unsafe fn serve_device() {
+    unsafe {
+        events := 0u32
+        match &mut DEVICE {
+            some(device) => {
+                events = device.serve()
+            }
+            none => {}
+        }
+        if events == 0 {
+            return
+        }
+        match &WAKE {
+            some(signal) => {
+                signal.raise()
+            }
+            none => {}
+        }
+        if (events & BOOTLOADER_REQUESTED) != 0 {
+            BOOTLOADER.run()
+        }
+    }
+}
+
+// Start the device on the controller at `registers` with its DPRAM at
+// `ram`, announcing itself with `identity`, and return its port. Writes queue
+// at once; the host enumerates the device within a second of connection,
+// after which a terminal can open it. `bootloader` restarts the chip into
+// its USB bootloader. The caller enables USBCTRL_IRQ in the NVIC.
+// SAFETY: the controller must be out of reset with clk_usb at 48 MHz, no
+// port may be open, and nothing else may use the controller.
+pub unsafe fn open(registers: usize, ram: usize, identity: Identity, bootloader: fn()) -> Serial {
+    device := unsafe {
+        Device.new(hal.RegisterBlock.at(registers), hal.RegisterBlock.at(ram))
+    }
+    device.start(identity)
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked, so the handler is not running.
+    unsafe {
+        DEVICE = some(device)
+        BOOTLOADER.set(bootloader)
+        WAKE = none
+        INTERRUPT.set(serve_interrupt)
+        rp_pins.set_panic_console(some(panic_report), some(panic_idle))
+    }
+    core.drop(section)
+    return Serial { open: true }
+}
+
+// Disconnect and stop the device of `serial`. The caller disables
+// USBCTRL_IRQ and holds the controller in reset afterwards.
+pub fn close(serial: Serial) {
+    section := hal.Critical.enter()
+    // SAFETY: interrupts are masked, so the handler is not running.
+    unsafe {
+        INTERRUPT.clear()
+        BOOTLOADER.clear()
+        rp_pins.set_panic_console(none, none)
+        WAKE = none
+        match &mut DEVICE {
+            some(device) => {
+                device.stop()
+            }
+            none => {}
+        }
+        DEVICE = none
+    }
+    core.drop(section)
+    let Serial { open } = serial
+}
+
+// Queue a panic report, as rp_pins.report_panic writes it, and wait until
+// the host has taken it, the port is closed, or PANIC_TIMEOUT_FRAMES pass.
+// Older output makes room if needed. Does nothing without an open port.
+// SAFETY: `check` and `file` must be NUL-terminated, and interrupts must be
+// masked for good: the caller halts or resets afterwards.
+pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    unsafe {
+        // Put the report together first: the device stays borrowed while
+        // it is queued.
+        report := Report { text: [0u8; PANIC_ROOM], length: 0 }
+        report.add(b"\r\ndodo: ")
+        report.add_text(check)
+        report.add(b" check failed at ")
+        report.add_text(file)
+        report.add(b":")
+        report.add_number(line)
+        report.add(b":")
+        report.add_number(column)
+        report.add(b"\r\n")
+        match &mut DEVICE {
+            some(device) => {
+                device.set_crlf(false)
+                device.make_room(report.length)
+                device.queue(&report.text[..report.length])
+            }
+            none => {
+                return
+            }
+        }
+        frames := 0u32
+        polls := 0u32
+        last := 0u32
+        for {
+            serve_device()
+            done := true
+            frame := 0u32
+            match &mut DEVICE {
+                some(device) => {
+                    done = device.unsent() == 0 || !device.is_connected()
+                    frame = device.frame()
+                }
+                none => {}
+            }
+            if done {
+                return
+            }
+            polls += 1
+            if frame != last {
+                last = frame
+                frames += 1
+            }
+            if frames > PANIC_TIMEOUT_FRAMES || polls > MAX_IDLE_POLLS {
+                return
+            }
+        }
+    }
+}
+
+// Keep serving an open port forever with interrupts masked, after a panic:
+// a terminal opened later still receives the report, and a host can still
+// restart the board into its bootloader. Returns at once without a port.
+// SAFETY: interrupts must be masked for good, as in a panic hook.
+pub unsafe fn idle_after_panic() {
+    unsafe {
+        if IDLING {
+            return
+        }
+        IDLING = true
+        match &DEVICE {
+            some(_) => {}
+            none => {
+                return
+            }
+        }
+        for {
+            serve_device()
+        }
+    }
+}
+
+// report_panic and idle_after_panic as rp_pins' panic console, which
+// calls them only from the panic hook.
+fn panic_report(check: *const u8, file: *const u8, line: u32, column: u32) {
+    // SAFETY: the panic hook passes NUL-terminated strings, with
+    // interrupts masked for good.
+    unsafe {
+        report_panic(check, file, line, column)
+    }
+}
+
+fn panic_idle() {
+    // SAFETY: as in panic_report.
+    unsafe {
+        idle_after_panic()
+    }
+}
+
+// A panic report, cut at PANIC_ROOM bytes.
+struct Report {
+    text: [PANIC_ROOM]u8
+    length: usize
+
+    fn add(&mut self, bytes: &[u8]) {
+        for index in 0..bytes.len {
+            if self.length == PANIC_ROOM {
+                return
+            }
+            self.text[self.length] = bytes[index]
+            self.length += 1
+        }
+    }
+
+    // Add a NUL-terminated string, up to its first 1024 bytes.
+    // SAFETY: `text` must be NUL-terminated.
+    unsafe fn add_text(&mut self, text: *const u8) {
+        for index in 0..1024isize {
+            byte := unsafe {
+                ptr.read(ptr.offset(text, index))
+            }
+            if byte == 0 || self.length == PANIC_ROOM {
+                return
+            }
+            self.text[self.length] = byte
+            self.length += 1
+        }
+    }
+
+    fn add_number(&mut self, value: u32) {
+        digits: [10]u8 = [0; 10]
+        position := 10usize
+        rest := value
+        for {
+            position -= 1
+            digits[position] = (48 + rest % 10) as u8
+            rest = rest / 10
+            if rest == 0 {
+                break
+            }
+        }
+        self.add(&digits[position..])
+    }
+}
+
+// The USB serial port, as chip packages hand it out. Implements the std/io
+// Reader and Writer protocols, so std/fmt prints to it. Every method is
+// safe to call at any time; the interrupt handler serves the host in
+// between.
+pub struct Serial: io.ReadWriter {
+    open: bool
+
+    // Queue `bytes` for the host and return once they are queued. While no
+    // terminal has the port open, output is kept up to TX_CAPACITY bytes,
+    // for the terminal to receive when it opens it, and the rest is dropped.
+    // While one has it open, a full queue waits for the host, and output
+    // the host does not take within WRITE_TIMEOUT_FRAMES ms is dropped,
+    // so printing never stops the program. Never fails.
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        written := 0usize
+        idle_frames := 0u32
+        polls := 0u32
+        last_frame := 0u32
+        for written < bytes.len {
+            queued := 0usize
+            connected := false
+            frame := 0u32
+            section := hal.Critical.enter()
+            // SAFETY: interrupts are masked, so the handler is not running.
+            unsafe {
+                serve_device()
+                match &mut DEVICE {
+                    some(device) => {
+                        queued = device.queue(&bytes[written..])
+                        connected = device.is_connected()
+                        frame = device.frame()
+                    }
+                    none => {}
+                }
+            }
+            core.drop(section)
+            written += queued
+            if written == bytes.len || !connected {
+                break
+            }
+            if queued > 0 {
+                idle_frames = 0
+                polls = 0
+            } else {
+                polls += 1
+                if frame != last_frame {
+                    last_frame = frame
+                    idle_frames += 1
+                }
+                if idle_frames > WRITE_TIMEOUT_FRAMES || polls > MAX_IDLE_POLLS {
+                    break
+                }
+            }
+        }
+        return ok(bytes.len)
+    }
+
+    // Queue what fits without waiting; Pending, with what was queued, once
+    // the queue is full.
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        queued := 0usize
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            match &mut DEVICE {
+                some(device) => {
+                    queued = device.queue(bytes)
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+        state := io.PollState.Ready
+        if queued < bytes.len {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: queued, state })
+    }
+
+    // Wait until the host has taken everything written, while a terminal
+    // has the port open and the host keeps taking output; as write, it
+    // gives up after WRITE_TIMEOUT_FRAMES ms without progress. Never fails.
+    pub fn flush(&mut self) -> void!io.Error {
+        idle_frames := 0u32
+        polls := 0u32
+        last_frame := 0u32
+        last_unsent := 0usize
+        for {
+            unsent := 0usize
+            connected := false
+            frame := 0u32
+            section := hal.Critical.enter()
+            // SAFETY: as in write.
+            unsafe {
+                serve_device()
+                match &mut DEVICE {
+                    some(device) => {
+                        unsent = device.unsent()
+                        connected = device.is_connected()
+                        frame = device.frame()
+                    }
+                    none => {}
+                }
+            }
+            core.drop(section)
+            if unsent == 0 || !connected {
+                return ok()
+            }
+            if unsent != last_unsent {
+                last_unsent = unsent
+                idle_frames = 0
+                polls = 0
+            } else {
+                polls += 1
+                if frame != last_frame {
+                    last_frame = frame
+                    idle_frames += 1
+                }
+                if idle_frames > WRITE_TIMEOUT_FRAMES || polls > MAX_IDLE_POLLS {
+                    return ok()
+                }
+            }
+        }
+    }
+
+    // Wait for the first byte, then return what has arrived, up to
+    // `buffer.len`. A USB serial port never reaches end of input.
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        if buffer.len == 0 {
+            return ok(0)
+        }
+        for {
+            count := self.take(buffer)
+            if count > 0 {
+                return ok(count)
+            }
+        }
+    }
+
+    // Return what has arrived without waiting; Pending while nothing has.
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        count := self.take(buffer)
+        state := io.PollState.Ready
+        if count == 0 && buffer.len != 0 {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // Whether a program on the host has the port open (DTR set), so that
+    // what is written now is read now.
+    pub fn is_connected(&self) -> bool {
+        result := false
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            match &DEVICE {
+                some(device) => {
+                    result = device.is_connected()
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+        return result
+    }
+
+    // Whether the host has enumerated and configured the device.
+    pub fn is_configured(&self) -> bool {
+        result := false
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            match &DEVICE {
+                some(device) => {
+                    result = device.is_configured()
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+        return result
+    }
+
+    // DTR and RTS, as the host last set them.
+    pub fn line_state(&self) -> u32 {
+        result := 0u32
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            match &DEVICE {
+                some(device) => {
+                    result = device.line_state()
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+        return result
+    }
+
+    // The baud rate the host last set; 115200 until it sets one.
+    pub fn baud(&self) -> u32 {
+        result := 0u32
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            match &DEVICE {
+                some(device) => {
+                    result = device.baud()
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+        return result
+    }
+
+    // Received bytes waiting to be read.
+    pub fn available(&self) -> usize {
+        result := 0usize
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            match &DEVICE {
+                some(device) => {
+                    result = device.available()
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+        return result
+    }
+
+    // Write "\n" as "\r\n" and read Enter as "\n", for terminals. On at
+    // first; turn it off for binary data.
+    pub fn set_crlf(&mut self, on: bool) {
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            match &mut DEVICE {
+                some(device) => {
+                    device.set_crlf(on)
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+    }
+
+    // Whether the host setting 1200 baud restarts the board into its
+    // bootloader, as `dodo run` does; on at first.
+    pub fn set_bootloader_reset(&mut self, on: bool) {
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            match &mut DEVICE {
+                some(device) => {
+                    device.set_bootloader_reset(on)
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+    }
+
+    // Raise `signal` from the interrupt whenever something happens on the
+    // port: bytes arrive, output leaves, or the host connects, opens,
+    // closes, or suspends it. A task that takes the signal and then reads
+    // with `poll_read` is woken by input; see std/embedded/executor.
+    pub fn set_signal(&mut self, signal: &executor.Signal) {
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            WAKE = some(executor.Signal { id: signal.id })
+        }
+        core.drop(section)
+    }
+
+    // Stop raising the signal.
+    pub fn clear_signal(&mut self) {
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            WAKE = none
+        }
+        core.drop(section)
+    }
+
+    fn take(&mut self, buffer: &mut[u8]) -> usize {
+        count := 0usize
+        section := hal.Critical.enter()
+        // SAFETY: as in write.
+        unsafe {
+            serve_device()
+            match &mut DEVICE {
+                some(device) => {
+                    count = device.take(buffer)
+                }
+                none => {}
+            }
+        }
+        core.drop(section)
+        return count
+    }
+}

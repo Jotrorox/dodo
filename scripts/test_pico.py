@@ -84,6 +84,7 @@ LAST_CHECKS = [
     "PWM pins, frequencies, and outputs are validated and owned once",
     "PWM output reads back low, high, 50% duty, and inverted on its pad",
     "ADC inputs and temperature sensor are owned once and read plausibly",
+    "USB serial port enumerates within 2 s, never blocks writes, and shares PLL_USB with the ADC",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",
