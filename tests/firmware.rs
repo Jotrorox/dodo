@@ -330,6 +330,8 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
             "dodo_panic_report",
             "USBCTRL_IRQ",
             "dodo_usb_interrupt",
+            "DMA_IRQ_0",
+            "dodo_dma_interrupt",
             "memcpy",
             "memset",
         ] {
@@ -674,9 +676,15 @@ fn the_default_panic_hook_reports_on_serial_ports() {
 /// The first literal of the runtime's USBCTRL_IRQ stub, which it calls if
 /// nonzero: dodo_usb_interrupt's address or 0.
 fn usb_interrupt_literal(elf: &Path, family: u32) -> u32 {
+    stub_literal(elf, family, "USBCTRL_IRQ")
+}
+
+/// The first literal of a runtime stub that tail-calls a weak handler,
+/// such as USBCTRL_IRQ's or DMA_IRQ_0's: the handler's address or 0.
+fn stub_literal(elf: &Path, family: u32, symbol: &str) -> u32 {
     let bytes = fs::read(elf).unwrap();
     let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), family);
-    let stub = (elf_symbol(&bytes, "USBCTRL_IRQ").expect("USB handler") & !1) as usize;
+    let stub = (elf_symbol(&bytes, symbol).expect("runtime stub") & !1) as usize;
     // ldr, cmp, bne, ldr, bx: five halfwords, then the aligned words.
     let at = (stub - 0x1000_0000 + 10 + 3) & !3;
     word(&image, at)
@@ -744,6 +752,73 @@ fn the_usb_serial_port_is_served_from_the_default_usb_interrupt() {
         let elf = scratch.path(&format!("bare-{chip}.elf"));
         build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
         assert_eq!(usb_interrupt_literal(Path::new(&elf), family), 0, "{chip}");
+    }
+}
+
+#[test]
+fn dma_signals_are_raised_from_the_default_dma_interrupt() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("dma");
+    let example = root().join("examples/dma.dodo");
+    // DMA_IRQ_0's vector: IRQ 11 on the RP2040, 10 on the RP2350.
+    let boards = [
+        ("pico", 0xE48B_FF56, 11),
+        ("pico2", 0xE48B_FF59, 10),
+        ("pico2_w", 0xE48B_FF59, 10),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("dma-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let bytes = fs::read(&elf).unwrap();
+            let serve = elf_symbol(&bytes, "dodo_dma_interrupt").expect("the handler is linked");
+            assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
+            assert_eq!(stub_literal(Path::new(&elf), family, "DMA_IRQ_0"), serve);
+            let image = flash_image(
+                &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+                family,
+            );
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                elf_symbol(&bytes, "DMA_IRQ_0").unwrap() | 1,
+                "{board} -O{level}: the vector is the runtime's handler"
+            );
+        }
+    }
+    // A program's own handler replaces the runtime's and the default one.
+    let own = scratch.write(
+        "own.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic mut COUNT: u32 = 0\n@interrupt(DMA_IRQ_0)\nfn dma() {\n unsafe {\n  COUNT += 1\n }\n}\nfn main() {\n b := board.take()!\n b.led.toggle()\n}\n",
+    );
+    for board in ["pico", "pico2"] {
+        let elf = scratch.path(&format!("own-{board}.elf"));
+        build(&["build", own.to_str().unwrap(), "--board", board, "-o", &elf]);
+        let bytes = fs::read(&elf).unwrap();
+        assert_eq!(elf_symbol(&bytes, "dodo_dma_interrupt"), None, "{board}");
+        assert!(elf_symbol(&bytes, "DMA_IRQ_0").is_some(), "{board}");
+    }
+    // Without std/embedded/chip the stub falls through to DefaultHandler.
+    let bare = scratch.write("bare.dodo", "package main\nfn main() {}\n");
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(
+            stub_literal(Path::new(&elf), family, "DMA_IRQ_0"),
+            0,
+            "{chip}"
+        );
     }
 }
 

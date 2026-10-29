@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- DMA on the RP2040 and RP2350: `b.dma.channel()` claims one of the chip's
+  12 or 16 channels, `claim(n)` a given one, and `release(channel)` gives it
+  back. `channel.copy` copies buffers, and `channel.set_signal(&SIGNAL)`
+  wakes executor tasks when a transfer ends, from a default `DMA_IRQ_0`
+  handler in the chip runtimes. The driver, `std/embedded/chip/rp_dma`,
+  finds each peripheral's data request from the register a transfer reads or
+  writes, and the panic report aborts every claimed channel first.
+- `std/embedded/hal` gains `DmaChannel`, the protocol through which
+  peripheral drivers start DMA transfers (`DmaTransfer`, `DmaWidth`,
+  `DmaPace`, `DmaRing`), and `address_of` for a buffer's address.
+- SPI by DMA: `bus.dma(&mut tx, &mut rx, &mut buffer)` returns a
+  `pl022.DmaBus` whose `start_transfer` and `start_write` return at once and
+  run without gaps between frames while the program or other tasks work.
+  The session lends its buffer out only between transfers, so the borrow
+  checker keeps the program off memory the channels are moving, and
+  dropping it aborts a running transfer.
+- Serial ports by DMA: `port.dma(&mut rx, &mut ring, &mut tx, &mut output)`
+  returns a `pl011.DmaPort`, a `std/io` Reader and Writer that receives into
+  a ring buffer of up to 32 KiB, so input is no longer limited to the
+  32-byte FIFO between reads, and writes in the background.
+- Queued I2C transactions: `start_write`, `start_read`, and
+  `start_write_read` put a transaction of up to 16 commands into the
+  controller's FIFO and return; `poll_finish` collects it without waiting,
+  `listen` raises the controller's interrupt when it ends, and `cancel`
+  aborts it.
+- `examples/dma.dodo` runs a DMA serial console that polls ten times a
+  second next to a task streaming SPI frames by DMA. The board self-tests
+  check DMA copies, SPI and UART loopback by DMA, and queued I2C reads, and
+  record up to 128 checks.
+
 - The RP2040 and RP2350 boards are USB serial ports on their own USB
   connector: `b.usb.serial()` returns a CDC-ACM port with the `std/io` Reader
   and Writer protocols, so `fmt.printf` prints over the USB cable with no

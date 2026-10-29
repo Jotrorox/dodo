@@ -17,6 +17,7 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
+| DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, and a simulated clock that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
@@ -946,7 +947,8 @@ share a driver with a task. The same pattern serves a serial port: listen for
 `pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT`, and let the task drain the
 port with `poll_read` before it enables `chip.UART0_IRQ` again. Read the port
 at least every 2.8 ms while bytes arrive at 115200 baud, as its FIFO holds
-32 bytes. The repository's
+32 bytes, or give it a [DMA ring](#serial-ports-by-dma), which holds as
+much as its size and lets the task poll at its own pace. The repository's
 [`examples/tasks`](https://github.com/Jotrorox/dodo/blob/main/examples/tasks/main.dodo)
 runs a blinking LED, a debounced button, and such a serial console together.
 
@@ -956,6 +958,8 @@ runs a blinking LED, a debounced button, and such a serial console together.
 | Serial port | `port.listen(sources)` | Reading drains the receive sources; `clear_interrupts` the errors. |
 | Timer alarm | `alarm.listen()` | `alarm.clear()`. An alarm used as the executor's clock is busy. |
 | USB serial port | `serial.set_signal(&SIGNAL)`: the port's own interrupt handler raises it | Nothing to acknowledge: read with `poll_read` until it is Pending. |
+| DMA channel | `channel.set_signal(&SIGNAL)`: the runtime's `DMA_IRQ_0` handler raises it when a transfer ends | Nothing to acknowledge: check the transfer, for example with `is_busy()`. |
+| Queued I2C transaction | `bus.listen()`: the transaction's STOP or abort raises `I2C0_IRQ` or `I2C1_IRQ` | `bus.poll_finish(&mut buffer)` collects it, which ends the condition. |
 
 Several pins share `IO_IRQ_BANK0`, so give them one signal and let each
 task check its own pin's `events()`: raising wakes every waiting task.
@@ -1036,8 +1040,12 @@ while nothing has been fed.
   fields, and do each step without waiting.
 - A task owns its peripherals. Tasks that share a bus are one task, or one
   task owns the bus and the others send it requests with signals.
-- I2C and SPI transfers still wait for the bus inside `poll`; they are short
-  at usual speeds.
+- The blocking bus methods (`write`, `read`, `transfer`) wait for the bus
+  inside `poll`; they are short at usual speeds. For long transfers, or to
+  keep other tasks running, use [SPI by DMA](#spi-transfers-by-dma), a
+  [serial port by DMA](#serial-ports-by-dma), and
+  [queued I2C transactions](#transactions-that-run-in-the-background), which
+  return at once and finish while the task waits.
 - On a desktop, where a critical section excludes nothing, use the executor
   and its signals from one thread.
 
@@ -1112,6 +1120,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
 | `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`; `alarm(n)` claims an alarm, which can also run the [executor](#tasks-and-the-executor). |
+| `b.dma` | The [DMA channels](#dma-on-the-rp2040-and-rp2350): `channel()` claims one, `release(channel)` gives it back. Buses and serial ports take them for transfers that run while the program does other work. |
 | `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
 | `board.report_panic(check, file, line, column)` | Unsafe. Write a failed check to the serial ports and the USB serial port, as the [default panic hook](#panics-on-the-serial-port) does; for panic hooks of your own. |
@@ -1219,6 +1228,36 @@ low after an interrupted transfer, which makes every transaction `Timeout`:
 release the bus, claim SCL as an output and SDA as an input, pulse SCL
 until SDA reads high (at most nine times), release both pins, and claim the
 bus again.
+
+#### Transactions that run in the background
+
+The blocking methods return when the transaction is over. A transaction that
+fits the controller's FIFO, 16 commands on both chips (`queue_depth()`, one
+per byte written and one per byte read), can instead be queued at once: the
+controller runs it while the program does other work, and `poll_finish`
+collects the outcome without waiting:
+
+```dodo
+register: [1]u8 = [0x0F]
+i2c.start_write_read(0x48, &register, 2)!
+reply: [2]u8 = [0, 0]
+for !i2c.poll_finish(&mut reply)! {
+    // other work
+}
+```
+
+`start_write(address, bytes)`, `start_read(address, count)`, and
+`start_write_read(address, bytes, count)` queue the three kinds of
+transaction. `poll_finish(&mut buffer)` returns false while the controller
+works, and true once the transaction has ended, with the bytes read in the
+buffer; its errors are those of the blocking methods. Until then the bus is
+`is_busy()`, and every other transaction on it is `Busy`. A task waits for
+the end with the controller's interrupt: `listen()` raises `I2C0_IRQ` or
+`I2C1_IRQ` at the STOP or an abort, and a handler masks it and raises a
+signal, as in [waking tasks from interrupts](#waking-tasks-from-interrupts).
+A transaction never ends while a device holds SCL low: bound the wait with
+an `executor.Timer` and `cancel()` it, which aborts it and disables the
+controller as a stuck blocking transfer does.
 
 #### Answering another master
 
@@ -1588,6 +1627,154 @@ releasing the last with `pins.release_analog(input)` stops both. The sensor
 is accurate to a few degrees and depends on the reference voltage; on the
 Pico and Pico 2, GP29 reads a third of the supply voltage VSYS.
 
+### DMA on the RP2040 and RP2350
+
+Both chips have a DMA controller, 12 channels on the RP2040 and 16 on the
+RP2350, that moves data between memory and peripherals while the processor
+does other work. `b.dma` hands the channels out, each once:
+
+```dodo
+b := board.take()!
+channel := b.dma.channel()!
+source: [256]u8 = [7; 256]
+copy: [256]u8 = [0; 256]
+channel.copy(&mut copy, &source)!
+b.dma.release(channel)
+```
+
+| `b.dma` | Purpose |
+| --- | --- |
+| `channel()` | Claim the free channel with the lowest number; `Busy` if all are taken. |
+| `claim(number)` | Claim a given channel, for a program that also drives channels through registers of its own; `Busy` if taken, `InvalidInput` beyond the chip's channels. |
+| `release(channel)` | Abort its transfer, stop its signal, and take it back. |
+| `channels()`, `is_claimed(number)` | The number of channels; whether one is claimed. |
+
+A channel, an `rp_dma.Channel`, does little by itself: `copy(destination,
+source)` copies a buffer and waits, a word at a time when both are
+word-aligned, at about a word per clock cycle. Its main use is to be lent to
+a bus or a serial port, which starts transfers on it and paces them by the
+peripheral's data requests, so a FIFO never overflows or runs dry:
+
+| Peripheral | DMA session | What runs in the background |
+| --- | --- | --- |
+| SPI bus | `bus.dma(&mut tx, &mut rx, &mut buffer)`, a `pl022.DmaBus` | Transfers to and from a buffer, without gaps between frames at any clock rate. |
+| Serial port | `port.dma(&mut rx, &mut ring, &mut tx, &mut output)`, a `pl011.DmaPort` | Reception into a ring buffer of up to 32 KiB, and writes. |
+
+A session borrows the peripheral, its channels, and its buffers until it is
+dropped, which stops its transfers and gives them back: the borrow checker
+then keeps the program away from memory a channel is moving, and from the
+peripheral. A task keeps the session in a field.
+
+`channel.set_signal(&SIGNAL)` raises an [executor signal](#waking-tasks-from-interrupts)
+each time a transfer on the channel ends, from the chip runtime's default
+`DMA_IRQ_0` handler, so a task returns Pending until then instead of waiting
+for the bus. `clear_signal()` stops it. A program's own
+`@interrupt(DMA_IRQ_0)` replaces the default handler, and the signals with
+it; `listen()`, `finished()`, and `clear()` serve such a handler, and
+`DMA_IRQ_1` is left free. If the program panics, the panic report aborts
+every claimed channel before it writes to the serial ports.
+
+#### SPI transfers by DMA
+
+`bus.dma(&mut tx, &mut rx, &mut buffer)` returns a `pl022.DmaBus` that
+sends from and receives into `buffer`, `tx` feeding the transmit FIFO and
+`rx` emptying the receive FIFO:
+
+```dodo
+spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 8_000_000)!
+tx := b.dma.channel()!
+rx := b.dma.channel()!
+buffer: [512]u8 = [0; 512]
+flash := spi.dma(&mut tx, &mut rx, &mut buffer)!
+command := flash.buffer()!
+command[0] = 0x03
+flash.start_transfer(512)!
+// ... other work ...
+flash.finish()!
+data := flash.buffer()!
+```
+
+| `pl022.DmaBus` | Purpose |
+| --- | --- |
+| `buffer()` | The buffer, to fill before a transfer or read after one; `Busy` from a start until `finish`. |
+| `start_transfer(count)` | Send `buffer[..count]` and replace each byte with the one received at the same time; returns at once. |
+| `start_write(count)` | Send `buffer[..count]` and discard what arrives; the buffer stays as it is. |
+| `is_busy()` | True until the last byte has been received, which is when `rx`'s signal is raised. |
+| `finish()` | Wait for the running transfer, if any, and end it: `Overrun` if replies were lost, `Bus` on a bus error. |
+| `transfer(count)`, `write(count)` | Start and finish, for code that waits anyway but wants no gaps between frames. |
+| `capacity()` | The buffer's length, the most one transfer moves. |
+
+Drive a chip select around the transfer with an output pin, as with the
+polled bus: low before `start_transfer`, high after `finish`. Dropping the
+session aborts a running transfer, so the device sees only part of it; the
+bus then works as before. Frames above 8 bits are `Unsupported`.
+
+#### Serial ports by DMA
+
+`port.dma(&mut rx, &mut ring, &mut tx, &mut output)` returns a
+`pl011.DmaPort`, a serial port with the `std/io` Reader and Writer
+protocols, like `pl011.Port`, but with two differences:
+
+- `rx` moves every byte that arrives into `ring`, round and round, so input
+  waits there and not just in the 32-byte FIFO: a 1 KiB ring holds 89 ms at
+  115200 baud. Bytes not read when the ring comes round again are lost, and
+  the next read reports `OVERRUN`.
+- A write copies its bytes into `output` and returns once `tx` is sending
+  them; it waits only while the previous write is still in `output`. Larger
+  writes go out in `output`-sized chunks.
+
+```dodo
+port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+port.set_crlf(true)
+rx := b.dma.channel()!
+tx := b.dma.channel()!
+ring: [1024]u8 = [0; 1024]
+output: [128]u8 = [0; 128]
+serial := port.dma(&mut rx, &mut ring, &mut tx, &mut output)!
+fmt.printf(&mut serial, "ready\n")!
+```
+
+The ring is the largest block of `ring` whose size is a power of two and
+whose address is a multiple of its size, as the controller needs to wrap
+around it: `ring_size()` tells. Any buffer of 2N bytes holds an N-byte ring;
+a static with `@align(N)` holds one of all its N bytes. Below 32 bytes is
+`InvalidInput`. `available()` counts the bytes waiting, and `read`,
+`poll_read`, `write`, `poll_write`, `flush`, `set_crlf`, the poll limits,
+and the interrupt methods work as on `pl011.Port`. Bytes with framing or
+parity errors, and breaks, arrive in the ring like the rest; a read reports
+the error after the bytes it returns, without telling which byte it was.
+Dropping the session stops both channels: input still in the ring is lost
+and output not yet sent is cut short.
+
+A task polls the port on a ticker, at whatever pace the ring allows, or
+listens for `pl011.RX_TIMEOUT_INTERRUPT` to hear when a message has ended.
+The repository's
+[`examples/dma.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/dma.dodo)
+runs such a console next to a task that streams SPI frames by DMA.
+
+#### DMA in drivers
+
+The peripheral drivers start their transfers through `hal.DmaChannel`, so
+they name no chip, and their desktop tests run them against test channels
+that move real memory. A transfer is a `hal.DmaTransfer`: a source and a
+destination address, a count of elements of `hal.DmaWidth.Byte`,
+`HalfWord`, or `Word`, which addresses increment, what paces it
+(`hal.DmaPace.Unpaced`, or the `Destination` or `Source` peripheral), and an
+optional `hal.DmaRing`. `start` is unsafe, as the channel then writes memory
+behind the borrow checker's back; `is_busy`, `remaining`, `max_count`,
+`abort`, and `take_error` are safe. A driver keeps its buffers borrowed until
+the transfer is done or aborted, and aborts it when dropped, as the DMA
+sessions above do. `hal.address_of(bytes)` gives a buffer's address.
+
+An `rp_dma.Channel` finds the data request (DREQ) from the peripheral
+register a transfer reads or writes: the UARTs' and SPI controllers' data
+registers, the I2C controllers' `DATA_CMD`, the ADC's FIFO, and the PIO
+state machines' FIFOs; `rp_dma.request(chip, address, transmit)` looks one
+up. `start_request(transfer, dreq)` paces by any other request, or by
+`rp_dma.TIMER0` to `TIMER3`. The driver, `std/embedded/chip/rp_dma`, is a
+`Driver` over any `hal.Registers`, tested against a model of both chips'
+controllers.
+
 ### The Raspberry Pi Pico 2 W
 
 The Pico 2 W is a Pico 2 with an Infineon CYW43439 Wi-Fi and Bluetooth chip.
@@ -1692,18 +1879,16 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  the timer, and a USB serial port; PIO, DMA, and other USB devices (HID,
+  the timer, DMA, and a USB serial port; PIO and other USB devices (HID,
   mass storage, several functions at once) or USB host mode are not bundled
   yet. Write them with `hal.Reg` as above.
 - PWM outputs only generate; the slices' input modes, which count or time a
   pin's pulses, and the PWM wrap interrupt are not exposed. ADC reads are
   polled one at a time, without the round-robin sampler, FIFO, or DMA.
-- I2C and SPI transfers are polled, without interrupts or DMA. Serial ports
-  are polled too unless a program serves their interrupts, as in
-  [an interrupt-driven driver](#an-interrupt-driven-driver) or a
-  [task woken by them](#waking-tasks-from-interrupts); without that a
-  port keeps no more input than its 32-byte FIFO unless the other end honours
-  RTS. An I2C master is the bus's only master, without high-speed
+- A serial port keeps no more input than its 32-byte FIFO unless it
+  receives [by DMA](#serial-ports-by-dma), a program serves its interrupts,
+  as in [an interrupt-driven driver](#an-interrupt-driven-driver), or the
+  other end honours RTS. An I2C master is the bus's only master, without high-speed
   mode, which the chips' controllers lack, and cannot send empty transfers.
   The Pico 2 W's wireless chip drives only its LED and senses USB power;
   Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
@@ -1721,7 +1906,12 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - Inline assembly lives inside functions; there is no global or naked
   assembly, so startup code and vector tables come from the chip runtime or a
   `@section`-placed static.
-- Timers and DMA have no shared protocol yet. Expose them as methods on your
-  chip's types.
+- Timers have no shared protocol yet. Expose them as methods on your chip's
+  types.
+- SPI by DMA moves frames of up to 8 bits; wider frames use the word
+  methods, which are polled. A queued I2C transaction fits the controller's
+  FIFO, 16 commands on both chips; longer transfers use the blocking
+  methods. The ADC is not read by DMA yet, and channel signals come only
+  from `DMA_IRQ_0`.
 
 For raw register and pointer contracts, see [memory and foreign calls](memory-and-ffi.md).
