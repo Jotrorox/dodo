@@ -1,5 +1,6 @@
 package main
 
+import "core/mem"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_usb"
 
@@ -37,7 +38,7 @@ const BUF_AVAILABLE: u32 = 1 << 10
 const BUF_LENGTH: u32 = 0x3FF
 const EP_ENABLE: u32 = 1 << 31
 
-const PRODUCT: &[u8] = b"Test Board"
+const PRODUCT: &str = "Test Board"
 const NOTHING: &[u8] = b""
 
 // The controller's registers and its 4 KiB of DPRAM, by word.
@@ -157,9 +158,13 @@ fn reset_model() {
 }
 
 fn new_device() -> rp_usb.Device<UsbView> {
+    return device_with(rp_usb.default_identity(PRODUCT))
+}
+
+fn device_with(identity: rp_usb.Identity) -> rp_usb.Device<UsbView> {
     reset_model()
     device := rp_usb.Device.new(UsbView { ram: false }, UsbView { ram: true })
-    device.start(PRODUCT)
+    device.start(identity)
     return device
 }
 
@@ -373,8 +378,8 @@ fn enumeration() {
     core.assert_eq(descriptor.data[1], 1u8)
     core.assert_eq(descriptor.data[4], 0x02u8)
     core.assert_eq(descriptor.data[7], 64u8)
-    core.assert_eq(descriptor.data[8] as u16 | (descriptor.data[9] as u16 << 8), rp_usb.VENDOR_ID)
-    core.assert_eq(descriptor.data[10] as u16 | (descriptor.data[11] as u16 << 8), rp_usb.PRODUCT_ID)
+    core.assert_eq(descriptor.data[8] as u16 | (descriptor.data[9] as u16 << 8), rp_usb.DEFAULT_VENDOR_ID)
+    core.assert_eq(descriptor.data[10] as u16 | (descriptor.data[11] as u16 << 8), rp_usb.DEFAULT_PRODUCT_ID)
     core.assert_eq(descriptor.data[17], 1u8)
 
     // The address applies after the status stage, not before.
@@ -420,15 +425,9 @@ fn enumeration() {
     core.assert_eq(languages.data[2], 0x09u8)
     core.assert_eq(languages.data[3], 0x04u8)
     product := control_read(&mut device, 0x80, 6, 0x0302, 0x0409, 255)
-    core.assert_eq(product.length, 2 + 2 * PRODUCT.len)
-    core.assert_eq(product.data[1], 3u8)
-    for index in 0..PRODUCT.len {
-        core.assert_eq(product.data[2 + 2 * index], PRODUCT[index])
-        core.assert_eq(product.data[3 + 2 * index], 0u8)
-    }
+    expect_string(&product, mem.str_bytes(PRODUCT))
     manufacturer := control_read(&mut device, 0x80, 6, 0x0301, 0x0409, 255)
-    core.assert_eq(manufacturer.length, 10usize)
-    core.assert_eq(manufacturer.data[2], 0x44u8)
+    expect_string(&manufacturer, b"Dodo")
     // A short read of a string.
     cut := control_read(&mut device, 0x80, 6, 0x0302, 0x0409, 2)
     core.assert_eq(cut.length, 2usize)
@@ -457,6 +456,39 @@ fn enumeration() {
     expect_stall(&mut device, 0x01, 11, 1, 1, 0)
     // The receive endpoint waits for data at once.
     core.assert(host_out(2, b"x", false) == Reply.Ack)
+    expect_rules_kept()
+}
+
+// A string descriptor holding ASCII `text`.
+fn expect_string(descriptor: &Response, text: &[u8]) {
+    core.assert_eq(descriptor.length, 2 + 2 * text.len)
+    core.assert_eq(descriptor.data[0] as usize, 2 + 2 * text.len)
+    core.assert_eq(descriptor.data[1], 3u8)
+    for index in 0..text.len {
+        core.assert_eq(descriptor.data[2 + 2 * index], text[index])
+        core.assert_eq(descriptor.data[3 + 2 * index], 0u8)
+    }
+}
+
+// A device started with an identity of its own reports its IDs and
+// strings, and cuts strings at MAX_STRING_LENGTH bytes.
+fn custom_identity() {
+    device := device_with(rp_usb.Identity {
+        vendor_id: 0x1209,
+        product_id: 0xC0DE,
+        manufacturer: "Example Maker",
+        product: "A product name longer than thirty-two bytes",
+    })
+    set_status(BUS_RESET)
+    device.serve()
+    descriptor := control_read(&mut device, 0x80, 6, 0x0100, 0, 18)
+    core.assert_eq(descriptor.length, 18usize)
+    core.assert_eq(descriptor.data[8] as u16 | (descriptor.data[9] as u16 << 8), 0x1209u16)
+    core.assert_eq(descriptor.data[10] as u16 | (descriptor.data[11] as u16 << 8), 0xC0DEu16)
+    manufacturer := control_read(&mut device, 0x80, 6, 0x0301, 0x0409, 255)
+    expect_string(&manufacturer, b"Example Maker")
+    product := control_read(&mut device, 0x80, 6, 0x0302, 0x0409, 255)
+    expect_string(&product, b"A product name longer than thirt")
     expect_rules_kept()
 }
 
@@ -710,6 +742,7 @@ fn receiving() {
 fn main() {
     controller_setup()
     enumeration()
+    custom_identity()
     line_control()
     sending()
     output_before_configuration()

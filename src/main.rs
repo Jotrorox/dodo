@@ -708,7 +708,7 @@ fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Resul
         [drive] => drive,
         [] => {
             return Err(format!(
-                "no {} bootloader drive is mounted; hold BOOTSEL while connecting the {} over USB, then run again (firmware that opens its USB serial port, `b.usb.serial()`, lets `dodo run` restart it without BOOTSEL)",
+                "no {} bootloader drive is mounted; hold BOOTSEL while connecting the {} over USB, then run again (firmware that opens its USB serial port with the default identity, `b.usb.serial()`, lets `dodo run` restart it without BOOTSEL)",
                 platform.bootloader_drive_name(),
                 platform.description()
             ));

@@ -1,5 +1,6 @@
 package rp_usb
 
+import "core/mem"
 import "core/ptr"
 import "std/embedded/chip/rp_pins"
 import "std/embedded/executor"
@@ -27,7 +28,8 @@ import "std/io"
 // reported on the port, and the default panic hook keeps the port alive
 // afterwards so that the report reaches a terminal opened later and
 // `dodo run` still works. Chip packages hand out the Serial:
-// `b.usb.serial()` on the Raspberry Pi Pico boards.
+// `b.usb.serial()` on the Raspberry Pi Pico boards, or
+// `b.usb.serial_with(identity)` for a device with an `Identity` of its own.
 
 // Controller registers (RP2040 datasheet 4.1.4), from USBCTRL_REGS.
 const ADDR_ENDP: usize = 0x00
@@ -85,11 +87,13 @@ const RX_BUFFER: usize = 0x1C0
 const TX_BUFFER: usize = 0x200
 const DPRAM_CONTROL_END: usize = 0x100
 // The rest of the DPRAM holds the device's queues, the control response
-// being sent, and the product string, so that a Device stays small.
+// being sent, and the manufacturer and product strings, so that a Device
+// stays small.
 const TX_QUEUE: usize = 0x400
 const RX_QUEUE: usize = 0x800
 const CONTROL_AREA: usize = 0x900
-const PRODUCT_AREA: usize = 0x980
+const MANUFACTURER_AREA: usize = 0x980
+const PRODUCT_AREA: usize = 0x9C0
 
 // Endpoint control: enabled, BUFF_STATUS raised per buffer, and the type.
 const EP_ENABLE: u32 = 1 << 31
@@ -118,13 +122,41 @@ const NOTIFY_ENDPOINT: u32 = 1
 const DATA_ENDPOINT: u32 = 2
 pub const PACKET_SIZE: usize = 64
 
-// The device's identity. Raspberry Pi's vendor ID with the product ID of
-// the Pico SDK's USB serial port, so hosts treat the board like other
-// Picos and `dodo run` restarts either kind into the bootloader.
-pub const VENDOR_ID: u16 = 0x2E8A
-pub const PRODUCT_ID: u16 = 0x000A
-// The product string's longest length, in bytes of ASCII.
-pub const MAX_PRODUCT_LENGTH: usize = 32
+// The device's identity on the bus: the vendor and product IDs a host
+// matches drivers and tools against, and the manufacturer and product
+// strings it shows. The IDs name the device and its firmware, not the
+// library it was built with.
+pub struct Identity {
+    pub vendor_id: u16
+    pub product_id: u16
+    // ASCII, cut at MAX_STRING_LENGTH bytes.
+    pub manufacturer: &str
+    pub product: &str
+}
+
+// The default identity's IDs, for development: Raspberry Pi's vendor ID
+// with the product ID of the Pico SDK's USB serial port (CDC UART). Hosts
+// and tools take a board using them for a Pico running Pico SDK firmware,
+// which the device behaves like, and `dodo run` finds it by them to
+// restart it into the bootloader. A product distributed with its own USB
+// identity uses a vendor ID its maker owns, or a product ID assigned to
+// it under someone else's, never another product ID under Raspberry Pi's.
+pub const DEFAULT_VENDOR_ID: u16 = 0x2E8A
+pub const DEFAULT_PRODUCT_ID: u16 = 0x000A
+pub const DEFAULT_MANUFACTURER: &str = "Dodo"
+// The longest manufacturer and product strings, in bytes of ASCII.
+pub const MAX_STRING_LENGTH: usize = 32
+
+// The default identity, with the default IDs and manufacturer, and
+// `product` as the product string.
+pub fn default_identity(product: &str) -> Identity {
+    return Identity {
+        vendor_id: DEFAULT_VENDOR_ID,
+        product_id: DEFAULT_PRODUCT_ID,
+        manufacturer: DEFAULT_MANUFACTURER,
+        product,
+    }
+}
 
 // Queue sizes. Output is kept while no terminal has the port open, up to
 // TX_CAPACITY bytes, and input until the program reads it: the host waits
@@ -177,15 +209,17 @@ const DESCRIPTOR_DEVICE: u32 = 1
 const DESCRIPTOR_CONFIGURATION: u32 = 2
 const DESCRIPTOR_STRING: u32 = 3
 
-// Device descriptor: USB 2.0, the CDC class, 64-byte EP0, the IDs above,
-// release 1.00, manufacturer and product strings, no serial number, and
-// one configuration.
+// Device descriptor: USB 2.0, the CDC class, 64-byte EP0, the vendor and
+// product IDs (bytes 8 to 11, from the Identity), release 1.00,
+// manufacturer and product strings, no serial number, and one
+// configuration.
 const DEVICE_DESCRIPTOR: [18]u8 = [
     18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
-    (VENDOR_ID & 0xFF) as u8, (VENDOR_ID >> 8) as u8,
-    (PRODUCT_ID & 0xFF) as u8, (PRODUCT_ID >> 8) as u8, 0x00, 0x01, 1, 2,
+    0, 0, 0, 0, 0x00, 0x01, 1, 2,
     0, 1,
 ]
+const VENDOR_ID_OFFSET: usize = 8
+const PRODUCT_ID_OFFSET: usize = 10
 
 // Configuration descriptor: bus-powered, 100 mA, with the CDC
 // communication interface (header, call management, ACM, and union
@@ -206,7 +240,6 @@ const CONFIGURATION_DESCRIPTOR: [67]u8 = [
 
 // String descriptor 0: US English.
 const LANGUAGES: [4]u8 = [4, 3, 0x09, 0x04]
-const MANUFACTURER: &[u8] = b"Dodo"
 
 // Register reads after a buffer control write before AVAILABLE may be set:
 // the controller samples the other bits in clk_usb, which can run at a
@@ -220,6 +253,9 @@ const CARRIAGE_RETURN: u8 = 0x0D
 pub struct Device<R: hal.Registers> {
     registers: R
     ram: R
+    vendor_id: u16
+    product_id: u16
+    manufacturer_length: usize
     product_length: usize
 
     // Enumeration: the address to take once SET_ADDRESS's status stage is
@@ -266,6 +302,9 @@ pub struct Device<R: hal.Registers> {
         return Device<R> {
             registers,
             ram,
+            vendor_id: DEFAULT_VENDOR_ID,
+            product_id: DEFAULT_PRODUCT_ID,
+            manufacturer_length: 0,
             product_length: 0,
             pending_address: 0,
             address_pending: false,
@@ -297,25 +336,22 @@ pub struct Device<R: hal.Registers> {
         }
     }
 
-    // Power the controller up as a device with product string `product`,
-    // ASCII, cut at MAX_PRODUCT_LENGTH bytes, and connect to the host,
-    // which then enumerates it. The controller must be out of reset with
-    // clk_usb at 48 MHz.
-    pub fn start(&mut self, product: &[u8]) {
+    // Power the controller up as a device with `identity` and connect to
+    // the host, which then enumerates it. The controller must be out of
+    // reset with clk_usb at 48 MHz.
+    pub fn start(&mut self, identity: Identity) {
         // The DPRAM's control registers are undefined after reset.
         offset := 0usize
         for offset < DPRAM_CONTROL_END {
             self.ram.write(offset, 0)
             offset += 4
         }
-        self.product_length = 0
-        for index in 0..product.len {
-            if index == MAX_PRODUCT_LENGTH {
-                break
-            }
-            self.set_byte(PRODUCT_AREA + index, product[index])
-            self.product_length += 1
-        }
+        self.vendor_id = identity.vendor_id
+        self.product_id = identity.product_id
+        manufacturer_length := self.store_string(MANUFACTURER_AREA, mem.str_bytes(identity.manufacturer))
+        product_length := self.store_string(PRODUCT_AREA, mem.str_bytes(identity.product))
+        self.manufacturer_length = manufacturer_length
+        self.product_length = product_length
         self.registers.write(USB_MUXING, MUX_TO_PHY | MUX_SOFTCON)
         self.registers.write(USB_PWR, VBUS_DETECT | VBUS_DETECT_OVERRIDE)
         self.registers.write(MAIN_CTRL, CONTROLLER_ENABLE)
@@ -492,7 +528,7 @@ pub struct Device<R: hal.Registers> {
 
     // Give back the register blocks, after `stop`.
     pub fn release(self) -> (R, R) {
-        let Device { registers, ram, product_length, pending_address, address_pending, configured, suspended, control_length, control_sent, control_zero_packet, control_sending, status_sending, expecting_line_coding, ep0_data1, line_coding, line_state, bootloader_reset, bootloader_pending, tx_data1, rx_data1, tx_busy, tx_in_flight, tx_last_full, rx_armed, tx_head, tx_length, rx_head, rx_length, crlf, after_return } = self
+        let Device { registers, ram, vendor_id, product_id, manufacturer_length, product_length, pending_address, address_pending, configured, suspended, control_length, control_sent, control_zero_packet, control_sending, status_sending, expecting_line_coding, ep0_data1, line_coding, line_state, bootloader_reset, bootloader_pending, tx_data1, rx_data1, tx_busy, tx_in_flight, tx_last_full, rx_armed, tx_head, tx_length, rx_head, rx_length, crlf, after_return } = self
         return (registers, ram)
     }
 
@@ -791,6 +827,12 @@ pub struct Device<R: hal.Registers> {
             for position in 0..18usize {
                 self.set_control(position, DEVICE_DESCRIPTOR[position])
             }
+            vendor_id := self.vendor_id
+            product_id := self.product_id
+            self.set_control(VENDOR_ID_OFFSET, (vendor_id & 0xFF) as u8)
+            self.set_control(VENDOR_ID_OFFSET + 1, (vendor_id >> 8) as u8)
+            self.set_control(PRODUCT_ID_OFFSET, (product_id & 0xFF) as u8)
+            self.set_control(PRODUCT_ID_OFFSET + 1, (product_id >> 8) as u8)
             self.reply(18, length)
         } else if kind == DESCRIPTOR_CONFIGURATION && index == 0 {
             for position in 0..67usize {
@@ -803,19 +845,36 @@ pub struct Device<R: hal.Registers> {
             }
             self.reply(4, length)
         } else if kind == DESCRIPTOR_STRING && index == 1 {
-            self.send_string(MANUFACTURER, length)
+            used := self.manufacturer_length
+            self.send_stored_string(MANUFACTURER_AREA, used, length)
         } else if kind == DESCRIPTOR_STRING && index == 2 {
-            text := [0u8; MAX_PRODUCT_LENGTH]
             used := self.product_length
-            for position in 0..used {
-                text[position] = self.byte_at(PRODUCT_AREA + position)
-            }
-            self.send_string(&text[..used], length)
+            self.send_stored_string(PRODUCT_AREA, used, length)
         } else {
             // Among others the device qualifier, which a full-speed-only
             // device must refuse.
             self.stall()
         }
+    }
+
+    // Copy ASCII `text`, cut at MAX_STRING_LENGTH bytes, to the DPRAM at
+    // `area`, and return the length kept.
+    fn store_string(&mut self, area: usize, text: &[u8]) -> usize {
+        kept := 0usize
+        for kept < text.len && kept < MAX_STRING_LENGTH {
+            self.set_byte(area + kept, text[kept])
+            kept += 1
+        }
+        return kept
+    }
+
+    // The string descriptor of the `used` bytes stored at `area`.
+    fn send_stored_string(&mut self, area: usize, used: usize, length: usize) {
+        text := [0u8; MAX_STRING_LENGTH]
+        for position in 0..used {
+            text[position] = self.byte_at(area + position)
+        }
+        self.send_string(&text[..used], length)
     }
 
     // A string descriptor: ASCII `text` as UTF-16LE.
@@ -1028,17 +1087,17 @@ unsafe fn serve_device() {
 }
 
 // Start the device on the controller at `registers` with its DPRAM at
-// `ram`, announcing itself as `product`, and return its port. Writes queue
+// `ram`, announcing itself with `identity`, and return its port. Writes queue
 // at once; the host enumerates the device within a second of connection,
 // after which a terminal can open it. `bootloader` restarts the chip into
 // its USB bootloader. The caller enables USBCTRL_IRQ in the NVIC.
 // SAFETY: the controller must be out of reset with clk_usb at 48 MHz, no
 // port may be open, and nothing else may use the controller.
-pub unsafe fn open(registers: usize, ram: usize, product: &[u8], bootloader: fn()) -> Serial {
+pub unsafe fn open(registers: usize, ram: usize, identity: Identity, bootloader: fn()) -> Serial {
     device := unsafe {
         Device.new(hal.RegisterBlock.at(registers), hal.RegisterBlock.at(ram))
     }
-    device.start(product)
+    device.start(identity)
     section := hal.Critical.enter()
     // SAFETY: interrupts are masked, so the handler is not running.
     unsafe {

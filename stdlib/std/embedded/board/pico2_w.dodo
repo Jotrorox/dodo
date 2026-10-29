@@ -147,12 +147,21 @@ pub struct Led {
 pub struct Usb {
     usb: rp2350.Usb
 
-    // Make the board a USB serial port named after it, for printing and
-    // reading over the USB cable; rp_usb documents the port. After a
-    // restart into the bootloader through the port, as `dodo run` does,
+    // Make the board a USB serial port named after it, with rp_usb's
+    // default identity, for printing and reading over the USB cable;
+    // rp_usb documents the port. After a restart into the bootloader
+    // through the port, as `dodo run` does,
     // the LED is on the wireless chip, so no pin shows the bootloader's drive activity. Busy if a port is open.
     pub fn serial(&mut self) -> rp_usb.Serial!hal.Error {
-        return self.usb.serial_as(NAME, rp2350.PIN_COUNT)
+        return self.usb.serial_with(rp_usb.default_identity(NAME), rp2350.PIN_COUNT)
+    }
+
+    // `serial`, with the `identity` the host sees in place of the default:
+    // the vendor and product IDs and strings of a product of your own.
+    // `dodo run` finds only the default IDs, so a board with others needs
+    // BOOTSEL held to flash it.
+    pub fn serial_with(&mut self, identity: rp_usb.Identity) -> rp_usb.Serial!hal.Error {
+        return self.usb.serial_with(identity, rp2350.PIN_COUNT)
     }
 
     // Give back the port: the board disconnects from the host.

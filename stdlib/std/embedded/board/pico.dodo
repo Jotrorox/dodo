@@ -69,12 +69,21 @@ pub fn take() -> Board!hal.Error {
 pub struct Usb {
     usb: rp2040.Usb
 
-    // Make the board a USB serial port named after it, for printing and
-    // reading over the USB cable; rp_usb documents the port. After a
-    // restart into the bootloader through the port, as `dodo run` does,
+    // Make the board a USB serial port named after it, with rp_usb's
+    // default identity, for printing and reading over the USB cable;
+    // rp_usb documents the port. After a restart into the bootloader
+    // through the port, as `dodo run` does,
     // the LED lights while the bootloader's drive is accessed. Busy if a port is open.
     pub fn serial(&mut self) -> rp_usb.Serial!hal.Error {
-        return self.usb.serial_as(NAME, LED_PIN)
+        return self.usb.serial_with(rp_usb.default_identity(NAME), LED_PIN)
+    }
+
+    // `serial`, with the `identity` the host sees in place of the default:
+    // the vendor and product IDs and strings of a product of your own.
+    // `dodo run` finds only the default IDs, so a board with others needs
+    // BOOTSEL held to flash it.
+    pub fn serial_with(&mut self, identity: rp_usb.Identity) -> rp_usb.Serial!hal.Error {
+        return self.usb.serial_with(identity, LED_PIN)
     }
 
     // Give back the port: the board disconnects from the host.

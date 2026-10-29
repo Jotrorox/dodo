@@ -1112,7 +1112,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
 | `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`; `alarm(n)` claims an alarm, which can also run the [executor](#tasks-and-the-executor). |
-| `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.release_serial(port)` gives it back. |
+| `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
 | `board.report_panic(check, file, line, column)` | Unsafe. Write a failed check to the serial ports and the USB serial port, as the [default panic hook](#panics-on-the-serial-port) does; for panic hooks of your own. |
 
@@ -1432,9 +1432,40 @@ is a small command line over USB.
 | Tasks | `set_signal(&SIGNAL)` raises an [executor signal](#waking-tasks-from-interrupts) whenever bytes arrive, output leaves, or the host opens, closes, or suspends the port. |
 | Restarting into the bootloader | A host that sets the port to 1200 baud restarts the board into its USB bootloader once the request is answered, as with the Pico SDK and Arduino. `dodo run` does this when no bootloader drive is mounted, so after the first flash the board needs no BOOTSEL press. `set_bootloader_reset(false)` turns it off, for example for a bridge to a UART that may really run at 1200 baud. |
 | Panics | Until the port is released, a panic writes its report to it, and the default panic hook keeps serving the port after it halts: a terminal opened later still receives the report, and `dodo run` still works. |
-| Identity | Raspberry Pi's vendor ID `0x2E8A` with the Pico SDK's USB serial product ID `0x000A`, manufacturer "Dodo", and the board's name as the product. `b.usb.serial()` claims the port once (`Busy` otherwise); `b.usb.release_serial(port)` disconnects from the host and stops the controller. |
+| Identity | By default, Raspberry Pi's vendor ID `0x2E8A` with the Pico SDK's USB serial product ID `0x000A`, manufacturer "Dodo", and the board's name as the product; `b.usb.serial_with(identity)` sets your own, [below](#usb-identity). `b.usb.serial()` claims the port once (`Busy` otherwise); `b.usb.release_serial(port)` disconnects from the host and stops the controller. |
 | Clocks | The controller runs at 48 MHz from PLL_USB, which the ADC shares: the PLL runs while either uses it. |
 | Limits | One serial port, in device mode only: no host mode and no other USB classes. The queues are fixed at 256 bytes in (`rp_usb.RX_CAPACITY`) and 1 KiB out (`rp_usb.TX_CAPACITY`). |
+
+#### USB identity
+
+A USB vendor and product ID identify a device and its USB firmware, not the
+library it was built with, so Dodo has no product ID of its own. The default
+identity is meant for development: the board behaves like the Pico SDK's USB
+serial port (CDC UART) and uses its IDs, so hosts need no driver and
+`dodo run` finds the board to restart it into the bootloader. Hosts and tools
+take it for a Pico running Pico SDK firmware, though, and may treat it like
+one, or confuse it with another Pico plugged in at the same time.
+
+A product you distribute with its own USB identity passes it to
+`b.usb.serial_with`:
+
+```dodo
+usb := b.usb.serial_with(rp_usb.Identity {
+    vendor_id: 0x1209,
+    product_id: 0x0001,
+    manufacturer: "Example Maker",
+    product: "Plant Monitor",
+})!
+```
+
+Use a vendor ID you own, or a product ID assigned to your product under
+someone else's vendor ID, such as one from a vendor's sublicensing program
+or the pid.codes registry (vendor ID `0x1209`, whose `0x0001` above is a test
+ID). Do not pick an unassigned product ID under Raspberry Pi's vendor ID
+`0x2E8A`. Strings are ASCII, cut at 32 bytes (`rp_usb.MAX_STRING_LENGTH`).
+`rp_usb.default_identity(name)` is the default with another product name.
+`dodo run` looks only for the default IDs, so a board with its own needs
+BOOTSEL held while it is connected to flash it.
 
 A task woken by the port reads until nothing is left:
 
@@ -1470,7 +1501,7 @@ runtime's default `USBCTRL_IRQ` handler serves it; a program's own
 `@interrupt(USBCTRL_IRQ)` replaces that handler, and with it the port, for
 example to run a USB stack of its own. A custom board that uses
 `std/embedded/chip` directly calls `p.usb.serial()`, named after the chip,
-or `p.usb.serial_as(name, activity_led)`.
+or `p.usb.serial_with(identity, activity_led)`.
 
 ### PWM and the ADC on the RP2040 and RP2350
 

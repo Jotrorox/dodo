@@ -1,7 +1,6 @@
 package rp2350
 
 import "core/cpu"
-import "core/mem"
 import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
@@ -728,8 +727,8 @@ pub struct Usb {
     crystal_hz: u32
     open: bool
 
-    // Start the controller as a USB serial port (CDC-ACM) named "RP2350"
-    // and return it. The host enumerates it within about a second; what is
+    // Start the controller as a USB serial port (CDC-ACM) named "RP2350",
+    // with rp_usb's default identity, and return it. The host enumerates it within about a second; what is
     // written before a terminal opens it is kept, up to rp_usb.TX_CAPACITY
     // bytes. The port is served from the USBCTRL_IRQ interrupt, so it keeps
     // working while the program busy-waits; a program's own USBCTRL_IRQ
@@ -738,15 +737,15 @@ pub struct Usb {
     // board into its bootloader. Busy if a port is open, Timeout if PLL_USB
     // or the controller does not start.
     pub fn serial(&mut self) -> rp_usb.Serial!hal.Error {
-        return self.serial_as("RP2350", PIN_COUNT)
+        return self.serial_with(rp_usb.default_identity("RP2350"), PIN_COUNT)
     }
 
-    // `serial`, with the product name the host shows, ASCII, cut at
-    // rp_usb.MAX_PRODUCT_LENGTH bytes, and the pin the USB bootloader
-    // lights while its drive is accessed after the host restarts the board
-    // into it, or PIN_COUNT for none. Board packages pass the board's name
-    // and LED.
-    pub fn serial_as(&mut self, product: &str, activity_led: u32) -> rp_usb.Serial!hal.Error {
+    // `serial`, with the `identity` the host sees, and the pin the USB
+    // bootloader lights while its drive is accessed after the host
+    // restarts the board into it, or PIN_COUNT for none. Board packages
+    // pass the default identity with the board's name, and the board's
+    // LED.
+    pub fn serial_with(&mut self, identity: rp_usb.Identity, activity_led: u32) -> rp_usb.Serial!hal.Error {
         if self.open {
             return err(hal.Error.Busy)
         }
@@ -770,7 +769,7 @@ pub struct Usb {
                 }
             }
             USB_ACTIVITY_LED = activity_led
-            serial := rp_usb.open(USBCTRL_REGS_BASE, USBCTRL_DPRAM_BASE, mem.str_bytes(product), usb_bootloader)
+            serial := rp_usb.open(USBCTRL_REGS_BASE, USBCTRL_DPRAM_BASE, identity, usb_bootloader)
             cortex_m.enable(USBCTRL_IRQ)
             self.open = true
             return ok(serial)
