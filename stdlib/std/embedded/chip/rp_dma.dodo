@@ -1,0 +1,707 @@
+package rp_dma
+
+import "core/cpu"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
+import "std/embedded/hal"
+
+// The DMA controller the RP2040 and RP2350 share (RP2040 datasheet 2.5,
+// RP2350 datasheet 12.6): 12 channels on the RP2040 and 16 on the RP2350,
+// each of which moves data between memory and peripherals while the
+// processor does other work. A channel copies `count` elements of 1, 2, or
+// 4 bytes, paced by a peripheral's data request (DREQ) so that it never
+// overruns a FIFO, or as fast as the bus allows between two buffers.
+//
+// `Driver` is one channel over any hal.Registers: a `hal.RegisterBlock` at
+// the controller's base on the chip, or a simulated controller in a desktop
+// test. It implements hal.DmaChannel, through which the peripheral drivers
+// start their transfers, so they never name a DREQ: a channel finds the
+// request line from the peripheral register a transfer reads or writes.
+// Channels write only their own registers, and their own bits of the
+// shared interrupt registers through the atomic set and clear aliases, so
+// each can belong to a different owner, an interrupt handler included.
+//
+// Chip packages hand out channels with `Dma`: `b.dma.channel()` claims a
+// free one, `claim(n)` a given one, and `release(channel)` gives it back.
+// `Channel.set_signal` raises an executor signal when a transfer finishes,
+// from the chip runtime's default DMA_IRQ_0 handler, so a task waits for a
+// transfer instead of for the bus.
+
+// The controller's base address, the same on both chips.
+pub const BASE: usize = 0x5000_0000
+
+// Channel registers, CHANNEL_STRIDE apart. Writing CTRL_TRIG starts the
+// channel; AL1_CTRL is the same register without the trigger.
+const READ_ADDR: usize = 0x00
+const WRITE_ADDR: usize = 0x04
+const TRANS_COUNT: usize = 0x08
+const CTRL_TRIG: usize = 0x0C
+const AL1_CTRL: usize = 0x10
+const CHANNEL_STRIDE: usize = 0x40
+
+// Shared registers: raw interrupts, and interrupt 0's enables and status.
+const INTR: usize = 0x400
+const INTE0: usize = 0x404
+const INTS0: usize = 0x40C
+const RP2040_CHAN_ABORT: usize = 0x444
+const RP2350_CHAN_ABORT: usize = 0x464
+
+// Atomic register aliases (RP2040 datasheet 2.1.2).
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// CTRL fields both chips share: enable, element size, increment the read
+// address, the bus errors (write one to clear), and their sum.
+const ENABLE: u32 = 1 << 0
+const DATA_SIZE: u32 = 0b11 << 2
+const INCREMENT_READ: u32 = 1 << 4
+const WRITE_ERROR: u32 = 1 << 29
+const READ_ERROR: u32 = 1 << 30
+const ERRORS: u32 = WRITE_ERROR | READ_ERROR
+// The rest moved on the RP2350 to make room for decrementing addresses.
+const RP2040_INCREMENT_WRITE: u32 = 1 << 5
+const RP2040_RING_SIZE: u32 = 0b1111 << 6
+const RP2040_RING_WRITE: u32 = 1 << 10
+const RP2040_CHAIN_TO: u32 = 0b1111 << 11
+const RP2040_REQUEST: u32 = 0b11_1111 << 15
+const RP2040_BUSY: u32 = 1 << 24
+const RP2350_INCREMENT_WRITE: u32 = 1 << 6
+const RP2350_RING_SIZE: u32 = 0b1111 << 8
+const RP2350_RING_WRITE: u32 = 1 << 12
+const RP2350_CHAIN_TO: u32 = 0b1111 << 13
+const RP2350_REQUEST: u32 = 0b11_1111 << 17
+const RP2350_BUSY: u32 = 1 << 26
+// The RP2350's TRANS_COUNT keeps a mode in its top four bits; 0 is a
+// normal transfer of COUNT elements.
+const RP2350_COUNT: u32 = 0x0FFF_FFFF
+
+// The largest ring, 32 KiB.
+pub const MAX_RING_BITS: u32 = 15
+
+// Data requests (TREQ_SEL) that no peripheral raises: the timers below
+// pace a transfer at a fixed rate, and UNPACED not at all.
+pub const TIMER0: u32 = 0x3B
+pub const TIMER1: u32 = 0x3C
+pub const TIMER2: u32 = 0x3D
+pub const TIMER3: u32 = 0x3E
+pub const UNPACED: u32 = 0x3F
+
+// Polls of CHAN_ABORT before an abort is taken as done. An abort settles
+// within a few bus cycles.
+const ABORT_POLLS: u32 = 100_000
+
+// The chips, whose controllers differ in their number of channels and in
+// where some fields sit.
+pub const RP2040: u32 = 2040
+pub const RP2350: u32 = 2350
+
+// The number of channels of `chip`'s controller.
+pub fn channel_count(chip: u32) -> u32 {
+    if chip == RP2350 {
+        return 16
+    }
+    return 12
+}
+
+// The interrupt `chip`'s controller raises for interrupt 0: DMA_IRQ_0.
+pub fn irq(chip: u32) -> u32 {
+    if chip == RP2350 {
+        return 10
+    }
+    return 11
+}
+
+// The data request that paces transfers to (`transmit`) or from the
+// peripheral register at `address` on `chip`: the UARTs' and SPI
+// controllers' data registers, the I2C controllers' DATA_CMD, the ADC's
+// FIFO, and the PIO state machines' FIFOs. None for any other address.
+pub fn request(chip: u32, address: usize, transmit: bool) -> Option<u32> {
+    direction := 1u32
+    if transmit {
+        direction = 0
+    }
+    if chip == RP2350 {
+        return rp2350_request(address, transmit, direction)
+    }
+    return rp2040_request(address, transmit, direction)
+}
+
+fn rp2040_request(address: usize, transmit: bool, direction: u32) -> Option<u32> {
+    if address == 0x4003_4000 {
+        return some(20 + direction)
+    } else if address == 0x4003_8000 {
+        return some(22 + direction)
+    } else if address == 0x4003_C008 {
+        return some(16 + direction)
+    } else if address == 0x4004_0008 {
+        return some(18 + direction)
+    } else if address == 0x4004_4010 {
+        return some(32 + direction)
+    } else if address == 0x4004_8010 {
+        return some(34 + direction)
+    } else if address == 0x4004_C00C && !transmit {
+        return some(36)
+    }
+    return pio_request(address, transmit, 2)
+}
+
+fn rp2350_request(address: usize, transmit: bool, direction: u32) -> Option<u32> {
+    if address == 0x4007_0000 {
+        return some(28 + direction)
+    } else if address == 0x4007_8000 {
+        return some(30 + direction)
+    } else if address == 0x4008_0008 {
+        return some(24 + direction)
+    } else if address == 0x4008_8008 {
+        return some(26 + direction)
+    } else if address == 0x4009_0010 {
+        return some(44 + direction)
+    } else if address == 0x4009_8010 {
+        return some(46 + direction)
+    } else if address == 0x400A_000C && !transmit {
+        return some(48)
+    }
+    return pio_request(address, transmit, 3)
+}
+
+// The request of a PIO state machine's transmit FIFO TXF0 to TXF3, at 0x10
+// to 0x1C in its block, or receive FIFO RXF0 to RXF3, at 0x20 to 0x2C.
+// Block n is at 0x5020_0000 + n * 0x10_0000 and raises requests 8n to
+// 8n + 3 for transmitting and 8n + 4 to 8n + 7 for receiving.
+fn pio_request(address: usize, transmit: bool, blocks: u32) -> Option<u32> {
+    if address < 0x5020_0000 || address % 4 != 0 {
+        return none
+    }
+    block := ((address - 0x5020_0000) / 0x10_0000) as u32
+    offset := (address - 0x5020_0000) % 0x10_0000
+    if block >= blocks {
+        return none
+    }
+    if transmit && offset >= 0x10 && offset < 0x20 {
+        return some(8 * block + ((offset - 0x10) / 4) as u32)
+    } else if !transmit && offset >= 0x20 && offset < 0x30 {
+        return some(8 * block + 4 + ((offset - 0x20) / 4) as u32)
+    }
+    return none
+}
+
+// Signals to raise when a channel finishes, by channel: the signal's id
+// plus one, 0 for none. Set and read with interrupts masked, or by the
+// interrupt handler.
+static mut SIGNALS: [16]u32 = [0u32; 16]
+// The channels handed out by `Dma`, one bit each, and the chip that runs
+// them, for `stop_all`.
+static mut CLAIMED: u32 = 0
+static mut CHIP: u32 = RP2040
+
+// The chip runtimes' default DMA_IRQ_0 handler calls this weak symbol, if
+// a program defines it. Every program that uses std/embedded/chip defines
+// it through this package: it acknowledges each finished channel that
+// interrupt 0 serves and raises the channel's signal, if it has one. A
+// program's own `@interrupt(DMA_IRQ_0)` replaces the default handler, and
+// with it the signals; DMA_IRQ_1 stays free for programs that serve
+// channels themselves.
+extern "C" fn dodo_dma_interrupt() {
+    // SAFETY: INTS0's write-one-to-clear bits acknowledge only the
+    // channels found finished. SIGNALS changes only with interrupts
+    // masked, which excludes this handler.
+    unsafe {
+        status: hal.Reg<u32> = hal.Reg.at(BASE + INTS0)
+        pending := status.read()
+        status.write(pending)
+        for index in 0..16usize {
+            if (pending & (1u32 << index as u32)) != 0 && SIGNALS[index] != 0 {
+                signal := executor.Signal { id: SIGNALS[index] - 1 }
+                signal.raise()
+            }
+        }
+    }
+}
+
+// Abort every channel handed out by `Dma` and wait until they stop, so
+// none writes to memory any more. The panic report calls it before it
+// writes to the serial ports, which a channel might be feeding.
+// SAFETY: the caller must halt or reset afterwards, as this takes the
+// channels from their owners.
+pub unsafe fn stop_all() {
+    unsafe {
+        if CLAIMED == 0 {
+            return
+        }
+        abort: hal.Reg<u32> = hal.Reg.at(BASE + abort_offset(CHIP))
+        abort.write(CLAIMED)
+        polls := 0u32
+        for (abort.read() & CLAIMED) != 0 && polls < ABORT_POLLS {
+            polls += 1
+        }
+    }
+}
+
+// One channel of the controller with registers R, any hal.Registers, such
+// as a hal.RegisterBlock at BASE or a simulated controller in a test.
+// Implements hal.DmaChannel.
+pub struct Driver<R: hal.Registers>: hal.DmaChannel {
+    registers: R
+    // RP2040 or RP2350.
+    chip: u32
+    rp2350: bool
+    number: u32
+    // This channel's registers, from the controller's base, and its bit in
+    // the shared ones.
+    base: usize
+    bit: u32
+
+    // Channel `number` of `chip`'s controller at `registers`, idle.
+    pub fn new(registers: R, chip: u32, number: u32) -> Driver<R> {
+        core.assert(number < channel_count(chip))
+        channel := Driver<R> { registers, chip, rp2350: chip == RP2350, number, base: CHANNEL_STRIDE * number as usize, bit: 1u32 << number }
+        channel.abort()
+        return channel
+    }
+
+    // The channel's number.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // The chip this channel belongs to, RP2040 or RP2350.
+    pub fn chip(&self) -> u32 {
+        return self.chip
+    }
+
+    // Start `transfer`, paced by the request of the peripheral register it
+    // names; see hal.DmaChannel. InvalidInput for a peripheral register
+    // that raises no request, a misaligned address, a ring of more than
+    // MAX_RING_BITS, or a count above max_count().
+    // SAFETY: as for hal.DmaChannel.start.
+    pub unsafe fn start(&mut self, transfer: hal.DmaTransfer) -> void!hal.Error {
+        found: Option<u32> = some(UNPACED)
+        match &transfer.pace {
+            hal.DmaPace.Unpaced => {}
+            hal.DmaPace.Destination => {
+                found = request(self.chip, transfer.destination, true)
+            }
+            hal.DmaPace.Source => {
+                found = request(self.chip, transfer.source, false)
+            }
+        }
+        if let some(pace) = found {
+            unsafe {
+                return self.start_request(transfer, pace)
+            }
+        }
+        return err(hal.Error.InvalidInput)
+    }
+
+    // Start `transfer` paced by data request `pace`, a DREQ number from
+    // the chip's datasheet, one of TIMER0 to TIMER3, or UNPACED; the
+    // transfer's own pace is ignored. For peripherals that `start` does
+    // not know, such as a PWM slice's wrap.
+    // SAFETY: as for hal.DmaChannel.start.
+    pub unsafe fn start_request(&mut self, transfer: hal.DmaTransfer, pace: u32) -> void!hal.Error {
+        size := width_bytes(&transfer.width)
+        if pace > UNPACED || transfer.count > self.max_count() || transfer.source % size != 0 || transfer.destination % size != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        ring_bits := 0u32
+        ring_write := false
+        match &transfer.ring {
+            hal.DmaRing.None => {}
+            hal.DmaRing.Source(bits) => {
+                ring_bits = *bits
+            }
+            hal.DmaRing.Destination(bits) => {
+                ring_bits = *bits
+                ring_write = true
+            }
+        }
+        if ring_bits > MAX_RING_BITS || (ring_bits != 0 && (1usize << ring_bits as usize) < size) {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        control := ENABLE | hal.encode(DATA_SIZE, size_code(&transfer.width))
+        if transfer.increment_source {
+            control |= INCREMENT_READ
+        }
+        if self.rp2350 {
+            control |= hal.encode(RP2350_RING_SIZE, ring_bits) | hal.encode(RP2350_CHAIN_TO, self.number) | hal.encode(RP2350_REQUEST, pace)
+            if transfer.increment_destination {
+                control |= RP2350_INCREMENT_WRITE
+            }
+            if ring_write {
+                control |= RP2350_RING_WRITE
+            }
+        } else {
+            control |= hal.encode(RP2040_RING_SIZE, ring_bits) | hal.encode(RP2040_CHAIN_TO, self.number) | hal.encode(RP2040_REQUEST, pace)
+            if transfer.increment_destination {
+                control |= RP2040_INCREMENT_WRITE
+            }
+            if ring_write {
+                control |= RP2040_RING_WRITE
+            }
+        }
+        // Errors left from an earlier transfer would report on this one.
+        self.registers.write(self.base + AL1_CTRL, ERRORS)
+        self.registers.write(self.base + READ_ADDR, transfer.source as u32)
+        self.registers.write(self.base + WRITE_ADDR, transfer.destination as u32)
+        self.registers.write(self.base + TRANS_COUNT, transfer.count)
+        self.registers.write(self.base + CTRL_TRIG, control)
+        return ok()
+    }
+
+    pub fn is_busy(&mut self) -> bool {
+        busy := RP2040_BUSY
+        if self.rp2350 {
+            busy = RP2350_BUSY
+        }
+        return (self.registers.read(self.base + AL1_CTRL) & busy) != 0
+    }
+
+    pub fn remaining(&mut self) -> u32 {
+        count := self.registers.read(self.base + TRANS_COUNT)
+        if self.rp2350 {
+            return count & RP2350_COUNT
+        }
+        return count
+    }
+
+    pub fn max_count(&mut self) -> u32 {
+        if self.rp2350 {
+            return RP2350_COUNT
+        }
+        return 0xFFFF_FFFF
+    }
+
+    // The address the channel reads next, and the one it writes next.
+    pub fn read_address(&mut self) -> usize {
+        return self.registers.read(self.base + READ_ADDR) as usize
+    }
+
+    pub fn write_address(&mut self) -> usize {
+        return self.registers.read(self.base + WRITE_ADDR) as usize
+    }
+
+    // Stop the running transfer and wait until the channel has stopped.
+    // The channel's interrupt is held off meanwhile, as an abort can raise
+    // it on the RP2040 (erratum RP2040-E13), and a finish the abort
+    // overtook is forgotten.
+    pub fn abort(&mut self) {
+        offset := abort_offset(self.chip)
+        listening := (self.registers.read(INTE0) & self.bit) != 0
+        self.registers.write(INTE0 + CLEAR_ALIAS, self.bit)
+        self.registers.write(offset, self.bit)
+        polls := 0u32
+        for (self.registers.read(offset) & self.bit) != 0 && polls < ABORT_POLLS {
+            polls += 1
+        }
+        self.registers.write(INTR, self.bit)
+        if listening {
+            self.registers.write(INTE0 + SET_ALIAS, self.bit)
+        }
+    }
+
+    pub fn take_error(&mut self) -> void!hal.Error {
+        control := self.registers.read(self.base + AL1_CTRL)
+        if (control & ERRORS) == 0 {
+            return ok()
+        }
+        // Through the alias that does not trigger, writing the errors back
+        // clears them and leaves the rest as it is.
+        self.registers.write(self.base + AL1_CTRL, control)
+        return err(hal.Error.Bus)
+    }
+
+    // Raise interrupt 0 (the chip's DMA_IRQ_0) when a transfer finishes.
+    pub fn listen(&mut self) {
+        self.registers.write(INTE0 + SET_ALIAS, self.bit)
+    }
+
+    // Stop raising it.
+    pub fn ignore(&mut self) {
+        self.registers.write(INTE0 + CLEAR_ALIAS, self.bit)
+    }
+
+    pub fn is_listening(&mut self) -> bool {
+        return (self.registers.read(INTE0) & self.bit) != 0
+    }
+
+    // True once a transfer has finished, until `clear`, whether the
+    // channel listens or not.
+    pub fn finished(&mut self) -> bool {
+        return (self.registers.read(INTR) & self.bit) != 0
+    }
+
+    // Acknowledge a finish, ending the interrupt it raised.
+    pub fn clear(&mut self) {
+        self.registers.write(INTR, self.bit)
+    }
+}
+
+// CHAN_ABORT on `chip`.
+fn abort_offset(chip: u32) -> usize {
+    if chip == RP2350 {
+        return RP2350_CHAN_ABORT
+    }
+    return RP2040_CHAN_ABORT
+}
+
+fn width_bytes(width: &hal.DmaWidth) -> usize {
+    match width {
+        hal.DmaWidth.Byte => {
+            return 1
+        }
+        hal.DmaWidth.HalfWord => {
+            return 2
+        }
+        hal.DmaWidth.Word => {
+            return 4
+        }
+    }
+}
+
+fn size_code(width: &hal.DmaWidth) -> u32 {
+    match width {
+        hal.DmaWidth.Byte => {
+            return 0
+        }
+        hal.DmaWidth.HalfWord => {
+            return 1
+        }
+        hal.DmaWidth.Word => {
+            return 2
+        }
+    }
+}
+
+// A channel on the chip, as `Dma` hands it out. It implements
+// hal.DmaChannel like Driver, which the peripheral drivers' DMA methods
+// take, and adds what needs the chip: signals and copies.
+pub struct Channel: hal.DmaChannel {
+    driver: Driver<hal.RegisterBlock>
+
+    // The channel's number, 0 to channel_count(chip) - 1.
+    pub fn number(&self) -> u32 {
+        return self.driver.number()
+    }
+
+    // The interrupt the channel raises while it listens: DMA_IRQ_0.
+    pub fn irq(&self) -> u32 {
+        return irq(self.driver.chip())
+    }
+
+    // SAFETY: as for hal.DmaChannel.start.
+    pub unsafe fn start(&mut self, transfer: hal.DmaTransfer) -> void!hal.Error {
+        unsafe {
+            return self.driver.start(transfer)
+        }
+    }
+
+    // SAFETY: as for hal.DmaChannel.start.
+    pub unsafe fn start_request(&mut self, transfer: hal.DmaTransfer, pace: u32) -> void!hal.Error {
+        unsafe {
+            return self.driver.start_request(transfer, pace)
+        }
+    }
+
+    pub fn is_busy(&mut self) -> bool {
+        return self.driver.is_busy()
+    }
+
+    pub fn remaining(&mut self) -> u32 {
+        return self.driver.remaining()
+    }
+
+    pub fn max_count(&mut self) -> u32 {
+        return self.driver.max_count()
+    }
+
+    pub fn read_address(&mut self) -> usize {
+        return self.driver.read_address()
+    }
+
+    pub fn write_address(&mut self) -> usize {
+        return self.driver.write_address()
+    }
+
+    pub fn abort(&mut self) {
+        self.driver.abort()
+    }
+
+    pub fn take_error(&mut self) -> void!hal.Error {
+        return self.driver.take_error()
+    }
+
+    // Raise `signal` whenever a transfer on this channel finishes, from
+    // the chip runtime's default DMA_IRQ_0 handler, so a task waits for it:
+    // `SIGNAL.take(cx)`, then check the transfer. Enables the channel's
+    // interrupt and DMA_IRQ_0 in the NVIC.
+    pub fn set_signal(&mut self, signal: &executor.Signal) {
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, which excludes the handler, and
+        // the slot is this channel's.
+        unsafe {
+            SIGNALS[self.number() as usize] = signal.id + 1
+        }
+        self.driver.listen()
+        core.drop(section)
+        cortex_m.enable(self.irq())
+    }
+
+    // Stop raising the signal and the channel's interrupt.
+    pub fn clear_signal(&mut self) {
+        section := hal.Critical.enter()
+        self.driver.ignore()
+        // SAFETY: as in set_signal.
+        unsafe {
+            SIGNALS[self.number() as usize] = 0
+        }
+        core.drop(section)
+    }
+
+    // Interrupts for handlers of your own, as Driver documents: with
+    // `listen`, a finished transfer raises DMA_IRQ_0.
+    pub fn listen(&mut self) {
+        self.driver.listen()
+    }
+
+    pub fn ignore(&mut self) {
+        self.driver.ignore()
+    }
+
+    pub fn finished(&mut self) -> bool {
+        return self.driver.finished()
+    }
+
+    pub fn clear(&mut self) {
+        self.driver.clear()
+    }
+
+    // Copy `source` into `destination`, which must have the same length,
+    // and wait until it is done: whole words at a time when both are
+    // word-aligned, bytes otherwise. InvalidInput for different lengths or
+    // more bytes than a transfer moves; Bus on a bus error.
+    pub fn copy(&mut self, destination: &mut[u8], source: &[u8]) -> void!hal.Error {
+        if destination.len != source.len {
+            return err(hal.Error.InvalidInput)
+        }
+        if source.len == 0 {
+            return ok()
+        }
+        target := hal.address_of(destination)
+        origin := hal.address_of(source)
+        width := hal.DmaWidth.Byte
+        count := source.len
+        if target % 4 == 0 && origin % 4 == 0 && count % 4 == 0 {
+            width = hal.DmaWidth.Word
+            count = count / 4
+        }
+        if count as u64 > self.max_count() as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        transfer := hal.DmaTransfer {
+            source: origin,
+            destination: target,
+            count: count as u32,
+            width,
+            increment_source: true,
+            increment_destination: true,
+            pace: hal.DmaPace.Unpaced,
+            ring: hal.DmaRing.None,
+        }
+        // SAFETY: both buffers stay borrowed until the copy is done, as
+        // this waits for it, and the fences order the processor's own
+        // accesses around the channel's.
+        unsafe {
+            cpu.fence()
+            self.start(transfer)?
+        }
+        for self.is_busy() {}
+        cpu.fence()
+        return self.take_error()
+    }
+}
+
+// The controller's channels, handed out once each. Chip packages make the
+// one Dma when the chip starts and pass it on as `p.dma`.
+pub struct Dma {
+    // RP2040 or RP2350.
+    chip: u32
+
+    // The controller of `chip`, RP2040 or RP2350.
+    // SAFETY: the controller must be out of reset, this must be the only
+    // Dma, and nothing else may use the channels it hands out.
+    pub unsafe fn new(chip: u32) -> Dma {
+        unsafe {
+            CHIP = chip
+        }
+        return Dma { chip }
+    }
+
+    // The number of channels: 12 on the RP2040, 16 on the RP2350.
+    pub fn channels(&self) -> u32 {
+        return channel_count(self.chip)
+    }
+
+    // Claim the free channel with the lowest number. Busy if every channel
+    // is taken.
+    pub fn channel(&mut self) -> Channel!hal.Error {
+        for number in 0..self.channels() {
+            if !self.is_claimed(number) {
+                return self.claim(number)
+            }
+        }
+        return err(hal.Error.Busy)
+    }
+
+    // Claim channel `number`, for a program that also drives channels
+    // through registers of its own. Busy if it is claimed already;
+    // InvalidInput for a number the chip does not have.
+    pub fn claim(&mut self, number: u32) -> Channel!hal.Error {
+        if number >= self.channels() {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.is_claimed(number) {
+            return err(hal.Error.Busy)
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so the panic report sees the set
+        // before or after the claim.
+        unsafe {
+            CLAIMED |= 1u32 << number
+        }
+        core.drop(section)
+        // SAFETY: the claim above makes this the only Channel for
+        // `number`, and a Driver writes only its channel's registers and
+        // bits.
+        driver := unsafe {
+            Driver.new(hal.RegisterBlock.at(BASE), self.chip, number)
+        }
+        return ok(Channel { driver })
+    }
+
+    // Whether channel `number` is claimed.
+    pub fn is_claimed(&self, number: u32) -> bool {
+        // SAFETY: only Dma changes CLAIMED, from the program.
+        claimed := unsafe {
+            CLAIMED
+        }
+        return number < 32 && (claimed & (1u32 << number)) != 0
+    }
+
+    // Abort the channel's transfer, stop its signal and interrupt, and
+    // take it back.
+    pub fn release(&mut self, channel: Channel) {
+        channel.clear_signal()
+        channel.abort()
+        channel.clear()
+        number := channel.number()
+        section := hal.Critical.enter()
+        // SAFETY: as in claim.
+        unsafe {
+            CLAIMED &= ~(1u32 << number)
+        }
+        core.drop(section)
+    }
+}
