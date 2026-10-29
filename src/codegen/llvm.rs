@@ -419,6 +419,16 @@ impl<'ctx> Value<'ctx> {
     pub(super) fn set_section(self, section: Option<&str>) {
         unsafe { LLVMSetSection(self.0, cstring(section.unwrap_or("")).as_ptr()) }
     }
+    /// The initializer of a defined global variable; none for a declaration.
+    pub(super) fn get_initializer(self) -> Option<Self> {
+        Self::optional(unsafe { LLVMGetInitializer(self.0) })
+    }
+    pub(super) fn is_global_constant(self) -> bool {
+        unsafe { LLVMIsGlobalConstant(self.0) != 0 }
+    }
+    pub(super) fn is_thread_local(self) -> bool {
+        unsafe { LLVMIsThreadLocal(self.0) != 0 }
+    }
     pub(super) fn has_section(self) -> bool {
         let section = unsafe { LLVMGetSection(self.0) };
         !section.is_null() && unsafe { *section } != 0
@@ -588,6 +598,12 @@ impl<'ctx> Module<'ctx> {
         let first = Value::optional(unsafe { LLVMGetFirstFunction(self.0) });
         std::iter::successors(first, |v| {
             Value::optional(unsafe { LLVMGetNextFunction(v.0) })
+        })
+    }
+    pub(super) fn globals(&self) -> impl Iterator<Item = Value<'ctx>> {
+        let first = Value::optional(unsafe { LLVMGetFirstGlobal(self.0) });
+        std::iter::successors(first, |v| {
+            Value::optional(unsafe { LLVMGetNextGlobal(v.0) })
         })
     }
     pub(super) fn add_global(

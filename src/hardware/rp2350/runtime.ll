@@ -22,6 +22,8 @@
 ;   dodo_rp2350_rom_call
 ;                  Calls a boot ROM function by its two-letter code, for
 ;                  example reboot ('RB') to restart into the USB bootloader.
+;   USBCTRL_IRQ    Calls dodo_usb_interrupt if the program defines it:
+;                  std/embedded/chip/rp_usb does, for the USB serial port.
 ;   dodo_board_panic
 ;                  The panic hook: masks interrupts, passes its arguments to
 ;                  dodo_panic_report if the program defines it, and halts.
@@ -128,6 +130,22 @@ module asm ".thumb_func"
 module asm "DefaultHandler:"
 module asm "    b DefaultHandler"
 
+; USBCTRL_IRQ, weak like the other handlers, tail-calls the weak
+; dodo_usb_interrupt if the program defines it, and is DefaultHandler
+; otherwise. std/embedded/chip/rp_usb defines it to serve the USB serial
+; port while one is open.
+module asm ".section .text.USBCTRL_IRQ, \22ax\22, %progbits"
+module asm ".weak dodo_usb_interrupt"
+module asm ".type USBCTRL_IRQ, %function"
+module asm ".thumb_func"
+module asm "USBCTRL_IRQ:"
+module asm "    ldr r0, =dodo_usb_interrupt"
+module asm "    cmp r0, #0"
+module asm "    bne 1f"
+module asm "    ldr r0, =DefaultHandler"
+module asm "1:  bx r0"                                  ; lr still holds EXC_RETURN
+module asm "    .ltorg"
+
 ; A weak reference: without a definition the linker makes it 0, and a
 ; definition is kept by --gc-sections only while this hook is.
 module asm ".section .text.dodo_board_panic, \22ax\22, %progbits"
@@ -209,7 +227,6 @@ module asm ".thumb_set DMA_IRQ_0, DefaultHandler"
 module asm ".thumb_set DMA_IRQ_1, DefaultHandler"
 module asm ".thumb_set DMA_IRQ_2, DefaultHandler"
 module asm ".thumb_set DMA_IRQ_3, DefaultHandler"
-module asm ".thumb_set USBCTRL_IRQ, DefaultHandler"
 module asm ".thumb_set PIO0_IRQ_0, DefaultHandler"
 module asm ".thumb_set PIO0_IRQ_1, DefaultHandler"
 module asm ".thumb_set PIO1_IRQ_0, DefaultHandler"

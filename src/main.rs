@@ -1,7 +1,7 @@
 //! Command-line driver. Linking is an explicit process invocation, never a shell command.
 use cli::{Action, Invocation, Parsed};
 use dodoc::codegen::{Context, FileType};
-use dodoc::hardware::{Platform, image};
+use dodoc::hardware::{Platform, image, serial};
 use dodoc::{cli, codegen, lsp, package, project, sema, toml};
 use project::{Emit, Purpose, Resolved};
 use std::ffi::{OsStr, OsString};
@@ -700,12 +700,15 @@ fn link_firmware(
 }
 /// Build firmware and copy it to the platform's mounted bootloader drive.
 fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Result<i32, String> {
-    let drives = platform.bootloader_drives();
+    let mut drives = platform.bootloader_drives();
+    if drives.is_empty() {
+        drives = restart_into_bootloader(args, platform)?;
+    }
     let drive = match drives.as_slice() {
         [drive] => drive,
         [] => {
             return Err(format!(
-                "no {} bootloader drive is mounted; hold BOOTSEL while connecting the {} over USB, then run again",
+                "no {} bootloader drive is mounted; hold BOOTSEL while connecting the {} over USB, then run again (firmware that opens its USB serial port, `b.usb.serial()`, lets `dodo run` restart it without BOOTSEL)",
                 platform.bootloader_drive_name(),
                 platform.description()
             ));
@@ -744,6 +747,51 @@ fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Resul
         );
     }
     Ok(0)
+}
+/// Restart a board running firmware with a USB serial port into its
+/// bootloader, by setting the port to 1200 baud, and wait for its drive.
+/// Returns the mounted drives: none if no such board is attached.
+fn restart_into_bootloader(args: &Args, platform: Platform) -> Result<Vec<PathBuf>, String> {
+    let Some(id) = platform.chip.usb_serial else {
+        return Ok(vec![]);
+    };
+    let ports = serial::usb_serial_ports(id);
+    let port = match ports.as_slice() {
+        [] => return Ok(vec![]),
+        [port] => port,
+        _ => {
+            return Err(format!(
+                "several boards with USB serial ports are connected ({}); connect one board at a time, or hold BOOTSEL on the one to flash",
+                ports
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    };
+    if !args.quiet {
+        eprintln!(
+            "Restarting the board on {} into its bootloader",
+            port.display()
+        );
+    }
+    serial::request_bootloader(port)?;
+    // The board restarts at once; the host mounts its drive a few seconds
+    // later.
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(15) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let drives = platform.bootloader_drives();
+        if !drives.is_empty() {
+            return Ok(drives);
+        }
+    }
+    Err(format!(
+        "the board on {} did not appear as the {} drive within 15 seconds; its firmware may have turned off the restart (set_bootloader_reset), or hold BOOTSEL while connecting it, then run again",
+        port.display(),
+        platform.bootloader_drive_name()
+    ))
 }
 fn execute(mut args: Args) -> Result<i32, String> {
     // A project folder selects its entry file. Directory imports are still

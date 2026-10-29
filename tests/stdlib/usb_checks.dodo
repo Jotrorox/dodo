@@ -1,0 +1,717 @@
+package main
+
+import "std/embedded/hal"
+import "std/embedded/chip/rp_usb"
+
+// Host checks for std/embedded/chip/rp_usb: the USB serial device against a
+// model of the RP2040 and RP2350 USB controller, driven by a simulated host
+// that enumerates the device, opens the port, and moves data both ways. The
+// model enforces the controller's rules: buffer control's AVAILABLE bit is
+// set only after the rest of the register, a buffer handed to the
+// controller is not touched, data PIDs alternate, and an EP0 stall lasts
+// until the next SETUP packet.
+
+// Controller registers, by byte offset.
+const ADDR_ENDP: usize = 0x00
+const MAIN_CTRL: usize = 0x40
+const SOF_RD: usize = 0x48
+const SIE_CTRL: usize = 0x4C
+const SIE_STATUS: usize = 0x50
+const BUFF_STATUS: usize = 0x58
+const EP_STALL_ARM: usize = 0x68
+const USB_MUXING: usize = 0x74
+const USB_PWR: usize = 0x78
+const INTE: usize = 0x90
+const INTS: usize = 0x98
+
+const PULLUP: u32 = 1 << 16
+const SETUP_REC: u32 = 1 << 17
+const BUS_RESET: u32 = 1 << 19
+const SUSPENDED: u32 = 1 << 4
+const RESUMED: u32 = 1 << 11
+
+const BUF_FULL: u32 = 1 << 15
+const BUF_DATA1: u32 = 1 << 13
+const BUF_STALL: u32 = 1 << 11
+const BUF_AVAILABLE: u32 = 1 << 10
+const BUF_LENGTH: u32 = 0x3FF
+const EP_ENABLE: u32 = 1 << 31
+
+const PRODUCT: &[u8] = b"Test Board"
+const NOTHING: &[u8] = b""
+
+// The controller's registers and its 4 KiB of DPRAM, by word.
+static mut REGISTERS: [64]u32 = [0u32; 64]
+static mut DPRAM: [1024]u32 = [0u32; 1024]
+// Violations of the buffer control rules the model saw.
+static mut EARLY_AVAILABLE: u32 = 0
+static mut TOUCHED_WHILE_AVAILABLE: u32 = 0
+
+// The device reaches the registers and the DPRAM through two views, as on
+// the chip.
+struct UsbView: hal.Registers {
+    ram: bool
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(offset % 4 == 0)
+        unsafe {
+            if self.ram {
+                core.assert(offset < 0x1000)
+                return DPRAM[offset / 4]
+            }
+            core.assert(offset < 0x100)
+            if offset == INTS {
+                return pending_interrupts() & REGISTERS[INTE / 4]
+            }
+            return REGISTERS[offset / 4]
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        core.assert(offset % 4 == 0)
+        unsafe {
+            if self.ram {
+                core.assert(offset < 0x1000)
+                word := offset / 4
+                if offset >= 0x80 && offset < 0x100 {
+                    old := DPRAM[word]
+                    if (old & BUF_AVAILABLE) != 0 && value != 0 && (value & BUF_STALL) == 0 {
+                        // Only a SETUP packet's reset or a stall may take a
+                        // buffer back from the controller.
+                        TOUCHED_WHILE_AVAILABLE += 1
+                    }
+                    if (value & BUF_AVAILABLE) != 0 && (old | BUF_AVAILABLE) != value {
+                        EARLY_AVAILABLE += 1
+                    }
+                }
+                DPRAM[word] = value
+                return
+            }
+            alias := offset & 0x3000
+            register := offset & 0xFFF
+            core.assert(register < 0x100)
+            word := register / 4
+            core.assert(register != INTS && register != SOF_RD)
+            if register == SIE_STATUS || register == BUFF_STATUS {
+                core.assert_eq(alias, 0usize)
+                REGISTERS[word] &= ~value
+            } else if alias == 0x2000 {
+                REGISTERS[word] |= value
+            } else if alias == 0x3000 {
+                REGISTERS[word] &= ~value
+            } else {
+                core.assert_eq(alias, 0usize)
+                REGISTERS[word] = value
+            }
+        }
+    }
+}
+
+// INTR: buffers done, bus reset, suspend, resume, and SETUP.
+fn pending_interrupts() -> u32 {
+    unsafe {
+        status := REGISTERS[SIE_STATUS / 4]
+        pending := 0u32
+        if REGISTERS[BUFF_STATUS / 4] != 0 {
+            pending |= 1 << 4
+        }
+        if (status & BUS_RESET) != 0 {
+            pending |= 1 << 12
+        }
+        if (status & SUSPENDED) != 0 {
+            pending |= 1 << 14
+        }
+        if (status & RESUMED) != 0 {
+            pending |= 1 << 15
+        }
+        if (status & SETUP_REC) != 0 {
+            pending |= 1 << 16
+        }
+        return pending
+    }
+}
+
+fn register(offset: usize) -> u32 {
+    unsafe {
+        return REGISTERS[offset / 4]
+    }
+}
+
+fn set_status(bits: u32) {
+    unsafe {
+        REGISTERS[SIE_STATUS / 4] |= bits
+    }
+}
+
+fn reset_model() {
+    unsafe {
+        for index in 0..64usize {
+            REGISTERS[index] = 0
+        }
+        for index in 0..1024usize {
+            DPRAM[index] = 0xDEAD_BEEF
+        }
+        EARLY_AVAILABLE = 0
+        TOUCHED_WHILE_AVAILABLE = 0
+    }
+}
+
+fn new_device() -> rp_usb.Device<UsbView> {
+    reset_model()
+    device := rp_usb.Device.new(UsbView { ram: false }, UsbView { ram: true })
+    device.start(PRODUCT)
+    return device
+}
+
+// --- The simulated host -------------------------------------------------
+
+enum Reply {
+    Ack, Nak, Stall
+}
+
+// A transaction's outcome and, for IN, its data.
+struct Packet {
+    reply: Reply
+    data: [64]u8
+    length: usize
+}
+
+fn host_setup(packet: [8]u8) {
+    unsafe {
+        DPRAM[0] = packet[0] as u32 | (packet[1] as u32 << 8) | (packet[2] as u32 << 16) | (packet[3] as u32 << 24)
+        DPRAM[1] = packet[4] as u32 | (packet[5] as u32 << 8) | (packet[6] as u32 << 16) | (packet[7] as u32 << 24)
+        REGISTERS[SIE_STATUS / 4] |= SETUP_REC
+        // A SETUP packet ends an EP0 stall.
+        REGISTERS[EP_STALL_ARM / 4] = 0
+    }
+}
+
+fn buffer_address(endpoint: usize, incoming: bool) -> usize {
+    if endpoint == 0 {
+        return 0x100
+    }
+    control_offset := 0x08 + 8 * (endpoint - 1)
+    if !incoming {
+        control_offset += 4
+    }
+    unsafe {
+        control := DPRAM[control_offset / 4]
+        core.assert((control & EP_ENABLE) != 0)
+        return (control & 0xFFFF) as usize
+    }
+}
+
+// An IN token to `endpoint`; the device's packet must carry `data1`.
+fn host_in(endpoint: usize, data1: bool) -> Packet {
+    packet := Packet { reply: Reply.Nak, data: [0u8; 64], length: 0 }
+    offset := 0x80 + 8 * endpoint
+    unsafe {
+        control := DPRAM[offset / 4]
+        if endpoint == 0 && (REGISTERS[EP_STALL_ARM / 4] & 1) != 0 && (control & BUF_STALL) != 0 {
+            packet.reply = Reply.Stall
+            return packet
+        }
+        if (control & BUF_AVAILABLE) == 0 {
+            return packet
+        }
+        core.assert((control & BUF_FULL) != 0)
+        core.assert_eq((control & BUF_DATA1) != 0, data1)
+        length := (control & BUF_LENGTH) as usize
+        core.assert(length <= 64)
+        base := buffer_address(endpoint, true)
+        for index in 0..length {
+            word := DPRAM[(base + index) / 4]
+            packet.data[index] = ((word >> (8 * ((base + index) % 4) as u32)) & 0xFF) as u8
+        }
+        packet.length = length
+        packet.reply = Reply.Ack
+        DPRAM[offset / 4] = control & ~(BUF_AVAILABLE | BUF_FULL)
+        REGISTERS[BUFF_STATUS / 4] |= 1u32 << (2 * endpoint as u32)
+    }
+    return packet
+}
+
+// An OUT transaction of `data` to `endpoint`, with PID `data1`.
+fn host_out(endpoint: usize, data: &[u8], data1: bool) -> Reply {
+    offset := 0x84 + 8 * endpoint
+    unsafe {
+        control := DPRAM[offset / 4]
+        if endpoint == 0 && (REGISTERS[EP_STALL_ARM / 4] & 2) != 0 && (control & BUF_STALL) != 0 {
+            return Reply.Stall
+        }
+        if (control & BUF_AVAILABLE) == 0 {
+            return Reply.Nak
+        }
+        core.assert((control & BUF_FULL) == 0)
+        core.assert_eq((control & BUF_DATA1) != 0, data1)
+        core.assert(data.len <= (control & BUF_LENGTH) as usize)
+        base := buffer_address(endpoint, false)
+        for index in 0..data.len {
+            word := (base + index) / 4
+            shift := 8 * ((base + index) % 4) as u32
+            DPRAM[word] = (DPRAM[word] & ~(0xFFu32 << shift)) | ((data[index] as u32) << shift)
+        }
+        DPRAM[offset / 4] = (control & ~(BUF_AVAILABLE | BUF_LENGTH)) | BUF_FULL | data.len as u32
+        REGISTERS[BUFF_STATUS / 4] |= 1u32 << (2 * endpoint as u32 + 1)
+    }
+    return Reply.Ack
+}
+
+fn setup_packet(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> [8]u8 {
+    return [request_type, request, (value & 0xFF) as u8, (value >> 8) as u8, (index & 0xFF) as u8, (index >> 8) as u8, (length & 0xFF) as u8, (length >> 8) as u8]
+}
+
+// A control read: SETUP, IN data until a short packet or `length` bytes,
+// and the OUT status stage. Returns what the device sent.
+struct Response {
+    data: [256]u8
+    length: usize
+    packets: u32
+}
+
+fn control_read(device: &mut rp_usb.Device<UsbView>, request_type: u8, request: u8, value: u16, index: u16, length: u16) -> Response {
+    response := Response { data: [0u8; 256], length: 0, packets: 0 }
+    host_setup(setup_packet(request_type, request, value, index, length))
+    device.serve()
+    data1 := true
+    for {
+        packet := host_in(0, data1)
+        core.assert(packet.reply == Reply.Ack)
+        for index in 0..packet.length {
+            response.data[response.length + index] = packet.data[index]
+        }
+        response.length += packet.length
+        response.packets += 1
+        data1 = !data1
+        device.serve()
+        if packet.length < 64 || response.length == length as usize {
+            break
+        }
+    }
+    // Status stage: a zero-length DATA1 OUT packet.
+    core.assert(host_out(0, NOTHING, true) == Reply.Ack)
+    device.serve()
+    return response
+}
+
+// A control write without data or with `data` in one packet, and the IN
+// status stage. Returns the events the device reported.
+fn control_write(device: &mut rp_usb.Device<UsbView>, request_type: u8, request: u8, value: u16, index: u16, data: &[u8]) -> u32 {
+    host_setup(setup_packet(request_type, request, value, index, data.len as u16))
+    events := device.serve()
+    if data.len > 0 {
+        core.assert(host_out(0, data, true) == Reply.Ack)
+        events |= device.serve()
+    }
+    status := host_in(0, true)
+    core.assert(status.reply == Reply.Ack)
+    core.assert_eq(status.length, 0usize)
+    events |= device.serve()
+    return events
+}
+
+fn expect_stall(device: &mut rp_usb.Device<UsbView>, request_type: u8, request: u8, value: u16, index: u16, length: u16) {
+    host_setup(setup_packet(request_type, request, value, index, length))
+    device.serve()
+    stalled := host_in(0, true)
+    core.assert(stalled.reply == Reply.Stall)
+    core.assert(host_out(0, NOTHING, true) == Reply.Stall)
+}
+
+fn expect_rules_kept() {
+    unsafe {
+        core.assert_eq(EARLY_AVAILABLE, 0u32)
+        core.assert_eq(TOUCHED_WHILE_AVAILABLE, 0u32)
+    }
+}
+
+// Reset the bus, take address 9, and configure the device.
+fn enumerate(device: &mut rp_usb.Device<UsbView>) {
+    set_status(BUS_RESET)
+    device.serve()
+    control_read(device, 0x80, 6, 0x0100, 0, 64)
+    control_write(device, 0x00, 5, 9, 0, NOTHING)
+    control_read(device, 0x80, 6, 0x0200, 0, 255)
+    control_write(device, 0x00, 9, 1, 0, NOTHING)
+}
+
+fn open_port(device: &mut rp_usb.Device<UsbView>) {
+    enumerate(device)
+    control_write(device, 0x21, 0x22, 3, 0, NOTHING)
+    core.assert(device.is_connected())
+}
+
+// --- Checks -------------------------------------------------------------
+
+fn controller_setup() {
+    device := new_device()
+    core.assert_eq(register(USB_MUXING), (1u32 << 0) | (1u32 << 3))
+    core.assert_eq(register(USB_PWR), (1u32 << 2) | (1u32 << 3))
+    core.assert_eq(register(MAIN_CTRL), 1u32)
+    core.assert((register(SIE_CTRL) & PULLUP) != 0)
+    core.assert((register(SIE_CTRL) & (1u32 << 29)) != 0)
+    core.assert(!device.is_configured())
+    core.assert(!device.is_connected())
+    // Nothing happens without the host.
+    core.assert_eq(device.serve(), 0u32)
+    device.stop()
+    core.assert_eq(register(SIE_CTRL) & PULLUP, 0u32)
+    core.assert_eq(register(MAIN_CTRL), 0u32)
+    core.assert_eq(register(INTE), 0u32)
+}
+
+fn enumeration() {
+    device := new_device()
+    set_status(BUS_RESET)
+    device.serve()
+    core.assert_eq(register(SIE_STATUS) & BUS_RESET, 0u32)
+
+    // The device descriptor, asked for with 64 bytes as Windows does.
+    descriptor := control_read(&mut device, 0x80, 6, 0x0100, 0, 64)
+    core.assert_eq(descriptor.length, 18usize)
+    core.assert_eq(descriptor.data[0], 18u8)
+    core.assert_eq(descriptor.data[1], 1u8)
+    core.assert_eq(descriptor.data[4], 0x02u8)
+    core.assert_eq(descriptor.data[7], 64u8)
+    core.assert_eq(descriptor.data[8] as u16 | (descriptor.data[9] as u16 << 8), rp_usb.VENDOR_ID)
+    core.assert_eq(descriptor.data[10] as u16 | (descriptor.data[11] as u16 << 8), rp_usb.PRODUCT_ID)
+    core.assert_eq(descriptor.data[17], 1u8)
+
+    // The address applies after the status stage, not before.
+    host_setup(setup_packet(0x00, 5, 9, 0, 0))
+    device.serve()
+    core.assert_eq(register(ADDR_ENDP), 0u32)
+    status := host_in(0, true)
+    core.assert(status.reply == Reply.Ack)
+    core.assert_eq(status.length, 0usize)
+    device.serve()
+    core.assert_eq(register(ADDR_ENDP), 9u32)
+
+    // The configuration descriptor: its first 9 bytes, then all 67 in a
+    // full packet and a short one.
+    header := control_read(&mut device, 0x80, 6, 0x0200, 0, 9)
+    core.assert_eq(header.length, 9usize)
+    core.assert_eq(header.data[2] as usize | (header.data[3] as usize << 8), 67usize)
+    core.assert_eq(header.data[4], 2u8)
+    whole := control_read(&mut device, 0x80, 6, 0x0200, 0, 255)
+    core.assert_eq(whole.length, 67usize)
+    core.assert_eq(whole.packets, 2u32)
+    // The descriptors chain to exactly the total length, and name the
+    // three endpoints.
+    position := 0usize
+    endpoints := 0u32
+    for position < whole.length {
+        size := whole.data[position] as usize
+        core.assert(size >= 2)
+        if whole.data[position + 1] == 5 {
+            endpoints += 1
+        }
+        position += size
+    }
+    core.assert_eq(position, 67usize)
+    core.assert_eq(endpoints, 3u32)
+    // The first interface is CDC ACM.
+    core.assert_eq(whole.data[9 + 5], 0x02u8)
+    core.assert_eq(whole.data[9 + 6], 0x02u8)
+
+    // Strings: the language, the manufacturer, and the product.
+    languages := control_read(&mut device, 0x80, 6, 0x0300, 0, 255)
+    core.assert_eq(languages.length, 4usize)
+    core.assert_eq(languages.data[2], 0x09u8)
+    core.assert_eq(languages.data[3], 0x04u8)
+    product := control_read(&mut device, 0x80, 6, 0x0302, 0x0409, 255)
+    core.assert_eq(product.length, 2 + 2 * PRODUCT.len)
+    core.assert_eq(product.data[1], 3u8)
+    for index in 0..PRODUCT.len {
+        core.assert_eq(product.data[2 + 2 * index], PRODUCT[index])
+        core.assert_eq(product.data[3 + 2 * index], 0u8)
+    }
+    manufacturer := control_read(&mut device, 0x80, 6, 0x0301, 0x0409, 255)
+    core.assert_eq(manufacturer.length, 10usize)
+    core.assert_eq(manufacturer.data[2], 0x44u8)
+    // A short read of a string.
+    cut := control_read(&mut device, 0x80, 6, 0x0302, 0x0409, 2)
+    core.assert_eq(cut.length, 2usize)
+
+    // No serial number string, and no device qualifier: a full-speed-only
+    // device refuses it. The stall ends with the next SETUP packet.
+    expect_stall(&mut device, 0x80, 6, 0x0303, 0x0409, 255)
+    expect_stall(&mut device, 0x80, 6, 0x0600, 0, 10)
+    expect_stall(&mut device, 0x40, 0x99, 0, 0, 0)
+
+    // Configuring enables the endpoints and is reported.
+    core.assert(!device.is_configured())
+    unconfigured := control_read(&mut device, 0x80, 8, 0, 0, 1)
+    core.assert_eq(unconfigured.data[0], 0u8)
+    events := control_write(&mut device, 0x00, 9, 1, 0, NOTHING)
+    core.assert((events & rp_usb.LINE_CHANGED) != 0)
+    core.assert(device.is_configured())
+    core.assert(!device.is_connected())
+    configured := control_read(&mut device, 0x80, 8, 0, 0, 1)
+    core.assert_eq(configured.data[0], 1u8)
+    status_reply := control_read(&mut device, 0x80, 0, 0, 0, 2)
+    core.assert_eq(status_reply.length, 2usize)
+    alternate := control_read(&mut device, 0x81, 10, 0, 1, 1)
+    core.assert_eq(alternate.data[0], 0u8)
+    control_write(&mut device, 0x01, 11, 0, 1, NOTHING)
+    expect_stall(&mut device, 0x01, 11, 1, 1, 0)
+    // The receive endpoint waits for data at once.
+    core.assert(host_out(2, b"x", false) == Reply.Ack)
+    expect_rules_kept()
+}
+
+fn line_control() {
+    device := new_device()
+    enumerate(&mut device)
+    // A terminal opens the port: DTR and RTS.
+    events := control_write(&mut device, 0x21, 0x22, 3, 0, NOTHING)
+    core.assert((events & rp_usb.LINE_CHANGED) != 0)
+    core.assert(device.is_connected())
+    core.assert_eq(device.line_state(), rp_usb.DTR | rp_usb.RTS)
+    // The same state again is no change.
+    core.assert_eq(control_write(&mut device, 0x21, 0x22, 3, 0, NOTHING) & rp_usb.LINE_CHANGED, 0u32)
+
+    // The line coding: 115200 8N1 at first, then what the host sets.
+    coding := control_read(&mut device, 0xA1, 0x21, 0, 0, 7)
+    core.assert_eq(coding.length, 7usize)
+    core.assert_eq(device.baud(), 115_200u32)
+    core.assert_eq(coding.data[6], 8u8)
+    coding_9600: [7]u8 = [0x80, 0x25, 0, 0, 0, 0, 8]
+    coding_1200: [7]u8 = [0xB0, 0x04, 0, 0, 0, 0, 8]
+    events = control_write(&mut device, 0x21, 0x20, 0, 0, &coding_9600)
+    core.assert_eq(events & rp_usb.BOOTLOADER_REQUESTED, 0u32)
+    core.assert_eq(device.baud(), 9600u32)
+    coding = control_read(&mut device, 0xA1, 0x21, 0, 0, 7)
+    core.assert_eq(coding.data[0], 0x80u8)
+    core.assert_eq(coding.data[1], 0x25u8)
+    control_write(&mut device, 0x21, 0x23, 0, 0, NOTHING)
+
+    // 1200 baud asks for the bootloader, once the status stage is done.
+    host_setup(setup_packet(0x21, 0x20, 0, 0, 7))
+    core.assert_eq(device.serve(), 0u32)
+    core.assert(host_out(0, &coding_1200, true) == Reply.Ack)
+    core.assert_eq(device.serve() & rp_usb.BOOTLOADER_REQUESTED, 0u32)
+    status := host_in(0, true)
+    core.assert(status.reply == Reply.Ack)
+    core.assert((device.serve() & rp_usb.BOOTLOADER_REQUESTED) != 0)
+    // Unless the program turned that off.
+    device.set_bootloader_reset(false)
+    events = control_write(&mut device, 0x21, 0x20, 0, 0, &coding_1200)
+    core.assert_eq(events & rp_usb.BOOTLOADER_REQUESTED, 0u32)
+
+    // The terminal closes the port.
+    events = control_write(&mut device, 0x21, 0x22, 0, 0, NOTHING)
+    core.assert((events & rp_usb.LINE_CHANGED) != 0)
+    core.assert(device.is_configured())
+    core.assert(!device.is_connected())
+
+    // Suspension hides the port until the host resumes the bus.
+    control_write(&mut device, 0x21, 0x22, 1, 0, NOTHING)
+    set_status(SUSPENDED)
+    core.assert((device.serve() & rp_usb.LINE_CHANGED) != 0)
+    core.assert(!device.is_connected())
+    set_status(RESUMED)
+    core.assert((device.serve() & rp_usb.LINE_CHANGED) != 0)
+    core.assert(device.is_connected())
+
+    // A suspension latched with a bus reset, as when the bus idles before
+    // the host first resets it, is over once the reset is.
+    set_status(SUSPENDED | BUS_RESET)
+    device.serve()
+    enumerate(&mut device)
+    core.assert(device.is_configured())
+    // A suspension the host ends with a request rather than resume
+    // signaling.
+    set_status(SUSPENDED)
+    device.serve()
+    core.assert(!device.is_configured())
+    control_read(&mut device, 0x80, 8, 0, 0, 1)
+    core.assert(device.is_configured())
+
+    // A bus reset forgets the configuration and the address.
+    set_status(BUS_RESET)
+    core.assert((device.serve() & rp_usb.LINE_CHANGED) != 0)
+    core.assert(!device.is_configured())
+    core.assert_eq(register(ADDR_ENDP), 0u32)
+    expect_rules_kept()
+}
+
+// Collect what the host reads from the data endpoint until it NAKs.
+struct Received {
+    data: [2048]u8
+    length: usize
+    packets: u32
+    zero_packets: u32
+}
+
+fn drain(device: &mut rp_usb.Device<UsbView>, data1: &mut bool) -> Received {
+    received := Received { data: [0u8; 2048], length: 0, packets: 0, zero_packets: 0 }
+    for {
+        packet := host_in(2, *data1)
+        if packet.reply != Reply.Ack {
+            break
+        }
+        *data1 = !*data1
+        for index in 0..packet.length {
+            received.data[received.length + index] = packet.data[index]
+        }
+        received.length += packet.length
+        received.packets += 1
+        if packet.length == 0 {
+            received.zero_packets += 1
+        }
+        core.assert((device.serve() & rp_usb.SENT) != 0)
+    }
+    return received
+}
+
+fn sending() {
+    device := new_device()
+    open_port(&mut device)
+    data1 := false
+    // Newlines go out as CR LF.
+    core.assert_eq(device.queue(b"hello\n"), 6usize)
+    received := drain(&mut device, &mut data1)
+    core.assert_eq(received.length, 7usize)
+    core.assert_eq(received.data[5], 0x0Du8)
+    core.assert_eq(received.data[6], 0x0Au8)
+    core.assert_eq(device.unsent(), 0usize)
+
+    // 200 bytes: three full packets and a short one, PIDs alternating.
+    device.set_crlf(false)
+    block := [0u8; 200]
+    for index in 0..200usize {
+        block[index] = index as u8
+    }
+    core.assert_eq(device.queue(&block), 200usize)
+    received = drain(&mut device, &mut data1)
+    core.assert_eq(received.length, 200usize)
+    core.assert_eq(received.packets, 4u32)
+    core.assert_eq(received.zero_packets, 0u32)
+    for index in 0..200usize {
+        core.assert_eq(received.data[index], index as u8)
+    }
+
+    // Exactly one packet's worth ends with a zero-length packet.
+    core.assert_eq(device.queue(&block[..64]), 64usize)
+    received = drain(&mut device, &mut data1)
+    core.assert_eq(received.length, 64usize)
+    core.assert_eq(received.packets, 2u32)
+    core.assert_eq(received.zero_packets, 1u32)
+
+    // A full queue takes no more until the host reads.
+    filler := [0x41u8; 300]
+    total := 0usize
+    for _ in 0..10u32 {
+        total += device.queue(&filler)
+    }
+    // One packet is in flight, outside the queue.
+    core.assert_eq(total, rp_usb.TX_CAPACITY + 64)
+    core.assert_eq(device.room(), 0usize)
+    core.assert_eq(device.queue(b"x"), 0usize)
+    // A CR LF needs room for both bytes.
+    device.set_crlf(true)
+    received = drain(&mut device, &mut data1)
+    core.assert_eq(received.length, rp_usb.TX_CAPACITY + 64)
+    core.assert_eq(device.room(), rp_usb.TX_CAPACITY)
+
+    // make_room drops the oldest output.
+    device.set_crlf(false)
+    for _ in 0..4u32 {
+        device.queue(&filler)
+    }
+    device.make_room(100)
+    core.assert(device.room() >= 100)
+    core.assert_eq(device.queue(b"PANIC"), 5usize)
+    received = drain(&mut device, &mut data1)
+    core.assert_eq(received.data[received.length - 1], 0x43u8)
+    expect_rules_kept()
+}
+
+fn output_before_configuration() {
+    device := new_device()
+    device.set_crlf(false)
+    // Written before the host configures the device: kept, then sent.
+    core.assert_eq(device.queue(b"boot banner"), 11usize)
+    core.assert_eq(device.unsent(), 11usize)
+    open_port(&mut device)
+    data1 := false
+    received := drain(&mut device, &mut data1)
+    core.assert_eq(received.length, 11usize)
+    core.assert_eq(received.data[0], 0x62u8)
+
+    // Reconfiguring restarts the data toggles at DATA0.
+    control_write(&mut device, 0x00, 9, 1, 0, NOTHING)
+    device.queue(b"again")
+    data1 = false
+    received = drain(&mut device, &mut data1)
+    core.assert_eq(received.length, 5usize)
+    expect_rules_kept()
+}
+
+fn receiving() {
+    device := new_device()
+    open_port(&mut device)
+    data1 := false
+    // Enter sends CR; reads see "\n".
+    core.assert(host_out(2, b"ab\r", data1) == Reply.Ack)
+    data1 = !data1
+    core.assert((device.serve() & rp_usb.RECEIVED) != 0)
+    core.assert_eq(device.available(), 3usize)
+    buffer := [0u8; 300]
+    core.assert_eq(device.take(&mut buffer), 3usize)
+    core.assert_eq(buffer[0], 0x61u8)
+    core.assert_eq(buffer[2], 0x0Au8)
+    // The LF of a CR LF that follows is dropped.
+    core.assert(host_out(2, b"\ncd\r\n", data1) == Reply.Ack)
+    data1 = !data1
+    device.serve()
+    core.assert_eq(device.take(&mut buffer), 3usize)
+    core.assert_eq(buffer[0], 0x63u8)
+    core.assert_eq(buffer[2], 0x0Au8)
+
+    // The host waits once the queue has no room for another packet.
+    device.set_crlf(false)
+    packet := [0x55u8; 64]
+    accepted := 0u32
+    for _ in 0..10u32 {
+        if host_out(2, &packet, data1) != Reply.Ack {
+            break
+        }
+        data1 = !data1
+        accepted += 1
+        device.serve()
+    }
+    core.assert_eq(accepted, (rp_usb.RX_CAPACITY / 64) as u32)
+    core.assert_eq(device.available(), rp_usb.RX_CAPACITY)
+    // Reading makes room, and the host may send again.
+    core.assert_eq(device.take(&mut buffer[..100]), 100usize)
+    core.assert(host_out(2, &packet, data1) == Reply.Ack)
+    data1 = !data1
+    device.serve()
+    core.assert_eq(device.available(), rp_usb.RX_CAPACITY - 100 + 64)
+    total := 0usize
+    for {
+        count := device.take(&mut buffer)
+        if count == 0 {
+            break
+        }
+        total += count
+    }
+    core.assert_eq(total, rp_usb.RX_CAPACITY - 100 + 64)
+    // A short packet.
+    core.assert(host_out(2, b"z", data1) == Reply.Ack)
+    device.serve()
+    core.assert_eq(device.take(&mut buffer), 1usize)
+    core.assert_eq(buffer[0], 0x7Au8)
+    expect_rules_kept()
+}
+
+fn main() {
+    controller_setup()
+    enumeration()
+    line_control()
+    sending()
+    output_before_configuration()
+    receiving()
+}

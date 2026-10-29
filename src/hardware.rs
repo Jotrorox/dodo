@@ -25,6 +25,7 @@ use std::path::PathBuf;
 pub mod image;
 mod rp2040;
 mod rp2350;
+pub mod serial;
 
 #[derive(Debug)]
 pub struct Chip {
@@ -52,6 +53,9 @@ pub struct Chip {
     /// The standard library package `import "std/embedded/chip"` selects.
     pub package: &'static str,
     pub image: ImageFormat,
+    /// The USB IDs of the serial port the chip package's firmware can open,
+    /// through which `dodo run` restarts the board into its bootloader.
+    pub usb_serial: Option<serial::UsbId>,
     /// Chip-specific changes to the linked ELF, such as boot checksums.
     pub fixup: Fixup,
 }

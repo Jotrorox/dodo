@@ -3,6 +3,7 @@ package pico2_w
 import "std/embedded/wireless/cyw43"
 import "std/embedded/hal"
 import "std/embedded/chip/rp2350"
+import "std/embedded/chip/rp_usb"
 
 // Raspberry Pi Pico 2 W: a Pico 2 (RP2350A, 12 MHz crystal, 4 MiB of flash)
 // with an Infineon CYW43439 wireless chip. The green user LED hangs off the
@@ -63,6 +64,9 @@ pub struct Board {
     pub pins: rp2350.Pins
     // The 1 MHz system timer: delay_us, delay_ms, and now_us.
     pub timer: rp2350.Timer
+    // The USB port: `serial()` makes the board a USB serial port, for
+    // printing over the USB cable.
+    pub usb: Usb
 }
 
 // Start the chip with the Pico 2 W's crystal, power up the wireless chip,
@@ -79,8 +83,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer } = chip
-    return ok(Board { led, pins, timer })
+    let rp2350.Peripherals { pins, timer, usb } = chip
+    return ok(Board { led, pins, timer, usb: Usb { usb } })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal
@@ -139,8 +143,27 @@ pub struct Led {
     }
 }
 
+// The USB port, as `b.usb`.
+pub struct Usb {
+    usb: rp2350.Usb
+
+    // Make the board a USB serial port named after it, for printing and
+    // reading over the USB cable; rp_usb documents the port. After a
+    // restart into the bootloader through the port, as `dodo run` does,
+    // the LED is on the wireless chip, so no pin shows the bootloader's drive activity. Busy if a port is open.
+    pub fn serial(&mut self) -> rp_usb.Serial!hal.Error {
+        return self.usb.serial_as(NAME, rp2350.PIN_COUNT)
+    }
+
+    // Give back the port: the board disconnects from the host.
+    pub fn release_serial(&mut self, serial: rp_usb.Serial) {
+        self.usb.release_serial(serial)
+    }
+}
+
 // Write a failed check's message to every serial port claimed from
-// `b.pins.uart`, as the default panic hook does before it halts. For a panic
+// `b.pins.uart` and to the USB serial port, as the default panic hook does
+// before it halts. For a panic
 // hook of your own, for example one that restarts into the bootloader so
 // `dodo run` works again without pressing BOOTSEL:
 //

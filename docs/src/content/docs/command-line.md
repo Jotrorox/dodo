@@ -311,7 +311,9 @@ dodo run blink.dodo --board pico
 ```
 
 The first writes `build/blink.elf` and the flashable `build/blink.uf2`; the
-second copies the image to a Raspberry Pi Pico held in BOOTSEL mode. Boards need
+second copies the image to a Raspberry Pi Pico held in BOOTSEL mode, or first
+restarts a Pico running firmware with a [USB serial port](hardware.md#usb-serial-on-the-rp2040-and-rp2350)
+into that mode by itself. Boards need
 an ELF linker, `ld.lld` by default (Homebrew and most Linux distributions
 package it as `lld`). See [hardware and embedded](hardware.md#boards).
 Otherwise `run` executes only the host target. The repository exercises
