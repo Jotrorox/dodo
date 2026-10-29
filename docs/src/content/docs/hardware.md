@@ -1434,6 +1434,7 @@ is a small command line over USB.
 | Panics | Until the port is released, a panic writes its report to it, and the default panic hook keeps serving the port after it halts: a terminal opened later still receives the report, and `dodo run` still works. |
 | Identity | Raspberry Pi's vendor ID `0x2E8A` with the Pico SDK's USB serial product ID `0x000A`, manufacturer "Dodo", and the board's name as the product. `b.usb.serial()` claims the port once (`Busy` otherwise); `b.usb.release_serial(port)` disconnects from the host and stops the controller. |
 | Clocks | The controller runs at 48 MHz from PLL_USB, which the ADC shares: the PLL runs while either uses it. |
+| Limits | One serial port, in device mode only: no host mode and no other USB classes. The queues are fixed at 256 bytes in (`rp_usb.RX_CAPACITY`) and 1 KiB out (`rp_usb.TX_CAPACITY`). |
 
 A task woken by the port reads until nothing is left:
 

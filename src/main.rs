@@ -777,20 +777,19 @@ fn restart_into_bootloader(args: &Args, platform: Platform) -> Result<Vec<PathBu
         );
     }
     serial::request_bootloader(port)?;
-    // The board restarts at once; the host mounts its drive a few seconds
-    // later.
-    let start = std::time::Instant::now();
-    while start.elapsed() < std::time::Duration::from_secs(15) {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let drives = platform.bootloader_drives();
-        if !drives.is_empty() {
-            return Ok(drives);
-        }
+    let drives = serial::wait_for_drives(
+        serial::BOOTLOADER_DRIVE_WAIT,
+        std::time::Duration::from_millis(200),
+        || platform.bootloader_drives(),
+    );
+    if !drives.is_empty() {
+        return Ok(drives);
     }
     Err(format!(
-        "the board on {} did not appear as the {} drive within 15 seconds; its firmware may have turned off the restart (set_bootloader_reset), or hold BOOTSEL while connecting it, then run again",
+        "the board on {} did not appear as the {} drive within {} seconds; its firmware may have turned off the restart (set_bootloader_reset), or hold BOOTSEL while connecting it, then run again",
         port.display(),
-        platform.bootloader_drive_name()
+        platform.bootloader_drive_name(),
+        serial::BOOTLOADER_DRIVE_WAIT.as_secs()
     ))
 }
 fn execute(mut args: Args) -> Result<i32, String> {

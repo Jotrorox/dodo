@@ -4,6 +4,7 @@
 //! when the host sets the port to 1200 baud, so `dodo run` needs no BOOTSEL
 //! button press.
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The USB vendor and product IDs of a board's serial port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +15,28 @@ pub struct UsbId {
 
 /// The baud rate that asks the firmware to restart into its bootloader.
 pub const BOOTLOADER_BAUD: u32 = 1200;
+
+/// How long a restarted board has to appear as its bootloader drive: it
+/// restarts at once, and the host mounts the drive a few seconds later.
+pub const BOOTLOADER_DRIVE_WAIT: Duration = Duration::from_secs(15);
+
+/// Call `drives` every `interval` until it returns some, and return those,
+/// or none once `timeout` has passed without any.
+pub fn wait_for_drives(
+    timeout: Duration,
+    interval: Duration,
+    mut drives: impl FnMut() -> Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        std::thread::sleep(interval);
+        let found = drives();
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    vec![]
+}
 
 /// Serial ports of attached USB devices with `id`, sorted. Linux and macOS
 /// only; elsewhere none.
@@ -182,6 +205,34 @@ mod tests {
         +-o IOSerialBSDClient  <class IOSerialBSDClient, id 0x9>
               "IOCalloutDevice" = "/dev/cu.usbmodem2101"
 "#;
+
+    #[test]
+    fn waiting_for_drives_returns_them_once_mounted() {
+        let mut calls = 0;
+        let drives = wait_for_drives(Duration::from_secs(5), Duration::ZERO, || {
+            calls += 1;
+            if calls < 3 {
+                vec![]
+            } else {
+                vec![PathBuf::from("/Volumes/RPI-RP2")]
+            }
+        });
+        assert_eq!(drives, [PathBuf::from("/Volumes/RPI-RP2")]);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn waiting_for_drives_gives_up_after_the_timeout() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let drives = wait_for_drives(Duration::from_millis(50), Duration::from_millis(10), || {
+            calls += 1;
+            vec![]
+        });
+        assert!(drives.is_empty());
+        assert!(calls >= 1);
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
 
     #[test]
     fn ioreg_ports_belong_to_the_nearest_device_with_ids() {
