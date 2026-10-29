@@ -124,6 +124,12 @@ pub fn ioreg_ports(text: &str, id: UsbId) -> Vec<PathBuf> {
 #[cfg(all(unix, feature = "llvm"))]
 pub fn request_bootloader(port: &Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
+    // Declared here under their plain names: the libc crate binds them to
+    // versioned glibc symbols, which the static release link cannot resolve.
+    unsafe extern "C" {
+        fn cfsetispeed(settings: *mut libc::termios, speed: libc::speed_t) -> libc::c_int;
+        fn cfsetospeed(settings: *mut libc::termios, speed: libc::speed_t) -> libc::c_int;
+    }
     let path = std::ffi::CString::new(port.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
     let failed = |action: &str| {
         let error = std::io::Error::last_os_error();
@@ -148,8 +154,8 @@ pub fn request_bootloader(port: &Path) -> Result<(), String> {
         let mut settings: libc::termios = std::mem::zeroed();
         let result = if libc::tcgetattr(fd, &mut settings) != 0 {
             Err(failed("read the settings of"))
-        } else if libc::cfsetispeed(&mut settings, libc::B1200) != 0
-            || libc::cfsetospeed(&mut settings, libc::B1200) != 0
+        } else if cfsetispeed(&mut settings, libc::B1200) != 0
+            || cfsetospeed(&mut settings, libc::B1200) != 0
             || libc::tcsetattr(fd, libc::TCSANOW, &settings) != 0
         {
             Err(failed("set the baud rate of"))
