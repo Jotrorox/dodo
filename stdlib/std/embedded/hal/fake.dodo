@@ -184,6 +184,119 @@ pub struct Spi {
     }
 }
 
+// A PWM output that remembers its duty. It starts at 0, low.
+pub struct Pwm {
+    max: u16
+    duty: u16
+    changes: u32
+    failure: Option<hal.Error>
+
+    // An output whose duty runs from 0 to `max_duty`, at least 1.
+    pub fn new(max_duty: u16) -> Pwm {
+        core.assert(max_duty != 0)
+        return Pwm { max: max_duty, duty: 0, changes: 0, failure: none }
+    }
+
+    pub fn max_duty(&self) -> u16 {
+        return self.max
+    }
+
+    pub fn set_duty(&mut self, duty: u16) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if duty > self.max {
+            return err(hal.Error.InvalidInput)
+        }
+        self.duty = duty
+        self.changes += 1
+        return ok()
+    }
+
+    // The duty last set.
+    pub fn duty(&self) -> u16 {
+        return self.duty
+    }
+
+    // The number of duties set so far.
+    pub fn changes(&self) -> u32 {
+        return self.changes
+    }
+
+    // Make the next set_duty fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+}
+
+// An analog input that reads the value given to `set`, at first 0, or the
+// values given to `queue`, one per read, before that.
+pub struct Analog {
+    max: u16
+    value: u16
+    queued: [32]u16
+    queued_length: usize
+    queued_position: usize
+    reads: u32
+    failure: Option<hal.Error>
+
+    // An input whose values run from 0 to `max_value`, such as 4095 for a
+    // 12-bit converter.
+    pub fn new(max_value: u16) -> Analog {
+        return Analog { max: max_value, value: 0, queued: [0u16; 32], queued_length: 0, queued_position: 0, reads: 0, failure: none }
+    }
+
+    pub fn max_value(&self) -> u16 {
+        return self.max
+    }
+
+    // Read `value` from now on, once queued values are used up. Traps if it
+    // is above max_value.
+    pub fn set(&mut self, value: u16) {
+        core.assert(value <= self.max)
+        self.value = value
+    }
+
+    // Values for the next reads to return in order, after any still
+    // unread, before the one given to `set`. At most 32 can wait at once.
+    pub fn queue(&mut self, values: &[u16]) {
+        unread := self.queued_length - self.queued_position
+        core.assert(unread + values.len <= 32)
+        for index in 0..unread {
+            self.queued[index] = self.queued[self.queued_position + index]
+        }
+        for index in 0..values.len {
+            core.assert(values[index] <= self.max)
+            self.queued[unread + index] = values[index]
+        }
+        self.queued_position = 0
+        self.queued_length = unread + values.len
+    }
+
+    pub fn read(&mut self) -> u16!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        self.reads += 1
+        if self.queued_position < self.queued_length {
+            value := self.queued[self.queued_position]
+            self.queued_position += 1
+            return ok(value)
+        }
+        return ok(self.value)
+    }
+
+    // The number of successful reads so far.
+    pub fn reads(&self) -> u32 {
+        return self.reads
+    }
+
+    // Make the next read fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+}
+
 // A serial port that records the most recent 256 bytes written and reads
 // back bytes given to `feed`, as if they had arrived on its receive line;
 // once they are read, reads report end of input. Implements the std/io

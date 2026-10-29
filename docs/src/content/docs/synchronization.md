@@ -256,6 +256,20 @@ fn increments_and_replaces() {
 
 `atomic.Atomic.new(value)` stores an inline integer. `allocated.Atomic` supplies
 a retained stable allocation for sharing the same atomic across move tasks.
+A `static` can hold an inline atomic, shared by every thread and interrupt
+handler without `unsafe`:
+
+```dodo
+static REQUESTS: atomic.Atomic<u64> = atomic.Atomic.new(0u64)
+
+fn handled() -> u64!error.Error {
+    return REQUESTS.fetch_add(1, atomic.Ordering.Relaxed)
+}
+```
+
+Such a static is placed in writable memory although it is not `mut`. A
+`const` cannot hold an atomic, because each use of a constant is a separate
+copy.
 Both expose `load`, `store`, `exchange`, `fetch_add`, and strong
 `compare_exchange`, with explicit `atomic.Ordering`: Relaxed, Acquire, Release,
 AcqRel, or SeqCst. `fetch_add` wraps. Compare-exchange returns
@@ -268,12 +282,20 @@ intrinsics require literal ordering codes 0–4 and diagnose invalid combination
 Pointers must be aligned, live, and accessed through a compatible atomic protocol.
 Volatile/MMIO operations are not synchronization.
 
-The backend supports native integer atomic instructions on x86-64 and AArch64,
-widths 8/16/32/64 no wider than the target pointer. It inserts no OS/libatomic
-fallback. Hosted x64 tests exercise the operations; other accepted architectures
-are compilation capabilities, not claimed hardware verification. Unsupported
-targets, including Cortex-M0 and non-atomic WebAssembly, receive a build
-diagnostic. Importing unused atomic declarations requires no OS adapter.
+The backend supports native integer atomic instructions on x86-64, AArch64,
+and the Arm Cortex-M cores with exclusive loads and stores (ARMv7-M,
+ARMv7E-M, and ARMv8-M, such as the RP2350's Cortex-M33), with widths
+8/16/32/64 no wider than the target pointer. ARMv6-M (Cortex-M0 and M0+, as
+in the RP2040) supports `load` and `store` only. It inserts no OS/libatomic
+fallback. Hosted x64 and AArch64 tests and the board self-tests exercise the
+operations; other accepted architectures are compilation capabilities, not
+claimed hardware verification. An operation the target cannot perform, such
+as `fetch_add` on ARMv6-M or anything on non-atomic WebAssembly, is a build
+diagnostic where the program can reach it. Importing unused atomic
+declarations, or containing unreachable operations, requires no OS adapter
+and builds for every target. See
+[sharing state with atomics](hardware.md#sharing-state-with-atomics) for
+interrupt handlers.
 Payload operations are lock-free for those supported native widths. Retaining
 and destroying shared owners use native locks; constructors and blocking APIs
 have no lock-free guarantee.

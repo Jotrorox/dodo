@@ -163,8 +163,20 @@ fn check_program(
         function.from = context.functions[&function.name].from.clone();
     }
     let mut lifted = Vec::new();
-    for constant in &mut program.constants {
+    let atomic_constants: Vec<bool> = program
+        .constants
+        .iter()
+        .map(|constant| !constant.static_ && program.holds_interior_mutable(&constant.ty))
+        .collect();
+    for (constant, atomic) in program.constants.iter_mut().zip(atomic_constants) {
+        let functions = &program.functions;
         let result = (|| {
+            if atomic {
+                return Err(Diagnostic::new(
+                    constant.span,
+                    "a `const` cannot hold an atomic: each use would be a separate copy; declare shared storage with `static`",
+                ));
+            }
             let mut checker = Checker::new(&context, Type::Void, vec![], HashMap::new());
             checker.namespace = context.function_namespace(&constant.name);
             checker.function_name = constant.name.clone();
@@ -172,6 +184,7 @@ fn check_program(
             lifted.append(&mut checker.closures);
             let value = value?;
             checker.expect(&constant.ty, &value.ty, constant.span)?;
+            inline_constructors(&mut constant.value, functions);
             if !constant_expression(&constant.value) {
                 return Err(Diagnostic::new(
                     constant.span,
@@ -5672,6 +5685,79 @@ fn validate_constant(expression: &Expr, bits: u32) -> Check<()> {
     }
     Ok(())
 }
+// A call to a constructor with constant arguments is replaced by the struct
+// literal it returns, so `atomic.Atomic.new(0u32)` can initialize a static.
+// A constructor is a safe function whose body is only `return S { ... }`,
+// with every field a parameter or a constant expression.
+fn inline_constructors(expression: &mut Expr, functions: &[Function]) {
+    match &mut expression.kind {
+        ExprKind::Unary(_, e)
+        | ExprKind::Cast(e, _)
+        | ExprKind::Constant(e, _)
+        | ExprKind::Repeat(e, _) => inline_constructors(e, functions),
+        ExprKind::Binary(_, a, b) => {
+            inline_constructors(a, functions);
+            inline_constructors(b, functions);
+        }
+        ExprKind::Array(_, elements) => {
+            for element in elements {
+                inline_constructors(element, functions);
+            }
+        }
+        ExprKind::Struct(_, fields) => {
+            for (_, value) in fields {
+                inline_constructors(value, functions);
+            }
+        }
+        ExprKind::Call { args, .. } => {
+            for arg in args {
+                inline_constructors(arg, functions);
+            }
+        }
+        _ => {}
+    }
+    let ExprKind::Call { name, args, .. } = &expression.kind else {
+        return;
+    };
+    let Some(function) = functions.iter().find(|f| f.name == *name) else {
+        return;
+    };
+    let Some([statement]) = function.body.as_deref() else {
+        return;
+    };
+    let StmtKind::Return(Some(Expr {
+        kind: ExprKind::Struct(ty, fields),
+        ..
+    })) = &statement.kind
+    else {
+        return;
+    };
+    if function.unsafe_
+        || function.extern_
+        || !function.generics.is_empty()
+        || function.params.len() != args.len()
+        || !args.iter().all(constant_expression)
+    {
+        return;
+    }
+    let mut inlined = Vec::new();
+    for (field, value) in fields {
+        let parameter = match &value.kind {
+            ExprKind::Name(name) => function.params.iter().position(|p| p.name == *name),
+            _ => None,
+        };
+        inlined.push((
+            field.clone(),
+            match parameter {
+                Some(index) => args[index].clone(),
+                None if constant_expression(value) => value.clone(),
+                None => return,
+            },
+        ));
+    }
+    expression.kind = ExprKind::Struct(ty.clone(), inlined);
+}
+
 fn constant_expression(expression: &Expr) -> bool {
     match &expression.kind {
         ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::String(..) => true,

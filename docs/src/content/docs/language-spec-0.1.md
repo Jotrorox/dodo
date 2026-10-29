@@ -205,7 +205,11 @@ Wildcard imports and re-export declarations are not supported.
 
 **PKG-INIT.** There is no implicit package initialization hook or import-time execution.
 Package `const` and `static` initializers must be constant expressions; ordinary
-function calls in them are rejected. Constant dependencies may refer forward
+function calls in them are rejected. A call to a constructor with constant
+arguments is the exception: a safe, non-generic function (after
+instantiation) whose body is only `return S { ... }`, with every field a
+parameter or a constant expression, stands for the struct literal it returns,
+as in `static HITS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)`. Constant dependencies may refer forward
 across the loaded package graph; cycles and dependencies on mutable statics are
 errors. Static storage is initialized before entry to the program. This imposes
 no runtime order among imports, because their initialization has no side effects.
@@ -1442,7 +1446,12 @@ any reachable use rather than silently weaken a critical section (ID-HW).
 Mutable static globals require unsafe access unless a synchronization primitive
 encapsulates them. Core atomics are the narrow exception to ordinary immutable
 shared-access restrictions; they must not expose ordinary mutable references to
-storage accessible concurrently.
+storage accessible concurrently. A non-`mut` `static` that holds an atomic is
+therefore placed in writable storage and accessed safely through shared
+references, including from interrupt handlers; a `const`, which is copied at
+each use, cannot hold one. A target may provide only some atomic operations
+(ARMv6-M has loads and stores only); a reachable operation it lacks is a build
+error, never a call into an OS or libatomic fallback.
 
 Interrupt-safe wrappers must account for every context that can reach the
 underlying storage.

@@ -134,6 +134,50 @@ pub fn pointer_bits(options: &Options) -> Result<u32> {
 }
 /// Declared for reachable `core/cpu` calls the target cannot lower.
 const UNSUPPORTED_CPU: &str = "dodo.unsupported.cpu.";
+/// Declared for reachable `mem.atomic_*` calls the target cannot lower,
+/// suffixed with the operation and its LLVM integer type.
+const UNSUPPORTED_ATOMIC: &str = "dodo.unsupported.atomic.";
+
+/// What `mem.atomic_*` lowers to native instructions on a target triple.
+#[derive(Clone, Copy, PartialEq)]
+enum AtomicSupport {
+    /// Loads, stores, and read-modify-write operations.
+    Full,
+    /// Single-copy atomic loads and stores only (ARMv6-M).
+    LoadStore,
+    None,
+}
+
+fn atomic_support(triple: &str) -> AtomicSupport {
+    let arch = triple.split('-').next().unwrap_or_default();
+    // LLVM spells Apple's AArch64 as `arm64` (and `arm64e`). ARMv7-M,
+    // ARMv7E-M, and ARMv8-M (Cortex-M3, M4, M7, M23, M33, M55, M85) have
+    // exclusive loads and stores up to 32 bits; the checker limits widths to
+    // the pointer width.
+    if ["x86_64", "aarch64", "arm64", "arm64e"].contains(&arch)
+        || ["thumbv7m", "thumbv7em", "thumbv8m.", "thumbv8.1m."]
+            .iter()
+            .any(|prefix| arch.starts_with(prefix))
+    {
+        AtomicSupport::Full
+    } else if arch.starts_with("thumbv6m") {
+        AtomicSupport::LoadStore
+    } else {
+        AtomicSupport::None
+    }
+}
+
+fn unsupported_atomic(op: &str, triple: &str) -> String {
+    if atomic_support(triple) == AtomicSupport::LoadStore {
+        format!(
+            "atomic `{op}` is not supported for target `{triple}`: ARMv6-M (Cortex-M0 and M0+) has no atomic read-modify-write instructions, only atomic loads and stores; update the value inside a critical section (`hal.Critical`) instead"
+        )
+    } else {
+        format!(
+            "atomic integer primitives are not supported for target `{triple}`; no OS or libatomic fallback is inserted"
+        )
+    }
+}
 
 pub fn generate<'ctx>(
     context: &'ctx Context,
@@ -230,6 +274,20 @@ pub fn generate<'ctx>(
         return Err(error(format!(
             "`cpu.{op}` is not supported for target `{}`; interrupt control is available for bare-metal Cortex-M and RISC-V targets and is a no-op on hosted OS targets",
             triple.as_str().to_string_lossy()
+        )));
+    }
+    if let Some(op) = cg.module.functions().find_map(|f| {
+        let name = f
+            .get_name()
+            .to_str()
+            .ok()?
+            .strip_prefix(UNSUPPORTED_ATOMIC)?;
+        Some(name.split('.').next().unwrap_or(name).to_owned())
+    }) {
+        let triple = cg.module.get_triple();
+        return Err(error(unsupported_atomic(
+            &op,
+            &triple.as_str().to_string_lossy(),
         )));
     }
     function_sections(&cg.module);
@@ -709,7 +767,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 &format!("dodo.{}.{}", self.program.package, c.name),
             );
             g.set_initializer(&val);
-            g.set_constant(!c.mutable);
+            // An atomic changes through shared references, so a static that
+            // holds one needs writable memory even when it is not `mut`.
+            g.set_constant(!c.mutable && !program.holds_interior_mutable(&c.ty));
             let natural = self.data.get_abi_alignment(&self.ty(&c.ty)?);
             self.apply_placement(g, &c.placement, true, natural)?;
             g.set_linkage(if c.public {
@@ -2952,14 +3012,36 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .as_str()
                     .to_string_lossy()
                     .into_owned();
-                // LLVM spells Apple's AArch64 as `arm64` (and `arm64e`).
-                if !["x86_64-", "aarch64-", "arm64-", "arm64e-"]
-                    .iter()
-                    .any(|arch| triple.starts_with(arch))
+                let support = atomic_support(&triple);
+                if support == AtomicSupport::None
+                    || (support == AtomicSupport::LoadStore
+                        && !matches!(operation, "load" | "store"))
                 {
-                    return Err(error(format!(
-                        "atomic integer primitives are not supported for target `{triple}`; no OS or libatomic fallback is inserted"
-                    )));
+                    // Diagnosed after dead-code elimination (see `generate`),
+                    // so a package that merely contains these operations
+                    // stays portable. The arguments are still evaluated.
+                    let mut values = Vec::new();
+                    for arg in args {
+                        values.push(self.expr(arg)?);
+                    }
+                    let result = match operation {
+                        "store" => None,
+                        "load" => Some(self.ty(ret)?),
+                        _ => Some(values[1].get_type()),
+                    };
+                    let name = format!(
+                        "{UNSUPPORTED_ATOMIC}{operation}.i{}",
+                        result.map_or(0, |ty| ty.get_bit_width())
+                    );
+                    let marker = self.module.lookup_function(&name).unwrap_or_else(|| {
+                        let ty = match result {
+                            Some(ty) => ty.fn_type(&[], false),
+                            None => self.context.void_type().fn_type(&[], false),
+                        };
+                        self.module.add_function(&name, ty, None)
+                    });
+                    let value = self.builder.build_call(marker, &[], "atomic.unsupported")?;
+                    return Ok(if result.is_some() { value } else { unit });
                 }
                 let pointer = self.expr(&args[0])?;
                 let order = |index: usize| -> Result<AtomicOrdering> {

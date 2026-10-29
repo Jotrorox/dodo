@@ -4,6 +4,7 @@ import "core/ptr"
 import "std/embedded/board"
 import "core/mem"
 import "std/embedded/chip"
+import "std/embedded/chip/rp_adc"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
 import "std/embedded/hal"
@@ -11,10 +12,11 @@ import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 import "std/io"
+import "std/sync/atomic"
 
 // Hardware self-test for the `pico2_w` board: the RP2350 startup runtime,
-// std/embedded/chip/rp2350 (clocks, timer, I2C, SPI, UART, single ownership,
-// configuration checks), std/embedded/board/pico2_w with the CYW43439 driver in
+// std/embedded/chip/rp2350 (clocks, timer, I2C, SPI, UART, PWM, the ADC,
+// single ownership, configuration checks), std/embedded/board/pico2_w with the CYW43439 driver in
 // std/embedded/wireless/cyw43 (gSPI bus bring-up, the LED and USB-power GPIOs
 // of the wireless chip), and the runtime's integer and floating-point helpers.
 // Every outcome ends in the USB bootloader with a record that
@@ -466,7 +468,9 @@ fn protocol_checks<P, T>(pins: &mut P, timer: &mut T) {
 // and a function placed in SRAM.
 static mut ALARM: Option<chip.Alarm> = none
 static mut ALARM_HITS: u32 = 0
-static mut PENDED_HITS: u32 = 0
+// Counted with an atomic, which the handler and main share without a
+// critical section or `unsafe`.
+static PENDED_HITS: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
 
 @interrupt(TIMER0_IRQ_0)
 fn alarm_fired() {
@@ -484,9 +488,7 @@ fn alarm_fired() {
 // Nothing else raises TRNG_IRQ; the checks pend it from software.
 @interrupt(TRNG_IRQ)
 fn pended() {
-    unsafe {
-        PENDED_HITS += 1
-    }
+    PENDED_HITS.fetch_add(1, atomic.Ordering.AcqRel)!
 }
 
 fn alarm_hits() -> u32 {
@@ -496,9 +498,7 @@ fn alarm_hits() -> u32 {
 }
 
 fn pended_hits() -> u32 {
-    return unsafe {
-        PENDED_HITS
-    }
+    return PENDED_HITS.load(atomic.Ordering.Acquire)!
 }
 
 @section(".ramfunc")
@@ -694,6 +694,86 @@ fn executor_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
     timer.release_alarm(alarm)
 }
 
+// The level of GPIO `pin`, from the single-cycle I/O block's input register,
+// which reads the pad whatever drives it.
+fn pin_level(pin: u32) -> bool {
+    // SAFETY: GPIO_IN is read-only.
+    unsafe {
+        input: hal.Reg<u32> = hal.Reg.at(0xD000_0004)
+        return input.any(1u32 << pin)
+    }
+}
+
+// The share of 1000 samples, 10 us apart, at which GPIO `pin` is high.
+fn high_samples(pin: u32, timer: &mut chip.Timer) -> u32 {
+    high := 0u32
+    for _ in 0..1000 {
+        if pin_level(pin) {
+            high += 1
+        }
+        timer.delay_us(10)
+    }
+    return high
+}
+
+// PWM and the ADC with nothing connected (3 checks): pin, frequency, and
+// output validation and ownership; an output's level read back from its pad
+// at duties 0, 50%, and full, and inverted; ADC inputs and the temperature
+// sensor.
+fn pwm_adc_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    // GP14 and GP15 are outputs A and B of slice 7; GP31 does not exist.
+    led := pins.pwm(15, 1000)!
+    validated := refused(pins.pwm(30, 1000), hal.Error.InvalidInput) && refused(pins.pwm(14, 7), hal.Error.InvalidInput) && refused(pins.pwm(14, 100_000_000), hal.Error.InvalidInput)
+    owned := refused(pins.pwm(15, 1000), hal.Error.Busy) && refused(pins.output(15), hal.Error.Busy) && refused(pins.pwm(14, 2000), hal.Error.Busy)
+    other := pins.pwm(14, 1000)!
+    check(validated && owned && led.frequency_hz() == 1000 && led.max_duty() == other.max_duty() && led.slice() == 7 && led.output() == 1)
+    pins.release_pwm(other)
+
+    // Compare values take effect at the next wrap, 1 ms away at most.
+    timer.delay_ms(2)
+    low := !pin_level(15)
+    full := led.max_duty()
+    led.set_duty(full)!
+    timer.delay_ms(2)
+    high := pin_level(15)
+    hal.set_duty_percent(&mut led, 50)!
+    timer.delay_ms(2)
+    half := high_samples(15, timer)
+    led.set_duty(0)!
+    led.set_inverted(true)
+    timer.delay_ms(2)
+    inverted := pin_level(15)
+    led.set_inverted(false)
+    pins.release_pwm(led)
+    again := pins.pwm(15, 50)!
+    pins.release_pwm(again)
+    check(low && high && half > 420 && half < 580 && inverted)
+
+    // Inputs on GP26 and GP27 float, so any value will do; the sensor reads
+    // room temperature, give or take, and conversions take 2 us at 48 MHz.
+    knob := pins.analog(26)!
+    inputs_owned := refused(pins.analog(25), hal.Error.InvalidInput) && refused(pins.analog(26), hal.Error.Busy) && refused(pins.output(26), hal.Error.Busy)
+    second := pins.analog(27)!
+    sensor := pins.temperature()!
+    sensor_owned := refused(pins.temperature(), hal.Error.Busy)
+    start := timer.now_us()
+    in_range := true
+    for _ in 0..100 {
+        in_range = in_range && knob.read()! <= 4095 && second.read()! <= 4095
+    }
+    elapsed := timer.now_us() - start
+    celsius := rp_adc.millicelsius(sensor.read()!, 3300)
+    pins.release_analog(knob)
+    pins.release_analog(second)
+    pins.release_analog(sensor)
+    pin := pins.output(26)!
+    pins.release(pin)
+    knob = pins.analog(26)!
+    restarted := knob.read()! <= 4095
+    pins.release_analog(knob)
+    check(inputs_owned && sensor_owned && in_range && restarted && elapsed >= 400 && elapsed < 1500 && celsius > 0 && celsius < 70_000)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -851,6 +931,7 @@ fn main() {
     protocol_checks(&mut b.pins, &mut b.timer)
     interrupt_checks(&mut b.timer)
     executor_checks(&mut b.pins, &mut b.timer)
+    pwm_adc_checks(&mut b.pins, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.

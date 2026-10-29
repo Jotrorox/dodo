@@ -209,6 +209,7 @@ impl Expander {
             repr_c: false,
             unsafe_send: false,
             unsafe_sync: false,
+            interior_mutable: false,
         };
         self.struct_templates
             .insert(name.to_owned(), template.clone());

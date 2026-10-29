@@ -18,7 +18,8 @@ import "core/ptr"
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
 // 3. Device protocols. The interfaces below (OutputPin, InputPin, Delay, I2c,
-//    Spi, and Registers) name what drivers need from a device. Any value with
+//    Spi, PwmOutput, AnalogInput, and Registers) name what drivers need
+//    from a device. Any value with
 //    matching methods implements them. Drivers are usually generic over a
 //    bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
 //    statically dispatched and reports a wrong argument where it is passed.
@@ -29,9 +30,11 @@ import "core/ptr"
 //
 // Addresses are 7-bit I2C addresses; controllers that also reach 10-bit
 // addresses offer that through methods of their own. Pin and delay
-// operations cannot fail; bus operations report the shared `Error` below. A bus is configured when it
-// is created, with a frequency and for SPI a `SpiMode`; the protocols then
-// only move bytes, so drivers never depend on how a bus was set up.
+// operations cannot fail; bus, PWM, and analog operations report the shared
+// `Error` below, because such a device may itself sit on a bus. A bus is
+// configured when it is created, with a frequency and for SPI a `SpiMode`,
+// and so is a PWM output, with its frequency; the protocols then only move
+// bytes and duty cycles, so drivers never depend on how a device was set up.
 //
 // The register block protocol is for peripheral drivers rather than device
 // drivers. Microcontroller vendors license the same peripheral designs, so
@@ -62,9 +65,16 @@ import "core/ptr"
 //                                  those pins (Busy if a pin or the
 //                                  controller is taken, InvalidInput if the
 //                                  pins cannot carry the bus);
+//                                  pwm(pin, hz) for a PWM output and
+//                                  analog(pin) for an analog input on
+//                                  that pin, and temperature() for the
+//                                  chip's temperature sensor, an analog
+//                                  input too;
 //                                  release(pin), release_i2c(bus),
-//                                  release_spi(bus), and release_uart(port)
-//                                  give them back. Chips may offer more,
+//                                  release_spi(bus), release_uart(port),
+//                                  release_pwm(output), and
+//                                  release_analog(input) give them back.
+//                                  Chips may offer more,
 //                                  as the RP2040 and RP2350 do: targets
 //                                  (slaves) with i2c_target and spi_target,
 //                                  spi_with_select, and uart_flow
@@ -155,6 +165,27 @@ pub interface Spi {
     // Full-duplex exchange in place: each byte sent is replaced by the byte read.
     fn transfer(&mut self, bytes: &mut[u8]) -> void!Error
     fn write(&mut self, bytes: &[u8]) -> void!Error
+}
+
+// A pulse-width modulated output: a square wave that is high for
+// duty / max_duty() of each period, which dims an LED, sets a motor's speed,
+// or positions a servo. Its frequency is set when the output is created.
+// A duty of 0 holds it low and max_duty() high.
+pub interface PwmOutput {
+    // The duty that holds the output high, at least 1.
+    fn max_duty(&self) -> u16
+    // InvalidInput if `duty` is above max_duty().
+    fn set_duty(&mut self, duty: u16) -> void!Error
+}
+
+// An input of an analog-to-digital converter. Each read converts the voltage
+// once: 0 at ground, max_value() at the converter's reference voltage, and
+// proportionally in between.
+pub interface AnalogInput {
+    // The value read at the reference voltage, such as 4095 for a 12-bit
+    // converter.
+    fn max_value(&self) -> u16
+    fn read(&mut self) -> u16!Error
 }
 
 // A peripheral's 32-bit registers at byte offsets, for peripheral drivers.
@@ -424,6 +455,43 @@ pub fn delay_ms<D: Delay>(delay: &mut D, milliseconds: u32) {
     for _ in 0..milliseconds {
         delay.delay_us(1000)
     }
+}
+
+// Set a PWM output high for `numerator / denominator` of each period,
+// rounded to the nearest step the output has. InvalidInput if the
+// denominator is zero or below the numerator.
+pub fn set_duty_fraction<P: PwmOutput>(output: &mut P, numerator: u32, denominator: u32) -> void!Error {
+    if denominator == 0 || numerator > denominator {
+        return err(Error.InvalidInput)
+    }
+    steps := output.max_duty() as u64
+    duty := (numerator as u64 * steps + denominator as u64 / 2) / denominator as u64
+    return output.set_duty(duty as u16)
+}
+
+// Set a PWM output high for `percent` of each period, 0 to 100.
+pub fn set_duty_percent<P: PwmOutput>(output: &mut P, percent: u32) -> void!Error {
+    return set_duty_fraction(output, percent, 100)
+}
+
+// Make a PWM output's pulses `pulse_us` long, for an output whose period is
+// `period_us`: a hobby servo, for example, expects a 50 Hz output (a period
+// of 20_000 us) and turns from one end to the other as the pulse goes from
+// about 1000 to 2000 us. InvalidInput if the pulse is longer than the
+// period.
+pub fn set_pulse_us<P: PwmOutput>(output: &mut P, pulse_us: u32, period_us: u32) -> void!Error {
+    return set_duty_fraction(output, pulse_us, period_us)
+}
+
+// One read of an analog input as a voltage in millivolts, for a converter
+// whose reference is `reference_mv`, such as 3300 for a 3.3 V supply.
+pub fn read_millivolts<A: AnalogInput>(input: &mut A, reference_mv: u32) -> u32!Error {
+    value := input.read()? as u64
+    full := input.max_value() as u64
+    if full == 0 {
+        return err(Error.Unsupported)
+    }
+    return ok(((value * reference_mv as u64 + full / 2) / full) as u32)
 }
 
 // Most I2C sensors expose numbered 8-bit registers. These helpers implement

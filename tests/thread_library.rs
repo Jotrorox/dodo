@@ -247,20 +247,98 @@ fn atomic_ordering_and_target_capabilities_are_checked() {
         assert!(!output.status.success(), "accepted {name}");
         assert!(message.contains(expected), "{name}: {message}");
     }
-    let source = workspace.0.join("unsupported.dodo");
-    fs::write(&source, "package unsupported\nimport \"core/mem\"\npub unsafe fn read(p: *const usize) -> usize { unsafe { return mem.atomic_load(p, 0) } }\n").unwrap();
-    for target in ["thumbv6m-none-eabi", "wasm32-unknown-unknown"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dodo"))
+    let build = |name: &str, text: &str, target: &str, emit: &str| {
+        let source = workspace.0.join(format!("{name}.dodo"));
+        fs::write(&source, text).unwrap();
+        let output = workspace.0.join(format!("{name}-{target}.{emit}"));
+        let result = Command::new(env!("CARGO_BIN_EXE_dodo"))
             .arg("build")
             .arg(&source)
-            .args(["--target", target, "--emit", "obj", "-o"])
-            .arg(workspace.0.join("unsupported.o"))
+            .args(["--target", target, "--emit", emit, "-O", "2", "-o"])
+            .arg(&output)
             .output()
             .unwrap();
+        (result, output)
+    };
+    let load = "package atomics\nimport \"core/mem\"\npub unsafe fn read(p: *const u32) -> u32 { unsafe { return mem.atomic_load(p, 4) } }\npub unsafe fn write(p: *mut u8, v: u8) { unsafe { mem.atomic_store(p, v, 2) } }\n";
+    let add = "package atomics\nimport \"core/mem\"\npub unsafe fn add(p: *mut u32) -> u32 { unsafe { return mem.atomic_fetch_add(p, 1u32, 0) } }\n";
+    // No OS or libatomic fallback is inserted where the CPU has no atomics.
+    let (output, _) = build("load", load, "wasm32-unknown-unknown", "obj");
+    assert!(!output.status.success(), "accepted atomics on wasm32");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not supported for target"));
+    // ARMv7-M and ARMv8-M have exclusive loads and stores; the Cortex-M33
+    // also has load-acquire and store-release.
+    for (target, expected) in [
+        (
+            "thumbv8m.main-none-eabi",
+            &["lda\t", "stlb", "ldrex", "strex"][..],
+        ),
+        (
+            "thumbv7em-none-eabihf",
+            &["ldr", "strb", "ldrex", "strex", "dmb"][..],
+        ),
+    ] {
+        let mut text = String::new();
+        for (name, source) in [("load", load), ("add", add)] {
+            let (output, assembly) = build(name, source, target, "asm");
+            assert!(
+                output.status.success(),
+                "{target}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            text.push_str(&fs::read_to_string(assembly).unwrap());
+        }
+        for instruction in expected {
+            assert!(
+                text.contains(instruction),
+                "{target} lacks {instruction}:\n{text}"
+            );
+        }
         assert!(
-            !output.status.success(),
-            "accepted unsupported atomic target {target}"
+            !text.contains("__atomic") && !text.contains("__sync"),
+            "{text}"
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("not supported for target"));
     }
+    // ARMv6-M (the RP2040's Cortex-M0+) has atomic loads and stores only.
+    let (output, assembly) = build("load", load, "thumbv6m-none-eabi", "asm");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = fs::read_to_string(assembly).unwrap();
+    assert!(text.contains("dmb") && !text.contains("__atomic"), "{text}");
+    let (output, _) = build("add", add, "thumbv6m-none-eabi", "obj");
+    assert!(
+        !output.status.success(),
+        "accepted read-modify-write on ARMv6-M"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("atomic `fetch_add` is not supported for target `thumbv6m-none-eabi`")
+            && message.contains("critical section"),
+        "{message}"
+    );
+    // Only reachable operations are diagnosed, so packages stay portable.
+    let unused = "package atomics\nimport \"core/mem\"\nunsafe fn add(p: *mut u32) -> u32 { unsafe { return mem.atomic_fetch_add(p, 1u32, 0) } }\npub unsafe fn read(p: *const u32) -> u32 { unsafe { return mem.atomic_load(p, 0) } }\n";
+    for target in ["thumbv6m-none-eabi", "wasm32-unknown-unknown"] {
+        let (output, _) = build(
+            "unused",
+            &unused.replace("mem.atomic_load(p, 0)", "*p"),
+            target,
+            "obj",
+        );
+        assert!(
+            output.status.success(),
+            "{target}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let typed = "package atomics\nimport \"std/sync/atomic\"\npub fn get(a: &atomic.Atomic<u32>) -> u32 { return a.load(atomic.Ordering.SeqCst)! }\npub fn put(a: &atomic.Atomic<u16>, v: u16) { a.store(v, atomic.Ordering.Release)! }\n";
+    let (output, _) = build("typed", typed, "thumbv6m-none-eabi", "obj");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

@@ -1165,6 +1165,7 @@ impl Parser {
             repr_c: mods.repr_c,
             unsafe_send: mods.unsafe_send,
             unsafe_sync: mods.unsafe_sync,
+            interior_mutable: false,
         });
         Ok(())
     }

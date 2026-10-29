@@ -1,0 +1,387 @@
+package rp_pwm
+
+import "std/embedded/hal"
+
+// The PWM block the RP2040 and RP2350 share (RP2040 datasheet 4.5, RP2350
+// datasheet 12.5). Eight slices serve GPIO 0 to 29, each a 16-bit counter
+// with two outputs, A and B: GPIO n is output A of slice (n / 2) % 8 when n
+// is even and output B when it is odd, so GPIO 0 and 16, for example, carry
+// the same output. The RP2350's slices 8 to 11 serve GPIO 32 to 47, which
+// are not supported.
+//
+// A slice counts at clk_sys / divider from 0 to its TOP and wraps. An
+// output is high while the count is below its compare value, so its duty
+// cycle is compare / (TOP + 1) and its frequency
+// clk_sys / divider / (TOP + 1). The two outputs of a slice share the
+// divider and TOP, and so their frequency. Compare values and TOP take
+// effect when the counter wraps, so a period is never cut short.
+//
+// `Channel` is one output over any hal.Registers: a `hal.RegisterBlock` at
+// the block's base on the chip, or a simulated block in a desktop test. It
+// implements hal.PwmOutput. The outputs of a slice write their own bits of
+// shared registers through the block's atomic XOR, set, and clear aliases,
+// at 0x1000, 0x2000, and 0x3000 above each register, so neither disturbs
+// the other, nor an interrupt handler that owns one of them.
+
+// Slice registers, SLICE_STRIDE apart.
+const CSR: usize = 0x00
+const DIV: usize = 0x04
+const CTR: usize = 0x08
+const CC: usize = 0x0C
+const TOP: usize = 0x10
+const SLICE_STRIDE: usize = 0x14
+
+// Atomic register aliases (RP2040 datasheet 2.1.2).
+const XOR_ALIAS: usize = 0x1000
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// CSR: the slice counts, and output A or B is inverted.
+const ENABLE: u32 = 1 << 0
+const INVERT_A: u32 = 1 << 2
+
+// The slices GPIO 0 to 29 reach.
+pub const SLICE_COUNT: u32 = 8
+// The GPIOs with a PWM output.
+pub const PIN_COUNT: u32 = 30
+
+// The divider is a fixed-point number in sixteenths: 16 divides by one,
+// 4095 by 255 15/16.
+pub const MIN_DIVIDER: u32 = 16
+pub const MAX_DIVIDER: u32 = 4095
+// The largest TOP: one short of 16 bits, so that the compare value that
+// holds an output high, TOP + 1, still fits its 16-bit field.
+pub const MAX_TOP: u32 = 0xFFFE
+
+// The slice of GPIO `pin`.
+pub fn slice_of(pin: u32) -> u32 {
+    return (pin / 2) % SLICE_COUNT
+}
+
+// The output of GPIO `pin` within its slice: 0 for A, 1 for B.
+pub fn output_of(pin: u32) -> u32 {
+    return pin % 2
+}
+
+// A slice's divider and TOP, from `timing` or `divided`.
+pub struct Timing {
+    // The block's input clock, clk_sys, in hertz.
+    pub clock_hz: u32
+    // The divider in sixteenths, MIN_DIVIDER to MAX_DIVIDER.
+    pub divider: u32
+    // The count the counter wraps after, 0 to MAX_TOP: a period is TOP + 1
+    // counts, and outputs have TOP + 2 duty steps, 0 to TOP + 1.
+    pub top: u32
+
+    // The resulting frequency, rounded to whole hertz.
+    pub fn frequency_hz(&self) -> u32 {
+        counts := self.divider as u64 * (self.top as u64 + 1)
+        return ((self.clock_hz as u64 * 16 + counts / 2) / counts) as u32
+    }
+}
+
+// The divider and TOP closest to `frequency_hz` with the finest duty steps:
+// the smallest divider whose period fits in MAX_TOP + 1 counts. At a
+// clk_sys of 125 MHz, from 8 Hz to 62.5 MHz; up to 1907 Hz the period
+// has the full 65535 counts. InvalidInput outside that range.
+pub fn timing(clock_hz: u32, frequency_hz: u32) -> Timing!hal.Error {
+    if frequency_hz == 0 {
+        return err(hal.Error.InvalidInput)
+    }
+    scaled := clock_hz as u64 * 16
+    period := frequency_hz as u64 * (MAX_TOP as u64 + 1)
+    divider := (scaled + period - 1) / period
+    if divider < MIN_DIVIDER as u64 {
+        divider = MIN_DIVIDER as u64
+    }
+    if divider > MAX_DIVIDER as u64 {
+        return err(hal.Error.InvalidInput)
+    }
+    counts := (scaled + divider * frequency_hz as u64 / 2) / (divider * frequency_hz as u64)
+    if counts > MAX_TOP as u64 + 1 {
+        counts = MAX_TOP as u64 + 1
+    }
+    if counts < 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(Timing { clock_hz, divider: divider as u32, top: (counts - 1) as u32 })
+}
+
+// A timing with a given divider, in sixteenths, and TOP. InvalidInput if
+// either is out of range.
+pub fn divided(clock_hz: u32, divider: u32, top: u32) -> Timing!hal.Error {
+    if divider < MIN_DIVIDER || divider > MAX_DIVIDER || top > MAX_TOP {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(Timing { clock_hz, divider, top })
+}
+
+// The outputs handed out, one bit each, slice * 2 + output. A chip has one
+// PWM block, so one set serves the program.
+static mut CLAIMED: u32 = 0
+
+// One output of a slice, driving the GPIO it is routed to. Implements
+// hal.PwmOutput: max_duty is TOP + 1, so a duty of 0 holds the output low
+// and max_duty holds it high.
+pub struct Channel<R: hal.Registers>: hal.PwmOutput {
+    registers: R
+    pin: u32
+    // The slice's registers, from the block's base.
+    base: usize
+    // This output's bit within the slice's compare value and its CSR
+    // invert bit, and its bit in CLAIMED and its sibling's.
+    shift: u32
+    invert: u32
+    bit: u32
+    sibling: u32
+    timing: Timing
+    duty: u16
+
+    // Start output `output_of(pin)` of slice `slice_of(pin)` at `timing`,
+    // low. If the slice's other output is already in use, the slice keeps
+    // running and `timing` must be what it runs at: Busy otherwise, and Busy
+    // if this output is in use too. InvalidInput above GPIO 29.
+    // SAFETY: `registers` must be the PWM block's, out of reset and clocked
+    // at timing.clock_hz, and only Channels may use it.
+    pub unsafe fn new(registers: R, pin: u32, timing: Timing) -> Channel<R>!hal.Error {
+        if pin >= PIN_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        slice := slice_of(pin)
+        output := output_of(pin)
+        bit := 1u32 << (2 * slice + output)
+        sibling := 1u32 << (2 * slice + 1 - output)
+        channel := Channel<R> {
+            registers,
+            pin,
+            base: SLICE_STRIDE * slice as usize,
+            shift: 16 * output,
+            invert: INVERT_A << output,
+            bit,
+            sibling,
+            timing,
+            duty: 0,
+        }
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so CLAIMED is read and changed
+        // atomically on this core; only core 0 runs.
+        claimed := unsafe {
+            CLAIMED
+        }
+        if (claimed & bit) != 0 {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        if (claimed & sibling) != 0 {
+            divider := channel.timing.divider
+            top := channel.timing.top
+            if !channel.runs_at(divider, top) {
+                core.drop(section)
+                return err(hal.Error.Busy)
+            }
+        } else {
+            channel.registers.write(channel.base + CSR, 0)
+            channel.registers.write(channel.base + DIV, channel.timing.divider)
+            channel.registers.write(channel.base + TOP, channel.timing.top)
+            channel.registers.write(channel.base + CC, 0)
+            channel.registers.write(channel.base + CTR, 0)
+            channel.registers.write(channel.base + CSR, ENABLE)
+        }
+        channel.write_compare(0)
+        channel.registers.write(channel.base + CSR + CLEAR_ALIAS, channel.invert)
+        unsafe {
+            CLAIMED = claimed | bit
+        }
+        core.drop(section)
+        return ok(channel)
+    }
+
+    pub fn max_duty(&self) -> u16 {
+        return (self.timing.top + 1) as u16
+    }
+
+    // The output is high for duty / max_duty of each period, from the next
+    // period on. InvalidInput above max_duty.
+    pub fn set_duty(&mut self, duty: u16) -> void!hal.Error {
+        if duty as u32 > self.timing.top + 1 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.write_compare(duty)
+        return ok()
+    }
+
+    // The duty last set.
+    pub fn duty(&self) -> u16 {
+        return self.duty
+    }
+
+    // The slice's divider and TOP.
+    pub fn timing(&self) -> Timing {
+        return Timing { clock_hz: self.timing.clock_hz, divider: self.timing.divider, top: self.timing.top }
+    }
+
+    pub fn frequency_hz(&self) -> u32 {
+        return self.timing.frequency_hz()
+    }
+
+    // The GPIO the output was started for.
+    pub fn pin(&self) -> u32 {
+        return self.pin
+    }
+
+    // The slice, 0 to 7, and the output within it, 0 for A and 1 for B.
+    pub fn slice(&self) -> u32 {
+        return (self.base / SLICE_STRIDE) as u32
+    }
+
+    pub fn output(&self) -> u32 {
+        return self.shift / 16
+    }
+
+    // Change the frequency to the closest to `frequency_hz`, as `timing`
+    // finds it, keeping the duty cycle. Busy if the slice's other output is
+    // in use, since it shares the frequency, unless the timing does not
+    // change; InvalidInput if the frequency is out of range.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        changed := timing(self.timing.clock_hz, frequency_hz)?
+        return self.set_timing(changed)
+    }
+
+    // Change the divider and TOP, as from `divided`, keeping the duty cycle
+    // as closely as the new duty steps allow. Busy as for set_frequency.
+    pub fn set_timing(&mut self, timing: Timing) -> void!hal.Error {
+        section := hal.Critical.enter()
+        // SAFETY: as in `new`.
+        claimed := unsafe {
+            CLAIMED
+        }
+        if (claimed & self.sibling) != 0 && !self.runs_at(timing.divider, timing.top) {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        old_steps := self.timing.top as u64 + 1
+        duty := (self.duty as u64 * (timing.top as u64 + 1) + old_steps / 2) / old_steps
+        self.registers.write(self.base + DIV, timing.divider)
+        self.registers.write(self.base + TOP, timing.top)
+        self.timing = timing
+        self.write_compare(duty as u16)
+        core.drop(section)
+        return ok()
+    }
+
+    // Invert the output: high while the count is at or above the compare
+    // value instead of below it.
+    pub fn set_inverted(&mut self, inverted: bool) {
+        if inverted {
+            self.registers.write(self.base + CSR + SET_ALIAS, self.invert)
+        } else {
+            self.registers.write(self.base + CSR + CLEAR_ALIAS, self.invert)
+        }
+    }
+
+    // The slice's count, 0 to TOP, which advances while the slice runs.
+    pub fn count(&mut self) -> u32 {
+        return self.registers.read(self.base + CTR) & 0xFFFF
+    }
+
+    // Hold the output low and give it up, and stop the slice if its other
+    // output is not in use either. Returns the registers.
+    pub fn release(self) -> R {
+        self.write_compare(0)
+        self.set_inverted(false)
+        section := hal.Critical.enter()
+        // SAFETY: as in `new`.
+        unsafe {
+            CLAIMED &= ~self.bit
+            if (CLAIMED & self.sibling) == 0 {
+                self.registers.write(self.base + CSR + CLEAR_ALIAS, ENABLE)
+            }
+        }
+        core.drop(section)
+        let Channel { registers, pin, base, shift, invert, bit, sibling, timing, duty } = self
+        return registers
+    }
+
+    // Whether the slice runs with `divider` and `top` now.
+    fn runs_at(&mut self, divider: u32, top: u32) -> bool {
+        return self.registers.read(self.base + DIV) == divider && self.registers.read(self.base + TOP) == top
+    }
+
+    // Change this output's half of the shared compare register through the
+    // XOR alias: the bits that differ flip and the other half stays.
+    fn write_compare(&mut self, duty: u16) {
+        current := (self.registers.read(self.base + CC) >> self.shift) & 0xFFFF
+        self.registers.write(self.base + CC + XOR_ALIAS, (current ^ duty as u32) << self.shift)
+        self.duty = duty
+    }
+}
+
+// An output on the chip: a Channel over the PWM block's registers, which
+// the chip packages hand out. Implements hal.PwmOutput.
+pub struct Pwm: hal.PwmOutput {
+    channel: Channel<hal.RegisterBlock>
+
+    // Channel.new over the block at `base`.
+    // SAFETY: as for Channel.new, with `base` the PWM block's base address.
+    pub unsafe fn at(base: usize, pin: u32, timing: Timing) -> Pwm!hal.Error {
+        unsafe {
+            channel := Channel.new(hal.RegisterBlock.at(base), pin, timing)?
+            return ok(Pwm { channel })
+        }
+    }
+
+    pub fn max_duty(&self) -> u16 {
+        return self.channel.max_duty()
+    }
+
+    pub fn set_duty(&mut self, duty: u16) -> void!hal.Error {
+        return self.channel.set_duty(duty)
+    }
+
+    pub fn duty(&self) -> u16 {
+        return self.channel.duty()
+    }
+
+    pub fn timing(&self) -> Timing {
+        return self.channel.timing()
+    }
+
+    pub fn frequency_hz(&self) -> u32 {
+        return self.channel.frequency_hz()
+    }
+
+    pub fn pin(&self) -> u32 {
+        return self.channel.pin()
+    }
+
+    pub fn slice(&self) -> u32 {
+        return self.channel.slice()
+    }
+
+    pub fn output(&self) -> u32 {
+        return self.channel.output()
+    }
+
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        return self.channel.set_frequency(frequency_hz)
+    }
+
+    pub fn set_timing(&mut self, timing: Timing) -> void!hal.Error {
+        return self.channel.set_timing(timing)
+    }
+
+    pub fn set_inverted(&mut self, inverted: bool) {
+        self.channel.set_inverted(inverted)
+    }
+
+    pub fn count(&mut self) -> u32 {
+        return self.channel.count()
+    }
+
+    // Channel.release; returns the block's base address.
+    pub fn release(self) -> usize {
+        let Pwm { channel } = self
+        registers := channel.release()
+        return registers.base()
+    }
+}

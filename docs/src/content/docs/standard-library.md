@@ -128,7 +128,9 @@ registers and portable device protocols; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico2_w` the RP2350, Pico 2, and Pico 2 W, including
 their I2C and SPI buses, as master or target, and serial ports through the
 shared controller drivers in `std/embedded/peripheral` and the pin and
-controller ownership both chips share in `std/embedded/chip/rp_pins`.
+controller ownership both chips share in `std/embedded/chip/rp_pins`, and
+their PWM outputs and ADC inputs through `std/embedded/chip/rp_pwm` and
+`std/embedded/chip/rp_adc`.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
 tasks on one core, waking each on time or on an interrupt and sleeping
