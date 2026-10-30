@@ -1,0 +1,76 @@
+package lifecycle
+
+import "std/net/native"
+import "std/platform/error"
+import "std/signal"
+
+// Portable: opens the wake channel and installs the handlers on every hosted
+// target without delivering anything.
+fn quiet(listener: &mut signal.Listener) -> bool {
+    match listener.next() {
+        some(_) => {
+            return false
+        }
+        none => {}
+    }
+    match listener.wait(10)! {
+        some(_) => {
+            return false
+        }
+        none => {}
+    }
+    set := native.PollSet.new()
+    index := listener.register(&mut set)!
+    set.wait(0)!
+    return !set.ready(index) && !listener.cancelled()
+}
+fn main() -> i32 {
+    selection := [signal.Signal.Interrupt, signal.Signal.Terminate, signal.Signal.Hangup, signal.Signal.Break]
+    listener := signal.listen(&selection)!
+    match signal.listen(&selection) {
+        ok(_) => {
+            return 1
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.AlreadyExists {
+                return 2
+            }
+        }
+    }
+    if !quiet(&mut listener) {
+        return 3
+    }
+    listener.close()!
+    listener.close()!
+    set := native.PollSet.new()
+    match listener.register(&mut set) {
+        ok(_) => {
+            return 4
+        }
+        err(_) => {}
+    }
+    match listener.wait(0) {
+        ok(_) => {
+            return 5
+        }
+        err(reason) => {
+            if reason.kind != error.Kind.Closed {
+                return 6
+            }
+        }
+    }
+    // The channel outlives a listener; the next one reuses it.
+    empty: [0]signal.Signal = []
+    again := signal.listen(&empty)!
+    if !quiet(&mut again) {
+        return 7
+    }
+    // Dropping a listener releases the handlers just as close() does.
+    core.drop(again)
+    third := signal.listen(&selection)!
+    if !quiet(&mut third) {
+        return 8
+    }
+    third.close()!
+    return 0
+}

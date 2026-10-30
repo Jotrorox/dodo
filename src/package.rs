@@ -494,6 +494,7 @@ impl Loader<'_> {
                     | "sync"
                     | "net"
                     | "tls"
+                    | "signal"
                     | "web"
                     | "time"
             )

@@ -197,7 +197,10 @@ Readiness includes hangup/error notifications: the next socket operation reports
 the result. `set.clear()` removes registrations for the next batch. Registrations
 borrow native handle values without transferring ownership; keep every registered
 owner open until the wait finishes. `TcpConnection.closed()` supplies an empty,
-safe-to-drop owner for caller-owned connection slots.
+safe-to-drop owner for caller-owned connection slots. A
+[signal listener](signals.md#in-a-poll-loop) registers its wake channel the same
+way. `set.add_raw(handle, interest)` registers a descriptor (POSIX) or `SOCKET`
+(Windows) that other code owns, under the same rule.
 
 Every socket owns exactly one native descriptor/handle, moves as an aggregate,
 and releases it on `close()` or `drop`. `close()` is idempotent. A close error

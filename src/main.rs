@@ -573,7 +573,10 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 }
                 if target.contains("-windows-") {
                     linker.args(["-lkernel32", "-lshell32"]);
-                    if native.iter().any(|(name, _)| name.starts_with("std/net/")) {
+                    // The signal wake channel is a loopback socket pair.
+                    if native.iter().any(|(name, _)| {
+                        name.starts_with("std/net/") || name.starts_with("std/signal/")
+                    }) {
                         linker.arg("-lws2_32");
                     }
                 }

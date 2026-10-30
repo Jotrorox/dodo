@@ -172,6 +172,7 @@ virtual package names rather than independent source files:
 | `std/fs/native` | [Filesystem providers](filesystem.md) |
 | `std/env/native` | [Native environment strings](environment.md) |
 | `std/process/native` | [Process providers](processes.md) |
+| `std/signal/native` | [Signal providers](signals.md) |
 | `std/thread/native` | [Native threads](threads.md) |
 | `std/sync/native` | [Blocking synchronization](synchronization.md) |
 | `std/net/native` | [Native sockets](networking.md) |

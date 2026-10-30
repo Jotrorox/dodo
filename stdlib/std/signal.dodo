@@ -1,0 +1,97 @@
+package signal
+
+import "std/net"
+import "std/net/native" as poll
+import "std/platform/error"
+import "std/signal/native" as backend
+
+// Process-control requests delivered to a hosted program.
+// Interrupt: SIGINT, or Ctrl-C in a Windows console.
+// Terminate: SIGTERM, or a Windows console close, logoff or shutdown.
+// Hangup: SIGHUP; POSIX only. Services conventionally reload on it.
+// Break: Ctrl-Break in a Windows console; Windows only. The conventional
+// counterpart of Hangup there.
+// Selecting a signal the platform lacks is accepted; it never arrives.
+pub enum Signal {
+    Interrupt, Terminate, Hangup, Break
+}
+fn bit(value: &Signal) -> u32 {
+    match value {
+        Signal.Interrupt => {
+            return 1
+        }
+        Signal.Terminate => {
+            return 2
+        }
+        Signal.Hangup => {
+            return 4
+        }
+        Signal.Break => {
+            return 8
+        }
+    }
+}
+fn from_tag(tag: u32) -> Signal {
+    if tag == 0 {
+        return Signal.Interrupt
+    }
+    if tag == 1 {
+        return Signal.Terminate
+    }
+    if tag == 2 {
+        return Signal.Hangup
+    }
+    return Signal.Break
+}
+// Replaces the default action of the selected signals: instead of ending the
+// process, each arrival is queued for next() in arrival order. Only one
+// listener exists at a time; a second listen() fails with AlreadyExists.
+pub fn listen(signals: &[Signal]) -> Listener!error.Error {
+    mask := 0u32
+    for i in 0usize..signals.len {
+        mask |= bit(&signals[i])
+    }
+    return ok(Listener { channel: backend.Channel.open(mask)? })
+}
+pub struct Listener {
+    channel: backend.Channel
+    // The wake channel is readable while signals are pending. Register it with
+    // the other sources of an event loop, then call next() when it is ready.
+    pub fn register(&self, set: &mut poll.PollSet) -> usize!net.Error {
+        return self.channel.register(set)
+    }
+    // The oldest pending signal, without waiting.
+    pub fn next(&mut self) -> Option<Signal> {
+        match self.channel.next() {
+            some(tag) => {
+                return some(from_tag(tag))
+            }
+            none => {
+                return none
+            }
+        }
+    }
+    // For programs without an event loop: the oldest pending signal, waiting
+    // up to milliseconds for one. none when the time passes first.
+    pub fn wait(&mut self, milliseconds: u32) -> Option<Signal>!error.Error {
+        match self.next() {
+            some(value) => {
+                return ok(some(value))
+            }
+            none => {}
+        }
+        self.channel.wait(milliseconds)?
+        return ok(self.next())
+    }
+    // Whether Interrupt or Terminate has arrived since listen(), whether or not
+    // next() has reported it. A listener is a cancellation source for APIs
+    // such as std/web/reactor serve_with.
+    pub fn cancelled(&self) -> bool {
+        return self.channel.shutdown_requested()
+    }
+    // Restores the actions in place before listen(), as dropping the listener
+    // does. Pending signals are discarded; closing twice does nothing.
+    pub fn close(&mut self) -> void!error.Error {
+        return self.channel.close()
+    }
+}

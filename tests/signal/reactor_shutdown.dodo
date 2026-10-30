@@ -1,0 +1,50 @@
+package reactor_shutdown
+
+import "std/console"
+import "std/net/native"
+import "std/signal"
+import "std/web"
+import "std/web/reactor"
+
+pub struct Handler {
+    pub fn handle(&mut self, request: &mut web.Request, response: &mut web.Response) -> void!web.Failure {
+        return response.text(b"Hello, Dodo!\n")
+    }
+}
+// A listener is the server's cancellation source: SIGTERM or SIGINT ends
+// serve_with with a report instead of killing the process.
+fn main() -> i32 {
+    selection := [signal.Signal.Interrupt, signal.Signal.Terminate]
+    stop := signal.listen(&selection)!
+    routes := [web.Route { method: b"GET", pattern: b"/", id: 0 }]
+    slots := reactor.slots()
+    workspace := [0u8; reactor.WORKSPACE_BYTES *8]
+    request := [0u8; 4096 *8]
+    response := [0u8; 65536 *8]
+    handler := Handler {}
+    clock := native.MonotonicClock {}
+    console.println("ready")!
+    match reactor.serve_with(b"127.0.0.1:0", &routes, &mut handler, &mut slots, &mut workspace, &mut request,
+    &mut response, reactor.Config.defaults(), &mut clock, &stop) {
+        ok(report) => {
+            if !report.cancelled {
+                return 2
+            }
+            match stop.next() {
+                some(value) => {
+                    if value != signal.Signal.Terminate {
+                        return 3
+                    }
+                }
+                none => {
+                    return 4
+                }
+            }
+            console.println("stopped")!
+            return 0
+        }
+        err(_) => {
+            return 1
+        }
+    }
+}

@@ -1,0 +1,102 @@
+package event_loop
+
+import "std/console"
+import "std/net"
+import "std/net/native"
+import "std/signal"
+
+// Driven by tests/signal_library.rs: each signal is sent only after the
+// previous line arrived, so none of them can coalesce.
+fn name(value: &signal.Signal) -> &str {
+    match value {
+        signal.Signal.Interrupt => {
+            return "interrupt"
+        }
+        signal.Signal.Terminate => {
+            return "terminate"
+        }
+        signal.Signal.Hangup => {
+            return "hangup"
+        }
+        signal.Signal.Break => {
+            return "break"
+        }
+    }
+}
+fn pending(listener: &mut signal.Listener) -> bool {
+    match listener.next() {
+        some(_) => {
+            return true
+        }
+        none => {
+            return false
+        }
+    }
+}
+fn run() -> i32!net.Error {
+    selection := [signal.Signal.Interrupt, signal.Signal.Terminate, signal.Signal.Hangup, signal.Signal.Break]
+    listener := signal.listen(&selection)!
+    if pending(&mut listener) || listener.cancelled() {
+        return ok(3)
+    }
+    set := native.PollSet.new()
+    console.println("ready")!
+    for true {
+        set.clear()
+        index := listener.register(&mut set)?
+        match set.wait(10000) {
+            ok(count) => {
+                if count == 0 {
+                    return ok(4)
+                }
+            }
+            err(reason) => {
+                if reason.kind == net.ErrorKind.Interrupted {
+                    continue
+                }
+                return err(reason)
+            }
+        }
+        if !set.ready(index) {
+            continue
+        }
+        for true {
+            match listener.next() {
+                some(value) => {
+                    console.print(name(&value))!
+                    if listener.cancelled() {
+                        console.print(" cancelled")!
+                    }
+                    console.println("")!
+                    if value == signal.Signal.Terminate {
+                        listener.close()!
+                        listener.close()!
+                        if pending(&mut listener) {
+                            return ok(5)
+                        }
+                        again := signal.listen(&selection)!
+                        if again.cancelled() {
+                            return ok(6)
+                        }
+                        again.close()!
+                        return ok(0)
+                    }
+                }
+                none => {
+                    break
+                }
+            }
+        }
+    }
+    return ok(7)
+}
+fn main() -> i32 {
+    match run() {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return 8
+        }
+    }
+}

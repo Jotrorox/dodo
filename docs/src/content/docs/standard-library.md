@@ -166,6 +166,7 @@ individual modules and links every public declaration back to its source.
 | [Filesystem and lexical paths](filesystem.md) | `std/fs`, `std/fs/path`, `std/fs/types`, `std/fs/unix`, `std/fs/windows_ext` | Paths/types portable; files hosted. |
 | [Environment](environment.md) | `std/env` | Hosted. |
 | [Processes](processes.md) | `std/process`, `std/process/alloc` | Hosted. |
+| [Signals](signals.md) | `std/signal` | Hosted. |
 | [Threads](threads.md) | `std/thread` | Hosted. |
 | [Synchronization](synchronization.md) | `std/sync`, `std/sync/allocated`, `std/sync/atomic`, `std/sync/error` | Blocking/allocated hosted; atomic target-specific. |
 | [Networking and DNS](networking.md) | `std/net`, `std/net/dns`, `std/net/operations` | Values/DNS/operations portable; native sockets hosted. |
@@ -193,6 +194,8 @@ select providers; they are not additional recommended starting paths.
 | `std/platform/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/process/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/process/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
+| `std/signal/posix` | Native signal boundary; use [signals](signals.md). |
+| `std/signal/windows` | Native signal boundary; use [signals](signals.md). |
 | `std/sync/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/sync/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/thread/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
@@ -206,7 +209,7 @@ select providers; they are not additional recommended starting paths.
 | `std/web/windows` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
-`std/process/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
+`std/process/native`, `std/signal/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
 `std/time/native`, `std/tls/native`, and `std/web/native` select compatible
 providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`
