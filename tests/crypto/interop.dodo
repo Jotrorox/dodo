@@ -1,0 +1,126 @@
+package crypto_interop
+import "std/crypto"
+import "std/crypto/openssl"
+import "std/console"
+import "std/io"
+
+// Line protocol with an independent OpenSSL command-line peer, hex encoded:
+// out: our public key DER; in: a ciphertext for it; out: its plaintext;
+// in: the peer's public key DER; out: MESSAGE encrypted to it.
+const MESSAGE: &[u8] = b"dodo interop secret"
+
+fn nibble(c: u8) -> u8 {
+    if c >= 97 {
+        return c - 87
+    }
+    if c >= 65 {
+        return c - 55
+    }
+    return c - 48
+}
+fn send(bytes: &[u8]) -> void!io.Error {
+    digits := b"0123456789abcdef"
+    line := [0u8; 4097]
+    for i in 0usize..bytes.len {
+        line[2 * i] = digits[(bytes[i] >> 4) as usize]
+        line[2 * i + 1] = digits[(bytes[i] & 15) as usize]
+    }
+    line[2 * bytes.len] = 10
+    output := console.stdout()
+    io.write_all(&mut output, &line[..2 * bytes.len + 1])?
+    return ok()
+}
+fn receive(output: &mut[u8]) -> usize!io.Error {
+    line := [0u8; 4097]
+    input := console.stdin()
+    read := input.read_line(&mut line)?
+    count := read.count
+    for count > 0 && (line[count - 1] == 10 || line[count - 1] == 13) {
+        count -= 1
+    }
+    for i in 0usize..count / 2 {
+        output[i] = (nibble(line[2 * i]) << 4) | nibble(line[2 * i + 1])
+    }
+    return ok(count / 2)
+}
+fn exchange() -> i32 {
+    key := match openssl.RsaPrivateKey.generate(1024) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return 2
+        }
+    }
+    der := [0u8; 2048]
+    length := match key.public_key_der(&mut der) {
+        ok(value) => {
+            value
+        }
+        err(_) => {
+            return 3
+        }
+    }
+    match send(&der[..length]) {
+        ok() => {}
+        err(_) => {
+            return 4
+        }
+    }
+    ciphertext := [0u8; 2048]
+    plain := [0u8; 2048]
+    match receive(&mut ciphertext) {
+        ok(count) => {
+            match key.decrypt_pkcs1(&ciphertext[..count], &mut plain) {
+                ok(used) => {
+                    match send(&plain[..used]) {
+                        ok() => {}
+                        err(_) => {
+                            return 5
+                        }
+                    }
+                }
+                err(_) => {
+                    return 6
+                }
+            }
+        }
+        err(_) => {
+            return 7
+        }
+    }
+    match receive(&mut der) {
+        ok(count) => {
+            match openssl.RsaPublicKey.from_der(&der[..count]) {
+                ok(peer) => {
+                    match peer.encrypt_pkcs1(MESSAGE, &mut ciphertext) {
+                        ok(used) => {
+                            match send(&ciphertext[..used]) {
+                                ok() => {}
+                                err(_) => {
+                                    return 8
+                                }
+                            }
+                        }
+                        err(_) => {
+                            return 9
+                        }
+                    }
+                }
+                err(reason) => {
+                    if reason.kind == crypto.ErrorKind.InvalidInput {
+                        return 10
+                    }
+                    return 11
+                }
+            }
+        }
+        err(_) => {
+            return 12
+        }
+    }
+    return 0
+}
+fn main() -> i32 {
+    return exchange()
+}

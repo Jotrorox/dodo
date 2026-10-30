@@ -583,12 +583,29 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 }
                 if native
                     .iter()
-                    .any(|(name, _)| name.starts_with("std/tls/") || name.starts_with("std/quic/"))
+                    .any(|(name, _)| *name == "std/crypto/runtime.c")
                 {
+                    if apple {
+                        linker.args(["-framework", "Security"]);
+                    }
+                    if target.contains("-windows-") {
+                        linker.arg("-lbcrypt");
+                    }
+                }
+                let ssl = native
+                    .iter()
+                    .any(|(name, _)| name.starts_with("std/tls/") || name.starts_with("std/quic/"));
+                let libcrypto = native
+                    .iter()
+                    .any(|(name, _)| name.starts_with("std/crypto/openssl/"));
+                if ssl || libcrypto {
                     if apple {
                         homebrew_openssl(&mut linker);
                     }
-                    linker.args(["-lssl", "-lcrypto"]);
+                    if ssl {
+                        linker.arg("-lssl");
+                    }
+                    linker.arg("-lcrypto");
                 }
             }
             linker.args(&args.link_args).arg("-o").arg(out);

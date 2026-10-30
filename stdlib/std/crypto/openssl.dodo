@@ -1,0 +1,357 @@
+package openssl
+
+import "core/ptr"
+import "std/crypto"
+import "std/crypto/openssl/native"
+
+// Hashes, HMAC, AES-CFB8 and RSA from OpenSSL 3.5+ libcrypto. Every value
+// owns its OpenSSL state and frees it when dropped; no call retains a
+// caller's buffer. Values are deliberately not Send/Sync: use each on one
+// execution lane. Secret inputs are copied into OpenSSL during construction,
+// so the caller may wipe its own key bytes afterwards.
+pub const SHA1_BYTES: usize = 20
+pub const SHA256_BYTES: usize = 32
+pub const AES128_KEY_BYTES: usize = 16
+pub const AES_IV_BYTES: usize = 16
+pub const RSA_MIN_BITS: u32 = 1024
+pub const RSA_MAX_BITS: u32 = 16384
+// Bytes of PKCS#1 v1.5 encryption padding; messages are at most size() - 11.
+pub const PKCS1_OVERHEAD: usize = 11
+
+const SHA1: i32 = 1
+const SHA256: i32 = 2
+const AES128_CFB8: i32 = 1
+
+fn failure(status: i32) -> crypto.Error {
+    kind := crypto.ErrorKind.Backend
+    if status == -1 {
+        kind = crypto.ErrorKind.InvalidInput
+    }
+    if status == -2 {
+        kind = crypto.ErrorKind.BufferTooSmall
+    }
+    if status == -3 {
+        kind = crypto.ErrorKind.AllocationFailed
+    }
+    code := unsafe {
+        native.dodo_crypto_error()
+    }
+    return crypto.failure(kind, code)
+}
+fn check(status: i32) -> void!crypto.Error {
+    if status != 0 {
+        return err(failure(status))
+    }
+    return ok()
+}
+
+struct Digest {
+    handle: *mut u8
+    fn new(algorithm: i32) -> Digest!crypto.Error {
+        status := 0i32
+        handle := unsafe {
+            native.dodo_crypto_digest_new(algorithm, ptr.from_mut(&mut status))
+        }
+        if ptr.is_null(handle) {
+            return err(failure(status))
+        }
+        return ok(Digest { handle: handle })
+    }
+    fn update(&mut self, data: &[u8]) -> void!crypto.Error {
+        return check(unsafe {
+            native.dodo_crypto_digest_update(self.handle, ptr.as_ptr(data), data.len)
+        })
+    }
+    fn finish(&mut self, output: &mut[u8]) -> void!crypto.Error {
+        return check(unsafe {
+            native.dodo_crypto_digest_finish(self.handle, ptr.as_mut_ptr(output), output.len)
+        })
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_crypto_digest_free(self.handle)
+        }
+    }
+}
+// Incremental SHA-1. Use it only where a protocol requires it, such as the
+// Mojang server hash: SHA-1 is not collision resistant.
+pub struct Sha1 {
+    state: Digest
+    pub fn new() -> Sha1!crypto.Error {
+        return ok(Sha1 { state: Digest.new(SHA1)? })
+    }
+    pub fn update(&mut self, data: &[u8]) -> void!crypto.Error {
+        return self.state.update(data)
+    }
+    // Returns the digest of everything since construction or the previous
+    // finish, and starts a new empty message.
+    pub fn finish(&mut self) -> [20]u8!crypto.Error {
+        digest := [0u8; 20]
+        self.state.finish(&mut digest)?
+        return ok(digest)
+    }
+}
+pub fn sha1(data: &[u8]) -> [20]u8!crypto.Error {
+    hasher := Sha1.new()?
+    hasher.update(data)?
+    return hasher.finish()
+}
+// Incremental SHA-256.
+pub struct Sha256 {
+    state: Digest
+    pub fn new() -> Sha256!crypto.Error {
+        return ok(Sha256 { state: Digest.new(SHA256)? })
+    }
+    pub fn update(&mut self, data: &[u8]) -> void!crypto.Error {
+        return self.state.update(data)
+    }
+    // Returns the digest of everything since construction or the previous
+    // finish, and starts a new empty message.
+    pub fn finish(&mut self) -> [32]u8!crypto.Error {
+        digest := [0u8; 32]
+        self.state.finish(&mut digest)?
+        return ok(digest)
+    }
+}
+pub fn sha256(data: &[u8]) -> [32]u8!crypto.Error {
+    hasher := Sha256.new()?
+    hasher.update(data)?
+    return hasher.finish()
+}
+
+struct Mac {
+    handle: *mut u8
+    fn hmac(algorithm: i32, key: &[u8]) -> Mac!crypto.Error {
+        status := 0i32
+        handle := unsafe {
+            native.dodo_crypto_hmac_new(algorithm, ptr.as_ptr(key), key.len, ptr.from_mut(&mut status))
+        }
+        if ptr.is_null(handle) {
+            return err(failure(status))
+        }
+        return ok(Mac { handle: handle })
+    }
+    fn update(&mut self, data: &[u8]) -> void!crypto.Error {
+        return check(unsafe {
+            native.dodo_crypto_mac_update(self.handle, ptr.as_ptr(data), data.len)
+        })
+    }
+    fn finish(&mut self, output: &mut[u8]) -> void!crypto.Error {
+        return check(unsafe {
+            native.dodo_crypto_mac_finish(self.handle, ptr.as_mut_ptr(output), output.len)
+        })
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_crypto_mac_free(self.handle)
+        }
+    }
+}
+// Incremental HMAC-SHA256 (RFC 2104). Keys of any length are accepted,
+// including empty keys; keys longer than 64 bytes are hashed first.
+pub struct HmacSha256 {
+    state: Mac
+    pub fn new(key: &[u8]) -> HmacSha256!crypto.Error {
+        return ok(HmacSha256 { state: Mac.hmac(SHA256, key)? })
+    }
+    pub fn update(&mut self, data: &[u8]) -> void!crypto.Error {
+        return self.state.update(data)
+    }
+    // Returns the tag of everything since construction or the previous
+    // finish or verify, and starts a new message under the same key.
+    pub fn finish(&mut self) -> [32]u8!crypto.Error {
+        tag := [0u8; 32]
+        self.state.finish(&mut tag)?
+        return ok(tag)
+    }
+    // Finishes the message and compares the tag with expected in constant
+    // time. A truncated or overlong expected tag never matches.
+    pub fn verify(&mut self, expected: &[u8]) -> bool!crypto.Error {
+        tag := self.finish()?
+        matched := crypto.equal(&tag, expected)
+        crypto.wipe(&mut tag)
+        return ok(matched)
+    }
+}
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [32]u8!crypto.Error {
+    mac := HmacSha256.new(key)?
+    mac.update(data)?
+    return mac.finish()
+}
+
+struct Cipher {
+    handle: *mut u8
+    fn new(algorithm: i32, encrypt: bool, key: &[u8], iv: &[u8]) -> Cipher!crypto.Error {
+        status := 0i32
+        direction := 0i32
+        if encrypt {
+            direction = 1
+        }
+        handle := unsafe {
+            native.dodo_crypto_cipher_new(algorithm, direction, ptr.as_ptr(key), key.len, ptr.as_ptr(iv), iv.len, ptr.from_mut(&mut status))
+        }
+        if ptr.is_null(handle) {
+            return err(failure(status))
+        }
+        return ok(Cipher { handle: handle })
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_crypto_cipher_free(self.handle)
+        }
+    }
+}
+// AES-128 in 8-bit cipher feedback mode (CFB8), as a stream: each update
+// continues where the previous one stopped, so a message may be split at any
+// byte. One value either encrypts or decrypts; a connection needs one of
+// each. Minecraft protocol encryption uses the 16-byte shared secret as both
+// key and IV.
+pub struct Aes128Cfb8 {
+    state: Cipher
+    // key and iv must each be 16 bytes.
+    pub fn encryptor(key: &[u8], iv: &[u8]) -> Aes128Cfb8!crypto.Error {
+        return ok(Aes128Cfb8 { state: Cipher.new(AES128_CFB8, true, key, iv)? })
+    }
+    pub fn decryptor(key: &[u8], iv: &[u8]) -> Aes128Cfb8!crypto.Error {
+        return ok(Aes128Cfb8 { state: Cipher.new(AES128_CFB8, false, key, iv)? })
+    }
+    // Transforms input into output[..input.len]; later output bytes are left
+    // unchanged. A shorter output fails BufferTooSmall before any progress.
+    pub fn update(&mut self, input: &[u8], output: &mut[u8]) -> void!crypto.Error {
+        if output.len < input.len {
+            return err(crypto.failure(crypto.ErrorKind.BufferTooSmall, 0))
+        }
+        return check(unsafe {
+            native.dodo_crypto_cipher_update(self.state.handle, ptr.as_ptr(input), ptr.as_mut_ptr(output), input.len)
+        })
+    }
+    pub fn update_in_place(&mut self, data: &mut[u8]) -> void!crypto.Error {
+        address := ptr.as_mut_ptr(data)
+        return check(unsafe {
+            native.dodo_crypto_cipher_update(self.state.handle, address as *const u8, address, data.len)
+        })
+    }
+}
+
+struct Key {
+    handle: *mut u8
+    fn bits(&self) -> u32 {
+        return unsafe {
+            native.dodo_crypto_key_bits(self.handle)
+        } as u32
+    }
+    fn size(&self) -> usize {
+        return unsafe {
+            native.dodo_crypto_key_size(self.handle)
+        } as usize
+    }
+    fn public_der(&self, output: &mut[u8]) -> usize!crypto.Error {
+        actual := 0usize
+        check(unsafe {
+            native.dodo_crypto_key_public_der(self.handle, ptr.as_mut_ptr(output), output.len, ptr.from_mut(&mut actual))
+        })?
+        return ok(actual)
+    }
+    fn public_der_len(&self) -> usize!crypto.Error {
+        empty := [0u8; 0]
+        actual := 0usize
+        status := unsafe {
+            native.dodo_crypto_key_public_der(self.handle, ptr.as_mut_ptr(&mut empty), 0, ptr.from_mut(&mut actual))
+        }
+        if status != 0 && status != -2 {
+            return err(failure(status))
+        }
+        return ok(actual)
+    }
+    fn drop(&mut self) {
+        unsafe {
+            native.dodo_crypto_key_free(self.handle)
+        }
+    }
+}
+// An RSA key pair with public exponent 65537.
+pub struct RsaPrivateKey {
+    key: Key
+    // bits must be within RSA_MIN_BITS..=RSA_MAX_BITS. Generation draws on
+    // OpenSSL's CSPRNG; a 1024-bit key takes milliseconds, 4096 bits seconds.
+    pub fn generate(bits: u32) -> RsaPrivateKey!crypto.Error {
+        status := 0i32
+        handle := unsafe {
+            native.dodo_crypto_rsa_generate(bits, ptr.from_mut(&mut status))
+        }
+        if ptr.is_null(handle) {
+            return err(failure(status))
+        }
+        return ok(RsaPrivateKey { key: Key { handle: handle } })
+    }
+    pub fn bits(&self) -> u32 {
+        return self.key.bits()
+    }
+    // Modulus length in bytes, which is also the ciphertext length.
+    pub fn size(&self) -> usize {
+        return self.key.size()
+    }
+    // Writes the public key as DER SubjectPublicKeyInfo (RFC 5280), the form
+    // Minecraft's encryption request carries, and returns its length. A
+    // shorter output fails BufferTooSmall and is left unchanged.
+    pub fn public_key_der(&self, output: &mut[u8]) -> usize!crypto.Error {
+        return self.key.public_der(output)
+    }
+    // The exact length public_key_der writes: 162 bytes for 1024-bit keys.
+    pub fn public_key_der_len(&self) -> usize!crypto.Error {
+        return self.key.public_der_len()
+    }
+    // RSAES-PKCS1-v1_5 decryption (RFC 8017). ciphertext must be exactly
+    // size() bytes. Returns the message length; a shorter output fails
+    // BufferTooSmall and is left unchanged.
+    //
+    // OpenSSL applies implicit rejection: a malformed ciphertext of the right
+    // length decrypts to a deterministic pseudorandom message instead of
+    // failing, so a padding oracle reveals nothing. Validate the plaintext,
+    // such as the expected length and a verify token, before trusting it.
+    pub fn decrypt_pkcs1(&self, ciphertext: &[u8], output: &mut[u8]) -> usize!crypto.Error {
+        actual := 0usize
+        check(unsafe {
+            native.dodo_crypto_rsa_decrypt(self.key.handle, ptr.as_ptr(ciphertext), ciphertext.len, ptr.as_mut_ptr(output), output.len, ptr.from_mut(&mut actual))
+        })?
+        return ok(actual)
+    }
+}
+// An RSA public key, such as a peer's encryption key.
+pub struct RsaPublicKey {
+    key: Key
+    // Parses exactly one DER SubjectPublicKeyInfo holding an RSA key of
+    // RSA_MIN_BITS..=RSA_MAX_BITS. Trailing bytes are rejected.
+    pub fn from_der(der: &[u8]) -> RsaPublicKey!crypto.Error {
+        status := 0i32
+        handle := unsafe {
+            native.dodo_crypto_rsa_public_from_der(ptr.as_ptr(der), der.len, ptr.from_mut(&mut status))
+        }
+        if ptr.is_null(handle) {
+            return err(failure(status))
+        }
+        return ok(RsaPublicKey { key: Key { handle: handle } })
+    }
+    pub fn bits(&self) -> u32 {
+        return self.key.bits()
+    }
+    pub fn size(&self) -> usize {
+        return self.key.size()
+    }
+    pub fn public_key_der(&self, output: &mut[u8]) -> usize!crypto.Error {
+        return self.key.public_der(output)
+    }
+    pub fn public_key_der_len(&self) -> usize!crypto.Error {
+        return self.key.public_der_len()
+    }
+    // RSAES-PKCS1-v1_5 encryption with fresh random padding. message may be
+    // at most size() - PKCS1_OVERHEAD bytes; output needs size() bytes.
+    // Returns size().
+    pub fn encrypt_pkcs1(&self, message: &[u8], output: &mut[u8]) -> usize!crypto.Error {
+        actual := 0usize
+        check(unsafe {
+            native.dodo_crypto_rsa_encrypt(self.key.handle, ptr.as_ptr(message), message.len, ptr.as_mut_ptr(output), output.len, ptr.from_mut(&mut actual))
+        })?
+        return ok(actual)
+    }
+}

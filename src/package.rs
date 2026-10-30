@@ -506,24 +506,30 @@ impl Loader<'_> {
         if import == "std/embedded/board" || import == "std/embedded/chip" {
             return self.platform_import(import);
         }
-        let parts: Vec<_> = import.split('/').collect();
-        if parts.len() != 3
-            || parts[0] != "std"
-            || !matches!(
-                parts[1],
-                "platform"
-                    | "fs"
-                    | "process"
-                    | "env"
-                    | "thread"
-                    | "sync"
-                    | "net"
-                    | "tls"
-                    | "quic"
-                    | "web"
-                    | "time"
-            )
-            || !matches!(parts[2], "native" | "posix" | "linux" | "macos" | "windows")
+        // An area is a stdlib directory with its own adapters and `runtime.c`;
+        // `crypto/openssl` keeps libcrypto out of programs that only need entropy.
+        let Some((area, selector)) = import
+            .strip_prefix("std/")
+            .and_then(|rest| rest.rsplit_once('/'))
+        else {
+            return Ok(import.to_owned());
+        };
+        if !matches!(
+            area,
+            "platform"
+                | "fs"
+                | "process"
+                | "env"
+                | "thread"
+                | "sync"
+                | "net"
+                | "tls"
+                | "quic"
+                | "crypto"
+                | "crypto/openssl"
+                | "web"
+                | "time"
+        ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
             return Ok(import.to_owned());
         }
@@ -532,10 +538,10 @@ impl Loader<'_> {
         };
         // `std/AREA/linux` and `std/AREA/macos` name the shared POSIX adapter
         // on their own operating system only.
-        if !matches!(parts[2], "native") && parts[2] != adapter && parts[2] != os {
-            return Err(format!("`{import}` cannot be used for target `{}`; select `std/{}/native` or the `{os}` adapter", self.target, parts[1]).into());
+        if selector != "native" && selector != adapter && selector != os {
+            return Err(format!("`{import}` cannot be used for target `{}`; select `std/{area}/native` or the `{os}` adapter", self.target).into());
         }
-        Ok(format!("std/{}/{adapter}", parts[1]))
+        Ok(format!("std/{area}/{adapter}"))
     }
 
     fn module(
