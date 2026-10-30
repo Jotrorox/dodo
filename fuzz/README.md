@@ -3,7 +3,7 @@
 `compiler_safety` turns bytes into small Dodo programs with initialization,
 whole-value moves, reassignment, branches, conditional/range/forever loops,
 break/continue/return edges, nesting, and shadowed scalar/owned bindings.
-Every input is syntactically valid and remains in the supported flow subset.
+Every input is syntactically valid and well typed.
 Generation has a node budget of 20 and a nesting limit of two; missing bytes
 decode as zero, and bytes beyond the generated program are ignored.
 
@@ -15,16 +15,16 @@ Like the conservative compiler policy, range loops include zero iterations,
 even for literal bounds, and repeated tests of `b` are independent choices.
 Repeating generated loops read outer owned bindings before modifying them, so losing
 an outer owned value on a back edge produces an actual invalid read on the next
-iteration. This avoids treating the AST checker's stronger loop restrictions
-as a semantic safety oracle.
+iteration. This avoids treating stronger loop restrictions as a semantic
+safety oracle.
 
-AST-only, flow-only, combined, and production fail-fast results are each checked
-against the oracle. Both flow reports must analyze every generated body; missing
-coverage and fallback fail the test. Every expected use/declaration position,
-binding name, and presence of move provenance is checked. Hand-specified fixtures
-validate the oracle's branch joins, loop exits, reinitialization, and shadowing.
-These tests cover initialization and whole-local ownership; they do not certify
-borrowing, Result obligations, types outside this subset, or native cleanup.
+Recovering and fail-fast checking are both compared with the oracle. The flow
+report must analyze every generated body, and every expected use/declaration
+position, binding name, and presence of move provenance is checked.
+Hand-specified fixtures validate the oracle's branch joins, loop exits,
+reinitialization, and shadowing. These tests cover initialization and
+whole-local ownership; loans, Result obligations, and destruction order are
+covered by `tests/flow_ownership`.
 
 The regular frontend CI automatically runs 1,024 deterministic seeds at both
 target widths, short/repeated byte inputs, and single-bit mutations:

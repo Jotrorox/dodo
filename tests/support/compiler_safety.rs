@@ -197,12 +197,13 @@ impl Case {
                                 } else {
                                     "_ = "
                                 });
+                                // Diagnostics point at the binding itself.
                                 site.start = source.len();
                                 source.push_str(local.name);
+                                site.end = source.len();
                                 if matches!(kind, Action::Read) && local.owned {
                                     source.push_str(".n");
                                 }
-                                site.end = source.len();
                                 if matches!(kind, Action::Move) {
                                     source.push(')');
                                 }
@@ -383,79 +384,64 @@ fn verify_case(case: &mut Case, pointer_bits: u32) -> bool {
     let source = case.render();
     let expected = expectations(case);
     let program = parser::parse(&source).unwrap_or_else(|error| panic!("{error:?}\n{source}"));
-    let comparison = flow::compare_checkers(&program, pointer_bits);
-    for (name, report) in [
-        ("AST", &comparison.ast),
-        ("flow", &comparison.flow),
-        ("combined", &comparison.combined),
-    ] {
-        assert_eq!(
-            report.diagnostics.is_empty(),
-            expected.is_empty(),
-            "{name}, {pointer_bits}-bit: {report:?}\nexpected {expected:?}\n{source}"
+    let report = flow::check_with_report(&mut program.clone(), pointer_bits);
+    assert_eq!(
+        report.diagnostics.is_empty(),
+        expected.is_empty(),
+        "{pointer_bits}-bit: {report:?}\nexpected {expected:?}\n{source}"
+    );
+    for diagnostic in &report.diagnostics {
+        assert!(
+            diagnostic.message.contains("uninitialized") || diagnostic.message.contains("moved"),
+            "unrelated rejection: {diagnostic:?}\n{source}"
         );
-        for diagnostic in &report.diagnostics {
-            assert!(
-                diagnostic.message.contains("uninitialized")
-                    || diagnostic.message.contains("moved"),
-                "unrelated {name} rejection: {diagnostic:?}\n{source}"
-            );
-        }
-        if let Some(first) = report.diagnostics.first() {
-            assert!(
-                case.locals.iter().any(|local| {
-                    expected.keys().any(|key| key.2 == local.declaration)
-                        && first.message.contains(&format!("`{}`", local.name))
-                }),
-                "{name} rejected the wrong binding: {first:?}\n{source}"
-            );
-        }
     }
-    assert!(comparison.ast.coverage.is_none());
-    // Inspect both reports against the oracle. A skip or missing coverage must
-    // never count as success, even when no user-facing diagnostic was emitted.
-    for report in [&comparison.flow, &comparison.combined] {
-        let coverage = report.coverage.as_ref().expect("prepared flow coverage");
-        assert_eq!(coverage.bodies.len(), 2, "{source}");
-        for name in ["f", "take"] {
-            assert!(
-                coverage.bodies.iter().any(|body| body.name == name),
-                "missing {name}: {source}"
-            );
-        }
-        for body in &coverage.bodies {
-            let issues = match &body.status {
-                flow::BodyStatus::Analyzed => &[][..],
-                flow::BodyStatus::Diagnostics(issues) => issues.as_slice(),
-                other => panic!("unexpected fallback for {}: {other:?}\n{source}", body.name),
-            };
-            let actual: Issues = issues
-                .iter()
-                .map(|issue| {
-                    let local = case
-                        .locals
-                        .iter()
-                        .find(|local| local.declaration == issue.declaration.start)
-                        .unwrap_or_else(|| panic!("unknown declaration: {issue:?}\n{source}"));
-                    assert_eq!(issue.name, local.name, "{source}");
-                    (
-                        (issue.span.start, issue.span.end, issue.declaration.start),
-                        issue.moved_at.is_some(),
-                    )
-                })
-                .collect();
-            assert_eq!(actual.len(), issues.len(), "duplicate findings: {source}");
-            let wanted = if body.name == "f" {
-                &expected
-            } else {
-                &Issues::new()
-            };
-            assert_eq!(
-                &actual, wanted,
-                "{}: {pointer_bits}-bit\n{source}",
-                body.name
-            );
-        }
+    if let Some(first) = report.diagnostics.first() {
+        assert!(
+            case.locals.iter().any(|local| {
+                expected.keys().any(|key| key.2 == local.declaration)
+                    && first.message.contains(&format!("`{}`", local.name))
+            }),
+            "rejected the wrong binding: {first:?}\n{source}"
+        );
+    }
+    // Every body is analyzed; compare all of its findings with the oracle.
+    let bodies = report.bodies.as_ref().expect("analyzed bodies");
+    assert_eq!(bodies.len(), 2, "{source}");
+    for name in ["f", "take"] {
+        assert!(
+            bodies.iter().any(|body| body.name == name),
+            "missing {name}: {source}"
+        );
+    }
+    for body in bodies {
+        let issues = &body.uninitialized;
+        let actual: Issues = issues
+            .iter()
+            .map(|issue| {
+                let local = case
+                    .locals
+                    .iter()
+                    .find(|local| local.declaration == issue.declaration.start)
+                    .unwrap_or_else(|| panic!("unknown declaration: {issue:?}\n{source}"));
+                assert_eq!(issue.name, local.name, "{source}");
+                (
+                    (issue.span.start, issue.span.end, issue.declaration.start),
+                    issue.moved_at.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(actual.len(), issues.len(), "duplicate findings: {source}");
+        let wanted = if body.name == "f" {
+            &expected
+        } else {
+            &Issues::new()
+        };
+        assert_eq!(
+            &actual, wanted,
+            "{}: {pointer_bits}-bit\n{source}",
+            body.name
+        );
     }
     assert_eq!(
         sema::check_for_target(&mut program.clone(), pointer_bits).is_ok(),

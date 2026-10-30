@@ -1,14 +1,7 @@
-//! Explicit region provenance for owner-bound allocated storage. A zero-length
-//! array witnesses the stored type without owning an active payload. Raw pointer
-//! validity remains unsafe; dependency deposition and return contracts are checked.
+//! Typed owner-bound allocated storage. A zero-length array witnesses the
+//! stored type without owning an active payload. Raw pointer validity remains
+//! unsafe; `flow` checks dependency deposition and return contracts.
 use super::*;
-
-#[derive(Clone, Default)]
-pub(super) struct StorageLoop {
-    roots: HashSet<usize>,
-    pub(super) accesses: Vec<(Loan, Span)>,
-    deposits: Vec<(Loan, Vec<Loan>)>,
-}
 
 impl Context {
     pub(super) fn storage_elements(&self, ty: &Type) -> Vec<Type> {
@@ -142,106 +135,6 @@ impl Context {
 }
 
 impl Checker<'_> {
-    pub(super) fn begin_storage_loop(&self) {
-        self.storage_loops.borrow_mut().push(StorageLoop {
-            roots: self.scopes.iter().flatten().map(|v| v.id).collect(),
-            ..StorageLoop::default()
-        });
-    }
-    pub(super) fn end_storage_loop(&mut self, span: Span) -> Check<()> {
-        let state = self.storage_loops.borrow_mut().pop().unwrap();
-        for (target, incoming) in state.deposits {
-            // Retain effects on break/continue branches that the ordinary
-            // fallthrough join excludes. Also check the next iteration's prefix.
-            for loan in &incoming {
-                if state
-                    .accesses
-                    .iter()
-                    .any(|(access, _)| overlaps(access, loan))
-                {
-                    return Err(Diagnostic::new(
-                        span,
-                        "stored borrow conflicts with source mutation across a loop back edge",
-                    )
-                    .label(
-                        loan.origin,
-                        "this dependency can survive into the next iteration",
-                    ));
-                }
-            }
-            self.retain_storage_dependencies(&target, &incoming);
-        }
-        Ok(())
-    }
-    fn retain_storage_dependencies(&mut self, target: &Loan, incoming: &[Loan]) {
-        for variable in self.scopes.iter_mut().flatten() {
-            if variable.id == target.root
-                || variable
-                    .deps
-                    .iter()
-                    .any(|d| !d.dependency && d.root == target.root)
-            {
-                variable.deps.extend(incoming.iter().cloned().map(|mut d| {
-                    d.dependency = true;
-                    d.stored = true;
-                    d
-                }));
-            }
-        }
-    }
-
-    // Update the original owner, not a temporary reborrow. An external root has
-    // no local binding: every incoming source must be covered by this body's
-    // declared effect, including effects forwarded through helpers.
-    pub(super) fn deposit(&mut self, owner: &Value, incoming: &[Loan], span: Span) -> Check<()> {
-        for target in owner.deps.iter().filter(|d| !d.dependency) {
-            if let Some(external) = &target.external {
-                for loan in incoming {
-                    let allowed = loan.external.as_ref().is_some_and(|source| {
-                        source == "static"
-                            || source == &format!("{external}.stored")
-                            || (self.stores.first() == Some(external)
-                                && self.stores[1..]
-                                    .iter()
-                                    .any(|s| source == s || source == &format!("{s}.stored")))
-                    });
-                    if !allowed {
-                        return Err(Diagnostic::new(span, "stored borrow source is outside the declared stores(target, source...) effect")
-                            .label(loan.origin, "this source would escape into caller storage")
-                            .note("forward parameter dependencies with stores; local storage cannot escape through a mutation effect"));
-                    }
-                }
-            } else if self.by_id(target.root).is_none() && !incoming.is_empty() {
-                return Err(Diagnostic::new(
-                    span,
-                    "cannot identify the owner of this stored borrow",
-                ));
-            }
-            let mut retained = vec![];
-            for loan in incoming {
-                if loan.root == target.root && loan.external.is_none() {
-                    return Err(Diagnostic::new(
-                        span,
-                        "a stored borrow cannot depend on its own container storage",
-                    ));
-                }
-                let mut loan = loan.clone();
-                loan.dependency = true;
-                loan.stored = true;
-                retained.push(loan);
-            }
-            // Reborrows made before this call must observe the new region union.
-            // Updating only the owner or only its temporary alias loses facts.
-            self.retain_storage_dependencies(target, &retained);
-            for state in self.storage_loops.borrow_mut().iter_mut() {
-                if state.roots.contains(&target.root) || target.external.is_some() {
-                    state.deposits.push((target.clone(), retained.clone()));
-                }
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn storage_intrinsic(
         &mut self,
         name: &str,
@@ -262,7 +155,6 @@ impl Checker<'_> {
                 format!("ptr.{operation} expects {arity} arguments and at most one element type"),
             ));
         }
-        let temporary_start = self.temporary.len();
         let pointer = self.expr(&mut args[0], None, false)?;
         let Type::Raw(writable, element) = pointer.ty else {
             return Err(Diagnostic::new(
@@ -281,13 +173,10 @@ impl Checker<'_> {
                 "moving typed storage requires a mutable raw pointer",
             ));
         }
-        let incoming = if operation == "store" {
+        if operation == "store" {
             let value = self.expr(&mut args[1], Some(&element), true)?;
             self.expect(&element, &value.ty, args[1].span)?;
-            value.deps
-        } else {
-            vec![]
-        };
+        }
         if operation == "relocate" {
             let destination = self.expr(&mut args[1], None, false)?;
             self.expect(
@@ -320,23 +209,6 @@ impl Checker<'_> {
                 "typed storage owner lacks a zero-length witness for this element type",
             ));
         }
-        if operation == "store" {
-            self.deposit(&owner, &incoming, span)?;
-        }
-        let mut deps = if view {
-            owner.deps
-        } else if operation == "take" && self.context.carries_borrow(&element) {
-            owner.deps.into_iter().filter(|d| d.stored).collect()
-        } else {
-            vec![]
-        };
-        if view {
-            for loan in &mut deps {
-                loan.mutable = false;
-            }
-        }
-        self.temporary.truncate(temporary_start);
-        self.temporary.extend(deps.clone());
         Ok(Value {
             ty: match operation {
                 "view" => Type::Ref(false, element),
@@ -344,7 +216,6 @@ impl Checker<'_> {
                 "take" => *element,
                 _ => Type::Void,
             },
-            deps,
         })
     }
 }
