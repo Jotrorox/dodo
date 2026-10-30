@@ -196,6 +196,38 @@ impl<'a> Plan<'a> {
                 self.block(body);
             }
         }
+        self.array_lengths();
+    }
+
+    /// Array lengths in `[N * 4]u8` and `[0u8; N * 4]` carry no source spans,
+    /// so reparse the tokens after `[` or `;` to tell `*` and `-` operators
+    /// from prefix ones. Only constant length expressions are marked; index
+    /// expressions get the same marks from the expression walk.
+    fn array_lengths(&mut self) {
+        let mut starts = Vec::new();
+        for (index, token) in self.tokens.iter().enumerate() {
+            match token.kind {
+                TokenKind::Symbol("[" | "(" | "{") => starts.push(index + 1),
+                TokenKind::Symbol(";") => {
+                    if let Some(start) = starts.last_mut() {
+                        *start = index + 1;
+                    }
+                }
+                TokenKind::Symbol(")" | "}") => {
+                    starts.pop();
+                }
+                TokenKind::Symbol("]") => {
+                    let Some(start) = starts.pop() else { continue };
+                    if let Some(length) =
+                        crate::parser::parse_expression(&self.tokens[start..index])
+                        && LengthExpr::from_expr(length.clone()).is_ok()
+                    {
+                        self.expression(&length);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn block(&mut self, block: &Block) {
@@ -753,6 +785,7 @@ fn needs_space(
                 | "->"
                 | "|"
                 | ","
+                | ";"
                 | ":"
         );
     }
@@ -776,6 +809,10 @@ fn needs_space(
     }
     if previous == "]" && matches!(current.kind, TokenKind::Ident(_)) {
         return matches!(text, "as" | "in" | "from" | "stores" | "requires_plain");
+    }
+    // Operators after `]` are marked binary; others start an element type.
+    if previous == "]" && matches!(text, "*" | "&") {
+        return false;
     }
     // Prefix `!` spaces like any operand; other `!` tokens are postfix unwraps
     // or the separator in `T!E` error types.
@@ -829,6 +866,24 @@ mod tests {
             "x += [1u32][0]",
             "x -= (x)",
             "x = (x)",
+        ] {
+            assert!(output.contains(text), "missing {text}: {output}");
+        }
+    }
+    #[test]
+    fn spaces_operators_in_array_lengths() {
+        let output = formatted(
+            "package p\nconst N:usize=4\nstruct S{data:[N*4]u8\nptrs:[2]*const u8}\nfn f(p:&u8)->[N-1]u8{a:=[0u8;16*16]\nb:[2*N]u32=[*p as u32;N*2]\nc:=[0u8;(N as usize)*2]\nd:=a[N-1]\nreturn [0u8;N-1]}\n",
+        );
+        for text in [
+            "data: [N * 4]u8",
+            "ptrs: [2]*const u8",
+            "-> [N - 1]u8",
+            "a := [0u8; 16 * 16]",
+            "b: [2 * N]u32 = [*p as u32; N * 2]",
+            "c := [0u8; (N as usize) * 2]",
+            "d := a[N - 1]",
+            "return [0u8; N - 1]",
         ] {
             assert!(output.contains(text), "missing {text}: {output}");
         }
