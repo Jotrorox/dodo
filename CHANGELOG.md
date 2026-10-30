@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Records larger than 1 KiB passed, returned, or moved by value compile as
+  memory copies at every optimization level. Before, LLVM split them into
+  one operation per element: a 256 KiB struct took minutes and gigabytes of
+  memory to build at `-O 2` and needed about 10 MB of stack at `-O 0`. Root
+  package public functions now pass such records through memory like other
+  Dodo functions.
 - The RP2040 and RP2350 boards are USB serial ports on their own USB
   connector: `b.usb.serial()` returns a CDC-ACM port with the `std/io` Reader
   and Writer protocols, so `fmt.printf` prints over the USB cable with no
