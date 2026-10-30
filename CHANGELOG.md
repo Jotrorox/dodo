@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `std/graphics` draws into caller-owned pixel storage on every target,
+  firmware included, with no allocation, operating system or floating
+  point: lines, rectangles, rounded rectangles, circles, ellipses and
+  even-odd polygons, outlined or filled, plus text, canvas-to-canvas copies
+  with format conversion, and alpha blending. Canvases come in RGBA, BGRA,
+  big-endian RGB565, 8-bit gray and 1-bit formats, clip every call, and
+  track the rectangle each call changed, so a display can be sent only what
+  changed. Rendering is integer-only and gives the same pixels everywhere.
+  `std/graphics/font` adds 6x8 and 8x16 bitmap fonts for ASCII and Latin-1,
+  `std/graphics/image` decodes PPM/PGM, QOI and BMP and encodes PPM, QOI
+  and BMP into caller buffers, and the `graphics.Display` protocol with the
+  in-memory `std/graphics/fake` display lets drawing code be tested under
+  `dodo test`. Golden images in `tests/graphics/golden/` pin the output.
+
 - `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
   (DCP), with no change to programs: division takes about 90 cycles instead
   of 1300, addition about 45 instead of 260, multiplication about 60 instead

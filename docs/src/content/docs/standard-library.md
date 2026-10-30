@@ -45,6 +45,7 @@ they are not prerequisites for using the safe entry APIs.
 | Build a string | `text.Builder.new` with a byte array | [Text](text.md) |
 | Decode or encode JSON | `@derive(Json)` and `json.decode<T>` | [JSON](json.md) |
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
+| Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
 | Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
@@ -104,7 +105,7 @@ Those details determine whether retrying or reusing storage is valid.
 ## Portable and hosted functionality
 
 Portable core, allocation, bytes, text, JSON, collections, math, hashes, time values,
-DNS/TLS contracts, HTTP/1.1 protocol engines and web routing require no OS,
+graphics, DNS/TLS contracts, HTTP/1.1 protocol engines and web routing require no OS,
 libc, global allocator, scheduler or garbage collector. Portable fixture checks
 emit `wasm32-unknown-unknown` and `thumbv6m-none-eabi` objects at O0 and O3.
 This is code-generation evidence, not tested board startup or hardware execution.
@@ -161,6 +162,7 @@ individual modules and links every public declaration back to its source.
 | [Collections](collections.md) | `std/collections`, `std/collections/deque`, `std/collections/fixed_deque`, `std/collections/fixed_map`, `std/collections/fixed_set`, `std/collections/fixed_vector`, `std/collections/hash_map`, `std/collections/hash_set`, `std/collections/heap`, `std/collections/ordered_map`, `std/collections/ordered_set`, `std/collections/shared_deque`, `std/collections/shared_hash_map`, `std/collections/shared_hash_set`, `std/collections/shared_heap`, `std/collections/shared_ordered_map`, `std/collections/shared_ordered_set`, `std/collections/shared_vector`, `std/collections/vector` | Portable. |
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
+| [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image` | Portable; caller-supplied pixel and file buffers. |
 | [Time and clocks](time.md) | `std/time`, `std/time/clock`, `std/time/hosted`, `std/time/iso8601`, `std/time/timer` | Values/contracts portable; hosted clock explicit. |
 | [Native strings and errors](platform.md) | `std/platform`, `std/platform/error` | Hosted. |
 | [Filesystem and lexical paths](filesystem.md) | `std/fs`, `std/fs/path`, `std/fs/types`, `std/fs/unix`, `std/fs/windows_ext` | Paths/types portable; files hosted. |

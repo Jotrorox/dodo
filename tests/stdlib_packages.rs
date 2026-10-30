@@ -377,6 +377,28 @@ fn portable_package_dependencies_are_independent_and_reserved() {
             "std/time/iso8601",
             vec!["alloc/", "std/time/clock", "std/time/timer"],
         ),
+        (
+            "std/graphics",
+            vec![
+                "alloc/",
+                "std/io",
+                "std/platform",
+                "std/math",
+                "std/graphics/",
+            ],
+        ),
+        (
+            "std/graphics/font",
+            vec!["alloc/", "std/platform", "std/graphics/image"],
+        ),
+        (
+            "std/graphics/image",
+            vec!["alloc/", "std/platform", "std/fs", "std/graphics/font"],
+        ),
+        (
+            "std/graphics/fake",
+            vec!["alloc/", "std/platform", "std/fs"],
+        ),
     ] {
         let source = workspace.write(
             "main.dodo",
