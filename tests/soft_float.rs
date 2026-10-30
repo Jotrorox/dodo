@@ -1,9 +1,11 @@
-//! The firmware runtime's floating-point helpers (src/hardware/arm_float.ll)
-//! are integer-only IR, so they also compile for the host. This builds them
-//! for the host, links them into a small C driver, and checks each helper
-//! against the host's IEEE 754 hardware on special values, boundary cases
-//! and random operands. Rust's `as` conversions saturate and map NaN to zero,
-//! which is the helpers' contract too.
+//! The firmware runtime's floating-point helpers (src/hardware/arm_float.ll,
+//! under the names arm_float_soft.ll gives them on chips without a
+//! double-precision accelerator) are integer-only IR, so they also compile
+//! for the host. This builds them for the host, links them into a small C
+//! driver, and checks each helper against the host's IEEE 754 hardware on
+//! special values, boundary cases and random operands. Rust's `as`
+//! conversions saturate and map NaN to zero, which is the helpers' contract
+//! too.
 #![cfg(unix)]
 use std::fmt::Write as _;
 use std::fs;
@@ -11,7 +13,10 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-const RUNTIME: &str = include_str!("../src/hardware/arm_float.ll");
+const RUNTIME: &str = concat!(
+    include_str!("../src/hardware/arm_float.ll"),
+    include_str!("../src/hardware/arm_float_soft.ll")
+);
 
 // Reads `name a b` lines in hex and prints each result in hex.
 const DRIVER: &str = r#"

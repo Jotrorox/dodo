@@ -8,6 +8,12 @@
 ; binary64 helpers, the conversions between f32 and f64 or 64-bit integers,
 ; and fmodf. All are weak; --gc-sections drops the unused ones.
 ;
+; binary64 addition, subtraction, multiplication and division, and the
+; conversions between binary64 and binary32 or 32-bit integers, are defined
+; here as dodo_soft_*. The file the compiler appends next gives them their
+; GNU and EABI names: arm_float_soft.ll, for chips without a
+; double-precision accelerator.
+;
 ; Results round to nearest, ties to even, and subnormals are kept. NaN
 ; results are the default quiet NaN; there are no exception flags.
 ; Out-of-range conversions to integers saturate and NaN converts to zero;
@@ -20,7 +26,7 @@
 ; round once more: binary64 has more than 2 * 24 + 2 significand bits, so the
 ; double rounding gives the correctly rounded binary32 result. These helpers
 ; need only the integer helpers from arm_eabi.ll, and on a 64-bit host they
-; need nothing, which is how tests/firmware.rs checks them against hardware.
+; need nothing, which is how tests/soft_float.rs checks them against hardware.
 
 attributes #1 = { nounwind "no-builtins" }
 
@@ -432,7 +438,7 @@ norm:
   ret i64 %r
 }
 
-define weak i64 @__aeabi_dadd(i64 %a, i64 %b) #1 {
+define weak i64 @dodo_soft_dadd(i64 %a, i64 %b) #1 {
 entry:
   %x = xor i64 %a, %b
   %same = icmp sgt i64 %x, -1
@@ -446,13 +452,13 @@ sub:
   ret i64 %difference
 }
 
-define weak i64 @__aeabi_dsub(i64 %a, i64 %b) #1 {
+define weak i64 @dodo_soft_dsub(i64 %a, i64 %b) #1 {
   %nb = xor i64 %b, -9223372036854775808
-  %r = call i64 @__aeabi_dadd(i64 %a, i64 %nb)
+  %r = call i64 @dodo_soft_dadd(i64 %a, i64 %nb)
   ret i64 %r
 }
 
-define weak i64 @__aeabi_dmul(i64 %a, i64 %b) #1 {
+define weak i64 @dodo_soft_dmul(i64 %a, i64 %b) #1 {
 entry:
   %x = xor i64 %a, %b
   %sign = lshr i64 %x, 63
@@ -510,7 +516,7 @@ multiply:
 
 ; Restoring division, one quotient bit per step, then the remainder as the
 ; sticky bit.
-define weak i64 @__aeabi_ddiv(i64 %a, i64 %b) #1 {
+define weak i64 @dodo_soft_ddiv(i64 %a, i64 %b) #1 {
 entry:
   %x = xor i64 %a, %b
   %sign = lshr i64 %x, 63
@@ -830,7 +836,7 @@ convert:
   ret i64 %sv
 }
 
-define weak i32 @__aeabi_d2iz(i64 %a) #1 {
+define weak i32 @dodo_soft_d2iz(i64 %a) #1 {
   %v = call i64 @__aeabi_d2lz(i64 %a)
   %over = icmp sgt i64 %v, 2147483647
   %c0 = select i1 %over, i64 2147483647, i64 %v
@@ -840,7 +846,7 @@ define weak i32 @__aeabi_d2iz(i64 %a) #1 {
   ret i32 %r
 }
 
-define weak i32 @__aeabi_d2uiz(i64 %a) #1 {
+define weak i32 @dodo_soft_d2uiz(i64 %a) #1 {
   %v = call i64 @__aeabi_d2ulz(i64 %a)
   %over = icmp ugt i64 %v, 4294967295
   %c = select i1 %over, i64 4294967295, i64 %v
@@ -879,12 +885,12 @@ define weak i64 @__aeabi_l2d(i64 %x) #1 {
   %r = call i64 @u64_to_f64(i64 %sign, i64 %mag)
   ret i64 %r
 }
-define weak i64 @__aeabi_ui2d(i32 %x) #1 {
+define weak i64 @dodo_soft_ui2d(i32 %x) #1 {
   %w = zext i32 %x to i64
   %r = call i64 @u64_to_f64(i64 0, i64 %w)
   ret i64 %r
 }
-define weak i64 @__aeabi_i2d(i32 %x) #1 {
+define weak i64 @dodo_soft_i2d(i32 %x) #1 {
   %w = sext i32 %x to i64
   %r = call i64 @__aeabi_l2d(i64 %w)
   ret i64 %r
@@ -942,7 +948,7 @@ round:
   ret i32 %p
 }
 
-define weak i64 @__aeabi_f2d(i32 %a) #1 {
+define weak i64 @dodo_soft_f2d(i32 %a) #1 {
 entry:
   %top = lshr i32 %a, 31
   %sign = zext i32 %top to i64
@@ -985,7 +991,7 @@ pack:
   ret i64 %r
 }
 
-define weak i32 @__aeabi_d2f(i64 %a) #1 {
+define weak i32 @dodo_soft_d2f(i64 %a) #1 {
 entry:
   %top = lshr i64 %a, 63
   %sign = trunc i64 %top to i32
@@ -1023,39 +1029,39 @@ round:
 ; binary32 arithmetic, through binary64 (see the top of the file).
 
 define weak i32 @__aeabi_fadd(i32 %a, i32 %b) #1 {
-  %da = call i64 @__aeabi_f2d(i32 %a)
-  %db = call i64 @__aeabi_f2d(i32 %b)
-  %d = call i64 @__aeabi_dadd(i64 %da, i64 %db)
-  %r = call i32 @__aeabi_d2f(i64 %d)
+  %da = call i64 @dodo_soft_f2d(i32 %a)
+  %db = call i64 @dodo_soft_f2d(i32 %b)
+  %d = call i64 @dodo_soft_dadd(i64 %da, i64 %db)
+  %r = call i32 @dodo_soft_d2f(i64 %d)
   ret i32 %r
 }
 define weak i32 @__aeabi_fsub(i32 %a, i32 %b) #1 {
-  %da = call i64 @__aeabi_f2d(i32 %a)
-  %db = call i64 @__aeabi_f2d(i32 %b)
-  %d = call i64 @__aeabi_dsub(i64 %da, i64 %db)
-  %r = call i32 @__aeabi_d2f(i64 %d)
+  %da = call i64 @dodo_soft_f2d(i32 %a)
+  %db = call i64 @dodo_soft_f2d(i32 %b)
+  %d = call i64 @dodo_soft_dsub(i64 %da, i64 %db)
+  %r = call i32 @dodo_soft_d2f(i64 %d)
   ret i32 %r
 }
 define weak i32 @__aeabi_fmul(i32 %a, i32 %b) #1 {
-  %da = call i64 @__aeabi_f2d(i32 %a)
-  %db = call i64 @__aeabi_f2d(i32 %b)
-  %d = call i64 @__aeabi_dmul(i64 %da, i64 %db)
-  %r = call i32 @__aeabi_d2f(i64 %d)
+  %da = call i64 @dodo_soft_f2d(i32 %a)
+  %db = call i64 @dodo_soft_f2d(i32 %b)
+  %d = call i64 @dodo_soft_dmul(i64 %da, i64 %db)
+  %r = call i32 @dodo_soft_d2f(i64 %d)
   ret i32 %r
 }
 define weak i32 @__aeabi_fdiv(i32 %a, i32 %b) #1 {
-  %da = call i64 @__aeabi_f2d(i32 %a)
-  %db = call i64 @__aeabi_f2d(i32 %b)
-  %d = call i64 @__aeabi_ddiv(i64 %da, i64 %db)
-  %r = call i32 @__aeabi_d2f(i64 %d)
+  %da = call i64 @dodo_soft_f2d(i32 %a)
+  %db = call i64 @dodo_soft_f2d(i32 %b)
+  %d = call i64 @dodo_soft_ddiv(i64 %da, i64 %db)
+  %r = call i32 @dodo_soft_d2f(i64 %d)
   ret i32 %r
 }
 ; The remainder is exact in binary64 and representable in binary32.
 define weak i32 @fmodf(i32 %a, i32 %b) #1 {
-  %da = call i64 @__aeabi_f2d(i32 %a)
-  %db = call i64 @__aeabi_f2d(i32 %b)
+  %da = call i64 @dodo_soft_f2d(i32 %a)
+  %db = call i64 @dodo_soft_f2d(i32 %b)
   %d = call i64 @fmod(i64 %da, i64 %db)
-  %r = call i32 @__aeabi_d2f(i64 %d)
+  %r = call i32 @dodo_soft_d2f(i64 %d)
   ret i32 %r
 }
 
@@ -1174,33 +1180,33 @@ define weak i32 @__gesf2(i32 %a, i32 %b) #1 {
 ; binary64 and rounds only once, to binary32.
 
 define weak i32 @__aeabi_f2iz(i32 %a) #1 {
-  %d = call i64 @__aeabi_f2d(i32 %a)
-  %r = call i32 @__aeabi_d2iz(i64 %d)
+  %d = call i64 @dodo_soft_f2d(i32 %a)
+  %r = call i32 @dodo_soft_d2iz(i64 %d)
   ret i32 %r
 }
 define weak i32 @__aeabi_f2uiz(i32 %a) #1 {
-  %d = call i64 @__aeabi_f2d(i32 %a)
-  %r = call i32 @__aeabi_d2uiz(i64 %d)
+  %d = call i64 @dodo_soft_f2d(i32 %a)
+  %r = call i32 @dodo_soft_d2uiz(i64 %d)
   ret i32 %r
 }
 define weak i64 @__aeabi_f2lz(i32 %a) #1 {
-  %d = call i64 @__aeabi_f2d(i32 %a)
+  %d = call i64 @dodo_soft_f2d(i32 %a)
   %r = call i64 @__aeabi_d2lz(i64 %d)
   ret i64 %r
 }
 define weak i64 @__aeabi_f2ulz(i32 %a) #1 {
-  %d = call i64 @__aeabi_f2d(i32 %a)
+  %d = call i64 @dodo_soft_f2d(i32 %a)
   %r = call i64 @__aeabi_d2ulz(i64 %d)
   ret i64 %r
 }
 define weak i32 @__aeabi_i2f(i32 %x) #1 {
-  %d = call i64 @__aeabi_i2d(i32 %x)
-  %r = call i32 @__aeabi_d2f(i64 %d)
+  %d = call i64 @dodo_soft_i2d(i32 %x)
+  %r = call i32 @dodo_soft_d2f(i64 %d)
   ret i32 %r
 }
 define weak i32 @__aeabi_ui2f(i32 %x) #1 {
-  %d = call i64 @__aeabi_ui2d(i32 %x)
-  %r = call i32 @__aeabi_d2f(i64 %d)
+  %d = call i64 @dodo_soft_ui2d(i32 %x)
+  %r = call i32 @dodo_soft_d2f(i64 %d)
   ret i32 %r
 }
 
@@ -1213,7 +1219,7 @@ define internal i32 @u64_to_f32(i64 %sign, i64 %m) #1 {
   %back = shl i64 %j, %dropw
   %k = select i1 %wide, i64 %back, i64 %m
   %d = call i64 @u64_to_f64(i64 %sign, i64 %k)
-  %r = call i32 @__aeabi_d2f(i64 %d)
+  %r = call i32 @dodo_soft_d2f(i64 %d)
   ret i32 %r
 }
 
@@ -1234,28 +1240,18 @@ define weak i32 @__aeabi_l2f(i64 %x) #1 {
 ; GNU names for the helpers above. Dodo's own code generator calls these;
 ; other LLVM configurations call the EABI names.
 
-@__adddf3 = weak alias i64 (i64, i64), ptr @__aeabi_dadd
-@__subdf3 = weak alias i64 (i64, i64), ptr @__aeabi_dsub
-@__muldf3 = weak alias i64 (i64, i64), ptr @__aeabi_dmul
-@__divdf3 = weak alias i64 (i64, i64), ptr @__aeabi_ddiv
 @__addsf3 = weak alias i32 (i32, i32), ptr @__aeabi_fadd
 @__subsf3 = weak alias i32 (i32, i32), ptr @__aeabi_fsub
 @__mulsf3 = weak alias i32 (i32, i32), ptr @__aeabi_fmul
 @__divsf3 = weak alias i32 (i32, i32), ptr @__aeabi_fdiv
 @__unorddf2 = weak alias i32 (i64, i64), ptr @__aeabi_dcmpun
 @__unordsf2 = weak alias i32 (i32, i32), ptr @__aeabi_fcmpun
-@__extendsfdf2 = weak alias i64 (i32), ptr @__aeabi_f2d
-@__truncdfsf2 = weak alias i32 (i64), ptr @__aeabi_d2f
-@__fixdfsi = weak alias i32 (i64), ptr @__aeabi_d2iz
-@__fixunsdfsi = weak alias i32 (i64), ptr @__aeabi_d2uiz
 @__fixdfdi = weak alias i64 (i64), ptr @__aeabi_d2lz
 @__fixunsdfdi = weak alias i64 (i64), ptr @__aeabi_d2ulz
 @__fixsfsi = weak alias i32 (i32), ptr @__aeabi_f2iz
 @__fixunssfsi = weak alias i32 (i32), ptr @__aeabi_f2uiz
 @__fixsfdi = weak alias i64 (i32), ptr @__aeabi_f2lz
 @__fixunssfdi = weak alias i64 (i32), ptr @__aeabi_f2ulz
-@__floatsidf = weak alias i64 (i32), ptr @__aeabi_i2d
-@__floatunsidf = weak alias i64 (i32), ptr @__aeabi_ui2d
 @__floatdidf = weak alias i64 (i64), ptr @__aeabi_l2d
 @__floatundidf = weak alias i64 (i64), ptr @__aeabi_ul2d
 @__floatsisf = weak alias i32 (i32), ptr @__aeabi_i2f
