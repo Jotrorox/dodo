@@ -177,6 +177,8 @@ virtual package names rather than independent source files:
 | `std/net/native` | [Native sockets](networking.md) |
 | `std/time/native` | [Hosted clocks](time.md) |
 | `std/tls/native` | [TLS providers](tls.md) |
+| `std/crypto/native` | [OS random bytes](crypto.md#random-bytes) |
+| `std/crypto/openssl/native` | [OpenSSL libcrypto](crypto.md#backend-and-build) |
 | `std/web/native` | [Static-file providers](web.md) |
 
 `std/net/native` is the socket entry point; many other native packages implement

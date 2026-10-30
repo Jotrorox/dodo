@@ -1,0 +1,440 @@
+package crypto_checks
+import "std/crypto"
+import "std/crypto/random"
+import "std/crypto/openssl"
+import "std/hash"
+
+// Published vectors: FIPS 180-2 (SHA-1/SHA-256), RFC 4231 (HMAC-SHA256),
+// NIST SP 800-38A F.3.7/F.3.8 (AES-128-CFB8). Each failure has its own code.
+fn nibble(c: u8) -> u8 {
+    if c >= 97 {
+        return c - 87
+    }
+    if c >= 65 {
+        return c - 55
+    }
+    return c - 48
+}
+fn unhex(text: &[u8], output: &mut[u8]) -> usize {
+    for i in 0usize..text.len / 2 {
+        output[i] = (nibble(text[2 * i]) << 4) | nibble(text[2 * i + 1])
+    }
+    return text.len / 2
+}
+fn matches(actual: &[u8], expected_hex: &[u8]) -> bool {
+    expected := [0u8; 256]
+    count := unhex(expected_hex, &mut expected)
+    return crypto.equal(actual, &expected[..count])
+}
+fn is20(actual: [20]u8, expected_hex: &[u8]) -> bool {
+    return matches(&actual, expected_hex)
+}
+fn is32(actual: [32]u8, expected_hex: &[u8]) -> bool {
+    return matches(&actual, expected_hex)
+}
+fn kind<T>(result: T!crypto.Error) -> i32 {
+    match result {
+        ok(_) => {
+            return -1
+        }
+        err(reason) => {
+            if reason.kind == crypto.ErrorKind.InvalidInput {
+                return 1
+            }
+            if reason.kind == crypto.ErrorKind.BufferTooSmall {
+                return 2
+            }
+            return 3
+        }
+    }
+}
+
+fn helpers() -> i32 {
+    if !crypto.equal(b"", b"") || !crypto.equal(b"abc", b"abc") {
+        return 1
+    }
+    if crypto.equal(b"abc", b"abd") || crypto.equal(b"abc", b"ab") || crypto.equal(b"\x80", b"\x00") {
+        return 2
+    }
+    secret := [255u8; 33]
+    crypto.wipe(&mut secret[1..])
+    if secret[0] != 255 || secret[1] != 0 || secret[32] != 0 {
+        return 3
+    }
+    return 0
+}
+
+fn entropy() -> i32!crypto.Error {
+    empty := [0u8; 0]
+    random.fill(&mut empty)?
+    first := [0u8; 4096]
+    second := [0u8; 4096]
+    random.fill(&mut first)?
+    random.fill(&mut second)?
+    if crypto.equal(&first, &second) {
+        return ok(10)
+    }
+    // 32768 fair bits: mean 16384, standard deviation 90.5. The bound is
+    // eleven deviations wide, so it fails only for a broken source.
+    ones := 0u32
+    for &byte in first {
+        for bit in 0u8..8 {
+            ones += ((byte >> bit) & 1) as u32
+        }
+    }
+    if ones < 15384 || ones > 17384 {
+        return ok(11)
+    }
+    // Large requests are split below every OS per-call limit.
+    large := [0u8; 70000]
+    random.fill(&mut large)?
+    zeros := 0usize
+    for &byte in large[69000..] {
+        if byte == 0 {
+            zeros += 1
+        }
+    }
+    if zeros > 40 {
+        return ok(12)
+    }
+    if random.next_u64()? == random.next_u64()? {
+        return ok(13)
+    }
+    if random.below(1)? != 0 {
+        return ok(14)
+    }
+    seen := [false; 6]
+    for i in 0usize..600 {
+        value := random.below(6)?
+        if value >= 6 {
+            return ok(15)
+        }
+        seen[value as usize] = true
+    }
+    for &flag in seen {
+        if !flag {
+            return ok(16)
+        }
+    }
+    match random.below(0) {
+        ok(_) => {
+            return ok(17)
+        }
+        err(reason) => {
+            if reason.kind != crypto.ErrorKind.InvalidInput {
+                return ok(18)
+            }
+        }
+    }
+    source := random.SystemRandom.new()
+    one := hash.Key128.new(0, 0)
+    match hash.obtain_key(&mut source) {
+        ok(key) => {
+            one = key
+        }
+        err(_) => {
+            return ok(19)
+        }
+    }
+    two := random.key()?
+    if one.word0() == two.word0() && one.word1() == two.word1() {
+        return ok(20)
+    }
+    return ok(0)
+}
+
+fn digests() -> i32!crypto.Error {
+    if !is20(openssl.sha1(b"")?, b"da39a3ee5e6b4b0d3255bfef95601890afd80709") {
+        return ok(30)
+    }
+    if !is20(openssl.sha1(b"abc")?, b"a9993e364706816aba3e25717850c26c9cd0d89d") {
+        return ok(31)
+    }
+    if !is20(openssl.sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")?, b"84983e441c3bd26ebaae4aa1f95129e5e54670f1") {
+        return ok(32)
+    }
+    // One million 'a' in uneven pieces; finish restarts an empty message.
+    chunk := [97u8; 1000]
+    sha1 := openssl.Sha1.new()?
+    sha256 := openssl.Sha256.new()?
+    fed := 0usize
+    step := 1usize
+    for fed < 1000000 {
+        piece := step
+        if piece > 1000 - (fed % 1000) {
+            piece = 1000 - (fed % 1000)
+        }
+        sha1.update(&chunk[..piece])?
+        sha256.update(&chunk[..piece])?
+        fed += piece
+        step = step % 997 + 1
+    }
+    if !is20(sha1.finish()?, b"34aa973cd4c4daa4f61eeb2bdbad27316534016f") {
+        return ok(33)
+    }
+    if !is32(sha256.finish()?, b"cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0") {
+        return ok(34)
+    }
+    if !is20(sha1.finish()?, b"da39a3ee5e6b4b0d3255bfef95601890afd80709") {
+        return ok(35)
+    }
+    if !is32(openssl.sha256(b"")?, b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+        return ok(36)
+    }
+    if !is32(openssl.sha256(b"abc")?, b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+        return ok(37)
+    }
+    sha256.update(b"abcdbcdecdefdefgefghfghighijhijk")?
+    sha256.update(b"")?
+    sha256.update(b"ijkljklmklmnlmnomnopnopq")?
+    if !is32(sha256.finish()?, b"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1") {
+        return ok(38)
+    }
+    return ok(0)
+}
+
+fn macs() -> i32!crypto.Error {
+    key := [0u8; 131]
+    for i in 0usize..20 {
+        key[i] = 0x0b
+    }
+    if !is32(openssl.hmac_sha256(&key[..20], b"Hi There")?, b"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7") {
+        return ok(40)
+    }
+    if !is32(openssl.hmac_sha256(b"Jefe", b"what do ya want for nothing?")?, b"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843") {
+        return ok(41)
+    }
+    for i in 0usize..131 {
+        key[i] = 0xaa
+    }
+    // Keys longer than the 64-byte block are hashed first.
+    mac := openssl.HmacSha256.new(&key)?
+    mac.update(b"Test Using Larger Than Block-Size Key - ")?
+    mac.update(b"Hash Key First")?
+    if !is32(mac.finish()?, b"60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54") {
+        return ok(42)
+    }
+    // finish keeps the key: the same message gives the same tag again.
+    mac.update(b"Test Using Larger Than Block-Size Key - Hash Key First")?
+    expected := [0u8; 32]
+    unhex(b"60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54", &mut expected)
+    if !mac.verify(&expected)? {
+        return ok(43)
+    }
+    mac.update(b"Test Using Larger Than Block-Size Key - Hash Key First")?
+    if mac.verify(&expected[..31])? {
+        return ok(44)
+    }
+    expected[31] = expected[31] ^ 1
+    mac.update(b"Test Using Larger Than Block-Size Key - Hash Key First")?
+    if mac.verify(&expected)? {
+        return ok(45)
+    }
+    if !is32(openssl.hmac_sha256(b"", b"")?, b"b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad") {
+        return ok(46)
+    }
+    return ok(0)
+}
+
+fn ciphers() -> i32!crypto.Error {
+    key := [0u8; 16]
+    iv := [0u8; 16]
+    plain := [0u8; 18]
+    cipher := [0u8; 18]
+    unhex(b"2b7e151628aed2a6abf7158809cf4f3c", &mut key)
+    unhex(b"000102030405060708090a0b0c0d0e0f", &mut iv)
+    unhex(b"6bc1bee22e409f96e93d7e117393172aae2d", &mut plain)
+    unhex(b"3b79424c9c0dd436bace9e0ed4586a4f32b9", &mut cipher)
+    whole := openssl.Aes128Cfb8.encryptor(&key, &iv)?
+    output := [0u8; 20]
+    whole.update(&plain, &mut output)?
+    if !crypto.equal(&output[..18], &cipher) || output[18] != 0 || output[19] != 0 {
+        return ok(50)
+    }
+    // A stream may be split anywhere, including into empty pieces.
+    pieces := openssl.Aes128Cfb8.encryptor(&key, &iv)?
+    data := [0u8; 18]
+    unhex(b"6bc1bee22e409f96e93d7e117393172aae2d", &mut data)
+    pieces.update_in_place(&mut data[..1])?
+    pieces.update_in_place(&mut data[1..1])?
+    pieces.update_in_place(&mut data[1..7])?
+    pieces.update_in_place(&mut data[7..])?
+    if !crypto.equal(&data, &cipher) {
+        return ok(51)
+    }
+    decryptor := openssl.Aes128Cfb8.decryptor(&key, &iv)?
+    for i in 0usize..18 {
+        decryptor.update_in_place(&mut data[i..i + 1])?
+    }
+    if !crypto.equal(&data, &plain) {
+        return ok(52)
+    }
+    // Minecraft uses the shared secret as both key and IV; check the two
+    // directions of a connection agree over many records.
+    secret := [0u8; 16]
+    random.fill(&mut secret)?
+    sender := openssl.Aes128Cfb8.encryptor(&secret, &secret)?
+    receiver := openssl.Aes128Cfb8.decryptor(&secret, &secret)?
+    record := [0u8; 257]
+    copy := [0u8; 257]
+    for round in 0usize..64 {
+        random.fill(&mut record)?
+        for i in 0usize..record.len {
+            copy[i] = record[i]
+        }
+        sender.update_in_place(&mut record[..round + 1])?
+        receiver.update_in_place(&mut record[..round + 1])?
+        if !crypto.equal(&record, &copy) {
+            return ok(53)
+        }
+    }
+    if kind(openssl.Aes128Cfb8.encryptor(&key[..15], &iv)) != 1 {
+        return ok(54)
+    }
+    return ok(0)
+}
+
+fn rsa() -> i32!crypto.Error {
+    key := openssl.RsaPrivateKey.generate(1024)?
+    if key.bits() != 1024 || key.size() != 128 {
+        return ok(60)
+    }
+    der := [0u8; 200]
+    length := key.public_key_der(&mut der)?
+    if length != 162 || key.public_key_der_len()? != 162 {
+        return ok(61)
+    }
+    // SEQUENCE { SEQUENCE { rsaEncryption, NULL }, BIT STRING { RSAPublicKey } }
+    if !matches(&der[..22], b"30819f300d06092a864886f70d010101050003818d00") {
+        return ok(62)
+    }
+    short := [0u8; 161]
+    match key.public_key_der(&mut short) {
+        ok(_) => {
+            return ok(63)
+        }
+        err(reason) => {
+            if reason.kind != crypto.ErrorKind.BufferTooSmall || short[0] != 0 {
+                return ok(64)
+            }
+        }
+    }
+    public := openssl.RsaPublicKey.from_der(&der[..length])?
+    if public.bits() != 1024 || public.size() != 128 {
+        return ok(65)
+    }
+    again := [0u8; 200]
+    if public.public_key_der(&mut again)? != 162 || !crypto.equal(&again[..162], &der[..162]) {
+        return ok(66)
+    }
+    secret := [0u8; 16]
+    random.fill(&mut secret)?
+    ciphertext := [0u8; 128]
+    if public.encrypt_pkcs1(&secret, &mut ciphertext)? != 128 {
+        return ok(67)
+    }
+    // Fresh padding: encrypting twice gives different ciphertexts.
+    other := [0u8; 128]
+    public.encrypt_pkcs1(&secret, &mut other)?
+    if crypto.equal(&ciphertext, &other) {
+        return ok(68)
+    }
+    plain := [0u8; 128]
+    count := key.decrypt_pkcs1(&ciphertext, &mut plain)?
+    if count != 16 || !crypto.equal(&plain[..16], &secret) {
+        return ok(69)
+    }
+    count = key.decrypt_pkcs1(&other, &mut plain)?
+    if count != 16 || !crypto.equal(&plain[..16], &secret) {
+        return ok(70)
+    }
+    exact := [0u8; 16]
+    if key.decrypt_pkcs1(&ciphertext, &mut exact)? != 16 || !crypto.equal(&exact, &secret) {
+        return ok(71)
+    }
+    tiny := [0u8; 15]
+    match key.decrypt_pkcs1(&ciphertext, &mut tiny) {
+        ok(_) => {
+            return ok(72)
+        }
+        err(reason) => {
+            if reason.kind != crypto.ErrorKind.BufferTooSmall || tiny[0] != 0 {
+                return ok(73)
+            }
+        }
+    }
+    // Implicit rejection: tampering yields an unrelated message, not an error.
+    ciphertext[64] = ciphertext[64] ^ 1
+    match key.decrypt_pkcs1(&ciphertext, &mut plain) {
+        ok(n) => {
+            if n == 16 && crypto.equal(&plain[..16], &secret) {
+                return ok(74)
+            }
+        }
+        err(_) => {}
+    }
+    if kind(key.decrypt_pkcs1(&ciphertext[..127], &mut plain)) != 1 {
+        return ok(75)
+    }
+    longest := [7u8; 118]
+    if public.encrypt_pkcs1(&longest[..117], &mut ciphertext)? != 128 {
+        return ok(76)
+    }
+    if key.decrypt_pkcs1(&ciphertext, &mut plain)? != 117 || !crypto.equal(&plain[..117], &longest[..117]) {
+        return ok(77)
+    }
+    if kind(public.encrypt_pkcs1(&longest, &mut ciphertext)) != 1 {
+        return ok(78)
+    }
+    if kind(public.encrypt_pkcs1(&secret, &mut ciphertext[..127])) != 2 {
+        return ok(79)
+    }
+    if public.encrypt_pkcs1(b"", &mut ciphertext)? != 128 || key.decrypt_pkcs1(&ciphertext, &mut plain)? != 0 {
+        return ok(80)
+    }
+    // Malformed, trailing and truncated DER are rejected.
+    if kind(openssl.RsaPublicKey.from_der(&der[..161])) != 1 {
+        return ok(81)
+    }
+    if kind(openssl.RsaPublicKey.from_der(&der[..163])) != 1 {
+        return ok(82)
+    }
+    if kind(openssl.RsaPublicKey.from_der(b"")) != 1 {
+        return ok(83)
+    }
+    if kind(openssl.RsaPrivateKey.generate(1023)) != 1 || kind(openssl.RsaPrivateKey.generate(16385)) != 1 {
+        return ok(84)
+    }
+    return ok(0)
+}
+
+// A backend error inside a section reports that section's failure base.
+fn outcome(result: i32!crypto.Error, failure: i32) -> i32 {
+    match result {
+        ok(code) => {
+            return code
+        }
+        err(_) => {
+            return failure
+        }
+    }
+}
+fn main() -> i32 {
+    status := helpers()
+    if status == 0 {
+        status = outcome(entropy(), 91)
+    }
+    if status == 0 {
+        status = outcome(digests(), 92)
+    }
+    if status == 0 {
+        status = outcome(macs(), 93)
+    }
+    if status == 0 {
+        status = outcome(ciphers(), 94)
+    }
+    if status == 0 {
+        status = outcome(rsa(), 95)
+    }
+    return status
+}
