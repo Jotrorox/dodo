@@ -11,8 +11,8 @@
 ; binary64 addition, subtraction, multiplication and division, and the
 ; conversions between binary64 and binary32 or 32-bit integers, are defined
 ; here as dodo_soft_*. The file the compiler appends next gives them their
-; GNU and EABI names: arm_float_soft.ll, for chips without a
-; double-precision accelerator.
+; GNU and EABI names: arm_float_soft.ll for these software versions, or
+; rp2350/dcp.ll for the RP2350's coprocessor, which falls back to them.
 ;
 ; Results round to nearest, ties to even, and subnormals are kept. NaN
 ; results are the default quiet NaN; there are no exception flags.

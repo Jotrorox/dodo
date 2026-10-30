@@ -5,7 +5,8 @@
 //! driver, and checks each helper against the host's IEEE 754 hardware on
 //! special values, boundary cases and random operands. Rust's `as`
 //! conversions saturate and map NaN to zero, which is the helpers' contract
-//! too.
+//! too. The RP2350's coprocessor helpers, which must give the same bits, are
+//! checked on a board by scripts/test_rp2350_float.py.
 #![cfg(unix)]
 use std::fmt::Write as _;
 use std::fs;

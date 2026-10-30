@@ -17,8 +17,8 @@
 ;   .picobin_block The IMAGE_DEF block the boot ROM requires (RP2350
 ;                  datasheet 5.9.5, minimum viable image metadata).
 ;   Reset_Handler  Clears the stack limit, points VTOR at the vector table,
-;                  enables the FPU, copies .data from flash, zeroes .bss, and
-;                  calls `main`.
+;                  enables the FPU and the double-precision coprocessor,
+;                  copies .data from flash, zeroes .bss, and calls `main`.
 ;   dodo_rp2350_rom_call
 ;                  Calls a boot ROM function by its two-letter code, for
 ;                  example reboot ('RB') to restart into the USB bootloader.
@@ -98,8 +98,9 @@ module asm "    ldr r0, =__vector_table"
 module asm "    ldr r1, =0xe000ed08"                    ; VTOR
 module asm "    str r0, [r1]"
 module asm "    ldr r0, =0xe000ed88"                    ; CPACR: full access to
-module asm "    ldr r1, [r0]"                           ; CP10 and CP11, the FPU
-module asm "    orr r1, r1, #0x00f00000"
+module asm "    ldr r1, [r0]"                           ; CP10 and CP11, the FPU,
+module asm "    orr r1, r1, #0x00f00000"                ; and CP4, the
+module asm "    orr r1, r1, #0x00000300"                ; double coprocessor
 module asm "    str r1, [r0]"
 module asm "    dsb"
 module asm "    isb"

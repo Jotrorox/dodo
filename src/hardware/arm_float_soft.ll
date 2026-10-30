@@ -1,7 +1,8 @@
 ; Names of the binary64 arithmetic and conversion helpers for chips without
 ; a double-precision accelerator, where each is the software implementation
 ; in arm_float.ll. The compiler appends this file after arm_float.ll (see
-; `src/hardware/CHIP.rs`).
+; `src/hardware/CHIP.rs`); the RP2350 appends rp2350/dcp.ll instead, which
+; defines the same names.
 ;
 ; Dodo's own code generator calls the GNU names; other LLVM configurations
 ; call the Arm EABI names.
