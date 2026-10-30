@@ -3135,6 +3135,39 @@ fn lsp_resolves_std_board_from_the_manifest_board() {
 }
 
 #[test]
+fn lsp_reports_forbidden_unsafe_from_the_manifest() {
+    let w = Workspace::new();
+    let manifest = w.file("dodo.toml", "schema=1\n[project]\nforbid-unsafe=true\n");
+    let uri = w.uri("main.dodo");
+    let source = "package app\nimport \"std/sync/allocated\"\nfn main() { unsafe {} }\n";
+    let mut client = Client::start("lsp");
+    let response = client.request(
+        json!(1),
+        "initialize",
+        json!({"rootUri": w.uri(""), "capabilities": {}}),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    client.open(&uri, source, 1);
+    let diagnostics = client.diagnostics()[&uri]["diagnostics"].clone();
+    let diagnostics = diagnostics.as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`unsafe` is forbidden in this project")
+    );
+    assert_eq!(
+        diagnostics[0]["range"],
+        json!({"start":{"line":2,"character":12},"end":{"line":2,"character":18}})
+    );
+    w.file("dodo.toml", "schema=1\n");
+    client.disk_change(&manifest, 2);
+    assert_eq!(client.diagnostics()[&uri]["diagnostics"], json!([]));
+    assert!(client.shutdown().is_empty());
+}
+
+#[test]
 fn lsp_manifest_selection_errors_and_explicit_platform_override() {
     let w = Workspace::new();
     w.file("dodo.toml","schema=1\n[targets.wasm]\nentry='main.dodo'\ntriple='wasm32-unknown-unknown'\n[targets.native]\nentry='main.dodo'\n");

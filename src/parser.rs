@@ -352,8 +352,20 @@ impl Parser {
             return Err(self.error("@test and @ignore apply only to functions"));
         }
         if self.at("struct") {
-            if mods.unsafe_ || mods.extern_ {
-                return Err(self.error("structs cannot be unsafe or extern"));
+            if mods.extern_ {
+                return Err(self.error("structs cannot be extern"));
+            }
+            // Thread contracts are unchecked promises, so they need the same
+            // explicit opt-in as any other unsafe code.
+            let contract = mods.unsafe_send || mods.unsafe_sync;
+            if contract && !mods.unsafe_ {
+                return Err(self.error(
+                    "@unsafe_send and @unsafe_sync are unsafe contracts; declare the struct as `unsafe struct`",
+                ));
+            }
+            if mods.unsafe_ && !contract {
+                return Err(self
+                    .error("`unsafe` on a struct applies only with @unsafe_send or @unsafe_sync"));
             }
             self.struct_decl(program, mods, start)?;
         } else if self.at("enum") {

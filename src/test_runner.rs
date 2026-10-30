@@ -1,5 +1,5 @@
 //! Hosted test discovery and process isolation, with optional project settings.
-use super::{Args, TempDir, compile};
+use super::{Args, TempDir, compile, forbid_unsafe};
 use dodoc::ast::{Function, Type};
 use dodoc::lexer::{self, TokenKind};
 use dodoc::{codegen, package, parser, sema};
@@ -286,7 +286,7 @@ fn discover(args: &TestArgs) -> Result<(Vec<Unit>, Vec<String>), String> {
     Ok((units, errors))
 }
 
-fn load(unit: &Unit) -> Result<package::Loaded, String> {
+fn load(unit: &Unit, forbid: bool) -> Result<package::Loaded, String> {
     if let Some((source, original)) = &unit.document {
         // The overlay lives beside the document so ordinary relative imports work.
         let path = unit.path.with_extension("dodo-doctest");
@@ -298,12 +298,21 @@ fn load(unit: &Unit) -> Result<package::Loaded, String> {
                         &unit.path.display().to_string(),
                     )
                 })?;
+        // Scan the extracted code, not the Markdown prose around it.
+        let uses = if forbid {
+            package::unsafe_uses(&loaded)
+        } else {
+            vec![]
+        };
         for source in &mut loaded.sources {
             if source.path == path {
                 source.path = unit.path.clone();
                 // Keep the virtual source length: other files' offsets follow it.
                 source.text = original[..source.text.len()].to_owned();
             }
+        }
+        if !uses.is_empty() {
+            return Err(uses.iter().map(|d| loaded.render(d)).collect());
         }
         Ok(loaded)
     } else {
@@ -312,7 +321,11 @@ fn load(unit: &Unit) -> Result<package::Loaded, String> {
         } else {
             &unit.path
         };
-        package::load(path)
+        let loaded = package::load(path)?;
+        if forbid {
+            forbid_unsafe(&loaded)?;
+        }
+        Ok(loaded)
     }
 }
 
@@ -505,7 +518,7 @@ pub fn execute(mut args: TestArgs) -> Result<i32, String> {
             std::env::consts::EXE_SUFFIX
         ));
         let built = (|| {
-            let mut loaded = load(unit)?;
+            let mut loaded = load(unit, args.compiler.forbid_unsafe)?;
             // Names are resolved in the test source's own package. Source spans
             // disambiguate names when companion files load the whole directory.
             for case in &active {
