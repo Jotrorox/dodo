@@ -130,6 +130,8 @@ pub struct Manifest {
     pub name: Option<String>,
     pub default_target: Option<String>,
     pub default_profile: Option<String>,
+    /// Reject `unsafe` in every project source; bundled sources are exempt.
+    pub forbid_unsafe: bool,
     pub build: Settings,
     pub out_dir: PathBuf,
     pub targets: BTreeMap<String, Target>,
@@ -334,6 +336,7 @@ impl Manifest {
                 name: None,
                 default_target: None,
                 default_profile: None,
+                forbid_unsafe: false,
                 build: Settings::default(),
                 out_dir: root.join("build"),
                 targets: BTreeMap::new(),
@@ -344,10 +347,16 @@ impl Manifest {
             };
             if let Some(v) = top.get("project") {
                 let t = table(v)?;
-                known(t, &["name", "default-target", "default-profile"])?;
+                known(
+                    t,
+                    &["name", "default-target", "default-profile", "forbid-unsafe"],
+                )?;
                 result.name = optional_string(t, "name")?;
                 result.default_target = optional_string(t, "default-target")?;
                 result.default_profile = optional_string(t, "default-profile")?;
+                if let Some(v) = t.get("forbid-unsafe") {
+                    result.forbid_unsafe = boolean(v)?;
+                }
             }
             if let Some(v) = top.get("build") {
                 let t = table(v)?;
@@ -594,6 +603,7 @@ pub struct Resolved {
     pub run_cwd: Option<PathBuf>,
     pub run_args: Vec<OsString>,
     pub timeout: Duration,
+    pub forbid_unsafe: bool,
 }
 pub fn resolve(request: Request<'_>) -> Result<Resolved, String> {
     let Request {
@@ -621,6 +631,7 @@ pub fn resolve(request: Request<'_>) -> Result<Resolved, String> {
         run_cwd: manifest.map(|m| m.root.clone()),
         run_args: vec![],
         timeout: Duration::from_secs(30),
+        forbid_unsafe: manifest.is_some_and(|m| m.forbid_unsafe),
     };
     r.settings.overlay(
         &Settings {
@@ -877,6 +888,9 @@ impl Resolved {
             );
         }
         add("run-args", argv(&self.run_args), "run.args / CLI");
+        if self.forbid_unsafe {
+            add("forbid-unsafe", "true".into(), "project.forbid-unsafe");
+        }
         lines.join("\n") + "\n"
     }
 }
