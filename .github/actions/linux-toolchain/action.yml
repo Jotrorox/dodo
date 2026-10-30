@@ -19,6 +19,9 @@ inputs:
   rust-cache:
     description: Cache Rust dependencies and build artifacts under this job-specific key; empty disables the cache
     default: ''
+  nextest:
+    description: Install cargo-nextest
+    default: 'false'
 
 runs:
   using: composite
@@ -28,6 +31,11 @@ runs:
       with:
         toolchain: 1.98.1
         components: rustfmt, clippy
+    - name: Install cargo-nextest
+      if: inputs.nextest == 'true'
+      uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      with:
+        tool: cargo-nextest@0.9.150
     - name: Install native build prerequisites
       id: native
       shell: bash
@@ -117,6 +125,8 @@ runs:
       with:
         path: ${{ runner.temp }}/dodo-openssl
         key: ${{ steps.openssl-cache.outputs.cache-primary-key }}
+    # Only main saves: pull requests restore main's dependencies and would
+    # otherwise push its caches out of the repository's 10 GB budget.
     - name: Cache Rust dependencies and build artifacts
       if: inputs.cache == 'true' && inputs.rust-cache != ''
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -125,3 +135,4 @@ runs:
         env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS CPATH LIBRARY_PATH
         cache-bin: false
         cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
