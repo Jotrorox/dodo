@@ -1,0 +1,82 @@
+name: macOS build toolchain
+description: >
+  Installs the pinned Rust toolchain, Homebrew's LLVM 23, and the OpenSSL
+  backend for TLS fixtures, and restores the Rust build cache when asked.
+
+inputs:
+  cache:
+    description: Restore and save dependency caches; false builds everything
+    default: 'true'
+  rust-cache:
+    description: Cache Rust dependencies and build artifacts under this job-specific key; empty disables the cache
+    default: ''
+  nextest:
+    description: Install cargo-nextest
+    default: 'false'
+
+outputs:
+  llvm-version:
+    description: The installed LLVM version
+    value: ${{ steps.native.outputs.llvm-version }}
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      with:
+        toolchain: 1.98.1
+        components: rustfmt, clippy
+    - name: Install native build prerequisites
+      id: native
+      shell: bash
+      env:
+        # The runner image's Homebrew is recent enough. Skipping the update
+        # saves time and removes a network round trip that can fail.
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+        HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: '1'
+        HOMEBREW_NO_ANALYTICS: '1'
+      run: |
+        set -euo pipefail
+        # Homebrew's llvm@23 ships native static libraries; the official
+        # macOS LLVM archive ships ThinLTO bitcode that Rust cannot link.
+        # zstd is an LLVM support library outside the macOS SDK; releases
+        # link its static archive. OpenSSL 3.5+ backs the TLS fixtures.
+        packages=(llvm@23 zstd openssl@3)
+        for attempt in 1 2 3; do
+          if brew install "${packages[@]}"; then
+            break
+          fi
+          if [[ $attempt == 3 ]]; then
+            echo 'Homebrew installation failed after retries' >&2
+            exit 1
+          fi
+          echo "::warning::Homebrew installation failed; retrying ($attempt/3)"
+          sleep $((attempt * 15))
+        done
+        llvm_prefix=$(brew --prefix llvm@23)
+        version=$("$llvm_prefix/bin/llvm-config" --version)
+        test "${version%%.*}" = 23
+        openssl_prefix=$(brew --prefix openssl@3)
+        "$openssl_prefix/bin/openssl" version
+        echo "LLVM_SYS_231_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
+        echo "CPATH=$openssl_prefix/include" >> "$GITHUB_ENV"
+        echo "LIBRARY_PATH=$openssl_prefix/lib:$(brew --prefix)/lib" >> "$GITHUB_ENV"
+        echo "$openssl_prefix/bin" >> "$GITHUB_PATH"
+        echo "llvm-version=$version" >> "$GITHUB_OUTPUT"
+    - name: Install cargo-nextest
+      if: inputs.nextest == 'true'
+      uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      with:
+        tool: cargo-nextest@0.9.150
+    # Only main saves: pull requests restore main's dependencies and would
+    # otherwise push its caches out of the repository's 10 GB budget.
+    - name: Cache Rust dependencies and build artifacts
+      if: inputs.cache == 'true' && inputs.rust-cache != ''
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        key: ${{ inputs.rust-cache }}-macos-15-llvm-${{ steps.native.outputs.llvm-version }}
+        env-vars: CARGO CC CFLAGS CXX CMAKE RUST LLVM_SYS CPATH LIBRARY_PATH
+        cache-bin: false
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}

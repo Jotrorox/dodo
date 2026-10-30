@@ -260,8 +260,15 @@ def server_checks(executable, port, context=None, cancellation=False):
                         except (BrokenPipeError, ConnectionResetError):
                             assert status >= 400
                             break
-                    response = http.client.HTTPResponse(stream, method=method)
-                    response.begin()
+                    # A rejecting server may close before reading the whole
+                    # request. The peer's reset surfaces as EPIPE on macOS, and
+                    # OpenSSL can report it instead of the buffered response.
+                    try:
+                        response = http.client.HTTPResponse(stream, method=method)
+                        response.begin()
+                    except (BrokenPipeError, ConnectionResetError):
+                        assert context and status >= 400, method
+                        continue
                     assert response.status == status, (method, response.status, status)
                     assert response.read() == expected, method
                     if method == 'HEAD':
@@ -269,7 +276,7 @@ def server_checks(executable, port, context=None, cancellation=False):
                     assert response.getheader('Connection') == 'close'
                     try:
                         assert stream.recv(1) == b''
-                    except ConnectionResetError:
+                    except (BrokenPipeError, ConnectionResetError):
                         assert status >= 400, method
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, (stdout, stderr, process.returncode)

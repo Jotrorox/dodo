@@ -1,7 +1,6 @@
 type SearchEntry = { title: string; heading: string; url: string; text: string };
 
 const searchDialog = document.querySelector<HTMLDialogElement>('#search-dialog')!;
-const shortcutsDialog = document.querySelector<HTMLDialogElement>('#shortcuts-dialog')!;
 const input = document.querySelector<HTMLInputElement>('#search-input')!;
 const results = document.querySelector<HTMLUListElement>('#search-results')!;
 const status = document.querySelector<HTMLElement>('#search-status')!;
@@ -99,33 +98,23 @@ async function loadIndex() {
   return loading;
 }
 
-function openDialog(dialog: HTMLDialogElement) {
-  if (dialog.open) return;
-  if (!searchDialog.open && !shortcutsDialog.open) {
-    returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  }
-  for (const other of [searchDialog, shortcutsDialog]) if (other.open) other.close();
-  dialog.showModal();
-  if (dialog === searchDialog) {
-    input.focus();
-    input.select();
-    void loadIndex();
-  }
+function openSearch() {
+  if (searchDialog.open) return;
+  returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  searchDialog.showModal();
+  input.focus();
+  input.select();
+  void loadIndex();
 }
 
-document.querySelectorAll('[data-search-open]').forEach((button) => button.addEventListener('click', () => openDialog(searchDialog)));
-document.querySelectorAll('[data-shortcuts-open]').forEach((button) => button.addEventListener('click', () => openDialog(shortcutsDialog)));
+document.querySelectorAll('[data-search-open]').forEach((button) => button.addEventListener('click', openSearch));
 document.querySelectorAll<HTMLButtonElement>('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => button.closest('dialog')?.close()));
-for (const dialog of [searchDialog, shortcutsDialog]) {
-  dialog.addEventListener('click', (event) => {
-    if (event.target !== dialog) return;
-    const rect = dialog.getBoundingClientRect();
-    if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
-  });
-  dialog.addEventListener('close', () => {
-    if (!searchDialog.open && !shortcutsDialog.open) returnFocus?.focus();
-  });
-}
+searchDialog.addEventListener('click', (event) => {
+  if (event.target !== searchDialog) return;
+  const rect = searchDialog.getBoundingClientRect();
+  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) searchDialog.close();
+});
+searchDialog.addEventListener('close', () => returnFocus?.focus());
 
 input.addEventListener('input', search);
 input.addEventListener('keydown', (event) => {
@@ -145,15 +134,15 @@ document.addEventListener('keydown', (event) => {
   if (event.isComposing || event.defaultPrevented) return;
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' && !event.altKey) {
     event.preventDefault();
-    openDialog(searchDialog);
+    openSearch();
     return;
   }
   const target = event.target;
   const typing = target instanceof HTMLElement && (target.isContentEditable || !!target.closest('input, textarea, select, [role="textbox"]'));
-  if (typing || event.metaKey || event.ctrlKey || event.altKey || searchDialog.open || shortcutsDialog.open) return;
-  if (event.key === '/' || event.key === '?') {
+  if (typing || event.metaKey || event.ctrlKey || event.altKey || searchDialog.open) return;
+  if (event.key === '/') {
     event.preventDefault();
-    openDialog(event.key === '/' ? searchDialog : shortcutsDialog);
+    openSearch();
   }
 });
 
@@ -263,7 +252,7 @@ document.querySelectorAll<HTMLHeadingElement>('.prose :is(h2, h3, h4)[id]').forE
   heading.prepend(anchor);
 });
 
-const tocLinks = [...document.querySelectorAll<HTMLAnchorElement>('.toc a[href^="#"]:not(.back-to-top)')];
+const tocLinks = [...document.querySelectorAll<HTMLAnchorElement>('.toc a[href^="#"]')];
 const headingLinks = new Map(tocLinks.map((link) => [decodeURIComponent(link.hash.slice(1)), link]));
 const observer = new IntersectionObserver((entries) => {
   const visible = entries.filter((entry) => entry.isIntersecting);
