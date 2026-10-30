@@ -2,9 +2,12 @@
 //! independent OpenSSL command-line peer. Keys are generated per run.
 use dodoc::package;
 use std::fs;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Stdio;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -50,14 +53,17 @@ fn build(source: &Path, executable: &Path, level: &str) {
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/crypto/{name}"))
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unhex(text: &str) -> Vec<u8> {
     (0..text.len() / 2)
         .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
         .collect()
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn openssl(directory: &Path, arguments: &[&str], context: &str) -> Output {
     success(
         Command::new("openssl")
