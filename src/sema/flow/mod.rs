@@ -1,174 +1,287 @@
-//! Whole-local control-flow analysis, adopted as an additional check for the
-//! supported subset. Borrow safety, Result obligations, and native destruction remain with
-//! the AST checker/backend. See docs/sema-flow-prototype.md.
+//! Control-flow ownership checking for every checked body: initialization,
+//! moves, loans, escapes, destructor order, and Result obligations.
+//!
+//! The AST checker resolves names and types, desugars method calls and range
+//! loops, and lifts closures. Each successfully checked body is then lowered
+//! to a graph of basic blocks and analyzed to a fixed point. There is no
+//! fallback: every construct the backend accepts has a lowering here.
+//! See docs/sema-flow.md.
+mod analysis;
 mod lower;
-mod report;
+mod patterns;
 
-use crate::ast::{Span, Type};
-use std::collections::VecDeque;
+use crate::ast::{Function, Program, Span, Type};
+use crate::diagnostic::Diagnostic;
 
-pub(super) use lower::Adapter;
-pub use lower::{Limitation, LimitationKind, lower, lower_for_target};
-pub use report::{
-    BodyReport, BodyStatus, CheckReport, CheckerComparison, CoverageReport, SkipScope,
-    check_with_report, compare_checkers,
-};
+pub(super) use lower::lower;
 
-/// Stable whole-local identity. Projections live in `Destination`; they do not
-/// have independent initialization or partial-move facts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Stable whole-local identity. Shadowed bindings and expression temporaries
+/// have distinct places; projections live in `Path`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Place(pub usize);
 pub type BlockId = usize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalKind {
+    /// A parameter; `capture` marks a closure environment reference.
+    Parameter {
+        capture: bool,
+    },
+    Binding {
+        immutable: bool,
+    },
+    /// Single-use expression results. A loan held by a temporary is live for
+    /// the remainder of its full expression.
+    Temporary,
+}
 
 #[derive(Clone, Debug)]
 pub struct Local {
     pub name: String,
     pub ty: Type,
     pub span: Span,
-    pub parameter: bool,
+    pub kind: LocalKind,
+    /// The local's scope, for escape and destruction-order checks.
+    pub scope: usize,
 }
+
 #[derive(Clone, Debug)]
-pub enum Operand {
-    /// Abstract value with no remaining local reads, including results of pure
-    /// scalar operations. Only its type matters; it does not prune branches.
-    Constant(Type),
-    Copy(Place),
-    Move(Place),
+pub enum Root {
+    Local(Place),
+    /// A global constant or static, by qualified name.
+    Global(String),
 }
-/// An address is captured before the RHS executes. Its root must be initialized,
-/// but a store through it never initializes (or moves) the whole root binding.
-#[derive(Clone, Debug)]
-pub struct Destination {
-    pub root: Place,
-    pub projections: Vec<Projection>,
-    pub ty: Type,
-}
+
 #[derive(Clone, Debug)]
 pub enum Projection {
-    Field(String),
+    /// An explicit `*reference`.
     Deref,
-    Index(Place),
+    /// `through_ref`: the base is a reference, dereferenced implicitly.
+    Field { name: String, through_ref: bool },
+    /// `view`: the base is a slice or a reference, so its loans are the
+    /// base's provenance rather than its own storage.
+    Index { index: Place, view: bool },
 }
-/// Paths into a matched temporary. They never establish partial-move facts on
-/// user storage: owned scrutinees have already moved into a whole local.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PatternProjection {
-    Deref,
-    Field(String),
-    Payload { variant: String, index: usize },
-}
+
+/// A checked place expression: a root and its projections.
 #[derive(Clone, Debug)]
-pub enum PatternTest {
-    Variant(String),
-    Bool(bool),
-    Int(u64),
-    Range(u64, u64, bool),
+pub struct Path {
+    pub root: Root,
+    /// The root binding's own source span, for use labels.
+    pub root_span: Span,
+    pub projections: Vec<Projection>,
 }
-#[derive(Clone, Debug)]
-pub struct PayloadBinding {
-    pub target: Place,
-    pub projections: Vec<PatternProjection>,
+
+impl Path {
+    pub fn local(place: Place, span: Span) -> Self {
+        Self {
+            root: Root::Local(place),
+            root_span: span,
+            projections: vec![],
+        }
+    }
+    fn root_local(&self) -> Option<Place> {
+        match self.root {
+            Root::Local(place) => Some(place),
+            Root::Global(_) => None,
+        }
+    }
+    fn whole_local(&self) -> Option<Place> {
+        self.projections
+            .is_empty()
+            .then(|| self.root_local())
+            .flatten()
+    }
+    fn indices(&self) -> impl Iterator<Item = Place> + '_ {
+        self.projections.iter().filter_map(|p| match p {
+            Projection::Index { index, .. } => Some(*index),
+            _ => None,
+        })
+    }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PatternMode {
-    /// Non-owning guard values. Ownership transfers only after a true guard.
-    Preview,
-    /// Transfer selected payloads and discard the remainder of the temporary.
-    /// This is an abstract whole-slot consumption, not a native drop plan.
-    Owned,
-    Borrowed(bool),
+
+/// How the result of a call depends on its arguments' loans.
+#[derive(Clone, Debug, Default)]
+pub struct Contract {
+    /// Arguments whose complete dependencies flow into the result.
+    pub from: Vec<usize>,
+    /// Arguments whose stored-element dependencies flow into the result.
+    pub stored: Vec<usize>,
+    /// The result may borrow program-lifetime storage.
+    pub static_: bool,
+    /// A borrowed result without argument loans borrows static storage.
+    pub fallback_static: bool,
+    /// `stores(target, sources...)`: deposit source loans into the target.
+    pub stores: Option<(usize, Vec<usize>)>,
 }
+
 #[derive(Clone, Debug)]
 pub enum Operation {
-    Assign {
+    /// Read a place, moving it when `consume` (only whole locals move).
+    Read {
         target: Place,
-        value: Operand,
+        path: Path,
+        consume: bool,
     },
-    Aggregate {
+    /// Require a binding to be initialized: the base of an index is taken
+    /// before the index is evaluated.
+    Require(Place),
+    /// A value with no loans: literals, scalar results, function values.
+    Constant { target: Place },
+    /// A value borrowing program-lifetime storage, such as a string literal.
+    Static { target: Place },
+    /// `&path` or `&mut path`. `carried`: the place itself carries borrows,
+    /// which the new reference keeps as dependencies.
+    Borrow {
         target: Place,
-        elements: Vec<Operand>,
+        path: Path,
+        mutable: bool,
+        carried: bool,
     },
-    Tagged {
-        target: Place,
-        variant: String,
-        fields: Vec<Operand>,
+    /// Combine (and consume) temporaries: aggregates, variants, closures.
+    Combine { target: Place, sources: Vec<Place> },
+    /// Share a value's loans without consuming or accessing it.
+    Alias { target: Place, source: Place },
+    /// A shared reborrow of an exclusive value.
+    Demote { place: Place },
+    /// Add the loans held by every local this value borrows, recursively:
+    /// copying a reference out of a collection keeps what it references.
+    Transitive { place: Place },
+    /// Keep only shared loans (`view`) or stored-element loans.
+    Filter {
+        place: Place,
+        shared: bool,
+        stored: bool,
     },
-    PatternTest {
+    /// Bind a pattern payload. Each path projects the subject's own loans;
+    /// no paths keep the subject's complete dependencies.
+    Project {
         target: Place,
         source: Place,
-        projections: Vec<PatternProjection>,
-        test: PatternTest,
+        paths: Vec<Vec<String>>,
     },
-    /// Tests and previews preserve the subject; an owned commit consumes it
-    /// once, initializing all selected payload slots together.
-    PatternBind {
-        source: Operand,
-        bindings: Vec<PayloadBinding>,
-        mode: PatternMode,
+    /// Open a SplitMut pair: sides receive disjoint partition witnesses.
+    Split {
+        source: Place,
+        bindings: Vec<(Place, Option<bool>)>,
+        partition: usize,
     },
-    Borrow {
+    /// Reborrow an argument for the rest of the call expression. The
+    /// reservation stands in for the argument's own loans until the call.
+    Reserve {
         target: Place,
         source: Place,
         mutable: bool,
     },
+    /// A call or invocation. Arguments and reservations are consumed.
     Call {
-        function: String,
-        args: Vec<Operand>,
         target: Place,
+        args: Vec<Place>,
+        reservations: Vec<Place>,
+        contract: Contract,
+        /// The result type carries borrows.
+        borrowed: bool,
     },
-    Capture {
-        target: Place,
-        destination: Destination,
-    },
-    Load {
-        target: Place,
-        address: Place,
-    },
+    /// Deposit `sources` into the storage regions owned through `owner`.
+    Deposit { owner: Place, sources: Vec<Place> },
+    /// Check that `path` may be written. `read` also requires initialization.
+    Write { path: Path, read: bool },
+    /// Reserve a captured destination until its store.
+    Reservation { target: Place, path: Path },
+    /// Store through a projected destination, releasing its reservation.
     Store {
-        address: Place,
-        value: Operand,
+        path: Path,
+        value: Place,
+        reservation: Place,
     },
-    /// Read the captured collection and initialize fresh iteration bindings.
-    /// Elements are borrowed, or copied by a shared reference pattern; the
-    /// collection is never consumed. Counter values and bounds are abstract.
-    Iteration {
-        collection: Place,
-        index: Option<Place>,
-        element: Option<Place>,
-    },
-    /// Conditional cleanup: kill the slot if initialized; no read obligation.
-    /// Custom destructors and reference-containing aggregates are unsupported.
+    /// Replace a whole binding.
+    Assign { target: Place, value: Place },
+    /// Scope exit: kill the slot. Destructors read their loans here.
     Cleanup(Place),
+    /// Release a reservation: its last use.
+    Release(Place),
+    /// A matched Result is handled, including through a whole borrow.
+    Handled(Place),
+    /// A scope is about to end: destruction order, unhandled Results, and
+    /// loans of outer bindings into departing storage.
+    ScopeEnd { scope: usize },
+    /// A return or error propagation leaves every enclosing scope.
+    Exit {
+        scope: usize,
+        returned: Option<Place>,
+    },
+    /// A value block yields `value` from scope `from`, leaving every scope
+    /// up to (not including) the block's enclosing scope `to`.
+    Yield {
+        value: Place,
+        from: usize,
+        to: usize,
+    },
+    /// A mutable element borrow cannot outlive its iteration.
+    IterationEscape { binding: Place, scope: usize },
+    /// A split view cannot be stored outside the loop that opened it.
+    SplitEscape {
+        partitions: Vec<usize>,
+        scope: usize,
+    },
 }
+
 #[derive(Clone, Debug)]
 pub struct Instruction {
     pub operation: Operation,
     pub span: Span,
+    /// Evaluation order: the first finding in this order is reported.
+    pub order: usize,
+    /// Inside a match guard, which may not move, mutate, or borrow mutably.
+    pub guard: bool,
+    /// Explains a borrow the compiler inserted (closure captures).
+    pub note: Option<String>,
 }
+
 #[derive(Clone, Debug)]
 pub enum Terminator {
     Goto(BlockId),
+    /// Both successors stay possible: values never prune paths.
     Branch {
-        condition: Operand,
-        yes: BlockId,
-        no: BlockId,
+        condition: Option<Place>,
+        targets: Vec<BlockId>,
     },
-    Return(Option<Operand>),
+    Return(Option<Place>),
     Unreachable,
 }
+
 #[derive(Clone, Debug)]
 pub struct BasicBlock {
     pub instructions: Vec<Instruction>,
     pub terminator: Terminator,
     pub span: Span,
 }
-#[derive(Clone, Debug)]
-pub struct Body {
-    pub locals: Vec<Local>,
-    pub blocks: Vec<BasicBlock>,
+
+#[derive(Clone, Debug, Default)]
+pub struct Scope {
+    pub parent: Option<usize>,
+    /// Declaration order.
+    pub locals: Vec<Place>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
+pub struct Body {
+    pub name: String,
+    pub locals: Vec<Local>,
+    pub blocks: Vec<BasicBlock>,
+    pub scopes: Vec<Scope>,
+    /// Loop statement spans, for loop-carried move diagnostics.
+    pub loops: Vec<Span>,
+    /// Borrow sources the return contract allows.
+    pub from: Vec<String>,
+    /// The declared `stores(target, sources...)` effect.
+    pub stores: Vec<String>,
+    pub return_contract: Span,
+    pub inferred_contract: bool,
+}
+
+/// One use of an uninitialized or moved binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UninitializedUse {
     pub name: String,
     pub span: Span,
@@ -176,295 +289,67 @@ pub struct UninitializedUse {
     /// One possible move reaching this use, selected in source order at joins.
     pub moved_at: Option<Span>,
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Availability {
-    pub initialized: bool,
-    pub maybe_initialized: bool,
-    pub moved_at: Option<Span>,
+
+/// The ownership findings for one body, in source order.
+#[derive(Debug, Default)]
+pub struct Findings {
+    pub uninitialized: Vec<UninitializedUse>,
+    pub diagnostics: Vec<Diagnostic>,
 }
-impl Availability {
-    fn initialized() -> Self {
-        Self {
-            initialized: true,
-            maybe_initialized: true,
-            moved_at: None,
-        }
-    }
-    fn join(self, other: Self) -> Self {
-        Self {
-            initialized: self.initialized && other.initialized,
-            maybe_initialized: self.maybe_initialized || other.maybe_initialized,
-            moved_at: [self.moved_at, other.moved_at]
-                .into_iter()
-                .flatten()
-                .min_by_key(|span| (span.start, span.end)),
-        }
-    }
+
+/// Analyze one lowered body.
+pub(super) fn analyze(context: &super::Context, body: &Body) -> Findings {
+    analysis::analyze(context, body)
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CleanupKind {
-    Never,
-    Always,
-    Conditional,
-}
+
+/// Developer report: every body's ownership findings, for differential tests.
 #[derive(Debug)]
-pub struct CleanupSite {
-    pub block: BlockId,
-    pub instruction: usize,
-    pub place: Place,
-    pub kind: CleanupKind,
+pub struct BodyReport {
+    pub name: String,
+    pub span: Span,
+    pub uninitialized: Vec<UninitializedUse>,
+    pub diagnostics: Vec<Diagnostic>,
 }
+
 #[derive(Debug)]
-pub struct Initialization {
-    /// None means unreachable; it is distinct from a reachable empty fact set.
-    pub incoming: Vec<Option<Vec<Availability>>>,
-    pub issues: Vec<UninitializedUse>,
-    /// Abstract slot cleanup, not a native destructor/drop plan.
-    pub cleanup: Vec<CleanupSite>,
+pub struct CheckReport {
+    /// What recovering production checking reports.
+    pub diagnostics: Vec<Diagnostic>,
+    /// None if shared declaration checks failed before bodies were analyzed.
+    pub bodies: Option<Vec<BodyReport>>,
 }
 
-impl Body {
-    pub fn operand_type<'a>(&'a self, operand: &'a Operand) -> &'a Type {
-        match operand {
-            Operand::Constant(ty) => ty,
-            Operand::Copy(place) | Operand::Move(place) => &self.locals[place.0].ty,
-        }
-    }
-
-    /// Forward must/may analysis. Entry parameters are initialized; joins
-    /// intersect definite facts and union possible facts/move origins from
-    /// reachable predecessors. Assign generates, move/cleanup kill. Loops reach
-    /// a fixed point before diagnostics and cleanup facts are collected.
-    pub fn initialization(&self) -> Initialization {
-        let mut incoming: Vec<Option<Vec<Availability>>> = vec![None; self.blocks.len()];
-        incoming[0] = Some(
-            self.locals
-                .iter()
-                .map(|local| {
-                    if local.parameter {
-                        Availability::initialized()
-                    } else {
-                        Availability::default()
-                    }
-                })
-                .collect(),
-        );
-        let mut work = VecDeque::from([0]);
-        while let Some(id) = work.pop_front() {
-            let mut state = incoming[id].clone().unwrap();
-            self.transfer(id, &mut state, &mut |_, _, _| {}, &mut |_, _, _| {});
-            let successors = match self.blocks[id].terminator {
-                Terminator::Goto(next) => vec![next],
-                Terminator::Branch { yes, no, .. } => vec![yes, no],
-                Terminator::Return(_) | Terminator::Unreachable => vec![],
-            };
-            for next in successors {
-                let joined = match &incoming[next] {
-                    None => state.clone(),
-                    Some(old) => old.iter().zip(&state).map(|(a, b)| a.join(*b)).collect(),
-                };
-                if incoming[next].as_ref() != Some(&joined) {
-                    incoming[next] = Some(joined);
-                    work.push_back(next);
-                }
-            }
-        }
-        let mut issues = Vec::new();
-        let mut cleanup = Vec::new();
-        for (id, state) in incoming.iter().enumerate() {
-            if let Some(state) = state {
-                self.transfer(
-                    id,
-                    &mut state.clone(),
-                    &mut |place, span, moved_at| {
-                        issues.push(UninitializedUse {
-                            name: self.locals[place.0].name.clone(),
-                            declaration: self.locals[place.0].span,
-                            span,
-                            moved_at,
-                        });
-                    },
-                    &mut |instruction, place, kind| {
-                        cleanup.push(CleanupSite {
-                            block: id,
-                            instruction,
-                            place,
-                            kind,
-                        });
-                    },
-                );
-            }
-        }
-        // Block allocation order need not be source order (nested branches).
-        issues.sort_by_key(|issue| (issue.span.start, issue.span.end, issue.declaration.start));
-        Initialization {
-            incoming,
-            issues,
-            cleanup,
-        }
-    }
-
-    fn transfer(
-        &self,
-        id: BlockId,
-        state: &mut [Availability],
-        issue: &mut impl FnMut(Place, Span, Option<Span>),
-        cleanup: &mut impl FnMut(usize, Place, CleanupKind),
+/// Recovering production checking with every analyzed body's findings attached.
+#[doc(hidden)]
+pub fn check_with_report(program: &mut Program, pointer_bits: u32) -> CheckReport {
+    let mut report = CheckReport {
+        diagnostics: Vec::new(),
+        bodies: None,
+    };
+    if let Err(error) = super::check_program(
+        program,
+        pointer_bits,
+        true,
+        &mut report.diagnostics,
+        Some(&mut report.bodies),
     ) {
-        let read = |place: Place,
-                    state: &[Availability],
-                    span,
-                    issue: &mut dyn FnMut(Place, Span, Option<Span>)| {
-            if !state[place.0].initialized {
-                issue(place, span, state[place.0].moved_at);
-            }
-        };
-        let operand = |value: &Operand,
-                       state: &mut [Availability],
-                       span,
-                       issue: &mut dyn FnMut(Place, Span, Option<Span>)| {
-            if let Operand::Copy(place) | Operand::Move(place) = value {
-                read(*place, state, span, issue);
-                if matches!(value, Operand::Move(_)) {
-                    state[place.0] = Availability {
-                        moved_at: Some(span),
-                        ..Availability::default()
-                    };
-                }
-            }
-        };
-        let block = &self.blocks[id];
-        for (index, instruction) in block.instructions.iter().enumerate() {
-            let span = instruction.span;
-            match &instruction.operation {
-                Operation::Assign { target, value } => {
-                    debug_assert_eq!(&self.locals[target.0].ty, self.operand_type(value));
-                    operand(value, state, span, issue);
-                    state[target.0] = Availability::initialized();
-                }
-                Operation::Aggregate { target, elements }
-                | Operation::Tagged {
-                    target,
-                    fields: elements,
-                    ..
-                } => {
-                    for element in elements {
-                        operand(element, state, span, issue);
-                    }
-                    state[target.0] = Availability::initialized();
-                }
-                Operation::PatternTest { target, source, .. } => {
-                    read(*source, state, span, issue);
-                    state[target.0] = Availability::initialized();
-                }
-                Operation::PatternBind {
-                    source, bindings, ..
-                } => {
-                    operand(source, state, span, issue);
-                    for binding in bindings {
-                        state[binding.target.0] = Availability::initialized();
-                    }
-                }
-                Operation::Borrow {
-                    target,
-                    source,
-                    mutable,
-                } => {
-                    debug_assert_eq!(
-                        self.locals[target.0].ty,
-                        Type::Ref(*mutable, Box::new(self.locals[source.0].ty.clone()))
-                    );
-                    read(*source, state, span, issue);
-                    state[target.0] = Availability::initialized();
-                }
-                Operation::Call {
-                    function,
-                    args,
-                    target,
-                } => {
-                    debug_assert!(!function.is_empty());
-                    for arg in args {
-                        operand(arg, state, span, issue);
-                    }
-                    state[target.0] = Availability::initialized();
-                }
-                Operation::Capture {
-                    target,
-                    destination,
-                } => {
-                    debug_assert_eq!(
-                        self.locals[target.0].ty,
-                        Type::Ref(true, Box::new(destination.ty.clone()))
-                    );
-                    read(destination.root, state, span, issue);
-                    for projection in &destination.projections {
-                        if let Projection::Index(index) = projection {
-                            read(*index, state, span, issue);
-                        }
-                    }
-                    state[target.0] = Availability::initialized();
-                }
-                Operation::Load { target, address } => {
-                    debug_assert!(matches!(&self.locals[address.0].ty, Type::Ref(_, inner)
-                        if **inner == self.locals[target.0].ty));
-                    read(*address, state, span, issue);
-                    state[target.0] = Availability::initialized();
-                }
-                Operation::Store { address, value } => {
-                    debug_assert!(matches!(&self.locals[address.0].ty, Type::Ref(_, inner)
-                        if inner.as_ref() == self.operand_type(value)));
-                    read(*address, state, span, issue);
-                    operand(value, state, span, issue);
-                }
-                Operation::Iteration {
-                    collection,
-                    index,
-                    element,
-                } => {
-                    let Type::Slice(mutable, ty) = &self.locals[collection.0].ty else {
-                        unreachable!("iteration requires a captured slice")
-                    };
-                    read(*collection, state, span, issue);
-                    if let Some(index) = index {
-                        debug_assert_eq!(self.locals[index.0].ty, Type::usize());
-                        state[index.0] = Availability::initialized();
-                    }
-                    if let Some(element) = element {
-                        debug_assert!(
-                            self.locals[element.0].ty == Type::Ref(*mutable, ty.clone())
-                                || (!mutable && ty.is_copy() && self.locals[element.0].ty == **ty)
-                        );
-                        state[element.0] = Availability::initialized();
-                    }
-                }
-                Operation::Cleanup(place) => {
-                    let slot = state[place.0];
-                    cleanup(
-                        index,
-                        *place,
-                        if slot.initialized {
-                            CleanupKind::Always
-                        } else if slot.maybe_initialized {
-                            CleanupKind::Conditional
-                        } else {
-                            CleanupKind::Never
-                        },
-                    );
-                    state[place.0] = Availability::default();
-                }
-            }
-        }
-        match &block.terminator {
-            Terminator::Branch { condition, .. } => operand(condition, state, block.span, issue),
-            Terminator::Return(Some(value)) => operand(value, state, block.span, issue),
-            _ => (),
-        }
+        report.diagnostics.push(error);
+    }
+    report
+}
+
+pub(super) fn body_report(function: &Function, findings: &Findings) -> BodyReport {
+    BodyReport {
+        name: function.name.clone(),
+        span: function.span,
+        uninitialized: findings.uninitialized.clone(),
+        diagnostics: findings.diagnostics.clone(),
     }
 }
 
 impl UninitializedUse {
-    pub(crate) fn diagnostic(&self) -> crate::diagnostic::Diagnostic {
-        let mut diagnostic = crate::diagnostic::Diagnostic::new(
+    pub(crate) fn diagnostic(&self) -> Diagnostic {
+        let mut diagnostic = Diagnostic::new(
             self.span,
             format!("`{}` is uninitialized or has been moved", self.name),
         )
