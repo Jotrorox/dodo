@@ -423,3 +423,61 @@ fn manifest_test_rerun_hints_preserve_cleared_features_and_debug_settings() {
     assert!(hint.contains("--features ''"), "{hint}");
     assert!(hint.contains("--clear-link-args"));
 }
+
+#[test]
+fn forbid_unsafe_rejects_project_sources_but_not_the_standard_library() {
+    let w = Workspace::new();
+    w.file(
+        "dodo.toml",
+        "schema=1\n[project]\nforbid-unsafe=true\n[test]\nroot='suite'\n",
+    );
+    // Bundled packages keep their internal unsafe code behind safe APIs.
+    w.file(
+        "main.dodo",
+        "package app\nimport \"std/sync/allocated\"\nimport \"util\"\nfn main() -> i32 { util.value() }\n",
+    );
+    w.file(
+        "util/util.dodo",
+        "package util\npub fn value() -> i32 { 3 }\n",
+    );
+    success(&w.run(&["check"]));
+    w.file(
+        "util/util.dodo",
+        "package util\npub fn value() -> i32 { 3 }\n@unsafe_send\npub unsafe struct Raw { pointer: *mut u8 }\nfn helper() { unsafe {} }\n",
+    );
+    let o = w.run(&["check"]);
+    assert_eq!(o.status.code(), Some(1));
+    let output = text(&o);
+    assert_eq!(
+        output
+            .matches("`unsafe` is forbidden in this project")
+            .count(),
+        2,
+        "{output}"
+    );
+    assert!(output.contains("util.dodo:4:5"), "{output}");
+    assert!(output.contains("util.dodo:5:15"), "{output}");
+    // The policy belongs to the manifest; bypassing it lifts the ban.
+    success(&w.run(&["check", "--no-manifest"]));
+
+    w.file(
+        "suite/checks.dodo",
+        "package checks\n@test fn raw() { unsafe {} }\n",
+    );
+    w.file(
+        "suite/guide.md",
+        "Prose may mention unsafe freely.\n```dodo test\npackage guide\nfn main() { unsafe {} }\n```\n",
+    );
+    let o = w.run(&["test"]);
+    assert_ne!(o.status.code(), Some(0));
+    let output = text(&o);
+    assert!(output.contains("checks.dodo:2:18"), "{output}");
+    assert!(output.contains("guide.md:4:13"), "{output}");
+    assert_eq!(
+        output
+            .matches("`unsafe` is forbidden in this project")
+            .count(),
+        2,
+        "{output}"
+    );
+}

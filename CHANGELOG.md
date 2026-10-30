@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `forbid-unsafe = true` in a manifest's `[project]` table rejects every
+  `unsafe` keyword in the project's own sources, including imported local
+  packages and `dodo test` documentation examples. The standard library and
+  board and chip packages are exempt. Build, check, run, and test stop with
+  every location, and the language server reports each one.
+- `@unsafe_send` and `@unsafe_sync` now require the struct to be declared
+  `unsafe` (`@unsafe_send pub unsafe struct Owner`), since they are unchecked
+  promises; `unsafe` on a struct without either contract is an error. Add
+  `unsafe` to existing annotated structs.
 - `std/sync/atomic` works on Arm Cortex-M. On cores with exclusive loads and
   stores (ARMv7-M, ARMv7E-M, and ARMv8-M, such as the RP2350's Cortex-M33)
   every operation lowers to native instructions for 8-, 16-, and 32-bit
