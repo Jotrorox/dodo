@@ -610,6 +610,107 @@ fn i2c_failures() {
     model.expect(&held_abort)
 }
 
+// Wait for a queued transaction, as a task would across polls.
+fn finish_queued(bus: &mut designware_i2c.Controller<I2cModel>, buffer: &mut[u8]) -> u32!hal.Error {
+    polls := 0u32
+    for !bus.poll_finish(buffer)? {
+        polls += 1
+        core.assert(polls < 1000)
+    }
+    return ok(polls)
+}
+
+fn i2c_queued_transactions() {
+    model := I2cModel.new(16, 4)
+    model.registers[0x20] = 0xAB
+    model.registers[0x21] = 0xCD
+    bus := i2c_bus(model)
+    core.assert_eq(bus.queue_depth(), 16usize)
+    bus.listen()
+    command: [1]u8 = [0x20]
+    bus.start_write_read(DEVICE, &command, 2)!
+    core.assert(bus.is_busy())
+    // Nothing else gets into the FIFOs meanwhile.
+    one: [1]u8 = [0x07]
+    expect_error(bus.write(DEVICE, &one), hal.Error.Busy)
+    expect_error(bus.start_read(DEVICE, 1), hal.Error.Busy)
+    reply: [2]u8 = [0, 0]
+    // The controller works while the program polls.
+    core.assert(finish_queued(&mut bus, &mut reply)! > 0)
+    core.assert_eq(reply[0], 0xABu8)
+    core.assert_eq(reply[1], 0xCDu8)
+    core.assert(!bus.is_busy())
+    match bus.poll_finish(&mut reply) {
+        ok(done) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    data: [3]u8 = [0x30, 1, 2]
+    bus.start_write(DEVICE, &data)!
+    nothing: [0]u8 = []
+    finish_queued(&mut bus, &mut nothing)!
+    bus.start_read(DEVICE, 1)!
+    finish_queued(&mut bus, &mut one)!
+    core.assert_eq(one[0], 0x00u8)
+    // A missing device ends the transaction with its reason.
+    bus.start_read(0x10, 1)!
+    match finish_queued(&mut bus, &mut one) {
+        ok(polls) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.NoAcknowledge)
+        }
+    }
+    // A buffer shorter than the read still ends the transaction.
+    bus.start_read(DEVICE, 2)!
+    match finish_queued(&mut bus, &mut one) {
+        ok(polls) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    core.assert(!bus.is_busy())
+    // More commands than the transmit FIFO takes at once.
+    long: [16]u8 = [0; 16]
+    expect_error(bus.start_write_read(DEVICE, &long, 1), hal.Error.InvalidInput)
+    expect_error(bus.start_read(DEVICE, 17), hal.Error.InvalidInput)
+    expect_error(bus.start_write(DEVICE, &nothing), hal.Error.InvalidInput)
+    // The blocking methods work again in between.
+    bus.write(DEVICE, &one)!
+    model = bus.release()
+    core.assert_eq(model.interrupt_mask, (1u32 << 9) | (1u32 << 6))
+    core.assert_eq(model.registers[0x30], 1u8)
+    core.assert_eq(model.registers[0x31], 2u8)
+    address := ADDRESS | (DEVICE as u32 << 1)
+    queued: [30]u32 = [
+        START, address, 0x20, RESTART, address | 1, 0xAB, 0xCD, STOP,
+        START, address, 0x30, 1, 2, STOP,
+        START, address | 1, 0x00, STOP,
+        START, ADDRESS | 0x21, STOP,
+        START, address | 1, 0x00, 0x00, STOP,
+        START, address, 0x00, STOP
+    ]
+    model.expect(&queued)
+
+    // A transaction that never ends is cancelled; the bus starts afresh.
+    model.stuck = true
+    bus = i2c_bus(model)
+    bus.start_write(DEVICE, &data)!
+    for _ in 0..100 {
+        core.assert(!bus.poll_finish(&mut nothing)!)
+    }
+    bus.cancel()
+    core.assert(!bus.is_busy())
+    model = bus.release()
+    core.assert(!model.enabled)
+}
+
 fn i2c_frequency() {
     bus := i2c_bus(I2cModel.new(16, 1))
     one: [1]u8 = [0]
@@ -3493,6 +3594,7 @@ fn main() {
     i2c_transactions()
     i2c_long_transfers()
     i2c_failures()
+    i2c_queued_transactions()
     i2c_frequency()
     i2c_ten_bit()
     i2c_probe()

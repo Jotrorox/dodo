@@ -2,6 +2,7 @@ package pico
 
 import "std/embedded/hal"
 import "std/embedded/chip/rp2040"
+import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_usb"
 
 // Raspberry Pi Pico: an RP2040 with a 12 MHz crystal, 2 MiB of flash, and a
@@ -54,6 +55,9 @@ pub struct Board {
     // The USB port: `serial()` makes the board a USB serial port, for
     // printing over the USB cable.
     pub usb: Usb
+    // The DMA channels: `channel()` claims one, for transfers that run
+    // while the program does other work.
+    pub dma: rp_dma.Dma
 }
 
 // Start the chip with the Pico's crystal and claim the LED. A second call
@@ -61,8 +65,8 @@ pub struct Board {
 pub fn take() -> Board!hal.Error {
     chip := rp2040.take(rp2040.Config { crystal_hz: CRYSTAL_HZ })?
     led := chip.pins.output(LED_PIN)?
-    let rp2040.Peripherals { pins, timer, usb } = chip
-    return ok(Board { led, pins, timer, usb: Usb { usb } })
+    let rp2040.Peripherals { pins, timer, usb, dma } = chip
+    return ok(Board { led, pins, timer, usb: Usb { usb }, dma })
 }
 
 // The USB port, as `b.usb`.

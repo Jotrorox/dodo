@@ -3,6 +3,7 @@ package rp_pins
 import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
@@ -653,13 +654,17 @@ extern "C" fn dodo_panic_report(check: *const u8, file: *const u8, line: u32, co
 // the line a desktop program prints, on a line of its own. Only the first
 // call reports; a failure while reporting must not report again.
 // SAFETY: `check` and `file` must be NUL-terminated, and the caller must
-// halt or reset afterwards, as this takes the ports from their owners.
+// halt or reset afterwards, as this takes the ports, and the DMA channels,
+// from their owners.
 pub unsafe fn report_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
     unsafe {
         if REPORTING {
             return
         }
         REPORTING = true
+        // A DMA channel may be feeding a port, or writing to memory the
+        // report uses.
+        rp_dma.stop_all()
         for index in 0..2usize {
             if CONSOLES[index] != 0 {
                 registers := hal.RegisterBlock.at(CONSOLES[index])
