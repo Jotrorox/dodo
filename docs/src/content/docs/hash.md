@@ -39,8 +39,9 @@ Expected output: none; exit 0 confirms both known results. These one-shot
 functions cannot fail. A checksum mismatch in an application means you should
 reject or reacquire the damaged data. Neither checksum nor FNV authenticates it.
 For hash tables accepting untrusted keys, use SipHash with an unpredictable
-caller-supplied key; if key acquisition fails, stop that operation. The library
-has no general OS entropy adapter and a fixed example seed is not a substitute.
+caller-supplied key; if key acquisition fails, stop that operation.
+[`std/crypto/random`](crypto.md#random-bytes) supplies keys from the OS; a fixed
+example seed is not a substitute.
 
 ## API and contracts
 
@@ -121,7 +122,8 @@ capability `source.next_key(&mut self) -> Key128!KeyError` exactly once.
 The source type and its `next_key` method must be public for dispatch from the
 hash package. `KeyError.Unavailable` propagates unchanged: there is no retry, fallback,
 implicit seed, or entropy access. The application implements the source and is
-responsible for unpredictable production keys. A source can return a fresh key
+responsible for unpredictable production keys; `std/crypto/random.SystemRandom`
+is a ready OS-backed source. A source can return a fresh key
 per request or apply an explicit application key-management policy. Failure
 may advance source state according to that source's contract, but never returns
 a usable key. The library provides no deterministic source as a production
@@ -129,8 +131,8 @@ default; fixtures/examples define clearly named deterministic test sources.
 
 SipHash is used here as a keyed table hash with a 64-bit output. It is not an
 unkeyed collision-resistant digest, password hash, general-purpose message
-authentication API, or encryption algorithm. No cryptographic API is provided;
-there is no constant-time or key-erasure guarantee. Checksums and FNV provide
+authentication API, or encryption algorithm; use [cryptography](crypto.md) for
+those. `std/hash` makes no constant-time or key-erasure guarantee. Checksums and FNV provide
 no protection against an adversary who can choose or alter the bytes.
 
 ## Statically dispatched contracts and value encodings
