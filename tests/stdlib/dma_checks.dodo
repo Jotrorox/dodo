@@ -1,0 +1,1281 @@
+package main
+
+import "core/mem"
+import "core/ptr"
+import "std/embedded/chip/rp_dma"
+import "std/embedded/hal"
+import "std/embedded/peripheral/pl011"
+import "std/embedded/peripheral/pl022"
+import "std/io"
+
+// Host checks for DMA: rp_dma's channel driver against a register model of
+// the RP2040 and RP2350 DMA controllers, and the PL022 and PL011 DMA
+// sessions against a simulated world in which test channels move real
+// memory, paced by models of the two controllers' FIFOs. Everything in the
+// world advances a step whenever a driver touches a register or asks a
+// channel how it is doing, so transfers run while the drivers poll, as on
+// the chip.
+
+// --- The RP DMA controller's registers --------------------------------
+
+// Channel registers and the shared ones, by word: 16 channels of 16 words,
+// then INTR at 0x400 and the rest. Aliases at 0x2000 and 0x3000 set and
+// clear bits.
+static mut WORDS: [512]u32 = [0u32; 512]
+// Each channel's live transfer count, and whether it runs.
+static mut LIVE: [16]u32 = [0u32; 16]
+static mut RUNNING: u32 = 0
+// The chip being modelled: its BUSY bit, and CHAN_ABORT's word.
+static mut MODEL_RP2350: bool = false
+static mut ABORTS: u32 = 0
+
+fn busy_bit() -> u32 {
+    unsafe {
+        if MODEL_RP2350 {
+            return 1 << 26
+        }
+    }
+    return 1 << 24
+}
+
+fn abort_word() -> usize {
+    unsafe {
+        if MODEL_RP2350 {
+            return 0x464 / 4
+        }
+    }
+    return 0x444 / 4
+}
+
+fn reset_model(rp2350: bool) {
+    unsafe {
+        WORDS = [0u32; 512]
+        LIVE = [0u32; 16]
+        RUNNING = 0
+        MODEL_RP2350 = rp2350
+        ABORTS = 0
+    }
+}
+
+struct DmaView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(offset < 0x1000 && offset % 4 == 0)
+        word := offset / 4
+        unsafe {
+            if word < 256 {
+                channel := word / 16
+                register := word % 16
+                if register == 2 {
+                    return LIVE[channel] | (WORDS[word] & 0xF000_0000)
+                }
+                if register == 3 || register == 4 {
+                    value := WORDS[channel * 16 + 3] & ~busy_bit()
+                    if (RUNNING & (1u32 << channel as u32)) != 0 {
+                        value |= busy_bit()
+                    }
+                    return value
+                }
+            }
+            if word == abort_word() {
+                return 0
+            }
+            if word == 0x40C / 4 {
+                return WORDS[0x400 / 4] & WORDS[0x404 / 4]
+            }
+            return WORDS[word]
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        alias := offset & 0x3000
+        word := (offset & 0xFFF) / 4
+        core.assert(word < 512)
+        unsafe {
+            if alias == 0x2000 {
+                WORDS[word] |= value
+                return
+            } else if alias == 0x3000 {
+                WORDS[word] &= ~value
+                return
+            }
+            core.assert(alias == 0)
+            if word < 256 {
+                channel := word / 16
+                register := word % 16
+                bit := 1u32 << channel as u32
+                if register == 3 {
+                    WORDS[channel * 16 + 3] = value & ~(busy_bit() | 0x6000_0000)
+                    if (value & 1) != 0 {
+                        LIVE[channel] = WORDS[channel * 16 + 2] & 0x0FFF_FFFF
+                        if !MODEL_RP2350 {
+                            LIVE[channel] = WORDS[channel * 16 + 2]
+                        }
+                        RUNNING |= bit
+                    }
+                    return
+                }
+                if register == 4 {
+                    // The errors clear when written as one; the rest is
+                    // replaced without a trigger.
+                    errors := WORDS[channel * 16 + 3] & 0x6000_0000 & ~value
+                    WORDS[channel * 16 + 3] = (value & ~(busy_bit() | 0x6000_0000)) | errors
+                    return
+                }
+                WORDS[word] = value
+                return
+            }
+            if word == abort_word() {
+                ABORTS |= value
+                RUNNING &= ~value
+                return
+            }
+            if word == 0x400 / 4 || word == 0x40C / 4 {
+                WORDS[0x400 / 4] &= ~value
+                return
+            }
+            WORDS[word] = value
+        }
+    }
+}
+
+fn control(channel: u32) -> u32 {
+    unsafe {
+        return WORDS[channel as usize * 16 + 3]
+    }
+}
+
+// The channel's transfer ends: done, or failed with a read error.
+fn finish(channel: u32, failed: bool) {
+    unsafe {
+        bit := 1u32 << channel
+        RUNNING &= ~bit
+        if failed {
+            WORDS[channel as usize * 16 + 3] |= 1u32 << 30
+        } else {
+            LIVE[channel as usize] = 0
+        }
+        WORDS[0x400 / 4] |= bit
+    }
+}
+
+fn transfer(source: usize, destination: usize, count: u32, pace: hal.DmaPace) -> hal.DmaTransfer {
+    return hal.DmaTransfer {
+        source,
+        destination,
+        count,
+        width: hal.DmaWidth.Byte,
+        increment_source: true,
+        increment_destination: false,
+        pace,
+        ring: hal.DmaRing.None,
+    }
+}
+
+fn expect_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn requests_follow_the_datasheets() {
+    expect_request(rp_dma.RP2040, 0x4003_4000, true, 20)
+    expect_request(rp_dma.RP2040, 0x4003_8000, false, 23)
+    expect_request(rp_dma.RP2040, 0x4003_C008, true, 16)
+    expect_request(rp_dma.RP2040, 0x4004_0008, false, 19)
+    expect_request(rp_dma.RP2040, 0x4004_4010, true, 32)
+    expect_request(rp_dma.RP2040, 0x4004_8010, false, 35)
+    expect_request(rp_dma.RP2040, 0x4004_C00C, false, 36)
+    expect_request(rp_dma.RP2040, 0x5020_0018, true, 2)
+    expect_request(rp_dma.RP2040, 0x5030_002C, false, 15)
+    expect_request(rp_dma.RP2350, 0x4007_0000, false, 29)
+    expect_request(rp_dma.RP2350, 0x4007_8000, true, 30)
+    expect_request(rp_dma.RP2350, 0x4008_0008, true, 24)
+    expect_request(rp_dma.RP2350, 0x4008_8008, false, 27)
+    expect_request(rp_dma.RP2350, 0x4009_0010, true, 44)
+    expect_request(rp_dma.RP2350, 0x4009_8010, false, 47)
+    expect_request(rp_dma.RP2350, 0x400A_000C, false, 48)
+    expect_request(rp_dma.RP2350, 0x5040_0020, false, 20)
+    // The ADC has no transmit request, the RP2040 no third PIO block, and
+    // a PIO block's control registers no request at all.
+    expect_no_request(rp_dma.RP2040, 0x4004_C00C, true)
+    expect_no_request(rp_dma.RP2040, 0x5040_0010, true)
+    expect_no_request(rp_dma.RP2350, 0x5020_0000, true)
+    expect_no_request(rp_dma.RP2350, 0x5020_0010, false)
+    expect_no_request(rp_dma.RP2350, 0x2000_0000, true)
+    core.assert(rp_dma.channel_count(rp_dma.RP2040) == 12)
+    core.assert(rp_dma.channel_count(rp_dma.RP2350) == 16)
+    core.assert(rp_dma.irq(rp_dma.RP2040) == 11)
+    core.assert(rp_dma.irq(rp_dma.RP2350) == 10)
+}
+
+fn expect_request(chip: u32, address: usize, transmit: bool, expected: u32) {
+    match rp_dma.request(chip, address, transmit) {
+        some(found) => {
+            core.assert(found == expected)
+        }
+        none => {
+            core.assert(false)
+        }
+    }
+}
+
+fn expect_no_request(chip: u32, address: usize, transmit: bool) {
+    match rp_dma.request(chip, address, transmit) {
+        some(found) => {
+            core.assert(false)
+        }
+        none => {}
+    }
+}
+
+fn rp2040_channels_are_programmed_and_triggered() {
+    reset_model(false)
+    channel := rp_dma.Driver.new(DmaView {}, rp_dma.RP2040, 5)
+    core.assert(channel.number() == 5)
+    core.assert(!channel.is_busy())
+    unsafe {
+        channel.start(transfer(0x2000_0100, 0x4003_C008, 300, hal.DmaPace.Destination))!
+    }
+    // EN, bytes, increment the read address, chain to itself (no chain),
+    // and SPI0's transmit request.
+    core.assert(control(5) == (1 | (1 << 4) | (5 << 11) | (16 << 15)))
+    unsafe {
+        core.assert(WORDS[5 * 16] == 0x2000_0100)
+        core.assert(WORDS[5 * 16 + 1] == 0x4003_C008)
+    }
+    core.assert(channel.is_busy())
+    core.assert(channel.remaining() == 300)
+    core.assert(channel.read_address() == 0x2000_0100)
+    // A second start while it runs.
+    unsafe {
+        expect_error(channel.start(transfer(0x2000_0100, 0x4003_C008, 1, hal.DmaPace.Destination)), hal.Error.Busy)
+    }
+    finish(5, false)
+    core.assert(!channel.is_busy())
+    core.assert(channel.remaining() == 0)
+    core.assert(channel.finished())
+    channel.clear()
+    core.assert(!channel.finished())
+    channel.take_error()!
+
+    // Words into a ring on the write side, unpaced: a copy.
+    word_ring := hal.DmaTransfer {
+        source: 0x2000_0000,
+        destination: 0x2000_1000,
+        count: 0xFFFF_FFFF,
+        width: hal.DmaWidth.Word,
+        increment_source: false,
+        increment_destination: true,
+        pace: hal.DmaPace.Unpaced,
+        ring: hal.DmaRing.Destination(10),
+    }
+    unsafe {
+        channel.start(word_ring)!
+    }
+    core.assert(control(5) == (1 | (2 << 2) | (1 << 5) | (10 << 6) | (1 << 10) | (5 << 11) | (0x3F << 15)))
+    core.assert(channel.remaining() == 0xFFFF_FFFF)
+    channel.abort()
+    unsafe {
+        core.assert(ABORTS == 1u32 << 5)
+    }
+    core.assert(!channel.is_busy())
+}
+
+fn rp2350_fields_sit_higher() {
+    reset_model(true)
+    channel := rp_dma.Driver.new(DmaView {}, rp_dma.RP2350, 15)
+    ring := hal.DmaTransfer {
+        source: 0x4007_0000,
+        destination: 0x2000_0200,
+        count: 0x0FFF_FFFF,
+        width: hal.DmaWidth.Byte,
+        increment_source: false,
+        increment_destination: true,
+        pace: hal.DmaPace.Source,
+        ring: hal.DmaRing.Destination(8),
+    }
+    unsafe {
+        channel.start(ring)!
+    }
+    // INCR_WRITE at 6, the ring at 8 and 12, CHAIN_TO at 13, and UART0's
+    // receive request at 17.
+    core.assert(control(15) == (1 | (1 << 6) | (8 << 8) | (1 << 12) | (15 << 13) | (29 << 17)))
+    core.assert(channel.is_busy())
+    // The mode in TRANS_COUNT's top bits is not part of the count.
+    unsafe {
+        WORDS[15 * 16 + 2] |= 0xF000_0000
+    }
+    core.assert(channel.remaining() == 0x0FFF_FFFF)
+    core.assert(channel.max_count() == 0x0FFF_FFFF)
+    channel.abort()
+    unsafe {
+        core.assert(ABORTS == 1u32 << 15)
+    }
+    // The RP2350 moves at most 2^28 - 1 elements at once.
+    unsafe {
+        expect_error(channel.start(transfer(0x2000_0000, 0x2000_1000, 0x1000_0000, hal.DmaPace.Unpaced)), hal.Error.InvalidInput)
+    }
+}
+
+fn bad_transfers_are_refused() {
+    reset_model(false)
+    channel := rp_dma.Driver.new(DmaView {}, rp_dma.RP2040, 0)
+    unsafe {
+        // Nothing raises requests at an SRAM address.
+        expect_error(channel.start(transfer(0x2000_0000, 0x2000_1000, 4, hal.DmaPace.Destination)), hal.Error.InvalidInput)
+        misaligned := hal.DmaTransfer {
+            source: 0x2000_0002,
+            destination: 0x2000_1000,
+            count: 4,
+            width: hal.DmaWidth.Word,
+            increment_source: true,
+            increment_destination: true,
+            pace: hal.DmaPace.Unpaced,
+            ring: hal.DmaRing.None,
+        }
+        expect_error(channel.start(misaligned), hal.Error.InvalidInput)
+        too_wide := hal.DmaTransfer {
+            source: 0x2000_0000,
+            destination: 0x2000_1000,
+            count: 4,
+            width: hal.DmaWidth.Byte,
+            increment_source: true,
+            increment_destination: true,
+            pace: hal.DmaPace.Unpaced,
+            ring: hal.DmaRing.Source(16),
+        }
+        expect_error(channel.start(too_wide), hal.Error.InvalidInput)
+        expect_error(channel.start_request(transfer(0x2000_0000, 0x2000_1000, 4, hal.DmaPace.Unpaced), 0x40), hal.Error.InvalidInput)
+        // A pace of the program's choosing, here timer 0.
+        channel.start_request(transfer(0x2000_0000, 0x4005_000C, 4, hal.DmaPace.Unpaced), rp_dma.TIMER0)!
+    }
+    core.assert(control(0) == (1 | (1 << 4) | (0x3B << 15)))
+    core.assert(!channel.is_busy() == false)
+    finish(0, true)
+    expect_error(channel.take_error(), hal.Error.Bus)
+    channel.take_error()!
+}
+
+fn aborts_keep_the_interrupt_quiet() {
+    reset_model(false)
+    channel := rp_dma.Driver.new(DmaView {}, rp_dma.RP2040, 3)
+    channel.listen()
+    core.assert(channel.is_listening())
+    unsafe {
+        channel.start(transfer(0x2000_0000, 0x4003_4000, 8, hal.DmaPace.Destination))!
+    }
+    // The channel finished just as it was aborted.
+    unsafe {
+        WORDS[0x400 / 4] |= 1u32 << 3
+    }
+    channel.abort()
+    core.assert(!channel.finished())
+    core.assert(channel.is_listening())
+    channel.ignore()
+    core.assert(!channel.is_listening())
+    // Other channels' bits are left alone.
+    unsafe {
+        WORDS[0x404 / 4] = 0x11
+        WORDS[0x400 / 4] = 0x11
+    }
+    channel.listen()
+    channel.abort()
+    unsafe {
+        core.assert(WORDS[0x404 / 4] == 0x19)
+        core.assert(WORDS[0x400 / 4] == 0x11)
+    }
+}
+
+// --- A world of test channels and controller models ---------------------
+
+// Addresses the test channels treat as the controllers' data registers.
+const SPI_DATA: usize = 0x4003_C008
+const UART_DATA: usize = 0x4003_4000
+
+// Up to four test channels, each moving one element per step when its
+// pace allows.
+const CHANNELS: usize = 4
+struct Lane {
+    active: bool
+    source: usize
+    destination: usize
+    remaining: u32
+    increment_source: bool
+    increment_destination: bool
+    pace: u32
+    // Ring mask of the destination or source address, 0 for none.
+    ring_mask: usize
+    ring_source: bool
+    starts: u32
+    aborts: u32
+    // Steps between two elements: a slow channel lets FIFOs fill.
+    period: u32
+    wait: u32
+}
+
+const PACE_NONE: u32 = 0
+const PACE_DESTINATION: u32 = 1
+const PACE_SOURCE: u32 = 2
+
+static mut LANES: [4]Lane = [
+    Lane { active: false, source: 0, destination: 0, remaining: 0, increment_source: false, increment_destination: false, pace: 0, ring_mask: 0, ring_source: false, starts: 0, aborts: 0, period: 1, wait: 0 },
+    Lane { active: false, source: 0, destination: 0, remaining: 0, increment_source: false, increment_destination: false, pace: 0, ring_mask: 0, ring_source: false, starts: 0, aborts: 0, period: 1, wait: 0 },
+    Lane { active: false, source: 0, destination: 0, remaining: 0, increment_source: false, increment_destination: false, pace: 0, ring_mask: 0, ring_source: false, starts: 0, aborts: 0, period: 1, wait: 0 },
+    Lane { active: false, source: 0, destination: 0, remaining: 0, increment_source: false, increment_destination: false, pace: 0, ring_mask: 0, ring_source: false, starts: 0, aborts: 0, period: 1, wait: 0 },
+]
+
+// The SPI controller: 8-entry FIFOs, a device that answers each byte with
+// the byte plus one, and a frame shifted every SPI_PERIOD steps.
+static mut SPI_TX: [8]u8 = [0u8; 8]
+static mut SPI_TX_COUNT: usize = 0
+static mut SPI_RX: [8]u8 = [0u8; 8]
+static mut SPI_RX_COUNT: usize = 0
+static mut SPI_SHIFTING: u32 = 0
+static mut SPI_DMA: u32 = 0
+static mut SPI_OVERRUN: bool = false
+static mut SPI_SENT: [64]u8 = [0u8; 64]
+static mut SPI_SENT_COUNT: usize = 0
+const SPI_PERIOD: u32 = 3
+
+// The UART: 32-entry FIFOs, a transmitter that puts a byte on the line
+// every UART_PERIOD steps, and a receive FIFO the test fills.
+static mut UART_TX: [32]u8 = [0u8; 32]
+static mut UART_TX_COUNT: usize = 0
+static mut UART_RX: [32]u8 = [0u8; 32]
+static mut UART_RX_COUNT: usize = 0
+static mut UART_DMA: u32 = 0
+static mut UART_RAW: u32 = 0
+static mut UART_MASK: u32 = 0
+static mut UART_LINE: [256]u8 = [0u8; 256]
+static mut UART_LINE_COUNT: usize = 0
+static mut UART_STEPS: u32 = 0
+const UART_PERIOD: u32 = 2
+
+fn reset_world() {
+    unsafe {
+        for index in 0..CHANNELS {
+            LANES[index].active = false
+            LANES[index].starts = 0
+            LANES[index].aborts = 0
+            LANES[index].period = 1
+            LANES[index].wait = 0
+        }
+        SPI_TX_COUNT = 0
+        SPI_RX_COUNT = 0
+        SPI_SHIFTING = 0
+        SPI_DMA = 0
+        SPI_OVERRUN = false
+        SPI_SENT_COUNT = 0
+        UART_TX_COUNT = 0
+        UART_RX_COUNT = 0
+        UART_DMA = 0
+        UART_RAW = 0
+        UART_MASK = 0
+        UART_LINE_COUNT = 0
+        UART_STEPS = 0
+    }
+}
+
+// One step of everything: the SPI shifter, the UART transmitter, and each
+// channel.
+fn step() {
+    unsafe {
+        if SPI_TX_COUNT > 0 {
+            SPI_SHIFTING += 1
+            if SPI_SHIFTING >= SPI_PERIOD {
+                SPI_SHIFTING = 0
+                byte := SPI_TX[0]
+                for index in 1..SPI_TX_COUNT {
+                    SPI_TX[index - 1] = SPI_TX[index]
+                }
+                SPI_TX_COUNT -= 1
+                if SPI_SENT_COUNT < 64 {
+                    SPI_SENT[SPI_SENT_COUNT] = byte
+                    SPI_SENT_COUNT += 1
+                }
+                if SPI_RX_COUNT < 8 {
+                    SPI_RX[SPI_RX_COUNT] = core.wrapping_add(byte, 1)
+                    SPI_RX_COUNT += 1
+                } else {
+                    SPI_OVERRUN = true
+                }
+            }
+        }
+        if UART_TX_COUNT > 0 {
+            UART_STEPS += 1
+            if UART_STEPS >= UART_PERIOD {
+                UART_STEPS = 0
+                if UART_LINE_COUNT < 256 {
+                    UART_LINE[UART_LINE_COUNT] = UART_TX[0]
+                    UART_LINE_COUNT += 1
+                }
+                for index in 1..UART_TX_COUNT {
+                    UART_TX[index - 1] = UART_TX[index]
+                }
+                UART_TX_COUNT -= 1
+            }
+        }
+        for index in 0..CHANNELS {
+            move_element(index)
+        }
+    }
+}
+
+// Move one element of channel `index` if it runs and its pace allows.
+fn move_element(index: usize) {
+    unsafe {
+        lane := &mut LANES[index]
+        if !lane.active {
+            return
+        }
+        lane.wait += 1
+        if lane.wait < lane.period {
+            return
+        }
+        lane.wait = 0
+        if lane.pace == PACE_DESTINATION && !has_room(lane.destination) {
+            return
+        }
+        if lane.pace == PACE_SOURCE && !has_data(lane.source) {
+            return
+        }
+        value := load(lane.source)
+        store(lane.destination, value)
+        if lane.increment_source {
+            lane.source = advance(lane.source, lane.ring_mask, lane.ring_source)
+        }
+        if lane.increment_destination {
+            lane.destination = advance(lane.destination, lane.ring_mask, !lane.ring_source)
+        }
+        lane.remaining -= 1
+        if lane.remaining == 0 {
+            lane.active = false
+        }
+    }
+}
+
+fn advance(address: usize, mask: usize, wraps: bool) -> usize {
+    if wraps && mask != 0 {
+        return (address & ~mask) | ((address + 1) & mask)
+    }
+    return address + 1
+}
+
+fn has_room(address: usize) -> bool {
+    unsafe {
+        if address == SPI_DATA {
+            return (SPI_DMA & 2) != 0 && SPI_TX_COUNT < 8
+        }
+        if address == UART_DATA {
+            return (UART_DMA & 2) != 0 && UART_TX_COUNT < 32
+        }
+    }
+    return true
+}
+
+fn has_data(address: usize) -> bool {
+    unsafe {
+        if address == SPI_DATA {
+            return (SPI_DMA & 1) != 0 && SPI_RX_COUNT > 0
+        }
+        if address == UART_DATA {
+            return (UART_DMA & 1) != 0 && UART_RX_COUNT > 0
+        }
+    }
+    return true
+}
+
+fn load(address: usize) -> u8 {
+    unsafe {
+        if address == SPI_DATA {
+            byte := SPI_RX[0]
+            for index in 1..SPI_RX_COUNT {
+                SPI_RX[index - 1] = SPI_RX[index]
+            }
+            SPI_RX_COUNT -= 1
+            return byte
+        }
+        if address == UART_DATA {
+            byte := UART_RX[0]
+            for index in 1..UART_RX_COUNT {
+                UART_RX[index - 1] = UART_RX[index]
+            }
+            UART_RX_COUNT -= 1
+            return byte
+        }
+        return ptr.read(address as *const u8)
+    }
+}
+
+fn store(address: usize, value: u8) {
+    unsafe {
+        if address == SPI_DATA {
+            SPI_TX[SPI_TX_COUNT] = value
+            SPI_TX_COUNT += 1
+            return
+        }
+        if address == UART_DATA {
+            UART_TX[UART_TX_COUNT] = value
+            UART_TX_COUNT += 1
+            return
+        }
+        ptr.write(address as *mut u8, value)
+    }
+}
+
+// A hal.DmaChannel over lane `index`, as a chip's channel is over its
+// controller. Each question it answers advances the world.
+struct TestChannel: hal.DmaChannel {
+    index: usize
+    max: u32
+
+    pub unsafe fn start(&mut self, transfer: hal.DmaTransfer) -> void!hal.Error {
+        if self.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        if transfer.count > self.max {
+            return err(hal.Error.InvalidInput)
+        }
+        unsafe {
+            lane := &mut LANES[self.index]
+            core.assert(width_is_byte(&transfer.width))
+            lane.source = transfer.source
+            lane.destination = transfer.destination
+            lane.remaining = transfer.count
+            lane.increment_source = transfer.increment_source
+            lane.increment_destination = transfer.increment_destination
+            lane.pace = PACE_NONE
+            match &transfer.pace {
+                hal.DmaPace.Unpaced => {}
+                hal.DmaPace.Destination => {
+                    lane.pace = PACE_DESTINATION
+                }
+                hal.DmaPace.Source => {
+                    lane.pace = PACE_SOURCE
+                }
+            }
+            lane.ring_mask = 0
+            lane.ring_source = false
+            match &transfer.ring {
+                hal.DmaRing.None => {}
+                hal.DmaRing.Source(bits) => {
+                    lane.ring_mask = (1usize << *bits as usize) - 1
+                    lane.ring_source = true
+                }
+                hal.DmaRing.Destination(bits) => {
+                    lane.ring_mask = (1usize << *bits as usize) - 1
+                }
+            }
+            lane.active = transfer.count != 0
+            lane.starts += 1
+        }
+        return ok()
+    }
+
+    pub fn is_busy(&mut self) -> bool {
+        step()
+        unsafe {
+            return LANES[self.index].active
+        }
+    }
+
+    pub fn remaining(&mut self) -> u32 {
+        step()
+        unsafe {
+            if !LANES[self.index].active {
+                return 0
+            }
+            return LANES[self.index].remaining
+        }
+    }
+
+    pub fn max_count(&mut self) -> u32 {
+        return self.max
+    }
+
+    pub fn abort(&mut self) {
+        unsafe {
+            if LANES[self.index].active {
+                LANES[self.index].aborts += 1
+            }
+            LANES[self.index].active = false
+        }
+    }
+
+    pub fn take_error(&mut self) -> void!hal.Error {
+        return ok()
+    }
+}
+
+fn width_is_byte(width: &hal.DmaWidth) -> bool {
+    match width {
+        hal.DmaWidth.Byte => {
+            return true
+        }
+        _ => {
+            return false
+        }
+    }
+}
+
+fn channel(index: usize) -> TestChannel {
+    return TestChannel { index, max: 0xFFFF_FFFF }
+}
+
+// The PL022's registers in the world.
+struct SpiView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        step()
+        unsafe {
+            if offset == 0x08 {
+                if SPI_RX_COUNT == 0 {
+                    return 0
+                }
+                return load(SPI_DATA) as u32
+            }
+            if offset == 0x0C {
+                status := 0u32
+                if SPI_TX_COUNT == 0 {
+                    status |= 1
+                }
+                if SPI_TX_COUNT < 8 {
+                    status |= 2
+                }
+                if SPI_RX_COUNT > 0 {
+                    status |= 4
+                }
+                if SPI_RX_COUNT == 8 {
+                    status |= 8
+                }
+                if SPI_TX_COUNT > 0 {
+                    status |= 16
+                }
+                return status
+            }
+            if offset == 0x18 {
+                if SPI_OVERRUN {
+                    return 1
+                }
+                return 0
+            }
+            if offset == 0x24 {
+                return SPI_DMA
+            }
+        }
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        step()
+        unsafe {
+            if offset == 0x08 {
+                core.assert(SPI_TX_COUNT < 8)
+                store(SPI_DATA, value as u8)
+            } else if offset == 0x20 {
+                if (value & 1) != 0 {
+                    SPI_OVERRUN = false
+                }
+            } else if offset == 0x24 {
+                SPI_DMA = value
+            }
+        }
+    }
+}
+
+// The PL011's registers in the world.
+struct UartView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        step()
+        unsafe {
+            if offset == 0x00 {
+                if UART_RX_COUNT == 0 {
+                    return 0
+                }
+                return load(UART_DATA) as u32
+            }
+            if offset == 0x18 {
+                flags := 0u32
+                if UART_TX_COUNT > 0 {
+                    flags |= 1 << 3
+                }
+                if UART_RX_COUNT == 0 {
+                    flags |= 1 << 4
+                }
+                if UART_TX_COUNT == 32 {
+                    flags |= 1 << 5
+                }
+                return flags
+            }
+            if offset == 0x30 {
+                return 0x301
+            }
+            if offset == 0x38 {
+                return UART_MASK
+            }
+            if offset == 0x3C {
+                return UART_RAW
+            }
+            if offset == 0x40 {
+                return UART_RAW & UART_MASK
+            }
+            if offset == 0x48 {
+                return UART_DMA
+            }
+        }
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        step()
+        unsafe {
+            if offset == 0x00 {
+                core.assert(UART_TX_COUNT < 32)
+                store(UART_DATA, value as u8)
+            } else if offset == 0x38 {
+                UART_MASK = value
+            } else if offset == 0x44 {
+                UART_RAW &= ~value
+            } else if offset == 0x48 {
+                UART_DMA = value
+            }
+        }
+    }
+}
+
+// Bytes arriving on the UART's receive line: into the FIFO, or lost with
+// an overrun once it is full.
+fn arrive(bytes: &[u8]) {
+    unsafe {
+        for index in 0..bytes.len {
+            if UART_RX_COUNT < 32 {
+                UART_RX[UART_RX_COUNT] = bytes[index]
+                UART_RX_COUNT += 1
+            } else {
+                UART_RAW |= 1 << 10
+            }
+            // The channel keeps up between bytes, as at any real baud rate.
+            step()
+        }
+    }
+}
+
+fn settle_world(steps: u32) {
+    for _ in 0..steps {
+        step()
+    }
+}
+
+// --- SPI by DMA --------------------------------------------------------
+
+fn spi_bus() -> pl022.Controller<SpiView> {
+    return pl022.Controller.new(SpiView {}, pl022.divisors(125_000_000, 1_000_000)!, hal.SpiMode.Mode0)
+}
+
+fn spi_transfers_move_the_buffer() {
+    reset_world()
+    bus := spi_bus()
+    tx := channel(0)
+    rx := channel(1)
+    buffer: [40]u8 = [0; 40]
+    {
+        dma := bus.dma_at(SPI_DATA, &mut tx, &mut rx, &mut buffer)!
+        core.assert(dma.capacity() == 40)
+        bytes := dma.buffer()!
+        for index in 0..40usize {
+            bytes[index] = index as u8 * 3
+        }
+        dma.start_transfer(40)!
+        // The buffer is lent out only between transfers.
+        expect_buffer_busy(&mut dma)
+        expect_error(dma.start_write(1), hal.Error.Busy)
+        core.assert(dma.is_busy())
+        polls := 0u32
+        for dma.is_busy() {
+            polls += 1
+        }
+        // The transfer ran while the program polled: one frame per
+        // SPI_PERIOD steps, with steps in between.
+        core.assert(polls > 40)
+        dma.finish()!
+        replies := dma.buffer()!
+        for index in 0..40usize {
+            core.assert(replies[index] == core.wrapping_add(index as u8 * 3, 1))
+        }
+        core.assert(!dma.is_busy())
+        // Finishing twice is harmless.
+        dma.finish()!
+        expect_error(dma.start_transfer(0), hal.Error.InvalidInput)
+        expect_error(dma.start_transfer(41), hal.Error.InvalidInput)
+    }
+    unsafe {
+        core.assert(SPI_SENT_COUNT == 40)
+        core.assert(SPI_SENT[39] == 39 * 3)
+        // Dropping the session turns the requests off.
+        core.assert(SPI_DMA == 0)
+    }
+    // The bus works without DMA again.
+    polled: [2]u8 = [7, 8]
+    bus.transfer(&mut polled)!
+    core.assert(polled[0] == 8 && polled[1] == 9)
+}
+
+fn expect_buffer_busy(dma: &mut pl022.DmaBus) {
+    match dma.buffer() {
+        ok(bytes) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Busy)
+        }
+    }
+}
+
+fn spi_writes_leave_the_buffer_alone() {
+    reset_world()
+    bus := spi_bus()
+    tx := channel(0)
+    rx := channel(1)
+    buffer: [16]u8 = [0x55; 16]
+    {
+        dma := bus.dma_at(SPI_DATA, &mut tx, &mut rx, &mut buffer)!
+        dma.write(16)!
+        dma.transfer(2)!
+        dma.write(3)!
+    }
+    core.assert(buffer[0] == 0x56 && buffer[1] == 0x56 && buffer[2] == 0x55 && buffer[15] == 0x55)
+    unsafe {
+        core.assert(SPI_SENT_COUNT == 21)
+        core.assert(LANES[1].starts == 3)
+    }
+}
+
+fn dropping_a_running_spi_transfer_aborts_it() {
+    reset_world()
+    bus := spi_bus()
+    tx := channel(0)
+    rx := channel(1)
+    buffer: [32]u8 = [1; 32]
+    {
+        dma := bus.dma_at(SPI_DATA, &mut tx, &mut rx, &mut buffer)!
+        dma.start_transfer(32)!
+    }
+    unsafe {
+        core.assert(LANES[0].aborts == 1)
+        core.assert(LANES[1].aborts == 1)
+        core.assert(!LANES[0].active && !LANES[1].active)
+        core.assert(SPI_DMA == 0)
+        // What was queued has left, and nothing waits in the FIFOs.
+        core.assert(SPI_TX_COUNT == 0 && SPI_RX_COUNT == 0)
+        core.assert(SPI_SENT_COUNT < 32)
+    }
+}
+
+fn a_held_up_receiver_is_an_overrun() {
+    reset_world()
+    bus := spi_bus()
+    tx := channel(0)
+    rx := channel(1)
+    unsafe {
+        LANES[1].period = 40
+    }
+    buffer: [24]u8 = [0; 24]
+    {
+        dma := bus.dma_at(SPI_DATA, &mut tx, &mut rx, &mut buffer)!
+        dma.start_transfer(24)!
+        // The receive channel never catches up with the frames: abort it
+        // by hand once the transmitter is done, as finish would wait.
+        for _ in 0..2000 {
+            step()
+        }
+        unsafe {
+            core.assert(SPI_OVERRUN)
+        }
+    }
+}
+
+fn a_lost_reply_is_reported_once() {
+    reset_world()
+    bus := spi_bus()
+    tx := channel(0)
+    rx := channel(1)
+    buffer: [8]u8 = [0; 8]
+    dma := bus.dma_at(SPI_DATA, &mut tx, &mut rx, &mut buffer)!
+    dma.start_transfer(8)!
+    // The controller flags a reply lost to a full receive FIFO.
+    unsafe {
+        SPI_OVERRUN = true
+    }
+    expect_error(dma.finish(), hal.Error.Overrun)
+    dma.transfer(8)!
+}
+
+fn spi_sessions_check_their_setup() {
+    reset_world()
+    bus := spi_bus()
+    tx := channel(0)
+    rx := channel(1)
+    empty: [0]u8 = []
+    match bus.dma_at(SPI_DATA, &mut tx, &mut rx, &mut empty) {
+        ok(dma) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    bus.set_frame_bits(12)!
+    buffer: [4]u8 = [0; 4]
+    match bus.dma_at(SPI_DATA, &mut tx, &mut rx, &mut buffer) {
+        ok(dma) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Unsupported)
+        }
+    }
+}
+
+// --- The UART by DMA ---------------------------------------------------
+
+fn uart() -> pl011.Controller<UartView> {
+    return pl011.Controller.new(UartView {}, pl011.divisors(125_000_000, 115_200)!)
+}
+
+fn line() -> &[u8] from(static) {
+    unsafe {
+        return &UART_LINE[..UART_LINE_COUNT]
+    }
+}
+
+fn uart_input_waits_in_the_ring() {
+    reset_world()
+    port := uart()
+    rx := channel(0)
+    tx := channel(1)
+    ring: [256]u8 = [0; 256]
+    output: [16]u8 = [0; 16]
+    {
+        serial := port.dma_at(UART_DATA, &mut rx, &mut ring, &mut tx, &mut output)!
+        // The ring is the largest aligned block within the buffer.
+        core.assert(serial.ring_size() >= 64 && serial.ring_size() <= 256)
+        size := serial.ring_size()
+        unsafe {
+            core.assert(UART_DMA == 3)
+        }
+        buffer: [8]u8 = [0; 8]
+        got := serial.poll_read(&mut buffer)!
+        core.assert(got.transferred == 0)
+        // Far more than the FIFO's 32 bytes arrive while the program is
+        // away, and none is lost.
+        message: [60]u8 = [0; 60]
+        for index in 0..60usize {
+            message[index] = 100 + index as u8
+        }
+        arrive(&message)
+        settle_world(10)
+        core.assert(serial.available() == 60)
+        received: [64]u8 = [0; 64]
+        count := serial.read(&mut received)!
+        core.assert(count == 60)
+        for index in 0..60usize {
+            core.assert(received[index] == 100 + index as u8)
+        }
+        core.assert(serial.available() == 0)
+        // Round the ring several times in small reads.
+        total := 0usize
+        for round in 0..10usize {
+            chunk: [40]u8 = [0; 40]
+            for index in 0..40usize {
+                chunk[index] = ((round * 40 + index) % 256) as u8
+            }
+            arrive(&chunk)
+            for _ in 0..4usize {
+                part: [10]u8 = [0; 10]
+                count = serial.read(&mut part)!
+                core.assert(count == 10)
+                for index in 0..10usize {
+                    core.assert(part[index] == ((total + index) % 256) as u8)
+                }
+                total += 10
+            }
+        }
+        // More than the ring holds, unread: the next read reports it.
+        flood: [200]u8 = [0; 200]
+        arrive(&flood)
+        arrive(&flood)
+        if size <= 256 {
+            match serial.poll_read(&mut buffer) {
+                ok(progress) => {
+                    core.assert(false)
+                }
+                err(error) => {
+                    core.assert(error.code == pl011.OVERRUN)
+                    core.assert(error.transferred == 0)
+                }
+            }
+        }
+        // And reading carries on with what arrives next.
+        arrive(mem.str_bytes("ok"))
+        count = serial.read(&mut buffer)!
+        core.assert(count == 2 && buffer[0] == 111 && buffer[1] == 107)
+    }
+    unsafe {
+        core.assert(LANES[0].aborts == 1)
+        core.assert(UART_DMA == 0)
+    }
+}
+
+fn uart_errors_follow_the_bytes() {
+    reset_world()
+    port := uart()
+    port.set_crlf(true)
+    rx := channel(0)
+    tx := channel(1)
+    ring: [128]u8 = [0; 128]
+    output: [16]u8 = [0; 16]
+    serial := port.dma_at(UART_DATA, &mut rx, &mut ring, &mut tx, &mut output)!
+    // Enter arrives as CR or CR LF; both read as one LF.
+    arrive(mem.str_bytes("a\rb\r\nc"))
+    buffer: [16]u8 = [0; 16]
+    count := serial.read(&mut buffer)!
+    core.assert(count == 5)
+    core.assert(buffer[0] == 97 && buffer[1] == 10 && buffer[2] == 98 && buffer[3] == 10 && buffer[4] == 99)
+    // A framing error latched in RIS is reported after the good bytes.
+    arrive(mem.str_bytes("xy"))
+    unsafe {
+        UART_RAW |= 1 << 7
+    }
+    match serial.read(&mut buffer) {
+        ok(count) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error.kind == io.ErrorKind.Other)
+            core.assert(error.code == pl011.FRAMING_ERROR)
+            core.assert(error.transferred == 2)
+        }
+    }
+    unsafe {
+        core.assert(UART_RAW == 0)
+    }
+}
+
+fn uart_receive_runs_restart() {
+    reset_world()
+    port := uart()
+    rx := TestChannel { index: 0, max: 50 }
+    tx := channel(1)
+    ring: [128]u8 = [0; 128]
+    output: [16]u8 = [0; 16]
+    serial := port.dma_at(UART_DATA, &mut rx, &mut ring, &mut tx, &mut output)!
+    // Transfers of 50 bytes: the port starts the next where the last ended
+    // once it has read it, while the FIFO holds what arrives meanwhile.
+    expected := 0usize
+    for round in 0..8usize {
+        chunk: [30]u8 = [0; 30]
+        for index in 0..30usize {
+            chunk[index] = ((round * 30 + index) % 256) as u8
+        }
+        arrive(&chunk)
+        got := 0usize
+        for got < 30 {
+            part: [7]u8 = [0; 7]
+            count := serial.read(&mut part)!
+            for index in 0..count {
+                core.assert(part[index] == ((expected + got + index) % 256) as u8)
+            }
+            got += count
+        }
+        expected += 30
+    }
+    unsafe {
+        core.assert(LANES[0].starts >= 4)
+    }
+}
+
+fn uart_writes_go_out_in_the_background() {
+    reset_world()
+    port := uart()
+    port.set_crlf(true)
+    rx := channel(0)
+    tx := channel(1)
+    ring: [128]u8 = [0; 128]
+    output: [8]u8 = [0; 8]
+    // A channel slow enough that a chunk is still going out when the
+    // program comes back.
+    unsafe {
+        LANES[1].period = 20
+    }
+    {
+        serial := port.dma_at(UART_DATA, &mut rx, &mut ring, &mut tx, &mut output)!
+        // A write returns once its last chunk is on its way.
+        written := serial.write(mem.str_bytes("hello\nworld, at length\n"))!
+        core.assert(written == 23)
+        unsafe {
+            core.assert(LANES[1].starts == 4)
+        }
+        // A second write waits only for the chunk before it.
+        progress := serial.poll_write(mem.str_bytes("!"))!
+        core.assert(progress.transferred == 0)
+        serial.flush()!
+        progress = serial.poll_write(mem.str_bytes("!"))!
+        core.assert(progress.transferred == 1)
+        serial.flush()!
+    }
+    expected := mem.str_bytes("hello\r\nworld, at length\r\n!")
+    core.assert(line().len == expected.len)
+    for index in 0..expected.len {
+        core.assert(line()[index] == expected[index])
+    }
+}
+
+fn uart_sessions_check_their_buffers() {
+    reset_world()
+    port := uart()
+    rx := channel(0)
+    tx := channel(1)
+    small: [31]u8 = [0; 31]
+    output: [8]u8 = [0; 8]
+    match port.dma_at(UART_DATA, &mut rx, &mut small, &mut tx, &mut output) {
+        ok(serial) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    ring: [64]u8 = [0; 64]
+    empty: [0]u8 = []
+    match port.dma_at(UART_DATA, &mut rx, &mut ring, &mut tx, &mut empty) {
+        ok(serial) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+}
+
+fn main() {
+    requests_follow_the_datasheets()
+    rp2040_channels_are_programmed_and_triggered()
+    rp2350_fields_sit_higher()
+    bad_transfers_are_refused()
+    aborts_keep_the_interrupt_quiet()
+    spi_transfers_move_the_buffer()
+    spi_writes_leave_the_buffer_alone()
+    dropping_a_running_spi_transfer_aborts_it()
+    a_held_up_receiver_is_an_overrun()
+    a_lost_reply_is_reported_once()
+    spi_sessions_check_their_setup()
+    uart_input_waits_in_the_ring()
+    uart_errors_follow_the_bytes()
+    uart_receive_runs_restart()
+    uart_writes_go_out_in_the_background()
+    uart_sessions_check_their_buffers()
+}

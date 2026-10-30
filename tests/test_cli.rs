@@ -43,6 +43,22 @@ fn text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     )
 }
+#[cfg(unix)]
+// Runs a freshly copied executable. On Linux a process another test thread
+// forks at the same moment can briefly hold the copy open for writing, and
+// running it then fails with "Text file busy" until that process execs.
+fn run_copied(command: &mut Command) -> Output {
+    for _ in 0..50 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            result => return result.unwrap(),
+        }
+    }
+    command.output().unwrap()
+}
+
 fn success(output: &Output) {
     assert!(output.status.success(), "{}", text(output));
 }
@@ -678,11 +694,11 @@ fn test_sources_link_once_and_relocated_compilers_embed_the_runtime() {
     );
     let compiler = w.0.join("relocated-dodo");
     fs::copy(env!("CARGO_BIN_EXE_dodo"), &compiler).unwrap();
-    let output = Command::new(compiler)
-        .current_dir(&w.0)
-        .args(["test", "--link-arg", "helpers.c"])
-        .output()
-        .unwrap();
+    let output = run_copied(Command::new(compiler).current_dir(&w.0).args([
+        "test",
+        "--link-arg",
+        "helpers.c",
+    ]));
     success(&output);
 }
 

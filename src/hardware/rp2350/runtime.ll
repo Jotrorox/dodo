@@ -17,13 +17,16 @@
 ;   .picobin_block The IMAGE_DEF block the boot ROM requires (RP2350
 ;                  datasheet 5.9.5, minimum viable image metadata).
 ;   Reset_Handler  Clears the stack limit, points VTOR at the vector table,
-;                  enables the FPU, copies .data from flash, zeroes .bss, and
-;                  calls `main`.
+;                  enables the FPU and the double-precision coprocessor,
+;                  copies .data from flash, zeroes .bss, and calls `main`.
 ;   dodo_rp2350_rom_call
 ;                  Calls a boot ROM function by its two-letter code, for
 ;                  example reboot ('RB') to restart into the USB bootloader.
 ;   USBCTRL_IRQ    Calls dodo_usb_interrupt if the program defines it:
 ;                  std/embedded/chip/rp_usb does, for the USB serial port.
+;   DMA_IRQ_0      Calls dodo_dma_interrupt if the program defines it:
+;                  std/embedded/chip/rp_dma does, to raise the signals of
+;                  finished DMA channels.
 ;   dodo_board_panic
 ;                  The panic hook: masks interrupts, passes its arguments to
 ;                  dodo_panic_report if the program defines it, and halts.
@@ -98,8 +101,9 @@ module asm "    ldr r0, =__vector_table"
 module asm "    ldr r1, =0xe000ed08"                    ; VTOR
 module asm "    str r0, [r1]"
 module asm "    ldr r0, =0xe000ed88"                    ; CPACR: full access to
-module asm "    ldr r1, [r0]"                           ; CP10 and CP11, the FPU
-module asm "    orr r1, r1, #0x00f00000"
+module asm "    ldr r1, [r0]"                           ; CP10 and CP11, the FPU,
+module asm "    orr r1, r1, #0x00f00000"                ; and CP4, the
+module asm "    orr r1, r1, #0x00000300"                ; double coprocessor
 module asm "    str r1, [r0]"
 module asm "    dsb"
 module asm "    isb"
@@ -144,6 +148,21 @@ module asm "    cmp r0, #0"
 module asm "    bne 1f"
 module asm "    ldr r0, =DefaultHandler"
 module asm "1:  bx r0"                                  ; lr still holds EXC_RETURN
+module asm "    .ltorg"
+
+; DMA_IRQ_0 does the same with dodo_dma_interrupt, which
+; std/embedded/chip/rp_dma defines to raise the signals of finished
+; channels.
+module asm ".section .text.DMA_IRQ_0, \22ax\22, %progbits"
+module asm ".weak dodo_dma_interrupt"
+module asm ".type DMA_IRQ_0, %function"
+module asm ".thumb_func"
+module asm "DMA_IRQ_0:"
+module asm "    ldr r0, =dodo_dma_interrupt"
+module asm "    cmp r0, #0"
+module asm "    bne 1f"
+module asm "    ldr r0, =DefaultHandler"
+module asm "1:  bx r0"
 module asm "    .ltorg"
 
 ; A weak reference: without a definition the linker makes it 0, and a
@@ -223,7 +242,6 @@ module asm ".thumb_set TIMER1_IRQ_2, DefaultHandler"
 module asm ".thumb_set TIMER1_IRQ_3, DefaultHandler"
 module asm ".thumb_set PWM_IRQ_WRAP_0, DefaultHandler"
 module asm ".thumb_set PWM_IRQ_WRAP_1, DefaultHandler"
-module asm ".thumb_set DMA_IRQ_0, DefaultHandler"
 module asm ".thumb_set DMA_IRQ_1, DefaultHandler"
 module asm ".thumb_set DMA_IRQ_2, DefaultHandler"
 module asm ".thumb_set DMA_IRQ_3, DefaultHandler"
