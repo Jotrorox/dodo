@@ -19,6 +19,21 @@
   memory to build at `-O 2` and needed about 10 MB of stack at `-O 0`. Root
   package public functions now pass such records through memory like other
   Dodo functions.
+- A cryptography package. `std/crypto/random` reads the operating system's
+  CSPRNG (`getrandom`, `SecRandomCopyBytes`, `BCryptGenRandom`) with no
+  user-space generator or fallback. It fills buffers, draws unbiased values
+  below a bound, and provides `SystemRandom`, a source for
+  `hash.obtain_key`. `std/crypto/openssl` wraps OpenSSL 3.5+ libcrypto:
+  incremental SHA-1 and SHA-256, HMAC-SHA256 with constant-time `verify`,
+  AES-128-CFB8 encryptors and decryptors for streams split at any byte, and
+  RSA key generation with PKCS#1 v1.5 encryption and decryption (OpenSSL's
+  implicit rejection on) plus SubjectPublicKeyInfo DER export and import.
+  `std/crypto` holds the shared error type, constant-time `equal` and
+  `wipe`, and stays portable. Entropy-only programs link no OpenSSL, and the
+  libcrypto backend links no libssl. Published FIPS, RFC 4231 and NIST
+  vectors, plus RSA exchanges in both directions with the `openssl` command,
+  check it at `-O0` and `-O3`.
+- Native adapter areas may be nested, as in `std/crypto/openssl/native`.
 - `forbid-unsafe = true` in a manifest's `[project]` table rejects every
   `unsafe` keyword in the project's own sources, including imported local
   packages and `dodo test` documentation examples. The standard library and
