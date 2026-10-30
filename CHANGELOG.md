@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- QUIC connections and streams, through OpenSSL 3.5's QUIC stack:
+  `std/quic/openssl` binds a `Listener` on a UDP socket and connects a
+  verified `Connection` to it, each opening and accepting bidirectional and
+  unidirectional streams that send, receive, conclude with FIN, and reset
+  with an application code. Every call is nonblocking; `wait` sleeps until a
+  datagram or the next protocol timer, and `timeout_ms` hands that timer to
+  another poller. Connections require ALPN, verify the server's hostname or
+  IP, support mutual authentication and an idle timeout, and close with an
+  application code that the peer reads from `close_info`. Streams also
+  implement the `std/io` polling contract. The portable `std/quic` package
+  holds the error and state types, and compiles for freestanding targets.
+
 - `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
   (DCP), with no change to programs: division takes about 90 cycles instead
   of 1300, addition about 45 instead of 260, multiplication about 60 instead

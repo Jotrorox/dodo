@@ -573,11 +573,16 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 }
                 if target.contains("-windows-") {
                     linker.args(["-lkernel32", "-lshell32"]);
-                    if native.iter().any(|(name, _)| name.starts_with("std/net/")) {
+                    if native.iter().any(|(name, _)| {
+                        name.starts_with("std/net/") || name.starts_with("std/quic/")
+                    }) {
                         linker.arg("-lws2_32");
                     }
                 }
-                if native.iter().any(|(name, _)| name.starts_with("std/tls/")) {
+                if native
+                    .iter()
+                    .any(|(name, _)| name.starts_with("std/tls/") || name.starts_with("std/quic/"))
+                {
                     if apple {
                         homebrew_openssl(&mut linker);
                     }

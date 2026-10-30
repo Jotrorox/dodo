@@ -849,7 +849,7 @@ examples, byte-fragmented chunks, HEAD, 404, malformed framing and disconnects.
 Wine executes Windows x64 HTTP peers and real Windows symlink fixtures at O0/O3.
 Native Windows filesystem/sharing behavior still merits verification.
 
-HTTP/2, HTTP/3/QUIC, WebSockets, cookies, multipart, compression and serialization
+HTTP/2, HTTP/3, WebSockets, cookies, multipart, compression and serialization
 integrations are separate extension work. HTTPS uses an independently supplied
 [TLS transport](tls.md); HTTP types and routing never select it implicitly.
 
