@@ -82,14 +82,23 @@ import "core/ptr"
 //                                  chips may hand out alarms that are
 //                                  std/embedded/executor clocks, as the
 //                                  RP2040 and RP2350 do with alarm(n)
+//    Board.usb                     serial() -> port!Error, a USB serial
+//                                  port on the board's USB connector with
+//                                  the serial port protocols (Busy if one
+//                                  is open), and release_serial(port)
+//    Board.dma                     chips with DMA hand out channels with
+//                                  the DmaChannel protocol, as the RP2040
+//                                  and RP2350 do with channel() and
+//                                  release(channel)
 //    I2C_SDA_PIN, I2C_SCL_PIN      the board's usual I2C pins
 //    SPI_CLOCK_PIN, SPI_TX_PIN,    the board's usual SPI pins, and a free
 //    SPI_RX_PIN, SPI_SELECT_PIN    pin for one device's chip select
 //    UART_TX_PIN, UART_RX_PIN      the board's usual serial port pins
 //    reboot_to_bootloader()        restart into the board's flashing mode
 //    report_panic(check, file,     unsafe; write a panic hook's failure to
-//                 line, column)    the serial ports, which the default hook
-//                                  also does before it halts
+//                 line, column)    the serial ports and the USB serial
+//                                  port, which the default hook also does
+//                                  before it halts
 
 // Bus and device failures shared by every driver and chip implementation.
 // A single payload-free enum keeps drivers composable and comparable with ==.
@@ -192,6 +201,85 @@ pub interface AnalogInput {
 pub interface Registers {
     fn read(&mut self, offset: usize) -> u32
     fn write(&mut self, offset: usize, value: u32)
+}
+
+// The size of each element a DMA transfer moves.
+pub enum DmaWidth {
+    Byte,
+    HalfWord,
+    Word
+}
+
+// What paces a DMA transfer.
+pub enum DmaPace {
+    // Nothing: the channel moves elements as fast as the bus allows, as
+    // for a copy between two buffers.
+    Unpaced,
+    // The peripheral register the transfer writes to: an element moves
+    // whenever the peripheral has room, such as a UART's transmit FIFO.
+    Destination,
+    // The peripheral register the transfer reads from: an element moves
+    // whenever the peripheral has one, such as a UART's receive FIFO.
+    Source
+}
+
+// An address that wraps around a ring of `1 << bits` bytes, aligned to its
+// size, instead of running on: a receiver keeps writing into the same
+// buffer, or a transmitter keeps reading from it.
+pub enum DmaRing {
+    None,
+    Source(u32),
+    Destination(u32)
+}
+
+// One DMA transfer: `count` elements of `width` from `source` to
+// `destination`. An address that increments advances by one element after
+// each; one that does not stays on a peripheral register.
+pub struct DmaTransfer {
+    pub source: usize
+    pub destination: usize
+    pub count: u32
+    pub width: DmaWidth
+    pub increment_source: bool
+    pub increment_destination: bool
+    pub pace: DmaPace
+    pub ring: DmaRing
+}
+
+// The address of `bytes`' first byte, for a DMA transfer's source or
+// destination. Taking it is safe; the channel's start is the unsafe step.
+pub fn address_of(bytes: &[u8]) -> usize {
+    // SAFETY: the pointer becomes a number and is never dereferenced here.
+    unsafe {
+        return ptr.as_ptr(bytes) as usize
+    }
+}
+
+// A DMA channel: moves data between memory and peripherals while the
+// processor does other work. Peripheral drivers start transfers through it
+// and chip packages implement it, so drivers that use DMA name no chip.
+// Drivers keep their buffers borrowed until the transfer is done or
+// aborted, as starting one is unsafe; applications use their safe methods.
+pub interface DmaChannel {
+    // Start `transfer`. InvalidInput if the channel cannot pace by the
+    // peripheral named, wrap a ring of that size, or move that many
+    // elements; Busy if a transfer is still running.
+    // SAFETY: the memory the transfer reads and writes must stay valid,
+    // and nothing else may access the memory it writes, until it is done or
+    // aborted.
+    unsafe fn start(&mut self, transfer: DmaTransfer) -> void!Error
+    // True while a transfer is running.
+    fn is_busy(&mut self) -> bool
+    // The elements the running transfer has yet to move: 0 once it is done.
+    fn remaining(&mut self) -> u32
+    // The largest count a transfer may have.
+    fn max_count(&mut self) -> u32
+    // Stop the running transfer, if any, and wait until the channel no
+    // longer touches memory.
+    fn abort(&mut self)
+    // Bus if a transfer since the last call hit a bus error, such as an
+    // address with nothing behind it, which stops it.
+    fn take_error(&mut self) -> void!Error
 }
 
 // Common I2C bus frequencies: standard mode, fast mode, and fast mode plus.

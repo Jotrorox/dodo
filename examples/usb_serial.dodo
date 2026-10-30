@@ -1,0 +1,73 @@
+package main
+
+import "core/bytes"
+import "std/embedded/board"
+import "std/fmt"
+import "std/io"
+
+// A command line over the board's own USB cable: no adapter, no wiring.
+// The board is a USB serial port, /dev/ttyACM0 on Linux, /dev/cu.usbmodem...
+// on macOS, or a COM port on Windows. Flash it once from BOOTSEL mode, then
+// open a terminal (the baud rate does not matter over USB):
+//
+//     dodo run examples/usb_serial.dodo --board pico
+//     picocom /dev/ttyACM0
+//
+// (or --board pico2 or pico2_w; `screen /dev/cu.usbmodem*` on macOS).
+// Type `help` and press Enter. While the port is open, `dodo run` restarts
+// the board into its bootloader by itself, so BOOTSEL is no longer needed.
+// `panic` makes a check fail on purpose: the report appears in the
+// terminal, and `dodo run` still works afterwards.
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    // Printing before a terminal is open is fine: the start of the output
+    // waits for it.
+    fmt.printf(&mut serial, "\n{} ready over USB; type help.\n", board.NAME)!
+    line: [64]u8 = [0; 64]
+    for {
+        fmt.printf(&mut serial, "> ")!
+        count := read_line(&mut serial, &mut line)!
+        command := &line[..count]
+        if bytes.equal(command, b"help") {
+            fmt.printf(&mut serial, "led     toggle the LED\nuptime  time since start\npanic   fail a check\n")!
+        } else if bytes.equal(command, b"led") {
+            b.led.toggle()
+            fmt.printf(&mut serial, "LED {}\n", b.led.is_high())!
+        } else if bytes.equal(command, b"uptime") {
+            milliseconds := b.timer.now_us() / 1000
+            fmt.printf(&mut serial, "{}.{:03} s\n", milliseconds / 1000, milliseconds % 1000)!
+        } else if bytes.equal(command, b"panic") {
+            // Past the end of the 64-byte line: an index bounds check fails.
+            fmt.printf(&mut serial, "{}\n", line[count + 60])!
+        } else if count != 0 {
+            fmt.printf(&mut serial, "unknown command; type help\n")!
+        }
+    }
+}
+
+// Read one line into `line`, without its newline, echoing it as it is
+// typed, since terminals do not show what they send. Backspace removes the
+// last character; bytes past the end of `line` are dropped. Returns the
+// line's length.
+fn read_line<S>(serial: &mut S, line: &mut[u8]) -> usize!io.Error {
+    count := 0usize
+    byte: [1]u8 = [0]
+    for {
+        serial.read(&mut byte)?
+        if byte[0] == 10 {
+            fmt.printf(serial, "\n")?
+            return ok(count)
+        } else if byte[0] == 8 || byte[0] == 127 {
+            if count > 0 {
+                count -= 1
+                // Back, blank out the character, and back again.
+                io.write_all(serial, b"\x08 \x08")?
+            }
+        } else if byte[0] >= 32 && byte[0] < 127 && count < line.len {
+            line[count] = byte[0]
+            count += 1
+            io.write_all(serial, &byte)?
+        }
+    }
+}

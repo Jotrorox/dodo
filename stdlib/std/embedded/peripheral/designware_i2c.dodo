@@ -16,7 +16,10 @@ import "std/embedded/hal"
 // 10-bit addresses, standard, fast, and fast-plus speeds (up to 1 MHz), and
 // transfers of any length, with the register FIFOs kept busy so bytes follow
 // each other without gaps. Every wait is bounded, so a device that holds
-// the clock low forever yields hal.Error.Timeout instead of a hang.
+// the clock low forever yields hal.Error.Timeout instead of a hang. A
+// transaction that fits the FIFO can also be queued with `start_write`,
+// `start_read`, or `start_write_read` and collected with `poll_finish`,
+// while the program does other work.
 //
 // Two things the controller cannot do. It has no way to send an address
 // without at least one data byte after it, so empty transfers are
@@ -102,9 +105,10 @@ const MASTER_ACTIVE: u32 = 1 << 5
 const NOT_ACKNOWLEDGED: u32 = 0b1_1111
 
 const SDA_TX_HOLD: u32 = 0xFFFF
-// COMP_PARAM_1: receive FIFO depth minus one (the transmit depth is in
-// bits 23:16). Zero when the integration leaves the parameter register out.
+// COMP_PARAM_1: the receive and transmit FIFO depths minus one. Zero when
+// the integration leaves the parameter register out.
 const RX_BUFFER_DEPTH: u32 = 0xFF << 8
+const TX_BUFFER_DEPTH: u32 = 0xFF << 16
 // Every DW_apb_i2c configuration has FIFOs at least this deep.
 const MINIMUM_DEPTH: usize = 2
 
@@ -223,14 +227,20 @@ pub struct Controller<R: hal.Registers>: hal.I2c {
     // Read commands that may be outstanding without overflowing the
     // receive FIFO.
     rx_depth: usize
+    // Commands the transmit FIFO holds.
+    tx_depth: usize
     // The address programmed in TAR, or NO_TARGET.
     target: u32
+    // A transaction from `start_write`, `start_read`, or `start_write_read`
+    // is in the FIFOs, and the bytes it reads.
+    queued: bool
+    reading: usize
 
     // Configure a controller fresh out of reset as the bus's only master,
     // using `timing` from the same clock that feeds it. It is enabled by the
     // first transaction.
     pub fn new(registers: R, timing: Timing) -> Controller<R> {
-        bus := Controller<R> { registers, timing, rx_depth: MINIMUM_DEPTH, target: NO_TARGET }
+        bus := Controller<R> { registers, timing, rx_depth: MINIMUM_DEPTH, tx_depth: MINIMUM_DEPTH, target: NO_TARGET, queued: false, reading: 0 }
         bus.registers.write(ENABLE, 0)
         bus.registers.write(CON, master_control())
         // Transfers poll the FIFO levels; no interrupts or DMA requests.
@@ -238,9 +248,14 @@ pub struct Controller<R: hal.Registers>: hal.I2c {
         bus.registers.write(TX_TL, 0)
         bus.registers.write(RX_TL, 0)
         bus.apply_timing()
-        depth := hal.decode(RX_BUFFER_DEPTH, bus.registers.read(COMP_PARAM_1)) as usize + 1
+        parameters := bus.registers.read(COMP_PARAM_1)
+        depth := hal.decode(RX_BUFFER_DEPTH, parameters) as usize + 1
         if depth > MINIMUM_DEPTH {
             bus.rx_depth = depth
+        }
+        depth = hal.decode(TX_BUFFER_DEPTH, parameters) as usize + 1
+        if depth > MINIMUM_DEPTH {
+            bus.tx_depth = depth
         }
         return bus
     }
@@ -321,6 +336,107 @@ pub struct Controller<R: hal.Registers>: hal.I2c {
         }
     }
 
+    // The most commands a queued transaction holds: bytes written plus
+    // bytes read, which the transmit FIFO must take at once (16 on the
+    // RP2040 and RP2350), with no more bytes read than the receive FIFO
+    // holds.
+    pub fn queue_depth(&self) -> usize {
+        return self.tx_depth
+    }
+
+    // Queue a whole transaction in the FIFOs and return at once, while the
+    // controller runs it: `bytes` to the device at `address`, then a STOP.
+    // `poll_finish` collects the outcome. A program does other work in
+    // the meantime, or a task returns Pending, woken by the controller's
+    // interrupt with `listen`. InvalidInput for an empty transfer, more
+    // than queue_depth() bytes, or an address above 0x7F; Busy while a
+    // queued transaction is unfinished.
+    pub fn start_write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        return self.queue(seven_bit(address)?, bytes, 0)
+    }
+
+    // Queue a read of `count` bytes, as for `start_write`; `poll_finish`
+    // hands them over.
+    pub fn start_read(&mut self, address: u8, count: usize) -> void!hal.Error {
+        none: [0]u8 = []
+        return self.queue(seven_bit(address)?, &none, count)
+    }
+
+    // Queue `bytes`, a repeated START, and a read of `count` bytes in one
+    // transaction, as `write_read` does, for `poll_finish` to complete.
+    // InvalidInput if both are empty or together more than queue_depth().
+    pub fn start_write_read(&mut self, address: u8, bytes: &[u8], count: usize) -> void!hal.Error {
+        return self.queue(seven_bit(address)?, bytes, count)
+    }
+
+    // True while a queued transaction is unfinished: until `poll_finish`
+    // has seen it end.
+    pub fn is_busy(&self) -> bool {
+        return self.queued
+    }
+
+    // Collect the queued transaction without waiting: false while the
+    // controller still runs it, true once it has ended, with the bytes
+    // read in buffer[..count]. Errors as for `write`, and then the
+    // transaction is over; InvalidInput if nothing is queued or `buffer`
+    // is shorter than the read. A transaction that never ends, because a
+    // device holds SCL low, stays unfinished: bound the wait with a timer
+    // and `cancel` it.
+    pub fn poll_finish(&mut self, buffer: &mut[u8]) -> bool!hal.Error {
+        if !self.queued {
+            return err(hal.Error.InvalidInput)
+        }
+        raw := self.registers.read(RAW_INTR_STAT)
+        if (raw & TX_ABORT) != 0 {
+            self.queued = false
+            self.aborted()?
+            return ok(true)
+        }
+        if (raw & STOP_DETECTED) == 0 {
+            return ok(false)
+        }
+        self.registers.read(CLR_STOP_DET)
+        self.queued = false
+        short := buffer.len < self.reading
+        for index in 0..self.reading {
+            byte := (self.registers.read(DATA_CMD) & 0xFF) as u8
+            if index < buffer.len {
+                buffer[index] = byte
+            }
+        }
+        if short {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(true)
+    }
+
+    // Abort the queued transaction, if any, and disable the controller,
+    // as a stuck transfer does.
+    pub fn cancel(&mut self) {
+        if self.queued {
+            self.queued = false
+            // Timeout is what a stuck transfer reports; here it is wanted.
+            match self.stuck() {
+                ok() => {}
+                err(_) => {}
+            }
+        }
+    }
+
+    // Raise the controller's interrupt (I2C0_IRQ or I2C1_IRQ on the RP2040
+    // and RP2350) when a transaction ends, with a STOP or an abort, so a
+    // task can wait for `poll_finish` to complete it. The condition lasts
+    // until poll_finish has seen the end, so a handler masks the interrupt
+    // in the NVIC and raises a signal, and the task enables it again.
+    pub fn listen(&mut self) {
+        self.registers.write(INTR_MASK, STOP_DETECTED | TX_ABORT)
+    }
+
+    // Stop raising the interrupt.
+    pub fn ignore(&mut self) {
+        self.registers.write(INTR_MASK, 0)
+    }
+
     // Disable the controller and give back its registers.
     pub fn release(self) -> R {
         // A stuck controller is given back as it is.
@@ -328,8 +444,38 @@ pub struct Controller<R: hal.Registers>: hal.I2c {
             ok() => {}
             err(_) => {}
         }
-        let Controller { registers, timing, rx_depth, target } = self
+        let Controller { registers, timing, rx_depth, tx_depth, target, queued, reading } = self
         return registers
+    }
+
+    // Queue a transaction of `bytes` and then `count` reads, all of whose
+    // commands the transmit FIFO takes at once.
+    fn queue(&mut self, target: u32, bytes: &[u8], count: usize) -> void!hal.Error {
+        total := bytes.len + count
+        if total == 0 || total > self.tx_depth || count > self.rx_depth {
+            return err(hal.Error.InvalidInput)
+        }
+        self.start(target)?
+        for index in 0..bytes.len {
+            command := bytes[index] as u32
+            if index + 1 == total {
+                command |= STOP
+            }
+            self.registers.write(DATA_CMD, command)
+        }
+        for index in 0..count {
+            command := READ
+            if index == 0 && bytes.len != 0 {
+                command |= RESTART
+            }
+            if bytes.len + index + 1 == total {
+                command |= STOP
+            }
+            self.registers.write(DATA_CMD, command)
+        }
+        self.queued = true
+        self.reading = count
+        return ok()
     }
 
     fn write_to(&mut self, target: u32, bytes: &[u8]) -> void!hal.Error {
@@ -372,6 +518,9 @@ pub struct Controller<R: hal.Registers>: hal.I2c {
     // what the last transaction left behind. TAR and CON can change only
     // while the controller is disabled.
     fn start(&mut self, target: u32) -> void!hal.Error {
+        if self.queued {
+            return err(hal.Error.Busy)
+        }
         if self.target != target {
             self.disable()?
             control := master_control()
@@ -789,6 +938,46 @@ pub struct Bus: hal.I2c {
     // Whether a device acknowledges `address`, from a one-byte read.
     pub fn probe(&mut self, address: u8) -> bool!hal.Error {
         return self.controller.probe(address)
+    }
+
+    // Transactions queued in the FIFOs, for programs that do other work
+    // meanwhile; see Controller.start_write.
+    pub fn queue_depth(&self) -> usize {
+        return self.controller.queue_depth()
+    }
+
+    pub fn start_write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        return self.controller.start_write(address, bytes)
+    }
+
+    pub fn start_read(&mut self, address: u8, count: usize) -> void!hal.Error {
+        return self.controller.start_read(address, count)
+    }
+
+    pub fn start_write_read(&mut self, address: u8, bytes: &[u8], count: usize) -> void!hal.Error {
+        return self.controller.start_write_read(address, bytes, count)
+    }
+
+    pub fn is_busy(&self) -> bool {
+        return self.controller.is_busy()
+    }
+
+    pub fn poll_finish(&mut self, buffer: &mut[u8]) -> bool!hal.Error {
+        return self.controller.poll_finish(buffer)
+    }
+
+    pub fn cancel(&mut self) {
+        self.controller.cancel()
+    }
+
+    // Raise the bus's interrupt when a queued transaction ends; see
+    // Controller.listen.
+    pub fn listen(&mut self) {
+        self.controller.listen()
+    }
+
+    pub fn ignore(&mut self) {
+        self.controller.ignore()
     }
 
     // The SCL frequency, in hertz.

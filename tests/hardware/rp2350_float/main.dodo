@@ -1,0 +1,418 @@
+package main
+
+import "core/ptr"
+import "std/embedded/board"
+import "std/embedded/hal"
+import "std/math"
+
+// Hardware test of the RP2350 runtime's binary64 helpers, which run on the
+// double-precision coprocessor (src/hardware/rp2350/dcp.ll). Each helper
+// must give the same bits as the software helper it replaces, whose results
+// tests/soft_float.rs checks against IEEE 754 on the host. This runs both on
+// pseudo-random operands weighted toward the cases where the coprocessor
+// differs (subnormals, NaNs, infinities, results near underflow and
+// overflow), while SysTick interrupts preempt the coprocessor sequences and
+// use the coprocessor themselves. Then it counts the cycles per call of
+// each pair.
+//
+// Every outcome ends in the USB bootloader with a record in the last flash
+// sector that `scripts/test_rp2350_float.py` reads with picotool. Words:
+//
+//   [0] 0x600D_00nn  finished, nn helpers compared
+//       0xDEAD_llll  panicked at line llll; [1] = column
+//       0x5747_00nn  hung or faulted while comparing helper nn
+//   [1] mismatches in the main loop  [2] cases per helper
+//   [3] SysTick interrupts  [4] mismatches in the interrupt handler
+//   [5] the first mismatch's helper (0xFFFF_FFFF for none)
+//   [6] to [13] its operands, result, and the software result, as u64 pairs
+//   [16] to [33] cycles per call for each helper: software, coprocessor
+//   [48] to [63] after a panic: the end of the file's path, NUL-terminated
+
+const RECORD: usize = 0x2007_0000
+const FLASH_RECORD: u32 = 0x103F_F000
+const ROM_FLASH_OP: u32 = 0x4F46
+const FLASH_ERASE: u32 = 0x0_0101
+const FLASH_PROGRAM: u32 = 0x1_0101
+const WATCHDOG: usize = 0x400D_8000
+const SCRATCH: usize = WATCHDOG + 0x0C
+const RUNNING: u32 = 0x5747_0000
+const FILE_OFFSET: usize = 192
+const FILE_BYTES: usize = 64
+const SYST_CSR: usize = 0xE000_E010
+const SYST_RVR: usize = 0xE000_E014
+const SYST_CVR: usize = 0xE000_E018
+const DEMCR: usize = 0xE000_EDFC
+const DWT_CTRL: usize = 0xE000_1000
+const DWT_CYCCNT: usize = 0xE000_1004
+const CASES: u32 = 200_000
+const HELPERS: u32 = 9
+
+// The program-facing helpers (GNU names, which Dodo's code generator calls)
+// and the software ones from src/hardware/arm_float.ll.
+unsafe extern "C" fn __adddf3(a: u64, b: u64) -> u64
+unsafe extern "C" fn __subdf3(a: u64, b: u64) -> u64
+unsafe extern "C" fn __muldf3(a: u64, b: u64) -> u64
+unsafe extern "C" fn __divdf3(a: u64, b: u64) -> u64
+unsafe extern "C" fn __floatsidf(a: u32) -> u64
+unsafe extern "C" fn __floatunsidf(a: u32) -> u64
+unsafe extern "C" fn __fixdfsi(a: u64) -> u32
+unsafe extern "C" fn __fixunsdfsi(a: u64) -> u32
+unsafe extern "C" fn __truncdfsf2(a: u64) -> u32
+unsafe extern "C" fn dodo_soft_dadd(a: u64, b: u64) -> u64
+unsafe extern "C" fn dodo_soft_dsub(a: u64, b: u64) -> u64
+unsafe extern "C" fn dodo_soft_dmul(a: u64, b: u64) -> u64
+unsafe extern "C" fn dodo_soft_ddiv(a: u64, b: u64) -> u64
+unsafe extern "C" fn dodo_soft_i2d(a: u32) -> u64
+unsafe extern "C" fn dodo_soft_ui2d(a: u32) -> u64
+unsafe extern "C" fn dodo_soft_d2iz(a: u64) -> u32
+unsafe extern "C" fn dodo_soft_d2uiz(a: u64) -> u32
+unsafe extern "C" fn dodo_soft_d2f(a: u64) -> u32
+unsafe extern "C" fn dodo_rp2350_rom_call(code: u32, a0: u32, a1: u32, a2: u32, a3: u32) -> i32
+
+static mut INTERRUPTS: u32 = 0
+static mut INTERRUPT_MISMATCHES: u32 = 0
+static mut INTERRUPT_LEFT: [16]u64 = [0; 16]
+static mut INTERRUPT_RIGHT: [16]u64 = [0; 16]
+static mut INTERRUPT_PRODUCTS: [16]u64 = [0; 16]
+static mut INTERRUPT_QUOTIENTS: [16]u64 = [0; 16]
+
+fn store(address: usize, value: u32) {
+    // SAFETY: RECORD is SRAM this program never otherwise uses, and the
+    // watchdog scratch registers are free for software.
+    unsafe {
+        word: hal.Reg<u32> = hal.Reg.at(address)
+        word.write(value)
+    }
+}
+
+fn store64(address: usize, value: u64) {
+    store(address, (value & 0xFFFF_FFFF) as u32)
+    store(address + 4, (value >> 32) as u32)
+}
+
+fn load(address: usize) -> u32 {
+    unsafe {
+        word: hal.Reg<u32> = hal.Reg.at(address)
+        return word.read()
+    }
+}
+
+fn record(state: u32, detail: u32) {
+    store(RECORD, state)
+    store(RECORD + 4, detail)
+    store(SCRATCH, state)
+    store(SCRATCH + 4, detail)
+}
+
+// Write the 256-byte record page to flash and restart into the bootloader.
+fn report() {
+    unsafe {
+        dodo_rp2350_rom_call(ROM_FLASH_OP, FLASH_ERASE, FLASH_RECORD, 4096, 0)
+        dodo_rp2350_rom_call(ROM_FLASH_OP, FLASH_PROGRAM, FLASH_RECORD, 256, RECORD as u32)
+    }
+    board.reboot_to_bootloader()
+}
+
+extern "C" fn dodo_board_panic(check: *const u8, file: *const u8, line: u32, column: u32) {
+    store(SYST_CSR, 0)
+    record(0xDEAD_0000 | (line & 0xFFFF), column)
+    unsafe {
+        length := 0usize
+        for ptr.read(ptr.offset(file, length as isize)) != 0 && length < 1024 {
+            length += 1
+        }
+        start := 0usize
+        if length > FILE_BYTES - 1 {
+            start = length - (FILE_BYTES - 1)
+        }
+        for index in 0..FILE_BYTES {
+            byte: hal.Reg<u8> = hal.Reg.at(RECORD + FILE_OFFSET + index)
+            if start + index < length {
+                byte.write(ptr.read(ptr.offset(file, (start + index) as isize)))
+            } else {
+                byte.write(0)
+            }
+        }
+    }
+    report()
+}
+
+// xorshift64*, as in tests/soft_float.rs, so a failure reproduces.
+struct Rng {
+    state: u64
+
+    fn next(&mut self) -> u64 {
+        self.state ^= self.state >> 12
+        self.state ^= (self.state & 0x7F_FFFF_FFFF) << 25
+        self.state ^= self.state >> 27
+        return core.wrapping_mul(self.state, 0x2545_F491_4F6C_DD1Du64)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        return self.next() % n
+    }
+
+    // Bits of a binary float with `exp` exponent and `frac` fraction bits,
+    // weighted toward zeros, subnormals, infinities, NaNs, the overflow
+    // boundary and fractions with few set bits, where rounding ties live.
+    fn float(&mut self, exp: u64, frac: u64) -> u64 {
+        max := (1u64 << exp) - 1
+        mask := (1u64 << frac) - 1
+        sign := self.below(2) << (exp + frac)
+        e := 0u64
+        f := self.next() & mask
+        kind := self.below(9)
+        if kind == 0 {
+            return self.next() & (0xFFFF_FFFF_FFFF_FFFFu64 >> (63 - exp - frac))
+        } else if kind == 1 {
+            e = self.below(3)
+        } else if kind == 2 {
+            e = max - self.below(4)
+        } else if kind == 3 {
+            e = max * self.below(2)
+            fractions := [0u64, 1, mask]
+            f = fractions[self.below(3) as usize]
+        } else if kind == 4 {
+            e = (max >> 1) + self.below(130) - 65
+        } else if kind == 5 {
+            e = self.below(max + 1)
+            f = f & self.next() & self.next()
+        } else if kind == 6 {
+            e = self.below(max + 1)
+            fractions := [0u64, mask, 1, 1u64 << (frac - 1)]
+            f = fractions[self.below(4) as usize]
+        } else if kind == 7 {
+            e = (max >> 1) + self.below(64)
+            f = f & ~(mask >> self.below(frac + 1))
+        } else {
+            e = self.below(max + 1)
+        }
+        return sign | e << frac | f
+    }
+
+    // A second binary64 operand: often the first, its negation or a
+    // neighbour, for cancellation and exact results, or one that puts a
+    // product or quotient near the smallest normal or near overflow.
+    fn partner(&mut self, a: u64) -> u64 {
+        exponent := (a >> 52) & 0x7FF
+        rest := (self.below(2) << 63) | (self.next() & 0xF_FFFF_FFFF_FFFF)
+        kind := self.below(9)
+        if kind == 0 {
+            return a
+        } else if kind == 1 {
+            return a ^ 0x8000_0000_0000_0000
+        } else if kind == 2 {
+            return a ^ (self.next() & 0xF)
+        } else if kind == 3 {
+            return core.wrapping_add(a, self.below(4) << 52)
+        } else if kind == 4 {
+            return rest | (core.wrapping_sub(1023 + self.below(6), exponent) & 0x7FF) << 52
+        } else if kind == 5 {
+            return rest | (core.wrapping_sub(exponent + 1023, self.below(6)) & 0x7FF) << 52
+        } else if kind == 6 {
+            return rest | (core.wrapping_sub(3069 + self.below(6), exponent) & 0x7FF) << 52
+        }
+        return self.float(11, 52)
+    }
+
+    fn int(&mut self) -> u64 {
+        if self.below(4) == 0 {
+            edges := [0u64, 1, 0xFFFF_FFFF, 0x8000_0000, 0x7FFF_FFFF, 0x0100_0001]
+            return edges[self.below(6) as usize]
+        }
+        return self.next() >> (32 + self.below(32))
+    }
+
+    // Operands for timing: normal numbers of everyday size, integers that
+    // fit, rather than the edge cases.
+    fn ordinary(&mut self, helper: u32) -> (u64, u64) {
+        a := (self.below(2) << 63) | (1003 + self.below(40)) << 52 | (self.next() & 0xF_FFFF_FFFF_FFFF)
+        b := (self.below(2) << 63) | (1003 + self.below(40)) << 52 | (self.next() & 0xF_FFFF_FFFF_FFFF)
+        if helper == 4 || helper == 5 {
+            return (self.next() & 0xFFFF_FFFF, 0u64)
+        } else if helper == 6 || helper == 7 {
+            return ((1023 + self.below(31)) << 52 | (self.next() & 0xF_FFFF_FFFF_FFFF), 0u64)
+        }
+        return (a, b)
+    }
+
+    fn operands(&mut self, helper: u32) -> (u64, u64) {
+        if helper < 4 {
+            a := self.float(11, 52)
+            return (a, self.partner(a))
+        } else if helper < 6 {
+            return (self.int(), 0u64)
+        }
+        return (self.float(11, 52), 0u64)
+    }
+}
+
+// Arithmetic and u32 to f64 go through Dodo's own operators and `as`,
+// which call the helpers; the other conversions call them directly, since
+// `as` checks ranges (and a u32 operand would not fit an i32).
+fn coprocessor(helper: u32, a: u64, b: u64) -> u64 {
+    unsafe {
+        if helper == 0 {
+            return math.to_bits(math.from_bits(a) + math.from_bits(b))
+        } else if helper == 1 {
+            return math.to_bits(math.from_bits(a) - math.from_bits(b))
+        } else if helper == 2 {
+            return math.to_bits(math.from_bits(a) * math.from_bits(b))
+        } else if helper == 3 {
+            return math.to_bits(math.from_bits(a) / math.from_bits(b))
+        } else if helper == 4 {
+            return __floatsidf(a as u32)
+        } else if helper == 5 {
+            return math.to_bits((a as u32) as f64)
+        } else if helper == 6 {
+            return __fixdfsi(a) as u64
+        } else if helper == 7 {
+            return __fixunsdfsi(a) as u64
+        }
+        return __truncdfsf2(a) as u64
+    }
+}
+
+fn software(helper: u32, a: u64, b: u64) -> u64 {
+    unsafe {
+        if helper == 0 {
+            return dodo_soft_dadd(a, b)
+        } else if helper == 1 {
+            return dodo_soft_dsub(a, b)
+        } else if helper == 2 {
+            return dodo_soft_dmul(a, b)
+        } else if helper == 3 {
+            return dodo_soft_ddiv(a, b)
+        } else if helper == 4 {
+            return dodo_soft_i2d(a as u32)
+        } else if helper == 5 {
+            return dodo_soft_ui2d(a as u32)
+        } else if helper == 6 {
+            return dodo_soft_d2iz(a) as u64
+        } else if helper == 7 {
+            return dodo_soft_d2uiz(a) as u64
+        }
+        return dodo_soft_d2f(a) as u64
+    }
+}
+
+// Every 1999 cycles: a coprocessor multiply and divide of one of 16 operand
+// pairs, checked against the software results main() worked out first,
+// most likely in the middle of the main loop's own coprocessor sequence.
+extern "C" fn SysTick_Handler() {
+    unsafe {
+        index := (INTERRUPTS & 15) as usize
+        INTERRUPTS += 1
+        a := INTERRUPT_LEFT[index]
+        b := INTERRUPT_RIGHT[index]
+        if __muldf3(a, b) != INTERRUPT_PRODUCTS[index] || __divdf3(a, b) != INTERRUPT_QUOTIENTS[index] {
+            INTERRUPT_MISMATCHES += 1
+        }
+    }
+}
+
+// Cycles per call over 256 ordinary operand pairs, for the helper on the
+// coprocessor and in software, each timed on its second pass so that both
+// run from the flash cache. Both go through the same dispatch, so the difference is the
+// helpers'.
+fn cycles(rng: &mut Rng, helper: u32) -> (u32, u32) {
+    left: [256]u64 = [0; 256]
+    right: [256]u64 = [0; 256]
+    for index in 0..256 {
+        pair := rng.ordinary(helper)
+        left[index] = pair.0
+        right[index] = pair.1
+    }
+    sink := 0u64
+    hardware := 0u32
+    soft := 0u32
+    for _ in 0..2 {
+        start := load(DWT_CYCCNT)
+        for index in 0..256 {
+            sink ^= coprocessor(helper, left[index], right[index])
+        }
+        middle := load(DWT_CYCCNT)
+        for index in 0..256 {
+            sink ^= software(helper, left[index], right[index])
+        }
+        end := load(DWT_CYCCNT)
+        hardware = (middle - start) / 256
+        soft = (end - middle) / 256
+    }
+    store(RECORD + 252, (sink & 1) as u32)
+    return (soft, hardware)
+}
+
+fn main() {
+    // A previous run hung and the watchdog reset the chip: report it.
+    if (load(WATCHDOG + 0x08) & 1) != 0 && (load(SCRATCH) & 0xFFFF_0000) == RUNNING {
+        record(load(SCRATCH), load(SCRATCH + 4))
+        store(SCRATCH, 0)
+        report()
+    }
+    for word in 0..64usize {
+        store(RECORD + 4 * word, 0)
+    }
+    record(RUNNING, 0)
+    store(RECORD + 20, 0xFFFF_FFFF)
+    b := board.take()!
+    // Watchdog: reset everything but the oscillators after 3 s without a
+    // feed.
+    store(0x4001_8008, 0x1FF_FFF3)
+    store(WATCHDOG + 0x04, 3_000_000)
+    store(WATCHDOG, 1 << 30)
+
+    rng := Rng { state: 0x9E37_79B9_7F4A_7C15 }
+    for index in 0..16 {
+        pair := rng.operands(3)
+        unsafe {
+            INTERRUPT_LEFT[index] = pair.0
+            INTERRUPT_RIGHT[index] = pair.1
+            INTERRUPT_PRODUCTS[index] = dodo_soft_dmul(pair.0, pair.1)
+            INTERRUPT_QUOTIENTS[index] = dodo_soft_ddiv(pair.0, pair.1)
+        }
+    }
+    store(SYST_RVR, 1998)
+    store(SYST_CVR, 0)
+    store(SYST_CSR, 0b111)
+    mismatches := 0u32
+    for helper in 0..HELPERS {
+        record(RUNNING | helper, mismatches)
+        for count in 0..CASES {
+            if count % 4096 == 0 {
+                store(WATCHDOG + 0x04, 3_000_000)
+            }
+            pair := rng.operands(helper)
+            got := coprocessor(helper, pair.0, pair.1)
+            want := software(helper, pair.0, pair.1)
+            if got != want {
+                if mismatches == 0 {
+                    store(RECORD + 20, helper)
+                    store64(RECORD + 24, pair.0)
+                    store64(RECORD + 32, pair.1)
+                    store64(RECORD + 40, got)
+                    store64(RECORD + 48, want)
+                }
+                mismatches += 1
+            }
+        }
+    }
+    store(SYST_CSR, 0)
+    store(RECORD + 8, CASES)
+    unsafe {
+        store(RECORD + 12, INTERRUPTS)
+        store(RECORD + 16, INTERRUPT_MISMATCHES)
+    }
+
+    store(DEMCR, load(DEMCR) | (1 << 24))
+    store(DWT_CTRL, load(DWT_CTRL) | 1)
+    for helper in 0..HELPERS {
+        store(WATCHDOG + 0x04, 3_000_000)
+        pair := cycles(&mut rng, helper)
+        store(RECORD + 64 + 8 * helper as usize, pair.0)
+        store(RECORD + 68 + 8 * helper as usize, pair.1)
+    }
+    record(0x600D_0000 | HELPERS, mismatches)
+    b.timer.delay_ms(1)
+    report()
+}

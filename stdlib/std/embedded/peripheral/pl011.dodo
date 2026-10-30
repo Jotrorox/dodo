@@ -1,5 +1,6 @@
 package pl011
 
+import "core/cpu"
 import "std/embedded/hal"
 import "std/io"
 
@@ -23,6 +24,8 @@ import "std/io"
 // every 32 bytes' time (2.8 ms at 115200 baud) while data arrives, or bytes
 // are lost and a read reports OVERRUN; with hardware flow control, see
 // `set_flow_control`, the controller asks the other end to pause instead.
+// `Port.dma` lifts the limit: a `DmaPort` receives into a ring buffer by
+// DMA, and writes in the background.
 // `set_break` holds the line low, for protocols that signal with breaks.
 //
 // Waits are counted in status polls, not time. A write, `flush`, and the
@@ -44,6 +47,7 @@ const LCR_H: usize = 0x02C
 const CR: usize = 0x030
 const IFLS: usize = 0x034
 const IMSC: usize = 0x038
+const RIS: usize = 0x03C
 const MIS: usize = 0x040
 const ICR: usize = 0x044
 const DMACR: usize = 0x048
@@ -86,6 +90,12 @@ const FIFO_LEVELS: u32 = (0b011 << 3) | 0b010
 
 // ICR: every interrupt.
 const ALL_INTERRUPTS: u32 = 0x7FF
+// RIS and ICR: framing, parity, break, and overrun errors, in the order of
+// their codes below.
+const RECEIVE_ERRORS: u32 = 0xF << 7
+// DMACR: raise DMA requests for the receive and transmit FIFOs.
+const RX_DMA: u32 = 1 << 0
+const TX_DMA: u32 = 1 << 1
 
 // Interrupt sources, as bits of `listen`, `ignore`, `pending_interrupts`,
 // and `clear_interrupts`. The controller raises its one interrupt line
@@ -348,13 +358,15 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
     // stays low for longer than a frame, so keep it on for at least two
     // frame times (174 us at 115200 baud, 8N1); LIN and DMX, for example,
     // start their frames with breaks. Timeout if what was written does not
-    // get out.
+    // get out before a break starts.
     pub fn set_break(&mut self, on: bool) -> void!hal.Error {
-        self.settle()?
         line := self.format | FIFO_ENABLE
         if on {
             line |= SEND_BREAK
+            self.settle()?
         }
+        // The controller reports BUSY for as long as a break lasts, so
+        // ending one must not wait for idle.
         // Rewriting LCR_H latches the same divisor again, so a break may
         // start and end while the controller runs.
         self.registers.write(LCR_H, line)
@@ -475,6 +487,48 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
         return ok(io.Poll { transferred: count, state })
     }
 
+    // Receive into `ring` and send from `output` by DMA until the returned
+    // DmaPort is dropped; see DmaPort. `data` is the address of the
+    // controller's data register as the channels see it, which chip
+    // packages know; `Port.dma` passes it. InvalidInput if `ring` holds no
+    // aligned block of MIN_RING bytes or `output` is empty, or if a channel
+    // cannot serve this controller; Busy if a channel is still running.
+    pub fn dma_at(&mut self, data: usize, rx: &mut dyn hal.DmaChannel, ring: &mut[u8], tx: &mut dyn hal.DmaChannel, output: &mut[u8]) -> DmaPort!hal.Error from(self, rx, ring, tx, output) {
+        bits := ring_bits(hal.address_of(ring), ring.len)
+        if bits == 0 || output.len == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        if rx.is_busy() || tx.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        size := 1usize << bits as usize
+        start := (size - hal.address_of(ring) % size) % size
+        port := DmaPort {
+            registers: &mut self.registers,
+            data,
+            rx,
+            ring,
+            start,
+            bits,
+            run_count: 0,
+            run_offset: 0,
+            consumed: 0,
+            tx,
+            output,
+            sending: false,
+            poll_limit: self.poll_limit,
+            read_poll_limit: self.read_poll_limit,
+            crlf: self.crlf,
+            after_return: self.after_return,
+            feed_pending: self.feed_pending,
+        }
+        // Errors latched before the ring existed belong to no byte in it.
+        port.registers.write(ICR, RECEIVE_ERRORS)
+        port.receive()?
+        port.registers.write(DMACR, RX_DMA | TX_DMA)
+        return ok(port)
+    }
+
     // Wait until everything written is out, within the poll limit, disable
     // the controller, and give back its registers. Output still stuck after
     // the poll limit is dropped.
@@ -548,6 +602,375 @@ pub struct Controller<R: hal.Registers>: io.ReadWriter {
         self.registers.write(CR, control & ~ENABLE)
         self.configure()
         self.registers.write(CR, control)
+    }
+}
+
+// The smallest receive ring a DmaPort uses: the receive FIFO's size.
+pub const MIN_RING: usize = 32
+const MIN_RING_BITS: u32 = 5
+// The largest, 32 KiB, as DMA rings go.
+const MAX_RING_BITS: u32 = 15
+
+// The size, as a power of two, of the largest block aligned to its size
+// within `length` bytes at `address`, up to MAX_RING_BITS; 0 if none of
+// MIN_RING bytes fits.
+fn ring_bits(address: usize, length: usize) -> u32 {
+    bits := MAX_RING_BITS
+    for bits >= MIN_RING_BITS {
+        size := 1usize << bits as usize
+        start := (size - address % size) % size
+        if start <= length && length - start >= size {
+            return bits
+        }
+        bits -= 1
+    }
+    return 0
+}
+
+// A serial port that receives into a ring buffer and sends from an output
+// buffer by DMA, from `Port.dma(rx, ring, tx, output)`. It implements the
+// std/io Reader and Writer protocols like Port, with two differences:
+//
+// - Input is kept in the ring, not just the 32-byte FIFO, so the program
+//   reads at its own pace: a 1 KiB ring holds 89 ms of input at 115200
+//   baud. `rx` moves each byte into the ring as it arrives, round and
+//   round; bytes the program has not read when the ring comes round again
+//   are lost, and the next read reports OVERRUN.
+// - A write copies its bytes into `output` and returns once `tx` is
+//   sending them, waiting only while the previous write is still going
+//   out, so printing hardly ever waits for the line.
+//
+// The ring is the largest block within `ring` whose size is a power of two
+// and whose address is a multiple of its size, as the channel needs: a
+// static buffer with `@align(N)` and N bytes gives all N, any other buffer
+// at least a quarter of its length (`ring_size()` tells). Bytes with
+// framing or parity errors, and breaks, arrive in the ring like others;
+// a read reports the error, with the code bits of FRAMING_ERROR and the
+// rest, after the bytes it returns, without telling which byte it was.
+//
+// A task waits for input with the executor: `rx`'s signal is raised only
+// when its transfer ends, so poll on a ticker, or listen for
+// RX_TIMEOUT_INTERRUPT and RX_INTERRUPT as with a polled port. Dropping
+// the DmaPort stops both channels and hands the port back; input still in
+// the ring is lost and output not yet sent is cut short.
+pub struct DmaPort: io.ReadWriter {
+    registers: &mut dyn hal.Registers
+    data: usize
+    rx: &mut dyn hal.DmaChannel
+    ring: &mut[u8]
+    // The ring within `ring`: its first byte and its size as a power of
+    // two.
+    start: usize
+    bits: u32
+    // The running receive transfer: its count, the ring position it
+    // started at, and the bytes of it read so far.
+    run_count: u32
+    run_offset: usize
+    consumed: u32
+    tx: &mut dyn hal.DmaChannel
+    output: &mut[u8]
+    // A write's transfer started and not yet seen done.
+    sending: bool
+    poll_limit: u32
+    read_poll_limit: u32
+    crlf: bool
+    after_return: bool
+    feed_pending: bool
+
+    // The ring's size in bytes: how much input waits for the program.
+    pub fn ring_size(&self) -> usize {
+        return 1usize << self.bits as usize
+    }
+
+    // The bytes received and not yet read, up to the ring's size.
+    pub fn available(&mut self) -> usize {
+        waiting := core.wrapping_sub(self.received(), self.consumed) as usize
+        if waiting > self.ring_size() {
+            return self.ring_size()
+        }
+        return waiting
+    }
+
+    // Wait for the first byte, then return what has arrived, up to
+    // `buffer.len`; errors as for `poll_read`. The read poll limit bounds
+    // the wait as on Port.
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        polls := 0u32
+        for {
+            progress := self.poll_read(buffer)?
+            if progress.transferred != 0 || buffer.len == 0 {
+                return ok(progress.transferred)
+            }
+            polls += 1
+            if self.read_poll_limit != NO_POLL_LIMIT && polls >= self.read_poll_limit {
+                return err(io.failure(io.ErrorKind.TimedOut, 0))
+            }
+        }
+    }
+
+    // Return what the ring holds, up to `buffer.len`, without waiting:
+    // Pending, with nothing, while it is empty. An error has kind Other and
+    // the bits of FRAMING_ERROR, PARITY_ERROR, BREAK, and OVERRUN in its
+    // code, after the bytes before it in buffer[..transferred]; OVERRUN
+    // here means the ring came round over unread bytes, which are dropped.
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        written := self.received()
+        if core.wrapping_sub(written, self.consumed) as usize > self.ring_size() {
+            return self.overrun(0, written)
+        }
+        count := 0usize
+        mask := self.ring_size() - 1
+        cpu.fence()
+        for count < buffer.len && self.consumed != written {
+            position := self.start + (core.wrapping_add(self.run_offset, self.consumed as usize) & mask)
+            byte := self.ring[position]
+            self.consumed += 1
+            if self.crlf && self.after_return && byte == LINE_FEED {
+                self.after_return = false
+            } else {
+                self.after_return = self.crlf && byte == CARRIAGE_RETURN
+                if self.after_return {
+                    byte = LINE_FEED
+                }
+                buffer[count] = byte
+                count += 1
+            }
+        }
+        // The channel may have come round over the bytes while they were
+        // copied.
+        now := self.received()
+        if core.wrapping_sub(now, self.consumed) as usize > self.ring_size() {
+            return self.overrun(count, now)
+        }
+        if self.consumed == self.run_count && !self.rx.is_busy() {
+            self.restart()
+        }
+        errors := self.registers.read(RIS) & RECEIVE_ERRORS
+        if errors != 0 {
+            self.registers.write(ICR, errors)
+            self.after_return = false
+            return err(io.Error { kind: io.ErrorKind.Other, transferred: count, code: (errors >> 7) as i32 })
+        }
+        state := io.PollState.Ready
+        if count == 0 && buffer.len != 0 {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // Send `bytes`: copy them into the output buffer, chunk by chunk, each
+    // once the previous one has gone into the transmit FIFO, and return
+    // when the last chunk is on its way; `flush` waits until it has left.
+    // TimedOut, with the bytes handed over before it, if a chunk makes no
+    // progress for the poll limit.
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        sent := 0usize
+        for sent < bytes.len {
+            if !self.wait_output() {
+                return err(io.failure(io.ErrorKind.TimedOut, sent))
+            }
+            sent += self.send(&bytes[sent..])
+        }
+        return ok(bytes.len)
+    }
+
+    // Hand over as much of `bytes` as the output buffer takes if the
+    // previous write is out of it, without waiting; Pending, with what was
+    // handed over, otherwise.
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        count := 0usize
+        if !self.output_busy() && bytes.len != 0 {
+            count = self.send(bytes)
+        }
+        state := io.PollState.Ready
+        if count < bytes.len {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // Wait until everything written has left; TimedOut after the poll
+    // limit, as on Port.
+    pub fn flush(&mut self) -> void!io.Error {
+        if !self.wait_output() {
+            return err(io.failure(io.ErrorKind.TimedOut, 0))
+        }
+        polls := 0u64
+        budget := self.poll_limit as u64 * (FIFO_DEPTH as u64 + 1)
+        for (self.registers.read(FR) & BUSY) != 0 {
+            polls += 1
+            if self.poll_limit != NO_POLL_LIMIT && polls >= budget {
+                return err(io.failure(io.ErrorKind.TimedOut, 0))
+            }
+        }
+        return ok()
+    }
+
+    // Translate newlines, as Port.set_crlf does.
+    pub fn set_crlf(&mut self, on: bool) {
+        self.crlf = on
+        self.after_return = false
+        self.feed_pending = false
+    }
+
+    // Bound waits for output, and for a read's first byte, in polls, as
+    // on Port.
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.poll_limit = polls
+    }
+
+    pub fn set_read_poll_limit(&mut self, polls: u32) {
+        self.read_poll_limit = polls
+    }
+
+    // Interrupts, as on Port: with RX_TIMEOUT_INTERRUPT, a pause in the
+    // input raises the port's interrupt, so a task can wait for a message
+    // to end. Reading the ring does not end that condition; the channel
+    // emptying the FIFO does.
+    pub fn listen(&mut self, sources: u32) {
+        mask := self.registers.read(IMSC)
+        self.registers.write(IMSC, (mask | sources) & ALL_INTERRUPTS)
+    }
+
+    pub fn ignore(&mut self, sources: u32) {
+        mask := self.registers.read(IMSC)
+        self.registers.write(IMSC, mask & ~sources)
+    }
+
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.registers.read(MIS)
+    }
+
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.registers.write(ICR, sources & ALL_INTERRUPTS)
+    }
+
+    // Bytes the receive channel has written in its running transfer.
+    fn received(&mut self) -> u32 {
+        return core.wrapping_sub(self.run_count, self.rx.remaining())
+    }
+
+    // Start a receive transfer where the last one ended, as long as a
+    // transfer may be: at 921600 baud the RP2040's runs for 13 hours and
+    // the RP2350's for 48 minutes, after which the next read starts
+    // another while the FIFO holds what arrives meanwhile.
+    fn receive(&mut self) -> void!hal.Error {
+        count := self.rx.max_count()
+        transfer := hal.DmaTransfer {
+            source: self.data,
+            destination: hal.address_of(self.ring) + self.start + self.run_offset,
+            count,
+            width: hal.DmaWidth.Byte,
+            increment_source: false,
+            increment_destination: true,
+            pace: hal.DmaPace.Source,
+            ring: hal.DmaRing.Destination(self.bits),
+        }
+        // SAFETY: the ring stays borrowed by this port, which aborts the
+        // channel before it is dropped, and the port only reads the bytes
+        // the channel has written.
+        unsafe {
+            self.rx.start(transfer)?
+        }
+        self.run_count = count
+        self.consumed = 0
+        return ok()
+    }
+
+    // Start the next receive transfer once the running one has ended and
+    // been read; a bus error that ended it early drops the rest.
+    fn restart(&mut self) {
+        self.run_offset = core.wrapping_add(self.run_offset, self.consumed as usize) & (self.ring_size() - 1)
+        succeeded(self.rx.take_error())
+        // The channel was just found idle and serves this port.
+        succeeded(self.receive())
+    }
+
+    // Report lost input once, skipping to the newest byte, after `count`
+    // bytes read.
+    fn overrun(&mut self, count: usize, written: u32) -> io.Poll!io.Error {
+        self.consumed = written
+        self.after_return = false
+        self.registers.write(ICR, RECEIVE_ERRORS)
+        return err(io.Error { kind: io.ErrorKind.Other, transferred: count, code: OVERRUN })
+    }
+
+    fn output_busy(&mut self) -> bool {
+        if self.sending && !self.tx.is_busy() {
+            self.sending = false
+            succeeded(self.tx.take_error())
+        }
+        return self.sending
+    }
+
+    // Wait while the previous write is in the output buffer; false after
+    // the poll limit.
+    fn wait_output(&mut self) -> bool {
+        polls := 0u64
+        budget := self.poll_limit as u64 * FIFO_DEPTH as u64
+        for self.output_busy() {
+            polls += 1
+            if self.poll_limit != NO_POLL_LIMIT && polls >= budget {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Copy the start of `bytes` into the free output buffer, translating
+    // newlines, and start sending it; returns how many bytes went in.
+    fn send(&mut self, bytes: &[u8]) -> usize {
+        taken := 0usize
+        filled := 0usize
+        for taken < bytes.len && filled < self.output.len {
+            byte := bytes[taken]
+            if self.crlf && byte == LINE_FEED && !self.feed_pending {
+                self.output[filled] = CARRIAGE_RETURN
+                self.feed_pending = true
+            } else {
+                self.output[filled] = byte
+                self.feed_pending = false
+                taken += 1
+            }
+            filled += 1
+        }
+        transfer := hal.DmaTransfer {
+            source: hal.address_of(self.output),
+            destination: self.data,
+            count: filled as u32,
+            width: hal.DmaWidth.Byte,
+            increment_source: true,
+            increment_destination: false,
+            pace: hal.DmaPace.Destination,
+            ring: hal.DmaRing.None,
+        }
+        cpu.fence()
+        // SAFETY: the output buffer stays borrowed by this port, which
+        // writes to it again only once the channel is done, and aborts the
+        // channel before it is dropped. The channel is idle and serves
+        // this port, so starting cannot fail.
+        unsafe {
+            succeeded(self.tx.start(transfer))
+        }
+        self.sending = true
+        return taken
+    }
+
+    fn drop(&mut self) {
+        self.rx.abort()
+        self.tx.abort()
+        self.registers.write(DMACR, 0)
+    }
+}
+
+fn succeeded(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(error) => {
+            return false
+        }
     }
 }
 
@@ -682,6 +1105,15 @@ pub struct Port: io.ReadWriter {
     // Acknowledge TX_INTERRUPT or ERROR_INTERRUPTS.
     pub fn clear_interrupts(&mut self, sources: u32) {
         self.controller.clear_interrupts(sources)
+    }
+
+    // Receive into `ring` and send from `output` by DMA, with channels
+    // `rx` and `tx`, until the returned DmaPort is dropped; see DmaPort.
+    // InvalidInput if `ring` holds no aligned block of MIN_RING bytes,
+    // `output` is empty, or a channel cannot serve this port.
+    pub fn dma(&mut self, rx: &mut dyn hal.DmaChannel, ring: &mut[u8], tx: &mut dyn hal.DmaChannel, output: &mut[u8]) -> DmaPort!hal.Error from(self, rx, ring, tx, output) {
+        data := self.controller.registers.base() + DR
+        return self.controller.dma_at(data, rx, ring, tx, output)
     }
 
     // Wait until everything written is out, within the poll limit, disable

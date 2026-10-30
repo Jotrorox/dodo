@@ -84,6 +84,14 @@ LAST_CHECKS = [
     "PWM pins, frequencies, and outputs are validated and owned once",
     "PWM output reads back low, high, 50% duty, and inverted on its pad",
     "ADC inputs and temperature sensor are owned once and read plausibly",
+    "USB serial port enumerates within 2 s, never blocks writes, and shares PLL_USB with the ADC",
+    "DMA channels are claimed once each, lowest free first",
+    "DMA copies 1 KiB by words at bus speed, and bytes at odd addresses",
+    "SPI loopback by DMA runs while the program spins and raises the channel's signal",
+    "UART DMA ring is the largest aligned block of its buffer",
+    "UART loopback by DMA keeps 100 bytes in the ring until they are read",
+    "queued I2C read of an absent device is NoAcknowledge, polled meanwhile",
+    "DMA channels are given back",
     "invalid crystal is rejected",
     "chip take() after board take() is refused",
     "delay_ms(10) lasts 10 ms",
@@ -119,7 +127,8 @@ def read_record(picotool, record):
             stdout=subprocess.DEVNULL,
         )
         data = path.read_bytes()
-        return struct.unpack("<8I", data[:32]), data[32:96].split(b"\0")[0].decode(errors="replace")
+        words = struct.unpack("<8I", data[:32]) + struct.unpack("<I", data[96:100])
+        return words, data[32:96].split(b"\0")[0].decode(errors="replace")
 
 
 def run(dodo, picotool, board, level):
@@ -140,7 +149,7 @@ def run(dodo, picotool, board, level):
         print(f"-O{level}: the board did not return to BOOTSEL; check the LED and USB cable")
         return False
     words, file = read_record(picotool, record)
-    state, detail, khz, delay_us, cycles, more, toggles_us, last = words
+    state, detail, khz, delay_us, cycles, more, toggles_us, last, extra = words
     kind, value = state >> 16, state & 0xFFFF
     if kind == 0xDEAD:
         # Self-tests that record the panicking file name it; others panic in
@@ -157,7 +166,8 @@ def run(dodo, picotool, board, level):
     if kind != 0x600D:
         print(f"-O{level}: no result record (read {state:#010x})")
         return False
-    failed = [index for index in range(96) if (detail | more << 32 | last << 64) >> index & 1]
+    failures = detail | more << 32 | last << 64 | extra << 96
+    failed = [index for index in range(128) if failures >> index & 1]
     print(
         f"-O{level}: {value - len(failed)}/{value} checks passed; "
         f"clk_sys {khz} kHz, 10 ms delay {delay_us} us, {cycles} cycles"

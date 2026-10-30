@@ -1,7 +1,7 @@
 //! Raspberry Pi RP2040: dual Cortex-M0+, 264 KiB SRAM, external QSPI flash
 //! executed in place, and a boot ROM with a UF2 USB bootloader. The matching
 //! peripheral support is `std/embedded/chip/rp2040`.
-use super::{Chip, ImageFormat, Platform, Region, image::Segment};
+use super::{Chip, ImageFormat, Platform, Region, image::Segment, serial::UsbId};
 
 pub static CHIP: Chip = Chip {
     name: "rp2040",
@@ -17,7 +17,8 @@ pub static CHIP: Chip = Chip {
     runtime: concat!(
         include_str!("rp2040/runtime.ll"),
         include_str!("arm_eabi.ll"),
-        include_str!("arm_float.ll")
+        include_str!("arm_float.ll"),
+        include_str!("arm_float_soft.ll")
     ),
     linker_script: include_str!("rp2040/link.ld"),
     panic_hook: "dodo_board_panic",
@@ -61,6 +62,11 @@ pub static CHIP: Chip = Chip {
         family: 0xE48B_FF56,
         drive_id: "RPI-RP2",
     },
+    // std/embedded/chip/rp_usb's DEFAULT_VENDOR_ID and DEFAULT_PRODUCT_ID.
+    usb_serial: Some(UsbId {
+        vendor: 0x2E8A,
+        product: 0x000A,
+    }),
     fixup: boot2_checksum,
 };
 

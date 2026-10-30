@@ -4,7 +4,7 @@
 //!
 //! The RP2350 can also boot its Hazard3 RISC-V cores; Dodo builds for the Arm
 //! cores, the default.
-use super::{Chip, ImageFormat, Platform, Region, image::Segment};
+use super::{Chip, ImageFormat, Platform, Region, image::Segment, serial::UsbId};
 
 pub static CHIP: Chip = Chip {
     name: "rp2350",
@@ -20,7 +20,8 @@ pub static CHIP: Chip = Chip {
     runtime: concat!(
         include_str!("rp2350/runtime.ll"),
         include_str!("arm_eabi.ll"),
-        include_str!("arm_float.ll")
+        include_str!("arm_float.ll"),
+        include_str!("rp2350/dcp.ll")
     ),
     linker_script: include_str!("rp2350/link.ld"),
     panic_hook: "dodo_board_panic",
@@ -90,6 +91,11 @@ pub static CHIP: Chip = Chip {
         family: 0xE48B_FF59,
         drive_id: "RP2350",
     },
+    // std/embedded/chip/rp_usb's DEFAULT_VENDOR_ID and DEFAULT_PRODUCT_ID.
+    usb_serial: Some(UsbId {
+        vendor: 0x2E8A,
+        product: 0x000A,
+    }),
     fixup: image_def_check,
 };
 

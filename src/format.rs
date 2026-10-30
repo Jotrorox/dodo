@@ -221,6 +221,13 @@ impl<'a> Plan<'a> {
                 }
             }
             StmtKind::Assign { target, value, .. } => {
+                // Space the operator like a binary one, so `x |= (y)` keeps
+                // the space before an opening parenthesis or bracket.
+                for token in self.between(target.span.end, value.span.start) {
+                    if matches!(token.kind, TokenKind::Symbol(_)) {
+                        self.binary.insert(token.span.start);
+                    }
+                }
                 self.expression(target);
                 self.expression(value);
             }
@@ -811,6 +818,20 @@ mod tests {
             "formatter must be idempotent"
         );
         result
+    }
+    #[test]
+    fn spaces_compound_assignments_before_parentheses() {
+        let output = formatted(
+            "package p\nfn main(){x:u32=0\nx|=(1 as u32)<<2\nx+=[1u32][0]\nx-=(x)\nx=(x)}\n",
+        );
+        for text in [
+            "x |= (1 as u32) << 2",
+            "x += [1u32][0]",
+            "x -= (x)",
+            "x = (x)",
+        ] {
+            assert!(output.contains(text), "missing {text}: {output}");
+        }
     }
     #[test]
     fn preserves_printing_prototypes_and_literal_formats() {

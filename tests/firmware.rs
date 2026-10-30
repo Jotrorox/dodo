@@ -328,6 +328,10 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
             "Reset_Handler",
             chip.panic_hook,
             "dodo_panic_report",
+            "USBCTRL_IRQ",
+            "dodo_usb_interrupt",
+            "DMA_IRQ_0",
+            "dodo_dma_interrupt",
             "memcpy",
             "memset",
         ] {
@@ -348,6 +352,7 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "__ashrdi3",
         "__aeabi_fadd",
         "__aeabi_dmul",
+        "__adddf3",
         "__aeabi_f2d",
         "fmodf",
     ] {
@@ -365,7 +370,11 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "__aeabi_uldivmod",
         "__udivdi3",
         "__aeabi_ddiv",
+        "__divdf3",
+        "__aeabi_f2d",
         "__aeabi_l2f",
+        "dodo_dcp_save",
+        "dodo_soft_ddiv",
         "fmod",
     ] {
         assert!(text.contains(name), "rp2350 runtime lacks {name}");
@@ -558,6 +567,7 @@ fn rp2350_projects_link_to_flashable_firmware() {
     let dimmer = root().join("examples/dimmer_board.dodo");
     let selftest = root().join("tests/hardware/pico2");
     let selftest_w = root().join("tests/hardware/pico2_w");
+    let float = root().join("tests/hardware/rp2350_float");
     let tasks = root().join("examples/tasks");
     for (project, name, board) in [
         (&blink, "blink", &["--board", "pico2"][..]),
@@ -570,6 +580,8 @@ fn rp2350_projects_link_to_flashable_firmware() {
         (&dimmer, "dimmer-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),
         (&selftest_w, "selftest-w", &[][..]),
+        (&float, "float", &["-b", "pico2"][..]),
+        (&float, "float-w", &["-b", "pico2_w"][..]),
     ] {
         for level in ["0", "2"] {
             let elf = scratch.path(&format!("{name}-O{level}.elf"));
@@ -666,5 +678,204 @@ fn the_default_panic_hook_reports_on_serial_ports() {
             None
         );
         assert_eq!(panic_hook_literal(Path::new(&elf), family), 0, "{chip}");
+    }
+}
+
+/// The first literal of the runtime's USBCTRL_IRQ stub, which it calls if
+/// nonzero: dodo_usb_interrupt's address or 0.
+fn usb_interrupt_literal(elf: &Path, family: u32) -> u32 {
+    stub_literal(elf, family, "USBCTRL_IRQ")
+}
+
+/// The first literal of a runtime stub that tail-calls a weak handler,
+/// such as USBCTRL_IRQ's or DMA_IRQ_0's: the handler's address or 0.
+fn stub_literal(elf: &Path, family: u32, symbol: &str) -> u32 {
+    let bytes = fs::read(elf).unwrap();
+    let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), family);
+    let stub = (elf_symbol(&bytes, symbol).expect("runtime stub") & !1) as usize;
+    // ldr, cmp, bne, ldr, bx: five halfwords, then the aligned words.
+    let at = (stub - 0x1000_0000 + 10 + 3) & !3;
+    word(&image, at)
+}
+
+#[test]
+fn the_usb_serial_port_is_served_from_the_default_usb_interrupt() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("usb-serial");
+    let example = root().join("examples/usb_serial.dodo");
+    // USBCTRL_IRQ's vector: IRQ 5 on the RP2040, 14 on the RP2350, after
+    // the 16 Cortex-M exceptions.
+    let boards = [
+        ("pico", 0xE48B_FF56, 5),
+        ("pico2", 0xE48B_FF59, 14),
+        ("pico2_w", 0xE48B_FF59, 14),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("usb-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let bytes = fs::read(&elf).unwrap();
+            let serve = elf_symbol(&bytes, "dodo_usb_interrupt").expect("the server is linked");
+            assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
+            assert_eq!(usb_interrupt_literal(Path::new(&elf), family), serve);
+            let image = flash_image(
+                &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+                family,
+            );
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                elf_symbol(&bytes, "USBCTRL_IRQ").unwrap() | 1,
+                "{board} -O{level}: the vector is the runtime's handler"
+            );
+        }
+    }
+    // A program's own handler replaces the runtime's, and the port's
+    // server is dropped with it.
+    let own = scratch.write(
+        "own.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic mut COUNT: u32 = 0\n@interrupt(USBCTRL_IRQ)\nfn usb() {\n unsafe {\n  COUNT += 1\n }\n}\nfn main() {\n b := board.take()!\n b.led.toggle()\n}\n",
+    );
+    for board in ["pico", "pico2"] {
+        let elf = scratch.path(&format!("own-{board}.elf"));
+        build(&["build", own.to_str().unwrap(), "--board", board, "-o", &elf]);
+        let bytes = fs::read(&elf).unwrap();
+        assert_eq!(elf_symbol(&bytes, "dodo_usb_interrupt"), None, "{board}");
+        assert!(elf_symbol(&bytes, "USBCTRL_IRQ").is_some(), "{board}");
+    }
+    // Without std/embedded/chip the stub falls through to DefaultHandler.
+    let bare = scratch.write("bare.dodo", "package main\nfn main() {}\n");
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(usb_interrupt_literal(Path::new(&elf), family), 0, "{chip}");
+    }
+}
+
+#[test]
+fn dma_signals_are_raised_from_the_default_dma_interrupt() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("dma");
+    let example = root().join("examples/dma.dodo");
+    // DMA_IRQ_0's vector: IRQ 11 on the RP2040, 10 on the RP2350.
+    let boards = [
+        ("pico", 0xE48B_FF56, 11),
+        ("pico2", 0xE48B_FF59, 10),
+        ("pico2_w", 0xE48B_FF59, 10),
+    ];
+    for (board, family, irq) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("dma-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let bytes = fs::read(&elf).unwrap();
+            let serve = elf_symbol(&bytes, "dodo_dma_interrupt").expect("the handler is linked");
+            assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
+            assert_eq!(stub_literal(Path::new(&elf), family, "DMA_IRQ_0"), serve);
+            let image = flash_image(
+                &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
+                family,
+            );
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            assert_eq!(
+                word(&image, vectors + 4 * (16 + irq)),
+                elf_symbol(&bytes, "DMA_IRQ_0").unwrap() | 1,
+                "{board} -O{level}: the vector is the runtime's handler"
+            );
+        }
+    }
+    // A program's own handler replaces the runtime's and the default one.
+    let own = scratch.write(
+        "own.dodo",
+        "package main\nimport \"std/embedded/board\"\nstatic mut COUNT: u32 = 0\n@interrupt(DMA_IRQ_0)\nfn dma() {\n unsafe {\n  COUNT += 1\n }\n}\nfn main() {\n b := board.take()!\n b.led.toggle()\n}\n",
+    );
+    for board in ["pico", "pico2"] {
+        let elf = scratch.path(&format!("own-{board}.elf"));
+        build(&["build", own.to_str().unwrap(), "--board", board, "-o", &elf]);
+        let bytes = fs::read(&elf).unwrap();
+        assert_eq!(elf_symbol(&bytes, "dodo_dma_interrupt"), None, "{board}");
+        assert!(elf_symbol(&bytes, "DMA_IRQ_0").is_some(), "{board}");
+    }
+    // Without std/embedded/chip the stub falls through to DefaultHandler.
+    let bare = scratch.write("bare.dodo", "package main\nfn main() {}\n");
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(
+            stub_literal(Path::new(&elf), family, "DMA_IRQ_0"),
+            0,
+            "{chip}"
+        );
+    }
+}
+
+#[test]
+fn usb_serial_ports_compile_for_every_board() {
+    let scratch = Scratch::new("usb-compile");
+    let source = scratch.write(
+        "usb.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/executor"
+import "std/fmt"
+const USB: executor.Signal = executor.Signal { id: 3 }
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    serial.set_signal(&USB)
+    serial.set_crlf(false)
+    serial.set_bootloader_reset(true)
+    connected := serial.is_connected()
+    baud := serial.baud()
+    fmt.printf(&mut serial, "{} {}\n", connected, baud)!
+    buffer := [0u8; 8]
+    serial.poll_read(&mut buffer)!
+    serial.flush()!
+    b.usb.release_serial(serial)
+    analog := b.pins.analog(26)!
+    again := b.usb.serial()!
+    analog.read()!
+    b.pins.release_analog(analog)
+    b.usb.release_serial(again)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("usb-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
     }
 }

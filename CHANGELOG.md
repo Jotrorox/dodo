@@ -11,6 +11,72 @@
   `unsafe` (`@unsafe_send pub unsafe struct Owner`), since they are unchecked
   promises; `unsafe` on a struct without either contract is an error. Add
   `unsafe` to existing annotated structs.
+- `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
+  (DCP), with no change to programs: division takes about 90 cycles instead
+  of 1300, addition about 45 instead of 260, multiplication about 60 instead
+  of 200, and conversions between `f64` and `f32` or 32-bit integers a
+  third to a tenth of their software time. Results are bit for bit those of
+  the software helpers, subnormals included: the cases the coprocessor
+  flushes to zero are computed in software, and NaN results stay the default
+  NaN. The helpers save and restore the coprocessor's state when one
+  interrupts another, so `f64` stays safe in interrupt handlers.
+  `scripts/test_rp2350_float.py` compares them with the software helpers on
+  a Pico 2 or Pico 2 W, on 1.8 million edge-weighted operands while
+  interrupts preempt them, and times both.
+- DMA on the RP2040 and RP2350: `b.dma.channel()` claims one of the chip's
+  12 or 16 channels, `claim(n)` a given one, and `release(channel)` gives it
+  back. `channel.copy` copies buffers, and `channel.set_signal(&SIGNAL)`
+  wakes executor tasks when a transfer ends, from a default `DMA_IRQ_0`
+  handler in the chip runtimes. The driver, `std/embedded/chip/rp_dma`,
+  finds each peripheral's data request from the register a transfer reads or
+  writes, and the panic report aborts every claimed channel first.
+- `std/embedded/hal` gains `DmaChannel`, the protocol through which
+  peripheral drivers start DMA transfers (`DmaTransfer`, `DmaWidth`,
+  `DmaPace`, `DmaRing`), and `address_of` for a buffer's address.
+- SPI by DMA: `bus.dma(&mut tx, &mut rx, &mut buffer)` returns a
+  `pl022.DmaBus` whose `start_transfer` and `start_write` return at once and
+  run without gaps between frames while the program or other tasks work.
+  The session lends its buffer out only between transfers, so the borrow
+  checker keeps the program off memory the channels are moving, and
+  dropping it aborts a running transfer.
+- Serial ports by DMA: `port.dma(&mut rx, &mut ring, &mut tx, &mut output)`
+  returns a `pl011.DmaPort`, a `std/io` Reader and Writer that receives into
+  a ring buffer of up to 32 KiB, so input is no longer limited to the
+  32-byte FIFO between reads, and writes in the background.
+- Queued I2C transactions: `start_write`, `start_read`, and
+  `start_write_read` put a transaction of up to 16 commands into the
+  controller's FIFO and return; `poll_finish` collects it without waiting,
+  `listen` raises the controller's interrupt when it ends, and `cancel`
+  aborts it.
+- `examples/dma.dodo` runs a DMA serial console that polls ten times a
+  second next to a task streaming SPI frames by DMA. The board self-tests
+  check DMA copies, SPI and UART loopback by DMA, and queued I2C reads, and
+  record up to 128 checks.
+
+- The RP2040 and RP2350 boards are USB serial ports on their own USB
+  connector: `b.usb.serial()` returns a CDC-ACM port with the `std/io` Reader
+  and Writer protocols, so `fmt.printf` prints over the USB cable with no
+  adapter. The port is served from `USBCTRL_IRQ`, so it keeps answering the
+  host while the program busy-waits. Output written before a terminal opens
+  the port waits for it, up to 1 KiB, and printing never blocks the program
+  for long or fails. Newlines go out as CR LF, `set_signal` wakes executor
+  tasks on input, and a panic is reported on the port, which the default
+  panic hook keeps serving after it halts. The driver,
+  `std/embedded/chip/rp_usb`, keeps its queues in the controller's own RAM
+  and runs against a model of the controller and a simulated host in the
+  desktop tests.
+- `dodo run` no longer needs BOOTSEL for firmware with a USB serial port:
+  when no bootloader drive is mounted, it finds the board's port on Linux
+  and macOS, sets it to 1200 baud, which restarts the board into its
+  bootloader, waits for the drive, and flashes.
+- Fix `dodo fmt` dropping the space after a compound assignment before a
+  parenthesis or bracket, which turned `x |= (y)` into `x |=(y)`.
+- Fix `set_break(false)` on PL011 serial ports, which waited for the
+  transmitter to go idle while the break itself kept it busy, and so never
+  returned.
+- Constants and statics get their own ELF sections, as functions already
+  did, so the linker drops the unused ones: firmware no longer carries every
+  imported package's public constants once it uses one string constant.
 - `std/sync/atomic` works on Arm Cortex-M. On cores with exclusive loads and
   stores (ARMv7-M, ARMv7E-M, and ARMv8-M, such as the RP2350's Cortex-M33)
   every operation lowers to native instructions for 8-, 16-, and 32-bit
@@ -225,6 +291,8 @@
   pause from 24 received bytes on. `set_break` holds the line low. On the
   RP2350, `pins.uart` also takes TX and RX on the UART_AUX pins (GPIO n
   with n % 4 of 2 and 3).
+- Fix `set_break(false)` waiting for the UART to go idle, which a break
+  prevents: ending a break now returns at once.
 - `std/embedded/hal/fake` gains `fake.Serial`, an in-memory serial port for
   testing drivers of devices on a serial line. The board self-tests check
   the serial port's pins, ownership, timing at 115200 baud and 1 Mbaud,
