@@ -62,6 +62,10 @@
   bootloader, waits for the drive, and flashes.
 - Fix `dodo fmt` dropping the space after a compound assignment before a
   parenthesis or bracket, which turned `x |= (y)` into `x |=(y)`.
+- Fix `dodo fmt` spacing in array types and lengths: `[0u8; 16 * 16]` no
+  longer becomes `[0u8; 16 *16]`, `[N - 1]u8` no longer becomes `[N -1]u8`,
+  `[0u8; (N) * 2]` keeps the space after `;`, and `[3]&mut T` no longer gains
+  a space before `&`.
 - Fix `set_break(false)` on PL011 serial ports, which waited for the
   transmitter to go idle while the break itself kept it busy, and so never
   returned.
