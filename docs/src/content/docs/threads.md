@@ -160,7 +160,20 @@ contracts in their implementation and validate their generic payloads at
 construction.
 
 `@unsafe_send` and `@unsafe_sync` on a struct are **unsafe implementation
-contracts**, not compiler proofs. The author must guarantee that moving the
+contracts**, not compiler proofs, so the struct must also be declared
+`unsafe`:
+
+```dodo
+// SAFETY: ...
+@unsafe_send
+@unsafe_sync
+pub unsafe struct Mutex<T> {
+    pointer: *mut T
+}
+```
+
+A project with `forbid-unsafe = true` therefore cannot declare these contracts
+itself. The author must guarantee that moving the
 complete owner, including destruction, or concurrently calling shared methods
 is safe. Annotated raw-pointer owners must preserve allocation lifetime,
 exclusivity, synchronization, and exactly-once release. Private fields and

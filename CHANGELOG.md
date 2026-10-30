@@ -22,6 +22,15 @@
   them from core 0, and the board self-tests gain three checks of core 1, the
   FIFOs, and spinlocks.
 
+- `forbid-unsafe = true` in a manifest's `[project]` table rejects every
+  `unsafe` keyword in the project's own sources, including imported local
+  packages and `dodo test` documentation examples. The standard library and
+  board and chip packages are exempt. Build, check, run, and test stop with
+  every location, and the language server reports each one.
+- `@unsafe_send` and `@unsafe_sync` now require the struct to be declared
+  `unsafe` (`@unsafe_send pub unsafe struct Owner`), since they are unchecked
+  promises; `unsafe` on a struct without either contract is an error. Add
+  `unsafe` to existing annotated structs.
 - `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
   (DCP), with no change to programs: division takes about 90 cycles instead
   of 1300, addition about 45 instead of 260, multiplication about 60 instead
