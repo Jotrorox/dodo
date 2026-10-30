@@ -13,6 +13,24 @@ pub fn parse(source: &str) -> ParseResult<Program> {
     Parser::new(lex(source)?, false).program()
 }
 
+/// Parse already-lexed tokens as one complete expression. The formatter uses
+/// this for array lengths, which the AST keeps without source spans.
+pub(crate) fn parse_expression(tokens: &[Token]) -> Option<Expr> {
+    let end = tokens.last()?.span.end;
+    let mut tokens: Vec<_> = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+        .cloned()
+        .collect();
+    tokens.push(Token {
+        kind: TokenKind::Eof,
+        span: Span { start: end, end },
+    });
+    let mut parser = Parser::new(tokens, false);
+    let expression = parser.expression(false).ok()?;
+    parser.eof().then_some(expression)
+}
+
 /// Editor parser: retain sound declarations and statements after syntax errors.
 /// Compilation and formatting continue to use the strict `parse` entry point.
 pub fn parse_recovering(source: &str) -> (Program, Vec<Diagnostic>) {
@@ -352,8 +370,20 @@ impl Parser {
             return Err(self.error("@test and @ignore apply only to functions"));
         }
         if self.at("struct") {
-            if mods.unsafe_ || mods.extern_ {
-                return Err(self.error("structs cannot be unsafe or extern"));
+            if mods.extern_ {
+                return Err(self.error("structs cannot be extern"));
+            }
+            // Thread contracts are unchecked promises, so they need the same
+            // explicit opt-in as any other unsafe code.
+            let contract = mods.unsafe_send || mods.unsafe_sync;
+            if contract && !mods.unsafe_ {
+                return Err(self.error(
+                    "@unsafe_send and @unsafe_sync are unsafe contracts; declare the struct as `unsafe struct`",
+                ));
+            }
+            if mods.unsafe_ && !contract {
+                return Err(self
+                    .error("`unsafe` on a struct applies only with @unsafe_send or @unsafe_sync"));
             }
             self.struct_decl(program, mods, start)?;
         } else if self.at("enum") {

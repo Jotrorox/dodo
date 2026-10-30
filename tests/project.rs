@@ -185,3 +185,52 @@ fn standalone_profiles_and_manifest_paths_are_resolved_without_environment_reads
     assert_eq!(r.run_args.len(), 2);
     assert!(dodoc::toml::parse(&r.report()).is_ok());
 }
+#[test]
+fn forbid_unsafe_is_a_project_wide_boolean() {
+    assert!(!manifest("schema=1").forbid_unsafe);
+    let m = manifest("schema=1\n[project]\nforbid-unsafe=true\n[test.build]\ndebug=true");
+    assert!(m.forbid_unsafe);
+    for purpose in [Purpose::Build, Purpose::Check, Purpose::Run, Purpose::Test] {
+        let r = resolve(
+            Some(&m),
+            None,
+            None,
+            purpose,
+            &Settings::default(),
+            &[],
+            false,
+        );
+        assert!(r.forbid_unsafe);
+    }
+    let r = resolve(
+        Some(&m),
+        None,
+        None,
+        Purpose::Build,
+        &Settings::default(),
+        &[],
+        false,
+    );
+    assert!(
+        r.report()
+            .contains("forbid-unsafe = true # project.forbid-unsafe\n")
+    );
+    let r = resolve(
+        None,
+        None,
+        None,
+        Purpose::Build,
+        &Settings::default(),
+        &[],
+        false,
+    );
+    assert!(!r.forbid_unsafe && !r.report().contains("forbid-unsafe"));
+    for s in [
+        "schema=1\n[project]\nforbid-unsafe='yes'",
+        "schema=1\n[build]\nforbid-unsafe=true",
+        "schema=1\n[targets.app]\nentry='main.dodo'\nforbid-unsafe=true",
+    ] {
+        let error = Manifest::parse(s, Path::new("dodo.toml")).unwrap_err();
+        assert!(error.starts_with("dodo.toml:"), "{error}");
+    }
+}

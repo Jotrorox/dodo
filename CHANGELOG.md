@@ -19,6 +19,15 @@
   memory to build at `-O 2` and needed about 10 MB of stack at `-O 0`. Root
   package public functions now pass such records through memory like other
   Dodo functions.
+- `forbid-unsafe = true` in a manifest's `[project]` table rejects every
+  `unsafe` keyword in the project's own sources, including imported local
+  packages and `dodo test` documentation examples. The standard library and
+  board and chip packages are exempt. Build, check, run, and test stop with
+  every location, and the language server reports each one.
+- `@unsafe_send` and `@unsafe_sync` now require the struct to be declared
+  `unsafe` (`@unsafe_send pub unsafe struct Owner`), since they are unchecked
+  promises; `unsafe` on a struct without either contract is an error. Add
+  `unsafe` to existing annotated structs.
 - `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
   (DCP), with no change to programs: division takes about 90 cycles instead
   of 1300, addition about 45 instead of 260, multiplication about 60 instead
@@ -79,6 +88,10 @@
   bootloader, waits for the drive, and flashes.
 - Fix `dodo fmt` dropping the space after a compound assignment before a
   parenthesis or bracket, which turned `x |= (y)` into `x |=(y)`.
+- Fix `dodo fmt` spacing in array types and lengths: `[0u8; 16 * 16]` no
+  longer becomes `[0u8; 16 *16]`, `[N - 1]u8` no longer becomes `[N -1]u8`,
+  `[0u8; (N) * 2]` keeps the space after `;`, and `[3]&mut T` no longer gains
+  a space before `&`.
 - Fix `set_break(false)` on PL011 serial ports, which waited for the
   transmitter to go idle while the break itself kept it busy, and so never
   returned.

@@ -124,7 +124,7 @@ custom profiles require one. `check` does not use profiles.
 | Location | Supported fields |
 | --- | --- |
 | Root | Required `schema = 1`. |
-| `[project]` | Display `name`, `default-target`, `default-profile`. |
+| `[project]` | Display `name`, `default-target`, `default-profile`, `forbid-unsafe`. |
 | `[build]` | `out-dir` and compiler settings below. |
 | `[targets.NAME]` | Required `entry`, optional `emit`, and compiler settings. |
 | `[targets.NAME.run]` | Argument array `args`, working directory `cwd`. |
@@ -232,6 +232,28 @@ Test root defaults to `.` and timeout to 30 seconds; 0 disables the timeout.
 For test, an explicit path alongside `--manifest-path` overrides the discovery
 root. Filters, skips, documentation and ignored-test selection remain explicit
 CLI options. See [testing](testing.md) for their behavior.
+
+## Forbid unsafe code
+
+```toml
+schema = 1
+
+[project]
+forbid-unsafe = true
+```
+
+`forbid-unsafe` rejects every `unsafe` keyword in the project's own sources:
+unsafe functions, unsafe blocks and expressions, unsafe interface methods, and
+`unsafe struct` declarations. Because `@unsafe_send` and `@unsafe_sync` require
+`unsafe struct`, it also rejects hand-written thread contracts. It applies to
+build, check, run, and test, including `dodo test` documentation examples, and
+the language server reports each use as a diagnostic.
+
+The setting covers every local source a build loads, including imported local
+packages. The standard library and the board and chip packages are exempt, so
+their safe APIs keep working. Like other manifest settings, it does not apply
+when an explicit source file or `--no-manifest` bypasses the manifest. The
+default is `false`.
 
 ## Inspect configuration and editor targets
 
