@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 #[cfg(feature = "llvm")]
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +42,22 @@ impl Drop for Workspace {
 }
 
 #[cfg(feature = "llvm")]
+// Runs a freshly copied executable. On Linux a process another test thread
+// forks at the same moment can briefly hold the copy open for writing, and
+// running it then fails with "Text file busy" until that process execs.
+fn run_copied(command: &mut Command) -> Output {
+    for _ in 0..50 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            result => return result.unwrap(),
+        }
+    }
+    command.output().unwrap()
+}
+
+#[cfg(feature = "llvm")]
 #[test]
 fn copied_compiler_loads_bundled_sources_from_an_unrelated_directory() {
     let workspace = Workspace::new();
@@ -54,12 +70,12 @@ fn copied_compiler_loads_bundled_sources_from_an_unrelated_directory() {
         "package app\nimport \"std/bytes\"\nfn main() -> i32 {\n if bytes.equal(b\"x\", b\"x\") { return 0 }\n return 1\n}\n",
     );
     fs::create_dir(workspace.0.join("unrelated")).unwrap();
-    let output = Command::new(&compiler)
-        .current_dir(workspace.0.join("unrelated"))
-        .arg("check")
-        .arg(&source)
-        .output()
-        .unwrap();
+    let output = run_copied(
+        Command::new(&compiler)
+            .current_dir(workspace.0.join("unrelated"))
+            .arg("check")
+            .arg(&source),
+    );
     assert!(
         output.status.success(),
         "{}",
