@@ -3,7 +3,8 @@ use crate::ast::*;
 use llvm::{Attribute, AttributeLoc, BasicBlock, Builder, LlvmType, Module, TargetData, Value};
 pub use llvm::{Context, FileType, TargetMachine};
 use llvm_sys::LLVMLinkage::{
-    LLVMAppendingLinkage, LLVMExternalLinkage, LLVMInternalLinkage, LLVMPrivateLinkage,
+    LLVMAppendingLinkage, LLVMExternalLinkage, LLVMExternalWeakLinkage, LLVMInternalLinkage,
+    LLVMPrivateLinkage,
 };
 use llvm_sys::{
     LLVMAtomicOrdering as AtomicOrdering, LLVMAtomicRMWBinOp as AtomicRMWBinOp,
@@ -2746,6 +2747,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if hosted {
             return Ok(match op {
                 "disable_interrupts" => self.context.bool_type().const_zero(),
+                "core_id" => self.context.i32_type().const_zero(),
                 _ => unit,
             });
         }
@@ -2753,21 +2755,24 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             // Diagnosed after dead-code elimination (see `generate`), so a
             // package that merely contains interrupt control stays portable.
             let name = format!("{UNSUPPORTED_CPU}{op}");
-            let result = if op == "disable_interrupts" {
-                self.context.bool_type()
-            } else {
-                void
+            let result = match op {
+                "disable_interrupts" => self.context.bool_type(),
+                "core_id" => self.context.i32_type(),
+                _ => void,
             };
             let marker = self.module.lookup_function(&name).unwrap_or_else(|| {
                 self.module
                     .add_function(&name, result.fn_type(&[], false), None)
             });
             let value = self.builder.build_call(marker, &[], "cpu.unsupported")?;
-            return Ok(if op == "disable_interrupts" {
+            return Ok(if matches!(op, "disable_interrupts" | "core_id") {
                 value
             } else {
                 unit
             });
+        }
+        if op == "core_id" {
+            return self.core_id(riscv);
         }
         // Cortex-M PRIMASK bit 0 masks interrupts; RISC-V mstatus.MIE is bit 3.
         let (register, enable_bit) = if cortex_m {
@@ -2845,6 +2850,47 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
             _ => Err(error(format!("unknown CPU operation `{op}`"))),
         }
+    }
+    /// Lowers `cpu.core_id()` on bare metal. RISC-V reads `mhartid`. Cortex-M
+    /// has no architectural core number, so a chip runtime with several cores
+    /// defines `dodo_core_id`, which is referenced weakly: without one the
+    /// chip is taken to have a single core, number 0.
+    fn core_id(&mut self, riscv: bool) -> Result<Value<'ctx>> {
+        let i32_type = self.context.i32_type();
+        if riscv {
+            let hart = self.builder.build_inline_asm(
+                self.usize_type().fn_type(&[], false),
+                "csrr $0, mhartid",
+                "=r",
+                &[],
+                "cpu.hart",
+            )?;
+            return self
+                .builder
+                .build_int_cast_sign_flag(hart, i32_type, false, "cpu.core");
+        }
+        let hook = self
+            .module
+            .lookup_function("dodo_core_id")
+            .unwrap_or_else(|| {
+                self.module.add_function(
+                    "dodo_core_id",
+                    i32_type.fn_type(&[], false),
+                    Some(LLVMExternalWeakLinkage),
+                )
+            });
+        let start = self.builder.get_insert_block().unwrap();
+        let ask = self.bb("core_id.ask");
+        let done = self.bb("core_id.done");
+        let missing = self.builder.build_is_null(hook, "core_id.missing")?;
+        self.builder.build_conditional_branch(missing, done, ask)?;
+        self.builder.position_at_end(ask);
+        let number = self.builder.build_call(hook, &[], "core_id.number")?;
+        self.builder.build_unconditional_branch(done)?;
+        self.builder.position_at_end(done);
+        let phi = self.builder.build_phi(i32_type, "cpu.core")?;
+        phi.add_incoming(&[(&i32_type.const_zero(), start), (&number, ask)]);
+        Ok(phi)
     }
     fn call(
         &mut self,

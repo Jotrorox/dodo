@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- The RP2040 and RP2350 run code on their second core. `b.core1.start(&mut
+  stack, task)` runs a task value's `run(self)` method on core 1, with the
+  task and the stack in memory the program provides, until the returned
+  handle is dropped or stopped, which holds core 1 in reset again. Tasks are
+  checked like `std/thread` tasks, so they own what they hold and carry no
+  references. On the RP2350 the stack's bottom is core 1's stack limit, and
+  core 1 enables its FPU and double-precision coprocessor as core 0 does.
+  `b.fifos.claim()` hands out each core's end of the hardware FIFOs between
+  the cores, and `b.spinlocks.claim(n)` the hardware spinlocks, whose guard
+  also masks interrupts on the holding core. On the RP2350, the spinlocks that
+  erratum RP2350-E2 can unlock are never handed out. Each core can run its own
+  `std/embedded/executor`: signals now belong to the core that raises and
+  takes them, and `fifo.set_signal(&signal)` wakes a task when the other core
+  writes, through the chip runtime's default FIFO interrupt handler. The new
+  `cpu.core_id()` intrinsic returns the executing core's number: `mhartid` on
+  RISC-V, the chip runtime's `dodo_core_id` on a Cortex-M, and 0 on hosted
+  targets. `examples/two_cores.dodo` searches for primes on core 1 and reports
+  them from core 0, and the board self-tests gain three checks of core 1, the
+  FIFOs, and spinlocks.
+
 - `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
   (DCP), with no change to programs: division takes about 90 cycles instead
   of 1300, addition about 45 instead of 260, multiplication about 60 instead

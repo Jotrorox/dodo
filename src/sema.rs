@@ -4685,6 +4685,13 @@ impl<'a> Checker<'a> {
             let (parameters, result) = match operation {
                 "fence" | "wait_for_interrupt" => (vec![], Type::Void),
                 "disable_interrupts" => (vec![], Type::Bool),
+                "core_id" => (
+                    vec![],
+                    Type::Int {
+                        signed: false,
+                        bits: 32,
+                    },
+                ),
                 "restore_interrupts" => {
                     self.unsafe_required(span, "restoring the interrupt mask")?;
                     (vec![Type::Bool], Type::Void)
@@ -6649,6 +6656,7 @@ mod tests {
         accepts(
             "import \"core/cpu\"\nfn f() -> void {\n cpu.fence()\n cpu.wait_for_interrupt()\n was := cpu.disable_interrupts()\n unsafe { cpu.restore_interrupts(was) }\n}",
         );
+        accepts("import \"core/cpu\"\nfn f() -> u32 { return cpu.core_id() }");
         rejects(
             "import \"core/cpu\"\nfn f() -> void { cpu.restore_interrupts(true) }",
             "explicit unsafe block",

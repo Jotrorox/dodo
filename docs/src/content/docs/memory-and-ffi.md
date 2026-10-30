@@ -171,6 +171,7 @@ respective references.
 | `cpu.disable_interrupts()` | `bool` | Safe; masks interrupts, returns whether they were enabled. |
 | `cpu.restore_interrupts(enabled)` | `void` | Unsafe; re-enables only if `enabled`. |
 | `cpu.wait_for_interrupt()` | `void` | Safe; sleeps until an interrupt is pending. |
+| `cpu.core_id()` | `u32` | Safe; the executing core's number, 0 on a single-core target. |
 | `ptr.read(pointer)` | Pointee value | Unsafe; raw pointer. |
 | `ptr.write(pointer, value)` | `void` | Unsafe; mutable raw pointer; overwrites without dropping. |
 | `ptr.read_unaligned(pointer)` | Pointee value | Unsafe; load alignment one. |
@@ -349,6 +350,14 @@ express with memory accesses. `std/embedded/hal` builds its `Critical` section o
 | Bare-metal RISC-V machine mode (`riscv32`, `riscv64`) | `csrrci mstatus, 8` / `csrs mstatus` | `wfi` |
 | Hosted OS targets (Linux, Windows, macOS, BSDs, WASI) | No-op; returns `false` | No-op |
 | Other freestanding targets | Rejected if the call is reachable | Rejected if reachable |
+
+`cpu.core_id()` numbers the cores of a multi-core chip from 0, so that code
+such as `std/embedded/executor` can keep separate state for each core. Hosted
+targets return 0. RISC-V reads `mhartid`. A Cortex-M has no architectural
+core number, so the call asks the chip runtime's `dodo_core_id` function, which
+the RP2040 and RP2350 runtimes define (it reads the SIO's CPUID register), and
+returns 0 when the linked runtime defines none. Other freestanding targets
+reject a reachable call.
 
 `cpu.fence()` is available on every target and lowers to a sequentially
 consistent LLVM `fence` (`dmb` on Arm, `fence rw, rw` on RISC-V). Use it to order
