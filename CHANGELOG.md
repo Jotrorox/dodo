@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- PIO on the RP2040 and RP2350: `std/embedded/chip/rp_pio` drives the chips'
+  programmable I/O blocks, and `rp_pio.assemble` assembles PIO programs
+  when the firmware is compiled, from string literals in the language of the
+  Pico SDK's pioasm, so SDK `.pio` programs work unchanged and a mistake is a
+  compile error at its line. The assembler exists only in firmware for these
+  chips and checks each program against the chip's PIO version, so the
+  RP2350's additions (`mov pindirs`, RX FIFO registers, neighbouring blocks'
+  IRQ flags, `wait jmppin`) are errors on the RP2040. `pins.pio(n)` claims a
+  block and `pins.pio_pins` hands it GPIOs; a block loads programs into its
+  instruction memory, relocating their jumps, and hands out its four state
+  machines, which are configured from the program's directives, take and
+  give words through their FIFOs, execute single instructions, and raise
+  the block's interrupts. `examples/ws2812.dodo` drives WS2812 LEDs, and the
+  board self-tests gain three PIO checks.
+
 - `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
   (DCP), with no change to programs: division takes about 90 cycles instead
   of 1300, addition about 45 instead of 260, multiplication about 60 instead

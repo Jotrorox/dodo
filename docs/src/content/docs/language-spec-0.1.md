@@ -661,6 +661,9 @@ allocation are introduced. The bodyless `@compiler(print)`,
 `@compiler(println)`, and `@compiler(printf)` declarations are reserved for the
 bundled `std/fmt` and `std/console` packages; user packages cannot declare them.
 This facility does not provide general argument packs or function overloading.
+Likewise, `@compiler(pio)` is reserved for `assemble` in the bundled
+`std/embedded/chip/rp_pio`: a call with string literal arguments is assembled
+at compile time into a `Program` value, in firmware for chips with PIO only.
 
 ### 6.6. Interfaces and dynamic dispatch
 

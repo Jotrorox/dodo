@@ -244,6 +244,155 @@ fn platform_selection_errors_name_the_problem() {
     assert!(error.contains("unknown board 'arduino'"), "{error}");
 }
 
+// rp_pio.assemble assembles PIO programs at compile time, for the RP2040
+// and RP2350 only, checking each program against its chip's PIO version.
+#[test]
+fn pio_programs_assemble_only_for_rp_chips() {
+    let scratch = Scratch::new("pio");
+    let program = |lines: &str| {
+        format!(
+            "package main\nimport \"std/embedded/chip/rp_pio\"\nconst PROGRAM: rp_pio.Program = rp_pio.assemble(\n{lines}\n)\nfn main() {{\n core.assert(PROGRAM.length > 0)\n}}\n"
+        )
+    };
+    let valid = scratch.write(
+        "valid.dodo",
+        &program("    \".side_set 1 opt\",\n    \"loop:\",\n    \"    out pins, 1 side 0 [2]\",\n    \"    jmp loop    side 1\","),
+    );
+    let valid = valid.to_str().unwrap();
+    for board in ["pico", "pico2", "pico2_w"] {
+        stdout(&dodo(&["check", valid, "--board", board]));
+    }
+    stdout(&dodo(&["check", valid, "--chip", "rp2350"]));
+    // Hosted builds have no PIO.
+    let error = stderr(&dodo(&["check", valid]));
+    assert!(
+        error.contains("PIO programs are assembled for the RP2040 and RP2350 only")
+            && error.contains("valid.dodo:3:33"),
+        "{error}"
+    );
+    // An error points into its line.
+    let invalid = scratch.write(
+        "invalid.dodo",
+        &program("    \"set x, 1\",\n    \"    jmp nowhere\","),
+    );
+    let error = stderr(&dodo(&[
+        "check",
+        invalid.to_str().unwrap(),
+        "--board",
+        "pico2",
+    ]));
+    assert!(
+        error.contains("invalid PIO program: undefined symbol `nowhere`")
+            && error.contains("invalid.dodo:5:14"),
+        "{error}"
+    );
+    // RP2350 instructions are refused on the RP2040.
+    let newer = scratch.write("newer.dodo", &program("    \"mov pindirs, ~null\","));
+    let newer = newer.to_str().unwrap();
+    stdout(&dodo(&["check", newer, "--board", "pico2"]));
+    let error = stderr(&dodo(&["check", newer, "--board", "pico"]));
+    assert!(
+        error.contains("`mov pindirs` needs PIO version 1 (the RP2350), but the build's chip, the RP2040, has PIO version 0"),
+        "{error}"
+    );
+    // Only literals, and only rp_pio may declare the assembler.
+    let runtime = scratch.write(
+        "runtime.dodo",
+        "package main\nimport \"std/embedded/chip/rp_pio\"\nfn main() {\n line := \"nop\"\n program := rp_pio.assemble(line)\n}\n",
+    );
+    let error = stderr(&dodo(&[
+        "check",
+        runtime.to_str().unwrap(),
+        "--board",
+        "pico",
+    ]));
+    assert!(
+        error.contains("rp_pio.assemble takes string literals"),
+        "{error}"
+    );
+    let reserved = scratch.write(
+        "reserved.dodo",
+        "package main\n@compiler(pio)\npub fn assemble(source: &str) -> u32\nfn main() {}\n",
+    );
+    let error = stderr(&dodo(&[
+        "check",
+        reserved.to_str().unwrap(),
+        "--board",
+        "pico",
+    ]));
+    assert!(
+        error.contains("@compiler(pio) is reserved for std/embedded/chip/rp_pio"),
+        "{error}"
+    );
+}
+
+// The WS2812 example and the rest of the PIO driver on every board. Needs
+// no linker.
+#[test]
+fn pio_drivers_compile_for_every_board() {
+    let scratch = Scratch::new("pio-compile");
+    let example = root().join("examples/ws2812.dodo");
+    let source = scratch.write(
+        "pio.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip/rp_pio"
+import "std/embedded/cortex_m"
+const ECHO: rp_pio.Program = rp_pio.assemble(".in 32 left auto 8", "    pull block", "    mov isr, ::osr", "    push iffull noblock")
+fn main() {
+    b := board.take()!
+    pio := b.pins.pio(1)!
+    b.pins.pio_pins(&pio, 6, 2)!
+    loaded := pio.load(&ECHO)!
+    config := loaded.config()
+    config.set_out_pins(6, 2)!
+    config.set_set_pins(6, 2)!
+    config.set_in_pins(8)!
+    config.set_jmp_pin(9)!
+    config.set_out_special(true, none)!
+    config.set_mov_status(rp_pio.STATUS_TX_LESS, 1)!
+    config.set_frequency(10_000_000)!
+    sm := pio.free_state_machine()!
+    sm.init(&config)
+    sm.set_pindirs(6, 2, 0b11)
+    pio.listen(0, rp_pio.rx_not_empty(sm.index()) | rp_pio.flag(0))
+    cortex_m.enable(pio.irq(0))
+    pio.enable_in_sync(1u32 << sm.index())
+    sm.put(5)
+    if let some(word) = sm.try_get() {
+        sm.exec_wait(ECHO.instructions[0])
+        sm.set_frequency(word + 1)!
+    }
+    sm.drain_tx()
+    flags := pio.flags()
+    pio.clear_flags(flags)
+    pio.release_state_machine(sm)
+    pio.unload(loaded)
+    b.pins.release_pio(pio)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for (name, path) in [("ws2812", &example), ("pio", &source)] {
+            for level in ["0", "2"] {
+                let object = scratch.path(&format!("{name}-{board}-O{level}.o"));
+                stdout(&dodo(&[
+                    "build",
+                    path.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "--emit",
+                    "obj",
+                    "-o",
+                    &object,
+                ]));
+            }
+        }
+    }
+}
+
 #[test]
 fn std_board_and_std_chip_follow_the_selected_platform() {
     let scratch = Scratch::new("imports");
@@ -534,8 +683,8 @@ fn rp2040_projects_link_to_flashable_firmware() {
     ]);
     check_rp2040_firmware(Path::new(&elf));
     // Portable drivers, tested with fakes, on the board's I2C bus and on
-    // an ADC input and a PWM output.
-    for name in ["hal_sensor_board", "dimmer_board"] {
+    // an ADC input and a PWM output, and WS2812 LEDs on PIO.
+    for name in ["hal_sensor_board", "dimmer_board", "ws2812"] {
         let source = root().join(format!("examples/{name}.dodo"));
         for level in ["0", "2"] {
             let elf = scratch.path(&format!("{name}-O{level}.elf"));
@@ -563,6 +712,7 @@ fn rp2350_projects_link_to_flashable_firmware() {
     let blink = root().join("examples/blink");
     let sensor = root().join("examples/hal_sensor_board.dodo");
     let dimmer = root().join("examples/dimmer_board.dodo");
+    let ws2812 = root().join("examples/ws2812.dodo");
     let selftest = root().join("tests/hardware/pico2");
     let selftest_w = root().join("tests/hardware/pico2_w");
     let float = root().join("tests/hardware/rp2350_float");
@@ -576,6 +726,8 @@ fn rp2350_projects_link_to_flashable_firmware() {
         (&sensor, "sensor-w", &["--board", "pico2_w"][..]),
         (&dimmer, "dimmer", &["--board", "pico2"][..]),
         (&dimmer, "dimmer-w", &["--board", "pico2_w"][..]),
+        (&ws2812, "ws2812", &["--board", "pico2"][..]),
+        (&ws2812, "ws2812-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),
         (&selftest_w, "selftest-w", &[][..]),
         (&float, "float", &["-b", "pico2"][..]),

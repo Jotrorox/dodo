@@ -1,0 +1,1066 @@
+package rp_pio
+
+import "std/embedded/hal"
+
+// Programmable I/O, the RP2040's and RP2350's small state machines for
+// protocols the other peripherals do not speak: WS2812 LEDs, extra serial
+// ports, parallel buses, and the Pico 2 W's wireless bus (RP2040 datasheet
+// 3, RP2350 datasheet 11). The RP2040 has two PIO blocks, the RP2350 three.
+// Each block has four state machines, which run programs from the block's
+// 32 shared instruction slots, move data to and from the program through
+// one 4-word FIFO each way, drive and read GPIOs, and signal each other and
+// the processor through eight IRQ flags.
+//
+// Programs are written in the Pico SDK's PIO assembly language and
+// assembled when the firmware is compiled, by `assemble`, so a mistake is a
+// compile error and a program costs no work at run time:
+//
+//     // High on the side-set pin for as many cycles as each word says.
+//     const PULSE: rp_pio.Program = rp_pio.assemble(
+//         ".side_set 1",
+//         "    pull block    side 0",
+//         "    out x, 32     side 0",
+//         "on:",
+//         "    jmp x-- on    side 1",
+//     )
+//
+// A program runs on a state machine claimed from a block, which a chip's
+// `Pins` hands out together with the GPIOs it drives:
+//
+//     pio := b.pins.pio(0)!
+//     b.pins.pio_pins(&pio, 15, 1)!        // GPIO 15 belongs to PIO0
+//     loaded := pio.load(&PULSE)!
+//     config := loaded.config()
+//     config.set_sideset_pins(15)!
+//     config.set_frequency(1_000_000)!     // one instruction per microsecond
+//     sm := pio.state_machine(0)!
+//     sm.init(&config)
+//     sm.set_pindirs(15, 1, 1)             // drive GPIO 15
+//     sm.set_enabled(true)
+//     sm.put(500_000)                      // high for half a second
+//
+// `assemble` exists only in firmware builds for these chips, and checks
+// that a program uses only instructions and settings of the chip's PIO
+// version: the RP2350's (version 1) adds `mov pindirs`, `mov` to and from
+// RX FIFO registers, `irq` and `wait irq` on the neighbouring blocks'
+// flags, `wait jmppin`, and more `.fifo` and `.mov_status` choices.
+//
+// The registers are shared by a block's state machines; each StateMachine
+// changes only its own bits of the shared ones, through the block's atomic
+// set, clear, and XOR aliases. Programs a state machine runs belong to the
+// Pio they were loaded into, so give every state machine back before its
+// block, and unload a program only once nothing runs it.
+
+// Block registers.
+const CTRL: usize = 0x000
+const FSTAT: usize = 0x004
+const FDEBUG: usize = 0x008
+const FLEVEL: usize = 0x00C
+const TXF0: usize = 0x010
+const RXF0: usize = 0x020
+const IRQ: usize = 0x030
+const IRQ_FORCE: usize = 0x034
+const INPUT_SYNC_BYPASS: usize = 0x038
+const INSTR_MEM0: usize = 0x048
+// The interrupt registers follow the state machines' on the RP2040 and the
+// RP2350's RX FIFO registers on the RP2350.
+const INTR_V0: usize = 0x128
+const INTR_V1: usize = 0x16C
+// The RP2350's RX FIFO registers, four per state machine.
+const RXF0_PUTGET0: usize = 0x128
+
+// State machine registers, SM_STRIDE apart from SM0's.
+const SM0: usize = 0x0C8
+const SM_STRIDE: usize = 0x18
+const CLKDIV: usize = 0x00
+const EXECCTRL: usize = 0x04
+const SHIFTCTRL: usize = 0x08
+const ADDR: usize = 0x0C
+const INSTR: usize = 0x10
+const PINCTRL: usize = 0x14
+
+// Atomic register aliases.
+const XOR_ALIAS: usize = 0x1000
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// CTRL: per state machine, one bit each from these.
+const SM_ENABLE: u32 = 0
+const SM_RESTART: u32 = 4
+const CLKDIV_RESTART: u32 = 8
+
+// FSTAT and FDEBUG: per state machine, one bit each from these.
+const RX_FULL: u32 = 0
+const RX_EMPTY: u32 = 8
+const TX_FULL: u32 = 16
+const TX_EMPTY: u32 = 24
+const RX_STALL: u32 = 0
+const RX_UNDER: u32 = 8
+const TX_OVER: u32 = 16
+const TX_STALL: u32 = 24
+
+// EXECCTRL.
+const EXEC_STALLED: u32 = 1 << 31
+const SIDE_EN: u32 = 1 << 30
+const SIDE_PINDIR: u32 = 1 << 29
+const JMP_PIN: u32 = 0x1F << 24
+const OUT_EN_SEL: u32 = 0x1F << 19
+const INLINE_OUT_EN: u32 = 1 << 18
+const OUT_STICKY: u32 = 1 << 17
+const WRAP_TOP: u32 = 0x1F << 12
+const WRAP_BOTTOM: u32 = 0x1F << 7
+// STATUS_SEL and STATUS_N: one and four bits on the RP2040, two and five
+// on the RP2350.
+const STATUS_V0: u32 = 0x1F
+const STATUS_V1: u32 = 0x7F
+
+// SHIFTCTRL.
+const FJOIN_RX: u32 = 1 << 31
+const FJOIN_TX: u32 = 1 << 30
+const PULL_THRESH: u32 = 0x1F << 25
+const PUSH_THRESH: u32 = 0x1F << 20
+const OUT_SHIFTDIR: u32 = 1 << 19
+const IN_SHIFTDIR: u32 = 1 << 18
+const AUTOPULL: u32 = 1 << 17
+const AUTOPUSH: u32 = 1 << 16
+const FJOIN_RX_GET: u32 = 1 << 15
+const FJOIN_RX_PUT: u32 = 1 << 14
+const IN_COUNT: u32 = 0x1F
+const JOINS: u32 = FJOIN_RX | FJOIN_TX | FJOIN_RX_GET | FJOIN_RX_PUT
+
+// PINCTRL.
+const SIDESET_COUNT: u32 = 0x7 << 29
+const SET_COUNT: u32 = 0x7 << 26
+const OUT_COUNT: u32 = 0x3F << 20
+const IN_BASE: u32 = 0x1F << 15
+const SIDESET_BASE: u32 = 0x1F << 10
+const SET_BASE: u32 = 0x1F << 5
+const OUT_BASE: u32 = 0x1F
+
+// Instructions the driver executes on state machines.
+const JMP: u16 = 0x0000
+const SET_PINS: u16 = 0xE000
+const SET_PINDIRS: u16 = 0xE080
+const PULL_NOBLOCK: u16 = 0x8080
+const OUT_NULL_32: u16 = 0x6060
+// The opcode bits; 0 for JMP.
+const OPCODE: u16 = 0xE000
+
+// Instruction slots in a block, and state machines.
+pub const INSTRUCTION_COUNT: u32 = 32
+pub const MACHINE_COUNT: u32 = 4
+// The GPIO numbers a state machine's pin mappings reach.
+pub const PIN_LIMIT: u32 = 32
+// Program.origin of a program that loads at any address.
+pub const ANYWHERE: u32 = 0xFFFF_FFFF
+
+// FIFO joins, for Program.fifo and Config.set_fifo_join. TX and RX give the
+// one FIFO both directions' entries, eight words deep. The rest are
+// RP2350 only and keep the TX FIFO: TXPUT makes the RX FIFO four registers
+// the program writes (with `mov rxfifo[...], isr`) and the processor reads
+// with StateMachine.rx_register, TXGET four the processor writes and the
+// program reads (`mov osr, rxfifo[...]`), and PUTGET four the program both
+// writes and reads.
+pub const FIFO_TXRX: u32 = 0
+pub const FIFO_TX: u32 = 1
+pub const FIFO_RX: u32 = 2
+pub const FIFO_TXPUT: u32 = 3
+pub const FIFO_TXGET: u32 = 4
+pub const FIFO_PUTGET: u32 = 5
+
+// What `mov x, status` reads as all ones, for Config.set_mov_status: the
+// TX FIFO holds fewer than N words, the RX FIFO does, or (RP2350) IRQ flag
+// N is set, with N + 8 for the previous block's flag N and N + 16 for the
+// next block's.
+pub const STATUS_TX_LESS: u32 = 0
+pub const STATUS_RX_LESS: u32 = 1
+pub const STATUS_IRQ: u32 = 2
+
+// Interrupt sources, for Pio.listen, ignore, and interrupts: the state
+// machine's RX FIFO holds a word, its TX FIFO has room, or IRQ flag n is
+// set (flags 0 to 3 on the RP2040, 0 to 7 on the RP2350).
+pub fn rx_not_empty(machine: u32) -> u32 {
+    return 1u32 << machine
+}
+
+pub fn tx_not_full(machine: u32) -> u32 {
+    return 1u32 << (4 + machine)
+}
+
+pub fn flag(number: u32) -> u32 {
+    return 1u32 << (8 + number)
+}
+
+// An assembled PIO program and the state machine settings it asks for,
+// from `assemble`. Load it into a block with Pio.load.
+pub struct Program {
+    // The instructions, `length` of them, with JMP targets relative to the
+    // first; loading adds the address the program lands at.
+    pub instructions: [32]u16
+    pub length: u32
+    // The address `.origin` fixes, or ANYWHERE.
+    pub origin: u32
+    // `.wrap_target` and `.wrap`, relative to the first instruction: after
+    // the instruction at `wrap`, the program continues at `wrap_target`.
+    // By default the program wraps from its last instruction to its first.
+    pub wrap_target: u32
+    pub wrap: u32
+    // `.side_set`: the delay field bits side-set takes, counting the enable
+    // bit of an optional side-set, whether it is optional, and whether it
+    // sets pin directions instead of levels. 0 without side-set.
+    pub side_set_count: u32
+    pub side_set_optional: bool
+    pub side_set_pindirs: bool
+    // The PIO version the program needs: 1 if it uses RP2350 features.
+    pub version: u32
+    // `.clock_div`, in 256ths: 256 runs one instruction per system clock.
+    pub clock_divider: u32
+    // `.fifo`: FIFO_TXRX to FIFO_PUTGET.
+    pub fifo: u32
+    // `.mov_status`: STATUS_TX_LESS, STATUS_RX_LESS, or STATUS_IRQ, and N.
+    pub status_select: u32
+    pub status_n: u32
+    // `.in`: the pins IN reads unmasked (RP2350; 32 reads all), whether
+    // the ISR shifts right, autopush, and its threshold in bits.
+    pub in_count: u32
+    pub in_right: bool
+    pub autopush: bool
+    pub push_threshold: u32
+    // `.out`: the pins OUT drives, whether the OSR shifts right, autopull,
+    // and its threshold in bits.
+    pub out_count: u32
+    pub out_right: bool
+    pub autopull: bool
+    pub pull_threshold: u32
+    // `.set`: the pins SET drives, 0 to 5.
+    pub set_count: u32
+}
+
+// Assemble a PIO program when the firmware is compiled, from string
+// literals, one line each, and return it. The language is the Pico SDK's
+// pioasm: labels, `.define`, expressions, side-set and delay, every
+// instruction, and the directives above; comments start with `;` or `//`.
+// The program may also be one literal with `\n` between its lines. An
+// error in the program is a compile error at its line. Only firmware for
+// the RP2040 and RP2350 can assemble programs.
+@compiler(pio)
+pub fn assemble(source: &str) -> Program
+
+// A state machine's settings: clock divider, pin mappings, shifting, FIFO
+// joins, and wrap. Loaded.config starts one from the program's settings;
+// the set_ methods change it, and StateMachine.init applies it.
+pub struct Config {
+    clock_hz: u32
+    version: u32
+    start: u32
+    clkdiv: u32
+    execctrl: u32
+    shiftctrl: u32
+    pinctrl: u32
+
+    // Run one instruction every `divider` 256ths of a system clock cycle,
+    // from 256 (every cycle) to 65535 255/256 cycles. InvalidInput outside
+    // that range.
+    pub fn set_divider(&mut self, divider: u32) -> void!hal.Error {
+        if divider < 256 || divider > 0xFF_FFFF {
+            return err(hal.Error.InvalidInput)
+        }
+        self.clkdiv = divider << 8
+        return ok()
+    }
+
+    // Run `frequency_hz` instructions a second, as closely as the divider
+    // allows: from the system clock frequency down to 1/65536th of it.
+    // InvalidInput outside that range.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        if frequency_hz == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        scaled := self.clock_hz as u64 * 256
+        divider := (scaled + frequency_hz as u64 / 2) / frequency_hz as u64
+        if divider > 0xFF_FFFF {
+            return err(hal.Error.InvalidInput)
+        }
+        return self.set_divider(divider as u32)
+    }
+
+    // The divider, in 256ths.
+    pub fn divider(&self) -> u32 {
+        return self.clkdiv >> 8
+    }
+
+    // The instruction rate the divider gives, rounded to whole hertz.
+    pub fn frequency_hz(&self) -> u32 {
+        divider := (self.clkdiv >> 8) as u64
+        return ((self.clock_hz as u64 * 256 + divider / 2) / divider) as u32
+    }
+
+    // OUT and `mov pins` drive `count` pins from GPIO `first`, wrapping
+    // after GPIO 31. InvalidInput for a pin above 31 or more than 32 pins.
+    pub fn set_out_pins(&mut self, first: u32, count: u32) -> void!hal.Error {
+        if first >= PIN_LIMIT || count > 32 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.pinctrl = with_field(self.pinctrl, OUT_BASE, first)
+        self.pinctrl = with_field(self.pinctrl, OUT_COUNT, count)
+        return ok()
+    }
+
+    // SET drives `count` pins, up to five, from GPIO `first`.
+    pub fn set_set_pins(&mut self, first: u32, count: u32) -> void!hal.Error {
+        if first >= PIN_LIMIT || count > 5 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.pinctrl = with_field(self.pinctrl, SET_BASE, first)
+        self.pinctrl = with_field(self.pinctrl, SET_COUNT, count)
+        return ok()
+    }
+
+    // IN, `wait pin`, and `mov x, pins` read from GPIO `first` up. They
+    // read any GPIO with its input enabled, whichever function drives it:
+    // pins given to the block, and pins claimed as inputs, for example.
+    pub fn set_in_pins(&mut self, first: u32) -> void!hal.Error {
+        if first >= PIN_LIMIT {
+            return err(hal.Error.InvalidInput)
+        }
+        self.pinctrl = with_field(self.pinctrl, IN_BASE, first)
+        return ok()
+    }
+
+    // Reads of the IN pins see only the first `count` of them, 1 to 32,
+    // and zeros above (RP2350). Unsupported on the RP2040, which always
+    // reads 32 pins, unless `count` is 32.
+    pub fn set_in_count(&mut self, count: u32) -> void!hal.Error {
+        if count == 0 || count > 32 {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.version == 0 {
+            if count != 32 {
+                return err(hal.Error.Unsupported)
+            }
+            return ok()
+        }
+        self.shiftctrl = with_field(self.shiftctrl, IN_COUNT, count % 32)
+        return ok()
+    }
+
+    // Side-set drives pins from GPIO `first`; the program's `.side_set`
+    // decides how many.
+    pub fn set_sideset_pins(&mut self, first: u32) -> void!hal.Error {
+        if first >= PIN_LIMIT {
+            return err(hal.Error.InvalidInput)
+        }
+        self.pinctrl = with_field(self.pinctrl, SIDESET_BASE, first)
+        return ok()
+    }
+
+    // `jmp pin` branches on GPIO `pin`, and `wait jmppin` waits on it.
+    pub fn set_jmp_pin(&mut self, pin: u32) -> void!hal.Error {
+        if pin >= PIN_LIMIT {
+            return err(hal.Error.InvalidInput)
+        }
+        self.execctrl = with_field(self.execctrl, JMP_PIN, pin)
+        return ok()
+    }
+
+    // The OSR shifts right (least significant bit first) or left, and with
+    // `autopull` refills from the TX FIFO once OUT has shifted out
+    // `threshold` bits, 1 to 32.
+    pub fn set_out_shift(&mut self, right: bool, autopull: bool, threshold: u32) -> void!hal.Error {
+        if threshold == 0 || threshold > 32 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.shiftctrl = with(self.shiftctrl, OUT_SHIFTDIR, right)
+        self.shiftctrl = with(self.shiftctrl, AUTOPULL, autopull)
+        self.shiftctrl = with_field(self.shiftctrl, PULL_THRESH, threshold % 32)
+        return ok()
+    }
+
+    // The ISR shifts right or left, and with `autopush` goes to the RX
+    // FIFO once IN has shifted in `threshold` bits, 1 to 32.
+    pub fn set_in_shift(&mut self, right: bool, autopush: bool, threshold: u32) -> void!hal.Error {
+        if threshold == 0 || threshold > 32 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.shiftctrl = with(self.shiftctrl, IN_SHIFTDIR, right)
+        self.shiftctrl = with(self.shiftctrl, AUTOPUSH, autopush)
+        self.shiftctrl = with_field(self.shiftctrl, PUSH_THRESH, threshold % 32)
+        return ok()
+    }
+
+    // Join the FIFOs: FIFO_TXRX to FIFO_PUTGET. InvalidInput for another
+    // value, Unsupported for an RP2350 join on the RP2040.
+    pub fn set_fifo_join(&mut self, join: u32) -> void!hal.Error {
+        bits := 0u32
+        if join == FIFO_TX {
+            bits = FJOIN_TX
+        } else if join == FIFO_RX {
+            bits = FJOIN_RX
+        } else if join == FIFO_TXPUT {
+            bits = FJOIN_RX_PUT
+        } else if join == FIFO_TXGET {
+            bits = FJOIN_RX_GET
+        } else if join == FIFO_PUTGET {
+            bits = FJOIN_RX_PUT | FJOIN_RX_GET
+        } else if join != FIFO_TXRX {
+            return err(hal.Error.InvalidInput)
+        }
+        if join >= FIFO_TXPUT && self.version == 0 {
+            return err(hal.Error.Unsupported)
+        }
+        self.shiftctrl = (self.shiftctrl & ~JOINS) | bits
+        return ok()
+    }
+
+    // With `sticky`, the OUT pins keep their last level and direction
+    // while OUT and SET do not write them. With `enable_pin`, an OUT data
+    // bit at that index (0 to 31) decides whether each OUT writes the pins
+    // at all.
+    pub fn set_out_special(&mut self, sticky: bool, enable_pin: Option<u32>) -> void!hal.Error {
+        self.execctrl = with(self.execctrl, OUT_STICKY, sticky)
+        if let some(index) = enable_pin {
+            if index >= 32 {
+                return err(hal.Error.InvalidInput)
+            }
+            self.execctrl = with_field(self.execctrl | INLINE_OUT_EN, OUT_EN_SEL, index)
+        } else {
+            self.execctrl &= ~INLINE_OUT_EN
+        }
+        return ok()
+    }
+
+    // What `mov x, status` reads as all ones: STATUS_TX_LESS or
+    // STATUS_RX_LESS with a FIFO level `n`, or STATUS_IRQ (RP2350) with a
+    // flag. InvalidInput for values out of range, Unsupported for
+    // STATUS_IRQ on the RP2040.
+    pub fn set_mov_status(&mut self, select: u32, n: u32) -> void!hal.Error {
+        if select > STATUS_IRQ || n > 31 || (select == STATUS_IRQ && n >= 24) {
+            return err(hal.Error.InvalidInput)
+        }
+        if self.version > 0 {
+            self.execctrl = (self.execctrl & ~STATUS_V1) | (select << 5) | n
+            return ok()
+        }
+        if select == STATUS_IRQ {
+            return err(hal.Error.Unsupported)
+        }
+        if n > 15 {
+            return err(hal.Error.InvalidInput)
+        }
+        self.execctrl = (self.execctrl & ~STATUS_V0) | (select << 4) | n
+        return ok()
+    }
+
+    // After the instruction at address `wrap`, continue at `target`,
+    // both absolute addresses (Loaded.offset plus the program's).
+    pub fn set_wrap(&mut self, target: u32, wrap: u32) -> void!hal.Error {
+        if target >= INSTRUCTION_COUNT || wrap >= INSTRUCTION_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        self.execctrl = with_field(self.execctrl, WRAP_BOTTOM, target)
+        self.execctrl = with_field(self.execctrl, WRAP_TOP, wrap)
+        return ok()
+    }
+
+    // StateMachine.init starts the program at absolute address `address`,
+    // instead of at the program's first instruction.
+    pub fn set_start(&mut self, address: u32) -> void!hal.Error {
+        if address >= INSTRUCTION_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        self.start = address
+        return ok()
+    }
+
+    pub fn copy(&self) -> Config {
+        return Config {
+            clock_hz: self.clock_hz,
+            version: self.version,
+            start: self.start,
+            clkdiv: self.clkdiv,
+            execctrl: self.execctrl,
+            shiftctrl: self.shiftctrl,
+            pinctrl: self.pinctrl,
+        }
+    }
+}
+
+// `value` with field `mask` holding `field`.
+fn with_field(value: u32, mask: u32, field: u32) -> u32 {
+    return (value & ~mask) | hal.encode(mask, field)
+}
+
+// `value` with the bits of `mask` set if `on`, clear otherwise.
+fn with(value: u32, mask: u32, on: bool) -> u32 {
+    if on {
+        return value | mask
+    }
+    return value & ~mask
+}
+
+// A program in a block's instruction memory, from Pio.load.
+pub struct Loaded {
+    block: u32
+    offset: u32
+    length: u32
+    config: Config
+
+    // The address of the program's first instruction. Add a label's
+    // address in the program to get its address in the block.
+    pub fn offset(&self) -> u32 {
+        return self.offset
+    }
+
+    pub fn length(&self) -> u32 {
+        return self.length
+    }
+
+    // The settings the program asks for: its wrap, side-set, and the
+    // `.clock_div`, `.fifo`, `.mov_status`, `.in`, `.out`, and `.set`
+    // directives, starting at its first instruction. Pins start at GPIO 0.
+    pub fn config(&self) -> Config {
+        return self.config.copy()
+    }
+}
+
+// A PIO block, claimed from a chip's Pins with `pins.pio(n)`: its
+// instruction memory, state machines, IRQ flags, and interrupts.
+pub struct Pio {
+    registers: hal.RegisterBlock
+    number: u32
+    version: u32
+    clock_hz: u32
+    irq: u32
+    // Instruction slots and state machines in use, one bit each.
+    memory: u32
+    machines: u32
+
+    // The block `number` at `base`, a PIO of version `version`, clocked at
+    // `clock_hz`, raising interrupts `irq` and `irq + 1`.
+    // SAFETY: `base` must be the base address of PIO block `number`, out
+    // of reset and in its reset state, and only this Pio and the
+    // StateMachines it hands out may use it.
+    pub unsafe fn at(base: usize, number: u32, version: u32, clock_hz: u32, irq: u32) -> Pio {
+        unsafe {
+            return Pio { registers: hal.RegisterBlock.at(base), number, version, clock_hz, irq, memory: 0, machines: 0 }
+        }
+    }
+
+    // The block number: 0 to 1 on the RP2040, 0 to 2 on the RP2350.
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // The block's PIO version: 0 on the RP2040, 1 on the RP2350.
+    pub fn version(&self) -> u32 {
+        return self.version
+    }
+
+    // The instruction slots in use, one bit each.
+    pub fn memory(&self) -> u32 {
+        return self.memory
+    }
+
+    // Load `program` into free instruction slots: at its `.origin`, or
+    // else at the highest free addresses it fits. Busy if it does not fit,
+    // InvalidInput for an empty program or one longer than 32 instructions,
+    // Unsupported for an RP2350 program on the RP2040.
+    pub fn load(&mut self, program: &Program) -> Loaded!hal.Error {
+        length := program.length
+        if length == 0 || length > INSTRUCTION_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        if program.version > self.version {
+            return err(hal.Error.Unsupported)
+        }
+        mask := 0xFFFF_FFFFu32 >> (32 - length)
+        offset := 0u32
+        if program.origin != ANYWHERE {
+            if program.origin > INSTRUCTION_COUNT - length {
+                return err(hal.Error.InvalidInput)
+            }
+            if (self.memory & (mask << program.origin)) != 0 {
+                return err(hal.Error.Busy)
+            }
+            offset = program.origin
+        } else {
+            found := false
+            candidate := INSTRUCTION_COUNT - length
+            for !found {
+                if (self.memory & (mask << candidate)) == 0 {
+                    found = true
+                    offset = candidate
+                } else if candidate == 0 {
+                    return err(hal.Error.Busy)
+                } else {
+                    candidate -= 1
+                }
+            }
+        }
+        config := self.config_for(program, offset)?
+        for index in 0..length {
+            word := program.instructions[index as usize]
+            if (word & OPCODE) == JMP {
+                word += offset as u16
+            }
+            self.registers.write(INSTR_MEM0 + 4 * (offset + index) as usize, word as u32)
+        }
+        self.memory |= mask << offset
+        return ok(Loaded { block: self.number, offset, length, config })
+    }
+
+    // Free the slots of a program from `load` of this block. State machines
+    // must no longer run it.
+    pub fn unload(&mut self, loaded: Loaded) {
+        core.assert(loaded.block == self.number)
+        mask := 0xFFFF_FFFFu32 >> (32 - loaded.length)
+        self.memory &= ~(mask << loaded.offset)
+    }
+
+    // Claim state machine `index`, 0 to 3, stopped. Busy if it is claimed,
+    // InvalidInput for another index.
+    pub fn state_machine(&mut self, index: u32) -> StateMachine!hal.Error {
+        if index >= MACHINE_COUNT {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << index
+        if (self.machines & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.machines |= bit
+        // SAFETY: `at` makes this Pio the block's owner, and the claim
+        // above makes the StateMachine the only user of its registers; it
+        // changes only its own bits of the shared ones, through the
+        // aliases.
+        registers := unsafe {
+            hal.RegisterBlock.at(self.registers.base())
+        }
+        return ok(StateMachine { registers, block: self.number, index, sm: SM0 + SM_STRIDE * index as usize, version: self.version, clock_hz: self.clock_hz })
+    }
+
+    // Claim the lowest-numbered free state machine. Busy if all four are
+    // claimed.
+    pub fn free_state_machine(&mut self) -> StateMachine!hal.Error {
+        for index in 0..MACHINE_COUNT {
+            if (self.machines & (1u32 << index)) == 0 {
+                return self.state_machine(index)
+            }
+        }
+        return err(hal.Error.Busy)
+    }
+
+    // Stop a state machine claimed from this block and give it back, with
+    // its interrupt sources turned off.
+    pub fn release_state_machine(&mut self, machine: StateMachine) {
+        core.assert(machine.block == self.number)
+        machine.set_enabled(false)
+        sources := rx_not_empty(machine.index) | tx_not_full(machine.index)
+        self.ignore(0, sources)
+        self.ignore(1, sources)
+        self.machines &= ~(1u32 << machine.index)
+    }
+
+    // The state machines claimed, one bit each.
+    pub fn machines(&self) -> u32 {
+        return self.machines
+    }
+
+    // Start the claimed state machines among `machines` (one bit each)
+    // together, with their clock dividers in step, so they run in lock
+    // step.
+    pub fn enable_in_sync(&mut self, machines: u32) {
+        owned := machines & self.machines
+        self.registers.write(CTRL + SET_ALIAS, (owned << SM_ENABLE) | (owned << CLKDIV_RESTART))
+    }
+
+    // The IRQ flags that are set, one bit each.
+    pub fn flags(&mut self) -> u32 {
+        return self.registers.read(IRQ) & 0xFF
+    }
+
+    // Clear the IRQ flags among `flags`, releasing state machines waiting
+    // for them to clear.
+    pub fn clear_flags(&mut self, flags: u32) {
+        self.registers.write(IRQ, flags & 0xFF)
+    }
+
+    // Set the IRQ flags among `flags`, as an `irq` instruction would.
+    pub fn force_flags(&mut self, flags: u32) {
+        self.registers.write(IRQ_FORCE, flags & 0xFF)
+    }
+
+    // The interrupt number of the block's interrupt line 0 or 1, for
+    // cortex_m.enable and `@interrupt`.
+    pub fn irq(&self, line: u32) -> u32 {
+        core.assert(line < 2)
+        return self.irq + line
+    }
+
+    // Raise interrupt line `line`, 0 or 1, while any of `sources` is
+    // active: rx_not_empty, tx_not_full, and flag bits. Enable the
+    // interrupt in the NVIC too: `cortex_m.enable(pio.irq(line))`.
+    pub fn listen(&mut self, line: u32, sources: u32) {
+        inte := self.inte(line)
+        mask := self.source_mask()
+        self.registers.write(inte + SET_ALIAS, sources & mask)
+    }
+
+    // Stop raising line `line` for `sources`.
+    pub fn ignore(&mut self, line: u32, sources: u32) {
+        inte := self.inte(line)
+        mask := self.source_mask()
+        self.registers.write(inte + CLEAR_ALIAS, sources & mask)
+    }
+
+    // The listened-to sources raising line `line` now. A flag stays active
+    // until cleared with clear_flags; FIFO sources until the FIFO changes.
+    pub fn interrupts(&mut self, line: u32) -> u32 {
+        inte := self.inte(line)
+        return self.registers.read(inte + 8)
+    }
+
+    // Read GPIO `pin` straight from the pad, without the two-cycle input
+    // synchronizer, if `bypass`: faster for clocked inputs, and safe only
+    // for signals synchronous to the system clock.
+    pub fn bypass_input_sync(&mut self, pin: u32, bypass: bool) {
+        core.assert(pin < PIN_LIMIT)
+        if bypass {
+            self.registers.write(INPUT_SYNC_BYPASS + SET_ALIAS, 1u32 << pin)
+        } else {
+            self.registers.write(INPUT_SYNC_BYPASS + CLEAR_ALIAS, 1u32 << pin)
+        }
+    }
+
+    // Stop every state machine and return the block number, for the chip
+    // package to hold the block in reset. Every state machine must have
+    // been given back.
+    pub fn release(self) -> u32 {
+        core.assert(self.machines == 0)
+        self.registers.write(CTRL, 0)
+        return self.number
+    }
+
+    // IRQ0_INTE, or IRQ1_INTE for line 1; INTF and INTS follow each.
+    fn inte(&self, line: u32) -> usize {
+        core.assert(line < 2)
+        base := INTR_V0
+        if self.version > 0 {
+            base = INTR_V1
+        }
+        return base + 4 + 12 * line as usize
+    }
+
+    // The interrupt sources: four flags on the RP2040, eight on the RP2350.
+    fn source_mask(&self) -> u32 {
+        if self.version > 0 {
+            return 0xFFFF
+        }
+        return 0xFFF
+    }
+
+    // The settings `program` asks for at `offset`. InvalidInput for
+    // settings out of range, Unsupported for RP2350 ones on the RP2040.
+    fn config_for(&self, program: &Program, offset: u32) -> Config!hal.Error {
+        length := program.length
+        if program.wrap_target >= length || program.wrap >= length || program.side_set_count > 5 || program.set_count > 5 || program.out_count > 32 || program.in_count == 0 || program.in_count > 32 {
+            return err(hal.Error.InvalidInput)
+        }
+        if program.push_threshold == 0 || program.push_threshold > 32 || program.pull_threshold == 0 || program.pull_threshold > 32 {
+            return err(hal.Error.InvalidInput)
+        }
+        execctrl := hal.encode(WRAP_TOP, offset + program.wrap) | hal.encode(WRAP_BOTTOM, offset + program.wrap_target)
+        execctrl = with(execctrl, SIDE_EN, program.side_set_optional)
+        execctrl = with(execctrl, SIDE_PINDIR, program.side_set_pindirs)
+        shiftctrl := hal.encode(PULL_THRESH, program.pull_threshold % 32) | hal.encode(PUSH_THRESH, program.push_threshold % 32)
+        shiftctrl = with(shiftctrl, OUT_SHIFTDIR, program.out_right)
+        shiftctrl = with(shiftctrl, IN_SHIFTDIR, program.in_right)
+        shiftctrl = with(shiftctrl, AUTOPULL, program.autopull)
+        shiftctrl = with(shiftctrl, AUTOPUSH, program.autopush)
+        config := Config {
+            clock_hz: self.clock_hz,
+            version: self.version,
+            start: offset,
+            clkdiv: 0,
+            execctrl,
+            shiftctrl,
+            pinctrl: hal.encode(SIDESET_COUNT, program.side_set_count) | hal.encode(SET_COUNT, program.set_count) | hal.encode(OUT_COUNT, program.out_count),
+        }
+        config.set_divider(program.clock_divider)?
+        config.set_in_count(program.in_count)?
+        config.set_fifo_join(program.fifo)?
+        config.set_mov_status(program.status_select, program.status_n)?
+        return ok(config)
+    }
+}
+
+// One state machine, claimed with Pio.state_machine. It runs the program
+// a Config points it at, moving words through its FIFOs.
+pub struct StateMachine {
+    registers: hal.RegisterBlock
+    block: u32
+    index: u32
+    // Its registers' offset in the block.
+    sm: usize
+    version: u32
+    clock_hz: u32
+
+    // 0 to 3, within its block.
+    pub fn index(&self) -> u32 {
+        return self.index
+    }
+
+    // The number of the block it belongs to.
+    pub fn block(&self) -> u32 {
+        return self.block
+    }
+
+    // Stop the state machine and set it up with `config`: its settings
+    // apply, its FIFOs and their error flags clear, its state (shift
+    // counters, delay, stall) resets, and it jumps to the config's start.
+    // Its X, Y, ISR, and OSR keep their values. Start it with set_enabled.
+    pub fn init(&mut self, config: &Config) {
+        self.set_enabled(false)
+        self.registers.write(self.sm + CLKDIV, config.clkdiv)
+        self.registers.write(self.sm + EXECCTRL, config.execctrl)
+        self.registers.write(self.sm + SHIFTCTRL, config.shiftctrl)
+        self.registers.write(self.sm + PINCTRL, config.pinctrl)
+        self.clear_fifos()
+        errors := (1u32 << TX_STALL) | (1u32 << TX_OVER) | (1u32 << RX_UNDER) | (1u32 << RX_STALL)
+        self.registers.write(FDEBUG, errors << self.index)
+        self.restart()
+        self.restart_clock()
+        self.jump(config.start)
+    }
+
+    // Run (true) or pause (false) the program. A paused state machine
+    // keeps its state and resumes where it stopped.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        bit := 1u32 << (SM_ENABLE + self.index)
+        if enabled {
+            self.registers.write(CTRL + SET_ALIAS, bit)
+        } else {
+            self.registers.write(CTRL + CLEAR_ALIAS, bit)
+        }
+    }
+
+    pub fn is_enabled(&mut self) -> bool {
+        return (self.registers.read(CTRL) & (1u32 << (SM_ENABLE + self.index))) != 0
+    }
+
+    // Reset the state machine's internal state: shift counters, a pending
+    // delay or stall, and its sticky output. Not its registers or FIFOs.
+    pub fn restart(&mut self) {
+        self.registers.write(CTRL + SET_ALIAS, 1u32 << (SM_RESTART + self.index))
+    }
+
+    // Restart the clock divider's phase, as enable_in_sync does for
+    // several state machines.
+    pub fn restart_clock(&mut self) {
+        self.registers.write(CTRL + SET_ALIAS, 1u32 << (CLKDIV_RESTART + self.index))
+    }
+
+    // Change the clock divider while running, in 256ths, as for
+    // Config.set_divider.
+    pub fn set_divider(&mut self, divider: u32) -> void!hal.Error {
+        if divider < 256 || divider > 0xFF_FFFF {
+            return err(hal.Error.InvalidInput)
+        }
+        self.registers.write(self.sm + CLKDIV, divider << 8)
+        return ok()
+    }
+
+    // Change the instruction rate while running, as for
+    // Config.set_frequency.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        if frequency_hz == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        divider := (self.clock_hz as u64 * 256 + frequency_hz as u64 / 2) / frequency_hz as u64
+        if divider > 0xFF_FFFF {
+            return err(hal.Error.InvalidInput)
+        }
+        return self.set_divider(divider as u32)
+    }
+
+    // Write `word` to the TX FIFO, waiting while it is full. Waits forever
+    // if the program never takes words.
+    pub fn put(&mut self, word: u32) {
+        for self.is_tx_full() {}
+        self.registers.write(TXF0 + 4 * self.index as usize, word)
+    }
+
+    // Write `word` to the TX FIFO unless it is full. Returns whether it did.
+    pub fn try_put(&mut self, word: u32) -> bool {
+        if self.is_tx_full() {
+            return false
+        }
+        self.registers.write(TXF0 + 4 * self.index as usize, word)
+        return true
+    }
+
+    // Read a word from the RX FIFO, waiting while it is empty. Waits
+    // forever if the program never pushes.
+    pub fn get(&mut self) -> u32 {
+        for self.is_rx_empty() {}
+        return self.registers.read(RXF0 + 4 * self.index as usize)
+    }
+
+    // Read a word from the RX FIFO, or none if it is empty.
+    pub fn try_get(&mut self) -> Option<u32> {
+        if self.is_rx_empty() {
+            return none
+        }
+        return some(self.registers.read(RXF0 + 4 * self.index as usize))
+    }
+
+    // The words in the TX and RX FIFOs.
+    pub fn tx_level(&mut self) -> u32 {
+        return (self.registers.read(FLEVEL) >> (8 * self.index)) & 0xF
+    }
+
+    pub fn rx_level(&mut self) -> u32 {
+        return (self.registers.read(FLEVEL) >> (8 * self.index + 4)) & 0xF
+    }
+
+    pub fn is_tx_full(&mut self) -> bool {
+        return self.status(TX_FULL)
+    }
+
+    pub fn is_tx_empty(&mut self) -> bool {
+        return self.status(TX_EMPTY)
+    }
+
+    pub fn is_rx_full(&mut self) -> bool {
+        return self.status(RX_FULL)
+    }
+
+    pub fn is_rx_empty(&mut self) -> bool {
+        return self.status(RX_EMPTY)
+    }
+
+    // Empty both FIFOs, dropping their words.
+    pub fn clear_fifos(&mut self) {
+        // Changing a FIFO join empties the FIFOs; change it there and back.
+        self.registers.write(self.sm + SHIFTCTRL + XOR_ALIAS, FJOIN_RX)
+        self.registers.write(self.sm + SHIFTCTRL + XOR_ALIAS, FJOIN_RX)
+    }
+
+    // Drop the words in the TX FIFO by pulling them into the OSR with
+    // executed instructions, which changes the OSR.
+    pub fn drain_tx(&mut self) {
+        instruction := PULL_NOBLOCK
+        if (self.registers.read(self.sm + SHIFTCTRL) & AUTOPULL) != 0 {
+            instruction = OUT_NULL_32
+        }
+        for !self.is_tx_empty() {
+            self.exec(instruction)
+        }
+    }
+
+    // Whether the program stalled on an empty TX FIFO since the last call,
+    // as it does once it has sent every word; clears the flag.
+    pub fn take_tx_stall(&mut self) -> bool {
+        bit := 1u32 << (TX_STALL + self.index)
+        stalled := (self.registers.read(FDEBUG) & bit) != 0
+        self.registers.write(FDEBUG, bit)
+        return stalled
+    }
+
+    // Run `instruction` at once, between the program's own, or on a
+    // stopped state machine. One that stalls, such as a blocking `pull`,
+    // finishes when its condition is met, while the program waits.
+    pub fn exec(&mut self, instruction: u16) {
+        self.registers.write(self.sm + INSTR, instruction as u32)
+    }
+
+    // exec, then wait until the instruction has finished stalling.
+    pub fn exec_wait(&mut self, instruction: u16) {
+        self.exec(instruction)
+        for self.is_exec_stalled() {}
+    }
+
+    // Whether an instruction from exec is still stalled.
+    pub fn is_exec_stalled(&mut self) -> bool {
+        return (self.registers.read(self.sm + EXECCTRL) & EXEC_STALLED) != 0
+    }
+
+    // The address of the instruction it runs now.
+    pub fn address(&mut self) -> u32 {
+        return self.registers.read(self.sm + ADDR) & 0x1F
+    }
+
+    // Continue at absolute address `address`.
+    pub fn jump(&mut self, address: u32) {
+        core.assert(address < INSTRUCTION_COUNT)
+        self.exec(JMP | address as u16)
+    }
+
+    // Drive the `count` pins from GPIO `first` to the levels in `levels`,
+    // bit 0 for `first`, through the state machine. Use it before starting
+    // a program, to give its pins defined levels; the pins must belong to
+    // the block (Pins.pio_pins).
+    pub fn set_pins(&mut self, first: u32, count: u32, levels: u32) {
+        self.set_each(SET_PINS, first, count, levels)
+    }
+
+    // Make the `count` pins from GPIO `first` outputs where `outputs` has a
+    // one, bit 0 for `first`, and inputs elsewhere, as for set_pins.
+    pub fn set_pindirs(&mut self, first: u32, count: u32, outputs: u32) {
+        self.set_each(SET_PINDIRS, first, count, outputs)
+    }
+
+    // RX FIFO register `index`, 0 to 3, which the program writes with
+    // `mov rxfifo[index], isr` under FIFO_TXPUT or FIFO_PUTGET (RP2350).
+    // Unsupported on the RP2040, InvalidInput for another index.
+    pub fn rx_register(&mut self, index: u32) -> u32!hal.Error {
+        offset := self.putget(index)?
+        return ok(self.registers.read(offset))
+    }
+
+    // Write RX FIFO register `index`, which the program reads with
+    // `mov osr, rxfifo[index]` under FIFO_TXGET or FIFO_PUTGET (RP2350).
+    pub fn set_rx_register(&mut self, index: u32, value: u32) -> void!hal.Error {
+        offset := self.putget(index)?
+        self.registers.write(offset, value)
+        return ok()
+    }
+
+    // The addresses of the TX and RX FIFOs, for DMA.
+    pub fn tx_fifo_address(&self) -> usize {
+        return self.registers.base() + TXF0 + 4 * self.index as usize
+    }
+
+    pub fn rx_fifo_address(&self) -> usize {
+        return self.registers.base() + RXF0 + 4 * self.index as usize
+    }
+
+    fn status(&mut self, shift: u32) -> bool {
+        return (self.registers.read(FSTAT) & (1u32 << (shift + self.index))) != 0
+    }
+
+    fn putget(&self, index: u32) -> usize!hal.Error {
+        if self.version == 0 {
+            return err(hal.Error.Unsupported)
+        }
+        if index >= 4 {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(RXF0_PUTGET0 + 16 * self.index as usize + 4 * index as usize)
+    }
+
+    // Execute `set pins` or `set pindirs` once per pin, with SET mapped to
+    // that pin alone, then restore the pin mapping and sticky output.
+    fn set_each(&mut self, instruction: u16, first: u32, count: u32, values: u32) {
+        core.assert(first < PIN_LIMIT && count <= 32)
+        pinctrl := self.registers.read(self.sm + PINCTRL)
+        execctrl := self.registers.read(self.sm + EXECCTRL)
+        self.registers.write(self.sm + EXECCTRL + CLEAR_ALIAS, OUT_STICKY)
+        for offset in 0..count {
+            pin := (first + offset) % PIN_LIMIT
+            self.registers.write(self.sm + PINCTRL, hal.encode(SET_COUNT, 1) | hal.encode(SET_BASE, pin))
+            self.exec(instruction | ((values >> offset) & 1) as u16)
+        }
+        self.registers.write(self.sm + PINCTRL, pinctrl)
+        self.registers.write(self.sm + EXECCTRL, execctrl)
+    }
+}

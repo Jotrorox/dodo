@@ -4,6 +4,7 @@ import "std/embedded/board"
 import "core/mem"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_pio"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
 import "std/embedded/hal"
@@ -15,7 +16,7 @@ import "std/sync/atomic"
 
 // Hardware self-test for the `pico` board: the RP2040 startup runtime,
 // std/embedded/chip/rp2040 (clocks, timer, I2C, SPI, UART, PWM, the ADC,
-// the USB serial port, single ownership, configuration checks), std/embedded/board/pico, and the runtime's integer and
+// PIO, the USB serial port, single ownership, configuration checks), std/embedded/board/pico, and the runtime's integer and
 // floating-point helpers. Every outcome ends in the USB bootloader with a
 // record that scripts/test_pico.py reads over USB with picotool. Words at
 // RECORD (SRAM, kept by the boot ROM):
@@ -727,6 +728,97 @@ fn pwm_adc_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
     check(inputs_owned && sensor_owned && in_range && restarted && elapsed >= 400 && elapsed < 1500 && celsius > 0 && celsius < 70_000)
 }
 
+// PIO programs for pio_checks: one that echoes each word inverted, and a
+// square wave on its side-set pin, half high and half low, that sets IRQ
+// flag 0 each period.
+const ECHO: rp_pio.Program = rp_pio.assemble(
+    "    pull block",
+    "    mov isr, ~osr",
+    "    push block",
+)
+const SQUARE: rp_pio.Program = rp_pio.assemble(
+    ".side_set 1",
+    "    irq 0   side 1 [15]",
+    "    nop     side 0 [15]",
+)
+const FILLER: rp_pio.Program = rp_pio.assemble(".origin 0", "nop [1]", "nop [2]", "nop [3]", "nop [4]", "nop [5]", "nop [6]", "nop [7]", "nop [8]", "nop [9]", "nop [10]", "nop [11]", "nop [12]", "nop [13]", "nop [14]", "nop [15]", "nop [16]", "nop [17]", "nop [18]", "nop [19]", "nop [20]", "nop [21]", "nop [22]", "nop [23]", "nop [24]", "nop [25]", "nop [26]", "nop [27]")
+// PIO with nothing connected (3 checks): block, program memory, state
+// machine, and pin ownership and validation; a program echoing words
+// through the FIFOs; a side-set square wave read
+// back from its pad, with its IRQ flag.
+fn pio_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    validated := refused(pins.pio(chip.PIO_BLOCKS), hal.Error.InvalidInput)
+    pio := pins.pio(0)!
+    pins.pio_pins(&pio, 15, 1)!
+    owned := refused(pins.pio(0), hal.Error.Busy) && refused(pins.output(15), hal.Error.Busy) && failed_with(pins.pio_pins(&pio, 15, 1), hal.Error.Busy) && failed_with(pins.pio_pins(&pio, 29, 2), hal.Error.InvalidInput)
+    filler := pio.load(&FILLER)!
+    echo := pio.load(&ECHO)!
+    full := refused(pio.load(&SQUARE), hal.Error.Busy) && refused(pio.load(&FILLER), hal.Error.Busy) && echo.offset() == 29 && filler.offset() == 0
+    pio.unload(filler)
+    machine := pio.state_machine(0)!
+    claimed := refused(pio.state_machine(0), hal.Error.Busy) && refused(pio.state_machine(4), hal.Error.InvalidInput)
+    check(validated && owned && full && claimed)
+
+    // Echo: nothing before the first word, then each word inverted, up to
+    // a full RX FIFO.
+    config := echo.config()
+    machine.init(&config)
+    machine.set_enabled(true)
+    quiet := machine.try_get()
+    echoed := false
+    if let none = quiet {
+        echoed = true
+    }
+    for word in 0..8u32 {
+        machine.put(0x1234_5670 + word)
+    }
+    timer.delay_us(10)
+    // Four words wait in the RX FIFO, one in the ISR, and three in the TX
+    // FIFO.
+    echoed = echoed && machine.rx_level() == 4 && machine.tx_level() == 3 && machine.is_rx_full()
+    for word in 0..8u32 {
+        start := timer.now_us()
+        received := false
+        for !received && timer.now_us() - start < 1000 {
+            if let some(value) = machine.try_get() {
+                received = true
+                echoed = echoed && value == ~(0x1234_5670 + word)
+            }
+        }
+        echoed = echoed && received
+    }
+    echoed = echoed && machine.is_rx_empty() && machine.is_tx_empty()
+    check(echoed)
+
+    // The square wave: 32 cycles a period at 32 kHz is 1 kHz.
+    pio.unload(echo)
+    square := pio.load(&SQUARE)!
+    wave := square.config()
+    wave.set_sideset_pins(15)!
+    wave.set_frequency(32_000)!
+    machine.init(&wave)
+    machine.set_pins(15, 1, 1)
+    machine.set_pindirs(15, 1, 1)
+    set_high := pin_level(15)
+    machine.set_pins(15, 1, 0)
+    set_low := !pin_level(15)
+    pio.clear_flags(0xFF)
+    unflagged := pio.flags() == 0
+    machine.set_enabled(true)
+    half := high_samples(15, timer)
+    flagged := (pio.flags() & 1) != 0
+    pio.clear_flags(1)
+    timer.delay_ms(2)
+    again := (pio.flags() & 1) != 0
+    running := machine.address() >= square.offset() && machine.address() < square.offset() + 2
+    pio.release_state_machine(machine)
+    pio.unload(square)
+    pins.release_pio(pio)
+    pin := pins.output(15)!
+    pins.release(pin)
+    check(set_high && set_low && unflagged && half > 420 && half < 580 && flagged && again && running)
+}
+
 // Restart the watchdog's 3 s countdown, for checks that wait on the host.
 fn feed_watchdog() {
     unsafe {
@@ -895,6 +987,7 @@ fn main() {
     interrupt_checks(&mut b.timer)
     executor_checks(&mut b.pins, &mut b.timer)
     pwm_adc_checks(&mut b.pins, &mut b.timer)
+    pio_checks(&mut b.pins, &mut b.timer)
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is

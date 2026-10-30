@@ -5,6 +5,8 @@ use crate::ast::*;
 use crate::diagnostic::Diagnostic;
 use std::collections::{HashMap, HashSet};
 
+#[path = "pio.rs"]
+mod pio;
 #[path = "printing.rs"]
 mod printing;
 
@@ -109,6 +111,7 @@ pub(super) fn instantiate(program: &mut Program) -> Check<Vec<Obligation>> {
         count: 0,
         depth: 0,
         printing_count: 0,
+        pio_version: program.pio_version,
         obligations: vec![],
         required: HashSet::new(),
         pending: vec![],
@@ -123,9 +126,9 @@ pub(super) fn instantiate(program: &mut Program) -> Check<Vec<Obligation>> {
     }
     program.structs.retain(|s| s.generics.is_empty());
     program.enums.retain(|e| e.generics.is_empty());
-    program
-        .functions
-        .retain(|f| f.generics.is_empty() && (f.printing.is_none() || f.generic_instance));
+    program.functions.retain(|f| {
+        f.generics.is_empty() && (f.printing.is_none() || f.generic_instance) && !f.pio
+    });
     let substitutions = HashMap::new();
     for structure in &mut program.structs {
         for field in &mut structure.fields {
@@ -175,6 +178,8 @@ struct Expander {
     count: usize,
     depth: usize,
     printing_count: usize,
+    /// The build chip's PIO version, for `rp_pio.assemble`.
+    pio_version: Option<u8>,
     obligations: Vec<Obligation>,
     required: HashSet<(String, String, String)>,
     // Generic parameters of the call whose arguments are being inferred.
@@ -218,7 +223,7 @@ impl Expander {
     /// The function pointer type of a named, non-generic function.
     fn function_value_type(&self, name: &str) -> Option<Type> {
         let function = self.signatures.get(name)?;
-        (function.generics.is_empty() && function.printing.is_none()).then(|| {
+        (function.generics.is_empty() && function.printing.is_none() && !function.pio).then(|| {
             Type::Fn(
                 function.params.iter().map(|p| p.ty.clone()).collect(),
                 Box::new(function.ret.clone()),
@@ -240,6 +245,12 @@ impl Expander {
             return Err(Diagnostic::new(
                 span,
                 "printing entry points cannot be used as function values; wrap a concrete call in an ordinary function",
+            ));
+        }
+        if template.pio {
+            return Err(Diagnostic::new(
+                span,
+                "rp_pio.assemble runs at compile time and cannot be used as a function value",
             ));
         }
         if template.generics.is_empty() {
@@ -1173,6 +1184,16 @@ impl Expander {
                 args: std::mem::take(args),
             };
         }
+        if let ExprKind::Call {
+            name,
+            type_args,
+            args,
+        } = &e.kind
+            && let Some(template) = self.signatures.get(name)
+            && template.pio
+        {
+            e.kind = self.pio_program(template, type_args, args, span)?;
+        }
         // A qualified function used as a value, such as `math.square`.
         if let ExprKind::Field(..) = &e.kind
             && let Some(path) = qualified_name(e)
@@ -1551,6 +1572,12 @@ impl Expander {
                         return Err(Diagnostic::new(
                             span,
                             "printing entry points cannot be used as callbacks; wrap a concrete call in an ordinary function",
+                        ));
+                    }
+                    if template.pio {
+                        return Err(Diagnostic::new(
+                            span,
+                            "rp_pio.assemble runs at compile time and cannot be used as a callback",
                         ));
                     }
                     let mapping = self.substitutions(&template.generics, type_args, span)?;

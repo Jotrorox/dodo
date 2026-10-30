@@ -71,6 +71,8 @@ struct Parser {
 #[derive(Default)]
 struct Modifiers {
     printing: Option<Printing>,
+    // `@compiler(pio)`: rp_pio's compile-time assembler.
+    pio: bool,
     test: bool,
     ignore: Option<String>,
     public: bool,
@@ -84,6 +86,12 @@ struct Modifiers {
     json_deny_unknown: bool,
     interrupt: Option<String>,
     placement: Placement,
+}
+
+impl Modifiers {
+    fn compiler(&self) -> bool {
+        self.printing.is_some() || self.pio
+    }
 }
 
 impl Parser {
@@ -310,7 +318,7 @@ impl Parser {
                 || mods.derive_json
                 || mods.json_deny_unknown
                 || mods.json_name.is_some()
-                || mods.printing.is_some()
+                || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
             {
@@ -330,7 +338,7 @@ impl Parser {
                 || mods.derive_json
                 || mods.json_deny_unknown
                 || mods.json_name.is_some()
-                || mods.printing.is_some()
+                || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
             {
@@ -345,8 +353,8 @@ impl Parser {
         if mods.json_name.is_some() {
             return Err(self.error("@json_name applies only to fields of @derive(Json) structs"));
         }
-        if mods.printing.is_some() && !self.at("fn") {
-            return Err(self.error("@compiler applies only to printing functions"));
+        if mods.compiler() && !self.at("fn") {
+            return Err(self.error("@compiler applies only to functions"));
         }
         if (mods.test || mods.ignore.is_some()) && !self.at("fn") {
             return Err(self.error("@test and @ignore apply only to functions"));
@@ -489,16 +497,17 @@ impl Parser {
                     continue;
                 }
                 if name == "compiler" {
-                    if mods.printing.is_some() {
+                    if mods.compiler() {
                         return Err(self.error("duplicate @compiler attribute"));
                     }
                     self.expect("(")?;
-                    mods.printing = Some(match self.identifier()?.as_str() {
-                        "print" => Printing::Print,
-                        "println" => Printing::Println,
-                        "printf" => Printing::Printf,
-                        _ => return Err(self.error("expected print, println, or printf")),
-                    });
+                    match self.identifier()?.as_str() {
+                        "print" => mods.printing = Some(Printing::Print),
+                        "println" => mods.printing = Some(Printing::Println),
+                        "printf" => mods.printing = Some(Printing::Printf),
+                        "pio" => mods.pio = true,
+                        _ => return Err(self.error("expected print, println, printf, or pio")),
+                    }
                     self.expect(")")?;
                     self.newlines();
                     continue;
@@ -712,7 +721,7 @@ impl Parser {
                 || mods.derive_json
                 || mods.json_deny_unknown
                 || mods.json_name.is_some()
-                || mods.printing.is_some()
+                || mods.compiler()
                 || mods.test
                 || mods.ignore.is_some()
             {
@@ -1082,8 +1091,8 @@ impl Parser {
                     self.error("@json_name applies only to fields of @derive(Json) structs")
                 );
             }
-            if field_mods.printing.is_some() && !self.at("fn") {
-                return Err(self.error("@compiler applies only to printing functions"));
+            if field_mods.compiler() && !self.at("fn") {
+                return Err(self.error("@compiler applies only to functions"));
             }
             if field_mods.test || field_mods.ignore.is_some() {
                 return Err(self.error("@test and @ignore apply only to top-level functions"));
@@ -1363,11 +1372,9 @@ impl Parser {
             self.cursor = saved;
             self.end_statement()?;
             None
-        } else if mods.printing.is_some() {
+        } else if mods.compiler() {
             if self.at("{") || mods.extern_ || mods.unsafe_ || mods.test {
-                return Err(
-                    self.error("compiler printing declarations are safe prototypes without bodies")
-                );
+                return Err(self.error("@compiler declarations are safe prototypes without bodies"));
             }
             self.cursor = saved;
             self.end_statement()?;
@@ -1429,6 +1436,7 @@ impl Parser {
             unsafe_: mods.unsafe_,
             extern_: mods.extern_,
             printing: mods.printing,
+            pio: mods.pio,
             generics,
             bounds,
             params,

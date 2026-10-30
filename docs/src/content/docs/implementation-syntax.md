@@ -421,7 +421,9 @@ conflicting aliases. Prefer passing state explicitly or using
 | `@align(N)` | Function or `static`: align it to `N` bytes, a power of two. |
 
 `@compiler(print)`, `@compiler(println)`, and `@compiler(printf)` are reserved for
-bundled printing declarations; user packages cannot define them. Other unknown
+bundled printing declarations, and `@compiler(pio)` for the
+[PIO assembler](hardware.md#pio-on-the-rp2040-and-rp2350) in
+`std/embedded/chip/rp_pio`; user packages cannot define them. Other unknown
 attributes are errors. There is no general macro or attribute-extension system.
 
 `unsafe { ... }` permits specific unchecked operations; it does not turn off
