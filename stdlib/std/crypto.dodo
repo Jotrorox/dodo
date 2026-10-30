@@ -1,0 +1,69 @@
+package crypto
+
+import "core/ptr"
+import "std/io"
+
+// Portable cryptographic errors and secret-handling helpers. No entropy
+// source, primitive implementation, allocator or native library is imported
+// here: `std/crypto/random` reads the operating system's CSPRNG and
+// `std/crypto/openssl` wraps OpenSSL's libcrypto.
+pub enum ErrorKind {
+    InvalidInput, BufferTooSmall, AllocationFailed, Unavailable, Backend
+}
+pub struct Error {
+    pub kind: ErrorKind
+    // Numeric OS or OpenSSL code only; never key, plaintext or digest bytes.
+    pub code: i32
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("crypto: ")?
+        match &self.kind {
+            ErrorKind.InvalidInput => {
+                output.string("InvalidInput")?
+            }
+            ErrorKind.BufferTooSmall => {
+                output.string("BufferTooSmall")?
+            }
+            ErrorKind.AllocationFailed => {
+                output.string("AllocationFailed")?
+            }
+            ErrorKind.Unavailable => {
+                output.string("Unavailable")?
+            }
+            ErrorKind.Backend => {
+                output.string("Backend")?
+            }
+        }
+        output.string(" code=")?
+        output.decimal(self.code as i64)?
+        return ok()
+    }
+}
+pub fn failure(kind: ErrorKind, code: i32) -> Error {
+    return Error { kind: kind, code: code }
+}
+// Compares MACs, tokens and other secrets without exiting at the first
+// differing byte. Lengths are not secret: unequal lengths return false at once.
+pub fn equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len != right.len {
+        return false
+    }
+    difference := 0u8
+    for i in 0usize..left.len {
+        // Volatile accesses keep the optimizer from turning the accumulation
+        // into an early exit.
+        unsafe {
+            previous := ptr.read_volatile(ptr.from_ref(&difference))
+            ptr.write_volatile(ptr.from_mut(&mut difference), previous | (left[i] ^ right[i]))
+        }
+    }
+    return difference == 0
+}
+// Overwrites secret bytes with zeros using stores the optimizer cannot remove
+// as dead, even when the storage is never read again.
+pub fn wipe(bytes: &mut[u8]) {
+    for i in 0usize..bytes.len {
+        unsafe {
+            ptr.write_volatile(ptr.from_mut(&mut bytes[i]), 0u8)
+        }
+    }
+}

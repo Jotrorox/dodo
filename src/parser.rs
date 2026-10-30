@@ -13,6 +13,24 @@ pub fn parse(source: &str) -> ParseResult<Program> {
     Parser::new(lex(source)?, false).program()
 }
 
+/// Parse already-lexed tokens as one complete expression. The formatter uses
+/// this for array lengths, which the AST keeps without source spans.
+pub(crate) fn parse_expression(tokens: &[Token]) -> Option<Expr> {
+    let end = tokens.last()?.span.end;
+    let mut tokens: Vec<_> = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+        .cloned()
+        .collect();
+    tokens.push(Token {
+        kind: TokenKind::Eof,
+        span: Span { start: end, end },
+    });
+    let mut parser = Parser::new(tokens, false);
+    let expression = parser.expression(false).ok()?;
+    parser.eof().then_some(expression)
+}
+
 /// Editor parser: retain sound declarations and statements after syntax errors.
 /// Compilation and formatting continue to use the strict `parse` entry point.
 pub fn parse_recovering(source: &str) -> (Program, Vec<Diagnostic>) {

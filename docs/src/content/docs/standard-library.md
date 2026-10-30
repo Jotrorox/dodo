@@ -112,12 +112,13 @@ This is code-generation evidence, not tested board startup or hardware execution
 Freestanding links supply startup, memory helpers and any soft-float support.
 
 Hosted console, filesystem, environment, processes, clocks, threads,
-synchronization, sockets, TLS backends and HTTP/web wrappers support **x86-64
+synchronization, sockets, OS entropy, crypto and TLS backends and HTTP/web wrappers support **x86-64
 and AArch64 Linux GNU, macOS, and Windows x64 MSVC/GNU**. They reject Linux
 x32/musl and other unsupported ABIs. Atomic operations have a separate
 [x86-64/AArch64 target contract](synchronization.md#atomics).
-Hosted linking needs a target C toolchain and headers; OpenSSL-backed TLS also
-needs OpenSSL 3.5 or newer. See [platform adapters](platform.md) and [TLS](tls.md).
+Hosted linking needs a target C toolchain and headers; OpenSSL-backed TLS and
+`std/crypto/openssl` also need OpenSSL 3.5 or newer. See [platform adapters](platform.md),
+[TLS](tls.md), and [cryptography](crypto.md).
 OS/C-library calls may allocate internally even when Dodo storage is fixed.
 
 HTTP/1.1 clients, servers, streaming framing, and web routing **are implemented**.
@@ -173,6 +174,7 @@ individual modules and links every public declaration back to its source.
 | [Threads](threads.md) | `std/thread` | Hosted. |
 | [Synchronization](synchronization.md) | `std/sync`, `std/sync/allocated`, `std/sync/atomic`, `std/sync/error` | Blocking/allocated hosted; atomic target-specific. |
 | [Networking and DNS](networking.md) | `std/net`, `std/net/dns`, `std/net/operations` | Values/DNS/operations portable; native sockets hosted. |
+| [Cryptography](crypto.md) | `std/crypto`, `std/crypto/openssl`, `std/crypto/random` | Errors/secret helpers portable; OS entropy and OpenSSL hosted. |
 | [TLS](tls.md) | `std/tls`, `std/tls/openssl`, `std/tls/stream` | Contracts/stream portable; OpenSSL hosted. |
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
@@ -185,6 +187,10 @@ select providers; they are not additional recommended starting paths.
 
 | Imports | Role and entry point |
 | --- | --- |
+| `std/crypto/openssl/posix` | Native OpenSSL libcrypto boundary; use [cryptography](crypto.md). |
+| `std/crypto/openssl/windows` | Native OpenSSL libcrypto boundary; use [cryptography](crypto.md). |
+| `std/crypto/posix` | Native OS entropy boundary; use [random bytes](crypto.md#random-bytes). |
+| `std/crypto/windows` | Native OS entropy boundary; use [random bytes](crypto.md#random-bytes). |
 | `std/env/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/env/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/float_decimal` | Internal decimal conversion; use [formatting](formatting.md) or [text parsing](text.md). |
@@ -211,7 +217,8 @@ select providers; they are not additional recommended starting paths.
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
 `std/process/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
-`std/time/native`, `std/tls/native`, and `std/web/native` select compatible
+`std/time/native`, `std/tls/native`, `std/crypto/native`,
+`std/crypto/openssl/native`, and `std/web/native` select compatible
 providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`
 imports are for matching-target integrations. `runtime.c` files are embedded
