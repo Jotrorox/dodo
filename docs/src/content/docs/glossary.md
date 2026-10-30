@@ -87,5 +87,5 @@ full rule or a worked example.
 | FFI | Foreign function interface: calling or exposing code through another language's ABI, usually C. |
 | MMIO | Memory-mapped input/output: accessing hardware registers at device addresses. It needs board-specific knowledge. |
 
-Return to the [learning path](index.md#start-here), the
+Return to the [learning path](installation.md), the
 [language reference](implementation-syntax.md), or [API notation](stdlib-api.md#read-a-signature).
