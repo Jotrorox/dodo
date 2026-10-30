@@ -131,8 +131,10 @@ shared controller drivers in `std/embedded/peripheral` and the pin and
 controller ownership both chips share in `std/embedded/chip/rp_pins`, and
 their PWM outputs and ADC inputs through `std/embedded/chip/rp_pwm` and
 `std/embedded/chip/rp_adc`, their PIO state machines, with programs assembled
-at compile time, through `std/embedded/chip/rp_pio`, and a USB serial port
-on the board's own USB connector through `std/embedded/chip/rp_usb`.
+at compile time, through `std/embedded/chip/rp_pio`, a USB serial port on
+the board's own USB connector through `std/embedded/chip/rp_usb`, and their
+DMA channels through `std/embedded/chip/rp_dma`, which the SPI buses and
+serial ports use for transfers that run in the background.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
 tasks on one core, waking each on time or on an interrupt and sleeping

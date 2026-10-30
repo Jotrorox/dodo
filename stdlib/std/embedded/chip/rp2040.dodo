@@ -4,6 +4,7 @@ import "core/cpu"
 import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_usb"
@@ -50,6 +51,7 @@ const RESETS_BASE: usize = 0x4000_C000
 const RESET: usize = RESETS_BASE + 0x0
 const RESET_DONE: usize = RESETS_BASE + 0x8
 const RESET_ADC: u32 = 1 << 0
+const RESET_DMA: u32 = 1 << 2
 const RESET_I2C0: u32 = 1 << 3
 const RESET_I2C1: u32 = 1 << 4
 const RESET_IO_BANK0: u32 = 1 << 5
@@ -284,9 +286,11 @@ pub struct Peripherals {
     pub pins: Pins
     pub timer: Timer
     pub usb: Usb
+    // The DMA controller's channels; rp_dma documents them.
+    pub dma: rp_dma.Dma
 }
 
-// Configure clocks, take GPIO and the timer out of reset, and return the
+// Configure clocks, take GPIO, the timer, and DMA out of reset, and return the
 // peripherals. A second call returns Error.Busy, so no two owners exist; an
 // unusable crystal frequency returns Error.InvalidInput, and a crystal or PLL
 // that does not start returns Error.Timeout.
@@ -312,7 +316,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     // user of the clock, reset, PLL, and watchdog tick registers.
     unsafe {
         start_clocks(crystal)?
-        reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER)?
+        reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER | RESET_DMA)?
     }
     // SAFETY: the timer was just taken out of reset; Timer only reads its
     // free-running counter registers.
@@ -326,7 +330,12 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         rp_pins.Bank.new(Chip { crystal_hz: crystal })
     }
     usb := Usb { crystal_hz: crystal, open: false }
-    return ok(Peripherals { pins: Pins { bank }, timer, usb })
+    // SAFETY: TAKEN guarantees one Dma, and the controller was just taken
+    // out of reset.
+    dma := unsafe {
+        rp_dma.Dma.new(rp_dma.RP2040)
+    }
+    return ok(Peripherals { pins: Pins { bank }, timer, usb, dma })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2040 register.

@@ -3,6 +3,7 @@ package pico2_w
 import "std/embedded/wireless/cyw43"
 import "std/embedded/hal"
 import "std/embedded/chip/rp2350"
+import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_usb"
 
 // Raspberry Pi Pico 2 W: a Pico 2 (RP2350A, 12 MHz crystal, 4 MiB of flash)
@@ -67,6 +68,9 @@ pub struct Board {
     // The USB port: `serial()` makes the board a USB serial port, for
     // printing over the USB cable.
     pub usb: Usb
+    // The DMA channels: `channel()` claims one, for transfers that run
+    // while the program does other work.
+    pub dma: rp_dma.Dma
 }
 
 // Start the chip with the Pico 2 W's crystal, power up the wireless chip,
@@ -83,8 +87,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, usb } = chip
-    return ok(Board { led, pins, timer, usb: Usb { usb } })
+    let rp2350.Peripherals { pins, timer, usb, dma } = chip
+    return ok(Board { led, pins, timer, usb: Usb { usb }, dma })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal

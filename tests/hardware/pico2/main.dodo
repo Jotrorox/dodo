@@ -4,6 +4,7 @@ import "std/embedded/board"
 import "core/mem"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
+import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
@@ -29,6 +30,7 @@ import "std/sync/atomic"
 //   [2] clk_sys in kHz  [3] a 10 ms delay in timer us  [4] its SysTick cycles
 //   [5] failed-check bits for checks 32 to 63
 //   [7] failed-check bits for checks 64 to 95
+//   [24] failed-check bits for checks 96 to 127
 //
 // A copy of [0] and [1] in watchdog SCRATCH0/1 survives the watchdog reset
 // that reports a hang. (The boot ROM's reboot uses SCRATCH2 to 7.)
@@ -46,10 +48,11 @@ const WATCHDOG: usize = 0x400D_8000
 const SCRATCH: usize = WATCHDOG + 0x0C
 const RUNNING: u32 = 0x5747_0000
 static mut CHECKS: u32 = 0
-// Failed-check bits: checks 0 to 31, 32 to 63, and 64 to 95.
+// Failed-check bits: checks 0 to 31, 32 to 63, 64 to 95, and 96 to 127.
 static mut FAILURES: u32 = 0
 static mut MORE_FAILURES: u32 = 0
 static mut LAST_FAILURES: u32 = 0
+static mut EXTRA_FAILURES: u32 = 0
 // Initialized data: checks that the reset handler copies .data from flash.
 static mut DATA: [3]u32 = [0xDEAD_BEEFu32, 7, 0x1234_5678]
 
@@ -91,6 +94,8 @@ fn check(ok: bool) {
             MORE_FAILURES |= 1u32 << (CHECKS - 32)
         } else if !ok && CHECKS < 96 {
             LAST_FAILURES |= 1u32 << (CHECKS - 64)
+        } else if !ok && CHECKS < 128 {
+            EXTRA_FAILURES |= 1u32 << (CHECKS - 96)
         }
         CHECKS += 1
         record(RUNNING | CHECKS, FAILURES)
@@ -897,6 +902,136 @@ fn usb_checks(usb: &mut board.Usb, pins: &mut chip.Pins, timer: &mut chip.Timer)
     check(owned && configured && quick && shared)
 }
 
+const DMA_DONE: executor.Signal = executor.Signal { id: 30 }
+
+// DMA: the claim API, copies, and SPI, UART, and I2C transfers that run
+// while the program does other work.
+fn dma_checks(dma: &mut rp_dma.Dma, pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    // Channels are claimed once each, lowest free first.
+    last := dma.channels() - 1
+    first := dma.channel()!
+    second := dma.claim(last)!
+    check(first.number() == 0 && second.number() == last && dma.is_claimed(0) && refused(dma.claim(0), hal.Error.Busy) && refused(dma.claim(last + 1), hal.Error.InvalidInput))
+
+    // 1 KiB by words at bus speed, about a cycle a word, and bytes at odd
+    // addresses.
+    source: [1024]u8 = [0; 1024]
+    target: [1024]u8 = [0; 1024]
+    for index in 0..1024usize {
+        source[index] = (index * 7 % 251) as u8
+    }
+    start := timer.now_us()
+    first.copy(&mut target, &source)!
+    elapsed := timer.now_us() - start
+    same := true
+    for index in 0..1024usize {
+        same = same && target[index] == source[index]
+    }
+    first.copy(&mut target[1..100], &source[3..102])!
+    odd := target[1] == source[3] && target[99] == source[101] && target[0] == source[0] && target[100] == source[100]
+    check(same && odd && elapsed < 20 && refused_void(first.copy(&mut target[..2], &source[..3]), hal.Error.InvalidInput))
+
+    // SPI loopback by DMA: 64 bytes at 1 MHz take 512 us, while the
+    // program spins, and the receive channel's signal comes from the
+    // runtime's DMA_IRQ_0 handler.
+    DMA_DONE.reset()
+    spi := pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, some(board.SPI_RX_PIN), hal.SpiMode.Mode0, 1_000_000)!
+    spi.set_loopback(true)
+    second.set_signal(&DMA_DONE)
+    buffer: [64]u8 = [0; 64]
+    {
+        transfers := spi.dma(&mut first, &mut second, &mut buffer)!
+        bytes := transfers.buffer()!
+        for index in 0..64usize {
+            bytes[index] = (index * 5 + 1) as u8
+        }
+        transfers.start_transfer(64)!
+        lent := refused(transfers.buffer(), hal.Error.Busy)
+        spins := 0u32
+        for transfers.is_busy() {
+            spins += 1
+        }
+        raised := DMA_DONE.is_raised()
+        transfers.finish()!
+        echoed := transfers.buffer()!
+        looped := true
+        for index in 0..64usize {
+            looped = looped && echoed[index] == (index * 5 + 1) as u8
+        }
+        check(lent && spins > 1000 && raised && looped)
+    }
+    second.clear_signal()
+    pins.release_spi(spi)
+
+    // UART loopback by DMA: 100 bytes, three FIFOs' worth, go out in the
+    // background and wait in the ring until the program reads them.
+    port := pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    port.set_loopback(true)!
+    ring: [256]u8 = [0; 256]
+    output: [32]u8 = [0; 32]
+    {
+        serial := port.dma(&mut second, &mut ring, &mut first, &mut output)!
+        message: [100]u8 = [0; 100]
+        for index in 0..100usize {
+            message[index] = (index + 20) as u8
+        }
+        serial.write(&message)!
+        serial.flush()!
+        timer.delay_ms(2)
+        waiting := serial.available()
+        received: [128]u8 = [0; 128]
+        count := serial.read(&mut received)!
+        kept := true
+        for index in 0..100usize {
+            kept = kept && received[index] == (index + 20) as u8
+        }
+        check(serial.ring_size() == 256 || serial.ring_size() == 128)
+        check(waiting == 100 && count == 100 && kept)
+    }
+    pins.release_uart(port)
+
+    // A queued I2C read of an absent device: the program polls while the
+    // controller addresses it, about 100 us at 100 kHz.
+    i2c := pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_STANDARD_HZ)!
+    i2c.start_read(0x7C, 1)!
+    byte: [1]u8 = [0]
+    polls := 0u32
+    absent := false
+    for {
+        match i2c.poll_finish(&mut byte) {
+            ok(done) => {
+                if done {
+                    break
+                }
+                polls += 1
+            }
+            err(error) => {
+                absent = error == hal.Error.NoAcknowledge
+                break
+            }
+        }
+    }
+    check(absent && polls > 10 && !i2c.is_busy())
+    pins.release_i2c(i2c)
+
+    dma.release(first)
+    dma.release(second)
+    again := dma.channel()!
+    check(again.number() == 0 && !dma.is_claimed(last))
+    dma.release(again)
+}
+
+fn refused_void(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -1034,6 +1169,7 @@ fn main() {
     pwm_adc_checks(&mut b.pins, &mut b.timer)
     pio_checks(&mut b.pins, &mut b.timer)
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
+    dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.
@@ -1064,6 +1200,7 @@ fn main() {
         control.write(0)
         store(RECORD + 20, MORE_FAILURES)
         store(RECORD + 28, LAST_FAILURES)
+        store(RECORD + 96, EXTRA_FAILURES)
         record(0x600D_0000 | CHECKS, FAILURES)
     }
     report()

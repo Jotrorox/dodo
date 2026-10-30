@@ -149,8 +149,18 @@ fn cross_thread_transfer_and_scoped_storage_rejections() {
         ),
         (
             "unsafe_borrow_override",
-            "@unsafe_send\nstruct Bad { value: &usize }\nfn main() { mem.assert_send::<Bad>() }",
+            "@unsafe_send\nunsafe struct Bad { value: &usize }\nfn main() { mem.assert_send::<Bad>() }",
             "cross-thread transfer",
+        ),
+        (
+            "contract_without_unsafe",
+            "@unsafe_sync\nstruct Bad { pointer: *mut usize }\nfn main() { mem.assert_sync::<Bad>() }",
+            "declare the struct as `unsafe struct`",
+        ),
+        (
+            "unsafe_without_contract",
+            "unsafe struct Bad { pointer: *mut usize }\nfn main() {}",
+            "`unsafe` on a struct applies only with @unsafe_send or @unsafe_sync",
         ),
         (
             "sharing",
