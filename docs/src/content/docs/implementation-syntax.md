@@ -410,7 +410,7 @@ conflicting aliases. Prefer passing state explicitly or using
 | Attribute | Placement and purpose |
 | --- | --- |
 | `@repr(C)` | Struct: C-compatible field order, alignment, and padding. |
-| `@unsafe_send`, `@unsafe_sync` | Struct: explicit unsafe thread transfer/sharing contract; see [threads](threads.md). |
+| `@unsafe_send`, `@unsafe_sync` | `unsafe struct`: explicit unsafe thread transfer/sharing contract; see [threads](threads.md). |
 | `@test` | Safe nongeneric top-level void function with no parameters; see [testing](testing.md). |
 | `@ignore("reason")` | Test function: skipped unless ignored tests are selected. |
 | `@derive(Json)` | Struct: generate supported JSON methods; see [JSON](json.md). |

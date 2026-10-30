@@ -182,6 +182,31 @@ pub fn native_sources(loaded: &Loaded) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// Every `unsafe` keyword in project sources, for `project.forbid-unsafe`.
+/// Bundled sources are exempt: the standard library and chip packages wrap
+/// their unsafe code behind safe APIs. Compiler-generated code is never
+/// scanned, because only source text is lexed.
+pub fn unsafe_uses(loaded: &Loaded) -> Vec<Diagnostic> {
+    let mut diagnostics = vec![];
+    for source in &loaded.sources {
+        if source.path.starts_with("<stdlib>") {
+            continue;
+        }
+        for token in crate::lexer::lex_recovering(&source.text).0 {
+            if matches!(&token.kind, crate::lexer::TokenKind::Ident(name) if name == "unsafe") {
+                diagnostics.push(Diagnostic::new(
+                    Span {
+                        start: source.start + token.span.start,
+                        end: source.start + token.span.end,
+                    },
+                    "`unsafe` is forbidden in this project (project.forbid-unsafe in dodo.toml)",
+                ));
+            }
+        }
+    }
+    diagnostics
+}
+
 /// Load editor buffers with string errors for callers of the original overlay API.
 /// Keys use the same normalized absolute paths as `load_with_overlays`.
 pub fn load_with_overrides(
