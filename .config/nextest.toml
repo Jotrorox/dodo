@@ -1,0 +1,24 @@
+# cargo-nextest runs every test in its own process and spreads the test
+# binaries across all cores, instead of running them one binary at a time.
+# CI builds the tests once into an archive and runs partitions on parallel
+# runners (see .github/workflows/build.yml).
+
+[profile.ci]
+# Report every failure in one run instead of stopping at the first.
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "flaky"
+# Flag slow tests every two minutes and stop a hung test after 20.
+slow-timeout = { period = "120s", terminate-after = 10 }
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# These tests drive native servers and clients against independent Python
+# peers over loopback, with sub-second deadlines. On shared CI runners a
+# connection reset can still race a completed exchange (mostly on macOS).
+# Retry them, but nextest still reports every retried pass as FLAKY.
+[[profile.ci.overrides]]
+filter = "binary(http_hosted_library) | binary(http_library) | binary(tls_library) | binary(web_library)"
+retries = { backoff = "fixed", count = 2, delay = "2s" }
