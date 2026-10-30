@@ -1,8 +1,13 @@
 //! QUIC credentials are generated locally; all traffic stays on IPv4 loopback.
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Stdio;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Workspace(PathBuf);
@@ -31,6 +36,8 @@ fn success(output: Output, context: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+// The loopback fixture runs on the hosts with a local OpenSSL build in CI.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn credentials(directory: &Path) {
     let commands = [
         vec![
@@ -91,6 +98,7 @@ fn credentials(directory: &Path) {
         );
     }
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn fixture(directory: &Path) -> PathBuf {
     let mut contents = include_str!("quic/checks.dodo").to_owned();
     for (name, file) in [("CA", "ca.pem"), ("CERT", "cert.pem"), ("KEY", "key.pem")] {
@@ -112,6 +120,7 @@ fn fixture(directory: &Path) -> PathBuf {
     fs::write(&path, contents).unwrap();
     path
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_bounded(path: &Path) -> Output {
     let mut child = Command::new(path)
         .stdout(Stdio::piped())
