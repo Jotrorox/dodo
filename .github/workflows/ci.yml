@@ -37,6 +37,8 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: frontend-no-llvm-${{ matrix.os }}
+          # Pull requests restore main's cache without saving their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy without LLVM
