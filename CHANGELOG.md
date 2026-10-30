@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
+  (DCP), with no change to programs: division takes about 90 cycles instead
+  of 1300, addition about 45 instead of 260, multiplication about 60 instead
+  of 200, and conversions between `f64` and `f32` or 32-bit integers a
+  third to a tenth of their software time. Results are bit for bit those of
+  the software helpers, subnormals included: the cases the coprocessor
+  flushes to zero are computed in software, and NaN results stay the default
+  NaN. The helpers save and restore the coprocessor's state when one
+  interrupts another, so `f64` stays safe in interrupt handlers.
+  `scripts/test_rp2350_float.py` compares them with the software helpers on
+  a Pico 2 or Pico 2 W, on 1.8 million edge-weighted operands while
+  interrupts preempt them, and times both.
+
 - The RP2040 and RP2350 boards are USB serial ports on their own USB
   connector: `b.usb.serial()` returns a CDC-ACM port with the `std/io` Reader
   and Writer protocols, so `fmt.printf` prints over the USB cable with no

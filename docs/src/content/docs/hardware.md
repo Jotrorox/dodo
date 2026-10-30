@@ -1165,8 +1165,8 @@ RP2040's:
 | --- | --- |
 | Vector table | At the start of flash, where the boot ROM enters Arm images. Weak defaults for the Cortex-M33 exceptions (including `SecureFault_Handler`) and all 52 interrupts. |
 | Image definition | The `IMAGE_DEF` block, in the first 4 KiB of flash, that marks the image as a secure Arm RP2350 executable. The boot ROM runs nothing without it. |
-| Reset handler | Clears the stack limit, installs the vector table, enables the FPU, initializes RAM, and calls `main`. |
-| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. Its FPU does single precision only: `f32` arithmetic runs in hardware, and `f64`, `f32` `%`, and conversions between `f32` and `f64` or 64-bit integers use the software helpers. |
+| Reset handler | Clears the stack limit, installs the vector table, enables the FPU and the double-precision coprocessor, initializes RAM, and calls `main`. |
+| Panic hook and helpers | As on the RP2040. The Cortex-M33 divides 32-bit integers in hardware, so only the 64-bit helpers are linked. Its FPU does single precision only, so `f32` arithmetic runs in hardware. `f64` addition, subtraction, multiplication, and division, and conversions between `f64` and `f32` or 32-bit integers, run on the RP2350's double-precision coprocessor (DCP): an `f64` division takes about 90 cycles instead of 1300, an addition about 45 instead of 260. The results are the software helpers' bit for bit: subnormal operands and results, which the coprocessor flushes to zero, are computed in software, and NaN results are the default NaN. The helpers save and restore the coprocessor's state when they interrupt one another, so `f64` works in interrupt handlers. The coprocessor sequences come from the Pico SDK, under its BSD-3-Clause license (`src/hardware/rp2350/LICENSE.pico-sdk`). Comparisons, `%`, conversion from `f32`, and conversions to and from 64-bit integers use the software helpers. |
 | Linker script | Flash at `0x10000000` (size from the board), 520 KiB of RAM, and the stack at the top of RAM; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). |
 
 `std/embedded/chip/rp2350` mirrors the RP2040 package: `rp2350.take(config)`
@@ -1662,7 +1662,8 @@ so each new board or chip is a small, self-contained addition:
 The compiler compiles the runtime itself with the selected target machine, so
 no assembler or C toolchain is involved. `scripts/test_pico.py` (with
 `--board pico`, `--board pico2`, or `--board pico2_w`) shows how to check a chip
-on real hardware.
+on real hardware, and `scripts/test_rp2350_float.py` checks the RP2350's
+coprocessor `f64` helpers against the software ones on a board.
 
 ### Unsupported chips
 
@@ -1709,7 +1710,8 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   Wi-Fi and Bluetooth need its firmware, which is not loaded yet.
 - The software floating-point helpers are written for correctness, not speed:
   division, for example, computes one quotient bit per step, and `f32`
-  arithmetic on the Cortex-M0+ goes through `f64`. They raise no
+  arithmetic on the Cortex-M0+ goes through `f64`. On the RP2350, `f64`
+  arithmetic runs on the double-precision coprocessor instead. They raise no
   floating-point exception flags and return the default quiet NaN for every
   NaN result.
 - Only core 0 runs; core 1 stays in the boot ROM. Several activities share
