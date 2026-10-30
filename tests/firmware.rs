@@ -352,6 +352,7 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "__ashrdi3",
         "__aeabi_fadd",
         "__aeabi_dmul",
+        "__adddf3",
         "__aeabi_f2d",
         "fmodf",
     ] {
@@ -369,7 +370,11 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
         "__aeabi_uldivmod",
         "__udivdi3",
         "__aeabi_ddiv",
+        "__divdf3",
+        "__aeabi_f2d",
         "__aeabi_l2f",
+        "dodo_dcp_save",
+        "dodo_soft_ddiv",
         "fmod",
     ] {
         assert!(text.contains(name), "rp2350 runtime lacks {name}");
@@ -562,6 +567,7 @@ fn rp2350_projects_link_to_flashable_firmware() {
     let dimmer = root().join("examples/dimmer_board.dodo");
     let selftest = root().join("tests/hardware/pico2");
     let selftest_w = root().join("tests/hardware/pico2_w");
+    let float = root().join("tests/hardware/rp2350_float");
     let tasks = root().join("examples/tasks");
     for (project, name, board) in [
         (&blink, "blink", &["--board", "pico2"][..]),
@@ -574,6 +580,8 @@ fn rp2350_projects_link_to_flashable_firmware() {
         (&dimmer, "dimmer-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),
         (&selftest_w, "selftest-w", &[][..]),
+        (&float, "float", &["-b", "pico2"][..]),
+        (&float, "float-w", &["-b", "pico2_w"][..]),
     ] {
         for level in ["0", "2"] {
             let elf = scratch.path(&format!("{name}-O{level}.elf"));

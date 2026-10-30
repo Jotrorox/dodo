@@ -378,7 +378,9 @@ mod tests {
                 .lines()
                 .filter_map(|line| line.strip_prefix("module asm \".weak "))
                 .flat_map(|names| names.trim_end_matches('"').split(", "))
-                .filter(|name| !name.starts_with("dodo_"))
+                // Runtime hooks and helper aliases, such as __adddf3, are
+                // weak too.
+                .filter(|name| !name.starts_with("dodo_") && !name.starts_with("__"))
                 .collect();
             assert_eq!(weak, chip.interrupts, "{}", chip.name);
             let table: Vec<&str> = chip
