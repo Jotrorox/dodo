@@ -154,7 +154,7 @@ individual modules and links every public declaration back to its source.
 | [Allocation and boxes](allocation.md) | `alloc/arena`, `alloc/arena_box`, `alloc/block`, `alloc/boxed`, `alloc/error`, `alloc/layout`, `alloc/pool`, `alloc/pool_box`, `alloc/shared_arena`, `alloc/shared_box` | Portable. |
 | [Binary bytes](bytes.md) | `std/arena_bytes`, `std/bytes`, `std/bytes_alloc`, `std/pool_bytes` | Portable. |
 | [Byte I/O](io.md) | `std/io`, `std/io_alloc` | Portable. |
-| [Compression](compression.md) | `std/compress/deflate`, `std/compress/inflate`, `std/compress/deflate_fixed`, `std/compress/deflate_dynamic`, `std/compress/deflate_store`, `std/compress/deflate_workspace`, `std/compress/zlib_store`, `std/compress/gzip_store`, `std/compress/zlib`, `std/compress/gzip`, `std/compress/zlib_stream`, `std/compress/gzip_stream`, `std/compress/io` | Portable; caller-supplied buffers. |
+| [Compression](compression.md) | `std/compress/deflate`, `std/compress/zlib`, `std/compress/gzip`, `std/compress/io` | Portable; caller-supplied buffers. |
 | [Console I/O](console.md) | `std/console` | Hosted. |
 | [Formatting](formatting.md) | `std/fmt`, `std/fmt/errors`, `std/fmt_alloc` | Portable. |
 | [UTF-8 text](text.md) | `std/text`, `std/text_alloc`, `std/text_shared` | Portable. |

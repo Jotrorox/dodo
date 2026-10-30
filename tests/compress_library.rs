@@ -47,8 +47,18 @@ for mode in (-15, 15, 31):
     stream, b = b[4:4+n], b[4+n:]
     assert zlib.decompress(stream, mode) == expected
 n = int.from_bytes(b[:4], 'little')
+stream, b = b[4:4+n], b[4+n:]
+assert zlib.decompress(stream, -15) == bytes(range(256)) * 256
+import gzip, io
+n = int.from_bytes(b[:4], 'little')
 assert len(b) == 4 + n
-assert zlib.decompress(b[4:], -15) == bytes(range(256)) * 256
+member = b[4:]
+with gzip.GzipFile(fileobj=io.BytesIO(member)) as f:
+    assert f.read() == b'hello hello hello'
+    assert f.mtime == 1700000000
+assert member[3] == 1 | 4 | 8 | 16 and member[9] == 3
+assert member[10:14] == bytes([2, 0]) + b'AB'
+assert member[14:24] == b'notes.txt\0' and member[24:30] == b'about\0'
 "#,
         ])
         .stdin(Stdio::piped())

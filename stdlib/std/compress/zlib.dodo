@@ -2,238 +2,262 @@ package zlib
 
 import "std/checksum"
 import "std/compress/deflate"
-import "std/compress/deflate_fixed"
-import "std/compress/deflate_dynamic"
-import "std/compress/deflate_workspace"
 
-pub enum Error {
-    Truncated, InvalidData, OutputFull, ChecksumMismatch, UnsupportedDictionary
-}
-pub struct DecodeResult {
-    pub input_consumed: usize
-    pub output_written: usize
+// RFC 1950 zlib streams: a two-byte header, raw DEFLATE data, and an Adler-32
+// trailer. Results use deflate.Error, deflate.Progress, and deflate.Status.
+// Preset dictionaries are rejected with UnsupportedDictionary.
+
+// An output length that every encode level is guaranteed to fit.
+pub fn max_encoded_len(input_len: usize) -> usize {
+    return deflate.max_encoded_len(input_len) + 6
 }
 
-// Decodes one zlib stream; bytes following its trailer are left unconsumed.
-// Preset dictionaries are deliberately unsupported. This is a one-shot API;
-// the output prefix is unspecified on error, including checksum failure.
-pub fn decode(input: &[u8], output: &mut[u8]) -> DecodeResult!Error {
-    if input.len < 2 {
-        return err(Error.Truncated)
+fn header(level: usize) -> [2]u8 {
+    // FLEVEL advertises the speed/size trade-off; FCHECK makes the pair a
+    // multiple of 31.
+    flevel := 2u32
+    if level < 2 {
+        flevel = 0
+    } else if level < 6 {
+        flevel = 1
+    } else if level > 6 {
+        flevel = 3
     }
-    cmf := input[0] as u32
-    flg := input[1] as u32
-    if (cmf & 15) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 {
-        return err(Error.InvalidData)
+    flg := flevel << 6
+    flg = flg + 31 - ((0x78u32 << 8) | flg) % 31
+    return [0x78u8, flg as u8]
+}
+fn parse_header(cmf: u8, flg: u8) -> usize!deflate.Error {
+    c := cmf as u32
+    if (c & 15) != 8 || (c >> 4) > 7 || ((c << 8) | (flg as u32)) % 31 != 0 {
+        return err(deflate.Error.InvalidData)
     }
     if (flg & 32) != 0 {
-        return err(Error.UnsupportedDictionary)
+        return err(deflate.Error.UnsupportedDictionary)
     }
-    decoded := match deflate.decode_with_window(&input[2..], output, 1usize << (8 + (cmf >> 4) as usize)) {
-        ok(result) => {
-            result
-        },
-        err(reason) => {
-            match reason {
-                deflate.Error.Truncated => {
-                    return err(Error.Truncated)
-                },
-                deflate.Error.InvalidData => {
-                    return err(Error.InvalidData)
-                },
-                deflate.Error.OutputFull => {
-                    return err(Error.OutputFull)
-                },
-            }
-        },
+    return ok(1usize << (8 + (c >> 4) as usize))
+}
+fn put_u32_be(output: &mut[u8], value: u32) {
+    output[0] = (value >> 24) as u8
+    output[1] = ((value >> 16) & 255) as u8
+    output[2] = ((value >> 8) & 255) as u8
+    output[3] = (value & 255) as u8
+}
+
+// Decodes one zlib stream; bytes after its trailer are left unconsumed. On
+// error the output contents are unspecified.
+pub fn decode(input: &[u8], output: &mut[u8]) -> deflate.DecodeResult!deflate.Error {
+    if input.len < 2 {
+        return err(deflate.Error.Truncated)
     }
+    window := parse_header(input[0], input[1])?
+    decoded := deflate.decode_with_window(&input[2..], output, window)?
     offset := 2 + decoded.input_consumed
     if input.len - offset < 4 {
-        return err(Error.Truncated)
+        return err(deflate.Error.Truncated)
     }
     expected := ((input[offset] as u32) << 24) | ((input[offset + 1] as u32) << 16) | ((input[offset + 2] as u32) << 8) | (input[offset + 3] as u32)
     if checksum.adler32(&output[..decoded.output_written]) != expected {
-        return err(Error.ChecksumMismatch)
+        return err(deflate.Error.ChecksumMismatch)
     }
-    return ok(DecodeResult { input_consumed: offset + 4, output_written: decoded.output_written })
+    return ok(deflate.DecodeResult { input_consumed: offset + 4, output_written: decoded.output_written })
 }
 
-// Emits a zlib stream using stored DEFLATE blocks.
-pub fn encode(input: &[u8], output: &mut[u8]) -> usize!Error {
+// Compresses input into one zlib stream at level 0 through 9; see
+// deflate.encode. max_encoded_len(input.len) bytes always suffice.
+pub fn encode(input: &[u8], output: &mut[u8], level: usize) -> usize!deflate.Error {
+    if level > deflate.MAX_LEVEL {
+        return err(deflate.Error.InvalidArgument)
+    }
+    words := [0u32; deflate.WORKSPACE_LEN]
+    return encode_with_workspace(input, output, level, &mut words)
+}
+pub fn encode_with_workspace(input: &[u8], output: &mut[u8], level: usize, words: &mut[u32]) -> usize!deflate.Error {
+    if level > deflate.MAX_LEVEL {
+        return err(deflate.Error.InvalidArgument)
+    }
     if output.len < 6 {
-        return err(Error.OutputFull)
+        return err(deflate.Error.OutputFull)
     }
-    output[0] = 0x78
-    output[1] = 0x01
-    written := match deflate.encode(input, &mut output[2..output.len - 4]) {
-        ok(count) => {
-            count
-        },
-        err(_) => {
-            return err(Error.OutputFull)
-        },
-    }
-    sum := checksum.adler32(input)
-    offset := written + 2
-    output[offset] = ((sum >> 24) & 255) as u8
-    output[offset + 1] = ((sum >> 16) & 255) as u8
-    output[offset + 2] = ((sum >> 8) & 255) as u8
-    output[offset + 3] = (sum & 255) as u8
-    return ok(offset + 4)
+    h := header(level)
+    output[0] = h[0]
+    output[1] = h[1]
+    end := output.len - 4
+    written := deflate.encode_with_workspace(input, &mut output[2..end], level, words)?
+    put_u32_be(&mut output[2 + written..], checksum.adler32(input))
+    return ok(written + 6)
 }
 
-// Emits a stream using fixed Huffman codes and LZ77 matches.
-pub fn encode_fixed(input: &[u8], output: &mut[u8]) -> usize!Error {
-    if output.len < 6 {
-        return err(Error.OutputFull)
+const DECODE_HEADER: usize = 0
+const DECODE_BODY: usize = 1
+const DECODE_TRAILER: usize = 2
+const DECODE_DONE: usize = 3
+const DECODE_FAILED: usize = 4
+
+// Incremental zlib decoder for one stream. It reads nothing past the trailer.
+// Errors are final; reset() starts a new stream.
+pub struct Decoder {
+    raw: deflate.Decoder
+    adler: checksum.Adler32
+    phase: usize
+    value: u32
+    count: usize
+    pub fn new() -> Decoder {
+        return Decoder { raw: deflate.Decoder.new(), adler: checksum.Adler32.new(), phase: DECODE_HEADER, value: 0, count: 0 }
     }
-    output[0] = 0x78
-    output[1] = 0x01
-    written := match deflate_fixed.encode(input, &mut output[2..output.len - 4]) {
-        ok(count) => {
-            count
-        },
-        err(_) => {
-            return err(Error.OutputFull)
-        },
+    pub fn reset(&mut self) {
+        self.raw.reset()
+        self.adler.reset()
+        self.phase = DECODE_HEADER
+        self.value = 0
+        self.count = 0
     }
-    sum := checksum.adler32(input)
-    offset := written + 2
-    output[offset] = ((sum >> 24) & 255) as u8
-    output[offset + 1] = ((sum >> 16) & 255) as u8
-    output[offset + 2] = ((sum >> 8) & 255) as u8
-    output[offset + 3] = (sum & 255) as u8
-    return ok(offset + 4)
+    pub fn is_done(&self) -> bool {
+        return self.phase == DECODE_DONE
+    }
+    pub fn process(&mut self, input: &[u8], output: &mut[u8]) -> deflate.Progress!deflate.Error {
+        used := 0usize
+        written := 0usize
+        if self.phase == DECODE_FAILED {
+            return err(deflate.Error.InvalidData)
+        }
+        for {
+            if self.phase == DECODE_HEADER {
+                for self.count < 2 {
+                    if used == input.len {
+                        return ok(deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.NeedInput })
+                    }
+                    self.value = (self.value << 8) | (input[used] as u32)
+                    used += 1
+                    self.count += 1
+                }
+                window := match parse_header((self.value >> 8) as u8, (self.value & 255) as u8) {
+                    ok(window) => {
+                        window
+                    },
+                    err(reason) => {
+                        self.phase = DECODE_FAILED
+                        return err(reason)
+                    },
+                }
+                self.raw = match deflate.Decoder.new_with_window(window) {
+                    ok(raw) => {
+                        raw
+                    },
+                    err(reason) => {
+                        self.phase = DECODE_FAILED
+                        return err(reason)
+                    },
+                }
+                self.value = 0
+                self.count = 0
+                self.phase = DECODE_BODY
+            } else if self.phase == DECODE_BODY {
+                p := match self.raw.process(&input[used..], &mut output[written..]) {
+                    ok(p) => {
+                        p
+                    },
+                    err(reason) => {
+                        self.phase = DECODE_FAILED
+                        return err(reason)
+                    },
+                }
+                self.adler.update(&output[written..written + p.output_written])
+                used += p.input_consumed
+                written += p.output_written
+                if p.status != deflate.Status.Done {
+                    p.input_consumed = used
+                    p.output_written = written
+                    return ok(p)
+                }
+                self.phase = DECODE_TRAILER
+            } else if self.phase == DECODE_TRAILER {
+                for self.count < 4 {
+                    if used == input.len {
+                        return ok(deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.NeedInput })
+                    }
+                    self.value = (self.value << 8) | (input[used] as u32)
+                    used += 1
+                    self.count += 1
+                }
+                if self.value != self.adler.finish() {
+                    self.phase = DECODE_FAILED
+                    return err(deflate.Error.ChecksumMismatch)
+                }
+                self.phase = DECODE_DONE
+            } else {
+                return ok(deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.Done })
+            }
+        }
+    }
 }
 
-// Emits a dynamic-Huffman stream using frequency-ranked trees.
-pub fn encode_dynamic(input: &[u8], output: &mut[u8]) -> usize!Error {
-    if output.len < 6 {
-        return err(Error.OutputFull)
-    }
-    output[0] = 0x78
-    output[1] = 0x01
-    written := match deflate_dynamic.encode(input, &mut output[2..output.len - 4]) {
-        ok(count) => {
-            count
-        },
-        err(_) => {
-            return err(Error.OutputFull)
-        },
-    }
-    sum := checksum.adler32(input)
-    offset := written + 2
-    output[offset] = ((sum >> 24) & 255) as u8
-    output[offset + 1] = ((sum >> 16) & 255) as u8
-    output[offset + 2] = ((sum >> 8) & 255) as u8
-    output[offset + 3] = (sum & 255) as u8
-    return ok(offset + 4)
-}
+const ENCODE_HEADER: usize = 0
+const ENCODE_BODY: usize = 1
+const ENCODE_TRAILER: usize = 2
+const ENCODE_DONE: usize = 3
 
-// Compress using a specified match-search level from 0 through 9.
-pub fn encode_fixed_level(input: &[u8], output: &mut[u8], level: usize) -> usize!Error {
-    if level > 9 {
-        return err(Error.InvalidData)
+// Incremental zlib compressor; see deflate.Encoder for the process contract.
+pub struct Encoder {
+    raw: deflate.Encoder
+    adler: checksum.Adler32
+    level: usize
+    phase: usize
+    bytes: [4]u8
+    index: usize
+    count: usize
+    // Borrows storage as deflate.Encoder.new does.
+    pub fn new(level: usize, buffer: &mut[u8], words: &mut[u32]) -> Encoder!deflate.Error from(buffer, words) {
+        raw := deflate.Encoder.new(level, buffer, words)?
+        e := Encoder { raw: raw, adler: checksum.Adler32.new(), level: level, phase: ENCODE_HEADER, bytes: [0u8; 4], index: 0, count: 0 }
+        e.reset()
+        return ok(e)
     }
-    if output.len < 6 {
-        return err(Error.OutputFull)
+    pub fn reset(&mut self) {
+        self.raw.reset()
+        self.adler.reset()
+        h := header(self.level)
+        self.bytes[0] = h[0]
+        self.bytes[1] = h[1]
+        self.index = 0
+        self.count = 2
+        self.phase = ENCODE_HEADER
     }
-    output[0] = 0x78
-    output[1] = 0x01
-    written := match deflate_fixed.encode_level(input, &mut output[2..output.len - 4], level) {
-        ok(count) => {
-            count
-        },
-        err(_) => {
-            return err(Error.OutputFull)
-        },
+    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> deflate.Progress {
+        used := 0usize
+        written := 0usize
+        for {
+            if self.phase == ENCODE_BODY {
+                p := self.raw.process(&input[used..], &mut output[written..], finish)
+                self.adler.update(&input[used..used + p.input_consumed])
+                used += p.input_consumed
+                written += p.output_written
+                if p.status != deflate.Status.Done {
+                    p.input_consumed = used
+                    p.output_written = written
+                    return p
+                }
+                put_u32_be(&mut self.bytes, self.adler.finish())
+                self.index = 0
+                self.count = 4
+                self.phase = ENCODE_TRAILER
+            } else if self.phase == ENCODE_DONE {
+                return deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.Done }
+            } else {
+                for self.index < self.count {
+                    if written == output.len {
+                        return deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.NeedOutput }
+                    }
+                    output[written] = self.bytes[self.index]
+                    written += 1
+                    self.index += 1
+                }
+                if self.phase == ENCODE_HEADER {
+                    self.phase = ENCODE_BODY
+                } else {
+                    self.phase = ENCODE_DONE
+                }
+            }
+        }
     }
-    sum := checksum.adler32(input)
-    offset := written + 2
-    output[offset] = ((sum >> 24) & 255) as u8
-    output[offset + 1] = ((sum >> 16) & 255) as u8
-    output[offset + 2] = ((sum >> 8) & 255) as u8
-    output[offset + 3] = (sum & 255) as u8
-    return ok(offset + 4)
-}
-
-// Compress using a specified match-search level from 0 through 9.
-pub fn encode_dynamic_level(input: &[u8], output: &mut[u8], level: usize) -> usize!Error {
-    if level > 9 {
-        return err(Error.InvalidData)
-    }
-    if output.len < 6 {
-        return err(Error.OutputFull)
-    }
-    output[0] = 0x78
-    output[1] = 0x01
-    written := match deflate_dynamic.encode_level(input, &mut output[2..output.len - 4], level) {
-        ok(count) => {
-            count
-        },
-        err(_) => {
-            return err(Error.OutputFull)
-        },
-    }
-    sum := checksum.adler32(input)
-    offset := written + 2
-    output[offset] = ((sum >> 24) & 255) as u8
-    output[offset + 1] = ((sum >> 16) & 255) as u8
-    output[offset + 2] = ((sum >> 8) & 255) as u8
-    output[offset + 3] = (sum & 255) as u8
-    return ok(offset + 4)
-}
-
-// Compress with reusable caller-owned match-finder storage.
-pub fn encode_fixed_with_workspace(input: &[u8], output: &mut[u8], level: usize, workspace: &mut deflate_workspace.Workspace) -> usize!Error {
-    if level > 9 {
-        return err(Error.InvalidData)
-    }
-    if output.len < 6 {
-        return err(Error.OutputFull)
-    }
-    output[0] = 0x78
-    output[1] = 0x01
-    written := match deflate_fixed.encode_with_workspace(input, &mut output[2..output.len - 4], level, workspace) {
-        ok(count) => {
-            count
-        },
-        err(_) => {
-            return err(Error.OutputFull)
-        },
-    }
-    sum := checksum.adler32(input)
-    offset := written + 2
-    output[offset] = ((sum >> 24) & 255) as u8
-    output[offset + 1] = ((sum >> 16) & 255) as u8
-    output[offset + 2] = ((sum >> 8) & 255) as u8
-    output[offset + 3] = (sum & 255) as u8
-    return ok(offset + 4)
-}
-
-// Compress with reusable caller-owned match-finder storage.
-pub fn encode_dynamic_with_workspace(input: &[u8], output: &mut[u8], level: usize, workspace: &mut deflate_workspace.Workspace) -> usize!Error {
-    if level > 9 {
-        return err(Error.InvalidData)
-    }
-    if output.len < 6 {
-        return err(Error.OutputFull)
-    }
-    output[0] = 0x78
-    output[1] = 0x01
-    written := match deflate_dynamic.encode_with_workspace(input, &mut output[2..output.len - 4], level, workspace) {
-        ok(count) => {
-            count
-        },
-        err(_) => {
-            return err(Error.OutputFull)
-        },
-    }
-    sum := checksum.adler32(input)
-    offset := written + 2
-    output[offset] = ((sum >> 24) & 255) as u8
-    output[offset + 1] = ((sum >> 16) & 255) as u8
-    output[offset + 2] = ((sum >> 8) & 255) as u8
-    output[offset + 3] = (sum & 255) as u8
-    return ok(offset + 4)
 }

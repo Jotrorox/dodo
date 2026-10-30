@@ -1,6 +1,6 @@
 package inflate_oracle
 
-import "std/compress/inflate"
+import "std/compress/deflate"
 import "std/console"
 import "std/io"
 
@@ -13,28 +13,48 @@ fn main() -> i32 {
     used := 0usize
     for used < input.len {
         n := match source.read(&mut input[used..]) {
-            ok(n) => { n }, err(_) => { return 1 }
+            ok(n) => {
+                n
+            }, err(_) => {
+                return 1
+            }
         }
-        if n == 0 { break }
+        if n == 0 {
+            break
+        }
         used += n
     }
-    decoder := inflate.Decoder.new()
+    decoder := deflate.Decoder.new()
     pos := 0usize
     for {
         end := pos
-        if end < used { end += 1 }
+        if end < used {
+            end += 1
+        }
         report := match decoder.process(&input[pos..end], &mut output) {
-            ok(result) => { result }, err(_) => { return 2 }
+            ok(result) => {
+                result
+            }, err(_) => {
+                return 2
+            }
         }
         pos += report.input_consumed
         match io.write_all(&mut sink, &output[..report.output_written]) {
-            ok(_) => {}, err(_) => { return 3 }
+            ok(_) => {}, err(_) => {
+                return 3
+            }
         }
-        if report.status == inflate.Status.Done {
-            if pos != used { return 4 }
+        if report.status == deflate.Status.Done {
+            if pos != used {
+                return 4
+            }
             return 0
         }
-        if report.status == inflate.Status.NeedInput && pos == used { return 5 }
-        if report.input_consumed == 0 && report.output_written == 0 && report.status != inflate.Status.NeedInput { return 6 }
+        if report.status == deflate.Status.NeedInput && pos == used {
+            return 5
+        }
+        if report.input_consumed == 0 && report.output_written == 0 && report.status != deflate.Status.NeedInput {
+            return 6
+        }
     }
 }

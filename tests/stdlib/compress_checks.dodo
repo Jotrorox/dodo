@@ -10,15 +10,23 @@ fn check_empty() -> i32 {
     output := [0u8; 1]
     match deflate.decode(&input, &mut output) {
         ok(result) => {
-            if result.input_consumed != 2 || result.output_written != 0 { return 1 }
-            for i in 0usize..0 {
-                if output[i] != (97 + (i % 5)) as u8 { return 2 }
+            if result.input_consumed != 2 || result.output_written != 0 {
+                return 1
             }
-        }, err(_) => { return 3 }
+            for i in 0usize..0 {
+                if output[i] != (97 + (i % 5)) as u8 {
+                    return 2
+                }
+            }
+        }, err(_) => {
+            return 3
+        }
     }
     for split in 0usize..2 {
         match deflate.decode(&input[..split], &mut output) {
-            ok(_) => { return 5 }, err(_) => {}
+            ok(_) => {
+                return 5
+            }, err(_) => {}
         }
     }
     return 0
@@ -29,18 +37,32 @@ fn check_stored() -> i32 {
     output := [0u8; 350]
     match deflate.decode(&input, &mut output) {
         ok(result) => {
-            if result.input_consumed != 355 || result.output_written != 350 { return 1 }
-            for i in 0usize..350 {
-                if output[i] != (97 + (i % 5)) as u8 { return 2 }
+            if result.input_consumed != 355 || result.output_written != 350 {
+                return 1
             }
-        }, err(_) => { return 3 }
+            for i in 0usize..350 {
+                if output[i] != (97 + (i % 5)) as u8 {
+                    return 2
+                }
+            }
+        }, err(_) => {
+            return 3
+        }
     }
     match deflate.decode(&input, &mut output[..349]) {
-        ok(_) => { return 4 }, err(reason) => { if reason != deflate.Error.OutputFull { return 6 } }
+        ok(_) => {
+            return 4
+        }, err(reason) => {
+            if reason != deflate.Error.OutputFull {
+                return 6
+            }
+        }
     }
     for split in 0usize..355 {
         match deflate.decode(&input[..split], &mut output) {
-            ok(_) => { return 5 }, err(_) => {}
+            ok(_) => {
+                return 5
+            }, err(_) => {}
         }
     }
     return 0
@@ -51,18 +73,32 @@ fn check_fixed() -> i32 {
     output := [0u8; 40000]
     match deflate.decode(&input, &mut output) {
         ok(result) => {
-            if result.input_consumed != 281 || result.output_written != 40000 { return 1 }
-            for i in 0usize..40000 {
-                if output[i] != (97 + (i % 5)) as u8 { return 2 }
+            if result.input_consumed != 281 || result.output_written != 40000 {
+                return 1
             }
-        }, err(_) => { return 3 }
+            for i in 0usize..40000 {
+                if output[i] != (97 + (i % 5)) as u8 {
+                    return 2
+                }
+            }
+        }, err(_) => {
+            return 3
+        }
     }
     match deflate.decode(&input, &mut output[..39999]) {
-        ok(_) => { return 4 }, err(reason) => { if reason != deflate.Error.OutputFull { return 6 } }
+        ok(_) => {
+            return 4
+        }, err(reason) => {
+            if reason != deflate.Error.OutputFull {
+                return 6
+            }
+        }
     }
     for split in 0usize..281 {
         match deflate.decode(&input[..split], &mut output) {
-            ok(_) => { return 5 }, err(_) => {}
+            ok(_) => {
+                return 5
+            }, err(_) => {}
         }
     }
     return 0
@@ -73,18 +109,32 @@ fn check_dynamic() -> i32 {
     output := [0u8; 40000]
     match deflate.decode(&input, &mut output) {
         ok(result) => {
-            if result.input_consumed != 80 || result.output_written != 40000 { return 1 }
-            for i in 0usize..40000 {
-                if output[i] != (97 + (i % 5)) as u8 { return 2 }
+            if result.input_consumed != 80 || result.output_written != 40000 {
+                return 1
             }
-        }, err(_) => { return 3 }
+            for i in 0usize..40000 {
+                if output[i] != (97 + (i % 5)) as u8 {
+                    return 2
+                }
+            }
+        }, err(_) => {
+            return 3
+        }
     }
     match deflate.decode(&input, &mut output[..39999]) {
-        ok(_) => { return 4 }, err(reason) => { if reason != deflate.Error.OutputFull { return 6 } }
+        ok(_) => {
+            return 4
+        }, err(reason) => {
+            if reason != deflate.Error.OutputFull {
+                return 6
+            }
+        }
     }
     for split in 0usize..80 {
         match deflate.decode(&input[..split], &mut output) {
-            ok(_) => { return 5 }, err(_) => {}
+            ok(_) => {
+                return 5
+            }, err(_) => {}
         }
     }
     return 0
@@ -95,18 +145,32 @@ fn check_zlib() -> i32 {
     output := [0u8; 40000]
     match zlib.decode(&input, &mut output) {
         ok(result) => {
-            if result.input_consumed != 86 || result.output_written != 40000 { return 1 }
-            for i in 0usize..40000 {
-                if output[i] != (97 + (i % 5)) as u8 { return 2 }
+            if result.input_consumed != 86 || result.output_written != 40000 {
+                return 1
             }
-        }, err(_) => { return 3 }
+            for i in 0usize..40000 {
+                if output[i] != (97 + (i % 5)) as u8 {
+                    return 2
+                }
+            }
+        }, err(_) => {
+            return 3
+        }
     }
     match zlib.decode(&input, &mut output[..39999]) {
-        ok(_) => { return 4 }, err(reason) => { if reason != zlib.Error.OutputFull { return 6 } }
+        ok(_) => {
+            return 4
+        }, err(reason) => {
+            if reason != deflate.Error.OutputFull {
+                return 6
+            }
+        }
     }
     for split in 0usize..86 {
         match zlib.decode(&input[..split], &mut output) {
-            ok(_) => { return 5 }, err(_) => {}
+            ok(_) => {
+                return 5
+            }, err(_) => {}
         }
     }
     return 0
@@ -117,18 +181,32 @@ fn check_gzip() -> i32 {
     output := [0u8; 40000]
     match gzip.decode(&input, &mut output) {
         ok(result) => {
-            if result.input_consumed != 98 || result.output_written != 40000 { return 1 }
-            for i in 0usize..40000 {
-                if output[i] != (97 + (i % 5)) as u8 { return 2 }
+            if result.input_consumed != 98 || result.output_written != 40000 {
+                return 1
             }
-        }, err(_) => { return 3 }
+            for i in 0usize..40000 {
+                if output[i] != (97 + (i % 5)) as u8 {
+                    return 2
+                }
+            }
+        }, err(_) => {
+            return 3
+        }
     }
     match gzip.decode(&input, &mut output[..39999]) {
-        ok(_) => { return 4 }, err(reason) => { if reason != gzip.Error.OutputFull { return 6 } }
+        ok(_) => {
+            return 4
+        }, err(reason) => {
+            if reason != deflate.Error.OutputFull {
+                return 6
+            }
+        }
     }
     for split in 0usize..98 {
         match gzip.decode(&input[..split], &mut output) {
-            ok(_) => { return 5 }, err(_) => {}
+            ok(_) => {
+                return 5
+            }, err(_) => {}
         }
     }
     return 0
@@ -139,70 +217,402 @@ fn check_errors() -> i32 {
     invalid_type := [7u8]
     invalid_stored := [1u8, 1, 0, 0, 0, 65]
     invalid_distance := [3u8, 2, 0]
-    invalid_tree := [5u8,0,146,4]
+    invalid_tree := [5u8, 0, 146, 4]
     invalid_inputs := [&invalid_type[..], &invalid_stored[..], &invalid_distance[..], &invalid_tree[..]]
     for &input in invalid_inputs {
         match deflate.decode(input, &mut output) {
-            ok(_) => { return 1 }, err(reason) => { if reason != deflate.Error.InvalidData { return 2 } }
+            ok(_) => {
+                return 1
+            }, err(reason) => {
+                if reason != deflate.Error.InvalidData {
+                    return 2
+                }
+            }
         }
     }
     bad_zlib := [0u8, 0]
     match zlib.decode(&bad_zlib, &mut output) {
-        ok(_) => { return 3 }, err(reason) => { if reason != zlib.Error.InvalidData { return 4 } }
+        ok(_) => {
+            return 3
+        }, err(reason) => {
+            if reason != deflate.Error.InvalidData {
+                return 4
+            }
+        }
     }
     dictionary := [0x78u8, 0x20]
     match zlib.decode(&dictionary, &mut output) {
-        ok(_) => { return 5 }, err(reason) => { if reason != zlib.Error.UnsupportedDictionary { return 6 } }
+        ok(_) => {
+            return 5
+        }, err(reason) => {
+            if reason != deflate.Error.UnsupportedDictionary {
+                return 6
+            }
+        }
     }
     bad_adler := [0x78u8, 0x9c, 3, 0, 0, 0, 0, 0]
     match zlib.decode(&bad_adler, &mut output) {
-        ok(_) => { return 7 }, err(reason) => { if reason != zlib.Error.ChecksumMismatch { return 8 } }
+        ok(_) => {
+            return 7
+        }, err(reason) => {
+            if reason != deflate.Error.ChecksumMismatch {
+                return 8
+            }
+        }
     }
     bad_gzip := [31u8, 139, 8, 224, 0, 0, 0, 0, 0, 255]
     match gzip.decode(&bad_gzip, &mut output) {
-        ok(_) => { return 9 }, err(reason) => { if reason != gzip.Error.InvalidData { return 10 } }
+        ok(_) => {
+            return 9
+        }, err(reason) => {
+            if reason != deflate.Error.InvalidData {
+                return 10
+            }
+        }
     }
     bad_crc := [31u8, 139, 8, 0, 0, 0, 0, 0, 0, 255, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0]
     match gzip.decode(&bad_crc, &mut output) {
-        ok(_) => { return 11 }, err(reason) => { if reason != gzip.Error.ChecksumMismatch { return 12 } }
+        ok(_) => {
+            return 11
+        }, err(reason) => {
+            if reason != deflate.Error.ChecksumMismatch {
+                return 12
+            }
+        }
+    }
+    return 0
+}
+
+// Every optional header field, decoded whole, byte by byte, and corrupted.
+fn check_gzip_header() -> i32 {
+    input: [45]u8 = [31u8, 139, 8, 30, 0, 0, 0, 0, 0, 255, 3, 0, 1, 2, 3, 110, 97, 109, 101, 0, 99, 111, 109, 109, 101, 110, 116, 0, 53, 95, 203, 72, 205, 201, 201, 7, 0, 134, 166, 16, 54, 5, 0, 0, 0]
+    output := [0u8; 5]
+    match gzip.decode(&input, &mut output) {
+        ok(result) => {
+            if result.input_consumed != 45 || result.output_written != 5 {
+                return 1
+            }
+            if output[0] != 104 || output[4] != 111 {
+                return 2
+            }
+        }, err(_) => {
+            return 3
+        }
+    }
+    for i in 0usize..45 {
+        match gzip.decode(&input[..i], &mut output) {
+            ok(_) => {
+                return 4
+            }, err(reason) => {
+                if reason != deflate.Error.Truncated {
+                    return 5
+                }
+            }
+        }
+    }
+    decoder := gzip.Decoder.new()
+    used := 0usize
+    written := 0usize
+    for !decoder.is_done() {
+        limit := used + 1
+        if limit > input.len {
+            limit = input.len
+        }
+        space := written + 1
+        if space > output.len {
+            space = output.len
+        }
+        p := match decoder.process(&input[used..limit], &mut output[written..space]) {
+            ok(p) => {
+                p
+            }, err(_) => {
+                return 6
+            }
+        }
+        used += p.input_consumed
+        written += p.output_written
+    }
+    if used != input.len || written != 5 || output[1] != 101 {
+        return 7
+    }
+    input[28] = 0
+    match gzip.decode(&input, &mut output) {
+        ok(_) => {
+            return 8
+        }, err(reason) => {
+            if reason != deflate.Error.ChecksumMismatch {
+                return 9
+            }
+        }
+    }
+    decoder.reset()
+    match decoder.process(&input, &mut output) {
+        ok(_) => {
+            return 10
+        }, err(reason) => {
+            if reason != deflate.Error.ChecksumMismatch {
+                return 11
+            }
+        }
+    }
+    // Errors are final.
+    match decoder.process(&input, &mut output) {
+        ok(_) => {
+            return 12
+        }, err(_) => {}
+    }
+    return 0
+}
+
+// Concatenated members decode one at a time, leaving the rest unconsumed.
+fn check_gzip_members() -> i32 {
+    joined := [0u8; 64]
+    first := match gzip.encode(b"ab", &mut joined, 6) {
+        ok(n) => {
+            n
+        }, err(_) => {
+            return 1
+        }
+    }
+    second := match gzip.encode(b"cde", &mut joined[first..], 0) {
+        ok(n) => {
+            n
+        }, err(_) => {
+            return 2
+        }
+    }
+    output := [0u8; 8]
+    a := match gzip.decode(&joined[..first + second], &mut output) {
+        ok(r) => {
+            r
+        }, err(_) => {
+            return 3
+        }
+    }
+    if a.input_consumed != first || a.output_written != 2 {
+        return 4
+    }
+    b := match gzip.decode(&joined[first..first + second], &mut output) {
+        ok(r) => {
+            r
+        }, err(_) => {
+            return 5
+        }
+    }
+    if b.input_consumed != second || b.output_written != 3 || output[0] != 99 {
+        return 6
+    }
+    decoder := gzip.Decoder.new()
+    p := match decoder.process(&joined[..first + second], &mut output) {
+        ok(p) => {
+            p
+        }, err(_) => {
+            return 7
+        }
+    }
+    if p.status != deflate.Status.Done || p.input_consumed != first {
+        return 8
+    }
+    decoder.reset()
+    p = match decoder.process(&joined[first..first + second], &mut output) {
+        ok(p) => {
+            p
+        }, err(_) => {
+            return 9
+        }
+    }
+    if p.status != deflate.Status.Done || p.output_written != 3 {
+        return 10
+    }
+    return 0
+}
+
+// Metadata is read back from Python-made and self-made headers.
+fn check_header_fields() -> i32 {
+    input: [45]u8 = [31u8, 139, 8, 30, 0, 0, 0, 0, 0, 255, 3, 0, 1, 2, 3, 110, 97, 109, 101, 0, 99, 111, 109, 109, 101, 110, 116, 0, 53, 95, 203, 72, 205, 201, 201, 7, 0, 134, 166, 16, 54, 5, 0, 0, 0]
+    info := match gzip.read_header(&input) {
+        ok(info) => {
+            info
+        }, err(_) => {
+            return 1
+        }
+    }
+    if info.length != 30 || info.header.extra.len != 3 || info.header.extra[2] != 3 {
+        return 2
+    }
+    if info.header.name.len != 4 || info.header.name[0] != 110 || info.header.comment.len != 7 || info.header.os != 255 {
+        return 3
+    }
+    header := gzip.Header { mtime: 1700000000, os: 3, text: true, extra: b"AB", name: b"notes.txt", comment: b"about" }
+    words := [0u32; deflate.WORKSPACE_LEN]
+    packed := [0u8; 128]
+    n := match gzip.encode_with_header(b"hello hello hello", &mut packed, 9, &header, &mut words) {
+        ok(n) => {
+            n
+        }, err(_) => {
+            return 4
+        }
+    }
+    back := match gzip.read_header(&packed[..n]) {
+        ok(info) => {
+            info
+        }, err(_) => {
+            return 5
+        }
+    }
+    length := match gzip.header_len(&header) {
+        ok(length) => {
+            length
+        }, err(_) => {
+            return 6
+        }
+    }
+    if back.length != length || back.header.mtime != 1700000000 || back.header.os != 3 || !back.header.text {
+        return 7
+    }
+    if back.header.name.len != 9 || back.header.name[0] != 110 || back.header.comment.len != 5 || back.header.extra[1] != 66 {
+        return 8
+    }
+    restored := [0u8; 32]
+    r := match gzip.decode(&packed[..n], &mut restored) {
+        ok(r) => {
+            r
+        }, err(_) => {
+            return 9
+        }
+    }
+    if r.output_written != 17 || r.input_consumed != n {
+        return 10
+    }
+    header.name = b"bad\x00name"
+    match gzip.encode_with_header(b"x", &mut packed, 6, &header, &mut words) {
+        ok(_) => {
+            return 11
+        }, err(reason) => {
+            if reason != deflate.Error.InvalidArgument {
+                return 12
+            }
+        }
+    }
+    header.name = b"notes.txt"
+    stream := console.stdout()
+    n = match gzip.encode_with_header(b"hello hello hello", &mut packed, 6, &header, &mut words) {
+        ok(n) => {
+            n
+        }, err(_) => {
+            return 13
+        }
+    }
+    prefix := [(n & 255) as u8, ((n >> 8) & 255) as u8, ((n >> 16) & 255) as u8, ((n >> 24) & 255) as u8]
+    match io.write_all(&mut stream, &prefix) {
+        ok(_) => {}, err(_) => {
+            return 14
+        }
+    }
+    match io.write_all(&mut stream, &packed[..n]) {
+        ok(_) => {}, err(_) => {
+            return 15
+        }
     }
     return 0
 }
 
 fn main() -> i32 {
-    if check_errors() != 0 { return 40 }
-    if check_empty() != 0 { return 10 }
-    if check_stored() != 0 { return 11 }
-    if check_fixed() != 0 { return 12 }
-    if check_dynamic() != 0 { return 13 }
-    if check_zlib() != 0 { return 14 }
-    if check_gzip() != 0 { return 15 }
+    if check_gzip_header() != 0 {
+        return 50
+    }
+    if check_gzip_members() != 0 {
+        return 51
+    }
+    if check_errors() != 0 {
+        return 40
+    }
+    if check_empty() != 0 {
+        return 10
+    }
+    if check_stored() != 0 {
+        return 11
+    }
+    if check_fixed() != 0 {
+        return 12
+    }
+    if check_dynamic() != 0 {
+        return 13
+    }
+    if check_zlib() != 0 {
+        return 14
+    }
+    if check_gzip() != 0 {
+        return 15
+    }
     data := [0u8; 257]
-    for i in 0usize..data.len { data[i] = (i & 255) as u8 }
+    for i in 0usize..data.len {
+        data[i] = (i & 255) as u8
+    }
     encoded := [0u8; 1024]
     stream := console.stdout()
     for kind in 0usize..3 {
         count := 0usize
         if kind == 0 {
-            match deflate.encode(&data, &mut encoded) { ok(n) => { count = n }, err(_) => { return 30 } }
+            match deflate.encode(&data, &mut encoded, 0) {
+                ok(n) => {
+                    count = n
+                }, err(_) => {
+                    return 30
+                }
+            }
         } else if kind == 1 {
-            match zlib.encode(&data, &mut encoded) { ok(n) => { count = n }, err(_) => { return 31 } }
+            match zlib.encode(&data, &mut encoded, 0) {
+                ok(n) => {
+                    count = n
+                }, err(_) => {
+                    return 31
+                }
+            }
         } else {
-            match gzip.encode(&data, &mut encoded) { ok(n) => { count = n }, err(_) => { return 32 } }
+            match gzip.encode(&data, &mut encoded, 0) {
+                ok(n) => {
+                    count = n
+                }, err(_) => {
+                    return 32
+                }
+            }
         }
         prefix := [(count & 255) as u8, ((count >> 8) & 255) as u8, ((count >> 16) & 255) as u8, ((count >> 24) & 255) as u8]
-        match io.write_all(&mut stream, &prefix) { ok(_) => {}, err(_) => { return 33 } }
-        match io.write_all(&mut stream, &encoded[..count]) { ok(_) => {}, err(_) => { return 34 } }
+        match io.write_all(&mut stream, &prefix) {
+            ok(_) => {}, err(_) => {
+                return 33
+            }
+        }
+        match io.write_all(&mut stream, &encoded[..count]) {
+            ok(_) => {}, err(_) => {
+                return 34
+            }
+        }
     }
     // A stored encoder must cross the 65535-byte block boundary.
     large := [0u8; 65536]
-    for i in 0usize..large.len { large[i] = (i & 255) as u8 }
+    for i in 0usize..large.len {
+        large[i] = (i & 255) as u8
+    }
     large_encoded := [0u8; 65560]
-    count := match deflate.encode(&large, &mut large_encoded) {
-        ok(n) => { n }, err(_) => { return 41 }
+    count := match deflate.encode(&large, &mut large_encoded, 0) {
+        ok(n) => {
+            n
+        }, err(_) => {
+            return 41
+        }
     }
     prefix := [(count & 255) as u8, ((count >> 8) & 255) as u8, ((count >> 16) & 255) as u8, ((count >> 24) & 255) as u8]
-    match io.write_all(&mut stream, &prefix) { ok(_) => {}, err(_) => { return 42 } }
-    match io.write_all(&mut stream, &large_encoded[..count]) { ok(_) => {}, err(_) => { return 43 } }
-    return 0
+    match io.write_all(&mut stream, &prefix) {
+        ok(_) => {}, err(_) => {
+            return 42
+        }
+    }
+    match io.write_all(&mut stream, &large_encoded[..count]) {
+        ok(_) => {}, err(_) => {
+            return 43
+        }
+    }
+    return check_header_fields()
 }

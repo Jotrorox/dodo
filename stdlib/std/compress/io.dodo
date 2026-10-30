@@ -2,335 +2,180 @@ package io
 
 import "std/io" as streamio
 import "core/mem"
-import "std/compress/deflate_store"
-import "std/compress/zlib_store"
-import "std/compress/gzip_store"
-import "std/compress/inflate"
-import "std/compress/zlib_stream"
-import "std/compress/gzip_stream"
+import "std/compress/deflate"
 
-// A checked decoding reader distinguishes device failures from malformed data,
-// checksum failures, unsupported dictionaries, and truncated streams.
+// Adapters between std/io streams and the incremental codecs. deflate, zlib,
+// and gzip Decoder and Encoder values all satisfy these interfaces.
+pub interface Decoder {
+    fn process(&mut self, input: &[u8], output: &mut[u8]) -> deflate.Progress!deflate.Error
+    fn reset(&mut self)
+}
+pub interface Encoder {
+    fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> deflate.Progress
+}
+
+// read_checked keeps device failures apart from format errors.
 pub enum ErrorKind {
-    Io, Truncated, InvalidData, ChecksumMismatch, UnsupportedDictionary
+    // The source failed; cause holds its error.
+    Io,
+    // The source ended inside the stream.
+    Truncated,
+    // The stream is malformed; format holds the decoder's error.
+    Format
 }
 pub struct Error {
     pub kind: ErrorKind
+    pub format: deflate.Error
     pub transferred: usize
     pub cause: streamio.Error
 }
-pub enum Status {
-    NeedInput, NeedOutput, Done
+fn io_error(cause: streamio.Error, transferred: usize) -> Error {
+    return Error { kind: ErrorKind.Io, format: deflate.Error.InvalidData, transferred: transferred, cause: cause }
 }
-pub struct Progress {
-    pub input_consumed: usize, pub output_written: usize, pub status: Status
+fn format_error(format: deflate.Error, transferred: usize) -> Error {
+    return Error { kind: ErrorKind.Format, format: format, transferred: transferred, cause: streamio.failure(streamio.ErrorKind.InvalidInput, transferred) }
 }
-pub struct CodecError {
-    pub kind: ErrorKind;
-    pub input_consumed: usize;
-    pub output_written: usize
-}
-pub interface Codec {
-    fn process(&mut self, input: &[u8], output: &mut[u8]) -> Progress!CodecError
-}
-pub struct Raw {
-    decoder: inflate.Decoder
-    pub fn new() -> Raw {
-        return Raw { decoder: inflate.Decoder.new() }
+
+// Decompresses one stream from source. Compressed bytes are read into the
+// caller's storage; bytes read past the end of the stream stay available
+// through buffered(). A one-byte storage never reads past the stream.
+pub struct Reader<R: streamio.Reader, D: Decoder> {
+    source: &mut R
+    decoder: &mut D
+    storage: &mut[u8]
+    start: usize
+    end: usize
+    done: bool
+    deferred: bool
+    reason: streamio.Error
+    pub fn new(source: &mut R, decoder: &mut D, storage: &mut[u8]) -> Reader<R, D>!streamio.Error from(source, decoder, storage) {
+        if storage.len == 0 {
+            return err(streamio.failure(streamio.ErrorKind.InvalidInput, 0))
+        }
+        return ok(Reader<R, D> { source: source, decoder: decoder, storage: storage, start: 0, end: 0, done: false, deferred: false, reason: streamio.failure(streamio.ErrorKind.Other, 0) })
     }
-    pub fn process(&mut self, input: &[u8], output: &mut[u8]) -> Progress!CodecError {
-        p := match self.decoder.process(input, output) {
-            ok(value) => {
-                value
-            }, err(_) => {
-                return err(CodecError { kind: ErrorKind.InvalidData, input_consumed: self.decoder.last_input_consumed(), output_written: self.decoder.last_output_written() })
+    // Source bytes read but not consumed by the decoder.
+    pub fn buffered(&self) -> &[u8] {
+        return &self.storage[self.start..self.end]
+    }
+    pub fn is_done(&self) -> bool {
+        return self.done
+    }
+    // Resets the decoder to read a following stream, such as the next member
+    // of a concatenated gzip file. Returns false at the end of the source.
+    pub fn next_stream(&mut self) -> bool!Error {
+        self.decoder.reset()
+        self.done = false
+        if self.start < self.end {
+            return ok(true)
+        }
+        self.fill(0)?
+        return ok(self.start < self.end)
+    }
+    fn fill(&mut self, written: usize) -> void!Error {
+        self.start = 0
+        self.end = 0
+        if self.deferred {
+            self.deferred = false
+            reason := mem.replace(&mut self.reason, streamio.failure(streamio.ErrorKind.Other, 0))
+            reason.transferred = written
+            return err(io_error(reason, written))
+        }
+        for {
+            match streamio.read_once(self.source, self.storage) {
+                ok(count) => {
+                    self.end = count
+                    return ok()
+                },
+                err(reason) => {
+                    self.end = reason.transferred
+                    if reason.kind != streamio.ErrorKind.Interrupted {
+                        if self.end == 0 {
+                            reason.transferred = written
+                            return err(io_error(reason, written))
+                        }
+                        // Decode the bytes that arrived, then report.
+                        self.reason = reason
+                        self.deferred = true
+                        return ok()
+                    }
+                    if self.end != 0 {
+                        return ok()
+                    }
+                },
             }
         }
-        s := Status.NeedInput
-        match &p.status {
-            inflate.Status.NeedInput => {
-                s = Status.NeedInput
-            },
-            inflate.Status.NeedOutput => {
-                s = Status.NeedOutput
-            },
-            inflate.Status.Done => {
-                s = Status.Done
-            },
-        }
-        return ok(Progress { input_consumed: p.input_consumed, output_written: p.output_written, status: s })
-    }
-}
-pub struct Zlib {
-    decoder: zlib_stream.Decoder
-    pub fn new() -> Zlib {
-        return Zlib { decoder: zlib_stream.Decoder.new() }
-    }
-    pub fn process(&mut self, input: &[u8], output: &mut[u8]) -> Progress!CodecError {
-        p := match self.decoder.process(input, output) {
-            ok(value) => {
-                value
-            },
-            err(e) => {
-                match e {
-                    zlib_stream.Error.InvalidData => {
-                        return err(CodecError { kind: ErrorKind.InvalidData, input_consumed: self.decoder.last_input_consumed(), output_written: self.decoder.last_output_written() })
-                    },
-                    zlib_stream.Error.ChecksumMismatch => {
-                        return err(CodecError { kind: ErrorKind.ChecksumMismatch, input_consumed: self.decoder.last_input_consumed(), output_written: self.decoder.last_output_written() })
-                    },
-                    zlib_stream.Error.UnsupportedDictionary => {
-                        return err(CodecError { kind: ErrorKind.UnsupportedDictionary, input_consumed: self.decoder.last_input_consumed(), output_written: self.decoder.last_output_written() })
-                    },
-                }
-            },
-        }
-        s := Status.NeedInput
-        match &p.status {
-            zlib_stream.Status.NeedInput => {
-                s = Status.NeedInput
-            },
-            zlib_stream.Status.NeedOutput => {
-                s = Status.NeedOutput
-            },
-            zlib_stream.Status.Done => {
-                s = Status.Done
-            },
-        }
-        return ok(Progress { input_consumed: p.input_consumed, output_written: p.output_written, status: s })
-    }
-}
-pub struct Gzip {
-    decoder: gzip_stream.Decoder
-    pub fn new() -> Gzip {
-        return Gzip { decoder: gzip_stream.Decoder.new() }
-    }
-    pub fn process(&mut self, input: &[u8], output: &mut[u8]) -> Progress!CodecError {
-        p := match self.decoder.process(input, output) {
-            ok(value) => {
-                value
-            },
-            err(e) => {
-                match e {
-                    gzip_stream.Error.InvalidData => {
-                        return err(CodecError { kind: ErrorKind.InvalidData, input_consumed: self.decoder.last_input_consumed(), output_written: self.decoder.last_output_written() })
-                    },
-                    gzip_stream.Error.ChecksumMismatch => {
-                        return err(CodecError { kind: ErrorKind.ChecksumMismatch, input_consumed: self.decoder.last_input_consumed(), output_written: self.decoder.last_output_written() })
-                    },
-                }
-            },
-        }
-        s := Status.NeedInput
-        match &p.status {
-            gzip_stream.Status.NeedInput => {
-                s = Status.NeedInput
-            },
-            gzip_stream.Status.NeedOutput => {
-                s = Status.NeedOutput
-            },
-            gzip_stream.Status.Done => {
-                s = Status.Done
-            },
-        }
-        return ok(Progress { input_consumed: p.input_consumed, output_written: p.output_written, status: s })
-    }
-}
-// Reads only as far as the end of one stream, leaving a following stream or
-// trailer in the source. Read errors carrying a byte are deferred until that
-// byte has been consumed, with produced output included in transferred.
-pub struct Reader<R: streamio.Reader, C: Codec> {
-    source: &mut R
-    codec: C
-    byte: [1]u8
-    have: usize
-    done: bool
-    failed: bool
-    reason: streamio.Error
-    pub fn new(source: &mut R, codec: C) -> Reader<R, C> from(source) {
-        return Reader<R, C> { source: source, codec: codec, byte: [0u8; 1], have: 0, done: false, failed: false, reason: streamio.failure(streamio.ErrorKind.Other, 0) }
     }
     pub fn read_checked(&mut self, output: &mut[u8]) -> usize!Error {
         if output.len == 0 || self.done {
             return ok(0)
         }
         written := 0usize
-        for true {
-            progress := match self.codec.process(&self.byte[..self.have], &mut output[written..]) {
-                ok(value) => {
-                    value
+        for {
+            p := match self.decoder.process(&self.storage[self.start..self.end], &mut output[written..]) {
+                ok(p) => {
+                    p
                 },
                 err(reason) => {
-                    if reason.input_consumed > self.have || reason.output_written > output.len - written {
-                        return err(Error { kind: ErrorKind.Io, transferred: written, cause: streamio.failure(streamio.ErrorKind.InvalidProgress, 0) })
-                    }
-                    self.have -= reason.input_consumed
-                    written += reason.output_written
-                    kind := mem.replace(&mut reason.kind, ErrorKind.InvalidData)
-                    return err(Error { kind: kind, transferred: written, cause: streamio.failure(streamio.ErrorKind.InvalidInput, 0) })
+                    return err(format_error(reason, written))
                 },
             }
-            if progress.input_consumed > self.have || progress.output_written > output.len - written {
-                return err(Error { kind: ErrorKind.Io, transferred: written, cause: streamio.failure(streamio.ErrorKind.InvalidProgress, 0) })
+            self.start += p.input_consumed
+            written += p.output_written
+            if p.status == deflate.Status.Done {
+                self.done = true
+                return ok(written)
             }
-            self.have -= progress.input_consumed
-            written += progress.output_written
-            if self.have == 0 && self.failed {
-                self.failed = false
-                reason := mem.replace(&mut self.reason, streamio.failure(streamio.ErrorKind.Other, 0))
-                return err(Error { kind: ErrorKind.Io, transferred: written, cause: reason })
+            if p.status == deflate.Status.NeedOutput {
+                return ok(written)
             }
-            match &progress.status {
-                Status.Done => {
-                    self.done = true;
-                    return ok(written)
-                },
-                Status.NeedOutput => {
-                    return ok(written)
-                },
-                Status.NeedInput => {
-                    if self.have != 0 {
-                        return err(Error { kind: ErrorKind.InvalidData, transferred: written, cause: streamio.failure(streamio.ErrorKind.Other, 0) })
-                    }
-                    match streamio.read_once(self.source, &mut self.byte) {
-                        ok(count) => {
-                            if count == 0 {
-                                return err(Error { kind: ErrorKind.Truncated, transferred: written, cause: streamio.failure(streamio.ErrorKind.UnexpectedEof, 0) })
-                            }
-                            self.have = count
-                        },
-                        err(reason) => {
-                            self.have = reason.transferred
-                            if reason.kind == streamio.ErrorKind.Interrupted {
-                                // Process any returned byte and retry.
-                            } else if self.have == 0 {
-                                return err(Error { kind: ErrorKind.Io, transferred: written, cause: reason })
-                            } else {
-                                self.reason = reason
-                                self.failed = true
-                            }
-                        },
-                    }
-                },
+            // Return what is ready rather than wait on the source.
+            if written != 0 && !self.deferred {
+                return ok(written)
+            }
+            self.fill(written)?
+            if self.end == 0 {
+                return err(Error { kind: ErrorKind.Truncated, format: deflate.Error.Truncated, transferred: written, cause: streamio.failure(streamio.ErrorKind.UnexpectedEof, written) })
             }
         }
-        return ok(written)
     }
-    // streamio.Reader compatibility. Use read_checked to inspect format errors.
+    // std/io Reader compatibility. Format errors become InvalidInput and
+    // truncation UnexpectedEof; use read_checked to tell them apart.
     pub fn read(&mut self, output: &mut[u8]) -> usize!streamio.Error {
         match self.read_checked(output) {
             ok(count) => {
                 return ok(count)
             },
             err(reason) => {
-                if reason.kind == ErrorKind.Io {
-                    error := mem.replace(&mut reason.cause, streamio.failure(streamio.ErrorKind.Other, 0))
-                    error.transferred = reason.transferred
-                    return err(error)
-                }
-                kind := streamio.ErrorKind.InvalidInput
-                if reason.kind == ErrorKind.Truncated {
-                    kind = streamio.ErrorKind.UnexpectedEof
-                }
-                return err(streamio.failure(kind, reason.transferred))
+                cause := mem.replace(&mut reason.cause, streamio.failure(streamio.ErrorKind.Other, 0))
+                cause.transferred = reason.transferred
+                return err(cause)
             },
         }
     }
 }
 
-// Streaming stored-block encoders. These adapters write valid streams without
-// compression; use finish() and handle its result before discarding a writer.
-
-pub interface EncoderCodec {
-    fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> Progress
-}
-pub struct RawEncoder {
-    encoder: deflate_store.Encoder
-    pub fn new() -> RawEncoder {
-        return RawEncoder { encoder: deflate_store.Encoder.new() }
-    }
-    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> Progress {
-        p := self.encoder.process(input, output, finish)
-        s := Status.NeedInput
-        match &p.status {
-            deflate_store.Status.NeedInput => {
-                s = Status.NeedInput
-            },
-            deflate_store.Status.NeedOutput => {
-                s = Status.NeedOutput
-            },
-            deflate_store.Status.Done => {
-                s = Status.Done
-            },
-        }
-        return Progress { input_consumed: p.input_consumed, output_written: p.output_written, status: s }
-    }
-}
-pub struct ZlibEncoder {
-    encoder: zlib_store.Encoder
-    pub fn new() -> ZlibEncoder {
-        return ZlibEncoder { encoder: zlib_store.Encoder.new() }
-    }
-    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> Progress {
-        p := self.encoder.process(input, output, finish)
-        s := Status.NeedInput
-        match &p.status {
-            zlib_store.Status.NeedInput => {
-                s = Status.NeedInput
-            },
-            zlib_store.Status.NeedOutput => {
-                s = Status.NeedOutput
-            },
-            zlib_store.Status.Done => {
-                s = Status.Done
-            },
-        }
-        return Progress { input_consumed: p.input_consumed, output_written: p.output_written, status: s }
-    }
-}
-pub struct GzipEncoder {
-    encoder: gzip_store.Encoder
-    pub fn new() -> GzipEncoder {
-        return GzipEncoder { encoder: gzip_store.Encoder.new() }
-    }
-    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> Progress {
-        p := self.encoder.process(input, output, finish)
-        s := Status.NeedInput
-        match &p.status {
-            gzip_store.Status.NeedInput => {
-                s = Status.NeedInput
-            },
-            gzip_store.Status.NeedOutput => {
-                s = Status.NeedOutput
-            },
-            gzip_store.Status.Done => {
-                s = Status.Done
-            },
-        }
-        return Progress { input_consumed: p.input_consumed, output_written: p.output_written, status: s }
-    }
-}
-// A write accepts input before attempting to flush the corresponding encoded
-// bytes. A failed write reports the accepted input count, and retains every
-// unflushed encoded byte for the next write or finish. finish is repeatable
-// after device errors, and returns the encoded byte count flushed by that call.
-pub struct Writer<W: streamio.Writer, C: EncoderCodec> {
+// Compresses everything written into one stream on sink. Call finish() and
+// handle its result to write the final block and trailer. After a sink error
+// the unwritten compressed bytes are kept for the next write or finish.
+pub struct Writer<W: streamio.Writer, E: Encoder> {
     sink: &mut W
-    codec: C
+    encoder: &mut E
     buffer: [4096]u8
     start: usize
     end: usize
     finishing: bool
     done: bool
-    pub fn new(sink: &mut W, codec: C) -> Writer<W, C> from(sink) {
-        return Writer<W, C> { sink: sink, codec: codec, buffer: [0u8; 4096], start: 0, end: 0, finishing: false, done: false }
+    pub fn new(sink: &mut W, encoder: &mut E) -> Writer<W, E> from(sink, encoder) {
+        return Writer<W, E> { sink: sink, encoder: encoder, buffer: [0u8; 4096], start: 0, end: 0, finishing: false, done: false }
     }
-    fn flush_pending(&mut self) -> usize!streamio.Error {
+    // Writes buffered compressed bytes; the count is this call's.
+    fn flush_buffer(&mut self) -> usize!streamio.Error {
         total := 0usize
         for self.start < self.end {
             match streamio.write_once(self.sink, &self.buffer[self.start..self.end]) {
                 ok(count) => {
-                    self.start += count;
+                    self.start += count
                     total += count
                 },
                 err(reason) => {
@@ -347,76 +192,60 @@ pub struct Writer<W: streamio.Writer, C: EncoderCodec> {
         self.end = 0
         return ok(total)
     }
+    // Accepts all of input unless the sink fails; the error then counts the
+    // input accepted.
     pub fn write(&mut self, input: &[u8]) -> usize!streamio.Error {
         if self.finishing {
             return err(streamio.failure(streamio.ErrorKind.Closed, 0))
         }
-        if input.len == 0 {
-            return ok(0)
-        }
-        match self.flush_pending() {
-            ok(_) => {},
-            err(reason) => {
-                reason.transferred = 0;
-                return err(reason)
-            },
-        }
-        // A complete stored block and the largest wrapper header fit in the
-        // buffer, so a successful partial write can be followed by finish.
-        count := input.len
-        if count > 4080 {
-            count = 4080
-        }
-        p := self.codec.process(&input[..count], &mut self.buffer, false)
-        if p.input_consumed > count || p.output_written > self.buffer.len || (p.input_consumed == 0 && p.output_written == 0) {
-            return err(streamio.failure(streamio.ErrorKind.InvalidProgress, 0))
-        }
-        self.end = p.output_written
-        match self.flush_pending() {
-            ok(_) => {
-                return ok(p.input_consumed)
-            },
-            err(reason) => {
-                reason.transferred = p.input_consumed;
-                return err(reason)
-            },
+        used := 0usize
+        for {
+            match self.flush_buffer() {
+                ok(_) => {},
+                err(reason) => {
+                    reason.transferred = used
+                    return err(reason)
+                },
+            }
+            if used == input.len {
+                return ok(used)
+            }
+            p := self.encoder.process(&input[used..], &mut self.buffer, false)
+            if p.input_consumed > input.len - used || p.output_written > self.buffer.len || (p.input_consumed == 0 && p.output_written == 0) {
+                return err(streamio.failure(streamio.ErrorKind.InvalidProgress, used))
+            }
+            used += p.input_consumed
+            self.end = p.output_written
         }
     }
+    // Ends the stream. Repeatable after a sink error; returns the compressed
+    // byte count written by this call.
     pub fn finish(&mut self) -> usize!streamio.Error {
         self.finishing = true
         total := 0usize
-        for true {
-            match self.flush_pending() {
+        for {
+            match self.flush_buffer() {
                 ok(count) => {
                     total += count
                 },
                 err(reason) => {
-                    reason.transferred += total;
+                    reason.transferred += total
                     return err(reason)
                 },
             }
             if self.done {
                 return ok(total)
             }
-            p := self.codec.process(b"", &mut self.buffer, true)
+            p := self.encoder.process(b"", &mut self.buffer, true)
             if p.input_consumed != 0 || p.output_written > self.buffer.len {
                 return err(streamio.failure(streamio.ErrorKind.InvalidProgress, total))
             }
             self.end = p.output_written
-            match &p.status {
-                Status.Done => {
-                    self.done = true
-                },
-                Status.NeedInput => {
-                    return err(streamio.failure(streamio.ErrorKind.InvalidInput, total))
-                },
-                Status.NeedOutput => {
-                    if p.output_written == 0 {
-                        return err(streamio.failure(streamio.ErrorKind.InvalidProgress, total))
-                    }
-                },
+            if p.status == deflate.Status.Done {
+                self.done = true
+            } else if p.status == deflate.Status.NeedInput || p.output_written == 0 {
+                return err(streamio.failure(streamio.ErrorKind.InvalidProgress, total))
             }
         }
-        return ok(total)
     }
 }
