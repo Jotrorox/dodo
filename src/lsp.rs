@@ -46,6 +46,7 @@ struct Server {
     platform: Option<crate::hardware::Platform>,
     project_config: project_config::ProjectConfig,
     project_error: Option<String>,
+    forbid_unsafe: bool,
     pointer_bits: u32,
     document_changes: bool,
     inlay_refresh: bool,
@@ -143,7 +144,7 @@ impl Server {
                     Ok(config) => config,
                     Err(message) => return error(ErrorCode::InvalidParams, &message),
                 };
-            let (target, bits, platform) = match project_config.settings() {
+            let (target, bits, platform, forbid_unsafe) = match project_config.settings() {
                 Ok(settings) => settings,
                 Err(message) => return error(ErrorCode::InvalidParams, &message),
             };
@@ -153,6 +154,7 @@ impl Server {
             self.target = target;
             self.platform = platform;
             self.pointer_bits = bits;
+            self.forbid_unsafe = forbid_unsafe;
             self.document_changes = params.document_changes;
             self.inlay_refresh = params.inlay_refresh;
             self.watches.supported = params.dynamic_watches;
@@ -529,10 +531,11 @@ impl Server {
                     .is_some_and(|manifest| paths.contains(&package::source_path(manifest)))
                 {
                     match self.project_config.settings() {
-                        Ok((target, bits, platform)) => {
+                        Ok((target, bits, platform, forbid_unsafe)) => {
                             self.target = target;
                             self.platform = platform;
                             self.pointer_bits = bits;
+                            self.forbid_unsafe = forbid_unsafe;
                             self.project_error = None;
                         }
                         Err(message) => self.project_error = Some(message),
@@ -638,6 +641,9 @@ impl Server {
                     let original = loaded.program.clone();
                     let semantic = sema::check_recovering(&mut loaded.program, self.pointer_bits);
                     loaded.diagnostics.extend(semantic);
+                    if self.forbid_unsafe {
+                        loaded.diagnostics.extend(package::unsafe_uses(&loaded));
+                    }
                     let index = Arc::new(editor::symbols::Index::new(&loaded, &original));
                     for diagnostic in &loaded.diagnostics {
                         self.add_diagnostic(

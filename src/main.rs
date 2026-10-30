@@ -27,6 +27,7 @@ struct Args {
     manifest: Option<PathBuf>,
     profile: Option<String>,
     platform: Option<Platform>,
+    forbid_unsafe: bool,
 }
 struct FormatArgs {
     input: PathBuf,
@@ -75,6 +76,7 @@ fn from_resolved(i: &Invocation, r: &Resolved) -> Args {
         profile: r.profile.clone(),
         // Resolution already validated the board and chip names.
         platform: r.settings.platform().ok().flatten(),
+        forbid_unsafe: r.forbid_unsafe,
     }
 }
 fn prepare(
@@ -766,6 +768,14 @@ fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Resul
     }
     Ok(0)
 }
+fn forbid_unsafe(loaded: &package::Loaded) -> Result<(), String> {
+    let uses = package::unsafe_uses(loaded);
+    if uses.is_empty() {
+        return Ok(());
+    }
+    // Report every location at once so a project can be cleaned up in one pass.
+    Err(uses.iter().map(|d| loaded.render(d)).collect())
+}
 /// Restart a board running firmware with a USB serial port into its
 /// bootloader, by setting the port to 1200 baud, and wait for its drive.
 /// Returns the mounted drives: none if no such board is attached.
@@ -836,6 +846,9 @@ fn execute(mut args: Args) -> Result<i32, String> {
             .into_owned()
     });
     let mut loaded = package::load_for_platform(&args.input, &target, args.platform)?;
+    if args.forbid_unsafe {
+        forbid_unsafe(&loaded)?;
+    }
     let bits = codegen::pointer_bits(&args.options).map_err(|e| e.to_string())?;
     sema::check_for_target(&mut loaded.program, bits).map_err(|d| loaded.render(&d))?;
     if args.action == Action::Check {

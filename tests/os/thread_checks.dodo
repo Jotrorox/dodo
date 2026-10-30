@@ -42,7 +42,7 @@ pub struct CounterTask {
 // These explicit unsafe contracts are justified by global atomics exclusively
 // accessed atomically and by owned scalar payloads. No raw pointer is sent.
 @unsafe_send
-pub struct DropResult {
+pub unsafe struct DropResult {
     fn drop(&mut self) {
         unsafe {
             mem.atomic_fetch_add(ptr.from_ref(&RESULT_DROPS) as *mut usize, 1usize, 2)
@@ -50,7 +50,7 @@ pub struct DropResult {
     }
 }
 @unsafe_send
-pub struct DropTask {
+pub unsafe struct DropTask {
     wait: bool
     pub fn run(self) -> DropResult {
         thread.sleep_ms(1)

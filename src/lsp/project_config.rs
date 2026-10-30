@@ -49,7 +49,8 @@ impl ProjectConfig {
             target: string("target")?,
         })
     }
-    pub fn settings(&self) -> Result<(String, u32, Option<Platform>), String> {
+    /// The target triple, pointer width, platform, and `project.forbid-unsafe`.
+    pub fn settings(&self) -> Result<(String, u32, Option<Platform>, bool), String> {
         let manifest = if let Some(path) = &self.path {
             match std::fs::symlink_metadata(path) {
                 Ok(_) => Some(project::Manifest::read(path)?),
@@ -79,6 +80,7 @@ impl ProjectConfig {
             cwd: Path::new("."),
             host: &host,
         })?;
+        let forbid_unsafe = resolved.forbid_unsafe;
         let settings = resolved.settings;
         let platform = settings.platform()?;
         let bits = codegen::pointer_bits(&codegen::Options {
@@ -88,6 +90,6 @@ impl ProjectConfig {
             ..Default::default()
         })
         .map_err(|e| format!("invalid target: {e}"))?;
-        Ok((settings.triple.unwrap(), bits, platform))
+        Ok((settings.triple.unwrap(), bits, platform, forbid_unsafe))
     }
 }

@@ -1,0 +1,139 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/peripheral/pl011"
+import "std/embedded/peripheral/pl022"
+import "std/fmt"
+
+// DMA moves bytes while tasks wait for it instead of for the bus:
+//
+// - a serial console on GP0 (TX) and GP1 (RX) at 115200 baud reads its
+//   input from a DMA ring only ten times a second, yet loses nothing even
+//   when a whole pasted paragraph arrives at once, and prints through DMA
+//   without waiting for the line;
+// - an SPI stream on GP18 (clock) and GP19 (TX) sends a 256-byte frame
+//   every 20 ms, as for an LED strip or a display, woken by the DMA
+//   channel's signal when a frame has gone out;
+// - the LED blinks, showing that neither of them holds up the core.
+//
+//     dodo run examples/dma.dodo --board pico
+//     picocom -b 115200 /dev/ttyACM0
+//
+// Type a line and press Enter; `frames` tells how many frames went out.
+
+// Signals, numbered for the whole program.
+const FRAME_SENT: executor.Signal = executor.Signal { id: 0 }
+
+// Echoes lines, polling the ring on a ticker: input waits there, up to
+// its size, however long the task sleeps between polls.
+struct Console {
+    serial: pl011.DmaPort
+    ticker: executor.Ticker
+    line: [64]u8
+    length: usize
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if !self.ticker.ready(cx) {
+            return executor.Poll.Pending
+        }
+        input: [64]u8 = [0; 64]
+        got := self.serial.poll_read(&mut input)!
+        for index in 0..got.transferred {
+            byte := input[index]
+            if byte == 10 {
+                fmt.printf(&mut self.serial, "\n{} bytes; frames {}\n", self.length, frames_sent())!
+                self.length = 0
+            } else if self.length < 64 {
+                self.line[self.length] = byte
+                self.length += 1
+            }
+        }
+        // Echo what was typed: this goes out by DMA while the task returns.
+        self.serial.write(&input[..got.transferred])!
+        return executor.Poll.Pending
+    }
+}
+
+static mut FRAMES: u32 = 0
+
+fn frames_sent() -> u32 {
+    // SAFETY: only the tasks, which never run at the same time, use it.
+    unsafe {
+        return FRAMES
+    }
+}
+
+// Sends a frame every period, by DMA, and is woken when it has gone out.
+struct Stream {
+    spi: pl022.DmaBus
+    ticker: executor.Ticker
+    shade: u8
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if FRAME_SENT.take(cx) && !self.spi.is_busy() {
+            self.spi.finish()!
+            // SAFETY: as in frames_sent.
+            unsafe {
+                FRAMES += 1
+            }
+        }
+        if self.ticker.ready(cx) && !self.spi.is_busy() {
+            // The buffer is ours again: draw the next frame and send it.
+            frame := self.spi.buffer()!
+            for index in 0..frame.len {
+                frame[index] = core.wrapping_add(self.shade, index as u8)
+            }
+            self.shade = core.wrapping_add(self.shade, 1)
+            count := self.spi.capacity()
+            self.spi.start_write(count)!
+        }
+        return executor.Poll.Pending
+    }
+}
+
+struct Blinker<L> {
+    led: &mut L
+    ticker: executor.Ticker
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.led.toggle()
+        }
+        return executor.Poll.Pending
+    }
+}
+
+fn main() {
+    b := board.take()!
+    clock := b.timer.alarm(0)!
+
+    port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    port.set_crlf(true)
+    receive := b.dma.channel()!
+    send := b.dma.channel()!
+    // Twice the ring's size, so an aligned 512-byte ring fits anywhere.
+    ring: [1024]u8 = [0; 1024]
+    output: [128]u8 = [0; 128]
+    serial := port.dma(&mut receive, &mut ring, &mut send, &mut output)!
+    size := serial.ring_size()
+    fmt.printf(&mut serial, "{}: DMA console, {}-byte ring\n", board.NAME, size)!
+
+    spi := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, none, hal.SpiMode.Mode0, 8_000_000)!
+    spi_tx := b.dma.channel()!
+    spi_rx := b.dma.channel()!
+    // The receive channel finishes last: after the frame's last bit.
+    spi_rx.set_signal(&FRAME_SENT)
+    frame: [256]u8 = [0; 256]
+    stream := Stream {
+        spi: spi.dma(&mut spi_tx, &mut spi_rx, &mut frame)!,
+        ticker: executor.Ticker.every_ms(20),
+        shade: 0,
+    }
+
+    console := Console { serial, ticker: executor.Ticker.every_ms(100), line: [0; 64], length: 0 }
+    blinker := Blinker { led: &mut b.led, ticker: executor.Ticker.every_ms(250) }
+    tasks: [3] &mut dyn executor.Task = [&mut console, &mut stream, &mut blinker]
+    executor.run(&mut tasks, &mut clock)
+}

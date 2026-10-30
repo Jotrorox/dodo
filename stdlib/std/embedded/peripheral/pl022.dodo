@@ -1,5 +1,7 @@
 package pl022
 
+import "core/cpu"
+import "core/ptr"
 import "std/embedded/hal"
 
 // The Arm PrimeCell PL022 synchronous serial port, as an SPI bus master or
@@ -18,6 +20,8 @@ import "std/embedded/hal"
 // methods (`transfer_words`, `write_words`) carry any size. Transfers keep
 // both 8-entry FIFOs busy, so frames follow each other without gaps, and
 // never queue more than the receive FIFO holds, so no frame is lost.
+// `Bus.dma` hands out a `DmaBus`, whose transfers run by DMA while the
+// program does other work.
 //
 // Chip select is usually left to a GPIO and hal.SpiDevice: in modes 0 and 2
 // the PL022's own frame signal rises between every two frames, which most
@@ -37,6 +41,7 @@ const CPSR: usize = 0x010
 const IMSC: usize = 0x014
 const RIS: usize = 0x018
 const ICR: usize = 0x020
+const DMACR: usize = 0x024
 
 // CR0: data size minus one, frame format, clock polarity and phase, and the
 // serial clock rate divisor minus one.
@@ -60,6 +65,10 @@ const BUSY: u32 = 1 << 4
 
 // RIS and ICR: the receive FIFO overflowed.
 const RX_OVERRUN: u32 = 1 << 0
+
+// DMACR: raise DMA requests for the receive and transmit FIFOs.
+const RX_DMA: u32 = 1 << 0
+const TX_DMA: u32 = 1 << 1
 
 // Entries in each FIFO.
 const FIFO_DEPTH: usize = 8
@@ -279,6 +288,25 @@ pub struct Controller<R: hal.Registers>: hal.Spi {
         return ok()
     }
 
+    // Move bytes between `buffer` and the bus by DMA until the returned
+    // DmaBus is dropped: `tx` feeds the transmit FIFO and `rx` empties the
+    // receive FIFO, while the processor does other work. `data` is the
+    // address of the controller's data register as the channels see it,
+    // which chip packages know; `Bus.dma` passes it. Unsupported for frames
+    // above 8 bits; InvalidInput for an empty buffer; Busy if a channel is
+    // still running.
+    pub fn dma_at(&mut self, data: usize, tx: &mut dyn hal.DmaChannel, rx: &mut dyn hal.DmaChannel, buffer: &mut[u8]) -> DmaBus!hal.Error from(self, tx, rx, buffer) {
+        self.check_bytes()?
+        if buffer.len == 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        if tx.is_busy() || rx.is_busy() {
+            return err(hal.Error.Busy)
+        }
+        self.settle()
+        return ok(DmaBus { registers: &mut self.registers, data, tx, rx, buffer, running: false })
+    }
+
     // Disable the controller and give back its registers.
     pub fn release(self) -> R {
         self.registers.write(CR1, 0)
@@ -381,6 +409,195 @@ pub struct Controller<R: hal.Registers>: hal.Spi {
 // The bits of a frame of `bits` bits.
 fn frame_mask(bits: u32) -> u32 {
     return (1u32 << bits) - 1
+}
+
+fn succeeded(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(error) => {
+            return false
+        }
+    }
+}
+
+// Where write-only DMA transfers drop the bytes they receive. Every bus
+// writes here; nothing reads it.
+static mut DISCARD: u8 = 0
+
+// An SPI bus master that moves bytes between a buffer it holds and the bus
+// by DMA, from `Bus.dma(tx, rx, buffer)`. A transfer runs while the
+// program does other work, without gaps between frames at any clock rate:
+//
+//     dma := bus.dma(&mut tx, &mut rx, &mut buffer)!
+//     // fill dma.buffer()!, then:
+//     dma.start_transfer(count)!
+//     // ... other work, or return Pending from a task ...
+//     if !dma.is_busy() {
+//         dma.finish()!
+//     }
+//
+// The bus holds the controller, both channels, and the buffer until it is
+// dropped, and lends the buffer out only between transfers, so the program
+// never touches memory the channels are moving. A task keeps the DmaBus in
+// a field and waits for `rx`'s signal (rp_dma.Channel.set_signal), which
+// is raised once the last byte has arrived. Dropping the bus aborts a
+// running transfer; the device then saw only part of it.
+pub struct DmaBus {
+    registers: &mut dyn hal.Registers
+    data: usize
+    tx: &mut dyn hal.DmaChannel
+    rx: &mut dyn hal.DmaChannel
+    buffer: &mut[u8]
+    // A transfer started and not yet finished.
+    running: bool
+
+    // The buffer, to fill before a transfer or read after one. Busy from
+    // `start_transfer` or `start_write` until `finish`.
+    pub fn buffer(&mut self) -> &mut[u8]!hal.Error from(self) {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        return ok(&mut self.buffer[..])
+    }
+
+    // The buffer's length, the most a transfer moves.
+    pub fn capacity(&self) -> usize {
+        return self.buffer.len
+    }
+
+    // Start sending buffer[..count] and replacing each byte with the one
+    // received at the same time, and return at once. InvalidInput for 0
+    // or more than the buffer holds; Busy until the last transfer is
+    // finished.
+    pub fn start_transfer(&mut self, count: usize) -> void!hal.Error {
+        return self.begin(count, true)
+    }
+
+    // Start sending buffer[..count] and discard what arrives, as for
+    // `start_transfer`; the buffer stays as it is.
+    pub fn start_write(&mut self, count: usize) -> void!hal.Error {
+        return self.begin(count, false)
+    }
+
+    // True while a transfer runs: until the last byte has been received.
+    pub fn is_busy(&mut self) -> bool {
+        return self.running && (self.tx.is_busy() || self.rx.is_busy())
+    }
+
+    // Wait until the running transfer is done, if one is, and end it, so
+    // the buffer is free again. Overrun if received bytes were lost, which
+    // happens only if the receive channel was held up, and Bus if a
+    // channel hit a bus error; either way the transfer is over.
+    pub fn finish(&mut self) -> void!hal.Error {
+        if !self.running {
+            return ok()
+        }
+        for self.tx.is_busy() || self.rx.is_busy() {}
+        return self.end()
+    }
+
+    // `start_transfer`, then `finish`.
+    pub fn transfer(&mut self, count: usize) -> void!hal.Error {
+        self.start_transfer(count)?
+        return self.finish()
+    }
+
+    // `start_write`, then `finish`.
+    pub fn write(&mut self, count: usize) -> void!hal.Error {
+        self.start_write(count)?
+        return self.finish()
+    }
+
+    fn begin(&mut self, count: usize, keep: bool) -> void!hal.Error {
+        if self.running {
+            return err(hal.Error.Busy)
+        }
+        if count == 0 || count > self.buffer.len || count as u64 > self.tx.max_count() as u64 || count as u64 > self.rx.max_count() as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        start := hal.address_of(self.buffer)
+        destination := start
+        if !keep {
+            // SAFETY: the address is a number here; the channel writes
+            // single bytes there, which nothing reads.
+            destination = unsafe {
+                ptr.from_mut(&mut DISCARD) as usize
+            }
+        }
+        receive := hal.DmaTransfer {
+            source: self.data,
+            destination,
+            count: count as u32,
+            width: hal.DmaWidth.Byte,
+            increment_source: false,
+            increment_destination: keep,
+            pace: hal.DmaPace.Source,
+            ring: hal.DmaRing.None,
+        }
+        send := hal.DmaTransfer {
+            source: start,
+            destination: self.data,
+            count: count as u32,
+            width: hal.DmaWidth.Byte,
+            increment_source: true,
+            increment_destination: false,
+            pace: hal.DmaPace.Destination,
+            ring: hal.DmaRing.None,
+        }
+        self.registers.write(ICR, RX_OVERRUN)
+        // The fence makes the buffer's contents visible to the channels.
+        // SAFETY: the buffer stays borrowed by this bus, which lends it out
+        // again only once both channels are done or aborted.
+        cpu.fence()
+        unsafe {
+            self.rx.start(receive)?
+            match self.tx.start(send) {
+                ok() => {}
+                err(error) => {
+                    self.rx.abort()
+                    return err(error)
+                }
+            }
+        }
+        self.running = true
+        // The receiver's request goes first, so no frame waits for it.
+        self.registers.write(DMACR, RX_DMA | TX_DMA)
+        return ok()
+    }
+
+    // End a transfer whose channels have stopped.
+    fn end(&mut self) -> void!hal.Error {
+        self.registers.write(DMACR, 0)
+        self.running = false
+        cpu.fence()
+        for (self.registers.read(SR) & BUSY) != 0 {}
+        overrun := (self.registers.read(RIS) & RX_OVERRUN) != 0
+        for (self.registers.read(SR) & RX_NOT_EMPTY) != 0 {
+            self.registers.read(DR)
+        }
+        self.registers.write(ICR, RX_OVERRUN)
+        // Clear both channels' errors before reporting either.
+        sent := succeeded(self.tx.take_error())
+        received := succeeded(self.rx.take_error())
+        if !sent || !received {
+            return err(hal.Error.Bus)
+        }
+        if overrun {
+            return err(hal.Error.Overrun)
+        }
+        return ok()
+    }
+
+    fn drop(&mut self) {
+        if self.running {
+            self.tx.abort()
+            self.rx.abort()
+            // An aborted transfer has nothing to report.
+            succeeded(self.end())
+        }
+    }
 }
 
 // An SPI target (slave) on one PL022 with registers R: a master drives the
@@ -640,6 +857,15 @@ pub struct Bus: hal.Spi {
     // self-tests: transfers read back what they send.
     pub fn set_loopback(&mut self, on: bool) {
         self.controller.set_loopback(on)
+    }
+
+    // Move bytes between `buffer` and the bus by DMA, `tx` feeding it and
+    // `rx` emptying it, until the returned DmaBus is dropped; see DmaBus.
+    // Unsupported for frames above 8 bits; InvalidInput for an empty
+    // buffer or a channel that cannot serve this controller.
+    pub fn dma(&mut self, tx: &mut dyn hal.DmaChannel, rx: &mut dyn hal.DmaChannel, buffer: &mut[u8]) -> DmaBus!hal.Error from(self, tx, rx, buffer) {
+        data := self.controller.registers.base() + DR
+        return self.controller.dma_at(data, tx, rx, buffer)
     }
 
     // Disable the controller and return its base address, for the chip

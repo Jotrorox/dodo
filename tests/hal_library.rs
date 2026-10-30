@@ -120,6 +120,25 @@ fn peripheral_drivers_execute_against_simulated_controllers() {
 }
 
 #[test]
+fn dma_channels_and_sessions_execute_against_simulated_controllers() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("dma");
+    let source = root.join("tests/stdlib/dma_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "dma-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile dma fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute dma fixture",
+        );
+    }
+}
+
+#[test]
 fn usb_serial_device_enumerates_and_moves_data_against_a_simulated_host() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("usb");

@@ -46,6 +46,21 @@ impl Drop for Workspace {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+// Runs a freshly copied executable. On Linux a process another test thread
+// forks at the same moment can briefly hold the copy open for writing, and
+// running it then fails with "Text file busy" until that process execs.
+fn run_copied(command: &mut Command) -> Output {
+    for _ in 0..50 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            result => return result.unwrap(),
+        }
+    }
+    command.output().unwrap()
+}
+
 fn success(output: Output) -> Output {
     assert!(
         output.status.success(),
@@ -193,14 +208,12 @@ fn console_is_embedded_and_only_selects_the_platform_boundary() {
         "relocated",
         "package relocated\nimport \"std/console\"\nfn main() -> i32 { match console.println(\"Hello, world!\") { ok(_) => { return 0 } err(_) => { return 1 } } }\n",
     );
-    let output = success(
+    let output = success(run_copied(
         Command::new(&compiler)
             .current_dir(&work.0)
             .arg("run")
-            .arg(&relocated)
-            .output()
-            .unwrap(),
-    );
+            .arg(&relocated),
+    ));
     assert_eq!(output.stdout, b"Hello, world!\n");
 }
 
