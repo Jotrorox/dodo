@@ -1,0 +1,76 @@
+package random
+
+import "core/ptr"
+import "std/crypto"
+import "std/hash"
+import "std/crypto/native"
+
+// Operating-system CSPRNG: getrandom on Linux, SecRandomCopyBytes on macOS and
+// BCryptGenRandom on Windows. Every call reads the OS directly; there is no
+// user-space generator, reseeding state, or fallback to weaker randomness.
+
+// Fills output completely. On error the contents of output are unspecified
+// and must not be used as random bytes.
+pub fn fill(output: &mut[u8]) -> void!crypto.Error {
+    if output.len == 0 {
+        return ok()
+    }
+    code := unsafe {
+        native.dodo_crypto_random(ptr.as_mut_ptr(output), output.len)
+    }
+    if code != 0 {
+        return err(crypto.failure(crypto.ErrorKind.Unavailable, code))
+    }
+    return ok()
+}
+// A uniformly distributed u64.
+pub fn next_u64() -> u64!crypto.Error {
+    bytes := [0u8; 8]
+    fill(&mut bytes)?
+    value := 0u64
+    for i in 0usize..8 {
+        value = value | ((bytes[i] as u64) << (8 * i as u64))
+    }
+    return ok(value)
+}
+// A uniformly distributed value in 0..bound, without modulo bias. bound must
+// be nonzero.
+pub fn below(bound: u64) -> u64!crypto.Error {
+    if bound == 0 {
+        return err(crypto.failure(crypto.ErrorKind.InvalidInput, 0))
+    }
+    // Reject the low 2^64 mod bound values so every residue is equally likely.
+    threshold := core.wrapping_sub(0u64, bound) % bound
+    for {
+        value := next_u64()?
+        if value >= threshold {
+            return ok(value % bound)
+        }
+    }
+}
+// A random SipHash key for keyed hash maps.
+pub fn key() -> hash.Key128!crypto.Error {
+    k0 := next_u64()?
+    k1 := next_u64()?
+    return ok(hash.Key128.new(k0, k1))
+}
+// Stateless OS source with the `hash.obtain_key` capability, for code that
+// takes its entropy source as a parameter.
+pub struct SystemRandom {
+    pub fn new() -> SystemRandom {
+        return SystemRandom {}
+    }
+    pub fn fill(&mut self, output: &mut[u8]) -> void!crypto.Error {
+        return fill(output)
+    }
+    pub fn next_key(&mut self) -> hash.Key128!hash.KeyError {
+        match key() {
+            ok(value) => {
+                return ok(value)
+            }
+            err(_) => {
+                return err(hash.KeyError.Unavailable)
+            }
+        }
+    }
+}
