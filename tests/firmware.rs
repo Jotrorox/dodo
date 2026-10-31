@@ -244,6 +244,155 @@ fn platform_selection_errors_name_the_problem() {
     assert!(error.contains("unknown board 'arduino'"), "{error}");
 }
 
+// rp_pio.assemble assembles PIO programs at compile time, for the RP2040
+// and RP2350 only, checking each program against its chip's PIO version.
+#[test]
+fn pio_programs_assemble_only_for_rp_chips() {
+    let scratch = Scratch::new("pio");
+    let program = |lines: &str| {
+        format!(
+            "package main\nimport \"std/embedded/chip/rp_pio\"\nconst PROGRAM: rp_pio.Program = rp_pio.assemble(\n{lines}\n)\nfn main() {{\n core.assert(PROGRAM.length > 0)\n}}\n"
+        )
+    };
+    let valid = scratch.write(
+        "valid.dodo",
+        &program("    \".side_set 1 opt\",\n    \"loop:\",\n    \"    out pins, 1 side 0 [2]\",\n    \"    jmp loop    side 1\","),
+    );
+    let valid = valid.to_str().unwrap();
+    for board in ["pico", "pico2", "pico2_w"] {
+        stdout(&dodo(&["check", valid, "--board", board]));
+    }
+    stdout(&dodo(&["check", valid, "--chip", "rp2350"]));
+    // Hosted builds have no PIO.
+    let error = stderr(&dodo(&["check", valid]));
+    assert!(
+        error.contains("PIO programs are assembled for the RP2040 and RP2350 only")
+            && error.contains("valid.dodo:3:33"),
+        "{error}"
+    );
+    // An error points into its line.
+    let invalid = scratch.write(
+        "invalid.dodo",
+        &program("    \"set x, 1\",\n    \"    jmp nowhere\","),
+    );
+    let error = stderr(&dodo(&[
+        "check",
+        invalid.to_str().unwrap(),
+        "--board",
+        "pico2",
+    ]));
+    assert!(
+        error.contains("invalid PIO program: undefined symbol `nowhere`")
+            && error.contains("invalid.dodo:5:14"),
+        "{error}"
+    );
+    // RP2350 instructions are refused on the RP2040.
+    let newer = scratch.write("newer.dodo", &program("    \"mov pindirs, ~null\","));
+    let newer = newer.to_str().unwrap();
+    stdout(&dodo(&["check", newer, "--board", "pico2"]));
+    let error = stderr(&dodo(&["check", newer, "--board", "pico"]));
+    assert!(
+        error.contains("`mov pindirs` needs PIO version 1 (the RP2350), but the build's chip, the RP2040, has PIO version 0"),
+        "{error}"
+    );
+    // Only literals, and only rp_pio may declare the assembler.
+    let runtime = scratch.write(
+        "runtime.dodo",
+        "package main\nimport \"std/embedded/chip/rp_pio\"\nfn main() {\n line := \"nop\"\n program := rp_pio.assemble(line)\n}\n",
+    );
+    let error = stderr(&dodo(&[
+        "check",
+        runtime.to_str().unwrap(),
+        "--board",
+        "pico",
+    ]));
+    assert!(
+        error.contains("rp_pio.assemble takes string literals"),
+        "{error}"
+    );
+    let reserved = scratch.write(
+        "reserved.dodo",
+        "package main\n@compiler(pio)\npub fn assemble(source: &str) -> u32\nfn main() {}\n",
+    );
+    let error = stderr(&dodo(&[
+        "check",
+        reserved.to_str().unwrap(),
+        "--board",
+        "pico",
+    ]));
+    assert!(
+        error.contains("@compiler(pio) is reserved for std/embedded/chip/rp_pio"),
+        "{error}"
+    );
+}
+
+// The WS2812 example and the rest of the PIO driver on every board. Needs
+// no linker.
+#[test]
+fn pio_drivers_compile_for_every_board() {
+    let scratch = Scratch::new("pio-compile");
+    let example = root().join("examples/ws2812.dodo");
+    let source = scratch.write(
+        "pio.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip/rp_pio"
+import "std/embedded/cortex_m"
+const ECHO: rp_pio.Program = rp_pio.assemble(".in 32 left auto 8", "    pull block", "    mov isr, ::osr", "    push iffull noblock")
+fn main() {
+    b := board.take()!
+    pio := b.pins.pio(1)!
+    b.pins.pio_pins(&pio, 6, 2)!
+    loaded := pio.load(&ECHO)!
+    config := loaded.config()
+    config.set_out_pins(6, 2)!
+    config.set_set_pins(6, 2)!
+    config.set_in_pins(8)!
+    config.set_jmp_pin(9)!
+    config.set_out_special(true, none)!
+    config.set_mov_status(rp_pio.STATUS_TX_LESS, 1)!
+    config.set_frequency(10_000_000)!
+    sm := pio.free_state_machine()!
+    sm.init(&config)
+    sm.set_pindirs(6, 2, 0b11)
+    pio.listen(0, rp_pio.rx_not_empty(sm.index()) | rp_pio.flag(0))
+    cortex_m.enable(pio.irq(0))
+    pio.enable_in_sync(1u32 << sm.index())
+    sm.put(5)
+    if let some(word) = sm.try_get() {
+        sm.exec_wait(ECHO.instructions[0])
+        sm.set_frequency(word + 1)!
+    }
+    sm.drain_tx()
+    flags := pio.flags()
+    pio.clear_flags(flags)
+    pio.release_state_machine(sm)
+    pio.unload(loaded)
+    b.pins.release_pio(pio)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for (name, path) in [("ws2812", &example), ("pio", &source)] {
+            for level in ["0", "2"] {
+                let object = scratch.path(&format!("{name}-{board}-O{level}.o"));
+                stdout(&dodo(&[
+                    "build",
+                    path.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "--emit",
+                    "obj",
+                    "-o",
+                    &object,
+                ]));
+            }
+        }
+    }
+}
+
 #[test]
 fn std_board_and_std_chip_follow_the_selected_platform() {
     let scratch = Scratch::new("imports");
@@ -332,6 +481,11 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
             "dodo_usb_interrupt",
             "DMA_IRQ_0",
             "dodo_dma_interrupt",
+            "FifoHandler",
+            "dodo_fifo_interrupt",
+            "dodo_core_id",
+            "dodo_core1_trampoline",
+            "dodo_core1_entry",
             "memcpy",
             "memset",
         ] {
@@ -536,8 +690,8 @@ fn rp2040_projects_link_to_flashable_firmware() {
     ]);
     check_rp2040_firmware(Path::new(&elf));
     // Portable drivers, tested with fakes, on the board's I2C bus and on
-    // an ADC input and a PWM output.
-    for name in ["hal_sensor_board", "dimmer_board"] {
+    // an ADC input and a PWM output, and WS2812 LEDs on PIO.
+    for name in ["hal_sensor_board", "dimmer_board", "ws2812"] {
         let source = root().join(format!("examples/{name}.dodo"));
         for level in ["0", "2"] {
             let elf = scratch.path(&format!("{name}-O{level}.elf"));
@@ -565,6 +719,7 @@ fn rp2350_projects_link_to_flashable_firmware() {
     let blink = root().join("examples/blink");
     let sensor = root().join("examples/hal_sensor_board.dodo");
     let dimmer = root().join("examples/dimmer_board.dodo");
+    let ws2812 = root().join("examples/ws2812.dodo");
     let selftest = root().join("tests/hardware/pico2");
     let selftest_w = root().join("tests/hardware/pico2_w");
     let float = root().join("tests/hardware/rp2350_float");
@@ -578,6 +733,8 @@ fn rp2350_projects_link_to_flashable_firmware() {
         (&sensor, "sensor-w", &["--board", "pico2_w"][..]),
         (&dimmer, "dimmer", &["--board", "pico2"][..]),
         (&dimmer, "dimmer-w", &["--board", "pico2_w"][..]),
+        (&ws2812, "ws2812", &["--board", "pico2"][..]),
+        (&ws2812, "ws2812-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),
         (&selftest_w, "selftest-w", &[][..]),
         (&float, "float", &["-b", "pico2"][..]),
@@ -684,17 +841,17 @@ fn the_default_panic_hook_reports_on_serial_ports() {
 /// The first literal of the runtime's USBCTRL_IRQ stub, which it calls if
 /// nonzero: dodo_usb_interrupt's address or 0.
 fn usb_interrupt_literal(elf: &Path, family: u32) -> u32 {
-    stub_literal(elf, family, "USBCTRL_IRQ")
+    stub_literal(elf, family, "USBCTRL_IRQ", 10)
 }
 
-/// The first literal of a runtime stub that tail-calls a weak handler,
-/// such as USBCTRL_IRQ's or DMA_IRQ_0's: the handler's address or 0.
-fn stub_literal(elf: &Path, family: u32, symbol: &str) -> u32 {
+/// The first literal after `instructions` bytes of the runtime function
+/// `symbol`, in the flashed image.
+fn stub_literal(elf: &Path, family: u32, symbol: &str, instructions: usize) -> u32 {
     let bytes = fs::read(elf).unwrap();
     let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), family);
-    let stub = (elf_symbol(&bytes, symbol).expect("runtime stub") & !1) as usize;
-    // ldr, cmp, bne, ldr, bx: five halfwords, then the aligned words.
-    let at = (stub - 0x1000_0000 + 10 + 3) & !3;
+    let stub = (elf_symbol(&bytes, symbol).expect(symbol) & !1) as usize;
+    // The literal pool follows, word-aligned.
+    let at = (stub - 0x1000_0000 + instructions + 3) & !3;
     word(&image, at)
 }
 
@@ -763,6 +920,119 @@ fn the_usb_serial_port_is_served_from_the_default_usb_interrupt() {
     }
 }
 
+// examples/two_cores.dodo on every board: the default FIFO interrupt
+// handlers serve rp_multicore's signal, and core 1 is launched at the
+// runtime's trampoline.
+#[test]
+fn two_core_programs_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("two-cores");
+    let example = root().join("examples/two_cores.dodo");
+    // The FIFO interrupts: SIO_IRQ_PROC0 and SIO_IRQ_PROC1 on the RP2040,
+    // SIO_IRQ_FIFO on the RP2350.
+    let boards: [(&str, u32, &[usize]); 3] = [
+        ("pico", 0xE48B_FF56, &[15, 16]),
+        ("pico2", 0xE48B_FF59, &[25]),
+        ("pico2_w", 0xE48B_FF59, &[25]),
+    ];
+    for (board, family, irqs) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("two-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let serve = elf_symbol(&bytes, "dodo_fifo_interrupt").expect("the hook is linked");
+            assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
+            // ldr, cmp, bne, ldr, bx, as in USBCTRL_IRQ.
+            assert_eq!(stub_literal(path, family, "FifoHandler", 10), serve);
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            let handler = elf_symbol(&bytes, "FifoHandler").unwrap() | 1;
+            for irq in irqs {
+                assert_eq!(
+                    word(&image, vectors + 4 * (16 + irq)),
+                    handler,
+                    "{board} -O{level}: IRQ {irq} is the FIFO handler"
+                );
+            }
+            let trampoline = elf_symbol(&bytes, "dodo_core1_trampoline").expect("trampoline");
+            // ldr, bx, then the trampoline's address with the Thumb bit.
+            assert_eq!(
+                stub_literal(path, family, "dodo_core1_entry", 4),
+                trampoline | 1,
+                "{board} -O{level}"
+            );
+            assert!(
+                elf_symbol(&bytes, "dodo_core_id").is_some(),
+                "{board} -O{level}"
+            );
+        }
+    }
+    // Without std/embedded/chip the FIFO stub falls through to DefaultHandler.
+    let bare = scratch.write("bare.dodo", "package main\nfn main() {}\n");
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(
+            stub_literal(Path::new(&elf), family, "FifoHandler", 10),
+            0,
+            "{chip}"
+        );
+    }
+}
+
+// Starting core 1 checks what moves there: a task holding a reference is
+// rejected, as for std/thread.
+#[test]
+fn core1_tasks_cannot_hold_references() {
+    let scratch = Scratch::new("core1-borrow");
+    let source = scratch.write(
+        "borrow.dodo",
+        r#"package main
+import "std/embedded/board"
+struct Counter {
+    count: &mut u32
+    pub fn run(self) {
+        *self.count += 1
+    }
+}
+fn main() {
+    b := board.take()!
+    count := 0u32
+    stack := [0u64; 256]
+    running := b.core1.start(&mut stack, Counter { count: &mut count })!
+    running.stop()
+}
+"#,
+    );
+    let object = scratch.path("borrow.o");
+    let error = stderr(&dodo(&[
+        "build",
+        source.to_str().unwrap(),
+        "--board",
+        "pico2",
+        "--emit",
+        "obj",
+        "-o",
+        &object,
+    ]));
+    assert!(
+        error.contains("not checked for cross-thread transfer"),
+        "{error}"
+    );
+}
+
 #[test]
 fn dma_signals_are_raised_from_the_default_dma_interrupt() {
     if !ld_lld() {
@@ -792,7 +1062,10 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
             let bytes = fs::read(&elf).unwrap();
             let serve = elf_symbol(&bytes, "dodo_dma_interrupt").expect("the handler is linked");
             assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
-            assert_eq!(stub_literal(Path::new(&elf), family, "DMA_IRQ_0"), serve);
+            assert_eq!(
+                stub_literal(Path::new(&elf), family, "DMA_IRQ_0", 10),
+                serve
+            );
             let image = flash_image(
                 &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
                 family,
@@ -823,7 +1096,7 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
         let elf = scratch.path(&format!("bare-{chip}.elf"));
         build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
         assert_eq!(
-            stub_literal(Path::new(&elf), family, "DMA_IRQ_0"),
+            stub_literal(Path::new(&elf), family, "DMA_IRQ_0", 10),
             0,
             "{chip}"
         );

@@ -1033,8 +1033,10 @@ while nothing has been fed.
 
 - One executor runs at a time on a core, with up to 32 tasks
   (`executor.MAX_TASKS`) and 32 signals (`executor.MAX_SIGNALS`). Signal
-  numbers are one set for the whole program, so libraries that raise signals
-  take their numbers from the application.
+  numbers are one set for each core's program, so libraries that raise
+  signals take their numbers from the application. On the RP2040 and RP2350
+  each core can run an executor of its own; see
+  [two cores](#two-cores-on-the-rp2040-and-rp2350).
 - Tasks are state machines written by hand: Dodo has no `async` functions
   that the compiler would turn into them. Keep the state in the task's
   fields, and do each step without waiting.
@@ -1627,6 +1629,121 @@ releasing the last with `pins.release_analog(input)` stops both. The sensor
 is accurate to a few degrees and depends on the reference voltage; on the
 Pico and Pico 2, GP29 reads a third of the supply voltage VSYS.
 
+### PIO on the RP2040 and RP2350
+
+PIO, programmable I/O, is the RP chips' set of small state machines for
+protocols no other peripheral speaks: WS2812 LEDs, extra serial ports,
+parallel buses, and the Pico 2 W's wireless bus. The RP2040 has two PIO blocks
+and the RP2350 three. Each block has four state machines, which run programs
+from 32 shared instruction slots, exchange 32-bit words with the processor
+through a 4-word FIFO in each direction, drive and read GPIOs, and signal
+each other through eight IRQ flags. Every instruction takes one cycle of the
+state machine's clock, up to clk_sys, so timing is exact.
+
+Programs are written in the Pico SDK's PIO assembly language and assembled
+when the firmware is compiled. `rp_pio.assemble` takes the program as string
+literals, one line each, and returns an `rp_pio.Program`, usually as a
+constant:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_pio"
+
+// Each word from the program: the LED on GP15 stays on for that many
+// cycles of the state machine, then off until the next word.
+const PULSE: rp_pio.Program = rp_pio.assemble(
+    ".side_set 1",
+    "    pull block    side 0",
+    "    out x, 32     side 0",
+    "on:",
+    "    jmp x-- on    side 1",
+)
+
+fn main() {
+    b := board.take()!
+    pio := b.pins.pio(0)!
+    b.pins.pio_pins(&pio, 15, 1)!
+    loaded := pio.load(&PULSE)!
+    config := loaded.config()
+    config.set_sideset_pins(15)!
+    // One instruction a microsecond.
+    config.set_frequency(1_000_000)!
+    sm := pio.state_machine(0)!
+    sm.init(&config)
+    sm.set_pindirs(15, 1, 1)
+    sm.set_enabled(true)
+    for {
+        sm.put(250_000)
+        b.timer.delay_ms(1000)
+    }
+}
+```
+
+The assembler accepts the language of the SDK's `pioasm`, so `.pio` files
+from the SDK and its examples work unchanged: labels, `public` labels,
+`.define`, integer expressions in parentheses, `side` and `[delay]` on any
+instruction, `;` and `//` comments, and every instruction (`jmp`, `wait`,
+`in`, `out`, `push`, `pull`, `mov`, `irq`, `set`, `nop`). Directives set up
+the program and its state machine: `.side_set`, `.wrap_target`, `.wrap`,
+`.origin`, `.word`, `.pio_version`, and `.clock_div`, `.fifo`, `.mov_status`,
+`.in`, `.out`, and `.set`, whose settings `loaded.config()` starts from.
+`.lang_opt` lines and `% c-sdk { ... %}` blocks are ignored. Write one
+program per call; a single literal with `\n` between lines works too.
+
+A mistake in a program is a compile error at its line, such as
+`invalid PIO program: the SET value must be 0 to 31, not 32`. `assemble`
+exists only in firmware for the RP2040 and RP2350, and checks the program
+against the chip's PIO version: the RP2350's version 1 adds `mov pindirs`,
+`mov rxfifo[...]` to and from RX FIFO registers, `irq` and `wait irq` on the
+`prev` and `next` blocks' flags, `wait jmppin`, the `.fifo` choices `txput`,
+`txget`, and `putget`, `.mov_status irq`, and IN pin counts below 32. Using
+one in an RP2040 build is an error naming the instruction. Hosted builds
+cannot assemble programs; desktop tests build an `rp_pio.Program` from its
+instruction words instead.
+
+`pins.pio(n)` claims block `n` and returns an `rp_pio.Pio`. State machines
+drive only pins connected to their block: `pins.pio_pins(&pio, first, count)`
+connects GPIO `first` and the `count - 1` after it, which are then taken like
+any claimed pin. A state machine reads any pin whose input is enabled, so a
+pin it only reads can also be claimed with `pins.input(n)`.
+
+| `rp_pio.Pio` | Purpose |
+| --- | --- |
+| `load(&program)`, `unload(loaded)` | Load a program at its `.origin` or the highest free slots it fits, relocating its jumps; `Busy` if it does not fit. Returns an `rp_pio.Loaded`, whose `offset()` is its first instruction's address and whose `config()` is a `Config` with the program's settings. |
+| `state_machine(index)`, `free_state_machine()`, `release_state_machine(sm)` | Claim state machine 0 to 3, or the first free one, stopped; give it back. |
+| `enable_in_sync(machines)` | Start several state machines with their clock dividers in step. |
+| `flags()`, `clear_flags(flags)`, `force_flags(flags)` | The IRQ flags, one bit each. Clearing releases state machines waiting on `irq wait`. |
+| `listen(line, sources)`, `ignore(line, sources)`, `interrupts(line)`, `irq(line)` | Raise interrupt line 0 or 1 for `rp_pio.rx_not_empty(sm)`, `rp_pio.tx_not_full(sm)`, and `rp_pio.flag(n)` sources; `irq(line)` is its number for `cortex_m.enable` and `@interrupt`, such as `PIO0_IRQ_0`. |
+| `bypass_input_sync(pin, on)` | Read a pin without the two-cycle input synchronizer. |
+
+| `rp_pio.Config` | Purpose |
+| --- | --- |
+| `set_frequency(hz)`, `set_divider(divider)` | Instructions per second, from clk_sys down to 1/65536 of it, or the divider of clk_sys in 256ths. |
+| `set_out_pins(first, count)`, `set_set_pins(first, count)`, `set_sideset_pins(first)`, `set_in_pins(first)`, `set_jmp_pin(pin)` | The pin mappings of `out`, `set`, side-set, `in` and `wait pin`, and `jmp pin`. |
+| `set_out_shift(right, autopull, bits)`, `set_in_shift(right, autopush, bits)` | Shift direction, and automatic `pull` and `push` after so many bits. |
+| `set_fifo_join(join)` | `rp_pio.FIFO_TX` or `FIFO_RX` give one direction both FIFOs, 8 words; `FIFO_TXPUT`, `FIFO_TXGET`, and `FIFO_PUTGET` (RP2350) turn the RX FIFO into four registers. |
+| `set_wrap(target, wrap)`, `set_start(address)`, `set_mov_status(select, n)`, `set_out_special(sticky, enable_pin)`, `set_in_count(count)` | The rest of the state machine's settings. |
+
+| `rp_pio.StateMachine` | Purpose |
+| --- | --- |
+| `init(&config)` | Stop, apply the settings, empty the FIFOs, reset the internal state, and jump to the start. |
+| `set_enabled(on)`, `restart()`, `restart_clock()` | Run or pause the program. |
+| `put(word)`, `try_put(word)`, `get()`, `try_get()` | Words to and from the program. `put` and `get` wait while the FIFO is full or empty. |
+| `tx_level()`, `rx_level()`, `is_tx_full()`, `is_rx_empty()`, ..., `clear_fifos()`, `drain_tx()`, `take_tx_stall()` | FIFO state; `take_tx_stall()` tells when the program has run out of words. |
+| `exec(instruction)`, `exec_wait(instruction)`, `jump(address)`, `address()` | Run one instruction now, such as a word of an assembled constant: `sm.exec(SET_X.instructions[0])`. |
+| `set_pins(first, count, levels)`, `set_pindirs(first, count, outputs)` | Set pin levels and directions through the state machine, before its program starts. |
+| `rx_register(index)`, `set_rx_register(index, value)` | The RP2350's RX FIFO registers. |
+| `set_frequency(hz)`, `set_divider(divider)` | Change the clock while running. |
+
+`pins.release_pio(pio)`, once its state machines have been given back,
+disconnects the block's pins and holds it in reset. State machines change
+only their own bits of the registers they share, so one can be kept by an
+interrupt handler and another by the main program.
+[`examples/ws2812.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/ws2812.dodo)
+drives a strip of WS2812 LEDs this way.
+
 ### DMA on the RP2040 and RP2350
 
 Both chips have a DMA controller, 12 channels on the RP2040 and 16 on the
@@ -1775,6 +1892,152 @@ up. `start_request(transfer, dreq)` paces by any other request, or by
 `Driver` over any `hal.Registers`, tested against a model of both chips'
 controllers.
 
+### Two cores on the RP2040 and RP2350
+
+Both chips have two Arm cores that run the same program from the same flash
+and share all memory and peripherals. `main` runs on core 0; core 1 waits in
+the boot ROM until the program starts it with a task of its own. The board
+hands out three parts from `std/embedded/chip/rp_multicore`:
+
+| Part | What it does |
+| --- | --- |
+| `b.core1` | `start(&mut stack, task)` runs `task.run()` on core 1 and returns a `Running` handle. |
+| `b.fifos` | `claim()` hands out a core's end of the FIFOs between the cores, twice: one for core 0 and one to move into core 1's task. |
+| `b.spinlocks` | `claim(n)` and `claim_free()` hand out the hardware locks both cores see. |
+
+A task for core 1 is a value with a public `run(self)` method, like a
+[`std/thread`](threads.md) task. It moves to core 1, so it may own
+peripherals, FIFO ends, and spinlocks, but holds no references: `start`
+rejects a task type that could not cross a thread boundary. This program
+answers each word core 0 sends with the next number:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_multicore"
+
+struct Echo {
+    fifo: rp_multicore.Fifo
+
+    pub fn run(self) {
+        for {
+            word := self.fifo.read()
+            self.fifo.write(word + 1)
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    fifo := b.fifos.claim()!
+    stack := [0u64; 512]
+    core1 := b.core1.start(&mut stack, Echo { fifo: b.fifos.claim()! })!
+    fifo.write(41)
+    core.assert(fifo.read() == 42)
+    for {
+        b.led.toggle()
+        b.timer.delay_ms(500)
+    }
+}
+```
+
+The task and the three words the runtime's start-up code needs go at the top
+of `stack`, and core 1's stack grows down from below them. `start` asks for
+`rp_multicore.MIN_STACK_BYTES` (256) beyond the task; give it room for what
+`run` calls as well, a few KiB for an executor. On the RP2350 the stack's
+bottom becomes core 1's stack limit, so an overflow faults and the panic
+hook reports it instead of overwriting memory; the RP2040's Cortex-M0+
+cannot detect one. A stack in a `static mut` keeps it off core 0's stack.
+
+Core 1 runs until `Running` is dropped or `stop()`ped, which holds core 1 in
+reset, so it never outlives its stack: keep the handle for as long as core 1
+should run, typically in `main`, whose loop never ends. `is_finished()` reports
+that `run` returned, after which core 1 sleeps. `start` always restarts core 1
+first, so a stopped core starts again the same way, and a program that a
+debugger restarted finds core 1 in a known state. A stopped task is not
+dropped: peripherals it owned stay claimed, and a spinlock it held stays
+locked. `start` must be called on core 0; it returns `InvalidInput` for a
+stack that is too small, and `Timeout` or `Bus` if core 1's boot ROM does not
+answer the launch sequence.
+
+| `rp_multicore.Fifo` | Purpose |
+| --- | --- |
+| `write(word)`, `try_write(word)` | Send a 32-bit word to the other core, waiting while the FIFO is full, or false then. Wakes the other core from `read`. |
+| `read()`, `try_read()` | The next word the other core sent, sleeping (`wfe`) until there is one, or none then. |
+| `can_read()`, `can_write()`, `drain()` | Whether a word waits or there is room, and discarding the waiting words. |
+| `set_signal(&signal)`, `clear_signal()` | Raise an executor signal on this core whenever the other core has written. |
+| `irq()` | This core's FIFO interrupt: `SIO_IRQ_PROC0` or `SIO_IRQ_PROC1` on the RP2040, `SIO_IRQ_FIFO` on the RP2350. |
+
+Each direction holds 8 words on the RP2040 and 4 on the RP2350. A `Fifo`
+always reaches the end of the core that uses it, so the two from `claim()`
+are alike: keep one on each core.
+
+Each core has its own interrupt mask and NVIC: `hal.Critical` and
+`cortex_m.enable` act on the core that calls them, and a handler runs on the
+core that enabled its interrupt. So each core can run its own
+[executor](#tasks-and-the-executor), with its own alarm as the clock. Its
+signals belong to that core: an id raised on core 0 does not wake a task on
+core 1. To wake a task on the other core, write to the FIFO: after
+`fifo.set_signal(&WORDS)`, the chip runtime's handler of this core's FIFO
+interrupt raises `WORDS` and holds the interrupt back until the next
+`try_read`, `read`, or `drain`. The waiting task takes the signal and reads
+until `try_read` returns none:
+
+```dodo
+const WORDS: executor.Signal = executor.Signal { id: 0 }
+
+struct Doubler {
+    fifo: rp_multicore.Fifo
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        WORDS.take(cx)
+        for {
+            match self.fifo.try_read() {
+                some(word) => self.fifo.write(word * 2),
+                none => break,
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+```
+
+A program's own `@interrupt` handler for the FIFO interrupt replaces the
+runtime's, and `set_signal` with it. GPIO events reach core 0 only: `Pin.listen`
+enables them for core 0's `IO_IRQ_BANK0`. The USB serial port's interrupt runs
+on the core that opened the port.
+
+Statics are shared by both cores, and a critical section does not keep the
+other core out. Guard state both cores change with a spinlock:
+
+```dodo
+static mut TOTAL: u32 = 0
+
+guard := lock.lock()
+unsafe {
+    TOTAL += 1
+}
+core.drop(guard)
+```
+
+`lock()` masks interrupts on this core, then waits while the other core holds
+the lock; dropping the guard releases it and unmasks them again. `try_lock()`
+does not wait, and `is_locked()` reports either core's hold. Claim a lock once,
+then give the other core its own copy with `clone()`. The RP2040 has 32 locks.
+On the RP2350, writes to some other SIO registers unlock the locks just below
+them (erratum RP2350-E2), so locks 0 to 4, 8, 9, and 12 to 17 are never handed
+out; locks 18 to 31 work on both chips. On the RP2350 a single word can also be
+shared with [atomics](#sharing-state-with-atomics), whose exclusive loads and
+stores work across cores; the RP2040's Cortex-M0+ only loads and stores
+atomically.
+
+`examples/two_cores.dodo` searches for primes on core 1 and reports progress
+over USB serial from an executor on core 0, woken through the FIFO, with a
+spinlock around the results both cores read. The ADC and the USB serial port
+share the bookkeeping that starts and stops PLL_USB, so claim and release them
+from one core.
+
 ### The Raspberry Pi Pico 2 W
 
 The Pico 2 W is a Pico 2 with an Infineon CYW43439 Wi-Fi and Bluetooth chip.
@@ -1838,7 +2101,8 @@ so each new board or chip is a small, self-contained addition:
   `src/hardware.rs` (name, chip, flash size) and a `std/embedded/board/NAME` package
   that configures the chip and provides the entry points above.
 - **A chip** is a `src/hardware/NAME.rs` descriptor (target triple, CPU,
-  memory map, image format, and image fixups such as boot checksums), its
+  memory map, image format, its PIO version if it has PIO, and image fixups
+  such as boot checksums), its
   startup runtime as LLVM IR and linker script, an entry in `CHIPS`, and a
   `std/embedded/chip/NAME` package with its peripherals.
 - **A peripheral** that `std/embedded/peripheral` already drives needs only
@@ -1880,9 +2144,17 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  the timer, DMA, and a USB serial port; PIO and other USB devices (HID,
+  PIO, the timer, DMA, a USB serial port, and the second core; other USB
+  devices (HID,
   mass storage, several functions at once) or USB host mode are not bundled
   yet. Write them with `hal.Reg` as above.
+- PIO state machines move words through their FIFOs by polling or their
+  interrupts. DMA can pace transfers by their FIFOs' data requests
+  (`rp_dma.request` with `sm.tx_fifo_address()`), but there is no DMA
+  session for them as for SPI buses and serial ports. Their pin mappings
+  reach GPIO 0 to 31; the
+  RP2350B's GPIO 32 to 47 and the RP2350's GPIOBASE register are not
+  supported. `rp_pio.assemble` takes one program per call.
 - PWM outputs only generate; the slices' input modes, which count or time a
   pin's pulses, and the PWM wrap interrupt are not exposed. ADC reads are
   polled one at a time, without the round-robin sampler, FIFO, or DMA.
@@ -1899,10 +2171,11 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   arithmetic runs on the double-precision coprocessor instead. They raise no
   floating-point exception flags and return the default quiet NaN for every
   NaN result.
-- Only core 0 runs; core 1 stays in the boot ROM. Several activities share
-  core 0 as [executor tasks](#tasks-and-the-executor), which are
-  cooperative: there is no preemptive scheduler. The RP2350's RISC-V cores
-  are not supported.
+- Core 1 runs one task, started from core 0, and the cores share the
+  vector table. Executor tasks on either core are cooperative: there is no
+  preemptive scheduler. GPIO events interrupt core 0 only, the RP2350's
+  doorbells between the cores are not exposed, and its RISC-V cores are not
+  supported.
 - On the Cortex-M0+ of the RP2040, atomics only load and store; see
   [sharing state with atomics](#sharing-state-with-atomics).
 - Inline assembly lives inside functions; there is no global or naked

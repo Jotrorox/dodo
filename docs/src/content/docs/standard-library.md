@@ -45,6 +45,7 @@ they are not prerequisites for using the safe entry APIs.
 | Build a string | `text.Builder.new` with a byte array | [Text](text.md) |
 | Decode or encode JSON | `@derive(Json)` and `json.decode<T>` | [JSON](json.md) |
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
+| Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
 | Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
@@ -104,7 +105,7 @@ Those details determine whether retrying or reusing storage is valid.
 ## Portable and hosted functionality
 
 Portable core, allocation, bytes, text, JSON, collections, math, hashes, time values,
-DNS/TLS contracts, HTTP/1.1 protocol engines and web routing require no OS,
+graphics, DNS/TLS contracts, HTTP/1.1 protocol engines and web routing require no OS,
 libc, global allocator, scheduler or garbage collector. Portable fixture checks
 emit `wasm32-unknown-unknown` and `thumbv6m-none-eabi` objects at O0 and O3.
 This is code-generation evidence, not tested board startup or hardware execution.
@@ -132,13 +133,16 @@ their I2C and SPI buses, as master or target, and serial ports through the
 shared controller drivers in `std/embedded/peripheral` and the pin and
 controller ownership both chips share in `std/embedded/chip/rp_pins`, and
 their PWM outputs and ADC inputs through `std/embedded/chip/rp_pwm` and
-`std/embedded/chip/rp_adc`, a USB serial port on the board's own USB
-connector through `std/embedded/chip/rp_usb`, and their DMA channels
-through `std/embedded/chip/rp_dma`, which the SPI buses and serial ports
-use for transfers that run in the background.
+`std/embedded/chip/rp_adc`, their PIO state machines, with programs assembled
+at compile time, through `std/embedded/chip/rp_pio`, a USB serial port on
+the board's own USB connector through `std/embedded/chip/rp_usb`, their DMA
+channels through `std/embedded/chip/rp_dma`, which the SPI buses and serial
+ports use for transfers that run in the background, and their second core,
+with the FIFOs and spinlocks the cores share, through
+`std/embedded/chip/rp_multicore`.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
-tasks on one core, waking each on time or on an interrupt and sleeping
+tasks on a core, waking each on time or on an interrupt and sleeping
 in between. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
@@ -158,6 +162,7 @@ individual modules and links every public declaration back to its source.
 | [Allocation and boxes](allocation.md) | `alloc/arena`, `alloc/arena_box`, `alloc/block`, `alloc/boxed`, `alloc/error`, `alloc/layout`, `alloc/pool`, `alloc/pool_box`, `alloc/shared_arena`, `alloc/shared_box` | Portable. |
 | [Binary bytes](bytes.md) | `std/arena_bytes`, `std/bytes`, `std/bytes_alloc`, `std/pool_bytes` | Portable. |
 | [Byte I/O](io.md) | `std/io`, `std/io_alloc` | Portable. |
+| [Compression](compression.md) | `std/compress/deflate`, `std/compress/zlib`, `std/compress/gzip`, `std/compress/io` | Portable; caller-supplied buffers. |
 | [Console I/O](console.md) | `std/console` | Hosted. |
 | [Formatting](formatting.md) | `std/fmt`, `std/fmt/errors`, `std/fmt_alloc` | Portable. |
 | [UTF-8 text](text.md) | `std/text`, `std/text_alloc`, `std/text_shared` | Portable. |
@@ -165,6 +170,7 @@ individual modules and links every public declaration back to its source.
 | [Collections](collections.md) | `std/collections`, `std/collections/deque`, `std/collections/fixed_deque`, `std/collections/fixed_map`, `std/collections/fixed_set`, `std/collections/fixed_vector`, `std/collections/hash_map`, `std/collections/hash_set`, `std/collections/heap`, `std/collections/ordered_map`, `std/collections/ordered_set`, `std/collections/shared_deque`, `std/collections/shared_hash_map`, `std/collections/shared_hash_set`, `std/collections/shared_heap`, `std/collections/shared_ordered_map`, `std/collections/shared_ordered_set`, `std/collections/shared_vector`, `std/collections/vector` | Portable. |
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
+| [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image` | Portable; caller-supplied pixel and file buffers. |
 | [Time and clocks](time.md) | `std/time`, `std/time/clock`, `std/time/hosted`, `std/time/iso8601`, `std/time/timer` | Values/contracts portable; hosted clock explicit. |
 | [Native strings and errors](platform.md) | `std/platform`, `std/platform/error` | Hosted. |
 | [Filesystem and lexical paths](filesystem.md) | `std/fs`, `std/fs/path`, `std/fs/types`, `std/fs/unix`, `std/fs/windows_ext` | Paths/types portable; files hosted. |

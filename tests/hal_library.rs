@@ -82,6 +82,25 @@ fn executor_runs_tasks_against_the_simulated_clock() {
 }
 
 #[test]
+fn core1_launch_and_shared_parts_execute_against_a_simulated_boot_rom() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("multicore");
+    let source = root.join("tests/stdlib/multicore_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "multicore-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        let args = ["build", source.to_str().unwrap(), "-O", optimization, "-o"];
+        success(&dodo(&args, &executable), "compile multicore fixture");
+        success(
+            &Command::new(&executable).output().unwrap(),
+            "execute multicore fixture",
+        );
+    }
+}
+
+#[test]
 fn cyw43_driver_executes_against_simulated_pins_and_chip() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = Scratch::new("cyw43");
@@ -253,6 +272,39 @@ fn interrupt_control_lowers_to_each_architecture_mask() {
     );
     let text = fs::read_to_string(&assembly).unwrap();
     assert!(text.contains("wfi") && text.contains("dmb"), "{text}");
+
+    // The core number: Cortex-M asks the chip runtime's dodo_core_id, if
+    // there is one, and RISC-V reads mhartid.
+    let core_id = scratch.write(
+        "core_id.dodo",
+        "package core_number\nimport \"core/cpu\"\npub fn here() -> u32 {\n return cpu.core_id()\n}\n",
+    );
+    for (target, expected) in [
+        ("thumbv6m-none-eabi", &[".weak", "dodo_core_id"][..]),
+        ("thumbv8m.main-none-eabi", &[".weak", "dodo_core_id"][..]),
+        ("riscv32-unknown-none-elf", &["mhartid"][..]),
+    ] {
+        let assembly = scratch.0.join(format!("core_id-{target}.s"));
+        success(
+            &dodo(
+                &[
+                    "build",
+                    core_id.to_str().unwrap(),
+                    "--emit",
+                    "asm",
+                    "--target",
+                    target,
+                    "-o",
+                ],
+                &assembly,
+            ),
+            &format!("emit core_id for {target}"),
+        );
+        let text = fs::read_to_string(&assembly).unwrap();
+        for needle in expected {
+            assert!(text.contains(needle), "{target} lacks {needle}:\n{text}");
+        }
+    }
 }
 
 #[test]
