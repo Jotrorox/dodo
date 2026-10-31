@@ -195,7 +195,8 @@ def main():
     if kernel32 is None:
         raise SystemExit("MinGW libkernel32.a not found; provide --kernel32 or install the MinGW development files")
     fixtures = [path.resolve() for path in args.fixture] if args.fixture else (
-        sorted((ROOT / "tests/stdlib").glob("*.dodo")) +
+        # window_events opens a real window; tests/window_library.rs drives it.
+        sorted(path for path in (ROOT / "tests/stdlib").glob("*.dodo") if path.name != "window_events.dodo") +
         sorted(path for path in (ROOT / "tests/os").glob("*.dodo")
                if "_unix_" not in path.name and path.name not in (
                    "process_checks.dodo", "env_native_checks.dodo", "thread_failures.dodo")))
@@ -270,7 +271,9 @@ def main():
                          *[str(native_objects[path, optimization]) for path in boundaries],
                          *([str(kernel32.parent / "libmsvcrt.a")] if boundaries else []),
                          *([str(kernel32.parent / "libws2_32.a")]
-                           if any(path.parent.name == "net" for path in boundaries) else [])])
+                           if any(path.parent.name == "net" for path in boundaries) else []),
+                         *([str(kernel32.parent / "libuser32.a"), str(kernel32.parent / "libgdi32.a")]
+                           if any(path.parent.name == "window" for path in boundaries) else [])])
                     if exe.read_bytes()[:2] != b"MZ":
                         raise RuntimeError(f"Linker did not produce a Windows executable: {exe}")
                     work = scratch / f"work-{source.stem}-{optimization}"
