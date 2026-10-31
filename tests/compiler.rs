@@ -1265,7 +1265,7 @@ fn c_function_pointers_keep_the_c_abi_separate_and_unsafe() {
         ),
         (
             "package bad\nstruct P { x: i32 }\nstruct T { f: extern \"C\" fn(P) -> i32 }\n",
-            "C ABI parameters and results",
+            "struct `P` cannot cross the C ABI by value: it is not declared @repr(C)",
         ),
         (
             "package bad\nstruct T { f: extern \"C\" fn() -> &str }\n",
