@@ -536,7 +536,19 @@ pub struct Function {
     /// exception or interrupt. It is exported under the vector's symbol name
     /// and cannot be called from Dodo code.
     pub interrupt: Option<String>,
+    /// `@link_name("symbol")`: the C symbol an extern declaration binds in
+    /// place of its own name. Several declarations may bind one symbol with
+    /// different signatures, as Objective-C does with `objc_msgSend`.
+    pub link_name: Option<String>,
     pub placement: Placement,
+}
+impl Function {
+    /// The C symbol of an extern function: its `@link_name`, or its own name.
+    pub fn foreign_symbol(&self) -> &str {
+        self.link_name
+            .as_deref()
+            .unwrap_or_else(|| self.name.rsplit('.').next().unwrap_or(&self.name))
+    }
 }
 /// Linker placement chosen by `@section("name")` and `@align(N)` on functions
 /// and statics.

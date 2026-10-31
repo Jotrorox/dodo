@@ -83,7 +83,7 @@ fn validate_interrupt_handlers(program: &Program) -> Check<()> {
         }
     }
     for function in &program.functions {
-        let symbol = function.name.rsplit('.').next().unwrap_or(&function.name);
+        let symbol = function.foreign_symbol();
         if function.extern_
             && let Some(handler) = handlers.get(symbol)
         {
