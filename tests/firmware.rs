@@ -690,8 +690,15 @@ fn rp2040_projects_link_to_flashable_firmware() {
     ]);
     check_rp2040_firmware(Path::new(&elf));
     // Portable drivers, tested with fakes, on the board's I2C bus and on
-    // an ADC input and a PWM output, and WS2812 LEDs on PIO.
-    for name in ["hal_sensor_board", "dimmer_board", "ws2812"] {
+    // an ADC input and a PWM output, WS2812 LEDs on PIO, an ST7789 panel
+    // on SPI, and an SSD1306 panel on I2C.
+    for name in [
+        "hal_sensor_board",
+        "dimmer_board",
+        "ws2812",
+        "thermometer_board",
+        "oled_demo",
+    ] {
         let source = root().join(format!("examples/{name}.dodo"));
         for level in ["0", "2"] {
             let elf = scratch.path(&format!("{name}-O{level}.elf"));
@@ -720,6 +727,8 @@ fn rp2350_projects_link_to_flashable_firmware() {
     let sensor = root().join("examples/hal_sensor_board.dodo");
     let dimmer = root().join("examples/dimmer_board.dodo");
     let ws2812 = root().join("examples/ws2812.dodo");
+    let thermometer = root().join("examples/thermometer_board.dodo");
+    let oled = root().join("examples/oled_demo.dodo");
     let selftest = root().join("tests/hardware/pico2");
     let selftest_w = root().join("tests/hardware/pico2_w");
     let float = root().join("tests/hardware/rp2350_float");
@@ -735,6 +744,10 @@ fn rp2350_projects_link_to_flashable_firmware() {
         (&dimmer, "dimmer-w", &["--board", "pico2_w"][..]),
         (&ws2812, "ws2812", &["--board", "pico2"][..]),
         (&ws2812, "ws2812-w", &["--board", "pico2_w"][..]),
+        (&thermometer, "thermometer", &["--board", "pico2"][..]),
+        (&thermometer, "thermometer-w", &["--board", "pico2_w"][..]),
+        (&oled, "oled", &["--board", "pico2"][..]),
+        (&oled, "oled-w", &["--board", "pico2_w"][..]),
         (&selftest, "selftest", &[][..]),
         (&selftest_w, "selftest-w", &[][..]),
         (&float, "float", &["-b", "pico2"][..]),

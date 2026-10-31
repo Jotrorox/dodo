@@ -1,0 +1,159 @@
+package thermometer
+
+import "std/graphics"
+import "std/graphics/fake"
+import "std/graphics/font"
+import "std/text"
+
+// A thermometer screen for a 240x240 panel, drawn in screen coordinates
+// so that a canvas covering any part of the screen gets exactly that part.
+// `dodo test examples/thermometer.dodo` checks it against
+// std/graphics/fake; thermometer_board.dodo shows it on an ST7789 panel
+// with a canvas of a third of the screen, drawing the screen in bands and
+// then redrawing only the rows that change.
+
+pub const WIDTH: u32 = 240
+pub const HEIGHT: u32 = 240
+
+// The rows the reading and its bar occupy, the only ones that change.
+pub const CHANGING_TOP: i32 = 80
+pub const CHANGING_ROWS: u32 = 80
+
+const BACKGROUND: graphics.Color = 0xff1d2330
+const HOT_TENTHS: i32 = 300
+
+// Draw the screen for a temperature in tenths of a degree Celsius.
+pub fn draw(canvas: &mut graphics.Canvas, tenths: i32) {
+    label := font.medium()
+    canvas.clear(BACKGROUND)
+    title := "CHIP TEMPERATURE"
+    title_size := label.measure(title)
+    canvas.text(&label, centered(title_size.width), 24, title, graphics.LIGHT_GRAY)
+    canvas.fill_rect(20, 56, WIDTH - 40, 2, graphics.DARK_GRAY)
+
+    // The reading, such as "23.4°C", at twice the font's size.
+    digits := [0u8; 16]
+    length := format_tenths(&mut digits, tenths)
+    reading := text.Text.new(&digits[..length])!
+    large := font.medium().scaled(2)
+    reading_size := large.measure(reading.as_str())
+    canvas.text(&large, centered(reading_size.width), CHANGING_TOP + 4, reading.as_str(), graphics.WHITE)
+
+    // A bar from 0 to 50 °C, red from HOT_TENTHS up.
+    bar_top := CHANGING_TOP + 52
+    canvas.round_rect(20, bar_top, WIDTH - 40, 20, 6, graphics.GRAY)
+    clamped := tenths
+    if clamped < 0 {
+        clamped = 0
+    }
+    if clamped > 500 {
+        clamped = 500
+    }
+    filled := (clamped as u32 * (WIDTH - 44)) / 500
+    color := graphics.hex(0x98c379)
+    if tenths >= HOT_TENTHS {
+        color = graphics.hex(0xe06c75)
+    }
+    canvas.fill_round_rect(22, bar_top + 2, filled, 16, 5, color)
+
+    footer := "dodo + st7789"
+    footer_size := label.measure(footer)
+    canvas.text(&label, centered(footer_size.width), 200, footer, graphics.GRAY)
+}
+
+fn centered(width: u32) -> i32 {
+    return (WIDTH as i32 - width as i32) / 2
+}
+
+// Write `tenths` as "-12.3°C" into `buffer`, as UTF-8, and return its length.
+pub fn format_tenths(buffer: &mut[u8], tenths: i32) -> usize {
+    length := 0usize
+    value := tenths as i64
+    if value < 0 {
+        buffer[0] = 45
+        length = 1
+        value = -value
+    }
+    whole := value / 10
+    digits := [0u8; 10]
+    count := 0usize
+    for {
+        digits[count] = 48 + (whole % 10) as u8
+        count += 1
+        whole = whole / 10
+        if whole == 0 {
+            break
+        }
+    }
+    for index in 0usize..count {
+        buffer[length] = digits[count - 1 - index]
+        length += 1
+    }
+    buffer[length] = 46
+    buffer[length + 1] = 48 + (value % 10) as u8
+    // U+00B0 DEGREE SIGN, then C.
+    buffer[length + 2] = 0xC2
+    buffer[length + 3] = 0xB0
+    buffer[length + 4] = 67
+    return length + 5
+}
+
+@test
+fn formats_readings() {
+    buffer := [0u8; 16]
+    length := format_tenths(&mut buffer, 234)
+    assert_eq(length, 7usize)
+    assert(buffer[0] == 50 && buffer[1] == 51 && buffer[2] == 46 && buffer[3] == 52 && buffer[6] == 67)
+    length = format_tenths(&mut buffer, -5)
+    assert_eq(length, 7usize)
+    assert(buffer[0] == 45 && buffer[1] == 48 && buffer[3] == 53)
+}
+
+@test
+fn bands_draw_the_same_screen_as_one_canvas() {
+    screen_storage := [0u8; 240 * 240 * 2]
+    screen := fake.Display.new(&mut screen_storage, WIDTH, HEIGHT, graphics.PixelFormat.Rgb565)!
+    band_pixels := [0u8; 240 * 80 * 2]
+    band := graphics.canvas(&mut band_pixels, WIDTH, CHANGING_ROWS, graphics.PixelFormat.Rgb565)!
+    bands := graphics.Bands.new(HEIGHT)
+    for bands.next(&mut band) {
+        draw(&mut band, 234)
+        graphics.present_all(&mut screen, &mut band)!
+    }
+    assert_eq(screen.presents(), 3u32)
+
+    whole_pixels := [0u8; 240 * 240 * 2]
+    whole := graphics.canvas(&mut whole_pixels, WIDTH, HEIGHT, graphics.PixelFormat.Rgb565)!
+    draw(&mut whole, 234)
+    assert(screen.screen().equals(&whole))
+}
+
+@test
+fn a_new_reading_redraws_only_its_rows() {
+    screen_storage := [0u8; 240 * 240 * 2]
+    screen := fake.Display.new(&mut screen_storage, WIDTH, HEIGHT, graphics.PixelFormat.Rgb565)!
+    whole_pixels := [0u8; 240 * 240 * 2]
+    whole := graphics.canvas(&mut whole_pixels, WIDTH, HEIGHT, graphics.PixelFormat.Rgb565)!
+    draw(&mut whole, 215)
+    graphics.present_all(&mut screen, &mut whole)!
+
+    band_pixels := [0u8; 240 * 80 * 2]
+    band := graphics.canvas(&mut band_pixels, WIDTH, CHANGING_ROWS, graphics.PixelFormat.Rgb565)!
+    band.set_origin(0, CHANGING_TOP)
+    draw(&mut band, 312)
+    graphics.present_all(&mut screen, &mut band)!
+    changed := screen.last_dirty()
+    assert(changed.y == CHANGING_TOP && changed.height == CHANGING_ROWS)
+
+    draw(&mut whole, 312)
+    assert(screen.screen().equals(&whole))
+    // Hot readings turn the bar red.
+    match screen.screen().color_at(30, CHANGING_TOP + 60) {
+        some(color) => {
+            assert_eq(graphics.red(color) > graphics.green(color), true)
+        }
+        none => {
+            assert(false)
+        }
+    }
+}

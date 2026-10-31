@@ -415,6 +415,24 @@ fn portable_package_dependencies_are_independent_and_reserved() {
             "std/graphics/fake",
             vec!["alloc/", "std/platform", "std/fs"],
         ),
+        (
+            "std/embedded/display",
+            vec![
+                "alloc/",
+                "std/io",
+                "std/platform",
+                "std/fs",
+                "std/graphics/",
+            ],
+        ),
+        (
+            "std/embedded/display/st7789",
+            vec!["alloc/", "std/io", "std/platform", "std/graphics/"],
+        ),
+        (
+            "std/embedded/display/ssd1306",
+            vec!["alloc/", "std/io", "std/platform", "std/graphics/"],
+        ),
     ] {
         let source = workspace.write(
             "main.dodo",

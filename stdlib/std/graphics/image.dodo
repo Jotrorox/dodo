@@ -138,14 +138,17 @@ fn check_dimensions(width: u32, height: u32) -> void!Error {
 fn put(canvas: &mut graphics.Canvas, x: i32, y: i32, column: u32, row: u32, color: graphics.Color) {
     px := x as i64 + column as i64
     py := y as i64 + row as i64
-    if px >= 0 && py >= 0 && px < canvas.width() as i64 && py < canvas.height() as i64 {
+    bounds := canvas.bounds()
+    if px >= bounds.x as i64 && py >= bounds.y as i64 && px < bounds.right() && py < bounds.bottom() {
         canvas.pixel(px as i32, py as i32, color)
     }
 }
 
-// Canvas pixels in row-major order as 8-bit channels.
+// Canvas pixels in row-major order as 8-bit channels, counted from the
+// canvas's top-left pixel wherever its origin is.
 fn pixel_at(canvas: &graphics.Canvas, x: u32, y: u32) -> graphics.Color {
-    match canvas.color_at(x as i32, y as i32) {
+    bounds := canvas.bounds()
+    match canvas.color_at((bounds.x as i64 + x as i64) as i32, (bounds.y as i64 + y as i64) as i32) {
         some(color) => {
             return color
         }

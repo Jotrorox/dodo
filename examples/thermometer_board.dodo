@@ -1,0 +1,72 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/display"
+import "std/embedded/display/st7789"
+import "std/embedded/hal"
+import "std/graphics"
+import "thermometer"
+
+// The screen from thermometer.dodo, unchanged, on a 240x240 ST7789 panel,
+// showing the chip's own temperature sensor once a second. Its tests draw
+// it on `fake.Display`; here the panel takes its place.
+//
+// The canvas holds 80 of the 240 rows, 38,400 bytes. The first frame is
+// drawn in three bands; after that only the 80 rows with the reading change,
+// so the canvas moves there and redraws them.
+//
+// Wiring, with the Raspberry Pi Pico boards' pin numbers: the panel's SCL
+// (or SCK) to GP18, SDA (or MOSI) to GP19, CS to GP17, DC to GP16, RES to
+// GP20, BLK (the backlight) to GP21, and VCC and GND. A panel without CS
+// works too: pass none for the select pin. Flash it from BOOTSEL mode with
+//
+//     dodo run examples/thermometer_board.dodo --board pico
+//
+// (or --board pico2 or pico2_w).
+const DATA_COMMAND_PIN: u32 = 16
+const RESET_PIN: u32 = 20
+const BACKLIGHT_PIN: u32 = 21
+
+fn main() {
+    b := board.take()!
+    bus := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, none, hal.SpiMode.Mode3, 62_500_000)!
+    data_command := b.pins.output(DATA_COMMAND_PIN)!
+    select := b.pins.output(board.SPI_SELECT_PIN)!
+    reset := b.pins.output(RESET_PIN)!
+    backlight := b.pins.output(BACKLIGHT_PIN)!
+    display.reset(&mut reset, &mut b.timer)
+    wiring := display.SpiInterface.new(bus, data_command, some(select))
+    lcd := st7789.Display.new(wiring, st7789.panel_240x240(), st7789.Rotation.Deg0, &mut b.timer)!
+    backlight.set_high()
+
+    sensor := b.pins.temperature()!
+    pixels := [0u8; 240 * 80 * 2]
+    band := graphics.canvas(&mut pixels, thermometer.WIDTH, thermometer.CHANGING_ROWS, graphics.PixelFormat.Rgb565)!
+    bands := graphics.Bands.new(thermometer.HEIGHT)
+    tenths := read_tenths(&mut sensor)
+    for bands.next(&mut band) {
+        thermometer.draw(&mut band, tenths)
+        graphics.present_all(&mut lcd, &mut band)!
+    }
+    for {
+        b.timer.delay_ms(1000)
+        tenths = read_tenths(&mut sensor)
+        band.set_origin(0, thermometer.CHANGING_TOP)
+        thermometer.draw(&mut band, tenths)
+        graphics.present_all(&mut lcd, &mut band)!
+    }
+}
+
+// The temperature in tenths of a degree Celsius, from the sensor's voltage
+// by the formula in the RP2040 and RP2350 datasheets: 27 °C at 0.706 V,
+// falling 1.721 mV per degree. Uncalibrated, so expect a few degrees off.
+fn read_tenths<A: hal.AnalogInput>(sensor: &mut A) -> i32 {
+    match hal.read_millivolts(sensor, 3300) {
+        ok(millivolts) => {
+            return 270 - (millivolts as i32 - 706) * 10000 / 1721
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
