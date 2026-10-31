@@ -1,0 +1,364 @@
+package opengl
+
+import "core/mem"
+import "core/ptr"
+import "std/gpu/opengl/common"
+import "std/gpu/opengl/gl"
+import "std/gpu/opengl/native" as backend
+
+// OpenGL contexts without a window, and offscreen render targets.
+//
+// This package creates a context and loads the raw OpenGL binding,
+// std/gpu/opengl/gl, with its entry points. Draw with the gl package's
+// commands into a Target, then read the pixels back, for example to show
+// them in a std/window canvas or save them with std/graphics/image.
+//
+// Everything is written in Dodo and talks to each operating system's own
+// OpenGL interface, loaded when a context is created: EGL on Linux (Mesa or
+// a vendor driver, without an X server), CGL on macOS and WGL on Windows. A
+// program links no OpenGL library, so it starts on machines without one and
+// can choose another renderer when create() fails.
+//
+// OpenGL state belongs to the thread a context is current on. create() makes
+// the new context current on the calling thread; with several contexts, call
+// make_current() before using one. The gl package's table of entry points is
+// shared by the whole process and holds the addresses of the context that was
+// made current last; contexts from one driver share those addresses, so
+// threads may each use their own context.
+
+pub type Error = common.Error
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.InvalidInput => {
+            return "InvalidInput"
+        }
+        Error.NoLibrary => {
+            return "NoLibrary"
+        }
+        Error.NoDisplay => {
+            return "NoDisplay"
+        }
+        Error.NoConfig => {
+            return "NoConfig"
+        }
+        Error.Unsupported => {
+            return "Unsupported"
+        }
+        Error.System => {
+            return "System"
+        }
+    }
+}
+
+// Which context to create. Versions 3.2 and later use the core profile, the
+// one std/gpu/opengl/gl binds; earlier versions get a legacy context.
+pub struct Options {
+    pub major: u32
+    pub minor: u32
+    // Ask for a debug context, which reports errors through
+    // gl.debug_message_callback. Not every system offers one; macOS ignores it.
+    pub debug: bool
+
+    // OpenGL `major`.`minor` without debugging.
+    pub fn new(major: u32, minor: u32) -> Options {
+        return Options { major: major, minor: minor, debug: false }
+    }
+    // OpenGL 3.3 core, which every desktop driver from the last decade and
+    // macOS offer.
+    pub fn default() -> Options {
+        return Options.new(3, 3)
+    }
+}
+
+// An OpenGL context with no window. Dropping it destroys the context and,
+// when it was current, clears the gl package's entry points.
+pub struct Context {
+    backend: backend.Backend
+    major: u32
+    minor: u32
+    // Which context the gl package's table was loaded for: switching back
+    // and forth between contexts then reloads only when it has to.
+    serial: u64
+
+    // Create a context, make it current on the calling thread and load the
+    // gl package. Fails with InvalidInput for a version OpenGL does not
+    // define, NoLibrary or NoDisplay when the system has no usable OpenGL,
+    // and Unsupported when the driver's version is older than requested.
+    // The driver may provide a newer compatible version than requested;
+    // version() reports it.
+    pub fn create(options: Options) -> Context!Error {
+        if !defined(options.major, options.minor) {
+            return err(Error.InvalidInput)
+        }
+        system := backend.Backend.create(options.major, options.minor, options.debug)?
+        serial := unsafe {
+            NEXT_SERIAL += 1
+            NEXT_SERIAL
+        }
+        context := Context { backend: system, major: 0, minor: 0, serial: serial }
+        context.load()
+        version := context.query_version()
+        context.major = version / 100
+        context.minor = version % 100
+        if version < options.major * 100 + options.minor {
+            return err(Error.Unsupported)
+        }
+        return ok(context)
+    }
+
+    // Make this context current on the calling thread and point the gl
+    // package's commands at it.
+    pub fn make_current(&self) -> void!Error {
+        self.backend.make_current()?
+        if unsafe {
+            LOADED_SERIAL
+        } != self.serial || !gl.is_loaded("glGetString") {
+            self.load()
+        }
+        return ok()
+    }
+
+    // Whether this context is current on the calling thread.
+    pub fn is_current(&self) -> bool {
+        return self.backend.is_current()
+    }
+
+    // The version the driver provides, at least the requested one.
+    pub fn major(&self) -> u32 {
+        return self.major
+    }
+    pub fn minor(&self) -> u32 {
+        return self.minor
+    }
+
+    // The driver's name for the GPU or renderer, such as "llvmpipe" or
+    // "Apple M2", and the full version and vendor text the driver reports.
+    // The context must be current.
+    pub fn renderer(&self) -> &str from(self) {
+        return self.text(gl.RENDERER)
+    }
+    pub fn version(&self) -> &str from(self) {
+        return self.text(gl.VERSION)
+    }
+    pub fn vendor(&self) -> &str from(self) {
+        return self.text(gl.VENDOR)
+    }
+
+    // The address of the command or extension function with this
+    // NUL-terminated name, or 0, for functions the gl package does not bind.
+    pub fn proc_address(&self, name: *const u8) -> usize {
+        return self.backend.resolve(name)
+    }
+
+    fn text(&self, name: u32) -> &str from(self) {
+        unsafe {
+            text := gl.get_string(name)
+            if ptr.is_null(text) {
+                return ""
+            }
+            length := 0usize
+            for *ptr.offset(text, length as isize) != 0 {
+                length += 1
+            }
+            // Drivers report ASCII; anything else reads as empty.
+            bytes := ptr.borrow_slice(text, length, self)
+            for i in 0usize..length {
+                if bytes[i] >= 128 {
+                    return ""
+                }
+            }
+            return mem.str_from_utf8(bytes)
+        }
+    }
+
+    fn load(&self) {
+        unsafe {
+            gl.load(fn(name: *const u8) -> usize {
+                return self.backend.resolve(name)
+            })
+            LOADED_SERIAL = self.serial
+        }
+    }
+
+    // The version as major * 100 + minor, from the version string so that
+    // OpenGL 2.1 contexts, which lack GL_MAJOR_VERSION, work too.
+    fn query_version(&self) -> u32 {
+        text := mem.str_bytes(self.text(gl.VERSION))
+        // "4.1 Metal - 88", "4.5 (Core Profile) Mesa 24.2": major.minor first.
+        major := 0u32
+        minor := 0u32
+        index := 0usize
+        for index < text.len && text[index] >= 48 && text[index] <= 57 {
+            major = major * 10 + (text[index] - 48) as u32
+            index += 1
+        }
+        if index < text.len && text[index] == 46 {
+            index += 1
+            for index < text.len && text[index] >= 48 && text[index] <= 57 {
+                minor = minor * 10 + (text[index] - 48) as u32
+                index += 1
+            }
+        }
+        if major > 99 || minor > 99 {
+            return 0
+        }
+        return major * 100 + minor
+    }
+
+    fn drop(&mut self) {
+        if self.backend.is_current() {
+            unsafe {
+                gl.unload()
+                LOADED_SERIAL = 0
+            }
+        }
+    }
+}
+
+static mut NEXT_SERIAL: u64 = 0
+static mut LOADED_SERIAL: u64 = 0
+
+fn defined(major: u32, minor: u32) -> bool {
+    if major == 1 {
+        return minor <= 5
+    }
+    if major == 2 {
+        return minor <= 1
+    }
+    if major == 3 {
+        return minor <= 3
+    }
+    if major == 4 {
+        return minor <= 6
+    }
+    return false
+}
+
+// An offscreen framebuffer to draw into: 8-bit RGBA color with a 24-bit
+// depth and 8-bit stencil buffer. Create it while its context is current;
+// dropping it deletes its OpenGL objects in the current context.
+pub struct Target {
+    framebuffer: u32
+    color: u32
+    depth: u32
+    width: u32
+    height: u32
+
+    // A target of `width` by `height` pixels, bound for drawing with the
+    // viewport covering it. Fails with InvalidInput for a zero size or one
+    // above the driver's renderbuffer limit, and Unsupported before OpenGL
+    // 3.0 or when the driver cannot render to it.
+    pub fn new(width: u32, height: u32) -> Target!Error {
+        // Framebuffer objects are OpenGL 3.0.
+        if !gl.is_loaded("glGenFramebuffers") {
+            return err(Error.Unsupported)
+        }
+        limit := 0i32
+        unsafe {
+            gl.get_integerv(gl.MAX_RENDERBUFFER_SIZE, ptr.from_mut(&mut limit))
+        }
+        if width == 0 || height == 0 || limit <= 0 || width > limit as u32 || height > limit as u32 {
+            return err(Error.InvalidInput)
+        }
+        target := Target { framebuffer: 0, color: 0, depth: 0, width: width, height: height }
+        status := 0u32
+        unsafe {
+            gl.gen_framebuffers(1, ptr.from_mut(&mut target.framebuffer))
+            gl.bind_framebuffer(gl.FRAMEBUFFER, target.framebuffer)
+            gl.gen_renderbuffers(1, ptr.from_mut(&mut target.color))
+            gl.bind_renderbuffer(gl.RENDERBUFFER, target.color)
+            gl.renderbuffer_storage(gl.RENDERBUFFER, gl.RGBA8, width as i32, height as i32)
+            gl.framebuffer_renderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, target.color)
+            gl.gen_renderbuffers(1, ptr.from_mut(&mut target.depth))
+            gl.bind_renderbuffer(gl.RENDERBUFFER, target.depth)
+            gl.renderbuffer_storage(gl.RENDERBUFFER, gl.DEPTH24_STENCIL8, width as i32, height as i32)
+            gl.framebuffer_renderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, target.depth)
+            status = gl.check_framebuffer_status(gl.FRAMEBUFFER)
+        }
+        if status != gl.FRAMEBUFFER_COMPLETE {
+            return err(Error.Unsupported)
+        }
+        target.bind()
+        return ok(target)
+    }
+
+    pub fn width(&self) -> u32 {
+        return self.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.height
+    }
+    // The framebuffer object's name, for gl commands that take one.
+    pub fn framebuffer(&self) -> u32 {
+        return self.framebuffer
+    }
+
+    // Draw into this target from now on, with the viewport covering it.
+    pub fn bind(&self) {
+        unsafe {
+            gl.bind_framebuffer(gl.FRAMEBUFFER, self.framebuffer)
+            gl.viewport(0, 0, self.width as i32, self.height as i32)
+        }
+    }
+
+    // How many bytes read_rgba and read_bgra write: width * height * 4.
+    pub fn bytes_needed(&self) -> usize {
+        return self.width as usize * self.height as usize * 4
+    }
+
+    // Copy the pixels into `pixels`, four bytes each in the order red, green,
+    // blue, alpha, with rows top to bottom as std/graphics stores them
+    // (OpenGL's own rows run bottom to top). Waits for drawing to finish.
+    // Fails with InvalidInput when `pixels` is shorter than bytes_needed().
+    pub fn read_rgba(&self, pixels: &mut[u8]) -> void!Error {
+        return self.read(pixels, gl.RGBA)
+    }
+    // The same in the order blue, green, red, alpha: graphics.PixelFormat
+    // Bgra8888, the layout of a std/window canvas.
+    pub fn read_bgra(&self, pixels: &mut[u8]) -> void!Error {
+        return self.read(pixels, gl.BGRA)
+    }
+
+    fn read(&self, pixels: &mut[u8], format: u32) -> void!Error {
+        if pixels.len < self.bytes_needed() {
+            return err(Error.InvalidInput)
+        }
+        // Leave the caller's read binding and pack alignment as they were.
+        bound := 0i32
+        alignment := 0i32
+        unsafe {
+            gl.get_integerv(gl.READ_FRAMEBUFFER_BINDING, ptr.from_mut(&mut bound))
+            gl.get_integerv(gl.PACK_ALIGNMENT, ptr.from_mut(&mut alignment))
+            gl.bind_framebuffer(gl.READ_FRAMEBUFFER, self.framebuffer)
+            gl.pixel_storei(gl.PACK_ALIGNMENT, 1)
+            gl.read_pixels(0, 0, self.width as i32, self.height as i32, format, gl.UNSIGNED_BYTE, ptr.as_mut_ptr(pixels))
+            gl.pixel_storei(gl.PACK_ALIGNMENT, alignment)
+            gl.bind_framebuffer(gl.READ_FRAMEBUFFER, bound as u32)
+        }
+        // Flip the rows in place.
+        row := self.width as usize * 4
+        top := 0usize
+        bottom := self.height as usize - 1
+        for top < bottom {
+            for i in 0usize..row {
+                swap := pixels[top * row + i]
+                pixels[top * row + i] = pixels[bottom * row + i]
+                pixels[bottom * row + i] = swap
+            }
+            top += 1
+            bottom -= 1
+        }
+        return ok()
+    }
+
+    fn drop(&mut self) {
+        unsafe {
+            if gl.is_loaded("glDeleteFramebuffers") {
+                gl.delete_framebuffers(1, ptr.from_ref(&self.framebuffer))
+                gl.delete_renderbuffers(1, ptr.from_ref(&self.color))
+                gl.delete_renderbuffers(1, ptr.from_ref(&self.depth))
+            }
+        }
+    }
+}
