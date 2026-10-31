@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- `std/gpu/vulkan`: the Vulkan API in pure Dodo, one to one like Rust's
+  `ash`, as the bottom layer for a future portable `std/gpu`. Constants,
+  handles, enums, bitmasks, structs and the command tables are generated from
+  the Khronos registry by `scripts/generate_vulkan.py` and cover core Vulkan
+  1.0 to 1.4, the Xlib, XCB, Wayland, Win32, Metal and headless surfaces,
+  swapchains, portability (MoltenVK) and debug utils. Nothing is linked:
+  `vk.open()` loads `libvulkan.so.1`, `vulkan-1.dll` or the macOS loader or
+  MoltenVK at run time and resolves every command through
+  `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` into `extern "C" fn` fields
+  of `EntryFns`, `InstanceFns` and `DeviceFns`. Structs have a `default()`
+  with `s_type` set, and helpers cover Result checking and names, API
+  versions, name fields and clear-value unions. All 2,572 struct sizes,
+  alignments and field offsets match the C headers
+  (`scripts/vulkan_layout_check.py`), and `examples/vulkan_compute.dodo` runs
+  a compute shader on Mesa's lavapipe.
+- `std/dylib` opens shared libraries at run time (dlopen on Linux and macOS,
+  LoadLibrary on Windows) and looks up their symbols; Linux builds that use
+  it also link libdl for glibc before 2.34.
+
 - `std/graphics` solid fills and same-format blits are 9–35× faster at -O2
   (1280×800 `clear` 1.4 ms → 0.06 ms, full-frame `blit` 2.3 ms → 0.07 ms).
   Their loops now store through a local row subslice, which the optimizer
