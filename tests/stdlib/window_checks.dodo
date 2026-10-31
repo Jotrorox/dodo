@@ -213,9 +213,38 @@ fn requests() {
     assert_eq(out[1], 1u8)
     assert_eq(x11.fill_rectangle(&mut out, 2, 3, 0, 0, 1, 1), 20usize)
 
+    assert_eq(x11.query_extension(&mut out, b"Present"), 16usize)
+    assert_eq(out[0], 98u8)
+    assert_eq(x11.u16_at(&out, 2), 4u32)
+    assert_eq(x11.u16_at(&out, 4), 7u32)
+    assert_eq(out[8], 80u8)
+    assert_eq(out[15], 0u8)
+    assert_eq(x11.present_query_version(&mut out, 140, 1, 0), 12usize)
+    assert_eq(out[0], 140u8)
+    assert_eq(out[1], 0u8)
+    assert_eq(x11.u16_at(&out, 2), 3u32)
+    assert_eq(x11.u32_at(&out, 4), 1u32)
+    assert_eq(x11.present_select_input(&mut out, 140, 9, 7, x11.PRESENT_COMPLETE_MASK), 16usize)
+    assert_eq(out[1], 3u8)
+    assert_eq(x11.u16_at(&out, 2), 4u32)
+    assert_eq(x11.u32_at(&out, 4), 9u32)
+    assert_eq(x11.u32_at(&out, 8), 7u32)
+    assert_eq(x11.u32_at(&out, 12), 2u32)
+    assert_eq(x11.present_notify_msc(&mut out, 140, 7, 5, 0x100000002, 1, 0), 40usize)
+    assert_eq(out[1], 2u8)
+    assert_eq(x11.u16_at(&out, 2), 10u32)
+    assert_eq(x11.u32_at(&out, 4), 7u32)
+    assert_eq(x11.u32_at(&out, 8), 5u32)
+    assert_eq(x11.u32_at(&out, 12), 0u32)
+    assert_eq(x11.u64_at(&out, 16), 0x100000002u64)
+    assert_eq(x11.u64_at(&out, 24), 1u64)
+    assert_eq(x11.u64_at(&out, 32), 0u64)
+
     tiny := [0u8; 4]
     assert_eq(x11.create_window(&mut tiny, 1, 2, 3, 4, 5), 0usize)
     assert_eq(x11.map_window(&mut tiny, 1), 0usize)
+    assert_eq(x11.query_extension(&mut tiny, b"Present"), 0usize)
+    assert_eq(x11.present_notify_msc(&mut tiny, 140, 7, 5, 0, 1, 0), 0usize)
 }
 
 fn messages() {
@@ -230,6 +259,10 @@ fn messages() {
     assert_eq(x11.code(&message), x11.KEY_PRESS)
     message[0] = x11.ERROR
     assert_eq(x11.message_length(&message), 32usize)
+    // Generic events, such as Present's, carry extra data like replies.
+    message[0] = x11.GENERIC_EVENT
+    put32(&mut message, 4, 2)
+    assert_eq(x11.message_length(&message), 40usize)
     put16(&mut message, 24, 0xfffe)
     assert_eq(x11.i16_at(&message, 24), -2i32)
 }

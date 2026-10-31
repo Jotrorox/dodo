@@ -2,7 +2,8 @@ package x11
 
 import "std/window/raw"
 
-// The parts of the X11 core protocol std/window needs, as pure functions
+// The parts of the X11 core protocol, and of the Present extension that
+// paces frames, std/window needs, as pure functions
 // over byte buffers: request encoders, the connection setup parser, event
 // field readers and keysym translation. Nothing here performs I/O, so the
 // protocol is testable on every host; std/window/linux moves the bytes.
@@ -39,6 +40,8 @@ pub const EXPOSE: u8 = 12
 pub const CONFIGURE_NOTIFY: u8 = 22
 pub const CLIENT_MESSAGE: u8 = 33
 pub const MAPPING_NOTIFY: u8 = 34
+// An extension event that may be longer than 32 bytes.
+pub const GENERIC_EVENT: u8 = 35
 
 // Key and button state bits.
 pub const SHIFT_MASK: u32 = 0x1
@@ -75,6 +78,9 @@ pub fn i16_at(data: &[u8], offset: usize) -> i32 {
 pub fn u32_at(data: &[u8], offset: usize) -> u32 {
     return data[offset] as u32 | (data[offset + 1] as u32 << 8) | (data[offset + 2] as u32 << 16) | (data[offset + 3] as u32 << 24)
 }
+pub fn u64_at(data: &[u8], offset: usize) -> u64 {
+    return u32_at(data, offset) as u64 | (u32_at(data, offset + 4) as u64 << 32)
+}
 fn put16(out: &mut[u8], offset: usize, value: u32) {
     out[offset] = (value & 0xff) as u8
     out[offset + 1] = ((value >> 8) & 0xff) as u8
@@ -84,6 +90,10 @@ fn put32(out: &mut[u8], offset: usize, value: u32) {
     out[offset + 1] = ((value >> 8) & 0xff) as u8
     out[offset + 2] = ((value >> 16) & 0xff) as u8
     out[offset + 3] = ((value >> 24) & 0xff) as u8
+}
+fn put64(out: &mut[u8], offset: usize, value: u64) {
+    put32(out, offset, (value & 0xffffffff) as u32)
+    put32(out, offset + 4, (value >> 32) as u32)
 }
 fn padded(length: usize) -> usize {
     return (length + 3) / 4 * 4
@@ -419,12 +429,78 @@ pub fn get_keyboard_mapping(out: &mut[u8], first: u32, count: u32) -> usize {
     return 8
 }
 
+// QueryExtension, whose reply tells whether the server has the extension
+// `name` (byte 8) and its major opcode (byte 9).
+pub fn query_extension(out: &mut[u8], name: &[u8]) -> usize {
+    total := 8 + padded(name.len)
+    if out.len < total || name.len > 0xffff {
+        return 0
+    }
+    zero(out, 0, total)
+    header(out, 98, 0, total)
+    put16(out, 4, name.len as u32)
+    copy(out, 8, name)
+    return total
+}
+
+// -- Present extension ---------------------------------------------------
+
+// Present reports the display's refreshes. Its requests go to the major
+// opcode QueryExtension returned, with the request number in the data byte.
+
+// PresentSelectInput mask for CompleteNotify events.
+pub const PRESENT_COMPLETE_MASK: u32 = 2
+// GenericEvent type of a CompleteNotify, and its kind for a NotifyMSC.
+pub const PRESENT_COMPLETE_NOTIFY: u32 = 1
+pub const PRESENT_KIND_NOTIFY_MSC: u8 = 1
+
+pub fn present_query_version(out: &mut[u8], opcode: u8, major: u32, minor: u32) -> usize {
+    if out.len < 12 {
+        return 0
+    }
+    header(out, opcode, 0, 12)
+    put32(out, 4, major)
+    put32(out, 8, minor)
+    return 12
+}
+
+// Ask for `mask` events about `window`, under the new event id `event`.
+pub fn present_select_input(out: &mut[u8], opcode: u8, event: u32, window: u32, mask: u32) -> usize {
+    if out.len < 16 {
+        return 0
+    }
+    header(out, opcode, 3, 16)
+    put32(out, 4, event)
+    put32(out, 8, window)
+    put32(out, 12, mask)
+    return 16
+}
+
+// PresentNotifyMSC: a CompleteNotify once the display's frame counter
+// reaches `target`, or, when that has passed, the next frame where
+// counter % divisor == remainder. Target 0 and divisor 1 mean the next
+// refresh.
+pub fn present_notify_msc(out: &mut[u8], opcode: u8, window: u32, serial: u32, target: u64, divisor: u64, remainder: u64) -> usize {
+    if out.len < 40 {
+        return 0
+    }
+    zero(out, 0, 40)
+    header(out, opcode, 2, 40)
+    put32(out, 4, window)
+    put32(out, 8, serial)
+    put64(out, 16, target)
+    put64(out, 24, divisor)
+    put64(out, 32, remainder)
+    return 40
+}
+
 // -- Server messages -----------------------------------------------------
 
 // Total length of the message starting with `head` (at least 32 bytes):
-// replies carry extra data, errors and events never do.
+// replies and generic events carry extra data, errors and core events never
+// do.
 pub fn message_length(head: &[u8]) -> usize {
-    if head[0] == REPLY {
+    if head[0] == REPLY || code(head) == GENERIC_EVENT {
         return PACKET + u32_at(head, 4) as usize * 4
     }
     return PACKET
