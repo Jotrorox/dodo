@@ -1,0 +1,339 @@
+package main
+
+import "core/cpu"
+import "std/embedded/chip/rp_multicore"
+import "std/embedded/hal"
+
+// std/embedded/chip/rp_multicore on the host: holding, releasing, and
+// launching core 1 against a simulated boot ROM behind simulated SIO and
+// power-on state machine registers, and the claims of FIFO ends and
+// spinlocks. Starting core 1 itself needs a chip; the board self-tests in
+// tests/hardware cover it.
+
+const FIFO_ST: usize = 0x050
+const FIFO_WR: usize = 0x054
+const FIFO_RD: usize = 0x058
+const FRCE_OFF: usize = 0x4
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+const PROC1: u32 = 1 << 24
+const DEPTH: usize = 4
+
+// The simulated chip: the FIFO from core 0 to core 1 and back, whether core
+// 1 is held in reset, and its boot ROM's progress through the launch
+// sequence.
+static mut TO_CORE1: [4]u32 = [0u32; 4]
+static mut TO_CORE1_LEN: usize = 0
+static mut TO_CORE0: [4]u32 = [0u32; 4]
+static mut TO_CORE0_LEN: usize = 0
+static mut HELD: bool = false
+// The last six words the boot ROM received, newest last, and what it
+// launched with: vector table, stack pointer, entry point.
+static mut RECEIVED: [6]u32 = [1u32; 6]
+static mut LAUNCHED: bool = false
+static mut LAUNCH: [3]u32 = [0u32; 3]
+// Faults to inject: echoes to get wrong, a boot ROM that never answers, and
+// one that never writes its 0 after a reset.
+static mut WRONG_ECHOES: u32 = 0
+static mut SILENT: bool = false
+static mut NO_ZERO: bool = false
+static mut NOTIFIED: u32 = 0
+
+fn reset_simulation() {
+    unsafe {
+        TO_CORE1_LEN = 0
+        TO_CORE0_LEN = 0
+        HELD = false
+        RECEIVED = [1u32; 6]
+        LAUNCHED = false
+        LAUNCH = [0u32; 3]
+        WRONG_ECHOES = 0
+        SILENT = false
+        NO_ZERO = false
+        NOTIFIED = 0
+    }
+}
+
+fn push_to_core0(word: u32) {
+    unsafe {
+        core.assert(TO_CORE0_LEN < DEPTH)
+        TO_CORE0[TO_CORE0_LEN] = word
+        TO_CORE0_LEN += 1
+    }
+}
+
+fn pop_to_core0() -> u32 {
+    unsafe {
+        core.assert(TO_CORE0_LEN > 0)
+        word := TO_CORE0[0]
+        for index in 1..TO_CORE0_LEN {
+            TO_CORE0[index - 1] = TO_CORE0[index]
+        }
+        TO_CORE0_LEN -= 1
+        return word
+    }
+}
+
+// Core 1's boot ROM, between core 0's register accesses: echo each word,
+// and launch once the last six were 0, 0, 1, and the three addresses.
+fn run_rom() {
+    unsafe {
+        if HELD || SILENT || LAUNCHED {
+            return
+        }
+        for TO_CORE1_LEN > 0 && TO_CORE0_LEN < DEPTH {
+            word := TO_CORE1[0]
+            for index in 1..TO_CORE1_LEN {
+                TO_CORE1[index - 1] = TO_CORE1[index]
+            }
+            TO_CORE1_LEN -= 1
+            for index in 1..6 {
+                RECEIVED[index - 1] = RECEIVED[index]
+            }
+            RECEIVED[5] = word
+            if WRONG_ECHOES > 0 {
+                WRONG_ECHOES -= 1
+                push_to_core0(word ^ 1)
+            } else {
+                push_to_core0(word)
+            }
+            if RECEIVED[0] == 0 && RECEIVED[1] == 0 && RECEIVED[2] == 1 && RECEIVED[3] != 0 {
+                LAUNCHED = true
+                LAUNCH = [RECEIVED[3], RECEIVED[4], RECEIVED[5]]
+            }
+        }
+    }
+}
+
+struct SioView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        run_rom()
+        unsafe {
+            if offset == FIFO_ST {
+                status := 0u32
+                if TO_CORE0_LEN > 0 {
+                    status |= 1
+                }
+                if TO_CORE1_LEN < DEPTH {
+                    status |= 2
+                }
+                return status
+            }
+            core.assert(offset == FIFO_RD)
+            return pop_to_core0()
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        core.assert(offset == FIFO_WR)
+        unsafe {
+            core.assert(TO_CORE1_LEN < DEPTH)
+            TO_CORE1[TO_CORE1_LEN] = value
+            TO_CORE1_LEN += 1
+        }
+        run_rom()
+    }
+}
+
+struct PsmView: hal.Registers {
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(offset == FRCE_OFF)
+        unsafe {
+            if HELD {
+                return PROC1
+            }
+        }
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        core.assert(value == PROC1)
+        unsafe {
+            if offset == FRCE_OFF + SET_ALIAS {
+                HELD = true
+                LAUNCHED = false
+            } else {
+                core.assert(offset == FRCE_OFF + CLEAR_ALIAS)
+                if HELD {
+                    // Out of reset, the boot ROM empties its FIFO end and
+                    // reports that it is ready.
+                    HELD = false
+                    TO_CORE1_LEN = 0
+                    RECEIVED = [1u32; 6]
+                    if !NO_ZERO {
+                        push_to_core0(0)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn notify() {
+    unsafe {
+        NOTIFIED += 1
+    }
+}
+
+fn failed(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn succeeded(result: void!hal.Error) -> bool {
+    match result {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn restarts_core1_and_launches_it() {
+    reset_simulation()
+    sio := SioView {}
+    psm := PsmView {}
+    // Words core 1 wrote before the restart are not mistaken for its 0.
+    push_to_core0(7)
+    push_to_core0(0xFFFF_FFFF)
+    core.assert(succeeded(rp_multicore.hold(&mut psm, PROC1)))
+    unsafe {
+        core.assert(HELD)
+    }
+    core.assert(succeeded(rp_multicore.release(&mut sio, &mut psm, PROC1)))
+    unsafe {
+        core.assert(!HELD && TO_CORE0_LEN == 0)
+    }
+    core.assert(succeeded(rp_multicore.launch(&mut sio, 0x1000_0100, 0x2000_1F00, 0x1000_2001, notify)))
+    unsafe {
+        core.assert(LAUNCHED)
+        core.assert(LAUNCH[0] == 0x1000_0100 && LAUNCH[1] == 0x2000_1F00 && LAUNCH[2] == 0x1000_2001)
+        // Each of the six writes wakes core 1, and so does each 0 sent
+        // after emptying the FIFO.
+        core.assert(NOTIFIED == 8)
+        core.assert(TO_CORE0_LEN == 0 && TO_CORE1_LEN == 0)
+    }
+}
+
+fn wrong_echoes_start_the_sequence_over() {
+    reset_simulation()
+    sio := SioView {}
+    psm := PsmView {}
+    core.assert(succeeded(rp_multicore.hold(&mut psm, PROC1)))
+    core.assert(succeeded(rp_multicore.release(&mut sio, &mut psm, PROC1)))
+    unsafe {
+        WRONG_ECHOES = 3
+    }
+    core.assert(succeeded(rp_multicore.launch(&mut sio, 0x1000_0000, 0x2000_8000, 0x1000_0201, notify)))
+    unsafe {
+        core.assert(LAUNCHED && LAUNCH[1] == 0x2000_8000)
+        WRONG_ECHOES = 1000
+        LAUNCHED = false
+        RECEIVED = [1u32; 6]
+    }
+    // A boot ROM that keeps answering wrongly is a protocol fault.
+    core.assert(failed(rp_multicore.launch(&mut sio, 0x1000_0000, 0x2000_8000, 0x1000_0201, notify), hal.Error.Bus))
+    unsafe {
+        core.assert(!LAUNCHED)
+    }
+}
+
+fn a_silent_core1_times_out() {
+    reset_simulation()
+    sio := SioView {}
+    psm := PsmView {}
+    unsafe {
+        NO_ZERO = true
+    }
+    core.assert(succeeded(rp_multicore.hold(&mut psm, PROC1)))
+    core.assert(failed(rp_multicore.release(&mut sio, &mut psm, PROC1), hal.Error.Timeout))
+    unsafe {
+        SILENT = true
+    }
+    core.assert(failed(rp_multicore.launch(&mut sio, 0x1000_0000, 0x2000_8000, 0x1000_0201, notify), hal.Error.Timeout))
+    unsafe {
+        core.assert(!LAUNCHED)
+    }
+}
+
+fn spinlocks_and_fifo_ends_are_claimed_once() {
+    // RP2350 numbering: locks 0 to 4, 8, 9, and 12 to 17 are reserved.
+    parts := unsafe {
+        rp_multicore.take(rp_multicore.Chip {
+            psm_base: 0x4001_8000,
+            core1_bit: PROC1,
+            core0_fifo_irq: 25,
+            core1_fifo_irq: 25,
+            reserved_locks: 0x0003_F31F,
+        })
+    }
+    spinlocks := &mut parts.spinlocks
+    match spinlocks.claim(3) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    match spinlocks.claim(32) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    first := spinlocks.claim_free()!
+    core.assert(first.number() == 5)
+    twenty := spinlocks.claim(20)!
+    shared := twenty.clone()
+    core.assert(shared.number() == 20)
+    match spinlocks.claim(20) {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    second := spinlocks.claim_free()!
+    core.assert(second.number() == 6)
+    spinlocks.release(first)
+    again := spinlocks.claim_free()!
+    core.assert(again.number() == 5)
+    usable := 0u32
+    for number in 0u32..rp_multicore.SPINLOCK_COUNT {
+        if spinlocks.is_usable(number) {
+            usable += 1
+        }
+    }
+    core.assert(usable == 19)
+    count := 3u32
+    for {
+        match spinlocks.claim_free() {
+            ok(_) => {
+                count += 1
+            }
+            err(error) => {
+                core.assert(error == hal.Error.Busy)
+                break
+            }
+        }
+    }
+    core.assert(count == usable)
+
+    fifos := &mut parts.fifos
+    fifo0 := fifos.claim()!
+    fifo1 := fifos.claim()!
+    match fifos.claim() {
+        ok(_) => core.assert(false),
+        err(error) => core.assert(error == hal.Error.Busy),
+    }
+    core.drop(fifo0)
+    core.drop(fifo1)
+}
+
+fn main() {
+    core.assert(rp_multicore.core_id() == 0 && cpu.core_id() == 0)
+    restarts_core1_and_launches_it()
+    wrong_echoes_start_the_sequence_over()
+    a_silent_core1_times_out()
+    spinlocks_and_fifo_ends_are_claimed_once()
+}

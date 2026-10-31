@@ -1,0 +1,89 @@
+package windows
+
+import "core/ptr"
+import "std/net"
+import "std/net/native" as poll
+import "std/platform/native"
+import "std/platform/error"
+
+unsafe extern "C" fn dodo_signal_listen(mask: u32, handle: *mut isize) -> i32
+unsafe extern "C" fn dodo_signal_close() -> i32
+unsafe extern "C" fn dodo_signal_wait(milliseconds: u32) -> i32
+unsafe extern "C" fn dodo_signal_next(signal: *mut u32) -> i32
+unsafe extern "C" fn dodo_signal_shutdown_requested() -> u32
+
+// Handlers are process-wide, so one channel is open at a time. Tags and mask
+// bits are std/signal Signal ordinals.
+pub struct Channel {
+    handle: isize
+    pub fn open(mask: u32) -> Channel!error.Error {
+        handle := -1isize
+        code := unsafe {
+            dodo_signal_listen(mask, ptr.from_mut(&mut handle))
+        }
+        if code == -1 {
+            return err(error.failure(error.Kind.AlreadyExists))
+        }
+        if code != 0 {
+            return err(native.from_code(code))
+        }
+        return ok(Channel { handle: handle })
+    }
+    pub fn register(&self, set: &mut poll.PollSet) -> usize!net.Error {
+        return set.add_raw(self.handle, net.Interest.Read)
+    }
+    pub fn next(&mut self) -> Option<u32> {
+        if self.handle == -1 {
+            return none
+        }
+        tag := 0u32
+        found := unsafe {
+            dodo_signal_next(ptr.from_mut(&mut tag))
+        }
+        if found == 0 {
+            return none
+        }
+        return some(tag)
+    }
+    // True when the channel became readable; may return early on POSIX when
+    // a signal interrupts the wait.
+    pub fn wait(&mut self, milliseconds: u32) -> bool!error.Error {
+        if self.handle == -1 {
+            return err(error.failure(error.Kind.Closed))
+        }
+        result := unsafe {
+            dodo_signal_wait(milliseconds)
+        }
+        if result < 0 {
+            return err(native.from_code(-result))
+        }
+        return ok(result != 0)
+    }
+    pub fn shutdown_requested(&self) -> bool {
+        if self.handle == -1 {
+            return false
+        }
+        return unsafe {
+            dodo_signal_shutdown_requested()
+        } != 0
+    }
+    pub fn close(&mut self) -> void!error.Error {
+        if self.handle == -1 {
+            return ok()
+        }
+        self.handle = -1
+        code := unsafe {
+            dodo_signal_close()
+        }
+        if code != 0 {
+            return err(native.from_code(code))
+        }
+        return ok()
+    }
+    fn drop(&mut self) {
+        match self.close() {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}

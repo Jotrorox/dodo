@@ -1,0 +1,119 @@
+package quic
+
+import "std/io"
+
+// Portable QUIC vocabulary shared by backends. No cryptography, sockets, clock,
+// entropy, allocation or execution provider is imported here.
+pub enum ErrorKind {
+    InvalidInput, AllocationFailed, VerificationFailed, Protocol, Closed,
+    StreamReset, ConnectionClosed, Network, Cancelled, TimedOut, Backend, LimitExceeded
+}
+// Largest QUIC variable-length integer, the range of every QUIC error code.
+pub const MAX_CODE: u64 = 4611686018427387903
+pub struct Error {
+    pub kind: ErrorKind
+    // Numeric backend, verification or operating-system code only.
+    pub code: i32
+    // The peer's RESET_STREAM/STOP_SENDING code for StreamReset, or the
+    // CONNECTION_CLOSE code for ConnectionClosed; zero otherwise.
+    pub application: u64
+    pub transferred: usize
+    // Only fixed kind names and numeric metadata; never input or native messages.
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("quic: ")?
+        match &self.kind {
+            ErrorKind.InvalidInput => {
+                output.string("InvalidInput")?
+            }
+            ErrorKind.AllocationFailed => {
+                output.string("AllocationFailed")?
+            }
+            ErrorKind.VerificationFailed => {
+                output.string("VerificationFailed")?
+            }
+            ErrorKind.Protocol => {
+                output.string("Protocol")?
+            }
+            ErrorKind.Closed => {
+                output.string("Closed")?
+            }
+            ErrorKind.StreamReset => {
+                output.string("StreamReset")?
+            }
+            ErrorKind.ConnectionClosed => {
+                output.string("ConnectionClosed")?
+            }
+            ErrorKind.Network => {
+                output.string("Network")?
+            }
+            ErrorKind.Cancelled => {
+                output.string("Cancelled")?
+            }
+            ErrorKind.TimedOut => {
+                output.string("TimedOut")?
+            }
+            ErrorKind.Backend => {
+                output.string("Backend")?
+            }
+            ErrorKind.LimitExceeded => {
+                output.string("LimitExceeded")?
+            }
+        }
+        output.string(" code=")?
+        output.decimal(self.code as i64)?
+        output.string(" application=")?
+        output.natural(self.application)?
+        output.string(" transferred=")?
+        output.natural(self.transferred as u64)?
+        return ok()
+    }
+}
+pub fn failure(kind: ErrorKind, code: i32) -> Error {
+    return Error { kind: kind, code: code, application: 0, transferred: 0 }
+}
+// Ready: the operation completed. Pending: retry after processing network
+// events. Finished: the peer ended the stream, or the connection has closed.
+pub enum State {
+    Ready, Pending, Finished
+}
+pub struct Progress {
+    pub state: State
+    pub transferred: usize
+}
+// Why a connection ended. `local` is set when this endpoint closed it,
+// including idle timeout; `transport` marks a QUIC transport error code
+// rather than an application code.
+pub struct CloseInfo {
+    pub code: u64
+    pub local: bool
+    pub transport: bool
+}
+pub fn io_error(reason: &Error) -> io.Error {
+    kind := io.ErrorKind.Other
+    if reason.kind == ErrorKind.InvalidInput {
+        kind = io.ErrorKind.InvalidInput
+    }
+    if reason.kind == ErrorKind.Closed {
+        kind = io.ErrorKind.Closed
+    }
+    if reason.kind == ErrorKind.StreamReset || reason.kind == ErrorKind.ConnectionClosed {
+        kind = io.ErrorKind.ConnectionReset
+    }
+    if reason.kind == ErrorKind.TimedOut {
+        kind = io.ErrorKind.TimedOut
+    }
+    if reason.kind == ErrorKind.Cancelled {
+        kind = io.ErrorKind.Cancelled
+    }
+    return io.Error { kind: kind, transferred: reason.transferred, code: reason.code }
+}
+pub fn poll(progress: Progress) -> io.Poll {
+    state := io.PollState.Ready
+    if progress.state == State.Pending {
+        state = io.PollState.Pending
+    }
+    if progress.state == State.Finished {
+        state = io.PollState.Eof
+    }
+    return io.Poll { transferred: progress.transferred, state: state }
+}

@@ -62,6 +62,7 @@ pub static CHIP: Chip = Chip {
         family: 0xE48B_FF56,
         drive_id: "RPI-RP2",
     },
+    pio_version: Some(0),
     // std/embedded/chip/rp_usb's DEFAULT_VENDOR_ID and DEFAULT_PRODUCT_ID.
     usb_serial: Some(UsbId {
         vendor: 0x2E8A,

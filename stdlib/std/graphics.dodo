@@ -1,0 +1,1604 @@
+package graphics
+
+import "core/bytes"
+import "core/mem"
+import "core/num"
+
+// CPU drawing into caller-owned pixel storage. No allocation, no operating
+// system, and no floating point: every target, firmware included, produces
+// identical pixels, which makes rendered images comparable byte for byte.
+//
+// A Canvas borrows its pixels; it never owns or grows them. Drawing calls
+// cannot fail: anything outside the canvas or its clip rectangle is skipped.
+// Only construction and presenting return Results.
+//
+// Coordinates are i32 pixels with the origin at the top-left corner and y
+// growing downward. Pixel (x, y) covers the unit square from (x, y) to
+// (x + 1, y + 1). Line and polygon vertices are clamped to +/-2^29 and ellipse
+// radii to 16383 so intermediate products fit in 64 bits; circles, rectangles
+// and text are exact for every i32/u32 input.
+
+pub enum Error {
+    // An argument is outside what the operation accepts, such as a stride
+    // shorter than one row or a dimension above MAX_DIMENSION.
+    InvalidInput,
+    // The pixel storage or output buffer is shorter than required.
+    BufferTooSmall,
+    // The pixel format, file variant or feature is not implemented.
+    Unsupported,
+    // A display or its bus failed while presenting.
+    Device
+}
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.InvalidInput => {
+            return "InvalidInput"
+        }
+        Error.BufferTooSmall => {
+            return "BufferTooSmall"
+        }
+        Error.Unsupported => {
+            return "Unsupported"
+        }
+        Error.Device => {
+            return "Device"
+        }
+    }
+}
+
+// Memory layout of one pixel.
+pub enum PixelFormat {
+    // Four bytes per pixel in the order red, green, blue, alpha.
+    Rgba8888,
+    // Four bytes per pixel in the order blue, green, red, alpha, the native
+    // 32-bit layout of Windows DIBs, macOS bitmaps and X11 on little-endian.
+    Bgra8888,
+    // Two bytes per pixel, 5 bits red, 6 green, 5 blue, high byte first: the
+    // order SPI panels such as the ST7789 and ILI9341 receive.
+    Rgb565,
+    // One luminance byte per pixel.
+    Gray8,
+    // One bit per pixel, eight pixels per byte with the leftmost in the most
+    // significant bit; each row starts on a byte boundary. A set bit is on
+    // (white).
+    Mono1
+}
+
+// The largest accepted width or height. Keeping both well inside i32 lets
+// every edge computation use plain checked integer arithmetic.
+pub const MAX_DIMENSION: u32 = 16777216
+
+const COORD_LIMIT: i64 = 536870912
+const ELLIPSE_LIMIT: u64 = 16383
+const POLYGON_CROSSINGS: usize = 64
+
+// Bits used by one pixel: 32, 16, 8 or 1.
+pub fn bits_per_pixel(format: PixelFormat) -> u32 {
+    return format_bits(&format) as u32
+}
+
+// Bytes in one tightly packed row, or the largest usize if it does not fit.
+pub fn min_stride(width: u32, format: PixelFormat) -> usize {
+    return row_bytes(width, &format)
+}
+
+// Bytes a tightly packed width x height canvas needs, or the largest usize if
+// the size does not fit in memory. Size static storage or an allocation with it.
+pub fn bytes_needed(width: u32, height: u32, format: PixelFormat) -> usize {
+    match num.checked_mul(row_bytes(width, &format), height as usize) {
+        ok(total) => {
+            return total
+        }
+        err(_) => {
+            return core.wrapping_sub(0usize, 1usize)
+        }
+    }
+}
+
+// A canvas over `pixels` with tightly packed rows; see Canvas.new.
+pub fn canvas(pixels: &mut[u8], width: u32, height: u32, format: PixelFormat) -> Canvas!Error from(pixels) {
+    return Canvas.new(pixels, width, height, format)
+}
+
+fn format_bits(format: &PixelFormat) -> usize {
+    match format {
+        PixelFormat.Rgba8888 => {
+            return 32
+        }
+        PixelFormat.Bgra8888 => {
+            return 32
+        }
+        PixelFormat.Rgb565 => {
+            return 16
+        }
+        PixelFormat.Gray8 => {
+            return 8
+        }
+        PixelFormat.Mono1 => {
+            return 1
+        }
+    }
+}
+
+fn row_bytes(width: u32, format: &PixelFormat) -> usize {
+    bits := format_bits(format)
+    if bits == 1 {
+        return (width as usize + 7) / 8
+    }
+    return num.saturating_mul(width as usize, bits / 8)
+}
+
+// ---------------------------------------------------------------------------
+// Colors
+
+// A color as 0xAARRGGBB: alpha in the top byte, then red, green and blue.
+// Colors are plain integers so they copy freely into every drawing call.
+pub type Color = u32
+
+pub const TRANSPARENT: Color = 0x00000000
+pub const BLACK: Color = 0xff000000
+pub const WHITE: Color = 0xffffffff
+pub const RED: Color = 0xffff0000
+pub const GREEN: Color = 0xff00ff00
+pub const BLUE: Color = 0xff0000ff
+pub const YELLOW: Color = 0xffffff00
+pub const CYAN: Color = 0xff00ffff
+pub const MAGENTA: Color = 0xffff00ff
+pub const GRAY: Color = 0xff808080
+pub const DARK_GRAY: Color = 0xff404040
+pub const LIGHT_GRAY: Color = 0xffc0c0c0
+
+// An opaque color from its channels.
+pub fn rgb(red: u8, green: u8, blue: u8) -> Color {
+    return rgba(red, green, blue, 255)
+}
+
+// A color with an explicit alpha; 0 is fully transparent, 255 opaque.
+pub fn rgba(red: u8, green: u8, blue: u8, alpha: u8) -> Color {
+    return ((alpha as u32) << 24) | ((red as u32) << 16) | ((green as u32) << 8) | (blue as u32)
+}
+
+// An opaque color from 0xRRGGBB, as written in CSS. Bits above the low 24
+// are ignored.
+pub fn hex(value: u32) -> Color {
+    return 0xff000000 | (value & 0x00ffffff)
+}
+
+pub fn red(color: Color) -> u8 {
+    return ((color >> 16) & 255) as u8
+}
+
+pub fn green(color: Color) -> u8 {
+    return ((color >> 8) & 255) as u8
+}
+
+pub fn blue(color: Color) -> u8 {
+    return (color & 255) as u8
+}
+
+pub fn alpha(color: Color) -> u8 {
+    return (color >> 24) as u8
+}
+
+// The same color with its alpha replaced.
+pub fn with_alpha(color: Color, alpha: u8) -> Color {
+    return (color & 0x00ffffff) | ((alpha as u32) << 24)
+}
+
+// Perceived brightness, 0 to 255, using integer BT.601 weights. Gray8 and
+// Mono1 canvases store this value (Mono1 lights pixels from 128 up).
+pub fn luma(color: Color) -> u8 {
+    value := 77 * ((color >> 16) & 255) + 150 * ((color >> 8) & 255) + 29 * (color & 255)
+    return ((value + 128) >> 8) as u8
+}
+
+// `top` composited over `bottom` (source-over). Both are straight, not
+// premultiplied, colors.
+pub fn over(top: Color, bottom: Color) -> Color {
+    a := top >> 24
+    if a == 255 {
+        return top
+    }
+    if a == 0 {
+        return bottom
+    }
+    inverse := 255 - a
+    bottom_alpha := bottom >> 24
+    // out_alpha * 255 = a * 255 + bottom_alpha * (255 - a)
+    out_alpha := a * 255 + bottom_alpha * inverse
+    if out_alpha == 0 {
+        return TRANSPARENT
+    }
+    r := mix_channel((top >> 16) & 255, (bottom >> 16) & 255, a, bottom_alpha * inverse, out_alpha)
+    g := mix_channel((top >> 8) & 255, (bottom >> 8) & 255, a, bottom_alpha * inverse, out_alpha)
+    b := mix_channel(top & 255, bottom & 255, a, bottom_alpha * inverse, out_alpha)
+    return (div255(out_alpha) << 24) | (r << 16) | (g << 8) | b
+}
+
+// (top * a * 255 + bottom * weight) / out_alpha, rounded.
+fn mix_channel(top: u32, bottom: u32, a: u32, weight: u32, out_alpha: u32) -> u32 {
+    value := (top * a * 255 + bottom * weight) as u64
+    return ((value + (out_alpha as u64) / 2) / (out_alpha as u64)) as u32
+}
+
+// Round value / 255 for value <= 255 * 255.
+fn div255(value: u32) -> u32 {
+    biased := value + 128
+    return (biased + (biased >> 8)) >> 8
+}
+
+// The bytes `color` occupies in `format`, packed with the first memory byte
+// in the low bits. Mono1 yields 0 or 1.
+fn encode(format: &PixelFormat, color: Color) -> u32 {
+    r := (color >> 16) & 255
+    g := (color >> 8) & 255
+    b := color & 255
+    a := color >> 24
+    match format {
+        PixelFormat.Rgba8888 => {
+            return r | (g << 8) | (b << 16) | (a << 24)
+        }
+        PixelFormat.Bgra8888 => {
+            return b | (g << 8) | (r << 16) | (a << 24)
+        }
+        PixelFormat.Rgb565 => {
+            value := ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+            return (value >> 8) | ((value & 255) << 8)
+        }
+        PixelFormat.Gray8 => {
+            return luma(color) as u32
+        }
+        PixelFormat.Mono1 => {
+            if luma(color) >= 128 {
+                return 1
+            }
+            return 0
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geometry
+
+pub struct Point {
+    pub x: i32
+    pub y: i32
+
+    pub fn new(x: i32, y: i32) -> Point {
+        return Point { x: x, y: y }
+    }
+    pub fn clone(&self) -> Point {
+        return Point { x: self.x, y: self.y }
+    }
+    pub fn equals(&self, other: &Point) -> bool {
+        return self.x == other.x && self.y == other.y
+    }
+}
+
+pub struct Size {
+    pub width: u32
+    pub height: u32
+
+    pub fn new(width: u32, height: u32) -> Size {
+        return Size { width: width, height: height }
+    }
+    pub fn clone(&self) -> Size {
+        return Size { width: self.width, height: self.height }
+    }
+    pub fn equals(&self, other: &Size) -> bool {
+        return self.width == other.width && self.height == other.height
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.width == 0 || self.height == 0
+    }
+}
+
+// An axis-aligned rectangle covering columns x..x+width and rows y..y+height,
+// end exclusive. A rectangle with zero width or height is empty.
+pub struct Rect {
+    pub x: i32
+    pub y: i32
+    pub width: u32
+    pub height: u32
+
+    pub fn new(x: i32, y: i32, width: u32, height: u32) -> Rect {
+        return Rect { x: x, y: y, width: width, height: height }
+    }
+    pub fn empty() -> Rect {
+        return Rect { x: 0, y: 0, width: 0, height: 0 }
+    }
+    pub fn clone(&self) -> Rect {
+        return Rect { x: self.x, y: self.y, width: self.width, height: self.height }
+    }
+    // Field-wise equality; two differently placed empty rectangles differ.
+    pub fn equals(&self, other: &Rect) -> bool {
+        return self.x == other.x && self.y == other.y && self.width == other.width && self.height == other.height
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.width == 0 || self.height == 0
+    }
+    pub fn size(&self) -> Size {
+        return Size { width: self.width, height: self.height }
+    }
+    // One past the last column, which may exceed the i32 range.
+    pub fn right(&self) -> i64 {
+        return self.x as i64 + self.width as i64
+    }
+    // One past the last row, which may exceed the i32 range.
+    pub fn bottom(&self) -> i64 {
+        return self.y as i64 + self.height as i64
+    }
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        return x >= self.x && (x as i64) < self.right() && y >= self.y && (y as i64) < self.bottom()
+    }
+    // The overlap of both rectangles, or Rect.empty() if they do not overlap.
+    pub fn intersect(&self, other: &Rect) -> Rect {
+        return edges_rect(max64(self.x as i64, other.x as i64), max64(self.y as i64, other.y as i64), min64(self.right(), other.right()), min64(self.bottom(), other.bottom()))
+    }
+    // The smallest rectangle containing both. An empty operand is ignored;
+    // a result wider than u32 saturates.
+    pub fn union(&self, other: &Rect) -> Rect {
+        if self.is_empty() {
+            return other.clone()
+        }
+        if other.is_empty() {
+            return self.clone()
+        }
+        return edges_rect(min64(self.x as i64, other.x as i64), min64(self.y as i64, other.y as i64), max64(self.right(), other.right()), max64(self.bottom(), other.bottom()))
+    }
+    // The same rectangle moved by (dx, dy), saturating at the i32 range.
+    pub fn offset(&self, dx: i32, dy: i32) -> Rect {
+        x := clamp64(self.x as i64 + dx as i64, -2147483648, 2147483647) as i32
+        y := clamp64(self.y as i64 + dy as i64, -2147483648, 2147483647) as i32
+        return Rect { x: x, y: y, width: self.width, height: self.height }
+    }
+}
+
+// A rectangle from edges, empty when they cross, saturating to i32/u32.
+fn edges_rect(left: i64, top: i64, right: i64, bottom: i64) -> Rect {
+    if left >= right || top >= bottom {
+        return Rect.empty()
+    }
+    x := clamp64(left, -2147483648, 2147483647)
+    y := clamp64(top, -2147483648, 2147483647)
+    width := min64(right - x, 4294967295)
+    height := min64(bottom - y, 4294967295)
+    return Rect { x: x as i32, y: y as i32, width: width as u32, height: height as u32 }
+}
+
+fn min64(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max64(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn clamp64(value: i64, low: i64, high: i64) -> i64 {
+    if value < low {
+        return low
+    }
+    if value > high {
+        return high
+    }
+    return value
+}
+
+fn abs64(value: i64) -> i64 {
+    if value < 0 {
+        return -value
+    }
+    return value
+}
+
+fn coordinate(value: i32) -> i64 {
+    return clamp64(value as i64, -COORD_LIMIT, COORD_LIMIT)
+}
+
+// floor(sqrt(value)), bit by bit.
+fn isqrt(value: u64) -> u64 {
+    if value < 2 {
+        return value
+    }
+    bit := 1u64 << 62
+    for bit > value {
+        bit = bit >> 2
+    }
+    remainder := value
+    root := 0u64
+    for bit != 0 {
+        if remainder >= root + bit {
+            remainder -= root + bit
+            root = (root >> 1) + bit
+        } else {
+            root = root >> 1
+        }
+        bit = bit >> 2
+    }
+    return root
+}
+
+// Floor and ceiling division by a positive divisor.
+fn floor_div(value: i64, divisor: i64) -> i64 {
+    if value >= 0 {
+        return value / divisor
+    }
+    return -((-value + divisor - 1) / divisor)
+}
+
+fn ceil_div(value: i64, divisor: i64) -> i64 {
+    return -floor_div(-value, divisor)
+}
+
+// Half the width of row `dy` of a disk of radius r centred on a pixel: the
+// largest w with w^2 + dy^2 <= r^2 + r, that is, the pixel centres within
+// r + 1/2. Requires dy <= r.
+fn circle_half(radius: u64, dy: u64) -> i64 {
+    return isqrt(radius * radius + radius - dy * dy) as i64
+}
+
+// The same for an ellipse with radii rx, ry (both <= ELLIPSE_LIMIT): the
+// largest w with (w / (rx + 1/2))^2 + (dy / (ry + 1/2))^2 <= 1. Requires dy <= ry.
+fn ellipse_half(rx: u64, ry: u64, dy: u64) -> i64 {
+    a := (2 * rx + 1) * (2 * rx + 1)
+    b := (2 * ry + 1) * (2 * ry + 1)
+    return isqrt(a * (b - 4 * dy * dy) / (4 * b)) as i64
+}
+
+// The first pixel column right of where the edge from vertex `edge` to the
+// next crosses the centre of `row`, or none if the edge does not span that
+// row. Horizontal edges never cross. `coordinates` holds x, y pairs.
+fn crossing(coordinates: &[i32], edge: usize, row: i64) -> Option<i64> {
+    next := (edge + 1) % (coordinates.len / 2)
+    ax := coordinate(coordinates[2 * edge])
+    ay := coordinate(coordinates[2 * edge + 1])
+    bx := coordinate(coordinates[2 * next])
+    by := coordinate(coordinates[2 * next + 1])
+    if ay == by {
+        return none
+    }
+    if ay > by {
+        swap_x := ax
+        ax = bx
+        bx = swap_x
+        swap_y := ay
+        ay = by
+        by = swap_y
+    }
+    if row < ay || row >= by {
+        return none
+    }
+    dy := by - ay
+    t := 2 * (row - ay) + 1
+    // Pixel px is inside from this edge when px + 1/2 >= the crossing.
+    return some(ceil_div(2 * ax * dy + t * (bx - ax) - dy, 2 * dy))
+}
+
+// ---------------------------------------------------------------------------
+// Fonts
+
+// A fixed-width bitmap font. Glyphs are stored for consecutive code points
+// starting at `first`, each `glyph_height` rows of ceil(glyph_width / 8)
+// bytes, leftmost pixel in the most significant bit. The cell includes any
+// spacing, so text advances by exactly glyph_width * scale per character.
+// Characters outside the font draw as an outlined replacement box.
+pub struct Font {
+    glyph_width: u32
+    glyph_height: u32
+    first: u32
+    count: u32
+    scale: u32
+    bitmap: &[u8]
+
+    // Fails with InvalidInput for a zero or above-256 glyph dimension or a
+    // zero count, and BufferTooSmall when `bitmap` is shorter than
+    // count * glyph_height * ceil(glyph_width / 8) bytes.
+    pub fn new(glyph_width: u32, glyph_height: u32, first: u32, count: u32, bitmap: &[u8]) -> Font!Error from(bitmap) {
+        if glyph_width == 0 || glyph_height == 0 || glyph_width > 256 || glyph_height > 256 || count == 0 {
+            return err(Error.InvalidInput)
+        }
+        per_glyph := ((glyph_width as usize + 7) / 8) * glyph_height as usize
+        match num.checked_mul(per_glyph, count as usize) {
+            ok(total) => {
+                if bitmap.len < total {
+                    return err(Error.BufferTooSmall)
+                }
+            }
+            err(_) => {
+                return err(Error.BufferTooSmall)
+            }
+        }
+        return ok(Font { glyph_width: glyph_width, glyph_height: glyph_height, first: first, count: count, scale: 1, bitmap: bitmap })
+    }
+    // The same font drawn `factor` times larger in both directions. Factors
+    // are limited to 1 through 64; 0 is treated as 1.
+    pub fn scaled(self, factor: u32) -> Font {
+        scale := factor
+        if scale == 0 {
+            scale = 1
+        }
+        if scale > 64 {
+            scale = 64
+        }
+        return Font { glyph_width: self.glyph_width, glyph_height: self.glyph_height, first: self.first, count: self.count, scale: scale, bitmap: self.bitmap }
+    }
+    pub fn scale(&self) -> u32 {
+        return self.scale
+    }
+    // Horizontal distance between characters, in canvas pixels.
+    pub fn advance(&self) -> u32 {
+        return self.glyph_width * self.scale
+    }
+    // Vertical distance between lines, in canvas pixels.
+    pub fn line_height(&self) -> u32 {
+        return self.glyph_height * self.scale
+    }
+    pub fn has_glyph(&self, code_point: u32) -> bool {
+        return code_point >= self.first && code_point - self.first < self.count
+    }
+    // The size `text` covers: the longest line times the advance, and the
+    // line count times the line height. "\n" starts a line; "\r" is ignored.
+    pub fn measure(&self, text: &str) -> Size {
+        data := mem.str_bytes(text)
+        columns := 0u64
+        widest := 0u64
+        lines := 0u64
+        if data.len > 0 {
+            lines = 1
+        }
+        index := 0usize
+        for index < data.len {
+            code := decode_utf8(data, index)
+            index += utf8_length(data[index])
+            if code == 10 {
+                lines += 1
+                columns = 0
+            } else if code != 13 {
+                columns += 1
+                if columns > widest {
+                    widest = columns
+                }
+            }
+        }
+        width := widest * self.advance() as u64
+        height := lines * self.line_height() as u64
+        return Size { width: min64(width as i64, 4294967295) as u32, height: min64(height as i64, 4294967295) as u32 }
+    }
+}
+
+// Length of the UTF-8 sequence starting with `lead`, in bytes.
+fn utf8_length(lead: u8) -> usize {
+    if lead < 0x80 {
+        return 1
+    }
+    if lead < 0xe0 {
+        return 2
+    }
+    if lead < 0xf0 {
+        return 3
+    }
+    return 4
+}
+
+// The scalar at `index` of valid UTF-8 (a &str's bytes).
+fn decode_utf8(data: &[u8], index: usize) -> u32 {
+    lead := data[index] as u32
+    if lead < 0x80 {
+        return lead
+    }
+    if lead < 0xe0 {
+        return ((lead & 0x1f) << 6) | (data[index + 1] as u32 & 0x3f)
+    }
+    if lead < 0xf0 {
+        return ((lead & 0x0f) << 12) | ((data[index + 1] as u32 & 0x3f) << 6) | (data[index + 2] as u32 & 0x3f)
+    }
+    return ((lead & 0x07) << 18) | ((data[index + 1] as u32 & 0x3f) << 12) | ((data[index + 2] as u32 & 0x3f) << 6) | (data[index + 3] as u32 & 0x3f)
+}
+
+// ---------------------------------------------------------------------------
+// Canvas
+
+// A drawing surface over borrowed pixel storage. Row y starts at byte
+// y * stride. Every drawing call is limited to the clip rectangle, which
+// starts as the whole canvas, and grows the dirty rectangle to cover the
+// pixels it wrote. Displays present only the dirty part; take_dirty() reads
+// and resets it.
+pub struct Canvas {
+    pixels: &mut[u8]
+    width: u32
+    height: u32
+    stride: usize
+    format: PixelFormat
+    bytes_per_pixel: usize
+    clip_left: i64
+    clip_top: i64
+    clip_right: i64
+    clip_bottom: i64
+    dirty_left: i64
+    dirty_top: i64
+    dirty_right: i64
+    dirty_bottom: i64
+
+    // A canvas with tightly packed rows. Fails with InvalidInput when a
+    // dimension exceeds MAX_DIMENSION and BufferTooSmall when `pixels` is
+    // shorter than bytes_needed(width, height, format). Extra bytes are unused.
+    // The pixels keep their contents and the dirty rectangle starts empty.
+    pub fn new(pixels: &mut[u8], width: u32, height: u32, format: PixelFormat) -> Canvas!Error from(pixels) {
+        stride := row_bytes(width, &format)
+        return Canvas.with_stride(pixels, width, height, stride, format)
+    }
+    // A canvas whose rows are `stride` bytes apart, for storage with padded
+    // rows such as a window system's shared buffer. The stride must be at
+    // least min_stride(width, format); `pixels` must hold stride * height bytes.
+    pub fn with_stride(pixels: &mut[u8], width: u32, height: u32, stride: usize, format: PixelFormat) -> Canvas!Error from(pixels) {
+        if width > MAX_DIMENSION || height > MAX_DIMENSION || stride < row_bytes(width, &format) {
+            return err(Error.InvalidInput)
+        }
+        match num.checked_mul(stride, height as usize) {
+            ok(total) => {
+                if pixels.len < total {
+                    return err(Error.BufferTooSmall)
+                }
+            }
+            err(_) => {
+                return err(Error.BufferTooSmall)
+            }
+        }
+        bytes_per_pixel := format_bits(&format) / 8
+        return ok(Canvas { pixels: pixels, width: width, height: height, stride: stride, format: format, bytes_per_pixel: bytes_per_pixel, clip_left: 0, clip_top: 0, clip_right: width as i64, clip_bottom: height as i64, dirty_left: 0, dirty_top: 0, dirty_right: 0, dirty_bottom: 0 })
+    }
+
+    pub fn width(&self) -> u32 {
+        return self.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.height
+    }
+    pub fn size(&self) -> Size {
+        return Size { width: self.width, height: self.height }
+    }
+    // The whole canvas as a rectangle at the origin.
+    pub fn bounds(&self) -> Rect {
+        return Rect { x: 0, y: 0, width: self.width, height: self.height }
+    }
+    pub fn format(&self) -> PixelFormat {
+        match &self.format {
+            PixelFormat.Rgba8888 => {
+                return PixelFormat.Rgba8888
+            }
+            PixelFormat.Bgra8888 => {
+                return PixelFormat.Bgra8888
+            }
+            PixelFormat.Rgb565 => {
+                return PixelFormat.Rgb565
+            }
+            PixelFormat.Gray8 => {
+                return PixelFormat.Gray8
+            }
+            PixelFormat.Mono1 => {
+                return PixelFormat.Mono1
+            }
+        }
+    }
+    // Bytes from the start of one row to the next.
+    pub fn stride(&self) -> usize {
+        return self.stride
+    }
+    // The canvas bytes, stride * height of them, for presenting or encoding.
+    pub fn pixels(&self) -> &[u8] from(self) {
+        return &self.pixels[..self.stride * self.height as usize]
+    }
+    // The bytes of row y, exactly min_stride(width, format) long.
+    // Panics when y >= height.
+    pub fn row(&self, y: u32) -> &[u8] from(self) {
+        start := y as usize * self.stride
+        return &self.pixels[start..start + row_bytes(self.width, &self.format)]
+    }
+
+    // -- Clipping ----------------------------------------------------------
+
+    pub fn clip(&self) -> Rect {
+        return edges_rect(self.clip_left, self.clip_top, self.clip_right, self.clip_bottom)
+    }
+    // Limit drawing to `rect`, intersected with the canvas.
+    pub fn set_clip(&mut self, rect: Rect) {
+        self.clip_left = clamp64(rect.x as i64, 0, self.width as i64)
+        self.clip_top = clamp64(rect.y as i64, 0, self.height as i64)
+        self.clip_right = clamp64(rect.right(), 0, self.width as i64)
+        self.clip_bottom = clamp64(rect.bottom(), 0, self.height as i64)
+        if self.clip_right < self.clip_left {
+            self.clip_right = self.clip_left
+        }
+        if self.clip_bottom < self.clip_top {
+            self.clip_bottom = self.clip_top
+        }
+    }
+    pub fn reset_clip(&mut self) {
+        self.clip_left = 0
+        self.clip_top = 0
+        self.clip_right = self.width as i64
+        self.clip_bottom = self.height as i64
+    }
+
+    // -- Dirty tracking ----------------------------------------------------
+
+    // The smallest rectangle covering every pixel drawn since the last
+    // take_dirty(), or an empty rectangle.
+    pub fn dirty(&self) -> Rect {
+        return edges_rect(self.dirty_left, self.dirty_top, self.dirty_right, self.dirty_bottom)
+    }
+    // Return the dirty rectangle and reset it to empty.
+    pub fn take_dirty(&mut self) -> Rect {
+        result := self.dirty()
+        self.dirty_left = 0
+        self.dirty_top = 0
+        self.dirty_right = 0
+        self.dirty_bottom = 0
+        return result
+    }
+    // Add `rect`, limited to the canvas, to the dirty rectangle: for pixels
+    // changed through other means, or to retry a failed present.
+    pub fn mark_dirty(&mut self, rect: Rect) {
+        width := self.width as i64
+        height := self.height as i64
+        self.touch(clamp64(rect.x as i64, 0, width), clamp64(rect.y as i64, 0, height), clamp64(rect.right(), 0, width), clamp64(rect.bottom(), 0, height))
+    }
+    // Mark the whole canvas dirty.
+    pub fn mark_all_dirty(&mut self) {
+        width := self.width as i64
+        height := self.height as i64
+        self.touch(0, 0, width, height)
+    }
+    fn touch(&mut self, left: i64, top: i64, right: i64, bottom: i64) {
+        if left >= right || top >= bottom {
+            return
+        }
+        if self.dirty_left >= self.dirty_right {
+            self.dirty_left = left
+            self.dirty_top = top
+            self.dirty_right = right
+            self.dirty_bottom = bottom
+            return
+        }
+        if left < self.dirty_left {
+            self.dirty_left = left
+        }
+        if top < self.dirty_top {
+            self.dirty_top = top
+        }
+        if right > self.dirty_right {
+            self.dirty_right = right
+        }
+        if bottom > self.dirty_bottom {
+            self.dirty_bottom = bottom
+        }
+    }
+
+    // -- Pixel access ------------------------------------------------------
+
+    // The color at (x, y), or none outside the canvas. Formats without alpha
+    // read as opaque; Rgb565 channels are widened by repeating their high bits.
+    pub fn color_at(&self, x: i32, y: i32) -> Option<Color> {
+        if x < 0 || y < 0 || x as i64 >= self.width as i64 || y as i64 >= self.height as i64 {
+            return none
+        }
+        return some(self.read(x as usize, y as usize))
+    }
+    fn read(&self, x: usize, y: usize) -> Color {
+        row := y * self.stride
+        match &self.format {
+            PixelFormat.Rgba8888 => {
+                i := row + x * 4
+                return rgba(self.pixels[i], self.pixels[i + 1], self.pixels[i + 2], self.pixels[i + 3])
+            }
+            PixelFormat.Bgra8888 => {
+                i := row + x * 4
+                return rgba(self.pixels[i + 2], self.pixels[i + 1], self.pixels[i], self.pixels[i + 3])
+            }
+            PixelFormat.Rgb565 => {
+                i := row + x * 2
+                value := ((self.pixels[i] as u32) << 8) | (self.pixels[i + 1] as u32)
+                r := value >> 11
+                g := (value >> 5) & 63
+                b := value & 31
+                return 0xff000000 | (((r << 3) | (r >> 2)) << 16) | (((g << 2) | (g >> 4)) << 8) | ((b << 3) | (b >> 2))
+            }
+            PixelFormat.Gray8 => {
+                v := self.pixels[row + x] as u32
+                return 0xff000000 | (v << 16) | (v << 8) | v
+            }
+            PixelFormat.Mono1 => {
+                if (self.pixels[row + x / 8] & (0x80u8 >> ((x % 8) as u8))) != 0 {
+                    return WHITE
+                }
+                return BLACK
+            }
+        }
+    }
+    // Store already encoded bytes for one in-bounds pixel.
+    fn write(&mut self, x: usize, y: usize, packed: u32) {
+        i := y * self.stride + x * self.bytes_per_pixel
+        if self.bytes_per_pixel == 4 {
+            self.pixels[i] = (packed & 255) as u8
+            self.pixels[i + 1] = ((packed >> 8) & 255) as u8
+            self.pixels[i + 2] = ((packed >> 16) & 255) as u8
+            self.pixels[i + 3] = (packed >> 24) as u8
+        } else if self.bytes_per_pixel == 2 {
+            self.pixels[i] = (packed & 255) as u8
+            self.pixels[i + 1] = (packed >> 8) as u8
+        } else if self.bytes_per_pixel == 1 {
+            self.pixels[i] = packed as u8
+        } else {
+            index := y * self.stride + x / 8
+            mask := 0x80u8 >> ((x % 8) as u8)
+            if packed != 0 {
+                self.pixels[index] = self.pixels[index] | mask
+            } else {
+                self.pixels[index] = self.pixels[index] & (255 - mask)
+            }
+        }
+    }
+    // Fill columns left..right of `row`, all inside the canvas.
+    fn run(&mut self, left: usize, right: usize, row: usize, packed: u32) {
+        start := row * self.stride
+        if self.bytes_per_pixel == 4 {
+            b0 := (packed & 255) as u8
+            b1 := ((packed >> 8) & 255) as u8
+            b2 := ((packed >> 16) & 255) as u8
+            b3 := (packed >> 24) as u8
+            i := start + left * 4
+            for _ in left..right {
+                self.pixels[i] = b0
+                self.pixels[i + 1] = b1
+                self.pixels[i + 2] = b2
+                self.pixels[i + 3] = b3
+                i += 4
+            }
+        } else if self.bytes_per_pixel == 2 {
+            b0 := (packed & 255) as u8
+            b1 := (packed >> 8) as u8
+            i := start + left * 2
+            for _ in left..right {
+                self.pixels[i] = b0
+                self.pixels[i + 1] = b1
+                i += 2
+            }
+        } else if self.bytes_per_pixel == 1 {
+            bytes.fill(&mut self.pixels[start + left..start + right], packed as u8)
+        } else {
+            x := left
+            for x < right && x % 8 != 0 {
+                self.write(x, row, packed)
+                x += 1
+            }
+            full := 0u8
+            if packed != 0 {
+                full = 255
+            }
+            for x + 8 <= right {
+                self.pixels[start + x / 8] = full
+                x += 8
+            }
+            for x < right {
+                self.write(x, row, packed)
+                x += 1
+            }
+        }
+    }
+    // Fill columns left..right of `row`, clipped, and mark them dirty.
+    fn hline(&mut self, left: i64, right: i64, row: i64, packed: u32) {
+        if row < self.clip_top || row >= self.clip_bottom {
+            return
+        }
+        l := max64(left, self.clip_left)
+        r := min64(right, self.clip_right)
+        if l >= r {
+            return
+        }
+        self.run(l as usize, r as usize, row as usize, packed)
+        self.touch(l, row, r, row + 1)
+    }
+    // Set one pixel, clipped, and mark it dirty.
+    fn dot(&mut self, x: i64, y: i64, packed: u32) {
+        if x < self.clip_left || x >= self.clip_right || y < self.clip_top || y >= self.clip_bottom {
+            return
+        }
+        self.write(x as usize, y as usize, packed)
+        self.touch(x, y, x + 1, y + 1)
+    }
+    // Fill an edge-bounded area, clipped.
+    fn block(&mut self, left: i64, top: i64, right: i64, bottom: i64, packed: u32) {
+        t := max64(top, self.clip_top)
+        b := min64(bottom, self.clip_bottom)
+        l := max64(left, self.clip_left)
+        r := min64(right, self.clip_right)
+        if l >= r || t >= b {
+            return
+        }
+        for row in t..b {
+            self.run(l as usize, r as usize, row as usize, packed)
+        }
+        self.touch(l, t, r, b)
+    }
+    // Draw the part of the outer span outer_left..=outer_right not covered
+    // by the inner span, keeping at least one pixel on each side.
+    // `inner_left > inner_right` means no inner span on this row.
+    fn ring_row(&mut self, row: i64, outer_left: i64, outer_right: i64, inner_left: i64, inner_right: i64, packed: u32) {
+        if inner_left > inner_right {
+            self.hline(outer_left, outer_right + 1, row, packed)
+            return
+        }
+        self.hline(outer_left, max64(inner_left, outer_left + 1), row, packed)
+        self.hline(min64(inner_right + 1, outer_right), outer_right + 1, row, packed)
+    }
+
+    // -- Drawing -----------------------------------------------------------
+
+    // Fill the clip rectangle (the whole canvas unless set_clip was called).
+    pub fn clear(&mut self, color: Color) {
+        packed := encode(&self.format, color)
+        left := self.clip_left
+        top := self.clip_top
+        right := self.clip_right
+        bottom := self.clip_bottom
+        self.block(left, top, right, bottom, packed)
+    }
+    // Set one pixel. Colors are stored, not blended; see blend_rect.
+    pub fn pixel(&mut self, x: i32, y: i32, color: Color) {
+        packed := encode(&self.format, color)
+        self.dot(x as i64, y as i64, packed)
+    }
+    // A one pixel wide line including both end points. Pixel rows (or
+    // columns, for steep lines) follow the exact line, rounding half up.
+    pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
+        packed := encode(&self.format, color)
+        self.segment(coordinate(x0), coordinate(y0), coordinate(x1), coordinate(y1), packed)
+    }
+    fn segment(&mut self, ax: i64, ay: i64, bx: i64, by: i64, packed: u32) {
+        dx := bx - ax
+        dy := by - ay
+        if dx == 0 && dy == 0 {
+            self.dot(ax, ay, packed)
+            return
+        }
+        if dx == 0 {
+            self.block(ax, min64(ay, by), ax + 1, max64(ay, by) + 1, packed)
+            return
+        }
+        if dy == 0 {
+            self.hline(min64(ax, bx), max64(ax, bx) + 1, ay, packed)
+            return
+        }
+        steep := abs64(dy) > abs64(dx)
+        // Walk the major axis m; the minor axis n follows.
+        m0 := ax
+        n0 := ay
+        major := dx
+        minor := dy
+        m_low := self.clip_left
+        m_high := self.clip_right
+        n_low := self.clip_top
+        n_high := self.clip_bottom
+        if steep {
+            m0 = ay
+            n0 = ax
+            major = dy
+            minor = dx
+            m_low = self.clip_top
+            m_high = self.clip_bottom
+            n_low = self.clip_left
+            n_high = self.clip_right
+        }
+        length := abs64(major)
+        rise := abs64(minor)
+        m_step := 1i64
+        if major < 0 {
+            m_step = -1
+        }
+        n_step := 1i64
+        if minor < 0 {
+            n_step = -1
+        }
+        // Steps k with m0 + m_step * k inside the clip on the major axis.
+        first := 0i64
+        last := length
+        if m_step > 0 {
+            first = max64(first, m_low - m0)
+            last = min64(last, m_high - 1 - m0)
+        } else {
+            first = max64(first, m0 - (m_high - 1))
+            last = min64(last, m0 - m_low)
+        }
+        if first > last {
+            return
+        }
+        // n(k) = n0 + n_step * floor((2 * rise * k + length) / (2 * length))
+        span := 2 * length
+        numerator := 2 * rise * first + length
+        quotient := numerator / span
+        remainder := numerator % span
+        for k in first..last + 1 {
+            n := n0 + n_step * quotient
+            if (n_step > 0 && n >= n_high) || (n_step < 0 && n < n_low) {
+                return
+            }
+            if n >= n_low && n < n_high {
+                m := m0 + m_step * k
+                if steep {
+                    self.write(n as usize, m as usize, packed)
+                    self.touch(n, m, n + 1, m + 1)
+                } else {
+                    self.write(m as usize, n as usize, packed)
+                    self.touch(m, n, m + 1, n + 1)
+                }
+            }
+            remainder += 2 * rise
+            if remainder >= span {
+                remainder -= span
+                quotient += 1
+            }
+        }
+    }
+    // The one pixel wide outline of a width x height rectangle.
+    pub fn rect(&mut self, x: i32, y: i32, width: u32, height: u32, color: Color) {
+        if width == 0 || height == 0 {
+            return
+        }
+        packed := encode(&self.format, color)
+        left := x as i64
+        top := y as i64
+        right := left + width as i64
+        bottom := top + height as i64
+        self.hline(left, right, top, packed)
+        if height > 1 {
+            self.hline(left, right, bottom - 1, packed)
+        }
+        self.block(left, top + 1, left + 1, bottom - 1, packed)
+        if width > 1 {
+            self.block(right - 1, top + 1, right, bottom - 1, packed)
+        }
+    }
+    pub fn fill_rect(&mut self, x: i32, y: i32, width: u32, height: u32, color: Color) {
+        packed := encode(&self.format, color)
+        self.block(x as i64, y as i64, x as i64 + width as i64, y as i64 + height as i64, packed)
+    }
+    // fill_rect for a Rect value, such as the bounds text() returned.
+    pub fn fill(&mut self, rect: Rect, color: Color) {
+        self.fill_rect(rect.x, rect.y, rect.width, rect.height, color)
+    }
+    // Composite `color` over the pixels of a rectangle using its alpha.
+    pub fn blend_rect(&mut self, x: i32, y: i32, width: u32, height: u32, color: Color) {
+        a := color >> 24
+        if a == 255 {
+            self.fill_rect(x, y, width, height, color)
+            return
+        }
+        if a == 0 {
+            return
+        }
+        t := max64(y as i64, self.clip_top)
+        b := min64(y as i64 + height as i64, self.clip_bottom)
+        l := max64(x as i64, self.clip_left)
+        r := min64(x as i64 + width as i64, self.clip_right)
+        if l >= r || t >= b {
+            return
+        }
+        for row in t..b {
+            for column in l..r {
+                below := self.read(column as usize, row as usize)
+                blended := encode(&self.format, over(color, below))
+                self.write(column as usize, row as usize, blended)
+            }
+        }
+        self.touch(l, t, r, b)
+    }
+    // A rectangle outline with corners rounded to `radius`, limited to half
+    // the shorter side.
+    pub fn round_rect(&mut self, x: i32, y: i32, width: u32, height: u32, radius: u32, color: Color) {
+        if width == 0 || height == 0 {
+            return
+        }
+        packed := encode(&self.format, color)
+        r := corner_radius(width, height, radius)
+        top := y as i64
+        bottom := top + height as i64
+        first := max64(top, self.clip_top)
+        last := min64(bottom, self.clip_bottom)
+        for row in first..last {
+            outer := corner_inset(row - top, height as i64, r)
+            ol := x as i64 + outer
+            or := x as i64 + width as i64 - 1 - outer
+            if width < 3 || height < 3 || row == top || row == bottom - 1 {
+                self.hline(ol, or + 1, row, packed)
+            } else {
+                inner_r := r
+                if inner_r > 0 {
+                    inner_r -= 1
+                }
+                inner := corner_inset(row - top - 1, height as i64 - 2, inner_r)
+                self.ring_row(row, ol, or, x as i64 + 1 + inner, x as i64 + width as i64 - 2 - inner, packed)
+            }
+        }
+    }
+    pub fn fill_round_rect(&mut self, x: i32, y: i32, width: u32, height: u32, radius: u32, color: Color) {
+        if width == 0 || height == 0 {
+            return
+        }
+        packed := encode(&self.format, color)
+        r := corner_radius(width, height, radius)
+        top := y as i64
+        first := max64(top, self.clip_top)
+        last := min64(top + height as i64, self.clip_bottom)
+        for row in first..last {
+            inset := corner_inset(row - top, height as i64, r)
+            self.hline(x as i64 + inset, x as i64 + width as i64 - inset, row, packed)
+        }
+    }
+    // A one pixel wide circle outline. Radius r spans 2r + 1 pixels centred
+    // on (cx, cy) and covers the pixel centres within r + 1/2 of it.
+    pub fn circle(&mut self, cx: i32, cy: i32, radius: u32, color: Color) {
+        packed := encode(&self.format, color)
+        r := radius as i64
+        x := cx as i64
+        y := cy as i64
+        first := max64(y - r, self.clip_top)
+        last := min64(y + r + 1, self.clip_bottom)
+        for row in first..last {
+            dy := abs64(row - y)
+            outer := circle_half(r as u64, dy as u64)
+            if dy < r {
+                inner := circle_half((r - 1) as u64, dy as u64)
+                self.ring_row(row, x - outer, x + outer, x - inner, x + inner, packed)
+            } else {
+                self.hline(x - outer, x + outer + 1, row, packed)
+            }
+        }
+    }
+    pub fn fill_circle(&mut self, cx: i32, cy: i32, radius: u32, color: Color) {
+        packed := encode(&self.format, color)
+        r := radius as i64
+        x := cx as i64
+        y := cy as i64
+        first := max64(y - r, self.clip_top)
+        last := min64(y + r + 1, self.clip_bottom)
+        for row in first..last {
+            half := circle_half(r as u64, abs64(row - y) as u64)
+            self.hline(x - half, x + half + 1, row, packed)
+        }
+    }
+    // An axis-aligned ellipse outline spanning 2rx + 1 by 2ry + 1 pixels.
+    // Radii above 16383 are clamped.
+    pub fn ellipse(&mut self, cx: i32, cy: i32, rx: u32, ry: u32, color: Color) {
+        if rx == ry {
+            self.circle(cx, cy, rx, color)
+            return
+        }
+        packed := encode(&self.format, color)
+        a := num.min(rx as usize, ELLIPSE_LIMIT as usize) as u64
+        b := num.min(ry as usize, ELLIPSE_LIMIT as usize) as u64
+        x := cx as i64
+        y := cy as i64
+        first := max64(y - b as i64, self.clip_top)
+        last := min64(y + b as i64 + 1, self.clip_bottom)
+        for row in first..last {
+            dy := abs64(row - y) as u64
+            outer := ellipse_half(a, b, dy)
+            if a > 0 && b > 0 && dy < b {
+                inner := ellipse_half(a - 1, b - 1, dy)
+                self.ring_row(row, x - outer, x + outer, x - inner, x + inner, packed)
+            } else {
+                self.hline(x - outer, x + outer + 1, row, packed)
+            }
+        }
+    }
+    pub fn fill_ellipse(&mut self, cx: i32, cy: i32, rx: u32, ry: u32, color: Color) {
+        if rx == ry {
+            self.fill_circle(cx, cy, rx, color)
+            return
+        }
+        packed := encode(&self.format, color)
+        a := num.min(rx as usize, ELLIPSE_LIMIT as usize) as u64
+        b := num.min(ry as usize, ELLIPSE_LIMIT as usize) as u64
+        x := cx as i64
+        y := cy as i64
+        first := max64(y - b as i64, self.clip_top)
+        last := min64(y + b as i64 + 1, self.clip_bottom)
+        for row in first..last {
+            half := ellipse_half(a, b, abs64(row - y) as u64)
+            self.hline(x - half, x + half + 1, row, packed)
+        }
+    }
+    // The closed outline through the vertices in `coordinates`, given as x, y
+    // pairs (x0, y0, x1, y1, ...): a line from each vertex to the next and
+    // from the last back to the first. A trailing unpaired value is ignored.
+    pub fn polygon(&mut self, coordinates: &[i32], color: Color) {
+        vertices := coordinates.len / 2
+        if vertices == 0 {
+            return
+        }
+        packed := encode(&self.format, color)
+        if vertices == 1 {
+            self.dot(coordinates[0] as i64, coordinates[1] as i64, packed)
+            return
+        }
+        for i in 0usize..vertices {
+            next := (i + 1) % vertices
+            self.segment(coordinate(coordinates[2 * i]), coordinate(coordinates[2 * i + 1]), coordinate(coordinates[2 * next]), coordinate(coordinates[2 * next + 1]), packed)
+            if vertices == 2 {
+                return
+            }
+        }
+    }
+    // Fill the inside of the polygon through `coordinates` (x, y pairs) by
+    // the even-odd rule: a pixel is filled when its centre is enclosed by an
+    // odd number of edges. Self-intersecting outlines and holes traced in
+    // either direction work. Needs at least three vertices.
+    pub fn fill_polygon(&mut self, coordinates: &[i32], color: Color) {
+        vertices := coordinates.len / 2
+        if vertices < 3 {
+            return
+        }
+        packed := encode(&self.format, color)
+        top := COORD_LIMIT
+        bottom := -COORD_LIMIT
+        for i in 0usize..vertices {
+            y := coordinate(coordinates[2 * i + 1])
+            top = min64(top, y)
+            bottom = max64(bottom, y)
+        }
+        first := max64(top, self.clip_top)
+        last := min64(bottom, self.clip_bottom)
+        keys := [0i64; POLYGON_CROSSINGS]
+        for row in first..last {
+            count := 0usize
+            overflow := false
+            for i in 0usize..vertices {
+                match crossing(coordinates, i, row) {
+                    some(key) => {
+                        if count < POLYGON_CROSSINGS {
+                            // Clamping keeps the order and fits the clip.
+                            keys[count] = clamp64(key, self.clip_left - 1, self.clip_right + 1)
+                            count += 1
+                        } else {
+                            overflow = true
+                        }
+                    }
+                    none => {}
+                }
+            }
+            if overflow {
+                self.polygon_row_unbuffered(coordinates, row, packed)
+            } else {
+                for i in 1usize..count {
+                    key := keys[i]
+                    j := i
+                    for j > 0 && keys[j - 1] > key {
+                        keys[j] = keys[j - 1]
+                        j -= 1
+                    }
+                    keys[j] = key
+                }
+                pair := 0usize
+                for pair + 1 < count {
+                    self.hline(keys[pair], keys[pair + 1], row, packed)
+                    pair += 2
+                }
+            }
+        }
+    }
+    // One row of fill_polygon with more crossings than its buffer: select
+    // crossings in (column, edge) order without storing them.
+    fn polygon_row_unbuffered(&mut self, coordinates: &[i32], row: i64, packed: u32) {
+        vertices := coordinates.len / 2
+        last_key := 0i64
+        last_edge := 0usize
+        started := false
+        inside := false
+        start := 0i64
+        for {
+            found := false
+            best_key := 0i64
+            best_edge := 0usize
+            for i in 0usize..vertices {
+                match crossing(coordinates, i, row) {
+                    some(key) => {
+                        after := !started || key > last_key || (key == last_key && i > last_edge)
+                        better := !found || key < best_key || (key == best_key && i < best_edge)
+                        if after && better {
+                            found = true
+                            best_key = key
+                            best_edge = i
+                        }
+                    }
+                    none => {}
+                }
+            }
+            if !found {
+                return
+            }
+            if inside {
+                self.hline(start, best_key, row, packed)
+            } else {
+                start = best_key
+            }
+            inside = !inside
+            started = true
+            last_key = best_key
+            last_edge = best_edge
+        }
+    }
+    // Copy all of `source` with its top-left corner at (x, y), converting
+    // the pixel format if needed. Alpha is copied, not blended.
+    pub fn blit(&mut self, source: &Canvas, x: i32, y: i32) {
+        self.blit_region(source, source.bounds(), x, y)
+    }
+    // Copy `region` of `source` with its top-left corner at (x, y).
+    pub fn blit_region(&mut self, source: &Canvas, region: Rect, x: i32, y: i32) {
+        self.copy_from(source, region, x, y, false)
+    }
+    // Composite all of `source` over this canvas at (x, y) using the source
+    // alpha (source-over). Sources without alpha are opaque, like blit.
+    pub fn blend(&mut self, source: &Canvas, x: i32, y: i32) {
+        self.blend_region(source, source.bounds(), x, y)
+    }
+    pub fn blend_region(&mut self, source: &Canvas, region: Rect, x: i32, y: i32) {
+        self.copy_from(source, region, x, y, true)
+    }
+    fn copy_from(&mut self, source: &Canvas, region: Rect, x: i32, y: i32, blend: bool) {
+        // Source rectangle limited to the source canvas.
+        sl := max64(region.x as i64, 0)
+        st := max64(region.y as i64, 0)
+        sr := min64(region.right(), source.width as i64)
+        sb := min64(region.bottom(), source.height as i64)
+        // Where the source's top-left lands, shifted by any trimmed margin.
+        dl := x as i64 + (sl - region.x as i64)
+        dt := y as i64 + (st - region.y as i64)
+        // Destination rectangle limited to the clip.
+        l := max64(dl, self.clip_left)
+        t := max64(dt, self.clip_top)
+        r := min64(dl + (sr - sl), self.clip_right)
+        b := min64(dt + (sb - st), self.clip_bottom)
+        if l >= r || t >= b {
+            return
+        }
+        // Byte copies work for equal whole-byte formats; Mono1 bits may be
+        // misaligned between the canvases.
+        same := self.bytes_per_pixel > 0 && same_format(&self.format, &source.format)
+        has_alpha := format_bits(&source.format) == 32
+        for row in t..b {
+            source_row := (row - dt + st) as usize
+            source_column := (l - dl + sl) as usize
+            if same && (!blend || !has_alpha) {
+                bpp := self.bytes_per_pixel
+                source_start := source_row * source.stride + source_column * bpp
+                to := row as usize * self.stride + l as usize * bpp
+                count := (r - l) as usize * bpp
+                for i in 0usize..count {
+                    self.pixels[to + i] = source.pixels[source_start + i]
+                }
+            } else {
+                for column in l..r {
+                    color := source.read(source_column + (column - l) as usize, source_row)
+                    if blend && has_alpha {
+                        a := color >> 24
+                        if a != 0 {
+                            if a != 255 {
+                                color = over(color, self.read(column as usize, row as usize))
+                            }
+                            converted := encode(&self.format, color)
+                            self.write(column as usize, row as usize, converted)
+                        }
+                    } else {
+                        converted := encode(&self.format, color)
+                        self.write(column as usize, row as usize, converted)
+                    }
+                }
+            }
+        }
+        self.touch(l, t, r, b)
+    }
+    // Draw `text` with its top-left corner at (x, y) and return the area its
+    // character cells cover, the same size font.measure(text) reports, even
+    // where clipping hid them. Only set glyph pixels are drawn; fill the
+    // returned bounds first for an opaque background. "\n" returns to x on
+    // the next line and "\r" is ignored.
+    pub fn text(&mut self, font: &Font, x: i32, y: i32, text: &str, color: Color) -> Rect {
+        packed := encode(&self.format, color)
+        data := mem.str_bytes(text)
+        advance := font.advance() as i64
+        line_height := font.line_height() as i64
+        pen_x := x as i64
+        pen_y := y as i64
+        index := 0usize
+        for index < data.len {
+            code := decode_utf8(data, index)
+            index += utf8_length(data[index])
+            if code == 10 {
+                pen_x = x as i64
+                pen_y += line_height
+            } else if code != 13 {
+                self.glyph(font, pen_x, pen_y, code, packed)
+                pen_x += advance
+            }
+        }
+        size := font.measure(text)
+        return Rect { x: x, y: y, width: size.width, height: size.height }
+    }
+    fn glyph(&mut self, font: &Font, x: i64, y: i64, code: u32, packed: u32) {
+        scale := font.scale as i64
+        width := font.glyph_width as i64
+        height := font.glyph_height as i64
+        if x >= self.clip_right || y >= self.clip_bottom || x + width * scale <= self.clip_left || y + height * scale <= self.clip_top {
+            return
+        }
+        if !font.has_glyph(code) {
+            // Replacement box: the outline of the cell minus its spacing.
+            box_width := max64(width - 1, 1) * scale
+            box_height := max64(height - 1, 1) * scale
+            self.block(x, y, x + box_width, y + scale, packed)
+            self.block(x, y + box_height - scale, x + box_width, y + box_height, packed)
+            self.block(x, y, x + scale, y + box_height, packed)
+            self.block(x + box_width - scale, y, x + box_width, y + box_height, packed)
+            return
+        }
+        row_bytes := (font.glyph_width as usize + 7) / 8
+        base := (code - font.first) as usize * row_bytes * font.glyph_height as usize
+        for gy in 0i64..height {
+            row := base + gy as usize * row_bytes
+            gx := 0i64
+            for gx < width {
+                if glyph_bit(font.bitmap, row, gx as usize) {
+                    start := gx
+                    for gx < width && glyph_bit(font.bitmap, row, gx as usize) {
+                        gx += 1
+                    }
+                    self.block(x + start * scale, y + gy * scale, x + gx * scale, y + (gy + 1) * scale, packed)
+                } else {
+                    gx += 1
+                }
+            }
+        }
+    }
+
+    // -- Comparison --------------------------------------------------------
+
+    // True when both canvases have the same size and every pixel decodes to
+    // the same color. Formats may differ; padding bytes are ignored.
+    pub fn equals(&self, other: &Canvas) -> bool {
+        if self.width != other.width || self.height != other.height {
+            return false
+        }
+        difference := self.diff_bounds(other)
+        return difference.is_empty()
+    }
+    // The smallest rectangle covering every pixel whose color differs, or
+    // an empty rectangle. Pixels present in only one canvas count as
+    // different.
+    pub fn diff_bounds(&self, other: &Canvas) -> Rect {
+        common_width := num.min(self.width as usize, other.width as usize)
+        common_height := num.min(self.height as usize, other.height as usize)
+        left := common_width as i64
+        top := common_height as i64
+        right := 0i64
+        bottom := 0i64
+        for y in 0usize..common_height {
+            for x in 0usize..common_width {
+                if self.read(x, y) != other.read(x, y) {
+                    left = min64(left, x as i64)
+                    top = min64(top, y as i64)
+                    right = max64(right, x as i64 + 1)
+                    bottom = max64(bottom, y as i64 + 1)
+                }
+            }
+        }
+        result := edges_rect(left, top, right, bottom)
+        if self.width != other.width || self.height != other.height {
+            outer := edges_rect(0, 0, max64(self.width as i64, other.width as i64), max64(self.height as i64, other.height as i64))
+            if self.width != other.width {
+                band := edges_rect(common_width as i64, 0, max64(self.width as i64, other.width as i64), outer.bottom())
+                result = result.union(&band)
+            }
+            if self.height != other.height {
+                band := edges_rect(0, common_height as i64, outer.right(), max64(self.height as i64, other.height as i64))
+                result = result.union(&band)
+            }
+        }
+        return result
+    }
+}
+
+fn same_format(a: &PixelFormat, b: &PixelFormat) -> bool {
+    match a {
+        PixelFormat.Rgba8888 => {
+            return *b == PixelFormat.Rgba8888
+        }
+        PixelFormat.Bgra8888 => {
+            return *b == PixelFormat.Bgra8888
+        }
+        PixelFormat.Rgb565 => {
+            return *b == PixelFormat.Rgb565
+        }
+        PixelFormat.Gray8 => {
+            return *b == PixelFormat.Gray8
+        }
+        PixelFormat.Mono1 => {
+            return *b == PixelFormat.Mono1
+        }
+    }
+}
+
+fn glyph_bit(bitmap: &[u8], row: usize, column: usize) -> bool {
+    return (bitmap[row + column / 8] & (0x80u8 >> ((column % 8) as u8))) != 0
+}
+
+// Radius limited so both corners of the shorter side fit.
+fn corner_radius(width: u32, height: u32, radius: u32) -> i64 {
+    limit := min64((width as i64 - 1) / 2, (height as i64 - 1) / 2)
+    return min64(radius as i64, limit)
+}
+
+// Columns cut from each side of row `t` (0 = top) of a rounded rectangle
+// `height` rows tall with corner radius r.
+fn corner_inset(t: i64, height: i64, radius: i64) -> i64 {
+    if radius <= 0 {
+        return 0
+    }
+    dy := 0i64
+    if t < radius {
+        dy = radius - t
+    } else if t >= height - radius {
+        dy = t - (height - 1 - radius)
+    }
+    if dy == 0 {
+        return 0
+    }
+    return radius - circle_half(radius as u64, dy as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Displays
+
+// Anything that can show a canvas: a window, an SPI or I2C panel, or the
+// in-memory std/graphics/fake display. Drawing code generic over Display runs
+// unchanged on all of them.
+pub interface Display {
+    // Pixel size the display expects canvases to have.
+    fn size(&self) -> Size
+    // The pixel format it reads most efficiently. Others may be converted.
+    fn format(&self) -> PixelFormat
+    // Show `dirty` (in canvas coordinates) from `canvas`. Pixels outside it
+    // may or may not be transferred.
+    fn present(&mut self, canvas: &Canvas, dirty: Rect) -> void!Error
+}
+
+// Present the canvas's dirty rectangle, if any, and reset it. On failure the
+// rectangle is marked dirty again so the next call retries it.
+pub fn present<D: Display>(display: &mut D, canvas: &mut Canvas) -> void!Error {
+    dirty := canvas.take_dirty()
+    if dirty.is_empty() {
+        return ok()
+    }
+    retry := dirty.clone()
+    match display.present(canvas, dirty) {
+        ok() => {
+            return ok()
+        }
+        err(error) => {
+            canvas.mark_dirty(retry)
+            return err(error)
+        }
+    }
+}
+
+// Present the whole canvas regardless of its dirty rectangle, then reset it.
+pub fn present_all<D: Display>(display: &mut D, canvas: &mut Canvas) -> void!Error {
+    canvas.mark_all_dirty()
+    return present(display, canvas)
+}

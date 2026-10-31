@@ -45,6 +45,7 @@ they are not prerequisites for using the safe entry APIs.
 | Build a string | `text.Builder.new` with a byte array | [Text](text.md) |
 | Decode or encode JSON | `@derive(Json)` and `json.decode<T>` | [JSON](json.md) |
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
+| Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
 | Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
@@ -106,24 +107,25 @@ Those details determine whether retrying or reusing storage is valid.
 ## Portable and hosted functionality
 
 Portable core, allocation, bytes, text, JSON, collections, math, hashes, time values,
-DNS/TLS contracts, HTTP/1.1 protocol engines and web routing require no OS,
+graphics, DNS/TLS contracts, HTTP/1.1 protocol engines and web routing require no OS,
 libc, global allocator, scheduler or garbage collector. Portable fixture checks
 emit `wasm32-unknown-unknown` and `thumbv6m-none-eabi` objects at O0 and O3.
 This is code-generation evidence, not tested board startup or hardware execution.
 Freestanding links supply startup, memory helpers and any soft-float support.
 
 Hosted console, filesystem, environment, processes, clocks, threads,
-synchronization, sockets, OS entropy, crypto and TLS backends and HTTP/web wrappers support **x86-64
+synchronization, sockets, OS entropy, crypto, TLS and QUIC backends and HTTP/web wrappers support **x86-64
 and AArch64 Linux GNU, macOS, and Windows x64 MSVC/GNU**. They reject Linux
 x32/musl and other unsupported ABIs. Atomic operations have a separate
 [x86-64/AArch64 target contract](synchronization.md#atomics).
-Hosted linking needs a target C toolchain and headers; OpenSSL-backed TLS and
+Hosted linking needs a target C toolchain and headers; OpenSSL-backed TLS, QUIC and
 `std/crypto/openssl` also need OpenSSL 3.5 or newer. See [platform adapters](platform.md),
-[TLS](tls.md), and [cryptography](crypto.md).
+[TLS](tls.md), [QUIC](quic.md), and [cryptography](crypto.md).
 OS/C-library calls may allocate internally even when Dodo storage is fixed.
 
-HTTP/1.1 clients, servers, streaming framing, and web routing **are implemented**.
-HTTP/2, HTTP/3/QUIC, WebSockets, TOML serialization and chip support beyond
+HTTP/1.1 clients, servers, streaming framing, web routing, and QUIC connections
+and streams **are implemented**.
+HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
 the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
 registers and portable device protocols; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
@@ -133,13 +135,16 @@ their I2C and SPI buses, as master or target, and serial ports through the
 shared controller drivers in `std/embedded/peripheral` and the pin and
 controller ownership both chips share in `std/embedded/chip/rp_pins`, and
 their PWM outputs and ADC inputs through `std/embedded/chip/rp_pwm` and
-`std/embedded/chip/rp_adc`, a USB serial port on the board's own USB
-connector through `std/embedded/chip/rp_usb`, and their DMA channels
-through `std/embedded/chip/rp_dma`, which the SPI buses and serial ports
-use for transfers that run in the background.
+`std/embedded/chip/rp_adc`, their PIO state machines, with programs assembled
+at compile time, through `std/embedded/chip/rp_pio`, a USB serial port on
+the board's own USB connector through `std/embedded/chip/rp_usb`, their DMA
+channels through `std/embedded/chip/rp_dma`, which the SPI buses and serial
+ports use for transfers that run in the background, and their second core,
+with the FIFOs and spinlocks the cores share, through
+`std/embedded/chip/rp_multicore`.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
-tasks on one core, waking each on time or on an interrupt and sleeping
+tasks on a core, waking each on time or on an interrupt and sleeping
 in between. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
@@ -159,6 +164,7 @@ individual modules and links every public declaration back to its source.
 | [Allocation and boxes](allocation.md) | `alloc/arena`, `alloc/arena_box`, `alloc/block`, `alloc/boxed`, `alloc/error`, `alloc/layout`, `alloc/pool`, `alloc/pool_box`, `alloc/shared_arena`, `alloc/shared_box` | Portable. |
 | [Binary bytes](bytes.md) | `std/arena_bytes`, `std/bytes`, `std/bytes_alloc`, `std/pool_bytes` | Portable. |
 | [Byte I/O](io.md) | `std/io`, `std/io_alloc` | Portable. |
+| [Compression](compression.md) | `std/compress/deflate`, `std/compress/zlib`, `std/compress/gzip`, `std/compress/io` | Portable; caller-supplied buffers. |
 | [Console I/O](console.md) | `std/console` | Hosted. |
 | [Formatting](formatting.md) | `std/fmt`, `std/fmt/errors`, `std/fmt_alloc` | Portable. |
 | [UTF-8 text](text.md) | `std/text`, `std/text_alloc`, `std/text_shared` | Portable. |
@@ -166,16 +172,19 @@ individual modules and links every public declaration back to its source.
 | [Collections](collections.md) | `std/collections`, `std/collections/deque`, `std/collections/fixed_deque`, `std/collections/fixed_map`, `std/collections/fixed_set`, `std/collections/fixed_vector`, `std/collections/hash_map`, `std/collections/hash_set`, `std/collections/heap`, `std/collections/ordered_map`, `std/collections/ordered_set`, `std/collections/shared_deque`, `std/collections/shared_hash_map`, `std/collections/shared_hash_set`, `std/collections/shared_heap`, `std/collections/shared_ordered_map`, `std/collections/shared_ordered_set`, `std/collections/shared_vector`, `std/collections/vector` | Portable. |
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
+| [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image` | Portable; caller-supplied pixel and file buffers. |
 | [Time and clocks](time.md) | `std/time`, `std/time/clock`, `std/time/hosted`, `std/time/iso8601`, `std/time/timer` | Values/contracts portable; hosted clock explicit. |
 | [Native strings and errors](platform.md) | `std/platform`, `std/platform/error` | Hosted. |
 | [Filesystem and lexical paths](filesystem.md) | `std/fs`, `std/fs/path`, `std/fs/types`, `std/fs/unix`, `std/fs/windows_ext` | Paths/types portable; files hosted. |
 | [Environment](environment.md) | `std/env` | Hosted. |
 | [Processes](processes.md) | `std/process`, `std/process/alloc` | Hosted. |
+| [Signals](signals.md) | `std/signal` | Hosted. |
 | [Threads](threads.md) | `std/thread` | Hosted. |
 | [Synchronization](synchronization.md) | `std/sync`, `std/sync/allocated`, `std/sync/atomic`, `std/sync/error` | Blocking/allocated hosted; atomic target-specific. |
 | [Networking and DNS](networking.md) | `std/net`, `std/net/dns`, `std/net/operations` | Values/DNS/operations portable; native sockets hosted. |
 | [Cryptography](crypto.md) | `std/crypto`, `std/crypto/openssl`, `std/crypto/random` | Errors/secret helpers portable; OS entropy and OpenSSL hosted. |
 | [TLS](tls.md) | `std/tls`, `std/tls/openssl`, `std/tls/stream` | Contracts/stream portable; OpenSSL hosted. |
+| [QUIC](quic.md) | `std/quic`, `std/quic/openssl` | Error and state vocabulary portable; OpenSSL endpoints hosted. |
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
@@ -204,6 +213,8 @@ select providers; they are not additional recommended starting paths.
 | `std/platform/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/process/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/process/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
+| `std/signal/posix` | Native signal boundary; use [signals](signals.md). |
+| `std/signal/windows` | Native signal boundary; use [signals](signals.md). |
 | `std/sync/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/sync/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/thread/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
@@ -213,12 +224,14 @@ select providers; they are not additional recommended starting paths.
 | `std/time/windows` | Native clock boundary; use [hosted clocks](time.md). |
 | `std/tls/posix` | Native OpenSSL boundary; use [TLS](tls.md). |
 | `std/tls/windows` | Native OpenSSL boundary; use [TLS](tls.md). |
+| `std/quic/posix` | Native OpenSSL QUIC boundary; use [QUIC](quic.md). |
+| `std/quic/windows` | Native OpenSSL QUIC boundary; use [QUIC](quic.md). |
 | `std/web/posix` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
 | `std/web/windows` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
-`std/process/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
-`std/time/native`, `std/tls/native`, `std/crypto/native`,
+`std/process/native`, `std/signal/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
+`std/time/native`, `std/tls/native`, `std/quic/native`, `std/crypto/native`,
 `std/crypto/openssl/native`, and `std/web/native` select compatible
 providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`

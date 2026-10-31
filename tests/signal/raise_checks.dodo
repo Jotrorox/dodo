@@ -1,0 +1,124 @@
+package raise_checks
+
+import "std/net/native"
+import "std/signal"
+
+// POSIX only. SIGHUP, SIGINT and SIGTERM are 1, 2 and 15 on Linux and macOS.
+// raise() runs the handler before it returns in a single-threaded process.
+unsafe extern "C" fn raise(number: i32) -> i32
+unsafe extern "C" fn signal(number: i32, handler: usize) -> usize
+
+const HANGUP: i32 = 1
+const INTERRUPT: i32 = 2
+const TERMINATE: i32 = 15
+const IGNORE: usize = 1
+// Well past a 64 KiB pipe, so later arrivals overflow the wake channel.
+const FLOOD: usize = 100000
+
+fn send(number: i32) -> bool {
+    return unsafe {
+        raise(number)
+    } == 0
+}
+fn expect(listener: &mut signal.Listener, expected: signal.Signal) -> bool {
+    match listener.next() {
+        some(value) => {
+            return value == expected
+        }
+        none => {
+            return false
+        }
+    }
+}
+fn order() -> i32 {
+    unsafe {
+        signal(HANGUP, IGNORE)
+    }
+    selection := [signal.Signal.Interrupt, signal.Signal.Terminate, signal.Signal.Hangup]
+    listener := signal.listen(&selection)!
+    if listener.cancelled() {
+        return 10
+    }
+    if !send(HANGUP) || listener.cancelled() {
+        return 11
+    }
+    if !send(TERMINATE) || !send(HANGUP) || !send(INTERRUPT) {
+        return 12
+    }
+    if !listener.cancelled() {
+        return 13
+    }
+    match listener.wait(0)! {
+        some(value) => {
+            if value != signal.Signal.Hangup {
+                return 14
+            }
+        }
+        none => {
+            return 15
+        }
+    }
+    if !expect(&mut listener, signal.Signal.Terminate) || !expect(&mut listener, signal.Signal.Hangup) {
+        return 16
+    }
+    if !expect(&mut listener, signal.Signal.Interrupt) {
+        return 16
+    }
+    match listener.wait(20)! {
+        some(_) => {
+            return 17
+        }
+        none => {}
+    }
+    listener.close()!
+    // The ignored disposition is back; the default would end the process.
+    if !send(HANGUP) {
+        return 18
+    }
+    return 0
+}
+fn flood() -> i32 {
+    selection := [signal.Signal.Hangup]
+    listener := signal.listen(&selection)!
+    if listener.cancelled() {
+        return 20
+    }
+    for i in 0usize..FLOOD {
+        if !send(HANGUP) {
+            return 21
+        }
+    }
+    // Overflowed arrivals must keep the channel readable until all are taken.
+    set := native.PollSet.new()
+    received := 0usize
+    for true {
+        match listener.next() {
+            some(value) => {
+                if value != signal.Signal.Hangup {
+                    return 22
+                }
+                received += 1
+            }
+            none => {
+                set.clear()
+                index := listener.register(&mut set)!
+                set.wait(0)!
+                if !set.ready(index) {
+                    break
+                }
+            }
+        }
+    }
+    if received != FLOOD {
+        return 23
+    }
+    listener.close()!
+    return 0
+}
+fn main() -> i32 {
+    code := order()
+    if code != 0 {
+        return code
+    }
+    return flood()
+}

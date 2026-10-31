@@ -24,6 +24,7 @@ existing credentials are required.
 | Encrypt a custom byte protocol | `std/tls/stream.Stream` plus an engine | Drive readiness, deadlines, flush, and shutdown. |
 | Drive TLS records directly | `std/tls/openssl.Engine` | Feed/drain encrypted bytes and handle engine progress. |
 | Supply a different backend | Portable `std/tls` contracts | Implement verification and provider lifecycle obligations. |
+| Multiplex streams over UDP | [`std/quic/openssl`](quic.md) | Drive QUIC handshakes, streams and event processing. |
 
 The lower-level engine never opens sockets. The transport wrapper never chooses
 your trust policy. HTTPS is the layer that connects the URL, TCP transport,

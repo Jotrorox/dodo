@@ -19,6 +19,7 @@ pub mod lexer;
 pub mod lsp;
 pub mod package;
 pub mod parser;
+pub mod pio;
 pub mod project;
 pub mod sema;
 pub mod toml;

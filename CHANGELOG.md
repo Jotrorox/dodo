@@ -23,6 +23,92 @@
   a scripted loopback broker, raw-socket checks of the Dodo broker, and an app
   talking to it check everything at `-O0` and `-O3`. TLS (`mqtts://`) and
   MQTT 5 are not supported yet.
+- QUIC connections and streams, through OpenSSL 3.5's QUIC stack:
+  `std/quic/openssl` binds a `Listener` on a UDP socket and connects a
+  verified `Connection` to it, each opening and accepting bidirectional and
+  unidirectional streams that send, receive, conclude with FIN, and reset
+  with an application code. Every call is nonblocking; `wait` sleeps until a
+  datagram or the next protocol timer, and `timeout_ms` hands that timer to
+  another poller. Connections require ALPN, verify the server's hostname or
+  IP, support mutual authentication and an idle timeout, and close with an
+  application code that the peer reads from `close_info`. Streams also
+  implement the `std/io` polling contract. The portable `std/quic` package
+  holds the error and state types, and compiles for freestanding targets.
+- `std/graphics` draws into caller-owned pixel storage on every target,
+  firmware included, with no allocation, operating system or floating
+  point: lines, rectangles, rounded rectangles, circles, ellipses and
+  even-odd polygons, outlined or filled, plus text, canvas-to-canvas copies
+  with format conversion, and alpha blending. Canvases come in RGBA, BGRA,
+  big-endian RGB565, 8-bit gray and 1-bit formats, clip every call, and
+  track the rectangle each call changed, so a display can be sent only what
+  changed. Rendering is integer-only and gives the same pixels everywhere.
+  `std/graphics/font` adds 6x8 and 8x16 bitmap fonts for ASCII and Latin-1,
+  `std/graphics/image` decodes PPM/PGM, QOI and BMP and encodes PPM, QOI
+  and BMP into caller buffers, and the `graphics.Display` protocol with the
+  in-memory `std/graphics/fake` display lets drawing code be tested under
+  `dodo test`. Golden images in `tests/graphics/golden/` pin the output.
+- PIO on the RP2040 and RP2350: `std/embedded/chip/rp_pio` drives the chips'
+  programmable I/O blocks, and `rp_pio.assemble` assembles PIO programs
+  when the firmware is compiled, from string literals in the language of the
+  Pico SDK's pioasm, so SDK `.pio` programs work unchanged and a mistake is a
+  compile error at its line. The assembler exists only in firmware for these
+  chips and checks each program against the chip's PIO version, so the
+  RP2350's additions (`mov pindirs`, RX FIFO registers, neighbouring blocks'
+  IRQ flags, `wait jmppin`) are errors on the RP2040. `pins.pio(n)` claims a
+  block and `pins.pio_pins` hands it GPIOs; a block loads programs into its
+  instruction memory, relocating their jumps, and hands out its four state
+  machines, which are configured from the program's directives, take and
+  give words through their FIFOs, execute single instructions, and raise
+  the block's interrupts. `examples/ws2812.dodo` drives WS2812 LEDs, and the
+  board self-tests gain three PIO checks.
+- The RP2040 and RP2350 run code on their second core. `b.core1.start(&mut
+  stack, task)` runs a task value's `run(self)` method on core 1, with the
+  task and the stack in memory the program provides, until the returned
+  handle is dropped or stopped, which holds core 1 in reset again. Tasks are
+  checked like `std/thread` tasks, so they own what they hold and carry no
+  references. On the RP2350 the stack's bottom is core 1's stack limit, and
+  core 1 enables its FPU and double-precision coprocessor as core 0 does.
+  `b.fifos.claim()` hands out each core's end of the hardware FIFOs between
+  the cores, and `b.spinlocks.claim(n)` the hardware spinlocks, whose guard
+  also masks interrupts on the holding core. On the RP2350, the spinlocks that
+  erratum RP2350-E2 can unlock are never handed out. Each core can run its own
+  `std/embedded/executor`: signals now belong to the core that raises and
+  takes them, and `fifo.set_signal(&signal)` wakes a task when the other core
+  writes, through the chip runtime's default FIFO interrupt handler. The new
+  `cpu.core_id()` intrinsic returns the executing core's number: `mhartid` on
+  RISC-V, the chip runtime's `dodo_core_id` on a Cortex-M, and 0 on hosted
+  targets. `examples/two_cores.dodo` searches for primes on core 1 and reports
+  them from core 0, and the board self-tests gain three checks of core 1, the
+  FIFOs, and spinlocks.
+
+- New portable compression packages read and write DEFLATE
+  (`std/compress/deflate`), zlib (`std/compress/zlib`), and gzip
+  (`std/compress/gzip`) through caller-supplied buffers, without allocating.
+  `encode(input, output, level)` compresses at levels 0 through 9 with lazy
+  LZ77 matching and optimal Huffman codes, choosing the smallest of stored,
+  fixed, and dynamic blocks; its output matches zlib's size, and
+  `max_encoded_len` bounds it. `decode` checks the Adler-32 or CRC-32 and
+  stops after one stream or gzip member. Each package also has incremental
+  `Decoder` and `Encoder` types for buffers of any size, gzip headers can
+  carry a name, comment, and time, and `std/compress/io` adapts all three
+  formats to `std/io` readers and writers.
+- Records larger than 1 KiB passed, returned, or moved by value compile as
+  memory copies at every optimization level. Before, LLVM split them into
+  one operation per element: a 256 KiB struct took minutes and gigabytes of
+  memory to build at `-O 2` and needed about 10 MB of stack at `-O 0`. Root
+  package public functions now pass such records through memory like other
+  Dodo functions.
+- Ownership is checked on each function's control-flow graph, for every body
+  the compiler accepts: initialization, moves, borrows, escapes, destructor
+  order, and Result obligations. The earlier checker that ran beside it, and
+  covered every body the graph could not yet represent, is gone. Liveness now
+  follows each binding exactly: a borrow ends at its last use even across
+  shadowing and loops, and a conflict names the binding that holds the
+  borrow and points at its next use. Some programs the old checker rejected
+  because of its approximations now compile, such as a mutable slice
+  `&mut a[..]` iterated and written in place. Some errors are reported
+  differently: type errors come before ownership errors, and a use after a
+  move into a value block is now reported as one.
 - A cryptography package. `std/crypto/random` reads the operating system's
   CSPRNG (`getrandom`, `SecRandomCopyBytes`, `BCryptGenRandom`) with no
   user-space generator or fallback. It fills buffers, draws unbiased values
@@ -47,6 +133,16 @@
   `unsafe` (`@unsafe_send pub unsafe struct Owner`), since they are unchecked
   promises; `unsafe` on a struct without either contract is an error. Add
   `unsafe` to existing annotated structs.
+- `std/signal` delivers `SIGINT`, `SIGTERM` and `SIGHUP`, and Ctrl-C,
+  Ctrl-Break and console close on Windows, into a program's poll loop:
+  `signal.listen` queues each selected signal in arrival order instead of
+  letting it end the process, and the listener registers a wake channel in a
+  `std/net/native` `PollSet` next to the program's sockets. A listener is
+  also a cancellation source, so SIGTERM ends `reactor.serve_with` with its
+  report. The wake channel is a self-pipe on Linux and macOS (signalfd would
+  block the signals, and child processes would inherit that mask) and a
+  loopback socket pair on Windows. `PollSet.add_raw` registers other
+  descriptors that a program owns.
 - `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
   (DCP), with no change to programs: division takes about 90 cycles instead
   of 1300, addition about 45 instead of 260, multiplication about 60 instead

@@ -208,6 +208,11 @@ pub struct PollSet {
         self.count += 1
         return ok(index)
     }
+    // A descriptor (POSIX) or SOCKET (Windows) owned elsewhere, such as the
+    // std/signal wake channel. Its owner keeps it open until the next clear().
+    pub fn add_raw(&mut self, handle: isize, interest: net.Interest) -> usize!net.Error {
+        return self.add(handle, interest)
+    }
     pub fn ready(&self, index: usize) -> bool {
         return index < self.count && self.events[index] != 0
     }

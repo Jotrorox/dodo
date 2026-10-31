@@ -1,0 +1,214 @@
+package golden
+
+import "core/bytes"
+import "core/mem"
+import "std/env"
+import "std/fs"
+import "std/graphics"
+import "std/graphics/font"
+import "std/graphics/image"
+import "std/platform"
+import "std/platform/error"
+import "std/text"
+
+// Golden-image tests for std/graphics. Each scene is rendered and compared
+// pixel for pixel with tests/graphics/golden/NAME.qoi. Rendering uses only
+// integer arithmetic, so the images are identical on every target and at
+// every optimization level.
+//
+// Run from the repository root:
+//
+//     dodo test tests/graphics
+//
+// After an intended rendering change, regenerate the images, view them (QOI
+// opens in GIMP, ImageMagick and ffmpeg), and commit them:
+//
+//     DODO_UPDATE_GOLDEN=1 dodo test tests/graphics
+//
+// DODO_GOLDEN_DIR selects another directory.
+
+// Largest encoded golden file, and largest golden image in pixels.
+const FILE_LIMIT: usize = 65536
+const PIXEL_LIMIT: usize = 65536
+
+fn variable(name: &str, output: &mut[u8]) -> Option<&str> from(output) {
+    workspace := env.Workspace.new()
+    match env.get(name, output, &mut workspace, platform.TextPolicy.Strict) {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return none
+        }
+    }
+}
+
+fn check(name: &str, canvas: &graphics.Canvas) {
+    directory_storage := [0u8; 1024]
+    directory := "tests/graphics/golden"
+    match variable("DODO_GOLDEN_DIR", &mut directory_storage) {
+        some(value) => {
+            directory = value
+        }
+        none => {}
+    }
+    path_storage := [0u8; 1200]
+    builder := text.Builder.new(&mut path_storage)
+    first := text.Text.from_str(directory)
+    builder.append(&first)!
+    second := text.Text.from_str("/")
+    builder.append(&second)!
+    third := text.Text.from_str(name)
+    builder.append(&third)!
+    fourth := text.Text.from_str(".qoi")
+    builder.append(&fourth)!
+    built := builder.as_text()
+    path := built.as_str()
+
+    update_storage := [0u8; 16]
+    updating := false
+    match variable("DODO_UPDATE_GOLDEN", &mut update_storage) {
+        some(value) => {
+            updating = !bytes.equal(mem.str_bytes(value), b"") && !bytes.equal(mem.str_bytes(value), b"0")
+        }
+        none => {}
+    }
+    workspace := platform.workspace()
+    if updating {
+        encoded := [0u8; FILE_LIMIT]
+        length := image.encode_qoi(canvas, &mut encoded)!
+        fs.write_file(path, &encoded[..length], &mut workspace)!
+        return
+    }
+    stored := [0u8; FILE_LIMIT]
+    match fs.read_file(path, &mut stored, &mut workspace) {
+        ok(report) => {
+            assert(report.eof, "golden image larger than the test's buffer")
+            pixels := [0u8; PIXEL_LIMIT * 4]
+            expected := image.decode(&stored[..report.read], &mut pixels, graphics.PixelFormat.Rgba8888)!
+            difference := expected.diff_bounds(canvas)
+            assert(difference.is_empty(), "rendering differs from the golden image; inspect and regenerate with DODO_UPDATE_GOLDEN=1")
+        }
+        err(reason) => {
+            assert(reason.cause.kind != error.Kind.NotFound, "golden image missing: run from the repository root, or create it with DODO_UPDATE_GOLDEN=1")
+            assert(false, "golden image unreadable")
+        }
+    }
+}
+
+@test
+fn shapes() {
+    pixels := [0u8; 64 * 48 * 4]
+    canvas := graphics.canvas(&mut pixels, 64, 48, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.hex(0x1d2330))
+    canvas.fill_rect(2, 2, 12, 8, graphics.hex(0xe06c75))
+    canvas.rect(16, 2, 12, 8, graphics.hex(0xe5c07b))
+    canvas.fill_round_rect(30, 2, 14, 10, 4, graphics.hex(0x98c379))
+    canvas.round_rect(46, 2, 16, 10, 3, graphics.hex(0x56b6c2))
+    canvas.fill_circle(8, 20, 6, graphics.hex(0x61afef))
+    canvas.circle(24, 20, 6, graphics.hex(0xc678dd))
+    canvas.fill_ellipse(42, 20, 9, 5, graphics.hex(0xd19a66))
+    canvas.ellipse(42, 20, 11, 7, graphics.WHITE)
+    star := [12i32, 28, 16, 44, 2, 34, 22, 34, 8, 44]
+    canvas.fill_polygon(&star, graphics.hex(0xe5c07b))
+    canvas.polygon(&star, graphics.hex(0xe06c75))
+    for i in 0i32..8 {
+        canvas.line(40, 46, 26 + i * 5, 30, graphics.rgb(255 - (i * 24) as u8, 160, (i * 30) as u8))
+    }
+    canvas.blend_rect(30, 26, 32, 10, graphics.rgba(255, 255, 255, 96))
+    check("shapes", &canvas)
+}
+
+@test
+fn text_rendering() {
+    pixels := [0u8; 160 * 56 * 4]
+    canvas := graphics.canvas(&mut pixels, 160, 56, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.BLACK)
+    small := font.small()
+    medium := font.medium()
+    canvas.text(&small, 1, 1, "Dodo graphics 0123456789", graphics.WHITE)
+    canvas.text(&small, 1, 10, "Grüße, señor! Ça va? 50€", graphics.hex(0xe5c07b))
+    canvas.text(&medium, 1, 19, "Hello, (ÿ) {g}", graphics.hex(0x61afef))
+    big := font.small().scaled(2)
+    bounds := canvas.text(&big, 1, 36, "x2", graphics.hex(0x98c379))
+    canvas.rect(bounds.x, bounds.y, bounds.width, bounds.height, graphics.DARK_GRAY)
+    canvas.text(&small, 40, 38, "two\nlines", graphics.hex(0xc678dd))
+    check("text", &canvas)
+}
+
+fn glyph_sheet(canvas: &mut graphics.Canvas, sheet: &graphics.Font) {
+    canvas.clear(graphics.hex(0x202020))
+    storage := [0u8; 4]
+    for code in 0x20u32..0x100 {
+        index := code - 0x20
+        x := ((index % 16) * sheet.advance()) as i32
+        y := ((index / 16) * sheet.line_height()) as i32
+        if (index + index / 16) % 2 == 0 {
+            canvas.fill_rect(x, y, sheet.advance(), sheet.line_height(), graphics.hex(0x303030))
+        }
+        builder := text.Builder.new(&mut storage)
+        builder.push(code)!
+        glyph := builder.as_text()
+        canvas.text(sheet, x, y, glyph.as_str(), graphics.WHITE)
+    }
+}
+
+@test
+fn small_font_sheet() {
+    pixels := [0u8; 96 * 112 * 4]
+    canvas := graphics.canvas(&mut pixels, 96, 112, graphics.PixelFormat.Rgba8888)!
+    small := font.small()
+    glyph_sheet(&mut canvas, &small)
+    check("font_small", &canvas)
+}
+
+@test
+fn medium_font_sheet() {
+    pixels := [0u8; 128 * 224 * 4]
+    canvas := graphics.canvas(&mut pixels, 128, 224, graphics.PixelFormat.Rgba8888)!
+    medium := font.medium()
+    glyph_sheet(&mut canvas, &medium)
+    check("font_medium", &canvas)
+}
+
+fn badge(canvas: &mut graphics.Canvas) {
+    canvas.clear(graphics.hex(0x284b63))
+    canvas.fill_circle(10, 10, 8, graphics.hex(0xf4a259))
+    canvas.fill_rect(4, 14, 24, 4, graphics.hex(0xbc4b51))
+    canvas.line(0, 19, 31, 0, graphics.WHITE)
+}
+
+// The same drawing in every pixel format, converted back side by side, and
+// alpha compositing of one canvas over another.
+@test
+fn formats() {
+    pixels := [0u8; 128 * 44 * 4]
+    canvas := graphics.canvas(&mut pixels, 128, 44, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.BLACK)
+    rgba_pixels := [0u8; 32 * 20 * 4]
+    rgba := graphics.canvas(&mut rgba_pixels, 32, 20, graphics.PixelFormat.Rgba8888)!
+    badge(&mut rgba)
+    canvas.blit(&rgba, 0, 0)
+    rgb565_pixels := [0u8; 32 * 20 * 2]
+    rgb565 := graphics.canvas(&mut rgb565_pixels, 32, 20, graphics.PixelFormat.Rgb565)!
+    badge(&mut rgb565)
+    canvas.blit(&rgb565, 32, 0)
+    gray_pixels := [0u8; 32 * 20]
+    gray := graphics.canvas(&mut gray_pixels, 32, 20, graphics.PixelFormat.Gray8)!
+    badge(&mut gray)
+    canvas.blit(&gray, 64, 0)
+    mono_pixels := [0u8; 4 * 20]
+    mono := graphics.canvas(&mut mono_pixels, 32, 20, graphics.PixelFormat.Mono1)!
+    badge(&mut mono)
+    canvas.blit(&mono, 96, 0)
+
+    overlay_pixels := [0u8; 40 * 20 * 4]
+    overlay := graphics.canvas(&mut overlay_pixels, 40, 20, graphics.PixelFormat.Bgra8888)!
+    overlay.clear(graphics.TRANSPARENT)
+    overlay.fill_round_rect(0, 0, 40, 20, 6, graphics.rgba(255, 255, 255, 140))
+    overlay.fill_circle(20, 10, 6, graphics.rgba(224, 108, 117, 220))
+    canvas.fill_rect(0, 22, 128, 22, graphics.hex(0x3a3f4b))
+    canvas.blend(&overlay, 4, 23)
+    canvas.blit(&overlay, 84, 23)
+    check("formats", &canvas)
+}

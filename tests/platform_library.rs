@@ -52,7 +52,7 @@ fn default_loaders_select_host_adapters_without_llvm() {
 fn adapters_are_selected_independently_and_reject_wrong_targets() {
     let scratch = std::env::temp_dir().join(format!("dodo-platform-{}", std::process::id()));
     fs::create_dir_all(&scratch).unwrap();
-    for area in ["fs", "process", "env", "thread", "sync", "time"] {
+    for area in ["fs", "process", "env", "thread", "sync", "time", "signal"] {
         let source = scratch.join(format!("{area}.dodo"));
         let import = if area == "time" { "time/hosted" } else { area };
         fs::write(

@@ -36,7 +36,7 @@ Start with these frequently used packages:
 | Parse or encode JSON | [std/encoding/json](api/std/encoding/json.md) | [JSON](json.md) |
 | Read and write files | [std/fs](api/std/fs.md) | [Filesystem](filesystem.md) |
 | Serve an HTTP application | [std/web/app](api/std/web/app.md) | [Web](web.md) |
-| Program a microcontroller board | [std/embedded/hal](api/std/embedded/hal.md), [std/embedded/board/pico](api/std/embedded/board/pico.md), [std/embedded/chip/rp2040](api/std/embedded/chip/rp2040.md), [std/embedded/board/pico2](api/std/embedded/board/pico2.md), [std/embedded/chip/rp2350](api/std/embedded/chip/rp2350.md), [std/embedded/chip/rp_pins](api/std/embedded/chip/rp_pins.md), [std/embedded/chip/rp_pwm](api/std/embedded/chip/rp_pwm.md), [std/embedded/chip/rp_adc](api/std/embedded/chip/rp_adc.md), [std/embedded/chip/rp_usb](api/std/embedded/chip/rp_usb.md), [std/embedded/board/pico2_w](api/std/embedded/board/pico2_w.md), [std/embedded/wireless/cyw43](api/std/embedded/wireless/cyw43.md), [std/embedded/peripheral/designware_i2c](api/std/embedded/peripheral/designware_i2c.md), [std/embedded/peripheral/pl022](api/std/embedded/peripheral/pl022.md), [std/embedded/peripheral/pl011](api/std/embedded/peripheral/pl011.md), [std/embedded/cortex_m](api/std/embedded/cortex_m.md) | [Hardware](hardware.md#boards); `std/embedded/board` and `std/embedded/chip` name the build's board and chip |
+| Program a microcontroller board | [std/embedded/hal](api/std/embedded/hal.md), [std/embedded/board/pico](api/std/embedded/board/pico.md), [std/embedded/chip/rp2040](api/std/embedded/chip/rp2040.md), [std/embedded/board/pico2](api/std/embedded/board/pico2.md), [std/embedded/chip/rp2350](api/std/embedded/chip/rp2350.md), [std/embedded/chip/rp_pins](api/std/embedded/chip/rp_pins.md), [std/embedded/chip/rp_pwm](api/std/embedded/chip/rp_pwm.md), [std/embedded/chip/rp_adc](api/std/embedded/chip/rp_adc.md), [std/embedded/chip/rp_usb](api/std/embedded/chip/rp_usb.md), [std/embedded/chip/rp_multicore](api/std/embedded/chip/rp_multicore.md), [std/embedded/board/pico2_w](api/std/embedded/board/pico2_w.md), [std/embedded/wireless/cyw43](api/std/embedded/wireless/cyw43.md), [std/embedded/peripheral/designware_i2c](api/std/embedded/peripheral/designware_i2c.md), [std/embedded/peripheral/pl022](api/std/embedded/peripheral/pl022.md), [std/embedded/peripheral/pl011](api/std/embedded/peripheral/pl011.md), [std/embedded/cortex_m](api/std/embedded/cortex_m.md) | [Hardware](hardware.md#boards); `std/embedded/board` and `std/embedded/chip` name the build's board and chip |
 
 ## Read a signature
 
@@ -137,6 +137,9 @@ Some declarations use `@compiler(print)`, `@compiler(println)`, or
 accepts a literal format followed by heterogeneous arguments even though its
 source declaration only names the format parameter. The
 [formatting guide](formatting.md) documents accepted values and format syntax.
+`rp_pio.assemble` uses `@compiler(pio)`: it takes string literals, one line
+of a PIO program each, and the compiler assembles them into a `Program`; see
+[PIO](hardware.md#pio-on-the-rp2040-and-rp2350).
 These attributes identify bundled compiler hooks; they are not general user
 extension points.
 
@@ -172,6 +175,7 @@ virtual package names rather than independent source files:
 | `std/fs/native` | [Filesystem providers](filesystem.md) |
 | `std/env/native` | [Native environment strings](environment.md) |
 | `std/process/native` | [Process providers](processes.md) |
+| `std/signal/native` | [Signal providers](signals.md) |
 | `std/thread/native` | [Native threads](threads.md) |
 | `std/sync/native` | [Blocking synchronization](synchronization.md) |
 | `std/net/native` | [Native sockets](networking.md) |

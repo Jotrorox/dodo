@@ -1,5 +1,6 @@
 package executor
 
+import "core/cpu"
 import "std/embedded/hal"
 
 // A cooperative task executor for firmware: several activities share one
@@ -68,26 +69,34 @@ import "std/embedded/hal"
 // a signal are safe anywhere: they use a critical section.
 //
 // One executor runs at a time per core; signals and the record of woken
-// tasks belong to the core, not to an executor value. On hosted targets,
-// where a critical section excludes nothing, use the executor and its
-// signals from one thread.
+// tasks belong to the core, not to an executor value. On a chip with two
+// cores, such as the RP2040 and RP2350, each core can run an executor of
+// its own: a signal raised on one core wakes only that core's tasks, and the
+// same id names a different signal on each core. Words through the FIFOs
+// between the cores wake a task on the other core instead; see
+// std/embedded/chip/rp_multicore. On hosted targets, where a critical
+// section excludes nothing, use the executor and its signals from one
+// thread.
 
-// Tasks one executor runs, and signals a program can number.
+// Tasks one executor runs, signals a program can number, and cores that
+// can each run an executor.
 pub const MAX_TASKS: usize = 32
 pub const MAX_SIGNALS: u32 = 32
+pub const MAX_CORES: u32 = 2
 
 // A time that never comes, for computing the earliest of several.
 const NEVER: u64 = 0xFFFF_FFFF_FFFF_FFFF
 // The task index of a context made outside an executor.
 const NO_TASK: u32 = 32
 
-// Tasks that a signal woke since the executor last looked, one bit each.
-static mut WOKEN: u32 = 0
-// Per signal: raises since the task last took it, the last value sent, and
-// the tasks waiting for it.
-static mut RAISES: [32]u32 = [0u32; 32]
-static mut VALUES: [32]u32 = [0u32; 32]
-static mut WAITERS: [32]u32 = [0u32; 32]
+// Per core: tasks that a signal woke since the executor last looked, one
+// bit each.
+static mut WOKEN: [2]u32 = [0u32; 2]
+// Per core and signal, at core * MAX_SIGNALS + id: raises since the task
+// last took it, the last value sent, and the tasks waiting for it.
+static mut RAISES: [64]u32 = [0u32; 64]
+static mut VALUES: [64]u32 = [0u32; 64]
+static mut WAITERS: [64]u32 = [0u32; 64]
 
 // What a poll reports: Pending to be polled again, Ready when the task is
 // done and is not polled again.
@@ -196,13 +205,15 @@ pub struct Signal {
     // handlers. The count stops at the largest u32.
     pub fn raise(&self) {
         index := self.slot()
+        here := this_core()
         section := hal.Critical.enter()
-        // SAFETY: interrupts are masked on this core, which owns the tables.
+        // SAFETY: interrupts are masked on this core, which owns its part of
+        // the tables.
         unsafe {
             if RAISES[index] != 0xFFFF_FFFF {
                 RAISES[index] += 1
             }
-            WOKEN |= WAITERS[index]
+            WOKEN[here] |= WAITERS[index]
             WAITERS[index] = 0
         }
         core.drop(section)
@@ -290,9 +301,11 @@ pub struct Signal {
         core.drop(section)
     }
 
+    // This signal's place in the tables, in the part of the core running
+    // this code.
     fn slot(&self) -> usize {
         core.assert(self.id < MAX_SIGNALS)
-        return self.id as usize
+        return this_core() * MAX_SIGNALS as usize + self.id as usize
     }
 }
 
@@ -479,12 +492,13 @@ pub struct Executor {
                 if end_us < next {
                     next = end_us
                 }
+                here := this_core()
                 section := hal.Critical.enter()
                 // SAFETY: interrupts are masked, so no handler can raise a
-                // signal between this check and the sleep: one that becomes
-                // pending ends the sleep instead.
+                // signal on this core between this check and the sleep: one
+                // that becomes pending ends the sleep instead.
                 woken := unsafe {
-                    WOKEN
+                    WOKEN[here]
                 }
                 if woken == 0 {
                     if next == NEVER {
@@ -521,16 +535,25 @@ pub fn run<C: Clock>(tasks: &mut[&mut dyn Task], clock: &mut C) {
     executor.run(tasks, clock)
 }
 
-// Take the record of tasks that signals woke.
+// Take this core's record of tasks that signals woke.
 fn take_woken() -> u32 {
+    here := this_core()
     section := hal.Critical.enter()
-    // SAFETY: interrupts are masked on this core, which owns the record.
+    // SAFETY: interrupts are masked on this core, which owns its record.
     woken := unsafe {
-        WOKEN
+        WOKEN[here]
     }
     unsafe {
-        WOKEN = 0
+        WOKEN[here] = 0
     }
     core.drop(section)
     return woken
+}
+
+// The number of the core running this code, which selects its part of the
+// tables. Traps on a core beyond MAX_CORES.
+fn this_core() -> usize {
+    here := cpu.core_id()
+    core.assert(here < MAX_CORES)
+    return here as usize
 }

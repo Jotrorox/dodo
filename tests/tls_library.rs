@@ -193,9 +193,24 @@ fn tls_stream_keeps_transport_exclusively_borrowed() {
             &source,
             format!(
                 r#"package reuse
+import "std/io"
+import "std/tls"
 import "std/tls/stream"
-pub struct Engine {{ pub fn abort(&mut self) {{}} }}
-struct Transport {{}}
+pub struct Engine {{
+    pub fn handshake(&mut self) -> tls.State!tls.Error {{ return ok(tls.State.Ready) }}
+    pub fn feed(&mut self, source: &[u8]) -> usize!tls.Error {{ return ok(0) }}
+    pub fn drain(&mut self, destination: &mut[u8]) -> usize!tls.Error {{ return ok(0) }}
+    pub fn read_plain(&mut self, destination: &mut[u8]) -> tls.Progress!tls.Error {{ return ok(tls.Progress {{ state: tls.State.Ready, transferred: 0 }}) }}
+    pub fn write_plain(&mut self, source: &[u8]) -> tls.Progress!tls.Error {{ return ok(tls.Progress {{ state: tls.State.Ready, transferred: 0 }}) }}
+    pub fn flush(&mut self) -> tls.State!tls.Error {{ return ok(tls.State.Ready) }}
+    pub fn shutdown(&mut self) -> tls.State!tls.Error {{ return ok(tls.State.Closed) }}
+    pub fn eof(&mut self) {{}}
+    pub fn abort(&mut self) {{}}
+}}
+pub struct Transport {{
+    pub fn poll_read(&mut self, bytes: &mut[u8]) -> io.Poll!io.Error {{ return ok(io.Poll {{ transferred: 0, state: io.PollState.Pending }}) }}
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {{ return ok(io.Poll {{ transferred: 0, state: io.PollState.Pending }}) }}
+}}
 fn main() {{
     transport := Transport {{}}
     input := [0u8; 16]

@@ -4,13 +4,14 @@ import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 
-// The GPIO, I2C, SPI, UART, PWM, and ADC ownership the RP2040 and RP2350
-// share. On both chips GPIO 0 to 29 select the same controller signals with
+// The GPIO, I2C, SPI, UART, PWM, ADC, and PIO ownership the RP2040 and
+// RP2350 share. On both chips GPIO 0 to 29 select the same controller signals with
 // the same function numbers and pad bits, so the chip packages keep their
 // pins in a `Bank`, which checks bus pins, hands out each pin and controller
 // once, and takes them back. Serial ports claimed from a bank also report panics; see
@@ -30,6 +31,11 @@ const CONTROLLERS: usize = 6
 // The PWM block and the ADC, which serve several pins each.
 pub const PWM: u32 = 6
 pub const ADC: u32 = 7
+// The PIO blocks: PIO0 + n is block n, up to PIO1 on the RP2040 and PIO2 on
+// the RP2350.
+pub const PIO0: u32 = 8
+pub const PIO1: u32 = 9
+pub const PIO2: u32 = 10
 
 // GPIO functions (FUNCSEL). NULL disconnects the pin: it floats, apart from
 // its pad's pulls.
@@ -38,6 +44,8 @@ const FUNCTION_UART: u32 = 2
 const FUNCTION_I2C: u32 = 3
 const FUNCTION_PWM: u32 = 4
 const FUNCTION_SIO: u32 = 5
+// PIO block n drives the pins connected to function FUNCTION_PIO0 + n.
+const FUNCTION_PIO0: u32 = 6
 // The RP2350's second UART function, TX and RX on the pins that otherwise
 // carry CTS and RTS.
 const FUNCTION_UART_AUX: u32 = 11
@@ -174,15 +182,16 @@ fn uart_of(number: u32) -> u32 {
 // GPIO 0 to 29, the bus controllers, and the PWM outputs and ADC inputs of
 // one chip C, each handed out once and taken back by the release methods. C
 // does what differs between the chips, with these methods, `controller`
-// numbered as I2C0 to ADC above:
+// numbered as I2C0 to PIO2 above:
 //
 //    route(&mut self, pin: u32, function: u32, clear: u32, set: u32)
 //        connect the pin to FUNCSEL `function`, then clear the `clear` and
 //        set the `set` bits of its pad
 //    reset(&mut self, controller: u32) -> void!hal.Error
-//        pulse the controller's reset and wait until it runs (I2C0 to PWM)
+//        pulse the controller's reset and wait until it runs (I2C0 to PWM,
+//        and the PIO blocks)
 //    hold(&mut self, controller: u32)
-//        hold the controller in reset (I2C0 to PWM)
+//        hold the controller in reset (as for `reset`)
 //    base(&self, controller: u32) -> usize
 //        the controller's register block
 //    clock_hz(&self) -> u32
@@ -193,6 +202,13 @@ fn uart_of(number: u32) -> u32 {
 //        rp_adc.stop the ADC, hold it in reset, and stop its clock
 //    uart_aux(&self) -> bool
 //        whether the chip has the UART_AUX function (the RP2350)
+//    pio_blocks(&self) -> u32
+//        the number of PIO blocks: 2 on the RP2040, 3 on the RP2350
+//    pio_version(&self) -> u32
+//        their PIO version: 0 on the RP2040, 1 on the RP2350
+//    pio_irq(&self, block: u32) -> u32
+//        the interrupt number of PIO block `block`'s interrupt line 0;
+//        line 1's follows it
 pub struct Bank<C> {
     chip: C
     // Pins in use, one bit each.
@@ -203,14 +219,18 @@ pub struct Bank<C> {
     // Pins driven by PWM outputs, and ADC inputs in use, one bit each.
     pwm_pins: u32
     analog_inputs: u32
+    // PIO blocks in use, one bit each, and the pins each one drives.
+    pio_blocks: u32
+    pio_pins: [3]u32
 
     // SAFETY: C's methods must do what the protocol above says, `base` must
-    // name the controller's DW_apb_i2c, PL022, or PL011, or the PWM block or
-    // ADC, and the bank must be the only bank, and the only user of GPIO 0
-    // to 29's control and pad registers, of the controllers, the PWM block,
-    // and the ADC, and of their resets and clocks.
+    // name the controller's DW_apb_i2c, PL022, or PL011, the PWM block, the
+    // ADC, or the PIO block, and the bank must be the only bank, and the
+    // only user of GPIO 0 to 29's control and pad registers, of the
+    // controllers, the PWM block, the ADC, and the PIO blocks, and of their
+    // resets and clocks.
     pub unsafe fn new(chip: C) -> Bank<C> {
-        return Bank<C> { chip, taken: 0, buses: [0u32; 6], pwm_pins: 0, analog_inputs: 0 }
+        return Bank<C> { chip, taken: 0, buses: [0u32; 6], pwm_pins: 0, analog_inputs: 0, pio_blocks: 0, pio_pins: [0u32; 3] }
     }
 
     // Claim pin `number` for the single-cycle I/O block. Returns its bit, for
@@ -496,6 +516,63 @@ pub struct Bank<C> {
         if self.analog_inputs == 0 {
             self.chip.stop_adc()
         }
+    }
+
+    // Claim PIO block `number`, 0 to pio_blocks() - 1, out of reset with
+    // every state machine stopped. InvalidInput for another number, Busy
+    // if it is claimed, Timeout if it does not leave reset.
+    pub fn pio(&mut self, number: u32) -> rp_pio.Pio!hal.Error {
+        if number >= self.chip.pio_blocks() {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << number
+        if (self.pio_blocks & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.chip.reset(PIO0 + number)?
+        self.pio_blocks |= bit
+        base := self.chip.base(PIO0 + number)
+        version := self.chip.pio_version()
+        clock_hz := self.chip.clock_hz()
+        irq := self.chip.pio_irq(number)
+        // SAFETY: Bank.new vouches for the base address, the reset above
+        // left the block in its reset state, and the claim makes the Pio
+        // its only user.
+        unsafe {
+            return ok(rp_pio.Pio.at(base, number, version, clock_hz, irq))
+        }
+    }
+
+    // Connect the `count` pins from GPIO `first` to PIO block `pio`, so its
+    // state machines drive them, through the pin mappings of their
+    // configs, and read them. State machines also read pins claimed in
+    // other ways, such as inputs. InvalidInput for pins above GPIO 29 or a
+    // count of 0, Busy if a pin is taken.
+    pub fn pio_pins(&mut self, pio: &rp_pio.Pio, first: u32, count: u32) -> void!hal.Error {
+        if count == 0 || first >= PIN_COUNT || count > PIN_COUNT - first {
+            return err(hal.Error.InvalidInput)
+        }
+        block := pio.number()
+        core.assert((self.pio_blocks & (1u32 << block)) != 0)
+        mask := (0xFFFF_FFFFu32 >> (32 - count)) << first
+        self.reserve(mask)?
+        for number in first..first + count {
+            self.chip.route(number, FUNCTION_PIO0 + block, PAD_OUTPUT_DISABLE, PAD_INPUT_ENABLE)
+        }
+        self.pio_pins[block as usize] |= mask
+        return ok()
+    }
+
+    // Give back a PIO block from `pio` once its state machines have been
+    // given back to it: its pins are disconnected and the block is held in
+    // reset, which forgets its programs.
+    pub fn release_pio(&mut self, pio: rp_pio.Pio) {
+        block := pio.release()
+        pins := self.pio_pins[block as usize]
+        self.pio_pins[block as usize] = 0
+        self.disconnect(pins)
+        self.chip.hold(PIO0 + block)
+        self.pio_blocks &= ~(1u32 << block)
     }
 
     // Give back an I2C bus from `i2c`: its pins are disconnected, still

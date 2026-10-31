@@ -5,6 +5,8 @@ import "core/mem"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_multicore"
+import "std/embedded/chip/rp_pio"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
 import "std/embedded/hal"
@@ -16,7 +18,8 @@ import "std/sync/atomic"
 
 // Hardware self-test for the `pico2` board: the RP2350 startup runtime,
 // std/embedded/chip/rp2350 (clocks, timer, I2C, SPI, UART, PWM, the ADC,
-// the USB serial port, single ownership, configuration checks), std/embedded/board/pico2, and the runtime's integer and
+// PIO, the USB serial port, core 1 with the FIFOs and spinlocks, single
+// ownership, configuration checks), std/embedded/board/pico2, and the runtime's integer and
 // floating-point helpers. Every outcome ends in the USB bootloader with a
 // record that `scripts/test_pico.py --board pico2` reads over USB with
 // picotool. The RP2350 boot ROM clears SRAM when it starts, so the record is
@@ -754,6 +757,117 @@ fn pwm_adc_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
     check(inputs_owned && sensor_owned && in_range && restarted && elapsed >= 400 && elapsed < 1500 && celsius > 0 && celsius < 70_000)
 }
 
+// PIO programs for pio_checks: one that echoes each word inverted, and a
+// square wave on its side-set pin, half high and half low, that sets IRQ
+// flag 0 each period.
+const ECHO: rp_pio.Program = rp_pio.assemble(
+    "    pull block",
+    "    mov isr, ~osr",
+    "    push block",
+)
+const SQUARE: rp_pio.Program = rp_pio.assemble(
+    ".side_set 1",
+    "    irq 0   side 1 [15]",
+    "    nop     side 0 [15]",
+)
+const FILLER: rp_pio.Program = rp_pio.assemble(".origin 0", "nop [1]", "nop [2]", "nop [3]", "nop [4]", "nop [5]", "nop [6]", "nop [7]", "nop [8]", "nop [9]", "nop [10]", "nop [11]", "nop [12]", "nop [13]", "nop [14]", "nop [15]", "nop [16]", "nop [17]", "nop [18]", "nop [19]", "nop [20]", "nop [21]", "nop [22]", "nop [23]", "nop [24]", "nop [25]", "nop [26]", "nop [27]")
+// The RP2350's RX FIFO registers: register 1 keeps the inverse of
+// register 0.
+const REGISTERS: rp_pio.Program = rp_pio.assemble(
+    ".fifo putget",
+    "    mov osr, rxfifo[0]",
+    "    mov isr, ~osr",
+    "    mov rxfifo[1], isr",
+)
+// PIO with nothing connected (3 checks): block, program memory, state
+// machine, and pin ownership and validation; a program echoing words
+// through the FIFOs and the RX FIFO registers; a side-set square wave read
+// back from its pad, with its IRQ flag.
+fn pio_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
+    validated := refused(pins.pio(chip.PIO_BLOCKS), hal.Error.InvalidInput)
+    pio := pins.pio(0)!
+    pins.pio_pins(&pio, 15, 1)!
+    owned := refused(pins.pio(0), hal.Error.Busy) && refused(pins.output(15), hal.Error.Busy) && failed_with(pins.pio_pins(&pio, 15, 1), hal.Error.Busy) && failed_with(pins.pio_pins(&pio, 29, 2), hal.Error.InvalidInput)
+    filler := pio.load(&FILLER)!
+    echo := pio.load(&ECHO)!
+    full := refused(pio.load(&SQUARE), hal.Error.Busy) && refused(pio.load(&FILLER), hal.Error.Busy) && echo.offset() == 29 && filler.offset() == 0
+    pio.unload(filler)
+    machine := pio.state_machine(0)!
+    claimed := refused(pio.state_machine(0), hal.Error.Busy) && refused(pio.state_machine(4), hal.Error.InvalidInput)
+    check(validated && owned && full && claimed)
+
+    // Echo: nothing before the first word, then each word inverted, up to
+    // a full RX FIFO.
+    config := echo.config()
+    machine.init(&config)
+    machine.set_enabled(true)
+    quiet := machine.try_get()
+    echoed := false
+    if let none = quiet {
+        echoed = true
+    }
+    for word in 0..8u32 {
+        machine.put(0x1234_5670 + word)
+    }
+    timer.delay_us(10)
+    // Four words wait in the RX FIFO, one in the ISR, and three in the TX
+    // FIFO.
+    echoed = echoed && machine.rx_level() == 4 && machine.tx_level() == 3 && machine.is_rx_full()
+    for word in 0..8u32 {
+        start := timer.now_us()
+        received := false
+        for !received && timer.now_us() - start < 1000 {
+            if let some(value) = machine.try_get() {
+                received = true
+                echoed = echoed && value == ~(0x1234_5670 + word)
+            }
+        }
+        echoed = echoed && received
+    }
+    echoed = echoed && machine.is_rx_empty() && machine.is_tx_empty()
+    // The RX FIFO registers, from a second state machine.
+    registers := pio.load(&REGISTERS)!
+    setup := registers.config()
+    second := pio.state_machine(1)!
+    second.init(&setup)
+    second.set_rx_register(0, 0xA5A5_0F0F)!
+    second.set_enabled(true)
+    timer.delay_us(10)
+    inverse := second.rx_register(1)!
+    pio.release_state_machine(second)
+    pio.unload(registers)
+    echoed = echoed && inverse == 0x5A5A_F0F0
+    check(echoed)
+
+    // The square wave: 32 cycles a period at 32 kHz is 1 kHz.
+    pio.unload(echo)
+    square := pio.load(&SQUARE)!
+    wave := square.config()
+    wave.set_sideset_pins(15)!
+    wave.set_frequency(32_000)!
+    machine.init(&wave)
+    machine.set_pins(15, 1, 1)
+    machine.set_pindirs(15, 1, 1)
+    set_high := pin_level(15)
+    machine.set_pins(15, 1, 0)
+    set_low := !pin_level(15)
+    pio.clear_flags(0xFF)
+    unflagged := pio.flags() == 0
+    machine.set_enabled(true)
+    half := high_samples(15, timer)
+    flagged := (pio.flags() & 1) != 0
+    pio.clear_flags(1)
+    timer.delay_ms(2)
+    again := (pio.flags() & 1) != 0
+    running := machine.address() >= square.offset() && machine.address() < square.offset() + 2
+    pio.release_state_machine(machine)
+    pio.unload(square)
+    pins.release_pio(pio)
+    pin := pins.output(15)!
+    pins.release(pin)
+    check(set_high && set_low && unflagged && half > 420 && half < 580 && flagged && again && running)
+}
+
 // Restart the watchdog's 3 s countdown, for checks that wait on the host.
 fn feed_watchdog() {
     unsafe {
@@ -920,6 +1034,195 @@ fn refused_void(result: void!hal.Error, expected: hal.Error) -> bool {
     }
 }
 
+// Core 1: started with a task of its own, sharing the FIFOs and a spinlock
+// with core 0, and running an executor of its own. Its stack is a static,
+// so that it stays clear of the result record below core 0's stack.
+// Spinlock 0 is usable on the RP2040, reserved on the RP2350.
+const LOCK_ZERO_USABLE: bool = false
+static mut CORE1_STACK: [1024]u64 = [0u64; 1024]
+static mut SHARED_COUNT: u32 = 0
+static CORE1_FLAG: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+// Core 1's executor numbers its signals on its own: the same id as EDGE.
+const WORDS: executor.Signal = executor.Signal { id: 0 }
+const STOP_WORD: u32 = 0xFFFF_FFFF
+const ADDS: u32 = 10_000
+
+// On core 1, in three phases that core 0 drives: report the core number and
+// answer words until STOP_WORD; count to ADDS under the lock while core 0
+// does too; then double three words in a task of core 1's executor, woken
+// by the FIFO interrupt, and report how often that executor slept.
+struct Core1Test {
+    fifo: rp_multicore.Fifo
+    lock: rp_multicore.Spinlock
+    alarm: chip.Alarm
+
+    pub fn run(self) {
+        let Core1Test { fifo, lock, alarm } = self
+        link := fifo
+        clock := alarm
+        link.write(rp_multicore.core_id())
+        for {
+            word := link.read()
+            if word == STOP_WORD {
+                break
+            }
+            link.write(word * 3 + 1)
+        }
+        for _ in 0..ADDS {
+            guard := lock.lock()
+            unsafe {
+                SHARED_COUNT += 1
+            }
+            core.drop(guard)
+        }
+        link.write(ADDS)
+        link.set_signal(&WORDS)
+        doubler := Doubler { fifo: link, left: 3 }
+        runner := executor.Executor.new()
+        {
+            tasks: [1]&mut dyn executor.Task = [&mut doubler]
+            runner.run(&mut tasks, &mut clock)
+        }
+        doubler.fifo.clear_signal()
+        doubler.fifo.write(runner.sleeps() as u32)
+    }
+}
+
+// Doubles the words core 0 writes, polled when they arrive.
+struct Doubler {
+    fifo: rp_multicore.Fifo
+    left: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        WORDS.take(cx)
+        for {
+            match self.fifo.try_read() {
+                some(word) => {
+                    self.fifo.write(word * 2)
+                    self.left -= 1
+                    if self.left == 0 {
+                        return executor.Poll.Ready
+                    }
+                }
+                none => {
+                    break
+                }
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// On core 1, after a restart: show that it ran, and where.
+struct Flag {
+    pub fn run(self) {
+        match CORE1_FLAG.store(rp_multicore.core_id() + 1, atomic.Ordering.Release) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+fn flag() -> u32 {
+    match CORE1_FLAG.load(atomic.Ordering.Acquire) {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+// The next word from core 1, or STOP_WORD if none comes within 10 ms.
+fn receive(fifo: &mut rp_multicore.Fifo, timer: &mut chip.Timer) -> u32 {
+    start := timer.now_us()
+    for timer.now_us() - start < 10_000 {
+        if let some(word) = fifo.try_read() {
+            return word
+        }
+    }
+    return STOP_WORD
+}
+
+fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, spinlocks: &mut rp_multicore.Spinlocks, timer: &mut chip.Timer) {
+    feed_watchdog()
+    fifo := fifos.claim()!
+    lock := spinlocks.claim(20)!
+    claims := refused(spinlocks.claim(20), hal.Error.Busy) && refused(spinlocks.claim(32), hal.Error.InvalidInput) && spinlocks.is_usable(0) == LOCK_ZERO_USABLE
+    guard := lock.lock()
+    held := lock.is_locked() && cortex_m.interrupts_masked()
+    excluded := false
+    match lock.try_lock() {
+        some(_) => {}
+        none => {
+            excluded = true
+        }
+    }
+    core.drop(guard)
+    released := !lock.is_locked() && !cortex_m.interrupts_masked()
+    small := [0u64; 16]
+    tiny := refused(core1.start(&mut small, Flag {}), hal.Error.InvalidInput)
+
+    unsafe {
+        SHARED_COUNT = 0
+    }
+    task := Core1Test { fifo: fifos.claim()!, lock: lock.clone(), alarm: timer.alarm(3)! }
+    third := refused(fifos.claim(), hal.Error.Busy)
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, task)!
+    }
+    id := receive(&mut fifo, timer)
+    echoes := true
+    for word in 0..5u32 {
+        fifo.write(word * 1000)
+        echoes = echoes && receive(&mut fifo, timer) == word * 3000 + 1
+    }
+    check(tiny && third && id == 1 && echoes)
+
+    fifo.write(STOP_WORD)
+    for _ in 0..ADDS {
+        guard = lock.lock()
+        unsafe {
+            SHARED_COUNT += 1
+        }
+        core.drop(guard)
+    }
+    counted := receive(&mut fifo, timer) == ADDS
+    total := unsafe {
+        SHARED_COUNT
+    }
+    check(claims && held && excluded && released && counted && total == 2 * ADDS)
+
+    doubled := true
+    for word in 10..13u32 {
+        timer.delay_ms(2)
+        fifo.write(word)
+        doubled = doubled && receive(&mut fifo, timer) == 2 * word
+    }
+    sleeps := receive(&mut fifo, timer)
+    start := timer.now_us()
+    for !running.is_finished() && timer.now_us() - start < 10_000 {}
+    finished := running.is_finished()
+    running.stop()
+    match CORE1_FLAG.store(0, atomic.Ordering.Release) {
+        ok() => {}
+        err(_) => {}
+    }
+    second := unsafe {
+        core1.start(&mut CORE1_STACK, Flag {})!
+    }
+    start = timer.now_us()
+    for flag() == 0 && timer.now_us() - start < 10_000 {}
+    flagged := flag() == 2
+    for !second.is_finished() && timer.now_us() - start < 10_000 {}
+    restarted := flagged && second.is_finished()
+    second.stop()
+    check(doubled && sleeps >= 3 && sleeps < 100 && finished && restarted)
+    fifos.release(fifo)
+    spinlocks.release(lock)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -1055,8 +1358,10 @@ fn main() {
     interrupt_checks(&mut b.timer)
     executor_checks(&mut b.pins, &mut b.timer)
     pwm_adc_checks(&mut b.pins, &mut b.timer)
+    pio_checks(&mut b.pins, &mut b.timer)
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
+    core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.

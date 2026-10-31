@@ -575,7 +575,12 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                 }
                 if target.contains("-windows-") {
                     linker.args(["-lkernel32", "-lshell32"]);
-                    if native.iter().any(|(name, _)| name.starts_with("std/net/")) {
+                    // The signal wake channel is a loopback socket pair.
+                    if native.iter().any(|(name, _)| {
+                        name.starts_with("std/net/")
+                            || name.starts_with("std/quic/")
+                            || name.starts_with("std/signal/")
+                    }) {
                         linker.arg("-lws2_32");
                     }
                 }
@@ -590,15 +595,17 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                         linker.arg("-lbcrypt");
                     }
                 }
-                let tls = native.iter().any(|(name, _)| name.starts_with("std/tls/"));
+                let ssl = native
+                    .iter()
+                    .any(|(name, _)| name.starts_with("std/tls/") || name.starts_with("std/quic/"));
                 let libcrypto = native
                     .iter()
                     .any(|(name, _)| name.starts_with("std/crypto/openssl/"));
-                if tls || libcrypto {
+                if ssl || libcrypto {
                     if apple {
                         homebrew_openssl(&mut linker);
                     }
-                    if tls {
+                    if ssl {
                         linker.arg("-lssl");
                     }
                     linker.arg("-lcrypto");
