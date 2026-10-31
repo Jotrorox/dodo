@@ -565,6 +565,7 @@ impl Loader<'_> {
                 | "web"
                 | "time"
                 | "window"
+                | "dylib"
         ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
             return Ok(import.to_owned());

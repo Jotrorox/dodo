@@ -645,6 +645,16 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                     "-lobjc",
                 ]);
             }
+            // std/dylib needs no C boundary; glibc before 2.34 keeps dlopen
+            // in libdl, which later releases retain as an empty stub.
+            if target.contains("-linux-")
+                && loaded
+                    .sources
+                    .iter()
+                    .any(|source| source.path == Path::new("<stdlib>/std/dylib/posix.dodo"))
+            {
+                linker.arg("-ldl");
+            }
             linker.args(&args.link_args).arg("-o").arg(out);
             if args.verbose {
                 eprintln!("Linking: {linker:?}");

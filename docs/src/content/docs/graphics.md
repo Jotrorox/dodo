@@ -440,8 +440,8 @@ A path is one kind of `graphics.Outline`, the interface the rasterizer draws.
 Any type with a `pub fn trace(&self, pen: &mut graphics.Pen)` method is an
 outline: it describes itself by calling the same five commands on the pen,
 and needs no storage at all. The rasterizer calls `trace` several times per
-drawing call (once for the bounds, then once per row), so it must describe
-the same shape each time:
+drawing call (once for the bounds, then usually once more to collect its
+edges), so it must describe the same shape each time:
 
 ```dodo
 struct Diamond {
@@ -465,8 +465,14 @@ Curves are flattened to within 1/32 pixel. Path coordinates are clamped to
 +/-2^29 subpixels (+/-2^21 pixels) and the `aa_` calls' pixel coordinates to
 +/-2^21, which keeps every product within 64 bits. Work is bounded by the
 visible part of the shape: rows and columns outside the clip rectangle are
-never visited. Each visible row traces the whole outline again, so an outline
-with thousands of edges is drawn faster as several smaller ones.
+never visited. Within it, the cost follows the edges rather than the area:
+coverage is computed only in the pixels an edge passes through, and solid
+interiors are filled as whole spans, so an outline or a long thin line costs
+about as much as its length. The outline is flattened once into at most 256
+straight edges at a time. When more edges cross the visible rows, the rows
+are drawn in bands, each tracing the outline again, and a row crossed by more
+than 256 edges traces it once per 256 columns, so an outline with thousands
+of edges is still drawn faster as several smaller ones.
 
 ## Gradients
 
