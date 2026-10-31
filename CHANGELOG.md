@@ -13,6 +13,18 @@
   their interrupt when a time has passed before the alarm was armed.
   `std/embedded/hal/fake` gains `Alarm`, and `fake.Delay` is a counter whose
   time is the delays asked of it, so timeouts are tested without waiting.
+- `std/gpu/opengl` creates OpenGL contexts without a window, and
+  `std/gpu/opengl/gl` binds the complete OpenGL 4.6 core profile (656
+  commands, 1364 enums), generated from the Khronos registry by
+  `scripts/generate_opengl.py`. Both are pure Dodo with no C runtime: each
+  OS's interface is opened at run time (EGL on Linux, surfaceless and without
+  an X server; CGL on macOS; WGL with a hidden window on Windows), so programs
+  link no graphics library and start on machines without one.
+  `opengl.Target` is an offscreen framebuffer whose pixels read back in
+  `std/graphics` row order, as RGBA or as the BGRA a `std/window` canvas uses;
+  `examples/opengl_window.dodo` shows a shaded triangle in a window. A
+  fixture renders and reads back a triangle with Mesa's llvmpipe in Linux CI
+  and with CGL on macOS.
 - `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
   entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
   declared with its own signature. It covers devices, command queues,
