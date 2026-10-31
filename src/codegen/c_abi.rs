@@ -447,7 +447,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             operands.extend(self.c_argument(value, &e.ty, pass)?);
         }
         self.transfer(&pending)?;
-        let call = self.builder.build_call(function, &operands, "call")?;
+        // A @link_name declaration may bind the symbol with its own signature.
+        let call = match self.foreign_signatures.get(name) {
+            Some(&ty) => self
+                .builder
+                .build_indirect_call(ty, function, &operands, "call")?,
+            None => self.builder.build_call(function, &operands, "call")?,
+        };
         let declaration = self
             .program
             .functions

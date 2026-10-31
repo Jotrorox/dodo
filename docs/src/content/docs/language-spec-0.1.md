@@ -1506,9 +1506,13 @@ implementation does not provide must reject such declarations before code
 generation completes (ID-C).
 
 An external symbol is the final declared function name, independent of package
-aliases. Compatible repeated declarations refer to one symbol. Declarations with
-different lowered parameter/result types must fail before native linking;
-the binding author must also ensure consistent signedness and extension contracts
+aliases, or the string of a `@link_name("symbol")` attribute, which applies only
+to prototypes without a body. Compatible repeated declarations refer to one
+symbol. Declarations with different lowered parameter/result types must fail
+before native linking unless one of them names the symbol with `@link_name`;
+then each call to a prototype uses that prototype's signature, as Objective-C's
+`objc_msgSend` requires. A definition's signature never varies this way. The
+binding author must also ensure consistent signedness and extension contracts
 where those types have the same storage width (ID-C). C entry points must not unwind
 through Dodo frames; Dodo has no exception unwinding contract.
 
@@ -1552,7 +1556,8 @@ are unspecified. These storage rules do not constitute a C enum or C union ABI.
 Target scalar and aggregate alignment remain implementation-defined (ID-TARGET).
 
 Function attributes are `@test`, `@ignore("reason")`, `@interrupt(VECTOR)`
-(section 16.6), `@section("name")`, and `@align(N)` (section 16.5); statics
+(section 16.6), `@link_name("symbol")` (section 16.1), `@section("name")`, and
+`@align(N)` (section 16.5); statics
 accept `@section` and `@align`. Accepted struct attributes are `@repr(C)`, `@unsafe_send`, `@unsafe_sync`,
 `@derive(Json)`, and `@json_deny_unknown`; the latter requires `@derive(Json)`.
 Derived JSON structs may rename fields with `@json_name("name")`. JSON derivation
@@ -2051,7 +2056,7 @@ execution cases and enforced static boundaries are identified separately.
 | ASM, ASM-EFFECT | E `firmware_attributes::inline_assembly_runs_on_the_host`; R `firmware_attributes::inline_assembly_mistakes_are_diagnosed`; T `firmware_attributes::firmware_uses_inline_assembly_and_the_cortex_m_package`; A `sema::asm::tests::templates_number_outputs_before_inputs`, `parser::tests::firmware_attributes_and_inline_assembly`. |
 | PLACE | T `firmware_attributes::sections_and_alignment_place_code_and_data`; R `firmware_attributes::placement_mistakes_are_diagnosed`. |
 | IRQ | T `firmware_attributes::interrupt_handlers_fill_the_vector_table`, `riscv_interrupt_handlers_return_with_mret`; R `firmware_attributes::interrupt_handler_mistakes_are_diagnosed`; A `hardware::tests::interrupt_names_match_the_runtime_vector_tables`. |
-| ABI-C | E `spec::c_scalar_results_and_struct_pointer_layout_interoperate`, `spec::c_structs_pass_and_return_by_value_across_the_c_abi`, `spec::c_struct_classification_follows_each_target_abi`; R `spec::incompatible_lowered_foreign_declarations_fail_before_linking`; E `regressions::foreign_narrow_integer_arguments_follow_the_c_abi`, `compiler::hello_uses_native_c_abi`, `imported_foreign_declarations_keep_their_c_symbol_name`, `repeated_foreign_declarations_across_packages_share_a_c_symbol`; E/R `spec::hosted_entry_signatures_and_c_definitions`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`. |
+| ABI-C | E `spec::c_scalar_results_and_struct_pointer_layout_interoperate`, `spec::c_structs_pass_and_return_by_value_across_the_c_abi`, `spec::c_struct_classification_follows_each_target_abi`, `spec::link_name_prototypes_lower_c_structs_with_their_own_signature`; R `spec::incompatible_lowered_foreign_declarations_fail_before_linking`; E `regressions::foreign_narrow_integer_arguments_follow_the_c_abi`, `compiler::hello_uses_native_c_abi`, `imported_foreign_declarations_keep_their_c_symbol_name`, `repeated_foreign_declarations_across_packages_share_a_c_symbol`; E/R `spec::hosted_entry_signatures_and_c_definitions`; R `spec::unsafe_pointer_conversions_and_unsupported_abi_are_rejected`. |
 | ABI-NATIVE, ABI-ENTRY | T `spec::target_profiles_publish_width_endianness_and_native_symbols`; A/R/E `spec::hosted_entry_signatures_and_c_definitions`; E `compiler::cli_run_preserves_program_exit_status`; T `compiler::emits_llvm_ir_bitcode_assembly_and_object_files`. |
 | Bindings, returns, patterns, sections 5–6 and 11–12 | E `compiler::immutable_runtime_bindings_preserve_mutable_references_and_function_tails`, `recursive_patterns_ranges_guards_and_conditional_bindings_execute`, `alternative_patterns_retry_guards_in_order`; R `compiler::new_binding_and_pattern_forms_reject_invalid_programs`, `rejects_unhandled_results_and_incompatible_propagation`; A/R/E `tests/reference_iteration.rs`. |
 | Borrow contracts and unsafe boundary, sections 8, 13 | E `compiler::borrowed_return_contracts_and_static_storage`, `references_reborrow_and_disjoint_fields`; R `compiler::rejects_conflicting_borrows_and_moves`, `rejects_escaping_or_ambiguous_borrows`, `unsafe_function_body_still_needs_an_explicit_block`. |

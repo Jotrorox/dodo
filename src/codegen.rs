@@ -10,7 +10,7 @@ use llvm_sys::{
     LLVMAtomicOrdering as AtomicOrdering, LLVMAtomicRMWBinOp as AtomicRMWBinOp,
     LLVMIntPredicate as IntPredicate, LLVMRealPredicate as FloatPredicate,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 mod c_abi;
@@ -254,6 +254,9 @@ pub fn generate<'ctx>(
         interfaces: crate::sema::flattened_interfaces(program).map_err(|e| error(e.message))?,
         vtables: HashMap::new(),
         fn_pointers: HashMap::new(),
+        foreign_signatures: HashMap::new(),
+        link_named: HashSet::new(),
+        c_definitions: HashSet::new(),
         trampolines: HashMap::new(),
         used: vec![],
     };
@@ -385,6 +388,13 @@ struct Codegen<'a, 'ctx> {
     // Function-pointer entry points of named functions and closure bodies,
     // and per-signature adapters from function pointers to closure references.
     fn_pointers: HashMap<String, Value<'ctx>>,
+    /// Extern declarations that share a symbol under a different signature
+    /// than the module's declaration of it: calls use this function type.
+    foreign_signatures: HashMap<String, LlvmType<'ctx>>,
+    /// Symbols some declaration named with `@link_name`.
+    link_named: HashSet<String>,
+    /// Extern symbols this module defines.
+    c_definitions: HashSet<String>,
     trampolines: HashMap<String, Value<'ctx>>,
     // Definitions with `@section`, kept through `llvm.used`.
     used: Vec<Value<'ctx>>,
@@ -635,7 +645,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             let symbol = if let Some(vector) = &f.interrupt {
                 vector.clone()
             } else if f.extern_ {
-                f.name.rsplit('.').next().unwrap_or(&f.name).to_owned()
+                f.foreign_symbol().to_owned()
             } else {
                 format!("dodo.{}.{}", self.program.package, f.name)
             };
@@ -650,10 +660,20 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     LLVMInternalLinkage
                 };
             let function = if let Some(existing) = self.module.lookup_function(&symbol) {
-                if !f.extern_ || existing.get_type() != ty {
+                // Declarations naming their symbol with @link_name may bind
+                // it with their own signature, the way Objective-C casts
+                // `objc_msgSend` per method; calls then use that signature.
+                // An implicit clash stays an error, since two packages
+                // disagreeing about one C function is almost always a bug.
+                let aliased = f.link_name.is_some() || self.link_named.contains(&symbol);
+                let foreign = f.body.is_none() && !self.c_definitions.contains(&symbol);
+                if !f.extern_ || (existing.get_type() != ty && !(aliased && foreign)) {
                     return Err(error(format!(
                         "incompatible declarations of external symbol `{symbol}`"
                     )));
+                }
+                if existing.get_type() != ty {
+                    self.foreign_signatures.insert(f.name.clone(), ty);
                 }
                 existing
             } else {
@@ -662,7 +682,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             if let Some(lowering) = lowering {
                 self.c_abi.insert(f.name.clone(), lowering);
             }
-            if exported {
+            if f.link_name.is_some() {
+                self.link_named.insert(symbol.clone());
+            }
+            if f.extern_ && f.body.is_some() {
+                self.c_definitions.insert(symbol.clone());
+            }
+            if exported && !self.foreign_signatures.contains_key(&f.name) {
                 for (location, attribute) in self.c_abi_attributes(f)? {
                     function.add_attribute(location, attribute);
                 }
@@ -3500,15 +3526,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
         }
         self.transfer(&pending)?;
-        let call = self.builder.build_call(
-            f,
-            &vs,
-            if *ret == Type::Void || indirect_return {
-                ""
-            } else {
-                "call"
-            },
-        )?;
+        let label = if *ret == Type::Void || indirect_return {
+            ""
+        } else {
+            "call"
+        };
+        let call = match self.foreign_signatures.get(name) {
+            Some(&ty) => self.builder.build_indirect_call(ty, f, &vs, label)?,
+            None => self.builder.build_call(f, &vs, label)?,
+        };
         if let Some(function) = self
             .program
             .functions

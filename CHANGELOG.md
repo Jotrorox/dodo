@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `@link_name("symbol")` binds an `extern "C"` prototype to a symbol other
+  than its own name, and several prototypes may bind one symbol with different
+  signatures. Each call uses its own declaration's signature, so Objective-C
+  bindings can declare one `objc_msgSend` per method signature. Without
+  `@link_name`, clashing signatures for one symbol are still an error.
 - `extern "C"` functions pass and return `@repr(C)` structs by value, both
   when Dodo calls C and when C calls a Dodo `extern "C" fn`. The compiler
   classifies each struct as the target's C compiler does for x86-64 System V

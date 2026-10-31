@@ -903,6 +903,107 @@ fn main()->i32 {
 }
 
 #[test]
+fn link_name_binds_one_symbol_under_several_signatures() {
+    let workspace = Workspace::new();
+    // Like objc_msgSend: one entry point whose callers each cast it to the
+    // signature of the operation the selector names.
+    let foreign = workspace.file(
+        "foreign.rs",
+        r#"
+#[no_mangle] pub unsafe extern "C" fn send(selector: u64, value: usize) -> i64 {
+    match selector {
+        1 => value as i64 * 2,
+        2 => { *(value as *mut i64) = 5; 0 }
+        _ => -1,
+    }
+}
+"#,
+    );
+    let object = workspace.0.join("foreign.o");
+    success(
+        Command::new("rustc")
+            .args([
+                "--edition=2021",
+                "--crate-type=lib",
+                "--emit=obj",
+                "-Copt-level=3",
+            ])
+            .arg(foreign)
+            .arg("-o")
+            .arg(&object)
+            .output()
+            .unwrap(),
+    );
+    workspace.file(
+        "messages.dodo",
+        "package messages\n@link_name(\"send\")\npub unsafe extern \"C\" fn store(selector:u64, target:*mut i64)\n",
+    );
+    let source = workspace.file(
+        "main.dodo",
+        r#"package main
+import "core/ptr"
+import "messages"
+unsafe extern "C" fn send(selector:u64, value:u64)->i64
+@link_name("send")
+unsafe extern "C" fn double(selector:u64, value:i64)->i64
+fn main()->i32 {
+    slot := 0i64
+    unsafe {
+        if send(1u64, 4u64) != 8i64 { return 1 }
+        if double(1u64, 21i64) != 42i64 { return 2 }
+        messages.store(2u64, ptr.from_mut(&mut slot))
+    }
+    if slot != 5i64 { return 3 }
+    0
+}
+"#,
+    );
+    for level in ["0", "3"] {
+        let binary = workspace.0.join("link-name-program");
+        success(
+            workspace
+                .compiler(&["build", "-O", level])
+                .arg(&source)
+                .arg("--link-arg")
+                .arg(&object)
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .unwrap(),
+        );
+        success(Command::new(binary).output().unwrap());
+    }
+    for (body, message) in [
+        (
+            "@link_name(\"x\")\nfn take() {}",
+            "extern \"C\" declarations without a body",
+        ),
+        (
+            "@link_name(\"x\")\nextern \"C\" fn take() {}",
+            "extern \"C\" declarations without a body",
+        ),
+        (
+            "@link_name(\"x\")\nstruct S { x:i32 }",
+            "applies only to extern",
+        ),
+        (
+            "@link_name(\"\")\nextern \"C\" fn take()",
+            "nonempty printable ASCII",
+        ),
+        (
+            "@link_name(x)\nextern \"C\" fn take()",
+            "expects a string symbol name",
+        ),
+        (
+            "@link_name(\"x\") @link_name(\"y\")\nextern \"C\" fn take()",
+            "duplicate @link_name",
+        ),
+    ] {
+        workspace.reject(&format!("package invalid\n{body}\n"), message);
+    }
+}
+
+#[test]
 fn c_structs_pass_and_return_by_value_across_the_c_abi() {
     // The host C compiler classifies every struct shape; the fixture calls C
     // with each one and C calls back into Dodo definitions with them.
@@ -1032,6 +1133,66 @@ pub fn use_all() {
         String::from_utf8_lossy(&output.stderr).contains("does not support yet"),
         "{output:?}"
     );
+}
+
+#[test]
+fn link_name_prototypes_lower_c_structs_with_their_own_signature() {
+    // Objective-C bindings cast objc_msgSend once per method, including
+    // methods that take or return structs such as NSRect or MTLSize.
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "messages.dodo",
+        r#"package messages
+@repr(C)
+struct Rect { x: f64, y: f64, w: f64, h: f64 }
+@repr(C)
+struct Size { w: u64, h: u64, d: u64 }
+unsafe extern "C" fn objc_msgSend(receiver: *mut u8, selector: *mut u8) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn msg_rect(receiver: *mut u8, selector: *mut u8) -> Rect
+@link_name("objc_msgSend")
+unsafe extern "C" fn msg_dispatch(receiver: *mut u8, selector: *mut u8, groups: Size, threads: Size)
+pub fn send(receiver: *mut u8, selector: *mut u8) -> f64 {
+    unsafe {
+        _ = objc_msgSend(receiver, selector)
+        msg_dispatch(receiver, selector, Size { w: 1, h: 2, d: 3 }, Size { w: 4, h: 5, d: 6 })
+        rect := msg_rect(receiver, selector)
+        return rect.w
+    }
+}
+"#,
+    );
+    for (target, calls) in [
+        (
+            "aarch64-apple-darwin",
+            &[
+                "call [4 x double] @objc_msgSend(ptr",
+                "call void @objc_msgSend(ptr %",
+            ][..],
+        ),
+        (
+            "x86_64-apple-darwin",
+            &[
+                "call void @objc_msgSend(ptr sret(%Rect) align 8",
+                "ptr byval(%Size) align 8",
+            ][..],
+        ),
+    ] {
+        let ir = workspace.0.join(format!("{target}.ll"));
+        success(
+            workspace
+                .compiler(&["build", "--emit", "llvm-ir", "--target", target])
+                .arg(&source)
+                .arg("-o")
+                .arg(&ir)
+                .output()
+                .unwrap(),
+        );
+        let text = fs::read_to_string(&ir).unwrap();
+        for call in calls {
+            assert!(text.contains(call), "{target}: missing `{call}` in\n{text}");
+        }
+    }
 }
 
 #[test]
