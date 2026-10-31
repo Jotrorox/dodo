@@ -206,6 +206,9 @@ pub fn over(top: Color, bottom: Color) -> Color {
     }
     inverse := 255 - a
     bottom_alpha := bottom >> 24
+    if bottom_alpha == 255 {
+        return blend_opaque(tint_low(top, a), tint_high(top, a), inverse, bottom)
+    }
     // out_alpha * 255 = a * 255 + bottom_alpha * (255 - a)
     out_alpha := a * 255 + bottom_alpha * inverse
     if out_alpha == 0 {
@@ -227,6 +230,34 @@ fn mix_channel(top: u32, bottom: u32, a: u32, weight: u32, out_alpha: u32) -> u3
 fn div255(value: u32) -> u32 {
     biased := value + 128
     return (biased + (biased >> 8)) >> 8
+}
+
+// Blending works on whole 32-bit pixels, two 8-bit channels per operation:
+// bytes 0 and 2 of a pixel sit in the 16-bit lanes of one u32, bytes 1 and
+// 3 in another, and every lane product stays below 2^16. The alpha byte is
+// byte 3 both in a Color and in Rgba8888/Bgra8888 storage, so the same code
+// blends either layout.
+//
+// tint_low and tint_high premultiply a source pixel by its alpha `a` once:
+// bytes 0 and 2, then bytes 1 and 3 with the alpha byte taken as 255, so
+// blending onto an opaque pixel leaves it opaque.
+fn tint_low(pixel: u32, a: u32) -> u32 {
+    return (pixel & 0x00ff00ff) * a
+}
+
+fn tint_high(pixel: u32, a: u32) -> u32 {
+    return (((pixel >> 8) & 0x000000ff) | 0x00ff0000) * a
+}
+
+// A tinted source with alpha a composited over the opaque pixel `below`,
+// where inverse = 255 - a. Each channel is div255(top * a + below * inverse),
+// which is exactly what over() computes when the bottom alpha is 255.
+fn blend_opaque(low: u32, high: u32, inverse: u32, below: u32) -> u32 {
+    l := low + (below & 0x00ff00ff) * inverse + 0x00800080
+    h := high + ((below >> 8) & 0x00ff00ff) * inverse + 0x00800080
+    l = ((l + ((l >> 8) & 0x00ff00ff)) >> 8) & 0x00ff00ff
+    h = (h + ((h >> 8) & 0x00ff00ff)) & 0xff00ff00
+    return l | h
 }
 
 // The bytes `color` occupies in `format`, packed with the first memory byte
@@ -839,12 +870,11 @@ pub struct Canvas {
         row := y * self.stride
         match &self.format {
             PixelFormat.Rgba8888 => {
-                i := row + x * 4
-                return rgba(self.pixels[i], self.pixels[i + 1], self.pixels[i + 2], self.pixels[i + 3])
+                value := self.load(row + x * 4)
+                return (value & 0xff00ff00) | ((value & 255) << 16) | ((value >> 16) & 255)
             }
             PixelFormat.Bgra8888 => {
-                i := row + x * 4
-                return rgba(self.pixels[i + 2], self.pixels[i + 1], self.pixels[i], self.pixels[i + 3])
+                return self.load(row + x * 4)
             }
             PixelFormat.Rgb565 => {
                 i := row + x * 2
@@ -870,10 +900,7 @@ pub struct Canvas {
     fn write(&mut self, x: usize, y: usize, packed: u32) {
         i := y * self.stride + x * self.bytes_per_pixel
         if self.bytes_per_pixel == 4 {
-            self.pixels[i] = (packed & 255) as u8
-            self.pixels[i + 1] = ((packed >> 8) & 255) as u8
-            self.pixels[i + 2] = ((packed >> 16) & 255) as u8
-            self.pixels[i + 3] = (packed >> 24) as u8
+            self.store(i, packed)
         } else if self.bytes_per_pixel == 2 {
             self.pixels[i] = (packed & 255) as u8
             self.pixels[i + 1] = (packed >> 8) as u8
@@ -888,6 +915,37 @@ pub struct Canvas {
                 self.pixels[index] = self.pixels[index] & (255 - mask)
             }
         }
+    }
+    // Load and store the 32-bit pixel at byte offset i of a 4-byte format,
+    // with byte 0 in the low bits.
+    fn load(&self, i: usize) -> u32 {
+        p := &self.pixels[i..i + 4]
+        return (p[0] as u32) | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | ((p[3] as u32) << 24)
+    }
+    fn store(&mut self, i: usize, value: u32) {
+        p := &mut self.pixels[i..i + 4]
+        p[0] = (value & 255) as u8
+        p[1] = ((value >> 8) & 255) as u8
+        p[2] = ((value >> 16) & 255) as u8
+        p[3] = (value >> 24) as u8
+    }
+    // Composite `color` over the in-bounds pixel at storage position
+    // (x, y). Opaque 32-bit pixels blend in their stored layout without
+    // decoding; everything else goes through over().
+    fn composite(&mut self, x: usize, y: usize, color: Color) {
+        if self.bytes_per_pixel == 4 {
+            i := y * self.stride + x * 4
+            below := self.load(i)
+            if (below >> 24) == 255 {
+                a := color >> 24
+                top := encode(&self.format, color)
+                self.store(i, blend_opaque(tint_low(top, a), tint_high(top, a), 255 - a, below))
+                return
+            }
+        }
+        below := self.read(x, y)
+        blended := encode(&self.format, over(color, below))
+        self.write(x, y, blended)
     }
     // Fill columns left..right of `row`, all inside the canvas.
     //
@@ -1143,11 +1201,51 @@ pub struct Canvas {
         if l >= r || t >= b {
             return
         }
-        for row in t..b {
-            for column in l..r {
-                below := self.get(column, row)
-                blended := encode(&self.format, over(color, below))
-                self.put(column, row, blended)
+        ox := self.origin_x
+        oy := self.origin_y
+        // UI backgrounds repeat, so remember the last pixel blended.
+        last_below := 0u32
+        last_result := 0u32
+        have_last := false
+        if self.bytes_per_pixel == 4 {
+            // Premultiply once; opaque pixels then blend in storage layout.
+            top := encode(&self.format, color)
+            low := tint_low(top, a)
+            high := tint_high(top, a)
+            inverse := 255 - a
+            for row in t..b {
+                y := (row - oy) as usize
+                i := y * self.stride + (l - ox) as usize * 4
+                for column in l..r {
+                    below := self.load(i)
+                    if !have_last || below != last_below {
+                        last_below = below
+                        have_last = true
+                        if (below >> 24) == 255 {
+                            last_result = blend_opaque(low, high, inverse, below)
+                        } else {
+                            under := self.read((column - ox) as usize, y)
+                            last_result = encode(&self.format, over(color, under))
+                        }
+                    }
+                    self.store(i, last_result)
+                    i += 4
+                }
+            }
+        } else {
+            // Rgb565, Gray8 and Mono1 read as opaque colors.
+            for row in t..b {
+                y := (row - oy) as usize
+                for column in l..r {
+                    x := (column - ox) as usize
+                    below := self.read(x, y)
+                    if !have_last || below != last_below {
+                        last_below = below
+                        have_last = true
+                        last_result = encode(&self.format, over(color, below))
+                    }
+                    self.write(x, y, last_result)
+                }
             }
         }
         self.touch(l, t, r, b)
@@ -1446,12 +1544,13 @@ pub struct Canvas {
                     color := source.read(source_column + (column - l) as usize, source_row)
                     if blend && has_alpha {
                         a := color >> 24
-                        if a != 0 {
-                            if a != 255 {
-                                color = over(color, self.get(column, row))
-                            }
+                        if a == 255 {
                             converted := encode(&self.format, color)
                             self.put(column, row, converted)
+                        } else if a != 0 {
+                            cx := (column - self.origin_x) as usize
+                            cy := (row - self.origin_y) as usize
+                            self.composite(cx, cy, color)
                         }
                     } else {
                         converted := encode(&self.format, color)
@@ -1558,10 +1657,45 @@ pub struct Canvas {
         if l >= r || t >= b {
             return
         }
+        if gradient.rows_constant() && !gradient.dithers(&self.format) {
+            // Vertical gradients: one color per row, filled or blended whole.
+            width := (r - l) as u32
+            for row in t..b {
+                color := gradient.color_at(l as i32, row as i32)
+                self.blend_rect(l as i32, row as i32, width, 1, color)
+            }
+            self.touch(l, t, r, b)
+            return
+        }
+        ox := self.origin_x
+        oy := self.origin_y
+        wide := self.bytes_per_pixel == 4
+        // Runs of one opaque color encode once.
+        last_paint := 0u32
+        last_packed := encode(&self.format, 0)
         for row in t..b {
+            y := (row - oy) as usize
+            i := y * self.stride + (l - ox) as usize * self.bytes_per_pixel
+            walk := gradient.walk(l, row)
             for column in l..r {
-                paint := gradient.shade(column, row, &self.format)
-                self.paint_pixel(column, row, paint, 255)
+                color := gradient.walk_color(&mut walk)
+                paint := gradient.dithered(color, column, row, &self.format)
+                a := paint >> 24
+                if a == 255 {
+                    if paint != last_paint {
+                        last_paint = paint
+                        last_packed = encode(&self.format, paint)
+                    }
+                    if wide {
+                        self.store(i, last_packed)
+                    } else {
+                        self.write((column - ox) as usize, y, last_packed)
+                    }
+                } else if a != 0 {
+                    self.composite((column - ox) as usize, y, paint)
+                }
+                i += self.bytes_per_pixel
+                gradient.advance(&mut walk)
             }
         }
         self.touch(l, t, r, b)
@@ -1640,9 +1774,9 @@ pub struct Canvas {
             self.put(x, y, opaque)
             return
         }
-        below := self.get(x, y)
-        blended := encode(&self.format, over(with_alpha(color, a as u8), below))
-        self.put(x, y, blended)
+        column := (x - self.origin_x) as usize
+        row := (y - self.origin_y) as usize
+        self.composite(column, row, with_alpha(color, a as u8))
     }
     fn rasterize<O: Outline>(&mut self, outline: &O, rule: FillRule, color: Color, gradient: &Gradient, shaded: bool) {
         even_odd := false
@@ -1668,6 +1802,8 @@ pub struct Canvas {
         opaque := !shaded && (color >> 24) == 255
         packed := encode(&self.format, color)
         for row in top..bottom {
+            // A solid fill's walk is constant: `unused` has no extent.
+            walk := gradient.walk(left, row)
             start := left
             for start < right {
                 end := min64(start + CHUNK as i64, right)
@@ -1696,13 +1832,17 @@ pub struct Canvas {
                         if level == 255 && opaque {
                             self.put(column, row, packed)
                         } else if shaded {
-                            paint := gradient.shade(column, row, &self.format)
+                            sampled := gradient.walk_color(&mut walk)
+                            paint := gradient.dithered(sampled, column, row, &self.format)
                             self.paint_pixel(column, row, paint, level)
                         } else {
                             self.paint_pixel(column, row, color, level)
                         }
                         written_left = min64(written_left, column)
                         written_right = max64(written_right, column + 1)
+                    }
+                    if shaded {
+                        gradient.advance(&mut walk)
                     }
                 }
                 self.touch(written_left, row, written_right, row + 1)
@@ -2776,38 +2916,48 @@ pub struct Gradient {
     }
     // The undithered color at the centre of pixel (x, y).
     pub fn color_at(&self, x: i32, y: i32) -> Color {
-        return self.sample(x as i64, y as i64)
+        t := self.spread_position(self.position(x as i64, y as i64))
+        return unpremultiply(self.mixed(t))
     }
-    fn sample(&self, x: i64, y: i64) -> Color {
-        t := 65535i64
+    // The position of pixel (x, y) along the gradient, 0 at the start and
+    // 65536 at the end, before the spread applies.
+    fn position(&self, x: i64, y: i64) -> i64 {
         if self.radial {
             if self.radius > 0 {
                 ex := clamp64(x - self.x0, -GRADIENT_REACH, GRADIENT_REACH) * 256
                 ey := clamp64(y - self.y0, -GRADIENT_REACH, GRADIENT_REACH) * 256
-                distance := isqrt((ex * ex + ey * ey) as u64) as i64
-                t = distance * 65536 / self.radius
+                return isqrt((ex * ex + ey * ey) as u64) as i64 * 65536 / self.radius
             }
         } else if self.length2 > 0 {
             ex := clamp64(x - self.x0, -GRADIENT_REACH, GRADIENT_REACH)
             ey := clamp64(y - self.y0, -GRADIENT_REACH, GRADIENT_REACH)
-            t = floor_div((ex * self.dx + ey * self.dy) * 65536, self.length2)
+            return floor_div((ex * self.dx + ey * self.dy) * 65536, self.length2)
         }
+        return 65535
+    }
+    // A position mapped into 0..65535 by the spread.
+    fn spread_position(&self, position: i64) -> i64 {
+        t := position
         if self.spread == SPREAD_REPEAT {
-            t = t - floor_div(t, 65536) * 65536
-        } else if self.spread == SPREAD_REFLECT {
+            return t - floor_div(t, 65536) * 65536
+        }
+        if self.spread == SPREAD_REFLECT {
             t = t - floor_div(t, 131072) * 131072
             if t >= 65536 {
                 t = 131071 - t
             }
-        } else {
-            t = clamp64(t, 0, 65535)
+            return t
         }
+        return clamp64(t, 0, 65535)
+    }
+    // The premultiplied color at a spread position.
+    fn mixed(&self, t: i64) -> u32 {
         last := self.count - 1
         if t <= self.offsets[0] {
-            return unpremultiply(self.colors[0])
+            return self.colors[0]
         }
         if t >= self.offsets[last] {
-            return unpremultiply(self.colors[last])
+            return self.colors[last]
         }
         i := 0usize
         for i + 1 < last && t >= self.offsets[i + 1] {
@@ -2815,11 +2965,151 @@ pub struct Gradient {
         }
         low := self.offsets[i]
         f := ((t - low) * 256 / (self.offsets[i + 1] - low)) as u32
-        return unpremultiply(mix_premultiplied(self.colors[i], self.colors[i + 1], f))
+        return mix_premultiplied(self.colors[i], self.colors[i + 1], f)
     }
-    // The color to store at (x, y) of a canvas in `format`.
-    fn shade(&self, x: i64, y: i64, format: &PixelFormat) -> Color {
-        color := self.sample(x, y)
+
+    // -- Stepping along a row ----------------------------------------------
+    //
+    // gradient_rect and the rasterizer visit pixels left to right, so they
+    // step a Walk instead of sampling each pixel from scratch. A linear
+    // position advances by a constant quotient and remainder, with no
+    // division. A radial distance is predicted from the three before it
+    // and confirmed by squaring, so the square root is only computed near
+    // the centre, where the distance bends sharply. Pixels whose position
+    // or premultiplied color repeats reuse the previous color. Every result
+    // equals color_at exactly.
+
+    // A walk starting at pixel (x, y).
+    fn walk(&self, x: i64, y: i64) -> Walk {
+        w := Walk { x: x, position: 65535, remainder: 0, step: 0, step_remainder: 0, row_square: 0, root1: 0, root2: 0, root3: 0, roots: 0u32, segment: 0, segment_low: 0, segment_high: 0, reciprocal: 0, cached_t: 0, cached_mixed: 0, cached: 0, has_cache: false }
+        if self.radial {
+            if self.radius > 0 {
+                ey := clamp64(y - self.y0, -GRADIENT_REACH, GRADIENT_REACH) * 256
+                w.row_square = ey * ey
+                position := self.radial_position(&mut w)
+                w.position = position
+            }
+        } else if self.length2 > 0 {
+            ex := clamp64(x - self.x0, -GRADIENT_REACH, GRADIENT_REACH)
+            ey := clamp64(y - self.y0, -GRADIENT_REACH, GRADIENT_REACH)
+            numerator := (ex * self.dx + ey * self.dy) * 65536
+            w.position = floor_div(numerator, self.length2)
+            w.remainder = numerator - w.position * self.length2
+            step := self.dx * 65536
+            w.step = floor_div(step, self.length2)
+            w.step_remainder = step - w.step * self.length2
+        }
+        return w
+    }
+    // Move the walk one pixel to the right.
+    fn advance(&self, w: &mut Walk) {
+        if self.radial {
+            w.x += 1
+            if self.radius > 0 {
+                position := self.radial_position(w)
+                w.position = position
+            }
+            return
+        }
+        if self.length2 > 0 {
+            // Columns beyond GRADIENT_REACH clamp to the same position.
+            offset := w.x - self.x0
+            if offset >= -GRADIENT_REACH && offset < GRADIENT_REACH {
+                w.position += w.step
+                w.remainder += w.step_remainder
+                if w.remainder >= self.length2 {
+                    w.remainder -= self.length2
+                    w.position += 1
+                }
+            }
+        }
+        w.x += 1
+    }
+    // The radial position of the walk's pixel, recording its distance.
+    fn radial_position(&self, w: &mut Walk) -> i64 {
+        ex := clamp64(w.x - self.x0, -GRADIENT_REACH, GRADIENT_REACH) * 256
+        square := ex * ex + w.row_square
+        guess := w.root1
+        if w.roots >= 3 {
+            guess = 3 * (w.root1 - w.root2) + w.root3
+        } else if w.roots == 2 {
+            guess = 2 * w.root1 - w.root2
+        }
+        root := settle_root(square, guess)
+        w.root3 = w.root2
+        w.root2 = w.root1
+        w.root1 = root
+        if w.roots < 3 {
+            w.roots += 1
+        }
+        return root * 65536 / self.radius
+    }
+    // mixed(t), remembering the stop pair t falls between so neighbouring
+    // pixels skip the search and divide by multiplying with a reciprocal.
+    fn walk_mixed(&self, w: &mut Walk, t: i64) -> u32 {
+        last := self.count - 1
+        if t <= self.offsets[0] {
+            return self.colors[0]
+        }
+        if t >= self.offsets[last] {
+            return self.colors[last]
+        }
+        if t < w.segment_low || t >= w.segment_high {
+            // Stops in a nonempty interval offsets[i]..offsets[i + 1]
+            // containing t; mixed() finds the same pair.
+            i := 0usize
+            for i + 1 < last && t >= self.offsets[i + 1] {
+                i += 1
+            }
+            w.segment = i
+            w.segment_low = self.offsets[i]
+            w.segment_high = self.offsets[i + 1]
+            w.reciprocal = RECIPROCAL_ONE / (w.segment_high - w.segment_low) + 1
+        }
+        f := (((t - w.segment_low) * 256 * w.reciprocal) >> RECIPROCAL_SHIFT) as u32
+        return mix_premultiplied(self.colors[w.segment], self.colors[w.segment + 1], f)
+    }
+    // The undithered color of the walk's pixel.
+    fn walk_color(&self, w: &mut Walk) -> Color {
+        t := self.spread_position(w.position)
+        if w.has_cache && t == w.cached_t {
+            return w.cached
+        }
+        mixed := self.walk_mixed(w, t)
+        w.cached_t = t
+        if !w.has_cache || mixed != w.cached_mixed {
+            w.cached_mixed = mixed
+            w.cached = unpremultiply(mixed)
+            w.has_cache = true
+        }
+        return w.cached
+    }
+    // True when every pixel of a row has the same color.
+    fn rows_constant(&self) -> bool {
+        if self.radial {
+            return self.radius == 0
+        }
+        return self.dx == 0 || self.length2 == 0
+    }
+    // True when dithered() changes colors for `format`.
+    fn dithers(&self, format: &PixelFormat) -> bool {
+        if !self.dither {
+            return false
+        }
+        match format {
+            PixelFormat.Rgb565 => {
+                return true
+            }
+            PixelFormat.Mono1 => {
+                return true
+            }
+            _ => {
+                return false
+            }
+        }
+    }
+    // `color`, sampled at (x, y), as stored on a canvas in `format`.
+    fn dithered(&self, color: Color, x: i64, y: i64, format: &PixelFormat) -> Color {
         if !self.dither {
             return color
         }
@@ -2842,6 +3132,65 @@ pub struct Gradient {
             }
         }
     }
+}
+
+// The state of Gradient.walk along one row.
+struct Walk {
+    // The pixel's column and unspread position.
+    x: i64
+    position: i64
+    // Linear: position = floor(numerator / length2), kept as quotient and
+    // remainder, and the per-column step split the same way.
+    remainder: i64
+    step: i64
+    step_remainder: i64
+    // Radial: the row's squared distance from the centre, in 1/256 pixels,
+    // and the last three distances, newest first.
+    row_square: i64
+    root1: i64
+    root2: i64
+    root3: i64
+    roots: u32
+    // The stop pair of the last color mixed: offsets segment_low up to
+    // segment_high, and RECIPROCAL_ONE / (their distance), plus one.
+    segment: usize
+    segment_low: i64
+    segment_high: i64
+    reciprocal: i64
+    // The last spread position, its premultiplied color and that color.
+    cached_t: i64
+    cached_mixed: u32
+    cached: Color
+    has_cache: bool
+}
+
+// floor(n / d) = (n * (2^40 / d + 1)) >> 40 for n < 2^24 and d < 2^16:
+// the reciprocal overshoots n / d by less than n / 2^40 < 2^-16, while
+// the fraction of n / d is at most 1 - 1/d, more than 2^-16 below 1. The
+// product stays below 2^49 because n < 256 * d here.
+const RECIPROCAL_SHIFT: i64 = 40
+const RECIPROCAL_ONE: i64 = 1099511627776
+
+// Correct distances below 2^31 need squares below 2^62.
+const ROOT_LIMIT: i64 = 2147483647
+
+// floor(sqrt(value)) for 0 <= value < 2^62, starting from a guess: a few
+// steps of one confirm a close guess, and anything else falls back to isqrt.
+fn settle_root(value: i64, guess: i64) -> i64 {
+    root := clamp64(guess, 0, ROOT_LIMIT - 1)
+    for _ in 0..4 {
+        if root * root > value {
+            root -= 1
+        } else if (root + 1) * (root + 1) <= value {
+            root += 1
+        } else {
+            return root
+        }
+    }
+    if root * root <= value && (root + 1) * (root + 1) > value {
+        return root
+    }
+    return isqrt(value as u64) as i64
 }
 
 // The 4x4 Bayer threshold, 0 to 15, of pixel (x, y).
@@ -2921,17 +3270,13 @@ fn unpremultiply(color: u32) -> Color {
     return (a << 24) | (r << 16) | (g << 8) | b
 }
 
-// Channel-wise (a * (256 - f) + b * f) / 256, rounded, for f in 0..256.
+// Channel-wise (a * (256 - f) + b * f) / 256, rounded, for f in 0..256,
+// two channels per operation (see tint_low).
 fn mix_premultiplied(a: u32, b: u32, f: u32) -> u32 {
-    result := 0u32
-    shift := 0u32
-    for shift < 32 {
-        ca := (a >> shift) & 255
-        cb := (b >> shift) & 255
-        result = result | (((ca * (256 - f) + cb * f + 128) >> 8) << shift)
-        shift += 8
-    }
-    return result
+    g := 256 - f
+    low := (a & 0x00ff00ff) * g + (b & 0x00ff00ff) * f + 0x00800080
+    high := ((a >> 8) & 0x00ff00ff) * g + ((b >> 8) & 0x00ff00ff) * f + 0x00800080
+    return ((low >> 8) & 0x00ff00ff) | (high & 0xff00ff00)
 }
 
 fn min_u32(a: u32, b: u32) -> u32 {
