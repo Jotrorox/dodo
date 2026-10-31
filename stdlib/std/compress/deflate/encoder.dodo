@@ -1,0 +1,147 @@
+package deflate
+
+import "core/slice"
+
+const STREAM_WINDOW: usize = 65536
+const STREAM_BLOCK_RAW: usize = 32768
+// Positions this close to the end of buffered input wait for more input, so
+// matches are not cut short by a buffer boundary.
+const LOOKAHEAD: usize = MAX_MATCH + MIN_MATCH + 1
+// Holds one block, which is never larger than its stored form.
+const PENDING_SIZE: usize = STREAM_BLOCK_RAW + 1024
+// Bytes of caller storage an Encoder needs: an input window and a block buffer.
+pub const ENCODER_BUFFER_LEN: usize = STREAM_WINDOW + PENDING_SIZE
+
+// Incremental compressor producing one raw DEFLATE stream. It buffers up to
+// 64 KiB of input and emits whole blocks, so output lags input until finish.
+// Storage is borrowed so the encoder stays small and never moves its buffers:
+// a buffer of at least ENCODER_BUFFER_LEN bytes and a workspace of at least
+// WORKSPACE_LEN words, about 350 KiB together. Static storage suits small
+// stacks.
+pub struct Encoder {
+    lz: Lz
+    workspace: Workspace
+    window: &mut[u8]
+    fill: usize
+    pending: &mut[u8]
+    pending_start: usize
+    pending_end: usize
+    bits: u32
+    bit_count: usize
+    finished: bool
+    pub fn new(level: usize, buffer: &mut[u8], words: &mut[u32]) -> Encoder!Error from(buffer, words) {
+        if level > MAX_LEVEL {
+            return err(Error.InvalidArgument)
+        }
+        let some(parts) = slice.split_at_mut(buffer, STREAM_WINDOW) else {
+            return err(Error.InvalidArgument)
+        }
+        let slice.SplitMut { left, right } = parts
+        if right.len < PENDING_SIZE {
+            return err(Error.InvalidArgument)
+        }
+        workspace := split_workspace(words)?
+        return ok(Encoder { lz: new_lz(level, STREAM_BLOCK_RAW), workspace: workspace, window: left, fill: 0,
+        pending: right, pending_start: 0, pending_end: 0, bits: 0, bit_count: 0, finished: false })
+    }
+    // Starts a new stream at the same level.
+    pub fn reset(&mut self) {
+        self.lz = new_lz(self.lz.level, STREAM_BLOCK_RAW)
+        self.workspace.reset()
+        self.fill = 0
+        self.pending_start = 0
+        self.pending_end = 0
+        self.bits = 0
+        self.bit_count = 0
+        self.finished = false
+    }
+    // Consumes input and writes compressed output. Pass finish true once input
+    // holds the final bytes, and keep passing it, resubmitting unconsumed
+    // input, until Done. NeedInput means all input was consumed; NeedOutput
+    // means output is full. Counts cover this call only.
+    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> Progress {
+        ip := 0usize
+        op := 0usize
+        for {
+            for self.pending_start < self.pending_end && op < output.len {
+                output[op] = self.pending[self.pending_start]
+                op += 1
+                self.pending_start += 1
+            }
+            if self.pending_start < self.pending_end {
+                return progress(ip, op, Status.NeedOutput)
+            }
+            self.pending_start = 0
+            self.pending_end = 0
+            if self.finished {
+                return progress(ip, op, Status.Done)
+            }
+            if self.fill < STREAM_WINDOW && ip < input.len {
+                n := input.len - ip
+                if n > STREAM_WINDOW - self.fill {
+                    n = STREAM_WINDOW - self.fill
+                }
+                for i in 0usize..n {
+                    self.window[self.fill + i] = input[ip + i]
+                }
+                self.fill += n
+                ip += n
+            }
+            final_input := finish && ip == input.len
+            limit := self.fill
+            if !final_input {
+                if limit > LOOKAHEAD {
+                    limit -= LOOKAHEAD
+                } else {
+                    limit = 0
+                }
+            }
+            if self.lz.pos < limit && tokenize(&mut self.lz, &mut self.workspace, &self.window[..self.fill], self.fill, limit) {
+                self.emit(false)
+                continue
+            }
+            if final_input {
+                finish_tokens(&mut self.lz, &mut self.workspace, &self.window[..self.fill])
+                self.emit(true)
+                self.finished = true
+                continue
+            }
+            if self.fill == STREAM_WINDOW {
+                // Keep the newest 32 KiB as history. The current block's raw
+                // bytes must survive for a possible stored block.
+                if self.lz.block_start < WINDOW_SIZE {
+                    self.emit(false)
+                }
+                for i in 0usize..WINDOW_SIZE {
+                    self.window[i] = self.window[WINDOW_SIZE + i]
+                }
+                self.fill -= WINDOW_SIZE
+                self.lz.pos -= WINDOW_SIZE
+                self.lz.inserted -= WINDOW_SIZE
+                self.lz.block_start -= WINDOW_SIZE
+                self.workspace.slide(WINDOW_SIZE as u32)
+                continue
+            }
+            if ip == input.len {
+                return progress(ip, op, Status.NeedInput)
+            }
+        }
+    }
+    // Writes the current block into the empty pending buffer, which always
+    // has room for it.
+    fn emit(&mut self, final_block: bool) {
+        writer := BitWriter { output: &mut self.pending[..], position: 0, bits: self.bits, count: self.bit_count }
+        match emit_block(&mut self.lz, &mut self.workspace, &self.window[..self.fill], &mut writer, final_block) {
+            ok() => {}, err(_) => {}
+        }
+        if final_block {
+            match writer.align() {
+                ok() => {}, err(_) => {}
+            }
+        }
+        // Whole bytes are output; the partial byte carries into the next block.
+        self.pending_end = writer.position
+        self.bits = writer.bits
+        self.bit_count = writer.count
+    }
+}

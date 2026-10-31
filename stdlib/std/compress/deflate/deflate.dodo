@@ -1,0 +1,46 @@
+package deflate
+
+// Raw RFC 1951 DEFLATE. The zlib and gzip packages share these result types, so
+// one Decoder or Encoder interface covers all three framings.
+pub enum Error {
+    // The input ended inside a stream. Incremental decoders report NeedInput.
+    Truncated,
+    InvalidData,
+    // The caller's output buffer cannot hold the result.
+    OutputFull,
+    // A zlib or gzip check value or size disagrees with the decoded data.
+    ChecksumMismatch,
+    // A zlib stream requires a preset dictionary.
+    UnsupportedDictionary,
+    // A compression level outside 0 through 9, storage shorter than
+    // ENCODER_BUFFER_LEN or WORKSPACE_LEN, or an invalid gzip header field.
+    InvalidArgument
+}
+pub enum Status {
+    NeedInput, NeedOutput, Done
+}
+// Counts for one incremental process call.
+pub struct Progress {
+    pub input_consumed: usize
+    pub output_written: usize
+    pub status: Status
+}
+pub struct DecodeResult {
+    pub input_consumed: usize
+    pub output_written: usize
+}
+
+pub const MAX_LEVEL: usize = 9
+pub const DEFAULT_LEVEL: usize = 6
+// The largest back-reference distance, and the default decoder window.
+pub const WINDOW_SIZE: usize = 32768
+
+// An output length that every encode level is guaranteed to fit. Blocks never
+// exceed their stored-block size, so incompressible input grows only slightly.
+pub fn max_encoded_len(input_len: usize) -> usize {
+    return input_len + 6 * (input_len / BLOCK_MIN_RAW + 1)
+}
+
+fn progress(input: usize, output: usize, status: Status) -> Progress {
+    return Progress { input_consumed: input, output_written: output, status: status }
+}

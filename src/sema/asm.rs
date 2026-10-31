@@ -183,7 +183,6 @@ impl Checker<'_> {
                 Some(tuple) if several => tuple.clone(),
                 _ => asm_result(outputs),
             },
-            deps: vec![],
         })
     }
 }

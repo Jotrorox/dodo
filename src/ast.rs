@@ -373,6 +373,10 @@ pub struct Program {
     /// The vector names a firmware build's chip accepts in `@interrupt`; set
     /// by package loading for a board or chip, `None` elsewhere.
     pub interrupt_vectors: Option<&'static [&'static str]>,
+    /// The PIO version of a firmware build's chip, for `rp_pio.assemble`: 0
+    /// on the RP2040, 1 on the RP2350, `None` on chips without PIO and
+    /// outside firmware builds.
+    pub pio_version: Option<u8>,
 }
 impl Program {
     /// Whether a value of `ty` holds an interior-mutable struct (see
@@ -505,6 +509,9 @@ pub struct Function {
     pub extern_: bool,
     /// Reserved printing entry points; retained on fixed helpers for editor signatures.
     pub printing: Option<Printing>,
+    /// `@compiler(pio)`: std/embedded/chip/rp_pio's `assemble`, whose calls
+    /// are assembled at compile time into a `Program` literal.
+    pub pio: bool,
     pub generics: Vec<String>,
     pub bounds: Vec<Bound>,
     /// Compiler-generated specialization: declared borrow sources may become

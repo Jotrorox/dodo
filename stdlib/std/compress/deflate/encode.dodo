@@ -1,0 +1,541 @@
+package deflate
+
+import "core/slice"
+
+const HASH_SIZE: usize = 16384
+const TOKEN_LIMIT: usize = 16384
+// Raw bytes per block, leaving room below a single stored block's 65535.
+const ONE_SHOT_BLOCK_RAW: usize = 65000
+// Blocks hold at least this many raw bytes unless they are final.
+const BLOCK_MIN_RAW: usize = TOKEN_LIMIT
+const MIN_MATCH: usize = 3
+const MAX_MATCH: usize = 258
+// Length-3 matches farther away cost more than three literals (zlib's TOO_FAR).
+const TOO_FAR: usize = 4096
+
+// Words of caller storage for the LZ77 match finder and block tokens, 256 KiB.
+// Encoders reset it on each call, so one buffer serves any number of calls.
+pub const WORKSPACE_LEN: usize = HASH_SIZE + WINDOW_SIZE + TOKEN_LIMIT + 1
+
+// Views of caller storage. Storage is borrowed rather than owned because
+// moving large aggregates by value is slow to compile and stack-hungry.
+struct Workspace {
+    heads: &mut[u32]
+    links: &mut[u32]
+    tokens: &mut[u32]
+    fn reset(&mut self) {
+        for i in 0usize..HASH_SIZE {
+            self.heads[i] = 0
+        }
+        for i in 0usize..WINDOW_SIZE {
+            self.links[i] = 0
+        }
+    }
+    // Forgets positions older than delta and renumbers the rest.
+    fn slide(&mut self, delta: u32) {
+        for i in 0usize..HASH_SIZE {
+            entry := self.heads[i]
+            if entry > delta {
+                self.heads[i] = entry - delta
+            } else {
+                self.heads[i] = 0
+            }
+        }
+        for i in 0usize..WINDOW_SIZE {
+            entry := self.links[i]
+            if entry > delta {
+                self.links[i] = entry - delta
+            } else {
+                self.links[i] = 0
+            }
+        }
+    }
+}
+fn split_workspace(words: &mut[u32]) -> Workspace!Error from(words) {
+    if words.len < WORKSPACE_LEN {
+        return err(Error.InvalidArgument)
+    }
+    let some(first) = slice.split_at_mut(words, HASH_SIZE) else {
+        return err(Error.InvalidArgument)
+    }
+    let slice.SplitMut { left, right } = first
+    return split_rest(left, right)
+}
+fn split_rest(heads: &mut[u32], rest: &mut[u32]) -> Workspace!Error from(heads, rest) {
+    let some(second) = slice.split_at_mut(rest, WINDOW_SIZE) else {
+        return err(Error.InvalidArgument)
+    }
+    let slice.SplitMut { left, right } = second
+    ws := Workspace { heads: heads, links: left, tokens: right }
+    ws.reset()
+    return ok(ws)
+}
+
+// LSB-first writer. Values must fit in n bits, with n at most 16.
+struct BitWriter {
+    output: &mut[u8]
+    position: usize
+    bits: u32
+    count: usize
+    fn put(&mut self, value: usize, n: usize) -> void!Error {
+        self.bits = self.bits | ((value as u32) << (self.count as u32))
+        self.count += n
+        for self.count >= 8 {
+            if self.position == self.output.len {
+                return err(Error.OutputFull)
+            }
+            self.output[self.position] = (self.bits & 255) as u8
+            self.position += 1
+            self.bits = self.bits >> 8
+            self.count -= 8
+        }
+        return ok()
+    }
+    fn align(&mut self) -> void!Error {
+        if self.count != 0 {
+            padding := 8 - self.count
+            self.put(0, padding)?
+        }
+        return ok()
+    }
+    fn bytes(&mut self, data: &[u8]) -> void!Error {
+        if data.len > self.output.len - self.position {
+            return err(Error.OutputFull)
+        }
+        for i in 0usize..data.len {
+            self.output[self.position + i] = data[i]
+        }
+        self.position += data.len
+        return ok()
+    }
+}
+
+struct Match {
+    length: usize
+    distance: usize
+}
+
+// Tokenizer state. Positions index the data slice handed to each call; entries
+// in the workspace hold position + 1 - base, so zero ends a chain.
+struct Lz {
+    level: usize
+    max_chain: usize
+    good: usize
+    lazy: usize
+    nice: usize
+    block_raw: usize
+    base: usize
+    pos: usize
+    inserted: usize
+    block_start: usize
+    token_count: usize
+    // A match or literal found at pos - 1, waiting to see whether pos does better.
+    deferred: bool
+    deferred_match: Match
+}
+fn new_lz(level: usize, block_raw: usize) -> Lz {
+    // zlib's tuning: good length, lazy limit, nice length, chain length.
+    good := [0usize, 4, 4, 4, 4, 8, 8, 8, 32, 32]
+    lazy := [0usize, 0, 0, 0, 4, 16, 16, 32, 128, 258]
+    nice := [0usize, 8, 16, 32, 16, 32, 128, 128, 258, 258]
+    chain := [0usize, 4, 8, 32, 16, 32, 128, 256, 1024, 4096]
+    return Lz { level: level, max_chain: chain[level], good: good[level], lazy: lazy[level], nice: nice[level],
+    block_raw: block_raw, base: 0, pos: 0, inserted: 0, block_start: 0, token_count: 0,
+    deferred: false, deferred_match: Match { length: 0, distance: 0 } }
+}
+fn hash3(data: &[u8], pos: usize) -> usize {
+    return (((data[pos] as usize) << 10) ^ ((data[pos + 1] as usize) << 5) ^ (data[pos + 2] as usize)) & (HASH_SIZE - 1)
+}
+fn match_token(length: usize, distance: usize) -> u32 {
+    return ((length << 16) | distance) as u32
+}
+
+// Bytes the current block's tokens cover; a deferred choice is not yet covered.
+fn covered(lz: &Lz) -> usize {
+    if lz.deferred {
+        return lz.pos - 1
+    }
+    return lz.pos
+}
+// Hashes every position before pos.
+fn insert_until(lz: &mut Lz, ws: &mut Workspace, data: &[u8], end: usize) {
+    for lz.inserted < lz.pos {
+        at := lz.inserted
+        if end - at >= MIN_MATCH {
+            h := hash3(data, at)
+            ws.links[at & (WINDOW_SIZE - 1)] = ws.heads[h]
+            ws.heads[h] = (at + 1 - lz.base) as u32
+        }
+        lz.inserted += 1
+    }
+}
+// Finds a match at pos longer than shorter_than, within the bytes before end.
+fn longest_match(lz: &Lz, ws: &Workspace, data: &[u8], end: usize, shorter_than: usize) -> Match {
+    pos := lz.pos
+    best := Match { length: 0, distance: 0 }
+    max_length := end - pos
+    if max_length > MAX_MATCH {
+        max_length = MAX_MATCH
+    }
+    if max_length < MIN_MATCH {
+        return best
+    }
+    best_length := shorter_than
+    if best_length < MIN_MATCH - 1 {
+        best_length = MIN_MATCH - 1
+    }
+    chain := lz.max_chain
+    if shorter_than >= lz.good {
+        chain = chain >> 2
+    }
+    entry := ws.heads[hash3(data, pos)] as usize
+    for entry != 0 && chain > 0 {
+        candidate := entry - 1 + lz.base
+        if candidate >= pos || pos - candidate > WINDOW_SIZE {
+            break
+        }
+        if best_length < max_length && data[candidate + best_length] == data[pos + best_length] {
+            n := 0usize
+            for n < max_length && data[candidate + n] == data[pos + n] {
+                n += 1
+            }
+            if n > best_length {
+                best_length = n
+                best.length = n
+                best.distance = pos - candidate
+                if n >= lz.nice || n == max_length {
+                    break
+                }
+            }
+        }
+        entry = ws.links[candidate & (WINDOW_SIZE - 1)] as usize
+        chain -= 1
+    }
+    if best.length == MIN_MATCH && best.distance > TOO_FAR {
+        best.length = 0
+    }
+    return best
+}
+// Tokenizes from pos up to limit, matching against bytes before end. Returns
+// true when the block is full and must be emitted before continuing.
+fn tokenize(lz: &mut Lz, ws: &mut Workspace, data: &[u8], end: usize, limit: usize) -> bool {
+    if lz.level == 0 {
+        take := limit - lz.pos
+        room := lz.block_raw - (lz.pos - lz.block_start)
+        if take >= room {
+            lz.pos += room
+            lz.inserted = lz.pos
+            return true
+        }
+        lz.pos = limit
+        lz.inserted = limit
+        return false
+    }
+    for lz.pos < limit {
+        if lz.token_count >= TOKEN_LIMIT || covered(lz) - lz.block_start >= lz.block_raw {
+            return true
+        }
+        insert_until(lz, ws, data, end)
+        current := Match { length: 0, distance: 0 }
+        if !(lz.deferred && lz.deferred_match.length >= lz.lazy) {
+            floor := 0usize
+            if lz.deferred {
+                floor = lz.deferred_match.length
+            }
+            current = longest_match(lz, ws, data, end, floor)
+        }
+        if lz.deferred {
+            if lz.deferred_match.length >= MIN_MATCH && current.length <= lz.deferred_match.length {
+                ws.tokens[lz.token_count] = match_token(lz.deferred_match.length, lz.deferred_match.distance)
+                lz.token_count += 1
+                lz.pos = lz.pos - 1 + lz.deferred_match.length
+                lz.deferred = false
+                continue
+            }
+            ws.tokens[lz.token_count] = data[lz.pos - 1] as u32
+            lz.token_count += 1
+        }
+        if current.length >= MIN_MATCH && (lz.lazy == 0 || current.length >= lz.lazy) && !lz.deferred {
+            ws.tokens[lz.token_count] = match_token(current.length, current.distance)
+            lz.token_count += 1
+            lz.pos += current.length
+            continue
+        }
+        if lz.lazy == 0 {
+            // Greedy levels decide immediately.
+            ws.tokens[lz.token_count] = data[lz.pos] as u32
+            lz.token_count += 1
+            lz.deferred = false
+            lz.pos += 1
+            continue
+        }
+        lz.deferred = true
+        lz.deferred_match = current
+        lz.pos += 1
+    }
+    return false
+}
+// Emits the deferred choice at the end of the input. The token buffer has a
+// spare slot for it.
+fn finish_tokens(lz: &mut Lz, ws: &mut Workspace, data: &[u8]) {
+    if !lz.deferred {
+        return
+    }
+    if lz.deferred_match.length >= MIN_MATCH {
+        ws.tokens[lz.token_count] = match_token(lz.deferred_match.length, lz.deferred_match.distance)
+        lz.pos = lz.pos - 1 + lz.deferred_match.length
+    } else {
+        ws.tokens[lz.token_count] = data[lz.pos - 1] as u32
+    }
+    lz.token_count += 1
+    lz.deferred = false
+}
+
+// Code-length encoding of literal and distance lengths with repeat codes.
+// Symbols and their extra-bit values are stored in order.
+struct LengthCodes {
+    symbols: [318]u8
+    extras: [318]u8
+    count: usize
+    freq: [19]usize
+}
+fn run_length_codes(lengths: &[u8], out: &mut LengthCodes) {
+    out.count = 0
+    for i in 0usize..19 {
+        out.freq[i] = 0
+    }
+    i := 0usize
+    for i < lengths.len {
+        value := lengths[i]
+        run := 1usize
+        for i + run < lengths.len && lengths[i + run] == value {
+            run += 1
+        }
+        i += run
+        if value == 0 {
+            for run >= 11 {
+                n := run
+                if n > 138 {
+                    n = 138
+                }
+                push_length_code(out, 18, n - 11)
+                run -= n
+            }
+            if run >= 3 {
+                push_length_code(out, 17, run - 3)
+                run = 0
+            }
+        } else {
+            push_length_code(out, value as usize, 0)
+            run -= 1
+            for run >= 3 {
+                n := run
+                if n > 6 {
+                    n = 6
+                }
+                push_length_code(out, 16, n - 3)
+                run -= n
+            }
+        }
+        for k in 0usize..run {
+            push_length_code(out, value as usize, 0)
+        }
+    }
+}
+fn push_length_code(out: &mut LengthCodes, symbol: usize, extra: usize) {
+    out.symbols[out.count] = symbol as u8
+    out.extras[out.count] = extra as u8
+    out.count += 1
+    out.freq[symbol] += 1
+}
+
+// Code tables for one block.
+struct BlockCodes {
+    lit_lengths: [286]u8
+    lit_codes: [286]u16
+    dist_lengths: [30]u8
+    dist_codes: [30]u16
+}
+fn new_block_codes() -> BlockCodes {
+    return BlockCodes { lit_lengths: [0u8; 286], lit_codes: [0u16; 286], dist_lengths: [0u8; 30], dist_codes: [0u16; 30] }
+}
+fn put_tokens(writer: &mut BitWriter, tokens: &[u32], codes: &BlockCodes) -> void!Error {
+    for &token in tokens {
+        length := (token >> 16) as usize
+        if length == 0 {
+            symbol := token as usize
+            writer.put(codes.lit_codes[symbol] as usize, codes.lit_lengths[symbol] as usize)?
+            continue
+        }
+        distance := (token & 0xffff) as usize
+        l := length_code(length)
+        writer.put(codes.lit_codes[257 + l] as usize, codes.lit_lengths[257 + l] as usize)?
+        writer.put(length - LENGTH_BASE[l], LENGTH_EXTRA[l])?
+        d := distance_code(distance)
+        writer.put(codes.dist_codes[d] as usize, codes.dist_lengths[d] as usize)?
+        writer.put(distance - DIST_BASE[d], DIST_EXTRA[d])?
+    }
+    writer.put(codes.lit_codes[256] as usize, codes.lit_lengths[256] as usize)?
+    return ok()
+}
+fn put_stored(writer: &mut BitWriter, raw: &[u8], final_block: bool) -> void!Error {
+    flag := 0usize
+    if final_block {
+        flag = 1
+    }
+    writer.put(flag, 3)?
+    writer.align()?
+    writer.put(raw.len, 16)?
+    writer.put(raw.len ^ 0xffff, 16)?
+    writer.bytes(raw)?
+    return ok()
+}
+// Emits the pending tokens, or the raw bytes they cover, as whichever of a
+// stored, fixed, or dynamic block is smallest.
+fn emit_block(lz: &mut Lz, ws: &mut Workspace, data: &[u8], writer: &mut BitWriter, final_block: bool) -> void!Error {
+    raw := &data[lz.block_start..covered(lz)]
+    tokens := &ws.tokens[..lz.token_count]
+    lz.block_start = covered(lz)
+    lz.token_count = 0
+    if lz.level == 0 {
+        return put_stored(writer, raw, final_block)
+    }
+    lit_freq := [0usize; 286]
+    dist_freq := [0usize; 30]
+    extra_bits := 0usize
+    for &token in tokens {
+        length := (token >> 16) as usize
+        if length == 0 {
+            lit_freq[token as usize] += 1
+        } else {
+            l := length_code(length)
+            d := distance_code((token & 0xffff) as usize)
+            lit_freq[257 + l] += 1
+            dist_freq[d] += 1
+            extra_bits += LENGTH_EXTRA[l] + DIST_EXTRA[d]
+        }
+    }
+    lit_freq[256] = 1
+    codes := new_block_codes()
+    huffman_lengths(&lit_freq, &mut codes.lit_lengths, 15)
+    huffman_lengths(&dist_freq, &mut codes.dist_lengths, 15)
+    nlit := 286usize
+    for nlit > 257 && codes.lit_lengths[nlit - 1] == 0 {
+        nlit -= 1
+    }
+    ndist := 30usize
+    for ndist > 1 && codes.dist_lengths[ndist - 1] == 0 {
+        ndist -= 1
+    }
+    all_lengths := [0u8; 316]
+    for i in 0usize..nlit {
+        all_lengths[i] = codes.lit_lengths[i]
+    }
+    for i in 0usize..ndist {
+        all_lengths[nlit + i] = codes.dist_lengths[i]
+    }
+    runs := LengthCodes { symbols: [0u8; 318], extras: [0u8; 318], count: 0, freq: [0usize; 19] }
+    run_length_codes(&all_lengths[..nlit + ndist], &mut runs)
+    cl_lengths := [0u8; 19]
+    cl_codes := [0u16; 19]
+    huffman_lengths(&runs.freq, &mut cl_lengths, 7)
+    canonical_codes(&cl_lengths, &mut cl_codes)
+    ncode := 19usize
+    for ncode > 4 && cl_lengths[CODE_ORDER[ncode - 1]] == 0 {
+        ncode -= 1
+    }
+
+    dynamic_bits := 3 + 14 + 3 * ncode + extra_bits
+    dynamic_bits += 2 * runs.freq[16] + 3 * runs.freq[17] + 7 * runs.freq[18]
+    for i in 0usize..19 {
+        dynamic_bits += runs.freq[i] * (cl_lengths[i] as usize)
+    }
+    fixed_bits := 3 + extra_bits
+    for i in 0usize..286 {
+        dynamic_bits += lit_freq[i] * (codes.lit_lengths[i] as usize)
+        fixed_bits += lit_freq[i] * (fixed_literal_length(i) as usize)
+    }
+    for i in 0usize..30 {
+        dynamic_bits += dist_freq[i] * (codes.dist_lengths[i] as usize)
+        fixed_bits += dist_freq[i] * 5
+    }
+    stored_bits := 3 + ((8 - ((writer.count + 3) & 7)) & 7) + 32 + 8 * raw.len
+    if stored_bits <= fixed_bits && stored_bits <= dynamic_bits {
+        return put_stored(writer, raw, final_block)
+    }
+    flag := 0usize
+    if final_block {
+        flag = 1
+    }
+    if fixed_bits <= dynamic_bits {
+        writer.put(flag | 2, 3)?
+        for i in 0usize..286 {
+            codes.lit_lengths[i] = fixed_literal_length(i)
+        }
+        for i in 0usize..30 {
+            codes.dist_lengths[i] = 5
+        }
+    } else {
+        writer.put(flag | 4, 3)?
+        writer.put(nlit - 257, 5)?
+        writer.put(ndist - 1, 5)?
+        writer.put(ncode - 4, 4)?
+        for i in 0usize..ncode {
+            writer.put(cl_lengths[CODE_ORDER[i]] as usize, 3)?
+        }
+        for i in 0usize..runs.count {
+            symbol := runs.symbols[i] as usize
+            writer.put(cl_codes[symbol] as usize, cl_lengths[symbol] as usize)?
+            if symbol == 16 {
+                writer.put(runs.extras[i] as usize, 2)?
+            } else if symbol == 17 {
+                writer.put(runs.extras[i] as usize, 3)?
+            } else if symbol == 18 {
+                writer.put(runs.extras[i] as usize, 7)?
+            }
+        }
+    }
+    canonical_codes(&codes.lit_lengths, &mut codes.lit_codes)
+    canonical_codes(&codes.dist_lengths, &mut codes.dist_codes)
+    return put_tokens(writer, tokens, &codes)
+}
+
+// Compresses input into one raw DEFLATE stream at level 0 (stored blocks)
+// through 9 (slowest, smallest). Each block is stored, fixed-, or
+// dynamic-Huffman, whichever is smallest, so max_encoded_len(input.len) bytes
+// always suffice. Output contents are unspecified on error. The match finder
+// uses WORKSPACE_LEN words on the stack; see encode_with_workspace.
+pub fn encode(input: &[u8], output: &mut[u8], level: usize) -> usize!Error {
+    if level > MAX_LEVEL {
+        return err(Error.InvalidArgument)
+    }
+    words := [0u32; WORKSPACE_LEN]
+    return encode_with_workspace(input, output, level, &mut words)
+}
+// Like encode, with caller-owned match-finder storage of at least
+// WORKSPACE_LEN words, which may be static and reused.
+pub fn encode_with_workspace(input: &[u8], output: &mut[u8], level: usize, words: &mut[u32]) -> usize!Error {
+    if level > MAX_LEVEL {
+        return err(Error.InvalidArgument)
+    }
+    ws := split_workspace(words)?
+    workspace := &mut ws
+    lz := new_lz(level, ONE_SHOT_BLOCK_RAW)
+    writer := BitWriter { output: output, position: 0, bits: 0, count: 0 }
+    for {
+        if tokenize(&mut lz, workspace, input, input.len, input.len) {
+            emit_block(&mut lz, workspace, input, &mut writer, false)?
+        } else {
+            finish_tokens(&mut lz, workspace, input)
+            emit_block(&mut lz, workspace, input, &mut writer, true)?
+            writer.align()?
+            return ok(writer.position)
+        }
+        // Keep stored positions within u32 on very large inputs.
+        if lz.pos - lz.base >= (1usize << 30) {
+            delta := lz.pos - lz.base - WINDOW_SIZE
+            workspace.slide(delta as u32)
+            lz.base += delta
+        }
+    }
+}

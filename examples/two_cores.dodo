@@ -1,0 +1,131 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_multicore"
+import "std/embedded/executor"
+import "std/fmt"
+
+// Both cores at work. Core 1 searches for prime numbers as fast as it can.
+// Core 0 runs an executor: one task blinks the LED, and another reports
+// over the USB serial port each time core 1 has found another thousand
+// primes. Core 1 says so through the FIFO between the cores, whose
+// interrupt wakes the reporting task, so core 0 sleeps in between. The
+// count and the largest prime found so far are statics both cores use; a
+// spinlock keeps the two consistent.
+//
+//     dodo run examples/two_cores.dodo --board pico
+//     picocom /dev/ttyACM0
+//
+// (or --board pico2 or pico2_w; `screen /dev/cu.usbmodem*` on macOS).
+
+const MILESTONE: executor.Signal = executor.Signal { id: 0 }
+const EVERY: u32 = 1000
+
+// Guarded by the spinlock the two tasks share.
+static mut FOUND: u32 = 0
+static mut LARGEST: u32 = 0
+
+// Runs on core 1, forever.
+struct Primes {
+    lock: rp_multicore.Spinlock
+    fifo: rp_multicore.Fifo
+
+    pub fn run(self) {
+        candidate := 2u32
+        for {
+            if is_prime(candidate) {
+                guard := self.lock.lock()
+                // SAFETY: both cores use these statics only while holding
+                // the lock.
+                found := unsafe {
+                    FOUND += 1
+                    LARGEST = candidate
+                    FOUND
+                }
+                core.drop(guard)
+                if found % EVERY == 0 {
+                    // Waits while the FIFO is full, should core 0 fall behind.
+                    self.fifo.write(found)
+                }
+            }
+            candidate += 1
+        }
+    }
+}
+
+fn is_prime(number: u32) -> bool {
+    if number < 2 {
+        return false
+    }
+    divisor := 2u32
+    for divisor * divisor <= number {
+        if number % divisor == 0 {
+            return false
+        }
+        divisor += 1
+    }
+    return true
+}
+
+// Toggles the LED once per period, on core 0.
+struct Blinker<L> {
+    led: &mut L
+    ticker: executor.Ticker
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        if self.ticker.ready(cx) {
+            self.led.toggle()
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// Prints core 1's progress, on core 0, woken through the FIFO.
+struct Reporter<S> {
+    fifo: rp_multicore.Fifo
+    lock: rp_multicore.Spinlock
+    serial: S
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        MILESTONE.take(cx)
+        for {
+            match self.fifo.try_read() {
+                some(milestone) => {
+                    guard := self.lock.lock()
+                    // SAFETY: as in Primes.run.
+                    largest := unsafe {
+                        LARGEST
+                    }
+                    core.drop(guard)
+                    seconds := cx.now_us() / 1_000_000
+                    match fmt.printf(&mut self.serial, "{} primes after {} s; the largest so far is {}\n", milestone, seconds, largest) {
+                        ok(_) => {}
+                        err(_) => {}
+                    }
+                }
+                none => {
+                    break
+                }
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+    lock := b.spinlocks.claim_free()!
+    fifo := b.fifos.claim()!
+    fifo.set_signal(&MILESTONE)
+    // Core 1's stack. It runs for as long as `searching` exists.
+    stack := [0u64; 512]
+    primes := Primes { lock: lock.clone(), fifo: b.fifos.claim()! }
+    searching := b.core1.start(&mut stack, primes)!
+    blinker := Blinker { led: &mut b.led, ticker: executor.Ticker.every_ms(250) }
+    reporter := Reporter { fifo, lock, serial }
+    clock := b.timer.alarm(0)!
+    tasks: [2]&mut dyn executor.Task = [&mut blinker, &mut reporter]
+    executor.run(&mut tasks, &mut clock)
+    searching.stop()
+}
