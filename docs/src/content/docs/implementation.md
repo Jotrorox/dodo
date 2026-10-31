@@ -122,8 +122,9 @@ methods are statically dispatched.
 Hosted [platform packages](platform.md) add filesystem/process/environment APIs,
 native threads with checked move tasks, explicit unsafe transfer/sharing
 contracts, integer atomics, and guarded synchronization. Native callbacks use
-statically checked function specialization (`mem.callback`); Dodo function
-values do not use the C ABI. Closures are checked like references to what they
+statically checked function specialization (`mem.callback`) or `extern "C" fn`
+pointers, which also call C code through addresses such as those from
+[`std/dylib`](dylib.md); Dodo function values do not use the C ABI. Closures are checked like references to what they
 capture, so they cannot be moved to another thread.
 
 [Networking](networking.md), [TLS](tls.md), [HTTP/1.1](http.md), and [web routing](web.md)

@@ -549,6 +549,7 @@ impl Loader<'_> {
                 | "time"
                 | "window"
                 | "gpu/opengl"
+                | "dylib"
         ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
             return Ok(import.to_owned());

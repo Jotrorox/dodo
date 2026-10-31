@@ -14,6 +14,25 @@
   `examples/opengl_window.dodo` shows a shaded triangle in a window. A
   fixture renders and reads back a triangle with Mesa's llvmpipe in Linux CI
   and with CGL on macOS.
+- `std/gpu/vulkan`: the Vulkan API in pure Dodo, one to one like Rust's
+  `ash`, as the bottom layer for a future portable `std/gpu`. Constants,
+  handles, enums, bitmasks, structs and the command tables are generated from
+  the Khronos registry by `scripts/generate_vulkan.py` and cover core Vulkan
+  1.0 to 1.4, the Xlib, XCB, Wayland, Win32, Metal and headless surfaces,
+  swapchains, portability (MoltenVK) and debug utils. Nothing is linked:
+  `vk.open()` loads `libvulkan.so.1`, `vulkan-1.dll` or the macOS loader or
+  MoltenVK at run time and resolves every command through
+  `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` into `extern "C" fn` fields
+  of `EntryFns`, `InstanceFns` and `DeviceFns`. Structs have a `default()`
+  with `s_type` set, and helpers cover Result checking and names, API
+  versions, name fields and clear-value unions. All 2,572 struct sizes,
+  alignments and field offsets match the C headers
+  (`scripts/vulkan_layout_check.py`), and `examples/vulkan_compute.dodo` runs
+  a compute shader on Mesa's lavapipe.
+- `std/dylib` opens shared libraries at run time (dlopen on Linux and macOS,
+  LoadLibrary on Windows) and looks up their symbols; Linux builds that use
+  it also link libdl for glibc before 2.34.
+
 - `&mut T` parameters of Dodo functions, methods and closures are `noalias`
   in LLVM, as Rust's are, so optimized code no longer reloads fields of
   `self` after every store through a slice or pointer it holds. A loop that
@@ -60,7 +79,10 @@
   their integer counterparts pixel for pixel. `graphics.Path` stores move,
   line, quadratic and cubic commands in caller-owned words, and any type
   with a `trace(&self, pen)` method is a `graphics.Outline` drawn without
-  storage, filled by the nonzero or even-odd rule. `graphics.Gradient` paints
+  storage, filled by the nonzero or even-odd rule. The rasterizer's cost
+  follows a shape's edges rather than its bounding box: an outline is
+  flattened once, coverage is computed only in pixels an edge crosses, and
+  interiors are filled as whole spans. `graphics.Gradient` paints
   linear and radial gradients with up to eight stops, premultiplied
   interpolation, pad/repeat/reflect spreads and optional ordered dithering
   for RGB565 and monochrome panels. `std/graphics/truetype` reads `.ttf` and

@@ -49,6 +49,8 @@ they are not prerequisites for using the safe entry APIs.
 | Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
 | Open a window | `window.open` and `win.canvas()` | [Windows](window.md) |
 | Render with the GPU through OpenGL | `opengl.Context.create`, `opengl.Target.new` and the `gl` commands | [OpenGL](opengl.md) |
+| Run a shader on the GPU | `vk.open()` and `library.entry()` from `std/gpu/vulkan` | [GPU programming with Vulkan](gpu.md) |
+| Call a function in a shared library | `dylib.open` and `library.symbol` | [Shared libraries](dylib.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
 | Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
@@ -178,6 +180,8 @@ individual modules and links every public declaration back to its source.
 | [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image`, `std/graphics/truetype`; panels in `std/embedded/display`, `std/embedded/display/st7789`, `std/embedded/display/ssd1306` | Portable; caller-supplied pixel and file buffers. |
 | [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
 | [OpenGL](opengl.md) | `std/gpu/opengl`, `std/gpu/opengl/gl` | Hosted: EGL on Linux, CGL on macOS, WGL on Windows, loaded at run time; the generated binding is portable. |
+| [GPU programming with Vulkan](gpu.md) | `std/gpu/vulkan` | Hosted; the Vulkan loader is opened at run time, nothing is linked. |
+| [Shared libraries](dylib.md) | `std/dylib` | Hosted: dlopen on Linux and macOS, LoadLibrary on Windows. |
 | [Time and clocks](time.md) | `std/time`, `std/time/clock`, `std/time/hosted`, `std/time/iso8601`, `std/time/timer` | Values/contracts portable; hosted clock explicit. |
 | [Native strings and errors](platform.md) | `std/platform`, `std/platform/error` | Hosted. |
 | [Filesystem and lexical paths](filesystem.md) | `std/fs`, `std/fs/path`, `std/fs/types`, `std/fs/unix`, `std/fs/windows_ext` | Paths/types portable; files hosted. |
@@ -206,6 +210,8 @@ select providers; they are not additional recommended starting paths.
 | `std/crypto/openssl/windows` | Native OpenSSL libcrypto boundary; use [cryptography](crypto.md). |
 | `std/crypto/posix` | Native OS entropy boundary; use [random bytes](crypto.md#random-bytes). |
 | `std/crypto/windows` | Native OS entropy boundary; use [random bytes](crypto.md#random-bytes). |
+| `std/dylib/posix` | Native library loading boundary; use [shared libraries](dylib.md). |
+| `std/dylib/windows` | Native library loading boundary; use [shared libraries](dylib.md). |
 | `std/env/posix` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/env/windows` | Target-specific provider machinery; use the corresponding [hosted facade](platform.md). |
 | `std/float_decimal` | Internal decimal conversion; use [formatting](formatting.md) or [text parsing](text.md). |
