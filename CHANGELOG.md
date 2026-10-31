@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `std/window` opens a desktop window whose drawing area is a
+  `std/graphics` canvas, using only what each system ships: the X11
+  protocol spoken directly over the display socket on Linux (libc only, no
+  Xlib), AppKit through the Objective-C runtime on macOS, and user32/gdi32
+  on Windows. `win.canvas()` lends out the window's pixel buffer and
+  `update(dirty)` shows the part that changed; the window also implements
+  `graphics.Display`. Events are polled with `wait_event`, `poll_event` or
+  `wait_event_timeout`: close requests, resizes, focus, physical keys named
+  by their US-layout position, layout-aware text, mouse moves, buttons,
+  leaving and scrolling. Sizes follow the system scale on high-density
+  displays, with the canvas in physical pixels and `scale()` reporting the
+  factor. `std/window/x11` holds the protocol encoders and parsers as pure
+  functions that build for every target. `dodo run` needs no flags or
+  system packages.
 - MQTT 3.1.1 packages for both ends of a publish/subscribe system, in the
   style of the web packages. `std/mqtt/broker` runs a broker in one line,
   `broker.new().run(b"0.0.0.0:1883")`. It serves 16 clients from one thread

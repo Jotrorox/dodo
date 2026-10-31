@@ -1,0 +1,526 @@
+package x11
+
+import "std/window/raw"
+
+// The parts of the X11 core protocol std/window needs, as pure functions
+// over byte buffers: request encoders, the connection setup parser, event
+// field readers and keysym translation. Nothing here performs I/O, so the
+// protocol is testable on every host; std/window/linux moves the bytes.
+//
+// Every message uses little-endian byte order, which the client chooses in
+// its setup request. Encoders write at the start of `out` and return the
+// number of bytes written, always a multiple of four, or 0 when `out` is too
+// short.
+
+// Event masks.
+pub const KEY_PRESS_MASK: u32 = 0x1
+pub const KEY_RELEASE_MASK: u32 = 0x2
+pub const BUTTON_PRESS_MASK: u32 = 0x4
+pub const BUTTON_RELEASE_MASK: u32 = 0x8
+pub const LEAVE_WINDOW_MASK: u32 = 0x20
+pub const POINTER_MOTION_MASK: u32 = 0x40
+pub const EXPOSURE_MASK: u32 = 0x8000
+pub const STRUCTURE_NOTIFY_MASK: u32 = 0x20000
+pub const FOCUS_CHANGE_MASK: u32 = 0x200000
+
+// Event codes, after clearing the "sent by a client" bit 0x80.
+pub const ERROR: u8 = 0
+pub const REPLY: u8 = 1
+pub const KEY_PRESS: u8 = 2
+pub const KEY_RELEASE: u8 = 3
+pub const BUTTON_PRESS: u8 = 4
+pub const BUTTON_RELEASE: u8 = 5
+pub const MOTION_NOTIFY: u8 = 6
+pub const ENTER_NOTIFY: u8 = 7
+pub const LEAVE_NOTIFY: u8 = 8
+pub const FOCUS_IN: u8 = 9
+pub const FOCUS_OUT: u8 = 10
+pub const EXPOSE: u8 = 12
+pub const CONFIGURE_NOTIFY: u8 = 22
+pub const CLIENT_MESSAGE: u8 = 33
+pub const MAPPING_NOTIFY: u8 = 34
+
+// Key and button state bits.
+pub const SHIFT_MASK: u32 = 0x1
+pub const LOCK_MASK: u32 = 0x2
+pub const CONTROL_MASK: u32 = 0x4
+pub const MOD1_MASK: u32 = 0x8
+pub const MOD2_MASK: u32 = 0x10
+pub const MOD4_MASK: u32 = 0x40
+pub const MOD5_MASK: u32 = 0x80
+
+// Predefined atoms.
+pub const ATOM_ATOM: u32 = 4
+pub const ATOM_STRING: u32 = 31
+pub const ATOM_WM_NAME: u32 = 39
+pub const ATOM_WM_NORMAL_HINTS: u32 = 40
+pub const ATOM_WM_SIZE_HINTS: u32 = 41
+pub const ATOM_WM_CLASS: u32 = 67
+
+// Every message the server sends is at least this long.
+pub const PACKET: usize = 32
+
+// -- Little-endian fields ------------------------------------------------
+
+pub fn u16_at(data: &[u8], offset: usize) -> u32 {
+    return data[offset] as u32 | (data[offset + 1] as u32 << 8)
+}
+pub fn i16_at(data: &[u8], offset: usize) -> i32 {
+    value := u16_at(data, offset) as i32
+    if value >= 32768 {
+        return value - 65536
+    }
+    return value
+}
+pub fn u32_at(data: &[u8], offset: usize) -> u32 {
+    return data[offset] as u32 | (data[offset + 1] as u32 << 8) | (data[offset + 2] as u32 << 16) | (data[offset + 3] as u32 << 24)
+}
+fn put16(out: &mut[u8], offset: usize, value: u32) {
+    out[offset] = (value & 0xff) as u8
+    out[offset + 1] = ((value >> 8) & 0xff) as u8
+}
+fn put32(out: &mut[u8], offset: usize, value: u32) {
+    out[offset] = (value & 0xff) as u8
+    out[offset + 1] = ((value >> 8) & 0xff) as u8
+    out[offset + 2] = ((value >> 16) & 0xff) as u8
+    out[offset + 3] = ((value >> 24) & 0xff) as u8
+}
+fn padded(length: usize) -> usize {
+    return (length + 3) / 4 * 4
+}
+// Request header: opcode, one data byte, and the length in 4-byte units.
+fn header(out: &mut[u8], opcode: u8, data: u8, length: usize) {
+    out[0] = opcode
+    out[1] = data
+    put16(out, 2, (length / 4) as u32)
+}
+fn copy(out: &mut[u8], offset: usize, bytes: &[u8]) {
+    for i in 0usize..bytes.len {
+        out[offset + i] = bytes[i]
+    }
+}
+fn zero(out: &mut[u8], start: usize, end: usize) {
+    for i in start..end {
+        out[i] = 0
+    }
+}
+
+// -- Connection setup ----------------------------------------------------
+
+// The setup request, with optional authorization such as
+// "MIT-MAGIC-COOKIE-1" and its 16-byte cookie.
+pub fn setup_request(out: &mut[u8], auth_name: &[u8], auth_data: &[u8]) -> usize {
+    total := 12 + padded(auth_name.len) + padded(auth_data.len)
+    if out.len < total || auth_name.len > 0xffff || auth_data.len > 0xffff {
+        return 0
+    }
+    zero(out, 0, total)
+    out[0] = 0x6c // 'l': little-endian
+    put16(out, 2, 11)
+    put16(out, 4, 0)
+    put16(out, 6, auth_name.len as u32)
+    put16(out, 8, auth_data.len as u32)
+    copy(out, 12, auth_name)
+    copy(out, 12 + padded(auth_name.len), auth_data)
+    return total
+}
+
+// Total length of the setup reply whose first 8 bytes are `head`.
+pub fn setup_length(head: &[u8]) -> usize {
+    return 8 + u16_at(head, 6) as usize * 4
+}
+
+// What the client needs from the setup reply.
+pub struct Setup {
+    pub id_base: u32
+    pub id_mask: u32
+    // Largest request, in bytes.
+    pub max_request: usize
+    pub min_keycode: u32
+    pub max_keycode: u32
+    pub root: u32
+    pub root_visual: u32
+    pub root_depth: u32
+    pub screen_width: u32
+    pub screen_height: u32
+}
+
+// Parse the setup reply for `screen`. Fails with Protocol when the server
+// refused the connection, typically for missing authorization, or the reply
+// is malformed, and with Unsupported when the screen's default visual is not
+// 24-bit true color stored as 32-bit little-endian pixels, the layout of
+// graphics.PixelFormat.Bgra8888.
+pub fn parse_setup(reply: &[u8], screen: u32) -> Setup!raw.Error {
+    if reply.len < 8 || reply[0] != 1 || reply.len < setup_length(reply) || reply.len < 40 {
+        return err(raw.Error.Protocol)
+    }
+    vendor := u16_at(reply, 24) as usize
+    max_request := u16_at(reply, 26) as usize * 4
+    screens := reply[28] as u32
+    formats := reply[29] as usize
+    image_order := reply[30]
+    min_keycode := reply[34] as u32
+    max_keycode := reply[35] as u32
+    offset := 40 + padded(vendor)
+    format_start := offset
+    offset += formats * 8
+    if offset > reply.len || screen >= screens {
+        return err(raw.Error.Protocol)
+    }
+    for index in 0u32..screens {
+        if offset + 40 > reply.len {
+            return err(raw.Error.Protocol)
+        }
+        root := u32_at(reply, offset)
+        width := u16_at(reply, offset + 20)
+        height := u16_at(reply, offset + 22)
+        visual := u32_at(reply, offset + 32)
+        depth := reply[offset + 38] as u32
+        depths := reply[offset + 39] as usize
+        offset += 40
+        true_color := false
+        for d in 0usize..depths {
+            if offset + 8 > reply.len {
+                return err(raw.Error.Protocol)
+            }
+            visuals := u16_at(reply, offset + 2) as usize
+            offset += 8
+            if offset + visuals * 24 > reply.len {
+                return err(raw.Error.Protocol)
+            }
+            for v in 0usize..visuals {
+                at := offset + v * 24
+                if u32_at(reply, at) == visual && reply[at + 4] == 4 && u32_at(reply, at + 8) == 0xff0000 && u32_at(reply, at + 12) == 0xff00 && u32_at(reply, at + 16) == 0xff {
+                    true_color = true
+                }
+            }
+            offset += visuals * 24
+        }
+        if index == screen {
+            bits := 0u32
+            for f in 0usize..formats {
+                at := format_start + f * 8
+                if reply[at] as u32 == depth {
+                    bits = reply[at + 1] as u32
+                }
+            }
+            if !true_color || (depth != 24 && depth != 32) || bits != 32 || image_order != 0 {
+                return err(raw.Error.Unsupported)
+            }
+            return ok(Setup { id_base: u32_at(reply, 12), id_mask: u32_at(reply, 16), max_request: max_request, min_keycode: min_keycode, max_keycode: max_keycode, root: root, root_visual: visual, root_depth: depth, screen_width: width, screen_height: height })
+        }
+    }
+    return err(raw.Error.Protocol)
+}
+
+// -- Requests ------------------------------------------------------------
+
+// CreateWindow with the parent's depth and visual. NorthWest bit gravity
+// keeps the picture in place while resizing.
+pub fn create_window(out: &mut[u8], window: u32, parent: u32, width: u32, height: u32, event_mask: u32) -> usize {
+    if out.len < 40 {
+        return 0
+    }
+    header(out, 1, 0, 40)
+    put32(out, 4, window)
+    put32(out, 8, parent)
+    put16(out, 12, 0)
+    put16(out, 14, 0)
+    put16(out, 16, width)
+    put16(out, 18, height)
+    put16(out, 20, 0)
+    put16(out, 22, 1) // InputOutput
+    put32(out, 24, 0) // CopyFromParent visual
+    put32(out, 28, 0x10 | 0x800) // bit gravity, event mask
+    put32(out, 32, 1) // NorthWest
+    put32(out, 36, event_mask)
+    return 40
+}
+
+// ChangeWindowAttributes setting the cursor; 0 restores the parent's.
+pub fn set_cursor(out: &mut[u8], window: u32, cursor: u32) -> usize {
+    if out.len < 16 {
+        return 0
+    }
+    header(out, 2, 0, 16)
+    put32(out, 4, window)
+    put32(out, 8, 0x4000)
+    put32(out, 12, cursor)
+    return 16
+}
+
+pub fn destroy_window(out: &mut[u8], window: u32) -> usize {
+    if out.len < 8 {
+        return 0
+    }
+    header(out, 4, 0, 8)
+    put32(out, 4, window)
+    return 8
+}
+
+pub fn map_window(out: &mut[u8], window: u32) -> usize {
+    if out.len < 8 {
+        return 0
+    }
+    header(out, 8, 0, 8)
+    put32(out, 4, window)
+    return 8
+}
+
+pub fn intern_atom(out: &mut[u8], name: &[u8]) -> usize {
+    total := 8 + padded(name.len)
+    if out.len < total || name.len > 0xffff {
+        return 0
+    }
+    zero(out, 0, total)
+    header(out, 16, 0, total)
+    put16(out, 4, name.len as u32)
+    copy(out, 8, name)
+    return total
+}
+
+// ChangeProperty in Replace mode. `format` is 8 or 32: the size in bits of
+// each element of `data`, whose length is in bytes.
+pub fn change_property(out: &mut[u8], window: u32, property: u32, kind: u32, format: u8, data: &[u8]) -> usize {
+    total := 24 + padded(data.len)
+    if out.len < total || (format != 8 && format != 32) || data.len > 0x3ffff {
+        return 0
+    }
+    zero(out, 0, total)
+    header(out, 18, 0, total)
+    put32(out, 4, window)
+    put32(out, 8, property)
+    put32(out, 12, kind)
+    out[16] = format
+    put32(out, 20, (data.len / (format as usize / 8)) as u32)
+    copy(out, 24, data)
+    return total
+}
+
+// A WM_NORMAL_HINTS value fixing the size, for windows that cannot be resized.
+pub fn fixed_size_hints(out: &mut[u8], width: u32, height: u32) -> usize {
+    if out.len < 72 {
+        return 0
+    }
+    zero(out, 0, 72)
+    put32(out, 0, 16 | 32) // PMinSize | PMaxSize
+    put32(out, 20, width)
+    put32(out, 24, height)
+    put32(out, 28, width)
+    put32(out, 32, height)
+    return 72
+}
+
+pub fn create_pixmap(out: &mut[u8], pixmap: u32, drawable: u32, depth: u8, width: u32, height: u32) -> usize {
+    if out.len < 16 {
+        return 0
+    }
+    header(out, 53, depth, 16)
+    put32(out, 4, pixmap)
+    put32(out, 8, drawable)
+    put16(out, 12, width)
+    put16(out, 14, height)
+    return 16
+}
+
+pub fn free_pixmap(out: &mut[u8], pixmap: u32) -> usize {
+    if out.len < 8 {
+        return 0
+    }
+    header(out, 54, 0, 8)
+    put32(out, 4, pixmap)
+    return 8
+}
+
+// CreateGC drawing in `foreground`, without graphics exposure events.
+pub fn create_gc(out: &mut[u8], gc: u32, drawable: u32, foreground: u32) -> usize {
+    if out.len < 24 {
+        return 0
+    }
+    header(out, 55, 0, 24)
+    put32(out, 4, gc)
+    put32(out, 8, drawable)
+    put32(out, 12, 0x4 | 0x10000)
+    put32(out, 16, foreground)
+    put32(out, 20, 0)
+    return 24
+}
+
+// PolyFillRectangle with one rectangle.
+pub fn fill_rectangle(out: &mut[u8], drawable: u32, gc: u32, x: i32, y: i32, width: u32, height: u32) -> usize {
+    if out.len < 20 {
+        return 0
+    }
+    header(out, 70, 0, 20)
+    put32(out, 4, drawable)
+    put32(out, 8, gc)
+    put16(out, 12, (x & 0xffff) as u32)
+    put16(out, 14, (y & 0xffff) as u32)
+    put16(out, 16, width)
+    put16(out, 18, height)
+    return 20
+}
+
+pub fn free_gc(out: &mut[u8], gc: u32) -> usize {
+    if out.len < 8 {
+        return 0
+    }
+    header(out, 60, 0, 8)
+    put32(out, 4, gc)
+    return 8
+}
+
+// Bytes of the PutImage header that put_image_header writes.
+pub const PUT_IMAGE_HEADER: usize = 24
+
+// The header of a ZPixmap PutImage of width x height 32-bit pixels at
+// (x, y); width * height * 4 bytes of pixel rows must follow.
+pub fn put_image_header(out: &mut[u8], drawable: u32, gc: u32, width: u32, height: u32, x: i32, y: i32, depth: u8) -> usize {
+    if out.len < PUT_IMAGE_HEADER {
+        return 0
+    }
+    header(out, 72, 2, PUT_IMAGE_HEADER + width as usize * height as usize * 4)
+    put32(out, 4, drawable)
+    put32(out, 8, gc)
+    put16(out, 12, width)
+    put16(out, 14, height)
+    put16(out, 16, (x & 0xffff) as u32)
+    put16(out, 18, (y & 0xffff) as u32)
+    out[20] = 0
+    out[21] = depth
+    out[22] = 0
+    out[23] = 0
+    return PUT_IMAGE_HEADER
+}
+
+// CreateCursor from a source and mask bitmap; with an all-zero mask it is
+// invisible.
+pub fn create_cursor(out: &mut[u8], cursor: u32, source: u32, mask: u32) -> usize {
+    if out.len < 32 {
+        return 0
+    }
+    zero(out, 0, 32)
+    header(out, 93, 0, 32)
+    put32(out, 4, cursor)
+    put32(out, 8, source)
+    put32(out, 12, mask)
+    return 32
+}
+
+pub fn get_keyboard_mapping(out: &mut[u8], first: u32, count: u32) -> usize {
+    if out.len < 8 || first > 255 || count > 255 {
+        return 0
+    }
+    header(out, 101, 0, 8)
+    out[4] = first as u8
+    out[5] = count as u8
+    out[6] = 0
+    out[7] = 0
+    return 8
+}
+
+// -- Server messages -----------------------------------------------------
+
+// Total length of the message starting with `head` (at least 32 bytes):
+// replies carry extra data, errors and events never do.
+pub fn message_length(head: &[u8]) -> usize {
+    if head[0] == REPLY {
+        return PACKET + u32_at(head, 4) as usize * 4
+    }
+    return PACKET
+}
+
+// The message's code without the "sent by a client" bit.
+pub fn code(message: &[u8]) -> u8 {
+    return message[0] & 0x7f
+}
+
+// The 16-bit sequence number of the request a reply or error answers.
+pub fn sequence(message: &[u8]) -> u32 {
+    return u16_at(message, 2)
+}
+
+// -- Keysyms -------------------------------------------------------------
+
+// The keysym GetKeyboardMapping lists for `keycode` at `column`, where each
+// keycode has `per_keycode` columns starting at `first`. 0 is NoSymbol.
+pub fn keysym(mapping: &[u8], first: u32, per_keycode: u32, keycode: u32, column: u32) -> u32 {
+    if keycode < first || column >= per_keycode {
+        return 0
+    }
+    offset := ((keycode - first) as usize * per_keycode as usize + column as usize) * 4
+    if offset + 4 > mapping.len {
+        return 0
+    }
+    return u32_at(mapping, offset)
+}
+
+fn keypad(sym: u32) -> bool {
+    return sym >= 0xff80 && sym <= 0xffbd
+}
+
+fn lower_latin(sym: u32) -> bool {
+    return (sym >= 0x61 && sym <= 0x7a) || (sym >= 0xe0 && sym <= 0xfe && sym != 0xf7)
+}
+
+// The keysym a key press produces under `state`, following the core
+// protocol's rules for the first group: Shift selects the second column,
+// Lock capitalises letters, NumLock inverts Shift on the keypad, and Mod5
+// (AltGr in common layouts) selects columns 5 and 6 where XKB places the
+// third and fourth levels.
+pub fn lookup(mapping: &[u8], first: u32, per_keycode: u32, keycode: u32, state: u32) -> u32 {
+    base := 0u32
+    if (state & MOD5_MASK) != 0 && keysym(mapping, first, per_keycode, keycode, 4) != 0 {
+        base = 4
+    }
+    lower := keysym(mapping, first, per_keycode, keycode, base)
+    upper := keysym(mapping, first, per_keycode, keycode, base + 1)
+    shift := (state & SHIFT_MASK) != 0
+    if (state & MOD2_MASK) != 0 && keypad(upper) {
+        if shift {
+            return lower
+        }
+        return upper
+    }
+    if upper == 0 {
+        if lower_latin(lower) && (shift || (state & LOCK_MASK) != 0) {
+            return lower - 0x20
+        }
+        return lower
+    }
+    if shift {
+        return upper
+    }
+    if (state & LOCK_MASK) != 0 && lower_latin(lower) {
+        return upper
+    }
+    return lower
+}
+
+// The character a keysym types, or 0 for keys that type nothing. Covers
+// Latin-1, the keypad, the euro sign and the Unicode keysyms XKB uses for
+// everything else in current layouts.
+pub fn keysym_to_unicode(sym: u32) -> u32 {
+    if (sym >= 0x20 && sym <= 0x7e) || (sym >= 0xa0 && sym <= 0xff) {
+        return sym
+    }
+    if sym >= 0x01000100 && sym <= 0x0110ffff {
+        return sym - 0x01000000
+    }
+    if sym == 0x20ac {
+        return 0x20ac
+    }
+    if sym >= 0xffb0 && sym <= 0xffb9 {
+        return sym - 0xffb0 + 0x30
+    }
+    if sym == 0xff80 {
+        return 0x20
+    }
+    if sym >= 0xffaa && sym <= 0xffaf {
+        return sym - 0xffaa + 0x2a
+    }
+    if sym == 0xffbd {
+        return 0x3d
+    }
+    return 0
+}

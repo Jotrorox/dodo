@@ -1,0 +1,856 @@
+package linux
+
+import "core/ptr"
+import "core/mem"
+import "std/window/raw"
+import "std/window/x11"
+
+// X11 windows. std/window/x11 encodes and parses the protocol; runtime.c
+// only finds the server, connects and moves bytes, so no X library is
+// needed. Pixels are sent with PutImage, split to fit the server's request
+// size limit.
+
+unsafe extern "C" fn dodo_window_claim() -> i32
+unsafe extern "C" fn dodo_window_release()
+unsafe extern "C" fn dodo_window_alloc(bytes: usize) -> *mut u8
+unsafe extern "C" fn dodo_window_free(memory: *mut u8)
+unsafe extern "C" fn dodo_window_empty() -> *mut u8
+unsafe extern "C" fn dodo_window_x11_connect(socket: *mut i32, screen: *mut u32, cookie: *mut u8, capacity: usize) -> i32
+unsafe extern "C" fn dodo_window_x11_read(socket: i32, buffer: *mut u8, length: usize) -> i64
+unsafe extern "C" fn dodo_window_x11_write(socket: i32, data: *const u8, length: usize) -> i32
+unsafe extern "C" fn dodo_window_x11_wait(socket: i32, milliseconds: u32) -> i32
+unsafe extern "C" fn dodo_window_x11_close(socket: i32)
+
+// Shortcuts use Control on Linux.
+pub const SHORTCUT_IS_META: bool = false
+
+// Buffered server messages; the largest is the keyboard mapping reply.
+const INPUT: usize = 262144
+// Buffered requests; also bounds one PutImage.
+const OUTPUT: usize = 262144
+const NO_REPLY: u32 = 0xffffffff
+
+const EVENTS: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x20 | 0x40 | 0x8000 | 0x20000 | 0x200000
+
+// Bytes allocated by the C runtime and freed with their owner.
+struct Memory {
+    pointer: *mut u8
+    length: usize
+
+    fn new(length: usize) -> Memory!raw.Error {
+        pointer := unsafe {
+            dodo_window_alloc(length)
+        }
+        if ptr.is_null(pointer) {
+            return err(raw.Error.OutOfMemory)
+        }
+        return ok(Memory { pointer: pointer, length: length })
+    }
+    fn empty() -> Memory {
+        pointer := unsafe {
+            dodo_window_empty()
+        }
+        return Memory { pointer: pointer, length: 0 }
+    }
+    fn bytes(&mut self) -> &mut[u8] from(self) {
+        unsafe {
+            pointer := self.pointer
+            length := self.length
+            return ptr.borrow_slice_mut(pointer, length, self)
+        }
+    }
+    fn view(&self) -> &[u8] from(self) {
+        unsafe {
+            return ptr.borrow_slice(self.pointer as *const u8, self.length, self)
+        }
+    }
+    fn drop(&mut self) {
+        if self.length != 0 {
+            unsafe {
+                dodo_window_free(self.pointer)
+            }
+        }
+    }
+}
+
+fn modifiers(state: u32) -> u32 {
+    bits := 0u32
+    if (state & x11.SHIFT_MASK) != 0 {
+        bits |= raw.SHIFT
+    }
+    if (state & x11.CONTROL_MASK) != 0 {
+        bits |= raw.CONTROL
+    }
+    if (state & x11.MOD1_MASK) != 0 {
+        bits |= raw.ALT
+    }
+    if (state & x11.MOD4_MASK) != 0 {
+        bits |= raw.META
+    }
+    if (state & x11.LOCK_MASK) != 0 {
+        bits |= raw.CAPS_LOCK
+    }
+    return bits
+}
+
+// X servers using evdev or libinput number keys as Linux input codes plus
+// 8. Generated from the Key order in std/window.dodo.
+static EVDEV_KEYS: [128]u8 = [
+    0, 37, 28, 29, 30, 31, 32, 33, 34, 35, 36, 27, 42, 43, 40, 39,
+    17, 23, 5, 18, 20, 25, 21, 9, 15, 16, 44, 45, 38, 99, 1, 19,
+    4, 6, 7, 8, 10, 11, 12, 47, 48, 49, 100, 46, 26, 24, 3, 22,
+    2, 14, 13, 50, 51, 52, 104, 81, 101, 41, 53, 54, 55, 56, 57, 58,
+    59, 60, 61, 62, 63, 79, 67, 92, 93, 94, 82, 89, 90, 91, 83, 86,
+    87, 88, 85, 95, 0, 0, 97, 64, 65, 0, 0, 0, 0, 0, 0, 0,
+    84, 103, 80, 66, 105, 0, 70, 78, 71, 76, 75, 73, 77, 74, 69, 72,
+    0, 0, 0, 0, 0, 96, 0, 68, 0, 0, 0, 0, 0, 102, 106, 98,
+]
+
+fn key_of(keycode: u32) -> u32 {
+    if keycode < 8 || keycode >= 136 {
+        return 0
+    }
+    return EVDEV_KEYS[(keycode - 8) as usize] as u32
+}
+
+fn set(event: &mut raw.Event, kind: u32, code: u32, modifiers: u32, flags: u32, x: i32, y: i32) {
+    event.kind = kind
+    event.code = code
+    event.modifiers = modifiers
+    event.flags = flags
+    event.x = x
+    event.y = y
+}
+
+pub struct Backend {
+    socket: i32
+    active: bool
+    pixels: Memory
+    width: u32
+    height: u32
+    input: Memory
+    input_start: usize
+    input_end: usize
+    output: Memory
+    output_length: usize
+    mapping: Memory
+    mapping_first: u32
+    mapping_count: u32
+    per_keycode: u32
+    mapping_sequence: u32
+    root: u32
+    depth: u32
+    max_request: usize
+    id_base: u32
+    id_step: u32
+    id_count: u32
+    window: u32
+    gc: u32
+    blank_cursor: u32
+    wm_protocols: u32
+    wm_delete: u32
+    net_wm_name: u32
+    utf8_string: u32
+    sequence: u32
+    pending_text: u32
+    repeat_keycode: u32
+    mouse_inside: bool
+
+    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Backend!raw.Error {
+        claimed := unsafe {
+            dodo_window_claim()
+        }
+        if claimed != 0 {
+            return err(raw.from_code(claimed))
+        }
+        backend := Backend { socket: -1, active: false, pixels: Memory.empty(), width: 0, height: 0, input: Memory.empty(), input_start: 0, input_end: 0, output: Memory.empty(), output_length: 0, mapping: Memory.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, window: 0, gc: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, repeat_keycode: 0, mouse_inside: false }
+        // From here on, dropping the backend releases the claim and socket.
+        backend.active = true
+        backend.connect(title, width, height, resizable)?
+        return ok(backend)
+    }
+
+    fn connect(&mut self, title: &str, width: u32, height: u32, resizable: bool) -> void!raw.Error {
+        cookie := [0u8; 256]
+        socket := -1i32
+        screen := 0u32
+        found := unsafe {
+            dodo_window_x11_connect(ptr.from_mut(&mut socket), ptr.from_mut(&mut screen), ptr.as_mut_ptr(&mut cookie), 256)
+        }
+        if found < 0 {
+            return err(raw.from_code(-found))
+        }
+        self.socket = socket
+        self.input = Memory.new(INPUT)?
+        self.output = Memory.new(OUTPUT)?
+
+        // Setup: the request, then a reply of announced length.
+        name := mem.str_bytes("MIT-MAGIC-COOKIE-1")
+        if found == 0 {
+            name = mem.str_bytes("")
+        }
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.setup_request(&mut out[start..], name, &cookie[..found as usize])
+        self.output_length += length
+        self.flush()?
+        self.need(8)?
+        total := x11.setup_length(&self.input.view()[..8])
+        if total > INPUT {
+            return err(raw.Error.Protocol)
+        }
+        self.need(total)?
+        setup := x11.parse_setup(&self.input.view()[..total], screen)?
+        self.input_start = total
+        self.root = setup.root
+        self.depth = setup.root_depth
+        self.max_request = setup.max_request
+        self.id_base = setup.id_base
+        // Resource ids step by the lowest bit of the mask.
+        self.id_step = setup.id_mask & (core.wrapping_sub(0u32, setup.id_mask))
+        if self.id_step == 0 || self.max_request < 4096 {
+            return err(raw.Error.Protocol)
+        }
+
+        // Atoms and the keyboard mapping, before any window can send events.
+        protocols_atom := self.atom("WM_PROTOCOLS")?
+        self.wm_protocols = protocols_atom
+        delete_atom := self.atom("WM_DELETE_WINDOW")?
+        self.wm_delete = delete_atom
+        name_atom := self.atom("_NET_WM_NAME")?
+        self.net_wm_name = name_atom
+        utf8_atom := self.atom("UTF8_STRING")?
+        self.utf8_string = utf8_atom
+        self.mapping_first = setup.min_keycode
+        self.mapping_count = setup.max_keycode - setup.min_keycode + 1
+        self.request_mapping()?
+        for self.mapping_sequence != NO_REPLY {
+            self.receive(raw.FOREVER)?
+        }
+
+        // The window and its properties.
+        self.pixels = Memory.new(width as usize * height as usize * 4)?
+        self.width = width
+        self.height = height
+        window_id := self.new_id()?
+        self.window = window_id
+        gc_id := self.new_id()?
+        self.gc = gc_id
+        window := self.window
+        root := self.root
+        self.reserve(512)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.create_window(&mut out[start..], window, root, width, height, EVENTS)
+        self.commit(length)?
+        self.set_title(title)?
+        protocols := [0u8; 4]
+        put32(&mut protocols, 0, self.wm_delete)
+        wm_protocols := self.wm_protocols
+        self.property(wm_protocols, x11.ATOM_ATOM, 32, &protocols)?
+        self.property(x11.ATOM_WM_CLASS, x11.ATOM_STRING, 8, mem.str_bytes("dodo\0Dodo\0"))?
+        if !resizable {
+            hints := [0u8; 72]
+            x11.fixed_size_hints(&mut hints, width, height)
+            self.property(x11.ATOM_WM_NORMAL_HINTS, x11.ATOM_WM_SIZE_HINTS, 32, &hints)?
+        }
+        gc := self.gc
+        self.reserve(64)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.create_gc(&mut out[start..], gc, window, 0)
+        self.commit(length)?
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.map_window(&mut out[start..], window)
+        self.commit(length)?
+        return self.flush()
+    }
+
+    fn new_id(&mut self) -> u32!raw.Error {
+        self.id_count += 1
+        if self.id_count > 0xffff {
+            return err(raw.Error.Protocol)
+        }
+        return ok(self.id_base | (self.id_count * self.id_step))
+    }
+
+    // -- Output ------------------------------------------------------------
+
+    fn reserve(&mut self, bytes: usize) -> void!raw.Error {
+        if self.output_length + bytes > OUTPUT {
+            self.flush()?
+        }
+        return ok()
+    }
+    // Account for a request an encoder wrote at output_length.
+    fn commit(&mut self, length: usize) -> void!raw.Error {
+        if length == 0 {
+            return err(raw.Error.InvalidInput)
+        }
+        self.output_length += length
+        self.sequence = (self.sequence + 1) & 0xffff
+        return ok()
+    }
+    fn flush(&mut self) -> void!raw.Error {
+        if self.output_length == 0 {
+            return ok()
+        }
+        length := self.output_length
+        self.output_length = 0
+        code := unsafe {
+            dodo_window_x11_write(self.socket, self.output.pointer as *const u8, length)
+        }
+        if code != 0 {
+            return err(raw.from_code(code))
+        }
+        return ok()
+    }
+    fn property(&mut self, property: u32, kind: u32, format: u8, data: &[u8]) -> void!raw.Error {
+        if data.len > OUTPUT - 64 {
+            return err(raw.Error.InvalidInput)
+        }
+        self.reserve(data.len + 32)?
+        window := self.window
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.change_property(&mut out[start..], window, property, kind, format, data)
+        return self.commit(length)
+    }
+    fn atom(&mut self, name: &str) -> u32!raw.Error {
+        self.reserve(64)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.intern_atom(&mut out[start..], mem.str_bytes(name))
+        self.commit(length)?
+        wanted := self.sequence
+        self.flush()?
+        for {
+            self.need(x11.PACKET)?
+            begin := self.input_start
+            head := [0u8; 32]
+            copy_to(&mut head, &self.input.view()[begin..begin + x11.PACKET])
+            total := x11.message_length(&head)
+            if total > INPUT {
+                return err(raw.Error.Protocol)
+            }
+            self.need(total)?
+            self.input_start += total
+            kind := x11.code(&head)
+            if (kind == x11.REPLY || kind == x11.ERROR) && x11.sequence(&head) == wanted {
+                if kind == x11.ERROR {
+                    return err(raw.Error.Protocol)
+                }
+                return ok(x11.u32_at(&head, 8))
+            }
+        }
+    }
+    fn request_mapping(&mut self) -> void!raw.Error {
+        first := self.mapping_first
+        count := self.mapping_count
+        self.reserve(8)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.get_keyboard_mapping(&mut out[start..], first, count)
+        self.commit(length)?
+        self.mapping_sequence = self.sequence
+        return self.flush()
+    }
+
+    // -- Input -------------------------------------------------------------
+
+    // Read until at least `bytes` unread bytes are buffered.
+    fn need(&mut self, bytes: usize) -> void!raw.Error {
+        for self.input_end - self.input_start < bytes {
+            self.read()?
+        }
+        return ok()
+    }
+    // Read whatever the server has sent, waiting for at least one byte.
+    fn read(&mut self) -> void!raw.Error {
+        if self.input_start == self.input_end {
+            self.input_start = 0
+            self.input_end = 0
+        }
+        if self.input_end == INPUT {
+            // Move the unread part to the front.
+            begin := self.input_start
+            end := self.input_end
+            buffer := self.input.bytes()
+            for i in begin..end {
+                buffer[i - begin] = buffer[i]
+            }
+            self.input_start = 0
+            self.input_end = end - begin
+            if self.input_end == INPUT {
+                return err(raw.Error.Protocol)
+            }
+        }
+        end := self.input_end
+        count := unsafe {
+            dodo_window_x11_read(self.socket, ptr.offset(self.input.pointer, end as isize), INPUT - end)
+        }
+        if count < 0 {
+            return err(raw.from_code(-(count as i32)))
+        }
+        if count == 0 {
+            return err(raw.Error.Closed)
+        }
+        self.input_end += count as usize
+        return ok()
+    }
+    // Whether a whole message is buffered, waiting up to `milliseconds`
+    // for the first byte to arrive.
+    fn ready(&mut self, milliseconds: u32) -> bool!raw.Error {
+        if self.input_end - self.input_start >= x11.PACKET {
+            return ok(true)
+        }
+        if self.input_start == self.input_end {
+            waited := unsafe {
+                dodo_window_x11_wait(self.socket, milliseconds)
+            }
+            if waited < 0 {
+                return err(raw.from_code(-waited))
+            }
+            if waited == 0 {
+                return ok(false)
+            }
+        }
+        self.need(x11.PACKET)?
+        return ok(true)
+    }
+    // Handle one message from the server, waiting up to `milliseconds` for
+    // it. Fills `event` and returns true when the message is one to report.
+    fn receive_into(&mut self, milliseconds: u32, event: &mut raw.Event) -> bool!raw.Error {
+        if !self.ready(milliseconds)? {
+            return ok(false)
+        }
+        begin := self.input_start
+        message := [0u8; 32]
+        copy_to(&mut message, &self.input.view()[begin..begin + x11.PACKET])
+        total := x11.message_length(&message)
+        if total > INPUT {
+            return err(raw.Error.Protocol)
+        }
+        self.need(total)?
+        kind := x11.code(&message)
+        if kind == x11.REPLY {
+            if x11.sequence(&message) == self.mapping_sequence {
+                self.take_mapping(&message, total)
+            }
+            self.input_start += total
+            return ok(false)
+        }
+        self.input_start += x11.PACKET
+        if kind == x11.ERROR {
+            // A failed asynchronous request such as a PutImage racing a
+            // resize; nothing waits for it.
+            if x11.sequence(&message) == self.mapping_sequence {
+                self.mapping_sequence = NO_REPLY
+            }
+            return ok(false)
+        }
+        return self.translate(&message, event)
+    }
+    fn receive(&mut self, milliseconds: u32) -> bool!raw.Error {
+        event := raw.Event.empty()
+        return self.receive_into(milliseconds, &mut event)
+    }
+    fn take_mapping(&mut self, head: &[u8], total: usize) {
+        self.mapping_sequence = NO_REPLY
+        per := head[1] as u32
+        bytes := total - x11.PACKET
+        if per == 0 || bytes < self.mapping_count as usize * per as usize * 4 {
+            return
+        }
+        match Memory.new(bytes) {
+            ok(memory) => {
+                self.mapping = memory
+            }
+            err(_) => {
+                return
+            }
+        }
+        self.per_keycode = per
+        begin := self.input_start + x11.PACKET
+        source := self.input.view()
+        target := self.mapping.bytes()
+        copy_to(target, &source[begin..begin + bytes])
+    }
+
+    fn translate(&mut self, message: &[u8], event: &mut raw.Event) -> bool!raw.Error {
+        kind := x11.code(message)
+        if kind == x11.KEY_PRESS || kind == x11.KEY_RELEASE {
+            keycode := message[1] as u32
+            state := x11.u16_at(message, 28)
+            if kind == x11.KEY_RELEASE {
+                // Auto-repeat arrives as a release and a press with the same
+                // time; report it as one repeated press.
+                if self.followed_by_press(keycode, x11.u32_at(message, 4))? {
+                    self.repeat_keycode = keycode
+                    return ok(false)
+                }
+                set(event, raw.KEY, key_of(keycode), modifiers(state), 0, 0, 0)
+                return ok(true)
+            }
+            flags := raw.PRESSED
+            if self.repeat_keycode == keycode {
+                flags |= raw.REPEAT
+            }
+            self.repeat_keycode = 0
+            first := self.mapping_first
+            per := self.per_keycode
+            sym := x11.lookup(self.mapping.view(), first, per, keycode, state)
+            if (state & (x11.CONTROL_MASK | x11.MOD1_MASK | x11.MOD4_MASK)) == 0 {
+                self.pending_text = x11.keysym_to_unicode(sym)
+            }
+            set(event, raw.KEY, key_of(keycode), modifiers(state), flags, 0, 0)
+            return ok(true)
+        }
+        if kind == x11.BUTTON_PRESS || kind == x11.BUTTON_RELEASE {
+            detail := message[1] as u32
+            x := x11.i16_at(message, 24)
+            y := x11.i16_at(message, 26)
+            bits := modifiers(x11.u16_at(message, 28))
+            if detail >= 4 && detail <= 7 {
+                if kind == x11.BUTTON_RELEASE {
+                    return ok(false)
+                }
+                dx := 0i32
+                dy := 0i32
+                if detail == 4 {
+                    dy = -120
+                } else if detail == 5 {
+                    dy = 120
+                } else if detail == 6 {
+                    dx = -120
+                } else {
+                    dx = 120
+                }
+                set(event, raw.SCROLL, 0, bits, 0, dx, dy)
+                return ok(true)
+            }
+            button := 0u32
+            if detail == 2 {
+                button = 1
+            } else if detail == 3 {
+                button = 2
+            } else if detail == 8 {
+                button = 3
+            } else if detail == 9 {
+                button = 4
+            } else if detail != 1 {
+                return ok(false)
+            }
+            flags := 0u32
+            if kind == x11.BUTTON_PRESS {
+                flags = raw.PRESSED
+            }
+            set(event, raw.MOUSE_BUTTON, button, bits, flags, x, y)
+            return ok(true)
+        }
+        if kind == x11.MOTION_NOTIFY {
+            self.mouse_inside = true
+            set(event, raw.MOUSE_MOVE, 0, modifiers(x11.u16_at(message, 28)), 0, x11.i16_at(message, 24), x11.i16_at(message, 26))
+            return ok(true)
+        }
+        if kind == x11.LEAVE_NOTIFY {
+            // Ignore the crossings grabs cause while a button is held.
+            if message[30] != 0 || !self.mouse_inside {
+                return ok(false)
+            }
+            self.mouse_inside = false
+            set(event, raw.MOUSE_LEAVE, 0, 0, 0, 0, 0)
+            return ok(true)
+        }
+        if kind == x11.FOCUS_IN || kind == x11.FOCUS_OUT {
+            mode := message[9]
+            detail := message[1]
+            if (mode != 0 && mode != 3) || detail == 5 {
+                return ok(false)
+            }
+            flags := 0u32
+            if kind == x11.FOCUS_IN {
+                flags = raw.PRESSED
+            }
+            set(event, raw.FOCUS, 0, 0, flags, 0, 0)
+            return ok(true)
+        }
+        if kind == x11.EXPOSE {
+            x := x11.u16_at(message, 8) as i32
+            y := x11.u16_at(message, 10) as i32
+            width := x11.u16_at(message, 12)
+            height := x11.u16_at(message, 14)
+            self.put(x, y, width, height)?
+            return ok(false)
+        }
+        if kind == x11.CONFIGURE_NOTIFY {
+            if x11.u32_at(message, 8) != self.window {
+                return ok(false)
+            }
+            width := x11.u16_at(message, 20)
+            height := x11.u16_at(message, 22)
+            if width == self.width && height == self.height {
+                return ok(false)
+            }
+            self.resize(width, height)?
+            set(event, raw.RESIZE, 0, 0, 0, width as i32, height as i32)
+            return ok(true)
+        }
+        if kind == x11.CLIENT_MESSAGE {
+            if x11.u32_at(message, 8) == self.wm_protocols && x11.u32_at(message, 12) == self.wm_delete {
+                set(event, raw.CLOSE, 0, 0, 0, 0, 0)
+                return ok(true)
+            }
+            return ok(false)
+        }
+        if kind == x11.MAPPING_NOTIFY {
+            // A keyboard layout change: fetch the new keysyms.
+            if message[4] == 1 && self.mapping_sequence == NO_REPLY {
+                self.request_mapping()?
+            }
+            return ok(false)
+        }
+        return ok(false)
+    }
+
+    // Whether the next message, if it already arrived, is the press half of
+    // an auto-repeat.
+    fn followed_by_press(&mut self, keycode: u32, time: u32) -> bool!raw.Error {
+        if !self.ready(0)? {
+            return ok(false)
+        }
+        begin := self.input_start
+        source := self.input.view()
+        next := &source[begin..begin + x11.PACKET]
+        return ok(x11.code(next) == x11.KEY_PRESS && next[1] as u32 == keycode && x11.u32_at(next, 4) == time)
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> void!raw.Error {
+        next := Memory.new(width as usize * height as usize * 4)?
+        rows := smaller(height, self.height)
+        columns := smaller(width, self.width)
+        {
+            source := self.pixels.view()
+            target := next.bytes()
+            for y in 0usize..rows as usize {
+                origin := y * self.width as usize * 4
+                to := y * width as usize * 4
+                copy_to(&mut target[to..to + columns as usize * 4], &source[origin..origin + columns as usize * 4])
+            }
+        }
+        self.pixels = next
+        self.width = width
+        self.height = height
+        return ok()
+    }
+
+    // Send a rectangle of the pixel buffer in requests below the server's
+    // size limit.
+    fn put(&mut self, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
+        if x < 0 || y < 0 || width == 0 || height == 0 || x as u32 >= self.width || y as u32 >= self.height {
+            return ok()
+        }
+        w := smaller(width, self.width - x as u32)
+        h := smaller(height, self.height - y as u32)
+        limit := OUTPUT
+        if self.max_request < limit {
+            limit = self.max_request
+        }
+        row := w as usize * 4
+        per_request := (limit - x11.PUT_IMAGE_HEADER) / row
+        if per_request == 0 {
+            return err(raw.Error.Unsupported)
+        }
+        stride := self.width as usize * 4
+        window := self.window
+        gc := self.gc
+        depth := self.depth as u8
+        done := 0u32
+        for done < h {
+            rows := h - done
+            if rows as usize > per_request {
+                rows = per_request as u32
+            }
+            self.reserve(x11.PUT_IMAGE_HEADER + rows as usize * row)?
+            start := self.output_length
+            {
+                out := self.output.bytes()
+                source := self.pixels.view()
+                x11.put_image_header(&mut out[start..], window, gc, w, rows, x, y + done as i32, depth)
+                at := start + x11.PUT_IMAGE_HEADER
+                for r in 0u32..rows {
+                    origin := (y as usize + (done + r) as usize) * stride + x as usize * 4
+                    copy_to(&mut out[at..at + row], &source[origin..origin + row])
+                    at += row
+                }
+            }
+            self.commit(x11.PUT_IMAGE_HEADER + rows as usize * row)?
+            done += rows
+        }
+        return ok()
+    }
+
+    // -- std/window adapter --------------------------------------------------
+
+    pub fn width(&self) -> u32 {
+        return self.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.height
+    }
+    pub fn stride(&self) -> usize {
+        return self.width as usize * 4
+    }
+    pub fn scale_percent(&self) -> u32 {
+        return 100
+    }
+    pub fn pixels(&mut self) -> &mut[u8] from(self) {
+        return self.pixels.bytes()
+    }
+    pub fn next_event(&mut self, milliseconds: u32, event: &mut raw.Event) -> bool!raw.Error {
+        if !self.active {
+            return err(raw.Error.Closed)
+        }
+        if self.pending_text != 0 {
+            set(event, raw.TEXT, self.pending_text, 0, 0, 0, 0)
+            self.pending_text = 0
+            return ok(true)
+        }
+        wait := milliseconds
+        for {
+            self.flush()?
+            if self.receive_into(wait, event)? {
+                return ok(true)
+            }
+            if self.input_end - self.input_start < x11.PACKET && wait != raw.FOREVER {
+                // Messages handled internally, such as exposures, end a
+                // bounded wait early rather than extend it.
+                if wait == 0 || !self.ready(0)? {
+                    self.flush()?
+                    return ok(false)
+                }
+                wait = 0
+            }
+        }
+    }
+    pub fn present(&mut self, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
+        if !self.active {
+            return err(raw.Error.Closed)
+        }
+        self.put(x, y, width, height)?
+        return self.flush()
+    }
+    pub fn set_title(&mut self, title: &str) -> void!raw.Error {
+        if !self.active {
+            return err(raw.Error.Closed)
+        }
+        text := mem.str_bytes(title)
+        self.property(x11.ATOM_WM_NAME, x11.ATOM_STRING, 8, text)?
+        net_wm_name := self.net_wm_name
+        utf8_string := self.utf8_string
+        self.property(net_wm_name, utf8_string, 8, text)?
+        return self.flush()
+    }
+    pub fn set_cursor_visible(&mut self, visible: bool) -> void!raw.Error {
+        if !self.active {
+            return err(raw.Error.Closed)
+        }
+        if !visible && self.blank_cursor == 0 {
+            // An invisible cursor: a 1x1 bitmap cleared to 0 as its mask.
+            pixmap := self.new_id()?
+            gc := self.new_id()?
+            cursor := self.new_id()?
+            window := self.window
+            self.reserve(128)?
+            start := self.output_length
+            out := self.output.bytes()
+            length := x11.create_pixmap(&mut out[start..], pixmap, window, 1, 1, 1)
+            self.commit(length)?
+            start = self.output_length
+            out = self.output.bytes()
+            length = x11.create_gc(&mut out[start..], gc, pixmap, 0)
+            self.commit(length)?
+            start = self.output_length
+            out = self.output.bytes()
+            length = x11.fill_rectangle(&mut out[start..], pixmap, gc, 0, 0, 1, 1)
+            self.commit(length)?
+            start = self.output_length
+            out = self.output.bytes()
+            length = x11.create_cursor(&mut out[start..], cursor, pixmap, pixmap)
+            self.commit(length)?
+            start = self.output_length
+            out = self.output.bytes()
+            length = x11.free_gc(&mut out[start..], gc)
+            self.commit(length)?
+            start = self.output_length
+            out = self.output.bytes()
+            length = x11.free_pixmap(&mut out[start..], pixmap)
+            self.commit(length)?
+            self.blank_cursor = cursor
+        }
+        cursor := 0u32
+        if !visible {
+            cursor = self.blank_cursor
+        }
+        window := self.window
+        self.reserve(16)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.set_cursor(&mut out[start..], window, cursor)
+        self.commit(length)?
+        return self.flush()
+    }
+    pub fn close(&mut self) {
+        if !self.active {
+            return
+        }
+        self.active = false
+        if self.socket >= 0 {
+            if self.window != 0 {
+                window := self.window
+                self.output_length = 0
+                out := self.output.bytes()
+                length := x11.destroy_window(out, window)
+                self.output_length = length
+                match self.flush() {
+                    ok() => {}
+                    err(_) => {}
+                }
+            }
+            unsafe {
+                dodo_window_x11_close(self.socket)
+            }
+            self.socket = -1
+        }
+        self.pixels = Memory.empty()
+        self.width = 0
+        self.height = 0
+        unsafe {
+            dodo_window_release()
+        }
+    }
+    fn drop(&mut self) {
+        self.close()
+    }
+}
+
+fn smaller(a: u32, b: u32) -> u32 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn copy_to(target: &mut[u8], source: &[u8]) {
+    for i in 0usize..source.len {
+        target[i] = source[i]
+    }
+}
+
+fn put32(out: &mut[u8], offset: usize, value: u32) {
+    out[offset] = (value & 0xff) as u8
+    out[offset + 1] = ((value >> 8) & 0xff) as u8
+    out[offset + 2] = ((value >> 16) & 0xff) as u8
+    out[offset + 3] = ((value >> 24) & 0xff) as u8
+}

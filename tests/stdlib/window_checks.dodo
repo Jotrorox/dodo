@@ -1,0 +1,329 @@
+package main
+
+import "core/mem"
+import "std/window"
+import "std/window/raw"
+import "std/window/x11"
+
+// Portable checks for std/window: the X11 protocol encoders and parsers,
+// keysym translation and the public key tables. No window system is needed.
+
+fn put16(out: &mut[u8], offset: usize, value: u32) {
+    out[offset] = (value & 0xff) as u8
+    out[offset + 1] = (value >> 8) as u8
+}
+
+fn put32(out: &mut[u8], offset: usize, value: u32) {
+    out[offset] = (value & 0xff) as u8
+    out[offset + 1] = ((value >> 8) & 0xff) as u8
+    out[offset + 2] = ((value >> 16) & 0xff) as u8
+    out[offset + 3] = (value >> 24) as u8
+}
+
+fn same(actual: &[u8], expected: &[u8]) -> bool {
+    if actual.len != expected.len {
+        return false
+    }
+    for i in 0usize..actual.len {
+        if actual[i] != expected[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn setup_request() {
+    out := [0xffu8; 64]
+    length := x11.setup_request(&mut out, mem.str_bytes(""), mem.str_bytes(""))
+    assert_eq(length, 12usize)
+    expected := [0x6cu8, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    assert(same(&out[..12], &expected))
+
+    cookie := [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    length = x11.setup_request(&mut out, mem.str_bytes("MIT-MAGIC-COOKIE-1"), &cookie)
+    // 12 + 18 padded to 20 + 16.
+    assert_eq(length, 48usize)
+    assert_eq(x11.u16_at(&out, 6), 18u32)
+    assert_eq(x11.u16_at(&out, 8), 16u32)
+    assert_eq(out[12], 0x4du8)
+    assert_eq(out[30], 0u8)
+    assert_eq(out[31], 0u8)
+    assert(same(&out[32..48], &cookie))
+
+    short := [0u8; 20]
+    assert_eq(x11.setup_request(&mut short, mem.str_bytes("MIT-MAGIC-COOKIE-1"), &cookie), 0usize)
+}
+
+// A setup reply with one screen whose root visual is `visual_class` with
+// the given depth, pixmap bits per pixel and image byte order.
+fn setup_reply(out: &mut[u8], depth: u8, bits: u8, order: u8, visual_class: u8) -> usize {
+    for i in 0usize..out.len {
+        out[i] = 0
+    }
+    vendor := 5usize
+    total := 128usize
+    out[0] = 1
+    put16(out, 2, 11)
+    put16(out, 6, ((total - 8) / 4) as u32)
+    put32(out, 12, 0x00400000)
+    put32(out, 16, 0x001fffff)
+    put16(out, 24, vendor as u32)
+    put16(out, 26, 65535)
+    out[28] = 1
+    out[29] = 1
+    out[30] = order
+    out[34] = 8
+    out[35] = 255
+    // Vendor "Dodo!" padded to 8, then one pixmap format.
+    out[40] = 0x44
+    format := 48usize
+    out[format] = depth
+    out[format + 1] = bits
+    out[format + 2] = 32
+    screen := 56usize
+    put32(out, screen, 0x123)
+    put16(out, screen + 20, 1920)
+    put16(out, screen + 22, 1080)
+    put32(out, screen + 32, 0x21)
+    out[screen + 38] = depth
+    out[screen + 39] = 1
+    allowed := screen + 40
+    out[allowed] = depth
+    put16(out, allowed + 2, 1)
+    visual := allowed + 8
+    put32(out, visual, 0x21)
+    out[visual + 4] = visual_class
+    out[visual + 5] = 8
+    put16(out, visual + 6, 256)
+    put32(out, visual + 8, 0xff0000)
+    put32(out, visual + 12, 0xff00)
+    put32(out, visual + 16, 0xff)
+    return total
+}
+
+fn setup_parsing() {
+    reply := [0u8; 256]
+    total := setup_reply(&mut reply, 24, 32, 0, 4)
+    assert_eq(x11.setup_length(&reply), total)
+    setup := x11.parse_setup(&reply[..total], 0)!
+    assert_eq(setup.id_base, 0x00400000u32)
+    assert_eq(setup.id_mask, 0x001fffffu32)
+    assert_eq(setup.max_request, 65535usize * 4)
+    assert_eq(setup.min_keycode, 8u32)
+    assert_eq(setup.max_keycode, 255u32)
+    assert_eq(setup.root, 0x123u32)
+    assert_eq(setup.root_visual, 0x21u32)
+    assert_eq(setup.root_depth, 24u32)
+    assert_eq(setup.screen_width, 1920u32)
+    assert_eq(setup.screen_height, 1080u32)
+
+    match x11.parse_setup(&reply[..total], 1) {
+        ok(_) => assert(false, "screen 1 does not exist"),
+        err(error) => assert(error == raw.Error.Protocol),
+    }
+    match x11.parse_setup(&reply[..total - 4], 0) {
+        ok(_) => assert(false, "truncated reply accepted"),
+        err(error) => assert(error == raw.Error.Protocol),
+    }
+    // Pixel layouts other than 32-bit little-endian true color.
+    total = setup_reply(&mut reply, 16, 16, 0, 4)
+    match x11.parse_setup(&reply[..total], 0) {
+        ok(_) => assert(false, "16-bit visual accepted"),
+        err(error) => assert(error == raw.Error.Unsupported),
+    }
+    total = setup_reply(&mut reply, 24, 32, 1, 4)
+    match x11.parse_setup(&reply[..total], 0) {
+        ok(_) => assert(false, "big-endian images accepted"),
+        err(error) => assert(error == raw.Error.Unsupported),
+    }
+    total = setup_reply(&mut reply, 24, 32, 0, 3)
+    match x11.parse_setup(&reply[..total], 0) {
+        ok(_) => assert(false, "pseudo-color visual accepted"),
+        err(error) => assert(error == raw.Error.Unsupported),
+    }
+    // A refusal, as for a missing cookie.
+    total = setup_reply(&mut reply, 24, 32, 0, 4)
+    reply[0] = 0
+    match x11.parse_setup(&reply[..total], 0) {
+        ok(_) => assert(false, "refusal accepted"),
+        err(error) => assert(error == raw.Error.Protocol),
+    }
+    // Every truncation fails cleanly instead of reading past the end.
+    total = setup_reply(&mut reply, 24, 32, 0, 4)
+    for cut in 0usize..total {
+        match x11.parse_setup(&reply[..cut], 0) {
+            ok(_) => assert(false, "truncated reply accepted"),
+            err(_) => {}
+        }
+    }
+}
+
+fn requests() {
+    out := [0xeeu8; 128]
+    assert_eq(x11.create_window(&mut out, 0x400001, 0x123, 640, 480, 0x8001), 40usize)
+    expected := [1u8, 0, 10, 0, 1, 0, 0x40, 0, 0x23, 1, 0, 0, 0, 0, 0, 0, 0x80, 2, 0xe0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0x10, 8, 0, 0, 1, 0, 0, 0, 1, 0x80, 0, 0]
+    assert(same(&out[..40], &expected))
+
+    // Names are padded to whole words.
+    assert_eq(x11.intern_atom(&mut out, mem.str_bytes("WM_PROTOCOLS")), 20usize)
+    assert_eq(out[0], 16u8)
+    assert_eq(x11.u16_at(&out, 2), 5u32)
+    assert_eq(x11.u16_at(&out, 4), 12u32)
+    assert_eq(x11.intern_atom(&mut out, mem.str_bytes("UTF8_STRING")), 20usize)
+    assert_eq(out[19], 0u8)
+
+    data := [1u8, 0, 0, 0, 2, 0, 0, 0]
+    assert_eq(x11.change_property(&mut out, 7, 8, x11.ATOM_ATOM, 32, &data), 32usize)
+    assert_eq(out[0], 18u8)
+    assert_eq(x11.u16_at(&out, 2), 8u32)
+    assert_eq(out[16], 32u8)
+    // Two 32-bit elements.
+    assert_eq(x11.u32_at(&out, 20), 2u32)
+    assert_eq(x11.change_property(&mut out, 7, 39, x11.ATOM_STRING, 8, mem.str_bytes("Hi")), 28usize)
+    assert_eq(x11.u32_at(&out, 20), 2u32)
+    assert_eq(x11.change_property(&mut out, 7, 39, x11.ATOM_STRING, 16, mem.str_bytes("Hi")), 0usize)
+
+    assert_eq(x11.put_image_header(&mut out, 5, 6, 10, 3, -2, 7, 24), 24usize)
+    assert_eq(out[0], 72u8)
+    assert_eq(out[1], 2u8)
+    // 24 header bytes and 10 * 3 pixels in 4-byte units.
+    assert_eq(x11.u16_at(&out, 2), 36u32)
+    assert_eq(x11.i16_at(&out, 16), -2i32)
+    assert_eq(x11.i16_at(&out, 18), 7i32)
+    assert_eq(out[21], 24u8)
+
+    assert_eq(x11.get_keyboard_mapping(&mut out, 8, 248), 8usize)
+    assert_eq(out[0], 101u8)
+    assert_eq(out[4], 8u8)
+    assert_eq(out[5], 248u8)
+    assert_eq(x11.get_keyboard_mapping(&mut out, 8, 256), 0usize)
+
+    assert_eq(x11.create_gc(&mut out, 9, 7, 0), 24usize)
+    assert_eq(x11.u32_at(&out, 12), 0x10004u32)
+    assert_eq(x11.fixed_size_hints(&mut out, 320, 200), 72usize)
+    assert_eq(x11.u32_at(&out, 0), 48u32)
+    assert_eq(x11.u32_at(&out, 28), 320u32)
+    assert_eq(x11.u32_at(&out, 32), 200u32)
+    assert_eq(x11.map_window(&mut out, 7), 8usize)
+    assert_eq(x11.destroy_window(&mut out, 7), 8usize)
+    assert_eq(out[0], 4u8)
+    assert_eq(x11.set_cursor(&mut out, 7, 0), 16usize)
+    assert_eq(x11.create_cursor(&mut out, 1, 2, 2), 32usize)
+    assert_eq(x11.create_pixmap(&mut out, 2, 7, 1, 1, 1), 16usize)
+    assert_eq(out[1], 1u8)
+    assert_eq(x11.fill_rectangle(&mut out, 2, 3, 0, 0, 1, 1), 20usize)
+
+    tiny := [0u8; 4]
+    assert_eq(x11.create_window(&mut tiny, 1, 2, 3, 4, 5), 0usize)
+    assert_eq(x11.map_window(&mut tiny, 1), 0usize)
+}
+
+fn messages() {
+    message := [0u8; 32]
+    message[0] = x11.REPLY
+    put16(&mut message, 2, 0x1234)
+    put32(&mut message, 4, 3)
+    assert_eq(x11.message_length(&message), 44usize)
+    assert_eq(x11.sequence(&message), 0x1234u32)
+    message[0] = x11.KEY_PRESS | 0x80
+    assert_eq(x11.message_length(&message), 32usize)
+    assert_eq(x11.code(&message), x11.KEY_PRESS)
+    message[0] = x11.ERROR
+    assert_eq(x11.message_length(&message), 32usize)
+    put16(&mut message, 24, 0xfffe)
+    assert_eq(x11.i16_at(&message, 24), -2i32)
+}
+
+fn keysyms() {
+    // Keycodes 38 (a), 79 (keypad 7) and 26 (e, with a third level).
+    per := 6u32
+    first := 26u32
+    mapping := [0u8; 54 * 6 * 4]
+    put32(&mut mapping, ((26 - first) * per) as usize * 4, 0x65)
+    put32(&mut mapping, (((26 - first) * per) + 1) as usize * 4, 0x45)
+    put32(&mut mapping, (((26 - first) * per) + 4) as usize * 4, 0x20ac)
+    put32(&mut mapping, ((38 - first) * per) as usize * 4, 0x61)
+    put32(&mut mapping, ((79 - first) * per) as usize * 4, 0xff95)
+    put32(&mut mapping, (((79 - first) * per) + 1) as usize * 4, 0xffb7)
+
+    assert_eq(x11.lookup(&mapping, first, per, 38, 0), 0x61u32)
+    // A single lowercase letter capitalises with Shift or Lock.
+    assert_eq(x11.lookup(&mapping, first, per, 38, x11.SHIFT_MASK), 0x41u32)
+    assert_eq(x11.lookup(&mapping, first, per, 38, x11.LOCK_MASK), 0x41u32)
+    assert_eq(x11.lookup(&mapping, first, per, 26, 0), 0x65u32)
+    assert_eq(x11.lookup(&mapping, first, per, 26, x11.SHIFT_MASK), 0x45u32)
+    assert_eq(x11.lookup(&mapping, first, per, 26, x11.LOCK_MASK), 0x45u32)
+    assert_eq(x11.lookup(&mapping, first, per, 26, x11.MOD5_MASK), 0x20acu32)
+    // NumLock selects the digit, Shift inverts it.
+    assert_eq(x11.lookup(&mapping, first, per, 79, 0), 0xff95u32)
+    assert_eq(x11.lookup(&mapping, first, per, 79, x11.MOD2_MASK), 0xffb7u32)
+    assert_eq(x11.lookup(&mapping, first, per, 79, x11.MOD2_MASK | x11.SHIFT_MASK), 0xff95u32)
+    // Unmapped and out-of-range keycodes have no symbol.
+    assert_eq(x11.lookup(&mapping, first, per, 30, 0), 0u32)
+    assert_eq(x11.lookup(&mapping, first, per, 200, 0), 0u32)
+    assert_eq(x11.lookup(&mapping, first, per, 3, 0), 0u32)
+
+    assert_eq(x11.keysym_to_unicode(0x61), 0x61u32)
+    assert_eq(x11.keysym_to_unicode(0xe9), 0xe9u32)
+    assert_eq(x11.keysym_to_unicode(0x20ac), 0x20acu32)
+    assert_eq(x11.keysym_to_unicode(0x010003b1), 0x3b1u32)
+    assert_eq(x11.keysym_to_unicode(0xffb7), 0x37u32)
+    assert_eq(x11.keysym_to_unicode(0xffaa), 0x2au32)
+    assert_eq(x11.keysym_to_unicode(0xffbd), 0x3du32)
+    // Function, modifier and dead keys type nothing.
+    assert_eq(x11.keysym_to_unicode(0xff0d), 0u32)
+    assert_eq(x11.keysym_to_unicode(0xffe1), 0u32)
+    assert_eq(x11.keysym_to_unicode(0xfe51), 0u32)
+    assert_eq(x11.keysym_to_unicode(0x7f), 0u32)
+}
+
+fn keys() {
+    // Codes are the ABI between the adapters and std/window.
+    for code in 0u32..107 {
+        key := window.key_from_code(code)
+        assert_eq(window.key_code(&key), code)
+    }
+    unknown := window.key_from_code(107)
+    assert(unknown == window.Key.Unknown)
+    escape := window.Key.Escape
+    assert_eq(window.key_code(&escape), 37u32)
+    right_meta := window.Key.RightMeta
+    assert_eq(window.key_code(&right_meta), 106u32)
+    assert(same(mem.str_bytes(window.key_name(&escape)), mem.str_bytes("Escape")))
+    keypad := window.Key.Keypad7
+    assert(same(mem.str_bytes(window.key_name(&keypad)), mem.str_bytes("Keypad7")))
+
+    options := window.Options.new("Title", 320, 200)
+    assert(options.resizable)
+    assert_eq(options.width, 320u32)
+    assert(same(mem.str_bytes(window.error_name(window.Error.NoDisplay)), mem.str_bytes("NoDisplay")))
+    assert(raw.from_code(1) == raw.Error.NoDisplay)
+    assert(raw.from_code(7) == raw.Error.Unsupported)
+    assert(raw.from_code(99) == raw.Error.System)
+    none := window.Modifiers.none()
+    assert(!none.shift() && !none.control() && !none.alt() && !none.meta() && !none.caps_lock() && !none.shortcut())
+
+    // Invalid sizes fail before any window system is contacted.
+    match window.open(window.Options.new("Zero", 0, 10)) {
+        ok(_) => assert(false, "zero width accepted"),
+        err(error) => assert(error == window.Error.InvalidInput),
+    }
+    match window.open(window.Options.new("Huge", 10, window.MAX_SIZE + 1)) {
+        ok(_) => assert(false, "oversized window accepted"),
+        err(error) => assert(error == window.Error.InvalidInput),
+    }
+}
+
+fn main() {
+    setup_request()
+    setup_parsing()
+    requests()
+    messages()
+    keysyms()
+    keys()
+}
+
+@test
+fn window_checks_suite() {
+    main()
+}

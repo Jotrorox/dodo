@@ -24,6 +24,9 @@ microcontrollers:
 | `std/embedded/display/st7789` | ST7789 colour TFT and IPS panels, RGB565 over SPI. |
 | `std/embedded/display/ssd1306` | SSD1306 monochrome OLED panels, over I2C or SPI. |
 
+To show a canvas on a desktop, open a window with [std/window](window.md),
+which implements the `Display` protocol below like the panel drivers do.
+
 ## Quickstart
 
 Save this as `picture.dodo`:

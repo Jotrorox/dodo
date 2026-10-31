@@ -1,0 +1,114 @@
+package main
+
+import "std/console"
+import "std/graphics"
+import "std/window"
+
+// Opens a 320x240 window, prints every event on its own line and exits on
+// Escape or Close. tests/window_library.rs drives it with xdotool under Xvfb;
+// it also exits after five idle seconds, so a lost event cannot hang a test.
+// T renames the window, P draws a small square with a partial update, and
+// D presents a small canvas of its own, placed with set_origin, through the
+// graphics.Display protocol.
+
+fn present_own<D: graphics.Display>(display: &mut D) -> void!graphics.Error {
+    // A canvas covering only part of the window, as band rendering uses.
+    pixels := [0u8; 40 * 40 * 2]
+    canvas := graphics.canvas(&mut pixels, 40, 40, graphics.PixelFormat.Rgb565)?
+    canvas.set_origin(240, 140)
+    canvas.fill_rect(250, 150, 20, 20, graphics.CYAN)
+    return graphics.present(display, &mut canvas)
+}
+
+fn draw(win: &mut window.Window) {
+    canvas := win.canvas()
+    canvas.clear(graphics.hex(0x203040))
+    canvas.fill_rect(10, 10, 50, 30, graphics.RED)
+    canvas.fill_rect(70, 10, 50, 30, graphics.GREEN)
+    canvas.fill_rect(130, 10, 50, 30, graphics.BLUE)
+}
+
+fn run() -> void!window.Error {
+    win := window.open(window.Options.new("Events", 320, 240))?
+    console.printf("open {} {}\n", win.width(), win.height())!
+    draw(&mut win)
+    win.update_all()?
+    console.println("drawn")!
+    idle := 0u32
+    for idle < 50 {
+        match win.wait_event_timeout(100)? {
+            some(event) => {
+                idle = 0
+                match event {
+                    window.Event.Close => {
+                        console.println("close")!
+                        break
+                    }
+                    window.Event.Resize(width, height) => {
+                        console.printf("resize {} {}\n", width, height)!
+                        draw(&mut win)
+                        win.update_all()?
+                    }
+                    window.Event.Focus(focused) => {
+                        console.printf("focus {}\n", focused)!
+                    }
+                    window.Event.Key(key) => {
+                        console.printf("key {} {} {} {}\n", window.key_name(&key.key), key.pressed, key.repeat, key.modifiers.shift())!
+                        if key.key == window.Key.Escape {
+                            break
+                        }
+                        if key.key == window.Key.T && key.pressed {
+                            win.set_title("Renamed")?
+                        }
+                        if key.key == window.Key.P && key.pressed {
+                            canvas := win.canvas()
+                            canvas.fill_rect(200, 100, 20, 20, graphics.MAGENTA)
+                            dirty := canvas.take_dirty()
+                            win.update(dirty)?
+                            console.println("painted")!
+                        }
+                        if key.key == window.Key.D && key.pressed {
+                            match present_own(&mut win) {
+                                ok() => console.println("presented")!,
+                                err(error) => console.printf("present failed {}\n", graphics.error_name(error))!,
+                            }
+                        }
+                    }
+                    window.Event.Text(code_point) => {
+                        console.printf("text {}\n", code_point)!
+                    }
+                    window.Event.MouseMove(x, y) => {
+                        console.printf("move {} {}\n", x, y)!
+                    }
+                    window.Event.MouseButton(button) => {
+                        console.printf("button {} {} {}\n", button.pressed, button.x, button.y)!
+                    }
+                    window.Event.MouseLeave => {
+                        console.println("leave")!
+                    }
+                    window.Event.Scroll(dx, dy) => {
+                        console.printf("scroll {} {}\n", dx, dy)!
+                    }
+                }
+            }
+            none => {
+                idle += 1
+            }
+        }
+    }
+    win.close()
+    console.println("closed")!
+    return ok()
+}
+
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }
+        err(error) => {
+            console.printf("error {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+}
