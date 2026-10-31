@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `std/embedded/power` is one low-power layer for every chip: sleep and deep
+  sleep modes that every wait honours, including timer alarms and the
+  executor; clock gating with `power.Clocks` sets; and a dormant state, with
+  every oscillator stopped, that pins in a `power.Wake` end. The RP2040 and
+  RP2350 implement its `Power` protocol as `Peripherals.power`, and every board
+  hands it out as `b.power`. The chips name each clock gate
+  (`CLOCK_UART0`, `ALARM_CLOCKS`, `ESSENTIAL_CLOCKS`, ...).
+  `disable_unused_clocks` stops the clocks of unclaimed peripherals, and
+  claiming a peripheral starts them again. `disable_clocks` refuses clocks
+  the program needs or a claimed peripheral uses. `dormant` runs from the
+  crystal, stops the PLL and both oscillators, and restores clk_sys on wake.
+  `fake.Power` tests power-aware code on a desktop.
+  `cortex_m.set_deep_sleep`, `set_sleep_on_exit`, and `set_event_on_pend`
+  expose the core's SCR. The self-tests gain on-board checks, and
+  `examples/low_power.dodo` shows all three levels.
 - `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
   entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
   declared with its own signature. It covers devices, command queues,

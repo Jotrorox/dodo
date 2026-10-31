@@ -1,0 +1,40 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/power"
+
+// Low power with std/embedded/power, on any board (--board pico, pico2, or
+// pico2_w):
+//
+// - at start-up, the clocks of every peripheral nothing has claimed stop;
+// - between blinks the core deep-sleeps on a timer alarm, with only the
+//   timer's clocks running;
+// - after ten blinks the chip goes dormant, every oscillator stopped, until
+//   a push button between GP15 and 3V3(OUT) is pressed. The pin's default
+//   pull-down holds it low until then.
+
+const BUTTON_PIN: u32 = 15
+const BLINKS: u32 = 10
+
+fn main() {
+    b := board.take()!
+    b.power.disable_unused_clocks()
+    b.power.set_sleep_clocks(chip.ALARM_CLOCKS)
+    b.power.set_mode(power.Mode.DeepSleep)
+    button := b.pins.input(BUTTON_PIN)!
+    alarm := b.timer.alarm(0)!
+    for {
+        for _ in 0..BLINKS {
+            b.led.set_high()
+            on_until := alarm.now_us() + 50_000
+            alarm.sleep_until(some(on_until))
+            b.led.set_low()
+            off_until := alarm.now_us() + 950_000
+            alarm.sleep_until(some(off_until))
+        }
+        // Wait for a new press, not one latched earlier.
+        button.clear_events(chip.RISING_EDGE)
+        power.dormant_until(&mut b.power, BUTTON_PIN, power.RISING_EDGE)!
+    }
+}
