@@ -5,6 +5,7 @@ import "std/embedded/cortex_m"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/peripheral/designware_i2c"
@@ -14,7 +15,8 @@ import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
 // I2C, SPI, UART, PWM, the ADC, the microsecond timer, a USB serial port,
-// and the boot ROM. `take(config)` brings the chip from its boot state (ring
+// the second core, the FIFOs and spinlocks the cores share, and the boot
+// ROM. `take(config)` brings the chip from its boot state (ring
 // oscillator, peripherals held in reset) to a known configuration and hands
 // out the peripherals once. Pins implement the std/embedded/hal output and
 // input pin protocols, I2C and SPI buses claimed from `Pins` implement the
@@ -256,6 +258,16 @@ const ROM_VERSION_WORD: usize = 0x10
 // crystal start-up, takes about 1 ms at the ring oscillator's boot clock.
 const ATTEMPTS: u32 = 1_000_000
 
+// Power-on state machine (7.4): FRCE_OFF holds core 1 in reset while its
+// bit is set.
+const PSM_BASE: usize = 0x4001_8000
+const PSM_PROC1: u32 = 1 << 24
+// Erratum RP2350-E2: writes to SIO offsets 0x180 to 0x1FC also unlock the
+// spinlock 0x80 below. Locks 0 to 4, 8, 9, and 12 to 17 sit below writable
+// registers (doorbells, PERI_NONSEC, RISC-V soft interrupts, MTIME, TMDS),
+// so they are not handed out.
+const RESERVED_SPINLOCKS: u32 = 0x0003_F31F
+
 static mut TAKEN: bool = false
 // What runs PLL_USB: the ADC and the USB controller, one each. It stops when
 // neither does.
@@ -332,6 +344,11 @@ pub struct Peripherals {
     pub usb: Usb
     // The DMA controller's channels; rp_dma documents them.
     pub dma: rp_dma.Dma
+    // Core 1, which runs a task once started, and the FIFOs and spinlocks
+    // the two cores share; see std/embedded/chip/rp_multicore.
+    pub core1: rp_multicore.Core1
+    pub fifos: rp_multicore.Fifos
+    pub spinlocks: rp_multicore.Spinlocks
 }
 
 // Configure clocks, take GPIO, the timer, and DMA out of reset, and return the
@@ -345,7 +362,8 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     }
     section := hal.Critical.enter()
     // SAFETY: interrupts are masked, so the flag is read and set atomically
-    // on this core. Core 1 stays parked in the boot ROM.
+    // on this core. Core 1 waits in the boot ROM until the program starts
+    // it through the peripherals returned here.
     taken := unsafe {
         TAKEN
     }
@@ -379,7 +397,20 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     dma := unsafe {
         rp_dma.Dma.new(rp_dma.RP2350)
     }
-    return ok(Peripherals { pins: Pins { bank }, timer, usb, dma })
+    // SAFETY: TAKEN guarantees one set of the cores' parts, and core 1 is
+    // not running yet, so no spinlock is held.
+    cores := unsafe {
+        rp_multicore.reset_spinlocks(RESERVED_SPINLOCKS)
+        rp_multicore.take(rp_multicore.Chip {
+            psm_base: PSM_BASE,
+            core1_bit: PSM_PROC1,
+            core0_fifo_irq: SIO_IRQ_FIFO,
+            core1_fifo_irq: SIO_IRQ_FIFO,
+            reserved_locks: RESERVED_SPINLOCKS,
+        })
+    }
+    let rp_multicore.Cores { core1, fifos, spinlocks } = cores
+    return ok(Peripherals { pins: Pins { bank }, timer, usb, dma, core1, fifos, spinlocks })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.

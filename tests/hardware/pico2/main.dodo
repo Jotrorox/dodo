@@ -5,6 +5,7 @@ import "core/mem"
 import "std/embedded/chip"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
+import "std/embedded/chip/rp_multicore"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
 import "std/embedded/hal"
@@ -16,7 +17,8 @@ import "std/sync/atomic"
 
 // Hardware self-test for the `pico2` board: the RP2350 startup runtime,
 // std/embedded/chip/rp2350 (clocks, timer, I2C, SPI, UART, PWM, the ADC,
-// the USB serial port, single ownership, configuration checks), std/embedded/board/pico2, and the runtime's integer and
+// the USB serial port, core 1 with the FIFOs and spinlocks, single
+// ownership, configuration checks), std/embedded/board/pico2, and the runtime's integer and
 // floating-point helpers. Every outcome ends in the USB bootloader with a
 // record that `scripts/test_pico.py --board pico2` reads over USB with
 // picotool. The RP2350 boot ROM clears SRAM when it starts, so the record is
@@ -920,6 +922,195 @@ fn refused_void(result: void!hal.Error, expected: hal.Error) -> bool {
     }
 }
 
+// Core 1: started with a task of its own, sharing the FIFOs and a spinlock
+// with core 0, and running an executor of its own. Its stack is a static,
+// so that it stays clear of the result record below core 0's stack.
+// Spinlock 0 is usable on the RP2040, reserved on the RP2350.
+const LOCK_ZERO_USABLE: bool = false
+static mut CORE1_STACK: [1024]u64 = [0u64; 1024]
+static mut SHARED_COUNT: u32 = 0
+static CORE1_FLAG: atomic.Atomic<u32> = atomic.Atomic.new(0u32)
+// Core 1's executor numbers its signals on its own: the same id as EDGE.
+const WORDS: executor.Signal = executor.Signal { id: 0 }
+const STOP_WORD: u32 = 0xFFFF_FFFF
+const ADDS: u32 = 10_000
+
+// On core 1, in three phases that core 0 drives: report the core number and
+// answer words until STOP_WORD; count to ADDS under the lock while core 0
+// does too; then double three words in a task of core 1's executor, woken
+// by the FIFO interrupt, and report how often that executor slept.
+struct Core1Test {
+    fifo: rp_multicore.Fifo
+    lock: rp_multicore.Spinlock
+    alarm: chip.Alarm
+
+    pub fn run(self) {
+        let Core1Test { fifo, lock, alarm } = self
+        link := fifo
+        clock := alarm
+        link.write(rp_multicore.core_id())
+        for {
+            word := link.read()
+            if word == STOP_WORD {
+                break
+            }
+            link.write(word * 3 + 1)
+        }
+        for _ in 0..ADDS {
+            guard := lock.lock()
+            unsafe {
+                SHARED_COUNT += 1
+            }
+            core.drop(guard)
+        }
+        link.write(ADDS)
+        link.set_signal(&WORDS)
+        doubler := Doubler { fifo: link, left: 3 }
+        runner := executor.Executor.new()
+        {
+            tasks: [1]&mut dyn executor.Task = [&mut doubler]
+            runner.run(&mut tasks, &mut clock)
+        }
+        doubler.fifo.clear_signal()
+        doubler.fifo.write(runner.sleeps() as u32)
+    }
+}
+
+// Doubles the words core 0 writes, polled when they arrive.
+struct Doubler {
+    fifo: rp_multicore.Fifo
+    left: u32
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        WORDS.take(cx)
+        for {
+            match self.fifo.try_read() {
+                some(word) => {
+                    self.fifo.write(word * 2)
+                    self.left -= 1
+                    if self.left == 0 {
+                        return executor.Poll.Ready
+                    }
+                }
+                none => {
+                    break
+                }
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+
+// On core 1, after a restart: show that it ran, and where.
+struct Flag {
+    pub fn run(self) {
+        match CORE1_FLAG.store(rp_multicore.core_id() + 1, atomic.Ordering.Release) {
+            ok() => {}
+            err(_) => {}
+        }
+    }
+}
+
+fn flag() -> u32 {
+    match CORE1_FLAG.load(atomic.Ordering.Acquire) {
+        ok(value) => {
+            return value
+        }
+        err(_) => {
+            return 0
+        }
+    }
+}
+
+// The next word from core 1, or STOP_WORD if none comes within 10 ms.
+fn receive(fifo: &mut rp_multicore.Fifo, timer: &mut chip.Timer) -> u32 {
+    start := timer.now_us()
+    for timer.now_us() - start < 10_000 {
+        if let some(word) = fifo.try_read() {
+            return word
+        }
+    }
+    return STOP_WORD
+}
+
+fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, spinlocks: &mut rp_multicore.Spinlocks, timer: &mut chip.Timer) {
+    feed_watchdog()
+    fifo := fifos.claim()!
+    lock := spinlocks.claim(20)!
+    claims := refused(spinlocks.claim(20), hal.Error.Busy) && refused(spinlocks.claim(32), hal.Error.InvalidInput) && spinlocks.is_usable(0) == LOCK_ZERO_USABLE
+    guard := lock.lock()
+    held := lock.is_locked() && cortex_m.interrupts_masked()
+    excluded := false
+    match lock.try_lock() {
+        some(_) => {}
+        none => {
+            excluded = true
+        }
+    }
+    core.drop(guard)
+    released := !lock.is_locked() && !cortex_m.interrupts_masked()
+    small := [0u64; 16]
+    tiny := refused(core1.start(&mut small, Flag {}), hal.Error.InvalidInput)
+
+    unsafe {
+        SHARED_COUNT = 0
+    }
+    task := Core1Test { fifo: fifos.claim()!, lock: lock.clone(), alarm: timer.alarm(3)! }
+    third := refused(fifos.claim(), hal.Error.Busy)
+    running := unsafe {
+        core1.start(&mut CORE1_STACK, task)!
+    }
+    id := receive(&mut fifo, timer)
+    echoes := true
+    for word in 0..5u32 {
+        fifo.write(word * 1000)
+        echoes = echoes && receive(&mut fifo, timer) == word * 3000 + 1
+    }
+    check(tiny && third && id == 1 && echoes)
+
+    fifo.write(STOP_WORD)
+    for _ in 0..ADDS {
+        guard = lock.lock()
+        unsafe {
+            SHARED_COUNT += 1
+        }
+        core.drop(guard)
+    }
+    counted := receive(&mut fifo, timer) == ADDS
+    total := unsafe {
+        SHARED_COUNT
+    }
+    check(claims && held && excluded && released && counted && total == 2 * ADDS)
+
+    doubled := true
+    for word in 10..13u32 {
+        timer.delay_ms(2)
+        fifo.write(word)
+        doubled = doubled && receive(&mut fifo, timer) == 2 * word
+    }
+    sleeps := receive(&mut fifo, timer)
+    start := timer.now_us()
+    for !running.is_finished() && timer.now_us() - start < 10_000 {}
+    finished := running.is_finished()
+    running.stop()
+    match CORE1_FLAG.store(0, atomic.Ordering.Release) {
+        ok() => {}
+        err(_) => {}
+    }
+    second := unsafe {
+        core1.start(&mut CORE1_STACK, Flag {})!
+    }
+    start = timer.now_us()
+    for flag() == 0 && timer.now_us() - start < 10_000 {}
+    flagged := flag() == 2
+    for !second.is_finished() && timer.now_us() - start < 10_000 {}
+    restarted := flagged && second.is_finished()
+    second.stop()
+    check(doubled && sleeps >= 3 && sleeps < 100 && finished && restarted)
+    fifos.release(fifo)
+    spinlocks.release(lock)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -1057,6 +1248,7 @@ fn main() {
     pwm_adc_checks(&mut b.pins, &mut b.timer)
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
+    core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.

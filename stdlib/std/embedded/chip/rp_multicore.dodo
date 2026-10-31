@@ -1,0 +1,745 @@
+package rp_multicore
+
+import "core/cpu"
+import "core/mem"
+import "core/mmio"
+import "core/ptr"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
+import "std/embedded/hal"
+
+// The two Arm cores of the RP2040 and RP2350 working together (RP2040
+// datasheet 2.3.1 and 2.8.2, RP2350 datasheet 3.1 and 5.3). Both cores run
+// the same program from the same flash and share all memory and
+// peripherals. Core 0 runs `main`; core 1 waits in the boot ROM until the
+// program starts it. The chip's take() hands out three parts:
+//
+// - `Core1` starts core 1 running a task on a stack the program provides,
+//   until the returned `Running` handle is dropped.
+// - `Fifos` hands out each core's end of the FIFOs between the cores. Each
+//   core writes 32-bit words into its end that the other core reads from
+//   its own, in order.
+// - `Spinlocks` hands out the hardware locks both cores see, for state that
+//   both use.
+//
+// A task for core 1 is a value with a public `run(self)` method, like a
+// std/thread task. It moves to core 1, so it may hold peripherals and other
+// owned values but no references, which `start` checks:
+//
+//     struct Echo {
+//         fifo: rp_multicore.Fifo
+//
+//         pub fn run(self) {
+//             for {
+//                 word := self.fifo.read()
+//                 self.fifo.write(word + 1)
+//             }
+//         }
+//     }
+//
+//     fn main() {
+//         b := board.take()!
+//         stack := [0u64; 512]
+//         fifo := b.fifos.claim()!
+//         core1 := b.core1.start(&mut stack, Echo { fifo: b.fifos.claim()! })!
+//         fifo.write(41)
+//         core.assert(fifo.read() == 42)
+//         ...
+//     }
+//
+// Core 1 runs until `Running` is dropped or stopped, which holds it in
+// reset, so it never outlives its stack; keep the handle for as long as
+// core 1 should run. If `run` returns, core 1 sleeps.
+//
+// Each core has its own interrupt mask and NVIC: `hal.Critical` and
+// `cortex_m.enable` act on the core that calls them, and an interrupt's
+// handler runs on the core, or cores, that enabled it. Each core can run
+// its own std/embedded/executor, whose signals belong to the core that
+// uses them; `Fifo.set_signal` wakes a task when the other core writes.
+// Statics are shared: guard what both cores use with a `Spinlock` or, on
+// the RP2350, with std/sync/atomic. The RP2040's Cortex-M0+ has only atomic
+// loads and stores.
+
+// SIO, the single-cycle I/O block. Each core sees its own FIFO end and
+// CPUID at the same addresses.
+const SIO_BASE: usize = 0xD000_0000
+const CPUID: usize = 0x000
+const FIFO_ST: usize = 0x050
+const FIFO_WR: usize = 0x054
+const FIFO_RD: usize = 0x058
+const SPINLOCK_ST: usize = 0x05C
+const SPINLOCK0: usize = 0x100
+// FIFO_ST: this core's end has a word to read (VLD), room to write (RDY),
+// and sticky flags for a write when full (WOF) and a read when empty (ROE),
+// cleared by writing the register. The FIFO interrupt is raised while any
+// of VLD, WOF, and ROE is set.
+const FIFO_VALID: u32 = 1 << 0
+const FIFO_READY: u32 = 1 << 1
+
+// The Cortex-M core's ICSR, whose low bits are the running exception's
+// number, 16 + the IRQ; and the NVIC's interrupt clear-enable registers.
+const SCB_ICSR: usize = 0xE000_ED04
+const NVIC_ICER: usize = 0xE000_E180
+
+// PSM FRCE_OFF, relative to the power-on state machine's base, holds a core
+// in reset while its bit is set; and the atomic set and clear aliases.
+const FRCE_OFF: usize = 0x4
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+pub const CORE_COUNT: u32 = 2
+pub const SPINLOCK_COUNT: u32 = 32
+// The smallest stack `Core1.start` accepts, in bytes, besides the task.
+pub const MIN_STACK_BYTES: usize = 256
+
+// Polls before core 1 or the FIFO is reported as stuck, and launches that
+// may be answered wrongly before the boot ROM is reported as not listening.
+const ATTEMPTS: u32 = 1_000_000
+const MAX_RESTARTS: u32 = 8
+
+// Per core, the signal raised when its FIFO end has a word, or NO_SIGNAL.
+const NO_SIGNAL: u32 = 0xFFFF_FFFF
+static mut WAKE: [2]u32 = [NO_SIGNAL, NO_SIGNAL]
+
+// Provided by the compiler's RP2040 and RP2350 firmware runtimes: where core
+// 1 starts, with the Thumb bit set.
+unsafe extern "C" fn dodo_core1_entry() -> u32
+
+// What differs between the RP2040 and the RP2350, from their chip packages.
+pub struct Chip {
+    // The power-on state machine's base address, and core 1's bit in its
+    // FRCE_OFF register.
+    pub psm_base: usize
+    pub core1_bit: u32
+    // The FIFO interrupt of core 0 and of core 1.
+    pub core0_fifo_irq: u32
+    pub core1_fifo_irq: u32
+    // Spinlocks that must not be handed out, one bit each.
+    pub reserved_locks: u32
+}
+
+// The parts the chip's take() hands out.
+pub struct Cores {
+    pub core1: Core1
+    pub fifos: Fifos
+    pub spinlocks: Spinlocks
+}
+
+// The parts for `chip`.
+// SAFETY: call once, from the chip's take(), so that each part is the only
+// one of its kind.
+pub unsafe fn take(chip: Chip) -> Cores {
+    unsafe {
+        return Cores {
+            core1: Core1 { psm_base: chip.psm_base, core1_bit: chip.core1_bit, fifo_irq: chip.core0_fifo_irq },
+            fifos: Fifos { irq0: chip.core0_fifo_irq, irq1: chip.core1_fifo_irq, claimed: 0 },
+            spinlocks: Spinlocks { reserved: chip.reserved_locks, claimed: 0 },
+        }
+    }
+}
+
+// Unlock every spinlock not in `reserved`, as at power-up, for a program
+// started by a reset that left them locked, such as a debugger's.
+// SAFETY: core 1 must not be running, and nothing may hold a lock.
+pub unsafe fn reset_spinlocks(reserved: u32) {
+    for number in 0..SPINLOCK_COUNT {
+        if (reserved & (1u32 << number)) == 0 {
+            unsafe {
+                lock := lock_register(number)
+                lock.write(1)
+            }
+        }
+    }
+}
+
+// The number of the core running this code: 0 or 1.
+pub fn core_id() -> u32 {
+    return cpu.core_id()
+}
+
+// SAFETY: as hal.Reg.at, for spinlock `number`.
+unsafe fn lock_register(number: u32) -> hal.Reg<u32> {
+    unsafe {
+        return hal.Reg.at(SIO_BASE + SPINLOCK0 + 4 * number as usize)
+    }
+}
+
+// Core 1, handed out once by the chip's take().
+pub struct Core1 {
+    psm_base: usize
+    core1_bit: u32
+    fifo_irq: u32
+
+    // Run `task.run()` on core 1, with the top of `stack` as its stack, and
+    // return a handle that keeps core 1 running until it is dropped or
+    // stopped. The task, a value with a public `run(self)` method, moves
+    // into the stack's top; besides it, the stack needs MIN_STACK_BYTES and
+    // whatever the task's calls use. On the RP2350 a deeper stack faults,
+    // so the chip's panic hook reports it; the RP2040 cannot detect that.
+    //
+    // Core 1 is restarted first, so it starts the same way every time, and
+    // words it wrote to core 0 before are discarded. Call this on core 0.
+    // InvalidInput if the stack is too small, Unsupported on core 1, and
+    // Timeout or Bus if core 1's boot ROM does not answer as it should.
+    pub fn start<T>(&mut self, stack: &mut[u64], task: T) -> Running!hal.Error from(self, stack) {
+        mem.assert_send::<T>()
+        if cpu.core_id() != 0 {
+            return err(hal.Error.Unsupported)
+        }
+        bytes := stack.len * 8
+        size := mem.size_of::<Start<T>>()
+        align := mem.align_of::<Start<T>>()
+        if align < 8 {
+            align = 8
+        }
+        if bytes < size + align + MIN_STACK_BYTES {
+            return err(hal.Error.InvalidInput)
+        }
+        // The task at the top, aligned, then the three words the runtime's
+        // dodo_core1_trampoline pops: the task's address, the entry point,
+        // and the stack's bottom. The stack pointer is 8-aligned once they
+        // are popped, as the procedure call standard requires.
+        bottom := 0usize
+        start := 0usize
+        // SAFETY: `stack` is exclusively borrowed, and every address below
+        // lies within it: there is room for the task, its alignment, and
+        // MIN_STACK_BYTES. Start<T> is written once into uninitialized
+        // words, and T has no destructor, as assert_send ensures.
+        unsafe {
+            bottom = ptr.as_mut_ptr(stack) as usize
+            start = (bottom + bytes - size) & ~(align - 1)
+            ptr.write(start as *mut Start<T>, Start<T> { task: mem.init(task), finished: 0 })
+            frame := start - 12
+            ptr.write(frame as *mut u32, start as u32)
+            ptr.write((frame + 4) as *mut u32, mem.callback::<T>(run_task) as usize as u32)
+            ptr.write((frame + 8) as *mut u32, bottom as u32)
+        }
+        finished := start + mem.offset_of::<Start<T>>("finished")
+        // Core 0's FIFO interrupt stays off while core 1's boot ROM uses
+        // the FIFO, so the program's handler does not see the handshake.
+        irq := self.fifo_irq
+        listening := cortex_m.is_enabled(irq)
+        cortex_m.disable(irq)
+        // SAFETY: Core1 is the only handle on core 1's reset bit, and core 0's
+        // FIFO end is used only here until core 1 runs: the program's Fifo
+        // for core 0 sees no words from core 1 before it is launched.
+        result := unsafe {
+            boot(self.psm_base, self.core1_bit, (start - 12) as u32)
+        }
+        cortex_m.unpend(irq)
+        if listening {
+            cortex_m.enable(irq)
+        }
+        result?
+        return ok(Running { core1: self, stack, finished, active: true })
+    }
+}
+
+// Restart core 1 and launch it at the runtime's trampoline with stack
+// pointer `stack_pointer`, sharing core 0's vector table.
+// SAFETY: as in Core1.start.
+unsafe fn boot(psm_base: usize, core1_bit: u32, stack_pointer: u32) -> void!hal.Error {
+    unsafe {
+        sio := hal.RegisterBlock.at(SIO_BASE)
+        psm := hal.RegisterBlock.at(psm_base)
+        hold(&mut psm, core1_bit)?
+        release(&mut sio, &mut psm, core1_bit)?
+        return launch(&mut sio, cortex_m.vector_table() as u32, stack_pointer, dodo_core1_entry(), cortex_m.send_event)
+    }
+}
+
+// What Core1.start places at the top of core 1's stack.
+struct Start<T> {
+    task: MaybeUninit<T>
+    // Set once the task's run method has returned.
+    finished: u32
+}
+
+// Core 1's entry point: run the task Core1.start placed at `argument`, then
+// record that it finished.
+unsafe fn run_task<T>(argument: *mut u8) {
+    // As in Core1.start, which may be checked after this.
+    mem.assert_send::<T>()
+    unsafe {
+        task := ptr.read(ptr.offset(argument, mem.offset_of::<Start<T>>("task") as isize) as *mut T)
+        task.run()
+        mem.atomic_store(ptr.offset(argument, mem.offset_of::<Start<T>>("finished") as isize) as *mut u32, 1u32, 2)
+    }
+}
+
+// Core 1 running a task, from Core1.start. Dropping the handle stops core 1,
+// as `stop` does.
+pub struct Running {
+    core1: &mut Core1
+    stack: &mut[u64]
+    finished: usize
+    active: bool
+
+    // True once the task's run method has returned; core 1 then sleeps.
+    pub fn is_finished(&self) -> bool {
+        // SAFETY: `finished` is the word in the borrowed stack that core 1
+        // sets with a release store when the task returns.
+        return unsafe {
+            mem.atomic_load(self.finished as *const u32, 1)
+        } != 0
+    }
+
+    // Stop core 1 wherever it is by holding it in reset, which frees its
+    // stack and lets Core1 start it again. Its task is not dropped, so
+    // peripherals it owned stay claimed, and a spinlock it held stays
+    // locked. Words already in the FIFOs stay there.
+    pub fn stop(self) {
+        self.halt()
+    }
+
+    fn halt(&mut self) {
+        if !self.active {
+            return
+        }
+        self.active = false
+        // SAFETY: Running borrows Core1, the only handle on core 1's reset
+        // bit. Holding a core in reset cannot fail; the read back only waits
+        // for the write to take effect, so a timeout is ignored.
+        unsafe {
+            psm := hal.RegisterBlock.at(self.core1.psm_base)
+            match hold(&mut psm, self.core1.core1_bit) {
+                ok() => {}
+                err(_) => {}
+            }
+        }
+    }
+
+    fn drop(&mut self) {
+        self.halt()
+    }
+}
+
+// Hold core 1 in reset, through the power-on state machine registers `psm`
+// whose FRCE_OFF bit `core1_bit` is core 1's: it stops at once, wherever it
+// is. Reading the bit back makes sure the write took effect.
+pub fn hold<P: hal.Registers>(psm: &mut P, core1_bit: u32) -> void!hal.Error {
+    psm.write(FRCE_OFF + SET_ALIAS, core1_bit)
+    for _ in 0..ATTEMPTS {
+        if (psm.read(FRCE_OFF) & core1_bit) != 0 {
+            return ok()
+        }
+    }
+    return err(hal.Error.Timeout)
+}
+
+// Let core 1, held by `hold`, out of reset. Its boot ROM empties core 1's
+// FIFO end and writes a 0 to this core's when it is ready for `launch`.
+// Words core 1 wrote before are discarded first. Timeout if the 0 does not
+// come.
+pub fn release<S: hal.Registers, P: hal.Registers>(sio: &mut S, psm: &mut P, core1_bit: u32) -> void!hal.Error {
+    drain(sio)
+    psm.write(FRCE_OFF + CLEAR_ALIAS, core1_bit)
+    for _ in 0..ATTEMPTS {
+        if let some(word) = try_read(sio) {
+            if word == 0 {
+                return ok()
+            }
+        }
+    }
+    return err(hal.Error.Timeout)
+}
+
+// Send core 1's boot ROM the launch sequence through the SIO registers
+// `sio`: 0, 0, 1, then the vector table, stack pointer, and entry point
+// (with the Thumb bit) that core 1 starts with. The boot ROM echoes each
+// word; a wrong echo starts the sequence over, and the zeros, sent after
+// emptying this core's FIFO end, bring the boot ROM back to its start.
+// `notify` wakes the other core from `wfe` after each write. Timeout if the
+// boot ROM stops answering; Bus if it keeps answering wrongly.
+pub fn launch<S: hal.Registers>(sio: &mut S, vector_table: u32, stack_pointer: u32, entry: u32, notify: fn()) -> void!hal.Error {
+    words := [0u32, 0, 1, vector_table, stack_pointer, entry]
+    index := 0usize
+    restarts := 0u32
+    for index < 6 {
+        word := words[index]
+        if word == 0 {
+            drain(sio)
+            notify()
+        }
+        if !wait_ready(sio) {
+            return err(hal.Error.Timeout)
+        }
+        sio.write(FIFO_WR, word)
+        notify()
+        response := 0u32
+        if let some(answer) = read_within(sio) {
+            response = answer
+        } else {
+            return err(hal.Error.Timeout)
+        }
+        if response == word {
+            index += 1
+        } else {
+            restarts += 1
+            if restarts > MAX_RESTARTS {
+                return err(hal.Error.Bus)
+            }
+            index = 0
+        }
+    }
+    return ok()
+}
+
+// Discard the words in this core's FIFO end; returns how many there were.
+fn drain<S: hal.Registers>(sio: &mut S) -> u32 {
+    count := 0u32
+    for (sio.read(FIFO_ST) & FIFO_VALID) != 0 {
+        sio.read(FIFO_RD)
+        count += 1
+    }
+    return count
+}
+
+fn try_read<S: hal.Registers>(sio: &mut S) -> Option<u32> {
+    if (sio.read(FIFO_ST) & FIFO_VALID) == 0 {
+        return none
+    }
+    return some(sio.read(FIFO_RD))
+}
+
+// The next word, if one comes within ATTEMPTS polls.
+fn read_within<S: hal.Registers>(sio: &mut S) -> Option<u32> {
+    for _ in 0..ATTEMPTS {
+        if let some(word) = try_read(sio) {
+            return some(word)
+        }
+    }
+    return none
+}
+
+// True once there is room to write, within ATTEMPTS polls.
+fn wait_ready<S: hal.Registers>(sio: &mut S) -> bool {
+    for _ in 0..ATTEMPTS {
+        if (sio.read(FIFO_ST) & FIFO_READY) != 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// Each core's end of the FIFOs, handed out by `claim`.
+pub struct Fifos {
+    irq0: u32
+    irq1: u32
+    claimed: u32
+
+    // One of the two ends, for the core that will use it: claim one for
+    // core 0 and one to move into core 1's task. Both are alike, since each
+    // core reaches only its own end; a third claim is Busy.
+    pub fn claim(&mut self) -> Fifo!hal.Error {
+        if self.claimed >= CORE_COUNT {
+            return err(hal.Error.Busy)
+        }
+        self.claimed += 1
+        // SAFETY: at most two Fifos exist, one for each core's end, and each
+        // touches only its core's FIFO registers and WAKE slot.
+        sio := unsafe {
+            hal.RegisterBlock.at(SIO_BASE)
+        }
+        return ok(Fifo { sio, irq0: self.irq0, irq1: self.irq1 })
+    }
+
+    // Give back an end, which stops raising its signal.
+    pub fn release(&mut self, fifo: Fifo) {
+        fifo.clear_signal()
+        self.claimed -= 1
+    }
+}
+
+// One core's end of the FIFOs between the cores, claimed from `Fifos`. A
+// Fifo always reaches the end of the core that uses it: what it writes, the
+// other core reads, and it reads what the other core wrote. Each direction
+// holds 8 words on the RP2040 and 4 on the RP2350; `write` waits for room
+// and `read` for a word.
+pub struct Fifo {
+    sio: hal.RegisterBlock
+    irq0: u32
+    irq1: u32
+
+    // Write `word` for the other core if there is room, and wake it from
+    // `read`; false if the FIFO is full.
+    pub fn try_write(&mut self, word: u32) -> bool {
+        if !self.can_write() {
+            return false
+        }
+        self.sio.write(FIFO_WR, word)
+        cortex_m.send_event()
+        return true
+    }
+
+    // Write `word`, waiting while the FIFO is full: until the other core
+    // reads.
+    pub fn write(&mut self, word: u32) {
+        for !self.can_write() {}
+        self.sio.write(FIFO_WR, word)
+        cortex_m.send_event()
+    }
+
+    // The next word the other core wrote, if there is one.
+    pub fn try_read(&mut self) -> Option<u32> {
+        word := try_read(&mut self.sio)
+        self.listen()
+        return word
+    }
+
+    // The next word the other core wrote, sleeping (`wfe`) until there is
+    // one.
+    pub fn read(&mut self) -> u32 {
+        for !self.can_read() {
+            cortex_m.wait_for_event()
+        }
+        word := self.sio.read(FIFO_RD)
+        self.listen()
+        return word
+    }
+
+    // True if a word is waiting to be read.
+    pub fn can_read(&self) -> bool {
+        return self.status(FIFO_VALID)
+    }
+
+    // True if there is room to write.
+    pub fn can_write(&self) -> bool {
+        return self.status(FIFO_READY)
+    }
+
+    // Discard the words waiting to be read; returns how many there were.
+    pub fn drain(&mut self) -> u32 {
+        count := drain(&mut self.sio)
+        self.listen()
+        return count
+    }
+
+    // This core's FIFO interrupt, raised while a word is waiting: SIO_IRQ_PROC0
+    // or SIO_IRQ_PROC1 on the RP2040, SIO_IRQ_FIFO on either RP2350 core.
+    pub fn irq(&self) -> u32 {
+        if cpu.core_id() == 0 {
+            return self.irq0
+        }
+        return self.irq1
+    }
+
+    // Raise `signal` on this core whenever the other core has written, so
+    // that a task of this core's executor waits for words without polling:
+    // take the signal, then read with `try_read` until none is left. The
+    // chip runtime's handler of this core's FIFO interrupt raises the
+    // signal and holds the interrupt back until the next `try_read`, `read`,
+    // or `drain`. A program's own `@interrupt` handler for the FIFO
+    // interrupt replaces this.
+    pub fn set_signal(&mut self, signal: &executor.Signal) {
+        section := hal.Critical.enter()
+        // SAFETY: this core's slot, which only this core's program and its
+        // FIFO interrupt handler use; interrupts are masked.
+        unsafe {
+            WAKE[cpu.core_id() as usize] = signal.id
+        }
+        // Flags from reads and writes outside this API would hold the
+        // interrupt raised.
+        self.sio.write(FIFO_ST, 0)
+        core.drop(section)
+        self.listen()
+    }
+
+    // Stop raising the signal, and the interrupt.
+    pub fn clear_signal(&mut self) {
+        section := hal.Critical.enter()
+        // SAFETY: as in set_signal.
+        unsafe {
+            WAKE[cpu.core_id() as usize] = NO_SIGNAL
+        }
+        cortex_m.disable(self.irq())
+        core.drop(section)
+    }
+
+    // Let the FIFO interrupt through again if a signal is set; if a word is
+    // waiting, it raises the signal again at once.
+    fn listen(&mut self) {
+        // SAFETY: as in set_signal; a word read is atomic.
+        signal := unsafe {
+            WAKE[cpu.core_id() as usize]
+        }
+        if signal != NO_SIGNAL {
+            cortex_m.enable(self.irq())
+        }
+    }
+
+    fn status(&self, mask: u32) -> bool {
+        // SAFETY: reading FIFO_ST has no side effects.
+        status := unsafe {
+            reg: hal.Reg<u32> = hal.Reg.at(SIO_BASE + FIFO_ST)
+            reg.read()
+        }
+        return (status & mask) != 0
+    }
+}
+
+// The chip runtimes' default FIFO interrupt handlers call this weak symbol,
+// on the core whose FIFO end has a word. Every program that uses
+// std/embedded/chip defines it through this package; it only acts after
+// `Fifo.set_signal`. A program's own `@interrupt` handler for the FIFO
+// interrupt replaces the default handler, and with it this one.
+//
+// It disables its interrupt as cortex_m.disable does, but with plain
+// register accesses, since every program links it and inline assembly for
+// the Cortex-M would not build for a desktop test. Should the interrupt
+// still run once more, it only raises the signal again.
+extern "C" fn dodo_fifo_interrupt() {
+    // SAFETY: reading ICSR has no side effects, and ICER is
+    // write-one-to-clear, so other interrupts stay enabled. FIFO_ST and the
+    // WAKE slot are this core's, as in Fifo.set_signal; writing FIFO_ST
+    // clears sticky flags that would otherwise keep the interrupt raised.
+    unsafe {
+        irq := (mmio.read32(SCB_ICSR) & 0x1FF) - 16
+        mmio.write32(NVIC_ICER + 4 * (irq / 32) as usize, 1u32 << (irq % 32))
+        cpu.fence()
+        index := cpu.core_id() as usize
+        status: hal.Reg<u32> = hal.Reg.at(SIO_BASE + FIFO_ST)
+        status.write(0)
+        if WAKE[index] != NO_SIGNAL {
+            signal := executor.Signal { id: WAKE[index] }
+            signal.raise()
+        }
+    }
+}
+
+// The hardware spinlocks, handed out by number. On the RP2350, locks 0 to 4,
+// 8, 9, and 12 to 17 are never handed out: writes to other SIO registers
+// unlock them (erratum RP2350-E2). Locks 18 to 31 work on both chips.
+pub struct Spinlocks {
+    reserved: u32
+    claimed: u32
+
+    // Claim lock `number`, 0 to 31. InvalidInput for another number or one
+    // this chip reserves; Busy if it is claimed already.
+    pub fn claim(&mut self, number: u32) -> Spinlock!hal.Error {
+        if !self.is_usable(number) {
+            return err(hal.Error.InvalidInput)
+        }
+        bit := 1u32 << number
+        if (self.claimed & bit) != 0 {
+            return err(hal.Error.Busy)
+        }
+        self.claimed |= bit
+        // SAFETY: the claim makes this the only Spinlock for `number`, until
+        // it is cloned for another core, which is what locks are for.
+        register := unsafe {
+            lock_register(number)
+        }
+        return ok(Spinlock { number, register })
+    }
+
+    // Claim the lowest-numbered usable lock that is free. Busy if none is.
+    pub fn claim_free(&mut self) -> Spinlock!hal.Error {
+        for number in 0..SPINLOCK_COUNT {
+            if self.is_usable(number) && (self.claimed & (1u32 << number)) == 0 {
+                return self.claim(number)
+            }
+        }
+        return err(hal.Error.Busy)
+    }
+
+    // Give back a lock so it can be claimed again. Clones of it keep working
+    // and must no longer be used.
+    pub fn release(&mut self, lock: Spinlock) {
+        self.claimed &= ~(1u32 << lock.number)
+    }
+
+    // True if lock `number` exists on this chip and is not reserved.
+    pub fn is_usable(&self, number: u32) -> bool {
+        return number < SPINLOCK_COUNT && (self.reserved & (1u32 << number)) == 0
+    }
+}
+
+// A hardware spinlock: either core may hold it, and while one does, the
+// other waits in `lock`. Give each core its own copy with `clone`. Holding
+// it also masks interrupts on the holding core, so a handler on that core
+// cannot wait for the lock its own core holds. Hold it briefly: the other
+// core spins meanwhile.
+//
+//     static mut TOTAL: u32 = 0
+//
+//     guard := lock.lock()
+//     unsafe { TOTAL += 1 }
+//     core.drop(guard)
+pub struct Spinlock {
+    number: u32
+    register: hal.Reg<u32>
+
+    pub fn number(&self) -> u32 {
+        return self.number
+    }
+
+    // Take the lock, waiting while the other core holds it, and keep it
+    // until the guard is dropped. Waiting on the lock this core holds
+    // already never ends.
+    pub fn lock(&self) -> Guard {
+        for {
+            section := hal.Critical.enter()
+            if self.register.read() != 0 {
+                // Order the guarded accesses after taking the lock.
+                cpu.fence()
+                return Guard { register: self.release_register(), section }
+            }
+            core.drop(section)
+        }
+    }
+
+    // Take the lock if no core holds it.
+    pub fn try_lock(&self) -> Option<Guard> {
+        section := hal.Critical.enter()
+        if self.register.read() != 0 {
+            cpu.fence()
+            return some(Guard { register: self.release_register(), section })
+        }
+        core.drop(section)
+        return none
+    }
+
+    // True if a core holds the lock now.
+    pub fn is_locked(&self) -> bool {
+        // SAFETY: SPINLOCK_ST is read-only and reading it changes nothing.
+        status := unsafe {
+            reg: hal.Reg<u32> = hal.Reg.at(SIO_BASE + SPINLOCK_ST)
+            reg.read()
+        }
+        return (status & (1u32 << self.number)) != 0
+    }
+
+    // The register through which the guard of the lock just taken releases
+    // it.
+    fn release_register(&self) -> hal.Reg<u32> {
+        // SAFETY: only the holder writes the lock's register, once.
+        return unsafe {
+            lock_register(self.number)
+        }
+    }
+
+    // The same lock, for the other core.
+    pub fn clone(&self) -> Spinlock {
+        // SAFETY: sharing a lock between cores is its purpose; every copy
+        // takes it with a read and releases it, only while held, with a
+        // write.
+        register := unsafe {
+            lock_register(self.number)
+        }
+        return Spinlock { number: self.number, register }
+    }
+}
+
+// A held spinlock, from Spinlock.lock or try_lock. Dropping it releases the
+// lock, then unmasks interrupts if they were enabled before.
+pub struct Guard {
+    register: hal.Reg<u32>
+    section: hal.Critical
+
+    fn drop(&mut self) {
+        // Order the guarded accesses before releasing the lock.
+        cpu.fence()
+        self.register.write(1)
+    }
+}

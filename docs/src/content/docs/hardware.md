@@ -1033,8 +1033,10 @@ while nothing has been fed.
 
 - One executor runs at a time on a core, with up to 32 tasks
   (`executor.MAX_TASKS`) and 32 signals (`executor.MAX_SIGNALS`). Signal
-  numbers are one set for the whole program, so libraries that raise signals
-  take their numbers from the application.
+  numbers are one set for each core's program, so libraries that raise
+  signals take their numbers from the application. On the RP2040 and RP2350
+  each core can run an executor of its own; see
+  [two cores](#two-cores-on-the-rp2040-and-rp2350).
 - Tasks are state machines written by hand: Dodo has no `async` functions
   that the compiler would turn into them. Keep the state in the task's
   fields, and do each step without waiting.
@@ -1775,6 +1777,152 @@ up. `start_request(transfer, dreq)` paces by any other request, or by
 `Driver` over any `hal.Registers`, tested against a model of both chips'
 controllers.
 
+### Two cores on the RP2040 and RP2350
+
+Both chips have two Arm cores that run the same program from the same flash
+and share all memory and peripherals. `main` runs on core 0; core 1 waits in
+the boot ROM until the program starts it with a task of its own. The board
+hands out three parts from `std/embedded/chip/rp_multicore`:
+
+| Part | What it does |
+| --- | --- |
+| `b.core1` | `start(&mut stack, task)` runs `task.run()` on core 1 and returns a `Running` handle. |
+| `b.fifos` | `claim()` hands out a core's end of the FIFOs between the cores, twice: one for core 0 and one to move into core 1's task. |
+| `b.spinlocks` | `claim(n)` and `claim_free()` hand out the hardware locks both cores see. |
+
+A task for core 1 is a value with a public `run(self)` method, like a
+[`std/thread`](threads.md) task. It moves to core 1, so it may own
+peripherals, FIFO ends, and spinlocks, but holds no references: `start`
+rejects a task type that could not cross a thread boundary. This program
+answers each word core 0 sends with the next number:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_multicore"
+
+struct Echo {
+    fifo: rp_multicore.Fifo
+
+    pub fn run(self) {
+        for {
+            word := self.fifo.read()
+            self.fifo.write(word + 1)
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    fifo := b.fifos.claim()!
+    stack := [0u64; 512]
+    core1 := b.core1.start(&mut stack, Echo { fifo: b.fifos.claim()! })!
+    fifo.write(41)
+    core.assert(fifo.read() == 42)
+    for {
+        b.led.toggle()
+        b.timer.delay_ms(500)
+    }
+}
+```
+
+The task and the three words the runtime's start-up code needs go at the top
+of `stack`, and core 1's stack grows down from below them. `start` asks for
+`rp_multicore.MIN_STACK_BYTES` (256) beyond the task; give it room for what
+`run` calls as well, a few KiB for an executor. On the RP2350 the stack's
+bottom becomes core 1's stack limit, so an overflow faults and the panic
+hook reports it instead of overwriting memory; the RP2040's Cortex-M0+
+cannot detect one. A stack in a `static mut` keeps it off core 0's stack.
+
+Core 1 runs until `Running` is dropped or `stop()`ped, which holds core 1 in
+reset, so it never outlives its stack: keep the handle for as long as core 1
+should run, typically in `main`, whose loop never ends. `is_finished()` reports
+that `run` returned, after which core 1 sleeps. `start` always restarts core 1
+first, so a stopped core starts again the same way, and a program that a
+debugger restarted finds core 1 in a known state. A stopped task is not
+dropped: peripherals it owned stay claimed, and a spinlock it held stays
+locked. `start` must be called on core 0; it returns `InvalidInput` for a
+stack that is too small, and `Timeout` or `Bus` if core 1's boot ROM does not
+answer the launch sequence.
+
+| `rp_multicore.Fifo` | Purpose |
+| --- | --- |
+| `write(word)`, `try_write(word)` | Send a 32-bit word to the other core, waiting while the FIFO is full, or false then. Wakes the other core from `read`. |
+| `read()`, `try_read()` | The next word the other core sent, sleeping (`wfe`) until there is one, or none then. |
+| `can_read()`, `can_write()`, `drain()` | Whether a word waits or there is room, and discarding the waiting words. |
+| `set_signal(&signal)`, `clear_signal()` | Raise an executor signal on this core whenever the other core has written. |
+| `irq()` | This core's FIFO interrupt: `SIO_IRQ_PROC0` or `SIO_IRQ_PROC1` on the RP2040, `SIO_IRQ_FIFO` on the RP2350. |
+
+Each direction holds 8 words on the RP2040 and 4 on the RP2350. A `Fifo`
+always reaches the end of the core that uses it, so the two from `claim()`
+are alike: keep one on each core.
+
+Each core has its own interrupt mask and NVIC: `hal.Critical` and
+`cortex_m.enable` act on the core that calls them, and a handler runs on the
+core that enabled its interrupt. So each core can run its own
+[executor](#tasks-and-the-executor), with its own alarm as the clock. Its
+signals belong to that core: an id raised on core 0 does not wake a task on
+core 1. To wake a task on the other core, write to the FIFO: after
+`fifo.set_signal(&WORDS)`, the chip runtime's handler of this core's FIFO
+interrupt raises `WORDS` and holds the interrupt back until the next
+`try_read`, `read`, or `drain`. The waiting task takes the signal and reads
+until `try_read` returns none:
+
+```dodo
+const WORDS: executor.Signal = executor.Signal { id: 0 }
+
+struct Doubler {
+    fifo: rp_multicore.Fifo
+
+    pub fn poll(&mut self, cx: &mut executor.Context) -> executor.Poll {
+        WORDS.take(cx)
+        for {
+            match self.fifo.try_read() {
+                some(word) => self.fifo.write(word * 2),
+                none => break,
+            }
+        }
+        return executor.Poll.Pending
+    }
+}
+```
+
+A program's own `@interrupt` handler for the FIFO interrupt replaces the
+runtime's, and `set_signal` with it. GPIO events reach core 0 only: `Pin.listen`
+enables them for core 0's `IO_IRQ_BANK0`. The USB serial port's interrupt runs
+on the core that opened the port.
+
+Statics are shared by both cores, and a critical section does not keep the
+other core out. Guard state both cores change with a spinlock:
+
+```dodo
+static mut TOTAL: u32 = 0
+
+guard := lock.lock()
+unsafe {
+    TOTAL += 1
+}
+core.drop(guard)
+```
+
+`lock()` masks interrupts on this core, then waits while the other core holds
+the lock; dropping the guard releases it and unmasks them again. `try_lock()`
+does not wait, and `is_locked()` reports either core's hold. Claim a lock once,
+then give the other core its own copy with `clone()`. The RP2040 has 32 locks.
+On the RP2350, writes to some other SIO registers unlock the locks just below
+them (erratum RP2350-E2), so locks 0 to 4, 8, 9, and 12 to 17 are never handed
+out; locks 18 to 31 work on both chips. On the RP2350 a single word can also be
+shared with [atomics](#sharing-state-with-atomics), whose exclusive loads and
+stores work across cores; the RP2040's Cortex-M0+ only loads and stores
+atomically.
+
+`examples/two_cores.dodo` searches for primes on core 1 and reports progress
+over USB serial from an executor on core 0, woken through the FIFO, with a
+spinlock around the results both cores read. The ADC and the USB serial port
+share the bookkeeping that starts and stops PLL_USB, so claim and release them
+from one core.
+
 ### The Raspberry Pi Pico 2 W
 
 The Pico 2 W is a Pico 2 with an Infineon CYW43439 Wi-Fi and Bluetooth chip.
@@ -1880,7 +2028,7 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  the timer, DMA, and a USB serial port; PIO and other USB devices (HID,
+  the timer, DMA, a USB serial port, and the second core; PIO and other USB devices (HID,
   mass storage, several functions at once) or USB host mode are not bundled
   yet. Write them with `hal.Reg` as above.
 - PWM outputs only generate; the slices' input modes, which count or time a
@@ -1899,10 +2047,11 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   arithmetic runs on the double-precision coprocessor instead. They raise no
   floating-point exception flags and return the default quiet NaN for every
   NaN result.
-- Only core 0 runs; core 1 stays in the boot ROM. Several activities share
-  core 0 as [executor tasks](#tasks-and-the-executor), which are
-  cooperative: there is no preemptive scheduler. The RP2350's RISC-V cores
-  are not supported.
+- Core 1 runs one task, started from core 0, and the cores share the
+  vector table. Executor tasks on either core are cooperative: there is no
+  preemptive scheduler. GPIO events interrupt core 0 only, the RP2350's
+  doorbells between the cores are not exposed, and its RISC-V cores are not
+  supported.
 - On the Cortex-M0+ of the RP2040, atomics only load and store; see
   [sharing state with atomics](#sharing-state-with-atomics).
 - Inline assembly lives inside functions; there is no global or naked
