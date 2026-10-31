@@ -16,6 +16,15 @@
   it for a non-macOS target is an error. The test suite runs compute,
   rendering and readback on the GPU, including x86-64 under Rosetta, and
   checks every constant against the SDK headers.
+- `truetype.GlyphCache` keeps rasterized glyphs in caller-provided storage,
+  so text drawn again is blended instead of rasterized: about 13 times
+  faster at 14 pixels and 6 times faster at 96. It draws like `Font.draw`
+  except that glyphs are placed to a quarter pixel, and a full cache evicts
+  its oldest glyphs. `std/graphics` gains the coverage calls it is built on:
+  `outline_bounds`, `coverage_mask` with `Canvas.fill_mask` and
+  `gradient_mask`, and the run-length `coverage_spans` with
+  `Canvas.fill_spans` and `gradient_spans`, all drawing exactly what
+  `fill_outline` draws.
 - `std/gpu/vulkan`: the Vulkan API in pure Dodo, one to one like Rust's
   `ash`, as the bottom layer for a future portable `std/gpu`. Constants,
   handles, enums, bitmasks, structs and the command tables are generated from
