@@ -1,0 +1,1157 @@
+package truetype
+
+import "core/mem"
+import "std/graphics"
+
+// TrueType fonts drawn with std/graphics's antialiased rasterizer. The font
+// is read in place from a byte slice (a file read with std/fs, or bytes
+// embedded in the program); nothing is allocated or copied, and drawing a
+// glyph decodes its outline straight from the font data, so glyphs of any
+// complexity need no storage.
+//
+// Supported: TrueType outlines (the glyf table) in .ttf files and .ttc
+// collections, simple and composite glyphs, cmap formats 0, 4, 6 and 12
+// (all of Unicode), horizontal metrics and kerning pairs from the kern
+// table. Not supported: CFF outlines (.otf files starting with OTTO),
+// hinting, GPOS kerning, ligatures and other shaping, and right-to-left or
+// vertical text. Characters map one to one to glyphs.
+//
+// Untrusted fonts are safe: every offset is checked before use, and a
+// malformed glyph draws as much of its outline as is valid.
+
+pub enum Error {
+    // The data is not a TrueType font or collection, or a table it needs is
+    // missing or extends past the end of the data.
+    Malformed,
+    // A valid font this package cannot draw, such as one with CFF outlines
+    // or no Unicode character map.
+    Unsupported,
+    // A collection index past the last font.
+    NoSuchFont
+}
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.Malformed => {
+            return "Malformed"
+        }
+        Error.Unsupported => {
+            return "Unsupported"
+        }
+        Error.NoSuchFont => {
+            return "NoSuchFont"
+        }
+    }
+}
+
+// The largest size, in pixels per em, that drawing and measuring accept;
+// larger sizes are clamped.
+pub const MAX_SIZE: u32 = 4096
+
+// Composite glyphs nest at most this deep and expand to at most
+// COMPONENT_BUDGET components, which bounds the work a hostile font causes.
+const MAX_DEPTH: u32 = 8
+const COMPONENT_BUDGET: u32 = 512
+
+const TAG_TTCF: u32 = 0x74746366
+const TAG_OTTO: u32 = 0x4f54544f
+const TAG_TRUE: u32 = 0x74727565
+const TAG_HEAD: u32 = 0x68656164
+const TAG_HHEA: u32 = 0x68686561
+const TAG_MAXP: u32 = 0x6d617870
+const TAG_HMTX: u32 = 0x686d7478
+const TAG_CMAP: u32 = 0x636d6170
+const TAG_LOCA: u32 = 0x6c6f6361
+const TAG_GLYF: u32 = 0x676c7966
+const TAG_KERN: u32 = 0x6b65726e
+
+// Simple glyph point flags.
+const FLAG_ON_CURVE: u32 = 0x01
+const FLAG_X_SHORT: u32 = 0x02
+const FLAG_Y_SHORT: u32 = 0x04
+const FLAG_REPEAT: u32 = 0x08
+const FLAG_X_SAME: u32 = 0x10
+const FLAG_Y_SAME: u32 = 0x20
+
+// Composite glyph component flags.
+const ARG_WORDS: u32 = 0x0001
+const ARGS_ARE_XY: u32 = 0x0002
+const HAVE_SCALE: u32 = 0x0008
+const MORE_COMPONENTS: u32 = 0x0020
+const HAVE_XY_SCALE: u32 = 0x0040
+const HAVE_2X2: u32 = 0x0080
+const SCALED_OFFSET: u32 = 0x0800
+const UNSCALED_OFFSET: u32 = 0x1000
+
+// Big-endian reads that yield 0 past the end of `data`: outline decoding
+// cannot fail, and malformed data stops at the first bad point instead.
+fn u8_at(data: &[u8], offset: usize) -> u32 {
+    if offset >= data.len {
+        return 0
+    }
+    return data[offset] as u32
+}
+
+fn u16_at(data: &[u8], offset: usize) -> u32 {
+    if offset >= data.len || data.len - offset < 2 {
+        return 0
+    }
+    return ((data[offset] as u32) << 8) | (data[offset + 1] as u32)
+}
+
+fn i16_at(data: &[u8], offset: usize) -> i32 {
+    value := u16_at(data, offset) as i32
+    if value >= 32768 {
+        return value - 65536
+    }
+    return value
+}
+
+fn u32_at(data: &[u8], offset: usize) -> u32 {
+    if offset >= data.len || data.len - offset < 4 {
+        return 0
+    }
+    return (u16_at(data, offset) << 16) | u16_at(data, offset + 2)
+}
+
+// True when offset..offset + length lies inside `data`.
+fn fits(data: &[u8], offset: usize, length: usize) -> bool {
+    return offset <= data.len && length <= data.len - offset
+}
+
+// The number of fonts in `data`: the collection's count for a .ttc, 1 for
+// a single font.
+pub fn font_count(data: &[u8]) -> u32!Error {
+    if !fits(data, 0, 12) {
+        return err(Error.Malformed)
+    }
+    if u32_at(data, 0) == TAG_TTCF {
+        count := u32_at(data, 8)
+        if count as usize > (data.len - 12) / 4 {
+            return err(Error.Malformed)
+        }
+        return ok(count)
+    }
+    return ok(1)
+}
+
+struct Table {
+    offset: usize
+    length: usize
+}
+
+// The extent of a glyph's data in the glyf table, or an empty range.
+struct Span {
+    start: usize
+    end: usize
+}
+
+pub struct GlyphBox {
+    pub x_min: i32
+    pub y_min: i32
+    pub x_max: i32
+    pub y_max: i32
+}
+
+// A parsed font: offsets into the borrowed font data.
+pub struct Font {
+    data: &[u8]
+    units_per_em: u32
+    glyph_count: u32
+    long_loca: bool
+    loca: usize
+    glyf: usize
+    glyf_length: usize
+    hmtx: usize
+    hmtx_length: usize
+    metric_count: u32
+    cmap: usize
+    cmap_length: usize
+    cmap_format: u32
+    kern: usize
+    kern_pairs: u32
+    ascent: i32
+    descent: i32
+    line_gap: i32
+
+    // The font in a .ttf file, or the first font of a .ttc collection.
+    pub fn new(data: &[u8]) -> Font!Error from(data) {
+        return Font.from_collection(data, 0)
+    }
+    // Font `index` of a .ttc collection; index 0 also opens a .ttf.
+    pub fn from_collection(data: &[u8], index: u32) -> Font!Error from(data) {
+        count := font_count(data)?
+        if index >= count {
+            return err(Error.NoSuchFont)
+        }
+        start := 0usize
+        if u32_at(data, 0) == TAG_TTCF {
+            start = u32_at(data, 12 + index as usize * 4) as usize
+        }
+        return parse(data, start)
+    }
+
+    pub fn units_per_em(&self) -> u32 {
+        return self.units_per_em
+    }
+    pub fn glyph_count(&self) -> u32 {
+        return self.glyph_count
+    }
+    // Distance from the baseline to the top of the tallest glyphs, in font
+    // units (positive).
+    pub fn ascent(&self) -> i32 {
+        return self.ascent
+    }
+    // Distance from the baseline to the bottom of the lowest glyphs, in
+    // font units (negative).
+    pub fn descent(&self) -> i32 {
+        return self.descent
+    }
+    // Extra space between lines, in font units.
+    pub fn line_gap(&self) -> i32 {
+        return self.line_gap
+    }
+
+    // The glyph for a Unicode code point, or 0 (the font's .notdef glyph,
+    // usually a box) when the font has none.
+    pub fn glyph_index(&self, code_point: u32) -> u32 {
+        glyph := 0u32
+        if self.cmap_format == 4 {
+            glyph = self.lookup_format4(code_point)
+        } else if self.cmap_format == 12 {
+            glyph = self.lookup_format12(code_point)
+        } else if self.cmap_format == 6 {
+            first := u16_at(self.data, self.cmap + 6)
+            count := u16_at(self.data, self.cmap + 8)
+            if code_point >= first && code_point - first < count {
+                glyph = u16_at(self.data, self.cmap + 10 + 2 * (code_point - first) as usize)
+            }
+        } else if code_point < 256 {
+            glyph = u8_at(self.data, self.cmap + 6 + code_point as usize)
+        }
+        if glyph >= self.glyph_count {
+            return 0
+        }
+        return glyph
+    }
+    pub fn has_glyph(&self, code_point: u32) -> bool {
+        return self.glyph_index(code_point) != 0
+    }
+    fn lookup_format4(&self, code_point: u32) -> u32 {
+        if code_point > 0xffff {
+            return 0
+        }
+        data := self.data
+        segments := (u16_at(data, self.cmap + 6) / 2) as usize
+        ends := self.cmap + 14
+        starts := ends + 2 * segments + 2
+        deltas := starts + 2 * segments
+        ranges := deltas + 2 * segments
+        // The first segment whose end is at least the code point.
+        low := 0usize
+        high := segments
+        for low < high {
+            mid := (low + high) / 2
+            if u16_at(data, ends + 2 * mid) < code_point {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        if low >= segments {
+            return 0
+        }
+        start := u16_at(data, starts + 2 * low)
+        if start > code_point {
+            return 0
+        }
+        delta := u16_at(data, deltas + 2 * low)
+        range_offset := u16_at(data, ranges + 2 * low)
+        if range_offset == 0 {
+            return (code_point + delta) & 0xffff
+        }
+        at := ranges + 2 * low + range_offset as usize + 2 * (code_point - start) as usize
+        if at + 2 > self.cmap + self.cmap_length {
+            return 0
+        }
+        glyph := u16_at(data, at)
+        if glyph == 0 {
+            return 0
+        }
+        return (glyph + delta) & 0xffff
+    }
+    fn lookup_format12(&self, code_point: u32) -> u32 {
+        data := self.data
+        groups := u32_at(data, self.cmap + 12) as usize
+        low := 0usize
+        high := groups
+        for low < high {
+            mid := (low + high) / 2
+            at := self.cmap + 16 + 12 * mid
+            if u32_at(data, at + 4) < code_point {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        if low >= groups {
+            return 0
+        }
+        at := self.cmap + 16 + 12 * low
+        first := u32_at(data, at)
+        if first > code_point {
+            return 0
+        }
+        glyph := u32_at(data, at + 8) as u64 + (code_point - first) as u64
+        if glyph > 0xffffffff {
+            return 0
+        }
+        return glyph as u32
+    }
+
+    // How far the pen moves after `glyph`, in font units.
+    pub fn advance_width(&self, glyph: u32) -> u32 {
+        if self.metric_count == 0 {
+            return 0
+        }
+        entry := glyph
+        if entry >= self.metric_count {
+            entry = self.metric_count - 1
+        }
+        return u16_at(self.data, self.hmtx + 4 * entry as usize)
+    }
+    // Distance from the pen position to the left edge of `glyph`'s outline,
+    // in font units.
+    pub fn left_side_bearing(&self, glyph: u32) -> i32 {
+        if glyph >= self.glyph_count {
+            return 0
+        }
+        if glyph < self.metric_count {
+            return i16_at(self.data, self.hmtx + 4 * glyph as usize + 2)
+        }
+        at := self.hmtx + 4 * self.metric_count as usize + 2 * (glyph - self.metric_count) as usize
+        if at + 2 > self.hmtx + self.hmtx_length {
+            return 0
+        }
+        return i16_at(self.data, at)
+    }
+    // The adjustment to the advance between `left` and `right`, in font
+    // units, from the font's kern table; 0 without one.
+    pub fn kerning(&self, left: u32, right: u32) -> i32 {
+        if self.kern_pairs == 0 {
+            return 0
+        }
+        key := (left << 16) | (right & 0xffff)
+        low := 0usize
+        high := self.kern_pairs as usize
+        for low < high {
+            mid := (low + high) / 2
+            at := self.kern + 6 * mid
+            pair := u32_at(self.data, at)
+            if pair == key {
+                return i16_at(self.data, at + 4)
+            }
+            if pair < key {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return 0
+    }
+    // The bounding box the font records for `glyph`, in font units with y
+    // up; all zero for a glyph without an outline, such as a space.
+    pub fn glyph_box(&self, glyph: u32) -> GlyphBox {
+        span := self.span(glyph)
+        if span.end - span.start < 10 {
+            return GlyphBox { x_min: 0, y_min: 0, x_max: 0, y_max: 0 }
+        }
+        return GlyphBox { x_min: i16_at(self.data, span.start + 2), y_min: i16_at(self.data, span.start + 4), x_max: i16_at(self.data, span.start + 6), y_max: i16_at(self.data, span.start + 8) }
+    }
+    fn span(&self, glyph: u32) -> Span {
+        return glyph_span(self.data, self.loca, self.long_loca, self.glyf, self.glyf_length, self.glyph_count, glyph)
+    }
+
+    // -- Text in pixels ----------------------------------------------------
+
+    // Pixels from the top of a line to its baseline at `size` pixels per em.
+    pub fn baseline(&self, size: u32) -> u32 {
+        return scale_round(max_i64(self.ascent as i64, 0), clamp_size(size), self.units_per_em)
+    }
+    // Pixels from one line's top to the next at `size` pixels per em: the
+    // ascent, descent and line gap, rounded.
+    pub fn line_height(&self, size: u32) -> u32 {
+        total := self.ascent as i64 - self.descent as i64 + self.line_gap as i64
+        return scale_round(max_i64(total, 1), clamp_size(size), self.units_per_em)
+    }
+    // How far `glyph` advances the pen at `size`, in subpixels (256 to the
+    // pixel). Text is positioned to the subpixel, so advances need not be
+    // whole pixels.
+    pub fn advance(&self, glyph: u32, size: u32) -> i64 {
+        return self.advance_width(glyph) as i64 * clamp_size(size) as i64 * 256 / self.units_per_em as i64
+    }
+    // The area drawing `text` at `size` covers: the widest line's advance,
+    // rounded up, by the line count times line_height(size). "\n" starts a
+    // line and "\r" is ignored.
+    pub fn measure(&self, text: &str, size: u32) -> graphics.Size {
+        data := mem.str_bytes(text)
+        lines := 0u64
+        if data.len > 0 {
+            lines = 1
+        }
+        widest := 0i64
+        width := 0i64
+        previous := 0u32
+        has_previous := false
+        index := 0usize
+        for index < data.len {
+            code := decode_utf8(data, index)
+            index += utf8_length(data[index])
+            if code == 10 {
+                lines += 1
+                width = 0
+                has_previous = false
+            } else if code != 13 {
+                glyph := self.glyph_index(code)
+                if has_previous {
+                    width = clamp_i64(width + self.kerning(previous, glyph) as i64, -PEN_LIMIT, PEN_LIMIT)
+                }
+                width = clamp_i64(width + self.advance_width(glyph) as i64, -PEN_LIMIT, PEN_LIMIT)
+                if width > widest {
+                    widest = width
+                }
+                previous = glyph
+                has_previous = true
+            }
+        }
+        pixels := (widest * clamp_size(size) as i64 + self.units_per_em as i64 - 1) / self.units_per_em as i64
+        height := lines * self.line_height(size) as u64
+        return graphics.Size { width: min_i64(pixels, 4294967295) as u32, height: min_i64(height as i64, 4294967295) as u32 }
+    }
+    // Draw `text` at `size` pixels per em with the top-left corner of its
+    // first line at (x, y), antialiased and blended over the canvas, and
+    // return the area measure(text, size) reports. Each line's baseline is
+    // baseline(size) pixels below its top. Missing characters draw as the
+    // font's .notdef glyph.
+    pub fn draw(&self, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, color: graphics.Color) -> graphics.Rect {
+        unused := graphics.Gradient.linear(0, 0, 0, 0, color, color)
+        return self.render(canvas, x, y, text, size, color, &unused, false)
+    }
+    // draw with a gradient instead of a color.
+    pub fn draw_gradient(&self, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, gradient: &graphics.Gradient) -> graphics.Rect {
+        return self.render(canvas, x, y, text, size, 0, gradient, true)
+    }
+    fn render(&self, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, color: graphics.Color, gradient: &graphics.Gradient, shaded: bool) -> graphics.Rect {
+        em := clamp_size(size)
+        data := mem.str_bytes(text)
+        units := self.units_per_em as i64
+        line_height := self.line_height(em) as i64
+        line_top := y as i64
+        pen := 0i64
+        previous := 0u32
+        has_previous := false
+        index := 0usize
+        for index < data.len {
+            code := decode_utf8(data, index)
+            index += utf8_length(data[index])
+            if code == 10 {
+                line_top = clamp_i64(line_top + line_height, -PEN_LIMIT, PEN_LIMIT)
+                pen = 0
+                has_previous = false
+            } else if code != 13 {
+                glyph := self.glyph_index(code)
+                if has_previous {
+                    pen = clamp_i64(pen + self.kerning(previous, glyph) as i64, -PEN_LIMIT, PEN_LIMIT)
+                }
+                span := self.span(glyph)
+                if span.end > span.start {
+                    origin_x := x as i64 * 256 + pen * em as i64 * 256 / units
+                    origin_y := (line_top + self.baseline(em) as i64) * 256
+                    outline := self.glyph(glyph, clamp_fixed(origin_x), clamp_fixed(origin_y), em)
+                    if shaded {
+                        canvas.gradient_outline(&outline, graphics.FillRule.NonZero, gradient)
+                    } else {
+                        canvas.fill_outline(&outline, graphics.FillRule.NonZero, color)
+                    }
+                }
+                pen = clamp_i64(pen + self.advance_width(glyph) as i64, -PEN_LIMIT, PEN_LIMIT)
+                previous = glyph
+                has_previous = true
+            }
+        }
+        size_drawn := self.measure(text, em)
+        return graphics.Rect { x: x, y: y, width: size_drawn.width, height: size_drawn.height }
+    }
+    // The outline of `glyph` at `size` pixels per em with its origin (the
+    // pen position on the baseline) at subpixel position (x, y). Fill it
+    // with canvas.fill_outline or gradient_outline using FillRule.NonZero.
+    pub fn glyph(&self, glyph: u32, x: i32, y: i32, size: u32) -> Glyph from(self) {
+        return Glyph { data: self.data, loca: self.loca, long_loca: self.long_loca, glyf: self.glyf, glyf_length: self.glyf_length, glyph_count: self.glyph_count, index: glyph, origin_x: x as i64, origin_y: y as i64, scale: clamp_size(size) as i64 * 256, units: self.units_per_em as i64 }
+    }
+}
+
+fn parse(data: &[u8], start: usize) -> Font!Error from(data) {
+    if !fits(data, start, 12) {
+        return err(Error.Malformed)
+    }
+    version := u32_at(data, start)
+    if version == TAG_OTTO {
+        return err(Error.Unsupported)
+    }
+    if version != 0x00010000 && version != TAG_TRUE {
+        return err(Error.Malformed)
+    }
+    tables := u16_at(data, start + 4) as usize
+    if !fits(data, start + 12, 16 * tables) {
+        return err(Error.Malformed)
+    }
+    head := find_table(data, start, tables, TAG_HEAD)?
+    hhea := find_table(data, start, tables, TAG_HHEA)?
+    maxp := find_table(data, start, tables, TAG_MAXP)?
+    hmtx := find_table(data, start, tables, TAG_HMTX)?
+    cmap := find_table(data, start, tables, TAG_CMAP)?
+    loca := match find_table(data, start, tables, TAG_LOCA) {
+        ok(table) => table,
+        err(_) => {
+            return err(Error.Unsupported)
+        },
+    }
+    glyf := match find_table(data, start, tables, TAG_GLYF) {
+        ok(table) => table,
+        err(_) => {
+            return err(Error.Unsupported)
+        },
+    }
+    if head.length < 54 || hhea.length < 36 || maxp.length < 6 {
+        return err(Error.Malformed)
+    }
+    if u32_at(data, head.offset + 12) != 0x5f0f3cf5 {
+        return err(Error.Malformed)
+    }
+    units := u16_at(data, head.offset + 18)
+    if units < 16 || units > 16384 {
+        return err(Error.Malformed)
+    }
+    format := u16_at(data, head.offset + 50)
+    if format > 1 {
+        return err(Error.Malformed)
+    }
+    long_loca := format == 1
+    glyphs := u16_at(data, maxp.offset + 4)
+    entry := 2usize
+    if long_loca {
+        entry = 4
+    }
+    if loca.length < (glyphs as usize + 1) * entry {
+        return err(Error.Malformed)
+    }
+    metrics := u16_at(data, hhea.offset + 34)
+    if metrics > glyphs || hmtx.length < 4 * metrics as usize {
+        return err(Error.Malformed)
+    }
+    font := Font { data: data, units_per_em: units, glyph_count: glyphs, long_loca: long_loca, loca: loca.offset, glyf: glyf.offset, glyf_length: glyf.length, hmtx: hmtx.offset, hmtx_length: hmtx.length, metric_count: metrics, cmap: 0, cmap_length: 0, cmap_format: 0, kern: 0, kern_pairs: 0, ascent: i16_at(data, hhea.offset + 4), descent: i16_at(data, hhea.offset + 6), line_gap: i16_at(data, hhea.offset + 8) }
+    choose_cmap(&mut font, &cmap)?
+    match find_table(data, start, tables, TAG_KERN) {
+        ok(kern) => {
+            read_kern(&mut font, &kern)
+        }
+        err(_) => {}
+    }
+    return ok(font)
+}
+
+fn find_table(data: &[u8], start: usize, tables: usize, tag: u32) -> Table!Error {
+    for i in 0usize..tables {
+        record := start + 12 + 16 * i
+        if u32_at(data, record) == tag {
+            offset := u32_at(data, record + 8) as usize
+            length := u32_at(data, record + 12) as usize
+            if !fits(data, offset, length) {
+                return err(Error.Malformed)
+            }
+            return ok(Table { offset: offset, length: length })
+        }
+    }
+    return err(Error.Malformed)
+}
+
+// Pick the most complete Unicode subtable: format 12 (all of Unicode), then
+// format 4 (the Basic Multilingual Plane), then formats 6 and 0.
+fn choose_cmap(font: &mut Font, cmap: &Table) -> void!Error {
+    data := font.data
+    if cmap.length < 4 {
+        return err(Error.Malformed)
+    }
+    count := u16_at(data, cmap.offset + 2) as usize
+    if !fits(data, cmap.offset + 4, 8 * count) || 4 + 8 * count > cmap.length {
+        return err(Error.Malformed)
+    }
+    best := 0u32
+    best_offset := 0usize
+    best_length := 0usize
+    best_format := 0u32
+    for i in 0usize..count {
+        record := cmap.offset + 4 + 8 * i
+        platform := u16_at(data, record)
+        encoding := u16_at(data, record + 2)
+        offset := u32_at(data, record + 4) as usize
+        if offset >= cmap.length || cmap.length - offset < 8 {
+            continue
+        }
+        at := cmap.offset + offset
+        format := u16_at(data, at)
+        length := 0usize
+        if format == 12 {
+            length = u32_at(data, at + 4) as usize
+        } else if format == 4 || format == 6 || format == 0 {
+            length = u16_at(data, at + 2) as usize
+        } else {
+            continue
+        }
+        if length > cmap.length - offset {
+            continue
+        }
+        unicode := platform == 0 || (platform == 3 && (encoding == 1 || encoding == 10))
+        symbol := platform == 3 && encoding == 0
+        rank := 0u32
+        if unicode && format == 12 {
+            rank = 5
+        } else if unicode && format == 4 {
+            rank = 4
+        } else if unicode {
+            rank = 3
+        } else if symbol {
+            rank = 2
+        } else if format != 0 || platform == 1 {
+            rank = 1
+        }
+        if rank > best && subtable_valid(data, at, length, format) {
+            best = rank
+            best_offset = at
+            best_length = length
+            best_format = format
+        }
+    }
+    if best == 0 {
+        return err(Error.Unsupported)
+    }
+    font.cmap = best_offset
+    font.cmap_length = best_length
+    font.cmap_format = best_format
+    return ok()
+}
+
+// Check that a subtable's arrays fit inside its length, so lookups stay in
+// bounds.
+fn subtable_valid(data: &[u8], at: usize, length: usize, format: u32) -> bool {
+    if format == 4 {
+        if length < 14 {
+            return false
+        }
+        segments := (u16_at(data, at + 6) / 2) as usize
+        return 16 + 8 * segments <= length
+    }
+    if format == 12 {
+        if length < 16 {
+            return false
+        }
+        groups := u32_at(data, at + 12) as usize
+        return groups <= (length - 16) / 12
+    }
+    if format == 6 {
+        if length < 10 {
+            return false
+        }
+        return 10 + 2 * u16_at(data, at + 8) as usize <= length
+    }
+    return length >= 262
+}
+
+// Use the first horizontal format 0 subtable of a version 0 kern table.
+fn read_kern(font: &mut Font, kern: &Table) {
+    data := font.data
+    if kern.length < 4 || u16_at(data, kern.offset) != 0 {
+        return
+    }
+    count := u16_at(data, kern.offset + 2) as usize
+    at := kern.offset + 4
+    end := kern.offset + kern.length
+    for _ in 0usize..count {
+        if at + 6 > end {
+            return
+        }
+        length := u16_at(data, at + 2) as usize
+        coverage := u16_at(data, at + 4)
+        if (coverage >> 8) == 0 && (coverage & 0x07) == 0x01 && at + 14 <= end {
+            pairs := u16_at(data, at + 6) as usize
+            if pairs <= (end - (at + 14)) / 6 {
+                font.kern = at + 14
+                font.kern_pairs = pairs as u32
+            }
+            return
+        }
+        if length < 6 {
+            return
+        }
+        at += length
+    }
+}
+
+fn glyph_span(data: &[u8], loca: usize, long_loca: bool, glyf: usize, glyf_length: usize, glyph_count: u32, glyph: u32) -> Span {
+    empty := Span { start: 0, end: 0 }
+    if glyph >= glyph_count {
+        return empty
+    }
+    first := 0usize
+    next := 0usize
+    if long_loca {
+        first = u32_at(data, loca + 4 * glyph as usize) as usize
+        next = u32_at(data, loca + 4 * glyph as usize + 4) as usize
+    } else {
+        first = 2 * u16_at(data, loca + 2 * glyph as usize) as usize
+        next = 2 * u16_at(data, loca + 2 * glyph as usize + 2) as usize
+    }
+    if next <= first || next > glyf_length {
+        return empty
+    }
+    return Span { start: glyf + first, end: glyf + next }
+}
+
+// -- Glyph outlines ---------------------------------------------------------
+
+// A 2x2 matrix in 2^-14 units and an offset in 2^-14 font units: font
+// coordinates (x, y) map to (xx x + xy y + dx, yx x + yy y + dy) / 2^14.
+struct Transform {
+    xx: i64
+    xy: i64
+    yx: i64
+    yy: i64
+    dx: i64
+    dy: i64
+}
+
+const ONE: i64 = 16384
+const COORDINATE_LIMIT: i64 = 65536
+// Pen positions within a line, in font units, stay inside +/-2^32.
+const PEN_LIMIT: i64 = 4294967296
+const MATRIX_LIMIT: i64 = 262144
+const OFFSET_LIMIT: i64 = 17179869184
+
+fn identity() -> Transform {
+    return Transform { xx: ONE, xy: 0, yx: 0, yy: ONE, dx: 0, dy: 0 }
+}
+
+// `parent` applied after `child`: parent(child(p)).
+fn compose(parent: &Transform, child: &Transform) -> Transform {
+    return Transform {
+        xx: clamp_i64((parent.xx * child.xx + parent.xy * child.yx) >> 14, -MATRIX_LIMIT, MATRIX_LIMIT),
+        xy: clamp_i64((parent.xx * child.xy + parent.xy * child.yy) >> 14, -MATRIX_LIMIT, MATRIX_LIMIT),
+        yx: clamp_i64((parent.yx * child.xx + parent.yy * child.yx) >> 14, -MATRIX_LIMIT, MATRIX_LIMIT),
+        yy: clamp_i64((parent.yx * child.xy + parent.yy * child.yy) >> 14, -MATRIX_LIMIT, MATRIX_LIMIT),
+        dx: clamp_i64(((parent.xx * child.dx + parent.xy * child.dy) >> 14) + parent.dx, -OFFSET_LIMIT, OFFSET_LIMIT),
+        dy: clamp_i64(((parent.yx * child.dx + parent.yy * child.dy) >> 14) + parent.dy, -OFFSET_LIMIT, OFFSET_LIMIT)
+    }
+}
+
+// One glyph of a font, placed and scaled for drawing; see Font.glyph. It
+// implements graphics.Outline.
+pub struct Glyph {
+    data: &[u8]
+    loca: usize
+    long_loca: bool
+    glyf: usize
+    glyf_length: usize
+    glyph_count: u32
+    index: u32
+    origin_x: i64
+    origin_y: i64
+    scale: i64
+    units: i64
+
+    pub fn index(&self) -> u32 {
+        return self.index
+    }
+    pub fn trace(&self, pen: &mut graphics.Pen) {
+        budget := COMPONENT_BUDGET
+        start := identity()
+        self.trace_glyph(pen, self.index, &start, 0, &mut budget)
+    }
+    fn trace_glyph(&self, pen: &mut graphics.Pen, glyph: u32, transform: &Transform, depth: u32, budget: &mut u32) {
+        span := glyph_span(self.data, self.loca, self.long_loca, self.glyf, self.glyf_length, self.glyph_count, glyph)
+        if span.end - span.start < 10 {
+            return
+        }
+        contours := i16_at(self.data, span.start)
+        if contours >= 0 {
+            self.trace_simple(pen, &span, contours as usize, transform)
+            return
+        }
+        if depth >= MAX_DEPTH {
+            return
+        }
+        at := span.start + 10
+        for {
+            if at + 4 > span.end || *budget == 0 {
+                return
+            }
+            *budget -= 1
+            flags := u16_at(self.data, at)
+            component := u16_at(self.data, at + 2)
+            at += 4
+            arg1 := 0i64
+            arg2 := 0i64
+            if (flags & ARG_WORDS) != 0 {
+                arg1 = i16_at(self.data, at) as i64
+                arg2 = i16_at(self.data, at + 2) as i64
+                at += 4
+            } else {
+                arg1 = signed_byte(u8_at(self.data, at))
+                arg2 = signed_byte(u8_at(self.data, at + 1))
+                at += 2
+            }
+            child := identity()
+            if (flags & HAVE_SCALE) != 0 {
+                scale := i16_at(self.data, at) as i64
+                child.xx = scale
+                child.yy = scale
+                at += 2
+            } else if (flags & HAVE_XY_SCALE) != 0 {
+                child.xx = i16_at(self.data, at) as i64
+                child.yy = i16_at(self.data, at + 2) as i64
+                at += 4
+            } else if (flags & HAVE_2X2) != 0 {
+                child.xx = i16_at(self.data, at) as i64
+                child.yx = i16_at(self.data, at + 2) as i64
+                child.xy = i16_at(self.data, at + 4) as i64
+                child.yy = i16_at(self.data, at + 6) as i64
+                at += 8
+            }
+            if at > span.end {
+                return
+            }
+            // Point-matched placement (args are point numbers) is rare and
+            // needs both outlines' points; such components are drawn
+            // without an offset.
+            if (flags & ARGS_ARE_XY) != 0 {
+                if (flags & SCALED_OFFSET) != 0 && (flags & UNSCALED_OFFSET) == 0 {
+                    child.dx = child.xx * arg1 + child.xy * arg2
+                    child.dy = child.yx * arg1 + child.yy * arg2
+                } else {
+                    child.dx = arg1 * ONE
+                    child.dy = arg2 * ONE
+                }
+            }
+            combined := compose(transform, &child)
+            self.trace_glyph(pen, component, &combined, depth + 1, budget)
+            if (flags & MORE_COMPONENTS) == 0 {
+                return
+            }
+        }
+    }
+    fn trace_simple(&self, pen: &mut graphics.Pen, span: &Span, contours: usize, transform: &Transform) {
+        data := self.data
+        ends := span.start + 10
+        if ends + 2 * contours + 2 > span.end || contours == 0 {
+            return
+        }
+        point_count := u16_at(data, ends + 2 * (contours - 1)) as usize + 1
+        instructions := u16_at(data, ends + 2 * contours) as usize
+        flags_at := ends + 2 * contours + 2 + instructions
+        // Find where the x and y coordinate arrays start by walking the
+        // flags once.
+        x_bytes := 0usize
+        at := flags_at
+        seen := 0usize
+        for seen < point_count {
+            if at >= span.end {
+                return
+            }
+            flag := u8_at(data, at)
+            at += 1
+            repeat := 1usize
+            if (flag & FLAG_REPEAT) != 0 {
+                if at >= span.end {
+                    return
+                }
+                repeat += u8_at(data, at) as usize
+                at += 1
+            }
+            if (flag & FLAG_X_SHORT) != 0 {
+                x_bytes += repeat
+            } else if (flag & FLAG_X_SAME) == 0 {
+                x_bytes += 2 * repeat
+            }
+            seen += repeat
+        }
+        points := Points { end: span.end, flags_at: flags_at, x_at: at, y_at: at + x_bytes, flag: 0, repeat: 0, x: 0, y: 0, failed: false }
+        first := 0usize
+        for c in 0usize..contours {
+            last := u16_at(data, ends + 2 * c) as usize
+            if last < first || last >= point_count {
+                return
+            }
+            self.trace_contour(pen, &mut points, last + 1 - first, transform)
+            if points.failed {
+                return
+            }
+            first = last + 1
+        }
+    }
+    // Trace `count` points as one closed contour of lines and quadratic
+    // curves. Two consecutive off-curve points imply an on-curve point
+    // halfway between them.
+    fn trace_contour(&self, pen: &mut graphics.Pen, points: &mut Points, count: usize, transform: &Transform) {
+        data := self.data
+        on := points.next(data)
+        if points.failed {
+            return
+        }
+        fx := self.map_x(points.x, points.y, transform)
+        fy := self.map_y(points.x, points.y, transform)
+        if count == 1 {
+            return
+        }
+        // The contour starts at an on-curve point: the first, else the last,
+        // else the midpoint between the last and the first.
+        start_x := fx
+        start_y := fy
+        pending := false
+        control_x := 0i64
+        control_y := 0i64
+        remaining := count - 1
+        skip_last := false
+        if !on {
+            ahead := points.copy()
+            for _ in 0usize..count - 2 {
+                ahead.next(data)
+            }
+            last_on := ahead.next(data)
+            lx := self.map_x(ahead.x, ahead.y, transform)
+            ly := self.map_y(ahead.x, ahead.y, transform)
+            if last_on {
+                start_x = lx
+                start_y = ly
+                skip_last = true
+            } else {
+                start_x = (lx + fx) >> 1
+                start_y = (ly + fy) >> 1
+            }
+            pending = true
+            control_x = fx
+            control_y = fy
+        }
+        pen.move_to(clamp_fixed(start_x), clamp_fixed(start_y))
+        for i in 0usize..remaining {
+            point_on := points.next(data)
+            if points.failed {
+                return
+            }
+            if skip_last && i + 1 == remaining {
+                break
+            }
+            px := self.map_x(points.x, points.y, transform)
+            py := self.map_y(points.x, points.y, transform)
+            if point_on {
+                if pending {
+                    pen.quad_to(clamp_fixed(control_x), clamp_fixed(control_y), clamp_fixed(px), clamp_fixed(py))
+                } else {
+                    pen.line_to(clamp_fixed(px), clamp_fixed(py))
+                }
+                pending = false
+            } else {
+                if pending {
+                    mx := (control_x + px) >> 1
+                    my := (control_y + py) >> 1
+                    pen.quad_to(clamp_fixed(control_x), clamp_fixed(control_y), clamp_fixed(mx), clamp_fixed(my))
+                }
+                pending = true
+                control_x = px
+                control_y = py
+            }
+        }
+        if pending {
+            pen.quad_to(clamp_fixed(control_x), clamp_fixed(control_y), clamp_fixed(start_x), clamp_fixed(start_y))
+        }
+        pen.close()
+    }
+    // Font units to canvas subpixels, flipping y so it grows downward.
+    fn map_x(&self, x: i64, y: i64, transform: &Transform) -> i64 {
+        units := transform.xx * x + transform.xy * y + transform.dx
+        return self.origin_x + floor_div(units * self.scale, self.units * ONE)
+    }
+    fn map_y(&self, x: i64, y: i64, transform: &Transform) -> i64 {
+        units := transform.yx * x + transform.yy * y + transform.dy
+        return self.origin_y - floor_div(units * self.scale, self.units * ONE)
+    }
+}
+
+// A cursor over a simple glyph's points: the flag stream and the x and y
+// coordinate streams advance together. Reading past the glyph marks it
+// failed and repeats the last point.
+struct Points {
+    end: usize
+    flags_at: usize
+    x_at: usize
+    y_at: usize
+    flag: u32
+    repeat: u32
+    x: i64
+    y: i64
+    failed: bool
+
+    fn copy(&self) -> Points {
+        return Points { end: self.end, flags_at: self.flags_at, x_at: self.x_at, y_at: self.y_at, flag: self.flag, repeat: self.repeat, x: self.x, y: self.y, failed: self.failed }
+    }
+    // Advance to the next point and return whether it is on the curve.
+    fn next(&mut self, data: &[u8]) -> bool {
+        if self.failed {
+            return true
+        }
+        if self.repeat > 0 {
+            self.repeat -= 1
+        } else {
+            if self.flags_at >= self.end {
+                self.failed = true
+                return true
+            }
+            self.flag = u8_at(data, self.flags_at)
+            self.flags_at += 1
+            if (self.flag & FLAG_REPEAT) != 0 {
+                self.repeat = u8_at(data, self.flags_at)
+                self.flags_at += 1
+            }
+        }
+        flag := self.flag
+        if (flag & FLAG_X_SHORT) != 0 {
+            if self.x_at >= self.end {
+                self.failed = true
+                return true
+            }
+            delta := u8_at(data, self.x_at) as i64
+            self.x_at += 1
+            if (flag & FLAG_X_SAME) != 0 {
+                self.x += delta
+            } else {
+                self.x -= delta
+            }
+        } else if (flag & FLAG_X_SAME) == 0 {
+            if self.x_at + 2 > self.end {
+                self.failed = true
+                return true
+            }
+            self.x += i16_at(data, self.x_at) as i64
+            self.x_at += 2
+        }
+        if (flag & FLAG_Y_SHORT) != 0 {
+            if self.y_at >= self.end {
+                self.failed = true
+                return true
+            }
+            delta := u8_at(data, self.y_at) as i64
+            self.y_at += 1
+            if (flag & FLAG_Y_SAME) != 0 {
+                self.y += delta
+            } else {
+                self.y -= delta
+            }
+        } else if (flag & FLAG_Y_SAME) == 0 {
+            if self.y_at + 2 > self.end {
+                self.failed = true
+                return true
+            }
+            self.y += i16_at(data, self.y_at) as i64
+            self.y_at += 2
+        }
+        // Real coordinates fit in 16 bits; clamping keeps hostile deltas
+        // from overflowing the transform.
+        self.x = clamp_i64(self.x, -COORDINATE_LIMIT, COORDINATE_LIMIT)
+        self.y = clamp_i64(self.y, -COORDINATE_LIMIT, COORDINATE_LIMIT)
+        return (flag & FLAG_ON_CURVE) != 0
+    }
+}
+
+// -- Helpers ----------------------------------------------------------------
+
+fn signed_byte(value: u32) -> i64 {
+    if value >= 128 {
+        return value as i64 - 256
+    }
+    return value as i64
+}
+
+fn clamp_size(size: u32) -> u32 {
+    if size == 0 {
+        return 1
+    }
+    if size > MAX_SIZE {
+        return MAX_SIZE
+    }
+    return size
+}
+
+// round(value * size / units) for non-negative value.
+fn scale_round(value: i64, size: u32, units: u32) -> u32 {
+    return ((value * size as i64 * 2 + units as i64) / (2 * units as i64)) as u32
+}
+
+fn clamp_fixed(value: i64) -> i32 {
+    return clamp_i64(value, -536870912, 536870912) as i32
+}
+
+fn clamp_i64(value: i64, low: i64, high: i64) -> i64 {
+    if value < low {
+        return low
+    }
+    if value > high {
+        return high
+    }
+    return value
+}
+
+fn min_i64(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max_i64(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn floor_div(value: i64, divisor: i64) -> i64 {
+    if value >= 0 {
+        return value / divisor
+    }
+    return -((-value + divisor - 1) / divisor)
+}
+
+fn utf8_length(lead: u8) -> usize {
+    if lead < 0x80 {
+        return 1
+    }
+    if lead < 0xe0 {
+        return 2
+    }
+    if lead < 0xf0 {
+        return 3
+    }
+    return 4
+}
+
+fn decode_utf8(data: &[u8], index: usize) -> u32 {
+    lead := data[index] as u32
+    if lead < 0x80 {
+        return lead
+    }
+    if lead < 0xe0 {
+        return ((lead & 0x1f) << 6) | (data[index + 1] as u32 & 0x3f)
+    }
+    if lead < 0xf0 {
+        return ((lead & 0x0f) << 12) | ((data[index + 1] as u32 & 0x3f) << 6) | (data[index + 2] as u32 & 0x3f)
+    }
+    return ((lead & 0x07) << 18) | ((data[index + 1] as u32 & 0x3f) << 12) | ((data[index + 2] as u32 & 0x3f) << 6) | (data[index + 3] as u32 & 0x3f)
+}

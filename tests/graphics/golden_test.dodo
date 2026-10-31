@@ -7,6 +7,7 @@ import "std/fs"
 import "std/graphics"
 import "std/graphics/font"
 import "std/graphics/image"
+import "std/graphics/truetype"
 import "std/platform"
 import "std/platform/error"
 import "std/text"
@@ -211,4 +212,140 @@ fn formats() {
     canvas.blend(&overlay, 4, 23)
     canvas.blit(&overlay, 84, 23)
     check("formats", &canvas)
+}
+
+// Antialiased shapes, paths and strokes. Coverage is computed exactly in
+// integers, so these images are as reproducible as the integer primitives.
+@test
+fn antialiased() {
+    pixels := [0u8; 96 * 64 * 4]
+    canvas := graphics.canvas(&mut pixels, 96, 64, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.hex(0x1d2330))
+    canvas.aa_fill_circle(10, 10, 8, graphics.hex(0x61afef))
+    canvas.aa_circle(30, 10, 8, graphics.WHITE)
+    canvas.aa_fill_ellipse(54, 10, 13, 6, graphics.hex(0xd19a66))
+    canvas.aa_ellipse(54, 10, 15, 8, graphics.hex(0xc678dd))
+    canvas.aa_fill_round_rect(72, 2, 22, 16, 5, graphics.hex(0x98c379))
+    canvas.aa_round_rect(73, 3, 20, 14, 4, graphics.WHITE)
+    for i in 0i32..8 {
+        canvas.aa_line(2 + i * 3, 24, 2 + i * 7, 60, graphics.rgb(255 - (i * 24) as u8, 180, (i * 30) as u8))
+    }
+    canvas.aa_thick_line(62, 26, 92, 44, 5, graphics.rgba(224, 108, 117, 200))
+    canvas.aa_thick_line(62, 58, 92, 28, 2, graphics.hex(0x56b6c2))
+    star := [44i32, 22, 52, 46, 32, 31, 56, 31, 36, 46]
+    canvas.aa_fill_polygon(&star, graphics.hex(0xe5c07b))
+    storage := [0i32; 256]
+    path := graphics.Path.new(&mut storage)
+    path.circle(76 * 256, 54 * 256 + 128, 9 * 256)
+    path.circle(76 * 256, 54 * 256 + 128, 4 * 256)
+    canvas.fill_path(&path, graphics.FillRule.EvenOdd, graphics.rgba(255, 255, 255, 180))
+    path.clear()
+    path.move_to(30 * 256, 62 * 256)
+    path.cubic_to(40 * 256, 40 * 256, 50 * 256, 70 * 256, 58 * 256, 50 * 256)
+    path.line_to(59 * 256, 51 * 256)
+    path.quad_to(50 * 256, 75 * 256, 30 * 256, 63 * 256)
+    canvas.fill_path(&path, graphics.FillRule.NonZero, graphics.WHITE)
+    check("antialiased", &canvas)
+}
+
+// Linear and radial gradients with stops, spreads and dithering, on their
+// own and filling paths.
+@test
+fn gradients() {
+    pixels := [0u8; 96 * 64 * 4]
+    canvas := graphics.canvas(&mut pixels, 96, 64, graphics.PixelFormat.Rgba8888)!
+    sky := graphics.Gradient.linear(0, 0, 0, 63, graphics.hex(0x203a5c), graphics.hex(0xf4a259))
+    sky.add_stop(170, graphics.hex(0xbc4b51))
+    canvas.gradient_rect(0, 0, 96, 64, &sky)
+    sun := graphics.Gradient.radial(70, 20, 14, graphics.rgba(255, 244, 214, 255), graphics.rgba(255, 200, 120, 0))
+    canvas.gradient_rect(50, 0, 40, 40, &sun)
+    stripes := graphics.Gradient.linear(4, 44, 12, 52, graphics.WHITE, graphics.hex(0x284b63))
+    stripes.set_spread(graphics.Spread.Reflect)
+    storage := [0i32; 128]
+    path := graphics.Path.new(&mut storage)
+    path.round_rect(4 * 256, 42 * 256, 40 * 256, 18 * 256, 6 * 256)
+    canvas.gradient_path(&path, graphics.FillRule.NonZero, &stripes)
+    rings := graphics.Gradient.radial(24, 18, 6, graphics.hex(0xe06c75), graphics.hex(0x56b6c2))
+    rings.set_spread(graphics.Spread.Repeat)
+    path.clear()
+    path.circle(24 * 256 + 128, 18 * 256 + 128, 16 * 256)
+    canvas.gradient_path(&path, graphics.FillRule.NonZero, &rings)
+    // A dithered ramp on an RGB565 canvas, converted back for the image.
+    ramp_pixels := [0u8; 44 * 18 * 2]
+    ramp := graphics.canvas(&mut ramp_pixels, 44, 18, graphics.PixelFormat.Rgb565)!
+    dark := graphics.Gradient.linear(0, 0, 43, 0, graphics.hex(0x102030), graphics.hex(0x304860))
+    dark.set_dither(true)
+    ramp.gradient_rect(0, 0, 44, 9, &dark)
+    dark.set_dither(false)
+    ramp.gradient_rect(0, 9, 44, 9, &dark)
+    canvas.blit(&ramp, 50, 44)
+    check("gradients", &canvas)
+}
+
+// Read a font file into `storage` and return its length.
+fn load_font(path: &str, storage: &mut[u8]) -> usize {
+    workspace := platform.workspace()
+    report := fs.read_file(path, storage, &mut workspace)!
+    assert(report.eof, "font larger than the test's buffer")
+    return report.read
+}
+
+// TrueType text from the test fonts in tests/graphics/fonts at several
+// sizes, in a solid color and a gradient, with kerning.
+@test
+fn truetype_text() {
+    storage := [0u8; 4096]
+    length := load_font("tests/graphics/fonts/dodo-test.ttf", &mut storage)
+    sans := truetype.Font.new(&storage[..length])!
+    pixels := [0u8; 160 * 96 * 4]
+    canvas := graphics.canvas(&mut pixels, 160, 96, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.hex(0x1d2330))
+    sans.draw(&mut canvas, 2, 2, "AODÄoNZ. AD DA", 10, graphics.WHITE)
+    sans.draw(&mut canvas, 2, 14, "AODÄoNZ.", 18, graphics.hex(0xe5c07b))
+    warm := graphics.Gradient.linear(0, 36, 0, 70, graphics.hex(0xf4a259), graphics.hex(0xbc4b51))
+    sans.draw_gradient(&mut canvas, 2, 34, "NOD", 40, &warm)
+    bounds := sans.draw(&mut canvas, 100, 40, "AD\nDA", 16, graphics.hex(0x61afef))
+    canvas.aa_round_rect(bounds.x - 1, bounds.y - 1, bounds.width + 2, bounds.height + 2, 2, graphics.DARK_GRAY)
+    check("truetype", &canvas)
+}
+
+// The same glyphs through the long-offset font, the format 12 character
+// map and both members of the collection render identically.
+@test
+fn truetype_variants() {
+    short_storage := [0u8; 4096]
+    short_length := load_font("tests/graphics/fonts/dodo-test.ttf", &mut short_storage)
+    short := truetype.Font.new(&short_storage[..short_length])!
+    long_storage := [0u8; 4096]
+    long_length := load_font("tests/graphics/fonts/dodo-test-long.ttf", &mut long_storage)
+    long := truetype.Font.new(&long_storage[..long_length])!
+    collection_storage := [0u8; 4096]
+    collection_length := load_font("tests/graphics/fonts/dodo-test.ttc", &mut collection_storage)
+    collection := &collection_storage[..collection_length]
+    assert_eq(truetype.font_count(collection)!, 2u32)
+    first := truetype.Font.from_collection(collection, 0)!
+    second := truetype.Font.from_collection(collection, 1)!
+    assert_eq(long.glyph_index(0x1f600), 3u32)
+    assert_eq(short.glyph_index(0x1f600), 0u32)
+    assert_eq(second.glyph_index(0x1f600), 3u32)
+    assert_eq(long.kerning(2, 4), 0i32)
+    assert_eq(first.kerning(2, 4), -80i32)
+
+    // No kerned pairs, so all four fonts lay the text out alike.
+    text := "NOZ.o ÄN"
+    expected_pixels := [0u8; 96 * 24 * 4]
+    expected := graphics.canvas(&mut expected_pixels, 96, 24, graphics.PixelFormat.Rgba8888)!
+    expected.clear(graphics.BLACK)
+    short.draw(&mut expected, 1, 1, text, 16, graphics.WHITE)
+    actual_pixels := [0u8; 96 * 24 * 4]
+    actual := graphics.canvas(&mut actual_pixels, 96, 24, graphics.PixelFormat.Rgba8888)!
+    actual.clear(graphics.BLACK)
+    long.draw(&mut actual, 1, 1, text, 16, graphics.WHITE)
+    assert(expected.equals(&actual))
+    actual.clear(graphics.BLACK)
+    first.draw(&mut actual, 1, 1, text, 16, graphics.WHITE)
+    assert(expected.equals(&actual))
+    actual.clear(graphics.BLACK)
+    second.draw(&mut actual, 1, 1, text, 16, graphics.WHITE)
+    assert(expected.equals(&actual))
 }
