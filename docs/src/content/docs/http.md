@@ -129,8 +129,8 @@ The wire grammar and framing follow [RFC 9112](https://www.rfc-editor.org/rfc/rf
 message semantics follow [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html),
 and URI components follow [RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html).
 The supported wire version is HTTP/1.1. HTTP/1.0 fallback, HTTP/2,
-HTTP/3/QUIC, WebSockets, cookies, multipart parsing, and compression are outside
-this package. Unknown content encodings are delivered as opaque body bytes.
+HTTP/3, WebSockets, cookies, multipart parsing, and compression are outside
+this package; the QUIC transport underneath HTTP/3 is in [`std/quic`](quic.md). Unknown content encodings are delivered as opaque body bytes.
 
 ## Types and ownership
 

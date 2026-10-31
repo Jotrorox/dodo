@@ -53,6 +53,10 @@ pub struct Chip {
     /// The standard library package `import "std/embedded/chip"` selects.
     pub package: &'static str,
     pub image: ImageFormat,
+    /// The version of the chip's programmable I/O blocks, which
+    /// `rp_pio.assemble` assembles for: 0 on the RP2040, 1 on the RP2350.
+    /// `None` for a chip without PIO, where the assembler is unavailable.
+    pub pio_version: Option<u8>,
     /// The USB IDs of the serial port the chip package's firmware can open,
     /// through which `dodo run` restarts the board into its bootloader.
     pub usb_serial: Option<serial::UsbId>,

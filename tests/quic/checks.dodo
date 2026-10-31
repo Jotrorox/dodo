@@ -1,0 +1,557 @@
+package quic_checks
+import "core/option"
+import "std/console"
+import "std/io"
+import "std/net"
+import "std/quic"
+import "std/quic/openssl"
+import "std/time/hosted"
+
+const CA: &[u8] = b"@@CA@@"
+const CERT: &[u8] = b"@@CERT@@"
+const KEY: &[u8] = b"@@KEY@@"
+const NOW: i64 = 0
+const ALPN: &[u8] = b"\x10rift-messaging/1"
+
+fn fail(code: i32) -> quic.Error {
+    return quic.failure(quic.ErrorKind.Backend, code)
+}
+fn loopback() -> net.SocketAddress {
+    return net.SocketAddress.new(net.IpAddress.v4(127, 0, 0, 1), 0)
+}
+fn client_config(hostname: &[u8]) -> openssl.Config from(hostname) {
+    config := openssl.Config.client(hostname, ALPN)
+    config.system_roots = false
+    config.trust_pem = CA
+    config.verification_time = NOW
+    return config
+}
+fn server_config() -> openssl.Config from(static) {
+    config := openssl.Config.server(CERT, KEY, ALPN)
+    config.verification_time = NOW
+    return config
+}
+fn bind(config: &openssl.Config) -> openssl.Listener!quic.Error {
+    address := loopback()
+    return openssl.Listener.bind(config, &address)
+}
+fn connect_to(config: &openssl.Config) -> openssl.Connection!quic.Error {
+    address := loopback()
+    return openssl.Connection.connect(config, &address)
+}
+fn spin(listener: &mut openssl.Listener, client: &mut openssl.Connection) -> void!quic.Error {
+    client.wait(1)?
+    listener.wait(1)?
+    return ok()
+}
+fn connect(listener: &openssl.Listener, config: &openssl.Config) -> openssl.Connection!quic.Error {
+    address := listener.local_address()?
+    target := net.SocketAddress.new(net.IpAddress.v4(127, 0, 0, 1), address.port)
+    return openssl.Connection.connect(config, &target)
+}
+// Completes both handshakes and returns the accepted server connection.
+// Like a real server, it skips accepted connections whose handshake failed,
+// such as one left queued by an earlier rejected client.
+fn establish(listener: &mut openssl.Listener, client: &mut openssl.Connection) -> openssl.Connection!quic.Error {
+    for i in 0usize..5000 {
+        state := client.handshake()?
+        match listener.accept()? {
+            some(server) => {
+                if settle(listener, client, &mut server)? {
+                    return ok(server)
+                }
+            }
+            none => {}
+        }
+        spin(listener, client)?
+    }
+    return err(fail(102))
+}
+fn settle(listener: &mut openssl.Listener, client: &mut openssl.Connection, server: &mut openssl.Connection) -> bool!quic.Error {
+    for i in 0usize..5000 {
+        client_state := client.handshake()?
+        match server.handshake() {
+            ok(server_state) => {
+                if client_state == quic.State.Ready && server_state == quic.State.Ready {
+                    return ok(true)
+                }
+            }
+            err(_) => {
+                return ok(false)
+            }
+        }
+        spin(listener, client)?
+    }
+    return err(fail(101))
+}
+// Both endpoints of one established connection over a loopback listener.
+struct Link {
+    listener: openssl.Listener
+    client: openssl.Connection
+    server: openssl.Connection
+    fn spin(&mut self) -> void!quic.Error {
+        return spin(&mut self.listener, &mut self.client)
+    }
+    fn accept_stream(&mut self, client: bool) -> openssl.Stream!quic.Error {
+        for i in 0usize..5000 {
+            accepted: Option<openssl.Stream> = none
+            if client {
+                accepted = self.client.accept_stream()?
+            } else {
+                accepted = self.server.accept_stream()?
+            }
+            match accepted {
+                some(stream) => {
+                    return ok(stream)
+                }
+                none => {}
+            }
+            self.spin()?
+        }
+        return err(fail(103))
+    }
+    fn open_stream(&mut self, client: bool, unidirectional: bool) -> openssl.Stream!quic.Error {
+        for i in 0usize..5000 {
+            opened: Option<openssl.Stream> = none
+            if client && unidirectional {
+                opened = self.client.open_unidirectional()?
+            } else if client {
+                opened = self.client.open_bidirectional()?
+            } else if unidirectional {
+                opened = self.server.open_unidirectional()?
+            } else {
+                opened = self.server.open_bidirectional()?
+            }
+            match opened {
+                some(stream) => {
+                    return ok(stream)
+                }
+                none => {}
+            }
+            self.spin()?
+        }
+        return err(fail(104))
+    }
+    // Reads until Finished into `destination`, returning the byte count.
+    fn receive_all(&mut self, stream: &mut openssl.Stream, destination: &mut[u8]) -> usize!quic.Error {
+        used := 0usize
+        for i in 0usize..20000 {
+            progress := stream.receive(&mut destination[used..])?
+            used += progress.transferred
+            if progress.state == quic.State.Finished {
+                return ok(used)
+            }
+            if used == destination.len {
+                return err(fail(105))
+            }
+            if progress.state == quic.State.Pending {
+                self.spin()?
+            }
+        }
+        return err(fail(106))
+    }
+    // Streams `total` bytes of a position-derived pattern from a small window
+    // to the server, which accepts and verifies it. Counts how often
+    // OpenSSL's bounded send buffer reported Pending.
+    fn transfer(&mut self, sender: &mut openssl.Stream, total: usize, pending: &mut usize) -> openssl.Stream!quic.Error {
+        window := [0u8; 4096]
+        for i in 0usize..4096 {
+            window[i] = (i % 251) as u8
+        }
+        sent := 0usize
+        received := 0usize
+        incoming: Option<openssl.Stream> = none
+        finished := false
+        for i in 0usize..200000 {
+            if sent < total {
+                start := sent % 251
+                end := start + 3800
+                if end - start > total - sent {
+                    end = start + total - sent
+                }
+                progress := sender.send(&window[start..end])?
+                sent += progress.transferred
+                if progress.state == quic.State.Pending {
+                    *pending += 1
+                }
+                if sent == total {
+                    sender.conclude()?
+                }
+            }
+            // The server reads only once the sender's buffer has filled.
+            if !present_ref(&incoming) && (*pending != 0 || sent == total) {
+                incoming = self.server.accept_stream()?
+            }
+            match &mut incoming {
+                some(stream) => {
+                    buffer := [0u8; 4096]
+                    progress := stream.receive(&mut buffer)?
+                    for j in 0usize..progress.transferred {
+                        if buffer[j] != ((received + j) % 251) as u8 {
+                            return err(fail(109))
+                        }
+                    }
+                    received += progress.transferred
+                    if progress.state == quic.State.Finished {
+                        finished = true
+                    }
+                }
+                none => {}
+            }
+            if finished {
+                break
+            }
+            self.spin()?
+        }
+        expect(finished && received == total, 120)?
+        match option.take(&mut incoming) {
+            some(stream) => {
+                return ok(stream)
+            }
+            none => {
+                return err(fail(108))
+            }
+        }
+    }
+    fn send_all(&mut self, stream: &mut openssl.Stream, source: &[u8]) -> void!quic.Error {
+        used := 0usize
+        for i in 0usize..20000 {
+            if used == source.len {
+                return ok()
+            }
+            progress := stream.send(&source[used..])?
+            used += progress.transferred
+            if progress.state == quic.State.Pending {
+                self.spin()?
+            }
+        }
+        return err(fail(107))
+    }
+}
+fn expect(condition: bool, code: i32) -> void!quic.Error {
+    if !condition {
+        return err(fail(code))
+    }
+    return ok()
+}
+fn present_ref<T>(value: &Option<T>) -> bool {
+    match value {
+        some(_) => {
+            return true
+        }
+        none => {
+            return false
+        }
+    }
+}
+fn present<T>(value: Option<T>) -> bool {
+    match value {
+        some(_) => {
+            return true
+        }
+        none => {
+            return false
+        }
+    }
+}
+fn expect_kind<T>(result: T!quic.Error, kind: quic.ErrorKind, code: i32) -> quic.Error!quic.Error {
+    match result {
+        err(reason) => {
+            if reason.kind != kind {
+                errors := console.stderr()
+                match errors.println(&reason) {
+                    ok(_) => {}, err(_) => {},
+                }
+                return err(fail(code))
+            }
+            return ok(reason)
+        }
+        ok(_) => {
+            return err(fail(code))
+        }
+    }
+}
+
+fn expect_failure(result: void!quic.Error, kind: quic.ErrorKind, code: i32) -> void!quic.Error {
+    match result {
+        ok() => {
+            return err(fail(code))
+        }
+        err(reason) => {
+            return expect(reason.kind == kind, code)
+        }
+    }
+}
+
+const PAYLOAD: usize = 1048576
+fn exchange() -> void!quic.Error {
+    defaults := server_config()
+    listener := bind(&defaults)?
+    bound := listener.local_address()?
+    expect(bound.port != 0, 110)?
+    config := client_config(b"localhost")
+    client := connect(&listener, &config)?
+    server := establish(&mut listener, &mut client)?
+    link := Link { listener: listener, client: client, server: server }
+    protocol := [0u8; 32]
+    length := link.client.selected_alpn(&mut protocol)?
+    expect(length == 16 && protocol[0] == 114 && protocol[15] == 49, 111)?
+    length = link.server.selected_alpn(&mut protocol)?
+    expect(length == 16, 112)?
+    source := link.client.local_address()?
+    expect(source.port != 0, 113)?
+    shared := link.server.local_address()?
+    expect(shared.port == bound.port, 114)?
+
+    // A bidirectional request larger than the stream buffers, then a reply.
+    request := link.open_stream(true, false)?
+    expect(request.id() == 0 && request.local() && request.readable() && request.writable(), 115)?
+    scratch := [0u8; 16]
+    match request.read(&mut scratch[..]) {
+        ok(_) => {
+            return err(fail(116))
+        }
+        err(reason) => {
+            expect(reason.kind == io.ErrorKind.WouldBlock, 116)?
+        }
+    }
+    expect(!present(request.take_error()), 117)?
+    // Larger than OpenSSL's 512 KiB stream send buffer: backpressure must
+    // surface as Pending while the peer drains the stream.
+    pending := 0usize
+    incoming := link.transfer(&mut request, PAYLOAD, &mut pending)?
+    expect(pending != 0, 121)?
+    request.conclude()?
+    expect_kind(request.send(b"late"), quic.ErrorKind.Closed, 118)?
+    expect(incoming.id() == 0 && !incoming.local() && incoming.writable(), 119)?
+    received := [0u8; 64]
+    link.send_all(&mut incoming, b"pong")?
+    incoming.conclude()?
+    count := link.receive_all(&mut request, &mut received)?
+    expect(count == 4 && received[0] == 112 && received[3] == 103, 122)?
+
+    // A server-initiated unidirectional stream, released right after FIN.
+    notice := link.open_stream(false, true)?
+    expect(notice.id() == 3 && !notice.readable(), 123)?
+    expect_kind(notice.receive(&mut scratch), quic.ErrorKind.InvalidInput, 124)?
+    link.send_all(&mut notice, b"notice")?
+    notice.conclude()?
+    notice.abort()
+    notice.abort()
+    expect_kind(notice.send(b"x"), quic.ErrorKind.Closed, 125)?
+    delivered := link.accept_stream(true)?
+    expect(delivered.readable() && !delivered.writable() && !delivered.local(), 126)?
+    expect_kind(delivered.send(b"x"), quic.ErrorKind.InvalidInput, 127)?
+    count = link.receive_all(&mut delivered, &mut received)?
+    expect(count == 6, 128)?
+
+    // A reset reaches the peer's reader with its application code.
+    abandoned := link.open_stream(true, false)?
+    link.send_all(&mut abandoned, b"partial")?
+    abandoned.reset(42)?
+    expect_failure(abandoned.reset(quic.MAX_CODE + 1), quic.ErrorKind.InvalidInput, 129)?
+    victim := link.accept_stream(false)?
+    reset := false
+    for i in 0usize..5000 {
+        match victim.poll_read(&mut received) {
+            ok(_) => {
+                link.spin()?
+            }
+            err(reason) => {
+                expect(reason.kind == io.ErrorKind.ConnectionReset, 130)?
+                match victim.take_error() {
+                    some(cause) => {
+                        expect(cause.kind == quic.ErrorKind.StreamReset && cause.application == 42, 131)?
+                        reset = true
+                        break
+                    }
+                    none => {
+                        return err(fail(132))
+                    }
+                }
+            }
+        }
+    }
+    expect(reset, 133)?
+
+    // Graceful application close is observed by the peer.
+    expect(!present(link.client.close_info()), 134)?
+    finished := false
+    for i in 0usize..5000 {
+        if link.client.close(7)? == quic.State.Finished {
+            finished = true
+            break
+        }
+        link.spin()?
+    }
+    expect(finished, 135)?
+    observed := false
+    for i in 0usize..5000 {
+        match link.server.close_info() {
+            some(info) => {
+                expect(info.code == 7 && !info.local && !info.transport, 136)?
+                observed = true
+                break
+            }
+            none => {}
+        }
+        link.listener.wait(1)?
+    }
+    expect(observed, 137)?
+    closed := expect_kind(link.server.accept_stream(), quic.ErrorKind.ConnectionClosed, 138)?
+    expect(closed.application == 7, 139)?
+    match link.client.close_info() {
+        some(info) => {
+            expect(info.local && info.code == 7, 140)?
+        }
+        none => {
+            return err(fail(141))
+        }
+    }
+    link.client.abort()
+    link.client.abort()
+    expect_kind(link.client.handshake(), quic.ErrorKind.Closed, 142)?
+    return ok()
+}
+fn rejections() -> void!quic.Error {
+    defaults := server_config()
+    listener := bind(&defaults)?
+    taken := listener.local_address()?
+    expect_kind(openssl.Listener.bind(&defaults, &taken), quic.ErrorKind.Network, 150)?
+
+    wrong := client_config(b"example.com")
+    client := connect(&listener, &wrong)?
+    expect_kind(establish(&mut listener, &mut client), quic.ErrorKind.VerificationFailed, 151)?
+
+    untrusted := client_config(b"localhost")
+    untrusted.trust_pem = b""
+    client = connect(&listener, &untrusted)?
+    expect_kind(establish(&mut listener, &mut client), quic.ErrorKind.VerificationFailed, 152)?
+
+    expired := client_config(b"localhost")
+    expired.verification_time = NOW + 30 * 86400
+    client = connect(&listener, &expired)?
+    expect_kind(establish(&mut listener, &mut client), quic.ErrorKind.VerificationFailed, 153)?
+
+    mismatch := client_config(b"localhost")
+    mismatch.alpn = b"\x02h3"
+    client = connect(&listener, &mismatch)?
+    expect_kind(establish(&mut listener, &mut client), quic.ErrorKind.ConnectionClosed, 154)?
+    match client.close_info() {
+        some(info) => {
+            expect(info.transport && info.code == 376, 155)?
+        }
+        none => {
+            return err(fail(156))
+        }
+    }
+
+    // A port without a listener refuses the connected socket promptly.
+    vacated := bind(&defaults)?
+    gone := vacated.local_address()?
+    vacated.abort()
+    config := client_config(b"localhost")
+    client = openssl.Connection.connect(&config, &gone)?
+    refused := false
+    for i in 0usize..2000 {
+        match client.handshake() {
+            ok(_) => {}
+            err(reason) => {
+                expect(reason.kind == quic.ErrorKind.ConnectionClosed, 147)?
+                refused = true
+                break
+            }
+        }
+        client.wait(1)?
+    }
+    expect(refused, 148)?
+
+    client = connect(&listener, &config)?
+    expect_kind(client.handshake_until(5, 5, false), quic.ErrorKind.TimedOut, 157)?
+    expect_kind(client.handshake(), quic.ErrorKind.Closed, 158)?
+    client = connect(&listener, &config)?
+    expect_kind(client.handshake_until(0, 5, true), quic.ErrorKind.Cancelled, 159)?
+    return ok()
+}
+fn mutual() -> void!quic.Error {
+    required := server_config()
+    required.require_client_certificate = true
+    required.trust_pem = CA
+    listener := bind(&required)?
+    anonymous := client_config(b"localhost")
+    client := connect(&listener, &anonymous)?
+    expect_kind(establish(&mut listener, &mut client), quic.ErrorKind.ConnectionClosed, 160)?
+    identified := client_config(b"localhost")
+    identified.certificate_pem = CERT
+    identified.private_key_pem = KEY
+    client = connect(&listener, &identified)?
+    server := establish(&mut listener, &mut client)?
+    return ok()
+}
+fn idle() -> void!quic.Error {
+    defaults := server_config()
+    listener := bind(&defaults)?
+    config := client_config(b"127.0.0.1")
+    config.idle_timeout_ms = 200
+    client := connect(&listener, &config)?
+    server := establish(&mut listener, &mut client)?
+    expect(present(client.timeout_ms()), 170)?
+    clock := hosted.MonotonicClock.new()
+    start := clock.now_ms()
+    for clock.now_ms() - start < 5000 {
+        match client.close_info() {
+            some(info) => {
+                expect(info.local && clock.now_ms() - start >= 150, 171)?
+                return ok()
+            }
+            none => {}
+        }
+        client.wait(10)?
+    }
+    return err(fail(172))
+}
+fn invalid() -> void!quic.Error {
+    empty := client_config(b"localhost")
+    empty.alpn = b""
+    expect_kind(connect_to(&empty), quic.ErrorKind.InvalidInput, 180)?
+    malformed := client_config(b"localhost")
+    malformed.alpn = b"\x05h3"
+    expect_kind(connect_to(&malformed), quic.ErrorKind.InvalidInput, 181)?
+    anonymous := client_config(b"")
+    expect_kind(connect_to(&anonymous), quic.ErrorKind.InvalidInput, 182)?
+    server := server_config()
+    server.idle_timeout_ms = 1000
+    expect_kind(bind(&server), quic.ErrorKind.InvalidInput, 183)?
+    keyless := openssl.Config.server(CERT, b"", ALPN)
+    expect_kind(bind(&keyless), quic.ErrorKind.InvalidInput, 184)?
+    scoped := net.SocketAddress.new(net.IpAddress.v4(127, 0, 0, 1), 1)
+    scoped.scope_id = 3
+    plain := client_config(b"localhost")
+    expect_kind(openssl.Connection.connect(&plain, &scoped), quic.ErrorKind.InvalidInput, 185)?
+    return ok()
+}
+fn run() -> void!quic.Error {
+    invalid()?
+    exchange()?
+    rejections()?
+    mutual()?
+    idle()?
+    return ok()
+}
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }
+        err(reason) => {
+            if reason.kind == quic.ErrorKind.Backend && reason.code >= 100 && reason.code < 200 {
+                return reason.code - 100
+            }
+            errors := console.stderr()
+            match errors.println(&reason) {
+                ok(_) => {}, err(_) => {},
+            }
+            return 99
+        }
+    }
+}

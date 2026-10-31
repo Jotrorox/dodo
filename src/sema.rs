@@ -1,8 +1,6 @@
-//! Name resolution, type checking, ownership, and conservative borrow checking.
-//!
-//! Loans carry their source places through references and aggregates. Liveness is
-//! based on future uses, extended across loop back edges and custom destruction.
-//! This is an intentionally conservative checker, not a formal safety proof.
+//! Name resolution and type checking. Each successfully checked body is then
+//! checked for ownership (initialization, moves, loans, destruction order,
+//! and Result obligations) on its control-flow graph by `flow`.
 use crate::ast::*;
 use crate::diagnostic::{Diagnostic, DiagnosticBinding, DiagnosticKind, MissingErrorVariant};
 use std::collections::{HashMap, HashSet};
@@ -18,56 +16,29 @@ mod interfaces;
 mod ownership;
 mod slices;
 mod storage;
-mod uses;
 
 use generics::{instantiate, intrinsic_result_type, source_spelling};
 #[cfg(feature = "llvm")]
 pub(crate) use interfaces::flattened_interfaces;
 pub(crate) use interfaces::signature_text as interface_signature;
 use interfaces::{InterfaceInfo, Obligation};
-use ownership::{
-    Access, Loan, Place, Value, Variable, incompatible, merge_states, overlaps, static_loan,
-};
-use uses::{binding_use_spans, names_block, names_expr, names_stmt};
+use ownership::{Place, Value, Variable};
 
 type Check<T> = Result<T, Diagnostic>;
-
-// Private body-checker selection, used only by the developer comparison helper.
-// Every compiler entry point below always uses Combined.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CheckMode {
-    AstOnly,
-    FlowOnly,
-    Combined,
-}
 
 pub fn check(program: &mut Program) -> Check<()> {
     check_for_target(program, 64)
 }
 
 pub fn check_for_target(program: &mut Program, pointer_bits: u32) -> Check<()> {
-    check_program(
-        program,
-        pointer_bits,
-        false,
-        &mut Vec::new(),
-        CheckMode::Combined,
-        None,
-    )
+    check_program(program, pointer_bits, false, &mut Vec::new(), None)
 }
 
 /// Check independent bodies after an error without reusing failed borrow state.
 /// Errors in shared declarations/preparation still stop checking that program.
 pub fn check_recovering(program: &mut Program, pointer_bits: u32) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    if let Err(error) = check_program(
-        program,
-        pointer_bits,
-        true,
-        &mut diagnostics,
-        CheckMode::Combined,
-        None,
-    ) {
+    if let Err(error) = check_program(program, pointer_bits, true, &mut diagnostics, None) {
         diagnostics.push(error);
     }
     diagnostics
@@ -133,8 +104,7 @@ fn check_program(
     pointer_bits: u32,
     recover: bool,
     diagnostics: &mut Vec<Diagnostic>,
-    mode: CheckMode,
-    mut report: Option<&mut Option<flow::CoverageReport>>,
+    report: Option<&mut Option<Vec<flow::BodyReport>>>,
 ) -> Check<()> {
     aliases::resolve(program)?;
     crate::prepare::prepare(program, pointer_bits)?;
@@ -177,7 +147,7 @@ fn check_program(
                     "a `const` cannot hold an atomic: each use would be a separate copy; declare shared storage with `static`",
                 ));
             }
-            let mut checker = Checker::new(&context, Type::Void, vec![], HashMap::new());
+            let mut checker = Checker::new(&context, Type::Void);
             checker.namespace = context.function_namespace(&constant.name);
             checker.function_name = constant.name.clone();
             let value = checker.expr(&mut constant.value, Some(&constant.ty), true);
@@ -201,85 +171,16 @@ fn check_program(
             diagnostics.push(error);
         }
     }
-    // First adoption stage: an additional initialization/move check for bodies
-    // fully covered by the adapter. Lower before AST checking mutates bodies;
-    // unsupported bodies keep the existing checker, and its diagnostics win.
-    // Keep only the first diagnostic per body in normal checking. Developer
-    // reports retain findings and limitations, never graphs/fixed-point states.
-    // Measure here, after preparation/instantiation, not on the original parse.
-    let flow_diagnostics: Vec<_> = if mode == CheckMode::AstOnly {
-        (0..program.functions.len()).map(|_| None).collect()
-    } else {
-        use flow::{BodyStatus, SkipScope};
-        let flow_adapter = flow::Adapter::new(program, pointer_bits);
-        if let Some(report) = report.as_deref_mut() {
-            *report = Some(flow::CoverageReport::default());
-        }
-        program
-            .functions
-            .iter()
-            .map(|function| {
-                let status = if function.body.is_none() {
-                    BodyStatus::NoBody
-                } else if context.functions[&function.name].unavailable {
-                    BodyStatus::Unavailable
-                } else {
-                    match &flow_adapter {
-                        Err(limitation) => BodyStatus::Skipped {
-                            scope: SkipScope::Program,
-                            limitation: limitation.clone(),
-                        },
-                        Ok(adapter) => match adapter.lower_function(function) {
-                            Err(limitation) => BodyStatus::Skipped {
-                                scope: SkipScope::Body,
-                                limitation,
-                            },
-                            Ok(body) => {
-                                let issues = body.initialization().issues;
-                                if issues.is_empty() {
-                                    BodyStatus::Analyzed
-                                } else {
-                                    BodyStatus::Diagnostics(issues)
-                                }
-                            }
-                        },
-                    }
-                };
-                let diagnostic = status.diagnostic();
-                if let Some(Some(report)) = report.as_deref_mut() {
-                    report.bodies.push(flow::BodyReport {
-                        name: function.name.clone(),
-                        span: function.span,
-                        status,
-                    });
-                }
-                diagnostic
-            })
-            .collect()
-    };
-    if mode == CheckMode::FlowOnly {
-        diagnostics.extend(flow_diagnostics.into_iter().flatten());
-        return Ok(());
-    }
-    for (function, flow_diagnostic) in program.functions.iter_mut().zip(flow_diagnostics) {
+    // Bodies whose AST check failed are not analyzed for ownership.
+    let mut failed = HashSet::new();
+    for function in program.functions.iter_mut() {
         if function.body.is_none() || context.functions[&function.name].unavailable {
             continue;
         }
         let result = (|| {
-            let mut uses = HashMap::new();
-            names_block(function.body.as_ref().unwrap(), &mut uses);
-            let mut checker = Checker::new(
-                &context,
-                function.ret.clone(),
-                context.functions[&function.name].from.clone(),
-                uses,
-            );
-            checker.stores = function.stores.clone();
+            let mut checker = Checker::new(&context, function.ret.clone());
             checker.recover = recover;
             checker.namespace = context.function_namespace(&function.name);
-            checker.binding_uses = binding_use_spans(function);
-            checker.return_contract = Some(function.from_span.unwrap_or(function.ret_span));
-            checker.inferred_contract = function.from_span.is_none();
             checker.function_name = function.name.clone();
             checker.imported = function.imported;
             for parameter in &function.params {
@@ -299,9 +200,8 @@ fn check_program(
                     ),
                 ));
             }
-            checker.finish_scope(function.span)?;
-            if !had_errors && let Some(diagnostic) = flow_diagnostic {
-                return Err(diagnostic);
+            if had_errors {
+                failed.insert(function.name.clone());
             }
             Ok(())
         })();
@@ -309,6 +209,7 @@ fn check_program(
             if !recover {
                 return Err(error);
             }
+            failed.insert(function.name.clone());
             diagnostics.push(error);
         }
     }
@@ -326,12 +227,34 @@ fn check_program(
     }
     unique.reverse();
     program.functions.extend(unique);
+    // Ownership: every successfully checked body, including lifted closures.
+    let mut bodies = report.as_ref().map(|_| Vec::new());
+    for function in &program.functions {
+        let enclosing = function.name.split('#').next().unwrap_or(&function.name);
+        if function.body.is_none() || failed.contains(enclosing) {
+            continue;
+        }
+        let body = flow::lower(&context, function);
+        let findings = flow::analyze(&context, &body);
+        if let Some(bodies) = &mut bodies {
+            bodies.push(flow::body_report(function, &findings));
+        }
+        if let Some(diagnostic) = findings.diagnostics.into_iter().next() {
+            if !recover {
+                return Err(diagnostic);
+            }
+            diagnostics.push(diagnostic);
+        }
+    }
+    if let Some(report) = report {
+        *report = bodies;
+    }
     Ok(())
 }
 
 pub(crate) fn array_length(expression: &mut Expr, bits: u32) -> Check<usize> {
     let context = Context::new(&Program::default(), bits)?;
-    let mut checker = Checker::new(&context, Type::Void, vec![], HashMap::new());
+    let mut checker = Checker::new(&context, Type::Void);
     let value = checker.expr(expression, None, false)?;
     if !value.ty.is_integer() || !constant_expression(expression) {
         return Err(Diagnostic::new(
@@ -927,22 +850,9 @@ impl Context {
 }
 
 #[derive(Clone)]
-struct LoopUse {
-    span: Span,
-    implicit: bool,
-}
-#[derive(Clone)]
-struct LoopState {
-    depth: usize,
-    breaks: Option<Vec<Vec<Variable>>>,
-    continues: Option<Vec<Vec<Variable>>>,
-}
-#[derive(Clone)]
 struct YieldContext {
     expected: Option<Type>,
-    depth: usize,
-    values: Vec<Value>,
-    states: Vec<Vec<Vec<Variable>>>,
+    yielded: bool,
 }
 #[derive(Clone)]
 struct Checker<'a> {
@@ -951,71 +861,44 @@ struct Checker<'a> {
     context: &'a Context,
     scopes: Vec<Vec<Variable>>,
     next_id: usize,
-    next_partition: usize,
     return_ty: Type,
-    from: Vec<String>,
-    stores: Vec<String>,
-    return_contract: Option<Span>,
-    inferred_contract: bool,
-    uses: HashMap<String, Span>,
-    binding_uses: HashMap<(usize, String), Span>,
+    /// Start of the statement being checked.
     position: usize,
     unsafe_depth: usize,
-    loops: Vec<LoopState>,
-    storage_loops: std::cell::RefCell<Vec<storage::StorageLoop>>,
-    temporary: Vec<Loan>,
-    protected: Vec<Loan>,
+    loops: usize,
     yields: Vec<YieldContext>,
-    loop_uses: Vec<HashMap<String, LoopUse>>,
     namespace: String,
     guard_depth: usize,
-    expression_deps: HashMap<(usize, usize), Vec<Loan>>,
     // Closure lowering: the enclosing function, the lifted bodies, and, while
-    // checking a closure body, which environment references were mutated.
+    // checking a closure body, its environment references and which of them
+    // were mutated.
     function_name: String,
     imported: bool,
     closures: Vec<Function>,
     inlined_constant: usize,
-    capture_roots: HashMap<usize, String>,
+    captures: HashSet<String>,
     mutated_captures: std::cell::RefCell<HashSet<String>>,
 }
 impl<'a> Checker<'a> {
-    fn new(
-        context: &'a Context,
-        return_ty: Type,
-        from: Vec<String>,
-        uses: HashMap<String, Span>,
-    ) -> Self {
+    fn new(context: &'a Context, return_ty: Type) -> Self {
         Self {
             recover: false,
             diagnostics: vec![],
             context,
             scopes: vec![vec![]],
             next_id: 1,
-            next_partition: 1,
             return_ty,
-            from,
-            stores: vec![],
-            return_contract: None,
-            inferred_contract: false,
-            uses,
-            binding_uses: HashMap::new(),
             position: 0,
             unsafe_depth: 0,
-            loops: vec![],
-            storage_loops: std::cell::RefCell::new(vec![]),
-            temporary: vec![],
-            protected: vec![],
+            loops: 0,
             yields: vec![],
-            loop_uses: vec![],
             namespace: String::new(),
             guard_depth: 0,
-            expression_deps: HashMap::new(),
             function_name: String::new(),
             imported: false,
             closures: vec![],
             inlined_constant: 0,
-            capture_roots: HashMap::new(),
+            captures: HashSet::new(),
             mutated_captures: std::cell::RefCell::new(HashSet::new()),
         }
     }
@@ -1029,9 +912,6 @@ impl<'a> Checker<'a> {
     fn by_id(&self, id: usize) -> Option<&Variable> {
         self.scopes.iter().flatten().find(|v| v.id == id)
     }
-    fn by_id_mut(&mut self, id: usize) -> Option<&mut Variable> {
-        self.scopes.iter_mut().flatten().find(|v| v.id == id)
-    }
     fn diagnostic_binding(&self, place: &Place, usage: Span) -> Option<Box<DiagnosticBinding>> {
         let variable = self.by_id(place.direct?)?;
         Some(Box::new(DiagnosticBinding {
@@ -1040,14 +920,7 @@ impl<'a> Checker<'a> {
             usage,
         }))
     }
-    fn bind(
-        &mut self,
-        name: String,
-        ty: Type,
-        deps: Option<Vec<Loan>>,
-        immutable: bool,
-        span: Span,
-    ) -> Check<()> {
+    fn bind(&mut self, name: String, ty: Type, immutable: bool, span: Span) -> Check<()> {
         if name == "_" {
             if matches!(ty, Type::Result(..)) {
                 return Err(Diagnostic::new(
@@ -1066,72 +939,25 @@ impl<'a> Checker<'a> {
                 format!("duplicate binding `{name}` in this scope"),
             ));
         }
-        let initialized = deps.is_some();
-        let pending_result = initialized && self.context.contains_result(&ty);
         let variable = Variable {
             id: self.next_id,
-            last_use: self.uses.get(&name).map_or(span.end, |span| span.start),
-            last_use_span: self.binding_uses.get(&(span.start, name.clone())).copied(),
             name,
             ty,
-            initialized,
-            moved_at: None,
             immutable,
-            deps: deps.unwrap_or_default(),
             span,
-            pending_result,
         };
         self.next_id += 1;
         self.scopes.last_mut().unwrap().push(variable);
         Ok(())
     }
-    /// Bind a parameter whose borrows come from the caller.
     fn bind_parameter(&mut self, name: &str, ty: &Type, span: Span) -> Check<()> {
-        let context = self.context;
-        let id = self.next_id;
-        let stored = context.contains_storage_witness(ty);
-        let borrowed = matches!(ty, Type::Ref(..) | Type::Slice(..));
-        let mut deps = if context.carries_borrow(ty) {
-            vec![Loan {
-                stored: stored && !borrowed,
-                dependency: false,
-                root: usize::MAX / 2 + id,
-                fields: vec![],
-                partitions: vec![],
-                mutable: context.carries_mutable_borrow(ty),
-                origin: span,
-                via: vec![],
-                external: Some(name.to_owned()),
-            }]
-        } else {
-            vec![]
-        };
-        if let Type::Ref(_, inner) | Type::Slice(_, inner) = ty
-            && stored
-            && context.carries_borrow(inner)
-        {
-            deps.push(Loan {
-                stored: true,
-                dependency: true,
-                root: usize::MAX / 4 + id,
-                fields: vec![],
-                partitions: vec![],
-                mutable: context.carries_mutable_borrow(inner),
-                origin: span,
-                via: vec![],
-                external: Some(format!("{name}.stored")),
-            });
-        }
-        self.bind(name.to_owned(), ty.clone(), Some(deps), false, span)
+        self.bind(name.to_owned(), ty.clone(), false, span)
     }
-    fn live(&self, v: &Variable) -> bool {
-        v.initialized
-            && (v.last_use >= self.position
-                || self.context.has_drop(&v.ty)
-                || self
-                    .loop_uses
-                    .iter()
-                    .any(|names| names.contains_key(&v.name)))
+    /// Inside a closure body, record a captured binding reached mutably.
+    fn note_capture_mutation(&self, place: &Place) {
+        if let Some(name) = &place.capture {
+            self.mutated_captures.borrow_mut().insert(name.clone());
+        }
     }
     fn expect(&self, expected: &Type, actual: &Type, span: Span) -> Check<()> {
         if expected != actual {
@@ -1142,52 +968,6 @@ impl<'a> Checker<'a> {
         } else {
             Ok(())
         }
-    }
-    /// Every loan in a returned value must come from the return contract.
-    fn check_returned_borrows(&self, deps: &[Loan], return_span: Span) -> Check<()> {
-        for loan in deps {
-            match &loan.external {
-                Some(source)
-                    if self.from.contains(source)
-                        || source == "static"
-                        || source
-                            .strip_suffix(".stored")
-                            .is_some_and(|s| self.from.iter().any(|f| f == s)) => {}
-                Some(source) => {
-                    let source_span = self.scopes[0]
-                        .iter()
-                        .find(|variable| &variable.name == source)
-                        .map_or(loan.origin, |variable| variable.span);
-                    return Err(self.label_return_contract(
-                        Diagnostic::new(
-                            return_span,
-                            format!(
-                                "returned borrow depends on `{source}`, outside the return contract"
-                            ),
-                        )
-                        .primary_label(format!("returned borrow comes from `{source}`"))
-                        .label(
-                            source_span,
-                            format!("borrowed source `{source}` is declared here"),
-                        ),
-                    ));
-                }
-                None => {
-                    let mut diagnostic =
-                        Diagnostic::new(return_span, "cannot return a borrow of a local value")
-                            .primary_label("local value does not live long enough to be returned")
-                            .label(loan.origin, "local borrow begins here");
-                    if let Some(source) = self.by_id(loan.root) {
-                        diagnostic = diagnostic.label(
-                            source.span,
-                            format!("local value `{}` is declared here", source.name),
-                        );
-                    }
-                    return Err(self.label_return_contract(diagnostic));
-                }
-            }
-        }
-        Ok(())
     }
     /// `?` propagates a `source` error from a function returning `target`
     /// errors by wrapping it in the one `target` variant carrying a `source`.
@@ -1263,208 +1043,6 @@ impl<'a> Checker<'a> {
             Ok(())
         }
     }
-    fn conflict(&self, place: &Loan, access: Access, span: Span) -> Check<()> {
-        if matches!(access, Access::Write | Access::Move | Access::Borrow(true)) {
-            self.note_capture_mutation(std::slice::from_ref(place));
-        }
-        if self.guard_depth > 0
-            && matches!(access, Access::Write | Access::Move | Access::Borrow(true))
-        {
-            return Err(Diagnostic::new(
-                span,
-                "match guards cannot move values, mutate storage, or borrow mutably",
-            ));
-        }
-        let access = if place.dependency {
-            match access {
-                Access::Read | Access::Borrow(false) => Access::Borrow(false),
-                _ => Access::Borrow(place.mutable),
-            }
-        } else {
-            access
-        };
-        if !place.dependency
-            && matches!(access, Access::Write | Access::Move | Access::Borrow(true))
-        {
-            for state in self.storage_loops.borrow_mut().iter_mut() {
-                state.accesses.push((place.clone(), span));
-            }
-        }
-        for variable in self.scopes.iter().flatten().filter(|v| self.live(v)) {
-            if place.via.contains(&variable.id) {
-                continue;
-            }
-            for loan in &variable.deps {
-                if overlaps(place, loan) && incompatible(access, loan.mutable) {
-                    let kind = if loan.mutable { "mutable" } else { "shared" };
-                    let diagnostic = Diagnostic::new(
-                        span,
-                        format!(
-                            "access conflicts with a live {kind} borrow held by `{}`",
-                            variable.name
-                        ),
-                    )
-                    .primary_label(self.access_label(place, access))
-                    .label(loan.origin, format!("{kind} borrow begins here"));
-                    return Err(self.label_live_borrow(diagnostic, variable, span)
-                        .note("end the borrow's uses before this access, or borrow disjoint struct fields"));
-                }
-            }
-        }
-        for loan in self.temporary.iter().chain(&self.protected) {
-            if overlaps(place, loan) && incompatible(access, loan.mutable) {
-                return Err(Diagnostic::new(
-                    span,
-                    "overlapping borrows within the same expression",
-                )
-                .primary_label(self.access_label(place, access))
-                .label(
-                    loan.origin,
-                    format!(
-                        "{} borrow begins here and remains live for this expression",
-                        if loan.mutable { "mutable" } else { "shared" }
-                    ),
-                ));
-            }
-        }
-        Ok(())
-    }
-    /// Inside a closure body, record captured bindings reached mutably.
-    fn note_capture_mutation(&self, loans: &[Loan]) {
-        if self.capture_roots.is_empty() {
-            return;
-        }
-        for loan in loans {
-            if let Some(name) = self.capture_roots.get(&loan.root) {
-                self.mutated_captures.borrow_mut().insert(name.clone());
-            }
-        }
-    }
-    fn access_label(&self, place: &Loan, access: Access) -> String {
-        let name = self.by_id(place.root).map_or_else(
-            || {
-                if let Some(name) = place.fields.first().and_then(|f| f.strip_prefix("static ")) {
-                    return format!("static `{}`", source_spelling(name));
-                }
-                place
-                    .external
-                    .clone()
-                    .unwrap_or_else(|| "this value".into())
-            },
-            |variable| format!("`{}`", variable.name),
-        );
-        let operation = match access {
-            Access::Read => "read",
-            Access::Write => "modify",
-            Access::Move => "move",
-            Access::Borrow(false) => "borrow",
-            Access::Borrow(true) => "mutably borrow",
-        };
-        format!("cannot {operation} {name} while this borrow is live")
-    }
-    fn label_live_borrow(
-        &self,
-        diagnostic: Diagnostic,
-        variable: &Variable,
-        access: Span,
-    ) -> Diagnostic {
-        if let Some(span) = variable
-            .last_use_span
-            .filter(|span| span.start >= access.end)
-        {
-            diagnostic.label(span, "borrow is used here")
-        } else if let Some(usage) = self
-            .loop_uses
-            .iter()
-            .rev()
-            .find_map(|uses| uses.get(&variable.name))
-        {
-            if usage.implicit {
-                diagnostic.label(usage.span, "borrow remains live for this iteration")
-            } else if variable.last_use_span == Some(usage.span) {
-                diagnostic.label(usage.span, "borrow is used here on a later loop iteration")
-            } else {
-                diagnostic.label(
-                    variable.span,
-                    "borrow remains live under conservative loop checking",
-                )
-            }
-        } else if self.context.has_drop(&variable.ty) {
-            diagnostic.label(
-                variable.span,
-                format!(
-                    "borrow may be used when `{}` is destroyed at scope exit",
-                    variable.name
-                ),
-            )
-        } else if let Some(span) = variable
-            .last_use_span
-            .filter(|span| span.start >= self.position)
-        {
-            diagnostic.label(span, "borrow is used here in the same statement")
-        } else {
-            diagnostic.label(
-                variable.span,
-                format!("borrow is held by `{}`", variable.name),
-            )
-        }
-    }
-    fn label_return_contract(&self, diagnostic: Diagnostic) -> Diagnostic {
-        if let Some(span) = self.return_contract {
-            diagnostic.label(
-                span,
-                format!(
-                    "{}return contract allows borrows from({})",
-                    if self.inferred_contract {
-                        "inferred "
-                    } else {
-                        ""
-                    },
-                    self.from.join(", ")
-                ),
-            )
-        } else {
-            diagnostic
-        }
-    }
-    fn finish_scope(&mut self, span: Span) -> Check<()> {
-        let departing: HashSet<_> = self.scopes.last().unwrap().iter().map(|v| v.id).collect();
-        self.check_drop_order(span)?;
-        for variable in self.scopes.last().unwrap() {
-            if variable.initialized && variable.pending_result {
-                return Err(Diagnostic::new(
-                    variable.span,
-                    format!("Result `{}` is never handled", variable.name),
-                )
-                .note("match both variants, return the Result, propagate it with `?`, or unwrap it with `!`"));
-            }
-        }
-        for variable in self
-            .scopes
-            .iter()
-            .take(self.scopes.len().saturating_sub(1))
-            .flatten()
-            .filter(|v| self.live(v))
-        {
-            if let Some(loan) = variable
-                .deps
-                .iter()
-                .find(|d| departing.contains(&d.root) && d.external.is_none())
-            {
-                let diagnostic = Diagnostic::new(
-                    span,
-                    format!(
-                        "borrow in `{}` outlives its source in this scope",
-                        variable.name
-                    ),
-                )
-                .primary_label("borrowed source cannot outlive this scope")
-                .label(loan.origin, "borrow begins here");
-                return Err(self.label_live_borrow(diagnostic, variable, span));
-            }
-        }
-        Ok(())
-    }
     fn block(&mut self, block: &mut Block, scoped: bool) -> Check<bool> {
         if scoped {
             self.scopes.push(vec![]);
@@ -1475,11 +1053,9 @@ impl<'a> Checker<'a> {
                 return Err(Diagnostic::new(statement.span, "unreachable statement"));
             }
             self.position = statement.span.start;
-            self.expression_deps.clear();
-            self.temporary.clear();
-            // Editor-only transaction: a failed statement may have moved values,
-            // created loans, or pushed scopes. Restore all checker state before
-            // considering the next independent statement. Strict builds never clone.
+            // Editor-only transaction: a failed statement may have pushed
+            // scopes or bindings. Restore all checker state before considering
+            // the next independent statement. Strict builds never clone.
             let checkpoint = self.recover.then(|| self.clone());
             match self.statement(statement) {
                 Ok(ends) => terminated = ends,
@@ -1491,13 +1067,8 @@ impl<'a> Checker<'a> {
                     self.diagnostics.push(error);
                 }
             }
-            self.temporary.clear();
         }
         if scoped {
-            self.finish_scope(Span {
-                start: self.position,
-                end: self.position,
-            })?;
             self.scopes.pop();
         }
         Ok(terminated)
@@ -1587,7 +1158,7 @@ impl<'a> Checker<'a> {
                 if *ty != Type::Unknown {
                     self.context.validate_type(ty, span, false)?;
                 }
-                let deps = if let Some(expression) = value {
+                if let Some(expression) = value {
                     let expected = (*ty != Type::Unknown).then(|| ty.clone());
                     let value = self.expr(expression, expected.as_ref(), true)?;
                     if *ty == Type::Unknown {
@@ -1607,7 +1178,6 @@ impl<'a> Checker<'a> {
                         }
                         validate_constant(expression, self.context.pointer_bits)?;
                     }
-                    Some(value.deps)
                 } else {
                     if *ty == Type::Unknown {
                         return Err(Diagnostic::new(
@@ -1621,9 +1191,8 @@ impl<'a> Checker<'a> {
                             "const binding requires an initializer",
                         ));
                     }
-                    None
-                };
-                self.bind(name.clone(), ty.clone(), deps, !*mutable, span)?;
+                }
+                self.bind(name.clone(), ty.clone(), !*mutable, span)?;
             }
             StmtKind::Assign { target, op, value } => {
                 if self.guard_depth > 0 {
@@ -1640,7 +1209,7 @@ impl<'a> Checker<'a> {
                     }
                     return Ok(false);
                 }
-                let place = self.place(target, op.is_some())?;
+                let place = self.place(target)?;
                 if !place.mutable {
                     return Err(Diagnostic::new(
                         target.span,
@@ -1650,75 +1219,32 @@ impl<'a> Checker<'a> {
                         self.diagnostic_binding(&place, target.span),
                     )));
                 }
-                for loan in &place.loans {
-                    self.conflict(loan, Access::Write, target.span)?;
-                }
+                self.note_capture_mutation(&place);
                 self.check_split_field_assignment(target)?;
-                // Codegen captures the destination address before evaluating the
-                // RHS. Keep projected storage alive even across value-block
-                // statements, whose temporary loans are cleared. A shared
-                // reservation permits reads and disjoint field edits, but not
-                // moving or replacing the owner of the captured destination.
-                // Whole bindings can be moved and reinitialized: their drop
-                // flags track whether an old value still needs destruction.
-                let protected_len = self.protected.len();
-                if place.direct.is_none() {
-                    self.protected
-                        .extend(place.loans.iter().cloned().map(|mut loan| {
-                            loan.mutable = false;
-                            loan.origin = target.span;
-                            loan
-                        }));
-                }
-                let val = self.expr(value, Some(&place.ty), true);
-                self.protected.truncate(protected_len);
-                let val = val?;
+                let val = self.expr(value, Some(&place.ty), true)?;
                 self.expect(&place.ty, &val.ty, value.span)?;
                 if let Some(binary) = op {
                     self.binary_type(*binary, &place.ty, span)?;
                 }
-                let pending_result = self.context.contains_result(&place.ty);
-                if let Some(id) = place.direct {
-                    let variable = self.by_id_mut(id).unwrap();
-                    if variable.initialized && variable.pending_result {
-                        return Err(Diagnostic::new(span, "overwriting an unhandled Result"));
-                    }
-                    variable.initialized = true;
-                    variable.moved_at = None;
-                    variable.deps = val.deps;
-                    variable.pending_result = pending_result;
-                } else if pending_result {
-                    // Handling state belongs to a whole local Variable. A field,
-                    // index, or dereference has no independent obligation state;
-                    // external storage may not have a local owner at all. Neither
-                    // overwriting its old Result nor publishing a new one can be
-                    // checked here, even if the caller previously matched it.
+                if place.direct.is_none() && self.context.contains_result(&place.ty) {
+                    // Handling state belongs to a whole binding. A field, index,
+                    // or dereference has no independent obligation state;
+                    // external storage may not have a local owner at all.
                     return Err(Diagnostic::new(
                         span,
                         "assigning Result-containing values through a field, index, or reference is unsupported",
                     )
                     .note("handle the old Result and replace the whole owned binding so the new handling obligation can be tracked"));
-                } else if self.context.carries_borrow(&place.ty) {
-                    // Field replacement may narrow an aggregate's lifetime, never erase
-                    // its existing conservative dependency set.
-                    for loan in &place.loans {
-                        // External parameter storage has no local Variable entry.
-                        // Checking only inside by_id_mut silently accepted storing
-                        // a callback argument's short borrow through &mut self.
-                        if let Some(name) = self.capture_roots.get(&loan.root) {
-                            return Err(Diagnostic::new(
-                                span,
-                                format!("a closure cannot store a borrow in captured `{name}`"),
-                            )
-                            .note("captured bindings outlive the closure's own borrows; return the value from the closure instead"));
-                        }
-                        if !loan.via.is_empty() || loan.external.is_some() {
-                            return Err(Diagnostic::new(span, "replacing borrow-carrying fields through a reference is not supported in 0.1").note("replace the owned aggregate so its complete borrow dependencies can be checked"));
-                        }
-                        if let Some(owner) = self.by_id_mut(loan.root) {
-                            owner.deps.extend(val.deps.clone());
-                        }
-                    }
+                }
+                if place.capture.is_some()
+                    && self.context.carries_borrow(&place.ty)
+                    && let Some(name) = &place.capture
+                {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("a closure cannot store a borrow in captured `{name}`"),
+                    )
+                    .note("captured bindings outlive the closure's own borrows; return the value from the closure instead"));
                 }
             }
             StmtKind::Expr(expression) => {
@@ -1736,68 +1262,22 @@ impl<'a> Checker<'a> {
                     .last()
                     .ok_or_else(|| Diagnostic::new(span, "value exit outside a value block"))?;
                 let expected = context.expected.clone();
-                let depth = context.depth;
                 let value = self.expr(expression, expected.as_ref(), true)?;
                 if let Some(expected) = &expected {
                     self.expect(expected, &value.ty, span)?;
                 }
-                let departing: HashSet<_> = self
-                    .scopes
-                    .iter()
-                    .skip(depth)
-                    .flatten()
-                    .map(|v| v.id)
-                    .collect();
-                if let Some(loan) = value
-                    .deps
-                    .iter()
-                    .find(|loan| departing.contains(&loan.root) && loan.external.is_none())
-                {
-                    let mut diagnostic = Diagnostic::new(
-                        expression.span,
-                        "value block cannot yield a borrow of its local storage",
-                    )
-                    .primary_label("local storage does not live beyond this value block")
-                    .label(loan.origin, "local borrow begins here");
-                    if let Some(source) = self.by_id(loan.root) {
-                        diagnostic = diagnostic.label(
-                            source.span,
-                            format!("local value `{}` is declared here", source.name),
-                        );
-                    }
-                    return Err(diagnostic);
-                }
-                if self
-                    .scopes
-                    .iter()
-                    .skip(depth)
-                    .flatten()
-                    .any(|v| v.initialized && v.pending_result)
-                {
-                    return Err(Diagnostic::new(
-                        span,
-                        "a Result must be handled before leaving its value block",
-                    ));
-                }
                 let context = self.yields.last_mut().unwrap();
                 context.expected = Some(value.ty.clone());
-                context.values.push(value);
-                context.states.push(self.scopes[..depth].to_vec());
+                context.yielded = true;
                 return Ok(true);
             }
             StmtKind::Return(expression) => {
                 let expected = self.return_ty.clone();
-                let return_span = expression
-                    .as_ref()
-                    .map_or(span, |expression| expression.span);
                 let value = match expression {
                     Some(e) => {
                         self.expr(e, (expected != Type::Unknown).then_some(&expected), true)?
                     }
-                    None => Value {
-                        ty: Type::Void,
-                        deps: vec![],
-                    },
+                    None => Value { ty: Type::Void },
                 };
                 // A closure without a declared result type takes its first return's.
                 if expected == Type::Unknown {
@@ -1805,10 +1285,6 @@ impl<'a> Checker<'a> {
                 } else {
                     self.expect(&expected, &value.ty, span)?;
                 }
-                if self.context.carries_borrow(&value.ty) {
-                    self.check_returned_borrows(&value.deps, return_span)?;
-                }
-                self.check_pending_all(span)?;
                 return Ok(true);
             }
             StmtKind::If {
@@ -1818,20 +1294,8 @@ impl<'a> Checker<'a> {
             } => {
                 let value = self.expr(condition, Some(&Type::Bool), false)?;
                 self.expect(&Type::Bool, &value.ty, condition.span)?;
-                self.temporary.clear();
-                let before = self.scopes.clone();
                 let first = self.block(then_block, true)?;
-                let then_state = self.scopes.clone();
-                self.scopes = before;
                 let second = self.block(else_block, true)?;
-                let else_state = self.scopes.clone();
-                self.scopes = if first && !second {
-                    else_state
-                } else if second && !first {
-                    then_state
-                } else {
-                    merge_states(then_state, else_state)
-                };
                 return Ok(first && second);
             }
             StmtKind::For {
@@ -1857,91 +1321,22 @@ impl<'a> Checker<'a> {
                         *ty = inferred;
                     }
                     self.statement(initializer)?;
-                    self.temporary.clear();
                 }
-                let before = self.scopes.clone();
-                let mut names = HashMap::new();
-                names_block(body, &mut names);
-                if let Some(e) = condition.as_ref() {
-                    names_expr(e, &mut names);
-                }
-                if let Some(s) = step.as_ref() {
-                    names_stmt(s, &mut names);
-                }
-                self.loop_uses.push(
-                    names
-                        .into_iter()
-                        .map(|(name, span)| {
-                            (
-                                name,
-                                LoopUse {
-                                    span,
-                                    implicit: false,
-                                },
-                            )
-                        })
-                        .collect(),
-                );
-                self.begin_storage_loop();
-                self.begin_loop();
-                let first_partition = self.next_partition;
-                let split_depth = self.scopes.len();
-                if let Some(e) = condition {
-                    let val = self.expr(e, Some(&Type::Bool), false)?;
-                    self.expect(&Type::Bool, &val.ty, e.span)?;
-                    self.temporary.clear();
-                }
-                let condition_exit = condition.as_ref().map(|_| self.scopes.clone());
-                let terminated = self.block(body, true)?;
-                let repeats = self.join_loop_continues(terminated);
-                if !repeats {
-                    // Still type-check and annotate an unreachable step, but
-                    // do not feed a break/return path through it.
-                    self.scopes = before.clone();
-                }
-                if let Some(step) = step {
-                    self.statement(step)?;
-                    self.temporary.clear();
-                }
-                // Only break edges reach the end of an unconditional loop.
-                // Save their initialization facts before the conservative
-                // ownership joins also include entry and back-edge states.
-                let break_initialization = self
-                    .loops
-                    .last()
-                    .unwrap()
-                    .breaks
-                    .as_ref()
-                    .filter(|_| condition.is_none())
-                    .map(|scopes| {
-                        scopes
-                            .iter()
-                            .flatten()
-                            .map(|v| (v.id, v.initialized, v.moved_at))
-                            .collect::<Vec<_>>()
-                    });
-                self.end_loop(&before, repeats, span)?;
-                if condition.is_none() {
-                    self.scopes = merge_states(before.clone(), self.scopes.clone());
-                    if let Some(initialization) = break_initialization {
-                        for (id, initialized, moved_at) in initialization {
-                            let variable = self.by_id_mut(id).unwrap();
-                            variable.initialized = initialized;
-                            variable.moved_at = moved_at;
-                        }
+                // A value block in the condition or step can also leave the loop.
+                self.loops += 1;
+                let result = (|| {
+                    if let Some(e) = condition.as_mut() {
+                        let val = self.expr(e, Some(&Type::Bool), false)?;
+                        self.expect(&Type::Bool, &val.ty, e.span)?;
                     }
-                }
-                // Check iteration-local views before the zero-iteration path
-                // makes bindings assigned only in the body uninitialized.
-                self.check_split_loop_escape(first_partition, split_depth, span)?;
-                if let Some(condition_exit) = condition_exit {
-                    self.scopes = merge_states(self.scopes.clone(), condition_exit);
-                }
-                self.loop_uses.pop();
-                if condition.is_some() {
-                    self.scopes = merge_states(before, self.scopes.clone());
-                }
-                self.finish_scope(span)?;
+                    self.block(body, true)?;
+                    if let Some(step) = step.as_mut() {
+                        self.statement(step)?;
+                    }
+                    Ok(())
+                })();
+                self.loops -= 1;
+                result?;
                 self.scopes.pop();
                 // A forever loop is a diverging statement unless it can break.
                 return Ok(condition.is_none() && !contains_break(body));
@@ -1955,14 +1350,12 @@ impl<'a> Checker<'a> {
             } => {
                 let place = match &iterable.kind {
                     ExprKind::Unary(UnaryOp::Borrow | UnaryOp::BorrowMut, _) => None,
-                    _ => Some(self.place(iterable, true)?),
+                    _ => Some(self.place(iterable)?),
                 };
                 let value = if let Some(place) = place {
                     let mutable = matches!(place.ty, Type::Slice(true, _));
-                    let mut deps = place.loans.clone();
-                    for loan in &mut deps {
-                        loan.mutable = mutable && (!loan.dependency || loan.mutable);
-                        self.conflict(loan, Access::Borrow(mutable), iterable.span)?;
+                    if mutable {
+                        self.note_capture_mutation(&place);
                     }
                     let ty = match dereferenced(&place.ty) {
                         Type::Array(_, t) | Type::Slice(_, t) => Type::Slice(mutable, t.clone()),
@@ -1974,7 +1367,7 @@ impl<'a> Checker<'a> {
                         }
                     };
                     // Preserve the original expression type for backend collection layout.
-                    Value { ty, deps }
+                    Value { ty }
                 } else {
                     self.expr(iterable, None, false)?
                 };
@@ -2005,119 +1398,27 @@ impl<'a> Checker<'a> {
                     )
                     .note("use `for value in values` to borrow elements without copying"));
                 }
-                let copied_deps = if *copy && self.context.carries_borrow(&element) {
-                    // Reading an owned array's element copies the references stored
-                    // in it, without borrowing the array storage itself.
-                    let source = match &iterable.kind {
-                        ExprKind::Unary(UnaryOp::Borrow, source)
-                            if matches!(source.ty, Type::Array(..)) =>
-                        {
-                            source.as_ref()
-                        }
-                        _ => iterable,
-                    };
-                    let deps = if matches!(source.ty, Type::Array(..)) {
-                        self.provenance(source)
-                    } else {
-                        // References and slices carry the source collection's
-                        // provenance, rather than borrowing their local binding.
-                        self.provenance(iterable)
-                    };
-                    self.transitive_dependencies(deps)
-                } else {
-                    vec![]
-                };
-                self.temporary.clear();
-                let before = self.scopes.clone();
                 self.scopes.push(vec![]);
                 if let Some(index) = index {
-                    self.bind(index.clone(), Type::usize(), Some(vec![]), false, span)?;
+                    self.bind(index.clone(), Type::usize(), false, span)?;
                 }
-                let collection = format!("$foreach.collection.{}", span.start);
                 if *copy {
-                    // The captured collection stays borrowed across every loop
-                    // back edge, independently of reassignment of the copy binding.
-                    let mut deps = value.deps;
-                    deps.extend(self.provenance(iterable));
-                    let mut deps = self.transitive_dependencies(deps);
-                    for loan in &mut deps {
-                        self.conflict(loan, Access::Borrow(false), iterable.span)?;
-                        loan.mutable = false;
-                    }
-                    self.bind(collection.clone(), value.ty, Some(deps), false, span)?;
                     if name != "_" {
-                        self.bind(name.clone(), element, Some(copied_deps), false, span)?;
+                        self.bind(name.clone(), element, false, span)?;
                     }
                 } else {
                     self.bind(
                         name.clone(),
                         Type::Ref(mutable, Box::new(element)),
-                        Some(value.deps),
                         false,
                         span,
                     )?;
                 }
-                let iteration_id = self.lookup(name).map(|variable| variable.id);
-                let mut names = HashMap::new();
-                names_block(body, &mut names);
-                let mut loop_uses: HashMap<_, _> = names
-                    .into_iter()
-                    .map(|(name, span)| {
-                        (
-                            name,
-                            LoopUse {
-                                span,
-                                implicit: false,
-                            },
-                        )
-                    })
-                    .collect();
-                loop_uses.entry(name.clone()).or_insert(LoopUse {
-                    span: iterable.span,
-                    implicit: true,
-                });
-                if *copy {
-                    loop_uses.insert(
-                        collection,
-                        LoopUse {
-                            span: iterable.span,
-                            implicit: true,
-                        },
-                    );
-                }
-                self.loop_uses.push(loop_uses);
-                self.begin_storage_loop();
-                self.begin_loop();
-                let first_partition = self.next_partition;
-                let terminated = self.block(body, false)?;
-                let repeats = self.join_loop_continues(terminated);
-                self.end_loop(&before, repeats, span)?;
-                self.check_split_loop_escape(first_partition, self.scopes.len() - 1, span)?;
-                self.loop_uses.pop();
-                if mutable {
-                    for variable in self.scopes.iter().take(self.scopes.len() - 1).flatten() {
-                        if let Some(loan) = variable
-                            .deps
-                            .iter()
-                            .find(|d| iteration_id.is_some_and(|id| d.via.contains(&id)))
-                        {
-                            let diagnostic = Diagnostic::new(
-                                span,
-                                "mutable foreach element borrow cannot escape its iteration",
-                            )
-                            .primary_label("element borrow escapes this iteration")
-                            .label(loan.origin, "mutable element borrow begins here")
-                            .label(
-                                variable.span,
-                                format!("borrow is stored in outer binding `{}`", variable.name),
-                            );
-                            return Err(self.label_live_borrow(diagnostic, variable, span));
-                        }
-                    }
-                }
-                self.finish_scope(span)?;
+                self.loops += 1;
+                let result = self.block(body, false);
+                self.loops -= 1;
+                result?;
                 self.scopes.pop();
-                self.scopes = merge_states(before, self.scopes.clone());
             }
             StmtKind::IfLet {
                 pattern,
@@ -2126,30 +1427,14 @@ impl<'a> Checker<'a> {
                 else_block,
             } => {
                 let val = self.expr(value, None, true)?;
-                self.temporary.clear();
                 let (matched, borrowed) = match_subject(&val.ty);
                 let (checked, bindings) = self.check_pattern(pattern, matched, borrowed, span)?;
                 self.check_conditional_pattern(&checked, matched, span)?;
-                if self.context.contains_result(dereferenced(&val.ty)) {
-                    self.mark_matched_result(value);
-                }
-                let before = self.scopes.clone();
                 self.scopes.push(vec![]);
-                self.bind_pattern(pattern, bindings, &val, true, span)?;
+                self.bind_pattern(bindings, true, span)?;
                 let first = self.block(then_block, false)?;
-                self.finish_scope(span)?;
                 self.scopes.pop();
-                let then_state = self.scopes.clone();
-                self.scopes = before;
                 let second = self.block(else_block, true)?;
-                let else_state = self.scopes.clone();
-                self.scopes = if first && !second {
-                    else_state
-                } else if second && !first {
-                    then_state
-                } else {
-                    merge_states(then_state, else_state)
-                };
                 return Ok(first && second);
             }
             StmtKind::LetPattern {
@@ -2167,42 +1452,30 @@ impl<'a> Checker<'a> {
                 } else {
                     self.expect(ty, &val.ty, span)?;
                 }
-                self.temporary.clear();
                 let (matched, borrowed) = match_subject(&val.ty);
                 let (checked, bindings) = self.check_pattern(pattern, matched, borrowed, span)?;
                 self.check_conditional_pattern(&checked, matched, span)?;
-                if self.context.contains_result(dereferenced(&val.ty)) {
-                    self.mark_matched_result(value);
-                }
                 let irrefutable =
                     self.patterns_exhaustive(&[vec![checked]], std::slice::from_ref(matched))?;
                 if let Some(block) = else_block {
-                    let before = self.scopes.clone();
                     if !self.block(block, true)? {
                         return Err(Diagnostic::new(
                             span,
                             "the `else` block of a let pattern must diverge (return, break, or continue)",
                         ));
                     }
-                    self.scopes = before;
                 } else if !irrefutable {
                     return Err(Diagnostic::new(
                         span,
                         "refutable let pattern requires an `else` block",
                     ));
                 }
-                self.bind_pattern(pattern, bindings, &val, true, span)?;
+                self.bind_pattern(bindings, true, span)?;
             }
             StmtKind::Match { value, arms } => {
                 let val = self.expr(value, None, true)?;
-                if self.context.contains_result(dereferenced(&val.ty)) {
-                    self.mark_matched_result(value);
-                }
-                self.temporary.clear();
-                let before = self.scopes.clone();
                 let (match_ty, borrowed) = match_subject(&val.ty);
                 let mut rows = vec![];
-                let mut surviving = vec![];
                 let mut all_terminate = true;
                 for arm in arms {
                     if self.patterns_exhaustive(&rows, std::slice::from_ref(match_ty))? {
@@ -2211,18 +1484,16 @@ impl<'a> Checker<'a> {
                             "unreachable match arm after exhaustive patterns",
                         ));
                     }
-                    self.scopes = before.clone();
                     self.scopes.push(vec![]);
                     let (checked, bindings) =
                         self.check_pattern(&arm.pattern, match_ty, borrowed, arm.span)?;
-                    self.bind_pattern(&arm.pattern, bindings, &val, false, arm.span)?;
+                    self.bind_pattern(bindings, false, arm.span)?;
                     if let Some(guard) = &mut arm.guard {
                         self.guard_depth += 1;
                         let result = self.expr(guard, Some(&Type::Bool), false);
                         self.guard_depth -= 1;
                         let guard_value = result?;
                         self.expect(&Type::Bool, &guard_value.ty, guard.span)?;
-                        self.temporary.clear();
                     } else {
                         if rows
                             .iter()
@@ -2233,39 +1504,22 @@ impl<'a> Checker<'a> {
                         rows.push(vec![checked]);
                     }
                     let terminates = self.block(&mut arm.body, false)?;
-                    self.finish_scope(arm.span)?;
                     self.scopes.pop();
                     all_terminate &= terminates;
-                    if !terminates {
-                        surviving.push(self.scopes.clone());
-                    }
                 }
                 if !self.patterns_exhaustive(&rows, std::slice::from_ref(match_ty))? {
                     return Err(Diagnostic::new(span, "non-exhaustive match")
                         .note("cover every possible payload; guarded arms do not establish exhaustiveness"));
                 }
-                self.scopes = surviving.into_iter().reduce(merge_states).unwrap_or(before);
                 return Ok(all_terminate);
             }
             StmtKind::Break | StmtKind::Continue => {
-                let Some(state) = self.loops.last_mut() else {
+                if self.loops == 0 {
                     return Err(Diagnostic::new(
                         span,
                         "break and continue require an enclosing for loop",
                     ));
-                };
-                // Branch joins exclude terminating arms. Preserve their facts
-                // at the destination in the innermost enclosing loop instead.
-                let incoming = self.scopes[..state.depth].to_vec();
-                let edge = if matches!(statement.kind, StmtKind::Break) {
-                    &mut state.breaks
-                } else {
-                    &mut state.continues
-                };
-                *edge = Some(match edge.take() {
-                    Some(previous) => merge_states(previous, incoming),
-                    None => incoming,
-                });
+                }
                 return Ok(true);
             }
             StmtKind::Block(block) => return self.block(block, true),
@@ -2277,105 +1531,6 @@ impl<'a> Checker<'a> {
             }
         }
         Ok(false)
-    }
-    fn check_drop_order(&self, span: Span) -> Check<()> {
-        for scope in &self.scopes {
-            for variable in scope
-                .iter()
-                .filter(|v| v.initialized && self.context.has_drop(&v.ty))
-            {
-                for loan in &variable.deps {
-                    if loan.external.is_none()
-                        && scope
-                            .iter()
-                            .any(|source| source.id == loan.root && source.id > variable.id)
-                    {
-                        let mut diagnostic = Diagnostic::new(span, format!("destructor of `{}` would run after its borrowed source is destroyed", variable.name))
-                            .primary_label("borrowed source is destroyed before its borrower")
-                            .label(loan.origin, "borrow begins here")
-                            .label(variable.span, format!("`{}` is declared first and will be destroyed last", variable.name));
-                        if let Some(source) = self.by_id(loan.root) {
-                            diagnostic = diagnostic.label(source.span, format!("borrowed source `{}` is declared later and will be destroyed first", source.name));
-                        }
-                        return Err(diagnostic.note("declare the borrowed source before the value whose destructor accesses it"));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    fn check_pending_all(&self, span: Span) -> Check<()> {
-        self.check_drop_order(span)?;
-        for variable in self.scopes.iter().flatten() {
-            if variable.initialized && variable.pending_result {
-                return Err(Diagnostic::new(
-                    span,
-                    format!("Result `{}` is left unhandled on this exit", variable.name),
-                ));
-            }
-        }
-        Ok(())
-    }
-    fn begin_loop(&mut self) {
-        self.loops.push(LoopState {
-            depth: self.scopes.len(),
-            breaks: None,
-            continues: None,
-        });
-    }
-    fn join_loop_continues(&mut self, terminated: bool) -> bool {
-        let continues = self.loops.last_mut().unwrap().continues.take();
-        if let Some(continues) = continues {
-            self.scopes = if terminated {
-                continues
-            } else {
-                merge_states(self.scopes.clone(), continues)
-            };
-            true
-        } else {
-            !terminated
-        }
-    }
-    fn end_loop(&mut self, before: &[Vec<Variable>], repeats: bool, span: Span) -> Check<()> {
-        if repeats {
-            // A value block in the step can also continue the loop.
-            self.join_loop_continues(false);
-            self.check_loop_moves(before, span)?;
-        } else {
-            // There is no back edge: discard return paths and any effects of
-            // type-checking an unreachable step. Break states are joined below.
-            self.scopes[..before.len()].clone_from_slice(before);
-        }
-        let state = self.loops.pop().unwrap();
-        if let Some(breaks) = state.breaks {
-            self.scopes = merge_states(self.scopes.clone(), breaks);
-        }
-        self.end_storage_loop(span)
-    }
-    fn check_loop_moves(&self, before: &[Vec<Variable>], span: Span) -> Check<()> {
-        for old in before.iter().flatten() {
-            if old.initialized && self.by_id(old.id).is_some_and(|v| !v.initialized) {
-                let moved_at = self
-                    .by_id(old.id)
-                    .and_then(|variable| variable.moved_at)
-                    .unwrap_or(span);
-                return Err(Diagnostic::new(
-                    moved_at,
-                    format!(
-                        "`{}` is moved in a loop and may be used again on the next iteration",
-                        old.name
-                    ),
-                )
-                .primary_label(format!("value `{}` is moved here", old.name))
-                .label(span, "this loop may repeat the move on a later iteration")
-                .label(
-                    old.span,
-                    format!("binding `{}` is declared outside the loop", old.name),
-                )
-                .note("reinitialize the binding before continuing the loop"));
-            }
-        }
-        Ok(())
     }
     fn expr(
         &mut self,
@@ -2579,7 +1734,7 @@ impl<'a> Checker<'a> {
                     .or_else(|| expected.filter(|t| t.is_integer()).cloned())
                     .unwrap_or_else(Type::isize);
                 self.integer_range(*number, &ty, false, span)?;
-                Value { ty, deps: vec![] }
+                Value { ty }
             }
             ExprKind::Float(value, suffix) => {
                 let ty = suffix
@@ -2592,19 +1747,15 @@ impl<'a> Checker<'a> {
                         "floating-point literal is out of range",
                     ));
                 }
-                Value { ty, deps: vec![] }
+                Value { ty }
             }
-            ExprKind::Bool(_) => Value {
-                ty: Type::Bool,
-                deps: vec![],
-            },
+            ExprKind::Bool(_) => Value { ty: Type::Bool },
             ExprKind::String(_, bytes) => Value {
                 ty: if *bytes {
                     Type::Slice(false, Box::new(Type::u8()))
                 } else {
                     Type::Str
                 },
-                deps: vec![static_loan(span)],
             },
             ExprKind::Name(name) if name == "none" => {
                 let ty = expected
@@ -2613,9 +1764,9 @@ impl<'a> Checker<'a> {
                     .ok_or_else(|| {
                         Diagnostic::new(span, "`none` needs an Option type from its context")
                     })?;
-                Value { ty, deps: vec![] }
+                Value { ty }
             }
-            ExprKind::Name(_) if let Some(ty) = function_value.take() => Value { ty, deps: vec![] },
+            ExprKind::Name(_) if let Some(ty) = function_value.take() => Value { ty },
             ExprKind::Closure(closure) => self.closure(closure, expected, span)?,
             ExprKind::Invoke { callee, args } => self.invoke(callee, args, span)?,
             ExprKind::Asm(asm) => self.inline_asm(asm, span)?,
@@ -2629,13 +1780,13 @@ impl<'a> Checker<'a> {
                     {
                         base.kind = ExprKind::Name(name);
                     }
-                    let result = Value { ty, deps: vec![] };
+                    let result = Value { ty };
                     expression.ty = result.ty.clone();
                     return Ok(result);
                 }
-                let place = self.place(expression, true)?;
+                let place = self.place(expression)?;
                 if expected.is_some_and(mutable_borrow) && mutable_borrow(&place.ty) {
-                    self.note_capture_mutation(&place.loans);
+                    self.note_capture_mutation(&place);
                 }
                 if expected.is_some_and(mutable_borrow)
                     && mutable_borrow(&place.ty)
@@ -2646,44 +1797,19 @@ impl<'a> Checker<'a> {
                         "cannot reborrow mutable storage through a shared reference",
                     ));
                 }
-                for loan in &place.loans {
-                    self.conflict(
-                        loan,
-                        if consume && !place.ty.is_copy() {
-                            Access::Move
-                        } else {
-                            Access::Read
-                        },
-                        span,
-                    )?;
-                }
-                let deps = if self.context.carries_borrow(&place.ty) {
-                    self.provenance(expression)
-                } else {
-                    vec![]
-                };
-                if consume && !place.ty.is_copy() {
-                    if let Some(id) = place.direct {
-                        let variable = self.by_id_mut(id).unwrap();
-                        variable.initialized = false;
-                        variable.moved_at = Some(span);
-                        variable.pending_result = false;
-                    } else if let Some(name) = place
-                        .loans
-                        .iter()
-                        .find_map(|loan| self.capture_roots.get(&loan.root))
-                        .filter(|_| matches!(&expression.kind, ExprKind::Unary(UnaryOp::Deref, inner) if matches!(inner.kind, ExprKind::Name(_))))
+                // Only whole bindings move; flow checks their later uses.
+                if consume && !place.ty.is_copy() && place.direct.is_none() {
+                    if let Some(name) = place.capture.as_ref().filter(|_| matches!(&expression.kind, ExprKind::Unary(UnaryOp::Deref, inner) if matches!(inner.kind, ExprKind::Name(_))))
                     {
                         return Err(Diagnostic::new(
                             span,
                             format!("a closure cannot move captured `{name}`; closures capture bindings by reference"),
                         )
                         .note("pass the value to the closure as a parameter, or borrow it inside the closure"));
-                    } else {
-                        return Err(Diagnostic::new(span, "moving a non-copy field or indexed element is not supported").note("move the complete owned value, borrow the subobject, or call an explicit clone function"));
                     }
+                    return Err(Diagnostic::new(span, "moving a non-copy field or indexed element is not supported").note("move the complete owned value, borrow the subobject, or call an explicit clone function"));
                 }
-                Value { ty: place.ty, deps }
+                Value { ty: place.ty }
             }
             ExprKind::Constant(value, ty) => {
                 // The constant's declaration was checked in its own package,
@@ -2717,40 +1843,23 @@ impl<'a> Checker<'a> {
                     ));
                 }
                 **element = value.ty;
-                Value {
-                    ty: ty.clone(),
-                    deps: value.deps,
-                }
+                Value { ty: ty.clone() }
             }
             ExprKind::ValueBlock(body) => {
-                let depth = self.scopes.len();
-                let protected_len = self.protected.len();
-                let temporaries = std::mem::take(&mut self.temporary);
-                self.protected.extend(temporaries.iter().cloned());
-                let expression_deps = std::mem::take(&mut self.expression_deps);
                 self.yields.push(YieldContext {
                     expected: expected.cloned(),
-                    depth,
-                    values: vec![],
-                    states: vec![],
+                    yielded: false,
                 });
-                let terminates = self.block(body, true)?;
+                let terminates = self.block(body, true);
                 let context = self.yields.pop().unwrap();
-                self.protected.truncate(protected_len);
-                self.temporary = temporaries;
-                self.expression_deps = expression_deps;
-                if !terminates || context.values.is_empty() {
+                if !terminates? || !context.yielded {
                     return Err(Diagnostic::new(
                         span,
                         "every continuing path of a value block must end with a value",
                     ));
                 }
-                self.scopes = context.states.into_iter().reduce(merge_states).unwrap();
-                let deps: Vec<_> = context.values.into_iter().flat_map(|v| v.deps).collect();
-                self.temporary.extend(deps.clone());
                 Value {
                     ty: context.expected.unwrap(),
-                    deps,
                 }
             }
             ExprKind::Slice {
@@ -2759,18 +1868,15 @@ impl<'a> Checker<'a> {
                 end,
                 mutable,
             } => {
-                let inherited = self.temporary.len();
-                let mut place = self.place(base, true)?;
+                let mut place = self.place(base)?;
                 while let Type::Ref(m, inner) = place.ty.clone() {
                     place.ty = *inner;
                     place.mutable = m;
-                    place.loans = self.provenance(base);
                 }
                 let element = match &place.ty {
                     Type::Array(_, t) => *t.clone(),
                     Type::Slice(m, t) => {
                         place.mutable = *m;
-                        place.loans = self.provenance(base);
                         *t.clone()
                     }
                     _ => return Err(Diagnostic::new(span, "slicing requires an array or slice")),
@@ -2787,40 +1893,23 @@ impl<'a> Checker<'a> {
                         "cannot mutably slice storage through a shared reference",
                     ));
                 }
-                if place.loans.is_empty() {
+                if place.raw {
                     return Err(Diagnostic::new(
                         span,
                         "slice requires checked source storage",
                     ));
                 }
-                // Reserve the captured source while bounds run: reads such as
-                // data.len are allowed, but moving or mutating it is not.
-                self.temporary.truncate(inherited);
-                let mut deps = place.loans;
-                for loan in &deps {
-                    self.conflict(loan, Access::Borrow(false), span)?;
-                    let mut reserved = loan.clone();
-                    reserved.mutable = false;
-                    reserved.origin = span;
-                    self.temporary.push(reserved);
+                if *mutable {
+                    self.note_capture_mutation(&place);
                 }
-                let reserved = self.temporary.len();
                 for bound in start.iter_mut().chain(end) {
                     let value = self.expr(bound, Some(&Type::usize()), false)?;
                     if !value.ty.is_integer() {
                         return Err(Diagnostic::new(bound.span, "slice bounds must be integers"));
                     }
-                    self.temporary.truncate(reserved);
                 }
-                self.temporary.truncate(inherited);
-                for loan in &mut deps {
-                    self.conflict(loan, Access::Borrow(*mutable), span)?;
-                    loan.mutable = *mutable && (!loan.dependency || loan.mutable);
-                }
-                self.temporary.extend(deps.clone());
                 Value {
                     ty: Type::Slice(*mutable, Box::new(element)),
-                    deps,
                 }
             }
             ExprKind::Range(..) => {
@@ -2866,16 +1955,11 @@ impl<'a> Checker<'a> {
                         ),
                     ));
                 }
-                let mut deps = vec![];
                 for item in items {
                     let value = self.expr(item, Some(&element), true)?;
                     self.expect(&element, &value.ty, item.span)?;
-                    deps.extend(value.deps);
                 }
-                Value {
-                    ty: ty.clone(),
-                    deps,
-                }
+                Value { ty: ty.clone() }
             }
             ExprKind::Struct(name, fields) => {
                 if self
@@ -2893,7 +1977,6 @@ impl<'a> Checker<'a> {
                         .with_kind(DiagnosticKind::UnknownStruct(name.as_str().into()))
                 })?;
                 let mut initialized = HashSet::new();
-                let mut deps = vec![];
                 for (name, expression) in fields {
                     if !initialized.insert(name.clone()) {
                         return Err(Diagnostic::new(
@@ -2919,7 +2002,6 @@ impl<'a> Checker<'a> {
                     }
                     let value = self.expr(expression, Some(&field.ty), true)?;
                     self.expect(&field.ty, &value.ty, expression.span)?;
-                    deps.extend(value.deps);
                 }
                 if let Some(missing) = declaration
                     .fields
@@ -2933,7 +2015,6 @@ impl<'a> Checker<'a> {
                 }
                 Value {
                     ty: Type::Named(name.clone()),
-                    deps,
                 }
             }
             ExprKind::Unary(op @ (UnaryOp::Borrow | UnaryOp::BorrowMut), operand) => {
@@ -2957,7 +2038,7 @@ impl<'a> Checker<'a> {
                         "collection length is a value, not an addressable field",
                     ));
                 }
-                let place = self.place(operand, true)?;
+                let place = self.place(operand)?;
                 if mutable && !place.mutable {
                     return Err(Diagnostic::new(
                         span,
@@ -2967,25 +2048,15 @@ impl<'a> Checker<'a> {
                         self.diagnostic_binding(&place, operand.span),
                     )));
                 }
-                if place.loans.is_empty() {
+                if place.raw {
                     return Err(Diagnostic::new(
                         span,
                         "creating a checked borrow from a raw pointer requires an explicit lifetime primitive; use unsafe ptr.borrow or ptr.borrow_mut with a checked owner",
                     ));
                 }
-                let mut deps = place.loans;
-                if self.context.carries_borrow(&place.ty) {
-                    deps.extend(self.provenance(operand).into_iter().map(|mut loan| {
-                        loan.dependency = true;
-                        loan
-                    }));
+                if mutable {
+                    self.note_capture_mutation(&place);
                 }
-                for loan in &mut deps {
-                    self.conflict(loan, Access::Borrow(mutable), span)?;
-                    loan.mutable = mutable && (!loan.dependency || loan.mutable);
-                    loan.origin = span;
-                }
-                self.temporary.extend(deps.clone());
                 let ty = match (expected, &place.ty) {
                     (Some(Type::Slice(m, element)), Type::Array(_, actual))
                         if (!*m || mutable) && element == actual =>
@@ -2994,7 +2065,7 @@ impl<'a> Checker<'a> {
                     }
                     _ => Type::Ref(mutable, Box::new(place.ty)),
                 };
-                Value { ty, deps }
+                Value { ty }
             }
             ExprKind::Unary(op, operand) => {
                 let value = if *op == UnaryOp::Neg {
@@ -3005,7 +2076,7 @@ impl<'a> Checker<'a> {
                             .unwrap_or_else(Type::isize);
                         self.integer_range(*number, &ty, true, span)?;
                         operand.ty = ty.clone();
-                        Value { ty, deps: vec![] }
+                        Value { ty }
                     } else {
                         self.expr(operand, expected, false)?
                     }
@@ -3026,10 +2097,7 @@ impl<'a> Checker<'a> {
                         format!("unary operator is not defined for `{}`", value.ty),
                     ));
                 }
-                Value {
-                    ty: value.ty,
-                    deps: vec![],
-                }
+                Value { ty: value.ty }
             }
             ExprKind::Binary(op, left, right) => {
                 let inferred = expected
@@ -3038,18 +2106,10 @@ impl<'a> Checker<'a> {
                     .or_else(|| self.peek_type(left))
                     .or_else(|| self.peek_type(right));
                 let lhs = self.expr(left, inferred.as_ref(), false)?;
-                // The RHS may be skipped, but the LHS always runs. Join both
-                // paths so RHS assignments are not definite and possible moves
-                // and borrows from either path remain visible.
-                let skipped =
-                    matches!(op, BinaryOp::And | BinaryOp::Or).then(|| self.scopes.clone());
                 let rhs = self.expr(right, Some(&lhs.ty), false)?;
                 self.expect(&lhs.ty, &rhs.ty, right.span)?;
                 let ty = self.binary_type(*op, &lhs.ty, span)?;
-                if let Some(skipped) = skipped {
-                    self.scopes = merge_states(skipped, std::mem::take(&mut self.scopes));
-                }
-                Value { ty, deps: vec![] }
+                Value { ty }
             }
             ExprKind::Call {
                 name,
@@ -3060,19 +2120,13 @@ impl<'a> Checker<'a> {
                 self.context.validate_type(target, span, false)?;
                 let value = self.expr(operand, None, false)?;
                 if value.ty.is_numeric() && target.is_numeric() {
-                    Value {
-                        ty: target.clone(),
-                        deps: vec![],
-                    }
+                    Value { ty: target.clone() }
                 } else if (matches!(value.ty, Type::Raw(..)) || value.ty.is_integer())
                     && matches!(target, Type::Raw(..))
                     || matches!(value.ty, Type::Raw(..)) && target.is_integer()
                 {
                     self.unsafe_required(span, "raw pointer conversion")?;
-                    Value {
-                        ty: target.clone(),
-                        deps: vec![],
-                    }
+                    Value { ty: target.clone() }
                 } else if matches!(&value.ty, Type::Ref(..)) && matches!(target, Type::Raw(..)) {
                     if matches!(
                         (&value.ty, &*target),
@@ -3088,10 +2142,7 @@ impl<'a> Checker<'a> {
                         _ => unreachable!(),
                     };
                     self.expect(source, destination, span)?;
-                    Value {
-                        ty: target.clone(),
-                        deps: vec![],
-                    }
+                    Value { ty: target.clone() }
                 } else if let (Type::Ref(mutable, actual), Type::Ref(wanted, object)) =
                     (&value.ty, &*target)
                     && let Type::Dyn(interface) = object.as_ref()
@@ -3122,33 +2173,18 @@ impl<'a> Checker<'a> {
                     {
                         return Err(diagnostic);
                     }
-                    let mut deps = value.deps;
-                    if !*wanted {
-                        for loan in &mut deps {
-                            loan.mutable = false;
-                        }
-                    }
-                    Value {
-                        ty: target.clone(),
-                        deps,
-                    }
+                    Value { ty: target.clone() }
                 } else if let (Type::Fn(p, r), Some((_, q, s))) =
                     (&value.ty, target.closure_signature())
                     && p.as_slice() == q
                     && **r == *s
                 {
-                    Value {
-                        ty: target.clone(),
-                        deps: vec![],
-                    }
+                    Value { ty: target.clone() }
                 } else if let (Some((false, ..)), Some((true, ..))) =
                     (value.ty.closure_signature(), target.closure_signature())
                     && value.ty.callable_signature() == target.callable_signature()
                 {
-                    Value {
-                        ty: target.clone(),
-                        deps: value.deps,
-                    }
+                    Value { ty: target.clone() }
                 } else if matches!(&value.ty, Type::Raw(..)) && matches!(target, Type::Ref(..)) {
                     self.unsafe_required(span, "raw pointer to checked-reference conversion")?;
                     return Err(Diagnostic::new(
@@ -3167,14 +2203,7 @@ impl<'a> Checker<'a> {
                 let Type::Result(success, _) = value.ty else {
                     return Err(Diagnostic::new(span, "postfix `!` requires a Result value"));
                 };
-                Value {
-                    deps: if self.context.carries_borrow(&success) {
-                        value.deps
-                    } else {
-                        vec![]
-                    },
-                    ty: *success,
-                }
+                Value { ty: *success }
             }
             ExprKind::Try(operand) => {
                 let value = self.expr(operand, None, true)?;
@@ -3201,19 +2230,8 @@ impl<'a> Checker<'a> {
                         ));
                     }
                 }
-                // The error path returns the operand's error. Its loans are not
-                // separated from the success payload's, so check all of them.
-                if self.context.carries_borrow(&error) {
-                    self.check_returned_borrows(&value.deps, span)?;
-                }
-                self.check_pending_all(span)?;
                 Value {
                     ty: success.clone(),
-                    deps: if self.context.carries_borrow(&success) {
-                        value.deps
-                    } else {
-                        vec![]
-                    },
                 }
             }
             ExprKind::MethodCall { .. } => unreachable!(),
@@ -3241,19 +2259,12 @@ impl<'a> Checker<'a> {
                         Expr::new(ExprKind::Cast(Box::new(inner), expected.clone()), span);
                     // The environment is the function pointer itself: no borrow.
                     result.ty = expected.clone();
-                    result.deps = vec![];
                 }
                 (Type::Ref(true, t), Type::Ref(false, u)) if t == u => {
                     result.ty = expected.clone();
-                    for loan in &mut result.deps {
-                        loan.mutable = false;
-                    }
                 }
                 (Type::Slice(true, t), Type::Slice(false, u)) if t == u => {
                     result.ty = expected.clone();
-                    for loan in &mut result.deps {
-                        loan.mutable = false;
-                    }
                 }
                 // A reference to a concrete implementation becomes a `dyn`
                 // reference, keeping the original's loans. The cast node tells
@@ -3289,11 +2300,6 @@ impl<'a> Checker<'a> {
                             if *mutable { "mut " } else { "" }
                         )));
                     }
-                    if !*wanted {
-                        for loan in &mut result.deps {
-                            loan.mutable = false;
-                        }
-                    }
                     expression.ty = result.ty.clone();
                     let inner =
                         std::mem::replace(expression, Expr::new(ExprKind::Bool(false), span));
@@ -3305,8 +2311,6 @@ impl<'a> Checker<'a> {
             }
         }
         expression.ty = result.ty.clone();
-        self.expression_deps
-            .insert((span.start, span.end), result.deps.clone());
         Ok(result)
     }
     fn infer_loop_type(&self, expression: &Expr, name: &str) -> Option<Type> {
@@ -3537,71 +2541,6 @@ impl<'a> Checker<'a> {
         }
         None
     }
-    fn provenance(&self, expression: &Expr) -> Vec<Loan> {
-        if let Some(deps) = self
-            .expression_deps
-            .get(&(expression.span.start, expression.span.end))
-            && !matches!(expression.kind, ExprKind::Name(_))
-        {
-            return deps.clone();
-        }
-        match &expression.kind {
-            ExprKind::Name(name) => self
-                .lookup(name)
-                .map(|v| {
-                    let mut deps = v.deps.clone();
-                    for loan in &mut deps {
-                        if !loan.via.contains(&v.id) {
-                            loan.via.push(v.id);
-                        }
-                    }
-                    deps
-                })
-                .unwrap_or_else(|| {
-                    if self.context.constants.contains_key(name) {
-                        vec![static_loan(expression.span)]
-                    } else {
-                        vec![]
-                    }
-                }),
-            ExprKind::Field(base, field) => {
-                let mut deps = self.provenance(base);
-                // Project fields of an externally borrowed struct. The caller
-                // still retains the complete dependency via from(parameter).
-                // Locally assembled aggregates retain their original sources.
-                if self
-                    .peek_type(base)
-                    .is_some_and(|ty| matches!(ty, Type::Ref(..)))
-                {
-                    for loan in &mut deps {
-                        if loan.external.is_some() && loan.root != 0 && !loan.dependency {
-                            loan.fields.push(field.clone());
-                        }
-                    }
-                }
-                deps
-            }
-            ExprKind::Index(base, _)
-            | ExprKind::Unary(UnaryOp::Deref, base)
-            | ExprKind::Cast(base, _) => self.provenance(base),
-            ExprKind::String(..) => vec![static_loan(expression.span)],
-            _ => vec![],
-        }
-    }
-    fn transitive_dependencies(&self, mut deps: Vec<Loan>) -> Vec<Loan> {
-        let mut visited = HashSet::new();
-        let mut cursor = 0;
-        while cursor < deps.len() {
-            let root = deps[cursor].root;
-            cursor += 1;
-            if visited.insert(root)
-                && let Some(variable) = self.by_id(root)
-            {
-                deps.extend(variable.deps.clone());
-            }
-        }
-        deps
-    }
     fn through_shared_reference(&self, expression: &Expr) -> bool {
         match &expression.kind {
             ExprKind::Field(base, _)
@@ -3625,7 +2564,7 @@ impl<'a> Checker<'a> {
             _ => false,
         }
     }
-    fn place(&mut self, expression: &mut Expr, initialized: bool) -> Check<Place> {
+    fn place(&mut self, expression: &mut Expr) -> Check<Place> {
         let span = expression.span;
         if let Some(name) = qualified_name(expression)
             && let Some(constant) = self.context.constants.get(&name)
@@ -3642,51 +2581,23 @@ impl<'a> Checker<'a> {
         let mut place = match &mut expression.kind {
             ExprKind::Name(name) => {
                 if let Some(variable) = self.lookup(name).cloned() {
-                    if initialized && !variable.initialized {
-                        let mut diagnostic = Diagnostic::new(
-                            span,
-                            format!("`{name}` is uninitialized or has been moved"),
-                        )
-                        .label(variable.span, format!("binding `{name}` is declared here"));
-                        diagnostic = if let Some(moved_at) = variable.moved_at {
-                            diagnostic
-                                .primary_label(format!("cannot use `{name}` after it was moved"))
-                                .label(moved_at, format!("value `{name}` is moved here"))
-                        } else {
-                            diagnostic
-                                .primary_label(format!("`{name}` is not initialized on every path"))
-                        };
-                        return Err(diagnostic);
-                    }
                     Place {
                         ty: variable.ty,
-                        loans: vec![Loan {
-                            stored: false,
-                            dependency: false,
-                            root: variable.id,
-                            fields: vec![],
-                            partitions: vec![],
-                            mutable: !variable.immutable,
-                            origin: span,
-                            via: vec![],
-                            external: None,
-                        }],
                         mutable: !variable.immutable,
                         direct: Some(variable.id),
+                        raw: false,
+                        capture: None,
                     }
                 } else if let Some(constant) = self.context.constants.get(name) {
                     if constant.mutable {
                         self.unsafe_required(span, "mutable static access")?;
                     }
-                    // Each static is its own place: borrowing one never
-                    // conflicts with reading another, or a constant.
-                    let mut loan = static_loan(span);
-                    loan.fields.push(format!("static {name}"));
                     Place {
                         ty: constant.ty.clone(),
-                        loans: vec![loan],
                         mutable: constant.mutable,
                         direct: None,
+                        raw: false,
+                        capture: None,
                     }
                 } else {
                     return Err(Diagnostic::new(span, format!("unknown binding `{name}`"))
@@ -3694,6 +2605,11 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Unary(UnaryOp::Deref, operand) => {
+                // A reference read from a captured binding (or through one).
+                let capture = match &operand.kind {
+                    ExprKind::Name(name) if self.captures.contains(name) => Some(name.clone()),
+                    _ => self.capture_of(operand),
+                };
                 let value = self.expr(operand, None, false)?;
                 match value.ty {
                     Type::Ref(_, ty) if matches!(*ty, Type::DynFn(..)) => {
@@ -3704,9 +2620,10 @@ impl<'a> Checker<'a> {
                     }
                     Type::Ref(mutable, ty) => Place {
                         ty: *ty,
-                        loans: value.deps,
                         mutable,
                         direct: None,
+                        raw: false,
+                        capture,
                     },
                     Type::Raw(mutable, ty) => {
                         self.unsafe_required(span, "raw pointer dereference")?;
@@ -3718,9 +2635,10 @@ impl<'a> Checker<'a> {
                         }
                         Place {
                             ty: *ty,
-                            loans: vec![],
                             mutable,
                             direct: None,
+                            raw: true,
+                            capture: None,
                         }
                     }
                     _ => {
@@ -3732,11 +2650,10 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Field(base, field) => {
-                let mut place = self.place(base, true)?;
+                let mut place = self.place(base)?;
                 while let Type::Ref(mutable, inner) = place.ty.clone() {
                     place.ty = *inner;
                     place.mutable = mutable;
-                    place.loans = self.provenance(base);
                     place.direct = None;
                 }
                 let field_ty = match &place.ty {
@@ -3771,28 +2688,21 @@ impl<'a> Checker<'a> {
                         ));
                     }
                 };
-                for loan in &mut place.loans {
-                    if !loan.dependency {
-                        loan.fields.push(field.clone());
-                    }
-                }
                 place.ty = field_ty;
                 place.direct = None;
                 place
             }
             ExprKind::Index(base, index) => {
-                let mut place = self.place(base, true)?;
+                let mut place = self.place(base)?;
                 while let Type::Ref(mutable, inner) = place.ty.clone() {
                     place.ty = *inner;
                     place.mutable = mutable;
-                    place.loans = self.provenance(base);
                     place.direct = None;
                 }
                 let (element, length) = match place.ty.clone() {
                     Type::Array(n, t) => (*t, Some(n)),
                     Type::Slice(m, t) => {
                         place.mutable = m;
-                        place.loans = self.provenance(base);
                         (*t, None)
                     }
                     Type::Str => {
@@ -3818,11 +2728,6 @@ impl<'a> Checker<'a> {
                         format!("constant index {index} is outside array length {length}"),
                     ));
                 }
-                for loan in &mut place.loans {
-                    if !loan.dependency {
-                        loan.fields.push("[]".into());
-                    }
-                }
                 place.ty = element;
                 place.direct = None;
                 place
@@ -3843,8 +2748,9 @@ impl<'a> Checker<'a> {
                 Place {
                     mutable: mutable_borrow(&value.ty),
                     ty: value.ty,
-                    loans: value.deps,
                     direct: None,
+                    raw: false,
+                    capture: None,
                 }
             }
             _ => {
@@ -3857,8 +2763,6 @@ impl<'a> Checker<'a> {
         // A stored exclusive reference cannot be reborrowed exclusively through
         // a shared aggregate view. Preserve the access route through fields,
         // indices and dereferences instead of trusting just the field's type.
-        // Reading that field produces a shared reborrow with the same complete
-        // dependencies; it never moves the stored exclusive reference.
         if shared_access_route(expression) {
             place.mutable = false;
             match &mut place.ty {
@@ -3868,6 +2772,17 @@ impl<'a> Checker<'a> {
         }
         expression.ty = place.ty.clone();
         Ok(place)
+    }
+    /// The captured binding a (checked) place expression is reached through.
+    fn capture_of(&self, expression: &Expr) -> Option<String> {
+        match &expression.kind {
+            ExprKind::Unary(UnaryOp::Deref, inner) => match &inner.kind {
+                ExprKind::Name(name) if self.captures.contains(name) => Some(name.clone()),
+                _ => self.capture_of(inner),
+            },
+            ExprKind::Field(base, _) | ExprKind::Index(base, _) => self.capture_of(base),
+            _ => None,
+        }
     }
     fn call(
         &mut self,
@@ -3898,7 +2813,6 @@ impl<'a> Checker<'a> {
             }
             return Ok(Value {
                 ty: Type::Option(Box::new(value.ty)),
-                deps: value.deps,
             });
         }
         if matches!(name.as_str(), "ok" | "err" | "some" | "none") {
@@ -3927,14 +2841,11 @@ impl<'a> Checker<'a> {
                     format!("`{name}` expects {count} arguments"),
                 ));
             }
-            let deps = if count == 1 {
+            if count == 1 {
                 let val = self.expr(&mut args[0], Some(&payload), true)?;
                 self.expect(&payload, &val.ty, args[0].span)?;
-                val.deps
-            } else {
-                vec![]
-            };
-            return Ok(Value { ty, deps });
+            }
+            return Ok(Value { ty });
         }
         if let Some((owner, variant)) = name.rsplit_once('.')
             && let Some(declaration) = self.context.enums.get(owner)
@@ -3957,15 +2868,12 @@ impl<'a> Checker<'a> {
                     ),
                 ));
             }
-            let mut deps = vec![];
             for (arg, field) in args.iter_mut().zip(&variant.fields) {
                 let val = self.expr(arg, Some(&field.ty), true)?;
                 self.expect(&field.ty, &val.ty, arg.span)?;
-                deps.extend(val.deps);
             }
             return Ok(Value {
                 ty: Type::Named(owner.into()),
-                deps,
             });
         }
         if name == "core.drop" {
@@ -3985,10 +2893,7 @@ impl<'a> Checker<'a> {
                     "a Result cannot be discarded with core.drop",
                 ));
             }
-            return Ok(Value {
-                ty: Type::Void,
-                deps: vec![],
-            });
+            return Ok(Value { ty: Type::Void });
         }
         let normalized = if let Some((prefix, suffix)) = name.split_once('.') {
             if matches!(prefix, "mem" | "ptr" | "mmio" | "cpu") {
@@ -4047,63 +2952,12 @@ impl<'a> Checker<'a> {
                 ),
             ));
         }
-        let temporary_start = self.temporary.len();
-        let mut dependencies = vec![];
-        let mut argument_values = vec![];
         for (arg, parameter) in args.iter_mut().zip(&signature.params) {
             let reference = matches!(parameter.ty, Type::Ref(..) | Type::Slice(..));
-            let argument_start = self.temporary.len();
             let value = self.expr(arg, Some(&parameter.ty), !reference)?;
             self.expect(&parameter.ty, &value.ty, arg.span)?;
-            if reference {
-                self.reserve_argument_borrow(
-                    &value,
-                    mutable_borrow(&parameter.ty),
-                    argument_start,
-                    arg.span,
-                )?;
-            }
-            if signature.from.contains(&parameter.name) {
-                dependencies.extend(value.deps.clone());
-            }
-            if signature
-                .from
-                .contains(&format!("{}.stored", parameter.name))
-            {
-                dependencies.extend(value.deps.iter().filter(|d| d.stored).cloned());
-            }
-            argument_values.push(value);
         }
-        if let Some(target) = signature.stores.first() {
-            let target_index = signature
-                .params
-                .iter()
-                .position(|p| &p.name == target)
-                .unwrap();
-            let mut incoming = vec![];
-            for source in &signature.stores[1..] {
-                let index = signature
-                    .params
-                    .iter()
-                    .position(|p| &p.name == source)
-                    .unwrap();
-                incoming.extend(argument_values[index].deps.clone());
-            }
-            self.deposit(&argument_values[target_index], &incoming, span)?;
-        }
-        if signature.from.iter().any(|n| n == "static") {
-            dependencies.push(static_loan(span));
-        }
-        self.temporary.truncate(temporary_start);
-        if self.context.carries_borrow(&signature.ret) {
-            self.temporary.extend(dependencies.clone());
-        } else {
-            dependencies.clear();
-        }
-        Ok(Value {
-            ty: signature.ret,
-            deps: dependencies,
-        })
+        Ok(Value { ty: signature.ret })
     }
     fn intrinsic(
         &mut self,
@@ -4121,10 +2975,7 @@ impl<'a> Checker<'a> {
                 ));
             }
             self.context.check_storage_element(&type_args[0], span)?;
-            return Ok(Value {
-                ty: Type::Void,
-                deps: vec![],
-            });
+            return Ok(Value { ty: Type::Void });
         }
         if matches!(
             name,
@@ -4175,10 +3026,7 @@ impl<'a> Checker<'a> {
             }
             let rhs = self.expr(&mut args[1], Some(&lhs.ty), false)?;
             self.expect(&lhs.ty, &rhs.ty, args[1].span)?;
-            return Ok(Value {
-                ty: lhs.ty,
-                deps: vec![],
-            });
+            return Ok(Value { ty: lhs.ty });
         }
         if matches!(name, "core.assert" | "core.assert_eq" | "core.assert_ne") {
             let count = if name == "core.assert" { 1 } else { 2 };
@@ -4208,10 +3056,7 @@ impl<'a> Checker<'a> {
                 let value = self.expr(message, Some(&Type::Str), false)?;
                 self.expect(&Type::Str, &value.ty, message.span)?;
             }
-            return Ok(Value {
-                ty: Type::Void,
-                deps: vec![],
-            });
+            return Ok(Value { ty: Type::Void });
         }
         if matches!(name, "core.mem.size_of" | "core.mem.align_of") {
             if type_args.len() != 1 || !args.is_empty() {
@@ -4221,10 +3066,7 @@ impl<'a> Checker<'a> {
                 ));
             }
             self.context.validate_type(&type_args[0], span, true)?;
-            return Ok(Value {
-                ty: Type::usize(),
-                deps: vec![],
-            });
+            return Ok(Value { ty: Type::usize() });
         }
         if let Some(operation) = name.strip_prefix("core.mem.") {
             if matches!(operation, "assert_send" | "assert_sync") {
@@ -4253,10 +3095,7 @@ impl<'a> Checker<'a> {
                         ),
                     ));
                 }
-                return Ok(Value {
-                    ty: Type::Void,
-                    deps: vec![],
-                });
+                return Ok(Value { ty: Type::Void });
             }
             if operation == "callback" {
                 self.unsafe_required(span, "native callback address conversion")?;
@@ -4295,7 +3134,6 @@ impl<'a> Checker<'a> {
                 }
                 return Ok(Value {
                     ty: Type::Raw(false, Box::new(Type::u8())),
-                    deps: vec![],
                 });
             }
             if let Some(operation) = operation.strip_prefix("atomic_") {
@@ -4405,7 +3243,6 @@ impl<'a> Checker<'a> {
                     } else {
                         *element
                     },
-                    deps: vec![],
                 });
             }
             if matches!(operation, "str_bytes" | "str_from_utf8") {
@@ -4422,14 +3259,9 @@ impl<'a> Checker<'a> {
                     self.unsafe_required(span, "unchecked UTF-8 conversion")?;
                     (bytes, Type::Str)
                 };
-                let start = self.temporary.len();
                 let value = self.expr(&mut args[0], Some(&expected), false)?;
                 self.expect(&expected, &value.ty, span)?;
-                self.reserve_argument_borrow(&value, false, start, args[0].span)?;
-                return Ok(Value {
-                    ty,
-                    deps: value.deps,
-                });
+                return Ok(Value { ty });
             }
             if operation == "offset_of" {
                 if type_args.len() != 1 || args.len() != 1 {
@@ -4475,10 +3307,7 @@ impl<'a> Checker<'a> {
                     ));
                 }
                 args[0].ty = Type::Str;
-                return Ok(Value {
-                    ty: Type::usize(),
-                    deps: vec![],
-                });
+                return Ok(Value { ty: Type::usize() });
             }
             if operation == "uninit" {
                 if type_args.len() != 1 || !args.is_empty() {
@@ -4490,7 +3319,6 @@ impl<'a> Checker<'a> {
                 self.context.validate_type(&type_args[0], span, false)?;
                 return Ok(Value {
                     ty: Type::MaybeUninit(Box::new(type_args[0].clone())),
-                    deps: vec![],
                 });
             }
             if operation == "init" {
@@ -4514,7 +3342,6 @@ impl<'a> Checker<'a> {
                 }
                 return Ok(Value {
                     ty: Type::MaybeUninit(Box::new(value.ty)),
-                    deps: vec![],
                 });
             }
             if operation == "assume_init" {
@@ -4541,10 +3368,7 @@ impl<'a> Checker<'a> {
                         "reading checked-borrow values from opaque storage is unsupported",
                     ));
                 }
-                return Ok(Value {
-                    ty: *element,
-                    deps: vec![],
-                });
+                return Ok(Value { ty: *element });
             }
             if matches!(operation, "uninit_as_ptr" | "uninit_as_mut_ptr") {
                 if args.len() != 1 || type_args.len() > 1 {
@@ -4578,7 +3402,6 @@ impl<'a> Checker<'a> {
                 }
                 return Ok(Value {
                     ty: Type::Raw(mutable, element),
-                    deps: vec![],
                 });
             }
             if matches!(operation, "replace" | "swap") {
@@ -4588,7 +3411,6 @@ impl<'a> Checker<'a> {
                         "mem.replace/mem.swap expects two arguments and at most one type argument",
                     ));
                 }
-                let temporary_start = self.temporary.len();
                 let first = self.intrinsic_reference(&mut args[0])?;
                 let Type::Ref(true, element) = first.ty else {
                     return Err(Diagnostic::new(
@@ -4618,14 +3440,12 @@ impl<'a> Checker<'a> {
                     let value = self.expr(&mut args[1], Some(&element), true)?;
                     self.expect(&element, &value.ty, args[1].span)?;
                 }
-                self.temporary.truncate(temporary_start);
                 return Ok(Value {
                     ty: if operation == "replace" {
                         *element
                     } else {
                         Type::Void
                     },
-                    deps: vec![],
                 });
             }
         }
@@ -4670,7 +3490,6 @@ impl<'a> Checker<'a> {
             self.arguments(args, &expected, span)?;
             return Ok(Value {
                 ty: if write { Type::Void } else { ty },
-                deps: vec![],
             });
         }
         if let Some(operation) = name.strip_prefix("core.cpu.") {
@@ -4685,6 +3504,13 @@ impl<'a> Checker<'a> {
             let (parameters, result) = match operation {
                 "fence" | "wait_for_interrupt" => (vec![], Type::Void),
                 "disable_interrupts" => (vec![], Type::Bool),
+                "core_id" => (
+                    vec![],
+                    Type::Int {
+                        signed: false,
+                        bits: 32,
+                    },
+                ),
                 "restore_interrupts" => {
                     self.unsafe_required(span, "restoring the interrupt mask")?;
                     (vec![Type::Bool], Type::Void)
@@ -4697,10 +3523,7 @@ impl<'a> Checker<'a> {
                 }
             };
             self.arguments(args, &parameters, span)?;
-            return Ok(Value {
-                ty: result,
-                deps: vec![],
-            });
+            return Ok(Value { ty: result });
         }
         if let Some(operation) = name.strip_prefix("core.ptr.") {
             // Unsafe validity is the caller's responsibility, but the resulting
@@ -4721,7 +3544,6 @@ impl<'a> Checker<'a> {
                         ),
                     ));
                 }
-                let temporary_start = self.temporary.len();
                 let pointer = self.expr(&mut args[0], None, false)?;
                 let Type::Raw(writable, element) = pointer.ty else {
                     return Err(Diagnostic::new(
@@ -4765,19 +3587,12 @@ impl<'a> Checker<'a> {
                         "mutable owned storage access requires an exclusive owner borrow",
                     ));
                 }
-                let mut deps = owner.deps;
-                for loan in &mut deps {
-                    loan.mutable = mutable && (!loan.dependency || loan.mutable);
-                }
-                self.temporary.truncate(temporary_start);
-                self.temporary.extend(deps.clone());
                 return Ok(Value {
                     ty: if slice {
                         Type::Slice(mutable, element)
                     } else {
                         Type::Ref(mutable, element)
                     },
-                    deps,
                 });
             }
             let expected_arity = match operation {
@@ -4860,7 +3675,6 @@ impl<'a> Checker<'a> {
             if conversion {
                 return Ok(Value {
                     ty: Type::Raw(mutable, Box::new(element)),
-                    deps: vec![],
                 });
             }
             let ty = match operation {
@@ -4948,7 +3762,7 @@ impl<'a> Checker<'a> {
                 }
                 _ => unreachable!(),
             };
-            Ok(Value { ty, deps: vec![] })
+            Ok(Value { ty })
         } else {
             Err(Diagnostic::new(
                 span,
@@ -4956,33 +3770,8 @@ impl<'a> Checker<'a> {
             ))
         }
     }
-    // An argument expression may itself create its returned loan (a slice,
-    // explicit borrow, or a call returning a borrow). Do not conflict that loan
-    // with itself, but retain reservations from every earlier argument.
-    fn reserve_argument_borrow(
-        &mut self,
-        value: &Value,
-        mutable: bool,
-        start: usize,
-        span: Span,
-    ) -> Check<()> {
-        let fresh = self.temporary.split_off(start);
-        let mut reserved = vec![];
-        for mut loan in value.deps.clone() {
-            loan.mutable = mutable && (!loan.dependency || loan.mutable);
-            self.conflict(&loan, Access::Borrow(mutable), span)?;
-            loan.origin = span;
-            reserved.push(loan);
-        }
-        self.temporary.extend(fresh);
-        self.temporary.extend(reserved);
-        Ok(())
-    }
     fn intrinsic_reference(&mut self, arg: &mut Expr) -> Check<Value> {
-        let start = self.temporary.len();
-        let value = self.expr(arg, None, false)?;
-        self.reserve_argument_borrow(&value, mutable_borrow(&value.ty), start, arg.span)?;
-        Ok(value)
+        self.expr(arg, None, false)
     }
 
     fn arguments(&mut self, args: &mut [Expr], expected: &[Type], span: Span) -> Check<()> {
@@ -5050,80 +3839,14 @@ impl<'a> Checker<'a> {
             }
         })
     }
-    fn mark_matched_result(&mut self, expression: &Expr) {
-        match &expression.kind {
-            ExprKind::Unary(UnaryOp::Borrow | UnaryOp::BorrowMut, owner) => {
-                self.mark_matched_result(owner)
-            }
-            ExprKind::Name(name) => {
-                if let Some(variable) = self.lookup(name).cloned() {
-                    self.by_id_mut(variable.id).unwrap().pending_result = false;
-                    for loan in variable.deps {
-                        if !loan.stored
-                            && loan.fields.is_empty()
-                            && let Some(owner) = self.by_id_mut(loan.root)
-                        {
-                            owner.pending_result = false;
-                        }
-                    }
-                }
-            }
-            _ => (),
-        }
-    }
     fn bind_pattern(
         &mut self,
-        pattern: &Pattern,
         bindings: Vec<(String, Type)>,
-        value: &Value,
         immutable: bool,
         span: Span,
     ) -> Check<()> {
-        if self.bind_split_pattern(pattern, &bindings, value, immutable, span)? {
-            return Ok(());
-        }
-        let mut paths = HashMap::new();
-        // Borrow-carrying aggregates also track loans rooted in their stored
-        // references' sources. Those roots do not share the aggregate's field
-        // paths: projecting Outer.inner.n onto an Inner loan would incorrectly
-        // make a live borrow appear disjoint from Inner.n. Keep these complete
-        // dependencies until projections can distinguish each loan's source.
-        if matches!(value.ty, Type::Ref(..))
-            && !self.context.carries_borrow(dereferenced(&value.ty))
-        {
-            pattern_binding_paths(pattern, &[], &mut paths);
-        }
         for (name, ty) in bindings {
-            let deps = if self.context.carries_borrow(&ty) {
-                if let Some(projections) = paths.get(&name) {
-                    projections
-                        .iter()
-                        .flat_map(|path| {
-                            value.deps.iter().map(move |loan| {
-                                let mut loan = loan.clone();
-                                if !loan.dependency {
-                                    loan.fields.extend(path.iter().cloned());
-                                }
-                                loan
-                            })
-                        })
-                        .collect()
-                } else {
-                    value.deps.clone()
-                }
-            } else {
-                vec![]
-            };
-            let pending = self.context.contains_result(dereferenced(&ty));
-            self.bind(name, ty, Some(deps), immutable, span)?;
-            if pending {
-                self.scopes
-                    .last_mut()
-                    .unwrap()
-                    .last_mut()
-                    .unwrap()
-                    .pending_result = true;
-            }
+            self.bind(name, ty, immutable, span)?;
         }
         Ok(())
     }
@@ -5538,30 +4261,6 @@ enum CheckedPattern {
     Constructor(String, Vec<CheckedPattern>),
     Range(i128, i128),
     Or(Vec<CheckedPattern>),
-}
-fn pattern_binding_paths(
-    pattern: &Pattern,
-    path: &[String],
-    paths: &mut HashMap<String, Vec<Vec<String>>>,
-) {
-    match pattern {
-        Pattern::Binding(name) => {
-            paths.entry(name.clone()).or_default().push(path.to_vec());
-        }
-        Pattern::Struct(_, fields, _) => {
-            for (field, pattern) in fields {
-                let mut projected = path.to_vec();
-                projected.push(field.clone());
-                pattern_binding_paths(pattern, &projected, paths);
-            }
-        }
-        Pattern::Variant(_, fields) | Pattern::Or(fields) => {
-            for pattern in fields {
-                pattern_binding_paths(pattern, path, paths);
-            }
-        }
-        _ => (),
-    }
 }
 fn pattern_expansion_size(pattern: &CheckedPattern) -> usize {
     match pattern {
@@ -6298,22 +4997,13 @@ mod tests {
         );
     }
     #[test]
-    fn shadowed_binding_is_not_labeled_as_a_borrow_use() {
-        // Existing liveness is conservative across shadowing. Its explanation
-        // must not claim that the new scalar binding uses the outer borrow.
-        let body = "fn f() -> void {\n u8 x = 1\n r := &x\n x = 2\n {\n r := 3\n n := r\n }\n}";
-        let error = checked(body).unwrap_err();
-        assert!(error.message.contains("live shared borrow"));
-        assert!(
-            !error
-                .labels
-                .iter()
-                .any(|label| label.message == "borrow is used here")
-        );
-        assert!(
-            diagnostic_label_source(body, &error, "borrow is held")
-                .0
-                .starts_with("r := &x")
+    fn shadowed_binding_does_not_keep_the_outer_borrow_live() {
+        // Liveness follows binding identity: the inner `r` is a new binding,
+        // so the outer borrow is unused once `x` is written.
+        accepts("fn f() -> void {\n u8 x = 1\n r := &x\n x = 2\n {\n r := 3\n n := r\n }\n}");
+        rejects(
+            "fn f() -> void {\n u8 x = 1\n r := &x\n x = 2\n {\n s := 3\n n := *r\n }\n}",
+            "live shared borrow",
         );
     }
     #[test]
@@ -6649,6 +5339,7 @@ mod tests {
         accepts(
             "import \"core/cpu\"\nfn f() -> void {\n cpu.fence()\n cpu.wait_for_interrupt()\n was := cpu.disable_interrupts()\n unsafe { cpu.restore_interrupts(was) }\n}",
         );
+        accepts("import \"core/cpu\"\nfn f() -> u32 { return cpu.core_id() }");
         rejects(
             "import \"core/cpu\"\nfn f() -> void { cpu.restore_interrupts(true) }",
             "explicit unsafe block",
@@ -6676,24 +5367,51 @@ mod tests {
             "owner.token = { owner = Owner { token: Token { n: 3 }, n: 0 }; Token { n: 2 } }",
             "owner.token = { core.drop(owner); owner = Owner { token: Token { n: 3 }, n: 0 }; Token { n: 2 } }",
             "owner.n += { core.drop(owner); 1 }",
-            "r := &mut owner.token\n*r = { core.drop(owner); Token { n: 2 } }",
-            "r := &mut owner\nr.token = { core.drop(owner); Token { n: 2 } }",
         ] {
             rejects(
                 &format!("{declarations}\nfn f(flag: bool, owner: Owner) {{ {body} }}"),
                 "overlapping borrows within the same expression",
             );
         }
-        for (target, setup) in [
-            ("items[0]", ""),
-            ("view[0]", "view := &mut items"),
-            ("view[0]", "view: &mut [Token] = &mut items"),
+        // Through a reference, the dereferenced destination stays reserved
+        // until the store.
+        for (body, message) in [
+            (
+                "r := &mut owner.token\n*r = { core.drop(owner); Token { n: 2 } }",
+                "overlapping borrows within the same expression",
+            ),
+            (
+                "r := &mut owner\nr.token = { core.drop(owner); Token { n: 2 } }",
+                "access conflicts with a live mutable borrow held by `r`",
+            ),
+        ] {
+            rejects(
+                &format!("{declarations}\nfn f(flag: bool, owner: Owner) {{ {body} }}"),
+                message,
+            );
+        }
+        for (target, setup, message) in [
+            (
+                "items[0]",
+                "",
+                "overlapping borrows within the same expression",
+            ),
+            (
+                "view[0]",
+                "view := &mut items",
+                "access conflicts with a live mutable borrow held by `view`",
+            ),
+            (
+                "view[0]",
+                "view: &mut [Token] = &mut items",
+                "access conflicts with a live mutable borrow held by `view`",
+            ),
         ] {
             rejects(
                 &format!(
                     "{declarations}\nfn f() {{ items := [Token {{ n: 1 }}]\n{setup}\n{target} = {{ core.drop(items); Token {{ n: 2 }} }} }}"
                 ),
-                "overlapping borrows within the same expression",
+                message,
             );
         }
     }
@@ -6822,6 +5540,11 @@ fn f(owner: Owner) {
                     // Reinitializing the fallthrough path cannot repair either
                     // terminating branch. Keep the original move in diagnostics.
                     let error = checked(&body).unwrap_err();
+                    if header == "for" && exit == "continue" {
+                        // Without a break, nothing after the loop is reachable.
+                        assert!(error.message.contains("unreachable statement"));
+                        continue;
+                    }
                     assert!(error.message.contains("moved"), "{error:?}\n{body}");
                     assert_eq!(
                         error.message.contains("moved in a loop"),

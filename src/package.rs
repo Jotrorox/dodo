@@ -398,6 +398,13 @@ fn load_internal(
                         .into(),
                 );
             }
+            if function.pio
+                && !matches!(&key, ModuleId::Bundled(path) if path == "std/embedded/chip/rp_pio")
+            {
+                return Err("@compiler(pio) is reserved for std/embedded/chip/rp_pio"
+                    .to_owned()
+                    .into());
+            }
         }
         if key == root {
             program.package = module.program.package.clone();
@@ -430,6 +437,7 @@ fn load_internal(
     program.imports.sort();
     program.imports.dedup();
     program.interrupt_vectors = platform.map(|platform| platform.chip.interrupts);
+    program.pio_version = platform.and_then(|platform| platform.chip.pio_version);
     Ok(Loaded {
         program,
         sources: loader.sources,
@@ -525,6 +533,7 @@ impl Loader<'_> {
                 | "net"
                 | "tls"
                 | "signal"
+                | "quic"
                 | "crypto"
                 | "crypto/openssl"
                 | "web"

@@ -1,0 +1,500 @@
+package openssl
+
+import "core/option"
+import "core/ptr"
+import "std/io"
+import "std/net"
+import "std/quic"
+import "std/quic/native"
+
+// All configuration bytes are copied/parsed during construction. PEM key bytes
+// remain the caller's secret and must be wiped by the caller when appropriate.
+pub struct Config {
+    pub hostname: &[u8]
+    // RFC 7301 wire format: one-byte length followed by protocol bytes. QUIC
+    // requires ALPN, so the list must be nonempty.
+    pub alpn: &[u8]
+    pub trust_pem: &[u8]
+    pub certificate_pem: &[u8]
+    pub private_key_pem: &[u8]
+    pub system_roots: bool
+    pub require_client_certificate: bool
+    // -1 uses the backend's platform wall clock; >=0 is explicit Unix seconds.
+    pub verification_time: i64
+    // Client-requested idle timeout; 0 keeps OpenSSL's 30 s default. The peers
+    // use the smaller nonzero value. OpenSSL 3.5 listeners cannot set it.
+    pub idle_timeout_ms: u64
+    pub fn client(hostname: &[u8], alpn: &[u8]) -> Config from(hostname, alpn) {
+        return Config { hostname: hostname, alpn: alpn, trust_pem: b"", certificate_pem: b"",
+        private_key_pem: b"", system_roots: true, require_client_certificate: false,
+        verification_time: -1, idle_timeout_ms: 0 }
+    }
+    pub fn server(certificate: &[u8], key: &[u8], alpn: &[u8]) -> Config from(certificate, key, alpn) {
+        return Config { hostname: b"", alpn: alpn, trust_pem: b"", certificate_pem: certificate,
+        private_key_pem: key, system_roots: false, require_client_certificate: false,
+        verification_time: -1, idle_timeout_ms: 0 }
+    }
+}
+fn error(status: i32, code: i32, application: u64) -> quic.Error {
+    kind := quic.ErrorKind.Backend
+    if status == -1 {
+        kind = quic.ErrorKind.InvalidInput
+    }
+    if status == -2 {
+        kind = quic.ErrorKind.AllocationFailed
+    }
+    if status == -3 {
+        kind = quic.ErrorKind.VerificationFailed
+    }
+    if status == -4 {
+        kind = quic.ErrorKind.Protocol
+    }
+    if status == -6 {
+        kind = quic.ErrorKind.Closed
+    }
+    if status == -7 {
+        kind = quic.ErrorKind.StreamReset
+    }
+    if status == -8 {
+        kind = quic.ErrorKind.ConnectionClosed
+    }
+    if status == -10 {
+        kind = quic.ErrorKind.LimitExceeded
+    }
+    if status == -11 {
+        kind = quic.ErrorKind.Network
+    }
+    return quic.Error { kind: kind, code: code, application: application, transferred: 0 }
+}
+fn state(status: i32, code: i32) -> quic.State!quic.Error {
+    if status < 0 {
+        return err(error(status, code, 0))
+    }
+    if status == 1 {
+        return ok(quic.State.Pending)
+    }
+    if status == 3 {
+        return ok(quic.State.Finished)
+    }
+    return ok(quic.State.Ready)
+}
+fn encode(address: &net.SocketAddress) -> [24]u8 {
+    wire := [0u8; 24]
+    wire[0] = 4
+    if address.ip.family == net.Family.V6 {
+        wire[0] = 6
+    }
+    wire[2] = (address.port >> 8) as u8
+    wire[3] = (address.port & 255) as u8
+    for i in 0usize..4 {
+        wire[4 + i] = ((address.scope_id >> ((i * 8) as u32)) & 255) as u8
+    }
+    for i in 0usize..16 {
+        wire[8 + i] = address.ip.octets[i]
+    }
+    return wire
+}
+fn local_address(handle: *mut u8) -> net.SocketAddress!quic.Error {
+    wire := [0u8; 24]
+    code := 0i32
+    unsafe {
+        status := native.dodo_quic_local_address(handle, ptr.as_mut_ptr(&mut wire), ptr.from_mut(&mut code))
+        if status < 0 {
+            return err(error(status, code, 0))
+        }
+    }
+    octets := [0u8; 16]
+    for i in 0usize..16 {
+        octets[i] = wire[8 + i]
+    }
+    family := net.Family.V4
+    if wire[0] == 6 {
+        family = net.Family.V6
+    }
+    port := ((wire[2] as u16) << 8) | (wire[3] as u16)
+    return ok(net.SocketAddress { ip: net.IpAddress { family: family, octets: octets }, port: port, scope_id: 0 })
+}
+fn process(handle: *mut u8) -> void!quic.Error {
+    code := 0i32
+    unsafe {
+        status := native.dodo_quic_events(handle, ptr.from_mut(&mut code))
+        if status < 0 {
+            return err(error(status, code, 0))
+        }
+    }
+    return ok()
+}
+fn timeout(handle: *mut u8) -> Option<u64> {
+    milliseconds := 0i64
+    unsafe {
+        milliseconds = native.dodo_quic_timeout(handle)
+    }
+    if milliseconds < 0 {
+        return none
+    }
+    return some(milliseconds as u64)
+}
+fn wait(handle: *mut u8, milliseconds: u32) -> void!quic.Error {
+    code := 0i32
+    unsafe {
+        status := native.dodo_quic_wait(handle, milliseconds, ptr.from_mut(&mut code))
+        if status < 0 {
+            return err(error(status, code, 0))
+        }
+    }
+    return ok()
+}
+fn free(handle: &mut *mut u8) {
+    unsafe {
+        native.dodo_quic_free(*handle)
+        *handle = 0usize as *mut u8
+    }
+}
+fn create(config: &Config, address: &net.SocketAddress, server: bool) -> *mut u8!quic.Error {
+    if address.ip.family == net.Family.V4 && address.scope_id != 0 {
+        return err(quic.failure(quic.ErrorKind.InvalidInput, 0))
+    }
+    wire := encode(address)
+    status := 0i32
+    code := 0i32
+    server_flag := 0i32
+    roots_flag := 0i32
+    auth_flag := 0i32
+    if server {
+        server_flag = 1
+    }
+    if config.system_roots {
+        roots_flag = 1
+    }
+    if config.require_client_certificate {
+        auth_flag = 1
+    }
+    unsafe {
+        handle := native.dodo_quic_new(server_flag, ptr.as_ptr(&wire),
+        ptr.as_ptr(config.hostname), config.hostname.len,
+        ptr.as_ptr(config.trust_pem), config.trust_pem.len,
+        ptr.as_ptr(config.certificate_pem), config.certificate_pem.len,
+        ptr.as_ptr(config.private_key_pem), config.private_key_pem.len,
+        ptr.as_ptr(config.alpn), config.alpn.len, roots_flag, auth_flag,
+        config.verification_time, config.idle_timeout_ms,
+        ptr.from_mut(&mut status), ptr.from_mut(&mut code))
+        if ptr.is_null(handle) {
+            return err(error(status, code, 0))
+        }
+        return ok(handle)
+    }
+}
+
+// A QUIC server endpoint: owns the bound UDP socket, the TLS context and every
+// connection that has not yet been accepted. Accepted connections and their
+// streams share its socket and event processing; processing events on any of
+// them advances all of them. Deliberately not Send/Sync.
+pub struct Listener {
+    handle: *mut u8
+    pub fn bind(config: &Config, address: &net.SocketAddress) -> Listener!quic.Error {
+        handle := create(config, address, true)?
+        return ok(Listener { handle: handle })
+    }
+    // A connection may still be completing its handshake; drive handshake()
+    // until Ready before trusting its peer.
+    pub fn accept(&mut self) -> Option<Connection>!quic.Error {
+        status := 0i32
+        code := 0i32
+        unsafe {
+            handle := native.dodo_quic_accept_connection(self.handle, ptr.from_mut(&mut status), ptr.from_mut(&mut code))
+            if status < 0 {
+                return err(error(status, code, 0))
+            }
+            if ptr.is_null(handle) {
+                return ok(none)
+            }
+            return ok(some(Connection { handle: handle }))
+        }
+    }
+    pub fn local_address(&self) -> net.SocketAddress!quic.Error {
+        return local_address(self.handle)
+    }
+    // Process received datagrams and expired timers without waiting.
+    pub fn process(&mut self) -> void!quic.Error {
+        return process(self.handle)
+    }
+    // Milliseconds until the next protocol timer; none when no timer is armed.
+    pub fn timeout_ms(&self) -> Option<u64> {
+        return timeout(self.handle)
+    }
+    // Wait for socket readiness up to `milliseconds` (capped at 60 s) or the
+    // next protocol timer, whichever is earlier, then process events.
+    pub fn wait(&mut self, milliseconds: u32) -> void!quic.Error {
+        return wait(self.handle, milliseconds)
+    }
+    // Immediate release without notifying peers. Idempotent.
+    pub fn abort(&mut self) {
+        free(&mut self.handle)
+    }
+    fn drop(&mut self) {
+        self.abort()
+    }
+}
+
+// One QUIC connection. A client connection owns its connected UDP socket.
+pub struct Connection {
+    handle: *mut u8
+    // Starts a nonblocking client handshake toward an already resolved address.
+    // `config.hostname` is verified independently of the address.
+    pub fn connect(config: &Config, address: &net.SocketAddress) -> Connection!quic.Error {
+        handle := create(config, address, false)?
+        return ok(Connection { handle: handle })
+    }
+    // Ready once the handshake and peer verification have completed.
+    pub fn handshake(&mut self) -> quic.State!quic.Error {
+        code := 0i32
+        unsafe {
+            return state(native.dodo_quic_handshake(self.handle, ptr.from_mut(&mut code)), code)
+        }
+    }
+    // Caller supplies monotonic time/deadline and cancellation observation.
+    // Deadline is inclusive. Timeout or cancellation aborts the connection.
+    pub fn handshake_until(&mut self, now: u64, deadline: u64, cancelled: bool) -> quic.State!quic.Error {
+        if cancelled {
+            self.abort()
+            return err(quic.failure(quic.ErrorKind.Cancelled, 0))
+        }
+        if now >= deadline {
+            self.abort()
+            return err(quic.failure(quic.ErrorKind.TimedOut, 0))
+        }
+        return self.handshake()
+    }
+    // None while the handshake is incomplete or the peer's stream limit is
+    // exhausted; process events and retry.
+    pub fn open_bidirectional(&mut self) -> Option<Stream>!quic.Error {
+        return self.open(0)
+    }
+    pub fn open_unidirectional(&mut self) -> Option<Stream>!quic.Error {
+        return self.open(1)
+    }
+    fn open(&mut self, unidirectional: i32) -> Option<Stream>!quic.Error {
+        status := 0i32
+        code := 0i32
+        unsafe {
+            handle := native.dodo_quic_open_stream(self.handle, unidirectional, ptr.from_mut(&mut status), ptr.from_mut(&mut code))
+            if status < 0 {
+                return err(error(status, code, 0))
+            }
+            if ptr.is_null(handle) {
+                return ok(none)
+            }
+            return ok(some(Stream { handle: handle, last_error: none }))
+        }
+    }
+    // The next stream the peer opened, if any.
+    pub fn accept_stream(&mut self) -> Option<Stream>!quic.Error {
+        status := 0i32
+        code := 0i32
+        unsafe {
+            handle := native.dodo_quic_accept_stream(self.handle, ptr.from_mut(&mut status), ptr.from_mut(&mut code))
+            if status < 0 {
+                application := 0u64
+                flags := 0u32
+                closed := native.dodo_quic_close_info(self.handle, ptr.from_mut(&mut application), ptr.from_mut(&mut flags))
+                return err(error(status, code, application))
+            }
+            if ptr.is_null(handle) {
+                return ok(none)
+            }
+            return ok(some(Stream { handle: handle, last_error: none }))
+        }
+    }
+    // Graceful CONNECTION_CLOSE carrying an application error code, after
+    // concluded streams have been flushed. Repeat until Finished.
+    pub fn close(&mut self, code: u64) -> quic.State!quic.Error {
+        native_code := 0i32
+        unsafe {
+            return state(native.dodo_quic_shutdown(self.handle, code, ptr.from_mut(&mut native_code)), native_code)
+        }
+    }
+    // Present once the connection has terminated for any reason.
+    pub fn close_info(&self) -> Option<quic.CloseInfo> {
+        application := 0u64
+        flags := 0u32
+        unsafe {
+            closed := native.dodo_quic_close_info(self.handle, ptr.from_mut(&mut application), ptr.from_mut(&mut flags))
+            if closed != 1 {
+                return none
+            }
+        }
+        return some(quic.CloseInfo { code: application, local: (flags & 1) != 0, transport: (flags & 2) != 0 })
+    }
+    pub fn selected_alpn(&self, destination: &mut[u8]) -> usize!quic.Error {
+        unsafe {
+            length := native.dodo_quic_alpn(self.handle, ptr.as_mut_ptr(destination), destination.len)
+            if length < 0 {
+                return err(error(length, 0, 0))
+            }
+            return ok(length as usize)
+        }
+    }
+    // The local socket address; accepted connections report the address of
+    // the listener socket they share.
+    pub fn local_address(&self) -> net.SocketAddress!quic.Error {
+        return local_address(self.handle)
+    }
+    pub fn process(&mut self) -> void!quic.Error {
+        return process(self.handle)
+    }
+    pub fn timeout_ms(&self) -> Option<u64> {
+        return timeout(self.handle)
+    }
+    pub fn wait(&mut self, milliseconds: u32) -> void!quic.Error {
+        return wait(self.handle, milliseconds)
+    }
+    // Immediate release without sending CONNECTION_CLOSE; the peer observes
+    // only its idle timeout. Idempotent. Live streams keep the connection's
+    // native state until they are released too.
+    pub fn abort(&mut self) {
+        free(&mut self.handle)
+    }
+    fn drop(&mut self) {
+        self.abort()
+    }
+}
+
+// One QUIC stream. Bidirectional streams read and write; a unidirectional
+// stream only writes when opened locally and only reads when accepted.
+pub struct Stream {
+    handle: *mut u8
+    last_error: Option<quic.Error>
+    // QUIC stream ID; bit 0 marks server-initiated, bit 1 unidirectional.
+    pub fn id(&self) -> u64 {
+        id := 0u64
+        flags := 0u32
+        unsafe {
+            status := native.dodo_quic_stream_info(self.handle, ptr.from_mut(&mut id), ptr.from_mut(&mut flags))
+        }
+        return id
+    }
+    pub fn readable(&self) -> bool {
+        return (self.flags() & 1) != 0
+    }
+    pub fn writable(&self) -> bool {
+        return (self.flags() & 2) != 0
+    }
+    pub fn local(&self) -> bool {
+        return (self.flags() & 4) != 0
+    }
+    fn flags(&self) -> u32 {
+        id := 0u64
+        flags := 0u32
+        unsafe {
+            status := native.dodo_quic_stream_info(self.handle, ptr.from_mut(&mut id), ptr.from_mut(&mut flags))
+        }
+        return flags
+    }
+    // Copies an initialized prefix. Pending means no data yet; Finished means
+    // the peer concluded the stream and every byte has been read.
+    pub fn receive(&mut self, destination: &mut[u8]) -> quic.Progress!quic.Error {
+        count := 0usize
+        code := 0i32
+        application := 0u64
+        status := 0i32
+        unsafe {
+            status = native.dodo_quic_read(self.handle, ptr.as_mut_ptr(destination), destination.len,
+            ptr.from_mut(&mut count), ptr.from_mut(&mut code), ptr.from_mut(&mut application))
+        }
+        if status < 0 {
+            return err(error(status, code, application))
+        }
+        progress := state(status, code)?
+        return ok(quic.Progress { state: progress, transferred: count })
+    }
+    // Accepts a prefix into OpenSSL's stream send buffer; accepted bytes are no
+    // longer borrowed. Pending means the buffer or flow-control window is full.
+    pub fn send(&mut self, source: &[u8]) -> quic.Progress!quic.Error {
+        count := 0usize
+        code := 0i32
+        application := 0u64
+        status := 0i32
+        unsafe {
+            status = native.dodo_quic_write(self.handle, ptr.as_ptr(source), source.len,
+            ptr.from_mut(&mut count), ptr.from_mut(&mut code), ptr.from_mut(&mut application))
+        }
+        if status < 0 {
+            return err(error(status, code, application))
+        }
+        progress := state(status, code)?
+        return ok(quic.Progress { state: progress, transferred: count })
+    }
+    // Send FIN after every accepted byte. Idempotent; later sends fail Closed.
+    pub fn conclude(&mut self) -> void!quic.Error {
+        code := 0i32
+        unsafe {
+            status := native.dodo_quic_conclude(self.handle, ptr.from_mut(&mut code))
+            if status < 0 {
+                return err(error(status, code, 0))
+            }
+        }
+        return ok()
+    }
+    // Abandon the sending part with RESET_STREAM; unsent bytes are discarded.
+    pub fn reset(&mut self, code: u64) -> void!quic.Error {
+        native_code := 0i32
+        unsafe {
+            status := native.dodo_quic_reset(self.handle, code, ptr.from_mut(&mut native_code))
+            if status < 0 {
+                return err(error(status, native_code, 0))
+            }
+        }
+        return ok()
+    }
+    // std/io adapters. Pending becomes WouldBlock; take_error() preserves the
+    // typed QUIC cause, including a peer's reset code.
+    pub fn take_error(&mut self) -> Option<quic.Error> {
+        return option.take(&mut self.last_error)
+    }
+    pub fn poll_read(&mut self, destination: &mut[u8]) -> io.Poll!io.Error {
+        match self.receive(destination) {
+            ok(progress) => {
+                return ok(quic.poll(progress))
+            }
+            err(reason) => {
+                mapped := quic.io_error(&reason)
+                self.last_error = some(reason)
+                return err(mapped)
+            }
+        }
+    }
+    pub fn poll_write(&mut self, source: &[u8]) -> io.Poll!io.Error {
+        match self.send(source) {
+            ok(progress) => {
+                return ok(quic.poll(progress))
+            }
+            err(reason) => {
+                mapped := quic.io_error(&reason)
+                self.last_error = some(reason)
+                return err(mapped)
+            }
+        }
+    }
+    pub fn read(&mut self, destination: &mut[u8]) -> usize!io.Error {
+        progress := self.poll_read(destination)?
+        if progress.state == io.PollState.Pending {
+            return err(io.failure(io.ErrorKind.WouldBlock, 0))
+        }
+        return ok(progress.transferred)
+    }
+    pub fn write(&mut self, source: &[u8]) -> usize!io.Error {
+        progress := self.poll_write(source)?
+        if progress.state == io.PollState.Pending {
+            return err(io.failure(io.ErrorKind.WouldBlock, 0))
+        }
+        return ok(progress.transferred)
+    }
+    // Release the stream object. A stream that was neither concluded nor reset
+    // is reset by OpenSSL; a concluded stream keeps delivering buffered bytes.
+    pub fn abort(&mut self) {
+        free(&mut self.handle)
+    }
+    fn drop(&mut self) {
+        self.abort()
+    }
+}

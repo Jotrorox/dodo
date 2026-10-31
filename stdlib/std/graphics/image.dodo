@@ -1,0 +1,847 @@
+package image
+
+import "core/num"
+import "std/graphics"
+
+// Image file decoding and encoding with caller-supplied storage only: no
+// allocation, no files. Read a file with std/fs (or embed its bytes), ask
+// info() for its size, provide graphics.bytes_needed(...) bytes, and decode.
+//
+// Decoders: binary PPM/PGM (P6/P5, any maxval), QOI, and uncompressed BMP
+// (1, 4 and 8-bit palettes; 16, 24 and 32-bit, with or without bit-field
+// masks; bottom-up or top-down). Encoders: PPM (P6), QOI and 24-bit BMP.
+// Untrusted input is safe: every length is checked before it is used.
+
+pub enum Error {
+    // The data ended before the image did.
+    Truncated,
+    // The data is not a valid file of its format.
+    Malformed,
+    // A valid file using something this package does not implement, such as
+    // RLE-compressed BMP or ASCII PPM.
+    Unsupported,
+    // A dimension exceeds graphics.MAX_DIMENSION or a size overflows.
+    TooLarge,
+    // The pixel storage or output buffer is shorter than required.
+    BufferTooSmall
+}
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.Truncated => {
+            return "Truncated"
+        }
+        Error.Malformed => {
+            return "Malformed"
+        }
+        Error.Unsupported => {
+            return "Unsupported"
+        }
+        Error.TooLarge => {
+            return "TooLarge"
+        }
+        Error.BufferTooSmall => {
+            return "BufferTooSmall"
+        }
+    }
+}
+
+pub enum Format {
+    // Netpbm binary PPM (P6) or PGM (P5).
+    Ppm,
+    Qoi,
+    Bmp
+}
+
+pub struct Info {
+    pub format: Format
+    pub width: u32
+    pub height: u32
+    // True when the file stores an alpha channel (QOI RGBA, BMP alpha mask).
+    pub has_alpha: bool
+}
+
+// Identify `data` by its signature and read its dimensions without decoding.
+pub fn info(data: &[u8]) -> Info!Error {
+    if data.len >= 4 && data[0] == b'q' && data[1] == b'o' && data[2] == b'i' && data[3] == b'f' {
+        header := qoi_header(data)?
+        return ok(Info { format: Format.Qoi, width: header.width, height: header.height, has_alpha: header.channels == 4 })
+    }
+    if data.len >= 2 && data[0] == b'B' && data[1] == b'M' {
+        header := bmp_header(data)?
+        return ok(Info { format: Format.Bmp, width: header.width, height: header.height, has_alpha: header.alpha_mask != 0 })
+    }
+    if data.len >= 2 && data[0] == b'P' {
+        header := ppm_header(data)?
+        return ok(Info { format: Format.Ppm, width: header.width, height: header.height, has_alpha: false })
+    }
+    return err(Error.Unsupported)
+}
+
+// Decode `data` into a new canvas over `pixels`, sized like the image and
+// stored in `format`. `pixels` needs graphics.bytes_needed(width, height,
+// format) bytes. The returned canvas's dirty rectangle covers the image.
+pub fn decode(data: &[u8], pixels: &mut[u8], format: graphics.PixelFormat) -> graphics.Canvas!Error from(pixels) {
+    header := info(data)?
+    canvas := match graphics.Canvas.new(pixels, header.width, header.height, format) {
+        ok(value) => value,
+        err(error) => {
+            return err(canvas_error(error))
+        }
+    }
+    draw(data, &mut canvas, 0, 0)?
+    return ok(canvas)
+}
+
+// Decode `data` onto an existing canvas with the image's top-left corner at
+// (x, y). Pixels outside the canvas or its clip are skipped; colors are
+// stored, not blended. A decoding error can leave a partly drawn image.
+pub fn draw(data: &[u8], canvas: &mut graphics.Canvas, x: i32, y: i32) -> void!Error {
+    header := info(data)?
+    match &header.format {
+        Format.Ppm => {
+            return draw_ppm(data, canvas, x, y)
+        }
+        Format.Qoi => {
+            return draw_qoi(data, canvas, x, y)
+        }
+        Format.Bmp => {
+            return draw_bmp(data, canvas, x, y)
+        }
+    }
+}
+
+fn canvas_error(error: graphics.Error) -> Error {
+    match error {
+        graphics.Error.BufferTooSmall => {
+            return Error.BufferTooSmall
+        }
+        graphics.Error.InvalidInput => {
+            return Error.TooLarge
+        }
+        graphics.Error.Unsupported => {
+            return Error.Unsupported
+        }
+        graphics.Error.Device => {
+            return Error.Unsupported
+        }
+    }
+}
+
+fn check_dimensions(width: u32, height: u32) -> void!Error {
+    if width > graphics.MAX_DIMENSION || height > graphics.MAX_DIMENSION {
+        return err(Error.TooLarge)
+    }
+    return ok()
+}
+
+fn put(canvas: &mut graphics.Canvas, x: i32, y: i32, column: u32, row: u32, color: graphics.Color) {
+    px := x as i64 + column as i64
+    py := y as i64 + row as i64
+    if px >= 0 && py >= 0 && px < canvas.width() as i64 && py < canvas.height() as i64 {
+        canvas.pixel(px as i32, py as i32, color)
+    }
+}
+
+// Canvas pixels in row-major order as 8-bit channels.
+fn pixel_at(canvas: &graphics.Canvas, x: u32, y: u32) -> graphics.Color {
+    match canvas.color_at(x as i32, y as i32) {
+        some(color) => {
+            return color
+        }
+        none => {
+            return graphics.TRANSPARENT
+        }
+    }
+}
+
+fn be32(data: &[u8], offset: usize) -> u32!Error {
+    if offset + 4 > data.len {
+        return err(Error.Truncated)
+    }
+    return ok(((data[offset] as u32) << 24) | ((data[offset + 1] as u32) << 16) | ((data[offset + 2] as u32) << 8) | (data[offset + 3] as u32))
+}
+
+fn le16(data: &[u8], offset: usize) -> u32!Error {
+    if offset + 2 > data.len {
+        return err(Error.Truncated)
+    }
+    return ok((data[offset] as u32) | ((data[offset + 1] as u32) << 8))
+}
+
+fn le32(data: &[u8], offset: usize) -> u32!Error {
+    if offset + 4 > data.len {
+        return err(Error.Truncated)
+    }
+    return ok((data[offset] as u32) | ((data[offset + 1] as u32) << 8) | ((data[offset + 2] as u32) << 16) | ((data[offset + 3] as u32) << 24))
+}
+
+fn put_be32(output: &mut[u8], offset: usize, value: u32) {
+    output[offset] = (value >> 24) as u8
+    output[offset + 1] = ((value >> 16) & 255) as u8
+    output[offset + 2] = ((value >> 8) & 255) as u8
+    output[offset + 3] = (value & 255) as u8
+}
+
+fn put_le16(output: &mut[u8], offset: usize, value: u32) {
+    output[offset] = (value & 255) as u8
+    output[offset + 1] = ((value >> 8) & 255) as u8
+}
+
+fn put_le32(output: &mut[u8], offset: usize, value: u32) {
+    output[offset] = (value & 255) as u8
+    output[offset + 1] = ((value >> 8) & 255) as u8
+    output[offset + 2] = ((value >> 16) & 255) as u8
+    output[offset + 3] = (value >> 24) as u8
+}
+
+fn pixel_count(width: u32, height: u32) -> usize!Error {
+    match num.checked_mul(width as usize, height as usize) {
+        ok(count) => {
+            return ok(count)
+        }
+        err(_) => {
+            return err(Error.TooLarge)
+        }
+    }
+}
+
+fn checked_size(count: usize, per: usize, extra: usize) -> usize!Error {
+    match num.checked_mul(count, per) {
+        ok(product) => {
+            match num.checked_add(product, extra) {
+                ok(total) => {
+                    return ok(total)
+                }
+                err(_) => {
+                    return err(Error.TooLarge)
+                }
+            }
+        }
+        err(_) => {
+            return err(Error.TooLarge)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PPM / PGM
+
+struct PpmHeader {
+    width: u32
+    height: u32
+    maxval: u32
+    channels: usize
+    data: usize
+}
+
+// Skip whitespace and # comments, then read a decimal number.
+fn ppm_number(data: &[u8], position: &mut usize) -> u32!Error {
+    for {
+        if *position >= data.len {
+            return err(Error.Truncated)
+        }
+        byte := data[*position]
+        if byte == b'#' {
+            for *position < data.len && data[*position] != 10 && data[*position] != 13 {
+                *position += 1
+            }
+        } else if byte == 32 || byte == 9 || byte == 10 || byte == 13 || byte == 11 || byte == 12 {
+            *position += 1
+        } else {
+            break
+        }
+    }
+    value := 0u64
+    digits := 0usize
+    for *position < data.len && data[*position] >= b'0' && data[*position] <= b'9' {
+        value = value * 10 + (data[*position] - b'0') as u64
+        if value > 0xffffffff {
+            return err(Error.TooLarge)
+        }
+        *position += 1
+        digits += 1
+    }
+    if digits == 0 {
+        if *position >= data.len {
+            return err(Error.Truncated)
+        }
+        return err(Error.Malformed)
+    }
+    return ok(value as u32)
+}
+
+fn ppm_header(data: &[u8]) -> PpmHeader!Error {
+    if data.len < 2 {
+        return err(Error.Truncated)
+    }
+    channels := 0usize
+    if data[1] == b'6' {
+        channels = 3
+    } else if data[1] == b'5' {
+        channels = 1
+    } else if data[1] >= b'1' && data[1] <= b'7' {
+        return err(Error.Unsupported)
+    } else {
+        return err(Error.Malformed)
+    }
+    position := 2usize
+    width := ppm_number(data, &mut position)?
+    height := ppm_number(data, &mut position)?
+    maxval := ppm_number(data, &mut position)?
+    if maxval == 0 || maxval > 65535 {
+        return err(Error.Malformed)
+    }
+    // Exactly one whitespace byte separates the header from the samples.
+    if position >= data.len {
+        return err(Error.Truncated)
+    }
+    position += 1
+    check_dimensions(width, height)?
+    return ok(PpmHeader { width: width, height: height, maxval: maxval, channels: channels, data: position })
+}
+
+fn draw_ppm(data: &[u8], canvas: &mut graphics.Canvas, x: i32, y: i32) -> void!Error {
+    header := ppm_header(data)?
+    sample_bytes := 1usize
+    if header.maxval > 255 {
+        sample_bytes = 2
+    }
+    count := pixel_count(header.width, header.height)?
+    length := checked_size(count, header.channels * sample_bytes, header.data)?
+    if data.len < length {
+        return err(Error.Truncated)
+    }
+    position := header.data
+    for row in 0u32..header.height {
+        for column in 0u32..header.width {
+            r := ppm_sample(data, position, sample_bytes, header.maxval)
+            position += sample_bytes
+            g := r
+            b := r
+            if header.channels == 3 {
+                g = ppm_sample(data, position, sample_bytes, header.maxval)
+                position += sample_bytes
+                b = ppm_sample(data, position, sample_bytes, header.maxval)
+                position += sample_bytes
+            }
+            put(canvas, x, y, column, row, graphics.rgb(r, g, b))
+        }
+    }
+    return ok()
+}
+
+// One sample scaled from 0..maxval to 0..255, rounded; samples above maxval
+// saturate.
+fn ppm_sample(data: &[u8], position: usize, bytes: usize, maxval: u32) -> u8 {
+    value := data[position] as u32
+    if bytes == 2 {
+        value = (value << 8) | (data[position + 1] as u32)
+    }
+    if value >= maxval {
+        return 255
+    }
+    if maxval == 255 {
+        return value as u8
+    }
+    return ((value * 255 + maxval / 2) / maxval) as u8
+}
+
+fn decimal_length(value: u32) -> usize {
+    length := 1usize
+    rest := value
+    for rest >= 10 {
+        rest = rest / 10
+        length += 1
+    }
+    return length
+}
+
+fn write_decimal(output: &mut[u8], offset: usize, value: u32) -> usize {
+    length := decimal_length(value)
+    rest := value
+    for i in 0usize..length {
+        output[offset + length - 1 - i] = b'0' + (rest % 10) as u8
+        rest = rest / 10
+    }
+    return offset + length
+}
+
+// Bytes encode_ppm writes for a width x height canvas.
+pub fn ppm_size(width: u32, height: u32) -> usize!Error {
+    header := 3 + decimal_length(width) + 1 + decimal_length(height) + 5
+    count := pixel_count(width, height)?
+    return checked_size(count, 3, header)
+}
+
+// Write `canvas` as binary PPM (P6, maxval 255; alpha is dropped) and return
+// the byte count, ppm_size(width, height).
+pub fn encode_ppm(canvas: &graphics.Canvas, output: &mut[u8]) -> usize!Error {
+    width := canvas.width()
+    height := canvas.height()
+    total := ppm_size(width, height)?
+    if output.len < total {
+        return err(Error.BufferTooSmall)
+    }
+    output[0] = b'P'
+    output[1] = b'6'
+    output[2] = 10
+    position := write_decimal(output, 3, width)
+    output[position] = 32
+    position = write_decimal(output, position + 1, height)
+    output[position] = 10
+    output[position + 1] = b'2'
+    output[position + 2] = b'5'
+    output[position + 3] = b'5'
+    output[position + 4] = 10
+    position += 5
+    for row in 0u32..height {
+        for column in 0u32..width {
+            color := pixel_at(canvas, column, row)
+            output[position] = graphics.red(color)
+            output[position + 1] = graphics.green(color)
+            output[position + 2] = graphics.blue(color)
+            position += 3
+        }
+    }
+    return ok(position)
+}
+
+// ---------------------------------------------------------------------------
+// QOI (https://qoiformat.org/qoi-specification.pdf)
+
+struct QoiHeader {
+    width: u32
+    height: u32
+    channels: u32
+}
+
+const QOI_HEADER: usize = 14
+const QOI_END: usize = 8
+const QOI_INDEX: u8 = 0x00
+const QOI_DIFF: u8 = 0x40
+const QOI_LUMA: u8 = 0x80
+const QOI_RUN: u8 = 0xc0
+const QOI_RGB: u8 = 0xfe
+const QOI_RGBA: u8 = 0xff
+
+fn qoi_header(data: &[u8]) -> QoiHeader!Error {
+    if data.len < QOI_HEADER {
+        return err(Error.Truncated)
+    }
+    width := be32(data, 4)?
+    height := be32(data, 8)?
+    channels := data[12] as u32
+    if (channels != 3 && channels != 4) || data[13] > 1 {
+        return err(Error.Malformed)
+    }
+    check_dimensions(width, height)?
+    return ok(QoiHeader { width: width, height: height, channels: channels })
+}
+
+fn qoi_hash(color: graphics.Color) -> usize {
+    r := (color >> 16) & 255
+    g := (color >> 8) & 255
+    b := color & 255
+    a := color >> 24
+    return ((r * 3 + g * 5 + b * 7 + a * 11) % 64) as usize
+}
+
+fn draw_qoi(data: &[u8], canvas: &mut graphics.Canvas, x: i32, y: i32) -> void!Error {
+    header := qoi_header(data)?
+    index := [0u32; 64]
+    r := 0u8
+    g := 0u8
+    b := 0u8
+    a := 255u8
+    run := 0u32
+    position := QOI_HEADER
+    for row in 0u32..header.height {
+        for column in 0u32..header.width {
+            if run > 0 {
+                run -= 1
+            } else {
+                if position >= data.len {
+                    return err(Error.Truncated)
+                }
+                tag := data[position]
+                position += 1
+                if tag == QOI_RGB {
+                    if position + 3 > data.len {
+                        return err(Error.Truncated)
+                    }
+                    r = data[position]
+                    g = data[position + 1]
+                    b = data[position + 2]
+                    position += 3
+                } else if tag == QOI_RGBA {
+                    if position + 4 > data.len {
+                        return err(Error.Truncated)
+                    }
+                    r = data[position]
+                    g = data[position + 1]
+                    b = data[position + 2]
+                    a = data[position + 3]
+                    position += 4
+                } else if (tag & 0xc0) == QOI_INDEX {
+                    color := index[(tag & 63) as usize]
+                    r = graphics.red(color)
+                    g = graphics.green(color)
+                    b = graphics.blue(color)
+                    a = graphics.alpha(color)
+                } else if (tag & 0xc0) == QOI_DIFF {
+                    r = core.wrapping_sub(core.wrapping_add(r, (tag >> 4) & 3), 2)
+                    g = core.wrapping_sub(core.wrapping_add(g, (tag >> 2) & 3), 2)
+                    b = core.wrapping_sub(core.wrapping_add(b, tag & 3), 2)
+                } else if (tag & 0xc0) == QOI_LUMA {
+                    if position >= data.len {
+                        return err(Error.Truncated)
+                    }
+                    second := data[position]
+                    position += 1
+                    // dg in -32..31; dr and db relative to it in -8..7.
+                    dg := core.wrapping_sub(tag & 63, 32)
+                    r = core.wrapping_add(r, core.wrapping_sub(core.wrapping_add(dg, second >> 4), 8))
+                    g = core.wrapping_add(g, dg)
+                    b = core.wrapping_add(b, core.wrapping_sub(core.wrapping_add(dg, second & 15), 8))
+                } else {
+                    run = (tag & 63) as u32
+                }
+                index[qoi_hash(graphics.rgba(r, g, b, a))] = graphics.rgba(r, g, b, a)
+            }
+            put(canvas, x, y, column, row, graphics.rgba(r, g, b, a))
+        }
+    }
+    return ok()
+}
+
+// The largest size encode_qoi can produce for a width x height canvas.
+pub fn qoi_max_size(width: u32, height: u32) -> usize!Error {
+    count := pixel_count(width, height)?
+    return checked_size(count, 5, QOI_HEADER + QOI_END)
+}
+
+// Write `canvas` as a 4-channel sRGB QOI file and return its length. The
+// output needs at most qoi_max_size(width, height) bytes; a smaller buffer
+// works when the image compresses well, else fails with BufferTooSmall.
+pub fn encode_qoi(canvas: &graphics.Canvas, output: &mut[u8]) -> usize!Error {
+    width := canvas.width()
+    height := canvas.height()
+    if output.len < QOI_HEADER + QOI_END {
+        return err(Error.BufferTooSmall)
+    }
+    output[0] = b'q'
+    output[1] = b'o'
+    output[2] = b'i'
+    output[3] = b'f'
+    put_be32(output, 4, width)
+    put_be32(output, 8, height)
+    output[12] = 4
+    output[13] = 0
+    index := [0u32; 64]
+    previous := graphics.BLACK
+    run := 0u32
+    position := QOI_HEADER
+    count := pixel_count(width, height)?
+    seen := 0usize
+    for row in 0u32..height {
+        for column in 0u32..width {
+            color := pixel_at(canvas, column, row)
+            seen += 1
+            if color == previous {
+                run += 1
+                if run == 62 || seen == count {
+                    if position + 1 > output.len {
+                        return err(Error.BufferTooSmall)
+                    }
+                    output[position] = QOI_RUN | (run - 1) as u8
+                    position += 1
+                    run = 0
+                }
+            } else {
+                if run > 0 {
+                    if position + 1 > output.len {
+                        return err(Error.BufferTooSmall)
+                    }
+                    output[position] = QOI_RUN | (run - 1) as u8
+                    position += 1
+                    run = 0
+                }
+                // Room for the largest chunk keeps the checks below simple.
+                if position + 5 > output.len {
+                    return err(Error.BufferTooSmall)
+                }
+                slot := qoi_hash(color)
+                if index[slot] == color {
+                    output[position] = QOI_INDEX | slot as u8
+                    position += 1
+                } else {
+                    index[slot] = color
+                    if graphics.alpha(color) == graphics.alpha(previous) {
+                        dr := graphics.red(color) as i32 - graphics.red(previous) as i32
+                        dg := graphics.green(color) as i32 - graphics.green(previous) as i32
+                        db := graphics.blue(color) as i32 - graphics.blue(previous) as i32
+                        dr = wrap_difference(dr)
+                        dg = wrap_difference(dg)
+                        db = wrap_difference(db)
+                        dr_dg := dr - dg
+                        db_dg := db - dg
+                        if dr >= -2 && dr <= 1 && dg >= -2 && dg <= 1 && db >= -2 && db <= 1 {
+                            output[position] = QOI_DIFF | (((dr + 2) << 4) | ((dg + 2) << 2) | (db + 2)) as u8
+                            position += 1
+                        } else if dg >= -32 && dg <= 31 && dr_dg >= -8 && dr_dg <= 7 && db_dg >= -8 && db_dg <= 7 {
+                            output[position] = QOI_LUMA | (dg + 32) as u8
+                            output[position + 1] = (((dr_dg + 8) << 4) | (db_dg + 8)) as u8
+                            position += 2
+                        } else {
+                            output[position] = QOI_RGB
+                            output[position + 1] = graphics.red(color)
+                            output[position + 2] = graphics.green(color)
+                            output[position + 3] = graphics.blue(color)
+                            position += 4
+                        }
+                    } else {
+                        output[position] = QOI_RGBA
+                        output[position + 1] = graphics.red(color)
+                        output[position + 2] = graphics.green(color)
+                        output[position + 3] = graphics.blue(color)
+                        output[position + 4] = graphics.alpha(color)
+                        position += 5
+                    }
+                }
+            }
+            previous = color
+        }
+    }
+    if position + QOI_END > output.len {
+        return err(Error.BufferTooSmall)
+    }
+    for i in 0usize..7 {
+        output[position + i] = 0
+    }
+    output[position + 7] = 1
+    return ok(position + QOI_END)
+}
+
+// A channel difference taken modulo 256 into -128..127.
+fn wrap_difference(value: i32) -> i32 {
+    if value > 127 {
+        return value - 256
+    }
+    if value < -128 {
+        return value + 256
+    }
+    return value
+}
+
+// ---------------------------------------------------------------------------
+// BMP
+
+struct BmpHeader {
+    width: u32
+    height: u32
+    top_down: bool
+    bits: u32
+    data: usize
+    stride: usize
+    palette: usize
+    palette_count: u32
+    red_mask: u32
+    green_mask: u32
+    blue_mask: u32
+    alpha_mask: u32
+}
+
+fn bmp_header(data: &[u8]) -> BmpHeader!Error {
+    if data.len < 26 {
+        return err(Error.Truncated)
+    }
+    offset := le32(data, 10)? as usize
+    header_size := le32(data, 14)?
+    if header_size < 40 {
+        // OS/2 BITMAPCOREHEADER and smaller variants.
+        return err(Error.Unsupported)
+    }
+    raw_width := le32(data, 18)?
+    raw_height := le32(data, 22)?
+    planes := le16(data, 26)?
+    bits := le16(data, 28)?
+    compression := le32(data, 30)?
+    colors_used := le32(data, 46)?
+    if planes != 1 || raw_width == 0 || raw_width > 0x7fffffff {
+        return err(Error.Malformed)
+    }
+    width := raw_width
+    height := raw_height
+    top_down := false
+    if raw_height > 0x7fffffff {
+        // A negative height stores rows top-down.
+        top_down = true
+        height = core.wrapping_sub(0u32, raw_height)
+    }
+    check_dimensions(width, height)?
+    red := 0u32
+    green := 0u32
+    blue := 0u32
+    alpha := 0u32
+    if compression == 3 || compression == 6 {
+        if bits != 16 && bits != 32 {
+            return err(Error.Malformed)
+        }
+        // Masks follow a 40-byte header, or sit inside a V2+ header.
+        red = le32(data, 54)?
+        green = le32(data, 58)?
+        blue = le32(data, 62)?
+        if compression == 6 || header_size >= 56 {
+            alpha = le32(data, 66)?
+        }
+    } else if compression != 0 {
+        return err(Error.Unsupported)
+    } else if bits == 16 {
+        red = 0x7c00
+        green = 0x03e0
+        blue = 0x001f
+    } else if bits == 24 || bits == 32 {
+        red = 0x00ff0000
+        green = 0x0000ff00
+        blue = 0x000000ff
+    }
+    if bits != 1 && bits != 4 && bits != 8 && bits != 16 && bits != 24 && bits != 32 {
+        return err(Error.Unsupported)
+    }
+    palette_count := 0u32
+    if bits <= 8 {
+        palette_count = colors_used
+        if palette_count == 0 || palette_count > (1u32 << bits) {
+            palette_count = 1u32 << bits
+        }
+    }
+    row_bits := checked_size(width as usize, bits as usize, 31)?
+    stride := (row_bits / 32) * 4
+    return ok(BmpHeader { width: width, height: height, top_down: top_down, bits: bits, data: offset, stride: stride, palette: 14 + header_size as usize, palette_count: palette_count, red_mask: red, green_mask: green, blue_mask: blue, alpha_mask: alpha })
+}
+
+// The masked field of `value` widened or narrowed to 8 bits. A mask with
+// gaps, which no real encoder writes, uses its lowest contiguous run.
+fn bmp_channel(value: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0
+    }
+    shift := 0u32
+    for ((mask >> shift) & 1) == 0 {
+        shift += 1
+    }
+    width := 0u32
+    for shift + width < 32 && ((mask >> (shift + width)) & 1) == 1 {
+        width += 1
+    }
+    low := (value & mask) >> shift
+    if width >= 8 {
+        return ((low >> (width - 8)) & 255) as u8
+    }
+    maximum := (1u32 << width) - 1
+    field := low & maximum
+    return ((field * 255 + maximum / 2) / maximum) as u8
+}
+
+fn draw_bmp(data: &[u8], canvas: &mut graphics.Canvas, x: i32, y: i32) -> void!Error {
+    header := bmp_header(data)?
+    end := checked_size(header.stride, header.height as usize, header.data)?
+    if data.len < end {
+        return err(Error.Truncated)
+    }
+    if header.bits <= 8 && header.palette + header.palette_count as usize * 4 > data.len {
+        return err(Error.Truncated)
+    }
+    for stored in 0u32..header.height {
+        row := header.height - 1 - stored
+        if header.top_down {
+            row = stored
+        }
+        start := header.data + stored as usize * header.stride
+        for column in 0u32..header.width {
+            color := graphics.BLACK
+            if header.bits <= 8 {
+                bit := column as usize * header.bits as usize
+                byte := data[start + bit / 8]
+                shift := 8 - header.bits - (bit % 8) as u32
+                entry := ((byte as u32) >> shift) & ((1u32 << header.bits) - 1)
+                if entry >= header.palette_count {
+                    return err(Error.Malformed)
+                }
+                p := header.palette + entry as usize * 4
+                color = graphics.rgb(data[p + 2], data[p + 1], data[p])
+            } else {
+                value := 0u32
+                i := start + column as usize * (header.bits / 8) as usize
+                if header.bits == 16 {
+                    value = (data[i] as u32) | ((data[i + 1] as u32) << 8)
+                } else if header.bits == 24 {
+                    value = (data[i] as u32) | ((data[i + 1] as u32) << 8) | ((data[i + 2] as u32) << 16)
+                } else {
+                    value = (data[i] as u32) | ((data[i + 1] as u32) << 8) | ((data[i + 2] as u32) << 16) | ((data[i + 3] as u32) << 24)
+                }
+                a := 255u8
+                if header.alpha_mask != 0 {
+                    a = bmp_channel(value, header.alpha_mask)
+                }
+                color = graphics.rgba(bmp_channel(value, header.red_mask), bmp_channel(value, header.green_mask), bmp_channel(value, header.blue_mask), a)
+            }
+            put(canvas, x, y, column, row, color)
+        }
+    }
+    return ok()
+}
+
+// Bytes encode_bmp writes for a width x height canvas.
+pub fn bmp_size(width: u32, height: u32) -> usize!Error {
+    stride := checked_size(width as usize, 3, 3)? / 4 * 4
+    total := checked_size(stride, height as usize, 54)?
+    if total > 0xffffffff {
+        return err(Error.TooLarge)
+    }
+    return ok(total)
+}
+
+// Write `canvas` as an uncompressed, bottom-up 24-bit BMP (alpha is dropped)
+// and return the byte count, bmp_size(width, height).
+pub fn encode_bmp(canvas: &graphics.Canvas, output: &mut[u8]) -> usize!Error {
+    width := canvas.width()
+    height := canvas.height()
+    total := bmp_size(width, height)?
+    if output.len < total {
+        return err(Error.BufferTooSmall)
+    }
+    stride := (width as usize * 3 + 3) / 4 * 4
+    for i in 0usize..54 {
+        output[i] = 0
+    }
+    output[0] = b'B'
+    output[1] = b'M'
+    put_le32(output, 2, total as u32)
+    put_le32(output, 10, 54)
+    put_le32(output, 14, 40)
+    put_le32(output, 18, width)
+    put_le32(output, 22, height)
+    put_le16(output, 26, 1)
+    put_le16(output, 28, 24)
+    put_le32(output, 34, (stride * height as usize) as u32)
+    // 2835 pixels per metre is 72 DPI.
+    put_le32(output, 38, 2835)
+    put_le32(output, 42, 2835)
+    for stored in 0u32..height {
+        row := height - 1 - stored
+        start := 54 + stored as usize * stride
+        for column in 0u32..width {
+            color := pixel_at(canvas, column, row)
+            i := start + column as usize * 3
+            output[i] = graphics.blue(color)
+            output[i + 1] = graphics.green(color)
+            output[i + 2] = graphics.red(color)
+        }
+        for i in start + width as usize * 3..start + stride {
+            output[i] = 0
+        }
+    }
+    return ok(total)
+}

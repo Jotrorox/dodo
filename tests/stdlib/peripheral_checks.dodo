@@ -5,6 +5,7 @@ import "core/ptr"
 import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_pins"
+import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/hal/fake"
 import "std/embedded/peripheral/designware_i2c"
@@ -16,7 +17,8 @@ import "std/io"
 // Host checks for std/embedded/peripheral: the DesignWare I2C, PL022 SPI, and
 // PL011 UART controller drivers against behavioural models of the
 // controllers, the RP2040 and RP2350 PWM and ADC drivers against models of
-// those blocks, and the pin and controller ownership and panic reports of
+// those blocks, the PIO driver against memory standing in for a PIO block,
+// and the pin and controller ownership and panic reports of
 // std/embedded/chip/rp_pins. The models enforce the hardware's rules
 // (registers that may change only while disabled, FIFO depths, the flushed
 // state after an abort) and process commands slower than the drivers poll,
@@ -3101,6 +3103,9 @@ static mut ADC_MEMORY: [4096]u32 = [0u32; 4096]
 static mut ADC_STARTS: u32 = 0
 static mut ADC_STOPS: u32 = 0
 static mut FAIL_ADC: bool = false
+// The fake chip's PIO blocks, 4096 words each, and their PIO version.
+static mut PIO_MEMORY: [12288]u32 = [0u32; 12288]
+static mut PIO_VERSION: u32 = 1
 
 const SIO: u32 = 5
 const UART: u32 = 2
@@ -3138,7 +3143,9 @@ struct FakeChip {
 
     pub fn base(&self, controller: u32) -> usize {
         unsafe {
-            if controller == rp_pins.PWM {
+            if controller >= rp_pins.PIO0 {
+                return pio_base(controller - rp_pins.PIO0)
+            } else if controller == rp_pins.PWM {
                 return ptr.from_mut(&mut PWM_MEMORY) as usize
             } else if controller == rp_pins.ADC {
                 return ptr.from_mut(&mut ADC_MEMORY) as usize
@@ -3171,6 +3178,20 @@ struct FakeChip {
         unsafe {
             return UART_AUX
         }
+    }
+
+    pub fn pio_blocks(&self) -> u32 {
+        return 3
+    }
+
+    pub fn pio_version(&self) -> u32 {
+        unsafe {
+            return PIO_VERSION
+        }
+    }
+
+    pub fn pio_irq(&self, block: u32) -> u32 {
+        return 15 + 2 * block
     }
 }
 
@@ -3588,6 +3609,408 @@ fn rp_bank_uart_rules() {
     bank.release_gpio(free)
 }
 
+// --- The RP PIO blocks -----------------------------------------------------
+
+// The PIO driver only writes registers and polls FIFO status, so plain
+// memory stands in for a block: a write to an atomic alias lands in the
+// alias's own word, where the checks read it back.
+const PIO_CTRL: usize = 0x000
+const PIO_FSTAT: usize = 0x004
+const PIO_FDEBUG: usize = 0x008
+const PIO_FLEVEL: usize = 0x00C
+const PIO_IRQ: usize = 0x030
+const PIO_IRQ_FORCE: usize = 0x034
+const PIO_SYNC_BYPASS: usize = 0x038
+const PIO_INSTR_MEM: usize = 0x048
+const PIO_SM1: usize = 0x0E0
+const PIO_PUTGET: usize = 0x128
+const PIO_FUNCTION: u32 = 6
+const SET: usize = 0x2000
+const CLEAR: usize = 0x3000
+
+fn pio_base(block: u32) -> usize {
+    unsafe {
+        return ptr.from_mut(&mut PIO_MEMORY) as usize + 0x4000 * block as usize
+    }
+}
+
+fn pio_word(block: u32, offset: usize) -> u32 {
+    unsafe {
+        return PIO_MEMORY[4096 * block as usize + offset / 4]
+    }
+}
+
+fn set_pio_word(block: u32, offset: usize, value: u32) {
+    unsafe {
+        PIO_MEMORY[4096 * block as usize + offset / 4] = value
+    }
+}
+
+fn clear_pio(block: u32) {
+    for index in 0..4096usize {
+        set_pio_word(block, 4 * index, 0)
+    }
+    // Every FIFO empty.
+    set_pio_word(block, PIO_FSTAT, 0x0F00_0F00)
+}
+
+fn pio_block(block: u32, version: u32) -> rp_pio.Pio {
+    clear_pio(block)
+    unsafe {
+        return rp_pio.Pio.at(pio_base(block), block, version, CLOCK_HZ, 7 + 2 * block)
+    }
+}
+
+// A program of `words` at `origin` with no settings of its own.
+fn pio_program(words: &[u16], origin: u32) -> rp_pio.Program {
+    instructions := [0u16; 32]
+    for index in 0..words.len {
+        instructions[index] = words[index]
+    }
+    length := words.len as u32
+    return rp_pio.Program { instructions, length, origin, wrap_target: 0, wrap: length - 1, side_set_count: 0, side_set_optional: false, side_set_pindirs: false, version: 0, clock_divider: 256, fifo: rp_pio.FIFO_TXRX, status_select: 0, status_n: 0, in_count: 32, in_right: true, autopush: false, push_threshold: 32, out_count: 0, out_right: true, autopull: false, pull_threshold: 32, set_count: 0 }
+}
+
+fn expect_failure(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+fn expect_unsupported<T>(result: T!hal.Error) {
+    match result {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Unsupported)
+        }
+    }
+}
+
+// Programs land at their origin or the highest free slots, with JMP
+// targets moved along; memory is owned once and freed by unload.
+fn pio_loading() {
+    pio := pio_block(0, 0)
+    // The datasheet's square wave: set pindirs, set pins [1], set pins,
+    // jmp 1.
+    words1 := [0xE081u16, 0xE101, 0xE000, 0x0001]
+    square := pio_program(&words1, rp_pio.ANYWHERE)
+    high := pio.load(&square)!
+    core.assert(high.offset() == 28 && high.length() == 4 && pio.memory() == 0xF000_0000)
+    core.assert(pio_word(0, PIO_INSTR_MEM + 4 * 28) == 0xE081 && pio_word(0, PIO_INSTR_MEM + 4 * 31) == 29)
+    below := pio.load(&square)!
+    core.assert(below.offset() == 24 && pio_word(0, PIO_INSTR_MEM + 4 * 27) == 25)
+    words2 := [0x0001u16, 0x0000]
+    fixed := pio_program(&words2, 0)
+    origin := pio.load(&fixed)!
+    core.assert(origin.offset() == 0 && pio_word(0, PIO_INSTR_MEM + 4) == 0 && pio.memory() == 0xFF00_0003)
+    expect_busy(pio.load(&fixed))
+    // 22 slots are left: a program of 23 does not fit, one of 22 does.
+    words3 := [0xA042u16; 23]
+    long := pio_program(&words3, rp_pio.ANYWHERE)
+    expect_busy(pio.load(&long))
+    words4 := [0xA042u16; 22]
+    fits := pio_program(&words4, rp_pio.ANYWHERE)
+    rest := pio.load(&fits)!
+    core.assert(rest.offset() == 2 && pio.memory() == 0xFFFF_FFFF)
+    pio.unload(below)
+    core.assert(pio.memory() == 0xF0FF_FFFF)
+    again := pio.load(&square)!
+    core.assert(again.offset() == 24)
+    pio.unload(again)
+    pio.unload(high)
+    pio.unload(origin)
+    pio.unload(rest)
+    core.assert(pio.memory() == 0)
+    // Malformed programs and RP2350 programs on an RP2040 are refused.
+    words5 := [0xA042u16]
+    empty := pio_program(&words5, rp_pio.ANYWHERE)
+    empty.length = 0
+    expect_invalid(pio.load(&empty))
+    words6 := [0xA042u16, 0xA042]
+    late := pio_program(&words6, 31)
+    expect_invalid(pio.load(&late))
+    words7 := [0xA042u16]
+    wrapped := pio_program(&words7, rp_pio.ANYWHERE)
+    wrapped.wrap = 1
+    expect_invalid(pio.load(&wrapped))
+    words8 := [0xA061u16]
+    newer := pio_program(&words8, rp_pio.ANYWHERE)
+    newer.version = 1
+    expect_unsupported(pio.load(&newer))
+    newer.version = 0
+    newer.fifo = rp_pio.FIFO_PUTGET
+    expect_unsupported(pio.load(&newer))
+    core.assert(pio.memory() == 0)
+}
+
+// A program's settings become the config's, and init writes them to the
+// state machine's registers.
+fn pio_configs() {
+    pio := pio_block(1, 1)
+    words9 := [0xA042u16, 0xA042, 0xA042]
+    program := pio_program(&words9, rp_pio.ANYWHERE)
+    program.wrap_target = 1
+    program.wrap = 2
+    program.side_set_count = 3
+    program.side_set_optional = true
+    program.side_set_pindirs = true
+    program.clock_divider = 640
+    program.fifo = rp_pio.FIFO_TX
+    program.status_select = rp_pio.STATUS_IRQ
+    program.status_n = 19
+    program.in_count = 5
+    program.in_right = false
+    program.autopull = true
+    program.pull_threshold = 24
+    program.out_count = 3
+    program.set_count = 2
+    loaded := pio.load(&program)!
+    core.assert(loaded.offset() == 29)
+    config := loaded.config()
+    core.assert(config.divider() == 640)
+    machine := pio.state_machine(1)!
+    machine.init(&config)
+    // EXECCTRL: side-set enable and pindirs, wrap 31 to 30, status IRQ 19.
+    core.assert_eq(pio_word(1, PIO_SM1 + 4), (3u32 << 29) | (31u32 << 12) | (30u32 << 7) | (2u32 << 5) | 19)
+    // SHIFTCTRL: TX join, pull threshold 24, push 32, right-shifting OSR,
+    // autopull, five IN pins.
+    core.assert_eq(pio_word(1, PIO_SM1 + 8), (1u32 << 30) | (24u32 << 25) | (1u32 << 19) | (1u32 << 17) | 5)
+    // PINCTRL: three side-set bits, two SET pins, three OUT pins.
+    core.assert_eq(pio_word(1, PIO_SM1 + 0x14), (3u32 << 29) | (2u32 << 26) | (3u32 << 20))
+    core.assert_eq(pio_word(1, PIO_SM1), 640u32 << 8)
+    // The FIFOs clear (FJOIN_RX flips there and back), errors clear, the
+    // machine and its divider restart, and it jumps to its start.
+    core.assert(pio_word(1, PIO_SM1 + 8 + 0x1000) == 1u32 << 31 && pio_word(1, PIO_FDEBUG) == 0x0202_0202)
+    core.assert(pio_word(1, PIO_CTRL + SET) == 1u32 << 9 && pio_word(1, PIO_SM1 + 0x10) == 29)
+    core.assert(pio_word(1, PIO_CTRL + CLEAR) == 1u32 << 1)
+    machine.set_enabled(true)
+    core.assert(pio_word(1, PIO_CTRL + SET) == 1u32 << 1)
+
+    // Settings change one field each.
+    config.set_frequency(1_000_000)!
+    core.assert(config.divider() == 32_000 && config.frequency_hz() == 1_000_000)
+    config.set_divider(256 * 3 + 128)!
+    core.assert(config.frequency_hz() == 35_714_286)
+    config.set_out_pins(5, 3)!
+    config.set_set_pins(6, 2)!
+    config.set_in_pins(7)!
+    config.set_sideset_pins(8)!
+    config.set_jmp_pin(9)!
+    config.set_in_shift(true, true, 8)!
+    config.set_out_shift(false, false, 32)!
+    config.set_fifo_join(rp_pio.FIFO_PUTGET)!
+    config.set_mov_status(rp_pio.STATUS_RX_LESS, 2)!
+    config.set_out_special(true, some(4u32))!
+    config.set_wrap(3, 7)!
+    config.set_start(4)!
+    machine.init(&config)
+    core.assert_eq(pio_word(1, PIO_SM1 + 0x14), (3u32 << 29) | (2u32 << 26) | (3u32 << 20) | (7u32 << 15) | (8u32 << 10) | (6u32 << 5) | 5)
+    core.assert_eq(pio_word(1, PIO_SM1 + 4), (3u32 << 29) | (9u32 << 24) | (4u32 << 19) | (3u32 << 17) | (7u32 << 12) | (3u32 << 7) | (1u32 << 5) | 2)
+    core.assert_eq(pio_word(1, PIO_SM1 + 8), (3u32 << 14) | (8u32 << 20) | (1u32 << 18) | (1u32 << 16) | 5)
+    core.assert(pio_word(1, PIO_SM1) == 896u32 << 8 && pio_word(1, PIO_SM1 + 0x10) == 4)
+    expect_failure(config.set_out_pins(32, 1), hal.Error.InvalidInput)
+    expect_failure(config.set_out_pins(0, 33), hal.Error.InvalidInput)
+    expect_failure(config.set_set_pins(0, 6), hal.Error.InvalidInput)
+    expect_failure(config.set_divider(255), hal.Error.InvalidInput)
+    expect_failure(config.set_frequency(0), hal.Error.InvalidInput)
+    expect_failure(config.set_frequency(1000), hal.Error.InvalidInput)
+    expect_failure(config.set_fifo_join(6), hal.Error.InvalidInput)
+    expect_failure(config.set_in_shift(true, false, 0), hal.Error.InvalidInput)
+    expect_failure(config.set_mov_status(rp_pio.STATUS_IRQ, 24), hal.Error.InvalidInput)
+    expect_failure(config.set_wrap(32, 0), hal.Error.InvalidInput)
+    expect_failure(config.set_start(32), hal.Error.InvalidInput)
+    pio.release_state_machine(machine)
+    core.assert(pio_word(1, PIO_CTRL + CLEAR) == 1u32 << 1)
+
+    // The RP2040's state machines have no IN count, RX FIFO registers,
+    // or IRQ status, and four status bits.
+    older := pio_block(0, 0)
+    words10 := [0xA042u16]
+    single := pio_program(&words10, rp_pio.ANYWHERE)
+    loaded = older.load(&single)!
+    config = loaded.config()
+    config.set_in_count(32)!
+    expect_failure(config.set_in_count(5), hal.Error.Unsupported)
+    expect_failure(config.set_fifo_join(rp_pio.FIFO_TXGET), hal.Error.Unsupported)
+    expect_failure(config.set_mov_status(rp_pio.STATUS_IRQ, 1), hal.Error.Unsupported)
+    expect_failure(config.set_mov_status(rp_pio.STATUS_TX_LESS, 16), hal.Error.InvalidInput)
+    config.set_mov_status(rp_pio.STATUS_RX_LESS, 15)!
+    machine = older.state_machine(0)!
+    machine.init(&config)
+    core.assert_eq(pio_word(0, 0x0C8 + 4) & 0x7F, 0x1Fu32)
+    expect_unsupported(machine.rx_register(0))
+    older.release_state_machine(machine)
+}
+
+// FIFO words, levels, and status; executed instructions; pins set through
+// the state machine; the RP2350's RX FIFO registers.
+fn pio_fifos() {
+    pio := pio_block(2, 1)
+    first := pio.state_machine(0)!
+    machine := pio.state_machine(1)!
+    machine.put(0x1234)
+    core.assert(pio_word(2, 0x014) == 0x1234 && pio_word(2, 0x010) == 0)
+    // TX full for state machine 1 only.
+    set_pio_word(2, PIO_FSTAT, 0x0F00_0F00 | (1u32 << 17))
+    core.assert(machine.is_tx_full() && !first.is_tx_full() && !machine.try_put(7) && first.try_put(8))
+    core.assert(pio_word(2, 0x014) == 0x1234 && pio_word(2, 0x010) == 8)
+    match machine.try_get() {
+        some(_) => {
+            core.assert(false)
+        }
+        none => {}
+    }
+    // A word for state machine 1.
+    set_pio_word(2, PIO_FSTAT, 0x0F00_0D00)
+    set_pio_word(2, 0x024, 0xCAFE)
+    core.assert(machine.get() == 0xCAFE && !machine.is_rx_empty() && first.is_rx_empty())
+    match machine.try_get() {
+        some(word) => {
+            core.assert(word == 0xCAFE)
+        }
+        none => {
+            core.assert(false)
+        }
+    }
+    set_pio_word(2, PIO_FLEVEL, 0x0000_3521)
+    core.assert(machine.tx_level() == 5 && machine.rx_level() == 3 && first.tx_level() == 1 && first.rx_level() == 2)
+    set_pio_word(2, PIO_FDEBUG, 1u32 << 25)
+    core.assert(machine.take_tx_stall() && pio_word(2, PIO_FDEBUG) == 1u32 << 25)
+    set_pio_word(2, PIO_FDEBUG, 0)
+    core.assert(!machine.take_tx_stall())
+    machine.exec(0xE03F)
+    core.assert(pio_word(2, PIO_SM1 + 0x10) == 0xE03F)
+    machine.jump(12)
+    core.assert(pio_word(2, PIO_SM1 + 0x10) == 12)
+    set_pio_word(2, PIO_SM1 + 0x0C, 0x13)
+    core.assert(machine.address() == 0x13 && !machine.is_exec_stalled())
+
+    // Pins are set one at a time with SET mapped to each, then the mapping
+    // and sticky output come back.
+    set_pio_word(2, PIO_SM1 + 0x14, 0x1234_5678)
+    set_pio_word(2, PIO_SM1 + 4, 0x0002_0000)
+    machine.set_pins(30, 3, 0b011)
+    core.assert(pio_word(2, PIO_SM1 + 0x10) == 0xE000 && pio_word(2, PIO_SM1 + 4 + CLEAR) == 1u32 << 17)
+    core.assert(pio_word(2, PIO_SM1 + 0x14) == 0x1234_5678 && pio_word(2, PIO_SM1 + 4) == 0x0002_0000)
+    machine.set_pindirs(4, 2, 0b10)
+    core.assert(pio_word(2, PIO_SM1 + 0x10) == 0xE081)
+
+    machine.set_rx_register(2, 77)!
+    core.assert(pio_word(2, PIO_PUTGET + 0x10 + 8) == 77)
+    set_pio_word(2, PIO_PUTGET + 0x10 + 12, 99)
+    core.assert(machine.rx_register(3)! == 99)
+    expect_invalid(machine.rx_register(4))
+    core.assert(machine.tx_fifo_address() == pio_base(2) + 0x014 && machine.rx_fifo_address() == pio_base(2) + 0x024)
+    pio.release_state_machine(first)
+    pio.release_state_machine(machine)
+}
+
+// State machines are owned once; IRQ flags, interrupts, and synchronized
+// starts reach only what the block's owner may touch.
+fn pio_machines_and_interrupts() {
+    pio := pio_block(0, 1)
+    zero := pio.state_machine(0)!
+    expect_busy(pio.state_machine(0))
+    expect_invalid(pio.state_machine(4))
+    one := pio.free_state_machine()!
+    core.assert(one.index() == 1 && one.block() == 0 && pio.machines() == 0b11)
+    pio.enable_in_sync(0b1111)
+    core.assert(pio_word(0, PIO_CTRL + SET) == 0x303)
+    // IRQ0_INTE and IRQ1_INTE of an RP2350 block, through their aliases.
+    pio.listen(0, rp_pio.rx_not_empty(1) | rp_pio.flag(7))
+    core.assert(pio_word(0, 0x170 + SET) == 0x8002)
+    pio.ignore(1, rp_pio.tx_not_full(0))
+    core.assert(pio_word(0, 0x17C + CLEAR) == 0x10)
+    set_pio_word(0, 0x178, 0x8002)
+    core.assert(pio.interrupts(0) == 0x8002 && pio.irq(0) == 7 && pio.irq(1) == 8)
+    set_pio_word(0, PIO_IRQ, 0x1A5)
+    core.assert(pio.flags() == 0xA5)
+    pio.clear_flags(0x101)
+    pio.force_flags(0x2)
+    core.assert(pio_word(0, PIO_IRQ) == 0x1 && pio_word(0, PIO_IRQ_FORCE) == 0x2)
+    pio.bypass_input_sync(5, true)
+    pio.bypass_input_sync(6, false)
+    core.assert(pio_word(0, PIO_SYNC_BYPASS + SET) == 1u32 << 5 && pio_word(0, PIO_SYNC_BYPASS + CLEAR) == 1u32 << 6)
+    // A released machine stops and stops raising interrupts.
+    pio.release_state_machine(one)
+    core.assert(pio_word(0, PIO_CTRL + CLEAR) == 1u32 << 1 && pio_word(0, 0x17C + CLEAR) == 0x22 && pio.machines() == 1)
+    again := pio.free_state_machine()!
+    core.assert(again.index() == 1)
+    pio.release_state_machine(again)
+    pio.release_state_machine(zero)
+    set_pio_word(0, PIO_CTRL, 0xF)
+    core.assert(pio.release() == 0 && pio_word(0, PIO_CTRL) == 0)
+
+    // The RP2040's interrupt registers sit lower, with four flags.
+    older := pio_block(1, 0)
+    older.listen(1, rp_pio.flag(3) | rp_pio.flag(4))
+    core.assert(pio_word(1, 0x138 + SET) == 0x800 && older.irq(1) == 10)
+}
+
+// The bank hands out each block once, out of reset, with the pins given to
+// it, and takes them back.
+fn rp_bank_pio() {
+    bank := unsafe {
+        rp_pins.Bank.new(FakeChip {})
+    }
+    resets := unsafe {
+        RESETS
+    }
+    expect_invalid(bank.pio(3))
+    pio := bank.pio(1)!
+    core.assert(pio.number() == 1 && pio.version() == 1 && pio.irq(0) == 17 && !held(rp_pins.PIO1))
+    unsafe {
+        core.assert_eq(RESETS, resets + 1)
+    }
+    expect_busy(bank.pio(1))
+    led := bank.gpio(12)!
+    expect_failure(bank.pio_pins(&pio, 11, 2), hal.Error.Busy)
+    expect_failure(bank.pio_pins(&pio, 29, 2), hal.Error.InvalidInput)
+    expect_failure(bank.pio_pins(&pio, 3, 0), hal.Error.InvalidInput)
+    bank.pio_pins(&pio, 13, 3)!
+    core.assert(function(13) == PIO_FUNCTION + 1 && function(15) == PIO_FUNCTION + 1 && function(12) == SIO)
+    unsafe {
+        core.assert((PADS[14] & OUTPUT_DISABLE) == 0 && (PADS[14] & INPUT_ENABLE) != 0)
+    }
+    expect_busy(bank.gpio(14))
+    // Another block's pins.
+    zero := bank.pio(0)!
+    bank.pio_pins(&zero, 0, 1)!
+    core.assert(function(0) == PIO_FUNCTION)
+    machine := pio.state_machine(2)!
+    pio.release_state_machine(machine)
+    bank.release_pio(pio)
+    core.assert(function(13) == DISCONNECTED && function(15) == DISCONNECTED && function(0) == PIO_FUNCTION && held(rp_pins.PIO1))
+    free := bank.gpio(14)!
+    bank.release_gpio(free)
+    // A failed reset claims nothing.
+    unsafe {
+        FAIL_RESET = true
+    }
+    match bank.pio(1) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+    unsafe {
+        FAIL_RESET = false
+    }
+    again := bank.pio(1)!
+    bank.release_pio(again)
+    bank.release_pio(zero)
+    bank.release_gpio(led)
+}
+
 fn main() {
     i2c_timing()
     i2c_configuration()
@@ -3620,4 +4043,9 @@ fn main() {
     pwm_channels()
     adc_inputs()
     rp_bank_pwm_and_adc()
+    pio_loading()
+    pio_configs()
+    pio_fifos()
+    pio_machines_and_interrupts()
+    rp_bank_pio()
 }

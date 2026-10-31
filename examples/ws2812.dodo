@@ -1,0 +1,90 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_pio"
+
+// A rainbow on a strip of WS2812 ("NeoPixel") LEDs, driven by one PIO
+// state machine. WS2812s take 24-bit colours as pulses on one data line:
+// at 800 kbit/s, each bit is a high pulse of 0.375 us for a zero or
+// 0.875 us for a one, then low for the rest of its 1.25 us. That timing
+// is too tight for software to keep while it does anything else, so a
+// four-instruction PIO program makes the pulses, and the program only
+// queues colours. Connect the strip's data input to GP2, its power to
+// VBUS (5 V), and its ground to GND, then flash the board from BOOTSEL
+// mode with:
+//
+//     dodo run examples/ws2812.dodo --board pico
+//
+// (or --board pico2 or pico2_w).
+
+const DATA_PIN: u32 = 2
+const LEDS: u32 = 8
+
+// From the Pico SDK's examples. Each bit takes T1 + T2 + T3 = 10 cycles:
+// T1 high for every bit, then T2 high for a one or low for a zero, then
+// T3 low. Side-set drives the data pin, alongside each instruction.
+const WS2812: rp_pio.Program = rp_pio.assemble(
+    ".program ws2812",
+    ".side_set 1",
+    ".define T1 3",
+    ".define T2 4",
+    ".define T3 3",
+    ".wrap_target",
+    "bitloop:",
+    "    out x, 1       side 0 [T3 - 1] ; side-set happens even while out stalls",
+    "    jmp !x do_zero side 1 [T1 - 1] ; every bit starts high",
+    "do_one:",
+    "    jmp bitloop    side 1 [T2 - 1] ; a one stays high",
+    "do_zero:",
+    "    nop            side 0 [T2 - 1] ; a zero goes low",
+    ".wrap",
+)
+
+fn main() {
+    b := board.take()!
+    pio := b.pins.pio(0)!
+    b.pins.pio_pins(&pio, DATA_PIN, 1)!
+    loaded := pio.load(&WS2812)!
+    config := loaded.config()
+    config.set_sideset_pins(DATA_PIN)!
+    // Colours go out most significant bit first, 24 bits a word, pulled
+    // from the FIFO automatically; the TX FIFO takes the RX FIFO's space.
+    config.set_out_shift(false, true, 24)!
+    config.set_fifo_join(rp_pio.FIFO_TX)!
+    config.set_frequency(800_000 * 10)!
+    strip := pio.state_machine(0)!
+    strip.init(&config)
+    strip.set_pins(DATA_PIN, 1, 0)
+    strip.set_pindirs(DATA_PIN, 1, 1)
+    strip.set_enabled(true)
+    hue := 0u32
+    for {
+        for led in 0..LEDS {
+            strip.put(color((hue + led * 256 / LEDS) % 256) << 8)
+        }
+        hue = (hue + 1) % 256
+        // A pause of more than 50 us latches the colours.
+        b.timer.delay_ms(20)
+    }
+}
+
+// The colour at `position`, 0 to 255, around a red, green, blue wheel, at
+// an eighth of full brightness, as the WS2812's 24 bits: green, red, blue.
+fn color(position: u32) -> u32 {
+    rising := (position % 85) * 3
+    falling := 255 - rising
+    red := 0u32
+    green := 0u32
+    blue := 0u32
+    if position < 85 {
+        red = falling
+        green = rising
+    } else if position < 170 {
+        green = falling
+        blue = rising
+    } else {
+        blue = falling
+        red = rising
+    }
+    return ((green / 8) << 16) | ((red / 8) << 8) | (blue / 8)
+}
