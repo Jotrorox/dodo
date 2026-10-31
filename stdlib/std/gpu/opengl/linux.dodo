@@ -1,0 +1,343 @@
+package linux
+
+import "core/ptr"
+import "std/gpu/opengl/common"
+
+// OpenGL contexts on Linux through EGL, without an X server or Wayland.
+//
+// libEGL is opened at run time with dlopen, so a program links no graphics
+// library and still starts on a machine without one. The display is Mesa's
+// surfaceless platform when the driver offers it, which needs no window
+// system at all, and otherwise the default display, which vendor drivers
+// such as NVIDIA's serve headless. Contexts are made current without a
+// surface where EGL_KHR_surfaceless_context allows, and with a 1x1 pbuffer
+// elsewhere; drawing goes to framebuffer objects either way.
+
+unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> usize
+unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
+
+const RTLD_NOW: i32 = 2
+
+const EGL_NONE: i32 = 0x3038
+const EGL_EXTENSIONS: i32 = 0x3055
+const EGL_SURFACE_TYPE: i32 = 0x3033
+const EGL_PBUFFER_BIT: i32 = 0x0001
+const EGL_RENDERABLE_TYPE: i32 = 0x3040
+const EGL_OPENGL_BIT: i32 = 0x0008
+const EGL_WIDTH: i32 = 0x3057
+const EGL_HEIGHT: i32 = 0x3056
+const EGL_OPENGL_API: u32 = 0x30a2
+const EGL_CONTEXT_MAJOR_VERSION: i32 = 0x3098
+const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30fb
+const EGL_CONTEXT_OPENGL_PROFILE_MASK: i32 = 0x30fd
+const EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT: i32 = 0x0001
+const EGL_CONTEXT_OPENGL_DEBUG: i32 = 0x31b0
+const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31dd
+
+type GetProcAddress = extern "C" fn(*const u8) -> usize
+type QueryString = extern "C" fn(*mut u8, i32) -> *const u8
+type GetDisplay = extern "C" fn(*mut u8) -> *mut u8
+type GetPlatformDisplay = extern "C" fn(u32, *mut u8, *const i32) -> *mut u8
+type Initialize = extern "C" fn(*mut u8, *mut i32, *mut i32) -> u32
+type BindApi = extern "C" fn(u32) -> u32
+type ChooseConfig = extern "C" fn(*mut u8, *const i32, *mut *mut u8, i32, *mut i32) -> u32
+type CreateContext = extern "C" fn(*mut u8, *mut u8, *mut u8, *const i32) -> *mut u8
+type DestroyContext = extern "C" fn(*mut u8, *mut u8) -> u32
+type CreatePbufferSurface = extern "C" fn(*mut u8, *mut u8, *const i32) -> *mut u8
+type DestroySurface = extern "C" fn(*mut u8, *mut u8) -> u32
+type MakeCurrent = extern "C" fn(*mut u8, *mut u8, *mut u8, *mut u8) -> u32
+type GetCurrentContext = extern "C" fn() -> *mut u8
+
+fn null() -> *mut u8 {
+    unsafe {
+        return 0usize as *mut u8
+    }
+}
+
+unsafe fn open(path: &[u8]) -> *mut u8 {
+    unsafe {
+        return dlopen(common.c_string(path), RTLD_NOW)
+    }
+}
+
+// Every EGL entry point the backend uses, from libEGL's exports.
+struct Egl {
+    get_proc_address: GetProcAddress
+    query_string: QueryString
+    get_display: GetDisplay
+    initialize: Initialize
+    bind_api: BindApi
+    choose_config: ChooseConfig
+    create_context: CreateContext
+    destroy_context: DestroyContext
+    create_pbuffer_surface: CreatePbufferSurface
+    destroy_surface: DestroySurface
+    make_current: MakeCurrent
+    get_current_context: GetCurrentContext
+}
+
+unsafe fn load_egl(library: *mut u8) -> Option<Egl> {
+    names := [
+        b"eglGetProcAddress\0", b"eglQueryString\0", b"eglGetDisplay\0", b"eglInitialize\0",
+        b"eglBindAPI\0", b"eglChooseConfig\0", b"eglCreateContext\0",
+        b"eglDestroyContext\0", b"eglCreatePbufferSurface\0", b"eglDestroySurface\0",
+        b"eglMakeCurrent\0", b"eglGetCurrentContext\0"
+    ]
+    addresses := [0usize; 12]
+    for i in 0usize..12 {
+        address := unsafe {
+            dlsym(library, common.c_string(names[i]))
+        }
+        if address == 0 {
+            return none
+        }
+        addresses[i] = address
+    }
+    unsafe {
+        return some(Egl {
+            get_proc_address: addresses[0] as GetProcAddress,
+            query_string: addresses[1] as QueryString,
+            get_display: addresses[2] as GetDisplay,
+            initialize: addresses[3] as Initialize,
+            bind_api: addresses[4] as BindApi,
+            choose_config: addresses[5] as ChooseConfig,
+            create_context: addresses[6] as CreateContext,
+            destroy_context: addresses[7] as DestroyContext,
+            create_pbuffer_surface: addresses[8] as CreatePbufferSurface,
+            destroy_surface: addresses[9] as DestroySurface,
+            make_current: addresses[10] as MakeCurrent,
+            get_current_context: addresses[11] as GetCurrentContext
+        })
+    }
+}
+
+pub struct Backend {
+    library: *mut u8
+    // libOpenGL or libGL, for commands eglGetProcAddress does not return on
+    // drivers without EGL_KHR_get_all_proc_addresses; may be null.
+    gl_library: *mut u8
+    egl: Egl
+    display: *mut u8
+    context: *mut u8
+    surface: *mut u8
+
+    // Create a context for OpenGL `major`.`minor`, core profile from 3.2, and
+    // make it current on the calling thread.
+    pub fn create(major: u32, minor: u32, debug: bool) -> Backend!common.Error {
+        library := unsafe {
+            open(b"libEGL.so.1\0")
+        }
+        if ptr.is_null(library) {
+            library = unsafe {
+                open(b"libEGL.so\0")
+            }
+        }
+        if ptr.is_null(library) {
+            return err(common.Error.NoLibrary)
+        }
+        egl := match unsafe {
+            load_egl(library)
+        }
+        {
+            some(egl) => egl,
+            none => {
+                unsafe {
+                    dlclose(library)
+                }
+                return err(common.Error.NoLibrary)
+            }
+        }
+        gl_library := unsafe {
+            open(b"libOpenGL.so.0\0")
+        }
+        if ptr.is_null(gl_library) {
+            gl_library = unsafe {
+                open(b"libGL.so.1\0")
+            }
+        }
+        backend := Backend {
+            library: library,
+            gl_library: gl_library,
+            egl: egl,
+            display: null(),
+            context: null(),
+            surface: null()
+        }
+        backend.open_display()?
+        bind := backend.egl.bind_api
+        if unsafe {
+            bind(EGL_OPENGL_API)
+        } == 0 {
+            return err(common.Error.Unsupported)
+        }
+        query := backend.egl.query_string
+        extensions := unsafe {
+            query(backend.display, EGL_EXTENSIONS)
+        }
+        surfaceless := unsafe {
+            common.has_word(extensions, b"EGL_KHR_surfaceless_context")
+        }
+        // A surfaceless context needs no surface type; a pbuffer one does.
+        surface_type := EGL_PBUFFER_BIT
+        if surfaceless {
+            surface_type = 0
+        }
+        config_attributes := [EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_SURFACE_TYPE, surface_type, EGL_NONE]
+        config := null()
+        count := 0i32
+        choose := backend.egl.choose_config
+        chosen := unsafe {
+            choose(backend.display, ptr.as_ptr(&config_attributes), ptr.from_mut(&mut config), 1, ptr.from_mut(&mut count))
+        }
+        if chosen == 0 || count < 1 {
+            return err(common.Error.NoConfig)
+        }
+        profile := 0i32
+        if major > 3 || (major == 3 && minor >= 2) {
+            profile = EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT
+        }
+        // Only nondefault attributes, so drivers without EGL 1.5's debug
+        // attribute still create ordinary contexts.
+        context_attributes := [EGL_NONE; 9]
+        context_attributes[0] = EGL_CONTEXT_MAJOR_VERSION
+        context_attributes[1] = major as i32
+        context_attributes[2] = EGL_CONTEXT_MINOR_VERSION
+        context_attributes[3] = minor as i32
+        used := 4usize
+        if profile != 0 {
+            context_attributes[used] = EGL_CONTEXT_OPENGL_PROFILE_MASK
+            context_attributes[used + 1] = profile
+            used += 2
+        }
+        if debug {
+            context_attributes[used] = EGL_CONTEXT_OPENGL_DEBUG
+            context_attributes[used + 1] = 1
+        }
+        create := backend.egl.create_context
+        context := unsafe {
+            create(backend.display, config, null(), ptr.as_ptr(&context_attributes))
+        }
+        if ptr.is_null(context) {
+            return err(common.Error.Unsupported)
+        }
+        backend.context = context
+        if !surfaceless {
+            size := [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE]
+            create_surface := backend.egl.create_pbuffer_surface
+            surface := unsafe {
+                create_surface(backend.display, config, ptr.as_ptr(&size))
+            }
+            if ptr.is_null(surface) {
+                return err(common.Error.System)
+            }
+            backend.surface = surface
+        }
+        backend.make_current()?
+        return ok(backend)
+    }
+
+    // Mesa's surfaceless platform first, then the default display.
+    fn open_display(&mut self) -> void!common.Error {
+        query := self.egl.query_string
+        initialize := self.egl.initialize
+        clients := unsafe {
+            query(null(), EGL_EXTENSIONS)
+        }
+        if unsafe {
+            common.has_word(clients, b"EGL_MESA_platform_surfaceless")
+        }
+        {
+            resolve := self.egl.get_proc_address
+            address := unsafe {
+                resolve(common.c_string(b"eglGetPlatformDisplayEXT\0"))
+            }
+            if address != 0 {
+                display := unsafe {
+                    get_platform_display := address as GetPlatformDisplay
+                    get_platform_display(EGL_PLATFORM_SURFACELESS_MESA, null(), 0usize as *const i32)
+                }
+                if !ptr.is_null(display) && unsafe {
+                    initialize(display, 0usize as *mut i32, 0usize as *mut i32)
+                } != 0 {
+                    self.display = display
+                    return ok()
+                }
+            }
+        }
+        get_display := self.egl.get_display
+        display := unsafe {
+            get_display(null())
+        }
+        if ptr.is_null(display) || unsafe {
+            initialize(display, 0usize as *mut i32, 0usize as *mut i32)
+        } == 0 {
+            return err(common.Error.NoDisplay)
+        }
+        self.display = display
+        return ok()
+    }
+
+    pub fn make_current(&self) -> void!common.Error {
+        make := self.egl.make_current
+        if unsafe {
+            make(self.display, self.surface, self.surface, self.context)
+        } == 0 {
+            return err(common.Error.System)
+        }
+        return ok()
+    }
+
+    // Leave the calling thread without a current context.
+    pub fn release_current(&self) {
+        make := self.egl.make_current
+        unsafe {
+            make(self.display, null(), null(), null())
+        }
+    }
+
+    pub fn is_current(&self) -> bool {
+        get := self.egl.get_current_context
+        return !ptr.is_null(self.context) && unsafe {
+            get() as usize == self.context as usize
+        }
+    }
+
+    // The address of an OpenGL command, or 0.
+    pub fn resolve(&self, name: *const u8) -> usize {
+        resolve := self.egl.get_proc_address
+        address := unsafe {
+            resolve(name)
+        }
+        if address == 0 && !ptr.is_null(self.gl_library) {
+            address = unsafe {
+                dlsym(self.gl_library, name)
+            }
+        }
+        return address
+    }
+
+    fn drop(&mut self) {
+        if !ptr.is_null(self.display) {
+            if self.is_current() {
+                self.release_current()
+            }
+            if !ptr.is_null(self.surface) {
+                destroy_surface := self.egl.destroy_surface
+                unsafe {
+                    destroy_surface(self.display, self.surface)
+                }
+            }
+            if !ptr.is_null(self.context) {
+                destroy := self.egl.destroy_context
+                unsafe {
+                    destroy(self.display, self.context)
+                }
+            }
+            // EGL displays are reference counted per process, not per
+            // eglInitialize call, so terminating would break other contexts
+            // on the same display. They stay initialized, as Mesa's own
+            // tools leave them; libEGL stays loaded with them.
+        }
+    }
+}

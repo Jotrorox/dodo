@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `std/gpu/opengl` creates OpenGL contexts without a window, and
+  `std/gpu/opengl/gl` binds the complete OpenGL 4.6 core profile (656
+  commands, 1364 enums), generated from the Khronos registry by
+  `scripts/generate_opengl.py`. Both are pure Dodo with no C runtime: each
+  OS's interface is opened at run time (EGL on Linux, surfaceless and without
+  an X server; CGL on macOS; WGL with a hidden window on Windows), so programs
+  link no graphics library and start on machines without one.
+  `opengl.Target` is an offscreen framebuffer whose pixels read back in
+  `std/graphics` row order, as RGBA or as the BGRA a `std/window` canvas uses;
+  `examples/opengl_window.dodo` shows a shaded triangle in a window. A
+  fixture renders and reads back a triangle with Mesa's llvmpipe in Linux CI
+  and with CGL on macOS.
 - `std/graphics` solid fills and same-format blits are 9–35× faster at -O2
   (1280×800 `clear` 1.4 ms → 0.06 ms, full-frame `blit` 2.3 ms → 0.07 ms).
   Their loops now store through a local row subslice, which the optimizer
