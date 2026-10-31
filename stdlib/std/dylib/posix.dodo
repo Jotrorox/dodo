@@ -1,0 +1,28 @@
+package posix
+
+// dlopen and friends are part of the C library on macOS and on glibc 2.34 and
+// later; the compiler links libdl for older glibc releases.
+unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *mut u8
+unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
+
+// RTLD_NOW has the same value on Linux and macOS.
+const RTLD_NOW: i32 = 2
+
+pub unsafe fn open(name: *const u8) -> *mut u8 {
+    unsafe {
+        return dlopen(name, RTLD_NOW)
+    }
+}
+
+pub unsafe fn symbol(handle: *mut u8, name: *const u8) -> *const u8 {
+    unsafe {
+        return dlsym(handle, name) as *const u8
+    }
+}
+
+pub unsafe fn close(handle: *mut u8) {
+    unsafe {
+        dlclose(handle)
+    }
+}

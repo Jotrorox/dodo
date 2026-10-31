@@ -185,6 +185,19 @@ pub fn native_sources(loaded: &Loaded) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// The Metal bindings, which call Objective-C directly and have no `runtime.c`.
+const METAL: &str = "std/gpu/metal";
+
+/// Whether the program loads `std/gpu/metal` or a package beneath it, whose
+/// frameworks the linker must then add.
+pub fn uses_metal(loaded: &Loaded) -> bool {
+    let root = Path::new("<stdlib>").join(METAL);
+    loaded
+        .sources
+        .iter()
+        .any(|source| source.path.starts_with(&root) || source.path == root.with_extension("dodo"))
+}
+
 /// Every `unsafe` keyword in project sources, for `project.forbid-unsafe`.
 /// Bundled sources are exempt: the standard library and chip packages wrap
 /// their unsafe code behind safe APIs. Compiler-generated code is never
@@ -523,6 +536,12 @@ impl Loader<'_> {
         if import == "std/embedded/board" || import == "std/embedded/chip" {
             return self.platform_import(import);
         }
+        // Metal and the Objective-C runtime exist only on Apple systems.
+        if (import == METAL || import.starts_with("std/gpu/metal/"))
+            && !matches!(hosted_os(&self.target), Some(("macos", _)))
+        {
+            return Err(format!("`{import}` is unsupported for target `{}`; Metal requires a macOS target such as aarch64-apple-darwin or x86_64-apple-darwin", self.target).into());
+        }
         // An area is a stdlib directory with its own adapters and `runtime.c`;
         // `crypto/openssl` keeps libcrypto out of programs that only need entropy.
         let Some((area, selector)) = import
@@ -548,6 +567,7 @@ impl Loader<'_> {
                 | "web"
                 | "time"
                 | "window"
+                | "dylib"
         ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
             return Ok(import.to_owned());

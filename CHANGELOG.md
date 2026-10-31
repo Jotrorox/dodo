@@ -27,6 +27,47 @@
   caller's section instead.
 - 64-bit integer division in firmware takes one 32-bit division when both
   operands fit in 32 bits, instead of 64 shift-and-subtract steps.
+- `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
+  entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
+  declared with its own signature. It covers devices, command queues,
+  command buffers, compute, render and blit encoders, buffers, textures,
+  samplers, shader libraries from source or `.metallib` data, compute and render
+  pipelines, vertex, depth-stencil and render-pass descriptors, fences,
+  events and `CAMetalLayer`. Objects release on drop, and compile and
+  pipeline errors carry Metal's message. Buffer and texture copies check
+  their ranges, and binding indices are bounds-checked. `std/gpu/metal/objc`
+  exposes the Objective-C runtime layer for methods the module lacks. Loading
+  the package links Metal, QuartzCore, Foundation and libobjc, and importing
+  it for a non-macOS target is an error. The test suite runs compute,
+  rendering and readback on the GPU, including x86-64 under Rosetta, and
+  checks every constant against the SDK headers.
+- `truetype.GlyphCache` keeps rasterized glyphs in caller-provided storage,
+  so text drawn again is blended instead of rasterized: about 13 times
+  faster at 14 pixels and 6 times faster at 96. It draws like `Font.draw`
+  except that glyphs are placed to a quarter pixel, and a full cache evicts
+  its oldest glyphs. `std/graphics` gains the coverage calls it is built on:
+  `outline_bounds`, `coverage_mask` with `Canvas.fill_mask` and
+  `gradient_mask`, and the run-length `coverage_spans` with
+  `Canvas.fill_spans` and `gradient_spans`, all drawing exactly what
+  `fill_outline` draws.
+- `std/gpu/vulkan`: the Vulkan API in pure Dodo, one to one like Rust's
+  `ash`, as the bottom layer for a future portable `std/gpu`. Constants,
+  handles, enums, bitmasks, structs and the command tables are generated from
+  the Khronos registry by `scripts/generate_vulkan.py` and cover core Vulkan
+  1.0 to 1.4, the Xlib, XCB, Wayland, Win32, Metal and headless surfaces,
+  swapchains, portability (MoltenVK) and debug utils. Nothing is linked:
+  `vk.open()` loads `libvulkan.so.1`, `vulkan-1.dll` or the macOS loader or
+  MoltenVK at run time and resolves every command through
+  `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` into `extern "C" fn` fields
+  of `EntryFns`, `InstanceFns` and `DeviceFns`. Structs have a `default()`
+  with `s_type` set, and helpers cover Result checking and names, API
+  versions, name fields and clear-value unions. All 2,572 struct sizes,
+  alignments and field offsets match the C headers
+  (`scripts/vulkan_layout_check.py`), and `examples/vulkan_compute.dodo` runs
+  a compute shader on Mesa's lavapipe.
+- `std/dylib` opens shared libraries at run time (dlopen on Linux and macOS,
+  LoadLibrary on Windows) and looks up their symbols; Linux builds that use
+  it also link libdl for glibc before 2.34.
 
 - `&mut T` parameters of Dodo functions, methods and closures are `noalias`
   in LLVM, as Rust's are, so optimized code no longer reloads fields of
@@ -74,7 +115,10 @@
   their integer counterparts pixel for pixel. `graphics.Path` stores move,
   line, quadratic and cubic commands in caller-owned words, and any type
   with a `trace(&self, pen)` method is a `graphics.Outline` drawn without
-  storage, filled by the nonzero or even-odd rule. `graphics.Gradient` paints
+  storage, filled by the nonzero or even-odd rule. The rasterizer's cost
+  follows a shape's edges rather than its bounding box: an outline is
+  flattened once, coverage is computed only in pixels an edge crosses, and
+  interiors are filled as whole spans. `graphics.Gradient` paints
   linear and radial gradients with up to eight stops, premultiplied
   interpolation, pad/repeat/reflect spreads and optional ordered dithering
   for RGB565 and monochrome panels. `std/graphics/truetype` reads `.ttf` and

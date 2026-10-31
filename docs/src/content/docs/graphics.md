@@ -440,8 +440,8 @@ A path is one kind of `graphics.Outline`, the interface the rasterizer draws.
 Any type with a `pub fn trace(&self, pen: &mut graphics.Pen)` method is an
 outline: it describes itself by calling the same five commands on the pen,
 and needs no storage at all. The rasterizer calls `trace` several times per
-drawing call (once for the bounds, then once per row), so it must describe
-the same shape each time:
+drawing call (once for the bounds, then usually once more to collect its
+edges), so it must describe the same shape each time:
 
 ```dodo
 struct Diamond {
@@ -465,8 +465,49 @@ Curves are flattened to within 1/32 pixel. Path coordinates are clamped to
 +/-2^29 subpixels (+/-2^21 pixels) and the `aa_` calls' pixel coordinates to
 +/-2^21, which keeps every product within 64 bits. Work is bounded by the
 visible part of the shape: rows and columns outside the clip rectangle are
-never visited. Each visible row traces the whole outline again, so an outline
-with thousands of edges is drawn faster as several smaller ones.
+never visited. Within it, the cost follows the edges rather than the area:
+coverage is computed only in the pixels an edge passes through, and solid
+interiors are filled as whole spans, so an outline or a long thin line costs
+about as much as its length. The outline is flattened once into at most 256
+straight edges at a time. When more edges cross the visible rows, the rows
+are drawn in bands, each tracing the outline again, and a row crossed by more
+than 256 edges traces it once per 256 columns, so an outline with thousands
+of edges is still drawn faster as several smaller ones.
+
+### Coverage masks
+
+A shape drawn many times can be rasterized once into a coverage mask, one
+byte per pixel from 0 (outside) to 255 (fully covered), and composited from
+it afterwards:
+
+```dodo
+bounds := graphics.outline_bounds(&shape)            // the pixels it touches
+mask := [0u8; 32 * 32]                               // at least width * height
+graphics.coverage_mask(&shape, graphics.FillRule.NonZero, &mut mask, bounds.x, bounds.y, bounds.width, bounds.height)
+canvas.fill_mask(&mask, bounds.width, bounds.height, bounds.x + 40, bounds.y, graphics.WHITE)
+```
+
+`coverage_mask(outline, rule, mask, x, y, width, height)` writes the coverage
+of the width x height pixels starting at (x, y), in rows of `width` bytes.
+`fill_mask(mask, width, height, x, y, color)` and `gradient_mask` blend each
+pixel exactly as `fill_outline` and `gradient_outline` would, so a mask moved
+by whole pixels draws the same pixels as the outline moved by the same
+amount. Coverage depends on where a shape sits within a pixel, so make one
+mask per subpixel offset you draw at.
+
+Coverage spans store the same coverage as runs, skipping uncovered pixels
+and filling fully covered ones whole, so they draw faster and usually take
+less room than the mask:
+
+```dodo
+buffer := [0u8; 4096]                    // at least spans_bound(width, height)
+length := graphics.coverage_spans(&shape, graphics.FillRule.NonZero, &mut buffer, bounds.x, bounds.y, bounds.width, bounds.height)
+canvas.fill_spans(&buffer[..length], bounds.width, bounds.height, bounds.x + 40, bounds.y, graphics.WHITE)
+```
+
+`coverage_spans` returns the length of the spans, or 0 when the buffer is
+smaller than `spans_bound(width, height)`. `fill_spans` and `gradient_spans`
+draw exactly what `fill_mask` and `gradient_mask` draw.
 
 ## Gradients
 
@@ -567,6 +608,44 @@ outlines (`.otf` files beginning with `OTTO`) return `Error.Unsupported`;
 other errors are `Malformed` and `NoSuchFont`. Untrusted fonts are safe:
 every offset is checked, composite glyphs are limited in depth and size, and
 a damaged glyph draws as much of its outline as is valid.
+
+### Glyph cache
+
+`Font.draw` rasterizes every glyph from its outline each time. Text that is
+drawn again, such as labels and counters redrawn every frame, is much faster
+through a `truetype.GlyphCache`, which keeps each rasterized glyph as
+[coverage spans](#coverage-masks) in storage you provide:
+
+```dodo
+cache_storage := [0u8; 65536]
+cache := truetype.GlyphCache.new(&font, &mut cache_storage)
+
+cache.draw(&mut canvas, 8, 8, "Score: 1200", 14, graphics.WHITE)
+```
+
+`cache.draw` and `cache.draw_gradient` take the same arguments and return the
+same area as the `Font` calls. The first time a glyph appears at a size it is
+rasterized into the cache; afterwards drawing it only blends its stored
+coverage. On an Apple M-series machine at `-O2`, repeated 14-pixel text
+drew about 13 times faster than with `Font.draw` (0.17 µs instead of 2.3 µs
+per glyph) and 96-pixel text about 6 times faster (0.64 µs instead of
+3.7 µs). The gain is largest at small sizes, where rasterizing costs the
+most per pixel drawn.
+
+The one visible difference is placement: the cache positions glyphs to a
+quarter pixel horizontally, where `Font.draw` uses 1/256 pixel, and keeps a
+separate copy for each of the four quarter-pixel offsets a glyph is drawn
+at. Glyphs that land on a quarter pixel draw exactly as `Font.draw` draws
+them.
+
+Any amount of storage works, and more holds more glyphs: 64 KiB holds
+several hundred glyphs at 14 pixels or a few dozen at 96. A full cache
+evicts the glyphs it cached longest ago. A glyph whose bounding box covers
+more pixels than about a quarter of the storage's bytes is drawn from its
+outline without being cached, so one huge glyph cannot flush the rest. `len()`, `hits()` and
+`misses()` show how well the storage fits the text, and `clear()` empties
+the cache. The cache borrows the font, so it cannot outlive it; use one
+cache per font.
 
 ## Images
 
