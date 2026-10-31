@@ -164,8 +164,8 @@ pub fn load_for_platform(
     .map_err(|error| error.to_string())
 }
 
-/// File stems of hosted adapters. `std/window` has one per OS; the other
-/// areas share `posix` between Linux and macOS.
+/// File stems of hosted adapters. `std/window` and `std/gpu/opengl` have one
+/// per OS; the other areas share `posix` between Linux and macOS.
 const ADAPTER_STEMS: &[&str] = &["posix", "windows", "linux", "macos"];
 
 /// C boundaries are embedded alongside the Dodo sources for relocated compilers.
@@ -521,8 +521,10 @@ impl Loader<'_> {
         if import == "std/embedded/board" || import == "std/embedded/chip" {
             return self.platform_import(import);
         }
-        // An area is a stdlib directory with its own adapters and `runtime.c`;
-        // `crypto/openssl` keeps libcrypto out of programs that only need entropy.
+        // An area is a stdlib directory with its own adapters, usually with a
+        // `runtime.c`; `crypto/openssl` keeps libcrypto out of programs that
+        // only need entropy, and `gpu/opengl` is pure Dodo that loads the
+        // system's OpenGL interface at run time.
         let Some((area, selector)) = import
             .strip_prefix("std/")
             .and_then(|rest| rest.rsplit_once('/'))
@@ -546,6 +548,7 @@ impl Loader<'_> {
                 | "web"
                 | "time"
                 | "window"
+                | "gpu/opengl"
                 | "dylib"
         ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
@@ -555,8 +558,13 @@ impl Loader<'_> {
             return Err(format!("`{import}` is unsupported for target `{}`; hosted adapters require x86_64 or aarch64 Linux GNU, x86_64 or arm64 macOS, or x86_64 Windows (MSVC/GNU)", self.target).into());
         };
         // Window systems differ on every OS, so `window` has one adapter per OS
-        // (X11, Cocoa, Win32) instead of a shared POSIX one.
-        let adapter = if area == "window" { os } else { adapter };
+        // (X11, Cocoa, Win32) instead of a shared POSIX one, and so does
+        // `gpu/opengl` (EGL, CGL, WGL).
+        let adapter = if matches!(area, "window" | "gpu/opengl") {
+            os
+        } else {
+            adapter
+        };
         // `std/AREA/linux` and `std/AREA/macos` name the shared POSIX adapter
         // on their own operating system only.
         if selector != "native" && selector != adapter && selector != os {
