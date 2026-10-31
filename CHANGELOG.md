@@ -19,6 +19,17 @@
   memory to build at `-O 2` and needed about 10 MB of stack at `-O 0`. Root
   package public functions now pass such records through memory like other
   Dodo functions.
+- Ownership is checked on each function's control-flow graph, for every body
+  the compiler accepts: initialization, moves, borrows, escapes, destructor
+  order, and Result obligations. The earlier checker that ran beside it, and
+  covered every body the graph could not yet represent, is gone. Liveness now
+  follows each binding exactly: a borrow ends at its last use even across
+  shadowing and loops, and a conflict names the binding that holds the
+  borrow and points at its next use. Some programs the old checker rejected
+  because of its approximations now compile, such as a mutable slice
+  `&mut a[..]` iterated and written in place. Some errors are reported
+  differently: type errors come before ownership errors, and a use after a
+  move into a value block is now reported as one.
 - A cryptography package. `std/crypto/random` reads the operating system's
   CSPRNG (`getrandom`, `SecRandomCopyBytes`, `BCryptGenRandom`) with no
   user-space generator or fallback. It fills buffers, draws unbiased values
