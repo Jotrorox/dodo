@@ -11,8 +11,9 @@ import "std/graphics/image"
 
 fn count(canvas: &graphics.Canvas, color: graphics.Color) -> u32 {
     total := 0u32
-    for y in 0i32..canvas.height() as i32 {
-        for x in 0i32..canvas.width() as i32 {
+    bounds := canvas.bounds()
+    for y in bounds.y..bounds.y + canvas.height() as i32 {
+        for x in bounds.x..bounds.x + canvas.width() as i32 {
             if at(canvas, x, y) == color {
                 total += 1
             }
@@ -705,16 +706,140 @@ fn displays() {
     stale := display.screen().diff_bounds(&canvas)
     assert(same_rect(&stale, 0, 15, 1, 1))
 
+    // A smaller canvas updates the part of the screen it covers, and
+    // pixels beyond the screen are dropped.
     other_pixels := [0u8; 8 * 8]
     other := graphics.canvas(&mut other_pixels, 8, 8, graphics.PixelFormat.Gray8)!
-    match display.present(&other, graphics.Rect.new(0, 0, 8, 8)) {
-        ok() => {
-            assert(false, "a canvas of another size must be rejected")
-        }
-        err(error) => {
-            assert(error == graphics.Error.InvalidInput)
+    other.set_origin(28, 12)
+    other.clear(graphics.WHITE)
+    graphics.present(&mut display, &mut other)!
+    shown := display.last_dirty()
+    assert(same_rect(&shown, 28, 12, 4, 4))
+    assert_eq(at(display.screen(), 28, 12), graphics.WHITE)
+    assert_eq(at(display.screen(), 31, 15), graphics.WHITE)
+    assert_eq(at(display.screen(), 27, 15), graphics.BLACK)
+}
+
+// Everything a canvas can draw, in surface coordinates.
+fn origin_scene(canvas: &mut graphics.Canvas, sprite: &graphics.Canvas, small: &graphics.Font) {
+    canvas.clear(graphics.hex(0x102030))
+    canvas.fill_circle(9, 8, 6, graphics.RED)
+    canvas.circle(14, 11, 7, graphics.WHITE)
+    canvas.fill_ellipse(18, 4, 5, 3, graphics.GREEN)
+    canvas.line(-3, 19, 25, 1, graphics.YELLOW)
+    canvas.line(2, 0, 5, 19, graphics.CYAN)
+    triangle: [6]i32 = [1, 18, 12, 9, 22, 19]
+    canvas.fill_polygon(&triangle, graphics.MAGENTA)
+    canvas.round_rect(3, 2, 17, 15, 4, graphics.LIGHT_GRAY)
+    canvas.blend_rect(0, 5, 24, 4, graphics.rgba(0, 0, 255, 128))
+    canvas.blit(sprite, 15, 13)
+    canvas.blend(sprite, 1, 1)
+    canvas.text(small, 2, 10, "Az", graphics.WHITE)
+    canvas.set_clip(graphics.Rect.new(0, 15, 24, 3))
+    canvas.fill_rect(4, 12, 6, 8, graphics.GRAY)
+    canvas.reset_clip()
+}
+
+fn origin_format(format: graphics.PixelFormat) {
+    small := font.small()
+    sprite_pixels := [0u8; 5 * 4 * 4]
+    sprite := graphics.canvas(&mut sprite_pixels, 5, 4, graphics.PixelFormat.Rgba8888)!
+    sprite.clear(graphics.rgba(255, 255, 0, 160))
+    sprite.pixel(2, 1, graphics.BLACK)
+
+    full_pixels := [0u8; 24 * 20 * 4]
+    full := graphics.canvas(&mut full_pixels, 24, 20, format)!
+    origin_scene(&mut full, &sprite, &small)
+
+    // A canvas placed inside the surface holds exactly the pixels under it,
+    // also from a column that is not a byte boundary in Mono1.
+    part_pixels := [0u8; 11 * 9 * 4]
+    part := graphics.canvas(&mut part_pixels, 11, 9, full.format())!
+    part.set_origin(5, 7)
+    bounds := part.bounds()
+    assert(same_rect(&bounds, 5, 7, 11, 9))
+    clip := part.clip()
+    assert(same_rect(&clip, 5, 7, 11, 9))
+    origin_scene(&mut part, &sprite, &small)
+    part_dirty := part.dirty()
+    assert(same_rect(&part_dirty, 5, 7, 11, 9))
+    for y in 0i32..20 {
+        for x in 0i32..24 {
+            match part.color_at(x, y) {
+                some(color) => {
+                    assert_eq(color, at(&full, x, y))
+                }
+                none => {
+                    assert(!bounds.contains(x, y))
+                }
+            }
         }
     }
+
+    // Bands render the same picture as one canvas for the whole screen;
+    // the last band hangs two rows below it.
+    screen_pixels := [0u8; 24 * 20 * 4]
+    screen := fake.Display.new(&mut screen_pixels, 24, 20, full.format())!
+    band_pixels := [0u8; 24 * 6 * 4]
+    band := graphics.canvas(&mut band_pixels, 24, 6, full.format())!
+    bands := graphics.Bands.new(20)
+    count := 0u32
+    for bands.next(&mut band) {
+        origin_scene(&mut band, &sprite, &small)
+        graphics.present_all(&mut screen, &mut band)!
+        count += 1
+    }
+    assert_eq(count, 4u32)
+    assert(screen.screen().equals(&full))
+    last := screen.last_dirty()
+    assert(same_rect(&last, 0, 18, 24, 2))
+    // The same Bands then draws the next frame from the top.
+    assert(bands.next(&mut band))
+    first := band.bounds()
+    assert(same_rect(&first, 0, 0, 24, 6))
+    assert(bands.next(&mut band))
+    bands.restart()
+    assert(bands.next(&mut band))
+    again := band.bounds()
+    assert(same_rect(&again, 0, 0, 24, 6))
+}
+
+fn origins() {
+    origin_format(graphics.PixelFormat.Rgba8888)
+    origin_format(graphics.PixelFormat.Bgra8888)
+    origin_format(graphics.PixelFormat.Rgb565)
+    origin_format(graphics.PixelFormat.Gray8)
+    origin_format(graphics.PixelFormat.Mono1)
+
+    // Blitting reads a source in its own surface coordinates.
+    source_pixels := [0u8; 4 * 3]
+    source := graphics.canvas(&mut source_pixels, 4, 3, graphics.PixelFormat.Gray8)!
+    source.clear(graphics.GRAY)
+    source.set_origin(100, 50)
+    source.pixel(101, 51, graphics.WHITE)
+    stored := source.row(1)
+    assert_eq(stored[1], 255u8)
+    target_pixels := [0u8; 8 * 8]
+    target := graphics.canvas(&mut target_pixels, 8, 8, graphics.PixelFormat.Gray8)!
+    target.clear(graphics.BLACK)
+    target.blit(&source, 2, 2)
+    assert_eq(at(&target, 3, 3), graphics.WHITE)
+    assert_eq(at(&target, 5, 4), graphics.GRAY)
+    assert_eq(at(&target, 6, 4), graphics.BLACK)
+    target.blit_region(&source, graphics.Rect.new(101, 51, 1, 1), 0, 0)
+    assert_eq(at(&target, 0, 0), graphics.WHITE)
+
+    // Moving a canvas resets its clip and dirty rectangle; extreme origins
+    // are clamped and drawing near them stays exact.
+    target.set_clip(graphics.Rect.new(0, 0, 2, 2))
+    target.set_origin(-2147483647, 2147483647)
+    far := target.bounds()
+    assert(same_rect(&far, -268435456, 268435456, 8, 8))
+    assert(clean(&target))
+    target.clear(graphics.BLACK)
+    target.line(-268435456, 268435456, -268435449, 268435463, graphics.WHITE)
+    assert_eq(at(&target, -268435453, 268435459), graphics.WHITE)
+    assert_eq(count(&target, graphics.WHITE), 8u32)
 }
 
 fn scene(canvas: &mut graphics.Canvas) {
@@ -1090,6 +1215,7 @@ fn main() {
     text()
     blitting()
     displays()
+    origins()
     codecs()
     corrupted_files()
     random_drawing()

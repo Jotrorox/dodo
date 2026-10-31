@@ -1,0 +1,321 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/display"
+import "std/embedded/display/ssd1306"
+import "std/embedded/hal"
+import "std/fmt"
+import "std/graphics"
+import "std/graphics/font"
+import "std/text"
+
+// A demo for a 0.96" 128x64 SSD1306 OLED module on I2C: a splash screen,
+// then a live screen with the uptime, a bouncing ball with the frame rate,
+// and the chip's temperature with a graph of the last 30 seconds.
+//
+// Wiring, with the Raspberry Pi Pico boards' pin numbers: the module's SDA
+// and SCL to any I2C pin pair, such as GP4 and GP5 (the board's usual pins)
+// or GP0 and GP1, VCC to 3V3 (pin 36), and GND to GND. The demo looks for
+// the display on every pair the board leaves free, at address 0x3C or 0x3D.
+// Flash it from BOOTSEL mode with
+//
+//     dodo run examples/oled_demo.dodo --board pico2_w
+//
+// (or --board pico or pico2). The board also opens its USB serial port,
+// which reports where it found the display and lets the next `dodo run`
+// restart the board without BOOTSEL. With no display found, the LED blinks
+// twice a second.
+
+const WIDTH: u32 = 128
+const HEIGHT: u32 = 64
+const HISTORY: usize = 60
+const SAMPLE_US: u64 = 500_000
+
+// SDA pins to try, each with SCL on the next pin: the board's usual pair
+// first, then every other I2C pair, leaving out GP22 to GP29, which the
+// Pico 2 W's wireless chip and the boards' power sensing use.
+const SDA_PINS: [11]u32 = [4, 0, 8, 12, 16, 20, 2, 6, 10, 14, 18]
+
+// The ball's box, and the ball, in 1/16 pixel steps.
+const BOX_LEFT: i32 = 0
+const BOX_TOP: i32 = 12
+const BOX_WIDTH: u32 = 60
+const BOX_HEIGHT: u32 = 52
+const RADIUS: i32 = 3
+
+// The temperature graph.
+const GRAPH_LEFT: i32 = 64
+const GRAPH_TOP: i32 = 30
+const GRAPH_WIDTH: u32 = 64
+const GRAPH_HEIGHT: u32 = 34
+
+fn main() {
+    b := board.take()!
+    serial := b.usb.serial()!
+
+    // Find the pins and address the display answers on.
+    sda := 0u32
+    address := 0u8
+    for &pin in SDA_PINS {
+        if address == 0 {
+            match b.pins.i2c(pin, pin + 1, hal.I2C_FAST_HZ) {
+                ok(probe) => {
+                    address = find_display(&mut probe)
+                    sda = pin
+                    b.pins.release_i2c(probe)
+                }
+                err(_) => {}
+            }
+        }
+    }
+    if address == 0 {
+        fmt.printf(&mut serial, "no SSD1306 answered at 0x3C or 0x3D on any I2C pins; check VCC, GND, SDA and SCL\n")!
+        for {
+            b.led.toggle()
+            b.timer.delay_ms(250)
+        }
+    }
+    fmt.printf(&mut serial, "SSD1306 at address {} on SDA GP{}, SCL GP{}\n", address, sda, sda + 1)!
+    bus := b.pins.i2c(sda, sda + 1, hal.I2C_FAST_HZ)!
+    oled := ssd1306.Display.new(display.I2cInterface.new(bus, address), ssd1306.panel_128x64())!
+    pixels := [0u8; 128 * 64 / 8]
+    canvas := graphics.canvas(&mut pixels, WIDTH, HEIGHT, graphics.PixelFormat.Mono1)!
+
+    match splash(&mut oled, &mut canvas, &mut b.timer) {
+        ok() => {}
+        err(_) => {
+            fmt.printf(&mut serial, "the display stopped answering during the splash\n")!
+        }
+    }
+
+    sensor := b.pins.temperature()!
+    history := [0i32; HISTORY]
+    first := read_tenths(&mut sensor)
+    for index in 0usize..HISTORY {
+        history[index] = first
+    }
+    tenths := first
+    next_sample := b.timer.now_us() + SAMPLE_US
+
+    ball_x := 20i32 * 16
+    ball_y := 30i32 * 16
+    speed_x := 23i32
+    speed_y := 17i32
+    frames := 0u32
+    rate := 0u32
+    second_start := b.timer.now_us()
+
+    for {
+        now := b.timer.now_us()
+        if now >= next_sample {
+            tenths = read_tenths(&mut sensor)
+            for index in 1usize..HISTORY {
+                history[index - 1] = history[index]
+            }
+            history[HISTORY - 1] = tenths
+            next_sample += SAMPLE_US
+        }
+        if now - second_start >= 1_000_000 {
+            rate = frames
+            frames = 0
+            second_start += 1_000_000
+            b.led.toggle()
+        }
+
+        // Move the ball and bounce it off the inside of its box.
+        ball_x += speed_x
+        ball_y += speed_y
+        left := (BOX_LEFT + 1 + RADIUS) * 16
+        right := (BOX_LEFT + BOX_WIDTH as i32 - 2 - RADIUS) * 16
+        top := (BOX_TOP + 1 + RADIUS) * 16
+        bottom := (BOX_TOP + BOX_HEIGHT as i32 - 2 - RADIUS) * 16
+        if ball_x < left || ball_x > right {
+            speed_x = -speed_x
+            ball_x += 2 * speed_x
+        }
+        if ball_y < top || ball_y > bottom {
+            speed_y = -speed_y
+            ball_y += 2 * speed_y
+        }
+
+        draw(&mut canvas, now, rate, ball_x / 16, ball_y / 16, tenths, &history)
+        match graphics.present(&mut oled, &mut canvas) {
+            ok() => {}
+            err(_) => {
+                // A loose wire: keep going, the next frame retries.
+                b.timer.delay_ms(100)
+            }
+        }
+        frames += 1
+    }
+}
+
+// The display's I2C address: 0x3C on most modules, 0x3D with the address
+// jumper moved, or 0 when neither answers. Sends the display-off command,
+// which the driver's setup turns on again.
+fn find_display<B: hal.I2c>(bus: &mut B) -> u8 {
+    probe: [2]u8 = [display.I2C_COMMANDS, 0xAE]
+    candidates: [2]u8 = [ssd1306.ADDRESS, ssd1306.ALTERNATE_ADDRESS]
+    for &candidate in candidates {
+        match bus.write(candidate, &probe) {
+            ok() => {
+                return candidate
+            }
+            err(_) => {}
+        }
+    }
+    return 0
+}
+
+// "dodo" in large letters, then a circle that grows to fill the screen and
+// opens again onto the live screen.
+fn splash<D: graphics.Display, T: hal.Delay>(oled: &mut D, canvas: &mut graphics.Canvas, delay: &mut T) -> void!graphics.Error {
+    small := font.small()
+    large := font.medium().scaled(2)
+    canvas.clear(graphics.BLACK)
+    canvas.text(&large, 32, 2, "dodo", graphics.WHITE)
+    line := "graphics on SSD1306"
+    line_size := small.measure(line)
+    canvas.text(&small, centered(line_size.width), 40, line, graphics.WHITE)
+    board_line := board.NAME
+    board_size := small.measure(board_line)
+    canvas.text(&small, centered(board_size.width), 52, board_line, graphics.WHITE)
+    graphics.present_all(oled, canvas)?
+    hal.delay_ms(delay, 2500)
+
+    radius := 0u32
+    for radius <= 72 {
+        canvas.fill_circle(64, 32, radius, graphics.WHITE)
+        graphics.present(oled, canvas)?
+        radius += 6
+    }
+    radius = 0
+    for radius <= 72 {
+        canvas.fill_circle(64, 32, radius, graphics.BLACK)
+        graphics.present(oled, canvas)?
+        radius += 6
+    }
+    return ok()
+}
+
+fn draw(canvas: &mut graphics.Canvas, now_us: u64, rate: u32, ball_x: i32, ball_y: i32, tenths: i32, history: &[i32]) {
+    small := font.small()
+    medium := font.medium()
+    canvas.clear(graphics.BLACK)
+
+    // Header: name on the left, uptime on the right, dark on light.
+    canvas.fill_rect(0, 0, WIDTH, 10, graphics.WHITE)
+    canvas.text(&small, 2, 1, "DODO DEMO", graphics.BLACK)
+    seconds := now_us / 1_000_000
+    uptime := [0u8; 16]
+    length := put_number(&mut uptime, 0, (seconds / 60) as u32, 2)
+    uptime[length] = 58
+    length = put_number(&mut uptime, length + 1, (seconds % 60) as u32, 2)
+    uptime_text := text.Text.new(&uptime[..length])!
+    canvas.text(&small, WIDTH as i32 - 2 - 6 * length as i32, 1, uptime_text.as_str(), graphics.BLACK)
+
+    // The ball in its box, with the frame rate behind it.
+    canvas.rect(BOX_LEFT, BOX_TOP, BOX_WIDTH, BOX_HEIGHT, graphics.WHITE)
+    fps := [0u8; 16]
+    fps_length := put_number(&mut fps, 0, rate, 1)
+    fps[fps_length] = 32
+    fps[fps_length + 1] = 102
+    fps[fps_length + 2] = 112
+    fps[fps_length + 3] = 115
+    fps_text := text.Text.new(&fps[..fps_length + 4])!
+    canvas.text(&small, BOX_LEFT + 3, BOX_TOP + 3, fps_text.as_str(), graphics.WHITE)
+    canvas.fill_circle(ball_x, ball_y, RADIUS as u32, graphics.WHITE)
+
+    // The temperature, and its graph scaled to the readings shown.
+    reading := [0u8; 16]
+    reading_length := put_tenths(&mut reading, tenths)
+    reading_text := text.Text.new(&reading[..reading_length])!
+    reading_size := medium.measure(reading_text.as_str())
+    canvas.text(&medium, GRAPH_LEFT + (GRAPH_WIDTH as i32 - reading_size.width as i32) / 2, 12, reading_text.as_str(), graphics.WHITE)
+    canvas.rect(GRAPH_LEFT, GRAPH_TOP, GRAPH_WIDTH, GRAPH_HEIGHT, graphics.WHITE)
+    low := history[0]
+    high := history[0]
+    for index in 0usize..history.len {
+        if history[index] < low {
+            low = history[index]
+        }
+        if history[index] > high {
+            high = history[index]
+        }
+    }
+    // At least 2 degrees of range, so sensor noise stays small.
+    if high - low < 20 {
+        middle := (high + low) / 2
+        low = middle - 10
+        high = middle + 10
+    }
+    plot_top := GRAPH_TOP + 2
+    plot_height := GRAPH_HEIGHT as i32 - 5
+    previous_x := 0i32
+    previous_y := 0i32
+    for index in 0usize..history.len {
+        x := GRAPH_LEFT + 2 + index as i32
+        y := plot_top + plot_height - (history[index] - low) * plot_height / (high - low)
+        if index > 0 {
+            canvas.line(previous_x, previous_y, x, y, graphics.WHITE)
+        }
+        previous_x = x
+        previous_y = y
+    }
+}
+
+fn centered(width: u32) -> i32 {
+    return (WIDTH as i32 - width as i32) / 2
+}
+
+// Write `value` in decimal at `start`, with at least `digits` digits, and
+// return the position after it.
+fn put_number(buffer: &mut[u8], start: usize, value: u32, digits: usize) -> usize {
+    reversed := [0u8; 10]
+    count := 0usize
+    rest := value
+    for count < digits || rest != 0 || count == 0 {
+        reversed[count] = 48 + (rest % 10) as u8
+        rest = rest / 10
+        count += 1
+    }
+    for index in 0usize..count {
+        buffer[start + index] = reversed[count - 1 - index]
+    }
+    return start + count
+}
+
+// Write `tenths` as "-12.3°C" in UTF-8 and return its length.
+fn put_tenths(buffer: &mut[u8], tenths: i32) -> usize {
+    length := 0usize
+    value := tenths
+    if value < 0 {
+        buffer[0] = 45
+        length = 1
+        value = -value
+    }
+    length = put_number(buffer, length, (value / 10) as u32, 1)
+    buffer[length] = 46
+    buffer[length + 1] = 48 + (value % 10) as u8
+    buffer[length + 2] = 0xC2
+    buffer[length + 3] = 0xB0
+    buffer[length + 4] = 67
+    return length + 5
+}
+
+// The temperature in tenths of a degree Celsius, averaged over 16 readings,
+// by the formula in the RP2040 and RP2350 datasheets: 27 °C at 0.706 V,
+// falling 1.721 mV per degree. Uncalibrated, so expect a few degrees off.
+fn read_tenths<A: hal.AnalogInput>(sensor: &mut A) -> i32 {
+    total := 0i32
+    for _ in 0..16 {
+        match hal.read_millivolts(sensor, 3300) {
+            ok(millivolts) => {
+                total += millivolts as i32
+            }
+            err(_) => {}
+        }
+    }
+    millivolts := total / 16
+    return 270 - (millivolts - 706) * 10000 / 1721
+}

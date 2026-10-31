@@ -1,6 +1,7 @@
 //! CPU graphics: exact pixels for every primitive and pixel format, the
 //! image codecs and fake display at O0 and O3, freestanding code generation,
-//! and golden images rendered through `dodo test`.
+//! golden images rendered through `dodo test`, and the display panel drivers
+//! against recorded and simulated controllers.
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -123,4 +124,67 @@ fn golden_images_match_at_every_optimization_level() {
             &format!("golden images -O{optimization}"),
         );
     }
+}
+
+#[test]
+fn display_drivers_execute_against_simulated_controllers_and_stay_freestanding() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("displays");
+    let source = root.join("tests/stdlib/display_checks.dodo");
+    for optimization in ["0", "3"] {
+        let executable = scratch.0.join(format!(
+            "displays-O{optimization}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        success(
+            &Command::new(env!("CARGO_BIN_EXE_dodo"))
+                .args(["build", source.to_str().unwrap(), "-O", optimization, "-o"])
+                .arg(&executable)
+                .output()
+                .unwrap(),
+            &format!("compile display fixture -O{optimization}"),
+        );
+        success(
+            &Command::new(&executable).output().unwrap(),
+            &format!("execute display fixture -O{optimization}"),
+        );
+    }
+    for target in ["wasm32-unknown-unknown", "thumbv6m-none-eabi"] {
+        let object = scratch.0.join(format!("displays-{target}.o"));
+        success(
+            &Command::new(env!("CARGO_BIN_EXE_dodo"))
+                .args([
+                    "build",
+                    source.to_str().unwrap(),
+                    "--emit",
+                    "obj",
+                    "--target",
+                    target,
+                    "-O",
+                    "3",
+                    "-o",
+                ])
+                .arg(&object)
+                .output()
+                .unwrap(),
+            &format!("emit display fixture for {target}"),
+        );
+        assert!(fs::metadata(object).unwrap().len() > 0);
+    }
+}
+
+#[test]
+fn thermometer_example_tests_pass_against_the_fake_display() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new(env!("CARGO_BIN_EXE_dodo"))
+        .args(["test", "examples/thermometer.dodo"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    success(&output, "test examples/thermometer.dodo");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("3 passed"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

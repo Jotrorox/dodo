@@ -1,0 +1,347 @@
+package st7789
+
+import "std/embedded/display"
+import "std/embedded/hal"
+import "std/graphics"
+
+// Sitronix ST7789 colour panel controllers, as on 1.14" to 2" TFT and IPS
+// modules and the Pimoroni Pico Display packs, through any
+// display.Interface, usually an SPI bus with a data/command pin. Implements
+// graphics.Display with RGB565 pixels, the panel's own format, so an Rgb565
+// canvas is sent straight from its storage; other formats are converted.
+// Only the dirty rectangle is sent: the panel keeps the rest.
+//
+//     wiring := display.SpiInterface.new(bus, dc_pin, some(select_pin))
+//     lcd := st7789.Display.new(wiring, st7789.panel_240x240(), st7789.Rotation.Deg0, &mut b.timer)!
+//     pixels := [0u8; 240 * 240 * 2]
+//     canvas := graphics.canvas(&mut pixels, 240, 240, graphics.PixelFormat.Rgb565)!
+//     canvas.clear(graphics.BLACK)
+//     graphics.present(&mut lcd, &mut canvas)!
+//
+// A frame that does not fit in memory is drawn in bands with
+// graphics.Bands. The controller has memory for 240 x 320 pixels; a smaller
+// panel shows part of it, at the offsets its Panel gives.
+
+// Commands, from the ST7789 datasheet.
+const SWRESET: u8 = 0x01
+const SLPIN: u8 = 0x10
+const SLPOUT: u8 = 0x11
+const NORON: u8 = 0x13
+const INVOFF: u8 = 0x20
+const INVON: u8 = 0x21
+const DISPOFF: u8 = 0x28
+const DISPON: u8 = 0x29
+const CASET: u8 = 0x2A
+const RASET: u8 = 0x2B
+const RAMWR: u8 = 0x2C
+const MADCTL: u8 = 0x36
+const COLMOD: u8 = 0x3A
+
+// MADCTL bits: row order, column order, row/column exchange, BGR order.
+const MADCTL_MY: u8 = 0x80
+const MADCTL_MX: u8 = 0x40
+const MADCTL_MV: u8 = 0x20
+const MADCTL_BGR: u8 = 0x08
+
+// COLMOD: 65K colours, 16 bits per pixel on the interface.
+const COLMOD_RGB565: u8 = 0x55
+
+// The controller's memory, in its own orientation.
+pub const MEMORY_WIDTH: u32 = 240
+pub const MEMORY_HEIGHT: u32 = 320
+
+// Pixels converted per write when a canvas is not Rgb565.
+const CONVERT_PIXELS: usize = 128
+
+// How a panel is wired to the controller's memory, in the controller's
+// orientation (Rotation.Deg0): its size, the memory column and row of its
+// top-left pixel, whether it needs inverted colours, as IPS panels do, and
+// whether its subpixels are in blue-green-red order.
+pub struct Panel {
+    pub width: u32
+    pub height: u32
+    pub column_offset: u32
+    pub row_offset: u32
+    pub inverted: bool
+    pub bgr: bool
+}
+
+// 1.3" and 1.54" square IPS panels.
+pub fn panel_240x240() -> Panel {
+    return Panel { width: 240, height: 240, column_offset: 0, row_offset: 0, inverted: true, bgr: false }
+}
+
+// 2" and 2.4" panels that use the whole memory, such as the Pimoroni Pico
+// Display Pack 2.0 (use Rotation.Deg90 for its landscape 320 x 240).
+pub fn panel_240x320() -> Panel {
+    return Panel { width: 240, height: 320, column_offset: 0, row_offset: 0, inverted: true, bgr: false }
+}
+
+// 1.14" panels: the Pimoroni Pico Display Pack and the LILYGO T-Display.
+pub fn panel_135x240() -> Panel {
+    return Panel { width: 135, height: 240, column_offset: 52, row_offset: 40, inverted: true, bgr: false }
+}
+
+// 1.69" panels with rounded corners.
+pub fn panel_240x280() -> Panel {
+    return Panel { width: 240, height: 280, column_offset: 0, row_offset: 20, inverted: true, bgr: false }
+}
+
+// 1.47" panels.
+pub fn panel_172x320() -> Panel {
+    return Panel { width: 172, height: 320, column_offset: 34, row_offset: 0, inverted: true, bgr: false }
+}
+
+// 1.9" panels.
+pub fn panel_170x320() -> Panel {
+    return Panel { width: 170, height: 320, column_offset: 35, row_offset: 0, inverted: true, bgr: false }
+}
+
+// Clockwise rotation of the picture from the controller's orientation.
+// Deg90 and Deg270 swap the display's width and height.
+pub enum Rotation {
+    Deg0,
+    Deg90,
+    Deg180,
+    Deg270
+}
+
+pub struct Display<I: display.Interface> {
+    wiring: I
+    width: u32
+    height: u32
+    column_offset: u32
+    row_offset: u32
+
+    // Reset the controller by command and set it up for `panel` at
+    // `rotation`: RGB565 pixels, the panel's colour inversion and order, and
+    // the display switched on. Takes about 300 ms of delays. The panel's
+    // memory holds whatever it did before, so present a whole frame first.
+    // InvalidInput if the panel does not fit the controller's memory.
+    pub fn new<D: hal.Delay>(wiring: I, panel: Panel, rotation: Rotation, delay: &mut D) -> Display<I>!hal.Error from(wiring) {
+        if panel.width == 0 || panel.height == 0 || panel.column_offset as u64 + panel.width as u64 > MEMORY_WIDTH as u64 || panel.row_offset as u64 + panel.height as u64 > MEMORY_HEIGHT as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        madctl := madctl_bits(&rotation)
+        if panel.bgr {
+            madctl = madctl | MADCTL_BGR
+        }
+        // The offset of the panel's first column and row, mirrored when the
+        // controller fills its memory backwards along that axis.
+        columns := panel.column_offset
+        if (madctl & MADCTL_MX) != 0 {
+            columns = MEMORY_WIDTH - panel.width - panel.column_offset
+        }
+        rows := panel.row_offset
+        if (madctl & MADCTL_MY) != 0 {
+            rows = MEMORY_HEIGHT - panel.height - panel.row_offset
+        }
+        lcd := Display<I> { wiring, width: panel.width, height: panel.height, column_offset: columns, row_offset: rows }
+        if (madctl & MADCTL_MV) != 0 {
+            lcd.width = panel.height
+            lcd.height = panel.width
+            lcd.column_offset = rows
+            lcd.row_offset = columns
+        }
+
+        lcd.simple(SWRESET)?
+        hal.delay_ms(delay, 150)
+        lcd.simple(SLPOUT)?
+        hal.delay_ms(delay, 120)
+        colmod: [1]u8 = [COLMOD_RGB565]
+        lcd.command(COLMOD, &colmod)?
+        memory: [1]u8 = [madctl]
+        lcd.command(MADCTL, &memory)?
+        lcd.set_inverted(panel.inverted)?
+        lcd.simple(NORON)?
+        hal.delay_ms(delay, 10)
+        lcd.simple(DISPON)?
+        hal.delay_ms(delay, 10)
+        return ok(lcd)
+    }
+
+    // The display's size at its rotation.
+    pub fn size(&self) -> graphics.Size {
+        return graphics.Size.new(self.width, self.height)
+    }
+
+    pub fn format(&self) -> graphics.PixelFormat {
+        return graphics.PixelFormat.Rgb565
+    }
+
+    // Send the part of `dirty` inside both the canvas and the display.
+    pub fn present(&mut self, canvas: &graphics.Canvas, dirty: graphics.Rect) -> void!graphics.Error {
+        area := display.visible(canvas, dirty, self.width, self.height)
+        if area.is_empty() {
+            return ok()
+        }
+        match self.send(canvas, area) {
+            ok() => {
+                return ok()
+            }
+            err(_) => {
+                return err(graphics.Error.Device)
+            }
+        }
+    }
+
+    // Fill the whole display with one colour, without a canvas: for example
+    // to clear a panel's memory once after new.
+    pub fn fill(&mut self, color: graphics.Color) -> void!hal.Error {
+        width := self.width
+        height := self.height
+        self.window(0, 0, width, height)?
+        value := rgb565(color)
+        chunk := [0u8; CONVERT_PIXELS * 2]
+        for index in 0usize..CONVERT_PIXELS {
+            chunk[2 * index] = (value >> 8) as u8
+            chunk[2 * index + 1] = (value & 255) as u8
+        }
+        remaining := width as usize * height as usize
+        for remaining > 0 {
+            count := remaining
+            if count > CONVERT_PIXELS {
+                count = CONVERT_PIXELS
+            }
+            self.wiring.write_data(&chunk[..2 * count])?
+            remaining -= count
+        }
+        return ok()
+    }
+
+    // Invert every colour; most IPS panels need this on to show colours
+    // correctly, which their Panel says.
+    pub fn set_inverted(&mut self, inverted: bool) -> void!hal.Error {
+        if inverted {
+            return self.simple(INVON)
+        }
+        return self.simple(INVOFF)
+    }
+
+    // Blank the panel or show its memory again. The memory is kept, and
+    // presents still update it while the panel is blank.
+    pub fn set_display_on(&mut self, on: bool) -> void!hal.Error {
+        if on {
+            return self.simple(DISPON)
+        }
+        return self.simple(DISPOFF)
+    }
+
+    // Enter sleep mode, which stops the panel and its oscillator; the
+    // memory is kept. Turn a backlight off separately.
+    pub fn sleep<D: hal.Delay>(&mut self, delay: &mut D) -> void!hal.Error {
+        self.simple(SLPIN)?
+        hal.delay_ms(delay, 5)
+        return ok()
+    }
+
+    // Leave sleep mode.
+    pub fn wake<D: hal.Delay>(&mut self, delay: &mut D) -> void!hal.Error {
+        self.simple(SLPOUT)?
+        hal.delay_ms(delay, 120)
+        return ok()
+    }
+
+    // The interface, for example to reach its bus between frames.
+    pub fn wiring(&mut self) -> &mut I from(self) {
+        return &mut self.wiring
+    }
+
+    // Give back the interface.
+    pub fn release(self) -> I from(self) {
+        let Display { wiring, width, height, column_offset, row_offset } = self
+        return wiring
+    }
+
+    // A command without parameters.
+    fn simple(&mut self, code: u8) -> void!hal.Error {
+        command: [1]u8 = [code]
+        return self.wiring.write_command(&command)
+    }
+
+    fn command(&mut self, code: u8, parameters: &[u8]) -> void!hal.Error {
+        self.simple(code)?
+        return self.wiring.write_data(parameters)
+    }
+
+    // Select the memory window that following pixel data fills, row by row.
+    fn window(&mut self, x: u32, y: u32, width: u32, height: u32) -> void!hal.Error {
+        left := x + self.column_offset
+        right := left + width - 1
+        top := y + self.row_offset
+        bottom := top + height - 1
+        columns: [4]u8 = [(left >> 8) as u8, (left & 255) as u8, (right >> 8) as u8, (right & 255) as u8]
+        self.command(CASET, &columns)?
+        rows: [4]u8 = [(top >> 8) as u8, (top & 255) as u8, (bottom >> 8) as u8, (bottom & 255) as u8]
+        self.command(RASET, &rows)?
+        return self.simple(RAMWR)
+    }
+
+    fn send(&mut self, canvas: &graphics.Canvas, area: graphics.Rect) -> void!hal.Error {
+        self.window(area.x as u32, area.y as u32, area.width, area.height)?
+        bounds := canvas.bounds()
+        // Storage position of the area's top-left pixel.
+        column := (area.x - bounds.x) as usize
+        first := (area.y - bounds.y) as usize
+        if canvas.format() == graphics.PixelFormat.Rgb565 {
+            row_length := area.width as usize * 2
+            if area.width == canvas.width() && canvas.stride() == row_length {
+                // Whole rows that follow each other in storage: one write.
+                pixels := canvas.pixels()
+                start := first * row_length
+                return self.wiring.write_data(&pixels[start..start + area.height as usize * row_length])
+            }
+            for row in first..first + area.height as usize {
+                line := canvas.row(row as u32)
+                self.wiring.write_data(&line[column * 2..column * 2 + row_length])?
+            }
+            return ok()
+        }
+        chunk := [0u8; CONVERT_PIXELS * 2]
+        filled := 0usize
+        for y in area.y..area.y + area.height as i32 {
+            for x in area.x..area.x + area.width as i32 {
+                value := 0u32
+                match canvas.color_at(x, y) {
+                    some(color) => {
+                        value = rgb565(color)
+                    }
+                    none => {}
+                }
+                chunk[filled] = (value >> 8) as u8
+                chunk[filled + 1] = (value & 255) as u8
+                filled += 2
+                if filled == chunk.len {
+                    self.wiring.write_data(&chunk)?
+                    filled = 0
+                }
+            }
+        }
+        if filled > 0 {
+            self.wiring.write_data(&chunk[..filled])?
+        }
+        return ok()
+    }
+}
+
+fn madctl_bits(rotation: &Rotation) -> u8 {
+    match rotation {
+        Rotation.Deg0 => {
+            return 0
+        }
+        Rotation.Deg90 => {
+            return MADCTL_MX | MADCTL_MV
+        }
+        Rotation.Deg180 => {
+            return MADCTL_MX | MADCTL_MY
+        }
+        Rotation.Deg270 => {
+            return MADCTL_MY | MADCTL_MV
+        }
+    }
+}
+
+// A colour as the panel's 16-bit RGB565 value, as an Rgb565 canvas stores it.
+pub fn rgb565(color: graphics.Color) -> u32 {
+    return ((color >> 8) & 0xF800) | ((color >> 5) & 0x07E0) | ((color >> 3) & 0x001F)
+}

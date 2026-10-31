@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Display panels: `std/embedded/display/st7789` drives ST7789 colour panels
+  (240x240, 240x320, 135x240, 240x280, 172x320 and 170x320, in four
+  rotations) and `std/embedded/display/ssd1306` SSD1306 OLED panels (128x64,
+  128x32, 96x16, 64x48 and 72x40). Both implement `graphics.Display` and
+  send only the dirty rectangle, so drawing code tested against
+  `fake.Display` runs unchanged on a panel. They talk through
+  `std/embedded/display`'s `SpiInterface` (an SPI bus with a data/command
+  pin) or `I2cInterface`, or any value with the `display.Interface`
+  methods. `canvas.set_origin(x, y)` places a canvas at a point of a larger
+  screen, and `graphics.Bands` moves one down the screen band by band, so
+  frames bigger than RAM are drawn with the same code; displays now accept
+  canvases that cover part of them and ignore what lies outside. The
+  thermometer examples show the chip's temperature on an ST7789 panel, and
+  `examples/oled_demo.dodo` animates a 0.96" SSD1306 module on I2C.
 - QUIC connections and streams, through OpenSSL 3.5's QUIC stack:
   `std/quic/openssl` binds a `Listener` on a UDP socket and connects a
   verified `Connection` to it, each opening and accepting bidirectional and

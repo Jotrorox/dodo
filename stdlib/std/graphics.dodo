@@ -72,6 +72,7 @@ pub const MAX_DIMENSION: u32 = 16777216
 const COORD_LIMIT: i64 = 536870912
 const ELLIPSE_LIMIT: u64 = 16383
 const POLYGON_CROSSINGS: usize = 64
+const ORIGIN_LIMIT: i64 = 268435456
 
 // Bits used by one pixel: 32, 16, 8 or 1.
 pub fn bits_per_pixel(format: PixelFormat) -> u32 {
@@ -610,6 +611,11 @@ fn decode_utf8(data: &[u8], index: usize) -> u32 {
 // starts as the whole canvas, and grows the dirty rectangle to cover the
 // pixels it wrote. Displays present only the dirty part; take_dirty() reads
 // and resets it.
+//
+// A canvas normally covers a surface from (0, 0). set_origin places it at
+// another point of a larger surface, such as one band of a screen: drawing,
+// clip, dirty and color_at coordinates are then surface coordinates, and the
+// canvas stores only its width x height pixels from the origin.
 pub struct Canvas {
     pixels: &mut[u8]
     width: u32
@@ -617,6 +623,8 @@ pub struct Canvas {
     stride: usize
     format: PixelFormat
     bytes_per_pixel: usize
+    origin_x: i64
+    origin_y: i64
     clip_left: i64
     clip_top: i64
     clip_right: i64
@@ -652,7 +660,7 @@ pub struct Canvas {
             }
         }
         bytes_per_pixel := format_bits(&format) / 8
-        return ok(Canvas { pixels: pixels, width: width, height: height, stride: stride, format: format, bytes_per_pixel: bytes_per_pixel, clip_left: 0, clip_top: 0, clip_right: width as i64, clip_bottom: height as i64, dirty_left: 0, dirty_top: 0, dirty_right: 0, dirty_bottom: 0 })
+        return ok(Canvas { pixels: pixels, width: width, height: height, stride: stride, format: format, bytes_per_pixel: bytes_per_pixel, origin_x: 0, origin_y: 0, clip_left: 0, clip_top: 0, clip_right: width as i64, clip_bottom: height as i64, dirty_left: 0, dirty_top: 0, dirty_right: 0, dirty_bottom: 0 })
     }
 
     pub fn width(&self) -> u32 {
@@ -664,9 +672,18 @@ pub struct Canvas {
     pub fn size(&self) -> Size {
         return Size { width: self.width, height: self.height }
     }
-    // The whole canvas as a rectangle at the origin.
+    // The area of the surface the canvas covers: its size at its origin.
     pub fn bounds(&self) -> Rect {
-        return Rect { x: 0, y: 0, width: self.width, height: self.height }
+        return Rect { x: self.origin_x as i32, y: self.origin_y as i32, width: self.width, height: self.height }
+    }
+    // Place the canvas's top-left pixel at (x, y) of the surface, each
+    // clamped to +/-2^28. The pixels keep their contents, the clip resets to
+    // the new bounds and the dirty rectangle to empty.
+    pub fn set_origin(&mut self, x: i32, y: i32) {
+        self.origin_x = clamp64(x as i64, -ORIGIN_LIMIT, ORIGIN_LIMIT)
+        self.origin_y = clamp64(y as i64, -ORIGIN_LIMIT, ORIGIN_LIMIT)
+        self.reset_clip()
+        self.take_dirty()
     }
     pub fn format(&self) -> PixelFormat {
         match &self.format {
@@ -692,10 +709,13 @@ pub struct Canvas {
         return self.stride
     }
     // The canvas bytes, stride * height of them, for presenting or encoding.
+    // Byte offsets count from the canvas's top-left pixel, wherever its
+    // origin is.
     pub fn pixels(&self) -> &[u8] from(self) {
         return &self.pixels[..self.stride * self.height as usize]
     }
-    // The bytes of row y, exactly min_stride(width, format) long.
+    // The bytes of the canvas's row y, counted from its top edge (surface
+    // row y + bounds().y), exactly min_stride(width, format) long.
     // Panics when y >= height.
     pub fn row(&self, y: u32) -> &[u8] from(self) {
         start := y as usize * self.stride
@@ -709,10 +729,14 @@ pub struct Canvas {
     }
     // Limit drawing to `rect`, intersected with the canvas.
     pub fn set_clip(&mut self, rect: Rect) {
-        self.clip_left = clamp64(rect.x as i64, 0, self.width as i64)
-        self.clip_top = clamp64(rect.y as i64, 0, self.height as i64)
-        self.clip_right = clamp64(rect.right(), 0, self.width as i64)
-        self.clip_bottom = clamp64(rect.bottom(), 0, self.height as i64)
+        left := self.origin_x
+        top := self.origin_y
+        right := left + self.width as i64
+        bottom := top + self.height as i64
+        self.clip_left = clamp64(rect.x as i64, left, right)
+        self.clip_top = clamp64(rect.y as i64, top, bottom)
+        self.clip_right = clamp64(rect.right(), left, right)
+        self.clip_bottom = clamp64(rect.bottom(), top, bottom)
         if self.clip_right < self.clip_left {
             self.clip_right = self.clip_left
         }
@@ -721,10 +745,10 @@ pub struct Canvas {
         }
     }
     pub fn reset_clip(&mut self) {
-        self.clip_left = 0
-        self.clip_top = 0
-        self.clip_right = self.width as i64
-        self.clip_bottom = self.height as i64
+        self.clip_left = self.origin_x
+        self.clip_top = self.origin_y
+        self.clip_right = self.origin_x + self.width as i64
+        self.clip_bottom = self.origin_y + self.height as i64
     }
 
     // -- Dirty tracking ----------------------------------------------------
@@ -746,15 +770,19 @@ pub struct Canvas {
     // Add `rect`, limited to the canvas, to the dirty rectangle: for pixels
     // changed through other means, or to retry a failed present.
     pub fn mark_dirty(&mut self, rect: Rect) {
-        width := self.width as i64
-        height := self.height as i64
-        self.touch(clamp64(rect.x as i64, 0, width), clamp64(rect.y as i64, 0, height), clamp64(rect.right(), 0, width), clamp64(rect.bottom(), 0, height))
+        left := self.origin_x
+        top := self.origin_y
+        right := left + self.width as i64
+        bottom := top + self.height as i64
+        self.touch(clamp64(rect.x as i64, left, right), clamp64(rect.y as i64, top, bottom), clamp64(rect.right(), left, right), clamp64(rect.bottom(), top, bottom))
     }
     // Mark the whole canvas dirty.
     pub fn mark_all_dirty(&mut self) {
-        width := self.width as i64
-        height := self.height as i64
-        self.touch(0, 0, width, height)
+        left := self.origin_x
+        top := self.origin_y
+        right := left + self.width as i64
+        bottom := top + self.height as i64
+        self.touch(left, top, right, bottom)
     }
     fn touch(&mut self, left: i64, top: i64, right: i64, bottom: i64) {
         if left >= right || top >= bottom {
@@ -786,10 +814,21 @@ pub struct Canvas {
     // The color at (x, y), or none outside the canvas. Formats without alpha
     // read as opaque; Rgb565 channels are widened by repeating their high bits.
     pub fn color_at(&self, x: i32, y: i32) -> Option<Color> {
-        if x < 0 || y < 0 || x as i64 >= self.width as i64 || y as i64 >= self.height as i64 {
+        column := x as i64 - self.origin_x
+        row := y as i64 - self.origin_y
+        if column < 0 || row < 0 || column >= self.width as i64 || row >= self.height as i64 {
             return none
         }
-        return some(self.read(x as usize, y as usize))
+        return some(self.read(column as usize, row as usize))
+    }
+    // Read and write one in-bounds pixel by surface coordinates.
+    fn get(&self, x: i64, y: i64) -> Color {
+        return self.read((x - self.origin_x) as usize, (y - self.origin_y) as usize)
+    }
+    fn put(&mut self, x: i64, y: i64, packed: u32) {
+        column := (x - self.origin_x) as usize
+        row := (y - self.origin_y) as usize
+        self.write(column, row, packed)
     }
     fn read(&self, x: usize, y: usize) -> Color {
         row := y * self.stride
@@ -902,7 +941,9 @@ pub struct Canvas {
         if l >= r {
             return
         }
-        self.run(l as usize, r as usize, row as usize, packed)
+        ox := self.origin_x
+        oy := self.origin_y
+        self.run((l - ox) as usize, (r - ox) as usize, (row - oy) as usize, packed)
         self.touch(l, row, r, row + 1)
     }
     // Set one pixel, clipped, and mark it dirty.
@@ -910,7 +951,7 @@ pub struct Canvas {
         if x < self.clip_left || x >= self.clip_right || y < self.clip_top || y >= self.clip_bottom {
             return
         }
-        self.write(x as usize, y as usize, packed)
+        self.put(x, y, packed)
         self.touch(x, y, x + 1, y + 1)
     }
     // Fill an edge-bounded area, clipped.
@@ -922,8 +963,10 @@ pub struct Canvas {
         if l >= r || t >= b {
             return
         }
+        ox := self.origin_x
+        oy := self.origin_y
         for row in t..b {
-            self.run(l as usize, r as usize, row as usize, packed)
+            self.run((l - ox) as usize, (r - ox) as usize, (row - oy) as usize, packed)
         }
         self.touch(l, t, r, b)
     }
@@ -1032,10 +1075,10 @@ pub struct Canvas {
             if n >= n_low && n < n_high {
                 m := m0 + m_step * k
                 if steep {
-                    self.write(n as usize, m as usize, packed)
+                    self.put(n, m, packed)
                     self.touch(n, m, n + 1, m + 1)
                 } else {
-                    self.write(m as usize, n as usize, packed)
+                    self.put(m, n, packed)
                     self.touch(m, n, m + 1, n + 1)
                 }
             }
@@ -1092,9 +1135,9 @@ pub struct Canvas {
         }
         for row in t..b {
             for column in l..r {
-                below := self.read(column as usize, row as usize)
+                below := self.get(column, row)
                 blended := encode(&self.format, over(color, below))
-                self.write(column as usize, row as usize, blended)
+                self.put(column, row, blended)
             }
         }
         self.touch(l, t, r, b)
@@ -1339,7 +1382,8 @@ pub struct Canvas {
     pub fn blit(&mut self, source: &Canvas, x: i32, y: i32) {
         self.blit_region(source, source.bounds(), x, y)
     }
-    // Copy `region` of `source` with its top-left corner at (x, y).
+    // Copy `region` of `source`, in the source's coordinates, with its
+    // top-left corner at (x, y).
     pub fn blit_region(&mut self, source: &Canvas, region: Rect, x: i32, y: i32) {
         self.copy_from(source, region, x, y, false)
     }
@@ -1353,10 +1397,10 @@ pub struct Canvas {
     }
     fn copy_from(&mut self, source: &Canvas, region: Rect, x: i32, y: i32, blend: bool) {
         // Source rectangle limited to the source canvas.
-        sl := max64(region.x as i64, 0)
-        st := max64(region.y as i64, 0)
-        sr := min64(region.right(), source.width as i64)
-        sb := min64(region.bottom(), source.height as i64)
+        sl := max64(region.x as i64, source.origin_x)
+        st := max64(region.y as i64, source.origin_y)
+        sr := min64(region.right(), source.origin_x + source.width as i64)
+        sb := min64(region.bottom(), source.origin_y + source.height as i64)
         // Where the source's top-left lands, shifted by any trimmed margin.
         dl := x as i64 + (sl - region.x as i64)
         dt := y as i64 + (st - region.y as i64)
@@ -1373,12 +1417,13 @@ pub struct Canvas {
         same := self.bytes_per_pixel > 0 && same_format(&self.format, &source.format)
         has_alpha := format_bits(&source.format) == 32
         for row in t..b {
-            source_row := (row - dt + st) as usize
-            source_column := (l - dl + sl) as usize
+            // Source storage position of destination (l, row).
+            source_row := (row - dt + st - source.origin_y) as usize
+            source_column := (l - dl + sl - source.origin_x) as usize
             if same && (!blend || !has_alpha) {
                 bpp := self.bytes_per_pixel
                 source_start := source_row * source.stride + source_column * bpp
-                to := row as usize * self.stride + l as usize * bpp
+                to := (row - self.origin_y) as usize * self.stride + (l - self.origin_x) as usize * bpp
                 count := (r - l) as usize * bpp
                 for i in 0usize..count {
                     self.pixels[to + i] = source.pixels[source_start + i]
@@ -1390,14 +1435,14 @@ pub struct Canvas {
                         a := color >> 24
                         if a != 0 {
                             if a != 255 {
-                                color = over(color, self.read(column as usize, row as usize))
+                                color = over(color, self.get(column, row))
                             }
                             converted := encode(&self.format, color)
-                            self.write(column as usize, row as usize, converted)
+                            self.put(column, row, converted)
                         }
                     } else {
                         converted := encode(&self.format, color)
-                        self.write(column as usize, row as usize, converted)
+                        self.put(column, row, converted)
                     }
                 }
             }
@@ -1470,7 +1515,8 @@ pub struct Canvas {
     // -- Comparison --------------------------------------------------------
 
     // True when both canvases have the same size and every pixel decodes to
-    // the same color. Formats may differ; padding bytes are ignored.
+    // the same color. Formats and origins may differ; padding bytes are
+    // ignored.
     pub fn equals(&self, other: &Canvas) -> bool {
         if self.width != other.width || self.height != other.height {
             return false
@@ -1480,7 +1526,8 @@ pub struct Canvas {
     }
     // The smallest rectangle covering every pixel whose color differs, or
     // an empty rectangle. Pixels present in only one canvas count as
-    // different.
+    // different. Origins are ignored: both canvases are compared from their
+    // top-left pixels, and the rectangle is relative to them.
     pub fn diff_bounds(&self, other: &Canvas) -> Rect {
         common_width := num.min(self.width as usize, other.width as usize)
         common_height := num.min(self.height as usize, other.height as usize)
@@ -1568,13 +1615,20 @@ fn corner_inset(t: i64, height: i64, radius: i64) -> i64 {
 // Anything that can show a canvas: a window, an SPI or I2C panel, or the
 // in-memory std/graphics/fake display. Drawing code generic over Display runs
 // unchanged on all of them.
+//
+// Display coordinates are surface coordinates: a canvas covers
+// canvas.bounds() of the display, the whole display when it has the
+// display's size and no origin, or one part of it, such as a band from
+// Bands. Only the part of a presented rectangle inside both the canvas and
+// the display is shown; the rest is ignored, as drawing ignores pixels
+// outside a canvas.
 pub interface Display {
-    // Pixel size the display expects canvases to have.
+    // Pixel size of the whole display.
     fn size(&self) -> Size
-    // The pixel format it reads most efficiently. Others may be converted.
+    // The pixel format it reads most efficiently. Others are converted.
     fn format(&self) -> PixelFormat
-    // Show `dirty` (in canvas coordinates) from `canvas`. Pixels outside it
-    // may or may not be transferred.
+    // Show `dirty` from `canvas`. Pixels outside it may or may not be
+    // transferred.
     fn present(&mut self, canvas: &Canvas, dirty: Rect) -> void!Error
 }
 
@@ -1601,4 +1655,48 @@ pub fn present<D: Display>(display: &mut D, canvas: &mut Canvas) -> void!Error {
 pub fn present_all<D: Display>(display: &mut D, canvas: &mut Canvas) -> void!Error {
     canvas.mark_all_dirty()
     return present(display, canvas)
+}
+
+// Draws a screen taller than the memory for its pixels one horizontal band
+// at a time. A 320x240 RGB565 frame needs 153,600 bytes, more than half an
+// RP2040's RAM; a 320x40 band needs 25,600. Each call to next moves a canvas
+// one band down the screen with set_origin, so drawing code keeps using
+// screen coordinates and the canvas keeps only what falls inside the band:
+//
+//     pixels := [0u8; 320 * 40 * 2]
+//     band := graphics.canvas(&mut pixels, 320, 40, graphics.PixelFormat.Rgb565)?
+//     bands := graphics.Bands.new(240)
+//     for bands.next(&mut band) {
+//         draw_screen(&mut band, &state)
+//         graphics.present_all(&mut lcd, &mut band)?
+//     }
+//
+// The scene is drawn once per band, so the work grows with the band count;
+// pick the tallest band the memory allows. Displays ignore the part of a
+// last band that hangs below the screen.
+pub struct Bands {
+    height: i64
+    next_y: i64
+
+    // Bands covering a screen `screen_height` pixels tall from row 0.
+    pub fn new(screen_height: u32) -> Bands {
+        return Bands { height: screen_height as i64, next_y: 0 }
+    }
+    // Move `canvas` to the left edge of the next band, resetting its clip
+    // and dirty rectangle, and return true; after the last band, return
+    // false and start over, so the same Bands draws the next frame. A
+    // canvas with no rows covers nothing and returns false.
+    pub fn next(&mut self, canvas: &mut Canvas) -> bool {
+        if self.next_y >= self.height || canvas.height() == 0 {
+            self.next_y = 0
+            return false
+        }
+        canvas.set_origin(0, self.next_y as i32)
+        self.next_y += canvas.height() as i64
+        return true
+    }
+    // Start the next frame from the top even if this one was cut short.
+    pub fn restart(&mut self) {
+        self.next_y = 0
+    }
 }
