@@ -137,6 +137,9 @@ Some declarations use `@compiler(print)`, `@compiler(println)`, or
 accepts a literal format followed by heterogeneous arguments even though its
 source declaration only names the format parameter. The
 [formatting guide](formatting.md) documents accepted values and format syntax.
+`rp_pio.assemble` uses `@compiler(pio)`: it takes string literals, one line
+of a PIO program each, and the compiler assembles them into a `Program`; see
+[PIO](hardware.md#pio-on-the-rp2040-and-rp2350).
 These attributes identify bundled compiler hooks; they are not general user
 extension points.
 

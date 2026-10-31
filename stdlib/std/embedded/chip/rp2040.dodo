@@ -6,6 +6,7 @@ import "std/embedded/hal"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
+import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/peripheral/designware_i2c"
@@ -14,8 +15,9 @@ import "std/embedded/peripheral/pl022"
 import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2040 chip support: clocks, resets, GPIO, I2C, SPI, UART,
-// PWM, the ADC, the microsecond timer, a USB serial port, the second core,
-// the FIFOs and spinlocks the cores share, and the boot ROM. `take(config)` brings the chip from its boot state (ring oscillator,
+// PWM, the ADC, PIO, the microsecond timer, a USB serial port, the second
+// core, the FIFOs and spinlocks the cores share, and the boot ROM.
+// `take(config)` brings the chip from its boot state (ring oscillator,
 // peripherals held in reset) to a known configuration and hands out the
 // peripherals once. Pins implement the std/embedded/hal output and input pin
 // protocols, I2C and SPI buses claimed from `Pins` implement the bus
@@ -38,6 +40,8 @@ import "std/embedded/chip/rp_pins"
 pub const SYS_HZ: u32 = 125_000_000
 // User GPIOs 0 to 29.
 pub const PIN_COUNT: u32 = 30
+// PIO blocks 0 to 1.
+pub const PIO_BLOCKS: u32 = 2
 
 // Each register also has atomic XOR, set, and clear aliases (2.1.2).
 const SET_ALIAS: usize = 0x2000
@@ -53,6 +57,8 @@ const RESET_I2C0: u32 = 1 << 3
 const RESET_I2C1: u32 = 1 << 4
 const RESET_IO_BANK0: u32 = 1 << 5
 const RESET_PADS_BANK0: u32 = 1 << 8
+const RESET_PIO0: u32 = 1 << 10
+const RESET_PIO1: u32 = 1 << 11
 const RESET_PLL_SYS: u32 = 1 << 12
 const RESET_PLL_USB: u32 = 1 << 13
 const RESET_PWM: u32 = 1 << 14
@@ -196,6 +202,10 @@ const UART1_BASE: usize = 0x4003_8000
 // PWM (4.5), clocked by clk_sys, and the ADC (4.9), by clk_adc.
 const PWM_BASE: usize = 0x4005_0000
 const ADC_BASE: usize = 0x4004_C000
+
+// The PIO blocks (3), clocked by clk_sys.
+const PIO0_BASE: usize = 0x5020_0000
+const PIO1_BASE: usize = 0x5030_0000
 
 // The USB controller (4.1): its registers and its 4 KiB of dual-port
 // RAM, clocked by clk_usb.
@@ -616,6 +626,31 @@ pub struct Pins {
         return self.bank.temperature()
     }
 
+    // Claim PIO block `number`, 0 to 1, with its four state machines
+    // stopped, for programs from rp_pio.assemble; rp_pio documents it. Its
+    // state machines run at up to SYS_HZ instructions a second and drive
+    // the pins given to it with `pio_pins`. InvalidInput for another
+    // number, Busy if the block is claimed.
+    pub fn pio(&mut self, number: u32) -> rp_pio.Pio!hal.Error {
+        return self.bank.pio(number)
+    }
+
+    // Connect the `count` pins from GPIO `first` to PIO block `pio`, for
+    // its state machines to drive through their pin mappings and read.
+    // They also read pins claimed in other ways: claim a pin they only
+    // read as an input, for example, to share it. InvalidInput above GPIO
+    // 29 or for a count of 0, Busy if a pin is taken.
+    pub fn pio_pins(&mut self, pio: &rp_pio.Pio, first: u32, count: u32) -> void!hal.Error {
+        return self.bank.pio_pins(pio, first, count)
+    }
+
+    // Give back a PIO block, once its state machines have been given back
+    // to it with `pio.release_state_machine`: its pins are disconnected
+    // and the block is held in reset, which forgets its programs.
+    pub fn release_pio(&mut self, pio: rp_pio.Pio) {
+        self.bank.release_pio(pio)
+    }
+
     // Give back a PWM output. Its pin stops driving and is disconnected.
     pub fn release_pwm(&mut self, output: rp_pwm.Pwm) {
         self.bank.release_pwm(output)
@@ -813,6 +848,10 @@ struct Chip {
             return UART1_BASE
         } else if controller == rp_pins.PWM {
             return PWM_BASE
+        } else if controller == rp_pins.PIO0 {
+            return PIO0_BASE
+        } else if controller == rp_pins.PIO1 {
+            return PIO1_BASE
         }
         return ADC_BASE
     }
@@ -856,6 +895,17 @@ struct Chip {
     pub fn uart_aux(&self) -> bool {
         return false
     }
+    pub fn pio_blocks(&self) -> u32 {
+        return PIO_BLOCKS
+    }
+
+    pub fn pio_version(&self) -> u32 {
+        return 0
+    }
+
+    pub fn pio_irq(&self, block: u32) -> u32 {
+        return PIO0_IRQ_0 + 2 * block
+    }
 }
 
 // The RESET_ bit of rp_pins controller number `controller`.
@@ -872,6 +922,10 @@ fn controller_reset(controller: u32) -> u32 {
         return RESET_UART0
     } else if controller == rp_pins.UART1 {
         return RESET_UART1
+    } else if controller == rp_pins.PIO0 {
+        return RESET_PIO0
+    } else if controller == rp_pins.PIO1 {
+        return RESET_PIO1
     }
     return RESET_PWM
 }

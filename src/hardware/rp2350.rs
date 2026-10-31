@@ -91,6 +91,7 @@ pub static CHIP: Chip = Chip {
         family: 0xE48B_FF59,
         drive_id: "RP2350",
     },
+    pio_version: Some(1),
     // std/embedded/chip/rp_usb's DEFAULT_VENDOR_ID and DEFAULT_PRODUCT_ID.
     usb_serial: Some(UsbId {
         vendor: 0x2E8A,

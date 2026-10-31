@@ -1629,6 +1629,121 @@ releasing the last with `pins.release_analog(input)` stops both. The sensor
 is accurate to a few degrees and depends on the reference voltage; on the
 Pico and Pico 2, GP29 reads a third of the supply voltage VSYS.
 
+### PIO on the RP2040 and RP2350
+
+PIO, programmable I/O, is the RP chips' set of small state machines for
+protocols no other peripheral speaks: WS2812 LEDs, extra serial ports,
+parallel buses, and the Pico 2 W's wireless bus. The RP2040 has two PIO blocks
+and the RP2350 three. Each block has four state machines, which run programs
+from 32 shared instruction slots, exchange 32-bit words with the processor
+through a 4-word FIFO in each direction, drive and read GPIOs, and signal
+each other through eight IRQ flags. Every instruction takes one cycle of the
+state machine's clock, up to clk_sys, so timing is exact.
+
+Programs are written in the Pico SDK's PIO assembly language and assembled
+when the firmware is compiled. `rp_pio.assemble` takes the program as string
+literals, one line each, and returns an `rp_pio.Program`, usually as a
+constant:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip/rp_pio"
+
+// Each word from the program: the LED on GP15 stays on for that many
+// cycles of the state machine, then off until the next word.
+const PULSE: rp_pio.Program = rp_pio.assemble(
+    ".side_set 1",
+    "    pull block    side 0",
+    "    out x, 32     side 0",
+    "on:",
+    "    jmp x-- on    side 1",
+)
+
+fn main() {
+    b := board.take()!
+    pio := b.pins.pio(0)!
+    b.pins.pio_pins(&pio, 15, 1)!
+    loaded := pio.load(&PULSE)!
+    config := loaded.config()
+    config.set_sideset_pins(15)!
+    // One instruction a microsecond.
+    config.set_frequency(1_000_000)!
+    sm := pio.state_machine(0)!
+    sm.init(&config)
+    sm.set_pindirs(15, 1, 1)
+    sm.set_enabled(true)
+    for {
+        sm.put(250_000)
+        b.timer.delay_ms(1000)
+    }
+}
+```
+
+The assembler accepts the language of the SDK's `pioasm`, so `.pio` files
+from the SDK and its examples work unchanged: labels, `public` labels,
+`.define`, integer expressions in parentheses, `side` and `[delay]` on any
+instruction, `;` and `//` comments, and every instruction (`jmp`, `wait`,
+`in`, `out`, `push`, `pull`, `mov`, `irq`, `set`, `nop`). Directives set up
+the program and its state machine: `.side_set`, `.wrap_target`, `.wrap`,
+`.origin`, `.word`, `.pio_version`, and `.clock_div`, `.fifo`, `.mov_status`,
+`.in`, `.out`, and `.set`, whose settings `loaded.config()` starts from.
+`.lang_opt` lines and `% c-sdk { ... %}` blocks are ignored. Write one
+program per call; a single literal with `\n` between lines works too.
+
+A mistake in a program is a compile error at its line, such as
+`invalid PIO program: the SET value must be 0 to 31, not 32`. `assemble`
+exists only in firmware for the RP2040 and RP2350, and checks the program
+against the chip's PIO version: the RP2350's version 1 adds `mov pindirs`,
+`mov rxfifo[...]` to and from RX FIFO registers, `irq` and `wait irq` on the
+`prev` and `next` blocks' flags, `wait jmppin`, the `.fifo` choices `txput`,
+`txget`, and `putget`, `.mov_status irq`, and IN pin counts below 32. Using
+one in an RP2040 build is an error naming the instruction. Hosted builds
+cannot assemble programs; desktop tests build an `rp_pio.Program` from its
+instruction words instead.
+
+`pins.pio(n)` claims block `n` and returns an `rp_pio.Pio`. State machines
+drive only pins connected to their block: `pins.pio_pins(&pio, first, count)`
+connects GPIO `first` and the `count - 1` after it, which are then taken like
+any claimed pin. A state machine reads any pin whose input is enabled, so a
+pin it only reads can also be claimed with `pins.input(n)`.
+
+| `rp_pio.Pio` | Purpose |
+| --- | --- |
+| `load(&program)`, `unload(loaded)` | Load a program at its `.origin` or the highest free slots it fits, relocating its jumps; `Busy` if it does not fit. Returns an `rp_pio.Loaded`, whose `offset()` is its first instruction's address and whose `config()` is a `Config` with the program's settings. |
+| `state_machine(index)`, `free_state_machine()`, `release_state_machine(sm)` | Claim state machine 0 to 3, or the first free one, stopped; give it back. |
+| `enable_in_sync(machines)` | Start several state machines with their clock dividers in step. |
+| `flags()`, `clear_flags(flags)`, `force_flags(flags)` | The IRQ flags, one bit each. Clearing releases state machines waiting on `irq wait`. |
+| `listen(line, sources)`, `ignore(line, sources)`, `interrupts(line)`, `irq(line)` | Raise interrupt line 0 or 1 for `rp_pio.rx_not_empty(sm)`, `rp_pio.tx_not_full(sm)`, and `rp_pio.flag(n)` sources; `irq(line)` is its number for `cortex_m.enable` and `@interrupt`, such as `PIO0_IRQ_0`. |
+| `bypass_input_sync(pin, on)` | Read a pin without the two-cycle input synchronizer. |
+
+| `rp_pio.Config` | Purpose |
+| --- | --- |
+| `set_frequency(hz)`, `set_divider(divider)` | Instructions per second, from clk_sys down to 1/65536 of it, or the divider of clk_sys in 256ths. |
+| `set_out_pins(first, count)`, `set_set_pins(first, count)`, `set_sideset_pins(first)`, `set_in_pins(first)`, `set_jmp_pin(pin)` | The pin mappings of `out`, `set`, side-set, `in` and `wait pin`, and `jmp pin`. |
+| `set_out_shift(right, autopull, bits)`, `set_in_shift(right, autopush, bits)` | Shift direction, and automatic `pull` and `push` after so many bits. |
+| `set_fifo_join(join)` | `rp_pio.FIFO_TX` or `FIFO_RX` give one direction both FIFOs, 8 words; `FIFO_TXPUT`, `FIFO_TXGET`, and `FIFO_PUTGET` (RP2350) turn the RX FIFO into four registers. |
+| `set_wrap(target, wrap)`, `set_start(address)`, `set_mov_status(select, n)`, `set_out_special(sticky, enable_pin)`, `set_in_count(count)` | The rest of the state machine's settings. |
+
+| `rp_pio.StateMachine` | Purpose |
+| --- | --- |
+| `init(&config)` | Stop, apply the settings, empty the FIFOs, reset the internal state, and jump to the start. |
+| `set_enabled(on)`, `restart()`, `restart_clock()` | Run or pause the program. |
+| `put(word)`, `try_put(word)`, `get()`, `try_get()` | Words to and from the program. `put` and `get` wait while the FIFO is full or empty. |
+| `tx_level()`, `rx_level()`, `is_tx_full()`, `is_rx_empty()`, ..., `clear_fifos()`, `drain_tx()`, `take_tx_stall()` | FIFO state; `take_tx_stall()` tells when the program has run out of words. |
+| `exec(instruction)`, `exec_wait(instruction)`, `jump(address)`, `address()` | Run one instruction now, such as a word of an assembled constant: `sm.exec(SET_X.instructions[0])`. |
+| `set_pins(first, count, levels)`, `set_pindirs(first, count, outputs)` | Set pin levels and directions through the state machine, before its program starts. |
+| `rx_register(index)`, `set_rx_register(index, value)` | The RP2350's RX FIFO registers. |
+| `set_frequency(hz)`, `set_divider(divider)` | Change the clock while running. |
+
+`pins.release_pio(pio)`, once its state machines have been given back,
+disconnects the block's pins and holds it in reset. State machines change
+only their own bits of the registers they share, so one can be kept by an
+interrupt handler and another by the main program.
+[`examples/ws2812.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/ws2812.dodo)
+drives a strip of WS2812 LEDs this way.
+
 ### DMA on the RP2040 and RP2350
 
 Both chips have a DMA controller, 12 channels on the RP2040 and 16 on the
@@ -1986,7 +2101,8 @@ so each new board or chip is a small, self-contained addition:
   `src/hardware.rs` (name, chip, flash size) and a `std/embedded/board/NAME` package
   that configures the chip and provides the entry points above.
 - **A chip** is a `src/hardware/NAME.rs` descriptor (target triple, CPU,
-  memory map, image format, and image fixups such as boot checksums), its
+  memory map, image format, its PIO version if it has PIO, and image fixups
+  such as boot checksums), its
   startup runtime as LLVM IR and linker script, an entry in `CHIPS`, and a
   `std/embedded/chip/NAME` package with its peripherals.
 - **A peripheral** that `std/embedded/peripheral` already drives needs only
@@ -2028,9 +2144,17 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  the timer, DMA, a USB serial port, and the second core; PIO and other USB devices (HID,
+  PIO, the timer, DMA, a USB serial port, and the second core; other USB
+  devices (HID,
   mass storage, several functions at once) or USB host mode are not bundled
   yet. Write them with `hal.Reg` as above.
+- PIO state machines move words through their FIFOs by polling or their
+  interrupts. DMA can pace transfers by their FIFOs' data requests
+  (`rp_dma.request` with `sm.tx_fifo_address()`), but there is no DMA
+  session for them as for SPI buses and serial ports. Their pin mappings
+  reach GPIO 0 to 31; the
+  RP2350B's GPIO 32 to 47 and the RP2350's GPIOBASE register are not
+  supported. `rp_pio.assemble` takes one program per call.
 - PWM outputs only generate; the slices' input modes, which count or time a
   pin's pulses, and the PWM wrap interrupt are not exposed. ADC reads are
   polled one at a time, without the round-robin sampler, FIFO, or DMA.
