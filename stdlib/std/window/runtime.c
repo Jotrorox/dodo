@@ -10,7 +10,11 @@
  *
  * Error codes match std/window/raw from_code: 0 success, 1 NoDisplay,
  * 2 AlreadyOpen, 3 Closed, 4 InvalidInput, 5 OutOfMemory, 6 Protocol,
- * 7 Unsupported, 8 System. dodo_window_next_event returns them negated. */
+ * 7 Unsupported, 8 System. dodo_window_next_event returns them negated.
+ *
+ * Frame pacing: dodo_window_clock is a monotonic nanosecond clock on every
+ * OS. macOS 14 and later report display refreshes with a CADisplayLink as
+ * FRAME events; Windows reads the next refresh time from the compositor. */
 #if defined(__linux__)
 #define _GNU_SOURCE
 #endif
@@ -25,7 +29,7 @@ enum {
 };
 enum {
     EV_CLOSE = 1, EV_RESIZE = 2, EV_FOCUS = 3, EV_KEY = 4, EV_TEXT = 5,
-    EV_MOVE = 6, EV_BUTTON = 7, EV_LEAVE = 8, EV_SCROLL = 9
+    EV_MOVE = 6, EV_BUTTON = 7, EV_LEAVE = 8, EV_SCROLL = 9, EV_FRAME = 10
 };
 enum { F_PRESSED = 1, F_REPEAT = 2 };
 enum { M_SHIFT = 1, M_CONTROL = 2, M_ALT = 4, M_META = 8, M_CAPS = 16 };
@@ -111,6 +115,7 @@ void dodo_window_buffer(intptr_t handle, uint8_t **out, uint32_t *width, uint32_
 #include <CoreGraphics/CoreGraphics.h>
 #include <math.h>
 #include <pthread.h>
+#include <time.h>
 
 extern void *objc_autoreleasePoolPush(void);
 extern void objc_autoreleasePoolPop(void *pool);
@@ -161,6 +166,11 @@ static CGColorSpaceRef color_space;
 static double backing_scale = 1;
 static int cursor_hidden, mouse_inside;
 static int launched;
+/* A CADisplayLink, paused except between request_frame and the refresh it
+ * reports, the refresh period it measured, and the App Nap opt-out held
+ * while animating. */
+static id display_link, activity;
+static uint64_t link_period;
 
 static uint32_t modifiers_of(unsigned long flags) {
     uint32_t bits = 0;
@@ -240,6 +250,24 @@ static void did_resize(id self, SEL command, id note) {
     (void)self; (void)command; (void)note;
     if (window) sync_size(1);
 }
+/* Marks frame_ready's application-defined wake-up event in data1. */
+#define FRAME_WAKE 0x646f646fl
+
+/* The display refreshed: report one FRAME and pause until the next request. */
+static void frame_ready(id self, SEL command, id link) {
+    (void)self; (void)command;
+    double last = SEND(send_double)(link, sel("timestamp"));
+    double next = SEND(send_double)(link, sel("targetTimestamp"));
+    if (next > last && next - last < 0.1) link_period = (uint64_t)((next - last) * 1e9 + 0.5);
+    msg_void_bool(link, "setPaused:", YES);
+    push(EV_FRAME, 0, 0, 0, 0, 0);
+    /* nextEventMatchingMask: returns only for events, so post an
+     * application-defined one to end its wait. */
+    id wake = SEND(id (*)(id, SEL, unsigned long, CGPoint, unsigned long, double, long, id, short, long, long))(
+        cls("NSEvent"), sel("otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
+        15ul, CGPointZero, 0ul, 0.0, 0l, nil, (short)0, FRAME_WAKE, 0l);
+    if (wake) SEND(void (*)(id, SEL, id, BOOL))(app, sel("postEvent:atStart:"), wake, NO);
+}
 
 static Class delegate_class(void) {
     Class existing = objc_getClass("DodoWindowDelegate");
@@ -251,6 +279,7 @@ static Class delegate_class(void) {
     class_addMethod(created, sel("windowDidResize:"), (IMP)did_resize, "v@:@");
     class_addMethod(created, sel("windowDidChangeBackingProperties:"), (IMP)did_resize, "v@:@");
     class_addMethod(created, sel("dodoQuit:"), (IMP)quit_requested, "v@:@");
+    class_addMethod(created, sel("dodoFrame:"), (IMP)frame_ready, "v@:@");
     objc_registerClassPair(created);
     return created;
 }
@@ -281,7 +310,36 @@ static void install_menu(void) {
     msg_void(app_item, "release"); msg_void(bar, "release");
 }
 
+static BOOL responds(id target, const char *name) {
+    return SEND(BOOL (*)(id, SEL, SEL))(target, sel("respondsToSelector:"), sel(name));
+}
+
+/* NSView display links exist from macOS 14; older systems pace by timer. */
+static void create_display_link(void) {
+    if (!responds(view, "displayLinkWithTarget:selector:")) return;
+    id link = SEND(id (*)(id, SEL, id, SEL))(view, sel("displayLinkWithTarget:selector:"), delegate, sel("dodoFrame:"));
+    if (!link) return;
+    display_link = msg(link, "retain");
+    msg_void_bool(display_link, "setPaused:", YES);
+    SEND(void (*)(id, SEL, id, id))(display_link, sel("addToRunLoop:forMode:"),
+        msg(cls("NSRunLoop"), "mainRunLoop"), NSDefaultRunLoopMode);
+}
+
+static void end_activity(void) {
+    if (!activity) return;
+    msg_void_id(msg(cls("NSProcessInfo"), "processInfo"), "endActivity:", activity);
+    msg_void(activity, "release");
+    activity = nil;
+}
+
 static void release_all(void) {
+    if (display_link) {
+        msg_void(display_link, "invalidate");
+        msg_void(display_link, "release");
+        display_link = nil;
+    }
+    link_period = 0;
+    end_activity();
     if (window) {
         msg_void_id(window, "setDelegate:", nil);
         msg_void_id(window, "orderOut:", nil);
@@ -328,6 +386,7 @@ int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t wid
     layer = msg(view, "layer");
     msg_void_id(layer, "setContentsGravity:", kCAGravityTopLeft);
     msg_void_id(layer, "setMagnificationFilter:", kCAFilterNearest);
+    create_display_link();
     /* Moves and exits over the drawing area, focused or not. */
     id area = SEND(id (*)(id, SEL, CGRect, unsigned long, id, id))(msg(cls("NSTrackingArea"), "alloc"),
         sel("initWithRect:options:owner:userInfo:"), CGRectZero, 0x01ul | 0x02ul | 0x80ul | 0x200ul, view, nil);
@@ -380,6 +439,8 @@ static int translate(id event) {
     int ours = msg(event, "window") == window;
     int32_t x = 0, y = 0;
     switch (type) {
+    case 15: /* application-defined, such as frame_ready's wake-up */
+        return SEND(send_long)(event, sel("data1")) != FRAME_WAKE;
     case 10: case 11: { /* key down, key up */
         unsigned short code = SEND(send_ushort)(event, sel("keyCode"));
         uint32_t key = code < 128 ? mac_keys[code] : 0;
@@ -510,6 +571,51 @@ uint32_t dodo_window_scale_percent(intptr_t handle) {
     if (!handle || !window) return 100;
     return (uint32_t)lround(backing_scale * 100);
 }
+
+/* mach_absolute_time in nanoseconds, the clock CADisplayLink uses. */
+uint64_t dodo_window_clock(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+uint64_t dodo_window_frame_period(intptr_t handle) {
+    if (!handle || !window) return 0;
+    if (link_period) return link_period;
+    id screen = msg(window, "screen");
+    if (screen && responds(screen, "maximumFramesPerSecond")) {
+        long rate = SEND(send_long)(screen, sel("maximumFramesPerSecond"));
+        if (rate > 0) return (UINT64_C(1000000000) + (uint64_t)rate / 2) / (uint64_t)rate;
+    }
+    return 0;
+}
+
+/* The display link reports refreshes as they happen instead. */
+uint64_t dodo_window_next_vblank(intptr_t handle, uint64_t now) {
+    (void)handle; (void)now;
+    return 0;
+}
+
+int32_t dodo_window_request_frame(intptr_t handle) {
+    if (!handle || !window) return -E_CLOSED;
+    if (!display_link) return 0;
+    msg_void_bool(display_link, "setPaused:", NO);
+    return 1;
+}
+
+void dodo_window_set_animating(intptr_t handle, uint32_t animating) {
+    if (!handle || !window) return;
+    if (!animating) { end_activity(); return; }
+    if (activity) return;
+    void *pool = objc_autoreleasePoolPush();
+    static const char reason[] = "Animating a window";
+    id text = string_from((const uint8_t *)reason, sizeof(reason) - 1);
+    /* NSActivityUserInitiatedAllowingIdleSystemSleep: no App Nap, but the
+     * display and system may still sleep when idle. */
+    id token = SEND(id (*)(id, SEL, unsigned long long, id))(msg(cls("NSProcessInfo"), "processInfo"),
+        sel("beginActivityWithOptions:reason:"), 0x00FFFFFFull & ~(1ull << 20), text);
+    msg_void(text, "release");
+    if (token) activity = msg(token, "retain");
+    objc_autoreleasePoolPop(pool);
+}
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -522,6 +628,7 @@ uint32_t dodo_window_scale_percent(intptr_t handle) {
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -710,6 +817,13 @@ int32_t dodo_window_x11_wait(int32_t fd, uint32_t milliseconds) {
 }
 
 void dodo_window_x11_close(int32_t fd) { close(fd); }
+
+/* CLOCK_MONOTONIC in nanoseconds, the clock of Present's timestamps. */
+uint64_t dodo_window_clock(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return 0;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -718,8 +832,15 @@ void dodo_window_x11_close(int32_t fd) { close(fd); }
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <dwmapi.h>
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x2
+#endif
 
 static HWND hwnd;
+/* Waits shorter than the 15.6 ms system tick, for frame pacing. */
+static HANDLE wait_timer;
 static int cursor_hidden, mouse_tracking, buttons_down;
 static UINT dpi = 96;
 static WCHAR high_surrogate;
@@ -970,9 +1091,92 @@ int32_t dodo_window_open(const uint8_t *title, size_t title_length, uint32_t wid
     return 0;
 }
 
+/* The performance counter in nanoseconds, the compositor's clock. */
+static uint64_t counter_nanos(uint64_t ticks) {
+    static uint64_t rate;
+    if (!rate) {
+        LARGE_INTEGER frequency;
+        rate = QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0 ? (uint64_t)frequency.QuadPart : 1;
+    }
+    return ticks / rate * UINT64_C(1000000000) + ticks % rate * UINT64_C(1000000000) / rate;
+}
+
+uint64_t dodo_window_clock(void) {
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return counter_nanos((uint64_t)counter.QuadPart);
+}
+
+/* Sleep until input arrives or `milliseconds` pass. A high-resolution
+ * waitable timer (Windows 10 1803 and later) keeps short waits short. */
+static int wait_input(DWORD milliseconds) {
+    if (milliseconds && milliseconds != INFINITE) {
+        if (!wait_timer) wait_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)milliseconds * 10000;
+        if (wait_timer && SetWaitableTimer(wait_timer, &due, 0, NULL, NULL, FALSE))
+            return MsgWaitForMultipleObjectsEx(1, &wait_timer, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) != WAIT_FAILED;
+    }
+    return MsgWaitForMultipleObjectsEx(0, NULL, milliseconds, QS_ALLINPUT, MWMO_INPUTAVAILABLE) != WAIT_FAILED;
+}
+
+/* The compositor's refresh period and latest refresh, in nanoseconds of
+ * dodo_window_clock. Fails without composition, as on Windows 7 Basic. */
+static int composition_timing(uint64_t *period, uint64_t *vblank) {
+    typedef HRESULT (WINAPI *timing_info)(HWND, DWM_TIMING_INFO *);
+    static timing_info lookup;
+    static int resolved;
+    if (!resolved) {
+        HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+        if (dwm) lookup = (timing_info)(void (*)(void))GetProcAddress(dwm, "DwmGetCompositionTimingInfo");
+        resolved = 1;
+    }
+    if (!lookup) return 0;
+    DWM_TIMING_INFO info;
+    memset(&info, 0, sizeof(info));
+    info.cbSize = sizeof(info);
+    /* Since Windows 8.1 only the whole desktop's timing, NULL, is valid. */
+    if (FAILED(lookup(NULL, &info)) || !info.qpcRefreshPeriod) return 0;
+    *period = counter_nanos(info.qpcRefreshPeriod);
+    *vblank = counter_nanos(info.qpcVBlank);
+    return *period != 0;
+}
+
+uint64_t dodo_window_frame_period(intptr_t handle) {
+    if (!handle || !hwnd) return 0;
+    uint64_t period, vblank;
+    if (composition_timing(&period, &vblank)) return period;
+    DEVMODEW mode;
+    memset(&mode, 0, sizeof(mode));
+    mode.dmSize = sizeof(mode);
+    /* 0 and 1 stand for the hardware's default rate. */
+    if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+        return (UINT64_C(1000000000) + mode.dmDisplayFrequency / 2) / mode.dmDisplayFrequency;
+    return 0;
+}
+
+uint64_t dodo_window_next_vblank(intptr_t handle, uint64_t now) {
+    if (!handle || !hwnd) return 0;
+    uint64_t period, vblank;
+    if (!composition_timing(&period, &vblank)) return 0;
+    if (vblank > now) return vblank;
+    return vblank + ((now - vblank) / period + 1) * period;
+}
+
+/* DwmFlush would block input until the compositor's next frame, so Windows
+ * paces by the refresh times of next_vblank instead of FRAME events. */
+int32_t dodo_window_request_frame(intptr_t handle) {
+    return !handle || !hwnd ? -E_CLOSED : 0;
+}
+
+void dodo_window_set_animating(intptr_t handle, uint32_t animating) {
+    (void)handle; (void)animating;
+}
+
 void dodo_window_close(intptr_t handle) {
     if (!handle || !hwnd) return;
     if (buttons_down) ReleaseCapture();
+    if (wait_timer) { CloseHandle(wait_timer); wait_timer = NULL; }
     DestroyWindow(hwnd);
     hwnd = NULL;
     MSG message;
@@ -985,7 +1189,7 @@ void dodo_window_close(intptr_t handle) {
 
 int32_t dodo_window_next_event(intptr_t handle, uint32_t milliseconds, struct dodo_window_event *event) {
     if (!handle || !hwnd) return -E_CLOSED;
-    ULONGLONG start = GetTickCount64();
+    uint64_t start = dodo_window_clock();
     for (;;) {
         if (pop(event)) return 1;
         MSG message;
@@ -996,11 +1200,11 @@ int32_t dodo_window_next_event(intptr_t handle, uint32_t milliseconds, struct do
         if (pop(event)) return 1;
         DWORD wait = INFINITE;
         if (milliseconds != FOREVER) {
-            ULONGLONG elapsed = GetTickCount64() - start;
+            uint64_t elapsed = (dodo_window_clock() - start) / 1000000;
             if (elapsed >= milliseconds) return 0;
             wait = (DWORD)(milliseconds - elapsed);
         }
-        if (MsgWaitForMultipleObjectsEx(0, NULL, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE) == WAIT_FAILED) return -E_SYSTEM;
+        if (!wait_input(wait)) return -E_SYSTEM;
     }
 }
 

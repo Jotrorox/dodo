@@ -195,8 +195,9 @@ def main():
     if kernel32 is None:
         raise SystemExit("MinGW libkernel32.a not found; provide --kernel32 or install the MinGW development files")
     fixtures = [path.resolve() for path in args.fixture] if args.fixture else (
-        # window_events opens a real window; tests/window_library.rs drives it.
-        sorted(path for path in (ROOT / "tests/stdlib").glob("*.dodo") if path.name != "window_events.dodo") +
+        # window_events and window_frames open real windows; tests/window_library.rs drives them.
+        sorted(path for path in (ROOT / "tests/stdlib").glob("*.dodo")
+               if path.name not in ("window_events.dodo", "window_frames.dodo")) +
         sorted(path for path in (ROOT / "tests/os").glob("*.dodo")
                if "_unix_" not in path.name and path.name not in (
                    "process_checks.dodo", "env_native_checks.dodo", "thread_failures.dodo")))

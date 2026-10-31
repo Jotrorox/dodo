@@ -74,6 +74,16 @@
   factor. `std/window/x11` holds the protocol encoders and parsers as pure
   functions that build for every target. `dodo run` needs no flags or
   system packages.
+- `std/window` paces animation: `wait_event_until_frame()` returns events as
+  they arrive and `none` once per display refresh, so a steady stream of
+  mouse moves no longer holds frames back, and `frame_interval()` gives the
+  refresh period. Frames follow the display where the system reports it: a
+  `CADisplayLink` on macOS 14 and later, DWM's refresh timing on Windows and
+  the X11 Present extension on Linux, with a timer elsewhere. Animating
+  programs on macOS are exempt from App Nap until they call `wait_event()`
+  again, and Windows waits use a high-resolution timer instead of the
+  15.6 ms system tick. `examples/window.dodo` uses it and moves the ball by
+  time, at the same speed on 60 and 120 Hz displays.
 - MQTT 3.1.1 packages for both ends of a publish/subscribe system, in the
   style of the web packages. `std/mqtt/broker` runs a broker in one line,
   `broker.new().run(b"0.0.0.0:1883")`. It serves 16 clients from one thread

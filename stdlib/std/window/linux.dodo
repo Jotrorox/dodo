@@ -20,6 +20,7 @@ unsafe extern "C" fn dodo_window_x11_read(socket: i32, buffer: *mut u8, length: 
 unsafe extern "C" fn dodo_window_x11_write(socket: i32, data: *const u8, length: usize) -> i32
 unsafe extern "C" fn dodo_window_x11_wait(socket: i32, milliseconds: u32) -> i32
 unsafe extern "C" fn dodo_window_x11_close(socket: i32)
+unsafe extern "C" fn dodo_window_clock() -> u64
 
 // Shortcuts use Control on Linux.
 pub const SHORTCUT_IS_META: bool = false
@@ -155,6 +156,14 @@ pub struct Backend {
     pending_text: u32
     repeat_keycode: u32
     mouse_inside: bool
+    // The Present extension's major opcode, or 0 without it.
+    present_opcode: u8
+    present_serial: u32
+    // An earlier refresh Present reported, its time in microseconds and
+    // frame counter, to measure the refresh period in nanoseconds against.
+    base_ust: u64
+    base_msc: u64
+    period: u64
 
     pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Backend!raw.Error {
         claimed := unsafe {
@@ -163,7 +172,7 @@ pub struct Backend {
         if claimed != 0 {
             return err(raw.from_code(claimed))
         }
-        backend := Backend { socket: -1, active: false, pixels: Memory.empty(), width: 0, height: 0, input: Memory.empty(), input_start: 0, input_end: 0, output: Memory.empty(), output_length: 0, mapping: Memory.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, window: 0, gc: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, repeat_keycode: 0, mouse_inside: false }
+        backend := Backend { socket: -1, active: false, pixels: Memory.empty(), width: 0, height: 0, input: Memory.empty(), input_start: 0, input_end: 0, output: Memory.empty(), output_length: 0, mapping: Memory.empty(), mapping_first: 0, mapping_count: 0, per_keycode: 0, mapping_sequence: NO_REPLY, root: 0, depth: 24, max_request: 0, id_base: 0, id_step: 1, id_count: 0, window: 0, gc: 0, blank_cursor: 0, wm_protocols: 0, wm_delete: 0, net_wm_name: 0, utf8_string: 0, sequence: 0, pending_text: 0, repeat_keycode: 0, mouse_inside: false, present_opcode: 0, present_serial: 0, base_ust: 0, base_msc: 0, period: 0 }
         // From here on, dropping the backend releases the claim and socket.
         backend.active = true
         backend.connect(title, width, height, resizable)?
@@ -227,6 +236,7 @@ pub struct Backend {
         for self.mapping_sequence != NO_REPLY {
             self.receive(raw.FOREVER)?
         }
+        self.find_present()?
 
         // The window and its properties.
         self.pixels = Memory.new(width as usize * height as usize * 4)?
@@ -260,6 +270,14 @@ pub struct Backend {
         out = self.output.bytes()
         length = x11.create_gc(&mut out[start..], gc, window, 0)
         self.commit(length)?
+        if self.present_opcode != 0 {
+            event_id := self.new_id()?
+            opcode := self.present_opcode
+            start = self.output_length
+            out = self.output.bytes()
+            length = x11.present_select_input(&mut out[start..], opcode, event_id, window, x11.PRESENT_COMPLETE_MASK)
+            self.commit(length)?
+        }
         start = self.output_length
         out = self.output.bytes()
         length = x11.map_window(&mut out[start..], window)
@@ -324,26 +342,57 @@ pub struct Backend {
         length := x11.intern_atom(&mut out[start..], mem.str_bytes(name))
         self.commit(length)?
         wanted := self.sequence
+        head := [0u8; 32]
+        if !self.reply(wanted, &mut head)? {
+            return err(raw.Error.Protocol)
+        }
+        return ok(x11.u32_at(&head, 8))
+    }
+    // Send the buffered requests and wait for the answer to request
+    // `wanted`, skipping other messages; only used before the window
+    // exists. Copies the answer's first 32 bytes to `head` and returns true
+    // for a reply, false for an error.
+    fn reply(&mut self, wanted: u32, head: &mut[u8]) -> bool!raw.Error {
         self.flush()?
         for {
             self.need(x11.PACKET)?
             begin := self.input_start
-            head := [0u8; 32]
-            copy_to(&mut head, &self.input.view()[begin..begin + x11.PACKET])
-            total := x11.message_length(&head)
+            copy_to(head, &self.input.view()[begin..begin + x11.PACKET])
+            total := x11.message_length(head)
             if total > INPUT {
                 return err(raw.Error.Protocol)
             }
             self.need(total)?
             self.input_start += total
-            kind := x11.code(&head)
-            if (kind == x11.REPLY || kind == x11.ERROR) && x11.sequence(&head) == wanted {
-                if kind == x11.ERROR {
-                    return err(raw.Error.Protocol)
-                }
-                return ok(x11.u32_at(&head, 8))
+            kind := x11.code(head)
+            if (kind == x11.REPLY || kind == x11.ERROR) && x11.sequence(head) == wanted {
+                return ok(kind == x11.REPLY)
             }
         }
+    }
+    // Look for the Present extension, which reports display refreshes.
+    // Without it frames are paced by a timer.
+    fn find_present(&mut self) -> void!raw.Error {
+        self.reserve(64)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.query_extension(&mut out[start..], mem.str_bytes("Present"))
+        self.commit(length)?
+        wanted := self.sequence
+        head := [0u8; 32]
+        if !self.reply(wanted, &mut head)? || head[8] == 0 {
+            return ok()
+        }
+        opcode := head[9]
+        start = self.output_length
+        out = self.output.bytes()
+        length = x11.present_query_version(&mut out[start..], opcode, 1, 0)
+        self.commit(length)?
+        wanted = self.sequence
+        if self.reply(wanted, &mut head)? {
+            self.present_opcode = opcode
+        }
+        return ok()
     }
     fn request_mapping(&mut self) -> void!raw.Error {
         first := self.mapping_first
@@ -441,6 +490,11 @@ pub struct Backend {
             self.input_start += total
             return ok(false)
         }
+        if kind == x11.GENERIC_EVENT {
+            reported := self.generic(begin, total, event)
+            self.input_start += total
+            return ok(reported)
+        }
         self.input_start += x11.PACKET
         if kind == x11.ERROR {
             // A failed asynchronous request such as a PutImage racing a
@@ -451,6 +505,43 @@ pub struct Backend {
             return ok(false)
         }
         return self.translate(&message, event)
+    }
+    // An extension event of `total` bytes at `begin`. A Present
+    // CompleteNotify answering request_frame() is reported as FRAME.
+    fn generic(&mut self, begin: usize, total: usize, event: &mut raw.Event) -> bool {
+        if total < 40 || self.present_opcode == 0 {
+            return false
+        }
+        ust := 0u64
+        msc := 0u64
+        {
+            source := self.input.view()
+            message := &source[begin..begin + 40]
+            if message[1] != self.present_opcode || x11.u16_at(message, 8) != x11.PRESENT_COMPLETE_NOTIFY || message[10] != x11.PRESENT_KIND_NOTIFY_MSC || x11.u32_at(message, 16) != self.window {
+                return false
+            }
+            ust = x11.u64_at(message, 24)
+            msc = x11.u64_at(message, 32)
+        }
+        // Averaged over at least 30 refreshes, since single reports jitter,
+        // and restarted every 300 to follow a changing display.
+        if self.base_msc == 0 || msc <= self.base_msc || ust <= self.base_ust {
+            self.base_ust = ust
+            self.base_msc = msc
+        } else if msc - self.base_msc >= 30 {
+            period := (ust - self.base_ust) * 1000 / (msc - self.base_msc)
+            // Between 500 and 10 Hz; anything else is a clock glitch.
+            plausible := period >= 2000000 && period <= 100000000
+            if plausible {
+                self.period = period
+            }
+            if msc - self.base_msc >= 300 || !plausible {
+                self.base_ust = ust
+                self.base_msc = msc
+            }
+        }
+        set(event, raw.FRAME, 0, 0, 0, 0, 0)
+        return true
     }
     fn receive(&mut self, milliseconds: u32) -> bool!raw.Error {
         event := raw.Event.empty()
@@ -734,6 +825,43 @@ pub struct Backend {
             }
         }
     }
+    // Monotonic nanoseconds, the clock of next_vblank and frame pacing.
+    pub fn clock(&self) -> u64 {
+        return unsafe {
+            dodo_window_clock()
+        }
+    }
+    // Nanoseconds per display refresh, or 0 while unknown: Present's
+    // reports give it after about half a second of frames.
+    pub fn frame_period(&self) -> u64 {
+        return self.period
+    }
+    // X11 reports refreshes as they happen instead; 0 means unknown.
+    pub fn next_vblank(&mut self, now: u64) -> u64 {
+        return 0
+    }
+    // Ask for a FRAME event at the next refresh. False without Present.
+    pub fn request_frame(&mut self) -> bool!raw.Error {
+        if !self.active {
+            return err(raw.Error.Closed)
+        }
+        if self.present_opcode == 0 {
+            return ok(false)
+        }
+        self.present_serial = core.wrapping_add(self.present_serial, 1u32)
+        opcode := self.present_opcode
+        window := self.window
+        serial := self.present_serial
+        self.reserve(40)?
+        start := self.output_length
+        out := self.output.bytes()
+        length := x11.present_notify_msc(&mut out[start..], opcode, window, serial, 0, 1, 0)
+        self.commit(length)?
+        self.flush()?
+        return ok(true)
+    }
+    // Nothing throttles an X11 client in the background.
+    pub fn set_animating(&mut self, animating: bool) {}
     pub fn present(&mut self, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
         if !self.active {
             return err(raw.Error.Closed)
