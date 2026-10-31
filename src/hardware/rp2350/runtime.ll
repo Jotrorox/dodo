@@ -27,6 +27,16 @@
 ;   DMA_IRQ_0      Calls dodo_dma_interrupt if the program defines it:
 ;                  std/embedded/chip/rp_dma does, to raise the signals of
 ;                  finished DMA channels.
+;   SIO_IRQ_FIFO   Calls dodo_fifo_interrupt if the program defines it:
+;                  std/embedded/chip/rp_multicore does, to wake a task when
+;                  the other core writes to the FIFO between the cores.
+;   dodo_core_id   The executing core's number, 0 or 1, from SIO CPUID; the
+;                  compiler calls it for `cpu.core_id()`.
+;   dodo_core1_trampoline
+;                  Where core 1 starts, launched by
+;                  std/embedded/chip/rp_multicore: limits the stack, enables
+;                  the FPU and the double coprocessor as Reset_Handler does
+;                  on core 0, and calls the program's entry point.
 ;   dodo_board_panic
 ;                  The panic hook: masks interrupts, passes its arguments to
 ;                  dodo_panic_report if the program defines it, and halts.
@@ -165,6 +175,65 @@ module asm "    ldr r0, =DefaultHandler"
 module asm "1:  bx r0"
 module asm "    .ltorg"
 
+; SIO_IRQ_FIFO, each core's FIFO interrupt, likewise tail-calls the weak
+; dodo_fifo_interrupt.
+module asm ".section .text.FifoHandler, \22ax\22, %progbits"
+module asm ".weak dodo_fifo_interrupt"
+module asm ".type FifoHandler, %function"
+module asm ".thumb_func"
+module asm "FifoHandler:"
+module asm "    ldr r0, =dodo_fifo_interrupt"
+module asm "    cmp r0, #0"
+module asm "    bne 1f"
+module asm "    ldr r0, =DefaultHandler"
+module asm "1:  bx r0"
+module asm "    .ltorg"
+
+module asm ".section .text.dodo_core_id, \22ax\22, %progbits"
+module asm ".global dodo_core_id"
+module asm ".type dodo_core_id, %function"
+module asm ".thumb_func"
+module asm "dodo_core_id:"
+module asm "    ldr r0, =0xd0000000"                    ; SIO CPUID
+module asm "    ldr r0, [r0]"
+module asm "    bx lr"
+module asm "    .ltorg"
+
+; Core 1's boot ROM sets VTOR and the stack pointer from the launch sequence
+; and enters here. The launching core left three words on top of the stack:
+; the entry point's argument, the entry point (`unsafe fn(*mut u8)`), and the
+; stack's lowest address, which becomes the stack limit, so an overflow
+; faults instead of overwriting memory below. If the entry point returns,
+; core 1 sleeps.
+module asm ".section .text.dodo_core1_trampoline, \22ax\22, %progbits"
+module asm ".global dodo_core1_trampoline"
+module asm ".type dodo_core1_trampoline, %function"
+module asm ".thumb_func"
+module asm "dodo_core1_trampoline:"
+module asm "    pop {r0, r1, r2}"
+module asm "    msr msplim, r2"
+module asm "    ldr r3, =0xe000ed88"                    ; CPACR, per core
+module asm "    ldr r2, [r3]"
+module asm "    orr r2, r2, #0x00f00000"
+module asm "    orr r2, r2, #0x00000300"
+module asm "    str r2, [r3]"
+module asm "    dsb"
+module asm "    isb"
+module asm "    blx r1"
+module asm "1:  wfi"
+module asm "    b 1b"
+module asm "    .ltorg"
+
+; dodo_core1_trampoline's address, with the Thumb bit, for the launch sequence.
+module asm ".section .text.dodo_core1_entry, \22ax\22, %progbits"
+module asm ".global dodo_core1_entry"
+module asm ".type dodo_core1_entry, %function"
+module asm ".thumb_func"
+module asm "dodo_core1_entry:"
+module asm "    ldr r0, =dodo_core1_trampoline"
+module asm "    bx lr"
+module asm "    .ltorg"
+
 ; A weak reference: without a definition the linker makes it 0, and a
 ; definition is kept by --gc-sections only while this hook is.
 module asm ".section .text.dodo_board_panic, \22ax\22, %progbits"
@@ -255,7 +324,7 @@ module asm ".thumb_set IO_IRQ_BANK0, DefaultHandler"
 module asm ".thumb_set IO_IRQ_BANK0_NS, DefaultHandler"
 module asm ".thumb_set IO_IRQ_QSPI, DefaultHandler"
 module asm ".thumb_set IO_IRQ_QSPI_NS, DefaultHandler"
-module asm ".thumb_set SIO_IRQ_FIFO, DefaultHandler"
+module asm ".thumb_set SIO_IRQ_FIFO, FifoHandler"
 module asm ".thumb_set SIO_IRQ_BELL, DefaultHandler"
 module asm ".thumb_set SIO_IRQ_FIFO_NS, DefaultHandler"
 module asm ".thumb_set SIO_IRQ_BELL_NS, DefaultHandler"

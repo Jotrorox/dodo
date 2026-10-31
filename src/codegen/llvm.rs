@@ -320,6 +320,142 @@ impl<'ctx> LlvmType<'ctx> {
     }
 }
 
+unsafe fn large_aggregate(data: &TargetData, ty: LLVMTypeRef, limit: u64) -> bool {
+    unsafe {
+        matches!(
+            LLVMGetTypeKind(ty),
+            LLVMTypeKind::LLVMStructTypeKind | LLVMTypeKind::LLVMArrayTypeKind
+        ) && LLVMABISizeOfType(data.0, ty) > limit
+    }
+}
+unsafe fn large_aggregate_load(data: &TargetData, value: LLVMValueRef, limit: u64) -> bool {
+    unsafe {
+        !LLVMIsALoadInst(value).is_null()
+            && LLVMGetVolatile(value) == 0
+            && LLVMGetOrdering(value) == LLVMAtomicOrdering::LLVMAtomicOrderingNotAtomic
+            && large_aggregate(data, LLVMTypeOf(value), limit)
+    }
+}
+// The alloca a pointer addresses through constant-offset GEPs, if any.
+unsafe fn underlying_alloca(mut pointer: LLVMValueRef) -> Option<LLVMValueRef> {
+    unsafe {
+        while !LLVMIsAGetElementPtrInst(pointer).is_null() {
+            pointer = LLVMGetOperand(pointer, 0);
+        }
+        (!LLVMIsAAllocaInst(pointer).is_null()).then_some(pointer)
+    }
+}
+// Whether `later`, in the same block as `earlier`, sees the memory at
+// `source` that `earlier` saw. Instructions in between may write only to
+// allocas other than the one holding `source`.
+unsafe fn no_writes_between(
+    earlier: LLVMValueRef,
+    later: LLVMValueRef,
+    source: LLVMValueRef,
+) -> bool {
+    unsafe {
+        if LLVMGetInstructionParent(earlier) != LLVMGetInstructionParent(later) {
+            return false;
+        }
+        let source = underlying_alloca(source);
+        let elsewhere = |pointer: LLVMValueRef| {
+            source.is_some() && underlying_alloca(pointer).is_some_and(|a| Some(a) != source)
+        };
+        let mut next = LLVMGetNextInstruction(earlier);
+        while !next.is_null() && next != later {
+            let safe = match LLVMGetInstructionOpcode(next) {
+                LLVMOpcode::LLVMGetElementPtr
+                | LLVMOpcode::LLVMBitCast
+                | LLVMOpcode::LLVMAlloca
+                | LLVMOpcode::LLVMExtractValue
+                | LLVMOpcode::LLVMICmp
+                | LLVMOpcode::LLVMLoad => true,
+                LLVMOpcode::LLVMStore => elsewhere(LLVMGetOperand(next, 1)),
+                LLVMOpcode::LLVMCall => {
+                    // memset and memmove/memcpy write only their first operand.
+                    let callee = LLVMGetCalledValue(next);
+                    let mut length = 0;
+                    let name = LLVMGetValueName2(callee, &mut length);
+                    let name = std::slice::from_raw_parts(name.cast::<u8>(), length);
+                    (name.starts_with(b"llvm.memset")
+                        || name.starts_with(b"llvm.memmove")
+                        || name.starts_with(b"llvm.memcpy"))
+                        && elsewhere(LLVMGetOperand(next, 0))
+                }
+                _ => false,
+            };
+            if !safe {
+                return false;
+            }
+            next = LLVMGetNextInstruction(next);
+        }
+        next == later
+    }
+}
+// Stores a constant aggregate without whole-aggregate operations: zero as
+// memset, undefined parts not at all, and other parts field by field.
+unsafe fn store_constant(
+    builder: LLVMBuilderRef,
+    data: &TargetData,
+    pointer: LLVMValueRef,
+    value: LLVMValueRef,
+    limit: u64,
+) {
+    unsafe {
+        let ty = LLVMTypeOf(value);
+        if LLVMIsUndef(value) != 0 || !LLVMIsAPoisonValue(value).is_null() {
+            return;
+        }
+        if !large_aggregate(data, ty, limit) {
+            LLVMBuildStore(builder, value, pointer);
+            return;
+        }
+        let context = LLVMGetTypeContext(ty);
+        if LLVMIsNull(value) != 0 {
+            let size = LLVMConstInt(
+                LLVMIntTypeInContext(context, data.get_pointer_byte_size() * 8),
+                LLVMABISizeOfType(data.0, ty),
+                0,
+            );
+            LLVMBuildMemSet(
+                builder,
+                pointer,
+                LLVMConstInt(LLVMInt8TypeInContext(context), 0, 0),
+                size,
+                1,
+            );
+            return;
+        }
+        let count = if LLVMGetTypeKind(ty) == LLVMTypeKind::LLVMStructTypeKind {
+            LLVMCountStructElementTypes(ty) as u64
+        } else {
+            LLVMGetArrayLength2(ty)
+        };
+        let i32_type = LLVMInt32TypeInContext(context);
+        for index in 0..count {
+            let element = LLVMGetAggregateElement(value, index as u32);
+            if element.is_null() {
+                // Not decomposable; keep the plain store.
+                LLVMBuildStore(builder, value, pointer);
+                return;
+            }
+            let mut indices = [
+                LLVMConstInt(i32_type, 0, 0),
+                LLVMConstInt(i32_type, index, 0),
+            ];
+            let field = LLVMBuildInBoundsGEP2(
+                builder,
+                ty,
+                pointer,
+                indices.as_mut_ptr(),
+                2,
+                c"field".as_ptr(),
+            );
+            store_constant(builder, data, field, element, limit);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Value<'ctx>(LLVMValueRef, PhantomData<&'ctx Context>);
 impl<'ctx> Value<'ctx> {
@@ -646,6 +782,114 @@ impl<'ctx> Module<'ctx> {
         Value::optional(unsafe {
             LLVMGetIntrinsicDeclaration(self.0, id, types.as_mut_ptr(), types.len())
         })
+    }
+    /// Rewrites whole-value operations on aggregates larger than `limit`
+    /// bytes. Instruction selection and scalar replacement split such values
+    /// into one operation per element, costing minutes and gigabytes of
+    /// compiler memory, and megabytes of stack at -O0. Constant stores become
+    /// memset or field stores. A loaded value's store becomes a memmove when
+    /// nothing in between can write its source, a field extraction becomes a
+    /// field load, and a load left without uses is erased. Other loads stay.
+    pub(super) fn lower_large_aggregates(&self, data: &TargetData, limit: u64) {
+        unsafe {
+            let context = LLVMGetModuleContext(self.0);
+            let builder = LLVMCreateBuilderInContext(context);
+            let instructions = |keep: &dyn Fn(LLVMValueRef) -> bool| {
+                let mut found = Vec::new();
+                for function in self.functions() {
+                    let mut block = LLVMGetFirstBasicBlock(function.0);
+                    while !block.is_null() {
+                        let mut instruction = LLVMGetFirstInstruction(block);
+                        while !instruction.is_null() {
+                            if keep(instruction) {
+                                found.push(instruction);
+                            }
+                            instruction = LLVMGetNextInstruction(instruction);
+                        }
+                        block = LLVMGetNextBasicBlock(block);
+                    }
+                }
+                found
+            };
+            let constant_stores = instructions(&|store| {
+                !LLVMIsAStoreInst(store).is_null()
+                    && LLVMGetVolatile(store) == 0
+                    && LLVMIsConstant(LLVMGetOperand(store, 0)) != 0
+                    && large_aggregate(data, LLVMTypeOf(LLVMGetOperand(store, 0)), limit)
+            });
+            for store in constant_stores {
+                LLVMPositionBuilderBefore(builder, store);
+                store_constant(
+                    builder,
+                    data,
+                    LLVMGetOperand(store, 1),
+                    LLVMGetOperand(store, 0),
+                    limit,
+                );
+                LLVMInstructionEraseFromParent(store);
+            }
+            let mut work = instructions(&|load| large_aggregate_load(data, load, limit));
+            let i32_type = LLVMInt32TypeInContext(context);
+            while let Some(load) = work.pop() {
+                let source = LLVMGetOperand(load, 0);
+                let mut users = Vec::new();
+                let mut use_ = LLVMGetFirstUse(load);
+                while !use_.is_null() {
+                    users.push(LLVMGetUser(use_));
+                    use_ = LLVMGetNextUse(use_);
+                }
+                let rewritable = users.iter().all(|&user| {
+                    if !LLVMIsAExtractValueInst(user).is_null() {
+                        return LLVMGetOperand(user, 0) == load;
+                    }
+                    !LLVMIsAStoreInst(user).is_null()
+                        && LLVMGetVolatile(user) == 0
+                        && LLVMGetOperand(user, 0) == load
+                        && LLVMGetOperand(user, 1) != load
+                        && no_writes_between(load, user, source)
+                });
+                if !rewritable {
+                    continue;
+                }
+                let ty = LLVMTypeOf(load);
+                let size = LLVMConstInt(
+                    LLVMIntTypeInContext(context, data.get_pointer_byte_size() * 8),
+                    LLVMABISizeOfType(data.0, ty),
+                    0,
+                );
+                for user in users {
+                    if LLVMIsAStoreInst(user).is_null() {
+                        // Read the field where the whole value was read.
+                        LLVMPositionBuilderBefore(builder, load);
+                        let count = LLVMGetNumIndices(user) as usize;
+                        let indices = std::slice::from_raw_parts(LLVMGetIndices(user), count);
+                        let mut gep = vec![LLVMConstInt(i32_type, 0, 0)];
+                        gep.extend(indices.iter().map(|&i| LLVMConstInt(i32_type, i as u64, 0)));
+                        let field = LLVMBuildInBoundsGEP2(
+                            builder,
+                            ty,
+                            source,
+                            gep.as_mut_ptr(),
+                            gep.len() as u32,
+                            c"field".as_ptr(),
+                        );
+                        let narrow =
+                            LLVMBuildLoad2(builder, LLVMTypeOf(user), field, c"field".as_ptr());
+                        LLVMReplaceAllUsesWith(user, narrow);
+                        LLVMInstructionEraseFromParent(user);
+                        if large_aggregate_load(data, narrow, limit) {
+                            work.push(narrow);
+                        }
+                    } else {
+                        LLVMPositionBuilderBefore(builder, user);
+                        LLVMBuildMemMove(builder, LLVMGetOperand(user, 1), 1, source, 1, size);
+                        LLVMInstructionEraseFromParent(user);
+                    }
+                }
+                LLVMInstructionEraseFromParent(load);
+            }
+            LLVMDisposeBuilder(builder);
+        }
     }
     pub fn verify(&self) -> Result<()> {
         let mut msg = ptr::null_mut();

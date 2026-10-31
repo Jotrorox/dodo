@@ -345,10 +345,8 @@ impl Scan<'_> {
 }
 
 use super::ownership::Value;
-use super::uses::{binding_use_spans, names_block};
-use super::{Check, Checker, static_loan};
+use super::{Check, Checker};
 use crate::diagnostic::Diagnostic;
-use std::collections::HashMap;
 
 impl Checker<'_> {
     /// A named function used as a value: a function pointer with no environment.
@@ -491,21 +489,14 @@ impl Checker<'_> {
             interrupt: None,
             placement: Placement::default(),
         };
-        let mut uses = HashMap::new();
-        names_block(function.body.as_ref().unwrap(), &mut uses);
-        let mut checker = Checker::new(self.context, closure.ret.clone(), from, uses);
+        let mut checker = Checker::new(self.context, closure.ret.clone());
         checker.recover = self.recover;
         checker.namespace = self.namespace.clone();
         checker.function_name = name.clone();
         checker.imported = self.imported;
         checker.unsafe_depth = self.unsafe_depth;
-        checker.binding_uses = binding_use_spans(&function);
-        checker.return_contract = Some(closure.ret_span);
-        checker.inferred_contract = true;
         for parameter in &function.params[..captured.len()] {
-            checker
-                .capture_roots
-                .insert(usize::MAX / 2 + checker.next_id, parameter.name.clone());
+            checker.captures.insert(parameter.name.clone());
             checker.bind_parameter(&parameter.name, &parameter.ty, parameter.span)?;
         }
         for parameter in &closure.params {
@@ -527,7 +518,6 @@ impl Checker<'_> {
                 format!("closure can reach its end without returning {ret}"),
             ));
         }
-        checker.finish_scope(span)?;
         if ret == Type::Void {
             settle_tails(body, false);
         }
@@ -573,7 +563,6 @@ impl Checker<'_> {
             }
         }
 
-        let mut deps = Vec::new();
         let mut captures = Vec::new();
         for (index, (name, ty)) in captured.iter().enumerate() {
             let mutable = mutated.contains(name);
@@ -596,7 +585,7 @@ impl Checker<'_> {
                 ),
                 span,
             );
-            let value = self.expr(&mut borrow, None, false).map_err(|error| {
+            self.expr(&mut borrow, None, false).map_err(|error| {
                 error.note(format!(
                     "the closure {} `{name}` for as long as it is used",
                     if mutable {
@@ -606,7 +595,6 @@ impl Checker<'_> {
                     }
                 ))
             })?;
-            deps.extend(value.deps);
             captures.push(Capture {
                 name: name.clone(),
                 mutable,
@@ -616,17 +604,13 @@ impl Checker<'_> {
         closure.captures = captures;
         self.closures.push(function);
         if captured.is_empty() {
-            Ok(Value {
-                ty: signature,
-                deps: vec![],
-            })
+            Ok(Value { ty: signature })
         } else {
             let Type::Fn(params, ret) = signature else {
                 unreachable!()
             };
             Ok(Value {
                 ty: Type::Ref(!mutated.is_empty(), Box::new(Type::DynFn(params, ret))),
-                deps,
             })
         }
     }
@@ -646,7 +630,6 @@ impl Checker<'_> {
             let inner = std::mem::replace(callee, Expr::new(ExprKind::Bool(false), span));
             *callee = Expr::new(ExprKind::Unary(UnaryOp::Deref, Box::new(inner)), span);
         }
-        let start = self.temporary.len();
         let peeked = self.peek_type(callee);
         let value = self.expr(callee, peeked.as_ref(), false)?;
         let Some((params, ret)) = value
@@ -662,9 +645,6 @@ impl Checker<'_> {
                 ),
             ));
         };
-        if let Some((mutable, ..)) = value.ty.closure_signature() {
-            self.reserve_argument_borrow(&value, mutable, start, callee.span)?;
-        }
         if args.len() != params.len() {
             return Err(Diagnostic::new(
                 span,
@@ -675,36 +655,11 @@ impl Checker<'_> {
                 ),
             ));
         }
-        let mut dependencies = vec![];
         for (arg, param) in args.iter_mut().zip(&params) {
             let reference = matches!(param, Type::Ref(..) | Type::Slice(..));
-            let argument_start = self.temporary.len();
             let value = self.expr(arg, Some(param), !reference)?;
             self.expect(param, &value.ty, arg.span)?;
-            if reference {
-                self.reserve_argument_borrow(
-                    &value,
-                    super::mutable_borrow(param),
-                    argument_start,
-                    arg.span,
-                )?;
-            }
-            if self.context.carries_borrow(param) {
-                dependencies.extend(value.deps);
-            }
         }
-        self.temporary.truncate(start);
-        if self.context.carries_borrow(&ret) {
-            if dependencies.is_empty() {
-                dependencies.push(static_loan(span));
-            }
-            self.temporary.extend(dependencies.clone());
-        } else {
-            dependencies.clear();
-        }
-        Ok(Value {
-            ty: ret,
-            deps: dependencies,
-        })
+        Ok(Value { ty: ret })
     }
 }

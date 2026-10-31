@@ -133,12 +133,14 @@ controller ownership both chips share in `std/embedded/chip/rp_pins`, and
 their PWM outputs and ADC inputs through `std/embedded/chip/rp_pwm` and
 `std/embedded/chip/rp_adc`, their PIO state machines, with programs assembled
 at compile time, through `std/embedded/chip/rp_pio`, a USB serial port on
-the board's own USB connector through `std/embedded/chip/rp_usb`, and their
-DMA channels through `std/embedded/chip/rp_dma`, which the SPI buses and
-serial ports use for transfers that run in the background.
+the board's own USB connector through `std/embedded/chip/rp_usb`, their DMA
+channels through `std/embedded/chip/rp_dma`, which the SPI buses and serial
+ports use for transfers that run in the background, and their second core,
+with the FIFOs and spinlocks the cores share, through
+`std/embedded/chip/rp_multicore`.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
-tasks on one core, waking each on time or on an interrupt and sleeping
+tasks on a core, waking each on time or on an interrupt and sleeping
 in between. `std/embedded/wireless/cyw43` drives the Pico 2 W's CYW43439 wireless chip
 far enough for its LED; Wi-Fi and Bluetooth are not supported yet.
 [Compiler limits](implementation.md) and [container element restrictions](container-elements.md)
@@ -158,6 +160,7 @@ individual modules and links every public declaration back to its source.
 | [Allocation and boxes](allocation.md) | `alloc/arena`, `alloc/arena_box`, `alloc/block`, `alloc/boxed`, `alloc/error`, `alloc/layout`, `alloc/pool`, `alloc/pool_box`, `alloc/shared_arena`, `alloc/shared_box` | Portable. |
 | [Binary bytes](bytes.md) | `std/arena_bytes`, `std/bytes`, `std/bytes_alloc`, `std/pool_bytes` | Portable. |
 | [Byte I/O](io.md) | `std/io`, `std/io_alloc` | Portable. |
+| [Compression](compression.md) | `std/compress/deflate`, `std/compress/zlib`, `std/compress/gzip`, `std/compress/io` | Portable; caller-supplied buffers. |
 | [Console I/O](console.md) | `std/console` | Hosted. |
 | [Formatting](formatting.md) | `std/fmt`, `std/fmt/errors`, `std/fmt_alloc` | Portable. |
 | [UTF-8 text](text.md) | `std/text`, `std/text_alloc`, `std/text_shared` | Portable. |

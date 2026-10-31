@@ -16,6 +16,54 @@
   give words through their FIFOs, execute single instructions, and raise
   the block's interrupts. `examples/ws2812.dodo` drives WS2812 LEDs, and the
   board self-tests gain three PIO checks.
+- The RP2040 and RP2350 run code on their second core. `b.core1.start(&mut
+  stack, task)` runs a task value's `run(self)` method on core 1, with the
+  task and the stack in memory the program provides, until the returned
+  handle is dropped or stopped, which holds core 1 in reset again. Tasks are
+  checked like `std/thread` tasks, so they own what they hold and carry no
+  references. On the RP2350 the stack's bottom is core 1's stack limit, and
+  core 1 enables its FPU and double-precision coprocessor as core 0 does.
+  `b.fifos.claim()` hands out each core's end of the hardware FIFOs between
+  the cores, and `b.spinlocks.claim(n)` the hardware spinlocks, whose guard
+  also masks interrupts on the holding core. On the RP2350, the spinlocks that
+  erratum RP2350-E2 can unlock are never handed out. Each core can run its own
+  `std/embedded/executor`: signals now belong to the core that raises and
+  takes them, and `fifo.set_signal(&signal)` wakes a task when the other core
+  writes, through the chip runtime's default FIFO interrupt handler. The new
+  `cpu.core_id()` intrinsic returns the executing core's number: `mhartid` on
+  RISC-V, the chip runtime's `dodo_core_id` on a Cortex-M, and 0 on hosted
+  targets. `examples/two_cores.dodo` searches for primes on core 1 and reports
+  them from core 0, and the board self-tests gain three checks of core 1, the
+  FIFOs, and spinlocks.
+
+- New portable compression packages read and write DEFLATE
+  (`std/compress/deflate`), zlib (`std/compress/zlib`), and gzip
+  (`std/compress/gzip`) through caller-supplied buffers, without allocating.
+  `encode(input, output, level)` compresses at levels 0 through 9 with lazy
+  LZ77 matching and optimal Huffman codes, choosing the smallest of stored,
+  fixed, and dynamic blocks; its output matches zlib's size, and
+  `max_encoded_len` bounds it. `decode` checks the Adler-32 or CRC-32 and
+  stops after one stream or gzip member. Each package also has incremental
+  `Decoder` and `Encoder` types for buffers of any size, gzip headers can
+  carry a name, comment, and time, and `std/compress/io` adapts all three
+  formats to `std/io` readers and writers.
+- Records larger than 1 KiB passed, returned, or moved by value compile as
+  memory copies at every optimization level. Before, LLVM split them into
+  one operation per element: a 256 KiB struct took minutes and gigabytes of
+  memory to build at `-O 2` and needed about 10 MB of stack at `-O 0`. Root
+  package public functions now pass such records through memory like other
+  Dodo functions.
+- Ownership is checked on each function's control-flow graph, for every body
+  the compiler accepts: initialization, moves, borrows, escapes, destructor
+  order, and Result obligations. The earlier checker that ran beside it, and
+  covered every body the graph could not yet represent, is gone. Liveness now
+  follows each binding exactly: a borrow ends at its last use even across
+  shadowing and loops, and a conflict names the binding that holds the
+  borrow and points at its next use. Some programs the old checker rejected
+  because of its approximations now compile, such as a mutable slice
+  `&mut a[..]` iterated and written in place. Some errors are reported
+  differently: type errors come before ownership errors, and a use after a
+  move into a value block is now reported as one.
 - A cryptography package. `std/crypto/random` reads the operating system's
   CSPRNG (`getrandom`, `SecRandomCopyBytes`, `BCryptGenRandom`) with no
   user-space generator or fallback. It fills buffers, draws unbiased values

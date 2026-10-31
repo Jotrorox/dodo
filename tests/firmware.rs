@@ -481,6 +481,11 @@ fn chip_runtimes_provide_startup_and_helper_symbols() {
             "dodo_usb_interrupt",
             "DMA_IRQ_0",
             "dodo_dma_interrupt",
+            "FifoHandler",
+            "dodo_fifo_interrupt",
+            "dodo_core_id",
+            "dodo_core1_trampoline",
+            "dodo_core1_entry",
             "memcpy",
             "memset",
         ] {
@@ -836,17 +841,17 @@ fn the_default_panic_hook_reports_on_serial_ports() {
 /// The first literal of the runtime's USBCTRL_IRQ stub, which it calls if
 /// nonzero: dodo_usb_interrupt's address or 0.
 fn usb_interrupt_literal(elf: &Path, family: u32) -> u32 {
-    stub_literal(elf, family, "USBCTRL_IRQ")
+    stub_literal(elf, family, "USBCTRL_IRQ", 10)
 }
 
-/// The first literal of a runtime stub that tail-calls a weak handler,
-/// such as USBCTRL_IRQ's or DMA_IRQ_0's: the handler's address or 0.
-fn stub_literal(elf: &Path, family: u32, symbol: &str) -> u32 {
+/// The first literal after `instructions` bytes of the runtime function
+/// `symbol`, in the flashed image.
+fn stub_literal(elf: &Path, family: u32, symbol: &str, instructions: usize) -> u32 {
     let bytes = fs::read(elf).unwrap();
     let image = flash_image(&fs::read(elf.with_extension("uf2")).unwrap(), family);
-    let stub = (elf_symbol(&bytes, symbol).expect("runtime stub") & !1) as usize;
-    // ldr, cmp, bne, ldr, bx: five halfwords, then the aligned words.
-    let at = (stub - 0x1000_0000 + 10 + 3) & !3;
+    let stub = (elf_symbol(&bytes, symbol).expect(symbol) & !1) as usize;
+    // The literal pool follows, word-aligned.
+    let at = (stub - 0x1000_0000 + instructions + 3) & !3;
     word(&image, at)
 }
 
@@ -915,6 +920,119 @@ fn the_usb_serial_port_is_served_from_the_default_usb_interrupt() {
     }
 }
 
+// examples/two_cores.dodo on every board: the default FIFO interrupt
+// handlers serve rp_multicore's signal, and core 1 is launched at the
+// runtime's trampoline.
+#[test]
+fn two_core_programs_link_for_every_board() {
+    if !ld_lld() {
+        return;
+    }
+    let scratch = Scratch::new("two-cores");
+    let example = root().join("examples/two_cores.dodo");
+    // The FIFO interrupts: SIO_IRQ_PROC0 and SIO_IRQ_PROC1 on the RP2040,
+    // SIO_IRQ_FIFO on the RP2350.
+    let boards: [(&str, u32, &[usize]); 3] = [
+        ("pico", 0xE48B_FF56, &[15, 16]),
+        ("pico2", 0xE48B_FF59, &[25]),
+        ("pico2_w", 0xE48B_FF59, &[25]),
+    ];
+    for (board, family, irqs) in boards {
+        for level in ["0", "2"] {
+            let elf = scratch.path(&format!("two-{board}-O{level}.elf"));
+            build(&[
+                "build",
+                example.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "-o",
+                &elf,
+            ]);
+            let path = Path::new(&elf);
+            let bytes = fs::read(path).unwrap();
+            let serve = elf_symbol(&bytes, "dodo_fifo_interrupt").expect("the hook is linked");
+            assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
+            // ldr, cmp, bne, ldr, bx, as in USBCTRL_IRQ.
+            assert_eq!(stub_literal(path, family, "FifoHandler", 10), serve);
+            let image = flash_image(&fs::read(path.with_extension("uf2")).unwrap(), family);
+            let vectors = elf_symbol(&bytes, "__vector_table").unwrap() as usize - 0x1000_0000;
+            let handler = elf_symbol(&bytes, "FifoHandler").unwrap() | 1;
+            for irq in irqs {
+                assert_eq!(
+                    word(&image, vectors + 4 * (16 + irq)),
+                    handler,
+                    "{board} -O{level}: IRQ {irq} is the FIFO handler"
+                );
+            }
+            let trampoline = elf_symbol(&bytes, "dodo_core1_trampoline").expect("trampoline");
+            // ldr, bx, then the trampoline's address with the Thumb bit.
+            assert_eq!(
+                stub_literal(path, family, "dodo_core1_entry", 4),
+                trampoline | 1,
+                "{board} -O{level}"
+            );
+            assert!(
+                elf_symbol(&bytes, "dodo_core_id").is_some(),
+                "{board} -O{level}"
+            );
+        }
+    }
+    // Without std/embedded/chip the FIFO stub falls through to DefaultHandler.
+    let bare = scratch.write("bare.dodo", "package main\nfn main() {}\n");
+    for (chip, family) in [("rp2040", 0xE48B_FF56), ("rp2350", 0xE48B_FF59)] {
+        let elf = scratch.path(&format!("bare-{chip}.elf"));
+        build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
+        assert_eq!(
+            stub_literal(Path::new(&elf), family, "FifoHandler", 10),
+            0,
+            "{chip}"
+        );
+    }
+}
+
+// Starting core 1 checks what moves there: a task holding a reference is
+// rejected, as for std/thread.
+#[test]
+fn core1_tasks_cannot_hold_references() {
+    let scratch = Scratch::new("core1-borrow");
+    let source = scratch.write(
+        "borrow.dodo",
+        r#"package main
+import "std/embedded/board"
+struct Counter {
+    count: &mut u32
+    pub fn run(self) {
+        *self.count += 1
+    }
+}
+fn main() {
+    b := board.take()!
+    count := 0u32
+    stack := [0u64; 256]
+    running := b.core1.start(&mut stack, Counter { count: &mut count })!
+    running.stop()
+}
+"#,
+    );
+    let object = scratch.path("borrow.o");
+    let error = stderr(&dodo(&[
+        "build",
+        source.to_str().unwrap(),
+        "--board",
+        "pico2",
+        "--emit",
+        "obj",
+        "-o",
+        &object,
+    ]));
+    assert!(
+        error.contains("not checked for cross-thread transfer"),
+        "{error}"
+    );
+}
+
 #[test]
 fn dma_signals_are_raised_from_the_default_dma_interrupt() {
     if !ld_lld() {
@@ -944,7 +1062,10 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
             let bytes = fs::read(&elf).unwrap();
             let serve = elf_symbol(&bytes, "dodo_dma_interrupt").expect("the handler is linked");
             assert_eq!(serve & 1, 1, "{board} -O{level}: a Thumb function");
-            assert_eq!(stub_literal(Path::new(&elf), family, "DMA_IRQ_0"), serve);
+            assert_eq!(
+                stub_literal(Path::new(&elf), family, "DMA_IRQ_0", 10),
+                serve
+            );
             let image = flash_image(
                 &fs::read(Path::new(&elf).with_extension("uf2")).unwrap(),
                 family,
@@ -975,7 +1096,7 @@ fn dma_signals_are_raised_from_the_default_dma_interrupt() {
         let elf = scratch.path(&format!("bare-{chip}.elf"));
         build(&["build", bare.to_str().unwrap(), "--chip", chip, "-o", &elf]);
         assert_eq!(
-            stub_literal(Path::new(&elf), family, "DMA_IRQ_0"),
+            stub_literal(Path::new(&elf), family, "DMA_IRQ_0", 10),
             0,
             "{chip}"
         );
