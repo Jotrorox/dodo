@@ -1989,6 +1989,319 @@ pub struct Canvas {
         }
     }
 
+    // Composite `color` over the canvas through a coverage mask: `mask`
+    // holds `width` x `height` levels, one byte per pixel in rows of `width`
+    // bytes, from 0 (untouched) to 255 (fully covered), as coverage_mask
+    // writes them. The mask's top-left pixel lands on (x, y). Each pixel is
+    // blended exactly as fill_outline blends one with that coverage, so
+    // filling an outline and filling its mask draw the same pixels. Rows past
+    // the end of `mask` are skipped.
+    pub fn fill_mask(&mut self, mask: &[u8], width: u32, height: u32, x: i32, y: i32, color: Color) {
+        rows := mask_rows(mask, width, height)
+        top := max64(y as i64, self.clip_top)
+        bottom := min64(y as i64 + rows, self.clip_bottom)
+        left := max64(x as i64, self.clip_left)
+        right := min64(x as i64 + width as i64, self.clip_right)
+        if left >= right || top >= bottom {
+            return
+        }
+        alpha := color >> 24
+        packed := encode(&self.format, color)
+        // Rgba8888 and Bgra8888 blend in their stored layout. A Bgra8888
+        // pixel read as a little-endian u32 is a Color; an Rgba8888 one is a
+        // Color with red and blue swapped.
+        wide := self.bytes_per_pixel == 4
+        swapped := false
+        match &self.format {
+            PixelFormat.Rgba8888 => {
+                swapped = true
+            }
+            _ => {}
+        }
+        stride := width as usize
+        written_left := right
+        written_right := left
+        written_top := bottom
+        written_bottom := top
+        for row in top..bottom {
+            at := (row - y as i64) as usize * stride + (left - x as i64) as usize
+            first := right
+            last := left
+            if wide {
+                // Store through a local row slice, as run() does.
+                start := (row - self.origin_y) as usize * self.stride + (left - self.origin_x) as usize * 4
+                span := &mut self.pixels[start..start + (right - left) as usize * 4]
+                for column in left..right {
+                    level := mask[at] as u32
+                    at += 1
+                    if level != 0 {
+                        blend_stored(span, (column - left) as usize * 4, color, packed, level, swapped)
+                        if column < first {
+                            first = column
+                        }
+                        last = column + 1
+                    }
+                }
+            } else {
+                for column in left..right {
+                    level := mask[at] as u32
+                    at += 1
+                    if level != 0 {
+                        if level == 255 && alpha == 255 {
+                            self.put(column, row, packed)
+                        } else {
+                            self.paint_pixel(column, row, color, level)
+                        }
+                        if column < first {
+                            first = column
+                        }
+                        last = column + 1
+                    }
+                }
+            }
+            if first < last {
+                written_left = min64(written_left, first)
+                written_right = max64(written_right, last)
+                written_top = min64(written_top, row)
+                written_bottom = row + 1
+            }
+        }
+        self.touch(written_left, written_top, written_right, written_bottom)
+    }
+    // fill_mask for spans from coverage_spans: the same pixels, drawn
+    // faster. `width` and `height` are the area the spans were made for.
+    pub fn fill_spans(&mut self, spans: &[u8], width: u32, height: u32, x: i32, y: i32, color: Color) {
+        self.draw_spans(spans, width, height, x, y, color)
+    }
+    // gradient_mask for spans from coverage_spans.
+    pub fn gradient_spans(&mut self, spans: &[u8], width: u32, height: u32, x: i32, y: i32, gradient: &Gradient) {
+        self.draw_spans_shaded(spans, width, height, x, y, gradient)
+    }
+    fn draw_spans(&mut self, spans: &[u8], width: u32, height: u32, x: i32, y: i32, color: Color) {
+        top := max64(y as i64, self.clip_top)
+        bottom := min64(y as i64 + height as i64, self.clip_bottom)
+        // Visible columns of the area, relative to its left edge.
+        low := max64(self.clip_left - x as i64, 0)
+        high := min64(self.clip_right - x as i64, width as i64)
+        if low >= high || top >= bottom {
+            return
+        }
+        alpha := color >> 24
+        packed := encode(&self.format, color)
+        wide := self.bytes_per_pixel == 4
+        swapped := false
+        match &self.format {
+            PixelFormat.Rgba8888 => {
+                swapped = true
+            }
+            _ => {}
+        }
+        b0 := (packed & 255) as u8
+        b1 := ((packed >> 8) & 255) as u8
+        b2 := ((packed >> 16) & 255) as u8
+        b3 := (packed >> 24) as u8
+        written_left := high
+        written_right := low
+        written_top := bottom
+        written_bottom := top
+        at := 0usize
+        for row in y as i64..y as i64 + height as i64 {
+            if row >= bottom {
+                break
+            }
+            visible := row >= top
+            first := high
+            last := low
+            column := 0i64
+            line := 0usize
+            if visible && wide {
+                line = (row - self.origin_y) as usize * self.stride
+            }
+            for column < width as i64 && at < spans.len {
+                tag := spans[at] as u32
+                at += 1
+                kind := tag >> 6
+                n := (tag & 63) as i64 + 1
+                if kind == SPAN_END {
+                    break
+                }
+                start := column
+                column += n
+                levels := at
+                if kind == SPAN_LEVELS {
+                    at += n as usize
+                    if at > spans.len {
+                        break
+                    }
+                }
+                if !visible || kind == SPAN_SKIP {
+                    continue
+                }
+                l := max64(start, low)
+                r := min64(column, high)
+                if l >= r {
+                    continue
+                }
+                first = min64(first, l)
+                last = max64(last, r)
+                if wide {
+                    pixel := line + (x as i64 + l - self.origin_x) as usize * 4
+                    span := &mut self.pixels[pixel..pixel + (r - l) as usize * 4]
+                    if kind == SPAN_FULL && alpha == 255 {
+                        for p in 0usize..span.len / 4 {
+                            span[p * 4] = b0
+                            span[p * 4 + 1] = b1
+                            span[p * 4 + 2] = b2
+                            span[p * 4 + 3] = b3
+                        }
+                    } else if kind == SPAN_FULL {
+                        for p in 0usize..(r - l) as usize {
+                            blend_stored(span, p * 4, color, packed, 255, swapped)
+                        }
+                    } else {
+                        offset := levels + (l - start) as usize
+                        for p in 0usize..(r - l) as usize {
+                            blend_stored(span, p * 4, color, packed, spans[offset + p] as u32, swapped)
+                        }
+                    }
+                } else {
+                    for c in l..r {
+                        level := 255u32
+                        if kind == SPAN_LEVELS {
+                            level = spans[levels + (c - start) as usize] as u32
+                        }
+                        if level == 255 && alpha == 255 {
+                            self.put(x as i64 + c, row, packed)
+                        } else {
+                            self.paint_pixel(x as i64 + c, row, color, level)
+                        }
+                    }
+                }
+            }
+            if first < last {
+                written_left = min64(written_left, first)
+                written_right = max64(written_right, last)
+                written_top = min64(written_top, row)
+                written_bottom = row + 1
+            }
+        }
+        self.touch(x as i64 + written_left, written_top, x as i64 + written_right, written_bottom)
+    }
+    fn draw_spans_shaded(&mut self, spans: &[u8], width: u32, height: u32, x: i32, y: i32, gradient: &Gradient) {
+        top := max64(y as i64, self.clip_top)
+        bottom := min64(y as i64 + height as i64, self.clip_bottom)
+        low := max64(self.clip_left - x as i64, 0)
+        high := min64(self.clip_right - x as i64, width as i64)
+        if low >= high || top >= bottom {
+            return
+        }
+        written_left := high
+        written_right := low
+        written_top := bottom
+        written_bottom := top
+        at := 0usize
+        for row in y as i64..y as i64 + height as i64 {
+            if row >= bottom {
+                break
+            }
+            visible := row >= top
+            first := high
+            last := low
+            column := 0i64
+            walk := gradient.walk(x as i64 + low, row)
+            for column < width as i64 && at < spans.len {
+                tag := spans[at] as u32
+                at += 1
+                kind := tag >> 6
+                n := (tag & 63) as i64 + 1
+                if kind == SPAN_END {
+                    break
+                }
+                start := column
+                column += n
+                levels := at
+                if kind == SPAN_LEVELS {
+                    at += n as usize
+                    if at > spans.len {
+                        break
+                    }
+                }
+                if !visible || kind == SPAN_SKIP {
+                    continue
+                }
+                l := max64(start, low)
+                r := min64(column, high)
+                if l >= r {
+                    continue
+                }
+                first = min64(first, l)
+                last = max64(last, r)
+                for c in l..r {
+                    level := 255u32
+                    if kind == SPAN_LEVELS {
+                        level = spans[levels + (c - start) as usize] as u32
+                    }
+                    px := x as i64 + c
+                    gradient.seek(&mut walk, px, row)
+                    sampled := gradient.walk_color(&mut walk)
+                    paint := gradient.dithered(sampled, px, row, &self.format)
+                    self.paint_pixel(px, row, paint, level)
+                }
+            }
+            if first < last {
+                written_left = min64(written_left, first)
+                written_right = max64(written_right, last)
+                written_top = min64(written_top, row)
+                written_bottom = row + 1
+            }
+        }
+        self.touch(x as i64 + written_left, written_top, x as i64 + written_right, written_bottom)
+    }
+    // fill_mask with a gradient instead of a color, blended as
+    // gradient_outline blends.
+    pub fn gradient_mask(&mut self, mask: &[u8], width: u32, height: u32, x: i32, y: i32, gradient: &Gradient) {
+        rows := mask_rows(mask, width, height)
+        top := max64(y as i64, self.clip_top)
+        bottom := min64(y as i64 + rows, self.clip_bottom)
+        left := max64(x as i64, self.clip_left)
+        right := min64(x as i64 + width as i64, self.clip_right)
+        if left >= right || top >= bottom {
+            return
+        }
+        stride := width as usize
+        written_left := right
+        written_right := left
+        written_top := bottom
+        written_bottom := top
+        for row in top..bottom {
+            at := (row - y as i64) as usize * stride + (left - x as i64) as usize
+            first := right
+            last := left
+            walk := gradient.walk(left, row)
+            for column in left..right {
+                level := mask[at] as u32
+                at += 1
+                if level != 0 {
+                    gradient.seek(&mut walk, column, row)
+                    sampled := gradient.walk_color(&mut walk)
+                    paint := gradient.dithered(sampled, column, row, &self.format)
+                    self.paint_pixel(column, row, paint, level)
+                    if column < first {
+                        first = column
+                    }
+                    last = column + 1
+                }
+            }
+            if first < last {
+                written_left = min64(written_left, first)
+                written_right = max64(written_right, last)
+                written_top = min64(written_top, row)
+                written_bottom = row + 1
+            }
+        }
+        self.touch(written_left, written_top, written_right, written_bottom)
+    }
+
     // -- Comparison --------------------------------------------------------
 
     // True when both canvases have the same size and every pixel decodes to
@@ -2747,6 +3060,182 @@ fn coverage_level(sum: i64, even_odd: bool) -> u32 {
         coverage = FULL
     }
     return ((coverage * 255 + 32768) >> 16) as u32
+}
+
+// The rows of a width x height mask that `mask` holds.
+fn mask_rows(mask: &[u8], width: u32, height: u32) -> i64 {
+    if width == 0 {
+        return 0
+    }
+    return min64(height as i64, (mask.len / width as usize) as i64)
+}
+
+// paint_pixel for the Rgba8888 or Bgra8888 pixel at byte `at` of `span`:
+// `color` with its alpha scaled by `level`, where `packed` is the color
+// stored and `swapped` tells Rgba8888 (red and blue swapped from a Color).
+fn blend_stored(span: &mut[u8], at: usize, color: Color, packed: u32, level: u32, swapped: bool) {
+    a := div255((color >> 24) * level)
+    if a == 0 {
+        return
+    }
+    pixel := &mut span[at..at + 4]
+    result := packed
+    if a != 255 {
+        below := (pixel[0] as u32) | ((pixel[1] as u32) << 8) | ((pixel[2] as u32) << 16) | ((pixel[3] as u32) << 24)
+        if (below >> 24) == 255 {
+            result = blend_opaque(tint_low(packed, a), tint_high(packed, a), 255 - a, below)
+        } else if swapped {
+            result = swap_red_blue(over(with_alpha(color, a as u8), swap_red_blue(below)))
+        } else {
+            result = over(with_alpha(color, a as u8), below)
+        }
+    }
+    pixel[0] = (result & 255) as u8
+    pixel[1] = ((result >> 8) & 255) as u8
+    pixel[2] = ((result >> 16) & 255) as u8
+    pixel[3] = (result >> 24) as u8
+}
+
+fn swap_red_blue(color: u32) -> u32 {
+    return (color & 0xff00ff00) | ((color >> 16) & 255) | ((color & 255) << 16)
+}
+
+// The pixels `outline` may cover: the smallest rectangle of whole pixels
+// around every point it passes through, or an empty rectangle for an
+// outline with no points. Size a mask for coverage_mask with it.
+pub fn outline_bounds<O: Outline>(outline: &O) -> Rect {
+    pen := Pen.new()
+    outline.trace(&mut pen)
+    pen.close()
+    if !pen.any {
+        return Rect.empty()
+    }
+    left := floor_div(pen.min_x, 256)
+    top := floor_div(pen.min_y, 256)
+    right := ceil_div(pen.max_x, 256)
+    bottom := ceil_div(pen.max_y, 256)
+    return Rect { x: left as i32, y: top as i32, width: (right - left) as u32, height: (bottom - top) as u32 }
+}
+
+// Rasterize `outline` by `rule` into a coverage mask instead of a canvas:
+// `mask` receives the coverage of the width x height pixels whose top-left
+// pixel is (x, y), one byte per pixel in rows of `width` bytes, from 0 to
+// 255. Pixels the outline misses are set to 0, and rows past the end of
+// `mask` are skipped. The levels are the ones fill_outline blends with, so
+// a mask drawn with Canvas.fill_mask matches filling the outline. Because
+// coverage depends only on where the outline lies relative to the pixel
+// grid, a mask made once can be drawn again anywhere the outline would be
+// moved by whole pixels.
+pub fn coverage_mask<O: Outline>(outline: &O, rule: FillRule, mask: &mut[u8], x: i32, y: i32, width: u32, height: u32) {
+    rows := mask_rows(mask, width, height)
+    if rows == 0 || width > MAX_DIMENSION {
+        return
+    }
+    stride := width as usize
+    area := &mut mask[..rows as usize * stride]
+    bytes.fill(area, 0)
+    // Fill white over black in a Gray8 canvas laid over the mask: each pixel
+    // then holds exactly the level fill_outline blends with, since blending
+    // white at alpha a over opaque black gives gray a, and luma(gray a) = a.
+    match Canvas.with_stride(area, width, rows as u32, stride, PixelFormat.Gray8) {
+        ok(canvas) => {
+            canvas.set_origin(x, y)
+            canvas.fill_outline(outline, rule, WHITE)
+        }
+        err(_) => {}
+    }
+}
+
+// Coverage spans: a mask stored as runs, which draws faster than the mask
+// because empty runs are skipped and fully covered runs are filled whole.
+// Each row is a sequence of tokens, each a tag byte whose top two bits are
+// the kind and whose low six bits are a length n - 1 (n from 1 to 64):
+// SPAN_SKIP passes n uncovered pixels, SPAN_FULL n fully covered ones, and
+// SPAN_LEVELS is followed by n coverage levels (1 to 255). SPAN_END leaves
+// the rest of the row uncovered; a row also ends once its tokens reach the
+// mask width.
+const SPAN_SKIP: u32 = 0
+const SPAN_FULL: u32 = 1
+const SPAN_LEVELS: u32 = 2
+const SPAN_END: u32 = 3
+
+// The bytes coverage_spans needs for a width x height area: room for the
+// mask itself and for its spans, which may be larger than the mask.
+pub fn spans_bound(width: u32, height: u32) -> usize {
+    return 2 * width as usize * height as usize + height as usize
+}
+
+// coverage_mask stored as spans for Canvas.fill_spans and gradient_spans.
+// `buffer` must hold spans_bound(width, height) bytes; the coverage is
+// rasterized into its end and encoded in place at its start. Returns the
+// length of the spans, or 0 when `buffer` is too small or the area is empty.
+// A typical glyph's spans are a fraction of its mask.
+pub fn coverage_spans<O: Outline>(outline: &O, rule: FillRule, buffer: &mut[u8], x: i32, y: i32, width: u32, height: u32) -> usize {
+    area := width as usize * height as usize
+    if area == 0 || buffer.len < spans_bound(width, height) {
+        return 0
+    }
+    // The mask sits far enough behind that encoding, at most two bytes
+    // per pixel plus one per row, never overtakes it.
+    mask_at := area + height as usize
+    coverage_mask(outline, rule, &mut buffer[mask_at..mask_at + area], x, y, width, height)
+    stride := width as usize
+    out := 0usize
+    for row in 0usize..height as usize {
+        line := mask_at + row * stride
+        column := 0usize
+        for column < stride {
+            level := buffer[line + column]
+            run := column + 1
+            if level == 0 {
+                for run < stride && buffer[line + run] == 0 {
+                    run += 1
+                }
+                if run == stride {
+                    buffer[out] = (SPAN_END << 6) as u8
+                    out += 1
+                    column = run
+                    break
+                }
+                out = put_runs(buffer, out, SPAN_SKIP, run - column)
+            } else if level == 255 {
+                for run < stride && buffer[line + run] == 255 {
+                    run += 1
+                }
+                out = put_runs(buffer, out, SPAN_FULL, run - column)
+            } else {
+                for run < stride && buffer[line + run] != 0 && buffer[line + run] != 255 {
+                    run += 1
+                }
+                at := column
+                for at < run {
+                    n := num.min(run - at, 64usize)
+                    buffer[out] = ((SPAN_LEVELS << 6) | (n - 1) as u32) as u8
+                    out += 1
+                    for k in 0usize..n {
+                        buffer[out + k] = buffer[line + at + k]
+                    }
+                    out += n
+                    at += n
+                }
+            }
+            column = run
+        }
+    }
+    return out
+}
+
+// Write a run of `count` pixels of one kind as tokens of at most 64.
+fn put_runs(buffer: &mut[u8], at: usize, kind: u32, count: usize) -> usize {
+    out := at
+    left := count
+    for left > 0 {
+        n := num.min(left, 64usize)
+        buffer[out] = ((kind << 6) | (n - 1) as u32) as u8
+        out += 1
+        left -= n
+    }
+    return out
 }
 
 // Coverage, up to and including `column`, of the part of a pixel row right of
