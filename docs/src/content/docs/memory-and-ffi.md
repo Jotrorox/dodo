@@ -56,11 +56,33 @@ borrow-checking error.
 Struct fields keep declaration order and LLVM target ABI alignment/padding.
 `@repr(C)` uses this C-compatible field layout. Native Dodo function ABI is
 compiler-internal and unstable. Primitive and raw-pointer `extern "C"`
-parameters/results use LLVM's C calling convention; C aggregate-by-value ABI
-classification and variadics are not supported. Pass pointers to `@repr(C)`
-structs instead. Imported foreign declarations use the declared final name as
+parameters/results use LLVM's C calling convention. Variadics are not
+supported. Imported foreign declarations use the declared final name as
 the external symbol; C definitions do the same. Native Dodo functions use
 `dodo.<root-package>.<qualified-name>`.
+
+A `@repr(C)` struct can also pass and return by value, as C passes the struct
+with the same fields:
+
+```dodo
+@repr(C)
+struct Size {
+    width: u64
+    height: u64
+    depth: u64
+}
+
+unsafe extern "C" fn dispatch(threadgroups: Size, threads: Size)
+```
+
+Its fields must be integers, floats, bool, raw pointers, other such structs, or
+nonempty arrays of these, and the struct must have at least one field and no
+destructor. The compiler classifies these structs for x86-64 Linux and macOS
+(System V), Windows x64, and AArch64 (Linux, macOS and Windows). Other targets,
+such as 32-bit Arm, RISC-V and WebAssembly, reject a struct by value; pass a
+pointer to it there. Arrays, enums, Options and Results never cross the C ABI
+by value. Dodo `extern "C" fn` definitions with a body accept and return C
+structs the same way, so C code can call them.
 
 Declare a foreign function without a body, then call it in an unsafe block:
 

@@ -13,6 +13,7 @@ use llvm_sys::{
 use std::collections::HashMap;
 use std::path::Path;
 
+mod c_abi;
 mod closures;
 mod debug;
 mod llvm;
@@ -239,6 +240,8 @@ pub fn generate<'ctx>(
         return_type: Type::Void,
         return_storage: None,
         indirect: HashMap::new(),
+        c_abi: HashMap::new(),
+        c_result: None,
         bits,
         sources,
         debug,
@@ -364,6 +367,10 @@ struct Codegen<'a, 'ctx> {
     return_storage: Option<Value<'ctx>>,
     // Internal calls pass large owned values through caller-owned storage.
     indirect: HashMap<String, (bool, Vec<bool>)>,
+    // C signatures that pass or return structs by value, and the coerced
+    // result pieces of the C definition being generated.
+    c_abi: HashMap<String, c_abi::Lowering<'ctx>>,
+    c_result: Option<Vec<LlvmType<'ctx>>>,
     bits: u32,
     sources: SourceMap<'a>,
     span: Span,
@@ -615,7 +622,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.ty(&p.ty)?
                 });
             }
-            let ty = if f.ret == Type::Void || indirect_return {
+            let lowering = if f.extern_ { self.c_lowering(f)? } else { None };
+            let ty = if let Some(lowering) = &lowering {
+                self.c_fn_type(f, lowering)?
+            } else if f.ret == Type::Void || indirect_return {
                 self.context.void_type().fn_type(&params, false)
             } else {
                 self.ty(&f.ret)?.fn_type(&params, false)
@@ -649,8 +659,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             } else {
                 self.module.add_function(&symbol, ty, Some(linkage))
             };
+            if let Some(lowering) = lowering {
+                self.c_abi.insert(f.name.clone(), lowering);
+            }
             if exported {
-                for (location, attribute) in self.c_abi_attributes(f) {
+                for (location, attribute) in self.c_abi_attributes(f)? {
                     function.add_attribute(location, attribute);
                 }
             }
@@ -740,7 +753,19 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             }
         }
     }
-    fn c_abi_attributes(&self, function: &Function) -> Vec<(AttributeLoc, Attribute<'ctx>)> {
+    fn c_abi_attributes(
+        &self,
+        function: &Function,
+    ) -> Result<Vec<(AttributeLoc, Attribute<'ctx>)>> {
+        let lowering = self.c_abi.get(&function.name);
+        let mut attributes = match lowering {
+            Some(lowering) => self.c_lowering_attributes(function, lowering)?,
+            None => Vec::new(),
+        };
+        let indices = match lowering {
+            Some(lowering) => Self::c_operand_indices(lowering),
+            None => (0..function.params.len() as u32).collect(),
+        };
         let triple = self.module.get_triple();
         let triple = triple.as_str().to_string_lossy();
         // SysV x86 C promotes narrow arguments/results in registers, and so
@@ -753,15 +778,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let apple_arm64 = (triple.starts_with("aarch64-") || triple.starts_with("arm64"))
             && triple.contains("-apple-");
         if !(x86 || apple_arm64) || triple.contains("windows") {
-            return Vec::new();
+            return Ok(attributes);
         }
-        std::iter::once((AttributeLoc::Return, &function.ret))
+        let extensions = std::iter::once((AttributeLoc::Return, &function.ret))
             .chain(
                 function
                     .params
                     .iter()
-                    .enumerate()
-                    .map(|(i, p)| (AttributeLoc::Param(i as u32), &p.ty)),
+                    .zip(indices)
+                    .map(|(p, i)| (AttributeLoc::Param(i), &p.ty)),
             )
             .filter_map(|(location, ty)| {
                 let name = match ty {
@@ -783,8 +808,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.context
                         .create_enum_attribute(Attribute::get_named_enum_kind_id(name), 0),
                 ))
-            })
-            .collect()
+            });
+        attributes.extend(extensions);
+        Ok(attributes)
     }
     fn declare_constants(&mut self) -> Result<()> {
         let program = self.program;
@@ -910,7 +936,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         let function = self.functions[&f.name];
         self.function = Some(function);
         self.return_type = f.ret.clone();
-        let (indirect_return, indirect_params) = self.indirect[&f.name].clone();
+        let lowering = self.c_abi.get(&f.name).cloned();
+        let (mut indirect_return, indirect_params) = self.indirect[&f.name].clone();
+        self.c_result = None;
+        if let Some(lowering) = &lowering {
+            match &lowering.ret {
+                c_abi::Pass::Indirect { .. } => indirect_return = true,
+                c_abi::Pass::Coerce(pieces) => self.c_result = Some(pieces.clone()),
+                c_abi::Pass::Direct => {}
+            }
+        }
         self.return_storage = if indirect_return {
             function.get_nth_param(0)
         } else {
@@ -941,6 +976,22 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 self.bind(&p.name, &p.ty, Some(address))?;
             }
         }
+        if let Some(lowering) = &lowering {
+            let operands: Vec<_> = function.get_param_iter().collect();
+            let indices = Self::c_operand_indices(lowering);
+            for (index, (p, pass)) in f.params.iter().zip(&lowering.params).enumerate() {
+                self.parameter = index as u32 + 1;
+                self.location(p.span);
+                let first = indices[index] as usize;
+                let count = match pass {
+                    c_abi::Pass::Coerce(pieces) => pieces.len(),
+                    _ => 1,
+                };
+                let value = self.c_parameter(&operands[first..first + count], &p.ty, pass)?;
+                self.bind(&p.name, &p.ty, Some(value))?;
+            }
+        }
+        let incoming = incoming.take(if lowering.is_some() { 0 } else { usize::MAX });
         for (index, (p, v)) in f.params[captures..].iter().zip(incoming).enumerate() {
             self.parameter = index as u32 + 1;
             self.location(p.span);
@@ -998,7 +1049,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         Ok(())
     }
     fn return_value(&self, value: Value<'ctx>) -> Result<()> {
-        if let Some(storage) = self.return_storage {
+        if let Some(pieces) = &self.c_result {
+            self.c_return(value, pieces)?;
+        } else if let Some(storage) = self.return_storage {
             self.store_value(storage, value)?;
             self.builder.build_return(None)?;
         } else {
@@ -3422,6 +3475,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .get(name)
             .copied()
             .ok_or_else(|| error(format!("unknown function {name}")))?;
+        if let Some(lowering) = self.c_abi.get(name).cloned() {
+            return self.c_call(name, f, &lowering, args, ret);
+        }
         let (indirect_return, indirect_params) = self.indirect[name].clone();
         let storage = if indirect_return {
             Some(self.alloca(self.ty(ret)?, "call.result")?)
@@ -3459,7 +3515,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .iter()
             .find(|f| f.name == name && f.extern_)
         {
-            for (location, attribute) in self.c_abi_attributes(function) {
+            for (location, attribute) in self.c_abi_attributes(function)? {
                 call.add_attribute(location, attribute);
             }
         }
