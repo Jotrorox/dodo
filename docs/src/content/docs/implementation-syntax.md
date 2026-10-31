@@ -417,6 +417,7 @@ conflicting aliases. Prefer passing state explicitly or using
 | `@json_name("name")` | Field of a JSON-derived struct: select its external key. |
 | `@json_deny_unknown` | JSON-derived struct: reject unknown fields. |
 | `@interrupt(VECTOR)` | Private, safe, nongeneric top-level `fn name()`: the hardware's handler for `VECTOR`; see [interrupts](hardware.md#interrupts). |
+| `@link_name("symbol")` | `extern "C"` prototype: bind `symbol` instead of the function's name; several prototypes may bind one symbol with different signatures; see [FFI](memory-and-ffi.md#struct-layout-and-the-c-abi). |
 | `@section("name")` | Function or `static`: place it in an object file section, and keep it even if unreferenced. |
 | `@align(N)` | Function or `static`: align it to `N` bytes, a power of two. |
 

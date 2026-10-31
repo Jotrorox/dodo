@@ -502,6 +502,7 @@ impl Checker<'_> {
             span,
             environment: Some(captured.len()),
             interrupt: None,
+            link_name: None,
             placement: Placement::default(),
         };
         let mut checker = Checker::new(self.context, closure.ret.clone());

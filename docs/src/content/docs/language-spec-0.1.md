@@ -1518,9 +1518,13 @@ target C declarations and satisfy the foreign function's validity requirements.
 Narrow argument/result extension must match the target ABI (ID-C).
 
 An external symbol is the final declared function name, independent of package
-aliases. Compatible repeated declarations refer to one symbol. Declarations with
-different lowered parameter/result types must fail before native linking;
-the binding author must also ensure consistent signedness and extension contracts
+aliases, or the string of a `@link_name("symbol")` attribute, which applies only
+to prototypes without a body. Compatible repeated declarations refer to one
+symbol. Declarations with different lowered parameter/result types must fail
+before native linking unless one of them names the symbol with `@link_name`;
+then each call to a prototype uses that prototype's signature, as Objective-C's
+`objc_msgSend` requires. A definition's signature never varies this way. The
+binding author must also ensure consistent signedness and extension contracts
 where those types have the same storage width (ID-C). C entry points must not unwind
 through Dodo frames; Dodo has no exception unwinding contract.
 
@@ -1564,7 +1568,8 @@ are unspecified. These storage rules do not constitute a C enum or C union ABI.
 Target scalar and aggregate alignment remain implementation-defined (ID-TARGET).
 
 Function attributes are `@test`, `@ignore("reason")`, `@interrupt(VECTOR)`
-(section 16.6), `@section("name")`, and `@align(N)` (section 16.5); statics
+(section 16.6), `@link_name("symbol")` (section 16.1), `@section("name")`, and
+`@align(N)` (section 16.5); statics
 accept `@section` and `@align`. Accepted struct attributes are `@repr(C)`, `@unsafe_send`, `@unsafe_sync`,
 `@derive(Json)`, and `@json_deny_unknown`; the latter requires `@derive(Json)`.
 Derived JSON structs may rename fields with `@json_name("name")`. JSON derivation

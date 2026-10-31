@@ -875,6 +875,107 @@ fn main()->i32 {
 }
 
 #[test]
+fn link_name_binds_one_symbol_under_several_signatures() {
+    let workspace = Workspace::new();
+    // Like objc_msgSend: one entry point whose callers each cast it to the
+    // signature of the operation the selector names.
+    let foreign = workspace.file(
+        "foreign.rs",
+        r#"
+#[no_mangle] pub unsafe extern "C" fn send(selector: u64, value: usize) -> i64 {
+    match selector {
+        1 => value as i64 * 2,
+        2 => { *(value as *mut i64) = 5; 0 }
+        _ => -1,
+    }
+}
+"#,
+    );
+    let object = workspace.0.join("foreign.o");
+    success(
+        Command::new("rustc")
+            .args([
+                "--edition=2021",
+                "--crate-type=lib",
+                "--emit=obj",
+                "-Copt-level=3",
+            ])
+            .arg(foreign)
+            .arg("-o")
+            .arg(&object)
+            .output()
+            .unwrap(),
+    );
+    workspace.file(
+        "messages.dodo",
+        "package messages\n@link_name(\"send\")\npub unsafe extern \"C\" fn store(selector:u64, target:*mut i64)\n",
+    );
+    let source = workspace.file(
+        "main.dodo",
+        r#"package main
+import "core/ptr"
+import "messages"
+unsafe extern "C" fn send(selector:u64, value:u64)->i64
+@link_name("send")
+unsafe extern "C" fn double(selector:u64, value:i64)->i64
+fn main()->i32 {
+    slot := 0i64
+    unsafe {
+        if send(1u64, 4u64) != 8i64 { return 1 }
+        if double(1u64, 21i64) != 42i64 { return 2 }
+        messages.store(2u64, ptr.from_mut(&mut slot))
+    }
+    if slot != 5i64 { return 3 }
+    0
+}
+"#,
+    );
+    for level in ["0", "3"] {
+        let binary = workspace.0.join("link-name-program");
+        success(
+            workspace
+                .compiler(&["build", "-O", level])
+                .arg(&source)
+                .arg("--link-arg")
+                .arg(&object)
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .unwrap(),
+        );
+        success(Command::new(binary).output().unwrap());
+    }
+    for (body, message) in [
+        (
+            "@link_name(\"x\")\nfn take() {}",
+            "extern \"C\" declarations without a body",
+        ),
+        (
+            "@link_name(\"x\")\nextern \"C\" fn take() {}",
+            "extern \"C\" declarations without a body",
+        ),
+        (
+            "@link_name(\"x\")\nstruct S { x:i32 }",
+            "applies only to extern",
+        ),
+        (
+            "@link_name(\"\")\nextern \"C\" fn take()",
+            "nonempty printable ASCII",
+        ),
+        (
+            "@link_name(x)\nextern \"C\" fn take()",
+            "expects a string symbol name",
+        ),
+        (
+            "@link_name(\"x\") @link_name(\"y\")\nextern \"C\" fn take()",
+            "duplicate @link_name",
+        ),
+    ] {
+        workspace.reject(&format!("package invalid\n{body}\n"), message);
+    }
+}
+
+#[test]
 fn incompatible_lowered_foreign_declarations_fail_before_linking() {
     let workspace = Workspace::new();
     workspace.file("a.dodo", "package a\nextern \"C\" fn same(x:i32)\n");

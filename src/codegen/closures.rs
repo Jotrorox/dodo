@@ -148,7 +148,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 _ => value,
             });
         }
-        let call = builder.build_call(target, &args, "result")?;
+        let call = match self.foreign_signatures.get(name) {
+            Some(&ty) => builder.build_indirect_call(ty, target, &args, "result")?,
+            None => builder.build_call(target, &args, "result")?,
+        };
         if ret == Type::Void {
             builder.build_return(None)?;
         } else {

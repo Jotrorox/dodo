@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `@link_name("symbol")` binds an `extern "C"` prototype to a symbol other
+  than its own name, and several prototypes may bind one symbol with different
+  signatures. Each call uses its own declaration's signature, so Objective-C
+  bindings can declare one `objc_msgSend` per method signature. Without
+  `@link_name`, clashing signatures for one symbol are still an error.
 - `extern "C" fn(A) -> R` is a C function pointer type, for code that uses the
   platform C calling convention: pointers from `dlsym`, `GetProcAddress` or
   `vkGetInstanceProcAddr`, COM method tables, and callbacks passed to C. An
