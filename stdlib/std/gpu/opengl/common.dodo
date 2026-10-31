@@ -1,0 +1,70 @@
+package common
+
+import "core/ptr"
+
+// Types shared by std/gpu/opengl and its per-OS context backends.
+
+// Why an OpenGL context could not be created or made current.
+pub enum Error {
+    // The options are outside what OpenGL defines, such as version 0.x.
+    InvalidInput,
+    // The system's OpenGL or EGL library could not be loaded.
+    NoLibrary,
+    // No display or device to render on, such as a Linux machine without a
+    // GPU driver or Mesa.
+    NoDisplay,
+    // No pixel format or framebuffer configuration supports OpenGL.
+    NoConfig,
+    // The driver does not offer the requested OpenGL version or profile.
+    Unsupported,
+    // Another system call failed, such as making the context current.
+    System
+}
+
+// The address of a byte inside a NUL-terminated string literal, for C calls.
+pub fn c_string(text: &[u8]) -> *const u8 {
+    return ptr.as_ptr(text)
+}
+
+// Whether `list`, a NUL-terminated, space-separated extension list such as
+// eglQueryString returns, contains `name` as a whole word.
+pub unsafe fn has_word(list: *const u8, name: &[u8]) -> bool {
+    if ptr.is_null(list) {
+        return false
+    }
+    start := 0isize
+    for {
+        // Find the end of the word that starts at `start`.
+        end := start
+        for {
+            byte := unsafe {
+                *ptr.offset(list, end)
+            }
+            if byte == 0 || byte == 32 {
+                break
+            }
+            end += 1
+        }
+        length := (end - start) as usize
+        if length == name.len {
+            same := true
+            for i in 0usize..length {
+                if unsafe {
+                    *ptr.offset(list, start + i as isize)
+                } != name[i] {
+                    same = false
+                    break
+                }
+            }
+            if same {
+                return true
+            }
+        }
+        if unsafe {
+            *ptr.offset(list, end)
+        } == 0 {
+            return false
+        }
+        start = end + 1
+    }
+}
