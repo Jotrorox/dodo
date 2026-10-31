@@ -296,7 +296,7 @@ def guide_for(module: str) -> str:
         "arena_bytes": "bytes", "bytes_alloc": "bytes", "pool_bytes": "bytes",
         "io_alloc": "io", "fmt": "formatting", "fmt_alloc": "formatting",
         "text_alloc": "text", "text_shared": "text", "float_decimal": "text",
-        "encoding": "json", "checksum": "hash", "fs": "filesystem",
+        "encoding": "json", "compress": "compression", "checksum": "hash", "fs": "filesystem",
         "env": "environment", "process": "processes", "thread": "threads",
         "sync": "synchronization", "net": "networking", "embedded": "hardware",
     }.get(family, family)

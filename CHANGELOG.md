@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- New portable compression packages read and write DEFLATE
+  (`std/compress/deflate`), zlib (`std/compress/zlib`), and gzip
+  (`std/compress/gzip`) through caller-supplied buffers, without allocating.
+  `encode(input, output, level)` compresses at levels 0 through 9 with lazy
+  LZ77 matching and optimal Huffman codes, choosing the smallest of stored,
+  fixed, and dynamic blocks; its output matches zlib's size, and
+  `max_encoded_len` bounds it. `decode` checks the Adler-32 or CRC-32 and
+  stops after one stream or gzip member. Each package also has incremental
+  `Decoder` and `Encoder` types for buffers of any size, gzip headers can
+  carry a name, comment, and time, and `std/compress/io` adapts all three
+  formats to `std/io` readers and writers.
+- Records larger than 1 KiB passed, returned, or moved by value compile as
+  memory copies at every optimization level. Before, LLVM split them into
+  one operation per element: a 256 KiB struct took minutes and gigabytes of
+  memory to build at `-O 2` and needed about 10 MB of stack at `-O 0`. Root
+  package public functions now pass such records through memory like other
+  Dodo functions.
 - Ownership is checked on each function's control-flow graph, for every body
   the compiler accepts: initialization, moves, borrows, escapes, destructor
   order, and Result obligations. The earlier checker that ran beside it, and

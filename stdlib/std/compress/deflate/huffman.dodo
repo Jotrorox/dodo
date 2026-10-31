@@ -1,0 +1,243 @@
+package deflate
+
+const LENGTH_BASE: [29]usize = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+const LENGTH_EXTRA: [29]usize = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+const DIST_BASE: [30]usize = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+const DIST_EXTRA: [30]usize = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+// Transmission order of code-length code lengths.
+const CODE_ORDER: [19]usize = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+fn fixed_literal_length(symbol: usize) -> u8 {
+    if symbol < 144 {
+        return 8
+    }
+    if symbol < 256 {
+        return 9
+    }
+    if symbol < 280 {
+        return 7
+    }
+    return 8
+}
+fn length_code(length: usize) -> usize {
+    code := 0usize
+    for code < 28 && length >= LENGTH_BASE[code + 1] {
+        code += 1
+    }
+    return code
+}
+fn distance_code(distance: usize) -> usize {
+    if distance <= 4 {
+        return distance - 1
+    }
+    // Two codes per power of two above 4: the top bit selects the pair and
+    // the next bit selects the code.
+    d := distance - 1
+    bits := 0usize
+    for (d >> bits) > 1 {
+        bits += 1
+    }
+    return bits * 2 + ((d >> (bits - 1)) & 1)
+}
+
+// A canonical decoding table: code counts per length and symbols in code order.
+struct Tree {
+    counts: [16]usize
+    symbols: [288]usize
+}
+fn empty_tree() -> Tree {
+    return Tree { counts: [0usize; 16], symbols: [0usize; 288] }
+}
+// Builds a decoding tree. Incomplete codes are rejected except for a single
+// one-bit code, which RFC 1951 permits for literal and distance alphabets.
+// allow_empty admits a distance alphabet without codes.
+fn build_tree(t: &mut Tree, lengths: &[u8], allow_empty: bool) -> void!Error {
+    for i in 0usize..16 {
+        t.counts[i] = 0
+    }
+    for &length in lengths {
+        if length > 15 {
+            return err(Error.InvalidData)
+        }
+        t.counts[length as usize] += 1
+    }
+    used := lengths.len - t.counts[0]
+    if used == 0 {
+        if allow_empty {
+            return ok()
+        }
+        return err(Error.InvalidData)
+    }
+    left := 1usize
+    for length in 1usize..16 {
+        left = left << 1
+        if t.counts[length] > left {
+            return err(Error.InvalidData)
+        }
+        left -= t.counts[length]
+    }
+    if left != 0 && !(used == 1 && t.counts[1] == 1) {
+        return err(Error.InvalidData)
+    }
+    offsets := [0usize; 16]
+    for length in 1usize..15 {
+        offsets[length + 1] = offsets[length] + t.counts[length]
+    }
+    for symbol in 0usize..lengths.len {
+        length := lengths[symbol] as usize
+        if length != 0 {
+            t.symbols[offsets[length]] = symbol
+            offsets[length] += 1
+        }
+    }
+    return ok()
+}
+fn fixed_trees(lit: &mut Tree, dist: &mut Tree) {
+    lengths := [0u8; 288]
+    for i in 0usize..288 {
+        lengths[i] = fixed_literal_length(i)
+    }
+    // Distance codes 30 and 31 occupy code space but are invalid in data.
+    distances := [5u8; 32]
+    match build_tree(lit, &lengths, false) {
+        ok() => {}, err(_) => {}
+    }
+    match build_tree(dist, &distances, false) {
+        ok() => {}, err(_) => {}
+    }
+}
+
+// Assigns code lengths of at most limit bits to the symbols with nonzero
+// frequency, minimizing the encoded size. At least two symbols receive codes so
+// every tree is complete. Returns the number of coded symbols.
+fn huffman_lengths(freq: &[usize], lengths: &mut[u8], limit: usize) -> usize {
+    n := freq.len
+    // Leaves sorted by ascending frequency, then internal nodes; parents index
+    // into the combined node array of at most 2n - 1 entries.
+    leaves := [0usize; 288]
+    weight := [0usize; 575]
+    parent := [0usize; 575]
+    used := 0usize
+    for i in 0usize..n {
+        lengths[i] = 0
+        if freq[i] != 0 {
+            leaves[used] = i
+            used += 1
+        }
+    }
+    for i in 0usize..n {
+        if used >= 2 {
+            break
+        }
+        if freq[i] == 0 {
+            leaves[used] = i
+            used += 1
+        }
+    }
+    // Insertion sort is enough for at most 288 symbols, and stable ties keep
+    // the result deterministic.
+    for i in 1usize..used {
+        symbol := leaves[i]
+        j := i
+        for j > 0 && freq[leaves[j - 1]] > freq[symbol] {
+            leaves[j] = leaves[j - 1]
+            j -= 1
+        }
+        leaves[j] = symbol
+    }
+    for i in 0usize..used {
+        weight[i] = freq[leaves[i]]
+    }
+    // Two-queue construction: leaves and internal nodes are each produced in
+    // nondecreasing weight order.
+    next_leaf := 0usize
+    next_node := used
+    nodes := used
+    for nodes < 2 * used - 1 {
+        children := [0usize; 2]
+        for c in 0usize..2 {
+            if next_leaf < used && (next_node == nodes || weight[next_leaf] <= weight[next_node]) {
+                children[c] = next_leaf
+                next_leaf += 1
+            } else {
+                children[c] = next_node
+                next_node += 1
+            }
+        }
+        weight[nodes] = weight[children[0]] + weight[children[1]]
+        parent[children[0]] = nodes
+        parent[children[1]] = nodes
+        nodes += 1
+    }
+    // Depths from the root down, counting leaves per length and clamping
+    // overlong ones to limit.
+    depth := [0usize; 575]
+    counts := [0usize; 16]
+    root := nodes - 1
+    i := root
+    for i > 0 {
+        i -= 1
+        depth[i] = depth[parent[i]] + 1
+        if i < used {
+            d := depth[i]
+            if d > limit {
+                d = limit
+            }
+            counts[d] += 1
+        }
+    }
+    // Clamping oversubscribes the code space; total measures it in units of
+    // the longest code. Each step moves a leaf one level down and lets a
+    // clamped leaf join it, removing one unit (zlib's method).
+    total := 0usize
+    for bits in 1usize..limit + 1 {
+        total += counts[bits] << (limit - bits)
+    }
+    for total > (1usize << limit) {
+        bits := limit - 1
+        for counts[bits] == 0 {
+            bits -= 1
+        }
+        counts[bits] -= 1
+        counts[bits + 1] += 2
+        counts[limit] -= 1
+        total -= 1
+    }
+    // Longest codes go to the least frequent symbols.
+    at := 0usize
+    for length in 0usize..limit {
+        bits := limit - length
+        for k in 0usize..counts[bits] {
+            lengths[leaves[at]] = bits as u8
+            at += 1
+        }
+    }
+    return used
+}
+// Canonical codes, bit-reversed for LSB-first output.
+fn canonical_codes(lengths: &[u8], codes: &mut[u16]) {
+    counts := [0usize; 16]
+    for &length in lengths {
+        counts[length as usize] += 1
+    }
+    counts[0] = 0
+    next := [0usize; 16]
+    code := 0usize
+    for bits in 1usize..16 {
+        code = (code + counts[bits - 1]) << 1
+        next[bits] = code
+    }
+    for symbol in 0usize..lengths.len {
+        length := lengths[symbol] as usize
+        codes[symbol] = 0
+        if length != 0 {
+            value := next[length]
+            next[length] += 1
+            reversed := 0usize
+            for b in 0usize..length {
+                reversed = (reversed << 1) | ((value >> b) & 1)
+            }
+            codes[symbol] = reversed as u16
+        }
+    }
+}

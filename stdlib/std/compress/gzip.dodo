@@ -1,0 +1,467 @@
+package gzip
+
+import "std/checksum"
+import "std/compress/deflate"
+
+// RFC 1952 gzip members: a header, raw DEFLATE data, and a CRC-32 and size
+// trailer. Results use deflate.Error, deflate.Progress, and deflate.Status.
+// read_header returns a member's metadata; encode_with_header writes it.
+// Other encoders write a minimal header with no name or time.
+
+// ID1, ID2, and CM (DEFLATE).
+const MAGIC: [3]u8 = [31, 139, 8]
+const FLAG_TEXT: u8 = 1
+const FLAG_HCRC: u8 = 2
+const FLAG_EXTRA: u8 = 4
+const FLAG_NAME: u8 = 8
+const FLAG_COMMENT: u8 = 16
+
+// An output length that every encode level is guaranteed to fit.
+pub fn max_encoded_len(input_len: usize) -> usize {
+    return deflate.max_encoded_len(input_len) + 18
+}
+
+fn minimal_header(level: usize) -> [10]u8 {
+    // XFL 2 and 4 mark the slowest and fastest levels; OS 255 is unknown.
+    xfl := 0u8
+    if level == 9 {
+        xfl = 2
+    } else if level == 1 {
+        xfl = 4
+    }
+    return [31u8, 139, 8, 0, 0, 0, 0, 0, xfl, 255]
+}
+fn put_u32_le(output: &mut[u8], value: u32) {
+    for i in 0usize..4 {
+        output[i] = ((value >> ((i * 8) as u32)) & 255) as u8
+    }
+}
+fn get_u32_le(input: &[u8]) -> u32 {
+    return (input[0] as u32) | ((input[1] as u32) << 8) | ((input[2] as u32) << 16) | ((input[3] as u32) << 24)
+}
+fn check_fixed_header(input: &[u8]) -> void!deflate.Error {
+    if input[0] != 31 || input[1] != 139 || input[2] != 8 || (input[3] & 0xe0) != 0 {
+        return err(deflate.Error.InvalidData)
+    }
+    return ok()
+}
+fn skip_zero_terminated(input: &[u8], offset: usize) -> usize!deflate.Error {
+    at := offset
+    for at < input.len && input[at] != 0 {
+        at += 1
+    }
+    if at == input.len {
+        return err(deflate.Error.Truncated)
+    }
+    return ok(at + 1)
+}
+
+// Member metadata. Fields are byte strings without terminating zeros; RFC
+// 1952 specifies ISO 8859-1 for name and comment. Empty fields are absent.
+pub struct Header {
+    // Modification time in seconds since 1970, or 0 when unknown.
+    pub mtime: u32
+    // Operating system that wrote the member: 3 is Unix, 255 unknown.
+    pub os: u8
+    // Whether the data is probably text.
+    pub text: bool
+    pub extra: &[u8]
+    pub name: &[u8]
+    pub comment: &[u8]
+}
+pub struct HeaderInfo {
+    pub header: Header
+    // Header bytes, where the compressed data starts.
+    pub length: usize
+}
+
+// Parses and validates the header at the start of input, including its CRC
+// when present. Truncated means the header continues past input.
+pub fn read_header(input: &[u8]) -> HeaderInfo!deflate.Error from(input) {
+    if input.len < 10 {
+        return err(deflate.Error.Truncated)
+    }
+    check_fixed_header(input)?
+    flags := input[3]
+    header := Header { mtime: get_u32_le(&input[4..]), os: input[9], text: (flags & FLAG_TEXT) != 0, extra: &input[..0], name: &input[..0], comment: &input[..0] }
+    offset := 10usize
+    if (flags & FLAG_EXTRA) != 0 {
+        if input.len - offset < 2 {
+            return err(deflate.Error.Truncated)
+        }
+        extra := (input[offset] as usize) | ((input[offset + 1] as usize) << 8)
+        offset += 2
+        if input.len - offset < extra {
+            return err(deflate.Error.Truncated)
+        }
+        header.extra = &input[offset..offset + extra]
+        offset += extra
+    }
+    if (flags & FLAG_NAME) != 0 {
+        end := skip_zero_terminated(input, offset)?
+        header.name = &input[offset..end - 1]
+        offset = end
+    }
+    if (flags & FLAG_COMMENT) != 0 {
+        end := skip_zero_terminated(input, offset)?
+        header.comment = &input[offset..end - 1]
+        offset = end
+    }
+    if (flags & FLAG_HCRC) != 0 {
+        if input.len - offset < 2 {
+            return err(deflate.Error.Truncated)
+        }
+        expected := (input[offset] as u32) | ((input[offset + 1] as u32) << 8)
+        if (checksum.crc32(&input[..offset]) & 0xffff) != expected {
+            return err(deflate.Error.ChecksumMismatch)
+        }
+        offset += 2
+    }
+    return ok(HeaderInfo { header: header, length: offset })
+}
+
+// Bytes encode_with_header spends on this header, or InvalidArgument for an
+// extra field over 65535 bytes or a name or comment containing a zero byte.
+pub fn header_len(header: &Header) -> usize!deflate.Error {
+    length := 10usize
+    if header.extra.len > 65535 {
+        return err(deflate.Error.InvalidArgument)
+    }
+    if header.extra.len != 0 {
+        length += 2 + header.extra.len
+    }
+    texts := [header.name, header.comment]
+    for &text in &texts {
+        for &byte in text {
+            if byte == 0 {
+                return err(deflate.Error.InvalidArgument)
+            }
+        }
+        if text.len != 0 {
+            length += text.len + 1
+        }
+    }
+    return ok(length)
+}
+fn write_header(header: &Header, level: usize, output: &mut[u8]) -> usize!deflate.Error {
+    length := header_len(header)?
+    if output.len < length {
+        return err(deflate.Error.OutputFull)
+    }
+    fixed := minimal_header(level)
+    for i in 0usize..10 {
+        output[i] = fixed[i]
+    }
+    flags := 0u8
+    if header.text {
+        flags = flags | FLAG_TEXT
+    }
+    put_u32_le(&mut output[4..], header.mtime)
+    output[9] = header.os
+    at := 10usize
+    if header.extra.len != 0 {
+        flags = flags | FLAG_EXTRA
+        output[at] = (header.extra.len & 255) as u8
+        output[at + 1] = (header.extra.len >> 8) as u8
+        at += 2
+        for &byte in header.extra {
+            output[at] = byte
+            at += 1
+        }
+    }
+    if header.name.len != 0 {
+        flags = flags | FLAG_NAME
+        at = put_zero_terminated(output, at, header.name)
+    }
+    if header.comment.len != 0 {
+        flags = flags | FLAG_COMMENT
+        at = put_zero_terminated(output, at, header.comment)
+    }
+    output[3] = flags
+    return ok(at)
+}
+fn put_zero_terminated(output: &mut[u8], offset: usize, text: &[u8]) -> usize {
+    for i in 0usize..text.len {
+        output[offset + i] = text[i]
+    }
+    output[offset + text.len] = 0
+    return offset + text.len + 1
+}
+
+// Decodes one gzip member; a following member or other data is left
+// unconsumed, so call again on the suffix for concatenated members. On error
+// the output contents are unspecified.
+pub fn decode(input: &[u8], output: &mut[u8]) -> deflate.DecodeResult!deflate.Error {
+    info := read_header(input)?
+    offset := info.length
+    decoded := deflate.decode(&input[offset..], output)?
+    offset += decoded.input_consumed
+    if input.len - offset < 8 {
+        return err(deflate.Error.Truncated)
+    }
+    size := (decoded.output_written & 0xffffffffusize) as u32
+    if checksum.crc32(&output[..decoded.output_written]) != get_u32_le(&input[offset..]) || size != get_u32_le(&input[offset + 4..]) {
+        return err(deflate.Error.ChecksumMismatch)
+    }
+    return ok(deflate.DecodeResult { input_consumed: offset + 8, output_written: decoded.output_written })
+}
+
+// Compresses input into one gzip member at level 0 through 9; see
+// deflate.encode. max_encoded_len(input.len) bytes always suffice.
+pub fn encode(input: &[u8], output: &mut[u8], level: usize) -> usize!deflate.Error {
+    if level > deflate.MAX_LEVEL {
+        return err(deflate.Error.InvalidArgument)
+    }
+    words := [0u32; deflate.WORKSPACE_LEN]
+    return encode_with_workspace(input, output, level, &mut words)
+}
+pub fn encode_with_workspace(input: &[u8], output: &mut[u8], level: usize, words: &mut[u32]) -> usize!deflate.Error {
+    header := Header { mtime: 0, os: 255, text: false, extra: b"", name: b"", comment: b"" }
+    return encode_with_header(input, output, level, &header, words)
+}
+// Like encode_with_workspace, writing header's metadata. Output needs up to
+// header_len(header) - 10 bytes beyond max_encoded_len(input.len).
+pub fn encode_with_header(input: &[u8], output: &mut[u8], level: usize, header: &Header, words: &mut[u32]) -> usize!deflate.Error {
+    if level > deflate.MAX_LEVEL {
+        return err(deflate.Error.InvalidArgument)
+    }
+    start := write_header(header, level, output)?
+    if output.len - start < 8 {
+        return err(deflate.Error.OutputFull)
+    }
+    end := output.len - 8
+    written := deflate.encode_with_workspace(input, &mut output[start..end], level, words)?
+    offset := start + written
+    put_u32_le(&mut output[offset..], checksum.crc32(input))
+    put_u32_le(&mut output[offset + 4..], (input.len & 0xffffffffusize) as u32)
+    return ok(offset + 8)
+}
+
+const DECODE_FIXED: usize = 0
+const DECODE_EXTRA_LEN: usize = 1
+const DECODE_EXTRA: usize = 2
+const DECODE_NAME: usize = 3
+const DECODE_COMMENT: usize = 4
+const DECODE_HCRC: usize = 5
+const DECODE_BODY: usize = 6
+const DECODE_TRAILER: usize = 7
+const DECODE_DONE: usize = 8
+const DECODE_FAILED: usize = 9
+
+// Incremental decoder for one gzip member. Optional header fields are skipped
+// without buffering. It reads nothing past the trailer, so a following member
+// stays in the input; reset() prepares for it. Errors are final.
+pub struct Decoder {
+    raw: deflate.Decoder
+    header_crc: checksum.Crc32
+    data_crc: checksum.Crc32
+    phase: usize
+    flags: u8
+    count: usize
+    remaining: usize
+    trailer: [8]u8
+    size: u32
+    pub fn new() -> Decoder {
+        return Decoder { raw: deflate.Decoder.new(), header_crc: checksum.Crc32.new(), data_crc: checksum.Crc32.new(),
+        phase: DECODE_FIXED, flags: 0, count: 0, remaining: 0, trailer: [0u8; 8], size: 0 }
+    }
+    pub fn reset(&mut self) {
+        self.raw.reset()
+        self.header_crc.reset()
+        self.data_crc.reset()
+        self.phase = DECODE_FIXED
+        self.flags = 0
+        self.count = 0
+        self.remaining = 0
+        self.size = 0
+    }
+    pub fn is_done(&self) -> bool {
+        return self.phase == DECODE_DONE
+    }
+    // Moves to the next header field the flags declare.
+    fn next_field(&mut self) {
+        self.count = 0
+        self.remaining = 0
+        if self.phase < DECODE_EXTRA_LEN && (self.flags & FLAG_EXTRA) != 0 {
+            self.phase = DECODE_EXTRA_LEN
+        } else if self.phase < DECODE_NAME && (self.flags & FLAG_NAME) != 0 {
+            self.phase = DECODE_NAME
+        } else if self.phase < DECODE_COMMENT && (self.flags & FLAG_COMMENT) != 0 {
+            self.phase = DECODE_COMMENT
+        } else if self.phase < DECODE_HCRC && (self.flags & FLAG_HCRC) != 0 {
+            self.phase = DECODE_HCRC
+        } else {
+            self.phase = DECODE_BODY
+        }
+    }
+    fn fail(&mut self, reason: deflate.Error) -> deflate.Progress!deflate.Error {
+        self.phase = DECODE_FAILED
+        return err(reason)
+    }
+    pub fn process(&mut self, input: &[u8], output: &mut[u8]) -> deflate.Progress!deflate.Error {
+        used := 0usize
+        written := 0usize
+        for {
+            phase := self.phase
+            if phase == DECODE_FAILED {
+                return err(deflate.Error.InvalidData)
+            }
+            if phase == DECODE_DONE {
+                return ok(deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.Done })
+            }
+            if phase == DECODE_BODY {
+                p := match self.raw.process(&input[used..], &mut output[written..]) {
+                    ok(p) => {
+                        p
+                    },
+                    err(reason) => {
+                        return self.fail(reason)
+                    },
+                }
+                self.data_crc.update(&output[written..written + p.output_written])
+                self.size = core.wrapping_add(self.size, (p.output_written & 0xffffffffusize) as u32)
+                used += p.input_consumed
+                written += p.output_written
+                if p.status != deflate.Status.Done {
+                    p.input_consumed = used
+                    p.output_written = written
+                    return ok(p)
+                }
+                self.phase = DECODE_TRAILER
+                self.count = 0
+                continue
+            }
+            if used == input.len {
+                return ok(deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.NeedInput })
+            }
+            byte := input[used]
+            used += 1
+            if phase == DECODE_TRAILER {
+                self.trailer[self.count] = byte
+                self.count += 1
+                if self.count == 8 {
+                    if get_u32_le(&self.trailer) != self.data_crc.finish() || get_u32_le(&self.trailer[4..]) != self.size {
+                        return self.fail(deflate.Error.ChecksumMismatch)
+                    }
+                    self.phase = DECODE_DONE
+                }
+                continue
+            }
+            if phase == DECODE_HCRC {
+                self.trailer[self.count] = byte
+                self.count += 1
+                if self.count == 2 {
+                    expected := (self.trailer[0] as u32) | ((self.trailer[1] as u32) << 8)
+                    if expected != (self.header_crc.finish() & 0xffff) {
+                        return self.fail(deflate.Error.ChecksumMismatch)
+                    }
+                    self.phase = DECODE_BODY
+                }
+                continue
+            }
+            self.header_crc.update(&input[used - 1..used])
+            if phase == DECODE_FIXED {
+                if self.count < 3 && byte != MAGIC[self.count] {
+                    return self.fail(deflate.Error.InvalidData)
+                }
+                if self.count == 3 {
+                    if (byte & 0xe0) != 0 {
+                        return self.fail(deflate.Error.InvalidData)
+                    }
+                    self.flags = byte
+                }
+                self.count += 1
+                if self.count == 10 {
+                    self.next_field()
+                }
+            } else if phase == DECODE_EXTRA_LEN {
+                self.remaining = self.remaining | ((byte as usize) << (8 * self.count))
+                self.count += 1
+                if self.count == 2 {
+                    self.phase = DECODE_EXTRA
+                    if self.remaining == 0 {
+                        self.next_field()
+                    }
+                }
+            } else if phase == DECODE_EXTRA {
+                self.remaining -= 1
+                if self.remaining == 0 {
+                    self.next_field()
+                }
+            } else if byte == 0 {
+                self.next_field()
+            }
+        }
+    }
+}
+
+const ENCODE_HEADER: usize = 0
+const ENCODE_BODY: usize = 1
+const ENCODE_TRAILER: usize = 2
+const ENCODE_DONE: usize = 3
+
+// Incremental gzip compressor; see deflate.Encoder for the process contract.
+pub struct Encoder {
+    raw: deflate.Encoder
+    crc: checksum.Crc32
+    size: u32
+    level: usize
+    phase: usize
+    bytes: [10]u8
+    index: usize
+    count: usize
+    // Borrows storage as deflate.Encoder.new does.
+    pub fn new(level: usize, buffer: &mut[u8], words: &mut[u32]) -> Encoder!deflate.Error from(buffer, words) {
+        raw := deflate.Encoder.new(level, buffer, words)?
+        e := Encoder { raw: raw, crc: checksum.Crc32.new(), size: 0, level: level, phase: ENCODE_HEADER, bytes: minimal_header(level), index: 0, count: 10 }
+        return ok(e)
+    }
+    pub fn reset(&mut self) {
+        self.raw.reset()
+        self.crc.reset()
+        self.size = 0
+        self.bytes = minimal_header(self.level)
+        self.index = 0
+        self.count = 10
+        self.phase = ENCODE_HEADER
+    }
+    pub fn process(&mut self, input: &[u8], output: &mut[u8], finish: bool) -> deflate.Progress {
+        used := 0usize
+        written := 0usize
+        for {
+            if self.phase == ENCODE_BODY {
+                p := self.raw.process(&input[used..], &mut output[written..], finish)
+                self.crc.update(&input[used..used + p.input_consumed])
+                self.size = core.wrapping_add(self.size, (p.input_consumed & 0xffffffffusize) as u32)
+                used += p.input_consumed
+                written += p.output_written
+                if p.status != deflate.Status.Done {
+                    p.input_consumed = used
+                    p.output_written = written
+                    return p
+                }
+                put_u32_le(&mut self.bytes, self.crc.finish())
+                put_u32_le(&mut self.bytes[4..], self.size)
+                self.index = 0
+                self.count = 8
+                self.phase = ENCODE_TRAILER
+            } else if self.phase == ENCODE_DONE {
+                return deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.Done }
+            } else {
+                for self.index < self.count {
+                    if written == output.len {
+                        return deflate.Progress { input_consumed: used, output_written: written, status: deflate.Status.NeedOutput }
+                    }
+                    output[written] = self.bytes[self.index]
+                    written += 1
+                    self.index += 1
+                }
+                if self.phase == ENCODE_HEADER {
+                    self.phase = ENCODE_BODY
+                } else {
+                    self.phase = ENCODE_DONE
+                }
+            }
+        }
+    }
+}
