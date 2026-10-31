@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `extern "C" fn(A) -> R` is a C function pointer type, for code that uses the
+  platform C calling convention: pointers from `dlsym`, `GetProcAddress` or
+  `vkGetInstanceProcAddr`, COM method tables, and callbacks passed to C. An
+  `extern "C"` function used as a value now has this type instead of being
+  rejected. Calls through one need `unsafe` and follow the C convention,
+  including narrow-integer extension, and unsafe `as` converts between C
+  function pointers, raw pointers and `usize`. The type never converts to or
+  from Dodo's `fn(..)` and closure types, which keep their internal ABI. C
+  declarations may take and return C function pointers.
 - Antialiased drawing, gradients and TrueType text for `std/graphics`, still
   integer-only, allocation-free and identical on every target, firmware
   included. The `aa_` canvas calls draw lines, thick round-capped lines,

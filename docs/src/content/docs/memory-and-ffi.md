@@ -55,8 +55,8 @@ borrow-checking error.
 
 Struct fields keep declaration order and LLVM target ABI alignment/padding.
 `@repr(C)` uses this C-compatible field layout. Native Dodo function ABI is
-compiler-internal and unstable. Primitive and raw-pointer `extern "C"`
-parameters/results use LLVM's C calling convention; C aggregate-by-value ABI
+compiler-internal and unstable. Primitive, raw-pointer and C function pointer
+`extern "C"` parameters/results use LLVM's C calling convention; C aggregate-by-value ABI
 classification and variadics are not supported. Pass pointers to `@repr(C)`
 structs instead. Imported foreign declarations use the declared final name as
 the external symbol; C definitions do the same. Native Dodo functions use
@@ -82,6 +82,48 @@ must match the foreign library's actual argument widths, signedness, ABI, and
 symbol names. An external declaration does not automatically link its library;
 use the [linker options](command-line.md) when extra libraries or objects are
 needed. Dodo can also define a function with a body using `extern "C" fn`.
+
+### C function pointers
+
+`extern "C" fn(A) -> R` is the address of code using the C calling convention.
+An ordinary `fn(A) -> R` is not: it uses Dodo's own convention, so the two
+types never convert into each other. A C function pointer comes from a C
+function's name, from C code, or from an unsafe `as` conversion of a raw
+pointer or address, for example one returned by `dlsym`. Calling one is unsafe,
+like calling the function by name:
+
+```dodo
+package main
+
+import "core/ptr"
+
+unsafe extern "C" fn dlopen(path: *const u8, mode: i32) -> *mut u8
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *const u8
+
+fn main() {
+    unsafe {
+        program := dlopen(0 as *const u8, 2)
+        symbol := dlsym(program, ptr.as_ptr(b"abs\0"))
+        // A C function pointer is never null: check before converting.
+        core.assert(symbol as usize != 0)
+        abs := symbol as extern "C" fn(i32) -> i32
+        core.assert_eq(abs(-42), 42i32)
+    }
+}
+```
+
+The converted pointer must address code with exactly the written signature.
+Struct fields of C function pointer type describe C method tables, and a
+function defined with `extern "C" fn` passes to C as a callback by name:
+
+```dodo
+unsafe extern "C" fn qsort(base: *mut u8, count: usize, size: usize,
+    compare: extern "C" fn(*const u8, *const u8) -> i32)
+
+extern "C" fn ascending(a: *const u8, b: *const u8) -> i32 {
+    unsafe { return *(a as *const i32) - *(b as *const i32) }
+}
+```
 
 `&str` is not a C string. Its bytes have no guaranteed trailing NUL, and its
 representation includes a length. C interfaces that expect a string usually

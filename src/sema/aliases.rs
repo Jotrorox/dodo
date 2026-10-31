@@ -374,7 +374,7 @@ impl Resolver {
                 self.ty(ok, scope, span, active)?;
                 self.ty(error, scope, span, active)?;
             }
-            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+            Type::Fn(params, ret) | Type::DynFn(params, ret) | Type::ExternFn(params, ret) => {
                 for param in params {
                     self.ty(param, scope, span, active)?;
                 }
@@ -782,6 +782,10 @@ fn substitute(ty: &Type, mapping: &HashMap<String, Type>) -> Type {
             Box::new(substitute(ret, mapping)),
         ),
         Type::DynFn(params, ret) => Type::DynFn(
+            params.iter().map(|t| substitute(t, mapping)).collect(),
+            Box::new(substitute(ret, mapping)),
+        ),
+        Type::ExternFn(params, ret) => Type::ExternFn(
             params.iter().map(|t| substitute(t, mapping)).collect(),
             Box::new(substitute(ret, mapping)),
         ),

@@ -399,7 +399,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             Type::Ref(_, t) if matches!(t.as_ref(), Type::Dyn(_) | Type::DynFn(..)) => self
                 .context
                 .struct_type(&[self.context.ptr_type(0), self.context.ptr_type(0)], false),
-            Type::Ref(..) | Type::Raw(..) | Type::Fn(..) => self.context.ptr_type(0),
+            Type::Ref(..) | Type::Raw(..) | Type::Fn(..) | Type::ExternFn(..) => {
+                self.context.ptr_type(0)
+            }
             Type::Slice(..) | Type::Str => self
                 .context
                 .struct_type(&[self.context.ptr_type(0), self.usize_type()], false),
@@ -741,6 +743,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
     }
     fn c_abi_attributes(&self, function: &Function) -> Vec<(AttributeLoc, Attribute<'ctx>)> {
+        let params: Vec<Type> = function.params.iter().map(|p| p.ty.clone()).collect();
+        self.c_signature_attributes(&params, &function.ret)
+    }
+    /// Argument and result extension attributes of a C signature.
+    fn c_signature_attributes(
+        &self,
+        params: &[Type],
+        ret: &Type,
+    ) -> Vec<(AttributeLoc, Attribute<'ctx>)> {
         let triple = self.module.get_triple();
         let triple = triple.as_str().to_string_lossy();
         // SysV x86 C promotes narrow arguments/results in registers, and so
@@ -755,13 +766,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if !(x86 || apple_arm64) || triple.contains("windows") {
             return Vec::new();
         }
-        std::iter::once((AttributeLoc::Return, &function.ret))
+        std::iter::once((AttributeLoc::Return, ret))
             .chain(
-                function
-                    .params
+                params
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| (AttributeLoc::Param(i as u32), &p.ty)),
+                    .map(|(i, ty)| (AttributeLoc::Param(i as u32), ty)),
             )
             .filter_map(|(location, ty)| {
                 let name = match ty {
@@ -824,7 +834,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn constant(&mut self, e: &Expr) -> Result<Value<'ctx>> {
         match &e.kind {
             ExprKind::String(bytes, _) => Ok(self.string_literal(bytes)),
-            ExprKind::Name(n) if matches!(e.ty, Type::Fn(..)) && self.functions.contains_key(n) => {
+            ExprKind::Name(n)
+                if matches!(e.ty, Type::Fn(..) | Type::ExternFn(..))
+                    && self.functions.contains_key(n) =>
+            {
                 self.fn_pointer(n)
             }
             ExprKind::Name(n) if n == "none" => Ok(self.ty(&e.ty)?.const_zero()),
@@ -2594,6 +2607,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 Ok(out)
             }
             (Type::Raw(..) | Type::Ref(..), Type::Raw(..) | Type::Ref(..)) => Ok(v),
+            (Type::Raw(..) | Type::ExternFn(..), Type::Raw(..) | Type::ExternFn(..)) => Ok(v),
+            (Type::Int { .. }, Type::ExternFn(..)) => {
+                Ok(self
+                    .builder
+                    .build_int_to_ptr(v, self.context.ptr_type(0), "code")?)
+            }
+            (Type::ExternFn(..), Type::Int { .. }) => {
+                Ok(self.builder.build_ptr_to_int(v, self.ty(to)?, "address")?)
+            }
             (Type::Int { .. }, Type::Raw(..)) => {
                 Ok(self
                     .builder

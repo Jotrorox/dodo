@@ -281,7 +281,9 @@ the value must be stored for later, for example as an
 values too, written `Point.length`, and calling a struct field that holds a
 function is written `button.on_press(x)` when the struct has no method of that
 name. The [language specification](language-spec-0.1.md#67-function-values-and-closures)
-gives the complete rules.
+gives the complete rules. C code is called through a separate type,
+`extern "C" fn(A) -> R`, described in
+[C function pointers](memory-and-ffi.md#c-function-pointers).
 
 ## Tuples group values without naming them
 

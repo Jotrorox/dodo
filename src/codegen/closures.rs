@@ -59,6 +59,33 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.builder
             .build_insert_value(value, environment, 1, "closure.environment")
     }
+    /// A call through an `extern "C" fn` pointer. Its parameters and result
+    /// are scalars or pointers, which the C convention passes directly; the
+    /// target ABI may additionally promise extension of narrow integers.
+    fn invoke_c(
+        &mut self,
+        code: Value<'ctx>,
+        params: &[Type],
+        args: &[Expr],
+        ret: &Type,
+    ) -> Result<Value<'ctx>> {
+        let mut values = Vec::new();
+        let mut pending = Vec::new();
+        for e in args {
+            values.push(self.stage(e, &mut pending)?);
+        }
+        self.transfer(&pending)?;
+        let call = self.builder.build_indirect_call(
+            self.value_fn_type(params, ret, false)?,
+            code,
+            &values,
+            "call",
+        )?;
+        for (location, attribute) in self.c_signature_attributes(params, ret) {
+            call.add_attribute(location, attribute);
+        }
+        Ok(call.basic().unwrap_or(self.context.i8_type().const_zero()))
+    }
     /// The function-pointer entry point of a named function or closure body.
     /// Functions already using the value convention are their own entry point.
     pub(super) fn fn_pointer(&mut self, name: &str) -> Result<Value<'ctx>> {
@@ -71,6 +98,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .iter()
             .find(|f| f.name == name)
             .ok_or_else(|| error(format!("unknown function value {name}")))?;
+        if function.extern_ {
+            let target = self.functions[name];
+            self.fn_pointers.insert(name.to_owned(), target);
+            return Ok(target);
+        }
         let captures = function.environment.unwrap_or(0);
         let params: Vec<Type> = function.params[captures..]
             .iter()
@@ -214,6 +246,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .callable_signature()
             .ok_or_else(|| error(format!("cannot call a value of type {}", callee.ty)))?;
         let params = params.to_vec();
+        if matches!(callee.ty, Type::ExternFn(..)) {
+            return self.invoke_c(value, &params, args, ret);
+        }
         let closure = callee.ty.closure_signature().is_some();
         let (indirect_return, indirect_params) = self.value_convention(&params, ret)?;
         let storage = if indirect_return {

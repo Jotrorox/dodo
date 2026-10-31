@@ -942,6 +942,30 @@ impl Parser {
         if self.eat("void") {
             return Ok(Type::Void);
         }
+        let mut foreign = false;
+        if self.at("extern") {
+            let start = self.span();
+            self.bump();
+            match self.bump() {
+                Token {
+                    kind: TokenKind::String(abi, false),
+                    ..
+                } if abi == b"C" => {}
+                token => {
+                    return Err(Diagnostic::new(
+                        token.span,
+                        "only the `extern \"C\"` ABI is supported",
+                    ));
+                }
+            }
+            if !self.at("fn") {
+                return Err(Diagnostic::new(
+                    start,
+                    "expected `fn` after `extern \"C\"` in a type",
+                ));
+            }
+            foreign = true;
+        }
         let callable = self.at("dyn") && self.look(1, "fn");
         if !callable && self.eat("dyn") {
             return Ok(Type::Dyn(self.qualified_name()?));
@@ -971,6 +995,8 @@ impl Parser {
             };
             return Ok(if callable {
                 Type::DynFn(params, Box::new(ret))
+            } else if foreign {
+                Type::ExternFn(params, Box::new(ret))
             } else {
                 Type::Fn(params, Box::new(ret))
             });
