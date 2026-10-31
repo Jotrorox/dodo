@@ -1,0 +1,435 @@
+package app
+
+import "std/console"
+import "std/mqtt"
+import "std/mqtt/hosted"
+import "std/net"
+import "std/net/native"
+import "std/thread"
+
+// A long-running MQTT client: subscribe handlers to topic filters, add
+// periodic tasks, and run. The app connects, subscribes, calls every handler
+// whose filter matches a message, publishes what handlers put in their
+// outbox, keeps the connection alive, and reconnects after it drops.
+pub const OUTBOX_BYTES: usize = 4096
+const NEVER: u64 = 18446744073709551615u64
+
+fn deadline(now: u64, milliseconds: u64) -> u64 {
+    if milliseconds > NEVER - now {
+        return NEVER
+    }
+    return now + milliseconds
+}
+fn quality(level: u8) -> mqtt.QoS {
+    if level == 1 {
+        return mqtt.QoS.AtLeastOnce
+    }
+    if level == 2 {
+        return mqtt.QoS.ExactlyOnce
+    }
+    return mqtt.QoS.AtMostOnce
+}
+
+// Writes "topic payload" lines to standard output.
+pub fn print() -> hosted.Print {
+    return hosted.Print {}
+}
+
+// Periodic tasks. A task is a value with
+// tick(&mut self, outbox: &mut mqtt.Outbox) -> void!mqtt.Error; it runs once
+// right after each connection and then every interval while connected.
+pub struct NoTasks {
+    pub fn start(&mut self, now: u64) {}
+    pub fn run_due(&mut self, now: u64, everything: bool, outbox: &mut mqtt.Outbox, outcome: &mut mqtt.Dispatch) {}
+    pub fn next_due(&self) -> u64 {
+        return NEVER
+    }
+    pub fn len(&self) -> usize {
+        return 0
+    }
+}
+pub struct Tasks<A, T> {
+    previous: A
+    current: T
+    interval_ms: u64
+    due: u64
+    pub fn start(&mut self, now: u64) {
+        self.previous.start(now)
+        self.due = now
+    }
+    pub fn run_due(&mut self, now: u64, everything: bool, outbox: &mut mqtt.Outbox, outcome: &mut mqtt.Dispatch) {
+        self.previous.run_due(now, everything, outbox, outcome)
+        if everything || now >= self.due {
+            self.due = deadline(now, self.interval_ms)
+            outcome.handled += 1
+            match self.current.tick(outbox) {
+                ok() => {}
+                err(reason) => {
+                    outcome.failed += 1
+                    outcome.failure = some(reason)
+                }
+            }
+        }
+    }
+    pub fn next_due(&self) -> u64 {
+        earlier := self.previous.next_due()
+        if self.due < earlier {
+            return self.due
+        }
+        return earlier
+    }
+    pub fn len(&self) -> usize {
+        return self.previous.len() + 1
+    }
+}
+// Runs every task once, for App.tick().
+struct Ticker<T> {
+    tasks: &mut T
+    pub fn dispatch(&mut self, message: &mqtt.Message, outbox: &mut mqtt.Outbox, outcome: &mut mqtt.Dispatch) {
+        self.tasks.run_due(0, true, outbox, outcome)
+    }
+}
+
+pub struct Report {
+    // Successful connections, including the first.
+    pub connections: u64
+    pub received: u64
+    pub published: u64
+    // Handler and task errors. The message still counts as handled.
+    pub failed: u64
+    pub reconnects: u64
+    pub cancelled: bool
+    pub last_error: Option<mqtt.Error>
+}
+fn record(report: &mut Report, outcome: mqtt.Dispatch) {
+    let mqtt.Dispatch { handled: _, failed: failed, failure: failure } = outcome
+    report.failed += failed as u64
+    match failure {
+        some(reason) => {
+            errors := console.stderr()
+            match errors.write(b"mqtt handler failed: ") {
+                ok(_) => {}
+                err(_) => {}
+            }
+            match errors.println(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            report.last_error = some(reason)
+        }
+        none => {}
+    }
+}
+fn flush(client: &mut hosted.Client, outbox: &mut mqtt.Outbox, report: &mut Report) -> void!mqtt.Error {
+    cursor := 0usize
+    failure: Option<mqtt.Error> = none
+    done := false
+    for !done {
+        match outbox.next(&mut cursor) {
+            some(message) => {
+                let mqtt.Message { topic: topic, payload: payload, qos: qos, retain: retain,.. } = message
+                match client.publish_with(topic, payload, qos, retain) {
+                    ok() => {
+                        report.published += 1
+                    }
+                    err(reason) => {
+                        failure = some(reason)
+                        done = true
+                    }
+                }
+            }
+            none => {
+                done = true
+            }
+        }
+    }
+    outbox.clear()
+    match failure {
+        some(reason) => {
+            return err(reason)
+        }
+        none => {
+            return ok()
+        }
+    }
+}
+// Errors that retrying cannot fix: configuration and broker refusals.
+fn permanent(reason: &mqtt.Error) -> bool {
+    return reason.kind == mqtt.ErrorKind.Refused || reason.kind == mqtt.ErrorKind.Rejected ||
+        reason.kind == mqtt.ErrorKind.InvalidInput || reason.kind == mqtt.ErrorKind.InvalidTopic ||
+        reason.kind == mqtt.ErrorKind.InvalidFilter
+}
+
+// A built app: run it, or test its handlers and tasks without a broker.
+pub struct App<R, T> {
+    routes: R
+    tasks: T
+    options: hosted.Options
+    qos: u8
+    status: &[u8]
+    max_messages: u64
+    // Runs every handler whose filter matches topic, without a broker.
+    pub fn deliver(&mut self, topic: &[u8], payload: &[u8]) -> mqtt.Delivery {
+        message := mqtt.Message.new(topic, payload)
+        return mqtt.capture(&mut self.routes, &message)
+    }
+    // Runs every periodic task once, without a broker.
+    pub fn tick(&mut self) -> mqtt.Delivery {
+        ticker := Ticker { tasks: &mut self.tasks }
+        message := mqtt.Message.new(b"", b"")
+        return mqtt.capture(&mut ticker, &message)
+    }
+    pub fn run(self, url: &[u8]) -> i32 {
+        return exit_code(self.serve(url))
+    }
+    pub fn serve(self, url: &[u8]) -> Report!mqtt.Error {
+        cancel := net.NeverCancel {}
+        return self.serve_until(url, &cancel)
+    }
+    // Runs until cancel.cancelled() returns true, or max_messages arrive.
+    // Fails only if the first connection fails or the broker refuses the
+    // client or a subscription; later connection losses reconnect.
+    pub fn serve_until<X>(self, url: &[u8], cancel: &X) -> Report!mqtt.Error {
+        let App { routes: owned_routes, tasks: owned_tasks, options: options, qos: qos, status: status, max_messages: max_messages } = self
+        routes := owned_routes
+        tasks := owned_tasks
+        workspace := [0u8; hosted.WORKSPACE_BYTES]
+        outbox_bytes := [0u8; OUTBOX_BYTES]
+        outbox := mqtt.Outbox.new(&mut outbox_bytes)
+        report := Report { connections: 0, received: 0, published: 0, failed: 0, reconnects: 0, cancelled: false, last_error: none }
+        backoff := 1000u64
+        for true {
+            before := report.connections
+            match session(url, &options, &mut workspace, &mut routes, &mut tasks, &mut outbox, qos, status, max_messages, cancel, &mut report) {
+                ok() => {
+                    return ok(report)
+                }
+                err(reason) => {
+                    if report.connections == 0 || permanent(&reason) {
+                        return err(reason)
+                    }
+                    if report.connections != before {
+                        backoff = 1000
+                    }
+                    errors := console.stderr()
+                    match errors.write(b"mqtt connection lost, reconnecting: ") {
+                        ok(_) => {}
+                        err(_) => {}
+                    }
+                    match errors.println(&reason) {
+                        ok(_) => {}
+                        err(_) => {}
+                    }
+                    report.last_error = some(reason)
+                    report.reconnects += 1
+                    waited := 0u64
+                    for waited < backoff {
+                        if cancel.cancelled() {
+                            report.cancelled = true
+                            return ok(report)
+                        }
+                        thread.sleep_ms(100)
+                        waited += 100
+                    }
+                    if backoff < 30000 {
+                        backoff = backoff * 2
+                    }
+                }
+            }
+        }
+        return ok(report)
+    }
+}
+fn session<R, T, X>(url: &[u8], options: &hosted.Options, workspace: &mut[u8], routes: &mut R, tasks: &mut T,
+outbox: &mut mqtt.Outbox, qos: u8, status: &[u8], max_messages: u64, cancel: &X, report: &mut Report) -> void!mqtt.Error {
+    client := hosted.Client.connect_with(url, options, workspace)?
+    report.connections += 1
+    for i in 0usize..routes.len() {
+        client.subscribe(routes.filter(i), quality(qos))?
+    }
+    if status.len != 0 {
+        client.publish_with(status, b"online", mqtt.QoS.AtLeastOnce, true)?
+    }
+    clock := native.MonotonicClock {}
+    tasks.start(clock.now_ms())
+    for true {
+        if cancel.cancelled() || (max_messages != 0 && report.received >= max_messages) {
+            report.cancelled = cancel.cancelled()
+            // A clean disconnect skips the will, so announce it here.
+            if status.len != 0 {
+                client.publish_with(status, b"offline", mqtt.QoS.AtLeastOnce, true)?
+            }
+            return client.disconnect()
+        }
+        ticks := mqtt.Dispatch.new()
+        tasks.run_due(clock.now_ms(), false, outbox, &mut ticks)
+        record(report, ticks)
+        flush(&mut client, outbox, report)?
+        now := clock.now_ms()
+        wait := 250u64
+        due := tasks.next_due()
+        if due <= now {
+            wait = 0
+        } else if due - now < wait {
+            wait = due - now
+        }
+        outcome := mqtt.Dispatch.new()
+        match client.poll(wait)? {
+            some(message) => {
+                report.received += 1
+                routes.dispatch(&message, outbox, &mut outcome)
+            }
+            none => {}
+        }
+        record(report, outcome)
+        flush(&mut client, outbox, report)?
+    }
+    return ok()
+}
+// Main-function reporting: printed failures and an exit code (0 success,
+// 1 startup failure, 2 if any handler or task failed).
+fn exit_code<E>(result: Report!E) -> i32 {
+    match result {
+        ok(report) => {
+            if report.failed != 0 {
+                return 2
+            }
+            return 0
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            return 1
+        }
+    }
+}
+
+pub struct Builder<R, T> {
+    routes: R
+    tasks: T
+    options: hosted.Options
+    qos: u8
+    status: &[u8]
+    max_messages: u64
+    problem: Option<mqtt.RegistrationError>
+    // Calls handler for every message whose topic matches filter. A handler
+    // is a value with handle(&mut self, message: &mqtt.Message,
+    // outbox: &mut mqtt.Outbox) -> void!mqtt.Error.
+    pub fn on<H>(self, filter: &[u8], handler: H) -> Builder<mqtt.Routes<R, H>, T> from(self, filter, handler) {
+        let Builder { routes: routes, tasks: tasks, options: options, qos: qos, status: status,
+        max_messages: max_messages, problem: previous } = self
+        problem := previous
+        failed := false
+        match &problem {
+            some(_) => {
+                failed = true
+            }
+            none => {}
+        }
+        if !failed {
+            problem = mqtt.check_filter(filter, routes.len())
+        }
+        return Builder { routes: mqtt.route(routes, filter, handler), tasks: tasks, options: options, qos: qos,
+        status: status, max_messages: max_messages, problem: problem }
+    }
+    // Calls task.tick(outbox) right after connecting, then every milliseconds.
+    pub fn every<N>(self, milliseconds: u64, task: N) -> Builder<R, Tasks<T, N>> from(self, task) {
+        let Builder { routes: routes, tasks: tasks, options: options, qos: qos, status: status,
+        max_messages: max_messages, problem: previous } = self
+        problem := previous
+        failed := false
+        match &problem {
+            some(_) => {
+                failed = true
+            }
+            none => {}
+        }
+        if !failed && milliseconds == 0 {
+            problem = some(mqtt.RegistrationError { kind: mqtt.ErrorKind.InvalidInput, filter: b"", index: tasks.len() })
+        }
+        return Builder { routes: routes, tasks: Tasks { previous: tasks, current: task, interval_ms: milliseconds, due: 0 },
+        options: options, qos: qos, status: status, max_messages: max_messages, problem: problem }
+    }
+    pub fn login(self, username: &[u8], password: &[u8]) -> Builder<R, T> from(self, username, password) {
+        self.options.username = username
+        self.options.password = password
+        return self
+    }
+    // Message the broker publishes if this app disappears without disconnecting.
+    pub fn will(self, topic: &[u8], payload: &[u8]) -> Builder<R, T> from(self, topic, payload) {
+        self.options.will_topic = topic
+        self.options.will_payload = payload
+        self.options.will_qos = mqtt.QoS.AtLeastOnce
+        return self
+    }
+    // Keeps a retained "online" or "offline" at topic, so others can see
+    // whether this app is running, even after a crash.
+    pub fn status(self, topic: &[u8]) -> Builder<R, T> from(self, topic) {
+        self.status = topic
+        self.options.will_topic = topic
+        self.options.will_payload = b"offline"
+        self.options.will_qos = mqtt.QoS.AtLeastOnce
+        self.options.will_retain = true
+        return self
+    }
+    pub fn keep_alive(self, seconds: u16) -> Builder<R, T> from(self) {
+        self.options.keep_alive_s = seconds
+        return self
+    }
+    // Subscription quality of service; AtLeastOnce by default.
+    pub fn qos(self, qos: mqtt.QoS) -> Builder<R, T> from(self) {
+        self.qos = mqtt.qos_level(&qos)
+        return self
+    }
+    // Disconnects after this many messages; 0, the default, runs forever.
+    pub fn max_messages(self, count: u64) -> Builder<R, T> from(self) {
+        self.max_messages = count
+        return self
+    }
+    pub fn build(self) -> App<R, T>!mqtt.RegistrationError from(self) {
+        let Builder { routes: routes, tasks: tasks, options: options, qos: qos, status: status,
+        max_messages: max_messages, problem: problem } = self
+        match problem {
+            some(reason) => {
+                return err(reason)
+            }
+            none => {
+                return ok(App { routes: routes, tasks: tasks, options: options, qos: qos, status: status, max_messages: max_messages })
+            }
+        }
+    }
+    // Connects to url (mqtt://host[:port]) and runs until the process stops.
+    // Prints failures and returns an exit code for main.
+    pub fn run(self, url: &[u8]) -> i32 {
+        return exit_code(self.serve(url))
+    }
+    pub fn serve(self, url: &[u8]) -> Report!mqtt.RunError from(self) {
+        cancel := net.NeverCancel {}
+        return self.serve_until(url, &cancel)
+    }
+    pub fn serve_until<X>(self, url: &[u8], cancel: &X) -> Report!mqtt.RunError from(self) {
+        match self.build() {
+            ok(app) => {
+                match app.serve_until(url, cancel) {
+                    ok(report) => {
+                        return ok(report)
+                    }
+                    err(reason) => {
+                        return err(mqtt.RunError { registration: none, serving: some(reason) })
+                    }
+                }
+            }
+            err(reason) => {
+                return err(mqtt.RunError { registration: some(reason), serving: none })
+            }
+        }
+    }
+}
+// Starts an app that connects as client_id.
+pub fn new(client_id: &[u8]) -> Builder<mqtt.NoRoutes, NoTasks> from(client_id) {
+    return Builder { routes: mqtt.NoRoutes {}, tasks: NoTasks {}, options: hosted.Options.new(client_id), qos: 1,
+    status: b"", max_messages: 0, problem: none }
+}

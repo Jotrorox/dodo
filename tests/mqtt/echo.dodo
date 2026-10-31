@@ -1,0 +1,19 @@
+package mqtt_echo
+import "std/mqtt"
+import "std/mqtt/app"
+
+// The test replaces BROKER with the Dodo broker's URL.
+pub struct Ticker {
+    pub fn tick(&mut self, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        return outbox.publish(b"apps/echo/tick", b"1")
+    }
+}
+fn main() -> i32 {
+    return app.new(b"echo")
+        .login(b"family", b"secret")
+        .on(b"ping", mqtt.reply(b"pong", b"hello"))
+        .every(60000, Ticker {})
+        .status(b"apps/echo/status")
+        .max_messages(1)
+        .run(b"BROKER")
+}

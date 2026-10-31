@@ -1,0 +1,1159 @@
+package mqtt
+
+import "std/io"
+import "std/text"
+import "core/bytes"
+
+// MQTT 3.1.1 (OASIS, protocol level 4) packets and topic rules. Portable and
+// allocation-free: no socket, clock or heap. Encoders write caller bytes and
+// return the frame length; decoded views borrow the frame they came from.
+pub const PORT: u16 = 1883
+pub const MAX_REMAINING: usize = 268435455
+pub const MAX_STRING: usize = 65535
+
+pub enum ErrorKind {
+    Malformed, PacketTooLarge, BufferFull, InvalidTopic, InvalidFilter, InvalidInput,
+    Protocol, Refused, Rejected, Resolve, Connect, Network, Closed, TimedOut
+}
+pub struct Error {
+    pub kind: ErrorKind
+    // CONNACK return code for Refused, SUBACK return code for Rejected, the
+    // numeric operating-system code for network failures, otherwise 0.
+    pub code: i32
+    // Only fixed kind names and numeric metadata; never topics or payloads.
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        output.string("mqtt: ")?
+        match &self.kind {
+            ErrorKind.Malformed => {
+                output.string("Malformed")?
+            }
+            ErrorKind.PacketTooLarge => {
+                output.string("PacketTooLarge")?
+            }
+            ErrorKind.BufferFull => {
+                output.string("BufferFull")?
+            }
+            ErrorKind.InvalidTopic => {
+                output.string("InvalidTopic")?
+            }
+            ErrorKind.InvalidFilter => {
+                output.string("InvalidFilter")?
+            }
+            ErrorKind.InvalidInput => {
+                output.string("InvalidInput")?
+            }
+            ErrorKind.Protocol => {
+                output.string("Protocol")?
+            }
+            ErrorKind.Refused => {
+                output.string("Refused")?
+            }
+            ErrorKind.Rejected => {
+                output.string("Rejected")?
+            }
+            ErrorKind.Resolve => {
+                output.string("Resolve")?
+            }
+            ErrorKind.Connect => {
+                output.string("Connect")?
+            }
+            ErrorKind.Network => {
+                output.string("Network")?
+            }
+            ErrorKind.Closed => {
+                output.string("Closed")?
+            }
+            ErrorKind.TimedOut => {
+                output.string("TimedOut")?
+            }
+        }
+        output.string(" code=")?
+        output.decimal(self.code as i64)?
+        return ok()
+    }
+}
+pub fn failure(kind: ErrorKind, code: i32) -> Error {
+    return Error { kind: kind, code: code }
+}
+
+// CONNACK return codes.
+pub const ACCEPTED: u8 = 0
+pub const UNACCEPTABLE_PROTOCOL: u8 = 1
+pub const IDENTIFIER_REJECTED: u8 = 2
+pub const SERVER_UNAVAILABLE: u8 = 3
+pub const BAD_CREDENTIALS: u8 = 4
+pub const NOT_AUTHORIZED: u8 = 5
+// SUBACK return code for a refused subscription.
+pub const SUBSCRIBE_FAILURE: u8 = 128
+
+pub enum QoS {
+    AtMostOnce, AtLeastOnce, ExactlyOnce
+}
+pub fn qos_level(qos: &QoS) -> u8 {
+    match qos {
+        QoS.AtMostOnce => {
+            return 0
+        }
+        QoS.AtLeastOnce => {
+            return 1
+        }
+        QoS.ExactlyOnce => {
+            return 2
+        }
+    }
+}
+pub fn qos_from(level: u8) -> Option<QoS> {
+    if level == 0 {
+        return some(QoS.AtMostOnce)
+    }
+    if level == 1 {
+        return some(QoS.AtLeastOnce)
+    }
+    if level == 2 {
+        return some(QoS.ExactlyOnce)
+    }
+    return none
+}
+
+pub enum PacketKind {
+    Connect, Connack, Publish, Puback, Pubrec, Pubrel, Pubcomp,
+    Subscribe, Suback, Unsubscribe, Unsuback, Pingreq, Pingresp, Disconnect
+}
+fn kind_code(kind: &PacketKind) -> u8 {
+    match kind {
+        PacketKind.Connect => {
+            return 1
+        }
+        PacketKind.Connack => {
+            return 2
+        }
+        PacketKind.Publish => {
+            return 3
+        }
+        PacketKind.Puback => {
+            return 4
+        }
+        PacketKind.Pubrec => {
+            return 5
+        }
+        PacketKind.Pubrel => {
+            return 6
+        }
+        PacketKind.Pubcomp => {
+            return 7
+        }
+        PacketKind.Subscribe => {
+            return 8
+        }
+        PacketKind.Suback => {
+            return 9
+        }
+        PacketKind.Unsubscribe => {
+            return 10
+        }
+        PacketKind.Unsuback => {
+            return 11
+        }
+        PacketKind.Pingreq => {
+            return 12
+        }
+        PacketKind.Pingresp => {
+            return 13
+        }
+        PacketKind.Disconnect => {
+            return 14
+        }
+    }
+}
+fn kind_from(code: u8) -> Option<PacketKind> {
+    if code == 1 {
+        return some(PacketKind.Connect)
+    }
+    if code == 2 {
+        return some(PacketKind.Connack)
+    }
+    if code == 3 {
+        return some(PacketKind.Publish)
+    }
+    if code == 4 {
+        return some(PacketKind.Puback)
+    }
+    if code == 5 {
+        return some(PacketKind.Pubrec)
+    }
+    if code == 6 {
+        return some(PacketKind.Pubrel)
+    }
+    if code == 7 {
+        return some(PacketKind.Pubcomp)
+    }
+    if code == 8 {
+        return some(PacketKind.Subscribe)
+    }
+    if code == 9 {
+        return some(PacketKind.Suback)
+    }
+    if code == 10 {
+        return some(PacketKind.Unsubscribe)
+    }
+    if code == 11 {
+        return some(PacketKind.Unsuback)
+    }
+    if code == 12 {
+        return some(PacketKind.Pingreq)
+    }
+    if code == 13 {
+        return some(PacketKind.Pingresp)
+    }
+    if code == 14 {
+        return some(PacketKind.Disconnect)
+    }
+    return none
+}
+
+// MQTT strings are UTF-8 without U+0000, at most 65535 bytes.
+pub fn valid_string(data: &[u8]) -> bool {
+    if data.len > MAX_STRING {
+        return false
+    }
+    for i in 0usize..data.len {
+        if data[i] == 0 {
+            return false
+        }
+    }
+    match text.validate(data) {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+// A topic name, as published: non-empty and free of the + and # wildcards.
+pub fn valid_topic(topic: &[u8]) -> bool {
+    if topic.len == 0 || !valid_string(topic) {
+        return false
+    }
+    for i in 0usize..topic.len {
+        if topic[i] == 43 || topic[i] == 35 {
+            return false
+        }
+    }
+    return true
+}
+// A topic filter, as subscribed: + fills a whole level, # only the last one.
+pub fn valid_filter(filter: &[u8]) -> bool {
+    if filter.len == 0 || !valid_string(filter) {
+        return false
+    }
+    for i in 0usize..filter.len {
+        if filter[i] == 43 || filter[i] == 35 {
+            if i > 0 && filter[i - 1] != 47 {
+                return false
+            }
+            if filter[i] == 35 && i + 1 != filter.len {
+                return false
+            }
+            if filter[i] == 43 && i + 1 < filter.len && filter[i + 1] != 47 {
+                return false
+            }
+        }
+    }
+    return true
+}
+fn level_end(data: &[u8], start: usize) -> usize {
+    end := start
+    for end < data.len && data[end] != 47 {
+        end += 1
+    }
+    return end
+}
+// Whether a valid filter selects a valid topic name. Wildcards in the first
+// level never match topics beginning with $, such as $SYS/broker/uptime.
+pub fn matches(filter: &[u8], topic: &[u8]) -> bool {
+    if filter.len == 0 || topic.len == 0 {
+        return false
+    }
+    if topic[0] == 36 && (filter[0] == 43 || filter[0] == 35) {
+        return false
+    }
+    f := 0usize
+    t := 0usize
+    for true {
+        filter_end := level_end(filter, f)
+        if filter_end - f == 1 && filter[f] == 35 {
+            return true
+        }
+        // t past the end: the topic has no further level.
+        if t > topic.len {
+            return false
+        }
+        topic_end := level_end(topic, t)
+        if !(filter_end - f == 1 && filter[f] == 43) && !bytes.equal(&filter[f..filter_end], &topic[t..topic_end]) {
+            return false
+        }
+        f = filter_end + 1
+        t = topic_end + 1
+        if f > filter.len {
+            return t > topic.len
+        }
+    }
+    return false
+}
+
+// Bounded big-endian writer over caller bytes.
+struct Encoder {
+    output: &mut[u8]
+    used: usize
+    fn new(output: &mut[u8]) -> Encoder from(output) {
+        return Encoder { output: output, used: 0 }
+    }
+    fn byte(&mut self, value: u8) -> void!Error {
+        if self.used >= self.output.len {
+            return err(failure(ErrorKind.BufferFull, 0))
+        }
+        self.output[self.used] = value
+        self.used += 1
+        return ok()
+    }
+    fn short(&mut self, value: u16) -> void!Error {
+        self.byte((value >> 8) as u8)?
+        return self.byte((value & 255) as u8)
+    }
+    fn raw(&mut self, data: &[u8]) -> void!Error {
+        if data.len > self.output.len - self.used {
+            return err(failure(ErrorKind.BufferFull, 0))
+        }
+        for i in 0usize..data.len {
+            self.output[self.used + i] = data[i]
+        }
+        self.used += data.len
+        return ok()
+    }
+    fn string(&mut self, data: &[u8]) -> void!Error {
+        if data.len > MAX_STRING {
+            return err(failure(ErrorKind.InvalidInput, 0))
+        }
+        self.short(data.len as u16)?
+        return self.raw(data)
+    }
+    // Fixed header: packet type and flags, then the variable-length remaining length.
+    fn header(&mut self, code: u8, flags: u8, remaining: usize) -> void!Error {
+        if remaining > MAX_REMAINING {
+            return err(failure(ErrorKind.PacketTooLarge, 0))
+        }
+        self.byte((code << 4) | flags)?
+        value := remaining
+        for true {
+            digit := (value % 128) as u8
+            value = value / 128
+            if value != 0 {
+                digit = digit | 128
+            }
+            self.byte(digit)?
+            if value == 0 {
+                return ok()
+            }
+        }
+        return ok()
+    }
+}
+
+// Session settings sent in CONNECT. Empty username, password and will_topic
+// mean absent; MQTT 3.1.1 permits a password only together with a username.
+pub struct Connect {
+    pub client_id: &[u8]
+    pub username: &[u8]
+    pub password: &[u8]
+    pub keep_alive_s: u16
+    pub clean_session: bool
+    pub will_topic: &[u8]
+    pub will_payload: &[u8]
+    pub will_qos: QoS
+    pub will_retain: bool
+    pub fn new(client_id: &[u8]) -> Connect from(client_id) {
+        return Connect { client_id: client_id, username: b"", password: b"", keep_alive_s: 60,
+        clean_session: true, will_topic: b"", will_payload: b"", will_qos: QoS.AtMostOnce, will_retain: false }
+    }
+}
+pub fn encode_connect(output: &mut[u8], connect: &Connect) -> usize!Error {
+    if !valid_string(connect.client_id) || !valid_string(connect.username) || connect.password.len > MAX_STRING ||
+        (connect.client_id.len == 0 && !connect.clean_session) || (connect.password.len != 0 && connect.username.len == 0) {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    will := connect.will_topic.len != 0
+    will_level := qos_level(&connect.will_qos)
+    if will && (!valid_topic(connect.will_topic) || connect.will_payload.len > MAX_STRING) {
+        return err(failure(ErrorKind.InvalidTopic, 0))
+    }
+    if !will && (connect.will_payload.len != 0 || will_level != 0 || connect.will_retain) {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    flags := 0u8
+    remaining := 10 + 2 + connect.client_id.len
+    if connect.clean_session {
+        flags = flags | 2
+    }
+    if will {
+        flags = flags | 4 | (will_level << 3)
+        if connect.will_retain {
+            flags = flags | 32
+        }
+        remaining += 4 + connect.will_topic.len + connect.will_payload.len
+    }
+    if connect.username.len != 0 {
+        flags = flags | 128
+        remaining += 2 + connect.username.len
+    }
+    if connect.password.len != 0 {
+        flags = flags | 64
+        remaining += 2 + connect.password.len
+    }
+    encoder := Encoder.new(output)
+    encoder.header(1, 0, remaining)?
+    encoder.string(b"MQTT")?
+    encoder.byte(4)?
+    encoder.byte(flags)?
+    encoder.short(connect.keep_alive_s)?
+    encoder.string(connect.client_id)?
+    if will {
+        encoder.string(connect.will_topic)?
+        encoder.string(connect.will_payload)?
+    }
+    if connect.username.len != 0 {
+        encoder.string(connect.username)?
+    }
+    if connect.password.len != 0 {
+        encoder.string(connect.password)?
+    }
+    return ok(encoder.used)
+}
+// Everything of a PUBLISH except its payload, so large payloads can be sent
+// from their own storage. packet_id must be 0 for QoS 0, otherwise non-zero.
+pub fn encode_publish_head(output: &mut[u8], topic: &[u8], payload_len: usize, qos: QoS, retain: bool,
+duplicate: bool, packet_id: u16) -> usize!Error {
+    if !valid_topic(topic) {
+        return err(failure(ErrorKind.InvalidTopic, 0))
+    }
+    level := qos_level(&qos)
+    if (level == 0) != (packet_id == 0) || (level == 0 && duplicate) {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    remaining := 2 + topic.len + payload_len
+    if level != 0 {
+        remaining += 2
+    }
+    if payload_len > MAX_REMAINING || remaining > MAX_REMAINING {
+        return err(failure(ErrorKind.PacketTooLarge, 0))
+    }
+    flags := level << 1
+    if retain {
+        flags = flags | 1
+    }
+    if duplicate {
+        flags = flags | 8
+    }
+    encoder := Encoder.new(output)
+    encoder.header(3, flags, remaining)?
+    encoder.string(topic)?
+    if level != 0 {
+        encoder.short(packet_id)?
+    }
+    return ok(encoder.used)
+}
+pub fn encode_publish(output: &mut[u8], topic: &[u8], payload: &[u8], qos: QoS, retain: bool,
+duplicate: bool, packet_id: u16) -> usize!Error {
+    used := encode_publish_head(output, topic, payload.len, qos, retain, duplicate, packet_id)?
+    if payload.len > output.len - used {
+        return err(failure(ErrorKind.BufferFull, 0))
+    }
+    for i in 0usize..payload.len {
+        output[used + i] = payload[i]
+    }
+    return ok(used + payload.len)
+}
+pub fn encode_subscribe(output: &mut[u8], packet_id: u16, filter: &[u8], qos: QoS) -> usize!Error {
+    if !valid_filter(filter) {
+        return err(failure(ErrorKind.InvalidFilter, 0))
+    }
+    if packet_id == 0 {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    encoder := Encoder.new(output)
+    encoder.header(8, 2, 5 + filter.len)?
+    encoder.short(packet_id)?
+    encoder.string(filter)?
+    encoder.byte(qos_level(&qos))?
+    return ok(encoder.used)
+}
+pub fn encode_unsubscribe(output: &mut[u8], packet_id: u16, filter: &[u8]) -> usize!Error {
+    if !valid_filter(filter) {
+        return err(failure(ErrorKind.InvalidFilter, 0))
+    }
+    if packet_id == 0 {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    encoder := Encoder.new(output)
+    encoder.header(10, 2, 4 + filter.len)?
+    encoder.short(packet_id)?
+    encoder.string(filter)?
+    return ok(encoder.used)
+}
+// PUBACK, PUBREC, PUBREL, PUBCOMP or UNSUBACK for a non-zero packet identifier.
+pub fn encode_ack(output: &mut[u8], kind: PacketKind, packet_id: u16) -> usize!Error {
+    if packet_id == 0 || !(kind == PacketKind.Puback || kind == PacketKind.Pubrec || kind == PacketKind.Pubrel ||
+        kind == PacketKind.Pubcomp || kind == PacketKind.Unsuback) {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    flags := 0u8
+    if kind == PacketKind.Pubrel {
+        flags = 2
+    }
+    encoder := Encoder.new(output)
+    encoder.header(kind_code(&kind), flags, 2)?
+    encoder.short(packet_id)?
+    return ok(encoder.used)
+}
+pub fn encode_connack(output: &mut[u8], session_present: bool, return_code: u8) -> usize!Error {
+    if return_code > NOT_AUTHORIZED || (session_present && return_code != ACCEPTED) {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    encoder := Encoder.new(output)
+    encoder.header(2, 0, 2)?
+    if session_present {
+        encoder.byte(1)?
+    } else {
+        encoder.byte(0)?
+    }
+    encoder.byte(return_code)?
+    return ok(encoder.used)
+}
+// One return code per requested filter: the granted QoS or SUBSCRIBE_FAILURE.
+pub fn encode_suback(output: &mut[u8], packet_id: u16, codes: &[u8]) -> usize!Error {
+    if packet_id == 0 || codes.len == 0 {
+        return err(failure(ErrorKind.InvalidInput, 0))
+    }
+    for i in 0usize..codes.len {
+        if codes[i] > 2 && codes[i] != SUBSCRIBE_FAILURE {
+            return err(failure(ErrorKind.InvalidInput, 0))
+        }
+    }
+    encoder := Encoder.new(output)
+    encoder.header(9, 0, 2 + codes.len)?
+    encoder.short(packet_id)?
+    encoder.raw(codes)?
+    return ok(encoder.used)
+}
+fn encode_empty(output: &mut[u8], code: u8) -> usize!Error {
+    encoder := Encoder.new(output)
+    encoder.header(code, 0, 0)?
+    return ok(encoder.used)
+}
+pub fn encode_pingreq(output: &mut[u8]) -> usize!Error {
+    return encode_empty(output, 12)
+}
+pub fn encode_pingresp(output: &mut[u8]) -> usize!Error {
+    return encode_empty(output, 13)
+}
+pub fn encode_disconnect(output: &mut[u8]) -> usize!Error {
+    return encode_empty(output, 14)
+}
+
+// Total length of the frame starting at data[0], once its fixed header is
+// complete; none while more header bytes are needed. The frame itself may
+// still be incomplete: compare the result with data.len.
+pub fn frame_length(data: &[u8]) -> Option<usize>!Error {
+    remaining := 0usize
+    scale := 1usize
+    for i in 1usize..5 {
+        if i >= data.len {
+            return ok(none)
+        }
+        digit := data[i]
+        remaining += ((digit & 127) as usize) * scale
+        if (digit & 128) == 0 {
+            // A non-minimal encoding ends in a zero continuation digit.
+            if digit == 0 && i > 1 {
+                return err(failure(ErrorKind.Malformed, 0))
+            }
+            return ok(some(1 + i + remaining))
+        }
+        scale = scale * 128
+    }
+    return err(failure(ErrorKind.Malformed, 0))
+}
+
+// One decoded control packet. Views borrow the frame. payload is the PUBLISH
+// application message, the SUBACK return codes, or the rest of a CONNECT,
+// SUBSCRIBE or UNSUBSCRIBE body (after the packet identifier).
+pub struct Packet {
+    pub kind: PacketKind
+    pub flags: u8
+    // Bytes of the whole frame, including the fixed header.
+    pub length: usize
+    // 0 when the packet carries no identifier.
+    pub packet_id: u16
+    pub topic: &[u8]
+    pub payload: &[u8]
+    pub qos: QoS
+    pub retain: bool
+    pub duplicate: bool
+    pub session_present: bool
+    pub return_code: u8
+}
+fn read_short(data: &[u8], offset: usize) -> u16 {
+    return ((data[offset] as u16) << 8) | (data[offset + 1] as u16)
+}
+fn malformed() -> Error {
+    return failure(ErrorKind.Malformed, 0)
+}
+// Decodes the complete frame at data[0]. Bytes after it are not inspected.
+pub fn decode(data: &[u8]) -> Packet!Error from(data) {
+    total: usize
+    match frame_length(data)? {
+        some(value) => {
+            total = value
+        }
+        none => {
+            return err(malformed())
+        }
+    }
+    if total > data.len {
+        return err(malformed())
+    }
+    code := data[0] >> 4
+    flags := data[0] & 15
+    kind: PacketKind
+    match kind_from(code) {
+        some(value) => {
+            kind = value
+        }
+        none => {
+            return err(malformed())
+        }
+    }
+    // frame_length checked every length byte, so this stays inside the frame.
+    header := 2usize
+    for (data[header - 1] & 128) != 0 {
+        header += 1
+    }
+    body := &data[header..total]
+    expected := 0u8
+    if kind == PacketKind.Pubrel || kind == PacketKind.Subscribe || kind == PacketKind.Unsubscribe {
+        expected = 2
+    }
+    if kind != PacketKind.Publish && flags != expected {
+        return err(malformed())
+    }
+    packet := Packet { kind: kind, flags: flags, length: total, packet_id: 0, topic: b"", payload: b"",
+    qos: QoS.AtMostOnce, retain: false, duplicate: false, session_present: false, return_code: 0 }
+    if packet.kind == PacketKind.Connack {
+        if body.len != 2 || body[0] > 1 || body[1] > NOT_AUTHORIZED || (body[0] == 1 && body[1] != ACCEPTED) {
+            return err(malformed())
+        }
+        packet.session_present = body[0] == 1
+        packet.return_code = body[1]
+        return ok(packet)
+    }
+    if packet.kind == PacketKind.Publish {
+        level := (flags >> 1) & 3
+        qos: QoS
+        match qos_from(level) {
+            some(value) => {
+                qos = value
+            }
+            none => {
+                return err(malformed())
+            }
+        }
+        packet.qos = qos
+        packet.retain = (flags & 1) != 0
+        packet.duplicate = (flags & 8) != 0
+        if (level == 0 && packet.duplicate) || body.len < 2 {
+            return err(malformed())
+        }
+        topic_end := 2 + (read_short(body, 0) as usize)
+        start := topic_end
+        if level != 0 {
+            start += 2
+        }
+        if start > body.len {
+            return err(malformed())
+        }
+        packet.topic = &body[2..topic_end]
+        if !valid_topic(packet.topic) {
+            return err(failure(ErrorKind.InvalidTopic, 0))
+        }
+        if level != 0 {
+            packet.packet_id = read_short(body, topic_end)
+            if packet.packet_id == 0 {
+                return err(malformed())
+            }
+        }
+        packet.payload = &body[start..]
+        return ok(packet)
+    }
+    if packet.kind == PacketKind.Puback || packet.kind == PacketKind.Pubrec || packet.kind == PacketKind.Pubrel ||
+        packet.kind == PacketKind.Pubcomp || packet.kind == PacketKind.Unsuback {
+        if body.len != 2 {
+            return err(malformed())
+        }
+        packet.packet_id = read_short(body, 0)
+        if packet.packet_id == 0 {
+            return err(malformed())
+        }
+        return ok(packet)
+    }
+    if packet.kind == PacketKind.Suback || packet.kind == PacketKind.Subscribe || packet.kind == PacketKind.Unsubscribe {
+        if body.len < 3 {
+            return err(malformed())
+        }
+        packet.packet_id = read_short(body, 0)
+        if packet.packet_id == 0 {
+            return err(malformed())
+        }
+        packet.payload = &body[2..]
+        if packet.kind == PacketKind.Suback {
+            for i in 0usize..packet.payload.len {
+                if packet.payload[i] > 2 && packet.payload[i] != SUBSCRIBE_FAILURE {
+                    return err(malformed())
+                }
+            }
+            packet.return_code = packet.payload[0]
+        }
+        return ok(packet)
+    }
+    if packet.kind == PacketKind.Connect {
+        packet.payload = body
+        return ok(packet)
+    }
+    // PINGREQ, PINGRESP and DISCONNECT have no body.
+    if body.len != 0 {
+        return err(malformed())
+    }
+    return ok(packet)
+}
+
+fn quality(level: u8) -> QoS {
+    if level == 1 {
+        return QoS.AtLeastOnce
+    }
+    if level == 2 {
+        return QoS.ExactlyOnce
+    }
+    return QoS.AtMostOnce
+}
+fn take_byte(data: &[u8], offset: &mut usize) -> u8!Error {
+    if *offset >= data.len {
+        return err(malformed())
+    }
+    value := data[*offset]
+    *offset += 1
+    return ok(value)
+}
+fn take_short(data: &[u8], offset: &mut usize) -> u16!Error {
+    if data.len - *offset < 2 || *offset > data.len {
+        return err(malformed())
+    }
+    value := read_short(data, *offset)
+    *offset += 2
+    return ok(value)
+}
+fn take_string(data: &[u8], offset: &mut usize) -> &[u8]!Error from(data) {
+    length := take_short(data, offset)? as usize
+    start := *offset
+    if length > data.len - start {
+        return err(malformed())
+    }
+    *offset = start + length
+    return ok(&data[start..start + length])
+}
+// The CONNECT body (Packet.payload) as a client sent it. A protocol name or
+// level other than MQTT 3.1.1 fails with Protocol and the level as code, so a
+// server can answer UNACCEPTABLE_PROTOCOL.
+pub fn decode_connect(body: &[u8]) -> Connect!Error from(body) {
+    offset := 0usize
+    name := take_string(body, &mut offset)?
+    level := take_byte(body, &mut offset)?
+    if !bytes.equal(name, b"MQTT") || level != 4 {
+        return err(failure(ErrorKind.Protocol, level as i32))
+    }
+    flags := take_byte(body, &mut offset)?
+    keep_alive := take_short(body, &mut offset)?
+    client_id := take_string(body, &mut offset)?
+    will := (flags & 4) != 0
+    will_level := (flags >> 3) & 3
+    if (flags & 1) != 0 || will_level == 3 || (!will && (will_level != 0 || (flags & 32) != 0)) ||
+        ((flags & 64) != 0 && (flags & 128) == 0) || !valid_string(client_id) {
+        return err(malformed())
+    }
+    connect := Connect.new(client_id)
+    connect.keep_alive_s = keep_alive
+    connect.clean_session = (flags & 2) != 0
+    if will {
+        connect.will_topic = take_string(body, &mut offset)?
+        connect.will_payload = take_string(body, &mut offset)?
+        connect.will_qos = quality(will_level)
+        connect.will_retain = (flags & 32) != 0
+        if !valid_topic(connect.will_topic) {
+            return err(failure(ErrorKind.InvalidTopic, 0))
+        }
+    }
+    if (flags & 128) != 0 {
+        connect.username = take_string(body, &mut offset)?
+        if !valid_string(connect.username) {
+            return err(malformed())
+        }
+    }
+    if (flags & 64) != 0 {
+        connect.password = take_string(body, &mut offset)?
+    }
+    if offset != body.len {
+        return err(malformed())
+    }
+    return ok(connect)
+}
+// One filter of a SUBSCRIBE or UNSUBSCRIBE payload (Packet.payload). next is
+// the offset of the following entry; it equals payload.len after the last.
+// Filters are not validated, so a server can refuse them one by one.
+pub struct Entry {
+    pub filter: &[u8]
+    pub qos: u8
+    pub next: usize
+}
+pub fn subscribe_entry(payload: &[u8], offset: usize) -> Entry!Error from(payload) {
+    at := offset
+    filter := take_string(payload, &mut at)?
+    qos := take_byte(payload, &mut at)?
+    if qos > 2 {
+        return err(malformed())
+    }
+    return ok(Entry { filter: filter, qos: qos, next: at })
+}
+pub fn unsubscribe_entry(payload: &[u8], offset: usize) -> Entry!Error from(payload) {
+    at := offset
+    filter := take_string(payload, &mut at)?
+    return ok(Entry { filter: filter, qos: 0, next: at })
+}
+
+// The level at index of a topic, counting from 0, or empty if the topic has
+// fewer levels: topic_level(b"home/kitchen/light", 1) is b"kitchen".
+pub fn topic_level(topic: &[u8], index: usize) -> &[u8] from(topic) {
+    start := 0usize
+    for i in 0usize..index {
+        start = level_end(topic, start) + 1
+        if start > topic.len {
+            return &topic[topic.len..]
+        }
+    }
+    return &topic[start..level_end(topic, start)]
+}
+// An application message, as handlers receive it.
+pub struct Message {
+    pub topic: &[u8]
+    pub payload: &[u8]
+    pub qos: QoS
+    pub retain: bool
+    pub duplicate: bool
+    pub fn new(topic: &[u8], payload: &[u8]) -> Message from(topic, payload) {
+        return Message { topic: topic, payload: payload, qos: QoS.AtMostOnce, retain: false, duplicate: false }
+    }
+    // See topic_level: message.level(1) of home/kitchen/light is b"kitchen".
+    pub fn level(&self, index: usize) -> &[u8] from(self) {
+        return topic_level(self.topic, index)
+    }
+    pub fn matches(&self, filter: &[u8]) -> bool {
+        return matches(filter, self.topic)
+    }
+}
+fn record_next(data: &[u8], cursor: &mut usize) -> Option<Message> from(data) {
+    at := *cursor
+    if at + 7 > data.len {
+        return none
+    }
+    flags := data[at]
+    topic_len := read_short(data, at + 1) as usize
+    payload_len := ((data[at + 3] as usize) << 24) | ((data[at + 4] as usize) << 16) |
+        ((data[at + 5] as usize) << 8) | (data[at + 6] as usize)
+    start := at + 7
+    *cursor = start + topic_len + payload_len
+    return some(Message { topic: &data[start..start + topic_len], payload: &data[start + topic_len..*cursor],
+    qos: quality(flags & 3), retain: (flags & 4) != 0, duplicate: false })
+}
+// Messages a handler publishes. The app or broker sends them after the
+// handler returns, in order. Storage is bounded; a full outbox fails with
+// BufferFull and keeps the messages queued before it.
+pub struct Outbox {
+    data: &mut[u8]
+    used: usize
+    count: usize
+    pub fn new(data: &mut[u8]) -> Outbox from(data) {
+        return Outbox { data: data, used: 0, count: 0 }
+    }
+    pub fn publish(&mut self, topic: &[u8], payload: &[u8]) -> void!Error {
+        return self.publish_with(topic, payload, QoS.AtMostOnce, false)
+    }
+    pub fn publish_with(&mut self, topic: &[u8], payload: &[u8], qos: QoS, retain: bool) -> void!Error {
+        if !valid_topic(topic) {
+            return err(failure(ErrorKind.InvalidTopic, 0))
+        }
+        if payload.len > MAX_REMAINING {
+            return err(failure(ErrorKind.PacketTooLarge, 0))
+        }
+        if 7 + topic.len + payload.len > self.data.len - self.used {
+            return err(failure(ErrorKind.BufferFull, 0))
+        }
+        flags := qos_level(&qos)
+        if retain {
+            flags = flags | 4
+        }
+        at := self.used
+        self.data[at] = flags
+        self.data[at + 1] = (topic.len >> 8) as u8
+        self.data[at + 2] = (topic.len & 255) as u8
+        self.data[at + 3] = (payload.len >> 24) as u8
+        self.data[at + 4] = ((payload.len >> 16) & 255) as u8
+        self.data[at + 5] = ((payload.len >> 8) & 255) as u8
+        self.data[at + 6] = (payload.len & 255) as u8
+        at += 7
+        for i in 0usize..topic.len {
+            self.data[at + i] = topic[i]
+        }
+        at += topic.len
+        for i in 0usize..payload.len {
+            self.data[at + i] = payload[i]
+        }
+        self.used = at + payload.len
+        self.count += 1
+        return ok()
+    }
+    pub fn len(&self) -> usize {
+        return self.count
+    }
+    // Start with cursor := 0usize and call until it returns none.
+    pub fn next(&self, cursor: &mut usize) -> Option<Message> from(self) {
+        return record_next(&self.data[..self.used], cursor)
+    }
+    pub fn clear(&mut self) {
+        self.used = 0
+        self.count = 0
+    }
+}
+
+// Ready-made handlers. reply publishes a fixed payload to a fixed topic for
+// every matching message; forward republishes each payload to another topic.
+pub struct Reply {
+    topic: &[u8]
+    payload: &[u8]
+    pub fn handle(&mut self, message: &Message, outbox: &mut Outbox) -> void!Error {
+        return outbox.publish(self.topic, self.payload)
+    }
+}
+pub fn reply(topic: &[u8], payload: &[u8]) -> Reply from(topic, payload) {
+    return Reply { topic: topic, payload: payload }
+}
+pub struct Forward {
+    topic: &[u8]
+    pub fn handle(&mut self, message: &Message, outbox: &mut Outbox) -> void!Error {
+        return outbox.publish(self.topic, message.payload)
+    }
+}
+pub fn forward(topic: &[u8]) -> Forward from(topic) {
+    return Forward { topic: topic }
+}
+
+// What dispatching one message did: matching handlers run and failures.
+pub struct Dispatch {
+    pub handled: usize
+    pub failed: usize
+    pub failure: Option<Error>
+    pub fn new() -> Dispatch {
+        return Dispatch { handled: 0, failed: 0, failure: none }
+    }
+}
+// Topic routes used by std/mqtt/app and std/mqtt/broker. Each registration
+// wraps the previous chain, so handlers keep their own types and state with
+// no allocation. Every handler whose filter matches runs, in registration order.
+pub struct NoRoutes {
+    pub fn dispatch(&mut self, message: &Message, outbox: &mut Outbox, outcome: &mut Dispatch) {}
+    pub fn len(&self) -> usize {
+        return 0
+    }
+    pub fn filter(&self, index: usize) -> &[u8] from(self) {
+        return b""
+    }
+}
+pub struct Routes<A, H> {
+    previous: A
+    current: H
+    pattern: &[u8]
+    index: usize
+    pub fn dispatch(&mut self, message: &Message, outbox: &mut Outbox, outcome: &mut Dispatch) {
+        self.previous.dispatch(message, outbox, outcome)
+        if matches(self.pattern, message.topic) {
+            outcome.handled += 1
+            match self.current.handle(message, outbox) {
+                ok() => {}
+                err(reason) => {
+                    outcome.failed += 1
+                    outcome.failure = some(reason)
+                }
+            }
+        }
+    }
+    pub fn len(&self) -> usize {
+        return self.index + 1
+    }
+    pub fn filter(&self, index: usize) -> &[u8] from(self) {
+        if index == self.index {
+            return self.pattern
+        }
+        return self.previous.filter(index)
+    }
+}
+pub fn route<A, H>(previous: A, filter: &[u8], handler: H) -> Routes<A, H> from(previous, filter, handler) {
+    index := previous.len()
+    return Routes { previous: previous, current: handler, pattern: filter, index: index }
+}
+// The first invalid registration, kept by fluent builders until build/run:
+// an invalid filter, or (kind InvalidInput) a zero task interval.
+pub struct RegistrationError {
+    pub kind: ErrorKind
+    pub filter: &[u8]
+    pub index: usize
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        if self.kind != ErrorKind.InvalidFilter {
+            output.string("mqtt task #")?
+            output.natural((self.index + 1) as u64)?
+            return output.string(": every() needs an interval of at least 1 millisecond")
+        }
+        output.string("mqtt route #")?
+        output.natural((self.index + 1) as u64)?
+        output.string(" (")?
+        output.bytes(self.filter)?
+        output.string("): InvalidFilter; use levels separated by /, + for one whole level, or # as the last level")?
+        return ok()
+    }
+}
+pub fn check_filter(filter: &[u8], index: usize) -> Option<RegistrationError> from(filter) {
+    if valid_filter(filter) {
+        return none
+    }
+    return some(RegistrationError { kind: ErrorKind.InvalidFilter, filter: filter, index: index })
+}
+// One error boundary for fluent setup and serving, as returned by
+// app and broker serve calls.
+pub struct RunError {
+    pub registration: Option<RegistrationError>
+    pub serving: Option<Error>
+    pub fn format<F>(&self, output: &mut F) -> void!io.Error {
+        match &self.registration {
+            some(reason) => {
+                return reason.format(output)
+            }
+            none => {}
+        }
+        match &self.serving {
+            some(reason) => {
+                return reason.format(output)
+            }
+            none => {
+                return output.string("mqtt: unknown startup failure")
+            }
+        }
+    }
+}
+
+// In-process test result: what the matching handlers did with one message.
+// Published messages are copied, so a Delivery outlives the app or broker.
+pub const DELIVERY_BYTES: usize = 1024
+pub struct Delivery {
+    data: [1024]u8
+    used: usize
+    count: usize
+    pub handled: usize
+    pub failure: Option<Error>
+    pub fn len(&self) -> usize {
+        return self.count
+    }
+    pub fn published(&self, index: usize) -> Option<Message> from(self) {
+        cursor := 0usize
+        for i in 0usize..index {
+            match record_next(&self.data[..self.used], &mut cursor) {
+                some(_) => {}
+                none => {
+                    return none
+                }
+            }
+        }
+        return record_next(&self.data[..self.used], &mut cursor)
+    }
+    pub fn contains(&self, topic: &[u8], payload: &[u8]) -> bool {
+        cursor := 0usize
+        for true {
+            match record_next(&self.data[..self.used], &mut cursor) {
+                some(message) => {
+                    if bytes.equal(message.topic, topic) && bytes.equal(message.payload, payload) {
+                        return true
+                    }
+                }
+                none => {
+                    return false
+                }
+            }
+        }
+        return false
+    }
+    pub fn expect_handled(self, expected: usize) -> Delivery {
+        assert_eq(self.handled, expected, "unexpected number of matching handlers")
+        return self
+    }
+    pub fn expect_ok(self) -> Delivery {
+        failed := false
+        match &self.failure {
+            some(_) => {
+                failed = true
+            }
+            none => {}
+        }
+        assert(!failed, "a handler returned an error")
+        return self
+    }
+    pub fn expect_failure(self) -> Delivery {
+        failed := false
+        match &self.failure {
+            some(_) => {
+                failed = true
+            }
+            none => {}
+        }
+        assert(failed, "expected a handler to return an error")
+        return self
+    }
+    pub fn expect_published(self, expected: usize) -> Delivery {
+        assert_eq(self.count, expected, "unexpected number of published messages")
+        return self
+    }
+    pub fn expect_publish(self, topic: &[u8], payload: &[u8]) -> Delivery {
+        assert(self.contains(topic, payload), "no published message has this topic and payload")
+        return self
+    }
+}
+// Runs runner.dispatch(message, outbox, outcome) and records the result.
+// App and broker test helpers use this; most programs call those instead.
+pub fn capture<R>(runner: &mut R, message: &Message) -> Delivery {
+    delivery := Delivery { data: [0u8; DELIVERY_BYTES], used: 0, count: 0, handled: 0, failure: none }
+    outcome := Dispatch.new()
+    outbox := Outbox.new(&mut delivery.data)
+    runner.dispatch(message, &mut outbox, &mut outcome)
+    used := outbox.used
+    count := outbox.count
+    core.drop(outbox)
+    let Dispatch { handled: handled, failed: _, failure: failure } = outcome
+    delivery.used = used
+    delivery.count = count
+    delivery.handled = handled
+    delivery.failure = failure
+    return delivery
+}

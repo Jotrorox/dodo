@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- MQTT 3.1.1 packages for both ends of a publish/subscribe system, in the
+  style of the web packages. `std/mqtt/broker` runs a broker in one line,
+  `broker.new().run(b"0.0.0.0:1883")`. It serves 16 clients from one thread
+  with QoS 0 to 2, wildcards, retained messages, wills, keep-alive and session
+  takeover. `.password(user, pass)` or `.authenticate(value)` controls who may
+  connect, and `.on(filter, handler)` handlers see every published message.
+  `std/mqtt/app` is a long-running client:
+  `app.new(id).on(filter, handler).every(ms, task).status(topic).run(url)`
+  subscribes, calls each matching handler with the message and an outbox for
+  replies, runs timers, keeps a retained online/offline status, and
+  reconnects with backoff. Both builders check filters before connecting.
+  Their `build()` results test handlers and tasks in process with
+  `deliver`/`publish`/`tick` and chainable `mqtt.Delivery` assertions.
+  `std/mqtt/hosted` is the step-by-step blocking client underneath
+  (`connect`, `publish_with`, `subscribe`, `receive`, `poll`). `std/mqtt`
+  holds the shared `Message`, `Outbox`, `reply`/`forward` handlers, packet
+  encoders and decoders for both sides, and topic matching, and stays
+  portable to WebAssembly and bare-metal targets. Spec-derived packet vectors,
+  a scripted loopback broker, raw-socket checks of the Dodo broker, and an app
+  talking to it check everything at `-O0` and `-O3`. TLS (`mqtts://`) and
+  MQTT 5 are not supported yet.
 - QUIC connections and streams, through OpenSSL 3.5's QUIC stack:
   `std/quic/openssl` binds a `Listener` on a UDP socket and connects a
   verified `Connection` to it, each opening and accepting bidirectional and
