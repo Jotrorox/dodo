@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Antialiased drawing, gradients and TrueType text for `std/graphics`, still
+  integer-only, allocation-free and identical on every target, firmware
+  included. The `aa_` canvas calls draw lines, thick round-capped lines,
+  circles, ellipses, rounded rectangles and polygons with exact
+  per-pixel coverage, composited over the canvas; axis-aligned ones match
+  their integer counterparts pixel for pixel. `graphics.Path` stores move,
+  line, quadratic and cubic commands in caller-owned words, and any type
+  with a `trace(&self, pen)` method is a `graphics.Outline` drawn without
+  storage, filled by the nonzero or even-odd rule. `graphics.Gradient` paints
+  linear and radial gradients with up to eight stops, premultiplied
+  interpolation, pad/repeat/reflect spreads and optional ordered dithering
+  for RGB565 and monochrome panels. `std/graphics/truetype` reads `.ttf` and
+  `.ttc` fonts in place and draws them at any size with kerning and subpixel
+  positioning, decoding glyph outlines straight from the font data (simple
+  and composite glyphs, cmap formats 0, 4, 6 and 12). Coverage, symmetry,
+  band rendering and hostile-font fuzzing are checked at `-O0` and `-O3`, and
+  for WebAssembly and Cortex-M0+; new golden images cover the antialiased
+  shapes, gradients and text from generated test fonts.
+- `std/graphics/image` reads and writes PNG. The decoder handles every color
+  type and bit depth (1 to 16 bits), palettes, `tRNS` transparency and Adam7
+  interlacing, checks every chunk CRC and the zlib checksum, and ignores
+  gamma and color profiles. `decode_png` and `draw_png` take caller scratch
+  of `png_scratch_size` bytes; `decode` and `draw` use 16 KiB of stack.
+  `encode_png` writes uncompressed 8-bit RGBA of exactly `png_size` bytes,
+  and `encode_png_compressed` adds per-row adaptive filters and deflate with
+  caller storage. `examples/poster.dodo` draws a poster with a TrueType font
+  and saves it as a PNG.
+- Fixed: the deflate encoder wrote wrong codes for literal bytes 144 to 255
+  in fixed-Huffman blocks, corrupting small compressed outputs that contained
+  such bytes.
 - `std/window` opens a desktop window whose drawing area is a
   `std/graphics` canvas, using only what each system ships: the X11
   protocol spoken directly over the display socket on Linux (libc only, no

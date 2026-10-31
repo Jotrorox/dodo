@@ -438,6 +438,11 @@ fn ceil_div(value: i64, divisor: i64) -> i64 {
     return -floor_div(-value, divisor)
 }
 
+// value / divisor rounded to the nearest integer, halves up.
+fn round_div(value: i64, divisor: i64) -> i64 {
+    return floor_div(2 * value + divisor, 2 * divisor)
+}
+
 // Half the width of row `dy` of a disk of radius r centred on a pixel: the
 // largest w with w^2 + dy^2 <= r^2 + r, that is, the pixel centres within
 // r + 1/2. Requires dy <= r.
@@ -1512,6 +1517,192 @@ pub struct Canvas {
         }
     }
 
+    // -- Antialiased and gradient drawing ---------------------------------
+    //
+    // These calls composite over the existing pixels: each pixel is blended
+    // with the color by the fraction of it the shape covers, times the
+    // color's alpha. Coordinates follow the integer primitives: shapes given
+    // by pixel centres (lines, circles, ellipses) cover the same pixels as
+    // their integer counterparts, with partial coverage at the edges.
+
+    // Fill `outline` by `rule` with `color`.
+    pub fn fill_outline<O: Outline>(&mut self, outline: &O, rule: FillRule, color: Color) {
+        unused := Gradient.linear(0, 0, 0, 0, color, color)
+        self.rasterize(outline, rule, color, &unused, false)
+    }
+    // Fill a stored path by `rule` with `color`.
+    pub fn fill_path(&mut self, path: &Path, rule: FillRule, color: Color) {
+        self.fill_outline(path, rule, color)
+    }
+    // Fill `outline` by `rule` with a gradient.
+    pub fn gradient_outline<O: Outline>(&mut self, outline: &O, rule: FillRule, gradient: &Gradient) {
+        self.rasterize(outline, rule, 0, gradient, true)
+    }
+    pub fn gradient_path(&mut self, path: &Path, rule: FillRule, gradient: &Gradient) {
+        self.gradient_outline(path, rule, gradient)
+    }
+    // Fill a width x height rectangle with a gradient.
+    pub fn gradient_rect(&mut self, x: i32, y: i32, width: u32, height: u32, gradient: &Gradient) {
+        t := max64(y as i64, self.clip_top)
+        b := min64(y as i64 + height as i64, self.clip_bottom)
+        l := max64(x as i64, self.clip_left)
+        r := min64(x as i64 + width as i64, self.clip_right)
+        if l >= r || t >= b {
+            return
+        }
+        for row in t..b {
+            for column in l..r {
+                paint := gradient.shade(column, row, &self.format)
+                self.paint_pixel(column, row, paint, 255)
+            }
+        }
+        self.touch(l, t, r, b)
+    }
+    // A one pixel wide line between the centres of pixels (x0, y0) and
+    // (x1, y1), with square ends reaching the outer edges of both pixels.
+    // Horizontal and vertical lines cover exactly the pixels line() draws.
+    pub fn aa_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
+        shape := StrokeShape { x0: centre(x0), y0: centre(y0), x1: centre(x1), y1: centre(y1), half: 128, round: false }
+        self.fill_outline(&shape, FillRule.NonZero, color)
+    }
+    // A line `width` pixels wide between the centres of pixels (x0, y0) and
+    // (x1, y1), with round ends centred on them.
+    pub fn aa_thick_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, width: u32, color: Color) {
+        if width == 0 {
+            return
+        }
+        half := min64(width as i64, AA_PIXEL_LIMIT) * 128
+        shape := StrokeShape { x0: centre(x0), y0: centre(y0), x1: centre(x1), y1: centre(y1), half: half, round: true }
+        self.fill_outline(&shape, FillRule.NonZero, color)
+    }
+    // A disk of radius + 1/2 pixels around the centre of pixel (cx, cy),
+    // the area fill_circle approximates with whole pixels.
+    pub fn aa_fill_circle(&mut self, cx: i32, cy: i32, radius: u32, color: Color) {
+        self.aa_fill_ellipse(cx, cy, radius, radius, color)
+    }
+    // The one pixel wide ring between radius - 1/2 and radius + 1/2, the
+    // area circle() approximates.
+    pub fn aa_circle(&mut self, cx: i32, cy: i32, radius: u32, color: Color) {
+        self.aa_ellipse(cx, cy, radius, radius, color)
+    }
+    pub fn aa_fill_ellipse(&mut self, cx: i32, cy: i32, rx: u32, ry: u32, color: Color) {
+        shape := EllipseShape { cx: centre(cx), cy: centre(cy), rx: aa_radius(rx), ry: aa_radius(ry), inner_rx: 0, inner_ry: 0, ring: false }
+        self.fill_outline(&shape, FillRule.NonZero, color)
+    }
+    pub fn aa_ellipse(&mut self, cx: i32, cy: i32, rx: u32, ry: u32, color: Color) {
+        outer_x := aa_radius(rx)
+        outer_y := aa_radius(ry)
+        shape := EllipseShape { cx: centre(cx), cy: centre(cy), rx: outer_x, ry: outer_y, inner_rx: outer_x - 256, inner_ry: outer_y - 256, ring: true }
+        self.fill_outline(&shape, FillRule.NonZero, color)
+    }
+    // A width x height rectangle with exactly round corners of `radius`
+    // pixels, limited to half the shorter side.
+    pub fn aa_fill_round_rect(&mut self, x: i32, y: i32, width: u32, height: u32, radius: u32, color: Color) {
+        left := corner(x)
+        top := corner(y)
+        shape := RoundRectShape { left: left, top: top, right: left + min64(width as i64, AA_PIXEL_LIMIT) * 256, bottom: top + min64(height as i64, AA_PIXEL_LIMIT) * 256, radius: min64(radius as i64, AA_PIXEL_LIMIT) * 256, inset: 256, ring: false }
+        self.fill_outline(&shape, FillRule.NonZero, color)
+    }
+    // The one pixel wide outline along the inside of aa_fill_round_rect.
+    pub fn aa_round_rect(&mut self, x: i32, y: i32, width: u32, height: u32, radius: u32, color: Color) {
+        left := corner(x)
+        top := corner(y)
+        shape := RoundRectShape { left: left, top: top, right: left + min64(width as i64, AA_PIXEL_LIMIT) * 256, bottom: top + min64(height as i64, AA_PIXEL_LIMIT) * 256, radius: min64(radius as i64, AA_PIXEL_LIMIT) * 256, inset: 256, ring: true }
+        self.fill_outline(&shape, FillRule.NonZero, color)
+    }
+    // The polygon through `coordinates` (x, y pairs of pixel corners, as for
+    // fill_polygon), filled by the even-odd rule. Vertices are clamped to
+    // +/-2^21. Needs at least three vertices.
+    pub fn aa_fill_polygon(&mut self, coordinates: &[i32], color: Color) {
+        if coordinates.len / 2 < 3 {
+            return
+        }
+        shape := PolygonShape { coordinates: coordinates }
+        self.fill_outline(&shape, FillRule.EvenOdd, color)
+    }
+    // Composite `color`, with its alpha scaled by coverage (0 to 255), over
+    // the in-bounds pixel (x, y).
+    fn paint_pixel(&mut self, x: i64, y: i64, color: Color, coverage: u32) {
+        a := div255((color >> 24) * coverage)
+        if a == 0 {
+            return
+        }
+        if a == 255 {
+            opaque := encode(&self.format, color)
+            self.put(x, y, opaque)
+            return
+        }
+        below := self.get(x, y)
+        blended := encode(&self.format, over(with_alpha(color, a as u8), below))
+        self.put(x, y, blended)
+    }
+    fn rasterize<O: Outline>(&mut self, outline: &O, rule: FillRule, color: Color, gradient: &Gradient, shaded: bool) {
+        even_odd := false
+        match rule {
+            FillRule.NonZero => {}
+            FillRule.EvenOdd => {
+                even_odd = true
+            }
+        }
+        pen := Pen.new()
+        outline.trace(&mut pen)
+        pen.close()
+        if !pen.any {
+            return
+        }
+        top := max64(floor_div(pen.min_y, 256), self.clip_top)
+        bottom := min64(ceil_div(pen.max_y, 256), self.clip_bottom)
+        left := max64(floor_div(pen.min_x, 256), self.clip_left)
+        right := min64(ceil_div(pen.max_x, 256), self.clip_right)
+        if left >= right || top >= bottom {
+            return
+        }
+        opaque := !shaded && (color >> 24) == 255
+        packed := encode(&self.format, color)
+        for row in top..bottom {
+            start := left
+            for start < right {
+                end := min64(start + CHUNK as i64, right)
+                pen.begin(row, start, end)
+                outline.trace(&mut pen)
+                pen.close()
+                // Resolve the pass: running sums of the cells are coverage.
+                sum := pen.carry
+                written_left := end
+                written_right := start
+                for column in start..end {
+                    index := (column - start) as usize
+                    sum += pen.cells[index]
+                    pen.cells[index] = 0
+                    coverage := abs64(sum)
+                    if even_odd {
+                        coverage = coverage % (2 * FULL)
+                        if coverage > FULL {
+                            coverage = 2 * FULL - coverage
+                        }
+                    } else if coverage > FULL {
+                        coverage = FULL
+                    }
+                    level := ((coverage * 255 + 32768) >> 16) as u32
+                    if level > 0 {
+                        if level == 255 && opaque {
+                            self.put(column, row, packed)
+                        } else if shaded {
+                            paint := gradient.shade(column, row, &self.format)
+                            self.paint_pixel(column, row, paint, level)
+                        } else {
+                            self.paint_pixel(column, row, color, level)
+                        }
+                        written_left = min64(written_left, column)
+                        written_right = max64(written_right, column + 1)
+                    }
+                }
+                self.touch(written_left, row, written_right, row + 1)
+                start = end
+            }
+        }
+    }
+
     // -- Comparison --------------------------------------------------------
 
     // True when both canvases have the same size and every pixel decodes to
@@ -1699,4 +1890,1045 @@ pub struct Bands {
     pub fn restart(&mut self) {
         self.next_y = 0
     }
+}
+
+// ---------------------------------------------------------------------------
+// Antialiased vector drawing
+//
+// Paths, outlines and the aa_* canvas methods are rasterized with exact
+// coverage: each pixel's alpha is the area of the pixel the shape covers,
+// computed in integers from the shape's edges at 1/256 pixel precision.
+// Curves are flattened to within 1/32 pixel. Antialiased and gradient drawing
+// composites over the existing pixels (source-over), unlike the integer
+// primitives above, which store their color.
+
+// Path, Pen and Outline coordinates are fixed point with SUBPIXEL units to
+// the pixel: 256 is one pixel, 128 half a pixel. The pixel (x, y) covers
+// x * 256 .. (x + 1) * 256 horizontally, so its centre is x * 256 + 128.
+pub const SUBPIXEL: i32 = 256
+
+// Path coordinates are clamped to +/-2^29 subpixels (+/-2^21 pixels).
+const PATH_LIMIT: i64 = 536870912
+const AA_PIXEL_LIMIT: i64 = 2097152
+// Columns rasterized per pass; a wider shape takes several passes per row.
+const CHUNK: usize = 256
+// Coverage of a whole pixel in the accumulation buffer.
+const FULL: i64 = 65536
+// Largest distance between a curve and its flattened chords, in subpixels.
+const FLATNESS: i64 = 8
+const CURVE_STEPS: i64 = 256
+
+// Which parts of a self-overlapping outline are inside.
+pub enum FillRule {
+    // Inside where the outline winds around a point at least once in either
+    // direction; overlapping contours merge. TrueType glyphs use this rule.
+    NonZero,
+    // Inside where a ray from the point crosses the outline an odd number of
+    // times, so a contour inside another cuts a hole whatever its direction.
+    EvenOdd
+}
+
+// A shape that can describe itself to a Pen. The rasterizer calls trace
+// several times per drawing call, once to find the bounds and then once per
+// row band, so trace must describe the same outline every time. Implement it
+// to draw procedural shapes without storing them; a Path stores commands for
+// shapes built up front.
+pub interface Outline {
+    fn trace(&self, pen: &mut Pen)
+}
+
+// Receives an outline as move, line, curve and close commands in subpixel
+// coordinates. Contours close themselves: move_to and the end of a trace
+// close an open contour with a straight line to its start.
+pub struct Pen {
+    measuring: bool
+    any: bool
+    min_x: i64
+    min_y: i64
+    max_x: i64
+    max_y: i64
+    row_top: i64
+    row_bottom: i64
+    column_start: i64
+    column_end: i64
+    carry: i64
+    cells: [256]i64
+    start_x: i64
+    start_y: i64
+    x: i64
+    y: i64
+    open: bool
+
+    fn new() -> Pen {
+        return Pen { measuring: true, any: false, min_x: 0, min_y: 0, max_x: 0, max_y: 0, row_top: 0, row_bottom: 0, column_start: 0, column_end: 0, carry: 0, cells: [0i64; 256], start_x: 0, start_y: 0, x: 0, y: 0, open: false }
+    }
+    // Rasterize the pixel row `row`, columns start..end, on the next trace.
+    fn begin(&mut self, row: i64, start: i64, end: i64) {
+        self.measuring = false
+        self.row_top = row * 256
+        self.row_bottom = row * 256 + 256
+        self.column_start = start
+        self.column_end = end
+        self.carry = 0
+        self.start_x = 0
+        self.start_y = 0
+        self.x = 0
+        self.y = 0
+        self.open = false
+    }
+
+    // Start a new contour at (x, y), closing the current one.
+    pub fn move_to(&mut self, x: i32, y: i32) {
+        self.close()
+        px := path_coordinate(x)
+        py := path_coordinate(y)
+        self.start_x = px
+        self.start_y = py
+        self.x = px
+        self.y = py
+        self.open = true
+        self.include(px, py)
+    }
+    // A straight edge from the current point to (x, y). Without a preceding
+    // move_to, the contour starts at the current point, initially (0, 0).
+    pub fn line_to(&mut self, x: i32, y: i32) {
+        self.ensure_open()
+        px := path_coordinate(x)
+        py := path_coordinate(y)
+        x0 := self.x
+        y0 := self.y
+        self.segment(x0, y0, px, py)
+        self.x = px
+        self.y = py
+    }
+    // A quadratic Bezier curve through control point (cx, cy) to (x, y).
+    pub fn quad_to(&mut self, cx: i32, cy: i32, x: i32, y: i32) {
+        self.ensure_open()
+        x0 := self.x
+        y0 := self.y
+        x1 := path_coordinate(cx)
+        y1 := path_coordinate(cy)
+        x2 := path_coordinate(x)
+        y2 := path_coordinate(y)
+        self.x = x2
+        self.y = y2
+        if self.measuring {
+            self.include(x1, y1)
+            self.include(x2, y2)
+            return
+        }
+        low_y := min64(y0, min64(y1, y2))
+        high_y := max64(y0, max64(y1, y2))
+        low_x := min64(x0, min64(x1, x2))
+        high_x := max64(x0, max64(x1, x2))
+        if self.outside(low_x, high_x, low_y, high_y, y0, y2) {
+            return
+        }
+        bend := abs64(x0 - 2 * x1 + x2) + abs64(y0 - 2 * y1 + y2)
+        n := curve_steps(bend, 4 * FLATNESS)
+        square := n * n
+        px := x0
+        py := y0
+        for i in 1i64..n + 1 {
+            s := n - i
+            qx := round_div(x0 * s * s + 2 * x1 * s * i + x2 * i * i, square)
+            qy := round_div(y0 * s * s + 2 * y1 * s * i + y2 * i * i, square)
+            self.segment(px, py, qx, qy)
+            px = qx
+            py = qy
+        }
+    }
+    // A cubic Bezier curve through control points (c1x, c1y) and (c2x, c2y)
+    // to (x, y).
+    pub fn cubic_to(&mut self, c1x: i32, c1y: i32, c2x: i32, c2y: i32, x: i32, y: i32) {
+        self.ensure_open()
+        x0 := self.x
+        y0 := self.y
+        x1 := path_coordinate(c1x)
+        y1 := path_coordinate(c1y)
+        x2 := path_coordinate(c2x)
+        y2 := path_coordinate(c2y)
+        x3 := path_coordinate(x)
+        y3 := path_coordinate(y)
+        self.x = x3
+        self.y = y3
+        if self.measuring {
+            self.include(x1, y1)
+            self.include(x2, y2)
+            self.include(x3, y3)
+            return
+        }
+        low_y := min64(min64(y0, y1), min64(y2, y3))
+        high_y := max64(max64(y0, y1), max64(y2, y3))
+        low_x := min64(min64(x0, x1), min64(x2, x3))
+        high_x := max64(max64(x0, x1), max64(x2, x3))
+        if self.outside(low_x, high_x, low_y, high_y, y0, y3) {
+            return
+        }
+        bend := max64(abs64(x0 - 2 * x1 + x2) + abs64(y0 - 2 * y1 + y2), abs64(x1 - 2 * x2 + x3) + abs64(y1 - 2 * y2 + y3))
+        n := curve_steps(3 * bend, 4 * FLATNESS)
+        cube := n * n * n
+        px := x0
+        py := y0
+        for i in 1i64..n + 1 {
+            s := n - i
+            a := s * s * s
+            b := 3 * s * s * i
+            c := 3 * s * i * i
+            d := i * i * i
+            qx := round_div(x0 * a + x1 * b + x2 * c + x3 * d, cube)
+            qy := round_div(y0 * a + y1 * b + y2 * c + y3 * d, cube)
+            self.segment(px, py, qx, qy)
+            px = qx
+            py = qy
+        }
+    }
+    // Close the current contour with a straight edge back to its start.
+    pub fn close(&mut self) {
+        if !self.open {
+            return
+        }
+        self.open = false
+        x0 := self.x
+        y0 := self.y
+        sx := self.start_x
+        sy := self.start_y
+        self.segment(x0, y0, sx, sy)
+        self.x = sx
+        self.y = sy
+    }
+
+    fn ensure_open(&mut self) {
+        if !self.open {
+            self.start_x = self.x
+            self.start_y = self.y
+            self.open = true
+            px := self.x
+            py := self.y
+            self.include(px, py)
+        }
+    }
+    fn include(&mut self, x: i64, y: i64) {
+        if !self.measuring {
+            return
+        }
+        if !self.any {
+            self.any = true
+            self.min_x = x
+            self.max_x = x
+            self.min_y = y
+            self.max_y = y
+            return
+        }
+        self.min_x = min64(self.min_x, x)
+        self.max_x = max64(self.max_x, x)
+        self.min_y = min64(self.min_y, y)
+        self.max_y = max64(self.max_y, y)
+    }
+    // True when a curve with this control hull contributes nothing to the
+    // current pass except, when it lies left of the pass, its winding.
+    fn outside(&mut self, low_x: i64, high_x: i64, low_y: i64, high_y: i64, first_y: i64, last_y: i64) -> bool {
+        if high_y <= self.row_top || low_y >= self.row_bottom || low_x >= self.column_end * 256 {
+            return true
+        }
+        if high_x <= (self.column_start - 1) * 256 {
+            top := self.row_top
+            bottom := self.row_bottom
+            self.carry += 256 * (clamp64(last_y, top, bottom) - clamp64(first_y, top, bottom))
+            return true
+        }
+        return false
+    }
+    // Add the coverage of one straight edge to the current pass.
+    fn segment(&mut self, x0: i64, y0: i64, x1: i64, y1: i64) {
+        if self.measuring {
+            self.include(x0, y0)
+            self.include(x1, y1)
+            return
+        }
+        if y0 == y1 {
+            return
+        }
+        tx := x0
+        ty := y0
+        bx := x1
+        by := y1
+        if y0 > y1 {
+            tx = x1
+            ty = y1
+            bx = x0
+            by = y0
+        }
+        top := self.row_top
+        bottom := self.row_bottom
+        if by <= top || ty >= bottom {
+            return
+        }
+        ya := max64(ty, top)
+        yb := min64(by, bottom)
+        span := by - ty
+        xa := tx + round_div((bx - tx) * (ya - ty), span)
+        xb := tx + round_div((bx - tx) * (yb - ty), span)
+        d := yb - ya
+        if y1 < y0 {
+            d = -d
+        }
+        self.accumulate(min64(xa, xb), max64(xa, xb), d)
+    }
+    // Spread the coverage of an edge running from x = left to right (in any
+    // direction) across `d` subpixel rows of the current row. Each cell holds
+    // the change in coverage from the previous column; columns left of the
+    // pass add up in `carry`.
+    fn accumulate(&mut self, left: i64, right: i64, d: i64) {
+        start := self.column_start
+        end := self.column_end
+        first := floor_div(left, 256)
+        if first >= end {
+            return
+        }
+        last := floor_div(right, 256)
+        low := first
+        previous := 0i64
+        if first < start {
+            previous = edge_cover(left, right, d, start - 1)
+            self.carry += previous
+            low = start
+        }
+        high := min64(last + 1, end - 1)
+        column := low
+        for column <= high {
+            value := edge_cover(left, right, d, column)
+            index := (column - start) as usize
+            self.cells[index] += value - previous
+            previous = value
+            column += 1
+        }
+    }
+}
+
+// Coverage, up to and including `column`, of the part of a pixel row right of
+// an edge from x = left to right spanning d subpixel rows: d * 256 once the
+// edge is entirely to the left. The edge's x moves linearly over its rows, so
+// this is d times the average of clamp(column + 1 - x, 0, 1) along it.
+fn edge_cover(left: i64, right: i64, d: i64, column: i64) -> i64 {
+    u := (column + 1) * 256
+    if u <= left {
+        return 0
+    }
+    if u - right >= 256 {
+        return d * 256
+    }
+    if right == left {
+        return d * (u - left)
+    }
+    return floor_div(d * (ramp_area(u - left) - ramp_area(u - right)), 2 * (right - left))
+}
+
+// Twice the integral of clamp(t, 0, 256) for t from -infinity to v.
+fn ramp_area(v: i64) -> i64 {
+    if v <= 0 {
+        return 0
+    }
+    if v <= 256 {
+        return v * v
+    }
+    return 512 * v - 65536
+}
+
+// Chords needed so a curve whose second difference is `bend` stays within
+// tolerance: ceil(sqrt(bend / tolerance)), from 1 to CURVE_STEPS.
+fn curve_steps(bend: i64, tolerance: i64) -> i64 {
+    quotient := ceil_div(bend, tolerance)
+    if quotient <= 1 {
+        return 1
+    }
+    n := isqrt(quotient as u64) as i64
+    if n * n < quotient {
+        n += 1
+    }
+    return min64(n, CURVE_STEPS)
+}
+
+fn path_coordinate(value: i32) -> i64 {
+    return clamp64(value as i64, -PATH_LIMIT, PATH_LIMIT)
+}
+
+// Pixel coordinate to the subpixel position of its top-left corner.
+fn corner(value: i32) -> i64 {
+    return clamp64(value as i64, -AA_PIXEL_LIMIT, AA_PIXEL_LIMIT) * 256
+}
+
+// Pixel coordinate to the subpixel position of its centre.
+fn centre(value: i32) -> i64 {
+    return corner(value) + 128
+}
+
+// A radius in pixels to subpixels, extended by half a pixel so the shape
+// reaches the outer edge of the pixels at that distance.
+fn aa_radius(radius: u32) -> i64 {
+    return min64(radius as i64, AA_PIXEL_LIMIT) * 256 + 128
+}
+
+fn fixed(value: i64) -> i32 {
+    return clamp64(value, -PATH_LIMIT, PATH_LIMIT) as i32
+}
+
+// Path commands in storage words: a tag followed by its coordinates.
+const COMMAND_MOVE: i32 = 1
+const COMMAND_LINE: i32 = 2
+const COMMAND_QUAD: i32 = 3
+const COMMAND_CUBIC: i32 = 4
+const COMMAND_CLOSE: i32 = 5
+
+// An outline stored as commands in caller-owned i32 words, in subpixel
+// coordinates. A move or line takes 3 words, a quadratic curve 5, a cubic 7,
+// a close 1; the shape helpers add whole closed contours. Building a path
+// cannot fail: when a command does not fit, the path is marked overflowed,
+// keeps no further commands, and draws nothing.
+//
+//     storage := [0i32; 256]
+//     path := graphics.Path.new(&mut storage)
+//     path.move_to(10 * graphics.SUBPIXEL, 0)
+//     path.quad_to(20 * graphics.SUBPIXEL, 20 * graphics.SUBPIXEL, 0, 20 * graphics.SUBPIXEL)
+//     path.close()
+//     canvas.fill_path(&path, graphics.FillRule.NonZero, graphics.WHITE)
+pub struct Path {
+    words: &mut[i32]
+    length: usize
+    overflowed: bool
+
+    pub fn new(storage: &mut[i32]) -> Path from(storage) {
+        return Path { words: storage, length: 0, overflowed: false }
+    }
+    // Remove every command and the overflow mark.
+    pub fn clear(&mut self) {
+        self.length = 0
+        self.overflowed = false
+    }
+    // Storage words in use.
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.length == 0
+    }
+    // True when a command did not fit; the path then draws nothing.
+    pub fn overflowed(&self) -> bool {
+        return self.overflowed
+    }
+    fn room(&mut self, words: usize) -> bool {
+        if self.overflowed || self.words.len - self.length < words {
+            self.overflowed = true
+            return false
+        }
+        return true
+    }
+    fn push(&mut self, value: i32) {
+        self.words[self.length] = value
+        self.length += 1
+    }
+    pub fn move_to(&mut self, x: i32, y: i32) {
+        if self.room(3) {
+            self.push(COMMAND_MOVE)
+            self.push(x)
+            self.push(y)
+        }
+    }
+    pub fn line_to(&mut self, x: i32, y: i32) {
+        if self.room(3) {
+            self.push(COMMAND_LINE)
+            self.push(x)
+            self.push(y)
+        }
+    }
+    pub fn quad_to(&mut self, cx: i32, cy: i32, x: i32, y: i32) {
+        if self.room(5) {
+            self.push(COMMAND_QUAD)
+            self.push(cx)
+            self.push(cy)
+            self.push(x)
+            self.push(y)
+        }
+    }
+    pub fn cubic_to(&mut self, c1x: i32, c1y: i32, c2x: i32, c2y: i32, x: i32, y: i32) {
+        if self.room(7) {
+            self.push(COMMAND_CUBIC)
+            self.push(c1x)
+            self.push(c1y)
+            self.push(c2x)
+            self.push(c2y)
+            self.push(x)
+            self.push(y)
+        }
+    }
+    pub fn close(&mut self) {
+        if self.room(1) {
+            self.push(COMMAND_CLOSE)
+        }
+    }
+    // A closed rectangle contour with its top-left corner at (x, y).
+    pub fn rect(&mut self, x: i32, y: i32, width: i32, height: i32) {
+        left := path_coordinate(x)
+        top := path_coordinate(y)
+        right := path_coordinate(x) + path_coordinate(width)
+        bottom := path_coordinate(y) + path_coordinate(height)
+        self.move_to(fixed(left), fixed(top))
+        self.line_to(fixed(right), fixed(top))
+        self.line_to(fixed(right), fixed(bottom))
+        self.line_to(fixed(left), fixed(bottom))
+        self.close()
+    }
+    // A closed rectangle contour with corners rounded to `radius`, limited
+    // to half the shorter side.
+    pub fn round_rect(&mut self, x: i32, y: i32, width: i32, height: i32, radius: i32) {
+        left := path_coordinate(x)
+        top := path_coordinate(y)
+        trace_round_rect(self, left, top, left + max64(path_coordinate(width), 0), top + max64(path_coordinate(height), 0), max64(radius as i64, 0), false)
+    }
+    // A closed ellipse contour centred on (cx, cy).
+    pub fn ellipse(&mut self, cx: i32, cy: i32, rx: i32, ry: i32) {
+        trace_ellipse(self, path_coordinate(cx), path_coordinate(cy), abs64(path_coordinate(rx)), abs64(path_coordinate(ry)), false)
+    }
+    pub fn circle(&mut self, cx: i32, cy: i32, radius: i32) {
+        self.ellipse(cx, cy, radius, radius)
+    }
+    // Describe the stored commands to `pen`; nothing once overflowed.
+    pub fn trace(&self, pen: &mut Pen) {
+        if self.overflowed {
+            return
+        }
+        i := 0usize
+        w := &self.words[..self.length]
+        for i < w.len {
+            tag := w[i]
+            if tag == COMMAND_MOVE {
+                pen.move_to(w[i + 1], w[i + 2])
+                i += 3
+            } else if tag == COMMAND_LINE {
+                pen.line_to(w[i + 1], w[i + 2])
+                i += 3
+            } else if tag == COMMAND_QUAD {
+                pen.quad_to(w[i + 1], w[i + 2], w[i + 3], w[i + 4])
+                i += 5
+            } else if tag == COMMAND_CUBIC {
+                pen.cubic_to(w[i + 1], w[i + 2], w[i + 3], w[i + 4], w[i + 5], w[i + 6])
+                i += 7
+            } else {
+                pen.close()
+                i += 1
+            }
+        }
+    }
+}
+
+// What the shape helpers draw into: a Pen or a Path.
+interface Sink {
+    fn move_to(&mut self, x: i32, y: i32)
+    fn line_to(&mut self, x: i32, y: i32)
+    fn cubic_to(&mut self, c1x: i32, c1y: i32, c2x: i32, c2y: i32, x: i32, y: i32)
+    fn close(&mut self)
+}
+
+// cos and sin of the multiples of 45 degrees, and 4/3 tan(pi/16), the control
+// distance of a 45 degree cubic arc, in 2^-24 units. Eight such arcs stay
+// within 4.2e-6 of the radius of a true circle.
+const ARC_ONE: i64 = 16777216
+const ARC_DIAGONAL: i64 = 11863283
+const ARC_HANDLE: i64 = 4449594
+
+fn arc_cos(index: usize) -> i64 {
+    match index % 8 {
+        0 => {
+            return ARC_ONE
+        }
+        1 => {
+            return ARC_DIAGONAL
+        }
+        2 => {
+            return 0
+        }
+        3 => {
+            return -ARC_DIAGONAL
+        }
+        4 => {
+            return -ARC_ONE
+        }
+        5 => {
+            return -ARC_DIAGONAL
+        }
+        6 => {
+            return 0
+        }
+        _ => {
+            return ARC_DIAGONAL
+        }
+    }
+}
+
+// value / 2^24, rounded to nearest.
+fn shift24(value: i64) -> i64 {
+    return (value + 8388608) >> 24
+}
+
+fn arc_sin(index: usize) -> i64 {
+    return arc_cos(index + 6)
+}
+
+// `count` 45 degree arcs of the ellipse c + a cos t + b sin t, starting at
+// angle index `first` (t = first * 45 degrees) and continuing through
+// increasing indexes. With `start`, the first point begins a new contour;
+// otherwise a line joins it to the current point.
+fn trace_arcs<S: Sink>(sink: &mut S, cx: i64, cy: i64, ax: i64, ay: i64, bx: i64, by: i64, first: usize, count: usize, start: bool) {
+    px := cx + shift24(ax * arc_cos(first) + bx * arc_sin(first))
+    py := cy + shift24(ay * arc_cos(first) + by * arc_sin(first))
+    if start {
+        sink.move_to(fixed(px), fixed(py))
+    } else {
+        sink.line_to(fixed(px), fixed(py))
+    }
+    for j in first..first + count {
+        tx := shift24(bx * arc_cos(j) - ax * arc_sin(j))
+        ty := shift24(by * arc_cos(j) - ay * arc_sin(j))
+        qx := cx + shift24(ax * arc_cos(j + 1) + bx * arc_sin(j + 1))
+        qy := cy + shift24(ay * arc_cos(j + 1) + by * arc_sin(j + 1))
+        ux := shift24(bx * arc_cos(j + 1) - ax * arc_sin(j + 1))
+        uy := shift24(by * arc_cos(j + 1) - ay * arc_sin(j + 1))
+        c1x := px + shift24(tx * ARC_HANDLE)
+        c1y := py + shift24(ty * ARC_HANDLE)
+        c2x := qx - shift24(ux * ARC_HANDLE)
+        c2y := qy - shift24(uy * ARC_HANDLE)
+        sink.cubic_to(fixed(c1x), fixed(c1y), fixed(c2x), fixed(c2y), fixed(qx), fixed(qy))
+        px = qx
+        py = qy
+    }
+}
+
+// A closed axis-aligned ellipse, clockwise on screen, or counterclockwise
+// when `reverse` is set.
+fn trace_ellipse<S: Sink>(sink: &mut S, cx: i64, cy: i64, rx: i64, ry: i64, reverse: bool) {
+    by := ry
+    if reverse {
+        by = -ry
+    }
+    trace_arcs(sink, cx, cy, rx, 0, 0, by, 0, 8, true)
+    sink.close()
+}
+
+// A closed rounded rectangle between the given edges, clockwise on screen or
+// counterclockwise when `reverse` is set (traced mirrored left to right).
+fn trace_round_rect<S: Sink>(sink: &mut S, left: i64, top: i64, right: i64, bottom: i64, radius: i64, reverse: bool) {
+    if right <= left || bottom <= top {
+        return
+    }
+    r := min64(min64(radius, (right - left) / 2), (bottom - top) / 2)
+    // Corner centres on the side traced first (near) and last (far).
+    near := right - r
+    far := left + r
+    s := 1i64
+    if reverse {
+        near = left + r
+        far = right - r
+        s = -1
+    }
+    sink.move_to(fixed(far), fixed(top))
+    if r == 0 {
+        sink.line_to(fixed(near), fixed(top))
+        sink.line_to(fixed(near), fixed(bottom))
+        sink.line_to(fixed(far), fixed(bottom))
+        sink.close()
+        return
+    }
+    trace_arcs(sink, near, top + r, s * r, 0, 0, r, 6, 2, false)
+    trace_arcs(sink, near, bottom - r, s * r, 0, 0, r, 0, 2, false)
+    trace_arcs(sink, far, bottom - r, s * r, 0, 0, r, 2, 2, false)
+    trace_arcs(sink, far, top + r, s * r, 0, 0, r, 4, 2, false)
+    sink.close()
+}
+
+// An ellipse, or a ring between two concentric ellipses.
+struct EllipseShape {
+    cx: i64
+    cy: i64
+    rx: i64
+    ry: i64
+    inner_rx: i64
+    inner_ry: i64
+    ring: bool
+
+    fn trace(&self, pen: &mut Pen) {
+        trace_ellipse(pen, self.cx, self.cy, self.rx, self.ry, false)
+        if self.ring && self.inner_rx > 0 && self.inner_ry > 0 {
+            trace_ellipse(pen, self.cx, self.cy, self.inner_rx, self.inner_ry, true)
+        }
+    }
+}
+
+// A rounded rectangle, or the ring between it and one inset by `inset`.
+struct RoundRectShape {
+    left: i64
+    top: i64
+    right: i64
+    bottom: i64
+    radius: i64
+    inset: i64
+    ring: bool
+
+    fn trace(&self, pen: &mut Pen) {
+        trace_round_rect(pen, self.left, self.top, self.right, self.bottom, self.radius, false)
+        if self.ring {
+            d := self.inset
+            trace_round_rect(pen, self.left + d, self.top + d, self.right - d, self.bottom - d, max64(self.radius - d, 0), true)
+        }
+    }
+}
+
+// A line of the given half width between two points: square ends extending
+// half the width past the points, or round ends centred on them.
+struct StrokeShape {
+    x0: i64
+    y0: i64
+    x1: i64
+    y1: i64
+    half: i64
+    round: bool
+
+    fn trace(&self, pen: &mut Pen) {
+        dx := self.x1 - self.x0
+        dy := self.y1 - self.y0
+        r := self.half
+        if dx == 0 && dy == 0 {
+            if self.round {
+                trace_ellipse(pen, self.x0, self.y0, r, r, false)
+            } else {
+                pen.move_to(fixed(self.x0 - r), fixed(self.y0 - r))
+                pen.line_to(fixed(self.x0 + r), fixed(self.y0 - r))
+                pen.line_to(fixed(self.x0 + r), fixed(self.y0 + r))
+                pen.line_to(fixed(self.x0 - r), fixed(self.y0 + r))
+                pen.close()
+            }
+            return
+        }
+        length := isqrt((dx * dx + dy * dy) as u64) as i64
+        // Unit direction u and normal v in 2^-24 units, then scaled by r.
+        ux := floor_div(2 * dx * ARC_ONE + length, 2 * length)
+        uy := floor_div(2 * dy * ARC_ONE + length, 2 * length)
+        ax := shift24(ux * r)
+        ay := shift24(uy * r)
+        nx := -ay
+        ny := ax
+        if self.round {
+            pen.move_to(fixed(self.x0 + nx), fixed(self.y0 + ny))
+            pen.line_to(fixed(self.x1 + nx), fixed(self.y1 + ny))
+            trace_arcs(pen, self.x1, self.y1, ax, ay, -nx, -ny, 6, 4, false)
+            pen.line_to(fixed(self.x0 - nx), fixed(self.y0 - ny))
+            trace_arcs(pen, self.x0, self.y0, -ax, -ay, nx, ny, 6, 4, false)
+            pen.close()
+            return
+        }
+        pen.move_to(fixed(self.x0 - ax + nx), fixed(self.y0 - ay + ny))
+        pen.line_to(fixed(self.x1 + ax + nx), fixed(self.y1 + ay + ny))
+        pen.line_to(fixed(self.x1 + ax - nx), fixed(self.y1 + ay - ny))
+        pen.line_to(fixed(self.x0 - ax - nx), fixed(self.y0 - ay - ny))
+        pen.close()
+    }
+}
+
+// A polygon through pixel-corner vertices given as x, y pairs.
+struct PolygonShape {
+    coordinates: &[i32]
+
+    fn trace(&self, pen: &mut Pen) {
+        vertices := self.coordinates.len / 2
+        for i in 0usize..vertices {
+            x := fixed(corner(self.coordinates[2 * i]))
+            y := fixed(corner(self.coordinates[2 * i + 1]))
+            if i == 0 {
+                pen.move_to(x, y)
+            } else {
+                pen.line_to(x, y)
+            }
+        }
+        pen.close()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gradients
+
+// The most color stops a gradient holds; add_stop ignores more.
+pub const GRADIENT_STOPS: usize = 8
+
+// What a gradient paints beyond its end points.
+pub enum Spread {
+    // Extend the first and last colors.
+    Pad,
+    // Start again from the first color.
+    Repeat,
+    // Run back and forth.
+    Reflect
+}
+
+const SPREAD_PAD: u8 = 0
+const SPREAD_REPEAT: u8 = 1
+const SPREAD_REFLECT: u8 = 2
+
+// Gradient coordinates are clamped to +/-2^20 pixels and pixel distances
+// from them to +/-2^22 so products stay within 64 bits.
+const GRADIENT_LIMIT: i64 = 1048576
+const GRADIENT_REACH: i64 = 4194304
+
+// A linear or radial color gradient for gradient_rect, gradient_path and
+// gradient_outline. Colors are sampled at pixel centres and interpolated in
+// premultiplied alpha, so fading to TRANSPARENT does not darken. Stops sit
+// at offsets from 0 (the start point or centre) to 255 (the end point or
+// radius); two stops at one offset make a hard edge.
+//
+//     sky := graphics.Gradient.linear(0, 0, 0, 99, graphics.hex(0x203a5c), graphics.hex(0xf4a259))
+//     sky.add_stop(160, graphics.hex(0xbc4b51))
+//     canvas.gradient_rect(0, 0, 160, 100, &sky)
+pub struct Gradient {
+    radial: bool
+    x0: i64
+    y0: i64
+    dx: i64
+    dy: i64
+    length2: i64
+    radius: i64
+    spread: u8
+    dither: bool
+    count: usize
+    offsets: [8]i64
+    colors: [8]u32
+
+    // From `start` at pixel (x0, y0) to `end` at pixel (x1, y1), constant
+    // along lines perpendicular to that direction. If both points are the
+    // same pixel, the gradient paints its last stop's color.
+    pub fn linear(x0: i32, y0: i32, x1: i32, y1: i32, start: Color, end: Color) -> Gradient {
+        ax := clamp64(x0 as i64, -GRADIENT_LIMIT, GRADIENT_LIMIT)
+        ay := clamp64(y0 as i64, -GRADIENT_LIMIT, GRADIENT_LIMIT)
+        dx := clamp64(x1 as i64, -GRADIENT_LIMIT, GRADIENT_LIMIT) - ax
+        dy := clamp64(y1 as i64, -GRADIENT_LIMIT, GRADIENT_LIMIT) - ay
+        g := Gradient { radial: false, x0: ax, y0: ay, dx: dx, dy: dy, length2: dx * dx + dy * dy, radius: 0, spread: SPREAD_PAD, dither: false, count: 2, offsets: [0i64; 8], colors: [0u32; 8] }
+        g.offsets[1] = 65535
+        g.colors[0] = premultiply(start)
+        g.colors[1] = premultiply(end)
+        return g
+    }
+    // From `inner` at the centre of pixel (cx, cy) to `outer` at `radius`
+    // pixels from it, constant along circles. A zero radius paints the last
+    // stop's color.
+    pub fn radial(cx: i32, cy: i32, radius: u32, inner: Color, outer: Color) -> Gradient {
+        ax := clamp64(cx as i64, -GRADIENT_LIMIT, GRADIENT_LIMIT)
+        ay := clamp64(cy as i64, -GRADIENT_LIMIT, GRADIENT_LIMIT)
+        r := min64(radius as i64, GRADIENT_LIMIT) * 256
+        g := Gradient { radial: true, x0: ax, y0: ay, dx: 0, dy: 0, length2: 0, radius: r, spread: SPREAD_PAD, dither: false, count: 2, offsets: [0i64; 8], colors: [0u32; 8] }
+        g.offsets[1] = 65535
+        g.colors[0] = premultiply(inner)
+        g.colors[1] = premultiply(outer)
+        return g
+    }
+    // Insert a stop at `offset` (0 to 255), after any stops already there.
+    // A gradient holds at most GRADIENT_STOPS stops; further ones are ignored.
+    pub fn add_stop(&mut self, offset: u8, color: Color) {
+        if self.count >= GRADIENT_STOPS {
+            return
+        }
+        position := offset as i64 * 257
+        at := self.count
+        for at > 0 && self.offsets[at - 1] > position {
+            self.offsets[at] = self.offsets[at - 1]
+            self.colors[at] = self.colors[at - 1]
+            at -= 1
+        }
+        self.offsets[at] = position
+        self.colors[at] = premultiply(color)
+        self.count += 1
+    }
+    pub fn stop_count(&self) -> usize {
+        return self.count
+    }
+    pub fn set_spread(&mut self, spread: Spread) {
+        match spread {
+            Spread.Pad => {
+                self.spread = SPREAD_PAD
+            }
+            Spread.Repeat => {
+                self.spread = SPREAD_REPEAT
+            }
+            Spread.Reflect => {
+                self.spread = SPREAD_REFLECT
+            }
+        }
+    }
+    // Ordered (4x4 Bayer) dithering when drawing on Rgb565 and Mono1
+    // canvases, which trades banding for a fine regular pattern. Other
+    // formats store 8 bits per channel and are unaffected.
+    pub fn set_dither(&mut self, on: bool) {
+        self.dither = on
+    }
+    // The undithered color at the centre of pixel (x, y).
+    pub fn color_at(&self, x: i32, y: i32) -> Color {
+        return self.sample(x as i64, y as i64)
+    }
+    fn sample(&self, x: i64, y: i64) -> Color {
+        t := 65535i64
+        if self.radial {
+            if self.radius > 0 {
+                ex := clamp64(x - self.x0, -GRADIENT_REACH, GRADIENT_REACH) * 256
+                ey := clamp64(y - self.y0, -GRADIENT_REACH, GRADIENT_REACH) * 256
+                distance := isqrt((ex * ex + ey * ey) as u64) as i64
+                t = distance * 65536 / self.radius
+            }
+        } else if self.length2 > 0 {
+            ex := clamp64(x - self.x0, -GRADIENT_REACH, GRADIENT_REACH)
+            ey := clamp64(y - self.y0, -GRADIENT_REACH, GRADIENT_REACH)
+            t = floor_div((ex * self.dx + ey * self.dy) * 65536, self.length2)
+        }
+        if self.spread == SPREAD_REPEAT {
+            t = t - floor_div(t, 65536) * 65536
+        } else if self.spread == SPREAD_REFLECT {
+            t = t - floor_div(t, 131072) * 131072
+            if t >= 65536 {
+                t = 131071 - t
+            }
+        } else {
+            t = clamp64(t, 0, 65535)
+        }
+        last := self.count - 1
+        if t <= self.offsets[0] {
+            return unpremultiply(self.colors[0])
+        }
+        if t >= self.offsets[last] {
+            return unpremultiply(self.colors[last])
+        }
+        i := 0usize
+        for i + 1 < last && t >= self.offsets[i + 1] {
+            i += 1
+        }
+        low := self.offsets[i]
+        f := ((t - low) * 256 / (self.offsets[i + 1] - low)) as u32
+        return unpremultiply(mix_premultiplied(self.colors[i], self.colors[i + 1], f))
+    }
+    // The color to store at (x, y) of a canvas in `format`.
+    fn shade(&self, x: i64, y: i64, format: &PixelFormat) -> Color {
+        color := self.sample(x, y)
+        if !self.dither {
+            return color
+        }
+        m := bayer(x, y)
+        match format {
+            PixelFormat.Rgb565 => {
+                r := min_u32(((color >> 16) & 255) + (2 * m + 1) / 4, 255)
+                g := min_u32(((color >> 8) & 255) + (2 * m + 1) / 8, 255)
+                b := min_u32((color & 255) + (2 * m + 1) / 4, 255)
+                return (color & 0xff000000) | (r << 16) | (g << 8) | b
+            }
+            PixelFormat.Mono1 => {
+                if luma(color) as u32 >= 16 * m + 8 {
+                    return color | 0x00ffffff
+                }
+                return color & 0xff000000
+            }
+            _ => {
+                return color
+            }
+        }
+    }
+}
+
+// The 4x4 Bayer threshold, 0 to 15, of pixel (x, y).
+fn bayer(x: i64, y: i64) -> u32 {
+    index := ((y & 3) * 4 + (x & 3)) as usize
+    match index {
+        0 => {
+            return 0
+        }
+        1 => {
+            return 8
+        }
+        2 => {
+            return 2
+        }
+        3 => {
+            return 10
+        }
+        4 => {
+            return 12
+        }
+        5 => {
+            return 4
+        }
+        6 => {
+            return 14
+        }
+        7 => {
+            return 6
+        }
+        8 => {
+            return 3
+        }
+        9 => {
+            return 11
+        }
+        10 => {
+            return 1
+        }
+        11 => {
+            return 9
+        }
+        12 => {
+            return 15
+        }
+        13 => {
+            return 7
+        }
+        14 => {
+            return 13
+        }
+        _ => {
+            return 5
+        }
+    }
+}
+
+fn premultiply(color: Color) -> u32 {
+    a := color >> 24
+    r := div255(((color >> 16) & 255) * a)
+    g := div255(((color >> 8) & 255) * a)
+    b := div255((color & 255) * a)
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+fn unpremultiply(color: u32) -> Color {
+    a := color >> 24
+    if a == 0 {
+        return TRANSPARENT
+    }
+    if a == 255 {
+        return color
+    }
+    r := min_u32((((color >> 16) & 255) * 255 + a / 2) / a, 255)
+    g := min_u32((((color >> 8) & 255) * 255 + a / 2) / a, 255)
+    b := min_u32(((color & 255) * 255 + a / 2) / a, 255)
+    return (a << 24) | (r << 16) | (g << 8) | b
+}
+
+// Channel-wise (a * (256 - f) + b * f) / 256, rounded, for f in 0..256.
+fn mix_premultiplied(a: u32, b: u32, f: u32) -> u32 {
+    result := 0u32
+    shift := 0u32
+    for shift < 32 {
+        ca := (a >> shift) & 255
+        cb := (b >> shift) & 255
+        result = result | (((ca * (256 - f) + cb * f + 128) >> 8) << shift)
+        shift += 8
+    }
+    return result
+}
+
+fn min_u32(a: u32, b: u32) -> u32 {
+    if a < b {
+        return a
+    }
+    return b
 }

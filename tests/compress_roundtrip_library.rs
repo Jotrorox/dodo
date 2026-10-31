@@ -11,7 +11,11 @@ text = open(sys.argv[1], 'rb').read()[:200000]
 cases = [b'', b'a', b'ab' * 3, bytes(range(256)), b'a' * 70000,
          bytes(rng.randrange(256) for _ in range(70000)), text,
          bytes(rng.randrange(4) for _ in range(40000)),
-         (b'hello streaming! ' * 4000)[:66000]]
+         (b'hello streaming! ' * 4000)[:66000],
+         # Small and repetitive with bytes above 143, which a fixed-Huffman
+         # block codes in 9 bits.
+         b'\x20\x30\x40\xff' + b'\x00' * 60 + bytes(range(144, 256)) * 2,
+         bytes([255, 200, 150, 144]) * 40]
 for data in cases:
     sys.stdout.buffer.write(struct.pack('<I', len(data)) + data)
 "#;

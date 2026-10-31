@@ -495,7 +495,21 @@ fn emit_block(lz: &mut Lz, ws: &mut Workspace, data: &[u8], writer: &mut BitWrit
             }
         }
     }
-    canonical_codes(&codes.lit_lengths, &mut codes.lit_codes)
+    if fixed_bits <= dynamic_bits {
+        // The fixed code also assigns 8-bit codes to symbols 286 and 287,
+        // which shifts every 9-bit code (literals 144 through 255) after them.
+        fixed_lengths := [0u8; 288]
+        fixed_codes := [0u16; 288]
+        for i in 0usize..288 {
+            fixed_lengths[i] = fixed_literal_length(i)
+        }
+        canonical_codes(&fixed_lengths, &mut fixed_codes)
+        for i in 0usize..286 {
+            codes.lit_codes[i] = fixed_codes[i]
+        }
+    } else {
+        canonical_codes(&codes.lit_lengths, &mut codes.lit_codes)
+    }
     canonical_codes(&codes.dist_lengths, &mut codes.dist_codes)
     return put_tokens(writer, tokens, &codes)
 }

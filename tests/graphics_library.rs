@@ -1,7 +1,8 @@
-//! CPU graphics: exact pixels for every primitive and pixel format, the
-//! image codecs and fake display at O0 and O3, freestanding code generation,
-//! golden images rendered through `dodo test`, and the display panel drivers
-//! against recorded and simulated controllers.
+//! CPU graphics: exact pixels for every primitive and pixel format,
+//! antialiased paths, gradients and TrueType text, the image codecs and fake
+//! display at O0 and O3, freestanding code generation, golden images rendered
+//! through `dodo test`, and the display panel drivers against recorded and
+//! simulated controllers.
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -78,7 +79,8 @@ fn drawing_formats_codecs_and_displays_execute_and_stay_freestanding() {
         );
         assert!(fs::metadata(object).unwrap().len() > 0);
     }
-    // Font tables are read-only data, which firmware keeps in flash.
+    // Font tables, bitmap and TrueType, are read-only data, which firmware
+    // keeps in flash.
     let ir = scratch.0.join("graphics.ll");
     success(
         &Command::new(env!("CARGO_BIN_EXE_dodo"))
@@ -99,7 +101,7 @@ fn drawing_formats_codecs_and_displays_execute_and_stay_freestanding() {
         "emit graphics fixture IR",
     );
     let ir = fs::read_to_string(ir).unwrap();
-    for table in ["SMALL_GLYPHS", "MEDIUM_GLYPHS"] {
+    for table in ["SMALL_GLYPHS", "MEDIUM_GLYPHS", "TEST_FONT"] {
         assert!(
             ir.lines()
                 .any(|line| line.contains(table) && line.contains("internal constant")),
@@ -187,4 +189,24 @@ fn thermometer_example_tests_pass_against_the_fake_display() {
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+#[test]
+fn poster_example_draws_with_a_truetype_font_and_writes_a_png() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let scratch = Scratch::new("poster");
+    let font = root.join("tests/graphics/fonts/dodo-test.ttf");
+    let output = Command::new(env!("CARGO_BIN_EXE_dodo"))
+        .arg("run")
+        .arg(root.join("examples/poster.dodo"))
+        .arg("--")
+        .arg(&font)
+        .current_dir(&scratch.0)
+        .output()
+        .unwrap();
+    success(&output, "run examples/poster.dodo");
+    let png = fs::read(scratch.0.join("poster.png")).unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    // IHDR: 360 x 240, 8-bit RGBA.
+    assert_eq!(&png[16..26], &[0, 0, 1, 104, 0, 0, 0, 240, 8, 6]);
 }

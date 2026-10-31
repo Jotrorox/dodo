@@ -1,13 +1,21 @@
 package main
 
+import "std/checksum"
+import "std/compress/deflate"
 import "std/graphics"
 import "std/graphics/fake"
 import "std/graphics/font"
 import "std/graphics/image"
+import "std/graphics/truetype"
 
 // Portable checks for std/graphics: exact pixels for every primitive, all
 // pixel formats, clipping, dirty tracking, text, blitting, the Display
-// protocol and the image codecs. No OS, allocator or floating point.
+// protocol, the image codecs, antialiased paths, gradients and TrueType
+// fonts. No OS, allocator or floating point.
+
+// The compressing PNG encoder's storage, too big for small stacks.
+static mut PNG_BUFFER: [deflate.ENCODER_BUFFER_LEN]u8 = [0u8; deflate.ENCODER_BUFFER_LEN]
+static mut PNG_WORDS: [deflate.WORKSPACE_LEN]u32 = [0u32; deflate.WORKSPACE_LEN]
 
 fn count(canvas: &graphics.Canvas, color: graphics.Color) -> u32 {
     total := 0u32
@@ -955,6 +963,52 @@ fn codecs() {
     assert_eq(at(&pal, 1, 0), graphics.GREEN)
     assert_eq(at(&pal, 0, 0), graphics.BLUE)
 
+    // PNG keeps every channel too, uncompressed or compressed.
+    assert_eq(image.png_size(12, 10)!, 558usize)
+    png := [0u8; 558]
+    assert_eq(image.encode_png(&canvas, &mut png)!, 558usize)
+    png_header := image.info(&png)!
+    assert(png_header.format == image.Format.Png)
+    assert_eq(png_header.width, 12u32)
+    assert_eq(png_header.height, 10u32)
+    assert(png_header.has_alpha)
+    from_png := image.decode(&png, &mut decoded_pixels, graphics.PixelFormat.Rgba8888)!
+    assert(from_png.equals(&canvas))
+    assert_eq(image.png_scratch_size(&png)!, 98usize)
+    png_scratch := [0u8; 98]
+    from_png_scratch := image.decode_png(&png, &mut decoded_pixels, graphics.PixelFormat.Rgba8888, &mut png_scratch)!
+    assert(from_png_scratch.equals(&canvas))
+    match image.decode_png(&png, &mut decoded_pixels, graphics.PixelFormat.Rgba8888, &mut png_scratch[..97]) {
+        ok(_) => {
+            assert(false, "short PNG scratch must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.BufferTooSmall)
+        }
+    }
+    match image.decode(&png[..300], &mut decoded_pixels, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, "a cut PNG must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.Truncated)
+        }
+    }
+    png_target_pixels := [0u8; 8 * 8 * 4]
+    png_target := graphics.canvas(&mut png_target_pixels, 8, 8, graphics.PixelFormat.Rgba8888)!
+    image.draw(&png, &mut png_target, -4, -2)!
+    assert_eq(at(&png_target, 0, 0), at(&canvas, 4, 2))
+    assert_eq(at(&png_target, 7, 7), at(&canvas, 11, 9))
+    compressed := [0u8; 700]
+    assert(image.png_compressed_max_size(12, 10)! <= 700)
+    compressed_length := 0usize
+    unsafe {
+        compressed_length = image.encode_png_compressed(&canvas, &mut compressed, 9, &mut PNG_BUFFER, &mut PNG_WORDS)!
+    }
+    assert(compressed_length < 558)
+    from_compressed := image.decode(&compressed[..compressed_length], &mut decoded_pixels, graphics.PixelFormat.Rgba8888)!
+    assert(from_compressed.equals(&canvas))
+
     // Rejections.
     garbage := [1u8, 2, 3, 4]
     match image.info(&garbage) {
@@ -1009,6 +1063,482 @@ fn codecs() {
     }
 }
 
+// -- Antialiased drawing, paths, gradients and TrueType ---------------------
+
+fn channel_gap(a: graphics.Color, b: graphics.Color) -> u32 {
+    gap := 0u32
+    shift := 0u32
+    for shift < 32 {
+        x := (a >> shift) & 255
+        y := (b >> shift) & 255
+        if x > y && x - y > gap {
+            gap = x - y
+        } else if y > x && y - x > gap {
+            gap = y - x
+        }
+        shift += 8
+    }
+    return gap
+}
+
+fn blue_total(canvas: &graphics.Canvas) -> u64 {
+    total := 0u64
+    for y in 0i32..canvas.height() as i32 {
+        for x in 0i32..canvas.width() as i32 {
+            total += (at(canvas, x, y) & 255) as u64
+        }
+    }
+    return total
+}
+
+// A triangle described procedurally: outlines need no stored path.
+struct Triangle {
+    size: i32
+
+    pub fn trace(&self, pen: &mut graphics.Pen) {
+        pen.move_to(0, 0)
+        pen.line_to(self.size, 0)
+        pen.line_to(0, self.size)
+    }
+}
+
+fn antialiasing() {
+    // Axis-aligned antialiased lines and square-cornered boxes cover whole
+    // pixels exactly as their integer counterparts do.
+    a_pixels := [0u8; 16 * 12 * 4]
+    b_pixels := [0u8; 16 * 12 * 4]
+    a := graphics.canvas(&mut a_pixels, 16, 12, graphics.PixelFormat.Rgba8888)!
+    b := graphics.canvas(&mut b_pixels, 16, 12, graphics.PixelFormat.Rgba8888)!
+    a.clear(graphics.BLACK)
+    b.clear(graphics.BLACK)
+    a.take_dirty()
+    b.take_dirty()
+    a.line(2, 3, 12, 3, graphics.YELLOW)
+    a.line(5, 1, 5, 10, graphics.CYAN)
+    a.fill_rect(8, 6, 5, 4, graphics.RED)
+    b.aa_line(2, 3, 12, 3, graphics.YELLOW)
+    b.aa_line(5, 1, 5, 10, graphics.CYAN)
+    b.aa_fill_round_rect(8, 6, 5, 4, 0, graphics.RED)
+    assert(a.equals(&b))
+    a_dirty := a.dirty()
+    b_dirty := b.dirty()
+    assert(a_dirty.equals(&b_dirty))
+
+    // A disk's alpha adds up to its area, pi * 20.5^2 pixels, within 0.2%
+    // (flattened curves run slightly inside the true circle).
+    pixels := [0u8; 48 * 48 * 4]
+    canvas := graphics.canvas(&mut pixels, 48, 48, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.BLACK)
+    canvas.aa_fill_circle(23, 23, 20, graphics.BLUE)
+    total := blue_total(&canvas)
+    assert(total > 335990 && total < 337000)
+    assert_eq(at(&canvas, 23, 23), graphics.BLUE)
+    assert_eq(at(&canvas, 23, 2), graphics.BLACK)
+    assert_eq(at(&canvas, 23, 4), graphics.BLUE)
+    assert_eq(at(&canvas, 42, 23), graphics.BLUE)
+    assert_eq(at(&canvas, 44, 23), graphics.BLACK)
+    // It is symmetric about both axes and the diagonal, to rounding.
+    for dy in -22i32..23 {
+        for dx in -22i32..23 {
+            here := at(&canvas, 23 + dx, 23 + dy)
+            assert(channel_gap(here, at(&canvas, 23 - dx, 23 + dy)) <= 1)
+            assert(channel_gap(here, at(&canvas, 23 + dx, 23 - dy)) <= 1)
+            assert(channel_gap(here, at(&canvas, 23 + dy, 23 + dx)) <= 1)
+        }
+    }
+    // The outline ring covers the circle's band: a 1 pixel ring of mean
+    // radius 20 has area 2 * pi * 20.
+    canvas.clear(graphics.BLACK)
+    canvas.aa_circle(23, 23, 20, graphics.BLUE)
+    ring := blue_total(&canvas)
+    assert(ring > 31950 && ring < 32130)
+    assert_eq(at(&canvas, 23, 23), graphics.BLACK)
+
+    // Half-covered pixels blend half of the color.
+    small_pixels := [0u8; 4 * 2 * 4]
+    small := graphics.canvas(&mut small_pixels, 4, 2, graphics.PixelFormat.Rgba8888)!
+    small.clear(graphics.BLACK)
+    small.take_dirty()
+    // A circle takes 60 words: a move, eight cubic arcs and a close.
+    storage := [0i32; 120]
+    path := graphics.Path.new(&mut storage)
+    path.rect(128, 0, 256, 512)
+    small.fill_path(&path, graphics.FillRule.NonZero, graphics.WHITE)
+    assert_eq(at(&small, 0, 0), graphics.hex(0x808080))
+    assert_eq(at(&small, 1, 1), graphics.hex(0x808080))
+    assert_eq(at(&small, 2, 0), graphics.BLACK)
+    dirty := small.take_dirty()
+    assert(same_rect(&dirty, 0, 0, 2, 2))
+    // Translucent colors scale their alpha by the coverage.
+    small.clear(graphics.BLACK)
+    small.take_dirty()
+    small.fill_path(&path, graphics.FillRule.NonZero, graphics.rgba(255, 255, 255, 128))
+    assert_eq(at(&small, 0, 0), graphics.hex(0x404040))
+    assert_eq(path.len(), 13usize)
+
+    // Two nested circles in the same direction: the nonzero rule fills the
+    // middle, even-odd leaves a hole.
+    path.clear()
+    path.circle(24 * 256, 24 * 256, 20 * 256)
+    path.circle(24 * 256, 24 * 256, 8 * 256)
+    assert(!path.overflowed())
+    canvas.clear(graphics.BLACK)
+    canvas.fill_path(&path, graphics.FillRule.NonZero, graphics.WHITE)
+    assert_eq(at(&canvas, 24, 24), graphics.WHITE)
+    canvas.clear(graphics.BLACK)
+    canvas.fill_path(&path, graphics.FillRule.EvenOdd, graphics.WHITE)
+    assert_eq(at(&canvas, 24, 24), graphics.BLACK)
+    assert_eq(at(&canvas, 24, 10), graphics.WHITE)
+
+    // A path that runs out of storage is marked and draws nothing.
+    tiny := [0i32; 5]
+    short := graphics.Path.new(&mut tiny)
+    short.move_to(0, 0)
+    short.line_to(4096, 0)
+    short.line_to(0, 4096)
+    assert(short.overflowed())
+    assert_eq(short.len(), 3usize)
+    canvas.clear(graphics.BLACK)
+    canvas.take_dirty()
+    canvas.fill_path(&short, graphics.FillRule.NonZero, graphics.WHITE)
+    assert(clean(&canvas))
+    short.clear()
+    assert(!short.overflowed() && short.is_empty())
+
+    // A procedural outline: the triangle below the diagonal of a 16 pixel
+    // square, half covered along the diagonal.
+    triangle := Triangle { size: 16 * 256 }
+    canvas.clear(graphics.BLACK)
+    canvas.fill_outline(&triangle, graphics.FillRule.NonZero, graphics.WHITE)
+    assert_eq(at(&canvas, 0, 0), graphics.WHITE)
+    assert_eq(at(&canvas, 15, 0), graphics.hex(0x808080))
+    assert_eq(at(&canvas, 15, 1), graphics.BLACK)
+    // 120 whole pixels and 16 halves, which round up to 128.
+    assert_eq(blue_total(&canvas), 120u64 * 255 + 16 * 128)
+
+    // Clipping limits antialiased drawing and its dirty rectangle.
+    canvas.clear(graphics.BLACK)
+    canvas.take_dirty()
+    canvas.set_clip(graphics.Rect.new(10, 10, 8, 6))
+    canvas.aa_fill_circle(23, 23, 20, graphics.WHITE)
+    clipped := canvas.dirty()
+    assert(same_rect(&clipped, 10, 10, 8, 6))
+    assert_eq(at(&canvas, 9, 12), graphics.BLACK)
+    assert_eq(at(&canvas, 12, 16), graphics.BLACK)
+    canvas.reset_clip()
+
+    // Drawing a scene in bands gives the same pixels as drawing it whole.
+    whole_pixels := [0u8; 32 * 30 * 4]
+    whole := graphics.canvas(&mut whole_pixels, 32, 30, graphics.PixelFormat.Rgba8888)!
+    vector_scene(&mut whole)
+    band_pixels := [0u8; 32 * 7 * 4]
+    band := graphics.canvas(&mut band_pixels, 32, 7, graphics.PixelFormat.Rgba8888)!
+    bands := graphics.Bands.new(30)
+    for bands.next(&mut band) {
+        vector_scene(&mut band)
+        bounds := band.bounds()
+        for y in 0i32..7 {
+            for x in 0i32..32 {
+                if bounds.y + y < 30 {
+                    assert_eq(at(&band, x, bounds.y + y), at(&whole, x, bounds.y + y))
+                }
+            }
+        }
+    }
+
+    // Other formats: interiors take the color, edges blend.
+    mono_pixels := [0u8; 4 * 32]
+    mono := graphics.canvas(&mut mono_pixels, 32, 32, graphics.PixelFormat.Mono1)!
+    mono.clear(graphics.BLACK)
+    mono.aa_fill_circle(16, 16, 10, graphics.WHITE)
+    assert_eq(at(&mono, 16, 16), graphics.WHITE)
+    assert_eq(at(&mono, 16, 27), graphics.BLACK)
+    rgb565_pixels := [0u8; 32 * 32 * 2]
+    rgb565 := graphics.canvas(&mut rgb565_pixels, 32, 32, graphics.PixelFormat.Rgb565)!
+    rgb565.clear(graphics.BLACK)
+    rgb565.aa_thick_line(4, 4, 27, 20, 5, graphics.WHITE)
+    assert_eq(at(&rgb565, 15, 12), graphics.WHITE)
+    assert_eq(at(&rgb565, 27, 4), graphics.BLACK)
+    gray_pixels := [0u8; 32 * 32]
+    gray := graphics.canvas(&mut gray_pixels, 32, 32, graphics.PixelFormat.Gray8)!
+    gray.clear(graphics.BLACK)
+    star := [16i32, 2, 20, 28, 2, 12, 30, 12, 12, 28]
+    gray.aa_fill_polygon(&star, graphics.WHITE)
+    assert_eq(at(&gray, 16, 16), graphics.BLACK)
+    assert_eq(at(&gray, 16, 10), graphics.WHITE)
+    gray.clear(graphics.BLACK)
+    gray.aa_round_rect(2, 2, 28, 20, 6, graphics.WHITE)
+    assert_eq(at(&gray, 16, 2), graphics.WHITE)
+    assert_eq(at(&gray, 16, 12), graphics.BLACK)
+    gray.aa_ellipse(16, 16, 12, 6, graphics.WHITE)
+    gray.aa_fill_ellipse(16, 16, 3, 2, graphics.WHITE)
+    assert_eq(at(&gray, 16, 16), graphics.WHITE)
+}
+
+fn vector_scene(canvas: &mut graphics.Canvas) {
+    canvas.clear(graphics.hex(0x1d2330))
+    canvas.aa_fill_circle(10, 12, 9, graphics.hex(0xe5c07b))
+    canvas.aa_thick_line(3, 27, 29, 4, 3, graphics.rgba(97, 175, 239, 200))
+    canvas.aa_round_rect(14, 14, 16, 14, 5, graphics.WHITE)
+    shade := graphics.Gradient.radial(22, 21, 8, graphics.WHITE, graphics.TRANSPARENT)
+    canvas.gradient_rect(14, 14, 16, 14, &shade)
+}
+
+fn gradients() {
+    across := graphics.Gradient.linear(0, 0, 10, 0, graphics.RED, graphics.BLUE)
+    assert_eq(across.color_at(0, 0), graphics.RED)
+    assert_eq(across.color_at(10, 5), graphics.BLUE)
+    assert_eq(across.color_at(-5, 0), graphics.RED)
+    assert_eq(across.color_at(30, 0), graphics.BLUE)
+    assert_eq(across.color_at(5, 0), graphics.rgb(128, 0, 128))
+    across.set_spread(graphics.Spread.Repeat)
+    assert_eq(across.color_at(15, 0), graphics.rgb(128, 0, 128))
+    assert_eq(across.color_at(-5, 0), graphics.rgb(128, 0, 128))
+    across.set_spread(graphics.Spread.Reflect)
+    assert_eq(across.color_at(18, 0), across.color_at(2, 0))
+    across.set_spread(graphics.Spread.Pad)
+
+    // Stops stay sorted, a stop at an existing offset goes after it, and a
+    // full gradient ignores more.
+    across.add_stop(128, graphics.GREEN)
+    assert_eq(across.stop_count(), 3usize)
+    assert_eq(across.color_at(5, 0), graphics.rgb(1, 254, 0))
+    for _ in 0usize..10 {
+        across.add_stop(200, graphics.WHITE)
+    }
+    assert_eq(across.stop_count(), graphics.GRADIENT_STOPS)
+
+    // Interpolation is premultiplied: white fading to transparent stays
+    // white while its alpha falls.
+    fade := graphics.Gradient.linear(0, 0, 0, 2, graphics.WHITE, graphics.TRANSPARENT)
+    assert_eq(fade.color_at(0, 1), graphics.rgba(255, 255, 255, 128))
+
+    round := graphics.Gradient.radial(5, 5, 4, graphics.WHITE, graphics.BLACK)
+    assert_eq(round.color_at(5, 5), graphics.WHITE)
+    assert_eq(round.color_at(9, 5), graphics.BLACK)
+    assert_eq(round.color_at(5, 1), graphics.BLACK)
+    assert_eq(round.color_at(7, 5), graphics.hex(0x808080))
+    flat := graphics.Gradient.radial(5, 5, 0, graphics.WHITE, graphics.RED)
+    assert_eq(flat.color_at(5, 5), graphics.RED)
+    same := graphics.Gradient.linear(3, 3, 3, 3, graphics.WHITE, graphics.GREEN)
+    assert_eq(same.color_at(0, 0), graphics.GREEN)
+
+    // gradient_rect samples pixel centres and stores opaque colors.
+    pixels := [0u8; 11 * 3 * 4]
+    canvas := graphics.canvas(&mut pixels, 11, 3, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.BLACK)
+    ramp := graphics.Gradient.linear(0, 0, 10, 0, graphics.BLACK, graphics.WHITE)
+    canvas.gradient_rect(0, 0, 11, 3, &ramp)
+    for x in 0i32..11 {
+        assert_eq(at(&canvas, x, 2), ramp.color_at(x, 2))
+    }
+    assert_eq(at(&canvas, 10, 1), graphics.WHITE)
+
+    // Dithering spreads an in-between level over a 4x4 pattern: on Mono1,
+    // mid gray lights exactly half of each block.
+    mono_pixels := [0u8; 1 * 8]
+    mono := graphics.canvas(&mut mono_pixels, 8, 8, graphics.PixelFormat.Mono1)!
+    mono.clear(graphics.BLACK)
+    gray := graphics.Gradient.linear(0, 0, 0, 0, graphics.hex(0x808080), graphics.hex(0x808080))
+    gray.set_dither(true)
+    mono.gradient_rect(0, 0, 8, 8, &gray)
+    assert_eq(count(&mono, graphics.WHITE), 32u32)
+    gray.set_dither(false)
+    mono.gradient_rect(0, 0, 8, 8, &gray)
+    assert_eq(count(&mono, graphics.WHITE), 64u32)
+    // On Rgb565, a level between two representable reds alternates.
+    red_pixels := [0u8; 4 * 4 * 2]
+    reds := graphics.canvas(&mut red_pixels, 4, 4, graphics.PixelFormat.Rgb565)!
+    between := graphics.Gradient.linear(0, 0, 0, 0, graphics.rgb(132, 0, 0), graphics.rgb(132, 0, 0))
+    between.set_dither(true)
+    reds.gradient_rect(0, 0, 4, 4, &between)
+    low := count(&reds, graphics.rgb(132, 0, 0))
+    high := count(&reds, graphics.rgb(140, 0, 0))
+    assert_eq(low, 8u32)
+    assert_eq(high, 8u32)
+
+    // Gradient fills of paths only paint inside them.
+    big_pixels := [0u8; 20 * 20 * 4]
+    big := graphics.canvas(&mut big_pixels, 20, 20, graphics.PixelFormat.Rgba8888)!
+    big.clear(graphics.BLACK)
+    // A rounded rectangle takes 72 words: four corners of two arcs each.
+    storage := [0i32; 72]
+    path := graphics.Path.new(&mut storage)
+    path.round_rect(2 * 256, 2 * 256, 16 * 256, 16 * 256, 4 * 256)
+    down := graphics.Gradient.linear(0, 2, 0, 17, graphics.RED, graphics.BLUE)
+    assert(!path.overflowed())
+    big.gradient_path(&path, graphics.FillRule.NonZero, &down)
+    assert_eq(at(&big, 10, 2), graphics.RED)
+    assert_eq(at(&big, 10, 17), graphics.BLUE)
+    assert_eq(at(&big, 1, 10), graphics.BLACK)
+    assert_eq(at(&big, 2, 2), graphics.BLACK)
+}
+
+const TEST_FONT: [808]u8 = [
+    0, 1, 0, 0, 0, 8, 0, 128, 0, 3, 0, 0, 99, 109, 97, 112, 2, 131, 1, 86,
+    0, 0, 0, 140, 0, 0, 0, 108, 103, 108, 121, 102, 107, 60, 248, 176, 0, 0, 0, 248,
+    0, 0, 1, 80, 104, 101, 97, 100, 94, 187, 67, 161, 0, 0, 2, 72, 0, 0, 0, 54,
+    104, 104, 101, 97, 6, 6, 1, 174, 0, 0, 2, 128, 0, 0, 0, 36, 104, 109, 116, 120,
+    16, 244, 0, 0, 0, 0, 2, 164, 0, 0, 0, 38, 107, 101, 114, 110, 255, 203, 255, 233,
+    0, 0, 2, 204, 0, 0, 0, 36, 108, 111, 99, 97, 1, 236, 1, 178, 0, 0, 2, 240,
+    0, 0, 0, 22, 109, 97, 120, 112, 0, 22, 0, 132, 0, 0, 3, 8, 0, 0, 0, 32,
+    0, 0, 0, 1, 0, 3, 0, 1, 0, 0, 0, 12, 0, 4, 0, 96, 0, 0, 0, 18,
+    0, 16, 0, 3, 0, 2, 0, 32, 0, 46, 0, 68, 0, 78, 0, 79, 0, 90, 0, 111,
+    0, 196, 255, 255, 0, 0, 0, 32, 0, 46, 0, 65, 0, 78, 0, 79, 0, 90, 0, 111,
+    0, 196, 255, 255, 255, 225, 255, 215, 0, 0, 255, 186, 255, 180, 255, 175, 255, 152, 255, 66,
+    0, 1, 0, 0, 0, 0, 0, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 2, 0, 0, 0, 0, 0, 4, 0, 2, 0, 50, 0, 0, 1, 194, 2, 188, 0, 3,
+    0, 7, 0, 0, 51, 17, 33, 17, 37, 33, 17, 33, 50, 1, 144, 254, 162, 1, 44, 254,
+    212, 2, 188, 253, 68, 50, 2, 88, 0, 2, 0, 0, 0, 0, 2, 88, 2, 188, 0, 7,
+    0, 10, 0, 0, 49, 19, 51, 19, 35, 39, 35, 7, 19, 51, 3, 250, 100, 250, 120, 60,
+    240, 60, 100, 160, 80, 2, 188, 253, 68, 180, 180, 1, 44, 1, 4, 0, 0, 2, 0, 50,
+    255, 246, 2, 38, 2, 198, 0, 3, 0, 7, 0, 0, 22, 16, 32, 16, 36, 32, 16, 32,
+    50, 1, 244, 254, 112, 1, 44, 254, 212, 10, 2, 208, 253, 48, 100, 2, 8, 0, 0, 0,
+    0, 2, 0, 60, 0, 0, 2, 48, 2, 188, 0, 6, 0, 13, 0, 0, 0, 17, 16, 33,
+    35, 17, 51, 3, 51, 50, 53, 52, 43, 1, 2, 48, 254, 252, 240, 240, 140, 140, 160, 160,
+    140, 2, 188, 254, 162, 254, 162, 2, 188, 253, 168, 250, 250, 0, 0, 0, 0, 1, 0, 0,
+    0, 0, 0, 120, 0, 120, 0, 3, 0, 0, 49, 53, 51, 21, 120, 120, 120, 0, 0, 0,
+    255, 255, 0, 0, 0, 0, 2, 88, 3, 132, 0, 34, 0, 2, 0, 0, 0, 35, 0, 5,
+    0, 150, 3, 12, 0, 3, 0, 5, 1, 74, 3, 12, 255, 255, 0, 25, 255, 251, 1, 19,
+    1, 99, 0, 10, 0, 3, 0, 0, 32, 0, 0, 0, 0, 1, 0, 60, 0, 0, 2, 28,
+    2, 188, 0, 9, 0, 0, 51, 17, 51, 1, 17, 51, 17, 35, 1, 17, 60, 100, 1, 24,
+    100, 100, 254, 232, 2, 188, 253, 248, 2, 8, 253, 68, 2, 8, 253, 248, 255, 255, 0, 40,
+    0, 48, 2, 88, 1, 176, 0, 131, 0, 8, 2, 88, 0, 0, 0, 0, 51, 51, 204, 205,
+    0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 95, 15, 60, 245,
+    0, 11, 3, 232, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    253, 18, 255, 56, 2, 138, 3, 132, 0, 0, 0, 8, 0, 2, 0, 0, 0, 0, 0, 0,
+    0, 1, 0, 0, 3, 32, 255, 56, 0, 90, 2, 108, 0, 0, 0, 0, 2, 138, 0, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 1, 244, 0, 0,
+    0, 250, 0, 0, 2, 88, 0, 0, 2, 88, 0, 0, 2, 108, 0, 0, 0, 220, 0, 0,
+    2, 88, 0, 0, 1, 94, 0, 0, 2, 88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    0, 0, 0, 32, 0, 1, 0, 3, 0, 12, 0, 1, 0, 6, 0, 2, 0, 3, 255, 226,
+    0, 2, 0, 4, 255, 176, 0, 4, 0, 2, 255, 216, 0, 0, 0, 20, 0, 20, 0, 44,
+    0, 66, 0, 94, 0, 106, 0, 122, 0, 132, 0, 154, 0, 168, 0, 0, 0, 1, 0, 0,
+    0, 10, 0, 64, 0, 4, 0, 64, 0, 4, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 3, 0, 2
+]
+
+fn truetype_checks() {
+    font := truetype.Font.new(&TEST_FONT)!
+    assert_eq(truetype.font_count(&TEST_FONT)!, 1u32)
+    assert_eq(font.units_per_em(), 1000u32)
+    assert_eq(font.glyph_count(), 10u32)
+    assert_eq(font.ascent(), 800i32)
+    assert_eq(font.descent(), -200i32)
+    assert_eq(font.line_gap(), 90i32)
+    assert_eq(font.glyph_index(0x41), 2u32)
+    assert_eq(font.glyph_index(0x42), 0u32)
+    assert_eq(font.glyph_index(0x44), 4u32)
+    assert_eq(font.glyph_index(0xc4), 6u32)
+    assert_eq(font.glyph_index(0x1f600), 0u32)
+    assert(font.has_glyph(0x20) && !font.has_glyph(0x43))
+    assert_eq(font.advance_width(2), 600u32)
+    assert_eq(font.advance_width(9), 600u32)
+    assert_eq(font.advance_width(500), 600u32)
+    assert_eq(font.left_side_bearing(9), 0i32)
+    assert_eq(font.left_side_bearing(70000), 0i32)
+    assert_eq(font.kerning(2, 4), -80i32)
+    assert_eq(font.kerning(4, 2), -40i32)
+    assert_eq(font.kerning(4, 4), 0i32)
+    box := font.glyph_box(2)
+    assert(box.x_min == 0 && box.y_min == 0 && box.x_max == 600 && box.y_max == 700)
+    space := font.glyph_box(1)
+    assert(space.x_max == 0 && space.y_max == 0)
+    assert_eq(font.baseline(20), 16u32)
+    assert_eq(font.line_height(20), 22u32)
+    assert_eq(font.advance(2, 20), 3072i64)
+    // "AD" is 600 + 620 - 80 units; at 20 px per em that is 22.8 pixels.
+    measured := font.measure("AD\nA", 20)
+    assert(measured.width == 23 && measured.height == 44)
+
+    pixels := [0u8; 64 * 30 * 4]
+    canvas := graphics.canvas(&mut pixels, 64, 30, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.BLACK)
+    canvas.take_dirty()
+    bounds := font.draw(&mut canvas, 2, 1, "AD.", 20, graphics.WHITE)
+    // 600 + 620 - 80 + 220 units, 27.2 pixels, rounded up.
+    assert(same_rect(&bounds, 2, 1, 28, 22))
+    // The left stem of A at the baseline, the hole of A, and D's stem.
+    assert_eq(at(&canvas, 3, 16), graphics.WHITE)
+    assert_eq(at(&canvas, 7, 10), graphics.BLACK)
+    assert_eq(at(&canvas, 8, 10), graphics.BLACK)
+    assert_eq(at(&canvas, 14, 10), graphics.WHITE)
+    dirty := canvas.dirty()
+    assert(dirty.x >= 2 && dirty.y >= 1 && dirty.right() <= 30 && dirty.bottom() <= 17)
+    // A gradient paints the same coverage.
+    other_pixels := [0u8; 64 * 30 * 4]
+    other := graphics.canvas(&mut other_pixels, 64, 30, graphics.PixelFormat.Rgba8888)!
+    other.clear(graphics.BLACK)
+    white := graphics.Gradient.linear(0, 0, 9, 9, graphics.WHITE, graphics.WHITE)
+    font.draw_gradient(&mut other, 2, 1, "AD.", 20, &white)
+    assert(canvas.equals(&other))
+
+    // Errors: not a font, CFF outlines, a missing collection member.
+    match truetype.Font.new(&TEST_FONT[..40]) {
+        ok(_) => {
+            assert(false, "a truncated font must be rejected")
+        }
+        err(error) => {
+            assert(error == truetype.Error.Malformed)
+        }
+    }
+    cff := [0u8; 16]
+    cff[0] = b'O'
+    cff[1] = b'T'
+    cff[2] = b'T'
+    cff[3] = b'O'
+    match truetype.Font.new(&cff) {
+        ok(_) => {
+            assert(false, "CFF fonts are not supported")
+        }
+        err(error) => {
+            assert(error == truetype.Error.Unsupported)
+        }
+    }
+    match truetype.Font.from_collection(&TEST_FONT, 1) {
+        ok(_) => {
+            assert(false, "a single font has no second member")
+        }
+        err(error) => {
+            assert(error == truetype.Error.NoSuchFont)
+        }
+    }
+}
+
+// Random corruption of the test font: parsing may fail, but parsing,
+// lookups and drawing never trap.
+fn corrupted_fonts() {
+    random := Random { state: 0x2468ace1 }
+    data := [0u8; 808]
+    pixels := [0u8; 24 * 16 * 4]
+    canvas := graphics.canvas(&mut pixels, 24, 16, graphics.PixelFormat.Rgba8888)!
+    for _ in 0u32..600 {
+        for i in 0usize..TEST_FONT.len {
+            data[i] = TEST_FONT[i]
+        }
+        changes := random.next() % 6 + 1
+        for _ in 0u32..changes {
+            position := (random.next() as usize) % TEST_FONT.len
+            data[position] = (random.next() & 255) as u8
+        }
+        length := TEST_FONT.len
+        if random.next() % 5 == 0 {
+            length = (random.next() as usize) % TEST_FONT.len
+        }
+        match truetype.Font.new(&data[..length]) {
+            ok(font) => {
+                font.draw(&mut canvas, -2, -3, "AODÄoNZ. ÿ", 9 + random.next() % 30, graphics.WHITE)
+                font.measure("ZAD\nOo", 4096)
+                font.glyph_box(random.next() % 12)
+                font.kerning(random.next() % 12, random.next() % 12)
+                font.left_side_bearing(random.next())
+                font.glyph_index(random.next())
+            }
+            err(_) => {}
+        }
+    }
+}
+
 struct Random {
     state: u32
 
@@ -1025,7 +1555,7 @@ struct Random {
 // Corrupt and cut valid files at random. Decoding may succeed or fail, but
 // Dodo traps on any unchecked index or overflow, so finishing proves every
 // length was validated. Work stays bounded by the input size.
-fn mutate(original: &[u8], random: &mut Random, rounds: u32) {
+fn mutate(original: &[u8], random: &mut Random, rounds: u32, repair: bool) {
     data := [0u8; 640]
     target_pixels := [0u8; 16 * 16 * 4]
     target := graphics.canvas(&mut target_pixels, 16, 16, graphics.PixelFormat.Rgba8888)!
@@ -1041,6 +1571,9 @@ fn mutate(original: &[u8], random: &mut Random, rounds: u32) {
         length := original.len
         if random.next() % 3 == 0 {
             length = (random.next() as usize) % original.len
+        }
+        if repair {
+            repair_png(&mut data, length)
         }
         match image.info(&data[..length]) {
             ok(_) => {}
@@ -1058,6 +1591,25 @@ fn mutate(original: &[u8], random: &mut Random, rounds: u32) {
     }
 }
 
+// Recompute the CRC of every whole PNG chunk, so mutations reach the image
+// data instead of failing the checksum.
+fn repair_png(data: &mut[u8], length: usize) {
+    offset := 8usize
+    for offset + 12 <= length {
+        size := ((data[offset] as usize) << 24) | ((data[offset + 1] as usize) << 16) | ((data[offset + 2] as usize) << 8) | (data[offset + 3] as usize)
+        if size > length - offset - 12 {
+            return
+        }
+        crc := checksum.crc32(&data[offset + 4..offset + 8 + size])
+        end := offset + 8 + size
+        data[end] = (crc >> 24) as u8
+        data[end + 1] = ((crc >> 16) & 255) as u8
+        data[end + 2] = ((crc >> 8) & 255) as u8
+        data[end + 3] = (crc & 255) as u8
+        offset = end + 4
+    }
+}
+
 fn corrupted_files() {
     pixels := [0u8; 12 * 10 * 4]
     canvas := graphics.canvas(&mut pixels, 12, 10, graphics.PixelFormat.Rgba8888)!
@@ -1065,13 +1617,13 @@ fn corrupted_files() {
     random := Random { state: 0x12345678 }
     qoi := [0u8; 622]
     qoi_length := image.encode_qoi(&canvas, &mut qoi)!
-    mutate(&qoi[..qoi_length], &mut random, 1500)
+    mutate(&qoi[..qoi_length], &mut random, 1500, false)
     ppm := [0u8; 373]
     image.encode_ppm(&canvas, &mut ppm)!
-    mutate(&ppm, &mut random, 1500)
+    mutate(&ppm, &mut random, 1500, false)
     bmp := [0u8; 414]
     image.encode_bmp(&canvas, &mut bmp)!
-    mutate(&bmp, &mut random, 1500)
+    mutate(&bmp, &mut random, 1500, false)
     // Paletted and bit-field BMP headers, mutated around their fields.
     one_bit := [
         b'B', b'M', 70, 0, 0, 0, 0, 0, 0, 0, 62, 0, 0, 0,
@@ -1080,7 +1632,7 @@ fn corrupted_files() {
         0, 255, 0, 0, 255, 0, 0, 0,
         0x40, 0, 0, 0, 0xa0, 0, 0, 0
     ]
-    mutate(&one_bit, &mut random, 1500)
+    mutate(&one_bit, &mut random, 1500, false)
     fields := [
         b'B', b'M', 74, 0, 0, 0, 0, 0, 0, 0, 66, 0, 0, 0,
         40, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 16, 0, 3, 0, 0, 0,
@@ -1088,7 +1640,46 @@ fn corrupted_files() {
         0x00, 0xf8, 0, 0, 0xe0, 0x07, 0, 0, 0x1f, 0, 0, 0,
         0x00, 0xf8, 0x1f, 0x00, 0xe0, 0x07, 0xff, 0xff
     ]
-    mutate(&fields, &mut random, 1500)
+    mutate(&fields, &mut random, 1500, false)
+    // PNG with stored blocks, and two files from tests/graphics/png: Adam7
+    // with a 4-bit palette, and 16-bit gray with tRNS, both using every row
+    // filter. Most rounds fix the CRCs so the corruption reaches the
+    // decompressor and the filters.
+    png := [0u8; 558]
+    image.encode_png(&canvas, &mut png)!
+    mutate(&png, &mut random, 500, false)
+    mutate(&png, &mut random, 1500, true)
+    palette_adam7 := [
+        0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x0a, 0x04, 0x03, 0x00, 0x00, 0x01, 0x08, 0x1b, 0xe2,
+        0x18, 0x00, 0x00, 0x00, 0x30, 0x50, 0x4c, 0x54, 0x45, 0x0b, 0x03, 0xff, 0x4e, 0x9a, 0xe2, 0x91,
+        0x31, 0xc5, 0xd4, 0xc8, 0xa8, 0x17, 0x5f, 0x8b, 0x5a, 0xf6, 0x6e, 0x9d, 0x8d, 0x51, 0xe0, 0x24,
+        0x34, 0x23, 0xbb, 0x17, 0x66, 0x52, 0xfa, 0xa9, 0xe9, 0xdd, 0xec, 0x80, 0xc0, 0x2f, 0x17, 0xa3,
+        0x72, 0xae, 0x86, 0xb5, 0x45, 0x69, 0xf8, 0xdc, 0x4c, 0x3b, 0xed, 0x51, 0x27, 0x00, 0x00, 0x00,
+        0x56, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x01, 0x4b, 0x00, 0xb4, 0xff, 0x02, 0x0a, 0x03, 0x01,
+        0x04, 0x00, 0x00, 0x00, 0x01, 0x46, 0x8a, 0x02, 0x32, 0x03, 0x51, 0x04, 0xcb, 0x00, 0x00, 0x13,
+        0x30, 0x01, 0xaa, 0xb6, 0xa0, 0x02, 0x1f, 0xfe, 0x00, 0x03, 0xec, 0x57, 0xc7, 0x04, 0x1b, 0x55,
+        0x00, 0x00, 0xa5, 0x8f, 0x40, 0x01, 0x1f, 0xdf, 0xd2, 0x02, 0x01, 0x30, 0xf0, 0xce, 0x91, 0x03,
+        0xf0, 0x6d, 0xc0, 0x93, 0xec, 0x04, 0x66, 0xc2, 0x70, 0x56, 0x25, 0x00, 0xbb, 0xb5, 0x68, 0xf0,
+        0xfc, 0x01, 0x01, 0x2f, 0xc0, 0xe5, 0x6a, 0xe8, 0x2b, 0x19, 0xa2, 0x50, 0x67, 0xeb, 0x9b, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82
+    ]
+    mutate(&palette_adam7, &mut random, 3000, true)
+    gray16_trns := [
+        0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x05, 0x10, 0x00, 0x00, 0x00, 0x00, 0xe2, 0xa8, 0x45,
+        0xf4, 0x00, 0x00, 0x00, 0x02, 0x74, 0x52, 0x4e, 0x53, 0x9c, 0x40, 0xdd, 0xbb, 0x49, 0xbe, 0x00,
+        0x00, 0x00, 0x6a, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x01, 0x5f, 0x00, 0xa0, 0xff, 0x00, 0x9c,
+        0x40, 0x1f, 0xff, 0x3f, 0xff, 0xff, 0xff, 0x00, 0x00, 0x9c, 0x40, 0x13, 0x53, 0x41, 0x8a, 0xfa,
+        0xfe, 0x01, 0x00, 0x00, 0x1f, 0xff, 0x20, 0x00, 0x5d, 0x41, 0x63, 0xbf, 0x01, 0x01, 0xb1, 0x70,
+        0x98, 0x4c, 0x53, 0x84, 0x02, 0x00, 0x00, 0x7d, 0x41, 0xc1, 0x01, 0x2c, 0x8c, 0x36, 0x52, 0x21,
+        0x9c, 0xeb, 0xd0, 0x36, 0x43, 0xe3, 0xbf, 0x03, 0xff, 0xff, 0x33, 0x61, 0xff, 0xff, 0x7f, 0xd9,
+        0x51, 0xb9, 0x3f, 0xb5, 0x23, 0xce, 0x20, 0x00, 0x20, 0x00, 0x04, 0xaf, 0xbb, 0xf5, 0x91, 0x9d,
+        0x41, 0x9d, 0xbf, 0x00, 0x41, 0x00, 0x00, 0xc0, 0x00, 0xdd, 0x41, 0x63, 0xbf, 0x50, 0x8e, 0x27,
+        0xf7, 0x8c, 0xa7, 0x2b, 0x81, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+        0x82
+    ]
+    mutate(&gray16_trns, &mut random, 3000, true)
     // The unmutated RGB565 bit-field file decodes to its four colors.
     field_pixels := [0u8; 2 * 2 * 4]
     decoded := image.decode(&fields, &mut field_pixels, graphics.PixelFormat.Rgba8888)!
@@ -1139,13 +1730,15 @@ fn random_drawing() {
     sprite := graphics.canvas(&mut sprite_pixels, 5, 5, graphics.PixelFormat.Rgba8888)!
     sprite.clear(graphics.rgba(10, 200, 30, 128))
     coordinates := [0i32; 12]
+    path_storage := [0i32; 64]
+    path := graphics.Path.new(&mut path_storage)
     for _ in 0u32..4000 {
         canvas := &mut canvases[(random.next() % 4) as usize]
         color := random.next()
         if random.next() % 16 == 0 {
             canvas.set_clip(graphics.Rect.new(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random)))
         }
-        operation := random.next() % 14
+        operation := random.next() % 22
         if operation == 0 {
             canvas.line(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), color)
         } else if operation == 1 {
@@ -1182,6 +1775,67 @@ fn random_drawing() {
             }
         } else if operation == 12 {
             canvas.blend_rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), color)
+        } else if operation == 14 {
+            canvas.aa_line(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), color)
+        } else if operation == 15 {
+            canvas.aa_thick_line(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), extent(&mut random), color)
+        } else if operation == 16 {
+            if random.next() % 2 == 0 {
+                canvas.aa_fill_circle(wild(&mut random), wild(&mut random), extent(&mut random), color)
+            } else {
+                canvas.aa_circle(wild(&mut random), wild(&mut random), extent(&mut random), color)
+            }
+        } else if operation == 17 {
+            if random.next() % 2 == 0 {
+                canvas.aa_fill_ellipse(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), color)
+            } else {
+                canvas.aa_ellipse(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), color)
+            }
+        } else if operation == 18 {
+            if random.next() % 2 == 0 {
+                canvas.aa_fill_round_rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), extent(&mut random), color)
+            } else {
+                canvas.aa_round_rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), extent(&mut random), color)
+            }
+        } else if operation == 19 {
+            count := (random.next() % 7) as usize
+            for i in 0usize..2 * count {
+                coordinates[i] = wild(&mut random)
+            }
+            canvas.aa_fill_polygon(&coordinates[..2 * count], color)
+        } else if operation == 20 {
+            path.clear()
+            commands := random.next() % 6
+            for _ in 0u32..commands {
+                kind := random.next() % 5
+                if kind == 0 {
+                    path.move_to(wild(&mut random), wild(&mut random))
+                } else if kind == 1 {
+                    path.line_to(wild(&mut random), wild(&mut random))
+                } else if kind == 2 {
+                    path.quad_to(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random))
+                } else if kind == 3 {
+                    path.cubic_to(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random))
+                } else {
+                    path.circle(wild(&mut random), wild(&mut random), wild(&mut random))
+                }
+            }
+            if random.next() % 2 == 0 {
+                canvas.fill_path(&path, graphics.FillRule.NonZero, color)
+            } else {
+                canvas.fill_path(&path, graphics.FillRule.EvenOdd, color)
+            }
+        } else if operation == 21 {
+            shade := graphics.Gradient.linear(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), color, random.next())
+            if random.next() % 2 == 0 {
+                shade = graphics.Gradient.radial(wild(&mut random), wild(&mut random), extent(&mut random), color, random.next())
+            }
+            shade.add_stop((random.next() & 255) as u8, random.next())
+            shade.set_dither(random.next() % 2 == 0)
+            if random.next() % 2 == 0 {
+                shade.set_spread(graphics.Spread.Reflect)
+            }
+            canvas.gradient_rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), &shade)
         } else {
             region := graphics.Rect.new(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random))
             if random.next() % 2 == 0 {
@@ -1219,6 +1873,10 @@ fn main() {
     codecs()
     corrupted_files()
     random_drawing()
+    antialiasing()
+    gradients()
+    truetype_checks()
+    corrupted_fonts()
 }
 
 @test

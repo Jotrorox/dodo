@@ -1,16 +1,21 @@
 package image
 
 import "core/num"
+import "std/checksum"
+import "std/compress/deflate"
+import "std/compress/zlib"
 import "std/graphics"
 
 // Image file decoding and encoding with caller-supplied storage only: no
 // allocation, no files. Read a file with std/fs (or embed its bytes), ask
 // info() for its size, provide graphics.bytes_needed(...) bytes, and decode.
 //
-// Decoders: binary PPM/PGM (P6/P5, any maxval), QOI, and uncompressed BMP
-// (1, 4 and 8-bit palettes; 16, 24 and 32-bit, with or without bit-field
-// masks; bottom-up or top-down). Encoders: PPM (P6), QOI and 24-bit BMP.
-// Untrusted input is safe: every length is checked before it is used.
+// Decoders: binary PPM/PGM (P6/P5, any maxval), QOI, uncompressed BMP (1, 4
+// and 8-bit palettes; 16, 24 and 32-bit, with or without bit-field masks;
+// bottom-up or top-down), and PNG (every color type and bit depth, palettes,
+// transparency, interlacing). Encoders: PPM (P6), QOI, 24-bit BMP, and 8-bit
+// RGBA PNG, uncompressed or compressed. Untrusted input is safe: every length
+// is checked before it is used.
 
 pub enum Error {
     // The data ended before the image did.
@@ -50,19 +55,26 @@ pub enum Format {
     // Netpbm binary PPM (P6) or PGM (P5).
     Ppm,
     Qoi,
-    Bmp
+    Bmp,
+    Png
 }
 
 pub struct Info {
     pub format: Format
     pub width: u32
     pub height: u32
-    // True when the file stores an alpha channel (QOI RGBA, BMP alpha mask).
+    // True when the file stores an alpha channel (QOI RGBA, BMP alpha mask,
+    // PNG gray or RGB with alpha) or a PNG transparency (tRNS) chunk.
     pub has_alpha: bool
 }
 
 // Identify `data` by its signature and read its dimensions without decoding.
 pub fn info(data: &[u8]) -> Info!Error {
+    if png_signature(data) {
+        header := png_header(data)?
+        alpha := header.color == 4 || header.color == 6 || header.transparency_len > 0
+        return ok(Info { format: Format.Png, width: header.width, height: header.height, has_alpha: alpha })
+    }
     if data.len >= 4 && data[0] == b'q' && data[1] == b'o' && data[2] == b'i' && data[3] == b'f' {
         header := qoi_header(data)?
         return ok(Info { format: Format.Qoi, width: header.width, height: header.height, has_alpha: header.channels == 4 })
@@ -81,6 +93,8 @@ pub fn info(data: &[u8]) -> Info!Error {
 // Decode `data` into a new canvas over `pixels`, sized like the image and
 // stored in `format`. `pixels` needs graphics.bytes_needed(width, height,
 // format) bytes. The returned canvas's dirty rectangle covers the image.
+// PNG rows are unfiltered in PNG_SCRATCH_LEN bytes of stack; an image whose
+// rows need more fails with BufferTooSmall, so use decode_png for it.
 pub fn decode(data: &[u8], pixels: &mut[u8], format: graphics.PixelFormat) -> graphics.Canvas!Error from(pixels) {
     header := info(data)?
     canvas := match graphics.Canvas.new(pixels, header.width, header.height, format) {
@@ -107,6 +121,9 @@ pub fn draw(data: &[u8], canvas: &mut graphics.Canvas, x: i32, y: i32) -> void!E
         }
         Format.Bmp => {
             return draw_bmp(data, canvas, x, y)
+        }
+        Format.Png => {
+            return draw_png_on_stack(data, canvas, x, y)
         }
     }
 }
@@ -847,4 +864,869 @@ pub fn encode_bmp(canvas: &graphics.Canvas, output: &mut[u8]) -> usize!Error {
         }
     }
     return ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// PNG (https://www.w3.org/TR/png-3/)
+//
+// The decoder reads every color type and bit depth, PLTE, tRNS and Adam7
+// interlacing; 16-bit samples are rounded to 8 bits. Every chunk's CRC is
+// checked, unknown ancillary chunks are skipped and unknown critical chunks
+// are rejected. Gamma, chromaticity and color profile chunks are ignored, so
+// samples are taken as sRGB. Chunks after the image data are not read.
+
+// Bytes of stack the generic decode() and draw() use for PNG rows; see
+// png_scratch_size.
+pub const PNG_SCRATCH_LEN: usize = 16384
+
+const PNG_IHDR: u32 = 0x49484452
+const PNG_PLTE: u32 = 0x504c5445
+const PNG_IDAT: u32 = 0x49444154
+const PNG_IEND: u32 = 0x49454e44
+const PNG_TRNS: u32 = 0x74524e53
+const PNG_CHUNK_LIMIT: u32 = 0x7fffffff
+// Signature and IHDR chunk; the empty IEND chunk.
+const PNG_START: usize = 33
+const PNG_END: usize = 12
+// The largest stored deflate block.
+const STORED_BLOCK: usize = 65535
+
+static ADAM7_X: [7]u32 = [0, 4, 0, 2, 0, 1, 0]
+static ADAM7_Y: [7]u32 = [0, 0, 4, 0, 2, 0, 1]
+static ADAM7_DX: [7]u32 = [8, 8, 4, 4, 2, 2, 1]
+static ADAM7_DY: [7]u32 = [8, 8, 8, 4, 4, 2, 2]
+
+fn png_signature(data: &[u8]) -> bool {
+    return data.len >= 8 && data[0] == 137 && data[1] == 80 && data[2] == 78 && data[3] == 71 && data[4] == 13 && data[5] == 10 && data[6] == 26 && data[7] == 10
+}
+
+struct PngChunk {
+    kind: u32
+    // Offset and length of the chunk's data, and the offset of the next chunk.
+    data: usize
+    length: usize
+    next: usize
+}
+
+// The chunk starting at `offset`, its CRC checked.
+fn png_chunk(data: &[u8], offset: usize) -> PngChunk!Error {
+    length := be32(data, offset)?
+    kind := be32(data, offset + 4)?
+    if length > PNG_CHUNK_LIMIT {
+        return err(Error.Malformed)
+    }
+    for i in 0usize..4 {
+        byte := data[offset + 4 + i]
+        if !((byte >= b'A' && byte <= b'Z') || (byte >= b'a' && byte <= b'z')) {
+            return err(Error.Malformed)
+        }
+    }
+    start := offset + 8
+    size := length as usize
+    if size > data.len - start || data.len - start - size < 4 {
+        return err(Error.Truncated)
+    }
+    crc := checksum.Crc32.new()
+    crc.update(&data[offset + 4..start + size])
+    if crc.finish() != be32(data, start + size)? {
+        return err(Error.Malformed)
+    }
+    return ok(PngChunk { kind: kind, data: start, length: size, next: start + size + 4 })
+}
+
+struct PngHeader {
+    width: u32
+    height: u32
+    depth: u32
+    color: u32
+    channels: u32
+    interlaced: bool
+    // PLTE and tRNS data offsets and their entry or byte counts; zero when
+    // absent.
+    palette: usize
+    palette_count: usize
+    transparency: usize
+    transparency_len: usize
+    // Offset of the first IDAT chunk.
+    idat: usize
+}
+
+// Read IHDR and the chunks before the image data.
+fn png_header(data: &[u8]) -> PngHeader!Error {
+    if data.len < 8 {
+        return err(Error.Truncated)
+    }
+    if !png_signature(data) {
+        return err(Error.Malformed)
+    }
+    ihdr := png_chunk(data, 8)?
+    if ihdr.kind != PNG_IHDR || ihdr.length != 13 {
+        return err(Error.Malformed)
+    }
+    p := ihdr.data
+    width := be32(data, p)?
+    height := be32(data, p + 4)?
+    depth := data[p + 8] as u32
+    color := data[p + 9] as u32
+    if width == 0 || height == 0 || width > 0x7fffffff || height > 0x7fffffff {
+        return err(Error.Malformed)
+    }
+    if data[p + 10] != 0 || data[p + 11] != 0 || data[p + 12] > 1 {
+        return err(Error.Malformed)
+    }
+    channels := 0u32
+    wide := depth == 8 || depth == 16
+    narrow := depth == 1 || depth == 2 || depth == 4 || depth == 8
+    if color == 0 && (narrow || wide) {
+        channels = 1
+    } else if color == 2 && wide {
+        channels = 3
+    } else if color == 3 && narrow {
+        channels = 1
+    } else if color == 4 && wide {
+        channels = 2
+    } else if color == 6 && wide {
+        channels = 4
+    } else {
+        return err(Error.Malformed)
+    }
+    check_dimensions(width, height)?
+    header := PngHeader { width: width, height: height, depth: depth, color: color, channels: channels, interlaced: data[p + 12] == 1, palette: 0, palette_count: 0, transparency: 0, transparency_len: 0, idat: 0 }
+    seen_transparency := false
+    offset := ihdr.next
+    for {
+        chunk := png_chunk(data, offset)?
+        if chunk.kind == PNG_IDAT {
+            break
+        }
+        if chunk.kind == PNG_PLTE {
+            if header.palette != 0 || seen_transparency || color == 0 || color == 4 || chunk.length == 0 || chunk.length % 3 != 0 || chunk.length > 768 {
+                return err(Error.Malformed)
+            }
+            header.palette = chunk.data
+            header.palette_count = chunk.length / 3
+        } else if chunk.kind == PNG_TRNS {
+            if seen_transparency {
+                return err(Error.Malformed)
+            }
+            seen_transparency = true
+            if (color == 0 && chunk.length != 2) || (color == 2 && chunk.length != 6) || (color == 3 && header.palette == 0) {
+                return err(Error.Malformed)
+            }
+            // Types with an alpha channel must not carry tRNS; it is ignored.
+            if color != 4 && color != 6 {
+                header.transparency = chunk.data
+                header.transparency_len = chunk.length
+                // Extra alpha values beyond the palette are ignored.
+                if color == 3 && chunk.length > header.palette_count {
+                    header.transparency_len = header.palette_count
+                }
+            }
+        } else if chunk.kind == PNG_IHDR || chunk.kind == PNG_IEND {
+            return err(Error.Malformed)
+        } else if (data[offset + 4] & 32) == 0 {
+            // An unknown critical chunk changes how the image must be read.
+            return err(Error.Unsupported)
+        }
+        offset = chunk.next
+    }
+    if color == 3 && header.palette == 0 {
+        return err(Error.Malformed)
+    }
+    header.idat = offset
+    return ok(header)
+}
+
+// Bytes in one row of `width` pixels of `bits` bits, without the filter byte.
+fn png_row_bytes(width: u32, bits: u32) -> usize!Error {
+    return ok(checked_size(width as usize, bits as usize, 7)? / 8)
+}
+
+// Bytes of scratch storage draw_png and decode_png need for `data`: two rows
+// of raw image data, each with its filter byte.
+pub fn png_scratch_size(data: &[u8]) -> usize!Error {
+    header := png_header(data)?
+    row := png_row_bytes(header.width, header.depth * header.channels)?
+    return checked_size(row + 1, 2, 0)
+}
+
+// Decode PNG `data` into a new canvas over `pixels`, like decode, using
+// `scratch` of at least png_scratch_size(data) bytes for its rows.
+pub fn decode_png(data: &[u8], pixels: &mut[u8], format: graphics.PixelFormat, scratch: &mut[u8]) -> graphics.Canvas!Error from(pixels) {
+    header := png_header(data)?
+    canvas := match graphics.Canvas.new(pixels, header.width, header.height, format) {
+        ok(value) => value,
+        err(error) => {
+            return err(canvas_error(error))
+        }
+    }
+    draw_png(data, &mut canvas, 0, 0, scratch)?
+    return ok(canvas)
+}
+
+fn draw_png_on_stack(data: &[u8], canvas: &mut graphics.Canvas, x: i32, y: i32) -> void!Error {
+    scratch := [0u8; PNG_SCRATCH_LEN]
+    return draw_png(data, canvas, x, y, &mut scratch)
+}
+
+// How one decoded row maps to pixels.
+struct PngFormat {
+    color: u32
+    depth: u32
+    channels: usize
+    palette_count: u32
+    // The tRNS color of gray and RGB images, as raw samples.
+    keyed: bool
+    key_red: u32
+    key_green: u32
+    key_blue: u32
+}
+
+// Where the decoder reads compressed data: the rest of the current IDAT
+// chunk, then the chunk at `next`.
+struct PngInput {
+    position: usize
+    end: usize
+    next: usize
+}
+
+// Draw PNG `data` onto `canvas` like draw, using `scratch` of at least
+// png_scratch_size(data) bytes for its rows.
+pub fn draw_png(data: &[u8], canvas: &mut graphics.Canvas, x: i32, y: i32, scratch: &mut[u8]) -> void!Error {
+    header := png_header(data)?
+    bits := header.depth * header.channels
+    row_bytes := png_row_bytes(header.width, bits)?
+    if scratch.len < checked_size(row_bytes + 1, 2, 0)? {
+        return err(Error.BufferTooSmall)
+    }
+    // Palette entries with their alpha, opaque black past the palette.
+    colors := [graphics.BLACK; 256]
+    for i in 0usize..header.palette_count {
+        p := header.palette + i * 3
+        alpha := 255u8
+        if i < header.transparency_len {
+            alpha = data[header.transparency + i]
+        }
+        colors[i] = graphics.rgba(data[p], data[p + 1], data[p + 2], alpha)
+    }
+    format := PngFormat { color: header.color, depth: header.depth, channels: header.channels as usize, palette_count: header.palette_count as u32, keyed: false, key_red: 0, key_green: 0, key_blue: 0 }
+    if header.transparency_len > 0 && header.color != 3 {
+        t := header.transparency
+        format.keyed = true
+        format.key_red = ((data[t] as u32) << 8) | (data[t + 1] as u32)
+        format.key_green = format.key_red
+        format.key_blue = format.key_red
+        if header.color == 2 {
+            format.key_green = ((data[t + 2] as u32) << 8) | (data[t + 3] as u32)
+            format.key_blue = ((data[t + 4] as u32) << 8) | (data[t + 5] as u32)
+        }
+    }
+    // Bytes per complete pixel, at least one, for the filters.
+    step := (bits as usize + 7) / 8
+    clip := canvas.clip()
+    decoder := zlib.Decoder.new()
+    input := PngInput { position: 0, end: 0, next: header.idat }
+    passes := 1usize
+    if header.interlaced {
+        passes = 7
+    }
+    for pass in 0usize..passes {
+        x0 := 0u32
+        y0 := 0u32
+        dx := 1u32
+        dy := 1u32
+        if header.interlaced {
+            x0 = ADAM7_X[pass]
+            y0 = ADAM7_Y[pass]
+            dx = ADAM7_DX[pass]
+            dy = ADAM7_DY[pass]
+        }
+        if header.width <= x0 || header.height <= y0 {
+            continue
+        }
+        columns := (header.width - x0 + dx - 1) / dx
+        rows := (header.height - y0 + dy - 1) / dy
+        length := png_row_bytes(columns, bits)? + 1
+        // The row above a pass's first row reads as zeros.
+        previous := 0usize
+        current := length
+        for i in 0usize..length {
+            scratch[i] = 0
+        }
+        // The pass's columns inside the clip: first..last.
+        left := x as i64 + x0 as i64
+        first := 0i64
+        last := columns as i64
+        if clip.x as i64 > left {
+            first = (clip.x as i64 - left + dx as i64 - 1) / dx as i64
+        }
+        if clip.right() <= left {
+            last = 0
+        } else if (clip.right() - left + dx as i64 - 1) / dx as i64 < last {
+            last = (clip.right() - left + dx as i64 - 1) / dx as i64
+        }
+        for r in 0u32..rows {
+            png_fill(data, &mut decoder, &mut input, &mut scratch[current..current + length])?
+            png_unfilter(scratch, previous, current, length, step)?
+            row := &scratch[current + 1..current + length]
+            if format.color == 3 && format.palette_count < (1u32 << format.depth) {
+                // Out-of-range indices are errors wherever the image is drawn.
+                for i in 0usize..columns as usize {
+                    if png_index(row, i, &format) >= format.palette_count {
+                        return err(Error.Malformed)
+                    }
+                }
+            }
+            py := y as i64 + y0 as i64 + r as i64 * dy as i64
+            if py >= clip.y as i64 && py < clip.bottom() {
+                i := first
+                for i < last {
+                    color := png_pixel(row, i as usize, &format, &colors)
+                    canvas.pixel((left + i * dx as i64) as i32, py as i32, color)
+                    i += 1
+                }
+            }
+            swap := previous
+            previous = current
+            current = swap
+        }
+    }
+    return png_finish(data, &mut decoder, &mut input)
+}
+
+fn deflate_error(error: deflate.Error) -> Error {
+    if error == deflate.Error.Truncated {
+        return Error.Truncated
+    }
+    return Error.Malformed
+}
+
+// Move `input` to the next chunk; false when it is not IDAT.
+fn png_next_idat(data: &[u8], input: &mut PngInput) -> bool!Error {
+    chunk := png_chunk(data, input.next)?
+    if chunk.kind != PNG_IDAT {
+        return ok(false)
+    }
+    input.position = chunk.data
+    input.end = chunk.data + chunk.length
+    input.next = chunk.next
+    return ok(true)
+}
+
+// Decompress exactly row.len bytes, reading IDAT chunks as needed.
+fn png_fill(data: &[u8], decoder: &mut zlib.Decoder, input: &mut PngInput, row: &mut[u8]) -> void!Error {
+    filled := 0usize
+    for filled < row.len {
+        progress := match decoder.process(&data[input.position..input.end], &mut row[filled..]) {
+            ok(value) => value,
+            err(error) => {
+                return err(deflate_error(error))
+            }
+        }
+        input.position += progress.input_consumed
+        filled += progress.output_written
+        if filled < row.len {
+            if progress.status == deflate.Status.Done {
+                // The stream ended before the image did.
+                return err(Error.Truncated)
+            }
+            if progress.status == deflate.Status.NeedInput && !png_next_idat(data, input)? {
+                return err(Error.Truncated)
+            }
+        }
+    }
+    return ok()
+}
+
+// After the last row, read the rest of the zlib stream to check its Adler-32
+// when it is there. Data past the image is ignored, and so is a stream or
+// file that ends right after the image data.
+fn png_finish(data: &[u8], decoder: &mut zlib.Decoder, input: &mut PngInput) -> void!Error {
+    nothing := [0u8; 1]
+    for {
+        progress := match decoder.process(&data[input.position..input.end], &mut nothing[..0]) {
+            ok(value) => value,
+            err(error) => {
+                return err(deflate_error(error))
+            }
+        }
+        input.position += progress.input_consumed
+        if progress.status != deflate.Status.NeedInput {
+            return ok()
+        }
+        match png_next_idat(data, input) {
+            ok(more) => {
+                if !more {
+                    return ok()
+                }
+            }
+            err(error) => {
+                if error == Error.Truncated {
+                    return ok()
+                }
+                return err(error)
+            }
+        }
+    }
+}
+
+// Undo the row filter in place. The rows start at `previous` and `current`
+// in `scratch`, each `length` bytes with the filter type first; `step` is the
+// distance to the corresponding byte of the pixel on the left.
+fn png_unfilter(scratch: &mut[u8], previous: usize, current: usize, length: usize, step: usize) -> void!Error {
+    filter := scratch[current]
+    p := previous + 1
+    c := current + 1
+    n := length - 1
+    lead := step
+    if lead > n {
+        lead = n
+    }
+    if filter == 0 {
+        return ok()
+    }
+    if filter == 1 {
+        for i in lead..n {
+            scratch[c + i] = core.wrapping_add(scratch[c + i], scratch[c + i - step])
+        }
+    } else if filter == 2 {
+        for i in 0usize..n {
+            scratch[c + i] = core.wrapping_add(scratch[c + i], scratch[p + i])
+        }
+    } else if filter == 3 {
+        for i in 0usize..lead {
+            scratch[c + i] = core.wrapping_add(scratch[c + i], scratch[p + i] >> 1)
+        }
+        for i in lead..n {
+            average := ((scratch[c + i - step] as u32 + scratch[p + i] as u32) >> 1) as u8
+            scratch[c + i] = core.wrapping_add(scratch[c + i], average)
+        }
+    } else if filter == 4 {
+        // With no pixel on the left, Paeth predicts the byte above.
+        for i in 0usize..lead {
+            scratch[c + i] = core.wrapping_add(scratch[c + i], scratch[p + i])
+        }
+        for i in lead..n {
+            predictor := paeth(scratch[c + i - step], scratch[p + i], scratch[p + i - step])
+            scratch[c + i] = core.wrapping_add(scratch[c + i], predictor)
+        }
+    } else {
+        return err(Error.Malformed)
+    }
+    return ok()
+}
+
+fn paeth(left: u8, above: u8, corner: u8) -> u8 {
+    a := left as i32
+    b := above as i32
+    c := corner as i32
+    estimate := a + b - c
+    da := estimate - a
+    db := estimate - b
+    dc := estimate - c
+    if da < 0 {
+        da = -da
+    }
+    if db < 0 {
+        db = -db
+    }
+    if dc < 0 {
+        dc = -dc
+    }
+    if da <= db && da <= dc {
+        return left
+    }
+    if db <= dc {
+        return above
+    }
+    return corner
+}
+
+// Sample `i` of a row of 1, 2, 4 or 8-bit single-sample pixels.
+fn png_index(row: &[u8], i: usize, format: &PngFormat) -> u32 {
+    if format.depth == 8 {
+        return row[i] as u32
+    }
+    bit := i * format.depth as usize
+    shift := 8 - format.depth - (bit % 8) as u32
+    return ((row[bit / 8] as u32) >> shift) & ((1u32 << format.depth) - 1)
+}
+
+// A 16-bit sample rounded to 8 bits.
+fn png_narrow(value: u32) -> u8 {
+    return ((value * 255 + 32767) / 65535) as u8
+}
+
+fn png_pixel(row: &[u8], i: usize, format: &PngFormat, colors: &[u32]) -> graphics.Color {
+    if format.color == 3 {
+        return colors[png_index(row, i, format) as usize]
+    }
+    if format.depth < 8 {
+        value := png_index(row, i, format)
+        gray := (value * (255 / ((1u32 << format.depth) - 1))) as u8
+        if format.keyed && value == format.key_red {
+            return graphics.rgba(gray, gray, gray, 0)
+        }
+        return graphics.rgb(gray, gray, gray)
+    }
+    if format.depth == 8 {
+        p := i * format.channels
+        if format.color == 0 {
+            gray := row[p]
+            if format.keyed && gray as u32 == format.key_red {
+                return graphics.rgba(gray, gray, gray, 0)
+            }
+            return graphics.rgb(gray, gray, gray)
+        }
+        if format.color == 2 {
+            r := row[p]
+            g := row[p + 1]
+            b := row[p + 2]
+            if format.keyed && r as u32 == format.key_red && g as u32 == format.key_green && b as u32 == format.key_blue {
+                return graphics.rgba(r, g, b, 0)
+            }
+            return graphics.rgb(r, g, b)
+        }
+        if format.color == 4 {
+            return graphics.rgba(row[p], row[p], row[p], row[p + 1])
+        }
+        return graphics.rgba(row[p], row[p + 1], row[p + 2], row[p + 3])
+    }
+    p := i * format.channels * 2
+    first := ((row[p] as u32) << 8) | (row[p + 1] as u32)
+    if format.color == 0 || format.color == 4 {
+        gray := png_narrow(first)
+        alpha := 255u8
+        if format.color == 4 {
+            alpha = png_narrow(((row[p + 2] as u32) << 8) | (row[p + 3] as u32))
+        } else if format.keyed && first == format.key_red {
+            alpha = 0
+        }
+        return graphics.rgba(gray, gray, gray, alpha)
+    }
+    second := ((row[p + 2] as u32) << 8) | (row[p + 3] as u32)
+    third := ((row[p + 4] as u32) << 8) | (row[p + 5] as u32)
+    alpha := 255u8
+    if format.color == 6 {
+        alpha = png_narrow(((row[p + 6] as u32) << 8) | (row[p + 7] as u32))
+    } else if format.keyed && first == format.key_red && second == format.key_green && third == format.key_blue {
+        alpha = 0
+    }
+    return graphics.rgba(png_narrow(first), png_narrow(second), png_narrow(third), alpha)
+}
+
+// Raw image data size of an 8-bit RGBA PNG: each row is a filter byte and
+// four bytes per pixel. PNG cannot store an empty image.
+fn png_raw_size(width: u32, height: u32) -> usize!Error {
+    if width == 0 || height == 0 {
+        return err(Error.Unsupported)
+    }
+    check_dimensions(width, height)?
+    row := checked_size(width as usize, 4, 1)?
+    return checked_size(row, height as usize, 0)
+}
+
+// Write the signature and an IHDR chunk for 8-bit RGBA, PNG_START bytes.
+fn png_start(output: &mut[u8], width: u32, height: u32) {
+    signature := [137u8, 80, 78, 71, 13, 10, 26, 10]
+    for i in 0usize..8 {
+        output[i] = signature[i]
+    }
+    put_be32(output, 8, 13)
+    put_be32(output, 12, PNG_IHDR)
+    put_be32(output, 16, width)
+    put_be32(output, 20, height)
+    output[24] = 8
+    output[25] = 6
+    output[26] = 0
+    output[27] = 0
+    output[28] = 0
+    png_seal(output, 8, 13)
+}
+
+// Write the CRC of the chunk at `offset` with `length` data bytes.
+fn png_seal(output: &mut[u8], offset: usize, length: usize) {
+    crc := checksum.Crc32.new()
+    crc.update(&output[offset + 4..offset + 8 + length])
+    put_be32(output, offset + 8 + length, crc.finish())
+}
+
+// Write the IEND chunk at `offset` and return the end of the file.
+fn png_close(output: &mut[u8], offset: usize) -> usize {
+    put_be32(output, offset, 0)
+    put_be32(output, offset + 4, PNG_IEND)
+    png_seal(output, offset, 0)
+    return offset + PNG_END
+}
+
+// Bytes encode_png writes for a width x height canvas. Fails with Unsupported
+// for an empty canvas, which PNG cannot store.
+pub fn png_size(width: u32, height: u32) -> usize!Error {
+    raw := png_raw_size(width, height)?
+    blocks := raw / STORED_BLOCK
+    if raw % STORED_BLOCK != 0 {
+        blocks += 1
+    }
+    // Each stored block sits in its own IDAT chunk: 12 bytes of chunk
+    // framing and a 5-byte block header; the zlib header and Adler-32 add 6.
+    fixed := checked_size(raw, 1, PNG_START + PNG_END + 6)?
+    return checked_size(blocks, 17, fixed)
+}
+
+// The stored-block writer's position in the output.
+struct StoredPng {
+    position: usize
+    // The current IDAT chunk and its stored block's first data byte.
+    chunk: usize
+    block: usize
+    // Bytes left in the current block and in the whole image.
+    block_left: usize
+    raw_left: usize
+    first: bool
+    adler: checksum.Adler32
+}
+
+fn stored_open(output: &mut[u8], state: &mut StoredPng) {
+    state.chunk = state.position
+    put_be32(output, state.chunk + 4, PNG_IDAT)
+    position := state.chunk + 8
+    if state.first {
+        // Deflate with a 32 KiB window and no dictionary, at the fastest level.
+        output[position] = 0x78
+        output[position + 1] = 0x01
+        position += 2
+        state.first = false
+    }
+    size := state.raw_left
+    if size > STORED_BLOCK {
+        size = STORED_BLOCK
+    }
+    output[position] = 0
+    if size == state.raw_left {
+        output[position] = 1
+    }
+    put_le16(output, position + 1, size as u32)
+    put_le16(output, position + 3, (size ^ 0xffff) as u32)
+    state.block = position + 5
+    state.position = position + 5
+    state.block_left = size
+}
+
+fn stored_close(output: &mut[u8], state: &mut StoredPng) {
+    state.adler.update(&output[state.block..state.position])
+    if state.raw_left == 0 {
+        put_be32(output, state.position, state.adler.finish())
+        state.position += 4
+    }
+    length := state.position - state.chunk - 8
+    put_be32(output, state.chunk, length as u32)
+    png_seal(output, state.chunk, length)
+    state.position += 4
+}
+
+// Append raw image bytes, splitting them into stored blocks.
+fn stored_write(output: &mut[u8], state: &mut StoredPng, bytes: &[u8]) {
+    for i in 0usize..bytes.len {
+        if state.block_left == 0 {
+            stored_open(output, state)
+        }
+        output[state.position] = bytes[i]
+        state.position += 1
+        state.block_left -= 1
+        state.raw_left -= 1
+        if state.block_left == 0 {
+            stored_close(output, state)
+        }
+    }
+}
+
+// Write `canvas` as an 8-bit RGBA PNG without compression (stored deflate
+// blocks, no row filters) and return the byte count, png_size(width, height).
+pub fn encode_png(canvas: &graphics.Canvas, output: &mut[u8]) -> usize!Error {
+    width := canvas.width()
+    height := canvas.height()
+    total := png_size(width, height)?
+    if output.len < total {
+        return err(Error.BufferTooSmall)
+    }
+    png_start(output, width, height)
+    state := StoredPng { position: PNG_START, chunk: 0, block: 0, block_left: 0, raw_left: png_raw_size(width, height)?, first: true, adler: checksum.Adler32.new() }
+    filter := [0u8; 1]
+    pixel := [0u8; 4]
+    for row in 0u32..height {
+        stored_write(output, &mut state, &filter)
+        for column in 0u32..width {
+            color := pixel_at(canvas, column, row)
+            pixel[0] = graphics.red(color)
+            pixel[1] = graphics.green(color)
+            pixel[2] = graphics.blue(color)
+            pixel[3] = graphics.alpha(color)
+            stored_write(output, &mut state, &pixel)
+        }
+    }
+    return ok(png_close(output, state.position))
+}
+
+// An upper bound on what encode_png_compressed writes for a width x height
+// canvas at any level.
+pub fn png_compressed_max_size(width: u32, height: u32) -> usize!Error {
+    raw := png_raw_size(width, height)?
+    // The streaming compressor ends a block at most once per 8 KiB of input
+    // on average, and no block is larger than its stored form: the raw bytes
+    // plus up to 6 bytes of header. The zlib header and Adler-32 add 6.
+    blocks := raw / 8192 + 2
+    data := checked_size(blocks, 6, 6 + PNG_START + 12 + PNG_END)?
+    return checked_size(raw, 1, data)
+}
+
+// Byte `k` (0 red, 1 green, 2 blue, 3 alpha) of `color`.
+fn png_channel(color: graphics.Color, k: usize) -> u8 {
+    if k == 3 {
+        return graphics.alpha(color)
+    }
+    return ((color >> (16 - 8 * k as u32)) & 255) as u8
+}
+
+// The byte filter type `filter` stores for raw byte x with neighbours a
+// (left), b (above) and c (above left).
+fn png_filtered(filter: usize, x: u8, a: u8, b: u8, c: u8) -> u8 {
+    if filter == 1 {
+        return core.wrapping_sub(x, a)
+    }
+    if filter == 2 {
+        return core.wrapping_sub(x, b)
+    }
+    if filter == 3 {
+        return core.wrapping_sub(x, ((a as u32 + b as u32) >> 1) as u8)
+    }
+    if filter == 4 {
+        return core.wrapping_sub(x, paeth(a, b, c))
+    }
+    return x
+}
+
+// The filter for `row` with the smallest sum of filtered bytes taken as
+// signed magnitudes, the usual adaptive heuristic.
+fn png_choose_filter(canvas: &graphics.Canvas, row: u32) -> usize {
+    sums := [0u64; 5]
+    left := graphics.TRANSPARENT
+    corner := graphics.TRANSPARENT
+    for column in 0u32..canvas.width() {
+        color := pixel_at(canvas, column, row)
+        above := graphics.TRANSPARENT
+        if row > 0 {
+            above = pixel_at(canvas, column, row - 1)
+        }
+        for k in 0usize..4 {
+            x := png_channel(color, k)
+            a := png_channel(left, k)
+            b := png_channel(above, k)
+            c := png_channel(corner, k)
+            for filter in 0usize..5 {
+                value := png_filtered(filter, x, a, b, c) as u64
+                if value > 128 {
+                    value = 256 - value
+                }
+                sums[filter] += value
+            }
+        }
+        left = color
+        corner = above
+    }
+    best := 0usize
+    for filter in 1usize..5 {
+        if sums[filter] < sums[best] {
+            best = filter
+        }
+    }
+    return best
+}
+
+// Compress `input` into output[*written..]; with `finish`, end the stream.
+fn png_compress(encoder: &mut zlib.Encoder, input: &[u8], output: &mut[u8], written: &mut usize, finish: bool) -> void!Error {
+    used := 0usize
+    for {
+        progress := encoder.process(&input[used..], &mut output[*written..], finish)
+        used += progress.input_consumed
+        *written += progress.output_written
+        if progress.status == deflate.Status.Done {
+            return ok()
+        }
+        if progress.status == deflate.Status.NeedOutput {
+            return err(Error.BufferTooSmall)
+        }
+        if !finish && used == input.len {
+            return ok()
+        }
+    }
+}
+
+// Write `canvas` as a compressed 8-bit RGBA PNG and return its length. Each
+// row gets the adaptive filter that suits it; `level` is the deflate level, 0
+// through 9. The compressor borrows `buffer` of deflate.ENCODER_BUFFER_LEN
+// bytes and `words` of deflate.WORKSPACE_LEN words (about 350 KiB together;
+// static storage suits small stacks). The output needs at most
+// png_compressed_max_size(width, height) bytes; a smaller buffer works when
+// the image compresses well, else fails with BufferTooSmall.
+pub fn encode_png_compressed(canvas: &graphics.Canvas, output: &mut[u8], level: usize, buffer: &mut[u8], words: &mut[u32]) -> usize!Error {
+    width := canvas.width()
+    height := canvas.height()
+    png_raw_size(width, height)?
+    if level > deflate.MAX_LEVEL {
+        return err(Error.Unsupported)
+    }
+    if buffer.len < deflate.ENCODER_BUFFER_LEN || words.len < deflate.WORKSPACE_LEN || output.len < PNG_START + 12 + PNG_END {
+        return err(Error.BufferTooSmall)
+    }
+    encoder := match zlib.Encoder.new(level, buffer, words) {
+        ok(value) => value,
+        err(_) => {
+            return err(Error.BufferTooSmall)
+        }
+    }
+    png_start(output, width, height)
+    chunk := PNG_START
+    put_be32(output, chunk + 4, PNG_IDAT)
+    start := chunk + 8
+    // Room for the chunk's CRC and IEND stays reserved.
+    limit := output.len - 4 - PNG_END
+    written := start
+    pending := [0u8; 512]
+    fill := 0usize
+    for row in 0u32..height {
+        filter := png_choose_filter(canvas, row)
+        if fill == pending.len {
+            png_compress(&mut encoder, &pending[..fill], &mut output[..limit], &mut written, false)?
+            fill = 0
+        }
+        pending[fill] = filter as u8
+        fill += 1
+        left := graphics.TRANSPARENT
+        corner := graphics.TRANSPARENT
+        for column in 0u32..width {
+            color := pixel_at(canvas, column, row)
+            above := graphics.TRANSPARENT
+            if row > 0 {
+                above = pixel_at(canvas, column, row - 1)
+            }
+            if fill + 4 > pending.len {
+                png_compress(&mut encoder, &pending[..fill], &mut output[..limit], &mut written, false)?
+                fill = 0
+            }
+            for k in 0usize..4 {
+                pending[fill + k] = png_filtered(filter, png_channel(color, k), png_channel(left, k), png_channel(above, k), png_channel(corner, k))
+            }
+            fill += 4
+            left = color
+            corner = above
+        }
+    }
+    png_compress(&mut encoder, &pending[..fill], &mut output[..limit], &mut written, true)?
+    length := written - start
+    if length > PNG_CHUNK_LIMIT as usize {
+        return err(Error.TooLarge)
+    }
+    put_be32(output, chunk, length as u32)
+    png_seal(output, chunk, length)
+    return ok(png_close(output, written + 4))
 }

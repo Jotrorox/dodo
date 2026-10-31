@@ -1,6 +1,6 @@
 ---
 title: "Graphics"
-description: "Draw shapes, text and images into pixel buffers on any target, present them on display panels or through the Display protocol, and test rendering with golden images."
+description: "Draw shapes, antialiased paths, gradients, bitmap and TrueType text and images into pixel buffers on any target, present them on display panels or through the Display protocol, and test rendering with golden images."
 section: "Standard library"
 order: 160.5
 ---
@@ -11,14 +11,15 @@ arithmetic, so the same program produces byte-identical pixels on a laptop, in
 WebAssembly and on a Raspberry Pi Pico without an FPU. Nothing is allocated and
 no operating system is needed.
 
-The family has four imports, and three more drive display panels on
+The family has five imports, and three more drive display panels on
 microcontrollers:
 
 | Import | Contents |
 | --- | --- |
-| `std/graphics` | `Canvas`, colors, rectangles, drawing, text rendering, the `Display` protocol, band rendering. |
+| `std/graphics` | `Canvas`, colors, rectangles, drawing, antialiased paths and shapes, gradients, text rendering, the `Display` protocol, band rendering. |
 | `std/graphics/font` | Built-in 6x8 and 8x16 bitmap fonts for ASCII and Latin-1. |
-| `std/graphics/image` | PPM, QOI and BMP decoding and encoding into caller buffers. |
+| `std/graphics/truetype` | TrueType (`.ttf`, `.ttc`) fonts drawn antialiased at any size. |
+| `std/graphics/image` | PPM, QOI, BMP and PNG decoding and encoding into caller buffers. |
 | `std/graphics/fake` | An in-memory `Display` for tests. |
 | `std/embedded/display` | The SPI and I2C links that panel drivers talk over. |
 | `std/embedded/display/st7789` | ST7789 colour TFT and IPS panels, RGB565 over SPI. |
@@ -335,6 +336,9 @@ reads and resets it, and `mark_dirty` adds an area changed by other means.
 | `blend(source, x, y)`, `blend_region(...)` | Another canvas composited by its alpha. |
 | `text(font, x, y, text, color)` | UTF-8 text; returns the bounds of its character cells. |
 
+These calls store their color in whole pixels; the
+[antialiased family](#antialiased-drawing) blends partial pixels instead.
+
 Polygons take a flat `[N]i32` of coordinate pairs because a Dodo array of
 structs cannot be filled by repetition; `[0i32; 2 * N]` can, so a program can
 compute its vertices in a loop.
@@ -352,6 +356,146 @@ ellipse radii to 16383, which keeps every intermediate product within 64 bits
 and only matters for shapes hundreds of millions of pixels away. Work is
 bounded by the visible area: a line between distant points costs at most one
 step per visible column.
+
+## Antialiased drawing
+
+The `aa_` calls draw the same shapes with smooth edges. Each pixel is blended
+with the color by the fraction of its area the shape covers, computed exactly
+from the shape's edges in integer arithmetic, so antialiased images are as
+reproducible as the rest. Unlike the integer primitives, they *composite*
+over what is already there; a translucent color is scaled by the coverage.
+
+```dodo test
+package smooth
+
+import "std/graphics"
+
+@test
+fn edges_blend_and_interiors_fill() {
+    pixels := [0u8; 32 * 32 * 4]
+    canvas := graphics.canvas(&mut pixels, 32, 32, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.BLACK)
+    canvas.aa_fill_circle(15, 15, 10, graphics.WHITE)
+    canvas.aa_thick_line(2, 30, 29, 22, 3, graphics.rgba(97, 175, 239, 200))
+
+    match canvas.color_at(15, 15) {
+        some(color) => assert_eq(color, graphics.WHITE),
+        none => assert(false),
+    }
+    // A pixel on the rim is only partly covered: a shade of gray.
+    match canvas.color_at(15, 5) {
+        some(color) => assert(graphics.red(color) > 0 && graphics.red(color) < 255),
+        none => assert(false),
+    }
+}
+```
+
+| Call | Draws |
+| --- | --- |
+| `aa_line(x0, y0, x1, y1, color)` | A one-pixel line between pixel centres with square ends; axis-aligned lines cover the same pixels as `line`. |
+| `aa_thick_line(x0, y0, x1, y1, width, color)` | A line `width` pixels wide with round ends. |
+| `aa_circle` / `aa_fill_circle(cx, cy, radius, color)` | The ring or disk `circle` and `fill_circle` approximate: radius + 1/2 around the centre of pixel (cx, cy). |
+| `aa_ellipse` / `aa_fill_ellipse(cx, cy, rx, ry, color)` | The same for ellipses. |
+| `aa_round_rect` / `aa_fill_round_rect(x, y, width, height, radius, color)` | Exactly round corners; radius 0 gives the same pixels as `fill_rect`. |
+| `aa_fill_polygon(coordinates, color)` | An even-odd polygon through pixel corners, like `fill_polygon`. |
+| `fill_path(path, rule, color)`, `fill_outline(outline, rule, color)` | Any [path or outline](#paths-and-outlines). |
+| `gradient_rect`, `gradient_path`, `gradient_outline` | The same with a [gradient](#gradients). |
+
+Clipping, dirty rectangles, origins and bands work as for every other call,
+and every pixel format is supported: `Mono1` lights a pixel once it is about
+half covered.
+
+### Paths and outlines
+
+Path coordinates are fixed point: `graphics.SUBPIXEL` (256) units make one
+pixel, so shapes can sit between pixels. The pixel (x, y) spans x * 256 to
+(x + 1) * 256, and its centre is x * 256 + 128.
+
+A `graphics.Path` stores commands in caller-owned `i32` words:
+
+```dodo
+storage := [0i32; 256]
+path := graphics.Path.new(&mut storage)
+path.move_to(4 * graphics.SUBPIXEL, 28 * graphics.SUBPIXEL)
+path.cubic_to(10 * 256, 0, 22 * 256, 0, 28 * 256, 28 * 256)
+path.quad_to(16 * 256, 16 * 256, 4 * 256, 28 * 256)
+path.close()
+path.circle(16 * 256, 20 * 256, 3 * 256)       // a whole contour
+canvas.fill_path(&path, graphics.FillRule.EvenOdd, graphics.hex(0xe5c07b))
+```
+
+`move_to`, `line_to`, `quad_to`, `cubic_to` and `close` build contours; a
+contour left open is closed by a straight line. `rect`, `round_rect`,
+`ellipse` and `circle` each add a closed contour. A move or line takes 3
+words, a quadratic curve 5, a cubic 7, `close` 1, a circle or ellipse 60 and
+a rounded rectangle 72. Building a path never fails: when a command does not
+fit, `overflowed()` turns true and the path draws nothing, so size the
+storage for the largest shape and check `overflowed()` in a test.
+
+`FillRule.NonZero` treats every area the contours wind around as inside, so
+overlapping contours merge; `FillRule.EvenOdd` makes each nested contour cut
+a hole whatever its direction.
+
+A path is one kind of `graphics.Outline`, the interface the rasterizer draws.
+Any type with a `pub fn trace(&self, pen: &mut graphics.Pen)` method is an
+outline: it describes itself by calling the same five commands on the pen,
+and needs no storage at all. The rasterizer calls `trace` several times per
+drawing call (once for the bounds, then once per row), so it must describe
+the same shape each time:
+
+```dodo
+struct Diamond {
+    cx: i32
+    cy: i32
+    radius: i32
+
+    pub fn trace(&self, pen: &mut graphics.Pen) {
+        pen.move_to(self.cx, self.cy - self.radius)
+        pen.line_to(self.cx + self.radius, self.cy)
+        pen.line_to(self.cx, self.cy + self.radius)
+        pen.line_to(self.cx - self.radius, self.cy)
+    }
+}
+
+shape := Diamond { cx: 16 * 256, cy: 16 * 256, radius: 10 * 256 }
+canvas.fill_outline(&shape, graphics.FillRule.NonZero, graphics.WHITE)
+```
+
+Curves are flattened to within 1/32 pixel. Path coordinates are clamped to
++/-2^29 subpixels (+/-2^21 pixels) and the `aa_` calls' pixel coordinates to
++/-2^21, which keeps every product within 64 bits. Work is bounded by the
+visible part of the shape: rows and columns outside the clip rectangle are
+never visited. Each visible row traces the whole outline again, so an outline
+with thousands of edges is drawn faster as several smaller ones.
+
+## Gradients
+
+A `graphics.Gradient` paints colors that change across an area:
+
+```dodo
+sky := graphics.Gradient.linear(0, 0, 0, 99, graphics.hex(0x203a5c), graphics.hex(0xf4a259))
+sky.add_stop(170, graphics.hex(0xbc4b51))
+canvas.gradient_rect(0, 0, 160, 100, &sky)
+
+glow := graphics.Gradient.radial(120, 30, 24, graphics.WHITE, graphics.TRANSPARENT)
+canvas.gradient_rect(96, 6, 48, 48, &glow)
+```
+
+`Gradient.linear(x0, y0, x1, y1, start, end)` runs from `start` at pixel
+(x0, y0) to `end` at pixel (x1, y1). `Gradient.radial(cx, cy, radius, inner,
+outer)` runs from the centre of pixel (cx, cy) outward. Colors are sampled at
+pixel centres, so the end pixels get exactly the end colors. `add_stop(offset,
+color)` inserts a color at `offset`, from 0 (start) to 255 (end); a gradient
+holds up to `graphics.GRADIENT_STOPS` (8) stops, and two stops at the same
+offset make a hard edge. `color_at(x, y)` returns the color a pixel gets.
+
+Interpolation uses premultiplied alpha, so fading to `TRANSPARENT` thins a
+color out instead of darkening it. `set_spread(Spread.Repeat)` and
+`Spread.Reflect` continue the gradient beyond its end instead of extending
+the end colors (`Spread.Pad`). `set_dither(true)` adds a 4x4 ordered dither
+when drawing on `Rgb565` and `Mono1` canvases, trading the bands those
+formats show for a fine pattern; on `Mono1` a mid gray becomes a checkerboard.
+Gradients composite over the canvas like the antialiased calls.
 
 ## Text and fonts
 
@@ -377,6 +521,53 @@ Glyphs are stored for consecutive code points from `first`, each
 the most significant bit. Put the bitmap in a `static` array so firmware keeps
 it in flash.
 
+### TrueType fonts
+
+`std/graphics/truetype` draws TrueType fonts antialiased at any size. A font
+is read in place from its bytes, a file loaded with [std/fs](filesystem.md)
+or bytes compiled into the program; nothing is copied or allocated, and each
+glyph's outline is decoded straight from the font data while drawing.
+
+```dodo
+import "std/fs"
+import "std/graphics"
+import "std/graphics/truetype"
+import "std/platform"
+
+storage := [0u8; 1048576]
+workspace := platform.workspace()
+report := fs.read_file("DejaVuSans.ttf", &mut storage, &mut workspace)?
+font := truetype.Font.new(&storage[..report.read])?
+
+bounds := font.draw(&mut canvas, 8, 8, "Grüße, 50 €", 24, graphics.WHITE)
+size := font.measure("Hello", 16)
+```
+
+`draw(canvas, x, y, text, size, color)` places the top-left corner of the
+first line at (x, y), with `size` the em size in pixels, and returns the area
+that `measure(text, size)` reports: the widest line's advance by the line
+count times `line_height(size)`. Each line's baseline is `baseline(size)`
+pixels below its top. `"\n"` starts a new line, kerning pairs from the
+font's `kern` table are applied, and glyphs are placed to 1/256 pixel, so
+spacing stays even at small sizes. `draw_gradient` takes a gradient instead
+of a color, and `font.glyph(index, x, y, size)` returns a single glyph as a
+`graphics.Outline` for `fill_outline`, positioned by its baseline origin in
+subpixels.
+
+`Font.new` opens a `.ttf` file or the first font of a `.ttc` collection;
+`truetype.font_count(data)` and `Font.from_collection(data, index)` reach the
+others. Lower-level lookups work in font units: `glyph_index(code_point)`
+(0, the box-shaped `.notdef` glyph, when the font has none), `advance_width`,
+`left_side_bearing`, `kerning`, `glyph_box`, `units_per_em`, `ascent`,
+`descent` and `line_gap`.
+
+Supported are TrueType outlines, simple and composite glyphs, and character
+maps in formats 0, 4, 6 and 12, which cover all of Unicode. Fonts with CFF
+outlines (`.otf` files beginning with `OTTO`) return `Error.Unsupported`;
+other errors are `Malformed` and `NoSuchFont`. Untrusted fonts are safe:
+every offset is checked, composite glyphs are limited in depth and size, and
+a damaged glyph draws as much of its outline as is valid.
+
 ## Images
 
 `std/graphics/image` decodes from a byte slice and encodes into a byte buffer;
@@ -394,12 +585,34 @@ image.draw(&data, &mut canvas, 10, 10)?   // straight onto an existing canvas
 | Netpbm | Binary PPM (P6) and PGM (P5), any maxval, comments | P6, `ppm_size` bytes |
 | QOI | RGB and RGBA | RGBA, at most `qoi_max_size` bytes |
 | BMP | Uncompressed 1, 4, 8-bit palettes; 16, 24, 32-bit with or without bit-field masks; bottom-up or top-down | 24-bit, `bmp_size` bytes |
+| PNG | Every color type and bit depth (gray, RGB, palette, gray and RGB with alpha; 1 to 16 bits), `tRNS` transparency, Adam7 interlacing | 8-bit RGBA: uncompressed, `png_size` bytes; or compressed, at most `png_compressed_max_size` bytes |
 
-PPM and BMP encoding drop alpha; QOI keeps it. Errors are `Truncated`,
-`Malformed`, `Unsupported` (ASCII PPM, compressed BMP), `TooLarge`, and
-`BufferTooSmall`. Every length is checked before use, so untrusted files are
-safe to decode; a failure part-way through `draw` can leave part of the image
-drawn.
+PPM and BMP encoding drop alpha; QOI and PNG keep it. Errors are `Truncated`,
+`Malformed`, `Unsupported` (ASCII PPM, compressed BMP, an unknown critical PNG
+chunk), `TooLarge`, and `BufferTooSmall`. Every length is checked before use,
+so untrusted files are safe to decode; a failure part-way through `draw` can
+leave part of the image drawn.
+
+PNG decoding checks every chunk's CRC and the zlib Adler-32, skips unknown
+ancillary chunks, and rounds 16-bit samples to 8 bits. Gamma, chromaticity and
+color profile chunks are ignored, so samples are taken as sRGB. Unfiltering
+needs two rows of raw image data: `decode` and `draw` keep
+`image.PNG_SCRATCH_LEN` (16 KiB) bytes of them on the stack and fail with
+`BufferTooSmall` for wider rows, such as RGBA wider than 2047 pixels. Pass
+your own storage of `image.png_scratch_size(&data)` bytes to `decode_png` or
+`draw_png` instead. The zlib decoder adds about 40 KiB of stack either way.
+
+```dodo
+scratch := [0u8; 32768]                   // png_scratch_size(&data) or more
+image.draw_png(&data, &mut canvas, 0, 0, &mut scratch)?
+```
+
+`encode_png` writes stored (uncompressed) deflate blocks with no row filters:
+the size is exact and nothing beyond the output buffer is needed, which suits
+firmware. `encode_png_compressed` picks a filter for each row and compresses
+with [std/compress](compression.md); it borrows `deflate.ENCODER_BUFFER_LEN`
+bytes and `deflate.WORKSPACE_LEN` words of storage, about 350 KiB together,
+which static storage provides best.
 
 ## Test rendering
 
@@ -418,9 +631,12 @@ including regenerating every image with `DODO_UPDATE_GOLDEN=1`.
 
 ## Limits
 
-There is no antialiasing, no floating point, and no GPU path: those are
-deliberate for predictable results on microcontrollers. Fonts are fixed-width
-bitmaps; there is no TrueType rasterizer, PNG codec, or text shaping.
+There is no floating point and no GPU path: both are deliberate for
+predictable results on microcontrollers. Paths can be filled but not yet
+stroked, except for the straight `aa_line` and `aa_thick_line`. TrueType
+text is not hinted, and there is no text shaping: no ligatures, GPOS
+kerning, right-to-left or vertical text, and characters map one to one to
+glyphs.
 
 The panel drivers write pixels through the SPI or I2C bus protocol, so a
 transfer keeps the processor busy; there is no DMA path for them yet. ST7789

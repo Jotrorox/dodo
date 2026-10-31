@@ -416,6 +416,17 @@ fn portable_package_dependencies_are_independent_and_reserved() {
             vec!["alloc/", "std/platform", "std/fs"],
         ),
         (
+            "std/graphics/truetype",
+            vec![
+                "alloc/",
+                "std/io",
+                "std/platform",
+                "std/fs",
+                "std/graphics/font",
+                "std/graphics/image",
+            ],
+        ),
+        (
             "std/embedded/display",
             vec![
                 "alloc/",

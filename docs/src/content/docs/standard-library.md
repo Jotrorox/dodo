@@ -46,6 +46,7 @@ they are not prerequisites for using the safe entry APIs.
 | Decode or encode JSON | `@derive(Json)` and `json.decode<T>` | [JSON](json.md) |
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
 | Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
+| Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
 | Open a window | `window.open` and `win.canvas()` | [Windows](window.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
@@ -173,7 +174,7 @@ individual modules and links every public declaration back to its source.
 | [Collections](collections.md) | `std/collections`, `std/collections/deque`, `std/collections/fixed_deque`, `std/collections/fixed_map`, `std/collections/fixed_set`, `std/collections/fixed_vector`, `std/collections/hash_map`, `std/collections/hash_set`, `std/collections/heap`, `std/collections/ordered_map`, `std/collections/ordered_set`, `std/collections/shared_deque`, `std/collections/shared_hash_map`, `std/collections/shared_hash_set`, `std/collections/shared_heap`, `std/collections/shared_ordered_map`, `std/collections/shared_ordered_set`, `std/collections/shared_vector`, `std/collections/vector` | Portable. |
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
-| [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image`; panels in `std/embedded/display`, `std/embedded/display/st7789`, `std/embedded/display/ssd1306` | Portable; caller-supplied pixel and file buffers. |
+| [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image`, `std/graphics/truetype`; panels in `std/embedded/display`, `std/embedded/display/st7789`, `std/embedded/display/ssd1306` | Portable; caller-supplied pixel and file buffers. |
 | [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
 | [Time and clocks](time.md) | `std/time`, `std/time/clock`, `std/time/hosted`, `std/time/iso8601`, `std/time/timer` | Values/contracts portable; hosted clock explicit. |
 | [Native strings and errors](platform.md) | `std/platform`, `std/platform/error` | Hosted. |

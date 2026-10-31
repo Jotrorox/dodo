@@ -1,0 +1,137 @@
+package main
+
+import "std/compress/deflate"
+import "std/console"
+import "std/env"
+import "std/fs"
+import "std/graphics"
+import "std/graphics/image"
+import "std/graphics/truetype"
+import "std/platform"
+
+// Draws a small poster with antialiased shapes, gradients and TrueType text
+// and saves it as poster.png. Pass the TrueType font to set the text in:
+//
+//     dodo run examples/poster.dodo -- /System/Library/Fonts/Supplemental/Georgia.ttf
+//     dodo run examples/poster.dodo -- /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+//     dodo run examples/poster.dodo -- C:\Windows\Fonts\arial.ttf
+//
+// The font, the encoded image and the compressor's working memory live in
+// static storage rather than on the stack. Touching a `static mut` is unsafe
+// because the compiler cannot rule out two threads sharing it; this program
+// has one thread.
+
+const WIDTH: u32 = 360
+const HEIGHT: u32 = 240
+const FONT_LIMIT: usize = 4194304
+const OUTPUT_LIMIT: usize = 400000
+
+static mut FONT: [FONT_LIMIT]u8 = [0u8; FONT_LIMIT]
+static mut OUTPUT: [OUTPUT_LIMIT]u8 = [0u8; OUTPUT_LIMIT]
+static mut COMPRESSOR_BUFFER: [deflate.ENCODER_BUFFER_LEN]u8 = [0u8; deflate.ENCODER_BUFFER_LEN]
+static mut COMPRESSOR_WORDS: [deflate.WORKSPACE_LEN]u32 = [0u32; deflate.WORKSPACE_LEN]
+
+fn draw_poster(canvas: &mut graphics.Canvas, font: &truetype.Font) {
+    // An evening sky, a sun with a soft glow, and hills drawn as curves.
+    sky := graphics.Gradient.linear(0, 0, 0, HEIGHT as i32 - 1, graphics.hex(0x1b2a49), graphics.hex(0xf4a259))
+    sky.add_stop(150, graphics.hex(0xbc4b51))
+    canvas.gradient_rect(0, 0, WIDTH, HEIGHT, &sky)
+    glow := graphics.Gradient.radial(262, 150, 80, graphics.rgba(255, 236, 179, 200), graphics.rgba(255, 236, 179, 0))
+    canvas.gradient_rect(182, 70, 160, 160, &glow)
+    canvas.aa_fill_circle(262, 150, 32, graphics.hex(0xfff1c1))
+
+    storage := [0i32; 64]
+    hills := graphics.Path.new(&mut storage)
+    hills.move_to(0, 196 * graphics.SUBPIXEL)
+    hills.cubic_to(80 * 256, 150 * 256, 150 * 256, 210 * 256, 220 * 256, 186 * 256)
+    hills.cubic_to(280 * 256, 166 * 256, 320 * 256, 160 * 256, 360 * 256, 172 * 256)
+    hills.line_to(360 * 256, 240 * 256)
+    hills.line_to(0, 240 * 256)
+    canvas.fill_path(&hills, graphics.FillRule.NonZero, graphics.hex(0x284b63))
+
+    // Two birds, each two round-ended strokes.
+    for i in 0i32..2 {
+        x := 52 + i * 30
+        y := 124 - i * 12
+        canvas.aa_thick_line(x - 9, y - 4, x, y, 2, graphics.hex(0x1b2a49))
+        canvas.aa_thick_line(x, y, x + 9, y - 4, 2, graphics.hex(0x1b2a49))
+    }
+
+    // The title, centred, over a soft shadow.
+    title := "Dodo graphics"
+    size := 40u32
+    measured := font.measure(title, size)
+    x := (WIDTH as i32 - measured.width as i32) / 2
+    font.draw(canvas, x + 2, 22, title, size, graphics.rgba(0, 0, 0, 80))
+    font.draw(canvas, x, 20, title, size, graphics.WHITE)
+    caption := "Antialiased shapes, gradients and TrueType text"
+    caption_size := font.measure(caption, 13)
+    font.draw(canvas, (WIDTH as i32 - caption_size.width as i32) / 2, 70, caption, 13, graphics.rgba(255, 255, 255, 220))
+
+    // A translucent label with exactly round corners.
+    canvas.aa_fill_round_rect(14, 200, 176, 28, 10, graphics.rgba(255, 255, 255, 48))
+    canvas.aa_round_rect(14, 200, 176, 28, 10, graphics.rgba(255, 255, 255, 140))
+    font.draw(canvas, 26, 206, "Integer-only, no allocation", 13, graphics.WHITE)
+}
+
+fn run() -> i32 {
+    arguments_storage := platform.list_workspace()
+    arguments := match env.Arguments.capture(&mut arguments_storage, platform.TextPolicy.Strict) {
+        ok(value) => value,
+        err(_) => {
+            console.println("cannot read the command line")!
+            return 1
+        },
+    }
+    path_storage := [0u8; 4096]
+    path := match arguments.get(1, &mut path_storage) {
+        ok(some(value)) => value,
+        ok(none) => {
+            console.println("usage: dodo run examples/poster.dodo -- FONT.ttf")!
+            return 2
+        },
+        err(_) => {
+            console.println("the font path is too long or not valid text")!
+            return 2
+        },
+    }
+    workspace := platform.workspace()
+    pixels := [0u8; 360 * 240 * 4]
+    canvas := graphics.canvas(&mut pixels, WIDTH, HEIGHT, graphics.PixelFormat.Rgba8888)!
+    unsafe {
+        report := match fs.read_file(path, &mut FONT, &mut workspace) {
+            ok(value) => value,
+            err(_) => {
+                console.printf("cannot read {}\n", path)!
+                return 3
+            },
+        }
+        if !report.eof {
+            console.println("the font is larger than 4 MiB")!
+            return 3
+        }
+        font := match truetype.Font.new(&FONT[..report.read]) {
+            ok(value) => value,
+            err(error) => {
+                console.printf("cannot use {}: {}\n", path, truetype.error_name(error))!
+                return 4
+            },
+        }
+        draw_poster(&mut canvas, &font)
+        // png_compressed_max_size(WIDTH, HEIGHT) bytes always suffice.
+        length := image.encode_png_compressed(&canvas, &mut OUTPUT, 9, &mut COMPRESSOR_BUFFER, &mut COMPRESSOR_WORDS)!
+        match fs.write_file("poster.png", &OUTPUT[..length], &mut workspace) {
+            ok() => {}
+            err(_) => {
+                console.println("cannot write poster.png")!
+                return 5
+            },
+        }
+    }
+    console.println("wrote poster.png")!
+    return 0
+}
+
+fn main() -> i32 {
+    return run()
+}

@@ -1,0 +1,382 @@
+package golden
+
+import "std/compress/deflate"
+
+// PNG decoding against the fixtures in tests/graphics/png, each paired with
+// the 8-bit RGBA image it must decode to (NAME.qoi), written by
+// tests/graphics/png/generate.py. Then encoder round trips in every pixel
+// format, and the rejection of invalid files.
+
+const PNG_FILE_LIMIT: usize = 8192
+const PNG_PIXEL_LIMIT: usize = 4096
+
+static mut PNG_BUFFER: [deflate.ENCODER_BUFFER_LEN]u8 = [0u8; deflate.ENCODER_BUFFER_LEN]
+static mut PNG_WORDS: [deflate.WORKSPACE_LEN]u32 = [0u32; deflate.WORKSPACE_LEN]
+
+fn read_fixture(name: &str, extension: &str, output: &mut[u8]) -> usize {
+    path_storage := [0u8; 256]
+    builder := text.Builder.new(&mut path_storage)
+    directory := text.Text.from_str("tests/graphics/png/")
+    builder.append(&directory)!
+    base := text.Text.from_str(name)
+    builder.append(&base)!
+    suffix := text.Text.from_str(extension)
+    builder.append(&suffix)!
+    built := builder.as_text()
+    workspace := platform.workspace()
+    match fs.read_file(built.as_str(), output, &mut workspace) {
+        ok(report) => {
+            assert(report.eof, "fixture larger than the test's buffer")
+            return report.read
+        }
+        err(reason) => {
+            assert(reason.cause.kind != error.Kind.NotFound, "fixture missing: run from the repository root, or run tests/graphics/png/generate.py")
+            assert(false, "fixture unreadable")
+            return 0
+        }
+    }
+}
+
+fn pixel_format(k: usize) -> graphics.PixelFormat {
+    if k == 0 {
+        return graphics.PixelFormat.Rgba8888
+    }
+    if k == 1 {
+        return graphics.PixelFormat.Bgra8888
+    }
+    if k == 2 {
+        return graphics.PixelFormat.Rgb565
+    }
+    if k == 3 {
+        return graphics.PixelFormat.Gray8
+    }
+    return graphics.PixelFormat.Mono1
+}
+
+fn same_image(name: &str, png: &[u8], qoi: &[u8], format: usize) {
+    expected_pixels := [0u8; PNG_PIXEL_LIMIT * 4]
+    decoded_pixels := [0u8; PNG_PIXEL_LIMIT * 4]
+    expected := image.decode(qoi, &mut expected_pixels, pixel_format(format))!
+    decoded := image.decode(png, &mut decoded_pixels, pixel_format(format))!
+    difference := decoded.diff_bounds(&expected)
+    assert(difference.is_empty(), name)
+    dirty := decoded.dirty()
+    whole := graphics.Rect.new(0, 0, decoded.width(), decoded.height())
+    assert(dirty.equals(&whole), name)
+}
+
+@test
+fn png_fixtures() {
+    names := [
+        "gray1", "gray2", "gray4", "gray8", "gray16", "rgb8", "rgb16",
+        "palette1", "palette2", "palette4", "palette8",
+        "gray_alpha8", "gray_alpha16", "rgba8", "rgba16",
+        "gray1_1x1", "rgba8_1x1", "gray1_wide", "gray2_odd", "palette4_odd",
+        "palette4_trns", "palette8_trns", "gray2_trns", "gray8_trns", "gray16_trns", "rgb8_trns", "rgb16_trns",
+        "gray1_adam7", "gray2_adam7", "gray8_adam7_1x1", "rgb8_adam7", "palette4_adam7",
+        "gray_alpha8_adam7", "rgba16_adam7", "rgb16_trns_adam7",
+        "rgba8_split", "gray4_split", "palette8_adam7_split",
+        "rgb8_stored", "gray8_window", "rgb8_ancillary", "rgba8_no_iend"
+    ]
+    png := [0u8; PNG_FILE_LIMIT]
+    qoi := [0u8; PNG_FILE_LIMIT]
+    for n in 0usize..names.len {
+        name := names[n]
+        png_length := read_fixture(name, ".png", &mut png)
+        qoi_length := read_fixture(name, ".qoi", &mut qoi)
+        file := &png[..png_length]
+        expected_file := &qoi[..qoi_length]
+
+        header := image.info(file)!
+        assert(header.format == image.Format.Png, name)
+        expected_header := image.info(expected_file)!
+        assert(header.width == expected_header.width && header.height == expected_header.height, name)
+
+        // Every pixel format through the generic decoder.
+        for k in 0usize..5 {
+            same_image(name, file, expected_file, k)
+        }
+
+        // decode_png with exactly the scratch it asks for, and one byte less.
+        scratch := [0u8; 1024]
+        need := image.png_scratch_size(file)!
+        assert(need <= scratch.len, name)
+        expected_pixels := [0u8; PNG_PIXEL_LIMIT * 4]
+        expected := image.decode(expected_file, &mut expected_pixels, graphics.PixelFormat.Rgba8888)!
+        decoded_pixels := [0u8; PNG_PIXEL_LIMIT * 4]
+        decoded := image.decode_png(file, &mut decoded_pixels, graphics.PixelFormat.Rgba8888, &mut scratch[..need])!
+        assert(decoded.equals(&expected), name)
+        match image.decode_png(file, &mut decoded_pixels, graphics.PixelFormat.Rgba8888, &mut scratch[..need - 1]) {
+            ok(_) => {
+                assert(false, name)
+            }
+            err(reason) => {
+                assert(reason == image.Error.BufferTooSmall, name)
+            }
+        }
+
+        // Drawing at offsets into a clipped canvas skips the same pixels as
+        // the QOI decoder does.
+        offsets := [-2i32, 3, 5, -1, 0, 0, -9, -6]
+        for k in 0usize..4 {
+            png_target_pixels := [0u8; 24 * 16 * 4]
+            png_target := graphics.canvas(&mut png_target_pixels, 24, 16, graphics.PixelFormat.Rgba8888)!
+            qoi_target_pixels := [0u8; 24 * 16 * 4]
+            qoi_target := graphics.canvas(&mut qoi_target_pixels, 24, 16, graphics.PixelFormat.Rgba8888)!
+            png_target.clear(graphics.GRAY)
+            qoi_target.clear(graphics.GRAY)
+            png_target.set_clip(graphics.Rect.new(1, 2, 12, 9))
+            qoi_target.set_clip(graphics.Rect.new(1, 2, 12, 9))
+            image.draw_png(file, &mut png_target, offsets[k * 2], offsets[k * 2 + 1], &mut scratch)!
+            image.draw(expected_file, &mut qoi_target, offsets[k * 2], offsets[k * 2 + 1])!
+            assert(png_target.equals(&qoi_target), name)
+        }
+    }
+
+    // Transparency shows up in info().
+    alpha_names := ["rgba8", "gray_alpha16", "palette4_trns", "gray16_trns", "rgb8_trns"]
+    for n in 0usize..alpha_names.len {
+        length := read_fixture(alpha_names[n], ".png", &mut png)
+        found := image.info(&png[..length])!
+        assert(found.has_alpha, alpha_names[n])
+    }
+    opaque_names := ["rgb8", "gray1", "palette8", "rgb8_ancillary"]
+    for n in 0usize..opaque_names.len {
+        length := read_fixture(opaque_names[n], ".png", &mut png)
+        found := image.info(&png[..length])!
+        assert(!found.has_alpha, opaque_names[n])
+    }
+}
+
+fn expect_error(name: &str, expected: image.Error) {
+    png := [0u8; PNG_FILE_LIMIT]
+    length := read_fixture(name, ".png", &mut png)
+    pixels := [0u8; PNG_PIXEL_LIMIT * 4]
+    match image.decode(&png[..length], &mut pixels, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, name)
+        }
+        err(reason) => {
+            assert(reason == expected, name)
+        }
+    }
+}
+
+@test
+fn png_invalid_files() {
+    expect_error("bad_crc", image.Error.Malformed)
+    expect_error("bad_truncated", image.Error.Truncated)
+    expect_error("bad_zlib_short", image.Error.Truncated)
+    expect_error("bad_critical", image.Error.Unsupported)
+    expect_error("bad_ihdr_depth", image.Error.Malformed)
+    expect_error("bad_ihdr_zero", image.Error.Malformed)
+    expect_error("bad_ihdr_interlace", image.Error.Malformed)
+    expect_error("bad_filter", image.Error.Malformed)
+    expect_error("bad_adler", image.Error.Malformed)
+    expect_error("bad_index", image.Error.Malformed)
+    expect_error("bad_no_palette", image.Error.Malformed)
+    expect_error("bad_palette_gray", image.Error.Malformed)
+    expect_error("bad_trns_length", image.Error.Malformed)
+
+    // Every cut of a file fails as Truncated until only IEND is missing.
+    png := [0u8; PNG_FILE_LIMIT]
+    length := read_fixture("palette4_adam7", ".png", &mut png)
+    scratch := [0u8; 64]
+    pixels := [0u8; 10 * 10 * 4]
+    for cut in 0usize..length + 1 {
+        match image.decode_png(&png[..cut], &mut pixels, graphics.PixelFormat.Rgba8888, &mut scratch) {
+            ok(_) => {
+                assert(cut >= length - 12)
+            }
+            err(reason) => {
+                assert(cut < length - 12 && reason == image.Error.Truncated)
+            }
+        }
+    }
+}
+
+// A drawing with every channel value, transparency and sharp edges.
+fn png_scene(canvas: &mut graphics.Canvas) {
+    canvas.clear(graphics.hex(0x203040))
+    width := canvas.width()
+    height := canvas.height()
+    for y in 0u32..height {
+        for x in 0u32..width {
+            if (x + y) % 7 == 0 {
+                canvas.pixel(x as i32, y as i32, graphics.rgba(((x * 37) & 255) as u8, ((y * 91) & 255) as u8, ((x * y) & 255) as u8, ((x + y * 3) & 255) as u8))
+            }
+        }
+    }
+    canvas.fill_circle((width / 2) as i32, (height / 2) as i32, height / 3, graphics.rgba(255, 128, 0, 200))
+    canvas.line(0, height as i32 - 1, width as i32 - 1, 0, graphics.WHITE)
+    canvas.fill_rect(1, 1, width / 4, height / 4, graphics.TRANSPARENT)
+}
+
+// Pseudo-random pixels, which deflate cannot compress.
+fn png_noise(canvas: &mut graphics.Canvas) {
+    state := 0x9e3779b9u32
+    for y in 0u32..canvas.height() {
+        for x in 0u32..canvas.width() {
+            state = state ^ core.wrapping_mul(state, 8192)
+            state = state ^ (state >> 17)
+            state = state ^ core.wrapping_mul(state, 32)
+            canvas.pixel(x as i32, y as i32, state)
+        }
+    }
+}
+
+fn round_trip(canvas: &graphics.Canvas, output: &mut[u8]) {
+    width := canvas.width()
+    height := canvas.height()
+    reference_pixels := [0u8; 320 * 64 * 4]
+    reference := graphics.canvas(&mut reference_pixels, width, height, graphics.PixelFormat.Rgba8888)!
+    reference.blit(canvas, 0, 0)
+    decoded_pixels := [0u8; 320 * 64 * 4]
+
+    size := image.png_size(width, height)!
+    length := image.encode_png(canvas, output)!
+    assert_eq(length, size)
+    decoded := image.decode(&output[..length], &mut decoded_pixels, graphics.PixelFormat.Rgba8888)!
+    assert(decoded.equals(&reference))
+    match image.encode_png(canvas, &mut output[..size - 1]) {
+        ok(_) => {
+            assert(false, "a short output buffer must be rejected")
+        }
+        err(reason) => {
+            assert(reason == image.Error.BufferTooSmall)
+        }
+    }
+
+    bound := image.png_compressed_max_size(width, height)!
+    levels := [0usize, 1, 6, 9]
+    for k in 0usize..levels.len {
+        compressed := 0usize
+        unsafe {
+            compressed = image.encode_png_compressed(canvas, &mut output[..bound], levels[k], &mut PNG_BUFFER, &mut PNG_WORDS)!
+        }
+        assert(compressed <= bound)
+        scratch := [0u8; 4096]
+        again := match image.decode_png(&output[..compressed], &mut decoded_pixels, graphics.PixelFormat.Rgba8888, &mut scratch) {
+            ok(value) => value,
+            err(reason) => {
+                assert(false, image.error_name(reason))
+                return
+            }
+        }
+        assert(again.equals(&reference))
+    }
+}
+
+@test
+fn png_encoders_round_trip() {
+    output := [0u8; 100000]
+    // Sizes with one pixel, odd dimensions, and enough data for two stored
+    // blocks.
+    widths := [1u32, 37, 320]
+    heights := [1u32, 23, 64]
+    for s in 0usize..3 {
+        width := widths[s]
+        height := heights[s]
+        rgba_pixels := [0u8; 320 * 64 * 4]
+        rgba := graphics.canvas(&mut rgba_pixels, width, height, graphics.PixelFormat.Rgba8888)!
+        png_scene(&mut rgba)
+        round_trip(&rgba, &mut output)
+        bgra_pixels := [0u8; 320 * 64 * 4]
+        bgra := graphics.canvas(&mut bgra_pixels, width, height, graphics.PixelFormat.Bgra8888)!
+        png_scene(&mut bgra)
+        round_trip(&bgra, &mut output)
+        rgb565_pixels := [0u8; 320 * 64 * 2]
+        rgb565 := graphics.canvas(&mut rgb565_pixels, width, height, graphics.PixelFormat.Rgb565)!
+        png_scene(&mut rgb565)
+        round_trip(&rgb565, &mut output)
+        gray_pixels := [0u8; 320 * 64]
+        gray := graphics.canvas(&mut gray_pixels, width, height, graphics.PixelFormat.Gray8)!
+        png_scene(&mut gray)
+        round_trip(&gray, &mut output)
+        mono_pixels := [0u8; 40 * 64]
+        mono := graphics.canvas(&mut mono_pixels, width, height, graphics.PixelFormat.Mono1)!
+        png_scene(&mut mono)
+        round_trip(&mono, &mut output)
+    }
+    assert(image.png_size(320, 64)! > 65535)
+
+    // Incompressible pixels fit the bound, and a canvas with an origin
+    // encodes from its top-left pixel.
+    noise_pixels := [0u8; 320 * 64 * 4]
+    noise := graphics.canvas(&mut noise_pixels, 320, 64, graphics.PixelFormat.Rgba8888)!
+    png_noise(&mut noise)
+    noise.set_origin(-50, 17)
+    round_trip(&noise, &mut output)
+
+    // A compressed image is much smaller than the stored one.
+    flat_pixels := [0u8; 320 * 64 * 4]
+    flat := graphics.canvas(&mut flat_pixels, 320, 64, graphics.PixelFormat.Rgba8888)!
+    flat.clear(graphics.hex(0x203040))
+    flat.fill_circle(100, 30, 25, graphics.rgba(255, 128, 0, 200))
+    flat.fill_round_rect(180, 10, 120, 40, 8, graphics.hex(0xe5c07b))
+    small := 0usize
+    unsafe {
+        small = image.encode_png_compressed(&flat, &mut output, 9, &mut PNG_BUFFER, &mut PNG_WORDS)!
+    }
+    assert(small * 8 < image.png_size(320, 64)!)
+    unsafe {
+        match image.encode_png_compressed(&flat, &mut output[..small - 1], 9, &mut PNG_BUFFER, &mut PNG_WORDS) {
+            ok(_) => {
+                assert(false, "a short output buffer must be rejected")
+            }
+            err(reason) => {
+                assert(reason == image.Error.BufferTooSmall)
+            }
+        }
+        match image.encode_png_compressed(&flat, &mut output, 10, &mut PNG_BUFFER, &mut PNG_WORDS) {
+            ok(_) => {
+                assert(false, "level 10 must be rejected")
+            }
+            err(reason) => {
+                assert(reason == image.Error.Unsupported)
+            }
+        }
+        match image.encode_png_compressed(&flat, &mut output, 6, &mut PNG_BUFFER[..1000], &mut PNG_WORDS) {
+            ok(_) => {
+                assert(false, "short encoder storage must be rejected")
+            }
+            err(reason) => {
+                assert(reason == image.Error.BufferTooSmall)
+            }
+        }
+    }
+
+    // PNG cannot store an empty image.
+    match image.png_size(0, 5) {
+        ok(_) => {
+            assert(false, "an empty image must be rejected")
+        }
+        err(reason) => {
+            assert(reason == image.Error.Unsupported)
+        }
+    }
+}
+
+@test
+fn png_rows_wider_than_the_stack_scratch() {
+    // 4100 RGBA pixels need two rows of 16401 bytes, more than
+    // PNG_SCRATCH_LEN, so the generic decoder declines and decode_png works.
+    pixels := [0u8; 4100 * 2 * 4]
+    canvas := graphics.canvas(&mut pixels, 4100, 2, graphics.PixelFormat.Rgba8888)!
+    png_scene(&mut canvas)
+    output := [0u8; 33000]
+    length := image.encode_png(&canvas, &mut output)!
+    assert_eq(image.png_scratch_size(&output[..length])!, 2usize * 16401)
+    decoded_pixels := [0u8; 4100 * 2 * 4]
+    match image.decode(&output[..length], &mut decoded_pixels, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, "rows beyond PNG_SCRATCH_LEN must be rejected")
+        }
+        err(reason) => {
+            assert(reason == image.Error.BufferTooSmall)
+        }
+    }
+    scratch := [0u8; 2 * 16401]
+    decoded := image.decode_png(&output[..length], &mut decoded_pixels, graphics.PixelFormat.Rgba8888, &mut scratch)!
+    assert(decoded.equals(&canvas))
+}
