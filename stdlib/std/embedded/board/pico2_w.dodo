@@ -6,6 +6,7 @@ import "std/embedded/chip/rp2350"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_usb"
+import "std/embedded/chip/rp_watchdog"
 
 // Raspberry Pi Pico 2 W: a Pico 2 (RP2350A, 12 MHz crystal, 4 MiB of flash)
 // with an Infineon CYW43439 wireless chip. The green user LED hangs off the
@@ -66,6 +67,10 @@ pub struct Board {
     pub pins: rp2350.Pins
     // The 1 MHz system timer: delay_us, delay_ms, and now_us.
     pub timer: rp2350.Timer
+    // The watchdog, stopped until `start(timeout_ms)`: it then resets the
+    // board unless `feed()` is called in time; see
+    // std/embedded/chip/rp_watchdog.
+    pub watchdog: rp_watchdog.Watchdog
     // The USB port: `serial()` makes the board a USB serial port, for
     // printing over the USB cable.
     pub usb: Usb
@@ -93,8 +98,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, usb, dma, core1, fifos, spinlocks } = chip
-    return ok(Board { led, pins, timer, usb: Usb { usb }, dma, core1, fifos, spinlocks })
+    let rp2350.Peripherals { pins, timer, watchdog, usb, dma, core1, fifos, spinlocks } = chip
+    return ok(Board { led, pins, timer, watchdog, usb: Usb { usb }, dma, core1, fifos, spinlocks })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal

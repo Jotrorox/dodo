@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Watchdog for the RP2040 and RP2350: `b.watchdog` on every board (and
+  `watchdog` in the chips' `Peripherals`) is a `std/embedded/chip/rp_watchdog`
+  `Watchdog`. It is stopped after `take()`. `start(timeout_ms)` makes it reset
+  the chip unless `feed()` is called in time, from 1 ms up to 8388 ms on the
+  RP2040 (whose count runs twice per tick, erratum RP2040-E1) or 16777 ms on
+  the RP2350. `stop()`, `remaining_us()`, and `restart()` for a deliberate
+  reset complete it. The reset restarts everything but the oscillators, and
+  the count pauses while a debugger halts a core. `reset_reason()` reads
+  `hal.ResetReason.Timeout`, `Restart`, or `Other`. A Pico SDK-style mark tells
+  the program's watchdog resets apart from the boot ROM's, so the first run
+  after flashing reads `Other`. Two `scratch` words survive the reset.
+  `std/embedded/hal` gains the `Watchdog` protocol (`feed`), so drivers and
+  tasks can feed any chip's watchdog. Desktop tests run the driver against a
+  model of both chips' watchdogs, and the board self-tests gain a watchdog
+  check.
 - `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
   entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
   declared with its own signature. It covers devices, command queues,
