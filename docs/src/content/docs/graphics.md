@@ -20,8 +20,9 @@ The family has four imports:
 | `std/graphics/image` | PPM, QOI and BMP decoding and encoding into caller buffers. |
 | `std/graphics/fake` | An in-memory `Display` for tests. |
 
-Windows and display panel drivers are not part of the library yet; the
-`Display` protocol below is the interface they will implement.
+To show a canvas on a desktop, open a window with [std/window](window.md),
+which implements the `Display` protocol below. Display panel drivers are not
+part of the library yet; they will implement the same protocol.
 
 ## Quickstart
 

@@ -164,6 +164,10 @@ pub fn load_for_platform(
     .map_err(|error| error.to_string())
 }
 
+/// File stems of hosted adapters. `std/window` has one per OS; the other
+/// areas share `posix` between Linux and macOS.
+const ADAPTER_STEMS: &[&str] = &["posix", "windows", "linux", "macos"];
+
 /// C boundaries are embedded alongside the Dodo sources for relocated compilers.
 pub fn native_sources(loaded: &Loaded) -> Vec<(&'static str, &'static str)> {
     BUNDLED_NATIVE_SOURCES
@@ -173,10 +177,9 @@ pub fn native_sources(loaded: &Loaded) -> Vec<(&'static str, &'static str)> {
             let directory = Path::new(name).parent().unwrap();
             loaded.sources.iter().any(|source| {
                 source.path.parent() == Some(Path::new("<stdlib>").join(directory).as_path())
-                    && source
-                        .path
-                        .file_stem()
-                        .is_some_and(|stem| stem == "posix" || stem == "windows")
+                    && source.path.file_stem().is_some_and(|stem| {
+                        ADAPTER_STEMS.contains(&stem.to_str().unwrap_or_default())
+                    })
             })
         })
         .collect()
@@ -292,7 +295,11 @@ pub(crate) fn bundled_import_candidates(
     };
     if namespace == "native" {
         for &(import, _) in BUNDLED_SOURCES {
-            if import.ends_with("/posix") || import.ends_with("/windows") {
+            if ADAPTER_STEMS.iter().any(|stem| {
+                import
+                    .rsplit_once('/')
+                    .is_some_and(|(_, last)| last == *stem)
+            }) {
                 let candidate = format!("{}/native", import.rsplit_once('/').unwrap().0);
                 if let Ok(selected) = loader.native_import(&candidate)
                     && let Some((_, text)) =
@@ -538,6 +545,7 @@ impl Loader<'_> {
                 | "crypto/openssl"
                 | "web"
                 | "time"
+                | "window"
         ) || !matches!(selector, "native" | "posix" | "linux" | "macos" | "windows")
         {
             return Ok(import.to_owned());
@@ -545,6 +553,9 @@ impl Loader<'_> {
         let Some((os, adapter)) = hosted_os(&self.target) else {
             return Err(format!("`{import}` is unsupported for target `{}`; hosted adapters require x86_64 or aarch64 Linux GNU, x86_64 or arm64 macOS, or x86_64 Windows (MSVC/GNU)", self.target).into());
         };
+        // Window systems differ on every OS, so `window` has one adapter per OS
+        // (X11, Cocoa, Win32) instead of a shared POSIX one.
+        let adapter = if area == "window" { os } else { adapter };
         // `std/AREA/linux` and `std/AREA/macos` name the shared POSIX adapter
         // on their own operating system only.
         if selector != "native" && selector != adapter && selector != os {

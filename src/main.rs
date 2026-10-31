@@ -584,6 +584,27 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                         linker.arg("-lws2_32");
                     }
                 }
+                // Windows draw through system libraries only: X11 is spoken
+                // over a socket and needs nothing beyond libc.
+                if native
+                    .iter()
+                    .any(|(name, _)| name.starts_with("std/window/"))
+                {
+                    if apple {
+                        linker.args([
+                            "-framework",
+                            "AppKit",
+                            "-framework",
+                            "QuartzCore",
+                            "-framework",
+                            "CoreGraphics",
+                            "-lobjc",
+                        ]);
+                    }
+                    if target.contains("-windows-") {
+                        linker.args(["-luser32", "-lgdi32"]);
+                    }
+                }
                 if native
                     .iter()
                     .any(|(name, _)| *name == "std/crypto/runtime.c")

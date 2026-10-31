@@ -1,0 +1,158 @@
+package system
+
+import "core/ptr"
+import "core/mem"
+import "std/window/raw"
+
+// The window adapter shared by macOS and Windows, whose window systems are
+// reached through the C runtime in runtime.c. The runtime keeps the single
+// window's state and pixel buffer; a Backend is the handle to it.
+
+unsafe extern "C" fn dodo_window_open(title: *const u8, title_length: usize, width: u32, height: u32, resizable: u32, handle: *mut isize) -> i32
+unsafe extern "C" fn dodo_window_close(handle: isize)
+unsafe extern "C" fn dodo_window_next_event(handle: isize, milliseconds: u32, event: *mut raw.Event) -> i32
+unsafe extern "C" fn dodo_window_buffer(handle: isize, pixels: *mut *mut u8, width: *mut u32, height: *mut u32, stride: *mut usize)
+unsafe extern "C" fn dodo_window_present(handle: isize, x: i32, y: i32, width: u32, height: u32) -> i32
+unsafe extern "C" fn dodo_window_set_title(handle: isize, title: *const u8, title_length: usize) -> i32
+unsafe extern "C" fn dodo_window_set_cursor_visible(handle: isize, visible: u32) -> i32
+unsafe extern "C" fn dodo_window_scale_percent(handle: isize) -> u32
+
+fn null() -> *mut u8 {
+    unsafe {
+        return 0usize as *mut u8
+    }
+}
+
+fn flag(value: bool) -> u32 {
+    if value {
+        return 1
+    }
+    return 0
+}
+
+pub struct Backend {
+    handle: isize
+    pixels: *mut u8
+    width: u32
+    height: u32
+    stride: usize
+
+    pub fn open(title: &str, width: u32, height: u32, resizable: bool) -> Backend!raw.Error {
+        handle := 0isize
+        text := mem.str_bytes(title)
+        code := unsafe {
+            dodo_window_open(ptr.as_ptr(text), text.len, width, height, flag(resizable), ptr.from_mut(&mut handle))
+        }
+        if code != 0 {
+            return err(raw.from_code(code))
+        }
+        backend := Backend { handle: handle, pixels: null(), width: 0, height: 0, stride: 0 }
+        backend.refresh()
+        return ok(backend)
+    }
+    fn refresh(&mut self) {
+        pixels := null()
+        width := 0u32
+        height := 0u32
+        stride := 0usize
+        unsafe {
+            dodo_window_buffer(self.handle, ptr.from_mut(&mut pixels), ptr.from_mut(&mut width), ptr.from_mut(&mut height), ptr.from_mut(&mut stride))
+        }
+        self.pixels = pixels
+        self.width = width
+        self.height = height
+        self.stride = stride
+    }
+    pub fn width(&self) -> u32 {
+        return self.width
+    }
+    pub fn height(&self) -> u32 {
+        return self.height
+    }
+    pub fn stride(&self) -> usize {
+        return self.stride
+    }
+    pub fn scale_percent(&self) -> u32 {
+        if self.handle == 0 {
+            return 100
+        }
+        return unsafe {
+            dodo_window_scale_percent(self.handle)
+        }
+    }
+    // The runtime keeps a nonnull buffer of stride * height bytes, replaced
+    // only inside next_event, which cannot run while this borrow is live.
+    pub fn pixels(&mut self) -> &mut[u8] from(self) {
+        unsafe {
+            pointer := self.pixels
+            length := self.stride * self.height as usize
+            return ptr.borrow_slice_mut(pointer, length, self)
+        }
+    }
+    pub fn next_event(&mut self, milliseconds: u32, event: &mut raw.Event) -> bool!raw.Error {
+        if self.handle == 0 {
+            return err(raw.Error.Closed)
+        }
+        result := unsafe {
+            dodo_window_next_event(self.handle, milliseconds, ptr.from_mut(event))
+        }
+        // Pumping the window system may have resized the buffer, even when
+        // the event returned is not the resize.
+        self.refresh()
+        if result < 0 {
+            return err(raw.from_code(-result))
+        }
+        return ok(result != 0)
+    }
+    pub fn present(&mut self, x: i32, y: i32, width: u32, height: u32) -> void!raw.Error {
+        if self.handle == 0 {
+            return err(raw.Error.Closed)
+        }
+        code := unsafe {
+            dodo_window_present(self.handle, x, y, width, height)
+        }
+        if code != 0 {
+            return err(raw.from_code(code))
+        }
+        return ok()
+    }
+    pub fn set_title(&mut self, title: &str) -> void!raw.Error {
+        if self.handle == 0 {
+            return err(raw.Error.Closed)
+        }
+        text := mem.str_bytes(title)
+        code := unsafe {
+            dodo_window_set_title(self.handle, ptr.as_ptr(text), text.len)
+        }
+        if code != 0 {
+            return err(raw.from_code(code))
+        }
+        return ok()
+    }
+    pub fn set_cursor_visible(&mut self, visible: bool) -> void!raw.Error {
+        if self.handle == 0 {
+            return err(raw.Error.Closed)
+        }
+        code := unsafe {
+            dodo_window_set_cursor_visible(self.handle, flag(visible))
+        }
+        if code != 0 {
+            return err(raw.from_code(code))
+        }
+        return ok()
+    }
+    pub fn close(&mut self) {
+        if self.handle == 0 {
+            return
+        }
+        unsafe {
+            dodo_window_close(self.handle)
+        }
+        // A closed handle reports an empty buffer at a valid address.
+        self.handle = 0
+        self.refresh()
+    }
+    fn drop(&mut self) {
+        self.close()
+    }
+}

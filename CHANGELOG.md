@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `std/window` opens a desktop window whose drawing area is a
+  `std/graphics` canvas, using only what each system ships: the X11
+  protocol spoken directly over the display socket on Linux (libc only, no
+  Xlib), AppKit through the Objective-C runtime on macOS, and user32/gdi32
+  on Windows. `win.canvas()` lends out the window's pixel buffer and
+  `update(dirty)` shows the part that changed; the window also implements
+  `graphics.Display`. Events are polled with `wait_event`, `poll_event` or
+  `wait_event_timeout`: close requests, resizes, focus, physical keys named
+  by their US-layout position, layout-aware text, mouse moves, buttons,
+  leaving and scrolling. Sizes follow the system scale on high-density
+  displays, with the canvas in physical pixels and `scale()` reporting the
+  factor. `std/window/x11` holds the protocol encoders and parsers as pure
+  functions that build for every target. `dodo run` needs no flags or
+  system packages.
 - QUIC connections and streams, through OpenSSL 3.5's QUIC stack:
   `std/quic/openssl` binds a `Listener` on a UDP socket and connects a
   verified `Connection` to it, each opening and accepting bidirectional and

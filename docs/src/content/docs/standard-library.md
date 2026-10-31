@@ -46,6 +46,7 @@ they are not prerequisites for using the safe entry APIs.
 | Decode or encode JSON | `@derive(Json)` and `json.decode<T>` | [JSON](json.md) |
 | Store values | `fixed_vector.Vector.new` with `Option<T>` slots | [Collections](collections.md) |
 | Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
+| Open a window | `window.open` and `win.canvas()` | [Windows](window.md) |
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
 | Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
@@ -171,6 +172,7 @@ individual modules and links every public declaration back to its source.
 | [Mathematics](math.md) | `std/math`, `std/math/trig` | Portable. |
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
 | [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image` | Portable; caller-supplied pixel and file buffers. |
+| [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
 | [Time and clocks](time.md) | `std/time`, `std/time/clock`, `std/time/hosted`, `std/time/iso8601`, `std/time/timer` | Values/contracts portable; hosted clock explicit. |
 | [Native strings and errors](platform.md) | `std/platform`, `std/platform/error` | Hosted. |
 | [Filesystem and lexical paths](filesystem.md) | `std/fs`, `std/fs/path`, `std/fs/types`, `std/fs/unix`, `std/fs/windows_ext` | Paths/types portable; files hosted. |
@@ -225,6 +227,11 @@ select providers; they are not additional recommended starting paths.
 | `std/quic/windows` | Native OpenSSL QUIC boundary; use [QUIC](quic.md). |
 | `std/web/posix` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
 | `std/web/windows` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
+| `std/window/linux` | X11 window adapter over the protocol in `std/window/x11`; use [windows](window.md). |
+| `std/window/macos` | Native Cocoa window boundary; use [windows](window.md). |
+| `std/window/windows` | Native Win32 window boundary; use [windows](window.md). |
+| `std/window/system` | The C-runtime adapter the macOS and Windows boundaries share; use [windows](window.md). |
+| `std/window/raw` | Error and event records exchanged with the adapters; use [windows](window.md). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
 `std/process/native`, `std/signal/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,

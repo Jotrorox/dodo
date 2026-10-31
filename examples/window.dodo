@@ -1,0 +1,91 @@
+package main
+
+import "std/console"
+import "std/graphics"
+import "std/graphics/font"
+import "std/window"
+
+// A ball bounces around a window. Click to move it, press Space to pause and
+// Escape or close the window to quit. Run with `dodo run examples/window.dodo`.
+
+struct Ball {
+    x: i32
+    y: i32
+    dx: i32
+    dy: i32
+}
+
+fn step(ball: &mut Ball, width: i32, height: i32, radius: i32) {
+    ball.x += ball.dx
+    ball.y += ball.dy
+    if ball.x < radius || ball.x > width - radius {
+        ball.dx = -ball.dx
+    }
+    if ball.y < radius || ball.y > height - radius {
+        ball.dy = -ball.dy
+    }
+}
+
+fn run() -> void!window.Error {
+    win := window.open(window.Options.new("Bouncing ball", 480, 320))?
+    scale := win.scale()
+    label := font.medium().scaled(scale)
+    radius := 16 * scale as i32
+    ball := Ball { x: 100, y: 100, dx: 3 * scale as i32, dy: 2 * scale as i32 }
+    paused := false
+    for {
+        // Handle everything pending, then draw a frame about every 16 ms.
+        for {
+            match win.wait_event_timeout(16)? {
+                some(window.Event.Close) => {
+                    return ok()
+                }
+                some(window.Event.Key(key)) => {
+                    if key.key == window.Key.Escape {
+                        return ok()
+                    }
+                    if key.key == window.Key.Space && key.pressed && !key.repeat {
+                        paused = !paused
+                    }
+                }
+                some(window.Event.MouseButton(button)) => {
+                    if button.pressed {
+                        ball.x = button.x
+                        ball.y = button.y
+                    }
+                }
+                some(_) => {}
+                none => {
+                    break
+                }
+            }
+        }
+        width := win.width() as i32
+        height := win.height() as i32
+        if !paused {
+            step(&mut ball, width, height, radius)
+        }
+        canvas := win.canvas()
+        canvas.clear(graphics.hex(0x1d2330))
+        canvas.fill_circle(ball.x, ball.y, radius as u32, graphics.hex(0xe5c07b))
+        hint := "Space pauses"
+        if paused {
+            hint = "Paused"
+        }
+        canvas.text(&label, 8 * scale as i32, 8 * scale as i32, hint, graphics.WHITE)
+        dirty := canvas.take_dirty()
+        win.update(dirty)?
+    }
+}
+
+fn main() -> i32 {
+    match run() {
+        ok() => {
+            return 0
+        }
+        err(error) => {
+            console.printf("cannot show the window: {}\n", window.error_name(error))!
+            return 1
+        }
+    }
+}
