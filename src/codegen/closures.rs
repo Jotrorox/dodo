@@ -59,9 +59,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.builder
             .build_insert_value(value, environment, 1, "closure.environment")
     }
-    /// A call through an `extern "C" fn` pointer. Its parameters and result
-    /// are scalars or pointers, which the C convention passes directly; the
-    /// target ABI may additionally promise extension of narrow integers.
+    /// A call through an `extern "C" fn` pointer, lowered like a call to a
+    /// C declaration with the pointer type's signature.
     fn invoke_c(
         &mut self,
         code: Value<'ctx>,
@@ -69,22 +68,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         args: &[Expr],
         ret: &Type,
     ) -> Result<Value<'ctx>> {
-        let mut values = Vec::new();
-        let mut pending = Vec::new();
-        for e in args {
-            values.push(self.stage(e, &mut pending)?);
-        }
-        self.transfer(&pending)?;
-        let call = self.builder.build_indirect_call(
-            self.value_fn_type(params, ret, false)?,
-            code,
-            &values,
-            "call",
-        )?;
-        for (location, attribute) in self.c_signature_attributes(params, ret) {
-            call.add_attribute(location, attribute);
-        }
-        Ok(call.basic().unwrap_or(self.context.i8_type().const_zero()))
+        let what = Type::ExternFn(params.to_vec(), Box::new(ret.clone()));
+        let lowering = self.c_lowering(&format!("`{what}`"), params, ret)?;
+        let fn_type = match &lowering {
+            Some(lowering) => self.c_fn_type(params, ret, lowering)?,
+            None => self.value_fn_type(params, ret, false)?,
+        };
+        self.c_call(code, fn_type, (params, ret), lowering.as_ref(), args)
     }
     /// The function-pointer entry point of a named function or closure body.
     /// Functions already using the value convention are their own entry point.
