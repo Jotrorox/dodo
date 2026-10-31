@@ -30,9 +30,12 @@ def tool(names):
 def run(arguments, *, env=None, timeout=120, cwd=None):
     # Wine's background services can inherit stdout/stderr. A log file avoids
     # waiting for those services to close pipes after the tested process exits.
-    with tempfile.TemporaryFile(mode="w+") as log:
+    # Fixtures may write binary data and read stdin; give them no input and
+    # decode their output only for the error message.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as log:
         try:
-            result = subprocess.run(arguments, stdout=log, stderr=log, env=env, timeout=timeout, cwd=cwd)
+            result = subprocess.run(arguments, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                    env=env, timeout=timeout, cwd=cwd)
         except subprocess.TimeoutExpired as error:
             log.seek(0)
             raise RuntimeError(f"Command timed out after {timeout}s: {' '.join(map(str, arguments))}\n"

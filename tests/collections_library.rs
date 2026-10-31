@@ -140,11 +140,11 @@ fn main() -> i32 {{ match verify() {{ ok(code) => {{ return code }}, err(_) => {
 #[test]
 fn owned_views_prevent_mutation_and_owner_destruction() {
     rejects(
-        "values := shared_vector.new::<i32>(allocator.handle())\nvalues.push(1)?\nview := values.as_slice()\nvalues.push(2)?\nreturn ok(view[0])",
+        "values := shared_vector.new::<i32>(allocator.handle())\nvalues.push(1)?\nview := values.as_slice()\nvalues.push(2)?\n_ = view[0]",
         "conflict",
     );
     rejects(
-        "values := shared_vector.new::<i32>(allocator.handle())\nvalues.push(1)?\nview := values.as_slice()\ncore.drop(values)\nreturn ok(view[0])",
+        "values := shared_vector.new::<i32>(allocator.handle())\nvalues.push(1)?\nview := values.as_slice()\ncore.drop(values)\n_ = view[0]",
         "borrow",
     );
     rejects(

@@ -1,0 +1,70 @@
+package inflate_oracle
+
+import "std/compress/deflate"
+import "std/console"
+import "std/io"
+
+// "hello hello hello dodo" as a fixed-Huffman stream, decoded when stdin is
+// empty so fixture runners that provide no input still exercise the decoder.
+const SAMPLE: [14]u8 = [203, 72, 205, 201, 201, 87, 200, 64, 34, 83, 242, 83, 242, 1]
+
+// Feed one compressed byte at a time, with small output chunks.
+fn main() -> i32 {
+    input := [0u8; 131072]
+    output := [0u8; 127]
+    source := console.stdin()
+    sink := console.stdout()
+    used := 0usize
+    for used < input.len {
+        n := match source.read(&mut input[used..]) {
+            ok(n) => {
+                n
+            }, err(_) => {
+                return 1
+            }
+        }
+        if n == 0 {
+            break
+        }
+        used += n
+    }
+    if used == 0 {
+        for i in 0usize..SAMPLE.len {
+            input[i] = SAMPLE[i]
+        }
+        used = SAMPLE.len
+    }
+    decoder := deflate.Decoder.new()
+    pos := 0usize
+    for {
+        end := pos
+        if end < used {
+            end += 1
+        }
+        report := match decoder.process(&input[pos..end], &mut output) {
+            ok(result) => {
+                result
+            }, err(_) => {
+                return 2
+            }
+        }
+        pos += report.input_consumed
+        match io.write_all(&mut sink, &output[..report.output_written]) {
+            ok(_) => {}, err(_) => {
+                return 3
+            }
+        }
+        if report.status == deflate.Status.Done {
+            if pos != used {
+                return 4
+            }
+            return 0
+        }
+        if report.status == deflate.Status.NeedInput && pos == used {
+            return 5
+        }
+        if report.input_consumed == 0 && report.output_written == 0 && report.status != deflate.Status.NeedInput {
+            return 6
+        }
+    }
+}

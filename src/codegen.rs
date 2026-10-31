@@ -270,6 +270,7 @@ pub fn generate<'ctx>(
     if let Some(debug) = &cg.debug {
         debug.builder.finalize();
     }
+    cg.module.lower_large_aggregates(&cg.data, 1024);
     cg.module
         .verify()
         .map_err(|e| error(format!("LLVM verification failed: {e}")))?;
@@ -589,11 +590,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             // otherwise flatten into thousands of ABI operands at -O0, making
             // ordinary owned-buffer APIs prohibitively expensive to compile.
             // Interrupt handlers are C functions the vector table names.
+            // Root-package public functions use the same Dodo convention:
+            // only their linkage differs, and returning a large record by
+            // value costs gigabytes of LLVM memory.
             let exported = f.extern_ || f.interrupt.is_some();
-            let internal =
-                !exported && f.name != "main" && (f.imported || !f.public || f.generic_instance);
+            let dodo_abi = !exported && f.name != "main";
             let large = |ty: &Type| -> Result<bool> {
-                Ok(internal && *ty != Type::Void && self.data.get_abi_size(&self.ty(ty)?) > 1024)
+                Ok(dodo_abi && *ty != Type::Void && self.data.get_abi_size(&self.ty(ty)?) > 1024)
             };
             let indirect_return = large(&f.ret)?;
             let indirect_params = f

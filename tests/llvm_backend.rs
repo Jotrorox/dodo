@@ -21,7 +21,9 @@ fn returned_zero_arrays_remain_compact_during_optimization() {
         };
         let generated = codegen::generate(&context, &program, &options).unwrap();
         let ir = generated.module.print_to_string();
-        assert!(ir.contains("ret [8192 x i64] zeroinitializer"), "{ir}");
+        // Large results return through memory, zeroed by memset.
+        assert!(ir.contains("@llvm.memset"), "{ir}");
+        assert!(!ir.contains("store [8192 x i64]"), "{ir}");
         assert!(
             ir.len() < 4096,
             "zero array initialization expanded: {} bytes",

@@ -1,0 +1,204 @@
+package compress_roundtrip
+
+import "std/compress/deflate"
+import "std/compress/zlib"
+import "std/compress/gzip"
+import "std/compress/io" as cio
+import "std/console"
+import "std/io"
+
+// Reads length-prefixed cases from stdin. For each format and level, writes the
+// one-shot and the streaming encoding, each length-prefixed, after checking
+// that both decode back through the one-shot, incremental, and io paths.
+static mut INPUT: [1048576]u8 = [0u8; 1048576]
+static mut ENCODED: [400000]u8 = [0u8; 400000]
+static mut STREAMED: [400000]u8 = [0u8; 400000]
+static mut DECODED: [300000]u8 = [0u8; 300000]
+static mut BUFFER: [deflate.ENCODER_BUFFER_LEN]u8 = [0u8; deflate.ENCODER_BUFFER_LEN]
+
+fn emit(data: &[u8]) {
+    stream := console.stdout()
+    n := data.len
+    prefix := [(n & 255) as u8, ((n >> 8) & 255) as u8, ((n >> 16) & 255) as u8, ((n >> 24) & 255) as u8]
+    io.write_all(&mut stream, &prefix)!
+    io.write_all(&mut stream, data)!
+}
+fn same(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+fn bound(format: usize, n: usize) -> usize {
+    if format == 0 {
+        return deflate.max_encoded_len(n)
+    }
+    if format == 1 {
+        return zlib.max_encoded_len(n)
+    }
+    return gzip.max_encoded_len(n)
+}
+fn one_shot(format: usize, input: &[u8], output: &mut[u8], level: usize) -> usize {
+    if format == 0 {
+        return deflate.encode(input, output, level)!
+    }
+    if format == 1 {
+        return zlib.encode(input, output, level)!
+    }
+    return gzip.encode(input, output, level)!
+}
+fn one_shot_decode(format: usize, input: &[u8], output: &mut[u8]) -> deflate.DecodeResult {
+    if format == 0 {
+        return deflate.decode(input, output)!
+    }
+    if format == 1 {
+        return zlib.decode(input, output)!
+    }
+    return gzip.decode(input, output)!
+}
+// Feeds input in uneven chunks and drains output seven bytes at a time.
+fn stream_encode<E: cio.Encoder>(encoder: &mut E, input: &[u8], output: &mut[u8]) -> usize {
+    used := 0usize
+    written := 0usize
+    chunk := 1usize
+    for {
+        end := used + chunk
+        if end > input.len {
+            end = input.len
+        }
+        chunk = (chunk * 7 + 3) % 5000 + 1
+        room := written + 7
+        p := encoder.process(&input[used..end], &mut output[written..room], end == input.len)
+        used += p.input_consumed
+        written += p.output_written
+        if p.status == deflate.Status.Done {
+            assert(used == input.len)
+            return written
+        }
+        if p.status == deflate.Status.NeedInput {
+            assert(used == end)
+        }
+    }
+}
+// Feeds one byte at a time with 13-byte output windows.
+fn stream_decode<D: cio.Decoder>(decoder: &mut D, input: &[u8], output: &mut[u8]) -> usize {
+    used := 0usize
+    written := 0usize
+    for {
+        end := used
+        if end < input.len {
+            end += 1
+        }
+        room := written + 13
+        if room > output.len {
+            room = output.len
+        }
+        p := decoder.process(&input[used..end], &mut output[written..room])!
+        used += p.input_consumed
+        written += p.output_written
+        if p.status == deflate.Status.Done {
+            assert(used == input.len)
+            return written
+        }
+        assert(!(p.status == deflate.Status.NeedInput && used == input.len))
+    }
+}
+fn check_decoder<D: cio.Decoder>(decoder: &mut D, stream: &[u8], input: &[u8], decoded: &mut[u8]) {
+    n := stream_decode(decoder, stream, decoded)
+    assert(same(&decoded[..n], input))
+}
+fn io_roundtrip<E: cio.Encoder, D: cio.Decoder>(encoder: &mut E, decoder: &mut D, input: &[u8], scratch: &mut[u8], output: &mut[u8]) {
+    sink := io.MemoryWriter.new(scratch)
+    writer := cio.Writer.new(&mut sink, encoder)
+    assert(io.write_all(&mut writer, input)! == input.len)
+    writer.finish()!
+    size := sink.position()
+    source := io.MemoryReader.new(&scratch[..size])
+    storage := [0u8; 64]
+    reader := cio.Reader.new(&mut source, decoder, &mut storage)!
+    total := 0usize
+    for {
+        n := reader.read_checked(&mut output[total..])!
+        if n == 0 {
+            break
+        }
+        total += n
+    }
+    assert(reader.is_done() && same(&output[..total], input))
+    assert(reader.buffered().len == 0)
+    assert(source.position() == size)
+}
+fn check(format: usize, level: usize, input: &[u8], encoded: &mut[u8], streamed: &mut[u8], decoded: &mut[u8], buffer: &mut[u8], workspace: &mut[u32]) {
+    limit := bound(format, input.len)
+    n := one_shot(format, input, &mut encoded[..limit], level)
+    r := one_shot_decode(format, &encoded[..n], decoded)
+    assert(r.input_consumed == n && same(&decoded[..r.output_written], input))
+    m := 0usize
+    if format == 0 {
+        e := deflate.Encoder.new(level, buffer, workspace)!
+        m = stream_encode(&mut e, input, streamed)
+        d := deflate.Decoder.new()
+        check_decoder(&mut d, &encoded[..n], input, decoded)
+        d.reset()
+        check_decoder(&mut d, &streamed[..m], input, decoded)
+    } else if format == 1 {
+        e := zlib.Encoder.new(level, buffer, workspace)!
+        m = stream_encode(&mut e, input, streamed)
+        d := zlib.Decoder.new()
+        check_decoder(&mut d, &encoded[..n], input, decoded)
+    } else {
+        e := gzip.Encoder.new(level, buffer, workspace)!
+        m = stream_encode(&mut e, input, streamed)
+        d := gzip.Decoder.new()
+        check_decoder(&mut d, &encoded[..n], input, decoded)
+    }
+    r = one_shot_decode(format, &streamed[..m], decoded)
+    assert(r.input_consumed == m && same(&decoded[..r.output_written], input))
+    emit(&encoded[..n])
+    emit(&streamed[..m])
+}
+fn main() {
+    unsafe {
+        run(&mut INPUT, &mut ENCODED, &mut STREAMED, &mut DECODED, &mut BUFFER)
+    }
+}
+fn run(input: &mut[u8], encoded: &mut[u8], streamed: &mut[u8], decoded: &mut[u8], buffer: &mut[u8]) {
+    workspace := [0u32; deflate.WORKSPACE_LEN]
+    stdin := console.stdin()
+    total := 0usize
+    for {
+        n := stdin.read(&mut input[total..])!
+        if n == 0 {
+            break
+        }
+        total += n
+    }
+    levels := [0usize, 1, 3, 4, 6, 9]
+    at := 0usize
+    for at < total {
+        size := (input[at] as usize) | ((input[at + 1] as usize) << 8) | ((input[at + 2] as usize) << 16) | ((input[at + 3] as usize) << 24)
+        case := &input[at + 4..at + 4 + size]
+        at += 4 + size
+        for format in 0usize..3 {
+            for &level in &levels {
+                check(format, level, case, encoded, streamed, decoded, buffer, &mut workspace)
+            }
+        }
+        e := gzip.Encoder.new(6, buffer, &mut workspace)!
+        d := gzip.Decoder.new()
+        io_roundtrip(&mut e, &mut d, case, streamed, decoded)
+    }
+    match deflate.encode(b"x", encoded, 10) {
+        ok(_) => {
+            assert(false)
+        },
+        err(reason) => {
+            assert(reason == deflate.Error.InvalidArgument)
+        },
+    }
+}
