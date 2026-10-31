@@ -1,0 +1,24 @@
+package windows
+
+// kernel32 is linked into every Windows program.
+unsafe extern "C" fn LoadLibraryA(name: *const u8) -> *mut u8
+unsafe extern "C" fn GetProcAddress(module: *mut u8, name: *const u8) -> *mut u8
+unsafe extern "C" fn FreeLibrary(module: *mut u8) -> i32
+
+pub unsafe fn open(name: *const u8) -> *mut u8 {
+    unsafe {
+        return LoadLibraryA(name)
+    }
+}
+
+pub unsafe fn symbol(handle: *mut u8, name: *const u8) -> *const u8 {
+    unsafe {
+        return GetProcAddress(handle, name) as *const u8
+    }
+}
+
+pub unsafe fn close(handle: *mut u8) {
+    unsafe {
+        FreeLibrary(handle)
+    }
+}

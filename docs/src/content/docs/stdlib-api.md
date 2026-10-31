@@ -184,6 +184,7 @@ virtual package names rather than independent source files:
 | `std/crypto/native` | [OS random bytes](crypto.md#random-bytes) |
 | `std/crypto/openssl/native` | [OpenSSL libcrypto](crypto.md#backend-and-build) |
 | `std/web/native` | [Static-file providers](web.md) |
+| `std/dylib/native` | [Shared libraries](dylib.md) |
 
 `std/net/native` is the socket entry point; many other native packages implement
 the higher-level facade shown in their guide. Explicit `/linux` and `/windows`
