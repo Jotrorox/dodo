@@ -295,9 +295,9 @@ def guide_for(module: str) -> str:
     if module.startswith("alloc/"):
         return "allocation"
     family = module.split("/")[1]
-    if family == "gpu" and module.count("/") >= 2:
-        # Each GPU interface has its own guide: std/gpu/opengl -> opengl.md.
-        return module.split("/")[2]
+    if module == "std/gpu/opengl" or module.startswith("std/gpu/opengl/"):
+        # OpenGL has its own guide; the rest of std/gpu shares gpu.md.
+        return "opengl"
     return {
         "arena_bytes": "bytes", "bytes_alloc": "bytes", "pool_bytes": "bytes",
         "io_alloc": "io", "fmt": "formatting", "fmt_alloc": "formatting",
