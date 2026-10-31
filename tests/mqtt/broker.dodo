@@ -1,0 +1,17 @@
+package mqtt_broker
+import "std/mqtt"
+import "std/mqtt/broker"
+
+// The test replaces the connection count and the address.
+pub struct Doorbell {
+    pub fn handle(&mut self, message: &mqtt.Message, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        return outbox.publish(b"house/announce", message.payload)
+    }
+}
+fn main() -> i32 {
+    return broker.new()
+        .on(b"house/doorbell", Doorbell {})
+        .password(b"family", b"secret")
+        .max_connections(7)
+        .run(b"127.0.0.1:1883")
+}

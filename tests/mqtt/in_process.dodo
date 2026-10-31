@@ -1,0 +1,74 @@
+package mqtt_in_process
+import "core/bytes"
+import "std/mqtt"
+import "std/mqtt/app"
+import "std/mqtt/broker"
+
+pub struct Lamp {
+    on: bool
+    pub fn handle(&mut self, message: &mqtt.Message, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        if bytes.equal(message.payload, b"on") {
+            self.on = true
+        } else if bytes.equal(message.payload, b"off") {
+            self.on = false
+        } else {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+        return outbox.publish_with(b"home/lamp/state", message.payload, mqtt.QoS.AtLeastOnce, true)
+    }
+}
+pub struct Counter {
+    count: u8
+    pub fn tick(&mut self, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        self.count += 1
+        digit := [48u8 + self.count]
+        return outbox.publish(b"home/count", &digit)
+    }
+}
+pub struct OnlyAdmins {
+    pub fn allow(&mut self, client_id: &[u8], username: &[u8], password: &[u8]) -> bool {
+        return bytes.starts_with(client_id, b"admin-")
+    }
+}
+fn main() -> i32 {
+    lamp := app.new(b"lamp")
+        .on(b"home/lamp/set", Lamp { on: false })
+        .on(b"home/+/set", mqtt.forward(b"home/log"))
+        .every(1000, Counter { count: 0 })
+        .build()!
+    lamp.deliver(b"home/lamp/set", b"on").expect_ok().expect_handled(2).expect_published(2)
+        .expect_publish(b"home/lamp/state", b"on").expect_publish(b"home/log", b"on")
+    lamp.deliver(b"home/lamp/set", b"blink").expect_failure().expect_handled(2).expect_published(1)
+    lamp.deliver(b"elsewhere", b"on").expect_handled(0).expect_published(0)
+    lamp.tick().expect_publish(b"home/count", b"1")
+    lamp.tick().expect_publish(b"home/count", b"2")
+    match app.new(b"x").on(b"ok", app.print()).on(b"bad/#/filter", app.print()).build() {
+        ok(_) => {
+            return 1
+        }
+        err(reason) => {
+            if reason.index != 1 || !bytes.equal(reason.filter, b"bad/#/filter") {
+                return 2
+            }
+        }
+    }
+    match app.new(b"x").every(0, Counter { count: 0 }).build() {
+        ok(_) => {
+            return 3
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.InvalidInput {
+                return 4
+            }
+        }
+    }
+    server := broker.new()
+        .on(b"house/doorbell", mqtt.reply(b"house/announce", b"visitor"))
+        .authenticate(OnlyAdmins {})
+        .build()!
+    server.publish(b"house/doorbell", b"ring").expect_handled(1).expect_publish(b"house/announce", b"visitor")
+    if !server.allows(b"admin-1", b"", b"") || server.allows(b"guest", b"", b"") {
+        return 5
+    }
+    return 0
+}

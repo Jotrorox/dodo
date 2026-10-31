@@ -1,0 +1,33 @@
+package mqtt_lamp
+import "core/bytes"
+import "std/mqtt"
+import "std/mqtt/app"
+
+// A pretend lamp. Publish "on" or "off" to home/lamp/set and it reports its
+// state on home/lamp/state, retained so new listeners see it at once. It
+// keeps home/lamp/status at "online" or "offline" and sends a heartbeat.
+pub struct Lamp {
+    on: bool
+    pub fn handle(&mut self, message: &mqtt.Message, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        if bytes.equal(message.payload, b"on") {
+            self.on = true
+        } else if bytes.equal(message.payload, b"off") {
+            self.on = false
+        } else {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+        return outbox.publish_with(b"home/lamp/state", message.payload, mqtt.QoS.AtLeastOnce, true)
+    }
+}
+pub struct Heartbeat {
+    pub fn tick(&mut self, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        return outbox.publish(b"home/lamp/heartbeat", b"alive")
+    }
+}
+fn main() -> i32 {
+    return app.new(b"dodo-lamp")
+        .on(b"home/lamp/set", Lamp { on: false })
+        .every(10000, Heartbeat {})
+        .status(b"home/lamp/status")
+        .run(b"mqtt://127.0.0.1")
+}

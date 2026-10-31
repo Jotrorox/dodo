@@ -1,0 +1,19 @@
+package mqtt_broker
+import "std/mqtt"
+import "std/mqtt/broker"
+
+// A broker for your local network that prints every message. Try it with
+// examples/mqtt_lamp.dodo, or with the Mosquitto command-line clients:
+//   mosquitto_sub -h 127.0.0.1 -t 'home/#' -v
+//   mosquitto_pub -h 127.0.0.1 -t home/lamp/set -m on
+pub struct Doorbell {
+    pub fn handle(&mut self, message: &mqtt.Message, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        return outbox.publish(b"home/announce", b"someone is at the door")
+    }
+}
+fn main() -> i32 {
+    return broker.new()
+        .on(b"#", broker.print())
+        .on(b"home/doorbell", Doorbell {})
+        .run(b"0.0.0.0:1883")
+}
