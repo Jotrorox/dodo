@@ -5,6 +5,7 @@ import "std/embedded/hal"
 import "std/embedded/chip/rp2350"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
+import "std/embedded/chip/rp_rng"
 import "std/embedded/chip/rp_usb"
 
 // Raspberry Pi Pico 2 W: a Pico 2 (RP2350A, 12 MHz crystal, 4 MiB of flash)
@@ -72,6 +73,9 @@ pub struct Board {
     // The DMA channels: `channel()` claims one, for transfers that run
     // while the program does other work.
     pub dma: rp_dma.Dma
+    // The random number generator, the RP2350's TRNG, fit for
+    // cryptographic keys; std/embedded/chip/rp_rng documents it.
+    pub rng: rp_rng.Trng
     // The second core, `start`ed with a task of its own, and the FIFOs and
     // spinlocks the two cores share; see std/embedded/chip/rp_multicore.
     pub core1: rp_multicore.Core1
@@ -93,8 +97,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, usb, dma, core1, fifos, spinlocks } = chip
-    return ok(Board { led, pins, timer, usb: Usb { usb }, dma, core1, fifos, spinlocks })
+    let rp2350.Peripherals { pins, timer, usb, dma, rng, core1, fifos, spinlocks } = chip
+    return ok(Board { led, pins, timer, usb: Usb { usb }, dma, rng, core1, fifos, spinlocks })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal

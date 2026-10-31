@@ -7,6 +7,7 @@ import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_pins"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
+import "std/embedded/chip/rp_rng"
 import "std/embedded/hal/fake"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
@@ -17,7 +18,8 @@ import "std/io"
 // Host checks for std/embedded/peripheral: the DesignWare I2C, PL022 SPI, and
 // PL011 UART controller drivers against behavioural models of the
 // controllers, the RP2040 and RP2350 PWM and ADC drivers against models of
-// those blocks, the PIO driver against memory standing in for a PIO block,
+// those blocks, the RP ring oscillator and TRNG generators against models
+// of their registers, the PIO driver against memory standing in for a PIO block,
 // and the pin and controller ownership and panic reports of
 // std/embedded/chip/rp_pins. The models enforce the hardware's rules
 // (registers that may change only while disabled, FIFO depths, the flushed
@@ -4011,6 +4013,293 @@ fn rp_bank_pio() {
     bank.release_gpio(led)
 }
 
+// --- The RP random number generators ------------------------------------
+
+fn expect_rng_error(result: void!hal.Error, expected: hal.Error) {
+    match result {
+        ok() => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == expected)
+        }
+    }
+}
+
+// The ring oscillator's RANDOMBIT register. It reads a constant while
+// stopped, flips every sample while locked to the system clock, and
+// otherwise reads bits that are one `bias` times in 16 from a linear
+// congruential generator.
+struct RoscModel: hal.Registers {
+    state: u32
+    reads: u32
+    stopped: bool
+    locked: bool
+    bias: u32
+
+    fn new() -> RoscModel {
+        return RoscModel { state: 12345, reads: 0, stopped: false, locked: false, bias: 8 }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert_eq(offset, rp_rng.RP2040_RANDOMBIT)
+        self.reads += 1
+        if self.stopped {
+            return 1
+        }
+        if self.locked {
+            return (self.reads / (rp_rng.SAMPLE_SPACING + 1)) % 2
+        }
+        self.state = core.wrapping_add(core.wrapping_mul(self.state, 1_103_515_245u32), 12345u32)
+        if ((self.state >> 16) & 15) < self.bias {
+            return 1
+        }
+        return 0
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        // RANDOMBIT is read-only; the generator never writes.
+        core.assert(false)
+    }
+}
+
+fn rosc_generator() {
+    model := RoscModel.new()
+    model.bias = 13
+    rng := unsafe {
+        rp_rng.RoscSource.new(model, rp_rng.RP2040_RANDOMBIT)
+    }
+    bytes := [0u8; 256]
+    rng.fill(&mut bytes)!
+    // Von Neumann's method evens out a source that reads one 13 times in
+    // 16: about half the bits come out one.
+    ones := 0u32
+    for index in 0usize..256 {
+        for bit in 0u32..8 {
+            ones += (bytes[index] as u32 >> bit) & 1
+        }
+    }
+    core.assert(ones > 900 && ones < 1150)
+    model = rng.release()
+    // Every sample is spaced by SAMPLE_SPACING reads, and pairs are read
+    // whole.
+    core.assert_eq(model.reads % (2 * (rp_rng.SAMPLE_SPACING + 1)), 0u32)
+
+    // Through the protocol.
+    model.bias = 8
+    unbiased := unsafe {
+        rp_rng.RoscSource.new(model, rp_rng.RP2040_RANDOMBIT)
+    }
+    word := hal.random_u32(&mut unbiased)!
+    model = unbiased.release()
+
+    // A stopped oscillator times out; one locked to the clock repeats.
+    model.stopped = true
+    stopped := unsafe {
+        rp_rng.RoscSource.new(model, rp_rng.RP2040_RANDOMBIT)
+    }
+    expect_rng_error(stopped.fill(&mut bytes), hal.Error.Timeout)
+    model = stopped.release()
+    model.stopped = false
+    model.locked = true
+    locked := unsafe {
+        rp_rng.RoscSource.new(model, rp_rng.RP2040_RANDOMBIT)
+    }
+    expect_rng_error(locked.fill(&mut bytes), hal.Error.Bus)
+    model = locked.release()
+}
+
+// The TRNG's registers. Writes after a software reset are lost for
+// `resetting` writes. With the source enabled, a block of 192 bits is
+// ready `delay` valid-flag reads later; its bytes count up from 0 across
+// blocks. Failure injection: the next `autocorrelation` blocks fail the
+// autocorrelation test, which halts the TRNG until a reset; the next block
+// first fails the CRNGT test, which only discards bits; blocks never
+// arrive.
+struct TrngModel: hal.Registers {
+    sample_count: u32
+    config: u32
+    debug: u32
+    mask: u32
+    status: u32
+    enabled: bool
+    valid: bool
+    halted: bool
+    countdown: u32
+    delay: u32
+    resetting: u32
+    reset_writes: u32
+    blocks: u32
+    resets: u32
+    autocorrelation: u32
+    crngt: bool
+    dead: bool
+
+    fn new() -> TrngModel {
+        return TrngModel { sample_count: 0xFFFF, config: 0, debug: 0, mask: 0xF, status: 0, enabled: false, valid: false, halted: false, countdown: 0, delay: 5, resetting: 0, reset_writes: 3, blocks: 0, resets: 0, autocorrelation: 0, crngt: false, dead: false }
+    }
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        if offset == 0x104 {
+            if self.valid {
+                return self.status | 1
+            }
+            return self.status
+        }
+        if offset == 0x110 {
+            self.step()
+            if self.valid {
+                return 1
+            }
+            return 0
+        }
+        if offset == 0x130 {
+            return self.sample_count
+        }
+        core.assert(offset >= 0x114 && offset <= 0x128)
+        core.assert(self.valid)
+        word := ((offset - 0x114) / 4) as u32
+        first := self.blocks * 24 + word * 4
+        value := 0u32
+        for byte in 0u32..4 {
+            value = value | (((first + byte) & 0xFF) << (8 * byte))
+        }
+        if word == 5 {
+            // Reading the last word starts the next block.
+            self.valid = false
+            self.blocks += 1
+            self.countdown = self.delay
+        }
+        return value
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        if offset == 0x140 {
+            core.assert(!self.enabled)
+            self.resets += 1
+            self.resetting = self.reset_writes
+            self.sample_count = 0xFFFF
+            self.config = 0
+            self.debug = 0
+            self.mask = 0xF
+            self.status = 0
+            self.valid = false
+            self.halted = false
+            self.countdown = 0
+            return
+        }
+        if self.resetting > 0 {
+            self.resetting -= 1
+            return
+        }
+        if offset == 0x100 {
+            self.mask = value
+        } else if offset == 0x108 {
+            // The autocorrelation error clears only on reset.
+            self.status &= ~(value & ~2u32)
+        } else if offset == 0x10C {
+            self.config = value
+        } else if offset == 0x12C {
+            self.enabled = (value & 1) != 0
+            if self.enabled {
+                // Configured with every health test on, sampling slowly
+                // enough for them to pass.
+                core.assert(self.debug == 0 && self.sample_count == rp_rng.SAMPLE_COUNT && self.config == 1 && self.mask == 0)
+                self.countdown = self.delay
+            }
+        } else if offset == 0x130 {
+            self.sample_count = value
+        } else if offset == 0x138 {
+            self.debug = value
+        } else {
+            core.assert_eq(offset, 0x1BCusize)
+            core.assert(!self.enabled)
+            self.valid = false
+            self.countdown = 0
+        }
+    }
+
+    fn step(&mut self) {
+        if !self.enabled || self.halted || self.valid || self.countdown == 0 || self.dead {
+            return
+        }
+        self.countdown -= 1
+        if self.countdown > 0 {
+            return
+        }
+        if self.autocorrelation > 0 {
+            self.autocorrelation -= 1
+            self.status |= 2
+            self.halted = true
+        } else if self.crngt {
+            self.crngt = false
+            self.status |= 4
+            self.countdown = self.delay
+        } else {
+            self.valid = true
+        }
+    }
+}
+
+fn expect_counting(bytes: &[u8], first: u32) {
+    for index in 0..bytes.len {
+        core.assert_eq(bytes[index] as u32, (first + index as u32) & 0xFF)
+    }
+}
+
+fn trng_generator() {
+    model := TrngModel.new()
+    // The first writes after the reset are lost, so start repeats them.
+    rp_rng.start(&mut model)!
+    core.assert(model.resets == 1 && model.sample_count == rp_rng.SAMPLE_COUNT && model.config == 1 && model.debug == 0 && model.mask == 0xF)
+    rng := unsafe {
+        rp_rng.TrngSource.new(model)
+    }
+    core.assert_eq(hal.random_u32(&mut rng)!, 0x0302_0100u32)
+    // The rest of the block serves the next fills; a fill that needs more
+    // collects another.
+    bytes := [0u8; 30]
+    rng.fill(&mut bytes)!
+    expect_counting(&bytes, 4)
+    model = rng.release()
+    core.assert(model.blocks == 2 && !model.enabled && model.mask == 0xF && model.countdown == 0)
+
+    // Failed autocorrelation tests restart the TRNG; a failed CRNGT test
+    // only discards bits.
+    model.autocorrelation = 2
+    model.crngt = true
+    resets := model.resets
+    rng = unsafe {
+        rp_rng.TrngSource.new(model)
+    }
+    long := [0u8; 48]
+    rng.fill(&mut long)!
+    expect_counting(&long, 48)
+    model = rng.release()
+    core.assert(model.resets == resets + 2 && model.status == 0 && model.blocks == 4)
+
+    // An autocorrelation test that keeps failing, a block that never
+    // arrives, and a reset that never ends.
+    model.autocorrelation = 1000
+    rng = unsafe {
+        rp_rng.TrngSource.new(model)
+    }
+    expect_rng_error(rng.fill(&mut bytes), hal.Error.Bus)
+    model = rng.release()
+    core.assert(!model.enabled)
+    model.autocorrelation = 0
+    rp_rng.start(&mut model)!
+    model.dead = true
+    rng = unsafe {
+        rp_rng.TrngSource.new(model)
+    }
+    expect_rng_error(rng.fill(&mut bytes), hal.Error.Timeout)
+    model = rng.release()
+    core.assert(!model.enabled && model.mask == 0xF)
+    model.reset_writes = 2_000_000
+    expect_rng_error(rp_rng.start(&mut model), hal.Error.Timeout)
+}
+
 fn main() {
     i2c_timing()
     i2c_configuration()
@@ -4043,6 +4332,8 @@ fn main() {
     pwm_channels()
     adc_inputs()
     rp_bank_pwm_and_adc()
+    rosc_generator()
+    trng_generator()
     pio_loading()
     pio_configs()
     pio_fifos()

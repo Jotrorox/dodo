@@ -8,6 +8,7 @@ import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
+import "std/embedded/chip/rp_rng"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
@@ -16,15 +17,16 @@ import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2040 chip support: clocks, resets, GPIO, I2C, SPI, UART,
 // PWM, the ADC, PIO, the microsecond timer, a USB serial port, the second
-// core, the FIFOs and spinlocks the cores share, and the boot ROM.
+// core, the FIFOs and spinlocks the cores share, a random number generator,
+// and the boot ROM.
 // `take(config)` brings the chip from its boot state (ring oscillator,
 // peripherals held in reset) to a known configuration and hands out the
 // peripherals once. Pins implement the std/embedded/hal output and input pin
 // protocols, I2C and SPI buses claimed from `Pins` implement the bus
 // protocols, serial ports the std/io Reader and Writer protocols, PWM
-// outputs and ADC inputs the PWM output and analog input protocols, and the
-// timer implements the delay protocol, so portable drivers use them
-// unchanged.
+// outputs and ADC inputs the PWM output and analog input protocols, the
+// random number generator the Rng protocol, and the timer implements the
+// delay protocol, so portable drivers use them unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -202,6 +204,8 @@ const UART1_BASE: usize = 0x4003_8000
 // PWM (4.5), clocked by clk_sys, and the ADC (4.9), by clk_adc.
 const PWM_BASE: usize = 0x4005_0000
 const ADC_BASE: usize = 0x4004_C000
+// The ring oscillator (2.17), which take() leaves running.
+const ROSC_BASE: usize = 0x4006_0000
 
 // The PIO blocks (3), clocked by clk_sys.
 const PIO0_BASE: usize = 0x5020_0000
@@ -296,6 +300,10 @@ pub struct Peripherals {
     pub usb: Usb
     // The DMA controller's channels; rp_dma documents them.
     pub dma: rp_dma.Dma
+    // The random number generator, from the ring oscillator's jitter:
+    // about 3 KB a second, fine for seeds and games but not for
+    // cryptographic keys; rp_rng documents it.
+    pub rng: rp_rng.Rosc
     // Core 1, which runs a task once started, and the FIFOs and spinlocks
     // the two cores share; see std/embedded/chip/rp_multicore.
     pub core1: rp_multicore.Core1
@@ -349,6 +357,12 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     dma := unsafe {
         rp_dma.Dma.new(rp_dma.RP2040)
     }
+    // SAFETY: TAKEN guarantees one generator. The ring oscillator runs from
+    // reset, clk_sys and clk_ref no longer run from it, and nothing else in
+    // this package touches it.
+    rng := unsafe {
+        rp_rng.Rosc.at(ROSC_BASE, rp_rng.RP2040_RANDOMBIT)
+    }
     // SAFETY: TAKEN guarantees one set of the cores' parts, and core 1 is
     // not running yet, so no spinlock is held.
     cores := unsafe {
@@ -362,7 +376,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         })
     }
     let rp_multicore.Cores { core1, fifos, spinlocks } = cores
-    return ok(Peripherals { pins: Pins { bank }, timer, usb, dma, core1, fifos, spinlocks })
+    return ok(Peripherals { pins: Pins { bank }, timer, usb, dma, rng, core1, fifos, spinlocks })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2040 register.

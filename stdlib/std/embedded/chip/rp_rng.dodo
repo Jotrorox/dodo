@@ -1,0 +1,331 @@
+package rp_rng
+
+import "std/embedded/cortex_m"
+import "std/embedded/hal"
+
+// The random number generators of the RP2040 and RP2350, with the hal.Rng
+// protocol. The chip packages hand out the best one each chip has as
+// `Peripherals.rng`, and board packages as `Board.rng`:
+//
+// - Every RP chip's ring oscillator (RP2040 datasheet 2.17, RP2350
+//   datasheet 8.3) has a RANDOMBIT register that reads its output, which
+//   jitters against the system clock. `RoscSource` samples it slowly and
+//   removes bias with von Neumann's method: of two samples that differ, it
+//   keeps the first, and it drops pairs that agree. About 3 KB a second.
+//   The ring oscillator was not designed or tested as an entropy source,
+//   so its bytes suit seeds, nonces for protocols that do not need secrecy,
+//   random delays, and games, but not cryptographic keys. The RP2040 has
+//   nothing better.
+// - The RP2350's TRNG (datasheet 12.12) is a dedicated entropy source: a
+//   ring oscillator sampled by hardware that removes bias and runs health
+//   tests on the bits, 192 bits at a time. `TrngSource` uses it with every
+//   test enabled, at about 20 KB a second. Its bytes are fit to seed a
+//   cryptographic generator or to be used as keys.
+//
+// Both are generic over hal.Registers, so they run against simulated blocks
+// in desktop tests; `Rosc` and `Trng` are the same over the chip's register
+// blocks, which the chip packages hand out. A generator holds the
+// registers it reads, so one exists at a time; it is not shared between
+// cores or with interrupt handlers unless moved there.
+
+// The ring oscillator's RANDOMBIT register, from the block's base.
+pub const RP2040_RANDOMBIT: usize = 0x1C
+pub const RP2350_RANDOMBIT: usize = 0x20
+
+// Reads of RANDOMBIT that space two samples: about 10 us on a 125 MHz
+// RP2040, as in the Pico SDK, so the oscillator gathers jitter between
+// them.
+pub const SAMPLE_SPACING: u32 = 128
+
+// Pairs of samples that all agree before RoscSource.fill reports Timeout:
+// the oscillator has stopped. Random samples differ in half the pairs.
+const ROSC_ATTEMPTS: u32 = 10_000
+
+// Equal bits in a row that RoscSource.fill reports as Bus: the oscillator
+// runs locked to the system clock, so its samples repeat. As in the TRNG's
+// von Neumann test, 32; random bits do that once in about 2^31 bits.
+const MAX_RUN: u32 = 32
+
+// Random bytes from the ring oscillator's RANDOMBIT register. Implements
+// hal.Rng.
+pub struct RoscSource<R: hal.Registers>: hal.Rng {
+    registers: R
+    randombit: usize
+
+    // The generator over the ring oscillator `registers`, whose RANDOMBIT
+    // register is at `randombit`: RP2040_RANDOMBIT or RP2350_RANDOMBIT.
+    // It only reads that register.
+    // SAFETY: `registers` must be a running ring oscillator's, and nothing
+    // may stop it, change its frequency, or run clk_sys from it while the
+    // generator exists.
+    pub unsafe fn new(registers: R, randombit: usize) -> RoscSource<R> {
+        return RoscSource<R> { registers, randombit }
+    }
+
+    // Fill `bytes` with debiased samples. Timeout if the oscillator has
+    // stopped, Bus if its samples repeat.
+    pub fn fill(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        last := 2u32
+        run := 0u32
+        for index in 0..bytes.len {
+            value := 0u32
+            for bit in 0u32..8 {
+                sample := self.unbiased()?
+                if sample == last {
+                    run += 1
+                    if run >= MAX_RUN {
+                        return err(hal.Error.Bus)
+                    }
+                } else {
+                    last = sample
+                    run = 1
+                }
+                value = value | (sample << bit)
+            }
+            bytes[index] = value as u8
+        }
+        return ok()
+    }
+
+    // Give back the registers.
+    pub fn release(self) -> R {
+        let RoscSource { registers, randombit } = self
+        return registers
+    }
+
+    // One bit from von Neumann's method.
+    fn unbiased(&mut self) -> u32!hal.Error {
+        for _ in 0..ROSC_ATTEMPTS {
+            first := self.sample()
+            second := self.sample()
+            if first != second {
+                return ok(first)
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+
+    fn sample(&mut self) -> u32 {
+        for _ in 0..SAMPLE_SPACING {
+            self.registers.read(self.randombit)
+        }
+        return self.registers.read(self.randombit) & 1
+    }
+}
+
+// The TRNG's registers.
+const RNG_IMR: usize = 0x100
+const RNG_ISR: usize = 0x104
+const RNG_ICR: usize = 0x108
+const TRNG_CONFIG: usize = 0x10C
+const TRNG_VALID: usize = 0x110
+const EHR_DATA: usize = 0x114
+const RND_SOURCE_ENABLE: usize = 0x12C
+const SAMPLE_CNT1: usize = 0x130
+const TRNG_DEBUG_CONTROL: usize = 0x138
+const TRNG_SW_RESET: usize = 0x140
+const RST_BITS_COUNTER: usize = 0x1BC
+
+// RNG_IMR, RNG_ISR, and RNG_ICR: 192 bits are ready; the autocorrelation
+// test failed four times in a row, which stops the TRNG until it is reset;
+// two blocks of 16 bits were equal; 32 bits in a row were equal. The last
+// two only discard bits.
+const EHR_VALID: u32 = 1 << 0
+const AUTOCORR_ERR: u32 = 1 << 1
+const CRNGT_ERR: u32 = 1 << 2
+const VN_ERR: u32 = 1 << 3
+const ALL_EVENTS: u32 = 0xF
+
+// Cycles of clk_sys between two samples of the TRNG's oscillator. The
+// datasheet suggests 20 to 25, but embassy-rp measured that the health
+// tests then fail while the core sleeps; 200 passes either way, at about
+// 1 ms for 192 bits at 150 MHz.
+pub const SAMPLE_COUNT: u32 = 200
+// The second shortest of the TRNG oscillator's four inverter chains, as in
+// embassy-rp.
+const INVERTER_CHAIN: u32 = 1
+
+// Bytes the TRNG produces at a time.
+pub const BLOCK_BYTES: usize = 24
+
+// Polls for the reset to finish, or for one block, before Timeout: a block
+// normally takes about a thousand.
+const TRNG_ATTEMPTS: u32 = 1_000_000
+// Restarts after failed autocorrelation tests for one block before Bus.
+const RESTARTS: u32 = 100
+
+// Reset the TRNG and configure it with every health test enabled; it stays
+// idle until a TrngSource fills a buffer. Timeout if it stays in reset.
+pub fn start<R: hal.Registers>(registers: &mut R) -> void!hal.Error {
+    registers.write(RND_SOURCE_ENABLE, 0)
+    registers.write(TRNG_SW_RESET, 1)
+    // Writes are lost while the reset runs, so repeat one until it sticks,
+    // as Arm's reference driver does.
+    for _ in 0..TRNG_ATTEMPTS {
+        registers.write(SAMPLE_CNT1, SAMPLE_COUNT)
+        if registers.read(SAMPLE_CNT1) == SAMPLE_COUNT {
+            registers.write(TRNG_CONFIG, INVERTER_CHAIN)
+            registers.write(TRNG_DEBUG_CONTROL, 0)
+            registers.write(RNG_IMR, ALL_EVENTS)
+            return ok()
+        }
+    }
+    return err(hal.Error.Timeout)
+}
+
+// Random bytes from the RP2350's TRNG. Implements hal.Rng. The TRNG runs
+// only while `fill` does. Bytes of a block that a fill does not use are
+// kept for the next, so small draws, such as hal.random_u32, mostly cost no
+// wait.
+pub struct TrngSource<R: hal.Registers>: hal.Rng {
+    registers: R
+    spare: [24]u8
+    // The first unused byte of `spare`; BLOCK_BYTES when it is used up.
+    position: usize
+
+    // The generator over the TRNG `registers`, configured with `start`.
+    // SAFETY: `registers` must be the TRNG's, and only this generator may
+    // use them.
+    pub unsafe fn new(registers: R) -> TrngSource<R> {
+        return TrngSource<R> { registers, spare: [0u8; 24], position: BLOCK_BYTES }
+    }
+
+    // Fill `bytes` from the TRNG. Bits that fail a health test are
+    // discarded; Bus if the autocorrelation test keeps failing after 100
+    // restarts, Timeout if no block arrives.
+    pub fn fill(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        running := false
+        for index in 0..bytes.len {
+            if self.position == BLOCK_BYTES {
+                if !running {
+                    self.run()
+                    running = true
+                }
+                match self.next_block() {
+                    ok() => {}
+                    err(error) => {
+                        self.idle()
+                        return err(error)
+                    }
+                }
+            }
+            bytes[index] = self.spare[self.position]
+            self.spare[self.position] = 0
+            self.position += 1
+        }
+        if running {
+            self.idle()
+        }
+        return ok()
+    }
+
+    // Give back the registers; the TRNG is idle between fills.
+    pub fn release(self) -> R {
+        let TrngSource { registers, spare, position } = self
+        return registers
+    }
+
+    // Start the oscillator and the sampling. The event bits are unmasked so
+    // the status register reports them; the TRNG_IRQ interrupt stays
+    // disabled in the NVIC unless the program enables it.
+    fn run(&mut self) {
+        self.registers.write(RNG_ICR, ALL_EVENTS)
+        self.registers.write(RNG_IMR, 0)
+        self.registers.write(RND_SOURCE_ENABLE, 1)
+    }
+
+    // Stop the oscillator, drop a partly collected block, and mask the
+    // events again.
+    fn idle(&mut self) {
+        self.registers.write(RND_SOURCE_ENABLE, 0)
+        self.registers.write(RST_BITS_COUNTER, 1)
+        self.registers.write(RNG_IMR, ALL_EVENTS)
+    }
+
+    // Wait for the next 192 bits and put them in `spare`.
+    fn next_block(&mut self) -> void!hal.Error {
+        restarts := 0u32
+        polls := 0u32
+        for {
+            if (self.registers.read(TRNG_VALID) & EHR_VALID) != 0 {
+                // Reading the last word starts the next block.
+                for word in 0usize..6 {
+                    value := self.registers.read(EHR_DATA + 4 * word)
+                    for byte in 0usize..4 {
+                        self.spare[4 * word + byte] = ((value >> (8 * byte as u32)) & 0xFF) as u8
+                    }
+                }
+                self.registers.write(RNG_ICR, EHR_VALID)
+                self.position = 0
+                return ok()
+            }
+            status := self.registers.read(RNG_ISR)
+            if (status & AUTOCORR_ERR) != 0 {
+                // Only a reset clears it.
+                restarts += 1
+                if restarts > RESTARTS {
+                    return err(hal.Error.Bus)
+                }
+                start(&mut self.registers)?
+                self.run()
+                polls = 0
+            } else if (status & (CRNGT_ERR | VN_ERR)) != 0 {
+                self.registers.write(RNG_ICR, CRNGT_ERR | VN_ERR)
+            }
+            polls += 1
+            if polls >= TRNG_ATTEMPTS {
+                return err(hal.Error.Timeout)
+            }
+        }
+    }
+}
+
+// The ring oscillator generator on the chip: a RoscSource over the
+// oscillator's registers, which the RP2040 package hands out. Implements
+// hal.Rng.
+pub struct Rosc: hal.Rng {
+    source: RoscSource<hal.RegisterBlock>
+
+    // RoscSource.new over the ring oscillator at `base`.
+    // SAFETY: as for RoscSource.new, with `base` the oscillator's base
+    // address.
+    pub unsafe fn at(base: usize, randombit: usize) -> Rosc {
+        unsafe {
+            return Rosc { source: RoscSource.new(hal.RegisterBlock.at(base), randombit) }
+        }
+    }
+
+    pub fn fill(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        return self.source.fill(bytes)
+    }
+}
+
+// The TRNG on the chip: a TrngSource over its registers, which the RP2350
+// package hands out. Implements hal.Rng.
+pub struct Trng: hal.Rng {
+    source: TrngSource<hal.RegisterBlock>
+    irq: u32
+
+    // `start`, then TrngSource.new, over the TRNG at `base`, whose
+    // interrupt is `irq`. Timeout if it stays in reset.
+    // SAFETY: as for TrngSource.new, with `base` the TRNG's base address,
+    // out of reset in the RESETS block.
+    pub unsafe fn at(base: usize, irq: u32) -> Trng!hal.Error {
+        unsafe {
+            registers := hal.RegisterBlock.at(base)
+            start(&mut registers)?
+            return ok(Trng { source: TrngSource.new(registers), irq })
+        }
+    }
+
+    pub fn fill(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        result := self.source.fill(bytes)
+        // The events raise the TRNG's interrupt line during a fill. Unless
+        // the program serves the interrupt, drop the pend they leave, so
+        // enabling it later runs no stale handler.
+        if !cortex_m.is_enabled(self.irq) {
+            cortex_m.unpend(self.irq)
+        }
+        return result
+    }
+}

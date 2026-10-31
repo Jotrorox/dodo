@@ -297,6 +297,65 @@ pub struct Analog {
     }
 }
 
+// A random number generator that fills buffers with the bytes given to
+// `queue`, in order, and after those with a counting pattern: 0, 1, 2, ...,
+// 255, 0, 1, ... continuing across calls. Tests then see exactly which bytes
+// a driver drew, and how many.
+pub struct Rng {
+    queued: [64]u8
+    queued_length: usize
+    queued_position: usize
+    next: u8
+    drawn: u32
+    failure: Option<hal.Error>
+
+    pub fn new() -> Rng {
+        return Rng { queued: [0u8; 64], queued_length: 0, queued_position: 0, next: 0, drawn: 0, failure: none }
+    }
+
+    // Bytes for the next fills to return in order, after any still unread,
+    // before the counting pattern resumes. At most 64 can wait at once.
+    pub fn queue(&mut self, bytes: &[u8]) {
+        unread := self.queued_length - self.queued_position
+        core.assert(unread + bytes.len <= 64)
+        for index in 0..unread {
+            self.queued[index] = self.queued[self.queued_position + index]
+        }
+        for index in 0..bytes.len {
+            self.queued[unread + index] = bytes[index]
+        }
+        self.queued_position = 0
+        self.queued_length = unread + bytes.len
+    }
+
+    pub fn fill(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        for index in 0..bytes.len {
+            if self.queued_position < self.queued_length {
+                bytes[index] = self.queued[self.queued_position]
+                self.queued_position += 1
+            } else {
+                bytes[index] = self.next
+                self.next = core.wrapping_add(self.next, 1u8)
+            }
+        }
+        self.drawn += bytes.len as u32
+        return ok()
+    }
+
+    // The number of bytes filled so far.
+    pub fn drawn(&self) -> u32 {
+        return self.drawn
+    }
+
+    // Make the next fill fail with `error`, for testing error paths.
+    pub fn fail_next(&mut self, error: hal.Error) {
+        self.failure = some(error)
+    }
+}
+
 // A serial port that records the most recent 256 bytes written and reads
 // back bytes given to `feed`, as if they had arrived on its receive line;
 // once they are read, reads report end of input. Implements the std/io

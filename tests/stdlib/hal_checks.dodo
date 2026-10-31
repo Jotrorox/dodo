@@ -318,6 +318,109 @@ fn analog_inputs() {
     core.assert_eq(input.read()!, 2048u16)
 }
 
+// A driver written once against the Rng protocol: shuffle `values` in place
+// (Fisher-Yates), for a game or a randomized test order.
+fn shuffle<R: hal.Rng>(rng: &mut R, values: &mut[u32]) -> void!hal.Error {
+    count := values.len as u32
+    for step in 1u32..count {
+        last := count - step
+        other := hal.random_below(rng, last + 1)? as usize
+        held := values[last as usize]
+        values[last as usize] = values[other]
+        values[other] = held
+    }
+    return ok()
+}
+
+fn random_numbers() {
+    // The fake fills a counting pattern; numbers are little-endian.
+    source := fake.Rng.new()
+    core.assert_eq(hal.random_u32(&mut source)!, 0x0302_0100u32)
+    core.assert_eq(hal.random_u64(&mut source)!, 0x0B0A_0908_0706_0504u64)
+    core.assert_eq(source.drawn(), 12u32)
+    bytes := [0u8; 3]
+    source.fill(&mut bytes)!
+    core.assert(bytes[0] == 12 && bytes[1] == 13 && bytes[2] == 14)
+
+    // random_below rejects the low 2^32 mod bound values: for a bound of 3
+    // that is 0 (2^32 = 1 mod 3), so 0 is drawn again.
+    rejected: [8]u8 = [0, 0, 0, 0, 7, 0, 0, 0]
+    source.queue(&rejected)
+    core.assert_eq(hal.random_below(&mut source, 3)!, 1u32)
+    core.assert_eq(source.drawn(), 23u32)
+    core.assert_eq(hal.random_below(&mut source, 1)!, 0u32)
+    match hal.random_below(&mut source, 0) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.InvalidInput)
+        }
+    }
+    source.fail_next(hal.Error.Timeout)
+    match hal.random_u32(&mut source) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Timeout)
+        }
+    }
+
+    // SoftRng is xoshiro128**: from the state 1, 2, 3, 4 its first outputs
+    // are those of the reference implementation.
+    state: [16]u8 = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]
+    source.queue(&state)
+    soft := hal.SoftRng.from_rng(&mut source)!
+    core.assert_eq(soft.next_u32(), 11520u32)
+    core.assert_eq(soft.next_u32(), 0u32)
+    core.assert_eq(soft.next_u32(), 5_927_040u32)
+    core.assert_eq(soft.next_u32(), 70_819_200u32)
+    // `new` expands its seed with SplitMix64.
+    seeded := hal.SoftRng.new(0)
+    core.assert_eq(seeded.next_u32(), 0xDEC9_045Du32)
+    again := hal.SoftRng.new(0)
+    core.assert_eq(again.next_u32(), 0xDEC9_045Du32)
+    // An all-zero state, which xoshiro cannot leave, is replaced.
+    zeros := [0u8; 16]
+    source.queue(&zeros)
+    stuck := hal.SoftRng.from_rng(&mut source)!
+    core.assert(stuck.next_u32() != 0 || stuck.next_u32() != 0)
+    source.fail_next(hal.Error.Bus)
+    match hal.SoftRng.from_rng(&mut source) {
+        ok(_) => {
+            core.assert(false)
+        }
+        err(error) => {
+            core.assert(error == hal.Error.Bus)
+        }
+    }
+
+    // Fills of any length, and roughly uniform values.
+    odd := [0u8; 7]
+    seeded.fill(&mut odd)!
+    counts := [0u32; 6]
+    for _ in 0..6000 {
+        counts[hal.random_below(&mut seeded, 6)! as usize] += 1
+    }
+    for face in 0usize..6 {
+        core.assert(counts[face] > 850 && counts[face] < 1150)
+    }
+
+    // A driver over the protocol, statically and through `dyn`.
+    values: [5]u32 = [1, 2, 3, 4, 5]
+    shuffle(&mut seeded, &mut values)!
+    sum := 0u32
+    for index in 0usize..5 {
+        sum += values[index]
+    }
+    core.assert_eq(sum, 15u32)
+    generators: [2] &mut dyn hal.Rng = [&mut seeded, &mut source]
+    for index in 0..2usize {
+        generators[index].fill(&mut bytes)!
+    }
+}
+
 fn critical_sections() {
     outer := hal.Critical.enter()
     inner := hal.Critical.enter()
@@ -333,5 +436,6 @@ fn main() {
     serial_ports()
     pwm_outputs()
     analog_inputs()
+    random_numbers()
     critical_sections()
 }

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Random numbers for firmware: `std/embedded/hal` gains the `Rng`
+  protocol (`fill(bytes)`), with `random_u32`, `random_u64`, and the unbiased
+  `random_below`, and `hal.SoftRng`, a xoshiro128** generator seeded from a
+  hardware one with `from_rng` or from a fixed seed with `new`.
+  `hal/fake` gains `fake.Rng`. Every board has `b.rng`, and the chip packages
+  `Peripherals.rng`, from the new `std/embedded/chip/rp_rng`: on the RP2040,
+  `rp_rng.Rosc` samples the ring oscillator's RANDOMBIT about every 10 us and
+  debiases it with von Neumann's method, about 3 KB a second and not for
+  keys; on the RP2350, `rp_rng.Trng` runs the TRNG with its hardware
+  debiasing and all health tests on, about 20 KB a second and fit for keys,
+  restarting it after failed autocorrelation tests and keeping a block's
+  unused bytes for the next fill. A stopped source reports `Timeout` and
+  failing health checks `Bus`. Both drivers are generic over
+  `hal.Registers` and tested against simulated registers on the desktop.
 - `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
   entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
   declared with its own signature. It covers devices, command queues,

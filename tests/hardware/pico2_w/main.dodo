@@ -1250,6 +1250,41 @@ fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, 
     spinlocks.release(lock)
 }
 
+// Random numbers: the board's generator fills two 64-byte buffers that
+// differ almost everywhere, with about half their bits set, and seeds a
+// SoftRng.
+fn filled<R: hal.Rng>(rng: &mut R, bytes: &mut[u8]) -> bool {
+    match rng.fill(bytes) {
+        ok() => {
+            return true
+        }
+        err(_) => {
+            return false
+        }
+    }
+}
+
+fn rng_checks<R: hal.Rng>(rng: &mut R) {
+    first := [0u8; 64]
+    second := [0u8; 64]
+    both := filled(rng, &mut first) && filled(rng, &mut second)
+    differing := 0u32
+    ones := 0u32
+    for index in 0usize..64 {
+        if first[index] != second[index] {
+            differing += 1
+        }
+        for bit in 0u32..8 {
+            ones += ((first[index] as u32 >> bit) & 1) + ((second[index] as u32 >> bit) & 1)
+        }
+    }
+    seeded := match hal.SoftRng.from_rng(rng) {
+        ok(_) => true,
+        err(_) => false,
+    }
+    check(both && seeded && differing >= 48 && ones > 400 && ones < 624)
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -1415,6 +1450,7 @@ fn main() {
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    rng_checks(&mut b.rng)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.
