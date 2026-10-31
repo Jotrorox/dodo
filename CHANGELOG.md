@@ -112,6 +112,16 @@
   `unsafe` (`@unsafe_send pub unsafe struct Owner`), since they are unchecked
   promises; `unsafe` on a struct without either contract is an error. Add
   `unsafe` to existing annotated structs.
+- `std/signal` delivers `SIGINT`, `SIGTERM` and `SIGHUP`, and Ctrl-C,
+  Ctrl-Break and console close on Windows, into a program's poll loop:
+  `signal.listen` queues each selected signal in arrival order instead of
+  letting it end the process, and the listener registers a wake channel in a
+  `std/net/native` `PollSet` next to the program's sockets. A listener is
+  also a cancellation source, so SIGTERM ends `reactor.serve_with` with its
+  report. The wake channel is a self-pipe on Linux and macOS (signalfd would
+  block the signals, and child processes would inherit that mask) and a
+  loopback socket pair on Windows. `PollSet.add_raw` registers other
+  descriptors that a program owns.
 - `f64` arithmetic on the RP2350 runs on its double-precision coprocessor
   (DCP), with no change to programs: division takes about 90 cycles instead
   of 1300, addition about 45 instead of 260, multiplication about 60 instead
