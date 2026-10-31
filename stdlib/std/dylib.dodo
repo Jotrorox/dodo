@@ -1,0 +1,87 @@
+package dylib
+
+import "core/ptr"
+import "std/dylib/native"
+
+// Open shared libraries at run time and look up their symbols.
+//
+// A program that loads an optional system library this way still starts
+// when the library is missing, and can report that instead of failing to
+// launch: std/gpu/vulkan opens the Vulkan loader like this. Names and
+// symbols are NUL-terminated byte strings, as in b"libvulkan.so.1\0".
+// dlopen and dlsym are used on Linux and macOS, LoadLibraryA and
+// GetProcAddress on Windows.
+
+// Why a library or symbol could not be used.
+pub enum Error {
+    // The name is empty, lacks its final NUL, or contains another NUL.
+    InvalidName,
+    // The system found no loadable library by that name.
+    NotFound,
+}
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.InvalidName => {
+            return "InvalidName"
+        }
+        Error.NotFound => {
+            return "NotFound"
+        }
+    }
+}
+
+// An open shared library. It stays loaded until close(), or for the rest of
+// the process when it is dropped: code and data looked up in it may still be
+// in use, which the library cannot know.
+pub struct Library {
+    handle: *mut u8
+
+    // The address of the exported symbol `name`, or null if the library has
+    // none. Reading or calling through it is unsafe: the caller must know
+    // the symbol's actual type.
+    pub fn symbol(&self, name: &[u8]) -> *const u8!Error {
+        if !terminated(name) {
+            return err(Error.InvalidName)
+        }
+        unsafe {
+            return ok(native.symbol(self.handle, ptr.as_ptr(name)))
+        }
+    }
+
+    // Unload the library. Unsafe: no address obtained from it may be used
+    // afterwards.
+    pub unsafe fn close(self) {
+        unsafe {
+            native.close(self.handle)
+        }
+    }
+}
+
+// Load the library `name`, searched for by the system's rules: a bare name
+// such as b"libvulkan.so.1\0" uses the dynamic linker's search path, while a
+// name containing a slash (a backslash on Windows) is a file path.
+pub fn open(name: &[u8]) -> Library!Error {
+    if !terminated(name) {
+        return err(Error.InvalidName)
+    }
+    handle := unsafe {
+        native.open(ptr.as_ptr(name))
+    }
+    if ptr.is_null(handle) {
+        return err(Error.NotFound)
+    }
+    return ok(Library { handle: handle })
+}
+
+fn terminated(name: &[u8]) -> bool {
+    if name.len < 2 || name[name.len - 1] != 0 {
+        return false
+    }
+    for i in 0usize..name.len - 1 {
+        if name[i] == 0 {
+            return false
+        }
+    }
+    return true
+}

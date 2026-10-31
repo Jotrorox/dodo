@@ -1,0 +1,290 @@
+package vulkan
+
+import "core/mem"
+import "core/ptr"
+import "std/dylib"
+
+// Raw Vulkan bindings, written entirely in Dodo.
+//
+// This package mirrors the C API one to one, like Rust's ash: types.dodo and
+// commands.dodo are generated from the Khronos registry (vk.xml) by
+// scripts/generate_vulkan.py, and this file opens the Vulkan loader at run
+// time and resolves commands through vkGetInstanceProcAddr. Nothing is
+// linked at build time, so a program using it starts on machines without
+// Vulkan and gets LoadError.NotFound from open().
+//
+// Every command is an `extern "C" fn` pointer in one of three tables:
+// EntryFns (before an instance exists), InstanceFns (instance and physical
+// device) and DeviceFns (device, queue, command buffer). Calling one is
+// unsafe, exactly as in C: the caller upholds the Vulkan specification's
+// valid-usage rules. Structs have a default() with every field zero and
+// s_type already set, so only the meaningful fields need assigning.
+//
+// Names drop the Vk/VK_/vk prefixes and fields become snake_case:
+// VkInstanceCreateInfo.ppEnabledExtensionNames is
+// InstanceCreateInfo.pp_enabled_extension_names, VK_FORMAT_R8G8B8A8_UNORM is
+// FORMAT_R8G8B8A8_UNORM, and vkCreateBuffer is DeviceFns.create_buffer.
+
+// Why the Vulkan loader could not be used.
+pub enum LoadError {
+    // No Vulkan loader or driver library was found.
+    NotFound,
+    // A library was found but does not export vkGetInstanceProcAddr.
+    MissingEntryPoint,
+}
+
+pub fn load_error_name(error: LoadError) -> &str from(static) {
+    match error {
+        LoadError.NotFound => {
+            return "NotFound"
+        }
+        LoadError.MissingEntryPoint => {
+            return "MissingEntryPoint"
+        }
+    }
+}
+
+// The opened Vulkan loader. It stays loaded for the rest of the process, so
+// the command tables resolved through it never dangle.
+pub struct Library {
+    library: dylib.Library
+    // vkGetInstanceProcAddr, from which every other command is resolved.
+    pub get_instance_proc_addr: PfnGetInstanceProcAddr
+
+    // The global commands: vkCreateInstance and the instance-level queries.
+    pub fn entry(&self) -> EntryFns {
+        unsafe {
+            return load_entry(self.get_instance_proc_addr)
+        }
+    }
+
+    // The commands of `instance`. Unsafe: the instance must have been created
+    // through this library and must outlive every use of the table.
+    pub unsafe fn instance(&self, instance: Instance) -> InstanceFns {
+        unsafe {
+            return load_instance(self.get_instance_proc_addr, instance)
+        }
+    }
+}
+
+// The commands of `device`, resolved through its instance's table. Unsafe:
+// the device must belong to that instance and outlive every use of the table.
+pub unsafe fn device_fns(instance: &InstanceFns, device: Device) -> DeviceFns {
+    unsafe {
+        return load_device(instance.get_device_proc_addr, device)
+    }
+}
+
+// Open the system's Vulkan loader: libvulkan.so.1 on Linux, vulkan-1.dll on
+// Windows, and on macOS the Vulkan SDK or Homebrew loader (libvulkan.1.dylib),
+// falling back to MoltenVK itself.
+pub fn open() -> Library!LoadError {
+    names := [
+        b"libvulkan.so.1\0",
+        b"libvulkan.so\0",
+        b"vulkan-1.dll\0",
+        b"libvulkan.1.dylib\0",
+        b"libvulkan.dylib\0",
+        b"/opt/homebrew/lib/libvulkan.1.dylib\0",
+        b"/usr/local/lib/libvulkan.1.dylib\0",
+        b"libMoltenVK.dylib\0",
+        b"/opt/homebrew/lib/libMoltenVK.dylib\0",
+        b"/usr/local/lib/libMoltenVK.dylib\0",
+    ]
+    for i in 0usize..names.len {
+        match open_path(names[i]) {
+            ok(library) => {
+                return ok(library)
+            }
+            err(LoadError.MissingEntryPoint) => {
+                return err(LoadError.MissingEntryPoint)
+            }
+            err(LoadError.NotFound) => {}
+        }
+    }
+    return err(LoadError.NotFound)
+}
+
+// Open a specific Vulkan loader or driver library, such as a bundled copy of
+// MoltenVK. `name` is NUL-terminated and searched for like dylib.open.
+pub fn open_path(name: &[u8]) -> Library!LoadError {
+    library := match dylib.open(name) {
+        ok(library) => library,
+        err(_) => {
+            return err(LoadError.NotFound)
+        }
+    }
+    address := match library.symbol(b"vkGetInstanceProcAddr\0") {
+        ok(address) => address,
+        err(_) => {
+            return err(LoadError.MissingEntryPoint)
+        }
+    }
+    if ptr.is_null(address) {
+        return err(LoadError.MissingEntryPoint)
+    }
+    get := unsafe {
+        address as PfnGetInstanceProcAddr
+    }
+    return ok(Library { library: library, get_instance_proc_addr: get })
+}
+
+// A failed Vulkan command: its negative (or unexpected) Result code.
+pub struct Error {
+    pub code: Result
+
+    pub fn name(&self) -> &str from(static) {
+        return result_name(self.code)
+    }
+}
+
+// Turn a command's Result into a Dodo Result: SUCCESS and the other
+// non-negative status codes (such as INCOMPLETE or SUBOPTIMAL_KHR) succeed
+// and are returned, negative error codes fail.
+pub fn check(code: Result) -> Result!Error {
+    if code < 0 {
+        return err(Error { code: code })
+    }
+    return ok(code)
+}
+
+// A packed API version, as VK_MAKE_API_VERSION.
+pub fn make_api_version(variant: u32, major: u32, minor: u32, patch: u32) -> u32 {
+    return (variant << 29) | (major << 22) | (minor << 12) | patch
+}
+
+pub fn api_version_variant(version: u32) -> u32 {
+    return version >> 29
+}
+
+pub fn api_version_major(version: u32) -> u32 {
+    return (version >> 22) & 127
+}
+
+pub fn api_version_minor(version: u32) -> u32 {
+    return (version >> 12) & 1023
+}
+
+pub fn api_version_patch(version: u32) -> u32 {
+    return version & 4095
+}
+
+// The text of a fixed-size, NUL-padded name field such as
+// ExtensionProperties.extension_name, without the padding.
+pub fn c_name(field: &[u8]) -> &[u8] from(field) {
+    for i in 0usize..field.len {
+        if field[i] == 0 {
+            return &field[..i]
+        }
+    }
+    return field
+}
+
+// Whether a NUL-padded name field holds `name`, which may itself end in a
+// NUL like the *_EXTENSION_NAME constants.
+pub fn name_eq(field: &[u8], name: &[u8]) -> bool {
+    a := c_name(field)
+    b := c_name(name)
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// A null dispatchable handle, such as `null_handle::<InstanceT>()` for an
+// Instance that a create command will fill in. Non-dispatchable handles are
+// u64 and null is NULL_HANDLE.
+pub fn null_handle<T>() -> *mut T {
+    unsafe {
+        return 0usize as *mut T
+    }
+}
+
+pub const NULL_HANDLE: u64 = 0
+
+// The null pAllocator argument of create and destroy commands, which selects
+// the driver's own allocator.
+pub fn no_allocator() -> *const AllocationCallbacks {
+    unsafe {
+        return 0usize as *const AllocationCallbacks
+    }
+}
+
+// A floating-point clear color, the float32 member of the C union.
+pub fn clear_color_float(red: f32, green: f32, blue: f32, alpha: f32) -> ClearColorValue {
+    value := ClearColorValue.default()
+    value.data[0] = f32_bits(red)
+    value.data[1] = f32_bits(green)
+    value.data[2] = f32_bits(blue)
+    value.data[3] = f32_bits(alpha)
+    return value
+}
+
+// An integer clear color, the int32 member of the C union.
+pub fn clear_color_int(red: i32, green: i32, blue: i32, alpha: i32) -> ClearColorValue {
+    value := ClearColorValue.default()
+    value.data[0] = i32_bits(red)
+    value.data[1] = i32_bits(green)
+    value.data[2] = i32_bits(blue)
+    value.data[3] = i32_bits(alpha)
+    return value
+}
+
+// An unsigned clear color, the uint32 member of the C union.
+pub fn clear_color_uint(red: u32, green: u32, blue: u32, alpha: u32) -> ClearColorValue {
+    value := ClearColorValue.default()
+    value.data[0] = red
+    value.data[1] = green
+    value.data[2] = blue
+    value.data[3] = alpha
+    return value
+}
+
+// A ClearValue for a color attachment.
+pub fn clear_value_color(color: ClearColorValue) -> ClearValue {
+    value := ClearValue.default()
+    for i in 0usize..4 {
+        value.data[i] = color.data[i]
+    }
+    return value
+}
+
+// A ClearValue for a depth/stencil attachment.
+pub fn clear_value_depth_stencil(depth: f32, stencil: u32) -> ClearValue {
+    value := ClearValue.default()
+    value.data[0] = f32_bits(depth)
+    value.data[1] = stencil
+    return value
+}
+
+fn f32_bits(value: f32) -> u32 {
+    copy := value
+    return unsafe {
+        ptr.read(ptr.from_ref(&copy) as *const u32)
+    }
+}
+
+fn i32_bits(value: i32) -> u32 {
+    copy := value
+    return unsafe {
+        ptr.read(ptr.from_ref(&copy) as *const u32)
+    }
+}
+
+// A value with every byte zero, such as an array of structs for a command
+// to fill in: `unsafe { vk.zeroed::<[16]vk.QueueFamilyProperties>() }`.
+// Unsafe: all-zero bytes must be a valid T. They are for every Vulkan
+// struct, handle and command table (integers, floats and null pointers),
+// and arrays of them, but not for Dodo references, slices or enums.
+pub unsafe fn zeroed<T>() -> T {
+    storage := mem.uninit::<T>()
+    unsafe {
+        ptr.write_bytes(mem.uninit_as_mut_ptr(&mut storage), 0u8, 1)
+        return mem.assume_init(storage)
+    }
+}
