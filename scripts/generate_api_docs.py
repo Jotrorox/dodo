@@ -294,6 +294,8 @@ def guide_for(module: str) -> str:
         return "core"
     if module.startswith("alloc/"):
         return "allocation"
+    if module == "std/gpu/metal" or module.startswith("std/gpu/metal/"):
+        return "metal"
     family = module.split("/")[1]
     return {
         "arena_bytes": "bytes", "bytes_alloc": "bytes", "pool_bytes": "bytes",

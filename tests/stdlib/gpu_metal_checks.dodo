@@ -1,0 +1,767 @@
+package main
+
+import "core/mem"
+import "core/ptr"
+import "std/console"
+import "std/gpu/metal"
+import "std/gpu/metal/objc"
+
+// std/gpu/metal against the real GPU: device queries, buffers, shader
+// compilation, compute dispatches, blits, an offscreen render pass read back
+// pixel by pixel, events and CAMetalLayer. Exits 0 after printing "skipped"
+// when the system has no Metal device, as in most virtual machines.
+
+const SHADERS: &str = "#include <metal_stdlib>\nusing namespace metal;\n\nkernel void add(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *out [[buffer(2)]], constant float &scale [[buffer(3)]], uint i [[thread_position_in_grid]]) {\n    out[i] = a[i] + b[i] * scale;\n}\n\nkernel void count(device atomic_uint *total [[buffer(0)]], uint i [[thread_position_in_grid]]) {\n    atomic_fetch_add_explicit(total, 1, memory_order_relaxed);\n}\n\nstruct VertexIn { float2 position [[attribute(0)]]; };\nstruct VertexOut { float4 position [[position]]; };\n\nvertex VertexOut vertex_main(VertexIn in [[stage_in]]) {\n    VertexOut out;\n    out.position = float4(in.position, 0.0, 1.0);\n    return out;\n}\n\nfragment float4 fragment_main(constant float4 &color [[buffer(0)]]) {\n    return color;\n}\n"
+
+fn f32_bytes(values: &[f32], out: &mut[u8]) {
+    for i in 0usize..values.len {
+        value := values[i]
+        bits := unsafe {
+            ptr.read(ptr.from_ref(&value) as *const u32)
+        }
+        out[i * 4] = (bits & 0xff) as u8
+        out[i * 4 + 1] = ((bits >> 8) & 0xff) as u8
+        out[i * 4 + 2] = ((bits >> 16) & 0xff) as u8
+        out[i * 4 + 3] = (bits >> 24) as u8
+    }
+}
+
+fn failed(result: void!metal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(_) => {
+            return true
+        }
+    }
+}
+
+fn rejected<T>(result: T!metal.Error) -> bool {
+    match result {
+        ok(_) => {
+            return false
+        }
+        err(_) => {
+            return true
+        }
+    }
+}
+
+fn missing<T>(value: Option<T>) -> bool {
+    match value {
+        some(_) => {
+            return false
+        }
+        none => {
+            return true
+        }
+    }
+}
+
+fn present<T>(value: Option<T>) -> bool {
+    return !missing(value)
+}
+
+fn layouts() {
+    assert_eq(mem.size_of::<metal.Size>(), 24usize)
+    assert_eq(mem.size_of::<metal.Origin>(), 24usize)
+    assert_eq(mem.size_of::<metal.Region>(), 48usize)
+    assert_eq(mem.size_of::<metal.ClearColor>(), 32usize)
+    assert_eq(mem.size_of::<metal.Viewport>(), 48usize)
+    assert_eq(mem.size_of::<metal.ScissorRect>(), 32usize)
+    assert_eq(mem.size_of::<metal.CGSize>(), 16usize)
+    assert_eq(mem.size_of::<metal.Range>(), 16usize)
+    region := metal.Region.new_2d(1, 2, 3, 4)
+    assert_eq(region.origin.y, 2usize)
+    assert_eq(region.size.depth, 1usize)
+}
+
+fn pixel_sizes() {
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_R8_UNORM), 1usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_STENCIL8), 1usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_RG8_SINT), 2usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_R16_FLOAT), 2usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_DEPTH16_UNORM), 2usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_BGRA8_UNORM_SRGB), 4usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_RGB10A2_UNORM), 4usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_RG11B10_FLOAT), 4usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_DEPTH32_FLOAT), 4usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_RGBA16_FLOAT), 8usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_RG32_FLOAT), 8usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_RGBA32_FLOAT), 16usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_BC1_RGBA), 0usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_ASTC_4X4_LDR), 0usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8), 0usize)
+    assert_eq(metal.pixel_size(metal.PIXEL_FORMAT_INVALID), 0usize)
+}
+
+fn strings() {
+    let some(text) = objc.NSString.new("Grüße, Metal") else {
+        assert(false)
+        return
+    }
+    assert_eq(text.len(), 14usize)
+    assert(text.equals("Grüße, Metal"))
+    assert(!text.equals("Grusse, Metal"))
+    whole := [0u8; 32]
+    assert_eq(text.copy_to(&mut whole), 14usize)
+    assert_eq(whole[2], 0xc3u8)
+    // "Gr" fits; the two-byte "ü" does not, so nothing of it is copied.
+    cut := [0u8; 3]
+    assert_eq(text.copy_to(&mut cut), 2usize)
+    other := text.as_object().clone()
+    assert(other.same(text.as_object()))
+    assert(missing(objc.selector(b"length")))
+    assert(missing(objc.selector(b"len\0gth\0")))
+    assert(present(objc.selector(b"length\0")))
+    assert(present(objc.class(b"NSString\0")))
+    assert(missing(objc.class(b"NoSuchClassAnywhere\0")))
+    let some(class) = objc.class(b"NSString\0") else {
+        return
+    }
+    assert(text.as_object().is_kind_of(class))
+    raw := other.into_retained()
+    let some(adopted) = unsafe {
+        objc.Object.from_retained(raw)
+    } else {
+        assert(false)
+        return
+    }
+    assert(adopted.same(text.as_object()))
+}
+
+fn same_text(text: Option<objc.NSString>, expected: &str) -> bool {
+    match text {
+        some(value) => {
+            return value.equals(expected)
+        }
+        none => {
+            return false
+        }
+    }
+}
+
+fn device_queries(device: &metal.Device) {
+    let some(name) = device.name() else {
+        assert(false)
+        return
+    }
+    assert(name.len() > 0)
+    assert(device.registry_id() != 0)
+    assert(device.max_buffer_length() >= 256 * 1024 * 1024)
+    assert(device.max_threadgroup_memory_length() >= 16384)
+    threads := device.max_threads_per_threadgroup()
+    assert(threads.width >= 256)
+    assert(threads.height >= 1)
+    assert(threads.depth >= 1)
+    assert(device.recommended_max_working_set_size() > 0)
+    assert(device.supports_family(metal.GPU_FAMILY_COMMON1))
+    assert(!device.supports_family(999999))
+    assert(device.supports_texture_sample_count(1))
+    assert(device.minimum_linear_texture_alignment(metal.PIXEL_FORMAT_RGBA8_UNORM) > 0)
+    all := metal.Device.all()
+    assert(all.len() >= 1)
+    found := false
+    for i in 0usize..all.len() {
+        if let some(other) = all.get(i) {
+            if other.registry_id() == device.registry_id() {
+                found = true
+            }
+        }
+    }
+    assert(found)
+    assert(missing(all.get(all.len())))
+    copy := device.clone()
+    assert(copy.as_object().same(device.as_object()))
+}
+
+fn buffers(device: &metal.Device) -> void!metal.Error {
+    buffer := device.new_buffer(64, metal.RESOURCE_STORAGE_MODE_SHARED)?
+    assert_eq(buffer.len(), 64usize)
+    assert_eq(buffer.storage_mode(), metal.STORAGE_MODE_SHARED)
+    assert(!ptr.is_null(buffer.contents()))
+    buffer.set_label("scratch")
+    assert(same_text(buffer.label(), "scratch"))
+    zeros := [0xffu8; 64]
+    buffer.read(0, &mut zeros)?
+    assert_eq(zeros[63], 0u8)
+    buffer.write(60, b"abcd")?
+    out := [0u8; 4]
+    buffer.read(60, &mut out)?
+    assert_eq(out[3], b'd')
+    assert(failed(buffer.write(61, b"abcd")))
+    assert(failed(buffer.read(65, &mut out)))
+    assert(failed(buffer.write(0xffffffffffffffff, b"a")))
+    values := [1.5f32, -2.0, 3.25]
+    buffer.write_f32(8, &values)?
+    back := [0f32; 3]
+    buffer.read_f32(8, &mut back)?
+    assert_eq(back[2], 3.25f32)
+    words := [7u32, 0xdeadbeef]
+    buffer.write_u32(56, &words)?
+    assert(failed(buffer.write_u32(60, &words)))
+    read_words := [0u32; 2]
+    buffer.read_u32(56, &mut read_words)?
+    assert_eq(read_words[1], 0xdeadbeefu32)
+    private := device.new_buffer(16, metal.RESOURCE_STORAGE_MODE_PRIVATE)?
+    assert(ptr.is_null(private.contents()))
+    assert(failed(private.write(0, b"x")))
+    assert(rejected(device.new_buffer(0, metal.RESOURCE_STORAGE_MODE_SHARED)))
+    copied := device.new_buffer_with_bytes(b"hello", metal.RESOURCE_STORAGE_MODE_SHARED)?
+    assert_eq(copied.len(), 5usize)
+    first := [0u8; 1]
+    copied.read(0, &mut first)?
+    assert_eq(first[0], b'h')
+    return ok()
+}
+
+fn libraries(device: &metal.Device) -> void!metal.Error {
+    options := metal.CompileOptions.new()?
+    options.set_math_mode(metal.MATH_MODE_SAFE)
+    options.set_language_version(metal.LANGUAGE_VERSION_2_0)
+    library := device.new_library_with_source(SHADERS, &options)?
+    library.set_label("checks")
+    let some(names) = library.function_names() else {
+        assert(false)
+        return ok()
+    }
+    assert_eq(names.len(), 4usize)
+    add := library.new_function("add")?
+    assert_eq(add.function_type(), metal.FUNCTION_TYPE_KERNEL)
+    assert(same_text(add.name(), "add"))
+    vertex := library.new_function("vertex_main")?
+    assert_eq(vertex.function_type(), metal.FUNCTION_TYPE_VERTEX)
+    match library.new_function("missing") {
+        ok(_) => {
+            assert(false)
+        }
+        err(metal.Error.NotFound) => {}
+        err(_) => {
+            assert(false)
+        }
+    }
+    match device.new_library_with_source("kernel void broken( {", &options) {
+        ok(_) => {
+            assert(false)
+        }
+        err(metal.Error.Failed(error)) => {
+            assert(error.code() != 0)
+            assert(same_text(error.domain(), "MTLLibraryErrorDomain"))
+            let some(message) = error.message() else {
+                assert(false)
+                return ok()
+            }
+            assert(message.len() > 0)
+        }
+        err(_) => {
+            assert(false)
+        }
+    }
+    match device.new_library_with_data(b"not a metallib") {
+        ok(_) => {
+            assert(false)
+        }
+        err(metal.Error.Failed(_)) => {}
+        err(_) => {
+            assert(false)
+        }
+    }
+    assert(rejected(device.new_library_with_data(b"")))
+    return ok()
+}
+
+fn compute(device: &metal.Device, queue: &metal.CommandQueue, library: &metal.Library) -> void!metal.Error {
+    function := library.new_function("add")?
+    pipeline := device.new_compute_pipeline_state(&function)?
+    width := pipeline.thread_execution_width()
+    assert(width >= 4)
+    assert(pipeline.max_total_threads_per_threadgroup() >= width)
+    assert_eq(pipeline.static_threadgroup_memory_length(), 0usize)
+
+    a := [0f32; 100]
+    b := [0f32; 100]
+    for i in 0usize..100 {
+        a[i] = i as f32
+        b[i] = (100 - i) as f32
+    }
+    shared := metal.RESOURCE_STORAGE_MODE_SHARED
+    left := device.new_buffer(400, shared)?
+    right := device.new_buffer(400, shared)?
+    out := device.new_buffer(400, shared)?
+    left.write_f32(0, &a)?
+    right.write_f32(0, &b)?
+    scale := [0u8; 4]
+    half := [0.5f32]
+    f32_bytes(&half, &mut scale)
+
+    commands := queue.command_buffer()?
+    commands.set_label("compute")
+    encoder := commands.compute_command_encoder()?
+    encoder.set_label("add")
+    encoder.push_debug_group("vectors")
+    encoder.set_compute_pipeline_state(&pipeline)
+    encoder.set_buffer(&left, 0, 0)
+    encoder.set_buffer(&right, 0, 1)
+    encoder.set_buffer(&out, 0, 2)
+    encoder.set_bytes(&scale, 3)
+    // 64 threads in groups of 32, then the remaining 36 with dispatchThreads
+    // starting 256 bytes into each buffer.
+    encoder.dispatch_threadgroups(metal.Size.new(2, 1, 1), metal.Size.new(32, 1, 1))
+    encoder.memory_barrier(metal.BARRIER_SCOPE_BUFFERS)
+    encoder.set_buffer_offset(256, 0)
+    encoder.set_buffer_offset(256, 1)
+    encoder.set_buffer_offset(256, 2)
+    encoder.insert_debug_signpost("tail")
+    encoder.dispatch_threads(metal.Size.new(36, 1, 1), metal.Size.new(32, 1, 1))
+    encoder.pop_debug_group()
+    encoder.end_encoding()
+    commands.commit()
+    commands.wait_until_completed()?
+    assert_eq(commands.status(), metal.COMMAND_BUFFER_STATUS_COMPLETED)
+    assert(missing(commands.error()))
+    assert(commands.gpu_end_time() >= commands.gpu_start_time())
+    assert(commands.gpu_start_time() > 0.0)
+
+    result := [0f32; 100]
+    out.read_f32(0, &mut result)?
+    for i in 0usize..100 {
+        assert_eq(result[i], a[i] + b[i] * 0.5)
+    }
+
+    // Indirect dispatch: 3 x 1 x 1 threadgroups of 8 threads, read from a
+    // buffer, increment one counter atomically.
+    counter_function := library.new_function("count")?
+    counter := device.new_compute_pipeline_state(&counter_function)?
+    total := device.new_buffer(4, shared)?
+    arguments := device.new_buffer(12, shared)?
+    groups := [3u32, 1, 1]
+    arguments.write_u32(0, &groups)?
+    commands = queue.command_buffer()?
+    encoder = commands.compute_command_encoder()?
+    encoder.set_compute_pipeline_state(&counter)
+    encoder.set_buffer(&total, 0, 0)
+    encoder.use_buffer(&arguments, metal.RESOURCE_USAGE_READ)
+    encoder.dispatch_threadgroups_indirect(&arguments, 0, metal.Size.new(8, 1, 1))
+    encoder.end_encoding()
+    commands.commit()
+    commands.wait_until_completed()?
+    count := [0u32; 1]
+    total.read_u32(0, &mut count)?
+    assert_eq(count[0], 24u32)
+    return ok()
+}
+
+fn blits(device: &metal.Device, queue: &metal.CommandQueue) -> void!metal.Error {
+    source := device.new_buffer(256, metal.RESOURCE_STORAGE_MODE_SHARED)?
+    destination := device.new_buffer(256, metal.RESOURCE_STORAGE_MODE_SHARED)?
+    pattern := [0u8; 16]
+    for i in 0usize..16 {
+        pattern[i] = i as u8
+    }
+    source.write(16, &pattern)?
+    fence := device.new_fence()?
+    fence.set_label("blits")
+    commands := queue.command_buffer()?
+    blit := commands.blit_command_encoder()?
+    blit.set_label("fill and copy")
+    blit.fill_buffer(&destination, 0, 256, 0xab)
+    blit.update_fence(&fence)
+    blit.end_encoding()
+    blit = commands.blit_command_encoder()?
+    blit.wait_for_fence(&fence)
+    blit.copy_buffer(&source, 16, &destination, 100, 16)
+    blit.end_encoding()
+    commands.commit()
+    commands.wait_until_completed()?
+    out := [0u8; 256]
+    destination.read(0, &mut out)?
+    assert_eq(out[0], 0xabu8)
+    assert_eq(out[99], 0xabu8)
+    assert_eq(out[100], 0u8)
+    assert_eq(out[115], 15u8)
+    assert_eq(out[116], 0xabu8)
+    return ok()
+}
+
+fn cpu_textures(device: &metal.Device) -> void!metal.Error {
+    descriptor := metal.TextureDescriptor.new_2d(metal.PIXEL_FORMAT_R8_UINT, 8, 4, metal.TEXTURE_USAGE_SHADER_READ | metal.TEXTURE_USAGE_PIXEL_FORMAT_VIEW)?
+    descriptor.set_mipmap_level_count(2)
+    texture := device.new_texture(&descriptor)?
+    assert_eq(texture.width(), 8usize)
+    assert_eq(texture.height(), 4usize)
+    assert_eq(texture.depth(), 1usize)
+    assert_eq(texture.mipmap_level_count(), 2usize)
+    assert_eq(texture.array_length(), 1usize)
+    assert_eq(texture.sample_count(), 1usize)
+    assert_eq(texture.pixel_format(), metal.PIXEL_FORMAT_R8_UINT)
+    assert_eq(texture.texture_type(), metal.TEXTURE_TYPE_2D)
+    texture.set_label("cpu")
+    assert(same_text(texture.label(), "cpu"))
+
+    // Rows padded to 10 bytes.
+    pixels := [0u8; 40]
+    for y in 0usize..4 {
+        for x in 0usize..8 {
+            pixels[y * 10 + x] = (y * 8 + x) as u8
+        }
+    }
+    texture.write_pixels(metal.Region.new_2d(0, 0, 8, 4), 0, 0, &pixels, 10)?
+    back := [0u8; 32]
+    texture.read_pixels(metal.Region.new_2d(0, 0, 8, 4), 0, 0, &mut back, 8)?
+    for i in 0usize..32 {
+        assert_eq(back[i], i as u8)
+    }
+    corner := [0u8; 4]
+    texture.read_pixels(metal.Region.new_2d(6, 2, 2, 2), 0, 0, &mut corner, 2)?
+    assert_eq(corner[0], 22u8)
+    assert_eq(corner[3], 31u8)
+    // Level 1 is 4 x 2.
+    small := [1u8, 2, 3, 4, 5, 6, 7, 8]
+    texture.write_pixels(metal.Region.new_2d(0, 0, 4, 2), 1, 0, &small, 4)?
+    assert(failed(texture.write_pixels(metal.Region.new_2d(0, 0, 5, 2), 1, 0, &pixels, 5)))
+    assert(failed(texture.write_pixels(metal.Region.new_2d(7, 0, 2, 1), 0, 0, &pixels, 2)))
+    assert(failed(texture.write_pixels(metal.Region.new_2d(0, 0, 8, 4), 0, 0, &pixels, 7)))
+    assert(failed(texture.write_pixels(metal.Region.new_2d(0, 0, 8, 4), 0, 0, &back, 10)))
+    assert(failed(texture.write_pixels(metal.Region.new_2d(0, 0, 8, 4), 2, 0, &pixels, 10)))
+    assert(failed(texture.write_pixels(metal.Region.new_2d(0, 0, 8, 4), 0, 1, &pixels, 10)))
+    assert(failed(texture.write_pixels(metal.Region.new_2d(0, 0, 0, 4), 0, 0, &pixels, 10)))
+    assert(failed(texture.read_pixels(metal.Region.new_2d(0, 0, 8, 4), 0, 0, &mut back, 0xffffffffffffffff)))
+
+    view := texture.new_view(metal.PIXEL_FORMAT_R8_SINT)?
+    assert_eq(view.pixel_format(), metal.PIXEL_FORMAT_R8_SINT)
+    level := texture.new_view_of(metal.PIXEL_FORMAT_R8_UINT, metal.TEXTURE_TYPE_2D, 1, 1, 0, 1)?
+    assert_eq(level.width(), 4usize)
+    level_pixels := [0u8; 8]
+    level.read_pixels(metal.Region.new_2d(0, 0, 4, 2), 0, 0, &mut level_pixels, 4)?
+    assert_eq(level_pixels[7], 8u8)
+    assert(rejected(texture.new_view_of(metal.PIXEL_FORMAT_R8_UINT, metal.TEXTURE_TYPE_2D, 1, 2, 0, 1)))
+    assert(rejected(texture.new_view_of(metal.PIXEL_FORMAT_R8_UINT, metal.TEXTURE_TYPE_2D, 0, 1, 0, 0)))
+
+    array := metal.TextureDescriptor.new()?
+    array.set_texture_type(metal.TEXTURE_TYPE_2D_ARRAY)
+    array.set_pixel_format(metal.PIXEL_FORMAT_RGBA8_UNORM)
+    array.set_width(2)
+    array.set_height(2)
+    array.set_array_length(3)
+    layers := device.new_texture(&array)?
+    assert_eq(layers.array_length(), 3usize)
+    one := [9u8, 8, 7, 6]
+    layers.write_pixels(metal.Region.new_2d(0, 0, 1, 1), 0, 2, &one, 4)?
+    texel := [0u8; 4]
+    layers.read_pixels(metal.Region.new_2d(0, 0, 1, 1), 0, 2, &mut texel, 4)?
+    assert_eq(texel[3], 6u8)
+    assert(failed(layers.write_pixels(metal.Region.new_2d(0, 0, 1, 1), 0, 3, &one, 4)))
+
+    private := metal.TextureDescriptor.new_2d(metal.PIXEL_FORMAT_R8_UINT, 4, 4, metal.TEXTURE_USAGE_SHADER_READ)?
+    private.set_storage_mode(metal.STORAGE_MODE_PRIVATE)
+    hidden := device.new_texture(&private)?
+    assert(failed(hidden.write_pixels(metal.Region.new_2d(0, 0, 1, 1), 0, 0, &one, 1)))
+
+    sampler := metal.SamplerDescriptor.new()?
+    sampler.set_label("linear")
+    sampler.set_min_filter(metal.SAMPLER_MIN_MAG_FILTER_LINEAR)
+    sampler.set_mag_filter(metal.SAMPLER_MIN_MAG_FILTER_LINEAR)
+    sampler.set_mip_filter(metal.SAMPLER_MIP_FILTER_LINEAR)
+    sampler.set_s_address_mode(metal.SAMPLER_ADDRESS_MODE_REPEAT)
+    sampler.set_t_address_mode(metal.SAMPLER_ADDRESS_MODE_MIRROR_REPEAT)
+    sampler.set_r_address_mode(metal.SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+    sampler.set_max_anisotropy(4)
+    sampler.set_lod_min_clamp(0.0)
+    sampler.set_lod_max_clamp(8.0)
+    sampler.set_border_color(metal.SAMPLER_BORDER_COLOR_OPAQUE_BLACK)
+    sampler.set_normalized_coordinates(true)
+    state := device.new_sampler_state(&sampler)?
+    copy := state.clone()
+    assert(copy.as_object().same(state.as_object()))
+    return ok()
+}
+
+// Bytes of pixel (x, y) in a tightly packed 32 x 32 RGBA8 image.
+fn pixel(image: &[u8], x: usize, y: usize) -> u32 {
+    at := (y * 32 + x) * 4
+    return (image[at] as u32) << 24 | (image[at + 1] as u32) << 16 | (image[at + 2] as u32) << 8 | image[at + 3] as u32
+}
+
+fn render(device: &metal.Device, queue: &metal.CommandQueue, library: &metal.Library) -> void!metal.Error {
+    vertex := library.new_function("vertex_main")?
+    fragment := library.new_function("fragment_main")?
+    vertices := metal.VertexDescriptor.new()?
+    vertices.set_attribute(0, metal.VERTEX_FORMAT_FLOAT2, 0, 1)?
+    vertices.set_layout(1, 8, metal.VERTEX_STEP_FUNCTION_PER_VERTEX, 1)?
+    assert(failed(vertices.set_attribute(31, metal.VERTEX_FORMAT_FLOAT2, 0, 1)))
+    assert(failed(vertices.set_layout(31, 8, metal.VERTEX_STEP_FUNCTION_PER_VERTEX, 1)))
+
+    pipeline_descriptor := metal.RenderPipelineDescriptor.new()?
+    pipeline_descriptor.set_label("triangle")
+    pipeline_descriptor.set_vertex_function(&vertex)
+    pipeline_descriptor.set_fragment_function(&fragment)
+    pipeline_descriptor.set_vertex_descriptor(&vertices)
+    pipeline_descriptor.set_depth_attachment_pixel_format(metal.PIXEL_FORMAT_DEPTH32_FLOAT)
+    pipeline_descriptor.set_input_primitive_topology(metal.PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE)
+    pipeline_descriptor.set_raster_sample_count(1)
+    target := pipeline_descriptor.color_attachment(0)?
+    target.set_pixel_format(metal.PIXEL_FORMAT_RGBA8_UNORM)
+    target.set_blending_enabled(true)
+    target.set_source_rgb_blend_factor(metal.BLEND_FACTOR_ONE)
+    target.set_destination_rgb_blend_factor(metal.BLEND_FACTOR_ZERO)
+    target.set_rgb_blend_operation(metal.BLEND_OPERATION_ADD)
+    target.set_source_alpha_blend_factor(metal.BLEND_FACTOR_ONE)
+    target.set_destination_alpha_blend_factor(metal.BLEND_FACTOR_ZERO)
+    target.set_alpha_blend_operation(metal.BLEND_OPERATION_ADD)
+    target.set_write_mask(metal.COLOR_WRITE_MASK_ALL)
+    assert(rejected(pipeline_descriptor.color_attachment(8)))
+    pipeline := device.new_render_pipeline_state(&pipeline_descriptor)?
+
+    // A pipeline whose formats do not match its shaders fails with Metal's
+    // reason.
+    broken := metal.RenderPipelineDescriptor.new()?
+    broken.set_vertex_function(&vertex)
+    match device.new_render_pipeline_state(&broken) {
+        ok(_) => {
+            assert(false)
+        }
+        err(metal.Error.Failed(error)) => {
+            assert(present(error.message()))
+        }
+        err(_) => {
+            assert(false)
+        }
+    }
+
+    stencil := metal.StencilDescriptor.new()?
+    stencil.set_stencil_compare_function(metal.COMPARE_FUNCTION_ALWAYS)
+    stencil.set_stencil_failure_operation(metal.STENCIL_OPERATION_KEEP)
+    stencil.set_depth_failure_operation(metal.STENCIL_OPERATION_KEEP)
+    stencil.set_depth_stencil_pass_operation(metal.STENCIL_OPERATION_REPLACE)
+    stencil.set_read_mask(0xff)
+    stencil.set_write_mask(0xff)
+    depth_descriptor := metal.DepthStencilDescriptor.new()?
+    depth_descriptor.set_label("depth")
+    depth_descriptor.set_depth_compare_function(metal.COMPARE_FUNCTION_LESS)
+    depth_descriptor.set_depth_write_enabled(true)
+    depth_state := device.new_depth_stencil_state(&depth_descriptor)?
+    // Stencil tests need a stencil attachment; this pass has none, so the
+    // stencil state is only created.
+    stencil_descriptor := metal.DepthStencilDescriptor.new()?
+    stencil_descriptor.set_front_face_stencil(&stencil)
+    stencil_descriptor.set_back_face_stencil(&stencil)
+    stencil_state := device.new_depth_stencil_state(&stencil_descriptor)?
+    assert(!stencil_state.as_object().same(depth_state.as_object()))
+
+    color_descriptor := metal.TextureDescriptor.new_2d(metal.PIXEL_FORMAT_RGBA8_UNORM, 32, 32, metal.TEXTURE_USAGE_RENDER_TARGET | metal.TEXTURE_USAGE_SHADER_READ)?
+    unified := device.has_unified_memory()
+    if !unified {
+        color_descriptor.set_storage_mode(metal.STORAGE_MODE_MANAGED)
+    }
+    color := device.new_texture(&color_descriptor)?
+    depth_texture_descriptor := metal.TextureDescriptor.new_2d(metal.PIXEL_FORMAT_DEPTH32_FLOAT, 32, 32, metal.TEXTURE_USAGE_RENDER_TARGET)?
+    depth_texture_descriptor.set_storage_mode(metal.STORAGE_MODE_PRIVATE)
+    depth := device.new_texture(&depth_texture_descriptor)?
+
+    pass := metal.RenderPassDescriptor.new()?
+    attachment := pass.color_attachment(0)?
+    attachment.set_texture(&color)
+    attachment.set_place(0, 0, 0)
+    attachment.set_load_action(metal.LOAD_ACTION_CLEAR)
+    attachment.set_store_action(metal.STORE_ACTION_STORE)
+    attachment.set_clear_color(metal.ClearColor.new(0.0, 0.0, 1.0, 1.0))
+    depth_attachment := pass.depth_attachment()?
+    depth_attachment.set_texture(&depth)
+    depth_attachment.set_load_action(metal.LOAD_ACTION_CLEAR)
+    depth_attachment.set_store_action(metal.STORE_ACTION_DONT_CARE)
+    depth_attachment.set_clear_depth(1.0)
+    assert(rejected(pass.color_attachment(8)))
+
+    // The upper-left half of the target, above its anti-diagonal.
+    positions := [-1.0f32, 1.0, 1.0, 1.0, -1.0, -1.0]
+    position_bytes := [0u8; 24]
+    f32_bytes(&positions, &mut position_bytes)
+    vertex_buffer := device.new_buffer_with_bytes(&position_bytes, metal.RESOURCE_STORAGE_MODE_SHARED)?
+    indices := [0u8, 0, 1, 0, 2, 0]
+    index_buffer := device.new_buffer_with_bytes(&indices, metal.RESOURCE_STORAGE_MODE_SHARED)?
+    red := [0u8; 16]
+    rgba := [1.0f32, 0.0, 0.0, 1.0]
+    f32_bytes(&rgba, &mut red)
+
+    commands := queue.command_buffer()?
+    encoder := commands.render_command_encoder(&pass)?
+    encoder.set_label("triangle")
+    encoder.push_debug_group("draw")
+    encoder.set_render_pipeline_state(&pipeline)
+    encoder.set_depth_stencil_state(&depth_state)
+    encoder.set_stencil_reference_value(1)
+    encoder.set_stencil_front_back_reference_value(1, 1)
+    encoder.set_viewport(metal.Viewport.new(0.0, 0.0, 32.0, 32.0, 0.0, 1.0))
+    encoder.set_scissor_rect(metal.ScissorRect.new(0, 0, 32, 32))
+    encoder.set_cull_mode(metal.CULL_MODE_NONE)
+    encoder.set_front_facing_winding(metal.WINDING_CLOCKWISE)
+    encoder.set_triangle_fill_mode(metal.TRIANGLE_FILL_MODE_FILL)
+    encoder.set_depth_clip_mode(metal.DEPTH_CLIP_MODE_CLIP)
+    encoder.set_depth_bias(0.0, 0.0, 0.0)
+    encoder.set_blend_color(0.0, 0.0, 0.0, 0.0)
+    encoder.set_vertex_buffer(&vertex_buffer, 0, 1)
+    encoder.set_fragment_bytes(&red, 0)
+    encoder.insert_debug_signpost("indexed")
+    encoder.draw_indexed_primitives(metal.PRIMITIVE_TYPE_TRIANGLE, 3, metal.INDEX_TYPE_UINT16, &index_buffer, 0, 1, 0, 0)
+    encoder.pop_debug_group()
+    encoder.end_encoding()
+
+    // Copy the image into a buffer and into a second texture with the
+    // struct-passing blit calls, then compare all three.
+    readback := device.new_buffer(4096, metal.RESOURCE_STORAGE_MODE_SHARED)?
+    copy_descriptor := metal.TextureDescriptor.new_2d(metal.PIXEL_FORMAT_RGBA8_UNORM, 32, 32, metal.TEXTURE_USAGE_SHADER_READ)?
+    if !unified {
+        copy_descriptor.set_storage_mode(metal.STORAGE_MODE_MANAGED)
+    }
+    copy := device.new_texture(&copy_descriptor)?
+    blit := commands.blit_command_encoder()?
+    blit.copy_texture_to_buffer(&color, 0, 0, metal.Origin.new(0, 0, 0), metal.Size.new(32, 32, 1), &readback, 0, 128, 4096)
+    blit.copy_texture(&color, 0, 0, metal.Origin.new(0, 0, 0), metal.Size.new(16, 16, 1), &copy, 0, 0, metal.Origin.new(16, 16, 0))
+    blit.copy_buffer_to_texture(&readback, 0, 128, 4096, metal.Size.new(16, 16, 1), &copy, 0, 0, metal.Origin.new(0, 0, 0))
+    if !unified {
+        blit.synchronize_texture(&color)
+        blit.synchronize_texture(&copy)
+    }
+    blit.end_encoding()
+    commands.commit()
+    commands.wait_until_completed()?
+
+    image := [0u8; 4096]
+    color.read_pixels(metal.Region.new_2d(0, 0, 32, 32), 0, 0, &mut image, 128)?
+    assert_eq(pixel(&image, 2, 2), 0xff0000ffu32)
+    assert_eq(pixel(&image, 20, 2), 0xff0000ffu32)
+    assert_eq(pixel(&image, 2, 20), 0xff0000ffu32)
+    assert_eq(pixel(&image, 29, 29), 0x0000ffffu32)
+    assert_eq(pixel(&image, 20, 20), 0x0000ffffu32)
+    buffered := [0u8; 4096]
+    readback.read(0, &mut buffered)?
+    for i in 0usize..4096 {
+        assert_eq(buffered[i], image[i])
+    }
+    copied := [0u8; 4096]
+    copy.read_pixels(metal.Region.new_2d(0, 0, 32, 32), 0, 0, &mut copied, 128)?
+    // Top-left quarter from the buffer, bottom-right from the texture copy
+    // of the top-left quarter: both red at their own (2, 2).
+    assert_eq(pixel(&copied, 2, 2), 0xff0000ffu32)
+    assert_eq(pixel(&copied, 18, 18), 0xff0000ffu32)
+    assert_eq(pixel(&copied, 30, 30), pixel(&image, 14, 14))
+    return ok()
+}
+
+fn events(device: &metal.Device, queue: &metal.CommandQueue) -> void!metal.Error {
+    shared := device.new_shared_event()?
+    shared.set_label("progress")
+    event := device.new_event()?
+    event.set_label("order")
+    commands := queue.command_buffer()?
+    commands.encode_signal_event(&event, 1)
+    commands.encode_wait_for_event(&event, 1)
+    commands.encode_signal_shared_event(&shared, 7)
+    commands.enqueue()
+    commands.commit()
+    commands.wait_until_scheduled()
+    commands.wait_until_completed()?
+    assert_eq(shared.signaled_value(), 7u64)
+    shared.set_signaled_value(9)
+    assert_eq(shared.signaled_value(), 9u64)
+    // The second buffer waits for the CPU to signal 10.
+    later := queue.command_buffer()?
+    later.encode_wait_for_shared_event(&shared, 10)
+    later.encode_signal_shared_event(&shared, 11)
+    later.commit()
+    shared.set_signaled_value(10)
+    later.wait_until_completed()?
+    assert_eq(shared.signaled_value(), 11u64)
+    return ok()
+}
+
+fn queues(device: &metal.Device) -> void!metal.Error {
+    queue := device.new_command_queue_with_max_command_buffer_count(2)?
+    queue.set_label("limited")
+    assert(same_text(queue.label(), "limited"))
+    assert(rejected(device.new_command_queue_with_max_command_buffer_count(0)))
+    other := queue.clone()
+    commands := other.command_buffer_with_unretained_references()?
+    commands.push_debug_group("empty")
+    commands.pop_debug_group()
+    commands.commit()
+    commands.wait_until_completed()?
+    return ok()
+}
+
+fn layer(device: &metal.Device) -> void!metal.Error {
+    surface := metal.MetalLayer.new()?
+    surface.set_device(device)
+    surface.set_pixel_format(metal.PIXEL_FORMAT_BGRA8_UNORM)
+    surface.set_framebuffer_only(false)
+    surface.set_maximum_drawable_count(2)
+    surface.set_display_sync_enabled(false)
+    surface.set_contents_scale(2.0)
+    surface.set_opaque(true)
+    surface.set_drawable_size(48.0, 16.0)
+    size := surface.drawable_size()
+    assert_eq(size.width, 48.0)
+    assert_eq(size.height, 16.0)
+    // A layer outside any window may still hand out drawables.
+    if let some(drawable) = surface.next_drawable() {
+        texture := drawable.texture()?
+        assert_eq(texture.width(), 48usize)
+        assert_eq(texture.pixel_format(), metal.PIXEL_FORMAT_BGRA8_UNORM)
+    }
+    return ok()
+}
+
+fn run(device: &metal.Device) -> void!metal.Error {
+    device_queries(device)
+    buffers(device)?
+    libraries(device)?
+    queue := device.new_command_queue()?
+    options := metal.CompileOptions.new()?
+    library := device.new_library_with_source(SHADERS, &options)?
+    compute(device, &queue, &library)?
+    blits(device, &queue)?
+    cpu_textures(device)?
+    render(device, &queue, &library)?
+    events(device, &queue)?
+    queues(device)?
+    layer(device)?
+    // Nothing above leaked into an autorelease pool that is never drained.
+    pool := objc.AutoreleasePool.new()
+    core.drop(pool)
+    return ok()
+}
+
+fn main() -> i32 {
+    layouts()
+    pixel_sizes()
+    strings()
+    missing_error := metal.Error.NotFound
+    assert_eq(metal.error_name(&missing_error), "NotFound")
+    match metal.Device.system_default() {
+        ok(device) => {
+            match run(&device) {
+                ok() => {
+                    return 0
+                }
+                err(error) => {
+                    console.println(metal.error_name(&error))!
+                    if let metal.Error.Failed(failure) = error {
+                        if let some(message) = failure.message() {
+                            text := [0u8; 2048]
+                            length := message.copy_to(&mut text)
+                            console.println(unsafe {
+                                mem.str_from_utf8(&text[..length])
+                            })!
+                        }
+                    }
+                    return 1
+                }
+            }
+        }
+        err(_) => {
+            console.println("no Metal device; GPU checks skipped")!
+            return 0
+        }
+    }
+}
