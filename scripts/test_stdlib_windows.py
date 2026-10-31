@@ -196,8 +196,9 @@ def main():
         raise SystemExit("MinGW libkernel32.a not found; provide --kernel32 or install the MinGW development files")
     fixtures = [path.resolve() for path in args.fixture] if args.fixture else (
         # window_events and window_frames open real windows; tests/window_library.rs drives them.
+        # gpu_metal_checks needs Metal, which only macOS has.
         sorted(path for path in (ROOT / "tests/stdlib").glob("*.dodo")
-               if path.name not in ("window_events.dodo", "window_frames.dodo")) +
+               if path.name not in ("window_events.dodo", "window_frames.dodo", "gpu_metal_checks.dodo")) +
         sorted(path for path in (ROOT / "tests/os").glob("*.dodo")
                if "_unix_" not in path.name and path.name not in (
                    "process_checks.dodo", "env_native_checks.dodo", "thread_failures.dodo")))
