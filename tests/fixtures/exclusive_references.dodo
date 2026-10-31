@@ -1,0 +1,67 @@
+package exclusive
+
+pub struct Buffer {
+    data: &mut[u8]
+    written: usize
+
+    // Each store goes through a pointer loaded from `self`. Only `noalias`
+    // on `self` tells LLVM that the stores cannot overwrite `self.data`, so
+    // the loop needs no reload or bounds check per byte and becomes memset.
+    pub fn fill(&mut self, value: u8) {
+        for i in 0..self.data.len {
+            self.data[i] = value
+        }
+        self.written += self.data.len
+    }
+}
+
+pub fn fill_buffer(buffer: &mut Buffer) {
+    buffer.fill(3)
+}
+
+interface Counter {
+    fn bump(&mut self)
+}
+
+struct Tally {
+    count: u32
+
+    pub fn bump(&mut self) {
+        self.count += 1
+    }
+}
+
+fn add(total: &mut u32, amount: &u32) {
+    *total += *amount
+}
+
+fn bump_dyn(counter: &mut dyn Counter) {
+    counter.bump()
+}
+
+// Returned through caller storage, which takes the first LLVM parameter.
+fn large(total: &mut u32) -> [2048]u8 {
+    *total += 1
+    return [7u8; 2048]
+}
+
+fn main() -> i32 {
+    storage := [0u8; 64]
+    buffer := Buffer { data: &mut storage, written: 0 }
+    buffer.fill(9)
+    fill_buffer(&mut buffer)
+    total := 1u32
+    amount := 2u32
+    add(&mut total, &amount)
+    tally := Tally { count: 0 }
+    bump_dyn(&mut tally)
+    step := fn(value: &mut u32) {
+        *value += amount
+    }
+    step(&mut total)
+    bytes := large(&mut total)
+    if buffer.written != 128 || storage[63] != 3 || total != 6 || tally.count != 1 || bytes[2047] != 7 {
+        return 1
+    }
+    return 0
+}
