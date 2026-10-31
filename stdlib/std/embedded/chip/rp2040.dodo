@@ -134,6 +134,8 @@ const TIMER_ALARM0: usize = TIMER_BASE + 0x10
 const TIMER_ARMED: usize = TIMER_BASE + 0x20
 const TIMER_INTR: usize = TIMER_BASE + 0x34
 const TIMER_INTE: usize = TIMER_BASE + 0x38
+// INTF forces an alarm's interrupt, as if it had fired, until cleared.
+const TIMER_INTF: usize = TIMER_BASE + 0x3C
 // The longest an alarm sleeps at once: below 2^31 us, so its 32-bit
 // target time is still ahead when the write lands.
 const MAX_ALARM_SLEEP_US: u64 = 0x7FFF_FFFF
@@ -1021,7 +1023,7 @@ pub struct Pin {
 }
 
 // The free-running 64-bit microsecond counter. Implements the std/embedded/hal
-// delay protocol.
+// delay and counter protocols.
 pub struct Timer {
     high: hal.Reg<u32>
     low: hal.Reg<u32>
@@ -1055,6 +1057,9 @@ pub struct Timer {
                 listening: hal.Reg.at(TIMER_INTE),
                 listen_set: hal.Reg.at(TIMER_INTE + SET_ALIAS),
                 listen_clear: hal.Reg.at(TIMER_INTE + CLEAR_ALIAS),
+                forced: hal.Reg.at(TIMER_INTF),
+                force_set: hal.Reg.at(TIMER_INTF + SET_ALIAS),
+                force_clear: hal.Reg.at(TIMER_INTF + CLEAR_ALIAS),
             }
         }
         return ok(alarm)
@@ -1094,7 +1099,9 @@ pub struct Timer {
 // fires once when the microsecond counter reaches the time it was given;
 // with `listen` it raises interrupt TIMER_IRQ_0 + n, whose handler calls
 // `clear` and may schedule the next time. Move it into a
-// `static mut Option<Alarm>` for the handler to use.
+// `static mut Option<Alarm>` for the handler to use. Implements the
+// std/embedded/hal alarm and counter protocols, with times up to
+// 2^31 - 1 us (35 minutes) ahead.
 pub struct Alarm {
     number: u32
     bit: u32
@@ -1106,6 +1113,9 @@ pub struct Alarm {
     listening: hal.Reg<u32>
     listen_set: hal.Reg<u32>
     listen_clear: hal.Reg<u32>
+    forced: hal.Reg<u32>
+    force_set: hal.Reg<u32>
+    force_clear: hal.Reg<u32>
 
     // 0 to 3.
     pub fn number(&self) -> u32 {
@@ -1136,6 +1146,32 @@ pub struct Alarm {
         self.target.write(core.wrapping_add(self.low.read(), microseconds))
     }
 
+    // Fire when now_us() reaches `time_us`, replacing any earlier time and
+    // clearing an earlier firing; the std/embedded/hal alarm protocol. A
+    // time already reached fires at once, raising the interrupt if the
+    // alarm listens. InvalidInput for a time more than 2^31 - 1 us ahead.
+    pub fn schedule_at_us(&mut self, time_us: u64) -> void!hal.Error {
+        now := self.now_us()
+        if time_us > now && time_us - now > MAX_ALARM_SLEEP_US {
+            return err(hal.Error.InvalidInput)
+        }
+        self.clear()
+        if time_us > now {
+            self.target.write((time_us & 0xFFFF_FFFF) as u32)
+            if self.now_us() < time_us {
+                return ok()
+            }
+        }
+        // The time had passed before the alarm was armed, which would fire
+        // only once the counter wraps, unless it fired just before. Either
+        // way the hardware alarm is done; force the firing it missed.
+        self.cancel()
+        if !self.raw.any(self.bit) {
+            self.force_set.write(self.bit)
+        }
+        return ok()
+    }
+
     // Disarm: a scheduled time no longer fires.
     pub fn cancel(&mut self) {
         self.armed.write(self.bit)
@@ -1148,13 +1184,14 @@ pub struct Alarm {
 
     // True once it has fired, until `clear`.
     pub fn fired(&self) -> bool {
-        return self.raw.any(self.bit)
+        return self.raw.any(self.bit) || self.forced.any(self.bit)
     }
 
     // Acknowledge that it fired. An interrupt handler has to, or the
     // interrupt stays raised and the handler runs again at once.
     pub fn clear(&mut self) {
         self.raw.write(self.bit)
+        self.force_clear.write(self.bit)
     }
 
     // Raise the interrupt when it fires. Enable the interrupt in the NVIC

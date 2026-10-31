@@ -17,8 +17,9 @@ import "core/ptr"
 //    handle afterwards is safe.
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
-// 3. Device protocols. The interfaces below (OutputPin, InputPin, Delay, I2c,
-//    Spi, PwmOutput, AnalogInput, and Registers) name what drivers need
+// 3. Device protocols. The interfaces below (OutputPin, InputPin, Delay,
+//    Counter, Alarm, I2c, Spi, PwmOutput, AnalogInput, and Registers) name
+//    what drivers need
 //    from a device. Any value with
 //    matching methods implements them. Drivers are usually generic over a
 //    bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
@@ -29,8 +30,10 @@ import "core/ptr"
 //    helpers and `std/fmt` formatting unchanged.
 //
 // Addresses are 7-bit I2C addresses; controllers that also reach 10-bit
-// addresses offer that through methods of their own. Pin and delay
-// operations cannot fail; bus, PWM, and analog operations report the shared
+// addresses offer that through methods of their own. Times are
+// microseconds: counters and alarms count them in a u64, which no program
+// outlives. Pin, delay, and counter operations cannot fail; alarm, bus, PWM,
+// and analog operations report the shared
 // `Error` below, because such a device may itself sit on a bus. A bus is
 // configured when it is created, with a frequency and for SPI a `SpiMode`,
 // and so is a PWM output, with its frequency; the protocols then only move
@@ -78,8 +81,10 @@ import "core/ptr"
 //                                  as the RP2040 and RP2350 do: targets
 //                                  (slaves) with i2c_target and spi_target,
 //                                  spi_with_select, and uart_flow
-//    Board.timer                   delay_us, delay_ms, now_us(&self) -> u64;
-//                                  chips may hand out alarms that are
+//    Board.timer                   the Delay and Counter protocols:
+//                                  delay_us, delay_ms, now_us(&self) -> u64;
+//                                  chips may hand out alarms with the Alarm
+//                                  protocol that are also
 //                                  std/embedded/executor clocks, as the
 //                                  RP2040 and RP2350 do with alarm(n)
 //    Board.usb                     serial() -> port!Error, a USB serial
@@ -164,6 +169,39 @@ pub interface InputPin {
 // A busy-waiting delay source, such as a timer.
 pub interface Delay {
     fn delay_us(&mut self, microseconds: u32)
+}
+
+// A free-running counter that keeps time, such as a chip's microsecond
+// timer. Drivers measure intervals and give up on stuck devices with it,
+// through Deadline and Ticker below, without naming a chip.
+pub interface Counter {
+    // Microseconds since some fixed start, such as the chip's start; never
+    // decreases.
+    fn now_us(&self) -> u64
+}
+
+// A one-shot alarm on a counter: it fires once when now_us() reaches the
+// time it was given. Code polls `fired`, or a chip's interrupt for the
+// alarm runs a handler, which calls `clear`. Raising that interrupt is
+// chip-specific, as for the RP2040's and RP2350's `listen` and `irq`; the
+// protocol only sets times and reports them. An alarm is also a Counter.
+pub interface Alarm {
+    // Microseconds on the counter the alarm compares with.
+    fn now_us(&self) -> u64
+    // Fire once when now_us() reaches `time_us`, replacing any earlier time
+    // and clearing an earlier firing. A time already reached fires at once.
+    // InvalidInput if the time lies further ahead than the alarm reaches,
+    // which each implementation states.
+    fn schedule_at_us(&mut self, time_us: u64) -> void!Error
+    // Disarm: a scheduled time no longer fires. An earlier firing stays
+    // reported until `clear`.
+    fn cancel(&mut self)
+    // True once the scheduled time was reached, until `clear` or the next
+    // schedule.
+    fn fired(&self) -> bool
+    // Acknowledge a firing. An interrupt handler has to, or the interrupt
+    // stays raised.
+    fn clear(&mut self)
 }
 
 // An I2C bus controller. Addresses are 7-bit device addresses.
@@ -547,6 +585,134 @@ pub fn write_pin<P: OutputPin>(pin: &mut P, high: bool) {
 pub fn delay_ms<D: Delay>(delay: &mut D, milliseconds: u32) {
     for _ in 0..milliseconds {
         delay.delay_us(1000)
+    }
+}
+
+// `time + microseconds`, or the largest time if that does not fit.
+fn later(time: u64, microseconds: u64) -> u64 {
+    if microseconds > 0xFFFF_FFFF_FFFF_FFFFu64 - time {
+        return 0xFFFF_FFFF_FFFF_FFFFu64
+    }
+    return time + microseconds
+}
+
+// The microseconds a counter has run since `since_us`, one of its own
+// now_us times; 0 for a time still ahead.
+pub fn elapsed_us<C: Counter>(counter: &C, since_us: u64) -> u64 {
+    now := counter.now_us()
+    if now <= since_us {
+        return 0
+    }
+    return now - since_us
+}
+
+// Busy-wait until a counter reaches `time_us`.
+pub fn wait_until<C: Counter>(counter: &C, time_us: u64) {
+    for counter.now_us() < time_us {}
+}
+
+// Fire an alarm `microseconds` from now. InvalidInput if that lies beyond
+// the alarm's reach.
+pub fn schedule_in_us<A: Alarm>(alarm: &mut A, microseconds: u64) -> void!Error {
+    time := later(alarm.now_us(), microseconds)
+    return alarm.schedule_at_us(time)
+}
+
+// Busy-wait until an alarm fires, then clear it.
+pub fn wait_for_alarm<A: Alarm>(alarm: &mut A) {
+    for !alarm.fired() {}
+    alarm.clear()
+}
+
+// A time on a counter by which something must have happened, for drivers
+// that poll a device and give up on one that is stuck:
+//
+//     deadline := hal.Deadline.after(timer, 10_000)
+//     for !ready(bus)? {
+//         if deadline.passed(timer) {
+//             return err(hal.Error.Timeout)
+//         }
+//     }
+//
+// It holds only the time, so it never borrows the counter, and the same
+// counter can delay between checks.
+pub struct Deadline {
+    time: u64
+
+    // The deadline at `time_us`, a now_us time of the counter it is checked
+    // against.
+    pub fn at(time_us: u64) -> Deadline {
+        return Deadline { time: time_us }
+    }
+
+    // The deadline `microseconds` from the counter's present time.
+    pub fn after<C: Counter>(counter: &C, microseconds: u64) -> Deadline {
+        return Deadline { time: later(counter.now_us(), microseconds) }
+    }
+
+    pub fn time_us(&self) -> u64 {
+        return self.time
+    }
+
+    // True once the counter has reached the deadline.
+    pub fn passed<C: Counter>(&self, counter: &C) -> bool {
+        return counter.now_us() >= self.time
+    }
+
+    // The microseconds left until the deadline; 0 once it has passed.
+    pub fn remaining_us<C: Counter>(&self, counter: &C) -> u64 {
+        now := counter.now_us()
+        if now >= self.time {
+            return 0
+        }
+        return self.time - now
+    }
+
+    // Busy-wait until the counter reaches the deadline.
+    pub fn wait<C: Counter>(&self, counter: &C) {
+        wait_until(counter, self.time)
+    }
+}
+
+// Ticks at a fixed period on a counter, for work that repeats, such as
+// sampling a sensor every 10 ms. Each tick falls a whole number of periods
+// after the start, so the ticks do not drift however late they are seen. A
+// tick missed entirely, because the program was busy for longer than a
+// period, is skipped rather than delivered late.
+pub struct Ticker {
+    next: u64
+    period: u64
+
+    // Ticks every `period_us`, at least 1, the first one period from now.
+    pub fn start<C: Counter>(counter: &C, period_us: u64) -> Ticker {
+        core.assert(period_us > 0)
+        return Ticker { next: later(counter.now_us(), period_us), period: period_us }
+    }
+
+    pub fn period_us(&self) -> u64 {
+        return self.period
+    }
+
+    // The counter time of the next tick.
+    pub fn next_us(&self) -> u64 {
+        return self.next
+    }
+
+    // True once per tick: when the counter has reached the next tick, which
+    // then moves on to the first tick still ahead.
+    pub fn ready<C: Counter>(&mut self, counter: &C) -> bool {
+        now := counter.now_us()
+        if now < self.next {
+            return false
+        }
+        missed := (now - self.next) / self.period
+        self.next = later(self.next, (missed + 1) * self.period)
+        return true
+    }
+
+    // Busy-wait for the next tick.
+    pub fn wait<C: Counter>(&mut self, counter: &C) {
+        for !self.ready(counter) {}
     }
 }
 
