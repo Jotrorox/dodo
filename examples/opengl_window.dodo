@@ -1,0 +1,111 @@
+package main
+
+import "core/ptr"
+import "std/graphics"
+import "std/gpu/opengl"
+import "std/gpu/opengl/gl"
+import "std/window"
+
+// Draw a triangle with OpenGL and show it in a std/window window. The GPU
+// renders into an offscreen target; each frame is read back and copied into
+// the window's canvas. Press Escape or close the window to quit.
+
+const WIDTH: u32 = 480
+const HEIGHT: u32 = 320
+
+const VERTEX_SHADER: &[u8] = b"#version 330 core\nlayout(location = 0) in vec2 position;\nlayout(location = 1) in vec3 color;\nout vec3 shade;\nvoid main() {\n    shade = color;\n    gl_Position = vec4(position, 0.0, 1.0);\n}\n\0"
+const FRAGMENT_SHADER: &[u8] = b"#version 330 core\nin vec3 shade;\nout vec4 result;\nvoid main() {\n    result = vec4(shade, 1.0);\n}\n\0"
+
+// Room for the window at up to twice the size on high-density displays.
+static mut FRAME: [2457600]u8 = [0; 2457600]
+
+fn compile(kind: u32, source: &[u8]) -> u32 {
+    unsafe {
+        shader := gl.create_shader(kind)
+        text := ptr.as_ptr(source)
+        gl.shader_source(shader, 1, ptr.from_ref(&text), 0usize as *const i32)
+        gl.compile_shader(shader)
+        return shader
+    }
+}
+
+fn setup() -> u32 {
+    vertices := [
+        -0.6f32, -0.6, 1.0, 0.3, 0.2,
+        0.6, -0.6, 0.2, 0.9, 0.4,
+        0.0, 0.6, 0.3, 0.4, 1.0
+    ]
+    vertex := compile(gl.VERTEX_SHADER, VERTEX_SHADER)
+    fragment := compile(gl.FRAGMENT_SHADER, FRAGMENT_SHADER)
+    unsafe {
+        program := gl.create_program()
+        gl.attach_shader(program, vertex)
+        gl.attach_shader(program, fragment)
+        gl.link_program(program)
+        array := 0u32
+        gl.gen_vertex_arrays(1, ptr.from_mut(&mut array))
+        gl.bind_vertex_array(array)
+        buffer := 0u32
+        gl.gen_buffers(1, ptr.from_mut(&mut buffer))
+        gl.bind_buffer(gl.ARRAY_BUFFER, buffer)
+        gl.buffer_data(gl.ARRAY_BUFFER, 60, ptr.as_ptr(&vertices) as *const u8, gl.STATIC_DRAW)
+        gl.vertex_attrib_pointer(0, 2, gl.FLOAT, 0, 20, 0usize as *const u8)
+        gl.enable_vertex_attrib_array(0)
+        gl.vertex_attrib_pointer(1, 3, gl.FLOAT, 0, 20, 8usize as *const u8)
+        gl.enable_vertex_attrib_array(1)
+        return program
+    }
+}
+
+fn run() -> void!opengl.Error {
+    context := opengl.Context.create(opengl.Options.default())?
+    title := context.renderer()
+    win := window.open(window.Options { title: title, width: WIDTH, height: HEIGHT, resizable: false })!
+    // The canvas has scale() times more pixels per side than the window.
+    scale := win.scale()
+    if scale > 2 {
+        scale = 2
+    }
+    width := WIDTH * scale
+    height := HEIGHT * scale
+
+    target := opengl.Target.new(width, height)?
+    program := setup()
+    unsafe {
+        gl.clear_color(0.11, 0.13, 0.19, 1.0)
+        gl.clear(gl.COLOR_BUFFER_BIT)
+        gl.use_program(program)
+        gl.draw_arrays(gl.TRIANGLES, 0, 3)
+    }
+    frame := unsafe {
+        &mut FRAME[..]
+    }
+    target.read_bgra(frame)?
+    image := graphics.Canvas.new(frame, width, height, graphics.PixelFormat.Bgra8888)!
+    for {
+        canvas := win.canvas()
+        canvas.blit(&image, 0, 0)
+        dirty := canvas.take_dirty()
+        win.update(dirty)!
+        match win.wait_event()! {
+            window.Event.Close => {
+                return ok()
+            }
+            window.Event.Key(key) => {
+                if key.key == window.Key.Escape {
+                    return ok()
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn main() {
+    match run() {
+        ok() => {}
+        err(error) => {
+            core.assert(false, opengl.error_name(error))
+        }
+    }
+}

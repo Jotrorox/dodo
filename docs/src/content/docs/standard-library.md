@@ -48,6 +48,7 @@ they are not prerequisites for using the safe entry APIs.
 | Draw shapes, text, or images | `graphics.canvas` over a byte array | [Graphics](graphics.md) |
 | Draw smooth shapes, gradients, or TrueType text | `canvas.aa_fill_circle`, `graphics.Gradient`, `truetype.Font.new` | [Graphics](graphics.md#antialiased-drawing) |
 | Open a window | `window.open` and `win.canvas()` | [Windows](window.md) |
+| Render with the GPU through OpenGL | `opengl.Context.create`, `opengl.Target.new` and the `gl` commands | [OpenGL](opengl.md) |
 | Run a shader on the GPU (macOS) | `metal.Device.system_default` and `new_library_with_source` | [Metal](metal.md) |
 | Run a shader on the GPU | `vk.open()` and `library.entry()` from `std/gpu/vulkan` | [GPU programming with Vulkan](gpu.md) |
 | Call a function in a shared library | `dylib.open` and `library.symbol` | [Shared libraries](dylib.md) |
@@ -180,6 +181,7 @@ individual modules and links every public declaration back to its source.
 | [Hashing and checksums](hash.md) | `std/checksum`, `std/hash` | Portable. |
 | [Graphics](graphics.md) | `std/graphics`, `std/graphics/fake`, `std/graphics/font`, `std/graphics/image`, `std/graphics/truetype`; panels in `std/embedded/display`, `std/embedded/display/st7789`, `std/embedded/display/ssd1306` | Portable; caller-supplied pixel and file buffers. |
 | [Windows](window.md) | `std/window`, `std/window/x11` | Hosted: X11 on Linux, AppKit on macOS, Win32 on Windows; the X11 protocol code is portable. |
+| [OpenGL](opengl.md) | `std/gpu/opengl`, `std/gpu/opengl/gl` | Hosted: EGL on Linux, CGL on macOS, WGL on Windows, loaded at run time; the generated binding is portable. |
 | [Metal](metal.md) | `std/gpu/metal`, `std/gpu/metal/objc` | macOS only (Apple silicon and Intel); links Metal, QuartzCore and Foundation. |
 | [GPU programming with Vulkan](gpu.md) | `std/gpu/vulkan` | Hosted; the Vulkan loader is opened at run time, nothing is linked. |
 | [Shared libraries](dylib.md) | `std/dylib` | Hosted: dlopen on Linux and macOS, LoadLibrary on Windows. |
@@ -245,12 +247,16 @@ select providers; they are not additional recommended starting paths.
 | `std/window/windows` | Native Win32 window boundary; use [windows](window.md). |
 | `std/window/system` | The C-runtime adapter the macOS and Windows boundaries share; use [windows](window.md). |
 | `std/window/raw` | Error and event records exchanged with the adapters; use [windows](window.md). |
+| `std/gpu/opengl/linux` | EGL context adapter; use [OpenGL](opengl.md). |
+| `std/gpu/opengl/macos` | CGL context adapter; use [OpenGL](opengl.md). |
+| `std/gpu/opengl/windows` | WGL context adapter; use [OpenGL](opengl.md). |
+| `std/gpu/opengl/common` | Error type and helpers the adapters share; use [OpenGL](opengl.md). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
 `std/process/native`, `std/signal/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
 `std/time/native`, `std/tls/native`, `std/quic/native`, `std/crypto/native`,
-`std/crypto/openssl/native`, and `std/web/native` select compatible
-providers. `std/platform/native` exposes advanced native values;
+`std/crypto/openssl/native`, `std/web/native`, `std/window/native` and
+`std/gpu/opengl/native` select compatible providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`
 imports are for matching-target integrations. `runtime.c` files are embedded
 implementation boundaries, not Dodo imports.
