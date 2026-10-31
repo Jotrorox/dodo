@@ -184,6 +184,78 @@ fn foreign_narrow_integer_arguments_follow_the_c_abi() {
 }
 
 #[test]
+fn c_function_pointers_follow_the_c_abi() {
+    let workspace = Workspace::new();
+    // Function addresses come from independently compiled code, as from
+    // `dlsym` or `vkGetInstanceProcAddr`, and C code calls back into Dodo.
+    let foreign = workspace.file("foreign.rs", r#"
+#[no_mangle] pub extern "C" fn signed_byte(value: i8) -> i32 { value as i32 }
+#[no_mangle] pub extern "C" fn narrow_result(value: i32) -> i8 { value as i8 }
+#[no_mangle] pub extern "C" fn proc_address(index: u32) -> *const u8 {
+    match index {
+        0 => signed_byte as *const u8,
+        1 => narrow_result as *const u8,
+        _ => core::ptr::null(),
+    }
+}
+#[no_mangle] pub extern "C" fn byte_function() -> extern "C" fn(i8) -> i32 { signed_byte }
+#[no_mangle] pub extern "C" fn apply(callback: extern "C" fn(i16) -> i32, value: i16) -> i32 { callback(value) }
+"#);
+    let object = workspace.0.join("foreign.o");
+    let output = Command::new("rustc")
+        .arg("--edition=2021")
+        .arg("--crate-type=lib")
+        .arg("--emit=obj")
+        .arg("-Copt-level=3")
+        .arg(&foreign)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .expect("compile independent C ABI fixture");
+    assert!(
+        output.status.success(),
+        "foreign fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let source = workspace.file(
+        "main.dodo",
+        r#"package regression
+unsafe extern "C" fn proc_address(index: u32) -> *const u8
+unsafe extern "C" fn byte_function() -> extern "C" fn(i8) -> i32
+unsafe extern "C" fn apply(callback: extern "C" fn(i16) -> i32, value: i16) -> i32
+extern "C" fn doubled(value: i16) -> i32 { return value as i32 * 2 }
+struct Table { byte: extern "C" fn(i8) -> i32, narrow: extern "C" fn(i32) -> i8 }
+fn main() -> i32 {
+    unsafe {
+        table := Table {
+            byte: proc_address(0u32) as extern "C" fn(i8) -> i32,
+            narrow: proc_address(1u32) as extern "C" fn(i32) -> i8,
+        }
+        if table.byte(-1i8) != -1 { return 41 }
+        if table.narrow(255) != -1i8 { return 42 }
+        if proc_address(2u32) as usize != 0 { return 43 }
+        byte := byte_function()
+        if byte(-128i8) != -128 { return 44 }
+        if apply(doubled, -300i16) != -600 { return 45 }
+        local: extern "C" fn(i16) -> i32 = doubled
+        if apply(local, 7i16) != 14 { return 46 }
+        if (local as *const u8) as usize != (doubled as usize) { return 47 }
+    }
+    return 0
+}
+"#,
+    );
+    for optimization in [0, 3] {
+        let executable = workspace.build(&source, optimization, Some(&object));
+        assert_eq!(
+            workspace.run(&executable).status.code(),
+            Some(0),
+            "C function pointer call failed at O{optimization}"
+        );
+    }
+}
+
+#[test]
 fn conditional_owned_arguments_only_drop_when_evaluated() {
     let workspace = Workspace::new();
     let source = workspace.file("main.dodo", &format!("package regression\n{DROPPING_TOKEN}\nfn consume(token: Token) -> bool {{ return true }}\nfn conjunction(flag: bool) -> bool {{ return flag && consume(Token{{id: 65}}) }}\nfn disjunction(flag: bool) -> bool {{ return flag || consume(Token{{id: 66}}) }}\nfn main() -> void {{\nfor i := 0; i < 5; i += 1 {{\nconjunction(false)\nconjunction(true)\ndisjunction(true)\ndisjunction(false)\n}}\n}}\n"));

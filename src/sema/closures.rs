@@ -370,12 +370,20 @@ impl Checker<'_> {
         if let Some(vector) = &signature.interrupt {
             return Err(super::interrupt_handler_use(name, vector, span));
         }
-        if signature.unsafe_ || signature.extern_ {
+        // A C function's address is a C function pointer; calling it
+        // through that pointer is unsafe, as calling it by name is.
+        if signature.extern_ {
+            return Ok(Type::ExternFn(
+                signature.params.iter().map(|p| p.ty.clone()).collect(),
+                Box::new(signature.ret.clone()),
+            ));
+        }
+        if signature.unsafe_ {
             return Err(Diagnostic::new(
                 span,
-                format!("unsafe or foreign function `{name}` cannot be used as a function value"),
+                format!("unsafe function `{name}` cannot be used as a function value"),
             )
-            .note("wrap the call in a safe function; pass C callbacks with `mem.callback`"));
+            .note("wrap the call in a safe function; pass C callbacks as `extern \"C\" fn` declarations"));
         }
         if signature.unavailable
             || name.ends_with(".drop")
@@ -406,6 +414,13 @@ impl Checker<'_> {
         expected: Option<&Type>,
         span: Span,
     ) -> Check<Value> {
+        if let Some(expected @ Type::ExternFn(..)) = expected {
+            return Err(Diagnostic::new(
+                span,
+                format!("a closure cannot be a C function pointer `{expected}`"),
+            )
+            .note("declare the callback as `extern \"C\" fn name(..) { .. }` and use its name"));
+        }
         let hint = expected
             .and_then(Type::callable_signature)
             .filter(|(params, _)| params.len() == closure.params.len())
@@ -633,6 +648,9 @@ impl Checker<'_> {
         }
         let peeked = self.peek_type(callee);
         let value = self.expr(callee, peeked.as_ref(), false)?;
+        if matches!(value.ty, Type::ExternFn(..)) {
+            self.unsafe_required(span, "calling through a C function pointer")?;
+        }
         let Some((params, ret)) = value
             .ty
             .callable_signature()

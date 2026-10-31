@@ -274,7 +274,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .create_basic_type(&name, size, encoding, LLVMDIFlagZero)
                     .map_err(error)?)
             }
-            Type::Fn(..) => {
+            Type::Fn(..) | Type::ExternFn(..) => {
                 let inner = self.debug_type(&Type::u8())?;
                 Ok(self
                     .debug

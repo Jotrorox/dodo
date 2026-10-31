@@ -623,6 +623,14 @@ impl Context {
                 }
                 self.validate_type(ret, span, true)
             }
+            Type::ExternFn(params, ret) => {
+                for param in params {
+                    self.validate_type(param, span, false)?;
+                    self.ffi_type(param, span)?;
+                }
+                self.validate_type(ret, span, true)?;
+                self.ffi_type(ret, span)
+            }
             Type::Dyn(name) => Err(Diagnostic::new(
                 span,
                 format!("`dyn {name}` has no fixed size; use it behind a reference"),
@@ -645,11 +653,16 @@ impl Context {
     }
     fn ffi_type(&self, ty: &Type, span: Span) -> Check<()> {
         match ty {
-            Type::Void | Type::Bool | Type::Int { .. } | Type::Float(_) | Type::Raw(..) => Ok(()),
+            Type::Void
+            | Type::Bool
+            | Type::Int { .. }
+            | Type::Float(_)
+            | Type::Raw(..)
+            | Type::ExternFn(..) => Ok(()),
             // Aggregate ABI classification is target-dependent and deliberately explicit.
             _ => Err(Diagnostic::new(
                 span,
-                "C ABI parameters and results currently require primitive or raw-pointer types",
+                "C ABI parameters and results currently require primitive, raw-pointer or `extern \"C\" fn` types",
             )
             .note("pass a pointer to a @repr(C) struct instead of passing it by value")),
         }
@@ -808,7 +821,12 @@ impl Context {
     fn thread_safe(&self, ty: &Type, sharing: bool, seen: &mut HashSet<String>) -> bool {
         match ty {
             // Function pointers carry code addresses and no captured state.
-            Type::Void | Type::Bool | Type::Int { .. } | Type::Float(_) | Type::Fn(..) => true,
+            Type::Void
+            | Type::Bool
+            | Type::Int { .. }
+            | Type::Float(_)
+            | Type::Fn(..)
+            | Type::ExternFn(..) => true,
             Type::Array(_, t) | Type::Option(t) => self.thread_safe(t, sharing, seen),
             Type::Result(t, e) => {
                 self.thread_safe(t, sharing, seen) && self.thread_safe(e, sharing, seen)
@@ -2127,6 +2145,22 @@ impl<'a> Checker<'a> {
                 {
                     self.unsafe_required(span, "raw pointer conversion")?;
                     Value { ty: target.clone() }
+                } else if matches!(value.ty, Type::Raw(..) | Type::ExternFn(..))
+                    && matches!(target, Type::ExternFn(..))
+                    || matches!(value.ty, Type::ExternFn(..)) && matches!(target, Type::Raw(..))
+                    || *target == Type::usize() && matches!(value.ty, Type::ExternFn(..))
+                    || value.ty == Type::usize() && matches!(target, Type::ExternFn(..))
+                {
+                    // A C function pointer is a code address: the caller
+                    // vouches for its signature, as with `dlsym`.
+                    self.unsafe_required(span, "C function pointer conversion")?;
+                    Value { ty: target.clone() }
+                } else if matches!(value.ty, Type::Fn(..)) && matches!(target, Type::ExternFn(..)) {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("cannot cast `{}` to `{target}`: Dodo functions do not use the C calling convention", value.ty),
+                    )
+                    .note("declare the callback as `extern \"C\" fn name(..) { .. }` and use its name"));
                 } else if matches!(&value.ty, Type::Ref(..)) && matches!(target, Type::Raw(..)) {
                     if matches!(
                         (&value.ty, &*target),
@@ -2398,10 +2432,13 @@ impl<'a> Checker<'a> {
                 .or_else(|| self.context.constants.get(n).map(|c| c.ty.clone()))
                 .or_else(|| {
                     self.context.functions.get(n).map(|f| {
-                        Type::Fn(
-                            f.params.iter().map(|p| p.ty.clone()).collect(),
-                            Box::new(f.ret.clone()),
-                        )
+                        let params = f.params.iter().map(|p| p.ty.clone()).collect();
+                        let ret = Box::new(f.ret.clone());
+                        if f.extern_ {
+                            Type::ExternFn(params, ret)
+                        } else {
+                            Type::Fn(params, ret)
+                        }
                     })
                 }),
             ExprKind::Closure(_) => None,
@@ -4372,7 +4409,10 @@ fn validate_constant(expression: &Expr, bits: u32) -> Check<()> {
         ExprKind::String(..) => (),
         // Named functions are link-time constant code addresses.
         ExprKind::Name(_) | ExprKind::Closure(_)
-            if matches!(expression.ty, Type::Fn(..) | Type::Option(_)) => {}
+            if matches!(
+                expression.ty,
+                Type::Fn(..) | Type::ExternFn(..) | Type::Option(_)
+            ) => {}
         ExprKind::Cast(e, Type::Ref(_, target)) if matches!(target.as_ref(), Type::DynFn(..)) => {
             validate_constant(e, bits)?
         }
@@ -4462,7 +4502,7 @@ fn constant_expression(expression: &Expr) -> bool {
         ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::String(..) => true,
         ExprKind::Name(name) => {
             name == "none" && matches!(expression.ty, Type::Option(_))
-                || matches!(expression.ty, Type::Fn(..))
+                || matches!(expression.ty, Type::Fn(..) | Type::ExternFn(..))
         }
         // A closure without captures is a function pointer.
         ExprKind::Closure(_) => matches!(expression.ty, Type::Fn(..)),
