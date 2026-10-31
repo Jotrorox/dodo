@@ -1,0 +1,149 @@
+package mqtt_client
+import "std/mqtt"
+import "std/mqtt/hosted"
+import "core/bytes"
+
+// The test replaces REFUSING and BROKER with loopback ports of a Rust broker.
+fn urls() -> i32 {
+    location: hosted.Location
+    match hosted.parse_url(b"mqtt://broker.example:8883/") {
+        ok(value) => {
+            location = value
+        }
+        err(_) => {
+            return 1
+        }
+    }
+    if !bytes.equal(location.host, b"broker.example") || location.port != 8883 {
+        return 2
+    }
+    match hosted.parse_url(b"[::1]") {
+        ok(value) => {
+            if !bytes.equal(value.host, b"::1") || value.port != 1883 {
+                return 3
+            }
+        }
+        err(_) => {
+            return 4
+        }
+    }
+    invalid := [b"", b"mqtts://x", b"x:", b"x:0", b"x:65536", b"x:12a", b"user@x", b"x/y", b"[::1", b"[::1]x", b"::1", b"mqtt://"]
+    for url in invalid {
+        match hosted.parse_url(*url) {
+            ok(_) => {
+                return 5
+            }
+            err(reason) => {
+                if reason.kind != mqtt.ErrorKind.InvalidInput {
+                    return 6
+                }
+            }
+        }
+    }
+    return 0
+}
+fn refused() -> i32 {
+    workspace := [0u8; hosted.MIN_WORKSPACE_BYTES]
+    match hosted.Client.connect(b"mqtt://REFUSING", b"dodo-test", &mut workspace) {
+        ok(_) => {
+            return 10
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.Refused || reason.code != 5 {
+                return 11
+            }
+        }
+    }
+    return 0
+}
+fn expect(client: &mut hosted.Client, topic: &[u8], payload: &[u8], level: u8) -> bool!mqtt.Error {
+    message := client.receive()?
+    return ok(bytes.equal(message.topic, topic) && bytes.equal(message.payload, payload) &&
+        mqtt.qos_level(&message.qos) == level && !message.retain && !message.duplicate)
+}
+fn session() -> i32!mqtt.Error {
+    workspace := [0u8; hosted.WORKSPACE_BYTES]
+    options := hosted.Options.new(b"dodo-test")
+    options.username = b"user"
+    options.password = b"pass"
+    options.keep_alive_s = 1
+    client := hosted.Client.connect_with(b"mqtt://BROKER", &options, &mut workspace)?
+    if client.session_present() {
+        return ok(20)
+    }
+    granted := client.subscribe(b"sensors/#", mqtt.QoS.ExactlyOnce)?
+    if granted != mqtt.QoS.AtLeastOnce {
+        return ok(21)
+    }
+    client.publish(b"sensors/a", b"zero")?
+    // The broker delivers sensors/x before acknowledging this one.
+    client.publish_with(b"sensors/b", b"one", mqtt.QoS.AtLeastOnce, false)?
+    client.publish_with(b"sensors/c", b"three", mqtt.QoS.ExactlyOnce, true)?
+    if !expect(&mut client, b"sensors/x", b"held", 1)? {
+        return ok(22)
+    }
+    if !expect(&mut client, b"sensors/y", b"two", 2)? {
+        return ok(23)
+    }
+    // Owes PUBREC, then answers PUBREL and keeps the idle session alive.
+    match client.poll(2500)? {
+        some(_) => {
+            return ok(24)
+        }
+        none => {}
+    }
+    client.unsubscribe(b"sensors/#")?
+    match client.subscribe(b"denied/#", mqtt.QoS.AtMostOnce) {
+        ok(_) => {
+            return ok(25)
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.Rejected || reason.code != 128 {
+                return ok(26)
+            }
+        }
+    }
+    match client.publish(b"bad/+", b"") {
+        ok() => {
+            return ok(27)
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.InvalidTopic {
+                return ok(28)
+            }
+        }
+    }
+    // Larger than the outgoing staging area, so the payload is sent separately.
+    big := [120u8; 6000]
+    client.publish(b"big", &big)?
+    client.disconnect()?
+    match client.publish(b"after", b"") {
+        ok() => {
+            return ok(29)
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.Closed {
+                return ok(30)
+            }
+        }
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    code := urls()
+    if code != 0 {
+        return code
+    }
+    code = refused()
+    if code != 0 {
+        return code
+    }
+    match session() {
+        ok(value) => {
+            return value
+        }
+        err(reason) => {
+            return 100 + (reason.code % 100)
+        }
+    }
+}

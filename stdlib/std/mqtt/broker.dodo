@@ -1,0 +1,984 @@
+package broker
+
+import "core/bytes"
+import "std/console"
+import "std/io"
+import "std/mqtt"
+import "std/mqtt/hosted"
+import "std/net"
+import "std/net/native"
+import "std/net/operations"
+
+// A small MQTT 3.1.1 broker for local networks, tests and learning. One
+// thread serves up to CLIENTS connections with readiness polling.
+// Subscriptions, retained messages and wills live in memory only, so nothing
+// survives a restart. Server-side handlers see every message clients publish.
+pub const CLIENTS: usize = 16
+// Largest packet a client may send, which bounds every message.
+pub const PACKET_BYTES: usize = 4096
+pub const RETAINED_BYTES: usize = 16384
+pub const OUTBOX_BYTES: usize = 4096
+// Per client: client ID, will topic plus payload, and subscription filters.
+pub const ID_BYTES: usize = 128
+pub const WILL_BYTES: usize = 512
+pub const FILTER_BYTES: usize = 1024
+const META_BYTES: usize = 1664
+const NEVER: u64 = 18446744073709551615u64
+
+pub struct Config {
+    // A new connection must send CONNECT within this time.
+    pub connect_timeout_ms: u64
+    // A client that cannot take a packet within this time is disconnected.
+    pub write_timeout_ms: u64
+    // Total accepted connections, not simultaneous ones. Zero is unlimited.
+    pub max_connections: usize
+    pub backlog: u32
+    pub fn defaults() -> Config {
+        return Config { connect_timeout_ms: 10000, write_timeout_ms: 5000, max_connections: 0, backlog: 64 }
+    }
+}
+pub struct Report {
+    pub accepted: u64
+    // Accepted CONNECTs, and those refused (protocol, client ID, credentials).
+    pub connected: u64
+    pub refused: u64
+    // PUBLISH packets from clients, and copies sent to subscribers.
+    pub messages: u64
+    pub delivered: u64
+    // Handler errors.
+    pub failed: u64
+    // Connections closed for invalid packets, timeouts or slow reading.
+    pub dropped: u64
+    pub cancelled: bool
+    pub last_error: Option<mqtt.Error>
+}
+
+// Authenticators are values with allow(&mut self, client_id, username,
+// password) -> bool. A refused client receives CONNACK NOT_AUTHORIZED.
+pub struct AllowAll {
+    pub fn allow(&mut self, client_id: &[u8], username: &[u8], password: &[u8]) -> bool {
+        return true
+    }
+}
+pub struct Password {
+    username: &[u8]
+    password: &[u8]
+    pub fn allow(&mut self, client_id: &[u8], username: &[u8], password: &[u8]) -> bool {
+        return bytes.equal(username, self.username) && bytes.equal(password, self.password)
+    }
+}
+// Writes "topic payload" lines to standard output.
+pub fn print() -> hosted.Print {
+    return hosted.Print {}
+}
+
+fn deadline(now: u64, milliseconds: u64) -> u64 {
+    if milliseconds > NEVER - now {
+        return NEVER
+    }
+    return now + milliseconds
+}
+fn quality(level: u8) -> mqtt.QoS {
+    if level == 1 {
+        return mqtt.QoS.AtLeastOnce
+    }
+    if level == 2 {
+        return mqtt.QoS.ExactlyOnce
+    }
+    return mqtt.QoS.AtMostOnce
+}
+fn short(data: &[u8], at: usize) -> usize {
+    return ((data[at] as usize) << 8) | (data[at + 1] as usize)
+}
+fn put_short(data: &mut[u8], at: usize, value: usize) {
+    data[at] = (value >> 8) as u8
+    data[at + 1] = (value & 255) as u8
+}
+fn net_error(reason: net.Error, kind: mqtt.ErrorKind) -> mqtt.Error {
+    return mqtt.failure(kind, reason.code)
+}
+
+struct Slot {
+    socket: native.TcpConnection
+    active: bool
+    connected: bool
+    closing: bool
+    will_on_close: bool
+    poll_index: usize
+    buffered: usize
+    id_len: usize
+    will_topic: usize
+    will_payload: usize
+    will_qos: u8
+    will_retain: bool
+    filters: usize
+    keep_alive_ms: u64
+    last_seen: u64
+    next_id: u16
+    fn new() -> Slot {
+        return Slot { socket: native.TcpConnection.closed(), active: false, connected: false, closing: false,
+        will_on_close: false, poll_index: native.POLL_CAPACITY, buffered: 0, id_len: 0, will_topic: 0,
+        will_payload: 0, will_qos: 0, will_retain: false, filters: 0, keep_alive_ms: 0, last_seen: 0, next_id: 0 }
+    }
+    fn start(&mut self, socket: native.TcpConnection, now: u64) {
+        self.socket = socket
+        self.active = true
+        self.last_seen = now
+        self.poll_index = native.POLL_CAPACITY
+    }
+    // Closes at the end of this turn, publishing the will unless asked not to.
+    fn close_later(&mut self, will: bool) {
+        if !self.closing {
+            self.closing = true
+            self.will_on_close = will
+        }
+    }
+    fn finish(&mut self) {
+        match self.socket.close() {
+            ok() => {}
+            err(_) => {}
+        }
+        self.active = false
+        self.connected = false
+        self.closing = false
+        self.will_on_close = false
+        self.poll_index = native.POLL_CAPACITY
+        self.buffered = 0
+        self.id_len = 0
+        self.will_topic = 0
+        self.will_payload = 0
+        self.filters = 0
+        self.next_id = 0
+    }
+    fn packet_id(&mut self) -> u16 {
+        if self.next_id == 65535 {
+            self.next_id = 1
+        } else {
+            self.next_id += 1
+        }
+        return self.next_id
+    }
+}
+fn new_slots() -> [16]Slot {
+    return [Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(),
+    Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new(), Slot.new()]
+}
+fn meta_base(index: usize) -> usize {
+    return index * META_BYTES
+}
+fn filter_base(index: usize) -> usize {
+    return index * META_BYTES + ID_BYTES + WILL_BYTES
+}
+
+// Subscription filters of one client: [length u16][qos u8][filter]...
+fn add_filter(region: &mut[u8], used: usize, filter: &[u8], qos: u8) -> Option<usize> {
+    at := 0usize
+    for at < used {
+        length := short(region, at)
+        if bytes.equal(&region[at + 3..at + 3 + length], filter) {
+            region[at + 2] = qos
+            return some(used)
+        }
+        at += 3 + length
+    }
+    if 3 + filter.len > region.len - used {
+        return none
+    }
+    put_short(region, used, filter.len)
+    region[used + 2] = qos
+    for i in 0usize..filter.len {
+        region[used + 3 + i] = filter[i]
+    }
+    return some(used + 3 + filter.len)
+}
+fn remove_filter(region: &mut[u8], used: usize, filter: &[u8]) -> usize {
+    at := 0usize
+    for at < used {
+        length := short(region, at)
+        size := 3 + length
+        if bytes.equal(&region[at + 3..at + size], filter) {
+            for k in at + size..used {
+                region[k - size] = region[k]
+            }
+            return used - size
+        }
+        at += size
+    }
+    return used
+}
+// The highest QoS among matching filters, or -1 if none matches.
+fn best_match(region: &[u8], topic: &[u8]) -> i32 {
+    best := -1i32
+    at := 0usize
+    for at < region.len {
+        length := short(region, at)
+        if mqtt.matches(&region[at + 3..at + 3 + length], topic) && (region[at + 2] as i32) > best {
+            best = region[at + 2] as i32
+        }
+        at += 3 + length
+    }
+    return best
+}
+
+// Retained messages: [topic length u16][payload length u16][qos u8][topic][payload]...
+struct Store {
+    data: &mut[u8]
+    used: usize
+    // Replaces the topic's retained message; an empty payload only removes it.
+    // A message that does not fit is not retained.
+    fn put(&mut self, topic: &[u8], payload: &[u8], qos: u8) {
+        at := 0usize
+        for at < self.used {
+            topic_len := short(self.data, at)
+            size := 5 + topic_len + short(self.data, at + 2)
+            if bytes.equal(&self.data[at + 5..at + 5 + topic_len], topic) {
+                for k in at + size..self.used {
+                    self.data[k - size] = self.data[k]
+                }
+                self.used -= size
+                break
+            }
+            at += size
+        }
+        if payload.len == 0 || payload.len > 65535 || 5 + topic.len + payload.len > self.data.len - self.used {
+            return
+        }
+        at = self.used
+        put_short(self.data, at, topic.len)
+        put_short(self.data, at + 2, payload.len)
+        self.data[at + 4] = qos
+        at += 5
+        for i in 0usize..topic.len {
+            self.data[at + i] = topic[i]
+        }
+        at += topic.len
+        for i in 0usize..payload.len {
+            self.data[at + i] = payload[i]
+        }
+        self.used = at + payload.len
+    }
+}
+
+fn send(slot: &mut Slot, data: &[u8], timeout_ms: u64) -> bool {
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    operation := net.Operation.until(deadline(clock.now_ms(), timeout_ms))
+    match operations.write_all(&mut slot.socket, data, &operation, &mut clock, &cancel) {
+        ok(_) => {
+            return true
+        }
+        err(_) => {
+            slot.close_later(true)
+            return false
+        }
+    }
+}
+fn answer(slot: &mut Slot, kind: mqtt.PacketKind, packet_id: u16, timeout_ms: u64) {
+    buffer := [0u8; 4]
+    match mqtt.encode_ack(&mut buffer, kind, packet_id) {
+        ok(length) => {
+            send(slot, &buffer[..length], timeout_ms)
+        }
+        err(_) => {
+            slot.close_later(true)
+        }
+    }
+}
+fn refuse(slot: &mut Slot, code: u8, timeout_ms: u64, report: &mut Report) {
+    buffer := [0u8; 4]
+    match mqtt.encode_connack(&mut buffer, false, code) {
+        ok(length) => {
+            send(slot, &buffer[..length], timeout_ms)
+        }
+        err(_) => {}
+    }
+    slot.close_later(false)
+    report.refused += 1
+}
+// Sends one copy to every client with a matching subscription, at the lower
+// of the message QoS and the highest granted matching QoS.
+fn route(slots: &mut[Slot], meta: &[u8], staging: &mut[u8], topic: &[u8], payload: &[u8], level: u8,
+timeout_ms: u64, report: &mut Report) {
+    for j in 0usize..slots.len {
+        if slots[j].connected && !slots[j].closing {
+            base := filter_base(j)
+            granted := best_match(&meta[base..base + slots[j].filters], topic)
+            if granted >= 0 {
+                q := level
+                if (granted as u8) < q {
+                    q = granted as u8
+                }
+                id := 0u16
+                if q != 0 {
+                    id = slots[j].packet_id()
+                }
+                match mqtt.encode_publish(staging, topic, payload, quality(q), false, false, id) {
+                    ok(length) => {
+                        if send(&mut slots[j], &staging[..length], timeout_ms) {
+                            report.delivered += 1
+                        } else {
+                            report.dropped += 1
+                        }
+                    }
+                    err(_) => {
+                        return
+                    }
+                }
+            }
+        }
+    }
+}
+fn publish(slots: &mut[Slot], meta: &[u8], store: &mut Store, staging: &mut[u8], topic: &[u8], payload: &[u8],
+level: u8, retain: bool, timeout_ms: u64, report: &mut Report) {
+    if retain {
+        store.put(topic, payload, level)
+    }
+    route(slots, meta, staging, topic, payload, level, timeout_ms, report)
+}
+fn send_retained(slot: &mut Slot, store: &Store, filter: &[u8], granted: u8, staging: &mut[u8], timeout_ms: u64, report: &mut Report) {
+    at := 0usize
+    for at < store.used && !slot.closing {
+        topic_len := short(store.data, at)
+        payload_len := short(store.data, at + 2)
+        q := store.data[at + 4]
+        topic := &store.data[at + 5..at + 5 + topic_len]
+        payload := &store.data[at + 5 + topic_len..at + 5 + topic_len + payload_len]
+        if mqtt.matches(filter, topic) {
+            if granted < q {
+                q = granted
+            }
+            id := 0u16
+            if q != 0 {
+                id = slot.packet_id()
+            }
+            match mqtt.encode_publish(staging, topic, payload, quality(q), true, false, id) {
+                ok(length) => {
+                    if send(slot, &staging[..length], timeout_ms) {
+                        report.delivered += 1
+                    }
+                }
+                err(_) => {}
+            }
+        }
+        at += 5 + topic_len + payload_len
+    }
+}
+fn record(report: &mut Report, outcome: mqtt.Dispatch) {
+    let mqtt.Dispatch { handled: _, failed: failed, failure: failure } = outcome
+    report.failed += failed as u64
+    match failure {
+        some(reason) => {
+            errors := console.stderr()
+            match errors.write(b"mqtt handler failed: ") {
+                ok(_) => {}
+                err(_) => {}
+            }
+            match errors.println(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            report.last_error = some(reason)
+        }
+        none => {}
+    }
+}
+fn flush(slots: &mut[Slot], meta: &[u8], store: &mut Store, staging: &mut[u8], outbox: &mut mqtt.Outbox,
+timeout_ms: u64, report: &mut Report) {
+    cursor := 0usize
+    done := false
+    for !done {
+        match outbox.next(&mut cursor) {
+            some(message) => {
+                let mqtt.Message { topic: topic, payload: payload, qos: qos, retain: retain,.. } = message
+                publish(slots, meta, store, staging, topic, payload, mqtt.qos_level(&qos), retain, timeout_ms, report)
+            }
+            none => {
+                done = true
+            }
+        }
+    }
+    outbox.clear()
+}
+fn generated_id(output: &mut[u8], number: u64) -> usize {
+    prefix := b"dodo-"
+    for i in 0usize..prefix.len {
+        output[i] = prefix[i]
+    }
+    digits := [0u8; 20]
+    count := 0usize
+    value := number
+    for true {
+        digits[count] = 48 + (value % 10) as u8
+        count += 1
+        value = value / 10
+        if value == 0 {
+            break
+        }
+    }
+    for i in 0usize..count {
+        output[prefix.len + i] = digits[count - 1 - i]
+    }
+    return prefix.len + count
+}
+fn accept_connect<A>(slots: &mut[Slot], i: usize, body: &[u8], meta: &mut[u8], auth: &mut A, config: &Config,
+generated: &mut u64, report: &mut Report) {
+    timeout := config.write_timeout_ms
+    connect: mqtt.Connect
+    match mqtt.decode_connect(body) {
+        ok(value) => {
+            connect = value
+        }
+        err(reason) => {
+            if reason.kind == mqtt.ErrorKind.Protocol {
+                refuse(&mut slots[i], mqtt.UNACCEPTABLE_PROTOCOL, timeout, report)
+            } else {
+                slots[i].close_later(false)
+                report.dropped += 1
+            }
+            return
+        }
+    }
+    base := meta_base(i)
+    id_len := connect.client_id.len
+    if id_len == 0 {
+        if !connect.clean_session {
+            refuse(&mut slots[i], mqtt.IDENTIFIER_REJECTED, timeout, report)
+            return
+        }
+        id_len = generated_id(&mut meta[base..base + ID_BYTES], *generated)
+        *generated += 1
+    } else {
+        if id_len > ID_BYTES {
+            refuse(&mut slots[i], mqtt.IDENTIFIER_REJECTED, timeout, report)
+            return
+        }
+        for k in 0usize..id_len {
+            meta[base + k] = connect.client_id[k]
+        }
+    }
+    if !auth.allow(&meta[base..base + id_len], connect.username, connect.password) {
+        refuse(&mut slots[i], mqtt.NOT_AUTHORIZED, timeout, report)
+        return
+    }
+    topic_len := connect.will_topic.len
+    payload_len := connect.will_payload.len
+    if topic_len + payload_len > WILL_BYTES {
+        refuse(&mut slots[i], mqtt.SERVER_UNAVAILABLE, timeout, report)
+        return
+    }
+    will := base + ID_BYTES
+    for k in 0usize..topic_len {
+        meta[will + k] = connect.will_topic[k]
+    }
+    for k in 0usize..payload_len {
+        meta[will + topic_len + k] = connect.will_payload[k]
+    }
+    // A second connection with the same client ID takes the session over.
+    for j in 0usize..slots.len {
+        other := meta_base(j)
+        if j != i && slots[j].connected && !slots[j].closing && slots[j].id_len == id_len &&
+            bytes.equal(&meta[other..other + id_len], &meta[base..base + id_len]) {
+            slots[j].close_later(true)
+        }
+    }
+    slots[i].id_len = id_len
+    slots[i].will_topic = topic_len
+    slots[i].will_payload = payload_len
+    slots[i].will_qos = mqtt.qos_level(&connect.will_qos)
+    slots[i].will_retain = connect.will_retain
+    slots[i].keep_alive_ms = (connect.keep_alive_s as u64) * 1000
+    slots[i].filters = 0
+    buffer := [0u8; 4]
+    match mqtt.encode_connack(&mut buffer, false, mqtt.ACCEPTED) {
+        ok(length) => {
+            if send(&mut slots[i], &buffer[..length], timeout) {
+                slots[i].connected = true
+                report.connected += 1
+            }
+        }
+        err(_) => {
+            slots[i].close_later(false)
+        }
+    }
+}
+fn handle<R, A>(slots: &mut[Slot], i: usize, frame: &[u8], meta: &mut[u8], store: &mut Store, staging: &mut[u8],
+outbox: &mut mqtt.Outbox, routes: &mut R, auth: &mut A, config: &Config, now: u64, generated: &mut u64, report: &mut Report) {
+    timeout := config.write_timeout_ms
+    packet: mqtt.Packet
+    match mqtt.decode(frame) {
+        ok(value) => {
+            packet = value
+        }
+        err(_) => {
+            slots[i].close_later(true)
+            report.dropped += 1
+            return
+        }
+    }
+    slots[i].last_seen = now
+    if !slots[i].connected {
+        if packet.kind != mqtt.PacketKind.Connect {
+            slots[i].close_later(false)
+            report.dropped += 1
+            return
+        }
+        accept_connect(slots, i, packet.payload, meta, auth, config, generated, report)
+        return
+    }
+    if packet.kind == mqtt.PacketKind.Publish {
+        level := mqtt.qos_level(&packet.qos)
+        if level == 1 {
+            answer(&mut slots[i], mqtt.PacketKind.Puback, packet.packet_id, timeout)
+        }
+        if level == 2 {
+            answer(&mut slots[i], mqtt.PacketKind.Pubrec, packet.packet_id, timeout)
+        }
+        report.messages += 1
+        publish(slots, meta, store, staging, packet.topic, packet.payload, level, packet.retain, timeout, report)
+        message := mqtt.Message { topic: packet.topic, payload: packet.payload, qos: quality(level),
+        retain: packet.retain, duplicate: packet.duplicate }
+        outcome := mqtt.Dispatch.new()
+        routes.dispatch(&message, outbox, &mut outcome)
+        record(report, outcome)
+        flush(slots, meta, store, staging, outbox, timeout, report)
+        return
+    }
+    if packet.kind == mqtt.PacketKind.Subscribe {
+        codes := [0u8; 64]
+        count := 0usize
+        offset := 0usize
+        base := filter_base(i)
+        for offset < packet.payload.len {
+            entry: mqtt.Entry
+            match mqtt.subscribe_entry(packet.payload, offset) {
+                ok(value) => {
+                    entry = value
+                }
+                err(_) => {
+                    slots[i].close_later(true)
+                    report.dropped += 1
+                    return
+                }
+            }
+            if count == codes.len {
+                slots[i].close_later(true)
+                report.dropped += 1
+                return
+            }
+            code := mqtt.SUBSCRIBE_FAILURE
+            if mqtt.valid_filter(entry.filter) {
+                match add_filter(&mut meta[base..base + FILTER_BYTES], slots[i].filters, entry.filter, entry.qos) {
+                    some(used) => {
+                        slots[i].filters = used
+                        code = entry.qos
+                    }
+                    none => {}
+                }
+            }
+            codes[count] = code
+            count += 1
+            offset = entry.next
+        }
+        suback := [0u8; 72]
+        match mqtt.encode_suback(&mut suback, packet.packet_id, &codes[..count]) {
+            ok(length) => {
+                if !send(&mut slots[i], &suback[..length], timeout) {
+                    return
+                }
+            }
+            err(_) => {
+                slots[i].close_later(true)
+                report.dropped += 1
+                return
+            }
+        }
+        // New subscribers receive the matching retained messages.
+        offset = 0
+        index := 0usize
+        for offset < packet.payload.len {
+            match mqtt.subscribe_entry(packet.payload, offset) {
+                ok(entry) => {
+                    if codes[index] != mqtt.SUBSCRIBE_FAILURE {
+                        send_retained(&mut slots[i], store, entry.filter, codes[index], staging, timeout, report)
+                    }
+                    offset = entry.next
+                }
+                err(_) => {
+                    return
+                }
+            }
+            index += 1
+        }
+        return
+    }
+    if packet.kind == mqtt.PacketKind.Unsubscribe {
+        offset := 0usize
+        base := filter_base(i)
+        for offset < packet.payload.len {
+            match mqtt.unsubscribe_entry(packet.payload, offset) {
+                ok(entry) => {
+                    slots[i].filters = remove_filter(&mut meta[base..base + FILTER_BYTES], slots[i].filters, entry.filter)
+                    offset = entry.next
+                }
+                err(_) => {
+                    slots[i].close_later(true)
+                    report.dropped += 1
+                    return
+                }
+            }
+        }
+        answer(&mut slots[i], mqtt.PacketKind.Unsuback, packet.packet_id, timeout)
+        return
+    }
+    if packet.kind == mqtt.PacketKind.Pingreq {
+        buffer := [0u8; 2]
+        match mqtt.encode_pingresp(&mut buffer) {
+            ok(length) => {
+                send(&mut slots[i], &buffer[..length], timeout)
+            }
+            err(_) => {}
+        }
+        return
+    }
+    if packet.kind == mqtt.PacketKind.Pubrel {
+        answer(&mut slots[i], mqtt.PacketKind.Pubcomp, packet.packet_id, timeout)
+        return
+    }
+    if packet.kind == mqtt.PacketKind.Pubrec {
+        answer(&mut slots[i], mqtt.PacketKind.Pubrel, packet.packet_id, timeout)
+        return
+    }
+    // Deliveries need no state, so their acknowledgements end here.
+    if packet.kind == mqtt.PacketKind.Puback || packet.kind == mqtt.PacketKind.Pubcomp {
+        return
+    }
+    if packet.kind == mqtt.PacketKind.Disconnect {
+        slots[i].close_later(false)
+        return
+    }
+    slots[i].close_later(true)
+    report.dropped += 1
+}
+
+fn serve_broker<R, A, X>(address: &[u8], routes: &mut R, auth: &mut A, config: &Config, cancel: &X) -> Report!mqtt.Error {
+    local: net.SocketAddress
+    match net.parse_socket(address) {
+        ok(value) => {
+            local = value
+        }
+        err(reason) => {
+            return err(net_error(reason, mqtt.ErrorKind.InvalidInput))
+        }
+    }
+    listener: native.TcpListener
+    match native.TcpListener.bind(&local, config.backlog) {
+        ok(value) => {
+            listener = value
+        }
+        err(reason) => {
+            return err(net_error(reason, mqtt.ErrorKind.Connect))
+        }
+    }
+    slots := new_slots()
+    inputs := [0u8; PACKET_BYTES * CLIENTS]
+    meta := [0u8; META_BYTES * CLIENTS]
+    retained := [0u8; RETAINED_BYTES]
+    staging := [0u8; PACKET_BYTES + 8]
+    outbox_bytes := [0u8; OUTBOX_BYTES]
+    store := Store { data: &mut retained, used: 0 }
+    outbox := mqtt.Outbox.new(&mut outbox_bytes)
+    report := Report { accepted: 0, connected: 0, refused: 0, messages: 0, delivered: 0, failed: 0, dropped: 0,
+    cancelled: false, last_error: none }
+    generated := 0u64
+    timeout := config.write_timeout_ms
+    clock := native.MonotonicClock {}
+    readiness := native.PollSet.new()
+    for true {
+        if cancel.cancelled() {
+            report.cancelled = true
+            return ok(report)
+        }
+        readiness.clear()
+        active := 0usize
+        for j in 0usize..slots.len {
+            if slots[j].active {
+                active += 1
+                match slots[j].socket.register(&mut readiness, net.Interest.Read) {
+                    ok(value) => {
+                        slots[j].poll_index = value
+                    }
+                    err(reason) => {
+                        return err(net_error(reason, mqtt.ErrorKind.Network))
+                    }
+                }
+            }
+        }
+        accepting := config.max_connections == 0 || report.accepted < config.max_connections as u64
+        if !accepting && active == 0 {
+            return ok(report)
+        }
+        listener_index := native.POLL_CAPACITY
+        if accepting && active < slots.len {
+            match listener.register(&mut readiness) {
+                ok(value) => {
+                    listener_index = value
+                }
+                err(reason) => {
+                    return err(net_error(reason, mqtt.ErrorKind.Network))
+                }
+            }
+        }
+        match readiness.wait(100) {
+            ok(_) => {}
+            err(reason) => {
+                if reason.kind != net.ErrorKind.Interrupted {
+                    return err(net_error(reason, mqtt.ErrorKind.Network))
+                }
+            }
+        }
+        now := clock.now_ms()
+        if listener_index != native.POLL_CAPACITY && readiness.ready(listener_index) {
+            for j in 0usize..slots.len {
+                if config.max_connections != 0 && report.accepted >= config.max_connections as u64 {
+                    break
+                }
+                if !slots[j].active {
+                    match listener.accept() {
+                        ok(pending) => {
+                            match pending {
+                                some(socket) => {
+                                    slots[j].start(socket, now)
+                                    report.accepted += 1
+                                }
+                                none => {
+                                    break
+                                }
+                            }
+                        }
+                        err(reason) => {
+                            if reason.kind != net.ErrorKind.Interrupted {
+                                return err(net_error(reason, mqtt.ErrorKind.Network))
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+        }
+        for j in 0usize..slots.len {
+            if slots[j].active && !slots[j].closing && readiness.ready(slots[j].poll_index) {
+                start := j * PACKET_BYTES
+                filled := slots[j].buffered
+                match slots[j].socket.poll_read(&mut inputs[start + filled..start + PACKET_BYTES]) {
+                    ok(progress) => {
+                        if progress.state == io.PollState.Eof {
+                            slots[j].close_later(true)
+                        } else {
+                            slots[j].buffered += progress.transferred
+                        }
+                    }
+                    err(reason) => {
+                        if reason.kind != io.ErrorKind.Interrupted {
+                            slots[j].close_later(true)
+                        }
+                    }
+                }
+                for slots[j].active && !slots[j].closing {
+                    buffered := slots[j].buffered
+                    length := 0usize
+                    match mqtt.frame_length(&inputs[start..start + buffered]) {
+                        ok(value) => {
+                            match value {
+                                some(total) => {
+                                    if total > PACKET_BYTES {
+                                        slots[j].close_later(true)
+                                        report.dropped += 1
+                                    } else if total <= buffered {
+                                        length = total
+                                    }
+                                }
+                                none => {
+                                    if buffered == PACKET_BYTES {
+                                        slots[j].close_later(true)
+                                        report.dropped += 1
+                                    }
+                                }
+                            }
+                        }
+                        err(_) => {
+                            slots[j].close_later(true)
+                            report.dropped += 1
+                        }
+                    }
+                    if length == 0 {
+                        break
+                    }
+                    handle(&mut slots, j, &inputs[start..start + length], &mut meta, &mut store, &mut staging,
+                    &mut outbox, routes, auth, config, now, &mut generated, &mut report)
+                    for k in start + length..start + buffered {
+                        inputs[k - length] = inputs[k]
+                    }
+                    slots[j].buffered = buffered - length
+                }
+            }
+        }
+        now = clock.now_ms()
+        for j in 0usize..slots.len {
+            if slots[j].active && !slots[j].closing && now >= slots[j].last_seen {
+                idle := now - slots[j].last_seen
+                if !slots[j].connected && idle >= config.connect_timeout_ms {
+                    slots[j].close_later(false)
+                    report.dropped += 1
+                } else if slots[j].connected && slots[j].keep_alive_ms != 0 &&
+                    idle >= slots[j].keep_alive_ms + slots[j].keep_alive_ms / 2 {
+                    slots[j].close_later(true)
+                    report.dropped += 1
+                }
+            }
+        }
+        for j in 0usize..slots.len {
+            if slots[j].closing {
+                if slots[j].will_on_close && slots[j].connected && slots[j].will_topic != 0 {
+                    will := meta_base(j) + ID_BYTES
+                    topic_len := slots[j].will_topic
+                    payload_len := slots[j].will_payload
+                    level := slots[j].will_qos
+                    retain := slots[j].will_retain
+                    slots[j].connected = false
+                    publish(&mut slots, &meta, &mut store, &mut staging, &meta[will..will + topic_len],
+                    &meta[will + topic_len..will + topic_len + payload_len], level, retain, timeout, &mut report)
+                }
+                slots[j].finish()
+            }
+        }
+    }
+    return ok(report)
+}
+
+// A built broker: run it, or test its handlers and authenticator directly.
+pub struct Broker<R, A> {
+    routes: R
+    auth: A
+    pub config: Config
+    // Runs every handler whose filter matches topic, without a network.
+    pub fn publish(&mut self, topic: &[u8], payload: &[u8]) -> mqtt.Delivery {
+        message := mqtt.Message.new(topic, payload)
+        return mqtt.capture(&mut self.routes, &message)
+    }
+    // Whether the authenticator accepts these credentials.
+    pub fn allows(&mut self, client_id: &[u8], username: &[u8], password: &[u8]) -> bool {
+        return self.auth.allow(client_id, username, password)
+    }
+    pub fn run(self, address: &[u8]) -> i32 {
+        return exit_code(self.serve(address))
+    }
+    pub fn serve(self, address: &[u8]) -> Report!mqtt.Error {
+        cancel := net.NeverCancel {}
+        return self.serve_until(address, &cancel)
+    }
+    pub fn serve_until<X>(self, address: &[u8], cancel: &X) -> Report!mqtt.Error {
+        let Broker { routes: owned_routes, auth: owned_auth, config: config } = self
+        routes := owned_routes
+        auth := owned_auth
+        return serve_broker(address, &mut routes, &mut auth, &config, cancel)
+    }
+}
+// Main-function reporting: printed failures and an exit code (0 success,
+// 1 startup failure, 2 if any handler failed).
+fn exit_code<E>(result: Report!E) -> i32 {
+    match result {
+        ok(report) => {
+            if report.failed != 0 {
+                return 2
+            }
+            return 0
+        }
+        err(reason) => {
+            errors := console.stderr()
+            match errors.println(&reason) {
+                ok(_) => {}
+                err(_) => {}
+            }
+            return 1
+        }
+    }
+}
+
+pub struct Builder<R, A> {
+    routes: R
+    auth: A
+    pub config: Config
+    problem: Option<mqtt.RegistrationError>
+    // Calls handler for every message a client publishes to a matching topic.
+    // Messages the handler puts in its outbox go to subscribers like any other.
+    pub fn on<H>(self, filter: &[u8], handler: H) -> Builder<mqtt.Routes<R, H>, A> from(self, filter, handler) {
+        let Builder { routes: routes, auth: auth, config: config, problem: previous } = self
+        problem := previous
+        failed := false
+        match &problem {
+            some(_) => {
+                failed = true
+            }
+            none => {}
+        }
+        if !failed {
+            problem = mqtt.check_filter(filter, routes.len())
+        }
+        return Builder { routes: mqtt.route(routes, filter, handler), auth: auth, config: config, problem: problem }
+    }
+    // Accepts only clients that log in with this username and password.
+    pub fn password(self, username: &[u8], password: &[u8]) -> Builder<R, Password> from(self, username, password) {
+        let Builder { routes: routes, auth: _, config: config, problem: problem } = self
+        return Builder<R, Password> { routes: routes, auth: Password { username: username, password: password }, config: config, problem: problem }
+    }
+    // Decides with auth.allow(client_id, username, password) -> bool.
+    pub fn authenticate<N>(self, auth: N) -> Builder<R, N> from(self, auth) {
+        let Builder { routes: routes, auth: _, config: config, problem: problem } = self
+        return Builder<R, N> { routes: routes, auth: auth, config: config, problem: problem }
+    }
+    // Stops after this many connections have come and gone; 0 runs forever.
+    pub fn max_connections(self, count: usize) -> Builder<R, A> from(self) {
+        self.config.max_connections = count
+        return self
+    }
+    pub fn build(self) -> Broker<R, A>!mqtt.RegistrationError from(self) {
+        let Builder { routes: routes, auth: auth, config: config, problem: problem } = self
+        match problem {
+            some(reason) => {
+                return err(reason)
+            }
+            none => {
+                return ok(Broker { routes: routes, auth: auth, config: config })
+            }
+        }
+    }
+    // Listens on address, such as b"0.0.0.0:1883", until the process stops.
+    // Prints failures and returns an exit code for main.
+    pub fn run(self, address: &[u8]) -> i32 {
+        return exit_code(self.serve(address))
+    }
+    pub fn serve(self, address: &[u8]) -> Report!mqtt.RunError from(self) {
+        cancel := net.NeverCancel {}
+        return self.serve_until(address, &cancel)
+    }
+    pub fn serve_until<X>(self, address: &[u8], cancel: &X) -> Report!mqtt.RunError from(self) {
+        match self.build() {
+            ok(broker) => {
+                match broker.serve_until(address, cancel) {
+                    ok(report) => {
+                        return ok(report)
+                    }
+                    err(reason) => {
+                        return err(mqtt.RunError { registration: none, serving: some(reason) })
+                    }
+                }
+            }
+            err(reason) => {
+                return err(mqtt.RunError { registration: some(reason), serving: none })
+            }
+        }
+    }
+}
+pub fn new() -> Builder<mqtt.NoRoutes, AllowAll> from(static) {
+    return Builder { routes: mqtt.NoRoutes {}, auth: AllowAll {}, config: Config.defaults(), problem: none }
+}

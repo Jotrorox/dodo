@@ -20,6 +20,7 @@ contract without DNS or an external service.
 | Exchange separate packets | `native.UdpSocket` | No ordering, delivery, or stream semantics. |
 | Encode/decode DNS packets | `std/net/dns` | No ready-made DNS resolver, cache, or retries. |
 | Fetch an HTTP URL | [Hosted HTTP](hosted-http.md) | Select [HTTPS](tls.md) explicitly for TLS. |
+| Publish/subscribe, or run a broker | [MQTT](mqtt.md) | No TLS (`mqtts://`) yet. |
 
 TCP is a byte stream: one write need not correspond to one peer read. Define a
 message boundary (a length, delimiter, or protocol such as HTTP) before building

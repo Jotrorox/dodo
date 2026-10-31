@@ -1,0 +1,640 @@
+package hosted
+
+import "core/bytes"
+import "core/slice"
+import "std/console"
+import "std/io"
+import "std/mqtt"
+import "std/net"
+import "std/net/native"
+import "std/net/operations"
+
+// A blocking MQTT 3.1.1 client over a native TCP connection (mqtt:// URLs).
+// The caller's workspace holds every packet: its first quarter stages outgoing
+// packets and the rest buffers incoming ones, which bounds the largest message
+// the client can receive. One acknowledged operation is in flight at a time.
+pub const WORKSPACE_BYTES: usize = 16384
+pub const MIN_WORKSPACE_BYTES: usize = 1024
+
+// Connection settings. Empty username, password and will_topic mean absent.
+pub struct Options {
+    pub client_id: &[u8]
+    pub username: &[u8]
+    pub password: &[u8]
+    // PINGREQ after this long without sending; 0 disables keep-alive.
+    pub keep_alive_s: u16
+    pub clean_session: bool
+    // Published by the broker if the connection ends without disconnect().
+    pub will_topic: &[u8]
+    pub will_payload: &[u8]
+    pub will_qos: mqtt.QoS
+    pub will_retain: bool
+    // Resolution, TCP connection and CONNACK together.
+    pub connect_timeout_ms: u64
+    // Each later write, and each wait for SUBACK, UNSUBACK, PUBACK or PUBCOMP.
+    pub timeout_ms: u64
+    pub fn new(client_id: &[u8]) -> Options from(client_id) {
+        return Options { client_id: client_id, username: b"", password: b"", keep_alive_s: 60,
+        clean_session: true, will_topic: b"", will_payload: b"", will_qos: mqtt.QoS.AtMostOnce,
+        will_retain: false, connect_timeout_ms: 10000, timeout_ms: 10000 }
+    }
+}
+pub struct Location {
+    pub host: &[u8]
+    pub port: u16
+}
+// Accepts mqtt://host[:port][/] and bare host[:port]; IPv6 literals use
+// brackets. The port defaults to 1883. Credentials belong in Options.
+pub fn parse_url(url: &[u8]) -> Location!mqtt.Error from(url) {
+    rest := url
+    if bytes.starts_with(url, b"mqtt://") {
+        rest = &url[7..]
+    }
+    if rest.len != 0 && rest[rest.len - 1] == 47 {
+        rest = &rest[..rest.len - 1]
+    }
+    for i in 0usize..rest.len {
+        if rest[i] == 47 || rest[i] == 64 || rest[i] == 63 || rest[i] == 35 || rest[i] == 37 || rest[i] <= 32 {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+    }
+    start := 0usize
+    end := 0usize
+    port_start := rest.len
+    has_port := false
+    if rest.len != 0 && rest[0] == 91 {
+        start = 1
+        end = 1
+        for end < rest.len && rest[end] != 93 {
+            end += 1
+        }
+        if end == rest.len {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+        if end + 1 < rest.len {
+            if rest[end + 1] != 58 {
+                return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+            }
+            has_port = true
+            port_start = end + 2
+        }
+    } else {
+        for end < rest.len && rest[end] != 58 {
+            end += 1
+        }
+        if end < rest.len {
+            has_port = true
+            port_start = end + 1
+        }
+    }
+    if end == start || end - start > 253 {
+        return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+    }
+    port := mqtt.PORT
+    if has_port {
+        if port_start == rest.len || rest.len - port_start > 5 {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+        value := 0u32
+        for i in port_start..rest.len {
+            if rest[i] < 48 || rest[i] > 57 {
+                return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+            }
+            value = value * 10 + (rest[i] - 48) as u32
+        }
+        if value == 0 || value > 65535 {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+        port = value as u16
+    }
+    return ok(Location { host: &rest[start..end], port: port })
+}
+
+fn deadline(now: u64, milliseconds: u64) -> u64 {
+    if milliseconds > 18446744073709551615u64 - now {
+        return 18446744073709551615u64
+    }
+    return now + milliseconds
+}
+fn io_error(reason: io.Error) -> mqtt.Error {
+    kind := mqtt.ErrorKind.Network
+    if reason.kind == io.ErrorKind.TimedOut {
+        kind = mqtt.ErrorKind.TimedOut
+    }
+    if reason.kind == io.ErrorKind.Closed || reason.kind == io.ErrorKind.UnexpectedEof ||
+        reason.kind == io.ErrorKind.ConnectionReset || reason.kind == io.ErrorKind.BrokenPipe {
+        kind = mqtt.ErrorKind.Closed
+    }
+    return mqtt.failure(kind, reason.code)
+}
+fn net_error(reason: net.Error, kind: mqtt.ErrorKind) -> mqtt.Error {
+    if reason.kind == net.ErrorKind.TimedOut {
+        return mqtt.failure(mqtt.ErrorKind.TimedOut, reason.code)
+    }
+    return mqtt.failure(kind, reason.code)
+}
+fn quality(level: u8) -> mqtt.QoS {
+    if level == 1 {
+        return mqtt.QoS.AtLeastOnce
+    }
+    if level == 2 {
+        return mqtt.QoS.ExactlyOnce
+    }
+    return mqtt.QoS.AtMostOnce
+}
+fn transmit(socket: &mut native.TcpConnection, data: &[u8], timeout_ms: u64) -> void!mqtt.Error {
+    clock := native.MonotonicClock {}
+    cancel := net.NeverCancel {}
+    operation := net.Operation.until(deadline(clock.now_ms(), timeout_ms))
+    match operations.write_all(socket, data, &operation, &mut clock, &cancel) {
+        ok(_) => {
+            return ok()
+        }
+        err(reason) => {
+            return err(io_error(reason))
+        }
+    }
+}
+// Scalars of one decoded frame, so no borrow of the input buffer outlives it.
+struct Info {
+    kind: mqtt.PacketKind
+    length: usize
+    packet_id: u16
+    level: u8
+    return_code: u8
+    session_present: bool
+}
+fn peek(data: &[u8]) -> Info!mqtt.Error {
+    let mqtt.Packet { kind: kind, length: length, packet_id: packet_id, qos: qos, return_code: return_code,
+    session_present: session_present,.. } = mqtt.decode(data)?
+    return ok(Info { kind: kind, length: length, packet_id: packet_id, level: mqtt.qos_level(&qos),
+    return_code: return_code, session_present: session_present })
+}
+
+pub struct Client {
+    socket: native.TcpConnection
+    output: &mut[u8]
+    input: &mut[u8]
+    // input[..buffered] holds received bytes, starting at a frame boundary.
+    buffered: usize
+    // Length of the frame last returned as a Message, released on the next call.
+    delivered: usize
+    // Acknowledgement owed for that message: its QoS level and packet identifier.
+    owed: u8
+    owed_id: u16
+    next_id: u16
+    keep_alive_ms: u64
+    timeout_ms: u64
+    last_sent: u64
+    ping_sent: u64
+    pinging: bool
+    session_present: bool
+    // Set by disconnect() and by any failure that leaves the session unusable.
+    broken: bool
+    // Connects with Options.new(client_id) defaults: clean session, 60 s keep-alive.
+    pub fn connect(url: &[u8], client_id: &[u8], workspace: &mut[u8]) -> Client!mqtt.Error from(workspace) {
+        options := Options.new(client_id)
+        return Client.connect_with(url, &options, workspace)
+    }
+    pub fn connect_with(url: &[u8], options: &Options, workspace: &mut[u8]) -> Client!mqtt.Error from(workspace) {
+        if workspace.len < MIN_WORKSPACE_BYTES || options.connect_timeout_ms == 0 || options.timeout_ms == 0 {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+        location := parse_url(url)?
+        let some(slice.SplitMut { left: output, right: input }) = slice.split_at_mut(workspace, workspace.len / 4) else {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+        // Encode first, so invalid options fail before any network activity.
+        will_level := mqtt.qos_level(&options.will_qos)
+        connect := mqtt.Connect { client_id: options.client_id, username: options.username, password: options.password,
+        keep_alive_s: options.keep_alive_s, clean_session: options.clean_session, will_topic: options.will_topic,
+        will_payload: options.will_payload, will_qos: quality(will_level), will_retain: options.will_retain }
+        used := mqtt.encode_connect(output, &connect)?
+        clock := native.MonotonicClock {}
+        cancel := net.NeverCancel {}
+        until := deadline(clock.now_ms(), options.connect_timeout_ms)
+        operation := net.Operation.until(until)
+        address_bytes := [0u8; 384]
+        addresses: native.Addresses
+        match native.resolve(location.host, location.port, &mut address_bytes) {
+            ok(value) => {
+                addresses = value
+            }
+            err(reason) => {
+                return err(net_error(reason, mqtt.ErrorKind.Resolve))
+            }
+        }
+        last := net.failure(net.ErrorKind.NameNotFound)
+        socket := native.TcpConnection.closed()
+        connected := false
+        for i in 0usize..addresses.len() {
+            if !connected {
+                address: net.SocketAddress
+                match addresses.get(i) {
+                    ok(value) => {
+                        address = value
+                    }
+                    err(reason) => {
+                        return err(net_error(reason, mqtt.ErrorKind.Resolve))
+                    }
+                }
+                match native.connect_with(&address, &operation, &mut clock, &cancel) {
+                    ok(value) => {
+                        socket = value
+                        connected = true
+                    }
+                    err(reason) => {
+                        last = reason
+                    }
+                }
+            }
+        }
+        if !connected {
+            return err(net_error(last, mqtt.ErrorKind.Connect))
+        }
+        client := Client { socket: socket, output: output, input: input, buffered: 0, delivered: 0,
+        owed: 0, owed_id: 0, next_id: 0, keep_alive_ms: (options.keep_alive_s as u64) * 1000,
+        timeout_ms: options.timeout_ms, last_sent: 0, ping_sent: 0, pinging: false,
+        session_present: false, broken: false }
+        now := clock.now_ms()
+        if now >= until {
+            return err(mqtt.failure(mqtt.ErrorKind.TimedOut, 0))
+        }
+        transmit(&mut client.socket, &client.output[..used], until - now)?
+        client.last_sent = clock.now_ms()
+        code := client.await_reply(mqtt.PacketKind.Connack, 0, until)?
+        if code != mqtt.ACCEPTED {
+            return err(mqtt.failure(mqtt.ErrorKind.Refused, code as i32))
+        }
+        return ok(client)
+    }
+    // Whether the broker resumed a stored session (clean_session = false).
+    pub fn session_present(&self) -> bool {
+        return self.session_present
+    }
+    // Publishes with QoS 0: no acknowledgement, no retained copy.
+    pub fn publish(&mut self, topic: &[u8], payload: &[u8]) -> void!mqtt.Error {
+        return self.publish_with(topic, payload, mqtt.QoS.AtMostOnce, false)
+    }
+    // Returns once the message is sent (QoS 0), acknowledged (QoS 1), or
+    // released and completed (QoS 2). retain asks the broker to keep it as
+    // the topic's last known value.
+    pub fn publish_with(&mut self, topic: &[u8], payload: &[u8], qos: mqtt.QoS, retain: bool) -> void!mqtt.Error {
+        self.settle()?
+        level := mqtt.qos_level(&qos)
+        id := 0u16
+        if level != 0 {
+            id = self.packet_id()
+        }
+        head := mqtt.encode_publish_head(self.output, topic, payload.len, quality(level), retain, false, id)?
+        if payload.len <= self.output.len - head {
+            for i in 0usize..payload.len {
+                self.output[head + i] = payload[i]
+            }
+            self.send(head + payload.len)?
+        } else {
+            self.send(head)?
+            match transmit(&mut self.socket, payload, self.timeout_ms) {
+                ok() => {}
+                err(reason) => {
+                    self.broken = true
+                    return err(reason)
+                }
+            }
+        }
+        if level == 1 {
+            until := self.limit()
+            self.await_reply(mqtt.PacketKind.Puback, id, until)?
+        }
+        if level == 2 {
+            until := self.limit()
+            self.await_reply(mqtt.PacketKind.Pubrec, id, until)?
+            self.send_ack(mqtt.PacketKind.Pubrel, id)?
+            until = self.limit()
+            self.await_reply(mqtt.PacketKind.Pubcomp, id, until)?
+        }
+        return ok()
+    }
+    // Returns the QoS the broker granted, which may be lower than requested.
+    // A refused subscription fails with Rejected and leaves the client usable.
+    pub fn subscribe(&mut self, filter: &[u8], qos: mqtt.QoS) -> mqtt.QoS!mqtt.Error {
+        self.settle()?
+        id := self.packet_id()
+        used := mqtt.encode_subscribe(self.output, id, filter, qos)?
+        self.send(used)?
+        until := self.limit()
+        code := self.await_reply(mqtt.PacketKind.Suback, id, until)?
+        if code == mqtt.SUBSCRIBE_FAILURE {
+            return err(mqtt.failure(mqtt.ErrorKind.Rejected, code as i32))
+        }
+        return ok(quality(code))
+    }
+    pub fn unsubscribe(&mut self, filter: &[u8]) -> void!mqtt.Error {
+        self.settle()?
+        id := self.packet_id()
+        used := mqtt.encode_unsubscribe(self.output, id, filter)?
+        self.send(used)?
+        until := self.limit()
+        self.await_reply(mqtt.PacketKind.Unsuback, id, until)?
+        return ok()
+    }
+    // Waits for the next message from a subscription. The message borrows the
+    // workspace and is acknowledged (QoS 1 and 2) when the client is next used. Keep-alive pings are
+    // sent while waiting.
+    pub fn receive(&mut self) -> mqtt.Message!mqtt.Error from(self) {
+        match self.poll(18446744073709551615u64)? {
+            some(message) => {
+                return ok(message)
+            }
+            none => {
+                return err(mqtt.failure(mqtt.ErrorKind.TimedOut, 0))
+            }
+        }
+    }
+    // Like receive, but returns none after timeout_ms without a message; 0
+    // only drains what has already arrived. Call it at least once per
+    // keep-alive interval while idle, so the client can answer for itself.
+    pub fn poll(&mut self, timeout_ms: u64) -> Option<mqtt.Message>!mqtt.Error from(self) {
+        self.settle()?
+        clock := native.MonotonicClock {}
+        until := deadline(clock.now_ms(), timeout_ms)
+        for true {
+            length := self.frame_at(0)?
+            if length != 0 {
+                info := self.inspect(0)?
+                if info.kind == mqtt.PacketKind.Publish {
+                    self.delivered = length
+                    self.owed = info.level
+                    self.owed_id = info.packet_id
+                    let mqtt.Packet { topic: topic, payload: payload, qos: qos, retain: retain, duplicate: duplicate,.. } =
+                        mqtt.decode(&self.input[..length])?
+                    return ok(some(mqtt.Message { topic: topic, payload: payload, qos: qos, retain: retain, duplicate: duplicate }))
+                }
+                self.control(&info)?
+                self.remove(0, length)
+            } else if !self.fill(until)? {
+                return ok(none)
+            }
+        }
+        return ok(none)
+    }
+    // Ends the session cleanly: the broker discards the will message.
+    pub fn disconnect(&mut self) -> void!mqtt.Error {
+        self.settle()?
+        used := mqtt.encode_disconnect(self.output)?
+        self.send(used)?
+        self.broken = true
+        match self.socket.close() {
+            ok() => {}
+            err(reason) => {
+                return err(net_error(reason, mqtt.ErrorKind.Network))
+            }
+        }
+        return ok()
+    }
+
+    fn limit(&mut self) -> u64 {
+        clock := native.MonotonicClock {}
+        return deadline(clock.now_ms(), self.timeout_ms)
+    }
+    fn packet_id(&mut self) -> u16 {
+        if self.next_id == 65535 {
+            self.next_id = 1
+        } else {
+            self.next_id += 1
+        }
+        return self.next_id
+    }
+    // Releases the last delivered message and sends what it was owed.
+    fn settle(&mut self) -> void!mqtt.Error {
+        if self.broken {
+            return err(mqtt.failure(mqtt.ErrorKind.Closed, 0))
+        }
+        delivered := self.delivered
+        if delivered != 0 {
+            self.delivered = 0
+            self.remove(0, delivered)
+        }
+        level := self.owed
+        id := self.owed_id
+        self.owed = 0
+        if level == 1 {
+            self.send_ack(mqtt.PacketKind.Puback, id)?
+        }
+        if level == 2 {
+            self.send_ack(mqtt.PacketKind.Pubrec, id)?
+        }
+        return ok()
+    }
+    fn send(&mut self, length: usize) -> void!mqtt.Error {
+        match transmit(&mut self.socket, &self.output[..length], self.timeout_ms) {
+            ok() => {}
+            err(reason) => {
+                self.broken = true
+                return err(reason)
+            }
+        }
+        clock := native.MonotonicClock {}
+        self.last_sent = clock.now_ms()
+        return ok()
+    }
+    fn send_ack(&mut self, kind: mqtt.PacketKind, packet_id: u16) -> void!mqtt.Error {
+        used := mqtt.encode_ack(self.output, kind, packet_id)?
+        return self.send(used)
+    }
+    // Length of the complete frame at input[start..], or 0 while incomplete.
+    fn frame_at(&mut self, start: usize) -> usize!mqtt.Error {
+        total: usize
+        match mqtt.frame_length(&self.input[start..self.buffered]) {
+            ok(value) => {
+                match value {
+                    some(length) => {
+                        total = length
+                    }
+                    none => {
+                        if self.buffered == self.input.len {
+                            self.broken = true
+                            return err(mqtt.failure(mqtt.ErrorKind.BufferFull, 0))
+                        }
+                        return ok(0)
+                    }
+                }
+            }
+            err(reason) => {
+                self.broken = true
+                return err(reason)
+            }
+        }
+        if total > self.input.len {
+            self.broken = true
+            return err(mqtt.failure(mqtt.ErrorKind.PacketTooLarge, 0))
+        }
+        if total > self.input.len - start {
+            // Messages set aside while awaiting an acknowledgement fill the buffer.
+            self.broken = true
+            return err(mqtt.failure(mqtt.ErrorKind.BufferFull, 0))
+        }
+        if total > self.buffered - start {
+            return ok(0)
+        }
+        return ok(total)
+    }
+    fn inspect(&mut self, start: usize) -> Info!mqtt.Error {
+        match peek(&self.input[start..self.buffered]) {
+            ok(info) => {
+                return ok(info)
+            }
+            err(reason) => {
+                self.broken = true
+                return err(reason)
+            }
+        }
+    }
+    fn remove(&mut self, start: usize, length: usize) {
+        for i in start + length..self.buffered {
+            self.input[i - length] = self.input[i]
+        }
+        self.buffered -= length
+    }
+    // Packets the broker may send at any time, apart from PUBLISH.
+    fn control(&mut self, info: &Info) -> void!mqtt.Error {
+        if info.kind == mqtt.PacketKind.Pingresp {
+            self.pinging = false
+            return ok()
+        }
+        if info.kind == mqtt.PacketKind.Pubrel {
+            id := info.packet_id
+            return self.send_ack(mqtt.PacketKind.Pubcomp, id)
+        }
+        self.broken = true
+        return err(mqtt.failure(mqtt.ErrorKind.Protocol, 0))
+    }
+    // Waits for the reply `kind` to packet_id and returns its return code.
+    // PUBLISH frames that arrive first stay buffered for poll().
+    fn await_reply(&mut self, kind: mqtt.PacketKind, packet_id: u16, until: u64) -> u8!mqtt.Error {
+        scan := 0usize
+        for true {
+            length := self.frame_at(scan)?
+            if length == 0 {
+                if !self.fill(until)? {
+                    self.broken = true
+                    return err(mqtt.failure(mqtt.ErrorKind.TimedOut, 0))
+                }
+            } else {
+                info := self.inspect(scan)?
+                if info.kind == mqtt.PacketKind.Publish {
+                    scan += length
+                } else if info.kind == kind && info.packet_id == packet_id {
+                    self.remove(scan, length)
+                    if info.kind == mqtt.PacketKind.Connack {
+                        self.session_present = info.session_present
+                    }
+                    return ok(info.return_code)
+                } else {
+                    self.control(&info)?
+                    self.remove(scan, length)
+                }
+            }
+        }
+        return err(mqtt.failure(mqtt.ErrorKind.Protocol, 0))
+    }
+    // Reads more input; false once `until` passes without any. Sends keep-alive
+    // pings when idle and fails if the broker stops answering them.
+    fn fill(&mut self, until: u64) -> bool!mqtt.Error {
+        clock := native.MonotonicClock {}
+        for true {
+            now := clock.now_ms()
+            if self.keep_alive_ms != 0 && !self.pinging && now - self.last_sent >= self.keep_alive_ms {
+                used := mqtt.encode_pingreq(self.output)?
+                self.send(used)?
+                self.pinging = true
+                self.ping_sent = now
+            }
+            match self.socket.poll_read(&mut self.input[self.buffered..]) {
+                ok(progress) => {
+                    if progress.state == io.PollState.Eof {
+                        self.broken = true
+                        return err(mqtt.failure(mqtt.ErrorKind.Closed, 0))
+                    }
+                    if progress.transferred != 0 {
+                        self.buffered += progress.transferred
+                        return ok(true)
+                    }
+                }
+                err(reason) => {
+                    if reason.kind != io.ErrorKind.Interrupted {
+                        self.broken = true
+                        return err(io_error(reason))
+                    }
+                }
+            }
+            // Nothing is waiting, so an outstanding PINGRESP is overdue.
+            now = clock.now_ms()
+            if self.pinging && now - self.ping_sent >= self.keep_alive_ms {
+                self.broken = true
+                return err(mqtt.failure(mqtt.ErrorKind.TimedOut, 0))
+            }
+            if now >= until {
+                return ok(false)
+            }
+            wait := until - now
+            if wait > 1000 {
+                wait = 1000
+            }
+            if self.keep_alive_ms != 0 {
+                due := self.last_sent + self.keep_alive_ms
+                if self.pinging {
+                    due = self.ping_sent + self.keep_alive_ms
+                }
+                if due <= now {
+                    wait = 1
+                } else if due - now < wait {
+                    wait = due - now
+                }
+            }
+            match self.socket.wait_ready(net.Interest.Read, wait as u32) {
+                ok(_) => {}
+                err(reason) => {
+                    if reason.kind != net.ErrorKind.Interrupted {
+                        self.broken = true
+                        return err(net_error(reason, mqtt.ErrorKind.Network))
+                    }
+                }
+            }
+        }
+        return ok(false)
+    }
+}
+
+// Handler that writes "topic payload" lines to standard output; app.print()
+// and broker.print() return it.
+pub struct Print {
+    pub fn handle(&mut self, message: &mqtt.Message, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        out := console.stdout()
+        match out.write(message.topic) {
+            ok(_) => {}
+            err(reason) => {
+                return err(io_error(reason))
+            }
+        }
+        match out.write(b" ") {
+            ok(_) => {}
+            err(reason) => {
+                return err(io_error(reason))
+            }
+        }
+        match out.write(message.payload) {
+            ok(_) => {}
+            err(reason) => {
+                return err(io_error(reason))
+            }
+        }
+        match out.write(b"\n") {
+            ok(_) => {}
+            err(reason) => {
+                return err(io_error(reason))
+            }
+        }
+        return ok()
+    }
+}

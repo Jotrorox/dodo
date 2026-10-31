@@ -48,6 +48,8 @@ they are not prerequisites for using the safe entry APIs.
 | Read the current time | `time/hosted.WallClock.new().wall_now()` | [Time and clocks](time.md) |
 | Fetch a URL | `http/hosted.Client.new` and `get` | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) |
 | Serve a route | `app.new().get(...).run(...)` from `std/web/app` | [Web applications](web.md) |
+| React to MQTT messages or publish on a timer | `app.new(id).on(...).every(...).run(url)` from `std/mqtt/app` | [MQTT](mqtt.md) |
+| Run an MQTT broker | `broker.new().run(address)` from `std/mqtt/broker` | [MQTT](mqtt.md#the-broker) |
 
 Use a fresh directory for each copied example and run the commands there.
 A marked `dodo test` example also runs through
@@ -175,6 +177,7 @@ individual modules and links every public declaration back to its source.
 | [Cryptography](crypto.md) | `std/crypto`, `std/crypto/openssl`, `std/crypto/random` | Errors/secret helpers portable; OS entropy and OpenSSL hosted. |
 | [TLS](tls.md) | `std/tls`, `std/tls/openssl`, `std/tls/stream` | Contracts/stream portable; OpenSSL hosted. |
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
+| [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
 | [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/cortex_m` | `std/embedded/hal` and `std/embedded/executor` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
 
