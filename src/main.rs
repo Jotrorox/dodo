@@ -632,6 +632,19 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                     linker.arg("-lcrypto");
                 }
             }
+            // Pure-Dodo bindings have no C runtime to key on, so linking
+            // follows the loaded packages.
+            if apple && package::uses_metal(loaded) {
+                linker.args([
+                    "-framework",
+                    "Metal",
+                    "-framework",
+                    "QuartzCore",
+                    "-framework",
+                    "Foundation",
+                    "-lobjc",
+                ]);
+            }
             // std/dylib needs no C boundary; glibc before 2.34 keeps dlopen
             // in libdl, which later releases retain as an empty stub.
             if target.contains("-linux-")

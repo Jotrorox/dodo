@@ -14,6 +14,20 @@
   `examples/opengl_window.dodo` shows a shaded triangle in a window. A
   fixture renders and reads back a triangle with Mesa's llvmpipe in Linux CI
   and with CGL on macOS.
+- `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
+  entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
+  declared with its own signature. It covers devices, command queues,
+  command buffers, compute, render and blit encoders, buffers, textures,
+  samplers, shader libraries from source or `.metallib` data, compute and render
+  pipelines, vertex, depth-stencil and render-pass descriptors, fences,
+  events and `CAMetalLayer`. Objects release on drop, and compile and
+  pipeline errors carry Metal's message. Buffer and texture copies check
+  their ranges, and binding indices are bounds-checked. `std/gpu/metal/objc`
+  exposes the Objective-C runtime layer for methods the module lacks. Loading
+  the package links Metal, QuartzCore, Foundation and libobjc, and importing
+  it for a non-macOS target is an error. The test suite runs compute,
+  rendering and readback on the GPU, including x86-64 under Rosetta, and
+  checks every constant against the SDK headers.
 - `truetype.GlyphCache` keeps rasterized glyphs in caller-provided storage,
   so text drawn again is blended instead of rasterized: about 13 times
   faster at 14 pixels and 6 times faster at 96. It draws like `Font.draw`

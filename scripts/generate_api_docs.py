@@ -294,10 +294,11 @@ def guide_for(module: str) -> str:
         return "core"
     if module.startswith("alloc/"):
         return "allocation"
+    # Metal and OpenGL have their own guides; the rest of std/gpu shares gpu.md.
+    for api in ("metal", "opengl"):
+        if module == f"std/gpu/{api}" or module.startswith(f"std/gpu/{api}/"):
+            return api
     family = module.split("/")[1]
-    if module == "std/gpu/opengl" or module.startswith("std/gpu/opengl/"):
-        # OpenGL has its own guide; the rest of std/gpu shares gpu.md.
-        return "opengl"
     return {
         "arena_bytes": "bytes", "bytes_alloc": "bytes", "pool_bytes": "bytes",
         "io_alloc": "io", "fmt": "formatting", "fmt_alloc": "formatting",
