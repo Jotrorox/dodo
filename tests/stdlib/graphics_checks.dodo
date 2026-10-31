@@ -16,6 +16,9 @@ import "std/graphics/truetype"
 // The compressing PNG encoder's storage, too big for small stacks.
 static mut PNG_BUFFER: [deflate.ENCODER_BUFFER_LEN]u8 = [0u8; deflate.ENCODER_BUFFER_LEN]
 static mut PNG_WORDS: [deflate.WORKSPACE_LEN]u32 = [0u32; deflate.WORKSPACE_LEN]
+// Path storage for outlines with more edges than the rasterizer collects at
+// once.
+static mut MANY_WORDS: [4800]i32 = [0i32; 4800]
 
 fn count(canvas: &graphics.Canvas, color: graphics.Color) -> u32 {
     total := 0u32
@@ -1275,6 +1278,102 @@ fn antialiasing() {
     assert_eq(at(&gray, 16, 16), graphics.WHITE)
 }
 
+// The rasterizer flattens an outline into at most 256 edges at a time:
+// outlines with more are drawn in bands of rows, and a row crossed by more
+// is drawn in passes that trace the outline again. Both give the pixels of
+// the shapes drawn one by one.
+fn many_edges() {
+    // 160 one pixel wide bars put 320 edges on each row they cross.
+    a_pixels := [0u8; 330 * 4 * 4]
+    b_pixels := [0u8; 330 * 4 * 4]
+    a := graphics.canvas(&mut a_pixels, 330, 4, graphics.PixelFormat.Rgba8888)!
+    b := graphics.canvas(&mut b_pixels, 330, 4, graphics.PixelFormat.Rgba8888)!
+    a.clear(graphics.BLACK)
+    b.clear(graphics.BLACK)
+    a.take_dirty()
+    b.take_dirty()
+    unsafe {
+        bars := graphics.Path.new(&mut MANY_WORDS)
+        for k in 0i32..160 {
+            a.fill_rect(2 * k + 3, 1, 1, 2, graphics.YELLOW)
+            bars.rect((2 * k + 3) * 256, 256, 256, 512)
+        }
+        assert(!bars.overflowed())
+        b.fill_path(&bars, graphics.FillRule.NonZero, graphics.YELLOW)
+    }
+    assert(a.equals(&b))
+    a_dirty := a.dirty()
+    b_dirty := b.dirty()
+    assert(a_dirty.equals(&b_dirty))
+
+    // The same with partly covered pixels: quarter-pixel bars, drawn
+    // together and one at a time.
+    a.clear(graphics.BLACK)
+    b.clear(graphics.BLACK)
+    single := [0i32; 16]
+    unsafe {
+        bars := graphics.Path.new(&mut MANY_WORDS)
+        for k in 0i32..160 {
+            one := graphics.Path.new(&mut single)
+            one.rect((2 * k + 3) * 256 + 64, 200, 64 + k, 400)
+            a.fill_path(&one, graphics.FillRule.EvenOdd, graphics.rgba(255, 200, 40, 220))
+            bars.rect((2 * k + 3) * 256 + 64, 200, 64 + k, 400)
+        }
+        b.fill_path(&bars, graphics.FillRule.EvenOdd, graphics.rgba(255, 200, 40, 220))
+    }
+    assert(a.equals(&b))
+    assert_eq(at(&b, 4, 1), graphics.BLACK)
+    assert(graphics.red(at(&b, 3, 1)) > 0)
+
+    // 72 small circles, about 1700 edges in all but few on any one row.
+    c_pixels := [0u8; 100 * 52 * 4]
+    d_pixels := [0u8; 100 * 52 * 4]
+    c := graphics.canvas(&mut c_pixels, 100, 52, graphics.PixelFormat.Rgba8888)!
+    d := graphics.canvas(&mut d_pixels, 100, 52, graphics.PixelFormat.Rgba8888)!
+    c.clear(graphics.BLACK)
+    d.clear(graphics.BLACK)
+    circle := [0i32; 64]
+    unsafe {
+        dots := graphics.Path.new(&mut MANY_WORDS)
+        for row in 0i32..6 {
+            for column in 0i32..12 {
+                x := column * 2048 + 1100 + 37 * row
+                y := row * 2048 + 1100 + 29 * column
+                one := graphics.Path.new(&mut circle)
+                one.circle(x, y, 700)
+                c.fill_path(&one, graphics.FillRule.NonZero, graphics.CYAN)
+                dots.circle(x, y, 700)
+            }
+        }
+        assert(!dots.overflowed())
+        d.fill_path(&dots, graphics.FillRule.NonZero, graphics.CYAN)
+    }
+    assert(c.equals(&d))
+    assert_eq(at(&d, 4, 4), graphics.CYAN)
+
+    // A sliver whose edges cross hundreds of columns in each row gives the
+    // same pixels drawn whole as drawn in two clipped halves.
+    e_pixels := [0u8; 600 * 8 * 4]
+    f_pixels := [0u8; 600 * 8 * 4]
+    e := graphics.canvas(&mut e_pixels, 600, 8, graphics.PixelFormat.Rgba8888)!
+    f := graphics.canvas(&mut f_pixels, 600, 8, graphics.PixelFormat.Rgba8888)!
+    e.clear(graphics.BLACK)
+    f.clear(graphics.BLACK)
+    sliver := [0i32; 16]
+    wedge := graphics.Path.new(&mut sliver)
+    wedge.move_to(-40 * 256, 300)
+    wedge.line_to(640 * 256, 700)
+    wedge.line_to(10 * 256, 1900)
+    wedge.close()
+    e.fill_path(&wedge, graphics.FillRule.NonZero, graphics.WHITE)
+    f.set_clip(graphics.Rect.new(0, 0, 150, 8))
+    f.fill_path(&wedge, graphics.FillRule.NonZero, graphics.WHITE)
+    f.set_clip(graphics.Rect.new(150, 0, 450, 8))
+    f.fill_path(&wedge, graphics.FillRule.NonZero, graphics.WHITE)
+    assert(e.equals(&f))
+    assert_eq(at(&e, 300, 4), graphics.WHITE)
+}
+
 fn vector_scene(canvas: &mut graphics.Canvas) {
     canvas.clear(graphics.hex(0x1d2330))
     canvas.aa_fill_circle(10, 12, 9, graphics.hex(0xe5c07b))
@@ -1874,6 +1973,7 @@ fn main() {
     corrupted_files()
     random_drawing()
     antialiasing()
+    many_edges()
     gradients()
     truetype_checks()
     corrupted_fonts()
