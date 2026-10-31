@@ -48,7 +48,10 @@
   their integer counterparts pixel for pixel. `graphics.Path` stores move,
   line, quadratic and cubic commands in caller-owned words, and any type
   with a `trace(&self, pen)` method is a `graphics.Outline` drawn without
-  storage, filled by the nonzero or even-odd rule. `graphics.Gradient` paints
+  storage, filled by the nonzero or even-odd rule. The rasterizer's cost
+  follows a shape's edges rather than its bounding box: an outline is
+  flattened once, coverage is computed only in pixels an edge crosses, and
+  interiors are filled as whole spans. `graphics.Gradient` paints
   linear and radial gradients with up to eight stops, premultiplied
   interpolation, pad/repeat/reflect spreads and optional ordered dithering
   for RGB565 and monochrome panels. `std/graphics/truetype` reads `.ttf` and
