@@ -224,10 +224,13 @@ impl Expander {
     fn function_value_type(&self, name: &str) -> Option<Type> {
         let function = self.signatures.get(name)?;
         (function.generics.is_empty() && function.printing.is_none() && !function.pio).then(|| {
-            Type::Fn(
-                function.params.iter().map(|p| p.ty.clone()).collect(),
-                Box::new(function.ret.clone()),
-            )
+            let params = function.params.iter().map(|p| p.ty.clone()).collect();
+            let ret = Box::new(function.ret.clone());
+            if function.extern_ {
+                Type::ExternFn(params, ret)
+            } else {
+                Type::Fn(params, ret)
+            }
         })
     }
     /// A named function used as a value. Generic functions are specialized
@@ -461,7 +464,7 @@ impl Expander {
                 self.ty(t, substitutions, span)?;
                 self.ty(e, substitutions, span)?;
             }
-            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+            Type::Fn(params, ret) | Type::DynFn(params, ret) | Type::ExternFn(params, ret) => {
                 for param in params.iter_mut() {
                     self.ty(param, substitutions, span)?;
                 }
@@ -915,6 +918,13 @@ impl Expander {
                     .collect(),
                 Box::new(Self::substitute(ret, mapping)),
             ),
+            Type::ExternFn(params, ret) => Type::ExternFn(
+                params
+                    .iter()
+                    .map(|t| Self::substitute(t, mapping))
+                    .collect(),
+                Box::new(Self::substitute(ret, mapping)),
+            ),
             _ => ty.clone(),
         }
     }
@@ -930,7 +940,7 @@ impl Expander {
             | Type::MaybeUninit(t) => Self::concrete(t, parameters),
             Type::Result(t, e) => Self::concrete(t, parameters) && Self::concrete(e, parameters),
             Type::Generic(_, args) => args.iter().all(|t| Self::concrete(t, parameters)),
-            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+            Type::Fn(params, ret) | Type::DynFn(params, ret) | Type::ExternFn(params, ret) => {
                 params.iter().all(|t| Self::concrete(t, parameters))
                     && Self::concrete(ret, parameters)
             }
@@ -992,6 +1002,12 @@ impl Expander {
             (Type::Fn(ps, p) | Type::DynFn(ps, p), Type::Fn(args, a) | Type::DynFn(args, a))
                 if ps.len() == args.len() =>
             {
+                for (p, a) in ps.iter().zip(args) {
+                    self.unify(p, a, parameters, mapping, span)?;
+                }
+                self.unify(p, a, parameters, mapping, span)?;
+            }
+            (Type::ExternFn(ps, p), Type::ExternFn(args, a)) if ps.len() == args.len() => {
                 for (p, a) in ps.iter().zip(args) {
                     self.unify(p, a, parameters, mapping, span)?;
                 }

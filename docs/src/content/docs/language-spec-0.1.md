@@ -328,6 +328,7 @@ unterminated literals are errors.
 | `fn(A, B) -> R` | Function pointer: code with no captured state |
 | `&dyn fn(A) -> R` | Shared closure reference: code and a borrowed environment |
 | `&mut dyn fn(A) -> R` | Exclusive closure reference that may modify what it captures |
+| `extern "C" fn(A, B) -> R` | C function pointer: code using the target C calling convention |
 
 ### 4.2. Arrays and slices
 
@@ -724,8 +725,9 @@ method (`Type.method`), or imported function (`package.name`) used as a value
 has the function pointer type of its signature. A generic function used as a
 value is specialized from the expected function type. Unsafe, foreign,
 destructor, interface-dispatch, and storage-contract (`stores`, `from(x.stored)`)
-functions are not function values. Function pointers do not use the C ABI; pass
-C callbacks with `mem.callback`. Two function pointers cannot be compared.
+functions are not function values. Function pointers do not use the C ABI; C
+code is addressed by `extern "C" fn` pointers (FN-EXTERN). Two function pointers
+cannot be compared.
 
 `dyn fn(A) -> R` is an unknown callable that may capture local bindings. Like
 `dyn I` it has no fixed size and appears only behind a reference. A closure
@@ -736,6 +738,23 @@ pointer converts implicitly (or with `as`) to either closure reference with no
 borrow, and `&dyn fn(..)` converts to `&mut dyn fn(..)`; `&mut dyn fn(..)`
 never becomes shared. `&fn(..)` is an ordinary reference to a function pointer.
 Closure references cannot be dereferenced.
+
+**FN-EXTERN.** `extern "C" fn(A, B) -> R` is a C function pointer type: the
+address of code using the target C calling convention (ABI-C), such as a
+pointer returned by `dlsym`, `GetProcAddress` or `vkGetInstanceProcAddr`, or
+an entry of a COM method table. Its parameter and result types follow the ABI-C
+rules, and an `extern "C" fn` type is itself permitted there, so C functions
+may take and return C function pointers. C function pointers are copyable,
+carry no borrows, and are permitted wherever `fn(..)` is. An `extern "C"`
+function, declared or defined, used as a value has the C function pointer type
+of its signature; no other function and no closure is a C function pointer, and
+`fn(..)`, `&dyn fn(..)` and `extern "C" fn(..)` do not convert to one another.
+A call through a C function pointer requires an explicit unsafe block. In
+unsafe code, `as` converts between a C function pointer and a raw pointer, a
+`usize`, or a C function pointer of a different signature; the program must
+ensure the address is non-null and refers to code with exactly that signature.
+A C function pointer is not nullable: test a raw pointer for null before
+converting it. The type has the size and alignment of a raw pointer.
 
 **FN-CLOSURE.** A closure literal is `fn(a: A, b) -> R { body }`. An omitted
 parameter type is taken from the expected function type and is otherwise an
@@ -1485,18 +1504,19 @@ unsafe extern "C" fn send(data: *const u8, length: usize) -> i32
 Only `extern "C"` is supported. A declaration may be a prototype without a body
 or a definition with a Dodo body. A call to either requires an explicit unsafe
 block, even without an `unsafe` declaration modifier. Parameters/results must
-be primitive integers, floats, bool, raw pointers, or C structs; `void` is
-permitted only as the result. A C struct is a `@repr(C)` struct with at least
-one field and no destructor (on itself or any field) whose fields are
-primitive integers, floats, bool, raw pointers, C structs, or nonempty arrays
-of these. Checked references, slices, arrays, other structs, enums, Option,
-and Result by value are rejected. Variadic declarations are rejected. Use a
-raw pointer to pass other aggregate storage.
+be primitive integers, floats, bool, raw pointers, C function pointers
+(FN-EXTERN), or C structs; `void` is permitted only as the result. A C struct
+is a `@repr(C)` struct with at least one field and no destructor (on itself or
+any field) whose fields are primitive integers, floats, bool, raw pointers, C
+function pointers, C structs, or nonempty arrays of these. Checked references,
+slices, arrays, other structs, enums, Option, and Result by value are
+rejected. Variadic declarations are rejected. Use a raw pointer to pass other
+aggregate storage.
 
 The selected target's C calling convention determines parameter passing and
 returning. Fixed-width integers correspond to C integers of the same width and
 signedness, `bool` to C `_Bool`, `f32`/`f64` to target binary32/binary64 C floating
-types, and raw pointers to C data pointers. `usize`/`isize` use the pointer-width
+types, raw pointers to C data pointers, and `extern "C" fn` to C function pointers. `usize`/`isize` use the pointer-width
 integer ABI, not necessarily C `unsigned long`/`long`. Bindings must supply exact
 target C declarations and satisfy the foreign function's validity requirements.
 Narrow argument/result extension must match the target ABI (ID-C). A C struct
@@ -1912,6 +1932,8 @@ type          = primitive-type
               | "fn", "(", [ type, { ",", type } ], ")", [ "->", type ]
               | "&", [ "mut" ], "dyn", "fn", "(", [ type, { ",", type } ], ")",
                 [ "->", type ]
+              | "extern", string-literal, "fn", "(", [ type, { ",", type } ], ")",
+                [ "->", type ]
               | type, "!", type ;
 
 block         = "{", { statement }, "}" ;
@@ -2081,7 +2103,7 @@ tests constrain the documented choice, not every possible conforming choice.
 | ID-TARGET: widths, endianness, alignment, object format | Uses the selected LLVM 23 target triple and its data layout. Default is the compiler host triple. `x86_64-unknown-linux-gnu` has 64-bit pointers and little-endian storage; `i686-unknown-linux-gnu` has 32-bit pointers and little-endian storage; `powerpc64-unknown-linux-gnu` has 64-bit pointers and big-endian storage. Scalar/aggregate alignment is the target data layout's ABI alignment, observable with core layout queries; emitted IR must include the triple/data layout. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `aggregate_layout_tags_and_string_byte_lengths` (E). |
 | ID-FLOAT: floating environment and constant precision | Runtime uses LLVM non-fast floating operations with default round-to-nearest, ties-to-even. Native tests assume gradual underflow and masked floating exceptions; no source facility changes rounding/exception modes. Constant scalar evaluation computes floating operations in host binary64 and rounds to the expression's type at each node. Integer-to-float constants round directly to the destination representation using round-to-nearest, ties-to-even, matching runtime conversion; an explicit cast through f64 still performs both conversions. Decimal literal conversion passes through binary64. Only narrowing f64 to f32 requires a finite, in-range source; identity and widening floating casts preserve NaN, infinities, and signed zero in constants and at runtime. NaN payload/sign is unspecified. Evidence: `spec::scalar_representations_and_float_comparisons`, `checked_float_cast_boundaries_trap`, `constant_integer_to_float_matches_runtime`, `constant_float_identity_and_widening_match_runtime` (E); `numeric_conversions::constant_float_narrowing_still_rejects_non_finite_and_out_of_range_values` (R). |
 | ID-PTR: address representation | The integral default-address-space profile uses LLVM data pointers and integer casts, with zero as null; pointer offsets use element-scaled address computation. No hidden runtime provenance table is maintained. Non-default address spaces and capability/non-integral pointer interfaces are outside this profile; LLVM emission alone does not establish their conformance. Evidence: `spec::pointer_integer_round_trip_offsets_and_byte_access` (E), `unsafe_pointer_conversions_and_unsupported_abi_are_rejected` (R). |
-| ID-C: target C argument/result passing | Uses LLVM C calling convention. On x86 SysV, i8/i16 use sign extension and u8/u16/bool use zero extension on declarations and calls; Windows uses its target convention without those SysV attributes. Other scalar and pointer passing follows the selected target. Duplicate extern declarations are compared by lowered LLVM function type, which does not distinguish signed/unsigned integers of the same width; the author must keep those contracts consistent. C structs are classified by the compiler for x86-64 System V (up to two INTEGER/SSE eightbytes in registers when enough remain for the whole struct, otherwise `byval` on the stack; larger results through `sret`), AArch64 AAPCS64 including Apple and Windows (homogeneous aggregates of up to four `f32` or `f64` in vector registers, other structs up to 16 bytes in one or two general registers, larger ones through a pointer to a caller copy or `sret`), and Windows x64 (structs of 1, 2, 4 or 8 bytes as that integer, all others through a pointer to a caller copy or `sret`). Other targets reject a C struct by value at code generation. Evidence: `spec::c_scalar_results_and_struct_pointer_layout_interoperate` (E), `spec::c_structs_pass_and_return_by_value_across_the_c_abi` (E), `spec::c_struct_classification_follows_each_target_abi` (E/R), `incompatible_lowered_foreign_declarations_fail_before_linking` (R), `regressions::foreign_narrow_integer_arguments_follow_the_c_abi` (E), `compiler::repeated_foreign_declarations_across_packages_share_a_c_symbol` (E). |
+| ID-C: target C argument/result passing | Uses LLVM C calling convention. On x86 SysV and Apple arm64, i8/i16 use sign extension and u8/u16/bool use zero extension on declarations, calls, and calls through `extern "C" fn` pointers; Windows uses its target convention without those SysV attributes. Other scalar and pointer passing follows the selected target. Duplicate extern declarations are compared by lowered LLVM function type, which does not distinguish signed/unsigned integers of the same width; the author must keep those contracts consistent. C structs, including in calls through `extern "C" fn` pointers, are classified by the compiler for x86-64 System V (up to two INTEGER/SSE eightbytes in registers when enough remain for the whole struct, otherwise `byval` on the stack; larger results through `sret`), AArch64 AAPCS64 including Apple and Windows (homogeneous aggregates of up to four `f32` or `f64` in vector registers, other structs up to 16 bytes in one or two general registers, larger ones through a pointer to a caller copy or `sret`), and Windows x64 (structs of 1, 2, 4 or 8 bytes as that integer, all others through a pointer to a caller copy or `sret`). Other targets reject a C struct by value at code generation. Evidence: `spec::c_scalar_results_and_struct_pointer_layout_interoperate` (E), `spec::c_structs_pass_and_return_by_value_across_the_c_abi` (E), `spec::c_struct_classification_follows_each_target_abi` (E/R), `incompatible_lowered_foreign_declarations_fail_before_linking` (R), `regressions::foreign_narrow_integer_arguments_follow_the_c_abi` (E), `compiler::repeated_foreign_declarations_across_packages_share_a_c_symbol` (E). |
 | ID-NATIVE: Dodo ABI and symbols | Parameters/results use the scalar/aggregate LLVM types in sections 4.8 and 16.2 with LLVM's default calling convention and no C aggregate classification. Parameters/results larger than 1,024 target ABI bytes pass indirectly through caller-owned storage, including for root-package public functions; root main, exported, and C signatures retain direct lowering. Unused loads of such large aggregates are removed before LLVM optimization. Symbols are `dodo.<root-package>.<qualified-name>`. Root declarations have no package prefix in qualified-name; imported packages use their name when unique and generated `__dodo_package_...` prefixes when necessary. Root-package public non-generic functions and methods, root main, and all C ABI definitions have external linkage; imported Dodo functions and generic instances have internal linkage. Unreachable internal functions are eliminated at every optimization level, following lowered references including implicit drops and callback addresses. ELF and COFF functions use separate code sections for linker garbage collection. Function pointers address code taking the parameters (results and parameters larger than 1,024 bytes through memory, result storage first); closure code takes the environment pointer after any result storage. A closure environment is an array of captured binding addresses in the creating function's frame; named functions whose own convention differs get internal adapter functions. Mangling of generic instances and collision prefixes is compiler-internal and may depend on the loaded graph. Link native objects only with a matching compiler/target configuration. Evidence: `spec::target_profiles_publish_width_endianness_and_native_symbols` (T), `compiler::generic_struct_methods_keep_borrowed_returns` (E). |
 | ID-FS: filesystem identity | Uses the host filesystem's path canonicalization and case sensitivity; directory entries are sorted using canonical host paths. Symlink entries are excluded from directory source enumeration, but an explicit input/import path may resolve through a symlink. No registry, network resolver, or lockfile participates. Evidence: `spec::canonical_package_identity_and_symlink_enumeration` (E, Unix), `package::root_directory_collects_only_immediate_dodo_files` (A), `spec::package_paths_cycles_ambiguity_and_unit_mismatch_are_rejected` (R). |
 | ID-LIB: bundled platform selection | Imports are embedded in the compiler. `std/{platform,fs,process,env,thread,sync,net,tls,web}/native` selects the shared `posix` adapter for x86_64 and aarch64 Linux GNU and for macOS, and `windows` for x86_64 Windows GNU/MSVC. An explicit mismatching adapter or unsupported target is rejected. Portable packages need no hosted adapter. Evidence: `tests/platform_library.rs` and `packages::portable_package_dependencies_are_independent_and_reserved` (A/R). |

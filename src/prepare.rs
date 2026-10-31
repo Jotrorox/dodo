@@ -154,7 +154,7 @@ impl Resolver {
                     self.ty(arg, locals, ns, span)?;
                 }
             }
-            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+            Type::Fn(params, ret) | Type::DynFn(params, ret) | Type::ExternFn(params, ret) => {
                 for param in params {
                     self.ty(param, locals, ns, span)?;
                 }

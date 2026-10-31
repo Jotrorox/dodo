@@ -114,7 +114,7 @@ impl Checker<'_> {
         let bits = self.context.pointer_bits;
         let supported = |ty: &Type| match ty {
             Type::Int { bits: width, .. } => *width <= bits,
-            Type::Raw(..) | Type::Fn(..) => true,
+            Type::Raw(..) | Type::Fn(..) | Type::ExternFn(..) => true,
             _ => false,
         };
         let unsupported = |ty: &Type, at: Span| {

@@ -111,6 +111,12 @@ unsafe extern "C" fn make_fd(f: f32, d: f64) -> FD
 unsafe extern "C" fn identity_size(s: Size, p: Pair) -> Size
 unsafe extern "C" fn narrow_after(b: Bytes3, n: u8) -> u8
 unsafe extern "C" fn run_callbacks() -> i32
+unsafe extern "C" fn mixed_maker() -> extern "C" fn(i64, f64) -> Mixed
+unsafe extern "C" fn apply(
+    scale: extern "C" fn(Color, f64) -> Color,
+    shift: extern "C" fn(Region, Size) -> Region,
+    combine: extern "C" fn(Mixed, Tri) -> Vec2,
+) -> f64
 unsafe extern "C" fn c_failures() -> i32
 
 extern "C" fn dodo_scale_color(c: Color, k: f64) -> Color {
@@ -134,6 +140,13 @@ extern "C" fn dodo_crowded(a: i64, b: i64, c: i64, d: i64, e: i64, w: Wide, f: i
 extern "C" fn dodo_viewport(v: Viewport, r: Region) -> Viewport {
     total := (r.origin.w + r.origin.h + r.origin.d + r.size.w + r.size.h + r.size.d) as f64
     return Viewport { x: v.x + total, y: v.y, w: v.w, h: v.h, n: v.n, f: v.f + total }
+}
+
+extern "C" fn dodo_shift(r: Region, by: Size) -> Region {
+    return Region {
+        origin: Size { w: r.origin.w + by.w, h: r.origin.h + by.h, d: r.origin.d + by.d },
+        size: Size { w: r.size.w + by.w, h: r.size.h + by.h, d: r.size.d + by.d },
+    }
 }
 
 fn main() {
@@ -190,6 +203,17 @@ fn main() {
         core.assert_eq(same.w + same.h + same.d, 24u64)
         core.assert_eq(narrow_after(Bytes3 { a: 50, b: 0, c: 0 }, 200), 250u8)
         core.assert_eq(run_callbacks(), 0i32)
+        // Calls through C function pointers: to C, and to Dodo definitions.
+        maker := mixed_maker()
+        made := maker(-7, 0.5)
+        core.assert_eq(made.a, -7i64)
+        core.assert_eq(made.b, 0.5)
+        take := take_size
+        core.assert_eq(take(Size { w: 1, h: 2, d: 3 }), 123u64)
+        shift := dodo_shift
+        moved := shift(Region { origin: Size { w: 1, h: 1, d: 1 }, size: Size { w: 2, h: 2, d: 2 } }, Size { w: 1, h: 2, d: 3 })
+        core.assert_eq(moved.size.d, 5u64)
+        core.assert_eq(apply(dodo_scale_color, dodo_shift, dodo_vec2), 2.0 + 22.0 + 3.0)
         core.assert_eq(c_failures(), 0i32)
     }
 }

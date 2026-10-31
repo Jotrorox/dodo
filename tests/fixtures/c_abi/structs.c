@@ -83,4 +83,14 @@ int32_t run_callbacks(void) {
     CHECK(vp.x == 22 && vp.f == 27);
     return failures;
 }
+/* C function pointers in both directions. */
+typedef Mixed (*MakeMixed)(int64_t, double);
+MakeMixed mixed_maker(void) { return make_mixed; }
+double apply(Color (*scale)(Color, double), Region (*shift)(Region, Size), Vec2 (*combine)(Mixed, Tri)) {
+    Color c = scale((Color){1, 2, 3, 4}, 2);
+    Region r = shift((Region){{1, 2, 3}, {4, 5, 6}}, (Size){10, 20, 30});
+    Vec2 v = combine((Mixed){1, 0.5}, (Tri){1, 1, 1});
+    CHECK(c.a == 8 && r.origin.w == 11 && r.size.d == 36 && v.x == 1.5f && v.y == 3);
+    return c.r + r.origin.h + v.y;
+}
 int32_t c_failures(void) { return failures; }

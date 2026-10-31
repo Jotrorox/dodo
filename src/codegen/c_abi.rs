@@ -68,25 +68,30 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         }
     }
     /// The lowering of a C signature, or None when every operand is direct.
-    pub(super) fn c_lowering(&self, f: &Function) -> Result<Option<Lowering<'ctx>>> {
+    /// `what` names the function or pointer type in diagnostics.
+    pub(super) fn c_lowering(
+        &self,
+        what: &str,
+        params: &[Type],
+        ret: &Type,
+    ) -> Result<Option<Lowering<'ctx>>> {
         let by_value = |ty: &Type| matches!(ty, Type::Named(_));
-        if !by_value(&f.ret) && !f.params.iter().any(|p| by_value(&p.ty)) {
+        if !by_value(ret) && !params.iter().any(by_value) {
             return Ok(None);
         }
         let abi = self.c_abi_kind();
         if abi == Abi::Other {
             let triple = self.module.get_triple();
             return Err(error(format!(
-                "`{}` passes a struct by value, which the C ABI of target `{}` does not support yet; pass a raw pointer instead",
-                f.name.rsplit('.').next().unwrap_or(&f.name),
+                "{what} passes a struct by value, which the C ABI of target `{}` does not support yet; pass a raw pointer instead",
                 triple.as_str().to_string_lossy()
             )));
         }
         // System V tracks the argument registers left, since a struct
         // either fits entirely or moves to the stack.
         let (mut integers, mut floats) = (6u32, 8u32);
-        let ret = if by_value(&f.ret) {
-            let pass = self.c_struct_pass(&f.ret, abi, true, &mut integers, &mut floats)?;
+        let ret = if by_value(ret) {
+            let pass = self.c_struct_pass(ret, abi, true, &mut integers, &mut floats)?;
             if matches!(pass, Pass::Indirect { .. }) {
                 integers -= 1;
             }
@@ -94,13 +99,13 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         } else {
             Pass::Direct
         };
-        let mut params = Vec::new();
-        for p in &f.params {
-            params.push(if by_value(&p.ty) {
-                self.c_struct_pass(&p.ty, abi, false, &mut integers, &mut floats)?
+        let mut passes = Vec::new();
+        for ty in params {
+            passes.push(if by_value(ty) {
+                self.c_struct_pass(ty, abi, false, &mut integers, &mut floats)?
             } else {
                 if abi == Abi::SysV {
-                    let (needed_integers, needed_floats) = match &p.ty {
+                    let (needed_integers, needed_floats) = match ty {
                         Type::Float(_) => (0, 1),
                         Type::Int { bits: 128, .. } => (2, 0),
                         _ => (1, 0),
@@ -113,7 +118,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 Pass::Direct
             });
         }
-        Ok(Some(Lowering { ret, params }))
+        Ok(Some(Lowering {
+            ret,
+            params: passes,
+        }))
     }
     fn c_struct_pass(
         &self,
@@ -247,7 +255,8 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     /// The IR function type of a lowered C signature.
     pub(super) fn c_fn_type(
         &self,
-        f: &Function,
+        types: &[Type],
+        ret: &Type,
         lowering: &Lowering<'ctx>,
     ) -> Result<LlvmType<'ctx>> {
         let pointer = self.context.ptr_type(0);
@@ -255,16 +264,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if matches!(lowering.ret, Pass::Indirect { .. }) {
             params.push(pointer);
         }
-        for (p, pass) in f.params.iter().zip(&lowering.params) {
+        for (ty, pass) in types.iter().zip(&lowering.params) {
             match pass {
-                Pass::Direct => params.push(self.ty(&p.ty)?),
+                Pass::Direct => params.push(self.ty(ty)?),
                 Pass::Coerce(pieces) => params.extend(pieces),
                 Pass::Indirect { .. } => params.push(pointer),
             }
         }
         let ret = match &lowering.ret {
-            Pass::Direct if f.ret == Type::Void => self.context.void_type(),
-            Pass::Direct => self.ty(&f.ret)?,
+            Pass::Direct if *ret == Type::Void => self.context.void_type(),
+            Pass::Direct => self.ty(ret)?,
             Pass::Coerce(pieces) => self.coerced_type(pieces),
             Pass::Indirect { .. } => self.context.void_type(),
         };
@@ -296,13 +305,14 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     /// `sret`, `byval` and `align` attributes of a lowered C signature.
     pub(super) fn c_lowering_attributes(
         &self,
-        f: &Function,
+        params: &[Type],
+        ret: &Type,
         lowering: &Lowering<'ctx>,
     ) -> Result<Vec<(AttributeLoc, Attribute<'ctx>)>> {
         let mut attributes = Vec::new();
         let kind = Attribute::get_named_enum_kind_id;
         if matches!(lowering.ret, Pass::Indirect { .. }) {
-            let ty = self.ty(&f.ret)?;
+            let ty = self.ty(ret)?;
             let align = self.data.get_abi_alignment(&ty);
             attributes.push((
                 AttributeLoc::Param(0),
@@ -315,12 +325,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             ));
         }
         let indices = Self::c_operand_indices(lowering);
-        for ((p, pass), index) in f.params.iter().zip(&lowering.params).zip(indices) {
+        for ((ty, pass), index) in params.iter().zip(&lowering.params).zip(indices) {
             if let Pass::Indirect { byval: Some(align) } = pass {
                 attributes.push((
                     AttributeLoc::Param(index),
                     self.context
-                        .create_type_attribute(kind("byval"), self.ty(&p.ty)?),
+                        .create_type_attribute(kind("byval"), self.ty(ty)?),
                 ));
                 attributes.push((
                     AttributeLoc::Param(index),
@@ -427,45 +437,39 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.builder.build_return(Some(&result))?;
         Ok(())
     }
-    /// A call to a C function that passes or returns structs by value.
+    /// A call with the C convention to `callee` of IR type `fn_type`: a
+    /// declaration, one bound under another signature with `@link_name`, or
+    /// a C function pointer.
     pub(super) fn c_call(
         &mut self,
-        name: &str,
-        function: Value<'ctx>,
-        lowering: &Lowering<'ctx>,
+        callee: Value<'ctx>,
+        fn_type: LlvmType<'ctx>,
+        (params, ret): (&[Type], &Type),
+        lowering: Option<&Lowering<'ctx>>,
         args: &[Expr],
-        ret: &Type,
     ) -> Result<Value<'ctx>> {
-        let storage = match lowering.ret {
-            Pass::Indirect { .. } => Some(self.alloca(self.ty(ret)?, "call.result")?),
+        let direct = Pass::Direct;
+        let pass = |index: usize| lowering.map_or(&direct, |l| &l.params[index]);
+        let storage = match lowering.map(|l| &l.ret) {
+            Some(Pass::Indirect { .. }) => Some(self.alloca(self.ty(ret)?, "call.result")?),
             _ => None,
         };
         let mut pending = Vec::new();
         let mut operands: Vec<Value<'ctx>> = storage.into_iter().collect();
-        for (e, pass) in args.iter().zip(&lowering.params) {
+        for (index, e) in args.iter().enumerate() {
             let value = self.stage(e, &mut pending)?;
-            operands.extend(self.c_argument(value, &e.ty, pass)?);
+            operands.extend(self.c_argument(value, &params[index], pass(index))?);
         }
         self.transfer(&pending)?;
-        // A @link_name declaration may bind the symbol with its own signature.
-        let call = match self.foreign_signatures.get(name) {
-            Some(&ty) => self
-                .builder
-                .build_indirect_call(ty, function, &operands, "call")?,
-            None => self.builder.build_call(function, &operands, "call")?,
-        };
-        let declaration = self
-            .program
-            .functions
-            .iter()
-            .find(|f| f.name == name && f.extern_)
-            .ok_or_else(|| error(format!("unknown C function {name}")))?;
-        for (location, attribute) in self.c_abi_attributes(declaration)? {
+        let call = self
+            .builder
+            .build_indirect_call(fn_type, callee, &operands, "call")?;
+        for (location, attribute) in self.c_signature_attributes(params, ret, lowering)? {
             call.add_attribute(location, attribute);
         }
-        match (&lowering.ret, storage) {
+        match (lowering.map(|l| &l.ret), storage) {
             (_, Some(storage)) => self.load(storage, ret),
-            (Pass::Coerce(pieces), _) => self.c_result(call, ret, pieces),
+            (Some(Pass::Coerce(pieces)), _) => self.c_result(call, ret, pieces),
             _ if *ret == Type::Void => Ok(self.context.i8_type().const_zero()),
             _ => Ok(call),
         }

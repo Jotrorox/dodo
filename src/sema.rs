@@ -298,6 +298,8 @@ struct Context {
     constants: HashMap<String, Constant>,
     pointer_bits: u32,
     imports: HashSet<String>,
+    /// Types with a `drop` method, known before signatures are collected.
+    destructors: HashSet<String>,
 }
 impl Context {
     fn new(program: &Program, pointer_bits: u32) -> Check<Self> {
@@ -310,6 +312,11 @@ impl Context {
             constants: HashMap::new(),
             pointer_bits,
             imports: program.imports.iter().cloned().collect(),
+            destructors: program
+                .functions
+                .iter()
+                .filter_map(|f| f.name.strip_suffix(".drop").map(str::to_owned))
+                .collect(),
         };
         let mut names = HashSet::new();
         for declaration in &program.structs {
@@ -624,6 +631,14 @@ impl Context {
                 }
                 self.validate_type(ret, span, true)
             }
+            Type::ExternFn(params, ret) => {
+                for param in params {
+                    self.validate_type(param, span, false)?;
+                    self.ffi_type(param, span)?;
+                }
+                self.validate_type(ret, span, true)?;
+                self.ffi_type(ret, span)
+            }
             Type::Dyn(name) => Err(Diagnostic::new(
                 span,
                 format!("`dyn {name}` has no fixed size; use it behind a reference"),
@@ -646,7 +661,12 @@ impl Context {
     }
     fn ffi_type(&self, ty: &Type, span: Span) -> Check<()> {
         match ty {
-            Type::Void | Type::Bool | Type::Int { .. } | Type::Float(_) | Type::Raw(..) => Ok(()),
+            Type::Void
+            | Type::Bool
+            | Type::Int { .. }
+            | Type::Float(_)
+            | Type::Raw(..)
+            | Type::ExternFn(..) => Ok(()),
             Type::Named(name) if self.structs.contains_key(name) => {
                 self.c_struct(name, span, &mut Vec::new())
             }
@@ -655,7 +675,7 @@ impl Context {
                 format!("C ABI parameters and results cannot have type `{ty}`"),
             )
             .note(
-                "use a primitive, a raw pointer or a @repr(C) struct; pass other aggregates through a raw pointer",
+                "use a primitive, a raw pointer, an `extern \"C\" fn` or a @repr(C) struct; pass other aggregates through a raw pointer",
             )),
         }
     }
@@ -679,7 +699,9 @@ impl Context {
         if declaration.fields.is_empty() {
             return reject("C structs need at least one field".into(), path);
         }
-        if self.has_drop(&Type::Named(name.into())) {
+        // Fields are C types, so recursion finds destructors of nested
+        // structs. Signatures may be checked before every one is known.
+        if self.destructors.contains(name) {
             return reject("C code cannot run its destructor".into(), path);
         }
         if declaration.interior_mutable {
@@ -694,7 +716,11 @@ impl Context {
                 ty = element;
             }
             match ty {
-                Type::Bool | Type::Int { .. } | Type::Float(_) | Type::Raw(..) => {}
+                Type::Bool
+                | Type::Int { .. }
+                | Type::Float(_)
+                | Type::Raw(..)
+                | Type::ExternFn(..) => {}
                 Type::Named(inner) if self.structs.contains_key(inner) => {
                     path.push(field.name.clone());
                     self.c_struct(inner, span, path)?;
@@ -867,7 +893,12 @@ impl Context {
     fn thread_safe(&self, ty: &Type, sharing: bool, seen: &mut HashSet<String>) -> bool {
         match ty {
             // Function pointers carry code addresses and no captured state.
-            Type::Void | Type::Bool | Type::Int { .. } | Type::Float(_) | Type::Fn(..) => true,
+            Type::Void
+            | Type::Bool
+            | Type::Int { .. }
+            | Type::Float(_)
+            | Type::Fn(..)
+            | Type::ExternFn(..) => true,
             Type::Array(_, t) | Type::Option(t) => self.thread_safe(t, sharing, seen),
             Type::Result(t, e) => {
                 self.thread_safe(t, sharing, seen) && self.thread_safe(e, sharing, seen)
@@ -2186,6 +2217,22 @@ impl<'a> Checker<'a> {
                 {
                     self.unsafe_required(span, "raw pointer conversion")?;
                     Value { ty: target.clone() }
+                } else if matches!(value.ty, Type::Raw(..) | Type::ExternFn(..))
+                    && matches!(target, Type::ExternFn(..))
+                    || matches!(value.ty, Type::ExternFn(..)) && matches!(target, Type::Raw(..))
+                    || *target == Type::usize() && matches!(value.ty, Type::ExternFn(..))
+                    || value.ty == Type::usize() && matches!(target, Type::ExternFn(..))
+                {
+                    // A C function pointer is a code address: the caller
+                    // vouches for its signature, as with `dlsym`.
+                    self.unsafe_required(span, "C function pointer conversion")?;
+                    Value { ty: target.clone() }
+                } else if matches!(value.ty, Type::Fn(..)) && matches!(target, Type::ExternFn(..)) {
+                    return Err(Diagnostic::new(
+                        span,
+                        format!("cannot cast `{}` to `{target}`: Dodo functions do not use the C calling convention", value.ty),
+                    )
+                    .note("declare the callback as `extern \"C\" fn name(..) { .. }` and use its name"));
                 } else if matches!(&value.ty, Type::Ref(..)) && matches!(target, Type::Raw(..)) {
                     if matches!(
                         (&value.ty, &*target),
@@ -2457,10 +2504,13 @@ impl<'a> Checker<'a> {
                 .or_else(|| self.context.constants.get(n).map(|c| c.ty.clone()))
                 .or_else(|| {
                     self.context.functions.get(n).map(|f| {
-                        Type::Fn(
-                            f.params.iter().map(|p| p.ty.clone()).collect(),
-                            Box::new(f.ret.clone()),
-                        )
+                        let params = f.params.iter().map(|p| p.ty.clone()).collect();
+                        let ret = Box::new(f.ret.clone());
+                        if f.extern_ {
+                            Type::ExternFn(params, ret)
+                        } else {
+                            Type::Fn(params, ret)
+                        }
                     })
                 }),
             ExprKind::Closure(_) => None,
@@ -4431,7 +4481,10 @@ fn validate_constant(expression: &Expr, bits: u32) -> Check<()> {
         ExprKind::String(..) => (),
         // Named functions are link-time constant code addresses.
         ExprKind::Name(_) | ExprKind::Closure(_)
-            if matches!(expression.ty, Type::Fn(..) | Type::Option(_)) => {}
+            if matches!(
+                expression.ty,
+                Type::Fn(..) | Type::ExternFn(..) | Type::Option(_)
+            ) => {}
         ExprKind::Cast(e, Type::Ref(_, target)) if matches!(target.as_ref(), Type::DynFn(..)) => {
             validate_constant(e, bits)?
         }
@@ -4521,7 +4574,7 @@ fn constant_expression(expression: &Expr) -> bool {
         ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::String(..) => true,
         ExprKind::Name(name) => {
             name == "none" && matches!(expression.ty, Type::Option(_))
-                || matches!(expression.ty, Type::Fn(..))
+                || matches!(expression.ty, Type::Fn(..) | Type::ExternFn(..))
         }
         // A closure without captures is a function pointer.
         ExprKind::Closure(_) => matches!(expression.ty, Type::Fn(..)),

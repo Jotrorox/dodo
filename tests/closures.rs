@@ -518,7 +518,7 @@ fn function_values_are_checked_where_used() {
     );
     rejects(
         "unsafe fn danger() {}\nfn main() {\n    f := danger\n}",
-        &["unsafe or foreign function `danger` cannot be used as a function value"],
+        &["unsafe function `danger` cannot be used as a function value"],
     );
     rejects(
         "fn id<T>(v: T) -> T { v }\nfn main() {\n    f := id\n}",

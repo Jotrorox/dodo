@@ -1233,7 +1233,7 @@ impl Names<'_> {
                 self.scoped_ty(ok, locals, generics);
                 self.scoped_ty(error, locals, generics);
             }
-            Type::Fn(params, ret) | Type::DynFn(params, ret) => {
+            Type::Fn(params, ret) | Type::DynFn(params, ret) | Type::ExternFn(params, ret) => {
                 for ty in params {
                     self.scoped_ty(ty, locals, generics);
                 }

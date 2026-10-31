@@ -7,6 +7,15 @@
   signatures. Each call uses its own declaration's signature, so Objective-C
   bindings can declare one `objc_msgSend` per method signature. Without
   `@link_name`, clashing signatures for one symbol are still an error.
+- `extern "C" fn(A) -> R` is a C function pointer type, for code that uses the
+  platform C calling convention: pointers from `dlsym`, `GetProcAddress` or
+  `vkGetInstanceProcAddr`, COM method tables, and callbacks passed to C. An
+  `extern "C"` function used as a value now has this type instead of being
+  rejected. Calls through one need `unsafe` and follow the C convention,
+  including narrow-integer extension, and unsafe `as` converts between C
+  function pointers, raw pointers and `usize`. The type never converts to or
+  from Dodo's `fn(..)` and closure types, which keep their internal ABI. C
+  declarations may take and return C function pointers.
 - `extern "C"` functions pass and return `@repr(C)` structs by value, both
   when Dodo calls C and when C calls a Dodo `extern "C" fn`. The compiler
   classifies each struct as the target's C compiler does for x86-64 System V

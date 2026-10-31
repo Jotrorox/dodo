@@ -138,6 +138,10 @@ pub enum Type {
     /// has no fixed size, so it only appears behind a reference: `&dyn fn(..)`
     /// and `&mut dyn fn(..)` pair code with a borrowed environment.
     DynFn(Vec<Type>, Box<Type>),
+    /// `extern "C" fn(A, B) -> R`: the address of code using the platform C
+    /// calling convention, such as a pointer `dlsym`, `vkGetInstanceProcAddr`
+    /// or a COM vtable supplies. Calling one is unsafe.
+    ExternFn(Vec<Type>, Box<Type>),
 }
 impl Type {
     pub fn isize() -> Self {
@@ -176,6 +180,7 @@ impl Type {
                 | Self::Slice(false, _)
                 | Self::Raw(..)
                 | Self::Fn(..)
+                | Self::ExternFn(..)
         )
     }
     /// The signature of a closure reference `&dyn fn(..)` or `&mut dyn fn(..)`.
@@ -198,10 +203,11 @@ impl Type {
             _ => self.callable_signature(),
         }
     }
-    /// The signature of any callable value: a function pointer or a closure reference.
+    /// The signature of any callable value: a function pointer, a C function
+    /// pointer or a closure reference.
     pub fn callable_signature(&self) -> Option<(&[Type], &Type)> {
         match self {
-            Self::Fn(params, ret) => Some((params, ret)),
+            Self::Fn(params, ret) | Self::ExternFn(params, ret) => Some((params, ret)),
             _ => self.closure_signature().map(|(_, p, r)| (p, r)),
         }
     }
@@ -262,9 +268,12 @@ impl std::fmt::Display for Type {
             Self::Option(t) => write!(f, "Option<{t}>"),
             Self::MaybeUninit(t) => write!(f, "MaybeUninit<{t}>"),
             Self::Dyn(n) => write!(f, "dyn {n}"),
-            Self::Fn(params, ret) | Self::DynFn(params, ret) => {
+            Self::Fn(params, ret) | Self::DynFn(params, ret) | Self::ExternFn(params, ret) => {
                 if matches!(self, Self::DynFn(..)) {
                     write!(f, "dyn ")?;
+                }
+                if matches!(self, Self::ExternFn(..)) {
+                    write!(f, "extern \"C\" ")?;
                 }
                 write!(f, "fn(")?;
                 for (i, t) in params.iter().enumerate() {

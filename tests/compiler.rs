@@ -1229,6 +1229,62 @@ fn unsafe_function_body_still_needs_an_explicit_block() {
 }
 
 #[test]
+fn c_function_pointers_keep_the_c_abi_separate_and_unsafe() {
+    for (source, message) in [
+        (
+            "package bad\nunsafe extern \"C\" fn abs(v: i32) -> i32\nfn main() { f := abs\nx := f(1) }\n",
+            "calling through a C function pointer requires an explicit unsafe block",
+        ),
+        (
+            "package bad\nfn main() { p := 0 as *const u8\nf := p as extern \"C\" fn() }\n",
+            "requires an explicit unsafe block",
+        ),
+        (
+            "package bad\nfn main() { x := 1usize\nf := x as extern \"C\" fn() }\n",
+            "C function pointer conversion requires an explicit unsafe block",
+        ),
+        (
+            "package bad\nfn main() { f: extern \"C\" fn(i32) -> i32 = fn(v: i32) -> i32 { v } }\n",
+            "a closure cannot be a C function pointer",
+        ),
+        (
+            "package bad\nfn g(v: i32) -> i32 { v }\nfn main() { f := unsafe { g as extern \"C\" fn(i32) -> i32 } }\n",
+            "Dodo functions do not use the C calling convention",
+        ),
+        (
+            "package bad\nfn g(v: i32) -> i32 { v }\nfn main() { f: extern \"C\" fn(i32) -> i32 = g }\n",
+            "expected `extern \"C\" fn(i32) -> i32`, found `fn(i32) -> i32`",
+        ),
+        (
+            "package bad\nunsafe extern \"C\" fn abs(v: i32) -> i32\nfn main() { f: fn(i32) -> i32 = abs }\n",
+            "expected `fn(i32) -> i32`, found `extern \"C\" fn(i32) -> i32`",
+        ),
+        (
+            "package bad\nunsafe extern \"C\" fn abs(v: i32) -> i32\nfn take(f: &dyn fn(i32) -> i32) {}\nfn main() { take(abs) }\n",
+            "found `extern \"C\" fn(i32) -> i32`",
+        ),
+        (
+            "package bad\nstruct P { x: i32 }\nstruct T { f: extern \"C\" fn(P) -> i32 }\n",
+            "struct `P` cannot cross the C ABI by value: it is not declared @repr(C)",
+        ),
+        (
+            "package bad\nstruct T { f: extern \"C\" fn() -> &str }\n",
+            "C ABI parameters and results",
+        ),
+        (
+            "package bad\nstruct T { f: extern \"Rust\" fn() }\n",
+            "only the `extern \"C\"` ABI is supported",
+        ),
+        (
+            "package bad\nstruct T { f: extern \"C\" i32 }\n",
+            "expected `fn` after `extern \"C\"` in a type",
+        ),
+    ] {
+        rejects(source, message);
+    }
+}
+
+#[test]
 fn rejects_invalid_types_returns_visibility_and_matches() {
     for (source, message) in [
         ("package bad\nfn missing() { return 1 }\n", "expected"),

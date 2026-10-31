@@ -416,7 +416,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             Type::Ref(_, t) if matches!(t.as_ref(), Type::Dyn(_) | Type::DynFn(..)) => self
                 .context
                 .struct_type(&[self.context.ptr_type(0), self.context.ptr_type(0)], false),
-            Type::Ref(..) | Type::Raw(..) | Type::Fn(..) => self.context.ptr_type(0),
+            Type::Ref(..) | Type::Raw(..) | Type::Fn(..) | Type::ExternFn(..) => {
+                self.context.ptr_type(0)
+            }
             Type::Slice(..) | Type::Str => self
                 .context
                 .struct_type(&[self.context.ptr_type(0), self.usize_type()], false),
@@ -632,9 +634,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     self.ty(&p.ty)?
                 });
             }
-            let lowering = if f.extern_ { self.c_lowering(f)? } else { None };
+            let types: Vec<Type> = f.params.iter().map(|p| p.ty.clone()).collect();
+            let lowering = if f.extern_ {
+                let short = f.name.rsplit('.').next().unwrap_or(&f.name);
+                self.c_lowering(&format!("`{short}`"), &types, &f.ret)?
+            } else {
+                None
+            };
             let ty = if let Some(lowering) = &lowering {
-                self.c_fn_type(f, lowering)?
+                self.c_fn_type(&types, &f.ret, lowering)?
             } else if f.ret == Type::Void || indirect_return {
                 self.context.void_type().fn_type(&params, false)
             } else {
@@ -783,14 +791,24 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         &self,
         function: &Function,
     ) -> Result<Vec<(AttributeLoc, Attribute<'ctx>)>> {
-        let lowering = self.c_abi.get(&function.name);
+        let params: Vec<Type> = function.params.iter().map(|p| p.ty.clone()).collect();
+        self.c_signature_attributes(&params, &function.ret, self.c_abi.get(&function.name))
+    }
+    /// Struct-passing and narrow-integer extension attributes of a C
+    /// signature, at the IR operand positions of its lowering.
+    fn c_signature_attributes(
+        &self,
+        params: &[Type],
+        ret: &Type,
+        lowering: Option<&c_abi::Lowering<'ctx>>,
+    ) -> Result<Vec<(AttributeLoc, Attribute<'ctx>)>> {
         let mut attributes = match lowering {
-            Some(lowering) => self.c_lowering_attributes(function, lowering)?,
+            Some(lowering) => self.c_lowering_attributes(params, ret, lowering)?,
             None => Vec::new(),
         };
         let indices = match lowering {
             Some(lowering) => Self::c_operand_indices(lowering),
-            None => (0..function.params.len() as u32).collect(),
+            None => (0..params.len() as u32).collect(),
         };
         let triple = self.module.get_triple();
         let triple = triple.as_str().to_string_lossy();
@@ -806,13 +824,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         if !(x86 || apple_arm64) || triple.contains("windows") {
             return Ok(attributes);
         }
-        let extensions = std::iter::once((AttributeLoc::Return, &function.ret))
+        let extensions = std::iter::once((AttributeLoc::Return, ret))
             .chain(
-                function
-                    .params
+                params
                     .iter()
                     .zip(indices)
-                    .map(|(p, i)| (AttributeLoc::Param(i), &p.ty)),
+                    .map(|(ty, i)| (AttributeLoc::Param(i), ty)),
             )
             .filter_map(|(location, ty)| {
                 let name = match ty {
@@ -876,7 +893,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
     fn constant(&mut self, e: &Expr) -> Result<Value<'ctx>> {
         match &e.kind {
             ExprKind::String(bytes, _) => Ok(self.string_literal(bytes)),
-            ExprKind::Name(n) if matches!(e.ty, Type::Fn(..)) && self.functions.contains_key(n) => {
+            ExprKind::Name(n)
+                if matches!(e.ty, Type::Fn(..) | Type::ExternFn(..))
+                    && self.functions.contains_key(n) =>
+            {
                 self.fn_pointer(n)
             }
             ExprKind::Name(n) if n == "none" => Ok(self.ty(&e.ty)?.const_zero()),
@@ -2673,6 +2693,15 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 Ok(out)
             }
             (Type::Raw(..) | Type::Ref(..), Type::Raw(..) | Type::Ref(..)) => Ok(v),
+            (Type::Raw(..) | Type::ExternFn(..), Type::Raw(..) | Type::ExternFn(..)) => Ok(v),
+            (Type::Int { .. }, Type::ExternFn(..)) => {
+                Ok(self
+                    .builder
+                    .build_int_to_ptr(v, self.context.ptr_type(0), "code")?)
+            }
+            (Type::ExternFn(..), Type::Int { .. }) => {
+                Ok(self.builder.build_ptr_to_int(v, self.ty(to)?, "address")?)
+            }
             (Type::Int { .. }, Type::Raw(..)) => {
                 Ok(self
                     .builder
@@ -3502,7 +3531,20 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .copied()
             .ok_or_else(|| error(format!("unknown function {name}")))?;
         if let Some(lowering) = self.c_abi.get(name).cloned() {
-            return self.c_call(name, f, &lowering, args, ret);
+            // A @link_name declaration may bind the symbol with its own signature.
+            let fn_type = self
+                .foreign_signatures
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| f.get_type());
+            let params: Vec<Type> = self
+                .program
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .map(|function| function.params.iter().map(|p| p.ty.clone()).collect())
+                .unwrap_or_default();
+            return self.c_call(f, fn_type, (&params, ret), Some(&lowering), args);
         }
         let (indirect_return, indirect_params) = self.indirect[name].clone();
         let storage = if indirect_return {

@@ -59,6 +59,23 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
         self.builder
             .build_insert_value(value, environment, 1, "closure.environment")
     }
+    /// A call through an `extern "C" fn` pointer, lowered like a call to a
+    /// C declaration with the pointer type's signature.
+    fn invoke_c(
+        &mut self,
+        code: Value<'ctx>,
+        params: &[Type],
+        args: &[Expr],
+        ret: &Type,
+    ) -> Result<Value<'ctx>> {
+        let what = Type::ExternFn(params.to_vec(), Box::new(ret.clone()));
+        let lowering = self.c_lowering(&format!("`{what}`"), params, ret)?;
+        let fn_type = match &lowering {
+            Some(lowering) => self.c_fn_type(params, ret, lowering)?,
+            None => self.value_fn_type(params, ret, false)?,
+        };
+        self.c_call(code, fn_type, (params, ret), lowering.as_ref(), args)
+    }
     /// The function-pointer entry point of a named function or closure body.
     /// Functions already using the value convention are their own entry point.
     pub(super) fn fn_pointer(&mut self, name: &str) -> Result<Value<'ctx>> {
@@ -71,6 +88,11 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .iter()
             .find(|f| f.name == name)
             .ok_or_else(|| error(format!("unknown function value {name}")))?;
+        if function.extern_ {
+            let target = self.functions[name];
+            self.fn_pointers.insert(name.to_owned(), target);
+            return Ok(target);
+        }
         let captures = function.environment.unwrap_or(0);
         let params: Vec<Type> = function.params[captures..]
             .iter()
@@ -217,6 +239,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
             .callable_signature()
             .ok_or_else(|| error(format!("cannot call a value of type {}", callee.ty)))?;
         let params = params.to_vec();
+        if matches!(callee.ty, Type::ExternFn(..)) {
+            return self.invoke_c(value, &params, args, ret);
+        }
         let closure = callee.ty.closure_signature().is_some();
         let (indirect_return, indirect_params) = self.value_convention(&params, ret)?;
         let storage = if indirect_return {
