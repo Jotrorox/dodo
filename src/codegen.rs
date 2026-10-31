@@ -594,6 +594,9 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     ty,
                     Some(LLVMInternalLinkage),
                 );
+                // The environment pointer follows the optional result slot.
+                let first = u32::from(convention.0) + 1;
+                self.mark_exclusive_params(function, &params, first, &convention.1);
                 self.indirect.insert(f.name.clone(), convention);
                 self.functions.insert(f.name.clone(), function);
                 continue;
@@ -682,6 +685,12 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     function.add_attribute(location, attribute);
                 }
             }
+            if dodo_abi {
+                let params: Vec<Type> = f.params.iter().map(|p| p.ty.clone()).collect();
+                let first = u32::from(indirect_return);
+                let indirect = &self.indirect[&f.name].1;
+                self.mark_exclusive_params(function, &params, first, indirect);
+            }
             if f.interrupt.is_some() && self.riscv_bare_metal() {
                 // Save every register the handler uses and return with `mret`.
                 function.add_attribute(
@@ -765,6 +774,38 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 if let Some(uwtable) = uwtable.filter(|_| function.count_basic_blocks() != 0) {
                     function.add_attribute(AttributeLoc::Function, uwtable);
                 }
+            }
+        }
+    }
+    /// Mark `&mut T` parameters `noalias`, as Rust does for `&mut`. For the
+    /// duration of the call nothing else accesses the referenced storage:
+    /// the flow checker rejects any overlapping loan while an exclusive one
+    /// is live, mutable statics and raw-pointer reborrows are unsafe, and
+    /// PTR-ALIAS forbids unsafe code from reaching exclusively borrowed
+    /// storage by an independent route. Without this, LLVM must assume every
+    /// store through a pointer loaded from `self` (such as the elements of a
+    /// slice field) may overwrite `*self`, reloading the slice and repeating
+    /// its bounds check on each iteration of the loop.
+    ///
+    /// Only Dodo-convention functions qualify: a C caller makes no such
+    /// promise. `&mut dyn` pairs are aggregates LLVM cannot annotate, and
+    /// mutable slices pass as `{ptr, len}` values, whose element pointer is
+    /// not reloaded from memory in the first place.
+    fn mark_exclusive_params(
+        &self,
+        function: Value<'ctx>,
+        params: &[Type],
+        first: u32,
+        indirect: &[bool],
+    ) {
+        let noalias = self
+            .context
+            .create_enum_attribute(Attribute::get_named_enum_kind_id("noalias"), 0);
+        for (index, (ty, indirect)) in params.iter().zip(indirect).enumerate() {
+            let exclusive = matches!(ty, Type::Ref(true, inner)
+                if !matches!(inner.as_ref(), Type::Dyn(_) | Type::DynFn(..)));
+            if exclusive && !indirect {
+                function.add_attribute(AttributeLoc::Param(first + index as u32), noalias);
             }
         }
     }

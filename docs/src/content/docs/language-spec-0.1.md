@@ -1307,9 +1307,13 @@ storage must not be mutated or invalidated except through the specified atomic
 storage primitives of section 15.5, and exclusively borrowed storage
 must not be accessed through an independent route while that loan is live.
 Access through a pointer derived from the active exclusive reference is allowed
-with its permissions and reborrow restrictions. Raw pointer casts cannot upgrade
-read-only storage or a shared loan to writable storage. Concurrent conflicting
-non-atomic accesses are invalid; volatile is not a synchronization exception.
+with its permissions and reborrow restrictions. An exclusive reference passed as
+a function argument keeps its loan live until the call returns, even after the
+callee's last use of it, and implementations may optimize on that, as Dodo's
+LLVM backend does by marking such parameters `noalias`. Raw pointer casts
+cannot upgrade read-only storage or a shared loan to writable storage.
+Concurrent conflicting non-atomic accesses are invalid; volatile is not a
+synchronization exception.
 These are runtime obligations even where the compiler accepts the unsafe code.
 
 ### 14.2. Casts, addresses, and offsets
