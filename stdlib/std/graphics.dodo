@@ -1799,46 +1799,193 @@ pub struct Canvas {
         if left >= right || top >= bottom {
             return
         }
-        opaque := !shaded && (color >> 24) == 255
-        packed := encode(&self.format, color)
+        ink := Ink { color: color, packed: encode(&self.format, color), opaque: !shaded && (color >> 24) == 255, shaded: shaded, even_odd: even_odd }
+        // Flatten the outline once per band of rows. A band starts as every
+        // visible row, is halved while its edges do not fit in the pen, and
+        // doubles again after one that fits.
+        height := bottom - top
+        row := top
+        for row < bottom {
+            band := min64(height, bottom - row)
+            pen.collect(row, row + band, left, right)
+            outline.trace(&mut pen)
+            pen.close()
+            if !pen.overflow {
+                self.sweep(&mut pen, row, row + band, left, right, &ink, gradient)
+                row += band
+                height = band * 2
+            } else if band > 1 {
+                height = band / 2
+            } else {
+                self.dense_row(outline, &mut pen, row, left, right, &ink, gradient)
+                row += 1
+            }
+        }
+    }
+    // Rasterize rows top..bottom, columns left..right, from the edges `pen`
+    // collected. Each row resolves coverage only in the columns its edges
+    // touch; between them coverage is constant, so whole spans are filled
+    // (or skipped) at once.
+    fn sweep(&mut self, pen: &mut Pen, top: i64, bottom: i64, left: i64, right: i64, ink: &Ink, gradient: &Gradient) {
+        pen.sort_edges()
         for row in top..bottom {
+            pen.advance(row)
+            count := pen.active_count
             // A solid fill's walk is constant: `unused` has no extent.
             walk := gradient.walk(left, row)
-            start := left
-            for start < right {
-                end := min64(start + CHUNK as i64, right)
-                pen.begin(row, start, end)
-                outline.trace(&mut pen)
-                pen.close()
-                // Resolve the pass: running sums of the cells are coverage.
-                sum := pen.carry
-                written_left := end
-                written_right := start
-                for column in start..end {
-                    index := (column - start) as usize
-                    sum += pen.cells[index]
-                    pen.cells[index] = 0
-                    level := coverage_level(sum, even_odd)
-                    if level > 0 {
-                        if level == 255 && opaque {
-                            self.put(column, row, packed)
-                        } else if shaded {
-                            sampled := gradient.walk_color(&mut walk)
-                            paint := gradient.dithered(sampled, column, row, &self.format)
-                            self.paint_pixel(column, row, paint, level)
-                        } else {
-                            self.paint_pixel(column, row, color, level)
-                        }
-                        written_left = min64(written_left, column)
-                        written_right = max64(written_right, column + 1)
-                    }
-                    if shaded {
-                        gradient.advance(&mut walk)
-                    }
+            // Edges wholly left of the visible columns add only their winding.
+            sum := 0i64
+            for i in 0usize..count {
+                if ((pen.span_left[i] as i64) >> 8) >= left {
+                    break
                 }
-                self.touch(written_left, row, written_right, row + 1)
-                start = end
+                if pen.passed(i, left) {
+                    sum += pen.span_rows[i] as i64 * 256
+                }
             }
+            x := left
+            i := 0usize
+            for i < count {
+                first := (pen.span_left[i] as i64) >> 8
+                if first >= right {
+                    break
+                }
+                if pen.passed(i, left) {
+                    i += 1
+                    continue
+                }
+                // A group of edges whose touched columns overlap or abut:
+                // edge k changes coverage in columns first..=last + 1.
+                low := max64(first, left)
+                high := min64(((pen.span_right[i] as i64) >> 8) + 1, right - 1)
+                j := i + 1
+                for j < count {
+                    next := (pen.span_left[j] as i64) >> 8
+                    if next >= right || max64(next, left) > high + 1 {
+                        break
+                    }
+                    if !pen.passed(j, left) {
+                        high = max64(high, min64(((pen.span_right[j] as i64) >> 8) + 1, right - 1))
+                    }
+                    j += 1
+                }
+                self.cover_span(x, low, row, sum, ink, gradient, &mut walk)
+                sum = self.cover_group(pen, i, j, low, high, row, sum, left, ink, gradient, &mut walk)
+                x = high + 1
+                i = j
+            }
+            self.cover_span(x, right, row, sum, ink, gradient, &mut walk)
+        }
+    }
+    // Paint columns left..right of `row`, where the running coverage sum is
+    // constant.
+    fn cover_span(&mut self, left: i64, right: i64, row: i64, sum: i64, ink: &Ink, gradient: &Gradient, walk: &mut Walk) {
+        if left >= right {
+            return
+        }
+        level := coverage_level(sum, ink.even_odd)
+        if level == 0 {
+            return
+        }
+        if level == 255 && ink.opaque {
+            ox := self.origin_x
+            oy := self.origin_y
+            self.run((left - ox) as usize, (right - ox) as usize, (row - oy) as usize, ink.packed)
+        } else {
+            for column in left..right {
+                self.paint(column, row, level, ink, gradient, walk)
+            }
+        }
+        self.touch(left, row, right, row + 1)
+    }
+    // Resolve columns low..=high of `row` from the active edges first..last
+    // (indexes into the pen's row order), starting from the coverage sum
+    // left of `low`. Returns the sum after `high`.
+    fn cover_group(&mut self, pen: &mut Pen, first: usize, last: usize, low: i64, high: i64, row: i64, sum: i64, left: i64, ink: &Ink, gradient: &Gradient, walk: &mut Walk) -> i64 {
+        running := sum
+        written_left := high + 1
+        written_right := low
+        start := low
+        for start <= high {
+            end := min64(start + CHUNK as i64, high + 1)
+            pen.column_start = start
+            pen.column_end = end
+            pen.carry = 0
+            for k in first..last {
+                if !pen.passed(k, left) {
+                    l := pen.span_left[k] as i64
+                    r := pen.span_right[k] as i64
+                    d := pen.span_rows[k] as i64
+                    pen.accumulate(l, r, d)
+                }
+            }
+            running = sum + pen.carry
+            for column in start..end {
+                index := (column - start) as usize
+                running += pen.cells[index]
+                pen.cells[index] = 0
+                // coverage_level(running, ink.even_odd), written out.
+                coverage := abs64(running)
+                if ink.even_odd {
+                    coverage = coverage % (2 * FULL)
+                    if coverage > FULL {
+                        coverage = 2 * FULL - coverage
+                    }
+                } else if coverage > FULL {
+                    coverage = FULL
+                }
+                level := ((coverage * 255 + 32768) >> 16) as u32
+                if level > 0 {
+                    self.paint(column, row, level, ink, gradient, walk)
+                    written_left = min64(written_left, column)
+                    written_right = max64(written_right, column + 1)
+                }
+            }
+            start = end
+        }
+        self.touch(written_left, row, written_right, row + 1)
+        return running
+    }
+    // Rasterize one row by tracing the outline again for every pass of
+    // CHUNK columns, for rows crossed by more edges than a pen collects.
+    fn dense_row<O: Outline>(&mut self, outline: &O, pen: &mut Pen, row: i64, left: i64, right: i64, ink: &Ink, gradient: &Gradient) {
+        walk := gradient.walk(left, row)
+        start := left
+        for start < right {
+            end := min64(start + CHUNK as i64, right)
+            pen.begin(row, start, end)
+            outline.trace(pen)
+            pen.close()
+            sum := pen.carry
+            written_left := end
+            written_right := start
+            for column in start..end {
+                index := (column - start) as usize
+                sum += pen.cells[index]
+                pen.cells[index] = 0
+                level := coverage_level(sum, ink.even_odd)
+                if level > 0 {
+                    self.paint(column, row, level, ink, gradient, &mut walk)
+                    written_left = min64(written_left, column)
+                    written_right = max64(written_right, column + 1)
+                }
+            }
+            self.touch(written_left, row, written_right, row + 1)
+            start = end
+        }
+    }
+    // Paint the in-bounds pixel (x, y) at coverage `level` (1 to 255).
+    // `walk` is the gradient's walk along row y; it moves to column x.
+    fn paint(&mut self, x: i64, y: i64, level: u32, ink: &Ink, gradient: &Gradient, walk: &mut Walk) {
+        if level == 255 && ink.opaque {
+            self.put(x, y, ink.packed)
+        } else if ink.shaded {
+            gradient.seek(walk, x, y)
+            sampled := gradient.walk_color(walk)
+            shade := gradient.dithered(sampled, x, y, &self.format)
+            self.paint_pixel(x, y, shade, level)
+        } else {
+            self.paint_pixel(x, y, ink.color, level)
         }
     }
 
@@ -1946,6 +2093,7 @@ pub struct Canvas {
                 level := mask[at] as u32
                 at += 1
                 if level != 0 {
+                    gradient.seek(&mut walk, column, row)
                     sampled := gradient.walk_color(&mut walk)
                     paint := gradient.dithered(sampled, column, row, &self.format)
                     self.paint_pixel(column, row, paint, level)
@@ -1954,7 +2102,6 @@ pub struct Canvas {
                     }
                     last = column + 1
                 }
-                gradient.advance(&mut walk)
             }
             if first < last {
                 written_left = min64(written_left, first)
@@ -2164,6 +2311,11 @@ pub struct Bands {
 // Curves are flattened to within 1/32 pixel. Antialiased and gradient drawing
 // composites over the existing pixels (source-over), unlike the integer
 // primitives above, which store their color.
+//
+// The cost follows the edges, not the bounding box. The outline is flattened
+// once into straight edges, and each row resolves coverage only in the
+// columns an edge touches; between edges coverage is constant, so interiors
+// are filled as spans and the inside of a ring or outline is skipped.
 
 // Path, Pen and Outline coordinates are fixed point with SUBPIXEL units to
 // the pixel: 256 is one pixel, 128 half a pixel. The pixel (x, y) covers
@@ -2173,13 +2325,22 @@ pub const SUBPIXEL: i32 = 256
 // Path coordinates are clamped to +/-2^29 subpixels (+/-2^21 pixels).
 const PATH_LIMIT: i64 = 536870912
 const AA_PIXEL_LIMIT: i64 = 2097152
-// Columns rasterized per pass; a wider shape takes several passes per row.
+// Columns resolved per pass; a wider run of edge columns takes several.
 const CHUNK: usize = 256
 // Coverage of a whole pixel in the accumulation buffer.
 const FULL: i64 = 65536
 // Largest distance between a curve and its flattened chords, in subpixels.
 const FLATNESS: i64 = 8
 const CURVE_STEPS: i64 = 256
+// Straight edges a Pen collects for one band of rows. An outline with more
+// edges crossing the visible rows is swept in several bands.
+const EDGES: usize = 256
+// The longest gap the rasterizer steps a gradient walk over; it starts a new
+// walk past a wider one.
+const WALK_STEPS: i64 = 16
+const PEN_MEASURE: u8 = 0
+const PEN_COLLECT: u8 = 1
+const PEN_DENSE: u8 = 2
 
 // Which parts of a self-overlapping outline are inside.
 pub enum FillRule {
@@ -2192,8 +2353,10 @@ pub enum FillRule {
 }
 
 // A shape that can describe itself to a Pen. The rasterizer calls trace
-// several times per drawing call, once to find the bounds and then once per
-// row band, so trace must describe the same outline every time. Implement it
+// several times per drawing call: once to find the bounds, then once per band
+// of rows (one band unless more than 256 edges cross the visible rows), and
+// once per 256 columns of a row crossed by more than 256 edges. trace must
+// describe the same outline every time. Implement it
 // to draw procedural shapes without storing them; a Path stores commands for
 // shapes built up front.
 pub interface Outline {
@@ -2203,19 +2366,45 @@ pub interface Outline {
 // Receives an outline as move, line, curve and close commands in subpixel
 // coordinates. Contours close themselves: move_to and the end of a trace
 // close an open contour with a straight line to its start.
+//
+// A pen works in one of three modes. Measuring finds the bounds from the
+// points and control points alone. Collecting flattens the outline once into
+// the straight edges that cross a band of rows, which the canvas then sweeps
+// row by row, computing coverage only next to edges. Dense rasterizes one
+// pass of one row straight into the cells; it is the fallback for a row
+// crossed by more edges than a band holds.
 pub struct Pen {
-    measuring: bool
+    mode: u8
     any: bool
     min_x: i64
     min_y: i64
     max_x: i64
     max_y: i64
+    // The rows (in subpixels) and columns the next trace rasterizes.
     row_top: i64
     row_bottom: i64
     column_start: i64
     column_end: i64
     carry: i64
     cells: [256]i64
+    // Collected edges, top end first, with `edge_down` set where the edge
+    // was traced downwards. `overflow` marks a band with more edges than fit.
+    edges: usize
+    overflow: bool
+    edge_top_x: [256]i32
+    edge_top_y: [256]i32
+    edge_bottom_x: [256]i32
+    edge_bottom_y: [256]i32
+    edge_down: [256]bool
+    // Sweep state: edge indexes by top, the edges crossing the current row
+    // ordered by their first column, and each one's extent on that row.
+    order: [256]u16
+    active: [256]u16
+    span_left: [256]i32
+    span_right: [256]i32
+    span_rows: [256]i32
+    next_edge: usize
+    active_count: usize
     start_x: i64
     start_y: i64
     x: i64
@@ -2223,21 +2412,156 @@ pub struct Pen {
     open: bool
 
     fn new() -> Pen {
-        return Pen { measuring: true, any: false, min_x: 0, min_y: 0, max_x: 0, max_y: 0, row_top: 0, row_bottom: 0, column_start: 0, column_end: 0, carry: 0, cells: [0i64; 256], start_x: 0, start_y: 0, x: 0, y: 0, open: false }
+        return Pen { mode: PEN_MEASURE, any: false, min_x: 0, min_y: 0, max_x: 0, max_y: 0, row_top: 0, row_bottom: 0, column_start: 0, column_end: 0, carry: 0, cells: [0i64; 256], edges: 0, overflow: false, edge_top_x: [0i32; 256], edge_top_y: [0i32; 256], edge_bottom_x: [0i32; 256], edge_bottom_y: [0i32; 256], edge_down: [false; 256], order: [0u16; 256], active: [0u16; 256], span_left: [0i32; 256], span_right: [0i32; 256], span_rows: [0i32; 256], next_edge: 0, active_count: 0, start_x: 0, start_y: 0, x: 0, y: 0, open: false }
     }
     // Rasterize the pixel row `row`, columns start..end, on the next trace.
     fn begin(&mut self, row: i64, start: i64, end: i64) {
-        self.measuring = false
+        self.mode = PEN_DENSE
         self.row_top = row * 256
         self.row_bottom = row * 256 + 256
         self.column_start = start
         self.column_end = end
         self.carry = 0
+        self.restart()
+    }
+    // Collect the edges that can affect rows top..bottom, columns
+    // start..end, on the next trace.
+    fn collect(&mut self, top: i64, bottom: i64, start: i64, end: i64) {
+        self.mode = PEN_COLLECT
+        self.row_top = top * 256
+        self.row_bottom = bottom * 256
+        self.column_start = start
+        self.column_end = end
+        self.edges = 0
+        self.overflow = false
+        self.restart()
+    }
+    fn restart(&mut self) {
         self.start_x = 0
         self.start_y = 0
         self.x = 0
         self.y = 0
         self.open = false
+    }
+    // Store one edge with y0 != y1 for the sweep.
+    fn store(&mut self, x0: i64, y0: i64, x1: i64, y1: i64) {
+        if self.edges == EDGES {
+            self.overflow = true
+            return
+        }
+        i := self.edges
+        down := y0 < y1
+        if down {
+            self.edge_top_x[i] = x0 as i32
+            self.edge_top_y[i] = y0 as i32
+            self.edge_bottom_x[i] = x1 as i32
+            self.edge_bottom_y[i] = y1 as i32
+        } else {
+            self.edge_top_x[i] = x1 as i32
+            self.edge_top_y[i] = y1 as i32
+            self.edge_bottom_x[i] = x0 as i32
+            self.edge_bottom_y[i] = y0 as i32
+        }
+        self.edge_down[i] = down
+        self.edges = i + 1
+    }
+    // Order the collected edges by their top (Shell sort) and empty the
+    // active list.
+    fn sort_edges(&mut self) {
+        n := self.edges
+        for i in 0usize..n {
+            self.order[i] = i as u16
+        }
+        gap := 1usize
+        for gap * 3 + 1 < n {
+            gap = gap * 3 + 1
+        }
+        for gap > 0 {
+            for i in gap..n {
+                item := self.order[i]
+                key := self.edge_top_y[item as usize]
+                j := i
+                for j >= gap && self.edge_top_y[self.order[j - gap] as usize] > key {
+                    self.order[j] = self.order[j - gap]
+                    j -= gap
+                }
+                self.order[j] = item
+            }
+            gap = gap / 3
+        }
+        self.next_edge = 0
+        self.active_count = 0
+    }
+    // Move the sweep to pixel row `row`: drop the edges that ended above it,
+    // add the ones that start in it, and find each active edge's extent on
+    // the row, ordered by its left end. The order carries over from the row
+    // above, so the insertion sort does little work.
+    fn advance(&mut self, row: i64) {
+        top := row * 256
+        bottom := top + 256
+        kept := 0usize
+        for i in 0usize..self.active_count {
+            e := self.active[i] as usize
+            if self.edge_bottom_y[e] as i64 > top {
+                self.active[kept] = self.active[i]
+                kept += 1
+            }
+        }
+        for self.next_edge < self.edges {
+            e := self.order[self.next_edge] as usize
+            if self.edge_top_y[e] as i64 >= bottom {
+                break
+            }
+            self.next_edge += 1
+            if self.edge_bottom_y[e] as i64 > top {
+                self.active[kept] = e as u16
+                kept += 1
+            }
+        }
+        self.active_count = kept
+        for i in 0usize..kept {
+            e := self.active[i] as usize
+            tx := self.edge_top_x[e] as i64
+            ty := self.edge_top_y[e] as i64
+            bx := self.edge_bottom_x[e] as i64
+            by := self.edge_bottom_y[e] as i64
+            ya := max64(ty, top)
+            yb := min64(by, bottom)
+            span := by - ty
+            xa := tx + round_div((bx - tx) * (ya - ty), span)
+            xb := tx + round_div((bx - tx) * (yb - ty), span)
+            d := yb - ya
+            if !self.edge_down[e] {
+                d = -d
+            }
+            self.span_left[i] = min64(xa, xb) as i32
+            self.span_right[i] = max64(xa, xb) as i32
+            self.span_rows[i] = d as i32
+        }
+        for i in 1usize..kept {
+            edge := self.active[i]
+            l := self.span_left[i]
+            r := self.span_right[i]
+            d := self.span_rows[i]
+            j := i
+            for j > 0 && self.span_left[j - 1] > l {
+                self.active[j] = self.active[j - 1]
+                self.span_left[j] = self.span_left[j - 1]
+                self.span_right[j] = self.span_right[j - 1]
+                self.span_rows[j] = self.span_rows[j - 1]
+                j -= 1
+            }
+            self.active[j] = edge
+            self.span_left[j] = l
+            self.span_right[j] = r
+            self.span_rows[j] = d
+        }
+    }
+    // True when active edge `i` lies so far left of column `left` that its
+    // whole winding is already added there: its coverage changes stop at
+    // column last + 1 < left.
+    fn passed(&self, i: usize, left: i64) -> bool {
+        return ((self.span_right[i] as i64) >> 8) + 1 < left
     }
 
     // Start a new contour at (x, y), closing the current one.
@@ -2275,7 +2599,7 @@ pub struct Pen {
         y2 := path_coordinate(y)
         self.x = x2
         self.y = y2
-        if self.measuring {
+        if self.mode == PEN_MEASURE {
             self.include(x1, y1)
             self.include(x2, y2)
             return
@@ -2315,7 +2639,7 @@ pub struct Pen {
         y3 := path_coordinate(y)
         self.x = x3
         self.y = y3
-        if self.measuring {
+        if self.mode == PEN_MEASURE {
             self.include(x1, y1)
             self.include(x2, y2)
             self.include(x3, y3)
@@ -2372,7 +2696,7 @@ pub struct Pen {
         }
     }
     fn include(&mut self, x: i64, y: i64) {
-        if !self.measuring {
+        if self.mode != PEN_MEASURE {
             return
         }
         if !self.any {
@@ -2390,11 +2714,23 @@ pub struct Pen {
     }
     // True when a curve with this control hull contributes nothing to the
     // current pass except, when it lies left of the pass, its winding.
+    // While collecting, such a curve is stored as one vertical edge with
+    // the same winding.
     fn outside(&mut self, low_x: i64, high_x: i64, low_y: i64, high_y: i64, first_y: i64, last_y: i64) -> bool {
+        collecting := self.mode == PEN_COLLECT
+        if collecting && self.overflow {
+            return true
+        }
         if high_y <= self.row_top || low_y >= self.row_bottom || low_x >= self.column_end * 256 {
             return true
         }
         if high_x <= (self.column_start - 1) * 256 {
+            if collecting {
+                if first_y != last_y {
+                    self.store(high_x, first_y, high_x, last_y)
+                }
+                return true
+            }
             top := self.row_top
             bottom := self.row_bottom
             self.carry += 256 * (clamp64(last_y, top, bottom) - clamp64(first_y, top, bottom))
@@ -2402,14 +2738,21 @@ pub struct Pen {
         }
         return false
     }
-    // Add the coverage of one straight edge to the current pass.
+    // Collect one straight edge, or add its coverage to the current pass.
     fn segment(&mut self, x0: i64, y0: i64, x1: i64, y1: i64) {
-        if self.measuring {
+        if self.mode == PEN_MEASURE {
             self.include(x0, y0)
             self.include(x1, y1)
             return
         }
         if y0 == y1 {
+            return
+        }
+        if self.mode == PEN_COLLECT {
+            if self.overflow || max64(y0, y1) <= self.row_top || min64(y0, y1) >= self.row_bottom || min64(x0, x1) >= self.column_end * 256 {
+                return
+            }
+            self.store(x0, y0, x1, y1)
             return
         }
         tx := x0
@@ -2445,11 +2788,22 @@ pub struct Pen {
     fn accumulate(&mut self, left: i64, right: i64, d: i64) {
         start := self.column_start
         end := self.column_end
-        first := floor_div(left, 256)
+        first := left >> 8
         if first >= end {
             return
         }
-        last := floor_div(right, 256)
+        last := right >> 8
+        if first == last && first >= start {
+            // Inside one column, edge_cover(first) is exactly half of
+            // d * (2u - left - right), and the next column completes d * 256.
+            u := (first + 1) * 256
+            value := (d * (2 * u - left - right)) >> 1
+            self.cells[(first - start) as usize] += value
+            if first + 1 < end {
+                self.cells[(first + 1 - start) as usize] += d * 256 - value
+            }
+            return
+        }
         low := first
         previous := 0i64
         if first < start {
@@ -2458,9 +2812,35 @@ pub struct Pen {
             low = start
         }
         high := min64(last + 1, end - 1)
+        twice := 2 * (right - left)
         column := low
         for column <= high {
-            value := edge_cover(left, right, d, column)
+            // edge_cover(left, right, d, column), written out: the helper
+            // call and its checks dominate this loop. column >= first, so
+            // u > left.
+            u := (column + 1) * 256
+            value := d * 256
+            if u - right < 256 {
+                if twice == 0 {
+                    value = d * (u - left)
+                } else {
+                    a := u - left
+                    area := 512 * a - 65536
+                    if a <= 256 {
+                        area = a * a
+                    }
+                    b := u - right
+                    if b > 0 {
+                        area -= b * b
+                    }
+                    n := d * area
+                    if n >= 0 {
+                        value = n / twice
+                    } else {
+                        value = -((twice - 1 - n) / twice)
+                    }
+                }
+            }
             index := (column - start) as usize
             self.cells[index] += value - previous
             previous = value
@@ -2469,8 +2849,17 @@ pub struct Pen {
     }
 }
 
-// The coverage level, 0 to 255, of a pixel whose accumulated winding area is
-// `sum`.
+// How a fill paints: its color (encoded as `packed`, stored directly where
+// an opaque color covers a whole pixel) or a gradient, and its fill rule.
+struct Ink {
+    color: Color
+    packed: u32
+    opaque: bool
+    shaded: bool
+    even_odd: bool
+}
+
+// The alpha (0 to 255) of a pixel whose running coverage sum is `sum`.
 fn coverage_level(sum: i64, even_odd: bool) -> u32 {
     coverage := abs64(sum)
     if even_odd {
@@ -2549,45 +2938,21 @@ pub fn outline_bounds<O: Outline>(outline: &O) -> Rect {
 // moved by whole pixels.
 pub fn coverage_mask<O: Outline>(outline: &O, rule: FillRule, mask: &mut[u8], x: i32, y: i32, width: u32, height: u32) {
     rows := mask_rows(mask, width, height)
+    if rows == 0 || width > MAX_DIMENSION {
+        return
+    }
     stride := width as usize
-    bytes.fill(&mut mask[..rows as usize * stride], 0)
-    even_odd := false
-    match rule {
-        FillRule.NonZero => {}
-        FillRule.EvenOdd => {
-            even_odd = true
+    area := &mut mask[..rows as usize * stride]
+    bytes.fill(area, 0)
+    // Fill white over black in a Gray8 canvas laid over the mask: each pixel
+    // then holds exactly the level fill_outline blends with, since blending
+    // white at alpha a over opaque black gives gray a, and luma(gray a) = a.
+    match Canvas.with_stride(area, width, rows as u32, stride, PixelFormat.Gray8) {
+        ok(canvas) => {
+            canvas.set_origin(x, y)
+            canvas.fill_outline(outline, rule, WHITE)
         }
-    }
-    pen := Pen.new()
-    outline.trace(&mut pen)
-    pen.close()
-    if !pen.any {
-        return
-    }
-    top := max64(floor_div(pen.min_y, 256), y as i64)
-    bottom := min64(ceil_div(pen.max_y, 256), y as i64 + rows)
-    left := max64(floor_div(pen.min_x, 256), x as i64)
-    right := min64(ceil_div(pen.max_x, 256), x as i64 + width as i64)
-    if left >= right || top >= bottom {
-        return
-    }
-    for row in top..bottom {
-        line := (row - y as i64) as usize * stride
-        start := left
-        for start < right {
-            end := min64(start + CHUNK as i64, right)
-            pen.begin(row, start, end)
-            outline.trace(&mut pen)
-            pen.close()
-            sum := pen.carry
-            for column in start..end {
-                index := (column - start) as usize
-                sum += pen.cells[index]
-                pen.cells[index] = 0
-                mask[line + (column - x as i64) as usize] = coverage_level(sum, even_odd) as u8
-            }
-            start = end
-        }
+        err(_) => {}
     }
 }
 
@@ -3261,6 +3626,17 @@ pub struct Gradient {
             }
         }
         w.x += 1
+    }
+    // Move the walk to pixel (x, y) of its row: step over a short gap, start
+    // again further away. Both give the colors color_at gives.
+    fn seek(&self, w: &mut Walk, x: i64, y: i64) {
+        if x > w.x && x - w.x <= WALK_STEPS {
+            for w.x < x {
+                self.advance(w)
+            }
+        } else if x != w.x {
+            *w = self.walk(x, y)
+        }
     }
     // The radial position of the walk's pixel, recording its distance.
     fn radial_position(&self, w: &mut Walk) -> i64 {
