@@ -298,6 +298,8 @@ struct Context {
     constants: HashMap<String, Constant>,
     pointer_bits: u32,
     imports: HashSet<String>,
+    /// Types with a `drop` method, known before signatures are collected.
+    destructors: HashSet<String>,
 }
 impl Context {
     fn new(program: &Program, pointer_bits: u32) -> Check<Self> {
@@ -310,6 +312,11 @@ impl Context {
             constants: HashMap::new(),
             pointer_bits,
             imports: program.imports.iter().cloned().collect(),
+            destructors: program
+                .functions
+                .iter()
+                .filter_map(|f| f.name.strip_suffix(".drop").map(str::to_owned))
+                .collect(),
         };
         let mut names = HashSet::new();
         for declaration in &program.structs {
@@ -465,12 +472,6 @@ impl Context {
                     ));
                 }
             }
-            if function.extern_ {
-                for param in &function.params {
-                    context.ffi_type(&param.ty, param.span)?;
-                }
-                context.ffi_type(&function.ret, function.span)?;
-            }
             context.functions.insert(
                 function.name.clone(),
                 Signature {
@@ -489,6 +490,13 @@ impl Context {
                     span: signature_span(function),
                 },
             );
+        }
+        // After every signature is known, so destructors are visible.
+        for function in program.functions.iter().filter(|f| f.extern_) {
+            for param in &function.params {
+                context.ffi_type(&param.ty, param.span)?;
+            }
+            context.ffi_type(&function.ret, function.span)?;
         }
         Ok(context)
     }
@@ -659,13 +667,77 @@ impl Context {
             | Type::Float(_)
             | Type::Raw(..)
             | Type::ExternFn(..) => Ok(()),
-            // Aggregate ABI classification is target-dependent and deliberately explicit.
+            Type::Named(name) if self.structs.contains_key(name) => {
+                self.c_struct(name, span, &mut Vec::new())
+            }
             _ => Err(Diagnostic::new(
                 span,
-                "C ABI parameters and results currently require primitive, raw-pointer or `extern \"C\" fn` types",
+                format!("C ABI parameters and results cannot have type `{ty}`"),
             )
-            .note("pass a pointer to a @repr(C) struct instead of passing it by value")),
+            .note(
+                "use a primitive, a raw pointer, an `extern \"C\" fn` or a @repr(C) struct; pass other aggregates through a raw pointer",
+            )),
         }
+    }
+    /// A struct C code can receive and return by value: `@repr(C)`, at
+    /// least one field, no destructor, and only C field types.
+    fn c_struct(&self, name: &str, span: Span, path: &mut Vec<String>) -> Check<()> {
+        let declaration = &self.structs[name];
+        let reject = |reason: String, path: &[String]| -> Check<()> {
+            let mut diagnostic = Diagnostic::new(
+                span,
+                format!("struct `{name}` cannot cross the C ABI by value: {reason}"),
+            );
+            if !path.is_empty() {
+                diagnostic = diagnostic.note(format!("reached through field `{}`", path.join(".")));
+            }
+            Err(diagnostic.note("pass a raw pointer to its storage instead"))
+        };
+        if !declaration.repr_c {
+            return reject("it is not declared @repr(C)".into(), path);
+        }
+        if declaration.fields.is_empty() {
+            return reject("C structs need at least one field".into(), path);
+        }
+        // Fields are C types, so recursion finds destructors of nested
+        // structs. Signatures may be checked before every one is known.
+        if self.destructors.contains(name) {
+            return reject("C code cannot run its destructor".into(), path);
+        }
+        if declaration.interior_mutable {
+            return reject("it changes through shared references".into(), path);
+        }
+        for field in &declaration.fields {
+            let mut ty = &field.ty;
+            while let Type::Array(length, element) = ty {
+                if *length == 0 {
+                    return reject(format!("field `{}` has no elements", field.name), path);
+                }
+                ty = element;
+            }
+            match ty {
+                Type::Bool
+                | Type::Int { .. }
+                | Type::Float(_)
+                | Type::Raw(..)
+                | Type::ExternFn(..) => {}
+                Type::Named(inner) if self.structs.contains_key(inner) => {
+                    path.push(field.name.clone());
+                    self.c_struct(inner, span, path)?;
+                    path.pop();
+                }
+                _ => {
+                    return reject(
+                        format!(
+                            "field `{}` has type `{}`, which is not a C type",
+                            field.name, field.ty
+                        ),
+                        path,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
     fn no_value_cycle(&self, ty: &Type, seen: &mut HashSet<String>, span: Span) -> Check<()> {
         match ty {

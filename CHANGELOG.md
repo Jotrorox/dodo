@@ -16,6 +16,16 @@
   function pointers, raw pointers and `usize`. The type never converts to or
   from Dodo's `fn(..)` and closure types, which keep their internal ABI. C
   declarations may take and return C function pointers.
+- `extern "C"` functions pass and return `@repr(C)` structs by value, both
+  when Dodo calls C and when C calls a Dodo `extern "C" fn`. The compiler
+  classifies each struct as the target's C compiler does for x86-64 System V
+  (Linux, macOS), Windows x64 and AArch64 (Linux, macOS, Windows), so calls
+  such as Metal's `dispatchThreadgroups:threadsPerThreadgroup:` with
+  `MTLSize` need no C shim. Struct fields must themselves be C types, and
+  structs with destructors are rejected. Other targets report an error for a
+  struct by value. A fixture checks every classification case against the
+  host C compiler, including structs that move to the stack when registers
+  run out.
 - Antialiased drawing, gradients and TrueType text for `std/graphics`, still
   integer-only, allocation-free and identical on every target, firmware
   included. The `aa_` canvas calls draw lines, thick round-capped lines,
