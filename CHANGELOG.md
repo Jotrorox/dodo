@@ -16,6 +16,16 @@
   it for a non-macOS target is an error. The test suite runs compute,
   rendering and readback on the GPU, including x86-64 under Rosetta, and
   checks every constant against the SDK headers.
+- `&mut T` parameters of Dodo functions, methods and closures are `noalias`
+  in LLVM, as Rust's are, so optimized code no longer reloads fields of
+  `self` after every store through a slice or pointer it holds. A loop that
+  fills `self.data` now compiles to `memset` instead of reloading and
+  bounds-checking the slice per byte, without the local-subslice workaround.
+  The flow checker already guarantees exclusivity for safe code. Unsafe code
+  must not reach storage passed as `&mut` by another route until the call
+  returns (spec PTR-ALIAS). Shared references stay unmarked because atomics
+  may change shared storage, and so do `&mut dyn` pairs, slices and C
+  functions.
 - `std/graphics` solid fills and same-format blits are 9–35× faster at -O2
   (1280×800 `clear` 1.4 ms → 0.06 ms, full-frame `blit` 2.3 ms → 0.07 ms).
   Their loops now store through a local row subslice, which the optimizer
