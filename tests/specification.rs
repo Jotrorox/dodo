@@ -795,7 +795,10 @@ fn unsafe_pointer_conversions_and_unsupported_abi_are_rejected() {
             "fn main(){ unsafe { p:=0usize as *const i32\nr:=p as &i32 } }",
             "explicit lifetime primitive",
         ),
-        ("struct S { x:i32 }\nextern \"C\" fn take(x:S)", "not declared @repr(C)"),
+        (
+            "struct S { x:i32 }\nextern \"C\" fn take(x:S)",
+            "not declared @repr(C)",
+        ),
         (
             "@repr(C)\nstruct S { x:&i32 }\nextern \"C\" fn take(x:S)",
             "not a C type",
@@ -1012,7 +1015,13 @@ pub fn use_all() {
         }
     }
     let output = workspace
-        .compiler(&["build", "--emit", "llvm-ir", "--target", "thumbv7em-none-eabi"])
+        .compiler(&[
+            "build",
+            "--emit",
+            "llvm-ir",
+            "--target",
+            "thumbv7em-none-eabi",
+        ])
         .arg(&source)
         .arg("-o")
         .arg(workspace.0.join("thumb.ll"))
