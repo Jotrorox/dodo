@@ -1,0 +1,198 @@
+package main
+
+import "core/mem"
+import "core/ptr"
+import "std/console"
+import "std/gpu/opengl"
+import "std/gpu/opengl/gl"
+
+// Renders a triangle offscreen with shaders and reads it back, and checks
+// the context and target API around it. Prints "unavailable NAME" and exits
+// successfully when the machine has no OpenGL 3.3 (a CI runner without a
+// GPU driver), so tests/opengl_library.rs decides whether that is allowed.
+
+const VERTEX_SHADER: &[u8] = b"#version 330 core\nlayout(location = 0) in vec2 position;\nlayout(location = 1) in vec3 color;\nout vec3 shade;\nvoid main() {\n    shade = color;\n    gl_Position = vec4(position, 0.0, 1.0);\n}\n\0"
+
+const FRAGMENT_SHADER: &[u8] = b"#version 330 core\nin vec3 shade;\nout vec4 result;\nvoid main() {\n    result = vec4(shade, 1.0);\n}\n\0"
+
+const WIDTH: u32 = 64
+const HEIGHT: u32 = 48
+
+fn compile(kind: u32, source: &[u8]) -> u32 {
+    unsafe {
+        shader := gl.create_shader(kind)
+        text := ptr.as_ptr(source)
+        gl.shader_source(shader, 1, ptr.from_ref(&text), 0usize as *const i32)
+        gl.compile_shader(shader)
+        status := 0i32
+        gl.get_shaderiv(shader, gl.COMPILE_STATUS, ptr.from_mut(&mut status))
+        if status == 0 {
+            log := [0u8; 1024]
+            length := 0i32
+            gl.get_shader_info_log(shader, 1024, ptr.from_mut(&mut length), ptr.as_mut_ptr(&mut log))
+            console.println("shader log:")!
+            console.println(unsafe {
+                mem.str_from_utf8(&log[..length as usize])
+            })!
+        }
+        assert(status != 0, "shader compiles")
+        return shader
+    }
+}
+
+fn program() -> u32 {
+    vertex := compile(gl.VERTEX_SHADER, VERTEX_SHADER)
+    fragment := compile(gl.FRAGMENT_SHADER, FRAGMENT_SHADER)
+    unsafe {
+        program := gl.create_program()
+        gl.attach_shader(program, vertex)
+        gl.attach_shader(program, fragment)
+        gl.link_program(program)
+        status := 0i32
+        gl.get_programiv(program, gl.LINK_STATUS, ptr.from_mut(&mut status))
+        assert(status != 0, "program links")
+        gl.delete_shader(vertex)
+        gl.delete_shader(fragment)
+        return program
+    }
+}
+
+// The RGBA pixel at (x, y), with y counted from the top.
+fn pixel(pixels: &[u8], x: u32, y: u32) -> u32 {
+    at := ((y * WIDTH + x) * 4) as usize
+    return (pixels[at] as u32 << 24) | (pixels[at + 1] as u32 << 16) | (pixels[at + 2] as u32 << 8) | pixels[at + 3] as u32
+}
+
+fn rejected(major: u32, minor: u32) {
+    match opengl.Context.create(opengl.Options.new(major, minor)) {
+        ok(_) => assert(false, "an undefined version is rejected"),
+        err(error) => assert_eq(opengl.error_name(error), "InvalidInput")
+    }
+}
+
+fn options() {
+    // Versions OpenGL never defined are rejected before the system is asked.
+    rejected(0, 0)
+    rejected(1, 6)
+    rejected(2, 3)
+    rejected(3, 4)
+    rejected(4, 7)
+    rejected(5, 0)
+    defaults := opengl.Options.default()
+    assert_eq(defaults.major, 3u32)
+    assert_eq(defaults.minor, 3u32)
+    assert(!defaults.debug)
+}
+
+fn triangle() {
+    // Upper half red to green to blue; clockwise or not, no culling is on.
+    vertices := [
+        -0.5f32, -0.5, 1.0, 0.0, 0.0,
+        0.5, -0.5, 0.0, 1.0, 0.0,
+        0.0, 0.5, 0.0, 0.0, 1.0
+    ]
+    target := opengl.Target.new(WIDTH, HEIGHT)!
+    assert_eq(target.width(), WIDTH)
+    assert_eq(target.height(), HEIGHT)
+    assert_eq(target.bytes_needed(), (WIDTH * HEIGHT * 4) as usize)
+    assert(target.framebuffer() != 0)
+    shaders := program()
+    array := 0u32
+    buffer := 0u32
+    unsafe {
+        gl.gen_vertex_arrays(1, ptr.from_mut(&mut array))
+        gl.bind_vertex_array(array)
+        gl.gen_buffers(1, ptr.from_mut(&mut buffer))
+        gl.bind_buffer(gl.ARRAY_BUFFER, buffer)
+        gl.buffer_data(gl.ARRAY_BUFFER, 60, ptr.as_ptr(&vertices) as *const u8, gl.STATIC_DRAW)
+        gl.vertex_attrib_pointer(0, 2, gl.FLOAT, 0, 20, 0usize as *const u8)
+        gl.enable_vertex_attrib_array(0)
+        gl.vertex_attrib_pointer(1, 3, gl.FLOAT, 0, 20, 8usize as *const u8)
+        gl.enable_vertex_attrib_array(1)
+        gl.clear_color(0.0, 0.0, 0.0, 1.0)
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+        gl.use_program(shaders)
+        gl.draw_arrays(gl.TRIANGLES, 0, 3)
+        assert_eq(gl.get_error(), gl.NO_ERROR)
+    }
+    pixels := [0u8; 12288]
+    target.read_rgba(&mut pixels)!
+    // Reading leaves the caller's pack alignment alone.
+    alignment := 0i32
+    unsafe {
+        gl.get_integerv(gl.PACK_ALIGNMENT, ptr.from_mut(&mut alignment))
+    }
+    assert_eq(alignment, 4i32)
+    // Corners stay clear; rows run top to bottom, so the apex is near the
+    // top and the red and green corners near the bottom.
+    assert_eq(pixel(&pixels, 0, 0), 0x000000ffu32)
+    assert_eq(pixel(&pixels, WIDTH - 1, HEIGHT - 1), 0x000000ffu32)
+    near_apex := pixel(&pixels, WIDTH / 2, HEIGHT / 4 + 2)
+    assert(((near_apex >> 8) & 0xff) > 0x80, "blue near the apex")
+    near_red := pixel(&pixels, WIDTH / 4 + 2, HEIGHT * 3 / 4 - 2)
+    assert((near_red >> 24) > 0x80, "red near the left corner")
+    near_green := pixel(&pixels, WIDTH * 3 / 4 - 2, HEIGHT * 3 / 4 - 2)
+    assert(((near_green >> 16) & 0xff) > 0x80, "green near the right corner")
+    // BGRA swaps red and blue.
+    swapped := [0u8; 12288]
+    target.read_bgra(&mut swapped)!
+    at := ((HEIGHT * 3 / 4 - 2) * WIDTH + WIDTH / 4 + 2) as usize * 4
+    assert_eq(swapped[at], pixels[at + 2])
+    assert_eq(swapped[at + 2], pixels[at])
+    // A short buffer is rejected without writing.
+    short := [7u8; 16]
+    match target.read_rgba(&mut short) {
+        ok() => assert(false, "a short buffer is rejected"),
+        err(error) => assert_eq(opengl.error_name(error), "InvalidInput")
+    }
+    assert_eq(short[0], 7u8)
+    unsafe {
+        gl.delete_buffers(1, ptr.from_ref(&buffer))
+        gl.delete_vertex_arrays(1, ptr.from_ref(&array))
+        gl.delete_program(shaders)
+    }
+    match opengl.Target.new(0, 4) {
+        ok(_) => assert(false, "a zero-width target is rejected"),
+        err(error) => assert_eq(opengl.error_name(error), "InvalidInput")
+    }
+}
+
+fn main() {
+    assert(!gl.is_loaded("glClear"), "nothing is loaded before a context")
+    options()
+    context := match opengl.Context.create(opengl.Options.default()) {
+        ok(context) => context,
+        err(error) => {
+            console.println("unavailable")!
+            console.println(opengl.error_name(error))!
+            return
+        }
+    }
+    assert(context.is_current())
+    assert(context.major() * 100 + context.minor() >= 303u32)
+    assert(context.renderer().len > 0, "a renderer name")
+    assert(context.version().len > 0, "a version text")
+    assert(gl.is_loaded("glClear"))
+    assert(gl.is_loaded("glDrawArrays"))
+    assert(!gl.is_loaded("glNoSuchCommand"))
+    assert(context.proc_address(ptr.as_ptr(b"glClear\0")) != 0)
+    assert_eq(gl.COMMAND_COUNT, 656usize)
+    triangle()
+    // A second context becomes current; switching back restores the first,
+    // and dropping one that is not current keeps the binding loaded.
+    other := opengl.Context.create(opengl.Options.default())!
+    assert(other.is_current())
+    assert(!context.is_current())
+    context.make_current()!
+    assert(context.is_current())
+    assert(!other.is_current())
+    core.drop(other)
+    assert(gl.is_loaded("glClear"), "dropping another context keeps the binding")
+    context.make_current()!
+    console.println("renderer")!
+    console.println(context.renderer())!
+    // Destroying the current context unloads the binding.
+    core.drop(context)
+    assert(!gl.is_loaded("glClear"), "dropping the current context unloads")
+    console.println("passed")!
+}
