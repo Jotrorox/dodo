@@ -3,7 +3,7 @@
 //! fixture at O0 and O3 (and as x86-64 under Rosetta), every constant
 //! against the SDK headers, and the binding-index checks.
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn success(output: &Output, context: &str) {
@@ -87,7 +87,7 @@ fn metal_builds_for_macos_and_is_rejected_elsewhere() {
 }
 
 #[cfg(target_os = "macos")]
-fn run_checks(executable: &Path, launcher: Option<&str>) {
+fn run_checks(executable: &std::path::Path, launcher: Option<&str>) {
     let output = match launcher {
         Some(arch) => Command::new("arch").arg(arch).arg(executable).output(),
         None => Command::new(executable).output(),
