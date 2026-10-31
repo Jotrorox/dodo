@@ -175,8 +175,26 @@ enum AtomicSupport {
     None,
 }
 
-fn atomic_support(triple: &str) -> AtomicSupport {
+fn atomic_support(triple: &str, features: &str) -> AtomicSupport {
     let arch = triple.split('-').next().unwrap_or_default();
+    // RISC-V cores have atomics with the A extension, as the ESP32-C6 does.
+    if let Some(extensions) = arch
+        .strip_prefix("riscv32")
+        .or_else(|| arch.strip_prefix("riscv64"))
+    {
+        let named = features.split(',').any(|feature| feature == "+a");
+        let removed = features.split(',').any(|feature| feature == "-a");
+        let base = extensions.starts_with('g')
+            || extensions
+                .split('_')
+                .next()
+                .is_some_and(|letters| letters.contains('a'));
+        return if (named || base) && !removed {
+            AtomicSupport::Full
+        } else {
+            AtomicSupport::None
+        };
+    }
     // LLVM spells Apple's AArch64 as `arm64` (and `arm64e`). ARMv7-M,
     // ARMv7E-M, and ARMv8-M (Cortex-M3, M4, M7, M23, M33, M55, M85) have
     // exclusive loads and stores up to 32 bits; the checker limits widths to
@@ -194,8 +212,8 @@ fn atomic_support(triple: &str) -> AtomicSupport {
     }
 }
 
-fn unsupported_atomic(op: &str, triple: &str) -> String {
-    if atomic_support(triple) == AtomicSupport::LoadStore {
+fn unsupported_atomic(op: &str, triple: &str, features: &str) -> String {
+    if atomic_support(triple, features) == AtomicSupport::LoadStore {
         format!(
             "atomic `{op}` is not supported for target `{triple}`: ARMv6-M (Cortex-M0 and M0+) has no atomic read-modify-write instructions, only atomic loads and stores; update the value inside a critical section (`hal.Critical`) instead"
         )
@@ -243,6 +261,7 @@ pub fn generate<'ctx>(
         c_abi: HashMap::new(),
         c_result: None,
         bits,
+        features: options.features.clone(),
         sources,
         debug,
         span: Span::default(),
@@ -321,6 +340,7 @@ pub fn generate<'ctx>(
         return Err(error(unsupported_atomic(
             &op,
             &triple.as_str().to_string_lossy(),
+            &options.features,
         )));
     }
     function_sections(&cg.module);
@@ -375,6 +395,8 @@ struct Codegen<'a, 'ctx> {
     c_abi: HashMap<String, c_abi::Lowering<'ctx>>,
     c_result: Option<Vec<LlvmType<'ctx>>>,
     bits: u32,
+    // LLVM target features, which decide what RISC-V atomics lower to.
+    features: String,
     sources: SourceMap<'a>,
     span: Span,
     parameter: u32,
@@ -710,7 +732,10 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 let indirect = &self.indirect[&f.name].1;
                 self.mark_exclusive_params(function, &params, first, indirect);
             }
-            if f.interrupt.is_some() && self.riscv_bare_metal() {
+            if f.interrupt.is_some()
+                && self.riscv_bare_metal()
+                && !self.program.dispatched_interrupts
+            {
                 // Save every register the handler uses and return with `mret`.
                 function.add_attribute(
                     AttributeLoc::Function,
@@ -718,6 +743,16 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                 );
             }
             self.apply_placement(function, &f.placement, f.body.is_some(), 1)?;
+            if f.placement.section.is_some() && f.body.is_some() {
+                // A function placed in a section, such as `.ramfunc` to run
+                // from SRAM, must run there: inlined into a caller, its code
+                // would run from the caller's section instead.
+                function.add_attribute(
+                    AttributeLoc::Function,
+                    self.context
+                        .create_enum_attribute(Attribute::get_named_enum_kind_id("noinline"), 0),
+                );
+            }
             self.functions.insert(f.name.clone(), function);
         }
         Ok(())
@@ -3235,7 +3270,7 @@ impl<'a, 'ctx> Codegen<'a, 'ctx> {
                     .as_str()
                     .to_string_lossy()
                     .into_owned();
-                let support = atomic_support(&triple);
+                let support = atomic_support(&triple, &self.features);
                 if support == AtomicSupport::None
                     || (support == AtomicSupport::LoadStore
                         && !matches!(operation, "load" | "store"))

@@ -128,7 +128,7 @@ OS/C-library calls may allocate internally even when Dodo storage is fixed.
 HTTP/1.1 clients, servers, streaming framing, web routing, and QUIC connections
 and streams **are implemented**.
 HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
-the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
+the RP2040, RP2350, and ESP32-C6 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
 registers and portable device protocols; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
 `std/embedded/chip/rp2350` with `std/embedded/board/pico2` and
@@ -144,6 +144,14 @@ channels through `std/embedded/chip/rp_dma`, which the SPI buses and serial
 ports use for transfers that run in the background, and their second core,
 with the FIFOs and spinlocks the cores share, through
 `std/embedded/chip/rp_multicore`.
+`std/embedded/chip/esp32c6` with `std/embedded/board/esp32c6_devkitc`
+supports the Espressif ESP32-C6 and ESP32-C6-DevKitC-1: GPIO through the
+GPIO matrix, its interrupt matrix, I2C, SPI, and serial ports through
+`std/embedded/peripheral/esp_i2c`, `esp_spi`, and `esp_uart`, PWM, the
+calibrated ADC and temperature sensor, the system timer's alarms, DMA copies,
+WS2812 LEDs such as the board's RGB LED, and the chip's own USB serial port
+through `std/embedded/peripheral/esp_usb_serial`, which `dodo run` also
+flashes through.
 `std/embedded/cortex_m` enables, pends, and prioritizes interrupts and runs
 SysTick on any Cortex-M core. `std/embedded/executor` runs several firmware
 tasks on a core, waking each on time or on an interrupt and sleeping
@@ -191,7 +199,7 @@ individual modules and links every public declaration back to its source.
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [MQTT](mqtt.md) | `std/mqtt`, `std/mqtt/app`, `std/mqtt/broker`, `std/mqtt/hosted` | Packets/topics/handlers/test deliveries portable; app, broker, and client hosted. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
-| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/cortex_m` | `std/embedded/hal` and `std/embedded/executor` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
+| [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/peripheral/esp_i2c`, `std/embedded/peripheral/esp_spi`, `std/embedded/peripheral/esp_uart`, `std/embedded/peripheral/esp_usb_serial`, `std/embedded/wireless/cyw43`, `std/embedded/cortex_m` | `std/embedded/hal` and `std/embedded/executor` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`, or `std/embedded/board/esp32c6_devkitc` and `std/embedded/chip/esp32c6`. |
 
 ## Implementation and adapter packages
 

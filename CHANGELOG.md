@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- New board `esp32c6_devkitc`, the Espressif ESP32-C6-DevKitC-1, on the new
+  `esp32c6` chip: the first RISC-V firmware target (`riscv32-unknown-none-elf`,
+  RV32IMAC). The firmware boots through the boot ROM's direct boot, so the
+  image is the linked program from flash offset 0, with no bootloader or
+  partition table, and the runtime starts the chip (watchdogs off, DMA's
+  access to SRAM, flash at 80 MHz dual I/O) and dispatches the 77 interrupt
+  sources to `@interrupt(NAME)` handlers, which are ordinary functions on this
+  chip. `dodo run` flashes through the boot ROM's serial protocol over the
+  chip's own USB serial port or a USB serial adapter, with no button and no
+  external tool, checks the result by MD5, and skips unchanged images.
+  `std/embedded/chip/esp32c6` covers clocks (160 MHz), GPIO on any pin
+  through the GPIO matrix, I2C, SPI, both UARTs, PWM, the ADC calibrated from
+  eFuse, the temperature sensor, the system timer's alarms as executor
+  clocks, the interrupt matrix, DMA copies, WS2812 LEDs, and the USB serial
+  port, with new drivers `std/embedded/peripheral/esp_i2c`, `esp_spi`,
+  `esp_uart`, and `esp_usb_serial`. `std/embedded/board/esp32c6_devkitc`
+  makes the RGB LED the board's `led`. The portable board examples build
+  unchanged, `examples/esp32c6_tasks` shows tasks woken by the board's
+  interrupts, and `scripts/test_esp32c6.py` runs a 50-check hardware
+  self-test, which passes at -O0 to -O3.
+- Functions placed with `@section`, such as `@section(".ramfunc")`, are no
+  longer inlined into their callers, which would have run their code from the
+  caller's section instead.
+- 64-bit integer division in firmware takes one 32-bit division when both
+  operands fit in 32 bits, instead of 64 shift-and-subtract steps.
+
 - `&mut T` parameters of Dodo functions, methods and closures are `noalias`
   in LLVM, as Rust's are, so optimized code no longer reloads fields of
   `self` after every store through a slice or pointer it holds. A loop that

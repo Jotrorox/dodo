@@ -1,0 +1,258 @@
+package esp_spi
+
+import "std/embedded/hal"
+
+// The general-purpose SPI controller of Espressif's RISC-V chips (GP-SPI2,
+// the ESP32-C6's FSPI, and the same controller in the ESP32-C3, C5, H2, and
+// others), as a bus master. `Controller` implements the std/embedded/hal SPI
+// bus protocol over any hal.Registers: a `hal.RegisterBlock` on the chip, or
+// a simulated controller in a desktop test, so device drivers use it
+// unchanged.
+//
+// The controller shifts up to 64 bytes per run from its own data buffer
+// (W0 to W15), full duplex, most significant bit first; longer transfers
+// are split into runs of 64 bytes, between which the clock pauses briefly.
+// Chip selects are output pins of their own (see hal.SpiDevice); the
+// controller's chip select outputs stay off.
+//
+// Chip packages enable the controller's clock, route its clock, data out,
+// and data in signals through the GPIO matrix, and pass the frequency of
+// its function clock.
+//
+// Register names follow the ESP32-C6 technical reference manual (SPI
+// Controller).
+
+// CMD: latch the configuration (reads 1 until done), and start a run
+// (reads 1 until it ends).
+const CMD: usize = 0x00
+const UPDATE: u32 = 1 << 23
+const USR: u32 = 1 << 24
+// CTRL: the reset value with the data and hold lines' idle polarities low,
+// most significant bit first.
+const CTRL: usize = 0x08
+const CTRL_VALUE: u32 = 0x0020_0000
+// CLOCK: SCK is the function clock itself, or the function clock divided
+// by (pre + 1) * (n + 1), high for h + 1 and low for the rest.
+const CLOCK: usize = 0x0C
+const CLOCK_EQUALS_SYSTEM: u32 = 1 << 31
+// USER: full duplex, chip select setup and hold, data out changes on the
+// other clock edge, a data out phase and a data in phase.
+const USER: usize = 0x10
+const FULL_DUPLEX: u32 = 1 << 0
+const CS_HOLD: u32 = 1 << 6
+const CS_SETUP: u32 = 1 << 7
+const CLOCK_OUT_EDGE: u32 = 1 << 9
+const DATA_OUT: u32 = 1 << 27
+const DATA_IN: u32 = 1 << 28
+const USER_VALUE: u32 = FULL_DUPLEX | CS_HOLD | CS_SETUP | DATA_OUT | DATA_IN
+// MS_DLEN: the run's length in bits, minus one.
+const MS_DLEN: usize = 0x1C
+// MISC: chip select outputs 0 to 5 off, and SCK idles high.
+const MISC: usize = 0x20
+const CHIP_SELECTS_OFF: u32 = 0x3F
+const CLOCK_IDLE_HIGH: u32 = 1 << 29
+const DMA_CONF: usize = 0x30
+const FIFO_RESETS: u32 = 0b111 << 29
+const DMA_INT_CLR: usize = 0x38
+const DMA_INT_RAW: usize = 0x3C
+const TRANS_DONE: u32 = 1 << 12
+const W0: usize = 0x98
+// SLAVE: master mode.
+const SLAVE: usize = 0xE0
+// CLK_GATE: the controller's clocks on.
+const CLK_GATE: usize = 0xE8
+const CLOCKS_ON: u32 = 0b11
+
+// Bytes in the data buffer, the most one run moves.
+pub const BUFFER_SIZE: usize = 64
+// Polls before a run that does not end is reported as Timeout: one byte at
+// the slowest clock takes about 10_000 function clock cycles.
+const POLLS: u32 = 10_000_000
+
+// The clock divider for one SCK frequency, from `divider`.
+pub struct Divider {
+    // The function clock it divides.
+    pub clock_hz: u32
+    // The CLOCK register's value.
+    pub value: u32
+    // The resulting SCK frequency.
+    pub frequency_hz: u32
+}
+
+// The fastest SCK at most `frequency_hz` from a function clock of
+// `clock_hz`: the function clock itself, or divided by 2 to 1024.
+// InvalidInput below clock_hz / 1024.
+pub fn divider(clock_hz: u32, frequency_hz: u32) -> Divider!hal.Error {
+    if frequency_hz == 0 || frequency_hz < clock_hz / 1024 {
+        return err(hal.Error.InvalidInput)
+    }
+    if frequency_hz >= clock_hz {
+        return ok(Divider { clock_hz, value: CLOCK_EQUALS_SYSTEM, frequency_hz: clock_hz })
+    }
+    total := (clock_hz + frequency_hz - 1) / frequency_hz
+    if total < 2 {
+        total = 2
+    }
+    // The smallest prescaler that leaves n within 64; n rounds up, so SCK
+    // never exceeds the request.
+    best_pre := 1u32
+    best_n := total
+    if total > 64 {
+        best_pre = 16
+        best_n = 64
+        for pre in (total + 63) / 64..17u32 {
+            n := (total + pre - 1) / pre
+            if n <= 64 && pre * n < best_pre * best_n {
+                best_pre = pre
+                best_n = n
+            }
+        }
+    }
+    high := best_n / 2
+    if high < 1 {
+        high = 1
+    }
+    value := (best_n - 1) | ((high - 1) << 6) | ((best_n - 1) << 12) | ((best_pre - 1) << 18)
+    return ok(Divider { clock_hz, value, frequency_hz: clock_hz / (best_pre * best_n) })
+}
+
+// An SPI bus master on one controller with registers R. Implements the
+// std/embedded/hal SPI bus protocol.
+pub struct Controller<R: hal.Registers>: hal.Spi {
+    registers: R
+    divider: Divider
+
+    // Configure a controller fresh out of reset as a master in `mode` at
+    // the SCK frequency of `divider`.
+    pub fn new(registers: R, divider: Divider, mode: hal.SpiMode) -> Controller<R> {
+        bus := Controller<R> { registers, divider }
+        bus.registers.write(CLK_GATE, CLOCKS_ON)
+        bus.registers.write(SLAVE, 0)
+        bus.registers.write(CTRL, CTRL_VALUE)
+        bus.registers.write(MISC, CHIP_SELECTS_OFF)
+        bus.registers.write(USER, USER_VALUE)
+        bus.registers.write(CLOCK, bus.divider.value)
+        conf := bus.registers.read(DMA_CONF)
+        bus.registers.write(DMA_CONF, conf | FIFO_RESETS)
+        bus.registers.write(DMA_CONF, conf & ~FIFO_RESETS)
+        bus.set_mode(mode)
+        return bus
+    }
+
+    // The SCK frequency, the fastest the controller makes up to the request.
+    pub fn frequency_hz(&self) -> u32 {
+        return self.divider.frequency_hz
+    }
+
+    // Change the SCK frequency; InvalidInput leaves it unchanged.
+    pub fn set_frequency(&mut self, frequency_hz: u32) -> void!hal.Error {
+        self.divider = divider(self.divider.clock_hz, frequency_hz)?
+        self.registers.write(CLOCK, self.divider.value)
+        return ok()
+    }
+
+    // Change the clock polarity and phase for the next transfer.
+    pub fn set_mode(&mut self, mode: hal.SpiMode) {
+        idle_high := false
+        out_edge := false
+        match mode {
+            hal.SpiMode.Mode0 => {}
+            hal.SpiMode.Mode1 => {
+                out_edge = true
+            }
+            hal.SpiMode.Mode2 => {
+                idle_high = true
+                out_edge = true
+            }
+            hal.SpiMode.Mode3 => {
+                idle_high = true
+            }
+        }
+        misc := CHIP_SELECTS_OFF
+        if idle_high {
+            misc |= CLOCK_IDLE_HIGH
+        }
+        self.registers.write(MISC, misc)
+        user := USER_VALUE
+        if out_edge {
+            user |= CLOCK_OUT_EDGE
+        }
+        self.registers.write(USER, user)
+    }
+
+    // Full-duplex exchange in place: each byte sent is replaced by the
+    // byte read.
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error {
+        done := 0usize
+        for done < bytes.len {
+            count := bytes.len - done
+            if count > BUFFER_SIZE {
+                count = BUFFER_SIZE
+            }
+            self.fill(&bytes[done..done + count])
+            self.run(count)?
+            for index in 0..count {
+                word := self.registers.read(W0 + 4 * (index / 4))
+                bytes[done + index] = ((word >> (8 * (index % 4) as u32)) & 0xFF) as u8
+            }
+            done += count
+        }
+        return ok()
+    }
+
+    // Send `bytes`, ignoring what comes back.
+    pub fn write(&mut self, bytes: &[u8]) -> void!hal.Error {
+        done := 0usize
+        for done < bytes.len {
+            count := bytes.len - done
+            if count > BUFFER_SIZE {
+                count = BUFFER_SIZE
+            }
+            self.fill(&bytes[done..done + count])
+            self.run(count)?
+            done += count
+        }
+        return ok()
+    }
+
+    // Give back the registers, with the controller's clocks off.
+    pub fn release(self) -> R {
+        self.registers.write(CLK_GATE, 0)
+        let Controller { registers, divider } = self
+        return registers
+    }
+
+    // Put `bytes`, at most 64, into the data buffer, little-endian words.
+    fn fill(&mut self, bytes: &[u8]) {
+        words := (bytes.len + 3) / 4
+        for word in 0..words {
+            value := 0u32
+            for lane in 0..4usize {
+                index := 4 * word + lane
+                if index < bytes.len {
+                    value |= (bytes[index] as u32) << (8 * lane as u32)
+                }
+            }
+            self.registers.write(W0 + 4 * word, value)
+        }
+    }
+
+    // Shift `count` bytes and wait until the run ends.
+    fn run(&mut self, count: usize) -> void!hal.Error {
+        self.registers.write(MS_DLEN, 8 * count as u32 - 1)
+        self.registers.write(CMD, UPDATE)
+        for _ in 0..POLLS {
+            if (self.registers.read(CMD) & UPDATE) == 0 {
+                break
+            }
+        }
+        self.registers.write(DMA_INT_CLR, TRANS_DONE)
+        self.registers.write(CMD, USR)
+        for _ in 0..POLLS {
+            if (self.registers.read(CMD) & USR) == 0 {
+                return ok()
+            }
+        }
+        return err(hal.Error.Timeout)
+    }
+}

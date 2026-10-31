@@ -1,0 +1,309 @@
+package esp_usb_serial
+
+import "std/embedded/hal"
+import "std/io"
+
+// The USB serial port Espressif builds into its newer chips (USB-Serial-JTAG
+// in the ESP32-C3, C6, H2, S3, and others): a full-speed USB device whose
+// enumeration, CDC-ACM serial class, and JTAG debug interface are all in
+// hardware. The board appears on the host as /dev/ttyACM0 on Linux,
+// /dev/cu.usbmodem... on macOS, or a COM port on Windows, with no driver
+// and no adapter, and the host flashes it through the same port: the
+// controller decodes the host's DTR and RTS lines into a reset into the
+// boot ROM's download mode, so `dodo run` needs no buttons.
+//
+// `Controller` drives one over any hal.Registers: a `hal.RegisterBlock` on
+// the chip, or a simulated controller in a desktop test. It implements the
+// std/io Reader and Writer interfaces and their polling forms. Each
+// direction has a 64-byte FIFO in the controller and nothing beyond it, so
+// a program must read at least every 64 bytes the host sends.
+//
+// Writes go into the transmit FIFO, and the host takes it as one USB
+// packet once it is full or a write ends. While a terminal has the port
+// open (the host's DTR line is on), a full FIFO waits for the host, and
+// output it does not take within WRITE_TIMEOUT_FRAMES ms (USB frames) is
+// dropped, so printing never stops the program, even when the host stops
+// reading. While none has it open, a write waits only 3 ms, for a program
+// that reads without setting DTR; with nobody reading, the FIFO keeps the
+// first 64 bytes for the terminal that opens it and the rest is dropped,
+// without waiting again until the host takes output.
+//
+// Register names follow the ESP32-C6 technical reference manual (USB
+// Serial/JTAG Controller, USB_SERIAL_JTAG_*).
+
+// EP1: write one byte to the transmit FIFO, or read one from the receive
+// FIFO.
+const EP1: usize = 0x00
+// EP1_CONF: the bytes written so far form a packet for the host (write
+// one), the transmit FIFO has room, and the receive FIFO holds a byte.
+const EP1_CONF: usize = 0x04
+const WR_DONE: u32 = 1 << 0
+const IN_FREE: u32 = 1 << 1
+const OUT_AVAILABLE: u32 = 1 << 2
+// INT_RAW, INT_ST, INT_ENA, INT_CLR.
+const INT_RAW: usize = 0x08
+const INT_ST: usize = 0x0C
+const INT_ENA: usize = 0x10
+const INT_CLR: usize = 0x14
+// FRAM_NUM: the number of the last start-of-frame packet, which a host
+// sends every millisecond: 11 bits.
+const FRAM_NUM: usize = 0x24
+const FRAME_MASK: u32 = 0x7FF
+// CHIP_RST: the levels of the host's RTS and DTR lines.
+const CHIP_RST: usize = 0x4C
+const DTR: u32 = 1 << 1
+
+// Interrupt sources, as bits of `listen`, `ignore`, `pending_interrupts`,
+// and `clear_interrupts`. The controller raises its one interrupt line,
+// USB_DEVICE on the ESP32-C6, while any listened-to source is pending.
+//
+// RX_INTERRUPT: a packet from the host arrived in the receive FIFO.
+pub const RX_INTERRUPT: u32 = 1 << 2
+// TX_INTERRUPT: the host took everything in the transmit FIFO.
+pub const TX_INTERRUPT: u32 = 1 << 3
+// The host turned DTR on or off, opening or closing the port.
+pub const DTR_INTERRUPT: u32 = 1 << 13
+const ALL_INTERRUPTS: u32 = 0xFFFF
+
+// Bytes in each FIFO.
+pub const FIFO_SIZE: usize = 64
+// How long, in milliseconds, a write or flush waits for a host that has the
+// port open but takes no output, before dropping it.
+pub const WRITE_TIMEOUT_FRAMES: u32 = 50
+// How long a write waits while no terminal has the port open (DTR off).
+const UNCONNECTED_FRAMES: u32 = 3
+// Polls without progress before a write gives up when the frame number does
+// not advance either, as when the cable is unplugged: about 10 ms at
+// 160 MHz.
+const MAX_IDLE_POLLS: u32 = 200_000
+
+const LINE_FEED: u8 = 10
+const CARRIAGE_RETURN: u8 = 13
+
+// The USB serial port of one controller with registers R. Implements the
+// std/io Reader and Writer interfaces and their polling forms.
+pub struct Controller<R: hal.Registers>: io.ReadWriter {
+    registers: R
+    // Translate newlines; see set_crlf.
+    crlf: bool
+    after_return: bool
+    // A write gave up on a host that took nothing; later writes do not
+    // wait until the host takes output again.
+    stalled: bool
+
+    // Take over a controller as the boot ROM leaves it: enumerated by the
+    // host if a cable is connected. Output and input already in the FIFOs
+    // stay.
+    pub fn new(registers: R) -> Controller<R> {
+        port := Controller<R> { registers, crlf: false, after_return: false, stalled: false }
+        port.registers.write(INT_ENA, 0)
+        return port
+    }
+
+    // Translate newlines for a serial terminal: write each "\n" as "\r\n",
+    // and read the carriage return that a terminal's Enter key sends, alone
+    // or followed by "\n", as one "\n". Off at first.
+    pub fn set_crlf(&mut self, on: bool) {
+        self.crlf = on
+        self.after_return = false
+    }
+
+    // Whether a program on the host has the port open (DTR on), so what is
+    // written now is read now.
+    pub fn is_connected(&mut self) -> bool {
+        return (self.registers.read(CHIP_RST) & DTR) != 0
+    }
+
+    // The bytes in the receive FIFO: at least one when nonzero; the
+    // controller reports only whether it is empty.
+    pub fn available(&mut self) -> usize {
+        if (self.registers.read(EP1_CONF) & OUT_AVAILABLE) != 0 {
+            return 1
+        }
+        return 0
+    }
+
+    // Raise the controller's interrupt for these sources, in addition to
+    // those already listened to.
+    pub fn listen(&mut self, sources: u32) {
+        mask := self.registers.read(INT_ENA)
+        self.registers.write(INT_CLR, sources & ALL_INTERRUPTS)
+        self.registers.write(INT_ENA, (mask | sources) & ALL_INTERRUPTS)
+    }
+
+    // Stop raising the interrupt for these sources.
+    pub fn ignore(&mut self, sources: u32) {
+        mask := self.registers.read(INT_ENA)
+        self.registers.write(INT_ENA, mask & ~sources)
+    }
+
+    // The listened-to sources that are pending now.
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.registers.read(INT_ST)
+    }
+
+    // Acknowledge sources. RX_INTERRUPT comes back while the receive FIFO
+    // still holds data, TX_INTERRUPT while the transmit FIFO is empty.
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.registers.write(INT_CLR, sources & ALL_INTERRUPTS)
+    }
+
+    // Send `bytes`, waiting while the transmit FIFO is full and a terminal
+    // takes output, as the package comment describes. Never fails.
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        for index in 0..bytes.len {
+            byte := bytes[index]
+            if self.crlf && byte == LINE_FEED {
+                if !self.put(CARRIAGE_RETURN) {
+                    break
+                }
+            }
+            if !self.put(byte) {
+                break
+            }
+        }
+        self.registers.write(EP1_CONF, WR_DONE)
+        return ok(bytes.len)
+    }
+
+    // Queue what fits in the transmit FIFO without waiting; Pending, with
+    // what was queued, once it is full.
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        count := 0usize
+        for count < bytes.len && (self.registers.read(EP1_CONF) & IN_FREE) != 0 {
+            byte := bytes[count]
+            if self.crlf && byte == LINE_FEED {
+                self.registers.write(EP1, CARRIAGE_RETURN as u32)
+                if (self.registers.read(EP1_CONF) & IN_FREE) == 0 {
+                    // The line feed waits for room; the next call sends it
+                    // after its own carriage return, which the terminal
+                    // shows as one newline.
+                    break
+                }
+            }
+            self.registers.write(EP1, byte as u32)
+            count += 1
+        }
+        self.registers.write(EP1_CONF, WR_DONE)
+        state := io.PollState.Ready
+        if count < bytes.len {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // Wait until the host has taken everything written, while a terminal
+    // has the port open and keeps taking output; gives up as write does.
+    // Never fails.
+    pub fn flush(&mut self) -> void!io.Error {
+        self.registers.write(EP1_CONF, WR_DONE)
+        self.wait_for_room()
+        return ok()
+    }
+
+    // Wait for the first byte, then return what has arrived, up to
+    // `buffer.len`. A USB serial port never reaches end of input.
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        for {
+            progress := self.poll_read(buffer)?
+            if progress.transferred != 0 || buffer.len == 0 {
+                return ok(progress.transferred)
+            }
+        }
+    }
+
+    // Return what the receive FIFO holds, up to `buffer.len`, without
+    // waiting: Pending, with nothing, while it is empty.
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        count := 0usize
+        for count < buffer.len && (self.registers.read(EP1_CONF) & OUT_AVAILABLE) != 0 {
+            byte := (self.registers.read(EP1) & 0xFF) as u8
+            if self.crlf && self.after_return && byte == LINE_FEED {
+                self.after_return = false
+            } else {
+                self.after_return = self.crlf && byte == CARRIAGE_RETURN
+                if self.after_return {
+                    buffer[count] = LINE_FEED
+                } else {
+                    buffer[count] = byte
+                }
+                count += 1
+            }
+        }
+        state := io.PollState.Ready
+        if count == 0 && buffer.len != 0 {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // Write `bytes` for a panic report: as write, without newline
+    // translation, and waiting for the host only while a terminal has the
+    // port open.
+    pub fn send_report(&mut self, bytes: &[u8]) {
+        for index in 0..bytes.len {
+            if !self.put(bytes[index]) {
+                break
+            }
+        }
+        self.registers.write(EP1_CONF, WR_DONE)
+        self.wait_for_room()
+    }
+
+    // Give back the controller's registers; the FIFOs keep their contents.
+    pub fn release(self) -> R {
+        self.registers.write(INT_ENA, 0)
+        let Controller { registers, crlf, after_return, stalled } = self
+        return registers
+    }
+
+    // Put one byte into the transmit FIFO; false once output is dropped.
+    fn put(&mut self, byte: u8) -> bool {
+        if (self.registers.read(EP1_CONF) & IN_FREE) == 0 {
+            // Send what the FIFO holds, then wait for the host to take it.
+            self.registers.write(EP1_CONF, WR_DONE)
+            if !self.wait_for_room() {
+                return false
+            }
+        }
+        self.registers.write(EP1, byte as u32)
+        return true
+    }
+
+    // Wait until the transmit FIFO has room, for as long as a terminal has
+    // the port open and the host takes output within WRITE_TIMEOUT_FRAMES
+    // frames. False if it gave up.
+    fn wait_for_room(&mut self) -> bool {
+        if (self.registers.read(EP1_CONF) & IN_FREE) != 0 {
+            self.stalled = false
+            return true
+        }
+        if self.stalled {
+            return false
+        }
+        // A host that reads without setting DTR, as some tools do, still
+        // takes each packet within a few frames.
+        limit := UNCONNECTED_FRAMES
+        if self.is_connected() {
+            limit = WRITE_TIMEOUT_FRAMES
+        }
+        last_frame := self.registers.read(FRAM_NUM) & FRAME_MASK
+        frames := 0u32
+        polls := 0u32
+        for (self.registers.read(EP1_CONF) & IN_FREE) == 0 {
+            frame := self.registers.read(FRAM_NUM) & FRAME_MASK
+            if frame != last_frame {
+                last_frame = frame
+                frames += 1
+                polls = 0
+            } else {
+                polls += 1
+            }
+            if frames > limit || polls > MAX_IDLE_POLLS {
+                self.stalled = true
+                return false
+            }
+        }
+        return true
+    }
+}

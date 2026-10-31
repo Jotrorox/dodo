@@ -140,10 +140,11 @@ Features are an LLVM CPU-feature string such as `"+sse4.2,-avx"`. `emit` accepts
 `exe` (default), `obj`, `asm`, `llvm-ir`, or `bitcode`.
 
 `board` selects firmware hardware: `"pico"` for the Raspberry Pi Pico,
-`"pico2"` for the Pico 2, or `"pico2_w"` for the Pico 2 W; `chip` (`"rp2040"` or `"rp2350"`) selects only the
-microcontroller, for a custom board. Either fills in `triple`, `cpu`, the panic hook, and the linker
+`"pico2"` for the Pico 2, `"pico2_w"` for the Pico 2 W, or `"esp32c6_devkitc"`
+for the Espressif ESP32-C6-DevKitC-1; `chip` (`"rp2040"`, `"rp2350"`, or
+`"esp32c6"`) selects only the microcontroller, for a custom board. Either fills in `triple`, `cpu`, the panic hook, and the linker
 wherever they are not set explicitly, makes `exe` output a flashable firmware
-image (the target's `.elf` plus, for example, a `.uf2` beside it), and selects
+image (the target's `.elf` plus a `.uf2`, or the ESP32-C6's `.bin`, beside it), and selects
 the packages `import "std/embedded/board"` and `import "std/embedded/chip"` resolve to. `run`
 flashes the board instead of executing on the host. A `triple` the chip cannot
 run, or a `chip` that is not the board's, is an error. See

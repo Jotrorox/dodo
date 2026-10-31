@@ -382,6 +382,10 @@ pub struct Program {
     /// The vector names a firmware build's chip accepts in `@interrupt`; set
     /// by package loading for a board or chip, `None` elsewhere.
     pub interrupt_vectors: Option<&'static [&'static str]>,
+    /// Whether the chip's runtime calls `@interrupt` handlers as ordinary C
+    /// functions (see `hardware::InterruptAbi::Dispatched`), so that RISC-V
+    /// handlers are not machine-mode trap handlers.
+    pub dispatched_interrupts: bool,
     /// The PIO version of a firmware build's chip, for `rp_pio.assemble`: 0
     /// on the RP2040, 1 on the RP2350, `None` on chips without PIO and
     /// outside firmware builds.

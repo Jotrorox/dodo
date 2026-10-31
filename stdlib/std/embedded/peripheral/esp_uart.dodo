@@ -1,0 +1,564 @@
+package esp_uart
+
+import "std/embedded/hal"
+import "std/io"
+
+// The UART of Espressif's RISC-V chips (UART0 and UART1 of the ESP32-C6,
+// and the same controller in the ESP32-C3, C5, H2, and others), an
+// asynchronous serial port. `Controller` implements the std/io Reader and
+// Writer interfaces over any hal.Registers: a `hal.RegisterBlock` on the
+// chip, or a simulated controller in a desktop test. A port therefore works
+// with every std/io helper and with std/fmt formatting:
+//
+//     fmt.printf(&mut serial, "{} degrees\n", celsius)!
+//
+// Chip packages enable the controller's clocks, route its pins through the
+// GPIO matrix, and pass the frequency of its function clock. Frames start
+// as 8N1 (eight data bits, no parity, one stop bit); `set_format` changes
+// that. Each direction has a 128-byte FIFO. Transfers are polled: a write
+// waits only while the transmit FIFO is full, and a read returns what the
+// receive FIFO holds, waiting only for the first byte. Nothing buffers input
+// beyond the FIFO, so a program must read at least every 128 bytes' time
+// (11 ms at 115200 baud) while data arrives, or bytes are lost and a read
+// reports OVERRUN; with hardware flow control, see `set_flow_control`, the
+// controller asks the other end to pause instead.
+//
+// Waits are counted in status polls, not time, as in std/embedded/
+// peripheral/pl011: a write, `flush`, and the settings that wait for output
+// give up with TimedOut after DEFAULT_POLL_LIMIT polls without progress,
+// and a read waits for its first byte as long as it takes unless
+// `set_read_poll_limit` bounds it.
+//
+// Register names follow the ESP32-C6 technical reference manual (UART
+// Controller). The controller latches configuration into its own clock
+// domain on a write to REG_UPDATE, which the driver does after each change.
+
+const FIFO: usize = 0x00
+const INT_RAW: usize = 0x04
+const INT_ST: usize = 0x08
+const INT_ENA: usize = 0x0C
+const INT_CLR: usize = 0x10
+// CLKDIV: the divisor's integer part, and its fraction in sixteenths.
+const CLKDIV: usize = 0x14
+const CLKDIV_INTEGER: u32 = 0xFFF
+const CLKDIV_FRACTION: u32 = 0xF << 20
+// STATUS: bytes in the receive and transmit FIFOs.
+const STATUS: usize = 0x1C
+const RX_COUNT: u32 = 0xFF
+const TX_COUNT: u32 = 0xFF << 16
+// CONF0: odd parity, parity on, data bits minus 5, stop bits (1: one,
+// 3: two), send a break after the data, internal loopback, CTS flow
+// control, inverted TXD, drop bytes received with errors, FIFO resets.
+const CONF0: usize = 0x20
+const PARITY_ODD: u32 = 1 << 0
+const PARITY_ENABLE: u32 = 1 << 1
+const DATA_BITS: u32 = 0b11 << 2
+const STOP_BITS: u32 = 0b11 << 4
+const LOOPBACK: u32 = 1 << 12
+const CTS_FLOW: u32 = 1 << 13
+const TXD_INVERT: u32 = 1 << 16
+const ERROR_WRITE_MASK: u32 = 1 << 18
+const RX_FIFO_RESET: u32 = 1 << 22
+const TX_FIFO_RESET: u32 = 1 << 23
+const FORMAT_BITS: u32 = PARITY_ODD | PARITY_ENABLE | DATA_BITS | STOP_BITS
+// CONF1: the receive FIFO level that raises RX_INTERRUPT, and the transmit
+// level below which TX_INTERRUPT is raised.
+const CONF1: usize = 0x24
+const RX_FULL_LEVEL: u32 = 96
+const TX_EMPTY_LEVEL: u32 = 64
+// HWFC_CONF: hold RTS high from this many received bytes, and RTS flow
+// control on.
+const HWFC_CONF: usize = 0x2C
+const RTS_LEVEL: u32 = 100
+const RTS_FLOW: u32 = 1 << 8
+// IDLE_CONF: no idle time between transmitted frames.
+const IDLE_CONF: usize = 0x48
+const TX_IDLE: u32 = 0x3FF << 10
+// TOUT_CONF: raise RX_TIMEOUT_INTERRUPT after this many bit times without
+// a frame, from bit 2.
+const TOUT_CONF: usize = 0x64
+const RX_TIMEOUT_ENABLE: u32 = 1 << 0
+const RX_TIMEOUT_BITS: u32 = 30
+// FSM_STATUS: the transmitter's state machine, 0 when idle.
+const FSM_STATUS: usize = 0x70
+const TX_STATE: u32 = 0xF << 4
+// REG_UPDATE: latch the configuration; reads 1 until done.
+const REG_UPDATE: usize = 0x98
+
+// Interrupt sources, as bits of `listen`, `ignore`, `pending_interrupts`,
+// and `clear_interrupts`. The controller raises its one interrupt line,
+// UART0 or UART1 on the ESP32-C6, while any listened-to source is pending.
+//
+// RX_INTERRUPT: the receive FIFO holds 96 bytes or more.
+// RX_TIMEOUT_INTERRUPT: received bytes have waited for 30 bit times with no
+// more arriving, so a handler also hears about a short message. Reads that
+// drain the FIFO end both; clear them too, as they are latched.
+pub const RX_INTERRUPT: u32 = 1 << 0
+// The transmit FIFO has drained below 64 bytes: room to write more.
+pub const TX_INTERRUPT: u32 = 1 << 1
+pub const RX_TIMEOUT_INTERRUPT: u32 = 1 << 8
+// A received frame had a parity or framing error, was a break, or found the
+// receive FIFO full.
+pub const ERROR_INTERRUPTS: u32 = PARITY_INTERRUPT | FRAMING_INTERRUPT | OVERFLOW_INTERRUPT | BREAK_INTERRUPT
+const PARITY_INTERRUPT: u32 = 1 << 2
+const FRAMING_INTERRUPT: u32 = 1 << 3
+const OVERFLOW_INTERRUPT: u32 = 1 << 4
+const BREAK_INTERRUPT: u32 = 1 << 7
+const ALL_INTERRUPTS: u32 = 0xF_FFFF
+
+// Status polls without progress before a wait for output gives up.
+pub const DEFAULT_POLL_LIMIT: u32 = 10_000_000
+// A poll limit of zero waits as long as it takes.
+pub const NO_POLL_LIMIT: u32 = 0
+// Polls before REG_UPDATE is reported as stuck.
+const UPDATE_POLLS: u32 = 100_000
+
+// Bytes in each FIFO.
+pub const FIFO_DEPTH: usize = 128
+
+// Receive errors, as in pl011: a failed read's io.Error has kind Other and
+// these bits in its code. The controller drops a byte with a framing or
+// parity error, or a break. An overrun means bytes were lost because the
+// receive FIFO was full.
+pub const FRAMING_ERROR: i32 = 1
+pub const PARITY_ERROR: i32 = 2
+pub const BREAK: i32 = 4
+pub const OVERRUN: i32 = 8
+
+const LINE_FEED: u8 = 10
+const CARRIAGE_RETURN: u8 = 13
+
+// The parity bit after each frame's data bits.
+pub enum Parity {
+    None,
+    Even,
+    Odd
+}
+
+// The divisor for one baud rate, from `divisor`.
+pub struct Divisor {
+    // The function clock it divides.
+    pub clock_hz: u32
+    // The divisor in sixteenths: clock_hz * 16 / sixteenths is the rate.
+    pub sixteenths: u32
+    // The resulting baud rate.
+    pub baud: u32
+}
+
+// The divisor from a function clock of `clock_hz` that comes closest to
+// `baud`, exact to 1/16. InvalidInput above clock_hz / 2 (20 Mbaud from a
+// 40 MHz crystal), or below clock_hz / 4096, where the divisor no longer
+// fits; a chip package divides the clock first for slower rates.
+pub fn divisor(clock_hz: u32, baud: u32) -> Divisor!hal.Error {
+    if baud == 0 || baud > clock_hz / 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    sixteenths := ((clock_hz as u64 * 16 + baud as u64 / 2) / baud as u64) as u32
+    if sixteenths < 32 || sixteenths > 0xFFFF {
+        return err(hal.Error.InvalidInput)
+    }
+    rate := ((clock_hz as u64 * 16 + sixteenths as u64 / 2) / sixteenths as u64) as u32
+    return ok(Divisor { clock_hz, sixteenths, baud: rate })
+}
+
+// CONF0's format bits.
+fn line_format(data_bits: u32, parity: Parity, stop_bits: u32) -> u32!hal.Error {
+    if data_bits < 5 || data_bits > 8 || stop_bits < 1 || stop_bits > 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    line := hal.encode(DATA_BITS, data_bits - 5)
+    if stop_bits == 2 {
+        line |= hal.encode(STOP_BITS, 3)
+    } else {
+        line |= hal.encode(STOP_BITS, 1)
+    }
+    match parity {
+        Parity.None => {}
+        Parity.Even => {
+            line |= PARITY_ENABLE
+        }
+        Parity.Odd => {
+            line |= PARITY_ENABLE | PARITY_ODD
+        }
+    }
+    return ok(line)
+}
+
+// A serial port on one controller with registers R, any hal.Registers.
+// Implements the std/io Reader and Writer interfaces and their polling
+// forms.
+pub struct Controller<R: hal.Registers>: io.ReadWriter {
+    registers: R
+    divisor: Divisor
+    poll_limit: u32
+    read_poll_limit: u32
+    // Translate newlines; see set_crlf.
+    crlf: bool
+    after_return: bool
+    feed_pending: bool
+
+    // Configure a controller fresh out of reset for 8N1 frames at the baud
+    // rate of `divisor`, with both FIFOs emptied.
+    pub fn new(registers: R, divisor: Divisor) -> Controller<R> {
+        port := Controller<R> {
+            registers,
+            divisor,
+            poll_limit: DEFAULT_POLL_LIMIT,
+            read_poll_limit: NO_POLL_LIMIT,
+            crlf: false,
+            after_return: false,
+            feed_pending: false,
+        }
+        port.registers.write(INT_ENA, 0)
+        port.registers.write(INT_CLR, ALL_INTERRUPTS)
+        port.registers.write(CONF0, hal.encode(DATA_BITS, 3) | hal.encode(STOP_BITS, 1) | ERROR_WRITE_MASK)
+        port.registers.write(CONF1, RX_FULL_LEVEL | (TX_EMPTY_LEVEL << 8))
+        port.registers.write(HWFC_CONF, RTS_LEVEL)
+        port.registers.write(TOUT_CONF, RX_TIMEOUT_ENABLE | (RX_TIMEOUT_BITS << 2))
+        idle := port.registers.read(IDLE_CONF)
+        port.registers.write(IDLE_CONF, idle & ~TX_IDLE)
+        port.write_divisor()
+        port.update()
+        port.reset_fifos(RX_FIFO_RESET | TX_FIFO_RESET)
+        port.registers.write(INT_CLR, ALL_INTERRUPTS)
+        return port
+    }
+
+    // The baud rate, in bits per second: the closest the controller can
+    // make to the requested one.
+    pub fn baud(&self) -> u32 {
+        return self.divisor.baud
+    }
+
+    // The function clock, as given to `new` or `set_divisor`.
+    pub fn clock_hz(&self) -> u32 {
+        return self.divisor.clock_hz
+    }
+
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.poll_limit = polls
+    }
+
+    pub fn set_read_poll_limit(&mut self, polls: u32) {
+        self.read_poll_limit = polls
+    }
+
+    // Change the baud rate, from the same function clock. Waits until
+    // everything written is out first. InvalidInput or Timeout leaves it
+    // unchanged.
+    pub fn set_baud(&mut self, baud: u32) -> void!hal.Error {
+        settings := divisor(self.divisor.clock_hz, baud)?
+        return self.set_divisor(settings)
+    }
+
+    // Change the divisor, for a chip package that changes the function
+    // clock too: waits as set_baud does, then latches `settings`.
+    pub fn set_divisor(&mut self, settings: Divisor) -> void!hal.Error {
+        self.settle()?
+        self.divisor = settings
+        self.write_divisor()
+        self.update()
+        return ok()
+    }
+
+    // Change the frame format: 5 to 8 data bits, the parity bit, and 1 or 2
+    // stop bits. Waits like set_baud; InvalidInput or Timeout leaves the
+    // format unchanged.
+    pub fn set_format(&mut self, data_bits: u32, parity: Parity, stop_bits: u32) -> void!hal.Error {
+        line := line_format(data_bits, parity, stop_bits)?
+        self.settle()?
+        conf := self.registers.read(CONF0) & ~FORMAT_BITS
+        self.registers.write(CONF0, conf | line)
+        self.update()
+        return ok()
+    }
+
+    // Translate newlines for a serial terminal: write each "\n" as "\r\n",
+    // and read the carriage return that a terminal's Enter key sends, alone
+    // or followed by "\n", as one "\n". Off at first.
+    pub fn set_crlf(&mut self, on: bool) {
+        self.crlf = on
+        self.after_return = false
+        self.feed_pending = false
+    }
+
+    // Turn hardware flow control on or off, once everything written is
+    // out: with `cts`, the transmitter sends only while the other end holds
+    // CTS low; with `rts`, the controller holds RTS low while its receive
+    // FIFO has room and raises it from 100 bytes on. Both need the pins
+    // routed, which chip packages do for ports claimed with flow control.
+    pub fn set_flow_control(&mut self, cts: bool, rts: bool) -> void!hal.Error {
+        self.settle()?
+        conf := self.registers.read(CONF0) & ~CTS_FLOW
+        if cts {
+            conf |= CTS_FLOW
+        }
+        self.registers.write(CONF0, conf)
+        flow := RTS_LEVEL
+        if rts {
+            flow |= RTS_FLOW
+        }
+        self.registers.write(HWFC_CONF, flow)
+        self.update()
+        return ok()
+    }
+
+    // Raise the controller's interrupt for these sources, in addition to
+    // those already listened to. Ports start with none.
+    pub fn listen(&mut self, sources: u32) {
+        mask := self.registers.read(INT_ENA)
+        self.registers.write(INT_ENA, (mask | sources) & ALL_INTERRUPTS)
+    }
+
+    pub fn ignore(&mut self, sources: u32) {
+        mask := self.registers.read(INT_ENA)
+        self.registers.write(INT_ENA, mask & ~sources)
+    }
+
+    // The listened-to sources that are pending now.
+    pub fn pending_interrupts(&mut self) -> u32 {
+        return self.registers.read(INT_ST)
+    }
+
+    // Acknowledge sources. The receive and transmit levels come back at
+    // once while their condition lasts.
+    pub fn clear_interrupts(&mut self, sources: u32) {
+        self.registers.write(INT_CLR, sources & ALL_INTERRUPTS)
+    }
+
+    // Hold the transmit line low, a break, from once everything written is
+    // out until `set_break(false)`.
+    pub fn set_break(&mut self, on: bool) -> void!hal.Error {
+        if on {
+            self.settle()?
+        }
+        conf := self.registers.read(CONF0) & ~TXD_INVERT
+        if on {
+            conf |= TXD_INVERT
+        }
+        self.registers.write(CONF0, conf)
+        self.update()
+        return ok()
+    }
+
+    // Connect the transmitter to the receiver inside the controller, so
+    // reads return what was written. Meant for self-tests. Timeout if what
+    // was written does not get out.
+    pub fn set_loopback(&mut self, on: bool) -> void!hal.Error {
+        self.settle()?
+        conf := self.registers.read(CONF0) & ~LOOPBACK
+        if on {
+            conf |= LOOPBACK
+        }
+        self.registers.write(CONF0, conf)
+        self.update()
+        return ok()
+    }
+
+    // Send `bytes`, waiting while the transmit FIFO is full. Returns once
+    // the last byte is queued; `flush` waits until it is sent. TimedOut,
+    // with the bytes queued before it in `transferred`, if the FIFO stays
+    // full for the poll limit.
+    pub fn write(&mut self, bytes: &[u8]) -> usize!io.Error {
+        sent := 0usize
+        polls := 0u32
+        for sent < bytes.len {
+            count := self.queue(&bytes[sent..])
+            if count == 0 {
+                polls += 1
+                if self.poll_limit != NO_POLL_LIMIT && polls >= self.poll_limit {
+                    return err(io.failure(io.ErrorKind.TimedOut, sent))
+                }
+            } else {
+                sent += count
+                polls = 0
+            }
+        }
+        return ok(bytes.len)
+    }
+
+    // Queue as much of `bytes` as the transmit FIFO has room for, without
+    // waiting; Pending, with what was queued, once it is full.
+    pub fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error {
+        count := self.queue(bytes)
+        state := io.PollState.Ready
+        if count < bytes.len {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // Wait until every byte written has left, stop bits included.
+    // TimedOut after the poll limit.
+    pub fn flush(&mut self) -> void!io.Error {
+        if !self.idle() {
+            return err(io.failure(io.ErrorKind.TimedOut, 0))
+        }
+        return ok()
+    }
+
+    // Wait for the first byte, then return what has arrived, up to
+    // `buffer.len`. A serial port has no end of input, so a read never
+    // returns 0 bytes for a nonempty buffer. On a receive error, the bytes
+    // before it are in buffer[..transferred] and io.Error.code holds its
+    // bits; see FRAMING_ERROR. The next read continues after it.
+    pub fn read(&mut self, buffer: &mut[u8]) -> usize!io.Error {
+        polls := 0u32
+        for {
+            progress := self.poll_read(buffer)?
+            if progress.transferred != 0 || buffer.len == 0 {
+                return ok(progress.transferred)
+            }
+            polls += 1
+            if self.read_poll_limit != NO_POLL_LIMIT && polls >= self.read_poll_limit {
+                return err(io.failure(io.ErrorKind.TimedOut, 0))
+            }
+        }
+    }
+
+    // Return what the receive FIFO holds, up to `buffer.len`, without
+    // waiting: Pending, with nothing, while it is empty. Errors as for
+    // `read`: the errors latched since the last read, after the bytes read
+    // now.
+    pub fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error {
+        count := 0usize
+        for count < buffer.len && hal.decode(RX_COUNT, self.registers.read(STATUS)) != 0 {
+            byte := (self.registers.read(FIFO) & 0xFF) as u8
+            if self.crlf && self.after_return && byte == LINE_FEED {
+                self.after_return = false
+            } else {
+                self.after_return = self.crlf && byte == CARRIAGE_RETURN
+                if self.after_return {
+                    byte = LINE_FEED
+                }
+                buffer[count] = byte
+                count += 1
+            }
+        }
+        // Errors latched until now: an overflow follows the bytes that
+        // filled the FIFO, and a dropped frame lies among them.
+        raw := self.registers.read(INT_RAW)
+        errors := 0i32
+        if (raw & FRAMING_INTERRUPT) != 0 {
+            errors |= FRAMING_ERROR
+        }
+        if (raw & PARITY_INTERRUPT) != 0 {
+            errors |= PARITY_ERROR
+        }
+        if (raw & BREAK_INTERRUPT) != 0 {
+            errors |= BREAK
+        }
+        if (raw & OVERFLOW_INTERRUPT) != 0 {
+            errors |= OVERRUN
+        }
+        if errors != 0 {
+            self.registers.write(INT_CLR, ERROR_INTERRUPTS)
+            if (errors & (FRAMING_ERROR | PARITY_ERROR | BREAK)) != 0 {
+                self.after_return = false
+            }
+            return err(io.Error { kind: io.ErrorKind.Other, transferred: count, code: errors })
+        }
+        state := io.PollState.Ready
+        if count == 0 && buffer.len != 0 {
+            state = io.PollState.Pending
+        }
+        return ok(io.Poll { transferred: count, state })
+    }
+
+    // Write `bytes` for a panic report: with newlines as given, waiting
+    // for room as long as the poll limit allows, then for the line to go
+    // idle.
+    pub fn send_report(&mut self, bytes: &[u8]) {
+        crlf := self.crlf
+        self.crlf = false
+        match self.write(bytes) {
+            ok(_) => {}
+            err(_) => {}
+        }
+        self.crlf = crlf
+        self.idle()
+    }
+
+    // Wait until everything written is out, within the poll limit, stop
+    // listening, and give back the registers. Output still stuck after the
+    // poll limit is dropped.
+    pub fn release(self) -> R {
+        self.idle()
+        self.registers.write(INT_ENA, 0)
+        self.registers.write(INT_CLR, ALL_INTERRUPTS)
+        let Controller { registers, divisor, poll_limit, read_poll_limit, crlf, after_return, feed_pending } = self
+        return registers
+    }
+
+    // Wait until everything written has left; false if it has not after
+    // the poll limit for each byte the FIFO holds.
+    fn idle(&mut self) -> bool {
+        budget := self.poll_limit as u64 * (FIFO_DEPTH as u64 + 1)
+        polls := 0u64
+        for {
+            status := self.registers.read(STATUS)
+            state := self.registers.read(FSM_STATUS)
+            if hal.decode(TX_COUNT, status) == 0 && hal.decode(TX_STATE, state) == 0 {
+                // The state machine reads idle for a moment between the
+                // FIFO's last byte and its start bit: look again.
+                if hal.decode(TX_STATE, self.registers.read(FSM_STATUS)) == 0 && hal.decode(TX_COUNT, self.registers.read(STATUS)) == 0 {
+                    return true
+                }
+            }
+            polls += 1
+            if self.poll_limit != NO_POLL_LIMIT && polls >= budget {
+                return false
+            }
+        }
+    }
+
+    fn settle(&mut self) -> void!hal.Error {
+        if !self.idle() {
+            return err(hal.Error.Timeout)
+        }
+        return ok()
+    }
+
+    // Queue the start of `bytes` while the transmit FIFO has room; returns
+    // how many went in.
+    fn queue(&mut self, bytes: &[u8]) -> usize {
+        count := 0usize
+        queued := hal.decode(TX_COUNT, self.registers.read(STATUS)) as usize
+        for count < bytes.len && queued < FIFO_DEPTH {
+            byte := bytes[count]
+            if self.crlf && byte == LINE_FEED && !self.feed_pending {
+                self.registers.write(FIFO, CARRIAGE_RETURN as u32)
+                self.feed_pending = true
+            } else {
+                self.registers.write(FIFO, byte as u32)
+                self.feed_pending = false
+                count += 1
+            }
+            queued += 1
+        }
+        return count
+    }
+
+    fn write_divisor(&mut self) {
+        sixteenths := self.divisor.sixteenths
+        self.registers.write(CLKDIV, (sixteenths >> 4) | ((sixteenths & 0xF) << 20))
+    }
+
+    // Latch the configuration into the controller's clock domain.
+    fn update(&mut self) {
+        self.registers.write(REG_UPDATE, 1)
+        for _ in 0..UPDATE_POLLS {
+            if (self.registers.read(REG_UPDATE) & 1) == 0 {
+                return
+            }
+        }
+    }
+
+    fn reset_fifos(&mut self, fifos: u32) {
+        conf := self.registers.read(CONF0)
+        self.registers.write(CONF0, conf | fifos)
+        self.update()
+        self.registers.write(CONF0, conf & ~fifos)
+        self.update()
+    }
+}

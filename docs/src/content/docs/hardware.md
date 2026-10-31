@@ -13,11 +13,11 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Layer | Import | What it gives you |
 | --- | --- | --- |
 | Device protocols | `std/embedded/hal` | Pin, delay, I2C, SPI, and serial interfaces that drivers are written against. |
-| Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, shared by every chip that contains the controller. |
+| Peripheral drivers | `std/embedded/peripheral/...` | I2C, SPI, and UART controller drivers, and Espressif's USB serial port, shared by every chip that contains the controller. |
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
-| Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
+| Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick; the ESP32-C6's interrupt matrix in `std/embedded/chip/esp32c6`. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
-| DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
+| DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma`, `std/embedded/chip/esp32c6` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels, and the ESP32-C6's for copies. |
 | Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, and a simulated clock that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
@@ -1103,6 +1103,15 @@ Without a manifest, pass `--board pico` to
 `dodo build`, `dodo run`, or `dodo check`. Editors use the manifest's board
 too.
 
+An Espressif ESP32-C6-DevKitC-1 needs no button at all: with
+`board = "esp32c6_devkitc"`, connect either of its USB connectors and run
+`dodo run`. Dodo resets the chip into its boot ROM's download mode through
+the USB serial port, writes the firmware, checks it, and restarts the chip
+into it, so the RGB LED blinks. `dodo build` writes
+`build/dev/riscv32-unknown-none-elf/blink.elf` and `blink.bin` next to it, the
+flash contents from offset 0, which esptool or espflash can also write. See
+[the ESP32-C6](#the-esp32-c6-and-esp32-c6-devkitc-1).
+
 The `board` setting selects the chip's instruction set, its startup code and
 linker script, and the package `std/embedded/board` resolves to. That package is
 `std/embedded/board/pico` here, and every board package offers the same entry points,
@@ -1138,6 +1147,7 @@ import `std/embedded/board`; keep that code in drivers and test them with fakes.
 | `pico` | `rp2040` | `std/embedded/board/pico`: Raspberry Pi Pico, 2 MiB flash, LED on GP25. |
 | `pico2` | `rp2350` | `std/embedded/board/pico2`: Raspberry Pi Pico 2, 4 MiB flash, LED on GP25. |
 | `pico2_w` | `rp2350` | `std/embedded/board/pico2_w`: Raspberry Pi Pico 2 W, 4 MiB flash, LED on the CYW43439 wireless chip. |
+| `esp32c6_devkitc` | `esp32c6` | `std/embedded/board/esp32c6_devkitc`: Espressif ESP32-C6-DevKitC-1, 8 MiB flash, RGB LED (WS2812) on GPIO 8. |
 
 ### The RP2040 and Raspberry Pi Pico
 
@@ -2064,6 +2074,96 @@ own pins.
 It does not load the wireless firmware, so Wi-Fi and Bluetooth are not
 available yet.
 
+### The ESP32-C6 and ESP32-C6-DevKitC-1
+
+The `esp32c6` chip runs on the Espressif ESP32-C6's 160 MHz RISC-V core and
+compiles for `riscv32-unknown-none-elf` with the M, A, and C extensions
+(`cpu = "generic-rv32"`, `features = "+m,+a,+c"`). Its boot ROM supports
+direct boot: when flash starts with a marker, the ROM maps the flash chip
+through the cache at `0x42000000` and jumps into it. So the firmware is the
+linked program as it lies in flash, with no second-stage bootloader,
+partition table, or image header, and the compiler adds the rest:
+
+| Part | What it does |
+| --- | --- |
+| Boot marker | `0xaedb041d` twice at flash offset 0, then the reset handler at `0x42000008`. |
+| Reset handler | Masks interrupts, turns off the watchdogs the boot ROM leaves running, opens SRAM to DMA (the access permission filters admit only the CPU at reset), copies `.data` and `.ramfunc`, zeroes `.bss`, switches the flash from the ROM's 1-bit reads at 30 MHz to dual I/O at 80 MHz, routes CPU interrupt 1, unmasks interrupts, and calls `main`. |
+| Interrupts | A vectored trap table. Every interrupt source the program enables raises CPU interrupt 1, and the runtime saves the caller-saved registers and calls the handler of each pending source, so an `@interrupt(UART0)` handler is an ordinary function, named after its [source](#interrupts-on-the-esp32-c6). Default handlers halt, except `USB_DEVICE` and the DMA channels' sources, which call `dodo_usb_interrupt` and `dodo_dma_interrupt` if the program defines them. |
+| Exceptions | `Exception_Handler(mcause, mepc, mtval)`; the default reports through the panic hook as `processor exception check failed at mcause:mepc:CAUSE:PC`. |
+| Panic hook | `dodo_board_panic` masks interrupts, writes the failure to the program's [serial ports](#panics-on-the-serial-port) and to the USB serial port while one is open, and halts. As on the Raspberry Pi chips, a program can define its own. |
+| Runtime helpers | `memcpy`, `memmove`, `memset`, `memcmp`, 64-bit division, and software `f32` and `f64` arithmetic, the same code as on the RP2040: the core multiplies and divides 32-bit integers in hardware but has no floating-point unit. |
+| Linker script | Flash at `0x42000000` (size from the board), 505 KiB of SRAM at `0x40800000` up to the boot ROM's data, and the stack at the top; `.ramfunc` and `.noinit` [sections](#sections-and-alignment). Functions placed with `@section` are never inlined into others. The boot ROM's functions are named at their stable jump table entries, such as `software_reset` and `esp_rom_spiflash_read`. |
+
+`dodo run` flashes through the boot ROM's serial protocol, the one esptool
+speaks, over the chip's own USB serial port (USB-Serial-JTAG, which decodes
+the reset into download mode in hardware), or over a CP210x or CH34x USB
+serial adapter wired to EN and the boot pin as on Espressif's boards. It
+checks the chip, writes 1 KiB blocks, compares the flash's MD5 with the
+image's, and skips writing when the flash already holds the image. Set
+`DODO_SERIAL_PORT` to choose the port when several boards are connected.
+Flashing needs macOS or Linux; on Windows, write the `.bin` at offset 0 with
+esptool or espflash.
+
+`std/embedded/chip/esp32c6` is the chip support. `esp32c6.take()` raises the
+CPU from the boot ROM's 80 MHz to 160 MHz and hands out the peripherals once:
+
+| Part | What it does |
+| --- | --- |
+| `p.pins` | GPIO 0 to 23, except GPIO 12 and 13, the USB serial port's lines (GPIO 24 to 30 are the module's flash). The GPIO matrix connects any peripheral signal to any pin, so `i2c`, `spi`, `uart`, `uart_flow`, and `pwm` take any free pins. `Pin` adds `set_pull(up, down)` and `set_open_drain(on)`, and `listen` watches one edge, both edges, or one level. |
+| I2C | One controller (`esp_i2c`), as master, 1 kHz to 1 MHz, with 7- and 10-bit addresses and `probe`; open-drain lines with the pads' pull-ups. Longer transfers run as several queued runs that keep the bus. |
+| SPI | GP-SPI2 (`esp_spi`), as master, from 78.2 kHz to 80 MHz, full duplex in runs of 64 bytes; chip selects are output pins. `set_loopback(true)` reads MISO from the MOSI pin, for self-tests. |
+| Serial ports | UART0 and UART1 (`esp_uart`), 300 to 5 000 000 bit/s, with 128-byte FIFOs, the Reader and Writer protocols, `set_format`, `set_crlf`, `set_break`, `set_loopback`, flow control, and interrupts, as `pl011` offers. |
+| PWM | The LED PWM controller's six channels and four timers, 5 Hz to 40 MHz, with up to 16384 duty steps; outputs at the same frequency share a timer. |
+| ADC | ADC1 on GPIO 0 to 6, 12 bits at the largest attenuation, calibrated from the chip's eFuse so that 4095 is 3.3 V: `hal.read_millivolts(&mut input, 3300)`. `temperature()` reads the on-chip sensor; `esp32c6.millicelsius` converts its 8-bit readings. |
+| `p.timer` | The system timer: `now_us`, `now_ticks` (16 MHz), the delay protocol, and three alarms. `alarm.schedule_at(time_us)` takes a 64-bit microsecond time; `sleep_until` makes an alarm the [executor](#tasks-and-the-executor)'s clock. |
+| `p.usb.serial()` | The USB serial port (`esp_usb_serial`): the Reader and Writer protocols over the hardware's 64-byte FIFOs. A write waits for a host that has the port open (DTR on) for up to 50 ms, so printing never stops the program, and keeps the first 64 bytes for a terminal opened later. |
+| `p.dma` | The general DMA controller's three channels, as `hal.DmaChannel`, for copies of up to 32 736 bytes between buffers in SRAM, with `copy`, `set_signal`, and interrupts. Its peripherals take DMA through their own interfaces, not register addresses, so transfers paced by a peripheral are `InvalidInput`. |
+| `pins.ws2812(pin)` | Up to seven WS2812 addressable LEDs, sent by the remote control peripheral (RMT). |
+| `esp32c6.reboot_to_bootloader()`, `restart()` | Restart into the boot ROM's download mode, or into the firmware. `dodo run` clears the download request when it flashes. |
+
+The ESP32-C6-DevKitC-1's package, `std/embedded/board/esp32c6_devkitc`,
+claims the RGB LED as `b.led`: `set_high` lights it in `LED_ON_COLOR`, a dim
+white, and `b.led.set_color(0x00_10_00)` shows any color. `BUTTON_PIN` is
+the BOOT button on GPIO 9, low while pressed. The usual bus pins are on the
+J1 header: I2C on GPIO 6 and 7, SPI on GPIO 2, 4, and 5 with GPIO 3 for a
+chip select, and the serial port on GPIO 16 and 17, which the board's USB
+serial adapter connects to its second USB connector.
+[`examples/esp32c6_tasks`](https://github.com/Jotrorox/dodo/blob/main/examples/esp32c6_tasks/main.dodo)
+runs three tasks on the board, woken by an alarm, the BOOT button's GPIO
+interrupt, and the USB serial port's receive interrupt.
+
+#### Interrupts on the ESP32-C6
+
+The interrupt matrix connects the chip's 77 interrupt sources to the CPU.
+The vector names are the sources' names in Espressif's technical reference
+manual, such as `UART0`, `GPIO`, `SYSTIMER_TARGET0`, `I2C_EXT0`, `SPI2`, and
+`USB_DEVICE`; the package defines each source's number under the same name.
+`esp32c6.enable(source)` routes a source to the CPU, `disable` stops it,
+`is_pending` reads its level, and `pend(n)` and `unpend(n)` raise and lower
+the software sources `FROM_CPU_INTR0` to `FROM_CPU_INTR3`:
+
+```dodo
+@interrupt(SYSTIMER_TARGET0)
+fn tick() {
+    unsafe {
+        match &mut ALARM {
+            some(alarm) => {
+                alarm.clear()
+                alarm.schedule_in(1000)
+            }
+            none => {}
+        }
+    }
+}
+
+alarm.listen()
+esp32c6.enable(alarm.irq())
+```
+
+Sources are level-triggered: a handler must clear its peripheral's
+condition, or it runs again at once. Handlers run with interrupts masked,
+one at a time.
+
 ### Custom boards
 
 For a circuit board of your own, set `chip` instead of `board` and configure
@@ -2090,7 +2190,9 @@ entry = "main.dodo"
 chip = "rp2040"
 ```
 
-A chip alone assumes 2 MiB of flash (4 MiB for `chip = "rp2350"`). To give the board a name that
+A chip alone assumes 2 MiB of flash (4 MiB for `chip = "rp2350"` and
+`chip = "esp32c6"`). An ESP32-C6 board needs no configuration:
+`p := chip.take()!`. To give the board a name that
 `std/embedded/board` resolves to, add it to the compiler (see below).
 
 ### Adding chips and boards
@@ -2113,9 +2215,10 @@ so each new board or chip is a small, self-contained addition:
 
 The compiler compiles the runtime itself with the selected target machine, so
 no assembler or C toolchain is involved. `scripts/test_pico.py` (with
-`--board pico`, `--board pico2`, or `--board pico2_w`) shows how to check a chip
-on real hardware, and `scripts/test_rp2350_float.py` checks the RP2350's
-coprocessor `f64` helpers against the software ones on a board.
+`--board pico`, `--board pico2`, or `--board pico2_w`) and
+`scripts/test_esp32c6.py` show how to check a chip on real hardware, and
+`scripts/test_rp2350_float.py` checks the RP2350's coprocessor `f64` helpers
+against the software ones on a board.
 
 ### Unsupported chips
 
@@ -2143,8 +2246,14 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 ## Current limits
 
-- The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
-  chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
+- The boards are `pico`, `pico2`, `pico2_w`, and `esp32c6_devkitc`, on the
+  `rp2040`, `rp2350`, and `esp32c6` chips. On the ESP32-C6, the radios
+  (Wi-Fi, Bluetooth LE, IEEE 802.15.4), the low-power core, sleep modes, and
+  the I2C and SPI controllers' target (slave) modes are not supported; its
+  DMA copies between buffers but is not used by the buses yet, an ADC input
+  draws enough current while it samples that sources above about 10 kOhm
+  read low, and flashing works from macOS and Linux. The Raspberry Pi
+  chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
   PIO, the timer, DMA, a USB serial port, and the second core; other USB
   devices (HID,
   mass storage, several functions at once) or USB host mode are not bundled

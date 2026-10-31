@@ -1,7 +1,7 @@
 //! Command-line driver. Linking is an explicit process invocation, never a shell command.
 use cli::{Action, Invocation, Parsed};
 use dodoc::codegen::{Context, FileType};
-use dodoc::hardware::{Platform, image, serial};
+use dodoc::hardware::{ImageFormat, Platform, esp_flash, image, serial};
 use dodoc::{cli, codegen, lsp, package, project, sema, toml};
 use project::{Emit, Purpose, Resolved};
 use std::ffi::{OsStr, OsString};
@@ -746,8 +746,17 @@ fn link_firmware(
     let path = image_path(out, platform);
     fs::write(&path, flashable).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
-/// Build firmware and copy it to the platform's mounted bootloader drive.
+/// Build firmware and flash it: copy it to the platform's mounted
+/// bootloader drive, or write it through the chip's serial flasher.
 fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Result<i32, String> {
+    if let ImageFormat::EspFlash {
+        chip_id,
+        usb,
+        download_flag,
+    } = platform.chip.image
+    {
+        return flash_serial(args, platform, loaded, chip_id, usb, download_flag);
+    }
     let mut drives = platform.bootloader_drives();
     if drives.is_empty() {
         drives = restart_into_bootloader(args, platform)?;
@@ -792,6 +801,52 @@ fn flash(args: &mut Args, platform: Platform, loaded: &package::Loaded) -> Resul
             args.input.display(),
             flashable.len() / 2 / 1024,
             drive.display()
+        );
+    }
+    Ok(0)
+}
+/// Build firmware and write it through the boot ROM's serial flasher of an
+/// Espressif chip, then restart the chip into it.
+fn flash_serial(
+    args: &mut Args,
+    platform: Platform,
+    loaded: &package::Loaded,
+    chip_id: u16,
+    usb: serial::UsbId,
+    download_flag: esp_flash::DownloadFlag,
+) -> Result<i32, String> {
+    let port = esp_flash::find_port(usb, platform.description())?;
+    let temp = TempDir::new(&std::env::temp_dir())?;
+    let elf = temp.0.join("firmware.elf");
+    args.emit = Emit::Exe;
+    compile(args, loaded, &elf)?;
+    let flashable = fs::read(image_path(&elf, platform)).map_err(|e| e.to_string())?;
+    if args.verbose {
+        eprintln!(
+            "Flashing: {} -> {}",
+            image_path(&elf, platform).display(),
+            port.path.display()
+        );
+    }
+    let written = esp_flash::flash(
+        &port,
+        &flashable,
+        chip_id,
+        platform.flash().length,
+        download_flag,
+        args.verbose,
+    )?;
+    if !args.quiet {
+        let verb = if written.unchanged {
+            "Flash already holds"
+        } else {
+            "Flashed"
+        };
+        eprintln!(
+            "{verb} {} ({} KiB) on {}",
+            args.input.display(),
+            written.bytes.div_ceil(1024),
+            port.path.display()
         );
     }
     Ok(0)
