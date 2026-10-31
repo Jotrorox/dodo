@@ -2,14 +2,15 @@
 
 ## Unreleased
 
-- `truetype.GlyphCache` keeps rasterized glyphs as coverage masks in
-  caller-provided storage, so text drawn again is blended instead of
-  rasterized: about 25 times faster at 14 pixels and 11 times faster at 96.
-  It draws like `Font.draw` except that glyphs are placed to a quarter pixel,
-  and a full cache evicts its oldest glyphs. `std/graphics` gains the
-  coverage mask calls it is built on: `outline_bounds`, `coverage_mask`, and
-  `Canvas.fill_mask` and `gradient_mask`, which blend exactly as
-  `fill_outline` does.
+- `truetype.GlyphCache` keeps rasterized glyphs in caller-provided storage,
+  so text drawn again is blended instead of rasterized: about 13 times
+  faster at 14 pixels and 6 times faster at 96. It draws like `Font.draw`
+  except that glyphs are placed to a quarter pixel, and a full cache evicts
+  its oldest glyphs. `std/graphics` gains the coverage calls it is built on:
+  `outline_bounds`, `coverage_mask` with `Canvas.fill_mask` and
+  `gradient_mask`, and the run-length `coverage_spans` with
+  `Canvas.fill_spans` and `gradient_spans`, all drawing exactly what
+  `fill_outline` draws.
 - `&mut T` parameters of Dodo functions, methods and closures are `noalias`
   in LLVM, as Rust's are, so optimized code no longer reloads fields of
   `self` after every store through a slice or pointer it holds. A loop that

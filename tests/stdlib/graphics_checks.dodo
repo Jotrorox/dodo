@@ -1711,6 +1711,7 @@ fn coverage_masks() {
     path_storage := [0i32; 128]
     path := graphics.Path.new(&mut path_storage)
     mask := [0u8; 40 * 40]
+    spans := [0u8; 4096]
     a_pixels := [0u8; 40 * 32 * 4]
     b_pixels := [0u8; 40 * 32 * 4]
     colors := [graphics.WHITE, graphics.rgba(250, 120, 30, 150), graphics.hex(0x3366cc)]
@@ -1759,9 +1760,54 @@ fn coverage_masks() {
             a_dirty := a.dirty()
             b_dirty := b.dirty()
             assert(a_dirty.equals(&b_dirty))
+
+            // The same coverage stored as spans draws the same pixels.
+            b.reset_clip()
+            b.clear(backgrounds[case % 3])
+            if case == 4 {
+                b.set_clip(graphics.Rect.new(3, 9, 17, 11))
+            }
+            b.take_dirty()
+            spans_rule := graphics.FillRule.NonZero
+            if case % 2 == 1 {
+                spans_rule = graphics.FillRule.EvenOdd
+            }
+            length := graphics.coverage_spans(&path, spans_rule, &mut spans, bounds.x, bounds.y, bounds.width, bounds.height)
+            assert(length > 0 && length < area)
+            if case == 7 {
+                gradient := graphics.Gradient.linear(0, 0, 30, 20, graphics.RED, graphics.rgba(0, 0, 255, 128))
+                b.gradient_spans(&spans[..length], bounds.width, bounds.height, bounds.x + 5, bounds.y + 3, &gradient)
+            } else {
+                b.fill_spans(&spans[..length], bounds.width, bounds.height, bounds.x + 5, bounds.y + 3, colors[case % 3])
+            }
+            assert(a.equals(&b))
+            spans_dirty := b.dirty()
+            assert(a_dirty.equals(&spans_dirty))
             a.reset_clip()
             b.reset_clip()
         }
+    }
+    // Too small a buffer or an empty area encodes nothing.
+    assert_eq(graphics.spans_bound(31, 28), 1764usize)
+    assert_eq(graphics.coverage_spans(&path, graphics.FillRule.NonZero, &mut spans[..1763], 0, 0, 31, 28), 0usize)
+    assert_eq(graphics.coverage_spans(&path, graphics.FillRule.NonZero, &mut spans, 0, 0, 0, 28), 0usize)
+    // Arbitrary bytes as spans draw without trapping and stay in bounds.
+    random := Random { state: 0x5eed1234 }
+    noise := graphics.canvas(&mut a_pixels, 40, 32, graphics.PixelFormat.Rgba8888)!
+    gray := graphics.canvas(&mut b_pixels, 40, 32, graphics.PixelFormat.Gray8)!
+    for _ in 0u32..300 {
+        length := (random.next() % 200) as usize
+        for i in 0usize..length {
+            spans[i] = (random.next() & 255) as u8
+        }
+        width := random.next() % 70
+        height := random.next() % 50
+        x := (random.next() % 100) as i32 - 50
+        y := (random.next() % 80) as i32 - 40
+        noise.fill_spans(&spans[..length], width, height, x, y, graphics.rgba(200, 100, 50, (random.next() & 255) as u8))
+        gray.fill_spans(&spans[..length], width, height, x, y, graphics.WHITE)
+        gradient := graphics.Gradient.linear(0, 0, 40, 0, graphics.RED, graphics.BLUE)
+        noise.gradient_spans(&spans[..length], width, height, x, y, &gradient)
     }
 
     // A mask region larger than the outline is zero around it; a region
@@ -1924,7 +1970,7 @@ fn glyph_cache_eviction() {
             assert_eq(cache.hits(), 0u64)
         } else {
             // Glyphs were reused, and many more were cached than fit.
-            assert(cache.hits() > 50 && cache.misses() > cache.len() as u64 + 200)
+            assert(cache.hits() > 30 && cache.misses() > cache.len() as u64 + 150)
         }
     }
 }

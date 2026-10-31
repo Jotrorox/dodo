@@ -528,9 +528,9 @@ fn paint_outline(font: &Font, canvas: &mut graphics.Canvas, glyph: u32, x: i64, 
 // -- Glyph cache -------------------------------------------------------------
 
 // Remembers rasterized glyphs so drawing text again copies coverage instead
-// of decoding and rasterizing outlines. Each cached glyph is a coverage mask,
-// one byte per pixel, kept in storage the caller provides; the cache never
-// allocates. Draw through the cache wherever Font.draw would be called:
+// of decoding and rasterizing outlines. Each cached glyph is its coverage,
+// stored as runs (graphics.coverage_spans) in storage the caller provides;
+// the cache never allocates. Draw through the cache wherever Font.draw would be called:
 //
 //     storage := [0u8; 65536]
 //     cache := truetype.GlyphCache.new(&font, &mut storage)
@@ -540,10 +540,10 @@ fn paint_outline(font: &Font, canvas: &mut graphics.Canvas, glyph: u32, x: i64, 
 // placed to a quarter pixel horizontally instead of 1/256: a glyph is cached
 // for each size and each of the four quarter-pixel offsets it is drawn at.
 // Any amount of storage works, more holds more glyphs: 64 KiB holds a few
-// hundred glyphs at 14 pixels per em, or about a dozen at 96. When the
-// cache is full the glyphs cached longest ago make room. A glyph whose mask
-// would take more than a quarter of the storage is drawn from its outline,
-// uncached, so one huge glyph cannot flush the rest.
+// hundred glyphs at 14 pixels per em, or a few dozen at 96. When the cache
+// is full the glyphs cached longest ago make room. A glyph whose bounding
+// box exceeds about a quarter of the storage in pixels is drawn from its
+// outline, uncached, so one huge glyph cannot flush the rest.
 pub struct GlyphCache {
     font: &Font
     masks: Masks
@@ -582,14 +582,15 @@ pub struct GlyphCache {
     }
 }
 
-// Storage layout: a hash table of SLOT_BYTES slots, then a ring of mask
+// Storage layout: a hash table of SLOT_BYTES slots, then a ring of glyph
 // blocks. A slot holds a glyph key (0 when free) and the offset of its block
 // in the ring; a block holds a BLOCK_HEADER header (key, block length, mask
-// width and height, and the mask's top-left pixel relative to the glyph
-// origin's pixel) followed by the mask. Blocks are added at the ring's head
-// and the oldest are evicted from its tail.
+// width and height, the mask's top-left pixel relative to the glyph origin's
+// pixel, and the length of its spans) followed by the glyph's coverage as
+// graphics.coverage_spans encodes it. Blocks are added at the ring's head and
+// the oldest are evicted from its tail.
 const SLOT_BYTES: usize = 8
-const BLOCK_HEADER: usize = 24
+const BLOCK_HEADER: usize = 28
 // One slot per this many bytes of storage.
 const BYTES_PER_SLOT: usize = 128
 const MIN_SLOTS: usize = 8
@@ -670,21 +671,27 @@ struct Masks {
                 self.misses += 1
                 outline := font.glyph(glyph, (phase * 64) as i32, 0, size)
                 bounds := graphics.outline_bounds(&outline)
+                // Reserve room to rasterize the glyph and encode its spans,
+                // at most half the ring, then shrink the block to the spans.
                 area := bounds.width as u64 * bounds.height as u64
-                if area > ((self.pool_size / 4) as u64) || round_up4(BLOCK_HEADER + area as usize) > self.pool_size {
+                if 2 * area + bounds.height as u64 + (BLOCK_HEADER as u64) + 3 > ((self.pool_size / 2) as u64) {
                     paint_outline(font, canvas, glyph, x, y, size, color, gradient, shaded)
                     return
                 }
-                total := round_up4(BLOCK_HEADER + area as usize)
-                block = self.pool + self.allocate(total)
+                needed := graphics.spans_bound(bounds.width, bounds.height)
+                reserved := round_up4(BLOCK_HEADER + needed)
+                block = self.pool + self.allocate(reserved)
+                start := block + BLOCK_HEADER
+                length := graphics.coverage_spans(&outline, graphics.FillRule.NonZero, &mut self.storage[start..start + needed], bounds.x, bounds.y, bounds.width, bounds.height)
+                total := round_up4(BLOCK_HEADER + length)
+                self.shrink_last(reserved, total)
                 write_u32(self.storage, block, key)
                 write_u32(self.storage, block + 4, total as u32)
                 write_u32(self.storage, block + 8, bounds.width)
                 write_u32(self.storage, block + 12, bounds.height)
                 write_u32(self.storage, block + 16, (bounds.x as i64 + OFFSET_BIAS) as u32)
                 write_u32(self.storage, block + 20, (bounds.y as i64 + OFFSET_BIAS) as u32)
-                start := block + BLOCK_HEADER
-                graphics.coverage_mask(&outline, graphics.FillRule.NonZero, &mut self.storage[start..start + area as usize], bounds.x, bounds.y, bounds.width, bounds.height)
+                write_u32(self.storage, block + 24, length as u32)
                 offset := (block - self.pool) as u32
                 self.insert(key, offset)
             }
@@ -693,12 +700,13 @@ struct Masks {
         height := read_u32(self.storage, block + 12)
         left := column + read_u32(self.storage, block + 16) as i64 - OFFSET_BIAS
         top := row + read_u32(self.storage, block + 20) as i64 - OFFSET_BIAS
+        length := read_u32(self.storage, block + 24) as usize
         start := block + BLOCK_HEADER
-        mask := &self.storage[start..start + width as usize * height as usize]
+        spans := &self.storage[start..start + length]
         if shaded {
-            canvas.gradient_mask(mask, width, height, left as i32, top as i32, gradient)
+            canvas.gradient_spans(spans, width, height, left as i32, top as i32, gradient)
         } else {
-            canvas.fill_mask(mask, width, height, left as i32, top as i32, color)
+            canvas.fill_spans(spans, width, height, left as i32, top as i32, color)
         }
     }
 
@@ -811,6 +819,12 @@ struct Masks {
             }
             self.evict()
         }
+    }
+    // Give back the end of the block just allocated, `reserved` bytes long,
+    // keeping its first `total`.
+    fn shrink_last(&mut self, reserved: usize, total: usize) {
+        self.head -= reserved - total
+        self.used -= reserved - total
     }
     // Drop the oldest block and its table entry.
     fn evict(&mut self) {

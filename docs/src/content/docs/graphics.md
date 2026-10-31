@@ -495,6 +495,20 @@ by whole pixels draws the same pixels as the outline moved by the same
 amount. Coverage depends on where a shape sits within a pixel, so make one
 mask per subpixel offset you draw at.
 
+Coverage spans store the same coverage as runs, skipping uncovered pixels
+and filling fully covered ones whole, so they draw faster and usually take
+less room than the mask:
+
+```dodo
+buffer := [0u8; 4096]                    // at least spans_bound(width, height)
+length := graphics.coverage_spans(&shape, graphics.FillRule.NonZero, &mut buffer, bounds.x, bounds.y, bounds.width, bounds.height)
+canvas.fill_spans(&buffer[..length], bounds.width, bounds.height, bounds.x + 40, bounds.y, graphics.WHITE)
+```
+
+`coverage_spans` returns the length of the spans, or 0 when the buffer is
+smaller than `spans_bound(width, height)`. `fill_spans` and `gradient_spans`
+draw exactly what `fill_mask` and `gradient_mask` draw.
+
 ## Gradients
 
 A `graphics.Gradient` paints colors that change across an area:
@@ -599,8 +613,8 @@ a damaged glyph draws as much of its outline as is valid.
 
 `Font.draw` rasterizes every glyph from its outline each time. Text that is
 drawn again, such as labels and counters redrawn every frame, is much faster
-through a `truetype.GlyphCache`, which keeps each rasterized glyph as a
-coverage mask in storage you provide:
+through a `truetype.GlyphCache`, which keeps each rasterized glyph as
+[coverage spans](#coverage-masks) in storage you provide:
 
 ```dodo
 cache_storage := [0u8; 65536]
@@ -611,22 +625,24 @@ cache.draw(&mut canvas, 8, 8, "Score: 1200", 14, graphics.WHITE)
 
 `cache.draw` and `cache.draw_gradient` take the same arguments and return the
 same area as the `Font` calls. The first time a glyph appears at a size it is
-rasterized into the cache; afterwards drawing it is a blend of its mask. On
-an Apple M-series machine at `-O2`, repeated 14-pixel text drew about 25
-times faster than with `Font.draw` (0.19 µs instead of 5 µs per glyph) and
-96-pixel text about 11 times faster (1 µs instead of 11 µs).
+rasterized into the cache; afterwards drawing it only blends its stored
+coverage. On an Apple M-series machine at `-O2`, repeated 14-pixel text
+drew about 13 times faster than with `Font.draw` (0.17 µs instead of 2.3 µs
+per glyph) and 96-pixel text about 6 times faster (0.64 µs instead of
+3.7 µs). The gain is largest at small sizes, where rasterizing costs the
+most per pixel drawn.
 
 The one visible difference is placement: the cache positions glyphs to a
 quarter pixel horizontally, where `Font.draw` uses 1/256 pixel, and keeps a
-separate mask for each of the four quarter-pixel offsets a glyph is drawn
+separate copy for each of the four quarter-pixel offsets a glyph is drawn
 at. Glyphs that land on a quarter pixel draw exactly as `Font.draw` draws
 them.
 
 Any amount of storage works, and more holds more glyphs: 64 KiB holds
-several hundred glyphs at 14 pixels or a dozen or so at 96. A full cache
-evicts the glyphs it cached longest ago. A glyph whose mask would need more
-than a quarter of the storage is drawn from its outline without being
-cached, so one huge glyph cannot flush the rest. `len()`, `hits()` and
+several hundred glyphs at 14 pixels or a few dozen at 96. A full cache
+evicts the glyphs it cached longest ago. A glyph whose bounding box covers
+more pixels than about a quarter of the storage's bytes is drawn from its
+outline without being cached, so one huge glyph cannot flush the rest. `len()`, `hits()` and
 `misses()` show how well the storage fits the text, and `clear()` empties
 the cache. The cache borrows the font, so it cannot outlive it; use one
 cache per font.
