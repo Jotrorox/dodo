@@ -5,23 +5,26 @@ import "std/graphics"
 import "std/graphics/font"
 import "std/window"
 
-// A ball bounces around a window. Click to move it, press Space to pause and
-// Escape or close the window to quit. Run with `dodo run examples/window.dodo`.
+// A ball bounces around a window, drawn once per display refresh. Click to
+// move it, press Space to pause and Escape or close the window to quit. Run
+// with `dodo run examples/window.dodo`.
 
+// Positions are in thousandths of a pixel, speeds in pixels per second, so
+// the ball moves equally fast at 60 and at 120 Hz.
 struct Ball {
-    x: i32
-    y: i32
-    dx: i32
-    dy: i32
+    x: i64
+    y: i64
+    dx: i64
+    dy: i64
 }
 
-fn step(ball: &mut Ball, width: i32, height: i32, radius: i32) {
-    ball.x += ball.dx
-    ball.y += ball.dy
-    if ball.x < radius || ball.x > width - radius {
+fn step(ball: &mut Ball, micros: i64, width: i64, height: i64, radius: i64) {
+    ball.x += ball.dx * micros / 1000
+    ball.y += ball.dy * micros / 1000
+    if (ball.x < radius && ball.dx < 0) || (ball.x > width - radius && ball.dx > 0) {
         ball.dx = -ball.dx
     }
-    if ball.y < radius || ball.y > height - radius {
+    if (ball.y < radius && ball.dy < 0) || (ball.y > height - radius && ball.dy > 0) {
         ball.dy = -ball.dy
     }
 }
@@ -31,43 +34,45 @@ fn run() -> void!window.Error {
     scale := win.scale()
     label := font.medium().scaled(scale)
     radius := 16 * scale as i32
-    ball := Ball { x: 100, y: 100, dx: 3 * scale as i32, dy: 2 * scale as i32 }
+    ball := Ball { x: 100000, y: 100000, dx: 180 * scale as i64, dy: 120 * scale as i64 }
     paused := false
     for {
-        // Handle everything pending, then draw a frame about every 16 ms.
-        for {
-            match win.wait_event_timeout(16)? {
-                some(window.Event.Close) => {
+        // Handle events as they come; none means the next frame is due.
+        match win.wait_event_until_frame()? {
+            some(window.Event.Close) => {
+                return ok()
+            }
+            some(window.Event.Key(key)) => {
+                if key.key == window.Key.Escape {
                     return ok()
                 }
-                some(window.Event.Key(key)) => {
-                    if key.key == window.Key.Escape {
-                        return ok()
-                    }
-                    if key.key == window.Key.Space && key.pressed && !key.repeat {
-                        paused = !paused
-                    }
+                if key.key == window.Key.Space && key.pressed && !key.repeat {
+                    paused = !paused
                 }
-                some(window.Event.MouseButton(button)) => {
-                    if button.pressed {
-                        ball.x = button.x
-                        ball.y = button.y
-                    }
-                }
-                some(_) => {}
-                none => {
-                    break
-                }
+                continue
             }
+            some(window.Event.MouseButton(button)) => {
+                if button.pressed {
+                    ball.x = button.x as i64 * 1000
+                    ball.y = button.y as i64 * 1000
+                }
+                continue
+            }
+            some(_) => {
+                continue
+            }
+            none => {}
         }
-        width := win.width() as i32
-        height := win.height() as i32
+        width := win.width() as i64 * 1000
+        height := win.height() as i64 * 1000
         if !paused {
-            step(&mut ball, width, height, radius)
+            interval := win.frame_interval()
+            micros := interval.to_micros()! as i64
+            step(&mut ball, micros, width, height, radius as i64 * 1000)
         }
         canvas := win.canvas()
         canvas.clear(graphics.hex(0x1d2330))
-        canvas.fill_circle(ball.x, ball.y, radius as u32, graphics.hex(0xe5c07b))
+        canvas.fill_circle((ball.x / 1000) as i32, (ball.y / 1000) as i32, radius as u32, graphics.hex(0xe5c07b))
         hint := "Space pauses"
         if paused {
             hint = "Paused"

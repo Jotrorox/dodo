@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `std/graphics` solid fills and same-format blits are 9–35× faster at -O2
+  (1280×800 `clear` 1.4 ms → 0.06 ms, full-frame `blit` 2.3 ms → 0.07 ms).
+  Their loops now store through a local row subslice, which the optimizer
+  turns into vector stores and `memcpy`.
 - `@link_name("symbol")` binds an `extern "C"` prototype to a symbol other
   than its own name, and several prototypes may bind one symbol with different
   signatures. Each call uses its own declaration's signature, so Objective-C
@@ -16,6 +20,16 @@
   function pointers, raw pointers and `usize`. The type never converts to or
   from Dodo's `fn(..)` and closure types, which keep their internal ABI. C
   declarations may take and return C function pointers.
+- `extern "C"` functions pass and return `@repr(C)` structs by value, both
+  when Dodo calls C and when C calls a Dodo `extern "C" fn`. The compiler
+  classifies each struct as the target's C compiler does for x86-64 System V
+  (Linux, macOS), Windows x64 and AArch64 (Linux, macOS, Windows), so calls
+  such as Metal's `dispatchThreadgroups:threadsPerThreadgroup:` with
+  `MTLSize` need no C shim. Struct fields must themselves be C types, and
+  structs with destructors are rejected. Other targets report an error for a
+  struct by value. A fixture checks every classification case against the
+  host C compiler, including structs that move to the stack when registers
+  run out.
 - Antialiased drawing, gradients and TrueType text for `std/graphics`, still
   integer-only, allocation-free and identical on every target, firmware
   included. The `aa_` canvas calls draw lines, thick round-capped lines,
@@ -63,6 +77,16 @@
   factor. `std/window/x11` holds the protocol encoders and parsers as pure
   functions that build for every target. `dodo run` needs no flags or
   system packages.
+- `std/window` paces animation: `wait_event_until_frame()` returns events as
+  they arrive and `none` once per display refresh, so a steady stream of
+  mouse moves no longer holds frames back, and `frame_interval()` gives the
+  refresh period. Frames follow the display where the system reports it: a
+  `CADisplayLink` on macOS 14 and later, DWM's refresh timing on Windows and
+  the X11 Present extension on Linux, with a timer elsewhere. Animating
+  programs on macOS are exempt from App Nap until they call `wait_event()`
+  again, and Windows waits use a high-resolution timer instead of the
+  15.6 ms system tick. `examples/window.dodo` uses it and moves the ball by
+  time, at the same speed on 60 and 120 Hz displays.
 - MQTT 3.1.1 packages for both ends of a publish/subscribe system, in the
   style of the web packages. `std/mqtt/broker` runs a broker in one line,
   `broker.new().run(b"0.0.0.0:1883")`. It serves 16 clients from one thread

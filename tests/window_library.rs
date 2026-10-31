@@ -248,8 +248,8 @@ mod x11 {
         u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) & 0xffffff
     }
 
-    #[test]
-    fn x11_window_round_trip_under_xvfb() {
+    /// Whether the X11 tools are installed; CI requires them.
+    fn have_window_tools() -> bool {
         let required = std::env::var_os("DODO_REQUIRE_WINDOW_TESTS").is_some();
         let missing: Vec<_> = ["Xvfb", "xdotool", "xwd"]
             .into_iter()
@@ -258,20 +258,16 @@ mod x11 {
         if !missing.is_empty() {
             assert!(!required, "window tests require {missing:?}");
             eprintln!("skipping: {missing:?} not installed");
-            return;
+            return false;
         }
-        let scratch = Scratch::new("xvfb");
-        let executable = scratch.0.join("events");
-        build(
-            &root().join("tests/stdlib/window_events.dodo"),
-            &executable,
-            "0",
-        );
+        true
+    }
 
-        // A display number no other test run uses at the same time.
-        let number = 90 + std::process::id() % 900;
+    /// Starts Xvfb on a display number no other test uses at the same time.
+    fn start_xvfb(offset: u32) -> (Server, String) {
+        let number = 90 + (std::process::id() * 2 + offset) % 1800;
         let display = format!(":{number}");
-        let _server = Server(
+        let server = Server(
             Command::new("Xvfb")
                 .args([
                     display.as_str(),
@@ -295,6 +291,76 @@ mod x11 {
             );
             sleep(Duration::from_millis(50));
         }
+        (server, display)
+    }
+
+    /// Frames keep their pace while events stream in: the mouse moves for
+    /// the whole two seconds the fixture animates.
+    #[test]
+    fn frames_keep_pace_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let scratch = Scratch::new("frames");
+        let executable = scratch.0.join("frames");
+        build(
+            &root().join("tests/stdlib/window_frames.dodo"),
+            &executable,
+            "0",
+        );
+        let (_server, display) = start_xvfb(1);
+        let log = scratch.0.join("frames.log");
+        let mut app = Command::new(&executable)
+            .env("DISPLAY", &display)
+            .env_remove("XAUTHORITY")
+            .stdout(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let mut step = 0;
+        let status = loop {
+            if let Some(status) = app.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(20) {
+                let _ = app.kill();
+                panic!("the frames program did not exit");
+            }
+            step += 1;
+            let (x, y) = (10 + step * 7 % 140, 10 + step * 5 % 100);
+            xdotool(&display, &["mousemove", &x.to_string(), &y.to_string()]);
+        };
+        let log = fs::read_to_string(&log).unwrap();
+        assert!(status.success(), "{status}: {log}");
+        let line = log
+            .lines()
+            .find(|line| line.starts_with("frames "))
+            .unwrap_or_else(|| panic!("no summary in:\n{log}"));
+        let fields: Vec<u64> = line
+            .split(' ')
+            .filter_map(|field| field.parse().ok())
+            .collect();
+        let (frames, events, interval) = (fields[0], fields[1], fields[2]);
+        // Xvfb refreshes at 60 Hz, so two seconds hold about 120 frames;
+        // the old fixed-wait loop drew none while the mouse moved.
+        assert!(events > 0, "no mouse moves arrived: {line}");
+        assert!((40..=130).contains(&frames), "{line}");
+        assert!((10_000..=25_000).contains(&interval), "{line}");
+    }
+
+    #[test]
+    fn x11_window_round_trip_under_xvfb() {
+        if !have_window_tools() {
+            return;
+        }
+        let scratch = Scratch::new("xvfb");
+        let executable = scratch.0.join("events");
+        build(
+            &root().join("tests/stdlib/window_events.dodo"),
+            &executable,
+            "0",
+        );
+        let (_server, display) = start_xvfb(0);
 
         let log = scratch.0.join("events.log");
         let mut app = Command::new(&executable)

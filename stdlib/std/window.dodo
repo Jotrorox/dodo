@@ -1,6 +1,7 @@
 package window
 
 import "std/graphics"
+import "std/time"
 import "std/window/native" as backend
 import "std/window/raw"
 
@@ -10,7 +11,8 @@ import "std/window/raw"
 // it out as a graphics.Canvas; update() shows the parts that changed. Events
 // are polled: wait_event() blocks for the next one, poll_event() returns
 // none when nothing is pending, so a program's main loop is an ordinary loop
-// with no callbacks.
+// with no callbacks. An animation's loop uses wait_event_until_frame()
+// instead, which also says when to draw the next frame.
 //
 // Each operating system's own window system is used directly, with nothing
 // to install: the X11 protocol over a socket on Linux, AppKit on macOS and
@@ -79,7 +81,7 @@ pub fn open(options: Options) -> Window!Error {
         return err(Error.InvalidInput)
     }
     handle := backend.Backend.open(options.title, options.width, options.height, options.resizable)?
-    return ok(Window { backend: handle, pending: raw.Event.empty() })
+    return ok(Window { backend: handle, pending: raw.Event.empty(), frame_deadline: 0, frame_previous: 0, frame_requested: false, frame_signalled: false, animating: false })
 }
 
 // Something that happened to the window.
@@ -224,6 +226,16 @@ fn convert(event: &raw.Event) -> Option<Event> {
 pub struct Window {
     backend: backend.Backend
     pending: raw.Event
+    // Frame pacing, in backend.clock() nanoseconds: when the awaited frame
+    // is due (0 before it is scheduled) and when the last one was.
+    frame_deadline: u64
+    frame_previous: u64
+    // A FRAME event was requested and has not arrived yet.
+    frame_requested: bool
+    // A FRAME event arrived: the display refreshed since the request.
+    frame_signalled: bool
+    // Frames were asked for since the last wait_event().
+    animating: bool
 
     // Size of the drawing area in pixels; also the size of canvas().
     pub fn size(&self) -> graphics.Size {
@@ -281,13 +293,118 @@ pub struct Window {
         return self.backend.present(0, 0, width, height)
     }
 
-    // The next event, waiting as long as it takes.
+    // The next event, waiting as long as it takes. A program that stops
+    // animating calls this, which lets macOS throttle it again.
     pub fn wait_event(&mut self) -> Event!Error {
+        if self.animating {
+            self.animating = false
+            self.backend.set_animating(false)
+        }
         for {
             if let some(event) = self.next(raw.FOREVER)? {
                 return ok(event)
             }
         }
+    }
+    // The next event, or none once it is time to draw the next frame. An
+    // animation handles events until none, draws, calls update() and asks
+    // again:
+    //
+    //     for {
+    //         match win.wait_event_until_frame()? {
+    //             some(event) => { ...handle it... }
+    //             none => { ...draw, then win.update(dirty)?... }
+    //         }
+    //     }
+    //
+    // A frame is due once per display refresh, frame_interval() apart,
+    // however many events arrive. Where the window system reports refreshes
+    // frames follow them: a display link on macOS 14 and later, the
+    // compositor's timing on Windows and the Present extension on X11;
+    // elsewhere a timer keeps the pace. A program slower than the display
+    // skips refreshes rather than falling behind, and a hidden window, whose
+    // display reports no refreshes, still gets a frame every two intervals.
+    // macOS does not put an animating program to sleep with App Nap until
+    // it calls wait_event() again.
+    pub fn wait_event_until_frame(&mut self) -> Option<Event>!Error {
+        if self.frame_deadline == 0 {
+            self.schedule_frame()?
+        }
+        for {
+            now := self.backend.clock()
+            if self.frame_signalled || now >= self.frame_deadline {
+                if self.frame_signalled {
+                    self.frame_previous = now
+                } else {
+                    self.frame_previous = self.frame_deadline
+                }
+                self.frame_signalled = false
+                self.frame_deadline = 0
+                return ok(none)
+            }
+            // Round up so the wait never ends early and spins.
+            wait := (self.frame_deadline - now + 999999) / 1000000
+            if wait > 1000 {
+                wait = 1000
+            }
+            if self.backend.next_event(wait as u32, &mut self.pending)? {
+                if self.pending.kind == raw.FRAME {
+                    self.note_frame()
+                } else if let some(event) = convert(&self.pending) {
+                    return ok(some(event))
+                }
+            }
+        }
+    }
+    // How long one display refresh lasts, such as about 16.7 ms at 60 Hz:
+    // the time between frames of wait_event_until_frame(), for advancing an
+    // animation by one frame. 60 Hz when the window system does not say; on
+    // X11 the real period is known after about half a second of frames.
+    pub fn frame_interval(&self) -> time.Duration {
+        return time.Duration.from_nanos(self.frame_period())
+    }
+    fn frame_period(&self) -> u64 {
+        period := self.backend.frame_period()
+        if period == 0 {
+            return 16666667
+        }
+        return period
+    }
+    // Set frame_deadline for the next frame.
+    fn schedule_frame(&mut self) -> void!Error {
+        if !self.animating {
+            self.animating = true
+            self.backend.set_animating(true)
+        }
+        period := self.frame_period()
+        if !self.frame_requested && !self.frame_signalled {
+            requested := self.backend.request_frame()?
+            self.frame_requested = requested
+        }
+        now := self.backend.clock()
+        if self.frame_requested {
+            // The FRAME event ends the wait; this deadline only matters
+            // when the display stops reporting refreshes.
+            self.frame_deadline = now + 2 * period
+            return ok()
+        }
+        vblank := self.backend.next_vblank(now)
+        if vblank > now {
+            self.frame_deadline = vblank
+            return ok()
+        }
+        // A timer at the refresh rate that keeps its phase, skipping the
+        // frames that were missed.
+        deadline := self.frame_previous + period
+        if deadline <= now {
+            deadline += ((now - deadline) / period + 1) * period
+        }
+        self.frame_deadline = deadline
+        return ok()
+    }
+    fn note_frame(&mut self) {
+        self.frame_requested = false
+        self.frame_signalled = true
     }
     // The next event if one is pending, without waiting.
     pub fn poll_event(&mut self) -> Option<Event>!Error {
@@ -303,10 +420,17 @@ pub struct Window {
         return self.next(limit)
     }
     fn next(&mut self, milliseconds: u32) -> Option<Event>!Error {
-        if !self.backend.next_event(milliseconds, &mut self.pending)? {
-            return ok(none)
+        for {
+            if !self.backend.next_event(milliseconds, &mut self.pending)? {
+                return ok(none)
+            }
+            // A refresh that arrives here is kept for the next
+            // wait_event_until_frame(), not reported.
+            if self.pending.kind != raw.FRAME {
+                return ok(convert(&self.pending))
+            }
+            self.note_frame()
         }
-        return ok(convert(&self.pending))
     }
 
     pub fn set_title(&mut self, title: &str) -> void!Error {

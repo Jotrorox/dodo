@@ -163,6 +163,16 @@ impl Context {
             PhantomData,
         )
     }
+    pub(super) fn create_type_attribute<'ctx>(
+        &'ctx self,
+        kind: u32,
+        ty: LlvmType<'ctx>,
+    ) -> Attribute<'ctx> {
+        Attribute(
+            unsafe { LLVMCreateTypeAttribute(self.0, kind, ty.0) },
+            PhantomData,
+        )
+    }
     pub(super) fn create_string_attribute(&self, key: &str, value: &str) -> Attribute<'_> {
         Attribute(
             unsafe {

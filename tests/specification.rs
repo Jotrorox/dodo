@@ -795,7 +795,35 @@ fn unsafe_pointer_conversions_and_unsupported_abi_are_rejected() {
             "fn main(){ unsafe { p:=0usize as *const i32\nr:=p as &i32 } }",
             "explicit lifetime primitive",
         ),
-        ("struct S { x:i32 }\nextern \"C\" fn take(x:S)", "C ABI"),
+        (
+            "struct S { x:i32 }\nextern \"C\" fn take(x:S)",
+            "not declared @repr(C)",
+        ),
+        (
+            "@repr(C)\nstruct S { x:&i32 }\nextern \"C\" fn take(x:S)",
+            "not a C type",
+        ),
+        (
+            "@repr(C)\nstruct S {}\nextern \"C\" fn take()->S",
+            "at least one field",
+        ),
+        (
+            "@repr(C)\nstruct S { x:[0]i32 }\nextern \"C\" fn take(x:S)",
+            "no elements",
+        ),
+        (
+            "@repr(C)\nstruct S { x:Option<i32> }\nextern \"C\" fn take(x:S)",
+            "not a C type",
+        ),
+        (
+            "struct In { x:i32 }\n@repr(C)\nstruct S { inner:In }\nextern \"C\" fn take(x:S)",
+            "reached through field `inner`",
+        ),
+        (
+            "@repr(C)\nstruct S { x:i32\nfn drop(self:&mut Self) -> void {} }\nextern \"C\" fn take(x:S)",
+            "destructor",
+        ),
+        ("extern \"C\" fn take(x:[4]i32)", "C ABI"),
         ("extern \"C\" fn take(x:&i32)", "C ABI"),
         ("extern \"C\" fn take(x:&[u8])", "C ABI"),
         ("extern \"C\" fn take(x:Option<i32>)", "C ABI"),
@@ -972,6 +1000,198 @@ fn main()->i32 {
         ),
     ] {
         workspace.reject(&format!("package invalid\n{body}\n"), message);
+    }
+}
+
+#[test]
+fn c_structs_pass_and_return_by_value_across_the_c_abi() {
+    // The host C compiler classifies every struct shape; the fixture calls C
+    // with each one and C calls back into Dodo definitions with them.
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/c_abi");
+    let workspace = Workspace::new();
+    for level in ["0", "3"] {
+        let binary = workspace.0.join(format!("structs-{level}"));
+        success(
+            workspace
+                .compiler(&["build", "-O", level])
+                .arg(fixtures.join("structs.dodo"))
+                .arg("--link-arg")
+                .arg(fixtures.join("structs.c"))
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .unwrap(),
+        );
+        let output = Command::new(binary).output().unwrap();
+        assert!(output.status.success(), "O{level}: {output:?}");
+    }
+}
+
+#[test]
+fn c_struct_classification_follows_each_target_abi() {
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "abi.dodo",
+        r#"package abi
+@repr(C)
+struct Size { w: u64, h: u64, d: u64 }
+@repr(C)
+struct Vec2 { x: f32, y: f32 }
+@repr(C)
+struct Mixed { a: i64, b: f64 }
+@repr(C)
+struct Bytes3 { a: u8, b: u8, c: u8 }
+@repr(C)
+struct Wide { a: i64, b: i64 }
+unsafe extern "C" fn take_size(s: Size) -> u64
+unsafe extern "C" fn make_size(w: u64) -> Size
+unsafe extern "C" fn take_vec2(v: Vec2) -> Vec2
+unsafe extern "C" fn take_mixed(m: Mixed) -> Mixed
+unsafe extern "C" fn take_bytes3(b: Bytes3) -> Bytes3
+unsafe extern "C" fn crowded(a: i64, b: i64, c: i64, d: i64, e: i64, w: Wide) -> i64
+pub fn use_all() {
+    unsafe {
+        _ = take_size(make_size(1))
+        _ = take_vec2(Vec2 { x: 1.0, y: 2.0 })
+        _ = take_mixed(Mixed { a: 1, b: 2.0 })
+        _ = take_bytes3(Bytes3 { a: 1, b: 2, c: 3 })
+        _ = crowded(1, 2, 3, 4, 5, Wide { a: 6, b: 7 })
+    }
+}
+"#,
+    );
+    for (target, declarations) in [
+        (
+            "x86_64-unknown-linux-gnu",
+            &[
+                "@take_size(ptr byval(%Size) align 8)",
+                "void @make_size(ptr sret(%Size) align 8, i64)",
+                "double @take_vec2(double)",
+                "{ i64, double } @take_mixed(i64, double)",
+                "i64 @take_bytes3(i64)",
+                // One register remains for a two-register struct: stack.
+                "@crowded(i64, i64, i64, i64, i64, ptr byval(%Wide) align 8)",
+            ][..],
+        ),
+        (
+            "x86_64-pc-windows-msvc",
+            &[
+                "@take_size(ptr)",
+                "void @make_size(ptr sret(%Size) align 8, i64)",
+                "i64 @take_vec2(i64)",
+                "void @take_mixed(ptr sret(%Mixed) align 8, ptr)",
+                "void @take_bytes3(ptr sret(%Bytes3) align 1, ptr)",
+                "@crowded(i64, i64, i64, i64, i64, ptr)",
+            ][..],
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            &[
+                "@take_size(ptr)",
+                "void @make_size(ptr sret(%Size) align 8, i64)",
+                "[2 x float] @take_vec2([2 x float])",
+                "[2 x i64] @take_mixed([2 x i64])",
+                "i64 @take_bytes3(i64)",
+                "@crowded(i64, i64, i64, i64, i64, [2 x i64])",
+            ][..],
+        ),
+    ] {
+        let ir = workspace.0.join(format!("{target}.ll"));
+        success(
+            workspace
+                .compiler(&["build", "--emit", "llvm-ir", "--target", target])
+                .arg(&source)
+                .arg("-o")
+                .arg(&ir)
+                .output()
+                .unwrap(),
+        );
+        let text = fs::read_to_string(&ir).unwrap();
+        for declaration in declarations {
+            assert!(
+                text.lines()
+                    .any(|line| line.starts_with("declare") && line.contains(declaration)),
+                "{target}: missing `{declaration}` in\n{text}"
+            );
+        }
+    }
+    let output = workspace
+        .compiler(&[
+            "build",
+            "--emit",
+            "llvm-ir",
+            "--target",
+            "thumbv7em-none-eabi",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(workspace.0.join("thumb.ll"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not support yet"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn link_name_prototypes_lower_c_structs_with_their_own_signature() {
+    // Objective-C bindings cast objc_msgSend once per method, including
+    // methods that take or return structs such as NSRect or MTLSize.
+    let workspace = Workspace::new();
+    let source = workspace.file(
+        "messages.dodo",
+        r#"package messages
+@repr(C)
+struct Rect { x: f64, y: f64, w: f64, h: f64 }
+@repr(C)
+struct Size { w: u64, h: u64, d: u64 }
+unsafe extern "C" fn objc_msgSend(receiver: *mut u8, selector: *mut u8) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn msg_rect(receiver: *mut u8, selector: *mut u8) -> Rect
+@link_name("objc_msgSend")
+unsafe extern "C" fn msg_dispatch(receiver: *mut u8, selector: *mut u8, groups: Size, threads: Size)
+pub fn send(receiver: *mut u8, selector: *mut u8) -> f64 {
+    unsafe {
+        _ = objc_msgSend(receiver, selector)
+        msg_dispatch(receiver, selector, Size { w: 1, h: 2, d: 3 }, Size { w: 4, h: 5, d: 6 })
+        rect := msg_rect(receiver, selector)
+        return rect.w
+    }
+}
+"#,
+    );
+    for (target, calls) in [
+        (
+            "aarch64-apple-darwin",
+            &[
+                "call [4 x double] @objc_msgSend(ptr",
+                "call void @objc_msgSend(ptr %",
+            ][..],
+        ),
+        (
+            "x86_64-apple-darwin",
+            &[
+                "call void @objc_msgSend(ptr sret(%Rect) align 8",
+                "ptr byval(%Size) align 8",
+            ][..],
+        ),
+    ] {
+        let ir = workspace.0.join(format!("{target}.ll"));
+        success(
+            workspace
+                .compiler(&["build", "--emit", "llvm-ir", "--target", target])
+                .arg(&source)
+                .arg("-o")
+                .arg(&ir)
+                .output()
+                .unwrap(),
+        );
+        let text = fs::read_to_string(&ir).unwrap();
+        for call in calls {
+            assert!(text.contains(call), "{target}: missing `{call}` in\n{text}");
+        }
     }
 }
 

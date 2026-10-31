@@ -60,7 +60,7 @@ operator precedence, runtime checks, unsafe contracts, and compiler restrictions
 | Errors | Mandatory Result handling, explicit matching, `?` with wrapping into an error enum's variant, panic-on-error `!`. | No exceptions, user-defined error conversion, or panic unwinding. |
 | Generic behavior | Concrete specialization, structural interfaces with bounds checked at each use, and `dyn` references with method tables. | No generic interfaces, associated types, owned `dyn` values, or separately compiled generic code. |
 | Packages | Single-file and directory imports, aliases, public/private declarations, embedded library. | Optional build manifest; local dependencies only, with no package manager, registry, or re-exports. |
-| Foreign and hardware code | C primitive/pointer calls, raw storage, volatile MMIO, typed registers, interrupt masking, layout queries, inline assembly, `@interrupt` handlers, `@section` and `@align` placement. | No C aggregate-by-value calls, C variadics, global or naked assembly, or export attributes. |
+| Foreign and hardware code | C primitive/pointer calls, `@repr(C)` structs by value on x86-64 and AArch64, raw storage, volatile MMIO, typed registers, interrupt masking, layout queries, inline assembly, `@interrupt` handlers, `@section` and `@align` placement. | No by-value C structs on other targets, C variadics, global or naked assembly, or export attributes. |
 | Hosted library | Files, processes, environment, threads, atomics, synchronization, networking, TLS, HTTP, web routing. | Availability and native dependencies vary by target; see [platform support](platform.md). |
 
 Named omission here means unavailable syntax or behavior, not a suggestion to
@@ -98,8 +98,8 @@ covers monomorphization and omitted type arguments.
 The native function ABI is implementation-defined. Enum storage uses the explicit
 tag and shared payload storage specified for 0.1, with target ABI padding. Result
 success and error alternatives also share storage. The supported C ABI accepts
-primitive and raw-pointer arguments and results; aggregate-by-value calls and
-variadics are not supported.
+primitive, raw-pointer and `@repr(C)` struct arguments and results; structs by
+value need an x86-64 or AArch64 target, and variadics are not supported.
 
 ## Implemented core calls
 

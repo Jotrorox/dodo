@@ -124,6 +124,26 @@ fn colors() {
     assert_eq(graphics.over(graphics.TRANSPARENT, graphics.BLUE), graphics.BLUE)
     assert_eq(graphics.over(graphics.rgba(255, 255, 255, 128), graphics.BLACK), graphics.rgb(128, 128, 128))
     assert_eq(graphics.over(graphics.rgba(255, 0, 0, 128), graphics.TRANSPARENT), graphics.rgba(255, 0, 0, 128))
+    // Over an opaque color, each channel is (top * a + bottom * (255 - a)) /
+    // 255 rounded, whichever channel it is: blending works on two channels
+    // at once, and no lane may leak into its neighbour.
+    for a in 0u32..256 {
+        top := 0u32
+        for top < 256 {
+            bottom := 0u32
+            for bottom < 256 {
+                upper := graphics.rgba(top as u8, (255 - top) as u8, (top ^ 0x55) as u8, a as u8)
+                lower := graphics.rgb(bottom as u8, (bottom ^ 0xa3) as u8, (255 - bottom) as u8)
+                mixed := graphics.over(upper, lower)
+                assert_eq(graphics.alpha(mixed), 255u8)
+                assert_eq(graphics.red(mixed) as u32, (top * a + bottom * (255 - a) + 127) / 255)
+                assert_eq(graphics.green(mixed) as u32, ((255 - top) * a + (bottom ^ 0xa3) * (255 - a) + 127) / 255)
+                assert_eq(graphics.blue(mixed) as u32, ((top ^ 0x55) * a + (255 - bottom) * (255 - a) + 127) / 255)
+                bottom += 7
+            }
+            top += 5
+        }
+    }
 }
 
 fn formats() {
@@ -1473,6 +1493,57 @@ fn gradients() {
     assert_eq(at(&big, 2, 2), graphics.BLACK)
 }
 
+// gradient_rect and gradient_path step along each row instead of sampling
+// every pixel; the result must still be color_at, composited, at every
+// pixel, including across the column where coordinates start to clamp.
+fn gradient_walks() {
+    random := Random { state: 0x5bd1e995 }
+    a_pixels := [0u8; 40 * 30 * 4]
+    b_pixels := [0u8; 40 * 30 * 4]
+    a := graphics.canvas(&mut a_pixels, 40, 30, graphics.PixelFormat.Rgba8888)!
+    b := graphics.canvas(&mut b_pixels, 40, 30, graphics.PixelFormat.Bgra8888)!
+    storage := [0i32; 16]
+    path := graphics.Path.new(&mut storage)
+    path.rect(0, 0, 40 * 256, 30 * 256)
+    for round in 0u32..120 {
+        // Every third round straddles the clamp at 2^22 pixels.
+        far := round % 3 == 0
+        base := 0i32
+        if far {
+            base = 4194304 - 20
+        }
+        x0 := (random.next() % 60) as i32 - 10
+        y0 := (random.next() % 50) as i32 - 10
+        shade := graphics.Gradient.linear(x0, y0, (random.next() % 90) as i32 - 25, (random.next() % 70) as i32 - 20, random.next(), random.next())
+        if random.next() % 2 == 0 {
+            shade = graphics.Gradient.radial(x0, y0, random.next() % 50, random.next(), random.next())
+        }
+        stops := random.next() % 4
+        for _ in 0u32..stops {
+            shade.add_stop((random.next() & 255) as u8, random.next())
+        }
+        spread := random.next() % 3
+        if spread == 1 {
+            shade.set_spread(graphics.Spread.Repeat)
+        } else if spread == 2 {
+            shade.set_spread(graphics.Spread.Reflect)
+        }
+        a.set_origin(base, 0)
+        a.clear(graphics.BLACK)
+        a.gradient_rect(base, 0, 40, 30, &shade)
+        for y in 0i32..30 {
+            for x in 0i32..40 {
+                assert_eq(at(&a, base + x, y), graphics.over(shade.color_at(base + x, y), graphics.BLACK))
+            }
+        }
+        if !far {
+            b.clear(graphics.BLACK)
+            b.gradient_path(&path, graphics.FillRule.NonZero, &shade)
+            assert(a.equals(&b))
+        }
+    }
+}
+
 const TEST_FONT: [808]u8 = [
     0, 1, 0, 0, 0, 8, 0, 128, 0, 3, 0, 0, 99, 109, 97, 112, 2, 131, 1, 86,
     0, 0, 0, 140, 0, 0, 0, 108, 103, 108, 121, 102, 107, 60, 248, 176, 0, 0, 0, 248,
@@ -1975,6 +2046,7 @@ fn main() {
     antialiasing()
     many_edges()
     gradients()
+    gradient_walks()
     truetype_checks()
     corrupted_fonts()
 }

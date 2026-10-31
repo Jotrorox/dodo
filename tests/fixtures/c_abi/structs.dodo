@@ -1,0 +1,219 @@
+// Passes and returns @repr(C) structs by value across the C ABI in both
+// directions. Each shape exercises a distinct classification rule.
+package main
+
+@repr(C)
+struct Size {
+    w: u64
+    h: u64
+    d: u64
+}
+@repr(C)
+struct Pair {
+    a: i32
+    b: i32
+}
+@repr(C)
+struct Color {
+    r: f64
+    g: f64
+    b: f64
+    a: f64
+}
+@repr(C)
+struct Vec2 {
+    x: f32
+    y: f32
+}
+@repr(C)
+struct Mixed {
+    a: i64
+    b: f64
+}
+@repr(C)
+struct Tri {
+    a: f32
+    b: f32
+    c: f32
+}
+@repr(C)
+struct Bytes3 {
+    a: u8
+    b: u8
+    c: u8
+}
+@repr(C)
+struct Nested {
+    p: Pair
+    f: f32
+}
+@repr(C)
+struct Arr {
+    v: [3]u16
+    flag: bool
+}
+@repr(C)
+struct Viewport {
+    x: f64
+    y: f64
+    w: f64
+    h: f64
+    n: f64
+    f: f64
+}
+@repr(C)
+struct Region {
+    origin: Size
+    size: Size
+}
+@repr(C)
+struct Wide {
+    a: i64
+    b: i64
+}
+@repr(C)
+struct DF {
+    d: f64
+    f: f32
+}
+@repr(C)
+struct FD {
+    f: f32
+    d: f64
+}
+
+unsafe extern "C" fn take_size(s: Size) -> u64
+unsafe extern "C" fn make_size(w: u64, h: u64, d: u64) -> Size
+unsafe extern "C" fn take_pair(p: Pair) -> i32
+unsafe extern "C" fn make_pair(a: i32, b: i32) -> Pair
+unsafe extern "C" fn take_color(c: Color) -> f64
+unsafe extern "C" fn make_color(r: f64, g: f64, b: f64, a: f64) -> Color
+unsafe extern "C" fn take_vec2(v: Vec2) -> f32
+unsafe extern "C" fn make_vec2(x: f32, y: f32) -> Vec2
+unsafe extern "C" fn take_mixed(m: Mixed) -> f64
+unsafe extern "C" fn make_mixed(a: i64, b: f64) -> Mixed
+unsafe extern "C" fn take_tri(t: Tri) -> f32
+unsafe extern "C" fn make_tri(a: f32, b: f32, c: f32) -> Tri
+unsafe extern "C" fn take_bytes3(b: Bytes3) -> u32
+unsafe extern "C" fn make_bytes3(a: u8, b: u8, c: u8) -> Bytes3
+unsafe extern "C" fn take_nested(n: Nested) -> f32
+unsafe extern "C" fn make_nested(a: i32, b: i32, f: f32) -> Nested
+unsafe extern "C" fn take_arr(a: Arr) -> u32
+unsafe extern "C" fn make_arr(x: u16, y: u16, z: u16, f: bool) -> Arr
+unsafe extern "C" fn take_viewport(v: Viewport) -> f64
+unsafe extern "C" fn make_viewport(x: f64) -> Viewport
+unsafe extern "C" fn take_region(r: Region) -> u64
+unsafe extern "C" fn make_region(base: u64) -> Region
+unsafe extern "C" fn crowded(a: i64, b: i64, c: i64, d: i64, e: i64, w: Wide, f: i64) -> i64
+unsafe extern "C" fn crowded_floats(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, m: Mixed, v: Vec2, h: f64) -> f64
+unsafe extern "C" fn take_df(x: DF) -> f64
+unsafe extern "C" fn make_fd(f: f32, d: f64) -> FD
+unsafe extern "C" fn identity_size(s: Size, p: Pair) -> Size
+unsafe extern "C" fn narrow_after(b: Bytes3, n: u8) -> u8
+unsafe extern "C" fn run_callbacks() -> i32
+unsafe extern "C" fn mixed_maker() -> extern "C" fn(i64, f64) -> Mixed
+unsafe extern "C" fn apply(
+    scale: extern "C" fn(Color, f64) -> Color,
+    shift: extern "C" fn(Region, Size) -> Region,
+    combine: extern "C" fn(Mixed, Tri) -> Vec2,
+) -> f64
+unsafe extern "C" fn c_failures() -> i32
+
+extern "C" fn dodo_scale_color(c: Color, k: f64) -> Color {
+    return Color { r: c.r * k, g: c.g * k, b: c.b * k, a: c.a * k }
+}
+extern "C" fn dodo_swap_pair(p: Pair) -> Pair {
+    return Pair { a: p.b, b: p.a }
+}
+extern "C" fn dodo_bump_size(s: Size) -> Size {
+    return Size { w: s.w + 1, h: s.h + 1, d: s.d + 1 }
+}
+extern "C" fn dodo_vec2(m: Mixed, t: Tri) -> Vec2 {
+    return Vec2 { x: m.a as f32 + m.b as f32, y: t.a + t.b + t.c }
+}
+extern "C" fn dodo_bytes3(b: Bytes3) -> Bytes3 {
+    return Bytes3 { a: b.c, b: b.b, c: b.a }
+}
+extern "C" fn dodo_crowded(a: i64, b: i64, c: i64, d: i64, e: i64, w: Wide, f: i64) -> i64 {
+    return a + b + c + d + e + w.a + w.b + f
+}
+extern "C" fn dodo_viewport(v: Viewport, r: Region) -> Viewport {
+    total := (r.origin.w + r.origin.h + r.origin.d + r.size.w + r.size.h + r.size.d) as f64
+    return Viewport { x: v.x + total, y: v.y, w: v.w, h: v.h, n: v.n, f: v.f + total }
+}
+
+extern "C" fn dodo_shift(r: Region, by: Size) -> Region {
+    return Region {
+        origin: Size { w: r.origin.w + by.w, h: r.origin.h + by.h, d: r.origin.d + by.d },
+        size: Size { w: r.size.w + by.w, h: r.size.h + by.h, d: r.size.d + by.d },
+    }
+}
+
+fn main() {
+    unsafe {
+        core.assert_eq(take_size(Size { w: 1, h: 2, d: 3 }), 123u64)
+        s := make_size(4, 5, 6)
+        core.assert_eq(s.w * 100 + s.h * 10 + s.d, 456u64)
+        core.assert_eq(take_pair(Pair { a: -5, b: 7 }), 2i32)
+        p := make_pair(8, -9)
+        core.assert_eq(p.a, 8i32)
+        core.assert_eq(p.b, -9i32)
+        core.assert_eq(take_color(Color { r: 0.25, g: 0.5, b: 0.75, a: 1.0 }), 2.5)
+        c := make_color(0.1, 0.2, 0.3, 0.4)
+        core.assert_eq(c.r, 0.1)
+        core.assert_eq(c.a, 0.4)
+        core.assert_eq(take_vec2(Vec2 { x: 1.5, y: -2.5 }), -3.75f32)
+        v := make_vec2(3.0, 4.0)
+        core.assert_eq(v.x, 3.0f32)
+        core.assert_eq(v.y, 4.0f32)
+        core.assert_eq(take_mixed(Mixed { a: -9, b: 2.5 }), -6.5)
+        m := make_mixed(-3, 0.125)
+        core.assert_eq(m.a, -3i64)
+        core.assert_eq(m.b, 0.125)
+        core.assert_eq(take_tri(Tri { a: 1.0, b: 2.0, c: 3.0 }), 6.0f32)
+        t := make_tri(7.0, 8.0, 9.0)
+        core.assert_eq(t.a + t.b * 10.0 + t.c * 100.0, 987.0f32)
+        core.assert_eq(take_bytes3(Bytes3 { a: 1, b: 2, c: 3 }), 6u32)
+        b := make_bytes3(9, 8, 7)
+        core.assert_eq(b.a as u32 * 100 + b.b as u32 * 10 + b.c as u32, 987u32)
+        core.assert_eq(take_nested(Nested { p: Pair { a: 4, b: 5 }, f: 0.5 }), 9.5f32)
+        n := make_nested(1, 2, 0.25)
+        core.assert_eq(n.p.a, 1i32)
+        core.assert_eq(n.p.b, 2i32)
+        core.assert_eq(n.f, 0.25f32)
+        core.assert_eq(take_arr(Arr { v: [10u16, 20, 30], flag: true }), 61u32)
+        a := make_arr(1, 2, 3, true)
+        core.assert_eq(a.v[0] + a.v[1] + a.v[2], 6u16)
+        core.assert(a.flag)
+        core.assert_eq(take_viewport(Viewport { x: 1.0, y: 2.0, w: 3.0, h: 4.0, n: 5.0, f: 6.0 }), 21.0)
+        vp := make_viewport(10.0)
+        core.assert_eq(vp.x, 10.0)
+        core.assert_eq(vp.f, 15.0)
+        core.assert_eq(take_region(Region { origin: Size { w: 1, h: 2, d: 3 }, size: Size { w: 4, h: 5, d: 6 } }), 21u64)
+        r := make_region(100)
+        core.assert_eq(r.origin.w, 100u64)
+        core.assert_eq(r.size.d, 105u64)
+        core.assert_eq(crowded(1, 2, 3, 4, 5, Wide { a: 60, b: 70 }, 8), 153i64)
+        core.assert_eq(crowded_floats(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, Mixed { a: 8, b: 9.0 }, Vec2 { x: 10.0, y: 11.0 }, 12.0), 78.0)
+        core.assert_eq(take_df(DF { d: 1.25, f: 2.5 }), 3.75)
+        fd := make_fd(0.5, 0.75)
+        core.assert_eq(fd.f, 0.5f32)
+        core.assert_eq(fd.d, 0.75)
+        same := identity_size(Size { w: 7, h: 8, d: 9 }, Pair { a: 1, b: 2 })
+        core.assert_eq(same.w + same.h + same.d, 24u64)
+        core.assert_eq(narrow_after(Bytes3 { a: 50, b: 0, c: 0 }, 200), 250u8)
+        core.assert_eq(run_callbacks(), 0i32)
+        // Calls through C function pointers: to C, and to Dodo definitions.
+        maker := mixed_maker()
+        made := maker(-7, 0.5)
+        core.assert_eq(made.a, -7i64)
+        core.assert_eq(made.b, 0.5)
+        take := take_size
+        core.assert_eq(take(Size { w: 1, h: 2, d: 3 }), 123u64)
+        shift := dodo_shift
+        moved := shift(Region { origin: Size { w: 1, h: 1, d: 1 }, size: Size { w: 2, h: 2, d: 2 } }, Size { w: 1, h: 2, d: 3 })
+        core.assert_eq(moved.size.d, 5u64)
+        core.assert_eq(apply(dodo_scale_color, dodo_shift, dodo_vec2), 2.0 + 22.0 + 3.0)
+        core.assert_eq(c_failures(), 0i32)
+    }
+}

@@ -80,8 +80,8 @@ window's close button. Exit 1 means no window could be opened, for example
 because the program runs over SSH without X forwarding.
 
 The program redraws after every event. Programs that animate use
-`wait_event_timeout` instead; `examples/window.dodo` in the repository is a
-bouncing ball that does.
+`wait_event_until_frame` instead, which also says when the next frame is due;
+`examples/window.dodo` in the repository is a bouncing ball that does.
 
 ## The main loop
 
@@ -95,33 +95,54 @@ A `Window` owns a pixel buffer exactly the size of its drawing area.
 | `win.wait_event()` | Waits for the next event. |
 | `win.poll_event()` | The next event if one is pending, else `none`; never waits. |
 | `win.wait_event_timeout(ms)` | Waits at most `ms` milliseconds; `none` when the time passes first. |
+| `win.wait_event_until_frame()` | Waits for the next event or the next frame; `none` when it is time to draw. |
+| `win.frame_interval()` | The display's refresh period as a `time.Duration`, such as 16.7 ms at 60 Hz. |
 
 Drawing changes nothing on screen until `update`. The canvas borrows the
 window, so its last use must come before the next event call; the borrow
 checker enforces that. This matters because a resize replaces the buffer
 inside the event call.
 
-For a steady frame rate, drain the pending events and draw once per frame:
+### Animation
+
+An animation draws once per display refresh. `wait_event_until_frame()`
+returns each event as it arrives and `none` when the next frame is due, so
+the loop handles events until `none`, then draws:
 
 ```dodo
 for {
-    for {
-        match win.wait_event_timeout(16)? {
-            some(window.Event.Close) => {
-                return ok()
-            }
-            some(_) => {}
-            none => {
-                break
-            }
+    match win.wait_event_until_frame()? {
+        some(window.Event.Close) => {
+            return ok()
+        }
+        some(_) => {
+            // ... handle the event ...
+        }
+        none => {
+            canvas := win.canvas()
+            // ... draw the next frame ...
+            dirty := canvas.take_dirty()
+            win.update(dirty)?
         }
     }
-    canvas := win.canvas()
-    // ... draw the next frame ...
-    dirty := canvas.take_dirty()
-    win.update(dirty)?
 }
 ```
+
+Frames are due `frame_interval()` apart, at a fixed pace however many events
+arrive: moving the mouse over the window does not hold frames back. Where
+the window system reports the display's refreshes, frames follow them (see
+the platform notes); elsewhere a timer at the refresh rate keeps the pace. A
+frame that takes longer than one refresh skips the refreshes it missed
+instead of making the next frames late. A hidden or minimized window, whose
+display stops reporting refreshes, still gets a frame every two intervals.
+
+Advance animations by `frame_interval()` per frame, or by the time measured
+with `std/time`, rather than by a fixed step: displays refresh at 60, 120,
+144 Hz or more, and the same step per frame would run twice as fast on a
+120 Hz display.
+
+Call `wait_event()` when there is nothing left to animate, so the program
+sleeps until the next event.
 
 ### Drawing into your own canvas
 
@@ -208,6 +229,7 @@ handle `Resize`.
 | Threads | Any one thread. | The main thread only; elsewhere `open` fails with `Unsupported`. | The thread that opened the window must read its events. |
 | Text input | Latin-1 and Unicode keysyms, Shift, Caps Lock, NumLock and AltGr. Dead keys and compose sequences type nothing. | Characters from the layout, Option combinations included. No input method or dead keys. | Characters from the layout, including dead keys and surrogate pairs. |
 | While resizing | Events keep flowing. | AppKit holds the event loop until the mouse is released, then reports the final size. | Windows holds the event loop until the mouse is released, then reports the size. |
+| Frame timing | The Present extension reports each refresh; servers without it fall back to a 60 Hz timer. `frame_interval()` is measured from Present after about half a second. | A display link reports each refresh on macOS 14 and later; older systems use a timer at the screen's refresh rate. Animating programs are exempt from App Nap until they call `wait_event()`. | The compositor's (DWM's) refresh times; a high-resolution timer keeps the waits precise. |
 
 ## Errors
 
