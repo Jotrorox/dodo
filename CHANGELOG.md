@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `@link_name("symbol")` binds an `extern "C"` prototype to a symbol other
+  than its own name, and several prototypes may bind one symbol with different
+  signatures. Each call uses its own declaration's signature, so Objective-C
+  bindings can declare one `objc_msgSend` per method signature. Without
+  `@link_name`, clashing signatures for one symbol are still an error.
 - Antialiased drawing, gradients and TrueType text for `std/graphics`, still
   integer-only, allocation-free and identical on every target, firmware
   included. The `aa_` canvas calls draw lines, thick round-capped lines,

@@ -83,6 +83,21 @@ symbol names. An external declaration does not automatically link its library;
 use the [linker options](command-line.md) when extra libraries or objects are
 needed. Dodo can also define a function with a body using `extern "C" fn`.
 
+`@link_name("symbol")` binds a foreign declaration to a symbol other than its
+own name. Several declarations may bind one symbol with different signatures,
+which is how Objective-C calls `objc_msgSend`: each message uses the signature
+of its method.
+
+```dodo
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_id(receiver: *mut u8, selector: *mut u8) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_bool(receiver: *mut u8, selector: *mut u8, flag: bool)
+```
+
+Each call passes its arguments by its own declaration's signature, and the
+binding author must make sure the callee expects exactly that.
+
 `&str` is not a C string. Its bytes have no guaranteed trailing NUL, and its
 representation includes a length. C interfaces that expect a string usually
 need an explicitly prepared byte buffer and raw pointer.

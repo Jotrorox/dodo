@@ -103,6 +103,8 @@ struct Modifiers {
     json_name: Option<String>,
     json_deny_unknown: bool,
     interrupt: Option<String>,
+    // `@link_name("symbol")`: the C symbol an extern declaration binds.
+    link_name: Option<String>,
     placement: Placement,
 }
 
@@ -323,6 +325,9 @@ impl Parser {
         let mods = self.modifiers()?;
         if mods.interrupt.is_some() && !self.at("fn") {
             return Err(self.error("@interrupt applies only to functions"));
+        }
+        if mods.link_name.is_some() && !self.at("fn") {
+            return Err(self.error("@link_name applies only to extern \"C\" functions"));
         }
         if !mods.placement.is_empty() && !self.at("fn") && !self.at("static") && !self.at("const") {
             return Err(self.error("@section and @align apply only to functions and statics"));
@@ -556,6 +561,35 @@ impl Parser {
                     self.newlines();
                     continue;
                 }
+                if name == "link_name" {
+                    if mods.link_name.is_some() {
+                        return Err(self.error("duplicate @link_name attribute"));
+                    }
+                    self.expect("(")?;
+                    let token = self.bump();
+                    let TokenKind::String(value, false) = token.kind else {
+                        return Err(Diagnostic::new(
+                            token.span,
+                            "@link_name expects a string symbol name, such as @link_name(\"objc_msgSend\")",
+                        ));
+                    };
+                    let symbol = String::from_utf8(value)
+                        .ok()
+                        .filter(|name| {
+                            !name.is_empty()
+                                && name.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+                        })
+                        .ok_or_else(|| {
+                            Diagnostic::new(
+                                token.span,
+                                "a link name must be nonempty printable ASCII without spaces, quotes, or backslashes",
+                            )
+                        })?;
+                    mods.link_name = Some(symbol);
+                    self.expect(")")?;
+                    self.newlines();
+                    continue;
+                }
                 if name == "section" {
                     if mods.placement.section.is_some() {
                         return Err(self.error("duplicate @section attribute"));
@@ -652,7 +686,7 @@ impl Parser {
                 }
                 if name != "repr" {
                     return Err(self.error(format!(
-                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @section(\"name\"), @align(N)"
+                        "unknown attribute `@{name}`; supported: @repr(C), @unsafe_send, @unsafe_sync, @test, @ignore(\"reason\"), @derive(Json), @json_name(\"name\"), @json_deny_unknown, @interrupt(VECTOR), @link_name(\"symbol\"), @section(\"name\"), @align(N)"
                     )));
                 }
                 if mods.repr_c {
@@ -1443,6 +1477,12 @@ impl Parser {
                 "@interrupt requires a private, safe, non-generic fn name() with a body and no result; the hardware calls it, so it takes no arguments, and code cannot call it",
             ));
         }
+        if mods.link_name.is_some() && (!mods.extern_ || body.is_some()) {
+            return Err(Diagnostic::new(
+                self.since(start),
+                "@link_name applies only to extern \"C\" declarations without a body",
+            ));
+        }
         if mods.test
             && (mods.unsafe_
                 || mods.extern_
@@ -1480,6 +1520,7 @@ impl Parser {
             span: self.since(start),
             environment: None,
             interrupt: mods.interrupt,
+            link_name: mods.link_name,
             placement: mods.placement,
         })
     }
