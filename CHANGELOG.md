@@ -11,6 +11,10 @@
   `Canvas.fill_mask` and `gradient_mask`, which blend exactly as
   `fill_outline` does. Antialiased drawing over opaque pixels is also
   faster, with unchanged results.
+- `std/graphics` solid fills and same-format blits are 9–35× faster at -O2
+  (1280×800 `clear` 1.4 ms → 0.06 ms, full-frame `blit` 2.3 ms → 0.07 ms).
+  Their loops now store through a local row subslice, which the optimizer
+  turns into vector stores and `memcpy`.
 - `@link_name("symbol")` binds an `extern "C"` prototype to a symbol other
   than its own name, and several prototypes may bind one symbol with different
   signatures. Each call uses its own declaration's signature, so Objective-C
