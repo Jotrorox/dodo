@@ -606,9 +606,9 @@ cache.draw(&mut canvas, 8, 8, "Score: 1200", 14, graphics.WHITE)
 `cache.draw` and `cache.draw_gradient` take the same arguments and return the
 same area as the `Font` calls. The first time a glyph appears at a size it is
 rasterized into the cache; afterwards drawing it is a blend of its mask. On
-an Apple M-series machine at `-O2`, repeated 14-pixel text drew about 35
-times faster than with `Font.draw` (0.16 µs instead of 6 µs per glyph) and
-96-pixel text about 12 times faster (1.1 µs instead of 13 µs).
+an Apple M-series machine at `-O2`, repeated 14-pixel text drew about 25
+times faster than with `Font.draw` (0.19 µs instead of 5 µs per glyph) and
+96-pixel text about 11 times faster (1 µs instead of 11 µs).
 
 The one visible difference is placement: the cache positions glyphs to a
 quarter pixel horizontally, where `Font.draw` uses 1/256 pixel, and keeps a

@@ -4,13 +4,12 @@
 
 - `truetype.GlyphCache` keeps rasterized glyphs as coverage masks in
   caller-provided storage, so text drawn again is blended instead of
-  rasterized: about 35 times faster at 14 pixels and 12 times faster at 96.
+  rasterized: about 25 times faster at 14 pixels and 11 times faster at 96.
   It draws like `Font.draw` except that glyphs are placed to a quarter pixel,
   and a full cache evicts its oldest glyphs. `std/graphics` gains the
   coverage mask calls it is built on: `outline_bounds`, `coverage_mask`, and
   `Canvas.fill_mask` and `gradient_mask`, which blend exactly as
-  `fill_outline` does. Antialiased drawing over opaque pixels is also
-  faster, with unchanged results.
+  `fill_outline` does.
 - `std/graphics` solid fills and same-format blits are 9–35× faster at -O2
   (1280×800 `clear` 1.4 ms → 0.06 ms, full-frame `blit` 2.3 ms → 0.07 ms).
   Their loops now store through a local row subslice, which the optimizer
@@ -83,6 +82,16 @@
   factor. `std/window/x11` holds the protocol encoders and parsers as pure
   functions that build for every target. `dodo run` needs no flags or
   system packages.
+- `std/window` paces animation: `wait_event_until_frame()` returns events as
+  they arrive and `none` once per display refresh, so a steady stream of
+  mouse moves no longer holds frames back, and `frame_interval()` gives the
+  refresh period. Frames follow the display where the system reports it: a
+  `CADisplayLink` on macOS 14 and later, DWM's refresh timing on Windows and
+  the X11 Present extension on Linux, with a timer elsewhere. Animating
+  programs on macOS are exempt from App Nap until they call `wait_event()`
+  again, and Windows waits use a high-resolution timer instead of the
+  15.6 ms system tick. `examples/window.dodo` uses it and moves the ball by
+  time, at the same speed on 60 and 120 Hz displays.
 - MQTT 3.1.1 packages for both ends of a publish/subscribe system, in the
   style of the web packages. `std/mqtt/broker` runs a broker in one line,
   `broker.new().run(b"0.0.0.0:1883")`. It serves 16 clients from one thread

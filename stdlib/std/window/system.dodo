@@ -16,6 +16,11 @@ unsafe extern "C" fn dodo_window_present(handle: isize, x: i32, y: i32, width: u
 unsafe extern "C" fn dodo_window_set_title(handle: isize, title: *const u8, title_length: usize) -> i32
 unsafe extern "C" fn dodo_window_set_cursor_visible(handle: isize, visible: u32) -> i32
 unsafe extern "C" fn dodo_window_scale_percent(handle: isize) -> u32
+unsafe extern "C" fn dodo_window_clock() -> u64
+unsafe extern "C" fn dodo_window_frame_period(handle: isize) -> u64
+unsafe extern "C" fn dodo_window_next_vblank(handle: isize, now: u64) -> u64
+unsafe extern "C" fn dodo_window_request_frame(handle: isize) -> i32
+unsafe extern "C" fn dodo_window_set_animating(handle: isize, animating: u32)
 
 fn null() -> *mut u8 {
     unsafe {
@@ -115,6 +120,54 @@ pub struct Backend {
             return err(raw.from_code(code))
         }
         return ok()
+    }
+    // Monotonic nanoseconds, the clock of next_vblank and frame pacing.
+    pub fn clock(&self) -> u64 {
+        return unsafe {
+            dodo_window_clock()
+        }
+    }
+    // Nanoseconds per display refresh, or 0 when unknown.
+    pub fn frame_period(&self) -> u64 {
+        if self.handle == 0 {
+            return 0
+        }
+        return unsafe {
+            dodo_window_frame_period(self.handle)
+        }
+    }
+    // The clock() time of the first display refresh after `now`, or 0 when
+    // unknown. Windows reads it from the compositor.
+    pub fn next_vblank(&mut self, now: u64) -> u64 {
+        if self.handle == 0 {
+            return 0
+        }
+        return unsafe {
+            dodo_window_next_vblank(self.handle, now)
+        }
+    }
+    // Ask for a FRAME event at the next refresh: macOS 14 and later have a
+    // display link for it. False when there is no such source.
+    pub fn request_frame(&mut self) -> bool!raw.Error {
+        if self.handle == 0 {
+            return err(raw.Error.Closed)
+        }
+        result := unsafe {
+            dodo_window_request_frame(self.handle)
+        }
+        if result < 0 {
+            return err(raw.from_code(-result))
+        }
+        return ok(result != 0)
+    }
+    // While animating, macOS must not throttle the program with App Nap.
+    pub fn set_animating(&mut self, animating: bool) {
+        if self.handle == 0 {
+            return
+        }
+        unsafe {
+            dodo_window_set_animating(self.handle, flag(animating))
+        }
     }
     pub fn set_title(&mut self, title: &str) -> void!raw.Error {
         if self.handle == 0 {
