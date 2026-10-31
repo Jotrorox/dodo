@@ -206,6 +206,17 @@ fn normalized(name: &str) -> String {
         .to_uppercase()
 }
 
+/// Constants whose enumerators the macOS 15.5 SDK (Xcode 16) lacks. Older SDKs
+/// skip them; newer SDKs still check their values.
+#[cfg(target_os = "macos")]
+const NEWER_THAN_MACOS_15_SDK: [&str; 5] = [
+    "GPU_FAMILY_APPLE10",
+    "GPU_FAMILY_APPLE11",
+    "GPU_FAMILY_METAL4",
+    "LANGUAGE_VERSION_4_0",
+    "LANGUAGE_VERSION_4_1",
+];
+
 /// Every public constant in std/gpu/metal names a Metal enumerator by its
 /// spelling, and has that enumerator's value in the installed SDK.
 #[cfg(target_os = "macos")]
@@ -237,6 +248,7 @@ fn constants_match_the_sdk_headers() {
     let mut program =
         String::from("#import <Metal/Metal.h>\n#include <stdio.h>\nint main(void) {\n");
     let mut expected = Vec::new();
+    let mut unknown = Vec::new();
     for line in source.lines() {
         let Some(rest) = line.strip_prefix("pub const ") else {
             continue;
@@ -247,15 +259,19 @@ fn constants_match_the_sdk_headers() {
         if name.starts_with("MAX_") {
             continue;
         }
-        let metal = identifiers
-            .get(&normalized(name))
-            .unwrap_or_else(|| panic!("{name} matches no Metal identifier"));
+        let Some(metal) = identifiers.get(&normalized(name)) else {
+            if !NEWER_THAN_MACOS_15_SDK.contains(&name) {
+                unknown.push(name);
+            }
+            continue;
+        };
         program.push_str(&format!(
             "printf(\"%llu\\n\", (unsigned long long){metal});\n"
         ));
         expected.push((name.to_owned(), value.parse::<u64>().unwrap()));
     }
     program.push_str("return 0;\n}\n");
+    assert!(unknown.is_empty(), "no Metal identifier for {unknown:?}");
     assert!(
         expected.len() > 300,
         "only {} constants found",
