@@ -331,21 +331,22 @@ pub struct Window {
     }
     // Copy `dirty` from a canvas of your own into the window's pixel buffer
     // and show it, so a window works with graphics.present like any other
-    // display. Fails with InvalidInput when the canvas size differs from the
-    // window's, which happens after a resize until the canvas is replaced,
-    // and with Device when the window system fails.
+    // display. Like every display it shows only what lies inside both the
+    // canvas's bounds() and the window and ignores the rest, so a smaller
+    // canvas, one with an origin, or one left over from before a resize
+    // updates just the part it covers. Fails with Device when the window
+    // system fails.
     pub fn present(&mut self, canvas: &graphics.Canvas, dirty: graphics.Rect) -> void!graphics.Error {
-        if canvas.width() != self.backend.width() || canvas.height() != self.backend.height() {
-            return err(graphics.Error.InvalidInput)
-        }
         bounds := canvas.bounds()
-        area := dirty.intersect(&bounds)
+        screen := graphics.Rect { x: 0, y: 0, width: self.backend.width(), height: self.backend.height() }
+        inside := dirty.intersect(&bounds)
+        area := inside.intersect(&screen)
         if area.is_empty() {
             return ok()
         }
         {
-            screen := self.canvas()
-            screen.blit_region(canvas, area.clone(), area.x, area.y)
+            pixels := self.canvas()
+            pixels.blit_region(canvas, area.clone(), area.x, area.y)
         }
         match self.backend.present(area.x, area.y, area.width, area.height) {
             ok() => {

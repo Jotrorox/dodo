@@ -1,0 +1,910 @@
+package main
+
+import "std/embedded/display"
+import "std/embedded/display/ssd1306"
+import "std/embedded/display/st7789"
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+import "std/graphics"
+import "std/graphics/font"
+
+// Display panel drivers against recorded and simulated controllers: exact
+// command sequences, window offsets for every rotation, partial and banded
+// presents, format conversion, and bus failures. No OS or allocator.
+
+// Recorded commands carry this flag; data bytes are stored as they are.
+const C: u16 = 0x100
+
+// An Interface that records every byte, up to its log's length, and counts
+// writes. It can fail one write, counted from 1.
+struct Recorder {
+    log: &mut[u16]
+    length: usize
+    bytes: usize
+    writes: u32
+    fail_at: u32
+
+    fn new(log: &mut[u16]) -> Recorder from(log) {
+        return Recorder { log: log, length: 0, bytes: 0, writes: 0, fail_at: 0 }
+    }
+
+    pub fn write_command(&mut self, bytes: &[u8]) -> void!hal.Error {
+        return self.record(bytes, C)
+    }
+
+    pub fn write_data(&mut self, bytes: &[u8]) -> void!hal.Error {
+        return self.record(bytes, 0)
+    }
+
+    fn record(&mut self, bytes: &[u8], flag: u16) -> void!hal.Error {
+        self.writes += 1
+        if self.writes == self.fail_at {
+            return err(hal.Error.Bus)
+        }
+        for index in 0..bytes.len {
+            if self.length < self.log.len {
+                self.log[self.length] = flag | bytes[index] as u16
+                self.length += 1
+            }
+        }
+        self.bytes += bytes.len
+        return ok()
+    }
+
+    fn clear(&mut self) {
+        self.length = 0
+        self.bytes = 0
+        self.writes = 0
+    }
+
+    fn matches(&self, expected: &[u16]) -> bool {
+        if self.length != expected.len {
+            return false
+        }
+        for index in 0..expected.len {
+            if self.log[index] != expected[index] {
+                return false
+            }
+        }
+        return true
+    }
+
+    // The entry at `index`, or 0xFFFF past the end.
+    fn at(&self, index: usize) -> u16 {
+        if index < self.length {
+            return self.log[index]
+        }
+        return 0xFFFF
+    }
+}
+
+// An ST7789 that keeps the RGB565 values written to its memory, 240 x 320,
+// high byte first, at the column and row addresses the driver sends.
+struct St7789 {
+    memory: &mut[u8]
+    command: u8
+    parameters: [4]u8
+    count: usize
+    left: u32
+    right: u32
+    top: u32
+    bottom: u32
+    x: u32
+    y: u32
+    high: u8
+    half: bool
+    madctl: u8
+    colmod: u8
+    inverted: bool
+    on: bool
+    awake: bool
+    pixels: u32
+    data_writes: u32
+
+    fn new(memory: &mut[u8]) -> St7789 from(memory) {
+        return St7789 { memory: memory, command: 0, parameters: [0u8; 4], count: 0, left: 0, right: 239, top: 0, bottom: 319, x: 0, y: 0, high: 0, half: false, madctl: 0xFF, colmod: 0, inverted: false, on: false, awake: false, pixels: 0, data_writes: 0 }
+    }
+
+    pub fn write_command(&mut self, bytes: &[u8]) -> void!hal.Error {
+        for index in 0..bytes.len {
+            code := bytes[index]
+            self.command = code
+            self.count = 0
+            self.half = false
+            if code == 0x01 {
+                self.madctl = 0
+                self.inverted = false
+                self.on = false
+                self.awake = false
+            } else if code == 0x10 {
+                self.awake = false
+            } else if code == 0x11 {
+                self.awake = true
+            } else if code == 0x20 {
+                self.inverted = false
+            } else if code == 0x21 {
+                self.inverted = true
+            } else if code == 0x28 {
+                self.on = false
+            } else if code == 0x29 {
+                self.on = true
+            } else if code == 0x2C {
+                self.x = self.left
+                self.y = self.top
+            }
+        }
+        return ok()
+    }
+
+    pub fn write_data(&mut self, bytes: &[u8]) -> void!hal.Error {
+        self.data_writes += 1
+        for index in 0..bytes.len {
+            byte := bytes[index]
+            if self.command == 0x2C {
+                if !self.half {
+                    self.high = byte
+                    self.half = true
+                } else {
+                    self.half = false
+                    self.store(byte)
+                }
+            } else if self.count < 4 {
+                self.parameters[self.count] = byte
+                self.count += 1
+                self.parameter()
+            }
+        }
+        return ok()
+    }
+
+    fn parameter(&mut self) {
+        first := ((self.parameters[0] as u32) << 8) | self.parameters[1] as u32
+        second := ((self.parameters[2] as u32) << 8) | self.parameters[3] as u32
+        if self.command == 0x2A && self.count == 4 {
+            self.left = first
+            self.right = second
+        } else if self.command == 0x2B && self.count == 4 {
+            self.top = first
+            self.bottom = second
+        } else if self.command == 0x36 && self.count == 1 {
+            self.madctl = self.parameters[0]
+        } else if self.command == 0x3A && self.count == 1 {
+            self.colmod = self.parameters[0]
+        }
+    }
+
+    fn store(&mut self, low: u8) {
+        if self.y > self.bottom {
+            return
+        }
+        assert(self.x < 320 && self.y < 320, "pixel outside the memory")
+        index := (self.y as usize * 320 + self.x as usize) * 2
+        self.memory[index] = self.high
+        self.memory[index + 1] = low
+        self.pixels += 1
+        self.x += 1
+        if self.x > self.right {
+            self.x = self.left
+            self.y += 1
+        }
+    }
+
+    fn value(&self, column: u32, row: u32) -> u32 {
+        index := (row as usize * 320 + column as usize) * 2
+        return ((self.memory[index] as u32) << 8) | self.memory[index + 1] as u32
+    }
+}
+
+// True when the memory from (column, row) holds `width` x `height` pixels of
+// `expected` from (x, y), as RGB565.
+fn st7789_shows(panel: &St7789, column: u32, row: u32, expected: &graphics.Canvas, x: i32, y: i32, width: u32, height: u32) -> bool {
+    for dy in 0u32..height {
+        for dx in 0u32..width {
+            wanted := 0u32
+            match expected.color_at(x + dx as i32, y + dy as i32) {
+                some(color) => {
+                    wanted = st7789.rgb565(color)
+                }
+                none => {
+                    assert(false, "expected pixel outside its canvas")
+                }
+            }
+            if panel.value(column + dx, row + dy) != wanted {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// An SSD1306 that keeps its 1 KiB memory, in horizontal addressing mode.
+struct Ssd1306 {
+    memory: [1024]u8
+    left: u32
+    right: u32
+    first: u32
+    last: u32
+    column: u32
+    page: u32
+    on: bool
+    inverted: bool
+    remapped: bool
+    scan_down: bool
+    contrast: u8
+    multiplex: u8
+    com_pins: u8
+    charge_pump: u8
+    mode: u8
+    commands: u32
+    data_bytes: u32
+
+    fn new() -> Ssd1306 {
+        return Ssd1306 { memory: [0xAAu8; 1024], left: 0, right: 127, first: 0, last: 7, column: 0, page: 0, on: false, inverted: false, remapped: false, scan_down: false, contrast: 0, multiplex: 0, com_pins: 0, charge_pump: 0, mode: 2, commands: 0, data_bytes: 0 }
+    }
+
+    // One write holds one command and its parameters, as the driver sends.
+    pub fn write_command(&mut self, bytes: &[u8]) -> void!hal.Error {
+        assert(bytes.len > 0)
+        self.commands += 1
+        code := bytes[0]
+        if code == 0x21 {
+            assert(bytes.len == 3)
+            self.left = bytes[1] as u32
+            self.right = bytes[2] as u32
+            self.column = self.left
+        } else if code == 0x22 {
+            assert(bytes.len == 3)
+            self.first = bytes[1] as u32
+            self.last = bytes[2] as u32
+            self.page = self.first
+        } else if code == 0x20 {
+            self.mode = bytes[1]
+        } else if code == 0x81 {
+            self.contrast = bytes[1]
+        } else if code == 0x8D {
+            self.charge_pump = bytes[1]
+        } else if code == 0xA8 {
+            self.multiplex = bytes[1]
+        } else if code == 0xDA {
+            self.com_pins = bytes[1]
+        } else if code == 0xA0 || code == 0xA1 {
+            self.remapped = code == 0xA1
+        } else if code == 0xC0 || code == 0xC8 {
+            self.scan_down = code == 0xC8
+        } else if code == 0xA6 || code == 0xA7 {
+            self.inverted = code == 0xA7
+        } else if code == 0xAE || code == 0xAF {
+            self.on = code == 0xAF
+        }
+        return ok()
+    }
+
+    pub fn write_data(&mut self, bytes: &[u8]) -> void!hal.Error {
+        assert(self.mode == 0, "data before horizontal addressing")
+        for index in 0..bytes.len {
+            self.memory[(self.page * 128 + self.column) as usize] = bytes[index]
+            self.data_bytes += 1
+            if self.column == self.right {
+                self.column = self.left
+                if self.page == self.last {
+                    self.page = self.first
+                } else {
+                    self.page += 1
+                }
+            } else {
+                self.column += 1
+            }
+        }
+        return ok()
+    }
+
+    fn lit(&self, column: u32, row: u32) -> bool {
+        return (self.memory[(row / 8 * 128 + column) as usize] & (1u8 << ((row % 8) as u8))) != 0
+    }
+}
+
+// True when the panel memory from `column` shows `expected` from (x, y) for
+// `width` x `height` pixels, lighting pixels with a luma of 128 or more.
+fn ssd1306_shows(panel: &Ssd1306, column: u32, expected: &graphics.Canvas, x: i32, y: i32, width: u32, height: u32) -> bool {
+    for dy in 0u32..height {
+        for dx in 0u32..width {
+            wanted := false
+            match expected.color_at(x + dx as i32, y + dy as i32) {
+                some(color) => {
+                    wanted = graphics.luma(color) >= 128
+                }
+                none => {
+                    assert(false, "expected pixel outside its canvas")
+                }
+            }
+            if panel.lit(column + dx, y as u32 + dy) != wanted {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// An I2C bus that records each write's address and length and the first
+// bytes of the last one.
+struct I2cRecorder {
+    writes: u32
+    total: usize
+    longest: usize
+    address: u8
+    first: [4]u8
+    controls: u32
+
+    fn new() -> I2cRecorder {
+        return I2cRecorder { writes: 0, total: 0, longest: 0, address: 0, first: [0u8; 4], controls: 0 }
+    }
+
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error {
+        self.writes += 1
+        self.total += bytes.len
+        if bytes.len > self.longest {
+            self.longest = bytes.len
+        }
+        self.address = address
+        for index in 0usize..4 {
+            if index < bytes.len {
+                self.first[index] = bytes[index]
+            }
+        }
+        if bytes.len > 0 && (bytes[0] == display.I2C_COMMANDS || bytes[0] == display.I2C_DATA) {
+            self.controls += 1
+        }
+        return ok()
+    }
+
+    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error {
+        return err(hal.Error.Unsupported)
+    }
+
+    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error {
+        return err(hal.Error.Unsupported)
+    }
+}
+
+fn same_rect(rect: &graphics.Rect, x: i32, y: i32, width: u32, height: u32) -> bool {
+    return rect.x == x && rect.y == y && rect.width == width && rect.height == height
+}
+
+// Shared drawing code, written once against graphics.Display.
+fn draw_status<D: graphics.Display>(screen: &mut D, canvas: &mut graphics.Canvas, small: &graphics.Font, hot: bool) -> void!graphics.Error {
+    light := graphics.GREEN
+    if hot {
+        light = graphics.RED
+    }
+    canvas.fill_rect(2, 2, 10, 10, light)
+    canvas.text(small, 16, 3, "TEMP", graphics.WHITE)
+    return graphics.present(screen, canvas)
+}
+
+// A scene with shapes, lines and text, in screen coordinates.
+fn scene(canvas: &mut graphics.Canvas, small: &graphics.Font, width: i32, height: i32) {
+    canvas.clear(graphics.hex(0x203040))
+    canvas.fill_circle(width / 3, height / 2, (height / 3) as u32, graphics.hex(0xe5c07b))
+    canvas.round_rect(width / 2, 4, (width / 3) as u32, (height / 2) as u32, 5, graphics.WHITE)
+    canvas.line(0, height - 1, width - 1, 0, graphics.CYAN)
+    canvas.text(small, 3, height - 12, "Dodo", graphics.WHITE)
+}
+
+fn interfaces() {
+    // SPI: the data/command pin tells commands from data.
+    spi := display.SpiInterface.new(fake.Spi.new(), fake.Pin.new(), some(fake.Pin.new()))
+    command: [1]u8 = [0x2A]
+    spi.write_command(&command)!
+    assert(!spi.data_command().is_high())
+    data: [2]u8 = [1, 2]
+    spi.write_data(&data)!
+    assert(spi.data_command().is_high())
+    sent := spi.bus().sent()
+    assert_eq(sent.len, 3usize)
+    assert_eq(sent[0], 0x2Au8)
+    assert_eq(sent[2], 2u8)
+    bus := spi.release()
+    assert_eq(bus.sent().len, 3usize)
+
+    // I2C: a control byte before every chunk of at most I2C_CHUNK bytes.
+    i2c := display.I2cInterface.new(I2cRecorder.new(), 0x3C)
+    assert_eq(i2c.address(), 0x3Cu8)
+    commands: [3]u8 = [0xAE, 0xD5, 0x80]
+    i2c.write_command(&commands)!
+    recorder := i2c.bus()
+    assert_eq(recorder.writes, 1u32)
+    assert_eq(recorder.address, 0x3Cu8)
+    assert_eq(recorder.first[0], display.I2C_COMMANDS)
+    assert_eq(recorder.first[1], 0xAEu8)
+    pixels := [0x5Au8; 300]
+    i2c.write_data(&pixels)!
+    recorder = i2c.bus()
+    assert_eq(recorder.writes, 4u32)
+    assert_eq(recorder.controls, 4u32)
+    assert_eq(recorder.total, 4usize + 300 + 3)
+    assert_eq(recorder.longest, 129usize)
+    assert_eq(recorder.first[0], display.I2C_DATA)
+    nothing := [0u8; 0]
+    i2c.write_data(&nothing)!
+    final := i2c.release()
+    assert_eq(final.writes, 4u32)
+
+    // A failing I2C device reports its error.
+    failing := display.I2cInterface.new(fake.I2c.new(0x10), 0x3C)
+    match failing.write_command(&commands) {
+        ok() => {
+            assert(false, "a missing device must be reported")
+        }
+        err(error) => {
+            assert(error == hal.Error.NoAcknowledge)
+        }
+    }
+
+    // The reset pulse ends high after 1 ms + 20 us + 120 ms.
+    pin := fake.Pin.new()
+    delay := fake.Delay.new()
+    display.reset(&mut pin, &mut delay)
+    assert(pin.is_high())
+    assert_eq(pin.changes(), 3u32)
+    assert_eq(delay.elapsed_us(), 121_020u64)
+}
+
+fn st7789_setup() {
+    log := [0u16; 64]
+    delay := fake.Delay.new()
+    lcd := st7789.Display.new(Recorder.new(&mut log), st7789.panel_240x240(), st7789.Rotation.Deg0, &mut delay)!
+    expected: [9]u16 = [C | 0x01, C | 0x11, C | 0x3A, 0x55, C | 0x36, 0x00, C | 0x21, C | 0x13, C | 0x29]
+    wiring := lcd.wiring()
+    assert(wiring.matches(&expected))
+    assert_eq(delay.elapsed_us(), 290_000u64)
+    size := lcd.size()
+    assert(size.width == 240 && size.height == 240)
+    assert(lcd.format() == graphics.PixelFormat.Rgb565)
+
+    // Commands after setup.
+    wiring = lcd.wiring()
+    wiring.clear()
+    lcd.set_inverted(false)!
+    lcd.set_display_on(false)!
+    lcd.set_display_on(true)!
+    lcd.sleep(&mut delay)!
+    lcd.wake(&mut delay)!
+    after: [5]u16 = [C | 0x20, C | 0x28, C | 0x29, C | 0x10, C | 0x11]
+    wiring = lcd.wiring()
+    assert(wiring.matches(&after))
+    assert_eq(delay.elapsed_us(), 290_000u64 + 125_000)
+
+    // A BGR panel that keeps normal colours.
+    custom := st7789.Panel { width: 240, height: 320, column_offset: 0, row_offset: 0, inverted: false, bgr: true }
+    log2 := [0u16; 64]
+    other := st7789.Display.new(Recorder.new(&mut log2), custom, st7789.Rotation.Deg90, &mut delay)!
+    second := other.wiring()
+    assert_eq(second.at(4), C | 0x36)
+    assert_eq(second.at(5), 0x68u16)
+    assert_eq(second.at(6), C | 0x20)
+    other_size := other.size()
+    assert(other_size.width == 320 && other_size.height == 240)
+
+    // Panels that do not fit the controller are rejected before any byte.
+    log3 := [0u16; 8]
+    too_wide := st7789.Panel { width: 200, height: 240, column_offset: 50, row_offset: 0, inverted: true, bgr: false }
+    match st7789.Display.new(Recorder.new(&mut log3), too_wide, st7789.Rotation.Deg0, &mut delay) {
+        ok(_) => {
+            assert(false, "a panel beyond the memory must be rejected")
+        }
+        err(error) => {
+            assert(error == hal.Error.InvalidInput)
+        }
+    }
+    empty := st7789.Panel { width: 0, height: 240, column_offset: 0, row_offset: 0, inverted: true, bgr: false }
+    match st7789.Display.new(Recorder.new(&mut log3), empty, st7789.Rotation.Deg0, &mut delay) {
+        ok(_) => {
+            assert(false, "an empty panel must be rejected")
+        }
+        err(error) => {
+            assert(error == hal.Error.InvalidInput)
+        }
+    }
+
+    // A bus failure during setup is reported.
+    log4 := [0u16; 8]
+    broken := Recorder.new(&mut log4)
+    broken.fail_at = 3
+    match st7789.Display.new(broken, st7789.panel_240x240(), st7789.Rotation.Deg0, &mut delay) {
+        ok(_) => {
+            assert(false, "the injected failure must be reported")
+        }
+        err(error) => {
+            assert(error == hal.Error.Bus)
+        }
+    }
+}
+
+// The MADCTL value and the window a 1 x 1 present at (0, 0) selects.
+fn st7789_window(panel: st7789.Panel, rotation: st7789.Rotation, madctl: u16, column: u16, row: u16, width: u32, height: u32) {
+    log := [0u16; 64]
+    delay := fake.Delay.new()
+    lcd := st7789.Display.new(Recorder.new(&mut log), panel, rotation, &mut delay)!
+    size := lcd.size()
+    assert_eq(size.width, width)
+    assert_eq(size.height, height)
+    wiring := lcd.wiring()
+    assert_eq(wiring.at(5), madctl)
+    wiring.clear()
+    pixels := [0u8; 2 * 2 * 2]
+    canvas := graphics.canvas(&mut pixels, 2, 2, graphics.PixelFormat.Rgb565)!
+    canvas.pixel(0, 0, graphics.WHITE)
+    graphics.present(&mut lcd, &mut canvas)!
+    expected: [13]u16 = [C | 0x2A, column >> 8, column & 255, column >> 8, column & 255, C | 0x2B, row >> 8, row & 255, row >> 8, row & 255, C | 0x2C, 0xFF, 0xFF]
+    wiring = lcd.wiring()
+    assert(wiring.matches(&expected))
+}
+
+fn st7789_rotations() {
+    st7789_window(st7789.panel_135x240(), st7789.Rotation.Deg0, 0x00, 52, 40, 135, 240)
+    st7789_window(st7789.panel_135x240(), st7789.Rotation.Deg90, 0x60, 40, 53, 240, 135)
+    st7789_window(st7789.panel_135x240(), st7789.Rotation.Deg180, 0xC0, 53, 40, 135, 240)
+    st7789_window(st7789.panel_135x240(), st7789.Rotation.Deg270, 0xA0, 40, 52, 240, 135)
+    st7789_window(st7789.panel_240x240(), st7789.Rotation.Deg0, 0x00, 0, 0, 240, 240)
+    st7789_window(st7789.panel_240x240(), st7789.Rotation.Deg90, 0x60, 0, 0, 240, 240)
+    st7789_window(st7789.panel_240x240(), st7789.Rotation.Deg180, 0xC0, 0, 80, 240, 240)
+    st7789_window(st7789.panel_240x240(), st7789.Rotation.Deg270, 0xA0, 80, 0, 240, 240)
+    st7789_window(st7789.panel_240x280(), st7789.Rotation.Deg0, 0x00, 0, 20, 240, 280)
+    st7789_window(st7789.panel_240x280(), st7789.Rotation.Deg90, 0x60, 20, 0, 280, 240)
+    st7789_window(st7789.panel_172x320(), st7789.Rotation.Deg0, 0x00, 34, 0, 172, 320)
+    st7789_window(st7789.panel_172x320(), st7789.Rotation.Deg180, 0xC0, 34, 0, 172, 320)
+    st7789_window(st7789.panel_170x320(), st7789.Rotation.Deg270, 0xA0, 0, 35, 320, 170)
+    st7789_window(st7789.panel_240x320(), st7789.Rotation.Deg90, 0x60, 0, 0, 320, 240)
+}
+
+fn st7789_presents() {
+    small := font.small()
+    memory := [0u8; 320 * 320 * 2]
+    delay := fake.Delay.new()
+    lcd := st7789.Display.new(St7789.new(&mut memory), st7789.panel_135x240(), st7789.Rotation.Deg0, &mut delay)!
+    panel := lcd.wiring()
+    assert(panel.awake && panel.on && panel.inverted)
+    assert_eq(panel.colmod, 0x55u8)
+    assert_eq(panel.madctl, 0u8)
+
+    // Clearing through fill reaches every pixel of the panel and no other.
+    lcd.fill(graphics.BLUE)!
+    panel = lcd.wiring()
+    assert_eq(panel.pixels, 135u32 * 240)
+    assert_eq(panel.value(52, 40), 0x001Fu32)
+    assert_eq(panel.value(186, 279), 0x001Fu32)
+    assert_eq(panel.value(51, 40), 0u32)
+    assert_eq(panel.value(187, 279), 0u32)
+
+    // A whole RGB565 frame goes out in a single write.
+    pixels := [0u8; 135 * 240 * 2]
+    canvas := graphics.canvas(&mut pixels, 135, 240, graphics.PixelFormat.Rgb565)!
+    scene(&mut canvas, &small, 135, 240)
+    panel = lcd.wiring()
+    panel.data_writes = 0
+    panel.pixels = 0
+    graphics.present(&mut lcd, &mut canvas)!
+    panel = lcd.wiring()
+    assert_eq(panel.data_writes, 3u32)
+    assert_eq(panel.pixels, 135u32 * 240)
+    assert(st7789_shows(panel, 52, 40, &canvas, 0, 0, 135, 240))
+
+    // A partial update sends only its rectangle, a row per write.
+    panel.data_writes = 0
+    panel.pixels = 0
+    canvas.fill_rect(2, 2, 10, 10, graphics.RED)
+    canvas.text(&small, 16, 3, "TEMP", graphics.WHITE)
+    area := canvas.dirty()
+    assert(area.width < 135)
+    graphics.present(&mut lcd, &mut canvas)!
+    panel = lcd.wiring()
+    assert_eq(panel.pixels, area.width * area.height)
+    assert_eq(panel.data_writes, 2 + area.height)
+    assert(st7789_shows(panel, 52, 40, &canvas, 0, 0, 135, 240))
+    assert_eq(panel.value(52 + 2, 40 + 2), st7789.rgb565(graphics.RED))
+    // Through code written against graphics.Display.
+    draw_status(&mut lcd, &mut canvas, &small, false)!
+    panel = lcd.wiring()
+    assert_eq(panel.value(52 + 2, 40 + 2), st7789.rgb565(graphics.GREEN))
+    assert(st7789_shows(panel, 52, 40, &canvas, 0, 0, 135, 240))
+
+    // Rectangles beyond the canvas or the panel are cut off; nothing
+    // visible means nothing sent.
+    panel.data_writes = 0
+    lcd.present(&canvas, graphics.Rect.new(130, -5, 20, 10))!
+    panel = lcd.wiring()
+    assert_eq(panel.data_writes, 2u32 + 5)
+    assert_eq(panel.right, 52u32 + 134)
+    assert_eq(panel.bottom, 40u32 + 4)
+    panel.data_writes = 0
+    lcd.present(&canvas, graphics.Rect.new(135, 0, 5, 5))!
+    lcd.present(&canvas, graphics.Rect.new(0, 0, 0, 5))!
+    panel = lcd.wiring()
+    assert_eq(panel.data_writes, 0u32)
+
+    // Other formats are converted on the way.
+    rgba := [0u8; 135 * 240 * 4]
+    color := graphics.canvas(&mut rgba, 135, 240, graphics.PixelFormat.Rgba8888)!
+    scene(&mut color, &small, 135, 240)
+    color.fill_rect(100, 200, 7, 9, graphics.rgb(250, 130, 10))
+    graphics.present(&mut lcd, &mut color)!
+    panel = lcd.wiring()
+    assert(st7789_shows(panel, 52, 40, &color, 0, 0, 135, 240))
+    assert_eq(panel.value(52 + 100, 40 + 200), st7789.rgb565(graphics.rgb(250, 130, 10)))
+
+    // Bands draw a frame with a fraction of the memory; the last band of 50
+    // rows hangs 10 rows below the screen.
+    band_pixels := [0u8; 135 * 50 * 2]
+    band := graphics.canvas(&mut band_pixels, 135, 50, graphics.PixelFormat.Rgb565)!
+    bands := graphics.Bands.new(240)
+    reference_pixels := [0u8; 135 * 240 * 2]
+    reference := graphics.canvas(&mut reference_pixels, 135, 240, graphics.PixelFormat.Rgb565)!
+    scene(&mut reference, &small, 135, 240)
+    reference.fill_circle(60, 120, 50, graphics.MAGENTA)
+    lcd.fill(graphics.BLACK)!
+    panel = lcd.wiring()
+    panel.pixels = 0
+    count := 0u32
+    for bands.next(&mut band) {
+        scene(&mut band, &small, 135, 240)
+        band.fill_circle(60, 120, 50, graphics.MAGENTA)
+        graphics.present_all(&mut lcd, &mut band)!
+        count += 1
+    }
+    assert_eq(count, 5u32)
+    panel = lcd.wiring()
+    assert_eq(panel.pixels, 135u32 * 240)
+    assert(st7789_shows(panel, 52, 40, &reference, 0, 0, 135, 240))
+    // A partial update through a band canvas lands in its band.
+    bands.next(&mut band)
+    bands.next(&mut band)
+    band.fill_rect(10, 60, 4, 4, graphics.YELLOW)
+    graphics.present(&mut lcd, &mut band)!
+    panel = lcd.wiring()
+    assert_eq(panel.top, 40u32 + 60)
+    assert_eq(panel.left, 52u32 + 10)
+    assert_eq(panel.value(52 + 10, 40 + 60), st7789.rgb565(graphics.YELLOW))
+    bands.restart()
+}
+
+fn st7789_failures() {
+    log := [0u16; 64]
+    delay := fake.Delay.new()
+    lcd := st7789.Display.new(Recorder.new(&mut log), st7789.panel_240x240(), st7789.Rotation.Deg0, &mut delay)!
+    pixels := [0u8; 240 * 240 * 2]
+    canvas := graphics.canvas(&mut pixels, 240, 240, graphics.PixelFormat.Rgb565)!
+    canvas.fill_rect(5, 6, 7, 8, graphics.WHITE)
+    wiring := lcd.wiring()
+    wiring.clear()
+    wiring.fail_at = 4
+    match graphics.present(&mut lcd, &mut canvas) {
+        ok() => {
+            assert(false, "the injected failure must be reported")
+        }
+        err(error) => {
+            assert(error == graphics.Error.Device)
+        }
+    }
+    dirty := canvas.dirty()
+    assert(same_rect(&dirty, 5, 6, 7, 8))
+    wiring = lcd.wiring()
+    wiring.clear()
+    wiring.fail_at = 0
+    graphics.present(&mut lcd, &mut canvas)!
+    wiring = lcd.wiring()
+    assert_eq(wiring.bytes, 11usize + 7 * 8 * 2)
+    match lcd.fill(graphics.BLACK) {
+        ok() => {}
+        err(_) => {
+            assert(false, "fill must succeed")
+        }
+    }
+    wiring = lcd.wiring()
+    wiring.clear()
+    wiring.fail_at = 2
+    match lcd.fill(graphics.BLACK) {
+        ok() => {
+            assert(false, "the injected failure must be reported")
+        }
+        err(error) => {
+            assert(error == hal.Error.Bus)
+        }
+    }
+    released := lcd.release()
+    assert_eq(released.writes, 2u32)
+}
+
+fn ssd1306_setup() {
+    oled := ssd1306.Display.new(Ssd1306.new(), ssd1306.panel_128x64())!
+    panel := oled.wiring()
+    assert(panel.on && !panel.inverted && panel.remapped && panel.scan_down)
+    assert_eq(panel.multiplex, 63u8)
+    assert_eq(panel.com_pins, 0x12u8)
+    assert_eq(panel.contrast, 0xCFu8)
+    assert_eq(panel.charge_pump, 0x14u8)
+    // Setup clears the whole memory.
+    assert_eq(panel.data_bytes, 1024u32)
+    for index in 0usize..1024 {
+        assert_eq(panel.memory[index], 0u8)
+    }
+    size := oled.size()
+    assert(size.width == 128 && size.height == 64)
+    assert(oled.format() == graphics.PixelFormat.Mono1)
+
+    oled.set_contrast(0x10)!
+    oled.set_inverted(true)!
+    oled.set_display_on(false)!
+    panel = oled.wiring()
+    assert_eq(panel.contrast, 0x10u8)
+    assert(panel.inverted && !panel.on)
+    oled.set_display_on(true)!
+    oled.set_inverted(false)!
+
+    // The exact setup sequence of a 128x32 panel.
+    log := [0u16; 1024]
+    short := ssd1306.Display.new(Recorder.new(&mut log), ssd1306.panel_128x32())!
+    expected: [31]u16 = [C | 0xAE, C | 0xD5, C | 0x80, C | 0xA8, C | 31, C | 0xD3, C | 0, C | 0x40, C | 0x8D, C | 0x14, C | 0x20, C | 0x00, C | 0xA1, C | 0xC8, C | 0xDA, C | 0x02, C | 0x81, C | 0x8F, C | 0xD9, C | 0xF1, C | 0xDB, C | 0x40, C | 0xA4, C | 0xA6, C | 0x2E, C | 0x21, C | 0, C | 127, C | 0x22, C | 0, C | 3]
+    recorded := short.wiring()
+    for index in 0usize..31 {
+        assert_eq(recorded.at(index), expected[index])
+    }
+    assert_eq(recorded.bytes, 31usize + 512 + 1)
+    assert_eq(recorded.at(31 + 512), C | 0xAF)
+    assert_eq(recorded.writes, 16u32 + 2 + 4 + 1)
+
+    // Panels the controller cannot drive.
+    odd := ssd1306.Panel { width: 128, height: 20, column_offset: 0, alternative_com_pins: false }
+    match ssd1306.Display.new(Ssd1306.new(), odd) {
+        ok(_) => {
+            assert(false, "a height that is not whole pages must be rejected")
+        }
+        err(error) => {
+            assert(error == hal.Error.InvalidInput)
+        }
+    }
+    wide := ssd1306.Panel { width: 100, height: 32, column_offset: 30, alternative_com_pins: false }
+    match ssd1306.Display.new(Ssd1306.new(), wide) {
+        ok(_) => {
+            assert(false, "a panel beyond the memory must be rejected")
+        }
+        err(error) => {
+            assert(error == hal.Error.InvalidInput)
+        }
+    }
+
+    // Over I2C, every page is one bus write.
+    i2c := display.I2cInterface.new(I2cRecorder.new(), ssd1306.ADDRESS)
+    over_i2c := ssd1306.Display.new(i2c, ssd1306.panel_128x64())!
+    wiring := over_i2c.wiring()
+    bus := wiring.bus()
+    assert_eq(bus.address, 0x3Cu8)
+    assert_eq(bus.writes, 16u32 + 2 + 8 + 1)
+    assert_eq(bus.longest, 129usize)
+}
+
+fn ssd1306_presents() {
+    small := font.small()
+    oled := ssd1306.Display.new(Ssd1306.new(), ssd1306.panel_128x64())!
+    pixels := [0u8; 128 * 64 / 8]
+    canvas := graphics.canvas(&mut pixels, 128, 64, graphics.PixelFormat.Mono1)!
+    canvas.clear(graphics.BLACK)
+    canvas.fill_circle(40, 30, 20, graphics.WHITE)
+    canvas.text(&small, 70, 10, "Hi", graphics.WHITE)
+    canvas.line(0, 63, 127, 0, graphics.WHITE)
+    graphics.present(&mut oled, &mut canvas)!
+    panel := oled.wiring()
+    assert(ssd1306_shows(panel, 0, &canvas, 0, 0, 128, 64))
+    assert(oled.is_lit(40, 30))
+    assert(!oled.is_lit(1, 1))
+    assert(!oled.is_lit(128, 0))
+
+    // A partial update sends only the pages and columns it touches and
+    // keeps the rest of those pages.
+    panel = oled.wiring()
+    panel.data_bytes = 0
+    canvas.fill_rect(100, 13, 5, 6, graphics.WHITE)
+    graphics.present(&mut oled, &mut canvas)!
+    panel = oled.wiring()
+    assert_eq(panel.left, 100u32)
+    assert_eq(panel.right, 104u32)
+    assert_eq(panel.first, 1u32)
+    assert_eq(panel.last, 2u32)
+    assert_eq(panel.data_bytes, 10u32)
+    assert(ssd1306_shows(panel, 0, &canvas, 0, 0, 128, 64))
+    // A pixel outside the presented rectangle stays as last sent, even in a
+    // page the present rewrote.
+    canvas.pixel(101, 12, graphics.WHITE)
+    canvas.take_dirty()
+    canvas.pixel(101, 14, graphics.BLACK)
+    graphics.present(&mut oled, &mut canvas)!
+    panel = oled.wiring()
+    assert(!panel.lit(101, 12))
+    assert(!panel.lit(101, 14))
+    assert(panel.lit(101, 13))
+    assert(panel.lit(101, 18))
+
+    // A colour canvas in bands: pixels light from a luma of 128.
+    band_pixels := [0u8; 128 * 24 * 2]
+    band := graphics.canvas(&mut band_pixels, 128, 24, graphics.PixelFormat.Rgb565)!
+    reference_pixels := [0u8; 128 * 64 * 2]
+    reference := graphics.canvas(&mut reference_pixels, 128, 64, graphics.PixelFormat.Rgb565)!
+    scene(&mut reference, &small, 128, 64)
+    bands := graphics.Bands.new(64)
+    count := 0u32
+    for bands.next(&mut band) {
+        scene(&mut band, &small, 128, 64)
+        graphics.present_all(&mut oled, &mut band)!
+        count += 1
+    }
+    assert_eq(count, 3u32)
+    panel = oled.wiring()
+    assert(ssd1306_shows(panel, 0, &reference, 0, 0, 128, 64))
+
+    // Flipping resends the whole picture.
+    panel.data_bytes = 0
+    oled.set_flipped(true)!
+    panel = oled.wiring()
+    assert(!panel.remapped && !panel.scan_down)
+    assert_eq(panel.data_bytes, 1024u32)
+    assert(ssd1306_shows(panel, 0, &reference, 0, 0, 128, 64))
+    oled.set_flipped(false)!
+    panel = oled.wiring()
+    assert(panel.remapped && panel.scan_down)
+
+    // A small panel sits at its column offset.
+    shield := ssd1306.Display.new(Ssd1306.new(), ssd1306.panel_64x48())!
+    shield_pixels := [0u8; 64 * 48 / 8]
+    tiny := graphics.canvas(&mut shield_pixels, 64, 48, graphics.PixelFormat.Mono1)!
+    tiny.clear(graphics.BLACK)
+    tiny.rect(0, 0, 64, 48, graphics.WHITE)
+    tiny.text(&small, 4, 4, "64x48", graphics.WHITE)
+    graphics.present(&mut shield, &mut tiny)!
+    sim := shield.wiring()
+    assert_eq(sim.multiplex, 47u8)
+    assert_eq(sim.left, 32u32)
+    assert_eq(sim.right, 95u32)
+    assert_eq(sim.last, 5u32)
+    assert(ssd1306_shows(sim, 32, &tiny, 0, 0, 64, 48))
+    assert(!sim.lit(31, 0) && !sim.lit(96, 0))
+
+    // A failed present is retried from the driver's copy.
+    log := [0u16; 8]
+    flaky := ssd1306.Display.new(Recorder.new(&mut log), ssd1306.panel_128x32())!
+    mono := [0u8; 128 * 32 / 8]
+    frame := graphics.canvas(&mut mono, 128, 32, graphics.PixelFormat.Mono1)!
+    frame.pixel(9, 9, graphics.WHITE)
+    recorder := flaky.wiring()
+    recorder.clear()
+    recorder.fail_at = 3
+    match graphics.present(&mut flaky, &mut frame) {
+        ok() => {
+            assert(false, "the injected failure must be reported")
+        }
+        err(error) => {
+            assert(error == graphics.Error.Device)
+        }
+    }
+    assert(flaky.is_lit(9, 9))
+    recorder = flaky.wiring()
+    recorder.clear()
+    recorder.fail_at = 0
+    graphics.present(&mut flaky, &mut frame)!
+    recorder = flaky.wiring()
+    retried: [7]u16 = [C | 0x21, C | 9, C | 9, C | 0x22, C | 1, C | 1, 0x02]
+    assert(recorder.matches(&retried))
+}
+
+fn main() {
+    interfaces()
+    st7789_setup()
+    st7789_rotations()
+    st7789_presents()
+    st7789_failures()
+    ssd1306_setup()
+    ssd1306_presents()
+}
+
+@test
+fn display_checks_suite() {
+    main()
+}

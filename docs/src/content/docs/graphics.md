@@ -1,6 +1,6 @@
 ---
 title: "Graphics"
-description: "Draw shapes, text and images into pixel buffers on any target, present them through the Display protocol, and test rendering with golden images."
+description: "Draw shapes, text and images into pixel buffers on any target, present them on display panels or through the Display protocol, and test rendering with golden images."
 section: "Standard library"
 order: 160.5
 ---
@@ -11,18 +11,21 @@ arithmetic, so the same program produces byte-identical pixels on a laptop, in
 WebAssembly and on a Raspberry Pi Pico without an FPU. Nothing is allocated and
 no operating system is needed.
 
-The family has four imports:
+The family has four imports, and three more drive display panels on
+microcontrollers:
 
 | Import | Contents |
 | --- | --- |
-| `std/graphics` | `Canvas`, colors, rectangles, drawing, text rendering, the `Display` protocol. |
+| `std/graphics` | `Canvas`, colors, rectangles, drawing, text rendering, the `Display` protocol, band rendering. |
 | `std/graphics/font` | Built-in 6x8 and 8x16 bitmap fonts for ASCII and Latin-1. |
 | `std/graphics/image` | PPM, QOI and BMP decoding and encoding into caller buffers. |
 | `std/graphics/fake` | An in-memory `Display` for tests. |
+| `std/embedded/display` | The SPI and I2C links that panel drivers talk over. |
+| `std/embedded/display/st7789` | ST7789 colour TFT and IPS panels, RGB565 over SPI. |
+| `std/embedded/display/ssd1306` | SSD1306 monochrome OLED panels, over I2C or SPI. |
 
 To show a canvas on a desktop, open a window with [std/window](window.md),
-which implements the `Display` protocol below. Display panel drivers are not
-part of the library yet; they will implement the same protocol.
+which implements the `Display` protocol below like the panel drivers do.
 
 ## Quickstart
 
@@ -128,6 +131,159 @@ preferred `format()` and shows a canvas with `present(&canvas, dirty)`.
 `graphics.present(display, canvas)` sends only the canvas's dirty rectangle and
 resets it; if presenting fails, the rectangle is marked dirty again so the next
 call retries. `graphics.present_all` sends the whole canvas.
+
+A canvas covers `canvas.bounds()` of the display: all of it when the canvas
+has the display's size, or a part of it when it is smaller or has an
+[origin](#bands-and-origins). Displays show only what lies inside both the
+canvas and the display and ignore the rest, the way drawing ignores pixels
+outside a canvas. Every display converts other pixel formats, so drawing code
+works with any canvas.
+
+## Display panels
+
+The drivers under `std/embedded/display` implement `graphics.Display` for
+the small panels found on microcontroller boards. A function such as
+`draw_status` above therefore runs unchanged on a panel, and its tests keep
+running against `fake.Display`.
+
+| Driver | Panels | Format | Connected over |
+| --- | --- | --- | --- |
+| `st7789.Display` | 1.14" to 2.4" colour TFT and IPS modules: 240x240, 240x320, 135x240, 240x280, 172x320, 170x320 | `Rgb565` | SPI |
+| `ssd1306.Display` | 0.42" to 1.3" monochrome OLED modules: 128x64, 128x32, 96x16, 64x48, 72x40 | `Mono1` | I2C or SPI |
+
+A driver talks to its controller through a `display.Interface`, which sends
+command bytes and data bytes. There are two, and a test can pass its own:
+
+| Interface | Wiring |
+| --- | --- |
+| `display.SpiInterface.new(bus, data_command, select)` | An SPI bus, the panel's D/C pin (low for commands, high for data), and its chip-select pin, or `none` when that is wired low. |
+| `display.I2cInterface.new(bus, address)` | An I2C bus and the controller's 7-bit address, such as `ssd1306.ADDRESS` (0x3C). |
+
+An ST7789 panel on a Raspberry Pi Pico:
+
+```dodo
+bus := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, none, hal.SpiMode.Mode3, 62_500_000)!
+data_command := b.pins.output(16)!
+select := b.pins.output(board.SPI_SELECT_PIN)!
+reset := b.pins.output(20)!
+display.reset(&mut reset, &mut b.timer)
+wiring := display.SpiInterface.new(bus, data_command, some(select))
+lcd := st7789.Display.new(wiring, st7789.panel_240x240(), st7789.Rotation.Deg0, &mut b.timer)!
+
+pixels := [0u8; 240 * 240 * 2]
+canvas := graphics.canvas(&mut pixels, 240, 240, graphics.PixelFormat.Rgb565)!
+canvas.clear(graphics.BLACK)
+graphics.present(&mut lcd, &mut canvas)!
+```
+
+`st7789.Display.new` resets the controller by command, selects 16-bit
+colour, applies the panel's colour inversion and subpixel order, and turns
+the display on, which takes about 300 ms. The panel's memory keeps whatever
+it held before, so present a whole frame (or `lcd.fill(color)`) first.
+`display.reset` pulses a reset pin wired to a GPIO; a panel whose reset pin is
+tied to the board's reset needs no call. An `Rgb565` canvas is sent straight
+from its storage; other formats are converted on the way.
+
+`Rotation.Deg90` and `Deg270` turn the picture a quarter turn and swap the
+display's width and height: `lcd.size()` reports the result, which the
+canvas should match. The controller has memory for 240x320 pixels; a
+smaller panel shows part of it, and its `st7789.Panel` holds where. For a
+module not in the list, fill in a `Panel` from its datasheet or a working
+driver: size, column and row offset, colour inversion (on for most IPS
+panels), and BGR order.
+
+An SSD1306 module on the board's I2C pins:
+
+```dodo
+bus := b.pins.i2c(board.I2C_SDA_PIN, board.I2C_SCL_PIN, hal.I2C_FAST_HZ)!
+oled := ssd1306.Display.new(display.I2cInterface.new(bus, ssd1306.ADDRESS), ssd1306.panel_128x64())!
+pixels := [0u8; 128 * 64 / 8]
+canvas := graphics.canvas(&mut pixels, 128, 64, graphics.PixelFormat.Mono1)!
+```
+
+`ssd1306.Display.new` sets the controller up for the panel, clears it, and
+turns it on. The controller stores eight rows per byte, so the driver keeps
+a copy of the panel memory (1 KiB): a present changes only the pixels inside
+its rectangle and sends only the bytes it touched. Colour canvases light the
+pixels whose luma is 128 or more, as a `Mono1` canvas stores them.
+[`examples/oled_demo.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/oled_demo.dodo)
+is a complete program for a 0.96" module: it finds the display on any free
+I2C pin pair and shows an animation, the uptime and the chip's temperature.
+
+| Method | ST7789 | SSD1306 |
+| --- | --- | --- |
+| `size()`, `format()`, `present(&canvas, dirty)` | yes | yes |
+| `set_inverted(on)`, `set_display_on(on)` | yes | yes |
+| `fill(color)` | yes | |
+| `sleep(&mut delay)`, `wake(&mut delay)` | yes | |
+| `set_contrast(level)`, `set_flipped(on)`, `is_lit(x, y)` | | yes |
+| `wiring()`, `release()` | the interface | the interface |
+
+Driver methods report bus failures as `hal.Error`; `present`, which the
+`Display` protocol defines, reports them as `graphics.Error.Device`.
+[`examples/thermometer_board.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/thermometer_board.dodo)
+is a complete program: the chip's temperature on an ST7789 panel, with the
+screen in
+[`examples/thermometer.dodo`](https://github.com/Jotrorox/dodo/blob/main/examples/thermometer.dodo)
+tested against `fake.Display`. Build it for a board with
+`dodo run examples/thermometer_board.dodo --board pico`.
+
+## Bands and origins
+
+A full frame does not always fit in memory: 320x240 at `Rgb565` is 153,600
+bytes, more than half an RP2040's RAM. `canvas.set_origin(x, y)` places a
+canvas at a point of a larger screen. Drawing calls keep using screen
+coordinates, and the canvas stores only the pixels under it, so the same
+drawing function renders the whole screen or any part of it.
+
+`graphics.Bands` moves a canvas down the screen one band at a time:
+
+```dodo test
+package banded
+
+import "std/graphics"
+import "std/graphics/fake"
+
+fn draw_screen(canvas: &mut graphics.Canvas) {
+    canvas.clear(graphics.BLACK)
+    canvas.fill_circle(60, 60, 50, graphics.YELLOW)
+}
+
+@test
+fn bands_draw_the_whole_screen() {
+    screen_storage := [0u8; 120 * 120 * 2]
+    screen := fake.Display.new(&mut screen_storage, 120, 120, graphics.PixelFormat.Rgb565)!
+    pixels := [0u8; 120 * 40 * 2]
+    band := graphics.canvas(&mut pixels, 120, 40, graphics.PixelFormat.Rgb565)!
+    bands := graphics.Bands.new(120)
+    for bands.next(&mut band) {
+        draw_screen(&mut band)
+        graphics.present_all(&mut screen, &mut band)!
+    }
+    assert_eq(screen.presents(), 3u32)
+    match screen.screen().color_at(60, 60) {
+        some(color) => assert_eq(color, graphics.YELLOW),
+        none => assert(false),
+    }
+}
+```
+
+`bands.next(&mut canvas)` sets the canvas's origin to the next band and
+returns true, or returns false after the last band and starts over for the
+next frame. The scene is drawn once per band, so use the tallest band the
+memory allows. A last band that hangs below the screen is cut off by the
+display.
+
+After the first frame, an origin also makes partial updates cheap: move the
+canvas over the part of the screen that changes, redraw, and present it.
+`examples/thermometer_board.dodo` keeps a canvas for a third of the screen
+and redraws only the rows holding its reading.
+
+`bounds()`, `clip()`, `dirty()` and `color_at` use screen coordinates.
+`row(y)` and `pixels()` stay relative to the canvas's own top-left pixel,
+and `equals` and `diff_bounds` compare canvases from their top-left pixels,
+whatever their origins. `set_origin` resets the clip to the new bounds and
+empties the dirty rectangle.
 
 ## Canvases and pixel formats
 
@@ -265,3 +421,9 @@ including regenerating every image with `DODO_UPDATE_GOLDEN=1`.
 There is no antialiasing, no floating point, and no GPU path: those are
 deliberate for predictable results on microcontrollers. Fonts are fixed-width
 bitmaps; there is no TrueType rasterizer, PNG codec, or text shaping.
+
+The panel drivers write pixels through the SPI or I2C bus protocol, so a
+transfer keeps the processor busy; there is no DMA path for them yet. ST7789
+panels are the only colour panels with a driver: ILI9341 and similar
+controllers use the same window commands but different setup, and SH1106
+OLED controllers lack the SSD1306's addressing mode.

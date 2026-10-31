@@ -8,11 +8,14 @@ import "std/window"
 // Escape or Close. tests/window_library.rs drives it with xdotool under Xvfb;
 // it also exits after five idle seconds, so a lost event cannot hang a test.
 // T renames the window, P draws a small square with a partial update, and
-// D presents a canvas of its own through the graphics.Display protocol.
+// D presents a small canvas of its own, placed with set_origin, through the
+// graphics.Display protocol.
 
 fn present_own<D: graphics.Display>(display: &mut D) -> void!graphics.Error {
-    pixels := [0u8; 320 * 240 * 2]
-    canvas := graphics.canvas(&mut pixels, 320, 240, graphics.PixelFormat.Rgb565)?
+    // A canvas covering only part of the window, as band rendering uses.
+    pixels := [0u8; 40 * 40 * 2]
+    canvas := graphics.canvas(&mut pixels, 40, 40, graphics.PixelFormat.Rgb565)?
+    canvas.set_origin(240, 140)
     canvas.fill_rect(250, 150, 20, 20, graphics.CYAN)
     return graphics.present(display, &mut canvas)
 }

@@ -1,0 +1,190 @@
+package display
+
+import "std/embedded/hal"
+import "std/graphics"
+
+// Display panel drivers and the buses they talk over. The drivers in
+// `std/embedded/display/NAME` implement the `std/graphics` Display protocol,
+// so drawing code written against graphics.Display runs unchanged on a panel,
+// in a desktop window, and under `dodo test` with std/graphics/fake:
+//
+//   st7789     colour TFT and IPS panels, RGB565 over SPI, 240x240 to 240x320
+//   ssd1306    monochrome OLED panels up to 128x64, over I2C or SPI
+//
+// Display controllers take two kinds of bytes: commands, and data such as
+// command parameters or pixels. An Interface carries both over one bus, so
+// each driver works on any bus its controller supports, and a test can pass a
+// recording or simulated Interface instead:
+//
+//   SpiInterface   an SPI bus plus a data/command pin (D/C, sometimes labelled
+//                  DC or RS) that is low for commands and high for data, and
+//                  optionally a chip-select pin
+//   I2cInterface   an I2C bus and the controller's address; each transfer
+//                  starts with a control byte that says which kind follows
+//
+// Building a panel on a board takes the bus, then the interface, then the
+// driver:
+//
+//     bus := b.pins.spi(board.SPI_CLOCK_PIN, board.SPI_TX_PIN, none, hal.SpiMode.Mode3, 62_500_000)!
+//     wiring := display.SpiInterface.new(bus, b.pins.output(16)!, some(b.pins.output(17)!))
+//     lcd := st7789.Display.new(wiring, st7789.panel_240x240(), st7789.Rotation.Deg0, &mut b.timer)!
+//
+// Drivers report bus failures from their own methods as hal.Error and from
+// present, which the Display protocol defines, as graphics.Error.Device.
+
+// Bytes to a display controller.
+pub interface Interface {
+    // Send command bytes.
+    fn write_command(&mut self, bytes: &[u8]) -> void!hal.Error
+    // Send data bytes: command parameters or pixels.
+    fn write_data(&mut self, bytes: &[u8]) -> void!hal.Error
+}
+
+// A display on an SPI bus with a data/command pin, and a chip-select pin
+// unless the panel's is wired low. Each write selects the panel, sends its
+// bytes, and deselects it. Configure the bus with the clock and mode the
+// controller's datasheet gives: SPI mode 3 for most ST7789 boards (mode 0
+// for those with a chip-select pin works too) and mode 0 for the SSD1306.
+pub struct SpiInterface<B: hal.Spi, P: hal.OutputPin> {
+    bus: B
+    data_command: P
+    select: Option<P>
+
+    // Takes the bus and pins, and deselects the panel.
+    pub fn new(bus: B, data_command: P, select: Option<P>) -> SpiInterface<B, P> from(bus, data_command, select) {
+        wiring := SpiInterface<B, P> { bus, data_command, select }
+        wiring.deselect()
+        return wiring
+    }
+
+    pub fn write_command(&mut self, bytes: &[u8]) -> void!hal.Error {
+        self.data_command.set_low()
+        return self.send(bytes)
+    }
+
+    pub fn write_data(&mut self, bytes: &[u8]) -> void!hal.Error {
+        self.data_command.set_high()
+        return self.send(bytes)
+    }
+
+    // The bus, for example to reconfigure it between frames.
+    pub fn bus(&mut self) -> &mut B from(self) {
+        return &mut self.bus
+    }
+
+    // The data/command pin.
+    pub fn data_command(&self) -> &P from(self) {
+        return &self.data_command
+    }
+
+    // Give back the bus. The pins are dropped with the interface.
+    pub fn release(self) -> B from(self) {
+        let SpiInterface { bus, data_command, select } = self
+        return bus
+    }
+
+    fn send(&mut self, bytes: &[u8]) -> void!hal.Error {
+        match &mut self.select {
+            some(pin) => {
+                pin.set_low()
+            }
+            none => {}
+        }
+        result := self.bus.write(bytes)
+        self.deselect()
+        return result
+    }
+
+    fn deselect(&mut self) {
+        match &mut self.select {
+            some(pin) => {
+                pin.set_high()
+            }
+            none => {}
+        }
+    }
+}
+
+// The largest number of bytes after the control byte in one I2C write.
+// Larger writes are split, which costs one address and control byte each.
+pub const I2C_CHUNK: usize = 128
+
+// Control bytes that start each I2C write: what follows is commands, or data.
+pub const I2C_COMMANDS: u8 = 0x00
+pub const I2C_DATA: u8 = 0x40
+
+// A display on an I2C bus at a 7-bit address, such as 0x3C for most SSD1306
+// modules. Each write is one or more bus writes of a control byte followed
+// by up to I2C_CHUNK bytes.
+pub struct I2cInterface<B: hal.I2c> {
+    bus: B
+    address: u8
+
+    pub fn new(bus: B, address: u8) -> I2cInterface<B> from(bus) {
+        return I2cInterface<B> { bus, address }
+    }
+
+    pub fn write_command(&mut self, bytes: &[u8]) -> void!hal.Error {
+        return self.send(I2C_COMMANDS, bytes)
+    }
+
+    pub fn write_data(&mut self, bytes: &[u8]) -> void!hal.Error {
+        return self.send(I2C_DATA, bytes)
+    }
+
+    pub fn address(&self) -> u8 {
+        return self.address
+    }
+
+    // The bus, for example to talk to other devices on it between frames.
+    pub fn bus(&mut self) -> &mut B from(self) {
+        return &mut self.bus
+    }
+
+    // Give back the bus.
+    pub fn release(self) -> B from(self) {
+        let I2cInterface { bus, address } = self
+        return bus
+    }
+
+    fn send(&mut self, control: u8, bytes: &[u8]) -> void!hal.Error {
+        packet := [0u8; 129]
+        packet[0] = control
+        start := 0usize
+        for start < bytes.len {
+            count := bytes.len - start
+            if count > I2C_CHUNK {
+                count = I2C_CHUNK
+            }
+            for index in 0..count {
+                packet[1 + index] = bytes[start + index]
+            }
+            self.bus.write(self.address, &packet[..1 + count])?
+            start += count
+        }
+        return ok()
+    }
+}
+
+// Pulse a controller's active-low reset pin and wait until the controller
+// is ready: 1 ms high, 20 us low, then 120 ms, the longest an ST7789 or
+// SSD1306 needs. Call it before creating a driver for a panel whose reset
+// pin is wired to a GPIO; drivers also reset by command.
+pub fn reset<P: hal.OutputPin, D: hal.Delay>(pin: &mut P, delay: &mut D) {
+    pin.set_high()
+    delay.delay_us(1000)
+    pin.set_low()
+    delay.delay_us(20)
+    pin.set_high()
+    hal.delay_ms(delay, 120)
+}
+
+// The part of `dirty` a display of `width` x `height` shows from `canvas`:
+// inside the canvas's bounds and the display, or an empty rectangle. For
+// drivers implementing graphics.Display.
+pub fn visible(canvas: &graphics.Canvas, dirty: graphics.Rect, width: u32, height: u32) -> graphics.Rect {
+    bounds := canvas.bounds()
+    screen := graphics.Rect.new(0, 0, width, height)
+    inside := dirty.intersect(&bounds)
+    return inside.intersect(&screen)
+}

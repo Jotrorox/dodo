@@ -1,0 +1,466 @@
+package mqtt_checks
+import "std/mqtt"
+import "core/bytes"
+
+fn encoders() -> i32!mqtt.Error {
+    output := [0u8; 128]
+    connect := mqtt.Connect.new(b"dodo")
+    used := mqtt.encode_connect(&mut output, &connect)?
+    if !bytes.equal(&output[..used], b"\x10\x10\x00\x04MQTT\x04\x02\x00\x3c\x00\x04dodo") {
+        return ok(1)
+    }
+    full := mqtt.Connect.new(b"dodo")
+    full.username = b"u"
+    full.password = b"p"
+    full.will_topic = b"w"
+    full.will_payload = b"bye"
+    full.will_qos = mqtt.QoS.AtLeastOnce
+    full.will_retain = true
+    full.keep_alive_s = 0
+    used = mqtt.encode_connect(&mut output, &full)?
+    if !bytes.equal(&output[..used], b"\x10\x1e\x00\x04MQTT\x04\xee\x00\x00\x00\x04dodo\x00\x01w\x00\x03bye\x00\x01u\x00\x01p") {
+        return ok(2)
+    }
+    used = mqtt.encode_publish(&mut output, b"a/b", b"hi", mqtt.QoS.AtMostOnce, false, false, 0)?
+    if !bytes.equal(&output[..used], b"\x30\x07\x00\x03a/bhi") {
+        return ok(3)
+    }
+    used = mqtt.encode_publish(&mut output, b"a/b", b"hi", mqtt.QoS.AtLeastOnce, true, false, 10)?
+    if !bytes.equal(&output[..used], b"\x33\x09\x00\x03a/b\x00\x0ahi") {
+        return ok(4)
+    }
+    used = mqtt.encode_publish(&mut output, b"a/b", b"hi", mqtt.QoS.ExactlyOnce, false, true, 258)?
+    if !bytes.equal(&output[..used], b"\x3c\x09\x00\x03a/b\x01\x02hi") {
+        return ok(5)
+    }
+    used = mqtt.encode_publish_head(&mut output, b"a/b", 200, mqtt.QoS.AtMostOnce, false, false, 0)?
+    if !bytes.equal(&output[..used], b"\x30\xcd\x01\x00\x03a/b") {
+        return ok(6)
+    }
+    used = mqtt.encode_subscribe(&mut output, 1, b"a/#", mqtt.QoS.AtLeastOnce)?
+    if !bytes.equal(&output[..used], b"\x82\x08\x00\x01\x00\x03a/#\x01") {
+        return ok(7)
+    }
+    used = mqtt.encode_unsubscribe(&mut output, 2, b"a/#")?
+    if !bytes.equal(&output[..used], b"\xa2\x07\x00\x02\x00\x03a/#") {
+        return ok(8)
+    }
+    used = mqtt.encode_ack(&mut output, mqtt.PacketKind.Pubrel, 5)?
+    if !bytes.equal(&output[..used], b"\x62\x02\x00\x05") {
+        return ok(9)
+    }
+    used = mqtt.encode_ack(&mut output, mqtt.PacketKind.Puback, 5)?
+    if !bytes.equal(&output[..used], b"\x40\x02\x00\x05") {
+        return ok(10)
+    }
+    used = mqtt.encode_pingreq(&mut output)?
+    if !bytes.equal(&output[..used], b"\xc0\x00") {
+        return ok(11)
+    }
+    used = mqtt.encode_disconnect(&mut output)?
+    if !bytes.equal(&output[..used], b"\xe0\x00") {
+        return ok(12)
+    }
+    used = mqtt.encode_connack(&mut output, true, mqtt.ACCEPTED)?
+    if !bytes.equal(&output[..used], b"\x20\x02\x01\x00") {
+        return ok(13)
+    }
+    used = mqtt.encode_suback(&mut output, 7, b"\x80")?
+    if !bytes.equal(&output[..used], b"\x90\x03\x00\x07\x80") {
+        return ok(14)
+    }
+    used = mqtt.encode_pingresp(&mut output)?
+    if !bytes.equal(&output[..used], b"\xd0\x00") {
+        return ok(15)
+    }
+    return ok(0)
+}
+fn encoder_errors() -> i32 {
+    small := [0u8; 8]
+    match mqtt.encode_publish(&mut small, b"a/b", b"payload", mqtt.QoS.AtMostOnce, false, false, 0) {
+        ok(_) => {
+            return 20
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.BufferFull {
+                return 21
+            }
+        }
+    }
+    output := [0u8; 64]
+    match mqtt.encode_publish(&mut output, b"a/+", b"", mqtt.QoS.AtMostOnce, false, false, 0) {
+        ok(_) => {
+            return 22
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.InvalidTopic {
+                return 23
+            }
+        }
+    }
+    // QoS 0 takes no packet identifier; QoS 1 and 2 need one.
+    match mqtt.encode_publish(&mut output, b"a", b"", mqtt.QoS.AtMostOnce, false, false, 1) {
+        ok(_) => {
+            return 24
+        }
+        err(_) => {}
+    }
+    match mqtt.encode_publish(&mut output, b"a", b"", mqtt.QoS.AtLeastOnce, false, false, 0) {
+        ok(_) => {
+            return 25
+        }
+        err(_) => {}
+    }
+    match mqtt.encode_subscribe(&mut output, 1, b"a/#/b", mqtt.QoS.AtMostOnce) {
+        ok(_) => {
+            return 26
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.InvalidFilter {
+                return 27
+            }
+        }
+    }
+    persistent := mqtt.Connect.new(b"")
+    persistent.clean_session = false
+    match mqtt.encode_connect(&mut output, &persistent) {
+        ok(_) => {
+            return 28
+        }
+        err(_) => {}
+    }
+    anonymous := mqtt.Connect.new(b"x")
+    anonymous.password = b"secret"
+    match mqtt.encode_connect(&mut output, &anonymous) {
+        ok(_) => {
+            return 29
+        }
+        err(_) => {}
+    }
+    orphan := mqtt.Connect.new(b"x")
+    orphan.will_retain = true
+    match mqtt.encode_connect(&mut output, &orphan) {
+        ok(_) => {
+            return 30
+        }
+        err(_) => {}
+    }
+    match mqtt.encode_ack(&mut output, mqtt.PacketKind.Pingreq, 1) {
+        ok(_) => {
+            return 31
+        }
+        err(_) => {}
+    }
+    return 0
+}
+fn lengths() -> i32!mqtt.Error {
+    incomplete := [b"", b"\x30", b"\x30\x80", b"\x30\xff\xff\xff"]
+    for input in incomplete {
+        match mqtt.frame_length(*input)? {
+            some(_) => {
+                return ok(40)
+            }
+            none => {}
+        }
+    }
+    headers := [b"\xc0\x00", b"\x30\x7f", b"\x30\x80\x01", b"\x30\xff\x7f", b"\x30\x80\x80\x01",
+    b"\x30\xff\xff\x7f", b"\x30\x80\x80\x80\x01", b"\x30\xff\xff\xff\x7f"]
+    expected := [2usize, 129, 131, 16386, 16388, 2097155, 2097157, 268435460]
+    for i in 0usize..headers.len {
+        match mqtt.frame_length(headers[i])? {
+            some(total) => {
+                if total != expected[i] {
+                    return ok(41)
+                }
+            }
+            none => {
+                return ok(42)
+            }
+        }
+    }
+    malformed := [b"\x30\x80\x80\x80\x80\x01", b"\x30\x80\x00", b"\x30\xff\xff\xff\xff"]
+    for input in malformed {
+        match mqtt.frame_length(*input) {
+            ok(_) => {
+                return ok(43)
+            }
+            err(reason) => {
+                if reason.kind != mqtt.ErrorKind.Malformed {
+                    return ok(44)
+                }
+            }
+        }
+    }
+    return ok(0)
+}
+fn decoding() -> i32!mqtt.Error {
+    frame := b"\x3b\x09\x00\x03a/b\x00\x0ahi\xc0\x00"
+    publish := mqtt.decode(frame)?
+    if publish.kind != mqtt.PacketKind.Publish || publish.length != 11 || publish.packet_id != 10 ||
+        !bytes.equal(publish.topic, b"a/b") || !bytes.equal(publish.payload, b"hi") ||
+        publish.qos != mqtt.QoS.AtLeastOnce || !publish.retain || !publish.duplicate {
+        return ok(50)
+    }
+    plain := mqtt.decode(b"\x30\x05\x00\x01xok")?
+    if plain.packet_id != 0 || plain.qos != mqtt.QoS.AtMostOnce || !bytes.equal(plain.payload, b"ok") {
+        return ok(51)
+    }
+    connack := mqtt.decode(b"\x20\x02\x00\x05")?
+    if connack.kind != mqtt.PacketKind.Connack || connack.session_present || connack.return_code != mqtt.NOT_AUTHORIZED {
+        return ok(52)
+    }
+    suback := mqtt.decode(b"\x90\x04\x00\x07\x01\x80")?
+    if suback.kind != mqtt.PacketKind.Suback || suback.packet_id != 7 || suback.return_code != 1 || suback.payload.len != 2 {
+        return ok(53)
+    }
+    pubrel := mqtt.decode(b"\x62\x02\x01\x00")?
+    if pubrel.kind != mqtt.PacketKind.Pubrel || pubrel.packet_id != 256 {
+        return ok(54)
+    }
+    ping := mqtt.decode(b"\xd0\x00")?
+    if ping.kind != mqtt.PacketKind.Pingresp || ping.length != 2 {
+        return ok(55)
+    }
+    subscribe := mqtt.decode(b"\x82\x08\x00\x01\x00\x03a/#\x01")?
+    if subscribe.kind != mqtt.PacketKind.Subscribe || subscribe.packet_id != 1 || !bytes.equal(subscribe.payload, b"\x00\x03a/#\x01") {
+        return ok(56)
+    }
+    // Reserved flags, QoS 3, DUP on QoS 0, zero identifiers, bad SUBACK codes,
+    // stray bodies, unknown types, wildcard topics and truncated frames.
+    invalid := [b"\x36\x05\x00\x01x\x00\x01", b"\x60\x02\x00\x05", b"\x41\x02\x00\x05", b"\x40\x02\x00\x00",
+    b"\x38\x03\x00\x01x", b"\x32\x05\x00\x01x\x00\x00", b"\x90\x03\x00\x01\x03", b"\xd0\x01\x00",
+    b"\x00\x00", b"\xf0\x00", b"\x30\x03\x00\x01#", b"\x30\x04\x00\x01x", b"\x30\x03\x00\x05x",
+    b"\x20\x02\x01\x05", b"\x20\x02\x00\x06", b"\x40\x03\x00\x05\x00", b"\x30\x02\x00\x00"]
+    for input in invalid {
+        match mqtt.decode(*input) {
+            ok(_) => {
+                return ok(57)
+            }
+            err(_) => {}
+        }
+    }
+    return ok(0)
+}
+fn topics() -> i32 {
+    filters := [b"sport/tennis/player1/#", b"sport/tennis/player1/#", b"sport/tennis/player1/#", b"sport/#",
+    b"#", b"sport/tennis/+", b"sport/tennis/+", b"sport/+", b"sport/+", b"+/+", b"/+", b"+",
+    b"#", b"+/monitor/Clients", b"$SYS/#", b"$SYS/monitor/+", b"a/b", b"a/b", b"a/b", b"a",
+    b"+", b"a/+/c", b"a/+/c", b"#", b"a/#"]
+    names := [b"sport/tennis/player1", b"sport/tennis/player1/ranking", b"sport/tennis/player1/score/wimbledon", b"sport",
+    b"anything/x", b"sport/tennis/player1", b"sport/tennis/player1/ranking", b"sport", b"sport/", b"/finance", b"/finance", b"/finance",
+    b"$SYS/uptime", b"$SYS/monitor/Clients", b"$SYS/monitor/Clients", b"$SYS/monitor/Clients", b"a/b", b"a/bc", b"a", b"a/b",
+    b"a", b"a/b/c", b"a/b/d", b"/", b"a/"]
+    expected := [true, true, true, true, true, true, false, false, true, true, true, false,
+    false, false, true, true, true, false, false, false, true, true, false, true, true]
+    for i in 0usize..filters.len {
+        if mqtt.matches(filters[i], names[i]) != expected[i] {
+            return 60 + (i as i32)
+        }
+    }
+    good_filters := [b"#", b"+", b"a/+/b", b"a/#", b"+/+", b"/", b"$SYS/#", b"caf\xc3\xa9/+"]
+    for filter in good_filters {
+        if !mqtt.valid_filter(*filter) {
+            return 90
+        }
+    }
+    bad_filters := [b"", b"a#", b"a/#/b", b"a+", b"+a", b"a/b+", b"##", b"a/\x00", b"\xff"]
+    for filter in bad_filters {
+        if mqtt.valid_filter(*filter) {
+            return 91
+        }
+    }
+    good_topics := [b"a", b"/", b"a/b", b"$SYS/uptime", b"caf\xc3\xa9"]
+    for topic in good_topics {
+        if !mqtt.valid_topic(*topic) {
+            return 92
+        }
+    }
+    bad_topics := [b"", b"a/+", b"#", b"a\x00b", b"\xff", b"\xed\xa0\x80"]
+    for topic in bad_topics {
+        if mqtt.valid_topic(*topic) {
+            return 93
+        }
+    }
+    return 0
+}
+pub struct Counter {
+    count: u32
+    pub fn handle(&mut self, message: &mqtt.Message, outbox: &mut mqtt.Outbox) -> void!mqtt.Error {
+        self.count += 1
+        if bytes.equal(message.payload, b"fail") {
+            return err(mqtt.failure(mqtt.ErrorKind.InvalidInput, 0))
+        }
+        return outbox.publish_with(b"seen", message.level(1), mqtt.QoS.AtLeastOnce, true)
+    }
+}
+fn handlers() -> i32 {
+    if !bytes.equal(mqtt.topic_level(b"home/kitchen/light", 1), b"kitchen") ||
+        !bytes.equal(mqtt.topic_level(b"home/kitchen/light", 2), b"light") ||
+        mqtt.topic_level(b"home/kitchen", 2).len != 0 || mqtt.topic_level(b"/a", 0).len != 0 {
+        return 110
+    }
+    routes := mqtt.route(mqtt.route(mqtt.route(mqtt.NoRoutes {}, b"home/+/light", Counter { count: 0 }),
+    b"home/#", mqtt.reply(b"ack", b"ok")), b"other", mqtt.forward(b"copy"))
+    if routes.len() != 3 || !bytes.equal(routes.filter(0), b"home/+/light") || !bytes.equal(routes.filter(2), b"other") {
+        return 111
+    }
+    message := mqtt.Message.new(b"home/hall/light", b"on")
+    delivery := mqtt.capture(&mut routes, &message)
+    if delivery.handled != 2 || delivery.len() != 2 || !delivery.contains(b"seen", b"hall") || !delivery.contains(b"ack", b"ok") {
+        return 112
+    }
+    match delivery.published(0) {
+        some(first) => {
+            if !bytes.equal(first.topic, b"seen") || first.qos != mqtt.QoS.AtLeastOnce || !first.retain {
+                return 113
+            }
+        }
+        none => {
+            return 114
+        }
+    }
+    other := mqtt.Message.new(b"other", b"payload")
+    copied := mqtt.capture(&mut routes, &other).expect_handled(1).expect_ok().expect_publish(b"copy", b"payload")
+    if copied.len() != 1 {
+        return 115
+    }
+    failing := mqtt.Message.new(b"home/hall/light", b"fail")
+    mqtt.capture(&mut routes, &failing).expect_handled(2).expect_failure().expect_published(1)
+    storage := [0u8; 16]
+    outbox := mqtt.Outbox.new(&mut storage)
+    match outbox.publish(b"t", b"0123456789") {
+        ok() => {
+            return 116
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.BufferFull {
+                return 117
+            }
+        }
+    }
+    match outbox.publish(b"a/+", b"") {
+        ok() => {
+            return 118
+        }
+        err(_) => {}
+    }
+    match mqtt.check_filter(b"a/#/b", 4) {
+        some(problem) => {
+            if problem.index != 4 || problem.kind != mqtt.ErrorKind.InvalidFilter {
+                return 119
+            }
+        }
+        none => {
+            return 120
+        }
+    }
+    return 0
+}
+fn server_side() -> i32!mqtt.Error {
+    output := [0u8; 128]
+    full := mqtt.Connect.new(b"dodo")
+    full.username = b"u"
+    full.password = b"p"
+    full.will_topic = b"w"
+    full.will_payload = b"bye"
+    full.will_qos = mqtt.QoS.AtLeastOnce
+    full.will_retain = true
+    full.clean_session = false
+    used := mqtt.encode_connect(&mut output, &full)?
+    packet := mqtt.decode(&output[..used])?
+    connect := mqtt.decode_connect(packet.payload)?
+    if !bytes.equal(connect.client_id, b"dodo") || !bytes.equal(connect.username, b"u") || !bytes.equal(connect.password, b"p") ||
+        !bytes.equal(connect.will_topic, b"w") || !bytes.equal(connect.will_payload, b"bye") || connect.will_qos != mqtt.QoS.AtLeastOnce ||
+        !connect.will_retain || connect.clean_session || connect.keep_alive_s != 60 {
+        return ok(130)
+    }
+    match mqtt.decode_connect(b"\x00\x06MQIsdp\x03\x02\x00\x3c\x00\x01x") {
+        ok(_) => {
+            return ok(131)
+        }
+        err(reason) => {
+            if reason.kind != mqtt.ErrorKind.Protocol || reason.code != 3 {
+                return ok(132)
+            }
+        }
+    }
+    // Reserved flag, password without username, trailing bytes.
+    invalid := [b"\x00\x04MQTT\x04\x03\x00\x3c\x00\x01x", b"\x00\x04MQTT\x04\x42\x00\x3c\x00\x01x\x00\x01p",
+    b"\x00\x04MQTT\x04\x02\x00\x3c\x00\x01xz"]
+    for body in invalid {
+        match mqtt.decode_connect(*body) {
+            ok(_) => {
+                return ok(133)
+            }
+            err(_) => {}
+        }
+    }
+    payload := b"\x00\x03a/#\x01\x00\x01b\x02"
+    first := mqtt.subscribe_entry(payload, 0)?
+    second := mqtt.subscribe_entry(payload, first.next)?
+    if !bytes.equal(first.filter, b"a/#") || first.qos != 1 || !bytes.equal(second.filter, b"b") || second.qos != 2 || second.next != payload.len {
+        return ok(134)
+    }
+    match mqtt.subscribe_entry(b"\x00\x01a\x03", 0) {
+        ok(_) => {
+            return ok(135)
+        }
+        err(_) => {}
+    }
+    used = mqtt.encode_suback(&mut output, 9, b"\x01\x80\x00")?
+    if !bytes.equal(&output[..used], b"\x90\x05\x00\x09\x01\x80\x00") {
+        return ok(136)
+    }
+    return ok(0)
+}
+fn main() -> i32 {
+    code := handlers()
+    if code != 0 {
+        return code
+    }
+    match server_side() {
+        ok(value) => {
+            if value != 0 {
+                return value
+            }
+        }
+        err(_) => {
+            return 103
+        }
+    }
+    match encoders() {
+        ok(code) => {
+            if code != 0 {
+                return code
+            }
+        }
+        err(_) => {
+            return 100
+        }
+    }
+    code = encoder_errors()
+    if code != 0 {
+        return code
+    }
+    match lengths() {
+        ok(value) => {
+            if value != 0 {
+                return value
+            }
+        }
+        err(_) => {
+            return 101
+        }
+    }
+    match decoding() {
+        ok(value) => {
+            if value != 0 {
+                return value
+            }
+        }
+        err(_) => {
+            return 102
+        }
+    }
+    return topics()
+}

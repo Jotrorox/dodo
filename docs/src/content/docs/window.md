@@ -139,11 +139,13 @@ fn show<D: graphics.Display>(display: &mut D, canvas: &mut graphics.Canvas) -> v
 ```
 
 `show(&mut win, &mut canvas)` copies the dirty part of your canvas into the
-window's buffer, converting its pixel format if needed, and shows it. The
-canvas must be `win.size()` pixels, which on a high-density display is larger
-than the size you opened the window with; otherwise `present` fails with
-`graphics.Error.InvalidInput`, for example after a resize until you replace
-the canvas. Drawing into `win.canvas()` avoids the copy and always has the
+window's buffer, converting its pixel format if needed, and shows it. As with
+every display, only what lies inside both the canvas's `bounds()` and the
+window is shown: a canvas the size of `win.size()` fills the window, while a
+smaller one, one placed with [`set_origin`](graphics.md#bands-and-origins), or
+one left over from before a resize updates just the part it covers. On a
+high-density display `win.size()` is larger than the size you opened the
+window with. Drawing into `win.canvas()` avoids the copy and always has the
 right size.
 
 ## Events

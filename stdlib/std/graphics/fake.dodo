@@ -31,17 +31,17 @@ pub struct Display {
         return self.screen.format()
     }
 
-    // Copy `dirty` from `canvas` to the screen, converting its format.
-    // Fails with InvalidInput if the canvas size differs from the display's.
+    // Copy `dirty` from `canvas` to the screen, converting its format. Only
+    // the part inside both the canvas's bounds and the screen is copied, so
+    // a band canvas updates its band.
     pub fn present(&mut self, canvas: &graphics.Canvas, dirty: graphics.Rect) -> void!graphics.Error {
         if let some(error) = option.take(&mut self.failure) {
             return err(error)
         }
-        if canvas.width() != self.screen.width() || canvas.height() != self.screen.height() {
-            return err(graphics.Error.InvalidInput)
-        }
         bounds := canvas.bounds()
-        area := dirty.intersect(&bounds)
+        screen := self.screen.bounds()
+        inside := dirty.intersect(&bounds)
+        area := inside.intersect(&screen)
         self.presents += 1
         self.covered = self.covered.union(&area)
         self.screen.blit_region(canvas, area.clone(), area.x, area.y)
@@ -60,7 +60,8 @@ pub struct Display {
         return self.presents
     }
 
-    // The area the last successful present copied, limited to the screen.
+    // The area the last successful present copied, limited to the canvas
+    // and the screen.
     pub fn last_dirty(&self) -> graphics.Rect {
         return self.last.clone()
     }
