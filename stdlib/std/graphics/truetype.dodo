@@ -1,5 +1,6 @@
 package truetype
 
+import "core/bytes"
 import "core/mem"
 import "std/graphics"
 
@@ -7,7 +8,8 @@ import "std/graphics"
 // is read in place from a byte slice (a file read with std/fs, or bytes
 // embedded in the program); nothing is allocated or copied, and drawing a
 // glyph decodes its outline straight from the font data, so glyphs of any
-// complexity need no storage.
+// complexity need no storage. For text drawn more than once, a GlyphCache
+// keeps rasterized glyphs in caller-provided storage.
 //
 // Supported: TrueType outlines (the glyf table) in .ttf files and .ttc
 // collections, simple and composite glyphs, cmap formats 0, 4, 6 and 12
@@ -435,19 +437,30 @@ pub struct Font {
     // font's .notdef glyph.
     pub fn draw(&self, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, color: graphics.Color) -> graphics.Rect {
         unused := graphics.Gradient.linear(0, 0, 0, 0, color, color)
-        return self.render(canvas, x, y, text, size, color, &unused, false)
+        direct := Direct {}
+        return self.render(&mut direct, canvas, x, y, text, size, color, &unused, false)
     }
     // draw with a gradient instead of a color.
     pub fn draw_gradient(&self, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, gradient: &graphics.Gradient) -> graphics.Rect {
-        return self.render(canvas, x, y, text, size, 0, gradient, true)
+        direct := Direct {}
+        return self.render(&mut direct, canvas, x, y, text, size, 0, gradient, true)
     }
-    fn render(&self, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, color: graphics.Color, gradient: &graphics.Gradient, shaded: bool) -> graphics.Rect {
+    // Lay out `text` and hand each glyph with an outline to `painter`.
+    fn render<P: Painter>(&self, painter: &mut P, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, color: graphics.Color, gradient: &graphics.Gradient, shaded: bool) -> graphics.Rect {
         em := clamp_size(size)
         data := mem.str_bytes(text)
         units := self.units_per_em as i64
         line_height := self.line_height(em) as i64
+        baseline := self.baseline(em) as i64
         line_top := y as i64
+        // The pen and the widest line so far, in font units, as measure
+        // computes them.
         pen := 0i64
+        widest := 0i64
+        lines := 0u64
+        if data.len > 0 {
+            lines = 1
+        }
         previous := 0u32
         has_previous := false
         index := 0usize
@@ -456,6 +469,7 @@ pub struct Font {
             index += utf8_length(data[index])
             if code == 10 {
                 line_top = clamp_i64(line_top + line_height, -PEN_LIMIT, PEN_LIMIT)
+                lines += 1
                 pen = 0
                 has_previous = false
             } else if code != 13 {
@@ -466,21 +480,20 @@ pub struct Font {
                 span := self.span(glyph)
                 if span.end > span.start {
                     origin_x := x as i64 * 256 + pen * em as i64 * 256 / units
-                    origin_y := (line_top + self.baseline(em) as i64) * 256
-                    outline := self.glyph(glyph, clamp_fixed(origin_x), clamp_fixed(origin_y), em)
-                    if shaded {
-                        canvas.gradient_outline(&outline, graphics.FillRule.NonZero, gradient)
-                    } else {
-                        canvas.fill_outline(&outline, graphics.FillRule.NonZero, color)
-                    }
+                    origin_y := (line_top + baseline) * 256
+                    painter.paint(self, canvas, glyph, origin_x, origin_y, em, color, gradient, shaded)
                 }
                 pen = clamp_i64(pen + self.advance_width(glyph) as i64, -PEN_LIMIT, PEN_LIMIT)
+                if pen > widest {
+                    widest = pen
+                }
                 previous = glyph
                 has_previous = true
             }
         }
-        size_drawn := self.measure(text, em)
-        return graphics.Rect { x: x, y: y, width: size_drawn.width, height: size_drawn.height }
+        width := (widest * em as i64 + units - 1) / units
+        height := lines * line_height as u64
+        return graphics.Rect { x: x, y: y, width: min_i64(width, 4294967295) as u32, height: min_i64(height as i64, 4294967295) as u32 }
     }
     // The outline of `glyph` at `size` pixels per em with its origin (the
     // pen position on the baseline) at subpixel position (x, y). Fill it
@@ -488,6 +501,349 @@ pub struct Font {
     pub fn glyph(&self, glyph: u32, x: i32, y: i32, size: u32) -> Glyph from(self) {
         return Glyph { data: self.data, loca: self.loca, long_loca: self.long_loca, glyf: self.glyf, glyf_length: self.glyf_length, glyph_count: self.glyph_count, index: glyph, origin_x: x as i64, origin_y: y as i64, scale: clamp_size(size) as i64 * 256, units: self.units_per_em as i64 }
     }
+}
+
+// Draws the glyphs Font.render lays out. Origins are subpixel positions of
+// the pen on the baseline; the vertical one is a whole pixel.
+interface Painter {
+    fn paint(&mut self, font: &Font, canvas: &mut graphics.Canvas, glyph: u32, x: i64, y: i64, size: u32, color: graphics.Color, gradient: &graphics.Gradient, shaded: bool)
+}
+
+// Rasterizes every glyph from its outline.
+struct Direct {
+    fn paint(&mut self, font: &Font, canvas: &mut graphics.Canvas, glyph: u32, x: i64, y: i64, size: u32, color: graphics.Color, gradient: &graphics.Gradient, shaded: bool) {
+        paint_outline(font, canvas, glyph, x, y, size, color, gradient, shaded)
+    }
+}
+
+fn paint_outline(font: &Font, canvas: &mut graphics.Canvas, glyph: u32, x: i64, y: i64, size: u32, color: graphics.Color, gradient: &graphics.Gradient, shaded: bool) {
+    outline := font.glyph(glyph, clamp_fixed(x), clamp_fixed(y), size)
+    if shaded {
+        canvas.gradient_outline(&outline, graphics.FillRule.NonZero, gradient)
+    } else {
+        canvas.fill_outline(&outline, graphics.FillRule.NonZero, color)
+    }
+}
+
+// -- Glyph cache -------------------------------------------------------------
+
+// Remembers rasterized glyphs so drawing text again copies coverage instead
+// of decoding and rasterizing outlines. Each cached glyph is a coverage mask,
+// one byte per pixel, kept in storage the caller provides; the cache never
+// allocates. Draw through the cache wherever Font.draw would be called:
+//
+//     storage := [0u8; 65536]
+//     cache := truetype.GlyphCache.new(&font, &mut storage)
+//     cache.draw(&mut canvas, 10, 10, "Score: 1200", 14, graphics.WHITE)
+//
+// Text drawn through the cache matches Font.draw except that glyphs are
+// placed to a quarter pixel horizontally instead of 1/256: a glyph is cached
+// for each size and each of the four quarter-pixel offsets it is drawn at.
+// Any amount of storage works, more holds more glyphs: 64 KiB holds a few
+// hundred glyphs at 14 pixels per em, or about a dozen at 96. When the
+// cache is full the glyphs cached longest ago make room. A glyph whose mask
+// would take more than a quarter of the storage is drawn from its outline,
+// uncached, so one huge glyph cannot flush the rest.
+pub struct GlyphCache {
+    font: &Font
+    masks: Masks
+
+    pub fn new(font: &Font, storage: &mut[u8]) -> GlyphCache from(font, storage) {
+        return GlyphCache { font: font, masks: Masks.new(storage) }
+    }
+    // Font.draw through the cache.
+    pub fn draw(&mut self, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, color: graphics.Color) -> graphics.Rect {
+        unused := graphics.Gradient.linear(0, 0, 0, 0, color, color)
+        return self.font.render(&mut self.masks, canvas, x, y, text, size, color, &unused, false)
+    }
+    // Font.draw_gradient through the cache. The cached masks are the same
+    // for every color and gradient.
+    pub fn draw_gradient(&mut self, canvas: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, gradient: &graphics.Gradient) -> graphics.Rect {
+        return self.font.render(&mut self.masks, canvas, x, y, text, size, 0, gradient, true)
+    }
+    // Forget every cached glyph.
+    pub fn clear(&mut self) {
+        self.masks.clear()
+    }
+    // The number of glyphs cached.
+    pub fn len(&self) -> usize {
+        return self.masks.count
+    }
+    pub fn is_empty(&self) -> bool {
+        return self.masks.count == 0
+    }
+    // Glyphs drawn from the cache and glyphs rasterized (cached or not)
+    // since the cache was made, for judging how much storage to give it.
+    pub fn hits(&self) -> u64 {
+        return self.masks.hits
+    }
+    pub fn misses(&self) -> u64 {
+        return self.masks.misses
+    }
+}
+
+// Storage layout: a hash table of SLOT_BYTES slots, then a ring of mask
+// blocks. A slot holds a glyph key (0 when free) and the offset of its block
+// in the ring; a block holds a BLOCK_HEADER header (key, block length, mask
+// width and height, and the mask's top-left pixel relative to the glyph
+// origin's pixel) followed by the mask. Blocks are added at the ring's head
+// and the oldest are evicted from its tail.
+const SLOT_BYTES: usize = 8
+const BLOCK_HEADER: usize = 24
+// One slot per this many bytes of storage.
+const BYTES_PER_SLOT: usize = 128
+const MIN_SLOTS: usize = 8
+const MAX_SLOTS: usize = 65536
+// Glyph origins further than this many pixels from (0, 0) are drawn
+// directly, where Font.draw clamps coordinates.
+const CACHE_REACH: i64 = 1048576
+// Mask offsets are stored as u32 with this added.
+const OFFSET_BIAS: i64 = 2147483648
+
+struct Masks {
+    storage: &mut[u8]
+    // Slot count, a power of two, or 0 when the storage is too small.
+    slots: usize
+    pool: usize
+    pool_size: usize
+    count: usize
+    head: usize
+    tail: usize
+    // Where the blocks before a wrap end; pool_size while not wrapped.
+    limit: usize
+    wrapped: bool
+    used: usize
+    hits: u64
+    misses: u64
+
+    fn new(storage: &mut[u8]) -> Masks from(storage) {
+        usable := storage.len
+        if usable > 4294967295 {
+            usable = 4294967295
+        }
+        slots := MIN_SLOTS
+        for slots < MAX_SLOTS && slots * 2 * BYTES_PER_SLOT <= usable {
+            slots *= 2
+        }
+        pool := slots * SLOT_BYTES
+        if pool + BLOCK_HEADER >= usable {
+            slots = 0
+            pool = 0
+        }
+        masks := Masks { storage: storage, slots: slots, pool: pool, pool_size: usable - pool, count: 0, head: 0, tail: 0, limit: usable - pool, wrapped: false, used: 0, hits: 0, misses: 0 }
+        masks.clear()
+        return masks
+    }
+    fn clear(&mut self) {
+        bytes_end := self.pool
+        bytes.fill(&mut self.storage[..bytes_end], 0)
+        self.count = 0
+        self.reset_ring()
+    }
+    fn reset_ring(&mut self) {
+        self.head = 0
+        self.tail = 0
+        self.limit = self.pool_size
+        self.wrapped = false
+        self.used = 0
+    }
+
+    fn paint(&mut self, font: &Font, canvas: &mut graphics.Canvas, glyph: u32, x: i64, y: i64, size: u32, color: graphics.Color, gradient: &graphics.Gradient, shaded: bool) {
+        // The origin to the nearest quarter pixel: a whole pixel and a phase.
+        quarter := floor_div(x + 32, 64)
+        column := floor_div(quarter, 4)
+        phase := (quarter - column * 4) as u32
+        row := floor_div(y + 128, 256)
+        if self.slots == 0 || column < -CACHE_REACH || column > CACHE_REACH || row < -CACHE_REACH || row > CACHE_REACH {
+            self.misses += 1
+            paint_outline(font, canvas, glyph, x, y, size, color, gradient, shaded)
+            return
+        }
+        key := (size << 18) | (phase << 16) | glyph
+        block := 0usize
+        match self.find(key) {
+            some(slot) => {
+                self.hits += 1
+                block = self.pool + read_u32(self.storage, slot + 4) as usize
+            }
+            none => {
+                self.misses += 1
+                outline := font.glyph(glyph, (phase * 64) as i32, 0, size)
+                bounds := graphics.outline_bounds(&outline)
+                area := bounds.width as u64 * bounds.height as u64
+                if area > ((self.pool_size / 4) as u64) || round_up4(BLOCK_HEADER + area as usize) > self.pool_size {
+                    paint_outline(font, canvas, glyph, x, y, size, color, gradient, shaded)
+                    return
+                }
+                total := round_up4(BLOCK_HEADER + area as usize)
+                block = self.pool + self.allocate(total)
+                write_u32(self.storage, block, key)
+                write_u32(self.storage, block + 4, total as u32)
+                write_u32(self.storage, block + 8, bounds.width)
+                write_u32(self.storage, block + 12, bounds.height)
+                write_u32(self.storage, block + 16, (bounds.x as i64 + OFFSET_BIAS) as u32)
+                write_u32(self.storage, block + 20, (bounds.y as i64 + OFFSET_BIAS) as u32)
+                start := block + BLOCK_HEADER
+                graphics.coverage_mask(&outline, graphics.FillRule.NonZero, &mut self.storage[start..start + area as usize], bounds.x, bounds.y, bounds.width, bounds.height)
+                offset := (block - self.pool) as u32
+                self.insert(key, offset)
+            }
+        }
+        width := read_u32(self.storage, block + 8)
+        height := read_u32(self.storage, block + 12)
+        left := column + read_u32(self.storage, block + 16) as i64 - OFFSET_BIAS
+        top := row + read_u32(self.storage, block + 20) as i64 - OFFSET_BIAS
+        start := block + BLOCK_HEADER
+        mask := &self.storage[start..start + width as usize * height as usize]
+        if shaded {
+            canvas.gradient_mask(mask, width, height, left as i32, top as i32, gradient)
+        } else {
+            canvas.fill_mask(mask, width, height, left as i32, top as i32, color)
+        }
+    }
+
+    // -- Hash table ----------------------------------------------------------
+
+    fn home(&self, key: u32) -> usize {
+        return ((key as u64 * 2654435761) >> 12) as usize & (self.slots - 1)
+    }
+    // The storage offset of the slot holding `key`.
+    fn find(&self, key: u32) -> Option<usize> {
+        index := self.home(key)
+        for {
+            slot := index * SLOT_BYTES
+            stored := read_u32(self.storage, slot)
+            if stored == key {
+                return some(slot)
+            }
+            if stored == 0 {
+                return none
+            }
+            index = (index + 1) & (self.slots - 1)
+        }
+    }
+    fn insert(&mut self, key: u32, block: u32) {
+        index := self.home(key)
+        for read_u32(self.storage, index * SLOT_BYTES) != 0 {
+            index = (index + 1) & (self.slots - 1)
+        }
+        write_u32(self.storage, index * SLOT_BYTES, key)
+        write_u32(self.storage, index * SLOT_BYTES + 4, block)
+        self.count += 1
+    }
+    // Remove `key` with backward-shift deletion: later entries of the probe
+    // run move up, so lookups never need tombstones.
+    fn remove(&mut self, key: u32) {
+        mask := self.slots - 1
+        hole := 0usize
+        match self.find(key) {
+            some(slot) => {
+                hole = slot / SLOT_BYTES
+            }
+            none => {
+                return
+            }
+        }
+        next := hole
+        for {
+            next = (next + 1) & mask
+            stored := read_u32(self.storage, next * SLOT_BYTES)
+            if stored == 0 {
+                break
+            }
+            // The entry at `next` may fill the hole unless its home lies
+            // cyclically in (hole, next].
+            home := self.home(stored)
+            stays := false
+            if hole <= next {
+                stays = hole < home && home <= next
+            } else {
+                stays = hole < home || home <= next
+            }
+            if !stays {
+                block := read_u32(self.storage, next * SLOT_BYTES + 4)
+                write_u32(self.storage, hole * SLOT_BYTES, stored)
+                write_u32(self.storage, hole * SLOT_BYTES + 4, block)
+                hole = next
+            }
+        }
+        write_u32(self.storage, hole * SLOT_BYTES, 0)
+        write_u32(self.storage, hole * SLOT_BYTES + 4, 0)
+        self.count -= 1
+    }
+
+    // -- Ring of masks -------------------------------------------------------
+
+    // Reserve `total` bytes, at most pool_size, at the ring's head, evicting
+    // the oldest blocks as needed, and return their offset in the ring.
+    fn allocate(&mut self, total: usize) -> usize {
+        // Keep the table at most three quarters full.
+        for self.count >= self.slots - self.slots / 4 {
+            self.evict()
+        }
+        for {
+            if self.used == 0 {
+                self.reset_ring()
+            }
+            if !self.wrapped {
+                // Blocks fill tail..head; free space is head..end and
+                // 0..tail.
+                if self.pool_size - self.head >= total {
+                    offset := self.head
+                    self.head += total
+                    self.used += total
+                    return offset
+                }
+                if self.tail >= total {
+                    self.limit = self.head
+                    self.wrapped = true
+                    self.head = total
+                    self.used += total
+                    return 0
+                }
+            } else if self.tail - self.head >= total {
+                // Blocks fill tail..limit and 0..head; free space is
+                // head..tail.
+                offset := self.head
+                self.head += total
+                self.used += total
+                return offset
+            }
+            self.evict()
+        }
+    }
+    // Drop the oldest block and its table entry.
+    fn evict(&mut self) {
+        if self.used == 0 {
+            return
+        }
+        block := self.pool + self.tail
+        key := read_u32(self.storage, block)
+        length := read_u32(self.storage, block + 4) as usize
+        self.remove(key)
+        self.tail += length
+        self.used -= length
+        if self.wrapped && self.tail == self.limit {
+            self.tail = 0
+            self.limit = self.pool_size
+            self.wrapped = false
+        }
+    }
+}
+
+fn round_up4(value: usize) -> usize {
+    return (value + 3) & ~3usize
+}
+
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    return (data[at] as u32) | ((data[at + 1] as u32) << 8) | ((data[at + 2] as u32) << 16) | ((data[at + 3] as u32) << 24)
+}
+
+fn write_u32(data: &mut[u8], at: usize, value: u32) {
+    data[at] = (value & 255) as u8
+    data[at + 1] = ((value >> 8) & 255) as u8
+    data[at + 2] = ((value >> 16) & 255) as u8
+    data[at + 3] = (value >> 24) as u8
 }
 
 fn parse(data: &[u8], start: usize) -> Font!Error from(data) {

@@ -206,6 +206,11 @@ pub fn over(top: Color, bottom: Color) -> Color {
     }
     inverse := 255 - a
     bottom_alpha := bottom >> 24
+    if bottom_alpha == 255 {
+        // An opaque bottom stays opaque; this is the general formula below
+        // with out_alpha = 255 * 255, without its divisions.
+        return 0xff000000 | (div255(((top >> 16) & 255) * a + ((bottom >> 16) & 255) * inverse) << 16) | (div255(((top >> 8) & 255) * a + ((bottom >> 8) & 255) * inverse) << 8) | div255((top & 255) * a + (bottom & 255) * inverse)
+    }
     // out_alpha * 255 = a * 255 + bottom_alpha * (255 - a)
     out_alpha := a * 255 + bottom_alpha * inverse
     if out_alpha == 0 {
@@ -1674,16 +1679,7 @@ pub struct Canvas {
                     index := (column - start) as usize
                     sum += pen.cells[index]
                     pen.cells[index] = 0
-                    coverage := abs64(sum)
-                    if even_odd {
-                        coverage = coverage % (2 * FULL)
-                        if coverage > FULL {
-                            coverage = 2 * FULL - coverage
-                        }
-                    } else if coverage > FULL {
-                        coverage = FULL
-                    }
-                    level := ((coverage * 255 + 32768) >> 16) as u32
+                    level := coverage_level(sum, even_odd)
                     if level > 0 {
                         if level == 255 && opaque {
                             self.put(column, row, packed)
@@ -1701,6 +1697,158 @@ pub struct Canvas {
                 start = end
             }
         }
+    }
+
+    // Composite `color` over the canvas through a coverage mask: `mask`
+    // holds `width` x `height` levels, one byte per pixel in rows of `width`
+    // bytes, from 0 (untouched) to 255 (fully covered), as coverage_mask
+    // writes them. The mask's top-left pixel lands on (x, y). Each pixel is
+    // blended exactly as fill_outline blends one with that coverage, so
+    // filling an outline and filling its mask draw the same pixels. Rows past
+    // the end of `mask` are skipped.
+    pub fn fill_mask(&mut self, mask: &[u8], width: u32, height: u32, x: i32, y: i32, color: Color) {
+        rows := mask_rows(mask, width, height)
+        top := max64(y as i64, self.clip_top)
+        bottom := min64(y as i64 + rows, self.clip_bottom)
+        left := max64(x as i64, self.clip_left)
+        right := min64(x as i64 + width as i64, self.clip_right)
+        if left >= right || top >= bottom {
+            return
+        }
+        alpha := color >> 24
+        packed := encode(&self.format, color)
+        // Rgba8888 and Bgra8888 blend in place: the bytes of red and blue.
+        red_at := 4usize
+        blue_at := 4usize
+        match &self.format {
+            PixelFormat.Rgba8888 => {
+                red_at = 0
+                blue_at = 2
+            }
+            PixelFormat.Bgra8888 => {
+                red_at = 2
+                blue_at = 0
+            }
+            _ => {}
+        }
+        stride := width as usize
+        written_left := right
+        written_right := left
+        written_top := bottom
+        written_bottom := top
+        for row in top..bottom {
+            at := (row - y as i64) as usize * stride + (left - x as i64) as usize
+            first := right
+            last := left
+            if red_at < 4 {
+                pixel := (row - self.origin_y) as usize * self.stride + (left - self.origin_x) as usize * 4
+                for column in left..right {
+                    level := mask[at] as u32
+                    at += 1
+                    if level != 0 {
+                        self.blend32(pixel, red_at, blue_at, color, packed, level)
+                        if column < first {
+                            first = column
+                        }
+                        last = column + 1
+                    }
+                    pixel += 4
+                }
+            } else {
+                for column in left..right {
+                    level := mask[at] as u32
+                    at += 1
+                    if level != 0 {
+                        if level == 255 && alpha == 255 {
+                            self.put(column, row, packed)
+                        } else {
+                            self.paint_pixel(column, row, color, level)
+                        }
+                        if column < first {
+                            first = column
+                        }
+                        last = column + 1
+                    }
+                }
+            }
+            if first < last {
+                written_left = min64(written_left, first)
+                written_right = max64(written_right, last)
+                written_top = min64(written_top, row)
+                written_bottom = row + 1
+            }
+        }
+        self.touch(written_left, written_top, written_right, written_bottom)
+    }
+    // paint_pixel for the 32-bit pixel at byte `at`, its red and blue at
+    // at + red_at and at + blue_at; `packed` is the color encoded.
+    fn blend32(&mut self, at: usize, red_at: usize, blue_at: usize, color: Color, packed: u32, level: u32) {
+        a := div255((color >> 24) * level)
+        if a == 0 {
+            return
+        }
+        if a == 255 {
+            self.pixels[at] = (packed & 255) as u8
+            self.pixels[at + 1] = ((packed >> 8) & 255) as u8
+            self.pixels[at + 2] = ((packed >> 16) & 255) as u8
+            self.pixels[at + 3] = (packed >> 24) as u8
+            return
+        }
+        below_alpha := self.pixels[at + 3] as u32
+        if below_alpha == 255 {
+            inverse := 255 - a
+            self.pixels[at + red_at] = div255(((color >> 16) & 255) * a + self.pixels[at + red_at] as u32 * inverse) as u8
+            self.pixels[at + 1] = div255(((color >> 8) & 255) * a + self.pixels[at + 1] as u32 * inverse) as u8
+            self.pixels[at + blue_at] = div255((color & 255) * a + self.pixels[at + blue_at] as u32 * inverse) as u8
+            return
+        }
+        below := rgba(self.pixels[at + red_at], self.pixels[at + 1], self.pixels[at + blue_at], below_alpha as u8)
+        blended := encode(&self.format, over(with_alpha(color, a as u8), below))
+        self.pixels[at] = (blended & 255) as u8
+        self.pixels[at + 1] = ((blended >> 8) & 255) as u8
+        self.pixels[at + 2] = ((blended >> 16) & 255) as u8
+        self.pixels[at + 3] = (blended >> 24) as u8
+    }
+    // fill_mask with a gradient instead of a color, blended as
+    // gradient_outline blends.
+    pub fn gradient_mask(&mut self, mask: &[u8], width: u32, height: u32, x: i32, y: i32, gradient: &Gradient) {
+        rows := mask_rows(mask, width, height)
+        top := max64(y as i64, self.clip_top)
+        bottom := min64(y as i64 + rows, self.clip_bottom)
+        left := max64(x as i64, self.clip_left)
+        right := min64(x as i64 + width as i64, self.clip_right)
+        if left >= right || top >= bottom {
+            return
+        }
+        stride := width as usize
+        written_left := right
+        written_right := left
+        written_top := bottom
+        written_bottom := top
+        for row in top..bottom {
+            at := (row - y as i64) as usize * stride + (left - x as i64) as usize
+            first := right
+            last := left
+            for column in left..right {
+                level := mask[at] as u32
+                at += 1
+                if level != 0 {
+                    paint := gradient.shade(column, row, &self.format)
+                    self.paint_pixel(column, row, paint, level)
+                    if column < first {
+                        first = column
+                    }
+                    last = column + 1
+                }
+            }
+            if first < last {
+                written_left = min64(written_left, first)
+                written_right = max64(written_right, last)
+                written_top = min64(written_top, row)
+                written_bottom = row + 1
+            }
+        }
+        self.touch(written_left, written_top, written_right, written_bottom)
     }
 
     // -- Comparison --------------------------------------------------------
@@ -2202,6 +2350,99 @@ pub struct Pen {
             self.cells[index] += value - previous
             previous = value
             column += 1
+        }
+    }
+}
+
+// The coverage level, 0 to 255, of a pixel whose accumulated winding area is
+// `sum`.
+fn coverage_level(sum: i64, even_odd: bool) -> u32 {
+    coverage := abs64(sum)
+    if even_odd {
+        coverage = coverage % (2 * FULL)
+        if coverage > FULL {
+            coverage = 2 * FULL - coverage
+        }
+    } else if coverage > FULL {
+        coverage = FULL
+    }
+    return ((coverage * 255 + 32768) >> 16) as u32
+}
+
+// The rows of a width x height mask that `mask` holds.
+fn mask_rows(mask: &[u8], width: u32, height: u32) -> i64 {
+    if width == 0 {
+        return 0
+    }
+    return min64(height as i64, (mask.len / width as usize) as i64)
+}
+
+// The pixels `outline` may cover: the smallest rectangle of whole pixels
+// around every point it passes through, or an empty rectangle for an
+// outline with no points. Size a mask for coverage_mask with it.
+pub fn outline_bounds<O: Outline>(outline: &O) -> Rect {
+    pen := Pen.new()
+    outline.trace(&mut pen)
+    pen.close()
+    if !pen.any {
+        return Rect.empty()
+    }
+    left := floor_div(pen.min_x, 256)
+    top := floor_div(pen.min_y, 256)
+    right := ceil_div(pen.max_x, 256)
+    bottom := ceil_div(pen.max_y, 256)
+    return Rect { x: left as i32, y: top as i32, width: (right - left) as u32, height: (bottom - top) as u32 }
+}
+
+// Rasterize `outline` by `rule` into a coverage mask instead of a canvas:
+// `mask` receives the coverage of the width x height pixels whose top-left
+// pixel is (x, y), one byte per pixel in rows of `width` bytes, from 0 to
+// 255. Pixels the outline misses are set to 0, and rows past the end of
+// `mask` are skipped. The levels are the ones fill_outline blends with, so
+// a mask drawn with Canvas.fill_mask matches filling the outline. Because
+// coverage depends only on where the outline lies relative to the pixel
+// grid, a mask made once can be drawn again anywhere the outline would be
+// moved by whole pixels.
+pub fn coverage_mask<O: Outline>(outline: &O, rule: FillRule, mask: &mut[u8], x: i32, y: i32, width: u32, height: u32) {
+    rows := mask_rows(mask, width, height)
+    stride := width as usize
+    bytes.fill(&mut mask[..rows as usize * stride], 0)
+    even_odd := false
+    match rule {
+        FillRule.NonZero => {}
+        FillRule.EvenOdd => {
+            even_odd = true
+        }
+    }
+    pen := Pen.new()
+    outline.trace(&mut pen)
+    pen.close()
+    if !pen.any {
+        return
+    }
+    top := max64(floor_div(pen.min_y, 256), y as i64)
+    bottom := min64(ceil_div(pen.max_y, 256), y as i64 + rows)
+    left := max64(floor_div(pen.min_x, 256), x as i64)
+    right := min64(ceil_div(pen.max_x, 256), x as i64 + width as i64)
+    if left >= right || top >= bottom {
+        return
+    }
+    for row in top..bottom {
+        line := (row - y as i64) as usize * stride
+        start := left
+        for start < right {
+            end := min64(start + CHUNK as i64, right)
+            pen.begin(row, start, end)
+            outline.trace(&mut pen)
+            pen.close()
+            sum := pen.carry
+            for column in start..end {
+                index := (column - start) as usize
+                sum += pen.cells[index]
+                pen.cells[index] = 0
+                mask[line + (column - x as i64) as usize] = coverage_level(sum, even_odd) as u8
+            }
+            start = end
         }
     }
 }

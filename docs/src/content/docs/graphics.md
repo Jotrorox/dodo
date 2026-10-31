@@ -468,6 +468,27 @@ visible part of the shape: rows and columns outside the clip rectangle are
 never visited. Each visible row traces the whole outline again, so an outline
 with thousands of edges is drawn faster as several smaller ones.
 
+### Coverage masks
+
+A shape drawn many times can be rasterized once into a coverage mask, one
+byte per pixel from 0 (outside) to 255 (fully covered), and composited from
+it afterwards:
+
+```dodo
+bounds := graphics.outline_bounds(&shape)            // the pixels it touches
+mask := [0u8; 32 * 32]                               // at least width * height
+graphics.coverage_mask(&shape, graphics.FillRule.NonZero, &mut mask, bounds.x, bounds.y, bounds.width, bounds.height)
+canvas.fill_mask(&mask, bounds.width, bounds.height, bounds.x + 40, bounds.y, graphics.WHITE)
+```
+
+`coverage_mask(outline, rule, mask, x, y, width, height)` writes the coverage
+of the width x height pixels starting at (x, y), in rows of `width` bytes.
+`fill_mask(mask, width, height, x, y, color)` and `gradient_mask` blend each
+pixel exactly as `fill_outline` and `gradient_outline` would, so a mask moved
+by whole pixels draws the same pixels as the outline moved by the same
+amount. Coverage depends on where a shape sits within a pixel, so make one
+mask per subpixel offset you draw at.
+
 ## Gradients
 
 A `graphics.Gradient` paints colors that change across an area:
@@ -567,6 +588,42 @@ outlines (`.otf` files beginning with `OTTO`) return `Error.Unsupported`;
 other errors are `Malformed` and `NoSuchFont`. Untrusted fonts are safe:
 every offset is checked, composite glyphs are limited in depth and size, and
 a damaged glyph draws as much of its outline as is valid.
+
+### Glyph cache
+
+`Font.draw` rasterizes every glyph from its outline each time. Text that is
+drawn again, such as labels and counters redrawn every frame, is much faster
+through a `truetype.GlyphCache`, which keeps each rasterized glyph as a
+coverage mask in storage you provide:
+
+```dodo
+cache_storage := [0u8; 65536]
+cache := truetype.GlyphCache.new(&font, &mut cache_storage)
+
+cache.draw(&mut canvas, 8, 8, "Score: 1200", 14, graphics.WHITE)
+```
+
+`cache.draw` and `cache.draw_gradient` take the same arguments and return the
+same area as the `Font` calls. The first time a glyph appears at a size it is
+rasterized into the cache; afterwards drawing it is a blend of its mask. On
+an Apple M-series machine at `-O2`, repeated 14-pixel text drew about 35
+times faster than with `Font.draw` (0.16 µs instead of 6 µs per glyph) and
+96-pixel text about 12 times faster (1.1 µs instead of 13 µs).
+
+The one visible difference is placement: the cache positions glyphs to a
+quarter pixel horizontally, where `Font.draw` uses 1/256 pixel, and keeps a
+separate mask for each of the four quarter-pixel offsets a glyph is drawn
+at. Glyphs that land on a quarter pixel draw exactly as `Font.draw` draws
+them.
+
+Any amount of storage works, and more holds more glyphs: 64 KiB holds
+several hundred glyphs at 14 pixels or a dozen or so at 96. A full cache
+evicts the glyphs it cached longest ago. A glyph whose mask would need more
+than a quarter of the storage is drawn from its outline without being
+cached, so one huge glyph cannot flush the rest. `len()`, `hits()` and
+`misses()` show how well the storage fits the text, and `clear()` empties
+the cache. The cache borrows the font, so it cannot outlive it; use one
+cache per font.
 
 ## Images
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `truetype.GlyphCache` keeps rasterized glyphs as coverage masks in
+  caller-provided storage, so text drawn again is blended instead of
+  rasterized: about 35 times faster at 14 pixels and 12 times faster at 96.
+  It draws like `Font.draw` except that glyphs are placed to a quarter pixel,
+  and a full cache evicts its oldest glyphs. `std/graphics` gains the
+  coverage mask calls it is built on: `outline_bounds`, `coverage_mask`, and
+  `Canvas.fill_mask` and `gradient_mask`, which blend exactly as
+  `fill_outline` does. Antialiased drawing over opaque pixels is also
+  faster, with unchanged results.
 - `@link_name("symbol")` binds an `extern "C"` prototype to a symbol other
   than its own name, and several prototypes may bind one symbol with different
   signatures. Each call uses its own declaration's signature, so Objective-C

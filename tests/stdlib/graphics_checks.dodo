@@ -1505,6 +1505,260 @@ fn truetype_checks() {
     }
 }
 
+fn format_number(n: u32) -> graphics.PixelFormat {
+    if n == 0 {
+        return graphics.PixelFormat.Rgba8888
+    }
+    if n == 1 {
+        return graphics.PixelFormat.Bgra8888
+    }
+    if n == 2 {
+        return graphics.PixelFormat.Rgb565
+    }
+    if n == 3 {
+        return graphics.PixelFormat.Gray8
+    }
+    return graphics.PixelFormat.Mono1
+}
+
+// A curved, self-overlapping shape with a hole, offset by (dx, dy)
+// subpixels.
+fn mask_shape(path: &mut graphics.Path, dx: i32, dy: i32) {
+    path.clear()
+    path.move_to(dx + 300, dy + 200)
+    path.quad_to(dx + 4000, dy - 100, dx + 7300, dy + 3100)
+    path.line_to(dx + 1200, dy + 6900)
+    path.cubic_to(dx - 500, dy + 4000, dx + 6000, dy + 1500, dx + 300, dy + 200)
+    path.close()
+    path.rect(dx + 2100, dy + 2600, 1500, 1333)
+}
+
+// Coverage masks: a mask made with coverage_mask and drawn with fill_mask
+// or gradient_mask paints exactly what filling the outline paints, in every
+// format, for translucent colors and backgrounds, under clipping, and after
+// moving the mask by whole pixels.
+fn coverage_masks() {
+    path_storage := [0i32; 128]
+    path := graphics.Path.new(&mut path_storage)
+    mask := [0u8; 40 * 40]
+    a_pixels := [0u8; 40 * 32 * 4]
+    b_pixels := [0u8; 40 * 32 * 4]
+    colors := [graphics.WHITE, graphics.rgba(250, 120, 30, 150), graphics.hex(0x3366cc)]
+    backgrounds := [graphics.BLACK, graphics.rgba(10, 200, 90, 100), graphics.TRANSPARENT]
+    for format in 0u32..5 {
+        a := graphics.canvas(&mut a_pixels, 40, 32, format_number(format))!
+        b := graphics.canvas(&mut b_pixels, 40, 32, format_number(format))!
+        for case in 0usize..9 {
+            dx := (case as i32 * 77) % 256 - 600
+            dy := (case as i32 * 45) % 256 + 512
+            a.clear(backgrounds[case % 3])
+            b.clear(backgrounds[case % 3])
+            if case == 4 {
+                a.set_clip(graphics.Rect.new(3, 9, 17, 11))
+                b.set_clip(graphics.Rect.new(3, 9, 17, 11))
+            }
+            a.take_dirty()
+            b.take_dirty()
+            rule := graphics.FillRule.NonZero
+            mask_rule := graphics.FillRule.NonZero
+            if case % 2 == 1 {
+                rule = graphics.FillRule.EvenOdd
+                mask_rule = graphics.FillRule.EvenOdd
+            }
+            // The outline is drawn shifted by (5, 3) pixels; the mask is
+            // made at the unshifted position and blitted at the shift.
+            mask_shape(&mut path, dx + 5 * 256, dy + 3 * 256)
+            if case == 7 {
+                gradient := graphics.Gradient.linear(0, 0, 30, 20, graphics.RED, graphics.rgba(0, 0, 255, 128))
+                a.gradient_path(&path, rule, &gradient)
+            } else {
+                a.fill_path(&path, rule, colors[case % 3])
+            }
+            mask_shape(&mut path, dx, dy)
+            bounds := graphics.outline_bounds(&path)
+            assert(bounds.width as usize * bounds.height as usize <= mask.len)
+            graphics.coverage_mask(&path, mask_rule, &mut mask, bounds.x, bounds.y, bounds.width, bounds.height)
+            area := bounds.width as usize * bounds.height as usize
+            if case == 7 {
+                gradient := graphics.Gradient.linear(0, 0, 30, 20, graphics.RED, graphics.rgba(0, 0, 255, 128))
+                b.gradient_mask(&mask[..area], bounds.width, bounds.height, bounds.x + 5, bounds.y + 3, &gradient)
+            } else {
+                b.fill_mask(&mask[..area], bounds.width, bounds.height, bounds.x + 5, bounds.y + 3, colors[case % 3])
+            }
+            assert(a.equals(&b))
+            a_dirty := a.dirty()
+            b_dirty := b.dirty()
+            assert(a_dirty.equals(&b_dirty))
+            a.reset_clip()
+            b.reset_clip()
+        }
+    }
+
+    // A mask region larger than the outline is zero around it; a region
+    // cutting the outline holds just that part.
+    mask_shape(&mut path, 0, 0)
+    bounds := graphics.outline_bounds(&path)
+    // x from -500 to 7300 subpixels, y from -100 to 6900.
+    assert(same_rect(&bounds, -2, -1, 31, 28))
+    inner := [0u8; 31 * 28]
+    graphics.coverage_mask(&path, graphics.FillRule.NonZero, &mut inner, -2, -1, 31, 28)
+    for i in 0usize..mask.len {
+        mask[i] = 7
+    }
+    graphics.coverage_mask(&path, graphics.FillRule.NonZero, &mut mask, -4, -2, 36, 32)
+    full := 0u32
+    for row in 0usize..32 {
+        for column in 0usize..36 {
+            level := mask[row * 36 + column]
+            if row >= 1 && row < 29 && column >= 2 && column < 33 {
+                assert_eq(level, inner[(row - 1) * 31 + column - 2])
+            } else {
+                assert_eq(level, 0u8)
+            }
+            if level == 255 {
+                full += 1
+            }
+        }
+    }
+    assert(full > 100)
+    part := [0u8; 6 * 4]
+    graphics.coverage_mask(&path, graphics.FillRule.NonZero, &mut part, 10, 4, 6, 4)
+    for row in 0usize..4 {
+        for column in 0usize..6 {
+            assert_eq(part[row * 6 + column], mask[(row + 6) * 36 + column + 14])
+        }
+    }
+    // Short masks fill and draw only the rows they hold; empty ones draw
+    // nothing.
+    short := [9u8; 13]
+    graphics.coverage_mask(&path, graphics.FillRule.NonZero, &mut short, 10, 4, 6, 4)
+    assert_eq(short[12], 9u8)
+    assert_eq(short[11], part[11])
+    c := graphics.canvas(&mut a_pixels, 40, 32, graphics.PixelFormat.Rgba8888)!
+    c.clear(graphics.BLACK)
+    c.take_dirty()
+    c.fill_mask(&short, 6, 4, 0, 0, graphics.WHITE)
+    c.fill_mask(&short, 0, 4, 0, 0, graphics.WHITE)
+    c.fill_mask(&short, 6, 4, 50, 0, graphics.WHITE)
+    c.fill_mask(&short, 6, 4, -6, 0, graphics.WHITE)
+    dirty := c.dirty()
+    assert(same_rect(&dirty, 0, 0, 6, 2))
+    nothing_storage := [0i32; 4]
+    nothing := graphics.Path.new(&mut nothing_storage)
+    empty := graphics.outline_bounds(&nothing)
+    assert(empty.is_empty())
+}
+
+// Draws `text` at `size` on `direct` with font.draw and on `cached` through
+// the cache, and checks that pixels, returned areas and dirty rectangles
+// match.
+fn cached_matches(font: &truetype.Font, cache: &mut truetype.GlyphCache, direct: &mut graphics.Canvas, cached: &mut graphics.Canvas, x: i32, y: i32, text: &str, size: u32, color: graphics.Color) {
+    direct.take_dirty()
+    cached.take_dirty()
+    a := font.draw(direct, x, y, text, size, color)
+    b := cache.draw(cached, x, y, text, size, color)
+    assert(a.equals(&b))
+    assert(direct.equals(cached))
+    a_dirty := direct.dirty()
+    b_dirty := cached.dirty()
+    assert(a_dirty.equals(&b_dirty))
+}
+
+// The TrueType glyph cache. The test font's advances and kerning are
+// multiples of 10 units of 1000 per em, so at multiples of 25 pixels per em
+// every glyph lands on a quarter pixel and cached text must match Font.draw
+// exactly.
+fn glyph_cache() {
+    font := truetype.Font.new(&TEST_FONT)!
+    direct_pixels := [0u8; 96 * 64 * 4]
+    cached_pixels := [0u8; 96 * 64 * 4]
+    storage := [0u8; 16384]
+    for format in 0u32..5 {
+        direct := graphics.canvas(&mut direct_pixels, 96, 64, format_number(format))!
+        cached := graphics.canvas(&mut cached_pixels, 96, 64, format_number(format))!
+        direct.clear(graphics.rgba(20, 40, 60, 200))
+        cached.clear(graphics.rgba(20, 40, 60, 200))
+        cache := truetype.GlyphCache.new(&font, &mut storage)
+        assert(cache.is_empty())
+        cached_matches(&font, &mut cache, &mut direct, &mut cached, 2, 1, "AD.\nÄNZo AO", 25, graphics.WHITE)
+        // Nine glyphs with outlines (the space has none), eight of them
+        // distinct: the second A lands on the same quarter-pixel phase.
+        assert_eq(cache.len(), 8usize)
+        assert_eq(cache.misses(), 8u64)
+        assert_eq(cache.hits(), 1u64)
+        // The second time every glyph comes from the cache, wherever the
+        // text is and whatever its color.
+        cached_matches(&font, &mut cache, &mut direct, &mut cached, 40, 30, "AD.\nÄNZo AO", 25, graphics.rgba(255, 200, 0, 140))
+        assert_eq(cache.misses(), 8u64)
+        assert_eq(cache.hits(), 10u64)
+        cached_matches(&font, &mut cache, &mut direct, &mut cached, -7, 50, "ZAD", 50, graphics.BLUE)
+        assert_eq(cache.len(), 11usize)
+        gradient := graphics.Gradient.linear(0, 0, 90, 60, graphics.RED, graphics.rgba(0, 255, 0, 90))
+        a := font.draw_gradient(&mut direct, 30, -4, "OoAZ", 25, &gradient)
+        b := cache.draw_gradient(&mut cached, 30, -4, "OoAZ", 25, &gradient)
+        assert(a.equals(&b))
+        assert(direct.equals(&cached))
+        cache.clear()
+        assert(cache.is_empty())
+        cached_matches(&font, &mut cache, &mut direct, &mut cached, 3, 20, "NZ", 75, graphics.WHITE)
+        assert_eq(cache.len(), 2usize)
+    }
+
+    // At other sizes glyphs snap to a quarter pixel, but the layout and the
+    // area returned are Font.draw's.
+    direct := graphics.canvas(&mut direct_pixels, 96, 64, graphics.PixelFormat.Rgba8888)!
+    cached := graphics.canvas(&mut cached_pixels, 96, 64, graphics.PixelFormat.Rgba8888)!
+    cache := truetype.GlyphCache.new(&font, &mut storage)
+    a := font.draw(&mut direct, 1, 2, "AD\nA", 20, graphics.WHITE)
+    b := cache.draw(&mut cached, 1, 2, "AD\nA", 20, graphics.WHITE)
+    assert(a.equals(&b))
+    assert(same_rect(&b, 1, 2, 23, 44))
+    // Glyphs drawn at different quarter-pixel offsets are cached apart.
+    cache.clear()
+    cache.draw(&mut cached, 0, 0, "A", 20, graphics.WHITE)
+    cache.draw(&mut cached, 9, 0, "A", 20, graphics.WHITE)
+    assert_eq(cache.len(), 1usize)
+    cache.draw(&mut cached, 0, 0, "OA", 25, graphics.WHITE)
+    assert_eq(cache.len(), 3usize)
+    cache.draw(&mut cached, 0, 0, "DA", 20, graphics.WHITE)
+    // A at 20 after D (620 units, kerned -40) sits 11.6 pixels in: a new
+    // quarter-pixel phase.
+    assert_eq(cache.len(), 5usize)
+}
+
+// Small caches evict constantly; text must still match Font.draw. Storage
+// too small for any glyph draws everything from outlines.
+fn glyph_cache_eviction() {
+    font := truetype.Font.new(&TEST_FONT)!
+    direct_pixels := [0u8; 80 * 48 * 4]
+    cached_pixels := [0u8; 80 * 48 * 4]
+    phrases := ["AD", "ZOo", ".N", "ÄA D", "oZ.", "NNA", "O", "DÄZo", "A.A", "ZZ O"]
+    random := Random { state: 0x1357bdf }
+    sizes := [16usize, 700, 1500, 3000, 9000]
+    big := [0u8; 9000]
+    for &capacity in sizes {
+        direct := graphics.canvas(&mut direct_pixels, 80, 48, graphics.PixelFormat.Rgba8888)!
+        cached := graphics.canvas(&mut cached_pixels, 80, 48, graphics.PixelFormat.Rgba8888)!
+        direct.clear(graphics.BLACK)
+        cached.clear(graphics.BLACK)
+        cache := truetype.GlyphCache.new(&font, &mut big[..capacity])
+        for _ in 0u32..150 {
+            text := phrases[(random.next() as usize) % phrases.len]
+            size := 25 * (random.next() % 3 + 1)
+            x := (random.next() % 90) as i32 - 20
+            y := (random.next() % 60) as i32 - 20
+            cached_matches(&font, &mut cache, &mut direct, &mut cached, x, y, text, size, graphics.rgba(255, 255, 255, (random.next() & 255) as u8))
+        }
+        if capacity == 16 {
+            assert(cache.is_empty())
+            assert_eq(cache.hits(), 0u64)
+        } else {
+            // Glyphs were reused, and many more were cached than fit.
+            assert(cache.hits() > 50 && cache.misses() > cache.len() as u64 + 200)
+        }
+    }
+}
+
 // Random corruption of the test font: parsing may fail, but parsing,
 // lookups and drawing never trap.
 fn corrupted_fonts() {
@@ -1512,6 +1766,7 @@ fn corrupted_fonts() {
     data := [0u8; 808]
     pixels := [0u8; 24 * 16 * 4]
     canvas := graphics.canvas(&mut pixels, 24, 16, graphics.PixelFormat.Rgba8888)!
+    cache_storage := [0u8; 2048]
     for _ in 0u32..600 {
         for i in 0usize..TEST_FONT.len {
             data[i] = TEST_FONT[i]
@@ -1528,6 +1783,9 @@ fn corrupted_fonts() {
         match truetype.Font.new(&data[..length]) {
             ok(font) => {
                 font.draw(&mut canvas, -2, -3, "AODÄoNZ. ÿ", 9 + random.next() % 30, graphics.WHITE)
+                cache := truetype.GlyphCache.new(&font, &mut cache_storage)
+                cache.draw(&mut canvas, -2, -3, "AODÄoNZ. ÿ", 9 + random.next() % 30, graphics.WHITE)
+                cache.draw(&mut canvas, 1, -1, "AODÄoNZ. ÿ", 9 + random.next() % 30, graphics.WHITE)
                 font.measure("ZAD\nOo", 4096)
                 font.glyph_box(random.next() % 12)
                 font.kerning(random.next() % 12, random.next() % 12)
@@ -1876,6 +2134,9 @@ fn main() {
     antialiasing()
     gradients()
     truetype_checks()
+    coverage_masks()
+    glyph_cache()
+    glyph_cache_eviction()
     corrupted_fonts()
 }
 
