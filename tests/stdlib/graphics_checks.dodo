@@ -1,0 +1,1101 @@
+package main
+
+import "std/graphics"
+import "std/graphics/fake"
+import "std/graphics/font"
+import "std/graphics/image"
+
+// Portable checks for std/graphics: exact pixels for every primitive, all
+// pixel formats, clipping, dirty tracking, text, blitting, the Display
+// protocol and the image codecs. No OS, allocator or floating point.
+
+fn count(canvas: &graphics.Canvas, color: graphics.Color) -> u32 {
+    total := 0u32
+    for y in 0i32..canvas.height() as i32 {
+        for x in 0i32..canvas.width() as i32 {
+            if at(canvas, x, y) == color {
+                total += 1
+            }
+        }
+    }
+    return total
+}
+
+fn at(canvas: &graphics.Canvas, x: i32, y: i32) -> graphics.Color {
+    match canvas.color_at(x, y) {
+        some(color) => {
+            return color
+        }
+        none => {
+            assert(false, "pixel outside the canvas")
+            return 0
+        }
+    }
+}
+
+fn clean(canvas: &graphics.Canvas) -> bool {
+    dirty := canvas.dirty()
+    return dirty.is_empty()
+}
+
+fn same_rect(rect: &graphics.Rect, x: i32, y: i32, width: u32, height: u32) -> bool {
+    return rect.x == x && rect.y == y && rect.width == width && rect.height == height
+}
+
+fn construction() {
+    assert_eq(graphics.bytes_needed(10, 3, graphics.PixelFormat.Rgba8888), 120usize)
+    assert_eq(graphics.bytes_needed(10, 3, graphics.PixelFormat.Rgb565), 60usize)
+    assert_eq(graphics.bytes_needed(10, 3, graphics.PixelFormat.Gray8), 30usize)
+    assert_eq(graphics.bytes_needed(10, 3, graphics.PixelFormat.Mono1), 6usize)
+    assert_eq(graphics.min_stride(9, graphics.PixelFormat.Mono1), 2usize)
+    assert_eq(graphics.bits_per_pixel(graphics.PixelFormat.Bgra8888), 32u32)
+
+    small := [0u8; 10]
+    match graphics.canvas(&mut small, 2, 2, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, "a short buffer must be rejected")
+        }
+        err(error) => {
+            assert(error == graphics.Error.BufferTooSmall)
+        }
+    }
+    padded := [0u8; 64]
+    match graphics.Canvas.with_stride(&mut padded, 4, 2, 15, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, "a stride shorter than a row must be rejected")
+        }
+        err(error) => {
+            assert(error == graphics.Error.InvalidInput)
+        }
+    }
+    match graphics.Canvas.with_stride(&mut padded, graphics.MAX_DIMENSION + 1, 0, 0, graphics.PixelFormat.Gray8) {
+        ok(_) => {
+            assert(false, "oversized dimensions must be rejected")
+        }
+        err(error) => {
+            assert(error == graphics.Error.InvalidInput)
+        }
+    }
+
+    // Padded rows: the padding is never written.
+    storage := [0xaau8; 2 * 20]
+    canvas := graphics.Canvas.with_stride(&mut storage, 4, 2, 20, graphics.PixelFormat.Rgba8888)!
+    canvas.clear(graphics.WHITE)
+    assert_eq(canvas.stride(), 20usize)
+    assert_eq(canvas.row(1).len, 16usize)
+    assert_eq(canvas.pixels().len, 40usize)
+    assert_eq(canvas.pixels()[16], 0xaau8)
+    assert_eq(canvas.pixels()[39], 0xaau8)
+    assert_eq(canvas.pixels()[20], 0xffu8)
+
+    empty := [0u8; 1]
+    zero := graphics.canvas(&mut empty, 0, 0, graphics.PixelFormat.Gray8)!
+    zero.fill_rect(-5, -5, 100, 100, graphics.WHITE)
+    zero.line(0, 0, 10, 10, graphics.WHITE)
+    assert(clean(&zero))
+}
+
+fn colors() {
+    assert_eq(graphics.rgb(1, 2, 3), 0xff010203u32)
+    assert_eq(graphics.rgba(1, 2, 3, 4), 0x04010203u32)
+    assert_eq(graphics.hex(0x12345678), 0xff345678u32)
+    assert_eq(graphics.red(0x80112233), 0x11u8)
+    assert_eq(graphics.green(0x80112233), 0x22u8)
+    assert_eq(graphics.blue(0x80112233), 0x33u8)
+    assert_eq(graphics.alpha(0x80112233), 0x80u8)
+    assert_eq(graphics.with_alpha(graphics.RED, 0), 0x00ff0000u32)
+    assert_eq(graphics.luma(graphics.WHITE), 255u8)
+    assert_eq(graphics.luma(graphics.BLACK), 0u8)
+    assert_eq(graphics.luma(graphics.GREEN), 149u8)
+    // Source-over: opaque wins, transparent leaves, half mixes.
+    assert_eq(graphics.over(graphics.RED, graphics.BLUE), graphics.RED)
+    assert_eq(graphics.over(graphics.TRANSPARENT, graphics.BLUE), graphics.BLUE)
+    assert_eq(graphics.over(graphics.rgba(255, 255, 255, 128), graphics.BLACK), graphics.rgb(128, 128, 128))
+    assert_eq(graphics.over(graphics.rgba(255, 0, 0, 128), graphics.TRANSPARENT), graphics.rgba(255, 0, 0, 128))
+}
+
+fn formats() {
+    rgba := [0u8; 8]
+    canvas := graphics.canvas(&mut rgba, 2, 1, graphics.PixelFormat.Rgba8888)!
+    canvas.pixel(1, 0, 0x80102030)
+    assert_eq(canvas.pixels()[4], 0x10u8)
+    assert_eq(canvas.pixels()[5], 0x20u8)
+    assert_eq(canvas.pixels()[6], 0x30u8)
+    assert_eq(canvas.pixels()[7], 0x80u8)
+    assert_eq(at(&canvas, 1, 0), 0x80102030u32)
+
+    bgra := [0u8; 4]
+    canvas2 := graphics.canvas(&mut bgra, 1, 1, graphics.PixelFormat.Bgra8888)!
+    canvas2.pixel(0, 0, 0x80102030)
+    assert_eq(canvas2.pixels()[0], 0x30u8)
+    assert_eq(canvas2.pixels()[2], 0x10u8)
+    assert_eq(at(&canvas2, 0, 0), 0x80102030u32)
+
+    // Rgb565 is big-endian and widens by repeating high bits.
+    rgb565 := [0u8; 4]
+    canvas3 := graphics.canvas(&mut rgb565, 2, 1, graphics.PixelFormat.Rgb565)!
+    canvas3.pixel(0, 0, graphics.RED)
+    canvas3.pixel(1, 0, graphics.rgb(0x08, 0x04, 0x08))
+    assert_eq(canvas3.pixels()[0], 0xf8u8)
+    assert_eq(canvas3.pixels()[1], 0x00u8)
+    assert_eq(canvas3.pixels()[2], 0x08u8)
+    assert_eq(canvas3.pixels()[3], 0x21u8)
+    assert_eq(at(&canvas3, 0, 0), graphics.RED)
+    assert_eq(at(&canvas3, 1, 0), graphics.rgb(0x08, 0x04, 0x08))
+    canvas3.pixel(0, 0, graphics.rgb(0x87, 0x43, 0x21))
+    assert_eq(at(&canvas3, 0, 0), graphics.rgb(0x84, 0x41, 0x21))
+
+    gray := [0u8; 2]
+    canvas4 := graphics.canvas(&mut gray, 2, 1, graphics.PixelFormat.Gray8)!
+    canvas4.pixel(0, 0, graphics.GREEN)
+    assert_eq(canvas4.pixels()[0], 149u8)
+    assert_eq(at(&canvas4, 0, 0), graphics.rgb(149, 149, 149))
+
+    // Mono1: MSB first, rows on byte boundaries, threshold at luma 128.
+    mono := [0u8; 4]
+    canvas5 := graphics.canvas(&mut mono, 10, 2, graphics.PixelFormat.Mono1)!
+    canvas5.pixel(0, 0, graphics.WHITE)
+    canvas5.pixel(9, 0, graphics.GRAY)
+    canvas5.pixel(1, 1, graphics.DARK_GRAY)
+    assert_eq(canvas5.pixels()[0], 0x80u8)
+    assert_eq(canvas5.pixels()[1], 0x40u8)
+    assert_eq(canvas5.pixels()[3], 0x00u8)
+    assert_eq(at(&canvas5, 9, 0), graphics.WHITE)
+    assert_eq(at(&canvas5, 8, 0), graphics.BLACK)
+    canvas5.fill_rect(3, 1, 7, 1, graphics.WHITE)
+    assert_eq(canvas5.pixels()[2], 0x1fu8)
+    assert_eq(canvas5.pixels()[3], 0xc0u8)
+    canvas5.fill_rect(0, 1, 10, 1, graphics.BLACK)
+    assert_eq(canvas5.pixels()[2], 0u8)
+    assert_eq(canvas5.pixels()[3], 0u8)
+    match canvas5.color_at(10, 0) {
+        some(_) => {
+            assert(false, "outside the canvas reads none")
+        }
+        none => {}
+    }
+    match canvas5.color_at(-1, 0) {
+        some(_) => {
+            assert(false, "negative coordinates read none")
+        }
+        none => {}
+    }
+}
+
+fn clipping_and_dirty() {
+    pixels := [0u8; 16 * 16]
+    canvas := graphics.canvas(&mut pixels, 16, 16, graphics.PixelFormat.Gray8)!
+    assert(clean(&canvas))
+    canvas.fill_rect(-4, 10, 8, 20, graphics.WHITE)
+    dirty := canvas.take_dirty()
+    assert(same_rect(&dirty, 0, 10, 4, 6))
+    assert(clean(&canvas))
+    assert_eq(count(&canvas, graphics.WHITE), 24u32)
+
+    canvas.pixel(16, 3, graphics.WHITE)
+    canvas.pixel(-1, 3, graphics.WHITE)
+    assert(clean(&canvas))
+
+    canvas.set_clip(graphics.Rect.new(4, 4, 4, 4))
+    canvas.clear(graphics.GRAY)
+    assert_eq(count(&canvas, graphics.rgb(128, 128, 128)), 16u32)
+    dirty2 := canvas.take_dirty()
+    assert(same_rect(&dirty2, 4, 4, 4, 4))
+    canvas.line(0, 0, 15, 15, graphics.WHITE)
+    dirty3 := canvas.take_dirty()
+    assert(same_rect(&dirty3, 4, 4, 4, 4))
+    clip := canvas.clip()
+    assert(same_rect(&clip, 4, 4, 4, 4))
+    canvas.set_clip(graphics.Rect.new(20, 20, 5, 5))
+    empty_clip := canvas.clip()
+    assert(empty_clip.is_empty())
+    canvas.clear(graphics.WHITE)
+    assert(clean(&canvas))
+    canvas.reset_clip()
+    clip2 := canvas.clip()
+    assert(same_rect(&clip2, 0, 0, 16, 16))
+
+    canvas.mark_dirty(graphics.Rect.new(14, -2, 10, 4))
+    dirty4 := canvas.take_dirty()
+    assert(same_rect(&dirty4, 14, 0, 2, 2))
+    canvas.mark_all_dirty()
+    dirty5 := canvas.take_dirty()
+    assert(same_rect(&dirty5, 0, 0, 16, 16))
+}
+
+fn rectangles() {
+    a := graphics.Rect.new(0, 0, 10, 10)
+    b := graphics.Rect.new(5, -5, 10, 10)
+    overlap := a.intersect(&b)
+    assert(same_rect(&overlap, 5, 0, 5, 5))
+    both := a.union(&b)
+    assert(same_rect(&both, 0, -5, 15, 15))
+    far := graphics.Rect.new(20, 20, 1, 1)
+    apart := a.intersect(&far)
+    assert(apart.is_empty())
+    empty := graphics.Rect.empty()
+    kept := a.union(&empty)
+    assert(kept.equals(&a))
+    assert(a.contains(9, 9))
+    assert(!a.contains(10, 9))
+    huge := graphics.Rect.new(2147483647, 0, 4294967295, 1)
+    assert_eq(huge.right(), 6442450942i64)
+    moved := huge.offset(10, -10)
+    assert_eq(moved.x, 2147483647i32)
+    assert_eq(moved.y, -10i32)
+
+    pixels := [0u8; 8 * 6]
+    canvas := graphics.canvas(&mut pixels, 8, 6, graphics.PixelFormat.Gray8)!
+    canvas.rect(1, 1, 6, 4, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 16u32)
+    assert_eq(at(&canvas, 2, 2), graphics.BLACK)
+    assert_eq(at(&canvas, 6, 4), graphics.WHITE)
+    canvas.clear(graphics.BLACK)
+    canvas.rect(0, 0, 1, 1, graphics.WHITE)
+    canvas.rect(2, 0, 3, 1, graphics.WHITE)
+    canvas.rect(6, 0, 1, 3, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 7u32)
+    canvas.clear(graphics.BLACK)
+    canvas.fill(graphics.Rect.new(1, 1, 3, 2), graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 6u32)
+
+    // Huge rectangles clip without overflowing.
+    canvas.fill_rect(-2147483648, -2147483648, 4294967295, 4294967295, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 48u32)
+    canvas.rect(2147483647, 0, 4294967295, 4294967295, graphics.BLACK)
+    assert_eq(count(&canvas, graphics.WHITE), 48u32)
+
+    // Rounded corners: radius 0 is a rectangle, oversized radii are limited.
+    canvas.clear(graphics.BLACK)
+    canvas.fill_round_rect(0, 0, 8, 6, 0, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 48u32)
+    canvas.clear(graphics.BLACK)
+    canvas.fill_round_rect(0, 0, 7, 5, 100, graphics.WHITE)
+    canvas.round_rect(0, 0, 7, 5, 100, graphics.GRAY)
+    assert_eq(at(&canvas, 0, 0), graphics.BLACK)
+    assert_eq(at(&canvas, 3, 2), graphics.WHITE)
+    assert_eq(at(&canvas, 0, 2), graphics.rgb(128, 128, 128))
+}
+
+fn lines() {
+    pixels := [0u8; 16 * 16]
+    canvas := graphics.canvas(&mut pixels, 16, 16, graphics.PixelFormat.Gray8)!
+    canvas.line(0, 0, 15, 15, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 16u32)
+    for i in 0i32..16 {
+        assert_eq(at(&canvas, i, i), graphics.WHITE)
+    }
+    // A shallow line: one pixel per column, rows following the exact line.
+    canvas.clear(graphics.BLACK)
+    canvas.line(0, 0, 10, 3, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 11u32)
+    expected := [0i32, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3]
+    for x in 0i32..11 {
+        assert_eq(at(&canvas, x, expected[x as usize]), graphics.WHITE)
+    }
+    // Drawing it backwards visits the same columns.
+    canvas.clear(graphics.BLACK)
+    canvas.line(10, 3, 0, 0, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 11u32)
+    assert_eq(at(&canvas, 0, 0), graphics.WHITE)
+    assert_eq(at(&canvas, 10, 3), graphics.WHITE)
+    // A steep line: one pixel per row.
+    canvas.clear(graphics.BLACK)
+    canvas.line(2, 0, 5, 15, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 16u32)
+    // Points, verticals and horizontals.
+    canvas.clear(graphics.BLACK)
+    canvas.line(3, 3, 3, 3, graphics.WHITE)
+    canvas.line(5, 9, 5, 2, graphics.WHITE)
+    canvas.line(12, 1, 7, 1, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 1u32 + 8 + 6)
+    // Far endpoints: bounded work, only the visible part is drawn.
+    canvas.clear(graphics.BLACK)
+    canvas.line(-2147483648, 5, 2147483647, 5, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 16u32)
+    canvas.clear(graphics.BLACK)
+    canvas.line(-2000000000, -2000000000, 2000000000, 2000000000, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 16u32)
+    canvas.clear(graphics.BLACK)
+    canvas.line(-100, 50, 100, 60, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 0u32)
+    assert(!clean(&canvas))
+    canvas.take_dirty()
+    canvas.line(-100, 50, 100, 60, graphics.WHITE)
+    assert(clean(&canvas))
+}
+
+fn circles() {
+    pixels := [0u8; 21 * 21]
+    canvas := graphics.canvas(&mut pixels, 21, 21, graphics.PixelFormat.Gray8)!
+    canvas.fill_circle(10, 10, 0, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 1u32)
+    canvas.clear(graphics.BLACK)
+    canvas.fill_circle(10, 10, 1, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 9u32)
+    canvas.clear(graphics.BLACK)
+    canvas.fill_circle(10, 10, 2, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 21u32)
+    canvas.clear(graphics.BLACK)
+    canvas.circle(10, 10, 0, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 1u32)
+
+    // Outlines lie inside the matching disk and are symmetric.
+    for radius in 1u32..10 {
+        canvas.clear(graphics.BLACK)
+        canvas.fill_circle(10, 10, radius, graphics.GRAY)
+        filled := count(&canvas, graphics.rgb(128, 128, 128))
+        canvas.circle(10, 10, radius, graphics.WHITE)
+        assert_eq(count(&canvas, graphics.rgb(128, 128, 128)) + count(&canvas, graphics.WHITE), filled)
+        assert_eq(at(&canvas, 10, 10 - radius as i32), graphics.WHITE)
+        assert_eq(at(&canvas, 10 + radius as i32, 10), graphics.WHITE)
+        assert(at(&canvas, 10, 10) != graphics.WHITE)
+        for y in 0i32..21 {
+            for x in 0i32..21 {
+                assert_eq(at(&canvas, x, y), at(&canvas, 20 - x, y))
+                assert_eq(at(&canvas, x, y), at(&canvas, y, x))
+            }
+        }
+    }
+    // Ellipses with equal radii are circles; others are symmetric.
+    other := [0u8; 21 * 21]
+    reference := graphics.canvas(&mut other, 21, 21, graphics.PixelFormat.Gray8)!
+    canvas.clear(graphics.BLACK)
+    canvas.ellipse(10, 10, 7, 7, graphics.WHITE)
+    reference.circle(10, 10, 7, graphics.WHITE)
+    assert(canvas.equals(&reference))
+    canvas.clear(graphics.BLACK)
+    canvas.fill_ellipse(10, 10, 9, 4, graphics.GRAY)
+    filled := count(&canvas, graphics.rgb(128, 128, 128))
+    canvas.ellipse(10, 10, 9, 4, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.rgb(128, 128, 128)) + count(&canvas, graphics.WHITE), filled)
+    assert_eq(at(&canvas, 1, 10), graphics.WHITE)
+    assert_eq(at(&canvas, 10, 6), graphics.WHITE)
+    assert_eq(at(&canvas, 0, 10), graphics.BLACK)
+    for y in 0i32..21 {
+        for x in 0i32..21 {
+            assert_eq(at(&canvas, x, y), at(&canvas, 20 - x, y))
+            assert_eq(at(&canvas, x, y), at(&canvas, x, 20 - y))
+        }
+    }
+    canvas.clear(graphics.BLACK)
+    canvas.ellipse(10, 10, 0, 5, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 11u32)
+    // Enormous circles clip to bounded work.
+    canvas.clear(graphics.BLACK)
+    canvas.fill_circle(10, 10, 4294967295, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 441u32)
+    canvas.circle(10, 10, 4294967295, graphics.BLACK)
+    assert_eq(count(&canvas, graphics.WHITE), 441u32)
+    canvas.fill_ellipse(-2147483648, 10, 4294967295, 4294967295, graphics.BLACK)
+    assert_eq(count(&canvas, graphics.WHITE), 0u32)
+}
+
+fn polygons() {
+    pixels := [0u8; 16 * 16]
+    canvas := graphics.canvas(&mut pixels, 16, 16, graphics.PixelFormat.Gray8)!
+    square := [1i32, 1, 5, 1, 5, 4, 1, 4]
+    canvas.fill_polygon(&square, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 12u32)
+    assert_eq(at(&canvas, 1, 1), graphics.WHITE)
+    assert_eq(at(&canvas, 4, 3), graphics.WHITE)
+    assert_eq(at(&canvas, 5, 3), graphics.BLACK)
+    // Winding direction does not matter.
+    canvas.clear(graphics.BLACK)
+    reversed := [1i32, 4, 5, 4, 5, 1, 1, 1]
+    canvas.fill_polygon(&reversed, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 12u32)
+    // Outline of a square covers its edge pixels.
+    canvas.clear(graphics.BLACK)
+    canvas.polygon(&square, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 14u32)
+    // Even-odd: the centre of a pentagram stays empty.
+    canvas.clear(graphics.BLACK)
+    star := [8i32, 0, 13, 15, 0, 5, 16, 5, 3, 15]
+    canvas.fill_polygon(&star, graphics.WHITE)
+    assert_eq(at(&canvas, 8, 8), graphics.BLACK)
+    assert_eq(at(&canvas, 8, 3), graphics.WHITE)
+    assert_eq(at(&canvas, 2, 5), graphics.WHITE)
+    // Degenerate input draws nothing or a point; an odd value is ignored.
+    canvas.clear(graphics.BLACK)
+    two := [0i32, 0, 5, 5, 9]
+    canvas.fill_polygon(&two, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 0u32)
+    canvas.polygon(&two, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 6u32)
+    one := [7i32, 7]
+    canvas.clear(graphics.BLACK)
+    canvas.polygon(&one, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 1u32)
+    // Far vertices clip.
+    canvas.clear(graphics.BLACK)
+    huge := [-2147483648i32, -2147483648, 2147483647, -2147483648, 2147483647, 2147483647, -2147483648, 2147483647]
+    canvas.fill_polygon(&huge, graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 256u32)
+}
+
+// A comb with more edge crossings per row than fill_polygon buffers: 40
+// two-pixel teeth over rows 0-9 joined by a spine in rows 10-11.
+fn comb_polygon() {
+    const TEETH: usize = 40
+    coordinates := [0i32; 2 * (1 + 4 * TEETH)]
+    coordinates[0] = 0
+    coordinates[1] = 12
+    n := 2usize
+    for tooth in 0usize..TEETH {
+        left := (tooth * 3) as i32
+        coordinates[n] = left
+        coordinates[n + 1] = 0
+        coordinates[n + 2] = left + 2
+        coordinates[n + 3] = 0
+        n += 4
+        if tooth + 1 < TEETH {
+            coordinates[n] = left + 2
+            coordinates[n + 1] = 10
+            coordinates[n + 2] = left + 3
+            coordinates[n + 3] = 10
+            n += 4
+        } else {
+            coordinates[n] = left + 2
+            coordinates[n + 1] = 12
+            n += 2
+        }
+    }
+    storage := [0u8; 120 * 12]
+    canvas := graphics.canvas(&mut storage, 120, 12, graphics.PixelFormat.Gray8)!
+    canvas.fill_polygon(&coordinates[..n], graphics.WHITE)
+    other := [0u8; 120 * 12]
+    reference := graphics.canvas(&mut other, 120, 12, graphics.PixelFormat.Gray8)!
+    for tooth in 0usize..TEETH {
+        reference.fill_rect((tooth * 3) as i32, 0, 2, 10, graphics.WHITE)
+    }
+    reference.fill_rect(0, 10, (TEETH * 3 - 1) as u32, 2, graphics.WHITE)
+    assert(canvas.equals(&reference))
+}
+
+fn text() {
+    small := font.small()
+    assert_eq(small.advance(), 6u32)
+    assert_eq(small.line_height(), 8u32)
+    assert(small.has_glyph(0x20))
+    assert(small.has_glyph(0xff))
+    assert(!small.has_glyph(0x100))
+    size := small.measure("Hello")
+    assert_eq(size.width, 30u32)
+    assert_eq(size.height, 8u32)
+    lines := small.measure("ab\nlonger\r\n")
+    assert_eq(lines.width, 36u32)
+    assert_eq(lines.height, 24u32)
+    nothing := small.measure("")
+    assert(nothing.is_empty())
+    accented := small.measure("héllo €")
+    assert_eq(accented.width, 42u32)
+    big := font.small().scaled(3)
+    assert_eq(big.advance(), 18u32)
+    big_size := big.measure("Hi")
+    assert_eq(big_size.width, 36u32)
+    assert_eq(big_size.height, 24u32)
+    unscaled := font.small().scaled(0)
+    assert_eq(unscaled.scale(), 1u32)
+    limited := font.small().scaled(1000)
+    assert_eq(limited.scale(), 64u32)
+    medium := font.medium()
+    assert_eq(medium.advance(), 8u32)
+    assert_eq(medium.line_height(), 16u32)
+
+    pixels := [0u8; 24 * 16]
+    canvas := graphics.canvas(&mut pixels, 24, 16, graphics.PixelFormat.Gray8)!
+    bounds := canvas.text(&small, 0, 0, "I", graphics.WHITE)
+    assert(same_rect(&bounds, 0, 0, 6, 8))
+    // The small capital I: a 3-pixel bar, a 5-row stem, another bar.
+    assert_eq(count(&canvas, graphics.WHITE), 11u32)
+    assert_eq(at(&canvas, 1, 0), graphics.WHITE)
+    assert_eq(at(&canvas, 2, 3), graphics.WHITE)
+    assert_eq(at(&canvas, 0, 0), graphics.BLACK)
+    dirty := canvas.take_dirty()
+    assert(same_rect(&dirty, 1, 0, 3, 7))
+
+    // Scaling multiplies every glyph pixel.
+    canvas.clear(graphics.BLACK)
+    big_i := font.small().scaled(2)
+    canvas.text(&big_i, 0, 0, "I", graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 44u32)
+
+    // Characters outside the font draw the replacement box.
+    canvas.clear(graphics.BLACK)
+    canvas.text(&small, 0, 0, "€", graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 20u32)
+    canvas.clear(graphics.BLACK)
+    canvas.text(&small, 0, 0, "\u{7f}", graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 20u32)
+
+    // Lines restart at x; a clipped string still reports its full bounds.
+    canvas.clear(graphics.BLACK)
+    two_lines := canvas.text(&small, 2, 0, "I\nI", graphics.WHITE)
+    assert(same_rect(&two_lines, 2, 0, 6, 16))
+    assert_eq(at(&canvas, 3, 8), graphics.WHITE)
+    clipped := canvas.text(&small, -100, 0, "a long string", graphics.WHITE)
+    assert(same_rect(&clipped, -100, 0, 78, 8))
+    off := canvas.text(&small, 1000, 1000, "unseen", graphics.WHITE)
+    assert_eq(off.width, 36u32)
+
+    // A custom font: 2x2 glyphs for 'A' and 'B'.
+    glyphs := [0x80u8, 0x40, 0xc0, 0xc0]
+    custom := graphics.Font.new(2, 2, 65, 2, &glyphs)!
+    canvas.clear(graphics.BLACK)
+    canvas.text(&custom, 0, 0, "AB", graphics.WHITE)
+    assert_eq(count(&canvas, graphics.WHITE), 6u32)
+    assert_eq(at(&canvas, 1, 1), graphics.WHITE)
+    assert_eq(at(&canvas, 1, 0), graphics.BLACK)
+    match graphics.Font.new(2, 2, 65, 3, &glyphs) {
+        ok(_) => {
+            assert(false, "a short bitmap must be rejected")
+        }
+        err(error) => {
+            assert(error == graphics.Error.BufferTooSmall)
+        }
+    }
+    match graphics.Font.new(0, 2, 65, 1, &glyphs) {
+        ok(_) => {
+            assert(false, "a zero width must be rejected")
+        }
+        err(error) => {
+            assert(error == graphics.Error.InvalidInput)
+        }
+    }
+}
+
+fn blitting() {
+    source_pixels := [0u8; 4 * 4 * 4]
+    source := graphics.canvas(&mut source_pixels, 4, 4, graphics.PixelFormat.Rgba8888)!
+    source.clear(graphics.RED)
+    source.fill_rect(2, 2, 2, 2, graphics.rgba(0, 0, 255, 128))
+
+    // Same format copies bytes, including alpha.
+    copy_pixels := [0u8; 8 * 8 * 4]
+    copy := graphics.canvas(&mut copy_pixels, 8, 8, graphics.PixelFormat.Rgba8888)!
+    copy.clear(graphics.BLACK)
+    copy.take_dirty()
+    copy.blit(&source, 2, 2)
+    assert_eq(at(&copy, 2, 2), graphics.RED)
+    assert_eq(at(&copy, 5, 5), graphics.rgba(0, 0, 255, 128))
+    assert_eq(at(&copy, 1, 1), graphics.BLACK)
+    dirty := copy.take_dirty()
+    assert(same_rect(&dirty, 2, 2, 4, 4))
+    // Off the edges, and a region of the source.
+    copy.blit(&source, -3, 6)
+    assert_eq(at(&copy, 0, 6), graphics.RED)
+    assert_eq(at(&copy, 0, 7), graphics.RED)
+    copy.clear(graphics.BLACK)
+    copy.blit_region(&source, graphics.Rect.new(1, 1, 2, 2), 0, 0)
+    assert_eq(at(&copy, 0, 0), graphics.RED)
+    assert_eq(at(&copy, 1, 1), graphics.rgba(0, 0, 255, 128))
+    assert_eq(at(&copy, 2, 2), graphics.BLACK)
+    copy.clear(graphics.BLACK)
+    copy.blit_region(&source, graphics.Rect.new(-2, -2, 4, 4), 0, 0)
+    assert_eq(at(&copy, 1, 1), graphics.BLACK)
+    assert_eq(at(&copy, 2, 2), graphics.RED)
+
+    // Blending composites the half-transparent corner.
+    copy.clear(graphics.BLACK)
+    copy.blend(&source, 0, 0)
+    assert_eq(at(&copy, 0, 0), graphics.RED)
+    assert_eq(at(&copy, 3, 3), graphics.rgb(0, 0, 128))
+    copy.clear(graphics.WHITE)
+    copy.blend_rect(0, 0, 2, 1, graphics.rgba(0, 0, 0, 128))
+    assert_eq(at(&copy, 0, 0), graphics.rgb(127, 127, 127))
+    copy.blend_rect(0, 1, 2, 1, graphics.TRANSPARENT)
+    assert_eq(at(&copy, 0, 1), graphics.WHITE)
+
+    // Conversion between formats.
+    rgb565_pixels := [0u8; 4 * 4 * 2]
+    rgb565 := graphics.canvas(&mut rgb565_pixels, 4, 4, graphics.PixelFormat.Rgb565)!
+    rgb565.blit(&source, 0, 0)
+    assert_eq(at(&rgb565, 0, 0), graphics.RED)
+    assert_eq(rgb565.pixels()[0], 0xf8u8)
+    mono_pixels := [0u8; 2 * 4]
+    mono := graphics.canvas(&mut mono_pixels, 12, 4, graphics.PixelFormat.Mono1)!
+    white_pixels := [0u8; 4 * 4]
+    white := graphics.canvas(&mut white_pixels, 4, 4, graphics.PixelFormat.Gray8)!
+    white.clear(graphics.WHITE)
+    mono.blit(&white, 3, 0)
+    assert_eq(mono.pixels()[0], 0x1eu8)
+    mono2_pixels := [0u8; 2 * 4]
+    mono2 := graphics.canvas(&mut mono2_pixels, 12, 4, graphics.PixelFormat.Mono1)!
+    mono2.blit(&mono, 2, 0)
+    assert_eq(mono2.pixels()[0], 0x07u8)
+    assert_eq(mono2.pixels()[1], 0x80u8)
+
+    // Comparison across formats and sizes.
+    a_pixels := [0u8; 4 * 4]
+    a := graphics.canvas(&mut a_pixels, 4, 4, graphics.PixelFormat.Gray8)!
+    b_pixels := [0u8; 4 * 4 * 4]
+    b := graphics.canvas(&mut b_pixels, 4, 4, graphics.PixelFormat.Rgba8888)!
+    a.clear(graphics.WHITE)
+    b.clear(graphics.WHITE)
+    assert(a.equals(&b))
+    b.pixel(2, 1, graphics.BLACK)
+    b.pixel(0, 3, graphics.BLACK)
+    assert(!a.equals(&b))
+    difference := a.diff_bounds(&b)
+    assert(same_rect(&difference, 0, 1, 3, 3))
+    c_pixels := [0u8; 5 * 4]
+    c := graphics.canvas(&mut c_pixels, 5, 4, graphics.PixelFormat.Gray8)!
+    c.clear(graphics.WHITE)
+    assert(!a.equals(&c))
+    wider := a.diff_bounds(&c)
+    assert(same_rect(&wider, 4, 0, 1, 4))
+}
+
+fn draw_frame<D: graphics.Display>(display: &mut D, canvas: &mut graphics.Canvas, small: &graphics.Font) -> void!graphics.Error {
+    canvas.fill_rect(0, 0, 10, 10, graphics.BLUE)
+    canvas.text(small, 12, 2, "ok", graphics.WHITE)
+    return graphics.present(display, canvas)
+}
+
+fn displays() {
+    screen_storage := [0u8; 32 * 16 * 2]
+    display := fake.Display.new(&mut screen_storage, 32, 16, graphics.PixelFormat.Rgb565)!
+    display_size := display.size()
+    assert_eq(display_size.width, 32u32)
+    assert(display.format() == graphics.PixelFormat.Rgb565)
+    pixels := [0u8; 32 * 16 * 4]
+    canvas := graphics.canvas(&mut pixels, 32, 16, graphics.PixelFormat.Rgba8888)!
+    small := font.small()
+
+    canvas.clear(graphics.BLACK)
+    graphics.present_all(&mut display, &mut canvas)!
+    assert_eq(display.presents(), 1u32)
+    assert(display.screen().equals(&canvas))
+
+    // Only the dirty part is copied.
+    draw_frame(&mut display, &mut canvas, &small)!
+    assert_eq(display.presents(), 2u32)
+    last := display.last_dirty()
+    assert(same_rect(&last, 0, 0, 22, 10))
+    assert(display.screen().equals(&canvas))
+    assert(clean(&canvas))
+    // Nothing dirty: nothing presented.
+    graphics.present(&mut display, &mut canvas)!
+    assert_eq(display.presents(), 2u32)
+
+    // A failed present keeps the area dirty for the retry.
+    canvas.pixel(31, 15, graphics.WHITE)
+    display.fail_next(graphics.Error.Device)
+    match graphics.present(&mut display, &mut canvas) {
+        ok() => {
+            assert(false, "the injected failure must be reported")
+        }
+        err(error) => {
+            assert(error == graphics.Error.Device)
+        }
+    }
+    dirty := canvas.dirty()
+    assert(same_rect(&dirty, 31, 15, 1, 1))
+    assert(!display.screen().equals(&canvas))
+    graphics.present(&mut display, &mut canvas)!
+    assert(display.screen().equals(&canvas))
+    covered := display.covered()
+    assert(same_rect(&covered, 0, 0, 32, 16))
+
+    // A dirty rectangle that misses a change leaves the screen stale.
+    canvas.pixel(0, 15, graphics.WHITE)
+    canvas.take_dirty()
+    display.present(&canvas, graphics.Rect.new(10, 10, 2, 2))!
+    stale := display.screen().diff_bounds(&canvas)
+    assert(same_rect(&stale, 0, 15, 1, 1))
+
+    other_pixels := [0u8; 8 * 8]
+    other := graphics.canvas(&mut other_pixels, 8, 8, graphics.PixelFormat.Gray8)!
+    match display.present(&other, graphics.Rect.new(0, 0, 8, 8)) {
+        ok() => {
+            assert(false, "a canvas of another size must be rejected")
+        }
+        err(error) => {
+            assert(error == graphics.Error.InvalidInput)
+        }
+    }
+}
+
+fn scene(canvas: &mut graphics.Canvas) {
+    canvas.clear(graphics.hex(0x203040))
+    canvas.fill_circle(5, 5, 4, graphics.rgba(255, 128, 0, 200))
+    canvas.line(0, 9, 11, 0, graphics.WHITE)
+    canvas.fill_rect(8, 6, 4, 4, graphics.rgba(0, 255, 0, 0))
+}
+
+fn codecs() {
+    pixels := [0u8; 12 * 10 * 4]
+    canvas := graphics.canvas(&mut pixels, 12, 10, graphics.PixelFormat.Rgba8888)!
+    scene(&mut canvas)
+
+    // QOI keeps every channel, alpha included.
+    assert_eq(image.qoi_max_size(12, 10)!, 622usize)
+    encoded := [0u8; 622]
+    length := image.encode_qoi(&canvas, &mut encoded)!
+    assert(length < 622)
+    header := image.info(&encoded[..length])!
+    assert(header.format == image.Format.Qoi)
+    assert_eq(header.width, 12u32)
+    assert_eq(header.height, 10u32)
+    assert(header.has_alpha)
+    decoded_pixels := [0u8; 12 * 10 * 4]
+    decoded := image.decode(&encoded[..length], &mut decoded_pixels, graphics.PixelFormat.Rgba8888)!
+    assert(decoded.equals(&canvas))
+    match image.decode(&encoded[..length - 9], &mut decoded_pixels, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, "a cut QOI stream must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.Truncated)
+        }
+    }
+    tiny := [0u8; 30]
+    match image.encode_qoi(&canvas, &mut tiny) {
+        ok(_) => {
+            assert(false, "a short output buffer must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.BufferTooSmall)
+        }
+    }
+
+    // A hand-written QOI file: RGB red, a run of one, DIFF, LUMA, INDEX.
+    qoi := [b'q', b'o', b'i', b'f', 0, 0, 0, 5, 0, 0, 0, 1, 3, 0, 0xfe, 255, 0, 0, 0xc0, 0x7f, 0xaf, 0x98, 0x32, 0, 0, 0, 0, 0, 0, 0, 1]
+    small_pixels := [0u8; 5 * 4]
+    strip := image.decode(&qoi, &mut small_pixels, graphics.PixelFormat.Rgba8888)!
+    assert_eq(at(&strip, 0, 0), graphics.RED)
+    assert_eq(at(&strip, 1, 0), graphics.RED)
+    assert_eq(at(&strip, 2, 0), graphics.rgb(0, 1, 1))
+    assert_eq(at(&strip, 3, 0), graphics.rgb(16, 16, 16))
+    assert_eq(at(&strip, 4, 0), graphics.RED)
+
+    // PPM drops alpha; compare against an opaque copy.
+    opaque_pixels := [0u8; 12 * 10 * 4]
+    opaque := graphics.canvas(&mut opaque_pixels, 12, 10, graphics.PixelFormat.Rgba8888)!
+    for y in 0i32..10 {
+        for x in 0i32..12 {
+            opaque.pixel(x, y, graphics.with_alpha(at(&canvas, x, y), 255))
+        }
+    }
+    assert_eq(image.ppm_size(12, 10)!, 373usize)
+    ppm := [0u8; 373]
+    assert_eq(image.encode_ppm(&canvas, &mut ppm)!, 373usize)
+    assert_eq(ppm[0], b'P')
+    assert_eq(ppm[1], b'6')
+    assert_eq(ppm[8], 10u8)
+    assert_eq(ppm[12], 10u8)
+    from_ppm := image.decode(&ppm, &mut decoded_pixels, graphics.PixelFormat.Rgba8888)!
+    assert(from_ppm.equals(&opaque))
+
+    bmp_length := image.bmp_size(12, 10)!
+    assert_eq(bmp_length, 54usize + 36 * 10)
+    bmp := [0u8; 414]
+    assert_eq(image.encode_bmp(&canvas, &mut bmp)!, 414usize)
+    from_bmp := image.decode(&bmp, &mut decoded_pixels, graphics.PixelFormat.Rgba8888)!
+    assert(from_bmp.equals(&opaque))
+
+    // Decoding converts to the requested format and can draw at an offset.
+    gray_pixels := [0u8; 12 * 10]
+    gray := image.decode(&bmp, &mut gray_pixels, graphics.PixelFormat.Gray8)!
+    assert_eq(gray.pixels()[0], graphics.luma(at(&canvas, 0, 0)))
+    target_pixels := [0u8; 8 * 8 * 4]
+    target := graphics.canvas(&mut target_pixels, 8, 8, graphics.PixelFormat.Rgba8888)!
+    image.draw(&ppm, &mut target, -4, -2)!
+    assert_eq(at(&target, 0, 0), at(&opaque, 4, 2))
+    assert_eq(at(&target, 7, 7), at(&opaque, 11, 9))
+
+    // A P5 file with comments and maxval 15.
+    pgm := [b'P', b'5', b' ', b'#', b'x', 10, b'2', b' ', b'1', 10, b'1', b'5', 10, 0, 15]
+    gray2_pixels := [0u8; 2]
+    gray2 := image.decode(&pgm, &mut gray2_pixels, graphics.PixelFormat.Gray8)!
+    assert_eq(gray2.pixels()[0], 0u8)
+    assert_eq(gray2.pixels()[1], 255u8)
+
+    // A 1-bit BMP with a two-color palette, rows stored bottom-up.
+    one_bit := [
+        b'B', b'M', 70, 0, 0, 0, 0, 0, 0, 0, 62, 0, 0, 0,
+        40, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0,
+        8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+        // Palette: green, blue (stored B, G, R, 0).
+        0, 255, 0, 0, 255, 0, 0, 0,
+        // Bottom row first: 0 1 0, then 1 0 1.
+        0x40, 0, 0, 0, 0xa0, 0, 0, 0
+    ]
+    pal_pixels := [0u8; 3 * 2 * 4]
+    pal := image.decode(&one_bit, &mut pal_pixels, graphics.PixelFormat.Rgba8888)!
+    assert_eq(at(&pal, 0, 1), graphics.GREEN)
+    assert_eq(at(&pal, 1, 1), graphics.BLUE)
+    assert_eq(at(&pal, 2, 1), graphics.GREEN)
+    assert_eq(at(&pal, 1, 0), graphics.GREEN)
+    assert_eq(at(&pal, 0, 0), graphics.BLUE)
+
+    // Rejections.
+    garbage := [1u8, 2, 3, 4]
+    match image.info(&garbage) {
+        ok(_) => {
+            assert(false, "unknown data must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.Unsupported)
+        }
+    }
+    ascii := [b'P', b'3', 10, b'1', b' ', b'1', 10, b'2', b'5', b'5', 10, b'0', b' ', b'0', b' ', b'0']
+    match image.info(&ascii) {
+        ok(_) => {
+            assert(false, "ASCII PPM is not supported")
+        }
+        err(error) => {
+            assert(error == image.Error.Unsupported)
+        }
+    }
+    match image.decode(&ppm[..200], &mut decoded_pixels, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, "a cut PPM must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.Truncated)
+        }
+    }
+    match image.decode(&bmp[..100], &mut decoded_pixels, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, "a cut BMP must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.Truncated)
+        }
+    }
+    huge := [b'q', b'o', b'i', b'f', 0x7f, 0xff, 0xff, 0xff, 0, 0, 0, 1, 4, 0]
+    match image.info(&huge) {
+        ok(_) => {
+            assert(false, "an oversized image must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.TooLarge)
+        }
+    }
+    match image.decode(&encoded[..length], &mut small_pixels, graphics.PixelFormat.Rgba8888) {
+        ok(_) => {
+            assert(false, "short pixel storage must be rejected")
+        }
+        err(error) => {
+            assert(error == image.Error.BufferTooSmall)
+        }
+    }
+}
+
+struct Random {
+    state: u32
+
+    fn next(&mut self) -> u32 {
+        x := self.state
+        x = x ^ core.wrapping_mul(x, 8192)
+        x = x ^ (x >> 17)
+        x = x ^ core.wrapping_mul(x, 32)
+        self.state = x
+        return x
+    }
+}
+
+// Corrupt and cut valid files at random. Decoding may succeed or fail, but
+// Dodo traps on any unchecked index or overflow, so finishing proves every
+// length was validated. Work stays bounded by the input size.
+fn mutate(original: &[u8], random: &mut Random, rounds: u32) {
+    data := [0u8; 640]
+    target_pixels := [0u8; 16 * 16 * 4]
+    target := graphics.canvas(&mut target_pixels, 16, 16, graphics.PixelFormat.Rgba8888)!
+    for _ in 0u32..rounds {
+        for i in 0usize..original.len {
+            data[i] = original[i]
+        }
+        changes := random.next() % 4 + 1
+        for _ in 0u32..changes {
+            position := (random.next() as usize) % original.len
+            data[position] = (random.next() & 255) as u8
+        }
+        length := original.len
+        if random.next() % 3 == 0 {
+            length = (random.next() as usize) % original.len
+        }
+        match image.info(&data[..length]) {
+            ok(_) => {}
+            err(_) => {}
+        }
+        match image.draw(&data[..length], &mut target, 0, 0) {
+            ok() => {}
+            err(_) => {}
+        }
+        decoded_pixels := [0u8; 16 * 16]
+        match image.decode(&data[..length], &mut decoded_pixels, graphics.PixelFormat.Gray8) {
+            ok(_) => {}
+            err(_) => {}
+        }
+    }
+}
+
+fn corrupted_files() {
+    pixels := [0u8; 12 * 10 * 4]
+    canvas := graphics.canvas(&mut pixels, 12, 10, graphics.PixelFormat.Rgba8888)!
+    scene(&mut canvas)
+    random := Random { state: 0x12345678 }
+    qoi := [0u8; 622]
+    qoi_length := image.encode_qoi(&canvas, &mut qoi)!
+    mutate(&qoi[..qoi_length], &mut random, 1500)
+    ppm := [0u8; 373]
+    image.encode_ppm(&canvas, &mut ppm)!
+    mutate(&ppm, &mut random, 1500)
+    bmp := [0u8; 414]
+    image.encode_bmp(&canvas, &mut bmp)!
+    mutate(&bmp, &mut random, 1500)
+    // Paletted and bit-field BMP headers, mutated around their fields.
+    one_bit := [
+        b'B', b'M', 70, 0, 0, 0, 0, 0, 0, 0, 62, 0, 0, 0,
+        40, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0,
+        8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+        0, 255, 0, 0, 255, 0, 0, 0,
+        0x40, 0, 0, 0, 0xa0, 0, 0, 0
+    ]
+    mutate(&one_bit, &mut random, 1500)
+    fields := [
+        b'B', b'M', 74, 0, 0, 0, 0, 0, 0, 0, 66, 0, 0, 0,
+        40, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 16, 0, 3, 0, 0, 0,
+        8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0x00, 0xf8, 0, 0, 0xe0, 0x07, 0, 0, 0x1f, 0, 0, 0,
+        0x00, 0xf8, 0x1f, 0x00, 0xe0, 0x07, 0xff, 0xff
+    ]
+    mutate(&fields, &mut random, 1500)
+    // The unmutated RGB565 bit-field file decodes to its four colors.
+    field_pixels := [0u8; 2 * 2 * 4]
+    decoded := image.decode(&fields, &mut field_pixels, graphics.PixelFormat.Rgba8888)!
+    assert_eq(at(&decoded, 0, 1), graphics.RED)
+    assert_eq(at(&decoded, 1, 1), graphics.BLUE)
+    assert_eq(at(&decoded, 0, 0), graphics.GREEN)
+    assert_eq(at(&decoded, 1, 0), graphics.WHITE)
+}
+
+// A coordinate that is usually near the canvas and sometimes extreme.
+fn wild(random: &mut Random) -> i32 {
+    choice := random.next() % 8
+    if choice == 0 {
+        return -2147483648
+    }
+    if choice == 1 {
+        return 2147483647
+    }
+    if choice == 2 {
+        return (random.next() as i64 - 2147483648) as i32
+    }
+    return (random.next() % 64) as i32 - 24
+}
+
+fn extent(random: &mut Random) -> u32 {
+    choice := random.next() % 8
+    if choice == 0 {
+        return 4294967295
+    }
+    if choice == 1 {
+        return random.next()
+    }
+    return random.next() % 40
+}
+
+// Random primitives with extreme arguments in every format: drawing must
+// never trap, and work must stay bounded by the visible area.
+fn random_drawing() {
+    random := Random { state: 0x9e3779b9 }
+    rgba := [0u8; 16 * 12 * 4]
+    rgb565 := [0u8; 16 * 12 * 2]
+    gray := [0u8; 16 * 12]
+    mono := [0u8; 2 * 12]
+    canvases := [graphics.canvas(&mut rgba, 16, 12, graphics.PixelFormat.Rgba8888)!, graphics.canvas(&mut rgb565, 16, 12, graphics.PixelFormat.Rgb565)!, graphics.canvas(&mut gray, 16, 12, graphics.PixelFormat.Gray8)!, graphics.canvas(&mut mono, 13, 12, graphics.PixelFormat.Mono1)!]
+    small := font.small()
+    big := font.medium().scaled(3)
+    sprite_pixels := [0u8; 5 * 5 * 4]
+    sprite := graphics.canvas(&mut sprite_pixels, 5, 5, graphics.PixelFormat.Rgba8888)!
+    sprite.clear(graphics.rgba(10, 200, 30, 128))
+    coordinates := [0i32; 12]
+    for _ in 0u32..4000 {
+        canvas := &mut canvases[(random.next() % 4) as usize]
+        color := random.next()
+        if random.next() % 16 == 0 {
+            canvas.set_clip(graphics.Rect.new(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random)))
+        }
+        operation := random.next() % 14
+        if operation == 0 {
+            canvas.line(wild(&mut random), wild(&mut random), wild(&mut random), wild(&mut random), color)
+        } else if operation == 1 {
+            canvas.rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), color)
+        } else if operation == 2 {
+            canvas.fill_rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), color)
+        } else if operation == 3 {
+            canvas.round_rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), extent(&mut random), color)
+        } else if operation == 4 {
+            canvas.fill_round_rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), extent(&mut random), color)
+        } else if operation == 5 {
+            canvas.circle(wild(&mut random), wild(&mut random), extent(&mut random), color)
+        } else if operation == 6 {
+            canvas.fill_circle(wild(&mut random), wild(&mut random), extent(&mut random), color)
+        } else if operation == 7 {
+            canvas.ellipse(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), color)
+        } else if operation == 8 {
+            canvas.fill_ellipse(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), color)
+        } else if operation == 9 || operation == 10 {
+            count := (random.next() % 7) as usize
+            for i in 0usize..2 * count {
+                coordinates[i] = wild(&mut random)
+            }
+            if operation == 9 {
+                canvas.polygon(&coordinates[..2 * count], color)
+            } else {
+                canvas.fill_polygon(&coordinates[..2 * count], color)
+            }
+        } else if operation == 11 {
+            if random.next() % 2 == 0 {
+                canvas.text(&small, wild(&mut random), wild(&mut random), "Wild € text\nÿ", color)
+            } else {
+                canvas.text(&big, wild(&mut random), wild(&mut random), "Ab", color)
+            }
+        } else if operation == 12 {
+            canvas.blend_rect(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random), color)
+        } else {
+            region := graphics.Rect.new(wild(&mut random), wild(&mut random), extent(&mut random), extent(&mut random))
+            if random.next() % 2 == 0 {
+                canvas.blit_region(&sprite, region, wild(&mut random), wild(&mut random))
+            } else {
+                canvas.blend_region(&sprite, region, wild(&mut random), wild(&mut random))
+            }
+        }
+        // The dirty rectangle never leaves the canvas.
+        dirty := canvas.dirty()
+        bounds := canvas.bounds()
+        inside := dirty.intersect(&bounds)
+        assert(dirty.is_empty() || inside.equals(&dirty))
+        if random.next() % 8 == 0 {
+            canvas.take_dirty()
+            canvas.reset_clip()
+        }
+    }
+}
+
+fn main() {
+    construction()
+    colors()
+    formats()
+    clipping_and_dirty()
+    rectangles()
+    lines()
+    circles()
+    polygons()
+    comb_polygon()
+    text()
+    blitting()
+    displays()
+    codecs()
+    corrupted_files()
+    random_drawing()
+}
+
+@test
+fn graphics_checks_suite() {
+    main()
+}

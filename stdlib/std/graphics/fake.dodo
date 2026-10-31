@@ -1,0 +1,77 @@
+package fake
+
+import "core/option"
+import "std/graphics"
+
+// An in-memory display implementing graphics.Display. It keeps its own copy
+// of the screen, updated only inside each presented dirty rectangle, so a
+// test can check both what an application drew and that its partial updates
+// were large enough. Drawing code generic over graphics.Display runs under
+// `dodo test` with no window or panel attached.
+pub struct Display {
+    screen: graphics.Canvas
+    presents: u32
+    last: graphics.Rect
+    covered: graphics.Rect
+    failure: Option<graphics.Error>
+
+    // A display of the given size whose screen lives in `storage`, which
+    // needs graphics.bytes_needed(width, height, format) bytes. The screen
+    // starts with whatever `storage` holds.
+    pub fn new(storage: &mut[u8], width: u32, height: u32, format: graphics.PixelFormat) -> Display!graphics.Error from(storage) {
+        screen := graphics.Canvas.new(storage, width, height, format)?
+        return ok(Display { screen: screen, presents: 0, last: graphics.Rect.empty(), covered: graphics.Rect.empty(), failure: none })
+    }
+
+    pub fn size(&self) -> graphics.Size {
+        return self.screen.size()
+    }
+
+    pub fn format(&self) -> graphics.PixelFormat {
+        return self.screen.format()
+    }
+
+    // Copy `dirty` from `canvas` to the screen, converting its format.
+    // Fails with InvalidInput if the canvas size differs from the display's.
+    pub fn present(&mut self, canvas: &graphics.Canvas, dirty: graphics.Rect) -> void!graphics.Error {
+        if let some(error) = option.take(&mut self.failure) {
+            return err(error)
+        }
+        if canvas.width() != self.screen.width() || canvas.height() != self.screen.height() {
+            return err(graphics.Error.InvalidInput)
+        }
+        bounds := canvas.bounds()
+        area := dirty.intersect(&bounds)
+        self.presents += 1
+        self.covered = self.covered.union(&area)
+        self.screen.blit_region(canvas, area.clone(), area.x, area.y)
+        self.last = area
+        self.screen.take_dirty()
+        return ok()
+    }
+
+    // What the display currently shows.
+    pub fn screen(&self) -> &graphics.Canvas {
+        return &self.screen
+    }
+
+    // Number of successful presents so far.
+    pub fn presents(&self) -> u32 {
+        return self.presents
+    }
+
+    // The area the last successful present copied, limited to the screen.
+    pub fn last_dirty(&self) -> graphics.Rect {
+        return self.last.clone()
+    }
+
+    // The smallest rectangle covering every area presented so far.
+    pub fn covered(&self) -> graphics.Rect {
+        return self.covered.clone()
+    }
+
+    // Make the next present fail with `error`, for testing retry paths.
+    pub fn fail_next(&mut self, error: graphics.Error) {
+        self.failure = some(error)
+    }
+}
