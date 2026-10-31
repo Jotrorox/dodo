@@ -532,6 +532,7 @@ impl Loader<'_> {
                 | "sync"
                 | "net"
                 | "tls"
+                | "quic"
                 | "crypto"
                 | "crypto/openssl"
                 | "web"

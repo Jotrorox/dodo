@@ -112,17 +112,18 @@ This is code-generation evidence, not tested board startup or hardware execution
 Freestanding links supply startup, memory helpers and any soft-float support.
 
 Hosted console, filesystem, environment, processes, clocks, threads,
-synchronization, sockets, OS entropy, crypto and TLS backends and HTTP/web wrappers support **x86-64
+synchronization, sockets, OS entropy, crypto, TLS and QUIC backends and HTTP/web wrappers support **x86-64
 and AArch64 Linux GNU, macOS, and Windows x64 MSVC/GNU**. They reject Linux
 x32/musl and other unsupported ABIs. Atomic operations have a separate
 [x86-64/AArch64 target contract](synchronization.md#atomics).
-Hosted linking needs a target C toolchain and headers; OpenSSL-backed TLS and
+Hosted linking needs a target C toolchain and headers; OpenSSL-backed TLS, QUIC and
 `std/crypto/openssl` also need OpenSSL 3.5 or newer. See [platform adapters](platform.md),
-[TLS](tls.md), and [cryptography](crypto.md).
+[TLS](tls.md), [QUIC](quic.md), and [cryptography](crypto.md).
 OS/C-library calls may allocate internally even when Dodo storage is fixed.
 
-HTTP/1.1 clients, servers, streaming framing, and web routing **are implemented**.
-HTTP/2, HTTP/3/QUIC, WebSockets, TOML serialization and chip support beyond
+HTTP/1.1 clients, servers, streaming framing, web routing, and QUIC connections
+and streams **are implemented**.
+HTTP/2, HTTP/3, WebSockets, TOML serialization and chip support beyond
 the RP2040 and RP2350 are remaining work. [`std/embedded/hal`](hardware.md) supplies typed
 registers and portable device protocols; `std/embedded/chip/rp2040` and
 `std/embedded/board/pico` support the Raspberry Pi RP2040 and Pico, and
@@ -180,6 +181,7 @@ individual modules and links every public declaration back to its source.
 | [Networking and DNS](networking.md) | `std/net`, `std/net/dns`, `std/net/operations` | Values/DNS/operations portable; native sockets hosted. |
 | [Cryptography](crypto.md) | `std/crypto`, `std/crypto/openssl`, `std/crypto/random` | Errors/secret helpers portable; OS entropy and OpenSSL hosted. |
 | [TLS](tls.md) | `std/tls`, `std/tls/openssl`, `std/tls/stream` | Contracts/stream portable; OpenSSL hosted. |
+| [QUIC](quic.md) | `std/quic`, `std/quic/openssl` | Error and state vocabulary portable; OpenSSL endpoints hosted. |
 | [HTTP](http.md), [hosted HTTP/HTTPS](hosted-http.md) | `std/http`, `std/http/client`, `std/http/connection`, `std/http/hosted`, `std/http/https`, `std/http/server` | Protocol/polling portable; hosted/HTTPS explicit. |
 | [Web serving](web.md) | `std/web`, `std/web/application`, `std/web/app`, `std/web/hosted`, `std/web/https`, `std/web/reactor`, `std/web/response`, `std/web/server`, `std/web/static_files`, `std/web/stream`, `std/web/testing` | Routing/registration/composition portable; app/hosted/HTTPS/reactor/static files explicit. |
 | [Hardware and embedded](hardware.md) | `std/embedded/hal`, `std/embedded/hal/fake`, `std/embedded/executor`, `std/embedded/board`, `std/embedded/chip`, `std/embedded/peripheral/designware_i2c`, `std/embedded/peripheral/pl022`, `std/embedded/peripheral/pl011`, `std/embedded/wireless/cyw43`, `std/embedded/cortex_m` | `std/embedded/hal` and `std/embedded/executor` are portable, with interrupt masking on bare-metal Cortex-M and RISC-V. `std/embedded/cortex_m` (interrupt controller, SysTick, barriers) runs only on Cortex-M. `std/embedded/board` and `std/embedded/chip` resolve to the firmware build's board and chip packages, such as `std/embedded/board/pico2` and `std/embedded/chip/rp2350`. |
@@ -216,12 +218,14 @@ select providers; they are not additional recommended starting paths.
 | `std/time/windows` | Native clock boundary; use [hosted clocks](time.md). |
 | `std/tls/posix` | Native OpenSSL boundary; use [TLS](tls.md). |
 | `std/tls/windows` | Native OpenSSL boundary; use [TLS](tls.md). |
+| `std/quic/posix` | Native OpenSSL QUIC boundary; use [QUIC](quic.md). |
+| `std/quic/windows` | Native OpenSSL QUIC boundary; use [QUIC](quic.md). |
 | `std/web/posix` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
 | `std/web/windows` | Native rooted-file boundary; use [static files](web.md#optional-static-files). |
 
 Virtual imports `std/platform/native`, `std/fs/native`, `std/env/native`,
 `std/process/native`, `std/thread/native`, `std/sync/native`, `std/net/native`,
-`std/time/native`, `std/tls/native`, `std/crypto/native`,
+`std/time/native`, `std/tls/native`, `std/quic/native`, `std/crypto/native`,
 `std/crypto/openssl/native`, and `std/web/native` select compatible
 providers. `std/platform/native` exposes advanced native values;
 `std/net/native` is also the public socket entry point. Explicit `linux`/`windows`
