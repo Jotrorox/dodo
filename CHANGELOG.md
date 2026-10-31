@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
+  entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
+  declared with its own signature. It covers devices, command queues,
+  command buffers, compute, render and blit encoders, buffers, textures,
+  samplers, shader libraries from source or `.metallib` data, compute and render
+  pipelines, vertex, depth-stencil and render-pass descriptors, fences,
+  events and `CAMetalLayer`. Objects release on drop, and compile and
+  pipeline errors carry Metal's message. Buffer and texture copies check
+  their ranges, and binding indices are bounds-checked. `std/gpu/metal/objc`
+  exposes the Objective-C runtime layer for methods the module lacks. Loading
+  the package links Metal, QuartzCore, Foundation and libobjc, and importing
+  it for a non-macOS target is an error. The test suite runs compute,
+  rendering and readback on the GPU, including x86-64 under Rosetta, and
+  checks every constant against the SDK headers.
 - `std/graphics` solid fills and same-format blits are 9–35× faster at -O2
   (1280×800 `clear` 1.4 ms → 0.06 ms, full-frame `blit` 2.3 ms → 0.07 ms).
   Their loops now store through a local row subslice, which the optimizer

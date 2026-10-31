@@ -1,0 +1,3970 @@
+package metal
+
+import "core/mem"
+import "core/ptr"
+import "std/gpu/metal/objc"
+
+// Apple's Metal GPU API, bound in Dodo through the Objective-C runtime. There
+// is no C runtime file: every call is an objc_msgSend declared with that
+// method's own signature, so the bindings can grow one method at a time.
+//
+// The API follows Metal closely, renamed to Dodo conventions:
+// newBufferWithLength:options: is Device.new_buffer, MTLPixelFormatBGRA8Unorm
+// is PIXEL_FORMAT_BGRA8_UNORM, and so on. Each object is an owned strong
+// reference that releases on drop; clone() retains another. Objects Metal
+// documents as thread-safe (devices, queues, resources, pipelines and other
+// states) can be sent and shared between threads.
+//
+// What is checked: arguments that would let Metal touch CPU memory outside a
+// Dodo slice or a resource, such as buffer and texture reads and writes and
+// binding indices. What is not: the GPU itself. Shaders, draws, dispatches
+// and blits run exactly as encoded; Metal's validation layer
+// (MTL_DEBUG_LAYER=1) reports misuse there. Only the macOS targets link
+// these bindings: Metal, QuartzCore and Foundation are added automatically.
+
+unsafe extern "C" fn MTLCreateSystemDefaultDevice() -> *mut u8
+unsafe extern "C" fn MTLCopyAllDevices() -> *mut u8
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> *const u8
+unsafe extern "C" fn dispatch_data_create(buffer: *const u8, size: usize, queue: *mut u8, destructor: *mut u8) -> *mut u8
+unsafe extern "C" fn dispatch_release(object: *mut u8)
+
+// Message signatures, named m_RESULT_ARGUMENTS. Codes: v void, p object or
+// pointer, q const pointer, u usize (NSUInteger), i isize (NSInteger), w u32,
+// c u8, b bool, f f32, d f64, S Size, O Origin, R Region, C ClearColor,
+// W Viewport, X ScissorRect, N Range, G CGSize.
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v(receiver: *mut u8, selector: *mut u8)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_p(receiver: *mut u8, selector: *mut u8) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_u(receiver: *mut u8, selector: *mut u8) -> usize
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_b(receiver: *mut u8, selector: *mut u8) -> bool
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_d(receiver: *mut u8, selector: *mut u8) -> f64
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_S(receiver: *mut u8, selector: *mut u8) -> Size
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_G(receiver: *mut u8, selector: *mut u8) -> CGSize
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_p_p(receiver: *mut u8, selector: *mut u8, a: *mut u8) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_p_u(receiver: *mut u8, selector: *mut u8, a: usize) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_p_pp(receiver: *mut u8, selector: *mut u8, a: *mut u8, error: *mut *mut u8) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_p_uu(receiver: *mut u8, selector: *mut u8, a: usize, b: usize) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_p_ppp(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: *mut u8, error: *mut *mut u8) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_p_quu(receiver: *mut u8, selector: *mut u8, a: *const u8, b: usize, c: usize) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_p_uuNN(receiver: *mut u8, selector: *mut u8, a: usize, b: usize, c: Range, d: Range) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_u_u(receiver: *mut u8, selector: *mut u8, a: usize) -> usize
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_b_u(receiver: *mut u8, selector: *mut u8, a: usize) -> bool
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_b_p(receiver: *mut u8, selector: *mut u8, a: *mut u8) -> bool
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_b_i(receiver: *mut u8, selector: *mut u8, a: isize) -> bool
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_p(receiver: *mut u8, selector: *mut u8, a: *mut u8)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_u(receiver: *mut u8, selector: *mut u8, a: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_w(receiver: *mut u8, selector: *mut u8, a: u32)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_b(receiver: *mut u8, selector: *mut u8, a: bool)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_f(receiver: *mut u8, selector: *mut u8, a: f32)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_d(receiver: *mut u8, selector: *mut u8, a: f64)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_N(receiver: *mut u8, selector: *mut u8, a: Range)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_C(receiver: *mut u8, selector: *mut u8, a: ClearColor)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_W(receiver: *mut u8, selector: *mut u8, a: Viewport)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_X(receiver: *mut u8, selector: *mut u8, a: ScissorRect)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_G(receiver: *mut u8, selector: *mut u8, a: CGSize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_pu(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_uu(receiver: *mut u8, selector: *mut u8, a: usize, b: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_ww(receiver: *mut u8, selector: *mut u8, a: u32, b: u32)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_SS(receiver: *mut u8, selector: *mut u8, a: Size, b: Size)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_puu(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize, c: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_quu(receiver: *mut u8, selector: *mut u8, a: *const u8, b: usize, c: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_uuu(receiver: *mut u8, selector: *mut u8, a: usize, b: usize, c: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_fff(receiver: *mut u8, selector: *mut u8, a: f32, b: f32, c: f32)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_upu(receiver: *mut u8, selector: *mut u8, a: usize, b: *mut u8, c: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_puS(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize, c: Size)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_pNc(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: Range, c: u8)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_ffff(receiver: *mut u8, selector: *mut u8, a: f32, b: f32, c: f32, d: f32)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_Ruqu(receiver: *mut u8, selector: *mut u8, a: Region, b: usize, c: *const u8, d: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_puRu(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize, c: Region, d: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_pupuu(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize, c: *mut u8, d: usize, e: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_uuuuu(receiver: *mut u8, selector: *mut u8, a: usize, b: usize, c: usize, d: usize, e: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_Ruuquu(receiver: *mut u8, selector: *mut u8, a: Region, b: usize, c: usize, d: *const u8, e: usize, f: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_puuRuu(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize, c: usize, d: Region, e: usize, f: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_uupupu(receiver: *mut u8, selector: *mut u8, a: usize, b: usize, c: *mut u8, d: usize, e: *mut u8, f: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_uuupuuiu(receiver: *mut u8, selector: *mut u8, a: usize, b: usize, c: usize, d: *mut u8, e: usize, f: usize, g: isize, h: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_puuuSpuuO(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize, c: usize, d: usize, e: Size, f: *mut u8, g: usize, h: usize, i: Origin)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_puuOSpuuu(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize, c: usize, d: Origin, e: Size, f: *mut u8, g: usize, h: usize, i: usize)
+@link_name("objc_msgSend")
+unsafe extern "C" fn m_v_puuOSpuuO(receiver: *mut u8, selector: *mut u8, a: *mut u8, b: usize, c: usize, d: Origin, e: Size, f: *mut u8, g: usize, h: usize, i: Origin)
+
+// NSRange: a span of elements, such as bytes, mipmap levels or slices.
+pub type Range = objc.Range
+
+// MTLSize: a count of threads, threadgroups or texels in each dimension.
+@repr(C)
+pub struct Size {
+    pub width: usize
+    pub height: usize
+    pub depth: usize
+
+    pub fn new(width: usize, height: usize, depth: usize) -> Size {
+        return Size { width: width, height: height, depth: depth }
+    }
+}
+
+// MTLOrigin: the first texel of a region.
+@repr(C)
+pub struct Origin {
+    pub x: usize
+    pub y: usize
+    pub z: usize
+
+    pub fn new(x: usize, y: usize, z: usize) -> Origin {
+        return Origin { x: x, y: y, z: z }
+    }
+}
+
+// MTLRegion: a box of texels.
+@repr(C)
+pub struct Region {
+    pub origin: Origin
+    pub size: Size
+
+    // A rectangle in a 2D texture or one slice of an array.
+    pub fn new_2d(x: usize, y: usize, width: usize, height: usize) -> Region {
+        return Region { origin: Origin.new(x, y, 0), size: Size.new(width, height, 1) }
+    }
+
+    pub fn new_3d(x: usize, y: usize, z: usize, width: usize, height: usize, depth: usize) -> Region {
+        return Region { origin: Origin.new(x, y, z), size: Size.new(width, height, depth) }
+    }
+}
+
+// MTLClearColor: what a clear load action fills a color attachment with.
+@repr(C)
+pub struct ClearColor {
+    pub red: f64
+    pub green: f64
+    pub blue: f64
+    pub alpha: f64
+
+    pub fn new(red: f64, green: f64, blue: f64, alpha: f64) -> ClearColor {
+        return ClearColor { red: red, green: green, blue: blue, alpha: alpha }
+    }
+}
+
+// MTLViewport: the transform from normalized device coordinates to pixels.
+@repr(C)
+pub struct Viewport {
+    pub origin_x: f64
+    pub origin_y: f64
+    pub width: f64
+    pub height: f64
+    pub znear: f64
+    pub zfar: f64
+
+    pub fn new(origin_x: f64, origin_y: f64, width: f64, height: f64, znear: f64, zfar: f64) -> Viewport {
+        return Viewport { origin_x: origin_x, origin_y: origin_y, width: width, height: height, znear: znear, zfar: zfar }
+    }
+}
+
+// MTLScissorRect: the pixels a draw may change.
+@repr(C)
+pub struct ScissorRect {
+    pub x: usize
+    pub y: usize
+    pub width: usize
+    pub height: usize
+
+    pub fn new(x: usize, y: usize, width: usize, height: usize) -> ScissorRect {
+        return ScissorRect { x: x, y: y, width: width, height: height }
+    }
+}
+
+// CGSize: a size in pixels or points, as Core Animation measures it.
+@repr(C)
+pub struct CGSize {
+    pub width: f64
+    pub height: f64
+
+    pub fn new(width: f64, height: f64) -> CGSize {
+        return CGSize { width: width, height: height }
+    }
+}
+
+// Binding limits enforced before a call reaches Metal, whose argument tables
+// have these many slots per shader stage.
+pub const MAX_BUFFER_BINDINGS: usize = 31
+pub const MAX_TEXTURE_BINDINGS: usize = 128
+pub const MAX_SAMPLER_BINDINGS: usize = 16
+pub const MAX_COLOR_ATTACHMENTS: usize = 8
+pub const MAX_VERTEX_ATTRIBUTES: usize = 31
+
+// Why a Metal call failed.
+pub enum Error {
+    // The system has no Metal device, as in many virtual machines.
+    NoDevice,
+    // Metal could not create the object; usually memory is exhausted.
+    OutOfMemory,
+    // An argument is outside what the call accepts, such as a byte range
+    // past the end of a buffer or a region outside a texture.
+    InvalidInput,
+    // The library has no function with the requested name.
+    NotFound,
+    // The operation needs something this system or object lacks, such as a
+    // pixel format whose size is unknown or a class that is not loaded.
+    Unsupported,
+    // Metal reported an error: shader compilation, pipeline creation or a
+    // failed command buffer. The NSError carries Metal's own message.
+    Failed(objc.NSError)
+}
+
+pub fn error_name(error: &Error) -> &str from(static) {
+    match error {
+        Error.NoDevice => {
+            return "NoDevice"
+        }
+        Error.OutOfMemory => {
+            return "OutOfMemory"
+        }
+        Error.InvalidInput => {
+            return "InvalidInput"
+        }
+        Error.NotFound => {
+            return "NotFound"
+        }
+        Error.Unsupported => {
+            return "Unsupported"
+        }
+        Error.Failed(_) => {
+            return "Failed"
+        }
+    }
+}
+
+fn null() -> objc.Id {
+    return unsafe {
+        0usize as objc.Id
+    }
+}
+
+// Callers pass a static slot used only for `name`, which ends in its NUL.
+fn sel(slot: *mut usize, name: &[u8]) -> objc.Id {
+    return unsafe {
+        objc.cached_selector(slot, name)
+    }
+}
+
+static mut S_NEW: usize = 0
+static mut S_SET_LABEL: usize = 0
+static mut S_LABEL: usize = 0
+static mut S_OBJECT_AT_INDEXED_SUBSCRIPT: usize = 0
+static mut S_PUSH_DEBUG_GROUP: usize = 0
+static mut S_POP_DEBUG_GROUP: usize = 0
+static mut S_INSERT_DEBUG_SIGNPOST: usize = 0
+static mut S_END_ENCODING: usize = 0
+
+// Adopt a +1 result: nil means Metal could not create the object.
+fn adopt(id: objc.Id) -> objc.Object!Error {
+    owned := unsafe {
+        objc.Object.from_retained(id)
+    }
+    match owned {
+        some(object) => {
+            return ok(object)
+        }
+        none => {
+            return err(Error.OutOfMemory)
+        }
+    }
+}
+
+// Adopt a +1 result of a call with an NSError out-parameter. The error is
+// autoreleased, so the caller's pool must still be alive.
+fn adopt_or_error(id: objc.Id, error: objc.Id) -> objc.Object!Error {
+    owned := unsafe {
+        objc.Object.from_retained(id)
+    }
+    match owned {
+        some(object) => {
+            return ok(object)
+        }
+        none => {
+            return err(failure(error))
+        }
+    }
+}
+
+fn failure(error: objc.Id) -> Error {
+    owned := unsafe {
+        objc.Object.retain(error)
+    }
+    match owned {
+        some(object) => {
+            return Error.Failed(unsafe {
+                objc.NSError.from_object(object)
+            })
+        }
+        none => {
+            return Error.OutOfMemory
+        }
+    }
+}
+
+// Calls that create or destroy objects run inside a temporary pool, as
+// do getters: Metal autoreleases internally even when it returns an owned
+// object, and a command-line program has no pool that would ever drain.
+
+// A new instance of the named class, from +new.
+fn instantiate(slot: *mut usize, name: &[u8]) -> objc.Object!Error {
+    class := unsafe {
+        objc.cached_class(slot, name)
+    }
+    if ptr.is_null(class) {
+        return err(Error.Unsupported)
+    }
+    pool := objc.AutoreleasePool.new()
+    return adopt(unsafe {
+        m_p(class, sel(ptr.from_mut(&mut S_NEW), b"new\0"))
+    })
+}
+
+// Retain a getter's unowned, possibly autoreleased result.
+fn get(receiver: objc.Id, selector: objc.Id) -> Option<objc.Object> {
+    return unsafe {
+        objc.get_object(receiver, selector)
+    }
+}
+
+// Retain an element of a Metal descriptor array such as colorAttachments.
+fn element(receiver: objc.Id, array_selector: objc.Id, index: usize) -> objc.Object!Error {
+    unsafe {
+        pool := objc.AutoreleasePool.new()
+        array := m_p(receiver, array_selector)
+        if ptr.is_null(array) {
+            return err(Error.Unsupported)
+        }
+        item := objc.Object.retain(m_p_u(array, sel(ptr.from_mut(&mut S_OBJECT_AT_INDEXED_SUBSCRIPT), b"objectAtIndexedSubscript:\0"), index))
+        core.drop(pool)
+        match item {
+            some(object) => {
+                return ok(object)
+            }
+            none => {
+                return err(Error.InvalidInput)
+            }
+        }
+    }
+}
+
+fn string_of(object: Option<objc.Object>) -> Option<objc.NSString> {
+    match object {
+        some(value) => {
+            return some(unsafe {
+                objc.NSString.from_object(value)
+            })
+        }
+        none => {
+            return none
+        }
+    }
+}
+
+fn set_string(receiver: objc.Id, selector: objc.Id, text: &str) {
+    if let some(string) = objc.NSString.new(text) {
+        unsafe {
+            m_v_p(receiver, selector, string.as_object().as_ptr())
+        }
+    }
+}
+
+fn set_label(receiver: objc.Id, text: &str) {
+    set_string(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_LABEL)
+    }, b"setLabel:\0"), text)
+}
+
+fn label(receiver: objc.Id) -> Option<objc.NSString> {
+    return string_of(get(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_LABEL)
+    }, b"label\0")))
+}
+
+fn push_debug_group(receiver: objc.Id, text: &str) {
+    set_string(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_PUSH_DEBUG_GROUP)
+    }, b"pushDebugGroup:\0"), text)
+}
+
+fn pop_debug_group(receiver: objc.Id) {
+    unsafe {
+        m_v(receiver, sel(ptr.from_mut(&mut S_POP_DEBUG_GROUP), b"popDebugGroup\0"))
+    }
+}
+
+fn insert_debug_signpost(receiver: objc.Id, text: &str) {
+    set_string(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_INSERT_DEBUG_SIGNPOST)
+    }, b"insertDebugSignpost:\0"), text)
+}
+
+fn end_encoding(receiver: objc.Id) {
+    pool := objc.AutoreleasePool.new()
+    unsafe {
+        m_v(receiver, sel(ptr.from_mut(&mut S_END_ENCODING), b"endEncoding\0"))
+    }
+    core.drop(pool)
+}
+
+fn get_usize(receiver: objc.Id, selector: objc.Id) -> usize {
+    return unsafe {
+        m_u(receiver, selector)
+    }
+}
+
+fn get_bool(receiver: objc.Id, selector: objc.Id) -> bool {
+    return unsafe {
+        m_b(receiver, selector)
+    }
+}
+
+fn set_usize(receiver: objc.Id, selector: objc.Id, value: usize) {
+    unsafe {
+        m_v_u(receiver, selector, value)
+    }
+}
+
+fn set_bool(receiver: objc.Id, selector: objc.Id, value: bool) {
+    unsafe {
+        m_v_b(receiver, selector, value)
+    }
+}
+
+fn set_object(receiver: objc.Id, selector: objc.Id, value: objc.Id) {
+    unsafe {
+        m_v_p(receiver, selector, value)
+    }
+}
+
+fn check_buffer_index(index: usize) {
+    core.assert(index < MAX_BUFFER_BINDINGS)
+}
+
+fn check_texture_index(index: usize) {
+    core.assert(index < MAX_TEXTURE_BINDINGS)
+}
+
+fn check_sampler_index(index: usize) {
+    core.assert(index < MAX_SAMPLER_BINDINGS)
+}
+
+// Whether [offset, offset + length) lies within `size` bytes.
+fn fits(offset: usize, length: usize, size: usize) -> bool {
+    return length <= size && offset <= size - length
+}
+
+// RTLD_DEFAULT on Apple systems.
+const DEFAULT_HANDLE: usize = 0xfffffffffffffffe
+
+static mut STRET_STATE: usize = 0
+
+// Send a message returning a Size. On x86-64 a 24-byte result needs
+// objc_msgSend_stret; arm64 has only objc_msgSend, which handles it.
+fn send_size(receiver: objc.Id, selector: objc.Id) -> Size {
+    unsafe {
+        state := mem.atomic_load(ptr.from_mut(&mut STRET_STATE), 0)
+        if state == 0 {
+            found := dlsym(DEFAULT_HANDLE as *mut u8, ptr.as_ptr(b"objc_msgSend_stret\0")) as usize
+            // 1 records that the symbol does not exist.
+            state = 1
+            if found != 0 {
+                state = found
+            }
+            mem.atomic_store(ptr.from_mut(&mut STRET_STATE), state, 0)
+        }
+        if state != 1 {
+            stret := state as extern "C" fn(*mut u8, *mut u8) -> Size
+            return stret(receiver, selector)
+        }
+        return m_S(receiver, selector)
+    }
+}
+
+static mut S_NAME: usize = 0
+static mut S_REGISTRY_ID: usize = 0
+static mut S_MAX_BUFFER_LENGTH: usize = 0
+static mut S_MAX_THREADGROUP_MEMORY_LENGTH: usize = 0
+static mut S_MAX_THREADS_PER_THREADGROUP: usize = 0
+static mut S_RECOMMENDED_MAX_WORKING_SET_SIZE: usize = 0
+static mut S_CURRENT_ALLOCATED_SIZE: usize = 0
+static mut S_HAS_UNIFIED_MEMORY: usize = 0
+static mut S_IS_LOW_POWER: usize = 0
+static mut S_IS_HEADLESS: usize = 0
+static mut S_IS_REMOVABLE: usize = 0
+static mut S_SUPPORTS_FAMILY: usize = 0
+static mut S_SUPPORTS_TEXTURE_SAMPLE_COUNT: usize = 0
+static mut S_MINIMUM_LINEAR_TEXTURE_ALIGNMENT: usize = 0
+static mut S_NEW_COMMAND_QUEUE: usize = 0
+static mut S_NEW_COMMAND_QUEUE_WITH_MAX: usize = 0
+static mut S_NEW_BUFFER_WITH_LENGTH: usize = 0
+static mut S_NEW_BUFFER_WITH_BYTES: usize = 0
+static mut S_NEW_TEXTURE_WITH_DESCRIPTOR: usize = 0
+static mut S_NEW_SAMPLER_STATE: usize = 0
+static mut S_NEW_DEPTH_STENCIL_STATE: usize = 0
+static mut S_NEW_LIBRARY_WITH_SOURCE: usize = 0
+static mut S_NEW_LIBRARY_WITH_DATA: usize = 0
+static mut S_NEW_COMPUTE_PIPELINE_STATE: usize = 0
+static mut S_NEW_RENDER_PIPELINE_STATE: usize = 0
+static mut S_NEW_FENCE: usize = 0
+static mut S_NEW_EVENT: usize = 0
+static mut S_NEW_SHARED_EVENT: usize = 0
+
+// MTLDevice: one GPU. It creates every other object.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct Device {
+    object: objc.Object
+
+    // The GPU macOS prefers for this process. Err(NoDevice) when there is
+    // none, as in a virtual machine without GPU support.
+    pub fn system_default() -> Device!Error {
+        pool := objc.AutoreleasePool.new()
+        owned := unsafe {
+            objc.Object.from_retained(MTLCreateSystemDefaultDevice())
+        }
+        match owned {
+            some(object) => {
+                return ok(Device { object: object })
+            }
+            none => {
+                return err(Error.NoDevice)
+            }
+        }
+    }
+
+    // Every GPU in the system, including external and headless ones.
+    pub fn all() -> DeviceList {
+        pool := objc.AutoreleasePool.new()
+        owned := unsafe {
+            objc.Object.from_retained(MTLCopyAllDevices())
+        }
+        match owned {
+            some(object) => {
+                return DeviceList { array: some(unsafe {
+                    objc.NSArray.from_object(object)
+                }) }
+            }
+            none => {
+                return DeviceList { array: none }
+            }
+        }
+    }
+
+    // Safety: `object` is an MTLDevice.
+    pub unsafe fn from_object(object: objc.Object) -> Device {
+        return Device { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> Device {
+        return Device { object: self.object.clone() }
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    // The GPU's name, such as "Apple M4".
+    pub fn name(&self) -> Option<objc.NSString> {
+        return string_of(get(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_NAME)
+        }, b"name\0")))
+    }
+
+    // An identifier that stays the same for this GPU across processes.
+    pub fn registry_id(&self) -> u64 {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_REGISTRY_ID)
+        }, b"registryID\0")) as u64
+    }
+
+    // The largest buffer new_buffer can create, in bytes.
+    pub fn max_buffer_length(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_MAX_BUFFER_LENGTH)
+        }, b"maxBufferLength\0"))
+    }
+
+    // The threadgroup memory one compute threadgroup may use, in bytes.
+    pub fn max_threadgroup_memory_length(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_MAX_THREADGROUP_MEMORY_LENGTH)
+        }, b"maxThreadgroupMemoryLength\0"))
+    }
+
+    // The most threads in each dimension of one threadgroup.
+    pub fn max_threads_per_threadgroup(&self) -> Size {
+        return send_size(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_MAX_THREADS_PER_THREADGROUP)
+        }, b"maxThreadsPerThreadgroup\0"))
+    }
+
+    // How much memory the GPU can use without hurting performance, in bytes.
+    pub fn recommended_max_working_set_size(&self) -> u64 {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_RECOMMENDED_MAX_WORKING_SET_SIZE)
+        }, b"recommendedMaxWorkingSetSize\0")) as u64
+    }
+
+    // The memory this process's Metal objects currently use, in bytes.
+    pub fn current_allocated_size(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_CURRENT_ALLOCATED_SIZE)
+        }, b"currentAllocatedSize\0"))
+    }
+
+    // Whether the CPU and GPU share memory, as on Apple silicon.
+    pub fn has_unified_memory(&self) -> bool {
+        return get_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_HAS_UNIFIED_MEMORY)
+        }, b"hasUnifiedMemory\0"))
+    }
+
+    pub fn is_low_power(&self) -> bool {
+        return get_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_IS_LOW_POWER)
+        }, b"isLowPower\0"))
+    }
+
+    pub fn is_headless(&self) -> bool {
+        return get_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_IS_HEADLESS)
+        }, b"isHeadless\0"))
+    }
+
+    pub fn is_removable(&self) -> bool {
+        return get_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_IS_REMOVABLE)
+        }, b"isRemovable\0"))
+    }
+
+    // Whether the GPU implements a feature family such as GPU_FAMILY_APPLE7.
+    pub fn supports_family(&self, family: GpuFamily) -> bool {
+        return unsafe {
+            m_b_i(self.id(), sel(ptr.from_mut(&mut S_SUPPORTS_FAMILY), b"supportsFamily:\0"), family as isize)
+        }
+    }
+
+    // Whether render targets may have this many samples per pixel.
+    pub fn supports_texture_sample_count(&self, count: usize) -> bool {
+        return unsafe {
+            m_b_u(self.id(), sel(ptr.from_mut(&mut S_SUPPORTS_TEXTURE_SAMPLE_COUNT), b"supportsTextureSampleCount:\0"), count)
+        }
+    }
+
+    // The alignment, in bytes, of a texture's rows stored in a buffer.
+    pub fn minimum_linear_texture_alignment(&self, format: PixelFormat) -> usize {
+        return unsafe {
+            m_u_u(self.id(), sel(ptr.from_mut(&mut S_MINIMUM_LINEAR_TEXTURE_ALIGNMENT), b"minimumLinearTextureAlignmentForPixelFormat:\0"), format)
+        }
+    }
+
+    pub fn new_command_queue(&self) -> CommandQueue!Error {
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p(self.id(), sel(ptr.from_mut(&mut S_NEW_COMMAND_QUEUE), b"newCommandQueue\0"))
+        })?
+        return ok(CommandQueue { object: object })
+    }
+
+    // A queue that allows at most `count` uncompleted command buffers;
+    // command_buffer() waits while that many are in flight.
+    pub fn new_command_queue_with_max_command_buffer_count(&self, count: usize) -> CommandQueue!Error {
+        if count == 0 {
+            return err(Error.InvalidInput)
+        }
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p_u(self.id(), sel(ptr.from_mut(&mut S_NEW_COMMAND_QUEUE_WITH_MAX), b"newCommandQueueWithMaxCommandBufferCount:\0"), count)
+        })?
+        return ok(CommandQueue { object: object })
+    }
+
+    // A zero-filled buffer of `length` bytes. RESOURCE_STORAGE_MODE_SHARED
+    // makes it CPU-visible; RESOURCE_STORAGE_MODE_PRIVATE keeps it on the GPU.
+    pub fn new_buffer(&self, length: usize, options: ResourceOptions) -> Buffer!Error {
+        if length == 0 {
+            return err(Error.InvalidInput)
+        }
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p_uu(self.id(), sel(ptr.from_mut(&mut S_NEW_BUFFER_WITH_LENGTH), b"newBufferWithLength:options:\0"), length, options)
+        })?
+        return ok(Buffer { object: object })
+    }
+
+    // A buffer holding a copy of `bytes`.
+    pub fn new_buffer_with_bytes(&self, bytes: &[u8], options: ResourceOptions) -> Buffer!Error {
+        if bytes.len == 0 {
+            return err(Error.InvalidInput)
+        }
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p_quu(self.id(), sel(ptr.from_mut(&mut S_NEW_BUFFER_WITH_BYTES), b"newBufferWithBytes:length:options:\0"), ptr.as_ptr(bytes), bytes.len, options)
+        })?
+        return ok(Buffer { object: object })
+    }
+
+    pub fn new_texture(&self, descriptor: &TextureDescriptor) -> Texture!Error {
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p_p(self.id(), sel(ptr.from_mut(&mut S_NEW_TEXTURE_WITH_DESCRIPTOR), b"newTextureWithDescriptor:\0"), descriptor.object.as_ptr())
+        })?
+        return ok(Texture { object: object })
+    }
+
+    pub fn new_sampler_state(&self, descriptor: &SamplerDescriptor) -> SamplerState!Error {
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p_p(self.id(), sel(ptr.from_mut(&mut S_NEW_SAMPLER_STATE), b"newSamplerStateWithDescriptor:\0"), descriptor.object.as_ptr())
+        })?
+        return ok(SamplerState { object: object })
+    }
+
+    pub fn new_depth_stencil_state(&self, descriptor: &DepthStencilDescriptor) -> DepthStencilState!Error {
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p_p(self.id(), sel(ptr.from_mut(&mut S_NEW_DEPTH_STENCIL_STATE), b"newDepthStencilStateWithDescriptor:\0"), descriptor.object.as_ptr())
+        })?
+        return ok(DepthStencilState { object: object })
+    }
+
+    // Compile Metal Shading Language source. A compile error is
+    // Err(Failed(error)) with the compiler's log as error.message().
+    pub fn new_library_with_source(&self, source: &str, options: &CompileOptions) -> Library!Error {
+        let some(text) = objc.NSString.new(source) else {
+            return err(Error.OutOfMemory)
+        }
+        pool := objc.AutoreleasePool.new()
+        error := null()
+        id := unsafe {
+            m_p_ppp(self.id(), sel(ptr.from_mut(&mut S_NEW_LIBRARY_WITH_SOURCE), b"newLibraryWithSource:options:error:\0"), text.as_object().as_ptr(), options.object.as_ptr(), ptr.from_mut(&mut error))
+        }
+        result := adopt_or_error(id, error)
+        core.drop(pool)
+        object := result?
+        return ok(Library { object: object })
+    }
+
+    // Load a compiled .metallib, such as the output of `xcrun metal`.
+    pub fn new_library_with_data(&self, bytes: &[u8]) -> Library!Error {
+        if bytes.len == 0 {
+            return err(Error.InvalidInput)
+        }
+        // A null destructor makes dispatch copy the bytes.
+        data := unsafe {
+            dispatch_data_create(ptr.as_ptr(bytes), bytes.len, null(), null())
+        }
+        if ptr.is_null(data) {
+            return err(Error.OutOfMemory)
+        }
+        pool := objc.AutoreleasePool.new()
+        error := null()
+        id := unsafe {
+            m_p_pp(self.id(), sel(ptr.from_mut(&mut S_NEW_LIBRARY_WITH_DATA), b"newLibraryWithData:error:\0"), data, ptr.from_mut(&mut error))
+        }
+        result := adopt_or_error(id, error)
+        core.drop(pool)
+        unsafe {
+            dispatch_release(data)
+        }
+        object := result?
+        return ok(Library { object: object })
+    }
+
+    pub fn new_compute_pipeline_state(&self, function: &Function) -> ComputePipelineState!Error {
+        pool := objc.AutoreleasePool.new()
+        error := null()
+        id := unsafe {
+            m_p_pp(self.id(), sel(ptr.from_mut(&mut S_NEW_COMPUTE_PIPELINE_STATE), b"newComputePipelineStateWithFunction:error:\0"), function.object.as_ptr(), ptr.from_mut(&mut error))
+        }
+        result := adopt_or_error(id, error)
+        core.drop(pool)
+        object := result?
+        return ok(ComputePipelineState { object: object })
+    }
+
+    pub fn new_render_pipeline_state(&self, descriptor: &RenderPipelineDescriptor) -> RenderPipelineState!Error {
+        pool := objc.AutoreleasePool.new()
+        error := null()
+        id := unsafe {
+            m_p_pp(self.id(), sel(ptr.from_mut(&mut S_NEW_RENDER_PIPELINE_STATE), b"newRenderPipelineStateWithDescriptor:error:\0"), descriptor.object.as_ptr(), ptr.from_mut(&mut error))
+        }
+        result := adopt_or_error(id, error)
+        core.drop(pool)
+        object := result?
+        return ok(RenderPipelineState { object: object })
+    }
+
+    pub fn new_fence(&self) -> Fence!Error {
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p(self.id(), sel(ptr.from_mut(&mut S_NEW_FENCE), b"newFence\0"))
+        })?
+        return ok(Fence { object: object })
+    }
+
+    // An event for ordering command buffers on this device.
+    pub fn new_event(&self) -> Event!Error {
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p(self.id(), sel(ptr.from_mut(&mut S_NEW_EVENT), b"newEvent\0"))
+        })?
+        return ok(Event { object: object })
+    }
+
+    // An event the CPU can also read and signal.
+    pub fn new_shared_event(&self) -> SharedEvent!Error {
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p(self.id(), sel(ptr.from_mut(&mut S_NEW_SHARED_EVENT), b"newSharedEvent\0"))
+        })?
+        return ok(SharedEvent { object: object })
+    }
+}
+
+// The GPUs Device.all() found.
+pub struct DeviceList {
+    array: Option<objc.NSArray>
+
+    pub fn len(&self) -> usize {
+        match &self.array {
+            some(array) => {
+                return array.len()
+            }
+            none => {
+                return 0
+            }
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<Device> {
+        match &self.array {
+            some(array) => {
+                match array.get(index) {
+                    some(object) => {
+                        return some(Device { object: object })
+                    }
+                    none => {
+                        return none
+                    }
+                }
+            }
+            none => {
+                return none
+            }
+        }
+    }
+}
+
+static mut S_COMMAND_BUFFER: usize = 0
+static mut S_COMMAND_BUFFER_UNRETAINED: usize = 0
+
+// MTLCommandQueue: submits command buffers to the GPU in order.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct CommandQueue {
+    object: objc.Object
+
+    // Safety: `object` is an MTLCommandQueue.
+    pub unsafe fn from_object(object: objc.Object) -> CommandQueue {
+        return CommandQueue { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> CommandQueue {
+        return CommandQueue { object: self.object.clone() }
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.object.as_ptr(), text)
+    }
+
+    pub fn label(&self) -> Option<objc.NSString> {
+        return label(self.object.as_ptr())
+    }
+
+    // A new command buffer that retains every resource it uses until the
+    // GPU has finished with it.
+    pub fn command_buffer(&self) -> CommandBuffer!Error {
+        match get(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_COMMAND_BUFFER)
+        }, b"commandBuffer\0")) {
+            some(object) => {
+                return ok(CommandBuffer { object: object })
+            }
+            none => {
+                return err(Error.OutOfMemory)
+            }
+        }
+    }
+
+    // A command buffer that does not retain the resources it uses: the
+    // program must keep them alive until the buffer completes.
+    pub fn command_buffer_with_unretained_references(&self) -> CommandBuffer!Error {
+        match get(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_COMMAND_BUFFER_UNRETAINED)
+        }, b"commandBufferWithUnretainedReferences\0")) {
+            some(object) => {
+                return ok(CommandBuffer { object: object })
+            }
+            none => {
+                return err(Error.OutOfMemory)
+            }
+        }
+    }
+}
+
+static mut S_COMPUTE_COMMAND_ENCODER: usize = 0
+static mut S_RENDER_COMMAND_ENCODER: usize = 0
+static mut S_BLIT_COMMAND_ENCODER: usize = 0
+static mut S_COMMIT: usize = 0
+static mut S_ENQUEUE: usize = 0
+static mut S_WAIT_UNTIL_SCHEDULED: usize = 0
+static mut S_WAIT_UNTIL_COMPLETED: usize = 0
+static mut S_STATUS: usize = 0
+static mut S_ERROR: usize = 0
+static mut S_PRESENT_DRAWABLE: usize = 0
+static mut S_ENCODE_SIGNAL_EVENT: usize = 0
+static mut S_ENCODE_WAIT_FOR_EVENT: usize = 0
+static mut S_GPU_START_TIME: usize = 0
+static mut S_GPU_END_TIME: usize = 0
+
+// MTLCommandBuffer: commands recorded by encoders, then committed to the
+// queue. One encoder at a time may record into it.
+@unsafe_send
+pub unsafe struct CommandBuffer {
+    object: objc.Object
+
+    // Safety: `object` is an MTLCommandBuffer.
+    pub unsafe fn from_object(object: objc.Object) -> CommandBuffer {
+        return CommandBuffer { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn label(&self) -> Option<objc.NSString> {
+        return label(self.id())
+    }
+
+    pub fn push_debug_group(&self, text: &str) {
+        push_debug_group(self.id(), text)
+    }
+
+    pub fn pop_debug_group(&self) {
+        pop_debug_group(self.id())
+    }
+
+    pub fn compute_command_encoder(&self) -> ComputeCommandEncoder!Error {
+        match get(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_COMPUTE_COMMAND_ENCODER)
+        }, b"computeCommandEncoder\0")) {
+            some(object) => {
+                return ok(ComputeCommandEncoder { object: object })
+            }
+            none => {
+                return err(Error.OutOfMemory)
+            }
+        }
+    }
+
+    pub fn render_command_encoder(&self, descriptor: &RenderPassDescriptor) -> RenderCommandEncoder!Error {
+        unsafe {
+            pool := objc.AutoreleasePool.new()
+            id := m_p_p(self.id(), sel(ptr.from_mut(&mut S_RENDER_COMMAND_ENCODER), b"renderCommandEncoderWithDescriptor:\0"), descriptor.object.as_ptr())
+            object := objc.Object.retain(id)
+            core.drop(pool)
+            match object {
+                some(value) => {
+                    return ok(RenderCommandEncoder { object: value })
+                }
+                none => {
+                    return err(Error.OutOfMemory)
+                }
+            }
+        }
+    }
+
+    pub fn blit_command_encoder(&self) -> BlitCommandEncoder!Error {
+        match get(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_BLIT_COMMAND_ENCODER)
+        }, b"blitCommandEncoder\0")) {
+            some(object) => {
+                return ok(BlitCommandEncoder { object: object })
+            }
+            none => {
+                return err(Error.OutOfMemory)
+            }
+        }
+    }
+
+    // Reserve this buffer's place in the queue before committing it.
+    pub fn enqueue(&self) {
+        unsafe {
+            m_v(self.id(), sel(ptr.from_mut(&mut S_ENQUEUE), b"enqueue\0"))
+        }
+    }
+
+    // Submit the recorded commands. Nothing more can be encoded afterwards.
+    pub fn commit(&self) {
+        unsafe {
+            m_v(self.id(), sel(ptr.from_mut(&mut S_COMMIT), b"commit\0"))
+        }
+    }
+
+    pub fn wait_until_scheduled(&self) {
+        unsafe {
+            m_v(self.id(), sel(ptr.from_mut(&mut S_WAIT_UNTIL_SCHEDULED), b"waitUntilScheduled\0"))
+        }
+    }
+
+    // Block until the GPU has finished, then report how it went: Err(Failed)
+    // carries Metal's description of a failed command buffer.
+    pub fn wait_until_completed(&self) -> void!Error {
+        unsafe {
+            m_v(self.id(), sel(ptr.from_mut(&mut S_WAIT_UNTIL_COMPLETED), b"waitUntilCompleted\0"))
+        }
+        if self.status() == COMMAND_BUFFER_STATUS_ERROR {
+            match self.error() {
+                some(error) => {
+                    return err(Error.Failed(error))
+                }
+                none => {
+                    return err(Error.OutOfMemory)
+                }
+            }
+        }
+        return ok()
+    }
+
+    pub fn status(&self) -> CommandBufferStatus {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_STATUS)
+        }, b"status\0"))
+    }
+
+    // Why the command buffer failed, once its status is
+    // COMMAND_BUFFER_STATUS_ERROR.
+    pub fn error(&self) -> Option<objc.NSError> {
+        match get(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_ERROR)
+        }, b"error\0")) {
+            some(object) => {
+                return some(unsafe {
+                    objc.NSError.from_object(object)
+                })
+            }
+            none => {
+                return none
+            }
+        }
+    }
+
+    // Show the drawable as soon as this command buffer has been scheduled.
+    pub fn present_drawable(&self, drawable: &Drawable) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_PRESENT_DRAWABLE)
+        }, b"presentDrawable:\0"), drawable.object.as_ptr())
+    }
+
+    // Set the event to `value` once the commands before this point finish.
+    pub fn encode_signal_event(&self, event: &Event, value: u64) {
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_ENCODE_SIGNAL_EVENT), b"encodeSignalEvent:value:\0"), event.object.as_ptr(), value as usize)
+        }
+    }
+
+    // Hold later commands until the event reaches `value`.
+    pub fn encode_wait_for_event(&self, event: &Event, value: u64) {
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_ENCODE_WAIT_FOR_EVENT), b"encodeWaitForEvent:value:\0"), event.object.as_ptr(), value as usize)
+        }
+    }
+
+    pub fn encode_signal_shared_event(&self, event: &SharedEvent, value: u64) {
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_ENCODE_SIGNAL_EVENT), b"encodeSignalEvent:value:\0"), event.object.as_ptr(), value as usize)
+        }
+    }
+
+    pub fn encode_wait_for_shared_event(&self, event: &SharedEvent, value: u64) {
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_ENCODE_WAIT_FOR_EVENT), b"encodeWaitForEvent:value:\0"), event.object.as_ptr(), value as usize)
+        }
+    }
+
+    // When the GPU started and finished this buffer, in seconds on the
+    // host's mach_absolute_time clock; 0 until it completes.
+    pub fn gpu_start_time(&self) -> f64 {
+        return unsafe {
+            m_d(self.id(), sel(ptr.from_mut(&mut S_GPU_START_TIME), b"GPUStartTime\0"))
+        }
+    }
+
+    pub fn gpu_end_time(&self) -> f64 {
+        return unsafe {
+            m_d(self.id(), sel(ptr.from_mut(&mut S_GPU_END_TIME), b"GPUEndTime\0"))
+        }
+    }
+}
+
+static mut S_SET_COMPUTE_PIPELINE_STATE: usize = 0
+static mut S_SET_BUFFER: usize = 0
+static mut S_SET_BUFFER_OFFSET: usize = 0
+static mut S_SET_BYTES: usize = 0
+static mut S_SET_TEXTURE: usize = 0
+static mut S_SET_SAMPLER_STATE: usize = 0
+static mut S_SET_THREADGROUP_MEMORY_LENGTH: usize = 0
+static mut S_DISPATCH_THREADGROUPS: usize = 0
+static mut S_DISPATCH_THREADS: usize = 0
+static mut S_DISPATCH_THREADGROUPS_INDIRECT: usize = 0
+static mut S_USE_RESOURCE: usize = 0
+static mut S_USE_RESOURCE_STAGES: usize = 0
+static mut S_MEMORY_BARRIER: usize = 0
+static mut S_MEMORY_BARRIER_STAGES: usize = 0
+static mut S_UPDATE_FENCE: usize = 0
+static mut S_WAIT_FOR_FENCE: usize = 0
+static mut S_UPDATE_FENCE_STAGES: usize = 0
+static mut S_WAIT_FOR_FENCE_STAGES: usize = 0
+
+// MTLComputeCommandEncoder: records compute dispatches. Binding indices
+// above the MAX_*_BINDINGS limits panic.
+pub struct ComputeCommandEncoder {
+    object: objc.Object
+
+    // Safety: `object` is an MTLComputeCommandEncoder.
+    pub unsafe fn from_object(object: objc.Object) -> ComputeCommandEncoder {
+        return ComputeCommandEncoder { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn push_debug_group(&self, text: &str) {
+        push_debug_group(self.id(), text)
+    }
+
+    pub fn pop_debug_group(&self) {
+        pop_debug_group(self.id())
+    }
+
+    pub fn insert_debug_signpost(&self, text: &str) {
+        insert_debug_signpost(self.id(), text)
+    }
+
+    pub fn set_compute_pipeline_state(&self, state: &ComputePipelineState) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_COMPUTE_PIPELINE_STATE)
+        }, b"setComputePipelineState:\0"), state.object.as_ptr())
+    }
+
+    // Bind `buffer`, starting `offset` bytes in, to [[buffer(index)]].
+    pub fn set_buffer(&self, buffer: &Buffer, offset: usize, index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_puu(self.id(), sel(ptr.from_mut(&mut S_SET_BUFFER), b"setBuffer:offset:atIndex:\0"), buffer.object.as_ptr(), offset, index)
+        }
+    }
+
+    // Move the offset of the buffer already bound at `index`.
+    pub fn set_buffer_offset(&self, offset: usize, index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_uu(self.id(), sel(ptr.from_mut(&mut S_SET_BUFFER_OFFSET), b"setBufferOffset:atIndex:\0"), offset, index)
+        }
+    }
+
+    // Copy a few bytes of constants (Metal suggests under 4 KiB) into
+    // [[buffer(index)]] without creating a buffer.
+    pub fn set_bytes(&self, bytes: &[u8], index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_quu(self.id(), sel(ptr.from_mut(&mut S_SET_BYTES), b"setBytes:length:atIndex:\0"), ptr.as_ptr(bytes), bytes.len, index)
+        }
+    }
+
+    pub fn set_texture(&self, texture: &Texture, index: usize) {
+        check_texture_index(index)
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_SET_TEXTURE), b"setTexture:atIndex:\0"), texture.object.as_ptr(), index)
+        }
+    }
+
+    pub fn set_sampler_state(&self, sampler: &SamplerState, index: usize) {
+        check_sampler_index(index)
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_SET_SAMPLER_STATE), b"setSamplerState:atIndex:\0"), sampler.object.as_ptr(), index)
+        }
+    }
+
+    // Reserve `length` bytes (a multiple of 16) for [[threadgroup(index)]].
+    pub fn set_threadgroup_memory_length(&self, length: usize, index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_uu(self.id(), sel(ptr.from_mut(&mut S_SET_THREADGROUP_MEMORY_LENGTH), b"setThreadgroupMemoryLength:atIndex:\0"), length, index)
+        }
+    }
+
+    // Run `threadgroups` groups of `threads_per_threadgroup` threads each.
+    pub fn dispatch_threadgroups(&self, threadgroups: Size, threads_per_threadgroup: Size) {
+        unsafe {
+            m_v_SS(self.id(), sel(ptr.from_mut(&mut S_DISPATCH_THREADGROUPS), b"dispatchThreadgroups:threadsPerThreadgroup:\0"), threadgroups, threads_per_threadgroup)
+        }
+    }
+
+    // Run exactly `threads` threads, which need not be a multiple of the
+    // threadgroup size (GPU_FAMILY_APPLE4 or GPU_FAMILY_MAC2 and later).
+    pub fn dispatch_threads(&self, threads: Size, threads_per_threadgroup: Size) {
+        unsafe {
+            m_v_SS(self.id(), sel(ptr.from_mut(&mut S_DISPATCH_THREADS), b"dispatchThreads:threadsPerThreadgroup:\0"), threads, threads_per_threadgroup)
+        }
+    }
+
+    // Read the threadgroup counts as three u32 values from the buffer.
+    pub fn dispatch_threadgroups_indirect(&self, buffer: &Buffer, offset: usize, threads_per_threadgroup: Size) {
+        unsafe {
+            m_v_puS(self.id(), sel(ptr.from_mut(&mut S_DISPATCH_THREADGROUPS_INDIRECT), b"dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:\0"), buffer.object.as_ptr(), offset, threads_per_threadgroup)
+        }
+    }
+
+    // Make a buffer reached only through an argument buffer resident.
+    pub fn use_buffer(&self, buffer: &Buffer, usage: ResourceUsage) {
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_USE_RESOURCE), b"useResource:usage:\0"), buffer.object.as_ptr(), usage)
+        }
+    }
+
+    pub fn use_texture(&self, texture: &Texture, usage: ResourceUsage) {
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_USE_RESOURCE), b"useResource:usage:\0"), texture.object.as_ptr(), usage)
+        }
+    }
+
+    // Order earlier dispatches' writes before later dispatches' accesses.
+    pub fn memory_barrier(&self, scope: BarrierScope) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_MEMORY_BARRIER)
+        }, b"memoryBarrierWithScope:\0"), scope)
+    }
+
+    pub fn update_fence(&self, fence: &Fence) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_UPDATE_FENCE)
+        }, b"updateFence:\0"), fence.object.as_ptr())
+    }
+
+    pub fn wait_for_fence(&self, fence: &Fence) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_WAIT_FOR_FENCE)
+        }, b"waitForFence:\0"), fence.object.as_ptr())
+    }
+
+    // Finish recording. The encoder cannot be used again.
+    pub fn end_encoding(self) {
+        end_encoding(self.id())
+    }
+}
+
+static mut S_SET_RENDER_PIPELINE_STATE: usize = 0
+static mut S_SET_VERTEX_BUFFER: usize = 0
+static mut S_SET_VERTEX_BUFFER_OFFSET: usize = 0
+static mut S_SET_VERTEX_BYTES: usize = 0
+static mut S_SET_VERTEX_TEXTURE: usize = 0
+static mut S_SET_VERTEX_SAMPLER_STATE: usize = 0
+static mut S_SET_FRAGMENT_BUFFER: usize = 0
+static mut S_SET_FRAGMENT_BUFFER_OFFSET: usize = 0
+static mut S_SET_FRAGMENT_BYTES: usize = 0
+static mut S_SET_FRAGMENT_TEXTURE: usize = 0
+static mut S_SET_FRAGMENT_SAMPLER_STATE: usize = 0
+static mut S_SET_VIEWPORT: usize = 0
+static mut S_SET_SCISSOR_RECT: usize = 0
+static mut S_SET_TRIANGLE_FILL_MODE: usize = 0
+static mut S_SET_CULL_MODE: usize = 0
+static mut S_SET_FRONT_FACING_WINDING: usize = 0
+static mut S_SET_DEPTH_CLIP_MODE: usize = 0
+static mut S_SET_DEPTH_STENCIL_STATE: usize = 0
+static mut S_SET_STENCIL_REFERENCE_VALUE: usize = 0
+static mut S_SET_STENCIL_FRONT_BACK_REFERENCE: usize = 0
+static mut S_SET_BLEND_COLOR: usize = 0
+static mut S_SET_DEPTH_BIAS: usize = 0
+static mut S_DRAW_PRIMITIVES: usize = 0
+static mut S_DRAW_PRIMITIVES_INSTANCED: usize = 0
+static mut S_DRAW_INDEXED_PRIMITIVES: usize = 0
+static mut S_DRAW_PRIMITIVES_INDIRECT: usize = 0
+static mut S_DRAW_INDEXED_PRIMITIVES_INDIRECT: usize = 0
+
+// MTLRenderCommandEncoder: records draws into one render pass. Binding
+// indices above the MAX_*_BINDINGS limits panic.
+pub struct RenderCommandEncoder {
+    object: objc.Object
+
+    // Safety: `object` is an MTLRenderCommandEncoder.
+    pub unsafe fn from_object(object: objc.Object) -> RenderCommandEncoder {
+        return RenderCommandEncoder { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn push_debug_group(&self, text: &str) {
+        push_debug_group(self.id(), text)
+    }
+
+    pub fn pop_debug_group(&self) {
+        pop_debug_group(self.id())
+    }
+
+    pub fn insert_debug_signpost(&self, text: &str) {
+        insert_debug_signpost(self.id(), text)
+    }
+
+    pub fn set_render_pipeline_state(&self, state: &RenderPipelineState) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_RENDER_PIPELINE_STATE)
+        }, b"setRenderPipelineState:\0"), state.object.as_ptr())
+    }
+
+    pub fn set_vertex_buffer(&self, buffer: &Buffer, offset: usize, index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_puu(self.id(), sel(ptr.from_mut(&mut S_SET_VERTEX_BUFFER), b"setVertexBuffer:offset:atIndex:\0"), buffer.object.as_ptr(), offset, index)
+        }
+    }
+
+    pub fn set_vertex_buffer_offset(&self, offset: usize, index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_uu(self.id(), sel(ptr.from_mut(&mut S_SET_VERTEX_BUFFER_OFFSET), b"setVertexBufferOffset:atIndex:\0"), offset, index)
+        }
+    }
+
+    pub fn set_vertex_bytes(&self, bytes: &[u8], index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_quu(self.id(), sel(ptr.from_mut(&mut S_SET_VERTEX_BYTES), b"setVertexBytes:length:atIndex:\0"), ptr.as_ptr(bytes), bytes.len, index)
+        }
+    }
+
+    pub fn set_vertex_texture(&self, texture: &Texture, index: usize) {
+        check_texture_index(index)
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_SET_VERTEX_TEXTURE), b"setVertexTexture:atIndex:\0"), texture.object.as_ptr(), index)
+        }
+    }
+
+    pub fn set_vertex_sampler_state(&self, sampler: &SamplerState, index: usize) {
+        check_sampler_index(index)
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_SET_VERTEX_SAMPLER_STATE), b"setVertexSamplerState:atIndex:\0"), sampler.object.as_ptr(), index)
+        }
+    }
+
+    pub fn set_fragment_buffer(&self, buffer: &Buffer, offset: usize, index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_puu(self.id(), sel(ptr.from_mut(&mut S_SET_FRAGMENT_BUFFER), b"setFragmentBuffer:offset:atIndex:\0"), buffer.object.as_ptr(), offset, index)
+        }
+    }
+
+    pub fn set_fragment_buffer_offset(&self, offset: usize, index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_uu(self.id(), sel(ptr.from_mut(&mut S_SET_FRAGMENT_BUFFER_OFFSET), b"setFragmentBufferOffset:atIndex:\0"), offset, index)
+        }
+    }
+
+    pub fn set_fragment_bytes(&self, bytes: &[u8], index: usize) {
+        check_buffer_index(index)
+        unsafe {
+            m_v_quu(self.id(), sel(ptr.from_mut(&mut S_SET_FRAGMENT_BYTES), b"setFragmentBytes:length:atIndex:\0"), ptr.as_ptr(bytes), bytes.len, index)
+        }
+    }
+
+    pub fn set_fragment_texture(&self, texture: &Texture, index: usize) {
+        check_texture_index(index)
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_SET_FRAGMENT_TEXTURE), b"setFragmentTexture:atIndex:\0"), texture.object.as_ptr(), index)
+        }
+    }
+
+    pub fn set_fragment_sampler_state(&self, sampler: &SamplerState, index: usize) {
+        check_sampler_index(index)
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_SET_FRAGMENT_SAMPLER_STATE), b"setFragmentSamplerState:atIndex:\0"), sampler.object.as_ptr(), index)
+        }
+    }
+
+    pub fn set_viewport(&self, viewport: Viewport) {
+        unsafe {
+            m_v_W(self.id(), sel(ptr.from_mut(&mut S_SET_VIEWPORT), b"setViewport:\0"), viewport)
+        }
+    }
+
+    // The rectangle must lie within the render targets.
+    pub fn set_scissor_rect(&self, rect: ScissorRect) {
+        unsafe {
+            m_v_X(self.id(), sel(ptr.from_mut(&mut S_SET_SCISSOR_RECT), b"setScissorRect:\0"), rect)
+        }
+    }
+
+    pub fn set_triangle_fill_mode(&self, mode: TriangleFillMode) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_TRIANGLE_FILL_MODE)
+        }, b"setTriangleFillMode:\0"), mode)
+    }
+
+    pub fn set_cull_mode(&self, mode: CullMode) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_CULL_MODE)
+        }, b"setCullMode:\0"), mode)
+    }
+
+    pub fn set_front_facing_winding(&self, winding: Winding) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_FRONT_FACING_WINDING)
+        }, b"setFrontFacingWinding:\0"), winding)
+    }
+
+    pub fn set_depth_clip_mode(&self, mode: DepthClipMode) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEPTH_CLIP_MODE)
+        }, b"setDepthClipMode:\0"), mode)
+    }
+
+    pub fn set_depth_stencil_state(&self, state: &DepthStencilState) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEPTH_STENCIL_STATE)
+        }, b"setDepthStencilState:\0"), state.object.as_ptr())
+    }
+
+    pub fn set_stencil_reference_value(&self, value: u32) {
+        unsafe {
+            m_v_w(self.id(), sel(ptr.from_mut(&mut S_SET_STENCIL_REFERENCE_VALUE), b"setStencilReferenceValue:\0"), value)
+        }
+    }
+
+    pub fn set_stencil_front_back_reference_value(&self, front: u32, back: u32) {
+        unsafe {
+            m_v_ww(self.id(), sel(ptr.from_mut(&mut S_SET_STENCIL_FRONT_BACK_REFERENCE), b"setStencilFrontReferenceValue:backReferenceValue:\0"), front, back)
+        }
+    }
+
+    // The constant color BLEND_FACTOR_BLEND_COLOR and friends use.
+    pub fn set_blend_color(&self, red: f32, green: f32, blue: f32, alpha: f32) {
+        unsafe {
+            m_v_ffff(self.id(), sel(ptr.from_mut(&mut S_SET_BLEND_COLOR), b"setBlendColorRed:green:blue:alpha:\0"), red, green, blue, alpha)
+        }
+    }
+
+    pub fn set_depth_bias(&self, bias: f32, slope_scale: f32, clamp: f32) {
+        unsafe {
+            m_v_fff(self.id(), sel(ptr.from_mut(&mut S_SET_DEPTH_BIAS), b"setDepthBias:slopeScale:clamp:\0"), bias, slope_scale, clamp)
+        }
+    }
+
+    pub fn draw_primitives(&self, primitive: PrimitiveType, vertex_start: usize, vertex_count: usize) {
+        unsafe {
+            m_v_uuu(self.id(), sel(ptr.from_mut(&mut S_DRAW_PRIMITIVES), b"drawPrimitives:vertexStart:vertexCount:\0"), primitive, vertex_start, vertex_count)
+        }
+    }
+
+    pub fn draw_primitives_instanced(&self, primitive: PrimitiveType, vertex_start: usize, vertex_count: usize, instance_count: usize, base_instance: usize) {
+        unsafe {
+            m_v_uuuuu(self.id(), sel(ptr.from_mut(&mut S_DRAW_PRIMITIVES_INSTANCED), b"drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:\0"), primitive, vertex_start, vertex_count, instance_count, base_instance)
+        }
+    }
+
+    // Draw `index_count` vertices whose indices start `index_offset` bytes
+    // into `index_buffer`; base_vertex is added to every index.
+    pub fn draw_indexed_primitives(&self, primitive: PrimitiveType, index_count: usize, index_type: IndexType, index_buffer: &Buffer, index_offset: usize, instance_count: usize, base_vertex: isize, base_instance: usize) {
+        unsafe {
+            m_v_uuupuuiu(self.id(), sel(ptr.from_mut(&mut S_DRAW_INDEXED_PRIMITIVES), b"drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:\0"), primitive, index_count, index_type, index_buffer.object.as_ptr(), index_offset, instance_count, base_vertex, base_instance)
+        }
+    }
+
+    // Read the draw's arguments (MTLDrawPrimitivesIndirectArguments) from
+    // the buffer.
+    pub fn draw_primitives_indirect(&self, primitive: PrimitiveType, indirect_buffer: &Buffer, indirect_offset: usize) {
+        unsafe {
+            m_v_upu(self.id(), sel(ptr.from_mut(&mut S_DRAW_PRIMITIVES_INDIRECT), b"drawPrimitives:indirectBuffer:indirectBufferOffset:\0"), primitive, indirect_buffer.object.as_ptr(), indirect_offset)
+        }
+    }
+
+    pub fn draw_indexed_primitives_indirect(&self, primitive: PrimitiveType, index_type: IndexType, index_buffer: &Buffer, index_offset: usize, indirect_buffer: &Buffer, indirect_offset: usize) {
+        unsafe {
+            m_v_uupupu(self.id(), sel(ptr.from_mut(&mut S_DRAW_INDEXED_PRIMITIVES_INDIRECT), b"drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:\0"), primitive, index_type, index_buffer.object.as_ptr(), index_offset, indirect_buffer.object.as_ptr(), indirect_offset)
+        }
+    }
+
+    pub fn use_buffer(&self, buffer: &Buffer, usage: ResourceUsage, stages: RenderStages) {
+        unsafe {
+            m_v_puu(self.id(), sel(ptr.from_mut(&mut S_USE_RESOURCE_STAGES), b"useResource:usage:stages:\0"), buffer.object.as_ptr(), usage, stages)
+        }
+    }
+
+    pub fn use_texture(&self, texture: &Texture, usage: ResourceUsage, stages: RenderStages) {
+        unsafe {
+            m_v_puu(self.id(), sel(ptr.from_mut(&mut S_USE_RESOURCE_STAGES), b"useResource:usage:stages:\0"), texture.object.as_ptr(), usage, stages)
+        }
+    }
+
+    pub fn memory_barrier(&self, scope: BarrierScope, after: RenderStages, before: RenderStages) {
+        unsafe {
+            m_v_uuu(self.id(), sel(ptr.from_mut(&mut S_MEMORY_BARRIER_STAGES), b"memoryBarrierWithScope:afterStages:beforeStages:\0"), scope, after, before)
+        }
+    }
+
+    pub fn update_fence(&self, fence: &Fence, after: RenderStages) {
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_UPDATE_FENCE_STAGES), b"updateFence:afterStages:\0"), fence.object.as_ptr(), after)
+        }
+    }
+
+    pub fn wait_for_fence(&self, fence: &Fence, before: RenderStages) {
+        unsafe {
+            m_v_pu(self.id(), sel(ptr.from_mut(&mut S_WAIT_FOR_FENCE_STAGES), b"waitForFence:beforeStages:\0"), fence.object.as_ptr(), before)
+        }
+    }
+
+    pub fn end_encoding(self) {
+        end_encoding(self.id())
+    }
+}
+
+static mut S_COPY_BUFFER: usize = 0
+static mut S_COPY_BUFFER_TO_TEXTURE: usize = 0
+static mut S_COPY_TEXTURE_TO_BUFFER: usize = 0
+static mut S_COPY_TEXTURE: usize = 0
+static mut S_FILL_BUFFER: usize = 0
+static mut S_GENERATE_MIPMAPS: usize = 0
+static mut S_SYNCHRONIZE_RESOURCE: usize = 0
+
+// MTLBlitCommandEncoder: records copies, fills and mipmap generation.
+pub struct BlitCommandEncoder {
+    object: objc.Object
+
+    // Safety: `object` is an MTLBlitCommandEncoder.
+    pub unsafe fn from_object(object: objc.Object) -> BlitCommandEncoder {
+        return BlitCommandEncoder { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn push_debug_group(&self, text: &str) {
+        push_debug_group(self.id(), text)
+    }
+
+    pub fn pop_debug_group(&self) {
+        pop_debug_group(self.id())
+    }
+
+    pub fn copy_buffer(&self, source: &Buffer, source_offset: usize, destination: &Buffer, destination_offset: usize, size: usize) {
+        unsafe {
+            m_v_pupuu(self.id(), sel(ptr.from_mut(&mut S_COPY_BUFFER), b"copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:\0"), source.object.as_ptr(), source_offset, destination.object.as_ptr(), destination_offset, size)
+        }
+    }
+
+    pub fn copy_buffer_to_texture(&self, source: &Buffer, source_offset: usize, source_bytes_per_row: usize, source_bytes_per_image: usize, source_size: Size, destination: &Texture, destination_slice: usize, destination_level: usize, destination_origin: Origin) {
+        unsafe {
+            m_v_puuuSpuuO(self.id(), sel(ptr.from_mut(&mut S_COPY_BUFFER_TO_TEXTURE), b"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:\0"), source.object.as_ptr(), source_offset, source_bytes_per_row, source_bytes_per_image, source_size, destination.object.as_ptr(), destination_slice, destination_level, destination_origin)
+        }
+    }
+
+    pub fn copy_texture_to_buffer(&self, source: &Texture, source_slice: usize, source_level: usize, source_origin: Origin, source_size: Size, destination: &Buffer, destination_offset: usize, destination_bytes_per_row: usize, destination_bytes_per_image: usize) {
+        unsafe {
+            m_v_puuOSpuuu(self.id(), sel(ptr.from_mut(&mut S_COPY_TEXTURE_TO_BUFFER), b"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:\0"), source.object.as_ptr(), source_slice, source_level, source_origin, source_size, destination.object.as_ptr(), destination_offset, destination_bytes_per_row, destination_bytes_per_image)
+        }
+    }
+
+    pub fn copy_texture(&self, source: &Texture, source_slice: usize, source_level: usize, source_origin: Origin, source_size: Size, destination: &Texture, destination_slice: usize, destination_level: usize, destination_origin: Origin) {
+        unsafe {
+            m_v_puuOSpuuO(self.id(), sel(ptr.from_mut(&mut S_COPY_TEXTURE), b"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:\0"), source.object.as_ptr(), source_slice, source_level, source_origin, source_size, destination.object.as_ptr(), destination_slice, destination_level, destination_origin)
+        }
+    }
+
+    // Set `length` bytes starting at `offset` to `value`.
+    pub fn fill_buffer(&self, buffer: &Buffer, offset: usize, length: usize, value: u8) {
+        unsafe {
+            m_v_pNc(self.id(), sel(ptr.from_mut(&mut S_FILL_BUFFER), b"fillBuffer:range:value:\0"), buffer.object.as_ptr(), Range.new(offset, length), value)
+        }
+    }
+
+    // Fill every mipmap level below the first from the one above it.
+    pub fn generate_mipmaps(&self, texture: &Texture) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_GENERATE_MIPMAPS)
+        }, b"generateMipmapsForTexture:\0"), texture.object.as_ptr())
+    }
+
+    // Copy a managed buffer's GPU changes back to its CPU copy.
+    pub fn synchronize_buffer(&self, buffer: &Buffer) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SYNCHRONIZE_RESOURCE)
+        }, b"synchronizeResource:\0"), buffer.object.as_ptr())
+    }
+
+    pub fn synchronize_texture(&self, texture: &Texture) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SYNCHRONIZE_RESOURCE)
+        }, b"synchronizeResource:\0"), texture.object.as_ptr())
+    }
+
+    pub fn update_fence(&self, fence: &Fence) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_UPDATE_FENCE)
+        }, b"updateFence:\0"), fence.object.as_ptr())
+    }
+
+    pub fn wait_for_fence(&self, fence: &Fence) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_WAIT_FOR_FENCE)
+        }, b"waitForFence:\0"), fence.object.as_ptr())
+    }
+
+    pub fn end_encoding(self) {
+        end_encoding(self.id())
+    }
+}
+
+static mut S_CONTENTS: usize = 0
+static mut S_LENGTH: usize = 0
+static mut S_DID_MODIFY_RANGE: usize = 0
+static mut S_RESOURCE_OPTIONS: usize = 0
+static mut S_STORAGE_MODE: usize = 0
+static mut S_GPU_ADDRESS: usize = 0
+
+// MTLBuffer: untyped GPU memory. Shared and managed buffers are also
+// visible to the CPU through read, write and contents.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct Buffer {
+    object: objc.Object
+
+    // Safety: `object` is an MTLBuffer.
+    pub unsafe fn from_object(object: objc.Object) -> Buffer {
+        return Buffer { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> Buffer {
+        return Buffer { object: self.object.clone() }
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn label(&self) -> Option<objc.NSString> {
+        return label(self.id())
+    }
+
+    // The size in bytes.
+    pub fn len(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_LENGTH)
+        }, b"length\0"))
+    }
+
+    pub fn resource_options(&self) -> ResourceOptions {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_RESOURCE_OPTIONS)
+        }, b"resourceOptions\0"))
+    }
+
+    pub fn storage_mode(&self) -> StorageMode {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_STORAGE_MODE)
+        }, b"storageMode\0"))
+    }
+
+    // The buffer's address for argument buffers and pointers in shaders.
+    pub fn gpu_address(&self) -> u64 {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_GPU_ADDRESS)
+        }, b"gpuAddress\0")) as u64
+    }
+
+    // The CPU address of the first byte, or null for a private buffer. The
+    // memory stays valid while the buffer is alive; the GPU may access it
+    // concurrently, so synchronize through command buffer completion.
+    pub fn contents(&self) -> *mut u8 {
+        // Some systems return an address the CPU must not use for private
+        // buffers, so the storage mode decides.
+        mode := self.storage_mode()
+        if mode == STORAGE_MODE_PRIVATE || mode == STORAGE_MODE_MEMORYLESS {
+            return null()
+        }
+        return unsafe {
+            m_p(self.id(), sel(ptr.from_mut(&mut S_CONTENTS), b"contents\0"))
+        }
+    }
+
+    // Copy `bytes` into the buffer at `offset`. Err(InvalidInput) if the
+    // range does not fit or the buffer is private.
+    pub fn write(&self, offset: usize, bytes: &[u8]) -> void!Error {
+        start := self.contents()
+        if ptr.is_null(start) || !fits(offset, bytes.len, self.len()) {
+            return err(Error.InvalidInput)
+        }
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.as_ptr(bytes), ptr.offset(start, offset as isize), bytes.len)
+        }
+        return ok()
+    }
+
+    // Copy bytes starting at `offset` out of the buffer to fill `out`.
+    pub fn read(&self, offset: usize, out: &mut[u8]) -> void!Error {
+        start := self.contents()
+        if ptr.is_null(start) || !fits(offset, out.len, self.len()) {
+            return err(Error.InvalidInput)
+        }
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.offset(start, offset as isize) as *const u8, ptr.as_mut_ptr(out), out.len)
+        }
+        return ok()
+    }
+
+    // Native-endian f32 and u32 forms of write and read, for shader data.
+    pub fn write_f32(&self, offset: usize, values: &[f32]) -> void!Error {
+        start := self.contents()
+        if values.len > self.len() / 4 || ptr.is_null(start) || !fits(offset, values.len * 4, self.len()) {
+            return err(Error.InvalidInput)
+        }
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.as_ptr(values) as *const u8, ptr.offset(start, offset as isize), values.len * 4)
+        }
+        return ok()
+    }
+
+    pub fn read_f32(&self, offset: usize, out: &mut[f32]) -> void!Error {
+        start := self.contents()
+        if out.len > self.len() / 4 || ptr.is_null(start) || !fits(offset, out.len * 4, self.len()) {
+            return err(Error.InvalidInput)
+        }
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.offset(start, offset as isize) as *const u8, ptr.as_mut_ptr(out) as *mut u8, out.len * 4)
+        }
+        return ok()
+    }
+
+    pub fn write_u32(&self, offset: usize, values: &[u32]) -> void!Error {
+        start := self.contents()
+        if values.len > self.len() / 4 || ptr.is_null(start) || !fits(offset, values.len * 4, self.len()) {
+            return err(Error.InvalidInput)
+        }
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.as_ptr(values) as *const u8, ptr.offset(start, offset as isize), values.len * 4)
+        }
+        return ok()
+    }
+
+    pub fn read_u32(&self, offset: usize, out: &mut[u32]) -> void!Error {
+        start := self.contents()
+        if out.len > self.len() / 4 || ptr.is_null(start) || !fits(offset, out.len * 4, self.len()) {
+            return err(Error.InvalidInput)
+        }
+        unsafe {
+            ptr.copy_nonoverlapping(ptr.offset(start, offset as isize) as *const u8, ptr.as_mut_ptr(out) as *mut u8, out.len * 4)
+        }
+        return ok()
+    }
+
+    // Tell Metal the CPU changed these bytes of a managed buffer.
+    pub fn did_modify_range(&self, offset: usize, length: usize) {
+        unsafe {
+            m_v_N(self.id(), sel(ptr.from_mut(&mut S_DID_MODIFY_RANGE), b"didModifyRange:\0"), Range.new(offset, length))
+        }
+    }
+}
+
+static mut S_WIDTH: usize = 0
+static mut S_HEIGHT: usize = 0
+static mut S_DEPTH: usize = 0
+static mut S_MIPMAP_LEVEL_COUNT: usize = 0
+static mut S_ARRAY_LENGTH: usize = 0
+static mut S_SAMPLE_COUNT: usize = 0
+static mut S_PIXEL_FORMAT: usize = 0
+static mut S_TEXTURE_TYPE: usize = 0
+static mut S_USAGE: usize = 0
+static mut S_REPLACE_REGION: usize = 0
+static mut S_GET_BYTES: usize = 0
+static mut S_NEW_TEXTURE_VIEW: usize = 0
+static mut S_NEW_TEXTURE_VIEW_RANGES: usize = 0
+
+// MTLTexture: formatted image memory.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct Texture {
+    object: objc.Object
+
+    // Safety: `object` is an MTLTexture.
+    pub unsafe fn from_object(object: objc.Object) -> Texture {
+        return Texture { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> Texture {
+        return Texture { object: self.object.clone() }
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn label(&self) -> Option<objc.NSString> {
+        return label(self.id())
+    }
+
+    pub fn width(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_WIDTH)
+        }, b"width\0"))
+    }
+
+    pub fn height(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_HEIGHT)
+        }, b"height\0"))
+    }
+
+    pub fn depth(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_DEPTH)
+        }, b"depth\0"))
+    }
+
+    pub fn mipmap_level_count(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_MIPMAP_LEVEL_COUNT)
+        }, b"mipmapLevelCount\0"))
+    }
+
+    pub fn array_length(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_ARRAY_LENGTH)
+        }, b"arrayLength\0"))
+    }
+
+    pub fn sample_count(&self) -> usize {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SAMPLE_COUNT)
+        }, b"sampleCount\0"))
+    }
+
+    pub fn pixel_format(&self) -> PixelFormat {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_PIXEL_FORMAT)
+        }, b"pixelFormat\0"))
+    }
+
+    pub fn texture_type(&self) -> TextureType {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_TEXTURE_TYPE)
+        }, b"textureType\0"))
+    }
+
+    pub fn usage(&self) -> TextureUsage {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_USAGE)
+        }, b"usage\0"))
+    }
+
+    pub fn storage_mode(&self) -> StorageMode {
+        return get_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_STORAGE_MODE)
+        }, b"storageMode\0"))
+    }
+
+    // The number of 2D images: array_length, times 6 for cube textures.
+    fn slices(&self) -> usize {
+        kind := self.texture_type()
+        if kind == TEXTURE_TYPE_CUBE || kind == TEXTURE_TYPE_CUBE_ARRAY {
+            return self.array_length() * 6
+        }
+        return self.array_length()
+    }
+
+    // Check a CPU copy of `region` at `level` and `slice` against the
+    // texture and a caller buffer of `available` bytes; returns the
+    // bytes per image the copy uses.
+    fn check_copy(&self, region: &Region, level: usize, slice: usize, bytes_per_row: usize, available: usize) -> usize!Error {
+        size := pixel_size(self.pixel_format())
+        if size == 0 || self.sample_count() != 1 {
+            return err(Error.Unsupported)
+        }
+        if self.storage_mode() == STORAGE_MODE_PRIVATE || self.storage_mode() == STORAGE_MODE_MEMORYLESS {
+            return err(Error.InvalidInput)
+        }
+        if level >= self.mipmap_level_count() || slice >= self.slices() {
+            return err(Error.InvalidInput)
+        }
+        if !fits(region.origin.x, region.size.width, mip(self.width(), level)) ||
+            !fits(region.origin.y, region.size.height, mip(self.height(), level)) ||
+            !fits(region.origin.z, region.size.depth, mip(self.depth(), level)) {
+            return err(Error.InvalidInput)
+        }
+        if region.size.width == 0 || region.size.height == 0 || region.size.depth == 0 {
+            return err(Error.InvalidInput)
+        }
+        // Every quantity below is bounded by the texture's own dimensions,
+        // except bytes_per_row; reject a row length that would overflow.
+        if bytes_per_row / size < region.size.width {
+            return err(Error.InvalidInput)
+        }
+        if bytes_per_row > available / region.size.height {
+            return err(Error.InvalidInput)
+        }
+        image := bytes_per_row * region.size.height
+        if image > available / region.size.depth {
+            return err(Error.InvalidInput)
+        }
+        return ok(image)
+    }
+
+    // Copy pixels from `bytes` into `region` of a CPU-accessible texture.
+    // Rows are `bytes_per_row` apart and images bytes_per_row * height apart.
+    // Compressed, depth-stencil and multisample formats are Unsupported.
+    pub fn write_pixels(&self, region: Region, level: usize, slice: usize, bytes: &[u8], bytes_per_row: usize) -> void!Error {
+        image := self.check_copy(&region, level, slice, bytes_per_row, bytes.len)?
+        unsafe {
+            m_v_Ruuquu(self.id(), sel(ptr.from_mut(&mut S_REPLACE_REGION), b"replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:\0"), region, level, slice, ptr.as_ptr(bytes), bytes_per_row, image)
+        }
+        return ok()
+    }
+
+    // Copy pixels from `region` into `out`, laid out as for write_pixels.
+    // The GPU must have finished writing the texture.
+    pub fn read_pixels(&self, region: Region, level: usize, slice: usize, out: &mut[u8], bytes_per_row: usize) -> void!Error {
+        image := self.check_copy(&region, level, slice, bytes_per_row, out.len)?
+        unsafe {
+            m_v_puuRuu(self.id(), sel(ptr.from_mut(&mut S_GET_BYTES), b"getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:\0"), ptr.as_mut_ptr(out), bytes_per_row, image, region, level, slice)
+        }
+        return ok()
+    }
+
+    // Copy any texture's pixels without checks, for formats write_pixels
+    // does not size, such as compressed blocks.
+    //
+    // Safety: the region, level and slice lie within the texture, and
+    // `bytes` holds every row and image the copy reads at these strides.
+    pub unsafe fn replace_region(&self, region: Region, level: usize, slice: usize, bytes: *const u8, bytes_per_row: usize, bytes_per_image: usize) {
+        unsafe {
+            m_v_Ruuquu(self.id(), sel(ptr.from_mut(&mut S_REPLACE_REGION), b"replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:\0"), region, level, slice, bytes, bytes_per_row, bytes_per_image)
+        }
+    }
+
+    // Safety: as for replace_region, with `bytes` writable.
+    pub unsafe fn get_bytes(&self, bytes: *mut u8, bytes_per_row: usize, bytes_per_image: usize, region: Region, level: usize, slice: usize) {
+        unsafe {
+            m_v_puuRuu(self.id(), sel(ptr.from_mut(&mut S_GET_BYTES), b"getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:\0"), bytes, bytes_per_row, bytes_per_image, region, level, slice)
+        }
+    }
+
+    // The same pixels read as another compatible format; the texture needs
+    // TEXTURE_USAGE_PIXEL_FORMAT_VIEW unless only sRGB-ness changes.
+    pub fn new_view(&self, format: PixelFormat) -> Texture!Error {
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p_u(self.id(), sel(ptr.from_mut(&mut S_NEW_TEXTURE_VIEW), b"newTextureViewWithPixelFormat:\0"), format)
+        })?
+        return ok(Texture { object: object })
+    }
+
+    // A view of some mipmap levels and slices, possibly as another type.
+    pub fn new_view_of(&self, format: PixelFormat, texture_type: TextureType, first_level: usize, level_count: usize, first_slice: usize, slice_count: usize) -> Texture!Error {
+        if level_count == 0 || slice_count == 0 || !fits(first_level, level_count, self.mipmap_level_count()) || !fits(first_slice, slice_count, self.slices()) {
+            return err(Error.InvalidInput)
+        }
+        pool := objc.AutoreleasePool.new()
+        object := adopt(unsafe {
+            m_p_uuNN(self.id(), sel(ptr.from_mut(&mut S_NEW_TEXTURE_VIEW_RANGES), b"newTextureViewWithPixelFormat:textureType:levels:slices:\0"), format, texture_type, Range.new(first_level, level_count), Range.new(first_slice, slice_count))
+        })?
+        return ok(Texture { object: object })
+    }
+}
+
+// The size of a dimension at a mipmap level: halved per level, at least 1.
+fn mip(size: usize, level: usize) -> usize {
+    value := size
+    for _ in 0usize..level {
+        if value <= 1 {
+            return 1
+        }
+        value = value / 2
+    }
+    return value
+}
+
+// Bytes per pixel of an uncompressed color, depth or stencil format that
+// CPU copies support; 0 for compressed, packed-YUV, combined depth-stencil,
+// and unknown formats.
+pub fn pixel_size(format: PixelFormat) -> usize {
+    if format == PIXEL_FORMAT_A8_UNORM || (format >= PIXEL_FORMAT_R8_UNORM && format <= PIXEL_FORMAT_R8_SINT) || format == PIXEL_FORMAT_STENCIL8 {
+        return 1
+    }
+    if (format >= PIXEL_FORMAT_R16_UNORM && format <= PIXEL_FORMAT_R16_FLOAT) ||
+        (format >= PIXEL_FORMAT_RG8_UNORM && format <= PIXEL_FORMAT_RG8_SINT) ||
+        (format >= PIXEL_FORMAT_B5G6R5_UNORM && format <= PIXEL_FORMAT_BGR5A1_UNORM) ||
+        format == PIXEL_FORMAT_DEPTH16_UNORM {
+        return 2
+    }
+    if (format >= PIXEL_FORMAT_R32_UINT && format <= PIXEL_FORMAT_R32_FLOAT) ||
+        (format >= PIXEL_FORMAT_RG16_UNORM && format <= PIXEL_FORMAT_RG16_FLOAT) ||
+        (format >= PIXEL_FORMAT_RGBA8_UNORM && format <= PIXEL_FORMAT_RGBA8_SINT) ||
+        format == PIXEL_FORMAT_BGRA8_UNORM || format == PIXEL_FORMAT_BGRA8_UNORM_SRGB ||
+        (format >= PIXEL_FORMAT_RGB10A2_UNORM && format <= PIXEL_FORMAT_BGR10A2_UNORM) ||
+        format == PIXEL_FORMAT_BGR10_XR || format == PIXEL_FORMAT_BGR10_XR_SRGB ||
+        format == PIXEL_FORMAT_DEPTH32_FLOAT {
+        return 4
+    }
+    if (format >= PIXEL_FORMAT_RG32_UINT && format <= PIXEL_FORMAT_RG32_FLOAT) ||
+        (format >= PIXEL_FORMAT_RGBA16_UNORM && format <= PIXEL_FORMAT_RGBA16_FLOAT) ||
+        format == PIXEL_FORMAT_BGRA10_XR || format == PIXEL_FORMAT_BGRA10_XR_SRGB {
+        return 8
+    }
+    if format >= PIXEL_FORMAT_RGBA32_UINT && format <= PIXEL_FORMAT_RGBA32_FLOAT {
+        return 16
+    }
+    return 0
+}
+
+static mut C_TEXTURE_DESCRIPTOR: usize = 0
+static mut S_SET_TEXTURE_TYPE: usize = 0
+static mut S_SET_PIXEL_FORMAT: usize = 0
+static mut S_SET_WIDTH: usize = 0
+static mut S_SET_HEIGHT: usize = 0
+static mut S_SET_DEPTH: usize = 0
+static mut S_SET_MIPMAP_LEVEL_COUNT: usize = 0
+static mut S_SET_SAMPLE_COUNT: usize = 0
+static mut S_SET_ARRAY_LENGTH: usize = 0
+static mut S_SET_USAGE: usize = 0
+static mut S_SET_STORAGE_MODE: usize = 0
+static mut S_SET_RESOURCE_OPTIONS: usize = 0
+
+// MTLTextureDescriptor: what Device.new_texture creates. A new descriptor
+// describes a 1x1 2D RGBA8 texture with one level, read by shaders.
+pub struct TextureDescriptor {
+    object: objc.Object
+
+    pub fn new() -> TextureDescriptor!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_TEXTURE_DESCRIPTOR)
+        }, b"MTLTextureDescriptor\0")?
+        return ok(TextureDescriptor { object: object })
+    }
+
+    // A 2D texture of `width` x `height` pixels.
+    pub fn new_2d(format: PixelFormat, width: usize, height: usize, usage: TextureUsage) -> TextureDescriptor!Error {
+        descriptor := TextureDescriptor.new()?
+        descriptor.set_pixel_format(format)
+        descriptor.set_width(width)
+        descriptor.set_height(height)
+        descriptor.set_usage(usage)
+        return ok(descriptor)
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_texture_type(&self, texture_type: TextureType) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_TEXTURE_TYPE)
+        }, b"setTextureType:\0"), texture_type)
+    }
+
+    pub fn set_pixel_format(&self, format: PixelFormat) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_PIXEL_FORMAT)
+        }, b"setPixelFormat:\0"), format)
+    }
+
+    pub fn set_width(&self, width: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_WIDTH)
+        }, b"setWidth:\0"), width)
+    }
+
+    pub fn set_height(&self, height: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_HEIGHT)
+        }, b"setHeight:\0"), height)
+    }
+
+    pub fn set_depth(&self, depth: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEPTH)
+        }, b"setDepth:\0"), depth)
+    }
+
+    pub fn set_mipmap_level_count(&self, count: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_MIPMAP_LEVEL_COUNT)
+        }, b"setMipmapLevelCount:\0"), count)
+    }
+
+    pub fn set_sample_count(&self, count: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_SAMPLE_COUNT)
+        }, b"setSampleCount:\0"), count)
+    }
+
+    pub fn set_array_length(&self, length: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_ARRAY_LENGTH)
+        }, b"setArrayLength:\0"), length)
+    }
+
+    pub fn set_usage(&self, usage: TextureUsage) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_USAGE)
+        }, b"setUsage:\0"), usage)
+    }
+
+    pub fn set_storage_mode(&self, mode: StorageMode) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_STORAGE_MODE)
+        }, b"setStorageMode:\0"), mode)
+    }
+
+    // Storage, CPU cache and hazard tracking modes as RESOURCE_* options.
+    pub fn set_resource_options(&self, options: ResourceOptions) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_RESOURCE_OPTIONS)
+        }, b"setResourceOptions:\0"), options)
+    }
+}
+
+static mut C_SAMPLER_DESCRIPTOR: usize = 0
+static mut S_SET_MIN_FILTER: usize = 0
+static mut S_SET_MAG_FILTER: usize = 0
+static mut S_SET_MIP_FILTER: usize = 0
+static mut S_SET_S_ADDRESS_MODE: usize = 0
+static mut S_SET_T_ADDRESS_MODE: usize = 0
+static mut S_SET_R_ADDRESS_MODE: usize = 0
+static mut S_SET_MAX_ANISOTROPY: usize = 0
+static mut S_SET_COMPARE_FUNCTION: usize = 0
+static mut S_SET_BORDER_COLOR: usize = 0
+static mut S_SET_LOD_MIN_CLAMP: usize = 0
+static mut S_SET_LOD_MAX_CLAMP: usize = 0
+static mut S_SET_NORMALIZED_COORDINATES: usize = 0
+static mut S_SET_SUPPORT_ARGUMENT_BUFFERS: usize = 0
+
+// MTLSamplerDescriptor: how shaders filter and address a texture. A new
+// descriptor samples the nearest texel and clamps to the edge.
+pub struct SamplerDescriptor {
+    object: objc.Object
+
+    pub fn new() -> SamplerDescriptor!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_SAMPLER_DESCRIPTOR)
+        }, b"MTLSamplerDescriptor\0")?
+        return ok(SamplerDescriptor { object: object })
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn set_min_filter(&self, filter: SamplerMinMagFilter) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_MIN_FILTER)
+        }, b"setMinFilter:\0"), filter)
+    }
+
+    pub fn set_mag_filter(&self, filter: SamplerMinMagFilter) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_MAG_FILTER)
+        }, b"setMagFilter:\0"), filter)
+    }
+
+    pub fn set_mip_filter(&self, filter: SamplerMipFilter) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_MIP_FILTER)
+        }, b"setMipFilter:\0"), filter)
+    }
+
+    pub fn set_s_address_mode(&self, mode: SamplerAddressMode) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_S_ADDRESS_MODE)
+        }, b"setSAddressMode:\0"), mode)
+    }
+
+    pub fn set_t_address_mode(&self, mode: SamplerAddressMode) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_T_ADDRESS_MODE)
+        }, b"setTAddressMode:\0"), mode)
+    }
+
+    pub fn set_r_address_mode(&self, mode: SamplerAddressMode) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_R_ADDRESS_MODE)
+        }, b"setRAddressMode:\0"), mode)
+    }
+
+    // 1 through 16.
+    pub fn set_max_anisotropy(&self, value: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_MAX_ANISOTROPY)
+        }, b"setMaxAnisotropy:\0"), value)
+    }
+
+    // Make this a comparison sampler for depth textures.
+    pub fn set_compare_function(&self, function: CompareFunction) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_COMPARE_FUNCTION)
+        }, b"setCompareFunction:\0"), function)
+    }
+
+    pub fn set_border_color(&self, color: SamplerBorderColor) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_BORDER_COLOR)
+        }, b"setBorderColor:\0"), color)
+    }
+
+    pub fn set_lod_min_clamp(&self, value: f32) {
+        unsafe {
+            m_v_f(self.id(), sel(ptr.from_mut(&mut S_SET_LOD_MIN_CLAMP), b"setLodMinClamp:\0"), value)
+        }
+    }
+
+    pub fn set_lod_max_clamp(&self, value: f32) {
+        unsafe {
+            m_v_f(self.id(), sel(ptr.from_mut(&mut S_SET_LOD_MAX_CLAMP), b"setLodMaxClamp:\0"), value)
+        }
+    }
+
+    // False addresses texels in pixels instead of 0 through 1.
+    pub fn set_normalized_coordinates(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_NORMALIZED_COORDINATES)
+        }, b"setNormalizedCoordinates:\0"), value)
+    }
+
+    pub fn set_support_argument_buffers(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_SUPPORT_ARGUMENT_BUFFERS)
+        }, b"setSupportArgumentBuffers:\0"), value)
+    }
+}
+
+// MTLSamplerState: an immutable sampler made from a SamplerDescriptor.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct SamplerState {
+    object: objc.Object
+
+    // Safety: `object` is an MTLSamplerState.
+    pub unsafe fn from_object(object: objc.Object) -> SamplerState {
+        return SamplerState { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> SamplerState {
+        return SamplerState { object: self.object.clone() }
+    }
+}
+
+static mut C_COMPILE_OPTIONS: usize = 0
+static mut S_SET_FAST_MATH_ENABLED: usize = 0
+static mut S_SET_MATH_MODE: usize = 0
+static mut S_SET_LANGUAGE_VERSION: usize = 0
+static mut S_SET_PRESERVE_INVARIANCE: usize = 0
+static mut S_RESPONDS_TO_SELECTOR: usize = 0
+
+// MTLCompileOptions: how new_library_with_source compiles. A new value
+// uses the newest language version and fast math.
+pub struct CompileOptions {
+    object: objc.Object
+
+    pub fn new() -> CompileOptions!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_COMPILE_OPTIONS)
+        }, b"MTLCompileOptions\0")?
+        return ok(CompileOptions { object: object })
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    // MATH_MODE_SAFE follows IEEE 754; fast math may reorder and drop
+    // special cases. Before macOS 15 only safe versus fast is available.
+    pub fn set_math_mode(&self, mode: MathMode) {
+        selector := sel(unsafe {
+            ptr.from_mut(&mut S_SET_MATH_MODE)
+        }, b"setMathMode:\0")
+        responds := unsafe {
+            m_b_p(self.id(), sel(ptr.from_mut(&mut S_RESPONDS_TO_SELECTOR), b"respondsToSelector:\0"), selector)
+        }
+        if responds {
+            set_usize(self.id(), selector, mode)
+        } else {
+            set_bool(self.id(), sel(unsafe {
+                ptr.from_mut(&mut S_SET_FAST_MATH_ENABLED)
+            }, b"setFastMathEnabled:\0"), mode != MATH_MODE_SAFE)
+        }
+    }
+
+    pub fn set_language_version(&self, version: LanguageVersion) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_LANGUAGE_VERSION)
+        }, b"setLanguageVersion:\0"), version)
+    }
+
+    // Compute positions identically in every pipeline using them, as
+    // multi-pass depth techniques need.
+    pub fn set_preserve_invariance(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_PRESERVE_INVARIANCE)
+        }, b"setPreserveInvariance:\0"), value)
+    }
+}
+
+static mut S_NEW_FUNCTION_WITH_NAME: usize = 0
+static mut S_FUNCTION_NAMES: usize = 0
+static mut S_FUNCTION_TYPE: usize = 0
+
+// MTLLibrary: compiled shader functions.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct Library {
+    object: objc.Object
+
+    // Safety: `object` is an MTLLibrary.
+    pub unsafe fn from_object(object: objc.Object) -> Library {
+        return Library { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> Library {
+        return Library { object: self.object.clone() }
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.object.as_ptr(), text)
+    }
+
+    // The function with this name. Err(NotFound) if there is none.
+    pub fn new_function(&self, name: &str) -> Function!Error {
+        let some(text) = objc.NSString.new(name) else {
+            return err(Error.OutOfMemory)
+        }
+        pool := objc.AutoreleasePool.new()
+        id := unsafe {
+            m_p_p(self.object.as_ptr(), sel(ptr.from_mut(&mut S_NEW_FUNCTION_WITH_NAME), b"newFunctionWithName:\0"), text.as_object().as_ptr())
+        }
+        owned := unsafe {
+            objc.Object.from_retained(id)
+        }
+        match owned {
+            some(object) => {
+                return ok(Function { object: object })
+            }
+            none => {
+                return err(Error.NotFound)
+            }
+        }
+    }
+
+    // The names of every function, as an array of NSString.
+    pub fn function_names(&self) -> Option<objc.NSArray> {
+        match get(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_FUNCTION_NAMES)
+        }, b"functionNames\0")) {
+            some(object) => {
+                return some(unsafe {
+                    objc.NSArray.from_object(object)
+                })
+            }
+            none => {
+                return none
+            }
+        }
+    }
+}
+
+// MTLFunctionType.
+pub type FunctionType = usize
+pub const FUNCTION_TYPE_VERTEX: FunctionType = 1
+pub const FUNCTION_TYPE_FRAGMENT: FunctionType = 2
+pub const FUNCTION_TYPE_KERNEL: FunctionType = 3
+
+// MTLFunction: one shader entry point.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct Function {
+    object: objc.Object
+
+    // Safety: `object` is an MTLFunction.
+    pub unsafe fn from_object(object: objc.Object) -> Function {
+        return Function { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> Function {
+        return Function { object: self.object.clone() }
+    }
+
+    pub fn name(&self) -> Option<objc.NSString> {
+        return string_of(get(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_NAME)
+        }, b"name\0")))
+    }
+
+    pub fn function_type(&self) -> FunctionType {
+        return get_usize(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_FUNCTION_TYPE)
+        }, b"functionType\0"))
+    }
+}
+
+static mut S_MAX_TOTAL_THREADS_PER_THREADGROUP: usize = 0
+static mut S_THREAD_EXECUTION_WIDTH: usize = 0
+static mut S_STATIC_THREADGROUP_MEMORY_LENGTH: usize = 0
+
+// MTLComputePipelineState: a compiled compute kernel.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct ComputePipelineState {
+    object: objc.Object
+
+    // Safety: `object` is an MTLComputePipelineState.
+    pub unsafe fn from_object(object: objc.Object) -> ComputePipelineState {
+        return ComputePipelineState { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> ComputePipelineState {
+        return ComputePipelineState { object: self.object.clone() }
+    }
+
+    // The most threads one threadgroup of this kernel may have.
+    pub fn max_total_threads_per_threadgroup(&self) -> usize {
+        return get_usize(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_MAX_TOTAL_THREADS_PER_THREADGROUP)
+        }, b"maxTotalThreadsPerThreadgroup\0"))
+    }
+
+    // The SIMD width: threadgroup sizes should be a multiple of it.
+    pub fn thread_execution_width(&self) -> usize {
+        return get_usize(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_THREAD_EXECUTION_WIDTH)
+        }, b"threadExecutionWidth\0"))
+    }
+
+    pub fn static_threadgroup_memory_length(&self) -> usize {
+        return get_usize(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_STATIC_THREADGROUP_MEMORY_LENGTH)
+        }, b"staticThreadgroupMemoryLength\0"))
+    }
+}
+
+static mut C_RENDER_PIPELINE_DESCRIPTOR: usize = 0
+static mut S_SET_VERTEX_FUNCTION: usize = 0
+static mut S_SET_FRAGMENT_FUNCTION: usize = 0
+static mut S_SET_VERTEX_DESCRIPTOR: usize = 0
+static mut S_COLOR_ATTACHMENTS: usize = 0
+static mut S_SET_DEPTH_ATTACHMENT_PIXEL_FORMAT: usize = 0
+static mut S_SET_STENCIL_ATTACHMENT_PIXEL_FORMAT: usize = 0
+static mut S_SET_RASTER_SAMPLE_COUNT: usize = 0
+static mut S_SET_INPUT_PRIMITIVE_TOPOLOGY: usize = 0
+static mut S_SET_ALPHA_TO_COVERAGE_ENABLED: usize = 0
+static mut S_SET_RASTERIZATION_ENABLED: usize = 0
+
+// MTLRenderPipelineDescriptor: shaders and fixed-function state for
+// Device.new_render_pipeline_state.
+pub struct RenderPipelineDescriptor {
+    object: objc.Object
+
+    pub fn new() -> RenderPipelineDescriptor!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_RENDER_PIPELINE_DESCRIPTOR)
+        }, b"MTLRenderPipelineDescriptor\0")?
+        return ok(RenderPipelineDescriptor { object: object })
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn set_vertex_function(&self, function: &Function) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_VERTEX_FUNCTION)
+        }, b"setVertexFunction:\0"), function.object.as_ptr())
+    }
+
+    pub fn set_fragment_function(&self, function: &Function) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_FRAGMENT_FUNCTION)
+        }, b"setFragmentFunction:\0"), function.object.as_ptr())
+    }
+
+    // How [[stage_in]] vertex attributes are fetched from buffers.
+    pub fn set_vertex_descriptor(&self, descriptor: &VertexDescriptor) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_VERTEX_DESCRIPTOR)
+        }, b"setVertexDescriptor:\0"), descriptor.object.as_ptr())
+    }
+
+    // Color attachment `index` (below MAX_COLOR_ATTACHMENTS); changes to
+    // it change this descriptor.
+    pub fn color_attachment(&self, index: usize) -> RenderPipelineColorAttachment!Error {
+        if index >= MAX_COLOR_ATTACHMENTS {
+            return err(Error.InvalidInput)
+        }
+        object := element(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_COLOR_ATTACHMENTS)
+        }, b"colorAttachments\0"), index)?
+        return ok(RenderPipelineColorAttachment { object: object })
+    }
+
+    pub fn set_depth_attachment_pixel_format(&self, format: PixelFormat) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEPTH_ATTACHMENT_PIXEL_FORMAT)
+        }, b"setDepthAttachmentPixelFormat:\0"), format)
+    }
+
+    pub fn set_stencil_attachment_pixel_format(&self, format: PixelFormat) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_STENCIL_ATTACHMENT_PIXEL_FORMAT)
+        }, b"setStencilAttachmentPixelFormat:\0"), format)
+    }
+
+    pub fn set_raster_sample_count(&self, count: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_RASTER_SAMPLE_COUNT)
+        }, b"setRasterSampleCount:\0"), count)
+    }
+
+    pub fn set_input_primitive_topology(&self, topology: PrimitiveTopologyClass) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_INPUT_PRIMITIVE_TOPOLOGY)
+        }, b"setInputPrimitiveTopology:\0"), topology)
+    }
+
+    pub fn set_alpha_to_coverage_enabled(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_ALPHA_TO_COVERAGE_ENABLED)
+        }, b"setAlphaToCoverageEnabled:\0"), value)
+    }
+
+    // False runs only the vertex stage, for vertex shaders that write
+    // buffers.
+    pub fn set_rasterization_enabled(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_RASTERIZATION_ENABLED)
+        }, b"setRasterizationEnabled:\0"), value)
+    }
+}
+
+static mut S_SET_BLENDING_ENABLED: usize = 0
+static mut S_SET_SOURCE_RGB_BLEND_FACTOR: usize = 0
+static mut S_SET_DESTINATION_RGB_BLEND_FACTOR: usize = 0
+static mut S_SET_RGB_BLEND_OPERATION: usize = 0
+static mut S_SET_SOURCE_ALPHA_BLEND_FACTOR: usize = 0
+static mut S_SET_DESTINATION_ALPHA_BLEND_FACTOR: usize = 0
+static mut S_SET_ALPHA_BLEND_OPERATION: usize = 0
+static mut S_SET_WRITE_MASK: usize = 0
+
+// MTLRenderPipelineColorAttachmentDescriptor: one render target's format
+// and blending.
+pub struct RenderPipelineColorAttachment {
+    object: objc.Object
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_pixel_format(&self, format: PixelFormat) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_PIXEL_FORMAT)
+        }, b"setPixelFormat:\0"), format)
+    }
+
+    pub fn set_blending_enabled(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_BLENDING_ENABLED)
+        }, b"setBlendingEnabled:\0"), value)
+    }
+
+    pub fn set_source_rgb_blend_factor(&self, factor: BlendFactor) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_SOURCE_RGB_BLEND_FACTOR)
+        }, b"setSourceRGBBlendFactor:\0"), factor)
+    }
+
+    pub fn set_destination_rgb_blend_factor(&self, factor: BlendFactor) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DESTINATION_RGB_BLEND_FACTOR)
+        }, b"setDestinationRGBBlendFactor:\0"), factor)
+    }
+
+    pub fn set_rgb_blend_operation(&self, operation: BlendOperation) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_RGB_BLEND_OPERATION)
+        }, b"setRgbBlendOperation:\0"), operation)
+    }
+
+    pub fn set_source_alpha_blend_factor(&self, factor: BlendFactor) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_SOURCE_ALPHA_BLEND_FACTOR)
+        }, b"setSourceAlphaBlendFactor:\0"), factor)
+    }
+
+    pub fn set_destination_alpha_blend_factor(&self, factor: BlendFactor) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DESTINATION_ALPHA_BLEND_FACTOR)
+        }, b"setDestinationAlphaBlendFactor:\0"), factor)
+    }
+
+    pub fn set_alpha_blend_operation(&self, operation: BlendOperation) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_ALPHA_BLEND_OPERATION)
+        }, b"setAlphaBlendOperation:\0"), operation)
+    }
+
+    pub fn set_write_mask(&self, mask: ColorWriteMask) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_WRITE_MASK)
+        }, b"setWriteMask:\0"), mask)
+    }
+}
+
+// MTLRenderPipelineState: compiled shaders and fixed-function state.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct RenderPipelineState {
+    object: objc.Object
+
+    // Safety: `object` is an MTLRenderPipelineState.
+    pub unsafe fn from_object(object: objc.Object) -> RenderPipelineState {
+        return RenderPipelineState { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> RenderPipelineState {
+        return RenderPipelineState { object: self.object.clone() }
+    }
+}
+
+static mut C_VERTEX_DESCRIPTOR: usize = 0
+static mut S_ATTRIBUTES: usize = 0
+static mut S_LAYOUTS: usize = 0
+static mut S_SET_FORMAT: usize = 0
+static mut S_SET_OFFSET: usize = 0
+static mut S_SET_BUFFER_INDEX: usize = 0
+static mut S_SET_STRIDE: usize = 0
+static mut S_SET_STEP_FUNCTION: usize = 0
+static mut S_SET_STEP_RATE: usize = 0
+
+// MTLVertexDescriptor: the format and source buffer of each [[attribute(n)]].
+pub struct VertexDescriptor {
+    object: objc.Object
+
+    pub fn new() -> VertexDescriptor!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_VERTEX_DESCRIPTOR)
+        }, b"MTLVertexDescriptor\0")?
+        return ok(VertexDescriptor { object: object })
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    // Describe [[attribute(index)]]: a `format` value `offset` bytes into
+    // each element of [[buffer(buffer_index)]].
+    pub fn set_attribute(&self, index: usize, format: VertexFormat, offset: usize, buffer_index: usize) -> void!Error {
+        if index >= MAX_VERTEX_ATTRIBUTES || buffer_index >= MAX_BUFFER_BINDINGS {
+            return err(Error.InvalidInput)
+        }
+        attribute := element(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_ATTRIBUTES)
+        }, b"attributes\0"), index)?
+        set_usize(attribute.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_FORMAT)
+        }, b"setFormat:\0"), format)
+        set_usize(attribute.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_OFFSET)
+        }, b"setOffset:\0"), offset)
+        set_usize(attribute.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_BUFFER_INDEX)
+        }, b"setBufferIndex:\0"), buffer_index)
+        return ok()
+    }
+
+    // Describe [[buffer(index)]]: elements `stride` bytes apart, advancing
+    // per vertex or every `step_rate` instances.
+    pub fn set_layout(&self, index: usize, stride: usize, step_function: VertexStepFunction, step_rate: usize) -> void!Error {
+        if index >= MAX_BUFFER_BINDINGS {
+            return err(Error.InvalidInput)
+        }
+        layout := element(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_LAYOUTS)
+        }, b"layouts\0"), index)?
+        set_usize(layout.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_STRIDE)
+        }, b"setStride:\0"), stride)
+        set_usize(layout.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_STEP_FUNCTION)
+        }, b"setStepFunction:\0"), step_function)
+        set_usize(layout.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_STEP_RATE)
+        }, b"setStepRate:\0"), step_rate)
+        return ok()
+    }
+}
+
+static mut C_DEPTH_STENCIL_DESCRIPTOR: usize = 0
+static mut C_STENCIL_DESCRIPTOR: usize = 0
+static mut S_SET_DEPTH_COMPARE_FUNCTION: usize = 0
+static mut S_SET_DEPTH_WRITE_ENABLED: usize = 0
+static mut S_SET_FRONT_FACE_STENCIL: usize = 0
+static mut S_SET_BACK_FACE_STENCIL: usize = 0
+static mut S_SET_STENCIL_COMPARE_FUNCTION: usize = 0
+static mut S_SET_STENCIL_FAILURE_OPERATION: usize = 0
+static mut S_SET_DEPTH_FAILURE_OPERATION: usize = 0
+static mut S_SET_DEPTH_STENCIL_PASS_OPERATION: usize = 0
+static mut S_SET_READ_MASK: usize = 0
+
+// MTLDepthStencilDescriptor: depth and stencil tests. A new descriptor
+// always passes and writes nothing.
+pub struct DepthStencilDescriptor {
+    object: objc.Object
+
+    pub fn new() -> DepthStencilDescriptor!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_DEPTH_STENCIL_DESCRIPTOR)
+        }, b"MTLDepthStencilDescriptor\0")?
+        return ok(DepthStencilDescriptor { object: object })
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.id(), text)
+    }
+
+    pub fn set_depth_compare_function(&self, function: CompareFunction) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEPTH_COMPARE_FUNCTION)
+        }, b"setDepthCompareFunction:\0"), function)
+    }
+
+    pub fn set_depth_write_enabled(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEPTH_WRITE_ENABLED)
+        }, b"setDepthWriteEnabled:\0"), value)
+    }
+
+    pub fn set_front_face_stencil(&self, stencil: &StencilDescriptor) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_FRONT_FACE_STENCIL)
+        }, b"setFrontFaceStencil:\0"), stencil.object.as_ptr())
+    }
+
+    pub fn set_back_face_stencil(&self, stencil: &StencilDescriptor) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_BACK_FACE_STENCIL)
+        }, b"setBackFaceStencil:\0"), stencil.object.as_ptr())
+    }
+}
+
+// MTLStencilDescriptor: the stencil test for one face.
+pub struct StencilDescriptor {
+    object: objc.Object
+
+    pub fn new() -> StencilDescriptor!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_STENCIL_DESCRIPTOR)
+        }, b"MTLStencilDescriptor\0")?
+        return ok(StencilDescriptor { object: object })
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_stencil_compare_function(&self, function: CompareFunction) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_STENCIL_COMPARE_FUNCTION)
+        }, b"setStencilCompareFunction:\0"), function)
+    }
+
+    pub fn set_stencil_failure_operation(&self, operation: StencilOperation) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_STENCIL_FAILURE_OPERATION)
+        }, b"setStencilFailureOperation:\0"), operation)
+    }
+
+    pub fn set_depth_failure_operation(&self, operation: StencilOperation) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEPTH_FAILURE_OPERATION)
+        }, b"setDepthFailureOperation:\0"), operation)
+    }
+
+    pub fn set_depth_stencil_pass_operation(&self, operation: StencilOperation) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEPTH_STENCIL_PASS_OPERATION)
+        }, b"setDepthStencilPassOperation:\0"), operation)
+    }
+
+    pub fn set_read_mask(&self, mask: u32) {
+        unsafe {
+            m_v_w(self.id(), sel(ptr.from_mut(&mut S_SET_READ_MASK), b"setReadMask:\0"), mask)
+        }
+    }
+
+    pub fn set_write_mask(&self, mask: u32) {
+        unsafe {
+            m_v_w(self.id(), sel(ptr.from_mut(&mut S_SET_WRITE_MASK), b"setWriteMask:\0"), mask)
+        }
+    }
+}
+
+// MTLDepthStencilState: immutable depth and stencil tests.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct DepthStencilState {
+    object: objc.Object
+
+    // Safety: `object` is an MTLDepthStencilState.
+    pub unsafe fn from_object(object: objc.Object) -> DepthStencilState {
+        return DepthStencilState { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn clone(&self) -> DepthStencilState {
+        return DepthStencilState { object: self.object.clone() }
+    }
+}
+
+static mut C_RENDER_PASS_DESCRIPTOR: usize = 0
+static mut S_DEPTH_ATTACHMENT: usize = 0
+static mut S_STENCIL_ATTACHMENT: usize = 0
+static mut S_SET_RENDER_TARGET_WIDTH: usize = 0
+static mut S_SET_RENDER_TARGET_HEIGHT: usize = 0
+static mut S_SET_RENDER_TARGET_ARRAY_LENGTH: usize = 0
+static mut S_SET_DEFAULT_RASTER_SAMPLE_COUNT: usize = 0
+
+// MTLRenderPassDescriptor: the attachments one render pass draws into and
+// what happens to them at its start and end.
+pub struct RenderPassDescriptor {
+    object: objc.Object
+
+    pub fn new() -> RenderPassDescriptor!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_RENDER_PASS_DESCRIPTOR)
+        }, b"MTLRenderPassDescriptor\0")?
+        return ok(RenderPassDescriptor { object: object })
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    // Color attachment `index` (below MAX_COLOR_ATTACHMENTS); changes to
+    // it change this descriptor.
+    pub fn color_attachment(&self, index: usize) -> RenderPassColorAttachment!Error {
+        if index >= MAX_COLOR_ATTACHMENTS {
+            return err(Error.InvalidInput)
+        }
+        object := element(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_COLOR_ATTACHMENTS)
+        }, b"colorAttachments\0"), index)?
+        return ok(RenderPassColorAttachment { object: object })
+    }
+
+    pub fn depth_attachment(&self) -> RenderPassDepthAttachment!Error {
+        match get(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_DEPTH_ATTACHMENT)
+        }, b"depthAttachment\0")) {
+            some(object) => {
+                return ok(RenderPassDepthAttachment { object: object })
+            }
+            none => {
+                return err(Error.OutOfMemory)
+            }
+        }
+    }
+
+    pub fn stencil_attachment(&self) -> RenderPassStencilAttachment!Error {
+        match get(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_STENCIL_ATTACHMENT)
+        }, b"stencilAttachment\0")) {
+            some(object) => {
+                return ok(RenderPassStencilAttachment { object: object })
+            }
+            none => {
+                return err(Error.OutOfMemory)
+            }
+        }
+    }
+
+    // The size of a pass without attachments.
+    pub fn set_render_target_width(&self, width: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_RENDER_TARGET_WIDTH)
+        }, b"setRenderTargetWidth:\0"), width)
+    }
+
+    pub fn set_render_target_height(&self, height: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_RENDER_TARGET_HEIGHT)
+        }, b"setRenderTargetHeight:\0"), height)
+    }
+
+    // The number of layers for layered rendering into array textures.
+    pub fn set_render_target_array_length(&self, length: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_RENDER_TARGET_ARRAY_LENGTH)
+        }, b"setRenderTargetArrayLength:\0"), length)
+    }
+
+    pub fn set_default_raster_sample_count(&self, count: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEFAULT_RASTER_SAMPLE_COUNT)
+        }, b"setDefaultRasterSampleCount:\0"), count)
+    }
+}
+
+static mut S_SET_ATTACHMENT_TEXTURE: usize = 0
+static mut S_SET_RESOLVE_TEXTURE: usize = 0
+static mut S_SET_LEVEL: usize = 0
+static mut S_SET_SLICE: usize = 0
+static mut S_SET_DEPTH_PLANE: usize = 0
+static mut S_SET_LOAD_ACTION: usize = 0
+static mut S_SET_STORE_ACTION: usize = 0
+static mut S_SET_RESOLVE_LEVEL: usize = 0
+static mut S_SET_RESOLVE_SLICE: usize = 0
+static mut S_SET_CLEAR_COLOR: usize = 0
+static mut S_SET_CLEAR_DEPTH: usize = 0
+static mut S_SET_CLEAR_STENCIL: usize = 0
+
+// The settings every kind of render pass attachment shares.
+fn attachment_set_texture(receiver: objc.Id, texture: &Texture) {
+    set_object(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_ATTACHMENT_TEXTURE)
+    }, b"setTexture:\0"), texture.object.as_ptr())
+}
+
+fn attachment_set_resolve_texture(receiver: objc.Id, texture: &Texture) {
+    set_object(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_RESOLVE_TEXTURE)
+    }, b"setResolveTexture:\0"), texture.object.as_ptr())
+}
+
+fn attachment_set_place(receiver: objc.Id, level: usize, slice: usize, depth_plane: usize) {
+    set_usize(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_LEVEL)
+    }, b"setLevel:\0"), level)
+    set_usize(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_SLICE)
+    }, b"setSlice:\0"), slice)
+    set_usize(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_DEPTH_PLANE)
+    }, b"setDepthPlane:\0"), depth_plane)
+}
+
+fn attachment_set_resolve_place(receiver: objc.Id, level: usize, slice: usize) {
+    set_usize(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_RESOLVE_LEVEL)
+    }, b"setResolveLevel:\0"), level)
+    set_usize(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_RESOLVE_SLICE)
+    }, b"setResolveSlice:\0"), slice)
+}
+
+fn attachment_set_load_action(receiver: objc.Id, action: LoadAction) {
+    set_usize(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_LOAD_ACTION)
+    }, b"setLoadAction:\0"), action)
+}
+
+fn attachment_set_store_action(receiver: objc.Id, action: StoreAction) {
+    set_usize(receiver, sel(unsafe {
+        ptr.from_mut(&mut S_SET_STORE_ACTION)
+    }, b"setStoreAction:\0"), action)
+}
+
+// MTLRenderPassColorAttachmentDescriptor.
+pub struct RenderPassColorAttachment {
+    object: objc.Object
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn set_texture(&self, texture: &Texture) {
+        attachment_set_texture(self.object.as_ptr(), texture)
+    }
+
+    // Where a multisample attachment resolves to, with
+    // STORE_ACTION_MULTISAMPLE_RESOLVE.
+    pub fn set_resolve_texture(&self, texture: &Texture) {
+        attachment_set_resolve_texture(self.object.as_ptr(), texture)
+    }
+
+    // Which mipmap level, array slice and 3D depth plane to draw into.
+    pub fn set_place(&self, level: usize, slice: usize, depth_plane: usize) {
+        attachment_set_place(self.object.as_ptr(), level, slice, depth_plane)
+    }
+
+    pub fn set_resolve_place(&self, level: usize, slice: usize) {
+        attachment_set_resolve_place(self.object.as_ptr(), level, slice)
+    }
+
+    pub fn set_load_action(&self, action: LoadAction) {
+        attachment_set_load_action(self.object.as_ptr(), action)
+    }
+
+    pub fn set_store_action(&self, action: StoreAction) {
+        attachment_set_store_action(self.object.as_ptr(), action)
+    }
+
+    pub fn set_clear_color(&self, color: ClearColor) {
+        unsafe {
+            m_v_C(self.object.as_ptr(), sel(ptr.from_mut(&mut S_SET_CLEAR_COLOR), b"setClearColor:\0"), color)
+        }
+    }
+}
+
+// MTLRenderPassDepthAttachmentDescriptor.
+pub struct RenderPassDepthAttachment {
+    object: objc.Object
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn set_texture(&self, texture: &Texture) {
+        attachment_set_texture(self.object.as_ptr(), texture)
+    }
+
+    pub fn set_resolve_texture(&self, texture: &Texture) {
+        attachment_set_resolve_texture(self.object.as_ptr(), texture)
+    }
+
+    pub fn set_place(&self, level: usize, slice: usize, depth_plane: usize) {
+        attachment_set_place(self.object.as_ptr(), level, slice, depth_plane)
+    }
+
+    pub fn set_load_action(&self, action: LoadAction) {
+        attachment_set_load_action(self.object.as_ptr(), action)
+    }
+
+    pub fn set_store_action(&self, action: StoreAction) {
+        attachment_set_store_action(self.object.as_ptr(), action)
+    }
+
+    // The depth a clear load action writes, 0 through 1.
+    pub fn set_clear_depth(&self, depth: f64) {
+        unsafe {
+            m_v_d(self.object.as_ptr(), sel(ptr.from_mut(&mut S_SET_CLEAR_DEPTH), b"setClearDepth:\0"), depth)
+        }
+    }
+}
+
+// MTLRenderPassStencilAttachmentDescriptor.
+pub struct RenderPassStencilAttachment {
+    object: objc.Object
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn set_texture(&self, texture: &Texture) {
+        attachment_set_texture(self.object.as_ptr(), texture)
+    }
+
+    pub fn set_place(&self, level: usize, slice: usize, depth_plane: usize) {
+        attachment_set_place(self.object.as_ptr(), level, slice, depth_plane)
+    }
+
+    pub fn set_load_action(&self, action: LoadAction) {
+        attachment_set_load_action(self.object.as_ptr(), action)
+    }
+
+    pub fn set_store_action(&self, action: StoreAction) {
+        attachment_set_store_action(self.object.as_ptr(), action)
+    }
+
+    pub fn set_clear_stencil(&self, value: u32) {
+        unsafe {
+            m_v_w(self.object.as_ptr(), sel(ptr.from_mut(&mut S_SET_CLEAR_STENCIL), b"setClearStencil:\0"), value)
+        }
+    }
+}
+
+// MTLFence: orders resource accesses between encoders of one queue.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct Fence {
+    object: objc.Object
+
+    // Safety: `object` is an MTLFence.
+    pub unsafe fn from_object(object: objc.Object) -> Fence {
+        return Fence { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.object.as_ptr(), text)
+    }
+}
+
+// MTLEvent: orders command buffers on one device.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct Event {
+    object: objc.Object
+
+    // Safety: `object` is an MTLEvent.
+    pub unsafe fn from_object(object: objc.Object) -> Event {
+        return Event { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.object.as_ptr(), text)
+    }
+}
+
+static mut S_SIGNALED_VALUE: usize = 0
+static mut S_SET_SIGNALED_VALUE: usize = 0
+
+// MTLSharedEvent: an event whose value the CPU can read and set, for
+// waiting on the GPU without blocking in wait_until_completed.
+@unsafe_send
+@unsafe_sync
+pub unsafe struct SharedEvent {
+    object: objc.Object
+
+    // Safety: `object` is an MTLSharedEvent.
+    pub unsafe fn from_object(object: objc.Object) -> SharedEvent {
+        return SharedEvent { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    pub fn set_label(&self, text: &str) {
+        set_label(self.object.as_ptr(), text)
+    }
+
+    pub fn signaled_value(&self) -> u64 {
+        return get_usize(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_SIGNALED_VALUE)
+        }, b"signaledValue\0")) as u64
+    }
+
+    pub fn set_signaled_value(&self, value: u64) {
+        set_usize(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_SIGNALED_VALUE)
+        }, b"setSignaledValue:\0"), value as usize)
+    }
+}
+
+static mut C_METAL_LAYER: usize = 0
+static mut S_SET_DEVICE: usize = 0
+static mut S_SET_FRAMEBUFFER_ONLY: usize = 0
+static mut S_SET_DRAWABLE_SIZE: usize = 0
+static mut S_DRAWABLE_SIZE: usize = 0
+static mut S_SET_MAXIMUM_DRAWABLE_COUNT: usize = 0
+static mut S_SET_DISPLAY_SYNC_ENABLED: usize = 0
+static mut S_SET_CONTENTS_SCALE: usize = 0
+static mut S_SET_OPAQUE: usize = 0
+static mut S_NEXT_DRAWABLE: usize = 0
+static mut S_SET_LAYER: usize = 0
+static mut S_SET_WANTS_LAYER: usize = 0
+static mut S_TEXTURE: usize = 0
+static mut S_PRESENT: usize = 0
+
+// CAMetalLayer: a Core Animation layer whose contents are Metal textures,
+// handed out one frame at a time by next_drawable.
+pub struct MetalLayer {
+    object: objc.Object
+
+    pub fn new() -> MetalLayer!Error {
+        object := instantiate(unsafe {
+            ptr.from_mut(&mut C_METAL_LAYER)
+        }, b"CAMetalLayer\0")?
+        return ok(MetalLayer { object: object })
+    }
+
+    // Safety: `object` is a CAMetalLayer.
+    pub unsafe fn from_object(object: objc.Object) -> MetalLayer {
+        return MetalLayer { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    fn id(&self) -> objc.Id {
+        return self.object.as_ptr()
+    }
+
+    pub fn set_device(&self, device: &Device) {
+        set_object(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DEVICE)
+        }, b"setDevice:\0"), device.object.as_ptr())
+    }
+
+    // PIXEL_FORMAT_BGRA8_UNORM (the default), its sRGB form,
+    // PIXEL_FORMAT_RGBA16_FLOAT, PIXEL_FORMAT_BGR10A2_UNORM or an XR format.
+    pub fn set_pixel_format(&self, format: PixelFormat) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_PIXEL_FORMAT)
+        }, b"setPixelFormat:\0"), format)
+    }
+
+    // True (the default) allows drawables only as render targets, which is
+    // faster; false also allows sampling and blits.
+    pub fn set_framebuffer_only(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_FRAMEBUFFER_ONLY)
+        }, b"setFramebufferOnly:\0"), value)
+    }
+
+    // The drawables' size in pixels.
+    pub fn set_drawable_size(&self, width: f64, height: f64) {
+        unsafe {
+            m_v_G(self.id(), sel(ptr.from_mut(&mut S_SET_DRAWABLE_SIZE), b"setDrawableSize:\0"), CGSize.new(width, height))
+        }
+    }
+
+    pub fn drawable_size(&self) -> CGSize {
+        return unsafe {
+            m_G(self.id(), sel(ptr.from_mut(&mut S_DRAWABLE_SIZE), b"drawableSize\0"))
+        }
+    }
+
+    // 2 or 3 (the default) drawables in flight.
+    pub fn set_maximum_drawable_count(&self, count: usize) {
+        set_usize(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_MAXIMUM_DRAWABLE_COUNT)
+        }, b"setMaximumDrawableCount:\0"), count)
+    }
+
+    // False presents immediately instead of at the display's refresh.
+    pub fn set_display_sync_enabled(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_DISPLAY_SYNC_ENABLED)
+        }, b"setDisplaySyncEnabled:\0"), value)
+    }
+
+    // Pixels per point, such as 2 on a Retina display.
+    pub fn set_contents_scale(&self, scale: f64) {
+        unsafe {
+            m_v_d(self.id(), sel(ptr.from_mut(&mut S_SET_CONTENTS_SCALE), b"setContentsScale:\0"), scale)
+        }
+    }
+
+    pub fn set_opaque(&self, value: bool) {
+        set_bool(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_SET_OPAQUE)
+        }, b"setOpaque:\0"), value)
+    }
+
+    // The next texture to draw a frame into. Waits up to a second for one
+    // to become free; none if none did or the layer has no device or size.
+    pub fn next_drawable(&self) -> Option<Drawable> {
+        match get(self.id(), sel(unsafe {
+            ptr.from_mut(&mut S_NEXT_DRAWABLE)
+        }, b"nextDrawable\0")) {
+            some(object) => {
+                return some(Drawable { object: object })
+            }
+            none => {
+                return none
+            }
+        }
+    }
+
+    // Make this layer the backing layer of an AppKit view, which then shows
+    // whatever is presented to it.
+    //
+    // Safety: `view` is a live NSView, and the call is on the main thread.
+    pub unsafe fn attach_to_view(&self, view: objc.Id) {
+        set_object(view, sel(unsafe {
+            ptr.from_mut(&mut S_SET_LAYER)
+        }, b"setLayer:\0"), self.id())
+        set_bool(view, sel(unsafe {
+            ptr.from_mut(&mut S_SET_WANTS_LAYER)
+        }, b"setWantsLayer:\0"), true)
+    }
+}
+
+// CAMetalDrawable: one frame of a MetalLayer.
+pub struct Drawable {
+    object: objc.Object
+
+    // Safety: `object` is a CAMetalDrawable.
+    pub unsafe fn from_object(object: objc.Object) -> Drawable {
+        return Drawable { object: object }
+    }
+
+    pub fn as_object(&self) -> &objc.Object {
+        return &self.object
+    }
+
+    // The texture to render the frame into.
+    pub fn texture(&self) -> Texture!Error {
+        match get(self.object.as_ptr(), sel(unsafe {
+            ptr.from_mut(&mut S_TEXTURE)
+        }, b"texture\0")) {
+            some(object) => {
+                return ok(Texture { object: object })
+            }
+            none => {
+                return err(Error.OutOfMemory)
+            }
+        }
+    }
+
+    // Show the frame now. Prefer CommandBuffer.present_drawable, which
+    // waits for the rendering commands to be scheduled.
+    pub fn present(&self) {
+        unsafe {
+            m_v(self.object.as_ptr(), sel(ptr.from_mut(&mut S_PRESENT), b"present\0"))
+        }
+    }
+}
+
+// Metal's enumerations, checked against the SDK headers by the test suite.
+// MTLPixelFormat.
+pub type PixelFormat = usize
+pub const PIXEL_FORMAT_INVALID: PixelFormat = 0
+pub const PIXEL_FORMAT_A8_UNORM: PixelFormat = 1
+pub const PIXEL_FORMAT_R8_UNORM: PixelFormat = 10
+pub const PIXEL_FORMAT_R8_UNORM_SRGB: PixelFormat = 11
+pub const PIXEL_FORMAT_R8_SNORM: PixelFormat = 12
+pub const PIXEL_FORMAT_R8_UINT: PixelFormat = 13
+pub const PIXEL_FORMAT_R8_SINT: PixelFormat = 14
+pub const PIXEL_FORMAT_R16_UNORM: PixelFormat = 20
+pub const PIXEL_FORMAT_R16_SNORM: PixelFormat = 22
+pub const PIXEL_FORMAT_R16_UINT: PixelFormat = 23
+pub const PIXEL_FORMAT_R16_SINT: PixelFormat = 24
+pub const PIXEL_FORMAT_R16_FLOAT: PixelFormat = 25
+pub const PIXEL_FORMAT_RG8_UNORM: PixelFormat = 30
+pub const PIXEL_FORMAT_RG8_UNORM_SRGB: PixelFormat = 31
+pub const PIXEL_FORMAT_RG8_SNORM: PixelFormat = 32
+pub const PIXEL_FORMAT_RG8_UINT: PixelFormat = 33
+pub const PIXEL_FORMAT_RG8_SINT: PixelFormat = 34
+pub const PIXEL_FORMAT_B5G6R5_UNORM: PixelFormat = 40
+pub const PIXEL_FORMAT_A1BGR5_UNORM: PixelFormat = 41
+pub const PIXEL_FORMAT_ABGR4_UNORM: PixelFormat = 42
+pub const PIXEL_FORMAT_BGR5A1_UNORM: PixelFormat = 43
+pub const PIXEL_FORMAT_R32_UINT: PixelFormat = 53
+pub const PIXEL_FORMAT_R32_SINT: PixelFormat = 54
+pub const PIXEL_FORMAT_R32_FLOAT: PixelFormat = 55
+pub const PIXEL_FORMAT_RG16_UNORM: PixelFormat = 60
+pub const PIXEL_FORMAT_RG16_SNORM: PixelFormat = 62
+pub const PIXEL_FORMAT_RG16_UINT: PixelFormat = 63
+pub const PIXEL_FORMAT_RG16_SINT: PixelFormat = 64
+pub const PIXEL_FORMAT_RG16_FLOAT: PixelFormat = 65
+pub const PIXEL_FORMAT_RGBA8_UNORM: PixelFormat = 70
+pub const PIXEL_FORMAT_RGBA8_UNORM_SRGB: PixelFormat = 71
+pub const PIXEL_FORMAT_RGBA8_SNORM: PixelFormat = 72
+pub const PIXEL_FORMAT_RGBA8_UINT: PixelFormat = 73
+pub const PIXEL_FORMAT_RGBA8_SINT: PixelFormat = 74
+pub const PIXEL_FORMAT_BGRA8_UNORM: PixelFormat = 80
+pub const PIXEL_FORMAT_BGRA8_UNORM_SRGB: PixelFormat = 81
+pub const PIXEL_FORMAT_RGB10A2_UNORM: PixelFormat = 90
+pub const PIXEL_FORMAT_RGB10A2_UINT: PixelFormat = 91
+pub const PIXEL_FORMAT_RG11B10_FLOAT: PixelFormat = 92
+pub const PIXEL_FORMAT_RGB9E5_FLOAT: PixelFormat = 93
+pub const PIXEL_FORMAT_BGR10A2_UNORM: PixelFormat = 94
+pub const PIXEL_FORMAT_BGR10_XR: PixelFormat = 554
+pub const PIXEL_FORMAT_BGR10_XR_SRGB: PixelFormat = 555
+pub const PIXEL_FORMAT_RG32_UINT: PixelFormat = 103
+pub const PIXEL_FORMAT_RG32_SINT: PixelFormat = 104
+pub const PIXEL_FORMAT_RG32_FLOAT: PixelFormat = 105
+pub const PIXEL_FORMAT_RGBA16_UNORM: PixelFormat = 110
+pub const PIXEL_FORMAT_RGBA16_SNORM: PixelFormat = 112
+pub const PIXEL_FORMAT_RGBA16_UINT: PixelFormat = 113
+pub const PIXEL_FORMAT_RGBA16_SINT: PixelFormat = 114
+pub const PIXEL_FORMAT_RGBA16_FLOAT: PixelFormat = 115
+pub const PIXEL_FORMAT_BGRA10_XR: PixelFormat = 552
+pub const PIXEL_FORMAT_BGRA10_XR_SRGB: PixelFormat = 553
+pub const PIXEL_FORMAT_RGBA32_UINT: PixelFormat = 123
+pub const PIXEL_FORMAT_RGBA32_SINT: PixelFormat = 124
+pub const PIXEL_FORMAT_RGBA32_FLOAT: PixelFormat = 125
+pub const PIXEL_FORMAT_BC1_RGBA: PixelFormat = 130
+pub const PIXEL_FORMAT_BC1_RGBA_SRGB: PixelFormat = 131
+pub const PIXEL_FORMAT_BC2_RGBA: PixelFormat = 132
+pub const PIXEL_FORMAT_BC2_RGBA_SRGB: PixelFormat = 133
+pub const PIXEL_FORMAT_BC3_RGBA: PixelFormat = 134
+pub const PIXEL_FORMAT_BC3_RGBA_SRGB: PixelFormat = 135
+pub const PIXEL_FORMAT_BC4_R_UNORM: PixelFormat = 140
+pub const PIXEL_FORMAT_BC4_R_SNORM: PixelFormat = 141
+pub const PIXEL_FORMAT_BC5_RG_UNORM: PixelFormat = 142
+pub const PIXEL_FORMAT_BC5_RG_SNORM: PixelFormat = 143
+pub const PIXEL_FORMAT_BC6H_RGB_FLOAT: PixelFormat = 150
+pub const PIXEL_FORMAT_BC6H_RGB_UFLOAT: PixelFormat = 151
+pub const PIXEL_FORMAT_BC7_RGBA_UNORM: PixelFormat = 152
+pub const PIXEL_FORMAT_BC7_RGBA_UNORM_SRGB: PixelFormat = 153
+pub const PIXEL_FORMAT_EAC_R11_UNORM: PixelFormat = 170
+pub const PIXEL_FORMAT_EAC_R11_SNORM: PixelFormat = 172
+pub const PIXEL_FORMAT_EAC_RG11_UNORM: PixelFormat = 174
+pub const PIXEL_FORMAT_EAC_RG11_SNORM: PixelFormat = 176
+pub const PIXEL_FORMAT_EAC_RGBA8: PixelFormat = 178
+pub const PIXEL_FORMAT_EAC_RGBA8_SRGB: PixelFormat = 179
+pub const PIXEL_FORMAT_ETC2_RGB8: PixelFormat = 180
+pub const PIXEL_FORMAT_ETC2_RGB8_SRGB: PixelFormat = 181
+pub const PIXEL_FORMAT_ETC2_RGB8A1: PixelFormat = 182
+pub const PIXEL_FORMAT_ETC2_RGB8A1_SRGB: PixelFormat = 183
+pub const PIXEL_FORMAT_ASTC_4X4_SRGB: PixelFormat = 186
+pub const PIXEL_FORMAT_ASTC_5X4_SRGB: PixelFormat = 187
+pub const PIXEL_FORMAT_ASTC_5X5_SRGB: PixelFormat = 188
+pub const PIXEL_FORMAT_ASTC_6X5_SRGB: PixelFormat = 189
+pub const PIXEL_FORMAT_ASTC_6X6_SRGB: PixelFormat = 190
+pub const PIXEL_FORMAT_ASTC_8X5_SRGB: PixelFormat = 192
+pub const PIXEL_FORMAT_ASTC_8X6_SRGB: PixelFormat = 193
+pub const PIXEL_FORMAT_ASTC_8X8_SRGB: PixelFormat = 194
+pub const PIXEL_FORMAT_ASTC_10X5_SRGB: PixelFormat = 195
+pub const PIXEL_FORMAT_ASTC_10X6_SRGB: PixelFormat = 196
+pub const PIXEL_FORMAT_ASTC_10X8_SRGB: PixelFormat = 197
+pub const PIXEL_FORMAT_ASTC_10X10_SRGB: PixelFormat = 198
+pub const PIXEL_FORMAT_ASTC_12X10_SRGB: PixelFormat = 199
+pub const PIXEL_FORMAT_ASTC_12X12_SRGB: PixelFormat = 200
+pub const PIXEL_FORMAT_ASTC_4X4_LDR: PixelFormat = 204
+pub const PIXEL_FORMAT_ASTC_5X4_LDR: PixelFormat = 205
+pub const PIXEL_FORMAT_ASTC_5X5_LDR: PixelFormat = 206
+pub const PIXEL_FORMAT_ASTC_6X5_LDR: PixelFormat = 207
+pub const PIXEL_FORMAT_ASTC_6X6_LDR: PixelFormat = 208
+pub const PIXEL_FORMAT_ASTC_8X5_LDR: PixelFormat = 210
+pub const PIXEL_FORMAT_ASTC_8X6_LDR: PixelFormat = 211
+pub const PIXEL_FORMAT_ASTC_8X8_LDR: PixelFormat = 212
+pub const PIXEL_FORMAT_ASTC_10X5_LDR: PixelFormat = 213
+pub const PIXEL_FORMAT_ASTC_10X6_LDR: PixelFormat = 214
+pub const PIXEL_FORMAT_ASTC_10X8_LDR: PixelFormat = 215
+pub const PIXEL_FORMAT_ASTC_10X10_LDR: PixelFormat = 216
+pub const PIXEL_FORMAT_ASTC_12X10_LDR: PixelFormat = 217
+pub const PIXEL_FORMAT_ASTC_12X12_LDR: PixelFormat = 218
+pub const PIXEL_FORMAT_ASTC_4X4_HDR: PixelFormat = 222
+pub const PIXEL_FORMAT_ASTC_5X4_HDR: PixelFormat = 223
+pub const PIXEL_FORMAT_ASTC_5X5_HDR: PixelFormat = 224
+pub const PIXEL_FORMAT_ASTC_6X5_HDR: PixelFormat = 225
+pub const PIXEL_FORMAT_ASTC_6X6_HDR: PixelFormat = 226
+pub const PIXEL_FORMAT_ASTC_8X5_HDR: PixelFormat = 228
+pub const PIXEL_FORMAT_ASTC_8X6_HDR: PixelFormat = 229
+pub const PIXEL_FORMAT_ASTC_8X8_HDR: PixelFormat = 230
+pub const PIXEL_FORMAT_ASTC_10X5_HDR: PixelFormat = 231
+pub const PIXEL_FORMAT_ASTC_10X6_HDR: PixelFormat = 232
+pub const PIXEL_FORMAT_ASTC_10X8_HDR: PixelFormat = 233
+pub const PIXEL_FORMAT_ASTC_10X10_HDR: PixelFormat = 234
+pub const PIXEL_FORMAT_ASTC_12X10_HDR: PixelFormat = 235
+pub const PIXEL_FORMAT_ASTC_12X12_HDR: PixelFormat = 236
+pub const PIXEL_FORMAT_GBGR422: PixelFormat = 240
+pub const PIXEL_FORMAT_BGRG422: PixelFormat = 241
+pub const PIXEL_FORMAT_DEPTH16_UNORM: PixelFormat = 250
+pub const PIXEL_FORMAT_DEPTH32_FLOAT: PixelFormat = 252
+pub const PIXEL_FORMAT_STENCIL8: PixelFormat = 253
+pub const PIXEL_FORMAT_DEPTH24_UNORM_STENCIL8: PixelFormat = 255
+pub const PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8: PixelFormat = 260
+pub const PIXEL_FORMAT_X32_STENCIL8: PixelFormat = 261
+pub const PIXEL_FORMAT_X24_STENCIL8: PixelFormat = 262
+
+// MTLResourceOptions.
+pub type ResourceOptions = usize
+pub const RESOURCE_CPU_CACHE_MODE_DEFAULT_CACHE: ResourceOptions = 0
+pub const RESOURCE_CPU_CACHE_MODE_WRITE_COMBINED: ResourceOptions = 1
+pub const RESOURCE_STORAGE_MODE_SHARED: ResourceOptions = 0
+pub const RESOURCE_STORAGE_MODE_MANAGED: ResourceOptions = 16
+pub const RESOURCE_STORAGE_MODE_PRIVATE: ResourceOptions = 32
+pub const RESOURCE_STORAGE_MODE_MEMORYLESS: ResourceOptions = 48
+pub const RESOURCE_HAZARD_TRACKING_MODE_DEFAULT: ResourceOptions = 0
+pub const RESOURCE_HAZARD_TRACKING_MODE_UNTRACKED: ResourceOptions = 256
+pub const RESOURCE_HAZARD_TRACKING_MODE_TRACKED: ResourceOptions = 512
+
+// MTLStorageMode.
+pub type StorageMode = usize
+pub const STORAGE_MODE_SHARED: StorageMode = 0
+pub const STORAGE_MODE_MANAGED: StorageMode = 1
+pub const STORAGE_MODE_PRIVATE: StorageMode = 2
+pub const STORAGE_MODE_MEMORYLESS: StorageMode = 3
+
+// MTLCpuCacheMode.
+pub type CpuCacheMode = usize
+pub const CPU_CACHE_MODE_DEFAULT_CACHE: CpuCacheMode = 0
+pub const CPU_CACHE_MODE_WRITE_COMBINED: CpuCacheMode = 1
+
+// MTLHazardTrackingMode.
+pub type HazardTrackingMode = usize
+pub const HAZARD_TRACKING_MODE_DEFAULT: HazardTrackingMode = 0
+pub const HAZARD_TRACKING_MODE_UNTRACKED: HazardTrackingMode = 1
+pub const HAZARD_TRACKING_MODE_TRACKED: HazardTrackingMode = 2
+
+// MTLTextureType.
+pub type TextureType = usize
+pub const TEXTURE_TYPE_1D: TextureType = 0
+pub const TEXTURE_TYPE_1D_ARRAY: TextureType = 1
+pub const TEXTURE_TYPE_2D: TextureType = 2
+pub const TEXTURE_TYPE_2D_ARRAY: TextureType = 3
+pub const TEXTURE_TYPE_2D_MULTISAMPLE: TextureType = 4
+pub const TEXTURE_TYPE_CUBE: TextureType = 5
+pub const TEXTURE_TYPE_CUBE_ARRAY: TextureType = 6
+pub const TEXTURE_TYPE_3D: TextureType = 7
+pub const TEXTURE_TYPE_2D_MULTISAMPLE_ARRAY: TextureType = 8
+pub const TEXTURE_TYPE_TEXTURE_BUFFER: TextureType = 9
+
+// MTLTextureUsage.
+pub type TextureUsage = usize
+pub const TEXTURE_USAGE_UNKNOWN: TextureUsage = 0
+pub const TEXTURE_USAGE_SHADER_READ: TextureUsage = 1
+pub const TEXTURE_USAGE_SHADER_WRITE: TextureUsage = 2
+pub const TEXTURE_USAGE_RENDER_TARGET: TextureUsage = 4
+pub const TEXTURE_USAGE_PIXEL_FORMAT_VIEW: TextureUsage = 16
+pub const TEXTURE_USAGE_SHADER_ATOMIC: TextureUsage = 32
+
+// MTLLoadAction.
+pub type LoadAction = usize
+pub const LOAD_ACTION_DONT_CARE: LoadAction = 0
+pub const LOAD_ACTION_LOAD: LoadAction = 1
+pub const LOAD_ACTION_CLEAR: LoadAction = 2
+
+// MTLStoreAction.
+pub type StoreAction = usize
+pub const STORE_ACTION_DONT_CARE: StoreAction = 0
+pub const STORE_ACTION_STORE: StoreAction = 1
+pub const STORE_ACTION_MULTISAMPLE_RESOLVE: StoreAction = 2
+pub const STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE: StoreAction = 3
+pub const STORE_ACTION_UNKNOWN: StoreAction = 4
+pub const STORE_ACTION_CUSTOM_SAMPLE_DEPTH_STORE: StoreAction = 5
+
+// MTLPrimitiveType.
+pub type PrimitiveType = usize
+pub const PRIMITIVE_TYPE_POINT: PrimitiveType = 0
+pub const PRIMITIVE_TYPE_LINE: PrimitiveType = 1
+pub const PRIMITIVE_TYPE_LINE_STRIP: PrimitiveType = 2
+pub const PRIMITIVE_TYPE_TRIANGLE: PrimitiveType = 3
+pub const PRIMITIVE_TYPE_TRIANGLE_STRIP: PrimitiveType = 4
+
+// MTLPrimitiveTopologyClass.
+pub type PrimitiveTopologyClass = usize
+pub const PRIMITIVE_TOPOLOGY_CLASS_UNSPECIFIED: PrimitiveTopologyClass = 0
+pub const PRIMITIVE_TOPOLOGY_CLASS_POINT: PrimitiveTopologyClass = 1
+pub const PRIMITIVE_TOPOLOGY_CLASS_LINE: PrimitiveTopologyClass = 2
+pub const PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE: PrimitiveTopologyClass = 3
+
+// MTLIndexType.
+pub type IndexType = usize
+pub const INDEX_TYPE_UINT16: IndexType = 0
+pub const INDEX_TYPE_UINT32: IndexType = 1
+
+// MTLCullMode.
+pub type CullMode = usize
+pub const CULL_MODE_NONE: CullMode = 0
+pub const CULL_MODE_FRONT: CullMode = 1
+pub const CULL_MODE_BACK: CullMode = 2
+
+// MTLWinding.
+pub type Winding = usize
+pub const WINDING_CLOCKWISE: Winding = 0
+pub const WINDING_COUNTER_CLOCKWISE: Winding = 1
+
+// MTLTriangleFillMode.
+pub type TriangleFillMode = usize
+pub const TRIANGLE_FILL_MODE_FILL: TriangleFillMode = 0
+pub const TRIANGLE_FILL_MODE_LINES: TriangleFillMode = 1
+
+// MTLDepthClipMode.
+pub type DepthClipMode = usize
+pub const DEPTH_CLIP_MODE_CLIP: DepthClipMode = 0
+pub const DEPTH_CLIP_MODE_CLAMP: DepthClipMode = 1
+
+// MTLCompareFunction.
+pub type CompareFunction = usize
+pub const COMPARE_FUNCTION_NEVER: CompareFunction = 0
+pub const COMPARE_FUNCTION_LESS: CompareFunction = 1
+pub const COMPARE_FUNCTION_EQUAL: CompareFunction = 2
+pub const COMPARE_FUNCTION_LESS_EQUAL: CompareFunction = 3
+pub const COMPARE_FUNCTION_GREATER: CompareFunction = 4
+pub const COMPARE_FUNCTION_NOT_EQUAL: CompareFunction = 5
+pub const COMPARE_FUNCTION_GREATER_EQUAL: CompareFunction = 6
+pub const COMPARE_FUNCTION_ALWAYS: CompareFunction = 7
+
+// MTLStencilOperation.
+pub type StencilOperation = usize
+pub const STENCIL_OPERATION_KEEP: StencilOperation = 0
+pub const STENCIL_OPERATION_ZERO: StencilOperation = 1
+pub const STENCIL_OPERATION_REPLACE: StencilOperation = 2
+pub const STENCIL_OPERATION_INCREMENT_CLAMP: StencilOperation = 3
+pub const STENCIL_OPERATION_DECREMENT_CLAMP: StencilOperation = 4
+pub const STENCIL_OPERATION_INVERT: StencilOperation = 5
+pub const STENCIL_OPERATION_INCREMENT_WRAP: StencilOperation = 6
+pub const STENCIL_OPERATION_DECREMENT_WRAP: StencilOperation = 7
+
+// MTLBlendFactor.
+pub type BlendFactor = usize
+pub const BLEND_FACTOR_ZERO: BlendFactor = 0
+pub const BLEND_FACTOR_ONE: BlendFactor = 1
+pub const BLEND_FACTOR_SOURCE_COLOR: BlendFactor = 2
+pub const BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR: BlendFactor = 3
+pub const BLEND_FACTOR_SOURCE_ALPHA: BlendFactor = 4
+pub const BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA: BlendFactor = 5
+pub const BLEND_FACTOR_DESTINATION_COLOR: BlendFactor = 6
+pub const BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR: BlendFactor = 7
+pub const BLEND_FACTOR_DESTINATION_ALPHA: BlendFactor = 8
+pub const BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA: BlendFactor = 9
+pub const BLEND_FACTOR_SOURCE_ALPHA_SATURATED: BlendFactor = 10
+pub const BLEND_FACTOR_BLEND_COLOR: BlendFactor = 11
+pub const BLEND_FACTOR_ONE_MINUS_BLEND_COLOR: BlendFactor = 12
+pub const BLEND_FACTOR_BLEND_ALPHA: BlendFactor = 13
+pub const BLEND_FACTOR_ONE_MINUS_BLEND_ALPHA: BlendFactor = 14
+pub const BLEND_FACTOR_SOURCE1_COLOR: BlendFactor = 15
+pub const BLEND_FACTOR_ONE_MINUS_SOURCE1_COLOR: BlendFactor = 16
+pub const BLEND_FACTOR_SOURCE1_ALPHA: BlendFactor = 17
+pub const BLEND_FACTOR_ONE_MINUS_SOURCE1_ALPHA: BlendFactor = 18
+
+// MTLBlendOperation.
+pub type BlendOperation = usize
+pub const BLEND_OPERATION_ADD: BlendOperation = 0
+pub const BLEND_OPERATION_SUBTRACT: BlendOperation = 1
+pub const BLEND_OPERATION_REVERSE_SUBTRACT: BlendOperation = 2
+pub const BLEND_OPERATION_MIN: BlendOperation = 3
+pub const BLEND_OPERATION_MAX: BlendOperation = 4
+
+// MTLColorWriteMask.
+pub type ColorWriteMask = usize
+pub const COLOR_WRITE_MASK_NONE: ColorWriteMask = 0
+pub const COLOR_WRITE_MASK_RED: ColorWriteMask = 8
+pub const COLOR_WRITE_MASK_GREEN: ColorWriteMask = 4
+pub const COLOR_WRITE_MASK_BLUE: ColorWriteMask = 2
+pub const COLOR_WRITE_MASK_ALPHA: ColorWriteMask = 1
+pub const COLOR_WRITE_MASK_ALL: ColorWriteMask = 15
+
+// MTLSamplerMinMagFilter.
+pub type SamplerMinMagFilter = usize
+pub const SAMPLER_MIN_MAG_FILTER_NEAREST: SamplerMinMagFilter = 0
+pub const SAMPLER_MIN_MAG_FILTER_LINEAR: SamplerMinMagFilter = 1
+
+// MTLSamplerMipFilter.
+pub type SamplerMipFilter = usize
+pub const SAMPLER_MIP_FILTER_NOT_MIPMAPPED: SamplerMipFilter = 0
+pub const SAMPLER_MIP_FILTER_NEAREST: SamplerMipFilter = 1
+pub const SAMPLER_MIP_FILTER_LINEAR: SamplerMipFilter = 2
+
+// MTLSamplerAddressMode.
+pub type SamplerAddressMode = usize
+pub const SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE: SamplerAddressMode = 0
+pub const SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE: SamplerAddressMode = 1
+pub const SAMPLER_ADDRESS_MODE_REPEAT: SamplerAddressMode = 2
+pub const SAMPLER_ADDRESS_MODE_MIRROR_REPEAT: SamplerAddressMode = 3
+pub const SAMPLER_ADDRESS_MODE_CLAMP_TO_ZERO: SamplerAddressMode = 4
+pub const SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR: SamplerAddressMode = 5
+
+// MTLSamplerBorderColor.
+pub type SamplerBorderColor = usize
+pub const SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK: SamplerBorderColor = 0
+pub const SAMPLER_BORDER_COLOR_OPAQUE_BLACK: SamplerBorderColor = 1
+pub const SAMPLER_BORDER_COLOR_OPAQUE_WHITE: SamplerBorderColor = 2
+
+// MTLVertexFormat.
+pub type VertexFormat = usize
+pub const VERTEX_FORMAT_INVALID: VertexFormat = 0
+pub const VERTEX_FORMAT_UCHAR2: VertexFormat = 1
+pub const VERTEX_FORMAT_UCHAR3: VertexFormat = 2
+pub const VERTEX_FORMAT_UCHAR4: VertexFormat = 3
+pub const VERTEX_FORMAT_CHAR2: VertexFormat = 4
+pub const VERTEX_FORMAT_CHAR3: VertexFormat = 5
+pub const VERTEX_FORMAT_CHAR4: VertexFormat = 6
+pub const VERTEX_FORMAT_UCHAR2_NORMALIZED: VertexFormat = 7
+pub const VERTEX_FORMAT_UCHAR3_NORMALIZED: VertexFormat = 8
+pub const VERTEX_FORMAT_UCHAR4_NORMALIZED: VertexFormat = 9
+pub const VERTEX_FORMAT_CHAR2_NORMALIZED: VertexFormat = 10
+pub const VERTEX_FORMAT_CHAR3_NORMALIZED: VertexFormat = 11
+pub const VERTEX_FORMAT_CHAR4_NORMALIZED: VertexFormat = 12
+pub const VERTEX_FORMAT_USHORT2: VertexFormat = 13
+pub const VERTEX_FORMAT_USHORT3: VertexFormat = 14
+pub const VERTEX_FORMAT_USHORT4: VertexFormat = 15
+pub const VERTEX_FORMAT_SHORT2: VertexFormat = 16
+pub const VERTEX_FORMAT_SHORT3: VertexFormat = 17
+pub const VERTEX_FORMAT_SHORT4: VertexFormat = 18
+pub const VERTEX_FORMAT_USHORT2_NORMALIZED: VertexFormat = 19
+pub const VERTEX_FORMAT_USHORT3_NORMALIZED: VertexFormat = 20
+pub const VERTEX_FORMAT_USHORT4_NORMALIZED: VertexFormat = 21
+pub const VERTEX_FORMAT_SHORT2_NORMALIZED: VertexFormat = 22
+pub const VERTEX_FORMAT_SHORT3_NORMALIZED: VertexFormat = 23
+pub const VERTEX_FORMAT_SHORT4_NORMALIZED: VertexFormat = 24
+pub const VERTEX_FORMAT_HALF2: VertexFormat = 25
+pub const VERTEX_FORMAT_HALF3: VertexFormat = 26
+pub const VERTEX_FORMAT_HALF4: VertexFormat = 27
+pub const VERTEX_FORMAT_FLOAT: VertexFormat = 28
+pub const VERTEX_FORMAT_FLOAT2: VertexFormat = 29
+pub const VERTEX_FORMAT_FLOAT3: VertexFormat = 30
+pub const VERTEX_FORMAT_FLOAT4: VertexFormat = 31
+pub const VERTEX_FORMAT_INT: VertexFormat = 32
+pub const VERTEX_FORMAT_INT2: VertexFormat = 33
+pub const VERTEX_FORMAT_INT3: VertexFormat = 34
+pub const VERTEX_FORMAT_INT4: VertexFormat = 35
+pub const VERTEX_FORMAT_UINT: VertexFormat = 36
+pub const VERTEX_FORMAT_UINT2: VertexFormat = 37
+pub const VERTEX_FORMAT_UINT3: VertexFormat = 38
+pub const VERTEX_FORMAT_UINT4: VertexFormat = 39
+pub const VERTEX_FORMAT_INT1010102_NORMALIZED: VertexFormat = 40
+pub const VERTEX_FORMAT_UINT1010102_NORMALIZED: VertexFormat = 41
+pub const VERTEX_FORMAT_UCHAR4_NORMALIZED_BGRA: VertexFormat = 42
+pub const VERTEX_FORMAT_UCHAR: VertexFormat = 45
+pub const VERTEX_FORMAT_CHAR: VertexFormat = 46
+pub const VERTEX_FORMAT_UCHAR_NORMALIZED: VertexFormat = 47
+pub const VERTEX_FORMAT_CHAR_NORMALIZED: VertexFormat = 48
+pub const VERTEX_FORMAT_USHORT: VertexFormat = 49
+pub const VERTEX_FORMAT_SHORT: VertexFormat = 50
+pub const VERTEX_FORMAT_USHORT_NORMALIZED: VertexFormat = 51
+pub const VERTEX_FORMAT_SHORT_NORMALIZED: VertexFormat = 52
+pub const VERTEX_FORMAT_HALF: VertexFormat = 53
+pub const VERTEX_FORMAT_FLOAT_RG11B10: VertexFormat = 54
+pub const VERTEX_FORMAT_FLOAT_RGB9E5: VertexFormat = 55
+
+// MTLVertexStepFunction.
+pub type VertexStepFunction = usize
+pub const VERTEX_STEP_FUNCTION_CONSTANT: VertexStepFunction = 0
+pub const VERTEX_STEP_FUNCTION_PER_VERTEX: VertexStepFunction = 1
+pub const VERTEX_STEP_FUNCTION_PER_INSTANCE: VertexStepFunction = 2
+pub const VERTEX_STEP_FUNCTION_PER_PATCH: VertexStepFunction = 3
+pub const VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT: VertexStepFunction = 4
+
+// MTLCommandBufferStatus.
+pub type CommandBufferStatus = usize
+pub const COMMAND_BUFFER_STATUS_NOT_ENQUEUED: CommandBufferStatus = 0
+pub const COMMAND_BUFFER_STATUS_ENQUEUED: CommandBufferStatus = 1
+pub const COMMAND_BUFFER_STATUS_COMMITTED: CommandBufferStatus = 2
+pub const COMMAND_BUFFER_STATUS_SCHEDULED: CommandBufferStatus = 3
+pub const COMMAND_BUFFER_STATUS_COMPLETED: CommandBufferStatus = 4
+pub const COMMAND_BUFFER_STATUS_ERROR: CommandBufferStatus = 5
+
+// MTLRenderStages.
+pub type RenderStages = usize
+pub const RENDER_STAGE_VERTEX: RenderStages = 1
+pub const RENDER_STAGE_FRAGMENT: RenderStages = 2
+
+// MTLResourceUsage.
+pub type ResourceUsage = usize
+pub const RESOURCE_USAGE_READ: ResourceUsage = 1
+pub const RESOURCE_USAGE_WRITE: ResourceUsage = 2
+pub const RESOURCE_USAGE_SAMPLE: ResourceUsage = 4
+
+// MTLBarrierScope.
+pub type BarrierScope = usize
+pub const BARRIER_SCOPE_BUFFERS: BarrierScope = 1
+pub const BARRIER_SCOPE_TEXTURES: BarrierScope = 2
+pub const BARRIER_SCOPE_RENDER_TARGETS: BarrierScope = 4
+
+// MTLGpuFamily.
+pub type GpuFamily = usize
+pub const GPU_FAMILY_APPLE1: GpuFamily = 1001
+pub const GPU_FAMILY_APPLE2: GpuFamily = 1002
+pub const GPU_FAMILY_APPLE3: GpuFamily = 1003
+pub const GPU_FAMILY_APPLE4: GpuFamily = 1004
+pub const GPU_FAMILY_APPLE5: GpuFamily = 1005
+pub const GPU_FAMILY_APPLE6: GpuFamily = 1006
+pub const GPU_FAMILY_APPLE7: GpuFamily = 1007
+pub const GPU_FAMILY_APPLE8: GpuFamily = 1008
+pub const GPU_FAMILY_APPLE9: GpuFamily = 1009
+pub const GPU_FAMILY_APPLE10: GpuFamily = 1010
+pub const GPU_FAMILY_APPLE11: GpuFamily = 1011
+pub const GPU_FAMILY_MAC1: GpuFamily = 2001
+pub const GPU_FAMILY_MAC2: GpuFamily = 2002
+pub const GPU_FAMILY_COMMON1: GpuFamily = 3001
+pub const GPU_FAMILY_COMMON2: GpuFamily = 3002
+pub const GPU_FAMILY_COMMON3: GpuFamily = 3003
+pub const GPU_FAMILY_METAL3: GpuFamily = 5001
+pub const GPU_FAMILY_METAL4: GpuFamily = 5002
+
+// MTLLanguageVersion.
+pub type LanguageVersion = usize
+pub const LANGUAGE_VERSION_2_0: LanguageVersion = 131072
+pub const LANGUAGE_VERSION_2_1: LanguageVersion = 131073
+pub const LANGUAGE_VERSION_2_2: LanguageVersion = 131074
+pub const LANGUAGE_VERSION_2_3: LanguageVersion = 131075
+pub const LANGUAGE_VERSION_2_4: LanguageVersion = 131076
+pub const LANGUAGE_VERSION_3_0: LanguageVersion = 196608
+pub const LANGUAGE_VERSION_3_1: LanguageVersion = 196609
+pub const LANGUAGE_VERSION_3_2: LanguageVersion = 196610
+pub const LANGUAGE_VERSION_4_0: LanguageVersion = 262144
+pub const LANGUAGE_VERSION_4_1: LanguageVersion = 262145
+
+// MTLMathMode.
+pub type MathMode = usize
+pub const MATH_MODE_SAFE: MathMode = 0
+pub const MATH_MODE_RELAXED: MathMode = 1
+pub const MATH_MODE_FAST: MathMode = 2

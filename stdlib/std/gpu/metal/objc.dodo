@@ -1,0 +1,411 @@
+package objc
+
+import "core/mem"
+import "core/ptr"
+
+// The Objective-C runtime, as std/gpu/metal uses it. Everything here is
+// plain C calls into libobjc: classes and selectors are looked up by name,
+// messages are sent through objc_msgSend declared once per method signature,
+// and objects are reference counted by hand.
+//
+// Object is an owned strong reference: creating one retains or adopts a
+// reference, and dropping it releases that reference. Because Dodo moves
+// structs, a reference has exactly one owner unless clone() retains another.
+//
+// Methods that return an object without transferring ownership often
+// autorelease it, and frameworks autorelease internally too. The wrappers
+// here and in std/gpu/metal make such calls inside a temporary autorelease
+// pool, so nothing collects in a pool a command-line program never drains.
+// A program sending its own messages can use AutoreleasePool the same way.
+
+// An object, class or selector pointer as the runtime passes it.
+pub type Id = *mut u8
+
+unsafe extern "C" fn objc_getClass(name: *const u8) -> *mut u8
+unsafe extern "C" fn sel_registerName(name: *const u8) -> *mut u8
+unsafe extern "C" fn objc_retain(object: *mut u8) -> *mut u8
+unsafe extern "C" fn objc_release(object: *mut u8)
+unsafe extern "C" fn objc_autoreleasePoolPush() -> *mut u8
+unsafe extern "C" fn objc_autoreleasePoolPop(pool: *mut u8)
+
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_id(receiver: *mut u8, selector: *mut u8) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_usize(receiver: *mut u8, selector: *mut u8) -> usize
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_isize(receiver: *mut u8, selector: *mut u8) -> isize
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_id_usize(receiver: *mut u8, selector: *mut u8, value: usize) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_usize_usize(receiver: *mut u8, selector: *mut u8, value: usize) -> usize
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_bool_id(receiver: *mut u8, selector: *mut u8, value: *mut u8) -> bool
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_init_bytes(receiver: *mut u8, selector: *mut u8, bytes: *const u8, length: usize, encoding: usize) -> *mut u8
+@link_name("objc_msgSend")
+unsafe extern "C" fn send_get_bytes(receiver: *mut u8, selector: *mut u8, buffer: *mut u8, capacity: usize, used: *mut usize, encoding: usize, options: usize, range: Range, remaining: *mut Range) -> bool
+
+// NSRange: a span of UTF-16 units or array elements.
+@repr(C)
+pub struct Range {
+    pub location: usize
+    pub length: usize
+
+    pub fn new(location: usize, length: usize) -> Range {
+        return Range { location: location, length: length }
+    }
+}
+
+// NSUTF8StringEncoding.
+const UTF8: usize = 4
+
+fn null() -> Id {
+    return unsafe {
+        0usize as Id
+    }
+}
+
+fn terminated(name: &[u8]) -> bool {
+    if name.len == 0 || name[name.len - 1] != 0 {
+        return false
+    }
+    for i in 0usize..name.len - 1 {
+        if name[i] == 0 {
+            return false
+        }
+    }
+    return true
+}
+
+// The class with this NUL-terminated name, if the process has loaded it.
+pub fn class(name: &[u8]) -> Option<Id> {
+    if !terminated(name) {
+        return none
+    }
+    found := unsafe {
+        objc_getClass(ptr.as_ptr(name))
+    }
+    if ptr.is_null(found) {
+        return none
+    }
+    return some(found)
+}
+
+// The selector with this NUL-terminated name, such as b"length\0".
+// Returns none for a name without exactly one terminating NUL.
+pub fn selector(name: &[u8]) -> Option<Id> {
+    if !terminated(name) {
+        return none
+    }
+    return some(unsafe {
+        sel_registerName(ptr.as_ptr(name))
+    })
+}
+
+// Look up a selector once and keep it in `slot`, a static initialized to 0.
+// Racing threads store the same value, so relaxed atomics suffice.
+//
+// Safety: `slot` addresses a live, aligned usize used only for this name,
+// and `name` ends in its only NUL.
+pub unsafe fn cached_selector(slot: *mut usize, name: &[u8]) -> Id {
+    unsafe {
+        value := mem.atomic_load(slot, 0)
+        if value == 0 {
+            value = sel_registerName(ptr.as_ptr(name)) as usize
+            mem.atomic_store(slot, value, 0)
+        }
+        return value as Id
+    }
+}
+
+// Look up a class once and keep it in `slot`, a static initialized to 0.
+// Returns null if the class is not loaded; a later call looks again.
+//
+// Safety: as for cached_selector.
+pub unsafe fn cached_class(slot: *mut usize, name: &[u8]) -> Id {
+    unsafe {
+        value := mem.atomic_load(slot, 0)
+        if value == 0 {
+            value = objc_getClass(ptr.as_ptr(name)) as usize
+            mem.atomic_store(slot, value, 0)
+        }
+        return value as Id
+    }
+}
+
+// An owned strong reference to an Objective-C object. Never null.
+pub struct Object {
+    id: Id
+
+    // Adopt a reference the caller owns, such as the result of a method
+    // whose name begins with alloc, new, copy or mutableCopy. Returns none
+    // for nil, which needs no release.
+    //
+    // Safety: `id` is nil or an object whose +1 reference is transferred.
+    pub unsafe fn from_retained(id: Id) -> Option<Object> {
+        if ptr.is_null(id) {
+            return none
+        }
+        return some(Object { id: id })
+    }
+
+    // Retain an object the caller does not own, such as most getters'
+    // results. Returns none for nil.
+    //
+    // Safety: `id` is nil or a live object.
+    pub unsafe fn retain(id: Id) -> Option<Object> {
+        if ptr.is_null(id) {
+            return none
+        }
+        unsafe {
+            objc_retain(id)
+        }
+        return some(Object { id: id })
+    }
+
+    // The object pointer, for sending messages. It stays valid while self
+    // is alive; the caller must not release it.
+    pub fn as_ptr(&self) -> Id {
+        return self.id
+    }
+
+    // Another strong reference to the same object.
+    pub fn clone(&self) -> Object {
+        unsafe {
+            objc_retain(self.id)
+        }
+        return Object { id: self.id }
+    }
+
+    // Give up ownership without releasing: the caller now owns the +1
+    // reference and must eventually release it.
+    pub fn into_retained(self) -> Id {
+        id := self.id
+        // Opaque storage never drops its payload, so this skips release.
+        forgotten := mem.init(self)
+        core.drop(forgotten)
+        return id
+    }
+
+    // Whether both reference the same object.
+    pub fn same(&self, other: &Object) -> bool {
+        return self.id == other.id
+    }
+
+    // Whether the object is an instance of the class or a subclass.
+    pub fn is_kind_of(&self, class: Id) -> bool {
+        return unsafe {
+            send_bool_id(self.id, cached_selector(ptr.from_mut(&mut S_IS_KIND_OF_CLASS), b"isKindOfClass:\0"), class)
+        }
+    }
+
+    // Deallocation may autorelease, so it runs inside a temporary pool.
+    fn drop(&mut self) {
+        unsafe {
+            pool := objc_autoreleasePoolPush()
+            objc_release(self.id)
+            objc_autoreleasePoolPop(pool)
+        }
+    }
+}
+
+// Collects autoreleased objects until dropped. Pools nest: drop them in the
+// reverse order of creation, on the thread that created them.
+pub struct AutoreleasePool {
+    token: Id
+
+    pub fn new() -> AutoreleasePool {
+        return AutoreleasePool { token: unsafe {
+            objc_autoreleasePoolPush()
+        }
+        }
+    }
+
+    fn drop(&mut self) {
+        unsafe {
+            objc_autoreleasePoolPop(self.token)
+        }
+    }
+}
+
+static mut S_IS_KIND_OF_CLASS: usize = 0
+static mut S_ALLOC: usize = 0
+static mut S_INIT_BYTES: usize = 0
+static mut S_LENGTH_OF_BYTES: usize = 0
+static mut S_LENGTH: usize = 0
+static mut S_GET_BYTES: usize = 0
+static mut S_IS_EQUAL_TO_STRING: usize = 0
+static mut S_CODE: usize = 0
+static mut S_DOMAIN: usize = 0
+static mut S_LOCALIZED_DESCRIPTION: usize = 0
+static mut S_COUNT: usize = 0
+static mut S_OBJECT_AT_INDEX: usize = 0
+static mut C_NSSTRING: usize = 0
+
+// Send a getter returning an unowned object and retain the result.
+//
+// Safety: `receiver` is live and `selector` names a method taking no
+// arguments and returning an object or nil.
+pub unsafe fn get_object(receiver: Id, selector: Id) -> Option<Object> {
+    unsafe {
+        pool := AutoreleasePool.new()
+        result := Object.retain(send_id(receiver, selector))
+        core.drop(pool)
+        return result
+    }
+}
+
+// An immutable NSString.
+pub struct NSString {
+    object: Object
+
+    // A copy of `text`. Returns none if Foundation is not loaded or
+    // the allocation fails.
+    pub fn new(text: &str) -> Option<NSString> {
+        bytes := mem.str_bytes(text)
+        pool := AutoreleasePool.new()
+        unsafe {
+            class := cached_class(ptr.from_mut(&mut C_NSSTRING), b"NSString\0")
+            if ptr.is_null(class) {
+                return none
+            }
+            allocated := send_id(class, cached_selector(ptr.from_mut(&mut S_ALLOC), b"alloc\0"))
+            if ptr.is_null(allocated) {
+                return none
+            }
+            id := send_init_bytes(allocated, cached_selector(ptr.from_mut(&mut S_INIT_BYTES), b"initWithBytes:length:encoding:\0"), ptr.as_ptr(bytes), bytes.len, UTF8)
+            match Object.from_retained(id) {
+                some(object) => {
+                    return some(NSString { object: object })
+                }
+                none => {
+                    return none
+                }
+            }
+        }
+    }
+
+    // Wrap an object known to be an NSString.
+    //
+    // Safety: `object` is an NSString or a subclass.
+    pub unsafe fn from_object(object: Object) -> NSString {
+        return NSString { object: object }
+    }
+
+    pub fn as_object(&self) -> &Object {
+        return &self.object
+    }
+
+    // The length in UTF-8 bytes.
+    pub fn len(&self) -> usize {
+        return unsafe {
+            send_usize_usize(self.object.id, cached_selector(ptr.from_mut(&mut S_LENGTH_OF_BYTES), b"lengthOfBytesUsingEncoding:\0"), UTF8)
+        }
+    }
+
+    // Copy the UTF-8 text into `out` and return the number of bytes
+    // written. A longer string is cut at the last whole character that fits,
+    // so the copied bytes are always valid UTF-8.
+    pub fn copy_to(&self, out: &mut[u8]) -> usize {
+        used := 0usize
+        unsafe {
+            units := send_usize(self.object.id, cached_selector(ptr.from_mut(&mut S_LENGTH), b"length\0"))
+            remaining := Range.new(0, 0)
+            send_get_bytes(self.object.id, cached_selector(ptr.from_mut(&mut S_GET_BYTES), b"getBytes:maxLength:usedLength:encoding:options:range:remainingRange:\0"), ptr.as_mut_ptr(out), out.len, ptr.from_mut(&mut used), UTF8, 0, Range.new(0, units), ptr.from_mut(&mut remaining))
+        }
+        return used
+    }
+
+    // Whether the string's text equals `text`.
+    pub fn equals(&self, text: &str) -> bool {
+        match NSString.new(text) {
+            some(other) => {
+                return unsafe {
+                    send_bool_id(self.object.id, cached_selector(ptr.from_mut(&mut S_IS_EQUAL_TO_STRING), b"isEqualToString:\0"), other.object.id)
+                }
+            }
+            none => {
+                return false
+            }
+        }
+    }
+}
+
+// An NSError: what failed, as a domain, a code and a readable message.
+// Shader compilation errors carry the compiler's whole log as the message.
+pub struct NSError {
+    object: Object
+
+    // Safety: `object` is an NSError or a subclass.
+    pub unsafe fn from_object(object: Object) -> NSError {
+        return NSError { object: object }
+    }
+
+    pub fn as_object(&self) -> &Object {
+        return &self.object
+    }
+
+    pub fn code(&self) -> isize {
+        return unsafe {
+            send_isize(self.object.id, cached_selector(ptr.from_mut(&mut S_CODE), b"code\0"))
+        }
+    }
+
+    // The error domain, such as MTLLibraryErrorDomain.
+    pub fn domain(&self) -> Option<NSString> {
+        return string_of(unsafe {
+            get_object(self.object.id, cached_selector(ptr.from_mut(&mut S_DOMAIN), b"domain\0"))
+        })
+    }
+
+    // The localized description.
+    pub fn message(&self) -> Option<NSString> {
+        return string_of(unsafe {
+            get_object(self.object.id, cached_selector(ptr.from_mut(&mut S_LOCALIZED_DESCRIPTION), b"localizedDescription\0"))
+        })
+    }
+}
+
+fn string_of(object: Option<Object>) -> Option<NSString> {
+    match object {
+        some(value) => {
+            return some(NSString { object: value })
+        }
+        none => {
+            return none
+        }
+    }
+}
+
+// An immutable NSArray of objects.
+pub struct NSArray {
+    object: Object
+
+    // Safety: `object` is an NSArray or a subclass.
+    pub unsafe fn from_object(object: Object) -> NSArray {
+        return NSArray { object: object }
+    }
+
+    pub fn as_object(&self) -> &Object {
+        return &self.object
+    }
+
+    pub fn len(&self) -> usize {
+        return unsafe {
+            send_usize(self.object.id, cached_selector(ptr.from_mut(&mut S_COUNT), b"count\0"))
+        }
+    }
+
+    // A strong reference to the element at `index`, or none past the end.
+    pub fn get(&self, index: usize) -> Option<Object> {
+        if index >= self.len() {
+            return none
+        }
+        unsafe {
+            pool := AutoreleasePool.new()
+            result := Object.retain(send_id_usize(self.object.id, cached_selector(ptr.from_mut(&mut S_OBJECT_AT_INDEX), b"objectAtIndex:\0"), index))
+            core.drop(pool)
+            return result
+        }
+    }
+}

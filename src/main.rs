@@ -632,6 +632,19 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
                     linker.arg("-lcrypto");
                 }
             }
+            // Pure-Dodo bindings have no C runtime to key on, so linking
+            // follows the loaded packages.
+            if apple && package::uses_metal(loaded) {
+                linker.args([
+                    "-framework",
+                    "Metal",
+                    "-framework",
+                    "QuartzCore",
+                    "-framework",
+                    "Foundation",
+                    "-lobjc",
+                ]);
+            }
             linker.args(&args.link_args).arg("-o").arg(out);
             if args.verbose {
                 eprintln!("Linking: {linker:?}");
