@@ -217,6 +217,7 @@ fn raw_i2c(offset: usize) -> u32 {
 
 const SIGNAL_I2C_SCL: u32 = 45
 const SIGNAL_I2C_SDA: u32 = 46
+const SIGNAL_SPI_MISO: u32 = 64
 
 // The software master's lines on the target's pads: high releases.
 fn master_sda(high: bool) {
@@ -283,7 +284,20 @@ fn i2c_master_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
     long: [40]u8 = [0x55; 40]
     started := !i2c.poll_write(0x7C, &long)!
     i2c.cancel()
-    check(started && !i2c.is_busy() && failed_with(i2c.write(0x7C, &register), hal.Error.NoAcknowledge))
+    idle := !i2c.is_busy()
+    after_nack := false
+    match i2c.write(0x7C, &register) {
+        ok() => {
+            say("write after cancel: ok\n")
+        }
+        err(error) => {
+            after_nack = error == hal.Error.NoAcknowledge
+            if !after_nack {
+                report("write after cancel: ", error)
+            }
+        }
+    }
+    check(started && idle && after_nack)
 
     // Against the software target at 5 kHz: 70 bytes written in three
     // runs, then 70 read back after a repeated start in three more.
@@ -366,6 +380,44 @@ fn i2c_master_checks(pins: &mut chip.Pins, timer: &mut chip.Timer) {
     }
     say_number("soft target restarts ", soft.restarts)
     check(same && soft.starts == 2 && soft.restarts == 1 && soft.stops == 2)
+    // Cancelled after its first run (the address and 30 bytes): the
+    // master holds SCL low at the run's END until cancel ends the
+    // transaction with a STOP, and the next transaction runs.
+    base := soft.written
+    cut_started := !slow.poll_write(0x3A, &data)!
+    for soft.alive && soft.written < base + 30 {
+        soft.step()
+    }
+    // The 30th byte's acknowledge clock, then SCL stays low.
+    held_since := timer.now_us()
+    for timer.now_us() - held_since < 1000 {
+        soft.step()
+    }
+    held_at_end := !pin_level(7) && soft.written == base + 30
+    begin_cancel := timer.now_us()
+    slow.cancel()
+    cancel_us := timer.now_us() - begin_cancel
+    released := pin_level(6) && pin_level(7) && !slow.is_busy()
+    two_back: [2]u8 = [0, 0]
+    reread := false
+    for soft.alive {
+        soft.step()
+        match slow.poll_write_read(0x3A, &pointer, &mut two_back) {
+            ok(done) => {
+                if done {
+                    reread = true
+                    break
+                }
+            }
+            err(error) => {
+                report("after cancel, write_read: ", error)
+                break
+            }
+        }
+    }
+    say_number("i2c cancel at END us ", cancel_us as u32)
+    say_flags("i2c cancel at END: started, held, released, reread ", cut_started, held_at_end, released, reread)
+    check(cut_started && held_at_end && released && reread && two_back[0] == data[1] && two_back[1] == data[2] && soft.written == base + 31)
     pins.release_i2c(slow)
 }
 
@@ -939,74 +991,66 @@ fn spi_master_checks(pins: &mut chip.Pins, timer: &mut chip.Timer, dma: &mut chi
     check(one[0] == 0x3C && copied[3] == 4)
     pins.release_spi(spi)
 
-    // The controller's own chip select on pad 3: high when idle, low from
-    // a transfer's first poll to its last, without a rise between the
-    // 64-byte runs, then high again.
+    // The controller's own chip select on pad 3. To see its level at
+    // every clock edge, whatever the program is doing, the controller's
+    // MISO input reads the select's pad: a transfer reads back zero bits
+    // exactly while the select is low at each sampling edge. The GPIO edge
+    // latch sees it fall and rise.
     check(refused(pins.spi_with_select(SPI_CLOCK, SPI_TX, some(SPI_RX), SPI_TX, hal.SpiMode.Mode0, 1_000_000), hal.Error.InvalidInput))
     selected := pins.spi_with_select(SPI_CLOCK, SPI_TX, some(SPI_RX), SPI_SELECT, hal.SpiMode.Mode0, 1_000_000)!
-    selected.set_loopback(true)
     idle_high := pin_level(SPI_SELECT)
-    watch(SPI_SELECT, 1)
-    low_throughout := true
-    first := !selected.poll_transfer(&mut data)!
-    low_at_start := !pin_level(SPI_SELECT)
-    begin := timer.now_us()
-    samples := 0u32
-    first_bad := 0u32
-    for !selected.poll_transfer(&mut data)! {
-        samples += 1
-        level := pin_level(SPI_SELECT)
-        rose_now := latched(SPI_SELECT)
-        // The select rises when the last run ends, which can be before
-        // the poll that sees it: 200 bytes take 1.6 ms.
-        if low_throughout && (level || rose_now) {
-            first_bad = (timer.now_us() - begin) as u32
-            low_throughout = first_bad >= 1600
-        }
+    route_input(SIGNAL_SPI_MISO, SPI_SELECT)
+    // 200 bytes: runs of 64, 64, 64, and 8, polled.
+    for index in 0..200usize {
+        data[index] = 0xFF
     }
-    say_number("cs first rise at us ", first_bad)
+    watch(SPI_SELECT, 2)
+    begin := timer.now_us()
+    first := !selected.poll_transfer(&mut data)!
+    cs_polls := 0u32
+    for !selected.poll_transfer(&mut data)! {
+        cs_polls += 1
+    }
     held := timer.now_us() - begin
+    fell := latched(SPI_SELECT)
     high_after := pin_level(SPI_SELECT)
-    rose := latched(SPI_SELECT)
-    say_flags("cs idle high, low at start, low throughout, high after ", idle_high, low_at_start, low_throughout, high_after)
-    say_number("cs held us ", held as u32)
-    check(first && idle_high && low_at_start && low_throughout && high_after && rose && samples > 100 && held >= 1600 && held < 2600)
-    // A short blocking transfer: one fall and one rise around it; the
-    // data shifts while selected.
-    // A cancelled long transfer raises the select too.
+    low_bits := zero_bytes(&data, 200)
+    say_number("cs polled: bytes read low ", low_bits)
+    say_number("cs polled us ", held as u32)
+    say_flags("cs idle high, fell, high after, - ", idle_high, fell, high_after, false)
+    check(first && idle_high && fell && high_after && low_bits == 200 && cs_polls > 100 && held >= 1600 && held < 2600)
+    // A cancelled long transfer: the select fell, and is high again after
+    // cancel, with the controller idle.
+    watch(SPI_SELECT, 2)
     started_long := !selected.poll_write(&data)!
-    low_while := !pin_level(SPI_SELECT)
     selected.cancel()
-    timer.delay_us(5)
-    say_flags("cs cancel: started, low, high after, idle ", started_long, low_while, pin_level(SPI_SELECT), !selected.is_busy())
-    check(started_long && low_while && pin_level(SPI_SELECT) && !selected.is_busy())
+    cancel_fell := latched(SPI_SELECT)
+    say_flags("cs cancel: started, fell, high after, idle ", started_long, cancel_fell, pin_level(SPI_SELECT), !selected.is_busy())
+    check(started_long && cancel_fell && pin_level(SPI_SELECT) && !selected.is_busy())
+    // Short blocking transfers: one fall and one rise around each, and
+    // the select low for all their bits.
     watch(SPI_SELECT, 2)
     four: [4]u8 = [9, 8, 7, 6]
     selected.transfer(&mut four)!
-    fell := latched(SPI_SELECT)
+    fell = latched(SPI_SELECT)
+    low_four := zero_bytes(&four, 4) == 4
     watch(SPI_SELECT, 1)
     selected.write(&four)!
-    rose = latched(SPI_SELECT)
-    check(fell && rose && pin_level(SPI_SELECT) && four[0] == 9 && four[3] == 6)
-    // By DMA, selected throughout.
+    rose := latched(SPI_SELECT)
+    check(fell && rose && low_four && pin_level(SPI_SELECT))
+    // By DMA, 1000 bytes in one run, selected for all of them.
     unsafe {
         transfers := selected.dma(&mut channel, &mut BIG[..1000])!
-        dma_start := timer.now_us()
-        transfers.start_write(1000)!
-        // 1000 bytes take 8 ms; the select rises as the last one ends.
-        dma_low := true
-        dma_samples := 0u32
-        for transfers.is_busy() {
-            dma_samples += 1
-            if (dma_samples & 15) == 0 && dma_low && pin_level(SPI_SELECT) {
-                rise := timer.now_us() - dma_start
-                say_number("cs dma rise at us ", rise as u32)
-                dma_low = rise >= 8000
-            }
+        bytes := transfers.buffer()!
+        for index in 0..1000usize {
+            bytes[index] = 0xFF
         }
-        transfers.finish()!
-        say_number("cs dma samples ", dma_samples)
-        check(dma_low && dma_samples > 100 && pin_level(SPI_SELECT))
+        watch(SPI_SELECT, 2)
+        transfers.transfer(1000)!
+        dma_fell := latched(SPI_SELECT)
+        dma_low := zero_bytes(transfers.buffer()!, 1000)
+        say_number("cs dma: bytes read low ", dma_low)
+        check(dma_fell && dma_low == 1000 && pin_level(SPI_SELECT))
     }
     unwatch(SPI_SELECT)
     pins.release_spi(selected)
@@ -1039,6 +1083,17 @@ fn dump_dma() {
     say_number("gdma out_link ", raw_word(0x6008_00E0))
     say_number("gdma out_state ", raw_word(0x6008_00E4))
     say_number("gdma out_peri_sel ", raw_word(0x6008_0100))
+}
+
+// How many of the first `count` bytes are zero.
+fn zero_bytes(bytes: &[u8], count: usize) -> u32 {
+    zeros := 0u32
+    for index in 0..count {
+        if bytes[index] == 0 {
+            zeros += 1
+        }
+    }
+    return zeros
 }
 
 fn refused_void(result: void!hal.Error, expected: hal.Error) -> bool {
