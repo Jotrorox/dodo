@@ -26,6 +26,9 @@ const P_AUTO_VACUUM: usize = 17
 const P_DATABASE_LIST: usize = 18
 const P_TABLE_LIST: usize = 19
 const P_IGNORED: usize = 20
+const P_LEGACY_ALTER: usize = 42
+const P_WAL_CHECKPOINT: usize = 40
+const P_WAL_AUTOCHECKPOINT: usize = 41
 
 fn pragma_id(e: &Engine, o: usize, l: usize) -> usize {
     if name_is(e, o, l, "user_version") {
@@ -85,6 +88,15 @@ fn pragma_id(e: &Engine, o: usize, l: usize) -> usize {
     if name_is(e, o, l, "table_list") {
         return P_TABLE_LIST
     }
+    if name_is(e, o, l, "legacy_alter_table") {
+        return P_LEGACY_ALTER
+    }
+    if name_is(e, o, l, "wal_checkpoint") {
+        return P_WAL_CHECKPOINT
+    }
+    if name_is(e, o, l, "wal_autocheckpoint") {
+        return P_WAL_AUTOCHECKPOINT
+    }
     P_IGNORED
 }
 
@@ -95,7 +107,7 @@ fn pragma_columns(id: usize) -> usize {
     if id == P_INDEX_LIST {
         return 5
     }
-    if id == P_INDEX_INFO || id == P_DATABASE_LIST {
+    if id == P_INDEX_INFO || id == P_DATABASE_LIST || id == P_WAL_CHECKPOINT {
         return 3
     }
     if id == P_TABLE_LIST {
@@ -128,6 +140,13 @@ fn pragma_column_name(id: usize, i: usize) -> &str from(static) {
         names := ["schema", "name", "type", "ncol", "wr", "strict"]
         return names[i]
     }
+    if id == P_WAL_CHECKPOINT {
+        names := ["busy", "log", "checkpointed"]
+        return names[i]
+    }
+    if id == P_WAL_AUTOCHECKPOINT {
+        return "wal_autocheckpoint"
+    }
     if id == P_USER_VERSION {
         return "user_version"
     }
@@ -155,6 +174,9 @@ fn pragma_column_name(id: usize, i: usize) -> &str from(static) {
     if id == P_FOREIGN_KEYS {
         return "foreign_keys"
     }
+    if id == P_LEGACY_ALTER {
+        return "legacy_alter_table"
+    }
     if id == P_INTEGRITY_CHECK {
         return "integrity_check"
     }
@@ -171,6 +193,30 @@ fn pragma_column_name(id: usize, i: usize) -> &str from(static) {
         return "auto_vacuum"
     }
     ""
+}
+
+// True when the set form (PRAGMA x = v) still returns a row.
+fn pragma_set_returns_row(id: usize) -> bool {
+    id == P_BUSY_TIMEOUT || id == P_JOURNAL_MODE || id == P_WAL_CHECKPOINT || id == P_WAL_AUTOCHECKPOINT
+}
+
+// The pragma argument as text (workspace offset, length); (0, 0) if absent
+// or not text.
+fn pragma_text_arg(e: &mut Engine, s: usize) -> (usize, usize)!db.Error {
+    if nflags(e, s) == 0 {
+        return ok((0usize, 0usize))
+    }
+    v := nc(e, s)
+    save := e.rtop
+    r := reg_push(e)?
+    eval(e, v, r)?
+    res := if rtype(e, r) == T_TEXT {
+        (roff(e, r), rlen(e, r))
+    } else {
+        (0usize, 0usize)
+    }
+    e.rtop = save
+    ok(res)
 }
 
 // True when the pragma modifies the database (needs a write transaction).
@@ -216,6 +262,21 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
     set := nflags(e, s) == 1
     arg := nflags(e, s) != 0
     r := resreg
+    // "PRAGMA schema.name": per-database pragmas act on that database
+    // (main by default); table_info and friends search all of them.
+    pdb := ndb_of(e, s)
+    let target = if pdb == NO_DB {
+        0usize
+    } else {
+        pdb
+    }
+    if target == DB_TEMP && !e.dbs[DB_TEMP].used {
+        temp_open(e)?
+    }
+    use_db(e, target)
+    if id == P_INTEGRITY_CHECK && pdb == NO_DB {
+        return integrity_check_all(e, r)
+    }
     if id == P_USER_VERSION || id == P_APP_ID {
         off := if id == P_USER_VERSION {
             60usize
@@ -244,9 +305,24 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         if set {
             v := pragma_int_arg(e, s)?
             if e.db_pages == 0 && v >= 512 && v <= 65536 && (v & (v - 1)) == 0 {
-                e.page_size = v as usize
-                layout(e)?
-                cache_clear(e)
+                old_ps := e.page_size
+                match set_page_size(e, v as usize) {
+                    ok() => {},
+                    err(reason) => {
+                        // Too big for the regions laid out at open: the
+                        // whole workspace is laid out again before the next
+                        // statement (see relayout_workspace).
+                        e.page_size = old_ps
+                        let fits = e.ws.len >= min_workspace_bytes(v as usize)
+                        if !fits || e.sp_n > 0 || cache_pinned(e) {
+                            return err(reason)
+                        }
+                        e.page_size = v as usize
+                        e.relayout = true
+                        e.msg_len = 0
+                    },
+                }
+                e.usable = e.page_size
             }
             return ok()
         }
@@ -265,16 +341,130 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         return prow(e, r, 1)
     }
     if id == P_ENCODING {
-        set_text_str(e, r, "UTF-8")?
+        if set {
+            // Only a database that does not exist yet takes a new encoding;
+            // otherwise the file's encoding stays, as in SQLite.
+            if e.db_pages != 0 {
+                return ok()
+            }
+            v := nc(e, s)
+            save := e.rtop
+            ar := reg_push(e)?
+            eval(e, v, ar)?
+            to_text(e, ar)?
+            to := roff(e, ar)
+            tl := rlen(e, ar)
+            enc := 0u8
+            if name_is(e, to, tl, "UTF-8") || name_is(e, to, tl, "UTF8") {
+                enc = ENC_UTF8
+            } else if name_is(e, to, tl, "UTF-16le") || name_is(e, to, tl, "UTF16le") || name_is(e, to, tl, "UTF-16") || name_is(e, to, tl, "UTF16") {
+                // Plain UTF-16 means the native byte order (little endian on
+                // every supported target).
+                enc = ENC_UTF16LE
+            } else if name_is(e, to, tl, "UTF-16be") || name_is(e, to, tl, "UTF16be") {
+                enc = ENC_UTF16BE
+            }
+            if enc == 0 {
+                x := fail2(e, SQLITE_ERROR, "unsupported encoding: ", to, tl)
+                e.rtop = save
+                return err(x)
+            }
+            e.rtop = save
+            e.enc_new = enc
+            e.enc = enc
+            return ok()
+        }
+        let value4 = if e.enc == ENC_UTF16LE {
+            "UTF-16le"
+        } else if e.enc == ENC_UTF16BE {
+            "UTF-16be"
+        } else {
+            "UTF-8"
+        }
+        set_text_str(e, r, value4)?
         return prow(e, r, 1)
     }
-    if id == P_JOURNAL_MODE {
-        let value3 = if e.memory {
-            "memory"
-        } else {
-            "delete"
+    if id == P_JOURNAL_MODE && set && pdb == NO_DB {
+        // Without a schema the mode of every attached database changes
+        // (not TEMP); the row reports main's.
+        k := e.ndb
+        for k > 1 {
+            k -= 1
+            if db_used(e, k) && k != DB_TEMP {
+                use_db(e, k)
+                journal_mode_pragma(e, s)?
+            }
         }
-        set_text_str(e, r, value3)?
+        use_db(e, 0)
+    }
+    if id == P_JOURNAL_MODE {
+        mode := journal_mode_pragma(e, s)?
+        set_text_str(e, r, mode)?
+        return prow(e, r, 1)
+    }
+    if id == P_WAL_CHECKPOINT {
+        let (to, tl) = pragma_text_arg(e, s)?
+        mode := if name_is(e, to, tl, "full") {
+            CKPT_FULL
+        } else if name_is(e, to, tl, "restart") {
+            CKPT_RESTART
+        } else if name_is(e, to, tl, "truncate") {
+            CKPT_TRUNCATE
+        } else {
+            CKPT_PASSIVE
+        }
+        // Like SQLite, a checkpoint cannot run inside a transaction that
+        // has already read or written.
+        if e.write_txn || (e.explicit_txn && !e.w.read_fresh) {
+            return err(fail(e, SQLITE_LOCKED, "database table is locked"))
+        }
+        busy_flag := false
+        log := -1i64
+        done := -1i64
+        if e.w.open {
+            // The checkpoint runs outside this statement's read transaction.
+            wal_end_read(e)
+            let (b, l, d) = wal_checkpoint(e, mode)?
+            busy_flag = b
+            log = l
+            done = d
+        }
+        set_int(e, r, if busy_flag {
+            1i64
+        } else {
+            0i64
+        })
+        set_int(e, r + 1, log)
+        set_int(e, r + 2, done)
+        return prow(e, r, 3)
+    }
+    if id == P_WAL_AUTOCHECKPOINT {
+        if set {
+            v := pragma_int_arg(e, s)?
+            e.w.autockpt = if v <= 0 {
+                0u32
+            } else if v > 2147483647 {
+                2147483647u32
+            } else {
+                v as u32
+            }
+        }
+        let value7 = e.w.autockpt as i64
+        set_int(e, r, value7)
+        return prow(e, r, 1)
+    }
+    if id == P_LEGACY_ALTER {
+        if set {
+            v := pragma_int_arg(e, s)?
+            e.legacy_alter = v != 0
+            return ok()
+        }
+        let lv = if e.legacy_alter {
+            1i64
+        } else {
+            0i64
+        }
+        set_int(e, r, lv)
         return prow(e, r, 1)
     }
     if id == P_FOREIGN_KEYS || id == P_AUTO_VACUUM {
@@ -315,15 +505,24 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         return prow(e, r, 1)
     }
     if id == P_DATABASE_LIST {
-        set_int(e, r, 0)
-        set_text_str(e, r + 1, "main")?
-        if e.memory {
-            set_text_str(e, r + 2, "")?
-        } else {
-            let path_len2 = e.path_len
-            set_bytes(e, r + 2, T_TEXT, 0, path_len2)
+        for k in 0usize..e.ndb {
+            if !db_used(e, k) {
+                continue
+            }
+            set_int(e, r, k as i64)
+            let no = db_name_off(e, k)
+            let nl = db_name_len(e, k)
+            set_bytes(e, r + 1, T_TEXT, no, nl)
+            if db_is_memory(e, k) {
+                set_text_str(e, r + 2, "")?
+            } else {
+                let po = db_path_off(e, k)
+                let pl = db_path_len(e, k)
+                set_bytes(e, r + 2, T_TEXT, po, pl)
+            }
+            prow(e, r, 3)?
         }
-        return prow(e, r, 3)
+        return ok()
     }
     if id == P_TABLE_INFO || id == P_INDEX_LIST || id == P_INDEX_INFO {
         if !arg {
@@ -333,7 +532,7 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
         name := na(e, v)
         nl := nb(e, v)
         if id == P_INDEX_INFO {
-            x := find_obj(e, OT_INDEX, name, nl)
+            x := find_obj(e, pdb, OT_INDEX, name, nl)
             if x == NO_COL {
                 return ok()
             }
@@ -341,7 +540,10 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
             for k in 0usize..obj_ncol(e, x) {
                 c := idx_col(e, x, k)
                 set_int(e, r, k as i64)
-                if c == NO_COL {
+                if c == EXPR_COL {
+                    set_int(e, r + 1, -2)
+                    set_null(e, r + 2)
+                } else if c == NO_COL {
                     set_int(e, r + 1, -1)
                     set_null(e, r + 2)
                 } else {
@@ -355,7 +557,7 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
             }
             return ok()
         }
-        t := find_obj(e, OT_TABLE, name, nl)
+        t := find_obj(e, pdb, OT_TABLE, name, nl)
         if t == NO_COL {
             return ok()
         }
@@ -434,7 +636,12 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
                 "c"
             }
             set_text_str(e, r + 3, origin)?
-            set_int(e, r + 4, 0)
+            let partial = if obj_u(e, j, O_WHEREL) != 0 {
+                1i64
+            } else {
+                0i64
+            }
+            set_int(e, r + 4, partial)
             prow(e, r, 5)?
             k += 1
         }
@@ -442,10 +649,13 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
     }
     if id == P_TABLE_LIST {
         for j in 0usize..e.schema_objs {
-            if obj_type(e, j) != OT_TABLE {
+            if obj_type(e, j) != OT_TABLE || pdb != NO_DB && obj_db(e, j) != pdb {
                 continue
             }
-            set_text_str(e, r, "main")?
+            let jd = obj_db(e, j)
+            let dno = db_name_off(e, jd)
+            let dnl = db_name_len(e, jd)
+            set_bytes(e, r, T_TEXT, dno, dnl)
             let name5 = obj_u(e, j, O_NAME)
             let name_len4 = obj_u(e, j, O_NAMEL)
             set_bytes(e, r + 1, T_TEXT, name5, name_len4)
@@ -466,6 +676,13 @@ fn exec_pragma(e: &mut Engine, s: usize, resreg: usize) -> void!db.Error {
 
 // 1-based position of column c in the table's primary key.
 fn pk_position(e: &Engine, t: usize, c: usize) -> i64 {
+    if is_wr(e, t) {
+        for k in 0usize..pk_count(e, t) {
+            if pk_col(e, t, k) == c {
+                return (k + 1) as i64
+            }
+        }
+    }
     // Use the order of the PRIMARY KEY autoindex when there is one.
     for j in 0usize..e.schema_objs {
         if obj_type(e, j) == OT_INDEX && obj_u(e, j, O_TABLE) == t && (obj_flags(e, j) & OF_PK) != 0 {
@@ -605,6 +822,43 @@ fn ic_tree(e: &mut Engine, map: usize, pgno: u32, r: usize, count: &mut usize, l
     ok((total, 1usize))
 }
 
+// integrity_check without a schema: every database; "ok" once when all
+// of them are.
+fn integrity_check_all(e: &mut Engine, r: usize) -> void!db.Error {
+    // SQLite opens the TEMP database to check it too.
+    temp_open(e)?
+    start := e.sort_top
+    for k in 0usize..e.ndb {
+        if !db_used(e, k) {
+            continue
+        }
+        use_db(e, k)
+        before := e.sort_top
+        integrity_check(e, r)?
+        // Drop this database's lone "ok" row.
+        if e.sort_top > before && ic_was_ok(e, before) {
+            e.sort_top = before
+        }
+    }
+    use_db(e, 0)
+    if e.sort_top == start {
+        set_text_str(e, r, "ok")?
+        prow(e, r, 1)?
+    }
+    ok()
+}
+
+fn ic_was_ok(e: &mut Engine, rec: usize) -> bool {
+    let len = rec_len(e, rec)
+    match record_column(e, rec + 4, len, 0, R_TMP) {
+        ok(_) => {},
+        err(_) => {
+            return false
+        },
+    }
+    rtype(e, R_TMP) == T_TEXT && name_is_exact(e, roff(e, R_TMP), rlen(e, R_TMP), "ok")
+}
+
 fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
     count := 0usize
     if e.db_pages == 0 {
@@ -655,7 +909,7 @@ fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
     let (_, _) = ic_tree(e, map, 1, r, &mut count, 0)?
     for i in 0usize..e.schema_objs {
         root := obj_root(e, i)
-        if root <= 1 {
+        if root <= 1 || obj_db(e, i) != e.cur_db {
             continue
         }
         k := obj_type(e, i)
@@ -663,7 +917,7 @@ fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
             continue
         }
         let (n, _) = ic_tree(e, map, root, r, &mut count, 0)?
-        if k == OT_INDEX {
+        if k == OT_INDEX && obj_u(e, i, O_WHEREL) == 0 {
             t := obj_u(e, i, O_TABLE)
             if t != NO_COL {
                 let root2 = obj_root(e, t)
@@ -687,4 +941,86 @@ fn integrity_check(e: &mut Engine, r: usize) -> void!db.Error {
         prow(e, r, 1)?
     }
     ok()
+}
+
+// PRAGMA journal_mode [= mode]. Supported modes are DELETE (rollback
+// journal) and WAL; converting runs a write transaction that sets the file
+// format version bytes (2 = WAL), as SQLite does. Other modes are accepted
+// as DELETE. In-memory databases always report "memory".
+fn journal_mode_pragma(e: &mut Engine, s: usize) -> &str!db.Error from(static) {
+    if e.cur_db == DB_TEMP {
+        // SQLite keeps TEMP in a temporary file with a rollback journal.
+        return ok("delete")
+    }
+    if e.memory {
+        return ok("memory")
+    }
+    let (to, tl) = pragma_text_arg(e, s)?
+    want_wal := name_is(e, to, tl, "wal")
+    want_rollback := name_is(e, to, tl, "delete") || name_is(e, to, tl, "persist") || name_is(e, to, tl, "truncate") || name_is(e, to, tl, "off") || name_is(e, to, tl, "memory")
+    if want_wal && !e.w.open {
+        if e.explicit_txn {
+            return err(fail(e, SQLITE_ERROR, "cannot change into wal mode from within a transaction"))
+        }
+        begin_write(e)?
+        if !e.w.open {
+            d := pg_write(e, 1)?
+            e.ws[d + 18] = 2
+            e.ws[d + 19] = 2
+        }
+        commit(e)?
+        return ok("wal")
+    }
+    if want_rollback && e.w.open {
+        if e.explicit_txn {
+            return err(fail(e, SQLITE_ERROR, "cannot change out of wal mode from within a transaction"))
+        }
+        wal_leave(e)?
+        return ok("delete")
+    }
+    if e.w.open {
+        return ok("wal")
+    }
+    ok("delete")
+}
+
+// Converts a WAL database back to rollback-journal mode: needs an EXCLUSIVE
+// lock on the database file (no other connection), checkpoints everything,
+// deletes the -wal and -shm files and resets the version bytes to 1.
+fn wal_leave(e: &mut Engine) -> void!db.Error {
+    wal_end_read(e)
+    saved := e.busy_retries
+    e.busy_retries = 0
+    locked := lock_exclusive(e)
+    e.busy_retries = saved
+    locked?
+    let (b, log, done) = match wal_checkpoint(e, CKPT_PASSIVE) {
+        ok(res) => res,
+        err(reason) => {
+            wal_db_lock_shared(e)
+            return err(reason)
+        },
+    }
+    if b || log != done {
+        wal_db_lock_shared(e)
+        return err(busy(e))
+    }
+    if !wal_close(e) {
+        // Another connection of this process still uses the log.
+        return err(busy(e))
+    }
+    // wal_close leaves the database file locked; convert while it is.
+    cache_clear(e)
+    e.w.no_wal = true
+    r := leave_set_version(e)
+    e.w.no_wal = false
+    r
+}
+
+fn leave_set_version(e: &mut Engine) -> void!db.Error {
+    begin_write(e)?
+    d := pg_write(e, 1)?
+    e.ws[d + 18] = 1
+    e.ws[d + 19] = 1
+    commit(e)
 }

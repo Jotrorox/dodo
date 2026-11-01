@@ -13,15 +13,18 @@ fn engine_new(ws: &mut[u8]) -> Engine from(ws) {
         reg_off: 0, cur_off: 0, arena_off: 0, arena_cap: 0, arena_top: 0,
         sort_off: 0, sort_cap: 0, sort_top: 0, sort_hi: 0, bitmap_off: 0, bitmap_bytes: 0,
         sj_off: 0, sj_cap: 0, sj_used: 0, sj_active: false, sj_overflow: false, sj_pages: 0,
+        sj_stmt_first: 0, sj_ht_off: 0, sj_ht_cap: 0, sj_ht_n: 0, sj_rec_off: 0, sj_ws_recs: 0,
+        sjf: none, sj_file_open: false, sp_n: 0, sp_names_used: 0, sp_txn: false,
+        trig_parse: false, trig_t: 4294967295, trig_new: 4294967295, trig_old: 4294967295, tstack_off: 0, tstack_n: 0, raise_kind: 0, last_changes: 0, legacy_alter: false, keep_off: 0, keep_cap: 0, keep_top: 0, tail_off: 0, relayout: false,
         gather_a: 0, gather_b: 0, meta_off: 0, hash_off: 0, hash_cap: 0,
         cache_off: 0, cache_end: 0, nslots: 0, scratch_page: 0, cell_buf: 0, cell_buf2: 0,
-        mj_off: 0, mj_cap: 0, mj_used: 0, stamp: 0,
+        stamp: 0, slot_ps: 4096,
         page_size: 4096, usable: 4096, reserved: 0, db_pages: 0, file_pages: 0, disk_pages: 0,
         lock: 0, shared_byte: 0, write_txn: false, explicit_txn: false,
         journal_open: false, journal_synced: false, journal_records: 0, journal_nonce: 0,
         db_written: false, initialized: false, schema_format: 4, change_counter: 0,
         schema_cookie: 0, schema_loaded: false, schema_gen: 0, schema_len: 0,
-        schema_objs: 0, schema_pool: 0, rng: 88172645463325252u64, busy_retries: 0,
+        schema_objs: 0, schema_pool: 0, rng: 88172645463325252u64, busy_retries: 0, enc: 1, enc_new: 1,
         last_rowid: 0, changes: 0, total_changes: 0, error_offset: -1,
         sb: 0, src: 0, src_end: 0, pos: 0, tk: 0, ts: 0, tl: 0, last_end: 0,
         node_off: 0, node_n: 0, pool_lo: 0, nparam: 0, named_n: 0, named_off: 0,
@@ -30,18 +33,25 @@ fn engine_new(ws: &mut[u8]) -> Engine from(ws) {
         subq_list: 0, subq_n: 0, min_ctx: 4294967295, regctx_t: 4294967295, regctx_base: 0, excluded_base: 0, group_list: 0, view_depth: 0, cte_off: 0, cte_n: 0, queue_rec: 0, ret_start: 0, bal_append: false,
         rtop: 16, param_reg: 16, arena_base: 0, slot_rec: 0, slot_len: 0, slot_first: 0, slot_first_len: 0,
         agg_top: 0, agg_end: 0, agg_hit: 0, active: 4294967295,
+        w: wal_state_new(), bm_base: 0, bm_len: 0, path_off: 0,
+        cur_db: 0, ndb: 2, bm_used: 0, dbs: dbs_new(),
+        dfile: [none, none, none, none, none, none, none, none, none, none, none, none],
+        djournal: [none, none, none, none, none, none, none, none, none, none, none, none],
+        dw: wals_new(), wdb: NO_DB, fix_db: NO_DB, db_mask: 0, test_crash: 0,
     }
 }
 
 // Opens (creating if allowed) the database file and reads its page size.
 fn engine_open(e: &mut Engine, path: &str) -> void!db.Error {
-    if e.ws.len < MIN_WORKSPACE_BYTES {
+    if e.ws.len < min_workspace_bytes(512) {
         e.msg_len = 0
         return err(db.Error.new(db.ErrorKind.Capacity, SQLITE_NOMEM))
     }
+    dbs_init(e)
     bytes := mem.str_bytes(path)
     if bytes.len == 0 || bytes_eq(bytes, mem.str_bytes(":memory:")) {
         e.memory = true
+        e.slot_ps = e.page_size
         layout(e)?
         return ok()
     }
@@ -86,15 +96,81 @@ fn engine_open(e: &mut Engine, path: &str) -> void!db.Error {
             e.page_size = ps
         }
     }
+    e.slot_ps = e.page_size
+    let plen = e.path_len
+    let clen = canonical_path(e, 0, plen)
+    e.path_len = clen
     layout(e)?
     ok()
 }
 
+// Replaces the path at `off` (an existing file) with its absolute,
+// symlink-free form when that fits, as SQLite reports and records it
+// (journal names inside a super-journal must not depend on the current
+// directory). Returns the new length.
+fn canonical_path(e: &mut Engine, off: usize, len: usize) -> usize {
+    ws := platform.workspace()
+    match ws.set(path_text(&e.ws[off..off + len])) {
+        ok() => {},
+        err(_) => {
+            return len
+        },
+    }
+    name := match ws.get() {
+        ok(n) => n,
+        err(_) => {
+            return len
+        },
+    }
+    bytes := [0u8; 4096]
+    wide := [0u16; 4096]
+    match fs.canonicalize(&name, &mut bytes, &mut wide) {
+        ok(full) => {
+            out := [0u8; 4096]
+            policy := platform.TextPolicy.Strict
+            n := match platform.decode(&full, &mut out, &policy) {
+                ok(t) => mem.str_bytes(t).len,
+                err(_) => {
+                    return len
+                },
+            }
+            if n == 0 || n + 16 > PATH_CAP {
+                return len
+            }
+            copy_in(e.ws, off, &out[..n])
+            n
+        },
+        err(_) => len,
+    }
+}
+
 fn engine_close(e: &mut Engine) -> void!db.Error {
-    if e.write_txn {
+    if any_write(e) {
         rollback(e)?
     }
     e.explicit_txn = false
+    sp_reset(e)
+    failed := false
+    k := e.ndb
+    for k > 0 {
+        k -= 1
+        if db_used(e, k) {
+            use_db(e, k)
+            if !db_close_files(e) {
+                failed = true
+            }
+        }
+    }
+    use_db(e, 0)
+    if failed {
+        return err(io_fail(e, "disk I/O error (close)"))
+    }
+    ok()
+}
+
+// Closes the current database's files (its log, journal and file).
+fn db_close_files(e: &mut Engine) -> bool {
+    wal_close(e)
     unlock_to(e, false)
     journal_close(e)
     failed := false
@@ -110,8 +186,5 @@ fn engine_close(e: &mut Engine) -> void!db.Error {
         none => {},
     }
     e.file = none
-    if failed {
-        return err(io_fail(e, "disk I/O error (close)"))
-    }
-    ok()
+    !failed
 }

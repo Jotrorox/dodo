@@ -24,6 +24,16 @@ const O_ROWID: usize = 40
 const O_ROWNO: usize = 44
 const O_ONCONF: usize = 48
 const O_NPK: usize = 49
+// The database holding the object.
+const O_DB: usize = 50
+// Partial indexes: the WHERE clause text.
+const O_WHERE: usize = 52
+const O_WHEREL: usize = 56
+// WITHOUT ROWID tables: the PRIMARY KEY as index column records.
+const O_PKCOLS: usize = 60
+// Indexes of WITHOUT ROWID tables: number of PRIMARY KEY columns appended
+// to the key (they take the place of the rowid).
+const O_NTAIL: usize = 40
 
 const OT_TABLE: u8 = 1
 const OT_INDEX: u8 = 2
@@ -37,6 +47,7 @@ const OF_UNSUPPORTED: u8 = 8
 const OF_PK: u8 = 16
 const OF_HAS_TRIGGER: u8 = 32
 const OF_UNSUPPORTED_INDEX: u8 = 64
+const OF_WR: u8 = 128
 
 // Column record.
 const K_NAME: usize = 0
@@ -49,11 +60,15 @@ const K_DFLT: usize = 12
 const K_DFLTL: usize = 16
 const K_TYPE: usize = 20
 const K_TYPEL: usize = 24
+// WITHOUT ROWID tables: the column's field number in the stored record.
+const K_RECPOS: usize = 28
 // Index column record: table column (0xffffffff = rowid), desc, coll.
 const K_COL: usize = 0
 const K_DESC: usize = 8
 
 const NO_COL: usize = 4294967295
+// Index column that is an expression; its text is at K_DFLT/K_DFLTL.
+const EXPR_COL: usize = 4294967293
 
 // Statement-local objects (FROM subqueries, views) are records in the
 // statement pool, encoded as LOCAL_OBJ + workspace offset.
@@ -64,6 +79,22 @@ fn obj(e: &Engine, i: usize) -> usize {
         return i - LOCAL_OBJ
     }
     e.schema_off + i * OBJ_BYTES
+}
+
+fn obj_db(e: &Engine, i: usize) -> usize {
+    e.ws[obj(e, i) + O_DB] as usize
+}
+
+// Position of database k in the search order of unqualified names: TEMP,
+// main, then attached databases in attach order.
+fn db_rank(k: usize) -> usize {
+    if k == DB_TEMP {
+        return 0
+    }
+    if k == 0 {
+        return 1
+    }
+    k
 }
 
 fn obj_type(e: &Engine, i: usize) -> u8 {
@@ -110,6 +141,199 @@ fn idx_col(e: &Engine, x: usize, k: usize) -> usize {
     ldu(e.ws, col_rec(e, x, k) + K_COL)
 }
 
+fn is_wr(e: &Engine, t: usize) -> bool {
+    t != NO_COL && (obj_flags(e, t) & OF_WR) != 0 && obj_type(e, t) == OT_TABLE
+}
+
+// Field number of column c in the table's records.
+fn rec_pos(e: &Engine, t: usize, c: usize) -> usize {
+    if t != NO_COL && (obj_flags(e, t) & OF_WR) != 0 {
+        return ld16(e.ws, col_rec(e, t, c) + K_RECPOS)
+    }
+    c
+}
+
+fn pk_count(e: &Engine, t: usize) -> usize {
+    e.ws[obj(e, t) + O_NPK] as usize
+}
+
+// PRIMARY KEY column record k of a WITHOUT ROWID table.
+fn pk_rec(e: &Engine, t: usize, k: usize) -> usize {
+    obj_u(e, t, O_PKCOLS) + k * COL_BYTES
+}
+
+fn pk_col(e: &Engine, t: usize, k: usize) -> usize {
+    ldu(e.ws, pk_rec(e, t, k) + K_COL)
+}
+
+// Index tail: for WITHOUT ROWID tables the PRIMARY KEY columns not already
+// in the key (with their collation and order), else the rowid.
+fn index_ntail(e: &Engine, x: usize) -> usize {
+    t := obj_u(e, x, O_TABLE)
+    if is_wr(e, t) {
+        return obj_u(e, x, O_NTAIL)
+    }
+    1
+}
+
+// Table column of tail field j of index x (WITHOUT ROWID tables).
+fn tail_col(e: &Engine, x: usize, j: usize) -> usize {
+    idx_col(e, x, obj_ncol(e, x) + j)
+}
+
+// Reads column c of a table record.
+fn row_column(e: &mut Engine, t: usize, p: usize, len: usize, c: usize, dst: usize) -> bool!db.Error {
+    let pos = rec_pos(e, t, c)
+    record_column(e, p, len, pos, dst)
+}
+
+// Appends the PRIMARY KEY tail to index x of a WITHOUT ROWID table. The
+// column records are copied after the key columns (the array is rebuilt
+// one record longer per tail column); O_NCOL keeps counting key columns.
+fn index_add_tail(e: &mut Engine, x: usize, t: usize) -> void!db.Error {
+    if !is_wr(e, t) {
+        return ok()
+    }
+    n := obj_ncol(e, x)
+    npk := pk_count(e, t)
+    cols := schema_alloc(e, (n + npk) * COL_BYTES)?
+    old := obj_u(e, x, O_COLS)
+    move_bytes(e.ws, old, cols, n * COL_BYTES)
+    zero_bytes(e.ws, cols + n * COL_BYTES, npk * COL_BYTES)
+    ntail := 0usize
+    for k in 0usize..npk {
+        pr := pk_rec(e, t, k)
+        pc := ldu(e.ws, pr + K_COL)
+        pcoll := e.ws[pr + K_COLL]
+        dup := false
+        for i in 0usize..n {
+            r := cols + i * COL_BYTES
+            if ldu(e.ws, r + K_COL) == pc && e.ws[r + K_COLL] == pcoll {
+                dup = true
+            }
+        }
+        if dup {
+            continue
+        }
+        r2 := cols + (n + ntail) * COL_BYTES
+        stu(e.ws, r2 + K_COL, pc)
+        e.ws[r2 + K_COLL] = pcoll
+        let pdesc = e.ws[pr + K_DESC]
+        e.ws[r2 + K_DESC] = pdesc
+        ntail += 1
+    }
+    o := obj(e, x)
+    stu(e.ws, o + O_COLS, cols)
+    stu(e.ws, o + O_NTAIL, ntail)
+    ok()
+}
+
+// WITHOUT ROWID: builds the PRIMARY KEY records and the record layout
+// (PRIMARY KEY columns first, then the others in table order).
+fn wr_setup(e: &mut Engine, i: usize, s: usize, pk_list: usize) -> void!db.Error {
+    o := obj(e, i)
+    if (e.ws[o + O_FLAGS] & OF_AUTOINC) != 0 {
+        return err(fail(e, SQLITE_ERROR, "AUTOINCREMENT not allowed on WITHOUT ROWID tables"))
+    }
+    ncol := obj_ncol(e, i)
+    // Collect the PRIMARY KEY columns in key order.
+    cnt := if pk_list != 0 {
+        list_len(e, pk_list)
+    } else {
+        0usize
+    }
+    for c in 0usize..ncol {
+        if pk_list == 0 && (col_flags(e, i, c) & CF_PK) != 0 {
+            cnt += 1
+        }
+    }
+    if cnt == 0 {
+        let tn = obj_u(e, i, O_NAME)
+        let tl = obj_u(e, i, O_NAMEL)
+        return err(fail2(e, SQLITE_ERROR, "PRIMARY KEY missing on table ", tn, tl))
+    }
+    pks := schema_alloc(e, cnt * COL_BYTES)?
+    zero_bytes(e.ws, pks, cnt * COL_BYTES)
+    npk := 0usize
+    if pk_list != 0 {
+        item := pk_list
+        for item != 0 {
+            id := na(e, item)
+            let ia = na(e, id)
+            let ib = nb(e, id)
+            c := find_column(e, i, ia, ib)
+            coll := nb(e, item)
+            let cc = if coll > 0 {
+                (coll - 1) as u8
+            } else {
+                col_coll(e, i, c)
+            }
+            dup := false
+            for k in 0usize..npk {
+                if ldu(e.ws, pks + k * COL_BYTES + K_COL) == c {
+                    dup = true
+                }
+            }
+            if !dup {
+                r := pks + npk * COL_BYTES
+                stu(e.ws, r + K_COL, c)
+                e.ws[r + K_COLL] = cc
+                let dsc = if (nflags(e, item) & 1) != 0 {
+                    1u8
+                } else {
+                    0u8
+                }
+                e.ws[r + K_DESC] = dsc
+                npk += 1
+            }
+            item = nnext(e, item)
+        }
+    } else {
+        for c in 0usize..ncol {
+            if (col_flags(e, i, c) & CF_PK) != 0 {
+                r := pks + npk * COL_BYTES
+                stu(e.ws, r + K_COL, c)
+                let cc2 = col_coll(e, i, c)
+                e.ws[r + K_COLL] = cc2
+                let dsc2 = if (col_flags(e, i, c) & CF_PKDESC) != 0 {
+                    1u8
+                } else {
+                    0u8
+                }
+                e.ws[r + K_DESC] = dsc2
+                npk += 1
+            }
+        }
+    }
+    o2 := obj(e, i)
+    e.ws[o2 + O_FLAGS] = e.ws[o2 + O_FLAGS] | OF_WR
+    e.ws[o2 + O_NPK] = npk as u8
+    stu(e.ws, o2 + O_PKCOLS, pks)
+    stu(e.ws, o2 + O_ROWID, NO_COL)
+    // Record layout; PRIMARY KEY columns are NOT NULL.
+    for k in 0usize..npk {
+        c := ldu(e.ws, pks + k * COL_BYTES + K_COL)
+        r := col_rec(e, i, c)
+        st16(e.ws, r + K_RECPOS, k)
+        e.ws[r + K_FLAGS] = e.ws[r + K_FLAGS] | (CF_NOTNULL as u8)
+    }
+    pos := npk
+    for c in 0usize..ncol {
+        is_pk := false
+        for k in 0usize..npk {
+            if ldu(e.ws, pks + k * COL_BYTES + K_COL) == c {
+                is_pk = true
+            }
+        }
+        if !is_pk {
+            r := col_rec(e, i, c)
+            st16(e.ws, r + K_RECPOS, pos)
+            pos += 1
+        }
+    }
+    ok()
+}
+
 fn schema_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
     lo := e.schema_off + e.schema_objs * OBJ_BYTES
     if e.schema_pool < lo + len + OBJ_BYTES {
@@ -137,15 +361,42 @@ fn new_obj(e: &mut Engine) -> usize!db.Error {
     ok(i)
 }
 
-fn find_obj(e: &Engine, kind: u8, name: usize, len: usize) -> usize {
+// Kind 0 finds tables, indexes and views; triggers have their own name
+// space. Looks in database `db`, or with NO_DB in every database in search
+// order (TEMP, main, attached).
+fn find_obj(e: &Engine, db: usize, kind: u8, name: usize, len: usize) -> usize {
+    best := NO_COL
+    best_rank := 1000usize
     for i in 0usize..e.schema_objs {
         let name2 = obj_u(e, i, O_NAME)
         let name_len = obj_u(e, i, O_NAMEL)
-        if (kind == 0 || obj_type(e, i) == kind) && names_eq(e, name2, name_len, name, len) {
-            return i
+        let ty = obj_type(e, i)
+        if (kind == 0 && ty != OT_TRIGGER || ty == kind) && names_eq(e, name2, name_len, name, len) {
+            d := obj_db(e, i)
+            if db != NO_DB {
+                if d == db {
+                    return i
+                }
+                continue
+            }
+            r := db_rank(d)
+            if r < best_rank {
+                best = i
+                best_rank = r
+            }
         }
     }
-    NO_COL
+    best
+}
+
+// Where to look up a name with schema qualifier `q` (NO_DB if none): the
+// named database, else the one a view or trigger body is bound to, else
+// every database.
+fn lookup_db(e: &Engine, q: usize) -> usize {
+    if q != NO_DB {
+        return q
+    }
+    e.fix_db
 }
 
 fn find_column(e: &Engine, t: usize, name: usize, len: usize) -> usize {
@@ -196,15 +447,121 @@ fn schema_slot(e: &Engine) -> usize {
 // ---------------------------------------------------------------------------
 // Loading
 
+// Loads the catalog of every open database: main, the attached ones, then
+// TEMP (so TEMP triggers come first when triggers are taken newest first).
 fn load_schema(e: &mut Engine) -> void!db.Error {
     if e.schema_loaded {
         return ok()
     }
+    here := e.cur_db
+    r := load_schema_all(e)
+    use_db(e, here)
+    r
+}
+
+fn load_schema_all(e: &mut Engine) -> void!db.Error {
     e.schema_objs = 0
     e.schema_pool = e.schema_off + e.schema_cap
     e.schema_gen += 1
+    for j in 0usize..e.ndb {
+        k := if j == 0 {
+            0usize
+        } else if j + 1 < e.ndb {
+            j + 1
+        } else {
+            DB_TEMP
+        }
+        if !db_used(e, k) {
+            continue
+        }
+        use_db(e, k)
+        // Databases the statement does not use are read just for this.
+        fresh := !read_active(e)
+        if fresh {
+            begin_read(e)?
+        }
+        r := load_db_objects(e, k)
+        if fresh && !e.write_txn {
+            unlock_to(e, false)
+        }
+        r?
+    }
+    // Pass 2: tables, then indexes and triggers (which refer to tables).
+    for i in 0usize..e.schema_objs {
+        if obj_type(e, i) == OT_TABLE {
+            match load_table(e, i) {
+                ok() => {},
+                err(_) => {
+                    o := obj(e, i)
+                    e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_UNSUPPORTED
+                },
+            }
+        }
+    }
+    for i in 0usize..e.schema_objs {
+        k := obj_type(e, i)
+        if k == OT_INDEX || k == OT_TRIGGER {
+            let tbl = obj_u(e, i, O_TBL)
+            let tbl_len = obj_u(e, i, O_TBLL)
+            d := obj_db(e, i)
+            if k == OT_TRIGGER {
+                // TEMP triggers may be on tables of other databases (named
+                // by a qualifier, else found in search order).
+                tdb := d
+                loaded := match load_trigger(e, i) {
+                    ok(q) => {
+                        if d == DB_TEMP {
+                            tdb = q
+                        }
+                        true
+                    },
+                    err(_) => false,
+                }
+                t := find_obj(e, tdb, OT_TABLE, tbl, tbl_len)
+                if t == NO_COL {
+                    t = find_obj(e, tdb, OT_VIEW, tbl, tbl_len)
+                }
+                o := obj(e, i)
+                stu(e.ws, o + O_TABLE, t)
+                if t == NO_COL {
+                    continue
+                }
+                if !loaded {
+                    // Writes must not silently skip a trigger.
+                    ot := obj(e, t)
+                    e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_HAS_TRIGGER
+                    o3 := obj(e, i)
+                    stu(e.ws, o3 + O_TABLE, NO_COL)
+                }
+                continue
+            }
+            t := find_obj(e, d, OT_TABLE, tbl, tbl_len)
+            o := obj(e, i)
+            stu(e.ws, o + O_TABLE, t)
+            if t == NO_COL {
+                continue
+            }
+            match load_index(e, i, t) {
+                ok() => {
+                    index_add_tail(e, i, t)?
+                },
+                err(_) => {
+                    o2 := obj(e, i)
+                    e.ws[o2 + O_FLAGS] = e.ws[o2 + O_FLAGS] | OF_UNSUPPORTED
+                    ot := obj(e, t)
+                    e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_UNSUPPORTED_INDEX
+                },
+            }
+        }
+    }
+    e.msg_len = 0
+    e.schema_loaded = true
+    ok()
+}
+
+// Pass 1 for database k (current): one object per sqlite_schema row.
+fn load_db_objects(e: &mut Engine, k: usize) -> void!db.Error {
     if e.db_pages == 0 {
-        e.schema_loaded = true
         return ok()
     }
     format := hdr_get(e, 44)?
@@ -216,7 +573,6 @@ fn load_schema(e: &mut Engine) -> void!db.Error {
     } else {
         format
     }
-    // Pass 1: objects.
     c := NCURSORS - 1
     cur_open(e, c, 1, false)
     mark := e.arena_top
@@ -225,6 +581,8 @@ fn load_schema(e: &mut Engine) -> void!db.Error {
         let (p, n) = cur_payload(e, c)?
         rowno := cur_rowid(e, c)
         i := new_obj(e)?
+        o0 := obj(e, i)
+        e.ws[o0 + O_DB] = k as u8
         record_column(e, p, n, 0, R_TMP)?
         kind := 0u8
         if rtype(e, R_TMP) == T_TEXT {
@@ -286,47 +644,6 @@ fn load_schema(e: &mut Engine) -> void!db.Error {
         more = cur_next(e, c)?
     }
     arena_reset(e, mark)
-    // Pass 2: tables, then indexes (which refer to their tables).
-    for i in 0usize..e.schema_objs {
-        if obj_type(e, i) == OT_TABLE {
-            match load_table(e, i) {
-                ok() => {},
-                err(_) => {
-                    o := obj(e, i)
-                    e.ws[o + O_FLAGS] = e.ws[o + O_FLAGS] | OF_UNSUPPORTED
-                },
-            }
-        }
-    }
-    for i in 0usize..e.schema_objs {
-        k := obj_type(e, i)
-        if k == OT_INDEX || k == OT_TRIGGER {
-            let tbl = obj_u(e, i, O_TBL)
-            let tbl_len = obj_u(e, i, O_TBLL)
-            t := find_obj(e, OT_TABLE, tbl, tbl_len)
-            o := obj(e, i)
-            stu(e.ws, o + O_TABLE, t)
-            if t == NO_COL {
-                continue
-            }
-            if k == OT_TRIGGER {
-                ot := obj(e, t)
-                e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_HAS_TRIGGER
-                continue
-            }
-            match load_index(e, i, t) {
-                ok() => {},
-                err(_) => {
-                    o2 := obj(e, i)
-                    e.ws[o2 + O_FLAGS] = e.ws[o2 + O_FLAGS] | OF_UNSUPPORTED
-                    ot := obj(e, t)
-                    e.ws[ot + O_FLAGS] = e.ws[ot + O_FLAGS] | OF_UNSUPPORTED_INDEX
-                },
-            }
-        }
-    }
-    e.msg_len = 0
-    e.schema_loaded = true
     ok()
 }
 
@@ -473,6 +790,9 @@ fn table_from_ast(e: &mut Engine, i: usize, s: usize) -> void!db.Error {
         }
     }
     e.ws[o + O_NPK] = pkcount as u8
+    if (nflags(e, s) & 4) != 0 {
+        return wr_setup(e, i, s, pk_list)
+    }
     ok()
 }
 
@@ -508,7 +828,29 @@ fn index_from_ast(e: &mut Engine, x: usize, t: usize, s: usize) -> void!db.Error
     for item != 0 {
         ex := na(e, item)
         if nkind(e, ex) != N_ID || nc(e, ex) != 0 {
-            return err(fail(e, SQLITE_ERROR, "indexes on expressions are not supported"))
+            // Expression column: keep its text; it is resolved where used.
+            r := cols + k * COL_BYTES
+            stu(e.ws, r + K_COL, EXPR_COL)
+            let span_o = nc(e, item)
+            let span_l = ndd(e, item)
+            d := schema_copy(e, span_o, span_l)?
+            stu(e.ws, r + K_DFLT, d)
+            stu(e.ws, r + K_DFLTL, span_l)
+            if (nflags(e, item) & 1) != 0 {
+                e.ws[r + K_DESC] = 1
+            }
+            coll := nb(e, item)
+            let (xc, strength) = expr_collation(e, ex)
+            e.ws[r + K_COLL] = if coll > 0 {
+                (coll - 1) as u8
+            } else if strength == 2 {
+                xc
+            } else {
+                COLL_BINARY
+            }
+            k += 1
+            item = nnext(e, item)
+            continue
         }
         let ex_a = na(e, ex)
         let ex_b = nb(e, ex)
@@ -544,6 +886,15 @@ fn index_from_ast(e: &mut Engine, x: usize, t: usize, s: usize) -> void!db.Error
         }
         k += 1
         item = nnext(e, item)
+    }
+    span := nx(e, s)
+    if span != 0 {
+        let wo = (span >> 32) as usize
+        let wl = (span & 0xffffffffu64) as usize
+        d := schema_copy(e, wo, wl)?
+        o2 := obj(e, x)
+        stu(e.ws, o2 + O_WHERE, d)
+        stu(e.ws, o2 + O_WHEREL, wl)
     }
     ok()
 }
@@ -731,4 +1082,38 @@ fn next_index_of(e: &Engine, t: usize, after: usize) -> usize {
         }
     }
     NO_COL
+}
+
+// Number of the PRIMARY KEY among a table's automatic indexes (0 if none);
+// a WITHOUT ROWID table's PRIMARY KEY is the table itself and has no
+// separate index, but still takes its number.
+fn autoindex_pk_number(e: &Engine, t: usize, s: usize) -> usize {
+    count := 0usize
+    ipk := rowid_col(e, t)
+    cd := nc(e, s)
+    k := 0usize
+    for cd != 0 {
+        flags := nflags(e, cd)
+        if (flags & CF_PK) != 0 && k != ipk {
+            count += 1
+            return count
+        }
+        if (flags & CF_UNIQUE) != 0 && !auto_duplicate1(e, t, s, k, count) {
+            count += 1
+        }
+        k += 1
+        cd = nnext(e, cd)
+    }
+    tc := ndd(e, s)
+    for tc != 0 {
+        op := nop(e, tc)
+        if op == 1 {
+            return count + 1
+        }
+        if op == 2 {
+            count += 1
+        }
+        tc = nnext(e, tc)
+    }
+    0
 }

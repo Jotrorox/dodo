@@ -1,0 +1,136 @@
+package sqlite
+
+import "std/db"
+
+// WITHOUT ROWID tables. The table is an index b-tree whose records hold the
+// PRIMARY KEY columns first and the remaining columns after them; rows are
+// identified by their PRIMARY KEY instead of a rowid, and secondary indexes
+// end with the PRIMARY KEY columns they do not already contain.
+
+// True when the column list names exactly the PRIMARY KEY columns.
+fn wr_list_is_pk(e: &Engine, t: usize, list: usize) -> bool {
+    npk := pk_count(e, t)
+    if list_len(e, list) != npk {
+        return false
+    }
+    id := list
+    for id != 0 {
+        let io = na(e, id)
+        let il = nb(e, id)
+        c := find_column(e, t, io, il)
+        found := false
+        for k in 0usize..npk {
+            if pk_col(e, t, k) == c && c != NO_COL {
+                found = true
+            }
+        }
+        if !found {
+            return false
+        }
+        id = nnext(e, id)
+    }
+    true
+}
+
+// Key registers a and b hold the same PRIMARY KEY.
+fn wr_same_key(e: &Engine, t: usize, a: usize, b: usize) -> bool {
+    for k in 0usize..pk_count(e, t) {
+        coll := e.ws[pk_rec(e, t, k) + K_COLL]
+        if reg_compare(e, a + k, b + k, coll) != 0 {
+            return false
+        }
+    }
+    true
+}
+
+// Makes `key` the identity of the row being changed.
+fn wr_set_identity(e: &mut Engine, w: usize, key: usize) {
+    t := wget(e, w, W_TABLE)
+    pk := wget(e, w, W_PK)
+    if key == pk {
+        return
+    }
+    for k in 0usize..pk_count(e, t) {
+        copy_reg(e, pk + k, key + k)
+    }
+}
+
+fn wr_pk_fail(e: &mut Engine, t: usize) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, "UNIQUE constraint failed: ")
+    tn := obj_u(e, t, O_NAME)
+    tl := obj_u(e, t, O_NAMEL)
+    for k in 0usize..pk_count(e, t) {
+        if k > 0 {
+            msg_add(e, ", ")
+        }
+        msg_add_ws(e, tn, tl)
+        msg_add(e, ".")
+        let c = pk_col(e, t, k)
+        r := col_rec(e, t, c)
+        let cn = ldu(e.ws, r + K_NAME)
+        let cl = ldu(e.ws, r + K_NAMEL)
+        msg_add_ws(e, cn, cl)
+    }
+    make_error(e, SQLITE_CONSTRAINT_PRIMARYKEY)
+}
+
+// Decodes the row at cursor c into registers dst (columns in table order;
+// dst + ncol, the rowid slot, is NULL).
+fn wr_load_row(e: &mut Engine, t: usize, c: usize, dst: usize) -> void!db.Error {
+    ncol := obj_ncol(e, t)
+    let (p, len) = cur_payload(e, c)?
+    for col in 0usize..ncol {
+        if !row_column(e, t, p, len, col, dst + col)? {
+            column_default(e, t, col, dst + col)?
+        }
+        reg_own(e, dst + col)?
+    }
+    set_null(e, dst + ncol)
+    ok()
+}
+
+// Deletes the row whose PRIMARY KEY is in `key`, with its index entries.
+fn wr_delete_by(e: &mut Engine, w: usize, key: usize) -> void!db.Error {
+    t := wget(e, w, W_TABLE)
+    c := wget(e, w, W_CUR)
+    old := wget(e, w, W_OLD)
+    if !wr_seek(e, c, t, key)? {
+        return ok()
+    }
+    wr_load_row(e, t, c, old)?
+    delete_index_entries(e, w, 0)?
+    if wr_seek(e, c, t, key)? {
+        cur_delete(e, c)?
+    }
+    ok()
+}
+
+// Runs the row-finding SELECT of an UPDATE or DELETE and keeps each row's
+// PRIMARY KEY as a record; returns the record list.
+fn wr_collect(e: &mut Engine, sel: usize, npk: usize) -> (usize, usize)!db.Error {
+    select_reset(e, sel)
+    resreg := select_resreg(e, sel)
+    mark := e.arena_top
+    got := select_next(e, sel)?
+    lend := list_begin(e)
+    for got {
+        rec := sort_push(e, resreg, npk)?
+        list_push(e, rec)?
+        arena_reset(e, mark)
+        got = select_next(e, sel)?
+    }
+    ok(list_finish(e, lend))
+}
+
+// Loads collected key record `rec` as the identity of the row to change.
+fn wr_take_identity(e: &mut Engine, w: usize, rec: usize) -> void!db.Error {
+    t := wget(e, w, W_TABLE)
+    pk := wget(e, w, W_PK)
+    for k in 0usize..pk_count(e, t) {
+        let len = rec_len(e, rec)
+        record_column(e, rec + 4, len, k, pk + k)?
+        reg_own(e, pk + k)?
+    }
+    ok()
+}

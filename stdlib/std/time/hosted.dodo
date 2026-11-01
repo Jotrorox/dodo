@@ -89,3 +89,17 @@ pub struct WallClock {
         }
     }
 }
+
+// Converts `seconds` since the Unix epoch to local time with the operating
+// system's time zone rules (localtime_r, or _localtime64_s on Windows).
+// Writes [second, minute, hour, day of month, month 0-11, year - 1900,
+// weekday 0-6 from Sunday, day of year 0-365, DST flag] to fields[0..9] and
+// returns false when the OS cannot represent the time. fields needs at
+// least nine elements.
+pub fn local_time_fields(seconds: i64, fields: &mut[i32]) -> bool {
+    core.assert(fields.len >= 9)
+    code := unsafe {
+        backend.dodo_time_local(seconds, ptr.as_mut_ptr(fields))
+    }
+    return code == 0
+}

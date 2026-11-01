@@ -4,9 +4,18 @@ and through the Dodo shell (tests/sqlite/shell.dodo), compare every result row,
 then check the Dodo-written database with SQLite's integrity_check and compare
 the final table contents.
 
-Usage: differential.py SHELL_BINARY WORKDIR SCRIPT...
+Each engine runs in a working directory of its own (WORKDIR/<script>.sqlite.d
+and WORKDIR/<script>.dodo.d), so scripts may ATTACH relative paths; every
+database file both runs leave there is cross-checked like the main database.
+
+Usage: differential.py [--encoding NAME] SHELL_BINARY WORKDIR SCRIPT...
+
+--encoding runs every script against a new database in that text encoding
+(it prepends "pragma encoding = 'NAME';"). The environment, TZ included,
+applies to both SQLite and the shell.
 """
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -24,12 +33,20 @@ def fmt(conn, value):
     return value
 
 
+# SQLite 3.47 changed real-to-text conversion from 15 to (up to) 17
+# significant digits, and 3.53 replaced its decimal conversion, which
+# changes some last digits; the Dodo driver matches 3.53 and later exactly,
+# so older oracles (such as Debian's 3.46) only need to agree numerically.
+OLD_REAL_FORMAT = sqlite3.sqlite_version_info < (3, 53)
+
+
 def same_row(e, g):
-    """Rows match exactly, or differ only in how reals are printed: SQLite
-    3.47 changed real-to-text conversion from 15 to (up to) 17 significant
-    digits, and this driver follows the newer rule."""
+    """Rows match exactly (or, on an older SQLite, differ only in how reals
+    are printed)."""
     if e == g:
         return True
+    if not OLD_REAL_FORMAT:
+        return False
     a, b = e.split("|"), g.split("|")
     if len(a) != len(b):
         return False
@@ -59,7 +76,16 @@ def statements(script):
         yield buf
 
 
-def oracle(path, script):
+def oracle(path, script, cwd):
+    here = os.getcwd()
+    os.chdir(cwd)
+    try:
+        return oracle_in(path, script)
+    finally:
+        os.chdir(here)
+
+
+def oracle_in(path, script):
     conn = sqlite3.connect(path, isolation_level=None)
     out = []
     for stmt in statements(script):
@@ -73,14 +99,28 @@ def oracle(path, script):
     return out
 
 
+def table_query(conn, t):
+    """SELECT for every row of table t in a stable order: rowid order, or
+    for WITHOUT ROWID tables the order of all columns."""
+    q = '"' + t.replace('"', '""') + '"'
+    try:
+        conn.execute(f"select rowid from {q} limit 0")
+        return f"select * from {q} order by rowid"
+    except sqlite3.Error:
+        # The planner may scan a covering index instead of the table, so
+        # order by every column.
+        n = len(conn.execute(f"select * from {q} limit 0").description)
+        order = ", ".join(str(i + 1) for i in range(n))
+        return f"select * from {q} order by {order}"
+
+
 def contents(path):
     conn = sqlite3.connect(path)
     rows = []
     tables = [r[0] for r in conn.execute(
         "select name from sqlite_schema where type='table' order by name")]
     for t in tables:
-        q = '"' + t.replace('"', '""') + '"'
-        for row in conn.execute(f"select * from {q} order by rowid"):
+        for row in conn.execute(table_query(conn, t)):
             rows.append(t + ": " + "|".join(fmt(conn, v) for v in row))
     schema = [r for r in conn.execute(
         "select type, name, tbl_name, sql from sqlite_schema order by name")]
@@ -89,10 +129,58 @@ def contents(path):
     return rows, schema, check
 
 
+def normalize(lines, main, d):
+    subs = []
+    for p in (main, d):
+        for q in {p, os.path.realpath(p)}:
+            subs.append((q, "<main>" if p == main else "<dir>"))
+    subs.sort(key=lambda x: -len(x[0]))
+    out = []
+    for line in lines:
+        for q, r in subs:
+            line = line.replace(q, r)
+        out.append(line)
+    return out
+
+
+def fresh_dir(path):
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    os.makedirs(path)
+    return path
+
+
+def side_files(d):
+    """Files a run left in its directory, ignoring WAL side files (this
+    SQLite keeps them after closing)."""
+    return sorted(f for f in os.listdir(d) if not f.endswith(("-wal", "-shm")))
+
+
+def compare_files(shell, workdir, name, a, b, problems, label):
+    """Cross-checks database files a (SQLite) and b (Dodo)."""
+    ra, sa, _ = contents(a)
+    rb, sb, cb = contents(b)
+    if cb != [("ok",)]:
+        problems.append(f"{label}integrity_check of the Dodo database: {cb}")
+    if len(ra) != len(rb) or not all(same_row(x, y) for x, y in zip(ra, rb)):
+        for x, y in zip(ra, rb):
+            if not same_row(x, y):
+                problems.append(f"{label}content differs: sqlite {x!r} dodo {y!r}")
+                break
+        if len(ra) != len(rb):
+            problems.append(f"{label}content rows: sqlite {len(ra)} dodo {len(rb)}")
+    if sa != sb:
+        problems.append(f"{label}schema differs:\n  sqlite {sa}\n  dodo   {sb}")
+
+
 def main():
-    shell, workdir = sys.argv[1], sys.argv[2]
+    args = sys.argv[1:]
+    encoding = None
+    if args[0] == "--encoding":
+        encoding, args = args[1], args[2:]
+    shell, workdir = args[0], os.path.abspath(args[1])
     failures = 0
-    for script_path in sys.argv[3:]:
+    for script_path in args[2:]:
         name = os.path.basename(script_path)
         with open(script_path, encoding="utf-8") as f:
             script = f.read()
@@ -103,59 +191,73 @@ def main():
             if sqlite3.sqlite_version_info < need:
                 print(f"skip {name} (needs SQLite {first.split(':', 1)[1].strip()})")
                 continue
+        if encoding:
+            script = f"pragma encoding = '{encoding}';\n" + script
+            name = f"{encoding}-{name}"
+            script_path = os.path.join(workdir, name)
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script)
         a = os.path.join(workdir, name + ".sqlite.db")
         b = os.path.join(workdir, name + ".dodo.db")
-        for p in (a, b, b + "-journal"):
+        for p in (a, a + "-wal", a + "-shm", b, b + "-journal", b + "-wal", b + "-shm"):
             if os.path.exists(p):
                 os.remove(p)
-        expected = "\n".join(oracle(a, script)).splitlines()
-        run = subprocess.run([shell, b, script_path], capture_output=True)
+        da = fresh_dir(os.path.join(workdir, name + ".sqlite.d"))
+        db_ = fresh_dir(os.path.join(workdir, name + ".dodo.d"))
+        expected = "\n".join(oracle(a, script, da)).splitlines()
+        run = subprocess.run([shell, b, os.path.abspath(script_path)], capture_output=True, cwd=db_)
         actual = run.stdout.decode("utf-8", "replace").splitlines()
+        # File names (PRAGMA database_list) differ only by directory.
+        expected = normalize(expected, a, da)
+        actual = normalize(actual, b, db_)
         problems = []
         if run.returncode != 0:
             problems.append(f"shell exited with {run.returncode}: {run.stderr.decode()[-2000:]}")
+        # "-- compare-errors" makes error messages count, not just errors.
+        exact_errors = "-- compare-errors" in script.split("\n", 2)[:2]
         for i in range(max(len(expected), len(actual))):
             e = expected[i] if i < len(expected) else "<missing>"
             g = actual[i] if i < len(actual) else "<missing>"
-            if e.startswith("ERROR") and g.startswith("ERROR"):
+            if e.startswith("ERROR") and g.startswith("ERROR") and not exact_errors:
                 continue
             if not same_row(e, g):
                 problems.append(f"row {i}: expected {e!r}, got {g!r}")
                 if len(problems) > 20:
                     break
         if not problems and os.path.exists(b):
-            ra, sa, _ = contents(a)
-            rb, sb, cb = contents(b)
-            if cb != [("ok",)]:
-                problems.append(f"integrity_check of the Dodo database: {cb}")
-            if len(ra) != len(rb) or not all(same_row(x, y) for x, y in zip(ra, rb)):
-                for x, y in zip(ra, rb):
-                    if not same_row(x, y):
-                        problems.append(f"content differs: sqlite {x!r} dodo {y!r}")
-                        break
-                if len(ra) != len(rb):
-                    problems.append(f"content rows: sqlite {len(ra)} dodo {len(rb)}")
-            if sa != sb:
-                problems.append(f"schema differs:\n  sqlite {sa}\n  dodo   {sb}")
+            compare_files(shell, workdir, name, a, b, problems, "")
+        if not problems:
+            # Attached databases the scripts created (relative paths).
+            fa, fb = side_files(da), side_files(db_)
+            if fa != fb:
+                problems.append(f"files differ: sqlite {fa} dodo {fb}")
+            else:
+                for f in fa:
+                    pa, pb = os.path.join(da, f), os.path.join(db_, f)
+                    if os.path.getsize(pa) == 0 and os.path.getsize(pb) == 0:
+                        continue
+                    if f.endswith("-journal"):
+                        problems.append(f"leftover journal {f}")
+                        continue
+                    compare_files(shell, workdir, name, pa, pb, problems, f + ": ")
         if not problems and os.path.exists(a):
             # Read the SQLite-written database back through Dodo.
             ra, _, _ = contents(a)
             conn = sqlite3.connect(a)
             tables = [r[0] for r in conn.execute(
                 "select name from sqlite_schema where type='table' order by name")]
+            queries = [table_query(conn, t) for t in tables]
             conn.close()
             dump = os.path.join(workdir, name + ".dump.sql")
             with open(dump, "w", encoding="utf-8") as f:
-                for t in tables:
-                    q = '"' + t.replace('"', '""') + '"'
-                    f.write(f"select * from {q} order by rowid;\n")
+                for query in queries:
+                    f.write(query + ";\n")
             run = subprocess.run([shell, a, dump], capture_output=True)
             got = run.stdout.decode("utf-8", "replace")
             want = []
             conn = sqlite3.connect(a)
-            for t in tables:
-                q = '"' + t.replace('"', '""') + '"'
-                for row in conn.execute(f"select * from {q} order by rowid"):
+            for query in queries:
+                for row in conn.execute(query):
                     want.append("|".join(fmt(conn, v) for v in row))
             conn.close()
             gl, wl = got.splitlines(), "\n".join(want).splitlines()

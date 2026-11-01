@@ -35,6 +35,10 @@ const SH_PPOS: usize = 84
 const SH_NAMES: usize = 88
 const SH_CURTOP: usize = 92
 const SH_LRU: usize = 96
+// Database the statement writes, plus one (0 = main / none).
+const SH_WDB: usize = 100
+// Databases the statement reads or writes (bit per index).
+const SH_DBMASK: usize = 104
 
 const ST_IDLE: usize = 0
 const ST_RUNNING: usize = 1
@@ -116,6 +120,13 @@ fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
     e.cte_n = 0
     e.min_ctx = NO_COL
     e.regctx_t = NO_COL
+    e.trig_t = NO_COL
+    e.trig_parse = false
+    e.tstack_off = 0
+    e.tstack_n = 0
+    e.wdb = NO_DB
+    e.fix_db = NO_DB
+    e.db_mask = 0
     next_token(e)
     root := 0usize
     if e.tk == TK_EOF || e.tk == TK_SEMI {
@@ -181,7 +192,15 @@ fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
     } else if kind == S_CREATE_VIEW {
         // Validate the definition now, as SQLite does.
         sel := ndd(e, root)
-        resolve_select(e, sel)?
+        vdb := stmt_target_db(e, root)
+        e.fix_db = if vdb == DB_TEMP {
+            NO_DB
+        } else {
+            vdb
+        }
+        rv := resolve_select(e, sel)
+        e.fix_db = NO_DB
+        rv?
         cols := nc(e, root)
         if cols != 0 && list_len(e, cols) != select_ncols(e, sel) {
             return err(fail(e, SQLITE_ERROR, "number of columns in the view definition does not match the select"))
@@ -221,7 +240,7 @@ fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
         let root_a = na(e, root)
         let root_b = nb(e, root)
         pragma = pragma_id(e, root_a, root_b)
-        if nflags(e, root) == 1 && pragma != P_BUSY_TIMEOUT {
+        if nflags(e, root) == 1 && !pragma_set_returns_row(pragma) {
             ncol = 0
         } else {
             ncol = pragma_columns(pragma)
@@ -235,7 +254,40 @@ fn compile_slot(e: &mut Engine, slot: usize) -> void!db.Error {
             let root_c = nc(e, root)
             resolve_expr(e, root_c, 0, false)?
         }
+    } else if kind == S_ATTACH || kind == S_DETACH {
+        let fx = na(e, root)
+        resolve_expr(e, fx, 0, false)?
+        let nx_ = nb(e, root)
+        resolve_expr(e, nx_, 0, false)?
     }
+    wdb := if kind == S_CREATE_TABLE || kind == S_CREATE_INDEX || kind == S_CREATE_VIEW || kind == S_CREATE_TRIGGER || kind == S_DROP || kind == S_ALTER || kind == S_PRAGMA {
+        stmt_target_db(e, root)
+    } else {
+        e.wdb
+    }
+    stu(e.ws, base + SH_WDB, if wdb == NO_DB {
+        0usize
+    } else {
+        wdb + 1
+    })
+    if wdb != NO_DB {
+        mark_db(e, wdb)
+    }
+    if kind == S_PRAGMA {
+        let pq = ndb_of(e, root)
+        let pid = pragma
+        if pid == P_INTEGRITY_CHECK && pq == NO_DB || pid == P_JOURNAL_MODE && pq == NO_DB && nflags(e, root) == 1 {
+            e.db_mask = 4095
+        } else {
+            mark_db(e, if pq == NO_DB {
+                0usize
+            } else {
+                pq
+            })
+        }
+    }
+    let dbm = e.db_mask as usize
+    stu(e.ws, base + SH_DBMASK, dbm)
     stu(e.ws, base + SH_ROOT, root)
     let nparam2 = e.nparam
     stu(e.ws, base + SH_NPARAM, nparam2)
@@ -276,11 +328,28 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
         stmt_finish(e, slot, true)?
     }
     e.error_offset = -1
+    e.raise_kind = 0
+    if e.relayout {
+        relayout_workspace(e)?
+    }
     activate(e, slot)
     kind := sh(e, slot, SH_KIND) as u8
     root := sh(e, slot, SH_ROOT)
     // Transaction control runs outside the autocommit logic.
-    if kind == S_BEGIN || kind == S_COMMIT || kind == S_ROLLBACK || kind == S_EMPTY || kind == S_VACUUM {
+    if kind == S_BEGIN || kind == S_COMMIT || kind == S_ROLLBACK || kind == S_EMPTY || kind == S_VACUUM || kind == S_SAVEPOINT || kind == S_RELEASE || kind == S_ATTACH || kind == S_DETACH {
+        if sh(e, slot, SH_GEN) == 4294967295 {
+            // Moved by relayout_workspace; these need no schema.
+            compile_slot(e, slot)?
+            activate(e, slot)
+        }
+        // ATTACH and DETACH evaluate expressions.
+        e.sort_top = e.sort_off
+        e.sort_hi = e.sort_off + e.sort_cap
+        e.keep_top = e.keep_off
+        e.arena_top = e.arena_off
+        e.arena_base = e.arena_top
+        let regtop0 = sh(e, slot, SH_REGTOP)
+        e.rtop = regtop0
         sh_set(e, slot, SH_STATE, ST_RUNNING)
         e.active = slot
         return ok()
@@ -290,12 +359,26 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
     if kind == S_PRAGMA {
         write = pragma_writes(e, nodes_root)
     } else {
-        write = kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE || kind == S_CREATE_TABLE || kind == S_CREATE_INDEX || kind == S_DROP || kind == S_ALTER || kind == S_CREATE_VIEW
+        write = kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE || kind == S_CREATE_TABLE || kind == S_CREATE_INDEX || kind == S_DROP || kind == S_ALTER || kind == S_CREATE_VIEW || kind == S_CREATE_TRIGGER
     }
+    // The written database starts its write transaction first (so it
+    // may wait for the lock with a fresh snapshot); the others read.
     if write {
-        begin_write(e)?
-    } else {
-        begin_read(e)?
+        match stmt_begin_write(e, slot) {
+            ok() => {},
+            err(reason) => {
+                abort_txn(e)
+                return err(reason)
+            },
+        }
+    }
+    let mask0 = sh(e, slot, SH_DBMASK) as u32
+    match begin_read_mask(e, mask0) {
+        ok(_) => {},
+        err(reason) => {
+            abort_txn(e)
+            return err(reason)
+        },
     }
     match load_schema(e) {
         ok() => {},
@@ -314,10 +397,28 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
             },
         }
         activate(e, slot)
+        if write {
+            match stmt_begin_write(e, slot) {
+                ok() => {},
+                err(reason) => {
+                    abort_txn(e)
+                    return err(reason)
+                },
+            }
+        }
+        let mask1 = sh(e, slot, SH_DBMASK) as u32
+        match begin_read_mask(e, mask1) {
+            ok(_) => {},
+            err(reason) => {
+                abort_txn(e)
+                return err(reason)
+            },
+        }
     }
     // Bind parameters (data is copied to the bottom of the sort stack).
     e.sort_top = e.sort_off
     e.sort_hi = e.sort_off + e.sort_cap
+    e.keep_top = e.keep_off
     e.arena_top = e.arena_off
     for c in 0usize..NCURSORS {
         co := e.cur_off + c * CURSOR_BYTES
@@ -382,6 +483,20 @@ fn stmt_start(e: &mut Engine, slot: usize, params: &[db.Value]) -> void!db.Error
     ok()
 }
 
+fn stmt_begin_write(e: &mut Engine, slot: usize) -> void!db.Error {
+    w := sh(e, slot, SH_WDB)
+    d := if w == 0 {
+        0usize
+    } else {
+        w - 1
+    }
+    here := e.cur_db
+    enter_db(e, d)?
+    r := begin_write(e)
+    use_db(e, here)
+    r
+}
+
 fn bind_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
     if e.sort_top + len > e.sort_hi {
         abort_txn(e)
@@ -399,7 +514,7 @@ fn abort_txn(e: &mut Engine) {
             ok() => {},
             err(_) => {},
         }
-        end_read(e)
+        end_read_all(e)
     }
 }
 
@@ -419,6 +534,30 @@ fn stmt_step(e: &mut Engine, slot: usize) -> bool!db.Error {
             ok(row)
         },
         err(reason) => {
+            kind := e.raise_kind
+            e.raise_kind = 0
+            if kind == RAISE_FAIL {
+                // FAIL keeps the changes made before the failure.
+                saved := e.msg_len
+                match stmt_finish(e, slot, true) {
+                    ok() => {},
+                    err(_) => {},
+                }
+                e.msg_len = saved
+                return err(reason)
+            }
+            if kind == RAISE_ROLLBACK && e.explicit_txn {
+                saved2 := e.msg_len
+                stmt_fail(e, slot)
+                match rollback(e) {
+                    ok() => {},
+                    err(_) => {},
+                }
+                e.explicit_txn = false
+                unlock_all(e, false)
+                e.msg_len = saved2
+                return err(reason)
+            }
             stmt_fail(e, slot)
             err(reason)
         },
@@ -487,6 +626,8 @@ fn step_inner(e: &mut Engine, slot: usize) -> bool!db.Error {
         exec_create_index(e, root)?
     } else if kind == S_CREATE_VIEW {
         exec_create_view(e, root)?
+    } else if kind == S_CREATE_TRIGGER {
+        exec_create_trigger(e, root)?
     } else if kind == S_DROP {
         exec_drop(e, root)?
     } else if kind == S_ALTER {
@@ -511,14 +652,51 @@ fn step_inner(e: &mut Engine, slot: usize) -> bool!db.Error {
         }
         commit(e)?
         e.explicit_txn = false
-        unlock_to(e, false)
+        sp_reset(e)
+        unlock_all(e, false)
+    } else if kind == S_ROLLBACK && nop(e, root) == 1 {
+        let name = na(e, root)
+        let nl = nb(e, root)
+        k := sp_find(e, name, nl)
+        if k == NO_COL {
+            return err(fail2(e, SQLITE_ERROR, "no such savepoint: ", name, nl))
+        }
+        sp_rollback_to(e, k)?
     } else if kind == S_ROLLBACK {
         if !e.explicit_txn {
             return err(fail(e, SQLITE_ERROR, "cannot rollback - no transaction is active"))
         }
         e.explicit_txn = false
         rollback(e)?
-        unlock_to(e, false)
+        sp_reset(e)
+        unlock_all(e, false)
+    } else if kind == S_SAVEPOINT {
+        if !e.explicit_txn {
+            e.explicit_txn = true
+            e.sp_txn = true
+        }
+        let name2 = na(e, root)
+        let nl2 = nb(e, root)
+        sp_push(e, name2, nl2)?
+    } else if kind == S_RELEASE {
+        let name3 = na(e, root)
+        let nl3 = nb(e, root)
+        k := sp_find(e, name3, nl3)
+        if k == NO_COL {
+            return err(fail2(e, SQLITE_ERROR, "no such savepoint: ", name3, nl3))
+        }
+        if k == 0 && e.sp_txn {
+            commit(e)?
+            e.explicit_txn = false
+            sp_reset(e)
+            unlock_all(e, false)
+        } else {
+            sp_release(e, k)
+        }
+    } else if kind == S_ATTACH {
+        exec_attach(e, root)?
+    } else if kind == S_DETACH {
+        exec_detach(e, root)?
     }
     ok(false)
 }
@@ -536,26 +714,30 @@ fn stmt_finish(e: &mut Engine, slot: usize, success: bool) -> void!db.Error {
     kind := sh(e, slot, SH_KIND) as u8
     if kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE {
         e.total_changes += e.changes
+        e.last_changes = e.changes
     }
+    clear_read_fresh(e)
     stmt_end(e)
     if !success {
         return ok()
     }
     if !e.explicit_txn {
-        if e.write_txn {
+        if any_write(e) {
             match commit(e) {
                 ok() => {},
                 err(reason) => {
+                    saved := e.msg_len
                     match rollback(e) {
                         ok() => {},
                         err(_) => {},
                     }
-                    end_read(e)
+                    end_read_all(e)
+                    e.msg_len = saved
                     return err(reason)
                 },
             }
         }
-        end_read(e)
+        end_read_all(e)
     }
     ok()
 }
@@ -572,7 +754,13 @@ fn stmt_fail(e: &mut Engine, slot: usize) {
     sh_set(e, slot, SH_PN, 0)
     sh_set(e, slot, SH_PPOS, 0)
     sh_set(e, slot, SH_PIDX, 0)
-    if e.explicit_txn && e.write_txn {
+    clear_read_fresh(e)
+    kind0 := sh(e, slot, SH_KIND) as u8
+    control := kind0 == S_BEGIN || kind0 == S_SAVEPOINT || kind0 == S_RELEASE || kind0 == S_ATTACH || kind0 == S_DETACH || kind0 == S_EMPTY || kind0 == S_VACUUM || kind0 == S_ROLLBACK && e.explicit_txn
+    if control && e.explicit_txn {
+        // A failed BEGIN, SAVEPOINT, RELEASE, ROLLBACK TO, ATTACH or DETACH
+        // changed nothing; the transaction goes on.
+    } else if e.explicit_txn && any_write(e) {
         undone := match stmt_rollback(e) {
             ok(v) => v,
             err(_) => false,
@@ -583,17 +771,21 @@ fn stmt_fail(e: &mut Engine, slot: usize) {
                 err(_) => {},
             }
             e.explicit_txn = false
-            unlock_to(e, false)
+            unlock_all(e, false)
         }
     } else if !e.explicit_txn {
         match rollback(e) {
             ok() => {},
             err(_) => {},
         }
-        end_read(e)
+        end_read_all(e)
     }
     stmt_end(e)
     e.changes = 0
+    kind := sh(e, slot, SH_KIND) as u8
+    if kind == S_INSERT || kind == S_UPDATE || kind == S_DELETE {
+        e.last_changes = 0
+    }
     e.msg_len = saved_len
 }
 
@@ -612,4 +804,46 @@ fn column_name(e: &Engine, slot: usize, i: usize) -> (usize, usize) {
         return (0usize, 0usize)
     }
     (ldu(e.ws, names + i * 8), ldu(e.ws, names + i * 8 + 4))
+}
+
+// Lays the whole workspace out again for a new page size chosen by PRAGMA
+// page_size before the database was created. Prepared statements keep their
+// SQL (parked at the end of the workspace, inside the empty page cache) and
+// are recompiled when next run.
+fn relayout_workspace(e: &mut Engine) -> void!db.Error {
+    e.relayout = false
+    old_off := e.stmt_off
+    old_slot := e.stmt_slot
+    n := e.stmt_slots + 1
+    park := e.ws.len
+    for s in 0usize..n {
+        base := old_off + s * old_slot
+        len := SLOT_SQL + ldu(e.ws, base + SH_SQLLEN)
+        park -= old_slot
+        move_bytes(e.ws, base, park, if len < old_slot {
+            len
+        } else {
+            old_slot
+        })
+    }
+    e.slot_ps = max_page_size(e)
+    layout(e)?
+    e.schema_loaded = false
+    p := e.ws.len
+    for s in 0usize..n {
+        p -= old_slot
+        len := SLOT_SQL + ldu(e.ws, p + SH_SQLLEN)
+        base := e.stmt_off + s * e.stmt_slot
+        if len + 1024 > e.stmt_slot {
+            // No longer fits: the handle is retired.
+            zero_bytes(e.ws, base, SLOT_SQL)
+            continue
+        }
+        move_bytes(e.ws, p, base, len)
+        // Force recompilation.
+        stu(e.ws, base + SH_GEN, 4294967295)
+        stu(e.ws, base + SH_STATE, ST_IDLE)
+    }
+    cache_clear_all(e)
+    ok()
 }

@@ -1,0 +1,771 @@
+package sqlite
+
+import "std/db"
+
+// Triggers. A trigger's body is compiled into the statement that fires it,
+// like SQLite's trigger sub-programs: when an INSERT, UPDATE or DELETE is
+// resolved, the CREATE TRIGGER text of every matching trigger is parsed
+// into the statement's slot and its WHEN clause and body statements are
+// resolved with NEW and OLD bound to the row registers of the write. At run
+// time the write fires the programs for each row. A trigger already being
+// compiled further up is skipped, which is SQLite's behaviour with
+// recursive_triggers off (the default).
+
+const N_RAISE: u8 = 60
+const N_TSTEP: u8 = 61
+const S_CREATE_TRIGGER: u8 = 70
+
+// Trigger op: timing | event << 2.
+const TT_BEFORE: u8 = 1
+const TT_AFTER: u8 = 2
+const TT_INSTEAD: u8 = 3
+const TE_DELETE: u8 = 1
+const TE_INSERT: u8 = 2
+const TE_UPDATE: u8 = 3
+
+const RAISE_IGNORE: u8 = 1
+const RAISE_ROLLBACK: u8 = 2
+const RAISE_ABORT: u8 = 3
+const RAISE_FAIL: u8 = 4
+
+const SQLITE_CONSTRAINT_TRIGGER: i32 = 1811
+
+const TSTACK_MAX: usize = 64
+
+// Trigger program record: [0] trigger object, [4] WHEN, [8] first step.
+const TP_BYTES: usize = 12
+
+fn trig_mask(event: u8, timing: u8) -> usize {
+    ((1usize << (event as usize)) | (16usize << (timing as usize)))
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+
+// CREATE [TEMP] TRIGGER, after the TRIGGER keyword.
+fn parse_create_trigger(e: &mut Engine) -> usize!db.Error {
+    s := new_node(e, S_CREATE_TRIGGER)?
+    if accept_kw(e, "IF") {
+        expect_kw(e, "NOT")?
+        expect_kw(e, "EXISTS")?
+        set_flags(e, s, 1)
+    }
+    name_start := take_object_name(e, s)?
+    timing := TT_BEFORE
+    if accept_kw(e, "BEFORE") {
+        timing = TT_BEFORE
+    } else if accept_kw(e, "AFTER") {
+        timing = TT_AFTER
+    } else if accept_kw(e, "INSTEAD") {
+        expect_kw(e, "OF")?
+        timing = TT_INSTEAD
+    }
+    event := 0u8
+    cols := 0usize
+    if accept_kw(e, "DELETE") {
+        event = TE_DELETE
+    } else if accept_kw(e, "INSERT") {
+        event = TE_INSERT
+    } else if accept_kw(e, "UPDATE") {
+        event = TE_UPDATE
+        if accept_kw(e, "OF") {
+            tail := 0usize
+            for {
+                let (co, cl) = take_name(e)?
+                id := new_node(e, N_ID)?
+                set_nf(e, id, 0, co)
+                set_nf(e, id, 1, cl)
+                let (h, t) = list_append(e, cols, tail, id)
+                cols = h
+                tail = t
+                if !accept(e, TK_COMMA) {
+                    break
+                }
+            }
+        }
+    } else {
+        return err(syntax_error(e))
+    }
+    expect_kw(e, "ON")?
+    let (to, tl) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        let (to2, tl2) = take_name(e)?
+        set_nf(e, s, 2, to2)
+        set_nf(e, s, 3, tl2)
+        set_schema(e, s, 1, to, tl)?
+    } else {
+        set_nf(e, s, 2, to)
+        set_nf(e, s, 3, tl)
+    }
+    if accept_kw(e, "FOR") {
+        expect_kw(e, "EACH")?
+        expect_kw(e, "ROW")?
+    }
+    if accept_kw(e, "WHEN") {
+        x := parse_expr(e)?
+        set_nf(e, s, 5, x)
+    }
+    expect_kw(e, "BEGIN")?
+    save := e.trig_parse
+    e.trig_parse = true
+    res := parse_trigger_steps(e)
+    e.trig_parse = save
+    head := res?
+    expect_kw(e, "END")?
+    set_op(e, s, timing | (event << 2))
+    set_nf(e, s, 4, name_start)
+    set_nf(e, s, 6, head)
+    let end = e.last_end
+    set_x(e, s, ((cols as u64) << 32) | (end as u64))
+    ok(s)
+}
+
+fn parse_trigger_steps(e: &mut Engine) -> usize!db.Error {
+    head := 0usize
+    tail := 0usize
+    for !is_kw(e, "END") {
+        if e.tk == TK_EOF {
+            return err(syntax_error(e))
+        }
+        st := parse_statement(e)?
+        k := nkind(e, st)
+        if k != S_SELECT && k != S_INSERT && k != S_UPDATE && k != S_DELETE {
+            return err(syntax_error(e))
+        }
+        if k != S_SELECT && nx(e, st) != 0 {
+            return err(fail(e, SQLITE_ERROR, "cannot use RETURNING in a trigger"))
+        }
+        expect(e, TK_SEMI)?
+        step := new_node(e, N_TSTEP)?
+        set_nf(e, step, 0, st)
+        let (h, t) = list_append(e, head, tail, step)
+        head = h
+        tail = t
+    }
+    if head == 0 {
+        return err(syntax_error(e))
+    }
+    ok(head)
+}
+
+// RAISE(IGNORE) or RAISE(ROLLBACK|ABORT|FAIL, message), after RAISE.
+fn parse_raise(e: &mut Engine) -> usize!db.Error {
+    n := new_node(e, N_RAISE)?
+    expect(e, TK_LP)?
+    if accept_kw(e, "IGNORE") {
+        set_op(e, n, RAISE_IGNORE)
+    } else {
+        if accept_kw(e, "ROLLBACK") {
+            set_op(e, n, RAISE_ROLLBACK)
+        } else if accept_kw(e, "ABORT") {
+            set_op(e, n, RAISE_ABORT)
+        } else if accept_kw(e, "FAIL") {
+            set_op(e, n, RAISE_FAIL)
+        } else {
+            return err(syntax_error(e))
+        }
+        expect(e, TK_COMMA)?
+        x := parse_expr(e)?
+        set_nf(e, n, 0, x)
+    }
+    expect(e, TK_RP)?
+    ok(n)
+}
+
+fn eval_raise(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    kind := nop(e, n)
+    if kind == RAISE_IGNORE {
+        e.raise_kind = RAISE_IGNORE
+        return err(fail(e, SQLITE_CONSTRAINT_TRIGGER, "RAISE(IGNORE)"))
+    }
+    let x = na(e, n)
+    eval(e, x, dst)?
+    to_text(e, dst)?
+    e.raise_kind = kind
+    let mo = roff(e, dst)
+    let ml = rlen(e, dst)
+    e.msg_len = 0
+    msg_add_ws(e, mo, ml)
+    err(make_error(e, SQLITE_CONSTRAINT_TRIGGER))
+}
+
+// ---------------------------------------------------------------------------
+// CREATE TRIGGER / DROP TRIGGER
+
+fn exec_create_trigger(e: &mut Engine, s: usize) -> void!db.Error {
+    name := na(e, s)
+    nl := nb(e, s)
+    d := stmt_target_db(e, s)
+    enter_db(e, d)?
+    if find_obj(e, d, OT_TRIGGER, name, nl) != NO_COL {
+        if (nflags(e, s) & 1) != 0 {
+            return ok()
+        }
+        return err(fail2(e, SQLITE_ERROR, "trigger already exists: ", name, nl))
+    }
+    if reserved_name(e, name, nl) {
+        return err(fail2(e, SQLITE_ERROR, "object name reserved for internal use: ", name, nl))
+    }
+    tn := nc(e, s)
+    tl := ndd(e, s)
+    timing := nop(e, s) & 3
+    tq := ndb2_of(e, s)
+    if d != DB_TEMP {
+        // A trigger may only refer to its own database (TEMP triggers
+        // excepted).
+        if tq != NO_DB && tq != d {
+            return err(cross_db_error(e, "trigger", name, nl, tq))
+        }
+        check_fixed_refs(e, "trigger", name, nl, d, true)?
+    }
+    ldb := if d == DB_TEMP {
+        tq
+    } else {
+        d
+    }
+    t := find_obj(e, ldb, OT_TABLE, tn, tl)
+    v := find_obj(e, ldb, OT_VIEW, tn, tl)
+    if t != NO_COL && v != NO_COL {
+        if db_rank(obj_db(e, v)) < db_rank(obj_db(e, t)) {
+            t = NO_COL
+        } else {
+            v = NO_COL
+        }
+    }
+    if t == NO_COL && v == NO_COL {
+        e.msg_len = 0
+        msg_add(e, "no such table: ")
+        let dn = db_name_off(e, d)
+        let dl = db_name_len(e, d)
+        msg_add_ws(e, dn, dl)
+        msg_add(e, ".")
+        msg_add_ws(e, tn, tl)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    if reserved_name(e, tn, tl) {
+        return err(fail(e, SQLITE_ERROR, "cannot create trigger on system table"))
+    }
+    if t != NO_COL && timing == TT_INSTEAD {
+        return err(fail2(e, SQLITE_ERROR, "cannot create INSTEAD OF trigger on table: ", tn, tl))
+    }
+    if t == NO_COL && timing != TT_INSTEAD {
+        e.msg_len = 0
+        msg_add(e, if timing == TT_BEFORE {
+            "cannot create BEFORE trigger on view: "
+        } else {
+            "cannot create AFTER trigger on view: "
+        })
+        msg_add_ws(e, tn, tl)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    let start = ne_(e, s)
+    let end = (nx(e, s) & 0xffffffffu64) as usize
+    let (sql, sqll) = normalized_sql(e, "CREATE TRIGGER ", start, end)?
+    schema_insert(e, "trigger", name, nl, tn, tl, 0, sql, sqll)?
+    schema_changed(e)
+}
+
+// Catalog loading: records the trigger's timing and event. Returns the
+// database its ON clause names (NO_DB when unqualified).
+fn load_trigger(e: &mut Engine, i: usize) -> usize!db.Error {
+    sql := obj_u(e, i, O_SQL)
+    sqll := obj_u(e, i, O_SQLL)
+    let slot = schema_slot(e)
+    begin_parse(e, slot, sql, sqll)
+    save := e.trig_parse
+    e.trig_parse = true
+    res := parse_statement(e)
+    e.trig_parse = save
+    s := res?
+    if nkind(e, s) != S_CREATE_TRIGGER {
+        return err(corrupt(e))
+    }
+    o := obj(e, i)
+    let op = nop(e, s)
+    e.ws[o + O_ONCONF] = op
+    ok(ndb2_of(e, s))
+}
+
+fn trigger_op(e: &Engine, i: usize) -> u8 {
+    e.ws[obj(e, i) + O_ONCONF]
+}
+
+// ---------------------------------------------------------------------------
+// Compilation
+
+// Compiles the triggers of table (or view) `t` that `event` fires into the
+// write block of statement `s`. INSERT statements with an UPSERT DO UPDATE
+// also get the UPDATE triggers.
+fn compile_triggers(e: &mut Engine, s: usize, w: usize, t: usize, event: u8) -> void!db.Error {
+    if t >= LOCAL_OBJ && wget(e, w, W_VIEW) == 0 {
+        return ok()
+    }
+    target := if wget(e, w, W_VIEW) != 0 {
+        wget(e, w, W_VIEW) - 1
+    } else {
+        t
+    }
+    n := 0usize
+    for i in 0usize..e.schema_objs {
+        if obj_type(e, i) == OT_TRIGGER && obj_u(e, i, O_TABLE) == target {
+            n += 1
+        }
+    }
+    if n == 0 {
+        return ok()
+    }
+    upsert_update := false
+    if event == TE_INSERT && wget(e, w, W_UPSERT) != 0 {
+        upsert_update = ldu(e.ws, wget(e, w, W_UPSERT) + 4) != 0
+    }
+    if e.tstack_off == 0 {
+        let st = pool_alloc(e, TSTACK_MAX * 4)?
+        e.tstack_off = st
+        e.tstack_n = 0
+    }
+    arr := pool_alloc(e, n * 8 + 4)?
+    count := 0usize
+    i := e.schema_objs
+    for i > 0 {
+        i -= 1
+        if obj_type(e, i) != OT_TRIGGER || obj_u(e, i, O_TABLE) != target {
+            continue
+        }
+        op := trigger_op(e, i)
+        tev := op >> 2
+        ttm := op & 3
+        if tev != event && !(upsert_update && tev == TE_UPDATE) {
+            continue
+        }
+        running := false
+        for k in 0usize..e.tstack_n {
+            if ldu(e.ws, e.tstack_off + k * 4) == i {
+                running = true
+            }
+        }
+        if running {
+            continue
+        }
+        if e.tstack_n >= TSTACK_MAX {
+            return err(fail(e, SQLITE_ERROR, "too many levels of trigger recursion"))
+        }
+        prog := compile_trigger(e, w, t, i, tev, ttm)?
+        if prog == 0 {
+            continue
+        }
+        stu(e.ws, arr + count * 8, trig_mask(tev, ttm))
+        stu(e.ws, arr + count * 8 + 4, prog)
+        count += 1
+    }
+    stu(e.ws, w + W_TRIG, arr)
+    stu(e.ws, w + W_NTRIG, count)
+    ok()
+}
+
+// True when an UPDATE ... SET list (col, expr) pairs touches a column named
+// in the trigger's UPDATE OF list.
+fn update_of_matches(e: &Engine, t: usize, cols: usize, sets: usize, nset: usize) -> bool {
+    id := cols
+    for id != 0 {
+        let io = na(e, id)
+        let il = nb(e, id)
+        c := find_column(e, t, io, il)
+        for k in 0usize..nset {
+            sc := ldu(e.ws, sets + k * 8)
+            if sc == c && c != NO_COL {
+                return true
+            }
+            if sc == ROWID_TARGET && (c == rowid_col(e, t) && c != NO_COL || c == NO_COL && is_rowid_name(e, io, il)) {
+                return true
+            }
+        }
+        id = nnext(e, id)
+    }
+    false
+}
+
+fn compile_trigger(e: &mut Engine, w: usize, t: usize, i: usize, tev: u8, ttm: u8) -> usize!db.Error {
+    sql := obj_u(e, i, O_SQL)
+    sqll := obj_u(e, i, O_SQLL)
+    node_lo := e.node_n
+    save_parse := e.trig_parse
+    e.trig_parse = true
+    res := parse_fragment_stmt(e, sql, sqll)
+    e.trig_parse = save_parse
+    root := res?
+    if nkind(e, root) != S_CREATE_TRIGGER {
+        return err(corrupt(e))
+    }
+    cols := (nx(e, root) >> 32) as usize
+    if tev == TE_UPDATE && cols != 0 {
+        sets := 0usize
+        nset := 0usize
+        if wget(e, w, W_SETS) != 0 {
+            sets = wget(e, w, W_SETS)
+            nset = wget(e, w, W_NSET)
+        } else if wget(e, w, W_UPSERT) != 0 {
+            info := wget(e, w, W_UPSERT)
+            sets = ldu(e.ws, info + 8)
+            nset = ldu(e.ws, info + 12)
+        }
+        if !update_of_matches(e, t, cols, sets, nset) {
+            e.node_n = node_lo
+            return ok(0)
+        }
+    }
+    ncol := wget(e, w, W_NCOL)
+    if tev == TE_INSERT && ttm == TT_BEFORE && wget(e, w, W_TNEW) == 0 {
+        let tnew = alloc_regs(e, ncol + 1)?
+        stu(e.ws, w + W_TNEW, tnew)
+    }
+    if tev != TE_INSERT && wget(e, w, W_TOLD) == 0 {
+        let told = alloc_regs(e, ncol + 1)?
+        stu(e.ws, w + W_TOLD, told)
+    }
+    stu(e.ws, e.tstack_off + e.tstack_n * 4, i)
+    e.tstack_n += 1
+    save_t := e.trig_t
+    save_new := e.trig_new
+    save_old := e.trig_old
+    e.trig_t = t
+    e.trig_new = if tev == TE_DELETE {
+        NO_COL
+    } else if tev == TE_INSERT && ttm == TT_BEFORE {
+        wget(e, w, W_TNEW)
+    } else {
+        wget(e, w, W_BASE)
+    }
+    e.trig_old = if tev == TE_INSERT {
+        NO_COL
+    } else {
+        wget(e, w, W_TOLD)
+    }
+    conf := wget(e, w, W_CONF) as u8
+    // Non-TEMP triggers name objects of their own database only.
+    save_fix := e.fix_db
+    let tdb = obj_db(e, i)
+    e.fix_db = if tdb == DB_TEMP {
+        NO_DB
+    } else {
+        tdb
+    }
+    res2 := resolve_trigger(e, root, conf)
+    e.fix_db = save_fix
+    e.trig_t = save_t
+    e.trig_new = save_new
+    e.trig_old = save_old
+    e.tstack_n -= 1
+    res2?
+    // Subqueries in a trigger see NEW and OLD, which change per row: never
+    // cache their results.
+    for nn in (node_lo + 1)..(e.node_n + 1) {
+        k := nkind(e, nn)
+        if k == N_SUBQ || k == N_EXISTS || k == N_INSEL {
+            o := nd(e, nn)
+            e.ws[o + 2] = 0
+        }
+    }
+    prog := pool_alloc(e, TP_BYTES)?
+    stu(e.ws, prog, i)
+    let when = nf(e, root, 5)
+    stu(e.ws, prog + 4, when)
+    let head = ng(e, root)
+    stu(e.ws, prog + 8, head)
+    ok(prog)
+}
+
+fn resolve_trigger(e: &mut Engine, root: usize, conf: u8) -> void!db.Error {
+    when := nf(e, root, 5)
+    if when != 0 {
+        resolve_expr(e, when, 0, false)?
+    }
+    step := ng(e, root)
+    for step != 0 {
+        st := na(e, step)
+        k := nkind(e, st)
+        // An ON CONFLICT policy of the firing statement overrides the
+        // body's own.
+        if conf != OE_ABORT && (k == S_INSERT || k == S_UPDATE) {
+            set_op(e, st, conf)
+        }
+        if k == S_INSERT {
+            resolve_insert(e, st)?
+        } else if k == S_UPDATE {
+            resolve_update(e, st)?
+        } else if k == S_DELETE {
+            resolve_delete(e, st)?
+        } else {
+            resolve_select(e, st)?
+        }
+        step = nnext(e, step)
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Firing
+
+fn has_triggers(e: &Engine, w: usize, mask: usize) -> bool {
+    arr := wget(e, w, W_TRIG)
+    for k in 0usize..wget(e, w, W_NTRIG) {
+        if (ldu(e.ws, arr + k * 8) & mask) == mask {
+            return true
+        }
+    }
+    false
+}
+
+// Runs the programs matching `mask` for the current row. Returns false when
+// RAISE(IGNORE) abandoned the row.
+fn fire_triggers(e: &mut Engine, w: usize, mask: usize) -> bool!db.Error {
+    arr := wget(e, w, W_TRIG)
+    n := wget(e, w, W_NTRIG)
+    for k in 0usize..n {
+        if (ldu(e.ws, arr + k * 8) & mask) != mask {
+            continue
+        }
+        let prog = ldu(e.ws, arr + k * 8 + 4)
+        if !run_trigger(e, prog)? {
+            return ok(false)
+        }
+    }
+    ok(true)
+}
+
+fn run_trigger(e: &mut Engine, prog: usize) -> bool!db.Error {
+    when := ldu(e.ws, prog + 4)
+    if when != 0 && eval_truth(e, when)? != 1 {
+        return ok(true)
+    }
+    save_changes := e.changes
+    save_last := e.last_changes
+    save_rowid := e.last_rowid
+    save_ret := e.ret_start
+    save_top := e.sort_top
+    save_hi := e.sort_hi
+    save_keep := e.keep_top
+    save_rtop := e.rtop
+    mark := e.arena_top
+    e.changes = 0
+    step := ldu(e.ws, prog + 8)
+    result := true
+    failure := false
+    for step != 0 {
+        st := na(e, step)
+        before := e.changes
+        r := run_step(e, st)
+        if nkind(e, st) != S_SELECT {
+            e.last_changes = e.changes - before
+        }
+        arena_reset(e, mark)
+        e.sort_top = save_top
+        e.sort_hi = save_hi
+        e.keep_top = save_keep
+        e.rtop = save_rtop
+        match r {
+            ok() => {},
+            err(reason) => {
+                if e.raise_kind == RAISE_IGNORE {
+                    e.raise_kind = 0
+                    e.msg_len = 0
+                    result = false
+                    break
+                }
+                e.total_changes += e.changes
+                e.changes = save_changes
+                e.last_changes = save_last
+                e.last_rowid = save_rowid
+                e.ret_start = save_ret
+                return err(reason)
+            },
+        }
+        step = nnext(e, step)
+    }
+    if failure {
+        result = false
+    }
+    e.total_changes += e.changes
+    e.changes = save_changes
+    e.last_changes = save_last
+    e.last_rowid = save_rowid
+    e.ret_start = save_ret
+    ok(result)
+}
+
+fn run_step(e: &mut Engine, st: usize) -> void!db.Error {
+    k := nkind(e, st)
+    if k == S_INSERT {
+        return exec_insert(e, st)
+    }
+    if k == S_UPDATE {
+        return exec_update(e, st)
+    }
+    if k == S_DELETE {
+        return exec_delete(e, st)
+    }
+    select_reset(e, st)
+    mark := e.arena_top
+    for select_next(e, st)? {
+        arena_reset(e, mark)
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// INSTEAD OF triggers: writes to views
+
+// When `o, l` names a view with an INSTEAD OF trigger for `event`, returns
+// the view object plus one; otherwise 0.
+fn view_target(e: &Engine, s: usize, event: u8) -> usize {
+    o := na(e, s)
+    l := nb(e, s)
+    db := lookup_db(e, ndb_of(e, s))
+    v := find_obj(e, db, OT_VIEW, o, l)
+    if v != NO_COL && find_obj(e, db, OT_TABLE, o, l) != NO_COL {
+        // A table of the same name earlier in the search order wins.
+        t := find_obj(e, db, OT_TABLE, o, l)
+        if db_rank(obj_db(e, t)) < db_rank(obj_db(e, v)) {
+            return 0
+        }
+    }
+    if v == NO_COL {
+        return 0
+    }
+    for i in 0usize..e.schema_objs {
+        if obj_type(e, i) == OT_TRIGGER && obj_u(e, i, O_TABLE) == v {
+            op := trigger_op(e, i)
+            if (op >> 2) == event && (op & 3) == TT_INSTEAD {
+                return v + 1
+            }
+        }
+    }
+    0
+}
+
+// A statement-local table object describing the view's columns.
+fn view_columns(e: &mut Engine, v: usize) -> usize!db.Error {
+    let (sel, cols) = view_select(e, v)?
+    src := new_node(e, N_SRC)?
+    let vn = obj_u(e, v, O_NAME)
+    let vl = obj_u(e, v, O_NAMEL)
+    set_nf(e, src, 0, vn)
+    set_nf(e, src, 1, vl)
+    subquery_obj(e, sel, cols, src)
+}
+
+// "SELECT * FROM view WHERE ..." for UPDATE and DELETE on a view.
+fn view_rows_select(e: &mut Engine, s: usize) -> usize!db.Error {
+    sel := new_node(e, S_SELECT)?
+    src := new_node(e, N_SRC)?
+    let s_a = na(e, s)
+    set_nf(e, src, 0, s_a)
+    let s_b = nb(e, s)
+    set_nf(e, src, 1, s_b)
+    let vq = ndb_of(e, s)
+    set_ndb(e, src, 0, vq)
+    set_nf(e, sel, 1, src)
+    rc := new_node(e, N_RESCOL)?
+    star := new_node(e, N_STAR)?
+    set_nf(e, rc, 0, star)
+    set_nf(e, sel, 0, rc)
+    let s_d = ndd(e, s)
+    set_nf(e, sel, 2, s_d)
+    resolve_select(e, sel)?
+    ok(sel)
+}
+
+// Materializes the view rows an UPDATE or DELETE on a view touches.
+fn view_collect(e: &mut Engine, w: usize) -> (usize, usize)!db.Error {
+    sel := wget(e, w, W_SEL)
+    ncol := wget(e, w, W_NCOL)
+    select_reset(e, sel)
+    resreg := select_resreg(e, sel)
+    mark := e.arena_top
+    // The first step may materialize the view on the sorter list itself.
+    got := select_next(e, sel)?
+    lend := list_begin(e)
+    for got {
+        rec := sort_push(e, resreg, ncol)?
+        list_push(e, rec)?
+        arena_reset(e, mark)
+        got = select_next(e, sel)?
+    }
+    ok(list_finish(e, lend))
+}
+
+fn view_load_old(e: &mut Engine, w: usize, rec: usize) -> void!db.Error {
+    old := wget(e, w, W_TOLD)
+    ncol := wget(e, w, W_NCOL)
+    for k in 0usize..ncol {
+        let len = rec_len(e, rec)
+        record_column(e, rec + 4, len, k, old + k)?
+    }
+    set_null(e, old + ncol)
+    ok()
+}
+
+fn exec_view_delete(e: &mut Engine, w: usize) -> void!db.Error {
+    let (idx, n) = view_collect(e, w)?
+    for i in 0usize..n {
+        mark := e.arena_top
+        rec := ldu(e.ws, idx + i * 4)
+        view_load_old(e, w, rec)?
+        fire_triggers(e, w, trig_mask(TE_DELETE, TT_INSTEAD))?
+        arena_reset(e, mark)
+    }
+    ok()
+}
+
+fn exec_view_update(e: &mut Engine, w: usize) -> void!db.Error {
+    let (idx, n) = view_collect(e, w)?
+    base := wget(e, w, W_BASE)
+    old := wget(e, w, W_TOLD)
+    ncol := wget(e, w, W_NCOL)
+    sets := wget(e, w, W_SETS)
+    nset := wget(e, w, W_NSET)
+    for i in 0usize..n {
+        mark := e.arena_top
+        rec := ldu(e.ws, idx + i * 4)
+        view_load_old(e, w, rec)?
+        save := e.rtop
+        first := e.rtop
+        for k in 0usize..nset {
+            r := reg_push(e)?
+            let x = ldu(e.ws, sets + k * 8 + 4)
+            eval(e, x, r)?
+        }
+        for k in 0usize..(ncol + 1) {
+            copy_reg(e, base + k, old + k)
+        }
+        for k in 0usize..nset {
+            col := ldu(e.ws, sets + k * 8)
+            if col != ROWID_TARGET {
+                copy_reg(e, base + col, first + k)
+            }
+        }
+        for k in 0usize..(ncol + 1) {
+            reg_own(e, base + k)?
+        }
+        e.rtop = save
+        fire_triggers(e, w, trig_mask(TE_UPDATE, TT_INSTEAD))?
+        arena_reset(e, mark)
+    }
+    ok()
+}
+
+// A write to a view needs an INSTEAD OF trigger that applies (UPDATE OF
+// lists must name an assigned column).
+fn view_needs_trigger(e: &mut Engine, w: usize) -> void!db.Error {
+    view := wget(e, w, W_VIEW)
+    if view == 0 || wget(e, w, W_NTRIG) != 0 {
+        return ok()
+    }
+    let vn = obj_u(e, view - 1, O_NAME)
+    let vl = obj_u(e, view - 1, O_NAMEL)
+    e.msg_len = 0
+    msg_add(e, "cannot modify ")
+    msg_add_ws(e, vn, vl)
+    msg_add(e, " because it is a view")
+    err(make_error(e, SQLITE_ERROR))
+}

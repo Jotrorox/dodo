@@ -6,13 +6,29 @@ import "std/time/hosted"
 // Date and time functions: date(), time(), datetime(), julianday(),
 // unixepoch(), strftime(), and CURRENT_DATE/TIME/TIMESTAMP. Times are kept
 // as a Julian day number in milliseconds, using Meeus' calendar algorithms.
-// All times are UTC; the 'localtime' and 'utc' modifiers are accepted and
-// leave the value unchanged.
+// The 'localtime' and 'utc' modifiers use the operating system's time zone
+// rules, as SQLite does.
 
 struct DateTime {
     jd: i64
     valid: bool
     subsec: bool
+    // Known to be UTC ('now', an explicit zone, or after 'utc'): 'utc' is
+    // then a no-op. Known to be local time (after 'localtime'): 'localtime'
+    // is then a no-op.
+    utc: bool
+    local: bool
+    // The year, month and day as parsed (the day may lie past the end of
+    // the month); 'localtime' reads them while no other modifier has
+    // replaced them, as SQLite does.
+    raw: bool
+    ry: i64
+    rm: i64
+    rd: i64
+}
+
+fn dt_new(jd: i64, valid: bool, utc: bool) -> DateTime {
+    DateTime { jd, valid, subsec: false, utc, local: false, raw: false, ry: 0, rm: 0, rd: 0 }
 }
 
 const MS_PER_DAY: i64 = 86400000
@@ -26,8 +42,9 @@ fn ymd_to_jd(year: i64, month: i64, day: i64) -> i64 {
         y -= 1
         m += 12
     }
-    a := y / 100
-    b := 2 - a + a / 4
+    // Offset so the divisions also floor for negative years.
+    a := (y + 4800) / 100
+    b := 38 - a + a / 4
     x1 := 36525 * (y + 4716) / 100
     x2 := 306001 * (m + 1) / 10000
     // (x1 + x2 + day + b - 1524.5) days, in milliseconds.
@@ -37,8 +54,8 @@ fn ymd_to_jd(year: i64, month: i64, day: i64) -> i64 {
 // (year, month, day) of a Julian day in milliseconds.
 fn jd_to_ymd(jd: i64) -> (i64, i64, i64) {
     z := (jd + 43200000) / MS_PER_DAY
-    alpha := ((z as f64 - 1867216.25) / 36524.25) as i64
-    a := z + 1 + alpha - alpha / 4
+    alpha := ((z as f64 + 32044.75) / 36524.25) as i64 - 52
+    a := z + 1 + alpha - (alpha + 100) / 4 + 25
     b := a + 1524
     c := ((b as f64 - 122.1) / 365.25) as i64
     d := (36525 * (c & 32767)) / 100
@@ -154,6 +171,56 @@ fn parse_tz(e: &Engine, p: usize, end: usize) -> (i64, usize, bool) {
     }, q2, true)
 }
 
+// True when the (already validated) zone suffix at p names a zone: Z or
+// [+-]HH:MM. Either way the time is then known to be UTC.
+fn tz_given(e: &Engine, p: usize, end: usize) -> bool {
+    q := p
+    for q < end && e.ws[q] == 32 {
+        q += 1
+    }
+    q < end
+}
+
+// Local time of the UTC instant `jd` (milliseconds Julian day), using the
+// OS's rules. Like SQLite, years outside 1970-2037 are moved to a year with
+// the same leap-year position (2000 + year % 4) for the lookup and moved
+// back afterwards. Returns (local jd, ok); ok is false when the OS cannot
+// convert the time or the local year falls outside -4713..9999.
+fn to_localtime(dt: &DateTime) -> (i64, bool, i64, i64, i64) {
+    jd := dt.jd
+    t := 0i64
+    year_diff := 0i64
+    if jd < 210866760000000 || jd > 213014145600000 {
+        let (y0, m0, d0) = jd_to_ymd(jd)
+        y := y0
+        m := m0
+        d := d0
+        if dt.raw {
+            y = dt.ry
+            m = dt.rm
+            d = dt.rd
+        }
+        year_diff = (2000 + y % 4) - y
+        moved := ymd_to_jd(y + year_diff, m, d) + jd_day_ms(jd)
+        t = moved / 1000 - 210866760000
+    } else {
+        t = jd / 1000 - 210866760000
+    }
+    fields := [0i32; 9]
+    if !hosted.local_time_fields(t, &mut fields) {
+        return (0i64, false, 0i64, 0i64, 0i64)
+    }
+    year := (fields[5] as i64) + 1900 - year_diff
+    if year < -4713 || year > 9999 {
+        return (0i64, false, 0i64, 0i64, 0i64)
+    }
+    month := (fields[4] as i64) + 1
+    mday := fields[3] as i64
+    day := ymd_to_jd(year, month, mday)
+    secs := (fields[2] as i64) * 3600 + (fields[1] as i64) * 60 + (fields[0] as i64)
+    (day + secs * 1000 + jd % 1000, true, year, month, mday)
+}
+
 // Parses a time value text into milliseconds Julian day.
 fn parse_time_value(e: &mut Engine, o: usize, l: usize) -> DateTime {
     end := o + l
@@ -165,7 +232,7 @@ fn parse_time_value(e: &mut Engine, o: usize, l: usize) -> DateTime {
         end -= 1
     }
     if name_is(e, p, end - p, "now") {
-        return DateTime { jd: now_jd(e), valid: true, subsec: false }
+        return dt_new(now_jd(e), true, true)
     }
     // YYYY-MM-DD
     neg := false
@@ -207,7 +274,14 @@ fn parse_time_value(e: &mut Engine, o: usize, l: usize) -> DateTime {
         if !okz || r3 != end {
             return invalid_dt()
         }
-        return DateTime { jd: jd - off, valid: true, subsec: false }
+        zoned := tz_given(e, r, end)
+        dt := dt_new(jd - off, true, zoned)
+        // Applying a zone offset recomputes the date from the Julian day.
+        dt.raw = off == 0
+        dt.ry = yy
+        dt.rm = mo
+        dt.rd = d
+        return dt
     }
     // HH:MM[:SS[.SSS]] (on 2000-01-01)
     let (ms, r) = parse_hms(e, p, end)
@@ -216,7 +290,8 @@ fn parse_time_value(e: &mut Engine, o: usize, l: usize) -> DateTime {
         if !okz || r2 != end {
             return invalid_dt()
         }
-        return DateTime { jd: ymd_to_jd(2000, 1, 1) + ms - off, valid: true, subsec: false }
+        zoned := tz_given(e, r, end)
+        return dt_new(ymd_to_jd(2000, 1, 1) + ms - off, true, zoned)
     }
     // A number: Julian day.
     let (k, i, f, whole) = parse_number(e, p, end - p)
@@ -232,14 +307,14 @@ fn parse_time_value(e: &mut Engine, o: usize, l: usize) -> DateTime {
 }
 
 fn invalid_dt() -> DateTime {
-    DateTime { jd: 0, valid: false, subsec: false }
+    dt_new(0, false, false)
 }
 
 fn jd_from_days(v: f64) -> DateTime {
     if v != v || v < 0.0 || v > 5373484.4999 {
         return invalid_dt()
     }
-    DateTime { jd: (v * 86400000.0 + 0.5) as i64, valid: true, subsec: false }
+    dt_new((v * 86400000.0 + 0.5) as i64, true, false)
 }
 
 // Applies one modifier. Returns false when it is not understood.
@@ -253,7 +328,57 @@ fn apply_modifier(e: &mut Engine, dt: &mut DateTime, o: usize, l: usize, first: 
         end -= 1
     }
     n := end - p
-    if name_is(e, p, n, "localtime") || name_is(e, p, n, "utc") {
+    let (ry, rm, rd) = dt_ymd(dt)
+    if !name_is(e, p, n, "localtime") && !name_is(e, p, n, "subsec") && !name_is(e, p, n, "subsecond") && !name_is(e, p, n, "start of day") {
+        dt.raw = false
+    }
+    if name_is(e, p, n, "localtime") {
+        if !dt.local {
+            let (l, okl, ly, lm, ld) = to_localtime(dt)
+            if !okl {
+                dt.valid = false
+                return true
+            }
+            // The local date is kept as computed: moved back from a stand-in
+            // year it can be February 29 of a common year, which SQLite
+            // prints as is.
+            dt.jd = l
+            dt.raw = true
+            dt.ry = ly
+            dt.rm = lm
+            dt.rd = ld
+        }
+        dt.utc = false
+        dt.local = true
+        return true
+    }
+    if name_is(e, p, n, "utc") {
+        if !dt.utc {
+            // Find the UTC time whose local time is dt.jd: refine a guess
+            // by the error up to four times (around a DST change there may
+            // be no exact answer, or two).
+            orig := dt.jd
+            guess := orig
+            off := 0i64
+            cnt := 0
+            for {
+                guess -= off
+                probe := dt_new(guess, true, false)
+                // An unconvertible time counts as Julian day 0, as in SQLite.
+                let (l, _, _, _, _) = to_localtime(&probe)
+                off = l - orig
+                if off == 0 || cnt >= 3 {
+                    break
+                }
+                cnt += 1
+            }
+            dt.jd = guess
+            // SQLite resets the whole value here, 'subsec' included.
+            dt.subsec = false
+            dt.raw = false
+        }
+        dt.utc = true
+        dt.local = false
         return true
     }
     if name_is(e, p, n, "subsec") || name_is(e, p, n, "subsecond") {
@@ -287,11 +412,10 @@ fn apply_modifier(e: &mut Engine, dt: &mut DateTime, o: usize, l: usize, first: 
         return true
     }
     if name_is(e, p, n, "start of month") || name_is(e, p, n, "start of year") {
-        let (y, m, _) = jd_to_ymd(dt.jd)
-        dt.jd = ymd_to_jd(y, if name_is(e, p, n, "start of year") {
+        dt.jd = ymd_to_jd(ry, if name_is(e, p, n, "start of year") {
             1i64
         } else {
-            m
+            rm
         }, 1)
         return true
     }
@@ -358,7 +482,9 @@ fn apply_modifier(e: &mut Engine, dt: &mut DateTime, o: usize, l: usize, first: 
         } else {
             amount as i64
         }
-        let (y, m, d) = jd_to_ymd(dt.jd)
+        y := ry
+        m := rm
+        d := rd
         tod := jd_day_ms(dt.jd)
         total := y * 12 + (m - 1) + months
         ny := if total >= 0 {
@@ -399,8 +525,36 @@ fn put_year(out: &mut[u8], o: usize, y: i64) -> usize {
     p + 4
 }
 
-fn put_date(out: &mut[u8], o: usize, jd: i64) -> usize {
-    let (y, m, d) = jd_to_ymd(jd)
+// A year as strftime's %Y prints it ("%04d": the sign counts as a digit).
+fn put_year4(out: &mut[u8], y: i64) -> usize {
+    if y >= 0 {
+        return put_year(out, 0, y)
+    }
+    o := 1usize
+    out[0] = 45
+    v := -y
+    if v < 10 {
+        out[1] = 48
+        out[2] = 48
+        o = 3
+    } else if v < 100 {
+        out[1] = 48
+        o = 2
+    }
+    n := format_i64(&mut out[o..], v)
+    o + n
+}
+
+// (year, month, day) to print: the parsed or local fields while a modifier
+// kept them (see DateTime.raw), else those of the Julian day.
+fn dt_ymd(dt: &DateTime) -> (i64, i64, i64) {
+    if dt.raw {
+        return (dt.ry, dt.rm, dt.rd)
+    }
+    jd_to_ymd(dt.jd)
+}
+
+fn put_ymd(out: &mut[u8], o: usize, y: i64, m: i64, d: i64) -> usize {
     p := put_year(out, o, y)
     out[p] = 45
     p = pad2(out, p + 1, m)
@@ -448,7 +602,7 @@ fn date_function(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize) -
         fmt_len = rlen(e, a)
         first = 1
     }
-    dt := DateTime { jd: now_jd(e), valid: true, subsec: false }
+    dt := dt_new(now_jd(e), true, true)
     raw := 0.0
     raw_numeric := false
     if id == F_CURRENT_TIMESTAMP || id == F_CURRENT_DATE || id == F_CURRENT_TIME {
@@ -498,13 +652,18 @@ fn date_function(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize) -
             }
         }
     }
-    if !dt.valid {
+    if !dt.valid || dt.jd < 0 || dt.jd > 464269060799999 {
         set_null(e, dst)
         return ok()
     }
+    if argc <= first + 1 {
+        // Without modifiers a day past the end of the month is normalized.
+        dt.raw = false
+    }
+    let (dy, dm, dd) = dt_ymd(&dt)
     out := [0u8; 64]
     if id == F_DATE || id == F_CURRENT_DATE {
-        n := put_date(&mut out, 0, dt.jd)
+        n := put_ymd(&mut out, 0, dy, dm, dd)
         return set_text_bytes(e, dst, &out[..n])
     }
     if id == F_TIME || id == F_CURRENT_TIME {
@@ -512,7 +671,7 @@ fn date_function(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize) -
         return set_text_bytes(e, dst, &out[..n])
     }
     if id == F_DATETIME || id == F_CURRENT_TIMESTAMP {
-        n := put_date(&mut out, 0, dt.jd)
+        n := put_ymd(&mut out, 0, dy, dm, dd)
         out[n] = 32
         m := put_time(&mut out, n + 1, dt.jd, dt.subsec)
         return set_text_bytes(e, dst, &out[..m])
@@ -547,7 +706,9 @@ fn date_function(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize) -
         spec := e.ws[fmt + i + 1]
         i += 2
         n := 0usize
-        let (y, m, d) = jd_to_ymd(dt.jd)
+        y := dy
+        m := dm
+        d := dd
         ms := jd_day_ms(dt.jd)
         if spec == 100 {
             n = pad2(&mut out, 0, d)
@@ -567,7 +728,7 @@ fn date_function(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize) -
             out[n + 3] = 48 + ((ms % 10) as u8)
             n += 4
         } else if spec == 70 {
-            n = put_date(&mut out, 0, dt.jd)
+            n = put_ymd(&mut out, 0, dy, dm, dd)
         } else if spec == 72 {
             n = pad2(&mut out, 0, ms / 3600000)
         } else if spec == 107 || spec == 108 || spec == 73 {
@@ -636,11 +797,15 @@ fn date_function(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize) -
             n = pad2(&mut out, n + 1, ms / 60000 % 60)
         } else if spec == 115 {
             secs := (dt.jd - UNIX_EPOCH_JD)
-            n = format_i64(&mut out, if secs >= 0 {
-                secs / 1000
+            if dt.subsec {
+                n = fp_format(&mut out, (secs as f64) / 1000.0, 102, 3, false, false, 0)
             } else {
-                (secs - 999) / 1000
-            })
+                n = format_i64(&mut out, if secs >= 0 {
+                    secs / 1000
+                } else {
+                    (secs - 999) / 1000
+                })
+            }
         } else if spec == 83 {
             n = pad2(&mut out, 0, ms / 1000 % 60)
         } else if spec == 84 {
@@ -675,12 +840,12 @@ fn date_function(e: &mut Engine, id: usize, a: usize, argc: usize, dst: usize) -
                 week := (thursday - ymd_to_jd(ty, 1, 1)) / MS_PER_DAY / 7 + 1
                 n = pad2(&mut out, 0, week)
             } else if spec == 71 {
-                n = put_year(&mut out, 0, ty)
+                n = put_year4(&mut out, ty)
             } else {
                 n = pad2(&mut out, 0, ty % 100)
             }
         } else if spec == 89 {
-            n = put_year(&mut out, 0, y)
+            n = put_year4(&mut out, y)
         } else if spec == 37 {
             out[0] = 37
             n = 1

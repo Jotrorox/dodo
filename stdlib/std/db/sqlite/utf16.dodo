@@ -1,0 +1,296 @@
+package sqlite
+
+import "std/db"
+
+// Text in UTF-16 databases (header text encoding 2 = UTF-16le, 3 =
+// UTF-16be). The engine keeps text as UTF-8 everywhere; records and blob
+// <-> text conversions translate at the boundary with SQLite's rules, so
+// invalid input maps the same way:
+//
+//   UTF-8 -> UTF-16: a lead byte >= 0xC0 absorbs every continuation byte
+//   that follows; code points below 0x80 decoded that way, surrogates and
+//   U+FFFE/U+FFFF become U+FFFD; any other byte stands for itself.
+//   UTF-16 -> UTF-8: a surrogate followed by another unit combines with it
+//   whatever it is; a trailing odd byte is dropped.
+//
+// In a UTF-16 database the BINARY collation orders text by its UTF-16 bytes
+// (memcmp), as SQLite does.
+
+const ENC_UTF8: u8 = 1
+const ENC_UTF16LE: u8 = 2
+const ENC_UTF16BE: u8 = 3
+
+// Reads one code point from UTF-8 at b[p..end); returns (code point, next).
+fn u8_read(b: &[u8], p: usize, end: usize) -> (u32, usize) {
+    c := b[p] as u32
+    q := p + 1
+    if c >= 192 {
+        c = if c < 224 {
+            c & 31
+        } else if c < 240 {
+            c & 15
+        } else if c < 248 {
+            c & 7
+        } else if c < 252 {
+            c & 3
+        } else if c < 254 {
+            c & 1
+        } else {
+            0u32
+        }
+        for q < end && (b[q] & 192) == 128 {
+            c = ((c & 67108863) << 6) | ((b[q] & 63) as u32)
+            q += 1
+        }
+        if c < 128 || (c & 4294965248) == 55296 || (c & 4294967294) == 65534 {
+            c = 65533
+        }
+    }
+    (c, q)
+}
+
+// UTF-16 byte length of the UTF-8 text b[o..o + n).
+fn utf16_len(b: &[u8], o: usize, n: usize) -> usize {
+    p := o
+    end := o + n
+    total := 0usize
+    for p < end {
+        let (c, q) = u8_read(b, p, end)
+        p = q
+        total += if c > 65535 {
+            4usize
+        } else {
+            2usize
+        }
+    }
+    total
+}
+
+fn put_unit(b: &mut[u8], o: usize, u: u32, enc: u8) {
+    if enc == ENC_UTF16LE {
+        b[o] = (u & 255) as u8
+        b[o + 1] = ((u >> 8) & 255) as u8
+    } else {
+        b[o] = ((u >> 8) & 255) as u8
+        b[o + 1] = (u & 255) as u8
+    }
+}
+
+// Surrogate pair for a code point above U+FFFF (masked like SQLite's, so
+// values past U+10FFFF wrap rather than fail).
+fn surrogates(c: u32) -> (u32, u32) {
+    v := c - 65536
+    (55296 | ((v >> 10) & 1023), 56320 | (c & 1023))
+}
+
+// Writes the UTF-16 form of the UTF-8 text b[src..src + n) at b[dst..];
+// the ranges must not overlap. Returns the bytes written.
+fn utf8_to_utf16(b: &mut[u8], src: usize, n: usize, dst: usize, enc: u8) -> usize {
+    p := src
+    end := src + n
+    o := dst
+    for p < end {
+        let (c, q) = u8_read(b, p, end)
+        p = q
+        if c <= 65535 {
+            put_unit(b, o, c, enc)
+            o += 2
+        } else {
+            let (hi, lo) = surrogates(c)
+            put_unit(b, o, hi, enc)
+            put_unit(b, o + 2, lo, enc)
+            o += 4
+        }
+    }
+    o - dst
+}
+
+fn get_unit(b: &[u8], o: usize, enc: u8) -> u32 {
+    if enc == ENC_UTF16LE {
+        return (b[o] as u32) | ((b[o + 1] as u32) << 8)
+    }
+    ((b[o] as u32) << 8) | (b[o + 1] as u32)
+}
+
+// Reads one code point from UTF-16 at b[p..end) (end even); returns
+// (code point, next).
+fn u16_read(b: &[u8], p: usize, end: usize, enc: u8) -> (u32, usize) {
+    c := get_unit(b, p, enc)
+    q := p + 2
+    if c >= 55296 && c < 57344 && q < end {
+        c2 := get_unit(b, q, enc)
+        q += 2
+        c = 65536 + ((c & 1023) << 10) + (c2 & 1023)
+    }
+    (c, q)
+}
+
+fn u8_width(c: u32) -> usize {
+    if c < 128 {
+        return 1
+    }
+    if c < 2048 {
+        return 2
+    }
+    if c < 65536 {
+        return 3
+    }
+    4
+}
+
+// UTF-8 length of the UTF-16 bytes b[o..o + n).
+fn utf16_to_utf8_len(b: &[u8], o: usize, n: usize, enc: u8) -> usize {
+    p := o
+    end := o + n - (n & 1)
+    total := 0usize
+    for p < end {
+        let (c, q) = u16_read(b, p, end, enc)
+        p = q
+        total += u8_width(c)
+    }
+    total
+}
+
+// Writes code point c as UTF-8 at b[o..]; returns the bytes written.
+fn put_utf8_at(b: &mut[u8], o: usize, c: u32) -> usize {
+    if c < 128 {
+        b[o] = c as u8
+        return 1
+    }
+    if c < 2048 {
+        b[o] = (192 | ((c >> 6) & 31)) as u8
+        b[o + 1] = (128 | (c & 63)) as u8
+        return 2
+    }
+    if c < 65536 {
+        b[o] = (224 | ((c >> 12) & 15)) as u8
+        b[o + 1] = (128 | ((c >> 6) & 63)) as u8
+        b[o + 2] = (128 | (c & 63)) as u8
+        return 3
+    }
+    b[o] = (240 | ((c >> 18) & 7)) as u8
+    b[o + 1] = (128 | ((c >> 12) & 63)) as u8
+    b[o + 2] = (128 | ((c >> 6) & 63)) as u8
+    b[o + 3] = (128 | (c & 63)) as u8
+    4
+}
+
+// Writes the UTF-8 form of the UTF-16 bytes b[src..src + n) at b[dst..];
+// the ranges must not overlap. Returns the bytes written.
+fn utf16_to_utf8(b: &mut[u8], src: usize, n: usize, dst: usize, enc: u8) -> usize {
+    p := src
+    end := src + n - (n & 1)
+    o := dst
+    for p < end {
+        let (c, q) = u16_read(b, p, end, enc)
+        p = q
+        o += put_utf8_at(b, o, c)
+    }
+    o - dst
+}
+
+// Like utf16_to_utf8, into a separate buffer; stops before overflowing it.
+fn utf16_to_utf8_into(b: &[u8], src: usize, n: usize, out: &mut[u8], enc: u8) -> usize {
+    p := src
+    end := src + n - (n & 1)
+    o := 0usize
+    for p < end && o + 4 <= out.len {
+        let (c, q) = u16_read(b, p, end, enc)
+        p = q
+        o += put_utf8_at(out, o, c)
+    }
+    o
+}
+
+// Sets register r to the text stored as database-encoded bytes [o, o + n)
+// (converted into the arena when the database is UTF-16).
+fn set_text_from_db(e: &mut Engine, r: usize, o: usize, n: usize) -> void!db.Error {
+    if e.enc == ENC_UTF8 {
+        set_bytes(e, r, T_TEXT, o, n)
+        return ok()
+    }
+    let enc = e.enc
+    len := utf16_to_utf8_len(e.ws, o, n, enc)
+    dst := arena_alloc(e, len)?
+    utf16_to_utf8(e.ws, o, n, dst, enc)
+    set_bytes(e, r, T_TEXT, dst, len)
+    ok()
+}
+
+// Replaces text register r by a blob of its database-encoded bytes.
+fn text_to_db_blob(e: &mut Engine, r: usize) -> void!db.Error {
+    if e.enc != ENC_UTF8 {
+        let enc = e.enc
+        let src = roff(e, r)
+        let n = rlen(e, r)
+        len := utf16_len(e.ws, src, n)
+        dst := arena_alloc(e, len)?
+        utf8_to_utf16(e.ws, src, n, dst, enc)
+        set_bytes(e, r, T_BLOB, dst, len)
+        return ok()
+    }
+    o := reg_at(e, r)
+    e.ws[o] = T_BLOB
+    ok()
+}
+
+// Next UTF-16 code unit of UTF-8 text at p. `pending` holds a low surrogate
+// still to be returned (0 when none). Returns (unit, next p, pending).
+fn next_unit(b: &[u8], p: usize, end: usize, pending: u32) -> (u32, usize, u32) {
+    if pending != 0 {
+        return (pending, p, 0u32)
+    }
+    let (c, q) = u8_read(b, p, end)
+    if c <= 65535 {
+        return (c, q, 0u32)
+    }
+    let (hi, lo) = surrogates(c)
+    (hi, q, lo)
+}
+
+// Compares two UTF-8 texts by the bytes of their UTF-16 forms in encoding
+// `enc` (the BINARY collation of a UTF-16 database), without converting.
+fn compare_utf16(e: &Engine, a: usize, an: usize, b: usize, bn: usize, enc: u8) -> i32 {
+    pa := a
+    pb := b
+    ea := a + an
+    eb := b + bn
+    qa := 0u32
+    qb := 0u32
+    for (pa < ea || qa != 0) && (pb < eb || qb != 0) {
+        let (ua, na, ra) = next_unit(e.ws, pa, ea, qa)
+        let (ub, nb, rb) = next_unit(e.ws, pb, eb, qb)
+        pa = na
+        qa = ra
+        pb = nb
+        qb = rb
+        if ua != ub {
+            // memcmp order: little endian compares the low byte first.
+            ka := if enc == ENC_UTF16LE {
+                ((ua & 255) << 8) | (ua >> 8)
+            } else {
+                ua
+            }
+            kb := if enc == ENC_UTF16LE {
+                ((ub & 255) << 8) | (ub >> 8)
+            } else {
+                ub
+            }
+            return if ka < kb {
+                -1
+            } else {
+                1
+            }
+        }
+    }
+    a_left := pa < ea || qa != 0
+    b_left := pb < eb || qb != 0
+    if a_left == b_left {
+        return 0
+    }
+    if a_left {
+        1
+    } else {
+        -1
+    }
+}

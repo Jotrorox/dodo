@@ -387,6 +387,106 @@ fn file_database_persists_and_reopens() {
     remove(path)
 }
 
+fn text_of(conn: &mut sqlite.Connection, sql_text: &str, out: &mut[u8]) -> usize!db.Error {
+    none_: [0]db.Value = []
+    rows := conn.select(sql_text, &none_)!
+    let some(row) = rows.next()! else {
+        return ok(0)
+    }
+    match row.text_into(0, out) {
+        some(n) => ok(n),
+        none => ok(0),
+    }
+}
+
+// WAL mode: conversion, statement-level undo and rollback inside the log,
+// the last connection deleting -wal/-shm, read-only access, and in-memory
+// databases staying in "memory" mode.
+@test
+fn wal_mode_round_trip() {
+    path := "dodo_sqlite_wal_checks.db"
+    remove(path)
+    remove("dodo_sqlite_wal_checks.db-wal")
+    remove("dodo_sqlite_wal_checks.db-shm")
+    buf := [0u8; 64]
+    {
+        conn := sqlite.Connection.open(path, workspace())!
+        n := text_of(&mut conn, "pragma journal_mode = wal", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, "wal"))
+        conn.exec("create table w(id integer primary key, v text unique)")!
+        assert(exists("dodo_sqlite_wal_checks.db-wal"))
+        conn.exec("begin")!
+        stmt := conn.prepare("insert into w(v) values (?)")!
+        for i in 0i64..500 {
+            p := [db.Value.Int(i)]
+            conn.run(&stmt, &p)!
+        }
+        dup := [db.Value.Int(7)]
+        match conn.run(&stmt, &dup) {
+            ok(_) => {
+                assert(false)
+            },
+            err(e) => {
+                assert(e.constraint == db.Constraint.Unique)
+            },
+        }
+        conn.exec("commit")!
+        conn.exec("begin; delete from w; rollback")!
+        none_: [0]db.Value = []
+        count := sql.ScalarInt.new()
+        conn.query("select count(*) from w", &none_, &mut count)!
+        assert_eq(count.value, 500i64)
+        n2 := text_of(&mut conn, "pragma wal_checkpoint(truncate)", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n2])
+        }, "0"))
+        conn.close()!
+    }
+    assert(!exists("dodo_sqlite_wal_checks.db-wal"))
+    assert(!exists("dodo_sqlite_wal_checks.db-shm"))
+    {
+        options := sqlite.Options.new()
+        options.read_only = true
+        conn := sqlite.Connection.open_with(path, workspace(), &options)!
+        n := text_of(&mut conn, "pragma journal_mode", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, "wal"))
+        none_: [0]db.Value = []
+        count := sql.ScalarInt.new()
+        conn.query("select count(*) from w", &none_, &mut count)!
+        assert_eq(count.value, 500i64)
+        match conn.exec("insert into w(v) values ('no')") {
+            ok() => {
+                assert(false)
+            },
+            err(e) => {
+                assert(e.kind == db.ErrorKind.ReadOnly)
+            },
+        }
+        conn.close()!
+    }
+    {
+        conn := sqlite.Connection.open(path, workspace())!
+        n := text_of(&mut conn, "pragma journal_mode = delete", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, "delete"))
+        conn.close()!
+    }
+    assert(!exists("dodo_sqlite_wal_checks.db-wal"))
+    remove(path)
+    {
+        conn := sqlite.Connection.open_memory(workspace())!
+        n := text_of(&mut conn, "pragma journal_mode = wal", &mut buf)!
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, "memory"))
+    }
+}
+
 @test
 fn workspace_too_small_is_a_capacity_error() {
     small := [0u8; 4096]
@@ -437,7 +537,68 @@ fn reals_format_like_sqlite() {
     }
 }
 
-static mut SMALL: [sqlite.MIN_WORKSPACE_BYTES]u8 = [0u8; sqlite.MIN_WORKSPACE_BYTES]
+static mut SMALL: [1048576]u8 = [0u8; 1048576]
+static mut MINIMAL: [sqlite.MIN_WORKSPACE_BYTES]u8 = [0u8; sqlite.MIN_WORKSPACE_BYTES]
+static mut DEFAULT: [sqlite.WORKSPACE_BYTES]u8 = [0u8; sqlite.WORKSPACE_BYTES]
+
+// The minimum workspace runs ordinary statements; 64 KiB pages fit in the
+// default workspace.
+@test
+fn minimum_and_large_page_workspaces() {
+    assert(sqlite.min_workspace_bytes(4096) <= sqlite.MIN_WORKSPACE_BYTES)
+    assert(sqlite.min_workspace_bytes(65536) <= sqlite.WORKSPACE_BYTES)
+    small_path := "dodo_sqlite_min_checks.db"
+    remove(small_path)
+    conn := sqlite.Connection.open(small_path, unsafe {
+        &mut MINIMAL[..]
+    })!
+    conn.exec("create table t(a integer primary key, b text); create index tb on t(b)")!
+    conn.exec("with recursive n(i) as (select 1 union all select i + 1 from n where i < 300) insert into t(b) select printf('row %d', i) from n")!
+    none_: [0]db.Value = []
+    total := sql.ScalarInt.new()
+    conn.query("select count(*) from t where b like 'row 1%'", &none_, &mut total)!
+    assert_eq(total.value, 111i64)
+    conn.close()!
+    remove(small_path)
+    path := "dodo_sqlite_64k_checks.db"
+    remove(path)
+    big := sqlite.Connection.open(path, unsafe {
+        &mut DEFAULT[..]
+    })!
+    big.exec("pragma page_size = 65536")!
+    big.exec("create table t(a integer primary key, b blob)")!
+    big.exec("insert into t(b) values (zeroblob(5000)), (zeroblob(30000)), (x'00ff')")!
+    blobs := sql.ScalarInt.new()
+    big.query("select sum(length(b)) from t", &none_, &mut blobs)!
+    assert_eq(blobs.value, 35002i64)
+    size := sql.ScalarInt.new()
+    big.query("pragma page_size", &none_, &mut size)!
+    assert_eq(size.value, 65536i64)
+    big.close()!
+    remove(path)
+}
+
+// A UTF-16 database stores text as UTF-16; the API still binds and returns
+// UTF-8, and the BINARY order is that of the UTF-16 bytes.
+@test
+fn utf16_database_round_trip() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    conn.exec("pragma encoding = 'UTF-16be'; create table u(s text); create index us on u(s)")!
+    params := [db.Value.Text("na\u{ef}ve \u{1f600}")]
+    conn.execute("insert into u values (?)", &params)!
+    conn.exec("insert into u values ('\u{e000}'), ('\u{10000}')")!
+    none_: [0]db.Value = []
+    rows := conn.select("select s, hex(s), length(s), (select group_concat(hex(s), ',') from (select s from u order by s)) from u where rowid = 1", &none_)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(row.text(0), "na\u{ef}ve \u{1f600}"))
+    assert(same(row.text(1), "006E006100EF007600650020D83DDE00"))
+    assert_eq(row.int(2), 7i64)
+    assert(same(row.text(3), "006E006100EF007600650020D83DDE00,D800DC00,E000"))
+}
+
 
 // A transaction much larger than a tiny page cache spills pages (including
 // newly allocated ones) to the file before commit; it must commit and roll
@@ -488,4 +649,39 @@ fn large_transactions_spill_and_recover() {
     core.drop(rows2)
     conn.close()!
     remove(path)
+}
+
+// Window queries materialize their rows; running out of sorter space is a
+// clean Capacity error and the connection stays usable.
+@test
+fn window_query_too_large_is_a_capacity_error() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    none_: [0]db.Value = []
+    big := "with recursive c(i) as (select 1 union all select i + 1 from c where i < 20000) select i, group_concat(printf('%050d', i)) over (order by i) from c"
+    failed := false
+    match conn.select(big, &none_) {
+        ok(rows) => {
+            for {
+                match rows.next() {
+                    ok(some(_)) => {},
+                    ok(none) => {
+                        break
+                    },
+                    err(e) => {
+                        assert(e.kind == db.ErrorKind.Capacity)
+                        failed = true
+                        break
+                    },
+                }
+            }
+        },
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Capacity)
+            failed = true
+        },
+    }
+    assert(failed)
+    total := sql.ScalarInt.new()
+    conn.query("select sum(r) from (select row_number() over (order by x desc) r from (select 1 x union all select 2 union all select 3))", &none_, &mut total)!
+    assert_eq(total.value, 6i64)
 }

@@ -1,7 +1,6 @@
 package sqlite
 
 import "std/db"
-import "std/text"
 
 // Tokenizer and recursive-descent parser for SQLite's SQL dialect. The parse
 // tree lives in the statement slot as fixed 48-byte nodes:
@@ -99,6 +98,10 @@ const S_ALTER: u8 = 51
 const S_EMPTY: u8 = 52
 const S_VACUUM: u8 = 53
 const S_CREATE_VIEW: u8 = 54
+const S_SAVEPOINT: u8 = 55
+const S_RELEASE: u8 = 56
+const S_ATTACH: u8 = 57
+const S_DETACH: u8 = 58
 
 // Operators.
 const OP_OR: u8 = 1
@@ -672,6 +675,65 @@ fn take_name(e: &mut Engine) -> (usize, usize)!db.Error {
     err(syntax_error(e))
 }
 
+// The database a node names ("schema." prefix): byte 36 of the node holds
+// the database index plus one (0 = unqualified); byte 37 a second one (the
+// table of CREATE TRIGGER ... ON).
+fn ndb_of(e: &Engine, n: usize) -> usize {
+    v := e.ws[nd(e, n) + 36] as usize
+    if v == 0 {
+        NO_DB
+    } else {
+        v - 1
+    }
+}
+
+fn ndb2_of(e: &Engine, n: usize) -> usize {
+    v := e.ws[nd(e, n) + 37] as usize
+    if v == 0 {
+        NO_DB
+    } else {
+        v - 1
+    }
+}
+
+fn set_ndb(e: &mut Engine, n: usize, which: usize, k: usize) {
+    o := nd(e, n) + 36 + which
+    e.ws[o] = if k == NO_DB {
+        0u8
+    } else {
+        ((k + 1) & 255) as u8
+    }
+}
+
+// Records schema name (o, l) on node n.
+fn set_schema(e: &mut Engine, n: usize, which: usize, o: usize, l: usize) -> void!db.Error {
+    k := db_find(e, o, l)
+    if k == NO_DB {
+        return err(fail2(e, SQLITE_ERROR, "unknown database ", o, l))
+    }
+    set_ndb(e, n, which, k)
+    ok()
+}
+
+// Reads "[schema.]name" into fields 0 and 1 of node n (the schema into its
+// database byte) and returns the offset where the name itself starts.
+fn take_object_name(e: &mut Engine, n: usize) -> usize!db.Error {
+    start := e.ts
+    let (o, l) = take_name(e)?
+    if e.tk == TK_DOT {
+        next_token(e)
+        start2 := e.ts
+        let (o2, l2) = take_name(e)?
+        set_nf(e, n, 0, o2)
+        set_nf(e, n, 1, l2)
+        set_schema(e, n, 0, o, l)?
+        return ok(start2)
+    }
+    set_nf(e, n, 0, o)
+    set_nf(e, n, 1, l)
+    ok(start)
+}
+
 fn is_name_token(e: &Engine) -> bool {
     (e.tk == TK_ID && !is_reserved(e)) || e.tk == TK_QID || e.tk == TK_STR
 }
@@ -834,9 +896,10 @@ fn number_literal(e: &mut Engine, negate: bool) -> usize!db.Error {
             return ok(n)
         }
     }
-    f := match text.parse_f64(&buf[..m]) {
-        ok(v) => v,
-        err(_) => 1.0e308 * 10.0,
+    f := if m == len {
+        fp_atof(e.ws, start, len)
+    } else {
+        fp_atof(&buf, 0, m)
     }
     n := new_node(e, N_REAL)?
     set_x(e, n, f2u(if negate {
@@ -1360,7 +1423,11 @@ fn parse_primary(e: &mut Engine) -> usize!db.Error {
             return ok(n)
         }
         if is_kw(e, "RAISE") {
-            return err(fail(e, SQLITE_ERROR, "RAISE is only valid in triggers"))
+            if !e.trig_parse {
+                return err(fail(e, SQLITE_ERROR, "RAISE() may only be used within a trigger-program"))
+            }
+            next_token(e)
+            return parse_raise(e)
         }
         if is_reserved(e) && !((is_kw(e, "REPLACE") || is_kw(e, "LIKE") || is_kw(e, "GLOB")) && next_is_lparen(e)) {
             return err(syntax_error(e))
@@ -1378,7 +1445,7 @@ fn parse_primary(e: &mut Engine) -> usize!db.Error {
             }
             let (o2, l2) = take_name(e)?
             if e.tk == TK_DOT {
-                // schema.table.column: only "main" is supported.
+                // schema.table.column
                 next_token(e)
                 let (o3, l3) = take_name(e)?
                 n := new_node(e, N_ID)?
@@ -1386,6 +1453,7 @@ fn parse_primary(e: &mut Engine) -> usize!db.Error {
                 set_nf(e, n, 1, l3)
                 set_nf(e, n, 2, o2)
                 set_nf(e, n, 3, l2)
+                set_schema(e, n, 0, o, l)?
                 return ok(n)
             }
             n := new_node(e, N_ID)?
@@ -1435,10 +1503,8 @@ fn parse_function(e: &mut Engine, o: usize, l: usize) -> usize!db.Error {
         }
     }
     expect(e, TK_RP)?
-    if is_kw(e, "FILTER") || is_kw(e, "OVER") {
-        return err(fail(e, SQLITE_ERROR, "window functions and FILTER are not supported"))
-    }
     set_flags(e, n, flags)
+    parse_filter_over(e, n)?
     ok(n)
 }
 
@@ -1643,6 +1709,10 @@ fn parse_select(e: &mut Engine) -> usize!db.Error {
         }
         next := parse_select_core(e)?
         set_op(e, next, op)
+        // A VALUES list is already a chain of UNION ALL rows.
+        for nnext(e, last) != 0 {
+            last = nnext(e, last)
+        }
         set_next(e, last, next)
         last = next
     }
@@ -1843,8 +1913,8 @@ fn parse_select_core(e: &mut Engine) -> usize!db.Error {
         ext := nd_ext(e, s)?
         set_nf(e, ext, 1, hv)
     }
-    if is_kw(e, "WINDOW") {
-        return err(fail(e, SQLITE_ERROR, "window functions are not supported"))
+    if accept_kw(e, "WINDOW") {
+        parse_window_clause(e, s)?
     }
     ok(s)
 }
@@ -1913,22 +1983,7 @@ fn parse_from(e: &mut Engine) -> usize!db.Error {
         if is_sub {
             // Alias handling below.
         } else {
-            let (o, l) = take_name(e)?
-            if e.tk == TK_DOT {
-                next_token(e)
-                if !name_is(e, o, l, "main") {
-                    e.msg_len = 0
-                    msg_add(e, "unknown database ")
-                    msg_add_ws(e, o, l)
-                    return err(make_error(e, SQLITE_ERROR))
-                }
-                let (o2, l2) = take_name(e)?
-                set_nf(e, src, 0, o2)
-                set_nf(e, src, 1, l2)
-            } else {
-                set_nf(e, src, 0, o)
-                set_nf(e, src, 1, l)
-            }
+            take_object_name(e, src)?
             if e.tk == TK_LP {
                 return err(fail(e, SQLITE_ERROR, "table-valued functions are not supported"))
             }
@@ -1937,7 +1992,7 @@ fn parse_from(e: &mut Engine) -> usize!db.Error {
             let (ao, al) = take_name(e)?
             set_nf(e, src, 2, ao)
             set_nf(e, src, 3, al)
-        } else if is_name_token(e) && e.tk != TK_STR {
+        } else if is_name_token(e) && e.tk != TK_STR && !is_kw(e, "INDEXED") {
             let (ao, al) = take_name(e)?
             set_nf(e, src, 2, ao)
             set_nf(e, src, 3, al)
@@ -2084,16 +2139,7 @@ fn parse_insert(e: &mut Engine) -> usize!db.Error {
         }
     }
     expect_kw(e, "INTO")?
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    take_object_name(e, s)?
     if accept_kw(e, "AS") {
         take_name(e)?
     }
@@ -2228,16 +2274,7 @@ fn parse_update(e: &mut Engine) -> usize!db.Error {
         c := parse_conflict(e)?
         set_op(e, s, c)
     }
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    take_object_name(e, s)?
     if accept_kw(e, "AS") {
         return err(fail(e, SQLITE_ERROR, "aliases in UPDATE are not supported"))
     }
@@ -2279,16 +2316,7 @@ fn parse_update(e: &mut Engine) -> usize!db.Error {
 fn parse_delete(e: &mut Engine) -> usize!db.Error {
     s := new_node(e, S_DELETE)?
     expect_kw(e, "FROM")?
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    take_object_name(e, s)?
     if accept_kw(e, "WHERE") {
         w := parse_expr(e)?
         set_nf(e, s, 3, w)
@@ -2356,11 +2384,12 @@ fn skip_references(e: &mut Engine) -> void!db.Error {
 
 fn parse_create(e: &mut Engine, sql_start: usize) -> usize!db.Error {
     expect_kw(e, "CREATE")?
-    if is_kw(e, "TEMP") || is_kw(e, "TEMPORARY") {
-        return err(fail(e, SQLITE_ERROR, "temporary tables are not supported"))
+    temp := accept_kw(e, "TEMP") || accept_kw(e, "TEMPORARY")
+    unique := false
+    if !temp {
+        unique = accept_kw(e, "UNIQUE")
     }
-    unique := accept_kw(e, "UNIQUE")
-    if is_kw(e, "INDEX") {
+    if is_kw(e, "INDEX") && !temp {
         next_token(e)
         return parse_create_index(e, unique, sql_start)
     }
@@ -2369,10 +2398,17 @@ fn parse_create(e: &mut Engine, sql_start: usize) -> usize!db.Error {
     }
     if is_kw(e, "VIEW") {
         next_token(e)
-        return parse_create_view(e)
+        v := parse_create_view(e)?
+        create_temp(e, v, temp, "temporary view name must be unqualified")?
+        return ok(v)
     }
-    if is_kw(e, "TRIGGER") || is_kw(e, "VIRTUAL") {
-        return err(fail(e, SQLITE_ERROR, "triggers and virtual tables are not supported"))
+    if accept_kw(e, "TRIGGER") {
+        t := parse_create_trigger(e)?
+        create_temp(e, t, temp, "temporary trigger may not have qualified name")?
+        return ok(t)
+    }
+    if is_kw(e, "VIRTUAL") {
+        return err(fail(e, SQLITE_ERROR, "virtual tables are not supported"))
     }
     expect_kw(e, "TABLE")?
     s := new_node(e, S_CREATE_TABLE)?
@@ -2381,18 +2417,8 @@ fn parse_create(e: &mut Engine, sql_start: usize) -> usize!db.Error {
         expect_kw(e, "EXISTS")?
         set_flags(e, s, 1)
     }
-    name_start := e.ts
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        name_start = e.ts
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    name_start := take_object_name(e, s)?
+    create_temp(e, s, temp, "temporary table name must be unqualified")?
     set_nf(e, s, 4, name_start)
     if is_kw(e, "AS") {
         return err(fail(e, SQLITE_ERROR, "CREATE TABLE ... AS SELECT is not supported"))
@@ -2429,7 +2455,10 @@ fn parse_create(e: &mut Engine, sql_start: usize) -> usize!db.Error {
     // Table options.
     for {
         if accept_kw(e, "WITHOUT") {
-            return err(fail(e, SQLITE_ERROR, "WITHOUT ROWID tables are not supported"))
+            expect_kw(e, "ROWID")?
+            let flags0 = nflags(e, s) | 4
+            set_flags(e, s, flags0)
+            continue
         }
         if accept_kw(e, "STRICT") {
             let flags = nflags(e, s) | 2
@@ -2442,6 +2471,20 @@ fn parse_create(e: &mut Engine, sql_start: usize) -> usize!db.Error {
     let last_end2 = e.last_end
     set_nf(e, s, 5, last_end2)
     ok(s)
+}
+
+// CREATE TEMP ...: the object goes into the TEMP database, which may also
+// be named explicitly ("temp.").
+fn create_temp(e: &mut Engine, s: usize, temp: bool, message: &str) -> void!db.Error {
+    if !temp {
+        return ok()
+    }
+    k := ndb_of(e, s)
+    if k != NO_DB && k != DB_TEMP {
+        return err(fail(e, SQLITE_ERROR, message))
+    }
+    set_ndb(e, s, 0, DB_TEMP)
+    ok()
 }
 
 fn parse_column_def(e: &mut Engine) -> usize!db.Error {
@@ -2646,18 +2689,7 @@ fn parse_create_index(e: &mut Engine, unique: bool, sql_start: usize) -> usize!d
         flags = flags | 1
     }
     set_flags(e, s, flags)
-    name_start := e.ts
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        name_start = e.ts
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    name_start := take_object_name(e, s)?
     set_nf(e, s, 5, name_start)
     expect_kw(e, "ON")?
     let (to, tl) = take_name(e)?
@@ -2667,15 +2699,19 @@ fn parse_create_index(e: &mut Engine, unique: bool, sql_start: usize) -> usize!d
     head := 0usize
     tail := 0usize
     for {
+        xstart := e.ts
         x := parse_expr(e)?
         item := new_node(e, N_ORDER)?
         // COLLATE on an index column is parsed as an expression postfix.
+        xlen := e.last_end - xstart
         if nkind(e, x) == N_COLLATE {
             let nb2 = nb(e, x) + 1
             set_nf(e, item, 1, nb2)
             x = na(e, x)
         }
         set_nf(e, item, 0, x)
+        set_nf(e, item, 2, xstart)
+        set_nf(e, item, 3, xlen)
         if accept_kw(e, "DESC") {
             set_flags(e, item, 1)
         } else {
@@ -2691,7 +2727,10 @@ fn parse_create_index(e: &mut Engine, unique: bool, sql_start: usize) -> usize!d
     expect(e, TK_RP)?
     set_nf(e, s, 4, head)
     if accept_kw(e, "WHERE") {
-        return err(fail(e, SQLITE_ERROR, "partial indexes are not supported"))
+        wstart := e.ts
+        parse_expr(e)?
+        let span = ((wstart as u64) << 32) | ((e.last_end - wstart) as u64)
+        set_x(e, s, span)
     }
     let last_end2 = e.last_end
     set_nf(e, s, 6, last_end2)
@@ -2705,18 +2744,7 @@ fn parse_create_view(e: &mut Engine) -> usize!db.Error {
         expect_kw(e, "EXISTS")?
         set_flags(e, s, 1)
     }
-    name_start := e.ts
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        name_start = e.ts
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    name_start := take_object_name(e, s)?
     set_nf(e, s, 4, name_start)
     if accept(e, TK_LP) {
         head := 0usize
@@ -2754,7 +2782,7 @@ fn parse_drop(e: &mut Engine) -> usize!db.Error {
     } else if accept_kw(e, "VIEW") {
         set_op(e, s, 3)
     } else if accept_kw(e, "TRIGGER") {
-        return err(fail(e, SQLITE_ERROR, "triggers are not supported"))
+        set_op(e, s, 4)
     } else {
         return err(syntax_error(e))
     }
@@ -2762,31 +2790,13 @@ fn parse_drop(e: &mut Engine) -> usize!db.Error {
         expect_kw(e, "EXISTS")?
         set_flags(e, s, 1)
     }
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    take_object_name(e, s)?
     ok(s)
 }
 
 fn parse_pragma(e: &mut Engine) -> usize!db.Error {
     s := new_node(e, S_PRAGMA)?
-    let (o, l) = take_name(e)?
-    if e.tk == TK_DOT {
-        next_token(e)
-        let (o2, l2) = take_name(e)?
-        set_nf(e, s, 0, o2)
-        set_nf(e, s, 1, l2)
-    } else {
-        set_nf(e, s, 0, o)
-        set_nf(e, s, 1, l)
-    }
+    take_object_name(e, s)?
     if accept(e, TK_EQ) {
         v := parse_pragma_value(e)?
         set_nf(e, s, 2, v)
@@ -2824,9 +2834,7 @@ fn parse_alter(e: &mut Engine) -> usize!db.Error {
     expect_kw(e, "ALTER")?
     expect_kw(e, "TABLE")?
     s := new_node(e, S_ALTER)?
-    let (o, l) = take_name(e)?
-    set_nf(e, s, 0, o)
-    set_nf(e, s, 1, l)
+    take_object_name(e, s)?
     if accept_kw(e, "RENAME") {
         if accept_kw(e, "TO") {
             set_op(e, s, 1)
@@ -2858,9 +2866,36 @@ fn parse_alter(e: &mut Engine) -> usize!db.Error {
         return ok(s)
     }
     if accept_kw(e, "DROP") {
-        return err(fail(e, SQLITE_ERROR, "ALTER TABLE DROP COLUMN is not supported"))
+        accept_kw(e, "COLUMN")
+        set_op(e, s, 4)
+        let (co, cl) = take_name(e)?
+        set_nf(e, s, 4, co)
+        set_nf(e, s, 5, cl)
+        return ok(s)
     }
     err(syntax_error(e))
+}
+
+fn attach_operand(e: &mut Engine) -> usize!db.Error {
+    if (e.tk == TK_ID && !is_reserved(e) || e.tk == TK_QID) && !next_is_lparen(e) {
+        save_pos := e.pos
+        save_ts := e.ts
+        save_tl := e.tl
+        save_tk := e.tk
+        let (o, l) = take_name(e)?
+        if e.tk == TK_DOT || e.tk == TK_LP {
+            e.pos = save_pos
+            e.ts = save_ts
+            e.tl = save_tl
+            e.tk = save_tk
+        } else {
+            n := new_node(e, N_STR)?
+            set_nf(e, n, 0, o)
+            set_nf(e, n, 1, l)
+            return ok(n)
+        }
+    }
+    parse_expr(e)
 }
 
 // Parses one statement starting at the current token. Returns the root.
@@ -2914,13 +2949,30 @@ fn parse_statement(e: &mut Engine) -> usize!db.Error {
     }
     if accept_kw(e, "ROLLBACK") {
         accept_kw(e, "TRANSACTION")
-        if is_kw(e, "TO") {
-            return err(fail(e, SQLITE_ERROR, "savepoints are not supported"))
+        s := new_node(e, S_ROLLBACK)?
+        if accept_kw(e, "TO") {
+            accept_kw(e, "SAVEPOINT")
+            let (o, l) = take_name(e)?
+            set_op(e, s, 1)
+            set_nf(e, s, 0, o)
+            set_nf(e, s, 1, l)
         }
-        return new_node(e, S_ROLLBACK)
+        return ok(s)
     }
-    if is_kw(e, "SAVEPOINT") || is_kw(e, "RELEASE") {
-        return err(fail(e, SQLITE_ERROR, "savepoints are not supported"))
+    if accept_kw(e, "SAVEPOINT") {
+        s := new_node(e, S_SAVEPOINT)?
+        let (o, l) = take_name(e)?
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+        return ok(s)
+    }
+    if accept_kw(e, "RELEASE") {
+        accept_kw(e, "SAVEPOINT")
+        s := new_node(e, S_RELEASE)?
+        let (o, l) = take_name(e)?
+        set_nf(e, s, 0, o)
+        set_nf(e, s, 1, l)
+        return ok(s)
     }
     if accept_kw(e, "PRAGMA") {
         return parse_pragma(e)
@@ -2935,8 +2987,27 @@ fn parse_statement(e: &mut Engine) -> usize!db.Error {
         }
         return new_node(e, S_EMPTY)
     }
-    if is_kw(e, "ATTACH") || is_kw(e, "DETACH") {
-        return err(fail(e, SQLITE_ERROR, "ATTACH and DETACH are not supported"))
+    if accept_kw(e, "ATTACH") {
+        // ATTACH [DATABASE] file AS name: both are expressions; a bare
+        // identifier stands for its own name.
+        accept_kw(e, "DATABASE")
+        s := new_node(e, S_ATTACH)?
+        f := attach_operand(e)?
+        expect_kw(e, "AS")?
+        n := attach_operand(e)?
+        if accept_kw(e, "KEY") {
+            parse_expr(e)?
+        }
+        set_nf(e, s, 0, f)
+        set_nf(e, s, 1, n)
+        return ok(s)
+    }
+    if accept_kw(e, "DETACH") {
+        accept_kw(e, "DATABASE")
+        s := new_node(e, S_DETACH)?
+        n := attach_operand(e)?
+        set_nf(e, s, 1, n)
+        return ok(s)
     }
     err(syntax_error(e))
 }

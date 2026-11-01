@@ -1,0 +1,1679 @@
+package sqlite
+
+import "core/mem"
+import "std/db"
+import "std/fs"
+import "std/platform"
+import "std/platform/error"
+import "std/thread"
+
+// Write-ahead log (WAL mode), compatible with SQLite's documented formats.
+//
+// A database whose header has read/write version 2 is in WAL mode. Changes
+// are appended as frames to "<db>-wal" instead of overwriting the database
+// file; a checkpoint later copies them back. "<db>-shm" holds the wal-index
+// shared by every connection, SQLite's included:
+//
+//   bytes 0..48     wal-index header (copy 1)
+//   bytes 48..96    wal-index header (copy 2, written first, read second)
+//   bytes 96..136   checkpoint info: nBackfill, five read marks, lock bytes,
+//                   nBackfillAttempted
+//   then 32 KiB blocks: 4096 frame page numbers (4062 in the first block,
+//   after the header) followed by an 8192-slot u16 hash table.
+//
+// SQLite maps the file into memory; this engine has no mmap and uses
+// positioned reads and writes instead. That is coherent with the mappings
+// (one page cache), and the format's own consistency rules (two header
+// copies with a checksum, read marks, retries) cover torn reads. The
+// wal-index header and the hash tables are in native byte order (little
+// endian on every supported host); the WAL file itself is big endian, with
+// checksums whose word order follows the magic number.
+//
+// Locks are POSIX record locks on the -shm file, at the same bytes SQLite
+// uses: WRITE 120, CKPT 121, RECOVER 122, READ0..READ4 123..127 and the
+// "dead man switch" 128 (held shared by every connection that has the
+// wal-index open; the first one to open it resets it). In WAL mode every
+// connection also keeps a SHARED lock on the database file while it is
+// open, so the last one to close can tell, by taking EXCLUSIVE, that it may
+// checkpoint and delete the -wal and -shm files.
+
+const WAL_MAGIC: u32 = 931071618
+const WAL_FORMAT: u32 = 3007000
+const WAL_HDR_BYTES: u64 = 32
+const WAL_FRAME_HDR: u64 = 24
+const SHM_HDR_BYTES: u64 = 136
+const SHM_BLOCK: u64 = 32768
+const SHM_HASH_OFF: u64 = 16384
+const HT_NPAGE: u32 = 4096
+const HT_NPAGE_ONE: u32 = 4062
+const HT_NSLOT: u32 = 8192
+const SHM_LOCKS: u64 = 120
+const SHM_DMS: u64 = 128
+const WAL_WRITE_LOCK: u64 = 0
+const WAL_CKPT_LOCK: u64 = 1
+const WAL_RECOVER_LOCK: u64 = 2
+const WAL_READ_LOCK0: u64 = 3
+const WAL_NREADER: u32 = 5
+const READMARK_NOT_USED: u32 = 4294967295
+const SQLITE_LOCKED: i32 = 6
+const SQLITE_PROTOCOL: i32 = 15
+
+const CKPT_PASSIVE: u32 = 0
+const CKPT_FULL: u32 = 1
+const CKPT_RESTART: u32 = 2
+const CKPT_TRUNCATE: u32 = 3
+
+// Wal-index header fields (offsets into WalState.hdr).
+const WH_CHANGE: usize = 8
+const WH_ISINIT: usize = 12
+const WH_BIGEND: usize = 13
+const WH_PGSZ: usize = 14
+const WH_MXFRAME: usize = 16
+const WH_NPAGE: usize = 20
+const WH_FCK: usize = 24
+const WH_SALT: usize = 32
+const WH_CK: usize = 40
+
+// Checkpoint-info fields (absolute -shm offsets).
+const CI_BACKFILL: u64 = 96
+const CI_MARKS: u64 = 100
+const CI_ATTEMPTED: u64 = 128
+
+struct WalState {
+    // "<db>-wal" and "<db>-shm".
+    file: Option<fs.File>
+    shm: Option<fs.File>
+    open: bool
+    // This connection's copy of the wal-index header: the snapshot of the
+    // current read transaction. A writer's mxFrame and frame checksum run
+    // ahead of the shared copy until it commits.
+    hdr: [48]u8
+    // Held read lock (0..4, -1 = none) and the first frame it may use.
+    read_lock: i32
+    min_frame: u32
+    write_lock: bool
+    ckpt_lock: bool
+    // The write transaction has appended frames (spilled pages).
+    appended: bool
+    // Checkpoint sequence number for the next WAL header.
+    nckpt: u32
+    // Known size of the -shm file (it only grows while it is open).
+    shm_size: u64
+    // Frames in the log that trigger an automatic checkpoint (0 = never).
+    autockpt: u32
+    ckpt_due: bool
+    // Set while converting out of WAL mode: read the file as rollback mode.
+    no_wal: bool
+    // A read transaction started since the last statement completed (so
+    // the current statement has not read through an older one).
+    read_fresh: bool
+    registered: bool
+}
+
+fn wal_state_new() -> WalState {
+    WalState {
+        file: none, shm: none, open: false, hdr: [0u8; 48], read_lock: -1, min_frame: 1,
+        write_lock: false, ckpt_lock: false, appended: false, nckpt: 0, shm_size: 0,
+        autockpt: 1000, ckpt_due: false, no_wal: false, read_fresh: false, registered: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connections of this process that have a WAL database open, by path hash.
+// POSIX record locks belong to the process, so two connections of one
+// process cannot exclude each other through them; this table at least keeps
+// one of them from resetting the wal-index or deleting the log under the
+// other.
+
+static mut WAL_PATHS: [16]u64 = [0u64; 16]
+static mut WAL_USERS: [16]u32 = [0u32; 16]
+
+fn path_hash(e: &Engine) -> u64 {
+    h := 14695981039346656037u64
+    for i in 0usize..e.path_len {
+        h = core.wrapping_mul(h ^ (e.ws[e.path_off + i] as u64), 1099511628211u64)
+    }
+    if h == 0 {
+        1u64
+    } else {
+        h
+    }
+}
+
+// Registers this connection; returns how many others of this process have
+// the same database open in WAL mode.
+fn wal_register(e: &mut Engine) -> u32 {
+    h := path_hash(e)
+    free := 16usize
+    others := 0u32
+    unsafe {
+        for i in 0usize..16 {
+            if WAL_PATHS[i] == h && WAL_USERS[i] > 0 {
+                others = WAL_USERS[i]
+                WAL_USERS[i] += 1
+                e.w.registered = true
+                return others
+            }
+            if WAL_USERS[i] == 0 && free == 16 {
+                free = i
+            }
+        }
+        if free < 16 {
+            WAL_PATHS[free] = h
+            WAL_USERS[free] = 1
+            e.w.registered = true
+        }
+    }
+    others
+}
+
+// Unregisters; returns how many other connections of this process remain.
+fn wal_unregister(e: &mut Engine) -> u32 {
+    if !e.w.registered {
+        // Not tracked (table full): assume others may exist.
+        return 1
+    }
+    e.w.registered = false
+    h := path_hash(e)
+    unsafe {
+        for i in 0usize..16 {
+            if WAL_PATHS[i] == h && WAL_USERS[i] > 0 {
+                WAL_USERS[i] -= 1
+                return WAL_USERS[i]
+            }
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Positioned file I/O
+
+// Reads up to buf.len bytes at pos; returns the count (short at end of
+// file) or -1 on error.
+fn fio_read(f: &mut Option<fs.File>, pos: u64, buf: &mut[u8]) -> isize {
+    got := 0usize
+    match f {
+        some(file) => {
+            match file.seek(pos as usize) {
+                ok(_) => {},
+                err(_) => {
+                    return -1
+                },
+            }
+            for got < buf.len {
+                match file.read(&mut buf[got..]) {
+                    ok(n) => {
+                        if n == 0 {
+                            break
+                        }
+                        got += n
+                    },
+                    err(_) => {
+                        return -1
+                    },
+                }
+            }
+        },
+        none => {},
+    }
+    got as isize
+}
+
+fn fio_write(f: &mut Option<fs.File>, pos: u64, buf: &[u8]) -> bool {
+    put := 0usize
+    match f {
+        some(file) => {
+            match file.seek(pos as usize) {
+                ok(_) => {},
+                err(_) => {
+                    return false
+                },
+            }
+            for put < buf.len {
+                match file.write(&buf[put..]) {
+                    ok(n) => {
+                        if n == 0 {
+                            return false
+                        }
+                        put += n
+                    },
+                    err(_) => {
+                        return false
+                    },
+                }
+            }
+        },
+        none => {
+            return false
+        },
+    }
+    true
+}
+
+fn fio_size(f: &mut Option<fs.File>) -> u64 {
+    match f {
+        some(file) => {
+            match file.metadata() {
+                ok(m) => m.size,
+                err(_) => 0u64,
+            }
+        },
+        none => 0u64,
+    }
+}
+
+fn fio_sync(f: &mut Option<fs.File>) -> bool {
+    match f {
+        some(file) => {
+            match file.sync() {
+                ok() => true,
+                err(_) => false,
+            }
+        },
+        none => true,
+    }
+}
+
+fn fio_set_len(f: &mut Option<fs.File>, len: u64) -> bool {
+    match f {
+        some(file) => {
+            match file.set_len(len) {
+                ok() => true,
+                err(_) => false,
+            }
+        },
+        none => false,
+    }
+}
+
+fn fio_close(f: &mut Option<fs.File>) {
+    match f {
+        some(file) => {
+            match file.close() {
+                ok() => {},
+                err(_) => {},
+            }
+        },
+        none => {},
+    }
+}
+
+// Opens "<db><suffix>".
+fn open_side_file(e: &Engine, suffix: &str, write: bool, create: bool) -> Option<fs.File> {
+    buf := [0u8; 1100]
+    n := side_path(e, suffix, &mut buf)
+    text := unsafe {
+        mem.str_from_utf8(&buf[..n])
+    }
+    ws := platform.workspace()
+    options := fs.OpenOptions.new()
+    options.read = true
+    options.write = write
+    options.create = create
+    match fs.File.open_utf8(text, &options, &mut ws) {
+        ok(file) => some(file),
+        err(_) => none,
+    }
+}
+
+// Deletes "<db><suffix>"; a missing file is not an error.
+fn remove_side_file(e: &Engine, suffix: &str) -> bool {
+    buf := [0u8; 1100]
+    n := side_path(e, suffix, &mut buf)
+    text := unsafe {
+        mem.str_from_utf8(&buf[..n])
+    }
+    ws := platform.workspace()
+    match ws.set(text) {
+        ok() => {},
+        err(_) => {
+            return false
+        },
+    }
+    match ws.get() {
+        ok(name) => {
+            match fs.remove_file(&name) {
+                ok() => true,
+                err(reason) => reason.kind == error.Kind.NotFound,
+            }
+        },
+        err(_) => false,
+    }
+}
+
+// -shm access. Short reads are zero-filled: a wal-index that is shorter
+// than expected reads as zeros, which never validates.
+fn shm_read(e: &mut Engine, pos: u64, buf: &mut[u8]) -> void!db.Error {
+    n := fio_read(&mut e.w.shm, pos, buf)
+    if n < 0 {
+        return err(io_fail(e, "disk I/O error (shm read)"))
+    }
+    for i in (n as usize)..buf.len {
+        buf[i] = 0
+    }
+    ok()
+}
+
+fn shm_write(e: &mut Engine, pos: u64, buf: &[u8]) -> void!db.Error {
+    if !fio_write(&mut e.w.shm, pos, buf) {
+        return err(io_fail(e, "disk I/O error (shm write)"))
+    }
+    let end = pos + (buf.len as u64)
+    if end > e.w.shm_size {
+        e.w.shm_size = end
+    }
+    ok()
+}
+
+fn shm_rd32(e: &mut Engine, pos: u64) -> u32!db.Error {
+    b := [0u8; 4]
+    shm_read(e, pos, &mut b)?
+    ok(ld32(&b, 0))
+}
+
+fn shm_wr32(e: &mut Engine, pos: u64, v: u32) -> void!db.Error {
+    b := [0u8; 4]
+    st32(&mut b, 0, v)
+    shm_write(e, pos, &b)
+}
+
+fn shm_rd16(e: &mut Engine, pos: u64) -> u32!db.Error {
+    b := [0u8; 2]
+    shm_read(e, pos, &mut b)?
+    ok(ld16(&b, 0) as u32)
+}
+
+fn shm_wr16(e: &mut Engine, pos: u64, v: u32) -> void!db.Error {
+    b := [0u8; 2]
+    st16(&mut b, 0, v as usize)
+    shm_write(e, pos, &b)
+}
+
+fn shm_zero(e: &mut Engine, start: u64, end: u64) -> void!db.Error {
+    zeros := [0u8; 4096]
+    p := start
+    for p < end {
+        n := if end - p < 4096 {
+            (end - p) as usize
+        } else {
+            4096usize
+        }
+        shm_write(e, p, &zeros[..n])?
+        p += n as u64
+    }
+    ok()
+}
+
+// Grows the -shm file to whole 32 KiB blocks covering `bytes`: SQLite maps
+// it block by block and only maps blocks the file fully covers.
+fn shm_ensure(e: &mut Engine, bytes: u64) -> void!db.Error {
+    if e.w.shm_size >= bytes {
+        return ok()
+    }
+    size := fio_size(&mut e.w.shm)
+    if size < bytes {
+        let want = (bytes + SHM_BLOCK - 1) / SHM_BLOCK * SHM_BLOCK
+        if !fio_set_len(&mut e.w.shm, want) {
+            return err(io_fail(e, "disk I/O error (shm size)"))
+        }
+        size = want
+    }
+    e.w.shm_size = size
+    ok()
+}
+
+// WAL locks: bytes 120 + lock on the -shm file.
+fn shm_lock(e: &mut Engine, lock: u64, n: u64, shared: bool) -> bool!db.Error {
+    got := false
+    failed := false
+    match &mut e.w.shm {
+        some(f) => {
+            match f.try_lock_range(SHM_LOCKS + lock, n, shared) {
+                ok(v) => {
+                    got = v
+                },
+                err(_) => {
+                    failed = true
+                },
+            }
+        },
+        none => {
+            got = true
+        },
+    }
+    if failed {
+        return err(io_fail(e, "disk I/O error (shm lock)"))
+    }
+    ok(got)
+}
+
+fn shm_unlock(e: &mut Engine, lock: u64, n: u64) {
+    match &mut e.w.shm {
+        some(f) => {
+            match f.unlock_range(SHM_LOCKS + lock, n) {
+                ok() => {},
+                err(_) => {},
+            }
+        },
+        none => {},
+    }
+}
+
+// Exclusive lock, retried for the busy timeout when `wait` is set.
+fn shm_lock_wait(e: &mut Engine, lock: u64, n: u64, wait: bool) -> bool!db.Error {
+    attempts := 0u32
+    for {
+        if shm_lock(e, lock, n, false)? {
+            return ok(true)
+        }
+        attempts += 1
+        if !wait || attempts > e.busy_retries {
+            return ok(false)
+        }
+        pause()
+    }
+}
+
+// WAL file access (workspace ranges).
+fn walf_read_ws(e: &mut Engine, pos: u64, dst: usize, len: usize) -> usize!db.Error {
+    n := fio_read(&mut e.w.file, pos, &mut e.ws[dst..dst + len])
+    if n < 0 {
+        return err(io_fail(e, "disk I/O error (wal read)"))
+    }
+    ok(n as usize)
+}
+
+fn walf_write_ws(e: &mut Engine, pos: u64, src: usize, len: usize) -> void!db.Error {
+    if !fio_write(&mut e.w.file, pos, &e.ws[src..src + len]) {
+        return err(io_fail(e, "disk I/O error (wal write)"))
+    }
+    ok()
+}
+
+fn walf_write(e: &mut Engine, pos: u64, buf: &[u8]) -> void!db.Error {
+    if !fio_write(&mut e.w.file, pos, buf) {
+        return err(io_fail(e, "disk I/O error (wal write)"))
+    }
+    ok()
+}
+
+fn walf_read(e: &mut Engine, pos: u64, buf: &mut[u8]) -> usize!db.Error {
+    n := fio_read(&mut e.w.file, pos, buf)
+    if n < 0 {
+        return err(io_fail(e, "disk I/O error (wal read)"))
+    }
+    ok(n as usize)
+}
+
+fn walf_sync(e: &mut Engine) -> void!db.Error {
+    if !fio_sync(&mut e.w.file) {
+        return err(io_fail(e, "disk I/O error (wal fsync)"))
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Header fields and checksums
+
+fn wh_get(e: &Engine, o: usize) -> u32 {
+    ld32(&e.w.hdr, o)
+}
+
+fn wh_set(e: &mut Engine, o: usize, v: u32) {
+    st32(&mut e.w.hdr, o, v)
+}
+
+fn wal_mx(e: &Engine) -> u32 {
+    wh_get(e, WH_MXFRAME)
+}
+
+fn wal_npage(e: &Engine) -> u32 {
+    wh_get(e, WH_NPAGE)
+}
+
+fn wal_page_size(e: &Engine) -> usize {
+    sz := ld16(&e.w.hdr, WH_PGSZ)
+    (sz & 65024) + ((sz & 1) << 16)
+}
+
+fn wal_set_page_size(e: &mut Engine, ps: usize) {
+    st16(&mut e.w.hdr, WH_PGSZ, (ps & 65280) | (ps >> 16))
+}
+
+// SQLite's WAL checksum: pairs of 32-bit words, big endian when `big`.
+fn wal_cksum(b: &[u8], off: usize, n: usize, big: bool, s1in: u32, s2in: u32) -> (u32, u32) {
+    s1 := s1in
+    s2 := s2in
+    i := 0usize
+    for i + 8 <= n {
+        x := if big {
+            rd32(b, off + i)
+        } else {
+            ld32(b, off + i)
+        }
+        y := if big {
+            rd32(b, off + i + 4)
+        } else {
+            ld32(b, off + i + 4)
+        }
+        s1 = core.wrapping_add(core.wrapping_add(s1, x), s2)
+        s2 = core.wrapping_add(core.wrapping_add(s2, y), s1)
+        i += 8
+    }
+    (s1, s2)
+}
+
+// Frame -> wal-index block and the block's layout.
+fn frame_block(f: u32) -> u32 {
+    (f + HT_NPAGE - HT_NPAGE_ONE - 1) / HT_NPAGE
+}
+
+fn block_zero(b: u32) -> u32 {
+    if b == 0 {
+        0u32
+    } else {
+        HT_NPAGE_ONE + (b - 1) * HT_NPAGE
+    }
+}
+
+fn block_pgnos(b: u32) -> u64 {
+    if b == 0 {
+        SHM_HDR_BYTES
+    } else {
+        (b as u64) * SHM_BLOCK
+    }
+}
+
+fn block_hash(b: u32) -> u64 {
+    (b as u64) * SHM_BLOCK + SHM_HASH_OFF
+}
+
+fn wal_hash(pgno: u32) -> u32 {
+    core.wrapping_mul(pgno, 383u32) & (HT_NSLOT - 1)
+}
+
+fn frame_offset(e: &Engine, f: u32) -> u64 {
+    WAL_HDR_BYTES + ((f - 1) as u64) * ((e.page_size as u64) + WAL_FRAME_HDR)
+}
+
+// ---------------------------------------------------------------------------
+// Opening and closing
+
+// Opens the -wal and -shm files of a WAL-mode database. The caller holds a
+// SHARED lock on the database file.
+fn wal_open(e: &mut Engine) -> void!db.Error {
+    e.w.shm = open_side_file(e, "-shm", true, true)
+    match &e.w.shm {
+        some(_) => {},
+        none => {
+            return err(fail(e, SQLITE_CANTOPEN, "unable to open the WAL index (-shm)"))
+        },
+    }
+    others := wal_register(e)
+    // The dead man switch: the first connection to open the wal-index
+    // (nobody else holds byte 128) resets it so it is rebuilt from the log.
+    attempts := 0u32
+    failed := false
+    for {
+        if others == 0 {
+            got := match shm_lock(e, SHM_DMS - SHM_LOCKS, 1, false) {
+                ok(v) => v,
+                err(_) => {
+                    failed = true
+                    false
+                },
+            }
+            if got {
+                fio_set_len(&mut e.w.shm, 0)
+                match shm_lock(e, SHM_DMS - SHM_LOCKS, 1, true) {
+                    ok(_) => {},
+                    err(_) => {},
+                }
+                break
+            }
+        }
+        if !failed {
+            got2 := match shm_lock(e, SHM_DMS - SHM_LOCKS, 1, true) {
+                ok(v) => v,
+                err(_) => {
+                    failed = true
+                    false
+                },
+            }
+            if got2 {
+                break
+            }
+        }
+        attempts += 1
+        if failed || attempts > e.busy_retries + 100 {
+            wal_unregister(e)
+            fio_close(&mut e.w.shm)
+            e.w.shm = none
+            if failed {
+                return err(io_fail(e, "disk I/O error (shm lock)"))
+            }
+            return err(busy(e))
+        }
+        pause()
+    }
+    e.w.shm_size = fio_size(&mut e.w.shm)
+    e.w.file = open_side_file(e, "-wal", !e.readonly, !e.readonly)
+    match &e.w.file {
+        some(_) => {},
+        none => {
+            if !e.readonly {
+                wal_unregister(e)
+                fio_close(&mut e.w.shm)
+                e.w.shm = none
+                return err(fail(e, SQLITE_CANTOPEN, "unable to open the write-ahead log (-wal)"))
+            }
+        },
+    }
+    e.w.open = true
+    e.w.read_lock = -1
+    e.w.write_lock = false
+    e.w.ckpt_lock = false
+    e.w.nckpt = 0
+    e.w.ckpt_due = false
+    zero_hdr(e)
+    ok()
+}
+
+fn zero_hdr(e: &mut Engine) {
+    for i in 0usize..48 {
+        e.w.hdr[i] = 0
+    }
+}
+
+// Closes the log. The last connection (it can take an EXCLUSIVE lock on the
+// database file) checkpoints and deletes the -wal and -shm files, as SQLite
+// does. Returns true when the files were deleted.
+fn wal_close(e: &mut Engine) -> bool {
+    if !e.w.open {
+        return false
+    }
+    wal_end_write(e)
+    wal_end_read(e)
+    others := wal_unregister(e)
+    remove := false
+    if others == 0 && !e.readonly {
+        saved := e.busy_retries
+        e.busy_retries = 0
+        got := match lock_exclusive(e) {
+            ok() => true,
+            err(_) => false,
+        }
+        e.busy_retries = saved
+        if got {
+            saved_msg := e.msg_len
+            match wal_checkpoint(e, CKPT_PASSIVE) {
+                ok(res) => {
+                    let (busy_flag, log, done) = res
+                    remove = !busy_flag && log == done
+                },
+                err(_) => {},
+            }
+            e.msg_len = saved_msg
+        }
+    }
+    if remove {
+        fio_close(&mut e.w.shm)
+        remove_side_file(e, "-shm")
+        fio_close(&mut e.w.file)
+        remove_side_file(e, "-wal")
+    } else {
+        fio_close(&mut e.w.file)
+        fio_close(&mut e.w.shm)
+    }
+    e.w.file = none
+    e.w.shm = none
+    e.w.open = false
+    e.w.read_lock = -1
+    e.w.ckpt_due = false
+    zero_hdr(e)
+    remove
+}
+
+// Drops an EXCLUSIVE lock on the database file back to SHARED while the log
+// stays open.
+fn wal_db_lock_shared(e: &mut Engine) {
+    e.w.open = false
+    unlock_to(e, true)
+    e.w.open = true
+}
+
+// ---------------------------------------------------------------------------
+// The wal-index header
+
+// Reads the shared header. Returns 0 when valid and unchanged, 1 when valid
+// and different from this connection's copy (now updated), 2 when invalid.
+fn wal_try_hdr(e: &mut Engine) -> u32!db.Error {
+    buf := [0u8; 96]
+    shm_read(e, 0, &mut buf)?
+    for i in 0usize..48 {
+        if buf[i] != buf[48 + i] {
+            return ok(2)
+        }
+    }
+    if buf[WH_ISINIT] == 0 {
+        return ok(2)
+    }
+    let (c1, c2) = wal_cksum(&buf, 0, 40, false, 0, 0)
+    if c1 != ld32(&buf, WH_CK) || c2 != ld32(&buf, WH_CK + 4) {
+        return ok(2)
+    }
+    changed := false
+    for i in 0usize..48 {
+        if e.w.hdr[i] != buf[i] {
+            changed = true
+            e.w.hdr[i] = buf[i]
+        }
+    }
+    if ld32(&buf, 0) != WAL_FORMAT {
+        return err(fail(e, SQLITE_CANTOPEN, "unsupported WAL index version"))
+    }
+    ok(if changed {
+        1u32
+    } else {
+        0u32
+    })
+}
+
+// True when the shared header still equals this connection's copy.
+fn wal_hdr_current(e: &mut Engine) -> bool!db.Error {
+    buf := [0u8; 48]
+    shm_read(e, 0, &mut buf)?
+    for i in 0usize..48 {
+        if e.w.hdr[i] != buf[i] {
+            return ok(false)
+        }
+    }
+    ok(true)
+}
+
+// Publishes this connection's header: copy 2 first, then copy 1.
+fn wal_write_hdr(e: &mut Engine) -> void!db.Error {
+    e.w.hdr[WH_ISINIT] = 1
+    wh_set(e, 0, WAL_FORMAT)
+    wh_set(e, 4, 0)
+    let (c1, c2) = wal_cksum(&e.w.hdr, 0, 40, false, 0, 0)
+    wh_set(e, WH_CK, c1)
+    wh_set(e, WH_CK + 4, c2)
+    shm_ensure(e, SHM_BLOCK)?
+    copy := [0u8; 48]
+    for i in 0usize..48 {
+        copy[i] = e.w.hdr[i]
+    }
+    shm_write(e, 48, &copy)?
+    shm_write(e, 0, &copy)?
+    ok()
+}
+
+// Reads the header, rebuilding the wal-index from the log when it is not
+// valid. Returns 0 (unchanged), 1 (changed) or 3 (busy: try again).
+fn wal_read_hdr(e: &mut Engine) -> u32!db.Error {
+    r := wal_try_hdr(e)?
+    if r != 2 {
+        return ok(r)
+    }
+    had := e.w.write_lock
+    if !had {
+        if !shm_lock(e, WAL_WRITE_LOCK, 1, false)? {
+            return ok(3)
+        }
+        e.w.write_lock = true
+    }
+    result := match wal_try_hdr(e) {
+        ok(v) => v,
+        err(reason) => {
+            if !had {
+                wal_end_write(e)
+            }
+            return err(reason)
+        },
+    }
+    if result == 2 {
+        result = match wal_recover(e) {
+            ok(done) => if done {
+                1u32
+            } else {
+                3u32
+            },
+            err(reason) => {
+                if !had {
+                    wal_end_write(e)
+                }
+                return err(reason)
+            },
+        }
+    }
+    if !had {
+        wal_end_write(e)
+    }
+    ok(result)
+}
+
+// Rebuilds the wal-index from the log: every frame with valid salts and a
+// valid running checksum, up to the last commit frame. Called with the
+// WRITE lock; returns false when another connection is recovering or
+// checkpointing.
+fn wal_recover(e: &mut Engine) -> bool!db.Error {
+    first := if e.w.ckpt_lock {
+        WAL_RECOVER_LOCK
+    } else {
+        WAL_CKPT_LOCK
+    }
+    let nlocks = WAL_READ_LOCK0 - first
+    if !shm_lock(e, first, nlocks, false)? {
+        return ok(false)
+    }
+    r := wal_recover_locked(e)
+    shm_unlock(e, first, nlocks)
+    r?
+    ok(true)
+}
+
+fn wal_recover_locked(e: &mut Engine) -> void!db.Error {
+    zero_hdr(e)
+    size := fio_size(&mut e.w.file)
+    mx := 0u32
+    npage := 0u32
+    fck1 := 0u32
+    fck2 := 0u32
+    big := false
+    salt := [0u8; 8]
+    ps := e.page_size
+    h := [0u8; 32]
+    valid := false
+    if size > WAL_HDR_BYTES {
+        walf_read(e, 0, &mut h)?
+        magic := rd32(&h, 0)
+        wps := rd32(&h, 8) as usize
+        valid = (magic & 4294967294u32) == WAL_MAGIC && wps >= 512 && wps <= 65536 && (wps & (wps - 1)) == 0
+        if valid {
+            big = (magic & 1) != 0
+            let (h1, h2) = wal_cksum(&h, 0, 24, big, 0, 0)
+            valid = h1 == rd32(&h, 24) && h2 == rd32(&h, 28)
+            fck1 = h1
+            fck2 = h2
+        }
+        if valid {
+            if rd32(&h, 4) != WAL_FORMAT {
+                return err(fail(e, SQLITE_CANTOPEN, "unsupported WAL format version"))
+            }
+            if wps != e.page_size {
+                return err(fail(e, SQLITE_CORRUPT, "database disk image is malformed (WAL page size)"))
+            }
+        }
+    }
+    if valid {
+        e.w.nckpt = rd32(&h, 12)
+        for i in 0usize..8 {
+            salt[i] = h[16 + i]
+        }
+        ck1 := fck1
+        ck2 := fck2
+        frame_bytes := (ps as u64) + WAL_FRAME_HDR
+        nframes := (size - WAL_HDR_BYTES) / frame_bytes
+        page := e.scratch_page
+        fh := [0u8; 24]
+        f := 1u32
+        for (f as u64) <= nframes {
+            off := WAL_HDR_BYTES + ((f - 1) as u64) * frame_bytes
+            if walf_read(e, off, &mut fh)? < 24 {
+                break
+            }
+            if walf_read_ws(e, off + WAL_FRAME_HDR, page, ps)? < ps {
+                break
+            }
+            same_salt := true
+            for i in 0usize..8 {
+                if fh[8 + i] != salt[i] {
+                    same_salt = false
+                }
+            }
+            pgno := rd32(&fh, 0)
+            if !same_salt || pgno == 0 {
+                break
+            }
+            let (a1, a2) = wal_cksum(&fh, 0, 8, big, ck1, ck2)
+            let (b1, b2) = wal_cksum(e.ws, page, ps, big, a1, a2)
+            if b1 != rd32(&fh, 16) || b2 != rd32(&fh, 20) {
+                break
+            }
+            ck1 = b1
+            ck2 = b2
+            wal_index_append(e, f, pgno)?
+            trunc := rd32(&fh, 4)
+            if trunc != 0 {
+                mx = f
+                npage = trunc
+                fck1 = b1
+                fck2 = b2
+            }
+            f += 1
+        }
+    }
+    zero_hdr(e)
+    for i in 0usize..8 {
+        e.w.hdr[WH_SALT + i] = salt[i]
+    }
+    e.w.hdr[WH_BIGEND] = if big {
+        1u8
+    } else {
+        0u8
+    }
+    wal_set_page_size(e, ps)
+    wh_set(e, WH_MXFRAME, mx)
+    wh_set(e, WH_NPAGE, npage)
+    wh_set(e, WH_FCK, fck1)
+    wh_set(e, WH_FCK + 4, fck2)
+    wal_write_hdr(e)?
+    shm_wr32(e, CI_BACKFILL, 0)?
+    shm_attempted(e, mx)
+    shm_wr32(e, CI_MARKS, 0)?
+    for i in 1u32..WAL_NREADER {
+        if shm_lock(e, WAL_READ_LOCK0 + (i as u64), 1, false)? {
+            mark := if i == 1 && mx > 0 {
+                mx
+            } else {
+                READMARK_NOT_USED
+            }
+            r := shm_wr32(e, CI_MARKS + 4 * (i as u64), mark)
+            shm_unlock(e, WAL_READ_LOCK0 + (i as u64), 1)
+            r?
+        }
+    }
+    ok()
+}
+
+// nBackfillAttempted shares a word with the dead-man-switch byte, which
+// every connection holds shared; where locks are mandatory (Windows) the
+// write fails, and it is informational only.
+fn shm_attempted(e: &mut Engine, v: u32) {
+    saved := e.msg_len
+    match shm_wr32(e, CI_ATTEMPTED, v) {
+        ok() => {},
+        err(_) => {
+            e.msg_len = saved
+        },
+    }
+}
+
+// Reads the checkpoint info, skipping the lock bytes 120..128.
+fn read_ckpt_info(e: &mut Engine, info: &mut[u8]) -> void!db.Error {
+    shm_read(e, CI_BACKFILL, &mut info[0..24])?
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Hash tables
+
+// Records that frame `f` holds page `pgno`.
+fn wal_index_append(e: &mut Engine, f: u32, pgno: u32) -> void!db.Error {
+    b := frame_block(f)
+    idx := f - block_zero(b)
+    po := block_pgnos(b)
+    ho := block_hash(b)
+    let block_end = ((b as u64) + 1) * SHM_BLOCK
+    shm_ensure(e, block_end)?
+    if idx == 1 {
+        shm_zero(e, po, block_end)?
+    } else if shm_rd32(e, po + ((idx - 1) as u64) * 4)? != 0 {
+        // Left over from a transaction that was rolled back.
+        wal_cleanup_hash(e)?
+    }
+    key := wal_hash(pgno)
+    collide := idx
+    for {
+        v := shm_rd16(e, ho + (key as u64) * 2)?
+        if v == 0 {
+            break
+        }
+        if collide == 0 {
+            return err(corrupt(e))
+        }
+        collide -= 1
+        key = (key + 1) & (HT_NSLOT - 1)
+    }
+    shm_wr32(e, po + ((idx - 1) as u64) * 4, pgno)?
+    shm_wr16(e, ho + (key as u64) * 2, idx)?
+    ok()
+}
+
+// Removes hash entries for frames after this connection's mxFrame.
+fn wal_cleanup_hash(e: &mut Engine) -> void!db.Error {
+    mx := wal_mx(e)
+    if mx == 0 {
+        return ok()
+    }
+    b := frame_block(mx)
+    limit := mx - block_zero(b)
+    po := block_pgnos(b)
+    ho := block_hash(b)
+    buf := [0u8; 2048]
+    for chunk in 0u64..8 {
+        pos := ho + chunk * 2048
+        shm_read(e, pos, &mut buf)?
+        dirty := false
+        for j in 0usize..1024 {
+            if (ld16(&buf, j * 2) as u32) > limit {
+                st16(&mut buf, j * 2, 0)
+                dirty = true
+            }
+        }
+        if dirty {
+            shm_write(e, pos, &buf)?
+        }
+    }
+    shm_zero(e, po + (limit as u64) * 4, ho)?
+    ok()
+}
+
+// The newest frame in [min, last] that holds page `pgno`, or 0.
+fn wal_find(e: &mut Engine, pgno: u32, last: u32, min: u32) -> u32!db.Error {
+    if last == 0 || last < min {
+        return ok(0)
+    }
+    b := frame_block(last)
+    bmin := frame_block(min)
+    slots := [0u8; 64]
+    for {
+        zero := block_zero(b)
+        po := block_pgnos(b)
+        ho := block_hash(b)
+        key := wal_hash(pgno)
+        found := 0u32
+        probes := 0u32
+        done := false
+        for !done {
+            // Read the probe sequence 32 slots at a time.
+            n := HT_NSLOT - key
+            if n > 32 {
+                n = 32
+            }
+            let bytes = (n as usize) * 2
+            shm_read(e, ho + (key as u64) * 2, &mut slots[..bytes])?
+            for j in 0usize..(n as usize) {
+                v := ld16(&slots, j * 2) as u32
+                if v == 0 {
+                    done = true
+                    break
+                }
+                f := v + zero
+                if f <= last && f >= min {
+                    if shm_rd32(e, po + ((v - 1) as u64) * 4)? == pgno {
+                        found = f
+                    }
+                }
+                probes += 1
+                if probes > HT_NSLOT {
+                    return err(corrupt(e))
+                }
+            }
+            key = (key + n) & (HT_NSLOT - 1)
+        }
+        if found != 0 {
+            return ok(found)
+        }
+        if b == bmin {
+            break
+        }
+        b -= 1
+    }
+    ok(0)
+}
+
+// Page number stored for frame f.
+fn wal_frame_pgno(e: &mut Engine, f: u32) -> u32!db.Error {
+    b := frame_block(f)
+    idx := f - block_zero(b)
+    shm_rd32(e, block_pgnos(b) + ((idx - 1) as u64) * 4)
+}
+
+// Frame holding the current version of `pgno` for this connection's read
+// snapshot (including its own uncommitted frames), or 0.
+fn wal_lookup(e: &mut Engine, pgno: u32) -> u32!db.Error {
+    if !e.w.open || e.w.read_lock <= 0 {
+        return ok(0)
+    }
+    let mx = wal_mx(e)
+    let min = e.w.min_frame
+    wal_find(e, pgno, mx, min)
+}
+
+// Reads `len` bytes of page `pgno` as of the read snapshot.
+fn wal_read_page(e: &mut Engine, pgno: u32, dst: usize, len: usize) -> void!db.Error {
+    f := wal_lookup(e, pgno)?
+    got := 0usize
+    if f != 0 {
+        let pos = frame_offset(e, f) + WAL_FRAME_HDR
+        got = walf_read_ws(e, pos, dst, len)?
+    } else {
+        let pos2 = ((pgno - 1) as u64) * (e.page_size as u64)
+        got = file_read(e, pos2, dst, len)?
+    }
+    if got < len {
+        zero_bytes(e.ws, dst + got, len - got)
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Read transactions
+
+// Starts a read transaction: takes a consistent header snapshot and a read
+// lock that keeps checkpoints from overwriting what it may still need.
+// Returns true when the database changed since this connection's previous
+// snapshot (its page cache must be dropped).
+fn wal_begin_read(e: &mut Engine) -> bool!db.Error {
+    changed := false
+    cnt := 0u32
+    for {
+        cnt += 1
+        if cnt > 5 {
+            if cnt > 100 {
+                return err(fail(e, SQLITE_PROTOCOL, "locking protocol"))
+            }
+            if cnt >= 10 {
+                thread.sleep_ms(if cnt > 40 {
+                    30u32
+                } else {
+                    cnt - 9
+                })
+            } else {
+                thread.yield_now()
+            }
+        }
+        r := wal_try_begin_read(e, false)?
+        if (r & 2) != 0 {
+            changed = true
+        }
+        if (r & 1) == 0 {
+            break
+        }
+    }
+    ok(changed)
+}
+
+// One attempt. Bit 0 of the result: retry; bit 1: header changed. With
+// `use_wal` (a writer restarting the log) the header is not re-read and
+// read lock 0 is not considered.
+fn wal_try_begin_read(e: &mut Engine, use_wal: bool) -> u32!db.Error {
+    flags := 0u32
+    if !use_wal {
+        h := wal_read_hdr(e)?
+        if h == 3 {
+            return ok(1)
+        }
+        if h == 1 {
+            flags = 2
+        }
+    }
+    info := [0u8; 24]
+    read_ckpt_info(e, &mut info)?
+    mx := wal_mx(e)
+    if !use_wal && ld32(&info, 0) == mx {
+        // Everything is in the database file: read it directly.
+        if shm_lock(e, WAL_READ_LOCK0, 1, true)? {
+            if !wal_hdr_current(e)? {
+                shm_unlock(e, WAL_READ_LOCK0, 1)
+                return ok(flags | 1)
+            }
+            e.w.read_lock = 0
+            e.w.min_frame = mx + 1
+            return ok(flags)
+        }
+    }
+    // The largest read mark not beyond mxFrame; set one to mxFrame if that
+    // is not current and a slot is free.
+    mark := 0u32
+    mi := 0u32
+    for i in 1u32..WAL_NREADER {
+        m := ld32(&info, 4 + 4 * (i as usize))
+        if mark <= m && m <= mx {
+            mark = m
+            mi = i
+        }
+    }
+    if mark < mx || mi == 0 {
+        for i in 1u32..WAL_NREADER {
+            if shm_lock(e, WAL_READ_LOCK0 + (i as u64), 1, false)? {
+                r := shm_wr32(e, CI_MARKS + 4 * (i as u64), mx)
+                shm_unlock(e, WAL_READ_LOCK0 + (i as u64), 1)
+                r?
+                mark = mx
+                mi = i
+                break
+            }
+        }
+    }
+    if mi == 0 {
+        return ok(flags | 1)
+    }
+    if !shm_lock(e, WAL_READ_LOCK0 + (mi as u64), 1, true)? {
+        return ok(flags | 1)
+    }
+    read_ckpt_info(e, &mut info)?
+    current := wal_hdr_current(e)?
+    if ld32(&info, 4 + 4 * (mi as usize)) != mark || !current {
+        shm_unlock(e, WAL_READ_LOCK0 + (mi as u64), 1)
+        return ok(flags | 1)
+    }
+    e.w.read_lock = mi as i32
+    e.w.min_frame = ld32(&info, 0) + 1
+    ok(flags)
+}
+
+fn wal_end_read(e: &mut Engine) {
+    if e.w.read_lock >= 0 {
+        let lock = WAL_READ_LOCK0 + (e.w.read_lock as u64)
+        shm_unlock(e, lock, 1)
+        e.w.read_lock = -1
+    }
+}
+
+fn wal_end_write(e: &mut Engine) {
+    if e.w.write_lock {
+        shm_unlock(e, WAL_WRITE_LOCK, 1)
+        e.w.write_lock = false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write transactions
+
+// Takes the WRITE lock. The read snapshot must be the newest one. When
+// `refresh` allows it (nothing has been read in this transaction yet), a
+// stale snapshot is replaced and the busy timeout applies; like SQLite, the
+// read lock is released while waiting, so a checkpointer that holds the
+// WRITE lock and waits for readers cannot deadlock with us. Inside a
+// transaction that has already read, a conflict fails at once.
+fn wal_begin_write(e: &mut Engine, refresh: bool) -> void!db.Error {
+    if e.readonly {
+        return err(fail(e, SQLITE_READONLY, "attempt to write a readonly database"))
+    }
+    attempts := 0u32
+    for {
+        if shm_lock(e, WAL_WRITE_LOCK, 1, false)? {
+            e.w.write_lock = true
+            current := match wal_hdr_current(e) {
+                ok(v) => v,
+                err(reason) => {
+                    wal_end_write(e)
+                    return err(reason)
+                },
+            }
+            if current {
+                break
+            }
+            wal_end_write(e)
+            if !refresh {
+                return err(busy(e))
+            }
+            // Another writer committed after our snapshot: take a new one.
+            wal_end_read(e)
+            begin_read_wal(e)?
+            continue
+        }
+        attempts += 1
+        if !refresh || attempts > e.busy_retries {
+            return err(busy(e))
+        }
+        wal_end_read(e)
+        pause()
+        begin_read_wal(e)?
+    }
+    e.w.appended = false
+    ok()
+}
+
+// Before the first frame of a transaction: if the read snapshot did not use
+// the log (read lock 0, everything checkpointed) and no reader uses it
+// either, start the log over; then switch to a read mark.
+fn wal_restart_log(e: &mut Engine) -> void!db.Error {
+    if e.w.read_lock != 0 {
+        return ok()
+    }
+    nb := shm_rd32(e, CI_BACKFILL)?
+    if nb > 0 {
+        if shm_lock(e, WAL_READ_LOCK0 + 1, (WAL_NREADER - 1) as u64, false)? {
+            r := wal_restart_hdr(e)
+            shm_unlock(e, WAL_READ_LOCK0 + 1, (WAL_NREADER - 1) as u64)
+            r?
+        }
+    }
+    shm_unlock(e, WAL_READ_LOCK0, 1)
+    e.w.read_lock = -1
+    cnt := 0u32
+    for {
+        r := wal_try_begin_read(e, true)?
+        if (r & 1) == 0 {
+            break
+        }
+        cnt += 1
+        if cnt > 100 {
+            return err(fail(e, SQLITE_PROTOCOL, "locking protocol"))
+        }
+        pause()
+    }
+    ok()
+}
+
+// Starts the log over: new salts, no frames, read marks reset.
+fn wal_restart_hdr(e: &mut Engine) -> void!db.Error {
+    e.w.nckpt = core.wrapping_add(e.w.nckpt, 1u32)
+    wh_set(e, WH_MXFRAME, 0)
+    let salt1 = core.wrapping_add(rd32(&e.w.hdr, WH_SALT), 1u32)
+    wr32(&mut e.w.hdr, WH_SALT, salt1)
+    let salt2 = (next_random(e) & 0xffffffffu64) as u32
+    wr32(&mut e.w.hdr, WH_SALT + 4, salt2)
+    wal_write_hdr(e)?
+    shm_wr32(e, CI_BACKFILL, 0)?
+    shm_attempted(e, 0)
+    shm_wr32(e, CI_MARKS + 4, 0)?
+    for i in 2u64..(WAL_NREADER as u64) {
+        shm_wr32(e, CI_MARKS + 4 * i, READMARK_NOT_USED)?
+    }
+    ok()
+}
+
+// Appends one frame holding the page at workspace offset `src`. `commit`
+// is the database size in pages for a commit frame, else 0.
+fn wal_append(e: &mut Engine, pgno: u32, src: usize, commit: u32) -> void!db.Error {
+    ps := e.page_size
+    mx := wal_mx(e)
+    if mx == 0 {
+        // A new log: header with fresh salts (or the restarted ones).
+        h := [0u8; 32]
+        wr32(&mut h, 0, WAL_MAGIC)
+        wr32(&mut h, 4, WAL_FORMAT)
+        wr32(&mut h, 8, ps as u32)
+        let nckpt = e.w.nckpt
+        wr32(&mut h, 12, nckpt)
+        if nckpt == 0 {
+            let r1 = (next_random(e) & 0xffffffffu64) as u32
+            let r2 = (next_random(e) & 0xffffffffu64) as u32
+            wr32(&mut e.w.hdr, WH_SALT, r1)
+            wr32(&mut e.w.hdr, WH_SALT + 4, r2)
+        }
+        for i in 0usize..8 {
+            h[16 + i] = e.w.hdr[WH_SALT + i]
+        }
+        let (c1, c2) = wal_cksum(&h, 0, 24, false, 0, 0)
+        wr32(&mut h, 24, c1)
+        wr32(&mut h, 28, c2)
+        e.w.hdr[WH_BIGEND] = 0
+        wh_set(e, WH_FCK, c1)
+        wh_set(e, WH_FCK + 4, c2)
+        wal_set_page_size(e, ps)
+        walf_write(e, 0, &h)?
+        walf_sync(e)?
+    }
+    f := mx + 1
+    fh := [0u8; 24]
+    wr32(&mut fh, 0, pgno)
+    wr32(&mut fh, 4, commit)
+    for i in 0usize..8 {
+        fh[8 + i] = e.w.hdr[WH_SALT + i]
+    }
+    big := e.w.hdr[WH_BIGEND] != 0
+    let k1 = wh_get(e, WH_FCK)
+    let k2 = wh_get(e, WH_FCK + 4)
+    let (a1, a2) = wal_cksum(&fh, 0, 8, big, k1, k2)
+    let (c3, c4) = wal_cksum(e.ws, src, ps, big, a1, a2)
+    wr32(&mut fh, 16, c3)
+    wr32(&mut fh, 20, c4)
+    off := frame_offset(e, f)
+    walf_write(e, off, &fh)?
+    walf_write_ws(e, off + WAL_FRAME_HDR, src, ps)?
+    wal_index_append(e, f, pgno)?
+    e.w.appended = true
+    wh_set(e, WH_MXFRAME, f)
+    wh_set(e, WH_FCK, c3)
+    wh_set(e, WH_FCK + 4, c4)
+    ok()
+}
+
+// Commits: appends every dirty page (the last frame is the commit frame and
+// carries the database size), syncs the log and publishes the header.
+fn wal_commit(e: &mut Engine) -> void!db.Error {
+    last := e.nslots
+    db := e.cur_db as u8
+    for s in 0usize..e.nslots {
+        m := slot_meta(e, s)
+        pgno := ld32(e.ws, m)
+        if pgno != 0 && e.ws[m + 4] != 0 && e.ws[m + 5] == db {
+            if pgno <= e.db_pages {
+                last = s
+            } else {
+                e.ws[m + 4] = 0
+            }
+        }
+    }
+    if last == e.nslots {
+        return ok()
+    }
+    wal_restart_log(e)?
+    for s in 0usize..(last + 1) {
+        m := slot_meta(e, s)
+        pgno := ld32(e.ws, m)
+        if pgno != 0 && e.ws[m + 4] != 0 && e.ws[m + 5] == db {
+            let size = if s == last {
+                e.db_pages
+            } else {
+                0u32
+            }
+            let data = slot_data(e, s)
+            wal_append(e, pgno, data, size)?
+            e.ws[m + 4] = 0
+        }
+    }
+    walf_sync(e)?
+    let change = core.wrapping_add(wh_get(e, WH_CHANGE), 1u32)
+    wh_set(e, WH_CHANGE, change)
+    let pages = e.db_pages
+    wh_set(e, WH_NPAGE, pages)
+    let ps = e.page_size
+    wal_set_page_size(e, ps)
+    wal_write_hdr(e)?
+    e.w.appended = false
+    if e.w.autockpt > 0 && wal_mx(e) >= e.w.autockpt {
+        e.w.ckpt_due = true
+    }
+    ok()
+}
+
+// Rolls back a write transaction's frames: back to the shared header, and
+// hash entries for discarded frames removed.
+fn wal_undo(e: &mut Engine) -> void!db.Error {
+    appended := e.w.appended
+    e.w.appended = false
+    buf := [0u8; 48]
+    shm_read(e, 0, &mut buf)?
+    for i in 0usize..48 {
+        e.w.hdr[i] = buf[i]
+    }
+    if appended {
+        wal_cleanup_hash(e)?
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoints
+
+// Copies committed frames back into the database file. Returns SQLite's
+// (busy, log frames, checkpointed frames). Must be called outside a read
+// transaction.
+fn wal_checkpoint(e: &mut Engine, mode: u32) -> (bool, i64, i64)!db.Error {
+    if e.readonly {
+        return err(fail(e, SQLITE_READONLY, "attempt to write a readonly database"))
+    }
+    if !shm_lock(e, WAL_CKPT_LOCK, 1, false)? {
+        return ok((true, -1i64, -1i64))
+    }
+    e.w.ckpt_lock = true
+    mode2 := mode
+    took_write := false
+    if mode != CKPT_PASSIVE {
+        match shm_lock_wait(e, WAL_WRITE_LOCK, 1, true) {
+            ok(v) => {
+                if v {
+                    e.w.write_lock = true
+                    took_write = true
+                } else {
+                    mode2 = CKPT_PASSIVE
+                }
+            },
+            err(reason) => {
+                shm_unlock(e, WAL_CKPT_LOCK, 1)
+                e.w.ckpt_lock = false
+                return err(reason)
+            },
+        }
+    }
+    r := wal_checkpoint_locked(e, mode2)
+    if took_write {
+        wal_end_write(e)
+    }
+    shm_unlock(e, WAL_CKPT_LOCK, 1)
+    e.w.ckpt_lock = false
+    let (busy_flag, log, done) = r?
+    ok((busy_flag || mode2 != mode, log, done))
+}
+
+fn wal_checkpoint_locked(e: &mut Engine, mode: u32) -> (bool, i64, i64)!db.Error {
+    h := wal_read_hdr(e)?
+    if h == 3 {
+        return ok((true, -1i64, -1i64))
+    }
+    mx := wal_mx(e)
+    if mx > 0 && wal_page_size(e) != e.page_size {
+        return err(corrupt(e))
+    }
+    busy_flag := wal_backfill(e, mode)?
+    log := wal_mx(e) as i64
+    done := shm_rd32(e, CI_BACKFILL)? as i64
+    if h == 1 {
+        // The header was newer than this connection's snapshot; make sure
+        // the next read transaction drops the page cache.
+        zero_hdr(e)
+    }
+    ok((busy_flag, log, done))
+}
+
+fn wal_backfill(e: &mut Engine, mode: u32) -> bool!db.Error {
+    ps := e.page_size
+    mx := wal_mx(e)
+    wait := mode != CKPT_PASSIVE
+    nb := shm_rd32(e, CI_BACKFILL)?
+    if nb < mx {
+        safe := mx
+        max_page := wal_npage(e)
+        for i in 1u32..WAL_NREADER {
+            pos := CI_MARKS + 4 * (i as u64)
+            y := shm_rd32(e, pos)?
+            if safe > y {
+                if shm_lock_wait(e, WAL_READ_LOCK0 + (i as u64), 1, wait)? {
+                    mark := if i == 1 {
+                        safe
+                    } else {
+                        READMARK_NOT_USED
+                    }
+                    r := shm_wr32(e, pos, mark)
+                    shm_unlock(e, WAL_READ_LOCK0 + (i as u64), 1)
+                    r?
+                } else {
+                    safe = y
+                    wait = false
+                }
+            }
+        }
+        if nb < safe {
+            if shm_lock_wait(e, WAL_READ_LOCK0, 1, wait)? {
+                r := wal_copy_frames(e, safe, max_page, ps)
+                shm_unlock(e, WAL_READ_LOCK0, 1)
+                r?
+            }
+        }
+    }
+    if mode != CKPT_PASSIVE {
+        nb2 := shm_rd32(e, CI_BACKFILL)?
+        if nb2 < wal_mx(e) {
+            return ok(true)
+        }
+        if mode >= CKPT_RESTART {
+            if shm_lock_wait(e, WAL_READ_LOCK0 + 1, (WAL_NREADER - 1) as u64, true)? {
+                r2 := if mode == CKPT_TRUNCATE {
+                    wal_truncate_log(e)
+                } else {
+                    ok()
+                }
+                shm_unlock(e, WAL_READ_LOCK0 + 1, (WAL_NREADER - 1) as u64)
+                r2?
+            } else {
+                return ok(true)
+            }
+        }
+    }
+    ok(false)
+}
+
+fn wal_truncate_log(e: &mut Engine) -> void!db.Error {
+    wal_restart_hdr(e)?
+    if !fio_set_len(&mut e.w.file, 0) {
+        return err(io_fail(e, "disk I/O error (wal truncate)"))
+    }
+    ok()
+}
+
+// Writes the newest version (up to frame `safe`) of every page changed
+// after nBackfill into the database file. Holds READ0 exclusively.
+fn wal_copy_frames(e: &mut Engine, safe: u32, max_page: u32, ps: usize) -> void!db.Error {
+    nb := shm_rd32(e, CI_BACKFILL)?
+    shm_attempted(e, safe)
+    walf_sync(e)?
+    page := e.scratch_page
+    f := nb + 1
+    for f <= safe {
+        pgno := wal_frame_pgno(e, f)?
+        if pgno != 0 && pgno <= max_page {
+            if wal_find(e, pgno, safe, f)? == f {
+                let pos = frame_offset(e, f) + WAL_FRAME_HDR
+                got := walf_read_ws(e, pos, page, ps)?
+                if got < ps {
+                    return err(io_fail(e, "disk I/O error (short wal read)"))
+                }
+                let dst = ((pgno - 1) as u64) * (ps as u64)
+                file_write(e, dst, page, ps)?
+            }
+        }
+        f += 1
+    }
+    live := shm_rd32(e, WH_MXFRAME as u64)?
+    if safe == live {
+        let size = (wal_npage(e) as u64) * (ps as u64)
+        file_truncate(e, size)?
+    }
+    file_sync(e)?
+    shm_wr32(e, CI_BACKFILL, safe)?
+    ok()
+}
+
+// Automatic checkpoint after a commit pushed the log past the
+// wal_autocheckpoint threshold. Failures are not reported (SQLite's
+// default hook ignores them too).
+fn wal_auto_checkpoint(e: &mut Engine) {
+    if !e.w.ckpt_due || !e.w.open || e.w.read_lock >= 0 || e.write_txn {
+        return
+    }
+    e.w.ckpt_due = false
+    saved := e.msg_len
+    match wal_checkpoint(e, CKPT_PASSIVE) {
+        ok(_) => {},
+        err(_) => {},
+    }
+    e.msg_len = saved
+}

@@ -1,0 +1,2170 @@
+package sqlite
+
+import "std/db"
+
+// Window functions: fn(args) [FILTER (WHERE ...)] OVER (window-defn).
+//
+// A select with window functions runs in three stages (window_rows):
+//   1. Every row that survives WHERE / GROUP BY / HAVING becomes a sorter
+//      record holding the select's slot values (columns, group keys),
+//      aggregates and subqueries used outside window functions, the
+//      arguments and FILTER value of every window function, and the
+//      PARTITION BY / ORDER BY keys of every distinct window.
+//   2. For each distinct window (last appearing first, as SQLite nests
+//      them) the rows are stably sorted by partition and order keys and the
+//      window values are computed per partition into a cell array.
+//   3. The result columns and ORDER BY terms are evaluated from the records
+//      (slots read the record, window functions their cells) and handed to
+//      the normal DISTINCT / ORDER BY / LIMIT machinery.
+// Frames, peer groups and the incremental step/inverse behaviour of the
+// built-in aggregates follow SQLite's window.c.
+
+const N_WINDEF: u8 = 70
+const N_WIN: u8 = 71
+
+// N_WINDEF: a partition list (N_ORDER items), b order list (N_ORDER items),
+// c/d base window name, e start offset, f end offset, op frame type, flags
+// start bound | end bound << 3 | exclude << 6 | WF_BYNAME, x the window's
+// name (offset | length << 32) for WINDOW clause entries and OVER name.
+//
+// N_WIN (a resolved window function call): a/b name, c arguments, d function
+// id, e index in the select's window list, f FILTER expression, g effective
+// window definition, x the select's window block.
+const WF_BYNAME: usize = 512
+
+const WT_IMPLICIT: u8 = 0
+const WT_ROWS: u8 = 1
+const WT_RANGE: u8 = 2
+const WT_GROUPS: u8 = 3
+
+const WB_UNB_PREC: usize = 1
+const WB_PREC: usize = 2
+const WB_CURRENT: usize = 3
+const WB_FOLL: usize = 4
+const WB_UNB_FOLL: usize = 5
+
+const WX_NONE: usize = 0
+const WX_NO_OTHERS: usize = 1
+const WX_CURRENT: usize = 2
+const WX_GROUP: usize = 3
+const WX_TIES: usize = 4
+
+// Built-in window-only functions.
+const W_ROW_NUMBER: usize = 200
+const W_RANK: usize = 201
+const W_DENSE_RANK: usize = 202
+const W_PERCENT_RANK: usize = 203
+const W_CUME_DIST: usize = 204
+const W_NTILE: usize = 205
+const W_LAG: usize = 206
+const W_LEAD: usize = 207
+const W_FIRST_VALUE: usize = 208
+const W_LAST_VALUE: usize = 209
+const W_NTH_VALUE: usize = 210
+
+// Select info fields used by windows.
+const I_WINOK: usize = 99
+const I_WIN: usize = 148
+
+// Window block (statement pool, pointer in the select info).
+const WB_STAGE: usize = 0
+const WB_NFUN: usize = 4
+const WB_NGRP: usize = 8
+const WB_GRPS: usize = 12
+const WB_PREFIX: usize = 16
+const WB_NEXTRA: usize = 20
+const WB_NREC: usize = 24
+const WB_CUR: usize = 28
+const WB_FDS: usize = 32
+const WB_FUNS: usize = 48
+const WB_EXTRAS: usize = 304
+const WB_BYTES: usize = 560
+const WB_MAX: usize = 64
+
+// Window function descriptors.
+const FD_NODE: usize = 0
+const FD_GRP: usize = 4
+const FD_ARGF: usize = 8
+const FD_NARGS: usize = 12
+const FD_FILTF: usize = 16
+const FD_SYN: usize = 20
+const FD_ARGREG: usize = 24
+const FD_DEF: usize = 28
+const FD_ID: usize = 32
+const FD_BYTES: usize = 40
+
+// Distinct windows (same PARTITION BY and ORDER BY).
+const GD_DEF: usize = 0
+const GD_NPART: usize = 4
+const GD_NORD: usize = 8
+const GD_KEYF: usize = 12
+const GD_INFO: usize = 16
+const GD_BYTES: usize = 24
+
+// group_concat state (start of the window workspace slab).
+const GC_START: usize = 0
+const GC_END: usize = 4
+const GC_FIRST: usize = 8
+const GC_NACC: usize = 12
+const GC_FSEP: usize = 16
+const GC_TRACK: usize = 20
+const GC_HEAD: usize = 24
+const GC_ARR: usize = 28
+const GC_BUF: usize = 32
+const GC_LIM: usize = 36
+const GC_BYTES: usize = 40
+
+// ---------------------------------------------------------------------------
+// Parsing
+
+fn win_name_bits(o: usize, l: usize) -> u64 {
+    (o as u64) | ((l as u64) << 32)
+}
+
+fn win_name_off(e: &Engine, w: usize) -> usize {
+    (nx(e, w) & 0xffffffffu64) as usize
+}
+
+fn win_name_len(e: &Engine, w: usize) -> usize {
+    (nx(e, w) >> 32) as usize
+}
+
+// After the ')' of a function call: [FILTER (WHERE expr)] [OVER window].
+fn parse_filter_over(e: &mut Engine, n: usize) -> void!db.Error {
+    if is_kw(e, "FILTER") {
+        next_token(e)
+        expect(e, TK_LP)?
+        expect_kw(e, "WHERE")?
+        f := parse_expr(e)?
+        expect(e, TK_RP)?
+        set_nf(e, n, 5, f)
+    }
+    if is_kw(e, "OVER") {
+        next_token(e)
+        w := 0usize
+        if accept(e, TK_LP) {
+            w = parse_window_body(e)?
+            expect(e, TK_RP)?
+        } else {
+            let (o, l) = take_name(e)?
+            w = new_node(e, N_WINDEF)?
+            set_flags(e, w, WF_BYNAME)
+            set_x(e, w, win_name_bits(o, l))
+        }
+        if (nflags(e, n) & 1) != 0 {
+            return err(fail(e, SQLITE_ERROR, "DISTINCT is not supported for window functions"))
+        }
+        set_nf(e, n, 6, w)
+    }
+    ok()
+}
+
+// [base-name] [PARTITION BY exprs] [ORDER BY terms] [frame]
+fn parse_window_body(e: &mut Engine) -> usize!db.Error {
+    w := new_node(e, N_WINDEF)?
+    base := e.tk == TK_QID
+    if e.tk == TK_ID && !is_reserved(e) && !is_kw(e, "PARTITION") && !is_kw(e, "RANGE") && !is_kw(e, "ROWS") && !is_kw(e, "GROUPS") {
+        base = true
+    }
+    if base {
+        let (o, l) = take_name(e)?
+        set_nf(e, w, 2, o)
+        set_nf(e, w, 3, l)
+    }
+    if accept_kw(e, "PARTITION") {
+        expect_kw(e, "BY")?
+        head := 0usize
+        tail := 0usize
+        for {
+            x := parse_expr(e)?
+            item := new_node(e, N_ORDER)?
+            set_nf(e, item, 0, x)
+            let (h, t) = list_append(e, head, tail, item)
+            head = h
+            tail = t
+            if !accept(e, TK_COMMA) {
+                break
+            }
+        }
+        set_nf(e, w, 0, head)
+    }
+    if is_kw(e, "ORDER") {
+        next_token(e)
+        expect_kw(e, "BY")?
+        order := parse_order_list(e)?
+        set_nf(e, w, 1, order)
+    }
+    if is_kw(e, "ROWS") || is_kw(e, "RANGE") || is_kw(e, "GROUPS") {
+        parse_frame(e, w)?
+    }
+    ok(w)
+}
+
+fn parse_frame(e: &mut Engine, w: usize) -> void!db.Error {
+    ft := if is_kw(e, "ROWS") {
+        WT_ROWS
+    } else if is_kw(e, "RANGE") {
+        WT_RANGE
+    } else {
+        WT_GROUPS
+    }
+    next_token(e)
+    sk := 0usize
+    ek := WB_CURRENT
+    sx := 0usize
+    ex := 0usize
+    if accept_kw(e, "BETWEEN") {
+        let (k1, x1) = parse_frame_bound(e, true)?
+        expect_kw(e, "AND")?
+        let (k2, x2) = parse_frame_bound(e, false)?
+        sk = k1
+        sx = x1
+        ek = k2
+        ex = x2
+    } else {
+        let (k1, x1) = parse_frame_bound(e, true)?
+        sk = k1
+        sx = x1
+    }
+    excl := WX_NONE
+    if accept_kw(e, "EXCLUDE") {
+        if accept_kw(e, "NO") {
+            expect_kw(e, "OTHERS")?
+            excl = WX_NO_OTHERS
+        } else if accept_kw(e, "CURRENT") {
+            expect_kw(e, "ROW")?
+            excl = WX_CURRENT
+        } else if accept_kw(e, "GROUP") {
+            excl = WX_GROUP
+        } else if accept_kw(e, "TIES") {
+            excl = WX_TIES
+        } else {
+            return err(syntax_error(e))
+        }
+    }
+    if (sk == WB_CURRENT && ek == WB_PREC) || (sk == WB_FOLL && (ek == WB_PREC || ek == WB_CURRENT)) {
+        return err(fail(e, SQLITE_ERROR, "unsupported frame specification"))
+    }
+    set_op(e, w, ft)
+    set_flags(e, w, sk | (ek << 3) | (excl << 6))
+    set_nf(e, w, 4, sx)
+    set_nf(e, w, 5, ex)
+    ok()
+}
+
+// One frame boundary: (kind, offset expression).
+fn parse_frame_bound(e: &mut Engine, start: bool) -> (usize, usize)!db.Error {
+    if is_kw(e, "UNBOUNDED") {
+        next_token(e)
+        if start {
+            expect_kw(e, "PRECEDING")?
+            return ok((WB_UNB_PREC, 0usize))
+        }
+        expect_kw(e, "FOLLOWING")?
+        return ok((WB_UNB_FOLL, 0usize))
+    }
+    if is_kw(e, "CURRENT") {
+        next_token(e)
+        expect_kw(e, "ROW")?
+        return ok((WB_CURRENT, 0usize))
+    }
+    x := parse_expr(e)?
+    kind := 0usize
+    if accept_kw(e, "PRECEDING") {
+        kind = WB_PREC
+    } else if accept_kw(e, "FOLLOWING") {
+        kind = WB_FOLL
+    } else {
+        return err(syntax_error(e))
+    }
+    // Like SQLite, an offset that is not constant becomes NULL (and fails
+    // the offset check when the query runs).
+    if !win_const(e, x) {
+        x = new_node(e, N_NULL)?
+    }
+    ok((kind, x))
+}
+
+fn win_const(e: &Engine, n: usize) -> bool {
+    if n == 0 {
+        return true
+    }
+    k := nkind(e, n)
+    // As in SQLite 3.54, function calls do not count as constant here, but
+    // bound parameters do.
+    if k == N_ID || k == N_FUNC || k == N_SUBQ || k == N_EXISTS || k == N_INSEL || k == N_STAR {
+        return false
+    }
+    if k == N_CASE {
+        if !win_const(e, na(e, n)) || !win_const(e, nc(e, n)) {
+            return false
+        }
+        w := nb(e, n)
+        for w != 0 {
+            if !win_const(e, na(e, w)) || !win_const(e, nb(e, w)) {
+                return false
+            }
+            w = nnext(e, w)
+        }
+        return true
+    }
+    if k == N_INLIST {
+        if !win_const(e, na(e, n)) {
+            return false
+        }
+        item := nb(e, n)
+        for item != 0 {
+            if !win_const(e, item) {
+                return false
+            }
+            item = nnext(e, item)
+        }
+        return true
+    }
+    if k == N_BINARY || k == N_LIKE || k == N_BETWEEN {
+        if !win_const(e, na(e, n)) || !win_const(e, nb(e, n)) {
+            return false
+        }
+        if k != N_BINARY {
+            return win_const(e, nc(e, n))
+        }
+        return true
+    }
+    if k == N_UNARY || k == N_CAST || k == N_COLLATE || k == N_ISNULL {
+        return win_const(e, na(e, n))
+    }
+    true
+}
+
+// WINDOW name AS (defn), ... Later definitions may be based on earlier ones.
+fn parse_window_clause(e: &mut Engine, s: usize) -> void!db.Error {
+    head := 0usize
+    tail := 0usize
+    for {
+        let (o, l) = take_name(e)?
+        expect_kw(e, "AS")?
+        expect(e, TK_LP)?
+        w := parse_window_body(e)?
+        expect(e, TK_RP)?
+        set_x(e, w, win_name_bits(o, l))
+        if head == 0 {
+            // SQLite only chains definitions after the first.
+            set_nf(e, w, 2, 0)
+            set_nf(e, w, 3, 0)
+        } else {
+            win_chain(e, w, w, head)?
+        }
+        let (h, t) = list_append(e, head, tail, w)
+        head = h
+        tail = t
+        if !accept(e, TK_COMMA) {
+            break
+        }
+    }
+    set_nf(e, s, 5, head)
+    ok()
+}
+
+// The last definition named (o, l) in a WINDOW list, or 0.
+fn win_find(e: &Engine, list: usize, o: usize, l: usize) -> usize {
+    found := 0usize
+    p := list
+    for p != 0 {
+        let po = win_name_off(e, p)
+        let pl = win_name_len(e, p)
+        if names_eq(e, po, pl, o, l) {
+            found = p
+        }
+        p = nnext(e, p)
+    }
+    found
+}
+
+fn win_error_name(e: &mut Engine, text: &str, o: usize, l: usize) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, text)
+    msg_add_ws(e, o, l)
+    make_error(e, SQLITE_ERROR)
+}
+
+// Applies base window `src`'s name (fields c/d) to `w` using `list`.
+fn win_chain(e: &mut Engine, w: usize, src: usize, list: usize) -> void!db.Error {
+    bl := ndd(e, src)
+    bo := nc(e, src)
+    if bl == 0 {
+        return ok()
+    }
+    p := win_find(e, list, bo, bl)
+    if p == 0 {
+        return err(win_error_name(e, "no such window: ", bo, bl))
+    }
+    what := 0usize
+    if na(e, w) != 0 {
+        what = 1
+    } else if nb(e, p) != 0 && nb(e, w) != 0 {
+        what = 2
+    } else if nop(e, p) != WT_IMPLICIT {
+        what = 3
+    }
+    if what != 0 {
+        e.msg_len = 0
+        msg_add(e, "cannot override ")
+        if what == 1 {
+            msg_add(e, "PARTITION clause")
+        } else if what == 2 {
+            msg_add(e, "ORDER BY clause")
+        } else {
+            msg_add(e, "frame specification")
+        }
+        msg_add(e, " of window: ")
+        msg_add_ws(e, bo, bl)
+        return err(make_error(e, SQLITE_ERROR))
+    }
+    let pa = na(e, p)
+    set_nf(e, w, 0, pa)
+    if nb(e, p) != 0 {
+        let pb = nb(e, p)
+        set_nf(e, w, 1, pb)
+    }
+    set_nf(e, w, 2, 0)
+    set_nf(e, w, 3, 0)
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Resolution
+
+fn win_func_lookup(e: &Engine, o: usize, l: usize) -> (usize, usize, usize) {
+    if name_is(e, o, l, "row_number") {
+        return (W_ROW_NUMBER, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "rank") {
+        return (W_RANK, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "dense_rank") {
+        return (W_DENSE_RANK, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "percent_rank") {
+        return (W_PERCENT_RANK, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "cume_dist") {
+        return (W_CUME_DIST, 0usize, 0usize)
+    }
+    if name_is(e, o, l, "ntile") {
+        return (W_NTILE, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "lag") {
+        return (W_LAG, 1usize, 3usize)
+    }
+    if name_is(e, o, l, "lead") {
+        return (W_LEAD, 1usize, 3usize)
+    }
+    if name_is(e, o, l, "first_value") {
+        return (W_FIRST_VALUE, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "last_value") {
+        return (W_LAST_VALUE, 1usize, 1usize)
+    }
+    if name_is(e, o, l, "nth_value") {
+        return (W_NTH_VALUE, 2usize, 2usize)
+    }
+    (0usize, 0usize, 0usize)
+}
+
+fn is_window_call(e: &Engine, n: usize) -> bool {
+    if ng(e, n) != 0 || nff(e, n) != 0 {
+        return true
+    }
+    let (id, _, _) = win_func_lookup(e, na(e, n), nb(e, n))
+    id != 0
+}
+
+// The select whose name context is innermost, or 0.
+fn win_select(e: &Engine) -> usize {
+    if e.ctx_n == 0 {
+        return 0
+    }
+    ldu(e.ws, e.ctx_off + (e.ctx_n - 1) * 8 + 4)
+}
+
+fn win_func_error(e: &mut Engine, before: &str, o: usize, l: usize, after: &str) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, before)
+    msg_add_ws(e, o, l)
+    msg_add(e, after)
+    make_error(e, SQLITE_ERROR)
+}
+
+// Resolves a function call with OVER or FILTER, or a window-only function.
+// Returns false when the call is an ordinary (possibly FILTERed) aggregate
+// or scalar call left to resolve_expr.
+fn resolve_window_func(e: &mut Engine, n: usize, sel: usize, allow_agg: bool) -> bool!db.Error {
+    name := na(e, n)
+    len := nb(e, n)
+    args := nc(e, n)
+    nargs := list_len(e, args)
+    flags := nflags(e, n)
+    win := ng(e, n)
+    let (wid, wlo, whi) = win_func_lookup(e, name, len)
+    cur := win_select(e)
+    allowed := false
+    if cur != 0 {
+        let ci = sinfo(e, cur)
+        allowed = e.ws[ci + I_WINOK] != 0
+    }
+    id := wid
+    if wid != 0 {
+        if nargs < wlo || nargs > whi {
+            return err(win_func_error(e, "wrong number of arguments to function ", name, len, "()"))
+        }
+        if win == 0 || !allow_agg || !allowed {
+            return err(win_func_error(e, "misuse of window function ", name, len, "()"))
+        }
+    } else {
+        let (fid, lo, hi) = func_lookup(e, name, len, nargs, (flags & 2) != 0)
+        agg := fid != 0 && is_aggregate_id(fid)
+        exact := nargs >= lo && nargs <= hi
+        if win != 0 && fid != 0 && !agg {
+            return err(win_func_error(e, "", name, len, "() may not be used as a window function"))
+        }
+        if win == 0 {
+            if fid != 0 && exact && !agg {
+                return err(win_func_error(e, "FILTER may not be used with non-aggregate ", name, len, "()"))
+            }
+            return ok(false)
+        }
+        if fid != 0 && exact && (!allow_agg || !allowed) {
+            return err(win_func_error(e, "misuse of window function ", name, len, "()"))
+        }
+        if fid == 0 {
+            return err(win_func_error(e, "no such function: ", name, len, ""))
+        }
+        if !exact {
+            return err(win_func_error(e, "wrong number of arguments to function ", name, len, "()"))
+        }
+        id = fid
+    }
+    set_kind(e, n, N_WIN)
+    set_nf(e, n, 3, id)
+    info := sinfo(e, cur)
+    saved := e.ws[info + I_WINOK]
+    e.ws[info + I_WINOK] = 0
+    r := win_resolve_parts(e, n, cur, sel, allow_agg, id, wid != 0)
+    e.ws[info + I_WINOK] = saved
+    r?
+    win_register(e, info, n)?
+    ok(true)
+}
+
+fn win_resolve_parts(e: &mut Engine, n: usize, cur: usize, sel: usize, allow_agg: bool, id: usize, window_only: bool) -> void!db.Error {
+    a := nc(e, n)
+    for a != 0 {
+        resolve_expr(e, a, sel, allow_agg)?
+        a = nnext(e, a)
+    }
+    eff := win_effective(e, n, cur, id, window_only)?
+    set_nf(e, n, 6, eff)
+    p := na(e, eff)
+    for p != 0 {
+        let px = na(e, p)
+        resolve_expr(e, px, sel, allow_agg)?
+        p = nnext(e, p)
+    }
+    o := nb(e, eff)
+    for o != 0 {
+        let ox = na(e, o)
+        resolve_expr(e, ox, sel, allow_agg)?
+        o = nnext(e, o)
+    }
+    f := nff(e, n)
+    if f != 0 {
+        resolve_expr(e, f, sel, allow_agg)?
+    }
+    let start = ne_(e, eff)
+    resolve_expr(e, start, 0, false)?
+    let end = nff(e, eff)
+    resolve_expr(e, end, 0, false)?
+    ok()
+}
+
+// The window definition a call actually uses (named window looked up, base
+// window applied, built-in frames forced), as a fresh node.
+fn win_effective(e: &mut Engine, n: usize, cur: usize, id: usize, window_only: bool) -> usize!db.Error {
+    w := ng(e, n)
+    defs := if cur != 0 {
+        nff(e, cur)
+    } else {
+        0usize
+    }
+    src := w
+    if (nflags(e, w) & WF_BYNAME) != 0 {
+        let o = win_name_off(e, w)
+        let l = win_name_len(e, w)
+        p := win_find(e, defs, o, l)
+        if p == 0 {
+            return err(win_error_name(e, "no such window: ", o, l))
+        }
+        src = p
+    }
+    eff := new_node(e, N_WINDEF)?
+    let src_o = nd(e, src)
+    let to = nd(e, eff)
+    move_bytes(e.ws, src_o, to, NODE)
+    set_next(e, eff, 0)
+    let fl = nflags(e, eff) & (WF_BYNAME - 1)
+    set_flags(e, eff, fl)
+    if src == w {
+        win_chain(e, eff, w, defs)?
+    }
+    if nop(e, eff) == WT_RANGE && (ne_(e, eff) != 0 || nff(e, eff) != 0) && list_len(e, nb(e, eff)) != 1 {
+        return err(fail(e, SQLITE_ERROR, "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"))
+    }
+    if window_only {
+        if nff(e, n) != 0 {
+            return err(fail(e, SQLITE_ERROR, "FILTER clause may only be used with aggregate window functions"))
+        }
+        if id != W_FIRST_VALUE && id != W_LAST_VALUE && id != W_NTH_VALUE {
+            // Ranking functions and lag/lead ignore the frame.
+            set_op(e, eff, WT_ROWS)
+            set_flags(e, eff, WB_UNB_PREC | (WB_UNB_FOLL << 3))
+            set_nf(e, eff, 4, 0)
+            set_nf(e, eff, 5, 0)
+        }
+    }
+    ok(eff)
+}
+
+fn win_register(e: &mut Engine, info: usize, n: usize) -> void!db.Error {
+    wb := iget(e, info, I_WIN)
+    if wb == 0 {
+        wb = pool_alloc(e, WB_BYTES)?
+        zero_bytes(e.ws, wb, WB_BYTES)
+        iset(e, info, I_WIN, wb)
+    }
+    k := ldu(e.ws, wb + WB_NFUN)
+    if k >= WB_MAX {
+        return err(fail(e, SQLITE_ERROR, "too many window functions"))
+    }
+    stu(e.ws, wb + WB_FUNS + k * 4, n)
+    stu(e.ws, wb + WB_NFUN, k + 1)
+    set_nf(e, n, 4, k)
+    set_x(e, n, wb as u64)
+    ok()
+}
+
+// slotify() for a window function: arguments, FILTER, partition and order.
+fn win_slotify(e: &mut Engine, n: usize, info: usize) -> void!db.Error {
+    a := nc(e, n)
+    for a != 0 {
+        slotify(e, a, info)?
+        a = nnext(e, a)
+    }
+    let f = nff(e, n)
+    slotify(e, f, info)?
+    w := ng(e, n)
+    p := na(e, w)
+    for p != 0 {
+        let px = na(e, p)
+        slotify(e, px, info)?
+        p = nnext(e, p)
+    }
+    o := nb(e, w)
+    for o != 0 {
+        let ox = na(e, o)
+        slotify(e, ox, info)?
+        o = nnext(e, o)
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Planning
+
+fn win_contains(e: &Engine, n: usize) -> bool {
+    if n == 0 {
+        return false
+    }
+    k := nkind(e, n)
+    if k == N_WIN {
+        return true
+    }
+    if k == N_SUBQ || k == N_EXISTS || k == N_AGG || k == N_ALIAS {
+        return false
+    }
+    if k == N_INSEL {
+        return win_contains(e, na(e, n))
+    }
+    if k == N_FUNC {
+        a := nc(e, n)
+        for a != 0 {
+            if win_contains(e, a) {
+                return true
+            }
+            a = nnext(e, a)
+        }
+        return false
+    }
+    if k == N_CASE {
+        if win_contains(e, na(e, n)) || win_contains(e, nc(e, n)) {
+            return true
+        }
+        w := nb(e, n)
+        for w != 0 {
+            if win_contains(e, na(e, w)) || win_contains(e, nb(e, w)) {
+                return true
+            }
+            w = nnext(e, w)
+        }
+        return false
+    }
+    if k == N_INLIST {
+        if win_contains(e, na(e, n)) {
+            return true
+        }
+        item := nb(e, n)
+        for item != 0 {
+            if win_contains(e, item) {
+                return true
+            }
+            item = nnext(e, item)
+        }
+        return false
+    }
+    if k == N_BINARY || k == N_LIKE || k == N_BETWEEN {
+        if win_contains(e, na(e, n)) || win_contains(e, nb(e, n)) {
+            return true
+        }
+        return k != N_BINARY && win_contains(e, nc(e, n))
+    }
+    if k == N_UNARY || k == N_CAST || k == N_COLLATE || k == N_ISNULL {
+        return win_contains(e, na(e, n))
+    }
+    false
+}
+
+// Aggregates and subqueries outside window functions are evaluated in stage
+// 1 and read back from the record in stage 3.
+fn win_mark_extras(e: &mut Engine, n: usize, wb: usize, prefix: usize) -> void!db.Error {
+    if n == 0 {
+        return ok()
+    }
+    k := nkind(e, n)
+    if k == N_WIN || k == N_ALIAS {
+        return ok()
+    }
+    if k == N_INSEL && win_contains(e, na(e, n)) {
+        let lhs = na(e, n)
+        return win_mark_extras(e, lhs, wb, prefix)
+    }
+    if k == N_AGG || k == N_SUBQ || k == N_EXISTS || k == N_INSEL {
+        if ng(e, n) == 0 {
+            cnt := ldu(e.ws, wb + WB_NEXTRA)
+            if cnt >= WB_MAX {
+                return err(fail(e, SQLITE_ERROR, "too many aggregates or subqueries in a window query"))
+            }
+            stu(e.ws, wb + WB_EXTRAS + cnt * 4, n)
+            stu(e.ws, wb + WB_NEXTRA, cnt + 1)
+            set_nf(e, n, 6, prefix + cnt + 1)
+            set_x(e, n, wb as u64)
+        }
+        return ok()
+    }
+    if k == N_FUNC {
+        a := nc(e, n)
+        for a != 0 {
+            win_mark_extras(e, a, wb, prefix)?
+            a = nnext(e, a)
+        }
+        return ok()
+    }
+    if k == N_CASE {
+        let base = na(e, n)
+        win_mark_extras(e, base, wb, prefix)?
+        w := nb(e, n)
+        for w != 0 {
+            let wa = na(e, w)
+            win_mark_extras(e, wa, wb, prefix)?
+            let wbb = nb(e, w)
+            win_mark_extras(e, wbb, wb, prefix)?
+            w = nnext(e, w)
+        }
+        let other = nc(e, n)
+        return win_mark_extras(e, other, wb, prefix)
+    }
+    if k == N_INLIST {
+        let lhs2 = na(e, n)
+        win_mark_extras(e, lhs2, wb, prefix)?
+        item := nb(e, n)
+        for item != 0 {
+            win_mark_extras(e, item, wb, prefix)?
+            item = nnext(e, item)
+        }
+        return ok()
+    }
+    if k == N_BINARY || k == N_LIKE || k == N_BETWEEN {
+        let l = na(e, n)
+        win_mark_extras(e, l, wb, prefix)?
+        let r = nb(e, n)
+        win_mark_extras(e, r, wb, prefix)?
+        if k != N_BINARY {
+            let x = nc(e, n)
+            win_mark_extras(e, x, wb, prefix)?
+        }
+        return ok()
+    }
+    if k == N_UNARY || k == N_CAST || k == N_COLLATE || k == N_ISNULL {
+        let inner = na(e, n)
+        return win_mark_extras(e, inner, wb, prefix)
+    }
+    ok()
+}
+
+fn win_expr_eq(e: &Engine, a: usize, b: usize) -> bool {
+    if a == b {
+        return true
+    }
+    if a == 0 || b == 0 {
+        return false
+    }
+    k := nkind(e, a)
+    if k != nkind(e, b) || nop(e, a) != nop(e, b) {
+        return false
+    }
+    if k == N_COL || k == N_SLOT {
+        return na(e, a) == na(e, b) && nb(e, a) == nb(e, b)
+    }
+    if k == N_INT || k == N_REAL {
+        return nx(e, a) == nx(e, b)
+    }
+    if k == N_NULL {
+        return true
+    }
+    if k == N_STR || k == N_BLOB {
+        return names_eq_exact(e, na(e, a), nb(e, a), na(e, b), nb(e, b))
+    }
+    if k == N_PARAM {
+        return na(e, a) == na(e, b)
+    }
+    if k == N_COLLATE || k == N_CAST {
+        return nb(e, a) == nb(e, b) && win_expr_eq(e, na(e, a), na(e, b))
+    }
+    if k == N_UNARY || k == N_ISNULL {
+        return nflags(e, a) == nflags(e, b) && win_expr_eq(e, na(e, a), na(e, b))
+    }
+    if k == N_BINARY {
+        return win_expr_eq(e, na(e, a), na(e, b)) && win_expr_eq(e, nb(e, a), nb(e, b))
+    }
+    if k == N_FUNC || k == N_AGG {
+        if ndd(e, a) != ndd(e, b) || nflags(e, a) != nflags(e, b) {
+            return false
+        }
+        x := nc(e, a)
+        y := nc(e, b)
+        for x != 0 && y != 0 {
+            if !win_expr_eq(e, x, y) {
+                return false
+            }
+            x = nnext(e, x)
+            y = nnext(e, y)
+        }
+        return x == 0 && y == 0
+    }
+    false
+}
+
+fn win_list_eq(e: &Engine, a: usize, b: usize, flags: bool) -> bool {
+    x := a
+    y := b
+    for x != 0 && y != 0 {
+        if flags && nflags(e, x) != nflags(e, y) {
+            return false
+        }
+        if !win_expr_eq(e, na(e, x), na(e, y)) {
+            return false
+        }
+        x = nnext(e, x)
+        y = nnext(e, y)
+    }
+    x == 0 && y == 0
+}
+
+// Assigns record fields, groups windows by PARTITION BY / ORDER BY and builds
+// the aggregate nodes window functions step. Runs after plan_output.
+fn window_plan(e: &mut Engine, s: usize, info: usize) -> void!db.Error {
+    wb := iget(e, info, I_WIN)
+    if wb == 0 {
+        return ok()
+    }
+    nfun := ldu(e.ws, wb + WB_NFUN)
+    iset(e, info, I_MODE, MODE_SORT)
+    ext := ndd(e, s)
+    if iget(e, info, I_AGG) == AGG_NONE {
+        slots := pool_alloc(e, 4 * 256)?
+        iset(e, info, I_SLOTS, slots)
+        iset(e, info, I_NSLOT, 0)
+        e.group_list = 0
+        rc := na(e, s)
+        for rc != 0 {
+            let x = na(e, rc)
+            slotify(e, x, info)?
+            rc = nnext(e, rc)
+        }
+        if ext != 0 {
+            o := nc(e, ext)
+            for o != 0 {
+                let ox = na(e, o)
+                slotify(e, ox, info)?
+                o = nnext(e, o)
+            }
+        }
+    }
+    prefix := iget(e, info, I_NGROUP) + iget(e, info, I_NSLOT)
+    stu(e.ws, wb + WB_PREFIX, prefix)
+    stu(e.ws, wb + WB_NEXTRA, 0)
+    rc2 := na(e, s)
+    for rc2 != 0 {
+        let x2 = na(e, rc2)
+        win_mark_extras(e, x2, wb, prefix)?
+        rc2 = nnext(e, rc2)
+    }
+    if ext != 0 {
+        o2 := nc(e, ext)
+        for o2 != 0 {
+            let ox2 = na(e, o2)
+            win_mark_extras(e, ox2, wb, prefix)?
+            o2 = nnext(e, o2)
+        }
+    }
+    field := prefix + ldu(e.ws, wb + WB_NEXTRA)
+    fds := pool_alloc(e, nfun * FD_BYTES)?
+    zero_bytes(e.ws, fds, nfun * FD_BYTES)
+    stu(e.ws, wb + WB_FDS, fds)
+    grps := pool_alloc(e, nfun * GD_BYTES)?
+    zero_bytes(e.ws, grps, nfun * GD_BYTES)
+    stu(e.ws, wb + WB_GRPS, grps)
+    ngrp := 0usize
+    for k in 0usize..nfun {
+        n := ldu(e.ws, wb + WB_FUNS + k * 4)
+        fd := fds + k * FD_BYTES
+        id := ndd(e, n)
+        let args = nc(e, n)
+        nargs := list_len(e, args)
+        stu(e.ws, fd + FD_NODE, n)
+        stu(e.ws, fd + FD_ID, id)
+        stu(e.ws, fd + FD_NARGS, nargs)
+        stu(e.ws, fd + FD_ARGF, field)
+        field += nargs
+        if nff(e, n) != 0 {
+            stu(e.ws, fd + FD_FILTF, field)
+            field += 1
+        } else {
+            stu(e.ws, fd + FD_FILTF, NO_COL)
+        }
+        def := ng(e, n)
+        stu(e.ws, fd + FD_DEF, def)
+        g := NO_COL
+        for j in 0usize..ngrp {
+            other := ldu(e.ws, grps + j * GD_BYTES + GD_DEF)
+            if win_list_eq(e, na(e, other), na(e, def), false) && win_list_eq(e, nb(e, other), nb(e, def), true) {
+                g = j
+                break
+            }
+        }
+        if g == NO_COL {
+            g = ngrp
+            ngrp += 1
+            gd := grps + g * GD_BYTES
+            let parts = na(e, def)
+            np := list_len(e, parts)
+            let ords = nb(e, def)
+            no := list_len(e, ords)
+            stu(e.ws, gd + GD_DEF, def)
+            stu(e.ws, gd + GD_NPART, np)
+            stu(e.ws, gd + GD_NORD, no)
+            stu(e.ws, gd + GD_KEYF, field)
+            field += np + no
+            ginfo := pool_alloc(e, (np + no + 1) * 2)?
+            i := 0usize
+            p := na(e, def)
+            for p != 0 {
+                let px = na(e, p)
+                let (coll, _) = expr_collation(e, px)
+                e.ws[ginfo + i * 2] = coll
+                e.ws[ginfo + i * 2 + 1] = 0
+                i += 1
+                p = nnext(e, p)
+            }
+            o3 := nb(e, def)
+            for o3 != 0 {
+                let ox3 = na(e, o3)
+                let (coll2, _) = expr_collation(e, ox3)
+                e.ws[ginfo + i * 2] = coll2
+                fl := nflags(e, o3)
+                v := (fl & 1) as u8
+                if (fl & 2) != 0 && (fl & 1) == 0 {
+                    v = v | 2
+                }
+                if (fl & 4) != 0 && (fl & 1) != 0 {
+                    v = v | 4
+                }
+                e.ws[ginfo + i * 2 + 1] = v
+                i += 1
+                o3 = nnext(e, o3)
+            }
+            stu(e.ws, gd + GD_INFO, ginfo)
+        }
+        stu(e.ws, fd + FD_GRP, g)
+        argreg := alloc_regs(e, nargs + 1)?
+        stu(e.ws, fd + FD_ARGREG, argreg)
+        if is_aggregate_id(id) && id < W_ROW_NUMBER {
+            syn := new_node(e, N_AGG)?
+            set_nf(e, syn, 3, id)
+            regs := alloc_regs(e, 4)?
+            set_nf(e, syn, 4, regs)
+            head := 0usize
+            tail := 0usize
+            a := nc(e, n)
+            i2 := 0usize
+            for a != 0 {
+                r := new_node(e, N_REG)?
+                set_nf(e, r, 0, argreg + i2)
+                item := r
+                let (coll3, _) = expr_collation(e, a)
+                if coll3 != COLL_BINARY {
+                    c := new_node(e, N_COLLATE)?
+                    set_nf(e, c, 0, r)
+                    set_nf(e, c, 1, coll3 as usize)
+                    item = c
+                }
+                let (h, t) = list_append(e, head, tail, item)
+                head = h
+                tail = t
+                i2 += 1
+                a = nnext(e, a)
+            }
+            set_nf(e, syn, 2, head)
+            stu(e.ws, fd + FD_SYN, syn)
+        }
+    }
+    stu(e.ws, wb + WB_NGRP, ngrp)
+    stu(e.ws, wb + WB_NREC, field)
+    if field > 400 {
+        return err(fail(e, SQLITE_ERROR, "window query too complex (too many columns)"))
+    }
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Expression hooks
+
+// True while stage 3 reads node n (an aggregate or subquery outside window
+// functions) from the window record.
+fn win_readback(e: &Engine, n: usize) -> bool {
+    wb := (nx(e, n) & 0xffffffffu64) as usize
+    wb != 0 && ldu(e.ws, wb + WB_STAGE) == 3
+}
+
+fn win_extra_value(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    rec := e.slot_rec
+    len := e.slot_len
+    let f = ng(e, n) - 1
+    record_column(e, rec, len, f, dst)?
+    ok()
+}
+
+fn win_value(e: &mut Engine, n: usize, dst: usize) -> void!db.Error {
+    wb := (nx(e, n) & 0xffffffffu64) as usize
+    if wb == 0 || ldu(e.ws, wb + WB_STAGE) != 3 {
+        set_null(e, dst)
+        return ok()
+    }
+    let cell = ldu(e.ws, wb + WB_CUR) + ne_(e, n) * REG_BYTES
+    let to = reg_at(e, dst)
+    move_bytes(e.ws, cell, to, REG_BYTES)
+    ok()
+}
+
+// Stage 1 collects rows only: result columns are not computed yet.
+fn win_collecting(e: &Engine, info: usize) -> bool {
+    wb := iget(e, info, I_WIN)
+    wb != 0 && ldu(e.ws, wb + WB_STAGE) == 1
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+
+// Runs the select's rows through its window functions. kind 0 pushes
+// [ORDER BY keys..., results...] records (materialize), kind 1 pushes
+// [results..., side] (compound arms). Returns the start of the record list.
+fn window_rows(e: &mut Engine, s: usize, info: usize, kind: usize, side: i64) -> usize!db.Error {
+    wb := iget(e, info, I_WIN)
+    nfun := ldu(e.ws, wb + WB_NFUN)
+    stu(e.ws, wb + WB_STAGE, 1)
+    if iget(e, info, I_AGG) == AGG_NONE {
+        e.slot_rec = 0
+    }
+    r1 := win_collect(e, s, info, wb)
+    stu(e.ws, wb + WB_STAGE, 0)
+    let (idx0, n) = r1?
+    ord := sort_alloc(e, n * 4 + 4)?
+    move_bytes(e.ws, idx0, ord, n * 4)
+    cells := sort_alloc(e, n * nfun * REG_BYTES + 8)?
+    zero_bytes(e.ws, cells, n * nfun * REG_BYTES)
+    if n > 0 {
+        pg := sort_alloc(e, (n + 1) * 4)?
+        gs := sort_alloc(e, (n + 2) * 4)?
+        save_top := e.agg_top
+        save_end := e.agg_end
+        slab := (e.sort_hi - e.sort_top) / 4 / 8 * 8
+        slab_base := e.sort_top
+        e.sort_top += slab
+        r2 := win_stage2(e, wb, ord, n, idx0, cells, pg, gs, slab_base, slab_base + slab)
+        e.agg_top = save_top
+        e.agg_end = save_end
+        r2?
+    }
+    stu(e.ws, wb + WB_STAGE, 3)
+    r3 := win_emit(e, s, info, wb, ord, n, idx0, cells, kind, side)
+    stu(e.ws, wb + WB_STAGE, 0)
+    e.slot_rec = 0
+    r3
+}
+
+fn win_collect(e: &mut Engine, s: usize, info: usize, wb: usize) -> (usize, usize)!db.Error {
+    nrec := ldu(e.ws, wb + WB_NREC)
+    prefix := ldu(e.ws, wb + WB_PREFIX)
+    nextra := ldu(e.ws, wb + WB_NEXTRA)
+    nfun := ldu(e.ws, wb + WB_NFUN)
+    fds := ldu(e.ws, wb + WB_FDS)
+    grps := ldu(e.ws, wb + WB_GRPS)
+    ngrp := ldu(e.ws, wb + WB_NGRP)
+    agg := iget(e, info, I_AGG)
+    nslot := iget(e, info, I_NSLOT)
+    slots := iget(e, info, I_SLOTS)
+    lend := list_begin(e)
+    for {
+        mark := e.arena_top
+        if !raw_next(e, s, info)? {
+            break
+        }
+        save := e.rtop
+        base := e.rtop
+        for _ in 0usize..nrec {
+            reg_push(e)?
+        }
+        if agg == AGG_NONE {
+            for i in 0usize..nslot {
+                sn := ldu(e.ws, slots + i * 4)
+                eval_column(e, sn, base + i)?
+            }
+        } else {
+            rec := e.slot_rec
+            rlen_ := e.slot_len
+            for i in 0usize..prefix {
+                if rec != 0 {
+                    record_column(e, rec, rlen_, i, base + i)?
+                } else {
+                    set_null(e, base + i)
+                }
+            }
+        }
+        for i in 0usize..nextra {
+            x := ldu(e.ws, wb + WB_EXTRAS + i * 4)
+            eval(e, x, base + prefix + i)?
+        }
+        for k in 0usize..nfun {
+            fd := fds + k * FD_BYTES
+            fnode := ldu(e.ws, fd + FD_NODE)
+            argf := ldu(e.ws, fd + FD_ARGF)
+            a := nc(e, fnode)
+            i := 0usize
+            for a != 0 {
+                eval(e, a, base + argf + i)?
+                i += 1
+                a = nnext(e, a)
+            }
+            filtf := ldu(e.ws, fd + FD_FILTF)
+            if filtf != NO_COL {
+                let fx = nff(e, fnode)
+                v := eval_truth(e, fx)?
+                set_int(e, base + filtf, if v == 1 {
+                    1i64
+                } else {
+                    0i64
+                })
+            }
+        }
+        for g in 0usize..ngrp {
+            gd := grps + g * GD_BYTES
+            def := ldu(e.ws, gd + GD_DEF)
+            keyf := ldu(e.ws, gd + GD_KEYF)
+            i := 0usize
+            p := na(e, def)
+            for p != 0 {
+                let px = na(e, p)
+                eval(e, px, base + keyf + i)?
+                i += 1
+                p = nnext(e, p)
+            }
+            o := nb(e, def)
+            for o != 0 {
+                let ox = na(e, o)
+                eval(e, ox, base + keyf + i)?
+                i += 1
+                o = nnext(e, o)
+            }
+        }
+        rec2 := sort_push(e, base, nrec)?
+        list_push(e, rec2)?
+        e.rtop = save
+        arena_reset(e, mark)
+    }
+    ok(list_finish(e, lend))
+}
+
+// Position of record `rec` in the insertion-ordered (address-ordered) list.
+fn win_ordinal(e: &Engine, idx0: usize, n: usize, rec: usize) -> usize {
+    lo := 0usize
+    hi := n
+    for lo + 1 < hi {
+        mid := (lo + hi) / 2
+        if ldu(e.ws, idx0 + mid * 4) <= rec {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+fn win_stage2(e: &mut Engine, wb: usize, ord: usize, n: usize, idx0: usize, cells: usize, pg: usize, gs: usize, slab: usize, slab_end: usize) -> void!db.Error {
+    ngrp := ldu(e.ws, wb + WB_NGRP)
+    grps := ldu(e.ws, wb + WB_GRPS)
+    nfun := ldu(e.ws, wb + WB_NFUN)
+    fds := ldu(e.ws, wb + WB_FDS)
+    g := ngrp
+    for g > 0 {
+        g -= 1
+        gd := grps + g * GD_BYTES
+        np := ldu(e.ws, gd + GD_NPART)
+        no := ldu(e.ws, gd + GD_NORD)
+        keyf := ldu(e.ws, gd + GD_KEYF)
+        ginfo := ldu(e.ws, gd + GD_INFO)
+        if np + no > 0 {
+            map := keymap_range(e, keyf, np + no, ginfo)?
+            sort_records(e, ord, n, map, np + no)?
+        }
+        pmap := keymap_range(e, keyf, np, ginfo)?
+        omap := keymap_range(e, keyf + np, no, ginfo + np * 2)?
+        i := 0usize
+        for i < n {
+            j := i + 1
+            if np > 0 {
+                for j < n {
+                    a := ldu(e.ws, ord + (j - 1) * 4)
+                    b := ldu(e.ws, ord + j * 4)
+                    if keymap_compare(e, a, b, pmap, np)? != 0 {
+                        break
+                    }
+                    j += 1
+                }
+            } else {
+                j = n
+            }
+            m := j - i
+            ngp := 0usize
+            for k in 0usize..m {
+                newgrp := k == 0
+                if k > 0 && no > 0 {
+                    a2 := ldu(e.ws, ord + (i + k - 1) * 4)
+                    b2 := ldu(e.ws, ord + (i + k) * 4)
+                    newgrp = keymap_compare(e, a2, b2, omap, no)? != 0
+                }
+                if newgrp {
+                    stu(e.ws, gs + ngp * 4, k)
+                    ngp += 1
+                }
+                stu(e.ws, pg + k * 4, ngp - 1)
+            }
+            stu(e.ws, gs + ngp * 4, m)
+            for f in 0usize..nfun {
+                fd := fds + f * FD_BYTES
+                if ldu(e.ws, fd + FD_GRP) != g {
+                    continue
+                }
+                win_partition(e, wb, fd, f, ord + i * 4, m, pg, gs, ngp, cells, idx0, n, slab, slab_end)?
+            }
+            i = j
+        }
+    }
+    ok()
+}
+
+// Stores register `r` as the value of window function f for record `rec`.
+fn win_store(e: &mut Engine, cells: usize, idx0: usize, n: usize, nfun: usize, f: usize, rec: usize, r: usize) -> void!db.Error {
+    ordl := win_ordinal(e, idx0, n, rec)
+    c := cells + (ordl * nfun + f) * REG_BYTES
+    let ro = reg_at(e, r)
+    move_bytes(e.ws, ro, c, REG_BYTES)
+    t := rtype(e, r)
+    if t == T_TEXT || t == T_BLOB {
+        len := rlen(e, r)
+        o := sort_alloc(e, len)?
+        let src = roff(e, r)
+        move_bytes(e.ws, src, o, len)
+        stu(e.ws, c + 16, o)
+    }
+    ok()
+}
+
+fn win_row(e: &Engine, rows: usize, k: usize) -> usize {
+    ldu(e.ws, rows + k * 4)
+}
+
+fn win_load(e: &mut Engine, rec: usize, f: usize, r: usize) -> void!db.Error {
+    let len = rec_len(e, rec)
+    record_column(e, rec + 4, len, f, r)?
+    ok()
+}
+
+fn win_offset_error(e: &mut Engine, range: bool, start: bool) -> db.Error {
+    if range {
+        if start {
+            return fail(e, SQLITE_ERROR, "frame starting offset must be a non-negative number")
+        }
+        return fail(e, SQLITE_ERROR, "frame ending offset must be a non-negative number")
+    }
+    if start {
+        return fail(e, SQLITE_ERROR, "frame starting offset must be a non-negative integer")
+    }
+    fail(e, SQLITE_ERROR, "frame ending offset must be a non-negative integer")
+}
+
+// Frame offset check (SQLite's windowCheckValue).
+fn win_check_offset(e: &mut Engine, r: usize, range: bool, start: bool) -> void!db.Error {
+    apply_affinity(e, r, AFF_NUMERIC)?
+    t := rtype(e, r)
+    bad := false
+    if range {
+        bad = (t != T_INT && t != T_REAL) || (t == T_INT && rint(e, r) < 0) || (t == T_REAL && !(rreal(e, r) >= 0.0))
+    } else {
+        bad = t != T_INT || rint(e, r) < 0
+    }
+    if bad {
+        return err(win_offset_error(e, range, start))
+    }
+    ok()
+}
+
+fn cmp_holds(c: i32, op: u8) -> bool {
+    if op == OP_GE {
+        return c >= 0
+    }
+    if op == OP_GT {
+        return c > 0
+    }
+    if op == OP_LE {
+        return c <= 0
+    }
+    c < 0
+}
+
+// SQLite's windowCodeRangeTest: is "r1 +/- val <op> r2" true? Text and
+// blob values are not shifted; NULLs compare equal to each other and below
+// everything else (or above with NULLS LAST ordering).
+fn range_test(e: &mut Engine, op0: u8, r1: usize, val: usize, r2: usize, coll: u8, flags: u8) -> bool!db.Error {
+    desc := (flags & 1) != 0
+    bignull := (flags & 6) != 0
+    op := op0
+    if desc {
+        op = if op0 == OP_GE {
+            OP_LE
+        } else if op0 == OP_GT {
+            OP_LT
+        } else {
+            OP_GE
+        }
+    }
+    n1 := rtype(e, r1) == T_NULL
+    n2 := rtype(e, r2) == T_NULL
+    if bignull {
+        if n1 {
+            return ok(op == OP_GE || (op == OP_GT && !n2) || (op == OP_LE && n2))
+        }
+        if n2 {
+            return ok(op == OP_LE || op == OP_LT)
+        }
+    }
+    save := e.rtop
+    tmp := reg_push(e)?
+    copy_reg(e, tmp, r1)
+    t1 := rtype(e, r1)
+    if t1 != T_TEXT && t1 != T_BLOB {
+        if (op == OP_GE && !desc) || (op == OP_LE && desc) {
+            if !n1 && !n2 && cmp_holds(reg_compare(e, tmp, r2, COLL_BINARY), op) {
+                e.rtop = save
+                return ok(true)
+            }
+        }
+        binary_values(e, if desc {
+            OP_SUB
+        } else {
+            OP_ADD
+        }, 0, 0, tmp, val)?
+    }
+    tn := rtype(e, tmp) == T_NULL
+    c := 0i32
+    if tn || n2 {
+        c = if tn && n2 {
+            0i32
+        } else if tn {
+            -1i32
+        } else {
+            1i32
+        }
+    } else {
+        c = reg_compare(e, tmp, r2, coll)
+    }
+    e.rtop = save
+    ok(cmp_holds(c, op))
+}
+
+fn win_filtered(e: &mut Engine, rec: usize, filtf: usize, r: usize) -> bool!db.Error {
+    if filtf == NO_COL {
+        return ok(false)
+    }
+    win_load(e, rec, filtf, r)?
+    ok(rint(e, r) != 1)
+}
+
+fn win_load_args(e: &mut Engine, rec: usize, argf: usize, nargs: usize, argreg: usize) -> void!db.Error {
+    for i in 0usize..nargs {
+        win_load(e, rec, argf + i, argreg + i)?
+    }
+    ok()
+}
+
+fn win_excluded(e: &Engine, pg: usize, ex: usize, r: usize, k: usize) -> bool {
+    if ex == WX_CURRENT {
+        return r == k
+    }
+    if ex == WX_GROUP {
+        return ldu(e.ws, pg + r * 4) == ldu(e.ws, pg + k * 4)
+    }
+    if ex == WX_TIES {
+        return r != k && ldu(e.ws, pg + r * 4) == ldu(e.ws, pg + k * 4)
+    }
+    false
+}
+
+// Computes window function fd for the m rows of one partition.
+fn win_partition(e: &mut Engine, wb: usize, fd: usize, f: usize, rows: usize, m: usize, pg: usize, gs: usize, ngp: usize, cells: usize, idx0: usize, n: usize, slab: usize, slab_end: usize) -> void!db.Error {
+    save := e.rtop
+    r := win_partition_inner(e, wb, fd, f, rows, m, pg, gs, ngp, cells, idx0, n, slab, slab_end)
+    e.rtop = save
+    r
+}
+
+fn win_partition_inner(e: &mut Engine, wb: usize, fd: usize, f: usize, rows: usize, m: usize, pg: usize, gs: usize, ngp: usize, cells: usize, idx0: usize, n: usize, slab: usize, slab_end: usize) -> void!db.Error {
+    nfun := ldu(e.ws, wb + WB_NFUN)
+    id := ldu(e.ws, fd + FD_ID)
+    argf := ldu(e.ws, fd + FD_ARGF)
+    nargs := ldu(e.ws, fd + FD_NARGS)
+    tmp := reg_push(e)?
+    tmp2 := reg_push(e)?
+    tmp3 := reg_push(e)?
+    if id == W_ROW_NUMBER || id == W_RANK || id == W_DENSE_RANK || id == W_PERCENT_RANK || id == W_CUME_DIST {
+        for k in 0usize..m {
+            g := ldu(e.ws, pg + k * 4)
+            first := ldu(e.ws, gs + g * 4)
+            if id == W_ROW_NUMBER {
+                set_int(e, tmp, (k + 1) as i64)
+            } else if id == W_RANK {
+                set_int(e, tmp, (first + 1) as i64)
+            } else if id == W_DENSE_RANK {
+                set_int(e, tmp, (g + 1) as i64)
+            } else if id == W_PERCENT_RANK {
+                set_real(e, tmp, if m > 1 {
+                    (first as f64) / ((m - 1) as f64)
+                } else {
+                    0.0
+                })
+            } else {
+                let gend = ldu(e.ws, gs + (g + 1) * 4)
+                set_real(e, tmp, (gend as f64) / (m as f64))
+            }
+            let rec = win_row(e, rows, k)
+            win_store(e, cells, idx0, n, nfun, f, rec, tmp)?
+        }
+        return ok()
+    }
+    if id == W_NTILE {
+        let rec0 = win_row(e, rows, 0)
+        win_load(e, rec0, argf, tmp2)?
+        np := to_int(e, tmp2)
+        if np <= 0 {
+            return err(fail(e, SQLITE_ERROR, "argument of ntile must be a positive integer"))
+        }
+        total := m as i64
+        size := total / np
+        large := total - np * size
+        small := large * (size + 1)
+        for k in 0usize..m {
+            row := k as i64
+            v := 0i64
+            if size == 0 {
+                v = row + 1
+            } else if row < small {
+                v = 1 + row / (size + 1)
+            } else {
+                v = 1 + large + (row - small) / size
+            }
+            set_int(e, tmp, v)
+            let rec = win_row(e, rows, k)
+            win_store(e, cells, idx0, n, nfun, f, rec, tmp)?
+        }
+        return ok()
+    }
+    if id == W_LAG || id == W_LEAD {
+        for k in 0usize..m {
+            rec := win_row(e, rows, k)
+            if nargs == 3 {
+                win_load(e, rec, argf + 2, tmp)?
+            } else {
+                set_null(e, tmp)
+            }
+            found := false
+            target := 0usize
+            if nargs < 2 {
+                if id == W_LEAD {
+                    found = k + 1 < m
+                    target = k + 1
+                } else {
+                    found = k > 0
+                    if found {
+                        target = k - 1
+                    }
+                }
+            } else {
+                win_load(e, rec, argf + 1, tmp2)?
+                if rtype(e, tmp2) != T_NULL {
+                    set_int(e, tmp3, k as i64)
+                    binary_values(e, if id == W_LEAD {
+                        OP_ADD
+                    } else {
+                        OP_SUB
+                    }, 0, 0, tmp3, tmp2)?
+                    t := rtype(e, tmp3)
+                    v := -1i64
+                    if t == T_INT {
+                        v = rint(e, tmp3)
+                    } else if t == T_REAL {
+                        let (exact, iv) = real_as_int(rreal(e, tmp3))
+                        if exact {
+                            v = iv
+                        }
+                    }
+                    if v >= 0 && v < (m as i64) {
+                        found = true
+                        target = v as usize
+                    }
+                }
+            }
+            if found {
+                let trec = win_row(e, rows, target)
+                win_load(e, trec, argf, tmp)?
+            }
+            win_store(e, cells, idx0, n, nfun, f, rec, tmp)?
+        }
+        return ok()
+    }
+    win_frame_func(e, wb, fd, f, rows, m, pg, gs, ngp, cells, idx0, n, slab, slab_end, tmp, tmp2, tmp3)
+}
+
+// first_value, last_value, nth_value and aggregates: per-row frames.
+fn win_frame_func(e: &mut Engine, wb: usize, fd: usize, f: usize, rows: usize, m: usize, pg: usize, gs: usize, ngp: usize, cells: usize, idx0: usize, n: usize, slab: usize, slab_end: usize, tmp: usize, tmp2: usize, tmp3: usize) -> void!db.Error {
+    nfun := ldu(e.ws, wb + WB_NFUN)
+    id := ldu(e.ws, fd + FD_ID)
+    argf := ldu(e.ws, fd + FD_ARGF)
+    nargs := ldu(e.ws, fd + FD_NARGS)
+    filtf := ldu(e.ws, fd + FD_FILTF)
+    syn := ldu(e.ws, fd + FD_SYN)
+    argreg := ldu(e.ws, fd + FD_ARGREG)
+    def := ldu(e.ws, fd + FD_DEF)
+    grps := ldu(e.ws, wb + WB_GRPS)
+    gd := grps + ldu(e.ws, fd + FD_GRP) * GD_BYTES
+    np := ldu(e.ws, gd + GD_NPART)
+    keyf := ldu(e.ws, gd + GD_KEYF)
+    ginfo := ldu(e.ws, gd + GD_INFO)
+    ft := nop(e, def)
+    fl := nflags(e, def)
+    sk := fl & 7
+    ek := (fl >> 3) & 7
+    ex := (fl >> 6) & 7
+    if ft == WT_IMPLICIT {
+        ft = WT_RANGE
+        sk = WB_UNB_PREC
+        ek = WB_CURRENT
+    }
+    is_range := ft == WT_RANGE
+    sv := reg_push(e)?
+    ev := reg_push(e)?
+    xa := reg_push(e)?
+    xb := reg_push(e)?
+    soff := 0usize
+    eoff := 0usize
+    if sk == WB_PREC || sk == WB_FOLL {
+        let sx = ne_(e, def)
+        eval(e, sx, sv)?
+        win_check_offset(e, sv, is_range, true)?
+        if !is_range {
+            soff = rint(e, sv) as usize
+        }
+    }
+    if ek == WB_PREC || ek == WB_FOLL {
+        let exx = nff(e, def)
+        eval(e, exx, ev)?
+        win_check_offset(e, ev, is_range, false)?
+        if !is_range {
+            eoff = rint(e, ev) as usize
+        }
+    }
+    rcoll := e.ws[ginfo + np * 2]
+    rflags := e.ws[ginfo + np * 2 + 1]
+    keyx := keyf + np
+    // Aggregation mode: 0 incremental step/inverse, 1 recompute each frame.
+    minmax := id == A_MIN || id == A_MAX
+    fresh := ex != WX_NONE || (minmax && sk != WB_UNB_PREC)
+    gc := id == A_GROUP_CONCAT
+    agg := is_aggregate_id(id) && id < W_ROW_NUMBER
+    if agg && !fresh {
+        if gc {
+            gc_reset(e, slab, slab_end, m)?
+        } else {
+            agg_reset(e, syn)
+            e.agg_top = slab
+            e.agg_end = slab_end
+        }
+    }
+    sp := 0usize
+    epn := 0usize
+    stp := 0usize
+    inv := 0usize
+    for k in 0usize..m {
+        g := ldu(e.ws, pg + k * 4)
+        rec := win_row(e, rows, k)
+        // Frame start.
+        fs := 0usize
+        if sk == WB_UNB_PREC {
+            fs = 0
+        } else if sk == WB_CURRENT {
+            fs = if ft == WT_ROWS {
+                k
+            } else {
+                ldu(e.ws, gs + g * 4)
+            }
+        } else if ft == WT_ROWS {
+            if sk == WB_PREC {
+                fs = if soff > k {
+                    0usize
+                } else {
+                    k - soff
+                }
+            } else {
+                fs = if soff >= m - k {
+                    m
+                } else {
+                    k + soff
+                }
+            }
+        } else if ft == WT_GROUPS {
+            if sk == WB_PREC {
+                gg := if soff > g {
+                    0usize
+                } else {
+                    g - soff
+                }
+                fs = ldu(e.ws, gs + gg * 4)
+            } else {
+                fs = if soff >= ngp - g {
+                    m
+                } else {
+                    ldu(e.ws, gs + (g + soff) * 4)
+                }
+            }
+        } else {
+            win_load(e, rec, keyx, xb)?
+            for sp < m {
+                let srec = win_row(e, rows, sp)
+                win_load(e, srec, keyx, xa)?
+                inside := if sk == WB_PREC {
+                    range_test(e, OP_GE, xa, sv, xb, rcoll, rflags)?
+                } else {
+                    range_test(e, OP_LE, xb, sv, xa, rcoll, rflags)?
+                }
+                if inside {
+                    break
+                }
+                sp += 1
+            }
+            fs = sp
+        }
+        // Frame end (exclusive).
+        ep := 0usize
+        if ek == WB_UNB_FOLL {
+            ep = m
+        } else if ek == WB_CURRENT {
+            ep = if ft == WT_ROWS {
+                k + 1
+            } else {
+                ldu(e.ws, gs + (g + 1) * 4)
+            }
+        } else if ft == WT_ROWS {
+            if ek == WB_PREC {
+                ep = if eoff > k {
+                    0usize
+                } else {
+                    k - eoff + 1
+                }
+            } else {
+                ep = if eoff >= m - k {
+                    m
+                } else {
+                    k + eoff + 1
+                }
+            }
+        } else if ft == WT_GROUPS {
+            if ek == WB_PREC {
+                ep = if eoff > g {
+                    0usize
+                } else {
+                    ldu(e.ws, gs + (g - eoff + 1) * 4)
+                }
+            } else {
+                gg2 := if eoff >= ngp - g {
+                    ngp - 1
+                } else {
+                    g + eoff
+                }
+                ep = ldu(e.ws, gs + (gg2 + 1) * 4)
+            }
+        } else {
+            win_load(e, rec, keyx, xb)?
+            for epn < m {
+                let erec = win_row(e, rows, epn)
+                win_load(e, erec, keyx, xa)?
+                inside2 := if ek == WB_FOLL {
+                    range_test(e, OP_GE, xb, ev, xa, rcoll, rflags)?
+                } else {
+                    !range_test(e, OP_GT, xa, ev, xb, rcoll, rflags)?
+                }
+                if !inside2 {
+                    break
+                }
+                epn += 1
+            }
+            ep = epn
+        }
+        // Value.
+        set_null(e, tmp)
+        if id == W_FIRST_VALUE || id == W_LAST_VALUE || id == W_NTH_VALUE {
+            nth := 0usize
+            if id == W_NTH_VALUE && ex == WX_NONE {
+                nth = win_nth_arg(e, rec, argf + 1, tmp2)?
+            }
+            if ex == WX_NONE {
+                if fs < ep {
+                    pick := NO_COL
+                    if id == W_FIRST_VALUE {
+                        pick = fs
+                    } else if id == W_LAST_VALUE {
+                        pick = ep - 1
+                    } else if nth - 1 < ep - fs {
+                        pick = fs + nth - 1
+                    }
+                    if pick != NO_COL {
+                        let prec = win_row(e, rows, pick)
+                        win_load(e, prec, argf, tmp)?
+                    }
+                }
+            } else {
+                count := 0usize
+                r := fs
+                for r < ep {
+                    if !win_excluded(e, pg, ex, r, k) {
+                        count += 1
+                        take := false
+                        if id == W_FIRST_VALUE {
+                            take = count == 1
+                        } else if id == W_LAST_VALUE {
+                            take = true
+                        } else {
+                            if count == 1 {
+                                nth = win_nth_arg(e, rec, argf + 1, tmp2)?
+                            }
+                            take = count == nth
+                        }
+                        if take {
+                            let prec2 = win_row(e, rows, r)
+                            win_load(e, prec2, argf, tmp)?
+                        }
+                    }
+                    r += 1
+                }
+            }
+        } else if minmax && ex == WX_NONE && sk != WB_UNB_PREC {
+            // SQLite keeps sliding min()/max() in an index and returns the
+            // newest of equal extremes.
+            let (coll, _) = expr_collation(e, nc(e, syn))
+            r3 := fs
+            for r3 < ep {
+                let mrec = win_row(e, rows, r3)
+                if !win_filtered(e, mrec, filtf, tmp2)? {
+                    win_load(e, mrec, argf, tmp3)?
+                    if rtype(e, tmp3) != T_NULL {
+                        better := rtype(e, tmp) == T_NULL
+                        if !better {
+                            c := reg_compare(e, tmp3, tmp, coll)
+                            better = if id == A_MIN {
+                                c <= 0
+                            } else {
+                                c >= 0
+                            }
+                        }
+                        if better {
+                            copy_reg(e, tmp, tmp3)
+                        }
+                    }
+                }
+                r3 += 1
+            }
+        } else if fresh {
+            if gc {
+                gc_reset(e, slab, slab_end, m)?
+            } else {
+                agg_reset(e, syn)
+                e.agg_top = slab
+                e.agg_end = slab_end
+            }
+            r2 := fs
+            for r2 < ep {
+                if !win_excluded(e, pg, ex, r2, k) {
+                    let arec = win_row(e, rows, r2)
+                    if !win_filtered(e, arec, filtf, tmp2)? {
+                        win_load_args(e, arec, argf, nargs, argreg)?
+                        if gc {
+                            gc_step(e, slab, argreg, nargs)?
+                        } else {
+                            agg_step(e, syn)?
+                        }
+                    }
+                }
+                r2 += 1
+            }
+            if gc {
+                gc_value(e, slab, tmp, true)
+            } else {
+                agg_value(e, syn, tmp)?
+            }
+        } else {
+            for inv < fs && inv < stp {
+                win_inverse_row(e, rows, inv, fd, slab, tmp2)?
+                inv += 1
+            }
+            for stp < ep {
+                let srec2 = win_row(e, rows, stp)
+                if !win_filtered(e, srec2, filtf, tmp2)? {
+                    win_load_args(e, srec2, argf, nargs, argreg)?
+                    if gc {
+                        gc_step(e, slab, argreg, nargs)?
+                    } else {
+                        agg_step(e, syn)?
+                    }
+                }
+                stp += 1
+            }
+            for inv < fs && inv < stp {
+                win_inverse_row(e, rows, inv, fd, slab, tmp2)?
+                inv += 1
+            }
+            if gc {
+                gc_value(e, slab, tmp, false)
+            } else {
+                agg_value(e, syn, tmp)?
+            }
+        }
+        win_store(e, cells, idx0, n, nfun, f, rec, tmp)?
+    }
+    ok()
+}
+
+// nth_value's N for the current row (SQLite requires a positive integer).
+fn win_nth_arg(e: &mut Engine, rec: usize, field: usize, r: usize) -> usize!db.Error {
+    win_load(e, rec, field, r)?
+    apply_affinity(e, r, AFF_NUMERIC)?
+    if rtype(e, r) != T_INT || rint(e, r) <= 0 {
+        return err(fail(e, SQLITE_ERROR, "second argument to nth_value must be a positive integer"))
+    }
+    ok(rint(e, r) as usize)
+}
+
+fn win_inverse_row(e: &mut Engine, rows: usize, k: usize, fd: usize, slab: usize, tmp: usize) -> void!db.Error {
+    rec := win_row(e, rows, k)
+    filtf := ldu(e.ws, fd + FD_FILTF)
+    if win_filtered(e, rec, filtf, tmp)? {
+        return ok()
+    }
+    argf := ldu(e.ws, fd + FD_ARGF)
+    nargs := ldu(e.ws, fd + FD_NARGS)
+    argreg := ldu(e.ws, fd + FD_ARGREG)
+    win_load_args(e, rec, argf, nargs, argreg)?
+    id := ldu(e.ws, fd + FD_ID)
+    if id == A_GROUP_CONCAT {
+        return gc_inverse(e, slab, argreg)
+    }
+    syn := ldu(e.ws, fd + FD_SYN)
+    agg_inverse(e, syn, argreg)
+    ok()
+}
+
+// Removes a value from count/sum/total/avg state (SQLite's xInverse).
+fn agg_inverse(e: &mut Engine, syn: usize, x: usize) {
+    id := ndd(e, syn)
+    b := ne_(e, syn)
+    if id == A_COUNT_STAR {
+        let c = rint(e, b) - 1
+        set_int(e, b, c)
+        return
+    }
+    if rtype(e, x) == T_NULL {
+        return
+    }
+    if id == A_COUNT {
+        let c2 = rint(e, b) - 1
+        set_int(e, b, c2)
+        return
+    }
+    let cnt = rint(e, b) - 1
+    set_int(e, b, cnt)
+    flags := e.ws[reg_at(e, b + 1) + 1]
+    to_numeric_for_sum(e, x)
+    if (flags & 1) == 0 {
+        let (s, ovf) = sub_i64(rint(e, b + 1), to_int(e, x))
+        if ovf {
+            flags = flags | 3
+        } else {
+            set_int(e, b + 1, s)
+        }
+    } else if rtype(e, x) == T_INT {
+        let v = -(rint(e, x) as f64)
+        kbn_add(e, b, v)
+    } else {
+        let v2 = -rreal(e, x)
+        kbn_add(e, b, v2)
+    }
+    o := reg_at(e, b + 1)
+    e.ws[o + 1] = flags
+}
+
+// ---------------------------------------------------------------------------
+// group_concat as a window function: SQLite's step/inverse state machine,
+// including how it tracks separator lengths, so sliding frames match.
+
+fn gc_reset(e: &mut Engine, st: usize, lim: usize, m: usize) -> void!db.Error {
+    arr := st + GC_BYTES
+    buf := arr + m * 4 + 4
+    if buf >= lim {
+        return err(full(e, "window function workspace"))
+    }
+    stu(e.ws, st + GC_START, buf)
+    stu(e.ws, st + GC_END, buf)
+    stu(e.ws, st + GC_FIRST, 1)
+    stu(e.ws, st + GC_NACC, 0)
+    stu(e.ws, st + GC_FSEP, 0)
+    stu(e.ws, st + GC_TRACK, 0)
+    stu(e.ws, st + GC_HEAD, 0)
+    stu(e.ws, st + GC_ARR, arr)
+    stu(e.ws, st + GC_BUF, buf)
+    stu(e.ws, st + GC_LIM, lim)
+    ok()
+}
+
+fn gc_append(e: &mut Engine, st: usize, src: usize, len: usize) -> void!db.Error {
+    start := ldu(e.ws, st + GC_START)
+    end := ldu(e.ws, st + GC_END)
+    lim := ldu(e.ws, st + GC_LIM)
+    if end + len > lim {
+        buf := ldu(e.ws, st + GC_BUF)
+        used := end - start
+        move_bytes(e.ws, start, buf, used)
+        start = buf
+        end = buf + used
+        stu(e.ws, st + GC_START, start)
+        if end + len > lim {
+            return err(full(e, "window function workspace (group_concat value too large)"))
+        }
+    }
+    move_bytes(e.ws, src, end, len)
+    stu(e.ws, st + GC_END, end + len)
+    ok()
+}
+
+fn gc_step(e: &mut Engine, st: usize, x: usize, nargs: usize) -> void!db.Error {
+    if rtype(e, x) == T_NULL {
+        return ok()
+    }
+    to_text(e, x)?
+    first := ldu(e.ws, st + GC_FIRST) != 0
+    stu(e.ws, st + GC_FIRST, 0)
+    nacc := ldu(e.ws, st + GC_NACC)
+    sep := x + 1
+    if nargs < 2 {
+        if !first {
+            let comma = reg_at(e, R_TMP) + 8
+            e.ws[comma] = 44
+            gc_append(e, st, comma, 1)?
+        } else {
+            stu(e.ws, st + GC_FSEP, 1)
+        }
+    } else if !first {
+        nsep := 0usize
+        if rtype(e, sep) != T_NULL {
+            to_text(e, sep)?
+            nsep = rlen(e, sep)
+            let so = roff(e, sep)
+            gc_append(e, st, so, nsep)?
+        }
+        if nsep != ldu(e.ws, st + GC_FSEP) || ldu(e.ws, st + GC_TRACK) != 0 {
+            arr := ldu(e.ws, st + GC_ARR)
+            head := ldu(e.ws, st + GC_HEAD)
+            if ldu(e.ws, st + GC_TRACK) == 0 {
+                fsep := ldu(e.ws, st + GC_FSEP)
+                for i in 1usize..nacc {
+                    stu(e.ws, arr + (head + i) * 4, fsep)
+                }
+                stu(e.ws, st + GC_TRACK, 1)
+            }
+            stu(e.ws, arr + (head + nacc) * 4, nsep)
+        }
+    } else {
+        fsep2 := 0usize
+        if rtype(e, sep) != T_NULL {
+            to_text(e, sep)?
+            fsep2 = rlen(e, sep)
+        }
+        stu(e.ws, st + GC_FSEP, fsep2)
+    }
+    stu(e.ws, st + GC_NACC, nacc + 1)
+    let xo = roff(e, x)
+    let xl = rlen(e, x)
+    gc_append(e, st, xo, xl)
+}
+
+fn gc_inverse(e: &mut Engine, st: usize, x: usize) -> void!db.Error {
+    if rtype(e, x) == T_NULL {
+        return ok()
+    }
+    to_text(e, x)?
+    nvs := rlen(e, x)
+    nacc := ldu(e.ws, st + GC_NACC) - 1
+    stu(e.ws, st + GC_NACC, nacc)
+    head := ldu(e.ws, st + GC_HEAD)
+    if ldu(e.ws, st + GC_TRACK) != 0 {
+        if nacc > 0 {
+            arr := ldu(e.ws, st + GC_ARR)
+            nvs += ldu(e.ws, arr + (head + 1) * 4)
+        }
+    } else {
+        nvs += ldu(e.ws, st + GC_FSEP)
+    }
+    stu(e.ws, st + GC_HEAD, head + 1)
+    start := ldu(e.ws, st + GC_START)
+    end := ldu(e.ws, st + GC_END)
+    if nvs >= end - start {
+        buf := ldu(e.ws, st + GC_BUF)
+        stu(e.ws, st + GC_START, buf)
+        stu(e.ws, st + GC_END, buf)
+        stu(e.ws, st + GC_FIRST, 1)
+        stu(e.ws, st + GC_TRACK, 0)
+    } else {
+        stu(e.ws, st + GC_START, start + nvs)
+    }
+    ok()
+}
+
+// `fin` selects xFinalize (frames recomputed for EXCLUDE) over xValue,
+// which returns a one-byte string holding NUL for an empty result.
+fn gc_value(e: &mut Engine, st: usize, dst: usize, fin: bool) {
+    start := ldu(e.ws, st + GC_START)
+    end := ldu(e.ws, st + GC_END)
+    if end > start {
+        set_bytes(e, dst, T_TEXT, start, end - start)
+    } else if ldu(e.ws, st + GC_NACC) > 0 {
+        e.ws[start] = 0
+        set_bytes(e, dst, T_TEXT, start, if fin {
+            0usize
+        } else {
+            1usize
+        })
+    } else {
+        set_null(e, dst)
+    }
+}
+
+// Stage 3: result columns (and ORDER BY keys) of every row in window order.
+fn win_emit(e: &mut Engine, s: usize, info: usize, wb: usize, ord: usize, n: usize, idx0: usize, cells: usize, kind: usize, side: i64) -> usize!db.Error {
+    nfun := ldu(e.ws, wb + WB_NFUN)
+    nres := iget(e, info, I_NRES)
+    resreg := iget(e, info, I_RESREG)
+    ext := ndd(e, s)
+    order := if kind == 0 && ext != 0 {
+        nc(e, ext)
+    } else {
+        0usize
+    }
+    norder := list_len(e, order)
+    lend := list_begin(e)
+    for p in 0usize..n {
+        rec := ldu(e.ws, ord + p * 4)
+        ordl := win_ordinal(e, idx0, n, rec)
+        e.slot_rec = rec + 4
+        let len = rec_len(e, rec)
+        e.slot_len = len
+        stu(e.ws, wb + WB_CUR, cells + ordl * nfun * REG_BYTES)
+        mark := e.arena_top
+        compute_results(e, s, info)?
+        save := e.rtop
+        base := e.rtop
+        rec2 := 0usize
+        if kind == 0 {
+            for _ in 0usize..(norder + nres) {
+                reg_push(e)?
+            }
+            o := order
+            k := 0usize
+            for o != 0 {
+                let ox = na(e, o)
+                eval(e, ox, base + k)?
+                k += 1
+                o = nnext(e, o)
+            }
+            for i in 0usize..nres {
+                copy_reg(e, base + norder + i, resreg + i)
+            }
+            rec2 = sort_push(e, base, norder + nres)?
+        } else {
+            for _ in 0usize..(nres + 1) {
+                reg_push(e)?
+            }
+            for i in 0usize..nres {
+                copy_reg(e, base + i, resreg + i)
+            }
+            set_int(e, base + nres, side)
+            rec2 = sort_push(e, base, nres + 1)?
+        }
+        list_push(e, rec2)?
+        e.rtop = save
+        arena_reset(e, mark)
+    }
+    ok(lend)
+}

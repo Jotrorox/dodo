@@ -18,8 +18,9 @@ import "std/text"
 //         id := row.int(0)
 //     }
 //
-// The file format, rollback journal and locking protocol are SQLite's, so
-// the same file can be used by SQLite itself.
+// The file format, rollback journal, write-ahead log (PRAGMA journal_mode =
+// WAL, with its -wal and -shm files) and locking protocols are SQLite's, so
+// the same file can be used by SQLite itself, concurrently.
 
 pub struct Options {
     pub read_only: bool
@@ -108,7 +109,7 @@ pub struct Connection {
     }
 
     pub fn changes(&self) -> u64 {
-        self.e.changes
+        self.e.last_changes
     }
 
     pub fn total_changes(&self) -> u64 {
@@ -122,6 +123,14 @@ pub struct Connection {
     // True inside BEGIN ... COMMIT/ROLLBACK.
     pub fn in_transaction(&self) -> bool {
         self.e.explicit_txn
+    }
+
+    // Test hook for crash-recovery tests: the process aborts at `point` of
+    // the next multi-file commit (1: super-journal written, 2: first
+    // database file written, 3: all files written, 4: super-journal
+    // deleted). 0 disables it.
+    pub fn set_crash_point_for_testing(&mut self, point: u32) {
+        self.e.test_crash = point
     }
 
     // Waits up to `milliseconds` for other processes' locks (like
@@ -177,9 +186,22 @@ pub struct Connection {
         if e.tk == TK_EOF {
             return ok(0)
         }
-        // A CREATE TRIGGER body could contain semicolons; triggers are not
-        // supported, so the first top-level semicolon ends the statement.
-        for e.tk != TK_EOF && e.tk != TK_SEMI {
+        // Like sqlite3_complete: inside CREATE [TEMP] TRIGGER, only a
+        // semicolon after END ends the statement.
+        trigger := false
+        if is_kw(e, "CREATE") {
+            next_token(e)
+            if is_kw(e, "TEMP") || is_kw(e, "TEMPORARY") {
+                next_token(e)
+            }
+            trigger = is_kw(e, "TRIGGER")
+        }
+        after_end := false
+        for e.tk != TK_EOF {
+            if e.tk == TK_SEMI && (!trigger || after_end) {
+                break
+            }
+            after_end = e.tk == TK_ID && is_kw(e, "END")
             next_token(e)
         }
         if e.tk != TK_SEMI && bytes.len < all.len {
@@ -341,18 +363,19 @@ fn prepare_one(e: &mut Engine, slot: usize, sql: &str) -> void!db.Error {
     if e.active == slot {
         stmt_finish(e, slot, true)?
     }
-    // Schema resolution needs the current schema.
-    begin_read(e)?
+    // Schema resolution needs the current schema (of every database:
+    // read transactions this starts end afterwards, even inside BEGIN).
+    fresh := begin_read_mask(e, 4095)?
     r := load_schema(e)
     match r {
         ok() => {},
         err(reason) => {
-            end_read(e)
+            release_reads(e, fresh)
             return err(reason)
         },
     }
     res := prepare_slot(e, slot, bytes)
-    end_read(e)
+    release_reads(e, fresh)
     res?
     tail := sh(e, slot, SH_TAIL)
     if tail < bytes.len {
