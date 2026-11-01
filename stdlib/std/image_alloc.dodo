@@ -694,8 +694,10 @@ pub struct Image<A> {
         return self.adopt_icc(data)
     }
     // A raw EXIF payload is copied. A compressed one (Brotli in a JPEG XL
-    // brob box) is decoded into a buffer of four times its stored size (at
-    // least 4 KiB), doubled while that is too small, up to MAX_EXIF_SIZE.
+    // brob box) is decoded with a workspace of meta.scratch_size() bytes
+    // (the exact need of the stream's prefix code tables, read from its
+    // headers) into a buffer of four times its stored size (at least 4
+    // KiB), doubled while that is too small, up to MAX_EXIF_SIZE.
     fn adopt_exif(&mut self, data: &[u8], item: &meta.Item) -> void!Error {
         if item.encoding == meta.ENCODING_RAW {
             match item.bytes(data) {
@@ -713,11 +715,29 @@ pub struct Image<A> {
         if size < 4096 {
             size = 4096
         }
+        need := match meta.scratch_size(data, item) {
+            ok(value) => {
+                value
+            }
+            err(_) => {
+                return ok()
+            }
+        }
+        work := allocate(&self.allocator, need)?
         for size <= MAX_EXIF_SIZE {
-            buffer := allocate(&self.allocator, size)?
-            outcome := meta.decode(data, item, buffer.slice_mut())
+            buffer := match allocate(&self.allocator, size) {
+                ok(value) => {
+                    value
+                }
+                err(reason) => {
+                    release(&self.allocator, work)
+                    return err(Error.Allocation(reason))
+                }
+            }
+            outcome := meta.decode_with_scratch(data, item, buffer.slice_mut(), work.slice_mut())
             match outcome {
                 ok(length) => {
+                    release(&self.allocator, work)
                     buffer.length = length
                     previous := mem.replace(&mut self.exif_data, buffer)
                     release(&self.allocator, previous)
@@ -726,12 +746,14 @@ pub struct Image<A> {
                 err(reason) => {
                     release(&self.allocator, buffer)
                     if reason != pixels.Error.BufferTooSmall {
+                        release(&self.allocator, work)
                         return ok()
                     }
                 }
             }
             size = 2 * size
         }
+        release(&self.allocator, work)
         return ok()
     }
     fn adopt_icc(&mut self, data: &[u8]) -> void!Error {

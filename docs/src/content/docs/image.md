@@ -141,8 +141,18 @@ covers the 4-byte inner box type and the Brotli stream); nothing is copied.
 output)` copies, inflates or decompresses one with
 [`std/compress/brotli`](compression.md#brotli). A decoded EXIF payload
 starts at the TIFF header whatever its encoding; for a `brob` box `output`
-must also hold the 4-byte offset field that precedes it. Brotli decoding
-keeps 256 KiB of workspace on the stack.
+must also hold the 4-byte offset field that precedes it. `meta.decode`
+decodes Brotli with a 16 KiB stack workspace (about 30 KiB of stack in all
+unoptimized, 23 KiB optimized), enough for streams the reference encoder
+writes for payloads of up to 128 KiB; a stream whose prefix code tables
+need more fails with `TooLarge`. `meta.decode_with_scratch(&data, &item,
+&mut output, &mut scratch)` takes the workspace from caller scratch of
+`meta.scratch_size(&data, &item)` bytes instead (14 KiB of stack
+unoptimized, 7 KiB optimized) and decodes every valid stream: the size,
+read from the stream's headers, is exact for almost every stream (a few
+KiB for typical metadata) and at most about 1.3 MiB; it is zero for the
+other encodings. Inflating a zlib item takes about 20 KiB of stack
+unoptimized, 8 KiB optimized.
 `image.icc(&data, &mut output, &mut scratch)` returns the decoded ICC profile
 directly; only JPEG XL needs scratch (`image.icc_scratch_size(&data)`). It
 is the profile of the decoded pixels: lossy (XYB) JPEG XL files with an
@@ -388,7 +398,9 @@ Errors are `image_alloc.Error`: `Image(pixels.Error)`,
 `Allocation(error.AllocError)` or `File(fs.FileError)`, so `?` wraps each in
 a function returning `image_alloc.Error`; `image_alloc.error_name(&error)`
 is a short fixed description. EXIF from Brotli-compressed JPEG XL `brob`
-boxes is decompressed. EXIF and ICC payloads that cannot be read (a damaged
+boxes is decompressed with a workspace allocated at the size
+`meta.scratch_size` reports and released afterwards, so every valid
+stream decodes. EXIF and ICC payloads that cannot be read (a damaged
 chunk or compressed stream) are skipped rather than failing the decode; ICC profiles above 64 MiB and files above
 `MAX_FILE_SIZE` (1 GiB) are not loaded.
 

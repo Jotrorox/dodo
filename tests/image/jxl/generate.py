@@ -34,6 +34,8 @@ import math, os, shutil, struct, subprocess, sys, zlib, random, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import codestream as cs
+sys.path.insert(1, os.path.join(HERE, '..', '..', 'compress', 'brotli'))
+import brotli_wide
 OUT = sys.argv[1] if len(sys.argv) > 1 else HERE
 TMP = tempfile.mkdtemp(prefix='jxlgen')
 
@@ -1317,6 +1319,12 @@ def main():
     meta = write_png('meta', w, h, 3, 8, gradient, chunk(b'eXIf', exif) + chunk(b'iTXt', xmp))
     add('meta_brob', meta, ['-d', '0'], 0)
     add('meta_raw', meta, ['-d', '0', '--compress_boxes=0'], 0)
+    # meta_raw with its Exif box in a brob box whose Brotli stream needs
+    # about 246,000 workspace words (tests/compress/brotli/brotli_wide.py).
+    with open(os.path.join(OUT, 'meta_raw.jxl'), 'rb') as f:
+        wide = brotli_wide.wide_brob(f.read())
+    with open(os.path.join(OUT, 'meta_wide_brob.jxl'), 'wb') as f:
+        f.write(wide)
     icc = make_icc()
     open(os.path.join(OUT, 'profile.icc'), 'wb').write(icc)
     iccp = chunk(b'iCCP', b'test\x00\x00' + zlib.compress(icc))
