@@ -498,8 +498,28 @@ fn compile(args: &Args, loaded: &package::Loaded, out: &Path) -> Result<(), Stri
     let mut options = args.options.clone();
     options.entry = args.emit == Emit::Exe;
     options.sources = loaded.sources.clone();
-    let generated = codegen::generate(&context, &loaded.program, &options)
-        .map_err(|e| format!("code generation failed: {e}"))?;
+    let generated = codegen::generate(&context, &loaded.program, &options).map_err(|e| {
+        let text = e.to_string();
+        // Map an embedded "Span { start: N" to file:line for diagnosis.
+        let location = text
+            .split("Span { start: ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .and_then(|at| {
+                loaded
+                    .sources
+                    .iter()
+                    .filter(|s| s.start <= at && at <= s.start + s.text.len())
+                    .max_by_key(|s| s.start)
+                    .map(|s| {
+                        let line = s.text[..at - s.start].matches('\n').count() + 1;
+                        format!(" ({}:{line})", s.path.display())
+                    })
+            })
+            .unwrap_or_default();
+        format!("code generation failed: {text}{location}")
+    })?;
     match args.emit {
         Emit::Ir => generated
             .module

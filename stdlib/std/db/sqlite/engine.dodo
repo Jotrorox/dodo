@@ -1,0 +1,823 @@
+package sqlite
+
+import "core/mem"
+import "core/ptr"
+import "std/db"
+import "std/fs"
+import "std/math"
+
+// The engine works entirely inside the caller's workspace. Every region is
+// addressed by byte offset; nothing allocates. Regions:
+//
+//   path | message | schema | statement cache | registers | cursors |
+//   arena (per-row values) | sorter stack | journal bitmap | statement
+//   journal | gather buffers | page cache metadata | page cache
+//
+// Pages are referred to by offset into `ws`; an offset obtained from
+// pg_fetch stays valid until the next cache miss evicts the least recently
+// used page, so code re-fetches (a cheap hash lookup) after fetching others.
+
+pub const MIN_WORKSPACE_BYTES: usize = 786432
+pub const WORKSPACE_BYTES: usize = 2097152
+
+const PATH_CAP: usize = 1024
+const MSG_CAP: usize = 512
+const REG_BYTES: usize = 32
+const NREGS: usize = 1024
+const CURSOR_BYTES: usize = 512
+const NCURSORS: usize = 48
+const MAX_DEPTH: usize = 24
+const SLOT_META: usize = 16
+const GATHER_PAGES: usize = 13
+
+// SQLite result codes (the native code carried by db.Error).
+const SQLITE_ERROR: i32 = 1
+const SQLITE_INTERNAL: i32 = 2
+const SQLITE_PERM: i32 = 3
+const SQLITE_ABORT: i32 = 4
+const SQLITE_BUSY: i32 = 5
+const SQLITE_NOMEM: i32 = 7
+const SQLITE_READONLY: i32 = 8
+const SQLITE_IOERR: i32 = 10
+const SQLITE_CORRUPT: i32 = 11
+const SQLITE_FULL: i32 = 13
+const SQLITE_CANTOPEN: i32 = 14
+const SQLITE_SCHEMA: i32 = 17
+const SQLITE_TOOBIG: i32 = 18
+const SQLITE_CONSTRAINT: i32 = 19
+const SQLITE_MISMATCH: i32 = 20
+const SQLITE_MISUSE: i32 = 21
+const SQLITE_RANGE: i32 = 25
+const SQLITE_NOTADB: i32 = 26
+const SQLITE_CONSTRAINT_CHECK: i32 = 275
+const SQLITE_CONSTRAINT_NOTNULL: i32 = 1299
+const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = 1555
+const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067
+
+// Value types held in registers.
+const T_NULL: u8 = 0
+const T_INT: u8 = 1
+const T_REAL: u8 = 2
+const T_TEXT: u8 = 3
+const T_BLOB: u8 = 4
+
+// Column affinities.
+const AFF_BLOB: u8 = 0
+const AFF_TEXT: u8 = 1
+const AFF_NUMERIC: u8 = 2
+const AFF_INTEGER: u8 = 3
+const AFF_REAL: u8 = 4
+const AFF_NONE: u8 = 5
+
+// Collating sequences.
+const COLL_BINARY: u8 = 0
+const COLL_NOCASE: u8 = 1
+const COLL_RTRIM: u8 = 2
+
+const PENDING_BYTE: u64 = 1073741824
+const RESERVED_BYTE: u64 = 1073741825
+const SHARED_FIRST: u64 = 1073741826
+const SHARED_SIZE: u64 = 510
+
+const LOCK_NONE: u32 = 0
+const LOCK_SHARED: u32 = 1
+const LOCK_RESERVED: u32 = 2
+const LOCK_EXCLUSIVE: u32 = 4
+
+struct Engine {
+    ws: &mut[u8]
+    file: Option<fs.File>
+    journal: Option<fs.File>
+    memory: bool
+    readonly: bool
+    create: bool
+    path_len: usize
+    msg_len: usize
+
+    // Region offsets and sizes.
+    schema_off: usize
+    schema_cap: usize
+    stmt_off: usize
+    stmt_slot: usize
+    stmt_slots: usize
+    reg_off: usize
+    cur_off: usize
+    arena_off: usize
+    arena_cap: usize
+    arena_top: usize
+    sort_off: usize
+    sort_cap: usize
+    sort_top: usize
+    sort_hi: usize
+    bitmap_off: usize
+    bitmap_bytes: usize
+    sj_off: usize
+    sj_cap: usize
+    sj_used: usize
+    sj_active: bool
+    sj_overflow: bool
+    sj_pages: u32
+    gather_a: usize
+    gather_b: usize
+    meta_off: usize
+    hash_off: usize
+    hash_cap: usize
+    cache_off: usize
+    cache_end: usize
+    nslots: usize
+    scratch_page: usize
+    cell_buf: usize
+    cell_buf2: usize
+    mj_off: usize
+    mj_cap: usize
+    mj_used: usize
+    stamp: u64
+
+    // Database file state.
+    page_size: usize
+    usable: usize
+    reserved: usize
+    db_pages: u32
+    file_pages: u32
+    disk_pages: u32
+    lock: u32
+    shared_byte: u64
+    write_txn: bool
+    explicit_txn: bool
+    journal_open: bool
+    journal_synced: bool
+    journal_records: u32
+    journal_nonce: u32
+    db_written: bool
+    initialized: bool
+    schema_format: u32
+    change_counter: u32
+    schema_cookie: u32
+    schema_loaded: bool
+    schema_gen: u32
+    schema_len: usize
+    schema_objs: usize
+    schema_pool: usize
+    rng: u64
+    busy_retries: u32
+
+    // Statement results.
+    last_rowid: i64
+    changes: u64
+    total_changes: u64
+    error_offset: i32
+
+    // Parser state.
+    sb: usize
+    src: usize
+    src_end: usize
+    pos: usize
+    tk: u8
+    ts: usize
+    tl: usize
+    last_end: usize
+    node_off: usize
+    node_n: usize
+    pool_lo: usize
+    nparam: usize
+    named_n: usize
+    named_off: usize
+    depth: usize
+    auto_target: usize
+
+    // Resolution state.
+    cur_alloc: usize
+    reg_alloc: usize
+    ctx_n: usize
+    ctx_off: usize
+    agg_list: usize
+    agg_n: usize
+    subq_list: usize
+    subq_n: usize
+    min_ctx: usize
+    regctx_t: usize
+    regctx_base: usize
+    excluded_base: usize
+    group_list: usize
+    view_depth: usize
+    cte_off: usize
+    cte_n: usize
+    queue_rec: usize
+    ret_start: usize
+    bal_append: bool
+
+    // Execution state.
+    rtop: usize
+    param_reg: usize
+    arena_base: usize
+    slot_rec: usize
+    slot_len: usize
+    slot_first: usize
+    slot_first_len: usize
+    agg_top: usize
+    agg_end: usize
+    agg_hit: usize
+    active: usize
+
+    fn file_open(&self) -> bool {
+        match &self.file {
+            some(_) => true,
+            none => self.memory && self.nslots > 0,
+        }
+    }
+}
+
+fn mem_bytes(s: &str) -> &[u8] {
+    mem.str_bytes(s)
+}
+
+// ---------------------------------------------------------------------------
+// Errors and messages
+
+fn kind_for(code: i32) -> db.ErrorKind {
+    base := code & 255
+    if base == SQLITE_BUSY || base == 6 {
+        return db.ErrorKind.Busy
+    }
+    if base == SQLITE_CONSTRAINT {
+        return db.ErrorKind.Constraint
+    }
+    if base == SQLITE_READONLY {
+        return db.ErrorKind.ReadOnly
+    }
+    if base == SQLITE_IOERR {
+        return db.ErrorKind.Io
+    }
+    if base == SQLITE_CORRUPT || base == SQLITE_NOTADB {
+        return db.ErrorKind.Corrupt
+    }
+    if base == SQLITE_FULL || base == SQLITE_NOMEM || base == SQLITE_TOOBIG {
+        return db.ErrorKind.Capacity
+    }
+    if base == SQLITE_CANTOPEN {
+        return db.ErrorKind.Connect
+    }
+    if base == SQLITE_SCHEMA {
+        return db.ErrorKind.Schema
+    }
+    if base == SQLITE_MISMATCH {
+        return db.ErrorKind.Type
+    }
+    if base == SQLITE_MISUSE {
+        return db.ErrorKind.Misuse
+    }
+    if base == SQLITE_RANGE {
+        return db.ErrorKind.Range
+    }
+    if base == SQLITE_PERM {
+        return db.ErrorKind.Auth
+    }
+    if base == SQLITE_INTERNAL {
+        return db.ErrorKind.Internal
+    }
+    if base == SQLITE_ABORT {
+        return db.ErrorKind.Interrupted
+    }
+    db.ErrorKind.Syntax
+}
+
+fn constraint_for(code: i32) -> db.Constraint {
+    if code == SQLITE_CONSTRAINT_UNIQUE {
+        return db.Constraint.Unique
+    }
+    if code == SQLITE_CONSTRAINT_PRIMARYKEY {
+        return db.Constraint.PrimaryKey
+    }
+    if code == SQLITE_CONSTRAINT_NOTNULL {
+        return db.Constraint.NotNull
+    }
+    if code == SQLITE_CONSTRAINT_CHECK {
+        return db.Constraint.Check
+    }
+    if code == 787 {
+        return db.Constraint.ForeignKey
+    }
+    if (code & 255) == SQLITE_CONSTRAINT {
+        return db.Constraint.Other
+    }
+    db.Constraint.None
+}
+
+fn make_error(e: &mut Engine, code: i32) -> db.Error {
+    db.Error { kind: kind_for(code), constraint: constraint_for(code), code, position: e.error_offset }
+}
+
+// Records `message` and returns the error for `code`.
+fn fail(e: &mut Engine, code: i32, message: &str) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, message)
+    make_error(e, code)
+}
+
+// Message with a quoted detail appended: "<message><detail>".
+fn fail2(e: &mut Engine, code: i32, message: &str, detail_off: usize, detail_len: usize) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, message)
+    msg_add_ws(e, detail_off, detail_len)
+    make_error(e, code)
+}
+
+fn msg_add(e: &mut Engine, text: &str) {
+    bytes := mem.str_bytes(text)
+    for &b in bytes {
+        if e.msg_len < MSG_CAP {
+            e.ws[PATH_CAP + e.msg_len] = b
+            e.msg_len += 1
+        }
+    }
+}
+
+fn msg_add_ws(e: &mut Engine, off: usize, len: usize) {
+    for i in 0usize..len {
+        if e.msg_len < MSG_CAP {
+            e.ws[PATH_CAP + e.msg_len] = e.ws[off + i]
+            e.msg_len += 1
+        }
+    }
+}
+
+fn msg_add_int(e: &mut Engine, value: i64) {
+    digits := [0u8; 24]
+    n := format_i64(&mut digits, value)
+    for i in 0usize..n {
+        if e.msg_len < MSG_CAP {
+            e.ws[PATH_CAP + e.msg_len] = digits[i]
+            e.msg_len += 1
+        }
+    }
+}
+
+fn io_fail(e: &mut Engine, what: &str) -> db.Error {
+    fail(e, SQLITE_IOERR, what)
+}
+
+fn corrupt(e: &mut Engine) -> db.Error {
+    fail(e, SQLITE_CORRUPT, "database disk image is malformed")
+}
+
+fn full(e: &mut Engine, what: &str) -> db.Error {
+    e.msg_len = 0
+    msg_add(e, "workspace exhausted: ")
+    msg_add(e, what)
+    make_error(e, SQLITE_FULL)
+}
+
+// ---------------------------------------------------------------------------
+// Byte helpers
+
+fn rd16(b: &[u8], o: usize) -> usize {
+    ((b[o] as usize) << 8) | (b[o + 1] as usize)
+}
+
+fn wr16(b: &mut[u8], o: usize, v: usize) {
+    b[o] = ((v >> 8) & 255) as u8
+    b[o + 1] = (v & 255) as u8
+}
+
+fn rd32(b: &[u8], o: usize) -> u32 {
+    ((b[o] as u32) << 24) | ((b[o + 1] as u32) << 16) | ((b[o + 2] as u32) << 8) | (b[o + 3] as u32)
+}
+
+fn wr32(b: &mut[u8], o: usize, v: u32) {
+    b[o] = ((v >> 24) & 255) as u8
+    b[o + 1] = ((v >> 16) & 255) as u8
+    b[o + 2] = ((v >> 8) & 255) as u8
+    b[o + 3] = (v & 255) as u8
+}
+
+// Native-order helpers for engine bookkeeping (little endian).
+fn ld32(b: &[u8], o: usize) -> u32 {
+    (b[o] as u32) | ((b[o + 1] as u32) << 8) | ((b[o + 2] as u32) << 16) | ((b[o + 3] as u32) << 24)
+}
+
+fn st32(b: &mut[u8], o: usize, v: u32) {
+    b[o] = (v & 255) as u8
+    b[o + 1] = ((v >> 8) & 255) as u8
+    b[o + 2] = ((v >> 16) & 255) as u8
+    b[o + 3] = ((v >> 24) & 255) as u8
+}
+
+fn ldu(b: &[u8], o: usize) -> usize {
+    ld32(b, o) as usize
+}
+
+fn stu(b: &mut[u8], o: usize, v: usize) {
+    st32(b, o, v as u32)
+}
+
+fn ld64(b: &[u8], o: usize) -> u64 {
+    (ld32(b, o) as u64) | ((ld32(b, o + 4) as u64) << 32)
+}
+
+fn st64(b: &mut[u8], o: usize, v: u64) {
+    st32(b, o, (v & 0xffffffffu64) as u32)
+    st32(b, o + 4, (v >> 32) as u32)
+}
+
+fn ld16(b: &[u8], o: usize) -> usize {
+    (b[o] as usize) | ((b[o + 1] as usize) << 8)
+}
+
+fn st16(b: &mut[u8], o: usize, v: usize) {
+    b[o] = (v & 255) as u8
+    b[o + 1] = ((v >> 8) & 255) as u8
+}
+
+fn i2u(v: i64) -> u64 {
+    if v >= 0 {
+        return v as u64
+    }
+    ((v + 9223372036854775807 + 1) as u64) + 9223372036854775808u64
+}
+
+fn u2i(v: u64) -> i64 {
+    if v < 9223372036854775808u64 {
+        return v as i64
+    }
+    ((v - 9223372036854775808u64) as i64) - 9223372036854775807 - 1
+}
+
+fn f2u(v: f64) -> u64 {
+    math.to_bits(v)
+}
+
+fn u2f(v: u64) -> f64 {
+    math.from_bits(v)
+}
+
+// Moves `len` bytes inside the workspace; ranges may overlap.
+fn move_bytes(b: &mut[u8], src: usize, dst: usize, len: usize) {
+    if len == 0 || src == dst {
+        return
+    }
+    core.assert(src + len <= b.len && dst + len <= b.len)
+    unsafe {
+        base := ptr.as_mut_ptr(b)
+        ptr.copy(ptr.offset(base, src as isize) as *const u8, ptr.offset(base, dst as isize), len)
+    }
+}
+
+fn zero_bytes(b: &mut[u8], off: usize, len: usize) {
+    if len == 0 {
+        return
+    }
+    core.assert(off + len <= b.len)
+    unsafe {
+        base := ptr.as_mut_ptr(b)
+        ptr.write_bytes(ptr.offset(base, off as isize), 0u8, len)
+    }
+}
+
+fn copy_in(b: &mut[u8], dst: usize, src: &[u8]) {
+    core.assert(dst + src.len <= b.len)
+    if src.len == 0 {
+        return
+    }
+    unsafe {
+        base := ptr.as_mut_ptr(b)
+        ptr.copy_nonoverlapping(ptr.as_ptr(src), ptr.offset(base, dst as isize), src.len)
+    }
+}
+
+// SQLite varint: big-endian groups of 7 bits, 9th byte carries 8 bits.
+fn get_varint(b: &[u8], o: usize) -> (u64, usize) {
+    v := 0u64
+    for i in 0usize..8 {
+        byte := b[o + i]
+        v = (v << 7) | ((byte & 127) as u64)
+        if byte < 128 {
+            return (v, i + 1)
+        }
+    }
+    v = (v << 8) | (b[o + 8] as u64)
+    (v, 9)
+}
+
+fn varint_len(v: u64) -> usize {
+    if v <= 127 {
+        return 1
+    }
+    if v <= 16383 {
+        return 2
+    }
+    if (v >> 56) != 0 {
+        return 9
+    }
+    n := 1usize
+    x := v >> 7
+    for x != 0 {
+        n += 1
+        x = x >> 7
+    }
+    n
+}
+
+fn put_varint(b: &mut[u8], o: usize, v: u64) -> usize {
+    if v <= 127 {
+        b[o] = v as u8
+        return 1
+    }
+    if (v >> 56) != 0 {
+        b[o + 8] = (v & 255) as u8
+        x := v >> 8
+        for k in 0usize..8 {
+            i := 7 - k
+            b[o + i] = ((x & 127) as u8) | 128
+            x = x >> 7
+        }
+        return 9
+    }
+    n := varint_len(v)
+    x := v
+    for k in 0usize..n {
+        i := n - 1 - k
+        byte := (x & 127) as u8
+        if k != 0 {
+            b[o + i] = byte | 128
+        } else {
+            b[o + i] = byte
+        }
+        x = x >> 7
+    }
+    n
+}
+
+fn format_i64(out: &mut[u8], value: i64) -> usize {
+    tmp := [0u8; 24]
+    n := 0usize
+    neg := value < 0
+    u := i2u(value)
+    if neg {
+        // magnitude of a negative two's complement value
+        u = (18446744073709551615u64 - u) + 1
+    }
+    if u == 0 {
+        tmp[0] = 48
+        n = 1
+    }
+    for u != 0 {
+        tmp[n] = 48 + ((u % 10) as u8)
+        u = u / 10
+        n += 1
+    }
+    k := 0usize
+    if neg {
+        out[0] = 45
+        k = 1
+    }
+    for i in 0usize..n {
+        out[k + i] = tmp[n - 1 - i]
+    }
+    k + n
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+
+fn layout(e: &mut Engine) -> void!db.Error {
+    total := e.ws.len
+    o := PATH_CAP + MSG_CAP
+    e.schema_cap = total / 16
+    if e.schema_cap < 32768 {
+        e.schema_cap = 32768
+    }
+    e.schema_off = o
+    o += e.schema_cap
+    // Prepared-statement slots, the transient slot, and the schema slot.
+    e.stmt_slots = 8
+    e.stmt_slot = total / 80
+    if e.stmt_slot < 16384 {
+        e.stmt_slot = 16384
+    }
+    e.stmt_slot = e.stmt_slot / 8 * 8
+    e.stmt_off = o
+    o += (e.stmt_slots + 1) * e.stmt_slot
+    e.reg_off = o
+    o += NREGS * REG_BYTES
+    e.cur_off = o
+    o += NCURSORS * CURSOR_BYTES
+    e.arena_cap = total / 12
+    if e.arena_cap < 32768 {
+        e.arena_cap = 32768
+    }
+    e.arena_off = o
+    e.arena_top = o
+    o += e.arena_cap
+    e.sort_cap = total / 5
+    if e.sort_cap < 32768 {
+        e.sort_cap = 32768
+    }
+    e.sort_off = o
+    e.sort_top = o
+    e.sort_hi = o + e.sort_cap
+    o += e.sort_cap
+    e.bitmap_bytes = total / 64
+    if e.bitmap_bytes < 4096 {
+        e.bitmap_bytes = 4096
+    }
+    e.bitmap_off = o
+    o += e.bitmap_bytes
+    e.sj_cap = total / 16
+    e.sj_off = o
+    o += e.sj_cap
+    gather := GATHER_PAGES * e.page_size
+    e.gather_a = o
+    o += gather
+    e.gather_b = o
+    o += gather
+    e.scratch_page = o
+    o += e.page_size
+    e.cell_buf = o
+    o += e.page_size + 64
+    e.cell_buf2 = o
+    o += e.page_size + 64
+    if o >= total {
+        return err(full(e, "workspace too small for this page size"))
+    }
+    remaining := total - o
+    if e.memory {
+        // In-memory databases keep rollback images in a memory journal.
+        e.mj_cap = remaining / 3
+        e.mj_off = o
+        o += e.mj_cap
+        remaining = total - o
+    }
+    per_slot := e.page_size + SLOT_META + 8
+    slots := remaining / per_slot
+    if slots < 24 {
+        return err(full(e, "workspace too small for the page cache"))
+    }
+    hash_cap := 1usize
+    for hash_cap < slots * 2 {
+        hash_cap = hash_cap * 2
+    }
+    for slots * SLOT_META + hash_cap * 4 + slots * e.page_size > remaining {
+        slots -= 1
+    }
+    e.nslots = slots
+    e.meta_off = o
+    o += slots * SLOT_META
+    e.hash_off = o
+    e.hash_cap = hash_cap
+    o += hash_cap * 4
+    e.cache_off = o
+    e.cache_end = o + slots * e.page_size
+    let meta_off2 = e.meta_off
+    let cache_off2 = e.cache_off - e.meta_off
+    zero_bytes(e.ws, meta_off2, cache_off2)
+    ok()
+}
+
+// ---------------------------------------------------------------------------
+// Registers: 32 bytes each. [0] type, [8..16] payload, [16..20] data
+// offset, [20..24] data length.
+
+fn reg_at(e: &Engine, r: usize) -> usize {
+    core.assert(r < NREGS)
+    e.reg_off + r * REG_BYTES
+}
+
+fn rtype(e: &Engine, r: usize) -> u8 {
+    e.ws[reg_at(e, r)]
+}
+
+fn rint(e: &Engine, r: usize) -> i64 {
+    u2i(ld64(e.ws, reg_at(e, r) + 8))
+}
+
+fn rreal(e: &Engine, r: usize) -> f64 {
+    u2f(ld64(e.ws, reg_at(e, r) + 8))
+}
+
+fn roff(e: &Engine, r: usize) -> usize {
+    ldu(e.ws, reg_at(e, r) + 16)
+}
+
+fn rlen(e: &Engine, r: usize) -> usize {
+    ldu(e.ws, reg_at(e, r) + 20)
+}
+
+fn set_null(e: &mut Engine, r: usize) {
+    o := reg_at(e, r)
+    e.ws[o] = T_NULL
+    e.ws[o + 1] = 0
+}
+
+fn set_int(e: &mut Engine, r: usize, v: i64) {
+    o := reg_at(e, r)
+    e.ws[o] = T_INT
+    e.ws[o + 1] = 0
+    st64(e.ws, o + 8, i2u(v))
+}
+
+fn set_real(e: &mut Engine, r: usize, v: f64) {
+    o := reg_at(e, r)
+    e.ws[o] = T_REAL
+    e.ws[o + 1] = 0
+    st64(e.ws, o + 8, f2u(v))
+}
+
+fn set_bytes(e: &mut Engine, r: usize, t: u8, off: usize, len: usize) {
+    o := reg_at(e, r)
+    e.ws[o] = t
+    e.ws[o + 1] = 0
+    stu(e.ws, o + 16, off)
+    stu(e.ws, o + 20, len)
+}
+
+fn copy_reg(e: &mut Engine, dst: usize, src: usize) {
+    if dst == src {
+        return
+    }
+    let reg = reg_at(e, src)
+    let reg2 = reg_at(e, dst)
+    move_bytes(e.ws, reg, reg2, REG_BYTES)
+}
+
+// ---------------------------------------------------------------------------
+// Arena: bump allocation for values that live until the next reset.
+
+fn arena_alloc(e: &mut Engine, len: usize) -> usize!db.Error {
+    if e.arena_top + len > e.arena_off + e.arena_cap {
+        x := full(e, "value area (a single value or row needs ")
+        msg_add_int(e, len as i64)
+        msg_add(e, " more bytes; use a larger workspace)")
+        return err(x)
+    }
+    o := e.arena_top
+    e.arena_top += len
+    ok(o)
+}
+
+// Resets the arena to `mark`, invalidating cursor payload copies above it.
+fn arena_reset(e: &mut Engine, mark: usize) {
+    e.arena_top = mark
+    end := e.arena_off + e.arena_cap
+    for c in 0usize..NCURSORS {
+        co := e.cur_off + c * CURSOR_BYTES
+        po := ldu(e.ws, co + C_PAYOFF)
+        if po >= mark && po < end {
+            stu(e.ws, co + C_PAYOFF, 0)
+            e.ws[co + C_PAYVALID] = 0
+        }
+    }
+}
+
+// Copies a register's text/blob into the arena so it survives page eviction
+// or reuse of its previous storage.
+fn reg_own(e: &mut Engine, r: usize) -> void!db.Error {
+    t := rtype(e, r)
+    if t == T_TEXT || t == T_BLOB {
+        len := rlen(e, r)
+        src := roff(e, r)
+        dst := arena_alloc(e, len)?
+        move_bytes(e.ws, src, dst, len)
+        set_bytes(e, r, t, dst, len)
+    }
+    ok()
+}
+
+// Like reg_own, but the copy lives on the sort stack and survives until the
+// statement finishes (the arena is reset at every step).
+fn reg_keep(e: &mut Engine, r: usize) -> void!db.Error {
+    t := rtype(e, r)
+    if t == T_TEXT || t == T_BLOB {
+        len := rlen(e, r)
+        if e.sort_top + len > e.sort_hi {
+            return err(full(e, "sorter (key values)"))
+        }
+        e.sort_hi -= len
+        dst := e.sort_hi
+        src := roff(e, r)
+        move_bytes(e.ws, src, dst, len)
+        set_bytes(e, r, t, dst, len)
+    }
+    ok()
+}
+
+fn next_random(e: &mut Engine) -> u64 {
+    // xorshift64*
+    x := e.rng
+    x = x ^ (x >> 12)
+    x = x ^ core.wrapping_mul(x, 33554432u64)
+    x = x ^ (x >> 27)
+    e.rng = x
+    core.wrapping_mul(x, 2685821657736338717u64)
+}
+
+fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    for i in 0usize..a.len {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    true
+}

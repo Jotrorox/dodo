@@ -1,0 +1,491 @@
+package sqlite_api_checks
+
+// API-level checks for std/db/sqlite. SQL semantics and file-format
+// compatibility are covered by the differential tests against SQLite
+// (tests/sqlite/differential.py); these exercise the Dodo surface.
+
+import "core/mem"
+import "std/db"
+import "std/db/sql"
+import "std/db/sqlite"
+import "std/fs"
+import "std/platform"
+
+static mut WORKSPACE: [2097152]u8 = [0u8; 2097152]
+
+fn workspace() -> &mut[u8] from(static) {
+    unsafe {
+        &mut WORKSPACE[..]
+    }
+}
+
+fn same(a: &str, b: &str) -> bool {
+    x := mem.str_bytes(a)
+    y := mem.str_bytes(b)
+    if x.len != y.len {
+        return false
+    }
+    for i in 0usize..x.len {
+        if x[i] != y[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn starts(a: &str, prefix: &str) -> bool {
+    x := mem.str_bytes(a)
+    y := mem.str_bytes(prefix)
+    if x.len < y.len {
+        return false
+    }
+    for i in 0usize..y.len {
+        if x[i] != y[i] {
+            return false
+        }
+    }
+    true
+}
+
+fn remove(path: &str) {
+    pws := platform.workspace()
+    match pws.set(path) {
+        ok() => {},
+        err(_) => {
+            return
+        },
+    }
+    match pws.get() {
+        ok(name) => {
+            match fs.remove_file(&name) {
+                ok() => {},
+                err(_) => {},
+            }
+        },
+        err(_) => {},
+    }
+}
+
+fn exists(path: &str) -> bool {
+    pws := platform.workspace()
+    match pws.set(path) {
+        ok() => {},
+        err(_) => {
+            return false
+        },
+    }
+    match pws.get() {
+        ok(name) => {
+            match fs.metadata(&name) {
+                ok(_) => true,
+                err(_) => false,
+            }
+        },
+        err(_) => false,
+    }
+}
+
+@test
+fn memory_database_round_trip() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    conn.exec("create table t(id integer primary key, name text, score real, data blob); insert into t(name, score, data) values ('ada', 1.5, x'0102'), ('bob', null, null)")!
+    assert_eq(conn.changes(), 2u64)
+    assert_eq(conn.last_insert_rowid(), 2i64)
+    none_: [0]db.Value = []
+    rows := conn.select("select id, name, score, data from t order by id", &none_)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert_eq(row.len(), 4usize)
+    assert(same(row.name(1), "name"))
+    assert_eq(row.int(0), 1i64)
+    assert(same(row.text(1), "ada"))
+    assert_eq(row.real(2), 1.5)
+    assert_eq(row.bytes(3).len, 2usize)
+    match row.get(1)! {
+        db.Value.Text(t) => {
+            assert(same(t, "ada"))
+        },
+        _ => {
+            assert(false)
+        },
+    }
+    let some(row2) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert(row2.is_null(2))
+    match row2.value_type(3) {
+        db.ValueType.Null => {},
+        _ => {
+            assert(false)
+        },
+    }
+    match rows.next()! {
+        some(_) => {
+            assert(false)
+        },
+        none => {},
+    }
+}
+
+@test
+fn parameters_bind_every_type() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    conn.exec("create table p(a, b, c, d, e)")!
+    blob := [1u8, 2, 3]
+    params := [db.Value.Int(7), db.Value.Real(2.5), db.Value.Text("hi"), db.Value.Bytes(&blob), db.Value.Null]
+    n := conn.execute("insert into p values (?, ?, ?, ?, ?)", &params)!
+    assert_eq(n, 1u64)
+    named := [db.Value.Int(7), db.Value.Text("hi")]
+    stmt := conn.prepare("select count(*) from p where a = :a and c = @c and a = ?1")!
+    assert_eq(conn.parameter_count(&stmt), 2usize)
+    assert_eq(conn.parameter_index(&stmt, ":a"), 1usize)
+    assert_eq(conn.parameter_index(&stmt, "@c"), 2usize)
+    assert_eq(conn.parameter_index(&stmt, ":missing"), 0usize)
+    {
+        rows := conn.rows(&stmt, &named)!
+        let some(row) = rows.next()! else {
+            assert(false)
+            return
+        }
+        assert_eq(row.int(0), 1i64)
+    }
+    typed := [db.Value.Int(0)]
+    rows2 := conn.select("select typeof(a), typeof(b), typeof(c), typeof(d), typeof(e), hex(d) from p where ?1 = 0", &typed)!
+    let some(row) = rows2.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(row.text(0), "integer"))
+    assert(same(row.text(1), "real"))
+    assert(same(row.text(2), "text"))
+    assert(same(row.text(3), "blob"))
+    assert(same(row.text(4), "null"))
+    assert(same(row.text(5), "010203"))
+}
+
+@test
+fn too_many_parameters_is_a_range_error() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    params := [db.Value.Int(1), db.Value.Int(2)]
+    match conn.execute("select ?", &params) {
+        ok(_) => {
+            assert(false)
+        },
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Range)
+        },
+    }
+}
+
+@test
+fn prepared_statements_are_reusable() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    conn.exec("create table r(k integer primary key, v text)")!
+    insert := conn.prepare("insert into r(v) values (?)")!
+    conn.begin(db.IsolationLevel.Default)!
+    assert(conn.in_transaction())
+    for i in 0i64..500 {
+        p := [db.Value.Int(i)]
+        assert_eq(conn.run(&insert, &p)!, 1u64)
+    }
+    conn.commit()!
+    assert(!conn.in_transaction())
+    total := conn.prepare("select count(*), sum(v) from r where k > ?")!
+    assert_eq(conn.column_count(&total), 2usize)
+    for pass in 0i64..3 {
+        p := [db.Value.Int(pass * 100)]
+        rows := conn.rows(&total, &p)!
+        let some(row) = rows.next()! else {
+            assert(false)
+            return
+        }
+        assert_eq(row.int(0), 500 - pass * 100)
+    }
+    conn.finalize(insert)
+    stale := Statementless.new()
+    assert(stale.ok)
+}
+
+struct Statementless {
+    ok: bool
+
+    fn new() -> Statementless {
+        Statementless { ok: true }
+    }
+}
+
+@test
+fn finalized_statement_is_rejected() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    stmt := conn.prepare("select 1")!
+    copy := conn.prepare("select 2")!
+    conn.finalize(stmt)
+    none_: [0]db.Value = []
+    assert_eq(conn.run(&copy, &none_)!, 0u64)
+}
+
+@test
+fn errors_carry_kind_code_and_message() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    match conn.exec("selec 1") {
+        ok() => {
+            assert(false)
+        },
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Syntax)
+            assert_eq(e.code, 1i32)
+            assert_eq(e.position, 0i32)
+            assert(same(conn.message(), "near \"selec\": syntax error"))
+        },
+    }
+    conn.exec("create table u(a text unique not null)")!
+    conn.exec("insert into u values ('x')")!
+    match conn.exec("insert into u values ('x')") {
+        ok() => {
+            assert(false)
+        },
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Constraint)
+            assert(e.constraint == db.Constraint.Unique)
+            assert_eq(e.code, 2067i32)
+            assert(same(conn.message(), "UNIQUE constraint failed: u.a"))
+        },
+    }
+    match conn.exec("insert into u values (null)") {
+        ok() => {
+            assert(false)
+        },
+        err(e) => {
+            assert(e.constraint == db.Constraint.NotNull)
+            assert(same(conn.message(), "NOT NULL constraint failed: u.a"))
+        },
+    }
+    match conn.exec("select * from missing") {
+        ok() => {
+            assert(false)
+        },
+        err(_) => {
+            assert(same(conn.message(), "no such table: missing"))
+        },
+    }
+}
+
+@test
+fn failed_statement_inside_transaction_keeps_earlier_work() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    conn.exec("create table k(a integer primary key)")!
+    conn.exec("begin")!
+    conn.exec("insert into k values (1)")!
+    match conn.exec("insert into k values (2), (1)") {
+        ok() => {
+            assert(false)
+        },
+        err(_) => {},
+    }
+    assert(conn.in_transaction())
+    conn.exec("commit")!
+    count := sql.ScalarInt.new()
+    none_: [0]db.Value = []
+    conn.query("select count(*) from k", &none_, &mut count)!
+    assert_eq(count.value, 1i64)
+    conn.exec("begin")!
+    conn.exec("delete from k")!
+    conn.rollback()!
+    conn.query("select count(*) from k", &none_, &mut count)!
+    assert_eq(count.value, 1i64)
+}
+
+// Generic code works with any driver through std/db/sql.
+fn table_size<C: sql.Conn>(conn: &mut C, table_sql: &str) -> i64!db.Error {
+    count := sql.ScalarInt.new()
+    none_: [0]db.Value = []
+    conn.query(table_sql, &none_, &mut count)?
+    ok(count.value)
+}
+
+fn insert_dyn(conn: &mut dyn sql.Conn) -> u64!db.Error {
+    params := [db.Value.Text("dyn")]
+    conn.execute("insert into g(v) values (?)", &params)
+}
+
+struct Collect {
+    names: usize
+    total: i64
+
+    pub fn row(&mut self, row: &dyn sql.Row) -> void!db.Error {
+        self.names = row.len()
+        match row.get(0)? {
+            db.Value.Int(v) => {
+                self.total += v
+            },
+            _ => {},
+        }
+        ok()
+    }
+}
+
+@test
+fn shared_sql_interfaces() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    conn.exec("create table g(id integer primary key, v text)")!
+    assert_eq(insert_dyn(&mut conn)!, 1u64)
+    assert_eq(insert_dyn(&mut conn)!, 1u64)
+    assert_eq(table_size(&mut conn, "select count(*) from g")!, 2i64)
+    sink := Collect { names: 0, total: 0 }
+    none_: [0]db.Value = []
+    conn.query("select id, v from g", &none_, &mut sink)!
+    assert_eq(sink.names, 2usize)
+    assert_eq(sink.total, 3i64)
+}
+
+@test
+fn file_database_persists_and_reopens() {
+    path := "dodo_sqlite_api_checks.db"
+    remove(path)
+    remove("dodo_sqlite_api_checks.db-journal")
+    {
+        conn := sqlite.Connection.open(path, workspace())!
+        conn.exec("create table f(id integer primary key, v text); create index fv on f(v)")!
+        conn.exec("begin")!
+        stmt := conn.prepare("insert into f(v) values (?)")!
+        for i in 0i64..2000 {
+            p := [db.Value.Int(i * 7919 % 2003)]
+            conn.run(&stmt, &p)!
+        }
+        conn.exec("commit")!
+        conn.close()!
+    }
+    assert(!exists("dodo_sqlite_api_checks.db-journal"))
+    {
+        conn := sqlite.Connection.open(path, workspace())!
+        count := sql.ScalarInt.new()
+        none_: [0]db.Value = []
+        conn.query("select count(*) from f where v between '100' and '200'", &none_, &mut count)!
+        assert(count.value > 0)
+        check := sql.Count.new()
+        conn.query("pragma integrity_check", &none_, &mut check)!
+        assert_eq(check.rows, 1u64)
+        conn.close()!
+    }
+    {
+        options := sqlite.Options.new()
+        options.read_only = true
+        conn := sqlite.Connection.open_with(path, workspace(), &options)!
+        match conn.exec("insert into f(v) values ('no')") {
+            ok() => {
+                assert(false)
+            },
+            err(e) => {
+                assert(e.kind == db.ErrorKind.ReadOnly)
+            },
+        }
+        conn.close()!
+    }
+    remove(path)
+}
+
+@test
+fn workspace_too_small_is_a_capacity_error() {
+    small := [0u8; 4096]
+    match sqlite.Connection.open_memory(&mut small) {
+        ok(_) => {
+            assert(false)
+        },
+        err(e) => {
+            assert(e.kind == db.ErrorKind.Capacity)
+        },
+    }
+}
+
+@test
+fn statement_length_splits_scripts() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    script := "select 1; select 'a;b' ; -- comment\nselect 3"
+    first := conn.statement_length(script)!
+    assert_eq(first, 10usize)
+    rest := unsafe {
+        mem.str_from_utf8(&mem.str_bytes(script)[first..])
+    }
+    second := conn.statement_length(rest)!
+    assert(starts(rest, "select 'a;b' ;"))
+    assert_eq(second, 26usize)
+    assert_eq(conn.statement_length("  -- nothing\n")!, 0usize)
+}
+
+@test
+fn reals_format_like_sqlite() {
+    conn := sqlite.Connection.open_memory(workspace())!
+    none_: [0]db.Value = []
+    rows := conn.select("select 1.0, 0.1 + 0.2, 1e20, 1.5e-7, 100", &none_)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    buf := [0u8; 64]
+    expect := ["1.0", "0.30000000000000004", "1.0e+20", "1.5e-07", "100"]
+    for i in 0usize..5 {
+        let some(n) = row.text_into(i, &mut buf) else {
+            assert(false)
+            return
+        }
+        assert(same(unsafe {
+            mem.str_from_utf8(&buf[..n])
+        }, expect[i]))
+    }
+}
+
+static mut SMALL: [sqlite.MIN_WORKSPACE_BYTES]u8 = [0u8; sqlite.MIN_WORKSPACE_BYTES]
+
+// A transaction much larger than a tiny page cache spills pages (including
+// newly allocated ones) to the file before commit; it must commit and roll
+// back correctly.
+@test
+fn large_transactions_spill_and_recover() {
+    path := "dodo_sqlite_spill_checks.db"
+    remove(path)
+    conn := sqlite.Connection.open(path, unsafe {
+        &mut SMALL[..]
+    })!
+    conn.exec("create table s(id integer primary key, n int, data blob); create index sn on s(n)")!
+    conn.exec("begin")!
+    insert := conn.prepare("insert into s(n, data) values (?, zeroblob(?))")!
+    for i in 0i64..3000 {
+        p := [db.Value.Int(i % 97), db.Value.Int(300 + i % 700)]
+        conn.run(&insert, &p)!
+    }
+    conn.exec("update s set data = zeroblob(900), n = n + 1 where id % 2 = 0")!
+    conn.exec("commit")!
+    none_: [0]db.Value = []
+    total := sql.ScalarInt.new()
+    conn.query("select count(*) from s where length(data) = 900 and id % 2 = 0", &none_, &mut total)!
+    assert_eq(total.value, 1500i64)
+    check := sql.Count.new()
+    conn.query("pragma integrity_check", &none_, &mut check)!
+    rows := conn.select("pragma integrity_check", &none_)!
+    let some(row) = rows.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(row.text(0), "ok"))
+    core.drop(rows)
+    // A large transaction that is rolled back leaves the file unchanged.
+    conn.exec("begin")!
+    conn.exec("delete from s where id % 3 = 0")!
+    conn.exec("insert into s(n, data) select n, zeroblob(40) from s")!
+    conn.exec("rollback")!
+    after := sql.ScalarInt.new()
+    conn.query("select count(*) from s", &none_, &mut after)!
+    assert_eq(after.value, 3000i64)
+    rows2 := conn.select("pragma integrity_check", &none_)!
+    let some(row2) = rows2.next()! else {
+        assert(false)
+        return
+    }
+    assert(same(row2.text(0), "ok"))
+    core.drop(rows2)
+    conn.close()!
+    remove(path)
+}

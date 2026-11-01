@@ -53,6 +53,16 @@ unsafe extern "C" fn GetFinalPathNameByHandleW(handle: *mut u8, output: *mut u16
 unsafe extern "C" fn FindFirstFileW(pattern: *const u16, output: *mut FindData) -> *mut u8
 unsafe extern "C" fn FindNextFileW(handle: *mut u8, output: *mut FindData) -> i32
 unsafe extern "C" fn FindClose(handle: *mut u8) -> i32
+@repr(C)
+struct Overlapped {
+    internal: usize
+    internal_high: usize
+    offset: u32
+    offset_high: u32
+    event: *mut u8
+}
+unsafe extern "C" fn LockFileEx(handle: *mut u8, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32
+unsafe extern "C" fn UnlockFileEx(handle: *mut u8, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32
 
 pub fn capabilities() -> types.Capabilities {
     return types.Capabilities { symbolic_links: true, unix_permissions: false, windows_sharing: true, directory_sync: false }
@@ -125,6 +135,50 @@ fn convert(data: &Information) -> types.Metadata {
     modified_seconds: seconds, modified_nanoseconds: nanos,
     readonly: (data.attributes & 1) != 0, unix_metadata: false, mode: 0, uid: 0, gid: 0,
     device: data.volume as u64, inode: ((data.index_high as u64) << 32) | (data.index_low as u64), links: data.links as u64 }
+}
+fn overlapped_at(start: u64) -> Overlapped {
+    event := unsafe {
+        0usize as *mut u8
+    }
+    return Overlapped { internal: 0, internal_high: 0, offset: (start & 0xffffffffu64) as u32,
+    offset_high: (start >> 32) as u32, event: event }
+}
+// Non-blocking LockFileEx byte-range lock on [start, start + length),
+// shared or exclusive. Returns false when another handle holds a
+// conflicting lock.
+pub fn lock_range(handle: &native.Handle, start: u64, length: u64, shared: bool) -> bool!error.Error {
+    if length == 0 || length > 18446744073709551615u64 - start {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    overlapped := overlapped_at(start)
+    unsafe {
+        // LOCKFILE_FAIL_IMMEDIATELY, plus LOCKFILE_EXCLUSIVE_LOCK unless shared.
+        if LockFileEx(handle.raw() as *mut u8, if shared {
+            1
+        } else {
+            3
+        }, 0, (length & 0xffffffffu64) as u32, (length >> 32) as u32, ptr.from_mut(&mut overlapped)) == 0 {
+            failure := native.last_error()
+            // ERROR_LOCK_VIOLATION and ERROR_IO_PENDING mean "held elsewhere".
+            if failure.code == 33 || failure.code == 997 {
+                return ok(false)
+            }
+            return err(failure)
+        }
+    }
+    return ok(true)
+}
+pub fn unlock_range(handle: &native.Handle, start: u64, length: u64) -> void!error.Error {
+    if length == 0 || length > 18446744073709551615u64 - start {
+        return err(error.failure(error.Kind.InvalidInput))
+    }
+    overlapped := overlapped_at(start)
+    unsafe {
+        if UnlockFileEx(handle.raw() as *mut u8, 0, (length & 0xffffffffu64) as u32, (length >> 32) as u32, ptr.from_mut(&mut overlapped)) == 0 {
+            return err(native.last_error())
+        }
+    }
+    return ok()
 }
 pub fn handle_metadata(handle: &native.Handle) -> types.Metadata!error.Error {
     data := information(handle)?

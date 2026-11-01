@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- New database packages. `std/db` holds the shared vocabulary for drivers:
+  `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
+  driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.
+  `std/db/sql` defines the `sql.Conn`, `sql.Row`, and `sql.RowSink`
+  interfaces that every SQL driver matches, so generic code
+  (`<C: sql.Conn>`) and runtime-selected code (`&mut dyn sql.Conn`) work with
+  any of them.
+- `std/db/sqlite` is an SQLite-compatible database engine written entirely in
+  Dodo, with no native library: it reads and writes SQLite 3 database files
+  (every page size, overflow pages, freelist, rollback journal with hot-journal
+  recovery, and SQLite's locking protocol), so the same file can be used by
+  SQLite itself at the same time. It runs inside a caller-owned workspace and
+  never allocates. SQL support covers tables, indexes (including SQLite's
+  automatic indexes), views, joins, subqueries, compound selects, common table
+  expressions including `WITH RECURSIVE`, aggregates, `GROUP BY`/`HAVING`,
+  `ORDER BY`/`LIMIT`, UPSERT, `RETURNING`, constraints with conflict clauses,
+  `AUTOINCREMENT`, `ALTER TABLE`, transactions with statement-level rollback,
+  common pragmas, and SQLite's core, aggregate, and date/time functions with
+  its type affinity rules. Differential tests compare results and written
+  files against SQLite. See the new [SQLite guide](docs/src/content/docs/sqlite.md).
+- `fs.File.try_lock_range(start, length, shared)` and `unlock_range` take
+  non-blocking advisory byte-range locks (POSIX `fcntl` record locks through
+  the fs C adapter, `LockFileEx` on Windows).
+- String literals no longer conflict with borrows of `static mut` storage
+  (for example passing `"literal"` while holding `&mut WORKSPACE[..]`).
+- `.len` and indexing through a reference to a slice or string (such as the
+  `&&[u8]` a `match &value` binds) no longer fail in code generation.
+
 - `std/script/lua` is a complete Lua 5.4 implementation written in Dodo,
   for embedding scripts, configuration and plugins in Dodo programs. It
   follows PUC Lua 5.4.9, including its error messages and the
