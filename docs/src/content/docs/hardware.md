@@ -101,6 +101,7 @@ methods implements it and can be passed where a driver expects it:
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
 | `hal.AnalogInput` | `max_value(&self) -> u16`<br>`read(&mut self) -> u16!hal.Error` |
+| `hal.Rng` | `fill(&mut self, bytes: &mut[u8]) -> void!hal.Error` |
 | `hal.Rtc` | `is_set(&mut self) -> bool!hal.Error`<br>`now_ms(&mut self) -> u64!hal.Error`<br>`set_ms(&mut self, time_ms: u64) -> void!hal.Error`<br>`resolution_ms(&self) -> u32` |
 | `hal.RtcAlarm` | `set_alarm_ms(&mut self, time_ms: u64) -> void!hal.Error`<br>`alarm_fired(&mut self) -> bool!hal.Error`<br>`clear_alarm(&mut self) -> void!hal.Error` |
 | Serial port | [`io.Reader` and `io.Writer`](io.md) from `std/io`; `serial.Port` adds `flush(&mut self) -> void!io.Error`. |
@@ -119,7 +120,8 @@ way, with its frequency, and the protocol then only sets its duty cycle: the
 output is high for `duty / max_duty()` of each period, so 0 holds it low and
 `max_duty()` holds it high. An analog input reads 0 at ground and
 `max_value()`, such as 4095 for a 12-bit converter, at the converter's
-reference voltage. A [real-time clock](#real-time-clocks) counts
+reference voltage. A [random number generator](#random-numbers) fills
+buffers with random bytes. A [real-time clock](#real-time-clocks) counts
 milliseconds since the Unix epoch. `hal.I2C_STANDARD_HZ`,
 `hal.I2C_FAST_HZ`, and `hal.I2C_FAST_PLUS_HZ` name the usual I2C speeds.
 The register block protocol is for [peripheral drivers](#register-blocks)
@@ -144,8 +146,8 @@ the device on an I2C or SPI bus, [pulse measurement](#measuring-pulses),
 [CAN](#can), [I2S audio](#i2s-audio), and [DMA buffer
 transfers](#transfers-in-the-background-dma).
 
-Pins, delays, and counters cannot fail. Alarm, bus, PWM, analog, and clock
-operations return
+Pins, delays, and counters cannot fail. Alarm, bus, PWM, analog, clock,
+and random operations return
 `hal.Error`, one shared enum, because such a device may itself sit on a bus,
 as a PWM controller chip or a clock chip on I2C does: `Timeout`, `NoAcknowledge`, `Bus`,
 `Overrun`, `Busy`, `InvalidInput`, and `Unsupported`. Every driver and chip uses the same error type, so `?` passes
@@ -177,6 +179,51 @@ fn log_reading<B: hal.I2c, W: io.Writer>(bus: &mut B, output: &mut W) -> u8!LogE
 The repository's `examples/sensor_log.dodo` tests this function against a fake
 bus and a memory buffer.
 
+### Random numbers
+
+A random number generator implements `hal.Rng`: `fill(bytes)` fills a
+buffer with random bytes, and `hal.random_u32`, `hal.random_u64`, and
+`hal.random_below` build numbers from them. Every board has one as `b.rng`,
+the best its chip offers, so code written against the protocol runs on any
+board and, with a fake or `hal.SoftRng`, in desktop tests:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+
+// Roll a die with any generator.
+fn roll<R: hal.Rng>(rng: &mut R) -> u32!hal.Error {
+    return ok(hal.random_below(rng, 6)? + 1)
+}
+
+fn main() {
+    b := board.take()!
+    key := [0u8; 16]
+    b.rng.fill(&mut key)!
+    if roll(&mut b.rng)! == 6 {
+        b.led.set_high()
+    }
+}
+```
+
+Hardware generators gather entropy from physical noise, such as an
+oscillator's jitter, and differ in quality and speed: the
+[RP2040's](#random-numbers-on-the-rp2040-and-rp2350) suits seeds and games
+but not cryptographic keys, and the RP2350's is fit for keys. A generator
+whose source stops reports `Timeout`, and one whose health checks fail
+reports `Bus`; the bytes of a failed fill must not be used.
+
+`hal.SoftRng` is a software generator, xoshiro128**, that implements the
+protocol too. Seed it once from a hardware generator with
+`hal.SoftRng.from_rng(&mut b.rng)` and it produces numbers at a few cycles
+each, with `next_u32()` or the helpers, and never fails. Its output is
+statistically uniform but predictable to anyone who learns its 128-bit
+state, so it is for simulations, games, random delays, and test order, not
+keys. `hal.SoftRng.new(seed)` repeats the same sequence for the same seed,
+for reproducible tests.
+
 ### Helpers
 
 | Helper | Purpose |
@@ -196,6 +243,9 @@ bus and a memory buffer.
 | `hal.set_duty_fraction(&mut output, numerator, denominator)` | Set a PWM duty cycle to a fraction, rounded to the nearest step. |
 | `hal.set_pulse_us(&mut output, pulse_us, period_us)` | Set a PWM pulse length, as for a servo: `set_pulse_us(&mut servo, 1500, 20_000)` centres one on a 50 Hz output. |
 | `hal.read_millivolts(&mut input, reference_mv)` | Read an analog input as millivolts. |
+| `hal.random_u32(&mut rng)`, `hal.random_u64(&mut rng)` | A uniformly distributed number from a [random number generator](#random-numbers). |
+| `hal.random_below(&mut rng, bound)` | A uniformly distributed number from 0 to `bound - 1`, without modulo bias: `random_below(&mut rng, 6)? + 1` rolls a die. |
+| `hal.SoftRng` | A fast [software generator](#random-numbers) seeded from a hardware one. |
 | `hal.rtc_now(&mut clock)`, `hal.rtc_set(&mut clock, &date_time)` | Read or set a real-time clock as a UTC `time.DateTime`. |
 | `hal.rtc_alarm_at(&mut clock, &date_time)`, `hal.rtc_alarm_in(&mut clock, ms)` | Set a clock's alarm for a date and time, or some milliseconds from now. |
 | `hal.date_time_of_ms(ms)`, `hal.ms_of_date_time(&date_time)` | Convert between Unix milliseconds and a `time.DateTime`. |
@@ -878,6 +928,7 @@ which pins can carry which bus.
 | `fake.Serial` | A serial port, `serial.Port` and `serial.PollPort`: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)`, `set_write_room(n)`, `set_flush_polls(n)`, `flushes()` |
 | `fake.Pwm` | A PWM output with a given `max_duty`, initially at duty 0. | `duty()`, `changes()`, `fail_next(error)` |
 | `fake.Analog` | An analog input with a given `max_value` that reads the value given to `set`, after any given to `queue`, one per read. | `set(value)`, `queue(values)`, `reads()`, `fail_next(error)` |
+| `fake.Rng` | A random number generator that fills with the bytes given to `queue`, then counts up 0, 1, 2, and so on, so tests know what a driver drew. | `queue(bytes)`, `drawn()`, `fail_next(error)` |
 | `fake.Rtc` | A [real-time clock](#real-time-clocks) with an alarm, unset until set, counting milliseconds (`new()`) or coarser steps (`with_resolution(ms)`). Time passes only by `advance`. | `advance(ms)`, `lose_power()`, `is_armed()`, `alarm_ms()`, `fail_next(error)` |
 | `fake.I2cTarget` | An I2C target and the master that talks to it, played by the test: the master's writes, reads, and STOPs come out of `poll` in order. | `master_write(bytes)`, `master_read(count)`, `master_stop()`, `master_received()`, `is_idle()`, `fail_next(error)` |
 | `fake.SpiTarget` | An SPI target and the master that clocks it. | `master_exchange(bytes)`, `queued()` |
@@ -889,7 +940,7 @@ which pins can carry which bus.
 | `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock, and a counter: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
 `fail_next` makes the next I2C transaction, duty change, analog read,
-alarm schedule, or clock operation fail,
+alarm schedule, clock operation, or random fill fail,
 so error paths are as easy to test as success. The repository's
 `examples/dimmer.dodo` tests an LED dimmer, a knob on an analog input setting
 a PWM output, this way, and `examples/dimmer_board.dodo` runs it unchanged on
@@ -1929,6 +1980,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
 | `b.timer` | The delay and counter protocols, plus `delay_ms(ms)`; `alarm(n)` claims an alarm with the alarm protocol, which can also run the [executor](#tasks-and-the-executor). |
 | `b.rtc` | The chip's [real-time clock](#real-time-clocks-on-the-rp2040-and-rp2350), implementing the clock and alarm protocols. |
+| `b.rng` | The chip's [random number generator](#random-numbers-on-the-rp2040-and-rp2350), implementing the random number generator protocol. |
 | `b.watchdog` | The [watchdog](#the-watchdog-on-the-rp2040-and-rp2350): `start(timeout_ms)`, then `feed()` in time or the board resets; `reset_reason()` tells whether it did. Implements `hal.Watchdog`. |
 | `b.dma` | The [DMA channels](#dma-on-the-rp2040-and-rp2350): `channel()` claims one, `release(channel)` gives it back. Buses and serial ports take them for transfers that run while the program does other work. |
 | `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
@@ -2484,6 +2536,38 @@ that does not finish is `Timeout`, and one the converter flags as failed is
 releasing the last with `pins.release_analog(input)` stops both. The sensor
 is accurate to a few degrees and depends on the reference voltage; on the
 Pico and Pico 2, GP29 reads a third of the supply voltage VSYS.
+
+### Random numbers on the RP2040 and RP2350
+
+`b.rng`, or `Peripherals.rng` from the chip package, is each chip's best
+generator; both implement [`hal.Rng`](#random-numbers), and
+`std/embedded/chip/rp_rng` holds the drivers:
+
+| Chip | `b.rng` | Source | Speed | Fit for keys |
+| --- | --- | --- | --- | --- |
+| RP2040 | `rp_rng.Rosc` | The ring oscillator's RANDOMBIT, sampled every 128 reads (about 10 us) and debiased with von Neumann's method: of two samples that differ, the first is kept; pairs that agree are dropped. | About 3 KB a second | No |
+| RP2350 | `rp_rng.Trng` | The TRNG, with its hardware debiasing and all three health tests on, sampling its oscillator every 200 clk_sys cycles. | About 20 KB a second | Yes |
+
+The ring oscillator was not designed or tested as an entropy source, and
+the RP2040 has nothing better: use its bytes for seeds, random delays,
+identifiers, and games. `take()` moves the clocks to the crystal and the
+PLL but leaves the oscillator running, so its jitter against clk_sys is
+what the samples see. An
+oscillator that has stopped makes a fill `Timeout`, and 32 equal bits in a
+row, which a source locked to the system clock gives, make it `Bus`.
+
+The RP2350's TRNG collects 192 bits at a time in about 1 ms. A fill keeps
+the bytes it does not use for the next, so `hal.random_u32` mostly returns
+at once. Bits that fail the repetition tests are discarded, and four failed
+autocorrelation tests in a row, which stop the TRNG, restart it; after 100
+restarts for one block the fill reports `Bus`. The TRNG runs only during a
+fill. Its events are unmasked meanwhile and raise `TRNG_IRQ`; while that
+interrupt is disabled in the NVIC, as it is unless the program enables it,
+the fill clears the pend they leave.
+
+Both generators are generic over `hal.Registers`, as `rp_rng.RoscSource` and
+`rp_rng.TrngSource`, so they run against simulated registers in
+[desktop tests](#testing-with-fakes).
 
 ### PIO on the RP2040 and RP2350
 
@@ -3218,8 +3302,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
   PIO, the timer, the real-time clock, the watchdog, DMA, a USB serial port,
-  low power, and the second core; other USB devices (HID, mass storage,
-  several functions at once) or USB host mode are not bundled
+  the random number generators, low power, and the second core; other USB
+  devices (HID, mass storage, several functions at once) or USB host mode
+  are not bundled
   yet. Write them with `hal.Reg` as above.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests

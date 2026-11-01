@@ -5,6 +5,7 @@ import "std/embedded/hal"
 import "std/embedded/chip/rp2350"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
+import "std/embedded/chip/rp_rng"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/chip/rp_watchdog"
 
@@ -80,6 +81,9 @@ pub struct Board {
     // The DMA channels: `channel()` claims one, for transfers that run
     // while the program does other work.
     pub dma: rp_dma.Dma
+    // The random number generator, the RP2350's TRNG, fit for
+    // cryptographic keys; std/embedded/chip/rp_rng documents it.
+    pub rng: rp_rng.Trng
     // The second core, `start`ed with a task of its own, and the FIFOs,
     // spinlocks, and doorbells the two cores share; see
     // std/embedded/chip/rp_multicore.
@@ -106,8 +110,8 @@ pub fn take() -> Board!hal.Error {
     wireless.init(&mut chip.timer)?
     led := Led { wireless, on: false }
     led.set_low()
-    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, core1, fifos, spinlocks, doorbells, power } = chip
-    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, core1, fifos, spinlocks, doorbells, power })
+    let rp2350.Peripherals { pins, timer, rtc, watchdog, usb, dma, rng, core1, fifos, spinlocks, doorbells, power } = chip
+    return ok(Board { led, pins, timer, rtc, watchdog, usb: Usb { usb }, dma, rng, core1, fifos, spinlocks, doorbells, power })
 }
 
 // The LED on the wireless chip's GPIO 0. Implements the std/embedded/hal

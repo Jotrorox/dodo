@@ -145,7 +145,9 @@ their I2C and SPI buses, as master or target, and serial ports through the
 shared controller drivers in `std/embedded/peripheral` and the pin and
 controller ownership both chips share in `std/embedded/chip/rp_pins`, and
 their PWM outputs and inputs and ADC inputs through `std/embedded/chip/rp_pwm` and
-`std/embedded/chip/rp_adc`, their PIO state machines, with programs assembled
+`std/embedded/chip/rp_adc`, their random number generators, the RP2040's
+ring oscillator and the RP2350's TRNG, through `std/embedded/chip/rp_rng`,
+their PIO state machines, with programs assembled
 at compile time, through `std/embedded/chip/rp_pio`, I2S audio on PIO
 through `std/embedded/chip/rp_i2s`, a USB serial port on
 the board's own USB connector through `std/embedded/chip/rp_usb`, their DMA
