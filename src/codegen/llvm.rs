@@ -874,7 +874,8 @@ impl<'ctx> Module<'ctx> {
                 // Left as a load, scalar replacement would split it into one
                 // operation per byte.
                 let direct = users.iter().all(|&user| {
-                    !LLVMIsAExtractValueInst(user).is_null() || no_writes_between(load, user, source)
+                    !LLVMIsAExtractValueInst(user).is_null()
+                        || no_writes_between(load, user, source)
                 });
                 let source = if direct {
                     source

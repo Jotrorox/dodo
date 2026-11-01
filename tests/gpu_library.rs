@@ -255,7 +255,10 @@ fn recording_mistakes_panic() {
         let line: usize = location.split(':').next().unwrap().parse().unwrap();
         let text = fs::read_to_string(root().join("stdlib/std/gpu.dodo")).unwrap();
         let reported = text.lines().nth(line - 1).unwrap();
-        assert!(reported.contains(message), "{name}: line {line} is {reported:?}");
+        assert!(
+            reported.contains(message),
+            "{name}: line {line} is {reported:?}"
+        );
     }
 }
 
