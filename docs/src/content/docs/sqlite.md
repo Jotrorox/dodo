@@ -60,16 +60,25 @@ until the cursor moves on.
 
 A connection keeps everything in the byte slice you pass to `open`: the page
 cache, the parsed statements, the values of the current row, and the space for
-sorting and grouping. `sqlite.WORKSPACE_BYTES` (2 MiB) suits most programs;
-the minimum is `sqlite.MIN_WORKSPACE_BYTES`. Larger workspaces cache more
-pages and can sort, group, and materialize larger results. Put a large
-workspace in a `static mut` array rather than on the stack.
+sorting and grouping. `sqlite.WORKSPACE_BYTES` (2 MiB) suits most programs.
+The smallest workspace depends on the page size:
+`sqlite.min_workspace_bytes(page_size)` returns it, and
+`sqlite.MIN_WORKSPACE_BYTES` (400 KiB) covers SQLite's default 4096-byte
+pages. Databases with 65536-byte pages fit in the default 2 MiB workspace.
+Larger workspaces cache more pages and can sort, group, and materialize larger
+results. Put a large workspace in a `static mut` array rather than on the
+stack.
 
-When a fixed region is too small for a request, for example a single value
+The regions are sized when the connection opens, from the database's page
+size. `PRAGMA page_size` on a database that does not exist yet lays the
+workspace out again for the new size before the next statement; prepared
+statements are recompiled automatically.
+
+When a region is too small for a request, for example a single value
 larger than the value area or an `ORDER BY` over more rows than the sorter
 holds, the statement fails with `db.ErrorKind.Capacity`, rolls back, and
-`conn.message()` names the region. Nothing is ever spilled to temporary
-files.
+`conn.message()` names the region. Query results are never spilled to
+temporary files.
 
 ## Running statements
 
@@ -134,11 +143,20 @@ conn.exec("commit")?
 ```
 
 As in SQLite, a statement that fails inside a transaction undoes only its own
-changes, and the transaction stays open. (A statement that changes more pages
-than the statement-undo area of the workspace holds rolls back the whole
-transaction instead; `conn.in_transaction()` then reports `false`.) `BEGIN IMMEDIATE` (and
+changes, and the transaction stays open. `BEGIN IMMEDIATE` (and
 `conn.begin(db.IsolationLevel.Serializable)`) takes the write lock at once,
 so a later write cannot fail because another process holds it.
+
+`SAVEPOINT name`, `RELEASE [SAVEPOINT] name`, and `ROLLBACK TO [SAVEPOINT]
+name` nest transactions as in SQLite: `ROLLBACK TO` undoes everything since
+the savepoint and leaves it open, `RELEASE` keeps the changes, and a
+`SAVEPOINT` outside `BEGIN` starts a transaction that the release of the
+outermost savepoint commits. The page images that savepoints and failing
+statements need for undo stay in the workspace; when a large transaction on
+a file database outgrows that area, they continue in a `<database>-stmtjrnl`
+file that is deleted when the transaction ends. (Without a savepoint, an
+in-memory database that outgrows the area rolls back the whole transaction
+when a statement fails; `conn.in_transaction()` then reports `false`.)
 
 When another process holds a conflicting lock, the operation fails with
 `db.ErrorKind.Busy` ("database is locked"). `Options.busy_timeout_ms`,
@@ -253,16 +271,23 @@ transactions with hot-journal recovery; WAL mode with its `-wal` log and
 [`fs.File.try_lock_range`](filesystem.md); UTF-8 databases; schema formats 1
 to 4.
 
-**SQL.** `CREATE`/`DROP` `TABLE`, `INDEX` (including `UNIQUE` and the
-automatic indexes behind `PRIMARY KEY` and `UNIQUE` constraints), and `VIEW`;
-`ALTER TABLE` `RENAME TO`, `RENAME COLUMN`, and `ADD COLUMN`; `INSERT`
+**SQL.** `CREATE`/`DROP` `TABLE` (including `WITHOUT ROWID` tables),
+`INDEX` (including `UNIQUE`, indexes on expressions, partial indexes with
+`WHERE`, and the automatic indexes behind `PRIMARY KEY` and `UNIQUE`
+constraints), `VIEW`, and `TRIGGER` (`BEFORE`, `AFTER`, and `INSTEAD OF` on
+views; `INSERT`, `DELETE`, `UPDATE [OF columns]`; `WHEN`; `RAISE`; nested
+triggers, with recursive firing off as in SQLite's default);
+`ALTER TABLE` `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, and `DROP COLUMN`
+(references in views, triggers, and foreign keys follow renames, as with
+SQLite's default `legacy_alter_table = OFF`); `INSERT`
 (including `INSERT ... SELECT`, `DEFAULT VALUES`, `OR IGNORE`/`REPLACE`/...,
 and UPSERT), `UPDATE`, `DELETE`, each with `RETURNING`; `SELECT` with joins
 (inner, `LEFT`, `CROSS`, `USING`), subqueries (scalar, `IN`, `EXISTS`, in
 `FROM`), compound selects (`UNION [ALL]`, `INTERSECT`, `EXCEPT`), `WITH` and
 `WITH RECURSIVE`, `DISTINCT`, aggregates, `GROUP BY`/`HAVING`,
 `ORDER BY ... NULLS FIRST/LAST`, and `LIMIT`/`OFFSET`; `BEGIN`
-(`DEFERRED`/`IMMEDIATE`/`EXCLUSIVE`), `COMMIT`, `ROLLBACK`; constraints
+(`DEFERRED`/`IMMEDIATE`/`EXCLUSIVE`), `COMMIT`, `ROLLBACK`, `SAVEPOINT`,
+`RELEASE`, `ROLLBACK TO`; constraints
 `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `CHECK`, `DEFAULT`, `COLLATE`,
 `AUTOINCREMENT`; `INTEGER PRIMARY KEY` rowid aliases; collations `BINARY`,
 `NOCASE`, and `RTRIM`; type affinity and comparison rules as in SQLite.
@@ -281,13 +306,12 @@ and UPSERT), `UPDATE`, `DELETE`, each with `RETURNING`; `SELECT` with joins
 `page_size`, `page_count`, `freelist_count`, `encoding`, `journal_mode`
 (`DELETE` and `WAL`; other rollback modes behave as `DELETE`),
 `wal_checkpoint`, `wal_autocheckpoint`, `table_info`, `table_list`, `index_list`, `index_info`, `integrity_check`,
-`quick_check`, `busy_timeout`, `database_list`; others are accepted and
+`quick_check`, `busy_timeout`, `database_list`, `legacy_alter_table`; others
+are accepted and
 ignored, as SQLite does for unknown pragmas.
 
-**Not supported.** Triggers (tables with triggers can be
-read but not written), window functions, `WITHOUT ROWID` and virtual tables,
-`ATTACH`, savepoints, `ALTER TABLE DROP COLUMN`, writes to tables with
-expression or partial indexes, UTF-16 databases, temporary tables, and
+**Not supported.** Window functions, virtual tables,
+`ATTACH`, UTF-16 databases, temporary tables, and
 time zones (`localtime` and `utc` leave times in UTC). Reals are printed
 with SQLite 3.47's rule (the shortest of 15 or 17 significant digits that
 round-trips); the 17th digit can occasionally differ from SQLite's own
