@@ -25,7 +25,7 @@ REPOSITORY = "https://github.com/Jotrorox/dodo/blob/main/"
 INTRINSIC_IMPORTS = {"core/mem", "core/ptr", "core/mmio", "core/cpu"}
 VIRTUAL_IMPORTS = {
     f"std/{family}/native"
-    for family in ("platform", "fs", "env", "process", "signal", "thread", "sync", "net", "time", "tls", "quic", "crypto", "crypto/openssl", "web", "window", "dylib")
+    for family in ("platform", "fs", "env", "process", "signal", "thread", "sync", "net", "time", "tls", "quic", "crypto", "crypto/openssl", "web", "window", "dylib", "gpu/opengl")
 }
 
 
@@ -294,8 +294,10 @@ def guide_for(module: str) -> str:
         return "core"
     if module.startswith("alloc/"):
         return "allocation"
-    if module == "std/gpu/metal" or module.startswith("std/gpu/metal/"):
-        return "metal"
+    # Metal and OpenGL have their own guides; the rest of std/gpu shares gpu.md.
+    for api in ("metal", "opengl"):
+        if module == f"std/gpu/{api}" or module.startswith(f"std/gpu/{api}/"):
+            return api
     family = module.split("/")[1]
     return {
         "arena_bytes": "bytes", "bytes_alloc": "bytes", "pool_bytes": "bytes",

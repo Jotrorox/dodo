@@ -29,6 +29,44 @@
   the eight doorbells between the cores. `ring()` interrupts the other core,
   and `set_signal` makes the runtime's new `SIO_IRQ_BELL` handler raise an
   executor signal there, to wake a task on the other core without the FIFO.
+- `std/embedded/hal` gains a shared timer protocol: `Counter` (`now_us`), a
+  free-running microsecond count, and `Alarm` (`now_us`, `schedule_at_us`,
+  `cancel`, `fired`, `clear`), a one-shot compare that fires at once for a
+  time already reached. `hal.Deadline` and `hal.Ticker` give drivers
+  timeouts and drift-free periodic work on any counter, with
+  `elapsed_us`, `wait_until`, `schedule_in_us`, and `wait_for_alarm`
+  helpers. Board timers are counters, and the RP2040 and RP2350 alarms
+  implement the alarm protocol for times up to 35 minutes ahead, forcing
+  their interrupt when a time has passed before the alarm was armed.
+  `std/embedded/hal/fake` gains `Alarm`, and `fake.Delay` is a counter whose
+  time is the delays asked of it, so timeouts are tested without waiting.
+- Watchdog for the RP2040 and RP2350: `b.watchdog` on every board (and
+  `watchdog` in the chips' `Peripherals`) is a `std/embedded/chip/rp_watchdog`
+  `Watchdog`. It is stopped after `take()`. `start(timeout_ms)` makes it reset
+  the chip unless `feed()` is called in time, from 1 ms up to 8388 ms on the
+  RP2040 (whose count runs twice per tick, erratum RP2040-E1) or 16777 ms on
+  the RP2350. `stop()`, `remaining_us()`, and `restart()` for a deliberate
+  reset complete it. The reset restarts everything but the oscillators, and
+  the count pauses while a debugger halts a core. `reset_reason()` reads
+  `hal.ResetReason.Timeout`, `Restart`, or `Other`. A Pico SDK-style mark tells
+  the program's watchdog resets apart from the boot ROM's, so the first run
+  after flashing reads `Other`. Two `scratch` words survive the reset.
+  `std/embedded/hal` gains the `Watchdog` protocol (`feed`), so drivers and
+  tasks can feed any chip's watchdog. Desktop tests run the driver against a
+  model of both chips' watchdogs, and the board self-tests gain a watchdog
+  check.
+- `std/gpu/opengl` creates OpenGL contexts without a window, and
+  `std/gpu/opengl/gl` binds the complete OpenGL 4.6 core profile (656
+  commands, 1364 enums), generated from the Khronos registry by
+  `scripts/generate_opengl.py`. Both are pure Dodo with no C runtime: each
+  OS's interface is opened at run time (EGL on Linux, surfaceless and without
+  an X server; CGL on macOS; WGL with a hidden window on Windows), so programs
+  link no graphics library and start on machines without one.
+  `opengl.Target` is an offscreen framebuffer whose pixels read back in
+  `std/graphics` row order, as RGBA or as the BGRA a `std/window` canvas uses;
+  `examples/opengl_window.dodo` shows a shaded triangle in a window. A
+  fixture renders and reads back a triangle with Mesa's llvmpipe in Linux CI
+  and with CGL on macOS.
 - `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
   entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
   declared with its own signature. It covers devices, command queues,
