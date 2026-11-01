@@ -8,6 +8,7 @@ import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
+import "std/embedded/chip/rp_watchdog"
 import "std/embedded/cortex_m"
 import "std/embedded/executor"
 import "std/embedded/hal"
@@ -1250,6 +1251,31 @@ fn core1_checks(core1: &mut rp_multicore.Core1, fifos: &mut rp_multicore.Fifos, 
     spinlocks.release(lock)
 }
 
+// The watchdog through its API, taking over the self-test's raw 3 s
+// watchdog: timeouts it cannot count are refused, it counts down once per
+// microsecond (the RP2040's double count included), reloads when fed, holds
+// its count while stopped, and its scratch word 0 is the register record()
+// copies the state to. It is left running at 3 s, as before.
+fn watchdog_checks(watchdog: &mut rp_watchdog.Watchdog, timer: &mut chip.Timer) {
+    zero := refused_void(watchdog.start(0), hal.Error.InvalidInput)
+    longest := watchdog.max_timeout_ms()
+    too_long := refused_void(watchdog.start(longest + 1), hal.Error.InvalidInput)
+    watchdog.start(3000)!
+    started := watchdog.is_running() && watchdog.timeout_ms() == 3000
+    timer.delay_ms(100)
+    left := watchdog.remaining_us()
+    counted := left > 2_890_000 && left < 2_910_000
+    watchdog.feed()
+    fed := watchdog.remaining_us() > 2_995_000
+    watchdog.stop()
+    held := watchdog.remaining_us()
+    timer.delay_ms(10)
+    paused := !watchdog.is_running() && watchdog.remaining_us() == held
+    mapped := (watchdog.scratch(0) & 0xFFFF_0000) == RUNNING
+    watchdog.start(3000)!
+    check(zero && too_long && started && counted && fed && paused && mapped && watchdog.is_running())
+}
+
 fn main() {
     // A previous run hung and the watchdog reset the chip: report it.
     unsafe {
@@ -1415,6 +1441,7 @@ fn main() {
     usb_checks(&mut b.usb, &mut b.pins, &mut b.timer)
     dma_checks(&mut b.dma, &mut b.pins, &mut b.timer)
     core1_checks(&mut b.core1, &mut b.fifos, &mut b.spinlocks, &mut b.timer)
+    watchdog_checks(&mut b.watchdog, &mut b.timer)
 
     // Configuration is validated before ownership: an unusable crystal is
     // InvalidInput, a valid one is Busy because the board already took it.

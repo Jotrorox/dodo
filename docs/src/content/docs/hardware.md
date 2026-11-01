@@ -92,6 +92,8 @@ methods implements it and can be passed where a driver expects it:
 | `hal.OutputPin` | `set_high(&mut self)`, `set_low(&mut self)` |
 | `hal.InputPin` | `is_high(&self) -> bool` |
 | `hal.Delay` | `delay_us(&mut self, microseconds: u32)` |
+| `hal.Counter` | `now_us(&self) -> u64` |
+| `hal.Alarm` | `now_us(&self) -> u64`<br>`schedule_at_us(&mut self, time_us: u64) -> void!hal.Error`<br>`cancel(&mut self)`<br>`fired(&self) -> bool`<br>`clear(&mut self)` |
 | `hal.I2c` | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
@@ -117,7 +119,21 @@ reference voltage. `hal.I2C_STANDARD_HZ`,
 The register block protocol is for [peripheral drivers](#register-blocks)
 rather than device drivers.
 
-Pins and delays cannot fail. Bus, PWM, and analog operations return
+A counter keeps time: `now_us()` is microseconds since a fixed start, such
+as the chip's, in a `u64` that never decreases and that no program outlives.
+Drivers measure intervals and give up on stuck devices with one; see
+[timeouts and periodic work](#timeouts-and-periodic-work). An alarm fires
+once when its counter reaches the time given to `schedule_at_us`, replacing
+any earlier time and clearing an earlier firing; a time already reached
+fires at once, and one further ahead than the alarm reaches is
+`InvalidInput`. Code polls `fired()`, or the alarm's interrupt runs a
+handler, and either calls `clear()`. Turning that interrupt on is
+chip-specific, as `listen` and `irq` are on the
+[RP2040 and RP2350](#an-interrupt-driven-driver); the protocol only sets
+times and reports them. An alarm has `now_us` too, so it is also a counter.
+
+Pins, delays, and counters cannot fail. Alarm, bus, PWM, and analog
+operations return
 `hal.Error`, one shared enum, because such a device may itself sit on a bus,
 as a PWM controller chip on I2C does: `Timeout`, `NoAcknowledge`, `Bus`,
 `Overrun`, `Busy`, `InvalidInput`, and `Unsupported`. Every driver and chip uses the same error type, so `?` passes
@@ -155,6 +171,12 @@ bus and a memory buffer.
 | --- | --- |
 | `hal.write_pin(&mut pin, high)` | Drive a pin from a `bool`. |
 | `hal.delay_ms(&mut delay, ms)` | Millisecond delay from any `delay_us`. |
+| `hal.elapsed_us(&counter, since_us)` | Microseconds since an earlier `now_us()`; 0 for a time still ahead. |
+| `hal.wait_until(&counter, time_us)` | Busy-wait until a counter reaches a time. |
+| `hal.Deadline` | A time by which something must happen: `Deadline.after(&counter, us)` or `Deadline.at(time_us)`, then `passed(&counter)`, `remaining_us(&counter)`, and `wait(&counter)`. |
+| `hal.Ticker` | Ticks at a fixed period without drift: `Ticker.start(&counter, period_us)`, then `ready(&counter)` once per tick, or `wait(&counter)`. Ticks missed entirely are skipped. |
+| `hal.schedule_in_us(&mut alarm, us)` | Fire an alarm a number of microseconds from now. |
+| `hal.wait_for_alarm(&mut alarm)` | Busy-wait until an alarm fires, then clear it. |
 | `hal.read_register(&mut bus, address, register)` | Read one numbered 8-bit I2C register. |
 | `hal.read_registers(&mut bus, address, first, buffer)` | Read consecutive I2C registers. |
 | `hal.write_register(&mut bus, address, register, value)` | Write one I2C register. |
@@ -163,6 +185,59 @@ bus and a memory buffer.
 | `hal.set_pulse_us(&mut output, pulse_us, period_us)` | Set a PWM pulse length, as for a servo: `set_pulse_us(&mut servo, 1500, 20_000)` centres one on a 50 Hz output. |
 | `hal.read_millivolts(&mut input, reference_mv)` | Read an analog input as millivolts. |
 | `hal.SpiDevice<P>` | One SPI device and its chip-select pin; see below. |
+
+### Timeouts and periodic work
+
+A driver that waits for a device names no chip when it takes a counter.
+Boards' timers are both a counter and a delay, so a driver bounded by
+`hal.Delay + hal.Counter` polls, delays between polls, and gives up at a
+deadline. A `hal.Deadline` holds only its time, so it never borrows the
+counter, and in a test `fake.Delay` reaches the deadline without waiting:
+its time is the sum of the delays asked of it.
+
+```dodo test
+package ready
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+const ADDRESS: u8 = 0x48
+const STATUS: u8 = 0x00
+
+// Poll the status register every millisecond until it is nonzero, for at
+// most `timeout_us`.
+pub fn wait_ready<B: hal.I2c, T: hal.Delay + hal.Counter>(bus: &mut B, timer: &mut T, timeout_us: u64) -> void!hal.Error {
+    deadline := hal.Deadline.after(timer, timeout_us)
+    for hal.read_register(bus, ADDRESS, STATUS)? == 0 {
+        if deadline.passed(timer) {
+            return err(hal.Error.Timeout)
+        }
+        timer.delay_us(1000)
+    }
+    return ok()
+}
+
+@test
+fn a_stuck_device_times_out() {
+    bus := fake.I2c.new(ADDRESS)
+    timer := fake.Delay.new()
+    match wait_ready(&mut bus, &mut timer, 5000) {
+        ok() => assert(false),
+        err(error) => assert(error == hal.Error.Timeout),
+    }
+    assert_eq(timer.now_us(), 5000u64)
+    bus.set_register(STATUS, 1)
+    wait_ready(&mut bus, &mut timer, 5000)!
+}
+```
+
+A `hal.Ticker` runs work at a fixed period, such as sampling every 10 ms:
+`ticker := hal.Ticker.start(&b.timer, 10_000)`, then `ticker.wait(&b.timer)`
+before each sample. Every tick falls a whole number of periods after the
+start, so the samples do not drift however long each one takes. Firmware
+that runs several such jobs side by side uses the
+[executor](#tasks-and-the-executor) instead, whose tasks sleep rather than
+busy-wait.
 
 ### Several devices on one SPI bus
 
@@ -331,15 +406,17 @@ which pins can carry which bus.
 | Fake | Behaves like | Inspect with |
 | --- | --- | --- |
 | `fake.Pin` | An input/output pin, initially low. | `is_high()`, `changes()` |
-| `fake.Delay` | A delay that returns at once. | `elapsed_us()` |
+| `fake.Delay` | A delay that returns at once, and a counter whose time is the delays so far. | `elapsed_us()`, `now_us()` |
+| `fake.Alarm` | An alarm on a counter that starts at 0 and moves only on `advance`. It reaches any time ahead. | `advance(us)`, `is_armed()`, `target_us()`, `schedules()`, `fail_next(error)` |
 | `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. | `register(n)`, `set_register(n, v)`, `fail_next(error)` |
 | `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. | `sent()`, `clear()`, `reply_with(bytes)` |
 | `fake.Serial` | A serial port, the `std/io` Reader and Writer: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)` |
 | `fake.Pwm` | A PWM output with a given `max_duty`, initially at duty 0. | `duty()`, `changes()`, `fail_next(error)` |
 | `fake.Analog` | An analog input with a given `max_value` that reads the value given to `set`, after any given to `queue`, one per read. | `set(value)`, `queue(values)`, `reads()`, `fail_next(error)` |
-| `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
+| `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock, and a counter: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
-`fail_next` makes the next I2C transaction, duty change, or analog read fail,
+`fail_next` makes the next I2C transaction, duty change, analog read, or
+alarm schedule fail,
 so error paths are as easy to test as success. The repository's
 `examples/dimmer.dodo` tests an LED dimmer, a knob on an analog input setting
 a PWM output, this way, and `examples/dimmer_board.dodo` runs it unchanged on
@@ -673,7 +750,7 @@ which is open at reset and closed only inside critical sections.
 | Driver | Interrupt sources |
 | --- | --- |
 | `pl011.Port` and `Controller` | `listen(sources)`, `ignore(sources)`, `pending_interrupts()`, and `clear_interrupts(sources)` with `RX_INTERRUPT` (FIFO 3/4 full), `RX_TIMEOUT_INTERRUPT` (bytes waiting for 32 bit times), `TX_INTERRUPT`, and `ERROR_INTERRUPTS`. The receive sources end when reads drain the FIFO. |
-| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` that fires once at `schedule_at(time)` or `schedule_in(microseconds)`; `listen` raises `alarm.irq()`, and its handler calls `clear`. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
+| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` with the [alarm protocol](#device-protocols): it fires once at `schedule_at_us(time)`, a `now_us()` time up to 2^31 - 1 us (35 minutes) ahead, or at the low 32 bits of the counter with `schedule_at(time)` and `schedule_in(microseconds)`. `listen` raises `alarm.irq()`, and its handler calls `clear`; a time `schedule_at_us` finds already passed raises it at once. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
 | `Pin` on the RP2040 and RP2350 | `listen(events)` raises `IO_IRQ_BANK0` for `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, or `LEVEL_LOW`; `events()` shows them, `clear_events(edges)` acknowledges edges, `ignore(events)` stops. |
 
 ### The Cortex-M core
@@ -1122,7 +1199,8 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
-| `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`; `alarm(n)` claims an alarm, which can also run the [executor](#tasks-and-the-executor). |
+| `b.timer` | The delay and counter protocols, plus `delay_ms(ms)`; `alarm(n)` claims an alarm with the alarm protocol, which can also run the [executor](#tasks-and-the-executor). |
+| `b.watchdog` | The [watchdog](#the-watchdog-on-the-rp2040-and-rp2350): `start(timeout_ms)`, then `feed()` in time or the board resets; `reset_reason()` tells whether it did. Implements `hal.Watchdog`. |
 | `b.dma` | The [DMA channels](#dma-on-the-rp2040-and-rp2350): `channel()` claims one, `release(channel)` gives it back. Buses and serial ports take them for transfers that run while the program does other work. |
 | `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
@@ -2039,6 +2117,56 @@ spinlock around the results both cores read. The ADC and the USB serial port
 share the bookkeeping that starts and stops PLL_USB, so claim and release them
 from one core.
 
+### The watchdog on the RP2040 and RP2350
+
+A watchdog restarts firmware that hangs. Once started, it counts down, and
+unless the program calls `feed()` before the count runs out, it resets the
+chip. `b.watchdog` is stopped after `board.take()`:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+
+fn main() {
+    b := board.take()!
+    if b.watchdog.reset_reason() == hal.ResetReason.Timeout {
+        // The last run hung: count it in a word that survived the reset.
+        hangs := b.watchdog.scratch(0)
+        b.watchdog.set_scratch(0, hangs + 1)
+    }
+    b.watchdog.start(500)!
+    for {
+        b.led.toggle()
+        b.timer.delay_ms(100)
+        b.watchdog.feed()
+    }
+}
+```
+
+| `rp_watchdog.Watchdog` | Purpose |
+| --- | --- |
+| `start(timeout_ms)` | Count down from the timeout, from 1 ms up to `max_timeout_ms()`: 8388 ms on the RP2040, which counts twice per tick (erratum RP2040-E1), and 16777 ms on the RP2350. `InvalidInput` outside that range. Starting a running watchdog changes its timeout. |
+| `feed()` | Count down from the timeout again; the `hal.Watchdog` protocol, so drivers and tasks can feed it without naming the chip. |
+| `stop()`, `is_running()` | Stop counting, so the chip is not reset, until `start` again. |
+| `timeout_ms()`, `remaining_us()` | The timeout last started, and the microseconds left before the reset. |
+| `reset_reason()` | Why the chip last started: `hal.ResetReason.Timeout` if the watchdog ran out, `Restart` after `restart()`, and `Other` after power-up, the RUN pin, a debugger, or the boot ROM. |
+| `scratch(n)`, `set_scratch(n, value)` | Two words, `n` 0 or 1, that survive a watchdog reset but not power-up, for a note to the next run. |
+| `restart()` | Reset the chip through the watchdog now. Does not return. |
+
+The reset restarts both cores, the peripherals, and RAM, but not the
+oscillators. The count pauses while a debugger halts a core. A panic halts
+the program, so with the watchdog running the default panic hook's report is
+followed by a restart, which `reset_reason()` reads as `Timeout`.
+
+The boot ROM resets through the same watchdog when it restarts into the
+bootloader and when it starts newly flashed firmware. As in the Pico SDK,
+`start` leaves a mark in a scratch register that the boot ROM overwrites, and
+only a reset with that mark counts as the watchdog's.
+`reboot_to_bootloader()` clears the mark, so the first run after `dodo run`
+reads `Other`. `board.take()` reads the reason once and clears the mark.
+
 ### The Raspberry Pi Pico 2 W
 
 The Pico 2 W is a Pico 2 with an Infineon CYW43439 Wi-Fi and Bluetooth chip.
@@ -2147,9 +2275,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  PIO, the timer, DMA, a USB serial port, and the second core; other USB
-  devices (HID,
-  mass storage, several functions at once) or USB host mode are not bundled
+  PIO, the timer, the watchdog, DMA, a USB serial port, and the second core;
+  other USB devices (HID, mass storage, several functions at once) or USB
+  host mode are not bundled
   yet. Write them with `hal.Reg` as above.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
@@ -2184,8 +2312,10 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - Inline assembly lives inside functions; there is no global or naked
   assembly, so startup code and vector tables come from the chip runtime or a
   `@section`-placed static.
-- Timers have no shared protocol yet. Expose them as methods on your chip's
-  types.
+- The timer protocols count microseconds. Counters at other rates, a
+  timer's capture and compare channels, and periodic hardware timers have no
+  shared protocol; use the chip's own methods, as for the RP2040's and
+  RP2350's alarms, whose interrupts `listen` turns on.
 - SPI by DMA moves frames of up to 8 bits; wider frames use the word
   methods, which are polled. A queued I2C transaction fits the controller's
   FIFO, 16 commands on both chips; longer transfers use the blocking

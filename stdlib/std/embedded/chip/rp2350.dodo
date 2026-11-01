@@ -9,22 +9,23 @@ import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_usb"
+import "std/embedded/chip/rp_watchdog"
 import "std/embedded/peripheral/designware_i2c"
 import "std/embedded/peripheral/pl011"
 import "std/embedded/peripheral/pl022"
 import "std/embedded/chip/rp_pins"
 
 // Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
-// I2C, SPI, UART, PWM, the ADC, PIO, the microsecond timer, a USB serial
-// port, the second core, the FIFOs and spinlocks the cores share, and the
-// boot ROM. `take(config)` brings the chip from its boot state (ring
+// I2C, SPI, UART, PWM, the ADC, PIO, the microsecond timer, the watchdog, a
+// USB serial port, the second core, the FIFOs and spinlocks the cores share,
+// and the boot ROM. `take(config)` brings the chip from its boot state (ring
 // oscillator, peripherals held in reset) to a known configuration and hands
 // out the peripherals once. Pins implement the std/embedded/hal output and
 // input pin protocols, I2C and SPI buses claimed from `Pins` implement the
 // bus protocols, serial ports the std/io Reader and Writer protocols, PWM
-// outputs and ADC inputs the PWM output and analog input protocols, and the
-// timer implements the delay protocol, so portable drivers use them
-// unchanged.
+// outputs and ADC inputs the PWM output and analog input protocols, the
+// timer the delay protocol, and the watchdog the watchdog protocol, so
+// portable drivers use them unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -133,6 +134,9 @@ const TICK_TIMER0: usize = TICKS_BASE + 0x18
 const TICK_WATCHDOG: usize = TICKS_BASE + 0x30
 const TICK_ENABLE: u32 = 1 << 0
 
+// The watchdog (12.9).
+const WATCHDOG_BASE: usize = 0x400D_8000
+
 // Microsecond timer TIMER0 (12.8). The raw registers read without latching.
 const TIMER0_BASE: usize = 0x400B_0000
 const TIMER_RAW_HIGH: usize = TIMER0_BASE + 0x24
@@ -144,6 +148,8 @@ const TIMER_ALARM0: usize = TIMER0_BASE + 0x10
 const TIMER_ARMED: usize = TIMER0_BASE + 0x20
 const TIMER_INTR: usize = TIMER0_BASE + 0x3C
 const TIMER_INTE: usize = TIMER0_BASE + 0x40
+// INTF forces an alarm's interrupt, as if it had fired, until cleared.
+const TIMER_INTF: usize = TIMER0_BASE + 0x44
 // The longest an alarm sleeps at once: below 2^31 us, so its 32-bit
 // target time is still ahead when the write lands.
 const MAX_ALARM_SLEEP_US: u64 = 0x7FFF_FFFF
@@ -313,7 +319,10 @@ pub fn reboot_to_bootloader(activity_led: u32) {
     }
     // SAFETY: on success the ROM resets the chip after 10 ms and never
     // returns, so no peripheral owned by this program is used afterwards.
+    // Clearing the watchdog's mark makes that reset, and the one after
+    // flashing, read as Other rather than as the program's.
     unsafe {
+        rp_watchdog.clear_mark(WATCHDOG_BASE)
         dodo_rp2350_rom_call(ROM_REBOOT, REBOOT_TYPE_BOOTSEL | REBOOT_NO_RETURN_ON_SUCCESS, 10, flags, pin)
     }
     for {}
@@ -352,6 +361,8 @@ pub struct Config {
 pub struct Peripherals {
     pub pins: Pins
     pub timer: Timer
+    // The watchdog, stopped; rp_watchdog documents it.
+    pub watchdog: rp_watchdog.Watchdog
     pub usb: Usb
     // The DMA controller's channels; rp_dma documents them.
     pub dma: rp_dma.Dma
@@ -402,6 +413,11 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     bank := unsafe {
         rp_pins.Bank.new(Chip { crystal_hz: crystal })
     }
+    // SAFETY: TAKEN guarantees one Watchdog, and the watchdog tick runs.
+    // Core 1 uses only the power-on state machine's FRCE_OFF register.
+    watchdog := unsafe {
+        rp_watchdog.Watchdog.at(rp_watchdog.RP2350, WATCHDOG_BASE, PSM_BASE)
+    }
     usb := Usb { crystal_hz: crystal, open: false }
     // SAFETY: TAKEN guarantees one Dma, and the controller was just taken
     // out of reset.
@@ -421,7 +437,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         })
     }
     let rp_multicore.Cores { core1, fifos, spinlocks } = cores
-    return ok(Peripherals { pins: Pins { bank }, timer, usb, dma, core1, fifos, spinlocks })
+    return ok(Peripherals { pins: Pins { bank }, timer, watchdog, usb, dma, core1, fifos, spinlocks })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.
@@ -1101,7 +1117,7 @@ pub struct Pin {
 }
 
 // The free-running 64-bit microsecond counter of TIMER0. Implements the
-// std/embedded/hal delay protocol.
+// std/embedded/hal delay and counter protocols.
 pub struct Timer {
     high: hal.Reg<u32>
     low: hal.Reg<u32>
@@ -1135,6 +1151,9 @@ pub struct Timer {
                 listening: hal.Reg.at(TIMER_INTE),
                 listen_set: hal.Reg.at(TIMER_INTE + SET_ALIAS),
                 listen_clear: hal.Reg.at(TIMER_INTE + CLEAR_ALIAS),
+                forced: hal.Reg.at(TIMER_INTF),
+                force_set: hal.Reg.at(TIMER_INTF + SET_ALIAS),
+                force_clear: hal.Reg.at(TIMER_INTF + CLEAR_ALIAS),
             }
         }
         return ok(alarm)
@@ -1174,7 +1193,9 @@ pub struct Timer {
 // fires once when the microsecond counter reaches the time it was given;
 // with `listen` it raises interrupt TIMER0_IRQ_0 + n, whose handler calls
 // `clear` and may schedule the next time. Move it into a
-// `static mut Option<Alarm>` for the handler to use.
+// `static mut Option<Alarm>` for the handler to use. Implements the
+// std/embedded/hal alarm and counter protocols, with times up to
+// 2^31 - 1 us (35 minutes) ahead.
 pub struct Alarm {
     number: u32
     bit: u32
@@ -1186,6 +1207,9 @@ pub struct Alarm {
     listening: hal.Reg<u32>
     listen_set: hal.Reg<u32>
     listen_clear: hal.Reg<u32>
+    forced: hal.Reg<u32>
+    force_set: hal.Reg<u32>
+    force_clear: hal.Reg<u32>
 
     // 0 to 3.
     pub fn number(&self) -> u32 {
@@ -1216,6 +1240,32 @@ pub struct Alarm {
         self.target.write(core.wrapping_add(self.low.read(), microseconds))
     }
 
+    // Fire when now_us() reaches `time_us`, replacing any earlier time and
+    // clearing an earlier firing; the std/embedded/hal alarm protocol. A
+    // time already reached fires at once, raising the interrupt if the
+    // alarm listens. InvalidInput for a time more than 2^31 - 1 us ahead.
+    pub fn schedule_at_us(&mut self, time_us: u64) -> void!hal.Error {
+        now := self.now_us()
+        if time_us > now && time_us - now > MAX_ALARM_SLEEP_US {
+            return err(hal.Error.InvalidInput)
+        }
+        self.clear()
+        if time_us > now {
+            self.target.write((time_us & 0xFFFF_FFFF) as u32)
+            if self.now_us() < time_us {
+                return ok()
+            }
+        }
+        // The time had passed before the alarm was armed, which would fire
+        // only once the counter wraps, unless it fired just before. Either
+        // way the hardware alarm is done; force the firing it missed.
+        self.cancel()
+        if !self.raw.any(self.bit) {
+            self.force_set.write(self.bit)
+        }
+        return ok()
+    }
+
     // Disarm: a scheduled time no longer fires.
     pub fn cancel(&mut self) {
         self.armed.write(self.bit)
@@ -1228,13 +1278,14 @@ pub struct Alarm {
 
     // True once it has fired, until `clear`.
     pub fn fired(&self) -> bool {
-        return self.raw.any(self.bit)
+        return self.raw.any(self.bit) || self.forced.any(self.bit)
     }
 
     // Acknowledge that it fired. An interrupt handler has to, or the
     // interrupt stays raised and the handler runs again at once.
     pub fn clear(&mut self) {
         self.raw.write(self.bit)
+        self.force_clear.write(self.bit)
     }
 
     // Raise the interrupt when it fires. Enable the interrupt in the NVIC
