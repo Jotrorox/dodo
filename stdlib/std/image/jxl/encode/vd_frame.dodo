@@ -164,8 +164,12 @@ fn vd_scratch_bytes(z: &VdSizes) -> usize!pixels.Error {
 
 // Worst-case codestream bytes: 29 bits per HF coefficient token (a 15-bit
 // code and 14 extra bits; at most 64 tokens per 8x8 block and channel), 36
-// bits per LF and metadata symbol, the alpha samples' lossless bound, and
-// generous room for headers, trees, codes and padding.
+// bits per LF and metadata symbol (residuals below 2^24), the alpha
+// samples' lossless bound, and the coding overhead: per modular stream with
+// its own tree at most 2560 tree tokens of 40 bits, 32 prefix codes of 250
+// bytes and a 256-entry context map (24 KiB); the HF code spec at most
+// 7426 context map symbols of 17 bits plus 32 codes (32 KiB); headers,
+// padding and TOC.
 fn vd_codestream_bound(plan: &VdPlan, layout: &pixels.Layout) -> usize!pixels.Error {
     padded := pixels.checked(plan.bw * 8, plan.bh * 8, 0)?
     blocks := plan.bw * plan.bh
@@ -174,8 +178,11 @@ fn vd_codestream_bound(plan: &VdPlan, layout: &pixels.Layout) -> usize!pixels.Er
     if plan.alpha {
         bits = pixels.checked(plan.width * plan.height, sample_bound_bits(layout), bits)?
     }
-    lf_groups := plan.lf_x * plan.lf_y
-    overhead := pixels.checked(2 * lf_groups + 4, 65536, 4096)?
+    streams := 2 * plan.lf_x * plan.lf_y
+    if plan.alpha {
+        streams += 1
+    }
+    overhead := pixels.checked(streams, 24576, 4096 + 32768)?
     overhead = pixels.checked(vd_toc_entries(plan), 72, overhead)?
     return pixels.checked(1, bits / 8 + 1, overhead)
 }

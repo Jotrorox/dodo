@@ -192,3 +192,89 @@ fn image_draws_and_encodes_canvases() {
     rgb8 := pixels.Layout.rgb8()
     assert(stored == image.max_encoded_size_for(pixels.Format.Png, 2, 1, &rgb8, &options)!)
 }
+
+static mut JXL_SCRATCH: [8388608]u8 = [0u8; 8388608]
+static mut JXL_OUTPUT: [262144]u8 = [0u8; 262144]
+static mut JXL_DECODED: [65536]u8 = [0u8; 65536]
+static mut JXL_DECODE_SCRATCH: [33554432]u8 = [0u8; 33554432]
+
+// Encode the source as JPEG XL with `options`; returns the size and the
+// decoded PSNR (in dB, 99 for an exact match).
+fn jxl_quality_round_trip(source: &pixels.View, options: &image.EncodeOptions) -> (usize, f64) {
+    format := pixels.Format.Jxl
+    length := 0usize
+    unsafe {
+        bound := image.max_encoded_size(pixels.Format.Jxl, source, options)!
+        assert(bound <= JXL_OUTPUT.len)
+        assert(image.encode_scratch_size(pixels.Format.Jxl, source, options)! <= JXL_SCRATCH.len)
+        length = image.encode(format, source, options, &mut JXL_OUTPUT, &mut JXL_SCRATCH)!
+        assert(length <= bound)
+        data := &JXL_OUTPUT[..length]
+        header := image.info(data)!
+        layout := source.layout()
+        target := pixels.ViewMut.new(&mut JXL_DECODED, source.width(), source.height(), layout.clone())!
+        need := image.scratch_size(data, layout)!
+        assert(need <= JXL_DECODE_SCRATCH.len)
+        image.decode(data, &mut target, &mut JXL_DECODE_SCRATCH[..need])!
+        sum := 0.0f64
+        n := 0usize
+        for y in 0u32..source.height() {
+            a := source.row(y)
+            b := target.row(y)
+            for i in 0usize..a.len {
+                d := a[i] as f64 - b[i] as f64
+                sum += d * d
+                n += 1
+            }
+        }
+        if sum == 0.0 {
+            assert(!header.lossy)
+            return (length, 99.0)
+        }
+        assert(header.lossy)
+        // PSNR without a log: compare the mean squared error instead.
+        mse := sum / n as f64
+        psnr := 0.0f64
+        threshold := 65025.0f64
+        for psnr < 99.0 && mse < threshold {
+            threshold = threshold / 1.2589254117941673
+            psnr += 1.0
+        }
+        return (length, psnr)
+    }
+}
+
+@test
+fn image_jxl_quality_and_lossless_select_the_encoding() {
+    storage := [0u8; 48 * 40 * 3]
+    for y in 0usize..40 {
+        for x in 0usize..48 {
+            for c in 0usize..3 {
+                v := x * 2 + y * 2 + c * 30 + (x * y) % 5
+                storage[(y * 48 + x) * 3 + c] = v as u8
+            }
+        }
+    }
+    source := pixels.View.new(&storage, 48, 40, pixels.Layout.rgb8())!
+    options := image.EncodeOptions.new()
+    assert(options.lossless)
+    let (lossless_size, lossless_psnr) = jxl_quality_round_trip(&source, &options)
+    assert(lossless_psnr == 99.0, "lossless by default")
+    options.lossless = false
+    options.quality = 90
+    let (q90_size, q90_psnr) = jxl_quality_round_trip(&source, &options)
+    options.quality = 50
+    let (q50_size, q50_psnr) = jxl_quality_round_trip(&source, &options)
+    assert(q90_psnr >= 30.0 && q90_psnr < 99.0, "quality 90 is close")
+    assert(q50_psnr < q90_psnr, "lower quality, lower PSNR")
+    assert(q50_size < q90_size && q90_size < lossless_size, "lower quality, smaller file")
+    // An explicit distance overrides the quality.
+    options.distance = 8.0
+    let (d8_size, d8_psnr) = jxl_quality_round_trip(&source, &options)
+    assert(d8_size <= q50_size && d8_psnr <= q50_psnr, "distance 8 is coarser than quality 50")
+    // Quality 100 is lossless.
+    options.distance = 0.0
+    options.quality = 100
+    let (q100_size, q100_psnr) = jxl_quality_round_trip(&source, &options)
+    assert(q100_psnr == 99.0 && q100_size == lossless_size, "quality 100 is lossless")
+}
