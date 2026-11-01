@@ -215,6 +215,132 @@ fn main() {
     }
 }
 
+// Every board's timer is a hal counter and delay, and its alarms are hal
+// alarms: drivers generic over the protocols take them unchanged.
+#[test]
+fn timer_protocols_compile_for_every_board() {
+    let scratch = Scratch::new("timer-protocols");
+    let source = scratch.write(
+        "timers.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/hal"
+fn settle<T: hal.Delay + hal.Counter>(timer: &mut T) -> u64 {
+    start := timer.now_us()
+    deadline := hal.Deadline.after(timer, 2000)
+    for !deadline.passed(timer) {
+        timer.delay_us(100)
+    }
+    return hal.elapsed_us(timer, start)
+}
+fn pulse<A: hal.Alarm>(alarm: &mut A) -> void!hal.Error {
+    hal.schedule_in_us(alarm, 500)?
+    hal.wait_for_alarm(alarm)
+    alarm.schedule_at_us(0)?
+    core.assert(alarm.fired())
+    alarm.clear()
+    alarm.cancel()
+    return ok()
+}
+fn main() {
+    b := board.take()!
+    core.assert(settle(&mut b.timer) >= 2000)
+    ticker := hal.Ticker.start(&b.timer, 1000)
+    ticker.wait(&b.timer)
+    alarm := b.timer.alarm(1)!
+    pulse(&mut alarm)!
+    far := alarm.now_us() + 0x8000_0000
+    match alarm.schedule_at_us(far) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    b.timer.release_alarm(alarm)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for level in ["0", "2"] {
+            let object = scratch.path(&format!("timers-{board}-O{level}.o"));
+            stdout(&dodo(&[
+                "build",
+                source.to_str().unwrap(),
+                "--board",
+                board,
+                "-O",
+                level,
+                "--emit",
+                "obj",
+                "-o",
+                &object,
+            ]));
+        }
+    }
+}
+
+// Low power on a board: the chip's Power through the portable protocol
+// and directly, and the example. Needs no linker.
+#[test]
+fn power_controls_compile_for_every_board() {
+    let scratch = Scratch::new("power");
+    let example = root().join("examples/low_power.dodo");
+    let source = scratch.write(
+        "power.dodo",
+        r#"package main
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/hal"
+import "std/embedded/power"
+fn idle<P: power.Power>(chip_power: &mut P, keep: power.Clocks) -> power.Clocks {
+    stopped := chip_power.disable_unused_clocks()
+    chip_power.set_sleep_clocks(keep)
+    chip_power.set_mode(power.Mode.DeepSleep)
+    chip_power.sleep()
+    chip_power.set_mode(power.Mode.Sleep)
+    return stopped
+}
+fn main() {
+    b := board.take()!
+    stopped := idle(&mut b.power, chip.ALARM_CLOCKS | chip.CLOCK_GPIO)
+    core.assert((stopped & chip.ESSENTIAL_CLOCKS) == 0)
+    match b.power.disable_clocks(chip.ESSENTIAL_CLOCKS) {
+        ok() => core.assert(false),
+        err(error) => core.assert(error == hal.Error.InvalidInput),
+    }
+    b.power.disable_clocks(chip.CLOCK_UART1)!
+    serial := b.pins.uart(4, none, 9600)!
+    core.assert((b.power.enabled_clocks() & chip.CLOCK_UART1) == chip.CLOCK_UART1)
+    b.pins.release_uart(serial)
+    power.deep_sleep(&mut b.power, chip.ALARM_CLOCKS)
+    button := b.pins.input(15)!
+    wake := power.Wake.new()
+    wake.on(15, power.RISING_EDGE | power.LEVEL_HIGH)
+    woken := b.power.dormant(&wake)!
+    core.assert(woken <= 1u64 << 15)
+    b.pins.release(button)
+}
+"#,
+    );
+    for board in ["pico", "pico2", "pico2_w"] {
+        for (input, name) in [(source.as_path(), "power"), (example.as_path(), "example")] {
+            for level in ["0", "2"] {
+                let object = scratch.path(&format!("{name}-{board}-O{level}.o"));
+                stdout(&dodo(&[
+                    "build",
+                    input.to_str().unwrap(),
+                    "--board",
+                    board,
+                    "-O",
+                    level,
+                    "--emit",
+                    "obj",
+                    "-o",
+                    &object,
+                ]));
+            }
+        }
+    }
+}
+
 #[test]
 fn platforms_fill_settings_that_are_not_explicit() {
     let blink = root().join("examples/blink");

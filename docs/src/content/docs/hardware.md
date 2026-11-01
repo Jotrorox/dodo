@@ -17,8 +17,9 @@ grouped under `std/embedded` in layers, on top of two small compiler packages:
 | Typed registers | `std/embedded/hal` | `hal.Reg<T>` and `hal.RegisterBlock` handles and mask constants for memory-mapped registers. |
 | Interrupts | `std/embedded/hal`, `std/embedded/cortex_m` | `@interrupt` handlers; `hal.Critical`, a section that masks interrupts until it is dropped; `hal.Handler`, a slot for a handler chosen at run time; the Cortex-M interrupt controller and SysTick. |
 | Tasks | `std/embedded/executor` | Several activities on one core, each woken on time or by an interrupt, with the core asleep in between. |
+| Low power | `std/embedded/power` | Sleep and deep sleep, clock gating, and a dormant state woken by pins, through one `Power` protocol that every chip and the fakes implement. |
 | DMA | `std/embedded/hal`, `std/embedded/chip/rp_dma` | `hal.DmaChannel`, through which drivers move data while the program does other work; the RP2040's and RP2350's channels. |
-| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, and a simulated clock that record what a driver did. |
+| Desktop testing | `std/embedded/hal/fake` | In-memory pins, delays, buses, serial ports, a simulated clock, and simulated power controls that record what a driver did. |
 | Boards | `std/embedded/board` | The selected board: one `take()` and the same LED, pin, and timer fields on every board. |
 | Chip support | `std/embedded/chip` | The selected microcontroller's peripherals, for custom boards. |
 | Wireless chip | `std/embedded/wireless/cyw43` | The CYW43439 on the Pico 2 W: power-up, its gSPI bus, and its GPIO pins. |
@@ -92,6 +93,8 @@ methods implements it and can be passed where a driver expects it:
 | `hal.OutputPin` | `set_high(&mut self)`, `set_low(&mut self)` |
 | `hal.InputPin` | `is_high(&self) -> bool` |
 | `hal.Delay` | `delay_us(&mut self, microseconds: u32)` |
+| `hal.Counter` | `now_us(&self) -> u64` |
+| `hal.Alarm` | `now_us(&self) -> u64`<br>`schedule_at_us(&mut self, time_us: u64) -> void!hal.Error`<br>`cancel(&mut self)`<br>`fired(&self) -> bool`<br>`clear(&mut self)` |
 | `hal.I2c` | `write(&mut self, address: u8, bytes: &[u8]) -> void!hal.Error`<br>`read(&mut self, address: u8, buffer: &mut[u8]) -> void!hal.Error`<br>`write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!hal.Error` |
 | `hal.Spi` | `transfer(&mut self, bytes: &mut[u8]) -> void!hal.Error`<br>`write(&mut self, bytes: &[u8]) -> void!hal.Error` |
 | `hal.PwmOutput` | `max_duty(&self) -> u16`<br>`set_duty(&mut self, duty: u16) -> void!hal.Error` |
@@ -117,7 +120,21 @@ reference voltage. `hal.I2C_STANDARD_HZ`,
 The register block protocol is for [peripheral drivers](#register-blocks)
 rather than device drivers.
 
-Pins and delays cannot fail. Bus, PWM, and analog operations return
+A counter keeps time: `now_us()` is microseconds since a fixed start, such
+as the chip's, in a `u64` that never decreases and that no program outlives.
+Drivers measure intervals and give up on stuck devices with one; see
+[timeouts and periodic work](#timeouts-and-periodic-work). An alarm fires
+once when its counter reaches the time given to `schedule_at_us`, replacing
+any earlier time and clearing an earlier firing; a time already reached
+fires at once, and one further ahead than the alarm reaches is
+`InvalidInput`. Code polls `fired()`, or the alarm's interrupt runs a
+handler, and either calls `clear()`. Turning that interrupt on is
+chip-specific, as `listen` and `irq` are on the
+[RP2040 and RP2350](#an-interrupt-driven-driver); the protocol only sets
+times and reports them. An alarm has `now_us` too, so it is also a counter.
+
+Pins, delays, and counters cannot fail. Alarm, bus, PWM, and analog
+operations return
 `hal.Error`, one shared enum, because such a device may itself sit on a bus,
 as a PWM controller chip on I2C does: `Timeout`, `NoAcknowledge`, `Bus`,
 `Overrun`, `Busy`, `InvalidInput`, and `Unsupported`. Every driver and chip uses the same error type, so `?` passes
@@ -155,6 +172,12 @@ bus and a memory buffer.
 | --- | --- |
 | `hal.write_pin(&mut pin, high)` | Drive a pin from a `bool`. |
 | `hal.delay_ms(&mut delay, ms)` | Millisecond delay from any `delay_us`. |
+| `hal.elapsed_us(&counter, since_us)` | Microseconds since an earlier `now_us()`; 0 for a time still ahead. |
+| `hal.wait_until(&counter, time_us)` | Busy-wait until a counter reaches a time. |
+| `hal.Deadline` | A time by which something must happen: `Deadline.after(&counter, us)` or `Deadline.at(time_us)`, then `passed(&counter)`, `remaining_us(&counter)`, and `wait(&counter)`. |
+| `hal.Ticker` | Ticks at a fixed period without drift: `Ticker.start(&counter, period_us)`, then `ready(&counter)` once per tick, or `wait(&counter)`. Ticks missed entirely are skipped. |
+| `hal.schedule_in_us(&mut alarm, us)` | Fire an alarm a number of microseconds from now. |
+| `hal.wait_for_alarm(&mut alarm)` | Busy-wait until an alarm fires, then clear it. |
 | `hal.read_register(&mut bus, address, register)` | Read one numbered 8-bit I2C register. |
 | `hal.read_registers(&mut bus, address, first, buffer)` | Read consecutive I2C registers. |
 | `hal.write_register(&mut bus, address, register, value)` | Write one I2C register. |
@@ -163,6 +186,59 @@ bus and a memory buffer.
 | `hal.set_pulse_us(&mut output, pulse_us, period_us)` | Set a PWM pulse length, as for a servo: `set_pulse_us(&mut servo, 1500, 20_000)` centres one on a 50 Hz output. |
 | `hal.read_millivolts(&mut input, reference_mv)` | Read an analog input as millivolts. |
 | `hal.SpiDevice<P>` | One SPI device and its chip-select pin; see below. |
+
+### Timeouts and periodic work
+
+A driver that waits for a device names no chip when it takes a counter.
+Boards' timers are both a counter and a delay, so a driver bounded by
+`hal.Delay + hal.Counter` polls, delays between polls, and gives up at a
+deadline. A `hal.Deadline` holds only its time, so it never borrows the
+counter, and in a test `fake.Delay` reaches the deadline without waiting:
+its time is the sum of the delays asked of it.
+
+```dodo test
+package ready
+
+import "std/embedded/hal"
+import "std/embedded/hal/fake"
+
+const ADDRESS: u8 = 0x48
+const STATUS: u8 = 0x00
+
+// Poll the status register every millisecond until it is nonzero, for at
+// most `timeout_us`.
+pub fn wait_ready<B: hal.I2c, T: hal.Delay + hal.Counter>(bus: &mut B, timer: &mut T, timeout_us: u64) -> void!hal.Error {
+    deadline := hal.Deadline.after(timer, timeout_us)
+    for hal.read_register(bus, ADDRESS, STATUS)? == 0 {
+        if deadline.passed(timer) {
+            return err(hal.Error.Timeout)
+        }
+        timer.delay_us(1000)
+    }
+    return ok()
+}
+
+@test
+fn a_stuck_device_times_out() {
+    bus := fake.I2c.new(ADDRESS)
+    timer := fake.Delay.new()
+    match wait_ready(&mut bus, &mut timer, 5000) {
+        ok() => assert(false),
+        err(error) => assert(error == hal.Error.Timeout),
+    }
+    assert_eq(timer.now_us(), 5000u64)
+    bus.set_register(STATUS, 1)
+    wait_ready(&mut bus, &mut timer, 5000)!
+}
+```
+
+A `hal.Ticker` runs work at a fixed period, such as sampling every 10 ms:
+`ticker := hal.Ticker.start(&b.timer, 10_000)`, then `ticker.wait(&b.timer)`
+before each sample. Every tick falls a whole number of periods after the
+start, so the samples do not drift however long each one takes. Firmware
+that runs several such jobs side by side uses the
+[executor](#tasks-and-the-executor) instead, whose tasks sleep rather than
+busy-wait.
 
 ### Several devices on one SPI bus
 
@@ -331,15 +407,17 @@ which pins can carry which bus.
 | Fake | Behaves like | Inspect with |
 | --- | --- | --- |
 | `fake.Pin` | An input/output pin, initially low. | `is_high()`, `changes()` |
-| `fake.Delay` | A delay that returns at once. | `elapsed_us()` |
+| `fake.Delay` | A delay that returns at once, and a counter whose time is the delays so far. | `elapsed_us()`, `now_us()` |
+| `fake.Alarm` | An alarm on a counter that starts at 0 and moves only on `advance`. It reaches any time ahead. | `advance(us)`, `is_armed()`, `target_us()`, `schedules()`, `fail_next(error)` |
 | `fake.I2c` | One device at an address with 256 numbered registers and an auto-incrementing register pointer. Other addresses report `NoAcknowledge`. | `register(n)`, `set_register(n, v)`, `fail_next(error)` |
 | `fake.Spi` | A bus that records sent bytes and answers from a programmed reply. | `sent()`, `clear()`, `reply_with(bytes)` |
 | `fake.Serial` | A serial port, the `std/io` Reader and Writer: it records what is written and reads back bytes given to `feed`, then reports end of input; `poll_read` reports Pending instead. | `sent()`, `clear()`, `feed(bytes)` |
 | `fake.Pwm` | A PWM output with a given `max_duty`, initially at duty 0. | `duty()`, `changes()`, `fail_next(error)` |
 | `fake.Analog` | An analog input with a given `max_value` that reads the value given to `set`, after any given to `queue`, one per read. | `set(value)`, `queue(values)`, `reads()`, `fail_next(error)` |
-| `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
+| `fake.Clock` | The [executor](#tasks-and-the-executor)'s clock, and a counter: time jumps ahead when the executor sleeps, and simulated interrupts raise signals. | `now_us()`, `interrupt_at(time, &signal)`, `advance(us)`, `sleeps()`, `idle_us()` |
 
-`fail_next` makes the next I2C transaction, duty change, or analog read fail,
+`fail_next` makes the next I2C transaction, duty change, analog read, or
+alarm schedule fail,
 so error paths are as easy to test as success. The repository's
 `examples/dimmer.dodo` tests an LED dimmer, a knob on an analog input setting
 a PWM output, this way, and `examples/dimmer_board.dodo` runs it unchanged on
@@ -673,7 +751,7 @@ which is open at reset and closed only inside critical sections.
 | Driver | Interrupt sources |
 | --- | --- |
 | `pl011.Port` and `Controller` | `listen(sources)`, `ignore(sources)`, `pending_interrupts()`, and `clear_interrupts(sources)` with `RX_INTERRUPT` (FIFO 3/4 full), `RX_TIMEOUT_INTERRUPT` (bytes waiting for 32 bit times), `TX_INTERRUPT`, and `ERROR_INTERRUPTS`. The receive sources end when reads drain the FIFO. |
-| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` that fires once at `schedule_at(time)` or `schedule_in(microseconds)`; `listen` raises `alarm.irq()`, and its handler calls `clear`. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
+| `Timer.alarm(n)` on the RP2040 and RP2350 | An `Alarm` with the [alarm protocol](#device-protocols): it fires once at `schedule_at_us(time)`, a `now_us()` time up to 2^31 - 1 us (35 minutes) ahead, or at the low 32 bits of the counter with `schedule_at(time)` and `schedule_in(microseconds)`. `listen` raises `alarm.irq()`, and its handler calls `clear`; a time `schedule_at_us` finds already passed raises it at once. `release_alarm` gives it back. With `now_us()` and `sleep_until(deadline)` it is also the [executor](#tasks-and-the-executor)'s clock. |
 | `Pin` on the RP2040 and RP2350 | `listen(events)` raises `IO_IRQ_BANK0` for `chip.RISING_EDGE`, `FALLING_EDGE`, `LEVEL_HIGH`, or `LEVEL_LOW`; `events()` shows them, `clear_events(edges)` acknowledges edges, `ignore(events)` stops. |
 
 ### The Cortex-M core
@@ -803,7 +881,8 @@ for the full rules.
 ### Sleeping and other targets
 
 `cpu.wait_for_interrupt()` sleeps until an interrupt is pending, which is the
-usual idle loop. `cpu.fence()` is a full hardware memory barrier, for example
+usual idle loop. How deeply it sleeps is set with
+[`std/embedded/power`](#low-power). `cpu.fence()` is a full hardware memory barrier, for example
 between filling a DMA buffer and starting the transfer.
 
 | Target | Critical section and `wait_for_interrupt` |
@@ -1052,6 +1131,136 @@ while nothing has been fed.
 - On a desktop, where a critical section excludes nothing, use the executor
   and its signals from one thread.
 
+## Low power
+
+Battery-powered firmware spends most of its time waiting.
+`std/embedded/power` decides how much of the chip keeps running meanwhile.
+Every chip package implements its `power.Power` protocol, every board hands it
+out as `b.power`, and `std/embedded/hal/fake.Power` implements it on a
+desktop. Power-aware code is therefore written and tested once, like a driver.
+
+There are three levels, from the lightest to the deepest:
+
+| Level | What stops | What wakes it | How |
+| --- | --- | --- | --- |
+| Sleep | The core | Any enabled interrupt | `power.Mode.Sleep`, the mode at reset |
+| Deep sleep | The core and every clock outside the sleep set | An interrupt from a peripheral whose clock still runs | `power.Mode.DeepSleep` with `set_sleep_clocks` |
+| Dormant | Every oscillator, and with them every clock | A pin event in a `power.Wake` | `dormant(&wake)` |
+
+### Sleep modes
+
+The mode says what every wait does from now on: `b.power.sleep()`,
+`cpu.wait_for_interrupt()`, a timer alarm's `sleep_until`, and the
+[executor](#tasks-and-the-executor) all honour it. An executor therefore
+deep-sleeps between its tasks without being changed:
+
+```dodo
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/executor"
+import "std/embedded/power"
+
+fn main() {
+    b := board.take()!
+    // Only the timer runs while the core sleeps, so its alarm can wake it.
+    b.power.set_sleep_clocks(chip.ALARM_CLOCKS)
+    b.power.set_mode(power.Mode.DeepSleep)
+    clock := b.timer.alarm(0)!
+    // ... tasks as before ...
+    executor.run(&mut tasks, &mut clock)
+}
+```
+
+The sleep set must keep the clocks of whatever should wake the core:
+`chip.ALARM_CLOCKS` for a timer alarm, `chip.CLOCK_GPIO` for a pin interrupt,
+and a peripheral's own constant, such as `chip.CLOCK_UART0`, for its
+interrupts. Add `chip.CLOCK_MEMORY` and `chip.CLOCK_DMA` for DMA that runs
+during the sleep. Every clock is in the sleep set at reset, so a deep sleep
+stops nothing more than a light one until the program says otherwise. When
+the core wakes, the stopped clocks start again before its handler runs.
+`power.deep_sleep(&mut b.power, keep)` deep-sleeps once and then restores the
+previous mode and sleep set.
+
+To wait for something an interrupt handler records, check it inside a
+`hal.Critical` section and sleep there. An interrupt that becomes pending
+between the check and the sleep still ends the sleep, and its handler runs
+once the section ends. The executor does this for you.
+
+### Clock gating
+
+Apart from sleeping, the chip stops the clocks of peripherals that nothing
+uses. Clocks are a `power.Clocks` set, a `u64` with one bit per clock gate.
+The chip package names the gates, such as `chip.CLOCK_UART1` or
+`chip.CLOCK_PIO0`, and they combine with `|`:
+
+```dodo
+stopped := b.power.disable_unused_clocks()   // every unclaimed peripheral
+b.power.disable_clocks(chip.CLOCK_JTAG)!    // one the chip does not claim
+serial := b.pins.uart(4, none, 115_200)!     // UART1's clocks start again
+```
+
+`disable_unused_clocks` stops the clocks of every peripheral the chip claims
+and releases that is not claimed now, and returns them. Claiming one of those
+peripherals starts its clocks again, so calling it once at start-up is safe.
+`disable_clocks` refuses with `InvalidInput` the clocks the program cannot run
+without (`chip.ESSENTIAL_CLOCKS`: memory, flash, the boot ROM, the bus fabric,
+GPIO, and the clock, reset, and oscillator controls), and refuses with `Busy`
+the clocks of a claimed peripheral. Peripherals that are not claimed through
+`Pins`, such as the timer (`chip.CLOCK_TIMER`) and DMA (`chip.CLOCK_DMA`),
+are the program's to stop: their registers stop answering until
+`enable_clocks` starts them again.
+
+### Dormant
+
+`dormant` stops every oscillator. The chip keeps its memory and pin levels
+and draws the least it can until one of the pin events in a `power.Wake`
+happens. The chip then restarts its clocks as they were, and `dormant`
+returns the pins that woke it, bit n for pin n:
+
+```dodo
+button := b.pins.input(15)!
+// Wait for a new press, not one latched earlier.
+button.clear_events(chip.RISING_EDGE)
+wake := power.Wake.new()
+wake.on(15, power.RISING_EDGE)
+woken := b.power.dormant(&wake)!
+```
+
+`power.dormant_until(&mut b.power, pin, events)` is the one-pin shorthand.
+The events are `power.LEVEL_LOW`, `LEVEL_HIGH`, `FALLING_EDGE`, and
+`RISING_EDGE`, numbered as for `Pin.listen`. Claim each wake pin as an input
+first, with the pull it needs, so its level is defined while nothing runs.
+An edge or level that is present already ends the dormant state at once.
+
+On the RP2040 and RP2350, `dormant` runs clk_sys from the crystal, stops
+PLL_SYS, the ring oscillator, and the crystal, and afterwards starts PLL_SYS
+again. Both cores stop. The microsecond timer pauses meanwhile, so `now_us`
+does not count the time spent dormant. `dormant` returns `Busy` while the USB
+serial port or an ADC input runs, because their 48 MHz clock would stop.
+Wait until serial ports have sent their last bytes before calling it. A
+complete example that blinks, deep-sleeps, and goes dormant until a button
+press is `examples/low_power.dodo`.
+
+### Testing power-aware code
+
+`fake.Power.new(essential, managed)` starts with every clock running. It
+refuses to disable `essential` clocks and treats `managed` clocks as
+peripherals that `disable_unused_clocks` stops. Tests can `claim` and
+`release` clocks as a chip does, and choose with `wake_next_dormant(pins)`
+which pins end the next dormant state. A dormant state that nothing could end
+traps instead of hanging the test. The fake counts `light_sleeps`,
+`deep_sleeps`, and `dormant_states`, and reports the `requested_events` of
+each pin.
+
+### Sleep controls of the Cortex-M core
+
+`std/embedded/cortex_m` also exposes the system control register directly.
+`set_deep_sleep(bool)` sets SLEEPDEEP, which the chips' `set_mode` uses.
+`set_sleep_on_exit(bool)` makes the core sleep again whenever its last
+handler returns, for firmware that works only in interrupt handlers.
+`set_event_on_pend(bool)` lets a pending but disabled interrupt end a
+`wait_for_event`. Each core has its own register.
+
 ## Building firmware
 
 ### Boards
@@ -1122,7 +1331,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.I2C_SDA_PIN`, `board.I2C_SCL_PIN` | The board's usual I2C pins. |
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
-| `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`; `alarm(n)` claims an alarm, which can also run the [executor](#tasks-and-the-executor). |
+| `b.timer` | The delay and counter protocols, plus `delay_ms(ms)`; `alarm(n)` claims an alarm with the alarm protocol, which can also run the [executor](#tasks-and-the-executor). |
 | `b.watchdog` | The [watchdog](#the-watchdog-on-the-rp2040-and-rp2350): `start(timeout_ms)`, then `feed()` in time or the board resets; `reset_reason()` tells whether it did. Implements `hal.Watchdog`. |
 | `b.dma` | The [DMA channels](#dma-on-the-rp2040-and-rp2350): `channel()` claims one, `release(channel)` gives it back. Buses and serial ports take them for transfers that run while the program does other work. |
 | `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
@@ -2196,9 +2405,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  PIO, the timer, the watchdog, DMA, a USB serial port, and the second core;
-  other USB devices (HID, mass storage, several functions at once) or USB
-  host mode are not bundled
+  PIO, the timer, the watchdog, DMA, a USB serial port, low power, and the
+  second core; other USB devices (HID, mass storage, several functions at
+  once) or USB host mode are not bundled
   yet. Write them with `hal.Reg` as above.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests
@@ -2233,8 +2442,17 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 - Inline assembly lives inside functions; there is no global or naked
   assembly, so startup code and vector tables come from the chip runtime or a
   `@section`-placed static.
-- Timers have no shared protocol yet. Expose them as methods on your chip's
-  types.
+- Low power covers sleep, deep sleep, clock gating, and the dormant state
+  woken by GPIO 0 to 29. The RP2350's power manager states, which switch
+  power domains off, its always-on timer, and waking a dormant chip by time
+  (the RP2040's RTC from an external clock, the RP2350's AON timer) are not
+  supported. Neither is lowering the system clock to save power. On a dual-core chip,
+  deep sleep stops the sleep set's other clocks only while both cores
+  deep-sleep.
+- The timer protocols count microseconds. Counters at other rates, a
+  timer's capture and compare channels, and periodic hardware timers have no
+  shared protocol; use the chip's own methods, as for the RP2040's and
+  RP2350's alarms, whose interrupts `listen` turns on.
 - SPI by DMA moves frames of up to 8 bits; wider frames use the word
   methods, which are polled. A queued I2C transaction fits the controller's
   FIFO, 16 commands on both chips; longer transfers use the blocking

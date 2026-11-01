@@ -3,10 +3,12 @@ package rp2350
 import "core/cpu"
 import "std/embedded/cortex_m"
 import "std/embedded/hal"
+import "std/embedded/power"
 import "std/embedded/chip/rp_adc"
 import "std/embedded/chip/rp_dma"
 import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
+import "std/embedded/chip/rp_power"
 import "std/embedded/chip/rp_pwm"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/chip/rp_watchdog"
@@ -18,7 +20,7 @@ import "std/embedded/chip/rp_pins"
 // Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
 // I2C, SPI, UART, PWM, the ADC, PIO, the microsecond timer, the watchdog, a
 // USB serial port, the second core, the FIFOs and spinlocks the cores share,
-// and the boot ROM. `take(config)` brings the chip from its boot state (ring
+// low power, and the boot ROM. `take(config)` brings the chip from its boot state (ring
 // oscillator, peripherals held in reset) to a known configuration and hands
 // out the peripherals once. Pins implement the std/embedded/hal output and
 // input pin protocols, I2C and SPI buses claimed from `Pins` implement the
@@ -59,6 +61,7 @@ const RESET: usize = RESETS_BASE + 0x0
 const RESET_DONE: usize = RESETS_BASE + 0x8
 const RESET_ADC: u32 = 1 << 0
 const RESET_DMA: u32 = 1 << 2
+const RESET_HSTX: u32 = 1 << 3
 const RESET_I2C0: u32 = 1 << 4
 const RESET_I2C1: u32 = 1 << 5
 const RESET_IO_BANK0: u32 = 1 << 6
@@ -69,12 +72,19 @@ const RESET_PIO2: u32 = 1 << 13
 const RESET_PLL_SYS: u32 = 1 << 14
 const RESET_PLL_USB: u32 = 1 << 15
 const RESET_PWM: u32 = 1 << 16
+const RESET_SHA256: u32 = 1 << 17
 const RESET_SPI0: u32 = 1 << 18
 const RESET_SPI1: u32 = 1 << 19
 const RESET_UART0: u32 = 1 << 26
 const RESET_UART1: u32 = 1 << 27
 const RESET_USBCTRL: u32 = 1 << 28
 const RESET_TIMER0: u32 = 1 << 23
+const RESET_TIMER1: u32 = 1 << 24
+const RESET_TRNG: u32 = 1 << 25
+
+// Ring oscillator (8.3): the boot clock, unused after take() but running.
+const ROSC_BASE: usize = 0x400E_8000
+const ROSC_STATUS: usize = 0x1C
 
 // Crystal oscillator (8.2).
 const XOSC_BASE: usize = 0x4004_8000
@@ -123,6 +133,10 @@ const CLK_REF_SRC_XOSC: u32 = 2
 const CLK_SYS_SRC_AUX: u32 = 1
 const CLK_SYS_AUXSRC: u32 = 0b111 << 5
 const CLK_ENABLE: u32 = 1 << 11
+// Clock gating (8.1.3.5): WAKE_EN0/1 and SLEEP_EN0/1.
+const CLOCKS_WAKE_EN: usize = 0xAC
+const CLOCKS_SLEEP_EN: usize = 0xB4
+
 // The integer part of both dividers is bits 16 and up; 0x1_0000 divides by
 // one.
 const DIVIDE_BY_ONE: u32 = 0x1_0000
@@ -148,6 +162,8 @@ const TIMER_ALARM0: usize = TIMER0_BASE + 0x10
 const TIMER_ARMED: usize = TIMER0_BASE + 0x20
 const TIMER_INTR: usize = TIMER0_BASE + 0x3C
 const TIMER_INTE: usize = TIMER0_BASE + 0x40
+// INTF forces an alarm's interrupt, as if it had fired, until cleared.
+const TIMER_INTF: usize = TIMER0_BASE + 0x44
 // The longest an alarm sleeps at once: below 2^31 us, so its 32-bit
 // target time is still ahead when the write lands.
 const MAX_ALARM_SLEEP_US: u64 = 0x7FFF_FFFF
@@ -203,6 +219,56 @@ pub const PLL_USB_IRQ: u32 = 43
 pub const POWMAN_IRQ_POW: u32 = 44
 pub const POWMAN_IRQ_TIMER: u32 = 45
 
+// Clock gates for `Power` (8.1.3.5), as std/embedded/power.Clocks: bit n
+// of WAKE_EN0 and SLEEP_EN0 is bit n, bit n of WAKE_EN1 and SLEEP_EN1 bit
+// 32 + n. Each peripheral's constant holds every clock it uses, its
+// clk_sys register clock and, where it has one, its own clock.
+pub const CLOCK_ADC: power.Clocks = (1 << 2) | (1 << 3)
+pub const CLOCK_BUSCTRL: power.Clocks = 1 << 5
+pub const CLOCK_DMA: power.Clocks = 1 << 7
+pub const CLOCK_HSTX: power.Clocks = (1 << 9) | (1 << 10)
+pub const CLOCK_I2C0: power.Clocks = 1 << 11
+pub const CLOCK_I2C1: power.Clocks = 1 << 12
+// GPIO control and pads: their interrupts need these to wake a deep sleep.
+pub const CLOCK_GPIO: power.Clocks = (1 << 13) | (1 << 17)
+pub const CLOCK_JTAG: power.Clocks = 1 << 14
+pub const CLOCK_PIO0: power.Clocks = 1 << 18
+pub const CLOCK_PIO1: power.Clocks = 1 << 19
+pub const CLOCK_PIO2: power.Clocks = 1 << 20
+// PLL_USB's registers; PLL_USB runs while the ADC or USB serial port does.
+pub const CLOCK_PLL_USB: power.Clocks = 1 << 22
+pub const CLOCK_PWM: power.Clocks = 1 << 25
+pub const CLOCK_SHA256: power.Clocks = 1 << 30
+pub const CLOCK_SPI0: power.Clocks = (1 << 32) | (1 << 33)
+pub const CLOCK_SPI1: power.Clocks = (1 << 34) | (1 << 35)
+// The SRAM banks and the bus fabric, for DMA during a deep sleep.
+pub const CLOCK_MEMORY: power.Clocks = (1 << 6) | (0x3FF << 36)
+pub const CLOCK_SYSCFG: power.Clocks = 1 << 46
+pub const CLOCK_SYSINFO: power.Clocks = 1 << 47
+pub const CLOCK_TBMAN: power.Clocks = 1 << 48
+// TIMER0 and the tick generators that count its microseconds.
+pub const CLOCK_TIMER: power.Clocks = (1 << 49) | (1 << 50) | (1 << 51)
+pub const CLOCK_TIMER1: power.Clocks = 1 << 52
+pub const CLOCK_TRNG: power.Clocks = 1 << 53
+pub const CLOCK_UART0: power.Clocks = (1 << 54) | (1 << 55)
+pub const CLOCK_UART1: power.Clocks = (1 << 56) | (1 << 57)
+pub const CLOCK_USB: power.Clocks = (1 << 58) | (1 << 59)
+pub const CLOCK_WATCHDOG: power.Clocks = 1 << 60
+// What the timer and its alarms need: keep them in the sleep set to wake
+// from a deep sleep on an alarm, as an executor on an alarm does.
+pub const ALARM_CLOCKS: power.Clocks = CLOCK_TIMER
+// Clocks the program cannot run without, which Power.disable_clocks
+// refuses: the clock, reset, power-on, and power manager controls, access
+// control, the glitch detector, the bus fabric, the boot ROM and its RAM,
+// OTP, SRAM, flash (XIP), the cores' SIO, GPIO, and the oscillators and
+// PLL_SYS, which `dormant` restarts.
+pub const ESSENTIAL_CLOCKS: power.Clocks = (1 << 0) | (1 << 1) | (1 << 4) | (1 << 6) | (1 << 8) | CLOCK_GPIO | (1 << 15) | (1 << 16) | (1 << 21) | (1 << 23) | (1 << 24) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 31) | (0x3FF << 36) | (1 << 61) | (1 << 62)
+// Every gate.
+pub const ALL_CLOCKS: power.Clocks = 0x7FFF_FFFF_FFFF_FFFF
+// The peripherals the chip claims and releases, or never uses, whose
+// clocks Power.disable_unused_clocks stops while they are held in reset.
+const MANAGED_CLOCKS: power.Clocks = CLOCK_ADC | CLOCK_HSTX | CLOCK_I2C0 | CLOCK_I2C1 | CLOCK_PIO0 | CLOCK_PIO1 | CLOCK_PIO2 | CLOCK_PLL_USB | CLOCK_PWM | CLOCK_SHA256 | CLOCK_SPI0 | CLOCK_SPI1 | CLOCK_TIMER1 | CLOCK_TRNG | CLOCK_UART0 | CLOCK_UART1 | CLOCK_USB
+
 // User bank GPIO control (9.11.1) and pads (9.11.3).
 const IO_BANK0_BASE: usize = 0x4002_8000
 const PADS_BANK0_BASE: usize = 0x4003_8000
@@ -213,6 +279,10 @@ const FUNCSEL: u32 = 0b11111
 const GPIO_INTR: usize = IO_BANK0_BASE + 0x230
 const GPIO_PROC0_INTE: usize = IO_BANK0_BASE + 0x248
 const GPIO_PROC0_INTS: usize = IO_BANK0_BASE + 0x278
+// GPIO events that end the dormant state (6.5.3), laid out as INTR:
+// offsets in IO_BANK0.
+const GPIO_DORMANT_WAKE_INTE: usize = 0x2D8
+const GPIO_DORMANT_WAKE_INTS: usize = 0x308
 
 // Pin events for `Pin.listen`, `ignore`, `events`, and `clear_events`:
 // the pin's level is low or high, or it fell or rose. Levels last as long
@@ -369,6 +439,8 @@ pub struct Peripherals {
     pub core1: rp_multicore.Core1
     pub fifos: rp_multicore.Fifos
     pub spinlocks: rp_multicore.Spinlocks
+    // Sleep modes, clock gating, and the dormant state; see Power.
+    pub power: Power
 }
 
 // Configure clocks, take GPIO, the timer, and DMA out of reset, and return the
@@ -435,7 +507,8 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         })
     }
     let rp_multicore.Cores { core1, fifos, spinlocks } = cores
-    return ok(Peripherals { pins: Pins { bank }, timer, watchdog, usb, dma, core1, fifos, spinlocks })
+    power := Power { crystal_hz: crystal }
+    return ok(Peripherals { pins: Pins { bank }, timer, watchdog, usb, dma, core1, fifos, spinlocks, power })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.
@@ -445,11 +518,14 @@ unsafe fn reg(address: usize) -> hal.Reg<u32> {
     }
 }
 
-// Pulse the reset of `blocks` and wait until they are running again. The
-// set and clear aliases leave every other block alone.
+// Pulse the reset of `blocks` and wait until they are running again. Their
+// clocks start first, in case Power stopped them. The set and clear aliases
+// leave every other block alone.
 // SAFETY: the caller owns `blocks`.
 unsafe fn reset_blocks(blocks: u32) -> void!hal.Error {
     unsafe {
+        clocks := hal.RegisterBlock.at(CLOCKS_BASE)
+        rp_power.set_clocks(&mut clocks, CLOCKS_WAKE_EN, block_clocks(blocks))
         hold := reg(RESET + SET_ALIAS)
         hold.write(blocks)
         release := reg(RESET + CLEAR_ALIAS)
@@ -1115,7 +1191,7 @@ pub struct Pin {
 }
 
 // The free-running 64-bit microsecond counter of TIMER0. Implements the
-// std/embedded/hal delay protocol.
+// std/embedded/hal delay and counter protocols.
 pub struct Timer {
     high: hal.Reg<u32>
     low: hal.Reg<u32>
@@ -1149,6 +1225,9 @@ pub struct Timer {
                 listening: hal.Reg.at(TIMER_INTE),
                 listen_set: hal.Reg.at(TIMER_INTE + SET_ALIAS),
                 listen_clear: hal.Reg.at(TIMER_INTE + CLEAR_ALIAS),
+                forced: hal.Reg.at(TIMER_INTF),
+                force_set: hal.Reg.at(TIMER_INTF + SET_ALIAS),
+                force_clear: hal.Reg.at(TIMER_INTF + CLEAR_ALIAS),
             }
         }
         return ok(alarm)
@@ -1188,7 +1267,9 @@ pub struct Timer {
 // fires once when the microsecond counter reaches the time it was given;
 // with `listen` it raises interrupt TIMER0_IRQ_0 + n, whose handler calls
 // `clear` and may schedule the next time. Move it into a
-// `static mut Option<Alarm>` for the handler to use.
+// `static mut Option<Alarm>` for the handler to use. Implements the
+// std/embedded/hal alarm and counter protocols, with times up to
+// 2^31 - 1 us (35 minutes) ahead.
 pub struct Alarm {
     number: u32
     bit: u32
@@ -1200,6 +1281,9 @@ pub struct Alarm {
     listening: hal.Reg<u32>
     listen_set: hal.Reg<u32>
     listen_clear: hal.Reg<u32>
+    forced: hal.Reg<u32>
+    force_set: hal.Reg<u32>
+    force_clear: hal.Reg<u32>
 
     // 0 to 3.
     pub fn number(&self) -> u32 {
@@ -1230,6 +1314,32 @@ pub struct Alarm {
         self.target.write(core.wrapping_add(self.low.read(), microseconds))
     }
 
+    // Fire when now_us() reaches `time_us`, replacing any earlier time and
+    // clearing an earlier firing; the std/embedded/hal alarm protocol. A
+    // time already reached fires at once, raising the interrupt if the
+    // alarm listens. InvalidInput for a time more than 2^31 - 1 us ahead.
+    pub fn schedule_at_us(&mut self, time_us: u64) -> void!hal.Error {
+        now := self.now_us()
+        if time_us > now && time_us - now > MAX_ALARM_SLEEP_US {
+            return err(hal.Error.InvalidInput)
+        }
+        self.clear()
+        if time_us > now {
+            self.target.write((time_us & 0xFFFF_FFFF) as u32)
+            if self.now_us() < time_us {
+                return ok()
+            }
+        }
+        // The time had passed before the alarm was armed, which would fire
+        // only once the counter wraps, unless it fired just before. Either
+        // way the hardware alarm is done; force the firing it missed.
+        self.cancel()
+        if !self.raw.any(self.bit) {
+            self.force_set.write(self.bit)
+        }
+        return ok()
+    }
+
     // Disarm: a scheduled time no longer fires.
     pub fn cancel(&mut self) {
         self.armed.write(self.bit)
@@ -1242,13 +1352,14 @@ pub struct Alarm {
 
     // True once it has fired, until `clear`.
     pub fn fired(&self) -> bool {
-        return self.raw.any(self.bit)
+        return self.raw.any(self.bit) || self.forced.any(self.bit)
     }
 
     // Acknowledge that it fired. An interrupt handler has to, or the
     // interrupt stays raised and the handler runs again at once.
     pub fn clear(&mut self) {
         self.raw.write(self.bit)
+        self.force_clear.write(self.bit)
     }
 
     // Raise the interrupt when it fires. Enable the interrupt in the NVIC
@@ -1319,4 +1430,237 @@ pub struct Alarm {
         }
         core.drop(section)
     }
+}
+
+// Low power, as `Peripherals.power`; implements std/embedded/power's
+// protocol, whose package comment describes the modes.
+//
+// On the RP2350, a deep sleep stops the clocks outside the sleep set only
+// while both cores deep-sleep; a core 1 that was never started does. Every
+// clock starts in the sleep set, so a deep sleep stops nothing more than a
+// light one until `set_sleep_clocks` says otherwise. The clock constants
+// above name the gates. Claiming a peripheral starts its clocks, so
+// `disable_unused_clocks` is safe at any time. It also stops HSTX, TIMER1,
+// SHA-256, and the TRNG, which this package does not drive, while they are
+// held in reset; the timer (CLOCK_TIMER) and DMA (CLOCK_DMA) are not
+// claimed through Pins, so it leaves them to the program.
+//
+// `dormant` runs clk_sys from the crystal, stops PLL_SYS and the ring
+// oscillator, and stops the crystal until a pin event, then starts them
+// again. Both cores stop. The microsecond timer pauses meanwhile, so
+// `now_us` does not count the time spent dormant. It returns Busy while the
+// USB serial port or an ADC input runs, since their 48 MHz clock would
+// stop. Wait until serial ports have sent their last bytes first, as
+// clk_peri slows down to the crystal's rate during the switch.
+pub struct Power: power.Power {
+    crystal_hz: u32
+
+    pub fn mode(&self) -> power.Mode {
+        return rp_power.mode()
+    }
+
+    pub fn set_mode(&mut self, mode: power.Mode) {
+        rp_power.set_mode(mode)
+    }
+
+    pub fn sleep(&mut self) {
+        rp_power.sleep()
+    }
+
+    pub fn enabled_clocks(&self) -> power.Clocks {
+        // SAFETY: reading WAKE_EN has no side effects.
+        clocks := unsafe {
+            hal.RegisterBlock.at(CLOCKS_BASE)
+        }
+        return rp_power.read_clocks(&mut clocks, CLOCKS_WAKE_EN)
+    }
+
+    pub fn enable_clocks(&mut self, clocks: power.Clocks) {
+        // SAFETY: Power owns WAKE_EN apart from reset_blocks, and both
+        // change it only through its set and clear aliases.
+        block := unsafe {
+            hal.RegisterBlock.at(CLOCKS_BASE)
+        }
+        rp_power.set_clocks(&mut block, CLOCKS_WAKE_EN, clocks & ALL_CLOCKS)
+    }
+
+    pub fn disable_clocks(&mut self, clocks: power.Clocks) -> void!hal.Error {
+        if (clocks & ~ALL_CLOCKS) != 0 || (clocks & ESSENTIAL_CLOCKS) != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        if (clocks & clocks_in_use()) != 0 {
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: as in enable_clocks; no claimed peripheral and nothing
+        // the program needs to run uses `clocks`.
+        block := unsafe {
+            hal.RegisterBlock.at(CLOCKS_BASE)
+        }
+        rp_power.clear_clocks(&mut block, CLOCKS_WAKE_EN, clocks)
+        return ok()
+    }
+
+    pub fn disable_unused_clocks(&mut self) -> power.Clocks {
+        unused := MANAGED_CLOCKS & ~clocks_in_use() & self.enabled_clocks()
+        // SAFETY: as in disable_clocks; the peripherals are held in reset.
+        block := unsafe {
+            hal.RegisterBlock.at(CLOCKS_BASE)
+        }
+        rp_power.clear_clocks(&mut block, CLOCKS_WAKE_EN, unused)
+        return unused
+    }
+
+    pub fn sleep_clocks(&self) -> power.Clocks {
+        // SAFETY: reading SLEEP_EN has no side effects.
+        clocks := unsafe {
+            hal.RegisterBlock.at(CLOCKS_BASE)
+        }
+        return rp_power.read_clocks(&mut clocks, CLOCKS_SLEEP_EN)
+    }
+
+    pub fn set_sleep_clocks(&mut self, clocks: power.Clocks) {
+        // SAFETY: Power alone writes SLEEP_EN, which only applies while the
+        // cores deep-sleep.
+        block := unsafe {
+            hal.RegisterBlock.at(CLOCKS_BASE)
+        }
+        rp_power.write_clocks(&mut block, CLOCKS_SLEEP_EN, clocks & ALL_CLOCKS)
+    }
+
+    pub fn dormant(&mut self, wake: &power.Wake) -> u64!hal.Error {
+        rp_power.check_wake(wake, PIN_COUNT)?
+        layout := power_layout()
+        section := hal.Critical.enter()
+        // SAFETY: interrupts are masked, so this core reads the count
+        // atomically and no handler sees the clocks change.
+        users := unsafe {
+            PLL_USB_USERS
+        }
+        if users != 0 {
+            core.drop(section)
+            return err(hal.Error.Busy)
+        }
+        // SAFETY: Power owns the dormant state; nothing runs from PLL_USB,
+        // and interrupts stay masked throughout.
+        result := unsafe {
+            go_dormant(self.crystal_hz, &layout, wake)
+        }
+        core.drop(section)
+        return result
+    }
+}
+
+// The register offsets rp_power needs.
+fn power_layout() -> rp_power.Layout {
+    return rp_power.Layout {
+        wake_en: CLOCKS_WAKE_EN,
+        sleep_en: CLOCKS_SLEEP_EN,
+        rosc_status: ROSC_STATUS,
+        dormant_wake_inte: GPIO_DORMANT_WAKE_INTE,
+        dormant_wake_ints: GPIO_DORMANT_WAKE_INTS,
+        pin_count: PIN_COUNT,
+    }
+}
+
+// Run from the crystal, stop until one of `wake`'s events, and restart
+// PLL_SYS and clk_sys from it; return the pins that woke the chip.
+// SAFETY: interrupts must be masked and PLL_USB stopped, and the caller
+// must own the clock, reset, PLL_SYS, oscillator, and dormant wake
+// registers.
+unsafe fn go_dormant(crystal_hz: u32, layout: &rp_power.Layout, wake: &power.Wake) -> u64!hal.Error {
+    unsafe {
+        io := hal.RegisterBlock.at(IO_BANK0_BASE)
+        xosc := hal.RegisterBlock.at(XOSC_BASE)
+        rosc := hal.RegisterBlock.at(ROSC_BASE)
+        // clk_sys from clk_ref, the crystal, through the glitchless mux,
+        // then PLL_SYS can stop.
+        sys_ctrl := reg(CLK_SYS_CTRL)
+        sys_ctrl.clear_bits(CLK_SYS_SRC_AUX)
+        sys_selected := reg(CLK_SYS_SELECTED)
+        sys_selected.wait_set(1, ATTEMPTS)?
+        hold := reg(RESET + SET_ALIAS)
+        hold.write(RESET_PLL_SYS)
+        rp_power.arm_wake(&mut io, layout, wake)
+        stopped := rp_power.stop_oscillators(&mut xosc, &mut rosc, layout)
+        woken := rp_power.woken_pins(&mut io, layout, wake)
+        rp_power.disarm_wake(&mut io, layout, wake)
+        stopped?
+        start_pll(PLL_SYS_BASE, RESET_PLL_SYS, crystal_hz, VCO_HZ, 5, 2)?
+        sys_ctrl.set_bits(CLK_SYS_SRC_AUX)
+        sys_selected.wait_set(1 << 1, ATTEMPTS)?
+        return ok(woken)
+    }
+}
+
+// The clocks of the blocks whose reset bits are `blocks`, apart from
+// essential ones.
+fn block_clocks(blocks: u32) -> power.Clocks {
+    clocks := 0u64
+    if (blocks & RESET_ADC) != 0 {
+        clocks |= CLOCK_ADC
+    }
+    if (blocks & RESET_DMA) != 0 {
+        clocks |= CLOCK_DMA
+    }
+    if (blocks & RESET_HSTX) != 0 {
+        clocks |= CLOCK_HSTX
+    }
+    if (blocks & RESET_I2C0) != 0 {
+        clocks |= CLOCK_I2C0
+    }
+    if (blocks & RESET_I2C1) != 0 {
+        clocks |= CLOCK_I2C1
+    }
+    if (blocks & RESET_PIO0) != 0 {
+        clocks |= CLOCK_PIO0
+    }
+    if (blocks & RESET_PIO1) != 0 {
+        clocks |= CLOCK_PIO1
+    }
+    if (blocks & RESET_PIO2) != 0 {
+        clocks |= CLOCK_PIO2
+    }
+    if (blocks & RESET_PLL_USB) != 0 {
+        clocks |= CLOCK_PLL_USB
+    }
+    if (blocks & RESET_PWM) != 0 {
+        clocks |= CLOCK_PWM
+    }
+    if (blocks & RESET_SHA256) != 0 {
+        clocks |= CLOCK_SHA256
+    }
+    if (blocks & RESET_SPI0) != 0 {
+        clocks |= CLOCK_SPI0
+    }
+    if (blocks & RESET_SPI1) != 0 {
+        clocks |= CLOCK_SPI1
+    }
+    if (blocks & RESET_TIMER0) != 0 {
+        clocks |= CLOCK_TIMER
+    }
+    if (blocks & RESET_TIMER1) != 0 {
+        clocks |= CLOCK_TIMER1
+    }
+    if (blocks & RESET_TRNG) != 0 {
+        clocks |= CLOCK_TRNG
+    }
+    if (blocks & RESET_UART0) != 0 {
+        clocks |= CLOCK_UART0
+    }
+    if (blocks & RESET_UART1) != 0 {
+        clocks |= CLOCK_UART1
+    }
+    if (blocks & RESET_USBCTRL) != 0 {
+        clocks |= CLOCK_USB
+    }
+    return clocks
+}
+
+// The clocks of managed peripherals that are out of reset, so in use.
+fn clocks_in_use() -> power.Clocks {
+    // SAFETY: reading RESET has no side effects.
+    held := unsafe {
+        reg(RESET)
+    }
+    return block_clocks(~held.read()) & MANAGED_CLOCKS
 }

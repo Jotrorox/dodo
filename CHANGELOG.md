@@ -30,6 +30,32 @@
   drops are still alive, are now copied aside in memory instead of being
   split by LLVM into one operation per byte. Such functions took minutes to
   compile at -O1 and above.
+- `std/embedded/power` is one low-power layer for every chip: sleep and deep
+  sleep modes that every wait honours, including timer alarms and the
+  executor; clock gating with `power.Clocks` sets; and a dormant state, with
+  every oscillator stopped, that pins in a `power.Wake` end. The RP2040 and
+  RP2350 implement its `Power` protocol as `Peripherals.power`, and every board
+  hands it out as `b.power`. The chips name each clock gate
+  (`CLOCK_UART0`, `ALARM_CLOCKS`, `ESSENTIAL_CLOCKS`, ...).
+  `disable_unused_clocks` stops the clocks of unclaimed peripherals, and
+  claiming a peripheral starts them again. `disable_clocks` refuses clocks
+  the program needs or a claimed peripheral uses. `dormant` runs from the
+  crystal, stops the PLL and both oscillators, and restores clk_sys on wake.
+  `fake.Power` tests power-aware code on a desktop.
+  `cortex_m.set_deep_sleep`, `set_sleep_on_exit`, and `set_event_on_pend`
+  expose the core's SCR. The self-tests gain on-board checks, and
+  `examples/low_power.dodo` shows all three levels.
+- `std/embedded/hal` gains a shared timer protocol: `Counter` (`now_us`), a
+  free-running microsecond count, and `Alarm` (`now_us`, `schedule_at_us`,
+  `cancel`, `fired`, `clear`), a one-shot compare that fires at once for a
+  time already reached. `hal.Deadline` and `hal.Ticker` give drivers
+  timeouts and drift-free periodic work on any counter, with
+  `elapsed_us`, `wait_until`, `schedule_in_us`, and `wait_for_alarm`
+  helpers. Board timers are counters, and the RP2040 and RP2350 alarms
+  implement the alarm protocol for times up to 35 minutes ahead, forcing
+  their interrupt when a time has passed before the alarm was armed.
+  `std/embedded/hal/fake` gains `Alarm`, and `fake.Delay` is a counter whose
+  time is the delays asked of it, so timeouts are tested without waiting.
 - Watchdog for the RP2040 and RP2350: `b.watchdog` on every board (and
   `watchdog` in the chips' `Peripherals`) is a `std/embedded/chip/rp_watchdog`
   `Watchdog`. It is stopped after `take()`. `start(timeout_ms)` makes it reset
