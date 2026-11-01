@@ -20,6 +20,20 @@
   for tests, which sweep power cuts over every erase and write of a long run.
   `examples/boot_counter.dodo` counts restarts, and the Pico self-tests check
   regions, writes, and a store on the flash.
+- Random numbers for firmware: `std/embedded/hal` gains the `Rng`
+  protocol (`fill(bytes)`), with `random_u32`, `random_u64`, and the unbiased
+  `random_below`, and `hal.SoftRng`, a xoshiro128** generator seeded from a
+  hardware one with `from_rng` or from a fixed seed with `new`.
+  `hal/fake` gains `fake.Rng`. Every board has `b.rng`, and the chip packages
+  `Peripherals.rng`, from the new `std/embedded/chip/rp_rng`: on the RP2040,
+  `rp_rng.Rosc` samples the ring oscillator's RANDOMBIT about every 10 us and
+  debiases it with von Neumann's method, about 3 KB a second and not for
+  keys; on the RP2350, `rp_rng.Trng` runs the TRNG with its hardware
+  debiasing and all health tests on, about 20 KB a second and fit for keys,
+  restarting it after failed autocorrelation tests and keeping a block's
+  unused bytes for the next fill. A stopped source reports `Timeout` and
+  failing health checks `Bus`. Both drivers are generic over
+  `hal.Registers` and tested against simulated registers on the desktop.
 - `std/gpu`: portable GPU compute and rendering on Metal, Vulkan and
   OpenGL, written in Dodo on top of `std/gpu/metal`, `std/gpu/vulkan` and
   `std/gpu/opengl`. It follows WebGPU's model: a `Device` creates buffers,

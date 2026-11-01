@@ -11,6 +11,7 @@ import "std/embedded/chip/rp_multicore"
 import "std/embedded/chip/rp_pio"
 import "std/embedded/chip/rp_power"
 import "std/embedded/chip/rp_pwm"
+import "std/embedded/chip/rp_rng"
 import "std/embedded/chip/rp_rtc"
 import "std/embedded/chip/rp_usb"
 import "std/embedded/chip/rp_watchdog"
@@ -22,16 +23,16 @@ import "std/embedded/chip/rp_pins"
 // Raspberry Pi RP2350 chip support for the Arm cores: clocks, resets, GPIO,
 // I2C, SPI, UART, PWM, the ADC, PIO, the microsecond timer, the always-on
 // timer as a real-time clock, the watchdog, a USB serial port, the second
-// core, the FIFOs and spinlocks the cores share, low power, and the boot
-// ROM. `take(config)` brings the chip from its boot state (ring
+// core, the FIFOs and spinlocks the cores share, the TRNG, low power, and
+// the boot ROM. `take(config)` brings the chip from its boot state (ring
 // oscillator, peripherals held in reset) to a known configuration and hands
 // out the peripherals once. Pins implement the std/embedded/hal output and
 // input pin protocols, I2C and SPI buses claimed from `Pins` implement the
 // bus protocols, serial ports the std/io Reader and Writer protocols, PWM
 // outputs and ADC inputs the PWM output and analog input protocols, the
 // timer the delay protocol, the real-time clock the clock and alarm
-// protocols, and the watchdog the watchdog protocol, so portable drivers use
-// them unchanged.
+// protocols, the watchdog the watchdog protocol, and the TRNG the Rng
+// protocol, so portable drivers use them unchanged.
 //
 // Applications normally use a board package instead, which supplies the
 // board's Config and wiring: `import "std/embedded/board"` with
@@ -316,6 +317,8 @@ const I2C1_BASE: usize = 0x4009_8000
 // PWM (12.5), clocked by clk_sys, and the ADC (12.4), by clk_adc.
 const PWM_BASE: usize = 0x400A_8000
 const ADC_BASE: usize = 0x400A_0000
+// The TRNG (12.12).
+const TRNG_BASE: usize = 0x400F_0000
 
 // The PIO blocks (11), clocked by clk_sys.
 const PIO0_BASE: usize = 0x5020_0000
@@ -444,6 +447,9 @@ pub struct Peripherals {
     pub usb: Usb
     // The DMA controller's channels; rp_dma documents them.
     pub dma: rp_dma.Dma
+    // The random number generator, the TRNG: about 20 KB a second, fit
+    // for cryptographic keys; rp_rng documents it.
+    pub rng: rp_rng.Trng
     // Core 1, which runs a task once started, and the FIFOs and spinlocks
     // the two cores share; see std/embedded/chip/rp_multicore.
     pub core1: rp_multicore.Core1
@@ -456,10 +462,10 @@ pub struct Peripherals {
     pub power: Power
 }
 
-// Configure clocks, take GPIO, the timer, and DMA out of reset, and return the
-// peripherals. A second call returns Error.Busy, so no two owners exist; an
-// unusable crystal frequency returns Error.InvalidInput, and a crystal or PLL
-// that does not start returns Error.Timeout.
+// Configure clocks, take GPIO, the timer, DMA, and the TRNG out of reset, and
+// return the peripherals. A second call returns Error.Busy, so no two owners exist; an
+// unusable crystal frequency returns Error.InvalidInput, and a crystal, PLL,
+// or TRNG that does not start returns Error.Timeout.
 pub fn take(config: Config) -> Peripherals!hal.Error {
     crystal := config.crystal_hz
     if crystal < 1_000_000 || crystal > 15_000_000 || crystal % 1_000_000 != 0 || VCO_HZ % crystal != 0 {
@@ -483,7 +489,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     // user of the clock, reset, PLL, and tick registers.
     unsafe {
         start_clocks(crystal)?
-        reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER0 | RESET_DMA)?
+        reset_blocks(RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER0 | RESET_DMA | RESET_TRNG)?
     }
     // SAFETY: TAKEN guarantees one Rtc, the only user of the power
     // manager's timer, alarm, and interrupt enable registers.
@@ -512,6 +518,11 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
     dma := unsafe {
         rp_dma.Dma.new(rp_dma.RP2350)
     }
+    // SAFETY: TAKEN guarantees one generator, and the TRNG was just taken
+    // out of reset.
+    rng := unsafe {
+        rp_rng.Trng.at(TRNG_BASE, TRNG_IRQ)?
+    }
     // SAFETY: TAKEN guarantees one set of the cores' parts, and core 1 is
     // not running yet, so no spinlock is held.
     cores := unsafe {
@@ -530,7 +541,7 @@ pub fn take(config: Config) -> Peripherals!hal.Error {
         rp_flash.Flash.take()
     }
     power := Power { crystal_hz: crystal }
-    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { aon }, watchdog, usb, dma, core1, fifos, spinlocks, power, flash })
+    return ok(Peripherals { pins: Pins { bank }, timer, rtc: Rtc { aon }, watchdog, usb, dma, rng, core1, fifos, spinlocks, power, flash })
 }
 
 // SAFETY: the caller owns `address`, a 32-bit RP2350 register.
@@ -1552,9 +1563,10 @@ pub struct Alarm {
 // light one until `set_sleep_clocks` says otherwise. The clock constants
 // above name the gates. Claiming a peripheral starts its clocks, so
 // `disable_unused_clocks` is safe at any time. It also stops HSTX, TIMER1,
-// SHA-256, and the TRNG, which this package does not drive, while they are
-// held in reset; the timer (CLOCK_TIMER) and DMA (CLOCK_DMA) are not
-// claimed through Pins, so it leaves them to the program.
+// and SHA-256, which this package does not drive, while they are held in
+// reset; the timer (CLOCK_TIMER), DMA (CLOCK_DMA), and the TRNG
+// (CLOCK_TRNG), which take() starts for `Peripherals.rng`, are not claimed
+// through Pins, so it leaves them to the program.
 //
 // `dormant` runs clk_sys from the crystal, stops PLL_SYS and the ring
 // oscillator, and stops the crystal until a pin event, then starts them

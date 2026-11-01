@@ -21,12 +21,13 @@ import "std/time"
 // 3. Device protocols. The interfaces below name what drivers need from a
 //    device: OutputPin, InputPin, Delay, Counter, Alarm, I2c, Spi,
 //    PwmOutput, PwmInput, AnalogInput, Rtc, RtcAlarm, Can, I2sOutput,
-//    I2sInput, Watchdog, Flash, and Registers; the polling forms I2cPoll and SpiPoll; the target
-//    (slave) sides I2cTarget and SpiTarget; and DmaChannel, DmaBuffer, and
-//    SpiDma for transfers that run while the program does other work. Any
-//    value with matching methods implements them. Drivers are usually
-//    generic over a bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
-//    statically dispatched and reports a wrong argument where it is passed.
+//    I2sInput, Rng, Watchdog, Flash, and Registers; the polling forms
+//    I2cPoll and SpiPoll; the target (slave) sides I2cTarget and SpiTarget; and
+//    DmaChannel, DmaBuffer, and SpiDma for transfers that run while the
+//    program does other work. Any value with matching methods implements
+//    them. Drivers are usually generic over a bounded parameter,
+//    `fn probe<B: hal.I2c>(bus: &mut B)`, which is statically dispatched
+//    and reports a wrong argument where it is passed.
 //    `&mut dyn hal.I2c` instead dispatches at run time, for drivers chosen at
 //    run time or a list of different devices. Serial ports implement the
 //    `std/io` Reader and Writer interfaces, so ports work with `std/io`
@@ -53,8 +54,8 @@ import "std/time"
 // addresses offer that through methods of their own. Times are
 // microseconds: counters and alarms count them in a u64, which no program
 // outlives; real-time clocks count Unix milliseconds. Pin, delay, and
-// counter operations cannot fail; alarm, bus, PWM, analog, and clock
-// operations report the shared
+// counter operations cannot fail; alarm, bus, PWM, analog, clock, and
+// random operations report the shared
 // `Error` below, because such a device may itself sit on a bus. A bus is
 // configured when it is created, with a frequency and for SPI a `SpiMode`,
 // and so is a PWM output, with its frequency; the protocols then only move
@@ -107,6 +108,10 @@ import "std/time"
 //                                  implement the polling forms too, and
 //                                  serial ports serial.Port and
 //                                  serial.PollPort
+//    Board.rng                     the chip's random number generator, with
+//                                  the Rng protocol: fill(bytes), and
+//                                  random_u32, random_u64, and
+//                                  random_below over it
 //    Board.timer                   the Delay and Counter protocols:
 //                                  delay_us, delay_ms, now_us(&self) -> u64;
 //                                  chips may hand out alarms with the Alarm
@@ -1034,6 +1039,19 @@ pub interface I2sInput {
     fn poll_read(&mut self, samples: &mut[i32]) -> usize!Error
 }
 
+// A source of random bytes: a chip's hardware generator, which gathers
+// entropy from physical noise such as an oscillator's jitter, or a SoftRng
+// seeded from one. random_u32, random_u64, and random_below build numbers
+// from the bytes. Hardware generators differ in quality and speed: each
+// chip package says whether its generator is fit for cryptographic keys.
+// Where it is slow, seed a SoftRng from it once and draw from that.
+pub interface Rng {
+    // Fill `bytes` completely. Timeout if a hardware source stops
+    // producing entropy, Bus if its health tests fail; on error the
+    // contents of `bytes` are unspecified and must not be used.
+    fn fill(&mut self, bytes: &mut[u8]) -> void!Error
+}
+
 // A watchdog: once started, it resets the chip unless the program feeds it
 // again within its timeout, so firmware that hangs restarts instead of
 // staying stuck. Its timeout is set when it is started; drivers and tasks
@@ -1875,6 +1893,124 @@ pub fn read_millivolts<A: AnalogInput>(input: &mut A, reference_mv: u32) -> u32!
         return err(Error.Unsupported)
     }
     return ok(((value * reference_mv as u64 + full / 2) / full) as u32)
+}
+
+// A uniformly distributed u32 from `rng`.
+pub fn random_u32<R: Rng>(rng: &mut R) -> u32!Error {
+    bytes := [0u8; 4]
+    rng.fill(&mut bytes)?
+    return ok(bytes[0] as u32 | (bytes[1] as u32 << 8) | (bytes[2] as u32 << 16) | (bytes[3] as u32 << 24))
+}
+
+// A uniformly distributed u64 from `rng`.
+pub fn random_u64<R: Rng>(rng: &mut R) -> u64!Error {
+    bytes := [0u8; 8]
+    rng.fill(&mut bytes)?
+    value := 0u64
+    for index in 0usize..8 {
+        value = value | (bytes[index] as u64 << (8 * index as u64))
+    }
+    return ok(value)
+}
+
+// A uniformly distributed value in 0..bound from `rng`, without the bias a
+// plain `random_u32(rng)? % bound` has: a die roll is
+// `random_below(rng, 6)? + 1`. InvalidInput if `bound` is zero.
+pub fn random_below<R: Rng>(rng: &mut R, bound: u32) -> u32!Error {
+    if bound == 0 {
+        return err(Error.InvalidInput)
+    }
+    // Reject the lowest 2^32 mod bound values, so every residue is equally
+    // likely.
+    threshold := core.wrapping_sub(0u32, bound) % bound
+    for {
+        value := random_u32(rng)?
+        if value >= threshold {
+            return ok(value % bound)
+        }
+    }
+}
+
+// `value` rotated left by `count` bits, 1 to 31.
+fn rotate_left(value: u32, count: u32) -> u32 {
+    return ((value & (0xFFFF_FFFFu32 >> count)) << count) | (value >> (32 - count))
+}
+
+// One step of SplitMix64 over `state`, for expanding a seed.
+fn split_mix(state: &mut u64) -> u64 {
+    *state = core.wrapping_add(*state, 0x9E37_79B9_7F4A_7C15u64)
+    value := *state
+    value = core.wrapping_mul(value ^ (value >> 30), 0xBF58_476D_1CE4_E5B9u64)
+    value = core.wrapping_mul(value ^ (value >> 27), 0x94D0_49BB_1331_11EBu64)
+    return value ^ (value >> 31)
+}
+
+// A fast software generator, xoshiro128**, for when a hardware generator
+// is slow or absent: seed it once from the chip's generator with
+// `from_rng`, then draw as many numbers as needed at a few cycles each.
+// Implements Rng. Its output is statistically uniform but predictable to
+// anyone who learns its 128-bit state, so it is not for cryptographic keys.
+// `new` with a fixed seed repeats the same sequence, for tests and
+// reproducible simulations.
+pub struct SoftRng: Rng {
+    state: [4]u32
+
+    // A generator whose state is expanded from `seed`.
+    pub fn new(seed: u64) -> SoftRng {
+        mix := seed
+        low := split_mix(&mut mix)
+        high := split_mix(&mut mix)
+        return SoftRng { state: [(low & 0xFFFF_FFFF) as u32, (low >> 32) as u32, (high & 0xFFFF_FFFF) as u32, (high >> 32) as u32] }
+    }
+
+    // A generator whose 128-bit state is read from `source`, such as a
+    // board's `rng`. Fails as `source.fill` does.
+    pub fn from_rng<S: Rng>(source: &mut S) -> SoftRng!Error {
+        bytes := [0u8; 16]
+        source.fill(&mut bytes)?
+        state := [0u32; 4]
+        zero := true
+        for index in 0usize..16 {
+            state[index / 4] = state[index / 4] | (bytes[index] as u32 << (8 * (index % 4) as u32))
+            if bytes[index] != 0 {
+                zero = false
+            }
+        }
+        if zero {
+            // The one state xoshiro cannot leave.
+            return ok(SoftRng.new(0))
+        }
+        return ok(SoftRng { state })
+    }
+
+    // The next uniformly distributed u32. Never fails.
+    pub fn next_u32(&mut self) -> u32 {
+        result := core.wrapping_mul(rotate_left(core.wrapping_mul(self.state[1], 5u32), 7), 9u32)
+        shifted := (self.state[1] & (0xFFFF_FFFFu32 >> 9)) << 9
+        self.state[2] = self.state[2] ^ self.state[0]
+        self.state[3] = self.state[3] ^ self.state[1]
+        self.state[1] = self.state[1] ^ self.state[2]
+        self.state[0] = self.state[0] ^ self.state[3]
+        self.state[2] = self.state[2] ^ shifted
+        self.state[3] = rotate_left(self.state[3], 11)
+        return result
+    }
+
+    // Fill `bytes` from the generator. Never fails.
+    pub fn fill(&mut self, bytes: &mut[u8]) -> void!Error {
+        index := 0usize
+        for index < bytes.len {
+            value := self.next_u32()
+            for _ in 0..4 {
+                if index < bytes.len {
+                    bytes[index] = (value & 0xFF) as u8
+                    value = value >> 8
+                    index += 1
+                }
+            }
+        }
+        return ok()
+    }
 }
 
 // Real-time clock times as calendar values. The calendar is UTC; shift by
