@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- JPEG XL in `std/image` loses its documented limitations.
+  The decoder now handles patches and splines in upsampled frames, upsampled
+  LF frames, and chroma-subsampled modular and VarDCT frames with upsampling,
+  Gaborish, EPF and adaptive LF smoothing (subsampled frames with varblocks
+  larger than 8x8 are invalid and fail `Malformed`, as in libjxl). It reads
+  up to 4096 extra channels, and the new `jxl.extra_channel_count`,
+  `extra_channel_info`, `extra_channel_name` and `decode_extra_channel`
+  return any of them at full size; spot colors are rendered into the color
+  output as `djxl` does. Scratch now follows the image size instead of the
+  frame sizes a file declares: frames are decoded over the part that can
+  reach the output and reference frames keep only what later patches read,
+  so a small file claiming gigapixel frames no longer asks for gigabytes
+  (`scratch_size` <= 64 (W+1100)(H+1100) C + 5 MiB C + 128 MiB, with the
+  exceptions listed in the guide). `info`, `metadata`, `frame_info` and
+  `scratch_size` no longer put a 196 KiB work area on the stack (about
+  32 KiB now) and decode larger ICC profiles; ICC tag-table checks and
+  shuffled ICC runs now match libjxl.
+- The JPEG XL encoder writes lossy files: `EncodeOptions.lossless = false`
+  (or `EncodeOptions.lossy(distance)`, `distance_from_quality(q)`) produces
+  a VarDCT frame in XYB with libjxl's quantizer, adaptive quantization,
+  inverse Gaborish, chroma-from-luma and varblock search, within a few
+  percent of `cjxl` at equal quality, in at most about 9 MiB of scratch.
+  Efforts 2 and up tune hybrid integers per cluster and use ANS when it is
+  smaller, for lossless and lossy output. ICC profiles can be embedded
+  (`Metadata.with_icc`, `icc_fits`, `icc_usable`, `icc_bound`) with
+  libjxl's predictive ICC coding; lossy files convert through the profile's
+  lookup table, matrix/TRC model or gray curve. `std/image`'s
+  `EncodeOptions.quality` and `lossless` now take effect (plus a new
+  `distance`), `encode_with_metadata` and `image_alloc` keep ICC profiles
+  for JPEG XL, and `imgtool convert` gains `--quality`, `--distance` and
+  `--lossy`.
+- New `std/compress/brotli`, a pure-Dodo RFC 7932 decoder with caller
+  buffers: one-shot `decompress`, `decompress_with_workspace`, a streaming
+  `Decoder` over a caller ring buffer, `decompressed_size`, `window_len` and
+  `workspace_size`, with the static dictionary and all 121 transforms.
+  `meta.decode` and the new `meta.decode_with_scratch`/`meta.scratch_size`
+  decompress JPEG XL `brob` metadata boxes, `jxl.metadata` reports the
+  Exif/XMP inside them, `std/image_alloc` keeps their EXIF, and
+  `imgtool info` shows decoded metadata sizes.
 - New database packages. `std/db` holds the shared vocabulary for drivers:
   `db.Error` with portable `db.ErrorKind`s and `db.Constraint`s plus the
   driver's native code, the borrowed `db.Value`, and `db.IsolationLevel`.

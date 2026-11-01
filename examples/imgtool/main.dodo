@@ -397,12 +397,29 @@ fn invalid(what: &str, value: &str) -> i32!Failure {
     return ok(EXIT_ERROR)
 }
 
+// Scratch for decoding Brotli metadata: brotli.WORKSPACE_LEN u16 words
+// cover any stream.
+const META_SCRATCH_SIZE: usize = 1392216
+
+static mut META_SCRATCH: [META_SCRATCH_SIZE]u8 = [0u8; META_SCRATCH_SIZE]
+
+// Decode a metadata item with the static Brotli scratch.
+fn decode_item(data: &[u8], item: &meta.Item, output: &mut[u8]) -> usize!pixels.Error {
+    need := meta.scratch_size(data, item)?
+    if need > META_SCRATCH_SIZE {
+        return err(pixels.Error.TooLarge)
+    }
+    unsafe {
+        return meta.decode_with_scratch(data, item, output, &mut META_SCRATCH[..need])
+    }
+}
+
 // One metadata line: the stored size and encoding, plus the decoded size
 // of a zlib or Brotli payload up to 64 KiB.
 fn print_item(kind: &str, data: &[u8], item: &meta.Item) -> void!Failure {
     if item.encoding == meta.ENCODING_ZLIB || item.encoding == meta.ENCODING_BROTLI {
         decoded := [0u8; 65536]
-        match meta.decode(data, item, &mut decoded) {
+        match decode_item(data, item, &mut decoded) {
             ok(length) => {
                 console.printf("metadata: {}, {} bytes ({}, {} decoded)\n", kind, item.length, encoding_name(item.encoding), length)?
                 return ok()
