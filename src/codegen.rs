@@ -71,6 +71,7 @@ fn function_sections(module: &Module<'_>) {
     if coff {
         return;
     }
+    let hosted_elf = triple.contains("-linux");
     // Otherwise every constant shares one .rodata section, which a single
     // reference keeps whole: firmware would carry every package's public
     // constants.
@@ -84,7 +85,17 @@ fn function_sections(module: &Module<'_>) {
             continue;
         }
         let kind = if global.is_global_constant() {
-            ".rodata."
+            // Code is position independent, so a constant holding addresses
+            // needs load-time relocations and LLVM marks its section
+            // writable. GNU ld would merge a writable `.rodata.*` into the
+            // text segment and make that writable and executable; hosted
+            // programs keep such constants in the RELRO segment instead.
+            // Firmware linker scripts place `.rodata.*` in flash.
+            if hosted_elf && global.value_type_has_pointer() {
+                ".data.rel.ro."
+            } else {
+                ".rodata."
+            }
         } else if initializer.is_null() {
             ".bss."
         } else {

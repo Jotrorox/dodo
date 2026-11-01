@@ -572,6 +572,24 @@ impl<'ctx> Value<'ctx> {
     pub(super) fn is_global_constant(self) -> bool {
         unsafe { LLVMIsGlobalConstant(self.0) != 0 }
     }
+    /// Whether the global's value type holds a pointer anywhere, so its
+    /// initializer may need relocations.
+    pub(super) fn value_type_has_pointer(self) -> bool {
+        unsafe fn has_pointer(ty: LLVMTypeRef) -> bool {
+            unsafe {
+                match LLVMGetTypeKind(ty) {
+                    LLVMTypeKind::LLVMPointerTypeKind => true,
+                    LLVMTypeKind::LLVMArrayTypeKind | LLVMTypeKind::LLVMVectorTypeKind => {
+                        has_pointer(LLVMGetElementType(ty))
+                    }
+                    LLVMTypeKind::LLVMStructTypeKind => (0..LLVMCountStructElementTypes(ty))
+                        .any(|i| has_pointer(LLVMStructGetTypeAtIndex(ty, i))),
+                    _ => false,
+                }
+            }
+        }
+        unsafe { has_pointer(LLVMGlobalGetValueType(self.0)) }
+    }
     pub(super) fn is_thread_local(self) -> bool {
         unsafe { LLVMIsThreadLocal(self.0) != 0 }
     }
