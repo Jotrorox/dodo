@@ -149,13 +149,19 @@ struct Proto {
 // --- Value accessors --------------------------------------------------------
 
 fn val_tag(v: *mut Value) -> u8 {
-    unsafe { return (*v).tag }
+    unsafe {
+        return (*v).tag
+    }
 }
 fn val_type(v: *mut Value) -> u8 {
-    unsafe { return (*v).tag & 15 }
+    unsafe {
+        return (*v).tag & 15
+    }
 }
 fn val_is_nil(v: *mut Value) -> bool {
-    unsafe { return ((*v).tag & 15) == TYPE_NIL }
+    unsafe {
+        return ((*v).tag & 15) == TYPE_NIL
+    }
 }
 // nil and false are the only false values.
 fn val_is_falsy(v: *mut Value) -> bool {
@@ -165,32 +171,50 @@ fn val_is_falsy(v: *mut Value) -> bool {
     }
 }
 fn val_is_collectable(v: *mut Value) -> bool {
-    unsafe { return ((*v).tag & COLLECTABLE) != 0 }
+    unsafe {
+        return ((*v).tag & COLLECTABLE) != 0
+    }
 }
 fn val_int(v: *mut Value) -> i64 {
-    unsafe { return *(v as *mut i64) }
+    unsafe {
+        return *(v as *mut i64)
+    }
 }
 fn val_float(v: *mut Value) -> f64 {
-    unsafe { return *(v as *mut f64) }
+    unsafe {
+        return *(v as *mut f64)
+    }
 }
 fn val_ptr(v: *mut Value) -> *mut u8 {
-    unsafe { return *(v as *mut *mut u8) }
+    unsafe {
+        return *(v as *mut *mut u8)
+    }
 }
 fn val_gc(v: *mut Value) -> *mut GCObject {
-    unsafe { return *(v as *mut *mut GCObject) }
+    unsafe {
+        return *(v as *mut *mut GCObject)
+    }
 }
 fn val_str(v: *mut Value) -> *mut LString {
-    unsafe { return *(v as *mut *mut LString) }
+    unsafe {
+        return *(v as *mut *mut LString)
+    }
 }
 fn val_proto(v: *mut Value) -> *mut Proto {
-    unsafe { return *(v as *mut *mut Proto) }
+    unsafe {
+        return *(v as *mut *mut Proto)
+    }
 }
 
 fn set_nil(v: *mut Value) {
-    unsafe { (*v).tag = TAG_NIL }
+    unsafe {
+        (*v).tag = TAG_NIL
+    }
 }
 fn set_empty(v: *mut Value) {
-    unsafe { (*v).tag = TAG_EMPTY }
+    unsafe {
+        (*v).tag = TAG_EMPTY
+    }
 }
 fn set_bool(v: *mut Value, b: bool) {
     unsafe {
@@ -242,17 +266,25 @@ fn set_obj(dst: *mut Value, src: *mut Value) {
 // --- String accessors -------------------------------------------------------
 
 fn str_data(s: *mut LString) -> *mut u8 {
-    unsafe { return ptr.offset(s as *mut u8, mem.size_of::<LString>() as isize) }
+    unsafe {
+        return ptr.offset(s as *mut u8, mem.size_of::<LString>() as isize)
+    }
 }
 fn str_len(s: *mut LString) -> usize {
-    unsafe { return (*s).length }
+    unsafe {
+        return (*s).length
+    }
 }
 fn str_is_short(s: *mut LString) -> bool {
-    unsafe { return (*s).tag == TAG_SHORTSTR }
+    unsafe {
+        return (*s).tag == TAG_SHORTSTR
+    }
 }
 
 fn gc_of<T>(o: *mut T) -> *mut GCObject {
-    unsafe { return o as *mut GCObject }
+    unsafe {
+        return o as *mut GCObject
+    }
 }
 
 // Outcome of a raised Lua error or a coroutine yield, propagated through
@@ -275,7 +307,9 @@ pub enum Throw {
 const CHUNKID_SIZE: usize = 60
 
 fn cid_put(out: *mut u8, at: usize, src: *mut u8, count: usize) -> usize {
-    unsafe { ptr.copy_nonoverlapping(src, ptr.offset(out, at as isize), count) }
+    unsafe {
+        ptr.copy_nonoverlapping(src, ptr.offset(out, at as isize), count)
+    }
     return at + count
 }
 
@@ -286,9 +320,17 @@ fn cid_put(out: *mut u8, at: usize, src: *mut u8, count: usize) -> usize {
 // with the first line of the source.
 fn chunk_id(source: *mut u8, length: usize, out: *mut u8) -> usize {
     unsafe {
-        let first = if length > 0 { *source } else { 0u8 }
+        let first = if length > 0 {
+            *source
+        } else {
+            0u8
+        }
         if first == b'=' {
-            let n = if length <= CHUNKID_SIZE { length - 1 } else { CHUNKID_SIZE - 1 }
+            let n = if length <= CHUNKID_SIZE {
+                length - 1
+            } else {
+                CHUNKID_SIZE - 1
+            }
             return cid_put(out, 0, ptr.offset(source, 1), n)
         }
         if first == b'@' {
