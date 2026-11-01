@@ -1294,6 +1294,27 @@ impl Lower<'_> {
                 );
                 target
             }
+            // The future moves into the suspended body and is destroyed once
+            // ready. Its output may keep the borrows the future carried.
+            ExprKind::Await { value, .. } => {
+                let future = self.expr(value, true);
+                let borrowed = self.carries(ty);
+                let target = self.temporary(ty.clone(), span);
+                self.emit(
+                    Operation::Call {
+                        target,
+                        args: vec![future],
+                        reservations: vec![],
+                        contract: Contract {
+                            from: if borrowed { vec![0] } else { vec![] },
+                            ..Contract::default()
+                        },
+                        borrowed,
+                    },
+                    span,
+                );
+                target
+            }
             ExprKind::Asm(asm) => {
                 for value in asm.inputs() {
                     self.expr(value, true);

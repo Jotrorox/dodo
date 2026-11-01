@@ -1160,12 +1160,13 @@ with `mret`.
 
 The handler and the code it interrupts share state through static storage: a
 single integer through an [atomic](#sharing-state-with-atomics), anything else
-through `static mut` storage. Reading or writing `static mut` storage is unsafe
-in Dodo, and keeping both sides consistent is the program's job: `hal.Critical.enter()` masks interrupts on the
-current core and remembers whether they were enabled; dropping it restores
-exactly that state, so sections nest. A handler cannot be interrupted by
-itself, so it needs no section for state only it and lower-priority code use.
-Keep sections short, and remember they never exclude other threads or cores.
+through a [mutex](#sharing-values-with-a-mutex) from `std/embedded/sync`.
+Both work in a plain `static` and need no `unsafe`. Underneath them,
+`hal.Critical.enter()` masks interrupts on the current core and remembers
+whether they were enabled; dropping it restores exactly that state, so
+sections nest. Raw `static mut` storage is still available, but reading or
+writing it is unsafe, and keeping both sides consistent is then the
+program's job.
 
 ### Sharing state with atomics
 
@@ -1221,36 +1222,95 @@ handler `load`s the count, adds one, and `store`s it, which is safe as long
 as nothing else stores to it. A value that both sides change needs a critical
 section there.
 
+### Sharing values with a mutex
+
+Anything larger than a word, such as a driver or a buffer, goes into a
+`sync.Mutex<T>` from `std/embedded/sync`, in a plain static initialized
+with `sync.Mutex.new`. `lock()` masks interrupts on this core and returns a
+guard whose `get()` and `get_mut()` reach the value; dropping the guard
+unlocks it and restores the interrupt mask:
+
+```dodo test
+package main
+
+import "std/embedded/sync"
+
+struct Stats {
+    samples: u32
+    peak: u32
+}
+
+static STATS: sync.Mutex<Stats> = sync.Mutex.new(Stats { samples: 0, peak: 0 })
+
+// Called from an interrupt handler and from the main loop alike.
+fn record(value: u32) {
+    guard := STATS.lock()
+    stats := guard.get_mut()
+    stats.samples += 1
+    if value > stats.peak {
+        stats.peak = value
+    }
+}
+
+fn main() {
+    record(12)
+    record(40)
+    record(7)
+    peak := 0u32
+    STATS.with(fn(stats: &mut Stats) { peak = stats.peak })
+    assert_eq(peak, 40u32)
+}
+```
+
+`with(closure)` runs a closure on the value under the lock, `set(value)` replaces the value (dropping the old one outside the
+lock), and `replace(value)` returns the old one, so `SERIAL.replace(none)`
+takes a driver back. `try_lock()` returns none instead of locking a mutex
+this core holds already, which `lock()` reports with a trap, since a second
+guard would be a second exclusive reference. Mutexes nest: code holding one
+may lock another.
+
+| Share | With | Notes |
+| --- | --- | --- |
+| A counter or flag that one side changes | `atomic.Atomic<T>` | `load` and `store` everywhere; read-modify-write except on the Cortex-M0+. |
+| A word both sides change | `atomic.Atomic<T>`, or a mutex on the Cortex-M0+ | One indivisible step per call. |
+| A driver, buffer, or record | `sync.Mutex<T>` | Interrupts on this core wait while it is held; so does the other core of a [running RP2040 or RP2350 pair](#two-cores-on-the-rp2040-and-rp2350). |
+| An event that wakes a task | `executor.Signal` | See [waking tasks from interrupts](#waking-tasks-from-interrupts). |
+
+Every mutex locks through one system-wide section, `sync.enter()`, which
+other code can take too. Keep it short: interrupts on the core wait while a
+guard lives. On a desktop, where there are no interrupts, a mutex excludes
+nothing, so use these mutexes from one thread there, as in tests, and
+[`std/sync`](synchronization.md)'s for threads.
+
 ### An interrupt-driven driver
 
-A driver can live in a `static mut Option<...>` that the handler serves. The
-repository's
+A driver can live in a mutex that the handler serves. The repository's
 [`examples/interrupts`](https://github.com/Jotrorox/dodo/blob/main/examples/interrupts/main.dodo)
 echoes a serial port this way: the UART's receive interrupt moves bytes into a
 queue, SysTick counts milliseconds, and the main loop sleeps until either has
 news:
 
 ```dodo
-static mut SERIAL: Option<pl011.Port> = none
+static SERIAL: sync.Mutex<Option<pl011.Port>> = sync.Mutex.new(none)
+static QUEUE: sync.Mutex<Queue> = sync.Mutex.new(Queue { bytes: [0u8; 64], start: 0, queued: 0, dropped: 0 })
 
 @interrupt(UART0_IRQ)
 fn serial_received() {
-    unsafe {
-        match &mut SERIAL {
-            some(port) => {
-                buffer := [0u8; 32]
-                match port.poll_read(&mut buffer) {
-                    ok(progress) => {
-                        enqueue(&buffer[..progress.transferred])
-                    }
-                    err(failure) => {
-                        enqueue(&buffer[..failure.transferred])
-                        port.clear_interrupts(pl011.ERROR_INTERRUPTS)
-                    }
-                }
+    serial := SERIAL.lock()
+    if let some(port) = serial.get_mut() {
+        buffer := [0u8; 32]
+        received := 0usize
+        match port.poll_read(&mut buffer) {
+            ok(progress) => {
+                received = progress.transferred
             }
-            none => {}
+            err(failure) => {
+                received = failure.transferred
+                port.clear_interrupts(pl011.ERROR_INTERRUPTS)
+            }
         }
+        queue := QUEUE.lock()
+        queue.get_mut().push(&buffer[..received])
     }
 }
 
@@ -1258,11 +1318,9 @@ fn main() {
     b := board.take()!
     port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
     port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT | pl011.ERROR_INTERRUPTS)
-    unsafe {
-        SERIAL = some(port)
-    }
+    SERIAL.set(some(port))
     cortex_m.enable(chip.UART0_IRQ)
-    // ... sleep with cpu.wait_for_interrupt() and drain the queue
+    // ... drain QUEUE, sleeping with cpu.wait_for_interrupt() while it is empty
 }
 ```
 
@@ -1428,8 +1486,10 @@ link alive. `std/embedded/executor` lets each activity be a **task** of its own.
 The executor polls a task only when something it waits for has happened, a
 time arriving or an interrupt, and puts the core to sleep while none has work.
 
-A task is any value with a `poll` method, usually a struct that owns the
-peripherals it uses and remembers where it is in its work:
+A task is any value with a `poll` method. Most tasks are easiest to write as
+[async functions](#async-tasks), which the compiler turns into such values;
+underneath, a task is a struct that owns the peripherals it uses and
+remembers where it is in its work:
 
 ```dodo
 struct Blinker<L> {
@@ -1499,6 +1559,70 @@ reaches `end_us` before every task is done, so a program or test can advance
 in steps. `polls()`, `sleeps()`, and `is_finished(index)` report what it did.
 `executor.Context.new(now_us)` makes a context for calling a task's `poll`
 directly, and `cx.wake_time()` shows what the task asked for.
+
+### Async tasks
+
+Written by hand, a task keeps where it is in its fields and returns to the
+executor at every step. An [`async fn`](async.md) writes the same task as
+straight-line code: each `await` returns to the executor until what it
+waits for has happened, and the next poll continues after it. Calling the
+function makes the task, a future, which goes into the task list like any
+other:
+
+```dodo
+const BUTTON: executor.Signal = executor.Signal { id: 1 }
+const PRESSES: executor.Signal = executor.Signal { id: 2 }
+
+async fn blink<L: hal.OutputPin>(led: &mut L, period_ms: u32) {
+    ticker := executor.Ticker.every_ms(period_ms)
+    for {
+        led.set_high()
+        await ticker.tick()
+        led.set_low()
+        await ticker.tick()
+    }
+}
+
+// Counts presses, ignoring the contacts' bounce.
+async fn count_presses(pin: &mut chip.Pin) {
+    presses := 0u32
+    for {
+        cortex_m.enable(chip.IO_IRQ_BANK0)
+        await BUTTON.wait()
+        if (pin.events() & chip.RISING_EDGE) != 0 {
+            pin.clear_events(chip.RISING_EDGE)
+            presses += 1
+            PRESSES.send(presses)
+            await executor.sleep_ms(50)
+            pin.clear_events(chip.RISING_EDGE)
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    clock := b.timer.alarm(0)!
+    pin := b.pins.input(15)!
+    pin.listen(chip.RISING_EDGE)
+    blinker := blink(&mut b.led, 250)
+    button := count_presses(&mut pin)
+    console := Console { port: b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)! }
+    tasks: [3]&mut dyn executor.Task = [&mut blinker, &mut button, &mut console]
+    executor.run(&mut tasks, &mut clock)
+}
+```
+
+Here `console` is a hand-written task; async and hand-written tasks mix
+freely, since a future has the task's `poll` method. The repository's
+[`examples/async_tasks`](https://github.com/Jotrorox/dodo/blob/main/examples/async_tasks/main.dodo)
+writes all three tasks of `examples/tasks` as async fns. A future keeps its
+locals between polls, and lives where its owner put it: on `main`'s stack
+above, or in a `static mut` for a large one. Once started, it must stay in
+place, as a reference into it may be held across an `await`. The
+[async functions](async.md) chapter describes `await` and what it accepts:
+`executor.sleep_ms`, `ticker.tick()`, `SIGNAL.wait()`, `SIGNAL.next_value()`,
+`executor.yield_now()`, `executor.now()`, other async fns, and `executor.select` and
+`executor.join` to wait for either or both of two futures.
 
 ### Waking tasks from interrupts
 
@@ -1640,9 +1764,9 @@ while nothing has been fed.
   signals take their numbers from the application. On the RP2040 and RP2350
   each core can run an executor of its own; see
   [two cores](#two-cores-on-the-rp2040-and-rp2350).
-- Tasks are state machines written by hand: Dodo has no `async` functions
-  that the compiler would turn into them. Keep the state in the task's
-  fields, and do each step without waiting.
+- A task does each step without waiting: an `async fn` returns to the
+  executor at each `await`, a hand-written task at the end of each `poll`.
+  Code between them runs to completion and delays every other task.
 - A task owns its peripherals. Tasks that share a bus are one task, or one
   task owns the bus and the others send it requests with signals.
 - The blocking bus methods (`write`, `read`, `transfer`) wait for the bus
@@ -2833,6 +2957,7 @@ hands out three parts from `std/embedded/chip/rp_multicore`:
 | `b.core1` | `start(&mut stack, task)` runs `task.run()` on core 1 and returns a `Running` handle. |
 | `b.fifos` | `claim()` hands out a core's end of the FIFOs between the cores, twice: one for core 0 and one to move into core 1's task. |
 | `b.spinlocks` | `claim(n)` and `claim_free()` hand out the hardware locks both cores see. |
+| `b.doorbells` | On the RP2350, `claim(n)` and `claim_free()` hand out the doorbells that interrupt the other core. The Pico's RP2040 has none. |
 
 A task for core 1 is a value with a public `run(self)` method, like a
 [`std/thread`](threads.md) task. It moves to core 1, so it may own
@@ -2937,8 +3062,30 @@ runtime's, and `set_signal` with it. GPIO events reach core 0 only: `Pin.listen`
 enables them for core 0's `IO_IRQ_BANK0`. The USB serial port's interrupt runs
 on the core that opened the port.
 
-Statics are shared by both cores, and a critical section does not keep the
-other core out. Guard state both cores change with a spinlock:
+Statics are shared by both cores, and `hal.Critical` does not keep the other
+core out. A [`sync.Mutex`](#sharing-values-with-a-mutex) does: `start`
+installs hardware spinlock 31 as the lock of `std/embedded/sync`'s sections,
+so from then on a mutex locked on one core makes the other core wait as
+well as masking interrupts, and the same static works across handlers,
+tasks, and cores:
+
+```dodo
+static PRIMES: sync.Mutex<Found> = sync.Mutex.new(Found { count: 0, largest: 0 })
+
+// On core 1:
+PRIMES.with(fn(found: &mut Found) {
+    found.count += 1
+    found.largest = candidate
+})
+
+// On core 0:
+guard := PRIMES.lock()
+report(guard.get().count)
+```
+
+While one core holds a mutex, the other spins when it locks any mutex, so
+keep sections short. Stopping core 1 releases a section it held. A program
+of its own can also guard state with a spinlock:
 
 ```dodo
 static mut TOTAL: u32 = 0
@@ -2953,13 +3100,42 @@ core.drop(guard)
 `lock()` masks interrupts on this core, then waits while the other core holds
 the lock; dropping the guard releases it and unmasks them again. `try_lock()`
 does not wait, and `is_locked()` reports either core's hold. Claim a lock once,
-then give the other core its own copy with `clone()`. The RP2040 has 32 locks.
-On the RP2350, writes to some other SIO registers unlock the locks just below
-them (erratum RP2350-E2), so locks 0 to 4, 8, 9, and 12 to 17 are never handed
-out; locks 18 to 31 work on both chips. On the RP2350 a single word can also be
+then give the other core its own copy with `clone()`. The RP2040 has 32 locks,
+of which lock 31 belongs to `std/embedded/sync`. On the RP2350, writes to some
+other SIO registers unlock the locks just below them (erratum RP2350-E2), so
+locks 0 to 4, 8, 9, and 12 to 17 are never handed out either; locks 18 to 30
+work on both chips. On the RP2350 a single word can also be
 shared with [atomics](#sharing-state-with-atomics), whose exclusive loads and
 stores work across cores; the RP2040's Cortex-M0+ only loads and stores
 atomically.
+
+The RP2350 also has eight **doorbells**, which interrupt the other core
+without passing data, so they wake the other core's executor without using
+the FIFO. Claim one, give core 1 a `clone()`, and let the core that waits
+raise a signal from it:
+
+```dodo
+const RUNG: executor.Signal = executor.Signal { id: 4 }
+
+// Core 0, before starting core 1 with `bell.clone()` in its task:
+bell := b.doorbells.claim(0)!
+bell.set_signal(&RUNG)
+
+// In an async task of core 0's executor:
+await RUNG.wait()
+
+// On core 1, when there is news:
+bell.ring()
+```
+
+| `rp_multicore.Doorbell` | Purpose |
+| --- | --- |
+| `ring()`, `withdraw()` | Ring the doorbell on the other core, or take back a ring it has not acknowledged. Rings before an acknowledgement are one. |
+| `is_ringing()`, `answer()` | Whether the other core rang it, and acknowledging that, true if it was ringing. |
+| `set_signal(&signal)`, `clear_signal()` | Raise a signal on this core when the other core rings: the RP2350 runtime's `SIO_IRQ_BELL` handler acknowledges the ring and raises it. |
+| `irq()`, `clone()` | `SIO_IRQ_BELL`, which each core has, and the same doorbell for the other core. |
+
+A program's own `@interrupt(SIO_IRQ_BELL)` handler replaces the runtime's.
 
 `examples/two_cores.dodo` searches for primes on core 1 and reports progress
 over USB serial from an executor on core 0, woken through the FIFO, with a
@@ -3157,10 +3333,16 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
   floating-point exception flags and return the default quiet NaN for every
   NaN result.
 - Core 1 runs one task, started from core 0, and the cores share the
-  vector table. Executor tasks on either core are cooperative: there is no
-  preemptive scheduler. GPIO events interrupt core 0 only, the RP2350's
-  doorbells between the cores are not exposed, and its RISC-V cores are not
-  supported.
+  vector table. Executor tasks on either core, async or hand-written, are
+  cooperative: there is no preemptive scheduler. GPIO events interrupt
+  core 0 only, and the RP2350's RISC-V cores are not supported. A signal
+  belongs to one core; the FIFO or a doorbell carries a wake-up across.
+- An async fn's future must stay in place once started, cannot await
+  itself, and is as large as everything its body keeps across an `await`;
+  `await` begins its statement. See [async functions](async.md).
+- `sync.Mutex` masks interrupts while held, and with core 1 running also
+  holds off the other core; on a hosted target it excludes nothing, like
+  the executor's signals, so use both from one thread there.
 - On the Cortex-M0+ of the RP2040, atomics only load and store; see
   [sharing state with atomics](#sharing-state-with-atomics).
 - Inline assembly lives inside functions; there is no global or naked

@@ -1,0 +1,135 @@
+package main
+
+import "std/embedded/board"
+import "std/embedded/chip"
+import "std/embedded/cortex_m"
+import "std/embedded/executor"
+import "std/embedded/hal"
+import "std/embedded/peripheral/pl011"
+import "std/fmt"
+
+// examples/tasks, written as async fns: three tasks share the core with
+// std/embedded/executor, and it sleeps whenever none of them has work.
+//
+// - the LED blinks twice a second;
+// - a push button between GP15 and 3V3(OUT) counts presses, ignoring the
+//   contacts' bounce, woken by a GPIO interrupt;
+// - a serial console on GP0 (TX) and GP1 (RX) at 115200 baud echoes what is
+//   typed, answers each line with the uptime, and reports button presses,
+//   woken by the UART's receive interrupt and by the button task.
+//
+// Each task is straight-line code: `await` returns to the executor until
+// what the task waits for has happened. Interrupt handlers hold their
+// interrupt back and raise a signal; the task that owns the peripheral
+// does the work and lets the interrupt through again.
+
+const BUTTON_PIN: u32 = 15
+const DEBOUNCE_MS: u32 = 50
+const NEWLINE: u8 = 0x0A
+
+// Signals, numbered for the whole program.
+const SERIAL: executor.Signal = executor.Signal { id: 0 }
+const BUTTON: executor.Signal = executor.Signal { id: 1 }
+const PRESSES: executor.Signal = executor.Signal { id: 2 }
+
+@interrupt(UART0_IRQ)
+fn serial_interrupt() {
+    cortex_m.disable(chip.UART0_IRQ)
+    SERIAL.raise()
+}
+
+@interrupt(IO_IRQ_BANK0)
+fn gpio_interrupt() {
+    cortex_m.disable(chip.IO_IRQ_BANK0)
+    BUTTON.raise()
+}
+
+async fn blink<L: hal.OutputPin>(led: &mut L, period_ms: u32) {
+    ticker := executor.Ticker.every_ms(period_ms)
+    for {
+        led.set_high()
+        await ticker.tick()
+        led.set_low()
+        await ticker.tick()
+    }
+}
+
+// Counts rising edges on the button pin. Edges during the DEBOUNCE_MS after
+// a press are the contacts bouncing, not new presses.
+async fn count_presses(pin: &mut chip.Pin) {
+    presses := 0u32
+    for {
+        cortex_m.enable(chip.IO_IRQ_BANK0)
+        await BUTTON.wait()
+        if (pin.events() & chip.RISING_EDGE) != 0 {
+            pin.clear_events(chip.RISING_EDGE)
+            presses += 1
+            PRESSES.send(presses)
+            await executor.sleep_ms(DEBOUNCE_MS)
+            pin.clear_events(chip.RISING_EDGE)
+        }
+    }
+}
+
+// Reports presses until the console has input to handle.
+async fn report_presses(port: &mut pl011.Port) {
+    match await executor.select(PRESSES.next_value(), SERIAL.wait()) {
+        executor.Which.First => {
+            // The value itself was taken by the select's first future.
+            fmt.printf(port, "button pressed\n")!
+        }
+        executor.Which.Second => {}
+    }
+}
+
+// Echoes input, answering each line with the uptime.
+async fn console(port: &mut pl011.Port) {
+    buffer := [0u8; 32]
+    for {
+        count := 0usize
+        match port.poll_read(&mut buffer) {
+            ok(progress) => {
+                count = progress.transferred
+            }
+            err(failure) => {
+                // A framing, parity, break, or overrun error: keep the
+                // bytes before it and acknowledge it.
+                count = failure.transferred
+                port.clear_interrupts(pl011.ERROR_INTERRUPTS)
+            }
+        }
+        if count == 0 {
+            // Nothing to read: let the interrupt through and wait for it,
+            // or for a button press to report.
+            cortex_m.enable(chip.UART0_IRQ)
+            await report_presses(port)
+        }
+        for index in 0..count {
+            byte := buffer[index]
+            if byte == NEWLINE {
+                now := await executor.now()
+                fmt.printf(port, "\nup {} ms\n", now / 1000)!
+            } else {
+                port.write(&buffer[index..index + 1])!
+            }
+        }
+    }
+}
+
+fn main() {
+    b := board.take()!
+    port := b.pins.uart(board.UART_TX_PIN, some(board.UART_RX_PIN), 115_200)!
+    port.set_crlf(true)
+    port.listen(pl011.RX_INTERRUPT | pl011.RX_TIMEOUT_INTERRUPT | pl011.ERROR_INTERRUPTS)
+    fmt.printf(&mut port, "{}: type a line, or press the button on GP{}\n", board.NAME, BUTTON_PIN)!
+    pin := b.pins.input(BUTTON_PIN)!
+    pin.listen(chip.RISING_EDGE)
+    // Alarm 0 times the executor's sleeps.
+    clock := b.timer.alarm(0)!
+
+    blinker := blink(&mut b.led, 250)
+    button := count_presses(&mut pin)
+    echo := console(&mut port)
+    tasks: [3]&mut dyn executor.Task = [&mut blinker, &mut button, &mut echo]
+    executor.run(&mut tasks, &mut clock)
+}

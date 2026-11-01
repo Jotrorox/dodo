@@ -1022,6 +1022,8 @@ impl Index {
                 "import",
                 "pub",
                 "unsafe",
+                "async",
+                "await",
                 "asm",
                 "true",
                 "false",

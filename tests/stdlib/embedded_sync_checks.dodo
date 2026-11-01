@@ -1,0 +1,203 @@
+package main
+
+import "std/embedded/executor"
+import "std/embedded/hal/fake"
+import "std/embedded/sync"
+
+// std/embedded/sync on the host: mutexes in plain statics, the guards and
+// helpers that reach their values, nesting, and the cross-core lock hook a
+// multicore chip installs, observed through counting functions.
+
+struct Reading {
+    celsius: i32
+    count: u32
+}
+
+static LATEST: sync.Mutex<Reading> = sync.Mutex.new(Reading { celsius: 0, count: 0 })
+static TOTAL: sync.Mutex<u32> = sync.Mutex.new(0u32)
+static SLOT: sync.Mutex<Option<Token>> = sync.Mutex.new(none)
+
+// Counts drops of tokens.
+static mut DROPPED: u32 = 0
+
+struct Token {
+    id: u32
+
+    fn drop(&mut self) {
+        unsafe {
+            DROPPED += self.id
+        }
+    }
+}
+
+// The fake cross-core lock: counts acquisitions and releases and checks
+// they alternate.
+static mut ACQUIRED: u32 = 0
+static mut RELEASED: u32 = 0
+static mut HELD: bool = false
+
+fn fake_acquire() {
+    unsafe {
+        core.assert(!HELD)
+        HELD = true
+        ACQUIRED += 1
+    }
+}
+
+fn fake_release() {
+    unsafe {
+        core.assert(HELD)
+        HELD = false
+        RELEASED += 1
+    }
+}
+
+fn record(celsius: i32) {
+    guard := LATEST.lock()
+    reading := guard.get_mut()
+    reading.celsius = celsius
+    reading.count += 1
+}
+
+fn guards() {
+    record(21)
+    record(23)
+    guard := LATEST.lock()
+    core.assert_eq(guard.get().celsius, 23i32)
+    core.assert_eq(guard.get().count, 2u32)
+    core.assert(LATEST.is_locked())
+    // This core holds it: try_lock declines instead of trapping.
+    match LATEST.try_lock() {
+        some(_) => core.assert(false),
+        none => {}
+    }
+    core.drop(guard)
+    core.assert(!LATEST.is_locked())
+    match LATEST.try_lock() {
+        some(again) => core.assert_eq(again.get().count, 2u32),
+        none => core.assert(false),
+    }
+}
+
+fn closures() {
+    for step in 1u32..5 {
+        TOTAL.with(fn(total: &mut u32) {
+            *total += step
+        })
+    }
+    doubled := 0u32
+    TOTAL.with(fn(total: &mut u32) {
+        doubled = *total * 2
+    })
+    core.assert_eq(doubled, 20u32)
+    // Mutexes nest: one held while locking another.
+    outer := TOTAL.lock()
+    record(30)
+    core.assert_eq(*outer.get(), 10u32)
+}
+
+fn values() {
+    unsafe {
+        DROPPED = 0
+    }
+    SLOT.set(some(Token { id: 1 }))
+    SLOT.set(some(Token { id: 10 }))
+    unsafe {
+        core.assert_eq(DROPPED, 1u32)
+    }
+    taken := SLOT.replace(none)
+    match &taken {
+        some(token) => core.assert_eq(token.id, 10u32),
+        none => core.assert(false),
+    }
+    core.drop(taken)
+    unsafe {
+        core.assert_eq(DROPPED, 11u32)
+    }
+    guard := SLOT.lock()
+    guard.set(some(Token { id: 100 }))
+    core.drop(guard)
+    SLOT.set(none)
+    unsafe {
+        core.assert_eq(DROPPED, 111u32)
+    }
+}
+
+fn core_lock() {
+    core.assert(!sync.has_core_lock())
+    unsafe {
+        sync.set_core_lock(fake_acquire, fake_release)
+    }
+    core.assert(sync.has_core_lock())
+    record(40)
+    unsafe {
+        core.assert_eq(ACQUIRED, 1u32)
+        core.assert_eq(RELEASED, 1u32)
+    }
+    // Nested sections take the cross-core lock once.
+    {
+        outer := TOTAL.lock()
+        inner := LATEST.lock()
+        section := sync.enter()
+        unsafe {
+            core.assert(HELD)
+            core.assert_eq(ACQUIRED, 2u32)
+        }
+        core.drop(section)
+        core.drop(inner)
+        unsafe {
+            core.assert(HELD)
+        }
+        core.drop(outer)
+    }
+    unsafe {
+        core.assert(!HELD)
+        core.assert_eq(RELEASED, 2u32)
+    }
+    // Abandoning another core leaves this core's section alone.
+    section := sync.enter()
+    unsafe {
+        sync.abandon_core(1)
+        core.assert(HELD)
+    }
+    core.drop(section)
+    unsafe {
+        core.assert(!HELD)
+        core.assert_eq(RELEASED, 3u32)
+    }
+}
+
+// Mutexes and async tasks: a task and the code around it share a counter.
+const TICK: executor.Signal = executor.Signal { id: 5 }
+
+async fn count_ticks(wanted: u32) {
+    seen := 0u32
+    for seen < wanted {
+        seen += await TICK.wait()
+        TOTAL.with(fn(total: &mut u32) {
+            *total += 1
+        })
+    }
+}
+
+fn tasks() {
+    TOTAL.set(0)
+    TICK.reset()
+    clock := fake.Clock.new()
+    clock.interrupt_at(100, &TICK)
+    clock.interrupt_at(200, &TICK)
+    future := count_ticks(2)
+    {
+        tasks: [1]&mut dyn executor.Task = [&mut future]
+        executor.run(&mut tasks, &mut clock)
+    }
+    core.assert_eq(TOTAL.replace(0), 2u32)
+}
+
+fn main() {
+    guards()
+    closures()
+    values()
+    tasks()
+    core_lock()
+}

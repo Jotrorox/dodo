@@ -301,6 +301,18 @@ pub struct Signal {
         core.drop(section)
     }
 
+    // A future that is ready once the signal is raised, or at once if it was
+    // raised since it was last taken: `count := await BUTTON.wait()`.
+    pub fn wait(&self) -> SignalWait {
+        return SignalWait { id: self.id, count: 0 }
+    }
+
+    // A future that is ready with the value of the next `send`:
+    // `value := await READING.next_value()`.
+    pub fn next_value(&self) -> SignalValue {
+        return SignalValue { id: self.id, value: 0 }
+    }
+
     // This signal's place in the tables, in the part of the core running
     // this code.
     fn slot(&self) -> usize {
@@ -356,6 +368,12 @@ pub struct Ticker {
     // Start over: the next tick comes one period after the next call.
     pub fn reset(&mut self) {
         self.started = false
+    }
+
+    // A future that is ready at the next tick, for async code:
+    // `await ticker.tick()`.
+    pub fn tick(&mut self) -> Tick {
+        return Tick { ticker: self }
     }
 }
 
@@ -556,4 +574,227 @@ fn this_core() -> usize {
     here := cpu.core_id()
     core.assert(here < MAX_CORES)
     return here as usize
+}
+
+// Futures. An `async fn` returns a future: a value with the task's `poll`
+// method, so the executor runs it like any other task, and `await` inside
+// another async fn runs it to completion first:
+//
+//     async fn blink<L: hal.OutputPin>(led: &mut L) {
+//         for {
+//             led.toggle()
+//             await executor.sleep_ms(250)
+//         }
+//     }
+//
+//     blinker := blink(&mut b.led)
+//     tasks: [2]&mut dyn executor.Task = [&mut blinker, &mut console]
+//
+// A future's `poll` returns Ready once its work is done; one whose work has
+// a result also has `output`, which `await` calls once after Ready. The
+// futures below are the leaves async code waits on: times, ticks, signals,
+// and other due tasks. Any value with these methods can be awaited, so a
+// hand-written task is a future too.
+
+// Waits until a time: `await executor.sleep_ms(250)`. The time is counted
+// from the first poll, which is when the awaiting code reaches it.
+pub struct Sleep {
+    duration: u64
+    deadline: u64
+    started: bool
+
+    pub fn poll(&mut self, cx: &mut Context) -> Poll {
+        if !self.started {
+            self.started = true
+            self.deadline = later(cx.now_us(), self.duration)
+        }
+        if cx.now_us() >= self.deadline {
+            return Poll.Ready
+        }
+        cx.wake_at(self.deadline)
+        return Poll.Pending
+    }
+}
+
+// Wait `microseconds`.
+pub fn sleep(microseconds: u64) -> Sleep {
+    return Sleep { duration: microseconds, deadline: 0, started: false }
+}
+
+// Wait `milliseconds`.
+pub fn sleep_ms(milliseconds: u32) -> Sleep {
+    return sleep((milliseconds as u64) * 1000)
+}
+
+// Wait until the clock reaches `time_us`; a time already past is ready at
+// once.
+pub fn sleep_until(time_us: u64) -> Sleep {
+    return Sleep { duration: 0, deadline: time_us, started: true }
+}
+
+// Lets the other due tasks run first: `await executor.yield_now()` splits
+// long work into steps.
+pub struct YieldNow {
+    yielded: bool
+
+    pub fn poll(&mut self, cx: &mut Context) -> Poll {
+        if self.yielded {
+            return Poll.Ready
+        }
+        self.yielded = true
+        cx.yield_now()
+        return Poll.Pending
+    }
+}
+
+pub fn yield_now() -> YieldNow {
+    return YieldNow { yielded: false }
+}
+
+// The time, without waiting: `now := await executor.now()` is the clock's
+// microseconds when the current poll started, as `cx.now_us()` is for a
+// hand-written task. Code that ran earlier in the same poll is not counted
+// in it; `await executor.yield_now()` first starts a new poll.
+pub struct Now {
+    time: u64
+
+    pub fn poll(&mut self, cx: &mut Context) -> Poll {
+        self.time = cx.now_us()
+        return Poll.Ready
+    }
+
+    pub fn output(&mut self) -> u64 {
+        return self.time
+    }
+}
+
+pub fn now() -> Now {
+    return Now { time: 0 }
+}
+
+// The next tick of a Ticker: `await ticker.tick()`. Ticks keep the ticker's
+// schedule however long the code between them takes.
+pub struct Tick {
+    ticker: &mut Ticker
+
+    pub fn poll(&mut self, cx: &mut Context) -> Poll {
+        if self.ticker.ready(cx) {
+            return Poll.Ready
+        }
+        return Poll.Pending
+    }
+}
+
+// The next raise of a signal: `count := await BUTTON.wait()`. A raise since
+// the signal was last taken counts, so code that waits in a loop never
+// misses one. The output is the number of raises taken.
+pub struct SignalWait {
+    id: u32
+    count: u32
+
+    pub fn poll(&mut self, cx: &mut Context) -> Poll {
+        signal := Signal { id: self.id }
+        count := signal.take_count(cx)
+        if count == 0 {
+            return Poll.Pending
+        }
+        self.count = count
+        return Poll.Ready
+    }
+
+    pub fn output(&mut self) -> u32 {
+        return self.count
+    }
+}
+
+// The value sent with the next raise of a signal: `value := await RX.next_value()`.
+pub struct SignalValue {
+    id: u32
+    value: u32
+
+    pub fn poll(&mut self, cx: &mut Context) -> Poll {
+        signal := Signal { id: self.id }
+        match signal.receive(cx) {
+            some(value) => {
+                self.value = value
+                return Poll.Ready
+            }
+            none => {
+                return Poll.Pending
+            }
+        }
+    }
+
+    pub fn output(&mut self) -> u32 {
+        return self.value
+    }
+}
+
+// Which of two futures of a `select` finished first.
+pub enum Which {
+    First,
+    Second
+}
+
+// Waits for whichever of two futures is ready first, and drops the other:
+//
+//     match await executor.select(BUTTON.wait(), executor.sleep_ms(500)) {
+//         executor.Which.First => pressed(),
+//         executor.Which.Second => timed_out(),
+//     }
+//
+// The first is polled first, so when both are ready it wins.
+pub struct Select<A: Task, B: Task> {
+    first: A
+    second: B
+    winner: u32
+
+    pub fn poll(&mut self, cx: &mut Context) -> Poll {
+        if self.first.poll(cx) == Poll.Ready {
+            self.winner = 1
+            return Poll.Ready
+        }
+        if self.second.poll(cx) == Poll.Ready {
+            self.winner = 2
+            return Poll.Ready
+        }
+        return Poll.Pending
+    }
+
+    pub fn output(&mut self) -> Which {
+        core.assert(self.winner != 0)
+        if self.winner == 1 {
+            return Which.First
+        }
+        return Which.Second
+    }
+}
+
+pub fn select<A: Task, B: Task>(first: A, second: B) -> Select<A, B> from(first, second) {
+    return Select<A, B> { first, second, winner: 0 }
+}
+
+// Runs two futures together until both are done: `await executor.join(a, b)`.
+// Their outputs are dropped; let them store results through references.
+pub struct Join<A: Task, B: Task> {
+    first: A
+    second: B
+    done: u32
+
+    pub fn poll(&mut self, cx: &mut Context) -> Poll {
+        if (self.done & 1) == 0 && self.first.poll(cx) == Poll.Ready {
+            self.done |= 1
+        }
+        if (self.done & 2) == 0 && self.second.poll(cx) == Poll.Ready {
+            self.done |= 2
+        }
+        if self.done == 3 {
+            return Poll.Ready
+        }
+        return Poll.Pending
+    }
+}
+
+pub fn join<A: Task, B: Task>(first: A, second: B) -> Join<A, B> from(first, second) {
+    return Join<A, B> { first, second, done: 0 }
 }

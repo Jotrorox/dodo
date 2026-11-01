@@ -30,6 +30,9 @@
 ;   SIO_IRQ_FIFO   Calls dodo_fifo_interrupt if the program defines it:
 ;                  std/embedded/chip/rp_multicore does, to wake a task when
 ;                  the other core writes to the FIFO between the cores.
+;   SIO_IRQ_BELL   Calls dodo_doorbell_interrupt if the program defines it:
+;                  std/embedded/chip/rp_multicore does, to wake a task when
+;                  the other core rings one of the doorbells.
 ;   dodo_core_id   The executing core's number, 0 or 1, from SIO CPUID; the
 ;                  compiler calls it for `cpu.core_id()`.
 ;   dodo_core1_trampoline
@@ -189,6 +192,20 @@ module asm "    ldr r0, =DefaultHandler"
 module asm "1:  bx r0"
 module asm "    .ltorg"
 
+; SIO_IRQ_BELL, each core's doorbell interrupt, likewise tail-calls the
+; weak dodo_doorbell_interrupt.
+module asm ".section .text.BellHandler, \22ax\22, %progbits"
+module asm ".weak dodo_doorbell_interrupt"
+module asm ".type BellHandler, %function"
+module asm ".thumb_func"
+module asm "BellHandler:"
+module asm "    ldr r0, =dodo_doorbell_interrupt"
+module asm "    cmp r0, #0"
+module asm "    bne 1f"
+module asm "    ldr r0, =DefaultHandler"
+module asm "1:  bx r0"
+module asm "    .ltorg"
+
 module asm ".section .text.dodo_core_id, \22ax\22, %progbits"
 module asm ".global dodo_core_id"
 module asm ".type dodo_core_id, %function"
@@ -325,7 +342,7 @@ module asm ".thumb_set IO_IRQ_BANK0_NS, DefaultHandler"
 module asm ".thumb_set IO_IRQ_QSPI, DefaultHandler"
 module asm ".thumb_set IO_IRQ_QSPI_NS, DefaultHandler"
 module asm ".thumb_set SIO_IRQ_FIFO, FifoHandler"
-module asm ".thumb_set SIO_IRQ_BELL, DefaultHandler"
+module asm ".thumb_set SIO_IRQ_BELL, BellHandler"
 module asm ".thumb_set SIO_IRQ_FIFO_NS, DefaultHandler"
 module asm ".thumb_set SIO_IRQ_BELL_NS, DefaultHandler"
 module asm ".thumb_set SIO_IRQ_MTIMECMP, DefaultHandler"
