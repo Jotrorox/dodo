@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Fixed: `Fifo.set_signal` and the FIFO interrupt hook of
+  `std/embedded/chip/rp_multicore` wrote 0 to `FIFO_ST` to clear its sticky
+  WOF and ROE flags, which only a 1 clears. A flag left set, such as the ROE
+  that core 1's boot ROM leaves while it waits to be launched, kept the FIFO
+  interrupt raised, so an executor waiting for FIFO words could spin instead
+  of sleeping.
+- CI runs firmware on emulated RP2040 and RP2350 chips: a self-test of the
+  startup runtime, the integer and floating-point helpers, interrupts,
+  SysTick, timer alarms, the executor, DMA, PIO, a UART, and the second core
+  with its FIFOs and spinlocks, at -O0 and -O2. `scripts/test_emulator.py`
+  builds `tests/emulator` and runs it in `emulator/`, a runner around the
+  picoem emulator crates with fixes in `emulator/patches`; it takes seconds.
 - `std/gpu/metal` binds Apple's Metal API on macOS (Apple silicon and Intel)
   entirely in Dodo, with no C runtime: each method is an `objc_msgSend`
   declared with its own signature. It covers devices, command queues,

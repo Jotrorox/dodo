@@ -1,7 +1,8 @@
 //! Firmware platforms: board and chip settings, `std/embedded/board` and `std/embedded/chip`
 //! resolution, the embedded chip runtimes, and (when ld.lld is installed)
 //! linking flashable images. Running on a real board is scripts/test_pico.py
-//! (`--board pico`, `--board pico2`, or `--board pico2_w`).
+//! (`--board pico`, `--board pico2`, or `--board pico2_w`); running on
+//! emulated chips is scripts/test_emulator.py.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
