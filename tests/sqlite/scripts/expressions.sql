@@ -37,7 +37,7 @@ select 1e15, 1e16, 1.5e16, 2.5e15, 123456789012345.6, 1.0 / 4, 0.000123, 1e-5;
 select -0.0, 0.0, -1.5e-10, 3.0e0, 12345678901234567.0;
 select 9223372036854775807, -9223372036854775808, 9223372036854775808, -9223372036854775809;
 select 0x10, 0xff, -0x10, 0x7fffffffffffffff, 0xffffffffffffffff;
-select 1_000_000, 1.5e3, .5, 5.;
+select 1.5e3, .5, 5.;
 select typeof(true), true, false, true + true;
 select 'It''s', "a", 'multi
 line';

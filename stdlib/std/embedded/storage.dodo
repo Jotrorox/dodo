@@ -1,0 +1,1203 @@
+package storage
+
+import "core/mem"
+import "std/embedded/hal"
+
+// Persistent storage on any device with the std/embedded/hal Flash
+// protocol: a region of a board's program flash (`b.flash.last(length)`),
+// an external SPI flash chip, or `std/embedded/hal/fake`'s flash in a
+// desktop test.
+//
+//   Store    a key-value store: short string keys and byte values that
+//            survive restarts and power cuts
+//   Region   a window of any flash device, itself a Flash, so a store can
+//            take part of a device and leave the rest to other uses
+//
+// On a board, a store keeps the free flash above the program, for example
+// its last 64 KiB:
+//
+//     b := board.take()!
+//     settings := storage.Store.open(b.flash.last(64 * 1024)!)!
+//     boots := 0u32
+//     match settings.get_u32("boots") {
+//         ok(some(count)) => {
+//             boots = count
+//         }
+//         ok(none) => {}
+//         err(error) => {
+//             return
+//         }
+//     }
+//     settings.set_u32("boots", boots + 1)!
+//
+// Rebuilding and flashing a program keeps the store, as long as the program
+// stays below it; boards hand out regions only above the program, so a
+// store never overwrites it.
+//
+// The store is a log. Each `set` or `remove` appends a record holding the
+// key and the new value, or a deletion, to the newest erase block in use,
+// and the latest record of a key wins. When the newest block is full, the
+// store moves on to the next one and compacts the oldest block in use: it
+// copies the records still current there to the new block and erases it.
+// One block is always kept erased for that, so a store needs at least two
+// blocks and holds at most one block less than its size, minus record
+// overheads. Erases are spread evenly over the blocks, and a `set` of an
+// unchanged value writes nothing.
+//
+// Every record carries a CRC-32, every write is checked by reading it back,
+// and writes go only to erased bytes, so the store also runs on flash that
+// cannot rewrite a byte. A power cut at any moment loses at most the `set`
+// or `remove` in progress: `open` finds the last complete record, finishes
+// or undoes an interrupted compaction, and never returns a partial value.
+//
+// Lookups scan the blocks in use, so they take time in proportion to the
+// size of the store; it suits settings, calibration data, counters, and
+// credentials of up to a few hundred kilobytes, not large or fast-changing
+// data. Compaction holds the flash busy for one erase and the copies.
+
+// The longest key, in bytes.
+pub const MAX_KEY_BYTES: usize = 64
+// The most erase blocks a store may span.
+pub const MAX_BLOCKS: u32 = 64
+
+// What can go wrong with a store.
+pub enum Error {
+    // The flash device reported an error.
+    Flash,
+    // The flash device cannot be used now, as on an RP2040 or RP2350 while
+    // core 1 runs.
+    Busy,
+    // There is no room for the record, even after compacting.
+    Full,
+    // The key is longer than MAX_KEY_BYTES, or the value is longer than
+    // `max_value_len` allows.
+    TooLarge,
+    // The key is empty, or the flash has a size or layout the store cannot
+    // use.
+    InvalidInput,
+    // The buffer is too short for the value or key.
+    BufferTooSmall
+}
+
+pub fn error_name(error: Error) -> &str from(static) {
+    match error {
+        Error.Flash => {
+            return "Flash"
+        }
+        Error.Busy => {
+            return "Busy"
+        }
+        Error.Full => {
+            return "Full"
+        }
+        Error.TooLarge => {
+            return "TooLarge"
+        }
+        Error.InvalidInput => {
+            return "InvalidInput"
+        }
+        Error.BufferTooSmall => {
+            return "BufferTooSmall"
+        }
+    }
+}
+
+fn device(error: hal.Error) -> Error {
+    match error {
+        hal.Error.Busy => {
+            return Error.Busy
+        }
+        hal.Error.InvalidInput => {
+            return Error.InvalidInput
+        }
+        _ => {
+            return Error.Flash
+        }
+    }
+}
+
+// `length` bytes of a flash device from `start`, as a flash device of its
+// own whose offsets count from `start`. It owns the device, so nothing else
+// writes there; `release` gives it back.
+pub struct Region<F: hal.Flash>: hal.Flash {
+    flash: F
+    start: u32
+    length: u32
+
+    // The region of `flash` from `start`. InvalidInput unless both are
+    // multiples of the device's erase size and the region lies inside it.
+    pub fn new(flash: F, start: u32, length: u32) -> Region<F>!hal.Error from(flash) {
+        block := flash.erase_size()
+        end := start as u64 + length as u64
+        if block == 0 || start % block != 0 || length % block != 0 || end > flash.capacity() as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(Region<F> { flash, start, length })
+    }
+
+    // The last `length` bytes of `flash`: InvalidInput unless `length` is a
+    // multiple of the erase size and at most the device's capacity.
+    pub fn last(flash: F, length: u32) -> Region<F>!hal.Error from(flash) {
+        capacity := flash.capacity()
+        if length > capacity {
+            return err(hal.Error.InvalidInput)
+        }
+        return Region.new(flash, capacity - length, length)
+    }
+
+    // Where the region starts on the device.
+    pub fn start(&self) -> u32 {
+        return self.start
+    }
+
+    pub fn capacity(&self) -> u32 {
+        return self.length
+    }
+
+    pub fn erase_size(&self) -> u32 {
+        return self.flash.erase_size()
+    }
+
+    pub fn write_size(&self) -> u32 {
+        return self.flash.write_size()
+    }
+
+    pub fn read(&mut self, offset: u32, buffer: &mut[u8]) -> void!hal.Error {
+        at := self.place(offset, buffer.len)?
+        return self.flash.read(at, buffer)
+    }
+
+    pub fn erase(&mut self, offset: u32, length: u32) -> void!hal.Error {
+        at := self.place(offset, length as usize)?
+        return self.flash.erase(at, length)
+    }
+
+    pub fn write(&mut self, offset: u32, bytes: &[u8]) -> void!hal.Error {
+        at := self.place(offset, bytes.len)?
+        return self.flash.write(at, bytes)
+    }
+
+    // Give back the device.
+    pub fn release(self) -> F from(self) {
+        let Region { flash, start: _, length: _ } = self
+        return flash
+    }
+
+    // The device offset of `offset`, after checking that `length` bytes from
+    // it lie inside the region.
+    fn place(&self, offset: u32, length: usize) -> u32!hal.Error {
+        if offset as u64 + length as u64 > self.length as u64 {
+            return err(hal.Error.InvalidInput)
+        }
+        return ok(self.start + offset)
+    }
+}
+
+// Block header: magic, sequence number, and the CRC-32 of both, little
+// endian. The newest block has the highest sequence number.
+const MAGIC: u32 = 0x3153_4B44
+const HEADER_BYTES: u32 = 12
+// Record header: value length (u16), key length (u8), kind (u8), and the
+// CRC-32 of those four bytes, the key, and the value; the key and value
+// follow, then 0xFF up to a multiple of the write size.
+const RECORD_HEADER: u32 = 8
+const VALUE: u8 = 0x56
+const DELETED: u8 = 0x44
+// Written to a block once compaction into it has copied everything, before
+// the compacted block is erased. It has no key.
+const COMPACTED: u8 = 0x43
+// What parse found.
+const FOUND: u8 = 0
+const END: u8 = 1
+const BAD: u8 = 2
+// Bytes moved through the stack at once; a multiple of every write size.
+const CHUNK: usize = 256
+
+// A record in a block, from parse.
+struct Record {
+    state: u8
+    block: u32
+    offset: u32
+    kind: u8
+    key_len: u32
+    value_len: u32
+    // Bytes the record takes, padding included.
+    size: u32
+}
+
+fn nothing() -> Record {
+    return Record { state: END, block: 0, offset: 0, kind: 0, key_len: 0, value_len: 0, size: 0 }
+}
+
+// A position in a store's keys, for Store.next_key.
+pub struct Cursor {
+    step: u32
+    offset: u32
+
+    // The position before the first key.
+    pub fn new() -> Cursor {
+        return Cursor { step: 0, offset: 0 }
+    }
+}
+
+// A key-value store on a flash device or region; see the package comment.
+// Keys are 1 to MAX_KEY_BYTES bytes of text, values any bytes up to
+// `max_value_len`.
+pub struct Store<F: hal.Flash> {
+    flash: F
+    block: u32
+    blocks: u32
+    align: u32
+    // Where records start in a block: the header, padded.
+    first: u32
+    // Per block: 0 while it is not in use, else where its records end.
+    ends: [64]u32
+    // The newest block in use, its sequence number, whether it takes no
+    // more records, and whether it holds a compaction's closing record;
+    // only meaningful while active.
+    head: u32
+    sequence: u32
+    closed: bool
+    marked: bool
+    active: bool
+    // Set when a write or erase failed, which may have changed the flash
+    // in ways this state does not reflect: the next operation reads the
+    // store again first.
+    stale: bool
+
+    // Open the store on `flash`, which must span 2 to MAX_BLOCKS erase
+    // blocks of at least 256 bytes each: a new store on erased or foreign
+    // contents, which it erases as it needs the space, or the store left
+    // there before. Finishes or undoes a compaction a power cut interrupted,
+    // which may write. InvalidInput if the flash's layout is unusable.
+    pub fn open(flash: F) -> Store<F>!Error from(flash) {
+        block := flash.erase_size()
+        align := flash.write_size()
+        capacity := flash.capacity()
+        if !power_of_two(block) || !power_of_two(align) || align > CHUNK as u32 || block < CHUNK as u32 {
+            return err(Error.InvalidInput)
+        }
+        blocks := capacity / block
+        if capacity % block != 0 || blocks < 2 || blocks > MAX_BLOCKS {
+            return err(Error.InvalidInput)
+        }
+        store := Store<F> {
+            flash,
+            block,
+            blocks,
+            align,
+            first: round_up(HEADER_BYTES, align),
+            ends: [0u32; 64],
+            head: 0,
+            sequence: 0,
+            closed: false,
+            marked: false,
+            active: false,
+            stale: false,
+        }
+        store.mount()?
+        return ok(store)
+    }
+
+    // The longest value a key of `key_len` bytes may have: what fits in an
+    // erase block beside the block and record headers and the room kept for
+    // compaction.
+    pub fn max_value_len(&self, key_len: usize) -> usize {
+        room := (self.block - self.first - round_up(RECORD_HEADER, self.align)) as usize
+        used := RECORD_HEADER as usize + key_len
+        longest := 0usize
+        if room > used {
+            longest = room - used
+        }
+        if longest > 0xFFFE {
+            longest = 0xFFFE
+        }
+        return longest
+    }
+
+    // Copy the value of `key` into the start of `buffer` and return its
+    // length, or none if the store has no such key. BufferTooSmall if the
+    // value is longer than the buffer.
+    pub fn get(&mut self, key: &str, buffer: &mut[u8]) -> Option<usize>!Error {
+        name := mem.str_bytes(key)
+        check_key(name)?
+        self.refresh()?
+        record := self.locate(name)?
+        if record.state != FOUND || record.kind != VALUE {
+            return ok(none)
+        }
+        length := record.value_len as usize
+        if buffer.len < length {
+            return err(Error.BufferTooSmall)
+        }
+        at := self.address(record.block, record.offset + RECORD_HEADER + record.key_len)
+        self.read(at, &mut buffer[..length])?
+        return ok(some(length))
+    }
+
+    // The length of the value of `key`, or none if the store has no such
+    // key.
+    pub fn len_of(&mut self, key: &str) -> Option<usize>!Error {
+        name := mem.str_bytes(key)
+        check_key(name)?
+        self.refresh()?
+        record := self.locate(name)?
+        if record.state != FOUND || record.kind != VALUE {
+            return ok(none)
+        }
+        return ok(some(record.value_len as usize))
+    }
+
+    pub fn contains(&mut self, key: &str) -> bool!Error {
+        name := mem.str_bytes(key)
+        check_key(name)?
+        self.refresh()?
+        record := self.locate(name)?
+        return ok(record.state == FOUND && record.kind == VALUE)
+    }
+
+    // Store `value` under `key`, replacing any value it had. Writes nothing
+    // if the key already has this value. TooLarge if the key or value is too
+    // long, Full if the store has no room for it.
+    pub fn set(&mut self, key: &str, value: &[u8]) -> void!Error {
+        name := mem.str_bytes(key)
+        check_key(name)?
+        self.refresh()?
+        if value.len > self.max_value_len(name.len) {
+            return err(Error.TooLarge)
+        }
+        current := self.locate(name)?
+        if current.state == FOUND && current.kind == VALUE && current.value_len as usize == value.len {
+            at := self.address(current.block, current.offset + RECORD_HEADER + current.key_len)
+            if self.matches(at, value)? {
+                return ok()
+            }
+        }
+        return self.append(VALUE, name, value, false)
+    }
+
+    // Remove `key` and its value; false if the store had no such key.
+    pub fn remove(&mut self, key: &str) -> bool!Error {
+        name := mem.str_bytes(key)
+        check_key(name)?
+        self.refresh()?
+        current := self.locate(name)?
+        if current.state != FOUND || current.kind != VALUE {
+            return ok(false)
+        }
+        self.append(DELETED, name, &name[..0], true)?
+        return ok(true)
+    }
+
+    // A u32 value, stored as 4 little-endian bytes. InvalidInput if the
+    // key's value is not 4 bytes long.
+    pub fn get_u32(&mut self, key: &str) -> Option<u32>!Error {
+        bytes: [4]u8 = [0, 0, 0, 0]
+        match self.len_of(key)? {
+            some(length) => {
+                if length != 4 {
+                    return err(Error.InvalidInput)
+                }
+            }
+            none => {
+                return ok(none)
+            }
+        }
+        self.get(key, &mut bytes)?
+        return ok(some(get_u32_le(&bytes, 0)))
+    }
+
+    pub fn set_u32(&mut self, key: &str, value: u32) -> void!Error {
+        bytes: [4]u8 = [0, 0, 0, 0]
+        put_u32_le(&mut bytes, 0, value)
+        return self.set(key, &bytes)
+    }
+
+    // The next key after `cursor`, copied into the start of `key`, and
+    // advance the cursor; none after the last key. Keys come in no
+    // particular order, each once. Changing the store while going through
+    // its keys may skip or repeat some. BufferTooSmall if `key` is shorter
+    // than the key (MAX_KEY_BYTES always suffices).
+    pub fn next_key(&mut self, cursor: &mut Cursor, key: &mut[u8]) -> Option<usize>!Error {
+        self.refresh()?
+        if !self.active {
+            return ok(none)
+        }
+        oldest := self.oldest()
+        name: [64]u8 = [0u8; 64]
+        for cursor.step < self.blocks {
+            block := (oldest + cursor.step) % self.blocks
+            if self.ends[block as usize] == 0 {
+                cursor.step += 1
+                cursor.offset = 0
+                continue
+            }
+            if cursor.offset == 0 {
+                cursor.offset = self.first
+            }
+            block_end := self.ends[block as usize]
+            record := self.parse(block, cursor.offset, block_end, false)?
+            if record.state != FOUND {
+                cursor.step += 1
+                cursor.offset = 0
+                continue
+            }
+            cursor.offset += record.size
+            if record.kind != VALUE {
+                continue
+            }
+            length := record.key_len as usize
+            key_at := self.address(block, record.offset + RECORD_HEADER)
+            self.read(key_at, &mut name[..length])?
+            latest := self.locate(&name[..length])?
+            if latest.block != block || latest.offset != record.offset {
+                continue
+            }
+            if key.len < length {
+                return err(Error.BufferTooSmall)
+            }
+            for index in 0..length {
+                key[index] = name[index]
+            }
+            return ok(some(length))
+        }
+        return ok(none)
+    }
+
+    // Remove every key, erasing all of the store's flash.
+    pub fn clear(&mut self) -> void!Error {
+        self.active = false
+        self.stale = true
+        for block in 0..self.blocks {
+            self.ends[block as usize] = 0
+            self.erase_block(block)?
+        }
+        self.stale = false
+        return ok()
+    }
+
+    // The flash, for its own queries, such as a fake's counters. Erasing or
+    // writing the store's part of it corrupts the store.
+    pub fn flash(&mut self) -> &mut F from(self) {
+        return &mut self.flash
+    }
+
+    // Give back the flash. The store stays there for the next open.
+    pub fn release(self) -> F from(self) {
+        let Store { flash,.. } = self
+        return flash
+    }
+
+    // Find the blocks in use and where their records end, then repair what
+    // a power cut may have left.
+    fn mount(&mut self) -> void!Error {
+        self.active = false
+        self.closed = false
+        self.marked = false
+        for block in 0..self.blocks {
+            match self.header(block)? {
+                some(sequence) => {
+                    if !self.active || sequence > self.sequence {
+                        self.head = block
+                        self.sequence = sequence
+                        self.active = true
+                    }
+                    self.ends[block as usize] = self.first
+                }
+                none => {
+                    self.ends[block as usize] = 0
+                }
+            }
+        }
+        if !self.active {
+            return ok()
+        }
+        for block in 0..self.blocks {
+            if self.ends[block as usize] != 0 {
+                self.scan(block)?
+            }
+        }
+        head := self.head
+        marked := self.has_compacted(head)?
+        self.marked = marked
+        return self.settle()
+    }
+
+    // Find where the records of `block` end, checking each CRC. A record
+    // that is not intact ends the block; if that is the newest, it takes no
+    // more records.
+    fn scan(&mut self, block: u32) -> void!Error {
+        offset := self.first
+        for {
+            limit := self.block
+            record := self.parse(block, offset, limit, true)?
+            if record.state == FOUND {
+                offset += record.size
+                continue
+            }
+            if record.state == BAD && block == self.head {
+                self.closed = true
+            }
+            break
+        }
+        self.ends[block as usize] = offset
+        return ok()
+    }
+
+    // Keep the block after the newest one erased. While it is in use, a
+    // compaction from it into the newest block was interrupted: if the
+    // newest block records that the copies were complete, only the erase is
+    // left; otherwise the copies are dropped and the newest block before
+    // them is the head again, closed so that the next write compacts anew.
+    fn settle(&mut self) -> void!Error {
+        if !self.active {
+            return ok()
+        }
+        victim := (self.head + 1) % self.blocks
+        if self.ends[victim as usize] == 0 {
+            return ok()
+        }
+        head := self.head
+        if self.has_compacted(head)? {
+            self.ends[victim as usize] = 0
+            return self.erase_block(victim)
+        }
+        dropped := self.head
+        self.ends[dropped as usize] = 0
+        self.erase_block(dropped)?
+        self.active = false
+        for block in 0..self.blocks {
+            if self.ends[block as usize] != 0 {
+                match self.header(block)? {
+                    some(sequence) => {
+                        if !self.active || sequence > self.sequence {
+                            self.head = block
+                            self.sequence = sequence
+                            self.active = true
+                        }
+                    }
+                    none => {}
+                }
+            }
+        }
+        self.closed = true
+        head = self.head
+        marked := self.has_compacted(head)?
+        self.marked = marked
+        return ok()
+    }
+
+    // Append a record of `kind` for `key` with `value`, moving on to new
+    // blocks as needed. Records other than compaction's leave room for its
+    // closing record in a block without one, so a block always compacts
+    // into a fresh one. With `removing`, the record deletes `key`, and compaction
+    // may drop the key's records instead: that leaves no older value
+    // behind, as the compacted block is the oldest.
+    fn append(&mut self, kind: u8, key: &[u8], value: &[u8], removing: bool) -> void!Error {
+        self.stale = true
+        self.extend(kind, key, value, removing)?
+        self.stale = false
+        return ok()
+    }
+
+    // Read the store again if a failed write left this state unreliable.
+    fn refresh(&mut self) -> void!Error {
+        if self.stale {
+            self.mount()?
+            self.stale = false
+        }
+        return ok()
+    }
+
+    fn extend(&mut self, kind: u8, key: &[u8], value: &[u8], removing: bool) -> void!Error {
+        self.settle()?
+        size := round_up(RECORD_HEADER + key.len as u32 + value.len as u32, self.align)
+        reserve := round_up(RECORD_HEADER, self.align)
+        attempts := 0u32
+        for {
+            if !self.active {
+                self.open_block(0, 0)?
+            }
+            head := self.head
+            room := self.block
+            if !self.marked {
+                room -= reserve
+            }
+            if !self.closed && self.ends[head as usize] + size <= room {
+                if self.put(kind, key, value, size)? {
+                    return ok()
+                }
+                self.closed = true
+            }
+            if attempts == 0 && !self.can_make_room(size, key, removing)? {
+                return err(Error.Full)
+            }
+            attempts += 1
+            if attempts > self.blocks {
+                return err(Error.Full)
+            }
+            self.advance(key, removing)?
+            if removing {
+                current := self.locate(key)?
+                if current.state != FOUND || current.kind != VALUE {
+                    return ok()
+                }
+            }
+        }
+    }
+
+    // Whether moving on to new blocks reaches one with room for a record of
+    // `size` bytes: a fresh block, or one that compacting a block in use,
+    // oldest first, leaves room in, or with `removing`, the compaction of
+    // the block that holds `key`'s value.
+    fn can_make_room(&mut self, size: u32, key: &[u8], removing: bool) -> bool!Error {
+        // With two blocks free, the next is a fresh one with nothing to
+        // compact, and every record fits in one.
+        used := 0u32
+        for index in 0..self.blocks {
+            if self.ends[index as usize] != 0 {
+                used += 1
+            }
+        }
+        if used + 2 <= self.blocks {
+            return ok(true)
+        }
+        reserve := round_up(RECORD_HEADER, self.align)
+        block := self.oldest()
+        for {
+            end := self.ends[block as usize]
+            kept := 0u32
+            holds := false
+            offset := self.first
+            for offset < end {
+                record := self.parse(block, offset, end, false)?
+                if record.state != FOUND {
+                    break
+                }
+                record_size := record.size
+                if removing && self.has_key(&record, key)? {
+                    holds = holds || (record.kind == VALUE && self.is_latest(&record)?)
+                } else if self.survives(&record, key, false)? {
+                    kept += record_size
+                }
+                offset += record_size
+            }
+            if holds || self.first + kept + reserve + size <= self.block {
+                return ok(true)
+            }
+            if block == self.head {
+                return ok(false)
+            }
+            block = (block + 1) % self.blocks
+        }
+    }
+
+    // Start the next block and compact the one after it into it.
+    fn advance(&mut self, key: &[u8], removing: bool) -> void!Error {
+        next := (self.head + 1) % self.blocks
+        if self.ends[next as usize] != 0 {
+            return err(Error.Full)
+        }
+        sequence := self.sequence + 1
+        self.open_block(next, sequence)?
+        return self.compact(key, removing)
+    }
+
+    // Copy the current records of the block after the head into the head,
+    // dropping `key`'s with `removing`, mark the head compacted, and erase
+    // that block.
+    fn compact(&mut self, key: &[u8], removing: bool) -> void!Error {
+        victim := (self.head + 1) % self.blocks
+        end := self.ends[victim as usize]
+        if end == 0 {
+            return ok()
+        }
+        offset := self.first
+        for offset < end {
+            record := self.parse(victim, offset, end, false)?
+            if record.state != FOUND {
+                break
+            }
+            size := record.size
+            if self.survives(&record, key, removing)? {
+                self.copy(&record)?
+            }
+            offset += size
+        }
+        name: [1]u8 = [0]
+        marker := round_up(RECORD_HEADER, self.align)
+        if !self.put(COMPACTED, &name[..0], &name[..0], marker)? {
+            self.closed = true
+            return err(Error.Flash)
+        }
+        self.marked = true
+        self.ends[victim as usize] = 0
+        return self.erase_block(victim)
+    }
+
+    // Whether compacting `record`'s block must keep it: a value that is
+    // its key's latest, or the latest deletion of a key whose older value
+    // is in the same block, since erasing that block could fail halfway and
+    // leave the value without the deletion. With `removing`, `key`'s
+    // records are dropped.
+    fn survives(&mut self, record: &Record, key: &[u8], removing: bool) -> bool!Error {
+        if record.kind != VALUE && record.kind != DELETED {
+            return ok(false)
+        }
+        if removing && self.has_key(record, key)? {
+            return ok(false)
+        }
+        if !self.is_latest(record)? {
+            return ok(false)
+        }
+        if record.kind == VALUE {
+            return ok(true)
+        }
+        name: [64]u8 = [0u8; 64]
+        length := record.key_len as usize
+        key_at := self.address(record.block, record.offset + RECORD_HEADER)
+        self.read(key_at, &mut name[..length])?
+        offset := self.first
+        for offset < record.offset {
+            earlier := self.parse(record.block, offset, record.offset, false)?
+            if earlier.state != FOUND {
+                break
+            }
+            size := earlier.size
+            if earlier.kind == VALUE && self.has_key(&earlier, &name[..length])? {
+                return ok(true)
+            }
+            offset += size
+        }
+        return ok(false)
+    }
+
+    // Whether no later record has `record`'s key: none after it in its
+    // block, nor in the newer blocks up to the head.
+    fn is_latest(&mut self, record: &Record) -> bool!Error {
+        name: [64]u8 = [0u8; 64]
+        length := record.key_len as usize
+        key_at := self.address(record.block, record.offset + RECORD_HEADER)
+        self.read(key_at, &mut name[..length])?
+        block := record.block
+        offset := record.offset + record.size
+        for {
+            end := self.ends[block as usize]
+            for offset < end {
+                later := self.parse(block, offset, end, false)?
+                if later.state != FOUND {
+                    break
+                }
+                size := later.size
+                if self.has_key(&later, &name[..length])? {
+                    return ok(false)
+                }
+                offset += size
+            }
+            if block == self.head {
+                return ok(true)
+            }
+            block = (block + 1) % self.blocks
+            offset = self.first
+        }
+    }
+
+    // Copy `record` unchanged to the end of the head.
+    fn copy(&mut self, record: &Record) -> void!Error {
+        head := self.head
+        at := self.ends[head as usize]
+        if self.closed || at + record.size > self.block {
+            return err(Error.Full)
+        }
+        target := self.address(head, at)
+        if !self.blank(target, record.size)? {
+            self.closed = true
+            return err(Error.Flash)
+        }
+        source := self.address(record.block, record.offset)
+        buffer: [256]u8 = [0u8; 256]
+        done := 0u32
+        for done < record.size {
+            count := record.size - done
+            if count > CHUNK as u32 {
+                count = CHUNK as u32
+            }
+            self.read(source + done, &mut buffer[..count as usize])?
+            self.write(target + done, &buffer[..count as usize])?
+            done += count
+        }
+        limit := self.block
+        check := self.parse(head, at, limit, true)?
+        if check.state != FOUND || check.size != record.size {
+            self.closed = true
+            return err(Error.Flash)
+        }
+        self.ends[head as usize] = at + record.size
+        return ok()
+    }
+
+    // Write a record of `size` bytes at the end of the head and check it;
+    // false, writing nothing or leaving a record that reads as damaged, if
+    // the space was not erased or the record does not read back intact.
+    fn put(&mut self, kind: u8, key: &[u8], value: &[u8], size: u32) -> bool!Error {
+        head := self.head
+        at := self.ends[head as usize]
+        target := self.address(head, at)
+        if !self.blank(target, size)? {
+            return ok(false)
+        }
+        prefix: [4]u8 = [(value.len & 0xFF) as u8, ((value.len >> 8) & 0xFF) as u8, key.len as u8, kind]
+        crc := crc_update(0xFFFF_FFFFu32, &prefix)
+        crc = crc_update(crc, key)
+        crc = crc_update(crc, value)
+        crc = crc ^ 0xFFFF_FFFFu32
+        header: [8]u8 = [prefix[0], prefix[1], prefix[2], prefix[3], 0, 0, 0, 0]
+        put_u32_le(&mut header, 4, crc)
+        key_end := RECORD_HEADER as usize + key.len
+        value_end := key_end + value.len
+        buffer: [256]u8 = [0u8; 256]
+        done := 0usize
+        total := size as usize
+        for done < total {
+            count := total - done
+            if count > CHUNK {
+                count = CHUNK
+            }
+            for index in 0..count {
+                position := done + index
+                byte := hal.FLASH_ERASED
+                if position < RECORD_HEADER as usize {
+                    byte = header[position]
+                } else if position < key_end {
+                    byte = key[position - RECORD_HEADER as usize]
+                } else if position < value_end {
+                    byte = value[position - key_end]
+                }
+                buffer[index] = byte
+            }
+            self.write(target + done as u32, &buffer[..count])?
+            done += count
+        }
+        limit := self.block
+        check := self.parse(head, at, limit, true)?
+        if check.state != FOUND || check.size != size {
+            return ok(false)
+        }
+        self.ends[head as usize] = at + size
+        return ok(true)
+    }
+
+    // Make `block` the head with sequence number `sequence`, erasing it
+    // first unless it already is.
+    fn open_block(&mut self, block: u32, sequence: u32) -> void!Error {
+        base := self.address(block, 0)
+        size := self.block
+        if !self.blank(base, size)? {
+            self.erase_block(block)?
+        }
+        fields: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        put_u32_le(&mut fields, 0, MAGIC)
+        put_u32_le(&mut fields, 4, sequence)
+        crc := crc_update(0xFFFF_FFFFu32, &fields) ^ 0xFFFF_FFFFu32
+        buffer: [256]u8 = [hal.FLASH_ERASED; 256]
+        for index in 0..8usize {
+            buffer[index] = fields[index]
+        }
+        put_u32_le(&mut buffer, 8, crc)
+        first := self.first as usize
+        self.write(base, &buffer[..first])?
+        match self.header(block)? {
+            some(written) => {
+                if written != sequence {
+                    return err(Error.Flash)
+                }
+            }
+            none => {
+                return err(Error.Flash)
+            }
+        }
+        self.head = block
+        self.sequence = sequence
+        self.ends[block as usize] = self.first
+        self.closed = false
+        self.marked = false
+        self.active = true
+        return ok()
+    }
+
+    // The sequence number in `block`'s header, or none if it has no intact
+    // header.
+    fn header(&mut self, block: u32) -> Option<u32>!Error {
+        bytes: [12]u8 = [0u8; 12]
+        base := self.address(block, 0)
+        self.read(base, &mut bytes)?
+        if get_u32_le(&bytes, 0) != MAGIC {
+            return ok(none)
+        }
+        crc := crc_update(0xFFFF_FFFFu32, &bytes[..8]) ^ 0xFFFF_FFFFu32
+        if crc != get_u32_le(&bytes, 8) {
+            return ok(none)
+        }
+        return ok(some(get_u32_le(&bytes, 4)))
+    }
+
+    // Whether the head holds a compaction's closing record.
+    fn has_compacted(&mut self, block: u32) -> bool!Error {
+        end := self.ends[block as usize]
+        offset := self.first
+        for offset < end {
+            record := self.parse(block, offset, end, false)?
+            if record.state != FOUND {
+                break
+            }
+            if record.kind == COMPACTED {
+                return ok(true)
+            }
+            offset += record.size
+        }
+        return ok(false)
+    }
+
+    // The latest record of `key`, in any state, or one with state END.
+    fn locate(&mut self, key: &[u8]) -> Record!Error {
+        found := nothing()
+        if !self.active {
+            return ok(found)
+        }
+        block := self.oldest()
+        for {
+            end := self.ends[block as usize]
+            offset := self.first
+            for offset < end {
+                record := self.parse(block, offset, end, false)?
+                if record.state != FOUND {
+                    break
+                }
+                size := record.size
+                if self.has_key(&record, key)? {
+                    found = record
+                }
+                offset += size
+            }
+            if block == self.head {
+                break
+            }
+            block = (block + 1) % self.blocks
+        }
+        return ok(found)
+    }
+
+    // Whether `record` has the key `key`.
+    fn has_key(&mut self, record: &Record, key: &[u8]) -> bool!Error {
+        if record.key_len as usize != key.len || key.len == 0 {
+            return ok(false)
+        }
+        at := self.address(record.block, record.offset + RECORD_HEADER)
+        return self.matches(at, key)
+    }
+
+    // The oldest block in use: the first after the head, going round.
+    fn oldest(&self) -> u32 {
+        for step in 1..self.blocks + 1 {
+            block := (self.head + step) % self.blocks
+            if self.ends[block as usize] != 0 {
+                return block
+            }
+        }
+        return self.head
+    }
+
+    // The record at `offset` in `block`, which must end by `limit`. With
+    // `verify`, its CRC is checked too.
+    fn parse(&mut self, block: u32, offset: u32, limit: u32, verify: bool) -> Record!Error {
+        result := nothing()
+        if offset + RECORD_HEADER > limit {
+            return ok(result)
+        }
+        header: [8]u8 = [0u8; 8]
+        header_at := self.address(block, offset)
+        self.read(header_at, &mut header)?
+        erased := true
+        for &byte in header {
+            if byte != hal.FLASH_ERASED {
+                erased = false
+            }
+        }
+        if erased {
+            return ok(result)
+        }
+        result.state = BAD
+        value_len := header[0] as u32 | (header[1] as u32 << 8)
+        key_len := header[2] as u32
+        kind := header[3]
+        if kind == COMPACTED {
+            if key_len != 0 || value_len != 0 {
+                return ok(result)
+            }
+        } else if kind == VALUE || kind == DELETED {
+            if key_len == 0 || key_len > MAX_KEY_BYTES as u32 || (kind == DELETED && value_len != 0) {
+                return ok(result)
+            }
+        } else {
+            return ok(result)
+        }
+        size := round_up(RECORD_HEADER + key_len + value_len, self.align)
+        if size > limit - offset {
+            return ok(result)
+        }
+        if verify {
+            crc := crc_update(0xFFFF_FFFFu32, &header[..4])
+            buffer: [256]u8 = [0u8; 256]
+            at := self.address(block, offset + RECORD_HEADER)
+            left := key_len + value_len
+            for left > 0 {
+                count := left
+                if count > CHUNK as u32 {
+                    count = CHUNK as u32
+                }
+                self.read(at, &mut buffer[..count as usize])?
+                crc = crc_update(crc, &buffer[..count as usize])
+                at += count
+                left -= count
+            }
+            if (crc ^ 0xFFFF_FFFFu32) != get_u32_le(&header, 4) {
+                return ok(result)
+            }
+        }
+        result.state = FOUND
+        result.block = block
+        result.offset = offset
+        result.kind = kind
+        result.key_len = key_len
+        result.value_len = value_len
+        result.size = size
+        return ok(result)
+    }
+
+    // Whether the flash from `at` holds `bytes`.
+    fn matches(&mut self, at: u32, bytes: &[u8]) -> bool!Error {
+        buffer: [256]u8 = [0u8; 256]
+        done := 0usize
+        for done < bytes.len {
+            count := bytes.len - done
+            if count > CHUNK {
+                count = CHUNK
+            }
+            self.read(at + done as u32, &mut buffer[..count])?
+            for index in 0..count {
+                if buffer[index] != bytes[done + index] {
+                    return ok(false)
+                }
+            }
+            done += count
+        }
+        return ok(true)
+    }
+
+    // Whether the `length` bytes from `at` are erased.
+    fn blank(&mut self, at: u32, length: u32) -> bool!Error {
+        buffer: [256]u8 = [0u8; 256]
+        done := 0u32
+        for done < length {
+            count := length - done
+            if count > CHUNK as u32 {
+                count = CHUNK as u32
+            }
+            self.read(at + done, &mut buffer[..count as usize])?
+            for index in 0..count as usize {
+                if buffer[index] != hal.FLASH_ERASED {
+                    return ok(false)
+                }
+            }
+            done += count
+        }
+        return ok(true)
+    }
+
+    fn address(&self, block: u32, offset: u32) -> u32 {
+        return block * self.block + offset
+    }
+
+    fn erase_block(&mut self, block: u32) -> void!Error {
+        size := self.block
+        match self.flash.erase(block * size, size) {
+            ok() => {
+                return ok()
+            }
+            err(error) => {
+                return err(device(error))
+            }
+        }
+    }
+
+    fn read(&mut self, at: u32, buffer: &mut[u8]) -> void!Error {
+        match self.flash.read(at, buffer) {
+            ok() => {
+                return ok()
+            }
+            err(error) => {
+                return err(device(error))
+            }
+        }
+    }
+
+    fn write(&mut self, at: u32, bytes: &[u8]) -> void!Error {
+        match self.flash.write(at, bytes) {
+            ok() => {
+                return ok()
+            }
+            err(error) => {
+                return err(device(error))
+            }
+        }
+    }
+}
+
+fn check_key(key: &[u8]) -> void!Error {
+    if key.len == 0 {
+        return err(Error.InvalidInput)
+    }
+    if key.len > MAX_KEY_BYTES {
+        return err(Error.TooLarge)
+    }
+    return ok()
+}
+
+fn power_of_two(value: u32) -> bool {
+    return value != 0 && (value & (value - 1)) == 0
+}
+
+// `value` rounded up to a multiple of `align`, a power of two.
+fn round_up(value: u32, align: u32) -> u32 {
+    return (value + align - 1) & ~(align - 1)
+}
+
+fn get_u32_le(bytes: &[u8], at: usize) -> u32 {
+    return bytes[at] as u32 | (bytes[at + 1] as u32 << 8) | (bytes[at + 2] as u32 << 16) | (bytes[at + 3] as u32 << 24)
+}
+
+fn put_u32_le(bytes: &mut[u8], at: usize, value: u32) {
+    bytes[at] = (value & 0xFF) as u8
+    bytes[at + 1] = ((value >> 8) & 0xFF) as u8
+    bytes[at + 2] = ((value >> 16) & 0xFF) as u8
+    bytes[at + 3] = (value >> 24) as u8
+}
+
+// CRC-32 (IEEE 802.3, as std/checksum) four bits at a time. Start from
+// 0xFFFF_FFFF and invert the result.
+const CRC_NIBBLES: [16]u32 = [
+    0x0000_0000, 0x1DB7_1064, 0x3B6E_20C8, 0x26D9_30AC,
+    0x76DC_4190, 0x6B6B_51F4, 0x4DB2_6158, 0x5005_713C,
+    0xEDB8_8320, 0xF00F_9344, 0xD6D6_A3E8, 0xCB61_B38C,
+    0x9B64_C2B0, 0x86D3_D2D4, 0xA00A_E278, 0xBDBD_F21C,
+]
+
+fn crc_update(state: u32, bytes: &[u8]) -> u32 {
+    crc := state
+    for &byte in bytes {
+        crc = crc ^ byte as u32
+        crc = (crc >> 4) ^ CRC_NIBBLES[(crc & 0xF) as usize]
+        crc = (crc >> 4) ^ CRC_NIBBLES[(crc & 0xF) as usize]
+    }
+    return crc
+}

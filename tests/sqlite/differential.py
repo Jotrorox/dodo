@@ -96,6 +96,13 @@ def main():
         name = os.path.basename(script_path)
         with open(script_path, encoding="utf-8") as f:
             script = f.read()
+        # "-- requires: X.Y.Z" skips scripts for features newer SQLite added.
+        first = script.split("\n", 1)[0]
+        if first.startswith("-- requires:"):
+            need = tuple(int(x) for x in first.split(":", 1)[1].strip().split("."))
+            if sqlite3.sqlite_version_info < need:
+                print(f"skip {name} (needs SQLite {first.split(':', 1)[1].strip()})")
+                continue
         a = os.path.join(workdir, name + ".sqlite.db")
         b = os.path.join(workdir, name + ".dodo.db")
         for p in (a, b, b + "-journal"):

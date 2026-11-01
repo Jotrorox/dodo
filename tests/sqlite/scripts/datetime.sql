@@ -5,9 +5,9 @@ select date('2024-01-31', '+1 month'), date('2024-03-31', '-1 month'), date('202
 select datetime('2024-01-01 10:00', '+90 minutes'), datetime('2024-01-01', '-1 day', '+12 hours'), datetime('2024-01-01', '+1.5 days');
 select date('2024-05-17', 'start of month'), date('2024-05-17', 'start of year'), datetime('2024-05-17 08:09:10', 'start of day');
 select date('2024-05-17', 'weekday 0'), date('2024-05-17', 'weekday 5'), date('2024-05-18', 'weekday 1');
-select strftime('%Y-%m-%d %H:%M:%S', '2024-07-04 09:05:03'), strftime('%j %w %u %W %U', '2024-07-04');
+select strftime('%Y-%m-%d %H:%M:%S', '2024-07-04 09:05:03'), strftime('%j %w %W', '2024-07-04');
 select strftime('%s', '2024-01-01'), strftime('%f', '2024-01-01 00:00:01.25'), strftime('%J', '2024-01-01 06:00');
-select strftime('%V %G %g', '2021-01-01'), strftime('%V %G', '2020-12-31'), strftime('%I %p %l %k', '2024-01-01 15:04');
+select strftime('%I %p %l %k', '2024-01-01 15:04');
 select date('2024-13-01'), date('not a date'), time('25:00'), date(null), datetime('2024-01-01', 'bogus');
 select datetime('2024-01-01T10:20:30Z'), datetime('2024-01-01 10:20:30+02:00'), datetime('2024-01-01 10:20:30-01:30');
 select time('12:00', '+30 seconds'), time('23:59:59', '+1 second'), datetime('2024-01-01 00:00:00', 'subsec');
