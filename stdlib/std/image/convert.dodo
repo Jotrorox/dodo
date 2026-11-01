@@ -1,0 +1,612 @@
+package convert
+
+import "core/ptr"
+import "std/image/color"
+import "std/image/pixels"
+
+// Conversion between pixel layouts: channel count, sample type and
+// premultiplication, plus sRGB and linear-light transfer.
+//
+// Integer destinations go through straight 16-bit RGBA with integer
+// arithmetic only, float sources included (their bits are decoded with
+// integer operations), so results are identical on every target and need no
+// FPU. Float destinations go through f32 RGBA with IEEE arithmetic, keeping
+// values outside 0.0 to 1.0.
+//
+// Rules: 8 to 16 bits multiplies by 257; 16 to 8 bits rounds (v * 255 +
+// 32767) / 65535; float to integer clamps to 0.0..1.0 and rounds; gray to
+// color replicates; color to gray uses BT.709 luma (0.2126, 0.7152, 0.0722);
+// a missing alpha is opaque and a dropped one is discarded without
+// compositing, leaving straight colors.
+
+// Pixels converted per batch through stack storage.
+const CHUNK: usize = 64
+
+// A layout reduced to scalars for inner loops.
+struct Shape {
+    channels: usize
+    sample: u32
+    size: usize
+    bpp: usize
+    premultiplied: bool
+}
+
+fn shape(layout: &pixels.Layout) -> Shape {
+    channels := layout.channel_count()
+    size := layout.sample_bytes()
+    alpha := channels == 2 || channels == 4
+    return Shape { channels: channels, sample: layout.sample_code(), size: size, bpp: channels * size, premultiplied: layout.premultiplied && alpha }
+}
+
+// ---------------------------------------------------------------------------
+// Float bits, integer-only
+
+pub fn f32_bits(value: f32) -> u32 {
+    unsafe {
+        return ptr.read_unaligned(ptr.from_ref(&value) as *const u32)
+    }
+}
+
+pub fn f32_from_bits(bits: u32) -> f32 {
+    unsafe {
+        return ptr.read_unaligned(ptr.from_ref(&bits) as *const f32)
+    }
+}
+
+// An IEEE binary16 value widened exactly to binary32 bits.
+pub fn half_to_f32_bits(half: u16) -> u32 {
+    h := half as u32
+    sign := (h & 0x8000) << 16
+    exponent := (h >> 10) & 31
+    mantissa := h & 1023
+    if exponent == 0 {
+        if mantissa == 0 {
+            return sign
+        }
+        // Subnormal: shift the leading one into the implicit position.
+        shifts := 0u32
+        for (mantissa & 1024) == 0 {
+            mantissa = mantissa << 1
+            shifts += 1
+        }
+        return sign | ((113 - shifts) << 23) | ((mantissa & 1023) << 13)
+    }
+    if exponent == 31 {
+        return sign | 0x7f800000 | (mantissa << 13)
+    }
+    return sign | ((exponent + 112) << 23) | (mantissa << 13)
+}
+
+// Binary32 bits rounded to binary16, to nearest with ties to even.
+pub fn f32_bits_to_half(bits: u32) -> u16 {
+    sign := (bits >> 16) & 0x8000
+    exponent := ((bits >> 23) & 255) as i32
+    mantissa := bits & 0x7fffff
+    if exponent == 255 {
+        if mantissa != 0 {
+            return (sign | 0x7e00) as u16
+        }
+        return (sign | 0x7c00) as u16
+    }
+    e := exponent - 112
+    if e >= 31 {
+        return (sign | 0x7c00) as u16
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign as u16
+        }
+        m := mantissa | 0x800000
+        shift := (14 - e) as u32
+        half := 1u32 << (shift - 1)
+        rest := m & ((1u32 << shift) - 1)
+        r := m >> shift
+        if rest > half || (rest == half && (r & 1) == 1) {
+            r += 1
+        }
+        return (sign | r) as u16
+    }
+    r := ((e as u32) << 10) | (mantissa >> 13)
+    rest := mantissa & 0x1fff
+    if rest > 0x1000 || (rest == 0x1000 && (r & 1) == 1) {
+        r += 1
+    }
+    return (sign | r) as u16
+}
+
+// Binary32 bits clamped to 0.0..1.0 and rounded to a 16-bit unorm; NaN is 0.
+pub fn f32_bits_to_unorm16(bits: u32) -> u16 {
+    if (bits & 0x80000000) != 0 {
+        return 0
+    }
+    exponent := (bits >> 23) & 255
+    if exponent == 255 {
+        if (bits & 0x7fffff) != 0 {
+            return 0
+        }
+        return 65535
+    }
+    if exponent >= 127 {
+        return 65535
+    }
+    // value = m * 2^(exponent - 150) with m < 2^24; scaled by 65535.
+    shift := 150 - exponent
+    if shift > 41 {
+        return 0
+    }
+    m := ((bits & 0x7fffff) | 0x800000) as u64
+    product := m * 65535
+    rounded := (product + (1u64 << (shift - 1) as u64)) >> shift as u64
+    if rounded > 65535 {
+        return 65535
+    }
+    return rounded as u16
+}
+
+// A 16-bit unorm as the nearest binary32 bits of value / 65535.
+pub fn unorm16_to_f32_bits(value: u16) -> u32 {
+    if value == 0 {
+        return 0
+    }
+    numerator := (value as u64) << 40
+    q := numerator / 65535
+    remainder := numerator - q * 65535
+    // q lies in [2^24, 2^40]; find its top bit.
+    top := 24u32
+    for top < 40 && (q >> (top + 1) as u64) != 0 {
+        top += 1
+    }
+    shift := top - 23
+    mantissa := q >> shift as u64
+    rest := q & ((1u64 << shift as u64) - 1)
+    half := 1u64 << (shift - 1) as u64
+    if rest > half || (rest == half && (remainder != 0 || (mantissa & 1) == 1)) {
+        mantissa += 1
+    }
+    if mantissa == (1u64 << 24) {
+        mantissa = mantissa >> 1
+        top += 1
+    }
+    exponent := top + 87
+    return (exponent << 23) | ((mantissa as u32) & 0x7fffff)
+}
+
+// ---------------------------------------------------------------------------
+// The 16-bit path
+
+fn sample16(row: &[u8], s: &Shape, offset: usize) -> u32 {
+    if s.sample == pixels.SAMPLE_U8 {
+        return row[offset] as u32 * 257
+    }
+    if s.sample == pixels.SAMPLE_U16 {
+        return pixels.get16(row, offset) as u32
+    }
+    if s.sample == pixels.SAMPLE_F16 {
+        return f32_bits_to_unorm16(half_to_f32_bits(pixels.get16(row, offset))) as u32
+    }
+    return f32_bits_to_unorm16(pixels.get32(row, offset)) as u32
+}
+
+fn put_sample16(row: &mut[u8], s: &Shape, offset: usize, value: u32) {
+    if s.sample == pixels.SAMPLE_U8 {
+        row[offset] = ((value * 255 + 32767) / 65535) as u8
+    } else if s.sample == pixels.SAMPLE_U16 {
+        pixels.put16(row, offset, value as u16)
+    } else if s.sample == pixels.SAMPLE_F16 {
+        pixels.put16(row, offset, f32_bits_to_half(unorm16_to_f32_bits(value as u16)))
+    } else {
+        pixels.put32(row, offset, unorm16_to_f32_bits(value as u16))
+    }
+}
+
+pub fn luma16(r: u32, g: u32, b: u32) -> u32 {
+    return (r * 13933 + g * 46871 + b * 4732 + 32768) >> 16
+}
+
+// Pixel i of `row` as straight RGBA in out[o..o + 4]. With `straighten`,
+// premultiplied colors are divided by alpha.
+fn load16(row: &[u8], s: &Shape, i: usize, out: &mut[u16], o: usize, straighten: bool) {
+    p := i * s.bpp
+    r := sample16(row, s, p)
+    g := r
+    b := r
+    a := 65535u32
+    if s.channels >= 3 {
+        g = sample16(row, s, p + s.size)
+        b = sample16(row, s, p + 2 * s.size)
+        if s.channels == 4 {
+            a = sample16(row, s, p + 3 * s.size)
+        }
+    } else if s.channels == 2 {
+        a = sample16(row, s, p + s.size)
+    }
+    if straighten && s.premultiplied && a < 65535 {
+        if a == 0 {
+            r = 0
+            g = 0
+            b = 0
+        } else {
+            r = unpremultiply16(r, a)
+            g = unpremultiply16(g, a)
+            b = unpremultiply16(b, a)
+        }
+    }
+    out[o] = r as u16
+    out[o + 1] = g as u16
+    out[o + 2] = b as u16
+    out[o + 3] = a as u16
+}
+
+fn unpremultiply16(c: u32, a: u32) -> u32 {
+    v := (c * 65535 + a / 2) / a
+    if v > 65535 {
+        return 65535
+    }
+    return v
+}
+
+fn premultiply16(c: u32, a: u32) -> u32 {
+    return (c * a + 32767) / 65535
+}
+
+// Store straight RGBA from input[o..o + 4] as pixel i of `row`; with
+// `premultiply`, colors are multiplied by alpha first.
+fn store16(input: &[u16], o: usize, row: &mut[u8], s: &Shape, i: usize, premultiply: bool) {
+    p := i * s.bpp
+    r := input[o] as u32
+    g := input[o + 1] as u32
+    b := input[o + 2] as u32
+    a := input[o + 3] as u32
+    if premultiply && s.premultiplied && a < 65535 {
+        r = premultiply16(r, a)
+        g = premultiply16(g, a)
+        b = premultiply16(b, a)
+    }
+    if s.channels <= 2 {
+        put_sample16(row, s, p, luma16(r, g, b))
+        if s.channels == 2 {
+            put_sample16(row, s, p + s.size, a)
+        }
+        return
+    }
+    put_sample16(row, s, p, r)
+    put_sample16(row, s, p + s.size, g)
+    put_sample16(row, s, p + 2 * s.size, b)
+    if s.channels == 4 {
+        put_sample16(row, s, p + 3 * s.size, a)
+    }
+}
+
+// `count` pixels of `row` (in `layout`) from pixel `first`, as straight
+// 16-bit RGBA in out[..4 * count].
+pub fn load_rgba16(row: &[u8], layout: &pixels.Layout, first: usize, count: usize, out: &mut[u16]) {
+    s := shape(layout)
+    for i in 0usize..count {
+        load16(row, &s, first + i, out, i * 4, true)
+    }
+}
+
+// Write `count` straight 16-bit RGBA pixels from input[..4 * count] into
+// `row` (in `layout`) from pixel `first`.
+pub fn store_rgba16(input: &[u16], row: &mut[u8], layout: &pixels.Layout, first: usize, count: usize) {
+    s := shape(layout)
+    for i in 0usize..count {
+        store16(input, i * 4, row, &s, first + i, true)
+    }
+}
+
+// `count` pixels from pixel `first` as straight 8-bit RGBA in
+// out[..4 * count]. 8-bit RGBA and RGB rows are copied directly.
+pub fn load_rgba8(row: &[u8], layout: &pixels.Layout, first: usize, count: usize, out: &mut[u8]) {
+    s := shape(layout)
+    if s.sample == pixels.SAMPLE_U8 && !s.premultiplied {
+        for i in 0usize..count {
+            p := (first + i) * s.channels
+            o := i * 4
+            if s.channels == 4 {
+                out[o] = row[p]
+                out[o + 1] = row[p + 1]
+                out[o + 2] = row[p + 2]
+                out[o + 3] = row[p + 3]
+            } else if s.channels == 3 {
+                out[o] = row[p]
+                out[o + 1] = row[p + 1]
+                out[o + 2] = row[p + 2]
+                out[o + 3] = 255
+            } else {
+                out[o] = row[p]
+                out[o + 1] = row[p]
+                out[o + 2] = row[p]
+                out[o + 3] = 255
+                if s.channels == 2 {
+                    out[o + 3] = row[p + 1]
+                }
+            }
+        }
+        return
+    }
+    wide := [0u16; 4]
+    for i in 0usize..count {
+        load16(row, &s, first + i, &mut wide, 0, true)
+        for k in 0usize..4 {
+            out[i * 4 + k] = ((wide[k] as u32 * 255 + 32767) / 65535) as u8
+        }
+    }
+}
+
+// Write `count` straight 8-bit RGBA pixels into `row` from pixel `first`.
+pub fn store_rgba8(input: &[u8], row: &mut[u8], layout: &pixels.Layout, first: usize, count: usize) {
+    s := shape(layout)
+    wide := [0u16; 4]
+    for i in 0usize..count {
+        for k in 0usize..4 {
+            wide[k] = input[i * 4 + k] as u16 * 257
+        }
+        store16(&wide, 0, row, &s, first + i, true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The float path
+
+fn sample_f32(row: &[u8], s: &Shape, offset: usize) -> f32 {
+    if s.sample == pixels.SAMPLE_U8 {
+        return row[offset] as f32 / 255.0
+    }
+    if s.sample == pixels.SAMPLE_U16 {
+        return pixels.get16(row, offset) as f32 / 65535.0
+    }
+    if s.sample == pixels.SAMPLE_F16 {
+        return f32_from_bits(half_to_f32_bits(pixels.get16(row, offset)))
+    }
+    return f32_from_bits(pixels.get32(row, offset))
+}
+
+fn put_sample_f32(row: &mut[u8], s: &Shape, offset: usize, value: f32) {
+    if s.sample == pixels.SAMPLE_F32 {
+        pixels.put32(row, offset, f32_bits(value))
+    } else if s.sample == pixels.SAMPLE_F16 {
+        pixels.put16(row, offset, f32_bits_to_half(f32_bits(value)))
+    } else {
+        // Integer destinations normally take the 16-bit path.
+        unorm := f32_bits_to_unorm16(f32_bits(value)) as u32
+        put_sample16(row, s, offset, unorm)
+    }
+}
+
+fn load_f32(row: &[u8], s: &Shape, i: usize, out: &mut[f32], straighten: bool) {
+    p := i * s.bpp
+    r := sample_f32(row, s, p)
+    g := r
+    b := r
+    a := 1.0f32
+    if s.channels >= 3 {
+        g = sample_f32(row, s, p + s.size)
+        b = sample_f32(row, s, p + 2 * s.size)
+        if s.channels == 4 {
+            a = sample_f32(row, s, p + 3 * s.size)
+        }
+    } else if s.channels == 2 {
+        a = sample_f32(row, s, p + s.size)
+    }
+    if straighten && s.premultiplied {
+        if a == 0.0 {
+            r = 0.0
+            g = 0.0
+            b = 0.0
+        } else if a != 1.0 {
+            r = r / a
+            g = g / a
+            b = b / a
+        }
+    }
+    out[0] = r
+    out[1] = g
+    out[2] = b
+    out[3] = a
+}
+
+fn store_f32(input: &[f32], row: &mut[u8], s: &Shape, i: usize, premultiply: bool) {
+    p := i * s.bpp
+    r := input[0]
+    g := input[1]
+    b := input[2]
+    a := input[3]
+    if premultiply && s.premultiplied {
+        r = r * a
+        g = g * a
+        b = b * a
+    }
+    if s.channels <= 2 {
+        put_sample_f32(row, s, p, 0.2126f32 * r + 0.7152f32 * g + 0.0722f32 * b)
+        if s.channels == 2 {
+            put_sample_f32(row, s, p + s.size, a)
+        }
+        return
+    }
+    put_sample_f32(row, s, p, r)
+    put_sample_f32(row, s, p + s.size, g)
+    put_sample_f32(row, s, p + 2 * s.size, b)
+    if s.channels == 4 {
+        put_sample_f32(row, s, p + 3 * s.size, a)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rows and views
+
+// Convert `count` pixels of `source` (in `from`, starting at pixel
+// `source_first`) into `target` (in `to`, from pixel `target_first`).
+pub fn row(source: &[u8], source_layout: &pixels.Layout, source_first: usize, target: &mut[u8], target_layout: &pixels.Layout, target_first: usize, count: usize) {
+    s := shape(source_layout)
+    d := shape(target_layout)
+    if source_layout.equals(target_layout) {
+        size := s.bpp
+        a := source_first * size
+        b := target_first * size
+        for k in 0usize..count * size {
+            target[b + k] = source[a + k]
+        }
+        return
+    }
+    // Premultiplied to premultiplied keeps the products as they are.
+    both := s.premultiplied && d.premultiplied
+    if d.sample >= pixels.SAMPLE_F16 {
+        value := [0.0f32; 4]
+        for i in 0usize..count {
+            load_f32(source, &s, source_first + i, &mut value, !both)
+            store_f32(&value, target, &d, target_first + i, !both)
+        }
+        return
+    }
+    wide := [0u16; 4]
+    for i in 0usize..count {
+        load16(source, &s, source_first + i, &mut wide, 0, !both)
+        store16(&wide, 0, target, &d, target_first + i, !both)
+    }
+}
+
+// Convert `source` into `target` with its top-left corner at (x, y),
+// skipping pixels outside the target.
+pub fn copy_rect(source: &pixels.View, target: &mut pixels.ViewMut, x: u32, y: u32) {
+    if x >= target.width() || y >= target.height() {
+        return
+    }
+    columns := source.width()
+    if columns > target.width() - x {
+        columns = target.width() - x
+    }
+    rows := source.height()
+    if rows > target.height() - y {
+        rows = target.height() - y
+    }
+    source_layout := source.layout().clone()
+    target_layout := target.layout().clone()
+    for r in 0u32..rows {
+        line := source.row(r)
+        row(line, &source_layout, 0, target.row_mut(y + r), &target_layout, x as usize, columns as usize)
+    }
+}
+
+// Convert `source` into `target`, which must have the same size.
+pub fn copy(source: &pixels.View, target: &mut pixels.ViewMut) -> void!pixels.Error {
+    if source.width() != target.width() || source.height() != target.height() {
+        return err(pixels.Error.Malformed)
+    }
+    copy_rect(source, target, 0, 0)
+    return ok()
+}
+
+// Multiply color by alpha in place and mark the view premultiplied. Views
+// without alpha, or already premultiplied, are unchanged.
+pub fn premultiply(view: &mut pixels.ViewMut) {
+    layout := view.layout().clone()
+    if !layout.has_alpha() || layout.premultiplied {
+        return
+    }
+    target := layout.clone()
+    target.premultiplied = true
+    convert_in_place(view, &layout, &target)
+    view.relabel(target)!
+}
+
+// Divide color by alpha in place and mark the view straight.
+pub fn unpremultiply(view: &mut pixels.ViewMut) {
+    layout := view.layout().clone()
+    if !layout.premultiplied {
+        return
+    }
+    target := layout.clone()
+    target.premultiplied = false
+    convert_in_place(view, &layout, &target)
+    view.relabel(target)!
+}
+
+// Same-size layouts converted pixel by pixel through a small buffer.
+fn convert_in_place(view: &mut pixels.ViewMut, source_layout: &pixels.Layout, target_layout: &pixels.Layout) {
+    size := source_layout.bytes_per_pixel()
+    buffer := [0u8; 16]
+    for y in 0u32..view.height() {
+        line := view.row_mut(y)
+        for x in 0usize..line.len / size {
+            for k in 0usize..size {
+                buffer[k] = line[x * size + k]
+            }
+            row(&buffer, source_layout, 0, &mut line[x * size..(x + 1) * size], target_layout, 0, 1)
+        }
+    }
+}
+
+// Re-encode the color channels of `view` from sRGB to linear light in place.
+// 8-bit samples lose shadow detail this way; prefer 16-bit or float views.
+// Float samples use the exact curve on 16-bit precision values clamped to
+// 0.0..1.0 for integer layouts; float layouts keep the sign and use the
+// curve's tables per sample.
+pub fn srgb_to_linear(view: &mut pixels.ViewMut) {
+    transfer(view, true)
+}
+
+// Re-encode the color channels of `view` from linear light to sRGB in place.
+pub fn linear_to_srgb(view: &mut pixels.ViewMut) {
+    transfer(view, false)
+}
+
+fn transfer(view: &mut pixels.ViewMut, to_linear: bool) {
+    layout := view.layout().clone()
+    s := shape(&layout)
+    colors := s.channels
+    if colors == 2 || colors == 4 {
+        colors -= 1
+    }
+    width := view.width()
+    for y in 0u32..view.height() {
+        line := view.row_mut(y)
+        for x in 0u32..width {
+            p := x as usize * s.bpp
+            for c in 0usize..colors {
+                offset := p + c * s.size
+                if s.sample >= pixels.SAMPLE_F16 {
+                    value := sample_f32(line, &s, offset)
+                    put_sample_f32(line, &s, offset, transfer_f32(value, to_linear))
+                } else {
+                    value := sample16(line, &s, offset) as u16
+                    if to_linear {
+                        put_sample16(line, &s, offset, color.srgb_to_linear16(value) as u32)
+                    } else {
+                        put_sample16(line, &s, offset, color.linear_to_srgb16(value) as u32)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The transfer curve on a float sample, by table interpolation on the
+// clamped value; the sign and any part above 1.0 pass through linearly.
+fn transfer_f32(value: f32, to_linear: bool) -> f32 {
+    if value <= 0.0 {
+        return value
+    }
+    if value >= 1.0 {
+        return value
+    }
+    scaled := value * 65535.0f32
+    low := scaled as u32
+    fraction := scaled - low as f32
+    a := 0u32
+    b := 0u32
+    if to_linear {
+        a = color.srgb_to_linear16(low as u16) as u32
+        b = a
+        if low < 65535 {
+            b = color.srgb_to_linear16((low + 1) as u16) as u32
+        }
+    } else {
+        a = color.linear_to_srgb16(low as u16) as u32
+        b = a
+        if low < 65535 {
+            b = color.linear_to_srgb16((low + 1) as u16) as u32
+        }
+    }
+    return (a as f32 + (b as f32 - a as f32) * fraction) / 65535.0f32
+}

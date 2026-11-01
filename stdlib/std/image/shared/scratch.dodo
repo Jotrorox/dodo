@@ -1,0 +1,93 @@
+package scratch
+
+import "core/mem"
+import "core/ptr"
+import "core/slice"
+import "std/image/pixels"
+
+// Typed working storage carved from one caller-supplied byte buffer, so a
+// codec's scratch_size() can describe everything it needs as one number.
+//
+// Split the buffer with split() (a compiler-recognized pair of independent
+// views), then view each part as typed elements:
+//
+//     let slice.SplitMut { left: a, right: rest } = scratch.split(bytes, scratch.size(4096, 4)?)?
+//     table := scratch.u32s(a)          // at least 4096 aligned u32s
+//
+// size() includes ALIGN_SLACK bytes for the alignment padding a typed view
+// may skip, so scratch_size() functions should add up size() results.
+
+// Padding one typed view may skip to align its first element.
+pub const ALIGN_SLACK: usize = 8
+
+// Bytes for `count` elements of `element` bytes, padding included.
+pub fn size(count: usize, element: usize) -> usize!pixels.Error {
+    return pixels.checked(count, element, ALIGN_SLACK)
+}
+
+// Sum two sizes, or TooLarge.
+pub fn add(a: usize, b: usize) -> usize!pixels.Error {
+    return pixels.checked(a, 1, b)
+}
+
+// The first `length` bytes and the rest, as independent views.
+pub fn split(bytes: &mut[u8], length: usize) -> slice.SplitMut<u8>!pixels.Error from(bytes) {
+    match slice.split_at_mut(bytes, length) {
+        some(parts) => {
+            return ok(parts)
+        }
+        none => {
+            return err(pixels.Error.BufferTooSmall)
+        }
+    }
+}
+
+// Bytes to skip so that the first element is aligned for `align`.
+fn padding(bytes: &mut[u8], align: usize) -> usize {
+    address := unsafe { ptr.as_mut_ptr(bytes) as usize }
+    skip := (align - address % align) % align
+    if skip > bytes.len {
+        return bytes.len
+    }
+    return skip
+}
+
+pub fn u16s(bytes: &mut[u8]) -> &mut[u16] from(bytes) {
+    skip := padding(bytes, mem.align_of::<u16>())
+    count := (bytes.len - skip) / 2
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.offset(ptr.as_mut_ptr(bytes), skip as isize) as *mut u16, count, bytes)
+    }
+}
+
+pub fn i16s(bytes: &mut[u8]) -> &mut[i16] from(bytes) {
+    skip := padding(bytes, mem.align_of::<i16>())
+    count := (bytes.len - skip) / 2
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.offset(ptr.as_mut_ptr(bytes), skip as isize) as *mut i16, count, bytes)
+    }
+}
+
+pub fn u32s(bytes: &mut[u8]) -> &mut[u32] from(bytes) {
+    skip := padding(bytes, mem.align_of::<u32>())
+    count := (bytes.len - skip) / 4
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.offset(ptr.as_mut_ptr(bytes), skip as isize) as *mut u32, count, bytes)
+    }
+}
+
+pub fn i32s(bytes: &mut[u8]) -> &mut[i32] from(bytes) {
+    skip := padding(bytes, mem.align_of::<i32>())
+    count := (bytes.len - skip) / 4
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.offset(ptr.as_mut_ptr(bytes), skip as isize) as *mut i32, count, bytes)
+    }
+}
+
+pub fn f32s(bytes: &mut[u8]) -> &mut[f32] from(bytes) {
+    skip := padding(bytes, mem.align_of::<f32>())
+    count := (bytes.len - skip) / 4
+    unsafe {
+        return ptr.borrow_slice_mut(ptr.offset(ptr.as_mut_ptr(bytes), skip as isize) as *mut f32, count, bytes)
+    }
+}
