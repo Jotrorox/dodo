@@ -399,7 +399,7 @@ fn vm_finish_get(L: *mut State, t0: *mut Value, key: *mut Value, res: isize, slo
                 slot = 0 as *mut Value
             }
         }
-        return err(err_runtime(L, "'__index' chain too long; possibly a loop"))
+        return err(err_runtime(L, "'__index' chain too long; possible loop"))
     }
 }
 
@@ -442,7 +442,7 @@ fn vm_finish_set(L: *mut State, t0: *mut Value, key: *mut Value, val: *mut Value
                 slot = 0 as *mut Value
             }
         }
-        return err(err_runtime(L, "'__newindex' chain too long; possibly a loop"))
+        return err(err_runtime(L, "'__newindex' chain too long; possible loop"))
     }
 }
 
@@ -621,4 +621,94 @@ fn concat_copy(top: *mut Value, n: i32, out: *mut u8) {
             at += l
         }
     }
+}
+
+// --- String arithmetic metamethods ------------------------------------------
+//
+// In Lua 5.4 the core never converts strings for arithmetic: the string
+// metatable carries __add, __sub, ... methods that convert numeric strings
+// and redo the operation. These are those methods; the string library
+// installs them with `string_arith_metamethods()`.
+
+// Push the number value of argument `arg` if it is a number or a numeric
+// string; false otherwise.
+fn strmm_tonum(cx: &mut Cx, arg: i32) -> bool!Throw {
+    if cx.type_of(arg) == TNUMBER {
+        cx.push_value(arg)
+        return ok(true)
+    }
+    match cx.to_lstr(arg)? {
+        some(s) => {
+            let b = s.bytes()
+            return ok(cx.string_to_number(b) == b.len + 1)
+        },
+        none => { return ok(false) },
+    }
+}
+
+fn strmm_arith(cx: &mut Cx, op: i32, event: &str) -> i32!Throw {
+    if strmm_tonum(cx, 1)? && strmm_tonum(cx, 2)? {
+        cx.arith(op)?
+        return ok(1)
+    }
+    // Not both numeric: try the other operand's metamethod.
+    cx.set_top(2)
+    if cx.type_of(2) == TSTRING || cx.get_metafield(2, event)? == TNIL {
+        b := Buffer.new(cx)
+        b.add_str("attempt to ")?
+        let eb = mem.str_bytes(event)
+        b.add_bytes(eb[2..eb.len])?
+        b.add_str(" a '")?
+        let t1 = cx.type_of(-2)
+        b.add_str(cx.type_name(t1))?
+        b.add_str("' with a '")?
+        let t2 = cx.type_of(-1)
+        b.add_str(cx.type_name(t2))?
+        b.add_str("'")?
+        return err(cx.error_buffer(&mut b))
+    }
+    cx.insert(-3)
+    cx.call(2, 1)?
+    return ok(1)
+}
+
+fn strmm_add(cx: &mut Cx) -> i32!Throw {
+    return strmm_arith(cx, OPADD, "__add")
+}
+fn strmm_sub(cx: &mut Cx) -> i32!Throw {
+    return strmm_arith(cx, OPSUB, "__sub")
+}
+fn strmm_mul(cx: &mut Cx) -> i32!Throw {
+    return strmm_arith(cx, OPMUL, "__mul")
+}
+fn strmm_mod(cx: &mut Cx) -> i32!Throw {
+    return strmm_arith(cx, OPMOD, "__mod")
+}
+fn strmm_pow(cx: &mut Cx) -> i32!Throw {
+    return strmm_arith(cx, OPPOW, "__pow")
+}
+fn strmm_div(cx: &mut Cx) -> i32!Throw {
+    return strmm_arith(cx, OPDIV, "__div")
+}
+fn strmm_idiv(cx: &mut Cx) -> i32!Throw {
+    return strmm_arith(cx, OPIDIV, "__idiv")
+}
+fn strmm_unm(cx: &mut Cx) -> i32!Throw {
+    return strmm_arith(cx, OPUNM, "__unm")
+}
+
+// Register the string arithmetic metamethods (__add ... __unm) into the
+// table on top of the stack (the string metatable).
+pub fn set_string_arith_metamethods(cx: &mut Cx) -> void!Throw {
+    let funcs = [
+        ("__add", strmm_add),
+        ("__sub", strmm_sub),
+        ("__mul", strmm_mul),
+        ("__mod", strmm_mod),
+        ("__pow", strmm_pow),
+        ("__div", strmm_div),
+        ("__idiv", strmm_idiv),
+        ("__unm", strmm_unm),
+    ]
+    return cx.set_funcs(&funcs, 0)
 }

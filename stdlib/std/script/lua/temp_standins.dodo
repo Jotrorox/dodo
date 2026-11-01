@@ -396,7 +396,12 @@ fn num_format_int(out: &mut [u8], v: i64, conv: u8, flags: u32, width: i32, prec
 // Opens the standard libraries written by other agents (string, table,
 // math, utf8, io, os, package, debug). Stand-in: nothing yet.
 fn open_other_libs(cx: &mut Cx) -> void!Throw {
-    unsafe {
-        return ok()
-    }
+    // Stand-in for lib_string's metatable: string arithmetic coercion.
+    cx.create_table(0, 8)?
+    set_string_arith_metamethods(cx)?
+    cx.push_str("")?
+    cx.push_value(-2)
+    cx.set_metatable(-2)
+    cx.pop(2)
+    return ok()
 }
