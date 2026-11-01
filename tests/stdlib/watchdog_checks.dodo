@@ -1,0 +1,336 @@
+package main
+
+import "std/embedded/chip/rp_watchdog"
+import "std/embedded/hal"
+
+// Host checks for std/embedded/chip/rp_watchdog against a model of the
+// RP2040 and RP2350 watchdog and the power-on state machine's WDSEL. The
+// model counts down per simulated microsecond, twice per tick on the RP2040
+// as erratum RP2040-E1 describes, resets "the chip" when the count runs out
+// or on a trigger, and keeps its scratch registers across those resets but
+// not across power-up. Every reset checks that WDSEL selects everything but
+// the oscillators, and nothing may touch the RP2040's tick generator.
+
+const TRIGGER: u32 = 1 << 31
+const ENABLE: u32 = 1 << 30
+const PAUSE: u32 = 0b111 << 24
+const TIME: u32 = 0xFF_FFFF
+const ROM_MARK: u32 = 0xB007_C0D3
+
+// The watchdog and WDSEL, shared by the two register handles below.
+struct Chip {
+    ticks_per_us: u32
+    resets_selected: u32
+    control: u32
+    count: u32
+    reason: u32
+    scratch: [8]u32
+    wdsel: u32
+    resets: u32
+    loads: u32
+}
+
+static mut CHIP: Chip = Chip {
+    ticks_per_us: 1,
+    resets_selected: 0,
+    control: 0,
+    count: 0,
+    reason: 0,
+    scratch: [0u32; 8],
+    wdsel: 0,
+    resets: 0,
+    loads: 0,
+}
+
+// Power up as `chip`: every register at its reset value.
+fn power_on(chip: u32) {
+    unsafe {
+        CHIP.ticks_per_us = 1
+        CHIP.resets_selected = 0x01FF_FFF3
+        if chip == rp_watchdog.RP2040 {
+            CHIP.ticks_per_us = 2
+            CHIP.resets_selected = 0x0001_FFFC
+        }
+        CHIP.control = 0
+        CHIP.count = 0
+        CHIP.reason = 0
+        CHIP.scratch = [0u32; 8]
+        CHIP.wdsel = 0
+        CHIP.resets = 0
+        CHIP.loads = 0
+    }
+}
+
+// A watchdog reset with REASON `reason`: 1 for a timeout, 2 for a trigger.
+// The program starts again, with the watchdog stopped.
+fn reset(reason: u32) {
+    unsafe {
+        core.assert_eq(CHIP.wdsel, CHIP.resets_selected)
+        CHIP.reason = reason
+        CHIP.control = 0
+        CHIP.resets += 1
+    }
+}
+
+// Let `microseconds` pass.
+fn elapse(microseconds: u32) {
+    unsafe {
+        if (CHIP.control & ENABLE) == 0 {
+            return
+        }
+        ticks := microseconds * CHIP.ticks_per_us
+        if ticks >= CHIP.count {
+            CHIP.count = 0
+            reset(1)
+        } else {
+            CHIP.count -= ticks
+        }
+    }
+}
+
+fn resets() -> u32 {
+    unsafe {
+        return CHIP.resets
+    }
+}
+
+// The watchdog's registers (`psm` false) or the power-on state machine's.
+struct Registers: hal.Registers {
+    psm: bool
+
+    pub fn read(&mut self, offset: usize) -> u32 {
+        core.assert(!self.psm)
+        unsafe {
+            if offset == 0x00 {
+                return CHIP.control | (CHIP.count & TIME)
+            } else if offset == 0x08 {
+                return CHIP.reason
+            }
+            core.assert(offset >= 0x0C && offset <= 0x28)
+            return CHIP.scratch[(offset - 0x0C) / 4]
+        }
+    }
+
+    pub fn write(&mut self, offset: usize, value: u32) {
+        alias := offset & 0x3000
+        register := offset & 0xFFF
+        unsafe {
+            if self.psm {
+                core.assert_eq(offset, 0x08usize)
+                CHIP.wdsel = value
+                return
+            }
+            if register == 0x00 {
+                if alias == 0x2000 {
+                    CHIP.control |= value & (ENABLE | PAUSE)
+                } else if alias == 0x3000 {
+                    CHIP.control &= ~value
+                } else {
+                    core.assert_eq(alias, 0usize)
+                    CHIP.control = value & (ENABLE | PAUSE)
+                }
+                if alias != 0x3000 && (value & TRIGGER) != 0 {
+                    reset(2)
+                }
+                return
+            }
+            // Only the control register is written through aliases.
+            core.assert_eq(alias, 0usize)
+            if register == 0x04 {
+                core.assert(value <= TIME)
+                CHIP.count = value
+                CHIP.loads += 1
+                return
+            }
+            // REASON is read-only, and the RP2040's tick generator at 0x2C
+            // belongs to the timer.
+            core.assert(register >= 0x0C && register <= 0x28)
+            CHIP.scratch[(register - 0x0C) / 4] = value
+        }
+    }
+}
+
+fn watchdog(chip: u32) -> rp_watchdog.Countdown<Registers> {
+    unsafe {
+        return rp_watchdog.Countdown.new(Registers { psm: false }, Registers { psm: true }, chip)
+    }
+}
+
+fn refused(result: void!hal.Error, expected: hal.Error) -> bool {
+    match result {
+        ok() => {
+            return false
+        }
+        err(error) => {
+            return error == expected
+        }
+    }
+}
+
+fn keep_alive<W: hal.Watchdog>(dog: &mut W) {
+    dog.feed()
+}
+
+// Start, feed, time out, and read the reason back, on `chip`.
+fn timeouts(chip: u32) {
+    power_on(chip)
+    dog := watchdog(chip)
+    core.assert(dog.reset_reason() == hal.ResetReason.Other)
+    core.assert(!dog.is_running())
+    core.assert_eq(dog.timeout_ms(), 0u32)
+    // Feeding a watchdog that was never started loads nothing.
+    dog.feed()
+    unsafe {
+        core.assert_eq(CHIP.loads, 0u32)
+    }
+
+    maximum := 16_777u32
+    if chip == rp_watchdog.RP2040 {
+        maximum = 8_388
+    }
+    core.assert_eq(dog.max_timeout_ms(), maximum)
+    core.assert_eq(rp_watchdog.max_timeout_ms(chip), maximum)
+    core.assert(refused(dog.start(0), hal.Error.InvalidInput))
+    core.assert(refused(dog.start(maximum + 1), hal.Error.InvalidInput))
+    core.assert(!dog.is_running())
+
+    dog.start(maximum)!
+    core.assert(dog.remaining_us() >= maximum * 1000)
+    dog.start(100)!
+    core.assert(dog.is_running())
+    core.assert_eq(dog.timeout_ms(), 100u32)
+    core.assert_eq(dog.remaining_us(), 100_000u32)
+    unsafe {
+        core.assert_eq(CHIP.control & PAUSE, PAUSE)
+        core.assert_eq(CHIP.wdsel, CHIP.resets_selected)
+    }
+
+    elapse(60_000)
+    core.assert_eq(dog.remaining_us(), 40_000u32)
+    dog.feed()
+    core.assert_eq(dog.remaining_us(), 100_000u32)
+    elapse(60_000)
+    keep_alive(&mut dog)
+    elapse(99_999)
+    core.assert_eq(resets(), 0u32)
+    core.assert_eq(dog.remaining_us(), 1u32)
+    elapse(1)
+    core.assert_eq(resets(), 1u32)
+
+    // The program starts again: the watchdog's reset, once.
+    again := watchdog(chip)
+    core.assert(again.reset_reason() == hal.ResetReason.Timeout)
+    core.assert(!again.is_running())
+    elapse(1_000_000)
+    core.assert_eq(resets(), 1u32)
+    // The reason is read once, at take(); a further reset through the boot
+    // ROM is not mistaken for the watchdog's.
+    third := watchdog(chip)
+    core.assert(third.reset_reason() == hal.ResetReason.Other)
+}
+
+// Stop, restart with another timeout, and reset on purpose.
+fn control(chip: u32) {
+    power_on(chip)
+    dog := watchdog(chip)
+    dog.start(50)!
+    elapse(40_000)
+    dog.stop()
+    core.assert(!dog.is_running())
+    elapse(1_000_000)
+    core.assert_eq(resets(), 0u32)
+    dog.feed()
+    core.assert_eq(dog.remaining_us(), 50_000u32)
+
+    // Starting again replaces the timeout and counts from it.
+    dog.start(10)!
+    core.assert_eq(dog.timeout_ms(), 10u32)
+    elapse(9_000)
+    dog.start(20)!
+    elapse(19_000)
+    core.assert_eq(resets(), 0u32)
+    elapse(1_000)
+    core.assert_eq(resets(), 1u32)
+
+    // restart() resets at once, running or not.
+    dog = watchdog(chip)
+    core.assert(dog.reset_reason() == hal.ResetReason.Timeout)
+    dog.restart()
+    core.assert_eq(resets(), 2u32)
+    dog = watchdog(chip)
+    core.assert(dog.reset_reason() == hal.ResetReason.Restart)
+    core.assert_eq(hal.reset_reason_name(dog.reset_reason()), "Restart")
+}
+
+// Resets the program did not cause read as Other.
+fn foreign_resets(chip: u32) {
+    // The boot ROM resets through the watchdog with its own mark.
+    power_on(chip)
+    dog := watchdog(chip)
+    dog.start(10)!
+    unsafe {
+        CHIP.scratch[4] = ROM_MARK
+    }
+    elapse(10_000)
+    dog = watchdog(chip)
+    core.assert(dog.reset_reason() == hal.ResetReason.Other)
+    unsafe {
+        core.assert_eq(CHIP.scratch[4], ROM_MARK)
+    }
+
+    // reboot_to_bootloader clears the mark (rp_watchdog.clear_mark) before
+    // the boot ROM triggers its reset.
+    dog.start(10)!
+    unsafe {
+        CHIP.scratch[4] = 0
+    }
+    reset(2)
+    dog = watchdog(chip)
+    core.assert(dog.reset_reason() == hal.ResetReason.Other)
+
+    // Power-up after a timeout: REASON and the scratch registers are clear.
+    dog.start(10)!
+    elapse(10_000)
+    power_on(chip)
+    dog = watchdog(chip)
+    core.assert(dog.reset_reason() == hal.ResetReason.Other)
+    core.assert_eq(hal.reset_reason_name(dog.reset_reason()), "Other")
+}
+
+// The scratch words map to registers the boot ROM leaves alone and survive
+// a watchdog reset.
+fn scratch(chip: u32) {
+    power_on(chip)
+    dog := watchdog(chip)
+    core.assert_eq(rp_watchdog.SCRATCH_WORDS, 2u32)
+    dog.set_scratch(0, 0x1234_5678)
+    dog.set_scratch(1, 0x9ABC_DEF0)
+    first := 0usize
+    if chip == rp_watchdog.RP2040 {
+        first = 2
+    }
+    unsafe {
+        core.assert_eq(CHIP.scratch[first], 0x1234_5678u32)
+        core.assert_eq(CHIP.scratch[first + 1], 0x9ABC_DEF0u32)
+    }
+    dog.start(5)!
+    elapse(5_000)
+    dog = watchdog(chip)
+    core.assert(dog.reset_reason() == hal.ResetReason.Timeout)
+    core.assert_eq(hal.reset_reason_name(dog.reset_reason()), "Timeout")
+    core.assert_eq(dog.scratch(0), 0x1234_5678u32)
+    core.assert_eq(dog.scratch(1), 0x9ABC_DEF0u32)
+    power_on(chip)
+    dog = watchdog(chip)
+    core.assert_eq(dog.scratch(0), 0u32)
+}
+
+fn main() {
+    chips: [2]u32 = [rp_watchdog.RP2040, rp_watchdog.RP2350]
+    for &chip in chips {
+        timeouts(chip)
+        control(chip)
+        foreign_resets(chip)
+        scratch(chip)
+    }
+}

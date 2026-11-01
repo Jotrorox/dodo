@@ -1123,6 +1123,7 @@ so changing the board in `dodo.toml` is the only change a program needs:
 | `board.SPI_CLOCK_PIN`, `board.SPI_TX_PIN`, `board.SPI_RX_PIN`, `board.SPI_SELECT_PIN` | The board's usual SPI pins, and a free pin for one chip select. |
 | `board.UART_TX_PIN`, `board.UART_RX_PIN` | The board's usual serial port pins. |
 | `b.timer` | The delay protocol, plus `delay_ms(ms)` and `now_us() -> u64`; `alarm(n)` claims an alarm, which can also run the [executor](#tasks-and-the-executor). |
+| `b.watchdog` | The [watchdog](#the-watchdog-on-the-rp2040-and-rp2350): `start(timeout_ms)`, then `feed()` in time or the board resets; `reset_reason()` tells whether it did. Implements `hal.Watchdog`. |
 | `b.dma` | The [DMA channels](#dma-on-the-rp2040-and-rp2350): `channel()` claims one, `release(channel)` gives it back. Buses and serial ports take them for transfers that run while the program does other work. |
 | `b.usb.serial()` | A [USB serial port](#usb-serial-on-the-rp2040-and-rp2350) on the board's USB connector, implementing the `std/io` Reader and Writer, for printing over the USB cable; `b.usb.serial_with(identity)` sets its [USB identity](#usb-identity), and `b.usb.release_serial(port)` gives it back. |
 | `board.reboot_to_bootloader()` | Restart into the board's flashing mode, for example to run `dodo run` again without pressing a button. |
@@ -2039,6 +2040,56 @@ spinlock around the results both cores read. The ADC and the USB serial port
 share the bookkeeping that starts and stops PLL_USB, so claim and release them
 from one core.
 
+### The watchdog on the RP2040 and RP2350
+
+A watchdog restarts firmware that hangs. Once started, it counts down, and
+unless the program calls `feed()` before the count runs out, it resets the
+chip. `b.watchdog` is stopped after `board.take()`:
+
+```dodo
+package main
+
+import "std/embedded/board"
+import "std/embedded/hal"
+
+fn main() {
+    b := board.take()!
+    if b.watchdog.reset_reason() == hal.ResetReason.Timeout {
+        // The last run hung: count it in a word that survived the reset.
+        hangs := b.watchdog.scratch(0)
+        b.watchdog.set_scratch(0, hangs + 1)
+    }
+    b.watchdog.start(500)!
+    for {
+        b.led.toggle()
+        b.timer.delay_ms(100)
+        b.watchdog.feed()
+    }
+}
+```
+
+| `rp_watchdog.Watchdog` | Purpose |
+| --- | --- |
+| `start(timeout_ms)` | Count down from the timeout, from 1 ms up to `max_timeout_ms()`: 8388 ms on the RP2040, which counts twice per tick (erratum RP2040-E1), and 16777 ms on the RP2350. `InvalidInput` outside that range. Starting a running watchdog changes its timeout. |
+| `feed()` | Count down from the timeout again; the `hal.Watchdog` protocol, so drivers and tasks can feed it without naming the chip. |
+| `stop()`, `is_running()` | Stop counting, so the chip is not reset, until `start` again. |
+| `timeout_ms()`, `remaining_us()` | The timeout last started, and the microseconds left before the reset. |
+| `reset_reason()` | Why the chip last started: `hal.ResetReason.Timeout` if the watchdog ran out, `Restart` after `restart()`, and `Other` after power-up, the RUN pin, a debugger, or the boot ROM. |
+| `scratch(n)`, `set_scratch(n, value)` | Two words, `n` 0 or 1, that survive a watchdog reset but not power-up, for a note to the next run. |
+| `restart()` | Reset the chip through the watchdog now. Does not return. |
+
+The reset restarts both cores, the peripherals, and RAM, but not the
+oscillators. The count pauses while a debugger halts a core. A panic halts
+the program, so with the watchdog running the default panic hook's report is
+followed by a restart, which `reset_reason()` reads as `Timeout`.
+
+The boot ROM resets through the same watchdog when it restarts into the
+bootloader and when it starts newly flashed firmware. As in the Pico SDK,
+`start` leaves a mark in a scratch register that the boot ROM overwrites, and
+only a reset with that mark counts as the watchdog's.
+`reboot_to_bootloader()` clears the mark, so the first run after `dodo run`
+reads `Other`. `board.take()` reads the reason once and clears the mark.
+
 ### The Raspberry Pi Pico 2 W
 
 The Pico 2 W is a Pico 2 with an Infineon CYW43439 Wi-Fi and Bluetooth chip.
@@ -2145,9 +2196,9 @@ dodo build firmware.dodo --emit obj --target thumbv7em-none-eabihf \
 
 - The boards are `pico`, `pico2`, and `pico2_w`, on the `rp2040` and `rp2350`
   chips. The chip packages cover clocks, GPIO, I2C, SPI, UART, PWM, the ADC,
-  PIO, the timer, DMA, a USB serial port, and the second core; other USB
-  devices (HID,
-  mass storage, several functions at once) or USB host mode are not bundled
+  PIO, the timer, the watchdog, DMA, a USB serial port, and the second core;
+  other USB devices (HID, mass storage, several functions at once) or USB
+  host mode are not bundled
   yet. Write them with `hal.Reg` as above.
 - PIO state machines move words through their FIFOs by polling or their
   interrupts. DMA can pace transfers by their FIFOs' data requests

@@ -1,0 +1,314 @@
+package rp_watchdog
+
+import "std/embedded/hal"
+
+// The watchdog the RP2040 and RP2350 share (RP2040 datasheet 4.7, RP2350
+// datasheet 12.9). It is a 24-bit counter that counts down on the chip's
+// 1 MHz watchdog tick, which the chip packages start in take(). Once
+// started, it resets the chip when the count reaches zero, so firmware that
+// hangs restarts instead of staying stuck. A program that still works calls
+// `feed` before then, which reloads the count. Timeouts run from 1 ms to
+// 8388 ms on the RP2040 and to 16777 ms on the RP2350: the RP2040 counts
+// down twice per tick (erratum RP2040-E1), which halves its range.
+//
+// A watchdog reset restarts everything except the oscillators, as the Pico
+// SDK does. That includes both cores, the peripherals, and RAM. The count
+// pauses while a debugger halts a core, so stepping through a program does
+// not reset it. After the reset, `reset_reason` tells whether the watchdog
+// caused it. The two `scratch` words survive the reset (but not power-up)
+// for a program to leave itself a note.
+//
+// `Countdown` drives the watchdog over any hal.Registers: `hal.RegisterBlock`s
+// at the watchdog's and the power-on state machine's bases on the chip, or
+// simulated registers in a desktop test. The chip packages hand out a
+// `Watchdog`, the countdown on the chip. Both implement hal.Watchdog.
+//
+// Which reset was the watchdog's. The boot ROM also resets through the
+// watchdog: when it restarts into the bootloader, and when it starts new
+// firmware after flashing. Like the Pico SDK, `start` therefore marks the
+// watchdog as started by the program, in a scratch register the boot ROM
+// overwrites when it resets the chip itself. `reset_reason` reports Timeout
+// or Restart only when that mark is there. The chip packages' take() reads
+// the reason once and clears the mark, and their `reboot_to_bootloader`
+// clears it too. A timeout reported after flashing new firmware is
+// therefore a real one.
+
+// Watchdog registers.
+const CTRL: usize = 0x00
+const LOAD: usize = 0x04
+const REASON: usize = 0x08
+const SCRATCH0: usize = 0x0C
+// The scratch register the Pico SDK and the boot ROM keep their marks in.
+const MARK: usize = SCRATCH0 + 4 * 4
+
+// The power-on state machine's WDSEL: which blocks a watchdog reset resets.
+const WDSEL: usize = 0x08
+
+// Atomic register aliases (RP2040 datasheet 2.1.2).
+const SET_ALIAS: usize = 0x2000
+const CLEAR_ALIAS: usize = 0x3000
+
+// CTRL: reset now, count down, pause while the cores or the JTAG port are
+// halted by a debugger, and the count that remains.
+const TRIGGER: u32 = 1 << 31
+const ENABLE: u32 = 1 << 30
+const PAUSE: u32 = 0b111 << 24
+const TIME: u32 = 0xFF_FFFF
+
+// REASON: the last reset was a timeout, or a trigger.
+const REASON_TIMER: u32 = 1 << 0
+const REASON_FORCE: u32 = 1 << 1
+
+// The Pico SDK's WATCHDOG_NON_REBOOT_MAGIC, so its tools read the mark too.
+const STARTED: u32 = 0x6AB7_3121
+
+// The largest count LOAD takes.
+const MAX_LOAD: u32 = 0xFF_FFFF
+
+// Every block but the ring and crystal oscillators: bits 2 to 16 of the
+// RP2040's WDSEL, and bits 0, 1, and 4 to 24 of the RP2350's.
+const RP2040_RESETS: u32 = 0x0001_FFFC
+const RP2350_RESETS: u32 = 0x01FF_FFF3
+
+// Chips, for `Countdown.new` and `Watchdog.at`.
+pub const RP2040: u32 = 2040
+pub const RP2350: u32 = 2350
+
+// The words `scratch` and `set_scratch` reach: SCRATCH2 and 3 on the
+// RP2040, SCRATCH0 and 1 on the RP2350. The boot ROMs keep their reboot
+// parameters in the others.
+pub const SCRATCH_WORDS: u32 = 2
+
+// The longest timeout `start` accepts on `chip`, in milliseconds.
+pub fn max_timeout_ms(chip: u32) -> u32 {
+    return MAX_LOAD / ticks_per_us(chip) / 1000
+}
+
+// How far the count drops per microsecond.
+fn ticks_per_us(chip: u32) -> u32 {
+    if chip == RP2040 {
+        return 2
+    }
+    return 1
+}
+
+// Reason codes: Other, Timeout, and Restart.
+const OTHER: u32 = 0
+const TIMEOUT: u32 = 1
+const RESTART: u32 = 2
+
+// The watchdog over any hal.Registers. Implements hal.Watchdog.
+pub struct Countdown<R: hal.Registers>: hal.Watchdog {
+    registers: R
+    select: R
+    chip: u32
+    // The timeout `start` was last given, 0 before.
+    timeout_ms: u32
+    // Why the chip last reset, read by `new`.
+    reason: u32
+
+    // The watchdog of `chip`, RP2040 or RP2350, with `registers` its
+    // registers and `select` the power-on state machine's. It is stopped,
+    // and the reason for the last reset is read and its mark cleared.
+    // SAFETY: the watchdog's tick must run at 1 MHz, and only this
+    // Countdown may use the watchdog's CTRL, LOAD, REASON, and SCRATCH
+    // registers and the state machine's WDSEL. (The RP2040's tick
+    // generator, at the end of its watchdog's registers, is not touched.)
+    pub unsafe fn new(registers: R, select: R, chip: u32) -> Countdown<R> {
+        core.assert(chip == RP2040 || chip == RP2350)
+        registers.write(CTRL + CLEAR_ALIAS, ENABLE)
+        cause := registers.read(REASON)
+        reason := OTHER
+        if registers.read(MARK) == STARTED {
+            if (cause & REASON_FORCE) != 0 {
+                reason = RESTART
+            } else if (cause & REASON_TIMER) != 0 {
+                reason = TIMEOUT
+            }
+            registers.write(MARK, 0)
+        }
+        return Countdown<R> { registers, select, chip, timeout_ms: 0, reason }
+    }
+
+    // Start counting down from `timeout_ms` milliseconds, or restart with
+    // this timeout if it runs already. InvalidInput for 0 or more than
+    // max_timeout_ms().
+    pub fn start(&mut self, timeout_ms: u32) -> void!hal.Error {
+        if timeout_ms == 0 || timeout_ms > self.max_timeout_ms() {
+            return err(hal.Error.InvalidInput)
+        }
+        self.registers.write(CTRL + CLEAR_ALIAS, ENABLE)
+        self.timeout_ms = timeout_ms
+        self.prepare_reset()
+        self.registers.write(CTRL + SET_ALIAS, PAUSE)
+        self.feed()
+        self.registers.write(CTRL + SET_ALIAS, ENABLE)
+        return ok()
+    }
+
+    // Count down from the timeout again. Does nothing before `start`.
+    pub fn feed(&mut self) {
+        if self.timeout_ms != 0 {
+            load := self.timeout_ms * 1000 * ticks_per_us(self.chip)
+            self.registers.write(LOAD, load)
+        }
+    }
+
+    // Stop counting down. The chip is no longer reset, until `start`.
+    pub fn stop(&mut self) {
+        self.registers.write(CTRL + CLEAR_ALIAS, ENABLE)
+    }
+
+    // True from `start` until `stop`.
+    pub fn is_running(&mut self) -> bool {
+        return (self.registers.read(CTRL) & ENABLE) != 0
+    }
+
+    // The timeout `start` was last given, in milliseconds; 0 before.
+    pub fn timeout_ms(&self) -> u32 {
+        return self.timeout_ms
+    }
+
+    // The longest timeout `start` accepts: 8388 ms on the RP2040 and
+    // 16777 ms on the RP2350.
+    pub fn max_timeout_ms(&self) -> u32 {
+        return max_timeout_ms(self.chip)
+    }
+
+    // Microseconds until the watchdog resets the chip, if it is running.
+    pub fn remaining_us(&mut self) -> u32 {
+        return (self.registers.read(CTRL) & TIME) / ticks_per_us(self.chip)
+    }
+
+    // Why the chip last reset: Timeout if this watchdog was not fed in
+    // time, Restart after `restart`, and Other after power-up, the RUN pin,
+    // a debugger, or the boot ROM.
+    pub fn reset_reason(&self) -> hal.ResetReason {
+        if self.reason == TIMEOUT {
+            return hal.ResetReason.Timeout
+        } else if self.reason == RESTART {
+            return hal.ResetReason.Restart
+        }
+        return hal.ResetReason.Other
+    }
+
+    // Scratch word `index`, below SCRATCH_WORDS: whatever the program last
+    // stored there, before or after a watchdog reset; 0 after power-up.
+    // Traps for another index.
+    pub fn scratch(&mut self, index: u32) -> u32 {
+        offset := self.scratch_offset(index)
+        return self.registers.read(offset)
+    }
+
+    // Store `value` in scratch word `index`, below SCRATCH_WORDS, where it
+    // survives a watchdog reset. Traps for another index.
+    pub fn set_scratch(&mut self, index: u32, value: u32) {
+        offset := self.scratch_offset(index)
+        self.registers.write(offset, value)
+    }
+
+    // Reset the chip through the watchdog now, as a timeout would but at
+    // once, whether it is running or not. reset_reason() then reads
+    // Restart. On the chip the reset follows the write; this returns only
+    // to a simulation.
+    pub fn restart(&mut self) {
+        self.prepare_reset()
+        self.registers.write(CTRL + SET_ALIAS, TRIGGER)
+    }
+
+    // Select what a watchdog reset resets, and mark the next one as the
+    // program's.
+    fn prepare_reset(&mut self) {
+        resets := RP2350_RESETS
+        if self.chip == RP2040 {
+            resets = RP2040_RESETS
+        }
+        self.select.write(WDSEL, resets)
+        self.registers.write(MARK, STARTED)
+    }
+
+    fn scratch_offset(&self, index: u32) -> usize {
+        core.assert(index < SCRATCH_WORDS)
+        first := 0u32
+        if self.chip == RP2040 {
+            first = 2
+        }
+        return SCRATCH0 + 4 * (first + index) as usize
+    }
+}
+
+// Forget the mark that makes the next watchdog reset the program's, so that
+// a reset through the boot ROM reads as Other. The chip packages'
+// reboot_to_bootloader does this before it calls the ROM.
+// SAFETY: `watchdog_base` must be the chip's watchdog, and the caller must
+// reset the chip before the program uses its Watchdog again.
+pub unsafe fn clear_mark(watchdog_base: usize) {
+    unsafe {
+        mark: hal.Reg<u32> = hal.Reg.at(watchdog_base + MARK)
+        mark.write(0)
+    }
+}
+
+// The watchdog on the chip: a Countdown over the watchdog's and the power-on
+// state machine's registers, which the chip packages hand out. Implements
+// hal.Watchdog.
+pub struct Watchdog: hal.Watchdog {
+    countdown: Countdown<hal.RegisterBlock>
+
+    // Countdown.new over the watchdog at `watchdog_base` and the power-on
+    // state machine at `psm_base`.
+    // SAFETY: as for Countdown.new, with the bases those of `chip`.
+    pub unsafe fn at(chip: u32, watchdog_base: usize, psm_base: usize) -> Watchdog {
+        unsafe {
+            registers := hal.RegisterBlock.at(watchdog_base)
+            select := hal.RegisterBlock.at(psm_base)
+            return Watchdog { countdown: Countdown.new(registers, select, chip) }
+        }
+    }
+
+    pub fn start(&mut self, timeout_ms: u32) -> void!hal.Error {
+        return self.countdown.start(timeout_ms)
+    }
+
+    pub fn feed(&mut self) {
+        self.countdown.feed()
+    }
+
+    pub fn stop(&mut self) {
+        self.countdown.stop()
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        return self.countdown.is_running()
+    }
+
+    pub fn timeout_ms(&self) -> u32 {
+        return self.countdown.timeout_ms()
+    }
+
+    pub fn max_timeout_ms(&self) -> u32 {
+        return self.countdown.max_timeout_ms()
+    }
+
+    pub fn remaining_us(&mut self) -> u32 {
+        return self.countdown.remaining_us()
+    }
+
+    pub fn reset_reason(&self) -> hal.ResetReason {
+        return self.countdown.reset_reason()
+    }
+
+    pub fn scratch(&mut self, index: u32) -> u32 {
+        return self.countdown.scratch(index)
+    }
+
+    pub fn set_scratch(&mut self, index: u32, value: u32) {
+        self.countdown.set_scratch(index, value)
+    }
+
+    // Reset the chip through the watchdog now. Does not return.
+    pub fn restart(&mut self) {
+        self.countdown.restart()
+        for {}
+    }
+}
