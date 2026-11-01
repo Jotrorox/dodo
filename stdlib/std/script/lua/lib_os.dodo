@@ -1,7 +1,448 @@
 package lua
 
-// Stub: replaced by the os library implementation.
+import "core/mem"
+import "core/ptr"
+import "std/script/native" as script_host
+
+// The os library (Lua 5.4 manual §6.9). Calendar conversions go through the
+// C library (localtime/gmtime/mktime/strftime) via std/script's host
+// boundary, which also hides the per-OS differences of processes, locales
+// and temporary names.
+
+unsafe extern "C" fn remove(path: *const u8) -> i32
+unsafe extern "C" fn rename(from_path: *const u8, to_path: *const u8) -> i32
+unsafe extern "C" fn exit(status: i32)
+
+// Bytes reserved for one strftime conversion (the reference's SIZETIMEFMT).
+const OS_TIME_FORMAT_SIZE: usize = 250
+
+// Indices of the broken-down time fields exchanged with the host boundary.
+const OS_SEC: usize = 0
+const OS_MIN: usize = 1
+const OS_HOUR: usize = 2
+const OS_MDAY: usize = 3
+const OS_MON: usize = 4
+const OS_YEAR: usize = 5
+const OS_WDAY: usize = 6
+const OS_YDAY: usize = 7
+const OS_ISDST: usize = 8
+
+const OS_INT_MAX: i64 = 2147483647
+const OS_INT_MIN: i64 = -2147483648
+
+// Opaque storage for a C struct tm (the host boundary checks that it fits).
+struct OsTm {
+    words: [16]u64
+
+    fn new() -> OsTm {
+        return OsTm { words: [0u64; 16] }
+    }
+    fn raw(&mut self) -> *mut u8 {
+        unsafe {
+            return ptr.as_mut_ptr(&mut self.words) as *mut u8
+        }
+    }
+}
+
+// i64 -> C int with wrap-around, like a C cast.
+fn os_to_c_int(v: i64) -> i32 {
+    let low = v & 0xffffffff
+    if low > OS_INT_MAX {
+        return (low - 4294967296) as i32
+    }
+    return low as i32
+}
+
+// --- Processes and the environment ------------------------------------------
+
+fn os_execute(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        if cx.is_none_or_nil(1) {
+            cx.push_boolean(script_host.dodo_script_has_shell() != 0)
+            return ok(1)
+        }
+        let cmd = cx.check_lstr(1)?
+        exited := 0i32
+        code := 0i32
+        if script_host.dodo_script_system(cmd.as_ptr(), ptr.from_mut(&mut exited), ptr.from_mut(&mut code)) == 0 {
+            return cx.file_result(false, none)
+        }
+        return cx.exec_result(exited != 0, code as i64)
+    }
+}
+
+fn os_exit(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        status := 0i32
+        if cx.is_boolean(1) {
+            status = if cx.to_boolean(1) {
+                0i32
+            } else {
+                1i32
+            }
+        } else {
+            status = os_to_c_int(cx.opt_integer(1, 0)?)
+        }
+        if cx.to_boolean(2) {
+            // Close the state first: pending to-be-closed variables of the
+            // main thread, then every finalizer.
+            state_close(cx.L)
+        }
+        // C exit flushes and closes every stdio stream.
+        exit(status)
+        return ok(0)
+    }
+}
+
+fn os_getenv(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let name = cx.check_lstr(1)?
+        let v = script_host.dodo_script_getenv(name.as_ptr())
+        if ptr.is_null(v) {
+            cx.push_nil()
+        } else {
+            cx.push_raw_bytes(v, strlen(v))?
+        }
+        return ok(1)
+    }
+}
+
+// --- Files ------------------------------------------------------------------
+
+fn os_remove(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let name = cx.check_lstr(1)?
+        script_host.dodo_script_clear_errno()
+        let r = remove(name.as_ptr())
+        return cx.file_result(r == 0, some(io_c_str(name.bytes())))
+    }
+}
+
+fn os_rename(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let src = cx.check_lstr(1)?
+        let dst = cx.check_lstr(2)?
+        script_host.dodo_script_clear_errno()
+        let r = rename(src.as_ptr(), dst.as_ptr())
+        return cx.file_result(r == 0, none)
+    }
+}
+
+fn os_tmpname(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        buf := [0u8; 512]
+        if script_host.dodo_script_tmpname(ptr.as_mut_ptr(&mut buf), buf.len) == 0 {
+            return err(cx.error_msg("unable to generate a unique filename"))
+        }
+        let p = ptr.as_ptr(&buf)
+        cx.push_raw_bytes(p, strlen(p))?
+        return ok(1)
+    }
+}
+
+// --- Locale and clock -------------------------------------------------------
+
+fn os_setlocale(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        locale := 0 as *const u8
+        if !cx.is_none_or_nil(1) {
+            let l = cx.check_lstr(1)?
+            locale = l.as_ptr()
+        }
+        let names = ["all", "collate", "ctype", "monetary", "numeric", "time"]
+        let category = cx.check_option(2, "all", &names)?
+        let r = script_host.dodo_script_setlocale(category, locale)
+        if ptr.is_null(r) {
+            cx.push_nil()
+        } else {
+            cx.push_raw_bytes(r, strlen(r))?
+        }
+        return ok(1)
+    }
+}
+
+fn os_clock(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        cx.push_number(script_host.dodo_script_clock())
+        return ok(1)
+    }
+}
+
+// --- Dates ------------------------------------------------------------------
+
+// A time_t argument.
+fn os_check_time(cx: &mut Cx, arg: i32) -> i64!Throw {
+    return cx.check_integer(arg)
+}
+
+fn os_set_int_field(cx: &mut Cx, key: &str, value: i32, delta: i64) -> void!Throw {
+    cx.push_integer(value as i64 + delta)
+    return cx.set_field(-2, key)
+}
+
+// Store the broken-down time `f` into the table on top.
+fn os_set_all_fields(cx: &mut Cx, f: &[9]i32) -> void!Throw {
+    os_set_int_field(cx, "year", f[OS_YEAR], 1900)?
+    os_set_int_field(cx, "month", f[OS_MON], 1)?
+    os_set_int_field(cx, "day", f[OS_MDAY], 0)?
+    os_set_int_field(cx, "hour", f[OS_HOUR], 0)?
+    os_set_int_field(cx, "min", f[OS_MIN], 0)?
+    os_set_int_field(cx, "sec", f[OS_SEC], 0)?
+    os_set_int_field(cx, "yday", f[OS_YDAY], 1)?
+    os_set_int_field(cx, "wday", f[OS_WDAY], 1)?
+    if f[OS_ISDST] >= 0 {
+        cx.push_boolean(f[OS_ISDST] != 0)
+        cx.set_field(-2, "isdst")?
+    }
+    return ok()
+}
+
+fn os_field_error(cx: &mut Cx, key: &str, what: &str) -> Throw {
+    b := Buffer.new(cx)
+    match os_field_error_text(&mut b, key, what) {
+        ok() => {},
+        err(e) => {
+            return e
+        },
+    }
+    return cx.error_buffer(&mut b)
+}
+
+fn os_field_error_text(b: &mut Buffer, key: &str, what: &str) -> void!Throw {
+    b.add_str("field '")?
+    b.add_str(key)?
+    b.add_str("' ")?
+    return b.add_str(what)
+}
+
+// Field `key` of the table on top, minus delta; `def` < 0 means required.
+fn os_get_field(cx: &mut Cx, key: &str, def: i32, delta: i64) -> i32!Throw {
+    let t = cx.get_field(-1, key)?
+    match cx.to_integer(-1) {
+        some(v) => {
+            let fits = if v >= 0 {
+                v - delta <= OS_INT_MAX
+            } else {
+                OS_INT_MIN + delta <= v
+            }
+            if !fits {
+                return err(os_field_error(cx, key, "is out-of-bound"))
+            }
+            cx.pop(1)
+            return ok((v - delta) as i32)
+        },
+        none => {
+            if t != TNIL {
+                return err(os_field_error(cx, key, "is not an integer"))
+            }
+            if def < 0 {
+                return err(os_field_error(cx, key, "missing in date table"))
+            }
+            cx.pop(1)
+            return ok(def)
+        },
+    }
+}
+
+// isdst field: -1 when absent, else its truth value.
+fn os_get_bool_field(cx: &mut Cx, key: &str) -> i32!Throw {
+    r := -1i32
+    if cx.get_field(-1, key)? != TNIL {
+        r = if cx.to_boolean(-1) {
+            1i32
+        } else {
+            0i32
+        }
+    }
+    cx.pop(1)
+    return ok(r)
+}
+
+fn os_valid_conversion(conv: &[u8], at: usize) -> usize {
+    // Length of the valid strftime conversion starting at conv[at], or 0.
+    let single = mem.str_bytes(script_host.STRFTIME_SINGLE)
+    let double = mem.str_bytes(script_host.STRFTIME_DOUBLE)
+    let left = conv.len - at
+    if left >= 1 {
+        for i in 0usize..single.len {
+            if single[i] == conv[at] {
+                return 1
+            }
+        }
+    }
+    if left >= 2 {
+        i := 0usize
+        for i + 1 < double.len {
+            if double[i] == conv[at] && double[i + 1] == conv[at + 1] {
+                return 2
+            }
+            i += 2
+        }
+    }
+    return 0
+}
+
+// Raise "invalid conversion specifier '%<rest>'" (the rest up to a NUL).
+fn os_conversion_error(cx: &mut Cx, fmt: &[u8], at: usize) -> Throw {
+    b := Buffer.new(cx)
+    match b.add_str("invalid conversion specifier '%") {
+        ok() => {},
+        err(e) => {
+            return e
+        },
+    }
+    i := at
+    for i < fmt.len && fmt[i] != 0 {
+        match b.add_char(fmt[i]) {
+            ok() => {},
+            err(e) => {
+                return e
+            },
+        }
+        i += 1
+    }
+    match b.add_str("'") {
+        ok() => {},
+        err(e) => {
+            return e
+        },
+    }
+    let n = b.size()
+    unsafe {
+        return cx.arg_error_bytes(1, ptr.borrow_slice(ptr.as_ptr(b.bytes()), n, &b))
+    }
+}
+
+// The rest of fmt from `at` up to a NUL is exactly "*t".
+fn os_is_table_format(fmt: &[u8], at: usize) -> bool {
+    let n = io_c_length(fmt)
+    return n == at + 2 && fmt[at] == b'*' && fmt[at + 1] == b't'
+}
+
+fn os_date(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        let fs = cx.opt_lstr(1, b"%c")?
+        let fmt = fs.bytes()
+        t := 0i64
+        if cx.is_none_or_nil(2) {
+            t = script_host.dodo_script_time()
+        } else {
+            t = os_check_time(cx, 2)?
+        }
+        at := 0usize
+        utc := 0i32
+        if fmt.len > 0 && fmt[0] == b'!' {
+            utc = 1
+            at = 1
+        }
+        tm := OsTm.new()
+        if script_host.dodo_script_broken_down(t, utc, tm.raw()) == 0 {
+            return err(cx.error_msg("date result cannot be represented in this installation"))
+        }
+        if os_is_table_format(fmt, at) {
+            fields := [0i32; 9]
+            script_host.dodo_script_tm_get(tm.raw() as *const u8, ptr.as_mut_ptr(&mut fields))
+            cx.create_table(0, 9)?
+            os_set_all_fields(cx, &fields)?
+            return ok(1)
+        }
+        b := Buffer.new(cx)
+        spec := [0u8; 4]
+        spec[0] = b'%'
+        i := at
+        for i < fmt.len {
+            if fmt[i] != b'%' {
+                b.add_char(fmt[i])?
+                i += 1
+                continue
+            }
+            i += 1
+            let n = os_valid_conversion(fmt, i)
+            if n == 0 {
+                return err(os_conversion_error(cx, fmt, i))
+            }
+            spec[1] = fmt[i]
+            spec[2] = if n == 2 {
+                fmt[i + 1]
+            } else {
+                0u8
+            }
+            spec[3] = 0
+            i += n
+            let out = b.prepare(OS_TIME_FORMAT_SIZE)?
+            let written = script_host.dodo_script_strftime(out, OS_TIME_FORMAT_SIZE, ptr.as_ptr(&spec), tm.raw() as *const u8)
+            b.add_size(written)
+        }
+        b.push_result(cx)?
+        return ok(1)
+    }
+}
+
+fn os_time(cx: &mut Cx) -> i32!Throw {
+    unsafe {
+        t := 0i64
+        if cx.is_none_or_nil(1) {
+            t = script_host.dodo_script_time()
+            if t == -1 {
+                return err(cx.error_msg("time result cannot be represented in this installation"))
+            }
+            cx.push_integer(t)
+            return ok(1)
+        }
+        cx.check_type(1, TTABLE)?
+        cx.set_top(1)
+        fields := [0i32; 9]
+        fields[OS_YEAR] = os_get_field(cx, "year", -1, 1900)?
+        fields[OS_MON] = os_get_field(cx, "month", -1, 1)?
+        fields[OS_MDAY] = os_get_field(cx, "day", -1, 0)?
+        fields[OS_HOUR] = os_get_field(cx, "hour", 12, 0)?
+        fields[OS_MIN] = os_get_field(cx, "min", 0, 0)?
+        fields[OS_SEC] = os_get_field(cx, "sec", 0, 0)?
+        fields[OS_ISDST] = os_get_bool_field(cx, "isdst")?
+        tm := OsTm.new()
+        script_host.dodo_script_tm_set(tm.raw(), ptr.as_ptr(&fields))
+        good := 0i32
+        t = script_host.dodo_script_mktime(tm.raw(), ptr.from_mut(&mut good))
+        // Store the normalized fields back into the table.
+        script_host.dodo_script_tm_get(tm.raw() as *const u8, ptr.as_mut_ptr(&mut fields))
+        os_set_all_fields(cx, &fields)?
+        if good == 0 {
+            return err(cx.error_msg("time result cannot be represented in this installation"))
+        }
+        cx.push_integer(t)
+        return ok(1)
+    }
+}
+
+fn os_difftime(cx: &mut Cx) -> i32!Throw {
+    let t1 = os_check_time(cx, 1)?
+    let t2 = os_check_time(cx, 2)?
+    // Exact when the difference fits, like difftime.
+    let d = core.wrapping_sub(t1, t2)
+    let overflow = (t1 >= 0) != (t2 >= 0) && (d >= 0) != (t1 >= 0)
+    if overflow {
+        cx.push_number(t1 as f64 - t2 as f64)
+    } else {
+        cx.push_number(d as f64)
+    }
+    return ok(1)
+}
+
+// Open the os library (pushes the os table).
 pub fn open_os(cx: &mut Cx) -> i32!Throw {
-    cx.create_table(0, 0)?
+    let funcs = [
+        ("clock", os_clock),
+        ("date", os_date),
+        ("difftime", os_difftime),
+        ("execute", os_execute),
+        ("exit", os_exit),
+        ("getenv", os_getenv),
+        ("remove", os_remove),
+        ("rename", os_rename),
+        ("setlocale", os_setlocale),
+        ("time", os_time),
+        ("tmpname", os_tmpname),
+    ]
+    cx.new_lib(&funcs)?
     return ok(1)
 }
