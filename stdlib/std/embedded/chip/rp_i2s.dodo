@@ -1,0 +1,900 @@
+package rp_i2s
+
+import "std/embedded/chip/rp_pio"
+import "std/embedded/hal"
+
+// I2S audio on the RP2040 and RP2350, which have no I2S peripheral, by PIO:
+// one state machine runs a program that makes the bit clock (BCLK) and word
+// select (LRCLK) and shifts the data line. `Output` plays samples to a DAC
+// or amplifier (such as the PCM5102 or MAX98357A) and implements
+// hal.I2sOutput; `Input` records a microphone or ADC (such as the INMP441)
+// and implements hal.I2sInput. Both are the controller (master) of the bus:
+// they drive BCLK and LRCLK, the device only the data line on input.
+//
+// Wiring. BCLK is GPIO `clock` and LRCLK the GPIO after it, `clock + 1`,
+// since the program drives them by side-set; DATA is any other GPIO. Give
+// all three to the PIO block before creating the stream:
+//
+//     pio := b.pins.pio(0)!
+//     b.pins.pio_pins(&pio, 10, 2)!        // BCLK on GPIO 10, LRCLK on 11
+//     b.pins.pio_pins(&pio, 9, 1)!         // DATA on GPIO 9
+//     config := rp_i2s.Config.new(48_000, 16, 2, hal.I2sFormat.Philips)
+//     output := rp_i2s.Output.new(&mut pio, 9, 10, &config)!
+//     hal.write_samples(&mut output, &samples, hal.NO_POLL_LIMIT)!
+//
+// Framing. Every frame carries two slots on the wire, left then right,
+// whatever the stream's channel count: a mono output sends each sample in
+// both slots, and a mono input keeps the slot Config.channel names. A slot
+// is 32 bit clocks, or 16 for 16-bit samples with Config.slot_bits = 16, so
+// the bit clock runs at sample_rate * 2 * slot_bits: 3.072 MHz for 48 kHz
+// in 32-bit slots. Samples go most significant bit first; a 24-bit sample
+// in a 32-bit slot is followed by eight zero bits (Philips and left
+// justified) or preceded by eight copies of its sign bit (right justified).
+// Word select is low for the left slot in Philips framing and high for it
+// in left- and right-justified framing; data changes on the falling edge
+// of BCLK and is sampled on the rising edge.
+//
+// Clock. The state machine runs four instructions per bit clock, so its
+// clock is 8 * slot_bits * sample_rate, which the PIO's fractional divider
+// makes from clk_sys in steps of 1/256 (`timing`): the rate is exact only
+// where clk_sys divides evenly, and otherwise off by up to a few hundred
+// parts per million, with the divider's jitter of one clk_sys cycle on
+// each edge (Timing.error_ppm). At a clk_sys of 125 MHz, 32-bit slots
+// reach from 8 Hz to 488 kHz.
+//
+// Queues. The state machine's two FIFOs are joined into one of eight
+// words in the stream's direction. Each 32-bit slot takes a word, and a
+// frame of two 16-bit slots one word, so the queue holds four frames, or
+// eight in 16-bit slots: at 48 kHz, 83 or 167 microseconds. Programs keep
+// it topped up from a fast poll or a timer, or play a buffer by DMA with
+// Output.dma.
+//
+// Running dry and overrunning. The output never stalls its clocks: once a
+// frame boundary finds fewer than a whole frame queued, the program sends
+// zeros, a frame at a time, until whole frames are queued again, so left
+// and right never trade places. The input does stall: when the processor
+// has not read the queue in time, the program stops the clocks with a
+// sample waiting until there is room, which keeps the channels in order;
+// poll_read then reports hal.Error.Overrun once, dropping what was queued.
+// Some microphones sleep while their clock stops and send zeros for a few
+// milliseconds after it restarts.
+//
+// Programs. The output takes 17 of the block's 32 instruction slots in
+// 32-bit slots and 10 in 16-bit slots, the input 8, so an output and an
+// input fit one block. `output_program` and `input_program` return them;
+// they are encoded here rather than assembled with rp_pio.assemble so the
+// package also builds for desktop tests, and the comments above them give
+// their source. `release` stops the stream, gives back its state machine,
+// and unloads its program; the pins stay with the block.
+
+// The instructions the programs use (RP2040 datasheet 3.4), without the
+// side-set and delay field in bits 12 to 8.
+const JMP: u16 = 0x0000
+const JMP_NOT_X: u16 = 0x0020
+const JMP_Y_DEC: u16 = 0x0080
+const IN_PINS_1: u16 = 0x4001
+const OUT_PINS_1: u16 = 0x6001
+const PULL_NOBLOCK: u16 = 0x8080
+const PULL_BLOCK: u16 = 0x80A0
+const MOV_X_STATUS: u16 = 0xA025
+const SET_Y: u16 = 0xE040
+// Instructions executed before a program starts: `mov osr, null`,
+// `mov x, ~null`, and `set x, 0`.
+const MOV_OSR_NULL: u16 = 0xA0E3
+const MOV_X_ONES: u16 = 0xA02B
+const SET_X_ZERO: u16 = 0xE020
+
+// The joined FIFO's depth, in words.
+pub const FIFO_DEPTH: u32 = 8
+// State machine cycles per bit clock.
+pub const CYCLES_PER_BIT: u32 = 4
+
+// The divider's range, in 256ths of clk_sys.
+const MIN_DIVIDER: u64 = 256
+const MAX_DIVIDER: u64 = 0xFF_FFFF
+
+// The slot a mono input keeps.
+pub enum Channel {
+    Left,
+    Right
+}
+
+// A stream's settings, for Output.new and Input.new.
+pub struct Config {
+    // Frames per second.
+    pub sample_rate: u32
+    // Bits per sample: 16, 24, or 32.
+    pub bits: u32
+    // Samples per frame in the slices the program passes: 1 or 2. The
+    // wire always carries two slots.
+    pub channels: u32
+    pub format: hal.I2sFormat
+    // Bit clocks per slot: 32, or 16 for 16-bit samples, which halves the
+    // bit clock and doubles the frames the queue holds. Most devices accept
+    // both; some, such as the INMP441, need 32.
+    pub slot_bits: u32
+    // The slot a mono input keeps; the other is dropped.
+    pub channel: Channel
+
+    // `sample_rate` frames per second of `channels` samples of `bits` bits,
+    // framed as `format`, in 32-bit slots, a mono input keeping the left
+    // slot.
+    pub fn new(sample_rate: u32, bits: u32, channels: u32, format: hal.I2sFormat) -> Config {
+        return Config { sample_rate, bits, channels, format, slot_bits: 32, channel: Channel.Left }
+    }
+}
+
+// A stream's clock: the state machine's divider of clk_sys and the sample
+// rate it gives, from `timing`.
+pub struct Timing {
+    // clk_sys, in hertz.
+    pub clock_hz: u32
+    // The sample rate asked for.
+    pub sample_rate: u32
+    pub slot_bits: u32
+    // The divider of clk_sys in 256ths, 256 to 0xFF_FFFF.
+    pub divider: u32
+
+    // The sample rate the divider gives, in millihertz.
+    pub fn actual_millihertz(&self) -> u64 {
+        cycles := self.divider as u64 * self.frame_cycles()
+        return (self.clock_hz as u64 * 256_000 + cycles / 2) / cycles
+    }
+
+    // The sample rate the divider gives, rounded to whole hertz.
+    pub fn actual_rate(&self) -> u32 {
+        return ((self.actual_millihertz() + 500) / 1000) as u32
+    }
+
+    // How far the actual rate is from the rate asked for, in parts per
+    // million, rounded: positive when it runs fast.
+    pub fn error_ppm(&self) -> i32 {
+        wanted := self.sample_rate as i64 * self.divider as i64 * self.frame_cycles() as i64
+        given := self.clock_hz as i64 * 256
+        difference := (given - wanted) * 1_000_000
+        if difference < 0 {
+            return -((-difference + wanted / 2) / wanted) as i32
+        }
+        return ((difference + wanted / 2) / wanted) as i32
+    }
+
+    // The bit clock the divider gives, rounded to whole hertz.
+    pub fn bit_clock_hz(&self) -> u32 {
+        cycles := self.divider as u64 * CYCLES_PER_BIT as u64
+        return ((self.clock_hz as u64 * 256 + cycles / 2) / cycles) as u32
+    }
+
+    pub fn copy(&self) -> Timing {
+        return Timing { clock_hz: self.clock_hz, sample_rate: self.sample_rate, slot_bits: self.slot_bits, divider: self.divider }
+    }
+
+    // State machine cycles per frame.
+    fn frame_cycles(&self) -> u64 {
+        return (2 * self.slot_bits * CYCLES_PER_BIT) as u64
+    }
+}
+
+// The divider closest to `sample_rate` frames per second in slots of
+// `slot_bits` (16 or 32) from a clk_sys of `clock_hz`. InvalidInput for a
+// rate the divider cannot reach or another slot width.
+pub fn timing(clock_hz: u32, sample_rate: u32, slot_bits: u32) -> Timing!hal.Error {
+    if sample_rate == 0 || (slot_bits != 16 && slot_bits != 32) {
+        return err(hal.Error.InvalidInput)
+    }
+    cycles := sample_rate as u64 * (2 * slot_bits * CYCLES_PER_BIT) as u64
+    divider := (clock_hz as u64 * 256 + cycles / 2) / cycles
+    if divider < MIN_DIVIDER || divider > MAX_DIVIDER {
+        return err(hal.Error.InvalidInput)
+    }
+    return ok(Timing { clock_hz, sample_rate, slot_bits, divider: divider as u32 })
+}
+
+// The side-set and delay field: LRCLK level `select`, BCLK level `clock`,
+// and `delay` extra cycles.
+fn side(select: u32, clock: u32, delay: u32) -> u16 {
+    return (((select << 12) | (clock << 11) | (delay << 8)) & 0x1F00) as u16
+}
+
+// LRCLK's level in each part of a frame for `format`: the left slot's,
+// the right slot's, and during the left slot's and the right slot's last
+// bit, which Philips framing sends with the next slot's level.
+struct Levels {
+    left: u32
+    right: u32
+    left_last: u32
+    right_last: u32
+}
+
+fn levels(format: &hal.I2sFormat) -> Levels {
+    match format {
+        hal.I2sFormat.Philips => {
+            return Levels { left: 0, right: 1, left_last: 1, right_last: 0 }
+        }
+        _ => {
+            return Levels { left: 1, right: 0, left_last: 1, right_last: 0 }
+        }
+    }
+}
+
+fn is_philips(format: &hal.I2sFormat) -> bool {
+    match format {
+        hal.I2sFormat.Philips => {
+            return true
+        }
+        _ => {
+            return false
+        }
+    }
+}
+
+fn is_right_justified(format: &hal.I2sFormat) -> bool {
+    match format {
+        hal.I2sFormat.RightJustified => {
+            return true
+        }
+        _ => {
+            return false
+        }
+    }
+}
+
+// A program of the first `length` of `words` with two side-set bits.
+fn program(words: [32]u16, length: u32) -> rp_pio.Program {
+    return rp_pio.Program {
+        instructions: words,
+        length,
+        origin: rp_pio.ANYWHERE,
+        wrap_target: 0,
+        wrap: length - 1,
+        side_set_count: 2,
+        side_set_optional: false,
+        side_set_pindirs: false,
+        version: 0,
+        clock_divider: 256,
+        fifo: rp_pio.FIFO_TXRX,
+        status_select: 0,
+        status_n: 0,
+        in_count: 32,
+        in_right: true,
+        autopush: false,
+        push_threshold: 32,
+        out_count: 0,
+        out_right: true,
+        autopull: false,
+        pull_threshold: 32,
+        set_count: 0,
+    }
+}
+
+// The output program for `format` in slots of `slot_bits`, 16 or 32;
+// InvalidInput for another width. In 32-bit slots, for Philips framing
+// (left-justified framing has LRCLK high in the left slot and low in the
+// right, throughout each slot):
+//
+//     .side_set 2                     ; LRCLK, BCLK
+//     .out 1 left
+//     .fifo tx
+//     .mov_status txfifo < 2          ; x: all ones while no whole frame
+//     .wrap_target
+//         out pins, 1    side 0b00 [1]    ; left bit 31
+//         set y, 29      side 0b01 [1]
+//     lbits:
+//         out pins, 1    side 0b00 [1]    ; bits 30 to 1
+//         jmp y-- lbits  side 0b01 [1]
+//         out pins, 1    side 0b10        ; bit 0, under the right's LRCLK
+//         jmp !x take_right side 0b10
+//         jmp right_msb  side 0b11 [1]    ; no frame: the right sends zeros
+//     take_right:
+//         pull block     side 0b11 [1]
+//     right_msb:
+//         out pins, 1    side 0b10 [1]    ; right bit 31
+//         set y, 29      side 0b11
+//         mov x, status  side 0b11        ; a whole frame queued?
+//     rbits:
+//         out pins, 1    side 0b10 [1]
+//         jmp y-- rbits  side 0b11 [1]
+//         out pins, 1    side 0b00
+//         jmp !x take_left side 0b00
+//         jmp 0          side 0b01 [1]    ; no frame: send zeros
+//     take_left:
+//         pull block     side 0b01 [1]
+//     .wrap
+//
+// Each bit takes four cycles, BCLK low for two and high for two. The OSR
+// shifts left and fills with zeros, so a slot that pulled nothing sends
+// zeros; the program pulls a frame's two words only when both are queued,
+// deciding once a frame with `mov x, status`, and so never stalls. Start
+// it with OSR zero and X all ones. In 16-bit slots a word holds a frame,
+// left in its upper half:
+//
+//     .side_set 2
+//     .out 1 left
+//     .fifo tx
+//     .wrap_target
+//         out pins, 1    side 0b00 [1]    ; left bit 15
+//         set y, 13      side 0b01 [1]
+//     lbits:
+//         out pins, 1    side 0b00 [1]    ; bits 14 to 1
+//         jmp y-- lbits  side 0b01 [1]
+//         out pins, 1    side 0b10 [1]    ; bit 0
+//         set y, 14      side 0b11 [1]
+//     rbits:
+//         out pins, 1    side 0b10 [1]    ; bits 15 to 1
+//         jmp y-- rbits  side 0b11 [1]
+//         out pins, 1    side 0b00 [1]    ; bit 0
+//         pull noblock   side 0b01 [1]    ; the next frame, or X: zero
+//     .wrap
+//
+// Start it with OSR and X zero.
+pub fn output_program(format: &hal.I2sFormat, slot_bits: u32) -> rp_pio.Program!hal.Error {
+    level := levels(format)
+    l := level.left
+    r := level.right
+    ll := level.left_last
+    rl := level.right_last
+    words := [0u16; 32]
+    length := 0u32
+    if slot_bits == 32 {
+        words[0] = OUT_PINS_1 | side(l, 0, 1)
+        words[1] = SET_Y | 29 | side(l, 1, 1)
+        words[2] = OUT_PINS_1 | side(l, 0, 1)
+        words[3] = JMP_Y_DEC | 2 | side(l, 1, 1)
+        words[4] = OUT_PINS_1 | side(ll, 0, 0)
+        words[5] = JMP_NOT_X | 7 | side(ll, 0, 0)
+        words[6] = JMP | 8 | side(ll, 1, 1)
+        words[7] = PULL_BLOCK | side(ll, 1, 1)
+        words[8] = OUT_PINS_1 | side(r, 0, 1)
+        words[9] = SET_Y | 29 | side(r, 1, 0)
+        words[10] = MOV_X_STATUS | side(r, 1, 0)
+        words[11] = OUT_PINS_1 | side(r, 0, 1)
+        words[12] = JMP_Y_DEC | 11 | side(r, 1, 1)
+        words[13] = OUT_PINS_1 | side(rl, 0, 0)
+        words[14] = JMP_NOT_X | 16 | side(rl, 0, 0)
+        words[15] = JMP | 0 | side(rl, 1, 1)
+        words[16] = PULL_BLOCK | side(rl, 1, 1)
+        length = 17
+    } else if slot_bits == 16 {
+        words[0] = OUT_PINS_1 | side(l, 0, 1)
+        words[1] = SET_Y | 13 | side(l, 1, 1)
+        words[2] = OUT_PINS_1 | side(l, 0, 1)
+        words[3] = JMP_Y_DEC | 2 | side(l, 1, 1)
+        words[4] = OUT_PINS_1 | side(ll, 0, 1)
+        words[5] = SET_Y | 14 | side(ll, 1, 1)
+        words[6] = OUT_PINS_1 | side(r, 0, 1)
+        words[7] = JMP_Y_DEC | 6 | side(r, 1, 1)
+        words[8] = OUT_PINS_1 | side(rl, 0, 1)
+        words[9] = PULL_NOBLOCK | side(rl, 1, 1)
+        length = 10
+    } else {
+        return err(hal.Error.InvalidInput)
+    }
+    result := program(words, length)
+    result.fifo = rp_pio.FIFO_TX
+    result.out_count = 1
+    result.out_right = false
+    if slot_bits == 32 {
+        result.status_select = rp_pio.STATUS_TX_LESS
+        result.status_n = 2
+    }
+    return ok(result)
+}
+
+// The input program for `format` in slots of `slot_bits`, 16 or 32;
+// InvalidInput for another width. It makes LRCLK in runs of `slot_bits`
+// bit clocks and shifts in DATA on each rising edge of BCLK; autopush
+// cuts the bits into 32-bit words, which line up with the slots because
+// the program starts at a slot's first bit. In 32-bit slots, for
+// left-justified framing:
+//
+//     .side_set 2                     ; LRCLK, BCLK
+//     .in 32 left auto 32
+//     .fifo rx
+//     .wrap_target
+//         set y, 30      side 0b10 [1]    ; LRCLK high: the left slot
+//     lbits:
+//         in pins, 1     side 0b11 [1]    ; bits 31 to 1
+//         jmp y-- lbits  side 0b10 [1]
+//         in pins, 1     side 0b11 [1]    ; bit 0
+//         set y, 30      side 0b00 [1]    ; LRCLK low: the right slot
+//     rbits:
+//         in pins, 1     side 0b01 [1]
+//         jmp y-- rbits  side 0b00 [1]
+//         in pins, 1     side 0b01 [1]
+//     .wrap
+//
+// Philips framing swaps the levels, LRCLK low for the run that starts with
+// the right slot's last bit, and starts at `lbits` with Y 30, the left
+// slot's first bit; 16-bit slots set Y to 14. A full RX FIFO stalls the
+// autopush, and with it the clocks.
+pub fn input_program(format: &hal.I2sFormat, slot_bits: u32) -> rp_pio.Program!hal.Error {
+    if slot_bits != 16 && slot_bits != 32 {
+        return err(hal.Error.InvalidInput)
+    }
+    level := levels(format)
+    l := level.left
+    r := level.right
+    count := ((slot_bits - 2) & 0x1F) as u16
+    words := [0u16; 32]
+    words[0] = SET_Y | count | side(l, 0, 1)
+    words[1] = IN_PINS_1 | side(l, 1, 1)
+    words[2] = JMP_Y_DEC | 1 | side(l, 0, 1)
+    words[3] = IN_PINS_1 | side(l, 1, 1)
+    words[4] = SET_Y | count | side(r, 0, 1)
+    words[5] = IN_PINS_1 | side(r, 1, 1)
+    words[6] = JMP_Y_DEC | 5 | side(r, 0, 1)
+    words[7] = IN_PINS_1 | side(r, 1, 1)
+    result := program(words, 8)
+    result.fifo = rp_pio.FIFO_RX
+    result.in_right = false
+    result.autopush = true
+    return ok(result)
+}
+
+// The i32 with the bits of `word`, and back. `as` would check the range.
+fn signed(word: u32) -> i32 {
+    if word >= 0x8000_0000 {
+        return -((~word) as i32) - 1
+    }
+    return word as i32
+}
+
+fn unsigned(sample: i32) -> u32 {
+    if sample < 0 {
+        return ~((-(sample + 1)) as u32)
+    }
+    return sample as u32
+}
+
+// The settings both directions check: InvalidInput for a resolution, slot
+// width, channel count, or pins out of range. Returns the timing.
+fn check(clock_hz: u32, data: u32, clock: u32, config: &Config) -> Timing!hal.Error {
+    bits := config.bits
+    if bits != 16 && bits != 24 && bits != 32 {
+        return err(hal.Error.InvalidInput)
+    }
+    if config.slot_bits != 32 && !(config.slot_bits == 16 && bits == 16) {
+        return err(hal.Error.InvalidInput)
+    }
+    if config.channels != 1 && config.channels != 2 {
+        return err(hal.Error.InvalidInput)
+    }
+    if data >= rp_pio.PIN_LIMIT || clock + 1 >= rp_pio.PIN_LIMIT || data == clock || data == clock + 1 {
+        return err(hal.Error.InvalidInput)
+    }
+    return timing(clock_hz, config.sample_rate, config.slot_bits)
+}
+
+// clk_sys of the block `loaded` was loaded into: the rate of a divider of
+// one.
+fn block_clock(loaded: &rp_pio.Loaded) -> u32!hal.Error {
+    probe := loaded.config()
+    probe.set_divider(256)?
+    return ok(probe.frequency_hz())
+}
+
+// Load `program` and claim a free state machine for it. Busy if either is
+// not free; nothing is held then.
+fn claim(pio: &mut rp_pio.Pio, program: &rp_pio.Program) -> Machine!hal.Error {
+    loaded := pio.load(program)?
+    match pio.free_state_machine() {
+        ok(machine) => {
+            return ok(Machine { machine, loaded })
+        }
+        err(error) => {
+            pio.unload(loaded)
+            return err(error)
+        }
+    }
+}
+
+struct Machine {
+    machine: rp_pio.StateMachine
+    loaded: rp_pio.Loaded
+}
+
+// An I2S output on one PIO state machine; see the package comment. It
+// implements hal.I2sOutput.
+pub struct Output: hal.I2sOutput {
+    machine: rp_pio.StateMachine
+    loaded: rp_pio.Loaded
+    data: u32
+    clock: u32
+    timing: Timing
+    bits: u32
+    channels: u32
+    slot_bits: u32
+    right_justified: bool
+
+    // Load the output program into `pio`, claim its lowest free state
+    // machine, and start sending `config`'s stream on GPIO `data`, with
+    // BCLK on GPIO `clock` and LRCLK on `clock + 1`; the three pins must be
+    // given to the block (Pins.pio_pins). It sends zeros until samples are
+    // queued. InvalidInput for settings out of range (see Config) or a rate
+    // the divider cannot reach; Busy if the program does not fit the
+    // block's free instruction slots or every state machine is claimed.
+    pub fn new(pio: &mut rp_pio.Pio, data: u32, clock: u32, config: &Config) -> Output!hal.Error {
+        program := output_program(&config.format, config.slot_bits)?
+        claimed := claim(pio, &program)?
+        match Output.start(&mut claimed.machine, &claimed.loaded, data, clock, config) {
+            ok(timing) => {
+                right_justified := is_right_justified(&config.format)
+                let Machine { machine, loaded } = claimed
+                return ok(Output { machine, loaded, data, clock, timing, bits: config.bits, channels: config.channels, slot_bits: config.slot_bits, right_justified })
+            }
+            err(error) => {
+                let Machine { machine, loaded } = claimed
+                pio.release_state_machine(machine)
+                pio.unload(loaded)
+                return err(error)
+            }
+        }
+    }
+
+    fn start(machine: &mut rp_pio.StateMachine, loaded: &rp_pio.Loaded, data: u32, clock: u32, config: &Config) -> Timing!hal.Error {
+        timing := check(block_clock(loaded)?, data, clock, config)?
+        settings := loaded.config()
+        settings.set_out_pins(data, 1)?
+        settings.set_sideset_pins(clock)?
+        settings.set_divider(timing.divider)?
+        machine.init(&settings)
+        machine.set_pins(data, 1, 0)
+        machine.set_pins(clock, 2, 0)
+        machine.set_pindirs(data, 1, 1)
+        machine.set_pindirs(clock, 2, 3)
+        // Silence first: an empty OSR, and in 32-bit slots no frame
+        // queued, in 16-bit slots zeros for `pull noblock`.
+        machine.exec(MOV_OSR_NULL)
+        if config.slot_bits == 32 {
+            machine.exec(MOV_X_ONES)
+        } else {
+            machine.exec(SET_X_ZERO)
+        }
+        machine.set_enabled(true)
+        return ok(timing)
+    }
+
+    // Frames per second, as asked for; `timing` tells the rate the divider
+    // gives.
+    pub fn sample_rate(&self) -> u32 {
+        return self.timing.sample_rate
+    }
+
+    // Samples per frame: 1 or 2.
+    pub fn channels(&self) -> u32 {
+        return self.channels
+    }
+
+    // Bits per sample: 16, 24, or 32.
+    pub fn bits(&self) -> u32 {
+        return self.bits
+    }
+
+    // Bit clocks per slot: 16 or 32.
+    pub fn slot_bits(&self) -> u32 {
+        return self.slot_bits
+    }
+
+    // The clock divider and the sample rate it gives.
+    pub fn timing(&self) -> Timing {
+        return self.timing.copy()
+    }
+
+    // The state machine's number in its block, for Pio.listen with
+    // rp_pio.tx_not_full.
+    pub fn machine_index(&self) -> u32 {
+        return self.machine.index()
+    }
+
+    // Queue `samples` without waiting: as many whole frames as the FIFO
+    // has room for, in the wire's format. Returns how many samples, 0 when
+    // the FIFO is full. InvalidInput for a slice that is not whole frames.
+    pub fn poll_write(&mut self, samples: &[i32]) -> usize!hal.Error {
+        channels := self.channels as usize
+        if samples.len % channels != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        per_frame := self.words_per_frame()
+        level := self.machine.tx_level()
+        free := 0u32
+        if level < FIFO_DEPTH {
+            free = FIFO_DEPTH - level
+        }
+        frames := samples.len / channels
+        room := (free / per_frame) as usize
+        if frames > room {
+            frames = room
+        }
+        for frame in 0usize..frames {
+            left := samples[frame * channels]
+            right := samples[frame * channels + channels - 1]
+            if self.slot_bits == 16 {
+                word := self.frame_word(left, right)
+                self.machine.put(word)
+            } else {
+                first := self.slot_word(left)
+                second := self.slot_word(right)
+                self.machine.put(first)
+                self.machine.put(second)
+            }
+        }
+        return ok(frames * channels)
+    }
+
+    // The frames queued and not yet started.
+    pub fn queued(&mut self) -> u32 {
+        return self.machine.tx_level() / self.words_per_frame()
+    }
+
+    // Write `samples` into `buffer` in the wire's format, as poll_write
+    // queues them: little-endian words for the TX FIFO, for Output.dma.
+    // Returns the bytes written, 4 or 8 per frame. InvalidInput for a
+    // slice that is not whole frames, or a buffer too small for them.
+    pub fn pack(&self, samples: &[i32], buffer: &mut[u8]) -> usize!hal.Error {
+        channels := self.channels as usize
+        if samples.len % channels != 0 {
+            return err(hal.Error.InvalidInput)
+        }
+        frames := samples.len / channels
+        size := frames * 4 * self.words_per_frame() as usize
+        if size > buffer.len {
+            return err(hal.Error.InvalidInput)
+        }
+        at := 0usize
+        for frame in 0usize..frames {
+            left := samples[frame * channels]
+            right := samples[frame * channels + channels - 1]
+            if self.slot_bits == 16 {
+                store(buffer, at, self.frame_word(left, right))
+                at += 4
+            } else {
+                store(buffer, at, self.slot_word(left))
+                store(buffer, at + 4, self.slot_word(right))
+                at += 8
+            }
+        }
+        return ok(size)
+    }
+
+    // A DMA session that plays buffers from `buffer` through `channel`,
+    // paced by the state machine's TX FIFO, while the processor does other
+    // work: fill the buffer with `pack`, then `start` it with the bytes
+    // packed. Transfers of whole frames keep left and right in place; the
+    // output sends zeros after the last one. The output stays borrowed
+    // until the session is dropped. Errors as for hal.DmaStream.transmit:
+    // InvalidInput for an empty buffer or one not aligned to 4 bytes, Busy
+    // if the channel is running.
+    pub fn dma(&mut self, channel: &mut dyn hal.DmaChannel, buffer: &mut[u8]) -> hal.DmaStream!hal.Error from(self, channel, buffer) {
+        return hal.DmaStream.transmit(channel, buffer, self.machine.tx_fifo_address(), hal.DmaWidth.Word)
+    }
+
+    // The address of the state machine's TX FIFO, for DMA transfers of
+    // one's own.
+    pub fn tx_fifo_address(&self) -> usize {
+        return self.machine.tx_fifo_address()
+    }
+
+    // Stop the clocks, make the three pins inputs, give the state machine
+    // back to `pio`, and unload the program. `pio` must be the block the
+    // output was created in.
+    pub fn release(self, pio: &mut rp_pio.Pio) {
+        stop(&mut self.machine, self.data, self.clock)
+        let Output { machine, loaded, data, clock, timing, bits, channels, slot_bits, right_justified } = self
+        pio.release_state_machine(machine)
+        pio.unload(loaded)
+    }
+
+    fn words_per_frame(&self) -> u32 {
+        if self.slot_bits == 16 {
+            return 1
+        }
+        return 2
+    }
+
+    // A sample as a 32-bit slot's word: its top `bits` bits, or for right
+    // justified framing those bits at the bottom with copies of the sign
+    // above.
+    fn slot_word(&self, sample: i32) -> u32 {
+        if self.bits == 32 {
+            return unsigned(sample)
+        }
+        if self.right_justified {
+            return unsigned(sample >> (32 - self.bits) as i32)
+        }
+        mask := ~(0xFFFF_FFFFu32 >> self.bits)
+        return unsigned(sample) & mask
+    }
+
+    // A frame of two 16-bit slots as one word, left in the upper half.
+    fn frame_word(&self, left: i32, right: i32) -> u32 {
+        return (unsigned(left) & 0xFFFF_0000) | (unsigned(right) >> 16)
+    }
+}
+
+// An I2S input on one PIO state machine; see the package comment. It
+// implements hal.I2sInput.
+pub struct Input: hal.I2sInput {
+    machine: rp_pio.StateMachine
+    loaded: rp_pio.Loaded
+    data: u32
+    clock: u32
+    timing: Timing
+    bits: u32
+    channels: u32
+    slot_bits: u32
+    right_justified: bool
+    // A mono input keeps the right slot.
+    right: bool
+
+    // Load the input program into `pio`, claim its lowest free state
+    // machine, and start receiving `config`'s stream on GPIO `data`, with
+    // BCLK on GPIO `clock` and LRCLK on `clock + 1`, all three given to the
+    // block (Pins.pio_pins). Errors as for Output.new.
+    pub fn new(pio: &mut rp_pio.Pio, data: u32, clock: u32, config: &Config) -> Input!hal.Error {
+        program := input_program(&config.format, config.slot_bits)?
+        claimed := claim(pio, &program)?
+        match Input.start(&mut claimed.machine, &claimed.loaded, data, clock, config) {
+            ok(timing) => {
+                right_justified := is_right_justified(&config.format)
+                right := false
+                match &config.channel {
+                    Channel.Right => {
+                        right = true
+                    }
+                    Channel.Left => {}
+                }
+                let Machine { machine, loaded } = claimed
+                return ok(Input { machine, loaded, data, clock, timing, bits: config.bits, channels: config.channels, slot_bits: config.slot_bits, right_justified, right })
+            }
+            err(error) => {
+                let Machine { machine, loaded } = claimed
+                pio.release_state_machine(machine)
+                pio.unload(loaded)
+                return err(error)
+            }
+        }
+    }
+
+    fn start(machine: &mut rp_pio.StateMachine, loaded: &rp_pio.Loaded, data: u32, clock: u32, config: &Config) -> Timing!hal.Error {
+        timing := check(block_clock(loaded)?, data, clock, config)?
+        settings := loaded.config()
+        settings.set_in_pins(data)?
+        settings.set_sideset_pins(clock)?
+        settings.set_divider(timing.divider)?
+        // Philips framing starts inside the first run of LRCLK low, at the
+        // left slot's first bit; see input_program.
+        philips := is_philips(&config.format)
+        if philips {
+            settings.set_start(loaded.offset() + 2)?
+        }
+        machine.init(&settings)
+        machine.set_pins(clock, 2, 0)
+        machine.set_pindirs(data, 1, 0)
+        machine.set_pindirs(clock, 2, 3)
+        if philips {
+            machine.exec(SET_Y | ((config.slot_bits - 2) & 0x1F) as u16)
+        }
+        machine.set_enabled(true)
+        return ok(timing)
+    }
+
+    // Frames per second, as asked for.
+    pub fn sample_rate(&self) -> u32 {
+        return self.timing.sample_rate
+    }
+
+    pub fn channels(&self) -> u32 {
+        return self.channels
+    }
+
+    pub fn bits(&self) -> u32 {
+        return self.bits
+    }
+
+    pub fn slot_bits(&self) -> u32 {
+        return self.slot_bits
+    }
+
+    pub fn timing(&self) -> Timing {
+        return self.timing.copy()
+    }
+
+    // The state machine's number in its block, for Pio.listen with
+    // rp_pio.rx_not_empty.
+    pub fn machine_index(&self) -> u32 {
+        return self.machine.index()
+    }
+
+    // The samples received since the last call, as many whole frames as
+    // fit `samples`, without waiting; returns how many samples. A 24-bit
+    // sample comes in the top 24 bits, the bits below zero. Overrun once
+    // after the FIFO filled up and stalled the clocks: the frames queued
+    // then are dropped, and the next call returns the samples that follow.
+    pub fn poll_read(&mut self, samples: &mut[i32]) -> usize!hal.Error {
+        per_frame := self.words_per_frame()
+        if self.machine.take_rx_stall() {
+            // Whole frames only, so the queue still starts with a left
+            // slot; the state machine refills it at once.
+            queued := self.machine.rx_level()
+            for _ in 0u32..queued - queued % per_frame {
+                match self.machine.try_get() {
+                    some(_) => {}
+                    none => {}
+                }
+            }
+            self.machine.take_rx_stall()
+            return err(hal.Error.Overrun)
+        }
+        channels := self.channels as usize
+        frames := (self.machine.rx_level() / per_frame) as usize
+        if frames > samples.len / channels {
+            frames = samples.len / channels
+        }
+        for frame in 0usize..frames {
+            left := 0i32
+            right := 0i32
+            if self.slot_bits == 16 {
+                word := self.machine.get()
+                left = signed(word & 0xFFFF_0000)
+                right = signed((word & 0xFFFF) << 16)
+            } else {
+                first := self.machine.get()
+                second := self.machine.get()
+                left = self.sample(first)
+                right = self.sample(second)
+            }
+            if channels == 2 {
+                samples[2 * frame] = left
+                samples[2 * frame + 1] = right
+            } else if self.right {
+                samples[frame] = right
+            } else {
+                samples[frame] = left
+            }
+        }
+        return ok(frames * channels)
+    }
+
+    // Stop the clocks, make the pins inputs, give the state machine back
+    // to `pio`, and unload the program, as Output.release does.
+    pub fn release(self, pio: &mut rp_pio.Pio) {
+        stop(&mut self.machine, self.data, self.clock)
+        let Input { machine, loaded, data, clock, timing, bits, channels, slot_bits, right_justified, right } = self
+        pio.release_state_machine(machine)
+        pio.unload(loaded)
+    }
+
+    fn words_per_frame(&self) -> u32 {
+        if self.slot_bits == 16 {
+            return 1
+        }
+        return 2
+    }
+
+    // A 32-bit slot's word as a sample, keeping `bits` bits: the top ones,
+    // or for right justified framing the bottom ones.
+    fn sample(&self, word: u32) -> i32 {
+        if self.bits == 32 {
+            return signed(word)
+        }
+        if self.right_justified {
+            low := word & (0xFFFF_FFFFu32 >> (32 - self.bits))
+            return signed(low << (32 - self.bits))
+        }
+        return signed(word & ~(0xFFFF_FFFFu32 >> self.bits))
+    }
+}
+
+// Stop a stream's state machine and make its pins inputs.
+fn stop(machine: &mut rp_pio.StateMachine, data: u32, clock: u32) {
+    machine.set_enabled(false)
+    machine.set_pindirs(clock, 2, 0)
+    machine.set_pindirs(data, 1, 0)
+}
+
+// `word` little-endian at buffer[at..at + 4].
+fn store(buffer: &mut[u8], at: usize, word: u32) {
+    buffer[at] = (word & 0xFF) as u8
+    buffer[at + 1] = ((word >> 8) & 0xFF) as u8
+    buffer[at + 2] = ((word >> 16) & 0xFF) as u8
+    buffer[at + 3] = (word >> 24) as u8
+}

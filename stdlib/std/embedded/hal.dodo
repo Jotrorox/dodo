@@ -17,17 +17,36 @@ import "core/ptr"
 //    handle afterwards is safe.
 // 2. Interrupts. `Critical` masks interrupts on the current core until it is
 //    dropped. It never excludes other threads or cores.
-// 3. Device protocols. The interfaces below (OutputPin, InputPin, Delay,
-//    Counter, Alarm, I2c, Spi, PwmOutput, AnalogInput, Watchdog, and
-//    Registers) name what drivers need
-//    from a device. Any value with
-//    matching methods implements them. Drivers are usually generic over a
-//    bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
+// 3. Device protocols. The interfaces below name what drivers need from a
+//    device: OutputPin, InputPin, Delay, Counter, Alarm, I2c, Spi,
+//    PwmOutput, PwmInput, AnalogInput, Can, I2sOutput, I2sInput, Watchdog,
+//    and Registers; the polling forms I2cPoll and SpiPoll; the target
+//    (slave) sides I2cTarget and SpiTarget; and DmaChannel, DmaBuffer, and
+//    SpiDma for transfers that run while the program does other work. Any
+//    value with matching methods implements them. Drivers are usually
+//    generic over a bounded parameter, `fn probe<B: hal.I2c>(bus: &mut B)`, which is
 //    statically dispatched and reports a wrong argument where it is passed.
 //    `&mut dyn hal.I2c` instead dispatches at run time, for drivers chosen at
 //    run time or a list of different devices. Serial ports implement the
 //    `std/io` Reader and Writer interfaces, so ports work with `std/io`
-//    helpers and `std/fmt` formatting unchanged.
+//    helpers and `std/fmt` formatting unchanged, and the Port and PollPort
+//    protocols of `std/embedded/hal/serial`, which stay out of this package
+//    so that it depends on no stream package.
+//
+// Blocking and polling. The plain protocols wait until an operation is
+// done. Their polling forms never wait: each call does what the hardware
+// allows now and reports whether the operation has finished, so a program
+// keeps working meanwhile, or an std/embedded/executor task returns Pending
+// and is polled again on a timer or when the peripheral's interrupt raises
+// a signal. A polled operation keeps its state in the peripheral value, not
+// in borrowed buffers: every call passes the same arguments again until the
+// operation finishes, fails, or is cancelled, and the buffers stay the
+// caller's in between. Methods that start an operation are named poll_*,
+// return `bool!Error` (true once finished) or an io.Poll for byte streams,
+// and the operation is over after any error. `BlockingI2c` and
+// `BlockingSpi` turn a polling implementation into a blocking one, so a
+// controller that implements only the polling form serves both kinds of
+// driver.
 //
 // Addresses are 7-bit I2C addresses; controllers that also reach 10-bit
 // addresses offer that through methods of their own. Times are
@@ -79,8 +98,13 @@ import "core/ptr"
 //                                  release_analog(input) give them back.
 //                                  Chips may offer more,
 //                                  as the RP2040 and RP2350 do: targets
-//                                  (slaves) with i2c_target and spi_target,
-//                                  spi_with_select, and uart_flow
+//                                  (slaves) with i2c_target and spi_target
+//                                  (I2cTarget, SpiTarget), pwm_input(pin,
+//                                  window_us) for a PwmInput,
+//                                  spi_with_select, and uart_flow. Buses
+//                                  implement the polling forms too, and
+//                                  serial ports serial.Port and
+//                                  serial.PollPort
 //    Board.timer                   the Delay and Counter protocols:
 //                                  delay_us, delay_ms, now_us(&self) -> u64;
 //                                  chips may hand out alarms with the Alarm
@@ -250,6 +274,674 @@ pub interface AnalogInput {
     fn read(&mut self) -> u16!Error
 }
 
+// --- Polling forms -------------------------------------------------------
+//
+// See "Blocking and polling" in the package comment for the contract they
+// share.
+
+// An I2C bus controller whose transactions run while the program does
+// other work. A transaction may be any length: an implementation moves as
+// many bytes as its FIFO holds per poll and holds the bus, with SCL low,
+// until the next poll continues it, which every I2C device accepts as clock
+// stretching. Addresses are 7-bit device addresses, as for I2c.
+pub interface I2cPoll {
+    // Advance a write of `bytes` to the device at `address`, without
+    // waiting: false while it runs, true once it has ended with a STOP. The
+    // first call starts the transaction; later calls pass the same address
+    // and bytes until it finishes. Errors as for I2c.write, after which the
+    // transaction is over. InvalidInput for a call whose address or lengths
+    // differ from the running transaction's, which keeps running.
+    fn poll_write(&mut self, address: u8, bytes: &[u8]) -> bool!Error
+    // Advance a read of `buffer.len` bytes, as for poll_write. The bytes
+    // are all in `buffer` once it returns true; before that its contents
+    // are unspecified.
+    fn poll_read(&mut self, address: u8, buffer: &mut[u8]) -> bool!Error
+    // Advance a write of `bytes`, a repeated START, and a read into
+    // `buffer`, as one transaction, as I2c.write_read does.
+    fn poll_write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> bool!Error
+    // Abandon the running transaction, if any, ending it on the bus as
+    // soon as the controller can, so the next poll starts a new one.
+    fn cancel(&mut self)
+}
+
+// An SPI bus controller whose transfers run while the program does other
+// work. Chip select stays a separate pin; SpiDevice drives it around
+// polled transfers too.
+pub interface SpiPoll {
+    // Advance a full-duplex exchange of `bytes` in place, without waiting:
+    // false while frames remain, true once every byte sent has been replaced
+    // by the byte read. Later calls pass the same slice until it finishes;
+    // InvalidInput for one of another length. The slice's bytes past the
+    // ones exchanged so far are still to be sent, so the caller must not
+    // change them meanwhile.
+    fn poll_transfer(&mut self, bytes: &mut[u8]) -> bool!Error
+    // Advance a write of `bytes`, discarding what arrives, as for
+    // poll_transfer.
+    fn poll_write(&mut self, bytes: &[u8]) -> bool!Error
+    // Abandon the running transfer, if any, once the frame on the wire is
+    // complete, and discard what was received.
+    fn cancel(&mut self)
+}
+
+// --- Target (slave) sides ------------------------------------------------
+
+// What happened on an I2C bus, from I2cTarget.poll.
+pub enum I2cTargetEvent {
+    // Nothing since the last poll.
+    Idle,
+    // The master wrote `count` bytes, now at the start of the buffer given
+    // to `poll`. `start` is true when the first of them is the first byte
+    // after the target's address, so it begins a new write, for example a
+    // register number; the bytes of one poll never span two writes.
+    Write(count: usize, start: bool),
+    // The master reads and waits, with SCL held low, until `respond`
+    // queues the bytes for it.
+    Read,
+    // A transaction addressed to the target ended with a STOP condition.
+    Stop
+}
+
+// An I2C target (slave): a device on a bus that another master addresses.
+// The address is set when the target is created. The program polls for
+// what the master did, in order: written bytes, a STOP, and reads, which
+// wait, with SCL held low, until `respond` answers them, so a slow program
+// delays the master but loses nothing.
+//
+//     match target.poll(&mut buffer)? {
+//         hal.I2cTargetEvent.Write(count, start) => { ... }
+//         hal.I2cTargetEvent.Read => { target.respond(&reply)? }
+//         hal.I2cTargetEvent.Stop => {}
+//         hal.I2cTargetEvent.Idle => {}
+//     }
+pub interface I2cTarget {
+    // What the master did since the last poll, without waiting: first the
+    // bytes it wrote, as many as fit `buffer`, then a STOP, then a read
+    // waiting for `respond`. Bus for an electrical or protocol fault, and
+    // Overrun if written bytes were lost.
+    fn poll(&mut self, buffer: &mut[u8]) -> I2cTargetEvent!Error
+    // Answer a Read with `bytes`, as many as the controller holds; returns
+    // how many. The master reads them one by one and may stop early; if it
+    // reads on, the next poll reports another Read. An empty `bytes`
+    // answers one 0xFF, what the master would read from an idle bus, so it
+    // is never left waiting.
+    fn respond(&mut self, bytes: &[u8]) -> usize!Error
+}
+
+// An SPI target (slave): another master drives the clock and the chip
+// select, and the target shifts out what it queued while it shifts in what
+// the master sends. Mode and frame size are set when it is created.
+pub interface SpiTarget {
+    // Queue `bytes` to send as the master clocks them, as many as there is
+    // room for, without waiting; returns how many.
+    fn queue(&mut self, bytes: &[u8]) -> usize!Error
+    // The bytes the master sent since the last call, up to `buffer.len`,
+    // without waiting; returns how many. Overrun if some were lost.
+    fn read(&mut self, buffer: &mut[u8]) -> usize!Error
+}
+
+// --- PWM input capture ---------------------------------------------------
+
+// One measurement of a pulse train from a PwmInput: how long a period
+// lasts and how long the signal is high in it, in nanoseconds, averaged
+// over `cycles` whole periods. Hardware that timestamps edges measures
+// single periods (cycles 1); hardware that counts edges over a window
+// averages many. A measurement that saw no whole period, such as a line
+// that did not change, has cycles 0: period_ns is then how long the line
+// was watched and high_ns how long of that it was high, so `duty` still
+// reads the share of time it was high (100% or 0% for a steady line).
+pub struct PulseCapture {
+    pub period_ns: u64
+    pub high_ns: u64
+    pub cycles: u32
+
+    // An empty measurement, for poll_capture to fill.
+    pub fn new() -> PulseCapture {
+        return PulseCapture { period_ns: 0, high_ns: 0, cycles: 0 }
+    }
+
+    // The signal's frequency in millihertz, rounded; 0 for a steady line.
+    pub fn frequency_millihz(&self) -> u64 {
+        if self.cycles == 0 || self.period_ns == 0 {
+            return 0
+        }
+        return (1_000_000_000_000u64 + self.period_ns / 2) / self.period_ns
+    }
+
+    // The signal's frequency in hertz, rounded; 0 for a steady line.
+    pub fn frequency_hz(&self) -> u32 {
+        millihertz := self.frequency_millihz()
+        hertz := (millihertz + 500) / 1000
+        if hertz > 0xFFFF_FFFFu64 {
+            return 0xFFFF_FFFF
+        }
+        return hertz as u32
+    }
+
+    // The high time as a share of the period, scaled to 0..`max` and
+    // rounded: `duty(100)` is a percentage, and a PwmOutput's max_duty()
+    // reproduces the signal on an output.
+    pub fn duty(&self, max: u32) -> u32 {
+        if self.period_ns == 0 {
+            return 0
+        }
+        high := self.high_ns
+        if high > self.period_ns {
+            high = self.period_ns
+        }
+        // 128-bit headroom is not needed: periods beyond 2^32 ns (4.3 s)
+        // lose low bits first.
+        period := self.period_ns
+        scale := max as u64
+        for high > 0xFFFF_FFFFu64 || period > 0xFFFF_FFFFu64 {
+            high = high >> 1
+            period = period >> 1
+        }
+        return ((high * scale + period / 2) / period) as u32
+    }
+
+    // The high time in microseconds, rounded, as a servo or RC receiver's
+    // pulse length is usually given.
+    // Saturates at the largest u32 (about 71 minutes).
+    pub fn high_us(&self) -> u32 {
+        return saturate_us(self.high_ns)
+    }
+
+    // The period in microseconds, rounded, saturating as high_us does.
+    pub fn period_us(&self) -> u32 {
+        return saturate_us(self.period_ns)
+    }
+}
+
+fn saturate_us(nanoseconds: u64) -> u32 {
+    microseconds := nanoseconds / 1000 + (nanoseconds % 1000 + 500) / 1000
+    if microseconds > 0xFFFF_FFFFu64 {
+        return 0xFFFF_FFFF
+    }
+    return microseconds as u32
+}
+
+// An input that measures the pulses on a pin: the frequency and duty cycle
+// of a PWM signal, a fan's tachometer, or the pulse length of a servo
+// signal. Like a PWM output it is configured when it is created, with how
+// long one measurement may take. Measurements follow one another
+// continuously.
+pub interface PwmInput {
+    // Without waiting: true with `capture` set to a measurement that
+    // finished since the last call, false while none has. A program that
+    // polls more slowly than measurements finish gets the latest. Overrun
+    // if a measurement was lost, as when a counter overflowed; the next
+    // measurement has then already begun.
+    fn poll_capture(&mut self, capture: &mut PulseCapture) -> bool!Error
+}
+
+// --- CAN -----------------------------------------------------------------
+
+// The largest identifiers: 11-bit standard and 29-bit extended.
+pub const CAN_MAX_STANDARD_ID: u32 = 0x7FF
+pub const CAN_MAX_EXTENDED_ID: u32 = 0x1FFF_FFFF
+// The most data bytes of a classic CAN frame and of a CAN FD frame.
+pub const CAN_MAX_DATA: usize = 8
+pub const CAN_FD_MAX_DATA: usize = 64
+
+// The data length of a CAN frame with data length code `dlc`, 0 to 15:
+// codes up to 8 are lengths, and on CAN FD 9 to 15 mean 12, 16, 20, 24,
+// 32, 48, and 64 bytes. A classic frame with a code above 8 carries 8.
+pub fn can_dlc_length(dlc: u8, fd: bool) -> usize {
+    code := dlc & 0xF
+    if code <= 8 {
+        return code as usize
+    }
+    if !fd {
+        return 8
+    }
+    if code <= 12 {
+        return 8 + (code as usize - 8) * 4
+    }
+    if code == 13 {
+        return 32
+    }
+    if code == 14 {
+        return 48
+    }
+    return 64
+}
+
+// The data length code for `length` bytes: InvalidInput above 64, or for
+// a length CAN FD cannot carry exactly (it pads to 12, 16, 20, 24, 32, 48,
+// or 64 bytes).
+pub fn can_length_dlc(length: usize) -> u8!Error {
+    if length <= 8 {
+        return ok(length as u8)
+    }
+    for code in 9u8..16 {
+        if can_dlc_length(code, true) == length {
+            return ok(code)
+        }
+    }
+    return err(Error.InvalidInput)
+}
+
+// One CAN frame: an identifier, standard or extended, and up to 8 data
+// bytes, or 64 on CAN FD, or a remote request for that many. The fields
+// are checked as they are set, so every frame is one a controller can
+// send. Frames are values a program keeps and reuses:
+//
+//     frame := hal.CanFrame.new()
+//     frame.set_data(0x123, false, &payload)?
+//     can.poll_send(&frame)?
+//     if can.poll_receive(&mut frame)? { ... frame.id(), frame.bytes() ... }
+pub struct CanFrame {
+    id: u32
+    extended: bool
+    remote: bool
+    fd: bool
+    bit_rate_switch: bool
+    length: usize
+    data: [64]u8
+
+    // A data frame with standard identifier 0 and no data, for a receive
+    // to fill or a set_* call to change.
+    pub fn new() -> CanFrame {
+        return CanFrame { id: 0, extended: false, remote: false, fd: false, bit_rate_switch: false, length: 0, data: [0; 64] }
+    }
+
+    // A classic data frame with standard identifier `id` and `bytes` as
+    // its data; see set_data.
+    pub fn standard(id: u32, bytes: &[u8]) -> CanFrame!Error {
+        frame := CanFrame.new()
+        frame.set_data(id, false, bytes)?
+        return ok(frame)
+    }
+
+    // A classic data frame with extended identifier `id`; see set_data.
+    pub fn extended(id: u32, bytes: &[u8]) -> CanFrame!Error {
+        frame := CanFrame.new()
+        frame.set_data(id, true, bytes)?
+        return ok(frame)
+    }
+
+    // Make this a classic data frame: identifier `id`, extended or
+    // standard, with `bytes` as its data. InvalidInput for an identifier
+    // too large for its kind or more than CAN_MAX_DATA bytes; the frame is
+    // then unchanged.
+    pub fn set_data(&mut self, id: u32, extended: bool, bytes: &[u8]) -> void!Error {
+        check_can_id(id, extended)?
+        if bytes.len > CAN_MAX_DATA {
+            return err(Error.InvalidInput)
+        }
+        self.fill(id, extended, false, false, false, bytes)
+        return ok()
+    }
+
+    // Make this a remote frame, a request for `length` bytes of data
+    // frame `id`, 0 to CAN_MAX_DATA. Errors as for set_data.
+    pub fn set_remote(&mut self, id: u32, extended: bool, length: usize) -> void!Error {
+        check_can_id(id, extended)?
+        if length > CAN_MAX_DATA {
+            return err(Error.InvalidInput)
+        }
+        none: [0]u8 = []
+        self.fill(id, extended, true, false, false, &none)
+        self.length = length
+        return ok()
+    }
+
+    // Make this a CAN FD data frame with `bytes` as its data, sent with the
+    // faster data bit rate if `bit_rate_switch`. InvalidInput for a length
+    // can_length_dlc rejects, or as for set_data.
+    pub fn set_fd(&mut self, id: u32, extended: bool, bytes: &[u8], bit_rate_switch: bool) -> void!Error {
+        check_can_id(id, extended)?
+        can_length_dlc(bytes.len)?
+        self.fill(id, extended, false, true, bit_rate_switch, bytes)
+        return ok()
+    }
+
+    fn fill(&mut self, id: u32, extended: bool, remote: bool, fd: bool, bit_rate_switch: bool, bytes: &[u8]) {
+        self.id = id
+        self.extended = extended
+        self.remote = remote
+        self.fd = fd
+        self.bit_rate_switch = bit_rate_switch
+        self.length = bytes.len
+        for index in 0..bytes.len {
+            self.data[index] = bytes[index]
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        return self.id
+    }
+
+    pub fn is_extended(&self) -> bool {
+        return self.extended
+    }
+
+    pub fn is_remote(&self) -> bool {
+        return self.remote
+    }
+
+    pub fn is_fd(&self) -> bool {
+        return self.fd
+    }
+
+    pub fn bit_rate_switch(&self) -> bool {
+        return self.bit_rate_switch
+    }
+
+    // The data length: of the data, or for a remote frame the length it
+    // requests.
+    pub fn len(&self) -> usize {
+        return self.length
+    }
+
+    // The frame's data length code.
+    pub fn dlc(&self) -> u8 {
+        match can_length_dlc(self.length) {
+            ok(code) => {
+                return code
+            }
+            err(_) => {
+                return 15
+            }
+        }
+    }
+
+    // The data bytes; empty for a remote frame.
+    pub fn bytes(&self) -> &[u8] {
+        if self.remote {
+            return self.data[0..0]
+        }
+        return self.data[0..self.length]
+    }
+
+    // Whether this frame equals `other`: identifier and its kind, remote,
+    // FD, bit rate switch, length, and data.
+    pub fn same(&self, other: &CanFrame) -> bool {
+        if self.id != other.id || self.extended != other.extended || self.remote != other.remote || self.fd != other.fd || self.bit_rate_switch != other.bit_rate_switch || self.length != other.length {
+            return false
+        }
+        if self.remote {
+            return true
+        }
+        for index in 0..self.length {
+            if self.data[index] != other.data[index] {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Make this frame a copy of `other`.
+    pub fn copy_from(&mut self, other: &CanFrame) {
+        self.id = other.id
+        self.extended = other.extended
+        self.remote = other.remote
+        self.fd = other.fd
+        self.bit_rate_switch = other.bit_rate_switch
+        self.length = other.length
+        for index in 0..other.length {
+            self.data[index] = other.data[index]
+        }
+    }
+}
+
+fn check_can_id(id: u32, extended: bool) -> void!Error {
+    if extended {
+        if id > CAN_MAX_EXTENDED_ID {
+            return err(Error.InvalidInput)
+        }
+    } else if id > CAN_MAX_STANDARD_ID {
+        return err(Error.InvalidInput)
+    }
+    return ok()
+}
+
+// An acceptance filter: frames whose identifier bits under `mask` equal
+// those of `id`, of the same kind (standard or extended), pass. A mask of 0
+// passes every frame of that kind. Controllers configure their hardware
+// filters from these when they are created.
+pub struct CanFilter {
+    pub id: u32
+    pub mask: u32
+    pub extended: bool
+
+    // A filter that passes exactly identifier `id`.
+    pub fn exact(id: u32, extended: bool) -> CanFilter {
+        mask := CAN_MAX_STANDARD_ID
+        if extended {
+            mask = CAN_MAX_EXTENDED_ID
+        }
+        return CanFilter { id, mask, extended }
+    }
+
+    // A filter that passes every frame of one kind.
+    pub fn all(extended: bool) -> CanFilter {
+        return CanFilter { id: 0, mask: 0, extended }
+    }
+
+    pub fn accepts(&self, frame: &CanFrame) -> bool {
+        return frame.is_extended() == self.extended && (frame.id() & self.mask) == (self.id & self.mask)
+    }
+}
+
+// Where a CAN controller stands in the bus's fault confinement, from its
+// transmit and receive error counters. An error-active node signals the
+// errors it sees; an error-passive one, after many errors, only listens for
+// them; a bus-off node, after very many, takes no part until it recovers
+// by seeing 128 runs of 11 recessive bits.
+pub enum CanErrorState {
+    Active,
+    Passive,
+    BusOff
+}
+
+// A CAN controller on a bus. Bit rate, filters, and modes are set when it
+// is created. Frames queue in the controller's buffers in both directions,
+// so both methods return at once.
+pub interface Can {
+    // Queue `frame` to send, without waiting: true once queued, false while
+    // every transmit buffer is full. Unsupported for an FD frame on a
+    // classic controller, Bus while the controller is bus-off.
+    fn poll_send(&mut self, frame: &CanFrame) -> bool!Error
+    // Without waiting: true with the oldest received frame in `frame`,
+    // false while none waits. Overrun once if frames were lost since the
+    // last call, before the frames that followed them.
+    fn poll_receive(&mut self, frame: &mut CanFrame) -> bool!Error
+    // Where the controller stands in fault confinement. Errors if the
+    // controller cannot be asked, as one on a failing SPI bus.
+    fn error_state(&mut self) -> CanErrorState!Error
+}
+
+// One bit time of a CAN controller in time quanta of `prescaler` input
+// clock cycles: a sync segment of one quantum, `segment1` (propagation
+// plus phase segment 1) before the sample point, and `segment2` after it.
+// `sync_jump` is how far the controller may move the sample point to
+// follow the transmitter. Controllers program their timing registers from
+// it, each with its own encoding.
+pub struct CanBitTiming {
+    pub prescaler: u32
+    pub segment1: u32
+    pub segment2: u32
+    pub sync_jump: u32
+
+    // Time quanta per bit.
+    pub fn quanta(&self) -> u32 {
+        return 1 + self.segment1 + self.segment2
+    }
+
+    // The resulting bit rate from an input clock of `clock_hz`, rounded.
+    pub fn bitrate(&self, clock_hz: u32) -> u32 {
+        cycles := self.prescaler as u64 * self.quanta() as u64
+        return ((clock_hz as u64 + cycles / 2) / cycles) as u32
+    }
+
+    // Where the sample point falls, in thousandths of the bit.
+    pub fn sample_point_permille(&self) -> u32 {
+        return ((1 + self.segment1) * 1000 + self.quanta() / 2) / self.quanta()
+    }
+}
+
+// The ranges a controller's timing registers accept, for can_timing.
+pub struct CanTimingLimits {
+    pub prescaler_min: u32
+    pub prescaler_max: u32
+    // Prescalers must be a multiple of this, such as 2 for controllers that
+    // count the clock in pairs.
+    pub prescaler_step: u32
+    pub segment1_min: u32
+    pub segment1_max: u32
+    pub segment2_min: u32
+    pub segment2_max: u32
+    pub sync_jump_max: u32
+}
+
+// The bit timing for `bitrate` from an input clock of `clock_hz`, within
+// `limits`, with the sample point closest to `sample_point_permille`
+// (875, 87.5%, is CiA's recommendation up to 800 kbit/s, 750 at 1 Mbit/s).
+// The exact bit rate is preferred; among timings as exact, the sample point
+// closest to the request, then the most quanta, which follow the bus most
+// finely. The synchronization jump
+// width is as wide as segment2 and the limits allow. InvalidInput if no
+// timing reaches the bit rate within 0.5%.
+pub fn can_timing(clock_hz: u32, bitrate: u32, sample_point_permille: u32, limits: &CanTimingLimits) -> CanBitTiming!Error {
+    if bitrate == 0 || clock_hz == 0 || sample_point_permille == 0 || sample_point_permille >= 1000 {
+        return err(Error.InvalidInput)
+    }
+    step := limits.prescaler_step
+    if step == 0 {
+        step = 1
+    }
+    smallest_quanta := 1 + limits.segment1_min + limits.segment2_min
+    largest_quanta := 1 + limits.segment1_max + limits.segment2_max
+    found := false
+    best_error := 0xFFFF_FFFF_FFFF_FFFFu64
+    best_sample := 0xFFFF_FFFFu32
+    best_quanta := 0u32
+    best := CanBitTiming { prescaler: 0, segment1: 0, segment2: 0, sync_jump: 0 }
+    prescaler := limits.prescaler_min
+    if prescaler == 0 {
+        prescaler = step
+    }
+    for prescaler <= limits.prescaler_max {
+        if prescaler % step == 0 {
+            quanta := (clock_hz as u64 + (prescaler as u64 * bitrate as u64) / 2) / (prescaler as u64 * bitrate as u64)
+            if quanta >= smallest_quanta as u64 && quanta <= largest_quanta as u64 {
+                actual := clock_hz as u64 / (prescaler as u64 * quanta)
+                // The bit-rate error in millionths.
+                difference := 0u64
+                if actual > bitrate as u64 {
+                    difference = actual - bitrate as u64
+                } else {
+                    difference = bitrate as u64 - actual
+                }
+                exact := clock_hz as u64 % (prescaler as u64 * quanta) == 0
+                error := difference * 1_000_000 / bitrate as u64
+                if !exact && error == 0 {
+                    error = 1
+                }
+                if error <= 5000 {
+                    total := quanta as u32
+                    // Segment 2 from the sample point, within the limits.
+                    after := (total * (1000 - sample_point_permille) + 500) / 1000
+                    if after < limits.segment2_min {
+                        after = limits.segment2_min
+                    }
+                    if after > limits.segment2_max {
+                        after = limits.segment2_max
+                    }
+                    before := total - 1 - after
+                    if before > limits.segment1_max {
+                        before = limits.segment1_max
+                        after = total - 1 - before
+                    }
+                    if before >= limits.segment1_min && after >= limits.segment2_min && after <= limits.segment2_max {
+                        point := ((1 + before) * 1000 + total / 2) / total
+                        miss := 0u32
+                        if point > sample_point_permille {
+                            miss = point - sample_point_permille
+                        } else {
+                            miss = sample_point_permille - point
+                        }
+                        better := !found || error < best_error || (error == best_error && (miss < best_sample || (miss == best_sample && total > best_quanta)))
+                        if better {
+                            jump := after
+                            if jump > limits.sync_jump_max {
+                                jump = limits.sync_jump_max
+                            }
+                            if jump == 0 {
+                                jump = 1
+                            }
+                            best = CanBitTiming { prescaler, segment1: before, segment2: after, sync_jump: jump }
+                            best_error = error
+                            best_sample = miss
+                            best_quanta = total
+                            found = true
+                        }
+                    }
+                }
+            }
+        }
+        if prescaler == limits.prescaler_max {
+            break
+        }
+        prescaler += 1
+    }
+    if !found {
+        return err(Error.InvalidInput)
+    }
+    return ok(best)
+}
+
+// --- I2S -----------------------------------------------------------------
+
+// How an I2S stream frames its samples. The word select (LRCLK) line marks
+// which channel a sample belongs to: low for the left channel in Philips
+// framing, high for it in both justified framings.
+pub enum I2sFormat {
+    // The Philips I2S standard: word select low for the left channel, and
+    // each sample starts, most significant bit first, one bit clock after
+    // word select changes.
+    Philips,
+    // Word select high for the left channel, and each sample starts on the
+    // bit clock where word select changes.
+    LeftJustified,
+    // Word select high for the left channel, and each sample ends on the
+    // bit clock before word select changes, sign-extended above in a wider
+    // slot.
+    RightJustified
+}
+
+// Samples are i32 values with the audio sample in the most significant
+// bits: a 16-bit sample is `value << 16`, so full scale is the same at
+// every resolution and an implementation keeps the top bits it sends.
+// Stereo samples interleave, left first. Rate, resolution, channels, and
+// format are set when a stream is created.
+
+// An I2S output: samples that a DAC or amplifier plays at the stream's
+// sample rate. The implementation keeps a queue and plays silence when it
+// runs dry, so a program keeps the queue topped up from its poll.
+pub interface I2sOutput {
+    // Frames per second.
+    fn sample_rate(&self) -> u32
+    // Samples per frame: 1 or 2.
+    fn channels(&self) -> u32
+    // Queue samples to play, without waiting: as many whole frames as there
+    // is room for; returns how many samples. InvalidInput for a slice that
+    // is not whole frames.
+    fn poll_write(&mut self, samples: &[i32]) -> usize!Error
+}
+
+// An I2S input: samples a microphone or ADC sends at the stream's sample
+// rate.
+pub interface I2sInput {
+    fn sample_rate(&self) -> u32
+    fn channels(&self) -> u32
+    // The samples received since the last call, as many whole frames as
+    // fit `samples`, without waiting; returns how many samples. Overrun
+    // once if samples were lost because they were not read in time.
+    fn poll_read(&mut self, samples: &mut[i32]) -> usize!Error
+}
+
 // A watchdog: once started, it resets the chip unless the program feeds it
 // again within its timeout, so firmware that hangs restarts instead of
 // staying stuck. Its timeout is set when it is started; drivers and tasks
@@ -368,6 +1060,301 @@ pub interface DmaChannel {
     // Bus if a transfer since the last call hit a bus error, such as an
     // address with nothing behind it, which stops it.
     fn take_error(&mut self) -> void!Error
+}
+
+// A transfer between a buffer and a peripheral that runs while the program
+// does other work, usually by DMA, in one direction fixed when the session
+// is created. The session holds the buffer and lends it out only between
+// transfers, so the program never touches memory a transfer is moving:
+//
+//     transfer.buffer()?[0] = command    // fill it, then:
+//     transfer.start(count)?
+//     // ... other work, or return Pending from a task ...
+//     if transfer.poll_finish()? { ... read transfer.buffer()? ... }
+//
+// DmaStream implements it over any DmaChannel; peripheral drivers build
+// their DMA sessions on it, and fake.DmaBuffer stands in for one in tests.
+pub interface DmaBuffer {
+    // The buffer, to fill before a transfer or read after one. Busy while
+    // a transfer runs.
+    fn buffer(&mut self) -> &mut[u8]!Error
+    // The buffer's length in bytes, the most a transfer moves.
+    fn capacity(&self) -> usize
+    // Start moving buffer[..count], and return at once. InvalidInput for
+    // 0, more than the capacity, or a count the session cannot move (not a
+    // whole number of its elements); Busy while a transfer runs.
+    fn start(&mut self, count: usize) -> void!Error
+    // Without waiting: true once no transfer runs, false while one does.
+    // Bus if the transfer hit a bus error, Overrun if the peripheral lost
+    // data; either way it is over.
+    fn poll_finish(&mut self) -> bool!Error
+    // Stop the running transfer, if any; the peripheral saw only part of
+    // it.
+    fn abort(&mut self)
+}
+
+// An SPI bus whose transfers run by DMA over a buffer the session holds,
+// as DmaBuffer does, in both directions at once. A display driver streams
+// a frame with start_write; a flash driver reads a page with
+// start_transfer.
+pub interface SpiDma {
+    fn buffer(&mut self) -> &mut[u8]!Error
+    fn capacity(&self) -> usize
+    // Start sending buffer[..count] and replacing each byte with the one
+    // received meanwhile. Errors as for DmaBuffer.start.
+    fn start_transfer(&mut self, count: usize) -> void!Error
+    // Start sending buffer[..count], discarding what arrives; the buffer
+    // stays as it is.
+    fn start_write(&mut self, count: usize) -> void!Error
+    fn poll_finish(&mut self) -> bool!Error
+    fn abort(&mut self)
+}
+
+// The number of bytes in one element of `width`.
+pub fn dma_width_bytes(width: &DmaWidth) -> usize {
+    match width {
+        DmaWidth.Byte => {
+            return 1
+        }
+        DmaWidth.HalfWord => {
+            return 2
+        }
+        DmaWidth.Word => {
+            return 4
+        }
+    }
+}
+
+fn copy_width(width: &DmaWidth) -> DmaWidth {
+    match width {
+        DmaWidth.Byte => {
+            return DmaWidth.Byte
+        }
+        DmaWidth.HalfWord => {
+            return DmaWidth.HalfWord
+        }
+        DmaWidth.Word => {
+            return DmaWidth.Word
+        }
+    }
+}
+
+// A buffer moved to or from one peripheral data register by a DMA channel:
+// the part every DMA-backed peripheral driver shares, written once against
+// DmaChannel so it works with any chip's channels. It holds the channel and
+// the buffer until it is dropped and implements DmaBuffer. Each transfer
+// moves elements of the stream's width between the buffer, advancing, and
+// the register, staying, paced by the peripheral's data request.
+//
+// The peripheral driver around it turns the peripheral's DMA request on
+// before `start` and off after the transfer, and adds its own errors, as
+// pl022.DmaBus does for SPI. Dropping a stream aborts a running transfer.
+pub struct DmaStream: DmaBuffer {
+    channel: &mut dyn DmaChannel
+    buffer: &mut[u8]
+    register: usize
+    width: DmaWidth
+    receive: bool
+    running: bool
+
+    // A stream that sends `buffer` to the peripheral register at
+    // `register`, its address as the channel sees it, `width` at a time,
+    // whenever the peripheral asks for data. InvalidInput for an empty
+    // buffer or one not aligned to the width; Busy if the channel is
+    // running.
+    pub fn transmit(channel: &mut dyn DmaChannel, buffer: &mut[u8], register: usize, width: DmaWidth) -> DmaStream!Error from(channel, buffer) {
+        return DmaStream.open(channel, buffer, register, width, false)
+    }
+
+    // A stream that fills `buffer` from the peripheral register at
+    // `register` whenever the peripheral has data; errors as for transmit.
+    pub fn receive(channel: &mut dyn DmaChannel, buffer: &mut[u8], register: usize, width: DmaWidth) -> DmaStream!Error from(channel, buffer) {
+        return DmaStream.open(channel, buffer, register, width, true)
+    }
+
+    fn open(channel: &mut dyn DmaChannel, buffer: &mut[u8], register: usize, width: DmaWidth, receive: bool) -> DmaStream!Error from(channel, buffer) {
+        size := dma_width_bytes(&width)
+        if buffer.len == 0 || address_of(buffer) % size != 0 {
+            return err(Error.InvalidInput)
+        }
+        if channel.is_busy() {
+            return err(Error.Busy)
+        }
+        return ok(DmaStream { channel, buffer, register, width, receive, running: false })
+    }
+
+    // The buffer, between transfers; Busy while one runs.
+    pub fn buffer(&mut self) -> &mut[u8]!Error from(self) {
+        if self.running {
+            return err(Error.Busy)
+        }
+        return ok(&mut self.buffer[..])
+    }
+
+    pub fn capacity(&self) -> usize {
+        return self.buffer.len
+    }
+
+    // True for a stream that fills its buffer from the peripheral.
+    pub fn is_receive(&self) -> bool {
+        return self.receive
+    }
+
+    // The peripheral register the stream moves data to or from.
+    pub fn register(&self) -> usize {
+        return self.register
+    }
+
+    // Start moving buffer[..count]; see DmaBuffer.start. InvalidInput also
+    // for a count that is not a whole number of elements or more elements
+    // than the channel moves at once.
+    pub fn start(&mut self, count: usize) -> void!Error {
+        if self.running {
+            return err(Error.Busy)
+        }
+        size := dma_width_bytes(&self.width)
+        if count == 0 || count > self.buffer.len || count % size != 0 {
+            return err(Error.InvalidInput)
+        }
+        elements := count / size
+        if elements as u64 > self.channel.max_count() as u64 {
+            return err(Error.InvalidInput)
+        }
+        start := address_of(self.buffer)
+        transfer := DmaTransfer {
+            source: start,
+            destination: self.register,
+            count: elements as u32,
+            width: copy_width(&self.width),
+            increment_source: true,
+            increment_destination: false,
+            pace: DmaPace.Destination,
+            ring: DmaRing.None,
+        }
+        if self.receive {
+            transfer = DmaTransfer {
+                source: self.register,
+                destination: start,
+                count: elements as u32,
+                width: copy_width(&self.width),
+                increment_source: false,
+                increment_destination: true,
+                pace: DmaPace.Source,
+                ring: DmaRing.None,
+            }
+        }
+        // The fence makes the buffer's contents visible to the channel.
+        cpu.fence()
+        // SAFETY: the stream holds the buffer and lends it out again only
+        // once the channel is done or aborted.
+        unsafe {
+            self.channel.start(transfer)?
+        }
+        self.running = true
+        return ok()
+    }
+
+    // True while a transfer runs.
+    pub fn is_busy(&mut self) -> bool {
+        return self.running && self.channel.is_busy()
+    }
+
+    // The bytes the running transfer has yet to move: 0 once it is done.
+    pub fn remaining(&mut self) -> usize {
+        if !self.running {
+            return 0
+        }
+        return self.channel.remaining() as usize * dma_width_bytes(&self.width)
+    }
+
+    // See DmaBuffer.poll_finish.
+    pub fn poll_finish(&mut self) -> bool!Error {
+        if !self.running {
+            return ok(true)
+        }
+        if self.channel.is_busy() {
+            return ok(false)
+        }
+        self.running = false
+        // Makes what the channel wrote visible to the program.
+        cpu.fence()
+        self.channel.take_error()?
+        return ok(true)
+    }
+
+    // Wait until the running transfer, if any, is done; errors as for
+    // poll_finish.
+    pub fn finish(&mut self) -> void!Error {
+        for !self.poll_finish()? {}
+        return ok()
+    }
+
+    // Stop the running transfer, if any.
+    pub fn abort(&mut self) {
+        if self.running {
+            self.channel.abort()
+            self.running = false
+            cpu.fence()
+            // An aborted transfer has nothing to report.
+            match self.channel.take_error() {
+                ok() => {}
+                err(_) => {}
+            }
+        }
+    }
+
+    fn drop(&mut self) {
+        self.abort()
+    }
+}
+
+// Copy `source` into `destination` with a DMA channel and wait until it is
+// done: unpaced, in words where both addresses and the length allow.
+// InvalidInput if the lengths differ or are too many elements for the
+// channel, Busy if it is running, Bus for a bus error.
+pub fn dma_copy<C: DmaChannel>(channel: &mut C, destination: &mut[u8], source: &[u8]) -> void!Error {
+    if destination.len != source.len {
+        return err(Error.InvalidInput)
+    }
+    if source.len == 0 {
+        return ok()
+    }
+    if channel.is_busy() {
+        return err(Error.Busy)
+    }
+    origin := address_of(source)
+    to := address_of(destination)
+    width := DmaWidth.Byte
+    size := 1usize
+    if origin % 4 == 0 && to % 4 == 0 && source.len % 4 == 0 {
+        width = DmaWidth.Word
+        size = 4
+    } else if origin % 2 == 0 && to % 2 == 0 && source.len % 2 == 0 {
+        width = DmaWidth.HalfWord
+        size = 2
+    }
+    elements := source.len / size
+    if elements as u64 > channel.max_count() as u64 {
+        return err(Error.InvalidInput)
+    }
+    transfer := DmaTransfer {
+        source: origin,
+        destination: to,
+        count: elements as u32,
+        width,
+        increment_source: true,
+        increment_destination: true,
+        pace: DmaPace.Unpaced,
+        ring: DmaRing.None,
+    }
+    cpu.fence()
+    // SAFETY: both slices stay borrowed until the channel is done.
+    unsafe {
+        channel.start(transfer)?
+    }
+    for channel.is_busy() {}
+    cpu.fence()
+    return channel.take_error()
 }
 
 // Common I2C bus frequencies: standard mode, fast mode, and fast mode plus.
@@ -821,14 +1808,102 @@ pub fn write_register<B: I2c>(bus: &mut B, address: u8, register: u8, value: u8)
 // One device on a shared SPI bus, selected by an active-low chip-select pin.
 // The device owns its pin; the bus is passed to each transaction, so several
 // devices share one bus and the borrow checker keeps transactions apart.
+//
+// The poll_* methods run the same transactions on a SpiPoll bus without
+// waiting: the device stays selected from the first poll until the
+// transaction finishes, fails, or is cancelled, and other devices must not
+// use the bus meanwhile.
 pub struct SpiDevice<P: OutputPin> {
     select: P
+    // Of a polled transaction: 0 when none runs, 1 while the first or only
+    // part runs, 2 while write_read's read runs.
+    phase: u32
 
     // Takes the chip-select pin and deselects the device.
     pub fn new(select: P) -> SpiDevice<P> {
-        device := SpiDevice<P> { select }
+        device := SpiDevice<P> { select, phase: 0 }
         device.select.set_high()
         return device
+    }
+
+    // Advance a full-duplex exchange in place with the device selected;
+    // see SpiPoll.poll_transfer.
+    pub fn poll_transfer<B: SpiPoll>(&mut self, bus: &mut B, bytes: &mut[u8]) -> bool!Error {
+        self.begin()
+        result := bus.poll_transfer(bytes)
+        return self.end(result)
+    }
+
+    // Advance a write with the device selected; see SpiPoll.poll_write.
+    pub fn poll_write<B: SpiPoll>(&mut self, bus: &mut B, bytes: &[u8]) -> bool!Error {
+        self.begin()
+        result := bus.poll_write(bytes)
+        return self.end(result)
+    }
+
+    // Advance a write of `command` and then a read of `buffer.len` bytes in
+    // the same selection, as write_read does.
+    pub fn poll_write_read<B: SpiPoll>(&mut self, bus: &mut B, command: &[u8], buffer: &mut[u8]) -> bool!Error {
+        self.begin()
+        if self.phase == 1 {
+            match bus.poll_write(command) {
+                ok(done) => {
+                    if !done {
+                        return ok(false)
+                    }
+                }
+                err(error) => {
+                    self.deselect()
+                    return err(error)
+                }
+            }
+            self.phase = 2
+            for index in 0..buffer.len {
+                buffer[index] = 0
+            }
+        }
+        result := bus.poll_transfer(buffer)
+        return self.end(result)
+    }
+
+    // Abandon a polled transaction, if one runs, and deselect the device.
+    pub fn cancel<B: SpiPoll>(&mut self, bus: &mut B) {
+        if self.phase != 0 {
+            bus.cancel()
+            self.deselect()
+        }
+    }
+
+    // True while a polled transaction runs.
+    pub fn is_busy(&self) -> bool {
+        return self.phase != 0
+    }
+
+    fn begin(&mut self) {
+        if self.phase == 0 {
+            self.select.set_low()
+            self.phase = 1
+        }
+    }
+
+    fn end(&mut self, result: bool!Error) -> bool!Error {
+        match result {
+            ok(done) => {
+                if done {
+                    self.deselect()
+                }
+                return ok(done)
+            }
+            err(error) => {
+                self.deselect()
+                return err(error)
+            }
+        }
+    }
+
+    fn deselect(&mut self) {
+        self.select.set_high()
+        self.phase = 0
     }
 
     // Full-duplex exchange in place with the device selected.
@@ -866,7 +1941,220 @@ pub struct SpiDevice<P: OutputPin> {
 
     // Give back the chip-select pin.
     pub fn release(self) -> P {
-        let SpiDevice { select } = self
+        let SpiDevice { select, phase } = self
         return select
     }
+}
+
+// --- Blocking from polling -------------------------------------------------
+
+// Polls a blocking adapter or helper makes before it gives up with Timeout:
+// far more than any transaction a device answers takes (a 256-byte I2C
+// transfer at 100 kHz is about 25 ms, tens of thousands of polls), so only
+// a stuck bus reaches it. NO_POLL_LIMIT waits as long as it takes.
+pub const DEFAULT_POLL_LIMIT: u32 = 50_000_000
+pub const NO_POLL_LIMIT: u32 = 0
+
+fn out_of_polls(polls: &mut u32, limit: u32) -> bool {
+    *polls += 1
+    return limit != NO_POLL_LIMIT && *polls >= limit
+}
+
+// An I2C bus with the blocking I2c protocol over any I2cPoll
+// implementation: each transaction polls until it finishes, and after
+// DEFAULT_POLL_LIMIT polls (or set_poll_limit's) cancels it and reports
+// Timeout. A controller that implements only the polling form thereby
+// serves every blocking driver too.
+pub struct BlockingI2c<B: I2cPoll>: I2c {
+    bus: B
+    limit: u32
+
+    pub fn new(bus: B) -> BlockingI2c<B> {
+        return BlockingI2c<B> { bus, limit: DEFAULT_POLL_LIMIT }
+    }
+
+    // Give up after `polls` polls per transaction; NO_POLL_LIMIT never
+    // does.
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.limit = polls
+    }
+
+    pub fn write(&mut self, address: u8, bytes: &[u8]) -> void!Error {
+        polls := 0u32
+        for !self.bus.poll_write(address, bytes)? {
+            if out_of_polls(&mut polls, self.limit) {
+                self.bus.cancel()
+                return err(Error.Timeout)
+            }
+        }
+        return ok()
+    }
+
+    pub fn read(&mut self, address: u8, buffer: &mut[u8]) -> void!Error {
+        polls := 0u32
+        for !self.bus.poll_read(address, buffer)? {
+            if out_of_polls(&mut polls, self.limit) {
+                self.bus.cancel()
+                return err(Error.Timeout)
+            }
+        }
+        return ok()
+    }
+
+    pub fn write_read(&mut self, address: u8, bytes: &[u8], buffer: &mut[u8]) -> void!Error {
+        polls := 0u32
+        for !self.bus.poll_write_read(address, bytes, buffer)? {
+            if out_of_polls(&mut polls, self.limit) {
+                self.bus.cancel()
+                return err(Error.Timeout)
+            }
+        }
+        return ok()
+    }
+
+    // The bus, for its own methods.
+    pub fn bus(&mut self) -> &mut B {
+        return &mut self.bus
+    }
+
+    pub fn release(self) -> B {
+        let BlockingI2c { bus, limit } = self
+        return bus
+    }
+}
+
+// An SPI bus with the blocking Spi protocol over any SpiPoll
+// implementation, as BlockingI2c is for I2C.
+pub struct BlockingSpi<B: SpiPoll>: Spi {
+    bus: B
+    limit: u32
+
+    pub fn new(bus: B) -> BlockingSpi<B> {
+        return BlockingSpi<B> { bus, limit: DEFAULT_POLL_LIMIT }
+    }
+
+    pub fn set_poll_limit(&mut self, polls: u32) {
+        self.limit = polls
+    }
+
+    pub fn transfer(&mut self, bytes: &mut[u8]) -> void!Error {
+        polls := 0u32
+        for !self.bus.poll_transfer(bytes)? {
+            if out_of_polls(&mut polls, self.limit) {
+                self.bus.cancel()
+                return err(Error.Timeout)
+            }
+        }
+        return ok()
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> void!Error {
+        polls := 0u32
+        for !self.bus.poll_write(bytes)? {
+            if out_of_polls(&mut polls, self.limit) {
+                self.bus.cancel()
+                return err(Error.Timeout)
+            }
+        }
+        return ok()
+    }
+
+    pub fn bus(&mut self) -> &mut B {
+        return &mut self.bus
+    }
+
+    pub fn release(self) -> B {
+        let BlockingSpi { bus, limit } = self
+        return bus
+    }
+}
+
+// Wait for a DMA buffer transfer to finish; errors as for poll_finish.
+pub fn finish_transfer<T: DmaBuffer>(transfer: &mut T) -> void!Error {
+    for !transfer.poll_finish()? {}
+    return ok()
+}
+
+// Wait for the next measurement of a PWM input, polling at most `polls`
+// times (NO_POLL_LIMIT for no limit); Timeout after that.
+pub fn capture<P: PwmInput>(input: &mut P, polls: u32) -> PulseCapture!Error {
+    capture := PulseCapture.new()
+    count := 0u32
+    for !input.poll_capture(&mut capture)? {
+        if out_of_polls(&mut count, polls) {
+            return err(Error.Timeout)
+        }
+    }
+    return ok(capture)
+}
+
+// Send a CAN frame, waiting for a free transmit buffer for at most `polls`
+// polls (NO_POLL_LIMIT for no limit); Timeout after that, as on a bus where
+// no other node acknowledges frames, so none ever leaves.
+pub fn send_frame<C: Can>(can: &mut C, frame: &CanFrame, polls: u32) -> void!Error {
+    count := 0u32
+    for !can.poll_send(frame)? {
+        if out_of_polls(&mut count, polls) {
+            return err(Error.Timeout)
+        }
+    }
+    return ok()
+}
+
+// Wait for a CAN frame, for at most `polls` polls; Timeout after that.
+pub fn receive_frame<C: Can>(can: &mut C, frame: &mut CanFrame, polls: u32) -> void!Error {
+    count := 0u32
+    for !can.poll_receive(frame)? {
+        if out_of_polls(&mut count, polls) {
+            return err(Error.Timeout)
+        }
+    }
+    return ok()
+}
+
+// Queue all of `samples` on an I2S output, waiting for room; Timeout after
+// `polls` polls without progress (NO_POLL_LIMIT for no limit).
+pub fn write_samples<O: I2sOutput>(output: &mut O, samples: &[i32], polls: u32) -> void!Error {
+    sent := 0usize
+    count := 0u32
+    for sent < samples.len {
+        taken := output.poll_write(samples[sent..])?
+        if taken == 0 {
+            if out_of_polls(&mut count, polls) {
+                return err(Error.Timeout)
+            }
+        } else {
+            sent += taken
+            count = 0
+        }
+    }
+    return ok()
+}
+
+// Fill all of `samples` from an I2S input, waiting for them; Timeout after
+// `polls` polls without progress.
+pub fn read_samples<I: I2sInput>(input: &mut I, samples: &mut[i32], polls: u32) -> void!Error {
+    received := 0usize
+    count := 0u32
+    for received < samples.len {
+        taken := input.poll_read(&mut samples[received..])?
+        if taken == 0 {
+            if out_of_polls(&mut count, polls) {
+                return err(Error.Timeout)
+            }
+        } else {
+            received += taken
+            count = 0
+        }
+    }
+    return ok()
+}
+
+// A 16-bit sample as an I2S sample, and an I2S sample's top 16 bits.
+pub fn sample_from_i16(value: i16) -> i32 {
+    return (value as i32) << 16
+}
+
+pub fn sample_to_i16(sample: i32) -> i16 {
+    return (sample >> 16) as i16
 }

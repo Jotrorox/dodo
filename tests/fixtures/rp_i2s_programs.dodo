@@ -1,0 +1,177 @@
+package main
+
+import "std/embedded/chip/rp_pio"
+
+// The PIO programs of std/embedded/chip/rp_i2s in pioasm, as its comments
+// show them, assembled by the compiler for a board. rp_i2s builds the same
+// words in code so that it also runs in desktop tests, where the assembler
+// is not available; tests/hal_library.rs compares the words assembled here
+// with those tests/stdlib/i2s_checks.dodo expects from rp_i2s. OUT16_LEFT
+// serves both justified formats in 16-bit slots.
+
+const OUT32_PHILIPS: rp_pio.Program = rp_pio.assemble(
+    ".side_set 2",
+    ".out 1 left",
+    ".fifo tx",
+    ".mov_status txfifo < 2",
+    ".wrap_target",
+    "    out pins, 1    side 0b00 [1]",
+    "    set y, 29      side 0b01 [1]",
+    "lbits:",
+    "    out pins, 1    side 0b00 [1]",
+    "    jmp y-- lbits  side 0b01 [1]",
+    "    out pins, 1    side 0b10",
+    "    jmp !x take_right side 0b10",
+    "    jmp right_msb  side 0b11 [1]",
+    "take_right:",
+    "    pull block     side 0b11 [1]",
+    "right_msb:",
+    "    out pins, 1    side 0b10 [1]",
+    "    set y, 29      side 0b11",
+    "    mov x, status  side 0b11",
+    "rbits:",
+    "    out pins, 1    side 0b10 [1]",
+    "    jmp y-- rbits side 0b11 [1]",
+    "    out pins, 1    side 0b00",
+    "    jmp !x take_left side 0b00",
+    "    jmp 0          side 0b01 [1]",
+    "take_left:",
+    "    pull block     side 0b01 [1]",
+    ".wrap",
+)
+
+const OUT32_LEFT: rp_pio.Program = rp_pio.assemble(
+    ".side_set 2",
+    ".out 1 left",
+    ".fifo tx",
+    ".mov_status txfifo < 2",
+    ".wrap_target",
+    "    out pins, 1    side 0b10 [1]",
+    "    set y, 29      side 0b11 [1]",
+    "lbits:",
+    "    out pins, 1    side 0b10 [1]",
+    "    jmp y-- lbits  side 0b11 [1]",
+    "    out pins, 1    side 0b10",
+    "    jmp !x take_right side 0b10",
+    "    jmp right_msb  side 0b11 [1]",
+    "take_right:",
+    "    pull block     side 0b11 [1]",
+    "right_msb:",
+    "    out pins, 1    side 0b00 [1]",
+    "    set y, 29      side 0b01",
+    "    mov x, status  side 0b01",
+    "rbits:",
+    "    out pins, 1    side 0b00 [1]",
+    "    jmp y-- rbits side 0b01 [1]",
+    "    out pins, 1    side 0b00",
+    "    jmp !x take_left side 0b00",
+    "    jmp 0          side 0b01 [1]",
+    "take_left:",
+    "    pull block     side 0b01 [1]",
+    ".wrap",
+)
+
+const OUT16_PHILIPS: rp_pio.Program = rp_pio.assemble(
+    ".side_set 2",
+    ".out 1 left",
+    ".fifo tx",
+    ".wrap_target",
+    "    out pins, 1    side 0b00 [1]",
+    "    set y, 13      side 0b01 [1]",
+    "lbits:",
+    "    out pins, 1    side 0b00 [1]",
+    "    jmp y-- lbits  side 0b01 [1]",
+    "    out pins, 1    side 0b10 [1]",
+    "    set y, 14      side 0b11 [1]",
+    "rbits:",
+    "    out pins, 1    side 0b10 [1]",
+    "    jmp y-- rbits side 0b11 [1]",
+    "    out pins, 1    side 0b00 [1]",
+    "    pull noblock   side 0b01 [1]",
+    ".wrap",
+)
+
+const OUT16_LEFT: rp_pio.Program = rp_pio.assemble(
+    ".side_set 2",
+    ".out 1 left",
+    ".fifo tx",
+    ".wrap_target",
+    "    out pins, 1    side 0b10 [1]",
+    "    set y, 13      side 0b11 [1]",
+    "lbits:",
+    "    out pins, 1    side 0b10 [1]",
+    "    jmp y-- lbits  side 0b11 [1]",
+    "    out pins, 1    side 0b10 [1]",
+    "    set y, 14      side 0b11 [1]",
+    "rbits:",
+    "    out pins, 1    side 0b00 [1]",
+    "    jmp y-- rbits side 0b01 [1]",
+    "    out pins, 1    side 0b00 [1]",
+    "    pull noblock   side 0b01 [1]",
+    ".wrap",
+)
+
+const IN32_LEFT: rp_pio.Program = rp_pio.assemble(
+    ".side_set 2",
+    ".in 32 left auto 32",
+    ".fifo rx",
+    ".wrap_target",
+    "    set y, 30      side 0b10 [1]",
+    "lbits:",
+    "    in pins, 1     side 0b11 [1]",
+    "    jmp y-- lbits  side 0b10 [1]",
+    "    in pins, 1     side 0b11 [1]",
+    "    set y, 30      side 0b00 [1]",
+    "rbits:",
+    "    in pins, 1     side 0b01 [1]",
+    "    jmp y-- rbits side 0b00 [1]",
+    "    in pins, 1     side 0b01 [1]",
+    ".wrap",
+)
+
+const IN32_PHILIPS: rp_pio.Program = rp_pio.assemble(
+    ".side_set 2",
+    ".in 32 left auto 32",
+    ".fifo rx",
+    ".wrap_target",
+    "    set y, 30      side 0b00 [1]",
+    "lbits:",
+    "    in pins, 1     side 0b01 [1]",
+    "    jmp y-- lbits  side 0b00 [1]",
+    "    in pins, 1     side 0b01 [1]",
+    "    set y, 30      side 0b10 [1]",
+    "rbits:",
+    "    in pins, 1     side 0b11 [1]",
+    "    jmp y-- rbits side 0b10 [1]",
+    "    in pins, 1     side 0b11 [1]",
+    ".wrap",
+)
+
+const IN16_PHILIPS: rp_pio.Program = rp_pio.assemble(
+    ".side_set 2",
+    ".in 32 left auto 32",
+    ".fifo rx",
+    ".wrap_target",
+    "    set y, 14      side 0b00 [1]",
+    "lbits:",
+    "    in pins, 1     side 0b01 [1]",
+    "    jmp y-- lbits  side 0b00 [1]",
+    "    in pins, 1     side 0b01 [1]",
+    "    set y, 14      side 0b10 [1]",
+    "rbits:",
+    "    in pins, 1     side 0b11 [1]",
+    "    jmp y-- rbits side 0b10 [1]",
+    "    in pins, 1     side 0b11 [1]",
+    ".wrap",
+)
+
+const EXECS: rp_pio.Program = rp_pio.assemble("mov osr, null", "mov x, ~null", "set x, 0", "set y, 30")
+
+// Keeps every program in the build.
+pub fn lengths() -> u32 {
+    return OUT32_PHILIPS.length + OUT32_LEFT.length + OUT16_PHILIPS.length + OUT16_LEFT.length + IN32_LEFT.length + IN32_PHILIPS.length + IN16_PHILIPS.length + EXECS.length
+}
+
+fn main() {
+    core.assert(lengths() > 0)
+}

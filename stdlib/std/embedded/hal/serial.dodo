@@ -1,0 +1,34 @@
+package serial
+
+import "std/io"
+
+// The serial port protocols of std/embedded/hal, kept in a package of
+// their own because they are built on std/io's streams: std/embedded/hal
+// itself depends on no stream package, so every driver can import it.
+//
+// A serial port is a byte stream. Ports implement std/io's Reader and
+// Writer, so std/io helpers and std/fmt formatting work with them
+// unchanged; `Port` adds `flush`, and `PollPort` is the polling form, which
+// never waits, under the contract described in std/embedded/hal's "Blocking
+// and polling". The chips' UARTs, their USB serial ports, and fake.Serial
+// implement both.
+
+// A serial port: a byte stream with std/io's read and write, which waits
+// for room or for the first byte, and `flush`, which waits until every
+// byte written has left the transmitter. Drivers for devices on a UART name
+// `S: serial.Port` when they need flush and `io.ReadWriter` when not.
+pub interface Port: io.ReadWriter {
+    fn flush(&mut self) -> void!io.Error
+}
+
+// A serial port that moves bytes without waiting, with the progress
+// contract of std/io: poll_read returns what has arrived, up to
+// `buffer.len`, and Pending with nothing while nothing has; poll_write
+// takes what there is room for and is Pending once it took less than all.
+pub interface PollPort {
+    fn poll_read(&mut self, buffer: &mut[u8]) -> io.Poll!io.Error
+    fn poll_write(&mut self, bytes: &[u8]) -> io.Poll!io.Error
+    // True once every byte written has left the transmitter, stop bits
+    // included; false while some are still going out.
+    fn poll_flush(&mut self) -> bool!io.Error
+}

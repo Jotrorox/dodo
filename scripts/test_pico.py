@@ -93,7 +93,7 @@ LAST_CHECKS = [
     "SPI loopback by DMA runs while the program spins and raises the channel's signal",
     "UART DMA ring is the largest aligned block of its buffer",
     "UART loopback by DMA keeps 100 bytes in the ring until they are read",
-    "queued I2C read of an absent device is NoAcknowledge, polled meanwhile",
+    "polled I2C read of an absent device takes many polls and is NoAcknowledge",
     "DMA channels are given back",
     "core 1 starts, reports its number, and answers over the FIFO; a small stack and a third FIFO end are refused",
     "spinlocks are claimed once and exclude; both cores count 10000 each under one",
