@@ -48,13 +48,15 @@ struct I2cModel {
     // A missing acknowledge raises NACK first, and the stop that follows
     // a read later.
     nack_lag: u32
+    // State machine resets (CTR.FSM_RST).
+    resets: u32
 
     fn new(delay: u32) -> I2cModel {
         memory: [256]u8 = [0; 256]
         for index in 0..256usize {
             memory[index] = ((index * 5 + 1) & 255) as u8
         }
-        return I2cModel { registers: [0u32; 64], tx: [0; 40], tx_count: 0, rx: [0; 40], rx_count: 0, raw: 0, memory, pointer: 0, pointer_set: false, events: [0u32; 400], event_count: 0, held: false, addressed: false, ten_bit_low: false, delay, pending: 0, starts: 0, nack_lag: 0 }
+        return I2cModel { registers: [0u32; 64], tx: [0; 40], tx_count: 0, rx: [0; 40], rx_count: 0, raw: 0, memory, pointer: 0, pointer_set: false, events: [0u32; 400], event_count: 0, held: false, addressed: false, ten_bit_low: false, delay, pending: 0, starts: 0, nack_lag: 0, resets: 0 }
     }
 
     fn log(&mut self, event: u32) {
@@ -200,6 +202,7 @@ struct I2cModel {
                 self.pending = 0
                 self.nack_lag = 0
                 self.pointer_set = false
+                self.resets += 1
             }
             self.registers[1] = value & ~((1u32 << 5) | (1u32 << 10) | (1u32 << 11))
         } else {
@@ -280,14 +283,33 @@ fn i2c_polled_failures() {
     for !bus.poll_write_ten_bit(DEVICE10, &data)! {}
     expect_error_bool(bus.poll_write_ten_bit(0x400, &data), hal.Error.InvalidInput)
     expect_error_bool(bus.poll_write(0x80, &data), hal.Error.InvalidInput)
-    // A cancelled transaction: the next one runs normally.
+    // A cancelled transaction: its first run ends at its END, holding the
+    // bus, and a STOP of its own ends it, without a state machine reset;
+    // the next one runs normally.
     long: [50]u8 = [0x11; 50]
     core.assert(!bus.poll_write(DEVICE, &long)!)
     bus.cancel()
     core.assert(!bus.is_busy())
-    bus.write(DEVICE, &data)!
     model := bus.release()
+    core.assert(!model.held && model.events[model.event_count - 1] == STOP)
+    core.assert_eq(model.events[model.event_count - 2], 0x11u32)
+    resets := model.resets
+    bus = esp_i2c.Controller.new(model, esp_i2c.timing(40_000_000, 100_000)!)
+    core.assert(!bus.poll_write(DEVICE, &long)!)
+    bus.cancel()
+    bus.write(DEVICE, &data)!
+    model = bus.release()
+    // new() and release() reset the state machine; cancel did not.
+    core.assert_eq(model.resets, resets + 2)
     core.assert_eq(model.memory[0x07], 0x99u8)
+    // Cancelled during a missing acknowledge: it ends with the stop the
+    // controller sends.
+    bus = esp_i2c.Controller.new(model, esp_i2c.timing(40_000_000, 100_000)!)
+    core.assert(!bus.poll_write(0x51, &long)!)
+    bus.cancel()
+    bus.write(DEVICE, &data)!
+    model = bus.release()
+    core.assert_eq(model.resets, resets + 4)
 
     // The blocking adapter of std/embedded/hal over the polled form.
     blocking := hal.BlockingI2c.new(esp_i2c.Controller.new(I2cModel.new(2), esp_i2c.timing(40_000_000, 100_000)!))

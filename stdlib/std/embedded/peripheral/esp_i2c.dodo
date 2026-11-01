@@ -366,13 +366,29 @@ pub struct Controller<R: hal.Registers>: hal.I2c + hal.I2cPoll {
         return self.phase != IDLE
     }
 
-    // Abandon the running polled transaction, if any: the state machine is
-    // reset, which releases both lines, and the bus is waited for and
-    // cleared as after a failure, so the next transaction starts afresh.
+    // Abandon the running polled transaction, if any, so the next poll
+    // starts a new one. The run on the bus ends first, at its END or STOP
+    // command: up to 31 bytes' time (2.8 ms at 100 kHz), or the
+    // controller's own timeout. A transaction it left holding the bus then
+    // gets a STOP of its own. Resetting the state machine in the middle of
+    // a run instead can leave the controller hung, so cancel does that
+    // only when the run does not end or the bus failed.
     pub fn cancel(&mut self) {
-        if self.phase != IDLE {
-            self.fail()
+        if self.phase == IDLE {
+            return
         }
+        self.phase = IDLE
+        if self.wait_run() != END_DETECT {
+            return
+        }
+        // Held at an END, with SCL low: end the transaction with a STOP.
+        self.begin()
+        self.add(OP_STOP)
+        self.execute()
+        if self.wait_run() != TRANS_COMPLETE {
+            return
+        }
+        self.reset()
     }
 
     // Give back the registers, with the controller stopped. A polled
@@ -605,6 +621,27 @@ pub struct Controller<R: hal.Registers>: hal.I2c + hal.I2cPoll {
             }
         }
         return true
+    }
+
+    // Wait for the run on the bus to end. TRANS_COMPLETE once it ended with
+    // a STOP (after a missing acknowledge too), END_DETECT if it holds the
+    // bus at an END, and 0 if it did not end or the bus failed, after which
+    // the state machine has been reset, as after any failure.
+    fn wait_run(&mut self) -> u32 {
+        for _ in 0..POLLS {
+            raw := self.registers.read(INT_RAW)
+            if (raw & (ARBITRATION_LOST | TIMEOUTS)) != 0 {
+                break
+            }
+            if (raw & TRANS_COMPLETE) != 0 {
+                return TRANS_COMPLETE
+            }
+            if (raw & END_DETECT) != 0 && (raw & NACK) == 0 {
+                return END_DETECT
+            }
+        }
+        self.recover()
+        return 0
     }
 
     // End a failed or abandoned transaction.
