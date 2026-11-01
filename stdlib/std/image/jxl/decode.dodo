@@ -151,6 +151,22 @@ fn make_header(h: &ImageHeader, s: &Scan, data_len: usize) -> pixels.Header {
     return header
 }
 
+// The header decode_extra_channel() reports: info()'s with the extra
+// channel's gray layout and depth.
+fn make_extra_header(h: &ImageHeader, s: &Scan, e: &EcInfo) -> pixels.Header {
+    header := pixels.Header.new(pixels.Format.Jxl, h.width, h.height, extra_layout(e.bits, e.exp_bits), e.bits)
+    header.orientation = color.orientation_from_exif(h.orientation)
+    header.frames = s.displayed
+    if header.frames == 0 {
+        header.frames = 1
+    }
+    header.animated = h.animated
+    header.loops = h.loops
+    header.lossy = h.xyb || s.any_vardct
+    header.progressive = s.progressive
+    return header
+}
+
 // EXIF and XMP boxes of a container file, and the ICC profile (entropy
 // coded in the codestream: decode it with icc()).
 pub fn metadata(data: &[u8]) -> meta.Metadata!pixels.Error {
@@ -237,6 +253,8 @@ struct Plan {
     slot_pixels: [4]usize
     ftemp: usize
     noise: usize
+    // Coded-size planes for patches and splines of upsampled frames.
+    low: usize
     splines: bool
     tile: usize
     float_path: bool
@@ -246,6 +264,9 @@ struct Plan {
     vd_tiles: usize
     hdist: usize
     lf_slot: [3]usize
+    // Channel list capacity and the extra channel table.
+    chan: usize
+    ex_bytes: usize
     total: usize
 }
 
@@ -326,7 +347,7 @@ fn plan(h: &ImageHeader, s: &Scan) -> Plan!pixels.Error {
         wp_width = 65536
     }
     temp := wp_width + 16
-    p := Plan { window: fit(window)?, gdist: fit(gtree / 2 + 2)?, ldist: fit(ltree / 2 + 2)?, gtree: fit(gtree)?, ltree: fit(ltree)?, wp_width: fit(wp_width)?, temp: fit(temp)?, toc: fit(s.max_toc as u64)?, arena: fit(arena)?, planes: (3 + nec) as usize, frame_pixels: 0, canvas_pixels: 0, slot_pixels: [0usize; 4], ftemp: 0, noise: 0, splines: s.any_splines, tile: 0, float_path: s.float_path, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, hdist: 0, lf_slot: [0usize; 3], total: 0 }
+    p := Plan { window: fit(window)?, gdist: fit(gtree / 2 + 2)?, ldist: fit(ltree / 2 + 2)?, gtree: fit(gtree)?, ltree: fit(ltree)?, wp_width: fit(wp_width)?, temp: fit(temp)?, toc: fit(s.max_toc as u64)?, arena: fit(arena)?, planes: (3 + nec) as usize, frame_pixels: 0, canvas_pixels: 0, slot_pixels: [0usize; 4], ftemp: 0, noise: 0, low: 0, splines: s.any_splines, tile: 0, float_path: s.float_path, vd_planes: 0, vd_blocks: 0, vd_tiles: 0, hdist: 0, lf_slot: [0usize; 3], chan: 0, ex_bytes: extras_bytes(h.num_extra), total: 0 }
     layout := native_layout(h)
     p.tile = TILE * TILE * layout.bytes_per_pixel()
     total := SCAN_BYTES + 64
@@ -336,7 +357,19 @@ fn plan(h: &ImageHeader, s: &Scan) -> Plan!pixels.Error {
     total = checked_add(total, code_bytes(TRANSIENT_DIST, CODE_POOL) as u64)?
     total = checked_add(total, 2 * code_bytes(2, NESTED_POOL) as u64)?
     total = checked_add(total, (p.gtree + p.ltree) as u64 * 16 + 16)?
-    total = checked_add(total, 4 * (MAX_CHANNELS * CH_STRIDE * 4 + 8) as u64)?
+    // Channel lists: every channel, palette meta channels, and the
+    // residuals of squeezing each channel down to one sample.
+    widest_side := s.max_sample_width
+    if s.max_sample_height > widest_side {
+        widest_side = s.max_sample_height
+    }
+    chan := s.max_channels as u64 * (2 + 2 * ceil_log2(widest_side) as u64) + MAX_TRANSFORMS as u64
+    if chan < MAX_CHANNELS as u64 {
+        chan = MAX_CHANNELS as u64
+    }
+    p.chan = fit(chan)?
+    total = checked_add(total, 4 * (chan * CH_STRIDE as u64 * 4 + 8))?
+    total = checked_add(total, p.ex_bytes as u64)?
     total = checked_add(total, 2 * (MAX_TRANSFORMS * TR_STRIDE * 4 + 8) as u64)?
     total = checked_add(total, p.wp_width as u64 * 20 + 16)?
     total = checked_add(total, p.temp as u64 * 4 + 8)?
@@ -368,6 +401,8 @@ fn plan(h: &ImageHeader, s: &Scan) -> Plan!pixels.Error {
             p.noise = fit(3 * p.frame_pixels as u64)?
             floats += p.noise as u64 + 16
         }
+        p.low = fit(planes * s.low_pixels)?
+        floats += p.low as u64 + 16
         if s.any_splines {
             floats += (SPLINE_WORDS + 2 * MAX_SPLINE_POINTS) as u64 + 16
         }
@@ -451,6 +486,12 @@ pub fn decode<S: sink.Sink>(data: &[u8], output: &mut S, buffer: &mut[u8]) -> vo
 // animation shows), composited over earlier frames as the format
 // specifies.
 pub fn decode_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, buffer: &mut[u8]) -> void!pixels.Error {
+    return decode_selected(data, index, NO_EXTRA, output, buffer)
+}
+
+// decode_frame() for the color channels (select == NO_EXTRA) or for extra
+// channel `select` alone.
+fn decode_selected<S: sink.Sink>(data: &[u8], index: u32, select: usize, output: &mut S, buffer: &mut[u8]) -> void!pixels.Error {
     if buffer.len < SCAN_BYTES + 64 {
         return err(pixels.Error.BufferTooSmall)
     }
@@ -468,13 +509,22 @@ pub fn decode_frame<S: sink.Sink>(data: &[u8], index: u32, output: &mut S, buffe
     }
     first := first_needed_frame(data, &h, index, work)?
     header := make_header(&h, &s, data.len)
+    if select != NO_EXTRA {
+        r.seek_bit(h.ec_bit)
+        e := read_ec_info(&mut r)?
+        for k in 0usize..select {
+            e = read_ec_info(&mut r)?
+        }
+        header = make_extra_header(&h, &s, &e)
+    }
     layout := header.native.clone()
     output.begin(&header)?
-    return run(data, &h, &p, index, first, output, rest, &layout)
+    return run(data, &h, &p, index, first, output, rest, &layout, select)
 }
 
-// Carve the scratch and decode frames up to displayed frame `index`.
-fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: u32, output: &mut S, bytes: &mut[u8], layout: &pixels.Layout) -> void!pixels.Error {
+// Carve the scratch and decode frames up to displayed frame `index`; emit
+// the color channels (select == NO_EXTRA) or extra channel `select`.
+fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: u32, output: &mut S, bytes: &mut[u8], layout: &pixels.Layout, select: usize) -> void!pixels.Error {
     let slice.SplitMut { left: b_window, right: r1 } = scratch.split(bytes, p.window * 4 + 8)?
     let slice.SplitMut { left: b_gcode, right: r2 } = scratch.split(r1, code_bytes(p.gdist, CODE_POOL))?
     let slice.SplitMut { left: b_lcode, right: r3 } = scratch.split(r2, code_bytes(p.ldist, CODE_POOL))?
@@ -483,10 +533,10 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
     let slice.SplitMut { left: b_n2, right: r6 } = scratch.split(r5, code_bytes(2, NESTED_POOL))?
     let slice.SplitMut { left: b_gtree, right: r7 } = scratch.split(r6, p.gtree * 16 + 8)?
     let slice.SplitMut { left: b_ltree, right: r8 } = scratch.split(r7, p.ltree * 16 + 8)?
-    let slice.SplitMut { left: b_gch, right: r9 } = scratch.split(r8, MAX_CHANNELS * CH_STRIDE * 4 + 8)?
-    let slice.SplitMut { left: b_lch, right: r10 } = scratch.split(r9, MAX_CHANNELS * CH_STRIDE * 4 + 8)?
-    let slice.SplitMut { left: b_gstash, right: r11 } = scratch.split(r10, MAX_CHANNELS * CH_STRIDE * 4 + 8)?
-    let slice.SplitMut { left: b_lstash, right: r12 } = scratch.split(r11, MAX_CHANNELS * CH_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_gch, right: r9 } = scratch.split(r8, p.chan * CH_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_lch, right: r10 } = scratch.split(r9, p.chan * CH_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_gstash, right: r11 } = scratch.split(r10, p.chan * CH_STRIDE * 4 + 8)?
+    let slice.SplitMut { left: b_lstash, right: r12 } = scratch.split(r11, p.chan * CH_STRIDE * 4 + 8)?
     let slice.SplitMut { left: b_gtr, right: r13 } = scratch.split(r12, MAX_TRANSFORMS * TR_STRIDE * 4 + 8)?
     let slice.SplitMut { left: b_ltr, right: r14 } = scratch.split(r13, MAX_TRANSFORMS * TR_STRIDE * 4 + 8)?
     let slice.SplitMut { left: b_wperr, right: r15 } = scratch.split(r14, p.wp_width * 4 + 8)?
@@ -495,7 +545,8 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
     let slice.SplitMut { left: b_toc, right: r18 } = scratch.split(r17, p.toc * 16 + 8)?
     let slice.SplitMut { left: b_arena, right: r19 } = scratch.split(r18, p.arena * 4 + 8)?
     let slice.SplitMut { left: b_tile, right: r20 } = scratch.split(r19, p.tile + 8)?
-    let slice.SplitMut { left: b_vd, right: b_float } = scratch.split(r20, vardct_bytes(p) as usize)?
+    let slice.SplitMut { left: b_ex, right: r21 } = scratch.split(r20, p.ex_bytes)?
+    let slice.SplitMut { left: b_vd, right: b_float } = scratch.split(r21, vardct_bytes(p) as usize)?
     let slice.SplitMut { left: b_planes, right: v1 } = scratch.split(b_vd, vd_size(p, 4 * p.vd_planes))?
     let slice.SplitMut { left: b_dct, right: v2 } = scratch.split(v1, vd_size(p, 4 * DCT_TEMP))?
     let slice.SplitMut { left: b_lf, right: v3 } = scratch.split(v2, vd_size(p, 12 * p.vd_blocks))?
@@ -529,6 +580,8 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
     gtr := TrList { t: scratch.i32s(b_gtr), count: 0 }
     ltr := TrList { t: scratch.i32s(b_ltr), count: 0 }
     toc := scratch.u32s(b_toc)
+    ex := carve_extras(b_ex, h.num_extra)?
+    load_extras(data, h, &mut ex)?
     vals := FrameVals { m_lf: [0.0f32; 3], gend: 0, patches_bit: 0, splines_bit: 0, noise_lut: [0.0f32; 8], visible: 0, nonvisible: 0, wp: [0i32; 11] }
     r := open(data)?
     r.seek_byte(h.frames_byte)
@@ -542,10 +595,10 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
         r.seek_byte64(f.end())
     }
     if !p.float_path {
-        f := read_frame_header(&mut r, h)?
+        f := read_frame_header_ex(&mut r, h, &mut ex)?
         read_toc(&mut r, &mut f, toc, &mut tcode, &mut n1, &mut n2, window)?
-        decode_frame_data(&mut r, h, &f, &mut work, &mut gcode, &mut lcode, &mut tcode, &mut n1, &mut n2, window, &mut gch, &mut lch, &mut gstash, &mut lstash, &mut gtr, &mut ltr, toc, &mut vals, &mut vb, vplanes, dct, &mut hcode)?
-        return emit_direct(output, h, &f, &work, &gch, layout, b_tile)
+        decode_frame_data(&mut r, h, &f, &mut work, &mut gcode, &mut lcode, &mut tcode, &mut n1, &mut n2, window, &mut gch, &mut lch, &mut gstash, &mut lstash, &mut gtr, &mut ltr, toc, &mut vals, &mut vb, vplanes, dct, &mut hcode, &ex)?
+        return emit_direct(output, h, &f, &work, &gch, layout, b_tile, &ex, select)
     }
     // The float pipeline: frame planes, canvas, reference slots, rows.
     planes := p.planes
@@ -560,7 +613,8 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
     let slice.SplitMut { left: b_frame, right: f1 } = scratch.split(b_float, planes * p.frame_pixels * 4 + 8)?
     let slice.SplitMut { left: b_canvas, right: f2 } = scratch.split(f1, planes * p.canvas_pixels * 4 + 8)?
     let slice.SplitMut { left: b_slots, right: f3 } = scratch.split(f2, slot_total * 4 + 8)?
-    let slice.SplitMut { left: b_noise, right: f4 } = scratch.split(f3, p.noise * 4 + 8)?
+    let slice.SplitMut { left: b_noise, right: f3b } = scratch.split(f3, p.noise * 4 + 8)?
+    let slice.SplitMut { left: b_low, right: f4 } = scratch.split(f3b, p.low * 4 + 8)?
     sp_words := 0usize
     if p.splines {
         sp_words = SPLINE_WORDS
@@ -569,12 +623,12 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
     let slice.SplitMut { left: b_cpf, right: b_ftemp } = scratch.split(f5, sp_words / 2 * 4 + 8)?
     sbuf := scratch.i32s(b_sbuf)
     cpf := scratch.f32s(b_cpf)
-    fb := FloatBufs { frame: scratch.f32s(b_frame), canvas: scratch.f32s(b_canvas), slots: scratch.f32s(b_slots), ftemp: scratch.f32s(b_ftemp), noise: scratch.f32s(b_noise), planes: planes, fw: 0, fh: 0, slot_off: slot_off, slot_cap: slot_cap, slot_w: [0usize; 4], slot_h: [0usize; 4], slot_valid: [false; 4], use_canvas: p.canvas_pixels > 0 }
+    fb := FloatBufs { frame: scratch.f32s(b_frame), canvas: scratch.f32s(b_canvas), slots: scratch.f32s(b_slots), ftemp: scratch.f32s(b_ftemp), noise: scratch.f32s(b_noise), low: scratch.f32s(b_low), planes: planes, fw: 0, fh: 0, lw: 0, lh: 0, slot_off: slot_off, slot_cap: slot_cap, slot_w: [0usize; 4], slot_h: [0usize; 4], slot_valid: [false; 4], use_canvas: p.canvas_pixels > 0 }
     ct := xyb_transform(h)
     shown := 0u32
     frame := 0u32
     for {
-        f := read_frame_header(&mut r, h)?
+        f := read_frame_header_ex(&mut r, h, &mut ex)?
         read_toc(&mut r, &mut f, toc, &mut tcode, &mut n1, &mut n2, window)?
         frame += 1
         if f.is_keyframe() {
@@ -595,11 +649,11 @@ fn run<S: sink.Sink>(data: &[u8], h: &ImageHeader, p: &Plan, index: u32, first: 
             r.seek_byte64(f.end())
             continue
         }
-        decode_frame_data(&mut r, h, &f, &mut work, &mut gcode, &mut lcode, &mut tcode, &mut n1, &mut n2, window, &mut gch, &mut lch, &mut gstash, &mut lstash, &mut gtr, &mut ltr, toc, &mut vals, &mut vb, vplanes, dct, &mut hcode)?
-        render_frame(&mut r, h, &f, &mut work, &gch, &vals, &mut fb, &mut vb, vplanes, sbuf, cpf, &mut tcode, &mut n1, &mut n2, window, &ct)?
+        decode_frame_data(&mut r, h, &f, &mut work, &mut gcode, &mut lcode, &mut tcode, &mut n1, &mut n2, window, &mut gch, &mut lch, &mut gstash, &mut lstash, &mut gtr, &mut ltr, toc, &mut vals, &mut vb, vplanes, dct, &mut hcode, &ex)?
+        render_frame(&mut r, h, &f, &mut work, &gch, &vals, &mut fb, &mut vb, vplanes, sbuf, cpf, &mut tcode, &mut n1, &mut n2, window, &ct, &mut ex)?
         if f.is_keyframe() {
             if shown == index {
-                return emit_canvas(output, h, &fb, layout, b_tile)
+                return emit_canvas(output, h, &fb, layout, b_tile, &ex, select)
             }
             shown += 1
         }
@@ -647,10 +701,7 @@ fn first_needed_frame(data: &[u8], h: &ImageHeader, index: u32, work: &mut[u8]) 
                 usable = false
             }
             if f.needs_blending(h.num_extra) {
-                sources := 1u32 << f.blend_source
-                for e in 0usize..h.num_extra as usize {
-                    sources = sources | (1u32 << f.ec_blend_source[e])
-                }
+                sources := (1u32 << f.blend_source) | f.ec_sources
                 for k in 0usize..4 {
                     if (sources & (1u32 << (k as u32))) != 0 && (!written[k] || writer[k] < candidate) {
                         usable = false

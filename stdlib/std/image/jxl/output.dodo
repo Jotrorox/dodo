@@ -24,15 +24,15 @@ fn native_layout(h: &ImageHeader) -> pixels.Layout {
     bits := h.bits
     float := h.exp_bits > 0
     premultiplied := false
-    if alpha < MAX_EXTRA {
+    if alpha != NO_EXTRA {
         channels += 1
-        if h.ec_bits[alpha] > bits {
-            bits = h.ec_bits[alpha]
+        if h.alpha_bits > bits {
+            bits = h.alpha_bits
         }
-        if h.ec_exp_bits[alpha] > 0 {
+        if h.alpha_exp_bits > 0 {
             float = true
         }
-        premultiplied = h.ec_associated[alpha]
+        premultiplied = h.alpha_associated
     }
     sample := pixels.SAMPLE_U8
     if float || bits > 16 {
@@ -168,15 +168,16 @@ fn put_sample(row: &mut[u8], at: usize, sample: u32, value: u32) {
 }
 
 // Emit a frame straight from the arena: channels 0..color are the color
-// samples (1 or 3), the alpha extra channel follows the image header.
-fn emit_direct<S: sink.Sink>(output: &mut S, h: &ImageHeader, f: &FrameHeader, work: &ModularWork, gch: &ChanList, layout: &pixels.Layout, tile: &mut[u8]) -> void!pixels.Error {
+// samples (1 or 3), the alpha extra channel follows the image header. With
+// `select` < NO_EXTRA, extra channel `select` alone (gray) instead.
+fn emit_direct<S: sink.Sink>(output: &mut S, h: &ImageHeader, f: &FrameHeader, work: &ModularWork, gch: &ChanList, layout: &pixels.Layout, tile: &mut[u8], ex: &Extras, select: usize) -> void!pixels.Error {
     color := f.color_channels as usize
     channels := layout.channel_count()
     sample := layout.sample_code()
     size := layout.sample_bytes()
     bpp := layout.bytes_per_pixel()
     alpha := h.alpha_channel()
-    has_alpha := alpha < MAX_EXTRA && layout.has_alpha()
+    has_alpha := alpha != NO_EXTRA && layout.has_alpha()
     width := h.width as usize
     height := h.height as usize
     tile_dim := f.group_dim as usize
@@ -202,8 +203,13 @@ fn emit_direct<S: sink.Sink>(output: &mut S, h: &ImageHeader, f: &FrameHeader, w
     }
     if has_alpha {
         src[channels - 1] = color + alpha
-        bits[channels - 1] = h.ec_bits[alpha]
-        exps[channels - 1] = h.ec_exp_bits[alpha]
+        bits[channels - 1] = h.alpha_bits
+        exps[channels - 1] = h.alpha_exp_bits
+    }
+    if select != NO_EXTRA {
+        src[0] = color + select
+        bits[0] = ex.get(select, EX_BITS)
+        exps[0] = ex.get(select, EX_EXP)
     }
     ty := 0usize
     for ty < height {
