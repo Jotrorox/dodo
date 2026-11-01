@@ -1,0 +1,859 @@
+package lua
+
+import "core/mem"
+import "core/ptr"
+
+// Calls, returns, protected calls, to-be-closed variables and coroutines.
+//
+// Lua-to-Lua calls never recurse on the native stack: the interpreter pushes
+// a CallInfo and continues in the same vm_execute activation. Native code
+// that calls a function (the API, metamethods) re-enters through call_value,
+// which counts nesting in `n_ccalls` (limit MAX_CCALLS: "C stack overflow").
+//
+// Errors are ordinary `err` returns. A protected call catches them, runs the
+// message handler while the failing frames are still in place (so tracebacks
+// see them), then unwinds: restores the frame, closes upvalues and pending
+// to-be-closed variables, and leaves the error object where the function was.
+//
+// A yield is the `err(Throw.Yield)` return of a native function (normally
+// coroutine.yield). It unwinds the native stack up to the resume, leaving
+// every CallInfo in place; resume continues the interrupted Lua frames
+// (finishing the instruction that was interrupted, see vm_finish_op) and the
+// interrupted native frames through their continuations.
+
+const MULTRET: i32 = -1
+
+// Check the native nesting level after an increment.
+fn check_cstack(L: *mut State) -> void!Throw {
+    unsafe {
+        let n = (*L).n_ccalls
+        if n == MAX_CCALLS {
+            return err(err_runtime(L, "C stack overflow"))
+        }
+        if n >= MAX_CCALLS / 10 * 11 {
+            return err(err_set_handler_error(L))
+        }
+        return ok()
+    }
+}
+
+// Move `nres` results (on top of the stack) to `res`, adjusted to `wanted`.
+fn move_results(L: *mut State, res: *mut Value, nres: i32, wanted: i32) {
+    unsafe {
+        if wanted == 0 {
+            (*L).top = res
+            return
+        }
+        if wanted == 1 {
+            if nres == 0 {
+                (*res).tag = TAG_NIL
+            } else {
+                set_obj(res, ptr.offset((*L).top, -(nres as isize)))
+            }
+            (*L).top = ptr.offset(res, 1)
+            return
+        }
+        let first = ptr.offset((*L).top, -(nres as isize))
+        if wanted == MULTRET {
+            for i in 0isize..(nres as isize) {
+                set_obj(ptr.offset(res, i), ptr.offset(first, i))
+            }
+            (*L).top = ptr.offset(res, nres as isize)
+            return
+        }
+        let ncopy = if nres < wanted {
+            nres
+        } else {
+            wanted
+        }
+        for i in 0isize..(ncopy as isize) {
+            set_obj(ptr.offset(res, i), ptr.offset(first, i))
+        }
+        for i in (ncopy as isize)..(wanted as isize) {
+            (*ptr.offset(res, i)).tag = TAG_NIL
+        }
+        (*L).top = ptr.offset(res, wanted as isize)
+    }
+}
+
+// Finish a call: run the return hook, move the results into place and
+// return to the previous frame.
+@inline(never)
+fn poscall(L: *mut State, ci: *mut CallInfo, nres: i32) -> void!Throw {
+    unsafe {
+        // A native function's to-be-closed slots are closed on return.
+        if (*L).tbc_count > 0 && ((*ci).callstatus & CIST_NATIVE) != 0 {
+            let level = save_stack(L, (*ci).func) + 1
+            if tbc_top(L) >= level {
+                let res_off = save_stack(L, (*L).top) - (nres as isize)
+                // Keep the results above everything while closing.
+                do_close(L, level, CLOSE_KTOP, false)?
+                (*L).top = restore_stack(L, res_off + (nres as isize))
+            }
+        }
+        let wanted = (*ci).nresults
+        if (*L).hookmask != 0 {
+            hook_return(L, ci, nres)?
+        }
+        move_results(L, (*ci).func, nres, wanted)
+        (*L).ci = (*ci).previous
+        return ok()
+    }
+}
+
+// Insert the __call metamethod of the value at `func` below it (shifting
+// the arguments up). Returns the new function slot.
+fn try_call_tm(L: *mut State, func0: *mut Value) -> (*mut Value)!Throw {
+    unsafe {
+        let off = save_stack(L, func0)
+        stack_check(L, 1)?
+        let func = restore_stack(L, off)
+        let tm = meta_get_tm_by_obj(L, func, TM_CALL)
+        if val_is_nil(tm) {
+            return err(err_call(L, func))
+        }
+        p := (*L).top
+        for p as usize > func as usize {
+            set_obj(p, ptr.offset(p, -1))
+            p = ptr.offset(p, -1)
+        }
+        (*L).top = ptr.offset((*L).top, 1)
+        set_obj(func, tm)
+        return ok(func)
+    }
+}
+
+// Call a native function at `func` with the arguments above it; its
+// results end up at func.. (adjusted to `nresults`).
+fn precall_native(L: *mut State, func0: *mut Value, nresults: i32, f: NativeFn) -> void!Throw {
+    unsafe {
+        func := func0
+        if sdiff((*L).stack_last, (*L).top) <= MIN_STACK {
+            let off = save_stack(L, func0)
+            stack_grow(L, MIN_STACK)?
+            func = restore_stack(L, off)
+        }
+        let cur = (*L).ci
+        ci := (*cur).next
+        if ptr.is_null(ci) {
+            ci = ci_extend(L, cur)?
+        }
+        (*L).ci = ci
+        (*ci).nresults = nresults
+        (*ci).callstatus = CIST_NATIVE
+        (*ci).func = func
+        (*ci).top = ptr.offset((*L).top, MIN_STACK)
+        if ((*L).hookmask & HOOK_MASK_CALL) != 0 {
+            let narg = sdiff((*L).top, func) - 1
+            hook_call_native(L, ci, narg as i32)?
+        }
+        cx := Cx { L: L }
+        let n = f(&mut cx)?
+        poscall(L, ci, n)?
+        return ok()
+    }
+}
+
+// Prepare a call of the value at `func` (arguments up to top). For a Lua
+// function, push its frame (it becomes L.ci; the caller runs it); for a
+// native function, run it to completion (L.ci is unchanged afterwards).
+@inline(never)
+fn precall(L: *mut State, func0: *mut Value, nresults: i32) -> void!Throw {
+    unsafe {
+        func := func0
+        for {
+            let tag = (*func).tag
+            if tag == TAG_LCLOSURE {
+                let p = (*(val_gc(func) as *mut LClosure)).p
+                let fsize = (*p).maxstacksize as isize
+                if sdiff((*L).stack_last, (*L).top) <= fsize {
+                    let off = save_stack(L, func)
+                    stack_grow(L, fsize)?
+                    func = restore_stack(L, off)
+                }
+                let cur = (*L).ci
+                ci := (*cur).next
+                if ptr.is_null(ci) {
+                    ci = ci_extend(L, cur)?
+                }
+                (*L).ci = ci
+                (*ci).nresults = nresults
+                (*ci).callstatus = 0
+                (*ci).func = func
+                (*ci).top = ptr.offset(func, 1 + fsize)
+                (*ci).savedpc = (*p).code
+                let narg = sdiff((*L).top, func) - 1
+                let nfix = (*p).numparams as isize
+                if narg < nfix {
+                    top := (*L).top
+                    for i in narg..nfix {
+                        (*top).tag = TAG_NIL
+                        top = ptr.offset(top, 1)
+                    }
+                    (*L).top = top
+                }
+                return ok()
+            }
+            if tag == TAG_LIGHTFN {
+                return precall_native(L, func, nresults, val_lightfn(func))
+            }
+            if tag == TAG_NCLOSURE {
+                let cl = val_gc(func) as *mut NClosure
+                return precall_native(L, func, nresults, (*cl).f)
+            }
+            func = try_call_tm(L, func)?
+        }
+    }
+}
+
+// Prepare a tail call from frame `ci` of the function at `func` with
+// `narg1` (function + arguments) values; `delta` is the vararg shift of the
+// calling frame. Stores -1 in *nres for a Lua callee (ci now runs it) or
+// the number of results of a native callee (on top of the stack).
+@inline(never)
+fn pretailcall(L: *mut State, ci: *mut CallInfo, func0: *mut Value, narg10: i32, delta: i32, nres: *mut i32) -> void!Throw {
+    unsafe {
+        func := func0
+        narg1 := narg10
+        for {
+            let tag = (*func).tag
+            if tag == TAG_LCLOSURE {
+                let cl = val_gc(func) as *mut LClosure
+                let p = (*cl).p
+                let fsize = (*p).maxstacksize as isize
+                let nfix = (*p).numparams as i32
+                if sdiff((*L).stack_last, (*L).top) <= fsize - (delta as isize) {
+                    let off = save_stack(L, func)
+                    stack_grow(L, fsize - (delta as isize))?
+                    func = restore_stack(L, off)
+                }
+                (*ci).func = ptr.offset((*ci).func, -(delta as isize))
+                let base = (*ci).func
+                for i in 0isize..(narg1 as isize) {
+                    set_obj(ptr.offset(base, i), ptr.offset(func, i))
+                }
+                for i in narg1..(nfix + 1) {
+                    (*ptr.offset(base, i as isize)).tag = TAG_NIL
+                }
+                (*ci).top = ptr.offset(base, 1 + fsize)
+                (*ci).savedpc = (*p).code
+                (*ci).callstatus = (*ci).callstatus | CIST_TAIL
+                let np = if narg1 > nfix + 1 {
+                    narg1
+                } else {
+                    nfix + 1
+                }
+                (*L).top = ptr.offset(base, np as isize)
+                *nres = -1
+                return ok()
+            }
+            if tag == TAG_NCLOSURE || tag == TAG_LIGHTFN {
+                let f = if tag == TAG_LIGHTFN {
+                    val_lightfn(func)
+                } else {
+                    (*(val_gc(func) as *mut NClosure)).f
+                }
+                let off = save_stack(L, func)
+                precall_native(L, func, MULTRET, f)?
+                *nres = sdiff((*L).top, restore_stack(L, off)) as i32
+                return ok()
+            }
+            func = try_call_tm(L, func)?
+            narg1 += 1
+        }
+    }
+}
+
+// Call the value at `func` (arguments up to top) from native code. The call
+// can yield if the context allows it.
+@inline(never)
+fn call_value(L: *mut State, func: *mut Value, nresults: i32) -> void!Throw {
+    unsafe {
+        (*L).n_ccalls = (*L).n_ccalls + 1
+        let old = (*L).ci
+        if (*L).n_ccalls >= MAX_CCALLS {
+            let off = save_stack(L, func)
+            check_cstack(L)?
+            precall(L, restore_stack(L, off), nresults)?
+        } else {
+            precall(L, func, nresults)?
+        }
+        let ci = (*L).ci
+        if ci != old {
+            (*ci).callstatus = CIST_FRESH
+            vm_execute(L, ci)?
+        }
+        (*L).n_ccalls = (*L).n_ccalls - 1
+        return ok()
+    }
+}
+
+// Call that cannot yield.
+fn call_noyield(L: *mut State, func: *mut Value, nresults: i32) -> void!Throw {
+    unsafe {
+        (*L).nny = (*L).nny + 1
+        call_value(L, func, nresults)?
+        (*L).nny = (*L).nny - 1
+        return ok()
+    }
+}
+
+// --- Message handler and protected calls ------------------------------------
+
+// Run the message handler (at stack offset L.errfunc) on the current error
+// object, repeating it on errors raised by the handler itself like nested
+// handler invocations would, until the native nesting limit turns the error
+// into "error in error handling". Returns the resulting status.
+fn call_handler(L: *mut State) -> i32 {
+    unsafe {
+        let saved = (*L).n_ccalls
+        status := ST_ERRRUN as i32
+        for {
+            (*L).n_ccalls = (*L).n_ccalls + 1
+            if (*L).n_ccalls >= MAX_CCALLS / 10 * 11 {
+                status = ST_ERRERR as i32
+                match err_set_handler_error(L) {
+                    Throw.Handler => {},
+                    _ => {
+                        status = ST_ERRMEM as i32
+                    },
+                }
+                break
+            }
+            if (*L).n_ccalls == MAX_CCALLS {
+                // The handler would overflow the native stack.
+                match err_runtime(L, "C stack overflow") {
+                    Throw.Runtime => {},
+                    _ => {
+                        status = ST_ERRMEM as i32
+                        break
+                    },
+                }
+                continue
+            }
+            match stack_check(L, 2) {
+                ok() => {},
+                err(e) => {
+                    status = throw_status(e)
+                    if status == ST_ERRRUN as i32 {
+                        continue
+                    }
+                    break
+                },
+            }
+            let top = (*L).top
+            set_obj(top, restore_stack(L, (*L).errfunc))
+            set_obj(ptr.offset(top, 1), L_errobj(L))
+            (*L).top = ptr.offset(top, 2)
+            match call_noyield(L, top, 1) {
+                ok() => {
+                    (*L).top = ptr.offset((*L).top, -1)
+                    set_obj(L_errobj(L), (*L).top)
+                    status = ST_ERRRUN as i32
+                    break
+                },
+                err(e) => {
+                    status = throw_status(e)
+                    if status != ST_ERRRUN as i32 {
+                        break
+                    }
+                },
+            }
+        }
+        (*L).n_ccalls = saved
+        return status
+    }
+}
+
+// Unwind after an error caught by a protected call whose function was at
+// stack offset `func_off` and whose caller frame was `old_ci`.
+fn pcall_recover(L: *mut State, status0: i32, old_ci: *mut CallInfo, func_off: isize, old_allowhook: u8, old_nny: u32, old_nccalls: u32) -> i32 {
+    unsafe {
+        status := status0
+        if status == ST_ERRRUN as i32 && (*L).errfunc != 0 {
+            status = call_handler(L)
+        }
+        (*L).ci = old_ci
+        (*L).allowhook = old_allowhook
+        (*L).nny = old_nny
+        (*L).n_ccalls = old_nccalls
+        status = do_close_protected(L, func_off, status)
+        move_error_obj(L, status, restore_stack(L, func_off))
+        stack_shrink(L)
+        return status
+    }
+}
+
+// Whether a status is an error status.
+fn is_error_status(status: i32) -> bool {
+    return status != ST_OK as i32 && status != ST_YIELD as i32 && status != CLOSE_KTOP
+}
+
+// Push the error object of `status` (resolving memory and handler errors).
+fn push_error_obj(L: *mut State, status: i32) {
+    unsafe {
+        set_error_obj(L, status, (*L).top)
+    }
+}
+
+// After closing in error mode the error object is on top: move it to `dest`
+// (the slot of the protected function) and make it the last value.
+fn move_error_obj(L: *mut State, status: i32, dest: *mut Value) {
+    unsafe {
+        if is_error_status(status) {
+            set_obj(dest, ptr.offset((*L).top, -1))
+            (*L).top = ptr.offset(dest, 1)
+        } else {
+            (*dest).tag = TAG_NIL
+            (*L).top = ptr.offset(dest, 1)
+        }
+    }
+}
+
+// Protected, non-yieldable call of the function at stack offset `func_off`
+// with message handler at offset `errfunc` (0: none). Returns the status;
+// on error the error object replaces the function and arguments.
+fn do_pcall_raw(L: *mut State, func_off: isize, nresults: i32, errfunc: isize) -> i32 {
+    unsafe {
+        let old_ci = (*L).ci
+        let old_allowhook = (*L).allowhook
+        let old_nny = (*L).nny
+        let old_nccalls = (*L).n_ccalls
+        let old_errfunc = (*L).errfunc
+        (*L).errfunc = errfunc
+        status := ST_OK as i32
+        match call_noyield(L, restore_stack(L, func_off), nresults) {
+            ok() => {},
+            err(e) => {
+                status = throw_status(e)
+                if status == ST_YIELD as i32 {
+                    // Cannot happen (non-yieldable); treat as a runtime error.
+                    status = ST_ERRRUN as i32
+                }
+                status = pcall_recover(L, status, old_ci, func_off, old_allowhook, old_nny, old_nccalls)
+            },
+        }
+        (*L).errfunc = old_errfunc
+        return status
+    }
+}
+
+// Run `f` (any Dodo body) protected; used for internal protected
+// operations. Errors leave the state at the error point; the caller restores.
+// Yieldable protected call with continuation (Cx.pcall_k): the calling
+// native frame records how to recover if an error happens after a yield.
+fn do_pcall_k(L: *mut State, func_off: isize, nresults: i32, errfunc: isize, ctx: isize, k: ContinuationFn) -> i32!Throw {
+    unsafe {
+        let ci = (*L).ci
+        (*ci).k = k
+        (*ci).ctx = ctx
+        (*ci).funcidx = func_off
+        (*ci).old_allowhook = (*L).allowhook
+        (*ci).old_errfunc = (*L).errfunc
+        (*L).errfunc = errfunc
+        (*ci).callstatus = (*ci).callstatus | CIST_YPCALL | CIST_HASK
+        let old_nny = (*L).nny
+        let old_nccalls = (*L).n_ccalls
+        status := ST_OK as i32
+        match call_value(L, restore_stack(L, func_off), nresults) {
+            ok() => {},
+            err(e) => {
+                if e == Throw.Yield {
+                    return err(Throw.Yield)
+                }
+                status = throw_status(e)
+            },
+        }
+        if status == ST_OK as i32 {
+            (*ci).callstatus = (*ci).callstatus & ~CIST_YPCALL
+            (*L).errfunc = (*ci).old_errfunc
+            return ok(status)
+        }
+        // Recover at this frame. Closing may yield (resumed through the
+        // continuation) or raise a new error (recovered again here).
+        for {
+            if status == ST_ERRRUN as i32 && (*L).errfunc != 0 {
+                status = call_handler(L)
+            }
+            (*L).ci = ci
+            (*L).nny = old_nny
+            (*L).n_ccalls = old_nccalls
+            match stack_check(L, 1) {
+                ok() => {},
+                err(_) => {},
+            }
+            push_error_obj(L, status)
+            (*ci).recover_status = status
+            (*ci).callstatus = (*ci).callstatus | CIST_RECST
+            match finish_pcall_k(L, ci) {
+                ok(st) => {
+                    return ok(st)
+                },
+                err(e) => {
+                    if e == Throw.Yield {
+                        return err(Throw.Yield)
+                    }
+                    status = throw_status(e)
+                },
+            }
+        }
+    }
+}
+
+// --- To-be-closed variables -------------------------------------------------
+
+// Mark the value at stack offset `off` as to-be-closed (nil and false are
+// ignored; values without __close are an error).
+@cold
+fn tbc_mark(L: *mut State, off: isize) -> void!Throw {
+    unsafe {
+        let obj = restore_stack(L, off)
+        if val_is_falsy(obj) {
+            return ok()
+        }
+        let tm = meta_get_tm_by_obj(L, obj, TM_CLOSE)
+        if val_is_nil(tm) {
+            let ci = (*L).ci
+            let idx = sdiff(obj, (*ci).func)
+            name := 0 as *mut LString
+            if ci_is_lua(ci) {
+                name = func_local_name(ci_proto(ci), idx as i32, dbg_current_pc(ci))
+            }
+            if ptr.is_null(name) {
+                return err(err_runtime(L, "variable '?' got a non-closable value"))
+            }
+            return err(err_runtime3(L, "variable '", name, "' got a non-closable value"))
+        }
+        return tbc_push(L, off)
+    }
+}
+
+// Call the __close metamethod of the to-be-closed value at offset `off`.
+// In error mode the error object is at off+1 (top is off+2).
+fn call_close_method(L: *mut State, off: isize, errmode: bool, yieldable: bool) -> void!Throw {
+    unsafe {
+        stack_check(L, 4)?
+        let obj = restore_stack(L, off)
+        let tm = meta_get_tm_by_obj(L, obj, TM_CLOSE)
+        let top = (*L).top
+        set_obj(top, tm)
+        set_obj(ptr.offset(top, 1), obj)
+        if errmode {
+            set_obj(ptr.offset(top, 2), ptr.offset(obj, 1))
+        } else {
+            (*ptr.offset(top, 2)).tag = TAG_NIL
+        }
+        (*L).top = ptr.offset(top, 3)
+        if yieldable {
+            return call_value(L, top, 0)
+        }
+        return call_noyield(L, top, 0)
+    }
+}
+
+// Status value meaning "normal close, keep the top" (used by RETURN).
+const CLOSE_KTOP: i32 = -1
+
+// Close upvalues and to-be-closed variables at or above stack offset
+// `level`. For an error `status` the current error object must be on top of
+// the stack; each __close receives it (and a new error replaces it).
+@cold
+fn do_close(L: *mut State, level: isize, status: i32, yieldable: bool) -> void!Throw {
+    unsafe {
+        func_close_upvals(L, restore_stack(L, level))
+        let errmode = is_error_status(status)
+        for (*L).tbc_count > 0 && tbc_top(L) >= level {
+            let off = tbc_top(L)
+            (*L).tbc_count = (*L).tbc_count - 1
+            if errmode {
+                // The error object goes right after the closed variable.
+                let errsrc = ptr.offset((*L).top, -1)
+                let slot = restore_stack(L, off + 1)
+                set_obj(slot, errsrc)
+                (*L).top = ptr.offset(slot, 1)
+            }
+            call_close_method(L, off, errmode, yieldable)?
+        }
+        return ok()
+    }
+}
+
+// Close everything at or above `level` in protected mode: an error in a
+// __close method replaces the current error and closing continues. For an
+// error status the error object is pushed first and left on top at the end.
+fn do_close_protected(L: *mut State, level: isize, status0: i32) -> i32 {
+    unsafe {
+        status := status0
+        let old_ci = (*L).ci
+        let old_allowhook = (*L).allowhook
+        let old_nny = (*L).nny
+        let old_nccalls = (*L).n_ccalls
+        if is_error_status(status) {
+            match stack_check(L, 1) {
+                ok() => {},
+                err(_) => {},
+            }
+            push_error_obj(L, status)
+        }
+        for {
+            match do_close(L, level, status, false) {
+                ok() => {
+                    return status
+                },
+                err(e) => {
+                    status = throw_status(e)
+                    (*L).ci = old_ci
+                    (*L).allowhook = old_allowhook
+                    (*L).nny = old_nny
+                    (*L).n_ccalls = old_nccalls
+                    push_error_obj(L, status)
+                },
+            }
+        }
+    }
+}
+
+// --- Coroutines -------------------------------------------------------------
+
+// Error raised by a failed resume before it runs: the message replaces the
+// arguments on the coroutine's stack.
+fn resume_error(L: *mut State, msg: &str, nargs: i32) -> i32 {
+    unsafe {
+        (*L).top = ptr.offset((*L).top, -(nargs as isize))
+        match str_from(L, msg) {
+            ok(s) => {
+                set_str((*L).top, s)
+            },
+            err(_) => {
+                set_str((*L).top, (*G(L)).memerrmsg)
+            },
+        }
+        (*L).top = ptr.offset((*L).top, 1)
+        return ST_ERRRUN as i32
+    }
+}
+
+// Complete an interrupted native frame (after a yield or a recovered error)
+// and return from it.
+fn finish_native(L: *mut State, ci: *mut CallInfo) -> void!Throw {
+    unsafe {
+        n := 0i32
+        if ((*ci).callstatus & CIST_HASK) == 0 {
+            // No continuation: the frame was the yielding function itself;
+            // its results are the values on top (the resume arguments).
+            n = sdiff((*L).top, (*ci).func) as i32 - 1
+            if ((*ci).callstatus & CIST_RECST) != 0 {
+                n = 0
+            }
+        } else {
+            status := ST_YIELD as i32
+            if ((*ci).callstatus & CIST_YPCALL) != 0 {
+                status = finish_pcall_k(L, ci)?
+            }
+            if (*ci).nresults == MULTRET && (*ci).top as usize < (*L).top as usize {
+                (*ci).top = (*L).top
+            }
+            cx := Cx { L: L }
+            let k = (*ci).k
+            n = k(&mut cx, status, (*ci).ctx)?
+        }
+        poscall(L, ci, n)?
+        return ok()
+    }
+}
+
+// The protected call of a yieldable pcall finished (normally, or by an error
+// recovered at this frame): returns the status for the continuation. When
+// recovering, the error object is on top of the stack and pending
+// to-be-closed variables are closed (this may yield or raise again; the
+// frame keeps its recovery state until it completes).
+fn finish_pcall_k(L: *mut State, ci: *mut CallInfo) -> i32!Throw {
+    unsafe {
+        status := ST_YIELD as i32
+        if ((*ci).callstatus & CIST_RECST) != 0 {
+            status = (*ci).recover_status
+            let func_off = (*ci).funcidx
+            (*L).allowhook = (*ci).old_allowhook
+            do_close(L, func_off, status, true)?
+            move_error_obj(L, status, restore_stack(L, func_off))
+            stack_shrink(L)
+            (*ci).callstatus = (*ci).callstatus & ~CIST_RECST
+        }
+        (*ci).callstatus = (*ci).callstatus & ~CIST_YPCALL
+        (*L).errfunc = (*ci).old_errfunc
+        return ok(status)
+    }
+}
+
+// Run every interrupted frame of a resumed coroutine to completion.
+fn unroll(L: *mut State) -> void!Throw {
+    unsafe {
+        let base = L_base_ci(L)
+        for (*L).ci != base {
+            let ci = (*L).ci
+            if !ci_is_lua(ci) {
+                finish_native(L, ci)?
+            } else {
+                vm_finish_op(L, ci)?
+                vm_execute(L, ci)?
+            }
+        }
+        return ok()
+    }
+}
+
+// Innermost frame with an active yieldable pcall, or null.
+fn find_pcall(L: *mut State) -> *mut CallInfo {
+    unsafe {
+        ci := (*L).ci
+        for !ptr.is_null(ci) {
+            if ((*ci).callstatus & CIST_YPCALL) != 0 {
+                return ci
+            }
+            ci = (*ci).previous
+        }
+        return 0 as *mut CallInfo
+    }
+}
+
+fn resume_body(L: *mut State, nargs: i32) -> void!Throw {
+    unsafe {
+        let first = ptr.offset((*L).top, -(nargs as isize))
+        if (*L).status == ST_OK {
+            // Starting the coroutine body.
+            let old = (*L).ci
+            precall(L, ptr.offset(first, -1), MULTRET)?
+            let ci = (*L).ci
+            if ci != old {
+                (*ci).callstatus = CIST_FRESH
+                vm_execute(L, ci)?
+            }
+            return ok()
+        }
+        // Resuming from a yield.
+        (*L).status = ST_OK
+        let ci = (*L).ci
+        if ci_is_lua(ci) {
+            // Yield from a hook inside a Lua function.
+            (*L).top = first
+            vm_execute(L, ci)?
+        } else {
+            n := nargs
+            if ((*ci).callstatus & CIST_HASK) != 0 {
+                cx := Cx { L: L }
+                let k = (*ci).k
+                n = k(&mut cx, ST_YIELD as i32, (*ci).ctx)?
+            }
+            poscall(L, ci, n)?
+        }
+        return unroll(L)
+    }
+}
+
+// Resume coroutine L (called from thread `from`, possibly null) with the
+// `nargs` values on top of its stack. Returns the status (OK: finished,
+// YIELD: suspended, else an error with the error object on top) and stores
+// the number of values returned/yielded in `*nresults`.
+fn do_resume(L: *mut State, caller: *mut State, nargs: i32, nresults: *mut i32) -> i32 {
+    unsafe {
+        if (*L).status == ST_OK {
+            if (*L).ci != L_base_ci(L) {
+                return resume_error(L, "cannot resume non-suspended coroutine", nargs)
+            }
+            if sdiff((*L).top, ptr.offset((*(*L).ci).func, 1)) == nargs as isize {
+                return resume_error(L, "cannot resume dead coroutine", nargs)
+            }
+        } else if (*L).status != ST_YIELD {
+            return resume_error(L, "cannot resume dead coroutine", nargs)
+        }
+        (*L).n_ccalls = if ptr.is_null(caller) {
+            0u32
+        } else {
+            (*caller).n_ccalls
+        }
+        if (*L).n_ccalls >= MAX_CCALLS {
+            return resume_error(L, "C stack overflow", nargs)
+        }
+        (*L).n_ccalls = (*L).n_ccalls + 1
+        (*L).nny = 0
+        let base_nccalls = (*L).n_ccalls
+        status := ST_OK as i32
+        match resume_body(L, nargs) {
+            ok() => {},
+            err(e) => {
+                status = throw_status(e)
+            },
+        }
+        // Errors inside a yieldable pcall that is no longer on the native
+        // stack are recovered at that pcall's frame.
+        for status != ST_OK as i32 && status != ST_YIELD as i32 {
+            let ci = find_pcall(L)
+            if ptr.is_null(ci) {
+                break
+            }
+            if status == ST_ERRRUN as i32 && (*L).errfunc != 0 {
+                status = call_handler(L)
+            }
+            (*L).ci = ci
+            (*L).n_ccalls = base_nccalls
+            (*L).nny = 0
+            match stack_check(L, 1) {
+                ok() => {},
+                err(_) => {},
+            }
+            push_error_obj(L, status)
+            (*ci).recover_status = status
+            (*ci).callstatus = (*ci).callstatus | CIST_RECST
+            status = ST_OK as i32
+            match unroll(L) {
+                ok() => {},
+                err(e) => {
+                    status = throw_status(e)
+                },
+            }
+        }
+        if status == ST_OK as i32 {
+            *nresults = sdiff((*L).top, ptr.offset((*(*L).ci).func, 1)) as i32
+        } else if status == ST_YIELD as i32 {
+            *nresults = (*(*L).ci).nyield
+        } else {
+            // The coroutine is dead; keep its frames for tracebacks.
+            (*L).status = status as u8
+            set_error_obj(L, status, (*L).top)
+            (*(*L).ci).top = (*L).top
+            *nresults = 1
+        }
+        (*L).n_ccalls = base_nccalls - 1
+        return status
+    }
+}
+
+// Suspend the running coroutine, yielding the `nresults` values on top of
+// the stack. Returns the Throw to propagate (Yield, or an error).
+fn do_yield(L: *mut State, nresults: i32, has_k: bool, ctx: isize, k: ContinuationFn) -> Throw {
+    unsafe {
+        let ci = (*L).ci
+        if (*L).nny > 0 {
+            if L != (*G(L)).mainthread {
+                return err_runtime(L, "attempt to yield across a C-call boundary")
+            }
+            return err_runtime(L, "attempt to yield from outside a coroutine")
+        }
+        (*L).status = ST_YIELD
+        (*ci).nyield = nresults
+        if !ci_is_lua(ci) && has_k {
+            (*ci).k = k
+            (*ci).ctx = ctx
+            (*ci).callstatus = (*ci).callstatus | CIST_HASK
+        }
+        return Throw.Yield
+    }
+}
+
+fn ci_proto(ci: *mut CallInfo) -> *mut Proto {
+    unsafe {
+        unsafe {
+            return (*(val_gc((*ci).func) as *mut LClosure)).p
+        }
+    }
+}

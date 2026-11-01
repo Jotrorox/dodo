@@ -1,0 +1,64 @@
+@@exit 0
+@@stdout
+return "abc	=> src:1: unfinished string near <eof>
+return 'abc	=> src:1: unfinished string near <eof>
+return "abc\10def"	=> src:1: unfinished string near '"abc'
+return "abc\13def"	=> src:1: unfinished string near '"abc'
+return "abc\	=> src:1: unfinished string near <eof>
+return "	=> src:1: unfinished string near <eof>
+return "\q"	=> src:1: invalid escape sequence near '"\q'
+return "\x4"	=> src:1: hexadecimal digit expected near '"\x4"'
+return "\xg0"	=> src:1: hexadecimal digit expected near '"\xg'
+return "\x"	=> src:1: hexadecimal digit expected near '"\x"'
+return "\256"	=> src:1: decimal escape too large near '"\256"'
+return "\999"	=> src:1: decimal escape too large near '"\999"'
+return "\u41"	=> src:1: missing '{' near '"\u4'
+return "\u{41"	=> src:1: missing '}' near '"\u{41"'
+return "\u{}"	=> src:1: hexadecimal digit expected near '"\u{}'
+return "\u{xyz}"	=> src:1: hexadecimal digit expected near '"\u{x'
+return "\u{80000000}"	=> src:1: UTF-8 value too large near '"\u{80000000'
+return "\u{7FFFFFFF}"	=> loaded
+return "\u{100000000000}"	=> src:1: UTF-8 value too large near '"\u{100000000'
+return "\c"	=> src:1: invalid escape sequence near '"\c'
+return "\8"	=> loaded
+return "\9x\10"	=> loaded
+return [[abc	=> src:1: unfinished long string (starting at line 1) near <eof>
+return [==[ abc ]=]	=> src:1: unfinished long string (starting at line 1) near <eof>
+return [==[ abc ]===]	=> src:1: unfinished long string (starting at line 1) near <eof>
+--[[ abc	=> src:1: unfinished long comment (starting at line 1) near <eof>
+--[==[ abc ]]	=> src:1: unfinished long comment (starting at line 1) near <eof>
+x = [=	=> src:1: invalid long string delimiter near '[='
+x = [==x	=> src:1: invalid long string delimiter near '[=='
+x = [=[ ok ]=]	=> loaded
+return 3x	=> src:1: malformed number near '3x'
+return 0x	=> src:1: malformed number near '0x'
+return 0xg	=> src:1: malformed number near '0xg'
+return 1e	=> src:1: malformed number near '1e'
+return 1e+	=> src:1: malformed number near '1e+'
+return 1e-x	=> src:1: malformed number near '1e-x'
+return 3..2	=> src:1: malformed number near '3..2'
+return 1.2.3	=> src:1: malformed number near '1.2.3'
+return 0x1p	=> src:1: malformed number near '0x1p'
+return 0x1pz	=> src:1: malformed number near '0x1pz'
+return 1.5e	=> src:1: malformed number near '1.5e'
+return 08	=> loaded
+return 0x.p1	=> src:1: malformed number near '0x.p1'
+return 12abc	=> src:1: malformed number near '12abc'
+return 1__2	=> src:1: malformed number near '1_'
+return .x	=> src:1: unexpected symbol near '.'
+return @	=> src:1: unexpected symbol near '@'
+return $	=> src:1: unexpected symbol near '$'
+return 1 ` 2	=> src:1: <eof> expected near '`'
+x = \1	=> src:1: unexpected symbol near '<\1>'
+#!/usr/bin/lua\10return 1	=> src:1: unexpected symbol near '#'
+return !1	=> src:1: unexpected symbol near '!'
+return 1 !== 2	=> src:1: <eof> expected near '!'
+[string "return +"]:1: unexpected symbol near '+'
+[string "x = = 1"]:1: unexpected symbol near '='
+[string "local t = {..."]:4: '}' expected (to close '{' at line 1) near <eof>
+[string "return 'a very long source line that will cer..."]:1: unexpected symbol near <eof>
+file.lua:1: unexpected symbol near <eof>
+[string "custom"]:1: unexpected symbol near <eof>
+\10\10\10return 'oops	=> src:4: unfinished string near <eof>
+x = 1\13\10\13\10y = "abc	=> src:3: unfinished string near <eof>
+x = 1\10\13z = 1\10\13y = "abc	=> src:3: unfinished string near <eof>

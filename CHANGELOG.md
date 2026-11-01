@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- `std/script/lua` is a complete Lua 5.4 implementation written in Dodo,
+  for embedding scripts, configuration and plugins in Dodo programs. It
+  follows PUC Lua 5.4.9, including its error messages and the
+  `LUA_COMPAT_5_3` behaviour of a default build, passes the official Lua
+  5.4.9 test suite (except the parts that need the internal `T` library),
+  and loads binary chunks from the reference `luac` 5.4. All standard
+  libraries are included; `io` and `os` wrap the target's C library on
+  Linux, macOS and Windows. The embedding API mirrors the Lua C API: a stack,
+  native functions (`lua.NativeFn`) with argument checking, protected calls,
+  userdata with metatables, coroutines with continuations, Dodo modules for
+  `require` (`preload_module`), memory limits, warnings, hooks and Ctrl-C
+  interrupts. There is no C API, so C modules cannot be loaded. At `-O 2`
+  it runs the `benchmarks/lua` set about 18% faster than the reference
+  interpreter. `examples/lua` builds a standalone `lua` interpreter
+  equivalent to the reference one, and `examples/lua_embed` shows embedding;
+  the [Lua guide](https://jotrorox.github.io/dodo/script/) covers both.
+  `tests/lua_corpus.rs` runs the `tests/lua` corpus against output recorded
+  from the reference interpreter.
+- Functions take `@inline`, `@inline(never)` and `@cold` attributes, which
+  optimized builds apply. A `match` on integer literals compiles to one LLVM
+  `switch`, and an interpreter loop of the shape `for { ...; match <u8> { ... } }`
+  with at least 16 literal arms dispatches through a table of block addresses
+  (threaded dispatch).
+- On Linux, constants that hold addresses (such as a `const NAME: &str`)
+  are placed in `.data.rel.ro` sections. They were in writable `.rodata`
+  sections, which GNU ld merged into the code segment, producing a
+  writable and executable segment and a linker warning.
 - GPUs draw straight into `std/window` windows:
   - `win.native_handle()` returns a `window.NativeHandle` (defined in the
     new, dependency-free `std/window/handle`): `Xcb(connection, window,

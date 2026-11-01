@@ -143,6 +143,8 @@ fn validate_signature(function: &Function) -> Result<(), Diagnostic> {
         Some("@compiler declarations cannot be async")
     } else if !function.placement.is_empty() {
         Some("@section and @align do not apply to async fns")
+    } else if function.inlining != crate::ast::Inlining::Auto {
+        Some("@inline and @cold do not apply to async fns")
     } else if !function.stores.is_empty() || !function.requires_plain.is_empty() {
         Some("an async fn cannot declare stores(...) or requires_plain(...)")
     } else if function.body.is_none() {
@@ -231,6 +233,7 @@ fn expand_function(function: &Function, future: &str, alias: &str) -> (Struct, V
         interrupt: None,
         link_name: None,
         placement: Placement::default(),
+        inlining: crate::ast::Inlining::Auto,
         async_part: Some(part),
     };
     let mut parts = vec![method(

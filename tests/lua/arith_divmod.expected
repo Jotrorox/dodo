@@ -1,0 +1,71 @@
+@@exit 0
+@@stdout
+-- integers
+7 // 3 = 2 (integer)   7 % 3 = 1 (integer)
+-7 // 3 = -3 (integer)   -7 % 3 = 2 (integer)
+7 // -3 = -3 (integer)   7 % -3 = -2 (integer)
+-7 // -3 = 2 (integer)   -7 % -3 = -1 (integer)
+0 // 3 = 0 (integer)   0 % 3 = 0 (integer)
+0 // -3 = 0 (integer)   0 % -3 = 0 (integer)
+6 // 3 = 2 (integer)   6 % 3 = 0 (integer)
+-6 // 3 = -2 (integer)   -6 % 3 = 0 (integer)
+1 // 7 = 0 (integer)   1 % 7 = 1 (integer)
+-1 // 7 = -1 (integer)   -1 % 7 = 6 (integer)
+9223372036854775807 // 2 = 4611686018427387903 (integer)   9223372036854775807 % 2 = 1 (integer)
+-9223372036854775808 // 2 = -4611686018427387904 (integer)   -9223372036854775808 % 2 = 0 (integer)
+-9223372036854775808 // -1 = -9223372036854775808 (integer)   -9223372036854775808 % -1 = 0 (integer)
+-9223372036854775808 // 9223372036854775807 = -2 (integer)   -9223372036854775808 % 9223372036854775807 = 9223372036854775806 (integer)
+9223372036854775807 // -9223372036854775808 = -1 (integer)   9223372036854775807 % -9223372036854775808 = -1 (integer)
+5 // 1 = 5 (integer)   5 % 1 = 0 (integer)
+-5 // -1 = 5 (integer)   -5 % -1 = 0 (integer)
+-- floats
+7.5 // 2 = 3.0 (float)   7.5 % 2 = 1.5 (float)
+-7.5 // 2 = -4.0 (float)   -7.5 % 2 = 0.5 (float)
+7.5 // -2 = -4.0 (float)   7.5 % -2 = -0.5 (float)
+-7.5 // -2 = 3.0 (float)   -7.5 % -2 = -1.5 (float)
+7 // 0.5 = 14.0 (float)   7 % 0.5 = 0.0 (float)
+5.25 // 0.5 = 10.0 (float)   5.25 % 0.5 = 0.25 (float)
+-0.0 // 1 = -0.0 (float)   -0.0 % 1 = -0.0 (float)
+0.0 // -1 = -0.0 (float)   0.0 % -1 = 0.0 (float)
+3.0 // 3 = 1.0 (float)   3.0 % 3 = 0.0 (float)
+-3.0 // 3 = -1.0 (float)   -3.0 % 3 = -0.0 (float)
+1e+308 // 1e-308 = inf (float)   1e+308 % 1e-308 = 3.4984455462456e-309 (float)
+-- float with infinities
+5	inf	//	0.0	%	5.0
+-5	inf	//	-0.0	%	inf
+5	-inf	//	-0.0	%	-inf
+-5	-inf	//	0.0	%	-5.0
+0	inf	//	0.0	%	0.0
+inf	2	//	inf	%	nan
+-- zero divisors
+1//0	err	arith_divmod.lua:40: attempt to divide by zero
+1%0	err	arith_divmod.lua:41: attempt to perform 'n%0'
+0//0	err	arith_divmod.lua:42: attempt to divide by zero
+0%0	err	arith_divmod.lua:43: attempt to perform 'n%0'
+1.0//0	ok	float	inf
+1//0.0	ok	float	inf
+-1//0.0	ok	float	-inf
+0.0//0.0	ok	float	nan
+1%0.0	ok	float	nan
+1.0%0	ok	float	nan
+1/0	ok	float	inf
+-1/0	ok	float	-inf
+0/0	ok	float	nan
+1/-0.0	ok	float	-inf
+minint//-1	ok	integer	-9223372036854775808
+minint%-1	ok	integer	0
+constant 1//0	err	[string "return 1 // 0"]:1: attempt to divide by zero
+constant 1%0	err	[string "return 1 % 0"]:1: attempt to perform 'n%0'
+math.fmod(7,0)	err	arith_divmod.lua:58: bad argument #2 to 'fmod' (zero)
+math.fmod(7,0.0)	ok	float	nan
+-- math.fmod truncates toward zero
+fmod	7	3	integer	1
+fmod	-7	3	integer	-1
+fmod	7	-3	integer	1
+fmod	-7	-3	integer	-1
+fmod	7.5	2	float	1.5
+fmod	-7.5	2	float	-1.5
+fmod	-9223372036854775808	-1	integer	0
+fmod	5	inf	float	5.0
+-- identity a == (a//b)*b + a%b
+identity holds	true

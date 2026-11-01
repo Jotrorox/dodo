@@ -1,0 +1,211 @@
+package lua
+
+import "std/console"
+import "std/io"
+
+// Test driver for std/script/lua/number.dodo. tests/lua_number.rs copies this
+// file next to number.dodo (both are package lua, so the package-internal num_*
+// functions are reachable) and feeds tests/fixtures/lua_number_vectors.txt.
+//
+// Line-oriented driver for number.dodo: one command per input line, one result
+// line per command. Commands:
+//   f CONV FLAGS WIDTH PREC HEXBITS   num_format_float
+//   i CONV FLAGS WIDTH PREC DECIMAL   num_format_int
+//   s HEXBITS                         num_float_to_string
+//   t DECIMAL                         num_int_to_string
+//   p HEXTEXT                         num_string_to_number -> "0" | "1 DEC" | "2 HEXBITS"
+//   b BASE HEXTEXT                    num_string_to_int_base -> "nil" | DEC
+
+struct HarnessLine {
+    fields: [8]usize
+    ends: [8]usize
+    count: usize
+}
+
+fn harness_split(line: &[u8]) -> HarnessLine {
+    result := HarnessLine { fields: [0usize; 8], ends: [0usize; 8], count: 0 }
+    index := 0usize
+    for index < line.len && result.count < 8 {
+        for index < line.len && line[index] == 32 {
+            index = index + 1
+        }
+        if index >= line.len {
+            break
+        }
+        result.fields[result.count] = index
+        for index < line.len && line[index] != 32 {
+            index = index + 1
+        }
+        result.ends[result.count] = index
+        result.count = result.count + 1
+    }
+    return result
+}
+
+fn harness_hex_nibble(c: u8) -> u64 {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as u64
+    }
+    return ((c | 32) - 87) as u64
+}
+
+fn harness_hex(text: &[u8]) -> u64 {
+    value := 0u64
+    for &c in text {
+        value = ((value & 0x0fffffffffffffff) << 4) | harness_hex_nibble(c)
+    }
+    return value
+}
+
+fn harness_int(text: &[u8]) -> i64 {
+    negative := text.len > 0 && text[0] == 45
+    value := 0u64
+    for &c in text {
+        if c != 45 {
+            value = core.wrapping_add(core.wrapping_mul(value, 10u64), (c - 48) as u64)
+        }
+    }
+    if negative {
+        value = core.wrapping_sub(0u64, value)
+    }
+    return num_u64_as_i64(value)
+}
+
+fn harness_put_hex(out: &mut[u8], at: usize, value: u64) -> usize {
+    digits := b"0123456789abcdef"
+    for index in 0usize..16 {
+        out[at + index] = digits[((value >> ((60 - index * 4) as u64)) & 15) as usize]
+    }
+    return at + 16
+}
+
+fn harness_command(line: &[u8], out: &mut[u8]) -> usize {
+    parts := harness_split(line)
+    if parts.count == 0 {
+        return 0
+    }
+    command := line[parts.fields[0]]
+    if command == 102 || command == 105 {
+        conv := line[parts.fields[1]]
+        flags := harness_int(&line[parts.fields[2]..parts.ends[2]]) as u32
+        width := harness_int(&line[parts.fields[3]..parts.ends[3]]) as i32
+        precision := harness_int(&line[parts.fields[4]..parts.ends[4]]) as i32
+        if command == 102 {
+            value := num_f64_from_bits(harness_hex(&line[parts.fields[5]..parts.ends[5]]))
+            return num_format_float(out, value, conv, flags, width, precision)
+        }
+        return num_format_int(out, harness_int(&line[parts.fields[5]..parts.ends[5]]), conv, flags, width, precision)
+    }
+    if command == 115 {
+        return num_float_to_string(out, num_f64_from_bits(harness_hex(&line[parts.fields[1]..parts.ends[1]])))
+    }
+    if command == 116 {
+        return num_int_to_string(out, harness_int(&line[parts.fields[1]..parts.ends[1]]))
+    }
+    text := [0u8; 4096]
+    source_index := 1usize
+    base := 0i64
+    if command == 98 {
+        base = harness_int(&line[parts.fields[1]..parts.ends[1]])
+        source_index = 2
+    }
+    length := 0usize
+    if parts.count > source_index {
+        hex := &line[parts.fields[source_index]..parts.ends[source_index]]
+        index := 0usize
+        for index + 1 < hex.len {
+            text[length] = ((harness_hex_nibble(hex[index]) << 4) | harness_hex_nibble(hex[index + 1])) as u8
+            length = length + 1
+            index = index + 2
+        }
+    }
+    if command == 98 {
+        result := 0i64
+        if !num_string_to_int_base(&text[0..length], base, &mut result) {
+            out[0] = 110
+            out[1] = 105
+            out[2] = 108
+            return 3
+        }
+        return num_int_to_string(out, result)
+    }
+    ival := 0i64
+    fval := 0.0
+    kind := num_string_to_number(&text[0..length], &mut ival, &mut fval)
+    if kind == 0 {
+        out[0] = 48
+        return 1
+    }
+    if kind == 1 {
+        out[0] = 49
+        out[1] = 32
+        return 2 + num_int_to_string(&mut out[2..], ival)
+    }
+    out[0] = 50
+    out[1] = 32
+    return harness_put_hex(out, 2, num_f64_bits(fval))
+}
+
+pub fn harness_run() -> i32 {
+    input := console.stdin()
+    output := console.stdout()
+    buffer := [0u8; 65536]
+    pending := [0u8; 65536]
+    filled := 0usize
+    used := 0usize
+    finished := false
+    for {
+        // Process every complete line in the buffer.
+        start := 0usize
+        index := 0usize
+        for index < filled {
+            if buffer[index] == 10 {
+                line := &buffer[start..index]
+                if used + 8192 > pending.len {
+                    match io.write_all(&mut output, &pending[0..used]) {
+                        ok(written) => {},
+                        err(problem) => {
+                            return 1
+                        },
+                    }
+                    used = 0
+                }
+                length := harness_command(line, &mut pending[used..used + 4096])
+                used = used + length
+                pending[used] = 10
+                used = used + 1
+                start = index + 1
+            }
+            index = index + 1
+        }
+        for move_index in start..filled {
+            buffer[move_index - start] = buffer[move_index]
+        }
+        filled = filled - start
+        if finished {
+            break
+        }
+        match input.read(&mut buffer[filled..]) {
+            ok(count) => {
+                if count == 0 {
+                    finished = true
+                    if filled > 0 {
+                        buffer[filled] = 10
+                        filled = filled + 1
+                    }
+                }
+                filled = filled + count
+            },
+            err(problem) => {
+                return 1
+            },
+        }
+    }
+    match io.write_all(&mut output, &pending[0..used]) {
+        ok(written) => {},
+        err(problem) => {
+            return 1
+        },
+    }
+    return 0
+}

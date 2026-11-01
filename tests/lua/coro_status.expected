@@ -1,0 +1,36 @@
+@@exit 0
+@@stdout
+main running:	thread	true
+main status:	running
+main yieldable:	false
+main yieldable(arg):	false
+before:	suspended	suspended
+A: running is A	true	false
+A: status(A)	running
+A: status(main)	normal
+A: yieldable	true	true
+B: status(A) while A resumes B	normal
+B: status(B)	running
+B: resume A ->	false	cannot resume non-suspended coroutine
+B: resume main ->	false	cannot resume non-suspended coroutine
+B: resume self ->	false	cannot resume non-suspended coroutine
+A: resume B ->	true	B yielded
+A: status(B) after B yielded	suspended
+resume A ->	true	A yielded
+after 1:	suspended	suspended
+resume A ->	true	A finished
+after 2:	dead	suspended
+resume A again ->	false	cannot resume dead coroutine
+resume B ->	true
+after 3:	dead
+resume B again ->	false	cannot resume dead coroutine
+E resume ->	false	boom
+E status:	dead
+E resume again ->	false	cannot resume dead coroutine
+wrap running:	thread	false	running	true
+yieldable in sort cmp (main):	false
+yieldable in sort cmp (coroutine):	true	false	true
+false	attempt to yield from outside a coroutine
+false	bad argument #1 to 'coroutine.status' (thread expected, got nil)
+false	bad argument #1 to 'coroutine.status' (thread expected, got table)
+false	bad argument #1 to 'coroutine.isyieldable' (thread expected, got number)
