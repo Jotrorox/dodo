@@ -1,0 +1,728 @@
+package lua
+
+import "core/ptr"
+
+// Lua 5.4 pattern matching (reference manual section 6.4.1), written for this
+// implementation. No allocation and no libc: the matcher works on raw byte views
+// that the caller keeps alive for as long as the matcher is used.
+//
+// Package-internal API (all names carry the `pat_`/`Pat` prefix):
+//
+//   pat_new(src, src_len, pat, pat_len) -> PatMatcher
+//   pat_match_at(&mut m, pos, pat_start) -> isize
+//       One anchored attempt at subject offset `pos`, starting at pattern offset
+//       `pat_start` (1 when a leading '^' was stripped, else 0). Resets the
+//       captures and the recursion budget. Returns the subject end offset (>= pos),
+//       PAT_NO_MATCH (-1), or PAT_ERROR (-2; read pat_error_message).
+//   pat_search(&mut m, first, pat_start, anchored, last_match, &mut start) -> isize
+//       The shared driver for find/match/gmatch/gsub: tries start offsets
+//       first..=src_len (only `first` when anchored) and returns the end of the
+//       first match whose end differs from `last_match` (pass -1 for none),
+//       storing its start offset. Same result codes as pat_match_at; no match
+//       when first > src_len.
+//   pat_anchor_offset(pat, pat_len) -> usize   1 if the pattern begins with '^'.
+//   pat_error_message(&m) -> &str               valid after PAT_ERROR.
+//   pat_capture_count(&m) -> usize              captures of the last match.
+//   pat_capture(&m, i, whole_start, whole_end, &mut start, &mut len) -> u32
+//       Reports capture i (0-based). Kinds: PAT_KIND_STRING (start/len valid),
+//       PAT_KIND_POSITION (start = 0-based offset; Lua shows start + 1),
+//       PAT_KIND_UNFINISHED (raise "unfinished capture"),
+//       PAT_KIND_INVALID (i >= count and i != 0; raise
+//       pat_capture_index_message(i + 1)). With no captures, i == 0 is the whole
+//       match [whole_start, whole_end).
+//   pat_capture_index_message(index) -> &str    "invalid capture index %<index>".
+//   pat_is_plain(pat, pat_len) -> bool          no byte from "^$*+?.([%-".
+//   pat_find_plain(src, src_len, needle, needle_len, first) -> isize
+//       First occurrence of needle in src[first..], or -1 (an empty needle is
+//       found at `first` when first <= src_len).
+//
+// Errors are lazy, exactly like the reference interpreter: a malformed piece is
+// diagnosed only when matching actually reaches it, so ("abc"):find("x%") is nil
+// while ("xbc"):find("x%") raises "malformed pattern (ends with '%')".
+//
+// Notes for the string library (verified against PUC Lua 5.4.9):
+//
+// * string.find uses pat_find_plain when the `plain` argument is true or when
+//   pat_is_plain holds. ')' is not special there: find("a)", "a)") is a plain
+//   search, but match("a)", "a)") raises "invalid pattern capture".
+// * find/match/gsub strip one leading '^' and then try a single start offset.
+//   gmatch does NOT: in 5.4 a leading '^' in gmatch is an ordinary literal byte.
+//   Elsewhere '^' is literal; '$' anchors only as the very last pattern byte.
+// * Start offsets run from init up to and including src_len, so an empty match at
+//   the end of the subject is found. find/match with init > len + 1 return nil
+//   before any matching happens (gmatch then yields nothing); a negative init
+//   counts from the end and clamps to 1, and 0 means 1.
+// * gmatch and gsub remember `last_match`, the end of the previous accepted match
+//   (initially none, -1). A match whose end equals last_match is rejected, so an
+//   empty match right after a previous match is skipped:
+//     gmatch: loop { e = pat_search(m, src, 0, false, last, &st); if e < 0 stop;
+//                    yield captures(st, e); src = e; last = e }
+//     (anchor = pat_anchor_offset(pat, pat_len) is passed as pat_start.)
+//     gsub:   while n < max { e = pat_search(m, src, anchor, anchor == 1, last,
+//                    &st); if e < 0 break; copy subject[src..st]; append the
+//                    replacement; src = e; last = e; n += 1; if anchor == 1 break }
+//             then copy subject[src..]. Each replacement counts, so
+//             gsub("abc", "%w*", "-") == "-", 1 and
+//             gsub("hello world", "o*", "x") == "xhxexlxlx xwxrxlxdx", 10.
+//   find/match pass last_match = -1.
+// * find returns start + 1, end, then the captures only if pat_capture_count > 0;
+//   match/gmatch return the captures, or the whole match when there are none.
+//   Position captures are integers (offset + 1); any unfinished capture raises
+//   "unfinished capture" when the captures are pushed (not inside gsub's %0).
+// * gsub replacement strings (handled by the string library): "%%" is '%',
+//   "%0" the whole match, "%1".."%9" via pat_capture (where "%1" with no captures
+//   means the whole match, and a missing index raises "invalid capture index %N",
+//   pat_capture_index_message(i + 1)); any other byte after '%' raises
+//   "invalid use of '%' in replacement string". Table and function replacements
+//   use the first capture (or the whole match); false/nil keeps the original.
+
+const PAT_MAXCAPTURES: usize = 32
+const PAT_CAP_POSITION: isize = -2
+const PAT_CAP_UNFINISHED: isize = -1
+// Nesting budget of the backtracking matcher (the reference MAXCCALLS).
+const PAT_MAXDEPTH: isize = 200
+
+const PAT_NO_MATCH: isize = -1
+const PAT_ERROR: isize = -2
+
+const PAT_KIND_STRING: u32 = 0
+const PAT_KIND_POSITION: u32 = 1
+const PAT_KIND_UNFINISHED: u32 = 2
+const PAT_KIND_INVALID: u32 = 3
+
+const PAT_ERR_NONE: u32 = 0
+const PAT_ERR_ENDS_WITH_ESCAPE: u32 = 1
+const PAT_ERR_MISSING_BRACKET: u32 = 2
+const PAT_ERR_BALANCE_ARGS: u32 = 3
+const PAT_ERR_FRONTIER_BRACKET: u32 = 4
+const PAT_ERR_CAPTURE_INDEX: u32 = 5
+const PAT_ERR_PATTERN_CAPTURE: u32 = 6
+const PAT_ERR_TOO_MANY_CAPTURES: u32 = 7
+const PAT_ERR_TOO_COMPLEX: u32 = 8
+
+struct PatMatcher {
+    src: *const u8
+    src_len: usize
+    pat: *const u8
+    pat_len: usize
+    // Number of open or closed captures in the current attempt.
+    level: usize
+    // Remaining nesting budget for the current attempt.
+    depth: isize
+    cap_start: [32]isize
+    // Capture length, or PAT_CAP_UNFINISHED / PAT_CAP_POSITION.
+    cap_len: [32]isize
+    error: u32
+    // The digit shown by "invalid capture index %N".
+    error_index: usize
+}
+
+fn pat_new(src: *const u8, src_len: usize, pat: *const u8, pat_len: usize) -> PatMatcher {
+    return PatMatcher {
+        src: src, src_len: src_len, pat: pat, pat_len: pat_len, level: 0, depth: PAT_MAXDEPTH,
+        cap_start: [0isize; 32], cap_len: [0isize; 32], error: PAT_ERR_NONE, error_index: 0,
+    }
+}
+
+fn pat_anchor_offset(pat: *const u8, pat_len: usize) -> usize {
+    if pat_len > 0 && pat_load(pat, 0) == b'^' {
+        return 1
+    }
+    return 0
+}
+
+fn pat_match_at(m: &mut PatMatcher, pos: usize, pat_start: usize) -> isize {
+    m.level = 0
+    m.depth = PAT_MAXDEPTH
+    m.error = PAT_ERR_NONE
+    return pat_run(m, pos, pat_start)
+}
+
+fn pat_search(m: &mut PatMatcher, first: usize, pat_start: usize, anchored: bool, last_match: isize, match_start: &mut usize) -> isize {
+    s := first
+    for s <= m.src_len {
+        e := pat_match_at(m, s, pat_start)
+        if e == PAT_ERROR {
+            return PAT_ERROR
+        }
+        if e >= 0 && e != last_match {
+            *match_start = s
+            return e
+        }
+        if anchored {
+            break
+        }
+        s += 1
+    }
+    return PAT_NO_MATCH
+}
+
+fn pat_error_message(m: &PatMatcher) -> &str from(static) {
+    let code = m.error
+    if code == PAT_ERR_ENDS_WITH_ESCAPE {
+        return "malformed pattern (ends with '%')"
+    }
+    if code == PAT_ERR_MISSING_BRACKET {
+        return "malformed pattern (missing ']')"
+    }
+    if code == PAT_ERR_BALANCE_ARGS {
+        return "malformed pattern (missing arguments to '%b')"
+    }
+    if code == PAT_ERR_FRONTIER_BRACKET {
+        return "missing '[' after '%f' in pattern"
+    }
+    if code == PAT_ERR_CAPTURE_INDEX {
+        return pat_capture_index_message(m.error_index)
+    }
+    if code == PAT_ERR_PATTERN_CAPTURE {
+        return "invalid pattern capture"
+    }
+    if code == PAT_ERR_TOO_MANY_CAPTURES {
+        return "too many captures"
+    }
+    if code == PAT_ERR_TOO_COMPLEX {
+        return "pattern too complex"
+    }
+    return "no pattern error"
+}
+
+// Message for a bad capture reference; index is the 1-based number written
+// after '%' (0..9 in back-references, up to 32 when pushing captures).
+fn pat_capture_index_message(index: usize) -> &str from(static) {
+    if index < PAT_INDEX_MESSAGES.len {
+        return PAT_INDEX_MESSAGES[index]
+    }
+    return "invalid capture index"
+}
+
+const PAT_INDEX_MESSAGES: [33]&str = [
+    "invalid capture index %0", "invalid capture index %1", "invalid capture index %2",
+    "invalid capture index %3", "invalid capture index %4", "invalid capture index %5",
+    "invalid capture index %6", "invalid capture index %7", "invalid capture index %8",
+    "invalid capture index %9", "invalid capture index %10", "invalid capture index %11",
+    "invalid capture index %12", "invalid capture index %13", "invalid capture index %14",
+    "invalid capture index %15", "invalid capture index %16", "invalid capture index %17",
+    "invalid capture index %18", "invalid capture index %19", "invalid capture index %20",
+    "invalid capture index %21", "invalid capture index %22", "invalid capture index %23",
+    "invalid capture index %24", "invalid capture index %25", "invalid capture index %26",
+    "invalid capture index %27", "invalid capture index %28", "invalid capture index %29",
+    "invalid capture index %30", "invalid capture index %31", "invalid capture index %32",
+]
+
+fn pat_capture_count(m: &PatMatcher) -> usize {
+    return m.level
+}
+
+fn pat_capture(m: &PatMatcher, i: usize, whole_start: usize, whole_end: usize, start: &mut usize, len: &mut usize) -> u32 {
+    if i >= m.level {
+        if i != 0 {
+            return PAT_KIND_INVALID
+        }
+        *start = whole_start
+        *len = whole_end - whole_start
+        return PAT_KIND_STRING
+    }
+    let size = m.cap_len[i]
+    if size == PAT_CAP_UNFINISHED {
+        return PAT_KIND_UNFINISHED
+    }
+    *start = m.cap_start[i] as usize
+    if size == PAT_CAP_POSITION {
+        *len = 0
+        return PAT_KIND_POSITION
+    }
+    *len = size as usize
+    return PAT_KIND_STRING
+}
+
+// ---------------------------------------------------------------------------
+// Matching engine.
+
+// Raw byte read; callers guarantee i is inside the view.
+fn pat_load(base: *const u8, i: usize) -> u8 {
+    return unsafe {
+        *ptr.offset(base, i as isize)
+    }
+}
+
+// Pattern byte at i, or 0 past the end (the reference reads a terminating NUL
+// there, and every lookahead below relies on that convention).
+fn pat_pbyte(m: &PatMatcher, i: usize) -> u8 {
+    if i >= m.pat_len {
+        return 0
+    }
+    return pat_load(m.pat, i)
+}
+
+// Subject byte at i, or 0 at/after the end (frontier and %b semantics).
+fn pat_sbyte(m: &PatMatcher, i: usize) -> u8 {
+    if i >= m.src_len {
+        return 0
+    }
+    return pat_load(m.src, i)
+}
+
+fn pat_fail(m: &mut PatMatcher, code: u32) -> isize {
+    m.error = code
+    return PAT_ERROR
+}
+
+// Class letter -> membership bits in PAT_CTYPE; 0 for letters that are not
+// classes (they match themselves). Bits: 1 alpha, 2 digit, 4 lower, 8 upper,
+// 16 space, 32 cntrl, 64 punct, 128 xdigit, 256 graph, 512 NUL (%z, deprecated
+// but still accepted by Lua 5.4). %w is alpha|digit.
+const PAT_CLASS_MASK: [26]u16 = [1, 0, 32, 2, 0, 0, 256, 0, 0, 0, 0, 4, 0, 0, 0, 64, 0, 0, 16, 0, 8, 0, 3, 128, 0, 512]
+
+// C-locale ctype bits for every byte; bytes >= 128 belong to no class.
+const PAT_CTYPE: [256]u16 = [
+    544, 32, 32, 32, 32, 32, 32, 32, 32, 48, 48, 48, 48, 48, 32, 32,
+    32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+    16, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320, 320,
+    386, 386, 386, 386, 386, 386, 386, 386, 386, 386, 320, 320, 320, 320, 320, 320,
+    320, 393, 393, 393, 393, 393, 393, 265, 265, 265, 265, 265, 265, 265, 265, 265,
+    265, 265, 265, 265, 265, 265, 265, 265, 265, 265, 265, 320, 320, 320, 320, 320,
+    320, 389, 389, 389, 389, 389, 389, 261, 261, 261, 261, 261, 261, 261, 261, 261,
+    261, 261, 261, 261, 261, 261, 261, 261, 261, 261, 261, 320, 320, 320, 320, 32,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]
+
+// Does byte c belong to escape class %<cl>? Unknown letters match themselves,
+// and an upper-case class letter complements its class.
+fn pat_escape_matches(c: u8, cl: u8) -> bool {
+    if cl >= b'a' && cl <= b'z' {
+        let bits = PAT_CLASS_MASK[(cl - b'a') as usize]
+        if bits == 0 {
+            return cl == c
+        }
+        return (PAT_CTYPE[c as usize] & bits) != 0
+    }
+    if cl >= b'A' && cl <= b'Z' {
+        let bits = PAT_CLASS_MASK[(cl - b'A') as usize]
+        if bits == 0 {
+            return cl == c
+        }
+        return (PAT_CTYPE[c as usize] & bits) == 0
+    }
+    return cl == c
+}
+
+// Offset just past the single-character class starting at p ('%x', '[set]', or
+// one byte). Returns PAT_ERROR for an unterminated escape or set.
+fn pat_item_end(m: &mut PatMatcher, p: usize) -> isize {
+    let first = pat_pbyte(m, p)
+    q := p + 1
+    if first == b'%' {
+        if q >= m.pat_len {
+            return pat_fail(m, PAT_ERR_ENDS_WITH_ESCAPE)
+        }
+        return (q + 1) as isize
+    }
+    if first == b'[' {
+        if pat_pbyte(m, q) == b'^' {
+            q += 1
+        }
+        // The first member is always taken literally, so "[]]" and "[^]]" are sets.
+        for {
+            if q >= m.pat_len {
+                return pat_fail(m, PAT_ERR_MISSING_BRACKET)
+            }
+            let member = pat_pbyte(m, q)
+            q += 1
+            if member == b'%' && q < m.pat_len {
+                q += 1
+            }
+            if pat_pbyte(m, q) == b']' {
+                break
+            }
+        }
+        return (q + 1) as isize
+    }
+    return q as isize
+}
+
+// Set membership; p is the '[' and close the offset of its closing ']'.
+fn pat_set_matches(m: &PatMatcher, c: u8, p: usize, close: usize) -> bool {
+    inside := true
+    i := p + 1
+    if pat_pbyte(m, i) == b'^' {
+        inside = false
+        i += 1
+    }
+    for i < close {
+        let b = pat_pbyte(m, i)
+        if b == b'%' {
+            i += 1
+            if pat_escape_matches(c, pat_pbyte(m, i)) {
+                return inside
+            }
+            i += 1
+        } else if pat_pbyte(m, i + 1) == b'-' && i + 2 < close {
+            if b <= c && c <= pat_pbyte(m, i + 2) {
+                return inside
+            }
+            i += 3
+        } else {
+            if b == c {
+                return inside
+            }
+            i += 1
+        }
+    }
+    return !inside
+}
+
+// Does subject offset s hold a byte matched by the class [p, end)?
+fn pat_single(m: &PatMatcher, s: usize, p: usize, end: usize) -> bool {
+    if s >= m.src_len {
+        return false
+    }
+    let c = pat_load(m.src, s)
+    let kind = pat_pbyte(m, p)
+    if kind == b'.' {
+        return true
+    }
+    if kind == b'%' {
+        return pat_escape_matches(c, pat_pbyte(m, p + 1))
+    }
+    if kind == b'[' {
+        return pat_set_matches(m, c, p, end - 1)
+    }
+    return kind == c
+}
+
+// Every nested matcher invocation spends one unit of the nesting budget;
+// continuing in the same invocation (a plain item, %b, %f, %1) is free.
+fn pat_run(m: &mut PatMatcher, s: usize, p: usize) -> isize {
+    if m.depth == 0 {
+        return pat_fail(m, PAT_ERR_TOO_COMPLEX)
+    }
+    m.depth -= 1
+    let result = pat_continue(m, s, p)
+    m.depth += 1
+    return result
+}
+
+fn pat_continue(m: &mut PatMatcher, s0: usize, p0: usize) -> isize {
+    s := s0
+    p := p0
+    for {
+        if p >= m.pat_len {
+            return s as isize
+        }
+        let op = pat_pbyte(m, p)
+        if op == b'(' {
+            if pat_pbyte(m, p + 1) == b')' {
+                return pat_open_capture(m, s, p + 2, PAT_CAP_POSITION)
+            }
+            return pat_open_capture(m, s, p + 1, PAT_CAP_UNFINISHED)
+        }
+        if op == b')' {
+            return pat_close_capture(m, s, p + 1)
+        }
+        if op == b'$' && p + 1 == m.pat_len {
+            if s == m.src_len {
+                return s as isize
+            }
+            return PAT_NO_MATCH
+        }
+        if op == b'%' {
+            let esc = pat_pbyte(m, p + 1)
+            if esc == b'b' {
+                let next = pat_balanced(m, s, p + 2)
+                if next < 0 {
+                    return next
+                }
+                s = next as usize
+                p += 4
+                continue
+            }
+            if esc == b'f' {
+                let set = p + 2
+                if pat_pbyte(m, set) != b'[' {
+                    return pat_fail(m, PAT_ERR_FRONTIER_BRACKET)
+                }
+                let after = pat_item_end(m, set)
+                if after < 0 {
+                    return after
+                }
+                let close = (after - 1) as usize
+                prev := 0u8
+                if s > 0 {
+                    prev = pat_sbyte(m, s - 1)
+                }
+                if !pat_set_matches(m, prev, set, close) && pat_set_matches(m, pat_sbyte(m, s), set, close) {
+                    p = after as usize
+                    continue
+                }
+                return PAT_NO_MATCH
+            }
+            if esc >= b'0' && esc <= b'9' {
+                let next = pat_back_reference(m, s, esc)
+                if next < 0 {
+                    return next
+                }
+                s = next as usize
+                p += 2
+                continue
+            }
+        }
+        // A single-character class with an optional quantifier.
+        let item_end = pat_item_end(m, p)
+        if item_end < 0 {
+            return item_end
+        }
+        let ep = item_end as usize
+        let quant = pat_pbyte(m, ep)
+        if !pat_single(m, s, p, ep) {
+            if quant == b'*' || quant == b'?' || quant == b'-' {
+                p = ep + 1
+                continue
+            }
+            return PAT_NO_MATCH
+        }
+        if quant == b'?' {
+            let taken = pat_run(m, s + 1, ep + 1)
+            if taken != PAT_NO_MATCH {
+                return taken
+            }
+            p = ep + 1
+            continue
+        }
+        if quant == b'*' {
+            return pat_greedy(m, s, p, ep)
+        }
+        if quant == b'+' {
+            return pat_greedy(m, s + 1, p, ep)
+        }
+        if quant == b'-' {
+            return pat_lazy(m, s, p, ep)
+        }
+        s += 1
+        p = ep
+    }
+}
+
+// Longest run first: count the repeatable bytes, then back off one at a time.
+fn pat_greedy(m: &mut PatMatcher, s: usize, p: usize, ep: usize) -> isize {
+    count := pat_run_length(m, s, p, ep)
+    for {
+        let result = pat_run(m, s + count, ep + 1)
+        if result != PAT_NO_MATCH {
+            return result
+        }
+        if count == 0 {
+            return PAT_NO_MATCH
+        }
+        count -= 1
+    }
+}
+
+// How many consecutive subject bytes from s match the class [p, ep)?
+fn pat_run_length(m: &PatMatcher, s: usize, p: usize, ep: usize) -> usize {
+    if s >= m.src_len {
+        return 0
+    }
+    let limit = m.src_len - s
+    let kind = pat_pbyte(m, p)
+    if kind == b'.' {
+        return limit
+    }
+    let base = m.src
+    count := 0usize
+    if kind == b'%' {
+        let cl = pat_pbyte(m, p + 1)
+        for count < limit && pat_escape_matches(pat_load(base, s + count), cl) {
+            count += 1
+        }
+        return count
+    }
+    if kind == b'[' {
+        for count < limit && pat_set_matches(m, pat_load(base, s + count), p, ep - 1) {
+            count += 1
+        }
+        return count
+    }
+    for count < limit && pat_load(base, s + count) == kind {
+        count += 1
+    }
+    return count
+}
+
+// Shortest run first: try the rest, and only then consume one more byte.
+fn pat_lazy(m: &mut PatMatcher, s0: usize, p: usize, ep: usize) -> isize {
+    s := s0
+    for {
+        let result = pat_run(m, s, ep + 1)
+        if result != PAT_NO_MATCH {
+            return result
+        }
+        if !pat_single(m, s, p, ep) {
+            return PAT_NO_MATCH
+        }
+        s += 1
+    }
+}
+
+fn pat_open_capture(m: &mut PatMatcher, s: usize, p: usize, kind: isize) -> isize {
+    let index = m.level
+    if index >= PAT_MAXCAPTURES {
+        return pat_fail(m, PAT_ERR_TOO_MANY_CAPTURES)
+    }
+    m.cap_start[index] = s as isize
+    m.cap_len[index] = kind
+    m.level = index + 1
+    let result = pat_run(m, s, p)
+    if result == PAT_NO_MATCH {
+        m.level = index
+    }
+    return result
+}
+
+fn pat_close_capture(m: &mut PatMatcher, s: usize, p: usize) -> isize {
+    // The innermost capture that is still open.
+    i := m.level
+    found := false
+    for i > 0 {
+        i -= 1
+        if m.cap_len[i] == PAT_CAP_UNFINISHED {
+            found = true
+            break
+        }
+    }
+    if !found {
+        return pat_fail(m, PAT_ERR_PATTERN_CAPTURE)
+    }
+    m.cap_len[i] = s as isize - m.cap_start[i]
+    let result = pat_run(m, s, p)
+    if result == PAT_NO_MATCH {
+        m.cap_len[i] = PAT_CAP_UNFINISHED
+    }
+    return result
+}
+
+// %bxy at subject offset s; p is the offset of x.
+fn pat_balanced(m: &mut PatMatcher, s0: usize, p: usize) -> isize {
+    if p + 1 >= m.pat_len {
+        return pat_fail(m, PAT_ERR_BALANCE_ARGS)
+    }
+    if s0 >= m.src_len {
+        return PAT_NO_MATCH
+    }
+    let open = pat_pbyte(m, p)
+    let close = pat_pbyte(m, p + 1)
+    if pat_sbyte(m, s0) != open {
+        return PAT_NO_MATCH
+    }
+    depth := 1usize
+    s := s0 + 1
+    for s < m.src_len {
+        let c = pat_load(m.src, s)
+        if c == close {
+            depth -= 1
+            if depth == 0 {
+                return (s + 1) as isize
+            }
+        } else if c == open {
+            depth += 1
+        }
+        s += 1
+    }
+    return PAT_NO_MATCH
+}
+
+// %1..%9 (and the always-invalid %0) at subject offset s.
+fn pat_back_reference(m: &mut PatMatcher, s: usize, digit: u8) -> isize {
+    let number = (digit - b'0') as usize
+    if number == 0 || number > m.level || m.cap_len[number - 1] == PAT_CAP_UNFINISHED {
+        m.error_index = number
+        return pat_fail(m, PAT_ERR_CAPTURE_INDEX)
+    }
+    let size = m.cap_len[number - 1]
+    if size < 0 {
+        // A position capture never matches as text.
+        return PAT_NO_MATCH
+    }
+    let length = size as usize
+    if m.src_len - s < length {
+        return PAT_NO_MATCH
+    }
+    let origin = m.cap_start[number - 1] as usize
+    for k in 0usize..length {
+        if pat_sbyte(m, origin + k) != pat_sbyte(m, s + k) {
+            return PAT_NO_MATCH
+        }
+    }
+    return (s + length) as isize
+}
+
+// ---------------------------------------------------------------------------
+// Plain search.
+
+fn pat_is_plain(pat: *const u8, pat_len: usize) -> bool {
+    for i in 0usize..pat_len {
+        let c = pat_load(pat, i)
+        if c == b'^' || c == b'$' || c == b'*' || c == b'+' || c == b'?' || c == b'.' || c == b'(' || c == b'[' ||
+            c == b'%' || c == b'-' {
+            return false
+        }
+    }
+    return true
+}
+
+fn pat_bytes_equal(a: *const u8, a_at: usize, b: *const u8, b_at: usize, count: usize) -> bool {
+    for i in 0usize..count {
+        if pat_load(a, a_at + i) != pat_load(b, b_at + i) {
+            return false
+        }
+    }
+    return true
+}
+
+// First occurrence of needle in src[first..]; returns its offset or -1.
+// Short needles scan for their first byte; longer ones use Horspool skipping.
+fn pat_find_plain(src: *const u8, src_len: usize, needle: *const u8, needle_len: usize, first: usize) -> isize {
+    if first > src_len || needle_len > src_len - first {
+        return -1
+    }
+    if needle_len == 0 {
+        return first as isize
+    }
+    let last = src_len - needle_len
+    let head = pat_load(needle, 0)
+    if needle_len < 4 || last - first < 64 {
+        pos := first
+        for pos <= last {
+            if pat_load(src, pos) == head &&
+                pat_bytes_equal(src, pos + 1, needle, 1, needle_len - 1) {
+                return pos as isize
+            }
+            pos += 1
+        }
+        return -1
+    }
+    skip := [0usize; 256]
+    for i in 0usize..256 {
+        skip[i] = needle_len
+    }
+    let tail_index = needle_len - 1
+    for i in 0usize..tail_index {
+        skip[pat_load(needle, i) as usize] = tail_index - i
+    }
+    let tail = pat_load(needle, tail_index)
+    pos := first
+    for pos <= last {
+        let c = pat_load(src, pos + tail_index)
+        if c == tail && pat_bytes_equal(src, pos, needle, 0, tail_index) {
+            return pos as isize
+        }
+        pos += skip[c as usize]
+    }
+    return -1
+}
