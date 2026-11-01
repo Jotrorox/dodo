@@ -6,9 +6,11 @@
 set -e
 root=$(cd "$(dirname "$0")/../.." && pwd)
 out="$root/target/luatool"
-rm -rf "$out"
+rm -rf "$out/lua"
 mkdir -p "$out/lua"
 cp "$root"/stdlib/std/script/lua/*.dodo "$out/lua/"
 cp "$root/tests/lua/tool/lua_tool.dodo" "$out/lua/"
 cp "$root/tests/lua/tool/main.dodo" "$out/main.dodo"
-"$root/target/debug/dodo" build "$@" "$out/main.dodo" -o "$out/luatool"
+# Build next to the old binary and swap, so running comparisons keep working.
+"$root/target/debug/dodo" build "$@" "$out/main.dodo" -o "$out/luatool.new"
+mv "$out/luatool.new" "$out/luatool"

@@ -506,6 +506,58 @@ fn lx_save(cx: *mut Cmp, c: i32) -> void!Throw {
     }
 }
 
+// Append the `n` source bytes starting at the current character and move
+// past them (the caller has checked they need no special treatment).
+fn lx_save_run(cx: *mut Cmp, n: usize) -> void!Throw {
+    unsafe {
+        let need = (*cx).nbuf + n
+        if need > (*cx).capbuf {
+            newcap := (*cx).capbuf * 2
+            for newcap < need {
+                newcap = newcap * 2
+            }
+            let nb = mem_realloc((*cx).L, (*cx).buf, (*cx).capbuf, newcap)?
+            (*cx).buf = nb
+            (*cx).capbuf = newcap
+        }
+        let start = (*cx).pos - 1
+        ptr.copy_nonoverlapping(ptr.offset((*cx).src, start as isize) as *const u8, ptr.offset((*cx).buf, (*cx).nbuf as isize), n)
+        (*cx).nbuf = need
+        (*cx).pos = start + n
+        lx_advance(cx)
+        return ok()
+    }
+}
+
+// Length of the run of bytes from the current character on for which
+// are name characters (at least 1: the current character starts a name).
+fn lx_ident_run(cx: *mut Cmp) -> usize {
+    unsafe {
+        let start = (*cx).pos - 1
+        i := (*cx).pos
+        for i < (*cx).srclen && lx_isalnum(*ptr.offset((*cx).src, i as isize) as i32) {
+            i = i + 1
+        }
+        return i - start
+    }
+}
+
+// Run of plain string characters: not the delimiter, a backslash or a line break.
+fn lx_plain_run(cx: *mut Cmp, del: i32) -> usize {
+    unsafe {
+        let start = (*cx).pos - 1
+        i := (*cx).pos
+        for i < (*cx).srclen {
+            let c = *ptr.offset((*cx).src, i as isize) as i32
+            if c == del || c == 92 || c == 10 || c == 13 {
+                break
+            }
+            i = i + 1
+        }
+        return i - start
+    }
+}
+
 fn lx_save_advance(cx: *mut Cmp) -> void!Throw {
     unsafe { lx_save(cx, (*cx).cur)? }
     lx_advance(cx)
@@ -636,7 +688,7 @@ fn lx_longstring(cx: *mut Cmp, keep: bool, sep: usize) -> void!Throw {
                     (*cx).nbuf = 0
                 }
             } else if keep {
-                lx_save_advance(cx)?
+                lx_save_run(cx, lx_plain_run(cx, 93))?
             } else {
                 lx_advance(cx)
             }
@@ -750,7 +802,7 @@ fn lx_shortstring(cx: *mut Cmp, del: i32) -> void!Throw {
                 return err(lx_error(cx, "unfinished string", TK_STRING))
             }
             if c != 92 {
-                lx_save_advance(cx)?
+                lx_save_run(cx, lx_plain_run(cx, del))?
                 continue
             }
             // Escape sequence; keep the backslash until it is decoded.
@@ -926,14 +978,7 @@ fn lx_scan(cx: *mut Cmp) -> i32!Throw {
             } else if c == LX_EOZ {
                 return ok(TK_EOS)
             } else if lx_isalpha(c) {
-                // Names are scanned straight from the source text.
-                let start = (*cx).pos - 1
-                for {
-                    lx_save_advance(cx)?
-                    if !lx_isalnum((*cx).cur) {
-                        break
-                    }
-                }
+                lx_save_run(cx, lx_ident_run(cx))?
                 tok := 0i32
                 (*cx).sc_s = lx_intern(cx, (*cx).buf, (*cx).nbuf, ptr.from_mut(&mut tok))?
                 if tok != 0 {
